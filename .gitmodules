@@ -1,0 +1,3 @@
+[submodule "wasm/jump-cannon"]
+	path = wasm/jump-cannon
+	url = git@github.com:ocasazza/jump-cannon.git

@@ -1,0 +1,39 @@
+---
+# yaml-language-server: $schema=https://taskfile.dev/schema.json
+version: "3"
+
+vars:
+  WASM_DIR: "{{.ROOT_DIR}}/wasm"
+
+tasks:
+  clean:
+    desc: Clean files and directories no longer needed after cluster bootstrap
+    cmds:
+    - rm -rf .nuxt .output wasm/jump-cannon/{pkg,target}
+
+    preconditions:
+    - { msg: "Missing bootstrap directory", sh: "test -d {{.ROOT_DIR}}" }
+
+  build:
+    desc: Clean files and directories no longer needed after cluster bootstrap
+    deps: [ "build-wasm" ]
+    cmds:
+    - npm run build
+
+  build-wasm:
+    desc: Builds shared Rust libraries with wasm-pack
+    cmds:
+    - wasm-pack build {{.WASM_DIR}}/jump-cannon --target web
+
+  install-rust:
+    desc: Install rustup and wasm-pack if not already installed
+    cmds:
+    - |
+      if ! command -v wasm-pack >/dev/null 2>&1; then
+        echo "wasm-pack not found. Installing..."
+        curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+        . "$HOME/.cargo/env"
+        curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
+      else
+        echo "wasm-pack is already installed. Skipping installation."
+      fi
