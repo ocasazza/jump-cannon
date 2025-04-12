@@ -23,7 +23,7 @@ jobs:
     - run: wasm-pack build ./wasm/jump-cannon --target web
     # build vuex
     - run: npm install
-    - run: nuxt generate --preset github_pages
+    - run: npx nuxt generate --preset github_pages
     - name: Upload artifact
       uses: actions/upload-pages-artifact@v3
       with:
