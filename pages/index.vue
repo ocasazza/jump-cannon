@@ -1,3 +1,3 @@
 <template>
-  <h2>Welcome to Layouts example</h2>
+  <h2>kgb</h2>
 </template>

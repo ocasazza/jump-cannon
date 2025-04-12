@@ -3,4 +3,11 @@
     <NuxtLayout>
       <NuxtPage />
     </NuxtLayout>
-  </template>
+</template>
+
+<script setup>
+import init, {greet} from "wasm/jump-cannon"
+
+init()
+greet()
+</script>
