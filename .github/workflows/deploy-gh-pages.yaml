@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
   push:
     branches:
-    - main
+    - deploy
 jobs:
 
   build:
@@ -22,26 +22,27 @@ jobs:
     # build wasm
     - run: wasm-pack build ./wasm/jump-cannon --target web
     # build vuex
-    - run: npx nuxt generate
-    - run: npx gh-pages --dotfiles -d .output/public
-    # cache artifacts
+    - run: npm install
+    - run: NUXT_APP_BASE_URL=/kbg/ npx nuxt build --preset github_pages
     - name: Upload artifact
       uses: actions/upload-pages-artifact@v3
       with:
         path: ./.output/public
-  # Deployment job
-  # deploy:
-  #   # Add a dependency to the build job
-  #   needs: build
-  #   # Grant GITHUB_TOKEN the permissions required to make a Pages deployment
-  #   permissions:
-  #     pages: write # to deploy to Pages
-  #     id-token: write # to verify the deployment originates from an appropriate source
-  #   # # Deploy to the github_pages environment
-  #   # environment:
-  #   #   name: github_pages
-  #   #   url: ${{ steps.deployment.outputs.page_url }}
-  #   # Specify runner + deployment step
-  #   runs-on: ubuntu-latest
-  #   steps:
-  #   - run: nuxt generate && gh-pages --dotfiles -d .output/public
+
+  deploy:
+    # Add a dependency to the build job
+    needs: build
+    # Grant GITHUB_TOKEN the permissions required to make a Pages deployment
+    permissions:
+      pages: write # to deploy to Pages
+      id-token: write # to verify the deployment originates from an appropriate source
+    # Deploy to the github_pages environment
+    environment:
+      name: github_pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    # Specify runner + deployment step
+    runs-on: ubuntu-latest
+    steps:
+    - name: Deploy to GitHub Pages
+      id: deployment
+      uses: actions/deploy-pages@v4
