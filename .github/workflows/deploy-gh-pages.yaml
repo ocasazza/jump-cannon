@@ -1,0 +1,47 @@
+# https://github.com/actions/deploy-pages#usage
+name: Deploy to GitHub Pages
+on:
+  workflow_dispatch:
+  push:
+    branches:
+    - main
+jobs:
+
+  build:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        submodules: true
+    - run: corepack enable
+    # setup wasm-pack dependencies
+    - uses: jetli/wasm-pack-action@v0.4.0
+    # setup node.js dependencies
+    - uses: actions/setup-node@v4
+    - run: npm install
+    # build wasm
+    - run: wasm-pack build ./wasm/jump-cannon --target web
+    # build vuex
+    - run: NUXT_APP_BASE_URL='https://ocasazza.github.io/kgb/' npx nuxt build --preset github_pages
+    # cache artifacts
+    - name: Upload artifact
+      uses: actions/upload-pages-artifact@v3
+      with:
+        path: ./.output/public
+
+  # Deployment job
+  deploy:
+    # Add a dependency to the build job
+    needs: build
+    # Grant GITHUB_TOKEN the permissions required to make a Pages deployment
+    permissions:
+      pages: write # to deploy to Pages
+      id-token: write # to verify the deployment originates from an appropriate source
+    # # Deploy to the github_pages environment
+    # environment:
+    #   name: github_pages
+    #   url: ${{ steps.deployment.outputs.page_url }}
+    # Specify runner + deployment step
+    runs-on: ubuntu-latest
+    steps:
+    - run: nuxt generate && gh-pages --dotfiles -d .output/public
