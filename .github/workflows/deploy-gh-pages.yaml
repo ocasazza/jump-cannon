@@ -22,8 +22,9 @@ jobs:
     # build wasm
     - run: wasm-pack build ./wasm/jump-cannon --target web
     # build vuex
-    - run: NUXT_APP_BASE_URL='https://ocasazza.github.io/kgb/' npx nuxt build --preset github_pages
+    # - run: NUXT_APP_BASE_URL='https://ocasazza.github.io/kgb/' npx nuxt build --preset github_pages
     # cache artifacts
+    - run: nuxt generate && gh-pages --dotfiles -d .output/public
     - name: Upload artifact
       uses: actions/upload-pages-artifact@v3
       with:
