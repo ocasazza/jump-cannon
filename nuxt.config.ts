@@ -2,14 +2,13 @@ import wasmPack from 'vite-plugin-wasm-pack'
 
 // https://nuxt.com/docs/api/configuration/nuxt-config
 export default defineNuxtConfig({
-  ssr: false,
+  ssr: true,
   app: {
     head: {
       title: 'kbg',
       meta: [
         { charset: 'utf-8' },
         { name: 'viewport', content: 'width=device-width, initial-scale=1' },
-        { hid: 'description', name: 'description', content: 'Dario Tecchia\' personal website!' },
         { name: 'format-detection', content: 'telephone=no' }
       ],
       link: [
@@ -31,6 +30,7 @@ export default defineNuxtConfig({
   nitro: {
     prerender: {
       // Workaround for "Error: [404] Page not found: /manifest.json"
+      routes: ["/"],
       failOnError: false,
     },
   },
