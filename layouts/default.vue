@@ -61,58 +61,28 @@
       </div>
     </div>
 
-    <!-- Command Palette (hidden by default) -->
-    <CommandPalette v-if="isCommandPaletteOpen" @close="closeCommandPalette" />
+    <!-- Command Palette is now managed in app.vue -->
   </div>
 </template>
 
 <script setup lang="ts">
-import { ref, onMounted, onBeforeUnmount, defineAsyncComponent } from 'vue';
+import { onMounted } from 'vue';
 import { useThemeStore } from '~/stores/theme';
 import { useUIStore } from '~/stores/ui';
 import ActivityBar from '~/components/sidebar/ActivityBar.vue';
-
-// Import components
-const CommandPalette = defineAsyncComponent(() => import('~/components/CommandPalette.vue'));
 
 // Stores
 const themeStore = useThemeStore();
 const uiStore = useUIStore();
 
-// Command palette state
-const isCommandPaletteOpen = ref(false);
-
-
-// Command palette functions
+// Command palette functions - now using the global app.vue instance
 function openCommandPalette() {
-  isCommandPaletteOpen.value = true;
+  // Emit a global event that app.vue can listen for
+  window.dispatchEvent(new CustomEvent('open-command-palette'));
 }
 
-function closeCommandPalette() {
-  isCommandPaletteOpen.value = false;
-}
-
-// Keyboard shortcut for command palette
-function handleKeyDown(event: KeyboardEvent) {
-  // Ctrl+P or Cmd+P
-  if ((event.ctrlKey || event.metaKey) && event.key === 'p') {
-    event.preventDefault();
-    openCommandPalette();
-  }
-  
-  // Escape to close command palette
-  if (event.key === 'Escape' && isCommandPaletteOpen.value) {
-    closeCommandPalette();
-  }
-}
-
-// Add and remove event listeners
+// Initialize UI store
 onMounted(() => {
-  window.addEventListener('keydown', handleKeyDown);
   uiStore.initialize();
-});
-
-onBeforeUnmount(() => {
-  window.removeEventListener('keydown', handleKeyDown);
 });
 </script>

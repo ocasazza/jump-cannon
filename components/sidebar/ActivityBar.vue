@@ -54,31 +54,115 @@
           <!-- Info Tab -->
           <SidebarInfo v-else-if="uiStore.sidebarActiveTab === 'info'" />
           
-          <!-- Settings Tab (placeholder) -->
-          <div v-else-if="uiStore.sidebarActiveTab === 'settings'" class="h-full overflow-y-auto p-4">
-            <h2 class="text-lg font-bold mb-3">Settings</h2>
-            <div class="mb-4">
-              <div class="flex items-center justify-between mb-2">
-                <span class="text-sm">Theme</span>
-                <button 
-                  @click="toggleTheme" 
-                  class="px-2 py-1 bg-bg-tertiary dark:bg-bg-dark-tertiary rounded text-sm"
-                >
-                  {{ themeStore.mode === 'light' ? 'Light' : 'Dark' }}
-                </button>
+          <!-- Settings Tab -->
+          <div v-else-if="uiStore.sidebarActiveTab === 'settings'" class="h-full overflow-y-auto">
+            <div class="p-4">
+              <h2 class="text-lg font-bold mb-3">Settings</h2>
+              
+              <!-- UI Settings -->
+              <div class="mb-4">
+                <h3 class="text-sm font-bold mb-2 text-text-secondary dark:text-text-dark-secondary">UI Settings</h3>
+                <div class="space-y-2">
+                  <div class="flex items-center justify-between mb-2">
+                    <span class="text-sm">Theme</span>
+                    <button 
+                      @click="toggleTheme" 
+                      class="px-2 py-1 bg-bg-tertiary dark:bg-bg-dark-tertiary rounded text-sm"
+                    >
+                      {{ themeStore.mode === 'light' ? 'Light' : 'Dark' }}
+                    </button>
+                  </div>
+                  <div class="flex items-center justify-between mb-2">
+                    <span class="text-sm">Sidebar Position</span>
+                    <button 
+                      @click="uiStore.toggleSidebarPosition" 
+                      class="px-2 py-1 bg-bg-tertiary dark:bg-bg-dark-tertiary rounded text-sm"
+                    >
+                      {{ uiStore.sidebarPosition === 'left' ? 'Left' : 'Right' }}
+                    </button>
+                  </div>
+                  <div class="flex items-center justify-between mb-2">
+                    <span class="text-sm">Sidebar Width</span>
+                    <div class="text-sm">{{ uiStore.sidebarWidth }}px</div>
+                  </div>
+                </div>
               </div>
-              <div class="flex items-center justify-between mb-2">
-                <span class="text-sm">Sidebar Position</span>
-                <button 
-                  @click="uiStore.toggleSidebarPosition" 
-                  class="px-2 py-1 bg-bg-tertiary dark:bg-bg-dark-tertiary rounded text-sm"
-                >
-                  {{ uiStore.sidebarPosition === 'left' ? 'Left' : 'Right' }}
-                </button>
-              </div>
-              <div class="flex items-center justify-between mb-2">
-                <span class="text-sm">Sidebar Width</span>
-                <div class="text-sm">{{ uiStore.sidebarWidth }}px</div>
+              
+              <!-- Workspace Settings -->
+              <div class="mb-4">
+                <h3 class="text-sm font-bold mb-2 text-text-secondary dark:text-text-dark-secondary">Workspace Settings</h3>
+                <div class="space-y-4">
+                  <!-- Font Size Setting -->
+                  <div class="setting-item">
+                    <label class="block text-sm font-medium mb-1">Font Size</label>
+                    <div class="flex items-center">
+                      <button 
+                        @click="decreaseFontSize" 
+                        class="px-2 py-1 bg-bg-tertiary dark:bg-bg-dark-tertiary rounded-l"
+                        :disabled="settingsStore.settings.fontSize <= 8"
+                      >
+                        <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4" viewBox="0 0 20 20" fill="currentColor">
+                          <path fill-rule="evenodd" d="M3 10a1 1 0 011-1h12a1 1 0 110 2H4a1 1 0 01-1-1z" clip-rule="evenodd" />
+                        </svg>
+                      </button>
+                      <input 
+                        v-model.number="fontSize" 
+                        type="number" 
+                        min="8" 
+                        max="32" 
+                        class="w-16 text-center py-1 bg-bg-secondary dark:bg-bg-dark-secondary border-y border-border dark:border-border-dark"
+                        @change="updateFontSize"
+                      />
+                      <button 
+                        @click="increaseFontSize" 
+                        class="px-2 py-1 bg-bg-tertiary dark:bg-bg-dark-tertiary rounded-r"
+                        :disabled="settingsStore.settings.fontSize >= 32"
+                      >
+                        <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4" viewBox="0 0 20 20" fill="currentColor">
+                          <path fill-rule="evenodd" d="M10 3a1 1 0 011 1v5h5a1 1 0 110 2h-5v5a1 1 0 11-2 0v-5H4a1 1 0 110-2h5V4a1 1 0 011-1z" clip-rule="evenodd" />
+                        </svg>
+                      </button>
+                    </div>
+                  </div>
+                  
+                  <!-- Font Family Setting -->
+                  <div class="setting-item">
+                    <label class="block text-sm font-medium mb-1">Font Family</label>
+                    <select 
+                      v-model="fontFamily" 
+                      class="w-full p-2 bg-bg-secondary dark:bg-bg-dark-secondary border border-border dark:border-border-dark rounded"
+                      @change="updateFontFamily"
+                    >
+                      <option value="monospace">Monospace</option>
+                      <option value="sans-serif">Sans Serif</option>
+                      <option value="serif">Serif</option>
+                    </select>
+                  </div>
+                  
+                  <!-- Line Numbers Setting -->
+                  <div class="setting-item">
+                    <div class="flex items-center">
+                      <input 
+                        id="show-line-numbers" 
+                        v-model="showLineNumbers" 
+                        type="checkbox"
+                        class="mr-2"
+                        @change="updateShowLineNumbers"
+                      />
+                      <label for="show-line-numbers" class="text-sm font-medium">Show Line Numbers</label>
+                    </div>
+                  </div>
+                  
+                  <!-- Actions -->
+                  <div class="setting-item pt-4 border-t border-border dark:border-border-dark">
+                    <button 
+                      @click="resetSettings" 
+                      class="px-3 py-1 bg-bg-tertiary dark:bg-bg-dark-tertiary rounded hover:bg-opacity-80 text-sm"
+                    >
+                      Reset to Defaults
+                    </button>
+                  </div>
+                </div>
               </div>
             </div>
           </div>
@@ -122,31 +206,115 @@
           <!-- Info Tab -->
           <SidebarInfo v-else-if="uiStore.sidebarActiveTab === 'info'" />
           
-          <!-- Settings Tab (placeholder) -->
-          <div v-else-if="uiStore.sidebarActiveTab === 'settings'" class="h-full overflow-y-auto p-4">
-            <h2 class="text-lg font-bold mb-3">Settings</h2>
-            <div class="mb-4">
-              <div class="flex items-center justify-between mb-2">
-                <span class="text-sm">Theme</span>
-                <button 
-                  @click="toggleTheme" 
-                  class="px-2 py-1 bg-bg-tertiary dark:bg-bg-dark-tertiary rounded text-sm"
-                >
-                  {{ themeStore.mode === 'light' ? 'Light' : 'Dark' }}
-                </button>
+          <!-- Settings Tab -->
+          <div v-else-if="uiStore.sidebarActiveTab === 'settings'" class="h-full overflow-y-auto">
+            <div class="p-4">
+              <h2 class="text-lg font-bold mb-3">Settings</h2>
+              
+              <!-- UI Settings -->
+              <div class="mb-4">
+                <h3 class="text-sm font-bold mb-2 text-text-secondary dark:text-text-dark-secondary">UI Settings</h3>
+                <div class="space-y-2">
+                  <div class="flex items-center justify-between mb-2">
+                    <span class="text-sm">Theme</span>
+                    <button 
+                      @click="toggleTheme" 
+                      class="px-2 py-1 bg-bg-tertiary dark:bg-bg-dark-tertiary rounded text-sm"
+                    >
+                      {{ themeStore.mode === 'light' ? 'Light' : 'Dark' }}
+                    </button>
+                  </div>
+                  <div class="flex items-center justify-between mb-2">
+                    <span class="text-sm">Sidebar Position</span>
+                    <button 
+                      @click="uiStore.toggleSidebarPosition" 
+                      class="px-2 py-1 bg-bg-tertiary dark:bg-bg-dark-tertiary rounded text-sm"
+                    >
+                      {{ uiStore.sidebarPosition === 'left' ? 'Left' : 'Right' }}
+                    </button>
+                  </div>
+                  <div class="flex items-center justify-between mb-2">
+                    <span class="text-sm">Sidebar Width</span>
+                    <div class="text-sm">{{ uiStore.sidebarWidth }}px</div>
+                  </div>
+                </div>
               </div>
-              <div class="flex items-center justify-between mb-2">
-                <span class="text-sm">Sidebar Position</span>
-                <button 
-                  @click="uiStore.toggleSidebarPosition" 
-                  class="px-2 py-1 bg-bg-tertiary dark:bg-bg-dark-tertiary rounded text-sm"
-                >
-                  {{ uiStore.sidebarPosition === 'left' ? 'Left' : 'Right' }}
-                </button>
-              </div>
-              <div class="flex items-center justify-between mb-2">
-                <span class="text-sm">Sidebar Width</span>
-                <div class="text-sm">{{ uiStore.sidebarWidth }}px</div>
+              
+              <!-- Workspace Settings -->
+              <div class="mb-4">
+                <h3 class="text-sm font-bold mb-2 text-text-secondary dark:text-text-dark-secondary">Workspace Settings</h3>
+                <div class="space-y-4">
+                  <!-- Font Size Setting -->
+                  <div class="setting-item">
+                    <label class="block text-sm font-medium mb-1">Font Size</label>
+                    <div class="flex items-center">
+                      <button 
+                        @click="decreaseFontSize" 
+                        class="px-2 py-1 bg-bg-tertiary dark:bg-bg-dark-tertiary rounded-l"
+                        :disabled="settingsStore.settings.fontSize <= 8"
+                      >
+                        <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4" viewBox="0 0 20 20" fill="currentColor">
+                          <path fill-rule="evenodd" d="M3 10a1 1 0 011-1h12a1 1 0 110 2H4a1 1 0 01-1-1z" clip-rule="evenodd" />
+                        </svg>
+                      </button>
+                      <input 
+                        v-model.number="fontSize" 
+                        type="number" 
+                        min="8" 
+                        max="32" 
+                        class="w-16 text-center py-1 bg-bg-secondary dark:bg-bg-dark-secondary border-y border-border dark:border-border-dark"
+                        @change="updateFontSize"
+                      />
+                      <button 
+                        @click="increaseFontSize" 
+                        class="px-2 py-1 bg-bg-tertiary dark:bg-bg-dark-tertiary rounded-r"
+                        :disabled="settingsStore.settings.fontSize >= 32"
+                      >
+                        <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4" viewBox="0 0 20 20" fill="currentColor">
+                          <path fill-rule="evenodd" d="M10 3a1 1 0 011 1v5h5a1 1 0 110 2h-5v5a1 1 0 11-2 0v-5H4a1 1 0 110-2h5V4a1 1 0 011-1z" clip-rule="evenodd" />
+                        </svg>
+                      </button>
+                    </div>
+                  </div>
+                  
+                  <!-- Font Family Setting -->
+                  <div class="setting-item">
+                    <label class="block text-sm font-medium mb-1">Font Family</label>
+                    <select 
+                      v-model="fontFamily" 
+                      class="w-full p-2 bg-bg-secondary dark:bg-bg-dark-secondary border border-border dark:border-border-dark rounded"
+                      @change="updateFontFamily"
+                    >
+                      <option value="monospace">Monospace</option>
+                      <option value="sans-serif">Sans Serif</option>
+                      <option value="serif">Serif</option>
+                    </select>
+                  </div>
+                  
+                  <!-- Line Numbers Setting -->
+                  <div class="setting-item">
+                    <div class="flex items-center">
+                      <input 
+                        id="show-line-numbers-right" 
+                        v-model="showLineNumbers" 
+                        type="checkbox"
+                        class="mr-2"
+                        @change="updateShowLineNumbers"
+                      />
+                      <label for="show-line-numbers-right" class="text-sm font-medium">Show Line Numbers</label>
+                    </div>
+                  </div>
+                  
+                  <!-- Actions -->
+                  <div class="setting-item pt-4 border-t border-border dark:border-border-dark">
+                    <button 
+                      @click="resetSettings" 
+                      class="px-3 py-1 bg-bg-tertiary dark:bg-bg-dark-tertiary rounded hover:bg-opacity-80 text-sm"
+                    >
+                      Reset to Defaults
+                    </button>
+                  </div>
+                </div>
               </div>
             </div>
           </div>
@@ -175,9 +343,10 @@
 </template>
 
 <script setup lang="ts">
-import { onMounted, onBeforeUnmount, computed } from 'vue';
+import { onMounted, onBeforeUnmount, computed, ref, watch } from 'vue';
 import { useUIStore } from '~/stores/ui';
 import { useThemeStore } from '~/stores/theme';
+import { useSettingsStore } from '~/stores/settings';
 import SearchTab from './SearchTab.vue';
 import InfoTab from './InfoTab.vue';
 import SettingsTab from './SettingsTab.vue';
@@ -186,6 +355,19 @@ import SidebarInfo from '~/components/SidebarInfo.vue';
 // Stores
 const uiStore = useUIStore();
 const themeStore = useThemeStore();
+const settingsStore = useSettingsStore();
+
+// Settings state
+const fontSize = ref(settingsStore.settings.fontSize);
+const fontFamily = ref(settingsStore.settings.fontFamily);
+const showLineNumbers = ref(settingsStore.settings.showLineNumbers);
+
+// Watch for settings changes
+watch(() => settingsStore.settings, (newSettings) => {
+  fontSize.value = newSettings.fontSize;
+  fontFamily.value = newSettings.fontFamily;
+  showLineNumbers.value = newSettings.showLineNumbers;
+}, { deep: true });
 
 // Computed properties
 const isLeftSidebar = computed(() => uiStore.sidebarPosition === 'left');
@@ -259,9 +441,47 @@ onBeforeUnmount(() => {
   document.removeEventListener('mouseup', stopResize);
 });
 
+// Settings methods
+function updateFontSize() {
+  if (fontSize.value < 8) fontSize.value = 8;
+  if (fontSize.value > 32) fontSize.value = 32;
+  settingsStore.updateSetting('fontSize', fontSize.value);
+}
+
+function increaseFontSize() {
+  if (fontSize.value < 32) {
+    fontSize.value++;
+    updateFontSize();
+  }
+}
+
+function decreaseFontSize() {
+  if (fontSize.value > 8) {
+    fontSize.value--;
+    updateFontSize();
+  }
+}
+
+function updateFontFamily() {
+  settingsStore.updateSetting('fontFamily', fontFamily.value);
+}
+
+function updateShowLineNumbers() {
+  settingsStore.updateSetting('showLineNumbers', showLineNumbers.value);
+}
+
+function resetSettings() {
+  settingsStore.resetSettings();
+}
+
 // Initialize UI store
 onMounted(() => {
   uiStore.initialize();
+  
+  // Initialize settings
+  fontSize.value = settingsStore.settings.fontSize;
+  fontFamily.value = settingsStore.settings.fontFamily;
+  showLineNumbers.value = settingsStore.settings.showLineNumbers;
 });
 </script>
 

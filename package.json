@@ -30,6 +30,7 @@
     "@pinia/nuxt": "^0.11.0",
     "@types/uuid": "^10.0.0",
     "bootstrap-vue-3": "^0.5.1",
+    "fuse.js": "^7.1.0",
     "pinia": "^3.0.2",
     "uuid": "^11.1.0"
   }
