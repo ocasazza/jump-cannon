@@ -16,7 +16,7 @@
       </div>
       
       <div class="command-results">
-        <div v-if="filteredActions.length === 0" class="p-4 text-[var(--color-text-tertiary)] text-center">
+        <div v-if="filteredActions.length === 0" class="p-4 text-text-tertiary dark:text-text-dark-tertiary text-center">
           No matching actions found
         </div>
         <div v-else>
@@ -32,9 +32,9 @@
           >
             <div class="flex-1">
               <div class="font-medium">{{ action.title }}</div>
-              <div class="text-xs text-[var(--color-text-secondary)]">{{ action.description }}</div>
+              <div class="text-xs text-text-secondary dark:text-text-dark-secondary">{{ action.description }}</div>
             </div>
-            <div class="text-xs px-1.5 py-0.5 bg-[var(--color-bg-tertiary)] rounded">
+            <div class="text-xs px-1.5 py-0.5 bg-bg-tertiary dark:bg-bg-dark-tertiary rounded">
               {{ action.type === ActionType.SINGLETON ? 'Singleton' : 'Multi-instance' }}
             </div>
           </div>

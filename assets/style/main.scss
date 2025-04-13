@@ -2,47 +2,9 @@
 @tailwind components;
 @tailwind utilities;
 
-:root {
-  /* Light mode colors */
-  --color-bg-primary: #ffffff;
-  --color-bg-secondary: #f3f3f3;
-  --color-bg-tertiary: #e5e5e5;
-  
-  --color-text-primary: #333333;
-  --color-text-secondary: #5a5a5a;
-  --color-text-tertiary: #767676;
-  
-  --color-border: #d4d4d4;
-  --color-border-active: #0078D4;
-  
-  --color-accent: #1AAF5C;
-  --color-error: #e51400;
-  --color-warning: #ff8c00;
-  --color-info: #0078D4;
-}
-
-.dark {
-  /* Dark mode colors */
-  --color-bg-primary: #1e1e1e;
-  --color-bg-secondary: #252526;
-  --color-bg-tertiary: #333333;
-  
-  --color-text-primary: #ffffff;
-  --color-text-secondary: #cccccc;
-  --color-text-tertiary: #9d9d9d;
-  
-  --color-border: #474747;
-  --color-border-active: #0078D4;
-  
-  --color-accent: #1AAF5C;
-  --color-error: #f48771;
-  --color-warning: #cca700;
-  --color-info: #75beff;
-}
-
 @layer base {
   html, body {
-    @apply bg-[var(--color-bg-primary)] text-[var(--color-text-primary)] min-h-screen h-full;
+    @apply bg-bg-primary dark:bg-bg-dark-primary text-text-primary dark:text-text-dark-primary min-h-screen h-full;
     font-family: 'Segoe UI', system-ui, sans-serif;
   }
   
@@ -72,27 +34,27 @@
   
   /* VSCode-inspired components */
   .activity-bar {
-    @apply bg-[var(--color-bg-tertiary)] w-12 flex flex-col items-center py-2 border-r border-[var(--color-border)];
+    @apply bg-bg-tertiary dark:bg-bg-dark-tertiary w-12 flex flex-col items-center py-2 border-r border-border dark:border-border-dark;
   }
   
   .side-bar {
-    @apply bg-[var(--color-bg-secondary)] w-64 border-r border-[var(--color-border)];
+    @apply bg-bg-secondary dark:bg-bg-dark-secondary w-64 border-r border-border dark:border-border-dark;
   }
   
   .editor-area {
-    @apply bg-[var(--color-bg-primary)] flex-grow;
+    @apply bg-bg-primary dark:bg-bg-dark-primary flex-grow;
   }
   
   .status-bar {
-    @apply bg-[var(--color-bg-tertiary)] h-6 border-t border-[var(--color-border)] flex items-center px-2 text-xs text-[var(--color-text-tertiary)];
+    @apply bg-bg-tertiary dark:bg-bg-dark-tertiary h-6 border-t border-border dark:border-border-dark flex items-center px-2 text-xs text-text-tertiary dark:text-text-dark-tertiary;
   }
   
   .command-palette {
-    @apply fixed top-1/4 left-1/2 transform -translate-x-1/2 w-[600px] max-w-[80vw] bg-[var(--color-bg-secondary)] shadow-lg rounded-md border border-[var(--color-border)] z-50;
+    @apply fixed top-1/4 left-1/2 transform -translate-x-1/2 w-[600px] max-w-[80vw] bg-bg-secondary dark:bg-bg-dark-secondary shadow-lg rounded-md border border-border dark:border-border-dark z-50;
   }
   
   .command-input {
-    @apply w-full bg-[var(--color-bg-secondary)] text-[var(--color-text-primary)] p-3 border-b border-[var(--color-border)] rounded-t-md;
+    @apply w-full bg-bg-secondary dark:bg-bg-dark-secondary text-text-primary dark:text-text-dark-primary p-3 border-b border-border dark:border-border-dark rounded-t-md;
   }
   
   .command-results {
@@ -100,10 +62,19 @@
   }
   
   .command-item {
-    @apply p-2 px-3 flex items-center gap-2 hover:bg-[var(--color-bg-tertiary)] cursor-pointer;
+    @apply p-2 px-3 flex items-center gap-2 hover:bg-bg-tertiary dark:hover:bg-bg-dark-tertiary cursor-pointer;
   }
   
   .command-item.active {
-    @apply bg-[var(--color-bg-tertiary)];
+    @apply bg-bg-tertiary dark:bg-bg-dark-tertiary;
+  }
+  
+  /* Resize feedback */
+  .resizing-sidebar {
+    cursor: ew-resize !important;
+    
+    * {
+      user-select: none !important;
+    }
   }
 }

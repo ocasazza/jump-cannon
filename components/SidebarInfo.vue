@@ -4,57 +4,57 @@
       <h2 class="text-lg font-bold mb-3">Actions Information</h2>
       
       <div class="mb-4">
-        <h3 class="text-sm font-bold mb-2 text-[var(--color-text-secondary)]">About Actions</h3>
+        <h3 class="text-sm font-bold mb-2 text-text-secondary dark:text-text-dark-secondary">About Actions</h3>
         <p class="text-sm mb-2">
           Actions are commands that can be executed through the command palette.
           They provide a generic interface for interacting with the application.
         </p>
         <p class="text-sm mb-2">
-          Press <kbd class="bg-[var(--color-bg-tertiary)] px-1 py-0.5 rounded text-xs">Ctrl+P</kbd> 
-          or <kbd class="bg-[var(--color-bg-tertiary)] px-1 py-0.5 rounded text-xs">Cmd+P</kbd> 
+          Press <kbd class="bg-bg-tertiary dark:bg-bg-dark-tertiary px-1 py-0.5 rounded text-xs">Ctrl+P</kbd> 
+          or <kbd class="bg-bg-tertiary dark:bg-bg-dark-tertiary px-1 py-0.5 rounded text-xs">Cmd+P</kbd> 
           to open the command palette.
         </p>
       </div>
       
       <div class="mb-4">
-        <h3 class="text-sm font-bold mb-2 text-[var(--color-text-secondary)]">Action Types</h3>
+        <h3 class="text-sm font-bold mb-2 text-text-secondary dark:text-text-dark-secondary">Action Types</h3>
         <div class="text-sm mb-2">
           <div class="flex items-center gap-2 mb-1">
-            <span class="text-xs px-1.5 py-0.5 bg-[var(--color-bg-tertiary)] rounded">Singleton</span>
+            <span class="text-xs px-1.5 py-0.5 bg-bg-tertiary dark:bg-bg-dark-tertiary rounded">Singleton</span>
             <span>Can only be applied once per workspace</span>
           </div>
           <div class="flex items-center gap-2">
-            <span class="text-xs px-1.5 py-0.5 bg-[var(--color-bg-tertiary)] rounded">Multi-instance</span>
+            <span class="text-xs px-1.5 py-0.5 bg-bg-tertiary dark:bg-bg-dark-tertiary rounded">Multi-instance</span>
             <span>Can be applied multiple times</span>
           </div>
         </div>
       </div>
       
       <div class="mb-4">
-        <h3 class="text-sm font-bold mb-2 text-[var(--color-text-secondary)]">Available Actions</h3>
-        <div v-for="action in actions" :key="action.id" class="mb-3 border-b border-[var(--color-border)] pb-2">
+        <h3 class="text-sm font-bold mb-2 text-text-secondary dark:text-text-dark-secondary">Available Actions</h3>
+        <div v-for="action in actions" :key="action.id" class="mb-3 border-b border-border dark:border-border-dark pb-2">
           <div class="flex items-center justify-between mb-1">
             <span class="font-medium">{{ action.title }}</span>
-            <span class="text-xs px-1.5 py-0.5 bg-[var(--color-bg-tertiary)] rounded">
+            <span class="text-xs px-1.5 py-0.5 bg-bg-tertiary dark:bg-bg-dark-tertiary rounded">
               {{ action.type === ActionType.SINGLETON ? 'Singleton' : 'Multi-instance' }}
             </span>
           </div>
-          <p class="text-xs text-[var(--color-text-secondary)] mb-1">{{ action.description }}</p>
-          <div class="text-xs text-[var(--color-text-tertiary)]">
+          <p class="text-xs text-text-secondary dark:text-text-dark-secondary mb-1">{{ action.description }}</p>
+          <div class="text-xs text-text-tertiary dark:text-text-dark-tertiary">
             Keywords: {{ action.keywords.join(', ') }}
           </div>
         </div>
       </div>
       
       <div class="mb-4">
-        <h3 class="text-sm font-bold mb-2 text-[var(--color-text-secondary)]">Active Instances</h3>
+        <h3 class="text-sm font-bold mb-2 text-text-secondary dark:text-text-dark-secondary">Active Instances</h3>
         <div v-if="activeInstances.length > 0">
           <div v-for="instance in activeInstances" :key="instance.id" class="mb-2 text-sm">
             <div class="font-medium">{{ getActionTitle(instance.actionId) }}</div>
-            <pre class="text-xs bg-[var(--color-bg-tertiary)] p-1 rounded overflow-x-auto mt-1">{{ JSON.stringify(instance.state, null, 2) }}</pre>
+            <pre class="text-xs bg-bg-tertiary dark:bg-bg-dark-tertiary p-1 rounded overflow-x-auto mt-1">{{ JSON.stringify(instance.state, null, 2) }}</pre>
           </div>
         </div>
-        <div v-else class="text-sm text-[var(--color-text-tertiary)]">
+        <div v-else class="text-sm text-text-tertiary dark:text-text-dark-tertiary">
           No active instances. Use the command palette to execute actions.
         </div>
       </div>

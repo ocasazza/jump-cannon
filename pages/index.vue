@@ -2,13 +2,13 @@
   <div class="p-6 h-full min-h-full">
     <div class="mb-6">
       <h1 class="text-2xl font-bold mb-2">KBG Command Palette</h1>
-      <p class="text-[var(--color-text-secondary)] mb-4">
+      <p class="text-text-secondary dark:text-text-dark-secondary mb-4">
         A VSCode-inspired UI with a command palette for executing actions
       </p>
       
-      <div class="bg-[var(--color-bg-tertiary)] p-4 rounded mb-6">
-        <p class="mb-2">Press <kbd class="bg-[var(--color-bg-secondary)] px-2 py-1 rounded">Ctrl+P</kbd> or <kbd class="bg-[var(--color-bg-secondary)] px-2 py-1 rounded">Cmd+P</kbd> to open the command palette</p>
-        <p>Or click the <kbd class="bg-[var(--color-bg-secondary)] px-2 py-1 rounded">Ctrl+P</kbd> button in the status bar</p>
+      <div class="bg-bg-tertiary dark:bg-bg-dark-tertiary p-4 rounded mb-6">
+        <p class="mb-2">Press <kbd class="bg-bg-secondary dark:bg-bg-dark-secondary px-2 py-1 rounded">Ctrl+P</kbd> or <kbd class="bg-bg-secondary dark:bg-bg-dark-secondary px-2 py-1 rounded">Cmd+P</kbd> to open the command palette</p>
+        <p>Or click the <kbd class="bg-bg-secondary dark:bg-bg-dark-secondary px-2 py-1 rounded">Ctrl+P</kbd> button in the status bar</p>
       </div>
     </div>
     
@@ -16,19 +16,19 @@
       <h2 class="text-xl font-bold mb-2">Available Actions</h2>
       <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
         <div v-for="action in actions" :key="action.id" 
-             class="bg-[var(--color-bg-secondary)] p-4 rounded border border-[var(--color-border)] hover:border-[var(--color-border-active)] cursor-pointer"
+             class="bg-bg-secondary dark:bg-bg-dark-secondary p-4 rounded border border-border dark:border-border-dark hover:border-border-active dark:hover:border-border-dark-active cursor-pointer"
              @click="executeAction(action.id)">
           <div class="flex items-center justify-between mb-2">
             <h3 class="font-bold">{{ action.title }}</h3>
-            <span v-if="action.type === ActionType.SINGLETON" class="text-xs px-2 py-1 bg-[var(--color-bg-tertiary)] rounded">
+            <span v-if="action.type === ActionType.SINGLETON" class="text-xs px-2 py-1 bg-bg-tertiary dark:bg-bg-dark-tertiary rounded">
               Singleton
             </span>
-            <span v-else class="text-xs px-2 py-1 bg-[var(--color-bg-tertiary)] rounded">
+            <span v-else class="text-xs px-2 py-1 bg-bg-tertiary dark:bg-bg-dark-tertiary rounded">
               Multi-instance
             </span>
           </div>
-          <p class="text-sm text-[var(--color-text-secondary)]">{{ action.description }}</p>
-          <div class="mt-2 text-xs text-[var(--color-text-tertiary)]">
+          <p class="text-sm text-text-secondary dark:text-text-dark-secondary">{{ action.description }}</p>
+          <div class="mt-2 text-xs text-text-tertiary dark:text-text-dark-tertiary">
             Keywords: {{ action.keywords.join(', ') }}
           </div>
         </div>
@@ -39,20 +39,20 @@
       <h2 class="text-xl font-bold mb-2">Active Instances</h2>
       <div v-if="activeInstances.length > 0" class="space-y-2">
         <div v-for="instance in activeInstances" :key="instance.id" 
-             class="bg-[var(--color-bg-secondary)] p-4 rounded border border-[var(--color-border)]">
+             class="bg-bg-secondary dark:bg-bg-dark-secondary p-4 rounded border border-border dark:border-border-dark">
           <div class="flex items-center justify-between">
             <div>
               <h3 class="font-bold">{{ getActionTitle(instance.actionId) }}</h3>
-              <pre class="mt-2 text-xs bg-[var(--color-bg-tertiary)] p-2 rounded overflow-x-auto">{{ JSON.stringify(instance.state, null, 2) }}</pre>
+              <pre class="mt-2 text-xs bg-bg-tertiary dark:bg-bg-dark-tertiary p-2 rounded overflow-x-auto">{{ JSON.stringify(instance.state, null, 2) }}</pre>
             </div>
             <button @click="removeInstance(instance.id)" 
-                    class="text-[var(--color-error)] hover:underline">
+                    class="text-error dark:text-error-dark hover:underline">
               Remove
             </button>
           </div>
         </div>
       </div>
-      <div v-else class="bg-[var(--color-bg-secondary)] p-4 rounded border border-[var(--color-border)] text-[var(--color-text-tertiary)]">
+      <div v-else class="bg-bg-secondary dark:bg-bg-dark-secondary p-4 rounded border border-border dark:border-border-dark text-text-tertiary dark:text-text-dark-tertiary">
         No active instances. Use the command palette to execute actions.
       </div>
     </div>
@@ -67,8 +67,7 @@ import { useActionsStore, ActionType } from '~/stores/actions';
 // Initialize WASM - wrapped in try/catch for safety
 onMounted(() => {
   try {
-    const { greet } = useWasmStore();
-    greet();
+    useWasmStore();
   } catch (error) {
     console.error('Failed to call WASM greet function:', error);
   }

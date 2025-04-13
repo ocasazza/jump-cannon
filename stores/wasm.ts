@@ -2,11 +2,9 @@ import { defineStore } from 'pinia'
 import initJumpCannon, { greet } from '~/wasm/jump-cannon/pkg/jump_cannon'
 
 export const useWasmStore = defineStore('wasm', () => {
-  const isLoaded = ref(false);
 
-  async function init (): Promise<void> {
+  async function initialize (): Promise<void> {
     await initJumpCannon()
-    isLoaded.value = true;
   }
 
   function dispose () {}
@@ -14,7 +12,6 @@ export const useWasmStore = defineStore('wasm', () => {
   return {
     greet,
     dispose,
-    init,
-    isLoaded,
+    initialize,
   }
 });

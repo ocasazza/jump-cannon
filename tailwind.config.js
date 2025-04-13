@@ -12,7 +12,36 @@ module.exports = {
   theme: {
     extend: {
       colors: {
-        // Light mode colors
+        // Theme colors
+        'bg': {
+          primary: '#ffffff',
+          secondary: '#f3f3f3',
+          tertiary: '#e5e5e5',
+          dark: {
+            primary: '#1e1e1e',
+            secondary: '#252526',
+            tertiary: '#333333',
+          }
+        },
+        'text': {
+          primary: '#333333',
+          secondary: '#5a5a5a',
+          tertiary: '#767676',
+          dark: {
+            primary: '#ffffff',
+            secondary: '#cccccc',
+            tertiary: '#9d9d9d',
+          }
+        },
+        'border': {
+          DEFAULT: '#d4d4d4',
+          active: '#0078D4',
+          dark: {
+            DEFAULT: '#474747',
+            active: '#0078D4',
+          }
+        },
+        // Semantic colors
         'primary': {
           DEFAULT: '#0078D4', // VSCode blue
           '50': '#E6F2FA',
@@ -52,7 +81,18 @@ module.exports = {
           '800': '#0A4625',
           '900': '#052312',
         },
-        // Dark mode specific colors will be handled via CSS variables
+        'error': {
+          DEFAULT: '#e51400',
+          dark: '#f48771',
+        },
+        'warning': {
+          DEFAULT: '#ff8c00',
+          dark: '#cca700',
+        },
+        'info': {
+          DEFAULT: '#0078D4',
+          dark: '#75beff',
+        },
       },
       fontFamily: {
         'mono': ['Menlo', 'Monaco', 'Consolas', 'monospace'],
