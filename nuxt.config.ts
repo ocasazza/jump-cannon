@@ -36,7 +36,7 @@ export default defineNuxtConfig({
   css: [
     '~/assets/style/main.scss',
   ],
-  
+
   plugins: [
     '~/plugins/register-actions',
   ],

@@ -1,7 +1,7 @@
 import { defineStore } from 'pinia';
 import { ref } from 'vue';
 
-export type SidebarTab = 'search' | 'info' | 'settings';
+export type SidebarTab = 'search' | 'info' | 'settings' | 'file';
 export type SidebarPosition = 'left' | 'right';
 
 export const useUIStore = defineStore('ui', () => {

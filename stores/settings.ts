@@ -1,13 +1,5 @@
 import { defineStore } from 'pinia';
-
-// Define the settings interface
-export interface WorkspaceSettings {
-  fontSize: number;
-  fontFamily: string;
-  showLineNumbers: boolean;
-  // Add more settings as needed
-}
-
+import type { WorkspaceSettings } from './workspace.ts';
 // Define the settings store
 export const useSettingsStore = defineStore('settings', {
   state: () => ({

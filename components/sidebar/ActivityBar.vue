@@ -9,6 +9,10 @@
             :is-active="uiStore.sidebarActiveTab === 'search'" 
             @click="uiStore.setSidebarTab('search')" 
           />
+          <FileTab
+            :is-active="uiStore.sidebarActiveTab === 'file'"
+            @click="uiStore.setSidebarTab('file')"
+          />
           <InfoTab 
             :is-active="uiStore.sidebarActiveTab === 'info'" 
             @click="uiStore.setSidebarTab('info')" 
@@ -50,6 +54,9 @@
               Type to search in files
             </div>
           </div>
+          
+          <!-- File Tab -->
+          <FileOperationsTab v-else-if="uiStore.sidebarActiveTab === 'file'" />
           
           <!-- Info Tab -->
           <SidebarInfo v-else-if="uiStore.sidebarActiveTab === 'info'" />
@@ -328,6 +335,10 @@
             :is-active="uiStore.sidebarActiveTab === 'search'" 
             @click="uiStore.setSidebarTab('search')" 
           />
+          <FileTab
+            :is-active="uiStore.sidebarActiveTab === 'file'"
+            @click="uiStore.setSidebarTab('file')"
+          />
           <InfoTab 
             :is-active="uiStore.sidebarActiveTab === 'info'" 
             @click="uiStore.setSidebarTab('info')" 
@@ -350,6 +361,8 @@ import { useSettingsStore } from '~/stores/settings';
 import SearchTab from './SearchTab.vue';
 import InfoTab from './InfoTab.vue';
 import SettingsTab from './SettingsTab.vue';
+import FileTab from './FileTab.vue';
+import FileOperationsTab from './FileOperationsTab.vue';
 import SidebarInfo from '~/components/SidebarInfo.vue';
 
 // Stores
