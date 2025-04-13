@@ -210,6 +210,9 @@
             </div>
           </div>
           
+          <!-- File Tab -->
+          <FileOperationsTab v-else-if="uiStore.sidebarActiveTab === 'file'" />
+          
           <!-- Info Tab -->
           <SidebarInfo v-else-if="uiStore.sidebarActiveTab === 'info'" />
           
