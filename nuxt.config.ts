@@ -16,45 +16,30 @@ export default defineNuxtConfig({
         { rel: 'icon', type: 'image/svg', href: '/favicon.svg' }
       ]
     },
-    baseURL: ''
+    baseURL: '/kbg/',
+    buildAssetsDir: 'assets'
   },
 
   devtools: { enabled: true },
-
   modules: [
-    // '@nuxt/content',
-    // '@nuxt/eslint',
-    // '@nuxt/fonts',
-    // '@nuxt/icon',
-    // '@nuxt/image',
-    // '@nuxt/scripts',
-    // '@nuxt/test-utils'
     '@pinia/nuxt',
     '@nuxtjs/tailwindcss',
   ],
-
   css: [
     '~/assets/style/main.scss',
   ],
-
   plugins: [
     '~/plugins/register-actions',
   ],
-
   nitro: {
     prerender: {
       // Workaround for "Error: [404] Page not found: /manifest.json"
-      // routes: ["/"],
       failOnError: false,
     },
   },
-
-  // compatibilityDate: '2025-04-12',
   vite: {
     plugins: [
       wasmPack(['./wasm/jump-cannon'])
     ]
   },
-
-  compatibilityDate: '2025-04-12',
 })
