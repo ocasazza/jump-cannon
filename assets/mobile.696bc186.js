@@ -1,1 +1,0 @@
-import{m as l,o as a,f as r,K as t,j as e,q as n}from"./entry.3acfa947.js";const c={},d={class:"custom"};function u(o,s){return a(),r("div",d,[t(o.$slots,"header",{},()=>[s[0]||(s[0]=e("p",null,[e("i",null,[n("Default #header slot content for "),e("code",null,"layouts/custom.vue")])],-1))]),t(o.$slots,"default")])}const m=l(c,[["render",u]]);export{m as default};
