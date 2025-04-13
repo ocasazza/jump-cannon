@@ -23,7 +23,7 @@ jobs:
     - run: wasm-pack build ./wasm/jump-cannon --target web
     # build vuex
     - run: npm install
-    - run: NUXT_APP_BASE_URL=/kbg/ npx nuxt generate --preset github_pages && touch .output/public/.nojekyll
+    - run: npx nuxt generate --preset github_pages && touch .output/public/.nojekyll
     - name: Upload artifact
       uses: actions/upload-pages-artifact@v3
       with:
