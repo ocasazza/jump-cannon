@@ -2,24 +2,22 @@ import wasmPack from 'vite-plugin-wasm-pack'
 
 // https://nuxt.com/docs/api/configuration/nuxt-config
 export default defineNuxtConfig({
-  ssr: false,
-
-  app: {
-    head: {
-      title: 'kbg',
-      meta: [
-        { charset: 'utf-8' },
-        { name: 'viewport', content: 'width=device-width, initial-scale=1' },
-        { name: 'format-detection', content: 'telephone=no' }
-      ],
-      link: [
-        { rel: 'icon', type: 'image/svg', href: '/favicon.svg' }
-      ]
-    },
-    baseURL: ''
-  },
-
-  devtools: { enabled: true },
+  // ssr: false,
+  // app: {
+  //   head: {
+  //     title: 'kbg',
+  //     meta: [
+  //       { charset: 'utf-8' },
+  //       { name: 'viewport', content: 'width=device-width, initial-scale=1' },
+  //       { name: 'format-detection', content: 'telephone=no' }
+  //     ],
+  //     link: [
+  //       { rel: 'icon', type: 'image/svg', href: '/favicon.svg' }
+  //     ]
+  //   },
+  //   baseURL: ''
+  // },
+  // devtools: { enabled: true },
 
   modules: [
     // '@nuxt/content',
@@ -36,18 +34,17 @@ export default defineNuxtConfig({
   css: [
     '~/assets/style/main.scss',
   ],
-
   plugins: [
     '~/plugins/register-actions',
   ],
 
-  nitro: {
-    prerender: {
-      // Workaround for "Error: [404] Page not found: /manifest.json"
-      routes: ["/"],
-      failOnError: false,
-    },
-  },
+  // nitro: {
+  //   prerender: {
+  //     // Workaround for "Error: [404] Page not found: /manifest.json"
+  //     routes: ["/"],
+  //     failOnError: false,
+  //   },
+  // },
 
   vite: {
     plugins: [
@@ -55,5 +52,5 @@ export default defineNuxtConfig({
     ]
   },
 
-  compatibilityDate: '2025-04-12',
+  // compatibilityDate: '2025-04-12',
 })
