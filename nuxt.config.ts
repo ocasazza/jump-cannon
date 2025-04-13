@@ -3,6 +3,7 @@ import wasmPack from 'vite-plugin-wasm-pack'
 // https://nuxt.com/docs/api/configuration/nuxt-config
 export default defineNuxtConfig({
   ssr: false,
+
   app: {
     head: {
       title: 'kbg',
@@ -17,7 +18,9 @@ export default defineNuxtConfig({
     },
     baseURL: ''
   },
+
   devtools: { enabled: true },
+
   modules: [
     // '@nuxt/content',
     // '@nuxt/eslint',
@@ -26,7 +29,18 @@ export default defineNuxtConfig({
     // '@nuxt/image',
     // '@nuxt/scripts',
     // '@nuxt/test-utils'
+    '@pinia/nuxt',
+    '@nuxtjs/tailwindcss',
   ],
+
+  css: [
+    '~/assets/style/main.scss',
+  ],
+  
+  plugins: [
+    '~/plugins/register-actions',
+  ],
+
   nitro: {
     prerender: {
       // Workaround for "Error: [404] Page not found: /manifest.json"
@@ -34,9 +48,12 @@ export default defineNuxtConfig({
       failOnError: false,
     },
   },
+
   vite: {
     plugins: [
       wasmPack(['./wasm/jump-cannon'])
     ]
   },
+
+  compatibilityDate: '2025-04-12',
 })
