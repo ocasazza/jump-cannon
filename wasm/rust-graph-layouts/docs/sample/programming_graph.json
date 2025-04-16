@@ -1,0 +1,569 @@
+{
+  "edges": [
+    {
+      "source": "n21",
+      "target": "n34",
+      "type": "uses",
+      "weight": 1.0
+    },
+    {
+      "source": "n10",
+      "target": "n35",
+      "type": "uses",
+      "weight": 1.0
+    },
+    {
+      "source": "n10",
+      "target": "n29",
+      "type": "depends_on",
+      "weight": 1.0
+    },
+    {
+      "source": "n29",
+      "target": "n32",
+      "type": "created_by",
+      "weight": 1.0
+    },
+    {
+      "source": "n3",
+      "target": "n34",
+      "type": "created_by",
+      "weight": 1.0
+    },
+    {
+      "source": "n18",
+      "target": "n3",
+      "type": "created_by",
+      "weight": 1.0
+    },
+    {
+      "source": "n12",
+      "target": "n19",
+      "type": "depends_on",
+      "weight": 1.0
+    },
+    {
+      "source": "n15",
+      "target": "n21",
+      "type": "uses",
+      "weight": 1.0
+    },
+    {
+      "source": "n29",
+      "target": "n8",
+      "type": "created_by",
+      "weight": 1.0
+    },
+    {
+      "source": "n9",
+      "target": "n12",
+      "type": "extends",
+      "weight": 1.0
+    },
+    {
+      "source": "n1",
+      "target": "n10",
+      "type": "uses",
+      "weight": 1.0
+    },
+    {
+      "source": "n16",
+      "target": "n18",
+      "type": "created_by",
+      "weight": 1.0
+    },
+    {
+      "source": "n10",
+      "target": "n16",
+      "type": "created_by",
+      "weight": 1.0
+    },
+    {
+      "source": "n21",
+      "target": "n2",
+      "type": "depends_on",
+      "weight": 1.0
+    },
+    {
+      "source": "n34",
+      "target": "n17",
+      "type": "implements",
+      "weight": 1.0
+    },
+    {
+      "source": "n1",
+      "target": "n23",
+      "type": "extends",
+      "weight": 1.0
+    },
+    {
+      "source": "n14",
+      "target": "n21",
+      "type": "uses",
+      "weight": 1.0
+    },
+    {
+      "source": "n24",
+      "target": "n22",
+      "type": "implements",
+      "weight": 1.0
+    },
+    {
+      "source": "n33",
+      "target": "n7",
+      "type": "implements",
+      "weight": 1.0
+    },
+    {
+      "source": "n22",
+      "target": "n6",
+      "type": "extends",
+      "weight": 1.0
+    },
+    {
+      "source": "n9",
+      "target": "n19",
+      "type": "extends",
+      "weight": 1.0
+    },
+    {
+      "source": "n6",
+      "target": "n24",
+      "type": "implements",
+      "weight": 1.0
+    },
+    {
+      "source": "n34",
+      "target": "n4",
+      "type": "created_by",
+      "weight": 1.0
+    },
+    {
+      "source": "n29",
+      "target": "n32",
+      "type": "uses",
+      "weight": 1.0
+    },
+    {
+      "source": "n12",
+      "target": "n29",
+      "type": "uses",
+      "weight": 1.0
+    },
+    {
+      "source": "n12",
+      "target": "n30",
+      "type": "uses",
+      "weight": 1.0
+    },
+    {
+      "source": "n27",
+      "target": "n33",
+      "type": "depends_on",
+      "weight": 1.0
+    },
+    {
+      "source": "n34",
+      "target": "n10",
+      "type": "implements",
+      "weight": 1.0
+    },
+    {
+      "source": "n34",
+      "target": "n5",
+      "type": "depends_on",
+      "weight": 1.0
+    },
+    {
+      "source": "n28",
+      "target": "n1",
+      "type": "uses",
+      "weight": 1.0
+    },
+    {
+      "source": "n9",
+      "target": "n30",
+      "type": "extends",
+      "weight": 1.0
+    },
+    {
+      "source": "n31",
+      "target": "n24",
+      "type": "uses",
+      "weight": 1.0
+    },
+    {
+      "source": "n14",
+      "target": "n3",
+      "type": "implements",
+      "weight": 1.0
+    },
+    {
+      "source": "n31",
+      "target": "n34",
+      "type": "implements",
+      "weight": 1.0
+    },
+    {
+      "source": "n15",
+      "target": "n28",
+      "type": "created_by",
+      "weight": 1.0
+    },
+    {
+      "source": "n33",
+      "target": "n25",
+      "type": "implements",
+      "weight": 1.0
+    },
+    {
+      "source": "n30",
+      "target": "n22",
+      "type": "uses",
+      "weight": 1.0
+    },
+    {
+      "source": "n30",
+      "target": "n24",
+      "type": "depends_on",
+      "weight": 1.0
+    },
+    {
+      "source": "n33",
+      "target": "n9",
+      "type": "extends",
+      "weight": 1.0
+    },
+    {
+      "source": "n10",
+      "target": "n5",
+      "type": "extends",
+      "weight": 1.0
+    },
+    {
+      "source": "n29",
+      "target": "n35",
+      "type": "uses",
+      "weight": 1.0
+    },
+    {
+      "source": "n14",
+      "target": "n20",
+      "type": "extends",
+      "weight": 1.0
+    },
+    {
+      "source": "n14",
+      "target": "n29",
+      "type": "implements",
+      "weight": 1.0
+    },
+    {
+      "source": "n26",
+      "target": "n7",
+      "type": "uses",
+      "weight": 1.0
+    },
+    {
+      "source": "n20",
+      "target": "n19",
+      "type": "depends_on",
+      "weight": 1.0
+    },
+    {
+      "source": "n34",
+      "target": "n23",
+      "type": "extends",
+      "weight": 1.0
+    },
+    {
+      "source": "n12",
+      "target": "n34",
+      "type": "uses",
+      "weight": 1.0
+    },
+    {
+      "source": "n15",
+      "target": "n23",
+      "type": "depends_on",
+      "weight": 1.0
+    },
+    {
+      "source": "n31",
+      "target": "n10",
+      "type": "depends_on",
+      "weight": 1.0
+    },
+    {
+      "source": "n14",
+      "target": "n34",
+      "type": "extends",
+      "weight": 1.0
+    },
+    {
+      "source": "n10",
+      "target": "n25",
+      "type": "uses",
+      "weight": 1.0
+    },
+    {
+      "source": "n16",
+      "target": "n1",
+      "type": "created_by",
+      "weight": 1.0
+    },
+    {
+      "source": "n8",
+      "target": "n23",
+      "type": "created_by",
+      "weight": 1.0
+    }
+  ],
+  "nodes": [
+    {
+      "id": "n1",
+      "label": "Programming Node 1",
+      "type": "programming",
+      "x": 523.7470726963526,
+      "y": 450.7382749721518
+    },
+    {
+      "id": "n2",
+      "label": "Programming Node 2",
+      "type": "programming",
+      "x": 1126.2832538972793,
+      "y": 607.7699966780621
+    },
+    {
+      "id": "n3",
+      "label": "Programming Node 3",
+      "type": "programming",
+      "x": 345.059115671632,
+      "y": 521.9202684604044
+    },
+    {
+      "id": "n4",
+      "label": "Programming Node 4",
+      "type": "programming",
+      "x": 992.377792238793,
+      "y": 625.4998786855507
+    },
+    {
+      "id": "n5",
+      "label": "Programming Node 5",
+      "type": "programming",
+      "x": 801.1785213332465,
+      "y": 425.426487022456
+    },
+    {
+      "id": "n6",
+      "label": "Programming Node 6",
+      "type": "programming",
+      "x": 1003.6326408989204,
+      "y": 227.58164599475688
+    },
+    {
+      "id": "n7",
+      "label": "Programming Node 7",
+      "type": "programming",
+      "x": 810.2074081660818,
+      "y": 387.626987679319
+    },
+    {
+      "id": "n8",
+      "label": "Programming Node 8",
+      "type": "programming",
+      "x": 680.9341862022875,
+      "y": 429.2651796674098
+    },
+    {
+      "id": "n9",
+      "label": "Programming Node 9",
+      "type": "programming",
+      "x": 346.4054257558485,
+      "y": 828.1101844576975
+    },
+    {
+      "id": "n10",
+      "label": "Programming Node 10",
+      "type": "programming",
+      "x": 571.4844370434055,
+      "y": 273.5351973660594
+    },
+    {
+      "id": "n11",
+      "label": "Programming Node 11",
+      "type": "programming",
+      "x": 989.8358461937271,
+      "y": 335.260583929095
+    },
+    {
+      "id": "n12",
+      "label": "Programming Node 12",
+      "type": "programming",
+      "x": 1117.871867686618,
+      "y": 239.05380466823908
+    },
+    {
+      "id": "n13",
+      "label": "Programming Node 13",
+      "type": "programming",
+      "x": 367.24948186693854,
+      "y": 799.0075062852394
+    },
+    {
+      "id": "n14",
+      "label": "Programming Node 14",
+      "type": "programming",
+      "x": 124.86617301718593,
+      "y": 309.4682136705039
+    },
+    {
+      "id": "n15",
+      "label": "Programming Node 15",
+      "type": "programming",
+      "x": 313.5658484856518,
+      "y": 655.6082920120142
+    },
+    {
+      "id": "n16",
+      "label": "Programming Node 16",
+      "type": "programming",
+      "x": 456.61616508938585,
+      "y": 200.96552834641787
+    },
+    {
+      "id": "n17",
+      "label": "Programming Node 17",
+      "type": "programming",
+      "x": 916.9000101875532,
+      "y": 285.34956381400605
+    },
+    {
+      "id": "n18",
+      "label": "Programming Node 18",
+      "type": "programming",
+      "x": 399.6092450095437,
+      "y": 105.10532556267424
+    },
+    {
+      "id": "n19",
+      "label": "Programming Node 19",
+      "type": "programming",
+      "x": 1158.9400571294864,
+      "y": 751.2848962191754
+    },
+    {
+      "id": "n20",
+      "label": "Programming Node 20",
+      "type": "programming",
+      "x": 1148.5501872283,
+      "y": 510.66484808949946
+    },
+    {
+      "id": "n21",
+      "label": "Programming Node 21",
+      "type": "programming",
+      "x": 1048.2244017455228,
+      "y": 691.8282135462899
+    },
+    {
+      "id": "n22",
+      "label": "Programming Node 22",
+      "type": "programming",
+      "x": 1182.4145583677634,
+      "y": 266.4179140689504
+    },
+    {
+      "id": "n23",
+      "label": "Programming Node 23",
+      "type": "programming",
+      "x": 675.8792187040624,
+      "y": 747.3673498832586
+    },
+    {
+      "id": "n24",
+      "label": "Programming Node 24",
+      "type": "programming",
+      "x": 830.9499829253493,
+      "y": 302.42307164056183
+    },
+    {
+      "id": "n25",
+      "label": "Programming Node 25",
+      "type": "programming",
+      "x": 467.9065603936993,
+      "y": 732.2621162463956
+    },
+    {
+      "id": "n26",
+      "label": "Programming Node 26",
+      "type": "programming",
+      "x": 682.8150632464136,
+      "y": 506.6577545510711
+    },
+    {
+      "id": "n27",
+      "label": "Programming Node 27",
+      "type": "programming",
+      "x": 223.30477627287775,
+      "y": 358.4107559107796
+    },
+    {
+      "id": "n28",
+      "label": "Programming Node 28",
+      "type": "programming",
+      "x": 240.5663287693275,
+      "y": 219.29276006112826
+    },
+    {
+      "id": "n29",
+      "label": "Programming Node 29",
+      "type": "programming",
+      "x": 230.96344446578178,
+      "y": 838.4759840754848
+    },
+    {
+      "id": "n30",
+      "label": "Programming Node 30",
+      "type": "programming",
+      "x": 126.313072025438,
+      "y": 745.2471455860383
+    },
+    {
+      "id": "n31",
+      "label": "Programming Node 31",
+      "type": "programming",
+      "x": 588.0976565575654,
+      "y": 317.32198113678635
+    },
+    {
+      "id": "n32",
+      "label": "Programming Node 32",
+      "type": "programming",
+      "x": 422.8193393869482,
+      "y": 827.414298560351
+    },
+    {
+      "id": "n33",
+      "label": "Programming Node 33",
+      "type": "programming",
+      "x": 648.675991077843,
+      "y": 255.3883039517693
+    },
+    {
+      "id": "n34",
+      "label": "Programming Node 34",
+      "type": "programming",
+      "x": 817.9049954819011,
+      "y": 371.18567672377003
+    },
+    {
+      "id": "n35",
+      "label": "Programming Node 35",
+      "type": "programming",
+      "x": 771.4918115679076,
+      "y": 730.6187553929934
+    }
+  ]
+}

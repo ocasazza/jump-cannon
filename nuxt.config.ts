@@ -39,7 +39,7 @@ export default defineNuxtConfig({
   },
   vite: {
     plugins: [
-      wasmPack(['./wasm/jump-cannon'])
+      wasmPack(['./wasm/rust-graph-layouts'])
     ]
   },
 })

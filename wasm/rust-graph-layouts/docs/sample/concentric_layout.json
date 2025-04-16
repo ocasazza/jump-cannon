@@ -1,0 +1,227 @@
+{
+  "edges": [
+    {
+      "source": "n1",
+      "target": "n3",
+      "weight": 8
+    },
+    {
+      "source": "n1",
+      "target": "n5",
+      "weight": 5
+    },
+    {
+      "source": "n1",
+      "target": "n11",
+      "weight": 9
+    },
+    {
+      "source": "n1",
+      "target": "n13",
+      "weight": 4
+    },
+    {
+      "source": "n1",
+      "target": "n16",
+      "weight": 5
+    },
+    {
+      "source": "n2",
+      "target": "n4",
+      "weight": 9
+    },
+    {
+      "source": "n2",
+      "target": "n7",
+      "weight": 8
+    },
+    {
+      "source": "n2",
+      "target": "n9",
+      "weight": 8
+    },
+    {
+      "source": "n2",
+      "target": "n11",
+      "weight": 1
+    },
+    {
+      "source": "n2",
+      "target": "n15",
+      "weight": 2
+    },
+    {
+      "source": "n2",
+      "target": "n18",
+      "weight": 9
+    },
+    {
+      "source": "n18",
+      "target": "n19",
+      "weight": 4
+    },
+    {
+      "source": "n7",
+      "target": "n3",
+      "weight": 1
+    },
+    {
+      "source": "n20",
+      "target": "n6",
+      "weight": 4
+    },
+    {
+      "source": "n4",
+      "target": "n10",
+      "weight": 1
+    }
+  ],
+  "layout": {
+    "concentricBy": "degree",
+    "levelWidth": 100,
+    "minNodeSpacing": 10,
+    "name": "concentric"
+  },
+  "nodes": [
+    {
+      "group": 4,
+      "id": "n1",
+      "label": "Node 1",
+      "shape": "hexagon",
+      "size": 38.0
+    },
+    {
+      "group": 3,
+      "id": "n2",
+      "label": "Node 2",
+      "shape": "triangle",
+      "size": 38.0
+    },
+    {
+      "group": 3,
+      "id": "n3",
+      "label": "Node 3",
+      "shape": "hexagon",
+      "size": 34.0
+    },
+    {
+      "group": 2,
+      "id": "n4",
+      "label": "Node 4",
+      "shape": "triangle",
+      "size": 36.0
+    },
+    {
+      "group": 2,
+      "id": "n5",
+      "label": "Node 5",
+      "shape": "rectangle",
+      "size": 34.0
+    },
+    {
+      "group": 3,
+      "id": "n6",
+      "label": "Node 6",
+      "shape": "ellipse",
+      "size": 23.0
+    },
+    {
+      "group": 4,
+      "id": "n7",
+      "label": "Node 7",
+      "shape": "hexagon",
+      "size": 16.0
+    },
+    {
+      "group": 4,
+      "id": "n8",
+      "label": "Node 8",
+      "shape": "diamond",
+      "size": 15.0
+    },
+    {
+      "group": 4,
+      "id": "n9",
+      "label": "Node 9",
+      "shape": "diamond",
+      "size": 24.0
+    },
+    {
+      "group": 1,
+      "id": "n10",
+      "label": "Node 10",
+      "shape": "rectangle",
+      "size": 28.0
+    },
+    {
+      "group": 2,
+      "id": "n11",
+      "label": "Node 11",
+      "shape": "rectangle",
+      "size": 49.0
+    },
+    {
+      "group": 4,
+      "id": "n12",
+      "label": "Node 12",
+      "shape": "ellipse",
+      "size": 26.0
+    },
+    {
+      "group": 4,
+      "id": "n13",
+      "label": "Node 13",
+      "shape": "hexagon",
+      "size": 42.0
+    },
+    {
+      "group": 2,
+      "id": "n14",
+      "label": "Node 14",
+      "shape": "hexagon",
+      "size": 37.0
+    },
+    {
+      "group": 5,
+      "id": "n15",
+      "label": "Node 15",
+      "shape": "ellipse",
+      "size": 42.0
+    },
+    {
+      "group": 2,
+      "id": "n16",
+      "label": "Node 16",
+      "shape": "triangle",
+      "size": 40.0
+    },
+    {
+      "group": 2,
+      "id": "n17",
+      "label": "Node 17",
+      "shape": "rectangle",
+      "size": 15.0
+    },
+    {
+      "group": 2,
+      "id": "n18",
+      "label": "Node 18",
+      "shape": "diamond",
+      "size": 48.0
+    },
+    {
+      "group": 2,
+      "id": "n19",
+      "label": "Node 19",
+      "shape": "triangle",
+      "size": 17.0
+    },
+    {
+      "group": 5,
+      "id": "n20",
+      "label": "Node 20",
+      "shape": "rectangle",
+      "size": 31.0
+    }
+  ]
+}

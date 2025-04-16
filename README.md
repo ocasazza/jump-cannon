@@ -1,72 +1,9 @@
-# Nuxt3 x GitHub Pages
+# Jump Cannon
 
-Welcome on this repo!
+[Annie Jump Cannon](https://en.wikipedia.org/wiki/Annie_Jump_Cannon)
 
-This is a basic template of an application using Nuxt3 published within the Github pages.
+> When Cannon first started cataloging the stars, she was able to classify 1,000 stars in three years, but by 1913, she was able to work on 200 stars an hour.[20] Cannon could classify three stars a minute just by looking at their spectral patterns and, if using a magnifying glass, could classify stars down to the ninth magnitude, around 16 times fainter than the human eye can see.[8] Her work was also highly accurate.[20]
 
-This is possible through the use of the gh-pages library.
+[8]  [Annie Cannon](https://www.sheisanastronomer.org/index.php/history/annie-cannon). She is an Astronomer. 2014. Retrieved February 18, 2014.
 
-## Getting Started
-
-### What is **Nuxt3**?
-Nuxt3 is a easy-to-use Web Framework based on Vue3 with Server Side Rendering.
-
-You can found more infos and docs on Nuxt3 on https://nuxt.com/.
-
-### What is **gh-pages**?
-gh-pages is a library which allows you to publish files to a gh-pages branch on GitHub (or any other branch anywhere else).
-
-You can found more infos and docs on gh-pages on https://github.com/tschaub/gh-pages.
-
-## Basic Usage
-### Configuration
-We need to configure correctly the baseUrl path inside the **nuxt.config.ts** file.
-
-If this is the main GitHub Pages repo, in example **dariotecchia.github.io**, we need an empty base url:
-```ts
-// https://nuxt.com/docs/api/configuration/nuxt-config
-export default defineNuxtConfig({
-  app: {
-    baseURL: ''
-  },
-})
-```
-Or you can delete this property.
-
-If you want to deploy a repo hosted on a different repo you need to configure the baseURL with the name of the repo:
-```ts
-// https://nuxt.com/docs/api/configuration/nuxt-config
-export default defineNuxtConfig({
-  app: {
-    baseURL: '/nuxt3-ghpages/'
-  },
-})
-```
-As you can see, in this case the value is `/nuxt3-ghpages/`, the name of this repo.
-### First Deploy
-The use is really simple.
-
-First, an initial "deployment" must be done via gh-pages to allow the branch to be created from where the GitHub Pages will be deployed.
-
-To do this we need to install the node modules via the `npm install` command, make sure everything is ok by doing a first local deployment via `npm run dev`.
-
-If everything was ok then we can proceed with the first deploy and the automatic creation of the deployment branch.
-
-Run the command `npm run deploy`, which will just run the command `nuxt generate && gh-pages --dotfiles -d .output/public`, so first the deployment package is generated via `nuxt generate` and then the contents of _`.output/public`_ is pushed to the gh-pages branch.
-
-After this is successfully executed we can move to the repository settings to go and set up the GitHub Pages.
-
-### Setting up GitHub Pages
-Go in the Settings tab:
-![GitHub Bar](assets/img/bar.png "GitHub Settings Tab")
-
-Go in the Pages menu:
-![GitHub Bar](assets/img/menu.png "GitHub Pages menu")
-
-Choose the branch where gh-pages push the dist directory:
-![GitHub Bar](assets/img/branch.png "Branch selection")
-
-Now wait for deploy. If everything will be ok you can found this:
-![GitHub Bar](assets/img/deployed.png "Site deployed")
-
-You can find the deploy at this url: https://dariotecchia.github.io/nuxt3-ghpages/
+[20] [Woman Making Index of 100,000 Stars for a Catalogue](https://www.newspapers.com/article/the-danville-news/10248290/). The Danville Morning News. February 10, 1913. Retrieved April 13, 2017 – via Newspapers.com.

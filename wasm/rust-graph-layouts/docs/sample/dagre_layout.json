@@ -1,0 +1,310 @@
+{
+  "edges": [
+    {
+      "source": "n1",
+      "target": "n2",
+      "weight": 8
+    },
+    {
+      "source": "n1",
+      "target": "n3",
+      "weight": 2
+    },
+    {
+      "source": "n2",
+      "target": "n4",
+      "weight": 5
+    },
+    {
+      "source": "n2",
+      "target": "n5",
+      "weight": 7
+    },
+    {
+      "source": "n2",
+      "target": "n6",
+      "weight": 9
+    },
+    {
+      "source": "n3",
+      "target": "n7",
+      "weight": 6
+    },
+    {
+      "source": "n3",
+      "target": "n8",
+      "weight": 8
+    },
+    {
+      "source": "n3",
+      "target": "n9",
+      "weight": 5
+    },
+    {
+      "source": "n4",
+      "target": "n10",
+      "weight": 8
+    },
+    {
+      "source": "n4",
+      "target": "n11",
+      "weight": 7
+    },
+    {
+      "source": "n4",
+      "target": "n12",
+      "weight": 6
+    },
+    {
+      "source": "n5",
+      "target": "n13",
+      "weight": 5
+    },
+    {
+      "source": "n5",
+      "target": "n14",
+      "weight": 6
+    },
+    {
+      "source": "n5",
+      "target": "n15",
+      "weight": 9
+    },
+    {
+      "source": "n6",
+      "target": "n16",
+      "weight": 6
+    },
+    {
+      "source": "n6",
+      "target": "n17",
+      "weight": 6
+    },
+    {
+      "source": "n6",
+      "target": "n18",
+      "weight": 4
+    },
+    {
+      "source": "n7",
+      "target": "n19",
+      "weight": 4
+    },
+    {
+      "source": "n7",
+      "target": "n20",
+      "weight": 2
+    },
+    {
+      "source": "n7",
+      "target": "n21",
+      "weight": 3
+    },
+    {
+      "source": "n8",
+      "target": "n22",
+      "weight": 9
+    },
+    {
+      "source": "n8",
+      "target": "n23",
+      "weight": 5
+    },
+    {
+      "source": "n8",
+      "target": "n24",
+      "weight": 5
+    },
+    {
+      "source": "n9",
+      "target": "n25",
+      "weight": 6
+    }
+  ],
+  "layout": {
+    "acyclic": true,
+    "align": "UL",
+    "name": "dagre",
+    "nodeSeparation": 50,
+    "rankDirection": "TB",
+    "rankSeparation": 50,
+    "ranker": "network-simplex"
+  },
+  "nodes": [
+    {
+      "group": 2,
+      "id": "n1",
+      "label": "Node 1",
+      "shape": "ellipse",
+      "size": 21.0
+    },
+    {
+      "group": 5,
+      "id": "n2",
+      "label": "Node 2",
+      "shape": "diamond",
+      "size": 20.0
+    },
+    {
+      "group": 3,
+      "id": "n3",
+      "label": "Node 3",
+      "shape": "ellipse",
+      "size": 30.0
+    },
+    {
+      "group": 4,
+      "id": "n4",
+      "label": "Node 4",
+      "shape": "hexagon",
+      "size": 47.0
+    },
+    {
+      "group": 3,
+      "id": "n5",
+      "label": "Node 5",
+      "shape": "rectangle",
+      "size": 44.0
+    },
+    {
+      "group": 1,
+      "id": "n6",
+      "label": "Node 6",
+      "shape": "triangle",
+      "size": 35.0
+    },
+    {
+      "group": 2,
+      "id": "n7",
+      "label": "Node 7",
+      "shape": "hexagon",
+      "size": 42.0
+    },
+    {
+      "group": 3,
+      "id": "n8",
+      "label": "Node 8",
+      "shape": "hexagon",
+      "size": 49.0
+    },
+    {
+      "group": 5,
+      "id": "n9",
+      "label": "Node 9",
+      "shape": "rectangle",
+      "size": 24.0
+    },
+    {
+      "group": 4,
+      "id": "n10",
+      "label": "Node 10",
+      "shape": "ellipse",
+      "size": 47.0
+    },
+    {
+      "group": 1,
+      "id": "n11",
+      "label": "Node 11",
+      "shape": "diamond",
+      "size": 37.0
+    },
+    {
+      "group": 2,
+      "id": "n12",
+      "label": "Node 12",
+      "shape": "ellipse",
+      "size": 28.0
+    },
+    {
+      "group": 5,
+      "id": "n13",
+      "label": "Node 13",
+      "shape": "diamond",
+      "size": 18.0
+    },
+    {
+      "group": 2,
+      "id": "n14",
+      "label": "Node 14",
+      "shape": "diamond",
+      "size": 20.0
+    },
+    {
+      "group": 1,
+      "id": "n15",
+      "label": "Node 15",
+      "shape": "triangle",
+      "size": 46.0
+    },
+    {
+      "group": 1,
+      "id": "n16",
+      "label": "Node 16",
+      "shape": "rectangle",
+      "size": 26.0
+    },
+    {
+      "group": 5,
+      "id": "n17",
+      "label": "Node 17",
+      "shape": "diamond",
+      "size": 30.0
+    },
+    {
+      "group": 5,
+      "id": "n18",
+      "label": "Node 18",
+      "shape": "rectangle",
+      "size": 30.0
+    },
+    {
+      "group": 4,
+      "id": "n19",
+      "label": "Node 19",
+      "shape": "diamond",
+      "size": 32.0
+    },
+    {
+      "group": 5,
+      "id": "n20",
+      "label": "Node 20",
+      "shape": "hexagon",
+      "size": 41.0
+    },
+    {
+      "group": 5,
+      "id": "n21",
+      "label": "Node 21",
+      "shape": "hexagon",
+      "size": 41.0
+    },
+    {
+      "group": 4,
+      "id": "n22",
+      "label": "Node 22",
+      "shape": "ellipse",
+      "size": 38.0
+    },
+    {
+      "group": 4,
+      "id": "n23",
+      "label": "Node 23",
+      "shape": "rectangle",
+      "size": 26.0
+    },
+    {
+      "group": 1,
+      "id": "n24",
+      "label": "Node 24",
+      "shape": "diamond",
+      "size": 37.0
+    },
+    {
+      "group": 4,
+      "id": "n25",
+      "label": "Node 25",
+      "shape": "hexagon",
+      "size": 27.0
+    }
+  ]
+}

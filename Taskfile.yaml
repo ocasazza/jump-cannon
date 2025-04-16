@@ -9,7 +9,7 @@ tasks:
   clean:
     desc: Clean files and directories no longer needed after cluster bootstrap
     cmds:
-    - rm -rf .nuxt .output wasm/jump-cannon/{pkg,target}
+    - rm -rf .nuxt .output wasm/rust-graph-layouts/{pkg,target}
 
     preconditions:
     - { msg: "Missing bootstrap directory", sh: "test -d {{.ROOT_DIR}}" }
@@ -23,7 +23,7 @@ tasks:
   build-wasm:
     desc: Builds shared Rust libraries with wasm-pack
     cmds:
-    - wasm-pack build {{.WASM_DIR}}/jump-cannon --target web
+    - wasm-pack build {{.WASM_DIR}}/rust-graph-layouts --target web
 
   install-rust:
     desc: Install rustup and wasm-pack if not already installed

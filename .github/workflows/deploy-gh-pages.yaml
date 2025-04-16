@@ -20,7 +20,7 @@ jobs:
     - uses: actions/setup-node@v4
     - run: npm install
     # build wasm
-    - run: wasm-pack build ./wasm/jump-cannon --target web
+    - run: wasm-pack build ./wasm/rust-graph-layouts --target web
     # build vuex
     - run: npm install
     - run: npx nuxt generate --preset github_pages && touch .output/public/.nojekyll

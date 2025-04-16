@@ -1,5 +1,5 @@
 import { defineStore } from 'pinia'
-import initJumpCannon, { greet } from '~/wasm/jump-cannon/pkg/jump_cannon'
+import initJumpCannon, { greet } from '~/wasm/rust-graph-layouts/pkg/rust-graph-layouts'
 
 export const useWasmStore = defineStore('wasm', () => {
 

@@ -1,3 +1,4 @@
-[submodule "wasm/jump-cannon"]
-	path = wasm/jump-cannon
-	url = git@github.com:ocasazza/jump-cannon.git
+[submodule "wasm/rust-graph-layouts"]
+	path = wasm/rust-graph-layouts
+	url = git@github.com:ocasazza/rust-graph-layouts.git
+

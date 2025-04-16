@@ -1,0 +1,70 @@
+graph KnowledgeGraph {
+  // Graph attributes
+  graph [rankdir=LR, splines=true, overlap=false, nodesep=0.8, ranksep=1.0];
+  node [shape=box, style="rounded,filled", fontname=Arial, fontsize=12];
+  edge [fontname=Arial, fontsize=10];
+
+  // Nodes
+  n1 [label="Build System Tool", fillcolor=lightcoral, shape=component, tooltip="tool node"];
+  n2 [label="Automation Platform", fillcolor=lightyellow, shape=folder, tooltip="resource node"];
+  n3 [label="Lean Monitoring", fillcolor=lavender, shape=diamond, tooltip="process node"];
+  n4 [label="Distributed Architecture", fillcolor=lightblue, shape=ellipse, tooltip="concept node"];
+  n5 [label="Testing Database", fillcolor=lightyellow, shape=folder, tooltip="resource node"];
+  n6 [label="Build System Tool", fillcolor=lightcoral, shape=component, tooltip="tool node"];
+  n7 [label="Development Platform", fillcolor=lightyellow, shape=folder, tooltip="resource node"];
+  n8 [label="Lean Planning", fillcolor=lavender, shape=diamond, tooltip="process node"];
+  n9 [label="Functional Paradigm", fillcolor=lightblue, shape=ellipse, tooltip="concept node"];
+  n10 [label="Web Researcher", fillcolor=lightgreen, shape=box, tooltip="person node"];
+  n11 [label="Lean Development", fillcolor=lavender, shape=diamond, tooltip="process node"];
+  n12 [label="Lean Development", fillcolor=lavender, shape=diamond, tooltip="process node"];
+  n13 [label="Monitoring Database", fillcolor=lightyellow, shape=folder, tooltip="resource node"];
+  n14 [label="Management Database", fillcolor=lightyellow, shape=folder, tooltip="resource node"];
+  n15 [label="Functional Paradigm", fillcolor=lightblue, shape=ellipse, tooltip="concept node"];
+  n16 [label="Software Manager", fillcolor=lightgreen, shape=box, tooltip="person node"];
+  n17 [label="Debugger Tool", fillcolor=lightcoral, shape=component, tooltip="tool node"];
+  n18 [label="Version Control Tool", fillcolor=lightcoral, shape=component, tooltip="tool node"];
+  n19 [label="BDD Integration", fillcolor=lavender, shape=diamond, tooltip="process node"];
+  n20 [label="Software Manager", fillcolor=lightgreen, shape=box, tooltip="person node"];
+
+  // Edges
+  n15 -- n1 [label="built_with", weight=1, tooltip="built_with (1 weight)"];
+  n10 -- n13 [label="maintains", weight=4, tooltip="maintains (4 weight)"];
+  n19 -- n5 [label="enabled_by", weight=9, tooltip="enabled_by (9 weight)"];
+  n1 -- n12 [label="automates", weight=2, tooltip="automates (2 weight)"];
+  n17 -- n6 [label="works_with", weight=4, tooltip="works_with (4 weight)"];
+  n1 -- n16 [label="operated_by", weight=5, tooltip="operated_by (5 weight)"];
+  n4 -- n20 [label="understood_by", weight=8, tooltip="understood_by (8 weight)"];
+  n3 -- n15 [label="applies", weight=10, tooltip="applies (10 weight)"];
+  n9 -- n12 [label="guides", weight=5, tooltip="guides (5 weight)"];
+  n9 -- n10 [label="taught_by", weight=3, tooltip="taught_by (3 weight)"];
+  n19 -- n3 [label="precedes", weight=5, tooltip="precedes (5 weight)"];
+  n8 -- n12 [label="precedes", weight=5, tooltip="precedes (5 weight)"];
+  n16 -- n14 [label="maintains", weight=2, tooltip="maintains (2 weight)"];
+  n11 -- n12 [label="precedes", weight=2, tooltip="precedes (2 weight)"];
+  n15 -- n7 [label="implemented_in", weight=8, tooltip="implemented_in (8 weight)"];
+  n10 -- n13 [label="maintains", weight=7, tooltip="maintains (7 weight)"];
+  n8 -- n19 [label="precedes", weight=8, tooltip="precedes (8 weight)"];
+  n14 -- n8 [label="constrains", weight=2, tooltip="constrains (2 weight)"];
+  n15 -- n7 [label="accessed_through", weight=3, tooltip="accessed_through (3 weight)"];
+  n4 -- n1 [label="built_with", weight=5, tooltip="built_with (5 weight)"];
+  n7 -- n2 [label="depends_on", weight=1, tooltip="depends_on (1 weight)"];
+  n11 -- n12 [label="precedes", weight=6, tooltip="precedes (6 weight)"];
+  n12 -- n11 [label="includes", weight=6, tooltip="includes (6 weight)"];
+  n19 -- n10 [label="improved_by", weight=6, tooltip="improved_by (6 weight)"];
+  n14 -- n12 [label="enables", weight=6, tooltip="enables (6 weight)"];
+  n13 -- n5 [label="depends_on", weight=3, tooltip="depends_on (3 weight)"];
+  n17 -- n18 [label="extends", weight=5, tooltip="extends (5 weight)"];
+  n6 -- n7 [label="accesses", weight=4, tooltip="accesses (4 weight)"];
+  n4 -- n19 [label="guides", weight=2, tooltip="guides (2 weight)"];
+  n3 -- n14 [label="supported_by", weight=8, tooltip="supported_by (8 weight)"];
+  n17 -- n15 [label="builds", weight=10, tooltip="builds (10 weight)"];
+  n12 -- n20 [label="followed_by", weight=5, tooltip="followed_by (5 weight)"];
+  n5 -- n9 [label="implements", weight=10, tooltip="implements (10 weight)"];
+  n1 -- n17 [label="extends", weight=3, tooltip="extends (3 weight)"];
+  n19 -- n12 [label="alternates_with", weight=7, tooltip="alternates_with (7 weight)"];
+  n20 -- n10 [label="mentors", weight=5, tooltip="mentors (5 weight)"];
+  n14 -- n7 [label="depends_on", weight=8, tooltip="depends_on (8 weight)"];
+  n4 -- n20 [label="understood_by", weight=1, tooltip="understood_by (1 weight)"];
+  n7 -- n10 [label="created_by", weight=6, tooltip="created_by (6 weight)"];
+  n11 -- n12 [label="precedes", weight=10, tooltip="precedes (10 weight)"];
+}
