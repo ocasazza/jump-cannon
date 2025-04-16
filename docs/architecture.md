@@ -1,8 +1,8 @@
-# KBG Application Architecture
+# jump-cannon Application Architecture
 
 ## Action System Architecture
 
-The KBG application implements a flexible and extensible action system inspired by VSCode's command palette. This document outlines the architecture, components, and features of this system.
+The jump-cannon application implements a flexible and extensible action system inspired by VSCode's command palette. This document outlines the architecture, components, and features of this system.
 
 ## Core Concepts
 

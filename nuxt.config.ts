@@ -6,7 +6,7 @@ export default defineNuxtConfig({
 
   app: {
     head: {
-      title: 'kbg',
+      title: 'jump-cannon',
       meta: [
         { charset: 'utf-8' },
         { name: 'viewport', content: 'width=device-width, initial-scale=1' },
@@ -16,7 +16,7 @@ export default defineNuxtConfig({
         { rel: 'icon', type: 'image/svg', href: '/favicon.svg' }
       ]
     },
-    baseURL: '/kbg/',
+    baseURL: '/jump-cannon/',
     buildAssetsDir: 'assets'
   },
 

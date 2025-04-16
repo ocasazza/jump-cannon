@@ -33,7 +33,7 @@
     <div class="status-bar">
       <div class="flex justify-between w-full">
         <div class="flex items-center gap-2">
-          <span>KBG</span>
+          <span>jump-cannon</span>
           <span class="px-1">|</span>
           <button @click="themeStore.toggleTheme()" class="hover:text-text-primary dark:hover:text-text-dark-primary flex items-center gap-1">
             <svg v-if="themeStore.mode === 'light'" xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="w-3 h-3">
