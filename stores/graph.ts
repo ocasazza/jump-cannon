@@ -1,374 +1,245 @@
 import { defineStore } from 'pinia';
+import { useNuxtApp } from 'nuxt/app';
 import { useActionsStore } from './actions';
+import type { LayoutManager } from '~/wasm/rust-graph-layouts/pkg/rust-graph-layouts';
 
-export interface GraphNode {
+export interface Node {
   id: string;
   label: string;
-  // Additional properties that might be in the file
-  [key: string]: any;
+  position?: [number, number];
+  metadata: Record<string, any>;
+  type?: string;
+  x: number;
+  y: number;
+  [key: string]: any;  // Allow additional properties
 }
 
-export interface GraphEdge {
+export interface Edge {
   id: string;
   source: string;
   target: string;
-  // Additional properties that might be in the file
-  [key: string]: any;
+  metadata: Record<string, any>;
+  type?: string;
+  weight: number;
+  [key: string]: any;  // Allow additional properties
 }
 
-export interface Graph {
-  nodes: GraphNode[];
-  edges: GraphEdge[];
-  // Metadata
-  name?: string;
-  description?: string;
+export interface LayoutOptions {
+  padding: number;
 }
+
+export type FileType = 'json' | 'dot' | 'csv';
 
 export const useGraphStore = defineStore('graph', {
   state: () => ({
-    graph: null as Graph | null,
-    filteredGraph: null as Graph | null,
+    layoutManager: null as LayoutManager | null,
+    nodes: new Map<string, Node>(),
+    edges: new Map<string, Edge>(),
+    filteredNodeIds: new Set<string>(),
     isLoading: false,
     error: null as string | null,
+    name: '',
+    description: '',
   }),
-  
+
   getters: {
-    hasGraph: (state) => state.graph !== null,
-    getGraph: (state) => state.graph,
-    getFilteredGraph: (state) => state.filteredGraph || state.graph,
-    getNodeCount: (state) => state.graph?.nodes.length || 0,
-    getEdgeCount: (state) => state.graph?.edges.length || 0,
+    // Basic data access
+    getNode: (state) => (id: string) => state.nodes.get(id),
+    getEdge: (state) => (id: string) => state.edges.get(id),
+    
+    // Array conversions for UI
+    nodesArray: (state) => Array.from(state.nodes.values()),
+    edgesArray: (state) => Array.from(state.edges.values()),
+    
+    // Filtered data
+    filteredNodes: (state) => 
+      state.filteredNodeIds.size > 0
+        ? Array.from(state.nodes.values()).filter(n => state.filteredNodeIds.has(n.id))
+        : Array.from(state.nodes.values()),
+    
+    filteredEdges: (state) => 
+      state.filteredNodeIds.size > 0
+        ? Array.from(state.edges.values())
+            .filter(e => state.filteredNodeIds.has(e.source) && state.filteredNodeIds.has(e.target))
+        : Array.from(state.edges.values()),
+    
+    // Stats
+    nodeCount: (state) => state.nodes.size,
+    edgeCount: (state) => state.edges.size,
+    hasGraph: (state) => state.nodes.size > 0 || state.edges.size > 0,
   },
-  
+
   actions: {
-    // Load graph from file
+    // WASM Integration
+    async initialize(): Promise<void> {
+      try {
+        const nuxtApp = useNuxtApp();
+        this.layoutManager = (nuxtApp.$createLayoutManager as () => LayoutManager)();
+      } catch (error) {
+        this.error = error instanceof Error ? error.message : String(error);
+        console.error('Failed to initialize layout manager:', error);
+      }
+    },
+
+    // Graph Loading
     async loadGraphFromFile(file: File): Promise<void> {
       this.isLoading = true;
       this.error = null;
-      
+
       try {
-        const content = await this.readFileContent(file);
-        const fileExtension = file.name.split('.').pop()?.toLowerCase();
-        
-        let graph: Graph;
-        
-        if (fileExtension === 'json') {
-          graph = this.parseJsonGraph(content);
-        } else if (fileExtension === 'dot') {
-          graph = this.parseDotGraph(content);
-        } else {
-          throw new Error(`Unsupported file format: ${fileExtension}`);
+        // Initialize WASM if needed
+        if (!this.layoutManager) {
+          await this.initialize();
         }
+
+        const content = await this.readFileContent(file);
+        const fileType = file.name.split('.').pop()?.toLowerCase() as FileType;
+
+        if (!['json', 'dot', 'csv'].includes(fileType)) {
+          throw new Error(`Unsupported file type: ${fileType}`);
+        }
+
+        // Parse and load graph using WASM
+        await this.layoutManager!.parse_and_load_graph(content, fileType);
+        const graphJson = await this.layoutManager!.get_graph_json();
+        const graph = JSON.parse(graphJson);
+
+        // Update store
+        this.clear();
         
-        // Set the graph name from the file name
-        graph.name = file.name.split('.')[0];
-        
-        this.graph = graph;
-        this.filteredGraph = null;
+        // Convert HashMaps from Rust to Maps in TypeScript
+        for (const [id, node] of Object.entries<Node>(graph.nodes)) {
+          this.nodes.set(id, node);
+        }
+
+        for (const [id, edge] of Object.entries<Edge>(graph.edges)) {
+          this.edges.set(id, edge);
+        }
+
+        this.name = file.name.split('.')[0];
         
         // Apply any active filters
         this.applyActiveFilters();
       } catch (error) {
         this.error = error instanceof Error ? error.message : String(error);
         console.error('Error loading graph:', error);
+        throw error;
       } finally {
         this.isLoading = false;
       }
     },
-    
-    // Read file content as text
-    async readFileContent(file: File): Promise<string> {
-      return new Promise((resolve, reject) => {
-        const reader = new FileReader();
-        
-        reader.onload = (event) => {
-          if (event.target?.result) {
-            resolve(event.target.result as string);
-          } else {
-            reject(new Error('Failed to read file'));
-          }
-        };
-        
-        reader.onerror = () => {
-          reject(new Error('Error reading file'));
-        };
-        
-        reader.readAsText(file);
-      });
-    },
-    
-    // Parse JSON graph
-    parseJsonGraph(content: string): Graph {
+
+    // Node Operations
+    addNode(node: Node): void {
       try {
-        const data = JSON.parse(content);
-        
-        // Check if the JSON has the expected structure
-        if (!Array.isArray(data.nodes) || !Array.isArray(data.edges)) {
-          // Try to detect and convert other JSON graph formats
-          if (Array.isArray(data) && data[0] && ('source' in data[0] || 'target' in data[0])) {
-            // Looks like an edge list format
-            return this.convertEdgeListToGraph(data);
-          }
-          
-          throw new Error('Invalid JSON graph format: missing nodes or edges arrays');
+        // Add to local store
+        this.nodes.set(node.id, node);
+
+        // Add to WASM
+        if (this.layoutManager) {
+          this.layoutManager.add_node(
+            node.id,
+            node.position ? node.position[0] : node.x,
+            node.position ? node.position[1] : node.y
+          );
         }
-        
-        // Ensure all nodes have an id and label
-        const nodes = data.nodes.map((node: any, index: number) => ({
-          id: node.id || `node-${index}`,
-          label: node.label || node.name || node.id || `Node ${index}`,
-          ...node
-        }));
-        
-        // Ensure all edges have an id, source, and target
-        const edges = data.edges.map((edge: any, index: number) => ({
-          id: edge.id || `edge-${index}`,
-          source: edge.source,
-          target: edge.target,
-          ...edge
-        }));
-        
-        return {
-          nodes,
-          edges,
-          name: data.name,
-          description: data.description
-        };
       } catch (error) {
-        throw new Error(`Error parsing JSON: ${error instanceof Error ? error.message : String(error)}`);
+        console.error('Error adding node:', error);
+        throw error;
       }
     },
-    
-    // Convert edge list to graph
-    convertEdgeListToGraph(edgeList: any[]): Graph {
-      const nodeMap = new Map<string, GraphNode>();
-      const edges: GraphEdge[] = [];
-      
-      // Extract nodes and edges from the edge list
-      edgeList.forEach((edge, index) => {
-        const sourceId = String(edge.source);
-        const targetId = String(edge.target);
-        
-        // Add source node if it doesn't exist
-        if (!nodeMap.has(sourceId)) {
-          nodeMap.set(sourceId, {
-            id: sourceId,
-            label: edge.sourceLabel || sourceId
-          });
-        }
-        
-        // Add target node if it doesn't exist
-        if (!nodeMap.has(targetId)) {
-          nodeMap.set(targetId, {
-            id: targetId,
-            label: edge.targetLabel || targetId
-          });
-        }
-        
-        // Add edge
-        edges.push({
-          id: edge.id || `edge-${index}`,
-          source: sourceId,
-          target: targetId,
-          ...edge
-        });
-      });
-      
-      return {
-        nodes: Array.from(nodeMap.values()),
-        edges
-      };
-    },
-    
-    // Parse DOT graph
-    parseDotGraph(content: string): Graph {
+
+    removeNode(id: string): void {
       try {
-        // Simple DOT parser (for basic DOT files)
-        const nodes: GraphNode[] = [];
-        const edges: GraphEdge[] = [];
-        const nodeMap = new Map<string, GraphNode>();
-        
-        // Extract graph name
-        const graphNameMatch = content.match(/(?:digraph|graph)\s+([a-zA-Z0-9_]+)/);
-        const graphName = graphNameMatch ? graphNameMatch[1] : 'Untitled';
-        
-        // Extract nodes and edges
-        const lines = content.split('\n');
-        
-        for (const line of lines) {
-          // Skip comments and empty lines
-          if (line.trim().startsWith('//') || line.trim().startsWith('#') || line.trim() === '') {
-            continue;
-          }
-          
-          // Extract node definitions
-          const nodeMatch = line.match(/\s*([a-zA-Z0-9_]+)\s*\[(.+)\]/);
-          if (nodeMatch) {
-            const nodeId = nodeMatch[1];
-            const attributes = this.parseDotAttributes(nodeMatch[2]);
-            
-            const node: GraphNode = {
-              id: nodeId,
-              label: attributes.label || nodeId,
-              ...attributes
-            };
-            
-            nodes.push(node);
-            nodeMap.set(nodeId, node);
-            continue;
-          }
-          
-          // Extract edge definitions
-          const edgeMatch = line.match(/\s*([a-zA-Z0-9_]+)\s*(->|--)\s*([a-zA-Z0-9_]+)(?:\s*\[(.+)\])?/);
-          if (edgeMatch) {
-            const sourceId = edgeMatch[1];
-            const targetId = edgeMatch[3];
-            const attributes = edgeMatch[4] ? this.parseDotAttributes(edgeMatch[4]) : {};
-            
-            // Add nodes if they don't exist
-            if (!nodeMap.has(sourceId)) {
-              const node: GraphNode = {
-                id: sourceId,
-                label: sourceId
-              };
-              nodes.push(node);
-              nodeMap.set(sourceId, node);
-            }
-            
-            if (!nodeMap.has(targetId)) {
-              const node: GraphNode = {
-                id: targetId,
-                label: targetId
-              };
-              nodes.push(node);
-              nodeMap.set(targetId, node);
-            }
-            
-            // Add edge
-            edges.push({
-              id: `${sourceId}-${targetId}`,
-              source: sourceId,
-              target: targetId,
-              ...attributes
-            });
+        // Remove from local store
+        this.nodes.delete(id);
+        this.filteredNodeIds.delete(id);
+
+        // Remove connected edges
+        for (const [edgeId, edge] of this.edges) {
+          if (edge.source === id || edge.target === id) {
+            this.edges.delete(edgeId);
           }
         }
-        
-        return {
-          nodes,
-          edges,
-          name: graphName
-        };
+
+        // Remove from WASM
+        if (this.layoutManager) {
+          this.layoutManager.remove_node(id);
+        }
       } catch (error) {
-        throw new Error(`Error parsing DOT: ${error instanceof Error ? error.message : String(error)}`);
+        console.error('Error removing node:', error);
+        throw error;
       }
     },
-    
-    // Parse DOT attributes
-    parseDotAttributes(attributesStr: string): Record<string, any> {
-      const attributes: Record<string, any> = {};
-      
-      // Match attribute pairs like key="value" or key=value
-      const attributeRegex = /([a-zA-Z0-9_]+)\s*=\s*(?:"([^"]*)"|\{([^}]*)\}|([a-zA-Z0-9_]+))/g;
-      let match;
-      
-      while ((match = attributeRegex.exec(attributesStr)) !== null) {
-        const key = match[1];
-        // Use the first non-undefined value from the capture groups
-        const value = match[2] !== undefined ? match[2] : (match[3] !== undefined ? match[3] : match[4]);
-        attributes[key] = value;
-      }
-      
-      return attributes;
-    },
-    
-    // Export graph to file
-    exportGraph(format: 'json' | 'dot'): void {
-      if (!this.graph) {
-        this.error = 'No graph to export';
-        return;
-      }
-      
+
+    // Edge Operations
+    addEdge(edge: Edge): void {
       try {
-        let content: string;
-        let fileName: string;
-        
-        if (format === 'json') {
-          content = JSON.stringify(this.graph, null, 2);
-          fileName = `${this.graph.name || 'graph'}.json`;
-        } else if (format === 'dot') {
-          content = this.convertToDot(this.graph);
-          fileName = `${this.graph.name || 'graph'}.dot`;
-        } else {
-          throw new Error(`Unsupported export format: ${format}`);
+        // Add to local store
+        this.edges.set(edge.id, edge);
+
+        // Add to WASM
+        if (this.layoutManager) {
+          this.layoutManager.add_edge(edge.id, edge.source, edge.target);
         }
-        
-        this.downloadFile(content, fileName, format === 'json' ? 'application/json' : 'text/plain');
       } catch (error) {
-        this.error = error instanceof Error ? error.message : String(error);
-        console.error('Error exporting graph:', error);
+        console.error('Error adding edge:', error);
+        throw error;
       }
     },
-    
-    // Convert graph to DOT format
-    convertToDot(graph: Graph): string {
-      const lines: string[] = [];
-      
-      // Graph header
-      lines.push(`digraph ${graph.name || 'G'} {`);
-      
-      // Node definitions
-      for (const node of graph.nodes) {
-        const attributes = Object.entries(node)
-          .filter(([key]) => !['id'].includes(key))
-          .map(([key, value]) => `${key}="${value}"`)
-          .join(', ');
-        
-        lines.push(`  ${node.id} [${attributes}];`);
-      }
-      
-      // Edge definitions
-      for (const edge of graph.edges) {
-        const attributes = Object.entries(edge)
-          .filter(([key]) => !['id', 'source', 'target'].includes(key))
-          .map(([key, value]) => `${key}="${value}"`)
-          .join(', ');
-        
-        if (attributes) {
-          lines.push(`  ${edge.source} -> ${edge.target} [${attributes}];`);
-        } else {
-          lines.push(`  ${edge.source} -> ${edge.target};`);
+
+    removeEdge(id: string): void {
+      try {
+        // Remove from local store
+        this.edges.delete(id);
+
+        // Remove from WASM
+        if (this.layoutManager) {
+          this.layoutManager.remove_edge(id);
         }
+      } catch (error) {
+        console.error('Error removing edge:', error);
+        throw error;
       }
-      
-      // Graph footer
-      lines.push('}');
-      
-      return lines.join('\n');
     },
-    
-    // Download file
-    downloadFile(content: string, fileName: string, mimeType: string): void {
-      const blob = new Blob([content], { type: mimeType });
-      const url = URL.createObjectURL(blob);
-      
-      const a = document.createElement('a');
-      a.href = url;
-      a.download = fileName;
-      a.click();
-      
-      URL.revokeObjectURL(url);
+
+    // Layout Operations
+    async applyLayout(options: LayoutOptions): Promise<void> {
+      if (!this.layoutManager) {
+        throw new Error('WASM LayoutManager not initialized');
+      }
+
+      try {
+        // Apply layout in WASM
+        const updatedGraphJson = await this.layoutManager.apply_fcose_layout(
+          JSON.stringify(options)
+        );
+
+        // Parse and update local store with new positions
+        const updatedGraph = JSON.parse(updatedGraphJson) as { nodes: Record<string, { position: [number, number] }> };
+        
+        // Update node positions
+        for (const [id, node] of Object.entries(updatedGraph.nodes)) {
+          const existingNode = this.nodes.get(id);
+          if (existingNode && node.position) {
+            existingNode.position = node.position;
+            existingNode.x = node.position[0];
+            existingNode.y = node.position[1];
+          }
+        }
+      } catch (error) {
+        console.error('Error applying layout:', error);
+        throw error;
+      }
     },
-    
-    // Apply active filters from the actions store
+
+    // Filtering
     applyActiveFilters(): void {
-      if (!this.graph) return;
-      
       const actionsStore = useActionsStore();
       const activeInstances = actionsStore.getActionInstances();
       
-      // Start with the original graph
-      let filteredNodes = [...this.graph.nodes];
+      // Start with all nodes
+      let filteredNodes = Array.from(this.nodes.values());
       
       // Apply each filter action
       for (const instance of activeInstances) {
@@ -436,28 +307,110 @@ export const useGraphStore = defineStore('graph', {
         }
       }
       
-      // Get the IDs of filtered nodes
-      const filteredNodeIds = new Set(filteredNodes.map(node => node.id));
-      
-      // Filter edges to only include those connecting filtered nodes
-      const filteredEdges = this.graph.edges.filter(edge => 
-        filteredNodeIds.has(edge.source) && filteredNodeIds.has(edge.target)
-      );
-      
-      // Update filtered graph
-      this.filteredGraph = {
-        nodes: filteredNodes,
-        edges: filteredEdges,
-        name: this.graph.name,
-        description: this.graph.description
-      };
+      // Update filtered node IDs
+      this.filteredNodeIds = new Set(filteredNodes.map(node => node.id));
     },
-    
-    // Clear the current graph
-    clearGraph(): void {
-      this.graph = null;
-      this.filteredGraph = null;
+
+    // File Operations
+    async readFileContent(file: File): Promise<string> {
+      return new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(reader.result as string);
+        reader.onerror = () => reject(new Error('Failed to read file'));
+        reader.readAsText(file);
+      });
+    },
+
+    exportGraph(format: 'json' | 'dot'): void {
+      try {
+        let content: string;
+        let fileName: string;
+        
+        const graph = {
+          nodes: this.nodesArray,
+          edges: this.edgesArray,
+          name: this.name,
+          description: this.description
+        };
+
+        if (format === 'json') {
+          content = JSON.stringify(graph, null, 2);
+          fileName = `${this.name || 'graph'}.json`;
+        } else if (format === 'dot') {
+          content = this.convertToDot(graph);
+          fileName = `${this.name || 'graph'}.dot`;
+        } else {
+          throw new Error(`Unsupported export format: ${format}`);
+        }
+        
+        this.downloadFile(content, fileName, format === 'json' ? 'application/json' : 'text/plain');
+      } catch (error) {
+        this.error = error instanceof Error ? error.message : String(error);
+        console.error('Error exporting graph:', error);
+      }
+    },
+
+    convertToDot(graph: { nodes: Node[]; edges: Edge[]; name?: string }): string {
+      const lines: string[] = [];
+      
+      // Graph header
+      lines.push(`digraph ${graph.name || 'G'} {`);
+      
+      // Node definitions
+      for (const node of graph.nodes) {
+        const attributes = Object.entries(node)
+          .filter(([key]) => !['id'].includes(key))
+          .map(([key, value]) => `${key}="${value}"`)
+          .join(', ');
+        
+        lines.push(`  ${node.id} [${attributes}];`);
+      }
+      
+      // Edge definitions
+      for (const edge of graph.edges) {
+        const attributes = Object.entries(edge)
+          .filter(([key]) => !['id', 'source', 'target'].includes(key))
+          .map(([key, value]) => `${key}="${value}"`)
+          .join(', ');
+        
+        if (attributes) {
+          lines.push(`  ${edge.source} -> ${edge.target} [${attributes}];`);
+        } else {
+          lines.push(`  ${edge.source} -> ${edge.target};`);
+        }
+      }
+      
+      // Graph footer
+      lines.push('}');
+      
+      return lines.join('\n');
+    },
+
+    downloadFile(content: string, fileName: string, mimeType: string): void {
+      const blob = new Blob([content], { type: mimeType });
+      const url = URL.createObjectURL(blob);
+      
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = fileName;
+      a.click();
+      
+      URL.revokeObjectURL(url);
+    },
+
+    // Cleanup
+    clear(): void {
+      this.nodes.clear();
+      this.edges.clear();
+      this.filteredNodeIds.clear();
+      this.name = '';
+      this.description = '';
       this.error = null;
+    },
+
+    dispose(): void {
+      this.layoutManager = null;
+      this.clear();
     }
   }
 });

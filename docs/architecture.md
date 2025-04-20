@@ -4,6 +4,108 @@
 
 The jump-cannon application implements a flexible and extensible action system inspired by VSCode's command palette. This document outlines the architecture, components, and features of this system.
 
+## Graph System Architecture
+
+The graph system implements a modular architecture for managing and visualizing graph data. It uses WebAssembly (WASM) for efficient graph layout calculations and provides a clean separation of concerns through specialized stores.
+
+### Store Architecture
+
+```mermaid
+graph TD
+    UI[UI Components] --> GV[Graph View Store]
+    UI --> GS[Graph Selection Store]
+    UI --> GF[Graph Filter Store]
+    UI --> GL[Graph Layout Store]
+    GV & GS & GF & GL --> GC[Graph Core Store]
+    GC --> WASM[Rust/WASM LayoutManager]
+```
+
+### Core Components
+
+1. **Graph Core Store** (`stores/graph/core.ts`)
+   - Central store managing graph data and WASM interaction
+   - Handles WASM initialization and lifecycle
+   - Maintains core graph data (nodes and edges)
+   - Provides fundamental graph operations
+   - Coordinates layout operations through WASM
+   - Interfaces:
+     ```typescript
+     interface Node {
+       id: string
+       label: string
+       position?: [number, number]
+       metadata: Record<string, any>
+       type?: string
+       x: number
+       y: number
+     }
+
+     interface Edge {
+       id: string
+       source: string
+       target: string
+       metadata: Record<string, any>
+       type?: string
+       weight: number
+     }
+     ```
+
+2. **Graph Layout Store** (`stores/graph/layout.ts`)
+   - Manages layout algorithms and configurations
+   - Supports multiple layout algorithms (fCoSE, concentric, dagre)
+   - Maintains layout history for undo operations
+   - Coordinates with core store for layout application
+   - Features:
+     - Layout algorithm selection
+     - Configurable layout parameters
+     - Layout history tracking
+     - Undo/redo support
+
+3. **Graph Selection Store** (`stores/graph/selection.ts`)
+   - Handles node and edge selection state
+   - Manages hover states
+   - Provides selection utilities
+   - Features:
+     - Multi-select support
+     - Connected node selection
+     - Edge selection between nodes
+     - Hover state management
+
+### WASM Integration
+
+The system uses a Rust-based WASM module for efficient graph layout calculations:
+
+- Direct integration through the Graph Core Store
+- Handles node and edge position calculations
+- Supports multiple layout algorithms
+- Provides efficient data transfer between Rust and JavaScript
+
+### Features
+
+1. **Efficient Graph Operations**
+   - Fast graph traversal and manipulation
+   - Optimized layout calculations via WASM
+   - Efficient state management with Pinia
+
+2. **Flexible Layout System**
+   - Multiple layout algorithm support
+   - Configurable layout parameters
+   - Layout history tracking
+   - Undo/redo capabilities
+
+3. **Advanced Selection Features**
+   - Multi-select support
+   - Connected node selection
+   - Edge selection between nodes
+   - Hover state management
+
+4. **Extensible Architecture**
+   - Modular store design
+   - Clear separation of concerns
+   - Easy addition of new features
+   - Plugin-based layout system
+
+
 ## Core Concepts
 
 ### Actions

@@ -1,16 +1,15 @@
 import { defineStore } from 'pinia'
-import initJumpCannon, { greet } from '~/wasm/rust-graph-layouts/pkg/rust-graph-layouts'
+import { LayoutManager, set_panic_hook } from '~/wasm/rust-graph-layouts/pkg/rust_graph_layouts'
 
 export const useWasmStore = defineStore('wasm', () => {
-
-  async function initialize (): Promise<void> {
-    await initJumpCannon()
+  async function initialize(): Promise<void> {
+    set_panic_hook()
   }
 
-  function dispose () {}
+  function dispose() {}
 
   return {
-    greet,
+    LayoutManager,
     dispose,
     initialize,
   }

@@ -1,7 +1,20 @@
-import wasmPack from 'vite-plugin-wasm-pack'
+import wasm from 'vite-plugin-wasm'
+import topLevelAwait from 'vite-plugin-top-level-await'
+import { defineNuxtConfig } from 'nuxt/config'
+import { resolve } from 'path'
 
 // https://nuxt.com/docs/api/configuration/nuxt-config
 export default defineNuxtConfig({
+  typescript: {
+    strict: false,
+    typeCheck: false,
+    shim: false,
+  },
+
+  alias: {
+    '#app': resolve(__dirname, 'node_modules/nuxt/dist/app'),
+  },
+
   ssr: false,
 
   app: {
@@ -20,26 +33,37 @@ export default defineNuxtConfig({
     buildAssetsDir: 'assets'
   },
 
-  devtools: { enabled: true },
   modules: [
     '@pinia/nuxt',
     '@nuxtjs/tailwindcss',
   ],
+
   css: [
     '~/assets/style/main.scss',
   ],
+
   plugins: [
+    '~/plugins/wasm',
     '~/plugins/register-actions',
   ],
+
   nitro: {
     prerender: {
       // Workaround for "Error: [404] Page not found: /manifest.json"
       failOnError: false,
     },
+    compatibilityDate: '2025-04-16',
   },
+
   vite: {
     plugins: [
-      wasmPack(['./wasm/rust-graph-layouts'])
-    ]
+      wasm(),
+      topLevelAwait()
+    ],
+    build: {
+      target: 'esnext'
+    }
   },
+
+  compatibilityDate: '2025-04-16',
 })
