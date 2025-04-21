@@ -1,0 +1,1 @@
+import{_ as a,t as l,v as r,a1 as s,x as e,B as n}from"./BWowZHYi.js";const c={},d={class:"custom"};function u(t,o){return r(),l("div",d,[s(t.$slots,"header",{},()=>[o[0]||(o[0]=e("p",null,[e("i",null,[n("Default #header slot content for "),e("code",null,"layouts/custom.vue")])],-1))]),s(t.$slots,"default")])}const i=a(c,[["render",u]]);export{i as default};

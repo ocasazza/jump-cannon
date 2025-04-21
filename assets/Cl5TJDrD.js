@@ -1,0 +1,1 @@
+import{d as o,o as t,H as n,t as r,v as s}from"./BWowZHYi.js";const a={class:"p-6 h-full min-h-full"},i=o({__name:"index",setup(c){return t(()=>{try{n()}catch(e){console.error("Failed to call WASM greet function:",e)}}),(e,l)=>(s(),r("div",a))}});export{i as default};
