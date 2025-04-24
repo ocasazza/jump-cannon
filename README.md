@@ -8,6 +8,8 @@
 
 [20] [Woman Making Index of 100,000 Stars for a Catalogue](https://www.newspapers.com/article/the-danville-news/10248290/). The Danville Morning News. February 10, 1913. Retrieved April 13, 2017 – via Newspapers.com.
 
+# Browser Demo
+[https://ocasazza.github.io/jump-cannon/](https://ocasazza.github.io/jump-cannon/)
 
 # Reference Papers
 ## Graphviz Papers

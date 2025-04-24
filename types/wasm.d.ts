@@ -1,4 +1,4 @@
-declare module '~/wasm/rust-graph-layouts/pkg/rust-graph-layouts' {
+declare module '~/wasm/rust-graph-layouts/pkg/rust_graph_layouts' {
   export class LayoutManager {
     add_node(id: string, x: number, y: number): void;
     add_edge(id: string, source: string, target: string): void;
@@ -10,7 +10,8 @@ declare module '~/wasm/rust-graph-layouts/pkg/rust-graph-layouts' {
     parse_and_load_graph(content: string, fileType: string): Promise<void>;
   }
 
-  export default function initJumpCannon(): Promise<void>;
+  export function set_panic_hook(): void;
+  export default function __wbg_init(): Promise<void>;
 }
 
 // Augment Nuxt's runtime

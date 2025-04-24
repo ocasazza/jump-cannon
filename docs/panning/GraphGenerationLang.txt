@@ -1,0 +1,410 @@
+A Framework for Concise Graph Generation: Language Design and Implementation
+I. Introduction
+A. Problem Statement
+Graphs provide a powerful abstraction for modeling relationships and structures across diverse domains, from social networks and biological pathways to software dependencies and knowledge representations. Generating specific, often complex, graph structures programmatically is a common requirement for tasks such as algorithm testing, system simulation, procedural content generation, and data modeling.1 However, existing tools often involve either direct manipulation via library APIs, which can be verbose for complex structures, or static description languages primarily focused on representation rather than generation.4 There is a need for a dedicated framework centered around a Graph Generation Language (GGL) designed explicitly for producing desired graph structures from the smallest possible, most intuitive set of inputs [User Query].
+B. Goals and Objectives
+The primary goal is to conceptualize a framework for generating arbitrary graphs using a concise and expressive Domain-Specific Language (DSL). Key objectives include:
+Conciseness: The GGL syntax should allow users to specify complex or large graphs with minimal textual input [User Query].
+Expressiveness: The language must be capable of defining a wide range of graph types, including standard structures (e.g., complete graphs, grids, trees) and custom, algorithmically generated topologies (e.g., scale-free networks, graphs based on user-defined rules) [User Query].
+Arbitrary Generation: The framework should support the generation of essentially any graph structure definable through declarative specification or generative procedures [User Query].
+Clear Semantics: The language constructs should have unambiguous interpretations, mapping clearly to graph generation operations.6
+C. Scope
+This report outlines the design and conceptual implementation of such a graph generation framework. It covers:
+Analysis of existing graph description and generation approaches [User Query point 1].
+Identification of common graph structures and their generative principles [User Query point 2].
+Definition of the core elements, operations, and syntax for the proposed GGL [User Query points 3, 4].
+Mechanisms for incorporating generative rules and patterns within the GGL syntax [User Query point 5].
+Strategies for parsing the GGL [User Query point 6].
+Translation of language constructs into internal graph representations [User Query point 7].
+Considerations for exporting generated graphs to standard formats [User Query point 8].
+D. Relevance and Applications
+A concise GGL framework addresses needs in various areas. Software testing requires generating diverse graph inputs for validating graph algorithms. Simulations in fields like network science or epidemiology often rely on generating graphs with specific topological properties (e.g., scale-free, small-world).7 Procedural content generation in games or simulations uses algorithms to create structures like levels, maps, or object relationships, which can often be modeled as graphs.1 Data modeling and knowledge representation sometimes involve generating initial graph schemas or instance data programmatically. A well-designed GGL can significantly streamline these tasks.
+II. Foundations: Existing Languages and Graph Structures
+To design an effective GGL, it is essential to understand the capabilities and limitations of existing tools and the fundamental principles behind generating common graph structures.
+A. Existing Graph Description Languages
+Several languages exist for describing graph structures, primarily for storage or visualization purposes.
+DOT (Graphviz): A simple, text-based language primarily used by the Graphviz toolkit.4 It supports directed (digraph) and undirected (graph) graphs, node and edge definitions, attributes (color, shape, labels), comments, and subgraphs (including cluster for visual grouping).4 Its strength lies in its readability and the power of Graphviz layout tools (dot, neato, etc.).4 However, DOT itself does not include direct generative capabilities; it describes a static graph structure.4 While concise for simple graphs 14, generating complex structures requires external scripting to produce the DOT text.
+GML (Graph Modelling Language): An ASCII-based format using hierarchical key-value lists.15 It aims for portability and extensibility, allowing arbitrary data structures to be associated with graph elements.16 It supports nodes, edges, attributes, and comments.15 While used by some tools, it is distinct from and less standardized than GraphML.15 Its key-value structure offers flexibility but can become verbose compared to DOT's direct syntax for simple connections.17
+GraphML: An XML-based standard format designed for generality, extensibility, and simplicity.18 It supports directed, undirected, mixed graphs, hypergraphs, and nested graphs (hierarchy).18 A key feature is its robust, typed attribute system using <key> definitions for nodes, edges, graphs, etc., allowing specification of attribute names, types (boolean, int, long, float, double, string), and default values.20 Its XML nature enables integration with other XML tools and complex data embedding (e.g., SVG for graphics) but also leads to significant verbosity compared to DOT or GML for basic structures.18 It is well-supported by libraries like NetworkX 23 and tools like Gephi.21
+Cypher Pattern Syntax: Primarily a declarative query language for property graph databases like Neo4j.24 Its ASCII-art style (:NodeLabel {prop:val})-->(:OtherLabel) is highly intuitive for matching graph patterns.24 While CREATE and MERGE clauses allow graph construction 24, its core design is optimized for querying existing graphs, not necessarily for concise generation of arbitrary structures from minimal input. However, its pattern-centric approach offers inspiration for defining structural motifs within a GGL. Tools like GraphRAG explore translating natural language to Cypher, highlighting the potential for high-level graph specification.30
+These existing languages provide valuable lessons. The simplicity and readability of DOT's core syntax are desirable.4 GraphML's typed attribute system and support for hierarchy offer robustness and expressiveness for metadata.18 Cypher's pattern matching provides an intuitive way to think about graph structures.24 However, none are explicitly designed as concise generative languages. A GGL should aim to capture DOT's simplicity for basic structure, GraphML's attribute power (without the XML verbosity), and introduce dedicated constructs for invoking or defining generative processes.
+B. Existing Graph Generation Libraries
+Libraries provide programmatic ways to generate graphs, offering a semantic foundation for a GGL.
+NetworkX: A prominent Python library for graph analysis and manipulation.31 It includes a comprehensive generators module capable of creating a vast array of graphs.5 These include:
+Classic Graphs: Complete graphs (complete_graph), cycle graphs (cycle_graph), path graphs (path_graph), grid graphs (grid_2d_graph), various trees (balanced, full r-ary), and composite graphs like barbell or lollipop graphs.5
+Random Graphs: Erdős-Rényi (erdos_renyi_graph), Watts-Strogatz small-world (watts_strogatz_graph), Barabási-Albert preferential attachment (barabasi_albert_graph).33
+Structured Graphs: Community graphs (caveman, stochastic block model), geometric graphs, expander graphs, trees, etc..5
+Generators are typically functions taking parameters (e.g., n for node count, p for probability, m for attachment count).5
+NetworkX demonstrates the kinds of generative operations a GGL should support. It provides a rich catalog of well-defined graph families and the parameters needed to specify instances of them.5 The GGL's role is not to reinvent these algorithms but to provide a concise language interface to invoke such underlying generation logic, abstracting away the specific library calls.
+C. Common Graph Structures and Generative Patterns
+The ability to generate graphs concisely relies on identifying the underlying rules, parameters, or algorithms that define them.
+Simple Parameterized Structures: Many classic graphs are defined by one or two parameters:
+Complete graph Kn​: n nodes, all possible edges.5 Parameter: n.
+Grid graph: m×n nodes connected to neighbors.34 Parameters: m,n, connectivity type (e.g., periodic).
+Path graph Pn​: n nodes in a line.5 Parameter: n.
+Cycle graph Cn​: n nodes in a ring.5 Parameter: n.
+Star graph Sn​: 1 central node connected to n leaves.5 Parameter: n.
+Balanced r-ary tree: Height h, branching factor r.5 Parameters: r,h.
+Algorithmic Generation Models: More complex structures arise from specific algorithms:
+Barabási-Albert (BA) Model: Generates scale-free networks exhibiting power-law degree distributions.8 Key mechanisms are growth (nodes added sequentially) and preferential attachment (new nodes connect preferentially to existing high-degree nodes).8 Parameters typically include the final number of nodes (n), the number of edges added with each new node (m), and potentially an initial seed graph.35
+Configuration Model: Generates a graph with a specific degree sequence by creating stubs for each node according to its degree and randomly connecting pairs of stubs.7 Parameter: Degree sequence.
+Stochastic Block Model (SBM): Models community structure by defining blocks (groups) of nodes and probabilities for edges within and between blocks.5 Parameters: Block sizes, intra-block probability matrix (pin​), inter-block probability matrix (pout​).
+Graph Grammars: Define graphs via transformation rules (productions) of the form LHS⇒RHS.39 Starting with an initial graph, rules are applied iteratively to find a subgraph matching the LHS and replace it with the RHS.39 This allows generation of complex, rule-based structures like fractals, trees, or even domain-specific models.41 The grammar itself (start symbol, terminal/non-terminal symbols, production rules) defines the generative process.40
+The conciseness sought by the GGL fundamentally depends on leveraging these underlying generative principles. Instead of listing every node and edge in a 1000-node complete graph, the GGL should allow generate complete(1000). Similarly, generating a BA network should involve specifying n and m, not the final edge list.35 For custom structures, defining grammar-like rules within the GGL offers a powerful, concise alternative to explicit construction.39
+III. Designing the Graph Generation Language (GGL)
+Building upon the foundations of existing languages and generative principles, the GGL requires careful design of its core components, syntax, and mechanisms for embedding generative rules.
+A. Core Elements and Operations
+The GGL must provide fundamental building blocks for graph specification:
+Nodes: Entities within the graph. Each node needs a unique identifier (e.g., a string or number) within the scope of the graph definition.11 Support for optional labels or types (e.g., :Person, type='router') allows for categorization.24 Syntax: node myNodeId; or node user123 :Person;.
+Edges: Connections between nodes. Edges must specify a source and target node using their identifiers.11 The language must explicitly support both directed (e.g., A -> B) and undirected (e.g., A -- B) edges, potentially with a graph-level default.4 Optional edge identifiers or types/labels (e.g., :FRIENDS, label="connects_to") are also necessary.20 Syntax: edge e1: A -> B; or edge conn1 (A -- B);.
+Attributes: Key-value data associated with graphs, nodes, or edges.4 The system should support common data types like string, integer, float/double, and boolean, similar to GraphML's attr.type.20 A flexible approach allows arbitrary keys, but typed attributes enhance robustness and facilitate processing by downstream tools. Default values for attributes, applicable if not explicitly set on an element, are also useful.20 Syntax: node N [color="red", size=10.5]; or graph [name="My Network", timestamp=1678886400]; or edge A -> B [weight=0.7, type="signal"];.
+Grouping/Subgraphs: Mechanisms to logically group nodes and edges are crucial for modularity, applying attributes or rules collectively, or defining hierarchical structures.11 This could range from simple named groups influencing layout (like DOT's subgraph { rank=same; A; B; } 11) to true nested graphs where nodes can contain entire subgraphs, as supported by GraphML.19 Syntax: group g1 { node A; node B; } or node C { graph nestedGraph {... } }.
+Clarity in defining these core elements is paramount. The syntax must unambiguously distinguish between node IDs, labels, attribute keys, and attribute values. Explicit type declarations for attributes, inspired by GraphML 20, prevent ambiguity and ensure data consistency, which is crucial for reliable generation and subsequent processing. Similarly, the directedness of edges must be clearly specified, either per-edge or via a graph default.20 Grouping mechanisms provide structure, allowing generators or rules to operate on specific graph parts or enabling the application of common attributes efficiently.
+B. Syntax Design: Balancing Conciseness, Expressiveness, and Parsability
+The syntax is the primary user interface to the GGL; its design critically impacts usability and power.44 The goal is a language that is easy to read and write for simple tasks but powerful enough for complex generation, embodying principles of minimal redundancy and maximal expressiveness within the graph generation domain.44
+Format: A text-based format is preferred over binary or verbose markup like XML.18 It should be human-readable and editable. Inspiration can be drawn from the simplicity of DOT 4 or potentially Python-like indentation for block structure, though the latter can add parsing complexity.6
+Declarative vs. Procedural Elements: A hybrid approach is necessary.
+Declarative: Define static graph components directly, similar to DOT or basic Cypher CREATE statements.4 This is suitable for specifying base structures, individual nodes/edges, or terminal parts of a generation process. Example: node A; node B; edge A -> B [weight=1.0];
+Procedural/Generative: Introduce commands or constructs to invoke algorithms or apply rules.5 This is essential for generating large or complex structures concisely. Example: generate complete(nodes=10, prefix="k"); or apply rule grow_tree 5 times;.
+The language must allow seamless mixing of these styles. A user might declare a few seed nodes and then apply generative rules to expand the graph.
+Syntax Principles:
+Readability: Use clear keywords (e.g., node, edge, graph, generate, rule, apply). Consider intuitive operators (e.g., -> for directed, -- for undirected).4 Avoid ambiguity; each construct should have a single interpretation.6
+Conciseness: Minimize boilerplate. Allow shorthand where appropriate (e.g., defining multiple nodes or edges in one statement if they share properties). Avoid unnecessary punctuation.11
+Expressiveness: Syntax must cover all core elements (nodes, edges, attributes, groups) and generative actions (invoking generators, defining/applying rules).
+Consistency: Use consistent conventions for identifiers, comments (e.g., # or // 4), block delimiters (e.g., {} 11), and attribute specification (e.g., [key=value,...]4).
+Potential Syntax Styles:
+Command-Based: Each statement is an action. Clear but potentially verbose.
+Code snippet
+NODE A;
+NODE B;
+EDGE A -> B [weight=1.0];
+GENERATE grid(rows=5, cols=5) AS g1;
+CONNECT A -> g1.node(0,0);
+
+
+Block-Based (DOT/C-like): Uses blocks {} for grouping definitions and generation scopes. Familiar structure.
+Code snippet
+graph myGraph {
+  node A;
+  node B;
+  edge A -> B [weight=1.0];
+
+  generate grid grid_section {
+    rows: 5;
+    cols: 5;
+  }
+
+  edge A -> grid_section.node(0,0);
+}
+
+
+Grammar-Inspired: Explicitly defines production rules within the syntax for generation. Powerful for rule-based generation but potentially complex syntax.
+Code snippet
+graph myGraph {
+  start node S;
+
+  rule expand {
+    S => S -> node A;
+  }
+
+  apply expand 3 times; // Generates S -> A1 -> A2 -> A3 (simplified example)
+}
+
+
+The choice of syntax style involves trade-offs. Command-based is explicit but can lack structure. Block-based offers familiar grouping. Grammar-inspired syntax integrates rule definition directly but might increase the learning curve. A block-based syntax, allowing both direct declarations and generate or rule/apply blocks, appears to offer a good balance between readability for simple cases and structured expression for complex generation tasks.
+The following table compares these styles for generating a simple 3-node path and a 4x4 grid:
+Task
+Command-Based Syntax
+Block-Based Syntax
+Grammar-Inspired Syntax (Conceptual)
+Simple Path (A->B->C)
+NODE A; NODE B; NODE C; <br> EDGE A -> B; EDGE B -> C;
+graph { node A; node B; node C; edge A -> B; edge B -> C; }
+graph { start node A; rule add_next { X => X -> node Y; } apply add_next 2 times starting A; }
+4x4 Grid
+GENERATE grid(rows=4, cols=4);
+graph { generate grid { rows: 4; cols: 4; } }
+graph { /* Complex rule definition for grid generation */ } (Likely impractical for standard grids compared to built-ins)
+Pros
+Explicit steps.
+Familiar structure, good grouping, balances declarative & generative.
+Powerful for custom recursive/rule-based structures.
+Cons
+Can be verbose, less visual structure.
+Requires understanding block scope.
+Potentially complex syntax, overkill for simple/standard graphs, rule definition might be separate.
+
+This comparison suggests that a block-based syntax incorporating generate commands for standard structures and potentially separate rule definitions offers a flexible and scalable approach.
+C. Incorporating Generative Rules and Patterns within the Syntax
+A key requirement is to move beyond static descriptions and allow concise specification of generative processes [User Query point 5].
+Parameterized Built-in Generators: The GGL should provide keywords or commands to invoke common graph generation algorithms, mirroring libraries like NetworkX.5 The syntax needs to support passing parameters like node counts, dimensions, probabilities, or attachment parameters.
+Example:
+Code snippet
+graph {
+  nodes K5 = generate complete(n=5);
+  nodes G = generate grid(rows=10, cols=10, periodic=false);
+  nodes SF = generate ba(n=100, m=3, initial_graph=K5); // Use K5 as seed
+}
+
+
+User-Defined Generative Rules: For custom or complex structures not covered by built-ins, users need to define their own rules.
+Graph Grammar Inspiration: A syntax inspired by graph transformation rules (LHS⇒RHS) provides a powerful mechanism.39 The LHS specifies a pattern (subgraph) to find, and the RHS specifies how to replace or augment it.39 Vertex equivalence between LHS and RHS needs clear definition (e.g., based on IDs or labels).39
+Example:
+Code snippet
+rule add_leaf {
+  // Find a node labeled 'intermediate'
+  lhs { node I :intermediate; }
+  // Replace it with itself, plus a new 'leaf' node attached
+  rhs { node I :intermediate -> node L :leaf; }
+}
+
+
+Pattern-Based Generation: Alternatively, syntax could focus on defining a structural pattern and rules for its repetition or connection, perhaps drawing inspiration from Cypher's pattern matching but adapted for creation.24 This might be more intuitive for certain repetitive structures than full graph grammars.
+Example (Conceptual): pattern P = (A -> B); repeat P 10 times connect last B to next A;
+Stochasticity: Allow probabilities in rule application or parameter choices.9
+Example: rule branch { lhs { A; } rhs { A -> B with 0.7; A -> C with 0.3; } }
+Control Flow for Generation: Applying rules or generators requires control mechanisms.
+Iteration: Specify how many times a rule should be applied (e.g., apply add_leaf 10 times;) or until a condition is met (e.g., apply branch while node_count < 50;).
+Selection: Choose which rules to apply based on context or probability.
+Sequencing: Define the order in which generation steps occur.
+This introduces procedural elements into the language.45 While full general-purpose programming constructs should likely be avoided to keep the language domain-specific, basic iteration and conditional logic focused on the generation process are necessary for complex tasks.9
+Templating/Macros: Define reusable graph snippets or generation procedures that can be instantiated with parameters. This promotes modularity and reduces redundancy for common custom patterns.
+The power of the GGL lies in this ability to blend declarative specification with procedural generation control. Defining a rule like add_leaf is declarative in specifying what transformation occurs. Controlling how often or under what conditions it's applied (apply add_leaf 10 times) is procedural.9 The syntax must support both aspects clearly. Grammar-based rules offer formal power 40, while parameterized built-ins provide conciseness for common cases.5
+IV. Implementing the Graph Generation Framework
+Translating the GGL design into a working framework involves parsing the language, managing an internal graph representation, translating language constructs into graph operations, and deciding on an execution strategy.
+A. Parsing the GGL Syntax
+Parsing transforms the GGL text into a structured representation that the framework can understand and execute.51
+Lexing and Parsing: This two-stage process first breaks the input string into a sequence of tokens (lexing – identifying keywords, identifiers, operators, literals) and then organizes these tokens into a hierarchical structure, typically an Abstract Syntax Tree (AST), according to the GGL's grammar rules (parsing).51
+Parser Generators: Tools like ANTLR (ANother Tool for Language Recognition) or PEG (Parsing Expression Grammar) libraries automate the creation of lexers and parsers.49
+ANTLR: A widely used, powerful parser generator.55 It takes a grammar file (usually in an EBNF-like format 54) defining lexer and parser rules and generates source code (in Java, Python, C#, JavaScript, etc.) for a parser that recognizes the language and builds a parse tree.51 It uses an advanced LL(*) parsing strategy, offering good performance and handling complex grammars.56 ANTLR provides mechanisms like Visitors and Listeners to traverse the generated parse tree and execute custom logic.51
+PEG Parsers: Based on Parsing Expression Grammars, which differ from traditional Context-Free Grammars (CFGs) primarily in their use of ordered choice (/).49 This means if the first alternative in a choice matches, others are not attempted, inherently resolving ambiguities found in CFGs.49 PEGs are often parsed using Packrat parsing, a memoized recursive descent technique guaranteeing linear parse time but potentially with higher constant overhead than ANTLR's LL().49 PEGs can sometimes express certain context-sensitive patterns or long lookaheads more naturally than LL() grammars.56
+Grammar Definition: The core of parsing is the formal grammar specifying the GGL's syntax.54 This includes defining all valid tokens (keywords like node, edge, generate; operators like ->, --; literals like numbers and strings; identifiers) and the rules for combining them into valid structures (node definitions, edge statements, attribute blocks, generator calls, rule definitions, control flow statements).
+Choice of Tool: ANTLR is a strong candidate due to its maturity, performance, wide language target support, good tooling (e.g., IDE plugins 53), and extensive documentation.51 While PEGs offer theoretical elegance in ambiguity resolution 49, ANTLR's practical advantages and performance often make it preferable for building robust parsers.56 The choice impacts how the grammar must be written (e.g., ANTLR's LL(*) has restrictions like avoiding left-recursion, though ANTLR has mechanisms to handle it 56) and the runtime performance of the parsing step.56
+B. Internal Graph Representation Strategies
+The framework needs an in-memory data structure to hold the graph as it is being generated. The choice impacts performance, memory usage, and flexibility.60
+Adjacency List: Represents the graph as an array or dictionary mapping each vertex ID to a list (or set) of its adjacent vertex IDs.61 For weighted or attributed edges, the list stores tuples or objects containing neighbor ID and edge data.61
+Pros: Space-efficient for sparse graphs (space complexity O(∣V∣+∣E∣)).61 Efficient iteration over a vertex's neighbors.64 Relatively fast node addition/deletion.64 Highly flexible.61
+Cons: Checking for the existence of a specific edge (u,v) requires searching u's neighbor list (worst-case O(degree(u)) time).61 Can exhibit poor cache locality due to pointer chasing in linked list implementations [60 (comment)].
+Adjacency Matrix: Uses a ∣V∣×∣V∣ matrix where entry [i][j] indicates the presence (or weight) of an edge from vertex i to vertex j.61
+Pros: Constant time O(1) edge existence check and edge addition/deletion.62 Potentially better cache performance for dense graphs or algorithms scanning all potential edges [64 (comment)]. Simpler concept for dense graphs.61
+Cons: Requires O(∣V∣2) space, highly inefficient for sparse graphs.61 Iterating over neighbors requires scanning a full row/column (O(∣V∣) time).64 Node addition/deletion is very expensive (O(∣V∣2) to resize/rebuild the matrix).64
+Object-Oriented Model: Defines Node and Edge classes. Nodes might contain collections of incident Edge objects or references to neighbor Node objects. Edges contain references to their source and target nodes. Attributes are stored as member variables of these objects.
+Pros: Conceptually clean, maps well to object-oriented design. Easy to attach complex data and behavior to nodes/edges. Structure is very flexible.
+Cons: Higher memory overhead due to object metadata and pointers. Performance can be limited by pointer chasing and reduced cache locality compared to contiguous array structures.60 Efficiency heavily depends on the specific implementation of neighbor lookups.
+Hybrid Structures: Modern graph processing systems often use hybrid approaches to balance trade-offs. For example, Compressed Sparse Row (CSR) is very fast for read-only operations but difficult to update. Structures like csr++ or LLAMA attempt to combine CSR's array-based performance with the update flexibility of adjacency lists, often using techniques like managing edge lists per vertex in arrays but allowing modifications or using versioning.60
+The ideal choice depends significantly on the expected graph density and, crucially, the dynamics of the generation process. If generation involves building a sparse graph incrementally with many node/edge additions, an adjacency list offers good performance and flexibility.64 If the generation process frequently checks for the existence of edges before adding them (e.g., to avoid duplicates in some grammar rules), an adjacency matrix's O(1) check is advantageous, but its space and node addition costs are prohibitive for large sparse graphs.62 If grammar rules involve complex subgraph matching and replacement, the efficiency of finding the LHS pattern and performing the modifications becomes critical, potentially favoring update-friendly structures.39 An adjacency list (using hash maps for O(1) average-case neighbor lookup if needed, or dynamic arrays) provides a good general-purpose starting point due to its flexibility and efficiency for sparse graphs, which are common in many domains. Hybrid structures 60 represent a more advanced option for optimizing both read and update performance if initial profiling indicates bottlenecks.
+The following table summarizes the trade-offs:
+
+Feature
+Adjacency List
+Adjacency Matrix
+Object Model (Typical)
+Hybrid (e.g., csr++)
+Space (Sparse Graph)
+$O(\$
+V\
++\
+E\
+Space (Dense Graph)
+$O(\$
+V\
+^2) (Okay)
+$O(\$
+Check Edge (u,v)
+O(degree(u)) worst
+O(1) (Excellent)
+Varies (O(1) to O(degree(u)))
+O(1) or O(log(degree(u)))
+Iterate Neighbors of u
+O(degree(u)) (Good)
+$O(\$
+V\
+) (Poor for sparse)
+Add Edge
+O(1) average
+O(1) (Excellent)
+O(1) average
+Fast
+Add Node
+O(1) average
+$O(\$
+V\
+^2) (Very Poor)
+Delete Node
+$O(\$
+E\
+) worst (update edges)
+$O(\$
+Suitability for Incremental
+High
+Low (due to node add/delete)
+High
+Very High
+
+C. Translating Language Constructs to Graph Structures (AST Traversal and Transformation)
+Once the GGL code is parsed into an AST 52, the framework must interpret this tree to build the graph in the chosen internal representation [User Query point 7].
+AST Traversal: The core mechanism is walking the AST.65 For parsers generated by ANTLR, the Visitor or Listener patterns are commonly used.51 A Visitor allows defining methods that are called when specific types of AST nodes are encountered during the traversal (e.g., visitNodeDefinition(ctx)).
+Semantic Analysis: Integrated with or preceding traversal, this phase checks for errors beyond syntax.52 This includes verifying that referenced nodes in edge definitions exist, checking attribute types against declarations (if using typed attributes), validating parameters passed to generators (e.g., n>0 for complete(n)), and resolving identifiers using a symbol table that stores defined nodes, rules, etc..52
+Mapping Constructs to Actions: The traversal logic translates AST nodes into actions on the internal graph representation:
+An AST node representing node A [type="user"]; triggers internal_graph.add_node('A', attributes={'type': 'user'}).
+An AST node for edge X -> Y [weight=5]; triggers internal_graph.add_edge('X', 'Y', attributes={'weight': 5}).
+An AST node for generate grid(rows=R, cols=C); invokes an internal function generator_library.create_grid(R, C) which modifies the internal_graph.5
+An AST node for rule R { LHS => RHS } might parse the LHS and RHS graph descriptions and store them in a structured format within a rule database.
+An AST node for apply R N times; triggers the rule execution engine to find matches for rule R's LHS in the internal_graph and apply the RHS transformation, repeating N times.39
+Intermediate Representation (IR) (Optional): For complex GGLs or if targeting multiple backends/optimizations, the AST could first be translated into a simpler, linear IR, like a sequence of basic graph operations (AddNode, AddEdge, SetAttribute) or three-address code.65 This can decouple the parsing logic from the final graph construction details. Code generation then proceeds from this IR.66
+The AST serves as the critical link between the high-level GGL syntax provided by the user and the low-level operations required to construct the graph data structure.52 The design of the AST traversal and transformation logic (whether using Visitors, Listeners, or direct tree walking) is where the semantics of the GGL are actually implemented.65
+D. Execution Strategy: Interpretation vs. Compilation for the GGL
+How the framework executes the parsed GGL script impacts development workflow, performance, and deployment.
+Interpreter: An interpreter processes the GGL script (or its AST/IR) directly at runtime.69 It reads a command or definition, performs the corresponding action (e.g., adds a node to the internal graph, calls a generator function), and proceeds to the next command.70
+Pros: Simpler to implement than a compiler. Faster development cycle – no separate compilation step is needed before running the generator script.71 Debugging can be more straightforward as errors occur directly during execution of the GGL logic.69 Offers flexibility, potentially allowing dynamic definition or modification of rules during generation.70 Often suitable for DSLs where runtime performance might be secondary to expressiveness and ease of use.44
+Cons: Generally slower execution compared to compiled code due to the "interpretive overhead" of analyzing constructs at runtime.70 The interpreter itself must be available wherever the GGL script needs to be run.69 Limited opportunities for global optimization across the entire generation process.70
+Compiler: A compiler translates the GGL script into executable code in another language (e.g., Python code using NetworkX, C++ code using a graph library) or even directly into machine code or bytecode.47 Running the GGL script involves first compiling it, then executing the generated output program.73
+Pros: The generated program typically runs significantly faster than an interpreted script, as analysis and optimization are done offline during compilation.70 The generated code can be distributed and run without the original GGL compiler.69 Can leverage the sophisticated optimizers of the target language's compiler (e.g., C++, Java).70
+Cons: More complex to implement, requiring code generation logic in addition to parsing and semantic analysis. Slower development cycle due to the added compilation step.71 Debugging involves two stages: debugging the GGL script itself and debugging the generated code.69
+Hybrid Approaches: Techniques like Just-In-Time (JIT) compilation translate parts of the script to machine code during runtime, offering a potential compromise between interpreter flexibility and compiler speed.71
+For a GGL, whose primary purpose is often to generate a graph structure once for later use, an interpreter is likely the most practical initial approach. The ease of implementation, rapid feedback loop during development, and flexibility align well with the goals of a DSL.44 While interpretation might be slower for generating extremely large or complex graphs 70, the generation time is often less critical than the time spent writing and debugging the GGL script itself. The framework could be designed modularly, however, allowing for future integration of a compiler for performance-critical sections or specific generation algorithms if bottlenecks arise. This decision directly impacts the user experience (instant execution vs. compile-then-run) and sets the performance characteristics of the generation process.71
+V. Output Generation and Integration
+Once the internal graph representation is populated according to the GGL script, the framework must provide ways to export this graph for use by other tools or applications.
+A. Exporting Generated Graphs: Supporting Standard Formats
+Interoperability requires the ability to serialize the generated graph into widely recognized formats.
+GraphML: An excellent choice due to its XML structure, strong support for typed attributes (<key>, <data>), hierarchical graphs, and extensibility.18 It is supported by many graph analysis and visualization tools, including NetworkX and Gephi.21 Implementation involves mapping the internal node/edge structure and attributes to the corresponding GraphML elements and attribute definitions.20
+GEXF (Graph Exchange XML Format): Another XML-based format, particularly suitable if the GGL supports generating dynamic graphs (graphs evolving over time), as GEXF has built-in support for time attributes (start, end, timeformat) and spells for elements existing over multiple intervals.74 It also supports attributes and basic hierarchy.77 It is the native format for Gephi.78
+JSON: A highly flexible, lightweight, and web-friendly format. Several conventions exist for representing graphs in JSON:
+Node-Link: Commonly used (e.g., by D3.js and NetworkX's node_link_data 79), typically involves separate lists/arrays for nodes (with IDs and attributes) and links or edges (referencing source/target IDs).79
+JSON Graph Format (JGF): A specific specification defining graph objects containing nodes (as an object/map keyed by ID) and edges (as an array of objects with source, target, relation, metadata etc.).80 Supports metadata and optional properties like directed and type.82
+Custom formats are also possible, but standardization aids interoperability.83 Serializing involves converting the internal graph and attributes into the chosen JSON structure.79
+DOT: Useful for quick visualization using Graphviz tools.4 The format is simple text, making serialization straightforward. However, it has limited support for complex, typed attributes compared to GraphML or GEXF, and hierarchical information might not be fully preserved or utilized by all layout engines.4
+Simple Text Formats (Edge List, Adjacency List): Formats like a simple list of edges (e.g., source target [weight]) or an adjacency list representation are easy to parse by custom scripts or simple tools.33 They are often lossy, typically discarding node and edge attributes unless a custom extended format is used.
+Implementation requires writing specific serializer functions for each target format. These functions traverse the internal graph structure (e.g., adjacency list or object model) and write out the corresponding text or XML according to the format's specification. Libraries like Python's xml.etree.ElementTree or json module can simplify this process. If using a library like NetworkX internally, its built-in writers can be leveraged.16
+B. Considerations for Visualization Output
+While the GGL's primary focus is generating graph structure and attributes, users often want to influence or specify visual aspects.
+Visual Attributes as Data: The most robust approach is to treat visual properties (e.g., color, size, shape, potentially even layout hints like position) as standard node or edge attributes within the GGL.12 These attributes can then be stored using the standard mechanisms of the chosen output format (e.g., GraphML <data> elements associated with appropriate <key> definitions 20, GEXF attributes 74, or fields in JSON objects 81).
+Leveraging External Tools: Visualization tools like Gephi or libraries like D3.js can then interpret these stored visual attributes to render the graph appropriately. For layout, exporting to DOT allows leveraging the sophisticated algorithms within Graphviz (dot, neato, fdp, circo).4
+Separation of Concerns: It is generally advisable to separate the concern of structural generation from visual layout and rendering. Graph layout is a complex problem in itself, and embedding sophisticated layout algorithms within the GGL framework significantly increases its scope and complexity. By storing visual properties as data, the GGL remains focused on generation while enabling downstream visualization tools to handle the presentation layer effectively.4 Directly generating final layout coordinates within the GGL is possible but often less flexible and powerful than using dedicated layout tools.
+VI. Synthesis and Recommendations
+Based on the analysis of existing technologies and the requirements for a concise graph generation language, the following recommendations are proposed for architecting and designing the GGL framework.
+A. Architecting a Cohesive Graph Generation Framework
+A modular architecture is recommended to separate concerns and facilitate development and extension:
+Frontend (Parser): Responsible for processing the GGL text.
+Input: GGL script (text file).
+Components: Lexer and Parser (generated by ANTLR is recommended 54).
+Output: Abstract Syntax Tree (AST).52
+Core (Engine): Interprets the AST and orchestrates graph generation.
+Input: AST.
+Components:
+Semantic Analyzer: Validates the AST, checks types, resolves references.52
+AST Interpreter: Traverses the AST and executes actions (Visitor/Listener pattern recommended 51).
+Rule Engine (if grammar-based rules are supported): Manages rule definitions, matching (LHS), and transformation (RHS).39
+Generator Library: Contains implementations for built-in generators (complete, grid, BA, etc.) callable by the interpreter.5
+Output: Populated internal graph structure.
+Backend (Storage): In-memory representation of the generated graph.
+Component: Internal Graph Data Structure (Adjacency List or Hybrid structure like CSR++ recommended for balance 60).
+Output (Serializers): Converts the internal graph structure to standard file formats.
+Input: Internal graph structure.
+Components: Serializer modules for GraphML, GEXF, JSON (Node-Link), DOT, etc..4
+Output: Graph files in specified formats.
+B. Key Design Recommendations for a Robust GGL
+Syntax: Adopt a hybrid text-based syntax that is concise and readable. It should seamlessly integrate simple declarative definitions (nodes, edges, attributes) with procedural/generative commands (invoking built-in generators, applying user-defined rules).4 A block-based structure ({}) can provide familiar scoping.11 Avoid XML verbosity.18
+Parsing: Utilize a mature parser generator like ANTLR 55 to create a robust parser from a formal grammar definition (EBNF-like).54 This simplifies development and ensures correctness.53
+Execution: Implement an interpreter first.69 This prioritizes ease of development, debugging, and flexibility, suitable for a DSL.44 However, design the core engine modularly to potentially allow for future compilation of performance-critical parts if needed.70
+Internal Representation: Choose a flexible and reasonably efficient structure like an adjacency list.61 For enhanced performance, especially if updates are frequent during generation, consider a hybrid structure like CSR++.60 The choice should reflect the expected graph sparsity and generation dynamics.64
+Generators: Provide a standard library of parameterized built-in generators for common graph types (complete, grid, tree, random models like BA, ER, WS) callable via simple GGL commands.5
+User Rules: Include a mechanism for users to define custom generative rules, potentially using a simplified graph grammar syntax (LHS⇒RHS) with clear semantics for pattern matching and replacement.39 Support for stochastic rules adds power.9
+Attributes: Implement a typed attribute system (supporting basic types like string, int, float, boolean) applicable to nodes, edges, and the graph itself, similar to GraphML's <key> system.20 Allow default attribute values.
+Error Handling: Implement robust error reporting during parsing (syntax errors), semantic analysis (type errors, undefined references), and generation (invalid parameters, inconsistent state).
+Output Formats: Support exporting the generated graph to multiple standard formats, including at least GraphML (for structure and attributes), JSON (for web/scripting integration), and DOT (for easy visualization via Graphviz).4
+C. Potential Extensions and Future Research Directions
+Dynamic Graphs: Extend the GGL and framework to support the generation of graphs that evolve over time, potentially using GEXF as the primary output format.75
+Constraint-Based Generation: Integrate with constraint satisfaction solvers to allow generation based on complex relational constraints rather than just direct construction or rules.
+Performance Optimization: Explore compilation of GGL scripts (or parts thereof) to a lower-level language or bytecode for improved performance on very large graphs.70 Investigate parallelization strategies for generation algorithms.
+Tooling: Develop IDE support (syntax highlighting, error checking, auto-completion) or a visual editor for the GGL.
+AI/LLM Integration: Investigate using Large Language Models to translate natural language descriptions or high-level goals into GGL scripts, similar to Text2Cypher efforts 30, potentially simplifying the creation of complex generation scripts.
+Graph Property Verification: Explore techniques to formally verify properties (e.g., connectivity, acyclicity, degree distribution bounds) of the graphs generated by specific GGL scripts or rules.
+By following these design principles and architectural recommendations, a powerful and concise graph generation framework can be developed, significantly simplifying the process of creating diverse graph structures for various applications. The emphasis on a hybrid declarative/procedural syntax, robust parsing, flexible internal representation, and support for both built-in and user-defined generation logic provides a solid foundation for a versatile tool.
+Works cited
+Procedural generation - Wikipedia, accessed April 24, 2025, https://en.wikipedia.org/wiki/Procedural_generation
+Diving Into Procedural Content Generation, With WorldEngine - Smashing Magazine, accessed April 24, 2025, https://www.smashingmagazine.com/2016/03/procedural-content-generation-introduction/
+How does one get started with procedural generation? - Stack Overflow, accessed April 24, 2025, https://stackoverflow.com/questions/155069/how-does-one-get-started-with-procedural-generation
+DOT (graph description language) - Wikipedia, accessed April 24, 2025, https://en.wikipedia.org/wiki/DOT_(graph_description_language)
+Graph generators — NetworkX 3.4.2 documentation, accessed April 24, 2025, https://networkx.org/documentation/stable/reference/generators.html
+Syntax - Computer Science, accessed April 24, 2025, https://cs.lmu.edu/~ray/notes/syntax/
+Scalable and Interpretable Graph Modeling with Graph Grammars 1 Introduction - Notre Dame Sites, accessed April 24, 2025, https://sites.nd.edu/ssikdar/files/2020/03/proposal-mar27-compressed.pdf
+4.5: Barabási-Albert model - Engineering LibreTexts, accessed April 24, 2025, https://eng.libretexts.org/Bookshelves/Computer_Science/Applied_Programming/Think_Complexity%3A_Exploring_Complexity_Science_with_Python_(Downey)/04%3A_Scale-free_networks/4.05%3A_Barabasi-Albert_model
+GIGL: A Domain Specific Language for Procedural Content Generation with Grammatical Representations, accessed April 24, 2025, https://motion.cs.umn.edu/pub/GIGLAIIDE/GIGL_aiide18.pdf
+Generative grammars as a form of procedural content generation - The Shaggy Dev, accessed April 24, 2025, https://shaggydev.com/2022/03/16/generative-grammars/
+DOT Language - Graphviz, accessed April 24, 2025, https://graphviz.org/doc/info/lang.html
+Graph Attributes - MIT, accessed April 24, 2025, https://web.mit.edu/spin_v4.2.5/share/graphviz/doc/html/info/attrs.html
+Drawing graphs with dot - Graphviz, accessed April 24, 2025, https://graphviz.org/pdf/dotguide.pdf
+Simple Graph - GraphViz Examples and Tutorial, accessed April 24, 2025, https://graphs.grevian.org/example
+Graph Modelling Language - Wikipedia, accessed April 24, 2025, https://en.wikipedia.org/wiki/Graph_Modelling_Language
+GML — NetworkX 3.4.2 documentation, accessed April 24, 2025, https://networkx.org/documentation/stable/reference/readwrite/gml.html
+GGL Tutorial: Graph Rewrite Rules - Theoretical Biochemistry Group, accessed April 24, 2025, https://www.tbi.univie.ac.at/software/GGL/Tutorials/tutorial-rules.pdf
+Graph Markup Language (GraphML) - Brown Computer Science, accessed April 24, 2025, https://cs.brown.edu/people/rtamassi/gdhandbook/chapters/graphml.pdf
+GraphML Specification, accessed April 24, 2025, http://graphml.graphdrawing.org/specification/dtd.html
+GraphML Primer, accessed April 24, 2025, http://graphml.graphdrawing.org/primer/graphml-primer.html
+GraphML Format - Gephi, accessed April 24, 2025, https://gephi.org/users/supported-graph-formats/graphml-format/
+GraphML Specification, accessed April 24, 2025, http://graphml.graphdrawing.org/specification.html
+graphml.py, accessed April 24, 2025, https://decoder-genetics.wustl.edu/software/conda/lib/python3.11/site-packages/networkx/readwrite/graphml.py
+What is Cypher - Getting Started - Neo4j, accessed April 24, 2025, https://neo4j.com/docs/getting-started/cypher/
+Cypher Query Language - TigerGraph, accessed April 24, 2025, https://www.tigergraph.com/glossary/cypher-query-language/
+A Guide to Graph Query Languages - Hypermode, accessed April 24, 2025, https://hypermode.com/blog/graph-query-languages
+Introduction to Graph Query Languages. From SPARQL to Gremlin., accessed April 24, 2025, https://graph.build/resources/graph-query-languages
+Patterns - Cypher Manual - Neo4j, accessed April 24, 2025, https://neo4j.com/docs/cypher-manual/current/patterns/
+GraphAcademy Live: Cypher Fundamentals - YouTube, accessed April 24, 2025, https://www.youtube.com/watch?v=K3nSwMheWng
+Text2Cypher - GraphRAG, accessed April 24, 2025, https://graphrag.com/reference/graphrag/text2cypher/
+Introduction — NetworkX 2.0.dev20161129121305 documentation, accessed April 24, 2025, https://pelegm-networkx.readthedocs.io/en/latest/reference/introduction.html
+NetworkX-style API - GraphScope documentation, accessed April 24, 2025, https://graphscope.io/docs/reference/networkx/
+Tutorial — NetworkX 3.4.2 documentation, accessed April 24, 2025, https://networkx.org/documentation/stable/tutorial.html
+Graph generators — NetworkX 1.9 documentation, accessed April 24, 2025, https://networkx.org/documentation/networkx-1.9/reference/generators.html
+barabasi_albert_graph — NetworkX 3.4.2 documentation, accessed April 24, 2025, https://networkx.org/documentation/stable/reference/generated/networkx.generators.random_graphs.barabasi_albert_graph.html
+Barabási–Albert model - Wikipedia, accessed April 24, 2025, https://en.wikipedia.org/wiki/Barab%C3%A1si%E2%80%93Albert_model
+eng.libretexts.org, accessed April 24, 2025, https://eng.libretexts.org/Bookshelves/Computer_Science/Applied_Programming/Think_Complexity%3A_Exploring_Complexity_Science_with_Python_(Downey)/04%3A_Scale-free_networks/4.05%3A_Barabasi-Albert_model#:~:text=The%20parameters%20are%20n%20%2C%20the,on%20a%20log%2Dlog%20scale.
+BarabasiAlbertGraphGenerator (JGraphT : a free Java graph library), accessed April 24, 2025, https://jgrapht.org/javadoc/org.jgrapht.core/org/jgrapht/generate/BarabasiAlbertGraphGenerator.html
+drobertadams/GraphGen: Graph Generation Grammar - GitHub, accessed April 24, 2025, https://github.com/drobertadams/GraphGen
+INTRODUCTION TO GRAPH GRAMMARS WITH APPLICATIONS TO SEMANTIC NETWORKS - CORE, accessed April 24, 2025, https://core.ac.uk/download/pdf/82566349.pdf
+A Graph Grammar for Modelling of 2D Shapes | CESCG, accessed April 24, 2025, https://cescg.org/wp-content/uploads/2019/03/Pogrzebacz-A-Graph-Grammar-for-Modelling-of-2D-Shapes.pdf
+Graph generation using a graph grammar, accessed April 24, 2025, https://ibisml.org/ibis2019/files/2019/11/slide_kajino.pdf
+Learning to generate feasible graphs using graph grammars - arXiv, accessed April 24, 2025, https://arxiv.org/pdf/2501.06003
+Domain-specific language - Wikipedia, accessed April 24, 2025, https://en.wikipedia.org/wiki/Domain-specific_language
+SE Radio 182: Domain-Specific Languages with Martin Fowler and Rebecca Parsons, accessed April 24, 2025, https://se-radio.net/2012/01/episode-182-domain-specific-languages-with-martin-fowler-and-rebecca-parsons/
+Design Spaces of Domain-Specific Languages: Comparing and Contrasting Approaches in PL and HCI - MIT Visualization Group, accessed April 24, 2025, https://vis.csail.mit.edu/pubs/dsl-design-spaces.pdf
+(PDF) Domain Specific Languages in Practice - ResearchGate, accessed April 24, 2025, https://www.researchgate.net/publication/275725872_Domain_Specific_Languages_in_Practice
+Syntax Design Constructs : r/ProgrammingLanguages - Reddit, accessed April 24, 2025, https://www.reddit.com/r/ProgrammingLanguages/comments/i85433/syntax_design_constructs/
+Parsing expression grammar - Wikipedia, accessed April 24, 2025, https://en.wikipedia.org/wiki/Parsing_expression_grammar
+Declarative programming - Wikipedia, accessed April 24, 2025, https://en.wikipedia.org/wiki/Declarative_programming
+The ANTLR Mega Tutorial - Federico Tomassetti, accessed April 24, 2025, https://tomassetti.me/antlr-mega-tutorial/
+Abstract syntax tree - Wikipedia, accessed April 24, 2025, https://en.wikipedia.org/wiki/Abstract_syntax_tree
+Introductions to DSLs with ANTLR - yalin.dev, accessed April 24, 2025, https://yalin.dev/blog/introduction-to-dsls-using-antlr/
+Generating Parsers with ANTLR 3 | Object Computing, Inc., accessed April 24, 2025, https://objectcomputing.com/resources/publications/sett/november-2007-generating-parsers-with-antlr-3
+ANTLR, accessed April 24, 2025, https://www.antlr.org/
+asking as a total noob, how does a PEG grammar compare to ANTLR's grammar? seems... | Hacker News, accessed April 24, 2025, https://news.ycombinator.com/item?id=2331234
+Using ANTLR to parse and calculate expressions (Part I) - Adaptive Financial Consulting, accessed April 24, 2025, https://weareadaptive.com/trading-resources/blog/using-antlr-parse-calculate-expressions-part/
+parsing - LL(*) versus PEG parsers : what is the difference? - Stack Overflow, accessed April 24, 2025, https://stackoverflow.com/questions/8816759/ll-versus-peg-parsers-what-is-the-difference/46743864
+Difference between a PEG and recursive descent parser? - Stack Overflow, accessed April 24, 2025, https://stackoverflow.com/questions/59157302/difference-between-a-peg-and-recursive-descent-parser
+CSR++: A Fast, Scalable, Update-Friendly Graph Data Structure - Oracle Labs, accessed April 24, 2025, https://labs.oracle.com/pls/apex/f?p=LABS:0:110997914434617:APPLICATION_PROCESS=GETDOC_INLINE:::DOC_ID:1580
+Representation of Graph in Data Structures - EnjoyAlgorithms, accessed April 24, 2025, https://www.enjoyalgorithms.com/blog/graph-representation-in-data-structures/
+Adjacency Matrix Vs. Adjacency List - HeyCoach | Blogs, accessed April 24, 2025, https://blog.heycoach.in/adjacency-matrix-vs-adjacency-list/
+Graph and its representations | GeeksforGeeks, accessed April 24, 2025, https://www.geeksforgeeks.org/graph-and-its-representations/
+What is better, adjacency lists or adjacency matrices for graph problems in C++?, accessed April 24, 2025, https://stackoverflow.com/questions/2218322/what-is-better-adjacency-lists-or-adjacency-matrices-for-graph-problems-in-c
+abstract syntax tree - How to go from AST to backend code? - Stack Overflow, accessed April 24, 2025, https://stackoverflow.com/questions/24457611/how-to-go-from-ast-to-backend-code
+How can an abstract-syntax tree be converted into linear three-address code?, accessed April 24, 2025, https://langdev.stackexchange.com/questions/1503/how-can-an-abstract-syntax-tree-be-converted-into-linear-three-address-code
+How to output assembly given a fully typed AST? : r/ProgrammingLanguages - Reddit, accessed April 24, 2025, https://www.reddit.com/r/ProgrammingLanguages/comments/7xpcd7/how_to_output_assembly_given_a_fully_typed_ast/
+General | Developer Tools | Abstract Syntax Tree - Codecademy, accessed April 24, 2025, https://www.codecademy.com/resources/docs/general/developer-tools/abstract-syntax-tree
+The difference between a compiler and an interpreter - Federico Tomassetti, accessed April 24, 2025, https://tomassetti.me/difference-between-compiler-interpreter/
+Interpreter (computing) - Wikipedia, accessed April 24, 2025, https://en.wikipedia.org/wiki/Interpreter_(computing)
+Compiler vs Interpreter: Understanding the Key Differences - Analytics Vidhya, accessed April 24, 2025, https://www.analyticsvidhya.com/blog/2024/06/compiler-and-interpreter/
+builtin.com, accessed April 24, 2025, https://builtin.com/software-engineering-perspectives/compiler-vs-interpreter#:~:text=Both%20compilers%20and%20interpreters%20have,while%20interpreted%20code%20runs%20slower.
+Compiler vs. Interpreter in Programming | Built In, accessed April 24, 2025, https://builtin.com/software-engineering-perspectives/compiler-vs-interpreter
+gexf-class function - RDocumentation, accessed April 24, 2025, https://www.rdocumentation.org/packages/rgexf/versions/0.16.3/topics/gexf-class
+Import Dynamic Data | Gephi Documentation, accessed April 24, 2025, https://docs.gephi.org/User_Manual/Import_Dynamic_Data/
+Dynamics - GEXF File Format, accessed April 24, 2025, https://gexf.net/dynamics.html
+GEXF File Format, accessed April 24, 2025, https://gexf.net/
+gexf | Gephi blog, accessed April 24, 2025, https://gephi.wordpress.com/tag/gexf/
+node_link_data — NetworkX 3.4.2 documentation, accessed April 24, 2025, https://networkx.org/documentation/stable/reference/readwrite/generated/networkx.readwrite.json_graph.node_link_data.html
+JSON Graph Format - XWiki, accessed April 24, 2025, https://wiki.rtsys.informatik.uni-kiel.de/bin/view/KIELER/Discontinued%20Projects/Web%20Services%20%28KWebS%29/Graph%20Formats/JSON%20Graph%20Format/
+gravis JSON Graph Format (gJGF) - GitHub Pages, accessed April 24, 2025, https://robert-haas.github.io/gravis-docs/rst/format_specification.html
+jsongraph/json-graph-specification: A proposal for representing graph structure (nodes / edges) in JSON. - GitHub, accessed April 24, 2025, https://github.com/jsongraph/json-graph-specification
+Representing a graph in JSON - Stack Overflow, accessed April 24, 2025, https://stackoverflow.com/questions/43052290/representing-a-graph-in-json
+GML - yFiles - Documentation - yWorks, accessed April 24, 2025, http://docs.yworks.com/yfiles/doc/developers-guide/gml.html
+Generating Domain-Specific Programs for Diagram Authoring with Large Language Models - Carnegie Mellon University, accessed April 24, 2025, https://www.cs.cmu.edu/~woden/assets/splash-23-llm-diagrams.pdf
+Discovering the Syntax and Strategies of Natural Language Programming with Generative Language Models - Gwern.net, accessed April 24, 2025, https://gwern.net/doc/ai/nn/transformer/gpt/lamda/2022-jiang.pdf

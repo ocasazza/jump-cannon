@@ -20,7 +20,6 @@
 
 <script setup lang="ts">
 import { computed, ref } from 'vue';
-import { useWasmStore } from '~/stores/wasm';
 import { useThemeStore } from '~/stores/theme';
 import { useActionsStore } from '~/stores/actions';
 import { useWorkspaceStore } from '~/stores/workspace';
@@ -29,7 +28,6 @@ import ActionParameterForm from '~/components/actions/ActionParameterForm.vue';
 import SettingsProvider from '~/components/SettingsProvider.vue';
 
 // Initialize stores
-await callOnce('init-wasm', () => useWasmStore().initialize());
 await callOnce('init-theme', () => useThemeStore().initialize());
 await callOnce('init-workspace', () => useWorkspaceStore().initialize());
 

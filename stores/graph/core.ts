@@ -1,6 +1,6 @@
 import { defineStore } from 'pinia'
 import { useNuxtApp } from 'nuxt/app'
-import type { LayoutManager } from '~/wasm/rust-graph-layouts/pkg/rust-graph-layouts'
+import type { LayoutManager } from '~/wasm/rust-graph-layouts/pkg/rust_graph_layouts'
 
 export interface Node {
   id: string
@@ -53,7 +53,7 @@ export const useGraphCoreStore = defineStore('graphCore', {
   },
 
   actions: {
-    async initialize(): Promise<void> {
+    initialize(): void {
       try {
         const nuxtApp = useNuxtApp()
         this.layoutManager = (nuxtApp.$createLayoutManager as () => LayoutManager)()
@@ -70,7 +70,7 @@ export const useGraphCoreStore = defineStore('graphCore', {
       try {
         // Initialize WASM if needed
         if (!this.layoutManager) {
-          await this.initialize()
+          this.initialize()
         }
 
         // Read file content
