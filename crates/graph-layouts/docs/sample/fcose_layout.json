@@ -1,0 +1,493 @@
+{
+  "edges": [
+    {
+      "source": "n1",
+      "target": "n2",
+      "weight": 3
+    },
+    {
+      "source": "n1",
+      "target": "n4",
+      "weight": 4
+    },
+    {
+      "source": "n1",
+      "target": "n6",
+      "weight": 8
+    },
+    {
+      "source": "n1",
+      "target": "n7",
+      "weight": 9
+    },
+    {
+      "source": "n1",
+      "target": "n9",
+      "weight": 8
+    },
+    {
+      "source": "n2",
+      "target": "n3",
+      "weight": 8
+    },
+    {
+      "source": "n2",
+      "target": "n5",
+      "weight": 3
+    },
+    {
+      "source": "n2",
+      "target": "n10",
+      "weight": 7
+    },
+    {
+      "source": "n3",
+      "target": "n5",
+      "weight": 5
+    },
+    {
+      "source": "n3",
+      "target": "n6",
+      "weight": 1
+    },
+    {
+      "source": "n3",
+      "target": "n7",
+      "weight": 1
+    },
+    {
+      "source": "n3",
+      "target": "n10",
+      "weight": 8
+    },
+    {
+      "source": "n4",
+      "target": "n7",
+      "weight": 3
+    },
+    {
+      "source": "n4",
+      "target": "n8",
+      "weight": 3
+    },
+    {
+      "source": "n5",
+      "target": "n7",
+      "weight": 1
+    },
+    {
+      "source": "n6",
+      "target": "n9",
+      "weight": 4
+    },
+    {
+      "source": "n7",
+      "target": "n10",
+      "weight": 1
+    },
+    {
+      "source": "n11",
+      "target": "n14",
+      "weight": 4
+    },
+    {
+      "source": "n11",
+      "target": "n17",
+      "weight": 8
+    },
+    {
+      "source": "n11",
+      "target": "n19",
+      "weight": 4
+    },
+    {
+      "source": "n14",
+      "target": "n18",
+      "weight": 4
+    },
+    {
+      "source": "n14",
+      "target": "n20",
+      "weight": 9
+    },
+    {
+      "source": "n15",
+      "target": "n18",
+      "weight": 6
+    },
+    {
+      "source": "n15",
+      "target": "n20",
+      "weight": 1
+    },
+    {
+      "source": "n21",
+      "target": "n24",
+      "weight": 3
+    },
+    {
+      "source": "n21",
+      "target": "n25",
+      "weight": 2
+    },
+    {
+      "source": "n21",
+      "target": "n28",
+      "weight": 5
+    },
+    {
+      "source": "n22",
+      "target": "n24",
+      "weight": 2
+    },
+    {
+      "source": "n22",
+      "target": "n26",
+      "weight": 3
+    },
+    {
+      "source": "n22",
+      "target": "n28",
+      "weight": 9
+    },
+    {
+      "source": "n22",
+      "target": "n29",
+      "weight": 5
+    },
+    {
+      "source": "n23",
+      "target": "n25",
+      "weight": 3
+    },
+    {
+      "source": "n23",
+      "target": "n26",
+      "weight": 8
+    },
+    {
+      "source": "n23",
+      "target": "n27",
+      "weight": 1
+    },
+    {
+      "source": "n24",
+      "target": "n25",
+      "weight": 4
+    },
+    {
+      "source": "n24",
+      "target": "n27",
+      "weight": 1
+    },
+    {
+      "source": "n24",
+      "target": "n28",
+      "weight": 4
+    },
+    {
+      "source": "n24",
+      "target": "n30",
+      "weight": 9
+    },
+    {
+      "source": "n25",
+      "target": "n27",
+      "weight": 9
+    },
+    {
+      "source": "n25",
+      "target": "n28",
+      "weight": 5
+    },
+    {
+      "source": "n27",
+      "target": "n29",
+      "weight": 8
+    },
+    {
+      "source": "n9",
+      "target": "n10",
+      "weight": 2
+    },
+    {
+      "source": "n10",
+      "target": "n20",
+      "weight": 2
+    },
+    {
+      "source": "n12",
+      "target": "n10",
+      "weight": 1
+    },
+    {
+      "source": "n19",
+      "target": "n7",
+      "weight": 4
+    },
+    {
+      "source": "n19",
+      "target": "n6",
+      "weight": 1
+    },
+    {
+      "source": "n9",
+      "target": "n23",
+      "weight": 3
+    },
+    {
+      "source": "n13",
+      "target": "n2",
+      "weight": 4
+    },
+    {
+      "source": "n1",
+      "target": "n5",
+      "weight": 2
+    },
+    {
+      "source": "n17",
+      "target": "n1",
+      "weight": 3
+    },
+    {
+      "source": "n8",
+      "target": "n27",
+      "weight": 4
+    },
+    {
+      "source": "n19",
+      "target": "n11",
+      "weight": 4
+    },
+    {
+      "source": "n17",
+      "target": "n29",
+      "weight": 4
+    },
+    {
+      "source": "n22",
+      "target": "n23",
+      "weight": 4
+    }
+  ],
+  "layout": {
+    "idealEdgeLength": 50,
+    "name": "fcose",
+    "nodeOverlap": 10,
+    "nodeRepulsion": 4500,
+    "quality": "default"
+  },
+  "nodes": [
+    {
+      "group": 5,
+      "id": "n1",
+      "label": "Node 1",
+      "shape": "triangle",
+      "size": 32.0
+    },
+    {
+      "group": 2,
+      "id": "n2",
+      "label": "Node 2",
+      "shape": "ellipse",
+      "size": 17.0
+    },
+    {
+      "group": 1,
+      "id": "n3",
+      "label": "Node 3",
+      "shape": "ellipse",
+      "size": 37.0
+    },
+    {
+      "group": 3,
+      "id": "n4",
+      "label": "Node 4",
+      "shape": "triangle",
+      "size": 37.0
+    },
+    {
+      "group": 5,
+      "id": "n5",
+      "label": "Node 5",
+      "shape": "ellipse",
+      "size": 24.0
+    },
+    {
+      "group": 5,
+      "id": "n6",
+      "label": "Node 6",
+      "shape": "rectangle",
+      "size": 38.0
+    },
+    {
+      "group": 1,
+      "id": "n7",
+      "label": "Node 7",
+      "shape": "triangle",
+      "size": 19.0
+    },
+    {
+      "group": 5,
+      "id": "n8",
+      "label": "Node 8",
+      "shape": "rectangle",
+      "size": 30.0
+    },
+    {
+      "group": 1,
+      "id": "n9",
+      "label": "Node 9",
+      "shape": "rectangle",
+      "size": 22.0
+    },
+    {
+      "group": 3,
+      "id": "n10",
+      "label": "Node 10",
+      "shape": "ellipse",
+      "size": 37.0
+    },
+    {
+      "group": 4,
+      "id": "n11",
+      "label": "Node 11",
+      "shape": "ellipse",
+      "size": 46.0
+    },
+    {
+      "group": 3,
+      "id": "n12",
+      "label": "Node 12",
+      "shape": "triangle",
+      "size": 47.0
+    },
+    {
+      "group": 4,
+      "id": "n13",
+      "label": "Node 13",
+      "shape": "triangle",
+      "size": 31.0
+    },
+    {
+      "group": 2,
+      "id": "n14",
+      "label": "Node 14",
+      "shape": "hexagon",
+      "size": 10.0
+    },
+    {
+      "group": 5,
+      "id": "n15",
+      "label": "Node 15",
+      "shape": "rectangle",
+      "size": 41.0
+    },
+    {
+      "group": 2,
+      "id": "n16",
+      "label": "Node 16",
+      "shape": "diamond",
+      "size": 41.0
+    },
+    {
+      "group": 3,
+      "id": "n17",
+      "label": "Node 17",
+      "shape": "diamond",
+      "size": 14.0
+    },
+    {
+      "group": 4,
+      "id": "n18",
+      "label": "Node 18",
+      "shape": "rectangle",
+      "size": 45.0
+    },
+    {
+      "group": 2,
+      "id": "n19",
+      "label": "Node 19",
+      "shape": "triangle",
+      "size": 17.0
+    },
+    {
+      "group": 4,
+      "id": "n20",
+      "label": "Node 20",
+      "shape": "triangle",
+      "size": 15.0
+    },
+    {
+      "group": 1,
+      "id": "n21",
+      "label": "Node 21",
+      "shape": "diamond",
+      "size": 39.0
+    },
+    {
+      "group": 2,
+      "id": "n22",
+      "label": "Node 22",
+      "shape": "diamond",
+      "size": 34.0
+    },
+    {
+      "group": 5,
+      "id": "n23",
+      "label": "Node 23",
+      "shape": "diamond",
+      "size": 36.0
+    },
+    {
+      "group": 4,
+      "id": "n24",
+      "label": "Node 24",
+      "shape": "triangle",
+      "size": 27.0
+    },
+    {
+      "group": 2,
+      "id": "n25",
+      "label": "Node 25",
+      "shape": "triangle",
+      "size": 40.0
+    },
+    {
+      "group": 5,
+      "id": "n26",
+      "label": "Node 26",
+      "shape": "hexagon",
+      "size": 24.0
+    },
+    {
+      "group": 2,
+      "id": "n27",
+      "label": "Node 27",
+      "shape": "triangle",
+      "size": 26.0
+    },
+    {
+      "group": 2,
+      "id": "n28",
+      "label": "Node 28",
+      "shape": "hexagon",
+      "size": 21.0
+    },
+    {
+      "group": 2,
+      "id": "n29",
+      "label": "Node 29",
+      "shape": "hexagon",
+      "size": 34.0
+    },
+    {
+      "group": 2,
+      "id": "n30",
+      "label": "Node 30",
+      "shape": "triangle",
+      "size": 18.0
+    }
+  ]
+}

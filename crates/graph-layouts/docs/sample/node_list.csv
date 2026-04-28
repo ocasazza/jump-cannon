@@ -1,0 +1,31 @@
+id,label,x,y,type,importance,description,created_date
+n1,Initiative Delta,927.1406531699429,96.91560333819815,project,1,"A innovation project focused on growth",2020-11-17
+n2,Machine Learning,83.56491270473265,93.72637642257531,technology,1,"A cutting-edge technology for businesses",2019-05-09
+n3,AR/VR,19.00732379101422,822.9142158598369,technology,1,"A cutting-edge technology for consumers",2017-07-12
+n4,Global Symposium,401.1221118833719,515.9393031300021,event,1,"An event held in 2023 focusing on networking",2024-03-06
+n5,Operation Horizon,648.686511767494,747.7779492362517,project,1,"A innovation project focused on efficiency",2017-08-06
+n6,Innovation Workshop,764.8101501667745,14.41647898918319,event,1,"An event held in 2023 focusing on collaboration",2024-03-14
+n7,Annual Hackathon,683.5626608294918,56.98521497617581,event,1,"An event held in annually focusing on education",2017-10-22
+n8,Machine Learning,763.6970504015732,892.571335050961,technology,1,"A established technology for consumers",2024-09-23
+n9,AdvancedInnovations,443.41945340208235,579.0107619160054,company,1,"A company specializing in hardware",2013-05-23
+n10,AI,55.46604982879688,813.197959966489,technology,1,"A revolutionary technology for consumers",2020-11-26
+n11,Robotics,786.4694010790676,525.2440985798938,technology,1,"A established technology for consumers",2022-07-25
+n12,Alice Johnson,96.26726849592005,196.38376393341207,person,1,"A professional in the field of research",2019-01-28
+n13,Global Conference,502.49538268712547,666.1147715987017,event,1,"An event held in 2023 focusing on innovation",2020-12-17
+n14,AdvancedTechnologies,272.8317215479656,17.513321085451228,company,1,"A company specializing in hardware",2017-08-27
+n15,John Davis,799.6219876551655,970.2885386721998,person,1,"A professional in the field of business",2021-01-24
+n16,Quantum Computing,895.9941844007917,610.9871820345934,technology,1,"A emerging technology for industries",2020-02-26
+n17,DigitalDynamics,226.42730687267832,326.6568090562727,company,1,"A company specializing in software",2018-12-17
+n18,Edward Williams,483.4575874278644,464.3661057249993,person,1,"A professional in the field of technology",2016-03-28
+n19,FutureTechnologies,134.32384037173816,48.19211662531875,company,1,"A company specializing in hardware",2021-03-20
+n20,Program Horizon,221.13201849453245,327.792622243444,project,1,"A research project focused on sustainability",2014-04-02
+n21,Plan Delta,451.82640760409345,358.3961076955198,project,1,"A innovation project focused on sustainability",2024-12-01
+n22,TechNetworks,792.3008433678873,877.8310950160877,company,1,"A company specializing in hardware",2011-01-26
+n23,International Hackathon,943.3927498172001,845.4978246732929,event,1,"An event held in 2024 focusing on collaboration",2019-04-05
+n24,Project Gamma,482.27842143525265,426.03746366914976,project,1,"A innovation project focused on efficiency",2017-10-26
+n25,DigitalTechnologies,830.5395425149395,570.359587056625,company,1,"A company specializing in research",2011-04-09
+n26,Global Conference,84.58373101343119,60.11491265802471,event,1,"An event held in 2023 focusing on innovation",2013-01-11
+n27,Diana Jones,532.6370198404031,704.5678914063593,person,1,"A professional in the field of education",2016-05-25
+n28,Robotics,889.9876562548341,596.7961765434118,technology,1,"A revolutionary technology for businesses",2020-03-16
+n29,AI,258.6346624022859,262.30334594992246,technology,1,"A revolutionary technology for consumers",2018-12-28
+n30,Program Phoenix,45.4566266880867,743.8278204152748,project,1,"A research project focused on transformation",2023-01-20

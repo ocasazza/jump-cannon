@@ -1,0 +1,705 @@
+{
+  "edges": [
+    {
+      "source": "n2",
+      "target": "n11",
+      "type": "implements",
+      "weight": 1.0
+    },
+    {
+      "source": "n31",
+      "target": "n13",
+      "type": "authored",
+      "weight": 1.0
+    },
+    {
+      "source": "n2",
+      "target": "n21",
+      "type": "used_in",
+      "weight": 1.0
+    },
+    {
+      "source": "n20",
+      "target": "n27",
+      "type": "developed_by",
+      "weight": 1.0
+    },
+    {
+      "source": "n4",
+      "target": "n29",
+      "type": "contributed_to",
+      "weight": 1.0
+    },
+    {
+      "source": "n18",
+      "target": "n20",
+      "type": "uses",
+      "weight": 1.0
+    },
+    {
+      "source": "n28",
+      "target": "n16",
+      "type": "used_in",
+      "weight": 1.0
+    },
+    {
+      "source": "n7",
+      "target": "n36",
+      "type": "authored",
+      "weight": 1.0
+    },
+    {
+      "source": "n9",
+      "target": "n11",
+      "type": "authored",
+      "weight": 1.0
+    },
+    {
+      "source": "n26",
+      "target": "n14",
+      "type": "cites",
+      "weight": 1.0
+    },
+    {
+      "source": "n12",
+      "target": "n11",
+      "type": "cites",
+      "weight": 1.0
+    },
+    {
+      "source": "n10",
+      "target": "n17",
+      "type": "includes",
+      "weight": 1.0
+    },
+    {
+      "source": "n33",
+      "target": "n15",
+      "type": "includes",
+      "weight": 1.0
+    },
+    {
+      "source": "n1",
+      "target": "n13",
+      "type": "contributed_to",
+      "weight": 1.0
+    },
+    {
+      "source": "n32",
+      "target": "n10",
+      "type": "contributed_to",
+      "weight": 1.0
+    },
+    {
+      "source": "n34",
+      "target": "n37",
+      "type": "affiliated_with",
+      "weight": 1.0
+    },
+    {
+      "source": "n21",
+      "target": "n31",
+      "type": "contributed_to",
+      "weight": 1.0
+    },
+    {
+      "source": "n17",
+      "target": "n14",
+      "type": "cites",
+      "weight": 1.0
+    },
+    {
+      "source": "n37",
+      "target": "n7",
+      "type": "cites",
+      "weight": 1.0
+    },
+    {
+      "source": "n37",
+      "target": "n31",
+      "type": "includes",
+      "weight": 1.0
+    },
+    {
+      "source": "n22",
+      "target": "n17",
+      "type": "uses",
+      "weight": 1.0
+    },
+    {
+      "source": "n22",
+      "target": "n20",
+      "type": "related",
+      "weight": 1.0
+    },
+    {
+      "source": "n40",
+      "target": "n5",
+      "type": "developed_by",
+      "weight": 1.0
+    },
+    {
+      "source": "n16",
+      "target": "n20",
+      "type": "uses",
+      "weight": 1.0
+    },
+    {
+      "source": "n12",
+      "target": "n3",
+      "type": "uses",
+      "weight": 1.0
+    },
+    {
+      "source": "n24",
+      "target": "n14",
+      "type": "uses",
+      "weight": 1.0
+    },
+    {
+      "source": "n25",
+      "target": "n34",
+      "type": "authored",
+      "weight": 1.0
+    },
+    {
+      "source": "n18",
+      "target": "n15",
+      "type": "related",
+      "weight": 1.0
+    },
+    {
+      "source": "n8",
+      "target": "n39",
+      "type": "authored",
+      "weight": 1.0
+    },
+    {
+      "source": "n4",
+      "target": "n30",
+      "type": "contributed_to",
+      "weight": 1.0
+    },
+    {
+      "source": "n28",
+      "target": "n22",
+      "type": "used_in",
+      "weight": 1.0
+    },
+    {
+      "source": "n38",
+      "target": "n5",
+      "type": "includes",
+      "weight": 1.0
+    },
+    {
+      "source": "n1",
+      "target": "n13",
+      "type": "authored",
+      "weight": 1.0
+    },
+    {
+      "source": "n2",
+      "target": "n29",
+      "type": "uses",
+      "weight": 1.0
+    },
+    {
+      "source": "n30",
+      "target": "n39",
+      "type": "related",
+      "weight": 1.0
+    },
+    {
+      "source": "n1",
+      "target": "n3",
+      "type": "affiliated_with",
+      "weight": 1.0
+    },
+    {
+      "source": "n24",
+      "target": "n30",
+      "type": "includes",
+      "weight": 1.0
+    },
+    {
+      "source": "n23",
+      "target": "n40",
+      "type": "cites",
+      "weight": 1.0
+    },
+    {
+      "source": "n18",
+      "target": "n20",
+      "type": "used_in",
+      "weight": 1.0
+    },
+    {
+      "source": "n37",
+      "target": "n8",
+      "type": "used_in",
+      "weight": 1.0
+    },
+    {
+      "source": "n10",
+      "target": "n22",
+      "type": "used_in",
+      "weight": 1.0
+    },
+    {
+      "source": "n11",
+      "target": "n39",
+      "type": "describes",
+      "weight": 1.0
+    },
+    {
+      "source": "n4",
+      "target": "n13",
+      "type": "authored",
+      "weight": 1.0
+    },
+    {
+      "source": "n30",
+      "target": "n2",
+      "type": "used_in",
+      "weight": 1.0
+    },
+    {
+      "source": "n30",
+      "target": "n20",
+      "type": "implements",
+      "weight": 1.0
+    },
+    {
+      "source": "n32",
+      "target": "n16",
+      "type": "uses",
+      "weight": 1.0
+    },
+    {
+      "source": "n32",
+      "target": "n1",
+      "type": "contributed_to",
+      "weight": 1.0
+    },
+    {
+      "source": "n14",
+      "target": "n18",
+      "type": "describes",
+      "weight": 1.0
+    },
+    {
+      "source": "n33",
+      "target": "n18",
+      "type": "used_in",
+      "weight": 1.0
+    },
+    {
+      "source": "n7",
+      "target": "n15",
+      "type": "contributed_to",
+      "weight": 1.0
+    },
+    {
+      "source": "n25",
+      "target": "n29",
+      "type": "contributed_to",
+      "weight": 1.0
+    },
+    {
+      "source": "n15",
+      "target": "n16",
+      "type": "used_in",
+      "weight": 1.0
+    },
+    {
+      "source": "n4",
+      "target": "n2",
+      "type": "affiliated_with",
+      "weight": 1.0
+    },
+    {
+      "source": "n27",
+      "target": "n35",
+      "type": "developed_by",
+      "weight": 1.0
+    },
+    {
+      "source": "n37",
+      "target": "n23",
+      "type": "cites",
+      "weight": 1.0
+    },
+    {
+      "source": "n40",
+      "target": "n11",
+      "type": "cites",
+      "weight": 1.0
+    },
+    {
+      "source": "n16",
+      "target": "n3",
+      "type": "contributed_to",
+      "weight": 1.0
+    },
+    {
+      "source": "n13",
+      "target": "n38",
+      "type": "cites",
+      "weight": 1.0
+    },
+    {
+      "source": "n40",
+      "target": "n11",
+      "type": "cites",
+      "weight": 1.0
+    },
+    {
+      "source": "n1",
+      "target": "n38",
+      "type": "contributed_to",
+      "weight": 1.0
+    }
+  ],
+  "nodes": [
+    {
+      "id": "n1",
+      "importance": 1.0,
+      "label": "Concept: Blockchain",
+      "type": "concept",
+      "x": 657.6849152408207,
+      "y": 500.1170114752164
+    },
+    {
+      "founded": 1983,
+      "id": "n2",
+      "importance": 1.0,
+      "label": "Organization: Microsoft",
+      "type": "organization",
+      "x": 128.55999086687632,
+      "y": 503.147128786971
+    },
+    {
+      "id": "n3",
+      "importance": 1.0,
+      "label": "Person: Alan Turing",
+      "type": "person",
+      "x": 160.65051466928693,
+      "y": 244.156794790387
+    },
+    {
+      "id": "n4",
+      "importance": 1.0,
+      "label": "Person: Grace Hopper",
+      "type": "person",
+      "x": 309.20612446364413,
+      "y": 226.34386254116023
+    },
+    {
+      "id": "n5",
+      "importance": 1.0,
+      "label": "Person: Tim Berners-Lee",
+      "type": "person",
+      "x": 352.7779595750633,
+      "y": 249.59814611504515
+    },
+    {
+      "id": "n6",
+      "importance": 1.0,
+      "label": "Concept: Quantum Computing",
+      "type": "concept",
+      "x": 251.31033532452776,
+      "y": 741.1507847348503
+    },
+    {
+      "id": "n7",
+      "importance": 1.0,
+      "label": "Person: Linus Torvalds",
+      "type": "person",
+      "x": 812.7415336097132,
+      "y": 321.9717472484277
+    },
+    {
+      "founded": 1974,
+      "id": "n8",
+      "importance": 1.0,
+      "label": "Organization: Apple",
+      "type": "organization",
+      "x": 748.9661167015126,
+      "y": 478.49671924924417
+    },
+    {
+      "id": "n9",
+      "importance": 1.0,
+      "label": "Person: Donald Knuth",
+      "type": "person",
+      "x": 155.50761912759927,
+      "y": 406.2257939878977
+    },
+    {
+      "id": "n10",
+      "importance": 1.0,
+      "label": "Concept: Cloud Computing",
+      "type": "concept",
+      "x": 229.62662889850435,
+      "y": 537.0566127342754
+    },
+    {
+      "id": "n11",
+      "importance": 1.0,
+      "label": "Paper: A Mathematical Theory of Communication",
+      "type": "paper",
+      "x": 364.6513550602793,
+      "y": 625.2061790557972,
+      "year": 1978
+    },
+    {
+      "id": "n12",
+      "importance": 1.0,
+      "label": "Paper: Computing Machinery and Intelligence",
+      "type": "paper",
+      "x": 468.5523029222075,
+      "y": 860.3778922783839,
+      "year": 2015
+    },
+    {
+      "id": "n13",
+      "importance": 1.0,
+      "label": "Paper: On Computable Numbers",
+      "type": "paper",
+      "x": 159.07689072758404,
+      "y": 592.6675339587432,
+      "year": 1958
+    },
+    {
+      "id": "n14",
+      "importance": 1.0,
+      "label": "Paper: The Anatomy of a Large-Scale Hypertextual Web Search Engine",
+      "type": "paper",
+      "x": 1089.66502294974,
+      "y": 162.86463659256736,
+      "year": 2021
+    },
+    {
+      "id": "n15",
+      "importance": 1.0,
+      "label": "Concept: Edge Computing",
+      "type": "concept",
+      "x": 668.6765931832773,
+      "y": 414.5481841582177
+    },
+    {
+      "id": "n16",
+      "importance": 1.0,
+      "label": "Application: Social Media",
+      "type": "application",
+      "users_millions": 807,
+      "x": 648.6595807755734,
+      "y": 812.3738853323002
+    },
+    {
+      "id": "n17",
+      "importance": 1.0,
+      "label": "Concept: Internet of Things",
+      "type": "concept",
+      "x": 149.97944192991343,
+      "y": 844.6504820360935
+    },
+    {
+      "id": "n18",
+      "importance": 1.0,
+      "label": "Concept: Big Data",
+      "type": "concept",
+      "x": 581.48902759063,
+      "y": 486.0436462025083
+    },
+    {
+      "id": "n19",
+      "importance": 1.0,
+      "label": "Concept: Data Science",
+      "type": "concept",
+      "x": 704.8921413328369,
+      "y": 671.5455757563061
+    },
+    {
+      "founded": 1920,
+      "id": "n20",
+      "importance": 1.0,
+      "label": "Organization: Amazon",
+      "type": "organization",
+      "x": 1143.1026208377616,
+      "y": 426.8119935379179
+    },
+    {
+      "id": "n21",
+      "importance": 1.0,
+      "label": "Person: Barbara Liskov",
+      "type": "person",
+      "x": 425.75097860230846,
+      "y": 719.21474291122
+    },
+    {
+      "id": "n22",
+      "importance": 1.0,
+      "label": "Application: E-commerce",
+      "type": "application",
+      "users_millions": 4019,
+      "x": 288.47703915484055,
+      "y": 385.09052823401043
+    },
+    {
+      "id": "n23",
+      "importance": 1.0,
+      "label": "Paper: MapReduce: Simplified Data Processing on Large Clusters",
+      "type": "paper",
+      "x": 153.04617058910884,
+      "y": 891.2492024775935,
+      "year": 1973
+    },
+    {
+      "founded": 1990,
+      "id": "n24",
+      "importance": 1.0,
+      "label": "Organization: Google",
+      "type": "organization",
+      "x": 248.94012956860792,
+      "y": 522.5461482845635
+    },
+    {
+      "id": "n25",
+      "importance": 1.0,
+      "label": "Person: Vint Cerf",
+      "type": "person",
+      "x": 727.4366426241636,
+      "y": 548.7635320661446
+    },
+    {
+      "founded": 1966,
+      "id": "n26",
+      "importance": 1.0,
+      "label": "Organization: Facebook",
+      "type": "organization",
+      "x": 711.8331505071985,
+      "y": 488.54991541408947
+    },
+    {
+      "id": "n27",
+      "importance": 1.0,
+      "label": "Paper: The PageRank Citation Ranking",
+      "type": "paper",
+      "x": 272.35470499406506,
+      "y": 798.0667248931013,
+      "year": 1992
+    },
+    {
+      "id": "n28",
+      "importance": 1.0,
+      "label": "Concept: Artificial Intelligence",
+      "type": "concept",
+      "x": 495.5498478861826,
+      "y": 472.23240702242606
+    },
+    {
+      "id": "n29",
+      "importance": 1.0,
+      "label": "Concept: Cybersecurity",
+      "type": "concept",
+      "x": 405.04575021426444,
+      "y": 179.30546821940752
+    },
+    {
+      "id": "n30",
+      "importance": 1.0,
+      "label": "Concept: DevOps",
+      "type": "concept",
+      "x": 1133.847349566258,
+      "y": 626.8433289598496
+    },
+    {
+      "id": "n31",
+      "importance": 1.0,
+      "label": "Concept: Microservices",
+      "type": "concept",
+      "x": 975.4512304106908,
+      "y": 245.4119048107424
+    },
+    {
+      "id": "n32",
+      "importance": 1.0,
+      "label": "Person: Margaret Hamilton",
+      "type": "person",
+      "x": 1011.2118775351637,
+      "y": 612.6630399532063
+    },
+    {
+      "founded": 1938,
+      "id": "n33",
+      "importance": 1.0,
+      "label": "Organization: Intel",
+      "type": "organization",
+      "x": 241.3539341303118,
+      "y": 540.8812530840486
+    },
+    {
+      "id": "n34",
+      "importance": 1.0,
+      "label": "Paper: Attention Is All You Need",
+      "type": "paper",
+      "x": 1151.9457980310294,
+      "y": 702.4770042395901,
+      "year": 1996
+    },
+    {
+      "id": "n35",
+      "importance": 1.0,
+      "label": "Application: Cloud Storage",
+      "type": "application",
+      "users_millions": 2059,
+      "x": 177.78489618743023,
+      "y": 565.0922739077332
+    },
+    {
+      "id": "n36",
+      "importance": 1.0,
+      "label": "Person: John McCarthy",
+      "type": "person",
+      "x": 220.26757497631843,
+      "y": 431.9089215172642
+    },
+    {
+      "founded": 1999,
+      "id": "n37",
+      "importance": 1.0,
+      "label": "Organization: AMD",
+      "type": "organization",
+      "x": 667.2075456799413,
+      "y": 631.3340659047374
+    },
+    {
+      "id": "n38",
+      "importance": 1.0,
+      "label": "Paper: Design Patterns: Elements of Reusable Object-Oriented Software",
+      "type": "paper",
+      "x": 1134.0593071746875,
+      "y": 737.050785000705,
+      "year": 1970
+    },
+    {
+      "id": "n39",
+      "importance": 1.0,
+      "label": "Concept: Serverless",
+      "type": "concept",
+      "x": 564.4177998241341,
+      "y": 138.36407819406188
+    },
+    {
+      "id": "n40",
+      "importance": 1.0,
+      "label": "Paper: A Relational Model of Data for Large Shared Data Banks",
+      "type": "paper",
+      "x": 384.4855158068104,
+      "y": 654.4059393677081,
+      "year": 1961
+    }
+  ]
+}

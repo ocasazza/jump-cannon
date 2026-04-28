@@ -1,0 +1,29 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/graph-layouts",
+    "crates/graph-renderer",
+    "crates/graph-ui",
+    "crates/vault-search",
+    "crates/tvix-wasm",
+]
+
+[workspace.dependencies]
+# Shared versions — crates reference these with `workspace = true`
+bevy       = { version = "0.16", default-features = false }
+serde      = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio      = { version = "1", features = ["full"] }
+wasm-bindgen = "0.2"
+rand       = "0.8"
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1

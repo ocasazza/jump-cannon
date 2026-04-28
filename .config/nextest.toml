@@ -1,0 +1,24 @@
+[profile.default]
+fail-fast = false
+
+[profile.ci]
+fail-fast = true
+retries = 2
+test-threads = 4
+
+# Unit tests: fast, no I/O
+[profile.unit]
+fail-fast = false
+filter = "test(/unit::/ | package(tvix-wasm) | package(vault-search))"
+
+# Integration tests: may do file I/O
+[profile.integration]
+fail-fast = false
+test-threads = 2
+filter = "test(/integration::/)"
+
+# E2E tests: headless Bevy, slower
+[profile.e2e]
+fail-fast = false
+test-threads = 1
+filter = "test(/e2e::/)"

@@ -1,0 +1,43 @@
+[package]
+name = "graph-generators"
+version = "0.1.0"
+edition = "2021"
+description = "Sample data generators for knowledge-base-graph"
+
+[dependencies]
+rand = "0.8"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+csv = "1.1"
+
+[[bin]]
+name = "generate_json_graph"
+path = "generate_json_graph.rs"
+
+[[bin]]
+name = "generate_csv_graph"
+path = "generate_csv_graph.rs"
+
+[[bin]]
+name = "generate_dot_graph"
+path = "generate_dot_graph.rs"
+
+[[bin]]
+name = "generate_layout_graph"
+path = "generate_layout_graph.rs"
+
+[[bin]]
+name = "generate_large_graph"
+path = "generate_large_graph.rs"
+
+[[bin]]
+name = "generate_domain_graph"
+path = "generate_domain_graph.rs"
+
+[[bin]]
+name = "generate_medicine_graph"
+path = "generate_medicine_graph.rs"
+
+[[bin]]
+name = "run_generators"
+path = "run_generators.rs"

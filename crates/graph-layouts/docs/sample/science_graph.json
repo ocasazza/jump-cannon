@@ -1,0 +1,486 @@
+{
+  "edges": [
+    {
+      "source": "n20",
+      "target": "n25",
+      "type": "related_to",
+      "weight": 1.0
+    },
+    {
+      "source": "n16",
+      "target": "n28",
+      "type": "works_at",
+      "weight": 1.0
+    },
+    {
+      "source": "n14",
+      "target": "n24",
+      "type": "related_to",
+      "weight": 1.0
+    },
+    {
+      "source": "n14",
+      "target": "n16",
+      "type": "discovered_by",
+      "weight": 1.0
+    },
+    {
+      "source": "n20",
+      "target": "n3",
+      "type": "discovered_by",
+      "weight": 1.0
+    },
+    {
+      "source": "n2",
+      "target": "n13",
+      "type": "part_of",
+      "weight": 1.0
+    },
+    {
+      "source": "n11",
+      "target": "n2",
+      "type": "published_in",
+      "weight": 1.0
+    },
+    {
+      "source": "n25",
+      "target": "n15",
+      "type": "published_in",
+      "weight": 1.0
+    },
+    {
+      "source": "n23",
+      "target": "n17",
+      "type": "related_to",
+      "weight": 1.0
+    },
+    {
+      "source": "n30",
+      "target": "n6",
+      "type": "published_in",
+      "weight": 1.0
+    },
+    {
+      "source": "n15",
+      "target": "n14",
+      "type": "published_in",
+      "weight": 1.0
+    },
+    {
+      "source": "n22",
+      "target": "n20",
+      "type": "works_at",
+      "weight": 1.0
+    },
+    {
+      "source": "n16",
+      "target": "n22",
+      "type": "published_in",
+      "weight": 1.0
+    },
+    {
+      "source": "n16",
+      "target": "n19",
+      "type": "part_of",
+      "weight": 1.0
+    },
+    {
+      "source": "n5",
+      "target": "n28",
+      "type": "part_of",
+      "weight": 1.0
+    },
+    {
+      "source": "n20",
+      "target": "n5",
+      "type": "related_to",
+      "weight": 1.0
+    },
+    {
+      "source": "n27",
+      "target": "n7",
+      "type": "part_of",
+      "weight": 1.0
+    },
+    {
+      "source": "n6",
+      "target": "n9",
+      "type": "published_in",
+      "weight": 1.0
+    },
+    {
+      "source": "n12",
+      "target": "n2",
+      "type": "published_in",
+      "weight": 1.0
+    },
+    {
+      "source": "n16",
+      "target": "n23",
+      "type": "related_to",
+      "weight": 1.0
+    },
+    {
+      "source": "n29",
+      "target": "n21",
+      "type": "part_of",
+      "weight": 1.0
+    },
+    {
+      "source": "n9",
+      "target": "n20",
+      "type": "works_at",
+      "weight": 1.0
+    },
+    {
+      "source": "n14",
+      "target": "n21",
+      "type": "discovered_by",
+      "weight": 1.0
+    },
+    {
+      "source": "n18",
+      "target": "n27",
+      "type": "discovered_by",
+      "weight": 1.0
+    },
+    {
+      "source": "n1",
+      "target": "n21",
+      "type": "works_at",
+      "weight": 1.0
+    },
+    {
+      "source": "n14",
+      "target": "n26",
+      "type": "related_to",
+      "weight": 1.0
+    },
+    {
+      "source": "n7",
+      "target": "n27",
+      "type": "part_of",
+      "weight": 1.0
+    },
+    {
+      "source": "n18",
+      "target": "n4",
+      "type": "published_in",
+      "weight": 1.0
+    },
+    {
+      "source": "n14",
+      "target": "n28",
+      "type": "related_to",
+      "weight": 1.0
+    },
+    {
+      "source": "n5",
+      "target": "n17",
+      "type": "published_in",
+      "weight": 1.0
+    },
+    {
+      "source": "n16",
+      "target": "n17",
+      "type": "related_to",
+      "weight": 1.0
+    },
+    {
+      "source": "n8",
+      "target": "n4",
+      "type": "works_at",
+      "weight": 1.0
+    },
+    {
+      "source": "n13",
+      "target": "n16",
+      "type": "works_at",
+      "weight": 1.0
+    },
+    {
+      "source": "n4",
+      "target": "n13",
+      "type": "works_at",
+      "weight": 1.0
+    },
+    {
+      "source": "n27",
+      "target": "n24",
+      "type": "discovered_by",
+      "weight": 1.0
+    },
+    {
+      "source": "n23",
+      "target": "n21",
+      "type": "published_in",
+      "weight": 1.0
+    },
+    {
+      "source": "n14",
+      "target": "n13",
+      "type": "related_to",
+      "weight": 1.0
+    },
+    {
+      "source": "n5",
+      "target": "n4",
+      "type": "works_at",
+      "weight": 1.0
+    },
+    {
+      "source": "n30",
+      "target": "n21",
+      "type": "works_at",
+      "weight": 1.0
+    },
+    {
+      "source": "n14",
+      "target": "n26",
+      "type": "works_at",
+      "weight": 1.0
+    },
+    {
+      "source": "n29",
+      "target": "n9",
+      "type": "works_at",
+      "weight": 1.0
+    },
+    {
+      "source": "n25",
+      "target": "n16",
+      "type": "published_in",
+      "weight": 1.0
+    },
+    {
+      "source": "n27",
+      "target": "n14",
+      "type": "part_of",
+      "weight": 1.0
+    },
+    {
+      "source": "n14",
+      "target": "n19",
+      "type": "part_of",
+      "weight": 1.0
+    },
+    {
+      "source": "n29",
+      "target": "n4",
+      "type": "discovered_by",
+      "weight": 1.0
+    }
+  ],
+  "nodes": [
+    {
+      "id": "n1",
+      "label": "Science Node 1",
+      "type": "science",
+      "x": 399.4239781428505,
+      "y": 225.82982634658498
+    },
+    {
+      "id": "n2",
+      "label": "Science Node 2",
+      "type": "science",
+      "x": 535.2735365754277,
+      "y": 260.68781444798435
+    },
+    {
+      "id": "n3",
+      "label": "Science Node 3",
+      "type": "science",
+      "x": 934.5141632614536,
+      "y": 248.09679907083063
+    },
+    {
+      "id": "n4",
+      "label": "Science Node 4",
+      "type": "science",
+      "x": 351.04161692351784,
+      "y": 742.9252226873584
+    },
+    {
+      "id": "n5",
+      "label": "Science Node 5",
+      "type": "science",
+      "x": 167.14139832761137,
+      "y": 530.0499020669816
+    },
+    {
+      "id": "n6",
+      "label": "Science Node 6",
+      "type": "science",
+      "x": 250.19685244151367,
+      "y": 552.3015305400962
+    },
+    {
+      "id": "n7",
+      "label": "Science Node 7",
+      "type": "science",
+      "x": 731.2841529767909,
+      "y": 802.4028100910364
+    },
+    {
+      "id": "n8",
+      "label": "Science Node 8",
+      "type": "science",
+      "x": 814.9859574108546,
+      "y": 724.4846277570117
+    },
+    {
+      "id": "n9",
+      "label": "Science Node 9",
+      "type": "science",
+      "x": 919.2127620060475,
+      "y": 138.67194696152615
+    },
+    {
+      "id": "n10",
+      "label": "Science Node 10",
+      "type": "science",
+      "x": 565.8215671564404,
+      "y": 381.9265944380596
+    },
+    {
+      "id": "n11",
+      "label": "Science Node 11",
+      "type": "science",
+      "x": 420.79749624438944,
+      "y": 818.4792789773734
+    },
+    {
+      "id": "n12",
+      "label": "Science Node 12",
+      "type": "science",
+      "x": 497.98173313437064,
+      "y": 542.9189499243181
+    },
+    {
+      "id": "n13",
+      "label": "Science Node 13",
+      "type": "science",
+      "x": 1015.8827435211932,
+      "y": 890.9092822341033
+    },
+    {
+      "id": "n14",
+      "label": "Science Node 14",
+      "type": "science",
+      "x": 594.4049702387779,
+      "y": 135.44483403336312
+    },
+    {
+      "id": "n15",
+      "label": "Science Node 15",
+      "type": "science",
+      "x": 1130.581173631651,
+      "y": 862.4225345652002
+    },
+    {
+      "id": "n16",
+      "label": "Science Node 16",
+      "type": "science",
+      "x": 1162.9393784309927,
+      "y": 184.79696529902245
+    },
+    {
+      "id": "n17",
+      "label": "Science Node 17",
+      "type": "science",
+      "x": 853.4443852770665,
+      "y": 673.7820006717038
+    },
+    {
+      "id": "n18",
+      "label": "Science Node 18",
+      "type": "science",
+      "x": 869.2409805186908,
+      "y": 640.3574530829982
+    },
+    {
+      "id": "n19",
+      "label": "Science Node 19",
+      "type": "science",
+      "x": 1002.3372372038875,
+      "y": 549.4072990385096
+    },
+    {
+      "id": "n20",
+      "label": "Science Node 20",
+      "type": "science",
+      "x": 294.1210490052739,
+      "y": 587.4506949448236
+    },
+    {
+      "id": "n21",
+      "label": "Science Node 21",
+      "type": "science",
+      "x": 162.34162174324,
+      "y": 359.3798486987358
+    },
+    {
+      "id": "n22",
+      "label": "Science Node 22",
+      "type": "science",
+      "x": 1062.0731645664705,
+      "y": 685.4963610068318
+    },
+    {
+      "id": "n23",
+      "label": "Science Node 23",
+      "type": "science",
+      "x": 209.27926308300943,
+      "y": 386.81741756042794
+    },
+    {
+      "id": "n24",
+      "label": "Science Node 24",
+      "type": "science",
+      "x": 1000.8419449016133,
+      "y": 640.3074064816287
+    },
+    {
+      "id": "n25",
+      "label": "Science Node 25",
+      "type": "science",
+      "x": 162.223175685261,
+      "y": 257.6912080038293
+    },
+    {
+      "id": "n26",
+      "label": "Science Node 26",
+      "type": "science",
+      "x": 710.5219658098302,
+      "y": 370.3047755913566
+    },
+    {
+      "id": "n27",
+      "label": "Science Node 27",
+      "type": "science",
+      "x": 1154.7970166629548,
+      "y": 747.8382054611135
+    },
+    {
+      "id": "n28",
+      "label": "Science Node 28",
+      "type": "science",
+      "x": 304.0178625742161,
+      "y": 222.60707169671025
+    },
+    {
+      "id": "n29",
+      "label": "Science Node 29",
+      "type": "science",
+      "x": 423.6686501857619,
+      "y": 137.21087604265935
+    },
+    {
+      "id": "n30",
+      "label": "Science Node 30",
+      "type": "science",
+      "x": 955.6953981104356,
+      "y": 746.1063578397604
+    }
+  ]
+}

@@ -1,0 +1,85 @@
+digraph KnowledgeGraph {
+  // Graph attributes
+  graph [rankdir=LR, splines=true, overlap=false, nodesep=0.8, ranksep=1.0];
+  node [shape=box, style="rounded,filled", fontname=Arial, fontsize=12];
+  edge [fontname=Arial, fontsize=10];
+
+  // Nodes
+  n1 [label="Parallel Standard", fillcolor=lightblue, shape=ellipse, tooltip="concept node"];
+  n2 [label="Web Specialist", fillcolor=lightgreen, shape=box, tooltip="person node"];
+  n3 [label="Scrum Planning", fillcolor=lavender, shape=diamond, tooltip="process node"];
+  n4 [label="Compiler Tool", fillcolor=lightcoral, shape=component, tooltip="tool node"];
+  n5 [label="Container Tool", fillcolor=lightcoral, shape=component, tooltip="tool node"];
+  n6 [label="BDD Development", fillcolor=lavender, shape=diamond, tooltip="process node"];
+  n7 [label="Security Database", fillcolor=lightyellow, shape=folder, tooltip="resource node"];
+  n8 [label="Asynchronous Standard", fillcolor=lightblue, shape=ellipse, tooltip="concept node"];
+  n9 [label="Data Manager", fillcolor=lightgreen, shape=box, tooltip="person node"];
+  n10 [label="Monitoring Database", fillcolor=lightyellow, shape=folder, tooltip="resource node"];
+  n11 [label="Management Service", fillcolor=lightyellow, shape=folder, tooltip="resource node"];
+  n12 [label="Automation SDK", fillcolor=lightyellow, shape=folder, tooltip="resource node"];
+  n13 [label="Declarative Design Pattern", fillcolor=lightblue, shape=ellipse, tooltip="concept node"];
+  n14 [label="DevOps Development", fillcolor=lavender, shape=diamond, tooltip="process node"];
+  n15 [label="IDE Tool", fillcolor=lightcoral, shape=component, tooltip="tool node"];
+  n16 [label="Scrum Maintenance", fillcolor=lavender, shape=diamond, tooltip="process node"];
+  n17 [label="Parallel Methodology", fillcolor=lightblue, shape=ellipse, tooltip="concept node"];
+  n18 [label="Automation Platform", fillcolor=lightyellow, shape=folder, tooltip="resource node"];
+  n19 [label="Cloud Engineer", fillcolor=lightgreen, shape=box, tooltip="person node"];
+  n20 [label="Version Control Tool", fillcolor=lightcoral, shape=component, tooltip="tool node"];
+  n21 [label="Reactive Algorithm", fillcolor=lightblue, shape=ellipse, tooltip="concept node"];
+  n22 [label="Waterfall Development", fillcolor=lavender, shape=diamond, tooltip="process node"];
+  n23 [label="Analytics Service", fillcolor=lightyellow, shape=folder, tooltip="resource node"];
+  n24 [label="Waterfall Review", fillcolor=lavender, shape=diamond, tooltip="process node"];
+  n25 [label="Distributed Paradigm", fillcolor=lightblue, shape=ellipse, tooltip="concept node"];
+
+  // Edges
+  n1 -> n20 [label="analyzed_with", weight=5, tooltip="analyzed_with (5 weight)"];
+  n13 -> n25 [label="extends", weight=10, tooltip="extends (10 weight)"];
+  n2 -> n9 [label="mentors", weight=1, tooltip="mentors (1 weight)"];
+  n23 -> n3 [label="enables", weight=8, tooltip="enables (8 weight)"];
+  n19 -> n11 [label="maintains", weight=7, tooltip="maintains (7 weight)"];
+  n13 -> n15 [label="supported_by", weight=10, tooltip="supported_by (10 weight)"];
+  n13 -> n23 [label="stored_in", weight=3, tooltip="stored_in (3 weight)"];
+  n4 -> n2 [label="built_by", weight=8, tooltip="built_by (8 weight)"];
+  n19 -> n22 [label="manages", weight=5, tooltip="manages (5 weight)"];
+  n19 -> n1 [label="understands", weight=10, tooltip="understands (10 weight)"];
+  n25 -> n3 [label="applied_in", weight=9, tooltip="applied_in (9 weight)"];
+  n22 -> n19 [label="followed_by", weight=9, tooltip="followed_by (9 weight)"];
+  n25 -> n14 [label="guides", weight=5, tooltip="guides (5 weight)"];
+  n2 -> n12 [label="maintains", weight=7, tooltip="maintains (7 weight)"];
+  n25 -> n5 [label="supported_by", weight=3, tooltip="supported_by (3 weight)"];
+  n23 -> n17 [label="stores", weight=6, tooltip="stores (6 weight)"];
+  n14 -> n12 [label="constrained_by", weight=7, tooltip="constrained_by (7 weight)"];
+  n5 -> n9 [label="built_by", weight=9, tooltip="built_by (9 weight)"];
+  n10 -> n14 [label="constrains", weight=8, tooltip="constrains (8 weight)"];
+  n23 -> n14 [label="constrains", weight=4, tooltip="constrains (4 weight)"];
+  n14 -> n12 [label="constrained_by", weight=2, tooltip="constrained_by (2 weight)"];
+  n19 -> n1 [label="teaches", weight=2, tooltip="teaches (2 weight)"];
+  n11 -> n6 [label="enables", weight=2, tooltip="enables (2 weight)"];
+  n21 -> n17 [label="relates_to", weight=9, tooltip="relates_to (9 weight)"];
+  n5 -> n13 [label="supports", weight=9, tooltip="supports (9 weight)"];
+  n19 -> n16 [label="follows", weight=5, tooltip="follows (5 weight)"];
+  n18 -> n4 [label="managed_by", weight=10, tooltip="managed_by (10 weight)"];
+  n17 -> n15 [label="built_with", weight=3, tooltip="built_with (3 weight)"];
+  n14 -> n10 [label="constrained_by", weight=5, tooltip="constrained_by (5 weight)"];
+  n24 -> n21 [label="guided_by", weight=9, tooltip="guided_by (9 weight)"];
+  n2 -> n18 [label="maintains", weight=1, tooltip="maintains (1 weight)"];
+  n5 -> n21 [label="supports", weight=4, tooltip="supports (4 weight)"];
+  n13 -> n22 [label="applied_in", weight=10, tooltip="applied_in (10 weight)"];
+  n5 -> n10 [label="manages", weight=5, tooltip="manages (5 weight)"];
+  n1 -> n22 [label="part_of", weight=5, tooltip="part_of (5 weight)"];
+  n9 -> n1 [label="understands", weight=7, tooltip="understands (7 weight)"];
+  n9 -> n8 [label="understands", weight=4, tooltip="understands (4 weight)"];
+  n6 -> n1 [label="applies", weight=2, tooltip="applies (2 weight)"];
+  n6 -> n16 [label="includes", weight=7, tooltip="includes (7 weight)"];
+  n16 -> n11 [label="constrained_by", weight=8, tooltip="constrained_by (8 weight)"];
+  n12 -> n1 [label="implements", weight=8, tooltip="implements (8 weight)"];
+  n21 -> n15 [label="supported_by", weight=9, tooltip="supported_by (9 weight)"];
+  n15 -> n2 [label="built_by", weight=8, tooltip="built_by (8 weight)"];
+  n23 -> n15 [label="deployed_with", weight=5, tooltip="deployed_with (5 weight)"];
+  n7 -> n17 [label="implements", weight=10, tooltip="implements (10 weight)"];
+  n10 -> n17 [label="provides_access_to", weight=7, tooltip="provides_access_to (7 weight)"];
+  n11 -> n14 [label="supports", weight=3, tooltip="supports (3 weight)"];
+  n2 -> n15 [label="operates", weight=8, tooltip="operates (8 weight)"];
+  n3 -> n1 [label="contains", weight=10, tooltip="contains (10 weight)"];
+  n22 -> n3 [label="alternates_with", weight=10, tooltip="alternates_with (10 weight)"];
+}
