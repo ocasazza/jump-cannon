@@ -65,6 +65,25 @@ pub fn click_select_system(
     }
 }
 
+/// Hide non-matching nodes when focus mode is active.
+pub fn focus_mode_system(
+    ui_state: Res<crate::state::ui::UiState>,
+    mut nodes: Query<(&GraphNode, &mut Visibility)>,
+) {
+    let should_filter = ui_state.focus_mode && !ui_state.search_query.is_empty();
+    for (node, mut vis) in nodes.iter_mut() {
+        *vis = if should_filter {
+            if ui_state.search_results.contains(&node.id) {
+                Visibility::Inherited
+            } else {
+                Visibility::Hidden
+            }
+        } else {
+            Visibility::Inherited
+        };
+    }
+}
+
 /// Tint hovered nodes slightly brighter.
 pub fn highlight_hover_system(
     hover: Res<HoverState>,

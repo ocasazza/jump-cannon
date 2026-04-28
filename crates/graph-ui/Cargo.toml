@@ -13,6 +13,7 @@ name = "graph_ui"
 path = "src/lib.rs"
 
 [dependencies]
+dirs          = "5"
 fuzzy-matcher = "0.3"
 vault-data    = { path = "../vault-data" }
 vault-links   = { path = "../vault-links" }

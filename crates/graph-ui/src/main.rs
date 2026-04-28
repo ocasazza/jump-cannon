@@ -4,14 +4,16 @@ use bevy_egui::EguiPlugin;
 use graph_ui::actions::ActionRegistry;
 use graph_ui::graph::render::draw_edges;
 use graph_ui::graph::simulation::{spawn_graph, run_fcose_layout, SimParams};
-use graph_ui::graph::interaction::{HoverState, SelectionState, hover_system, click_select_system, highlight_hover_system};
+use graph_ui::graph::interaction::{HoverState, SelectionState, hover_system, click_select_system, highlight_hover_system, focus_mode_system};
 use graph_ui::state::ui::UiState;
 use graph_ui::systems::camera::{setup_camera, keyboard_camera_system, mouse_pan_system, mouse_zoom_system};
 use graph_ui::systems::input::handle_input;
 use graph_ui::systems::modal::modal_system;
 use graph_ui::systems::palette::{dispatch_actions, palette_system, ExecuteAction};
+use graph_ui::systems::search::search_system;
 use graph_ui::systems::sidebar::sidebar_system;
 use graph_ui::systems::status_bar::status_bar_system;
+use graph_ui::systems::persistence::{restore_view_state, save_view_on_exit};
 use graph_ui::register_actions;
 use graph_ui::vault::{VaultGraphResource, load_vault_system};
 
@@ -26,7 +28,7 @@ fn main() {
         .init_resource::<HoverState>()
         .init_resource::<SelectionState>()
         .add_event::<ExecuteAction>()
-        .add_systems(Startup, (register_actions, setup_camera))
+        .add_systems(Startup, (register_actions, setup_camera, restore_view_state))
         .add_systems(
             Update,
             (
@@ -39,6 +41,9 @@ fn main() {
                 hover_system,
                 click_select_system,
                 highlight_hover_system,
+                // Search and focus
+                search_system,
+                focus_mode_system,
                 // UI systems
                 handle_input,
                 sidebar_system,
@@ -50,6 +55,8 @@ fn main() {
                 keyboard_camera_system,
                 mouse_pan_system,
                 mouse_zoom_system,
+                // Persistence
+                save_view_on_exit,
             ),
         )
         .run();

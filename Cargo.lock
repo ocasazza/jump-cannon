@@ -2920,6 +2920,7 @@ version = "0.1.0"
 dependencies = [
  "bevy",
  "bevy_egui",
+ "dirs 5.0.1",
  "fuzzy-matcher",
  "graph-layouts",
  "graph-metrics",
