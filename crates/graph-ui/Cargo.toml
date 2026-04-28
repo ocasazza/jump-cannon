@@ -14,6 +14,10 @@ path = "src/lib.rs"
 
 [dependencies]
 fuzzy-matcher = "0.3"
+vault-data    = { path = "../vault-data" }
+vault-links   = { path = "../vault-links" }
+graph-metrics = { path = "../graph-metrics" }
+graph-layouts = { path = "../graph-layouts" }
 
 bevy = { version = "0.16", default-features = false, features = [
     "bevy_asset",

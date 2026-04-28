@@ -6,6 +6,7 @@ pub struct UiState {
     pub sidebar_open: bool,
     pub sidebar_width: f32,
     pub active_tab: SidebarTab,
+    pub modal_open: bool,
 }
 
 impl Default for UiState {
@@ -15,6 +16,7 @@ impl Default for UiState {
             sidebar_open: true,
             sidebar_width: 240.0,
             active_tab: SidebarTab::default(),
+            modal_open: false,
         }
     }
 }

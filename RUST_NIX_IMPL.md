@@ -438,3 +438,357 @@ nodes | nix { nodes: filter (n: n.pagerank > 0.01) nodes }
 | `jump-cannon/components/CommandPalette.vue` | UX reference for egui port |
 | `jump-cannon/plugins/register-actions.ts` | 13 built-in actions |
 | `obsidian/nix/packages/vault-search/src/` | Rust HTTP API (keep unchanged) |
+
+---
+
+## vault-graph-cosmos Feature Port
+
+The Python app (`vault-graph-cosmos`, ~3600 lines) is the feature reference. These phases port its ~100 features into the Rust monorepo. All new crates added to `Cargo.toml` workspace members.
+
+### New workspace dependencies (add to root `Cargo.toml`)
+
+```toml
+petgraph   = "0.6"
+indexmap   = { version = "2", features = ["serde"] }
+serde_yaml = "0.9"
+regex      = "1"
+rayon      = "1"
+reqwest    = { version = "0.12", features = ["json"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+rand       = "0.8"
+```
+
+---
+
+## Phase 0 — vault-data: Shared Types Crate
+
+**Milestone:** All other crates can `use vault_data::*` for the canonical graph types.
+
+- [ ] Create `crates/vault-data/Cargo.toml` (`name = "vault-data"`, deps: serde, serde_json, indexmap)
+- [ ] Add `crates/vault-data` to workspace `members`
+- [ ] `src/lib.rs` — re-export all public types
+- [ ] `src/types.rs`:
+  ```rust
+  pub type NodeId = String;
+
+  #[derive(Debug, Clone, Serialize, Deserialize)]
+  pub struct NodeMeta {
+      pub id: NodeId,
+      pub title: String,
+      pub path: String,
+      pub tags: Vec<String>,
+      pub frontmatter: IndexMap<String, serde_json::Value>,
+  }
+
+  #[derive(Debug, Clone, Serialize, Deserialize)]
+  pub struct NodeMetrics {
+      pub pagerank: f64,
+      pub betweenness: f64,
+      pub degree: usize,
+      pub kcore: usize,
+      pub community: usize,
+      pub wcc: usize,
+  }
+
+  #[derive(Debug, Clone, Serialize, Deserialize)]
+  pub struct VaultNode {
+      pub meta: NodeMeta,
+      pub metrics: NodeMetrics,
+      pub x: f32,
+      pub y: f32,
+      pub pinned: bool,
+  }
+
+  #[derive(Debug, Clone, Serialize, Deserialize)]
+  pub struct VaultEdge {
+      pub source: NodeId,
+      pub target: NodeId,
+  }
+
+  #[derive(Debug, Default, Clone, Serialize, Deserialize)]
+  pub struct VaultGraph {
+      pub nodes: IndexMap<NodeId, VaultNode>,
+      pub edges: Vec<VaultEdge>,
+  }
+  ```
+- [ ] `src/schema.rs`:
+  ```rust
+  #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+  pub enum FieldType { Text, Number, Bool, List, Entity, Date, Url, Unknown }
+
+  #[derive(Debug, Clone, Serialize, Deserialize)]
+  pub struct FieldSchema {
+      pub name: String,
+      pub field_type: FieldType,
+      pub values: Vec<String>,   // enumerated values for filter dropdowns
+      pub count: usize,
+  }
+  ```
+- [ ] `src/palette.rs` — 17-color community palette as `pub const PALETTE: [Color32; 17]` (egui-compatible)
+- [ ] **Verify:** `cargo check -p vault-data` ✓
+
+---
+
+## Phase 1 — vault-links: Wikilink Extraction
+
+**Milestone:** Given a vault root, emit `VaultGraph` (nodes + edges) with populated `NodeMeta` and `FieldSchema` list.
+
+- [ ] Create `crates/vault-links/Cargo.toml` (deps: vault-data, serde, serde_json, serde_yaml, regex, ignore, rayon)
+- [ ] Add to workspace members
+- [ ] `src/walker.rs` — `build_walker(vault_root)` using `ignore::WalkBuilder`:
+  - Exclusions: `.obsidian/`, `Excalidraw/`, `Ink/`, `_hippo/`, `*.base`, `*.canvas`
+  - Returns `ignore::Walk` iterator over `.md` files
+- [ ] `src/frontmatter.rs` — `split_frontmatter(content) -> (Option<IndexMap<String,Value>>, &str)`:
+  - Parse YAML block between `---` delimiters via `serde_yaml`
+  - Returns `(frontmatter_map, body)`
+- [ ] `src/extractor.rs` — `extract_links(body) -> Vec<String>`:
+  - Regex: `\[\[([^\]|#]+)(?:[|#][^\]]*)?\]\]` captures wikilink targets
+  - Strip path prefix, extension, heading anchors
+- [ ] `src/lib.rs` — `pub fn build_vault_graph(vault_root: &Path) -> (VaultGraph, Vec<FieldSchema>)`:
+  1. First pass (rayon par_iter): collect all basenames → `HashMap<basename, Vec<full_path>>` for disambiguation
+  2. Second pass: for each `.md` file:
+     - `split_frontmatter` → populate `NodeMeta` (id=relative path, title=H1 or filename, tags from frontmatter)
+     - `extract_links` → emit edges (resolve basename via disambiguation map)
+  3. Collect `FieldSchema` by iterating all frontmatter keys across all nodes; infer `FieldType` from value shape
+  4. Return `(VaultGraph, Vec<FieldSchema>)`
+- [ ] `src/doctype.rs` — detect doctype from frontmatter `type`/`doctype` field or path prefix (maps to `.opencode/doctypes.json` categories)
+- [ ] Unit tests: disambiguation, wikilink extraction, frontmatter parse, doctype detection
+- [ ] **Verify:** `cargo test -p vault-links` ✓; test against vault fixture with ≥3 notes
+
+---
+
+## Phase 2 — graph-metrics: Petgraph Analytics
+
+**Milestone:** Given `VaultGraph` edges, compute and attach all `NodeMetrics` fields.
+
+- [ ] Create `crates/graph-metrics/Cargo.toml` (deps: vault-data, petgraph, rand, rayon)
+- [ ] Add to workspace members
+- [ ] `src/lib.rs` — `pub fn compute_metrics(graph: &mut VaultGraph)`:
+  - Build `petgraph::Graph<NodeId, ()>` from `graph.edges`
+  - Attach computed metrics to each `graph.nodes[id].metrics`
+- [ ] `src/pagerank.rs` — damping=0.85, max_iter=100, ε=1e-6 power iteration; normalize to [0,1]
+- [ ] `src/betweenness.rs` — Brandes algorithm on petgraph; normalize by `(n-1)(n-2)/2`; rayon parallelized
+- [ ] `src/kcore.rs` — iterative k-core decomposition; store core number as `kcore`
+- [ ] `src/wcc.rs` — petgraph `connected_components` for undirected version; label each component
+- [ ] `src/degree.rs` — in+out degree per node; stored as `degree`
+- [ ] `src/community.rs` — greedy Louvain (~150 lines):
+  - Initialize each node as its own community
+  - Phase 1: iterate nodes, move to neighbor community that maximizes modularity gain; repeat until stable
+  - Phase 2: contract graph; repeat until no improvement
+  - Seed with `rand::SeedableRng::seed_from_u64(42)` for reproducibility
+- [ ] Unit tests: PageRank on star graph, k-core on known graph, WCC on disconnected graph, community on two cliques
+- [ ] **Verify:** `cargo test -p graph-metrics` ✓
+
+---
+
+## Phase 3 — Bevy Resource Wiring
+
+**Milestone:** `VaultGraphResource` loaded at startup; graph data accessible to all Bevy systems.
+
+- [ ] Add `vault-data`, `vault-links`, `graph-metrics` as deps to `graph-ui/Cargo.toml`
+- [ ] `src/state/graph.rs`:
+  ```rust
+  #[derive(Resource, Default)]
+  pub struct VaultGraphResource {
+      pub graph: VaultGraph,
+      pub schema: Vec<FieldSchema>,
+      pub loaded: bool,
+  }
+
+  #[derive(Resource, Default)]
+  pub struct SelectionState {
+      pub hovered: Option<NodeId>,
+      pub selected: Option<NodeId>,
+      pub pinned: HashSet<NodeId>,
+  }
+  ```
+- [ ] `src/systems/graph_load.rs` — `load_vault_graph` startup system:
+  - Read `VAULT_ROOT` env var (default `~/vault` or argv[1])
+  - Call `vault_links::build_vault_graph(root)`
+  - Call `graph_metrics::compute_metrics(&mut graph)`
+  - Store in `VaultGraphResource`
+  - Spawn Bevy entities (one per node) with `Transform`, custom marker component `GraphNode { id }`
+- [ ] Register `VaultGraphResource` and `SelectionState` as resources in `main.rs`
+- [ ] Add `load_vault_graph` to `Startup` systems
+- [ ] **Verify:** `cargo run -p graph-ui -- /path/to/vault` → logs node count at startup ✓
+
+---
+
+## Phase 4 — Force Simulation + Rendering
+
+**Milestone:** Nodes laid out by force-directed simulation; edges drawn; color modes working.
+
+### Force simulation
+
+- [ ] `src/systems/force_sim.rs` — Verlet integration, run each `Update` frame when not converged:
+  - Repulsion: `F = k² / dist` (Barnes-Hut quadtree optional, O(n log n))
+  - Attraction (edges): `F = dist² / k` with spring constant
+  - Gravity: weak pull toward origin, strength=0.05
+  - Damping: velocity *= 0.9 each step
+  - Pinned nodes: zero velocity, fixed position
+  - Convergence: stop when max displacement < 0.5px
+  - Expose `SimState { running: bool, alpha: f32 }` resource; UI can pause/resume
+
+### Rendering
+
+- [ ] `src/systems/render_nodes.rs` — sync `VaultNode.{x,y}` → Bevy `Transform` each frame
+- [ ] Node visual: `Sprite` with circle mesh (radius proportional to `degree.sqrt()`); color by active color mode
+- [ ] Color modes (enum in `UiState`):
+  - `Community` — PALETTE[community % 17]
+  - `Pagerank` — lerp red→yellow→green by normalized pagerank
+  - `Degree` — lerp blue→orange by normalized degree
+  - `Kcore` — lerp purple→white by kcore / max_kcore
+  - `Wcc` — PALETTE[wcc % 17]
+  - `Tag` — color by first matching tag group (it-ops, research, etc.)
+- [ ] `src/systems/render_edges.rs` — draw edges with `bevy::prelude::Gizmos`:
+  - `gizmos.line_2d(src_pos, dst_pos, edge_color)`
+  - Edge alpha = 0.3 at rest; 1.0 if either endpoint is hovered/selected
+  - Edge color: dim gray at rest; highlight color when active
+- [ ] Labels: `Text2d` on each node, font size 10, hidden below zoom threshold (scale < 0.5)
+- [ ] **Verify:** `cargo run -p graph-ui -- /path/to/vault` → nodes visible, edges drawn, colors by community ✓
+
+---
+
+## Phase 5 — Camera Controls
+
+**Milestone:** Full camera navigation matching vault-graph-cosmos spec.
+
+- [ ] `src/systems/camera.rs` — single Bevy system on `Update`:
+  | Input | Action |
+  |-------|--------|
+  | WASD | Pan (speed proportional to zoom level) |
+  | Q / E | Rotate ±15° |
+  | R / F | Zoom in / out (multiply scale by 1.1) |
+  | Shift+WASD | Pan 4× faster |
+  | Ctrl+0 | Reset to default view |
+  | Scroll up/down | Zoom toward/away from cursor position |
+  | Right-click drag | Pan |
+  | Double-click background | Fit-to-view (compute AABB of all nodes, set camera to center + scale) |
+- [ ] Smooth interpolation: lerp camera toward target at 0.15/frame (avoids jarring snaps)
+- [ ] Fit-to-view: AABB with 10% padding, clamp min scale
+- [ ] **Verify:** All 9 input methods tested manually ✓
+
+---
+
+## Phase 6 — Node Interaction
+
+**Milestone:** Hover, select, drag, and pin nodes; interaction state drives rendering.
+
+- [ ] `src/systems/interaction.rs` — raycast from cursor → nearest node within 4px radius:
+  - Convert `CursorMoved` window coords → world coords via `Camera::viewport_to_world_2d`
+  - Hover: `SelectionState.hovered = Some(id)`; node outline brightens; tooltip shows title
+  - Click (left, no drag): `SelectionState.selected = Some(id)`; opens metadata panel in sidebar
+  - Drag (left, moved > 4px threshold): translate node `Transform`; sync to `VaultNode.{x,y}`; `SimState.alpha` bumped to 0.5 to re-settle neighbors
+  - Double-click node: fit-to-view centered on node + 2-hop neighborhood
+  - Right-click node: context menu (pin/unpin, isolate, copy id)
+  - Pin toggle: `SelectionState.pinned.insert/remove(id)`; pinned nodes get lock icon overlay
+- [ ] **Verify:** Click node → sidebar shows metadata; drag node → physics re-settles ✓
+
+---
+
+## Phase 7 — Metadata Modal / Sidebar Panel
+
+**Milestone:** All frontmatter fields rendered correctly in sidebar; 8 field type renderers.
+
+- [ ] `src/systems/sidebar.rs` — extend existing sidebar to show node metadata when `selected` is Some:
+  - Header: title (H2), path (monospace small), doctype badge
+  - Tags: each tag as a chip (click to filter graph to tag)
+  - Frontmatter fields: iterate `schema` order, render by `FieldType`:
+
+  | FieldType | Renderer |
+  |-----------|---------|
+  | `Text` | `ui.label(value)` |
+  | `Number` | right-aligned `ui.label` |
+  | `Bool` | checkbox (read-only) |
+  | `List` | bullet list |
+  | `Entity` | `[[wikilink]]` rendered as clickable button → select that node |
+  | `Date` | formatted string (YYYY-MM-DD) |
+  | `Url` | `ui.hyperlink(value)` |
+  | `Unknown` | raw JSON string |
+
+  - Special sections: `## Related` / `## See also` → extract wikilinks, render as entity list
+  - `## Authors` → comma-separated entity chips
+- [ ] Back button clears `selected`; breadcrumb trail for multi-hop navigation
+- [ ] **Verify:** Click each field type in fixture notes → correct renderer used ✓
+
+---
+
+## Phase 8 — Search & Filtering
+
+**Milestone:** Full-text search, regex, field drilldown, and focus mode all working.
+
+### vault-search subprocess
+
+- [ ] `src/systems/vault_search_client.rs`:
+  - On startup: `tokio::process::Command::new("vault-search").arg("--port=0")` to pick ephemeral port; parse port from stdout
+  - HTTP client via `reqwest`: `GET /ids?q={query}` → `Vec<NodeId>`; `GET /node/{id}` → `NodeMeta`
+  - Reconnect on failure with 1s backoff
+
+### Sidebar Search tab
+
+- [ ] Text input → debounce 150ms → send to vault-search `/ids?q=` → highlight matching nodes
+- [ ] Results list: node title + path, click → select node
+- [ ] Regex toggle: prefix query with `re:` to route to regex search path
+- [ ] Field filter drilldown (per `FieldSchema`):
+  - `Text`/`Entity`: substring match input
+  - `Number`: min/max range sliders
+  - `Bool`: checkbox
+  - `List`/`Tag`: multi-select checkboxes from `FieldSchema.values`
+  - `Date`: date range picker
+- [ ] Active filters shown as removable chips; "Clear all" button
+- [ ] Filter logic: intersection of all active filters → highlight matching nodes, dim others
+
+### Focus mode
+
+- [ ] Toggle in action registry (`focus-mode` action):
+  - When on: hide all nodes not in `SelectionState.selected`'s N-hop neighborhood (N configurable, default 2)
+  - Unhide on toggle-off
+- [ ] "Expand focus" / "Contract focus" actions adjust N
+
+### Query language integration
+
+- [ ] Palette query input (`|`-prefixed line) routes to `query::eval::evaluate(pipeline, &graph_resource.graph)`
+- [ ] Results rendered in palette result panel: node list, click → select
+- [ ] **Verify:** FTS "meeting" returns meeting notes; field filter `tags=it-ops` shows only IT-ops nodes; focus mode hides non-neighbors ✓
+
+---
+
+## Phase 9 — Persistence
+
+**Milestone:** View state survives restarts; per-vault config supported.
+
+- [ ] `src/persistence.rs`:
+  ```rust
+  #[derive(Serialize, Deserialize, Default)]
+  pub struct ViewState {
+      pub camera_x: f32,
+      pub camera_y: f32,
+      pub camera_scale: f32,
+      pub color_mode: String,
+      pub sidebar_open: bool,
+      pub sidebar_width: f32,
+      pub active_tab: String,
+      pub pinned_nodes: Vec<NodeId>,
+  }
+  ```
+- [ ] Config path: `~/.config/jump-cannon/view.json` (or `$XDG_CONFIG_HOME/jump-cannon/view.json`)
+- [ ] Load on startup (before `load_vault_graph`); save on graceful exit (`AppExit` event) and every 60s
+- [ ] Per-vault config: hash vault root path → separate config file per vault
+- [ ] **Verify:** Pin nodes, adjust camera → restart → state restored ✓
+
+---
+
+## Key Reference Files (vault-graph-cosmos)
+
+| Feature area | Python source | Rust target |
+|---|---|---|
+| Wikilink extraction | `vault-graph-cosmos/graph.py` L1-300 | `crates/vault-links/src/extractor.rs` |
+| Force simulation | `vault-graph-cosmos/simulation.py` | `crates/graph-ui/src/systems/force_sim.rs` |
+| PageRank | `vault-graph-cosmos/metrics.py` L1-60 | `crates/graph-metrics/src/pagerank.rs` |
+| Betweenness | `vault-graph-cosmos/metrics.py` L61-130 | `crates/graph-metrics/src/betweenness.rs` |
+| Community | `vault-graph-cosmos/metrics.py` L131-220 | `crates/graph-metrics/src/community.rs` |
+| Node rendering | `vault-graph-cosmos/renderer.py` | `crates/graph-ui/src/systems/render_nodes.rs` |
+| Camera | `vault-graph-cosmos/camera.py` | `crates/graph-ui/src/systems/camera.rs` |
+| Metadata modal | `vault-graph-cosmos/ui/modal.py` | `crates/graph-ui/src/systems/sidebar.rs` |
+| Search/filter | `vault-graph-cosmos/search.py` | `crates/graph-ui/src/systems/vault_search_client.rs` |
+| Persistence | `vault-graph-cosmos/state.py` | `crates/graph-ui/src/persistence.rs` |

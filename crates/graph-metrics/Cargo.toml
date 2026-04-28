@@ -1,0 +1,10 @@
+[package]
+name = "graph-metrics"
+version = "0.1.0"
+edition = "2021"
+description = "Graph metric computation for VaultGraph (degree, PageRank, betweenness, k-core, WCC, Louvain)"
+
+[dependencies]
+vault-data = { path = "../vault-data" }
+petgraph   = { workspace = true }
+rand       = { workspace = true }

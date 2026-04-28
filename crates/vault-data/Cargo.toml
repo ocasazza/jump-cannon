@@ -1,0 +1,11 @@
+[package]
+name = "vault-data"
+version = "0.1.0"
+edition = "2021"
+description = "Shared domain types for vault graph visualization"
+
+[dependencies]
+serde      = { workspace = true }
+serde_json = { workspace = true }
+indexmap   = { workspace = true }
+petgraph   = { workspace = true }

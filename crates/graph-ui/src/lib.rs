@@ -1,7 +1,9 @@
+pub mod graph;
 pub mod query;
 pub mod actions;
 pub mod state;
 pub mod systems;
+pub mod vault;
 
 use bevy::prelude::*;
 use actions::{ActionRegistry, FilterNodes, SearchNodes, SortNodes, ToggleTheme, TopNodes};
