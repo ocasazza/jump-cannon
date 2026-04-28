@@ -69,8 +69,8 @@
           cargoExtraArgs = "--package graph-layouts --package tvix-wasm";
         });
 
-        # System deps for Bevy
-        bevyLibs = with pkgs; [
+        # System deps for Bevy — platform-split so the flake works on both Linux and macOS
+        bevyLibsLinux = with pkgs; lib.optionals stdenv.isLinux [
           libGL
           vulkan-loader
           alsa-lib
@@ -82,6 +82,16 @@
           xorg.libXrandr
           xorg.libXi
         ];
+        # macOS: Bevy uses Metal via wgpu — no extra Nix libs needed; frameworks come with Xcode CLT.
+        # pkg-config is still required for openssl/other build deps.
+        bevyLibsDarwin = with pkgs; lib.optionals stdenv.isDarwin [
+          darwin.apple_sdk.frameworks.Metal
+          darwin.apple_sdk.frameworks.QuartzCore
+          darwin.apple_sdk.frameworks.AudioToolbox
+          darwin.apple_sdk.frameworks.CoreAudio
+          darwin.apple_sdk.frameworks.AppKit
+        ];
+        bevyLibs = bevyLibsLinux ++ bevyLibsDarwin;
 
         # ----- Native packages -----
 
@@ -175,11 +185,13 @@
             pkg-config
           ] ++ bevyLibs;
 
-          # Make Bevy's dynamic libs findable at runtime in the dev shell
-          LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath bevyLibs;
+          # Linux: make Bevy's dynamic libs findable at runtime
+          LD_LIBRARY_PATH = pkgs.lib.optionalString pkgs.stdenv.isLinux
+            (pkgs.lib.makeLibraryPath bevyLibsLinux);
 
-          # Vulkan ICD for software renderer fallback (CI / no GPU)
-          VK_ICD_FILENAMES = "${pkgs.mesa}/share/vulkan/icd.d/lvp_icd.x86_64.json";
+          # Linux: Vulkan software renderer fallback (headless CI / no GPU)
+          VK_ICD_FILENAMES = pkgs.lib.optionalString pkgs.stdenv.isLinux
+            "${pkgs.mesa}/share/vulkan/icd.d/lvp_icd.x86_64.json";
         };
       };
 
