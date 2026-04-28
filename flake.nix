@@ -82,16 +82,10 @@
           xorg.libXrandr
           xorg.libXi
         ];
-        # macOS: Bevy uses Metal via wgpu — no extra Nix libs needed; frameworks come with Xcode CLT.
-        # pkg-config is still required for openssl/other build deps.
-        bevyLibsDarwin = with pkgs; lib.optionals stdenv.isDarwin [
-          darwin.apple_sdk.frameworks.Metal
-          darwin.apple_sdk.frameworks.QuartzCore
-          darwin.apple_sdk.frameworks.AudioToolbox
-          darwin.apple_sdk.frameworks.CoreAudio
-          darwin.apple_sdk.frameworks.AppKit
-        ];
-        bevyLibs = bevyLibsLinux ++ bevyLibsDarwin;
+        # macOS: Bevy uses Metal via wgpu. Frameworks (Metal, CoreAudio, AppKit, etc.)
+        # are provided by the Xcode CLT and don't need to be listed here — adding them
+        # via darwin.apple_sdk breaks on nixpkgs-unstable (apple_sdk_11_0 removed).
+        bevyLibs = bevyLibsLinux;
 
         # ----- Native packages -----
 
