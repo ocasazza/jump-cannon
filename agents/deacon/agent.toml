@@ -1,0 +1,5 @@
+# Deacon: city-scoped health patrol. Monitors agent liveness, escalates
+# stalls, and runs gc-doctor checks on a patrol interval.
+# Uses auto-routing — patrol work is lightweight, any live node suffices.
+provider        = "litellm-local"
+option_defaults = { model = "local-coder", permission_mode = "plan" }

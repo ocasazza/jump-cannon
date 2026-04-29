@@ -8,3 +8,8 @@ node_modules
 dist
 /target
 **/target/
+
+# Beads / Dolt files (added by bd init)
+.dolt/
+*.db
+.beads-credential-key
