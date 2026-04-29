@@ -126,8 +126,10 @@ impl LayoutEngine for FcoseLayoutEngine {
             _temperature *= 0.95;
         }
         
-        // Apply overlap removal as a post-processing step
-        self.remove_overlaps(graph)?;
+        // Skip O(n²) overlap removal for large graphs — scale factor in the caller handles spacing
+        if graph.nodes.len() < 500 {
+            self.remove_overlaps(graph)?;
+        }
         
         Ok(())
     }

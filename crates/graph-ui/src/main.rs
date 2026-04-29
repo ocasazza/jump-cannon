@@ -18,12 +18,20 @@ use graph_ui::register_actions;
 use graph_ui::vault::{VaultGraphResource, load_vault_system};
 
 fn main() {
+    // First positional arg is the vault root path
+    let vault_root = std::env::args().nth(1).map(std::path::PathBuf::from);
+
+    let mut vault_resource = VaultGraphResource::default();
+    if let Some(root) = vault_root {
+        vault_resource.vault_root = root;
+    }
+
     App::new()
         .add_plugins(DefaultPlugins)
         .add_plugins(EguiPlugin { enable_multipass_for_primary_context: false })
         .init_resource::<UiState>()
         .init_resource::<ActionRegistry>()
-        .init_resource::<VaultGraphResource>()
+        .insert_resource(vault_resource)
         .init_resource::<SimParams>()
         .init_resource::<HoverState>()
         .init_resource::<SelectionState>()

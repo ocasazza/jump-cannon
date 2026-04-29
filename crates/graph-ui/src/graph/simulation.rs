@@ -117,10 +117,12 @@ pub fn run_fcose_layout(
 
     match graph_layouts::run_fcose_layout_native(&mut graph, &options) {
         Ok(()) => {
+            // Scale factor: fCoSE works in a ~100-unit radius; Bevy world needs thousands
+            let scale = (vault.graph.node_count() as f32).sqrt() * 8.0;
             for (graph_node, mut transform) in nodes.iter_mut() {
                 if let Some(node) = graph.nodes.get(&graph_node.id) {
                     if let Some((x, y)) = node.position {
-                        transform.translation = Vec3::new(x as f32, y as f32, 0.0);
+                        transform.translation = Vec3::new(x as f32 * scale, y as f32 * scale, 0.0);
                     }
                 }
             }
