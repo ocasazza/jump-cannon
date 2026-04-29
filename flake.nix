@@ -63,7 +63,10 @@
         commonArgs = { inherit src; strictDeps = true; };
 
         # Dependency caches — built once, reused per target
-        depsNative = craneLib.buildDepsOnly commonArgs;
+        depsNative = craneLib.buildDepsOnly (commonArgs // {
+          nativeBuildInputs = [ pkgs.pkg-config ];
+          buildInputs = bevyLibs;
+        });
         depsWasm   = craneLibWasm.buildDepsOnly (commonArgs // {
           CARGO_BUILD_TARGET = "wasm32-unknown-unknown";
           cargoExtraArgs = "--package graph-layouts --package tvix-wasm";
@@ -77,10 +80,10 @@
           udev
           wayland
           libxkbcommon
-          xorg.libX11
-          xorg.libXcursor
-          xorg.libXrandr
-          xorg.libXi
+          libx11
+          libxcursor
+          libxrandr
+          libxi
         ];
         # macOS: Bevy uses Metal via wgpu. Frameworks (Metal, CoreAudio, AppKit, etc.)
         # are provided by the Xcode CLT and don't need to be listed here — adding them
@@ -132,11 +135,15 @@
           tests-unit = craneLib.cargoNextest (commonArgs // {
             cargoArtifacts = depsNative;
             cargoNextestExtraArgs = "--profile unit";
+            nativeBuildInputs = [ pkgs.pkg-config ];
+            buildInputs = bevyLibs;
           });
 
           tests-integration = craneLib.cargoNextest (commonArgs // {
             cargoArtifacts = depsNative;
             cargoNextestExtraArgs = "--profile integration";
+            nativeBuildInputs = [ pkgs.pkg-config ];
+            buildInputs = bevyLibs;
           });
 
           tests-e2e = craneLib.cargoNextest (commonArgs // {
