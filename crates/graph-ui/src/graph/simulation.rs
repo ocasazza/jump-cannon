@@ -79,8 +79,8 @@ pub fn spawn_graph(
 }
 
 /// Run fCoSE layout once after the graph has been spawned.
-/// Uses `graph_layouts::LayoutManager` to compute positions, then writes them
-/// back into each `GraphNode`'s `Transform`.
+/// Uses the native `graph_layouts` API directly (no wasm_bindgen) to compute
+/// positions, then writes them back into each `GraphNode`'s `Transform`.
 pub fn run_fcose_layout(
     vault: Res<VaultGraphResource>,
     mut params: ResMut<SimParams>,
@@ -91,46 +91,42 @@ pub fn run_fcose_layout(
     // Wait until nodes have actually been spawned
     if nodes.is_empty() { return; }
 
-    use graph_layouts::LayoutManager;
+    use graph_layouts::{Graph, Node, Edge, FcoseOptions, LayoutOptions};
 
-    let mut lm = LayoutManager::new();
+    let mut graph = Graph::new();
 
     for id in vault.graph.nodes.keys() {
-        lm.add_node(id.clone(), None, None);
+        graph.add_node(Node::new(id.clone()));
     }
 
     for (i, edge) in vault.graph.edges.iter().enumerate() {
-        lm.add_edge(format!("e{}", i), edge.source.clone(), edge.target.clone());
+        graph.add_edge(Edge::new(
+            format!("e{}", i),
+            edge.source.clone(),
+            edge.target.clone(),
+        ));
     }
 
-    let options = serde_json::json!({
-        "quality": "default",
-        "node_repulsion": params.repulsion as f64,
-        "ideal_edge_length": params.spring_len as f64,
-        "node_overlap": 10.0,
-        "padding": 30.0
-    })
-    .to_string();
+    let options = FcoseOptions {
+        base: LayoutOptions { padding: 30 },
+        quality: "default".to_string(),
+        node_repulsion: params.repulsion as f64,
+        ideal_edge_length: params.spring_len as f64,
+        node_overlap: 10.0,
+    };
 
-    match lm.apply_fcose_layout(options) {
-        Ok(result_json) => {
-            // result_json is a serialised graph_layouts::Graph
-            // Parse into a HashMap of id -> (x, y)
-            if let Ok(graph) = serde_json::from_str::<graph_layouts::Graph>(&result_json) {
-                for (graph_node, mut transform) in nodes.iter_mut() {
-                    if let Some(node) = graph.nodes.get(&graph_node.id) {
-                        if let Some((x, y)) = node.position {
-                            transform.translation = Vec3::new(x as f32, y as f32, 0.0);
-                        }
+    match graph_layouts::run_fcose_layout_native(&mut graph, &options) {
+        Ok(()) => {
+            for (graph_node, mut transform) in nodes.iter_mut() {
+                if let Some(node) = graph.nodes.get(&graph_node.id) {
+                    if let Some((x, y)) = node.position {
+                        transform.translation = Vec3::new(x as f32, y as f32, 0.0);
                     }
                 }
-            } else {
-                warn!("fCoSE: failed to parse result JSON");
             }
         }
         Err(e) => {
-            // JsValue::as_string is not available on native; use debug formatting
-            warn!("fCoSE layout error: {:?}", e);
+            warn!("fCoSE layout error: {}", e);
         }
     }
 

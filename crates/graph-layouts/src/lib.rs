@@ -100,6 +100,12 @@ impl LayoutManager {
     }
 }
 
+/// Native (non-WASM) entry point — no wasm_bindgen, safe to call from native binaries.
+pub fn run_fcose_layout_native(graph: &mut Graph, options: &FcoseOptions) -> Result<(), String> {
+    use layout::LayoutEngine;
+    FcoseLayoutEngine::new(options.clone()).apply_layout(graph)
+}
+
 // CLI interface for running benchmarks
 #[cfg(all(feature = "cli", not(target_arch = "wasm32")))]
 pub fn main() {
