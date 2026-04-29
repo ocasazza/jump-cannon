@@ -91,45 +91,74 @@ pub fn run_fcose_layout(
     // Wait until nodes have actually been spawned
     if nodes.is_empty() { return; }
 
-    use graph_layouts::{Graph, Node, Edge, FcoseOptions, LayoutOptions};
+    let n = vault.graph.node_count();
 
-    let mut graph = Graph::new();
-
-    for id in vault.graph.nodes.keys() {
-        graph.add_node(Node::new(id.clone()));
-    }
-
-    for (i, edge) in vault.graph.edges.iter().enumerate() {
-        graph.add_edge(Edge::new(
-            format!("e{}", i),
-            edge.source.clone(),
-            edge.target.clone(),
-        ));
-    }
-
-    let options = FcoseOptions {
-        base: LayoutOptions { padding: 30 },
-        quality: "default".to_string(),
-        node_repulsion: params.repulsion as f64,
-        ideal_edge_length: params.spring_len as f64,
-        node_overlap: 10.0,
-    };
-
-    match graph_layouts::run_fcose_layout_native(&mut graph, &options) {
-        Ok(()) => {
-            // Scale factor: fCoSE works in a ~100-unit radius; Bevy world needs thousands
-            let scale = (vault.graph.node_count() as f32).sqrt() * 8.0;
-            for (graph_node, mut transform) in nodes.iter_mut() {
-                if let Some(node) = graph.nodes.get(&graph_node.id) {
-                    if let Some((x, y)) = node.position {
-                        transform.translation = Vec3::new(x as f32 * scale, y as f32 * scale, 0.0);
+    if n <= 500 {
+        // Small graph: run fCoSE for quality layout
+        use graph_layouts::{Graph, Node, Edge, FcoseOptions, LayoutOptions};
+        let mut graph = Graph::new();
+        for id in vault.graph.nodes.keys() {
+            graph.add_node(Node::new(id.clone()));
+        }
+        for (i, edge) in vault.graph.edges.iter().enumerate() {
+            graph.add_edge(Edge::new(format!("e{}", i), edge.source.clone(), edge.target.clone()));
+        }
+        let options = FcoseOptions {
+            base: LayoutOptions { padding: 30 },
+            quality: "default".to_string(),
+            node_repulsion: params.repulsion as f64,
+            ideal_edge_length: params.spring_len as f64,
+            node_overlap: 10.0,
+        };
+        match graph_layouts::run_fcose_layout_native(&mut graph, &options) {
+            Ok(()) => {
+                let scale = (n as f32).sqrt() * 8.0;
+                for (graph_node, mut transform) in nodes.iter_mut() {
+                    if let Some(node) = graph.nodes.get(&graph_node.id) {
+                        if let Some((x, y)) = node.position {
+                            transform.translation = Vec3::new(x as f32 * scale, y as f32 * scale, 0.0);
+                        }
                     }
                 }
             }
+            Err(e) => warn!("fCoSE layout error: {}", e),
         }
-        Err(e) => {
-            warn!("fCoSE layout error: {}", e);
+    } else {
+        // Large graph: community-grouped radial layout — O(n), instant
+        // Inner ring per community, communities arranged in a large circle
+        let world_radius = (n as f32).sqrt() * 30.0;
+        let num_communities = vault.graph.num_communities.max(1);
+
+        // Count nodes per community
+        let mut community_counts = vec![0usize; num_communities];
+        for node in vault.graph.nodes.values() {
+            let c = node.metrics.community.min(num_communities - 1);
+            community_counts[c] += 1;
         }
+        let mut community_offsets = vec![0usize; num_communities];
+
+        for (graph_node, mut transform) in nodes.iter_mut() {
+            if let Some(vault_node) = vault.graph.nodes.get(&graph_node.id) {
+                let c = vault_node.metrics.community.min(num_communities - 1);
+                let count = community_counts[c].max(1);
+                let offset = community_offsets[c];
+                community_offsets[c] += 1;
+
+                // Community center on a big circle
+                let community_angle = (c as f32 / num_communities as f32) * std::f32::consts::TAU;
+                let cx = community_angle.cos() * world_radius;
+                let cy = community_angle.sin() * world_radius;
+
+                // Node position within community cluster
+                let node_angle = (offset as f32 / count as f32) * std::f32::consts::TAU;
+                let cluster_radius = (count as f32).sqrt() * 20.0;
+                let nx = node_angle.cos() * cluster_radius;
+                let ny = node_angle.sin() * cluster_radius;
+
+                transform.translation = Vec3::new(cx + nx, cy + ny, 0.0);
+            }
+        }
+        info!("Radial community layout done: {} nodes, {} communities", n, num_communities);
     }
 
     params.layout_done = true;
