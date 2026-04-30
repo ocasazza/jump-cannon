@@ -60,18 +60,21 @@ async function fetchJson(url) {
 function setStats(text) { $stats.textContent = text; }
 
 // ---------- Color helpers ----------
+// Cosmograph 1.3 expects RGBA in 0-255 range, not 0-1.
+// Our palette comes from Rust in 0-1 floats, so we scale here.
 function gradient(t) {
   // blue → red sequential gradient. t in [0,1].
   t = Math.max(0, Math.min(1, t));
-  const r = 0.2 + t * (0.95 - 0.2);
-  const g = 0.4 + t * (0.2  - 0.4);
-  const b = 0.95 + t * (0.25 - 0.95);
-  return [r, g, b, 1.0];
+  const r = (0.2 + t * (0.95 - 0.2)) * 255;
+  const g = (0.4 + t * (0.2  - 0.4)) * 255;
+  const b = (0.95 + t * (0.25 - 0.95)) * 255;
+  return [r, g, b, 255];
 }
 
 function paletteColor(palette, idx) {
-  const c = palette[((idx | 0) % Math.max(palette.length, 1) + palette.length) % Math.max(palette.length, 1)];
-  return c ? [c[0], c[1], c[2], 1.0] : [0.7, 0.7, 0.7, 1.0];
+  const len = Math.max(palette.length, 1);
+  const c = palette[((idx | 0) % len + len) % len];
+  return c ? [c[0] * 255, c[1] * 255, c[2] * 255, 255] : [180, 180, 180, 255];
 }
 
 function metricBounds(arr) {
