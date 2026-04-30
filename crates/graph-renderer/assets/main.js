@@ -81,19 +81,6 @@ function paletteColor01(palette, idx) {
   const c = palette[((idx | 0) % len + len) % len];
   return c ? [c[0], c[1], c[2]] : [0.7, 0.7, 0.7];
 }
-function computeBounds(positions) {
-  let mnx = Infinity, mny = Infinity, mnz = Infinity;
-  let mxx = -Infinity, mxy = -Infinity, mxz = -Infinity;
-  for (let i = 0; i + 2 < positions.length; i += 3) {
-    const x = positions[i], y = positions[i + 1], z = positions[i + 2];
-    if (x < mnx) mnx = x; if (x > mxx) mxx = x;
-    if (y < mny) mny = y; if (y > mxy) mxy = y;
-    if (z < mnz) mnz = z; if (z > mxz) mxz = z;
-  }
-  if (!isFinite(mnx)) { mnx = -100; mxx = 100; mny = -100; mxy = 100; mnz = -100; mxz = 100; }
-  return { min: [mnx, mny, mnz], max: [mxx, mxy, mxz] };
-}
-
 function metricBounds(arr) {
   let min = Infinity, max = -Infinity;
   for (let i = 0; i < arr.length; i++) {
@@ -496,7 +483,7 @@ async function main() {
   renderer.resize($canvas.width, $canvas.height);
 
   // Fit camera to the actual data bounds so nodes land in view immediately.
-  const b = computeBounds(boot.positions);
+  const b = computeBounds(boot);
   console.log(`[graph-renderer] data bounds: x[${b.min[0].toFixed(0)},${b.max[0].toFixed(0)}] y[${b.min[1].toFixed(0)},${b.max[1].toFixed(0)}] z[${b.min[2].toFixed(0)},${b.max[2].toFixed(0)}]`);
   renderer.cam_fit_bounds(b.min[0], b.min[1], b.min[2], b.max[0], b.max[1], b.max[2]);
 
