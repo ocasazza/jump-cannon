@@ -63,8 +63,10 @@
         commonArgs = { inherit src; strictDeps = true; };
 
         # Dependency caches — built once, reused per target
+        # protobuf is needed for graph-api's prost-build; pkg-config + bevyLibs
+        # remain for graph-layouts/graph-renderer (Bevy is still in graph-renderer's tree as historical/example bin? — keep until we drop it).
         depsNative = craneLib.buildDepsOnly (commonArgs // {
-          nativeBuildInputs = [ pkgs.pkg-config ];
+          nativeBuildInputs = [ pkgs.pkg-config pkgs.protobuf ];
           buildInputs = bevyLibs;
         });
         depsWasm   = craneLibWasm.buildDepsOnly (commonArgs // {
@@ -97,11 +99,11 @@
           cargoExtraArgs = "--package vault-search";
         });
 
-        graph-ui = craneLib.buildPackage (commonArgs // {
+        graph-api = craneLib.buildPackage (commonArgs // {
           cargoArtifacts = depsNative;
-          cargoExtraArgs = "--package graph-ui";
-          nativeBuildInputs = [ pkgs.pkg-config ];
-          buildInputs = bevyLibs;
+          cargoExtraArgs = "--package graph-api";
+          # graph-api is pure Rust (axum + prost) — no system libs, just protoc
+          nativeBuildInputs = [ pkgs.protobuf ];
         });
 
         # ----- WASM packages -----
@@ -122,8 +124,8 @@
 
       in {
         packages = {
-          default          = graph-ui;
-          inherit vault-search graph-ui graph-layouts-wasm tvix-wasm;
+          default          = graph-api;
+          inherit vault-search graph-api graph-layouts-wasm tvix-wasm;
         };
 
         checks = {
@@ -182,8 +184,9 @@
             wasm-bindgen-cli
             trunk
 
-            # Bevy runtime/build deps
+            # Build tools
             pkg-config
+            protobuf
           ] ++ bevyLibs;
 
           # Linux: make Bevy's dynamic libs findable at runtime

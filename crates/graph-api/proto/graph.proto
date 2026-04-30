@@ -1,0 +1,41 @@
+syntax = "proto3";
+package jumpcannon.graph;
+
+// Manifest sent on /graph/init. Tiny — just metadata for setup.
+message Init {
+  uint32 n_nodes = 1;
+  uint32 n_edges = 2;
+  uint32 num_communities = 3;
+  uint32 num_wcc = 4;
+  // Color palette as flat r,g,b,r,g,b,... (3 floats per color).
+  // Future: clients pass color preferences; server returns derived palette.
+  repeated float palette = 5 [packed=true];
+}
+
+// Per-node metadata. Returned by /node/:id (sparse, on-demand).
+message NodeMeta {
+  string id = 1;
+  string title = 2;
+  string path = 3;
+  string folder = 4;
+  optional string doctype = 5;
+  repeated string tags = 6;
+  // Frontmatter as JSON-encoded string. Keeping this opaque avoids re-encoding
+  // arbitrary YAML in protobuf — frontends parse JSON.
+  string frontmatter_json = 7;
+
+  uint32 degree = 10;
+  uint32 indegree = 11;
+  uint32 outdegree = 12;
+  float pagerank = 13;
+  float betweenness = 14;
+  uint32 kcore = 15;
+  uint32 community = 16;
+  uint32 wcc = 17;
+}
+
+// Search response. Returned by /search?q=…
+message SearchResults {
+  repeated string ids = 1;
+  uint32 total = 2;
+}

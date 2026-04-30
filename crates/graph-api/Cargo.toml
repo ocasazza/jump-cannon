@@ -1,0 +1,35 @@
+[package]
+name = "graph-api"
+version = "0.1.0"
+edition = "2021"
+description = "axum HTTP API: serves the graph-renderer asset bundle plus protobuf + binary endpoints for the vault graph."
+
+[[bin]]
+name = "graph-api"
+path = "src/main.rs"
+
+[lib]
+name = "graph_api"
+path = "src/lib.rs"
+
+[dependencies]
+axum               = "0.7"
+tokio              = { workspace = true }
+tower              = "0.4"
+tower-http         = { version = "0.5", features = ["fs", "trace"] }
+serde              = { workspace = true }
+serde_json         = { workspace = true }
+bytes              = "1"
+prost              = "0.13"
+tracing            = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+open               = "5"
+clap               = { version = "4", features = ["derive"] }
+
+vault-data     = { path = "../vault-data" }
+vault-links    = { path = "../vault-links" }
+graph-metrics  = { path = "../graph-metrics" }
+graph-renderer = { path = "../graph-renderer" }
+
+[build-dependencies]
+prost-build = "0.13"

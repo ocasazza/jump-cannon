@@ -4,7 +4,7 @@ members = [
     "crates/graph-layouts",
     "crates/graph-metrics",
     "crates/graph-renderer",
-    "crates/graph-ui",
+    "crates/graph-api",
     "crates/vault-data",
     "crates/vault-links",
     "crates/vault-search",

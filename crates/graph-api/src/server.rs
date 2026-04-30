@@ -1,0 +1,178 @@
+//! HTTP API. axum router + route handlers.
+//
+// Future: when split across machines, this server runs on luna; the renderer
+// (graph-renderer) is served from any static host and points its fetch URLs
+// at this server via a --backend-url flag (not yet implemented).
+
+use axum::{
+    extract::{Path, Query, State},
+    http::{header, HeaderMap, HeaderValue, StatusCode},
+    response::IntoResponse,
+    routing::get,
+    Router,
+};
+use prost::Message;
+use serde::Deserialize;
+
+use crate::{binary, proto, state::AppState};
+use vault_data::color::PALETTE;
+
+const PROTOBUF_CT: &str = "application/x-protobuf";
+const OCTET_CT: &str = "application/octet-stream";
+
+pub fn router(state: AppState) -> Router {
+    Router::new()
+        .route("/", get(index))
+        .route("/assets/*path", get(asset))
+        .route("/graph/init", get(graph_init))
+        .route("/graph/ids", get(graph_ids))
+        .route("/graph/positions", get(graph_positions))
+        .route("/graph/edges", get(graph_edges))
+        .route("/graph/metrics/:name", get(graph_metric))
+        .route("/node/:id", get(node_meta))
+        .route("/search", get(search))
+        .with_state(state)
+}
+
+async fn index() -> impl IntoResponse {
+    asset_response("index.html")
+}
+
+async fn asset(Path(path): Path<String>) -> impl IntoResponse {
+    asset_response(&path)
+}
+
+fn asset_response(path: &str) -> impl IntoResponse {
+    match graph_renderer::assets().get_file(path) {
+        Some(file) => {
+            let mime = mime_for(path);
+            let mut headers = HeaderMap::new();
+            headers.insert(header::CONTENT_TYPE, HeaderValue::from_str(mime).unwrap());
+            (StatusCode::OK, headers, file.contents().to_vec()).into_response()
+        }
+        None => (StatusCode::NOT_FOUND, "not found").into_response(),
+    }
+}
+
+fn mime_for(path: &str) -> &'static str {
+    match path.rsplit('.').next().unwrap_or("") {
+        "html" => "text/html; charset=utf-8",
+        "js"   => "application/javascript",
+        "css"  => "text/css",
+        "json" => "application/json",
+        "proto" => "text/plain; charset=utf-8",
+        "png"  => "image/png",
+        "svg"  => "image/svg+xml",
+        _      => "application/octet-stream",
+    }
+}
+
+// --- Protobuf endpoints ---
+
+/// JSON list of node ids in the same order as the `/graph/positions`,
+/// `/graph/edges`, and `/graph/metrics/*` binary buffers. Lets the renderer
+/// hand server-side string ids (vault paths) directly to Cosmograph and back
+/// to `/node/:id` without a translation step.
+async fn graph_ids(State(s): State<AppState>) -> impl IntoResponse {
+    use axum::Json;
+    Json(s.inner.idx_to_id.clone())
+}
+
+async fn graph_init(State(s): State<AppState>) -> impl IntoResponse {
+    let g = &s.inner.graph;
+    let palette: Vec<f32> = PALETTE.iter().flat_map(|rgb| rgb.iter().copied()).collect();
+    let msg = proto::Init {
+        n_nodes: g.node_count() as u32,
+        n_edges: g.edge_count() as u32,
+        num_communities: g.num_communities as u32,
+        num_wcc: g.num_wcc as u32,
+        palette,
+    };
+    proto_response(&msg)
+}
+
+async fn node_meta(State(s): State<AppState>, Path(id): Path<String>) -> impl IntoResponse {
+    let Some(node) = s.inner.graph.nodes.get(&id) else {
+        return (StatusCode::NOT_FOUND, "no such node").into_response();
+    };
+    let frontmatter_json = serde_json::to_string(&node.meta.frontmatter)
+        .unwrap_or_else(|_| "{}".into());
+    let msg = proto::NodeMeta {
+        id: id.clone(),
+        title: node.meta.title.clone(),
+        path: node.meta.path.clone(),
+        folder: node.meta.folder.clone(),
+        doctype: node.meta.doctype.clone(),
+        tags: node.meta.tags.clone(),
+        frontmatter_json,
+        degree: node.metrics.degree as u32,
+        indegree: node.metrics.indegree as u32,
+        outdegree: node.metrics.outdegree as u32,
+        pagerank: node.metrics.pagerank as f32,
+        betweenness: node.metrics.betweenness as f32,
+        kcore: node.metrics.kcore as u32,
+        community: node.metrics.community as u32,
+        wcc: node.metrics.wcc as u32,
+    };
+    proto_response(&msg).into_response()
+}
+
+#[derive(Deserialize)]
+struct SearchParams {
+    q: String,
+    #[serde(default)]
+    limit: Option<u32>,
+}
+
+async fn search(State(s): State<AppState>, Query(p): Query<SearchParams>) -> impl IntoResponse {
+    // Future: proxy to vault-search subprocess for Tantivy BM25; for now
+    // we do a naive contains-match over titles so the wiring is real.
+    let q = p.q.to_lowercase();
+    let limit = p.limit.unwrap_or(50) as usize;
+    let mut ids: Vec<String> = s
+        .inner
+        .graph
+        .nodes
+        .iter()
+        .filter(|(_, n)| n.meta.title.to_lowercase().contains(&q))
+        .map(|(id, _)| id.clone())
+        .take(limit)
+        .collect();
+    ids.sort();
+    let msg = proto::SearchResults {
+        total: ids.len() as u32,
+        ids,
+    };
+    proto_response(&msg).into_response()
+}
+
+fn proto_response<M: Message>(msg: &M) -> impl IntoResponse {
+    let mut buf = Vec::with_capacity(msg.encoded_len());
+    msg.encode(&mut buf).expect("encode");
+    let mut headers = HeaderMap::new();
+    headers.insert(header::CONTENT_TYPE, HeaderValue::from_static(PROTOBUF_CT));
+    (StatusCode::OK, headers, buf)
+}
+
+// --- Binary endpoints (raw little-endian buffers for hot-path bulk data) ---
+
+async fn graph_positions(State(s): State<AppState>) -> impl IntoResponse {
+    binary_response(binary::positions_buffer(&s.inner.graph))
+}
+
+async fn graph_edges(State(s): State<AppState>) -> impl IntoResponse {
+    binary_response(binary::edges_buffer(&s.inner.graph, &s.inner.id_to_idx))
+}
+
+async fn graph_metric(State(s): State<AppState>, Path(name): Path<String>) -> impl IntoResponse {
+    match binary::metric_buffer(&s.inner.graph, &name) {
+        Some(buf) => binary_response(buf).into_response(),
+        None => (StatusCode::NOT_FOUND, "unknown metric").into_response(),
+    }
+}
+
+fn binary_response(buf: Vec<u8>) -> impl IntoResponse {
+    let mut headers = HeaderMap::new();
+    headers.insert(header::CONTENT_TYPE, HeaderValue::from_static(OCTET_CT));
+    (StatusCode::OK, headers, buf)
+}
