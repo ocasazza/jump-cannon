@@ -245,6 +245,8 @@ function pushCursorForce() {
   // LMB attract (negative strength), RMB repel (positive).
   const sign = cursor.rmb ? +1 : -1;
   renderer.set_cursor_force(w[0], w[1], w[2], cursor.radius, sign * cursor.strength);
+  // Cursor force is a perturbation — make sure the sim is awake to feel it.
+  try { renderer.sim_wake(); } catch (_) {}
 }
 
 // ---------- Keyboard / mouse ----------
@@ -372,6 +374,7 @@ function wireSidebar(boot) {
       state.preset = preset;
       $simBtns.forEach((b) => b.classList.toggle('active', b === btn));
       renderer.update_layout_options(JSON.stringify(SIM_PRESETS[preset]));
+      try { renderer.sim_wake(); } catch (_) {}
     });
   });
 
@@ -565,11 +568,13 @@ async function main() {
     console.warn('init_layout failed (force sim disabled):', e);
   }
 
-  setStats(
+  // Static prefix for the stats line; the frame loop appends a dynamic
+  // suffix (settled indicator / live KE) without re-stringifying these.
+  const statsPrefix =
     `${boot.nNodes.toLocaleString()} nodes • ` +
     `${Number(boot.init.nEdges).toLocaleString()} edges • ` +
-    `${boot.init.numCommunities} communities`
-  );
+    `${boot.init.numCommunities} communities`;
+  setStats(statsPrefix);
 
   wirePanel();
   wireSidebar(boot);
@@ -581,12 +586,22 @@ async function main() {
   window.addEventListener('resize', syncCanvasSize);
 
   let lastT = performance.now();
+  let lastStatsT = 0;
   function frame() {
     const now = performance.now();
     const dt = Math.min(0.1, (now - lastT) / 1000);
     lastT = now;
     applyKeyboardCamera(dt);
     try { renderer.step(); } catch (e) { console.error(e); }
+    // Throttle stats updates to ~4Hz so we don't thrash layout.
+    if (now - lastStatsT > 250) {
+      lastStatsT = now;
+      try {
+        const halted = renderer.sim_halted();
+        const ke = renderer.sim_max_ke();
+        setStats(`${statsPrefix} • ${halted ? 'settled' : `KE=${ke.toFixed(2)}`}`);
+      } catch (_) { /* sim_halted may not exist before a rebuild */ }
+    }
     requestAnimationFrame(frame);
   }
   requestAnimationFrame(frame);

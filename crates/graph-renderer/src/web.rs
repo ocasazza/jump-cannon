@@ -193,6 +193,27 @@ impl WebRenderer {
         self.inner.as_ref().and_then(|r| r.raycast(x, y))
     }
 
+    /// True once the GPU-force layout has settled and is auto-halted.
+    /// JS uses this to flip the stats display ("settled") and to skip
+    /// per-frame work that's only meaningful when the sim is moving.
+    pub fn sim_halted(&self) -> bool {
+        self.inner.as_ref().map(|r| r.sim_halted()).unwrap_or(false)
+    }
+
+    /// Wake the sim back up. Call from JS whenever something perturbs the
+    /// graph (cursor force engaged, slider dragged, preset switched).
+    pub fn sim_wake(&mut self) {
+        if let Some(r) = self.inner.as_mut() {
+            r.sim_wake();
+        }
+    }
+
+    /// Most recent max-per-node kinetic-energy proxy (|vel|^2). 0 before
+    /// the first readback completes. Useful for stats overlays.
+    pub fn sim_max_ke(&self) -> f32 {
+        self.inner.as_ref().map(|r| r.sim_max_ke()).unwrap_or(0.0)
+    }
+
     // Camera ops surfaced for JS keyboard/mouse handlers.
     pub fn cam_pan(&mut self, dx: f32, dy: f32, dz: f32) {
         if let Some(r) = &mut self.inner {

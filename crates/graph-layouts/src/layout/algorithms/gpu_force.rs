@@ -11,7 +11,22 @@
 
 use crate::types::Graph;
 use std::borrow::Cow;
+use std::sync::{Arc, Mutex};
 use wgpu::util::DeviceExt;
+
+/// State of the asynchronous energy_buf -> energy_staging readback. Shared
+/// between the main thread and the wgpu map_async callback via Arc<Mutex<>>.
+#[derive(Debug)]
+enum EnergyReadback {
+    /// No copy in flight; staging buffer is unmapped and idle.
+    Idle,
+    /// `copy_buffer_to_buffer` recorded + `map_async` issued; waiting for
+    /// the GPU + driver to call our callback.
+    Mapping,
+    /// Callback fired. Ok = mapped successfully (caller must
+    /// `get_mapped_range` + `unmap`); Err = map failed (no unmap needed).
+    Mapped(Result<(), String>),
+}
 
 // ---------- Public API -------------------------------------------------------
 
@@ -172,7 +187,20 @@ pub struct GpuForceLayout {
     options: GpuForceOptions,
     state: Option<GpuState>,
     owned_device: Option<OwnedDevice>,
+    /// Once max-KE has stayed below `energy_threshold` for `HALT_FRAMES`
+    /// consecutive observed readbacks, the sim is considered settled and
+    /// `step_with_encoder` becomes a no-op until something calls `wake()` or
+    /// updates options in a way that perturbs the system.
+    halted: bool,
+    halt_streak: u32,
+    /// Most recent max-KE reduction value (for diagnostics / stats UI).
+    last_max_ke: f32,
 }
+
+/// How many consecutive low-KE readbacks we require before halting. With
+/// `steps_per_call = 8` and ~60fps this is half a second of "settled" before
+/// we flip to halt.
+const HALT_FRAMES: u32 = 30;
 
 impl GpuForceLayout {
     pub fn new(options: GpuForceOptions) -> Self {
@@ -180,11 +208,39 @@ impl GpuForceLayout {
             options,
             state: None,
             owned_device: None,
+            halted: false,
+            halt_streak: 0,
+            last_max_ke: 0.0,
         }
     }
 
     pub fn set_options(&mut self, options: GpuForceOptions) {
+        // Any param change wakes the sim — sliders/cursor force/preset switch
+        // are the user telling us "do work again". The cheap correctness-first
+        // policy is to always wake; the energy-halt logic will re-settle on
+        // its own once the new params produce a steady state.
         self.options = options;
+        self.wake();
+    }
+
+    /// Re-activate a halted sim. Call this from JS / cursor tool / preset
+    /// switch / anywhere that perturbs the layout from the outside.
+    pub fn wake(&mut self) {
+        self.halted = false;
+        self.halt_streak = 0;
+    }
+
+    /// True once the sim has been observed below `energy_threshold` for
+    /// [`HALT_FRAMES`] consecutive readbacks. While halted, `step_with_encoder`
+    /// is a no-op.
+    pub fn is_halted(&self) -> bool {
+        self.halted
+    }
+
+    /// Most recent max-per-node kinetic-energy proxy from the readback path.
+    /// Returns 0.0 before the first readback completes.
+    pub fn last_max_ke(&self) -> f32 {
+        self.last_max_ke
     }
 
     pub fn options(&self) -> &GpuForceOptions {
@@ -320,6 +376,49 @@ impl GpuForceLayout {
         let Some(state) = self.state.as_mut() else {
             return;
         };
+
+        // Drive any pending native callbacks. On WASM the browser drives
+        // map_async via the event loop; on native we have to poll. `Poll`
+        // is non-blocking — if no GPU work has finished yet this just
+        // returns immediately and the callback fires on a later frame.
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            device.poll(wgpu::Maintain::Poll);
+        }
+
+        // Drain a previously-scheduled readback (if any) and update halt
+        // bookkeeping. We do this BEFORE the early-return so that even after
+        // halting we still unmap a stragglar staging buffer cleanly.
+        if let Some(max_ke) = state.drain_energy_readback() {
+            self.last_max_ke = max_ke;
+            if self.options.energy_threshold > 0.0
+                && max_ke < self.options.energy_threshold
+            {
+                self.halt_streak = self.halt_streak.saturating_add(1);
+                if self.halt_streak >= HALT_FRAMES {
+                    if !self.halted {
+                        // No `log` crate dep in graph-layouts; eprintln on
+                        // native is enough for debugging. WASM swallows
+                        // stderr so this is effectively native-only noise.
+                        #[cfg(not(target_arch = "wasm32"))]
+                        eprintln!(
+                            "gpu_force: halted (max_ke={:.4} < threshold={:.4})",
+                            max_ke, self.options.energy_threshold
+                        );
+                    }
+                    self.halted = true;
+                }
+            } else {
+                self.halt_streak = 0;
+            }
+        }
+
+        if self.halted {
+            // Sim is at rest. No dispatch, no readback. The renderer will
+            // still draw the last positions (they live in the shared buffer).
+            return;
+        }
+
         // First-call init for cooling.
         if state.effective_damping <= 0.0 || state.effective_damping > 1.0 {
             state.effective_damping = self.options.damping;
@@ -330,6 +429,12 @@ impl GpuForceLayout {
 
         state.rebuild_and_upload_grid(device, queue, &self.options);
         state.write_params(queue, &self.options);
+        // GPU-side bucket sort of positions into spatial-hash cells. Done
+        // once per call (not per step), reading from whichever buffer is
+        // currently the "in" side of the ping-pong.
+        if self.options.grid_enabled {
+            state.encode_grid_build_borrowed(device, encoder, shared_buffer);
+        }
         let steps = self.options.steps_per_call.max(1);
         for _ in 0..steps {
             state.dispatch_borrowed_step(device, encoder, shared_buffer);
@@ -352,6 +457,25 @@ impl GpuForceLayout {
                 0,
                 state.pos_buf_size,
             );
+        }
+
+        // Schedule an async energy readback for THIS frame's results. We
+        // only kick off a new copy when the previous one has been drained
+        // (state == Idle). If the GPU+CPU pipelines are running ahead of
+        // the readback we'll just skip a frame's worth of measurements;
+        // the halt detector tolerates that — its streak only counts
+        // observed-low samples.
+        let readback_idle = state
+            .energy_readback
+            .lock()
+            .map(|g| matches!(*g, EnergyReadback::Idle))
+            .unwrap_or(false);
+        if readback_idle {
+            state.schedule_energy_copy(encoder);
+            // map_async itself is queued by wgpu; the actual callback won't
+            // fire until the encoder is submitted by the caller and the GPU
+            // finishes the copy. That's fine — we drain on the next frame.
+            state.issue_energy_map();
         }
     }
 
@@ -441,6 +565,14 @@ struct GpuState {
     pipeline: wgpu::ComputePipeline,
     bind_group_layout: wgpu::BindGroupLayout,
 
+    /// Pipelines for the GPU-side spatial-grid bucket sort. All four share
+    /// `gb_bind_group_layout`.
+    gb_clear_pipeline: wgpu::ComputePipeline,
+    gb_count_pipeline: wgpu::ComputePipeline,
+    gb_scan_pipeline: wgpu::ComputePipeline,
+    gb_scatter_pipeline: wgpu::ComputePipeline,
+    gb_bind_group_layout: wgpu::BindGroupLayout,
+
     positions: PositionsStorage,
     /// True while pos_a is the "in" and pos_b is the "out" buffer.
     a_is_in: bool,
@@ -455,6 +587,12 @@ struct GpuState {
     cell_offsets_capacity: u64, // bytes
     cell_nodes_buf: wgpu::Buffer,
     cell_nodes_capacity: u64,
+    /// Per-cell atomic counts (filled by count_cells, scanned into offsets).
+    cell_counts_buf: wgpu::Buffer,
+    cell_counts_capacity: u64,
+    /// Per-cell atomic write cursor used by scatter_cells.
+    cell_write_cursor_buf: wgpu::Buffer,
+    cell_write_cursor_capacity: u64,
     /// Per-node KE proxy = |vel|^2 written by the shader; CPU reads back
     /// (small) for energy_threshold checks.
     energy_buf: wgpu::Buffer,
@@ -486,6 +624,11 @@ struct GpuState {
 
     /// Effective damping currently in use; cooled per call.
     effective_damping: f32,
+
+    /// Async energy-readback state. Shared with the wgpu map_async callback.
+    /// On native, drained inside `step_with_encoder` after `device.poll(Poll)`;
+    /// on WASM, the browser drives the callback between rAF ticks.
+    energy_readback: Arc<Mutex<EnergyReadback>>,
 }
 
 /// CPU-side pre-compute: stable id ordering, initial positions
@@ -673,9 +816,17 @@ fn build_grid(
     (origin, eff_cell, dim, n_cells, cell_offsets, cell_nodes)
 }
 
-fn build_pipeline(
-    device: &wgpu::Device,
-) -> (wgpu::ComputePipeline, wgpu::BindGroupLayout) {
+struct ForcePipelines {
+    force_step: wgpu::ComputePipeline,
+    force_bgl: wgpu::BindGroupLayout,
+    gb_clear: wgpu::ComputePipeline,
+    gb_count: wgpu::ComputePipeline,
+    gb_scan: wgpu::ComputePipeline,
+    gb_scatter: wgpu::ComputePipeline,
+    gb_bgl: wgpu::BindGroupLayout,
+}
+
+fn build_pipeline(device: &wgpu::Device) -> ForcePipelines {
     let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some("force.wgsl"),
         source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(include_str!(
@@ -709,6 +860,37 @@ fn build_pipeline(
             entries: &bgl_entries,
         },
     );
+
+    // Grid-build BGL (group 1 in shader). All four build entry points share
+    // it; bindings an entry point doesn't reference are simply unused.
+    let gb_bgl_entries = [
+        storage_entry(0, true), // gb_positions_in
+        wgpu::BindGroupLayoutEntry {
+            binding: 1,
+            visibility: wgpu::ShaderStages::COMPUTE,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Uniform,
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        },
+        storage_entry(2, false), // gb_cell_counts (atomic rw)
+        storage_entry(3, false), // gb_cell_cursor (atomic rw)
+        storage_entry(4, false), // gb_cell_offsets (rw u32)
+        storage_entry(5, false), // gb_cell_nodes   (rw u32)
+    ];
+    let gb_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("gpu_force_grid_build_bgl"),
+        entries: &gb_bgl_entries,
+    });
+    // Empty BGL placeholder at group(0) for build pipelines (the build
+    // entry points only reference @group(1) bindings).
+    let empty_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("gpu_force_grid_build_empty_bgl"),
+        entries: &[],
+    });
+
     let pipeline_layout = device.create_pipeline_layout(
         &wgpu::PipelineLayoutDescriptor {
             label: Some("gpu_force_pl"),
@@ -716,7 +898,7 @@ fn build_pipeline(
             push_constant_ranges: &[],
         },
     );
-    let pipeline = device.create_compute_pipeline(
+    let force_step = device.create_compute_pipeline(
         &wgpu::ComputePipelineDescriptor {
             label: Some("force_step"),
             layout: Some(&pipeline_layout),
@@ -726,7 +908,38 @@ fn build_pipeline(
             cache: None,
         },
     );
-    (pipeline, bind_group_layout)
+
+    let gb_pipeline_layout = device.create_pipeline_layout(
+        &wgpu::PipelineLayoutDescriptor {
+            label: Some("gpu_force_grid_build_pl"),
+            bind_group_layouts: &[&empty_bgl, &gb_bgl],
+            push_constant_ranges: &[],
+        },
+    );
+    let mk = |name: &'static str| {
+        device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some(name),
+            layout: Some(&gb_pipeline_layout),
+            module: &shader,
+            entry_point: Some(name),
+            compilation_options: Default::default(),
+            cache: None,
+        })
+    };
+    let gb_clear = mk("clear_cell_counts");
+    let gb_count = mk("count_cells");
+    let gb_scan = mk("scan_cell_offsets");
+    let gb_scatter = mk("scatter_cells");
+
+    ForcePipelines {
+        force_step,
+        force_bgl: bind_group_layout,
+        gb_clear,
+        gb_count,
+        gb_scan,
+        gb_scatter,
+        gb_bgl,
+    }
 }
 
 impl GpuState {
@@ -752,12 +965,17 @@ impl GpuState {
             usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
             mapped_at_creation: false,
         });
-        let (pipeline, bind_group_layout) = build_pipeline(device);
+        let pipelines = build_pipeline(device);
         let cpu_positions = pc.initial_positions.clone();
 
         Ok(Self {
-            pipeline,
-            bind_group_layout,
+            pipeline: pipelines.force_step,
+            bind_group_layout: pipelines.force_bgl,
+            gb_clear_pipeline: pipelines.gb_clear,
+            gb_count_pipeline: pipelines.gb_count,
+            gb_scan_pipeline: pipelines.gb_scan,
+            gb_scatter_pipeline: pipelines.gb_scatter,
+            gb_bind_group_layout: pipelines.gb_bgl,
             positions: PositionsStorage::Owned { pos_a, pos_b },
             a_is_in: true,
             velocities: aux.vel,
@@ -769,6 +987,10 @@ impl GpuState {
             cell_offsets_capacity: aux.cell_offsets_capacity,
             cell_nodes_buf: aux.cell_nodes,
             cell_nodes_capacity: aux.cell_nodes_capacity,
+            cell_counts_buf: aux.cell_counts,
+            cell_counts_capacity: aux.cell_counts_capacity,
+            cell_write_cursor_buf: aux.cell_write_cursor,
+            cell_write_cursor_capacity: aux.cell_write_cursor_capacity,
             energy_buf: aux.energy,
             energy_staging: aux.energy_staging,
             staging: Some(staging),
@@ -783,6 +1005,7 @@ impl GpuState {
             n_cells: 1,
             node_order: pc.node_order,
             effective_damping: 1.0,
+            energy_readback: Arc::new(Mutex::new(EnergyReadback::Idle)),
         })
     }
 
@@ -808,14 +1031,19 @@ impl GpuState {
                 | wgpu::BufferUsages::COPY_DST,
         });
         let aux = build_aux_buffers(device, &pc);
-        let (pipeline, bind_group_layout) = build_pipeline(device);
+        let pipelines = build_pipeline(device);
 
         let _ = positions_buffer; // sized check happens via caller usage
         let cpu_positions = pc.initial_positions.clone();
 
         Ok(Self {
-            pipeline,
-            bind_group_layout,
+            pipeline: pipelines.force_step,
+            bind_group_layout: pipelines.force_bgl,
+            gb_clear_pipeline: pipelines.gb_clear,
+            gb_count_pipeline: pipelines.gb_count,
+            gb_scan_pipeline: pipelines.gb_scan,
+            gb_scatter_pipeline: pipelines.gb_scatter,
+            gb_bind_group_layout: pipelines.gb_bgl,
             positions: PositionsStorage::Borrowed { pos_b },
             a_is_in: true,
             velocities: aux.vel,
@@ -827,6 +1055,10 @@ impl GpuState {
             cell_offsets_capacity: aux.cell_offsets_capacity,
             cell_nodes_buf: aux.cell_nodes,
             cell_nodes_capacity: aux.cell_nodes_capacity,
+            cell_counts_buf: aux.cell_counts,
+            cell_counts_capacity: aux.cell_counts_capacity,
+            cell_write_cursor_buf: aux.cell_write_cursor,
+            cell_write_cursor_capacity: aux.cell_write_cursor_capacity,
             energy_buf: aux.energy,
             energy_staging: aux.energy_staging,
             staging: None,
@@ -841,6 +1073,7 @@ impl GpuState {
             n_cells: 1,
             node_order: pc.node_order,
             effective_damping: 1.0,
+            energy_readback: Arc::new(Mutex::new(EnergyReadback::Idle)),
         })
     }
 
@@ -883,49 +1116,141 @@ impl GpuState {
         queue: &wgpu::Queue,
         opts: &GpuForceOptions,
     ) {
+        let _ = queue;
         let cell_size_target = if opts.repulsion_radius > 0.0 {
             opts.repulsion_radius
         } else {
             (opts.spring_len * 4.0).max(1.0)
         };
-        let (origin, cell_size, dim, n_cells, cell_offsets, cell_nodes) =
+        // Bbox + dims still computed CPU-side from the (possibly stale)
+        // cpu_positions mirror — same as before this refactor. The
+        // count+scatter use the *fresh* GPU positions buffer, so a slightly
+        // stale bbox just means a slightly wider grid, which is harmless
+        // (the in-shader clamp keeps every node in a valid cell).
+        let (origin, cell_size, dim, n_cells, _co, _cn) =
             build_grid(&self.cpu_positions, self.n_nodes, cell_size_target);
         self.grid_origin = origin;
         self.grid_cell_size = cell_size;
         self.grid_dim = dim;
         self.n_cells = n_cells;
 
-        // Resize cell_offsets buffer if needed.
-        let needed_off_bytes = (cell_offsets.len() as u64 * 4).max(64);
+        // (Re)allocate cell-* buffers if the grid grew. We size everything
+        // to (n_cells + 1) * 4 — cell_offsets needs the +1 sentinel; the
+        // count/cursor buffers don't but it's fine to oversize.
+        let needed_off_bytes = ((n_cells as u64 + 1) * 4).max(64);
         if needed_off_bytes > self.cell_offsets_capacity {
+            let cap = needed_off_bytes * 2;
             self.cell_offsets_buf = device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("cell_offsets"),
-                size: needed_off_bytes * 2,
+                size: cap,
                 usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             });
-            self.cell_offsets_capacity = needed_off_bytes * 2;
+            self.cell_offsets_capacity = cap;
+            // counts/cursor track cell_offsets capacity so all three resize
+            // together — the atomic buffers can't be smaller than n_cells*4.
+            self.cell_counts_buf = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("cell_counts"),
+                size: cap,
+                usage: wgpu::BufferUsages::STORAGE,
+                mapped_at_creation: false,
+            });
+            self.cell_counts_capacity = cap;
+            self.cell_write_cursor_buf = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("cell_write_cursor"),
+                size: cap,
+                usage: wgpu::BufferUsages::STORAGE,
+                mapped_at_creation: false,
+            });
+            self.cell_write_cursor_capacity = cap;
         }
-        let needed_nodes_bytes = (cell_nodes.len() as u64 * 4).max(64);
+        let needed_nodes_bytes = (self.n_nodes.max(1) as u64 * 4).max(64);
         if needed_nodes_bytes > self.cell_nodes_capacity {
+            let cap = needed_nodes_bytes * 2;
             self.cell_nodes_buf = device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("cell_nodes"),
-                size: needed_nodes_bytes * 2,
+                size: cap,
                 usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             });
-            self.cell_nodes_capacity = needed_nodes_bytes * 2;
+            self.cell_nodes_capacity = cap;
         }
-        queue.write_buffer(
-            &self.cell_offsets_buf,
-            0,
-            bytemuck::cast_slice(&cell_offsets),
-        );
-        queue.write_buffer(
-            &self.cell_nodes_buf,
-            0,
-            bytemuck::cast_slice(&cell_nodes),
-        );
+    }
+
+    /// Build the gb_* bind group used by the four grid-build entry points.
+    /// `pos_in` is the same positions buffer the upcoming `force_step` will
+    /// read — that way the grid is built from the same positions force_step
+    /// sees (no one-frame stale grid).
+    fn make_grid_build_bg(
+        &self,
+        device: &wgpu::Device,
+        pos_in: &wgpu::Buffer,
+    ) -> wgpu::BindGroup {
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("gpu_force_grid_build_bg"),
+            layout: &self.gb_bind_group_layout,
+            entries: &[
+                buf_entry(0, pos_in),
+                buf_entry(1, &self.params_buf),
+                buf_entry(2, &self.cell_counts_buf),
+                buf_entry(3, &self.cell_write_cursor_buf),
+                buf_entry(4, &self.cell_offsets_buf),
+                buf_entry(5, &self.cell_nodes_buf),
+            ],
+        })
+    }
+
+    /// Record the four grid-build dispatches (clear → count → scan → scatter)
+    /// into `encoder`. After this returns, cell_offsets + cell_nodes hold a
+    /// fresh bucket sort of `pos_in`. Each pass is its own compute pass so
+    /// wgpu inserts the necessary storage-buffer barriers between them.
+    fn encode_grid_build(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        bg: &wgpu::BindGroup,
+    ) {
+        let cells_groups = (self.n_cells + 63) / 64;
+        let nodes_groups = (self.n_nodes + 63) / 64;
+        // 1. clear counts + cursor + offsets
+        {
+            let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("grid_clear_pass"),
+                timestamp_writes: None,
+            });
+            cpass.set_pipeline(&self.gb_clear_pipeline);
+            cpass.set_bind_group(1, bg, &[]);
+            cpass.dispatch_workgroups(cells_groups.max(1), 1, 1);
+        }
+        // 2. count per cell (atomic add)
+        {
+            let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("grid_count_pass"),
+                timestamp_writes: None,
+            });
+            cpass.set_pipeline(&self.gb_count_pipeline);
+            cpass.set_bind_group(1, bg, &[]);
+            cpass.dispatch_workgroups(nodes_groups.max(1), 1, 1);
+        }
+        // 3. exclusive prefix sum, single workgroup, single thread
+        {
+            let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("grid_scan_pass"),
+                timestamp_writes: None,
+            });
+            cpass.set_pipeline(&self.gb_scan_pipeline);
+            cpass.set_bind_group(1, bg, &[]);
+            cpass.dispatch_workgroups(1, 1, 1);
+        }
+        // 4. scatter node indices into cell_nodes via cursor atomicAdd
+        {
+            let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("grid_scatter_pass"),
+                timestamp_writes: None,
+            });
+            cpass.set_pipeline(&self.gb_scatter_pipeline);
+            cpass.set_bind_group(1, bg, &[]);
+            cpass.dispatch_workgroups(nodes_groups.max(1), 1, 1);
+        }
     }
 
     /// Owned-mode "in/out" picker — both buffers live in PositionsStorage::Owned.
@@ -983,15 +1308,19 @@ impl GpuState {
     fn dispatch_step_direct(&self, device: &wgpu::Device, queue: &wgpu::Queue) {
         let (pos_in, pos_out) = self.owned_in_out();
         let bind_group = self.make_bind_group(device, pos_in, pos_out);
+        let gb_bg = self.make_grid_build_bg(device, pos_in);
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("gpu_force_cmd"),
         });
+        self.encode_grid_build(&mut encoder, &gb_bg);
         self.encode_compute(&mut encoder, &bind_group);
         queue.submit(Some(encoder.finish()));
     }
 
     /// Record dispatch into a caller-supplied encoder, reading/writing the
-    /// borrowed shared buffer + internal pos_b.
+    /// borrowed shared buffer + internal pos_b. Caller is responsible for
+    /// invoking `encode_grid_build_borrowed` before this if grid is enabled
+    /// — `step_with_encoder` does that once per call (not per step).
     fn dispatch_borrowed_step(
         &self,
         device: &wgpu::Device,
@@ -1001,6 +1330,19 @@ impl GpuState {
         let (pos_in, pos_out) = self.borrowed_in_out(shared);
         let bind_group = self.make_bind_group(device, pos_in, pos_out);
         self.encode_compute(encoder, &bind_group);
+    }
+
+    /// Borrowed-mode wrapper around `encode_grid_build` — builds the bind
+    /// group bound to whichever position buffer is currently the "in" side.
+    fn encode_grid_build_borrowed(
+        &self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        shared: &wgpu::Buffer,
+    ) {
+        let (pos_in, _pos_out) = self.borrowed_in_out(shared);
+        let bg = self.make_grid_build_bg(device, pos_in);
+        self.encode_grid_build(encoder, &bg);
     }
 
     fn encode_compute(&self, encoder: &mut wgpu::CommandEncoder, bind_group: &wgpu::BindGroup) {
@@ -1016,6 +1358,93 @@ impl GpuState {
 
     fn swap_position_buffers(&mut self) {
         self.a_is_in = !self.a_is_in;
+    }
+
+    /// If the previous frame's `energy_staging` map_async has completed, read
+    /// out the per-node KE values, take their max, unmap the staging buffer,
+    /// and reset the readback state to Idle. Returns Some(max_ke) if a value
+    /// was consumed this call, None if no completed map was waiting.
+    ///
+    /// This is the "drain on next frame" half of the deferred-readback pattern
+    /// — we never block. If the GPU/driver hasn't finished the map yet we
+    /// just report None and try again next frame.
+    fn drain_energy_readback(&self) -> Option<f32> {
+        // Take the lock briefly to inspect+transition state. We can't read
+        // the mapped range while holding the mutex (and we don't need to —
+        // the staging buffer's mapped slice is independent of this state).
+        let take_action = {
+            let mut guard = self.energy_readback.lock().ok()?;
+            match &*guard {
+                EnergyReadback::Mapped(Ok(())) => {
+                    *guard = EnergyReadback::Idle;
+                    Some(true)
+                }
+                EnergyReadback::Mapped(Err(_e)) => {
+                    // Map failures are rare and self-recovering — silently
+                    // reset to Idle and try again next frame.
+                    *guard = EnergyReadback::Idle;
+                    Some(false)
+                }
+                _ => None, // Idle or Mapping: nothing to drain.
+            }
+        };
+        let ok = take_action?;
+        if !ok {
+            return None;
+        }
+        // Map succeeded: read, reduce, unmap.
+        let slice = self.energy_staging.slice(..);
+        let view = slice.get_mapped_range();
+        let floats: &[f32] = bytemuck::cast_slice(&view);
+        let n = (self.n_nodes as usize).min(floats.len());
+        let mut max = 0.0f32;
+        for &v in &floats[..n] {
+            if v.is_finite() && v > max {
+                max = v;
+            }
+        }
+        drop(view);
+        self.energy_staging.unmap();
+        Some(max)
+    }
+
+    /// Record `energy_buf -> energy_staging` copy and schedule the
+    /// non-blocking map_async. Safe to call only when state is Idle —
+    /// remapping a buffer that's still mapped panics in wgpu. Caller is
+    /// responsible for that check.
+    fn schedule_energy_copy(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+    ) {
+        let n_bytes = (self.n_nodes as u64) * 4;
+        if n_bytes == 0 {
+            return;
+        }
+        encoder.copy_buffer_to_buffer(
+            &self.energy_buf,
+            0,
+            &self.energy_staging,
+            0,
+            n_bytes,
+        );
+        // Mark as Mapping *before* the async map fires so a slow callback
+        // can't race a future drain.
+        if let Ok(mut g) = self.energy_readback.lock() {
+            *g = EnergyReadback::Mapping;
+        }
+    }
+
+    /// Issue the actual `map_async` request on the energy_staging buffer.
+    /// Must be called AFTER the encoder is submitted (the copy needs to be
+    /// in flight). The callback signals completion via the shared Arc<Mutex<>>.
+    fn issue_energy_map(&self) {
+        let shared = self.energy_readback.clone();
+        let slice = self.energy_staging.slice(..);
+        slice.map_async(wgpu::MapMode::Read, move |res| {
+            if let Ok(mut g) = shared.lock() {
+                *g = EnergyReadback::Mapped(res.map_err(|e| format!("{e:?}")));
+            }
+        });
     }
 
     /// Owned-mode CPU readback of the latest positions.
@@ -1093,6 +1522,10 @@ struct AuxBuffers {
     cell_offsets_capacity: u64,
     cell_nodes: wgpu::Buffer,
     cell_nodes_capacity: u64,
+    cell_counts: wgpu::Buffer,
+    cell_counts_capacity: u64,
+    cell_write_cursor: wgpu::Buffer,
+    cell_write_cursor_capacity: u64,
     energy: wgpu::Buffer,
     energy_staging: wgpu::Buffer,
 }
@@ -1144,6 +1577,22 @@ fn build_aux_buffers(device: &wgpu::Device, pc: &PreCompute) -> AuxBuffers {
         usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
         mapped_at_creation: false,
     });
+    // GPU-side bucket-sort scratch: per-cell atomic counts + write cursor.
+    // Sized to match cell_offsets at construction; both grow alongside it.
+    let cell_counts_capacity = cell_offsets_capacity;
+    let cell_counts = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("cell_counts"),
+        size: cell_counts_capacity,
+        usage: wgpu::BufferUsages::STORAGE,
+        mapped_at_creation: false,
+    });
+    let cell_write_cursor_capacity = cell_offsets_capacity;
+    let cell_write_cursor = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("cell_write_cursor"),
+        size: cell_write_cursor_capacity,
+        usage: wgpu::BufferUsages::STORAGE,
+        mapped_at_creation: false,
+    });
     let energy_size = (n * 4).max(64);
     let energy = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("energy"),
@@ -1167,6 +1616,10 @@ fn build_aux_buffers(device: &wgpu::Device, pc: &PreCompute) -> AuxBuffers {
         cell_offsets_capacity,
         cell_nodes,
         cell_nodes_capacity,
+        cell_counts,
+        cell_counts_capacity,
+        cell_write_cursor,
+        cell_write_cursor_capacity,
         energy,
         energy_staging,
     }

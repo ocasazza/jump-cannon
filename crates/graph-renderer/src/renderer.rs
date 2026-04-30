@@ -520,6 +520,27 @@ impl Renderer {
         }
     }
 
+    /// True once the GPU-force layout has settled (max-KE under the
+    /// configured `energy_threshold` for `HALT_FRAMES` consecutive readbacks).
+    /// Always false if no layout is initialised.
+    pub fn sim_halted(&self) -> bool {
+        self.layout.as_ref().map(|l| l.is_halted()).unwrap_or(false)
+    }
+
+    /// Wake a halted layout. Call from any path that perturbs the sim
+    /// (cursor force, preset switch, slider drag).
+    pub fn sim_wake(&mut self) {
+        if let Some(l) = self.layout.as_mut() {
+            l.wake();
+        }
+    }
+
+    /// Most recent observed max kinetic-energy proxy (|vel|^2). 0 before
+    /// the first readback completes.
+    pub fn sim_max_ke(&self) -> f32 {
+        self.layout.as_ref().map(|l| l.last_max_ke()).unwrap_or(0.0)
+    }
+
     /// One-shot frame: optionally step the layout, then render.
     pub fn step(&mut self) -> Result<(), wgpu::SurfaceError> {
         // Update camera uniform.
