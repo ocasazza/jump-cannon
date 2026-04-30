@@ -19,6 +19,12 @@ struct Args {
     /// Don't auto-open the browser. Override with $GRAPH_API_NO_BROWSER=1.
     #[arg(long, env = "GRAPH_API_NO_BROWSER")]
     no_browser: bool,
+    /// Dev mode: serve /assets and / from this directory at request time
+    /// instead of from the embedded bundle. JS/CSS/HTML edits show up on
+    /// browser refresh without rebuild. Set $GRAPH_RENDERER_ASSETS_DIR or
+    /// pass --assets-dir.
+    #[arg(long, env = "GRAPH_RENDERER_ASSETS_DIR")]
+    assets_dir: Option<PathBuf>,
 }
 
 #[tokio::main]
@@ -56,7 +62,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    let state = AppState::new(vault_root, graph, vault_search);
+    if let Some(dir) = &args.assets_dir {
+        tracing::info!(assets_dir = %dir.display(), "dev mode: serving assets from disk");
+    }
+    let state = AppState::new(vault_root, graph, vault_search, args.assets_dir);
 
     let app = router(state);
 

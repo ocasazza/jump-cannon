@@ -34,23 +34,39 @@ pub fn router(state: AppState) -> Router {
         .with_state(state)
 }
 
-async fn index() -> impl IntoResponse {
-    asset_response("index.html")
+async fn index(State(s): State<AppState>) -> impl IntoResponse {
+    asset_response(&s, "index.html")
 }
 
-async fn asset(Path(path): Path<String>) -> impl IntoResponse {
-    asset_response(&path)
+async fn asset(State(s): State<AppState>, Path(path): Path<String>) -> impl IntoResponse {
+    asset_response(&s, &path)
 }
 
-fn asset_response(path: &str) -> impl IntoResponse {
-    match graph_renderer::assets().get_file(path) {
-        Some(file) => {
-            let mime = mime_for(path);
-            let mut headers = HeaderMap::new();
-            headers.insert(header::CONTENT_TYPE, HeaderValue::from_str(mime).unwrap());
-            (StatusCode::OK, headers, file.contents().to_vec()).into_response()
+/// Dev mode (assets_dir set): read from disk every request — refresh browser
+/// to see JS/CSS/HTML edits without rebuild.
+/// Release mode (assets_dir None): serve from the include_dir!() embedded bundle.
+fn asset_response(s: &AppState, path: &str) -> axum::response::Response {
+    let mime = mime_for(path);
+    if let Some(dir) = &s.inner.assets_dir {
+        let full = dir.join(path);
+        match std::fs::read(&full) {
+            Ok(bytes) => {
+                let mut headers = HeaderMap::new();
+                headers.insert(header::CONTENT_TYPE, HeaderValue::from_str(mime).unwrap());
+                (StatusCode::OK, headers, bytes).into_response()
+            }
+            Err(_) => (StatusCode::NOT_FOUND, format!("not found: {}", full.display()))
+                .into_response(),
         }
-        None => (StatusCode::NOT_FOUND, "not found").into_response(),
+    } else {
+        match graph_renderer::assets().get_file(path) {
+            Some(file) => {
+                let mut headers = HeaderMap::new();
+                headers.insert(header::CONTENT_TYPE, HeaderValue::from_str(mime).unwrap());
+                (StatusCode::OK, headers, file.contents().to_vec()).into_response()
+            }
+            None => (StatusCode::NOT_FOUND, "not found").into_response(),
+        }
     }
 }
 

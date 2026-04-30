@@ -29,6 +29,10 @@ pub struct AppStateInner {
     /// proxies to its `/ids` endpoint; when `None`, falls back to a naive
     /// title-contains scan.
     pub vault_search: Option<Arc<VaultSearch>>,
+    /// When `Some`, /assets/* and / are read from this directory at request
+    /// time (dev mode: edit JS/CSS/HTML, refresh browser, no rebuild).
+    /// When `None`, served from the embedded `graph-renderer` bundle.
+    pub assets_dir: Option<PathBuf>,
 }
 
 impl AppState {
@@ -36,6 +40,7 @@ impl AppState {
         vault_root: PathBuf,
         graph: VaultGraph,
         vault_search: Option<Arc<VaultSearch>>,
+        assets_dir: Option<PathBuf>,
     ) -> Self {
         let mut id_to_idx = HashMap::with_capacity(graph.nodes.len());
         let mut idx_to_id = Vec::with_capacity(graph.nodes.len());
@@ -50,6 +55,7 @@ impl AppState {
                 id_to_idx,
                 idx_to_id,
                 vault_search,
+                assets_dir,
             }),
         }
     }

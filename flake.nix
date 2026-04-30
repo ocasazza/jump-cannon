@@ -187,6 +187,9 @@
             # Build tools
             pkg-config
             protobuf
+
+            # Dev workflow
+            just
           ] ++ bevyLibs;
 
           # Linux: make Bevy's dynamic libs findable at runtime
