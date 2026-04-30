@@ -152,3 +152,35 @@ select.input {
 #modal .kv span:nth-child(odd) {
   color: #888;
 }
+
+#cheatsheet {
+  position: absolute;
+  bottom: 12px;
+  right: 12px;
+  background: rgba(20, 20, 24, 0.85);
+  border: 1px solid #2a2a30;
+  border-radius: 4px;
+  padding: 8px 10px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
+  color: #bbb;
+  z-index: 15;
+  pointer-events: none;
+}
+#cheatsheet.hidden { display: none; }
+#cheatsheet .ch-row {
+  display: grid;
+  grid-template-columns: 64px 1fr;
+  gap: 8px;
+  line-height: 1.6;
+}
+#cheatsheet kbd {
+  font-family: inherit;
+  background: #2a2a32;
+  border: 1px solid #3a3a44;
+  border-radius: 3px;
+  padding: 0 4px;
+  color: #ddd;
+  font-size: 10px;
+  text-align: center;
+}

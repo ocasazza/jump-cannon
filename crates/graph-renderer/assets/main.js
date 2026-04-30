@@ -4,8 +4,15 @@
 //   - bulk numeric (positions, edges, metrics) → raw Float32Array / Uint32Array
 //   - structured (init, node metadata, search) → protobuf via protobufjs
 //   - id list (/graph/ids) → JSON, fetched once at startup
+//
+// Rendering: three.js. InstancedMesh for nodes, LineSegments for edges.
+// Camera: OrbitControls + additive WASD/QE/RF keyboard 6DoF.
+// Layout sim is currently NOT live — server hands us static 2D positions
+// and we synthesize Z. Wave 2 will replace positionsBuf updates with the
+// graph-layouts WASM GPU compute output.
 
-import { Graph } from 'https://esm.sh/@cosmograph/cosmos@1.3.0';
+import * as THREE from 'https://esm.sh/three@0.160.0';
+import { OrbitControls } from 'https://esm.sh/three@0.160.0/examples/jsm/controls/OrbitControls.js';
 import protobuf from 'https://esm.sh/protobufjs@7';
 
 // ---------- DOM handles ----------
@@ -24,6 +31,7 @@ const $container = document.getElementById('container');
 const $simBtns   = document.querySelectorAll('.sim-preset');
 const $camFit    = document.getElementById('cam-fit');
 const $camReset  = document.getElementById('cam-reset');
+const $cheat     = document.getElementById('cheatsheet');
 
 // ---------- Protobuf schema ----------
 let Init = null, NodeMeta = null, SearchResults = null;
@@ -59,22 +67,20 @@ async function fetchJson(url) {
 
 function setStats(text) { $stats.textContent = text; }
 
-// ---------- Color helpers ----------
-// Cosmograph 1.3 expects RGBA in 0-255 range, not 0-1.
-// Our palette comes from Rust in 0-1 floats, so we scale here.
-function gradient(t) {
-  // blue → red sequential gradient. t in [0,1].
+// ---------- Color helpers (0-1 floats for three.js) ----------
+function gradient01(t) {
   t = Math.max(0, Math.min(1, t));
-  const r = (0.2 + t * (0.95 - 0.2)) * 255;
-  const g = (0.4 + t * (0.2  - 0.4)) * 255;
-  const b = (0.95 + t * (0.25 - 0.95)) * 255;
-  return [r, g, b, 255];
+  return [
+    0.2  + t * (0.95 - 0.2),
+    0.4  + t * (0.2  - 0.4),
+    0.95 + t * (0.25 - 0.95),
+  ];
 }
 
-function paletteColor(palette, idx) {
+function paletteColor01(palette, idx) {
   const len = Math.max(palette.length, 1);
   const c = palette[((idx | 0) % len + len) % len];
-  return c ? [c[0] * 255, c[1] * 255, c[2] * 255, 255] : [180, 180, 180, 255];
+  return c ? [c[0], c[1], c[2]] : [0.7, 0.7, 0.7];
 }
 
 function metricBounds(arr) {
@@ -122,24 +128,25 @@ async function loadBootstrap() {
 
   const nNodes = Number(init.nNodes);
   const idToIdx = new Map();
-  const nodes = new Array(nNodes);
+  for (let i = 0; i < nNodes; i++) idToIdx.set(ids[i], i);
+
+  // Server gives us 2D; promote to 3D with a small random Z spread until
+  // graph-layouts WASM hands us 3D positions in Wave 2.
+  const positionsBuf = new Float32Array(nNodes * 3);
   for (let i = 0; i < nNodes; i++) {
-    idToIdx.set(ids[i], i);
-    nodes[i] = { id: ids[i], x: positions[i * 2], y: positions[i * 2 + 1] };
-  }
-  const links = new Array(edges.length / 2);
-  for (let i = 0; i < links.length; i++) {
-    links[i] = { source: ids[edges[i * 2]], target: ids[edges[i * 2 + 1]] };
+    positionsBuf[i * 3 + 0] = positions[i * 2 + 0];
+    positionsBuf[i * 3 + 1] = positions[i * 2 + 1];
+    positionsBuf[i * 3 + 2] = (Math.random() - 0.5) * 200;
   }
 
-  return { init, ids, idToIdx, nodes, links, palette, metrics, bounds, nNodes };
+  return { init, ids, idToIdx, edges, positionsBuf, palette, metrics, bounds, nNodes };
 }
 
-// ---------- 2. Build graph ----------
+// ---------- 2. three.js scene ----------
 const SIM_PRESETS = {
-  fast:     { friction: 0.85, decay: 300,  repulsion: 1.0, gravity: 0.1, linkSpring: 0.4, linkDistance: 8 },
-  balanced: { friction: 0.95, decay: 5000, repulsion: 1.5, gravity: 0.1, linkSpring: 0.4, linkDistance: 8 },
-  pretty:   { friction: 0.95, decay: 2000, repulsion: 2.0, gravity: 0.1, linkSpring: 0.6, linkDistance: 12 },
+  fast:     {},
+  balanced: {},
+  pretty:   {},
 };
 
 const state = {
@@ -149,95 +156,278 @@ const state = {
   preset: 'balanced',
 };
 
-function makeSizeAccessor(boot) {
+let scene, camera, controls, renderer;
+let nodeMesh, edgeMesh;
+let raycaster, mousePos;
+let hoveredIdx = null;
+let selectedIds = null;     // Set<string> | null — null = nothing selected (all "normal")
+const dummy = new THREE.Object3D();
+
+function initThree() {
+  scene = new THREE.Scene();
+  scene.background = new THREE.Color(0x0d0d10);
+
+  const w = $canvas.clientWidth || window.innerWidth;
+  const h = $canvas.clientHeight || window.innerHeight;
+  camera = new THREE.PerspectiveCamera(60, w / h, 0.1, 200000);
+  camera.position.set(0, 0, 1500);
+
+  renderer = new THREE.WebGLRenderer({ antialias: true, canvas: $canvas });
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio, 1.5));
+  renderer.setSize(w, h, false);
+
+  controls = new OrbitControls(camera, $canvas);
+  controls.enableDamping = true;
+  controls.dampingFactor = 0.1;
+  controls.target.set(0, 0, 0);
+
+  raycaster = new THREE.Raycaster();
+  raycaster.params.Points = { threshold: 4 };
+  mousePos = new THREE.Vector2();
+
+  // Some fill light so the spheres aren't flat — though MeshBasicMaterial
+  // ignores lights, MeshLambertMaterial uses them.
+  scene.add(new THREE.AmbientLight(0xffffff, 0.7));
+  const dl = new THREE.DirectionalLight(0xffffff, 0.6);
+  dl.position.set(1, 1, 1);
+  scene.add(dl);
+
+  window.addEventListener('resize', onResize);
+}
+
+function onResize() {
+  const w = $canvas.clientWidth || window.innerWidth;
+  const h = $canvas.clientHeight || window.innerHeight;
+  renderer.setSize(w, h, false);
+  camera.aspect = w / h;
+  camera.updateProjectionMatrix();
+}
+
+function buildNodeMesh(boot) {
+  const geom = new THREE.SphereGeometry(1, 8, 6);
+  const mat  = new THREE.MeshLambertMaterial({ vertexColors: true });
+  nodeMesh = new THREE.InstancedMesh(geom, mat, boot.nNodes);
+  nodeMesh.instanceColor = new THREE.InstancedBufferAttribute(
+    new Float32Array(boot.nNodes * 3), 3
+  );
+  scene.add(nodeMesh);
+  updateNodeSizes(boot);
+  updateNodeColors(boot);
+}
+
+function buildEdgeMesh(boot) {
+  const nEdges = boot.edges.length / 2;
+  const positions = new Float32Array(nEdges * 2 * 3);
+  for (let i = 0; i < nEdges; i++) {
+    const a = boot.edges[i * 2];
+    const b = boot.edges[i * 2 + 1];
+    positions[i * 6 + 0] = boot.positionsBuf[a * 3 + 0];
+    positions[i * 6 + 1] = boot.positionsBuf[a * 3 + 1];
+    positions[i * 6 + 2] = boot.positionsBuf[a * 3 + 2];
+    positions[i * 6 + 3] = boot.positionsBuf[b * 3 + 0];
+    positions[i * 6 + 4] = boot.positionsBuf[b * 3 + 1];
+    positions[i * 6 + 5] = boot.positionsBuf[b * 3 + 2];
+  }
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+  const m = new THREE.LineBasicMaterial({
+    color: 0x555562, transparent: true, opacity: 0.4,
+  });
+  edgeMesh = new THREE.LineSegments(g, m);
+  scene.add(edgeMesh);
+}
+
+function nodeSizeAt(boot, idx) {
   const arr = boot.metrics[state.sizeBy];
   const { min, max } = boot.bounds[state.sizeBy];
   const span = max - min;
   const mul = state.sizeMul;
-  // Identity must change each call so Cosmograph's setConfig diff fires.
-  return (n) => {
-    const idx = boot.idToIdx.get(n.id);
-    if (idx === undefined) return 2 * mul;
-    if (span <= 0) return 2 * mul;
-    const t = Math.sqrt((arr[idx] - min) / span);
-    return (1 + t * 9) * mul;
-  };
+  if (!arr || span <= 0) return 2 * mul;
+  const t = Math.sqrt((arr[idx] - min) / span);
+  return (1 + t * 9) * mul;
 }
 
-function makeColorAccessor(boot) {
+function nodeColorAt(boot, idx) {
   const key = state.colorBy;
   if (key === 'community' || key === 'wcc') {
     const arr = boot.metrics[key];
-    return (n) => {
-      const idx = boot.idToIdx.get(n.id);
-      return paletteColor(boot.palette, idx === undefined ? 0 : (arr[idx] | 0));
-    };
+    return paletteColor01(boot.palette, arr[idx] | 0);
   }
   if (key === 'folder') {
-    // TODO: fetch per-node folder via NodeMeta or a bulk endpoint;
-    // currently fall back to community-by-palette.
+    // TODO: per-node folder via NodeMeta or bulk endpoint; fall back to community.
     const arr = boot.metrics.community;
-    return (n) => {
-      const idx = boot.idToIdx.get(n.id);
-      return paletteColor(boot.palette, idx === undefined ? 0 : (arr[idx] | 0));
-    };
+    return paletteColor01(boot.palette, arr[idx] | 0);
   }
-  // Sequential: indegree, kcore.
   const arr = boot.metrics[key];
   const { min, max } = boot.bounds[key];
   const span = max - min;
-  return (n) => {
-    const idx = boot.idToIdx.get(n.id);
-    if (idx === undefined || span <= 0) return gradient(0);
-    return gradient((arr[idx] - min) / span);
+  if (span <= 0) return gradient01(0);
+  return gradient01((arr[idx] - min) / span);
+}
+
+function updateNodeSizes(boot) {
+  for (let i = 0; i < boot.nNodes; i++) {
+    const s = nodeSizeAt(boot, i);
+    dummy.position.set(
+      boot.positionsBuf[i * 3 + 0],
+      boot.positionsBuf[i * 3 + 1],
+      boot.positionsBuf[i * 3 + 2],
+    );
+    dummy.scale.setScalar(s);
+    dummy.updateMatrix();
+    nodeMesh.setMatrixAt(i, dummy.matrix);
+  }
+  nodeMesh.instanceMatrix.needsUpdate = true;
+}
+
+function updateNodeColors(boot) {
+  const ca = nodeMesh.instanceColor.array;
+  const dim = (selectedIds !== null);
+  for (let i = 0; i < boot.nNodes; i++) {
+    const c = nodeColorAt(boot, i);
+    let mul = 1.0;
+    if (dim) {
+      mul = selectedIds.has(boot.ids[i]) ? 1.0 : 0.18;
+    }
+    ca[i * 3 + 0] = c[0] * mul;
+    ca[i * 3 + 1] = c[1] * mul;
+    ca[i * 3 + 2] = c[2] * mul;
+  }
+  nodeMesh.instanceColor.needsUpdate = true;
+}
+
+function refreshAccessors(boot) {
+  updateNodeSizes(boot);
+  updateNodeColors(boot);
+}
+
+// ---------- 3. Camera helpers ----------
+const initialCam = { pos: new THREE.Vector3(0, 0, 1500), target: new THREE.Vector3(0, 0, 0) };
+
+function computeBoundingSphere(boot) {
+  let cx = 0, cy = 0, cz = 0;
+  for (let i = 0; i < boot.nNodes; i++) {
+    cx += boot.positionsBuf[i * 3 + 0];
+    cy += boot.positionsBuf[i * 3 + 1];
+    cz += boot.positionsBuf[i * 3 + 2];
+  }
+  cx /= boot.nNodes; cy /= boot.nNodes; cz /= boot.nNodes;
+  let r2 = 0;
+  for (let i = 0; i < boot.nNodes; i++) {
+    const dx = boot.positionsBuf[i * 3 + 0] - cx;
+    const dy = boot.positionsBuf[i * 3 + 1] - cy;
+    const dz = boot.positionsBuf[i * 3 + 2] - cz;
+    const d2 = dx * dx + dy * dy + dz * dz;
+    if (d2 > r2) r2 = d2;
+  }
+  return { center: new THREE.Vector3(cx, cy, cz), radius: Math.sqrt(r2) || 1 };
+}
+
+function fitAll(boot) {
+  const { center, radius } = computeBoundingSphere(boot);
+  const fov = camera.fov * Math.PI / 180;
+  const dist = (radius * 1.4) / Math.sin(fov / 2);
+  const dir = new THREE.Vector3(0, 0, 1);
+  camera.position.copy(center).addScaledVector(dir, dist);
+  controls.target.copy(center);
+  controls.update();
+}
+
+function resetCamera() {
+  camera.position.copy(initialCam.pos);
+  controls.target.copy(initialCam.target);
+  controls.update();
+}
+
+// ---------- 4. Keyboard 6DoF (additive to OrbitControls) ----------
+const keys = {};
+window.addEventListener('keydown', (e) => {
+  // ignore when typing in input/search
+  const tag = e.target && e.target.tagName;
+  if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
+  keys[e.key.toLowerCase()] = true;
+});
+window.addEventListener('keyup', (e) => { keys[e.key.toLowerCase()] = false; });
+
+function applyKeyboardCamera(dt) {
+  const speed = (keys['shift'] ? 5 : 1) * 400 * dt;
+  const fwd = new THREE.Vector3();
+  camera.getWorldDirection(fwd);
+  const right = new THREE.Vector3().crossVectors(fwd, camera.up).normalize();
+  const up    = new THREE.Vector3().crossVectors(right, fwd).normalize();
+
+  let moved = false;
+  const move = (v, s) => {
+    camera.position.addScaledVector(v, s);
+    controls.target.addScaledVector(v, s);
+    moved = true;
   };
+  if (keys['w']) move(fwd, speed);
+  if (keys['s']) move(fwd, -speed);
+  if (keys['a']) move(right, -speed);
+  if (keys['d']) move(right, speed);
+  if (keys['q']) move(up, speed);
+  if (keys['e']) move(up, -speed);
+  if (keys['r']) move(fwd, speed * 2);
+  if (keys['f']) move(fwd, -speed * 2);
+  if (moved) controls.update();
 }
 
-function refreshAccessors(graph, boot) {
-  // Always mint NEW function references; Cosmograph skips identical refs.
-  graph.setConfig({
-    nodeSize: makeSizeAccessor(boot),
-    nodeColor: makeColorAccessor(boot),
+// ---------- 5. Hover + click ----------
+function wireRaycast(boot) {
+  $canvas.addEventListener('pointermove', (e) => {
+    const r = $canvas.getBoundingClientRect();
+    mousePos.x = ((e.clientX - r.left) / r.width) * 2 - 1;
+    mousePos.y = -((e.clientY - r.top) / r.height) * 2 + 1;
+    raycaster.setFromCamera(mousePos, camera);
+    const hits = raycaster.intersectObject(nodeMesh);
+    if (hits.length) {
+      hoveredIdx = hits[0].instanceId;
+      $canvas.style.cursor = 'pointer';
+    } else {
+      hoveredIdx = null;
+      $canvas.style.cursor = 'default';
+    }
+  });
+
+  $canvas.addEventListener('click', async () => {
+    if (hoveredIdx == null) { showModal(null); return; }
+    const id = boot.ids[hoveredIdx];
+    try {
+      const meta = await fetchProto(`/node/${encodeURIComponent(id)}`, NodeMeta);
+      showModal(meta);
+    } catch (e) { console.error(e); }
   });
 }
 
-function buildGraph(boot) {
-  const graph = new Graph($canvas, {
-    spaceSize: 8192,
-    backgroundColor: '#0d0d10',
-    nodeSize: makeSizeAccessor(boot),
-    nodeColor: makeColorAccessor(boot),
-    linkColor: [0.3, 0.3, 0.35, 0.4],
-    linkWidth: 1,
-    simulation: { ...SIM_PRESETS[state.preset] },
-    events: {
-      onClick: async (node) => {
-        if (!node) { showModal(null); return; }
-        try {
-          const meta = await fetchProto(`/node/${encodeURIComponent(node.id)}`, NodeMeta);
-          showModal(meta);
-        } catch (e) { console.error(e); }
-      },
-    },
-  });
-  graph.setData(boot.nodes, boot.links);
-  return graph;
+// ---------- 6. Animation loop ----------
+let lastT = performance.now();
+function animate() {
+  requestAnimationFrame(animate);
+  const now = performance.now();
+  const dt = Math.min(0.1, (now - lastT) / 1000);
+  lastT = now;
+  applyKeyboardCamera(dt);
+  controls.update();
+  // TODO Wave 2: pull updated positionsBuf from graph-layouts WASM compute,
+  // re-write nodeMesh instance matrices and edgeMesh `position` attribute.
+  renderer.render(scene, camera);
 }
 
-// ---------- 3. Sidebar controls ----------
-function wireSidebar(graph, boot) {
+// ---------- 7. Sidebar controls ----------
+function wireSidebar(boot) {
   $sizeBy.addEventListener('change', () => {
     state.sizeBy = $sizeBy.value;
-    refreshAccessors(graph, boot);
+    refreshAccessors(boot);
   });
   $sizeMul.addEventListener('input', () => {
     state.sizeMul = parseFloat($sizeMul.value);
     $sizeMulV.textContent = state.sizeMul.toFixed(2);
-    refreshAccessors(graph, boot);
+    refreshAccessors(boot);
   });
   $colorBy.addEventListener('change', () => {
     state.colorBy = $colorBy.value;
-    refreshAccessors(graph, boot);
+    refreshAccessors(boot);
   });
 
   $simBtns.forEach((btn) => {
@@ -246,32 +436,45 @@ function wireSidebar(graph, boot) {
       if (!SIM_PRESETS[preset]) return;
       state.preset = preset;
       $simBtns.forEach((b) => b.classList.toggle('active', b === btn));
-      graph.setConfig({ simulation: { ...SIM_PRESETS[preset] } });
-      if (typeof graph.start === 'function') graph.start();
+      // TODO Wave 2: wire to graph-layouts WASM GPU compute (preset → sim params).
     });
   });
 
-  $camFit.addEventListener('click', () => {
-    if (typeof graph.fitView === 'function') graph.fitView(500);
-  });
-  $camReset.addEventListener('click', () => {
-    if (typeof graph.zoom === 'function')           graph.zoom(1.0, 500);
-    else if (typeof graph.setZoomLevel === 'function') graph.setZoomLevel(1.0);
-  });
+  $camFit.addEventListener('click', () => fitAll(boot));
+  $camReset.addEventListener('click', () => resetCamera());
 
   // Cmd/Ctrl + B → toggle sidebar
+  // ? → toggle cheatsheet
+  // Space → fit-all
+  // Esc → close modal/clear selection
   window.addEventListener('keydown', (e) => {
+    const tag = e.target && e.target.tagName;
+    const inField = tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT';
     if ((e.metaKey || e.ctrlKey) && (e.key === 'b' || e.key === 'B')) {
       e.preventDefault();
       $container.classList.toggle('sidebar-collapsed');
+      onResize();
+      return;
+    }
+    if (inField) return;
+    if (e.key === '?') {
+      e.preventDefault();
+      $cheat.classList.toggle('hidden');
+    } else if (e.key === ' ') {
+      e.preventDefault();
+      fitAll(boot);
+    } else if (e.key === 'Escape') {
+      showModal(null);
+      selectedIds = null;
+      updateNodeColors(boot);
     }
   });
 }
 
-// ---------- 4. Search rows ----------
-function wireSearch(graph, boot) {
+// ---------- 8. Search rows ----------
+function wireSearch(boot) {
   let regexMode = false;
-  const lastSets = { search: null, include: null, exclude: null }; // null = "no query"
+  const lastSets = { search: null, include: null, exclude: null };
 
   const debounce = (fn, ms) => {
     let t = null;
@@ -294,14 +497,13 @@ function wireSearch(graph, boot) {
   function applyComposite() {
     const { search, include, exclude } = lastSets;
 
-    // If ALL rows empty → unselect.
     if (search === null && include === null && exclude === null) {
-      if (graph.unselectNodes) graph.unselectNodes();
+      selectedIds = null;
+      updateNodeColors(boot);
       return;
     }
 
     let final;
-    // search ∩ include
     if (search !== null && include !== null) {
       final = new Set();
       for (const id of search) if (include.has(id)) final.add(id);
@@ -310,19 +512,14 @@ function wireSearch(graph, boot) {
     } else if (include !== null) {
       final = new Set(include);
     } else {
-      final = new Set(boot.ids); // both empty, but exclude is set
+      final = new Set(boot.ids);
     }
-    // \ exclude
     if (exclude !== null) {
       for (const id of exclude) final.delete(id);
     }
 
-    if (final.size === 0) {
-      // Sentinel: select an id that doesn't exist → highlights nothing.
-      if (graph.selectNodesByIds) graph.selectNodesByIds(['__nope__:no-match']);
-      return;
-    }
-    if (graph.selectNodesByIds) graph.selectNodesByIds(Array.from(final));
+    selectedIds = final;
+    updateNodeColors(boot);
   }
 
   function makeRowHandler(slot, inputEl, allowRegex) {
@@ -344,12 +541,11 @@ function wireSearch(graph, boot) {
   $regexBtn.addEventListener('click', () => {
     regexMode = !regexMode;
     $regexBtn.classList.toggle('active', regexMode);
-    // Re-run search row immediately with new mode.
     $search.dispatchEvent(new Event('input'));
   });
 }
 
-// ---------- 5. Modal ----------
+// ---------- 9. Modal ----------
 function showModal(meta) {
   if (!meta) { $modal.classList.add('hidden'); return; }
   const tags = (meta.tags || []).map(t => `#${t}`).join(' ');
@@ -373,25 +569,26 @@ function showModal(meta) {
   $modal.classList.remove('hidden');
 }
 
-function wireModal() {
-  // Click-away to dismiss.
-  document.addEventListener('keydown', (e) => {
-    if (e.key === 'Escape') showModal(null);
-  });
-}
-
 // ---------- main ----------
 async function main() {
   const boot = await loadBootstrap();
-  const graph = buildGraph(boot);
+  initThree();
+  buildEdgeMesh(boot);
+  buildNodeMesh(boot);
+  fitAll(boot);
+  initialCam.pos.copy(camera.position);
+  initialCam.target.copy(controls.target);
+
   setStats(
     `${boot.nNodes.toLocaleString()} nodes • ` +
     `${Number(boot.init.nEdges).toLocaleString()} edges • ` +
     `${boot.init.numCommunities} communities`
   );
-  wireSidebar(graph, boot);
-  wireSearch(graph, boot);
-  wireModal();
+
+  wireSidebar(boot);
+  wireSearch(boot);
+  wireRaycast(boot);
+  animate();
 }
 
 main().catch((e) => {
