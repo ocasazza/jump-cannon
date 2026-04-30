@@ -18,6 +18,10 @@ pub enum MetadataValue {
 pub struct Node {
     pub id: Id,
     pub position: Option<(f64, f64)>,
+    /// 3D position for the GPU force backend. None until the GPU sim writes it.
+    /// Existing 2D layouts ignore this field.
+    #[serde(default)]
+    pub position3: Option<[f32; 3]>,
     #[serde(default)]
     pub metadata: HashMap<String, MetadataValue>,
     #[serde(default)]
@@ -35,6 +39,7 @@ impl Node {
         Self {
             id: id.into(),
             position: None,
+            position3: None,
             metadata: HashMap::new(),
             label: String::new(),
             r#type: String::new(),

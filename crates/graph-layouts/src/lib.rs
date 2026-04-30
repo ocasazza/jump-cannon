@@ -9,6 +9,7 @@ mod utils;
 use layout::LayoutEngine;
 pub use types::{Graph, Node, Edge, Id, MetadataValue, LayoutOptions};
 pub use layout::algorithms::fcose::{FcoseLayoutEngine, FcoseOptions};
+pub use layout::algorithms::gpu_force::{GpuForceLayout, GpuForceOptions};
 pub use benchmark::{run_benchmark, run_all_benchmarks};
 use file_parsers::parse_graph_file;
 
@@ -28,6 +29,9 @@ pub fn set_panic_hook() {
 #[wasm_bindgen]
 pub struct LayoutManager {
     graph: Graph,
+    /// Lazily-initialised GPU force engine. Holds wgpu device/queue/buffers
+    /// once `init_gpu_force` runs.
+    gpu_force: Option<GpuForceLayout>,
 }
 
 #[wasm_bindgen]
@@ -37,6 +41,7 @@ impl LayoutManager {
         set_panic_hook();
         Self {
             graph: Graph::new(),
+            gpu_force: None,
         }
     }
 
@@ -104,6 +109,78 @@ impl LayoutManager {
 pub fn run_fcose_layout_native(graph: &mut Graph, options: &FcoseOptions) -> Result<(), String> {
     use layout::LayoutEngine;
     FcoseLayoutEngine::new(options.clone()).apply_layout(graph)
+}
+
+/// Convenience native helper: spin up a one-shot GPU force layout, run
+/// `options.steps_per_call` steps, and write positions into the graph.
+/// For long-running per-frame use, hold a [`GpuForceLayout`] yourself.
+pub async fn run_gpu_force_native(
+    graph: &mut Graph,
+    options: &GpuForceOptions,
+) -> Result<(), String> {
+    let mut layout = GpuForceLayout::new(options.clone());
+    layout.run(graph).await
+}
+
+// ---------- WASM bindings for the GPU force backend -------------------------
+
+#[wasm_bindgen]
+impl LayoutManager {
+    /// Initialise (or reset) the GPU force engine for the current graph
+    /// topology. Subsequent `step_gpu_force` calls reuse the GPU resources.
+    /// `options_json` is a JSON object mirroring `GpuForceOptions`.
+    pub async fn init_gpu_force(&mut self, options_json: String) -> Result<(), JsValue> {
+        let opts: GpuForceOptions = serde_json::from_str(&options_json)
+            .map_err(|e| JsValue::from_str(&format!("parse options: {e}")))?;
+        // Stash the layout; GPU resources are built lazily on first run().
+        self.gpu_force = Some(GpuForceLayout::new(opts));
+        // Run a single step to materialise GPU state + write back positions.
+        if let Some(l) = self.gpu_force.as_mut() {
+            l.run(&mut self.graph)
+                .await
+                .map_err(|e| JsValue::from_str(&format!("init: {e}")))?;
+        }
+        Ok(())
+    }
+
+    /// Run `steps_per_call` simulation steps. Returns positions packed as
+    /// `[x0,y0,z0, x1,y1,z1, ...]` in the manager's stable id-sorted order.
+    pub async fn step_gpu_force(&mut self) -> Result<js_sys::Float32Array, JsValue> {
+        let Some(layout) = self.gpu_force.as_mut() else {
+            return Err(JsValue::from_str(
+                "gpu_force not initialised; call init_gpu_force first",
+            ));
+        };
+        layout
+            .run(&mut self.graph)
+            .await
+            .map_err(|e| JsValue::from_str(&format!("step: {e}")))?;
+
+        // Pack [x,y,z] in id-sorted order for stable downstream indexing.
+        let mut ids: Vec<&String> = self.graph.nodes.keys().collect();
+        ids.sort();
+        let mut out: Vec<f32> = Vec::with_capacity(ids.len() * 3);
+        for id in ids {
+            let p = self.graph.nodes[id].position3.unwrap_or([0.0, 0.0, 0.0]);
+            out.extend_from_slice(&p);
+        }
+        let arr = js_sys::Float32Array::new_with_length(out.len() as u32);
+        arr.copy_from(&out);
+        Ok(arr)
+    }
+
+    /// Update mutable options without rebuilding GPU state (cursor force,
+    /// slider tweaks, etc.).
+    pub fn update_gpu_force_options(&mut self, options_json: String) -> Result<(), JsValue> {
+        let opts: GpuForceOptions = serde_json::from_str(&options_json)
+            .map_err(|e| JsValue::from_str(&format!("parse options: {e}")))?;
+        if let Some(l) = self.gpu_force.as_mut() {
+            l.set_options(opts);
+            Ok(())
+        } else {
+            Err(JsValue::from_str("gpu_force not initialised"))
+        }
+    }
 }
 
 // CLI interface for running benchmarks

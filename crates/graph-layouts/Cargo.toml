@@ -31,6 +31,15 @@ chrono = { version = "0.4", optional = true }
 # code size when deploying.
 console_error_panic_hook = { version = "0.1.7", optional = false }
 
+# WebGPU compute backend for the 3D force-directed layout.
+# wgpu's WebGPU backend targets browsers; webgl is the fallback. Native picks
+# vulkan/metal/dx12 from the default backend set.
+wgpu     = { version = "23", default-features = false, features = ["webgpu", "webgl", "wgsl"] }
+bytemuck = { version = "1", features = ["derive"] }
+pollster = "0.4"
+wasm-bindgen-futures = "0.4"
+
 [dev-dependencies]
 wasm-bindgen-test = "0.3.34"
+tokio = { version = "1", features = ["macros", "rt"] }
 
