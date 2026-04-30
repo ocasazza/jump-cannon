@@ -147,6 +147,15 @@ const baseLayout = {
   gravity: 0.005, damping: 0.78, dt: 0.04,
   cursor_pos: [0, 0, 0], cursor_radius: 0, cursor_strength: 0,
   steps_per_call: 8,
+  // Spatial-hash grid + cooling. repulsion_radius bounds per-pair work to
+  // ~27 cells (3x3x3 neighbor walk). cooling_alpha < 1 cools damping per
+  // call toward cooling_floor. energy_threshold > 0 short-circuits when
+  // KE drops below it.
+  repulsion_radius: 120,
+  cooling_alpha: 0.998,
+  cooling_floor: 0.5,
+  energy_threshold: 0.05,
+  grid_enabled: true,
 };
 const SIM_PRESETS = {
   fast:     { ...baseLayout, repulsion: 150, damping: 0.70, steps_per_call: 16 },

@@ -32,6 +32,23 @@ pub struct GpuForceOptions {
     /// Negative attracts, positive repels.
     pub cursor_strength: f32,
     pub steps_per_call: u32,
+    /// Per-pair distance clip on repulsion. <=0 means "no clip" (full O(n^2)
+    /// attractor at infinity). With grid_enabled this also lets us skip
+    /// far-cell pairs cheaply. Default = 4 * spring_len = 120.
+    pub repulsion_radius: f32,
+    /// Multiplied into `damping` once per `step_with_encoder` / `run` call.
+    /// 1.0 = no cooling. 0.998 cools toward `cooling_floor` over a few
+    /// hundred frames. Set <1.0 to enable.
+    pub cooling_alpha: f32,
+    /// Lower bound on damping under cooling. Below this we stop decaying.
+    pub cooling_floor: f32,
+    /// Average kinetic-energy threshold below which we consider the layout
+    /// converged and short-circuit further dispatches. 0 disables.
+    pub energy_threshold: f32,
+    /// Whether to use the spatial-hash grid. Default true. Disable for
+    /// correctness comparison or for tiny graphs where the grid build
+    /// dominates.
+    pub grid_enabled: bool,
 }
 
 impl Default for GpuForceOptions {
@@ -47,6 +64,11 @@ impl Default for GpuForceOptions {
             cursor_radius: 0.0,
             cursor_strength: 0.0,
             steps_per_call: 8,
+            repulsion_radius: 120.0,
+            cooling_alpha: 1.0,
+            cooling_floor: 0.5,
+            energy_threshold: 0.0,
+            grid_enabled: true,
         }
     }
 }
@@ -61,7 +83,7 @@ mod _ignore {
 impl serde::Serialize for GpuForceOptions {
     fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeStruct;
-        let mut st = s.serialize_struct("GpuForceOptions", 11)?;
+        let mut st = s.serialize_struct("GpuForceOptions", 15)?;
         st.serialize_field("repulsion", &self.repulsion)?;
         st.serialize_field("spring_k", &self.spring_k)?;
         st.serialize_field("spring_len", &self.spring_len)?;
@@ -72,6 +94,11 @@ impl serde::Serialize for GpuForceOptions {
         st.serialize_field("cursor_radius", &self.cursor_radius)?;
         st.serialize_field("cursor_strength", &self.cursor_strength)?;
         st.serialize_field("steps_per_call", &self.steps_per_call)?;
+        st.serialize_field("repulsion_radius", &self.repulsion_radius)?;
+        st.serialize_field("cooling_alpha", &self.cooling_alpha)?;
+        st.serialize_field("cooling_floor", &self.cooling_floor)?;
+        st.serialize_field("energy_threshold", &self.energy_threshold)?;
+        st.serialize_field("grid_enabled", &self.grid_enabled)?;
         st.end()
     }
 }
@@ -100,6 +127,16 @@ impl<'de> serde::Deserialize<'de> for GpuForceOptions {
             cursor_strength: Option<f32>,
             #[serde(default)]
             steps_per_call: Option<u32>,
+            #[serde(default)]
+            repulsion_radius: Option<f32>,
+            #[serde(default)]
+            cooling_alpha: Option<f32>,
+            #[serde(default)]
+            cooling_floor: Option<f32>,
+            #[serde(default)]
+            energy_threshold: Option<f32>,
+            #[serde(default)]
+            grid_enabled: Option<bool>,
         }
         let r = Raw::deserialize(d)?;
         let def = GpuForceOptions::default();
@@ -114,6 +151,11 @@ impl<'de> serde::Deserialize<'de> for GpuForceOptions {
             cursor_radius: r.cursor_radius.unwrap_or(def.cursor_radius),
             cursor_strength: r.cursor_strength.unwrap_or(def.cursor_strength),
             steps_per_call: r.steps_per_call.unwrap_or(def.steps_per_call),
+            repulsion_radius: r.repulsion_radius.unwrap_or(def.repulsion_radius),
+            cooling_alpha: r.cooling_alpha.unwrap_or(def.cooling_alpha),
+            cooling_floor: r.cooling_floor.unwrap_or(def.cooling_floor),
+            energy_threshold: r.energy_threshold.unwrap_or(def.energy_threshold),
+            grid_enabled: r.grid_enabled.unwrap_or(def.grid_enabled),
         })
     }
 }
@@ -207,12 +249,29 @@ impl GpuForceLayout {
             .as_ref()
             .ok_or_else(|| "owned device missing".to_string())?;
         let state = self.state.as_mut().unwrap();
+        // First-call init for cooling.
+        if state.effective_damping <= 0.0 || state.effective_damping > 1.0 {
+            state.effective_damping = self.options.damping;
+        }
+        // Cool damping per call (toward floor).
+        let alpha = self.options.cooling_alpha.clamp(0.5, 1.0);
+        let floor = self.options.cooling_floor.clamp(0.0, 1.0);
+        state.effective_damping = (state.effective_damping * alpha).max(floor.min(self.options.damping));
+
+        state.rebuild_and_upload_grid(&od.device, &od.queue, &self.options);
         state.write_params(&od.queue, &self.options);
+        let mut steps_done = 0u32;
         for _ in 0..self.options.steps_per_call.max(1) {
             state.dispatch_step_direct(&od.device, &od.queue);
             state.swap_position_buffers();
+            steps_done += 1;
         }
+        let _ = steps_done;
         let positions = state.read_positions_owned(&od.device, &od.queue).await?;
+        // Mirror back into our CPU position cache for the next grid build.
+        if positions.len() == state.cpu_positions.len() {
+            state.cpu_positions.copy_from_slice(&positions);
+        }
         // Write back into the graph in the same id-order we built the buffer.
         for (id, p) in state.node_order.iter().zip(positions.chunks_exact(4)) {
             if let Some(node) = graph.nodes.get_mut(id) {
@@ -261,6 +320,15 @@ impl GpuForceLayout {
         let Some(state) = self.state.as_mut() else {
             return;
         };
+        // First-call init for cooling.
+        if state.effective_damping <= 0.0 || state.effective_damping > 1.0 {
+            state.effective_damping = self.options.damping;
+        }
+        let alpha = self.options.cooling_alpha.clamp(0.5, 1.0);
+        let floor = self.options.cooling_floor.clamp(0.0, 1.0);
+        state.effective_damping = (state.effective_damping * alpha).max(floor.min(self.options.damping));
+
+        state.rebuild_and_upload_grid(device, queue, &self.options);
         state.write_params(queue, &self.options);
         let steps = self.options.steps_per_call.max(1);
         for _ in 0..steps {
@@ -314,16 +382,25 @@ struct SimParamsRaw {
     spring_k: f32,
     spring_len: f32,
     gravity: f32,
+
     damping: f32,
     dt: f32,
     cursor_radius: f32,
     cursor_strength: f32,
+
     cursor_pos: [f32; 3],
     n_nodes: u32,
+
     n_edges: u32,
+    repulsion_radius: f32,
+    grid_cell_size: f32,
+    grid_enabled: u32,
+
+    grid_origin: [f32; 3],
+    n_cells: u32,
+
+    grid_dim: [u32; 3],
     _pad0: u32,
-    _pad1: u32,
-    _pad2: u32,
 }
 
 // Each vec3<f32> in a storage buffer occupies 16 bytes (vec3 has stride/align
@@ -371,6 +448,17 @@ struct GpuState {
     edge_offsets: wgpu::Buffer,
     edge_neighbors: wgpu::Buffer,
     params_buf: wgpu::Buffer,
+    /// Per-node mass (1 + log2(degree)). Static once built.
+    mass_buf: wgpu::Buffer,
+    /// Spatial-hash cells. (Re)allocated when capacity grows.
+    cell_offsets_buf: wgpu::Buffer,
+    cell_offsets_capacity: u64, // bytes
+    cell_nodes_buf: wgpu::Buffer,
+    cell_nodes_capacity: u64,
+    /// Per-node KE proxy = |vel|^2 written by the shader; CPU reads back
+    /// (small) for energy_threshold checks.
+    energy_buf: wgpu::Buffer,
+    energy_staging: wgpu::Buffer,
     /// Staging buffer for CPU readback. Only allocated in the owned path
     /// and on-demand for the borrowed path's `read_back_positions`.
     staging: Option<wgpu::Buffer>,
@@ -383,8 +471,21 @@ struct GpuState {
     /// can seed the shared buffer via `queue.write_buffer` after init.
     initial_positions: Vec<f32>,
 
+    /// CPU-side mirror of latest positions, used to rebuild the grid each
+    /// step without a GPU readback.
+    cpu_positions: Vec<f32>,
+
+    /// Last-built grid metadata (mirrored into params each step).
+    grid_origin: [f32; 3],
+    grid_cell_size: f32,
+    grid_dim: [u32; 3],
+    n_cells: u32,
+
     /// Stable node-id ordering used to interpret the position buffer.
     node_order: Vec<String>,
+
+    /// Effective damping currently in use; cooled per call.
+    effective_damping: f32,
 }
 
 /// CPU-side pre-compute: stable id ordering, initial positions
@@ -397,6 +498,8 @@ struct PreCompute {
     velocities: Vec<f32>,
     edge_offsets: Vec<u32>,
     edge_neighbors: Vec<u32>,
+    /// Per-node mass = 1 + log2(degree). Hubs end up heavier.
+    mass: Vec<f32>,
 }
 
 fn precompute(graph: &Graph) -> PreCompute {
@@ -453,6 +556,11 @@ fn precompute(graph: &Graph) -> PreCompute {
     if edge_neighbors.is_empty() {
         edge_neighbors.push(0);
     }
+    let mass: Vec<f32> = adj
+        .iter()
+        .map(|ns| 1.0 + ((ns.len() as f32).max(1.0)).log2())
+        .collect();
+    let mass = if mass.is_empty() { vec![1.0f32] } else { mass };
     PreCompute {
         n_nodes,
         n_edges,
@@ -461,7 +569,108 @@ fn precompute(graph: &Graph) -> PreCompute {
         velocities,
         edge_offsets,
         edge_neighbors,
+        mass,
     }
+}
+
+// ---------- Spatial-hash grid (CPU build) -----------------------------------
+
+/// Build a uniform 3D voxel grid over `positions` (length n*4, padded vec4).
+/// Returns (origin, cell_size, dim, n_cells, cell_offsets, cell_nodes).
+/// Caps `dim` at 64 per axis so memory stays bounded for crazy bboxes.
+fn build_grid(
+    positions: &[f32],
+    n_nodes: u32,
+    cell_size_in: f32,
+) -> (
+    [f32; 3],
+    f32,
+    [u32; 3],
+    u32,
+    Vec<u32>,
+    Vec<u32>,
+) {
+    let n = n_nodes as usize;
+    if n == 0 {
+        return ([0.0; 3], 1.0, [1, 1, 1], 1, vec![0, 0], vec![0]);
+    }
+    // 1. bbox
+    let mut mn = [f32::INFINITY; 3];
+    let mut mx = [f32::NEG_INFINITY; 3];
+    for i in 0..n {
+        for k in 0..3 {
+            let v = positions[i * 4 + k];
+            if v < mn[k] { mn[k] = v; }
+            if v > mx[k] { mx[k] = v; }
+        }
+    }
+    if !mn[0].is_finite() {
+        mn = [-1.0; 3];
+        mx = [1.0; 3];
+    }
+    // pad bbox slightly so points on the max edge still land in the last cell
+    let pad = (cell_size_in.max(1.0)) * 0.5;
+    let origin = [mn[0] - pad, mn[1] - pad, mn[2] - pad];
+    let extent = [
+        (mx[0] - mn[0]) + 2.0 * pad,
+        (mx[1] - mn[1]) + 2.0 * pad,
+        (mx[2] - mn[2]) + 2.0 * pad,
+    ];
+    let cell_size = cell_size_in.max(1.0);
+    const MAX_DIM: u32 = 64;
+    let mut dim = [
+        (((extent[0] / cell_size).ceil()) as u32).max(1).min(MAX_DIM),
+        (((extent[1] / cell_size).ceil()) as u32).max(1).min(MAX_DIM),
+        (((extent[2] / cell_size).ceil()) as u32).max(1).min(MAX_DIM),
+    ];
+    // If we capped, expand effective cell size so all points still fit.
+    let mut eff_cell = cell_size;
+    for k in 0..3 {
+        let needed = (extent[k] / dim[k] as f32).max(1e-3);
+        if needed > eff_cell {
+            eff_cell = needed;
+        }
+    }
+    // recompute dims with eff_cell to keep grid covering bbox precisely
+    for k in 0..3 {
+        dim[k] = (((extent[k] / eff_cell).ceil()) as u32).max(1).min(MAX_DIM);
+    }
+    let n_cells = dim[0] * dim[1] * dim[2];
+    let inv = 1.0 / eff_cell;
+
+    // 2. count per cell
+    let mut counts = vec![0u32; n_cells as usize];
+    let mut node_cell = vec![0u32; n];
+    for i in 0..n {
+        let mut ix = ((positions[i * 4] - origin[0]) * inv) as i32;
+        let mut iy = ((positions[i * 4 + 1] - origin[1]) * inv) as i32;
+        let mut iz = ((positions[i * 4 + 2] - origin[2]) * inv) as i32;
+        if ix < 0 { ix = 0; } else if ix >= dim[0] as i32 { ix = dim[0] as i32 - 1; }
+        if iy < 0 { iy = 0; } else if iy >= dim[1] as i32 { iy = dim[1] as i32 - 1; }
+        if iz < 0 { iz = 0; } else if iz >= dim[2] as i32 { iz = dim[2] as i32 - 1; }
+        let cell =
+            ix as u32 + iy as u32 * dim[0] + iz as u32 * dim[0] * dim[1];
+        node_cell[i] = cell;
+        counts[cell as usize] += 1;
+    }
+    // 3. prefix sum
+    let mut cell_offsets = vec![0u32; n_cells as usize + 1];
+    let mut acc = 0u32;
+    for c in 0..n_cells as usize {
+        cell_offsets[c] = acc;
+        acc += counts[c];
+    }
+    cell_offsets[n_cells as usize] = acc;
+    // 4. scatter
+    let mut cursor = cell_offsets.clone();
+    let mut cell_nodes = vec![0u32; n];
+    for i in 0..n {
+        let c = node_cell[i] as usize;
+        cell_nodes[cursor[c] as usize] = i as u32;
+        cursor[c] += 1;
+    }
+
+    (origin, eff_cell, dim, n_cells, cell_offsets, cell_nodes)
 }
 
 fn build_pipeline(
@@ -489,6 +698,10 @@ fn build_pipeline(
             },
             count: None,
         },
+        storage_entry(6, true),  // cell_offsets
+        storage_entry(7, true),  // cell_nodes
+        storage_entry(8, true),  // mass
+        storage_entry(9, false), // energy_out
     ];
     let bind_group_layout = device.create_bind_group_layout(
         &wgpu::BindGroupLayoutDescriptor {
@@ -532,7 +745,7 @@ impl GpuState {
             contents: bytemuck::cast_slice(&pc.initial_positions),
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
         });
-        let (vel, off, neigh, params_buf) = build_aux_buffers(device, &pc);
+        let aux = build_aux_buffers(device, &pc);
         let staging = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("positions_staging"),
             size: pos_buf_size,
@@ -540,22 +753,36 @@ impl GpuState {
             mapped_at_creation: false,
         });
         let (pipeline, bind_group_layout) = build_pipeline(device);
+        let cpu_positions = pc.initial_positions.clone();
 
         Ok(Self {
             pipeline,
             bind_group_layout,
             positions: PositionsStorage::Owned { pos_a, pos_b },
             a_is_in: true,
-            velocities: vel,
-            edge_offsets: off,
-            edge_neighbors: neigh,
-            params_buf,
+            velocities: aux.vel,
+            edge_offsets: aux.off,
+            edge_neighbors: aux.neigh,
+            params_buf: aux.params,
+            mass_buf: aux.mass,
+            cell_offsets_buf: aux.cell_offsets,
+            cell_offsets_capacity: aux.cell_offsets_capacity,
+            cell_nodes_buf: aux.cell_nodes,
+            cell_nodes_capacity: aux.cell_nodes_capacity,
+            energy_buf: aux.energy,
+            energy_staging: aux.energy_staging,
             staging: Some(staging),
             n_nodes: pc.n_nodes,
             n_edges: pc.n_edges,
             pos_buf_size,
             initial_positions: pc.initial_positions,
+            cpu_positions,
+            grid_origin: [0.0; 3],
+            grid_cell_size: 1.0,
+            grid_dim: [1, 1, 1],
+            n_cells: 1,
             node_order: pc.node_order,
+            effective_damping: 1.0,
         })
     }
 
@@ -580,26 +807,40 @@ impl GpuState {
                 | wgpu::BufferUsages::COPY_SRC
                 | wgpu::BufferUsages::COPY_DST,
         });
-        let (vel, off, neigh, params_buf) = build_aux_buffers(device, &pc);
+        let aux = build_aux_buffers(device, &pc);
         let (pipeline, bind_group_layout) = build_pipeline(device);
 
         let _ = positions_buffer; // sized check happens via caller usage
+        let cpu_positions = pc.initial_positions.clone();
 
         Ok(Self {
             pipeline,
             bind_group_layout,
             positions: PositionsStorage::Borrowed { pos_b },
             a_is_in: true,
-            velocities: vel,
-            edge_offsets: off,
-            edge_neighbors: neigh,
-            params_buf,
+            velocities: aux.vel,
+            edge_offsets: aux.off,
+            edge_neighbors: aux.neigh,
+            params_buf: aux.params,
+            mass_buf: aux.mass,
+            cell_offsets_buf: aux.cell_offsets,
+            cell_offsets_capacity: aux.cell_offsets_capacity,
+            cell_nodes_buf: aux.cell_nodes,
+            cell_nodes_capacity: aux.cell_nodes_capacity,
+            energy_buf: aux.energy,
+            energy_staging: aux.energy_staging,
             staging: None,
             n_nodes: pc.n_nodes,
             n_edges: pc.n_edges,
             pos_buf_size,
             initial_positions: pc.initial_positions,
+            cpu_positions,
+            grid_origin: [0.0; 3],
+            grid_cell_size: 1.0,
+            grid_dim: [1, 1, 1],
+            n_cells: 1,
             node_order: pc.node_order,
+            effective_damping: 1.0,
         })
     }
 
@@ -616,18 +857,75 @@ impl GpuState {
             spring_k: opts.spring_k,
             spring_len: opts.spring_len,
             gravity: opts.gravity,
-            damping: opts.damping,
+            damping: self.effective_damping,
             dt: opts.dt,
             cursor_radius: opts.cursor_radius,
             cursor_strength: opts.cursor_strength,
             cursor_pos: opts.cursor_pos,
             n_nodes: self.n_nodes,
             n_edges: self.n_edges,
+            repulsion_radius: opts.repulsion_radius,
+            grid_cell_size: self.grid_cell_size,
+            grid_enabled: if opts.grid_enabled { 1 } else { 0 },
+            grid_origin: self.grid_origin,
+            n_cells: self.n_cells,
+            grid_dim: self.grid_dim,
             _pad0: 0,
-            _pad1: 0,
-            _pad2: 0,
         };
         queue.write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&raw));
+    }
+
+    /// Build the spatial-hash grid from `cpu_positions`, (re)allocate the
+    /// cell buffers if needed, and upload to GPU.
+    fn rebuild_and_upload_grid(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        opts: &GpuForceOptions,
+    ) {
+        let cell_size_target = if opts.repulsion_radius > 0.0 {
+            opts.repulsion_radius
+        } else {
+            (opts.spring_len * 4.0).max(1.0)
+        };
+        let (origin, cell_size, dim, n_cells, cell_offsets, cell_nodes) =
+            build_grid(&self.cpu_positions, self.n_nodes, cell_size_target);
+        self.grid_origin = origin;
+        self.grid_cell_size = cell_size;
+        self.grid_dim = dim;
+        self.n_cells = n_cells;
+
+        // Resize cell_offsets buffer if needed.
+        let needed_off_bytes = (cell_offsets.len() as u64 * 4).max(64);
+        if needed_off_bytes > self.cell_offsets_capacity {
+            self.cell_offsets_buf = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("cell_offsets"),
+                size: needed_off_bytes * 2,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            self.cell_offsets_capacity = needed_off_bytes * 2;
+        }
+        let needed_nodes_bytes = (cell_nodes.len() as u64 * 4).max(64);
+        if needed_nodes_bytes > self.cell_nodes_capacity {
+            self.cell_nodes_buf = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("cell_nodes"),
+                size: needed_nodes_bytes * 2,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            self.cell_nodes_capacity = needed_nodes_bytes * 2;
+        }
+        queue.write_buffer(
+            &self.cell_offsets_buf,
+            0,
+            bytemuck::cast_slice(&cell_offsets),
+        );
+        queue.write_buffer(
+            &self.cell_nodes_buf,
+            0,
+            bytemuck::cast_slice(&cell_nodes),
+        );
     }
 
     /// Owned-mode "in/out" picker — both buffers live in PositionsStorage::Owned.
@@ -672,6 +970,10 @@ impl GpuState {
                 buf_entry(3, &self.edge_offsets),
                 buf_entry(4, &self.edge_neighbors),
                 buf_entry(5, &self.params_buf),
+                buf_entry(6, &self.cell_offsets_buf),
+                buf_entry(7, &self.cell_nodes_buf),
+                buf_entry(8, &self.mass_buf),
+                buf_entry(9, &self.energy_buf),
             ],
         })
     }
@@ -781,12 +1083,23 @@ impl GpuState {
     }
 }
 
-/// Build the velocity, edge_offsets, edge_neighbors, and params buffers
-/// used by both owned and borrowed paths.
-fn build_aux_buffers(
-    device: &wgpu::Device,
-    pc: &PreCompute,
-) -> (wgpu::Buffer, wgpu::Buffer, wgpu::Buffer, wgpu::Buffer) {
+struct AuxBuffers {
+    vel: wgpu::Buffer,
+    off: wgpu::Buffer,
+    neigh: wgpu::Buffer,
+    params: wgpu::Buffer,
+    mass: wgpu::Buffer,
+    cell_offsets: wgpu::Buffer,
+    cell_offsets_capacity: u64,
+    cell_nodes: wgpu::Buffer,
+    cell_nodes_capacity: u64,
+    energy: wgpu::Buffer,
+    energy_staging: wgpu::Buffer,
+}
+
+/// Build the velocity, edge_offsets, edge_neighbors, params, mass, grid,
+/// and energy buffers used by both owned and borrowed paths.
+fn build_aux_buffers(device: &wgpu::Device, pc: &PreCompute) -> AuxBuffers {
     let vel = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("velocities"),
         contents: bytemuck::cast_slice(&pc.velocities),
@@ -802,13 +1115,61 @@ fn build_aux_buffers(
         contents: bytemuck::cast_slice(&pc.edge_neighbors),
         usage: wgpu::BufferUsages::STORAGE,
     });
-    let params_buf = device.create_buffer(&wgpu::BufferDescriptor {
+    let params = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("sim_params"),
         size: std::mem::size_of::<SimParamsRaw>() as u64,
         usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         mapped_at_creation: false,
     });
-    (vel, off, neigh, params_buf)
+    let mass = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("mass"),
+        contents: bytemuck::cast_slice(&pc.mass),
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+    });
+    // Initial capacity: enough for a 1-cell grid + the n nodes. Will grow.
+    let init_cell_offsets = vec![0u32, pc.n_nodes];
+    let cell_offsets_capacity =
+        (init_cell_offsets.len() as u64 * 4).max(64);
+    let cell_offsets = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("cell_offsets"),
+        size: cell_offsets_capacity,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let n = pc.n_nodes.max(1) as u64;
+    let cell_nodes_capacity = (n * 4).max(64);
+    let cell_nodes = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("cell_nodes"),
+        size: cell_nodes_capacity,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let energy_size = (n * 4).max(64);
+    let energy = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("energy"),
+        size: energy_size,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        mapped_at_creation: false,
+    });
+    let energy_staging = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("energy_staging"),
+        size: energy_size,
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+    AuxBuffers {
+        vel,
+        off,
+        neigh,
+        params,
+        mass,
+        cell_offsets,
+        cell_offsets_capacity,
+        cell_nodes,
+        cell_nodes_capacity,
+        energy,
+        energy_staging,
+    }
 }
 
 fn storage_entry(binding: u32, read_only: bool) -> wgpu::BindGroupLayoutEntry {
@@ -977,5 +1338,64 @@ mod tests {
         }
         assert!(any_moved, "force step should have moved at least one node");
         assert_eq!(layout.node_count(), Some(3));
+    }
+
+    fn random_graph(n: usize, m: usize) -> Graph {
+        let mut g = Graph::new();
+        let mut s: u32 = 0xDEADBEEF;
+        let mut rng = || {
+            s = s.wrapping_mul(1664525).wrapping_add(1013904223);
+            s
+        };
+        for i in 0..n {
+            let mut node = Node::new(format!("{:06}", i));
+            let r = 200.0;
+            let x = ((rng() as f32) / u32::MAX as f32) * 2.0 * r - r;
+            let y = ((rng() as f32) / u32::MAX as f32) * 2.0 * r - r;
+            let z = ((rng() as f32) / u32::MAX as f32) * 2.0 * r - r;
+            node.position3 = Some([x, y, z]);
+            g.add_node(node);
+        }
+        for k in 0..m {
+            let a = (rng() as usize) % n;
+            let b = (rng() as usize) % n;
+            if a == b { continue; }
+            g.add_edge(Edge::new(format!("e{}", k), format!("{:06}", a), format!("{:06}", b)));
+        }
+        g
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn unit_gpu_force_grid_produces_reasonable_layout() {
+        // 100 random nodes, 200 random edges. Run 10 steps with grid on.
+        let mut g = random_graph(100, 200);
+        let mut layout = GpuForceLayout::new(GpuForceOptions {
+            steps_per_call: 10,
+            grid_enabled: true,
+            repulsion_radius: 120.0,
+            ..Default::default()
+        });
+        match layout.run(&mut g).await {
+            Ok(()) => {}
+            Err(e) => {
+                eprintln!("skipping (no gpu adapter): {e}");
+                return;
+            }
+        }
+        // Verify all positions finite + non-degenerate spread.
+        let mut mn = [f32::INFINITY; 3];
+        let mut mx = [f32::NEG_INFINITY; 3];
+        let mut all_finite = true;
+        for node in g.nodes.values() {
+            let p = node.position3.expect("position3 set");
+            for k in 0..3 {
+                if !p[k].is_finite() { all_finite = false; }
+                if p[k] < mn[k] { mn[k] = p[k]; }
+                if p[k] > mx[k] { mx[k] = p[k]; }
+            }
+        }
+        assert!(all_finite, "all positions must be finite");
+        let span = (mx[0] - mn[0]).max(mx[1] - mn[1]).max(mx[2] - mn[2]);
+        assert!(span > 50.0, "layout collapsed: span={span}");
     }
 }
