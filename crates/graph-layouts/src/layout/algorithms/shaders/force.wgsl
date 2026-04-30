@@ -7,7 +7,7 @@
 // (edge_offsets / edge_neighbors). Integration is semi-implicit Euler with
 // per-node mass and velocity damping.
 //
-// Bindings:
+// Bindings (force_step pipeline):
 //   @group(0) @binding(0) positions_in       (read)
 //   @group(0) @binding(1) positions_out      (read_write)
 //   @group(0) @binding(2) velocities         (read_write)
@@ -18,6 +18,16 @@
 //   @group(0) @binding(7) cell_nodes         (read)   length n
 //   @group(0) @binding(8) mass               (read)   length n
 //   @group(0) @binding(9) energy_out         (read_write) length n  (max disp proxy)
+//
+// Bindings (grid build pipelines: clear_cell_counts / count_cells /
+// scan_cell_offsets / scatter_cells). All four entry points share a single
+// bind group layout so they can be dispatched against one bind group:
+//   @group(1) @binding(0) gb_positions_in    (read)            length n
+//   @group(1) @binding(1) gb_params          (uniform)
+//   @group(1) @binding(2) gb_cell_counts     (atomic<u32>)     length n_cells
+//   @group(1) @binding(3) gb_cell_cursor     (atomic<u32>)     length n_cells
+//   @group(1) @binding(4) gb_cell_offsets    (read_write u32)  length n_cells+1
+//   @group(1) @binding(5) gb_cell_nodes      (read_write u32)  length n
 
 struct SimParams {
     repulsion: f32,
@@ -50,6 +60,78 @@ struct SimParams {
 @group(0) @binding(7) var<storage, read>       cell_nodes:      array<u32>;
 @group(0) @binding(8) var<storage, read>       mass:            array<f32>;
 @group(0) @binding(9) var<storage, read_write> energy_out:      array<f32>;
+
+// ---- Grid-build bindings (group 1) -----------------------------------------
+@group(1) @binding(0) var<storage, read>       gb_positions_in: array<vec3<f32>>;
+@group(1) @binding(1) var<uniform>             gb_params:       SimParams;
+@group(1) @binding(2) var<storage, read_write> gb_cell_counts:  array<atomic<u32>>;
+@group(1) @binding(3) var<storage, read_write> gb_cell_cursor:  array<atomic<u32>>;
+@group(1) @binding(4) var<storage, read_write> gb_cell_offsets: array<u32>;
+@group(1) @binding(5) var<storage, read_write> gb_cell_nodes:   array<u32>;
+
+fn gb_cell_for(pos: vec3<f32>) -> u32 {
+    let inv = 1.0 / gb_params.grid_cell_size;
+    let rel = (pos - gb_params.grid_origin) * inv;
+    let dim_x = i32(gb_params.grid_dim.x);
+    let dim_y = i32(gb_params.grid_dim.y);
+    let dim_z = i32(gb_params.grid_dim.z);
+    var ix = i32(floor(rel.x));
+    var iy = i32(floor(rel.y));
+    var iz = i32(floor(rel.z));
+    if (ix < 0) { ix = 0; } else if (ix >= dim_x) { ix = dim_x - 1; }
+    if (iy < 0) { iy = 0; } else if (iy >= dim_y) { iy = dim_y - 1; }
+    if (iz < 0) { iz = 0; } else if (iz >= dim_z) { iz = dim_z - 1; }
+    return u32(ix)
+        + u32(iy) * gb_params.grid_dim.x
+        + u32(iz) * gb_params.grid_dim.x * gb_params.grid_dim.y;
+}
+
+@compute @workgroup_size(64)
+fn clear_cell_counts(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    if (i >= gb_params.n_cells) { return; }
+    atomicStore(&gb_cell_counts[i], 0u);
+    atomicStore(&gb_cell_cursor[i], 0u);
+    // cell_offsets has length n_cells+1; clear the tail at thread 0.
+    if (i == 0u) {
+        gb_cell_offsets[gb_params.n_cells] = 0u;
+    }
+    gb_cell_offsets[i] = 0u;
+}
+
+@compute @workgroup_size(64)
+fn count_cells(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    if (i >= gb_params.n_nodes) { return; }
+    let cell = gb_cell_for(gb_positions_in[i]);
+    atomicAdd(&gb_cell_counts[cell], 1u);
+}
+
+// Single-workgroup, single-thread sequential exclusive prefix sum over
+// cell_counts → cell_offsets. n_cells is bounded (≤ 64^3 = 262144) so this
+// is fine: ~0.1ms for the worst case, dominated by memory ops not compute.
+// We do this on one thread to avoid a multi-pass GPU scan; the alternative
+// (CPU readback + upload) would force a mid-frame submit + map_async.
+@compute @workgroup_size(1)
+fn scan_cell_offsets(@builtin(global_invocation_id) gid: vec3<u32>) {
+    if (gid.x != 0u) { return; }
+    var acc: u32 = 0u;
+    let n = gb_params.n_cells;
+    for (var c: u32 = 0u; c < n; c = c + 1u) {
+        gb_cell_offsets[c] = acc;
+        acc = acc + atomicLoad(&gb_cell_counts[c]);
+    }
+    gb_cell_offsets[n] = acc;
+}
+
+@compute @workgroup_size(64)
+fn scatter_cells(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    if (i >= gb_params.n_nodes) { return; }
+    let cell = gb_cell_for(gb_positions_in[i]);
+    let slot = atomicAdd(&gb_cell_cursor[cell], 1u);
+    gb_cell_nodes[gb_cell_offsets[cell] + slot] = i;
+}
 
 @compute @workgroup_size(64)
 fn force_step(@builtin(global_invocation_id) gid: vec3<u32>) {

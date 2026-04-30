@@ -317,8 +317,12 @@ impl GpuForceLayout {
         state.rebuild_and_upload_grid(&od.device, &od.queue, &self.options);
         state.write_params(&od.queue, &self.options);
         let mut steps_done = 0u32;
-        for _ in 0..self.options.steps_per_call.max(1) {
-            state.dispatch_step_direct(&od.device, &od.queue);
+        let total_steps = self.options.steps_per_call.max(1);
+        for s in 0..total_steps {
+            // Build the grid only on the first step (matches borrowed path's
+            // "build once per call" cadence) and only if grid is enabled.
+            let build_grid = s == 0 && self.options.grid_enabled;
+            state.dispatch_step_direct(&od.device, &od.queue, build_grid);
             state.swap_position_buffers();
             steps_done += 1;
         }
@@ -1304,15 +1308,26 @@ impl GpuState {
     }
 
     /// Direct dispatch — owns its own encoder and submits immediately.
-    /// Used by the legacy `run()` path (owned mode only).
-    fn dispatch_step_direct(&self, device: &wgpu::Device, queue: &wgpu::Queue) {
+    /// Used by the legacy `run()` path (owned mode only). `build_grid`
+    /// controls whether the grid bucket sort runs in the same submit
+    /// (called once for the first step per call; subsequent steps within
+    /// the same `run()` reuse the grid for symmetry with the borrowed
+    /// path's "build once per call").
+    fn dispatch_step_direct(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        build_grid: bool,
+    ) {
         let (pos_in, pos_out) = self.owned_in_out();
         let bind_group = self.make_bind_group(device, pos_in, pos_out);
-        let gb_bg = self.make_grid_build_bg(device, pos_in);
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("gpu_force_cmd"),
         });
-        self.encode_grid_build(&mut encoder, &gb_bg);
+        if build_grid {
+            let gb_bg = self.make_grid_build_bg(device, pos_in);
+            self.encode_grid_build(&mut encoder, &gb_bg);
+        }
         self.encode_compute(&mut encoder, &bind_group);
         queue.submit(Some(encoder.finish()));
     }
