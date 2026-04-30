@@ -543,28 +543,454 @@ function wireSearch(boot) {
   });
 }
 
-// ---------- Modal ----------
+// ---------- Modal: rich typed badges + click-to-filter ----------
+//
+// Restores the metadata UX from vault-graph-cosmos.py: per-field type
+// detection (wikilinks, URLs, dates, tags, status pills, lists), each
+// badge is clickable to toggle a (field, value) filter that drills the
+// graph down via `selectedIds`.
+//
+// FILTER INDEX NOTE: the inverted index `fieldIndex: Map<field, Map<value,
+// Set<nodeId>>>` is built **lazily** — only nodes whose modal has been
+// opened contribute. A server-side `/graph/field_index` endpoint covering
+// the full vault is the proper follow-up.
+
+const $filterChips = document.getElementById('filter-chips');
+let bootRef = null;          // captured in main() so badge handlers can read ids
+let currentMeta = null;      // meta of currently-pinned modal node
+const fieldIndex = new Map();           // Map<field, Map<value, Set<nodeId>>>
+const activeFieldFilters = new Map();   // Map<field, Set<value>>
+
+const _wikilinkRe = /\[\[[^\]]+\]\]/;
+const _wikiSplitRe = /\[\[([^\]|]+)(?:\|([^\]]+))?\]\]/g;
+const _urlRe = /^https?:\/\//i;
+const _dateRe = /^\d{4}-\d{2}-\d{2}$/;
+const KNOWN_STATUS = new Set(['active', 'draft', 'needs-review', 'needs-fetch',
+                              'archived', 'failed', 'done']);
+
+function _isFilterActive(field, value) {
+  const s = activeFieldFilters.get(field);
+  return !!(s && s.has(String(value)));
+}
+
+function _addToFieldIndex(field, value, nid) {
+  if (typeof value !== 'string' && typeof value !== 'number' && typeof value !== 'boolean') return;
+  const v = String(value); if (!v) return;
+  let f = fieldIndex.get(field);
+  if (!f) { f = new Map(); fieldIndex.set(field, f); }
+  let bucket = f.get(v);
+  if (!bucket) { bucket = new Set(); f.set(v, bucket); }
+  bucket.add(nid);
+}
+function _ingestMetaIntoIndex(meta) {
+  if (!meta || !meta.id) return {};
+  const nid = meta.id;
+  for (const t of (meta.tags || [])) _addToFieldIndex('tags', t, nid);
+  if (meta.doctype) _addToFieldIndex('doctype', meta.doctype, nid);
+  if (meta.folder)  _addToFieldIndex('folder',  meta.folder,  nid);
+  let fm = {};
+  try { fm = meta.frontmatterJson ? JSON.parse(meta.frontmatterJson) : {}; }
+  catch (_) { fm = {}; }
+  for (const [k, v] of Object.entries(fm)) {
+    if (k === 'tags') continue;
+    if (Array.isArray(v)) for (const item of v) _addToFieldIndex(k, item, nid);
+    else _addToFieldIndex(k, v, nid);
+  }
+  return fm;
+}
+
+// ---------- Field-type detection ----------
+function inferType(_field, value) {
+  if (value === null || value === undefined) return 'scalar';
+  if (Array.isArray(value)) {
+    if (value.length === 0) return 'list';
+    let hasWiki = false, hasUrl = false;
+    for (const it of value) {
+      if (typeof it === 'string') {
+        if (_wikilinkRe.test(it)) hasWiki = true;
+        if (_urlRe.test(it))      hasUrl  = true;
+      }
+    }
+    if (hasWiki) return 'wikilink';
+    if (hasUrl)  return 'url';
+    return 'list';
+  }
+  if (typeof value === 'object') return 'object';
+  if (typeof value === 'string') {
+    if (_wikilinkRe.test(value)) return 'wikilink';
+    if (_urlRe.test(value))      return 'url';
+    if (_dateRe.test(value.trim())) return 'date';
+    if (KNOWN_STATUS.has(value.trim())) return 'status';
+    if (value.length > 120) return 'long_text';
+    return 'scalar';
+  }
+  return 'scalar';
+}
+
+// ---------- Badge factories ----------
+function makeBadge(field, value, displayText, extraClass) {
+  const span = document.createElement('span');
+  const active = _isFilterActive(field, value);
+  span.className = (extraClass || 'badge') + (active ? ' active' : '');
+  span.dataset.field = field;
+  span.dataset.value = String(value);
+  span.textContent = displayText !== undefined ? displayText : String(value);
+  span.title = active ? `Remove filter ${field}=${value}` : `Filter to ${field}=${value}`;
+  return span;
+}
+function makeTagBadge(value) { return makeBadge('tags', value, value, 'tag'); }
+function makeStatusBadge(field, value) {
+  const v = String(value).trim();
+  let cls = 'status';
+  if (KNOWN_STATUS.has(v)) cls += ' s-' + v;
+  return makeBadge(field, v, v, cls);
+}
+function makeDateBadge(field, value) { return makeBadge(field, value, value, 'date'); }
+function makeUrlChip(value) {
+  const url = String(value);
+  let domain = url; try { domain = new URL(url).hostname; } catch (_) {}
+  const a = document.createElement('a');
+  a.className = 'url'; a.href = url; a.target = '_blank'; a.rel = 'noopener noreferrer';
+  a.textContent = domain; a.title = `Open ${domain}`;
+  return a;
+}
+function _resolveWikilink(target) {
+  if (!bootRef) return null;
+  const idx = bootRef.idToIdx;
+  if (idx.has(target)) return target;
+  const base = target.split('/').pop();
+  if (idx.has(base)) return base;
+  const noExt = base.replace(/\.md$/, '');
+  if (idx.has(noExt)) return noExt;
+  for (const id of bootRef.ids) {
+    const idBase = id.split('/').pop();
+    if (idBase === base || idBase === noExt) return id;
+  }
+  return null;
+}
+function _parseWikilinks(s) {
+  if (typeof s !== 'string') return [];
+  const out = []; let m; _wikiSplitRe.lastIndex = 0;
+  while ((m = _wikiSplitRe.exec(s)) !== null) {
+    out.push({ target: m[1].trim(), alias: (m[2] || '').trim() || null });
+  }
+  return out;
+}
+function makeWikilinkChip(target, alias) {
+  const resolved = _resolveWikilink(target);
+  const span = document.createElement('span');
+  span.className = 'wikilink' + (resolved ? '' : ' unresolved');
+  span.dataset.action = 'navigate';
+  span.dataset.target = resolved || target;
+  span.textContent = alias || target;
+  span.title = resolved ? `Open ${target}` : `(unresolved) ${target}`;
+  return span;
+}
+function renderWikilinkChips(_field, value) {
+  const out = [];
+  const handle = (s) => {
+    if (typeof s !== 'string') return;
+    if (_wikilinkRe.test(s)) for (const w of _parseWikilinks(s)) out.push(makeWikilinkChip(w.target, w.alias));
+    else if (s.trim()) out.push(makeWikilinkChip(s.trim(), null));
+  };
+  if (Array.isArray(value)) for (const v of value) handle(v);
+  else handle(value);
+  return out;
+}
+function renderUrlChips(_field, value) {
+  const arr = Array.isArray(value) ? value : [value];
+  const out = [];
+  for (const u of arr) if (typeof u === 'string' && _urlRe.test(u)) out.push(makeUrlChip(u));
+  return out;
+}
+function renderListBadges(field, value) {
+  const arr = Array.isArray(value) ? value : [value];
+  const out = [];
+  for (const v of arr) {
+    if (v === null || v === undefined) continue;
+    const s = String(v).trim(); if (!s) continue;
+    out.push(makeBadge(field, s, s));
+  }
+  return out;
+}
+function renderEntityBadges(field, values) {
+  const PREFIX = { person: '[person]', org: '[org]', project: '[project]',
+                   company: '[org]', team: '[team]', tool: '[tool]', system: '[system]' };
+  const arr = Array.isArray(values) ? values : [values];
+  const out = [];
+  for (const item of arr) {
+    let name, type;
+    if (typeof item === 'string') { name = item; type = null; }
+    else if (item && typeof item === 'object') {
+      name = item.name || item.value || item.label || JSON.stringify(item);
+      type = item.type || item.kind || null;
+    } else continue;
+    name = String(name).trim(); if (!name) continue;
+    const display = type ? `${PREFIX[String(type).toLowerCase()] || `[${type}]`} ${name}` : name;
+    out.push(makeBadge(field, name, display));
+  }
+  return out;
+}
+function renderAuthorBadges(field, value) {
+  let names = [];
+  if (Array.isArray(value)) {
+    for (const v of value) if (typeof v === 'string') names.push(...v.split(',').map(s => s.trim()).filter(Boolean));
+  } else if (typeof value === 'string') {
+    names = value.split(',').map(s => s.trim()).filter(Boolean);
+  }
+  return names.map(n => makeBadge(field, n, n));
+}
+
+// Special-case (doctype-aware) renderers; null = fall through to inferType.
+function _specialRender(doctype, key, value, fm) {
+  if (key === 'authors' && doctype === 'literature') return renderAuthorBadges(key, value);
+  if (key === 'citekey' && doctype === 'literature') {
+    const src = fm && fm.source;
+    if (typeof src === 'string' && _urlRe.test(src)) {
+      const a = document.createElement('a');
+      a.className = 'url'; a.href = src; a.target = '_blank'; a.rel = 'noopener noreferrer';
+      a.textContent = String(value); a.title = `Open source: ${src}`;
+      return [a];
+    }
+    return [makeBadge(key, String(value), String(value))];
+  }
+  if (key === 'related')    return renderWikilinkChips(key, value);
+  if (key === 'entities')   return renderEntityBadges(key, value);
+  if (key === 'key_topics') return renderListBadges(key, value);
+  if (key === 'status')     return [makeStatusBadge(key, value)];
+  return null;
+}
+
+// Returns { kind: 'badges', els } or { kind: 'dd', el }.
+function renderField(key, value, doctype, fm) {
+  const sp = _specialRender(doctype, key, value, fm);
+  if (sp) return { kind: 'badges', els: sp };
+  const t = inferType(key, value);
+  switch (t) {
+    case 'wikilink': return { kind: 'badges', els: renderWikilinkChips(key, value) };
+    case 'url':      return { kind: 'badges', els: renderUrlChips(key, value) };
+    case 'date':     return { kind: 'badges', els: [makeDateBadge(key, value)] };
+    case 'status':   return { kind: 'badges', els: [makeStatusBadge(key, value)] };
+    case 'list':     return { kind: 'badges', els: renderListBadges(key, value) };
+    case 'scalar':   return { kind: 'badges', els: [makeBadge(key, String(value), String(value))] };
+    case 'object': {
+      const dd = document.createElement('dd');
+      let s = JSON.stringify(value); if (s.length > 120) s = s.slice(0, 117) + '...';
+      dd.textContent = s; return { kind: 'dd', el: dd };
+    }
+    case 'long_text':
+    default: {
+      const dd = document.createElement('dd');
+      dd.textContent = String(value);
+      return { kind: 'dd', el: dd };
+    }
+  }
+}
+
+// ---------- Modal render ----------
 function showModal(meta) {
-  if (!meta) { $modal.classList.add('hidden'); return; }
-  const tags = (meta.tags || []).map(t => `#${t}`).join(' ');
-  $modal.innerHTML = `
-    <h2>${meta.title || meta.path || '?'}</h2>
-    <div class="kv">
-      <span>path</span><span>${meta.path || ''}</span>
-      <span>folder</span><span>${meta.folder || ''}</span>
-      <span>doctype</span><span>${meta.doctype || ''}</span>
-      <span>tags</span><span>${tags}</span>
-      <span>degree</span><span>${meta.degree ?? ''}</span>
-      <span>indegree</span><span>${meta.indegree ?? ''}</span>
-      <span>outdegree</span><span>${meta.outdegree ?? ''}</span>
-      <span>pagerank</span><span>${(meta.pagerank ?? 0).toFixed(4)}</span>
-      <span>betweenness</span><span>${(meta.betweenness ?? 0).toFixed(4)}</span>
-      <span>kcore</span><span>${meta.kcore ?? ''}</span>
-      <span>community</span><span>${meta.community ?? ''}</span>
-      <span>wcc</span><span>${meta.wcc ?? ''}</span>
-    </div>`;
+  if (!meta) { $modal.classList.add('hidden'); currentMeta = null; return; }
+  const fm = _ingestMetaIntoIndex(meta) || {};
+  currentMeta = meta;
+  while ($modal.firstChild) $modal.removeChild($modal.firstChild);
+
+  const header = document.createElement('div');
+  header.className = 'modal-header';
+  const h2 = document.createElement('h2');
+  h2.textContent = meta.title || meta.path || '?';
+  const closeBtn = document.createElement('button');
+  closeBtn.type = 'button'; closeBtn.className = 'modal-close';
+  closeBtn.textContent = '\u2715';
+  closeBtn.addEventListener('click', (ev) => { ev.stopPropagation(); showModal(null); });
+  header.append(h2, closeBtn);
+  $modal.appendChild(header);
+
+  const path = document.createElement('div');
+  path.className = 'modal-path';
+  path.textContent = meta.path || '';
+  $modal.appendChild(path);
+
+  const tags = meta.tags || [];
+  if (tags.length) {
+    const row = document.createElement('div');
+    row.className = 'modal-tags';
+    for (const t of tags) row.appendChild(makeTagBadge(t));
+    $modal.appendChild(row);
+  }
+
+  if (meta.doctype || meta.folder) {
+    const row = document.createElement('div');
+    row.className = 'field-row';
+    if (meta.doctype) {
+      const pill = document.createElement('span'); pill.className = 'field-name-pill';
+      pill.textContent = 'doctype'; row.appendChild(pill);
+      row.appendChild(makeBadge('doctype', meta.doctype, meta.doctype));
+    }
+    if (meta.folder) {
+      const pill = document.createElement('span'); pill.className = 'field-name-pill';
+      pill.textContent = 'folder'; row.appendChild(pill);
+      row.appendChild(makeBadge('folder', meta.folder, meta.folder));
+    }
+    $modal.appendChild(row);
+  }
+
+  const dl = document.createElement('dl');
+  dl.className = 'modal-frontmatter';
+  let dlHasContent = false;
+  for (const [key, value] of Object.entries(fm)) {
+    if (key === 'tags' || value === null || value === undefined) continue;
+    const r = renderField(key, value, meta.doctype, fm);
+    if (!r) continue;
+    if (r.kind === 'badges') {
+      if (!r.els || r.els.length === 0) continue;
+      const row = document.createElement('div');
+      row.className = 'field-row';
+      const pill = document.createElement('span');
+      pill.className = 'field-name-pill'; pill.textContent = key;
+      row.appendChild(pill);
+      for (const el of r.els) row.appendChild(el);
+      $modal.appendChild(row);
+    } else if (r.kind === 'dd' && r.el) {
+      const dt = document.createElement('dt'); dt.textContent = key;
+      dl.append(dt, r.el); dlHasContent = true;
+    }
+  }
+  if (dlHasContent) $modal.appendChild(dl);
+
+  const metrics = document.createElement('div');
+  metrics.className = 'modal-metrics';
+  const addMetric = (label, val) => {
+    const m = document.createElement('span'); m.className = 'metric';
+    const l = document.createElement('label'); l.textContent = label;
+    m.append(l, document.createTextNode(' ' + val));
+    metrics.appendChild(m);
+  };
+  addMetric('degree', meta.degree ?? '');
+  addMetric('in', meta.indegree ?? '');
+  addMetric('out', meta.outdegree ?? '');
+  addMetric('pagerank', (meta.pagerank ?? 0).toFixed(4));
+  addMetric('betweenness', (meta.betweenness ?? 0).toFixed(4));
+  addMetric('kcore', meta.kcore ?? '');
+  addMetric('community', meta.community ?? '');
+  addMetric('wcc', meta.wcc ?? '');
+  $modal.appendChild(metrics);
+
   $modal.classList.remove('hidden');
 }
+
+// ---------- Filter chip strip ----------
+function renderFilterChips() {
+  while ($filterChips.firstChild) $filterChips.removeChild($filterChips.firstChild);
+  if (activeFieldFilters.size === 0) { $filterChips.classList.add('hidden'); return; }
+  $filterChips.classList.remove('hidden');
+  let totalValues = 0;
+  for (const [field, valueSet] of activeFieldFilters) {
+    if (!valueSet || valueSet.size === 0) continue;
+    for (const value of valueSet) {
+      const chip = document.createElement('span'); chip.className = 'fchip';
+      const f = document.createElement('span'); f.className = 'fchip-field'; f.textContent = field + ':';
+      const v = document.createElement('span'); v.textContent = ' ' + value + ' ';
+      const x = document.createElement('span'); x.className = 'fchip-x'; x.textContent = '\u2715';
+      x.addEventListener('click', (ev) => { ev.stopPropagation(); toggleFieldFilter(field, value); });
+      chip.append(f, v, x);
+      $filterChips.appendChild(chip);
+      totalValues++;
+    }
+  }
+  if (totalValues >= 2) {
+    const clear = document.createElement('button');
+    clear.type = 'button'; clear.className = 'fchip-clear';
+    clear.textContent = 'clear filters';
+    clear.addEventListener('click', (ev) => {
+      ev.stopPropagation();
+      activeFieldFilters.clear();
+      applyFieldFilters();
+      renderFilterChips();
+      if (currentMeta) showModal(currentMeta);
+    });
+    $filterChips.appendChild(clear);
+  }
+}
+
+function toggleFieldFilter(field, value) {
+  const v = String(value);
+  let bucket = activeFieldFilters.get(field);
+  if (!bucket) { bucket = new Set(); activeFieldFilters.set(field, bucket); }
+  if (bucket.has(v)) bucket.delete(v); else bucket.add(v);
+  if (bucket.size === 0) activeFieldFilters.delete(field);
+  applyFieldFilters();
+  renderFilterChips();
+  if (currentMeta) showModal(currentMeta); // refresh badge .active state
+}
+
+// Recompute selectedIds from active filters: within-field OR, cross-field AND.
+function applyFieldFilters() {
+  if (!bootRef) return;
+  if (activeFieldFilters.size === 0) {
+    selectedIds = null; refreshColors(bootRef); return;
+  }
+  const perField = [];
+  for (const [field, valueSet] of activeFieldFilters) {
+    if (!valueSet || valueSet.size === 0) continue;
+    const fmap = fieldIndex.get(field);
+    if (!fmap) { selectedIds = new Set(); refreshColors(bootRef); return; }
+    const merged = new Set();
+    for (const v of valueSet) {
+      const bucket = fmap.get(v); if (!bucket) continue;
+      for (const id of bucket) merged.add(id);
+    }
+    if (merged.size === 0) { selectedIds = new Set(); refreshColors(bootRef); return; }
+    perField.push(merged);
+  }
+  if (perField.length === 0) { selectedIds = null; refreshColors(bootRef); return; }
+  perField.sort((a, b) => a.size - b.size);
+  const out = new Set();
+  outer: for (const id of perField[0]) {
+    for (let i = 1; i < perField.length; i++) if (!perField[i].has(id)) continue outer;
+    out.add(id);
+  }
+  selectedIds = out;
+  refreshColors(bootRef);
+}
+
+// Wikilink navigation — open the resolved node's modal and nudge the camera.
+async function navigateToNode(target) {
+  if (!bootRef) return;
+  const id = _resolveWikilink(target);
+  if (!id) return;
+  try {
+    const meta = await fetchProto(`/node/${encodeURIComponent(id)}`, NodeMeta);
+    showModal(meta);
+    const i = bootRef.idToIdx.get(id);
+    if (i !== undefined && renderer && renderer.cam_fit_bounds) {
+      const x = bootRef.positions[i*3], y = bootRef.positions[i*3+1], z = bootRef.positions[i*3+2];
+      const r = 80;
+      try { renderer.cam_fit_bounds(x-r, y-r, z-r, x+r, y+r, z+r); } catch (_) {}
+    }
+  } catch (e) { console.error(e); }
+}
+
+// Single delegated badge-click handler (modal + chip strip). All paths
+// stopPropagation so the canvas/background-click logic doesn't see them.
+document.addEventListener('click', (ev) => {
+  const url = ev.target.closest && ev.target.closest('a.url');
+  if (url) { ev.stopPropagation(); return; }
+  const wl = ev.target.closest && ev.target.closest('.wikilink');
+  if (wl) {
+    ev.stopPropagation(); ev.preventDefault();
+    const target = wl.dataset && wl.dataset.target;
+    if (target) navigateToNode(target);
+    return;
+  }
+  const badge = ev.target.closest && ev.target.closest('.badge, .tag, .status, .date');
+  if (!badge) return;
+  if (badge.closest('#filter-chips')) return; // chip-strip x already handled it
+  const field = badge.dataset && badge.dataset.field;
+  const value = badge.dataset && badge.dataset.value;
+  if (!field || value === undefined) return;
+  ev.stopPropagation(); ev.preventDefault();
+  toggleFieldFilter(field, value);
+}, true);
 
 // ---------- main ----------
 async function main() {
@@ -579,6 +1005,7 @@ async function main() {
   await init('/assets/pkg/graph_renderer_bg.wasm');
 
   const boot = await loadBootstrap();
+  bootRef = boot;
   console.log(`[graph-renderer] bootstrap: ${boot.nNodes} nodes, ${boot.edges.length / 2} edges, ${boot.init.numCommunities} communities`);
 
   syncCanvasSize();
