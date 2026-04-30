@@ -39,12 +39,17 @@
           overlays = [ inputs.rust-overlay.overlays.default ];
         };
 
-        # Native toolchain (stable, includes rust-src for IDE)
+        # Native toolchain — full default + wasm32 target so a single toolchain
+        # can build both native and WASM (wasm-pack picks up rustc from PATH;
+        # this avoids "wasm32-unknown-unknown target not found" when the
+        # native toolchain wins in PATH ordering).
         rustToolchainNative = pkgs.rust-bin.stable.latest.default.override {
           extensions = [ "rust-src" "clippy" "rustfmt" ];
+          targets = [ "wasm32-unknown-unknown" ];
         };
 
-        # WASM toolchain (minimal + wasm32 target)
+        # Kept for crane wasm-only check derivations (no need for full default
+        # tooling there).
         rustToolchainWasm = pkgs.rust-bin.stable.latest.minimal.override {
           targets = [ "wasm32-unknown-unknown" ];
         };

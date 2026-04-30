@@ -9,6 +9,10 @@ dist
 /target
 **/target/
 
+# wasm-pack output for graph-renderer — rebuilt locally via `just wasm`.
+crates/graph-renderer/assets/pkg/*
+!crates/graph-renderer/assets/pkg/.gitkeep
+
 # Beads / Dolt files (added by bd init)
 .dolt/
 *.db

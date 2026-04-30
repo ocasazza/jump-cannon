@@ -2,11 +2,59 @@
 name = "graph-renderer"
 version = "0.1.0"
 edition = "2021"
-description = "Static HTML/CSS/JS bundle for the graph viewer; embedded via include_dir."
+description = "Rust + wgpu renderer for the vault graph viewer (native + WASM)."
 
 [lib]
 name = "graph_renderer"
+crate-type = ["cdylib", "rlib"]
 path = "src/lib.rs"
 
+[[bin]]
+name = "graph-renderer-native"
+path = "src/native.rs"
+required-features = ["native"]
+
+[features]
+default = []
+native = ["dep:winit", "dep:pollster", "dep:env_logger"]
+wasm = [
+  "dep:wasm-bindgen",
+  "dep:console_error_panic_hook",
+  "dep:console_log",
+  "dep:web-sys",
+  "dep:wasm-bindgen-futures",
+  "dep:js-sys",
+]
+
 [dependencies]
+wgpu = { version = "23", default-features = false, features = ["webgpu", "webgl", "wgsl"] }
+bytemuck = { version = "1", features = ["derive"] }
+glam = { version = "0.29", features = ["bytemuck"] }
+log = "0.4"
 include_dir = "0.7"
+
+# Native-only
+winit = { version = "0.30", optional = true }
+pollster = { version = "0.4", optional = true }
+env_logger = { version = "0.11", optional = true }
+
+# WASM-only
+wasm-bindgen = { version = "0.2", optional = true }
+wasm-bindgen-futures = { version = "0.4", optional = true }
+js-sys = { version = "0.3", optional = true }
+console_error_panic_hook = { version = "0.1", optional = true }
+console_log = { version = "1", optional = true }
+
+[dependencies.web-sys]
+version = "0.3"
+optional = true
+features = [
+  "Document",
+  "Window",
+  "Element",
+  "HtmlCanvasElement",
+  "Performance",
+  "KeyboardEvent",
+  "PointerEvent",
+  "WheelEvent",
+]
