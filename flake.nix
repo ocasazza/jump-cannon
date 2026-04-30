@@ -196,6 +196,21 @@
           # Linux: Vulkan software renderer fallback (headless CI / no GPU)
           VK_ICD_FILENAMES = pkgs.lib.optionalString pkgs.stdenv.isLinux
             "${pkgs.mesa}/share/vulkan/icd.d/lvp_icd.x86_64.json";
+
+          # Source .env on shell entry. graph-api also reads it directly via
+          # dotenvy at startup; sourcing it in the shell is convenience for
+          # ad-hoc commands. Future: add a per-machine .env per host name.
+          shellHook = ''
+            if [ -f .env ]; then
+              set -a
+              # shellcheck disable=SC1091
+              . ./.env
+              set +a
+            fi
+            # Make cargo-built binaries findable for cross-process spawning
+            # (graph-api spawns vault-search as a subprocess).
+            export PATH="$PWD/target/release:$PWD/target/debug:$PATH"
+          '';
         };
       };
 

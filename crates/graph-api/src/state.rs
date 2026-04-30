@@ -9,6 +9,8 @@ use std::sync::Arc;
 
 use vault_data::VaultGraph;
 
+use crate::subprocess::VaultSearch;
+
 /// Immutable, shared backend state. Cloning `AppState` clones the inner Arc.
 #[derive(Clone)]
 pub struct AppState {
@@ -23,10 +25,18 @@ pub struct AppStateInner {
     pub id_to_idx: HashMap<String, u32>,
     /// Dense-index ordered list of node ids (parallel to id_to_idx).
     pub idx_to_id: Vec<String>,
+    /// Optional vault-search subprocess. When `Some`, the `/search` handler
+    /// proxies to its `/ids` endpoint; when `None`, falls back to a naive
+    /// title-contains scan.
+    pub vault_search: Option<Arc<VaultSearch>>,
 }
 
 impl AppState {
-    pub fn new(vault_root: PathBuf, graph: VaultGraph) -> Self {
+    pub fn new(
+        vault_root: PathBuf,
+        graph: VaultGraph,
+        vault_search: Option<Arc<VaultSearch>>,
+    ) -> Self {
         let mut id_to_idx = HashMap::with_capacity(graph.nodes.len());
         let mut idx_to_id = Vec::with_capacity(graph.nodes.len());
         for (i, (id, _)) in graph.nodes.iter().enumerate() {
@@ -39,6 +49,7 @@ impl AppState {
                 graph,
                 id_to_idx,
                 idx_to_id,
+                vault_search,
             }),
         }
     }

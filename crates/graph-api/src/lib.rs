@@ -12,6 +12,7 @@ pub mod browser;
 pub mod proto;
 pub mod server;
 pub mod state;
+pub mod subprocess;
 pub mod vault_loader;
 
 pub use server::router;

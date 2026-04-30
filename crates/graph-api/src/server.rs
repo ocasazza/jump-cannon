@@ -125,10 +125,45 @@ struct SearchParams {
 }
 
 async fn search(State(s): State<AppState>, Query(p): Query<SearchParams>) -> impl IntoResponse {
-    // Future: proxy to vault-search subprocess for Tantivy BM25; for now
-    // we do a naive contains-match over titles so the wiring is real.
+    let limit = p.limit.unwrap_or(50);
+    // Fast path: proxy to vault-search's /ids endpoint (Tantivy BM25).
+    if let Some(vs) = &s.inner.vault_search {
+        let url = format!(
+            "{}/ids?q={}&limit={}",
+            vs.url(),
+            urlencoding::encode(&p.q),
+            limit
+        );
+        let resp = match reqwest::get(&url).await {
+            Ok(r) => r,
+            Err(e) => {
+                return (StatusCode::BAD_GATEWAY, format!("vault-search proxy: {e}"))
+                    .into_response()
+            }
+        };
+        let json: serde_json::Value = match resp.json().await {
+            Ok(v) => v,
+            Err(e) => {
+                return (StatusCode::BAD_GATEWAY, format!("vault-search decode: {e}"))
+                    .into_response()
+            }
+        };
+        // vault-search shape: {"ids": [...], "total": N}
+        let ids: Vec<String> = json["ids"]
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let total = json["total"].as_u64().unwrap_or(ids.len() as u64) as u32;
+        let msg = proto::SearchResults { total, ids };
+        return proto_response(&msg).into_response();
+    }
+
+    // Fallback: naive title-contains scan when vault-search isn't running.
     let q = p.q.to_lowercase();
-    let limit = p.limit.unwrap_or(50) as usize;
     let mut ids: Vec<String> = s
         .inner
         .graph
@@ -136,7 +171,7 @@ async fn search(State(s): State<AppState>, Query(p): Query<SearchParams>) -> imp
         .iter()
         .filter(|(_, n)| n.meta.title.to_lowercase().contains(&q))
         .map(|(id, _)| id.clone())
-        .take(limit)
+        .take(limit as usize)
         .collect();
     ids.sort();
     let msg = proto::SearchResults {
