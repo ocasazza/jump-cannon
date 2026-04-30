@@ -61,6 +61,38 @@ fn unit_louvain_two_cliques() {
 }
 
 #[test]
+fn unit_louvain_five_clusters() {
+    let mut g = VaultGraph::new();
+    for c in 0..5 {
+        for i in 0..20 {
+            g.add_node(VaultNode { id: format!("c{}_n{}", c, i), ..Default::default() });
+        }
+    }
+    // Intra-cluster: dense
+    for c in 0..5 {
+        for i in 0..20 {
+            for j in (i+1)..20 {
+                g.add_edge(VaultEdge {
+                    source: format!("c{}_n{}", c, i),
+                    target: format!("c{}_n{}", c, j),
+                });
+            }
+        }
+    }
+    // Inter-cluster: 1 edge between cluster reps
+    for c1 in 0..5 {
+        for c2 in (c1+1)..5 {
+            g.add_edge(VaultEdge {
+                source: format!("c{}_n0", c1),
+                target: format!("c{}_n0", c2),
+            });
+        }
+    }
+    crate::compute_louvain(&mut g, 20);
+    assert_eq!(g.num_communities, 5, "expected 5 communities, got {}", g.num_communities);
+}
+
+#[test]
 fn unit_kcore_triangle() {
     let mut g = make_triangle();
     crate::compute_kcore(&mut g);
