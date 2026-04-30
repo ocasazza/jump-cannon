@@ -193,6 +193,10 @@ pub struct GpuForceLayout {
     /// updates options in a way that perturbs the system.
     halted: bool,
     halt_streak: u32,
+    /// Step count since last wake. Halt is suppressed until this exceeds
+    /// `HALT_GRACE_STEPS` so the sim can break out of degenerate initial
+    /// conditions (e.g., uniform sphere, ring) before being declared settled.
+    steps_since_wake: u32,
     /// Most recent max-KE reduction value (for diagnostics / stats UI).
     last_max_ke: f32,
 }
@@ -202,6 +206,11 @@ pub struct GpuForceLayout {
 /// we flip to halt.
 const HALT_FRAMES: u32 = 30;
 
+/// Minimum number of compute dispatches before halting becomes possible.
+/// Prevents premature halt in the early "everything is at uniform low velocity"
+/// phase that happens with random sphere seeding.
+const HALT_GRACE_STEPS: u32 = 600;
+
 impl GpuForceLayout {
     pub fn new(options: GpuForceOptions) -> Self {
         Self {
@@ -210,6 +219,7 @@ impl GpuForceLayout {
             owned_device: None,
             halted: false,
             halt_streak: 0,
+            steps_since_wake: 0,
             last_max_ke: 0.0,
         }
     }
@@ -228,6 +238,7 @@ impl GpuForceLayout {
     pub fn wake(&mut self) {
         self.halted = false;
         self.halt_streak = 0;
+        self.steps_since_wake = 0;
     }
 
     /// True once the sim has been observed below `energy_threshold` for
@@ -395,19 +406,20 @@ impl GpuForceLayout {
         // halting we still unmap a stragglar staging buffer cleanly.
         if let Some(max_ke) = state.drain_energy_readback() {
             self.last_max_ke = max_ke;
-            if self.options.energy_threshold > 0.0
+            // Suppress halt during the grace period — even truly low velocities
+            // early on are usually because the random initial layout hasn't
+            // had time to gain energy yet, not because it's converged.
+            if self.steps_since_wake >= HALT_GRACE_STEPS
+                && self.options.energy_threshold > 0.0
                 && max_ke < self.options.energy_threshold
             {
                 self.halt_streak = self.halt_streak.saturating_add(1);
                 if self.halt_streak >= HALT_FRAMES {
                     if !self.halted {
-                        // No `log` crate dep in graph-layouts; eprintln on
-                        // native is enough for debugging. WASM swallows
-                        // stderr so this is effectively native-only noise.
                         #[cfg(not(target_arch = "wasm32"))]
                         eprintln!(
-                            "gpu_force: halted (max_ke={:.4} < threshold={:.4})",
-                            max_ke, self.options.energy_threshold
+                            "gpu_force: halted (max_ke={:.4} < threshold={:.4} after {} steps)",
+                            max_ke, self.options.energy_threshold, self.steps_since_wake
                         );
                     }
                     self.halted = true;
@@ -444,6 +456,7 @@ impl GpuForceLayout {
             state.dispatch_borrowed_step(device, encoder, shared_buffer);
             state.swap_position_buffers();
         }
+        self.steps_since_wake = self.steps_since_wake.saturating_add(steps);
         // Make sure the shared (external/borrowed) buffer ends up holding
         // the latest result. Convention:
         //   - Borrowed mode: pos_a == shared, pos_b == internal.

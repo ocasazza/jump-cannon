@@ -121,13 +121,22 @@ async function loadBootstrap() {
   const idToIdx = new Map();
   for (let i = 0; i < nNodes; i++) idToIdx.set(ids[i], i);
 
-  // Server gives 2D; promote to 3D with random Z spread (compute will
-  // scramble these soon enough).
+  // Discard the server's 2D ring seeding entirely — it traps the sim in a
+  // ring shape. Seed uniformly in a 3D ball via rejection sampling so the
+  // force sim has full freedom to find the natural layout.
   const positions3 = new Float32Array(nNodes * 3);
+  const radius = Math.max(200, Math.cbrt(nNodes) * 60);
   for (let i = 0; i < nNodes; i++) {
-    positions3[i * 3 + 0] = positions[i * 2 + 0];
-    positions3[i * 3 + 1] = positions[i * 2 + 1];
-    positions3[i * 3 + 2] = (Math.random() - 0.5) * 200;
+    let x, y, z, r2;
+    do {
+      x = Math.random() * 2 - 1;
+      y = Math.random() * 2 - 1;
+      z = Math.random() * 2 - 1;
+      r2 = x*x + y*y + z*z;
+    } while (r2 > 1.0 || r2 < 1e-6);
+    positions3[i * 3 + 0] = x * radius;
+    positions3[i * 3 + 1] = y * radius;
+    positions3[i * 3 + 2] = z * radius;
   }
   return { init, ids, idToIdx, edges, positions: positions3, palette, metrics, bounds, nNodes };
 }
