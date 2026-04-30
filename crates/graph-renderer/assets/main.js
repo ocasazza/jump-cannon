@@ -81,6 +81,19 @@ function paletteColor01(palette, idx) {
   const c = palette[((idx | 0) % len + len) % len];
   return c ? [c[0], c[1], c[2]] : [0.7, 0.7, 0.7];
 }
+function computeBounds(positions) {
+  let mnx = Infinity, mny = Infinity, mnz = Infinity;
+  let mxx = -Infinity, mxy = -Infinity, mxz = -Infinity;
+  for (let i = 0; i + 2 < positions.length; i += 3) {
+    const x = positions[i], y = positions[i + 1], z = positions[i + 2];
+    if (x < mnx) mnx = x; if (x > mxx) mxx = x;
+    if (y < mny) mny = y; if (y > mxy) mxy = y;
+    if (z < mnz) mnz = z; if (z > mxz) mxz = z;
+  }
+  if (!isFinite(mnx)) { mnx = -100; mxx = 100; mny = -100; mxy = 100; mnz = -100; mxz = 100; }
+  return { min: [mnx, mny, mnz], max: [mxx, mxy, mxz] };
+}
+
 function metricBounds(arr) {
   let min = Infinity, max = -Infinity;
   for (let i = 0; i < arr.length; i++) {
@@ -159,11 +172,15 @@ function computeSizes(boot) {
   const arr = boot.metrics[state.sizeBy];
   const { min, max } = boot.bounds[state.sizeBy] || { min: 0, max: 0 };
   const span = max - min, mul = state.sizeMul;
+  // Base scale grows with vault size so nodes are visible at default zoom.
+  // sqrt(n)/30 keeps a 100-node graph at base ~3 and a 10k graph at base ~3.3,
+  // but we floor it so small graphs still see something.
+  const base = Math.max(4.0, Math.sqrt(boot.nNodes) * 0.4);
   const out = new Float32Array(boot.nNodes);
   for (let i = 0; i < boot.nNodes; i++) {
-    if (!arr || span <= 0) { out[i] = 2 * mul; continue; }
+    if (!arr || span <= 0) { out[i] = base * mul; continue; }
     const t = Math.sqrt((arr[i] - min) / span);
-    out[i] = (1 + t * 9) * mul;
+    out[i] = (base + t * base * 3) * mul;
   }
   return out;
 }
@@ -456,22 +473,38 @@ function showModal(meta) {
 
 // ---------- main ----------
 async function main() {
+  // WebGPU sanity check — storage-buffer-in-vertex-shader requires WebGPU.
+  // WebGL fallback will fail at pipeline creation.
+  if (!('gpu' in navigator)) {
+    setStats('error: WebGPU not available. Use Chrome/Edge ≥ 113, Safari ≥ 18, or enable webgpu in your browser flags.');
+    throw new Error('navigator.gpu missing');
+  }
+  console.log('[graph-renderer] WebGPU available, init…');
+
   await init('/assets/pkg/graph_renderer_bg.wasm');
 
   const boot = await loadBootstrap();
+  console.log(`[graph-renderer] bootstrap: ${boot.nNodes} nodes, ${boot.edges.length / 2} edges, ${boot.init.numCommunities} communities`);
 
   syncCanvasSize();
   renderer = new WebRenderer();
 
   const colors = computeColors(boot);
   const sizes  = computeSizes(boot);
+  console.log(`[graph-renderer] sizes range: ${Math.min(...sizes).toFixed(2)} → ${Math.max(...sizes).toFixed(2)}`);
   await renderer.init('cosmos', boot.positions, boot.edges, colors, sizes);
   renderer.resize($canvas.width, $canvas.height);
+
+  // Fit camera to the actual data bounds so nodes land in view immediately.
+  const b = computeBounds(boot.positions);
+  console.log(`[graph-renderer] data bounds: x[${b.min[0].toFixed(0)},${b.max[0].toFixed(0)}] y[${b.min[1].toFixed(0)},${b.max[1].toFixed(0)}] z[${b.min[2].toFixed(0)},${b.max[2].toFixed(0)}]`);
+  renderer.cam_fit_bounds(b.min[0], b.min[1], b.min[2], b.max[0], b.max[1], b.max[2]);
 
   // Wave 2: live force sim. Builds GpuForceLayout against the renderer's
   // device + shared positions buffer.
   try {
     renderer.init_layout(boot.edges, JSON.stringify(SIM_PRESETS[state.preset]));
+    console.log('[graph-renderer] live force sim active');
   } catch (e) {
     console.warn('init_layout failed (force sim disabled):', e);
   }
