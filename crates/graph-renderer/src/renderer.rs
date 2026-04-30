@@ -1,10 +1,27 @@
 //! Target-agnostic wgpu state. Constructor takes an already-created
 //! `wgpu::Surface`, so the native (winit window) and web (canvas) paths can
 //! both feed it.
+//!
+//! ## Shared-buffer architecture (Wave 2)
+//!
+//! `Renderer` owns a single `positions_storage` buffer with usage
+//! `STORAGE | VERTEX | COPY_SRC | COPY_DST`. Layout (std430): one
+//! `vec3<f32>` per node (16-byte stride — vec3s are 16-aligned in WGSL).
+//!
+//! - The node + edge vertex shaders bind it as `storage<read>` and index
+//!   into it from `instance_index` / `vertex_index`. No per-frame CPU copy.
+//! - The compute shader from `graph-layouts::GpuForceLayout` writes into
+//!   the same buffer (via `init_with_device` → `step_with_encoder`).
+//! - Edges therefore automatically follow nodes — the edge vertex shader
+//!   reads each endpoint's current position from the same storage array.
+//!
+//! Effects (microscope focus plane) live in a small uniform alongside the
+//! camera so the fragment shaders can attenuate alpha by world-space Z.
 
 use crate::camera::Camera;
 use bytemuck::{Pod, Zeroable};
 use glam::Vec3;
+use graph_layouts::{Edge as GlEdge, Graph as GlGraph, GpuForceLayout, GpuForceOptions, Node as GlNode};
 use wgpu::util::DeviceExt;
 
 #[derive(Clone)]
@@ -31,6 +48,28 @@ struct CameraUniform {
 
 #[repr(C)]
 #[derive(Copy, Clone, Pod, Zeroable)]
+struct EffectsUniform {
+    focus_plane_z: f32,
+    focus_thickness: f32,
+    cursor_radius_visual: f32,
+    _pad: f32,
+}
+
+impl Default for EffectsUniform {
+    fn default() -> Self {
+        Self {
+            focus_plane_z: 0.0,
+            // Default huge thickness = effectively no focus attenuation
+            // until the user moves the slider.
+            focus_thickness: 1.0e9,
+            cursor_radius_visual: 0.0,
+            _pad: 0.0,
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Pod, Zeroable)]
 struct SphereVertex {
     position: [f32; 3],
     normal: [f32; 3],
@@ -50,20 +89,38 @@ pub struct Renderer {
     node_index_buffer: wgpu::Buffer,
     node_index_count: u32,
 
-    instance_position_buffer: wgpu::Buffer,
-    instance_color_buffer: wgpu::Buffer,
-    instance_size_buffer: wgpu::Buffer,
+    /// Shared with the compute layout engine. Layout: vec3+pad per node.
+    positions_storage: wgpu::Buffer,
+    colors_storage: wgpu::Buffer,
+    sizes_storage: wgpu::Buffer,
+    /// Edges-as-vec2<u32> storage buffer (src, tgt) per edge. Bound to the
+    /// edge pipeline's bind group; kept on the struct so the binding stays
+    /// alive for the lifetime of the renderer.
+    #[allow(dead_code)]
+    edges_storage: wgpu::Buffer,
     n_nodes: u32,
-
-    edge_position_buffer: wgpu::Buffer,
     n_edges: u32,
 
     camera_uniform_buffer: wgpu::Buffer,
-    camera_bind_group: wgpu::BindGroup,
+    effects_uniform_buffer: wgpu::Buffer,
+    /// Per-pipeline bind groups (each pipeline has its own bgl since the
+    /// node pipeline binds the geometry storage and the edge pipeline
+    /// additionally binds the edges array).
+    node_bind_group: wgpu::BindGroup,
+    edge_bind_group: wgpu::BindGroup,
 
-    // Cache of node positions + sizes for raycasting on CPU.
+    // CPU caches for raycasting / fit. Updated lazily via read_back_positions.
     node_positions_cpu: Vec<f32>,
     node_sizes_cpu: Vec<f32>,
+    edges_cpu: Vec<u32>,
+
+    layout: Option<GpuForceLayout>,
+    /// Stable id ordering used when we built the layout's graph; needed so
+    /// the renderer-side instance index lines up with the compute index.
+    /// Currently we just use 0..n_nodes order matching the GraphData input;
+    /// the layout uses sorted-id order. We synthesise integer ids
+    /// `0..n_nodes` when initialising the layout so the orderings match.
+    layout_initialized: bool,
 
     pub camera: Camera,
 }
@@ -89,7 +146,7 @@ impl Renderer {
                 &wgpu::DeviceDescriptor {
                     label: Some("graph-renderer device"),
                     required_features: wgpu::Features::empty(),
-                    required_limits: wgpu::Limits::downlevel_webgl2_defaults()
+                    required_limits: wgpu::Limits::downlevel_defaults()
                         .using_resolution(adapter.limits()),
                     memory_hints: wgpu::MemoryHints::default(),
                 },
@@ -118,7 +175,7 @@ impl Renderer {
         surface.configure(&device, &surface_config);
         let depth_view = create_depth_view(&device, surface_config.width, surface_config.height);
 
-        // --- Camera uniform + bind group ---
+        // --- Camera uniform + effects uniform ---
         let camera = Camera::new(surface_config.width as f32 / surface_config.height as f32);
         let cam_uniform = CameraUniform {
             view_proj: camera.view_proj(),
@@ -130,29 +187,13 @@ impl Renderer {
             contents: bytemuck::bytes_of(&cam_uniform),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
-        let camera_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("camera bgl"),
-            entries: &[wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Uniform,
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
-                },
-                count: None,
-            }],
-        });
-        let camera_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("camera bind group"),
-            layout: &camera_bgl,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: camera_uniform_buffer.as_entire_binding(),
-            }],
+        let effects_uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("effects uniform"),
+            contents: bytemuck::bytes_of(&EffectsUniform::default()),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
 
-        // --- Sphere geometry (icosphere subdivided once-ish; for size, just an icosahedron) ---
+        // --- Sphere geometry ---
         let (sphere_vertices, sphere_indices) = build_icosphere();
         let node_vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("sphere vertices"),
@@ -166,44 +207,109 @@ impl Renderer {
         });
         let node_index_count = sphere_indices.len() as u32;
 
-        // --- Per-instance buffers ---
+        // --- Storage buffers (shared with compute) ---
         let n_nodes = (graph.positions.len() / 3) as u32;
-        let instance_position_buffer =
-            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("instance positions"),
-                contents: bytemuck::cast_slice(&graph.positions),
-                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-            });
-        let instance_color_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("instance colors"),
-            contents: bytemuck::cast_slice(&graph.colors),
-            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-        });
-        let instance_size_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("instance sizes"),
-            contents: bytemuck::cast_slice(&graph.sizes),
-            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-        });
-
-        // --- Edge positions (unrolled to vertex pairs) ---
         let n_edges = (graph.edges.len() / 2) as u32;
-        let mut edge_positions = Vec::with_capacity((n_edges * 2 * 3) as usize);
-        for i in 0..n_edges as usize {
-            let a = graph.edges[i * 2] as usize;
-            let b = graph.edges[i * 2 + 1] as usize;
-            edge_positions.extend_from_slice(&[
-                graph.positions[a * 3],
-                graph.positions[a * 3 + 1],
-                graph.positions[a * 3 + 2],
-                graph.positions[b * 3],
-                graph.positions[b * 3 + 1],
-                graph.positions[b * 3 + 2],
+
+        // positions_storage: vec4-padded so the compute shader's
+        // `array<vec3<f32>>` (16-byte stride in WGSL) sees what we expect.
+        let mut positions_padded: Vec<f32> = Vec::with_capacity(n_nodes as usize * 4);
+        for i in 0..n_nodes as usize {
+            positions_padded.extend_from_slice(&[
+                graph.positions[i * 3],
+                graph.positions[i * 3 + 1],
+                graph.positions[i * 3 + 2],
+                0.0,
             ]);
         }
-        let edge_position_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("edge positions"),
-            contents: bytemuck::cast_slice(&edge_positions),
-            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+        // Ensure non-empty (wgpu rejects zero-sized storage buffers).
+        if positions_padded.is_empty() {
+            positions_padded.extend_from_slice(&[0.0; 4]);
+        }
+        let positions_storage = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("positions_storage"),
+            contents: bytemuck::cast_slice(&positions_padded),
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::VERTEX
+                | wgpu::BufferUsages::COPY_SRC
+                | wgpu::BufferUsages::COPY_DST,
+        });
+
+        // colors: vec4 per node (already 16-byte aligned).
+        let mut colors = graph.colors.clone();
+        if colors.is_empty() {
+            colors.extend_from_slice(&[0.0; 4]);
+        }
+        let colors_storage = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("colors_storage"),
+            contents: bytemuck::cast_slice(&colors),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        });
+
+        // sizes: f32 per node — std430 array stride = 4.
+        let mut sizes = graph.sizes.clone();
+        if sizes.is_empty() {
+            sizes.push(0.0);
+        }
+        let sizes_storage = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("sizes_storage"),
+            contents: bytemuck::cast_slice(&sizes),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        });
+
+        // edges: vec2<u32> per edge. WGSL std430 stride for vec2<u32> is 8.
+        let mut edges_packed: Vec<u32> = graph.edges.clone();
+        if edges_packed.is_empty() {
+            edges_packed.extend_from_slice(&[0, 0]);
+        }
+        let edges_storage = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("edges_storage"),
+            contents: bytemuck::cast_slice(&edges_packed),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        });
+
+        // --- Bind group layouts ---
+        // Node pipeline: camera + effects + positions + colors + sizes
+        let node_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("node bgl"),
+            entries: &[
+                uniform_entry(0, wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT),
+                uniform_entry(1, wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT),
+                ro_storage_entry(2, wgpu::ShaderStages::VERTEX),
+                ro_storage_entry(3, wgpu::ShaderStages::VERTEX),
+                ro_storage_entry(4, wgpu::ShaderStages::VERTEX),
+            ],
+        });
+        let edge_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("edge bgl"),
+            entries: &[
+                uniform_entry(0, wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT),
+                uniform_entry(1, wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT),
+                ro_storage_entry(2, wgpu::ShaderStages::VERTEX),
+                ro_storage_entry(3, wgpu::ShaderStages::VERTEX),
+            ],
+        });
+
+        let node_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("node bg"),
+            layout: &node_bgl,
+            entries: &[
+                bg_entry(0, &camera_uniform_buffer),
+                bg_entry(1, &effects_uniform_buffer),
+                bg_entry(2, &positions_storage),
+                bg_entry(3, &colors_storage),
+                bg_entry(4, &sizes_storage),
+            ],
+        });
+        let edge_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("edge bg"),
+            layout: &edge_bgl,
+            entries: &[
+                bg_entry(0, &camera_uniform_buffer),
+                bg_entry(1, &effects_uniform_buffer),
+                bg_entry(2, &positions_storage),
+                bg_entry(3, &edges_storage),
+            ],
         });
 
         // --- Pipelines ---
@@ -216,45 +322,29 @@ impl Renderer {
             source: wgpu::ShaderSource::Wgsl(include_str!("shaders/edge.wgsl").into()),
         });
 
-        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("pipeline layout"),
-            bind_group_layouts: &[&camera_bgl],
+        let node_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("node pipeline layout"),
+            bind_group_layouts: &[&node_bgl],
+            push_constant_ranges: &[],
+        });
+        let edge_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("edge pipeline layout"),
+            bind_group_layouts: &[&edge_bgl],
             push_constant_ranges: &[],
         });
 
         let node_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("node pipeline"),
-            layout: Some(&pipeline_layout),
+            layout: Some(&node_pl),
             vertex: wgpu::VertexState {
                 module: &node_shader,
                 entry_point: Some("vs_main"),
                 compilation_options: Default::default(),
-                buffers: &[
-                    // Sphere vertex (pos, normal)
-                    wgpu::VertexBufferLayout {
-                        array_stride: std::mem::size_of::<SphereVertex>() as u64,
-                        step_mode: wgpu::VertexStepMode::Vertex,
-                        attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3],
-                    },
-                    // Instance position (vec3)
-                    wgpu::VertexBufferLayout {
-                        array_stride: 12,
-                        step_mode: wgpu::VertexStepMode::Instance,
-                        attributes: &wgpu::vertex_attr_array![2 => Float32x3],
-                    },
-                    // Instance color (vec4)
-                    wgpu::VertexBufferLayout {
-                        array_stride: 16,
-                        step_mode: wgpu::VertexStepMode::Instance,
-                        attributes: &wgpu::vertex_attr_array![3 => Float32x4],
-                    },
-                    // Instance size (f32)
-                    wgpu::VertexBufferLayout {
-                        array_stride: 4,
-                        step_mode: wgpu::VertexStepMode::Instance,
-                        attributes: &wgpu::vertex_attr_array![4 => Float32],
-                    },
-                ],
+                buffers: &[wgpu::VertexBufferLayout {
+                    array_stride: std::mem::size_of::<SphereVertex>() as u64,
+                    step_mode: wgpu::VertexStepMode::Vertex,
+                    attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3],
+                }],
             },
             fragment: Some(wgpu::FragmentState {
                 module: &node_shader,
@@ -284,16 +374,12 @@ impl Renderer {
 
         let edge_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("edge pipeline"),
-            layout: Some(&pipeline_layout),
+            layout: Some(&edge_pl),
             vertex: wgpu::VertexState {
                 module: &edge_shader,
                 entry_point: Some("vs_main"),
                 compilation_options: Default::default(),
-                buffers: &[wgpu::VertexBufferLayout {
-                    array_stride: 12,
-                    step_mode: wgpu::VertexStepMode::Vertex,
-                    attributes: &wgpu::vertex_attr_array![0 => Float32x3],
-                }],
+                buffers: &[],
             },
             fragment: Some(wgpu::FragmentState {
                 module: &edge_shader,
@@ -332,16 +418,21 @@ impl Renderer {
             node_vertex_buffer,
             node_index_buffer,
             node_index_count,
-            instance_position_buffer,
-            instance_color_buffer,
-            instance_size_buffer,
+            positions_storage,
+            colors_storage,
+            sizes_storage,
+            edges_storage,
             n_nodes,
-            edge_position_buffer,
             n_edges,
             camera_uniform_buffer,
-            camera_bind_group,
+            effects_uniform_buffer,
+            node_bind_group,
+            edge_bind_group,
             node_positions_cpu: graph.positions,
             node_sizes_cpu: graph.sizes,
+            edges_cpu: graph.edges,
+            layout: None,
+            layout_initialized: false,
             camera,
         })
     }
@@ -357,25 +448,108 @@ impl Renderer {
         self.camera.aspect = w as f32 / h as f32;
     }
 
+    /// Update positions in the shared storage buffer (CPU-driven path; skip
+    /// when the live compute layout is running). Padded vec4 layout.
     pub fn update_positions(&mut self, positions: &[f32]) {
+        // Re-pad to vec4.
+        let mut padded: Vec<f32> = Vec::with_capacity(self.n_nodes as usize * 4);
+        for i in 0..self.n_nodes as usize {
+            padded.extend_from_slice(&[
+                positions[i * 3],
+                positions[i * 3 + 1],
+                positions[i * 3 + 2],
+                0.0,
+            ]);
+        }
         self.queue
-            .write_buffer(&self.instance_position_buffer, 0, bytemuck::cast_slice(positions));
+            .write_buffer(&self.positions_storage, 0, bytemuck::cast_slice(&padded));
         self.node_positions_cpu = positions.to_vec();
-        // Edge buffer would also need updating from edges list — left for Wave 2.
     }
 
     pub fn update_colors(&mut self, colors: &[f32]) {
         self.queue
-            .write_buffer(&self.instance_color_buffer, 0, bytemuck::cast_slice(colors));
+            .write_buffer(&self.colors_storage, 0, bytemuck::cast_slice(colors));
     }
 
     pub fn update_sizes(&mut self, sizes: &[f32]) {
         self.queue
-            .write_buffer(&self.instance_size_buffer, 0, bytemuck::cast_slice(sizes));
+            .write_buffer(&self.sizes_storage, 0, bytemuck::cast_slice(sizes));
         self.node_sizes_cpu = sizes.to_vec();
     }
 
-    pub fn render(&mut self) -> Result<(), wgpu::SurfaceError> {
+    pub fn set_focus_plane(&mut self, z: f32, thickness: f32) {
+        let eff = EffectsUniform {
+            focus_plane_z: z,
+            focus_thickness: thickness.max(1.0),
+            cursor_radius_visual: 0.0,
+            _pad: 0.0,
+        };
+        self.queue
+            .write_buffer(&self.effects_uniform_buffer, 0, bytemuck::bytes_of(&eff));
+    }
+
+    pub fn cam_fit_bounds(&mut self, min: Vec3, max: Vec3) {
+        self.camera.fit_to_bounds(min, max);
+    }
+
+    /// Build a `graph_layouts::Graph` from the renderer-side data and bind
+    /// the `GpuForceLayout` to this renderer's device + queue + shared
+    /// positions buffer.
+    pub fn init_layout(
+        &mut self,
+        edges: &[u32],
+        options: GpuForceOptions,
+    ) -> Result<(), String> {
+        // Build a synthetic id-keyed graph. Ids are decimal strings so the
+        // sorted ordering used by GpuForceLayout is just numeric ascending.
+        // To make sorted-string-of-int order match numeric order (so
+        // index `i` in our renderer == index `i` in compute), we
+        // zero-pad to a fixed width.
+        let n = self.n_nodes as usize;
+        let width = format!("{}", n.max(1) - 1).len().max(1);
+
+        let mut g = GlGraph::new();
+        // Seed each node with its current 3D position so the compute layer
+        // doesn't randomise on first init. (positions cache holds 3 f32/node)
+        for i in 0..n {
+            let id = format!("{:0width$}", i, width = width);
+            let mut node = GlNode::new(id.clone());
+            if i * 3 + 2 < self.node_positions_cpu.len() {
+                node.position3 = Some([
+                    self.node_positions_cpu[i * 3],
+                    self.node_positions_cpu[i * 3 + 1],
+                    self.node_positions_cpu[i * 3 + 2],
+                ]);
+            }
+            g.add_node(node);
+        }
+        for (e_i, chunk) in edges.chunks_exact(2).enumerate() {
+            let s = chunk[0] as usize;
+            let t = chunk[1] as usize;
+            if s >= n || t >= n {
+                continue;
+            }
+            let sid = format!("{:0width$}", s, width = width);
+            let tid = format!("{:0width$}", t, width = width);
+            let eid = format!("e{}", e_i);
+            g.add_edge(GlEdge::new(eid, sid, tid));
+        }
+
+        let mut layout = GpuForceLayout::new(options);
+        layout.init_with_device(&self.device, &self.queue, &g, &self.positions_storage)?;
+        self.layout = Some(layout);
+        self.layout_initialized = true;
+        Ok(())
+    }
+
+    pub fn update_layout_options(&mut self, options: GpuForceOptions) {
+        if let Some(l) = self.layout.as_mut() {
+            l.set_options(options);
+        }
+    }
+
+    /// One-shot frame: optionally step the layout, then render.
+    pub fn step(&mut self) -> Result<(), wgpu::SurfaceError> {
         // Update camera uniform.
         let cam_uniform = CameraUniform {
             view_proj: self.camera.view_proj(),
@@ -398,6 +572,13 @@ impl Renderer {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("frame encoder"),
             });
+
+        // Compute step (in the same encoder, before rendering — wgpu
+        // serialises commands within an encoder so the render pass sees the
+        // post-compute state).
+        if let Some(l) = self.layout.as_mut() {
+            l.step_with_encoder(&self.device, &self.queue, &mut encoder, &self.positions_storage);
+        }
 
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -430,18 +611,14 @@ impl Renderer {
             // Edges first (no depth write), nodes on top.
             if self.n_edges > 0 {
                 pass.set_pipeline(&self.edge_pipeline);
-                pass.set_bind_group(0, &self.camera_bind_group, &[]);
-                pass.set_vertex_buffer(0, self.edge_position_buffer.slice(..));
+                pass.set_bind_group(0, &self.edge_bind_group, &[]);
                 pass.draw(0..(self.n_edges * 2), 0..1);
             }
 
             if self.n_nodes > 0 {
                 pass.set_pipeline(&self.node_pipeline);
-                pass.set_bind_group(0, &self.camera_bind_group, &[]);
+                pass.set_bind_group(0, &self.node_bind_group, &[]);
                 pass.set_vertex_buffer(0, self.node_vertex_buffer.slice(..));
-                pass.set_vertex_buffer(1, self.instance_position_buffer.slice(..));
-                pass.set_vertex_buffer(2, self.instance_color_buffer.slice(..));
-                pass.set_vertex_buffer(3, self.instance_size_buffer.slice(..));
                 pass.set_index_buffer(self.node_index_buffer.slice(..), wgpu::IndexFormat::Uint32);
                 pass.draw_indexed(0..self.node_index_count, 0, 0..self.n_nodes);
             }
@@ -452,11 +629,23 @@ impl Renderer {
         Ok(())
     }
 
-    /// Naive sphere raycast on CPU. Returns nearest hit node index.
+    /// Backward-compatible alias for `step()` so the native binary's
+    /// `r.render()` call site keeps working.
+    pub fn render(&mut self) -> Result<(), wgpu::SurfaceError> {
+        self.step()
+    }
+
+    /// Naive sphere raycast on CPU. Returns nearest hit node index. Note:
+    /// with the live force sim running, the CPU position cache is only a
+    /// snapshot from the most recent `update_positions` call; for accurate
+    /// picking under live sim, call `read_back_positions` first.
     pub fn raycast(&self, ndc_x: f32, ndc_y: f32) -> Option<u32> {
         let (origin, dir) = self.camera.raycast(ndc_x, ndc_y);
         let mut best: Option<(f32, u32)> = None;
         for i in 0..self.n_nodes as usize {
+            if i * 3 + 2 >= self.node_positions_cpu.len() {
+                break;
+            }
             let center = Vec3::new(
                 self.node_positions_cpu[i * 3],
                 self.node_positions_cpu[i * 3 + 1],
@@ -477,6 +666,19 @@ impl Renderer {
         }
         best.map(|(_, i)| i)
     }
+
+    pub fn n_nodes(&self) -> u32 {
+        self.n_nodes
+    }
+    pub fn n_edges(&self) -> u32 {
+        self.n_edges
+    }
+    pub fn edges_cpu(&self) -> &[u32] {
+        &self.edges_cpu
+    }
+    pub fn positions_cpu(&self) -> &[f32] {
+        &self.node_positions_cpu
+    }
 }
 
 fn create_depth_view(device: &wgpu::Device, w: u32, h: u32) -> wgpu::TextureView {
@@ -495,6 +697,39 @@ fn create_depth_view(device: &wgpu::Device, w: u32, h: u32) -> wgpu::TextureView
         view_formats: &[],
     });
     tex.create_view(&wgpu::TextureViewDescriptor::default())
+}
+
+fn uniform_entry(binding: u32, vis: wgpu::ShaderStages) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: vis,
+        ty: wgpu::BindingType::Buffer {
+            ty: wgpu::BufferBindingType::Uniform,
+            has_dynamic_offset: false,
+            min_binding_size: None,
+        },
+        count: None,
+    }
+}
+
+fn ro_storage_entry(binding: u32, vis: wgpu::ShaderStages) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: vis,
+        ty: wgpu::BindingType::Buffer {
+            ty: wgpu::BufferBindingType::Storage { read_only: true },
+            has_dynamic_offset: false,
+            min_binding_size: None,
+        },
+        count: None,
+    }
+}
+
+fn bg_entry(binding: u32, buf: &wgpu::Buffer) -> wgpu::BindGroupEntry<'_> {
+    wgpu::BindGroupEntry {
+        binding,
+        resource: buf.as_entire_binding(),
+    }
 }
 
 /// 12-vertex / 20-tri icosahedron — small enough for instanced spheres

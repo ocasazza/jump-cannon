@@ -118,9 +118,18 @@ impl<'de> serde::Deserialize<'de> for GpuForceOptions {
     }
 }
 
+/// Owns the wgpu device + queue when the layout is constructed via the
+/// legacy `run()` path. The shared/borrowed path leaves this `None` since
+/// the caller's renderer owns those.
+struct OwnedDevice {
+    device: wgpu::Device,
+    queue: wgpu::Queue,
+}
+
 pub struct GpuForceLayout {
     options: GpuForceOptions,
     state: Option<GpuState>,
+    owned_device: Option<OwnedDevice>,
 }
 
 impl GpuForceLayout {
@@ -128,6 +137,7 @@ impl GpuForceLayout {
         Self {
             options,
             state: None,
+            owned_device: None,
         }
     }
 
@@ -146,6 +156,11 @@ impl GpuForceLayout {
     /// Run `steps_per_call` simulation steps. Initialises GPU resources on
     /// first call (or whenever the graph topology has changed). Writes back
     /// positions into `graph.nodes[*].position3`.
+    ///
+    /// This is the legacy "I own everything" path — it creates its own
+    /// `wgpu::Instance + Device + Queue + positions buffer`. Kept for native
+    /// standalone callers / WASM `LayoutManager`. For sharing GPU resources
+    /// with a renderer, use [`init_with_device`] + [`step_with_encoder`].
     pub async fn run(&mut self, graph: &mut Graph) -> Result<(), String> {
         // (Re)build GPU state if topology changed or this is the first run.
         let needs_rebuild = match &self.state {
@@ -153,19 +168,51 @@ impl GpuForceLayout {
             Some(state) => {
                 state.n_nodes as usize != graph.nodes.len()
                     || state.n_edges as usize != graph.edges.len()
+                    || !matches!(state.positions, PositionsStorage::Owned { .. })
             }
         };
         if needs_rebuild {
-            self.state = Some(GpuState::new(graph).await?);
+            // Acquire our own device/queue if we haven't already.
+            if self.owned_device.is_none() {
+                let instance = wgpu::Instance::default();
+                let adapter = instance
+                    .request_adapter(&wgpu::RequestAdapterOptions {
+                        power_preference: wgpu::PowerPreference::HighPerformance,
+                        compatible_surface: None,
+                        force_fallback_adapter: false,
+                    })
+                    .await
+                    .ok_or_else(|| "no GPU adapter".to_string())?;
+                let (device, queue) = adapter
+                    .request_device(
+                        &wgpu::DeviceDescriptor {
+                            label: Some("graph-layouts/gpu_force"),
+                            required_features: wgpu::Features::empty(),
+                            required_limits: wgpu::Limits::downlevel_defaults()
+                                .using_resolution(adapter.limits()),
+                            memory_hints: wgpu::MemoryHints::Performance,
+                        },
+                        None,
+                    )
+                    .await
+                    .map_err(|e| format!("request_device failed: {e}"))?;
+                self.owned_device = Some(OwnedDevice { device, queue });
+            }
+            let od = self.owned_device.as_ref().unwrap();
+            self.state = Some(GpuState::new_owned(&od.device, graph)?);
         }
 
+        let od = self
+            .owned_device
+            .as_ref()
+            .ok_or_else(|| "owned device missing".to_string())?;
         let state = self.state.as_mut().unwrap();
-        state.write_params(&self.options);
+        state.write_params(&od.queue, &self.options);
         for _ in 0..self.options.steps_per_call.max(1) {
-            state.dispatch_step();
+            state.dispatch_step_direct(&od.device, &od.queue);
             state.swap_position_buffers();
         }
-        let positions = state.read_positions().await?;
+        let positions = state.read_positions_owned(&od.device, &od.queue).await?;
         // Write back into the graph in the same id-order we built the buffer.
         for (id, p) in state.node_order.iter().zip(positions.chunks_exact(4)) {
             if let Some(node) = graph.nodes.get_mut(id) {
@@ -173,6 +220,88 @@ impl GpuForceLayout {
             }
         }
         Ok(())
+    }
+
+    /// Build GPU compute resources against a caller-supplied
+    /// `wgpu::Device + Queue + positions buffer`. The positions buffer must
+    /// be sized for `graph.nodes.len() * 16` bytes (vec3 + pad per node) and
+    /// usable as a STORAGE buffer (and whatever else the caller needs —
+    /// typically also VERTEX/COPY_SRC/COPY_DST for renderer sharing).
+    ///
+    /// After init, [`step_with_encoder`] records compute dispatches into a
+    /// caller-supplied encoder. The shared positions buffer always contains
+    /// the latest simulation state after the encoder is submitted, so a
+    /// vertex shader bound to the same buffer reads current positions with
+    /// zero CPU copies per frame.
+    pub fn init_with_device(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        graph: &Graph,
+        positions_buffer: &wgpu::Buffer,
+    ) -> Result<(), String> {
+        let state = GpuState::new_borrowed(device, graph, positions_buffer)?;
+        state.upload_initial_positions_to(queue, positions_buffer);
+        self.state = Some(state);
+        Ok(())
+    }
+
+    /// Record `steps_per_call` compute dispatches into the caller's encoder.
+    /// `device` and `queue` must be the same ones passed to
+    /// `init_with_device`. `queue` is used to write the params uniform
+    /// before the dispatches; `device` to allocate the per-step bind group.
+    /// No-op if the layout isn't initialised.
+    pub fn step_with_encoder(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        shared_buffer: &wgpu::Buffer,
+    ) {
+        let Some(state) = self.state.as_mut() else {
+            return;
+        };
+        state.write_params(queue, &self.options);
+        let steps = self.options.steps_per_call.max(1);
+        for _ in 0..steps {
+            state.dispatch_borrowed_step(device, encoder, shared_buffer);
+            state.swap_position_buffers();
+        }
+        // Make sure the shared (external/borrowed) buffer ends up holding
+        // the latest result. Convention:
+        //   - Borrowed mode: pos_a == shared, pos_b == internal.
+        //   - Each dispatch writes "out", then we flip a_is_in.
+        //   - After dispatch+swap, a_is_in indicates which buffer is the
+        //     NEXT step's "in" — i.e. which buffer holds the latest result.
+        //     So after the loop, if a_is_in == true the latest is pos_a
+        //     (shared, good). If a_is_in == false the latest is pos_b
+        //     (internal) — copy it to shared so the renderer reads it.
+        if !state.a_is_in {
+            encoder.copy_buffer_to_buffer(
+                state.positions.pos_b(),
+                0,
+                shared_buffer,
+                0,
+                state.pos_buf_size,
+            );
+        }
+    }
+
+    /// Read positions back to the CPU. Useful for picking / debugging from
+    /// the new shared-buffer path (the legacy `run()` already does this
+    /// internally).
+    pub async fn read_back_positions(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        shared_buffer: &wgpu::Buffer,
+    ) -> Result<Vec<f32>, String> {
+        let Some(state) = self.state.as_ref() else {
+            return Err("layout not initialised".to_string());
+        };
+        state
+            .read_positions_with_device(device, queue, shared_buffer)
+            .await
     }
 }
 
@@ -201,235 +330,287 @@ struct SimParamsRaw {
 // of 16 in WGSL). We use a 4-component layout on the CPU side to match.
 const VEC3_STRIDE: u64 = 16;
 
+/// Position buffer ownership.
+///
+/// In the legacy `run()` path the GPU state owns both ping-pong buffers.
+/// In the renderer-shared path the renderer owns one buffer (used as both
+/// vertex source and compute storage) and we own the second internal
+/// ping-pong target. The shared buffer is supplied to step / readback
+/// methods as a reference so we don't have to clone wgpu::Buffer (which
+/// isn't Clone in wgpu 23).
+enum PositionsStorage {
+    Owned {
+        pos_a: wgpu::Buffer,
+        pos_b: wgpu::Buffer,
+    },
+    /// Marker variant — the actual shared `pos_a` is passed in to each
+    /// method that needs it. We still own the internal `pos_b` ping-pong.
+    Borrowed {
+        pos_b: wgpu::Buffer,
+    },
+}
+
+impl PositionsStorage {
+    fn pos_b(&self) -> &wgpu::Buffer {
+        match self {
+            PositionsStorage::Owned { pos_b, .. } | PositionsStorage::Borrowed { pos_b, .. } => {
+                pos_b
+            }
+        }
+    }
+}
+
 struct GpuState {
-    device: wgpu::Device,
-    queue: wgpu::Queue,
     pipeline: wgpu::ComputePipeline,
     bind_group_layout: wgpu::BindGroupLayout,
 
-    pos_a: wgpu::Buffer,
-    pos_b: wgpu::Buffer,
+    positions: PositionsStorage,
     /// True while pos_a is the "in" and pos_b is the "out" buffer.
     a_is_in: bool,
     velocities: wgpu::Buffer,
     edge_offsets: wgpu::Buffer,
     edge_neighbors: wgpu::Buffer,
     params_buf: wgpu::Buffer,
-    staging: wgpu::Buffer,
+    /// Staging buffer for CPU readback. Only allocated in the owned path
+    /// and on-demand for the borrowed path's `read_back_positions`.
+    staging: Option<wgpu::Buffer>,
 
     n_nodes: u32,
     n_edges: u32,
     pos_buf_size: u64,
 
+    /// Initial (CPU-built) positions, kept around so the borrowed-mode path
+    /// can seed the shared buffer via `queue.write_buffer` after init.
+    initial_positions: Vec<f32>,
+
     /// Stable node-id ordering used to interpret the position buffer.
     node_order: Vec<String>,
 }
 
-impl GpuState {
-    async fn new(graph: &Graph) -> Result<Self, String> {
-        let n_nodes = graph.nodes.len() as u32;
-        let n_edges = graph.edges.len() as u32;
+/// CPU-side pre-compute: stable id ordering, initial positions
+/// (padded vec4 layout), velocities, and CSR adjacency arrays.
+struct PreCompute {
+    n_nodes: u32,
+    n_edges: u32,
+    node_order: Vec<String>,
+    initial_positions: Vec<f32>, // padded vec4-per-node
+    velocities: Vec<f32>,
+    edge_offsets: Vec<u32>,
+    edge_neighbors: Vec<u32>,
+}
 
-        // ---- Stable node ordering + id->idx map ----
-        let mut node_order: Vec<String> = graph.nodes.keys().cloned().collect();
-        node_order.sort();
-        let id_to_idx: std::collections::HashMap<&str, u32> = node_order
-            .iter()
-            .enumerate()
-            .map(|(i, id)| (id.as_str(), i as u32))
-            .collect();
+fn precompute(graph: &Graph) -> PreCompute {
+    let n_nodes = graph.nodes.len() as u32;
+    let n_edges = graph.edges.len() as u32;
 
-        // ---- Initial positions (vec3-as-vec4 padded) ----
-        // Use position3 if present, else random sphere of radius sqrt(n)*5.
-        let radius = ((n_nodes as f32).max(1.0).sqrt()) * 5.0;
-        let mut positions: Vec<f32> = Vec::with_capacity(n_nodes as usize * 4);
-        // Tiny LCG so we don't have to drag rand traits across cfg(target).
-        let mut seed: u32 = 0x9E37_79B1;
-        let mut next = || {
-            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
-            (seed as f32 / u32::MAX as f32) * 2.0 - 1.0
+    let mut node_order: Vec<String> = graph.nodes.keys().cloned().collect();
+    node_order.sort();
+    let id_to_idx: std::collections::HashMap<&str, u32> = node_order
+        .iter()
+        .enumerate()
+        .map(|(i, id)| (id.as_str(), i as u32))
+        .collect();
+
+    let radius = ((n_nodes as f32).max(1.0).sqrt()) * 5.0;
+    let mut positions: Vec<f32> = Vec::with_capacity(n_nodes as usize * 4);
+    let mut seed: u32 = 0x9E37_79B1;
+    let mut next = || {
+        seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+        (seed as f32 / u32::MAX as f32) * 2.0 - 1.0
+    };
+    for id in &node_order {
+        let n = &graph.nodes[id];
+        let p = n
+            .position3
+            .unwrap_or_else(|| [next() * radius, next() * radius, next() * radius]);
+        positions.extend_from_slice(&[p[0], p[1], p[2], 0.0]);
+    }
+    let velocities: Vec<f32> = vec![0.0; n_nodes as usize * 4];
+
+    let mut adj: Vec<Vec<u32>> = vec![Vec::new(); n_nodes as usize];
+    for e in graph.edges.values() {
+        let (Some(&s), Some(&t)) = (
+            id_to_idx.get(e.source.as_str()),
+            id_to_idx.get(e.target.as_str()),
+        ) else {
+            continue;
         };
-        for id in &node_order {
-            let n = &graph.nodes[id];
-            let p = n.position3.unwrap_or_else(|| {
-                [next() * radius, next() * radius, next() * radius]
-            });
-            positions.extend_from_slice(&[p[0], p[1], p[2], 0.0]);
+        if s == t {
+            continue;
         }
-        let velocities: Vec<f32> = vec![0.0; n_nodes as usize * 4];
+        adj[s as usize].push(t);
+        adj[t as usize].push(s);
+    }
+    let mut edge_offsets: Vec<u32> = Vec::with_capacity(n_nodes as usize + 1);
+    let mut edge_neighbors: Vec<u32> = Vec::new();
+    let mut acc: u32 = 0;
+    edge_offsets.push(0);
+    for ns in &adj {
+        acc += ns.len() as u32;
+        edge_neighbors.extend_from_slice(ns);
+        edge_offsets.push(acc);
+    }
+    if edge_neighbors.is_empty() {
+        edge_neighbors.push(0);
+    }
+    PreCompute {
+        n_nodes,
+        n_edges,
+        node_order,
+        initial_positions: positions,
+        velocities,
+        edge_offsets,
+        edge_neighbors,
+    }
+}
 
-        // ---- CSR adjacency (undirected) ----
-        let mut adj: Vec<Vec<u32>> = vec![Vec::new(); n_nodes as usize];
-        for e in graph.edges.values() {
-            let (Some(&s), Some(&t)) = (
-                id_to_idx.get(e.source.as_str()),
-                id_to_idx.get(e.target.as_str()),
-            ) else {
-                continue;
-            };
-            if s == t {
-                continue;
-            }
-            adj[s as usize].push(t);
-            adj[t as usize].push(s);
-        }
-        let mut edge_offsets: Vec<u32> = Vec::with_capacity(n_nodes as usize + 1);
-        let mut edge_neighbors: Vec<u32> = Vec::new();
-        let mut acc: u32 = 0;
-        edge_offsets.push(0);
-        for ns in &adj {
-            acc += ns.len() as u32;
-            edge_neighbors.extend_from_slice(ns);
-            edge_offsets.push(acc);
-        }
-        // Storage buffers must be non-empty.
-        if edge_neighbors.is_empty() {
-            edge_neighbors.push(0);
-        }
+fn build_pipeline(
+    device: &wgpu::Device,
+) -> (wgpu::ComputePipeline, wgpu::BindGroupLayout) {
+    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("force.wgsl"),
+        source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(include_str!(
+            "shaders/force.wgsl"
+        ))),
+    });
+    let bgl_entries = [
+        storage_entry(0, true),
+        storage_entry(1, false),
+        storage_entry(2, false),
+        storage_entry(3, true),
+        storage_entry(4, true),
+        wgpu::BindGroupLayoutEntry {
+            binding: 5,
+            visibility: wgpu::ShaderStages::COMPUTE,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Uniform,
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        },
+    ];
+    let bind_group_layout = device.create_bind_group_layout(
+        &wgpu::BindGroupLayoutDescriptor {
+            label: Some("gpu_force_bgl"),
+            entries: &bgl_entries,
+        },
+    );
+    let pipeline_layout = device.create_pipeline_layout(
+        &wgpu::PipelineLayoutDescriptor {
+            label: Some("gpu_force_pl"),
+            bind_group_layouts: &[&bind_group_layout],
+            push_constant_ranges: &[],
+        },
+    );
+    let pipeline = device.create_compute_pipeline(
+        &wgpu::ComputePipelineDescriptor {
+            label: Some("force_step"),
+            layout: Some(&pipeline_layout),
+            module: &shader,
+            entry_point: Some("force_step"),
+            compilation_options: Default::default(),
+            cache: None,
+        },
+    );
+    (pipeline, bind_group_layout)
+}
 
-        // ---- Adapter / device ----
-        let instance = wgpu::Instance::default();
-        let adapter = instance
-            .request_adapter(&wgpu::RequestAdapterOptions {
-                power_preference: wgpu::PowerPreference::HighPerformance,
-                compatible_surface: None,
-                force_fallback_adapter: false,
-            })
-            .await
-            .ok_or_else(|| {
-                "no GPU adapter (try a fallback adapter or skip)".to_string()
-            })?;
+impl GpuState {
+    /// Build state with caller-supplied device + owned positions buffers.
+    fn new_owned(device: &wgpu::Device, graph: &Graph) -> Result<Self, String> {
+        let pc = precompute(graph);
+        let pos_buf_size = (pc.n_nodes as u64).max(1) * VEC3_STRIDE;
 
-        let (device, queue) = adapter
-            .request_device(
-                &wgpu::DeviceDescriptor {
-                    label: Some("graph-layouts/gpu_force"),
-                    required_features: wgpu::Features::empty(),
-                    required_limits: wgpu::Limits::downlevel_defaults()
-                        .using_resolution(adapter.limits()),
-                    memory_hints: wgpu::MemoryHints::Performance,
-                },
-                None,
-            )
-            .await
-            .map_err(|e| format!("request_device failed: {e}"))?;
-
-        // ---- Buffers ----
-        let pos_buf_size = (n_nodes as u64).max(1) * VEC3_STRIDE;
         let pos_a = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("positions_a"),
-            contents: bytemuck::cast_slice(&positions),
+            contents: bytemuck::cast_slice(&pc.initial_positions),
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
         });
         let pos_b = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("positions_b"),
-            contents: bytemuck::cast_slice(&positions),
+            contents: bytemuck::cast_slice(&pc.initial_positions),
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
         });
-        let vel = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("velocities"),
-            contents: bytemuck::cast_slice(&velocities),
-            usage: wgpu::BufferUsages::STORAGE,
-        });
-        let off = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("edge_offsets"),
-            contents: bytemuck::cast_slice(&edge_offsets),
-            usage: wgpu::BufferUsages::STORAGE,
-        });
-        let neigh = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("edge_neighbors"),
-            contents: bytemuck::cast_slice(&edge_neighbors),
-            usage: wgpu::BufferUsages::STORAGE,
-        });
-        let params_buf = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("sim_params"),
-            size: std::mem::size_of::<SimParamsRaw>() as u64,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
+        let (vel, off, neigh, params_buf) = build_aux_buffers(device, &pc);
         let staging = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("positions_staging"),
             size: pos_buf_size,
             usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
             mapped_at_creation: false,
         });
-
-        // ---- Pipeline ----
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("force.wgsl"),
-            source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(include_str!(
-                "shaders/force.wgsl"
-            ))),
-        });
-
-        let bgl_entries = [
-            // 0: positions_in (read-only storage)
-            storage_entry(0, true),
-            // 1: positions_out
-            storage_entry(1, false),
-            // 2: velocities
-            storage_entry(2, false),
-            // 3: edge_offsets (read-only)
-            storage_entry(3, true),
-            // 4: edge_neighbors (read-only)
-            storage_entry(4, true),
-            // 5: params (uniform)
-            wgpu::BindGroupLayoutEntry {
-                binding: 5,
-                visibility: wgpu::ShaderStages::COMPUTE,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Uniform,
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
-                },
-                count: None,
-            },
-        ];
-        let bind_group_layout = device.create_bind_group_layout(
-            &wgpu::BindGroupLayoutDescriptor {
-                label: Some("gpu_force_bgl"),
-                entries: &bgl_entries,
-            },
-        );
-        let pipeline_layout = device.create_pipeline_layout(
-            &wgpu::PipelineLayoutDescriptor {
-                label: Some("gpu_force_pl"),
-                bind_group_layouts: &[&bind_group_layout],
-                push_constant_ranges: &[],
-            },
-        );
-        let pipeline = device.create_compute_pipeline(
-            &wgpu::ComputePipelineDescriptor {
-                label: Some("force_step"),
-                layout: Some(&pipeline_layout),
-                module: &shader,
-                entry_point: Some("force_step"),
-                compilation_options: Default::default(),
-                cache: None,
-            },
-        );
+        let (pipeline, bind_group_layout) = build_pipeline(device);
 
         Ok(Self {
-            device,
-            queue,
             pipeline,
             bind_group_layout,
-            pos_a,
-            pos_b,
+            positions: PositionsStorage::Owned { pos_a, pos_b },
             a_is_in: true,
             velocities: vel,
             edge_offsets: off,
             edge_neighbors: neigh,
             params_buf,
-            staging,
-            n_nodes,
-            n_edges,
+            staging: Some(staging),
+            n_nodes: pc.n_nodes,
+            n_edges: pc.n_edges,
             pos_buf_size,
-            node_order,
+            initial_positions: pc.initial_positions,
+            node_order: pc.node_order,
         })
     }
 
-    fn write_params(&self, opts: &GpuForceOptions) {
+    /// Build state against caller-supplied device + a borrowed positions
+    /// storage buffer (typically owned by the renderer). We don't take the
+    /// queue here — the caller passes it to `upload_initial_positions` and
+    /// `step_with_encoder`. This avoids cloning wgpu::Queue.
+    fn new_borrowed(
+        device: &wgpu::Device,
+        graph: &Graph,
+        positions_buffer: &wgpu::Buffer,
+    ) -> Result<Self, String> {
+        let pc = precompute(graph);
+        let pos_buf_size = (pc.n_nodes as u64).max(1) * VEC3_STRIDE;
+
+        // Internal ping-pong target. COPY_SRC so we can copy back to the
+        // shared buffer; COPY_DST so we can seed it.
+        let pos_b = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("positions_internal_b"),
+            contents: bytemuck::cast_slice(&pc.initial_positions),
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_SRC
+                | wgpu::BufferUsages::COPY_DST,
+        });
+        let (vel, off, neigh, params_buf) = build_aux_buffers(device, &pc);
+        let (pipeline, bind_group_layout) = build_pipeline(device);
+
+        let _ = positions_buffer; // sized check happens via caller usage
+
+        Ok(Self {
+            pipeline,
+            bind_group_layout,
+            positions: PositionsStorage::Borrowed { pos_b },
+            a_is_in: true,
+            velocities: vel,
+            edge_offsets: off,
+            edge_neighbors: neigh,
+            params_buf,
+            staging: None,
+            n_nodes: pc.n_nodes,
+            n_edges: pc.n_edges,
+            pos_buf_size,
+            initial_positions: pc.initial_positions,
+            node_order: pc.node_order,
+        })
+    }
+
+    /// Seed the shared (borrowed) positions buffer with our initial values.
+    /// Caller must supply the same shared buffer that was passed to
+    /// `new_borrowed`.
+    fn upload_initial_positions_to(&self, queue: &wgpu::Queue, shared: &wgpu::Buffer) {
+        queue.write_buffer(shared, 0, bytemuck::cast_slice(&self.initial_positions));
+    }
+
+    fn write_params(&self, queue: &wgpu::Queue, opts: &GpuForceOptions) {
         let raw = SimParamsRaw {
             repulsion: opts.repulsion,
             spring_k: opts.spring_k,
@@ -446,21 +627,42 @@ impl GpuState {
             _pad1: 0,
             _pad2: 0,
         };
-        self.queue
-            .write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&raw));
+        queue.write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&raw));
     }
 
-    fn current_in_out(&self) -> (&wgpu::Buffer, &wgpu::Buffer) {
+    /// Owned-mode "in/out" picker — both buffers live in PositionsStorage::Owned.
+    fn owned_in_out(&self) -> (&wgpu::Buffer, &wgpu::Buffer) {
+        let PositionsStorage::Owned { pos_a, pos_b } = &self.positions else {
+            panic!("owned_in_out called on borrowed state");
+        };
         if self.a_is_in {
-            (&self.pos_a, &self.pos_b)
+            (pos_a, pos_b)
         } else {
-            (&self.pos_b, &self.pos_a)
+            (pos_b, pos_a)
         }
     }
 
-    fn dispatch_step(&self) {
-        let (pos_in, pos_out) = self.current_in_out();
-        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+    /// Borrowed-mode "in/out" picker. The shared buffer (pos_a) is supplied
+    /// by the caller; the internal pos_b lives in the state.
+    fn borrowed_in_out<'a>(
+        &'a self,
+        shared: &'a wgpu::Buffer,
+    ) -> (&'a wgpu::Buffer, &'a wgpu::Buffer) {
+        let pos_b = self.positions.pos_b();
+        if self.a_is_in {
+            (shared, pos_b)
+        } else {
+            (pos_b, shared)
+        }
+    }
+
+    fn make_bind_group(
+        &self,
+        device: &wgpu::Device,
+        pos_in: &wgpu::Buffer,
+        pos_out: &wgpu::Buffer,
+    ) -> wgpu::BindGroup {
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("gpu_force_bg"),
             layout: &self.bind_group_layout,
             entries: &[
@@ -471,63 +673,142 @@ impl GpuState {
                 buf_entry(4, &self.edge_neighbors),
                 buf_entry(5, &self.params_buf),
             ],
+        })
+    }
+
+    /// Direct dispatch — owns its own encoder and submits immediately.
+    /// Used by the legacy `run()` path (owned mode only).
+    fn dispatch_step_direct(&self, device: &wgpu::Device, queue: &wgpu::Queue) {
+        let (pos_in, pos_out) = self.owned_in_out();
+        let bind_group = self.make_bind_group(device, pos_in, pos_out);
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("gpu_force_cmd"),
         });
-        let mut encoder = self
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("gpu_force_cmd"),
-            });
-        {
-            let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("force_step_pass"),
-                timestamp_writes: None,
-            });
-            cpass.set_pipeline(&self.pipeline);
-            cpass.set_bind_group(0, &bind_group, &[]);
-            let groups = (self.n_nodes + 63) / 64;
-            cpass.dispatch_workgroups(groups.max(1), 1, 1);
-        }
-        self.queue.submit(Some(encoder.finish()));
+        self.encode_compute(&mut encoder, &bind_group);
+        queue.submit(Some(encoder.finish()));
+    }
+
+    /// Record dispatch into a caller-supplied encoder, reading/writing the
+    /// borrowed shared buffer + internal pos_b.
+    fn dispatch_borrowed_step(
+        &self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        shared: &wgpu::Buffer,
+    ) {
+        let (pos_in, pos_out) = self.borrowed_in_out(shared);
+        let bind_group = self.make_bind_group(device, pos_in, pos_out);
+        self.encode_compute(encoder, &bind_group);
+    }
+
+    fn encode_compute(&self, encoder: &mut wgpu::CommandEncoder, bind_group: &wgpu::BindGroup) {
+        let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("force_step_pass"),
+            timestamp_writes: None,
+        });
+        cpass.set_pipeline(&self.pipeline);
+        cpass.set_bind_group(0, bind_group, &[]);
+        let groups = (self.n_nodes + 63) / 64;
+        cpass.dispatch_workgroups(groups.max(1), 1, 1);
     }
 
     fn swap_position_buffers(&mut self) {
         self.a_is_in = !self.a_is_in;
     }
 
-    /// Copy the current "in" position buffer (= last-written "out" before the
-    /// swap, or the initial buffer if zero steps ran) back to the CPU.
-    async fn read_positions(&self) -> Result<Vec<f32>, String> {
-        let (pos_in, _) = self.current_in_out();
-        let mut encoder = self
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("gpu_force_readback"),
-            });
-        encoder.copy_buffer_to_buffer(pos_in, 0, &self.staging, 0, self.pos_buf_size);
-        self.queue.submit(Some(encoder.finish()));
+    /// Owned-mode CPU readback of the latest positions.
+    async fn read_positions_owned(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+    ) -> Result<Vec<f32>, String> {
+        let staging = self
+            .staging
+            .as_ref()
+            .ok_or_else(|| "no staging buffer (borrowed mode)".to_string())?;
+        let (pos_in, _) = self.owned_in_out();
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("gpu_force_readback"),
+        });
+        encoder.copy_buffer_to_buffer(pos_in, 0, staging, 0, self.pos_buf_size);
+        queue.submit(Some(encoder.finish()));
+        Self::map_and_read(staging, device).await
+    }
 
-        let slice = self.staging.slice(..);
+    /// Borrowed-mode CPU readback. Allocates a temporary staging buffer.
+    async fn read_positions_with_device(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        shared: &wgpu::Buffer,
+    ) -> Result<Vec<f32>, String> {
+        let staging = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("positions_readback_tmp"),
+            size: self.pos_buf_size,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("gpu_force_readback_borrowed"),
+        });
+        // Latest result lives on the shared buffer after
+        // step_with_encoder ensures it's there.
+        encoder.copy_buffer_to_buffer(shared, 0, &staging, 0, self.pos_buf_size);
+        queue.submit(Some(encoder.finish()));
+        Self::map_and_read(&staging, device).await
+    }
+
+    async fn map_and_read(staging: &wgpu::Buffer, device: &wgpu::Device) -> Result<Vec<f32>, String> {
+        let slice = staging.slice(..);
         let (tx, rx) = futures_channel();
         slice.map_async(wgpu::MapMode::Read, move |res| {
             let _ = tx.send(res);
         });
-        // Drive the device until the map completes. On wasm32 the browser
-        // event loop drives this; on native we poll.
         #[cfg(not(target_arch = "wasm32"))]
         {
-            self.device.poll(wgpu::Maintain::Wait);
+            device.poll(wgpu::Maintain::Wait);
         }
+        #[cfg(target_arch = "wasm32")]
+        let _ = device;
         let res = rx.recv().await;
         res.map_err(|_| "map channel dropped".to_string())?
             .map_err(|e| format!("buffer map failed: {e:?}"))?;
-
         let data = slice.get_mapped_range();
-        // Layout: [x,y,z,_pad] per node.
         let floats: Vec<f32> = bytemuck::cast_slice::<u8, f32>(&data).to_vec();
         drop(data);
-        self.staging.unmap();
+        staging.unmap();
         Ok(floats)
     }
+}
+
+/// Build the velocity, edge_offsets, edge_neighbors, and params buffers
+/// used by both owned and borrowed paths.
+fn build_aux_buffers(
+    device: &wgpu::Device,
+    pc: &PreCompute,
+) -> (wgpu::Buffer, wgpu::Buffer, wgpu::Buffer, wgpu::Buffer) {
+    let vel = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("velocities"),
+        contents: bytemuck::cast_slice(&pc.velocities),
+        usage: wgpu::BufferUsages::STORAGE,
+    });
+    let off = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("edge_offsets"),
+        contents: bytemuck::cast_slice(&pc.edge_offsets),
+        usage: wgpu::BufferUsages::STORAGE,
+    });
+    let neigh = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("edge_neighbors"),
+        contents: bytemuck::cast_slice(&pc.edge_neighbors),
+        usage: wgpu::BufferUsages::STORAGE,
+    });
+    let params_buf = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("sim_params"),
+        size: std::mem::size_of::<SimParamsRaw>() as u64,
+        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    (vel, off, neigh, params_buf)
 }
 
 fn storage_entry(binding: u32, read_only: bool) -> wgpu::BindGroupLayoutEntry {

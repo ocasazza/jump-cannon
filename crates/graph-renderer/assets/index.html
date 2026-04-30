@@ -64,6 +64,25 @@
           <button id="cam-reset" class="btn">Reset zoom</button>
         </div>
       </div>
+
+      <div class="section">
+        <label class="lbl">Microscope focus</label>
+        <label class="lbl" for="focus-z">Plane Z: <span id="focus-z-val">0</span></label>
+        <input id="focus-z" class="slider" type="range" min="-1000" max="1000" step="10" value="0">
+        <label class="lbl" for="focus-thickness">Thickness: <span id="focus-thickness-val">2000</span></label>
+        <input id="focus-thickness" class="slider" type="range" min="50" max="3000" step="50" value="2000">
+      </div>
+
+      <div class="section">
+        <label class="lbl">Cursor force tool</label>
+        <label class="lbl" for="cursor-radius">Radius: <span id="cursor-radius-val">120</span></label>
+        <input id="cursor-radius" class="slider" type="range" min="0" max="500" step="10" value="120">
+        <label class="lbl" for="cursor-strength">Strength: <span id="cursor-strength-val">200</span></label>
+        <input id="cursor-strength" class="slider" type="range" min="0" max="2000" step="10" value="200">
+        <label class="lbl" for="cursor-depth">Depth: <span id="cursor-depth-val">800</span></label>
+        <input id="cursor-depth" class="slider" type="range" min="100" max="3000" step="10" value="800">
+        <div class="lbl" style="opacity:0.7">LMB attract · RMB repel · scroll = depth</div>
+      </div>
     </aside>
 
     <div id="canvas-wrap">

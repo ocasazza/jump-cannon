@@ -1,20 +1,34 @@
 //! WASM entrypoints invoked from `assets/main.js`. Wraps `Renderer` in a
-//! JS-friendly handle and surfaces camera ops for keyboard/mouse handlers
-//! that live in JS.
+//! JS-friendly handle and surfaces:
+//!
+//! - camera ops (pan / rotate / zoom / fit-to-bounds / reset)
+//! - the live force sim driver (`init_layout` / `update_layout_options` /
+//!   `step` / `set_cursor_force`)
+//! - microscope focus plane (`set_focus_plane`)
+//! - cursor world projection helper (`cursor_world_at`) so JS can map
+//!   screen + depth → world for the 6DoF cursor force tool.
 
-use crate::{Camera, GraphData, Renderer, RendererConfig};
+use crate::{GraphData, Renderer, RendererConfig};
+use graph_layouts::GpuForceOptions;
 use wasm_bindgen::prelude::*;
 
 #[wasm_bindgen]
 pub struct WebRenderer {
     inner: Option<Renderer>,
+    /// Mirror of the current sim options so `set_cursor_force` can mutate
+    /// just the cursor fields without the JS side having to pass the full
+    /// JSON every move.
+    sim_opts: GpuForceOptions,
 }
 
 #[wasm_bindgen]
 impl WebRenderer {
     #[wasm_bindgen(constructor)]
     pub fn new() -> Self {
-        Self { inner: None }
+        Self {
+            inner: None,
+            sim_opts: GpuForceOptions::default(),
+        }
     }
 
     /// Init wgpu against a canvas element. Takes the canvas id (string) and
@@ -92,12 +106,87 @@ impl WebRenderer {
         }
     }
 
+    /// Initialize the GPU force-sim layout against the renderer's device +
+    /// shared positions buffer. `options_json` is the JSON-encoded
+    /// `GpuForceOptions` shape.
+    pub fn init_layout(
+        &mut self,
+        edges: js_sys::Uint32Array,
+        options_json: String,
+    ) -> Result<(), JsValue> {
+        let opts: GpuForceOptions = serde_json::from_str(&options_json)
+            .map_err(|e| JsValue::from_str(&format!("parse options: {e}")))?;
+        self.sim_opts = opts.clone();
+        let edges_vec = edges.to_vec();
+        let r = self
+            .inner
+            .as_mut()
+            .ok_or_else(|| JsValue::from_str("renderer not initialised"))?;
+        r.init_layout(&edges_vec, opts)
+            .map_err(|e| JsValue::from_str(&e))
+    }
+
+    pub fn update_layout_options(&mut self, options_json: String) -> Result<(), JsValue> {
+        let opts: GpuForceOptions = serde_json::from_str(&options_json)
+            .map_err(|e| JsValue::from_str(&format!("parse options: {e}")))?;
+        self.sim_opts = opts.clone();
+        if let Some(r) = self.inner.as_mut() {
+            r.update_layout_options(opts);
+        }
+        Ok(())
+    }
+
+    /// Step the layout sim and render one frame.
+    pub fn step(&mut self) -> Result<(), JsValue> {
+        if let Some(r) = &mut self.inner {
+            r.step()
+                .map_err(|e| JsValue::from_str(&format!("step: {e:?}")))?;
+        }
+        Ok(())
+    }
+
+    /// Render one frame WITHOUT stepping the layout. Useful for warm-up
+    /// rendering before the layout is initialised. (`step()` already covers
+    /// the both-with-layout case.)
     pub fn render(&mut self) -> Result<(), JsValue> {
         if let Some(r) = &mut self.inner {
-            r.render()
+            r.step()
                 .map_err(|e| JsValue::from_str(&format!("render: {e:?}")))?;
         }
         Ok(())
+    }
+
+    /// Microscope focus plane controls. `z` is world-space; `thickness` is
+    /// the full focus band width. Outside ±thickness the alpha falls to
+    /// ~15%.
+    pub fn set_focus_plane(&mut self, z: f32, thickness: f32) {
+        if let Some(r) = &mut self.inner {
+            r.set_focus_plane(z, thickness);
+        }
+    }
+
+    /// 6DoF cursor force. Pass radius=0 to disable. Strength sign
+    /// convention: positive = repel, negative = attract.
+    pub fn set_cursor_force(&mut self, x: f32, y: f32, z: f32, radius: f32, strength: f32) {
+        self.sim_opts.cursor_pos = [x, y, z];
+        self.sim_opts.cursor_radius = radius;
+        self.sim_opts.cursor_strength = strength;
+        if let Some(r) = &mut self.inner {
+            r.update_layout_options(self.sim_opts.clone());
+        }
+    }
+
+    /// Project a screen-space point + a camera-space depth into world
+    /// coordinates. JS uses this to compute where the 6DoF cursor force
+    /// should live: `screen_x/y` in NDC ([-1, 1], y up), `depth` is the
+    /// distance forward from the camera.
+    pub fn cursor_world_at(&self, ndc_x: f32, ndc_y: f32, depth: f32) -> Vec<f32> {
+        let Some(r) = &self.inner else {
+            return vec![0.0, 0.0, 0.0];
+        };
+        let (origin, dir) = r.camera.raycast(ndc_x, ndc_y);
+        let p = origin + dir * depth.max(1.0);
+        vec![p.x, p.y, p.z]
     }
 
     pub fn raycast(&self, x: f32, y: f32) -> Option<u32> {
@@ -126,15 +215,27 @@ impl WebRenderer {
 
     pub fn cam_fit(&mut self) {
         if let Some(r) = &mut self.inner {
-            // Compute bounds from CPU position cache.
-            let positions = current_positions(&r.camera);
-            let _ = positions;
-            // Recompute bounds via a public method on Renderer: simplest is to
-            // re-derive by reading from the position cache that lives on
-            // Renderer. For now, fit to a default box around the origin.
+            // Default fallback box; prefer cam_fit_bounds for real data.
             let min = glam::Vec3::splat(-1000.0);
             let max = glam::Vec3::splat(1000.0);
             r.camera.fit_to_bounds(min, max);
+        }
+    }
+
+    pub fn cam_fit_bounds(
+        &mut self,
+        min_x: f32,
+        min_y: f32,
+        min_z: f32,
+        max_x: f32,
+        max_y: f32,
+        max_z: f32,
+    ) {
+        if let Some(r) = &mut self.inner {
+            r.cam_fit_bounds(
+                glam::Vec3::new(min_x, min_y, min_z),
+                glam::Vec3::new(max_x, max_y, max_z),
+            );
         }
     }
 
@@ -143,11 +244,6 @@ impl WebRenderer {
             r.camera.reset();
         }
     }
-}
-
-#[allow(dead_code)]
-fn current_positions(_cam: &Camera) -> &'static [f32] {
-    &[]
 }
 
 #[wasm_bindgen(start)]

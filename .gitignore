@@ -17,3 +17,5 @@ crates/graph-renderer/assets/pkg/*
 .dolt/
 *.db
 .beads-credential-key
+crates/graph-renderer/assets/pkg/*.wasm
+crates/graph-renderer/assets/pkg/*.d.ts
