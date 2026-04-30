@@ -43,7 +43,9 @@ pub struct RendererConfig {
 struct CameraUniform {
     view_proj: [[f32; 4]; 4],
     cam_pos: [f32; 3],
-    _pad: f32,
+    _pad0: f32,
+    screen: [f32; 2],
+    _pad1: [f32; 2],
 }
 
 #[repr(C)]
@@ -68,13 +70,6 @@ impl Default for EffectsUniform {
     }
 }
 
-#[repr(C)]
-#[derive(Copy, Clone, Pod, Zeroable)]
-struct SphereVertex {
-    position: [f32; 3],
-    normal: [f32; 3],
-}
-
 pub struct Renderer {
     device: wgpu::Device,
     queue: wgpu::Queue,
@@ -84,10 +79,6 @@ pub struct Renderer {
 
     node_pipeline: wgpu::RenderPipeline,
     edge_pipeline: wgpu::RenderPipeline,
-
-    node_vertex_buffer: wgpu::Buffer,
-    node_index_buffer: wgpu::Buffer,
-    node_index_count: u32,
 
     /// Shared with the compute layout engine. Layout: vec3+pad per node.
     positions_storage: wgpu::Buffer,
@@ -180,7 +171,9 @@ impl Renderer {
         let cam_uniform = CameraUniform {
             view_proj: camera.view_proj(),
             cam_pos: camera.position.to_array(),
-            _pad: 0.0,
+            _pad0: 0.0,
+            screen: [surface_config.width as f32, surface_config.height as f32],
+            _pad1: [0.0, 0.0],
         };
         let camera_uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("camera uniform"),
@@ -192,20 +185,6 @@ impl Renderer {
             contents: bytemuck::bytes_of(&EffectsUniform::default()),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
-
-        // --- Sphere geometry ---
-        let (sphere_vertices, sphere_indices) = build_icosphere();
-        let node_vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("sphere vertices"),
-            contents: bytemuck::cast_slice(&sphere_vertices),
-            usage: wgpu::BufferUsages::VERTEX,
-        });
-        let node_index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("sphere indices"),
-            contents: bytemuck::cast_slice(&sphere_indices),
-            usage: wgpu::BufferUsages::INDEX,
-        });
-        let node_index_count = sphere_indices.len() as u32;
 
         // --- Storage buffers (shared with compute) ---
         let n_nodes = (graph.positions.len() / 3) as u32;
@@ -340,11 +319,7 @@ impl Renderer {
                 module: &node_shader,
                 entry_point: Some("vs_main"),
                 compilation_options: Default::default(),
-                buffers: &[wgpu::VertexBufferLayout {
-                    array_stride: std::mem::size_of::<SphereVertex>() as u64,
-                    step_mode: wgpu::VertexStepMode::Vertex,
-                    attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3],
-                }],
+                buffers: &[],
             },
             fragment: Some(wgpu::FragmentState {
                 module: &node_shader,
@@ -362,7 +337,7 @@ impl Renderer {
             },
             depth_stencil: Some(wgpu::DepthStencilState {
                 format: wgpu::TextureFormat::Depth32Float,
-                depth_write_enabled: true,
+                depth_write_enabled: false,
                 depth_compare: wgpu::CompareFunction::Less,
                 stencil: Default::default(),
                 bias: Default::default(),
@@ -415,9 +390,6 @@ impl Renderer {
             depth_view,
             node_pipeline,
             edge_pipeline,
-            node_vertex_buffer,
-            node_index_buffer,
-            node_index_count,
             positions_storage,
             colors_storage,
             sizes_storage,
@@ -554,7 +526,12 @@ impl Renderer {
         let cam_uniform = CameraUniform {
             view_proj: self.camera.view_proj(),
             cam_pos: self.camera.position.to_array(),
-            _pad: 0.0,
+            _pad0: 0.0,
+            screen: [
+                self.surface_config.width as f32,
+                self.surface_config.height as f32,
+            ],
+            _pad1: [0.0, 0.0],
         };
         self.queue.write_buffer(
             &self.camera_uniform_buffer,
@@ -618,9 +595,7 @@ impl Renderer {
             if self.n_nodes > 0 {
                 pass.set_pipeline(&self.node_pipeline);
                 pass.set_bind_group(0, &self.node_bind_group, &[]);
-                pass.set_vertex_buffer(0, self.node_vertex_buffer.slice(..));
-                pass.set_index_buffer(self.node_index_buffer.slice(..), wgpu::IndexFormat::Uint32);
-                pass.draw_indexed(0..self.node_index_count, 0, 0..self.n_nodes);
+                pass.draw(0..6, 0..self.n_nodes);
             }
         }
 
@@ -642,6 +617,11 @@ impl Renderer {
     pub fn raycast(&self, ndc_x: f32, ndc_y: f32) -> Option<u32> {
         let (origin, dir) = self.camera.raycast(ndc_x, ndc_y);
         let mut best: Option<(f32, u32)> = None;
+        // Convert pixel sizes to world-space radius at each node's depth.
+        // px_world = (2 * tan(fov/2) * dist_to_camera) / screen_h * px_size
+        let tan_half = (self.camera.fov_y * 0.5).tan();
+        let screen_h = self.surface_config.height.max(1) as f32;
+        let two_tan_over_h = 2.0 * tan_half / screen_h;
         for i in 0..self.n_nodes as usize {
             if i * 3 + 2 >= self.node_positions_cpu.len() {
                 break;
@@ -651,7 +631,9 @@ impl Renderer {
                 self.node_positions_cpu[i * 3 + 1],
                 self.node_positions_cpu[i * 3 + 2],
             );
-            let r = self.node_sizes_cpu.get(i).copied().unwrap_or(1.0);
+            let px = self.node_sizes_cpu.get(i).copied().unwrap_or(4.0);
+            let dist = (center - origin).length().max(1.0);
+            let r = (two_tan_over_h * dist * px).max(1.0);
             let oc = origin - center;
             let b = oc.dot(dir);
             let c = oc.dot(oc) - r * r;
@@ -732,30 +714,3 @@ fn bg_entry(binding: u32, buf: &wgpu::Buffer) -> wgpu::BindGroupEntry<'_> {
     }
 }
 
-/// 12-vertex / 20-tri icosahedron — small enough for instanced spheres
-/// without subdivision, big enough not to look like a triangle.
-fn build_icosphere() -> (Vec<SphereVertex>, Vec<u32>) {
-    let t = (1.0_f32 + 5.0_f32.sqrt()) * 0.5;
-    let raw: [[f32; 3]; 12] = [
-        [-1.0, t, 0.0], [1.0, t, 0.0], [-1.0, -t, 0.0], [1.0, -t, 0.0],
-        [0.0, -1.0, t], [0.0, 1.0, t], [0.0, -1.0, -t], [0.0, 1.0, -t],
-        [t, 0.0, -1.0], [t, 0.0, 1.0], [-t, 0.0, -1.0], [-t, 0.0, 1.0],
-    ];
-    let verts: Vec<SphereVertex> = raw
-        .iter()
-        .map(|p| {
-            let v = Vec3::from_array(*p).normalize();
-            SphereVertex {
-                position: v.to_array(),
-                normal: v.to_array(),
-            }
-        })
-        .collect();
-    let indices: Vec<u32> = vec![
-        0, 11, 5, 0, 5, 1, 0, 1, 7, 0, 7, 10, 0, 10, 11,
-        1, 5, 9, 5, 11, 4, 11, 10, 2, 10, 7, 6, 7, 1, 8,
-        3, 9, 4, 3, 4, 2, 3, 2, 6, 3, 6, 8, 3, 8, 9,
-        4, 9, 5, 2, 4, 11, 6, 2, 10, 8, 6, 7, 9, 8, 1,
-    ];
-    (verts, indices)
-}

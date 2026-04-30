@@ -15,7 +15,9 @@
 struct CameraUniform {
     view_proj: mat4x4<f32>,
     cam_pos:   vec3<f32>,
-    _pad:      f32,
+    _pad0:     f32,
+    screen:    vec2<f32>,
+    _pad1:     vec2<f32>,
 };
 struct EffectsUniform {
     focus_plane_z:        f32,

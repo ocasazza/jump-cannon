@@ -37,16 +37,16 @@ pub struct GpuForceOptions {
 impl Default for GpuForceOptions {
     fn default() -> Self {
         Self {
-            repulsion: 50.0,
-            spring_k: 0.05,
+            repulsion: 200.0,
+            spring_k: 0.08,
             spring_len: 30.0,
-            gravity: 0.001,
-            damping: 0.85,
-            dt: 0.016,
+            gravity: 0.005,
+            damping: 0.78,
+            dt: 0.04,
             cursor_pos: [0.0; 3],
             cursor_radius: 0.0,
             cursor_strength: 0.0,
-            steps_per_call: 1,
+            steps_per_call: 8,
         }
     }
 }

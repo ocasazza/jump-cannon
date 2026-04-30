@@ -143,15 +143,15 @@ let selectedIds = null;
 // Sim params mirrored on the JS side. We seed `cursor_*` from the slider
 // values but only push them via set_cursor_force when LMB/RMB are held.
 const baseLayout = {
-  repulsion: 50.0, spring_k: 0.05, spring_len: 30.0,
-  gravity: 0.001, damping: 0.85, dt: 0.016,
+  repulsion: 200, spring_k: 0.08, spring_len: 30,
+  gravity: 0.005, damping: 0.78, dt: 0.04,
   cursor_pos: [0, 0, 0], cursor_radius: 0, cursor_strength: 0,
-  steps_per_call: 4,
+  steps_per_call: 8,
 };
 const SIM_PRESETS = {
-  fast:     { ...baseLayout, repulsion: 30, spring_k: 0.04, damping: 0.80, steps_per_call: 6 },
+  fast:     { ...baseLayout, repulsion: 150, damping: 0.70, steps_per_call: 16 },
   balanced: { ...baseLayout },
-  pretty:   { ...baseLayout, repulsion: 80, spring_k: 0.06, damping: 0.95, steps_per_call: 2 },
+  pretty:   { ...baseLayout, repulsion: 300, damping: 0.92, dt: 0.025, steps_per_call: 4 },
 };
 
 // ---------- Accessors → Float32Array ----------
@@ -159,15 +159,15 @@ function computeSizes(boot) {
   const arr = boot.metrics[state.sizeBy];
   const { min, max } = boot.bounds[state.sizeBy] || { min: 0, max: 0 };
   const span = max - min, mul = state.sizeMul;
-  // Base scale grows with vault size so nodes are visible at default zoom.
-  // sqrt(n)/30 keeps a 100-node graph at base ~3 and a 10k graph at base ~3.3,
-  // but we floor it so small graphs still see something.
-  const base = Math.max(4.0, Math.sqrt(boot.nNodes) * 0.4);
+  // Pixel-space sizes — billboarded points, so values are interpreted as
+  // pixel radii by the vertex shader. Range with mul=1: ~4-8px; with mul=4:
+  // ~16-32px for the largest hubs.
+  const base = 4.0;
   const out = new Float32Array(boot.nNodes);
   for (let i = 0; i < boot.nNodes; i++) {
     if (!arr || span <= 0) { out[i] = base * mul; continue; }
     const t = Math.sqrt((arr[i] - min) / span);
-    out[i] = (base + t * base * 3) * mul;
+    out[i] = (base + t * base) * mul;
   }
   return out;
 }
@@ -244,18 +244,19 @@ function wireInput(boot) {
   window.addEventListener('keydown', (e) => {
     const tag = e.target && e.target.tagName;
     const inField = tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT';
+    // Always-on shortcuts (work even when typing in an input).
     if ((e.metaKey || e.ctrlKey) && (e.key === 'b' || e.key === 'B')) {
       e.preventDefault();
-      $container.classList.toggle('sidebar-collapsed');
-      requestAnimationFrame(syncCanvasSize);
+      document.getElementById('sidebar').classList.toggle('collapsed');
       return;
     }
-    if (inField) return;
     if (e.key === '?') { e.preventDefault(); $cheat.classList.toggle('hidden'); return; }
-    if (e.key === ' ') { e.preventDefault(); fitAll(boot); return; }
+    if (e.key === ' ' && !inField) { e.preventDefault(); fitAll(boot); return; }
     if (e.key === 'Escape') {
       showModal(null); selectedIds = null; refreshColors(boot); return;
     }
+    // WASD / QE / RF nav must be gated so typing in search doesn't move camera.
+    if (inField) return;
     keys[e.key.toLowerCase()] = true;
   });
   window.addEventListener('keyup', (e) => { keys[e.key.toLowerCase()] = false; });
@@ -385,6 +386,65 @@ function wireSidebar(boot) {
   cursor.depth = parseFloat($curD.value);
 }
 
+// ---------- Floating panel (drag + collapse + persist) ----------
+function wirePanel() {
+  const $panel = document.getElementById('sidebar');
+  const $handle = document.getElementById('panel-drag-handle');
+  const $collapse = document.getElementById('panel-collapse');
+  if (!$panel || !$handle) return;
+
+  const KEY = 'graph-renderer.panel-pos';
+  try {
+    const saved = JSON.parse(localStorage.getItem(KEY) || 'null');
+    if (saved && typeof saved.left === 'number' && typeof saved.top === 'number') {
+      $panel.style.left = `${saved.left}px`;
+      $panel.style.top  = `${saved.top}px`;
+    }
+    if (saved && saved.collapsed) $panel.classList.add('collapsed');
+  } catch (_) {}
+
+  let dragging = false, sx = 0, sy = 0, ox = 0, oy = 0;
+  $handle.addEventListener('pointerdown', (e) => {
+    if (e.target === $collapse) return;
+    dragging = true;
+    const r = $panel.getBoundingClientRect();
+    sx = e.clientX; sy = e.clientY; ox = r.left; oy = r.top;
+    $handle.setPointerCapture(e.pointerId);
+    e.preventDefault();
+  });
+  $handle.addEventListener('pointermove', (e) => {
+    if (!dragging) return;
+    const nx = Math.max(0, Math.min(window.innerWidth  - 40, ox + (e.clientX - sx)));
+    const ny = Math.max(0, Math.min(window.innerHeight - 40, oy + (e.clientY - sy)));
+    $panel.style.left = `${nx}px`;
+    $panel.style.top  = `${ny}px`;
+  });
+  $handle.addEventListener('pointerup', (e) => {
+    if (!dragging) return;
+    dragging = false;
+    try { $handle.releasePointerCapture(e.pointerId); } catch (_) {}
+    persist();
+  });
+
+  if ($collapse) {
+    $collapse.addEventListener('click', (e) => {
+      e.stopPropagation();
+      $panel.classList.toggle('collapsed');
+      persist();
+    });
+  }
+
+  function persist() {
+    const r = $panel.getBoundingClientRect();
+    try {
+      localStorage.setItem(KEY, JSON.stringify({
+        left: r.left | 0, top: r.top | 0,
+        collapsed: $panel.classList.contains('collapsed'),
+      }));
+    } catch (_) {}
+  }
+}
+
 // ---------- Search ----------
 function wireSearch(boot) {
   let regexMode = false;
@@ -502,6 +562,7 @@ async function main() {
     `${boot.init.numCommunities} communities`
   );
 
+  wirePanel();
   wireSidebar(boot);
   wireSearch(boot);
   wireInput(boot);

@@ -9,7 +9,12 @@
 </head>
 <body>
   <div id="container">
-    <aside id="sidebar">
+    <aside id="sidebar" class="floating">
+      <div class="panel-header">
+        <span class="panel-title" id="panel-drag-handle">vault graph</span>
+        <button class="panel-btn" id="panel-collapse" title="Collapse [Ctrl+B]">−</button>
+      </div>
+      <div class="panel-body">
       <div id="stats" class="section"></div>
 
       <div class="section">
@@ -83,6 +88,7 @@
         <label class="lbl" for="cursor-depth">Depth: <span id="cursor-depth-val">800</span></label>
         <input id="cursor-depth" class="slider" type="range" min="100" max="3000" step="10" value="800">
         <div class="lbl" style="opacity:0.7">LMB attract · RMB repel · scroll = depth</div>
+      </div>
       </div>
     </aside>
 
