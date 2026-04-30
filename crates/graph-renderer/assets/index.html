@@ -8,11 +8,68 @@
 </head>
 <body>
   <div id="container">
-    <canvas id="cosmos"></canvas>
-    <div id="hud">
-      <input id="search" type="search" placeholder="search…" autocomplete="off">
-      <div id="stats"></div>
+    <aside id="sidebar">
+      <div id="stats" class="section"></div>
+
+      <div class="section">
+        <label class="lbl">Search</label>
+        <div class="row">
+          <input id="search" class="input" type="search" placeholder="search…" autocomplete="off">
+          <button id="regex-toggle" class="btn small" title="Regex mode (client-side)">.*</button>
+        </div>
+        <label class="lbl">Include</label>
+        <input id="include" class="input" type="search" placeholder="must match…" autocomplete="off">
+        <label class="lbl">Exclude</label>
+        <input id="exclude" class="input" type="search" placeholder="exclude…" autocomplete="off">
+      </div>
+
+      <div class="section">
+        <label class="lbl" for="size-by">Size by</label>
+        <select id="size-by" class="input">
+          <option value="degree">degree</option>
+          <option value="indegree">indegree</option>
+          <option value="outdegree">outdegree</option>
+          <option value="pagerank">pagerank</option>
+          <option value="betweenness">betweenness</option>
+          <option value="kcore">kcore</option>
+        </select>
+        <label class="lbl" for="size-mul">Size mul: <span id="size-mul-val">1.00</span></label>
+        <input id="size-mul" class="slider" type="range" min="0.25" max="4" step="0.05" value="1">
+      </div>
+
+      <div class="section">
+        <label class="lbl" for="color-by">Color by</label>
+        <select id="color-by" class="input">
+          <option value="community">community</option>
+          <option value="wcc">wcc</option>
+          <option value="folder">folder</option>
+          <option value="indegree">indegree</option>
+          <option value="kcore">kcore</option>
+        </select>
+      </div>
+
+      <div class="section">
+        <label class="lbl">Simulation</label>
+        <div class="row btn-group">
+          <button class="btn sim-preset" data-preset="fast">Fast</button>
+          <button class="btn sim-preset active" data-preset="balanced">Balanced</button>
+          <button class="btn sim-preset" data-preset="pretty">Pretty</button>
+        </div>
+      </div>
+
+      <div class="section">
+        <label class="lbl">Camera</label>
+        <div class="row btn-group">
+          <button id="cam-fit" class="btn">Fit</button>
+          <button id="cam-reset" class="btn">Reset zoom</button>
+        </div>
+      </div>
+    </aside>
+
+    <div id="canvas-wrap">
+      <canvas id="cosmos"></canvas>
     </div>
+
     <div id="modal" class="hidden"></div>
   </div>
   <script type="module" src="/assets/main.js"></script>

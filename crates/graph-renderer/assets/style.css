@@ -1,4 +1,4 @@
-/* graph-renderer minimal layout */
+/* graph-renderer layout */
 html, body {
   margin: 0;
   padding: 0;
@@ -14,6 +14,32 @@ html, body {
   position: relative;
   width: 100vw;
   height: 100vh;
+  display: flex;
+  flex-direction: row;
+}
+
+#sidebar {
+  flex: 0 0 280px;
+  width: 280px;
+  height: 100vh;
+  background: #1a1a1f;
+  border-right: 1px solid #2a2a30;
+  overflow-y: auto;
+  padding: 12px 14px;
+  box-sizing: border-box;
+  z-index: 10;
+  transition: margin-left 0.18s ease;
+}
+
+#container.sidebar-collapsed #sidebar {
+  margin-left: -280px;
+}
+
+#canvas-wrap {
+  flex: 1 1 auto;
+  position: relative;
+  min-width: 0;
+  height: 100vh;
 }
 
 #cosmos {
@@ -22,30 +48,74 @@ html, body {
   height: 100%;
 }
 
-#hud {
-  position: absolute;
-  top: 12px;
-  left: 12px;
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-  z-index: 10;
+.section {
+  padding: 8px 0;
+  border-bottom: 1px solid #26262c;
+}
+.section:last-child { border-bottom: none; }
+
+.lbl {
+  display: block;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: #888;
+  margin: 6px 0 4px 0;
 }
 
-#hud input {
-  background: rgba(20, 20, 24, 0.9);
-  color: #e8e8ea;
-  border: 1px solid #333;
+.input {
+  background: #0f0f13;
+  color: #fff;
+  border: 1px solid #2e2e36;
+  border-radius: 4px;
+  padding: 6px 8px;
+  font-size: 12px;
+  width: 100%;
+  box-sizing: border-box;
+  outline: none;
+}
+.input:focus { border-color: #4361ee; }
+
+select.input {
+  appearance: none;
+  -webkit-appearance: none;
+  cursor: pointer;
+}
+
+.slider {
+  width: 100%;
+  margin: 4px 0;
+}
+
+.row {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+}
+.row > .input { flex: 1 1 auto; }
+
+.btn {
+  background: #23232b;
+  color: #ddd;
+  border: 1px solid #2e2e36;
   border-radius: 4px;
   padding: 6px 10px;
-  font-size: 13px;
-  min-width: 220px;
+  font-size: 12px;
+  cursor: pointer;
+  font-family: inherit;
 }
+.btn:hover { background: #2c2c36; color: #fff; }
+.btn.active { background: #4361ee; color: #fff; border-color: #4361ee; }
+.btn.small { padding: 6px 8px; min-width: 32px; }
+
+.btn-group { display: flex; gap: 6px; }
+.btn-group .btn { flex: 1 1 auto; }
 
 #stats {
   font-size: 11px;
-  color: #888;
+  color: #aaa;
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  line-height: 1.5;
 }
 
 #modal {
@@ -60,12 +130,10 @@ html, body {
   border-radius: 4px;
   padding: 12px 14px;
   font-size: 12px;
-  z-index: 10;
+  z-index: 20;
 }
 
-#modal.hidden {
-  display: none;
-}
+#modal.hidden { display: none; }
 
 #modal h2 {
   margin: 0 0 6px 0;
