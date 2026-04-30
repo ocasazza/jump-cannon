@@ -173,6 +173,116 @@ select.input {
 }
 #modal .kv span:nth-child(odd) { color: #888; }
 
+#modal .modal-header {
+  display: flex; align-items: flex-start; justify-content: space-between;
+  gap: 8px; margin-bottom: 6px;
+}
+#modal .modal-header h2 { margin: 0; flex: 1 1 auto; }
+#modal .modal-close {
+  background: #000; color: #fff; border: 1px solid #fff;
+  padding: 0 6px; font-size: 12px; cursor: pointer; line-height: 1.4;
+}
+#modal .modal-close:hover { background: #fff; color: #000; }
+#modal .modal-path {
+  font-family: ui-monospace, Menlo, monospace;
+  color: #888; word-break: break-all; margin-bottom: 6px; font-size: 10px;
+}
+#modal .modal-tags, #modal .field-row {
+  display: flex; flex-wrap: wrap; gap: 2px; margin: 4px 0;
+  align-items: center;
+}
+#modal .field-name-pill {
+  display: inline-block; color: #888; font-family: ui-monospace, Menlo, monospace;
+  font-size: 10px; padding: 1px 4px; margin-right: 4px;
+  text-transform: uppercase; letter-spacing: 0.04em;
+}
+#modal .modal-frontmatter {
+  display: grid; grid-template-columns: 80px 1fr; gap: 2px 8px;
+  font-family: ui-monospace, Menlo, monospace; margin: 4px 0 0;
+}
+#modal .modal-frontmatter dt { color: #888; }
+#modal .modal-frontmatter dd { margin: 0; word-break: break-word; }
+#modal .modal-metrics {
+  display: flex; flex-wrap: wrap; gap: 4px 12px;
+  border-top: 1px solid #444; padding-top: 6px; margin-top: 8px;
+  font-family: ui-monospace, Menlo, monospace;
+}
+#modal .modal-metrics .metric label {
+  color: #888; margin-right: 4px; text-transform: uppercase; font-size: 10px;
+}
+
+/* Badge family — B&W */
+.badge {
+  display: inline-block; background: #000; color: #fff;
+  border: 1px solid #fff; padding: 1px 6px; font-size: 11px;
+  margin: 1px 2px; cursor: pointer; line-height: 1.4;
+}
+.badge:hover { background: #fff; color: #000; }
+.badge.active { background: #fff; color: #000; }
+.wikilink {
+  display: inline-block; background: #000; color: #fff;
+  border: 1px dashed #fff; padding: 1px 6px; font-size: 11px;
+  margin: 1px 2px; cursor: pointer; line-height: 1.4;
+}
+.wikilink:hover { background: #fff; color: #000; }
+.wikilink.unresolved { color: #888; border-color: #555; }
+.wikilink.unresolved:hover { background: #555; color: #fff; }
+.url {
+  display: inline-block; background: #000; color: #fff;
+  border: 1px solid #fff; padding: 1px 6px; font-size: 11px;
+  margin: 1px 2px; text-decoration: none; line-height: 1.4;
+}
+.url:hover { background: #fff; color: #000; }
+.status {
+  display: inline-block; background: #000; color: #fff;
+  border: 1px solid #fff; padding: 1px 6px; font-size: 11px;
+  margin: 1px 2px; cursor: pointer; font-weight: 600; line-height: 1.4;
+}
+.status:hover { background: #fff; color: #000; }
+.status.s-active { background: #fff; color: #000; }
+.status.s-draft { color: #888; }
+.status.s-archived { opacity: 0.6; }
+.status.s-done { background: #fff; color: #000; }
+.status.s-failed { background: #fff; color: #000; border: 1px dashed #fff; }
+.status.active-filter { background: #fff; color: #000; }
+.tag {
+  display: inline-block; background: #000; color: #fff;
+  border: 1px solid #fff; padding: 1px 6px; font-size: 10px;
+  margin: 1px 2px; cursor: pointer;
+  font-family: ui-monospace, Menlo, monospace; line-height: 1.4;
+}
+.tag:hover { background: #fff; color: #000; }
+.tag.active { background: #fff; color: #000; }
+.date {
+  display: inline-block; background: #000; color: #fff;
+  border: 1px solid #fff; padding: 1px 6px; font-size: 11px;
+  margin: 1px 2px; cursor: pointer;
+  font-family: ui-monospace, Menlo, monospace; line-height: 1.4;
+}
+.date:hover { background: #fff; color: #000; }
+.date.active { background: #fff; color: #000; }
+
+/* Filter chip strip (top-center) */
+#filter-chips {
+  position: absolute; top: 16px; left: 50%; transform: translateX(-50%);
+  display: flex; gap: 6px; flex-wrap: wrap;
+  max-width: 60vw; z-index: 22;
+}
+#filter-chips.hidden { display: none; }
+.fchip {
+  background: #000; border: 1px solid #fff; padding: 2px 6px 2px 8px;
+  font-size: 11px; display: flex; align-items: center; gap: 4px;
+  font-family: ui-monospace, Menlo, monospace;
+}
+.fchip .fchip-field { color: #888; }
+.fchip .fchip-x { cursor: pointer; padding: 0 2px; }
+.fchip .fchip-x:hover { background: #fff; color: #000; }
+.fchip-clear {
+  background: #fff; color: #000; border: 1px solid #fff;
+  padding: 2px 6px; font-size: 11px; cursor: pointer; font-family: inherit;
+}
+.fchip-clear:hover { background: #000; color: #fff; }
+
 /* --- Cheatsheet --- */
 #cheatsheet {
   position: absolute;

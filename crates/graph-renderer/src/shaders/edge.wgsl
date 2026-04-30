@@ -6,6 +6,9 @@
 // Draw call: `draw(0..(2 * n_edges), 0..1)`. Each pair of vertices forms
 // one line; vertex N indexes edge N/2 and picks endpoint N&1.
 //
+// DoF: line primitives have fixed pixel width, so we fake "blur" by
+// fading alpha as a function of the average-endpoint CoC.
+//
 // Layout:
 //   group(0) binding(0)  uniform CameraUniform
 //   group(0) binding(1)  uniform EffectsUniform
@@ -23,7 +26,9 @@ struct EffectsUniform {
     focus_plane_z:        f32,
     focus_thickness:      f32,
     cursor_radius_visual: f32,
-    _pad:                 f32,
+    blur_strength:        f32,
+    max_coc:              f32,
+    _pad:                 vec3<f32>,
 };
 
 @group(0) @binding(0) var<uniform> camera:  CameraUniform;
@@ -34,7 +39,8 @@ struct EffectsUniform {
 struct VertexOutput {
     @builtin(position) clip_pos:   vec4<f32>,
     @location(0)       world_z:    f32,
-    @location(1)       edge_len:   f32,  // world-space length of this edge
+    @location(1)       edge_len:   f32,
+    @location(2)       coc:        f32,
 };
 
 @vertex
@@ -45,31 +51,34 @@ fn vs_main(@builtin(vertex_index) vid: u32) -> VertexOutput {
     let node_idx = select(edge.x, edge.y, endpoint == 1u);
     let p = positions[node_idx];
 
-    // Length is the same for both endpoints — pass to fragment for
-    // length-based alpha falloff (long edges = transparent, avoid grey-mass).
     let p_src = positions[edge.x];
     let p_tgt = positions[edge.y];
     let edge_len = length(p_tgt - p_src);
+
+    // Average-midpoint CoC for the whole edge — both endpoints share it
+    // so the line's alpha is uniform along its length.
+    let z_mid = 0.5 * (p_src.z + p_tgt.z);
+    let dz = abs(z_mid - effects.focus_plane_z);
+    let half_t = max(effects.focus_thickness * 0.5, 0.001);
+    let blur_z = max(dz - half_t, 0.0);
+    let coc = min(blur_z * effects.blur_strength, effects.max_coc);
 
     var out: VertexOutput;
     out.clip_pos = camera.view_proj * vec4<f32>(p, 1.0);
     out.world_z  = p.z;
     out.edge_len = edge_len;
+    out.coc      = coc;
     return out;
 }
 
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
-    // Focus-plane attenuation
-    let dist_z = abs(in.world_z - effects.focus_plane_z);
-    let half_t = max(effects.focus_thickness * 0.5, 1.0);
-    let in_focus = 1.0 - smoothstep(half_t, half_t * 2.0, dist_z);
-
     // Length-based alpha: short edges full alpha, long edges fade.
-    // Reference length ≈ 50 world units; falls off gradually.
     let len_factor = 1.0 / (1.0 + in.edge_len / 30.0);
     let base_alpha = mix(0.05, 0.35, len_factor);
 
-    let alpha = base_alpha * mix(0.10, 1.0, in_focus);
-    return vec4<f32>(0.55, 0.62, 0.78, alpha);
+    // CoC fade — out-of-focus edges drop to ~5% alpha at max blur.
+    let focus_atten = 1.0 / (1.0 + in.coc * 0.05);
+
+    return vec4<f32>(0.55, 0.62, 0.78, base_alpha * focus_atten);
 }

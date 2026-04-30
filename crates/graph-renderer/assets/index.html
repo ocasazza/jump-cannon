@@ -77,6 +77,10 @@
         <input id="focus-z" class="slider" type="range" min="-1000" max="1000" step="10" value="0">
         <label class="lbl" for="focus-thickness">Thickness: <span id="focus-thickness-val">2000</span></label>
         <input id="focus-thickness" class="slider" type="range" min="50" max="3000" step="50" value="2000">
+        <label class="lbl" for="focus-blur">Blur strength: <span id="focus-blur-val">0.05</span></label>
+        <input id="focus-blur" class="slider" type="range" min="0" max="0.5" step="0.005" value="0.05">
+        <label class="lbl" for="focus-max-coc">Max CoC: <span id="focus-max-coc-val">60</span></label>
+        <input id="focus-max-coc" class="slider" type="range" min="10" max="200" step="5" value="60">
       </div>
 
       <div class="section">
@@ -96,6 +100,7 @@
       <canvas id="cosmos"></canvas>
     </div>
 
+    <div id="filter-chips" class="hidden"></div>
     <div id="modal" class="hidden"></div>
     <div id="cheatsheet">
       <div class="ch-row"><kbd>WASD</kbd><span>pan</span></div>
@@ -103,6 +108,7 @@
       <div class="ch-row"><kbd>RF</kbd><span>forward / back</span></div>
       <div class="ch-row"><kbd>drag</kbd><span>rotate</span></div>
       <div class="ch-row"><kbd>scroll</kbd><span>zoom</span></div>
+      <div class="ch-row"><kbd>F</kbd>+<kbd>scroll</kbd><span>focus plane</span></div>
       <div class="ch-row"><kbd>Space</kbd><span>fit all</span></div>
       <div class="ch-row"><kbd>Esc</kbd><span>close / clear</span></div>
       <div class="ch-row"><kbd>?</kbd><span>toggle help</span></div>

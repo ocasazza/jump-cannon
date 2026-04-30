@@ -36,6 +36,10 @@ const $focusZ    = document.getElementById('focus-z');
 const $focusZV   = document.getElementById('focus-z-val');
 const $focusT    = document.getElementById('focus-thickness');
 const $focusTV   = document.getElementById('focus-thickness-val');
+const $focusBlur  = document.getElementById('focus-blur');
+const $focusBlurV = document.getElementById('focus-blur-val');
+const $focusMaxCoc  = document.getElementById('focus-max-coc');
+const $focusMaxCocV = document.getElementById('focus-max-coc-val');
 const $curR      = document.getElementById('cursor-radius');
 const $curRV     = document.getElementById('cursor-radius-val');
 const $curS      = document.getElementById('cursor-strength');
@@ -328,6 +332,19 @@ function wireInput(boot) {
   });
   $canvas.addEventListener('wheel', (e) => {
     e.preventDefault();
+    if (keys['f']) {
+      // Microscope focus knob: F + scroll moves the focal plane in world Z.
+      const z = parseFloat($focusZ.value);
+      const min = parseFloat($focusZ.min), max = parseFloat($focusZ.max);
+      const dz = (e.deltaY > 0 ? -1 : 1) * 20;
+      const nz = Math.max(min, Math.min(max, z + dz));
+      $focusZ.value = nz;
+      $focusZV.textContent = nz | 0;
+      state.focus_z = nz;
+      const t = parseFloat($focusT.value);
+      renderer.set_focus_plane(nz, t);
+      return;
+    }
     if (cursor.enabled || e.shiftKey) {
       // Wheel adjusts cursor depth when force tool is active or shift held.
       cursor.depth = Math.max(50, cursor.depth + (e.deltaY > 0 ? -40 : 40));
@@ -393,11 +410,21 @@ function wireSidebar(boot) {
   function applyFocus() {
     const z = parseFloat($focusZ.value), t = parseFloat($focusT.value);
     $focusZV.textContent = z | 0; $focusTV.textContent = t | 0;
+    state.focus_z = z; state.focus_thickness = t;
     renderer.set_focus_plane(z, t);
+  }
+  function applyDof() {
+    const b = parseFloat($focusBlur.value), m = parseFloat($focusMaxCoc.value);
+    $focusBlurV.textContent = b.toFixed(3);
+    $focusMaxCocV.textContent = m | 0;
+    if (renderer.set_dof_params) renderer.set_dof_params(b, m);
   }
   $focusZ.addEventListener('input', applyFocus);
   $focusT.addEventListener('input', applyFocus);
+  $focusBlur.addEventListener('input', applyDof);
+  $focusMaxCoc.addEventListener('input', applyDof);
   applyFocus();
+  applyDof();
 
   $curR.addEventListener('input', () => { cursor.radius = parseFloat($curR.value); $curRV.textContent = cursor.radius|0; });
   $curS.addEventListener('input', () => { cursor.strength = parseFloat($curS.value); $curSV.textContent = cursor.strength|0; });

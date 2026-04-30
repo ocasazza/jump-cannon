@@ -165,6 +165,14 @@ impl WebRenderer {
         }
     }
 
+    /// DoF tuning: CoC pixels per world-unit-out-of-focus and the hard
+    /// cap on the bokeh disc.
+    pub fn set_dof_params(&mut self, blur_strength: f32, max_coc: f32) {
+        if let Some(r) = &mut self.inner {
+            r.set_dof_params(blur_strength, max_coc);
+        }
+    }
+
     /// 6DoF cursor force. Pass radius=0 to disable. Strength sign
     /// convention: positive = repel, negative = attract.
     pub fn set_cursor_force(&mut self, x: f32, y: f32, z: f32, radius: f32, strength: f32) {

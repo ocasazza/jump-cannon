@@ -54,7 +54,11 @@ struct EffectsUniform {
     focus_plane_z: f32,
     focus_thickness: f32,
     cursor_radius_visual: f32,
-    _pad: f32,
+    /// Pixels of CoC per world-unit outside the focus band.
+    blur_strength: f32,
+    /// Hard cap on CoC pixel size so far nodes don't become room-sized.
+    max_coc: f32,
+    _pad: [f32; 3],
 }
 
 impl Default for EffectsUniform {
@@ -65,7 +69,9 @@ impl Default for EffectsUniform {
             // until the user moves the slider.
             focus_thickness: 1.0e9,
             cursor_radius_visual: 0.0,
-            _pad: 0.0,
+            blur_strength: 0.05,
+            max_coc: 60.0,
+            _pad: [0.0; 3],
         }
     }
 }
@@ -94,6 +100,9 @@ pub struct Renderer {
 
     camera_uniform_buffer: wgpu::Buffer,
     effects_uniform_buffer: wgpu::Buffer,
+    /// CPU mirror so partial setters (focus plane only / dof params only)
+    /// don't clobber the unrelated fields.
+    effects: EffectsUniform,
     /// Per-pipeline bind groups (each pipeline has its own bgl since the
     /// node pipeline binds the geometry storage and the edge pipeline
     /// additionally binds the edges array).
@@ -398,6 +407,7 @@ impl Renderer {
             n_edges,
             camera_uniform_buffer,
             effects_uniform_buffer,
+            effects: EffectsUniform::default(),
             node_bind_group,
             edge_bind_group,
             node_positions_cpu: graph.positions,
@@ -450,14 +460,25 @@ impl Renderer {
     }
 
     pub fn set_focus_plane(&mut self, z: f32, thickness: f32) {
-        let eff = EffectsUniform {
-            focus_plane_z: z,
-            focus_thickness: thickness.max(1.0),
-            cursor_radius_visual: 0.0,
-            _pad: 0.0,
-        };
-        self.queue
-            .write_buffer(&self.effects_uniform_buffer, 0, bytemuck::bytes_of(&eff));
+        self.effects.focus_plane_z = z;
+        self.effects.focus_thickness = thickness.max(1.0);
+        self.queue.write_buffer(
+            &self.effects_uniform_buffer,
+            0,
+            bytemuck::bytes_of(&self.effects),
+        );
+    }
+
+    /// CoC growth rate (pixels per world-unit out of focus) and the hard
+    /// cap on bokeh disc size. Defaults: 0.05 / 60 px.
+    pub fn set_dof_params(&mut self, blur_strength: f32, max_coc: f32) {
+        self.effects.blur_strength = blur_strength.max(0.0);
+        self.effects.max_coc = max_coc.max(0.0);
+        self.queue.write_buffer(
+            &self.effects_uniform_buffer,
+            0,
+            bytemuck::bytes_of(&self.effects),
+        );
     }
 
     pub fn cam_fit_bounds(&mut self, min: Vec3, max: Vec3) {
