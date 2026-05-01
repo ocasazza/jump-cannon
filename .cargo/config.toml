@@ -1,0 +1,10 @@
+# Workspace cargo config.
+#
+# wasm32 reference-types: rustc 1.82+ enables reference-types by default for
+# wasm32-unknown-unknown, but the wasm-bindgen-cli that Trunk fetches
+# (currently 0.2.120) trips on the resulting .wasm with:
+#   error: failed to find intrinsics to enable `clone_ref` function
+# (see wasm-bindgen issues #4211 / #4654). Disabling the feature for the
+# wasm target avoids the bug. Re-evaluate when the cli catches up.
+[target.wasm32-unknown-unknown]
+rustflags = ["-C", "target-feature=+reference-types"]

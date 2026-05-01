@@ -23,7 +23,7 @@ const VAULT      = process.env.VAULT_ROOT || '/tmp/test-vault';
 const PORT       = Number(process.env.TEST_PORT || 47895);
 const URL        = `http://127.0.0.1:${PORT}/`;
 const OUT        = resolve('out');
-const ASSETS_DIR = resolve(REPO_ROOT, 'crates/graph-renderer/assets');
+const ASSETS_DIR = resolve(REPO_ROOT, 'crates/graph-renderer/assets/dist');
 const BIN        = resolve(REPO_ROOT, 'target/release/graph-api');
 
 mkdirSync(OUT, { recursive: true });
@@ -101,12 +101,15 @@ try {
 
   await page.goto(URL, { waitUntil: 'load', timeout: 30_000 });
 
-  // Wait up to 15s for the renderer's init log. If it doesn't show, we
+  // Wait up to 15s for the eframe canvas to mount. If it doesn't show, we
   // continue anyway and let the pixel + error checks decide pass/fail.
   const readyDeadline = Date.now() + 15_000;
   let ready = false;
   while (Date.now() < readyDeadline) {
-    if (consoleLines.some((l) => l.includes('[graph-renderer] live force sim active'))) {
+    const hasCanvas = await page
+      .evaluate(() => !!document.getElementById('graph-canvas'))
+      .catch(() => false);
+    if (hasCanvas) {
       ready = true;
       break;
     }
@@ -119,7 +122,7 @@ try {
   await page.screenshot({ path: `${OUT}/screenshot.png`, fullPage: false });
 
   const canvasInfo = await page.evaluate(() => {
-    const c = document.getElementById('cosmos');
+    const c = document.getElementById('graph-canvas');
     if (!c) return { error: 'no canvas' };
     return { width: c.width, height: c.height, gpu: !!navigator.gpu };
   });

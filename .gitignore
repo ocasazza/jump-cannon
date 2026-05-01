@@ -9,13 +9,11 @@ dist
 /target
 **/target/
 
-# wasm-pack output for graph-renderer — rebuilt locally via `just wasm`.
-crates/graph-renderer/assets/pkg/*
-!crates/graph-renderer/assets/pkg/.gitkeep
+# Trunk-built WASM frontend output for graph-renderer.
+# Rebuilt locally via `just wasm` (or `trunk build`).
+crates/graph-renderer/assets/dist/
 
 # Beads / Dolt files (added by bd init)
 .dolt/
 *.db
 .beads-credential-key
-crates/graph-renderer/assets/pkg/*.wasm
-crates/graph-renderer/assets/pkg/*.d.ts

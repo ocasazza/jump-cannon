@@ -1,62 +1,53 @@
 [package]
-name = "graph-renderer"
+name    = "graph-renderer"
 version = "0.1.0"
 edition = "2021"
-description = "Rust + wgpu renderer for the vault graph viewer (native + WASM)."
+description = "Rust + eframe + wgpu frontend for the vault graph viewer (native + WASM via trunk)."
 
 [lib]
-name = "graph_renderer"
+name       = "graph_renderer"
 crate-type = ["cdylib", "rlib"]
-path = "src/lib.rs"
+path       = "src/lib.rs"
 
 [[bin]]
-name = "graph-renderer-native"
-path = "src/native.rs"
-required-features = ["native"]
+name = "graph-renderer"
+path = "src/main.rs"
 
 [features]
 default = []
-native = ["dep:winit", "dep:pollster", "dep:env_logger"]
-wasm = [
-  "dep:wasm-bindgen",
+wasm    = [
   "dep:console_error_panic_hook",
   "dep:console_log",
-  "dep:web-sys",
+  "dep:wasm-bindgen",
   "dep:wasm-bindgen-futures",
-  "dep:js-sys",
+  "dep:web-sys",
 ]
 
 [dependencies]
-wgpu = { version = "23", default-features = false, features = ["webgpu", "webgl", "wgsl"] }
-bytemuck = { version = "1", features = ["derive"] }
-glam = { version = "0.29", features = ["bytemuck"] }
-log = "0.4"
+eframe   = { version = "0.30", default-features = false, features = ["default_fonts", "wgpu", "wayland", "x11"] }
+egui     = "0.30"
+log      = "0.4"
 include_dir = "0.7"
-graph-layouts = { path = "../graph-layouts" }
-serde_json = "1"
 
-# Native-only
-winit = { version = "0.30", optional = true }
-pollster = { version = "0.4", optional = true }
-env_logger = { version = "0.11", optional = true }
-
-# WASM-only
-wasm-bindgen = { version = "0.2", optional = true }
-wasm-bindgen-futures = { version = "0.4", optional = true }
-js-sys = { version = "0.3", optional = true }
 console_error_panic_hook = { version = "0.1", optional = true }
-console_log = { version = "1", optional = true }
+console_log              = { version = "1",  optional = true }
 
-[dependencies.web-sys]
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+env_logger = "0.11"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen         = { version = "0.2", optional = true }
+wasm-bindgen-futures = { version = "0.4", optional = true }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies.web-sys]
 version = "0.3"
 optional = true
 features = [
+  "console",
   "Document",
   "Window",
   "Element",
   "HtmlCanvasElement",
-  "Performance",
-  "KeyboardEvent",
-  "PointerEvent",
-  "WheelEvent",
+  "CssStyleDeclaration",
+  "HtmlElement",
 ]

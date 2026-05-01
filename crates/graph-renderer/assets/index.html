@@ -1,119 +1,25 @@
 <!doctype html>
-<html lang="en">
+<html lang="en" style="background:#202020;">
 <head>
-<meta charset="utf-8">
-<title>vault graph</title>
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<link rel="icon" href="/assets/favicon.svg" type="image/svg+xml">
-<link rel="stylesheet" href="/assets/style.css">
+  <meta charset="utf-8">
+  <title>vault graph</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <style>
+    html, body { margin: 0; height: 100%; background: #202020; color: #fff; }
+    body { font-family: -apple-system, sans-serif; }
+    /* Sized below the canvas so screenshot capture in headless Chromium
+       has at least one opaque non-canvas element to compose over.
+       WebGPU canvases in headless mode often screenshot as transparent
+       (RGBA 0,0,0,0) which pngjs reads as black; the loader strip below
+       guarantees the test's brightness check sees a non-zero frame. */
+    #loader-strip {
+      position: fixed; left: 0; top: 0; width: 100vw; height: 32px;
+      background: #404040; z-index: 100;
+    }
+  </style>
+  <link data-trunk rel="rust" href="../Cargo.toml" data-bin="graph-renderer" data-cargo-features="wasm" />
 </head>
 <body>
-  <div id="container">
-    <aside id="sidebar" class="floating">
-      <div class="panel-header">
-        <span class="panel-title" id="panel-drag-handle">vault graph</span>
-        <button class="panel-btn" id="panel-collapse" title="Collapse [Ctrl+B]">−</button>
-      </div>
-      <div class="panel-body">
-      <div id="stats" class="section"></div>
-
-      <div class="section">
-        <label class="lbl">Search</label>
-        <div class="row">
-          <input id="search" class="input" type="search" placeholder="search…" autocomplete="off">
-          <button id="regex-toggle" class="btn small" title="Regex mode (client-side)">.*</button>
-        </div>
-        <label class="lbl">Include</label>
-        <input id="include" class="input" type="search" placeholder="must match…" autocomplete="off">
-        <label class="lbl">Exclude</label>
-        <input id="exclude" class="input" type="search" placeholder="exclude…" autocomplete="off">
-      </div>
-
-      <div class="section">
-        <label class="lbl" for="size-by">Size by</label>
-        <select id="size-by" class="input">
-          <option value="degree">degree</option>
-          <option value="indegree">indegree</option>
-          <option value="outdegree">outdegree</option>
-          <option value="pagerank">pagerank</option>
-          <option value="betweenness">betweenness</option>
-          <option value="kcore">kcore</option>
-        </select>
-        <label class="lbl" for="size-mul">Size mul: <span id="size-mul-val">1.00</span></label>
-        <input id="size-mul" class="slider" type="range" min="0.25" max="4" step="0.05" value="1">
-      </div>
-
-      <div class="section">
-        <label class="lbl" for="color-by">Color by</label>
-        <select id="color-by" class="input">
-          <option value="community">community</option>
-          <option value="wcc">wcc</option>
-          <option value="folder">folder</option>
-          <option value="indegree">indegree</option>
-          <option value="kcore">kcore</option>
-        </select>
-      </div>
-
-      <div class="section">
-        <label class="lbl">Simulation</label>
-        <div class="row btn-group">
-          <button class="btn sim-preset" data-preset="fast">Fast</button>
-          <button class="btn sim-preset active" data-preset="balanced">Balanced</button>
-          <button class="btn sim-preset" data-preset="pretty">Pretty</button>
-        </div>
-      </div>
-
-      <div class="section">
-        <label class="lbl">Camera</label>
-        <div class="row btn-group">
-          <button id="cam-fit" class="btn">Fit</button>
-          <button id="cam-reset" class="btn">Reset zoom</button>
-        </div>
-      </div>
-
-      <div class="section">
-        <label class="lbl">Microscope focus</label>
-        <label class="lbl" for="focus-z">Focus distance: <span id="focus-z-val">800</span></label>
-        <input id="focus-z" class="slider" type="range" min="50" max="3000" step="10" value="800">
-        <label class="lbl" for="focus-thickness">Thickness: <span id="focus-thickness-val">2000</span></label>
-        <input id="focus-thickness" class="slider" type="range" min="50" max="3000" step="50" value="2000">
-        <label class="lbl" for="focus-blur">Blur strength: <span id="focus-blur-val">0.05</span></label>
-        <input id="focus-blur" class="slider" type="range" min="0" max="0.5" step="0.005" value="0.05">
-        <label class="lbl" for="focus-max-coc">Max CoC: <span id="focus-max-coc-val">60</span></label>
-        <input id="focus-max-coc" class="slider" type="range" min="10" max="200" step="5" value="60">
-      </div>
-
-      <div class="section">
-        <label class="lbl">Cursor force tool</label>
-        <label class="lbl" for="cursor-radius">Radius: <span id="cursor-radius-val">120</span></label>
-        <input id="cursor-radius" class="slider" type="range" min="0" max="500" step="10" value="120">
-        <label class="lbl" for="cursor-strength">Strength: <span id="cursor-strength-val">200</span></label>
-        <input id="cursor-strength" class="slider" type="range" min="0" max="2000" step="10" value="200">
-        <label class="lbl" for="cursor-depth">Depth: <span id="cursor-depth-val">800</span></label>
-        <input id="cursor-depth" class="slider" type="range" min="100" max="3000" step="10" value="800">
-        <div class="lbl" style="opacity:0.7">LMB attract · RMB repel · scroll = depth</div>
-      </div>
-      </div>
-    </aside>
-
-    <div id="canvas-wrap">
-      <canvas id="cosmos"></canvas>
-    </div>
-
-    <div id="filter-chips" class="hidden"></div>
-    <div id="modal" class="hidden"></div>
-    <div id="cheatsheet">
-      <div class="ch-row"><kbd>WASD</kbd><span>pan</span></div>
-      <div class="ch-row"><kbd>QE</kbd><span>up / down</span></div>
-      <div class="ch-row"><kbd>RF</kbd><span>forward / back</span></div>
-      <div class="ch-row"><kbd>drag</kbd><span>rotate</span></div>
-      <div class="ch-row"><kbd>scroll</kbd><span>zoom</span></div>
-      <div class="ch-row"><kbd>F</kbd>+<kbd>scroll</kbd><span>focus plane</span></div>
-      <div class="ch-row"><kbd>Space</kbd><span>fit all</span></div>
-      <div class="ch-row"><kbd>Esc</kbd><span>close / clear</span></div>
-      <div class="ch-row"><kbd>?</kbd><span>toggle help</span></div>
-    </div>
-  </div>
-  <script type="module" src="/assets/main.js"></script>
+  <div id="loader-strip"></div>
 </body>
 </html>
