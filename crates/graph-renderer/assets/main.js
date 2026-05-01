@@ -707,12 +707,29 @@ function makeWikilinkChip(target, alias) {
   span.title = resolved ? `Open ${target}` : `(unresolved) ${target}`;
   return span;
 }
+// `ITHELP-31820`, `JIRA-1234`, `RFC-42`, etc. — capture the ticket-ID
+// prefix so a value like "ITHELP-31820: Some Title" navigates to the
+// vault note titled "ITHELP-31820" rather than the full prose string.
+const _ticketIdRe = /^([A-Z][A-Z0-9]{1,15}-\d+)/;
+
 function renderWikilinkChips(_field, value) {
   const out = [];
   const handle = (s) => {
     if (typeof s !== 'string') return;
-    if (_wikilinkRe.test(s)) for (const w of _parseWikilinks(s)) out.push(makeWikilinkChip(w.target, w.alias));
-    else if (s.trim()) out.push(makeWikilinkChip(s.trim(), null));
+    if (_wikilinkRe.test(s)) {
+      for (const w of _parseWikilinks(s)) out.push(makeWikilinkChip(w.target, w.alias));
+      return;
+    }
+    const trimmed = s.trim();
+    if (!trimmed) return;
+    // Ticket-ID pattern: `ABC-123: rest of text` → target = "ABC-123",
+    // alias = full string. Click navigates via existing wikilink path.
+    const m = trimmed.match(_ticketIdRe);
+    if (m) {
+      out.push(makeWikilinkChip(m[1], trimmed));
+    } else {
+      out.push(makeWikilinkChip(trimmed, null));
+    }
   };
   if (Array.isArray(value)) for (const v of value) handle(v);
   else handle(value);
