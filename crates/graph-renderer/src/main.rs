@@ -3,9 +3,51 @@
 // `#[wasm_bindgen(start)]` annotations in the imported library trigger
 // after the wasm module is initialized.
 //
-// Phase B re-integrates the existing wgpu Renderer (still on disk in
-// src/renderer.rs) via an egui_wgpu callback; for now this just opens an
-// eframe window with a placeholder UI.
+// Phase B+C wires the wgpu graph layer into eframe via egui_wgpu callbacks
+// (see `graph_pipelines` + `graph_callback`). The compute side
+// (graph-layouts::GpuForceLayout) needs `max_storage_buffers_per_shader_stage`
+// >= 9, which is above the WebGPU downlevel default of 8 — we override
+// eframe's wgpu_options device_descriptor below to request the bump.
+
+use std::sync::Arc;
+
+/// Build a `wgpu::DeviceDescriptor` that bumps the storage-buffer limit
+/// to the value the GpuForceLayout compute shader needs (9). Falls back
+/// to the adapter's max if it's lower than what we request.
+fn device_descriptor_factory(
+) -> Arc<dyn Fn(&wgpu::Adapter) -> wgpu::DeviceDescriptor<'static> + Send + Sync> {
+    Arc::new(|adapter: &wgpu::Adapter| {
+        let adapter_limits = adapter.limits();
+        // Mirror the original standalone Renderer's limit derivation:
+        // downlevel_defaults (which supports compute) raised by the adapter,
+        // with max_storage_buffers_per_shader_stage bumped to 10 so the
+        // compute shader's 9-buffer binding doesn't trip validation.
+        let mut limits =
+            wgpu::Limits::downlevel_defaults().using_resolution(adapter_limits.clone());
+        limits.max_storage_buffers_per_shader_stage = limits
+            .max_storage_buffers_per_shader_stage
+            .max(10)
+            .min(adapter_limits.max_storage_buffers_per_shader_stage);
+
+        wgpu::DeviceDescriptor {
+            label: Some("graph-renderer device (raised limits)"),
+            required_features: wgpu::Features::empty(),
+            required_limits: limits,
+            memory_hints: wgpu::MemoryHints::default(),
+        }
+    })
+}
+
+fn wgpu_options() -> egui_wgpu::WgpuConfiguration {
+    egui_wgpu::WgpuConfiguration {
+        wgpu_setup: egui_wgpu::WgpuSetup::CreateNew {
+            supported_backends: wgpu::Backends::PRIMARY | wgpu::Backends::BROWSER_WEBGPU,
+            power_preference: wgpu::PowerPreference::HighPerformance,
+            device_descriptor: device_descriptor_factory(),
+        },
+        ..Default::default()
+    }
+}
 
 #[cfg(not(target_arch = "wasm32"))]
 fn main() -> eframe::Result<()> {
@@ -13,6 +55,7 @@ fn main() -> eframe::Result<()> {
     let opts = eframe::NativeOptions {
         renderer: eframe::Renderer::Wgpu,
         viewport: eframe::egui::ViewportBuilder::default().with_title("vault graph"),
+        wgpu_options: wgpu_options(),
         ..Default::default()
     };
     eframe::run_native(
@@ -53,10 +96,14 @@ fn main() {
 
         log::info!("[graph-renderer] eframe WebRunner starting");
 
+        let web_options = eframe::WebOptions {
+            wgpu_options: wgpu_options(),
+            ..Default::default()
+        };
         eframe::WebRunner::new()
             .start(
                 canvas,
-                eframe::WebOptions::default(),
+                web_options,
                 Box::new(|cc| Ok(Box::new(graph_renderer::App::new(cc)))),
             )
             .await

@@ -21,23 +21,36 @@ wasm    = [
   "dep:wasm-bindgen",
   "dep:wasm-bindgen-futures",
   "dep:web-sys",
+  "dep:gloo-net",
 ]
 
 [dependencies]
 eframe   = { version = "0.30", default-features = false, features = ["default_fonts", "wgpu", "wayland", "x11"] }
 egui     = "0.30"
+egui-wgpu = "0.30"
 log      = "0.4"
 include_dir = "0.7"
+wgpu     = { version = "23", default-features = false, features = ["webgpu", "webgl", "wgsl"] }
+bytemuck = { version = "1", features = ["derive"] }
+glam     = "0.29"
+graph-layouts = { path = "../graph-layouts" }
+prost    = "0.13"
+serde    = { version = "1", features = ["derive"] }
+serde_json = "1"
 
 console_error_panic_hook = { version = "0.1", optional = true }
 console_log              = { version = "1",  optional = true }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 env_logger = "0.11"
+reqwest    = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+tokio      = { version = "1", features = ["rt", "rt-multi-thread", "macros"] }
+pollster   = "0.4"
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 wasm-bindgen         = { version = "0.2", optional = true }
 wasm-bindgen-futures = { version = "0.4", optional = true }
+gloo-net             = { version = "0.6", features = ["http"], optional = true }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies.web-sys]
 version = "0.3"
@@ -46,8 +59,12 @@ features = [
   "console",
   "Document",
   "Window",
+  "Location",
   "Element",
   "HtmlCanvasElement",
   "CssStyleDeclaration",
   "HtmlElement",
 ]
+
+[build-dependencies]
+prost-build = "0.13"
