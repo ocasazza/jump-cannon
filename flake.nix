@@ -195,7 +195,21 @@
 
             # Dev workflow
             just
+
+            # Headless browser test (`just test-browser`).
+            # nodejs runs the Playwright script; playwright-driver.browsers
+            # provides a Chromium that's already wired up for both Linux and
+            # macOS — no `npx playwright install` needed at runtime. The
+            # PLAYWRIGHT_BROWSERS_PATH env var below points playwright at it.
+            nodejs_22
+            playwright-driver.browsers
           ] ++ bevyLibs;
+
+          # Point Playwright at the nix-provided browser bundle and skip its
+          # post-install download step (which fails in the pure devshell).
+          PLAYWRIGHT_BROWSERS_PATH = "${pkgs.playwright-driver.browsers}";
+          PLAYWRIGHT_SKIP_VALIDATE_HOST_REQUIREMENTS = "true";
+          PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD = "true";
 
           # Linux: make Bevy's dynamic libs findable at runtime
           LD_LIBRARY_PATH = pkgs.lib.optionalString pkgs.stdenv.isLinux

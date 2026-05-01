@@ -81,3 +81,27 @@ kill:
 # Nuke the WASM bundle to force a full rebuild on next `just dev`.
 clean-wasm:
     rm -rf crates/graph-renderer/assets/pkg/graph_renderer*
+
+# Headless browser test. Spins up graph-api against a tiny test vault, opens
+# it in Chromium with WebGPU enabled, screenshots the canvas, asserts it
+# isn't all-black + no console errors. Output:
+# tests/browser/out/screenshot.png and a JSON result on stdout.
+# Exit 0 = ok, 1 = canvas dark / page error / startup timeout.
+test-browser: wasm
+    @# Build graph-api binary if missing
+    cargo build --release -p graph-api
+    @# Tiny synthetic vault with three cross-linked notes
+    @mkdir -p /tmp/test-vault
+    @if [ ! -f /tmp/test-vault/Alpha.md ]; then \
+        printf 'See [[Beta]] and [[Gamma]].\n' > /tmp/test-vault/Alpha.md; \
+        printf '[[Alpha]]\n' > /tmp/test-vault/Beta.md; \
+        printf '[[Alpha]] [[Beta]]\n' > /tmp/test-vault/Gamma.md; \
+    fi
+    @# One-time playwright install. PLAYWRIGHT_BROWSERS_PATH (set in the
+    @# nix devshell) points at the nix-provided Chromium bundle, so the
+    @# install is just the npm package — no browser download.
+    @if [ ! -d tests/browser/node_modules ]; then \
+        echo "→ installing playwright npm package (one-time)…"; \
+        cd tests/browser && npm install --silent --no-audit --no-fund; \
+    fi
+    cd tests/browser && node run.mjs
