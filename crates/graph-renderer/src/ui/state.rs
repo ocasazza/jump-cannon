@@ -139,36 +139,44 @@ pub enum LayoutPreset {
 }
 
 impl LayoutPreset {
-    /// Apply the canonical slider values for this preset. Used by the
-    /// preset buttons so the user sees the sliders update on click.
+    /// Apply the canonical slider values for this preset. Tuned for
+    /// convergence on 10k-node vaults — the system bleeds kinetic energy
+    /// via cooling_alpha until damping bottoms out at cooling_floor, so
+    /// the layout reaches a steady state instead of orbiting forever.
     pub fn apply_to(self, l: &mut LayoutState) {
         match self {
             LayoutPreset::Fast => {
-                l.repulsion = 200.0;
+                l.repulsion = 150.0;
                 l.spring_k = 0.10;
+                l.spring_len = 25.0;
+                l.gravity = 0.005;
+                l.damping = 0.72;
+                l.dt = 0.045;
+                l.steps_per_call = 12.0;
+                l.cooling_alpha = 0.995;
+                l.cooling_floor = 0.50;
+            }
+            LayoutPreset::Balanced => {
+                l.repulsion = 200.0;
+                l.spring_k = 0.08;
                 l.spring_len = 30.0;
                 l.gravity = 0.005;
                 l.damping = 0.78;
                 l.dt = 0.04;
                 l.steps_per_call = 8.0;
-            }
-            LayoutPreset::Balanced => {
-                l.repulsion = 800.0;
-                l.spring_k = 0.05;
-                l.spring_len = 60.0;
-                l.gravity = 0.02;
-                l.damping = 0.85;
-                l.dt = 0.016;
-                l.steps_per_call = 4.0;
+                l.cooling_alpha = 0.998;
+                l.cooling_floor = 0.55;
             }
             LayoutPreset::Pretty => {
-                l.repulsion = 2000.0;
-                l.spring_k = 0.03;
-                l.spring_len = 120.0;
-                l.gravity = 0.04;
+                l.repulsion = 300.0;
+                l.spring_k = 0.06;
+                l.spring_len = 40.0;
+                l.gravity = 0.008;
                 l.damping = 0.92;
-                l.dt = 0.012;
-                l.steps_per_call = 2.0;
+                l.dt = 0.025;
+                l.steps_per_call = 4.0;
+                l.cooling_alpha = 0.999;
+                l.cooling_floor = 0.65;
             }
         }
         l.preset = self;
@@ -185,19 +193,34 @@ pub struct LayoutState {
     pub damping: f32,
     pub dt: f32,
     pub steps_per_call: f32,
+    /// Multiplied into damping per `step_with_encoder` call, until damping
+    /// floors at `cooling_floor`. Drives the sim toward a steady state
+    /// instead of perpetual orbiting.
+    #[serde(default = "default_cooling_alpha")]
+    pub cooling_alpha: f32,
+    #[serde(default = "default_cooling_floor")]
+    pub cooling_floor: f32,
 }
+
+fn default_cooling_alpha() -> f32 { 0.998 }
+fn default_cooling_floor() -> f32 { 0.55 }
 
 impl Default for LayoutState {
     fn default() -> Self {
+        // Tuned for 10k-node convergence: lower repulsion, stronger damping,
+        // higher steps_per_call, plus cooling. Without these the sim just
+        // orbits forever — kinetic energy never dissipates.
         Self {
             preset: LayoutPreset::default(),
-            repulsion: 800.0,
-            spring_k: 0.05,
-            spring_len: 60.0,
-            gravity: 0.02,
-            damping: 0.85,
-            dt: 0.016,
-            steps_per_call: 4.0,
+            repulsion: 200.0,
+            spring_k: 0.08,
+            spring_len: 30.0,
+            gravity: 0.005,
+            damping: 0.78,
+            dt: 0.04,
+            steps_per_call: 8.0,
+            cooling_alpha: 0.998,
+            cooling_floor: 0.55,
         }
     }
 }

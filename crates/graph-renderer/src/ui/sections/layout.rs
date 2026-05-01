@@ -35,6 +35,10 @@ pub fn show(ui: &mut egui::Ui, state: &mut AppState) {
     ui.add(egui::Slider::new(&mut l.spring_len, 1.0..=400.0).text("spring_len"));
     ui.add(egui::Slider::new(&mut l.gravity, 0.0..=1.0).text("gravity"));
     ui.add(egui::Slider::new(&mut l.damping, 0.0..=1.0).text("damping"));
-    ui.add(egui::Slider::new(&mut l.dt, 0.001..=0.05).text("dt"));
+    ui.add(egui::Slider::new(&mut l.dt, 0.001..=0.1).text("dt"));
     ui.add(egui::Slider::new(&mut l.steps_per_call, 1.0..=32.0).text("steps/call"));
+    ui.add_space(6.0);
+    ui.label("Cooling — drives sim toward steady state");
+    ui.add(egui::Slider::new(&mut l.cooling_alpha, 0.9..=1.0).text("cooling α"));
+    ui.add(egui::Slider::new(&mut l.cooling_floor, 0.0..=1.0).text("cooling floor"));
 }

@@ -527,7 +527,7 @@ impl App {
 
     fn layout_key(&self) -> u64 {
         let l = &self.state.layout;
-        // Bit-pack the seven floats into a hash.
+        // Bit-pack the slider floats into a hash.
         let bits = [
             l.repulsion.to_bits(),
             l.spring_k.to_bits(),
@@ -536,6 +536,8 @@ impl App {
             l.damping.to_bits(),
             l.dt.to_bits(),
             l.steps_per_call.to_bits(),
+            l.cooling_alpha.to_bits(),
+            l.cooling_floor.to_bits(),
         ];
         let mut h: u64 = 0xcbf2_9ce4_8422_2325;
         for b in bits {
@@ -566,7 +568,12 @@ impl App {
             opts.damping = l.damping;
             opts.dt = l.dt;
             opts.steps_per_call = l.steps_per_call.max(1.0) as u32;
-            // Default repulsion radius scales with spring_len if user didn't pin it.
+            // Cooling: damping decays toward floor each call so kinetic
+            // energy bleeds off and the layout reaches steady state.
+            opts.cooling_alpha = l.cooling_alpha;
+            opts.cooling_floor = l.cooling_floor;
+            // Repulsion radius scales with spring_len so the spatial-hash
+            // grid bounds per-pair work to a 27-cell neighborhood.
             opts.repulsion_radius = (4.0 * l.spring_len).max(1.0);
             pipes.update_layout_options(opts);
         }
