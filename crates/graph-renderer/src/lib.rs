@@ -6,6 +6,7 @@
 //! since trunk drives the wasm build via `--bin graph-renderer`.
 
 mod app;
+pub mod ui;
 pub use app::App;
 
 // The static asset bundle is still embedded so graph-api can serve

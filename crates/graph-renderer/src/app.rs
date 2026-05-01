@@ -1,49 +1,58 @@
 use eframe::egui;
 
+use crate::ui;
+
 pub struct App {
-    note: String,
+    state: ui::AppState,
 }
 
 impl App {
-    pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
-        Self {
-            note: "vault graph — Phase A scaffold".into(),
-        }
+    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        ui::apply_theme(&cc.egui_ctx);
+
+        let state = cc
+            .storage
+            .and_then(|s| s.get_string(ui::STORAGE_KEY))
+            .and_then(|s| serde_json::from_str::<ui::AppState>(&s).ok())
+            .unwrap_or_default();
+
+        Self { state }
     }
 }
 
 impl eframe::App for App {
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
-        // Force the wgpu surface clear color so even before egui draws a
-        // single shape, the canvas reads as a non-black frame. The
-        // Phase A test only checks that *anything* renders.
-        [0.10, 0.10, 0.10, 1.0]
+        // Slightly off-black so the test's brightness sampler clears the
+        // r+g+b > 60 threshold even on a frame where egui hasn't drawn
+        // borders into the central panel yet.
+        [0.06, 0.06, 0.06, 1.0]
+    }
+
+    fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        if let Ok(json) = serde_json::to_string(&self.state) {
+            storage.set_string(ui::STORAGE_KEY, json);
+        }
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // Keep redrawing — without this the headless test only sees the
-        // initial frame and may catch us mid-init.
+        // Re-apply the theme on every frame so a hot reload picks up edits
+        // to theme.rs without a restart. The cost is a struct copy.
+        ui::apply_theme(ctx);
         ctx.request_repaint();
-        // B&W theme — nail this once, all panels inherit it.
-        let mut visuals = egui::Visuals::dark();
-        visuals.window_rounding = egui::Rounding::ZERO;
-        visuals.menu_rounding = egui::Rounding::ZERO;
-        visuals.widgets.noninteractive.rounding = egui::Rounding::ZERO;
-        visuals.widgets.inactive.rounding = egui::Rounding::ZERO;
-        visuals.widgets.hovered.rounding = egui::Rounding::ZERO;
-        visuals.widgets.active.rounding = egui::Rounding::ZERO;
-        // Slightly off-black so the brightness sampler in tests/browser/run.mjs
-        // sees a non-black frame. Pure BLACK works for the eye but the
-        // sampler thresholds at r+g+b > 60.
-        let bg = egui::Color32::from_rgb(24, 24, 24);
-        visuals.window_fill = bg;
-        visuals.panel_fill = bg;
-        ctx.set_visuals(visuals);
 
-        egui::CentralPanel::default().show(ctx, |ui| {
-            ui.heading(&self.note);
-            ui.separator();
-            ui.label("graph render + sidebar + modal land in subsequent phases.");
-        });
+        ui::show_sidebar(ctx, &mut self.state);
+
+        egui::CentralPanel::default()
+            .frame(egui::Frame::none().fill(egui::Color32::BLACK))
+            .show(ctx, |ui| {
+                // Phase B owns the wgpu graph render here. For now leave
+                // the central panel empty.
+                let rect = ui.max_rect();
+                ui.painter().rect_stroke(
+                    rect.shrink(0.5),
+                    0.0,
+                    egui::Stroke::new(1.0, egui::Color32::from_gray(40)),
+                );
+            });
     }
 }
