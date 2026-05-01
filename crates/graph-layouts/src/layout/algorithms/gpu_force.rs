@@ -476,23 +476,21 @@ impl GpuForceLayout {
             );
         }
 
-        // Schedule an async energy readback for THIS frame's results. We
-        // only kick off a new copy when the previous one has been drained
-        // (state == Idle). If the GPU+CPU pipelines are running ahead of
-        // the readback we'll just skip a frame's worth of measurements;
-        // the halt detector tolerates that — its streak only counts
-        // observed-low samples.
-        let readback_idle = state
-            .energy_readback
-            .lock()
-            .map(|g| matches!(*g, EnergyReadback::Idle))
-            .unwrap_or(false);
-        if readback_idle {
-            state.schedule_energy_copy(encoder);
-            // map_async itself is queued by wgpu; the actual callback won't
-            // fire until the encoder is submitted by the caller and the GPU
-            // finishes the copy. That's fine — we drain on the next frame.
-            state.issue_energy_map();
+        // Schedule an async energy readback ONLY if energy_threshold > 0
+        // (i.e. the user actually wants the auto-halt feature). When it's
+        // disabled, skip the copy_buffer_to_buffer + map_async entirely —
+        // those generate per-frame "Buffer used while mapped" warnings on
+        // WASM where map_async fires synchronously and re-entrancy bites.
+        if self.options.energy_threshold > 0.0 {
+            let readback_idle = state
+                .energy_readback
+                .lock()
+                .map(|g| matches!(*g, EnergyReadback::Idle))
+                .unwrap_or(false);
+            if readback_idle {
+                state.schedule_energy_copy(encoder);
+                state.issue_energy_map();
+            }
         }
     }
 

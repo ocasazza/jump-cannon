@@ -167,7 +167,10 @@ const baseLayout = {
   repulsion_radius: 120,
   cooling_alpha: 0.998,
   cooling_floor: 0.5,
-  energy_threshold: 0.05,
+  // Energy-halt readback is disabled by default — the WASM map_async
+  // pattern re-enters itself and panics ("Buffer is already mapped").
+  // TODO: rework readback to use a deferred poll-only path before re-enabling.
+  energy_threshold: 0.0,
   grid_enabled: true,
 };
 const SIM_PRESETS = {

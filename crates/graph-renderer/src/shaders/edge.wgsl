@@ -22,13 +22,17 @@ struct CameraUniform {
     screen:    vec2<f32>,
     _pad1:     vec2<f32>,
 };
+// 3 scalar f32 pads (NOT vec3<f32> — that forces 16-byte struct alignment
+// and inflates size to 48 bytes; Rust EffectsUniform is 32 bytes).
 struct EffectsUniform {
     focus_plane_z:        f32,
     focus_thickness:      f32,
     cursor_radius_visual: f32,
     blur_strength:        f32,
     max_coc:              f32,
-    _pad:                 vec3<f32>,
+    _pad0:                f32,
+    _pad1:                f32,
+    _pad2:                f32,
 };
 
 @group(0) @binding(0) var<uniform> camera:  CameraUniform;
