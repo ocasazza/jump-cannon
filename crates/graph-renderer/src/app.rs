@@ -5,7 +5,12 @@ use crate::data::{self, Bootstrap, LoadState, SharedLoad};
 use crate::fetch::ApiClient;
 use crate::graph_callback::GraphCallback;
 use crate::graph_pipelines::{GraphData, GraphPipelines};
+use crate::proto;
 use crate::ui;
+
+/// Result of an async `/node/:id` fetch — Some(Ok) success, Some(Err) error,
+/// None means no fetch has completed since the last poll.
+type NodeFetchSlot = Arc<Mutex<Option<Result<proto::NodeMeta, String>>>>;
 
 pub struct App {
     state: ui::AppState,
@@ -15,6 +20,15 @@ pub struct App {
     loaded_into_gpu: bool,
     /// Set once we emit the readiness console-log line (used by the test harness).
     logged_ready: bool,
+    /// Phase E: ephemeral modal state. Not persisted — open-state is per-session.
+    modal: ui::ModalState,
+    /// Async slot the fetch task writes the NodeMeta into.
+    node_fetch: NodeFetchSlot,
+    /// Cached idx -> string id table (from Bootstrap.ids), used to resolve
+    /// raycast hits to node ids. Populated when bootstrap promotes to GPU.
+    ids: Vec<String>,
+    /// Base URL for `/node/:id` follow-up fetches.
+    base_url: String,
 }
 
 impl App {
@@ -49,14 +63,62 @@ impl App {
 
         // Phase C: kick off async bootstrap fetch.
         let load: SharedLoad = Arc::new(Mutex::new(LoadState::Pending));
-        kick_off_bootstrap(load.clone(), default_base_url());
+        let base_url = default_base_url();
+        kick_off_bootstrap(load.clone(), base_url.clone());
 
         Self {
             state,
             load,
             loaded_into_gpu: false,
             logged_ready: false,
+            modal: ui::ModalState::default(),
+            node_fetch: Arc::new(Mutex::new(None)),
+            ids: Vec::new(),
+            base_url,
         }
+    }
+
+    /// Spawn an async `/node/:id` fetch. The result lands in `self.node_fetch`
+    /// and gets drained into the modal on the next frame's `update`.
+    fn kick_off_node_fetch(&self, id: String) {
+        let slot = self.node_fetch.clone();
+        let client = ApiClient::new(self.base_url.clone());
+        spawn_async(async move {
+            let result = client.node(&id).await;
+            *slot.lock().unwrap() = Some(result);
+        });
+    }
+
+    /// Drain a completed `/node/:id` fetch into the modal state, if any.
+    fn drain_node_fetch(&mut self) {
+        let result_opt = self.node_fetch.lock().unwrap().take();
+        let Some(result) = result_opt else { return };
+        match result {
+            Ok(meta) => {
+                log::info!("[graph-renderer] modal: fetched node {}", meta.id);
+                self.modal.fetch_error = None;
+                self.modal.current = Some(meta);
+                self.modal.open = true;
+            }
+            Err(e) => {
+                log::warn!("[graph-renderer] modal: fetch error: {e}");
+                self.modal.fetch_error = Some(e);
+                self.modal.open = true;
+            }
+        }
+    }
+
+    /// Look up the string id for a node index from the cached bootstrap ids.
+    fn id_for_idx(&self, idx: u32) -> Option<String> {
+        self.ids.get(idx as usize).cloned()
+    }
+
+    /// Run a raycast against GraphPipelines and return the hit node index.
+    fn raycast_idx(&self, frame: &eframe::Frame, ndc_x: f32, ndc_y: f32) -> Option<u32> {
+        let wgpu_state = frame.wgpu_render_state()?;
+        let renderer = wgpu_state.renderer.read();
+        let pipes = renderer.callback_resources.get::<GraphPipelines>()?;
+        pipes.raycast(ndc_x, ndc_y)
     }
 
     fn try_promote_bootstrap_to_gpu(&mut self, frame: &mut eframe::Frame) {
@@ -80,6 +142,10 @@ impl App {
         let Some(bootstrap) = bootstrap_opt else {
             return;
         };
+
+        // Cache the idx -> id table for click-to-modal resolution before we
+        // consume the rest of the bootstrap into GPU buffers.
+        self.ids = bootstrap.ids.clone();
 
         let n_nodes = bootstrap.positions.len() / 3;
         let graph = GraphData {
@@ -160,22 +226,65 @@ impl eframe::App for App {
         self.try_promote_bootstrap_to_gpu(frame);
         self.emit_ready_log(frame);
 
+        // Drain any completed /node/:id fetch into the modal.
+        self.drain_node_fetch();
+
         // Phase D sidebar (activity bar + section panel) on the left.
         ui::show_sidebar(ctx, &mut self.state);
 
         // Phase B central panel — wgpu graph layer via egui_wgpu callback.
         // Frame is transparent so the wgpu output isn't covered.
+        let mut click: Option<(egui::Rect, egui::Pos2)> = None;
         egui::CentralPanel::default()
             .frame(egui::Frame::none().fill(egui::Color32::TRANSPARENT))
             .show(ctx, |ui| {
                 let avail = ui.available_size();
-                let (rect, _resp) = ui.allocate_exact_size(avail, egui::Sense::drag());
+                let (rect, resp) =
+                    ui.allocate_exact_size(avail, egui::Sense::click_and_drag());
                 let cb = GraphCallback {
                     screen_px: [rect.width().max(1.0), rect.height().max(1.0)],
                 };
                 ui.painter()
                     .add(egui_wgpu::Callback::new_paint_callback(rect, cb));
+
+                if resp.clicked() {
+                    if let Some(pos) = resp.interact_pointer_pos() {
+                        click = Some((rect, pos));
+                    }
+                }
             });
+
+        // Esc closes the modal.
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.modal.open = false;
+            self.modal.current = None;
+            self.modal.fetch_error = None;
+        }
+
+        if let Some((rect, pos)) = click {
+            let ndc_x = (pos.x - rect.left()) / rect.width().max(1.0) * 2.0 - 1.0;
+            let ndc_y = -((pos.y - rect.top()) / rect.height().max(1.0) * 2.0 - 1.0);
+            if let Some(idx) = self.raycast_idx(frame, ndc_x, ndc_y) {
+                if let Some(id) = self.id_for_idx(idx) {
+                    log::info!(
+                        "[graph-renderer] click hit node idx={} id={}",
+                        idx,
+                        id
+                    );
+                    self.kick_off_node_fetch(id);
+                }
+            }
+        }
+
+        // Draw the modal — last so it stacks above the central panel.
+        let action = ui::show_modal(ctx, &mut self.modal);
+        if let Some(target) = action.navigate_to {
+            self.kick_off_node_fetch(target);
+        }
+        if let Some((field, value)) = action.toggle_filter {
+            // Phase F's query model integrates the actual filter; for now log.
+            log::info!("[modal] toggle_filter({field}={value})");
+        }
     }
 }
 
