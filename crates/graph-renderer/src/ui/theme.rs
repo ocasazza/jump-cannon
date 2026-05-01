@@ -55,8 +55,39 @@ pub fn apply(ctx: &egui::Context) {
     v.selection.bg_fill = accent::BLUE;
     v.selection.stroke = egui::Stroke::new(1.0, egui::Color32::WHITE);
 
+    // Square slider handles — matches the no-rounding aesthetic.
+    v.slider_trailing_fill = false;
+    v.handle_shape = egui::style::HandleShape::Rect { aspect_ratio: 0.5 };
+
+    // Typography hierarchy.
+    // Section headers: 11px proportional (heading style).
+    // Body / slider labels: 11px monospace (body style).
+    // Small / hint text falls back to egui's default small size.
+    use egui::{FontFamily, FontId, TextStyle};
+    style.text_styles.insert(
+        TextStyle::Heading,
+        FontId::new(11.0, FontFamily::Proportional),
+    );
+    style.text_styles.insert(
+        TextStyle::Body,
+        FontId::new(11.0, FontFamily::Proportional),
+    );
+    style.text_styles.insert(
+        TextStyle::Monospace,
+        FontId::new(11.0, FontFamily::Monospace),
+    );
+    style.text_styles.insert(
+        TextStyle::Button,
+        FontId::new(11.0, FontFamily::Proportional),
+    );
+    style.text_styles.insert(
+        TextStyle::Small,
+        FontId::new(10.0, FontFamily::Proportional),
+    );
+
+    // Tighter vertical rhythm: 4px between items (slider-to-slider).
     style.spacing.button_padding = egui::vec2(8.0, 4.0);
-    style.spacing.item_spacing = egui::vec2(6.0, 6.0);
+    style.spacing.item_spacing = egui::vec2(6.0, 4.0);
     style.spacing.window_margin = egui::Margin::same(0.0);
 
     ctx.set_style(style);

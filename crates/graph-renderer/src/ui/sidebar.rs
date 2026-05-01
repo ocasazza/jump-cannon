@@ -9,7 +9,7 @@ use super::sections;
 use super::state::{AppState, Section};
 
 const ACTIVITY_W: f32 = 44.0;
-const ACTIVITY_BTN: f32 = 44.0;
+const ACTIVITY_BTN: f32 = 40.0;
 const SECTION_W: f32 = 280.0;
 
 pub fn show(ctx: &egui::Context, state: &mut AppState) {
@@ -38,7 +38,10 @@ fn show_activity_bar(ctx: &egui::Context, state: &mut AppState) {
                 egui::Stroke::new(1.0, egui::Color32::WHITE),
             );
 
-            ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
+            ui.spacing_mut().item_spacing = egui::vec2(0.0, 2.0);
+
+            // 2px top padding before first button.
+            ui.add_space(2.0);
 
             for &section in Section::ALL {
                 let active = state.active_section == Some(section);
@@ -79,9 +82,10 @@ fn activity_button(ui: &mut egui::Ui, section: Section, active: bool) -> egui::R
 }
 
 fn draw_icon(painter: &egui::Painter, rect: egui::Rect, section: Section, color: egui::Color32) {
+    // Icons are drawn in an 18×18 cell centered in the button rect.
     let center = rect.center();
     let s = egui::Stroke::new(1.5, color);
-    let r = 8.0;
+    let r = 9.0; // half of 18px icon size
     match section {
         // Magnifier: circle + handle.
         Section::Filter => {
@@ -175,7 +179,12 @@ fn show_section_panel(ctx: &egui::Context, state: &mut AppState, active: Section
             egui::Frame::none()
                 .fill(egui::Color32::BLACK)
                 .stroke(egui::Stroke::new(1.0, egui::Color32::WHITE))
-                .inner_margin(egui::Margin::symmetric(12.0, 8.0)),
+                .inner_margin(egui::Margin {
+                    left: 16.0,
+                    right: 16.0,
+                    top: 14.0,
+                    bottom: 14.0,
+                }),
         )
         .show(ctx, |ui| {
             egui::ScrollArea::vertical().show(ui, |ui| {
