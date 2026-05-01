@@ -5,6 +5,16 @@ use crate::ui::theme::accent;
 
 pub fn show(ui: &mut egui::Ui, state: &mut AppState) {
     ui.horizontal(|ui| {
+        ui.heading("CAMERA");
+        let avail = ui.available_size_before_wrap();
+        ui.add_space(avail.x - 58.0);
+        if ui.small_button("↺ Reset").clicked() {
+            state.camera = Default::default();
+        }
+    });
+    ui.add_space(4.0);
+
+    ui.horizontal(|ui| {
         let _ = ui.button("Fit");
         let _ = ui.button("Reset");
     });

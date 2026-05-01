@@ -4,6 +4,18 @@ use crate::ui::state::{AppState, LayoutPreset};
 use crate::ui::theme::accent;
 
 pub fn show(ui: &mut egui::Ui, state: &mut AppState) {
+    ui.horizontal(|ui| {
+        ui.heading("LAYOUT");
+        let avail = ui.available_size_before_wrap();
+        ui.add_space(avail.x - 58.0);
+        if ui.small_button("↺ Reset").clicked() {
+            let preset = state.layout.preset;
+            state.layout = Default::default();
+            preset.apply_to(&mut state.layout);
+        }
+    });
+    ui.add_space(4.0);
+
     ui.label("Preset");
     ui.horizontal(|ui| {
         for (preset, label) in [

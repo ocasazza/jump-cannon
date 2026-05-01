@@ -48,4 +48,15 @@ pub fn show(ui: &mut egui::Ui, state: &mut AppState) {
     for l in lines {
         ui.label(egui::RichText::new(l).monospace().size(11.0));
     }
+
+    ui.add_space(20.0);
+    ui.separator();
+    ui.label(egui::RichText::new("Danger zone").color(accent::RED).small());
+    ui.horizontal(|ui| {
+        if ui.button(
+            egui::RichText::new("Reset everything").color(accent::RED)
+        ).clicked() {
+            *state = AppState::default();
+        }
+    });
 }

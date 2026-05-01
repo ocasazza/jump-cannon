@@ -13,7 +13,14 @@ use crate::ui::state::AppState;
 use crate::ui::theme::accent;
 
 pub fn show(ui: &mut egui::Ui, state: &mut AppState) {
-    ui.heading("FILTER");
+    ui.horizontal(|ui| {
+        ui.heading("FILTER");
+        let avail = ui.available_size_before_wrap();
+        ui.add_space(avail.x - 58.0);
+        if ui.small_button("↺ Reset").clicked() {
+            state.query = Default::default();
+        }
+    });
     ui.add_space(4.0);
 
     let mut delete_at: Option<usize> = None;
