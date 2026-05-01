@@ -1608,6 +1608,7 @@ dependencies = [
  "csv",
  "getrandom 0.2.17",
  "js-sys",
+ "log",
  "pollster",
  "rand 0.8.6",
  "serde",

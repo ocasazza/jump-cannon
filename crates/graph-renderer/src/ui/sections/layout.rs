@@ -41,4 +41,10 @@ pub fn show(ui: &mut egui::Ui, state: &mut AppState) {
     ui.label("Cooling — drives sim toward steady state");
     ui.add(egui::Slider::new(&mut l.cooling_alpha, 0.9..=1.0).text("cooling α"));
     ui.add(egui::Slider::new(&mut l.cooling_floor, 0.0..=1.0).text("cooling floor"));
+    ui.add_space(6.0);
+    ui.label("Auto-halt — stop dispatching when truly settled");
+    ui.add(
+        egui::Slider::new(&mut l.energy_threshold, 0.0..=1.0)
+            .text("energy halt threshold"),
+    );
 }

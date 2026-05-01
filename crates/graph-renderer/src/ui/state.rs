@@ -155,6 +155,7 @@ impl LayoutPreset {
                 l.steps_per_call = 12.0;
                 l.cooling_alpha = 0.995;
                 l.cooling_floor = 0.50;
+                l.energy_threshold = 0.05;
             }
             LayoutPreset::Balanced => {
                 l.repulsion = 200.0;
@@ -166,6 +167,7 @@ impl LayoutPreset {
                 l.steps_per_call = 8.0;
                 l.cooling_alpha = 0.998;
                 l.cooling_floor = 0.55;
+                l.energy_threshold = 0.05;
             }
             LayoutPreset::Pretty => {
                 l.repulsion = 300.0;
@@ -177,6 +179,7 @@ impl LayoutPreset {
                 l.steps_per_call = 4.0;
                 l.cooling_alpha = 0.999;
                 l.cooling_floor = 0.65;
+                l.energy_threshold = 0.05;
             }
         }
         l.preset = self;
@@ -200,10 +203,17 @@ pub struct LayoutState {
     pub cooling_alpha: f32,
     #[serde(default = "default_cooling_floor")]
     pub cooling_floor: f32,
+    /// Auto-halt threshold on max per-node kinetic energy. 0.0 disables
+    /// auto-halt entirely (the sim runs forever); ~0.05 is a good
+    /// "settled" value for the default tuning. Drives `is_halted()` and
+    /// the Stats panel running/settled indicator.
+    #[serde(default = "default_energy_threshold")]
+    pub energy_threshold: f32,
 }
 
 fn default_cooling_alpha() -> f32 { 0.998 }
 fn default_cooling_floor() -> f32 { 0.55 }
+fn default_energy_threshold() -> f32 { 0.05 }
 
 impl Default for LayoutState {
     fn default() -> Self {
@@ -221,6 +231,7 @@ impl Default for LayoutState {
             steps_per_call: 8.0,
             cooling_alpha: 0.998,
             cooling_floor: 0.55,
+            energy_threshold: 0.05,
         }
     }
 }

@@ -538,6 +538,7 @@ impl App {
             l.steps_per_call.to_bits(),
             l.cooling_alpha.to_bits(),
             l.cooling_floor.to_bits(),
+            l.energy_threshold.to_bits(),
         ];
         let mut h: u64 = 0xcbf2_9ce4_8422_2325;
         for b in bits {
@@ -572,6 +573,7 @@ impl App {
             // energy bleeds off and the layout reaches steady state.
             opts.cooling_alpha = l.cooling_alpha;
             opts.cooling_floor = l.cooling_floor;
+            opts.energy_threshold = l.energy_threshold;
             // Repulsion radius scales with spring_len so the spatial-hash
             // grid bounds per-pair work to a 27-cell neighborhood.
             opts.repulsion_radius = (4.0 * l.spring_len).max(1.0);
@@ -719,9 +721,11 @@ impl App {
         }
         let Some(wgpu_state) = frame.wgpu_render_state() else { return };
         let renderer = wgpu_state.renderer.read();
+        let mut sim_halted = false;
         if let Some(pipes) = renderer.callback_resources.get::<GraphPipelines>() {
             self.state.stats.n_nodes = pipes.n_nodes();
             self.state.stats.n_edges = pipes.n_edges();
+            sim_halted = pipes.is_halted();
         }
         // Communities: max value + 1 over the community metric.
         if let Some(comm) = self.metrics.get("community") {
@@ -734,9 +738,15 @@ impl App {
             }
             self.state.stats.n_communities = (mx + 1).max(0) as u32;
         }
-        // Sim status: keep "running" while sim is alive — a real readback
-        // hook can lower this to "settled" once is_halted lands here.
-        self.state.sim_status = ui::state::SimStatus::Running;
+        // Sim status reflects the real GPU-force halt state. Once
+        // max-KE has stayed under `energy_threshold` for `HALT_FRAMES`
+        // consecutive readbacks, GraphPipelines::is_halted flips true and
+        // we surface "settled" in the Stats panel.
+        self.state.sim_status = if sim_halted {
+            ui::state::SimStatus::Settled
+        } else {
+            ui::state::SimStatus::Running
+        };
     }
 }
 

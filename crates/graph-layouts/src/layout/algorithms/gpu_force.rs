@@ -16,16 +16,42 @@ use wgpu::util::DeviceExt;
 
 /// State of the asynchronous energy_buf -> energy_staging readback. Shared
 /// between the main thread and the wgpu map_async callback via Arc<Mutex<>>.
+///
+/// **Critical invariant**: the `map_async` callback must NEVER call any wgpu
+/// method (no `get_mapped_range`, no `unmap`, no buffer access). On WASM the
+/// callback fires *synchronously* from inside the queue submit codepath, and
+/// any wgpu re-entry from there hits `Buffer is already mapped` /
+/// "recursive use of an object" panics.
+///
+/// Discipline: callback only flips this state. All wgpu access happens at
+/// the top of the next `step_with_encoder` (`drain_energy_readback`), where
+/// no other wgpu code is in flight.
 #[derive(Debug)]
 enum EnergyReadback {
     /// No copy in flight; staging buffer is unmapped and idle.
     Idle,
-    /// `copy_buffer_to_buffer` recorded + `map_async` issued; waiting for
-    /// the GPU + driver to call our callback.
+    /// `copy_buffer_to_buffer` was recorded into the current frame's
+    /// encoder. We have NOT yet issued `map_async` — that has to wait
+    /// until the encoder is actually submitted (by eframe, after we
+    /// return from `step_with_encoder`). We park here for one frame; on
+    /// the next `step_with_encoder` entry we issue `map_async` (the prior
+    /// encoder is now submitted, so the buffer is no longer "in use" from
+    /// wgpu's perspective).
+    CopyScheduled,
+    /// `map_async` issued; waiting for the driver/browser to fire our
+    /// callback. On WASM the callback can fire synchronously from inside
+    /// the queue submit path — the callback flips state and does NOT
+    /// touch wgpu, so re-entrancy is safe.
     Mapping,
-    /// Callback fired. Ok = mapped successfully (caller must
+    /// Callback fired. Ok = staging buffer is now mapped (drain must
     /// `get_mapped_range` + `unmap`); Err = map failed (no unmap needed).
-    Mapped(Result<(), String>),
+    Done(Result<(), wgpu::BufferAsyncError>),
+}
+
+impl Default for EnergyReadback {
+    fn default() -> Self {
+        EnergyReadback::Idle
+    }
 }
 
 // ---------- Public API -------------------------------------------------------
@@ -397,6 +423,20 @@ impl GpuForceLayout {
             device.poll(wgpu::Maintain::Poll);
         }
 
+        // If the previous frame parked us in CopyScheduled (we recorded
+        // the copy but didn't issue map_async because eframe hadn't
+        // submitted yet), eframe has now submitted that encoder. It's
+        // safe to issue map_async — the copy is in flight, the buffer is
+        // no longer "in use by a pending submit". The callback will only
+        // mutate state, so even synchronous WASM dispatch is safe.
+        let was_copy_scheduled = matches!(
+            state.energy_readback.lock().ok().as_deref(),
+            Some(EnergyReadback::CopyScheduled)
+        );
+        if was_copy_scheduled {
+            state.issue_energy_map();
+        }
+
         // Drain a previously-scheduled readback (if any) and update halt
         // bookkeeping. We do this BEFORE the early-return so that even after
         // halting we still unmap a stragglar staging buffer cleanly.
@@ -412,8 +452,9 @@ impl GpuForceLayout {
                 self.halt_streak = self.halt_streak.saturating_add(1);
                 if self.halt_streak >= HALT_FRAMES {
                     if !self.halted {
-                        #[cfg(not(target_arch = "wasm32"))]
-                        eprintln!(
+                        // log::info! so this surfaces on WASM (console)
+                        // as well as native (env_logger / pretty_env_logger).
+                        log::info!(
                             "gpu_force: halted (max_ke={:.4} < threshold={:.4} after {} steps)",
                             max_ke, self.options.energy_threshold, self.steps_since_wake
                         );
@@ -1391,42 +1432,56 @@ impl GpuState {
     /// — we never block. If the GPU/driver hasn't finished the map yet we
     /// just report None and try again next frame.
     fn drain_energy_readback(&self) -> Option<f32> {
-        // Take the lock briefly to inspect+transition state. We can't read
-        // the mapped range while holding the mutex (and we don't need to —
-        // the staging buffer's mapped slice is independent of this state).
-        let take_action = {
+        // Take the lock briefly to inspect state. We must NOT read the
+        // mapped range while holding the mutex, because the buffer view
+        // implicitly retains state inside wgpu and we want the lock dropped
+        // before we touch wgpu APIs again.
+        //
+        // We also clear the state here (Done -> Idle) so the next round
+        // can be scheduled cleanly. Buffer unmap happens after we drop the
+        // lock and finish the read.
+        let map_succeeded = {
             let mut guard = self.energy_readback.lock().ok()?;
             match &*guard {
-                EnergyReadback::Mapped(Ok(())) => {
-                    *guard = EnergyReadback::Idle;
-                    Some(true)
-                }
-                EnergyReadback::Mapped(Err(_e)) => {
+                EnergyReadback::Done(Ok(())) => true,
+                EnergyReadback::Done(Err(_e)) => {
                     // Map failures are rare and self-recovering — silently
-                    // reset to Idle and try again next frame.
+                    // reset to Idle and try again next frame. No unmap
+                    // needed (the buffer was never mapped).
                     *guard = EnergyReadback::Idle;
-                    Some(false)
+                    return None;
                 }
-                _ => None, // Idle or Mapping: nothing to drain.
+                _ => return None, // Idle or Mapping: nothing to drain.
             }
         };
-        let ok = take_action?;
-        if !ok {
+        if !map_succeeded {
             return None;
         }
-        // Map succeeded: read, reduce, unmap.
-        let slice = self.energy_staging.slice(..);
-        let view = slice.get_mapped_range();
-        let floats: &[f32] = bytemuck::cast_slice(&view);
-        let n = (self.n_nodes as usize).min(floats.len());
-        let mut max = 0.0f32;
-        for &v in &floats[..n] {
-            if v.is_finite() && v > max {
-                max = v;
+        // Map succeeded — guarded by the variant we just matched. The lock
+        // is dropped, so it's safe to enter wgpu again. The staging buffer
+        // is mapped; read, reduce, unmap.
+        let max = {
+            let slice = self.energy_staging.slice(..);
+            let view = slice.get_mapped_range();
+            let floats: &[f32] = bytemuck::cast_slice(&view);
+            let n = (self.n_nodes as usize).min(floats.len());
+            let mut m = 0.0f32;
+            for &v in &floats[..n] {
+                if v.is_finite() && v > m {
+                    m = v;
+                }
             }
-        }
-        drop(view);
+            // Drop the view BEFORE unmap — wgpu requires no outstanding
+            // mapped ranges when unmap is called.
+            drop(view);
+            m
+        };
         self.energy_staging.unmap();
+        // Now that wgpu state is clean, flip back to Idle so the next
+        // step_with_encoder can schedule a fresh readback.
+        if let Ok(mut g) = self.energy_readback.lock() {
+            *g = EnergyReadback::Idle;
+        }
         Some(max)
     }
 
@@ -1449,22 +1504,43 @@ impl GpuState {
             0,
             n_bytes,
         );
-        // Mark as Mapping *before* the async map fires so a slow callback
-        // can't race a future drain.
+        // Park in CopyScheduled. We can't issue `map_async` here because
+        // the encoder hasn't been submitted yet — on WASM the resulting
+        // map happens immediately and that races the not-yet-submitted
+        // copy ("Buffer used in submit while mapped"). The next
+        // step_with_encoder entry sees CopyScheduled, knows the copy has
+        // since been submitted by eframe, and issues the map_async then.
         if let Ok(mut g) = self.energy_readback.lock() {
-            *g = EnergyReadback::Mapping;
+            *g = EnergyReadback::CopyScheduled;
         }
     }
 
-    /// Issue the actual `map_async` request on the energy_staging buffer.
-    /// Must be called AFTER the encoder is submitted (the copy needs to be
-    /// in flight). The callback signals completion via the shared Arc<Mutex<>>.
+    /// Issue the `map_async` request on the energy_staging buffer.
+    ///
+    /// **Re-entrancy contract**: on WASM `map_async` invokes its callback
+    /// synchronously from inside the queue submit codepath. The callback
+    /// must therefore do nothing but flip the shared state — no wgpu
+    /// access (no `get_mapped_range`, no `unmap`, no buffer methods at
+    /// all), no allocation that could touch wgpu state. The actual buffer
+    /// read happens in `drain_energy_readback` at the top of the *next*
+    /// `step_with_encoder`, where no other wgpu code is in flight.
     fn issue_energy_map(&self) {
+        // Flip to Mapping *before* we issue map_async. On WASM the
+        // callback can fire synchronously inside this call (under the
+        // queue submit codepath of an unrelated submit), so the state
+        // must already be in Mapping when the callback's Done write lands
+        // — otherwise the order Done -> Mapping would clobber the result.
+        if let Ok(mut g) = self.energy_readback.lock() {
+            *g = EnergyReadback::Mapping;
+        }
         let shared = self.energy_readback.clone();
         let slice = self.energy_staging.slice(..);
         slice.map_async(wgpu::MapMode::Read, move |res| {
+            // Only mutate state. Do NOT touch any wgpu API here —
+            // re-entering wgpu from inside the callback panics with
+            // "Buffer is already mapped" / "recursive use of an object".
             if let Ok(mut g) = shared.lock() {
-                *g = EnergyReadback::Mapped(res.map_err(|e| format!("{e:?}")));
+                *g = EnergyReadback::Done(res);
             }
         });
     }

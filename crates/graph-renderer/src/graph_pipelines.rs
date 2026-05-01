@@ -582,6 +582,19 @@ impl GraphPipelines {
         l.set_options(opts);
     }
 
+    /// True once the GPU force layout has settled (max-KE under the
+    /// configured `energy_threshold` for `HALT_FRAMES` consecutive
+    /// readbacks). False if no layout is initialised or auto-halt is
+    /// disabled (`energy_threshold == 0.0`). Drives the Stats panel
+    /// running/settled indicator.
+    pub fn is_halted(&self) -> bool {
+        self.buffers
+            .as_ref()
+            .and_then(|b| b.layout.as_ref())
+            .map(|l| l.is_halted())
+            .unwrap_or(false)
+    }
+
     /// Current layout options snapshot, if a layout exists.
     pub fn layout_options(&self) -> Option<GpuForceOptions> {
         self.buffers

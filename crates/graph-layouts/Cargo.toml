@@ -38,6 +38,7 @@ wgpu     = { version = "23", default-features = false, features = ["webgpu", "we
 bytemuck = { version = "1", features = ["derive"] }
 pollster = "0.4"
 wasm-bindgen-futures = "0.4"
+log = "0.4"
 
 [dev-dependencies]
 wasm-bindgen-test = "0.3.34"
