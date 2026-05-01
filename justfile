@@ -18,12 +18,16 @@ default:
 # For active development of the graph-renderer crate, run `just watch-wasm`
 # in a second terminal — that rebuilds the WASM bundle on .rs/.wgsl changes.
 dev:
-    @if [ ! -f crates/graph-renderer/assets/pkg/graph_renderer.js ]; then \
-        echo "→ building WASM renderer bundle (first run, ~30-60s)…"; \
+    @# Rebuild WASM if missing OR if any graph-renderer / graph-layouts Rust
+    @# / WGSL source is newer than the bundle. Avoids "I pulled but the WASM
+    @# is still the old broken one" footgun.
+    @PKG=crates/graph-renderer/assets/pkg/graph_renderer.js; \
+     if [ ! -f $PKG ] || [ -n "$(find crates/graph-renderer/src crates/graph-layouts/src -newer $PKG -name '*.rs' -o -newer $PKG -name '*.wgsl' -o -newer $PKG -name '*.toml' 2>/dev/null | head -1)" ]; then \
+        echo "→ rebuilding WASM renderer bundle (Rust/WGSL changed or missing)…"; \
         wasm-pack build crates/graph-renderer --target web --out-dir assets/pkg --release -- --features wasm; \
-    else \
-        echo "→ WASM bundle present (run 'just wasm' to force rebuild)"; \
-    fi
+     else \
+        echo "→ WASM bundle up to date (run 'just wasm' to force rebuild)"; \
+     fi
     cargo build --release -p vault-search
     cargo watch \
       -w crates/graph-api \
