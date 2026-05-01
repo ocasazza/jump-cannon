@@ -141,36 +141,54 @@ pub fn colors_from_metric(
 }
 
 /// Build a per-node sizes buffer from a metric, scaled by `multiplier`.
-/// Sequential metrics get sqrt-normalised into the [2.0, 12.0] px range
-/// before the multiplier; uniform falls back to the default size.
+///
+/// Sizes are computed via per-graph min/max normalization followed by a
+/// sqrt curve so hubs are visually distinct from leaves without dwarfing
+/// them. Pixel radius range at mul=1: 2..=10 px.
+///
+/// "uniform" and "recency" (no server metric yet) both fall back to a flat
+/// 4 px × multiplier.
 pub fn sizes_from_metric(
     metric_key: &str,
     metrics: &std::collections::HashMap<String, Vec<f32>>,
     n: usize,
     multiplier: f32,
 ) -> Vec<f32> {
-    if metric_key == "uniform" {
-        return vec![3.0 * multiplier.max(0.0); n];
+    let mul = multiplier.max(0.0);
+    // Uniform sentinel and recency (no metric available yet) → flat size.
+    if metric_key == "uniform" || metric_key == "recency" {
+        return vec![4.0 * mul; n];
     }
     let Some(v) = metrics.get(metric_key) else {
-        return vec![3.0 * multiplier.max(0.0); n];
+        return vec![4.0 * mul; n];
     };
     if v.len() < n {
-        return vec![3.0 * multiplier.max(0.0); n];
+        return vec![4.0 * mul; n];
     }
-    let mut mn = f32::INFINITY;
-    let mut mx = f32::NEG_INFINITY;
+    // Per-graph min/max over the raw metric values.
+    let mut min = f32::INFINITY;
+    let mut max = f32::NEG_INFINITY;
     for &x in &v[..n] {
-        let xx = x.max(0.0).sqrt();
-        mn = mn.min(xx);
-        mx = mx.max(xx);
+        if x.is_finite() {
+            if x < min { min = x; }
+            if x > max { max = x; }
+        }
     }
-    let range = (mx - mn).max(1e-6);
+    if !min.is_finite() || min == max {
+        return vec![4.0 * mul; n];
+    }
+    let span = max - min;
     let mut out = Vec::with_capacity(n);
-    for i in 0..n {
-        let t = ((v[i].max(0.0).sqrt() - mn) / range).clamp(0.0, 1.0);
-        let px = 2.0 + 10.0 * t;
-        out.push(px * multiplier.max(0.0));
+    for &x in v.iter().take(n) {
+        let x = if x.is_finite() { x } else { min };
+        // Normalize to [0, 1].
+        let t = ((x - min) / span).clamp(0.0, 1.0);
+        // Sqrt scaling: compresses the high end so hubs aren't 100× the
+        // size of leaves while still being visibly larger.
+        let scaled = t.sqrt();
+        // Pixel radius: 2..=10 at mul=1.
+        let r = (2.0 + scaled * 8.0) * mul;
+        out.push(r);
     }
     out
 }
