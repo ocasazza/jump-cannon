@@ -324,7 +324,10 @@ function wireInput(boot) {
     if (dragging) {
       const dx = e.clientX - lastX, dy = e.clientY - lastY;
       lastX = e.clientX; lastY = e.clientY;
-      renderer.cam_rotate(dx * 0.005, -dy * 0.005);
+      // Orbit-style: drag right → graph appears to spin to the right
+      // (camera orbits counter-clockwise → yaw decreases). Pitch also
+      // inverted for natural drag-the-graph feel.
+      renderer.cam_rotate(-dx * 0.005, dy * 0.005);
     } else if (cursor.enabled) {
       pushCursorForce();
     } else {
@@ -373,9 +376,13 @@ function wireInput(boot) {
 function applyKeyboardCamera(dt) {
   const speed = (keys['shift'] ? 5 : 1) * 400 * dt;
   let dx = 0, dy = 0, dz = 0;
-  if (keys['w']) dz += speed; if (keys['s']) dz -= speed;
-  if (keys['d']) dx += speed; if (keys['a']) dx -= speed;
-  if (keys['q']) dy += speed; if (keys['e']) dy -= speed;
+  // Drag-the-graph semantics (Cosmograph-style): pressing a direction key
+  // moves the GRAPH that way, so the camera moves the opposite way. This
+  // matches the user's expectation more than FPS-style "press d, camera
+  // goes right" because graph apps feel like manipulating the canvas.
+  if (keys['w']) dz += speed; if (keys['s']) dz -= speed;   // forward/back unchanged
+  if (keys['d']) dx -= speed; if (keys['a']) dx += speed;   // FLIPPED
+  if (keys['q']) dy -= speed; if (keys['e']) dy += speed;   // FLIPPED
   if (keys['r']) dz += speed * 2; if (keys['f']) dz -= speed * 2;
   if (dx || dy || dz) renderer.cam_pan(dx, dy, dz);
 }
