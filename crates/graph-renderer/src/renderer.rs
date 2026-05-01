@@ -42,6 +42,7 @@ pub struct RendererConfig {
 #[derive(Copy, Clone, Pod, Zeroable)]
 struct CameraUniform {
     view_proj: [[f32; 4]; 4],
+    view: [[f32; 4]; 4],
     cam_pos: [f32; 3],
     _pad0: f32,
     screen: [f32; 2],
@@ -64,7 +65,10 @@ struct EffectsUniform {
 impl Default for EffectsUniform {
     fn default() -> Self {
         Self {
-            focus_plane_z: 0.0,
+            // View-space distance from camera to focal plane (positive = in front).
+            // Default is huge thickness anyway so this only matters once the
+            // user actually narrows the focus band.
+            focus_plane_z: 800.0,
             // Default huge thickness = effectively no focus attenuation
             // until the user moves the slider.
             focus_thickness: 1.0e9,
@@ -189,6 +193,7 @@ impl Renderer {
         let camera = Camera::new(surface_config.width as f32 / surface_config.height as f32);
         let cam_uniform = CameraUniform {
             view_proj: camera.view_proj(),
+            view: camera.view(),
             cam_pos: camera.position.to_array(),
             _pad0: 0.0,
             screen: [surface_config.width as f32, surface_config.height as f32],
@@ -577,6 +582,7 @@ impl Renderer {
         // Update camera uniform.
         let cam_uniform = CameraUniform {
             view_proj: self.camera.view_proj(),
+            view: self.camera.view(),
             cam_pos: self.camera.position.to_array(),
             _pad0: 0.0,
             screen: [

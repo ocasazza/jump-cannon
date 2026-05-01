@@ -58,6 +58,12 @@ impl Camera {
         (proj * view).to_cols_array_2d()
     }
 
+    /// Camera view matrix only (no projection). Used by shaders that need
+    /// view-space depth (camera-orthogonal focal plane).
+    pub fn view(&self) -> [[f32; 4]; 4] {
+        Mat4::look_to_rh(self.position, self.forward(), Vec3::Y).to_cols_array_2d()
+    }
+
     /// Pan along (right, up, forward) by raw deltas.
     pub fn pan(&mut self, dx: f32, dy: f32, dz: f32) {
         let r = self.right();

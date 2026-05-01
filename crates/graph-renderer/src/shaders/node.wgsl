@@ -21,6 +21,7 @@
 
 struct CameraUniform {
     view_proj: mat4x4<f32>,
+    view:      mat4x4<f32>,
     cam_pos:   vec3<f32>,
     _pad0:     f32,
     screen:    vec2<f32>,
@@ -73,7 +74,11 @@ fn vs_main(
     let base_size  = sizes[iid];
 
     // Circle of confusion: 0 inside the focus band, grows linearly outside.
-    let dz = abs(inst_pos.z - effects.focus_plane_z);
+    // View-space depth: in RH look_to_rh, points in front of the camera have
+    // negative view-space Z. Negate so view_dist is positive in front.
+    let view_pos = camera.view * vec4<f32>(inst_pos, 1.0);
+    let view_dist = -view_pos.z;
+    let dz = abs(view_dist - effects.focus_plane_z);
     let half_t = max(effects.focus_thickness * 0.5, 0.001);
     let blur_z = max(dz - half_t, 0.0);
     let coc = min(blur_z * effects.blur_strength, effects.max_coc);

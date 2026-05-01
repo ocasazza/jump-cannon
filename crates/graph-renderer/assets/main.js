@@ -339,7 +339,8 @@ function wireInput(boot) {
   $canvas.addEventListener('wheel', (e) => {
     e.preventDefault();
     if (keys['f']) {
-      // Microscope focus knob: F + scroll moves the focal plane in world Z.
+      // Microscope focus knob: F + scroll moves the focal plane along the
+      // camera's view ray (i.e. focus distance from camera, not world Z).
       const z = parseFloat($focusZ.value);
       const min = parseFloat($focusZ.min), max = parseFloat($focusZ.max);
       const dz = (e.deltaY > 0 ? -1 : 1) * 20;
@@ -370,6 +371,16 @@ function wireInput(boot) {
       const meta = await fetchProto(`/node/${encodeURIComponent(id)}`, NodeMeta);
       showModal(meta);
     } catch (err) { console.error(err); }
+  });
+
+  // Cosmograph-style: double-click on canvas exits selection-focus (clears
+  // the dim-others state). Keeps DoF / focal band untouched — they're a
+  // separate concept (camera-orthogonal depth-of-field).
+  $canvas.addEventListener('dblclick', (e) => {
+    if (cursor.enabled) return;
+    showModal(null);
+    selectedIds = null;
+    refreshColors(boot);
   });
 }
 

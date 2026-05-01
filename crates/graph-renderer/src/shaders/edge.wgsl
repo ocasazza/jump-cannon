@@ -17,6 +17,7 @@
 
 struct CameraUniform {
     view_proj: mat4x4<f32>,
+    view:      mat4x4<f32>,
     cam_pos:   vec3<f32>,
     _pad0:     f32,
     screen:    vec2<f32>,
@@ -60,9 +61,12 @@ fn vs_main(@builtin(vertex_index) vid: u32) -> VertexOutput {
     let edge_len = length(p_tgt - p_src);
 
     // Average-midpoint CoC for the whole edge — both endpoints share it
-    // so the line's alpha is uniform along its length.
-    let z_mid = 0.5 * (p_src.z + p_tgt.z);
-    let dz = abs(z_mid - effects.focus_plane_z);
+    // so the line's alpha is uniform along its length. Distance is measured
+    // in view-space (perpendicular to camera look vector).
+    let p_mid = 0.5 * (p_src + p_tgt);
+    let view_pos = camera.view * vec4<f32>(p_mid, 1.0);
+    let view_dist = -view_pos.z;
+    let dz = abs(view_dist - effects.focus_plane_z);
     let half_t = max(effects.focus_thickness * 0.5, 0.001);
     let blur_z = max(dz - half_t, 0.0);
     let coc = min(blur_z * effects.blur_strength, effects.max_coc);
