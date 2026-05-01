@@ -108,9 +108,17 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         discard;
     }
 
-    // Sharp: AA only over the last 5%. Heavily blurred (coc_ratio ≈ 0):
-    // smooth falloff across the entire disc → soft bokeh circle.
-    let aa_start = mix(0.0, 0.95, in.coc_ratio);
+    // Sharp fast-path: in-focus nodes get a crisp edge with minimal AA
+    // and full intensity. Floors any jitter in coc_ratio that was making
+    // even default-in-focus nodes glow.
+    if (in.coc_ratio > 0.99) {
+        let edge = 1.0 - smoothstep(0.92, 1.0, r);
+        return vec4<f32>(in.color.rgb, in.color.a * edge);
+    }
+
+    // Bokeh path for actual out-of-focus nodes:
+    // aa_start floored at 0.85 so even mild blur doesn't produce a giant halo.
+    let aa_start = max(mix(0.0, 0.95, in.coc_ratio), 0.85);
     let edge = 1.0 - smoothstep(aa_start, 1.0, r);
 
     // Energy conservation: spreading a bright point across a larger disc
