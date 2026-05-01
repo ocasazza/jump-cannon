@@ -25,7 +25,7 @@ wasm    = [
 ]
 
 [dependencies]
-eframe   = { version = "0.30", default-features = false, features = ["default_fonts", "wgpu", "wayland", "x11"] }
+eframe   = { version = "0.30", default-features = false, features = ["default_fonts", "wgpu", "wayland", "x11", "persistence"] }
 egui     = "0.30"
 egui-wgpu = "0.30"
 log      = "0.4"
@@ -34,8 +34,8 @@ wgpu     = { version = "23", default-features = false, features = ["webgpu", "we
 bytemuck = { version = "1", features = ["derive"] }
 glam     = "0.29"
 graph-layouts = { path = "../graph-layouts" }
-prost    = "0.13"
-serde    = { version = "1", features = ["derive"] }
+prost      = "0.13"
+serde      = { version = "1", features = ["derive"] }
 serde_json = "1"
 
 console_error_panic_hook = { version = "0.1", optional = true }

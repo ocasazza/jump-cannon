@@ -5,22 +5,31 @@ use crate::data::{self, Bootstrap, LoadState, SharedLoad};
 use crate::fetch::ApiClient;
 use crate::graph_callback::GraphCallback;
 use crate::graph_pipelines::{GraphData, GraphPipelines};
+use crate::ui;
 
 pub struct App {
-    note: String,
+    state: ui::AppState,
     load: SharedLoad,
     /// Once we successfully push a Bootstrap into GraphPipelines we flip
     /// this so we don't retry the (expensive) buffer creation.
     loaded_into_gpu: bool,
-    /// Set once we emit the readiness console-log line.
+    /// Set once we emit the readiness console-log line (used by the test harness).
     logged_ready: bool,
 }
 
 impl App {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        // Register GraphPipelines into eframe's wgpu callback resources.
-        // Without an active wgpu state (e.g. CPU renderer fallback) we just
-        // skip — the App still runs but the graph layer no-ops.
+        // Phase D theme: B&W high-contrast with RGBY accents.
+        ui::apply_theme(&cc.egui_ctx);
+
+        // Restore persisted UI state (active section, slider values, etc).
+        let state = cc
+            .storage
+            .and_then(|s| s.get_string(ui::STORAGE_KEY))
+            .and_then(|s| serde_json::from_str::<ui::AppState>(&s).ok())
+            .unwrap_or_default();
+
+        // Phase B: register GraphPipelines into eframe's wgpu callback resources.
         if let Some(wgpu_state) = cc.wgpu_render_state.as_ref() {
             let device = &wgpu_state.device;
             let format = wgpu_state.target_format;
@@ -38,19 +47,18 @@ impl App {
             log::warn!("[graph-renderer] no wgpu_render_state — graph layer disabled");
         }
 
+        // Phase C: kick off async bootstrap fetch.
         let load: SharedLoad = Arc::new(Mutex::new(LoadState::Pending));
         kick_off_bootstrap(load.clone(), default_base_url());
 
         Self {
-            note: "vault graph".into(),
+            state,
             load,
             loaded_into_gpu: false,
             logged_ready: false,
         }
     }
 
-    /// If the fetch task has placed a Bootstrap in `self.load`, hand it to
-    /// GraphPipelines and mark loaded.
     fn try_promote_bootstrap_to_gpu(&mut self, frame: &mut eframe::Frame) {
         if self.loaded_into_gpu {
             return;
@@ -59,9 +67,6 @@ impl App {
             return;
         };
 
-        // Move the Bootstrap out of the shared state so we don't double-load
-        // and so we drop the staging Vec ASAP. Failure modes leave the
-        // sentinel state alone.
         let bootstrap_opt: Option<Bootstrap> = {
             let mut guard = self.load.lock().unwrap();
             match std::mem::take(&mut *guard) {
@@ -104,10 +109,6 @@ impl App {
         }
     }
 
-    /// Once GPU upload is done, emit the readiness log line that the
-    /// browser test grep-asserts on. Done here (rather than in load()) so
-    /// the test can rely on a stable line wording even when the parallel
-    /// agent's UI logs land in between.
     fn emit_ready_log(&mut self, frame: &mut eframe::Frame) {
         if self.logged_ready || !self.loaded_into_gpu {
             return;
@@ -119,7 +120,6 @@ impl App {
         let Some(pipes) = renderer.callback_resources.get::<GraphPipelines>() else {
             return;
         };
-        // Single canonical line for the test harness.
         log::info!(
             "[graph-renderer] graph loaded: {} nodes",
             pipes.n_nodes()
@@ -140,46 +140,32 @@ impl App {
 
 impl eframe::App for App {
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
-        // Slightly off-black so the brightness sampler sees something even
-        // before any data lands.
-        [0.06, 0.06, 0.07, 1.0]
+        // Slightly off-black so the test brightness sampler clears the
+        // r+g+b > 60 threshold even on a bare frame.
+        [0.06, 0.06, 0.06, 1.0]
+    }
+
+    fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        if let Ok(json) = serde_json::to_string(&self.state) {
+            storage.set_string(ui::STORAGE_KEY, json);
+        }
     }
 
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
-        // Force-redraw — without this the headless test only catches the
-        // first frame and the force sim is invisible.
+        // Re-apply theme each frame so hot edits to theme.rs land without restart.
+        ui::apply_theme(ctx);
         ctx.request_repaint();
 
-        let mut visuals = egui::Visuals::dark();
-        visuals.window_rounding = egui::Rounding::ZERO;
-        visuals.menu_rounding = egui::Rounding::ZERO;
-        visuals.widgets.noninteractive.rounding = egui::Rounding::ZERO;
-        visuals.widgets.inactive.rounding = egui::Rounding::ZERO;
-        visuals.widgets.hovered.rounding = egui::Rounding::ZERO;
-        visuals.widgets.active.rounding = egui::Rounding::ZERO;
-        let bg = egui::Color32::from_rgb(15, 15, 18);
-        visuals.window_fill = bg;
-        visuals.panel_fill = egui::Color32::TRANSPARENT;
-        ctx.set_visuals(visuals);
-
-        // Hand Bootstrap → GPU once available.
+        // Pump the data pipeline.
         self.try_promote_bootstrap_to_gpu(frame);
         self.emit_ready_log(frame);
 
-        // Status snapshot for the UI.
-        let status: String = {
-            let guard = self.load.lock().unwrap();
-            match &*guard {
-                LoadState::Pending => "fetch pending…".into(),
-                LoadState::Loading(s) => s.clone(),
-                LoadState::Ready(_) => "ready (uploading…)".into(),
-                LoadState::Failed(e) => format!("error: {e}"),
-            }
-        };
+        // Phase D sidebar (activity bar + section panel) on the left.
+        ui::show_sidebar(ctx, &mut self.state);
 
+        // Phase B central panel — wgpu graph layer via egui_wgpu callback.
+        // Frame is transparent so the wgpu output isn't covered.
         egui::CentralPanel::default()
-            // Make panel transparent so the wgpu graph layer below shows
-            // through cleanly. The `clear_color` above paints the floor.
             .frame(egui::Frame::none().fill(egui::Color32::TRANSPARENT))
             .show(ctx, |ui| {
                 let avail = ui.available_size();
@@ -189,19 +175,6 @@ impl eframe::App for App {
                 };
                 ui.painter()
                     .add(egui_wgpu::Callback::new_paint_callback(rect, cb));
-
-                // Lightweight overlay so the test brightness sampler also
-                // sees text-rendered glyphs in addition to the WebGPU
-                // composited canvas (some headless backends drop alpha
-                // on the WebGPU layer at screenshot time).
-                let overlay_rect =
-                    egui::Rect::from_min_size(rect.min, egui::vec2(420.0, 40.0));
-                ui.scope_builder(egui::UiBuilder::new().max_rect(overlay_rect), |ui| {
-                    ui.label(
-                        egui::RichText::new(format!("{} — {}", &self.note, &status))
-                            .color(egui::Color32::from_rgb(220, 220, 230)),
-                    );
-                });
             });
     }
 }
@@ -218,19 +191,14 @@ fn default_base_url() -> String {
     }
     #[cfg(not(target_arch = "wasm32"))]
     {
-        std::env::var("GRAPH_API_URL")
-            .unwrap_or_else(|_| "http://127.0.0.1:4848".into())
+        std::env::var("GRAPH_API_URL").unwrap_or_else(|_| "http://127.0.0.1:4848".into())
     }
 }
 
-/// Kick off the parallel fetch of /graph/init + ids + positions + edges.
-/// Updates `load` when each milestone completes, ending in
-/// LoadState::Ready or LoadState::Failed.
 fn kick_off_bootstrap(load: SharedLoad, base: String) {
     let client = ApiClient::new(base);
 
     let task = async move {
-        // init
         set_status(&load, "fetching /graph/init…");
         let init = match client.init().await {
             Ok(v) => v,
@@ -245,7 +213,6 @@ fn kick_off_bootstrap(load: SharedLoad, base: String) {
             init.n_edges
         );
 
-        // ids
         set_status(&load, "fetching /graph/ids…");
         let ids = match client.ids().await {
             Ok(v) => v,
@@ -255,7 +222,6 @@ fn kick_off_bootstrap(load: SharedLoad, base: String) {
             }
         };
 
-        // positions (2D)
         set_status(&load, "fetching /graph/positions…");
         let positions_2d = match client.positions().await {
             Ok(v) => v,
@@ -265,7 +231,6 @@ fn kick_off_bootstrap(load: SharedLoad, base: String) {
             }
         };
 
-        // edges
         set_status(&load, "fetching /graph/edges…");
         let edges = match client.edges().await {
             Ok(v) => v,
@@ -275,7 +240,6 @@ fn kick_off_bootstrap(load: SharedLoad, base: String) {
             }
         };
 
-        // Optional metrics — failure is non-fatal.
         let mut metrics = std::collections::HashMap::new();
         for name in ["degree", "pagerank", "kcore", "community"] {
             set_status(&load, format!("fetching /graph/metrics/{name}…"));
@@ -329,10 +293,6 @@ fn spawn_async<F: std::future::Future<Output = ()> + 'static>(f: F) {
 
 #[cfg(not(target_arch = "wasm32"))]
 fn spawn_async<F: std::future::Future<Output = ()> + Send + 'static>(f: F) {
-    // Lazy-init a single shared multi-thread tokio runtime for the App's
-    // fetch tasks. The native binary currently only spawns one task, but
-    // keeping a runtime around means we don't need to thread it through
-    // App::new from the bin.
     use std::sync::OnceLock;
     static RT: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
     let rt = RT.get_or_init(|| {

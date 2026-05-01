@@ -20,7 +20,7 @@ pub mod fetch;
 pub mod graph_callback;
 pub mod graph_pipelines;
 pub mod proto;
-
+pub mod ui;
 pub use app::App;
 
 // Static asset bundle is still embedded so graph-api can serve the
