@@ -141,13 +141,23 @@ impl Renderer {
             .await
             .ok_or_else(|| "no compatible adapter".to_string())?;
 
+        // The compute pipeline binds 9 storage buffers in a single stage
+        // (positions in/out, velocities, edges via CSR (offsets+neighbors),
+        // mass, energy, cell_counts, cell_nodes). Default downlevel cap is 8;
+        // bump to at least 10. Adapter typically supports more on real GPUs.
+        let adapter_limits = adapter.limits();
+        let mut limits = wgpu::Limits::downlevel_defaults().using_resolution(adapter_limits.clone());
+        limits.max_storage_buffers_per_shader_stage = limits
+            .max_storage_buffers_per_shader_stage
+            .max(10)
+            .min(adapter_limits.max_storage_buffers_per_shader_stage);
+
         let (device, queue) = adapter
             .request_device(
                 &wgpu::DeviceDescriptor {
                     label: Some("graph-renderer device"),
                     required_features: wgpu::Features::empty(),
-                    required_limits: wgpu::Limits::downlevel_defaults()
-                        .using_resolution(adapter.limits()),
+                    required_limits: limits,
                     memory_hints: wgpu::MemoryHints::default(),
                 },
                 None,

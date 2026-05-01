@@ -145,7 +145,10 @@ fn force_step(@builtin(global_invocation_id) gid: vec3<u32>) {
     var force = vec3<f32>(0.0, 0.0, 0.0);
 
     let r_clip = params.repulsion_radius;
-    let r_clip2 = select(3.4028235e+38, r_clip * r_clip, r_clip > 0.0);
+    // Use a "very large" finite value as the no-clip sentinel. f32::MAX
+    // (3.4028235e+38) overflows naga's WGSL constant parser, so use a value
+    // far larger than any plausible distance² instead.
+    let r_clip2 = select(1.0e+18, r_clip * r_clip, r_clip > 0.0);
 
     // ---- Repulsion ---------------------------------------------------------
     if (params.grid_enabled == 1u) {

@@ -72,14 +72,15 @@ fn asset_response(s: &AppState, path: &str) -> axum::response::Response {
 
 fn mime_for(path: &str) -> &'static str {
     match path.rsplit('.').next().unwrap_or("") {
-        "html" => "text/html; charset=utf-8",
-        "js"   => "application/javascript",
-        "css"  => "text/css",
-        "json" => "application/json",
+        "html"  => "text/html; charset=utf-8",
+        "js"    => "application/javascript",
+        "wasm"  => "application/wasm",
+        "css"   => "text/css",
+        "json"  => "application/json",
         "proto" => "text/plain; charset=utf-8",
-        "png"  => "image/png",
-        "svg"  => "image/svg+xml",
-        _      => "application/octet-stream",
+        "png"   => "image/png",
+        "svg"   => "image/svg+xml",
+        _       => "application/octet-stream",
     }
 }
 
