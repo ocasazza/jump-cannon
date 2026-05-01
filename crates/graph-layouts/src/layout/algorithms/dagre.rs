@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 use std::collections::{HashMap, HashSet};
 use crate::types::{Graph, DagreLayoutOptions};
 use crate::layout::traits::{LayoutEngine, LayeredLayout};

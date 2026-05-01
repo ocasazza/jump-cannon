@@ -13,7 +13,7 @@
 //! `QueryModel::evaluate` is a stub that returns `None` (= no filter
 //! applied) so the rest of the renderer keeps working unchanged.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 
@@ -98,32 +98,172 @@ impl Default for QueryModel {
     }
 }
 
-/// Context passed to the evaluator. Only the id list is available in
-/// the current phase — a real per-field index hooks in later.
+/// Context passed to the evaluator. The query model resolves Search
+/// cards through the cached results map (populated by App as async
+/// `/search?q=` fetches complete). Filter cards are no-ops for now —
+/// they hook into a per-field index in a later phase.
 pub struct EvalContext<'a> {
     pub ids: &'a [String],
-    _placeholder: (),
+    pub id_to_idx: &'a HashMap<String, u32>,
+    pub search_results: &'a HashMap<String, HashSet<u32>>,
 }
 
 impl<'a> EvalContext<'a> {
-    pub fn new(ids: &'a [String]) -> Self {
+    pub fn new(
+        ids: &'a [String],
+        id_to_idx: &'a HashMap<String, u32>,
+        search_results: &'a HashMap<String, HashSet<u32>>,
+    ) -> Self {
         Self {
             ids,
-            _placeholder: (),
+            id_to_idx,
+            search_results,
         }
     }
 }
 
+/// One leaf clause + its connector to the previous clause. Negation is
+/// applied to the leaf result. Paren grouping is left for a later
+/// pass — Phase G keeps a flat AND/OR fold.
+#[derive(Debug, Clone)]
+enum Leaf {
+    /// A search term that resolved (or didn't yet) — `None` means
+    /// the cache hasn't returned for this query, so we treat as
+    /// "still loading" and skip rather than zero out the graph.
+    Search(String),
+    /// Filter cards are not yet evaluable (no field index).
+    Unsupported,
+}
+
+#[derive(Debug, Clone)]
+struct Clause {
+    connector: ConnectorOp,
+    negate: bool,
+    leaf: Leaf,
+}
+
 impl QueryModel {
-    /// Tokenize → AST → evaluate against per-field indices.
+    /// Tokenize the card stream into a flat sequence of clauses joined
+    /// by AND/OR (the connector for the first clause is meaningless and
+    /// ignored). Then resolve each leaf and fold.
     ///
     /// Returns the set of matching node indices, or `None` if the query
-    /// is empty / not yet wired (= match all). This is a stub for
-    /// Phase F: node-set computation hooks into a real index in a
-    /// follow-up phase.
+    /// has no resolvable constraint (= no filter applied).
     pub fn evaluate(&self, ctx: &EvalContext) -> Option<HashSet<u32>> {
-        let _ = ctx;
-        None
+        let clauses = self.collect_clauses();
+        if clauses.is_empty() {
+            return None;
+        }
+
+        // If every clause is "unsupported" we have nothing to apply.
+        if clauses.iter().all(|c| matches!(c.leaf, Leaf::Unsupported)) {
+            return None;
+        }
+
+        // Resolve each clause to a Some(set) (matched), or None (loading
+        // / unsupported — treated as "match all" for the purpose of the
+        // fold so we don't blank the graph mid-load).
+        let resolved: Vec<(ConnectorOp, bool, Option<HashSet<u32>>)> = clauses
+            .iter()
+            .map(|c| {
+                let set = match &c.leaf {
+                    Leaf::Search(q) => ctx.search_results.get(q).cloned(),
+                    Leaf::Unsupported => None,
+                };
+                (c.connector, c.negate, set)
+            })
+            .collect();
+
+        // If nothing has resolved yet, hold off filtering this frame.
+        if resolved.iter().all(|(_, _, s)| s.is_none()) {
+            return None;
+        }
+
+        // Fold left-to-right. AND intersects, OR unions. A "loading"
+        // (None) leaf is treated as the universe so the partial query
+        // doesn't go dark while a fetch is in flight.
+        let universe: HashSet<u32> = (0..ctx.ids.len() as u32).collect();
+        let materialise = |s: Option<HashSet<u32>>, neg: bool| -> HashSet<u32> {
+            let base = s.unwrap_or_else(|| universe.clone());
+            if neg {
+                universe.difference(&base).copied().collect()
+            } else {
+                base
+            }
+        };
+
+        let mut iter = resolved.into_iter();
+        let (_, neg0, s0) = iter.next().unwrap();
+        let mut acc = materialise(s0, neg0);
+        for (op, neg, s) in iter {
+            let next = materialise(s, neg);
+            acc = match op {
+                ConnectorOp::And => acc.intersection(&next).copied().collect(),
+                ConnectorOp::Or => acc.union(&next).copied().collect(),
+            };
+        }
+        Some(acc)
+    }
+
+    /// Walk `cards` and collapse into a flat clause list. Paren cards
+    /// are silently dropped (group-aware folding is a follow-up).
+    fn collect_clauses(&self) -> Vec<Clause> {
+        let mut out: Vec<Clause> = Vec::new();
+        let mut connector = ConnectorOp::And;
+        let mut negate = false;
+        for c in &self.cards {
+            match c {
+                Card::Connector { op } => {
+                    connector = *op;
+                }
+                Card::Not => {
+                    negate = !negate;
+                }
+                Card::ParenOpen | Card::ParenClose => {}
+                Card::Search { value, .. } => {
+                    let v = value.trim();
+                    if v.is_empty() {
+                        continue;
+                    }
+                    out.push(Clause {
+                        connector,
+                        negate,
+                        leaf: Leaf::Search(v.to_string()),
+                    });
+                    connector = ConnectorOp::And;
+                    negate = false;
+                }
+                Card::Filter { value, .. } => {
+                    let v = value.trim();
+                    if v.is_empty() {
+                        continue;
+                    }
+                    out.push(Clause {
+                        connector,
+                        negate,
+                        leaf: Leaf::Unsupported,
+                    });
+                    connector = ConnectorOp::And;
+                    negate = false;
+                }
+            }
+        }
+        out
+    }
+
+    /// Collect the set of search-card values that should be resolved
+    /// against the backend. Used by App to spawn missing fetches.
+    pub fn pending_searches(&self) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for c in &self.cards {
+            if let Card::Search { value, .. } = c {
+                let v = value.trim();
+                if !v.is_empty() && !out.iter().any(|x| x == v) {
+                    out.push(v.to_string());
+                }
+            }
+        }
+        out
     }
 
     /// Reset to the default model: just the system search card.

@@ -7,4 +7,5 @@ pub mod klay;
 pub mod nforce;
 pub mod gpu_force;
 
+#[allow(unused_imports)]
 pub use gpu_force::{GpuForceLayout, GpuForceOptions};

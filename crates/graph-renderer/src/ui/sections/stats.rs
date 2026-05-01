@@ -22,9 +22,13 @@ pub fn show(ui: &mut egui::Ui, state: &mut AppState) {
     });
 
     ui.add_space(10.0);
-    ui.label(egui::RichText::new("nodes      —").monospace());
-    ui.label(egui::RichText::new("edges      —").monospace());
-    ui.label(egui::RichText::new("communities —").monospace());
+    let s = &state.stats;
+    let n = if s.n_nodes == 0 { "—".to_string() } else { s.n_nodes.to_string() };
+    let m = if s.n_edges == 0 { "—".to_string() } else { s.n_edges.to_string() };
+    let c = if s.n_communities == 0 { "—".to_string() } else { s.n_communities.to_string() };
+    ui.label(egui::RichText::new(format!("nodes       {n}")).monospace());
+    ui.label(egui::RichText::new(format!("edges       {m}")).monospace());
+    ui.label(egui::RichText::new(format!("communities {c}")).monospace());
 
     ui.add_space(12.0);
     ui.label(

@@ -1,4 +1,5 @@
 use eframe::egui;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use crate::data::{self, Bootstrap, LoadState, SharedLoad};
@@ -7,10 +8,17 @@ use crate::graph_callback::GraphCallback;
 use crate::graph_pipelines::{GraphData, GraphPipelines};
 use crate::proto;
 use crate::ui;
+use crate::ui::query::EvalContext;
+use crate::ui::state::{ColorBy, SizeBy};
+use graph_layouts::GpuForceOptions;
 
 /// Result of an async `/node/:id` fetch — Some(Ok) success, Some(Err) error,
 /// None means no fetch has completed since the last poll.
 type NodeFetchSlot = Arc<Mutex<Option<Result<proto::NodeMeta, String>>>>;
+
+/// Shared cache of `/search?q=` results keyed by the query string.
+/// Async tasks push into it; the evaluator reads from it.
+type SearchCache = Arc<Mutex<HashMap<String, HashSet<u32>>>>;
 
 pub struct App {
     state: ui::AppState,
@@ -27,8 +35,30 @@ pub struct App {
     /// Cached idx -> string id table (from Bootstrap.ids), used to resolve
     /// raycast hits to node ids. Populated when bootstrap promotes to GPU.
     ids: Vec<String>,
+    /// Reverse map id -> idx, computed once on bootstrap promotion.
+    id_to_idx: HashMap<String, u32>,
+    /// Per-node metric buffers (degree, pagerank, community, kcore, …)
+    /// kept on the host so style changes can recompute color/size buffers
+    /// without a re-fetch.
+    metrics: HashMap<String, Vec<f32>>,
     /// Base URL for `/node/:id` follow-up fetches.
     base_url: String,
+    /// Async-shared `/search?q=` result cache.
+    search_cache: SearchCache,
+    /// Search queries we've already kicked off (avoid double-fire).
+    search_inflight: HashSet<String>,
+
+    // -- "previous-frame" trackers used to gate GPU writes -----------------
+    prev_style_key: Option<(SizeBy, ColorBy, u32)>,
+    prev_layout_key: Option<u64>,
+    prev_focus_key: Option<u64>,
+    prev_cursor_key: Option<u64>,
+    prev_selected_hash: Option<u64>,
+
+    // -- input deltas for the camera ---------------------------------------
+    prev_canvas_rect: Option<egui::Rect>,
+    last_pointer_in_canvas: Option<egui::Pos2>,
+    cursor_force_active: f32, // sign: +1 attract / -1 repel / 0 none
 }
 
 impl App {
@@ -74,7 +104,19 @@ impl App {
             modal: ui::ModalState::default(),
             node_fetch: Arc::new(Mutex::new(None)),
             ids: Vec::new(),
+            id_to_idx: HashMap::new(),
+            metrics: HashMap::new(),
             base_url,
+            search_cache: Arc::new(Mutex::new(HashMap::new())),
+            search_inflight: HashSet::new(),
+            prev_style_key: None,
+            prev_layout_key: None,
+            prev_focus_key: None,
+            prev_cursor_key: None,
+            prev_selected_hash: None,
+            prev_canvas_rect: None,
+            last_pointer_in_canvas: None,
+            cursor_force_active: 0.0,
         }
     }
 
@@ -146,13 +188,32 @@ impl App {
         // Cache the idx -> id table for click-to-modal resolution before we
         // consume the rest of the bootstrap into GPU buffers.
         self.ids = bootstrap.ids.clone();
+        self.id_to_idx = bootstrap
+            .ids
+            .iter()
+            .enumerate()
+            .map(|(i, s)| (s.clone(), i as u32))
+            .collect();
+        self.metrics = bootstrap.metrics.clone();
 
         let n_nodes = bootstrap.positions.len() / 3;
+        // Initial colors / sizes from the user's persisted style choice.
+        let colors = data::colors_from_metric(
+            self.state.style.color_by.metric_key(),
+            &self.metrics,
+            n_nodes,
+        );
+        let sizes = data::sizes_from_metric(
+            self.state.style.size_by.metric_key(),
+            &self.metrics,
+            n_nodes,
+            self.state.style.size_mul,
+        );
         let graph = GraphData {
             positions: bootstrap.positions,
             edges: bootstrap.edges,
-            colors: data::default_colors(n_nodes),
-            sizes: data::default_sizes(n_nodes),
+            colors,
+            sizes,
         };
 
         let device = wgpu_state.device.clone();
@@ -235,6 +296,10 @@ impl eframe::App for App {
         // Phase B central panel — wgpu graph layer via egui_wgpu callback.
         // Frame is transparent so the wgpu output isn't covered.
         let mut click: Option<(egui::Rect, egui::Pos2)> = None;
+        let mut canvas_rect: Option<egui::Rect> = None;
+        let mut pointer_in_canvas: Option<egui::Pos2> = None;
+        let mut lmb_held = false;
+        let mut rmb_held = false;
         egui::CentralPanel::default()
             .frame(egui::Frame::none().fill(egui::Color32::TRANSPARENT))
             .show(ctx, |ui| {
@@ -246,13 +311,72 @@ impl eframe::App for App {
                 };
                 ui.painter()
                     .add(egui_wgpu::Callback::new_paint_callback(rect, cb));
+                canvas_rect = Some(rect);
+
+                if let Some(pos) = resp.hover_pos().or_else(|| resp.interact_pointer_pos()) {
+                    if rect.contains(pos) {
+                        pointer_in_canvas = Some(pos);
+                    }
+                }
 
                 if resp.clicked() {
                     if let Some(pos) = resp.interact_pointer_pos() {
                         click = Some((rect, pos));
                     }
                 }
+
+                // LMB / RMB held → cursor force tool. egui's response gives
+                // us drag state for the primary button; secondary is read
+                // from the pointer state.
+                lmb_held = resp.dragged_by(egui::PointerButton::Primary)
+                    || ui.input(|i| {
+                        i.pointer
+                            .button_down(egui::PointerButton::Primary)
+                            && resp.hovered()
+                    });
+                rmb_held = ui.input(|i| {
+                    i.pointer.button_down(egui::PointerButton::Secondary) && resp.hovered()
+                });
+
+                // Apply camera-invert toggles to drag deltas. We only
+                // touch the camera if the user is dragging inside the
+                // canvas, so the sidebar sliders aren't fighting it.
+                if resp.dragged_by(egui::PointerButton::Primary) && !lmb_held {
+                    // (no-op branch — see below; cursor force takes over LMB drag)
+                }
+                if resp.dragged_by(egui::PointerButton::Middle) {
+                    let d = resp.drag_delta();
+                    let mut dx = d.x;
+                    let mut dy = d.y;
+                    if self.state.camera.invert_mouse_x {
+                        dx = -dx;
+                    }
+                    if self.state.camera.invert_mouse_y {
+                        dy = -dy;
+                    }
+                    if let Some(wgpu_state) = frame.wgpu_render_state() {
+                        let mut renderer = wgpu_state.renderer.write();
+                        if let Some(pipes) =
+                            renderer.callback_resources.get_mut::<GraphPipelines>()
+                        {
+                            pipes.camera.rotate_yaw(dx * 0.005);
+                            pipes.camera.rotate_pitch(-dy * 0.005);
+                        }
+                    }
+                }
             });
+
+        self.prev_canvas_rect = canvas_rect;
+        self.last_pointer_in_canvas = pointer_in_canvas;
+        // Cursor force sign: LMB attract (negative), RMB repel (positive),
+        // matching the cheatsheet labels.
+        self.cursor_force_active = if lmb_held {
+            -1.0
+        } else if rmb_held {
+            1.0
+        } else {
+            0.0
+        };
 
         // Esc closes the modal.
         if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
@@ -282,9 +406,330 @@ impl eframe::App for App {
             self.kick_off_node_fetch(target);
         }
         if let Some((field, value)) = action.toggle_filter {
-            // Phase F's query model integrates the actual filter; for now log.
-            log::info!("[modal] toggle_filter({field}={value})");
+            self.append_filter_card(field, value);
         }
+
+        // ---- Per-frame wiring loops -----------------------------------
+        self.kick_off_pending_searches();
+        self.apply_style_to_gpu(frame);
+        self.apply_layout_to_gpu(frame);
+        self.apply_focus_to_gpu(frame);
+        self.apply_camera_to_gpu(frame);
+        self.apply_cursor_force(frame);
+        self.apply_selection(frame);
+        self.refresh_stats(frame);
+    }
+}
+
+impl App {
+    /// Append a Filter card from a modal badge click. If the last card
+    /// isn't already a connector or paren-open, prepend an AND connector
+    /// so the new filter joins the chain. Auto-focuses the Filter section
+    /// in the sidebar so the user sees the addition land.
+    fn append_filter_card(&mut self, field: String, value: String) {
+        use crate::ui::query::{Card, ConnectorOp};
+        let cards = &mut self.state.query.cards;
+        let needs_connector = match cards.last() {
+            None => false,
+            Some(Card::Connector { .. }) | Some(Card::ParenOpen) | Some(Card::Not) => false,
+            _ => true,
+        };
+        if needs_connector {
+            cards.push(Card::Connector { op: ConnectorOp::And });
+        }
+        cards.push(Card::Filter {
+            field,
+            op: crate::ui::query::Op::Eq,
+            value,
+        });
+        self.state.active_section = Some(ui::Section::Filter);
+    }
+
+    /// Walk the QueryModel and spawn a /search?q= fetch for any Search
+    /// card whose value isn't yet in the cache and isn't already inflight.
+    fn kick_off_pending_searches(&mut self) {
+        let pending = self.state.query.pending_searches();
+        let cache_keys: Vec<String> = {
+            let g = self.search_cache.lock().unwrap();
+            g.keys().cloned().collect()
+        };
+        for q in pending {
+            if cache_keys.iter().any(|k| k == &q) {
+                continue;
+            }
+            if !self.search_inflight.insert(q.clone()) {
+                continue;
+            }
+            let cache = self.search_cache.clone();
+            let id_to_idx = self.id_to_idx.clone();
+            let client = ApiClient::new(self.base_url.clone());
+            let q_owned = q.clone();
+            spawn_async(async move {
+                match client.search(&q_owned).await {
+                    Ok(results) => {
+                        let mut set: HashSet<u32> = HashSet::new();
+                        for id in results.ids {
+                            if let Some(&idx) = id_to_idx.get(&id) {
+                                set.insert(idx);
+                            }
+                        }
+                        cache.lock().unwrap().insert(q_owned, set);
+                    }
+                    Err(e) => {
+                        log::warn!("[graph-renderer] /search failed: {e}");
+                        // Insert empty so we don't loop forever on bad query.
+                        cache.lock().unwrap().insert(q_owned, HashSet::new());
+                    }
+                }
+            });
+        }
+    }
+
+    fn style_key(&self) -> (SizeBy, ColorBy, u32) {
+        (
+            self.state.style.size_by,
+            self.state.style.color_by,
+            self.state.style.size_mul.to_bits(),
+        )
+    }
+
+    fn apply_style_to_gpu(&mut self, frame: &mut eframe::Frame) {
+        if !self.loaded_into_gpu {
+            return;
+        }
+        let key = self.style_key();
+        if self.prev_style_key == Some(key) {
+            return;
+        }
+        let Some(wgpu_state) = frame.wgpu_render_state() else { return };
+        let queue = wgpu_state.queue.clone();
+        let n = self.ids.len();
+        let colors = data::colors_from_metric(
+            self.state.style.color_by.metric_key(),
+            &self.metrics,
+            n,
+        );
+        let sizes = data::sizes_from_metric(
+            self.state.style.size_by.metric_key(),
+            &self.metrics,
+            n,
+            self.state.style.size_mul,
+        );
+        let mut renderer = wgpu_state.renderer.write();
+        if let Some(pipes) = renderer.callback_resources.get_mut::<GraphPipelines>() {
+            pipes.update_colors(&queue, colors);
+            pipes.update_sizes(&queue, sizes);
+        }
+        self.prev_style_key = Some(key);
+        // Force a selection re-push so the dim alpha overlays the new colours.
+        self.prev_selected_hash = None;
+    }
+
+    fn layout_key(&self) -> u64 {
+        let l = &self.state.layout;
+        // Bit-pack the seven floats into a hash.
+        let bits = [
+            l.repulsion.to_bits(),
+            l.spring_k.to_bits(),
+            l.spring_len.to_bits(),
+            l.gravity.to_bits(),
+            l.damping.to_bits(),
+            l.dt.to_bits(),
+            l.steps_per_call.to_bits(),
+        ];
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        for b in bits {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x100_0000_01b3);
+        }
+        h
+    }
+
+    fn apply_layout_to_gpu(&mut self, frame: &mut eframe::Frame) {
+        if !self.loaded_into_gpu {
+            return;
+        }
+        let key = self.layout_key();
+        if self.prev_layout_key == Some(key) {
+            return;
+        }
+        let Some(wgpu_state) = frame.wgpu_render_state() else { return };
+        let mut renderer = wgpu_state.renderer.write();
+        if let Some(pipes) = renderer.callback_resources.get_mut::<GraphPipelines>() {
+            // Start from existing options so we keep cursor pos / grid_enabled / cooling.
+            let mut opts = pipes.layout_options().unwrap_or_else(GpuForceOptions::default);
+            let l = &self.state.layout;
+            opts.repulsion = l.repulsion;
+            opts.spring_k = l.spring_k;
+            opts.spring_len = l.spring_len;
+            opts.gravity = l.gravity;
+            opts.damping = l.damping;
+            opts.dt = l.dt;
+            opts.steps_per_call = l.steps_per_call.max(1.0) as u32;
+            // Default repulsion radius scales with spring_len if user didn't pin it.
+            opts.repulsion_radius = (4.0 * l.spring_len).max(1.0);
+            pipes.update_layout_options(opts);
+        }
+        self.prev_layout_key = Some(key);
+    }
+
+    fn focus_key(&self) -> u64 {
+        let f = &self.state.focus;
+        let bits = [f.distance.to_bits(), f.thickness.to_bits(), f.blur.to_bits(), f.max_coc.to_bits()];
+        let mut h: u64 = 0;
+        for b in bits {
+            h = h.wrapping_mul(31).wrapping_add(b as u64);
+        }
+        h
+    }
+
+    fn apply_focus_to_gpu(&mut self, frame: &mut eframe::Frame) {
+        if !self.loaded_into_gpu {
+            return;
+        }
+        let key = self.focus_key();
+        if self.prev_focus_key == Some(key) {
+            return;
+        }
+        let Some(wgpu_state) = frame.wgpu_render_state() else { return };
+        let mut renderer = wgpu_state.renderer.write();
+        if let Some(pipes) = renderer.callback_resources.get_mut::<GraphPipelines>() {
+            let f = &self.state.focus;
+            // Distance is interpreted relative to the camera along its forward.
+            let plane_z = pipes.camera.position.z - f.distance;
+            pipes.set_focus_plane(plane_z, f.thickness);
+            pipes.set_dof_params(f.blur, f.max_coc);
+        }
+        self.prev_focus_key = Some(key);
+    }
+
+    fn apply_camera_to_gpu(&mut self, frame: &mut eframe::Frame) {
+        if !self.loaded_into_gpu {
+            return;
+        }
+        let Some(wgpu_state) = frame.wgpu_render_state() else { return };
+        let mut renderer = wgpu_state.renderer.write();
+        let Some(pipes) = renderer.callback_resources.get_mut::<GraphPipelines>() else {
+            return;
+        };
+        if self.state.camera.follow_centroid {
+            if let Some(c) = pipes.centroid() {
+                // Look-toward c: keep current distance along forward, retarget.
+                let f = pipes.camera.forward();
+                let dist = (c - pipes.camera.position).length().max(50.0);
+                pipes.camera.position = c - f * dist;
+            }
+        }
+        if self.state.camera.fit_to_window {
+            // Cheap drift detector: refit if bounds extent doubles since last.
+            // We keep the implementation simple — just refit each frame is
+            // visually fine for a small graph and a no-op once converged.
+            pipes.fit_camera();
+        }
+    }
+
+    fn cursor_key(&self) -> u64 {
+        let c = &self.state.cursor;
+        let s = self.cursor_force_active.to_bits() as u64;
+        (c.radius.to_bits() as u64)
+            .wrapping_mul(31)
+            .wrapping_add(c.strength.to_bits() as u64)
+            .wrapping_mul(31)
+            .wrapping_add(c.depth.to_bits() as u64)
+            .wrapping_mul(31)
+            .wrapping_add(s)
+    }
+
+    fn apply_cursor_force(&mut self, frame: &mut eframe::Frame) {
+        if !self.loaded_into_gpu {
+            return;
+        }
+        let key = self.cursor_key();
+        if self.prev_cursor_key == Some(key) {
+            return;
+        }
+        let Some(wgpu_state) = frame.wgpu_render_state() else { return };
+        let mut renderer = wgpu_state.renderer.write();
+        if let Some(pipes) = renderer.callback_resources.get_mut::<GraphPipelines>() {
+            if self.cursor_force_active.abs() > 0.0 {
+                // Project the last canvas pointer to a world point at the
+                // configured depth in front of the camera.
+                let world: [f32; 3] = if let Some(pos) = self.last_pointer_in_canvas {
+                    let rect = self.prev_canvas_rect.unwrap_or(egui::Rect::NOTHING);
+                    let ndc_x = (pos.x - rect.left()) / rect.width().max(1.0) * 2.0 - 1.0;
+                    let ndc_y = -((pos.y - rect.top()) / rect.height().max(1.0) * 2.0 - 1.0);
+                    let (origin, dir) = pipes.camera.raycast(ndc_x, ndc_y);
+                    let target = origin + dir * self.state.cursor.depth.max(1.0);
+                    target.to_array()
+                } else {
+                    [0.0, 0.0, 0.0]
+                };
+                pipes.set_cursor_force(
+                    world,
+                    self.state.cursor.radius,
+                    self.state.cursor.strength * self.cursor_force_active,
+                );
+            } else {
+                pipes.set_cursor_force([0.0, 0.0, 0.0], 0.0, 0.0);
+            }
+        }
+        self.prev_cursor_key = Some(key);
+    }
+
+    fn apply_selection(&mut self, frame: &mut eframe::Frame) {
+        if !self.loaded_into_gpu {
+            return;
+        }
+        let cache = self.search_cache.lock().unwrap().clone();
+        let ctx = EvalContext::new(&self.ids, &self.id_to_idx, &cache);
+        let selected = self.state.query.evaluate(&ctx);
+        // hash for change-detect
+        let h: u64 = match &selected {
+            None => 0,
+            Some(set) => {
+                let mut acc: u64 = 1;
+                for &i in set {
+                    acc = acc.wrapping_mul(0x100_0000_01b3) ^ i as u64;
+                }
+                acc
+            }
+        };
+        if self.prev_selected_hash == Some(h) {
+            return;
+        }
+        let Some(wgpu_state) = frame.wgpu_render_state() else { return };
+        let queue = wgpu_state.queue.clone();
+        let mut renderer = wgpu_state.renderer.write();
+        if let Some(pipes) = renderer.callback_resources.get_mut::<GraphPipelines>() {
+            pipes.set_selected(&queue, selected.as_ref());
+        }
+        self.prev_selected_hash = Some(h);
+    }
+
+    fn refresh_stats(&mut self, frame: &mut eframe::Frame) {
+        if !self.loaded_into_gpu {
+            return;
+        }
+        let Some(wgpu_state) = frame.wgpu_render_state() else { return };
+        let renderer = wgpu_state.renderer.read();
+        if let Some(pipes) = renderer.callback_resources.get::<GraphPipelines>() {
+            self.state.stats.n_nodes = pipes.n_nodes();
+            self.state.stats.n_edges = pipes.n_edges();
+        }
+        // Communities: max value + 1 over the community metric.
+        if let Some(comm) = self.metrics.get("community") {
+            let mut mx: i64 = -1;
+            for &v in comm {
+                let i = v as i64;
+                if i > mx {
+                    mx = i;
+                }
+            }
+            self.state.stats.n_communities = (mx + 1).max(0) as u32;
+        }
+        // Sim status: keep "running" while sim is alive — a real readback
+        // hook can lower this to "settled" once is_halted lands here.
+        self.state.sim_status = ui::state::SimStatus::Running;
     }
 }
 

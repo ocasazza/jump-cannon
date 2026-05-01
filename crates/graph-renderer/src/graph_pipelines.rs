@@ -93,12 +93,7 @@ pub struct GraphPipelines {
 
 struct Buffers {
     positions: wgpu::Buffer,
-    // colors / sizes / edges are bound into bind groups at load() time and
-    // referenced from the GPU side; we keep handles on the struct so the
-    // bindings stay alive but never read them through the host again.
-    #[allow(dead_code)]
     colors: wgpu::Buffer,
-    #[allow(dead_code)]
     sizes: wgpu::Buffer,
     #[allow(dead_code)]
     edges: wgpu::Buffer,
@@ -110,9 +105,13 @@ struct Buffers {
     edge_bind_group: wgpu::BindGroup,
 
     layout: Option<GpuForceLayout>,
-    /// CPU caches for raycasting / fit.
+    /// CPU mirrors. positions/sizes used for raycast + fit; colors_base
+    /// is the per-node base RGBA so set_selected can multiply alpha
+    /// without losing the underlying tint.
     positions_cpu: Vec<f32>,
     sizes_cpu: Vec<f32>,
+    colors_base: Vec<f32>,
+    sizes_base: Vec<f32>,
     edges_cpu: Vec<u32>,
 }
 
@@ -359,6 +358,8 @@ impl GraphPipelines {
             }
         };
 
+        let colors_base = graph.colors.clone();
+        let sizes_base = graph.sizes.clone();
         self.buffers = Some(Buffers {
             positions,
             colors: colors_buf,
@@ -373,6 +374,8 @@ impl GraphPipelines {
             layout,
             positions_cpu: graph.positions,
             sizes_cpu: graph.sizes,
+            colors_base,
+            sizes_base,
             edges_cpu: graph.edges,
         });
 
@@ -492,6 +495,148 @@ impl GraphPipelines {
     }
     pub fn positions_cpu(&self) -> &[f32] {
         self.buffers.as_ref().map(|b| b.positions_cpu.as_slice()).unwrap_or(&[])
+    }
+
+    /// Replace per-node base RGBA. Length must equal `n_nodes * 4`.
+    /// Caller can then call `set_selected` to overlay dimming.
+    pub fn update_colors(&mut self, queue: &wgpu::Queue, colors: Vec<f32>) {
+        let Some(b) = self.buffers.as_mut() else { return };
+        if colors.len() != b.n_nodes as usize * 4 {
+            log::warn!(
+                "[graph-renderer] update_colors: len {} != n*4 {}",
+                colors.len(),
+                b.n_nodes * 4
+            );
+            return;
+        }
+        b.colors_base = colors.clone();
+        queue.write_buffer(&b.colors, 0, bytemuck::cast_slice(&colors));
+    }
+
+    /// Replace per-node screen-space radius (px). Length must equal `n_nodes`.
+    pub fn update_sizes(&mut self, queue: &wgpu::Queue, sizes: Vec<f32>) {
+        let Some(b) = self.buffers.as_mut() else { return };
+        if sizes.len() != b.n_nodes as usize {
+            log::warn!(
+                "[graph-renderer] update_sizes: len {} != n {}",
+                sizes.len(),
+                b.n_nodes
+            );
+            return;
+        }
+        b.sizes_base = sizes.clone();
+        b.sizes_cpu = sizes.clone();
+        queue.write_buffer(&b.sizes, 0, bytemuck::cast_slice(&sizes));
+    }
+
+    /// Apply a per-node alpha multiplier from the query selection. When
+    /// `selected` is `None` the base RGBA is restored. Otherwise nodes
+    /// not in the set drop to 0.18 alpha.
+    pub fn set_selected(&mut self, queue: &wgpu::Queue, selected: Option<&std::collections::HashSet<u32>>) {
+        let Some(b) = self.buffers.as_mut() else { return };
+        if b.colors_base.len() != b.n_nodes as usize * 4 {
+            return;
+        }
+        let mut out: Vec<f32> = b.colors_base.clone();
+        if let Some(set) = selected {
+            for i in 0..b.n_nodes as usize {
+                let off = i * 4 + 3;
+                if !set.contains(&(i as u32)) {
+                    out[off] = b.colors_base[off] * 0.18;
+                }
+            }
+        }
+        queue.write_buffer(&b.colors, 0, bytemuck::cast_slice(&out));
+    }
+
+    /// Update the focal plane center + thickness (effects uniform).
+    pub fn set_focus_plane(&mut self, z: f32, thickness: f32) {
+        self.effects.focus_plane_z = z;
+        self.effects.focus_thickness = thickness.max(1.0);
+    }
+
+    /// Update DoF blur strength + max circle-of-confusion.
+    pub fn set_dof_params(&mut self, blur: f32, max_coc: f32) {
+        self.effects.blur_strength = blur.max(0.0);
+        self.effects.max_coc = max_coc.max(0.0);
+    }
+
+    /// Push the cursor force into the GPU layout. radius=0 disables.
+    pub fn set_cursor_force(&mut self, world: [f32; 3], radius: f32, strength: f32) {
+        let Some(b) = self.buffers.as_mut() else { return };
+        let Some(l) = b.layout.as_mut() else { return };
+        let mut opts = l.options().clone();
+        opts.cursor_pos = world;
+        opts.cursor_radius = radius;
+        opts.cursor_strength = strength;
+        l.set_options(opts);
+        // Mirror the visual radius into the effects uniform so the
+        // shader can render a hint ring at the cursor.
+        self.effects.cursor_radius_visual = radius;
+    }
+
+    /// Replace the entire layout option block. Wakes the sim.
+    pub fn update_layout_options(&mut self, opts: GpuForceOptions) {
+        let Some(b) = self.buffers.as_mut() else { return };
+        let Some(l) = b.layout.as_mut() else { return };
+        l.set_options(opts);
+    }
+
+    /// Current layout options snapshot, if a layout exists.
+    pub fn layout_options(&self) -> Option<GpuForceOptions> {
+        self.buffers
+            .as_ref()
+            .and_then(|b| b.layout.as_ref())
+            .map(|l| l.options().clone())
+    }
+
+    /// Centroid of currently-loaded node positions (CPU mirror —
+    /// reflects the bootstrap state, not the live GPU sim, which is
+    /// fine for follow-centroid steering at this scale).
+    pub fn centroid(&self) -> Option<Vec3> {
+        let b = self.buffers.as_ref()?;
+        if b.positions_cpu.is_empty() {
+            return None;
+        }
+        let mut sum = Vec3::ZERO;
+        let mut n = 0usize;
+        for chunk in b.positions_cpu.chunks_exact(3) {
+            sum += Vec3::new(chunk[0], chunk[1], chunk[2]);
+            n += 1;
+        }
+        if n == 0 {
+            None
+        } else {
+            Some(sum / n as f32)
+        }
+    }
+
+    /// Axis-aligned bounds of the loaded node positions.
+    pub fn bounds(&self) -> Option<(Vec3, Vec3)> {
+        let b = self.buffers.as_ref()?;
+        if b.positions_cpu.is_empty() {
+            return None;
+        }
+        let mut mn = Vec3::splat(f32::INFINITY);
+        let mut mx = Vec3::splat(f32::NEG_INFINITY);
+        for chunk in b.positions_cpu.chunks_exact(3) {
+            let p = Vec3::new(chunk[0], chunk[1], chunk[2]);
+            mn = mn.min(p);
+            mx = mx.max(p);
+        }
+        if mn.is_finite() && mx.is_finite() {
+            Some((mn, mx))
+        } else {
+            None
+        }
+    }
+
+    /// Re-fit the camera to the current bounds. Used by the camera
+    /// section's "Fit" button and the auto-fit toggle.
+    pub fn fit_camera(&mut self) {
+        if let Some((mn, mx)) = self.bounds() {
+            self.camera.fit_to_bounds(mn, mx);
+        }
     }
 }
 

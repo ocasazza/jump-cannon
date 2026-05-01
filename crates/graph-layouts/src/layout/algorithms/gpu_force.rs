@@ -88,10 +88,6 @@ impl Default for GpuForceOptions {
     }
 }
 
-#[cfg(feature = "_serde_gpu")]
-mod _ignore {
-    // intentionally empty
-}
 
 // Hand-rolled serde so callers can pass JSON through the WASM bridge
 // without dragging serde derives onto wgpu types.

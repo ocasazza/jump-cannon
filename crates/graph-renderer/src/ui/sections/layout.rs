@@ -23,7 +23,7 @@ pub fn show(ui: &mut egui::Ui, state: &mut AppState) {
                     egui::Stroke::new(1.0, egui::Color32::WHITE)
                 });
             if ui.add(btn).clicked() {
-                state.layout.preset = preset;
+                preset.apply_to(&mut state.layout);
             }
         }
     });

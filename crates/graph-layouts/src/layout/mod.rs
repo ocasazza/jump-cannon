@@ -3,10 +3,13 @@ use crate::types::{Graph, LayoutAlgorithm};
 pub mod traits;
 pub mod algorithms;
 
+#[allow(unused_imports)]
 pub use traits::*;
+#[allow(unused_imports)]
 pub use algorithms::*;
 
 /// Apply a layout algorithm to a graph
+#[allow(dead_code)]
 pub fn apply_layout(graph: &mut Graph, layout: &LayoutAlgorithm) -> Result<(), String> {
     match layout {
         LayoutAlgorithm::Fcose(options) => algorithms::fcose::apply_layout(graph, options),

@@ -347,6 +347,7 @@ impl Default for KlayLayeredLayoutOptions {
 }
 
 /// Enum representing all supported layout algorithms
+#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum LayoutAlgorithm {

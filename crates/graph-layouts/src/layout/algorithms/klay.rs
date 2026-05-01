@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 use std::collections::HashSet;
 use crate::types::{Graph, KlayLayeredLayoutOptions};
 use crate::layout::traits::{LayoutEngine, LayeredLayout};

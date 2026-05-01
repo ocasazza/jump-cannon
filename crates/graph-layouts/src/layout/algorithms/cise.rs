@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 use crate::types::{Graph, CiseLayoutOptions};
 use crate::layout::traits::{LayoutEngine, CircularLayout};
 

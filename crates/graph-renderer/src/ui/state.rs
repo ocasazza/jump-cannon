@@ -67,6 +67,16 @@ impl SizeBy {
             SizeBy::Recency => "Recency",
         }
     }
+    /// Bootstrap.metrics key — "uniform" is a sentinel handled specially
+    /// in [`crate::data::sizes_from_metric`].
+    pub fn metric_key(self) -> &'static str {
+        match self {
+            SizeBy::PageRank => "pagerank",
+            SizeBy::Degree => "degree",
+            SizeBy::Uniform => "uniform",
+            SizeBy::Recency => "recency",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -91,6 +101,14 @@ impl ColorBy {
             ColorBy::Folder => "Folder",
             ColorBy::Recency => "Recency",
             ColorBy::Doctype => "Doctype",
+        }
+    }
+    pub fn metric_key(self) -> &'static str {
+        match self {
+            ColorBy::Community => "community",
+            ColorBy::Folder => "folder",
+            ColorBy::Recency => "recency",
+            ColorBy::Doctype => "doctype",
         }
     }
 }
@@ -118,6 +136,43 @@ pub enum LayoutPreset {
     #[default]
     Balanced,
     Pretty,
+}
+
+impl LayoutPreset {
+    /// Apply the canonical slider values for this preset. Used by the
+    /// preset buttons so the user sees the sliders update on click.
+    pub fn apply_to(self, l: &mut LayoutState) {
+        match self {
+            LayoutPreset::Fast => {
+                l.repulsion = 200.0;
+                l.spring_k = 0.10;
+                l.spring_len = 30.0;
+                l.gravity = 0.005;
+                l.damping = 0.78;
+                l.dt = 0.04;
+                l.steps_per_call = 8.0;
+            }
+            LayoutPreset::Balanced => {
+                l.repulsion = 800.0;
+                l.spring_k = 0.05;
+                l.spring_len = 60.0;
+                l.gravity = 0.02;
+                l.damping = 0.85;
+                l.dt = 0.016;
+                l.steps_per_call = 4.0;
+            }
+            LayoutPreset::Pretty => {
+                l.repulsion = 2000.0;
+                l.spring_k = 0.03;
+                l.spring_len = 120.0;
+                l.gravity = 0.04;
+                l.damping = 0.92;
+                l.dt = 0.012;
+                l.steps_per_call = 2.0;
+            }
+        }
+        l.preset = self;
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -214,6 +269,15 @@ pub enum SimStatus {
     Error,
 }
 
+/// Runtime-only stats surfaced in the Stats section. Not persisted — App
+/// repopulates each frame from GraphPipelines / Bootstrap.
+#[derive(Clone, Debug, Default)]
+pub struct LiveStats {
+    pub n_nodes: u32,
+    pub n_edges: u32,
+    pub n_communities: u32,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
 pub struct AppState {
     pub active_section: Option<Section>,
@@ -226,6 +290,8 @@ pub struct AppState {
     pub sim_status: SimStatus,
     #[serde(default)]
     pub query: QueryModel,
+    #[serde(skip)]
+    pub stats: LiveStats,
 }
 
 pub const STORAGE_KEY: &str = "graph_renderer_app_state_v1";

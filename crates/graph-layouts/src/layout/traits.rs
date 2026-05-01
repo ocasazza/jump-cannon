@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 use crate::types::Graph;
 
 /// Common trait for all layout algorithms

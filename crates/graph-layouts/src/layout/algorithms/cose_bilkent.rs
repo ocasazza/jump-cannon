@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 use crate::types::{Graph, CoseBilkentLayoutOptions};
 use crate::layout::traits::{LayoutEngine, ForceDirectedLayout};
 
@@ -61,7 +62,7 @@ impl ForceDirectedLayout for CoseBilkentLayoutEngine {
         
         // Calculate repulsive forces between all pairs of nodes
         for i in 0..node_count {
-            let (id_i, node_i) = nodes[i];
+            let (_id_i, node_i) = nodes[i];
             let pos_i = node_i.position.unwrap_or((0.0, 0.0));
             
             for j in 0..node_count {

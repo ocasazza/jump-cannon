@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 use crate::types::{Graph, ConcentricLayoutOptions};
 use crate::layout::traits::{LayoutEngine, HierarchicalLayout};
 
