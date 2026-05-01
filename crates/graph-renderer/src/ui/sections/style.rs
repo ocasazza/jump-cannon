@@ -2,18 +2,17 @@ use eframe::egui;
 
 use crate::ui::state::{AppState, ColorBy, SizeBy};
 
+use super::subgroup_label;
+
 pub fn show(ui: &mut egui::Ui, state: &mut AppState) {
     ui.horizontal(|ui| {
-        ui.heading("STYLE");
         let avail = ui.available_size_before_wrap();
         ui.add_space(avail.x - 58.0);
         if ui.small_button("↺ Reset").clicked() {
             state.style = Default::default();
         }
     });
-    ui.add_space(4.0);
-
-    ui.label("Size by");
+    subgroup_label(ui, "Size by");
     egui::ComboBox::from_id_salt("style-size-by")
         .selected_text(state.style.size_by.label())
         .show_ui(ui, |ui| {
@@ -23,7 +22,7 @@ pub fn show(ui: &mut egui::Ui, state: &mut AppState) {
         });
 
     ui.add_space(8.0);
-    ui.label("Color by");
+    subgroup_label(ui, "Color by");
     egui::ComboBox::from_id_salt("style-color-by")
         .selected_text(state.style.color_by.label())
         .show_ui(ui, |ui| {
@@ -33,6 +32,6 @@ pub fn show(ui: &mut egui::Ui, state: &mut AppState) {
         });
 
     ui.add_space(8.0);
-    ui.label("Size multiplier");
+    subgroup_label(ui, "Size multiplier");
     ui.add(egui::Slider::new(&mut state.style.size_mul, 0.25..=4.0).text("×"));
 }

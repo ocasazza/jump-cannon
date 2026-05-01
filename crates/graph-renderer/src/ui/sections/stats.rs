@@ -3,6 +3,8 @@ use eframe::egui;
 use crate::ui::state::{AppState, SimStatus};
 use crate::ui::theme::accent;
 
+use super::{subgroup_label, subgroup_separator};
+
 pub fn show(ui: &mut egui::Ui, state: &mut AppState) {
     // Status dot.
     let (dot_color, label) = match state.sim_status {
@@ -30,12 +32,8 @@ pub fn show(ui: &mut egui::Ui, state: &mut AppState) {
     ui.label(egui::RichText::new(format!("edges       {m}")).monospace());
     ui.label(egui::RichText::new(format!("communities {c}")).monospace());
 
-    ui.add_space(12.0);
-    ui.label(
-        egui::RichText::new("CHEATSHEET")
-            .size(10.0)
-            .color(egui::Color32::from_gray(150)),
-    );
+    subgroup_separator(ui);
+    subgroup_label(ui, "Cheatsheet");
     ui.add_space(4.0);
     let lines = [
         "WASD   pan",

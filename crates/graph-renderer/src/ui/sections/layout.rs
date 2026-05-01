@@ -3,9 +3,10 @@ use eframe::egui;
 use crate::ui::state::{AppState, LayoutPreset};
 use crate::ui::theme::accent;
 
+use super::{hint_label, subgroup_label, subgroup_separator};
+
 pub fn show(ui: &mut egui::Ui, state: &mut AppState) {
     ui.horizontal(|ui| {
-        ui.heading("LAYOUT");
         let avail = ui.available_size_before_wrap();
         ui.add_space(avail.x - 58.0);
         if ui.small_button("↺ Reset").clicked() {
@@ -14,9 +15,9 @@ pub fn show(ui: &mut egui::Ui, state: &mut AppState) {
             preset.apply_to(&mut state.layout);
         }
     });
+    // Preset buttons row.
+    subgroup_label(ui, "Preset");
     ui.add_space(4.0);
-
-    ui.label("Preset");
     ui.horizontal(|ui| {
         for (preset, label) in [
             (LayoutPreset::Fast, "Fast"),
@@ -40,7 +41,11 @@ pub fn show(ui: &mut egui::Ui, state: &mut AppState) {
         }
     });
 
-    ui.add_space(10.0);
+    subgroup_separator(ui);
+
+    // Physics parameters.
+    subgroup_label(ui, "Physics");
+    ui.add_space(4.0);
     let l = &mut state.layout;
     ui.add(egui::Slider::new(&mut l.repulsion, 0.0..=4000.0).text("repulsion"));
     ui.add(egui::Slider::new(&mut l.spring_k, 0.0..=1.0).text("spring_k"));
@@ -49,12 +54,22 @@ pub fn show(ui: &mut egui::Ui, state: &mut AppState) {
     ui.add(egui::Slider::new(&mut l.damping, 0.0..=1.0).text("damping"));
     ui.add(egui::Slider::new(&mut l.dt, 0.001..=0.1).text("dt"));
     ui.add(egui::Slider::new(&mut l.steps_per_call, 1.0..=32.0).text("steps/call"));
-    ui.add_space(6.0);
-    ui.label("Cooling — drives sim toward steady state");
+
+    subgroup_separator(ui);
+
+    // Cooling group.
+    subgroup_label(ui, "Cooling");
+    hint_label(ui, "Drives sim toward steady state");
+    ui.add_space(4.0);
     ui.add(egui::Slider::new(&mut l.cooling_alpha, 0.9..=1.0).text("cooling α"));
     ui.add(egui::Slider::new(&mut l.cooling_floor, 0.0..=1.0).text("cooling floor"));
-    ui.add_space(6.0);
-    ui.label("Auto-halt — stop dispatching when truly settled");
+
+    subgroup_separator(ui);
+
+    // Auto-halt group.
+    subgroup_label(ui, "Auto-halt");
+    hint_label(ui, "Stop dispatching when truly settled");
+    ui.add_space(4.0);
     ui.add(
         egui::Slider::new(&mut l.energy_threshold, 0.0..=1.0)
             .text("energy halt threshold"),
