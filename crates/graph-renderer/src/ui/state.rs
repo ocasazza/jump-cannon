@@ -6,6 +6,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::ui::query::QueryModel;
+
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub enum Section {
     Filter,
@@ -222,6 +224,8 @@ pub struct AppState {
     pub cursor: CursorState,
     #[serde(default)]
     pub sim_status: SimStatus,
+    #[serde(default)]
+    pub query: QueryModel,
 }
 
 pub const STORAGE_KEY: &str = "graph_renderer_app_state_v1";
