@@ -45,6 +45,9 @@ struct CameraUniform {
     _pad1: [f32; 2],
 }
 
+// Mirrors `EffectsUniform` in shaders/{node,edge}.wgsl byte-for-byte.
+// Total size: 16 f32 = 64 bytes. The vec4 (`edge_color`) sits at offset 32
+// so its 16-byte WGSL alignment is naturally satisfied.
 #[repr(C)]
 #[derive(Copy, Clone, Pod, Zeroable)]
 struct EffectsUniform {
@@ -53,18 +56,39 @@ struct EffectsUniform {
     cursor_radius_visual: f32,
     blur_strength: f32,
     max_coc: f32,
-    _pad: [f32; 3],
+    edge_alpha_mul: f32,
+    edge_dist_min: f32,
+    edge_dist_max: f32,
+    edge_color: [f32; 4],
+    edge_min_transparency: f32,
+    _pad0: f32,
+    _pad1: f32,
+    _pad2: f32,
 }
 
 impl Default for EffectsUniform {
     fn default() -> Self {
         Self {
             focus_plane_z: 800.0,
+            // 1e9 = "DoF off" sentinel — node.wgsl skips the bokeh path
+            // entirely while focus_thickness >= 1e6.
             focus_thickness: 1.0e9,
             cursor_radius_visual: 0.0,
             blur_strength: 0.05,
             max_coc: 60.0,
-            _pad: [0.0; 3],
+            // Cosmograph-style edge defaults: thin alpha lines that stack
+            // on a near-black background. linkColor #3a4880 → linear-ish
+            // (0.227, 0.282, 0.502, 1.0); alpha-mul 0.6 mimics the demo's
+            // density. distance range 10..400 with min-transparency 0.6
+            // means long edges hold ~40% visibility, never disappearing.
+            edge_alpha_mul: 0.6,
+            edge_dist_min: 10.0,
+            edge_dist_max: 400.0,
+            edge_color: [0.227, 0.282, 0.502, 1.0],
+            edge_min_transparency: 0.6,
+            _pad0: 0.0,
+            _pad1: 0.0,
+            _pad2: 0.0,
         }
     }
 }
@@ -559,6 +583,26 @@ impl GraphPipelines {
     pub fn set_dof_params(&mut self, blur: f32, max_coc: f32) {
         self.effects.blur_strength = blur.max(0.0);
         self.effects.max_coc = max_coc.max(0.0);
+    }
+
+    /// Update cosmograph-style edge appearance. `color` is RGBA in 0..1.
+    /// `dist_range = (min, max)` is the visibility distance range from
+    /// the reference (`linkVisibilityDistanceRange`). `min_transparency`
+    /// is the floor at long distances (`linkVisibilityMinTransparency`).
+    pub fn set_edge_style(
+        &mut self,
+        color: [f32; 4],
+        alpha_mul: f32,
+        dist_range: (f32, f32),
+        min_transparency: f32,
+    ) {
+        self.effects.edge_color = color;
+        self.effects.edge_alpha_mul = alpha_mul.max(0.0);
+        let lo = dist_range.0.max(0.0);
+        let hi = dist_range.1.max(lo + 0.001);
+        self.effects.edge_dist_min = lo;
+        self.effects.edge_dist_max = hi;
+        self.effects.edge_min_transparency = min_transparency.clamp(0.0, 1.0);
     }
 
     /// Push the cursor force into the GPU layout. radius=0 disables.

@@ -5,6 +5,7 @@
 
 use eframe::egui;
 
+use super::actions::ActionRegistry;
 use super::sections;
 use super::state::{AppState, Section};
 
@@ -12,10 +13,10 @@ const ACTIVITY_W: f32 = 44.0;
 const ACTIVITY_BTN: f32 = 40.0;
 const SECTION_W: f32 = 280.0;
 
-pub fn show(ctx: &egui::Context, state: &mut AppState) {
+pub fn show(ctx: &egui::Context, state: &mut AppState, registry: &mut ActionRegistry) {
     show_activity_bar(ctx, state);
     if let Some(active) = state.active_section {
-        show_section_panel(ctx, state, active);
+        show_section_panel(ctx, state, active, registry);
     }
 }
 
@@ -168,10 +169,26 @@ fn draw_icon(painter: &egui::Painter, rect: egui::Rect, section: Section, color:
                 s,
             );
         }
+        // Instances: stacked rectangles (cards).
+        Section::Instances => {
+            for i in 0..3 {
+                let off = -6.0 + i as f32 * 4.0;
+                let rect = egui::Rect::from_center_size(
+                    egui::pos2(center.x, center.y + off),
+                    egui::vec2(16.0, 3.0),
+                );
+                painter.rect_stroke(rect, 0.0, s);
+            }
+        }
     }
 }
 
-fn show_section_panel(ctx: &egui::Context, state: &mut AppState, active: Section) {
+fn show_section_panel(
+    ctx: &egui::Context,
+    state: &mut AppState,
+    active: Section,
+    registry: &mut ActionRegistry,
+) {
     egui::SidePanel::left("section-panel")
         .exact_width(SECTION_W)
         .resizable(false)
@@ -188,7 +205,7 @@ fn show_section_panel(ctx: &egui::Context, state: &mut AppState, active: Section
         )
         .show(ctx, |ui| {
             egui::ScrollArea::vertical().show(ui, |ui| {
-                sections::show(ui, active, state);
+                sections::show(ui, active, state, registry);
             });
         });
 }

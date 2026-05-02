@@ -1,0 +1,759 @@
+//! Ctrl+P command palette. Ports `archive/nuxt/components/CommandPalette.vue`.
+//!
+//! Two render modes:
+//!   * search/list mode — fuzzy-matched action list with breadcrumb +
+//!     category root; arrow-key navigation, Enter to descend or execute.
+//!   * parameter form mode — driven by `ActionRegistry::configuring`,
+//!     walks one parameter at a time with per-param validation.
+//!
+//! Outcome: an `Execute { action_id, params }` is bubbled up to the App,
+//! which runs the actual handler (it owns AppState + GraphPipelines).
+
+use std::collections::HashMap;
+
+use eframe::egui;
+
+use super::actions::{
+    Action, ActionParameter, ActionRegistry, ParamValue, ParameterType,
+};
+use super::state::WorkspaceSettings;
+use super::theme::accent;
+
+#[derive(Debug, Clone, Default)]
+pub struct CommandPaletteState {
+    pub open: bool,
+    pub query: String,
+    /// Stack of parent action ids ("settings" → "node-operations" etc.).
+    pub breadcrumb: Vec<String>,
+    pub selected_idx: usize,
+    /// Set by the App after toggling open so we focus the input next frame.
+    pub focus_input: bool,
+    /// Set when a row is clicked mid-render so the outer return path can
+    /// surface it after the ScrollArea closure returns.
+    pub(crate) activated: Option<PaletteOutcome>,
+}
+
+impl CommandPaletteState {
+    pub fn open(&mut self) {
+        self.open = true;
+        self.query.clear();
+        self.breadcrumb.clear();
+        self.selected_idx = 0;
+        self.focus_input = true;
+    }
+    pub fn close(&mut self) {
+        self.open = false;
+        self.query.clear();
+        self.breadcrumb.clear();
+        self.selected_idx = 0;
+    }
+    pub fn toggle(&mut self) {
+        if self.open { self.close() } else { self.open() }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum PaletteOutcome {
+    None,
+    Execute {
+        action_id: String,
+        params: HashMap<String, ParamValue>,
+    },
+}
+
+pub fn show(
+    ctx: &egui::Context,
+    state: &mut CommandPaletteState,
+    registry: &mut ActionRegistry,
+    workspace: &WorkspaceSettings,
+) -> PaletteOutcome {
+    if !state.open {
+        return PaletteOutcome::None;
+    }
+
+    // Esc closes (above the modal Esc handler — palette wins if open).
+    if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+        if registry.configuring.is_some() {
+            registry.cancel_configuring();
+        } else {
+            state.close();
+        }
+        return PaletteOutcome::None;
+    }
+
+    let mut outcome = PaletteOutcome::None;
+
+    egui::Window::new("command-palette")
+        .title_bar(false)
+        .resizable(false)
+        .collapsible(false)
+        .anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, ctx.screen_rect().height() * 0.18))
+        .fixed_size(egui::vec2(600.0, 0.0))
+        .frame(
+            egui::Frame::none()
+                .fill(egui::Color32::from_rgb(0x10, 0x12, 0x16))
+                .stroke(egui::Stroke::new(1.0, egui::Color32::WHITE))
+                .inner_margin(egui::Margin::same(0.0)),
+        )
+        .show(ctx, |ui| {
+            if registry.configuring.is_some() {
+                outcome = render_param_form(ui, registry, workspace);
+            } else {
+                outcome = render_search(ui, state, registry, workspace);
+            }
+        });
+
+    outcome
+}
+
+// ----- search / list mode --------------------------------------------------
+
+fn render_search(
+    ui: &mut egui::Ui,
+    state: &mut CommandPaletteState,
+    registry: &mut ActionRegistry,
+    workspace: &WorkspaceSettings,
+) -> PaletteOutcome {
+    // Breadcrumb.
+    if !state.breadcrumb.is_empty() {
+        ui.horizontal(|ui| {
+            ui.add_space(10.0);
+            let mut pop_to: Option<usize> = None;
+            for (idx, parent_id) in state.breadcrumb.clone().iter().enumerate() {
+                let title = registry
+                    .get(parent_id)
+                    .map(|a| a.title.clone())
+                    .unwrap_or_else(|| parent_id.clone());
+                if ui.link(&title).clicked() {
+                    pop_to = Some(idx);
+                }
+                if idx + 1 < state.breadcrumb.len() {
+                    ui.label(" / ");
+                }
+            }
+            if let Some(idx) = pop_to {
+                state.breadcrumb.truncate(idx + 1);
+                state.query.clear();
+                state.selected_idx = 0;
+            }
+        });
+        ui.separator();
+    }
+
+    // Search input.
+    let input_id = egui::Id::new("command-palette-input");
+    ui.horizontal(|ui| {
+        ui.add_space(8.0);
+        let resp = ui.add_sized(
+            [ui.available_width() - 8.0, 28.0],
+            egui::TextEdit::singleline(&mut state.query)
+                .id(input_id)
+                .hint_text("Type a command or search…"),
+        );
+        if state.focus_input {
+            resp.request_focus();
+            state.focus_input = false;
+        }
+    });
+
+    // Filter actions for the current scope.
+    let scope_actions: Vec<Action> = current_scope(registry, &state.breadcrumb)
+        .into_iter()
+        .cloned()
+        .collect();
+    let ranked: Vec<(Action, MatchInfo)> = if state.query.trim().is_empty() {
+        scope_actions
+            .into_iter()
+            .map(|a| (a, MatchInfo::default()))
+            .collect()
+    } else {
+        let mut scored: Vec<(Action, MatchInfo)> = scope_actions
+            .into_iter()
+            .filter_map(|a| fuzzy_score(&a, &state.query).map(|m| (a, m)))
+            .collect();
+        scored.sort_by(|x, y| y.1.score.cmp(&x.1.score));
+        scored
+    };
+
+    // Keyboard navigation.
+    let key_down = ui.input(|i| i.key_pressed(egui::Key::ArrowDown));
+    let key_up = ui.input(|i| i.key_pressed(egui::Key::ArrowUp));
+    let key_enter = ui.input(|i| i.key_pressed(egui::Key::Enter));
+    let key_tab = ui.input(|i| i.key_pressed(egui::Key::Tab));
+    let key_backspace_empty =
+        state.query.is_empty() && ui.input(|i| i.key_pressed(egui::Key::Backspace));
+
+    if !ranked.is_empty() {
+        if key_down {
+            state.selected_idx = (state.selected_idx + 1) % ranked.len();
+        }
+        if key_up {
+            state.selected_idx = (state.selected_idx + ranked.len() - 1) % ranked.len();
+        }
+        if state.selected_idx >= ranked.len() {
+            state.selected_idx = 0;
+        }
+    }
+    if key_backspace_empty && !state.breadcrumb.is_empty() {
+        state.breadcrumb.pop();
+        state.selected_idx = 0;
+    }
+
+    // Tab completes query with selected title.
+    if key_tab && !ranked.is_empty() {
+        state.query = ranked[state.selected_idx].0.title.clone();
+    }
+
+    // Group root entries by category when the user hasn't typed anything
+    // and isn't drilled into a child scope (mirrors the Vue palette's
+    // `category-section` block).
+    let group_by_category = state.breadcrumb.is_empty() && state.query.trim().is_empty();
+
+    // Render list.
+    ui.add_space(4.0);
+    egui::ScrollArea::vertical()
+        .max_height(ctx_screen_h(ui.ctx()) * 0.6)
+        .show(ui, |ui| {
+            if ranked.is_empty() {
+                ui.add_space(16.0);
+                ui.vertical_centered(|ui| {
+                    ui.label(
+                        egui::RichText::new("No matching actions found")
+                            .color(egui::Color32::GRAY),
+                    );
+                });
+                ui.add_space(16.0);
+                return;
+            }
+
+            let mut row_idx = 0usize;
+            let render_row = |ui: &mut egui::Ui,
+                              row_idx: &mut usize,
+                              action: &Action,
+                              mi: &MatchInfo,
+                              state: &mut CommandPaletteState,
+                              registry: &mut ActionRegistry,
+                              workspace: &WorkspaceSettings| {
+                let active = *row_idx == state.selected_idx;
+                let resp = render_action_row(ui, action, mi, active);
+                if resp.hovered() {
+                    state.selected_idx = *row_idx;
+                }
+                if resp.clicked() {
+                    let outcome = enter_action(action, state, registry, workspace);
+                    if !matches!(outcome, PaletteOutcome::None) {
+                        state.activated.replace(outcome);
+                    }
+                }
+                *row_idx += 1;
+            };
+
+            if group_by_category {
+                // Stable category order from registry; uncategorised last.
+                let mut by_cat: Vec<(String, Vec<(Action, MatchInfo)>)> = Vec::new();
+                let mut uncategorised: Vec<(Action, MatchInfo)> = Vec::new();
+                for (a, mi) in &ranked {
+                    match &a.category {
+                        Some(c) => {
+                            if let Some(slot) = by_cat.iter_mut().find(|(name, _)| name == c) {
+                                slot.1.push((a.clone(), mi.clone()));
+                            } else {
+                                by_cat.push((c.clone(), vec![(a.clone(), mi.clone())]));
+                            }
+                        }
+                        None => uncategorised.push((a.clone(), mi.clone())),
+                    }
+                }
+                for (cat, items) in &by_cat {
+                    category_header(ui, cat);
+                    for (a, mi) in items {
+                        render_row(ui, &mut row_idx, a, mi, state, registry, workspace);
+                    }
+                }
+                if !uncategorised.is_empty() {
+                    category_header(ui, "Other");
+                    for (a, mi) in &uncategorised {
+                        render_row(ui, &mut row_idx, a, mi, state, registry, workspace);
+                    }
+                }
+            } else {
+                for (a, mi) in &ranked {
+                    render_row(ui, &mut row_idx, a, mi, state, registry, workspace);
+                }
+            }
+        });
+
+    if key_enter && !ranked.is_empty() {
+        let action = ranked[state.selected_idx].0.clone();
+        let outcome = enter_action(&action, state, registry, workspace);
+        if !matches!(outcome, PaletteOutcome::None) {
+            return outcome;
+        }
+    }
+
+    state.activated.take().unwrap_or(PaletteOutcome::None)
+}
+
+fn current_scope<'a>(reg: &'a ActionRegistry, breadcrumb: &[String]) -> Vec<&'a Action> {
+    if let Some(parent) = breadcrumb.last() {
+        reg.child_actions(parent)
+    } else {
+        reg.root_actions()
+    }
+}
+
+fn enter_action(
+    action: &Action,
+    state: &mut CommandPaletteState,
+    registry: &mut ActionRegistry,
+    workspace: &WorkspaceSettings,
+) -> PaletteOutcome {
+    if !action.children_ids.is_empty() {
+        // Drill down into children.
+        state.breadcrumb.push(action.id.clone());
+        state.query.clear();
+        state.selected_idx = 0;
+        state.focus_input = true;
+        return PaletteOutcome::None;
+    }
+    if action.parameters.is_empty() {
+        // Execute immediately.
+        state.close();
+        return PaletteOutcome::Execute {
+            action_id: action.id.clone(),
+            params: HashMap::new(),
+        };
+    }
+    // Parameterized: enter form mode, smart-default from workspace for
+    // settings actions.
+    let initial = if action.parent_id.as_deref() == Some("settings") {
+        workspace_initial_for(action, workspace)
+    } else {
+        HashMap::new()
+    };
+    registry.start_configuring(&action.id, &initial);
+    PaletteOutcome::None
+}
+
+fn workspace_initial_for(
+    action: &Action,
+    workspace: &WorkspaceSettings,
+) -> HashMap<String, ParamValue> {
+    let mut m = HashMap::new();
+    for p in &action.parameters {
+        match p.id.as_str() {
+            "font_size" => {
+                m.insert(p.id.clone(), ParamValue::Number(workspace.font_size as f64));
+            }
+            "font_family" => {
+                let s = match workspace.font_family {
+                    super::state::FontFamilyChoice::Monospace => "monospace",
+                    super::state::FontFamilyChoice::SansSerif => "sans-serif",
+                    super::state::FontFamilyChoice::Serif => "serif",
+                };
+                m.insert(p.id.clone(), ParamValue::Selected(vec![s.into()]));
+            }
+            "show_line_numbers" => {
+                m.insert(p.id.clone(), ParamValue::Boolean(workspace.show_line_numbers));
+            }
+            _ => {}
+        }
+    }
+    m
+}
+
+// ----- parameter form mode -------------------------------------------------
+
+fn render_param_form(
+    ui: &mut egui::Ui,
+    registry: &mut ActionRegistry,
+    _workspace: &WorkspaceSettings,
+) -> PaletteOutcome {
+    let cfg_snapshot = registry.configuring.clone();
+    let Some(cfg) = cfg_snapshot else {
+        return PaletteOutcome::None;
+    };
+    let action = match registry.get(&cfg.action_id) {
+        Some(a) => a.clone(),
+        None => {
+            registry.cancel_configuring();
+            return PaletteOutcome::None;
+        }
+    };
+    let n_params = action.parameters.len();
+    let idx = cfg.current_param_index.min(n_params.saturating_sub(1));
+    let is_last = idx + 1 == n_params;
+
+    ui.horizontal(|ui| {
+        ui.add_space(12.0);
+        ui.vertical(|ui| {
+            ui.add_space(10.0);
+            ui.label(
+                egui::RichText::new(format!("Configure {}", action.title))
+                    .strong()
+                    .size(13.0),
+            );
+            ui.label(
+                egui::RichText::new(&action.description)
+                    .color(egui::Color32::GRAY)
+                    .size(10.0),
+            );
+            if n_params > 1 {
+                ui.label(
+                    egui::RichText::new(format!("Parameter {} of {}", idx + 1, n_params))
+                        .color(egui::Color32::GRAY)
+                        .size(10.0),
+                );
+            }
+            ui.add_space(6.0);
+        });
+    });
+    ui.separator();
+
+    ui.add_space(8.0);
+    ui.horizontal(|ui| {
+        ui.add_space(12.0);
+        ui.vertical(|ui| {
+            if let Some(param) = action.parameters.get(idx) {
+                render_param_widget(ui, param, registry);
+            }
+        });
+    });
+
+    // Validate every frame for the live disabled-state of the apply button.
+    let valid = registry.validate_param(idx);
+
+    ui.add_space(8.0);
+    ui.horizontal(|ui| {
+        let avail = ui.available_width();
+        ui.add_space(avail - 220.0);
+        if ui.button("Cancel").clicked() {
+            registry.cancel_configuring();
+        }
+        if !is_last {
+            let prev_resp = ui.add_enabled(idx > 0, egui::Button::new("Previous"));
+            if prev_resp.clicked() {
+                if let Some(c) = registry.configuring.as_mut() {
+                    c.current_param_index = idx.saturating_sub(1);
+                }
+            }
+            let next_resp = ui.add_enabled(valid, egui::Button::new("Next"));
+            if next_resp.clicked() {
+                if let Some(c) = registry.configuring.as_mut() {
+                    c.current_param_index = (idx + 1).min(n_params - 1);
+                }
+            }
+        } else {
+            let apply_resp = ui.add_enabled(valid, egui::Button::new("Apply"));
+            if apply_resp.clicked() {
+                if let Some((id, params)) = registry.take_finished_form() {
+                    return Some(PaletteOutcome::Execute { action_id: id, params });
+                }
+            }
+        }
+        None::<PaletteOutcome>
+    });
+
+    // Enter on the last param applies; on earlier params advances.
+    if ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+        if valid {
+            if is_last {
+                if let Some((id, params)) = registry.take_finished_form() {
+                    return PaletteOutcome::Execute { action_id: id, params };
+                }
+            } else if let Some(c) = registry.configuring.as_mut() {
+                c.current_param_index = (idx + 1).min(n_params - 1);
+            }
+        }
+    }
+
+    PaletteOutcome::None
+}
+
+fn render_param_widget(
+    ui: &mut egui::Ui,
+    param: &ActionParameter,
+    registry: &mut ActionRegistry,
+) {
+    ui.label(
+        egui::RichText::new(if param.required {
+            format!("{} *", param.name)
+        } else {
+            param.name.clone()
+        })
+        .strong(),
+    );
+    ui.label(
+        egui::RichText::new(&param.description)
+            .size(10.0)
+            .color(egui::Color32::GRAY),
+    );
+    ui.add_space(4.0);
+
+    let Some(cfg) = registry.configuring.as_mut() else { return };
+    let value = cfg
+        .form_values
+        .entry(param.id.clone())
+        .or_insert_with(|| ParamValue::default_for(param.kind));
+
+    match param.kind {
+        ParameterType::String => {
+            if let ParamValue::String(s) = value {
+                ui.add(
+                    egui::TextEdit::singleline(s)
+                        .desired_width(ui.available_width() - 24.0),
+                );
+            }
+        }
+        ParameterType::Number => {
+            if let ParamValue::Number(n) = value {
+                let mut dv = egui::DragValue::new(n).speed(0.1);
+                if let Some(min) = param.validation.min {
+                    if let Some(max) = param.validation.max {
+                        dv = dv.range(min..=max);
+                    } else {
+                        dv = dv.range(min..=f64::INFINITY);
+                    }
+                } else if let Some(max) = param.validation.max {
+                    dv = dv.range(f64::NEG_INFINITY..=max);
+                }
+                ui.add(dv);
+            }
+        }
+        ParameterType::Boolean => {
+            if let ParamValue::Boolean(b) = value {
+                ui.checkbox(b, "Enable");
+            }
+        }
+        ParameterType::Select => {
+            if let ParamValue::Selected(items) = value {
+                let current = items.first().cloned().unwrap_or_default();
+                let label = param
+                    .options
+                    .iter()
+                    .find(|o| o.value == current)
+                    .map(|o| o.label.clone())
+                    .unwrap_or_else(|| current.clone());
+                egui::ComboBox::from_id_salt(format!("param-select-{}", param.id))
+                    .selected_text(label)
+                    .show_ui(ui, |ui| {
+                        for opt in &param.options {
+                            let mut chosen = current.clone();
+                            if ui.selectable_value(&mut chosen, opt.value.clone(), &opt.label).clicked() {
+                                *items = vec![chosen];
+                            }
+                        }
+                    });
+            }
+        }
+        ParameterType::MultiSelect => {
+            if let ParamValue::Selected(items) = value {
+                for opt in &param.options {
+                    let mut on = items.iter().any(|v| v == &opt.value);
+                    if ui.checkbox(&mut on, &opt.label).changed() {
+                        if on {
+                            if !items.iter().any(|v| v == &opt.value) {
+                                items.push(opt.value.clone());
+                            }
+                        } else {
+                            items.retain(|v| v != &opt.value);
+                        }
+                    }
+                }
+                if param.options.is_empty() {
+                    ui.label(
+                        egui::RichText::new("(no options available)")
+                            .italics()
+                            .color(egui::Color32::GRAY),
+                    );
+                }
+            }
+        }
+    }
+
+    if let Some(err) = cfg.validation_errors.get(&param.id) {
+        ui.label(
+            egui::RichText::new(err)
+                .color(accent::RED)
+                .size(10.0),
+        );
+    }
+}
+
+// ----- fuzzy match ---------------------------------------------------------
+
+#[derive(Debug, Clone, Default)]
+struct MatchInfo {
+    score: i32,
+    /// Byte indices in `title` that matched (used for highlighting).
+    title_hits: Vec<usize>,
+}
+
+/// Case-insensitive subsequence match across title + description + keywords.
+/// Returns `None` if every character in the query couldn't be placed.
+/// Score rewards consecutive matches and earlier positions.
+fn fuzzy_score(action: &Action, query: &str) -> Option<MatchInfo> {
+    let q = query.to_lowercase();
+    if q.is_empty() {
+        return Some(MatchInfo::default());
+    }
+    // Title is the primary haystack; description + keywords broaden hits.
+    let title_lc = action.title.to_lowercase();
+    let mut title_hits: Vec<usize> = Vec::new();
+    let title_score = subsequence_score(&title_lc, &q, Some(&mut title_hits));
+
+    let extras = format!(
+        "{} {} {}",
+        action.description.to_lowercase(),
+        action.keywords.join(" ").to_lowercase(),
+        action.id.to_lowercase()
+    );
+    let extra_score = subsequence_score(&extras, &q, None);
+
+    if title_score.is_none() && extra_score.is_none() {
+        return None;
+    }
+    let title = title_score.unwrap_or(0);
+    let extra = extra_score.unwrap_or(0);
+    Some(MatchInfo {
+        // Title matches weighted 3x — name typing should dominate.
+        score: title * 3 + extra,
+        title_hits,
+    })
+}
+
+fn subsequence_score(haystack: &str, needle: &str, mut hits: Option<&mut Vec<usize>>) -> Option<i32> {
+    let mut score: i32 = 0;
+    let mut last_match: Option<usize> = None;
+    let mut hi = 0;
+    let h_bytes = haystack.as_bytes();
+    let n_bytes = needle.as_bytes();
+    let mut ni = 0;
+    while ni < n_bytes.len() {
+        let nb = n_bytes[ni];
+        let mut found = None;
+        while hi < h_bytes.len() {
+            if h_bytes[hi] == nb {
+                found = Some(hi);
+                hi += 1;
+                break;
+            }
+            hi += 1;
+        }
+        let pos = found?;
+        if let Some(h) = hits.as_deref_mut() {
+            h.push(pos);
+        }
+        // Reward consecutive hits, prefer earlier matches.
+        if Some(pos.wrapping_sub(1)) == last_match {
+            score += 5;
+        } else {
+            score += 1;
+        }
+        if pos < 8 {
+            score += 2;
+        }
+        last_match = Some(pos);
+        ni += 1;
+    }
+    Some(score)
+}
+
+fn render_action_row(
+    ui: &mut egui::Ui,
+    action: &Action,
+    mi: &MatchInfo,
+    active: bool,
+) -> egui::Response {
+    let bg = if active {
+        egui::Color32::from_rgb(0x22, 0x28, 0x34)
+    } else {
+        egui::Color32::TRANSPARENT
+    };
+    let frame = egui::Frame::none()
+        .fill(bg)
+        .inner_margin(egui::Margin::symmetric(12.0, 8.0));
+    let resp = frame
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.vertical(|ui| {
+                    // Title with fuzzy-match highlight.
+                    let title_layout = highlighted_title(&action.title, &mi.title_hits);
+                    ui.label(title_layout);
+                    if !action.description.is_empty() {
+                        ui.label(
+                            egui::RichText::new(&action.description)
+                                .color(egui::Color32::GRAY)
+                                .size(10.0),
+                        );
+                    }
+                });
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if !action.children_ids.is_empty() {
+                        ui.label("›");
+                    }
+                    ui.label(
+                        egui::RichText::new(action.kind.label())
+                            .size(9.0)
+                            .color(egui::Color32::GRAY),
+                    );
+                    if let Some(sc) = &action.shortcut {
+                        ui.label(
+                            egui::RichText::new(sc)
+                                .monospace()
+                                .size(10.0)
+                                .color(egui::Color32::from_gray(180)),
+                        );
+                    }
+                });
+            });
+        })
+        .response;
+    resp.interact(egui::Sense::click())
+}
+
+fn highlighted_title(title: &str, hits: &[usize]) -> egui::WidgetText {
+    if hits.is_empty() {
+        return egui::RichText::new(title).into();
+    }
+    use egui::text::LayoutJob;
+    let mut job = LayoutJob::default();
+    let bytes = title.as_bytes();
+    let mut i = 0;
+    let in_hits = |idx: usize| hits.contains(&idx);
+    while i < bytes.len() {
+        let start = i;
+        let hit_now = in_hits(i);
+        while i < bytes.len() && in_hits(i) == hit_now {
+            i += 1;
+        }
+        let chunk = &title[start..i];
+        let mut fmt = egui::TextFormat::default();
+        if hit_now {
+            fmt.color = accent::BLUE;
+            fmt.font_id = egui::FontId::proportional(12.0);
+        } else {
+            fmt.color = egui::Color32::WHITE;
+            fmt.font_id = egui::FontId::proportional(12.0);
+        }
+        job.append(chunk, 0.0, fmt);
+    }
+    egui::WidgetText::LayoutJob(job)
+}
+
+fn ctx_screen_h(ctx: &egui::Context) -> f32 {
+    ctx.screen_rect().height().max(200.0)
+}
+
+fn category_header(ui: &mut egui::Ui, label: &str) {
+    ui.add_space(4.0);
+    ui.horizontal(|ui| {
+        ui.add_space(12.0);
+        ui.label(
+            egui::RichText::new(label.to_uppercase())
+                .size(9.0)
+                .strong()
+                .color(egui::Color32::from_gray(140)),
+        );
+    });
+}

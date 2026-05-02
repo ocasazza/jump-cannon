@@ -2,12 +2,14 @@ pub mod camera;
 pub mod cursor;
 pub mod filter;
 pub mod focus;
+pub mod instances;
 pub mod layout;
 pub mod stats;
 pub mod style;
 
 use eframe::egui;
 
+use super::actions::ActionRegistry;
 use super::state::Section;
 use super::theme;
 
@@ -98,7 +100,12 @@ pub fn hint_label(ui: &mut egui::Ui, text: &str) {
     );
 }
 
-pub fn show(ui: &mut egui::Ui, section: Section, state: &mut super::state::AppState) {
+pub fn show(
+    ui: &mut egui::Ui,
+    section: Section,
+    state: &mut super::state::AppState,
+    registry: &mut ActionRegistry,
+) {
     header(ui, section.title());
     match section {
         Section::Filter => filter::show(ui, state),
@@ -108,6 +115,7 @@ pub fn show(ui: &mut egui::Ui, section: Section, state: &mut super::state::AppSt
         Section::Focus => focus::show(ui, state),
         Section::Cursor => cursor::show(ui, state),
         Section::Stats => stats::show(ui, state),
+        Section::Instances => instances::show(ui, state, registry),
     }
     let _ = theme::accent::RED; // keep accent module referenced from here for tooling
 }

@@ -23,17 +23,22 @@ struct CameraUniform {
     screen:    vec2<f32>,
     _pad1:     vec2<f32>,
 };
-// 3 scalar f32 pads (NOT vec3<f32> — that forces 16-byte struct alignment
-// and inflates size to 48 bytes; Rust EffectsUniform is 32 bytes).
+// Layout mirrors the Rust `EffectsUniform` byte-for-byte. Keep in sync
+// with graph_pipelines.rs and node.wgsl.
 struct EffectsUniform {
-    focus_plane_z:        f32,
-    focus_thickness:      f32,
-    cursor_radius_visual: f32,
-    blur_strength:        f32,
-    max_coc:              f32,
-    _pad0:                f32,
-    _pad1:                f32,
-    _pad2:                f32,
+    focus_plane_z:         f32,
+    focus_thickness:       f32,
+    cursor_radius_visual:  f32,
+    blur_strength:         f32,
+    max_coc:               f32,
+    edge_alpha_mul:        f32,
+    edge_dist_min:         f32,
+    edge_dist_max:         f32,
+    edge_color:            vec4<f32>,
+    edge_min_transparency: f32,
+    _pad0:                 f32,
+    _pad1:                 f32,
+    _pad2:                 f32,
 };
 
 @group(0) @binding(0) var<uniform> camera:  CameraUniform;
@@ -81,12 +86,17 @@ fn vs_main(@builtin(vertex_index) vid: u32) -> VertexOutput {
 
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
-    // Length-based alpha: short edges full alpha, long edges fade.
-    let len_factor = 1.0 / (1.0 + in.edge_len / 30.0);
-    let base_alpha = mix(0.05, 0.35, len_factor);
+    // Cosmograph linkVisibilityDistanceRange: short edges fully visible,
+    // long edges fade toward edge_min_transparency (never disappearing
+    // entirely — they keep building density on the dark background).
+    let span = max(effects.edge_dist_max - effects.edge_dist_min, 0.001);
+    let t = clamp((in.edge_len - effects.edge_dist_min) / span, 0.0, 1.0);
+    let visibility = mix(1.0, effects.edge_min_transparency, t);
 
-    // CoC fade — out-of-focus edges drop to ~5% alpha at max blur.
+    // CoC fade — out-of-focus edges still drop alpha when DoF is engaged.
     let focus_atten = 1.0 / (1.0 + in.coc * 0.05);
 
-    return vec4<f32>(0.55, 0.62, 0.78, base_alpha * focus_atten);
+    let alpha = effects.edge_color.a * effects.edge_alpha_mul
+              * visibility * focus_atten;
+    return vec4<f32>(effects.edge_color.rgb, alpha);
 }

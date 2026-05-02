@@ -8,8 +8,10 @@ use crate::graph_callback::GraphCallback;
 use crate::graph_pipelines::{GraphData, GraphPipelines};
 use crate::proto;
 use crate::ui;
+use crate::ui::actions::{self, ActionRegistry, BuiltinAction, ParamValue};
+use crate::ui::command_palette::PaletteOutcome;
 use crate::ui::query::EvalContext;
-use crate::ui::state::{ColorBy, SizeBy};
+use crate::ui::state::{ColorBy, FontFamilyChoice, SizeBy};
 use graph_layouts::GpuForceOptions;
 
 /// Result of an async `/node/:id` fetch — Some(Ok) success, Some(Err) error,
@@ -59,6 +61,10 @@ pub struct App {
     prev_canvas_rect: Option<egui::Rect>,
     last_pointer_in_canvas: Option<egui::Pos2>,
     cursor_force_active: f32, // sign: +1 attract / -1 repel / 0 none
+
+    // -- command palette ---------------------------------------------------
+    palette_state: ui::CommandPaletteState,
+    actions: ActionRegistry,
 }
 
 impl App {
@@ -96,6 +102,18 @@ impl App {
         let base_url = default_base_url();
         kick_off_bootstrap(load.clone(), base_url.clone());
 
+        let mut actions = ActionRegistry::new();
+        actions::seed_default_actions(&mut actions);
+        // Rehydrate persisted ActionInstances. The registry is re-seeded
+        // each startup; only the live instance list survives.
+        actions.instances = state.action_instances.clone();
+        actions.next_instance_id = actions
+            .instances
+            .iter()
+            .map(|i| i.id)
+            .max()
+            .unwrap_or(0);
+
         Self {
             state,
             load,
@@ -117,6 +135,8 @@ impl App {
             prev_canvas_rect: None,
             last_pointer_in_canvas: None,
             cursor_force_active: 0.0,
+            palette_state: ui::CommandPaletteState::default(),
+            actions,
         }
     }
 
@@ -267,9 +287,10 @@ impl App {
 
 impl eframe::App for App {
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
-        // Slightly off-black so the test brightness sampler clears the
-        // r+g+b > 60 threshold even on a bare frame.
-        [0.06, 0.06, 0.06, 1.0]
+        // Cosmograph #050710 — deep cool near-black. Alpha-stacked edges
+        // read against this instead of mid-grey. The sidebar UI alone
+        // clears the test harness's brightFrac > 0.01 threshold.
+        [0.020, 0.027, 0.063, 1.0]
     }
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
@@ -290,8 +311,35 @@ impl eframe::App for App {
         // Drain any completed /node/:id fetch into the modal.
         self.drain_node_fetch();
 
+        // Ctrl+P (or ⌘P on macOS) toggles the command palette.
+        if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::P)) {
+            self.palette_state.toggle();
+        }
+        // Bare F (no modifiers, no text-edit focus) fits the camera —
+        // mirrors the shortcut hint shown on the Fit Camera action.
+        let f_pressed = ctx.input(|i| {
+            i.key_pressed(egui::Key::F)
+                && !i.modifiers.command
+                && !i.modifiers.shift
+                && !i.modifiers.alt
+        });
+        if f_pressed && !ctx.wants_keyboard_input() {
+            self.execute_action(frame, "fit-camera", HashMap::new());
+        }
+
         // Phase D sidebar (activity bar + section panel) on the left.
-        ui::show_sidebar(ctx, &mut self.state);
+        ui::show_sidebar(ctx, &mut self.state, &mut self.actions);
+
+        // Command palette modal — runs above the sidebar, below the modal.
+        let palette_outcome = ui::show_command_palette(
+            ctx,
+            &mut self.palette_state,
+            &mut self.actions,
+            &self.state.workspace,
+        );
+        if let PaletteOutcome::Execute { action_id, params } = palette_outcome {
+            self.execute_action(frame, &action_id, params);
+        }
 
         // Phase B central panel — wgpu graph layer via egui_wgpu callback.
         // Frame is transparent so the wgpu output isn't covered.
@@ -498,10 +546,27 @@ impl App {
             return;
         }
         let key = self.style_key();
-        if self.prev_style_key == Some(key) {
+        let Some(wgpu_state) = frame.wgpu_render_state() else { return };
+        let recompute_buffers = self.prev_style_key != Some(key);
+
+        // Edge style is cheap (uniform write) — push it every frame.
+        // Sliders read live, no change-detect needed.
+        let s = &self.state.style;
+        {
+            let mut renderer = wgpu_state.renderer.write();
+            if let Some(pipes) = renderer.callback_resources.get_mut::<GraphPipelines>() {
+                pipes.set_edge_style(
+                    s.edge_color,
+                    s.edge_alpha_mul,
+                    (s.edge_dist_min, s.edge_dist_max),
+                    s.edge_min_transparency,
+                );
+            }
+        }
+
+        if !recompute_buffers {
             return;
         }
-        let Some(wgpu_state) = frame.wgpu_render_state() else { return };
         let queue = wgpu_state.queue.clone();
         let n = self.ids.len();
         let colors = data::colors_from_metric(
@@ -747,7 +812,181 @@ impl App {
         } else {
             ui::state::SimStatus::Running
         };
+
+        // Mirror live ActionInstances back into AppState so the next
+        // eframe::Storage::save catches them.
+        if self.state.action_instances.len() != self.actions.instances.len()
+            || self.state.action_instances != self.actions.instances
+        {
+            self.state.action_instances = self.actions.instances.clone();
+        }
     }
+
+    /// Dispatch a built-in action variant. Mutates AppState (and the wgpu
+    /// graph layer where applicable), then records an `ActionInstance`.
+    fn execute_action(
+        &mut self,
+        frame: &mut eframe::Frame,
+        action_id: &str,
+        params: HashMap<String, ParamValue>,
+    ) {
+        let Some(action) = self.actions.get(action_id).cloned() else { return };
+        let ActionHandlerVariant::Builtin(variant) = handler_variant(&action);
+        // Parent-only actions in the palette tree drill into children;
+        // they should not produce instances even if accidentally executed.
+        if !action.children_ids.is_empty() && action.parameters.is_empty() {
+            return;
+        }
+        let result = self.run_builtin(frame, variant, &params);
+        self.actions.record_execution(&action.id, params, result);
+    }
+
+    fn run_builtin(
+        &mut self,
+        frame: &mut eframe::Frame,
+        variant: BuiltinAction,
+        params: &HashMap<String, ParamValue>,
+    ) -> serde_json::Value {
+        use crate::ui::query::Card;
+        use BuiltinAction::*;
+        match variant {
+            Settings | NodeOperations | Filter => serde_json::json!({}),
+
+            EditOptions => {
+                if let Some(ParamValue::Number(n)) = params.get("font_size") {
+                    self.state.workspace.font_size = (*n as f32).clamp(8.0, 32.0);
+                }
+                if let Some(ParamValue::Selected(items)) = params.get("font_family") {
+                    if let Some(v) = items.first() {
+                        self.state.workspace.font_family = parse_font_family(v);
+                    }
+                }
+                if let Some(ParamValue::Boolean(b)) = params.get("show_line_numbers") {
+                    self.state.workspace.show_line_numbers = *b;
+                }
+                serde_json::json!({ "settings": workspace_json(&self.state.workspace) })
+            }
+            FontSize => {
+                if let Some(ParamValue::Number(n)) = params.get("font_size") {
+                    self.state.workspace.font_size = (*n as f32).clamp(8.0, 32.0);
+                }
+                serde_json::json!({ "font_size": self.state.workspace.font_size })
+            }
+            FontFamily => {
+                if let Some(ParamValue::Selected(items)) = params.get("font_family") {
+                    if let Some(v) = items.first() {
+                        self.state.workspace.font_family = parse_font_family(v);
+                    }
+                }
+                serde_json::json!({ "font_family": format!("{:?}", self.state.workspace.font_family) })
+            }
+            LineNumbers => {
+                if let Some(ParamValue::Boolean(b)) = params.get("show_line_numbers") {
+                    self.state.workspace.show_line_numbers = *b;
+                }
+                serde_json::json!({ "show_line_numbers": self.state.workspace.show_line_numbers })
+            }
+            ToggleTheme => {
+                // The renderer is dark-mode only; this records intent but
+                // doesn't flip the theme until a light variant exists.
+                serde_json::json!({ "theme": "dark" })
+            }
+
+            FilterByName | FilterByContent => {
+                let field = if matches!(variant, FilterByName) { "name" } else { "content" };
+                let pattern = params
+                    .get("pattern")
+                    .and_then(|v| v.as_string())
+                    .unwrap_or("")
+                    .to_string();
+                self.append_filter_card(field.to_string(), pattern.clone());
+                serde_json::json!({ "filter": { "type": field, "pattern": pattern } })
+            }
+            FilterByTag => {
+                let tags: Vec<String> = params
+                    .get("tags")
+                    .and_then(|v| v.as_selected())
+                    .unwrap_or(&[])
+                    .to_vec();
+                for t in &tags {
+                    self.append_filter_card("tag".into(), t.clone());
+                }
+                serde_json::json!({ "filter": { "type": "tag", "tags": tags } })
+            }
+            SearchNodes => {
+                let q = params
+                    .get("query")
+                    .and_then(|v| v.as_string())
+                    .unwrap_or("")
+                    .to_string();
+                if !q.is_empty() {
+                    self.state.query.cards.push(Card::Search { value: q.clone(), regex: false });
+                }
+                serde_json::json!({ "search": { "query": q } })
+            }
+            CreateNode => {
+                // Node creation against a server-loaded vault is a no-op
+                // here — the server owns the vault. Recorded for parity.
+                let name = params
+                    .get("name")
+                    .and_then(|v| v.as_string())
+                    .unwrap_or("New Node")
+                    .to_string();
+                serde_json::json!({ "node": { "name": name } })
+            }
+
+            FitCamera => {
+                if let Some(wgpu_state) = frame.wgpu_render_state() {
+                    let mut renderer = wgpu_state.renderer.write();
+                    if let Some(pipes) =
+                        renderer.callback_resources.get_mut::<GraphPipelines>()
+                    {
+                        pipes.fit_camera();
+                    }
+                }
+                serde_json::json!({ "fit": true })
+            }
+            ResetStyle => {
+                self.state.style = Default::default();
+                self.prev_style_key = None;
+                serde_json::json!({ "style": "reset" })
+            }
+            JumpToSection(sec) => {
+                self.state.active_section = Some(sec);
+                serde_json::json!({ "section": sec.title() })
+            }
+        }
+    }
+}
+
+/// Tiny indirection so the match in `execute_action` doesn't need to
+/// borrow through `Action`'s `handler` field while we still hold the
+/// cloned action.
+enum ActionHandlerVariant {
+    Builtin(BuiltinAction),
+}
+
+fn handler_variant(action: &actions::Action) -> ActionHandlerVariant {
+    match &action.handler {
+        actions::ActionHandler::Builtin(b) => ActionHandlerVariant::Builtin(b.clone()),
+    }
+}
+
+fn parse_font_family(s: &str) -> FontFamilyChoice {
+    match s {
+        "monospace" => FontFamilyChoice::Monospace,
+        "sans-serif" => FontFamilyChoice::SansSerif,
+        "serif" => FontFamilyChoice::Serif,
+        _ => FontFamilyChoice::Monospace,
+    }
+}
+
+fn workspace_json(ws: &ui::state::WorkspaceSettings) -> serde_json::Value {
+    serde_json::json!({
+        "font_size": ws.font_size,
+        "font_family": format!("{:?}", ws.font_family),
+        "show_line_numbers": ws.show_line_numbers,
+    })
 }
 
 fn default_base_url() -> String {

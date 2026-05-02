@@ -27,17 +27,22 @@ struct CameraUniform {
     screen:    vec2<f32>,
     _pad1:     vec2<f32>,
 };
-// 3 scalar f32 pads (NOT vec3<f32> — that forces 16-byte struct alignment
-// and inflates size to 48 bytes; Rust EffectsUniform is 32 bytes).
+// Layout mirrors the Rust `EffectsUniform` byte-for-byte. Keep in sync
+// with graph_pipelines.rs and edge.wgsl.
 struct EffectsUniform {
-    focus_plane_z:        f32,
-    focus_thickness:      f32,
-    cursor_radius_visual: f32,
-    blur_strength:        f32,
-    max_coc:              f32,
-    _pad0:                f32,
-    _pad1:                f32,
-    _pad2:                f32,
+    focus_plane_z:         f32,
+    focus_thickness:       f32,
+    cursor_radius_visual:  f32,
+    blur_strength:         f32,
+    max_coc:               f32,
+    edge_alpha_mul:        f32,
+    edge_dist_min:         f32,
+    edge_dist_max:         f32,
+    edge_color:            vec4<f32>,
+    edge_min_transparency: f32,
+    _pad0:                 f32,
+    _pad1:                 f32,
+    _pad2:                 f32,
 };
 
 @group(0) @binding(0) var<uniform> camera:  CameraUniform;
@@ -108,16 +113,17 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         discard;
     }
 
-    // Sharp fast-path: in-focus nodes get a crisp edge with minimal AA
-    // and full intensity. Floors any jitter in coc_ratio that was making
-    // even default-in-focus nodes glow.
-    if (in.coc_ratio > 0.99) {
-        let edge = 1.0 - smoothstep(0.92, 1.0, r);
+    // DoF is "off" by default — focus_thickness is set to ~1e9 so the
+    // whole scene sits inside the focus band. In that mode every node
+    // takes the sharp path (cosmograph-style hard SDF disc, no halo).
+    // Bokeh only kicks in when the caller explicitly narrows the band.
+    let dof_engaged = effects.focus_thickness < 1.0e6;
+    if (!dof_engaged || in.coc_ratio > 0.985) {
+        let edge = 1.0 - smoothstep(0.96, 1.0, r);
         return vec4<f32>(in.color.rgb, in.color.a * edge);
     }
 
-    // Bokeh path for actual out-of-focus nodes:
-    // aa_start floored at 0.85 so even mild blur doesn't produce a giant halo.
+    // Bokeh path for actually out-of-focus nodes.
     let aa_start = max(mix(0.0, 0.95, in.coc_ratio), 0.85);
     let edge = 1.0 - smoothstep(aa_start, 1.0, r);
 

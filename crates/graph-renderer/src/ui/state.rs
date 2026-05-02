@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::ui::query::QueryModel;
 
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub enum Section {
     Filter,
     Style,
@@ -17,6 +17,7 @@ pub enum Section {
     Focus,
     Cursor,
     Stats,
+    Instances,
 }
 
 impl Section {
@@ -28,6 +29,7 @@ impl Section {
         Section::Focus,
         Section::Cursor,
         Section::Stats,
+        Section::Instances,
     ];
 
     pub fn title(self) -> &'static str {
@@ -39,6 +41,7 @@ impl Section {
             Section::Focus => "Focus",
             Section::Cursor => "Cursor",
             Section::Stats => "Stats",
+            Section::Instances => "Instances",
         }
     }
 }
@@ -118,7 +121,28 @@ pub struct StyleState {
     pub size_by: SizeBy,
     pub color_by: ColorBy,
     pub size_mul: f32,
+    /// Cosmograph-style edge tint (RGBA, 0..1). Default #3a4880.
+    #[serde(default = "default_edge_color")]
+    pub edge_color: [f32; 4],
+    /// Density multiplier on the edge alpha. Cosmograph mimics line
+    /// width via stacking many low-alpha lines; this is the same dial.
+    #[serde(default = "default_edge_alpha_mul")]
+    pub edge_alpha_mul: f32,
+    /// `linkVisibilityDistanceRange` from the reference.
+    #[serde(default = "default_edge_dist_min")]
+    pub edge_dist_min: f32,
+    #[serde(default = "default_edge_dist_max")]
+    pub edge_dist_max: f32,
+    /// `linkVisibilityMinTransparency` — alpha floor at long edges.
+    #[serde(default = "default_edge_min_transparency")]
+    pub edge_min_transparency: f32,
 }
+
+fn default_edge_color() -> [f32; 4] { [0.227, 0.282, 0.502, 1.0] }
+fn default_edge_alpha_mul() -> f32 { 0.6 }
+fn default_edge_dist_min() -> f32 { 10.0 }
+fn default_edge_dist_max() -> f32 { 400.0 }
+fn default_edge_min_transparency() -> f32 { 0.6 }
 
 impl Default for StyleState {
     fn default() -> Self {
@@ -126,6 +150,11 @@ impl Default for StyleState {
             size_by: SizeBy::default(),
             color_by: ColorBy::default(),
             size_mul: 1.0,
+            edge_color: default_edge_color(),
+            edge_alpha_mul: default_edge_alpha_mul(),
+            edge_dist_min: default_edge_dist_min(),
+            edge_dist_max: default_edge_dist_max(),
+            edge_min_transparency: default_edge_min_transparency(),
         }
     }
 }
@@ -312,6 +341,48 @@ pub struct LiveStats {
     pub n_communities: u32,
 }
 
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub enum FontFamilyChoice {
+    #[default]
+    Monospace,
+    SansSerif,
+    Serif,
+}
+
+impl FontFamilyChoice {
+    pub const ALL: &'static [FontFamilyChoice] = &[
+        FontFamilyChoice::Monospace,
+        FontFamilyChoice::SansSerif,
+        FontFamilyChoice::Serif,
+    ];
+    pub fn label(self) -> &'static str {
+        match self {
+            FontFamilyChoice::Monospace => "Monospace",
+            FontFamilyChoice::SansSerif => "Sans Serif",
+            FontFamilyChoice::Serif => "Serif",
+        }
+    }
+}
+
+/// Workspace-level settings driven by the Settings sub-tree of the action
+/// registry. Persisted in `AppState` so a reload preserves preferences.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct WorkspaceSettings {
+    pub font_size: f32,
+    pub font_family: FontFamilyChoice,
+    pub show_line_numbers: bool,
+}
+
+impl Default for WorkspaceSettings {
+    fn default() -> Self {
+        Self {
+            font_size: 14.0,
+            font_family: FontFamilyChoice::default(),
+            show_line_numbers: true,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
 pub struct AppState {
     pub active_section: Option<Section>,
@@ -321,9 +392,15 @@ pub struct AppState {
     pub focus: FocusState,
     pub cursor: CursorState,
     #[serde(default)]
+    pub workspace: WorkspaceSettings,
+    #[serde(default)]
     pub sim_status: SimStatus,
     #[serde(default)]
     pub query: QueryModel,
+    /// Persisted ActionInstances (the registry itself is re-seeded on
+    /// startup; only the live instance list survives a reload).
+    #[serde(default)]
+    pub action_instances: Vec<crate::ui::actions::ActionInstance>,
     #[serde(skip)]
     pub stats: LiveStats,
 }
