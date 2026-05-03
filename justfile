@@ -107,3 +107,17 @@ profile-browser: wasm
         cd tests/browser && npm install --silent --no-audit --no-fund; \
     fi
     cd tests/browser && node profile.mjs
+
+# Headless perf gate. Single phase, single synth vault, asserts FPS /
+# p99 / jank thresholds. Fails the process (exit 1) on regression. Use
+# in CI alongside test-browser. Tunables (env): PERF_VAULT_NODES (1000),
+# PERF_MIN_FPS (50), PERF_MAX_P99_MS (25), PERF_MAX_JANK_PCT (5).
+# Side effect: writes tests/browser/out/perf-idle.flame.txt — an
+# AI-readable text flame graph of where time went.
+perf-test: wasm
+    cargo build --release -p graph-api
+    @if [ ! -d tests/browser/node_modules ]; then \
+        echo "→ installing playwright npm package (one-time)…"; \
+        cd tests/browser && npm install --silent --no-audit --no-fund; \
+    fi
+    cd tests/browser && node perf.mjs

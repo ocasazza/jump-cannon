@@ -214,8 +214,15 @@ try {
     const cpuPath = `${OUT}/profile-${label}.cpuprofile`;
     writeFileSync(cpuPath, JSON.stringify(profile));
     const hot = topSelfTime(profile, 12);
+    const flame = flameTree(profile);
+    const flamePath = `${OUT}/profile-${label}.flame.txt`;
+    writeFileSync(flamePath, flame);
     const brightFrac = brightFraction(shotPath);
-    phases.push({ label, brightFrac, ...summarise(deltas), hot, cpuprofile: cpuPath });
+    phases.push({
+      label, brightFrac,
+      ...summarise(deltas),
+      hot, cpuprofile: cpuPath, flame: flamePath,
+    });
   };
 
   // Phase 1: idle baseline (current default state — DoF off).
@@ -312,6 +319,84 @@ function topSelfTime(profile, n) {
   });
   rows.sort((a, b) => b.self_ms - a.self_ms);
   return rows.filter((r) => r.self_ms > 0).slice(0, n);
+}
+
+/**
+ * Convert a V8 .cpuprofile into an AI-readable text flame graph. The
+ * tree mirrors the call hierarchy with self+total time per node, sorted
+ * by total time. (idle) and (program) at the root are surfaced first
+ * so it's clear how much of the wall-clock budget is GPU-wait vs. JS.
+ *
+ * Format:
+ *   total_ms (total_pct%)  self_ms (self_pct%)  fn_name (file)
+ *   ├── ...
+ *
+ * Children are pruned if they account for < 0.2 % total time, so the
+ * output stays scannable even on long phases.
+ */
+function flameTree(profile) {
+  if (!profile?.nodes?.length) return '(empty cpuprofile)';
+  const byId = new Map();
+  for (const n of profile.nodes) byId.set(n.id, n);
+
+  // Per-node self time (µs).
+  const selfUs = new Map();
+  for (let i = 0; i < profile.samples.length; i++) {
+    const id = profile.samples[i];
+    const dt = profile.timeDeltas[i] || 0;
+    selfUs.set(id, (selfUs.get(id) || 0) + dt);
+  }
+
+  // Total = self + sum(children total). Memoise.
+  const totalUs = new Map();
+  const visit = (id) => {
+    if (totalUs.has(id)) return totalUs.get(id);
+    const n = byId.get(id);
+    let t = selfUs.get(id) || 0;
+    if (n?.children) for (const c of n.children) t += visit(c);
+    totalUs.set(id, t);
+    return t;
+  };
+  for (const n of profile.nodes) visit(n.id);
+
+  const root = profile.nodes.find((n) => n.callFrame?.functionName === '(root)') || profile.nodes[0];
+  const totalAll = totalUs.get(root.id) || 1;
+
+  const minPct = 0.2;
+  const lines = [];
+  const fmt = (id, depth, prefix, isLast) => {
+    const n = byId.get(id);
+    const cf = n.callFrame || {};
+    const tUs = totalUs.get(id) || 0;
+    const sUs = selfUs.get(id) || 0;
+    const tPct = (100 * tUs) / totalAll;
+    if (depth > 0 && tPct < minPct) return;
+    const tMs = (tUs / 1000).toFixed(1).padStart(7);
+    const sMs = (sUs / 1000).toFixed(1).padStart(7);
+    const tPctStr = tPct.toFixed(1).padStart(5);
+    const sPctStr = ((100 * sUs) / totalAll).toFixed(1).padStart(5);
+    const url = cf.url ? cf.url.replace(/^.*\//, '') : '';
+    const branch = depth === 0 ? '' : prefix + (isLast ? '└── ' : '├── ');
+    lines.push(
+      `${tMs}ms ${tPctStr}% (self ${sMs}ms ${sPctStr}%)  ${branch}${cf.functionName || '(anon)'}${url ? '  [' + url + ']' : ''}`,
+    );
+    const childPrefix = depth === 0 ? '' : prefix + (isLast ? '    ' : '│   ');
+    const kids = (n.children || [])
+      .map((c) => [c, totalUs.get(c) || 0])
+      .filter(([, t]) => (100 * t) / totalAll >= minPct)
+      .sort((a, b) => b[1] - a[1]);
+    for (let i = 0; i < kids.length; i++) {
+      fmt(kids[i][0], depth + 1, childPrefix, i === kids.length - 1);
+    }
+  };
+  fmt(root.id, 0, '', true);
+  return [
+    `# Flame tree — total ${(totalAll / 1000).toFixed(1)}ms across ${profile.samples.length} samples`,
+    `# Columns: total_ms total_pct% (self_ms self_pct%)  call`,
+    `# Pruned: nodes contributing < ${minPct}% of total time omitted.`,
+    '',
+    ...lines,
+  ].join('\n');
 }
 
 function brightFraction(pngPath) {
