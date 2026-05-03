@@ -88,13 +88,18 @@ await new Promise((res, rej) => {
 
 // ---- 2. launch chromium with webgpu --------------------------------------
 const isMac = platform() === 'darwin';
-const chromiumArgs = ['--enable-unsafe-webgpu', '--enable-features=Vulkan', '--no-sandbox'];
+const HEADED = process.env.PERF_HEADED === '1';
+const chromiumArgs = [
+  '--enable-unsafe-webgpu',
+  '--enable-features=Vulkan',
+  '--no-sandbox',
+];
 if (!isMac) chromiumArgs.push('--use-angle=vulkan', '--use-gl=angle');
 
 let browser;
 let result;
 try {
-  browser = await chromium.launch({ headless: true, args: chromiumArgs });
+  browser = await chromium.launch({ headless: !HEADED, args: chromiumArgs });
   const ctx  = await browser.newContext({ viewport: { width: 1200, height: 800 } });
   const page = await ctx.newPage();
 
@@ -141,16 +146,51 @@ try {
   const cdp = await page.context().newCDPSession(page);
   await cdp.send('Profiler.enable');
   await cdp.send('Profiler.setSamplingInterval', { interval: 200 });
+
+  // Chromium tracing — captures the GPU process and compositor timeline
+  // that V8's per-process CPU profiler can't see. We collect events as
+  // they stream and dump them to a .trace.json (loadable in
+  // chrome://tracing or Perfetto), plus a text summary of the per-event-
+  // category time per frame.
+  const traceEvents = [];
+  cdp.on('Tracing.dataCollected', (msg) => {
+    if (msg?.value) for (const e of msg.value) traceEvents.push(e);
+  });
+  await cdp.send('Tracing.start', {
+    transferMode: 'ReportEvents',
+    traceConfig: {
+      includedCategories: [
+        'gpu', 'viz', 'cc', 'cc.debug', 'disabled-by-default-gpu.device',
+        'disabled-by-default-gpu.service', 'blink', 'renderer',
+      ],
+      recordMode: 'recordAsMuchAsPossible',
+    },
+  });
+
   await cdp.send('Profiler.start');
   await page.evaluate(() => window.__startFt());
   await page.waitForTimeout(PHASE_MS);
   const deltas = await page.evaluate(() => window.__stopFt());
   const { profile } = await cdp.send('Profiler.stop');
 
+  // Flush trace.
+  await cdp.send('Tracing.end');
+  await new Promise((r) => {
+    const onComplete = () => { cdp.off('Tracing.tracingComplete', onComplete); r(); };
+    cdp.on('Tracing.tracingComplete', onComplete);
+  });
+
   await page.screenshot({ path: `${OUT}/perf-idle.png` });
   writeFileSync(`${OUT}/perf-idle.cpuprofile`, JSON.stringify(profile));
   const flame = flameTree(profile);
   writeFileSync(`${OUT}/perf-idle.flame.txt`, flame);
+
+  // Dump the cross-process trace (Perfetto / chrome://tracing format)
+  // and a summary by event category so an AI / human can read where
+  // GPU + compositor time goes without opening a UI.
+  writeFileSync(`${OUT}/perf-idle.trace.json`, JSON.stringify({ traceEvents }));
+  const traceSummary = summariseTrace(traceEvents);
+  writeFileSync(`${OUT}/perf-idle.trace.summary.txt`, traceSummary);
 
   const stats = summarise(deltas);
   const fail = [];
@@ -246,6 +286,70 @@ function flameTree(profile) {
     `# Pruned: nodes contributing < ${minPct}% of total time omitted.`,
     '', ...lines,
   ].join('\n');
+}
+
+/**
+ * Roll a Chromium trace into per-(process, category, name) totals so it's
+ * readable as a text summary instead of needing chrome://tracing.
+ *
+ * Each event contributes either its own `dur` (for "complete" events,
+ * ph: "X") or the time between matching B/E pairs. We bucket by
+ * (process_name, category, name) and emit the top consumers sorted by
+ * total time.
+ */
+function summariseTrace(events) {
+  if (!events?.length) return '(empty trace)';
+  // Build process-id → process_name from metadata events.
+  const procName = new Map();
+  for (const e of events) {
+    if (e.name === 'process_name' && e.args?.name) procName.set(e.pid, e.args.name);
+  }
+  // Aggregate self time. Treat ph='X' as having .dur; for B/E, pair
+  // them per (pid, tid, name) on a small stack.
+  const stacks = new Map();
+  const buckets = new Map(); // key -> { dur_us, count }
+  const bump = (proc, cat, name, dur) => {
+    const key = `${proc}\t${cat}\t${name}`;
+    const slot = buckets.get(key) || { dur_us: 0, count: 0 };
+    slot.dur_us += dur;
+    slot.count += 1;
+    buckets.set(key, slot);
+  };
+  for (const e of events) {
+    const proc = procName.get(e.pid) || `pid${e.pid}`;
+    if (e.ph === 'X' && typeof e.dur === 'number') {
+      bump(proc, e.cat || '', e.name || '', e.dur);
+    } else if (e.ph === 'B') {
+      const k = `${e.pid}\t${e.tid}\t${e.name}`;
+      const s = stacks.get(k) || [];
+      s.push(e.ts);
+      stacks.set(k, s);
+    } else if (e.ph === 'E') {
+      const k = `${e.pid}\t${e.tid}\t${e.name}`;
+      const s = stacks.get(k);
+      if (s?.length) {
+        const start = s.pop();
+        bump(proc, e.cat || '', e.name || '', e.ts - start);
+      }
+    }
+  }
+  const rows = Array.from(buckets, ([k, v]) => {
+    const [proc, cat, name] = k.split('\t');
+    return { proc, cat, name, dur_ms: v.dur_us / 1000, count: v.count };
+  }).sort((a, b) => b.dur_ms - a.dur_ms);
+  const totalMs = rows.reduce((s, r) => s + r.dur_ms, 0) || 1;
+  const lines = [
+    `# Chromium trace summary — ${events.length} events, ${rows.length} unique buckets`,
+    `# Sum of all bucket times: ${totalMs.toFixed(1)}ms (NOT wall time — sum of overlapping per-thread spans)`,
+    `# Filtered to top 40 by total time. Columns: total_ms count proc / cat / name`,
+    '',
+  ];
+  for (const r of rows.slice(0, 40)) {
+    lines.push(
+      `${r.dur_ms.toFixed(1).padStart(10)}ms  ${String(r.count).padStart(6)}×  ${r.proc.padEnd(22)} / ${r.cat.padEnd(28)} / ${r.name}`,
+    );
+  }
+  return lines.join('\n');
 }
 
 function summarise(deltas) {

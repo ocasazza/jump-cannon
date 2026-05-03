@@ -106,6 +106,7 @@ await new Promise((res, rej) => {
 });
 
 // ---- 2. launch chromium with webgpu --------------------------------------
+const HEADED = process.env.PROFILE_HEADED === '1';
 const chromiumArgs = [
   '--enable-unsafe-webgpu',
   '--enable-features=Vulkan',
@@ -116,7 +117,7 @@ if (!isMac) chromiumArgs.push('--use-angle=vulkan', '--use-gl=angle');
 let browser;
 let result;
 try {
-  browser = await chromium.launch({ headless: true, args: chromiumArgs });
+  browser = await chromium.launch({ headless: !HEADED, args: chromiumArgs });
   const ctx  = await browser.newContext({ viewport: { width: 1200, height: 800 } });
   const page = await ctx.newPage();
 

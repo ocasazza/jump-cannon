@@ -65,6 +65,14 @@ pub struct App {
     // -- command palette ---------------------------------------------------
     palette_state: ui::CommandPaletteState,
     actions: ActionRegistry,
+
+    // -- auto-fit dedup ----------------------------------------------------
+    /// Last screen size we ran `fit_camera()` for. Used to skip re-fits
+    /// every frame when `fit_to_window` is true but nothing actually
+    /// resized. Without this, fit_to_window forces a per-frame O(n) bound
+    /// scan + camera mutation + uniform rewrite + re-render, saturating
+    /// the GPU command queue at large node counts.
+    last_fit_screen: Option<egui::Vec2>,
 }
 
 impl App {
@@ -143,6 +151,7 @@ impl App {
             cursor_force_active: 0.0,
             palette_state: ui::CommandPaletteState::default(),
             actions,
+            last_fit_screen: None,
         }
     }
 
@@ -726,10 +735,24 @@ impl App {
             }
         }
         if self.state.camera.fit_to_window {
-            // Cheap drift detector: refit if bounds extent doubles since last.
-            // We keep the implementation simple — just refit each frame is
-            // visually fine for a small graph and a no-op once converged.
-            pipes.fit_camera();
+            // Refit only when the canvas size changed since the last fit
+            // (or this is the first fit). Refitting every frame at large
+            // node counts saturates the GPU command queue with redundant
+            // re-renders and triggers `WaitForGetOffset` stalls (~27 % of
+            // wall time on synth-5000). The user can still re-fit on
+            // demand via Ctrl+P → Fit Camera or the Camera section.
+            let screen = self
+                .prev_canvas_rect
+                .map(|r| r.size())
+                .unwrap_or(egui::vec2(0.0, 0.0));
+            let need_fit = match self.last_fit_screen {
+                None => true,
+                Some(prev) => (prev - screen).abs().max_elem() > 1.0,
+            };
+            if need_fit {
+                pipes.fit_camera();
+                self.last_fit_screen = Some(screen);
+            }
         }
     }
 
