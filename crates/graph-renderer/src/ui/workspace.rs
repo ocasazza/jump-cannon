@@ -233,19 +233,33 @@ impl<'a, 'ctx> WorkspaceViewer<'a, 'ctx> {
             pitch_d -= dy * 0.005;
         }
 
-        // Scroll-wheel zoom (only when the canvas is hovered so it doesn't
-        // fight scrollable sidebars). raw_scroll_delta gives px on most
-        // mice / touchpads; scale to a useful camera-units amount.
-        if resp.hovered() {
-            let scroll = ui.input(|i| i.raw_scroll_delta.y);
-            if scroll.abs() > 0.0 {
+        // Read pointer position straight from input rather than from the
+        // response — egui_dock's nested layout doesn't always propagate
+        // hover state to the inner allocate_exact_size response, which
+        // killed scroll-wheel zoom in the dockable workspace.
+        let pointer_in_canvas = ui
+            .input(|i| i.pointer.hover_pos())
+            .map(|p| rect.contains(p))
+            .unwrap_or(false);
+
+        // Scroll-wheel zoom. smooth_scroll_delta is the egui-recommended
+        // accumulator (raw_scroll_delta resets too aggressively for our
+        // dispatch cadence). Eat the delta after consuming so a scroll
+        // over the canvas doesn't also scroll an underlying ScrollArea.
+        if pointer_in_canvas {
+            let scroll = ui.input(|i| i.smooth_scroll_delta.y);
+            if scroll.abs() > 0.5 {
                 zoom += scroll * 2.0;
+                ui.ctx().input_mut(|i| {
+                    i.smooth_scroll_delta = egui::Vec2::ZERO;
+                    i.raw_scroll_delta = egui::Vec2::ZERO;
+                });
             }
         }
 
-        // WASDQE keyboard pan / vertical (only while hovered to avoid
-        // hijacking text inputs in sidebars). Speed scales with frame dt.
-        if resp.hovered() {
+        // WASDQE keyboard pan / vertical. Same pointer-over-canvas guard
+        // so typing into a sidebar text field doesn't fly the camera.
+        if pointer_in_canvas {
             let (dt, w, a, s, d, q, e, shift) = ui.input(|i| (
                 i.unstable_dt.min(0.05),
                 i.key_down(egui::Key::W),
