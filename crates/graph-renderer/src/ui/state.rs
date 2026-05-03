@@ -225,6 +225,29 @@ impl LayoutPreset {
     }
 }
 
+/// Repulsion backend mirror of `graph_layouts::RepulsionMode`. Lives in
+/// the UI state so it persists across sessions and so the UI doesn't have
+/// to depend on the layouts crate's enum directly.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub enum RepulsionBackend {
+    #[default]
+    Grid,
+    BarnesHut,
+}
+
+impl RepulsionBackend {
+    pub const ALL: &'static [RepulsionBackend] = &[
+        RepulsionBackend::Grid,
+        RepulsionBackend::BarnesHut,
+    ];
+    pub fn label(self) -> &'static str {
+        match self {
+            RepulsionBackend::Grid => "Grid (27-cell)",
+            RepulsionBackend::BarnesHut => "Barnes-Hut",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct LayoutState {
     pub preset: LayoutPreset,
@@ -248,6 +271,11 @@ pub struct LayoutState {
     /// the Stats panel running/settled indicator.
     #[serde(default = "default_energy_threshold")]
     pub energy_threshold: f32,
+    /// Repulsion backend. Default Grid; flip to BarnesHut for clustered
+    /// graphs (Obsidian-style hub neighborhoods) where the 27-cell grid
+    /// degenerates into hundreds of pairs per voxel.
+    #[serde(default)]
+    pub repulsion_mode: RepulsionBackend,
 }
 
 fn default_cooling_alpha() -> f32 { 0.998 }
@@ -274,6 +302,7 @@ impl Default for LayoutState {
             cooling_alpha: 0.997,    // slow cool — give it time
             cooling_floor: 0.55,
             energy_threshold: 0.05,  // hold off on halting until truly settled
+            repulsion_mode: RepulsionBackend::default(),
         }
     }
 }

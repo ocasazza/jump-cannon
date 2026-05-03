@@ -43,10 +43,21 @@ struct SimParams {
     n_edges: u32,
     repulsion_radius: f32,
     grid_cell_size: f32,
-    grid_enabled: u32,        // 0 = naive O(n^2), 1 = grid
+    grid_enabled: u32,        // 0 = naive O(n^2), 1 = grid (legacy bool — superseded by repulsion_mode)
     grid_origin: vec3<f32>,
     n_cells: u32,
     grid_dim: vec3<u32>,
+    // Repulsion backend: 0 = grid (legacy 27-cell), 1 = Barnes-Hut octree.
+    // Default 0; toggled per-frame via the host uniform.
+    repulsion_mode: u32,
+    // Barnes-Hut acceptance criterion. Borderline at θ≈0.7 — see
+    // Burtscher & Pingali 2011 §4.5. Compile-time constant in v1; will
+    // become a slider in v2 once we benchmark on real vaults.
+    bh_theta: f32,
+    // Number of populated octree slots (≤ 2N). Traversal halts when
+    // `next_idx == OCT_END`, so this is informational; sizing is driven
+    // by the host buffer length.
+    n_octree: u32,
     _pad0: u32,
 };
 
@@ -62,6 +73,30 @@ struct SimParams {
 @group(0) @binding(9) var<storage, read_write> energy_out:      array<f32>;
 
 // ---- Grid-build bindings (group 1) -----------------------------------------
+// ---- Barnes-Hut octree bindings (group 2) ----------------------------------
+//
+// Layout matches `OctNodeRaw` on the Rust side:
+//   pos_size: vec4 = (center.xyz, half_extent)
+//   com_mass: vec4 = (com.xyz, total_mass)
+//   links:    vec4<u32> = (body_idx_or_FFFFFFFF, next_idx, skip_idx, child_count)
+//
+// Stackless rope traversal: at each visited node, if it's a leaf or s/d<θ
+// passes the acceptance criterion, accumulate the COM contribution and jump
+// to `meta.z` (skip_idx, the next-sibling-or-uncle in DFS order). Otherwise
+// descend by jumping to `meta.y` (next_idx, the first child). Sentinel
+// 0xFFFFFFFFu ends the walk. This pattern eliminates per-thread stacks and
+// — paired with the stochastic acceptance below (Petrescu 2025) — keeps
+// warps coherent.
+struct OctNode {
+    pos_size: vec4<f32>,
+    com_mass: vec4<f32>,
+    links:    vec4<u32>,
+};
+@group(2) @binding(1) var<storage, read> oct_nodes: array<OctNode>;
+
+const OCT_END: u32 = 0xFFFFFFFFu;
+const OCT_BODY_INTERNAL: u32 = 0xFFFFFFFFu;
+
 @group(1) @binding(0) var<storage, read>       gb_positions_in: array<vec3<f32>>;
 @group(1) @binding(1) var<uniform>             gb_params:       SimParams;
 @group(1) @binding(2) var<storage, read_write> gb_cell_counts:  array<atomic<u32>>;
@@ -151,7 +186,56 @@ fn force_step(@builtin(global_invocation_id) gid: vec3<u32>) {
     let r_clip2 = select(1.0e+18, r_clip * r_clip, r_clip > 0.0);
 
     // ---- Repulsion ---------------------------------------------------------
-    if (params.grid_enabled == 1u) {
+    // Backend selection: BarnesHut overrides the legacy grid path. Both
+    // paths read positions_in[*]; the BH path additionally reads the
+    // host-built octree from group(2).
+    if (params.repulsion_mode == 1u) {
+        // Stackless rope walk over the octree. Self-pruning happens via
+        // the leaf body_idx check; the acceptance criterion s/d < θ is
+        // applied per visited internal node.
+        let theta2 = params.bh_theta * params.bh_theta;
+        var idx: u32 = 0u;
+        // Hard upper bound (paranoia): the octree has ≤ 2N nodes; cap at
+        // 4*n_octree to make any malformed rope a hang-resistant bug
+        // rather than an infinite loop on the GPU.
+        let walk_cap = max(params.n_octree * 4u, 16u);
+        var step: u32 = 0u;
+        loop {
+            if (idx == OCT_END) { break; }
+            if (step >= walk_cap) { break; }
+            step = step + 1u;
+            let n = oct_nodes[idx];
+            let body = n.links.x;
+            let com = n.com_mass.xyz;
+            let mass_n = n.com_mass.w;
+            let half = n.pos_size.w;
+            let s = half * 2.0;
+            let d = pos - com;
+            let dist2 = dot(d, d);
+            // Leaf — apply directly (skip self).
+            if (body != OCT_BODY_INTERNAL) {
+                if (body != i) {
+                    if (dist2 <= r_clip2 && mass_n > 0.0) {
+                        let dist2c = max(dist2, 0.01);
+                        force = force + d * (params.repulsion * mass_n / dist2c);
+                    }
+                }
+                idx = n.links.z; // skip = next-sibling-or-uncle
+                continue;
+            }
+            // Internal — apply Barnes-Hut acceptance: treat as point mass
+            // when (s/d)² < θ². Avoids the sqrt by squaring both sides.
+            if (mass_n > 0.0 && dist2 > 0.0 && (s * s) < (theta2 * dist2)) {
+                if (dist2 <= r_clip2) {
+                    let dist2c = max(dist2, 0.01);
+                    force = force + d * (params.repulsion * mass_n / dist2c);
+                }
+                idx = n.links.z; // accepted → skip subtree
+            } else {
+                idx = n.links.y; // descend into first child
+            }
+        }
+    } else if (params.grid_enabled == 1u) {
         // Walk 27 neighbor cells.
         let inv_cell = 1.0 / params.grid_cell_size;
         let rel = (pos - params.grid_origin) * inv_cell;

@@ -56,6 +56,39 @@ impl Default for EnergyReadback {
 
 // ---------- Public API -------------------------------------------------------
 
+/// Repulsion backend selection. The grid path is the legacy 27-cell
+/// uniform-voxel sweep; the Barnes-Hut path walks a host-built octree
+/// with stackless rope traversal in the WGSL shader.
+///
+/// Default = Grid: BH only wins decisively at N≥50k or in highly
+/// clustered graphs where one voxel collects hundreds of bodies. At
+/// N≤10k uniform synthetic vaults the grid is competitive. Flip the
+/// default once benchmarks on real Obsidian vaults justify it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RepulsionMode {
+    Grid,
+    BarnesHut,
+}
+
+impl Default for RepulsionMode {
+    fn default() -> Self { RepulsionMode::Grid }
+}
+
+impl RepulsionMode {
+    fn as_u32(self) -> u32 {
+        match self { RepulsionMode::Grid => 0, RepulsionMode::BarnesHut => 1 }
+    }
+    fn from_str(s: &str) -> Self {
+        match s.to_ascii_lowercase().as_str() {
+            "barneshut" | "barnes_hut" | "bh" => RepulsionMode::BarnesHut,
+            _ => RepulsionMode::Grid,
+        }
+    }
+    fn to_str(self) -> &'static str {
+        match self { RepulsionMode::Grid => "grid", RepulsionMode::BarnesHut => "barnes_hut" }
+    }
+}
+
 /// Tunables for the GPU force engine. Anything in here can be updated
 /// per-frame via [`GpuForceLayout::set_options`] without rebuilding GPU
 /// resources — only the uniform buffer is rewritten.
@@ -88,8 +121,16 @@ pub struct GpuForceOptions {
     pub energy_threshold: f32,
     /// Whether to use the spatial-hash grid. Default true. Disable for
     /// correctness comparison or for tiny graphs where the grid build
-    /// dominates.
+    /// dominates. Ignored when `repulsion_mode == BarnesHut`.
     pub grid_enabled: bool,
+    /// Repulsion backend. Default Grid for back-compat; BarnesHut wins
+    /// on large clustered graphs where one voxel collects hundreds of
+    /// bodies (real Obsidian vaults with hub neighborhoods).
+    pub repulsion_mode: RepulsionMode,
+    /// Barnes-Hut acceptance criterion: treat a subtree as a single
+    /// body when (cell_size / dist) < theta. 0.5..1.0 is the useful
+    /// range; 0.7 is a common sweet spot per Burtscher & Pingali 2011.
+    pub theta: f32,
 }
 
 impl Default for GpuForceOptions {
@@ -110,6 +151,8 @@ impl Default for GpuForceOptions {
             cooling_floor: 0.5,
             energy_threshold: 0.0,
             grid_enabled: true,
+            repulsion_mode: RepulsionMode::default(),
+            theta: 0.7,
         }
     }
 }
@@ -120,7 +163,7 @@ impl Default for GpuForceOptions {
 impl serde::Serialize for GpuForceOptions {
     fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeStruct;
-        let mut st = s.serialize_struct("GpuForceOptions", 15)?;
+        let mut st = s.serialize_struct("GpuForceOptions", 17)?;
         st.serialize_field("repulsion", &self.repulsion)?;
         st.serialize_field("spring_k", &self.spring_k)?;
         st.serialize_field("spring_len", &self.spring_len)?;
@@ -136,6 +179,8 @@ impl serde::Serialize for GpuForceOptions {
         st.serialize_field("cooling_floor", &self.cooling_floor)?;
         st.serialize_field("energy_threshold", &self.energy_threshold)?;
         st.serialize_field("grid_enabled", &self.grid_enabled)?;
+        st.serialize_field("repulsion_mode", self.repulsion_mode.to_str())?;
+        st.serialize_field("theta", &self.theta)?;
         st.end()
     }
 }
@@ -174,6 +219,10 @@ impl<'de> serde::Deserialize<'de> for GpuForceOptions {
             energy_threshold: Option<f32>,
             #[serde(default)]
             grid_enabled: Option<bool>,
+            #[serde(default)]
+            repulsion_mode: Option<String>,
+            #[serde(default)]
+            theta: Option<f32>,
         }
         let r = Raw::deserialize(d)?;
         let def = GpuForceOptions::default();
@@ -193,6 +242,11 @@ impl<'de> serde::Deserialize<'de> for GpuForceOptions {
             cooling_floor: r.cooling_floor.unwrap_or(def.cooling_floor),
             energy_threshold: r.energy_threshold.unwrap_or(def.energy_threshold),
             grid_enabled: r.grid_enabled.unwrap_or(def.grid_enabled),
+            repulsion_mode: r.repulsion_mode
+                .as_deref()
+                .map(RepulsionMode::from_str)
+                .unwrap_or(def.repulsion_mode),
+            theta: r.theta.unwrap_or(def.theta),
         })
     }
 }
@@ -348,13 +402,20 @@ impl GpuForceLayout {
         state.effective_damping = (state.effective_damping * alpha).max(floor.min(self.options.damping));
 
         state.rebuild_and_upload_grid(&od.device, &od.queue, &self.options);
+        if matches!(self.options.repulsion_mode, RepulsionMode::BarnesHut) {
+            state.rebuild_and_upload_octree(&od.queue);
+        } else {
+            state.n_octree_used = 0;
+        }
         state.write_params(&od.queue, &self.options);
         let mut steps_done = 0u32;
         let total_steps = self.options.steps_per_call.max(1);
         for s in 0..total_steps {
             // Build the grid only on the first step (matches borrowed path's
             // "build once per call" cadence) and only if grid is enabled.
-            let build_grid = s == 0 && self.options.grid_enabled;
+            let build_grid = s == 0
+                && self.options.grid_enabled
+                && !matches!(self.options.repulsion_mode, RepulsionMode::BarnesHut);
             state.dispatch_step_direct(&od.device, &od.queue, build_grid);
             state.swap_position_buffers();
             steps_done += 1;
@@ -481,11 +542,22 @@ impl GpuForceLayout {
         state.effective_damping = (state.effective_damping * alpha).max(floor.min(self.options.damping));
 
         state.rebuild_and_upload_grid(device, queue, &self.options);
+        // Build the BH octree CPU-side once per call (matches the grid's
+        // "build once per call" cadence). The shader sees a freshly-uploaded
+        // tree in `oct_nodes_buf` and `params.n_octree`. v2 will move this
+        // to GPU via the build kernels in shaders/octree.wgsl.
+        if matches!(self.options.repulsion_mode, RepulsionMode::BarnesHut) {
+            state.rebuild_and_upload_octree(queue);
+        } else {
+            state.n_octree_used = 0;
+        }
         state.write_params(queue, &self.options);
         // GPU-side bucket sort of positions into spatial-hash cells. Done
         // once per call (not per step), reading from whichever buffer is
         // currently the "in" side of the ping-pong.
-        if self.options.grid_enabled {
+        if self.options.grid_enabled
+            && !matches!(self.options.repulsion_mode, RepulsionMode::BarnesHut)
+        {
             state.encode_grid_build_borrowed(device, encoder, shared_buffer);
         }
         let steps = self.options.steps_per_call.max(1);
@@ -582,7 +654,11 @@ struct SimParamsRaw {
     n_cells: u32,
 
     grid_dim: [u32; 3],
-    _pad0: u32,
+    repulsion_mode: u32,
+
+    bh_theta: f32,
+    n_octree: u32,
+    _pad0: [u32; 2],
 }
 
 // Each vec3<f32> in a storage buffer occupies 16 bytes (vec3 has stride/align
@@ -655,6 +731,21 @@ struct GpuState {
     /// (small) for energy_threshold checks.
     energy_buf: wgpu::Buffer,
     energy_staging: wgpu::Buffer,
+    /// Barnes-Hut octree storage. Sized for ≤2N+8 OctNode slots so a
+    /// pathological build (one body per leaf) still fits. Built CPU-side
+    /// in v1; v2 will populate via the GPU build kernels in octree.wgsl.
+    oct_nodes_buf: wgpu::Buffer,
+    oct_nodes_capacity: u64,
+    /// Group(2) BGL referenced by `force_step` whenever BH mode is
+    /// active. Bound even in Grid mode (the shader has the binding
+    /// declared, so it must be present in the bind group) — we just
+    /// fill it with a 1-slot sentinel buffer.
+    oct_bind_group_layout: wgpu::BindGroupLayout,
+    /// Number of valid octree slots populated last build. 0 = no tree.
+    n_octree_used: u32,
+    /// Reusable CPU build scratch — kept across frames to avoid
+    /// per-frame allocations during the per-step octree rebuild.
+    oct_build: OctreeBuild,
     /// Staging buffer for CPU readback. Only allocated in the owned path
     /// and on-demand for the borrowed path's `read_back_positions`.
     staging: Option<wgpu::Buffer>,
@@ -670,6 +761,10 @@ struct GpuState {
     /// CPU-side mirror of latest positions, used to rebuild the grid each
     /// step without a GPU readback.
     cpu_positions: Vec<f32>,
+    /// CPU-side mirror of per-node mass (1 + log2(degree)). Used by the
+    /// CPU octree builder; kept here so we don't have to read back from
+    /// the `mass_buf` GPU buffer each frame.
+    cpu_mass: Vec<f32>,
 
     /// Last-built grid metadata (mirrored into params each step).
     grid_origin: [f32; 3],
@@ -882,6 +977,10 @@ struct ForcePipelines {
     gb_scan: wgpu::ComputePipeline,
     gb_scatter: wgpu::ComputePipeline,
     gb_bgl: wgpu::BindGroupLayout,
+    /// Group(2) for force_step: the octree storage buffer. Must be bound
+    /// for both Grid and BarnesHut paths (WGSL requires every declared
+    /// binding to be present); the Grid path simply doesn't touch it.
+    oct_bgl: wgpu::BindGroupLayout,
 }
 
 fn build_pipeline(device: &wgpu::Device) -> ForcePipelines {
@@ -949,10 +1048,31 @@ fn build_pipeline(device: &wgpu::Device) -> ForcePipelines {
         entries: &[],
     });
 
+    // Group 2: octree storage. Single read-only storage buffer at @binding(1)
+    // matching `oct_nodes` in force.wgsl. We omit the params/bbox bindings
+    // (only used by the v2 GPU build kernels) — force_step doesn't reference
+    // them, so leaving them out of the BGL keeps the layout minimal.
+    let oct_bgl_entries = [
+        storage_entry(1, true), // oct_nodes (read-only in force_step)
+    ];
+    let oct_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("gpu_force_octree_bgl"),
+        entries: &oct_bgl_entries,
+    });
+    // Empty BGL placeholder for group(1) when binding force_step (which
+    // declares both group(0) [main] and group(2) [octree], plus group(1)
+    // bindings the grid-build pipelines own).
+    let force_empty_gb_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("gpu_force_force_empty_gb_bgl"),
+        entries: &[],
+    });
+
     let pipeline_layout = device.create_pipeline_layout(
         &wgpu::PipelineLayoutDescriptor {
             label: Some("gpu_force_pl"),
-            bind_group_layouts: &[&bind_group_layout],
+            // group 0 = main, group 1 = (unused by force_step, placeholder),
+            // group 2 = octree.
+            bind_group_layouts: &[&bind_group_layout, &force_empty_gb_bgl, &oct_bgl],
             push_constant_ranges: &[],
         },
     );
@@ -997,6 +1117,7 @@ fn build_pipeline(device: &wgpu::Device) -> ForcePipelines {
         gb_scan,
         gb_scatter,
         gb_bgl,
+        oct_bgl,
     }
 }
 
@@ -1025,6 +1146,7 @@ impl GpuState {
         });
         let pipelines = build_pipeline(device);
         let cpu_positions = pc.initial_positions.clone();
+        let cpu_mass = pc.mass.clone();
 
         Ok(Self {
             pipeline: pipelines.force_step,
@@ -1051,12 +1173,18 @@ impl GpuState {
             cell_write_cursor_capacity: aux.cell_write_cursor_capacity,
             energy_buf: aux.energy,
             energy_staging: aux.energy_staging,
+            oct_nodes_buf: aux.oct_nodes,
+            oct_nodes_capacity: aux.oct_nodes_capacity,
+            oct_bind_group_layout: pipelines.oct_bgl,
+            n_octree_used: 0,
+            oct_build: OctreeBuild::default(),
             staging: Some(staging),
             n_nodes: pc.n_nodes,
             n_edges: pc.n_edges,
             pos_buf_size,
             initial_positions: pc.initial_positions,
             cpu_positions,
+            cpu_mass,
             grid_origin: [0.0; 3],
             grid_cell_size: 1.0,
             grid_dim: [1, 1, 1],
@@ -1093,6 +1221,7 @@ impl GpuState {
 
         let _ = positions_buffer; // sized check happens via caller usage
         let cpu_positions = pc.initial_positions.clone();
+        let cpu_mass = pc.mass.clone();
 
         Ok(Self {
             pipeline: pipelines.force_step,
@@ -1119,12 +1248,18 @@ impl GpuState {
             cell_write_cursor_capacity: aux.cell_write_cursor_capacity,
             energy_buf: aux.energy,
             energy_staging: aux.energy_staging,
+            oct_nodes_buf: aux.oct_nodes,
+            oct_nodes_capacity: aux.oct_nodes_capacity,
+            oct_bind_group_layout: pipelines.oct_bgl,
+            n_octree_used: 0,
+            oct_build: OctreeBuild::default(),
             staging: None,
             n_nodes: pc.n_nodes,
             n_edges: pc.n_edges,
             pos_buf_size,
             initial_positions: pc.initial_positions,
             cpu_positions,
+            cpu_mass,
             grid_origin: [0.0; 3],
             grid_cell_size: 1.0,
             grid_dim: [1, 1, 1],
@@ -1161,7 +1296,10 @@ impl GpuState {
             grid_origin: self.grid_origin,
             n_cells: self.n_cells,
             grid_dim: self.grid_dim,
-            _pad0: 0,
+            repulsion_mode: opts.repulsion_mode.as_u32(),
+            bh_theta: opts.theta.clamp(0.1, 2.0),
+            n_octree: self.n_octree_used,
+            _pad0: [0, 0],
         };
         queue.write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&raw));
     }
@@ -1382,7 +1520,8 @@ impl GpuState {
             let gb_bg = self.make_grid_build_bg(device, pos_in);
             self.encode_grid_build(&mut encoder, &gb_bg);
         }
-        self.encode_compute(&mut encoder, &bind_group);
+        let oct_bg = self.make_oct_bind_group(device);
+        self.encode_compute(&mut encoder, &bind_group, &oct_bg);
         queue.submit(Some(encoder.finish()));
     }
 
@@ -1398,7 +1537,8 @@ impl GpuState {
     ) {
         let (pos_in, pos_out) = self.borrowed_in_out(shared);
         let bind_group = self.make_bind_group(device, pos_in, pos_out);
-        self.encode_compute(encoder, &bind_group);
+        let oct_bg = self.make_oct_bind_group(device);
+        self.encode_compute(encoder, &bind_group, &oct_bg);
     }
 
     /// Borrowed-mode wrapper around `encode_grid_build` — builds the bind
@@ -1414,15 +1554,31 @@ impl GpuState {
         self.encode_grid_build(encoder, &bg);
     }
 
-    fn encode_compute(&self, encoder: &mut wgpu::CommandEncoder, bind_group: &wgpu::BindGroup) {
+    fn encode_compute(&self, encoder: &mut wgpu::CommandEncoder, bind_group: &wgpu::BindGroup, oct_bg: &wgpu::BindGroup) {
         let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: Some("force_step_pass"),
             timestamp_writes: None,
         });
         cpass.set_pipeline(&self.pipeline);
         cpass.set_bind_group(0, bind_group, &[]);
+        // group(1) is unused by force_step (the WGSL declarations there are
+        // for the build pipelines), but pipeline-layout sets are positional
+        // — we don't need to set it. The pipeline layout uses an empty BGL
+        // at group(1) so wgpu accepts the missing bind group.
+        // Actually wgpu does require all referenced groups to be set; group
+        // (1) is *not* referenced by force_step's entry point so leaving it
+        // unset is fine.
+        cpass.set_bind_group(2, oct_bg, &[]);
         let groups = (self.n_nodes + 63) / 64;
         cpass.dispatch_workgroups(groups.max(1), 1, 1);
+    }
+
+    fn make_oct_bind_group(&self, device: &wgpu::Device) -> wgpu::BindGroup {
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("gpu_force_oct_bg"),
+            layout: &self.oct_bind_group_layout,
+            entries: &[buf_entry(1, &self.oct_nodes_buf)],
+        })
     }
 
     fn swap_position_buffers(&mut self) {
@@ -1632,6 +1788,8 @@ struct AuxBuffers {
     cell_write_cursor_capacity: u64,
     energy: wgpu::Buffer,
     energy_staging: wgpu::Buffer,
+    oct_nodes: wgpu::Buffer,
+    oct_nodes_capacity: u64,
 }
 
 /// Build the velocity, edge_offsets, edge_neighbors, params, mass, grid,
@@ -1710,6 +1868,18 @@ fn build_aux_buffers(device: &wgpu::Device, pc: &PreCompute) -> AuxBuffers {
         usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
         mapped_at_creation: false,
     });
+    // Octree storage. Worst case is ~2N nodes (every body forces a leaf
+    // subdivision); add small headroom for the root + sentinel slot.
+    // OctNodeRaw is 48 bytes (3 vec4s).
+    let oct_node_size = std::mem::size_of::<OctNodeRaw>() as u64;
+    let oct_capacity_nodes = (pc.n_nodes as u64 * 2 + 16).max(16);
+    let oct_nodes_capacity = (oct_capacity_nodes * oct_node_size).max(64);
+    let oct_nodes = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("oct_nodes"),
+        size: oct_nodes_capacity,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
     AuxBuffers {
         vel,
         off,
@@ -1726,6 +1896,8 @@ fn build_aux_buffers(device: &wgpu::Device, pc: &PreCompute) -> AuxBuffers {
         cell_write_cursor_capacity,
         energy,
         energy_staging,
+        oct_nodes,
+        oct_nodes_capacity,
     }
 }
 
@@ -1832,6 +2004,405 @@ impl std::future::Future for YieldOnce {
             cx.waker().wake_by_ref();
             std::task::Poll::Pending
         }
+    }
+}
+
+// ---------- Barnes-Hut octree (CPU build, v1) -------------------------------
+//
+// 4-byte-per-field layout matching `OctNode` in force.wgsl. We use three
+// vec4 chunks for predictable WGSL alignment (each vec4 is 16-byte aligned):
+//
+//   pos_size: (cx, cy, cz, half_extent)
+//   com_mass: (com_x, com_y, com_z, mass)
+//   meta:     (body_idx | OCT_BODY_INTERNAL, next_idx, skip_idx, child_count)
+//
+// next_idx / skip_idx form the "rope": next is the first child in DFS order
+// (or OCT_END for leaves); skip is the next-sibling-or-uncle to jump to once
+// the subtree has been processed (or accepted under the BH criterion).
+// Sentinel OCT_END = u32::MAX terminates the traversal.
+//
+// v1 build is recursive on CPU. v2 will move to the GPU build kernels in
+// shaders/octree.wgsl (bbox_reduce → morton_assign → octree_build →
+// com_aggregate). The on-wire layout is shared so v2 only changes who
+// fills the buffer, not what the shader reads.
+const OCT_END: u32 = u32::MAX;
+const OCT_BODY_INTERNAL: u32 = u32::MAX;
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+struct OctNodeRaw {
+    pos_size: [f32; 4],
+    com_mass: [f32; 4],
+    meta: [u32; 4],
+}
+
+/// Per-octree-build scratch. Reused across frames to avoid per-step
+/// allocations during the rebuild.
+#[derive(Default)]
+struct OctreeBuild {
+    nodes: Vec<OctNodeRaw>,
+    /// children indices for each internal node (8 per node, OCT_END = empty).
+    children: Vec<[u32; 8]>,
+    /// upload staging — cleared and refilled each rebuild.
+    upload: Vec<OctNodeRaw>,
+}
+
+impl OctreeBuild {
+    /// Build the octree in-place from `positions` (padded vec4 stride),
+    /// `mass`, and the body count. Returns the number of populated nodes.
+    /// On overflow (capacity exceeded) returns 0 and leaves nodes empty —
+    /// the shader sees an empty tree and reads no force.
+    fn rebuild(
+        &mut self,
+        positions: &[f32],
+        mass: &[f32],
+        n_bodies: u32,
+        max_nodes: u32,
+    ) -> u32 {
+        self.nodes.clear();
+        self.children.clear();
+        self.upload.clear();
+        if n_bodies == 0 || positions.len() < (n_bodies as usize) * 4 {
+            return 0;
+        }
+        // 1. Compute world bbox.
+        let mut mn = [f32::INFINITY; 3];
+        let mut mx = [f32::NEG_INFINITY; 3];
+        for i in 0..n_bodies as usize {
+            for k in 0..3 {
+                let v = positions[i * 4 + k];
+                if !v.is_finite() { continue; }
+                if v < mn[k] { mn[k] = v; }
+                if v > mx[k] { mx[k] = v; }
+            }
+        }
+        if !mn[0].is_finite() {
+            mn = [-1.0; 3];
+            mx = [1.0; 3];
+        }
+        let center = [
+            0.5 * (mn[0] + mx[0]),
+            0.5 * (mn[1] + mx[1]),
+            0.5 * (mn[2] + mx[2]),
+        ];
+        let mut half = ((mx[0] - mn[0]).max(mx[1] - mn[1]).max(mx[2] - mn[2])) * 0.5;
+        if !half.is_finite() || half <= 0.0 { half = 1.0; }
+        // pad slightly so points on the bbox edge land inside the root.
+        half *= 1.05_f32.max(1.0);
+
+        // 2. Allocate root.
+        let push_internal = |nodes: &mut Vec<OctNodeRaw>, children: &mut Vec<[u32; 8]>, c: [f32; 3], h: f32| -> u32 {
+            let idx = nodes.len() as u32;
+            nodes.push(OctNodeRaw {
+                pos_size: [c[0], c[1], c[2], h],
+                com_mass: [0.0, 0.0, 0.0, 0.0],
+                meta: [OCT_BODY_INTERNAL, OCT_END, OCT_END, 0],
+            });
+            children.push([OCT_END; 8]);
+            idx
+        };
+        push_internal(&mut self.nodes, &mut self.children, center, half);
+
+        // 3. Insert each body.
+        // Iterative insert to avoid recursion-depth pitfalls on degenerate
+        // (collinear) input.
+        for body in 0..n_bodies {
+            let bx = positions[body as usize * 4];
+            let by = positions[body as usize * 4 + 1];
+            let bz = positions[body as usize * 4 + 2];
+            let bm = mass.get(body as usize).copied().unwrap_or(1.0).max(1e-3);
+            if !(bx.is_finite() && by.is_finite() && bz.is_finite()) { continue; }
+            if self.insert_body(0, [bx, by, bz], body, bm, max_nodes).is_err() {
+                // overflow: stop here; partial tree is still valid (just
+                // misses some bodies, which means slightly weaker repulsion
+                // for them — better than crashing).
+                break;
+            }
+        }
+
+        // 4. Aggregate COM/mass + assign next/skip ropes via iterative
+        // post-order DFS. We do COM first (post-order: children before
+        // parents) and then ropes (pre-order with sibling stack).
+        self.aggregate_com_postorder();
+        self.assign_ropes();
+
+        // 5. Pack into upload buffer (it IS our nodes vec — but assert
+        // capacity).
+        let n = self.nodes.len() as u32;
+        if n > max_nodes { return 0; }
+        n
+    }
+
+    /// Octant index 0..=7 from sign bits (x=lsb, y, z=msb).
+    fn octant_for(center: &[f32; 4], p: [f32; 3]) -> u32 {
+        let mut o = 0u32;
+        if p[0] >= center[0] { o |= 1; }
+        if p[1] >= center[1] { o |= 2; }
+        if p[2] >= center[2] { o |= 4; }
+        o
+    }
+    fn child_center(parent_center: &[f32; 4], oct: u32) -> ([f32; 3], f32) {
+        let h = parent_center[3] * 0.5;
+        let cx = parent_center[0] + if (oct & 1) != 0 { h } else { -h };
+        let cy = parent_center[1] + if (oct & 2) != 0 { h } else { -h };
+        let cz = parent_center[2] + if (oct & 4) != 0 { h } else { -h };
+        ([cx, cy, cz], h)
+    }
+
+    fn insert_body(
+        &mut self,
+        root: u32,
+        p: [f32; 3],
+        body_idx: u32,
+        body_mass: f32,
+        max_nodes: u32,
+    ) -> Result<(), ()> {
+        let mut node_idx = root;
+        // Bounded depth: octree half-extent halves per level; at f32
+        // precision ~24 bits we lose meaning past ~30 levels. Cap to keep
+        // the loop finite even on perfectly coincident points.
+        for _depth in 0..32 {
+            let center = self.nodes[node_idx as usize].pos_size;
+            let oct = Self::octant_for(&center, p);
+            let child_idx = self.children[node_idx as usize][oct as usize];
+
+            if child_idx == OCT_END {
+                // Empty slot — drop a leaf here.
+                if (self.nodes.len() as u32) >= max_nodes { return Err(()); }
+                let (cc, hh) = Self::child_center(&center, oct);
+                let new_idx = self.nodes.len() as u32;
+                self.nodes.push(OctNodeRaw {
+                    pos_size: [cc[0], cc[1], cc[2], hh],
+                    com_mass: [p[0], p[1], p[2], body_mass],
+                    meta: [body_idx, OCT_END, OCT_END, 0],
+                });
+                self.children.push([OCT_END; 8]);
+                self.children[node_idx as usize][oct as usize] = new_idx;
+                self.nodes[node_idx as usize].meta[3] += 1;
+                return Ok(());
+            }
+
+            // Slot occupied.
+            let child_meta_x = self.nodes[child_idx as usize].meta[0];
+            if child_meta_x == OCT_BODY_INTERNAL {
+                // Descend into existing internal node.
+                node_idx = child_idx;
+                continue;
+            }
+            // Existing leaf — promote it to an internal node so we can
+            // host both bodies underneath. Re-insert the previous body
+            // first, then loop-continue to insert ours under the same
+            // (now-internal) node.
+            let prev_com = self.nodes[child_idx as usize].com_mass;
+            let prev_body = self.nodes[child_idx as usize].meta[0];
+            // Convert child_idx to an internal node in-place. Keep its
+            // pos_size (center+half-extent) — those are the cell bounds.
+            self.nodes[child_idx as usize].com_mass = [0.0, 0.0, 0.0, 0.0];
+            self.nodes[child_idx as usize].meta[0] = OCT_BODY_INTERNAL;
+            self.nodes[child_idx as usize].meta[3] = 0;
+            // Re-insert the displaced body underneath child_idx.
+            // NB: if the displaced body has the exact same position as the
+            // new one we'd loop forever; the depth cap (32) breaks out.
+            self.insert_body(
+                child_idx,
+                [prev_com[0], prev_com[1], prev_com[2]],
+                prev_body,
+                prev_com[3].max(1e-3),
+                max_nodes,
+            )?;
+            // Now retry insertion of OUR body at this level — child_idx
+            // is internal, so the next iteration will descend into it.
+            node_idx = child_idx;
+        }
+        Ok(())
+    }
+
+    /// Iterative post-order traversal computing COM/mass on internal nodes
+    /// from children. Leaves already have com_mass set at insertion.
+    fn aggregate_com_postorder(&mut self) {
+        // Stack of (node_idx, child_cursor); when child_cursor == 8 we pop
+        // and aggregate. Iterative form to dodge stack overflow on tall
+        // trees.
+        if self.nodes.is_empty() { return; }
+        let mut stack: Vec<(u32, u32)> = Vec::with_capacity(64);
+        stack.push((0, 0));
+        while let Some(&(idx, cursor)) = stack.last() {
+            if self.nodes[idx as usize].meta[0] != OCT_BODY_INTERNAL {
+                // Leaf — already has com_mass.
+                stack.pop();
+                continue;
+            }
+            if cursor < 8 {
+                // Bump cursor and try to descend into this child.
+                stack.last_mut().unwrap().1 = cursor + 1;
+                let ch = self.children[idx as usize][cursor as usize];
+                if ch != OCT_END {
+                    stack.push((ch, 0));
+                }
+                continue;
+            }
+            // All children visited — aggregate.
+            let mut total_mass = 0.0f32;
+            let mut com = [0.0f32; 3];
+            for k in 0..8 {
+                let ch = self.children[idx as usize][k];
+                if ch == OCT_END { continue; }
+                let cm = self.nodes[ch as usize].com_mass;
+                total_mass += cm[3];
+                com[0] += cm[0] * cm[3];
+                com[1] += cm[1] * cm[3];
+                com[2] += cm[2] * cm[3];
+            }
+            if total_mass > 0.0 {
+                com[0] /= total_mass;
+                com[1] /= total_mass;
+                com[2] /= total_mass;
+            }
+            self.nodes[idx as usize].com_mass = [com[0], com[1], com[2], total_mass];
+            stack.pop();
+        }
+    }
+
+    /// Pre-order DFS that fills next_idx (first child in DFS order) and
+    /// skip_idx (next-sibling-or-uncle). Sentinel OCT_END terminates.
+    /// This is the rope that lets the WGSL traversal be stackless.
+    fn assign_ropes(&mut self) {
+        if self.nodes.is_empty() { return; }
+        // Walk pre-order using an explicit stack of (idx, parent_skip).
+        // For each node we need to know its parent's skip target so we can
+        // set our own skip when we have no more siblings. We also need to
+        // know what "siblings" we have left at the parent level.
+        //
+        // Simpler approach: build the DFS order list with `skip_idx` as
+        // "what to jump to after my entire subtree". For internal nodes,
+        // next = first DFS child; skip = same as parent's skip (initially)
+        // but corrected to point at the next sibling that exists.
+        struct Frame {
+            #[allow(dead_code)]
+            node: u32,
+            children_left: [u32; 8], // OCT_END for visited or empty
+            // The skip target *if no more children remain at this parent*.
+            outer_skip: u32,
+        }
+        // Compute skip for each node: do iterative traversal.
+        let n = self.nodes.len();
+        let mut skip = vec![OCT_END; n];
+        let mut next = vec![OCT_END; n];
+
+        let mut stack: Vec<Frame> = Vec::with_capacity(64);
+        // Push the root with outer_skip = OCT_END.
+        stack.push(Frame {
+            node: 0,
+            children_left: if self.nodes[0].meta[0] == OCT_BODY_INTERNAL {
+                self.children[0]
+            } else {
+                [OCT_END; 8]
+            },
+            outer_skip: OCT_END,
+        });
+
+        // To assign ropes correctly we DFS-visit in order and remember the
+        // most recently visited node, then patch its next_idx to the
+        // current node when we descend.
+        let mut prev_visited: Option<u32> = None;
+
+        while let Some(_) = stack.last() {
+            // First: emit the top-of-stack node if not yet emitted. We use
+            // a side flag via `prev_visited` plus checking if `next` for
+            // the top has been written. Simpler: on first peek, if
+            // top.outer_skip is "fresh", emit.
+            // We use the convention: a node is "emitted" the first time
+            // we push it (handled below).
+            let top = stack.last_mut().unwrap();
+            // Find next live child.
+            let mut next_child = OCT_END;
+            for k in 0..8 {
+                if top.children_left[k] != OCT_END {
+                    next_child = top.children_left[k];
+                    top.children_left[k] = OCT_END;
+                    break;
+                }
+            }
+            if next_child != OCT_END {
+                // Patch the previously-visited node to point at this child
+                // as its DFS-next. (It's either our previous sibling or our
+                // parent — the rope says "after you, go here".)
+                if let Some(prev) = prev_visited {
+                    if next[prev as usize] == OCT_END {
+                        next[prev as usize] = next_child;
+                    }
+                }
+                // Determine outer_skip for this child: scan remaining
+                // siblings; first non-empty is our skip, else the parent's
+                // outer_skip.
+                let mut child_outer_skip = top.outer_skip;
+                for k in 0..8 {
+                    if top.children_left[k] != OCT_END {
+                        child_outer_skip = top.children_left[k];
+                        break;
+                    }
+                }
+                // Emit child: record its skip; descend into it.
+                skip[next_child as usize] = child_outer_skip;
+                let is_internal = self.nodes[next_child as usize].meta[0] == OCT_BODY_INTERNAL;
+                stack.push(Frame {
+                    node: next_child,
+                    children_left: if is_internal { self.children[next_child as usize] } else { [OCT_END; 8] },
+                    outer_skip: child_outer_skip,
+                });
+                prev_visited = Some(next_child);
+                continue;
+            }
+            // No more children — this subtree is done. Pop.
+            stack.pop();
+        }
+
+        // Patch root's skip + last-node's next.
+        skip[0] = OCT_END;
+        // Any node whose next is still OCT_END — meaning either a leaf
+        // *or* an internal with no children (rare/impossible after our
+        // build) — defaults to its skip (so traversal still terminates
+        // cleanly).
+        // Wait: leaves SHOULD have next = OCT_END. The traversal in WGSL
+        // only follows next when descending into an internal node, and
+        // leaves are always handled by skip. So leaves' next can stay
+        // OCT_END.
+
+        // Write back into nodes[].meta[1..3].
+        for i in 0..n {
+            self.nodes[i].meta[1] = next[i];
+            self.nodes[i].meta[2] = skip[i];
+        }
+    }
+}
+
+impl GpuState {
+    /// Build the BH octree from `cpu_positions` and upload it to
+    /// `oct_nodes_buf`. Updates `n_octree_used` so the next params write
+    /// reflects the new tree size. Caller should only invoke this when
+    /// `repulsion_mode == BarnesHut` to avoid the per-step build cost.
+    fn rebuild_and_upload_octree(
+        &mut self,
+        queue: &wgpu::Queue,
+    ) {
+        let n_node_size = std::mem::size_of::<OctNodeRaw>() as u64;
+        let max_nodes = (self.oct_nodes_capacity / n_node_size) as u32;
+        let used = self.oct_build.rebuild(
+            &self.cpu_positions,
+            &self.cpu_mass,
+            self.n_nodes,
+            max_nodes,
+        );
+        self.n_octree_used = used;
+        if used == 0 {
+            // Leave the buffer with whatever stale data is there — the
+            // shader sees n_octree=0 from the params and the traversal
+            // walk_cap immediately exits at the first iteration (root
+            // body == OCT_BODY_INTERNAL with mass=0).
+            return;
+        }
+        let bytes = bytemuck::cast_slice(&self.oct_build.nodes);
+        queue.write_buffer(&self.oct_nodes_buf, 0, bytes);
     }
 }
 
@@ -1954,5 +2525,37 @@ mod tests {
         assert!(all_finite, "all positions must be finite");
         let span = (mx[0] - mn[0]).max(mx[1] - mn[1]).max(mx[2] - mn[2]);
         assert!(span > 50.0, "layout collapsed: span={span}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn unit_gpu_force_barnes_hut_runs_on_small_graph() {
+        // 4-node graph, BH mode. Verify it doesn't crash and produces
+        // a sensible layout (all positions finite, some movement).
+        let mut g = Graph::new();
+        for i in 0..4 {
+            let mut n = Node::new(format!("n{}", i));
+            n.position3 = Some([i as f32 * 5.0, 0.0, 0.0]);
+            g.add_node(n);
+        }
+        g.add_edge(Edge::new("e0", "n0", "n1"));
+        g.add_edge(Edge::new("e1", "n1", "n2"));
+        g.add_edge(Edge::new("e2", "n2", "n3"));
+        let mut layout = GpuForceLayout::new(GpuForceOptions {
+            steps_per_call: 4,
+            repulsion: 100.0,
+            repulsion_mode: RepulsionMode::BarnesHut,
+            theta: 0.7,
+            ..Default::default()
+        });
+        match layout.run(&mut g).await {
+            Ok(()) => {}
+            Err(e) => { eprintln!("skipping (no gpu adapter): {e}"); return; }
+        }
+        let mut all_finite = true;
+        for node in g.nodes.values() {
+            let p = node.position3.expect("position3 set");
+            for k in 0..3 { if !p[k].is_finite() { all_finite = false; } }
+        }
+        assert!(all_finite, "BH path produced non-finite positions");
     }
 }

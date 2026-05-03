@@ -12,8 +12,7 @@ use crate::ui::actions::{self, ActionRegistry, BuiltinAction, ParamValue};
 use crate::ui::command_palette::PaletteOutcome;
 use crate::ui::query::EvalContext;
 use crate::ui::state::{ColorBy, FontFamilyChoice, SizeBy};
-use graph_layouts::GpuForceOptions;
-use graph_layouts::warmup_positions;
+use graph_layouts::{warmup_positions, GpuForceOptions, RepulsionMode};
 
 /// Result of an async `/node/:id` fetch — Some(Ok) success, Some(Err) error,
 /// None means no fetch has completed since the last poll.
@@ -718,6 +717,7 @@ impl App {
             l.cooling_alpha.to_bits(),
             l.cooling_floor.to_bits(),
             l.energy_threshold.to_bits(),
+            l.repulsion_mode as u32,
         ];
         let mut h: u64 = 0xcbf2_9ce4_8422_2325;
         for b in bits {
@@ -756,6 +756,12 @@ impl App {
             // Repulsion radius scales with spring_len so the spatial-hash
             // grid bounds per-pair work to a 27-cell neighborhood.
             opts.repulsion_radius = (4.0 * l.spring_len).max(1.0);
+            // Map UI enum -> layouts crate enum. Default is Grid until
+            // we benchmark BH on real vaults and flip the default.
+            opts.repulsion_mode = match l.repulsion_mode {
+                crate::ui::state::RepulsionBackend::Grid => RepulsionMode::Grid,
+                crate::ui::state::RepulsionBackend::BarnesHut => RepulsionMode::BarnesHut,
+            };
             pipes.update_layout_options(opts);
         }
         self.prev_layout_key = Some(key);

@@ -1,6 +1,6 @@
 use eframe::egui;
 
-use crate::ui::state::{AppState, LayoutPreset};
+use crate::ui::state::{AppState, LayoutPreset, RepulsionBackend};
 use crate::ui::theme::accent;
 
 use super::{hint_label, subgroup_label, subgroup_separator};
@@ -74,4 +74,17 @@ pub fn show(ui: &mut egui::Ui, state: &mut AppState) {
         egui::Slider::new(&mut l.energy_threshold, 0.0..=1.0)
             .text("energy halt threshold"),
     );
+
+    subgroup_separator(ui);
+
+    // Repulsion backend toggle. Default Grid; BarnesHut wins on
+    // clustered graphs at scale. See gpu_force.rs::RepulsionMode.
+    subgroup_label(ui, "Repulsion backend");
+    hint_label(ui, "BH wins on clustered N≥50k; Grid otherwise");
+    ui.add_space(4.0);
+    ui.horizontal(|ui| {
+        for mode in RepulsionBackend::ALL {
+            ui.selectable_value(&mut l.repulsion_mode, *mode, mode.label());
+        }
+    });
 }
