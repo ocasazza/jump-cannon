@@ -2,16 +2,12 @@ use eframe::egui;
 
 use crate::ui::state::{AppState, ColorBy, SizeBy};
 
-use super::subgroup_label;
+use super::{reset_row, subgroup_label};
 
 pub fn show(ui: &mut egui::Ui, state: &mut AppState) {
-    ui.horizontal(|ui| {
-        let avail = ui.available_size_before_wrap();
-        ui.add_space(avail.x - 58.0);
-        if ui.small_button("↺ Reset").clicked() {
-            state.style = Default::default();
-        }
-    });
+    if reset_row(ui) {
+        state.style = Default::default();
+    }
     subgroup_label(ui, "Size by");
     egui::ComboBox::from_id_salt("style-size-by")
         .selected_text(state.style.size_by.label())

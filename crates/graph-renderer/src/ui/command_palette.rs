@@ -744,32 +744,33 @@ fn render_param_form(
     let valid = registry.validate_param(idx);
 
     ui.add_space(8.0);
-    ui.horizontal(|ui| {
-        let avail = ui.available_width();
-        ui.add_space(avail - 220.0);
-        if ui.button("Cancel").clicked() {
-            registry.cancel_configuring();
-        }
-        if !is_last {
-            let prev_resp = ui.add_enabled(idx > 0, egui::Button::new("Previous"));
-            if prev_resp.clicked() {
-                if let Some(c) = registry.configuring.as_mut() {
-                    c.current_param_index = idx.saturating_sub(1);
-                }
-            }
-            let next_resp = ui.add_enabled(valid, egui::Button::new("Next"));
-            if next_resp.clicked() {
-                if let Some(c) = registry.configuring.as_mut() {
-                    c.current_param_index = (idx + 1).min(n_params - 1);
-                }
-            }
-        } else {
+    // Right-aligned button row. Buttons appear in visual order
+    // [Cancel | Previous | Next/Apply] thanks to the right_to_left layout
+    // emitting in reverse.
+    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+        if is_last {
             let apply_resp = ui.add_enabled(valid, egui::Button::new("Apply"));
             if apply_resp.clicked() {
                 if let Some((id, params)) = registry.take_finished_form() {
                     return Some(PaletteOutcome::Execute { action_id: id, params });
                 }
             }
+        } else {
+            let next_resp = ui.add_enabled(valid, egui::Button::new("Next"));
+            if next_resp.clicked() {
+                if let Some(c) = registry.configuring.as_mut() {
+                    c.current_param_index = (idx + 1).min(n_params - 1);
+                }
+            }
+            let prev_resp = ui.add_enabled(idx > 0, egui::Button::new("Previous"));
+            if prev_resp.clicked() {
+                if let Some(c) = registry.configuring.as_mut() {
+                    c.current_param_index = idx.saturating_sub(1);
+                }
+            }
+        }
+        if ui.button("Cancel").clicked() {
+            registry.cancel_configuring();
         }
         None::<PaletteOutcome>
     });

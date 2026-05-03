@@ -93,6 +93,22 @@ pub fn subgroup_separator(ui: &mut egui::Ui) {
     ui.add_space(6.0);
 }
 
+/// Right-aligned "↺ Reset" button. Used by every section-panel block
+/// to expose a per-section reset. Returns true on click.
+///
+/// Uses a `right_to_left` layout instead of an `add_space(avail - X)`
+/// hack so the button stays glued to the right edge across sidebar
+/// resizes.
+pub fn reset_row(ui: &mut egui::Ui) -> bool {
+    let mut clicked = false;
+    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+        if ui.small_button("↺ Reset").clicked() {
+            clicked = true;
+        }
+    });
+    clicked
+}
+
 /// Hint / help text — 10px, italic, white at 0.5 alpha.
 pub fn hint_label(ui: &mut egui::Ui, text: &str) {
     ui.label(

@@ -3,16 +3,12 @@ use eframe::egui;
 use crate::ui::state::AppState;
 use crate::ui::theme::accent;
 
-use super::subgroup_separator;
+use super::{reset_row, subgroup_separator};
 
 pub fn show(ui: &mut egui::Ui, state: &mut AppState) {
-    ui.horizontal(|ui| {
-        let avail = ui.available_size_before_wrap();
-        ui.add_space(avail.x - 58.0);
-        if ui.small_button("↺ Reset").clicked() {
-            state.camera = Default::default();
-        }
-    });
+    if reset_row(ui) {
+        state.camera = Default::default();
+    }
     ui.horizontal(|ui| {
         let _ = ui.button("Fit");
         let _ = ui.button("Reset");

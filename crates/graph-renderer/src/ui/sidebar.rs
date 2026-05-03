@@ -11,9 +11,15 @@ use super::sections;
 use super::state::{AppState, Section};
 use crate::perf::PerfCollector;
 
+// VSCode-style activity bar: 44px is the icon-rail width (40px touch
+// target + 4px breathing room on the right edge). Not a stretchable
+// layout — leaving as a fixed exact_width.
 const ACTIVITY_W: f32 = 44.0;
 const ACTIVITY_BTN: f32 = 40.0;
+// Default section panel width; user-resizable within `SECTION_W_RANGE`.
 const SECTION_W: f32 = 280.0;
+const SECTION_W_MIN: f32 = 200.0;
+const SECTION_W_MAX: f32 = 520.0;
 
 pub fn show(
     ctx: &egui::Context,
@@ -227,8 +233,9 @@ fn show_section_panel(
     perf: &PerfCollector,
 ) {
     egui::SidePanel::left("section-panel")
-        .exact_width(SECTION_W)
-        .resizable(false)
+        .default_width(SECTION_W)
+        .width_range(SECTION_W_MIN..=SECTION_W_MAX)
+        .resizable(true)
         .frame(
             egui::Frame::none()
                 .fill(egui::Color32::BLACK)

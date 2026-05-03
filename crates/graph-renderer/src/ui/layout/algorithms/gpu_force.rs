@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::ui::layout::registry::LayoutFactory;
-use crate::ui::sections::{hint_label, subgroup_label, subgroup_separator};
+use crate::ui::sections::{hint_label, reset_row, subgroup_label, subgroup_separator};
 use crate::ui::theme::accent;
 
 pub fn factory() -> LayoutFactory {
@@ -142,15 +142,11 @@ fn render_ui(ui: &mut egui::Ui, json: &mut Value) {
     // Reset row — mirrors pre-refactor behaviour: reset to defaults then
     // re-apply the currently active preset.
     let active_preset = LayoutPreset::detect(&opts).unwrap_or_default();
-    ui.horizontal(|ui| {
-        let avail = ui.available_size_before_wrap();
-        ui.add_space(avail.x - 58.0);
-        if ui.small_button("↺ Reset").clicked() {
-            opts = GpuForceOptions::default();
-            active_preset.apply_to(&mut opts);
-            changed = true;
-        }
-    });
+    if reset_row(ui) {
+        opts = GpuForceOptions::default();
+        active_preset.apply_to(&mut opts);
+        changed = true;
+    }
 
     // Preset row.
     subgroup_label(ui, "Preset");

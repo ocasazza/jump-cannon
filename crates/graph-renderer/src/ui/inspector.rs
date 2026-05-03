@@ -19,7 +19,12 @@ use std::collections::HashMap;
 
 use super::state::AppState;
 
+// Default expanded width — user-resizable within `PANEL_W_RANGE`.
 const PANEL_W: f32 = 320.0;
+const PANEL_W_MIN: f32 = 240.0;
+const PANEL_W_MAX: f32 = 560.0;
+// Collapsed strip is a fixed 24px thumb (chevron target only) — not a
+// stretchable layout.
 const COLLAPSED_W: f32 = 24.0;
 
 /// Read-only context the inspector uses to resolve node info, plus a
@@ -76,8 +81,9 @@ fn show_collapsed(ctx: &egui::Context, state: &mut AppState) {
 
 fn show_expanded(ctx: &egui::Context, state: &mut AppState, data: &mut InspectorData) {
     egui::SidePanel::right("inspector")
-        .exact_width(PANEL_W)
-        .resizable(false)
+        .default_width(PANEL_W)
+        .width_range(PANEL_W_MIN..=PANEL_W_MAX)
+        .resizable(true)
         .frame(
             egui::Frame::none()
                 .fill(egui::Color32::BLACK)

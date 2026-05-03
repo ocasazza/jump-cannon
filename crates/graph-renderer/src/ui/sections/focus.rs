@@ -2,16 +2,12 @@ use eframe::egui;
 
 use crate::ui::state::AppState;
 
-use super::hint_label;
+use super::{hint_label, reset_row};
 
 pub fn show(ui: &mut egui::Ui, state: &mut AppState) {
-    ui.horizontal(|ui| {
-        let avail = ui.available_size_before_wrap();
-        ui.add_space(avail.x - 58.0);
-        if ui.small_button("↺ Reset").clicked() {
-            state.focus = Default::default();
-        }
-    });
+    if reset_row(ui) {
+        state.focus = Default::default();
+    }
     let f = &mut state.focus;
     ui.checkbox(&mut f.dof_enabled, "Depth-of-field");
     ui.add_enabled_ui(f.dof_enabled, |ui| {
