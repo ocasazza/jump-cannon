@@ -91,6 +91,7 @@ pub fn show(ui: &mut egui::Ui, state: &AppState, perf: &PerfCollector) {
         .unwrap_or(0.0);
     let plot_x_min = (plot_x_max - CHART_WINDOW_SECS).max(0.0);
     Plot::new(plot_id)
+        .width(ui.available_width())
         .height(110.0)
         .allow_zoom(false)
         .allow_drag(false)
@@ -173,6 +174,7 @@ fn chart_block(
     let x_max = points.last().map(|p| p[0]).unwrap_or(0.0);
     let x_min = (x_max - CHART_WINDOW_SECS).max(0.0);
     Plot::new(plot_id)
+        .width(ui.available_width())
         .height(CHART_HEIGHT)
         .allow_zoom(false)
         .allow_drag(false)
