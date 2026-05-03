@@ -639,6 +639,17 @@ impl GraphPipelines {
             .unwrap_or(false)
     }
 
+    /// Most recent max-KE readback from the GPU force sim, if any.
+    /// Used by the renderer to throttle repaint cadence while the sim
+    /// is warming up (high KE → user can't perceive 60fps detail).
+    pub fn last_max_ke(&self) -> f32 {
+        self.buffers
+            .as_ref()
+            .and_then(|b| b.layout.as_ref())
+            .map(|l| l.last_max_ke())
+            .unwrap_or(0.0)
+    }
+
     /// Current layout options snapshot, if a layout exists.
     pub fn layout_options(&self) -> Option<GpuForceOptions> {
         self.buffers

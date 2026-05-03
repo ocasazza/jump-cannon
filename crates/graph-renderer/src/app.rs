@@ -61,20 +61,32 @@ pub struct App {
     prev_canvas_rect: Option<egui::Rect>,
     last_pointer_in_canvas: Option<egui::Pos2>,
     cursor_force_active: f32, // sign: +1 attract / -1 repel / 0 none
+    /// Previous-frame value of `cursor_force_active`, used to detect the
+    /// release edge (non-zero → 0) so we can kick a brief accelerated
+    /// cool-down. Without this, every click wakes the sim and the
+    /// HALT_GRACE_STEPS window pins continuous repaint for ~5s.
+    prev_cursor_force_active: f32,
+    /// Frames remaining in the post-click accelerated-cool-down window.
+    /// While > 0 we push a temporary options snapshot with stronger
+    /// cooling so the brief perturbation halts fast.
+    post_click_cooldown_frames: u32,
+    /// Latest max-KE readback mirrored from GraphPipelines, used to
+    /// pick render cadence (high KE → throttle repaint to ~20fps since
+    /// the user can't visually parse 60fps of layout shuffle).
+    last_observed_max_ke: f32,
 
     // -- command palette ---------------------------------------------------
     palette_state: ui::CommandPaletteState,
     actions: ActionRegistry,
 
     // -- auto-fit dedup ----------------------------------------------------
-    /// Last (screen size, graph bounds extent) we ran `fit_camera()` for.
-    /// Refit when EITHER changes meaningfully, so the camera follows a
-    /// growing/shrinking layout AND we don't refit every frame on idle.
-    /// Without the bounds half of this gate, clicking the canvas (which
-    /// fires the cursor force for one frame, perturbing the layout) lets
-    /// the graph drift outside the frustum and the screen goes black.
+    /// Last canvas size we ran `fit_camera()` for. Auto-refit only fires
+    /// when this changes (window resize). Following live graph bounds
+    /// caused click-blackouts: the cursor force perturbs the sim, bounds
+    /// spike, refit zooms way out, sub-pixel cull blanks the screen.
+    /// Manual refit via `F`, the Camera section button, or Ctrl+P → Fit
+    /// Camera covers the rest.
     last_fit_screen: Option<egui::Vec2>,
-    last_fit_extent: Option<f32>,
 }
 
 impl App {
@@ -151,10 +163,12 @@ impl App {
             prev_canvas_rect: None,
             last_pointer_in_canvas: None,
             cursor_force_active: 0.0,
+            prev_cursor_force_active: 0.0,
+            post_click_cooldown_frames: 0,
+            last_observed_max_ke: 0.0,
             palette_state: ui::CommandPaletteState::default(),
             actions,
             last_fit_screen: None,
-            last_fit_extent: None,
         }
     }
 
@@ -365,17 +379,43 @@ impl eframe::App for App {
         let mut pointer_in_canvas: Option<egui::Pos2> = None;
         let mut lmb_held = false;
         let mut rmb_held = false;
+        // Snapshot the load message so we can render a progress overlay
+        // before the graph buffers exist. Cheap clone; the lock is brief.
+        let load_msg: Option<String> = {
+            let guard = self.load.lock().unwrap();
+            match &*guard {
+                LoadState::Pending => Some("loading…".to_string()),
+                LoadState::Loading(m) => Some(m.clone()),
+                _ => None,
+            }
+        };
         egui::CentralPanel::default()
             .frame(egui::Frame::none().fill(egui::Color32::TRANSPARENT))
             .show(ctx, |ui| {
                 let avail = ui.available_size();
                 let (rect, resp) =
                     ui.allocate_exact_size(avail, egui::Sense::click_and_drag());
-                let cb = GraphCallback {
-                    screen_px: [rect.width().max(1.0), rect.height().max(1.0)],
-                };
-                ui.painter()
-                    .add(egui_wgpu::Callback::new_paint_callback(rect, cb));
+                // Skip the wgpu graph callback entirely while the bootstrap
+                // is still loading — there's nothing to draw yet, and
+                // showing a progress label gives the user a signal that
+                // something is happening instead of a blank canvas.
+                if self.loaded_into_gpu {
+                    let cb = GraphCallback {
+                        screen_px: [rect.width().max(1.0), rect.height().max(1.0)],
+                    };
+                    ui.painter()
+                        .add(egui_wgpu::Callback::new_paint_callback(rect, cb));
+                } else if let Some(msg) = load_msg.as_ref() {
+                    // Centered white label at ~14px on the dark cosmograph
+                    // background (clear_color is set above the callback).
+                    ui.painter().text(
+                        rect.center(),
+                        egui::Align2::CENTER_CENTER,
+                        msg,
+                        egui::FontId::proportional(14.0),
+                        egui::Color32::WHITE,
+                    );
+                }
                 canvas_rect = Some(rect);
 
                 if let Some(pos) = resp.hover_pos().or_else(|| resp.interact_pointer_pos()) {
@@ -481,6 +521,7 @@ impl eframe::App for App {
         self.apply_focus_to_gpu(frame);
         self.apply_camera_to_gpu(frame);
         self.apply_cursor_force(frame);
+        self.tick_post_click_cooldown(frame);
         self.apply_selection(frame);
         self.refresh_stats(frame);
 
@@ -493,8 +534,31 @@ impl eframe::App for App {
             || self.palette_state.open
             || !self.loaded_into_gpu
             || self.cursor_force_active.abs() > 0.0;
+        // Treat "any pointer activity this frame" as user input — force
+        // an immediate next-frame repaint so input feels snappy even if
+        // the warm-throttle below would otherwise slow us down.
+        let has_user_input = ctx.input(|i| {
+            i.pointer.any_pressed()
+                || i.pointer.any_released()
+                || i.pointer.is_moving()
+        });
         if needs_continuous {
-            ctx.request_repaint();
+            // While the sim is warm (KE well above the halt threshold)
+            // the user can't perceive 60fps of layout shuffle. Throttle
+            // to ~20fps so we waste less GPU on imperceptible frames.
+            // Pointer input bypasses the throttle for snappy interaction.
+            let warm_threshold = self.state.layout.energy_threshold * 5.0;
+            let warm = self.loaded_into_gpu
+                && !sim_settled
+                && self.last_observed_max_ke > warm_threshold
+                && self.cursor_force_active.abs() == 0.0
+                && self.post_click_cooldown_frames == 0
+                && !has_user_input;
+            if warm {
+                ctx.request_repaint_after(std::time::Duration::from_millis(50));
+            } else {
+                ctx.request_repaint();
+            }
         } else {
             // Light tick so a fresh user action (e.g. an action instance
             // mutating state) isn't held up for an arbitrary time.
@@ -776,6 +840,15 @@ impl App {
         if !self.loaded_into_gpu {
             return;
         }
+        // Release-edge detection: cursor was active last frame, now it's
+        // not. Kick a short accelerated cool-down so the brief disturbance
+        // halts before HALT_GRACE_STEPS (~5s at steps_per_call=2) elapses.
+        if self.prev_cursor_force_active.abs() > 0.0
+            && self.cursor_force_active.abs() == 0.0
+        {
+            self.post_click_cooldown_frames = 30;
+        }
+        self.prev_cursor_force_active = self.cursor_force_active;
         let key = self.cursor_key();
         if self.prev_cursor_key == Some(key) {
             return;
@@ -806,6 +879,32 @@ impl App {
             }
         }
         self.prev_cursor_key = Some(key);
+    }
+
+    /// While the post-click cool-down window is active, push a temporary
+    /// options snapshot with stronger cooling so the brief perturbation
+    /// halts fast. When the window expires, clear `prev_layout_key` so
+    /// the next `apply_layout_to_gpu` re-pushes the user's tuned values.
+    fn tick_post_click_cooldown(&mut self, frame: &mut eframe::Frame) {
+        if self.post_click_cooldown_frames == 0 || !self.loaded_into_gpu {
+            return;
+        }
+        self.post_click_cooldown_frames -= 1;
+        let Some(wgpu_state) = frame.wgpu_render_state() else { return };
+        let mut renderer = wgpu_state.renderer.write();
+        if let Some(pipes) = renderer.callback_resources.get_mut::<GraphPipelines>() {
+            if let Some(mut opts) = pipes.layout_options() {
+                // Aggressive cooling tweaks — only for the cooldown window.
+                opts.cooling_alpha *= 0.95;
+                opts.energy_threshold *= 5.0;
+                pipes.update_layout_options(opts);
+            }
+        }
+        if self.post_click_cooldown_frames == 0 {
+            // Restore the user's tuned values via apply_layout_to_gpu's
+            // normal path on the next frame.
+            self.prev_layout_key = None;
+        }
     }
 
     fn apply_selection(&mut self, frame: &mut eframe::Frame) {
@@ -849,6 +948,9 @@ impl App {
             self.state.stats.n_nodes = pipes.n_nodes();
             self.state.stats.n_edges = pipes.n_edges();
             sim_halted = pipes.is_halted();
+            // Mirror max-KE so the renderer can pick repaint cadence
+            // without re-locking the renderer in the update loop tail.
+            self.last_observed_max_ke = pipes.last_max_ke();
         }
         // Communities: max value + 1 over the community metric.
         if let Some(comm) = self.metrics.get("community") {
