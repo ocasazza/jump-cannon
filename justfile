@@ -87,3 +87,23 @@ test-browser: wasm
         cd tests/browser && npm install --silent --no-audit --no-fund; \
     fi
     cd tests/browser && node run.mjs
+
+# Headless browser PROFILER. Same setup as test-browser but instead of a
+# pass/fail screenshot check it captures rAF frame timings + a V8 CPU
+# profile (.cpuprofile) per phase (idle / palette-open / fit-camera).
+# Output: tests/browser/out/profile-*.{png,cpuprofile} + a JSON summary
+# on stdout (avg FPS, p50/p95/p99 frame time, jank pct, top-12 hot fns).
+# Drop the .cpuprofile into Chrome DevTools → Performance for a flame chart.
+profile-browser: wasm
+    cargo build --release -p graph-api
+    @mkdir -p /tmp/test-vault
+    @if [ ! -f /tmp/test-vault/Alpha.md ]; then \
+        printf 'See [[Beta]] and [[Gamma]].\n' > /tmp/test-vault/Alpha.md; \
+        printf '[[Alpha]]\n' > /tmp/test-vault/Beta.md; \
+        printf '[[Alpha]] [[Beta]]\n' > /tmp/test-vault/Gamma.md; \
+    fi
+    @if [ ! -d tests/browser/node_modules ]; then \
+        echo "→ installing playwright npm package (one-time)…"; \
+        cd tests/browser && npm install --silent --no-audit --no-fund; \
+    fi
+    cd tests/browser && node profile.mjs
