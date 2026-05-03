@@ -738,37 +738,25 @@ impl App {
             }
         }
         if self.state.camera.fit_to_window {
-            // Refit when EITHER the canvas resized OR the graph's bounds
-            // extent changed by >20 % since the last fit. The bounds gate
-            // keeps the camera following a still-spreading layout (so a
-            // click that nudges the sim doesn't drift the graph off-screen
-            // → all nodes culled → black canvas). The screen gate handles
-            // window resizes. Together they avoid the per-frame refit
-            // that was saturating the GPU command queue on large graphs.
+            // Auto-refit ONLY on canvas resize. Following the live graph
+            // bounds is too aggressive: a click fires the cursor force
+            // for one frame which perturbs the sim, bounds spike, the
+            // refit zooms out, all nodes become sub-pixel and cull to
+            // a blank canvas for the duration of the disturbance.
+            // Initial fit happens once at load (pipes.fit_to_loaded_bounds
+            // in load()). Manual refit via Ctrl+P → Fit Camera or `F`.
             let screen = self
                 .prev_canvas_rect
                 .map(|r| r.size())
                 .unwrap_or(egui::vec2(0.0, 0.0));
-            let extent = pipes
-                .bounds()
-                .map(|(mn, mx)| (mx - mn).max_element())
-                .unwrap_or(0.0);
             let screen_changed = match self.last_fit_screen {
-                None => true,
+                None => false, // initial fit done in load(); skip first frame
                 Some(prev) => (prev - screen).abs().max_elem() > 1.0,
             };
-            let extent_changed = match self.last_fit_extent {
-                None => true,
-                Some(prev) => {
-                    let denom = prev.abs().max(1e-3);
-                    ((extent - prev) / denom).abs() > 0.2
-                }
-            };
-            if screen_changed || extent_changed {
+            if screen_changed {
                 pipes.fit_camera();
-                self.last_fit_screen = Some(screen);
-                self.last_fit_extent = Some(extent);
             }
+            self.last_fit_screen = Some(screen);
         }
     }
 
