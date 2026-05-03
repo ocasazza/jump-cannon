@@ -214,23 +214,69 @@ impl<'a, 'ctx> WorkspaceViewer<'a, 'ctx> {
             i.pointer.button_down(egui::PointerButton::Secondary) && resp.hovered()
         });
 
+        // Aggregate per-frame camera deltas so we open the wgpu callback
+        // resources at most once.
+        let mut yaw_d = 0.0_f32;
+        let mut pitch_d = 0.0_f32;
+        let mut pan_x = 0.0_f32;
+        let mut pan_y = 0.0_f32;
+        let mut pan_z = 0.0_f32;
+        let mut zoom = 0.0_f32;
+
         if resp.dragged_by(egui::PointerButton::Middle) {
             let d = resp.drag_delta();
             let mut dx = d.x;
             let mut dy = d.y;
-            if self.ctx.invert_mouse_x {
-                dx = -dx;
+            if self.ctx.invert_mouse_x { dx = -dx; }
+            if self.ctx.invert_mouse_y { dy = -dy; }
+            yaw_d += dx * 0.005;
+            pitch_d -= dy * 0.005;
+        }
+
+        // Scroll-wheel zoom (only when the canvas is hovered so it doesn't
+        // fight scrollable sidebars). raw_scroll_delta gives px on most
+        // mice / touchpads; scale to a useful camera-units amount.
+        if resp.hovered() {
+            let scroll = ui.input(|i| i.raw_scroll_delta.y);
+            if scroll.abs() > 0.0 {
+                zoom += scroll * 2.0;
             }
-            if self.ctx.invert_mouse_y {
-                dy = -dy;
-            }
+        }
+
+        // WASDQE keyboard pan / vertical (only while hovered to avoid
+        // hijacking text inputs in sidebars). Speed scales with frame dt.
+        if resp.hovered() {
+            let (dt, w, a, s, d, q, e, shift) = ui.input(|i| (
+                i.unstable_dt.min(0.05),
+                i.key_down(egui::Key::W),
+                i.key_down(egui::Key::A),
+                i.key_down(egui::Key::S),
+                i.key_down(egui::Key::D),
+                i.key_down(egui::Key::Q),
+                i.key_down(egui::Key::E),
+                i.modifiers.shift,
+            ));
+            let speed = if shift { 5.0 } else { 1.0 } * 400.0 * dt;
+            if w { pan_z += speed; }
+            if s { pan_z -= speed; }
+            if d { pan_x += speed; }
+            if a { pan_x -= speed; }
+            if q { pan_y += speed; }
+            if e { pan_y -= speed; }
+        }
+
+        if yaw_d != 0.0 || pitch_d != 0.0 || pan_x != 0.0 || pan_y != 0.0
+            || pan_z != 0.0 || zoom != 0.0
+        {
             if let Some(wgpu_state) = self.ctx.frame.wgpu_render_state() {
                 let mut renderer = wgpu_state.renderer.write();
-                if let Some(pipes) =
-                    renderer.callback_resources.get_mut::<GraphPipelines>()
-                {
-                    pipes.camera.rotate_yaw(dx * 0.005);
-                    pipes.camera.rotate_pitch(-dy * 0.005);
+                if let Some(pipes) = renderer.callback_resources.get_mut::<GraphPipelines>() {
+                    if yaw_d != 0.0 { pipes.camera.rotate_yaw(yaw_d); }
+                    if pitch_d != 0.0 { pipes.camera.rotate_pitch(pitch_d); }
+                    if pan_x != 0.0 || pan_y != 0.0 || pan_z != 0.0 {
+                        pipes.camera.pan(pan_x, pan_y, pan_z);
+                    }
+                    if zoom != 0.0 { pipes.camera.zoom(zoom); }
                 }
             }
         }

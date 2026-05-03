@@ -139,11 +139,14 @@ fn show_expanded(ctx: &egui::Context, state: &mut AppState, data: &mut Inspector
 
 fn show_metadata(ui: &mut egui::Ui, idx: u32, data: &InspectorData) {
     let id = data.ids.get(idx as usize).cloned().unwrap_or_default();
-    ui.label(
-        egui::RichText::new(&id)
-            .color(egui::Color32::WHITE)
-            .strong()
-            .monospace(),
+    ui.add(
+        egui::Label::new(
+            egui::RichText::new(&id)
+                .color(egui::Color32::WHITE)
+                .strong()
+                .monospace(),
+        )
+        .wrap(),
     );
     ui.add_space(4.0);
 

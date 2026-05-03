@@ -17,3 +17,11 @@ crates/graph-renderer/assets/dist/
 .dolt/
 *.db
 .beads-credential-key
+.beads/
+
+# direnv layer (local nix env)
+.direnv/
+
+# Claude scratch + assorted local tooling
+.claude/
+.gc/

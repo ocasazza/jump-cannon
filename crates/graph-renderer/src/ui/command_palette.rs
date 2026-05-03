@@ -107,7 +107,16 @@ pub fn show(
     // Wider window when we'll be showing the file-preview pane.
     let configuring = registry.configuring.is_some();
     let two_pane = !configuring && !state.query.trim().is_empty() && !nodes.is_empty();
-    let width = if two_pane { 980.0 } else { 600.0 };
+    // Clamp to ~90% of the viewport so the palette doesn't overflow off
+    // the screen on narrow windows. egui_dock + sidebars eat horizontal
+    // space, and the prior 980px constant pushed the preview pane off
+    // the right edge on typical laptop widths.
+    let screen_w = ctx.screen_rect().width();
+    let width = if two_pane {
+        980.0_f32.min(screen_w * 0.9)
+    } else {
+        600.0_f32.min(screen_w * 0.9)
+    };
 
     egui::Window::new("command-palette")
         .title_bar(false)
