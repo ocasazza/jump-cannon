@@ -13,6 +13,7 @@ use crate::ui::command_palette::PaletteOutcome;
 use crate::ui::query::EvalContext;
 use crate::ui::state::{ColorBy, FontFamilyChoice, SizeBy};
 use graph_layouts::GpuForceOptions;
+use graph_layouts::warmup_positions;
 
 /// Result of an async `/node/:id` fetch — Some(Ok) success, Some(Err) error,
 /// None means no fetch has completed since the last poll.
@@ -233,7 +234,7 @@ impl App {
                 }
             }
         };
-        let Some(bootstrap) = bootstrap_opt else {
+        let Some(mut bootstrap) = bootstrap_opt else {
             return;
         };
 
@@ -249,6 +250,21 @@ impl App {
         self.metrics = bootstrap.metrics.clone();
 
         let n_nodes = bootstrap.positions.len() / 3;
+
+        // Multilevel coarsening warm-up (FM3 / sfdp). Replace the server's
+        // random initial layout with a coarsened-cascade seed so the GPU
+        // sim converges in a handful of frames instead of hundreds. No-op
+        // for n_nodes < 64 (handled inside warmup_positions).
+        let spring_len = self.state.layout.spring_len.max(1.0);
+        let warmed = warmup_positions(n_nodes, &bootstrap.edges, spring_len, 0xC0A75E);
+        if warmed.len() == bootstrap.positions.len() {
+            bootstrap.positions = warmed;
+            log::info!(
+                "[graph-renderer] coarsening warmup applied ({} nodes)",
+                n_nodes
+            );
+        }
+
         // Initial colors / sizes from the user's persisted style choice.
         let colors = data::colors_from_metric(
             self.state.style.color_by.metric_key(),
