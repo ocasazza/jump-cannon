@@ -178,7 +178,7 @@ impl LayoutPreset {
             // graphs (>10k) where you'd rather see structure now than
             // wait for a perfect arrangement.
             LayoutPreset::Fast => {
-                l.repulsion = 300.0;
+                l.repulsion = 150.0;
                 l.spring_k = 0.10;
                 l.spring_len = 40.0;
                 l.gravity = 0.005;
@@ -194,7 +194,7 @@ impl LayoutPreset {
             // doesn't collapse into a ring. Per-frame compute stays low
             // (steps_per_call=2) so it isn't perceived as slow.
             LayoutPreset::Balanced => {
-                l.repulsion = 500.0;
+                l.repulsion = 250.0;
                 l.spring_k = 0.06;
                 l.spring_len = 60.0;
                 l.gravity = 0.003;
@@ -209,7 +209,7 @@ impl LayoutPreset {
             // For small/medium graphs where the user wants the cleanest
             // possible final layout.
             LayoutPreset::Pretty => {
-                l.repulsion = 800.0;
+                l.repulsion = 400.0;
                 l.spring_k = 0.05;
                 l.spring_len = 80.0;
                 l.gravity = 0.002;
@@ -264,7 +264,7 @@ impl Default for LayoutState {
         // room and push the layout into 3D rather than flattening.
         Self {
             preset: LayoutPreset::default(),
-            repulsion: 500.0,        // was 200 — bigger 3D spread
+            repulsion: 250.0,        // mass-weighted; halved from 500 to compensate for hub amplification
             spring_k: 0.06,          // softer springs let repulsion win
             spring_len: 60.0,        // was 30 — wider edges
             gravity: 0.003,          // was 0.005 — less inward pull

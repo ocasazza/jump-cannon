@@ -181,7 +181,7 @@ fn force_step(@builtin(global_invocation_id) gid: vec3<u32>) {
                         let dist2 = dot(d, d);
                         if (dist2 > r_clip2) { continue; }
                         let dist2c = max(dist2, 0.01);
-                        force = force + d * (params.repulsion / dist2c);
+                        force = force + d * (params.repulsion * mass[j] / dist2c);
                     }
                 }
             }
@@ -193,7 +193,7 @@ fn force_step(@builtin(global_invocation_id) gid: vec3<u32>) {
             let dist2 = dot(d, d);
             if (dist2 > r_clip2) { continue; }
             let dist2c = max(dist2, 0.01);
-            force = force + d * (params.repulsion / dist2c);
+            force = force + d * (params.repulsion * mass[j] / dist2c);
         }
     }
 
