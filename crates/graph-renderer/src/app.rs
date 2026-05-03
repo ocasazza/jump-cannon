@@ -649,7 +649,13 @@ impl App {
 
     fn focus_key(&self) -> u64 {
         let f = &self.state.focus;
-        let bits = [f.distance.to_bits(), f.thickness.to_bits(), f.blur.to_bits(), f.max_coc.to_bits()];
+        let bits = [
+            f.distance.to_bits(),
+            f.thickness.to_bits(),
+            f.blur.to_bits(),
+            f.max_coc.to_bits(),
+            f.dof_enabled as u32,
+        ];
         let mut h: u64 = 0;
         for b in bits {
             h = h.wrapping_mul(31).wrapping_add(b as u64);
@@ -669,9 +675,12 @@ impl App {
         let mut renderer = wgpu_state.renderer.write();
         if let Some(pipes) = renderer.callback_resources.get_mut::<GraphPipelines>() {
             let f = &self.state.focus;
-            // Distance is interpreted relative to the camera along its forward.
             let plane_z = pipes.camera.position.z - f.distance;
-            pipes.set_focus_plane(plane_z, f.thickness);
+            // DoF off → push a sentinel thickness so node.wgsl's
+            // `focus_thickness < 1e6` gate stays false for every node
+            // (sharp fragment path, no bokeh quad inflation).
+            let effective_thickness = if f.dof_enabled { f.thickness } else { 1.0e9 };
+            pipes.set_focus_plane(plane_z, effective_thickness);
             pipes.set_dof_params(f.blur, f.max_coc);
         }
         self.prev_focus_key = Some(key);

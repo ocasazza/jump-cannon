@@ -290,6 +290,12 @@ impl Default for CameraState {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct FocusState {
+    /// Master DoF toggle. When false, the shader runs the sharp path
+    /// for every node (no bokeh halo, no fragment-area inflation) —
+    /// this is the cosmograph baseline. When true, the configured
+    /// distance / thickness / blur / max_coc band engages.
+    #[serde(default)]
+    pub dof_enabled: bool,
     pub distance: f32,
     pub thickness: f32,
     pub blur: f32,
@@ -299,6 +305,7 @@ pub struct FocusState {
 impl Default for FocusState {
     fn default() -> Self {
         Self {
+            dof_enabled: false,
             distance: 100.0,
             thickness: 50.0,
             blur: 0.5,
