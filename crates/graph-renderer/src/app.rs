@@ -104,6 +104,11 @@ pub struct App {
     /// Camera covers the rest.
     last_fit_screen: Option<egui::Vec2>,
 
+    /// Persistent ease-in timer for WASDQE pan speed (seconds of
+    /// continuous input). Resets to 0 on the first frame with no pan key
+    /// held so a quick tap stays a tap. Threaded into `WorkspaceCtx`.
+    camera_pan_accel_t: f32,
+
     /// Per-frame perf ring buffer (FPS, frame ms, per-stage ms, KE).
     /// Surfaced in the Debug sidebar section.
     pub perf: PerfCollector,
@@ -208,6 +213,7 @@ impl App {
             layout_registry: LayoutRegistry::seed_default(),
             prev_active_layout_id: None,
             last_fit_screen: None,
+            camera_pan_accel_t: 0.0,
             perf: PerfCollector::default(),
             selected_node_idx: None,
         }
@@ -534,6 +540,7 @@ impl eframe::App for App {
             load_msg: load_msg.as_deref(),
             invert_mouse_x: self.state.camera.invert_mouse_x,
             invert_mouse_y: self.state.camera.invert_mouse_y,
+            pan_accel_t: &mut self.camera_pan_accel_t,
             canvas_rect: None,
             pointer_in_canvas: None,
             click: None,
@@ -657,7 +664,7 @@ impl eframe::App for App {
 
         self.perf.begin_stage(StageId::ApplyEffects);
         self.apply_focus_to_gpu(frame);
-        self.apply_camera_to_gpu(frame);
+        self.apply_camera_to_gpu(ctx, frame);
         self.apply_cursor_force(frame);
         self.tick_post_click_cooldown(frame);
         self.perf.end_stage(StageId::ApplyEffects);
@@ -987,7 +994,7 @@ impl App {
         self.prev_focus_key = Some(key);
     }
 
-    fn apply_camera_to_gpu(&mut self, frame: &mut eframe::Frame) {
+    fn apply_camera_to_gpu(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         if !self.loaded_into_gpu {
             return;
         }
@@ -1005,17 +1012,13 @@ impl App {
             }
         }
         if self.state.camera.fit_to_window {
-            // Auto-refit ONLY on canvas resize. Following the live graph
-            // bounds is too aggressive: a click fires the cursor force
-            // for one frame which perturbs the sim, bounds spike, the
-            // refit zooms out, all nodes become sub-pixel and cull to
-            // a blank canvas for the duration of the disturbance.
-            // Initial fit happens once at load (pipes.fit_to_loaded_bounds
-            // in load()). Manual refit via Ctrl+P → Fit Camera or `F`.
-            let screen = self
-                .prev_canvas_rect
-                .map(|r| r.size())
-                .unwrap_or(egui::vec2(0.0, 0.0));
+            // Auto-refit ONLY on actual window resize. Use ctx.screen_rect
+            // (the egui-owned full surface) instead of the canvas rect,
+            // because the canvas rect *also* shifts when the user opens
+            // / closes a sidebar section — and refitting on a sidebar
+            // toggle made the camera jump every time a button was
+            // pressed.  Manual refit via `F` / Ctrl+P → Fit Camera.
+            let screen = ctx.screen_rect().size();
             let screen_changed = match self.last_fit_screen {
                 None => false, // initial fit done in load(); skip first frame
                 Some(prev) => (prev - screen).abs().max_elem() > 1.0,

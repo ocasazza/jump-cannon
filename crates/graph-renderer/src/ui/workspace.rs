@@ -84,6 +84,11 @@ pub struct WorkspaceCtx<'a> {
     pub invert_mouse_x: bool,
     pub invert_mouse_y: bool,
 
+    /// Persistent WASD ease-in timer (seconds of continuous pan input).
+    /// Owned by `App` so it survives across frames; threaded through the
+    /// per-frame ctx so the tab handler can ramp pan speed.
+    pub pan_accel_t: &'a mut f32,
+
     // Out: filled by the graph tab when it runs.
     pub canvas_rect: Option<egui::Rect>,
     pub pointer_in_canvas: Option<egui::Pos2>,
@@ -206,13 +211,24 @@ impl<'a, 'ctx> WorkspaceViewer<'a, 'ctx> {
             }
         }
 
+        // LMB held = cursor "attract" force. RMB held with Shift = cursor
+        // "repel" force. Plain RMB-drag rotates the camera (3D-editor
+        // convention) — see the rotation block below.
+        let pointer_in_canvas_for_btn = ui
+            .input(|i| i.pointer.hover_pos())
+            .map(|p| rect.contains(p))
+            .unwrap_or(false);
+        let shift_held = ui.input(|i| i.modifiers.shift);
         self.ctx.lmb_held = resp.dragged_by(egui::PointerButton::Primary)
             || ui.input(|i| {
-                i.pointer.button_down(egui::PointerButton::Primary) && resp.hovered()
+                i.pointer.button_down(egui::PointerButton::Primary)
+                    && pointer_in_canvas_for_btn
             });
-        self.ctx.rmb_held = ui.input(|i| {
-            i.pointer.button_down(egui::PointerButton::Secondary) && resp.hovered()
-        });
+        self.ctx.rmb_held = shift_held
+            && ui.input(|i| {
+                i.pointer.button_down(egui::PointerButton::Secondary)
+                    && pointer_in_canvas_for_btn
+            });
 
         // Aggregate per-frame camera deltas so we open the wgpu callback
         // resources at most once.
@@ -223,16 +239,6 @@ impl<'a, 'ctx> WorkspaceViewer<'a, 'ctx> {
         let mut pan_z = 0.0_f32;
         let mut zoom = 0.0_f32;
 
-        if resp.dragged_by(egui::PointerButton::Middle) {
-            let d = resp.drag_delta();
-            let mut dx = d.x;
-            let mut dy = d.y;
-            if self.ctx.invert_mouse_x { dx = -dx; }
-            if self.ctx.invert_mouse_y { dy = -dy; }
-            yaw_d += dx * 0.005;
-            pitch_d -= dy * 0.005;
-        }
-
         // Read pointer position straight from input rather than from the
         // response — egui_dock's nested layout doesn't always propagate
         // hover state to the inner allocate_exact_size response, which
@@ -241,6 +247,29 @@ impl<'a, 'ctx> WorkspaceViewer<'a, 'ctx> {
             .input(|i| i.pointer.hover_pos())
             .map(|p| rect.contains(p))
             .unwrap_or(false);
+
+        // Camera rotation — RMB-drag is the standard convention in 3D
+        // editors (Unity / Blender fly-mode / Unreal). Middle-drag also
+        // rotates as a fallback for trackpad users without a real RMB.
+        // RMB+Shift is reserved for the cursor "repel" tool above, so
+        // we only rotate on RMB *without* shift.
+        let rmb_drag_rotate = !shift_held
+            && pointer_in_canvas
+            && ui.input(|i| {
+                i.pointer.button_down(egui::PointerButton::Secondary)
+            });
+        let mid_dragging = resp.dragged_by(egui::PointerButton::Middle)
+            || (pointer_in_canvas
+                && ui.input(|i| i.pointer.button_down(egui::PointerButton::Middle)));
+        if rmb_drag_rotate || mid_dragging {
+            let d = ui.input(|i| i.pointer.delta());
+            let mut dx = d.x;
+            let mut dy = d.y;
+            if self.ctx.invert_mouse_x { dx = -dx; }
+            if self.ctx.invert_mouse_y { dy = -dy; }
+            yaw_d += dx * 0.005;
+            pitch_d -= dy * 0.005;
+        }
 
         // Scroll-wheel zoom. smooth_scroll_delta is the egui-recommended
         // accumulator (raw_scroll_delta resets too aggressively for our
@@ -259,6 +288,14 @@ impl<'a, 'ctx> WorkspaceViewer<'a, 'ctx> {
 
         // WASDQE keyboard pan / vertical. Same pointer-over-canvas guard
         // so typing into a sidebar text field doesn't fly the camera.
+        // Speed eases in: starts at BASE units/s, ramps to MAX over RAMP
+        // seconds of continuous input. Shift multiplies by SHIFT_MUL on
+        // top of the eased value. Ramp resets on the first frame with no
+        // pan input so a quick tap stays a tap.
+        const PAN_BASE: f32   = 1500.0;   // units/s at start of hold
+        const PAN_MAX: f32    = 12000.0;  // units/s after full ramp
+        const PAN_RAMP: f32   = 0.45;     // seconds to reach PAN_MAX
+        const SHIFT_MUL: f32  = 3.0;
         if pointer_in_canvas {
             let (dt, w, a, s, d, q, e, shift) = ui.input(|i| (
                 i.unstable_dt.min(0.05),
@@ -270,13 +307,26 @@ impl<'a, 'ctx> WorkspaceViewer<'a, 'ctx> {
                 i.key_down(egui::Key::E),
                 i.modifiers.shift,
             ));
-            let speed = if shift { 5.0 } else { 1.0 } * 400.0 * dt;
+            let any = w || a || s || d || q || e;
+            if any {
+                *self.ctx.pan_accel_t = (*self.ctx.pan_accel_t + dt).min(PAN_RAMP);
+            } else {
+                *self.ctx.pan_accel_t = 0.0;
+            }
+            // Ease-out cubic: gentle start, steeper finish — feels like
+            // the camera "spools up" rather than ramping linearly.
+            let t = (*self.ctx.pan_accel_t / PAN_RAMP).clamp(0.0, 1.0);
+            let eased = 1.0 - (1.0 - t).powi(3);
+            let base_speed = PAN_BASE + (PAN_MAX - PAN_BASE) * eased;
+            let speed = base_speed * if shift { SHIFT_MUL } else { 1.0 } * dt;
             if w { pan_z += speed; }
             if s { pan_z -= speed; }
             if d { pan_x += speed; }
             if a { pan_x -= speed; }
             if q { pan_y += speed; }
             if e { pan_y -= speed; }
+        } else {
+            *self.ctx.pan_accel_t = 0.0;
         }
 
         if yaw_d != 0.0 || pitch_d != 0.0 || pan_x != 0.0 || pan_y != 0.0
