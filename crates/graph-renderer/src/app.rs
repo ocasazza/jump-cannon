@@ -1425,12 +1425,29 @@ fn kick_off_bootstrap(load: SharedLoad, base: String) {
             }
         };
 
+        // Fetch all metrics concurrently rather than serially. Each
+        // request is now an `Arc::clone` + `Cache-Control` header on the
+        // server (see `graph-api/src/state.rs::binary_cache`), so the
+        // round-trip is dominated by the network — and four parallel
+        // hits over keep-alive cost ~one round-trip total instead of
+        // four. Keeps the load-status copy reasonable by listing all
+        // four names in the message.
+        const METRICS: &[&str] = &["degree", "pagerank", "kcore", "community"];
+        set_status(&load, format!("fetching {} metric buffers in parallel…", METRICS.len()));
+        let metric_futs = METRICS.iter().map(|name| {
+            let client = client.clone();
+            let name = name.to_string();
+            async move {
+                let res = client.metric(&name).await;
+                (name, res)
+            }
+        });
+        let metric_results = futures::future::join_all(metric_futs).await;
         let mut metrics = std::collections::HashMap::new();
-        for name in ["degree", "pagerank", "kcore", "community"] {
-            set_status(&load, format!("fetching /graph/metrics/{name}…"));
-            match client.metric(name).await {
+        for (name, res) in metric_results {
+            match res {
                 Ok(v) => {
-                    metrics.insert(name.to_string(), v);
+                    metrics.insert(name, v);
                 }
                 Err(e) => {
                     log::warn!("[graph-renderer] metric {name}: {e}");

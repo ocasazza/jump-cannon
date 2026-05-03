@@ -33,6 +33,12 @@ pub struct AppStateInner {
     /// time (dev mode: edit JS/CSS/HTML, refresh browser, no rebuild).
     /// When `None`, served from the embedded `graph-renderer` bundle.
     pub assets_dir: Option<PathBuf>,
+    /// Precomputed bulk-numeric binary buffers. Built once at AppState
+    /// construction so per-request handlers do an `Arc` clone instead of
+    /// re-walking `graph.nodes` and re-allocating the byte vec on every
+    /// hit. Keys: "positions", "edges", "degree", "pagerank", "kcore",
+    /// "community", "wcc", "indegree", "outdegree", "betweenness".
+    pub binary_cache: HashMap<String, Arc<[u8]>>,
 }
 
 impl AppState {
@@ -48,6 +54,30 @@ impl AppState {
             id_to_idx.insert(id.clone(), i as u32);
             idx_to_id.push(id.clone());
         }
+
+        // Precompute every bulk-numeric buffer once. The graph is
+        // immutable for the server's lifetime, so per-request handlers
+        // become `Arc<[u8]>::clone()` (one ptr inc) + a Cache-Control
+        // header. This collapses /graph/metrics/community from "walk
+        // 50k IndexMap entries + 200KB realloc" to a pointer copy.
+        let mut binary_cache: HashMap<String, Arc<[u8]>> = HashMap::new();
+        binary_cache.insert(
+            "positions".into(),
+            Arc::from(crate::binary::positions_buffer(&graph)),
+        );
+        binary_cache.insert(
+            "edges".into(),
+            Arc::from(crate::binary::edges_buffer(&graph, &id_to_idx)),
+        );
+        for name in [
+            "degree", "indegree", "outdegree", "pagerank",
+            "betweenness", "kcore", "community", "wcc",
+        ] {
+            if let Some(buf) = crate::binary::metric_buffer(&graph, name) {
+                binary_cache.insert(name.to_string(), Arc::from(buf));
+            }
+        }
+
         Self {
             inner: Arc::new(AppStateInner {
                 vault_root,
@@ -56,6 +86,7 @@ impl AppState {
                 idx_to_id,
                 vault_search,
                 assets_dir,
+                binary_cache,
             }),
         }
     }

@@ -14,7 +14,7 @@ use axum::{
 use prost::Message;
 use serde::Deserialize;
 
-use crate::{binary, proto, state::AppState};
+use crate::{proto, state::AppState};
 use vault_data::color::PALETTE;
 
 const PROTOBUF_CT: &str = "application/x-protobuf";
@@ -209,22 +209,31 @@ fn proto_response<M: Message>(msg: &M) -> impl IntoResponse {
 // --- Binary endpoints (raw little-endian buffers for hot-path bulk data) ---
 
 async fn graph_positions(State(s): State<AppState>) -> impl IntoResponse {
-    binary_response(binary::positions_buffer(&s.inner.graph))
+    cached_binary_response(&s, "positions").into_response()
 }
 
 async fn graph_edges(State(s): State<AppState>) -> impl IntoResponse {
-    binary_response(binary::edges_buffer(&s.inner.graph, &s.inner.id_to_idx))
+    cached_binary_response(&s, "edges").into_response()
 }
 
 async fn graph_metric(State(s): State<AppState>, Path(name): Path<String>) -> impl IntoResponse {
-    match binary::metric_buffer(&s.inner.graph, &name) {
-        Some(buf) => binary_response(buf).into_response(),
-        None => (StatusCode::NOT_FOUND, "unknown metric").into_response(),
-    }
+    cached_binary_response(&s, &name).into_response()
 }
 
-fn binary_response(buf: Vec<u8>) -> impl IntoResponse {
+/// Look up a precomputed buffer in `AppState::binary_cache` and serve it
+/// with `Cache-Control: max-age=…, immutable`. Bytes are an `Arc<[u8]>`
+/// so the response shares the buffer with the cache — no copy. The
+/// graph is immutable for the server's lifetime, so a long max-age is
+/// safe; `immutable` tells the browser not to revalidate on refresh.
+fn cached_binary_response(s: &AppState, key: &str) -> axum::response::Response {
+    let Some(buf) = s.inner.binary_cache.get(key).cloned() else {
+        return (StatusCode::NOT_FOUND, "unknown buffer").into_response();
+    };
     let mut headers = HeaderMap::new();
     headers.insert(header::CONTENT_TYPE, HeaderValue::from_static(OCTET_CT));
-    (StatusCode::OK, headers, buf)
+    headers.insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("public, max-age=31536000, immutable"),
+    );
+    (StatusCode::OK, headers, buf.to_vec()).into_response()
 }

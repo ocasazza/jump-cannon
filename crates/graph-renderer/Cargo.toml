@@ -46,6 +46,10 @@ fuzzy-matcher = "0.3"
 # wasm). `default-themes` keeps a few bundled themes; `default-syntaxes` keeps
 # the bundled syntax pack. No `dump-create*` features (we never re-dump caches).
 syntect = { version = "5", default-features = false, features = ["parsing", "default-syntaxes", "default-themes", "regex-fancy"] }
+# Used for `join_all` when fanning out the bootstrap metric fetches in
+# parallel. `default-features = false` keeps tokio out of the dep tree
+# (wasm doesn't want it); we only need the futures-util side.
+futures = { version = "0.3", default-features = false, features = ["std", "async-await"] }
 
 console_error_panic_hook = { version = "0.1", optional = true }
 console_log              = { version = "1",  optional = true }
