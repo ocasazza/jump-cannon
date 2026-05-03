@@ -22,7 +22,8 @@
 
 import { chromium } from 'playwright';
 import { spawn } from 'node:child_process';
-import { mkdirSync, writeFileSync, existsSync } from 'node:fs';
+import { mkdirSync, writeFileSync, existsSync, readFileSync } from 'node:fs';
+import { PNG } from 'pngjs';
 import { resolve } from 'node:path';
 import { platform } from 'node:os';
 
@@ -126,9 +127,8 @@ try {
 
   await page.goto(URL, { waitUntil: 'load', timeout: 30_000 });
 
-  // Wait for the canvas + a 3 s warm-up so the force sim isn't dominating
-  // the first measurement phase.
-  const readyDeadline = Date.now() + 15_000;
+  // Wait for the canvas to mount.
+  const readyDeadline = Date.now() + 30_000;
   let ready = false;
   while (Date.now() < readyDeadline) {
     const hasCanvas = await page
@@ -138,6 +138,26 @@ try {
     await page.waitForTimeout(250);
   }
   if (!ready) throw new Error('canvas never mounted');
+
+  // Wait for the renderer to log "graph loaded: N nodes" — that's the
+  // signal that bootstrap actually landed and the wgpu buffers are
+  // populated. Without this the synth-N=5000 case measures a blank
+  // canvas because graph-api is still indexing the synth vault.
+  const loadDeadline = Date.now() + 60_000;
+  let loaded = false;
+  while (Date.now() < loadDeadline) {
+    if (consoleLines.some((l) => l.includes('graph loaded:'))) {
+      loaded = true;
+      break;
+    }
+    await page.waitForTimeout(250);
+  }
+  if (!loaded) {
+    process.stderr.write(
+      `WARN: "graph loaded:" never logged after 60s. Last ${consoleLines.length} console lines:\n${consoleLines.slice(-10).join('\n')}\n`,
+    );
+  }
+  // Let the sim run a bit before the first measurement phase.
   await page.waitForTimeout(3_000);
 
   // Install a rAF-based frame timer once. Each call to startFrameTimer
@@ -188,12 +208,14 @@ try {
     await page.waitForTimeout(PHASE_MS);
     const deltas = await page.evaluate(() => window.stopFrameTimer());
     const { profile } = await cdp.send('Profiler.stop');
-    await page.screenshot({ path: `${OUT}/profile-${label}.png` });
+    const shotPath = `${OUT}/profile-${label}.png`;
+    await page.screenshot({ path: shotPath });
     if (after) await after();
     const cpuPath = `${OUT}/profile-${label}.cpuprofile`;
     writeFileSync(cpuPath, JSON.stringify(profile));
     const hot = topSelfTime(profile, 12);
-    phases.push({ label, ...summarise(deltas), hot, cpuprofile: cpuPath });
+    const brightFrac = brightFraction(shotPath);
+    phases.push({ label, brightFrac, ...summarise(deltas), hot, cpuprofile: cpuPath });
   };
 
   // Phase 1: idle baseline (current default state — DoF off).
@@ -235,7 +257,7 @@ try {
   process.stderr.write(`vault: ${VAULT} (synth N=${SYNTH_N || '-'})\n`);
   for (const p of phases) {
     process.stderr.write(
-      `[${p.label.padEnd(14)}] ${p.fps} fps  mean ${p.mean_ms}ms  p95 ${p.p95_ms}ms  p99 ${p.p99_ms}ms  jank ${p.jank_pct}%\n`,
+      `[${p.label.padEnd(14)}] ${p.fps} fps  mean ${p.mean_ms}ms  p95 ${p.p95_ms}ms  p99 ${p.p99_ms}ms  jank ${p.jank_pct}%  bright ${p.brightFrac}\n`,
     );
     const nontrivial = p.hot.filter(
       (h) => h.fn !== '(idle)' && h.fn !== '(program)' && h.fn !== '(garbage collector)',
@@ -290,6 +312,21 @@ function topSelfTime(profile, n) {
   });
   rows.sort((a, b) => b.self_ms - a.self_ms);
   return rows.filter((r) => r.self_ms > 0).slice(0, n);
+}
+
+function brightFraction(pngPath) {
+  try {
+    const png = PNG.sync.read(readFileSync(pngPath));
+    let bright = 0, sampled = 0;
+    const stride = 16;
+    for (let i = 0; i < png.data.length; i += stride * 4) {
+      if (png.data[i] + png.data[i + 1] + png.data[i + 2] > 60) bright++;
+      sampled++;
+    }
+    return Number(((sampled === 0 ? 0 : bright / sampled)).toFixed(4));
+  } catch {
+    return null;
+  }
 }
 
 function summarise(deltas) {

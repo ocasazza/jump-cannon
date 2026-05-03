@@ -302,7 +302,6 @@ impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         // Re-apply theme each frame so hot edits to theme.rs land without restart.
         ui::apply_theme(ctx);
-        ctx.request_repaint();
 
         // Pump the data pipeline.
         self.try_promote_bootstrap_to_gpu(frame);
@@ -466,6 +465,23 @@ impl eframe::App for App {
         self.apply_cursor_force(frame);
         self.apply_selection(frame);
         self.refresh_stats(frame);
+
+        // Drive continuous repaint only when something is actually
+        // changing frame-to-frame. Otherwise let egui's input-driven
+        // repaints handle redraws — saves enormous GPU work on settled
+        // graphs with the palette closed.
+        let sim_settled = matches!(self.state.sim_status, ui::state::SimStatus::Settled);
+        let needs_continuous = !sim_settled
+            || self.palette_state.open
+            || !self.loaded_into_gpu
+            || self.cursor_force_active.abs() > 0.0;
+        if needs_continuous {
+            ctx.request_repaint();
+        } else {
+            // Light tick so a fresh user action (e.g. an action instance
+            // mutating state) isn't held up for an arbitrary time.
+            ctx.request_repaint_after(std::time::Duration::from_millis(250));
+        }
     }
 }
 

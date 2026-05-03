@@ -65,6 +65,26 @@ fn vs_main(@builtin(vertex_index) vid: u32) -> VertexOutput {
     let p_tgt = positions[edge.y];
     let edge_len = length(p_tgt - p_src);
 
+    var out: VertexOutput;
+
+    // LOD cull: at very long edge lengths the alpha-fade curve has settled
+    // to its floor (`edge_min_transparency * edge_alpha_mul * color.a`) —
+    // if that combined alpha falls below ~2 % the edge is invisible and
+    // we just pay rasterization + alpha-blend ROP for nothing. Push the
+    // endpoints outside the clip volume so the rasterizer drops the line.
+    let floor_alpha = effects.edge_color.a
+                    * effects.edge_alpha_mul
+                    * effects.edge_min_transparency;
+    let cull_thresh = effects.edge_dist_max * 4.0;
+    if ((floor_alpha < 0.02 && edge_len > effects.edge_dist_max)
+        || edge_len > cull_thresh) {
+        out.clip_pos = vec4<f32>(2.0, 2.0, 2.0, 1.0);
+        out.world_z  = 0.0;
+        out.edge_len = edge_len;
+        out.coc      = 0.0;
+        return out;
+    }
+
     // Average-midpoint CoC for the whole edge — both endpoints share it
     // so the line's alpha is uniform along its length. Distance is measured
     // in view-space (perpendicular to camera look vector).
@@ -76,7 +96,6 @@ fn vs_main(@builtin(vertex_index) vid: u32) -> VertexOutput {
     let blur_z = max(dz - half_t, 0.0);
     let coc = min(blur_z * effects.blur_strength, effects.max_coc);
 
-    var out: VertexOutput;
     out.clip_pos = camera.view_proj * vec4<f32>(p, 1.0);
     out.world_z  = p.z;
     out.edge_len = edge_len;
@@ -98,5 +117,10 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 
     let alpha = effects.edge_color.a * effects.edge_alpha_mul
               * visibility * focus_atten;
+    // Skip near-invisible fragments — saves alpha-blend ROP cost on dense
+    // overdrawn edge bundles. Threshold is chosen well below visible.
+    if (alpha < 0.02) {
+        discard;
+    }
     return vec4<f32>(effects.edge_color.rgb, alpha);
 }
