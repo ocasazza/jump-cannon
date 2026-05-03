@@ -525,8 +525,14 @@ impl GpuForceLayout {
                 .map(|g| matches!(*g, EnergyReadback::Idle))
                 .unwrap_or(false);
             if readback_idle {
+                // Record the copy + park in CopyScheduled. The next
+                // step_with_encoder entry sees CopyScheduled and issues
+                // map_async there — by which point eframe has submitted
+                // this frame's encoder. Calling issue_energy_map here
+                // would race the not-yet-submitted copy and trigger
+                // wgpu's "Buffer used in submit while mapped" warning
+                // every frame.
                 state.schedule_energy_copy(encoder);
-                state.issue_energy_map();
             }
         }
     }
