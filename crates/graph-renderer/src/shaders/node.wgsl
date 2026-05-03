@@ -78,33 +78,43 @@ fn vs_main(
     let inst_color = colors[iid];
     let base_size  = sizes[iid];
 
-    // Circle of confusion: 0 inside the focus band, grows linearly outside.
-    // View-space depth: in RH look_to_rh, points in front of the camera have
-    // negative view-space Z. Negate so view_dist is positive in front.
-    let view_pos = camera.view * vec4<f32>(inst_pos, 1.0);
-    let view_dist = -view_pos.z;
-    let dz = abs(view_dist - effects.focus_plane_z);
-    let half_t = max(effects.focus_thickness * 0.5, 0.001);
-    let blur_z = max(dz - half_t, 0.0);
-    let coc = min(blur_z * effects.blur_strength, effects.max_coc);
-    let effective_size = base_size + coc;
-
     var out: VertexOutput;
     out.uv = corner;
     out.color = inst_color;
     out.world_z = inst_pos.z;
-    out.coc_ratio = base_size / max(effective_size, 1.0);
 
-    // Behind-camera cull: clip.w <= 0 means the node is behind the
-    // near plane; skip the fragment work entirely.
-    var clip = camera.view_proj * vec4<f32>(inst_pos, 1.0);
-    if (clip.w <= 0.0 || effective_size < 0.5 || inst_color.a < 0.005) {
+    // Cheap rejects first — no transform math required for invisible
+    // nodes. Saves a 4×4 mat-vec on culled instances.
+    if (inst_color.a < 0.005 || base_size < 0.5) {
         out.clip_pos = vec4<f32>(2.0, 2.0, 2.0, 1.0);
+        out.coc_ratio = 1.0;
         return out;
     }
 
-    // Use effective_size for the quad geometry so the bokeh disc actually
-    // covers more pixels.
+    var clip = camera.view_proj * vec4<f32>(inst_pos, 1.0);
+    if (clip.w <= 0.0) {
+        out.clip_pos = vec4<f32>(2.0, 2.0, 2.0, 1.0);
+        out.coc_ratio = 1.0;
+        return out;
+    }
+
+    // DoF off (the default — focus_thickness >= 1e6) skips the CoC
+    // computation entirely. coc_ratio = 1.0 means "sharp", which the
+    // fragment shader's fast path picks up.
+    var effective_size = base_size;
+    var coc_ratio = 1.0;
+    if (effects.focus_thickness < 1.0e6) {
+        let view_pos = camera.view * vec4<f32>(inst_pos, 1.0);
+        let view_dist = -view_pos.z;
+        let dz = abs(view_dist - effects.focus_plane_z);
+        let half_t = max(effects.focus_thickness * 0.5, 0.001);
+        let blur_z = max(dz - half_t, 0.0);
+        let coc = min(blur_z * effects.blur_strength, effects.max_coc);
+        effective_size = base_size + coc;
+        coc_ratio = base_size / max(effective_size, 1.0);
+    }
+    out.coc_ratio = coc_ratio;
+
     let screen = max(camera.screen, vec2<f32>(1.0, 1.0));
     let px = vec2<f32>(effective_size, effective_size) / screen * 2.0;
     clip = vec4<f32>(clip.xy + corner * px * clip.w, clip.zw);

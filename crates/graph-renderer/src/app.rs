@@ -67,12 +67,14 @@ pub struct App {
     actions: ActionRegistry,
 
     // -- auto-fit dedup ----------------------------------------------------
-    /// Last screen size we ran `fit_camera()` for. Used to skip re-fits
-    /// every frame when `fit_to_window` is true but nothing actually
-    /// resized. Without this, fit_to_window forces a per-frame O(n) bound
-    /// scan + camera mutation + uniform rewrite + re-render, saturating
-    /// the GPU command queue at large node counts.
+    /// Last (screen size, graph bounds extent) we ran `fit_camera()` for.
+    /// Refit when EITHER changes meaningfully, so the camera follows a
+    /// growing/shrinking layout AND we don't refit every frame on idle.
+    /// Without the bounds half of this gate, clicking the canvas (which
+    /// fires the cursor force for one frame, perturbing the layout) lets
+    /// the graph drift outside the frustum and the screen goes black.
     last_fit_screen: Option<egui::Vec2>,
+    last_fit_extent: Option<f32>,
 }
 
 impl App {
@@ -152,6 +154,7 @@ impl App {
             palette_state: ui::CommandPaletteState::default(),
             actions,
             last_fit_screen: None,
+            last_fit_extent: None,
         }
     }
 
@@ -735,23 +738,36 @@ impl App {
             }
         }
         if self.state.camera.fit_to_window {
-            // Refit only when the canvas size changed since the last fit
-            // (or this is the first fit). Refitting every frame at large
-            // node counts saturates the GPU command queue with redundant
-            // re-renders and triggers `WaitForGetOffset` stalls (~27 % of
-            // wall time on synth-5000). The user can still re-fit on
-            // demand via Ctrl+P → Fit Camera or the Camera section.
+            // Refit when EITHER the canvas resized OR the graph's bounds
+            // extent changed by >20 % since the last fit. The bounds gate
+            // keeps the camera following a still-spreading layout (so a
+            // click that nudges the sim doesn't drift the graph off-screen
+            // → all nodes culled → black canvas). The screen gate handles
+            // window resizes. Together they avoid the per-frame refit
+            // that was saturating the GPU command queue on large graphs.
             let screen = self
                 .prev_canvas_rect
                 .map(|r| r.size())
                 .unwrap_or(egui::vec2(0.0, 0.0));
-            let need_fit = match self.last_fit_screen {
+            let extent = pipes
+                .bounds()
+                .map(|(mn, mx)| (mx - mn).max_element())
+                .unwrap_or(0.0);
+            let screen_changed = match self.last_fit_screen {
                 None => true,
                 Some(prev) => (prev - screen).abs().max_elem() > 1.0,
             };
-            if need_fit {
+            let extent_changed = match self.last_fit_extent {
+                None => true,
+                Some(prev) => {
+                    let denom = prev.abs().max(1e-3);
+                    ((extent - prev) / denom).abs() > 0.2
+                }
+            };
+            if screen_changed || extent_changed {
                 pipes.fit_camera();
                 self.last_fit_screen = Some(screen);
+                self.last_fit_extent = Some(extent);
             }
         }
     }

@@ -85,16 +85,19 @@ fn vs_main(@builtin(vertex_index) vid: u32) -> VertexOutput {
         return out;
     }
 
-    // Average-midpoint CoC for the whole edge — both endpoints share it
-    // so the line's alpha is uniform along its length. Distance is measured
-    // in view-space (perpendicular to camera look vector).
-    let p_mid = 0.5 * (p_src + p_tgt);
-    let view_pos = camera.view * vec4<f32>(p_mid, 1.0);
-    let view_dist = -view_pos.z;
-    let dz = abs(view_dist - effects.focus_plane_z);
-    let half_t = max(effects.focus_thickness * 0.5, 0.001);
-    let blur_z = max(dz - half_t, 0.0);
-    let coc = min(blur_z * effects.blur_strength, effects.max_coc);
+    // CoC computation only runs when DoF is engaged (focus_thickness <
+    // 1e6 sentinel). Skipping saves a mat-vec + a handful of scalar ops
+    // per edge endpoint when DoF is off (the default).
+    var coc = 0.0;
+    if (effects.focus_thickness < 1.0e6) {
+        let p_mid = 0.5 * (p_src + p_tgt);
+        let view_pos = camera.view * vec4<f32>(p_mid, 1.0);
+        let view_dist = -view_pos.z;
+        let dz = abs(view_dist - effects.focus_plane_z);
+        let half_t = max(effects.focus_thickness * 0.5, 0.001);
+        let blur_z = max(dz - half_t, 0.0);
+        coc = min(blur_z * effects.blur_strength, effects.max_coc);
+    }
 
     out.clip_pos = camera.view_proj * vec4<f32>(p, 1.0);
     out.world_z  = p.z;
