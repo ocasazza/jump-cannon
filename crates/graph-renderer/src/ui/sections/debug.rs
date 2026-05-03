@@ -5,7 +5,7 @@
 //! collector is owned by `App`; we only borrow `&PerfCollector` here.
 
 use eframe::egui;
-use egui_plot::{Legend, Line, Plot, PlotPoints};
+use egui_plot::{Corner, Legend, Line, Plot, PlotPoints};
 
 use crate::perf::{PerfCollector, StageId};
 use crate::ui::state::AppState;
@@ -97,7 +97,14 @@ pub fn show(ui: &mut egui::Ui, state: &AppState, perf: &PerfCollector) {
         .allow_drag(false)
         .allow_scroll(false)
         .show_axes([false, true])
-        .legend(Legend::default().background_alpha(0.4))
+        // Pin the legend to a corner so it stays inside the plot rect
+        // instead of spilling out the right edge on a narrow sidebar.
+        .legend(
+            Legend::default()
+                .background_alpha(0.4)
+                .position(Corner::LeftTop)
+                .text_style(egui::TextStyle::Small),
+        )
         .include_x(plot_x_min)
         .include_x(plot_x_max)
         .include_y(0.0)
@@ -113,7 +120,10 @@ pub fn show(ui: &mut egui::Ui, state: &AppState, perf: &PerfCollector) {
             }
         });
 
-    // Per-stage avg/p99/max readout ----------------------------------------
+    // Per-stage avg/p99/max readout. Two lines per stage on narrow
+    // panels: label on top with the colour swatch, stats wrapped under.
+    // The previous single-line `{:<22}` monospace pad assumed a wide
+    // panel and overflowed at the default 280px section width.
     ui.add_space(4.0);
     for stage in StageId::ALL {
         let stats = PerfCollector::stats(
@@ -124,17 +134,24 @@ pub fn show(ui: &mut egui::Ui, state: &AppState, perf: &PerfCollector) {
             let (rect, _) =
                 ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover());
             ui.painter().rect_filled(rect, 0.0, egui::Color32::from_rgb(r, g, b));
-            ui.label(
-                egui::RichText::new(format!(
-                    "{:<22} {}",
-                    stage.label(),
-                    ms_stats_label(stats)
-                ))
-                .monospace()
-                .size(10.0)
-                .color(egui::Color32::from_gray(180)),
+            ui.add(
+                egui::Label::new(
+                    egui::RichText::new(stage.label())
+                        .size(10.0)
+                        .color(egui::Color32::from_gray(180)),
+                )
+                .truncate(),
             );
         });
+        ui.add(
+            egui::Label::new(
+                egui::RichText::new(ms_stats_label(stats))
+                    .monospace()
+                    .size(10.0)
+                    .color(egui::Color32::from_gray(140)),
+            )
+            .wrap(),
+        );
     }
 
     subgroup_separator(ui);

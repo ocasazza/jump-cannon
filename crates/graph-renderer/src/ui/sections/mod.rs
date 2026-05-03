@@ -96,15 +96,20 @@ pub fn subgroup_separator(ui: &mut egui::Ui) {
 /// Right-aligned "↺ Reset" button. Used by every section-panel block
 /// to expose a per-section reset. Returns true on click.
 ///
-/// Uses a `right_to_left` layout instead of an `add_space(avail - X)`
-/// hack so the button stays glued to the right edge across sidebar
-/// resizes.
+/// `ui.horizontal` constrains the row to one button-height; the inner
+/// `right_to_left` layout glues the button to the right edge of that
+/// row. Without the outer `horizontal`, `with_layout(right_to_left)`
+/// on a vertical parent claims the *entire remaining height* of the
+/// panel and pushes every slider below it off-screen — that's the
+/// classic egui sizing footgun this helper is here to avoid.
 pub fn reset_row(ui: &mut egui::Ui) -> bool {
     let mut clicked = false;
-    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-        if ui.small_button("↺ Reset").clicked() {
-            clicked = true;
-        }
+    ui.horizontal(|ui| {
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if ui.small_button("↺ Reset").clicked() {
+                clicked = true;
+            }
+        });
     });
     clicked
 }
