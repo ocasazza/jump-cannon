@@ -33,6 +33,12 @@ pub struct InspectorData<'a> {
 }
 
 pub fn show(ctx: &egui::Context, state: &mut AppState, data: &mut InspectorData) {
+    // No selection ⇒ no panel at all (not even the collapsed strip).
+    // The inspector exists to inspect the selected node; without one the
+    // strip would just be visual noise stealing 24px from the canvas.
+    let Some(idx) = data.selected_idx else { return };
+    if (idx as usize) >= data.ids.len() { return; }
+
     if state.inspector_open {
         show_expanded(ctx, state, data);
     } else {
@@ -109,21 +115,8 @@ fn show_expanded(ctx: &egui::Context, state: &mut AppState, data: &mut Inspector
             });
             ui.separator();
 
-            let Some(idx) = data.selected_idx else {
-                ui.add_space(8.0);
-                ui.label(
-                    egui::RichText::new("Click a node to inspect")
-                        .color(egui::Color32::from_gray(160))
-                        .italics(),
-                );
-                return;
-            };
-
-            let n = data.ids.len();
-            if (idx as usize) >= n {
-                ui.label("(invalid selection)");
-                return;
-            }
+            // `show()` already verified selected_idx is Some + in range.
+            let idx = data.selected_idx.expect("selection guard");
 
             egui::ScrollArea::vertical()
                 .auto_shrink([false; 2])
