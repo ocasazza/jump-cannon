@@ -54,6 +54,10 @@ pub fn show(ui: &mut egui::Ui, state: &mut AppState) {
     }
 
     ui.add_space(8.0);
+    subgroup_label(ui, "Edge width (px)");
+    ui.add(egui::Slider::new(&mut state.style.edge_width, 0.5..=8.0).text("px"));
+
+    ui.add_space(8.0);
     subgroup_label(ui, "Edge density");
     ui.add(egui::Slider::new(&mut state.style.edge_alpha_mul, 0.0..=2.0).text("α×"));
 

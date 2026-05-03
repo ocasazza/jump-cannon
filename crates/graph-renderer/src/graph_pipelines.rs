@@ -65,7 +65,10 @@ struct EffectsUniform {
     edge_dist_max: f32,
     edge_color: [f32; 4],
     edge_min_transparency: f32,
-    _pad0: f32,
+    /// Fat-line pixel width for the edge quad expansion (vertex shader).
+    /// 1.0 ≈ "old LineList" thickness; default 1.5 reads better on dense
+    /// graphs without overpowering the stacked-alpha effect.
+    edge_width: f32,
     _pad1: f32,
     _pad2: f32,
 }
@@ -90,7 +93,7 @@ impl Default for EffectsUniform {
             edge_dist_max: 400.0,
             edge_color: [0.227, 0.282, 0.502, 1.0],
             edge_min_transparency: 0.6,
-            _pad0: 0.0,
+            edge_width: 1.5,
             _pad1: 0.0,
             _pad2: 0.0,
         }
@@ -241,7 +244,10 @@ impl GraphPipelines {
                 })],
             }),
             primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::LineList,
+                // Fat lines: each edge expands into a screen-space quad
+                // (6 verts, 2 tris) in the vertex shader for a constant
+                // pixel width. See `shaders/edge.wgsl`.
+                topology: wgpu::PrimitiveTopology::TriangleList,
                 ..Default::default()
             },
             depth_stencil: None,
@@ -488,7 +494,8 @@ impl GraphPipelines {
         if b.n_edges > 0 {
             rpass.set_pipeline(&self.edge_pipeline);
             rpass.set_bind_group(0, &b.edge_bind_group, &[]);
-            rpass.draw(0..(b.n_edges * 2), 0..1);
+            // 6 verts per edge for the fat-line quad expansion.
+            rpass.draw(0..(b.n_edges * 6), 0..1);
         }
         if b.n_nodes > 0 {
             rpass.set_pipeline(&self.node_pipeline);
@@ -612,6 +619,7 @@ impl GraphPipelines {
         alpha_mul: f32,
         dist_range: (f32, f32),
         min_transparency: f32,
+        width_px: f32,
     ) {
         self.effects.edge_color = color;
         self.effects.edge_alpha_mul = alpha_mul.max(0.0);
@@ -620,6 +628,7 @@ impl GraphPipelines {
         self.effects.edge_dist_min = lo;
         self.effects.edge_dist_max = hi;
         self.effects.edge_min_transparency = min_transparency.clamp(0.0, 1.0);
+        self.effects.edge_width = width_px.max(0.0);
     }
 
     /// Push the cursor force into the GPU layout. radius=0 disables.

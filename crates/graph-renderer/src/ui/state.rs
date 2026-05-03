@@ -139,6 +139,11 @@ pub struct StyleState {
     /// `linkVisibilityMinTransparency` — alpha floor at long edges.
     #[serde(default = "default_edge_min_transparency")]
     pub edge_min_transparency: f32,
+    /// Fat-line pixel width (vertex-shader quad expansion). 1.0 ≈ the
+    /// old wgpu LineList thickness; default 1.5 for a slightly heavier
+    /// stroke on dense graphs.
+    #[serde(default = "default_edge_width")]
+    pub edge_width: f32,
 }
 
 fn default_edge_color() -> [f32; 4] { [0.227, 0.282, 0.502, 1.0] }
@@ -146,6 +151,7 @@ fn default_edge_alpha_mul() -> f32 { 0.6 }
 fn default_edge_dist_min() -> f32 { 10.0 }
 fn default_edge_dist_max() -> f32 { 400.0 }
 fn default_edge_min_transparency() -> f32 { 0.6 }
+fn default_edge_width() -> f32 { 1.5 }
 
 impl Default for StyleState {
     fn default() -> Self {
@@ -158,6 +164,7 @@ impl Default for StyleState {
             edge_dist_min: default_edge_dist_min(),
             edge_dist_max: default_edge_dist_max(),
             edge_min_transparency: default_edge_min_transparency(),
+            edge_width: default_edge_width(),
         }
     }
 }

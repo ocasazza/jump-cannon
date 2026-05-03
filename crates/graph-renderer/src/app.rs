@@ -815,6 +815,7 @@ impl App {
                     s.edge_alpha_mul,
                     (s.edge_dist_min, s.edge_dist_max),
                     s.edge_min_transparency,
+                    s.edge_width,
                 );
             }
         }

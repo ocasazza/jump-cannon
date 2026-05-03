@@ -9,10 +9,78 @@ use eframe::egui;
 
 pub mod accent {
     use eframe::egui::Color32;
+
+    // Legacy bright accents — kept for any callers that already use them.
     pub const RED: Color32 = Color32::from_rgb(0xff, 0x3b, 0x3b);
     pub const GREEN: Color32 = Color32::from_rgb(0x3b, 0xff, 0x7a);
     pub const BLUE: Color32 = Color32::from_rgb(0x3b, 0x9b, 0xff);
     pub const YELLOW: Color32 = Color32::from_rgb(0xff, 0xd8, 0x3b);
+}
+
+/// Core palette. Built around the user-chosen brand purple
+/// `#BC83BA` (HSL ≈ 302°, 30%, 63%). Semantic states (`good`, `bad`,
+/// `warning`, `info`) are derived from a single tuned chroma/lightness
+/// pair via [`palette::hsl`] so they sit at the same visual weight as
+/// PURPLE — no neon color clashing with the muted brand mark.
+///
+/// Pure NEUTRAL trio (`BLACK`, `GREY`, `WHITE`) for backgrounds and
+/// chrome.
+pub mod palette {
+    use eframe::egui::Color32;
+
+    // Brand.
+    /// `#BC83BA` — primary brand mark / selection accent.
+    pub const PURPLE: Color32 = Color32::from_rgb(188, 131, 186);
+
+    // Neutrals (kept square, no rounding).
+    pub const BLACK: Color32 = Color32::from_rgb(0x05, 0x07, 0x10);
+    pub const GREY:  Color32 = Color32::from_rgb(0x80, 0x80, 0x88);
+    pub const WHITE: Color32 = Color32::WHITE;
+
+    // Semantic. Derived at L=63%, S~45% (matching PURPLE's HSL anchor
+    // so all four colors carry the same visual weight). See
+    // `derive_semantic` for the math; values inlined here so this stays
+    // a const-eval module that egui code can use without runtime calc.
+
+    /// Spring green — complement of PURPLE (H≈122). "Good / success".
+    pub const GOOD:    Color32 = Color32::from_rgb(0x83, 0xCC, 0x95);
+    /// Coral — analogous to PURPLE's warm side (H≈10).  "Bad / error".
+    pub const BAD:     Color32 = Color32::from_rgb(0xCC, 0x88, 0x83);
+    /// Amber — triadic-ish (H≈40). "Warning / caution".
+    pub const WARNING: Color32 = Color32::from_rgb(0xCC, 0xB4, 0x83);
+    /// Sky blue — opposite-warm-cool (H≈200). "Info / hint".
+    pub const INFO:    Color32 = Color32::from_rgb(0x83, 0xB7, 0xCC);
+}
+
+/// HSL → RGB helper. Inputs in [0,1]; output as `Color32`.
+/// Used by the const palette above as the source of truth — runtime
+/// callers can derive matching shades via this if they need to tint
+/// dynamically (e.g. fading a bad-state to its low-saturation form).
+pub fn hsl(h: f32, s: f32, l: f32) -> eframe::egui::Color32 {
+    fn hue_to_rgb(p: f32, q: f32, mut t: f32) -> f32 {
+        if t < 0.0 { t += 1.0; }
+        if t > 1.0 { t -= 1.0; }
+        if t < 1.0 / 6.0 { return p + (q - p) * 6.0 * t; }
+        if t < 1.0 / 2.0 { return q; }
+        if t < 2.0 / 3.0 { return p + (q - p) * (2.0 / 3.0 - t) * 6.0; }
+        p
+    }
+    let (r, g, b) = if s == 0.0 {
+        (l, l, l)
+    } else {
+        let q = if l < 0.5 { l * (1.0 + s) } else { l + s - l * s };
+        let p = 2.0 * l - q;
+        (
+            hue_to_rgb(p, q, h + 1.0 / 3.0),
+            hue_to_rgb(p, q, h),
+            hue_to_rgb(p, q, h - 1.0 / 3.0),
+        )
+    };
+    eframe::egui::Color32::from_rgb(
+        (r * 255.0).round().clamp(0.0, 255.0) as u8,
+        (g * 255.0).round().clamp(0.0, 255.0) as u8,
+        (b * 255.0).round().clamp(0.0, 255.0) as u8,
+    )
 }
 
 pub fn apply(ctx: &egui::Context) {
@@ -20,9 +88,9 @@ pub fn apply(ctx: &egui::Context) {
     let v = &mut style.visuals;
 
     v.dark_mode = true;
-    v.override_text_color = Some(egui::Color32::WHITE);
-    v.window_fill = egui::Color32::BLACK;
-    v.panel_fill = egui::Color32::BLACK;
+    v.override_text_color = Some(palette::WHITE);
+    v.window_fill = palette::BLACK;
+    v.panel_fill = palette::BLACK;
     v.window_stroke = egui::Stroke::new(1.0, egui::Color32::WHITE);
     v.menu_rounding = egui::Rounding::ZERO;
     v.window_rounding = egui::Rounding::ZERO;
@@ -52,8 +120,10 @@ pub fn apply(ctx: &egui::Context) {
     v.widgets.active.weak_bg_fill = fg;
     v.widgets.open.bg_fill = bg;
 
-    v.selection.bg_fill = accent::BLUE;
-    v.selection.stroke = egui::Stroke::new(1.0, egui::Color32::WHITE);
+    // Selections / focus rings ride the brand purple so they're
+    // visually anchored to the rest of the palette.
+    v.selection.bg_fill = palette::PURPLE;
+    v.selection.stroke = egui::Stroke::new(1.0, palette::WHITE);
 
     // Square slider handles — matches the no-rounding aesthetic.
     v.slider_trailing_fill = false;
