@@ -11,6 +11,7 @@ use crate::ui;
 use crate::ui::actions::{self, ActionRegistry, BuiltinAction, ParamValue};
 use crate::ui::command_palette::PaletteOutcome;
 use crate::ui::layout::registry::LayoutRegistry;
+use crate::ui::progress::{Progress, ProgressSink};
 use crate::ui::query::EvalContext;
 use crate::ui::state::{ColorBy, FontFamilyChoice, SizeBy};
 use graph_layouts::{warmup_positions, GpuForceOptions};
@@ -116,6 +117,12 @@ pub struct App {
     /// Currently-selected node idx for the right-hand inspector panel.
     /// Session-only — not persisted.
     selected_node_idx: Option<u32>,
+
+    /// Per-frame progress / log surface. Populated by both on-thread
+    /// callers (layout warmup, palette previews) and async tasks (the
+    /// bootstrap fetch) via a clone-able `ProgressSink`. Drained at the
+    /// top of each `update` so the footer renders fresh state.
+    pub progress: Progress,
 }
 
 impl App {
@@ -168,7 +175,9 @@ impl App {
         // Phase C: kick off async bootstrap fetch.
         let load: SharedLoad = Arc::new(Mutex::new(LoadState::Pending));
         let base_url = default_base_url();
-        kick_off_bootstrap(load.clone(), base_url.clone());
+        let progress = Progress::new();
+        let progress_sink = progress.sink();
+        kick_off_bootstrap(load.clone(), base_url.clone(), progress_sink);
 
         let mut actions = ActionRegistry::new();
         actions::seed_default_actions(&mut actions);
@@ -216,6 +225,7 @@ impl App {
             camera_pan_accel_t: 0.0,
             perf: PerfCollector::default(),
             selected_node_idx: None,
+            progress,
         }
     }
 
@@ -344,12 +354,22 @@ impl App {
             .map(|f| f as f32)
             .unwrap_or_else(|| GpuForceOptions::default().spring_len)
             .max(1.0);
-        let warmed = warmup_positions(n_nodes, &bootstrap.edges, spring_len, 0xC0A75E);
+        let warmed = {
+            let _scope = self.progress.scope(
+                "layout",
+                format!("multilevel coarsening ({n_nodes} nodes)"),
+            );
+            warmup_positions(n_nodes, &bootstrap.edges, spring_len, 0xC0A75E)
+        };
         if warmed.len() == bootstrap.positions.len() {
             bootstrap.positions = warmed;
             log::info!(
                 "[graph-renderer] coarsening warmup applied ({} nodes)",
                 n_nodes
+            );
+            self.progress.info(
+                "layout",
+                format!("coarsening warmup applied ({n_nodes} nodes)"),
             );
         }
 
@@ -374,20 +394,41 @@ impl App {
 
         let device = wgpu_state.device.clone();
         let queue = wgpu_state.queue.clone();
-        let mut renderer = wgpu_state.renderer.write();
-        if let Some(pipes) = renderer.callback_resources.get_mut::<GraphPipelines>() {
-            match pipes.load(&device, &queue, graph) {
-                Ok(()) => {
-                    log::info!(
-                        "[graph-renderer] graph loaded: {} nodes, {} edges",
-                        pipes.n_nodes(),
-                        pipes.n_edges()
-                    );
-                    self.loaded_into_gpu = true;
+        let upload = self.progress.scope("layout", "first GPU step pending");
+        let mut load_result: Result<Option<(u32, u32)>, String> = Ok(None);
+        {
+            let mut renderer = wgpu_state.renderer.write();
+            if let Some(pipes) = renderer.callback_resources.get_mut::<GraphPipelines>() {
+                match pipes.load(&device, &queue, graph) {
+                    Ok(()) => {
+                        log::info!(
+                            "[graph-renderer] graph loaded: {} nodes, {} edges",
+                            pipes.n_nodes(),
+                            pipes.n_edges()
+                        );
+                        load_result = Ok(Some((pipes.n_nodes(), pipes.n_edges())));
+                    }
+                    Err(e) => {
+                        log::error!("[graph-renderer] GraphPipelines::load failed: {e}");
+                        load_result = Err(format!("{e}"));
+                    }
                 }
-                Err(e) => {
-                    log::error!("[graph-renderer] GraphPipelines::load failed: {e}");
-                }
+            }
+        }
+        match load_result {
+            Ok(Some((n_nodes_g, n_edges_g))) => {
+                drop(upload);
+                self.progress.info(
+                    "layout",
+                    format!("GPU buffers ready: {n_nodes_g} nodes, {n_edges_g} edges"),
+                );
+                self.loaded_into_gpu = true;
+            }
+            Ok(None) => {
+                drop(upload);
+            }
+            Err(e) => {
+                upload.fail(e);
             }
         }
     }
@@ -439,6 +480,10 @@ impl eframe::App for App {
         self.perf.begin_frame();
         // Re-apply theme each frame so hot edits to theme.rs land without restart.
         ui::apply_theme(ctx);
+
+        // Drain progress events posted by async tasks before any UI runs
+        // so the footer renders fresh state this frame.
+        self.progress.drain_sink();
 
         // Pump the data pipeline.
         self.try_promote_bootstrap_to_gpu(frame);
@@ -524,6 +569,12 @@ impl eframe::App for App {
             }
             PaletteOutcome::None => {}
         }
+
+        // Status footer — sits at the bottom of the screen, above the
+        // central panel which auto-shrinks to fit. Registered after the
+        // sidebar/inspector so the side panels still own the full
+        // height of the screen.
+        ui::status_footer::show(ctx, &mut self.state.status_footer_open, &mut self.progress);
 
         // Phase B central panel — now hosts the dockable Workspace
         // (tabs + splits via egui_dock). One initial "Graph" tab carries
@@ -1380,14 +1431,19 @@ fn default_base_url() -> String {
     }
 }
 
-fn kick_off_bootstrap(load: SharedLoad, base: String) {
+fn kick_off_bootstrap(load: SharedLoad, base: String, prog: ProgressSink) {
     let client = ApiClient::new(base);
 
     let task = async move {
         set_status(&load, "fetching /graph/init…");
+        let t_init = prog.start("bootstrap", "fetching /graph/init");
         let init = match client.init().await {
-            Ok(v) => v,
+            Ok(v) => {
+                prog.finish(t_init);
+                v
+            }
             Err(e) => {
+                prog.fail(t_init, format!("{e}"));
                 set_failed(&load, format!("/graph/init: {e}"));
                 return;
             }
@@ -1397,29 +1453,48 @@ fn kick_off_bootstrap(load: SharedLoad, base: String) {
             init.n_nodes,
             init.n_edges
         );
+        prog.info(
+            "bootstrap",
+            format!("init: {} nodes, {} edges", init.n_nodes, init.n_edges),
+        );
 
         set_status(&load, "fetching /graph/ids…");
+        let t_ids = prog.start("bootstrap", "fetching /graph/ids");
         let ids = match client.ids().await {
-            Ok(v) => v,
+            Ok(v) => {
+                prog.finish(t_ids);
+                v
+            }
             Err(e) => {
+                prog.fail(t_ids, format!("{e}"));
                 set_failed(&load, format!("/graph/ids: {e}"));
                 return;
             }
         };
 
         set_status(&load, "fetching /graph/positions…");
+        let t_pos = prog.start("bootstrap", "fetching /graph/positions");
         let positions_2d = match client.positions().await {
-            Ok(v) => v,
+            Ok(v) => {
+                prog.finish(t_pos);
+                v
+            }
             Err(e) => {
+                prog.fail(t_pos, format!("{e}"));
                 set_failed(&load, format!("/graph/positions: {e}"));
                 return;
             }
         };
 
         set_status(&load, "fetching /graph/edges…");
+        let t_edges = prog.start("bootstrap", "fetching /graph/edges");
         let edges = match client.edges().await {
-            Ok(v) => v,
+            Ok(v) => {
+                prog.finish(t_edges);
+                v
+            }
             Err(e) => {
+                prog.fail(t_edges, format!("{e}"));
                 set_failed(&load, format!("/graph/edges: {e}"));
                 return;
             }
@@ -1434,15 +1509,26 @@ fn kick_off_bootstrap(load: SharedLoad, base: String) {
         // four names in the message.
         const METRICS: &[&str] = &["degree", "pagerank", "kcore", "community"];
         set_status(&load, format!("fetching {} metric buffers in parallel…", METRICS.len()));
+        let t_metrics_all = prog.start(
+            "bootstrap",
+            format!("fetching {} metric buffers in parallel", METRICS.len()),
+        );
         let metric_futs = METRICS.iter().map(|name| {
             let client = client.clone();
+            let prog = prog.clone();
             let name = name.to_string();
             async move {
+                let id = prog.start("bootstrap", format!("metric {name}"));
                 let res = client.metric(&name).await;
+                match &res {
+                    Ok(_) => prog.finish(id),
+                    Err(e) => prog.fail(id, format!("{e}")),
+                }
                 (name, res)
             }
         });
         let metric_results = futures::future::join_all(metric_futs).await;
+        prog.finish(t_metrics_all);
         let mut metrics = std::collections::HashMap::new();
         for (name, res) in metric_results {
             match res {
@@ -1451,6 +1537,7 @@ fn kick_off_bootstrap(load: SharedLoad, base: String) {
                 }
                 Err(e) => {
                     log::warn!("[graph-renderer] metric {name}: {e}");
+                    prog.warn("bootstrap", format!("metric {name}: {e}"));
                 }
             }
         }
@@ -1463,6 +1550,17 @@ fn kick_off_bootstrap(load: SharedLoad, base: String) {
             positions_2d.len() / 2,
             edges.len() / 2,
             metrics.len()
+        );
+
+        prog.info(
+            "bootstrap",
+            format!(
+                "fetched: {} ids, {} positions, {} edges, {} metrics",
+                ids.len(),
+                positions_2d.len() / 2,
+                edges.len() / 2,
+                metrics.len()
+            ),
         );
 
         let bootstrap = Bootstrap {

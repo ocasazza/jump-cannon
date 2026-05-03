@@ -451,6 +451,10 @@ pub struct AppState {
     /// new users see it immediately on first node click.
     #[serde(default = "default_inspector_open")]
     pub inspector_open: bool,
+    /// Status footer open/collapsed flag. Default false so the footer
+    /// stays as an unobtrusive 24px strip until the user expands it.
+    #[serde(default)]
+    pub status_footer_open: bool,
     #[serde(skip)]
     pub stats: LiveStats,
     /// One-shot signal: the Layout sidebar's "Solve" button sets this to
@@ -480,6 +484,7 @@ impl Default for AppState {
             query: QueryModel::default(),
             action_instances: Vec::new(),
             inspector_open: default_inspector_open(),
+            status_footer_open: false,
             stats: LiveStats::default(),
             layout_solve_requested: false,
         }

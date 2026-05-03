@@ -1,0 +1,200 @@
+//! Collapsible status footer at the bottom of the egui app.
+//!
+//! - Collapsed: ~24px strip with the latest active task + a "running N"
+//!   badge on the right and a chevron to expand.
+//! - Expanded: list of active tasks (each with label + spinner /
+//!   determinate bar) above a scrollable log buffer.
+//!
+//! Driven by [`crate::ui::progress::Progress`]. The footer never mutates
+//! progress data except via `clear_log` triggered from its own button.
+
+use eframe::egui;
+
+use crate::ui::progress::{LogLevel, Progress, TaskStatus};
+use crate::ui::theme::palette;
+
+/// Per-line height for the collapsed strip and each active-task row.
+const ROW_H: f32 = 18.0;
+/// Default expanded panel height (resizable by the user).
+const EXPANDED_DEFAULT_H: f32 = 240.0;
+/// Collapsed panel height — one row plus a hair of vertical padding.
+const COLLAPSED_H: f32 = 24.0;
+
+/// Render the status footer panel.
+///
+/// Mutates `state.status_footer_open` (toggled by the chevron) and
+/// `progress` (only via `clear_log` from the explicit button).
+pub fn show(
+    ctx: &egui::Context,
+    open: &mut bool,
+    progress: &mut Progress,
+) {
+    let panel = egui::TopBottomPanel::bottom("status-footer")
+        .resizable(*open)
+        .show_separator_line(true);
+    let panel = if *open {
+        panel
+            .min_height(60.0)
+            .default_height(EXPANDED_DEFAULT_H)
+            .max_height(480.0)
+    } else {
+        panel.exact_height(COLLAPSED_H)
+    };
+    panel.show(ctx, |ui| {
+        if *open {
+            draw_expanded(ui, open, progress);
+        } else {
+            draw_collapsed(ui, open, progress);
+        }
+    });
+}
+
+fn draw_collapsed(ui: &mut egui::Ui, open: &mut bool, progress: &Progress) {
+    ui.horizontal(|ui| {
+        ui.set_min_height(ROW_H);
+        // Left: latest active task or idle marker.
+        let latest = progress.in_progress().last();
+        if let Some(task) = latest {
+            ui.add(egui::Spinner::new().size(10.0));
+            ui.label(
+                egui::RichText::new(format!("{} › {}", task.group, task.label))
+                    .small()
+                    .color(palette::WHITE),
+            );
+        } else {
+            ui.label(
+                egui::RichText::new("●")
+                    .small()
+                    .color(palette::GREY),
+            );
+            ui.label(
+                egui::RichText::new(format!("idle • {} entries", progress.log_len()))
+                    .small()
+                    .color(palette::GREY),
+            );
+        }
+
+        // Right: running badge + expand chevron.
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if ui
+                .small_button("▴")
+                .on_hover_text("Expand status panel")
+                .clicked()
+            {
+                *open = true;
+            }
+            let n_running = progress.in_progress().count();
+            if n_running > 0 {
+                ui.label(
+                    egui::RichText::new(format!("{n_running} running"))
+                        .small()
+                        .color(palette::INFO),
+                );
+            }
+        });
+    });
+}
+
+fn draw_expanded(ui: &mut egui::Ui, open: &mut bool, progress: &mut Progress) {
+    // Header: title + clear-log + collapse chevron.
+    ui.horizontal(|ui| {
+        ui.label(
+            egui::RichText::new("Status")
+                .strong()
+                .color(palette::WHITE),
+        );
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if ui
+                .small_button("▾")
+                .on_hover_text("Collapse status panel")
+                .clicked()
+            {
+                *open = false;
+            }
+            if ui.small_button("Clear log").clicked() {
+                progress.clear_log();
+            }
+        });
+    });
+
+    ui.separator();
+
+    // Active tasks.
+    let active: Vec<_> = progress.active().cloned().collect();
+    if active.is_empty() {
+        ui.label(
+            egui::RichText::new("no active tasks")
+                .small()
+                .color(palette::GREY),
+        );
+    } else {
+        for task in &active {
+            ui.horizontal(|ui| {
+                ui.set_min_height(ROW_H);
+                let (glyph, color) = match &task.status {
+                    TaskStatus::InProgress => ("⠿", palette::INFO),
+                    TaskStatus::Done => ("✓", palette::GOOD),
+                    TaskStatus::Failed(_) => ("✗", palette::BAD),
+                };
+                ui.label(egui::RichText::new(glyph).color(color).small());
+                let label = format!("{} › {}", task.group, task.label);
+                ui.label(egui::RichText::new(label).small().color(palette::WHITE));
+
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let elapsed = task.elapsed();
+                    let elapsed_txt = if elapsed.as_millis() < 1000 {
+                        format!("{}ms", elapsed.as_millis())
+                    } else {
+                        format!("{:.2}s", elapsed.as_secs_f32())
+                    };
+                    ui.label(
+                        egui::RichText::new(elapsed_txt)
+                            .small()
+                            .color(palette::GREY),
+                    );
+                    let bar_w = (ui.available_width() - 8.0).max(60.0);
+                    if let Some(p) = task.progress {
+                        let bar = egui::ProgressBar::new(p)
+                            .desired_width(bar_w)
+                            .show_percentage();
+                        ui.add(bar);
+                    } else if matches!(task.status, TaskStatus::InProgress) {
+                        // Indeterminate: use an unfilled bar + spinner so
+                        // the row aligns with determinate ones below it.
+                        ui.add(egui::Spinner::new().size(12.0));
+                    }
+                });
+            });
+        }
+    }
+
+    ui.separator();
+
+    // Scrollable log — newest at the bottom (console-style).
+    egui::ScrollArea::vertical()
+        .stick_to_bottom(true)
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            for line in progress.log() {
+                let color = match line.level {
+                    LogLevel::Info => palette::GREY,
+                    LogLevel::Warn => palette::WARNING,
+                    LogLevel::Error => palette::BAD,
+                };
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new(format!("[{}]", line.group))
+                            .small()
+                            .monospace()
+                            .color(palette::INFO),
+                    );
+                    ui.label(
+                        egui::RichText::new(&line.message)
+                            .small()
+                            .monospace()
+                            .color(color),
+                    );
+                });
+            }
+        });
+}
