@@ -108,9 +108,11 @@ profile-browser: wasm
     fi
     cd tests/browser && node profile.mjs
 
-# Headless perf gate. Single phase, single synth vault, asserts FPS /
-# p99 / jank thresholds. Fails the process (exit 1) on regression. Use
-# in CI alongside test-browser. Tunables (env): PERF_VAULT_NODES (1000),
+# Headless perf gate. Defaults to a synth 1000-node vault — that's our
+# defended floor (gates against regression below 60 fps / 25ms p99).
+# For stress measurements at higher node counts, set PERF_VAULT_NODES
+# manually; expect the gate to fail above ~3000 nodes until further
+# render-side optimization lands. Tunables (env): PERF_VAULT_NODES (1000),
 # PERF_MIN_FPS (50), PERF_MAX_P99_MS (25), PERF_MAX_JANK_PCT (5).
 # Side effect: writes tests/browser/out/perf-idle.flame.txt — an
 # AI-readable text flame graph of where time went.

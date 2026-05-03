@@ -89,20 +89,26 @@ fn vs_main(
     let coc = min(blur_z * effects.blur_strength, effects.max_coc);
     let effective_size = base_size + coc;
 
+    var out: VertexOutput;
+    out.uv = corner;
+    out.color = inst_color;
+    out.world_z = inst_pos.z;
+    out.coc_ratio = base_size / max(effective_size, 1.0);
+
+    // Behind-camera cull: clip.w <= 0 means the node is behind the
+    // near plane; skip the fragment work entirely.
     var clip = camera.view_proj * vec4<f32>(inst_pos, 1.0);
+    if (clip.w <= 0.0 || effective_size < 0.5 || inst_color.a < 0.005) {
+        out.clip_pos = vec4<f32>(2.0, 2.0, 2.0, 1.0);
+        return out;
+    }
 
     // Use effective_size for the quad geometry so the bokeh disc actually
     // covers more pixels.
     let screen = max(camera.screen, vec2<f32>(1.0, 1.0));
     let px = vec2<f32>(effective_size, effective_size) / screen * 2.0;
     clip = vec4<f32>(clip.xy + corner * px * clip.w, clip.zw);
-
-    var out: VertexOutput;
     out.clip_pos = clip;
-    out.uv = corner;
-    out.color = inst_color;
-    out.world_z = inst_pos.z;
-    out.coc_ratio = base_size / max(effective_size, 1.0);
     return out;
 }
 
