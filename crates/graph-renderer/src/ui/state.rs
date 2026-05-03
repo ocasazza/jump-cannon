@@ -174,48 +174,51 @@ impl LayoutPreset {
     /// the layout reaches a steady state instead of orbiting forever.
     pub fn apply_to(self, l: &mut LayoutState) {
         match self {
-            // Fast: low steps/frame + aggressive cooling. Best for big
-            // graphs where you want it settled and out of the way.
+            // Fast: settle quickly, accept a less-spread layout. For big
+            // graphs (>10k) where you'd rather see structure now than
+            // wait for a perfect arrangement.
             LayoutPreset::Fast => {
-                l.repulsion = 150.0;
+                l.repulsion = 300.0;
                 l.spring_k = 0.10;
-                l.spring_len = 25.0;
+                l.spring_len = 40.0;
                 l.gravity = 0.005;
                 l.damping = 0.85;
                 l.dt = 0.045;
                 l.steps_per_call = 1.0;
-                l.cooling_alpha = 0.985;
-                l.cooling_floor = 0.70;
-                l.energy_threshold = 1.0;
-            }
-            // Balanced (default): cosmograph-style 2 steps/frame, halt
-            // within a few seconds so the renderer can throttle paint.
-            LayoutPreset::Balanced => {
-                l.repulsion = 200.0;
-                l.spring_k = 0.08;
-                l.spring_len = 30.0;
-                l.gravity = 0.005;
-                l.damping = 0.85;
-                l.dt = 0.04;
-                l.steps_per_call = 2.0;
                 l.cooling_alpha = 0.99;
                 l.cooling_floor = 0.65;
                 l.energy_threshold = 0.5;
             }
-            // Pretty: more steps + slower cool-down for nicer convergence
-            // on smaller graphs. Will still halt eventually, just spends
-            // more frames doing it.
-            LayoutPreset::Pretty => {
-                l.repulsion = 300.0;
+            // Balanced (default): wide edges + strong repulsion + slow
+            // cool-down so the layout has time to spread into 3D and
+            // doesn't collapse into a ring. Per-frame compute stays low
+            // (steps_per_call=2) so it isn't perceived as slow.
+            LayoutPreset::Balanced => {
+                l.repulsion = 500.0;
                 l.spring_k = 0.06;
-                l.spring_len = 40.0;
-                l.gravity = 0.008;
+                l.spring_len = 60.0;
+                l.gravity = 0.003;
                 l.damping = 0.90;
+                l.dt = 0.04;
+                l.steps_per_call = 2.0;
+                l.cooling_alpha = 0.997;
+                l.cooling_floor = 0.55;
+                l.energy_threshold = 0.05;
+            }
+            // Pretty: more iterations, even softer cool-down, finer dt.
+            // For small/medium graphs where the user wants the cleanest
+            // possible final layout.
+            LayoutPreset::Pretty => {
+                l.repulsion = 800.0;
+                l.spring_k = 0.05;
+                l.spring_len = 80.0;
+                l.gravity = 0.002;
+                l.damping = 0.92;
                 l.dt = 0.025;
                 l.steps_per_call = 4.0;
-                l.cooling_alpha = 0.997;
-                l.cooling_floor = 0.70;
-                l.energy_threshold = 0.1;
+                l.cooling_alpha = 0.999;
+                l.cooling_floor = 0.55;
+                l.energy_threshold = 0.02;
             }
         }
         l.preset = self;
@@ -253,24 +256,24 @@ fn default_energy_threshold() -> f32 { 0.05 }
 
 impl Default for LayoutState {
     fn default() -> Self {
-        // Tuned for responsiveness over perfect convergence (cosmograph
-        // does the same — 1 step/frame, fast cool-down, halt quickly).
-        // 5000-node vaults were saturating the GPU swapchain at the old
-        // 8 steps/frame default; this keeps per-frame compute affordable
-        // and lets the sim reach `is_halted()` within a few seconds so
-        // the renderer's repaint-throttle path can engage.
+        // Per-frame compute is bounded by the low steps_per_call (2);
+        // the sim is allowed to keep running for many seconds so 3D
+        // structure has time to emerge (otherwise the sphere collapses
+        // to a planar ring before repulsion has spread it out).
+        // Bigger spring_len + repulsion give clusters more breathing
+        // room and push the layout into 3D rather than flattening.
         Self {
             preset: LayoutPreset::default(),
-            repulsion: 200.0,
-            spring_k: 0.08,
-            spring_len: 30.0,
-            gravity: 0.005,
-            damping: 0.85,        // start a bit colder
+            repulsion: 500.0,        // was 200 — bigger 3D spread
+            spring_k: 0.06,          // softer springs let repulsion win
+            spring_len: 60.0,        // was 30 — wider edges
+            gravity: 0.003,          // was 0.005 — less inward pull
+            damping: 0.90,
             dt: 0.04,
-            steps_per_call: 2.0,  // was 8 — 4× less compute per frame
-            cooling_alpha: 0.99,  // was 0.998 — halt in ~50 frames not ~170
-            cooling_floor: 0.65,  // was 0.55 — coast at higher damping
-            energy_threshold: 0.5, // was 0.05 — declare "good enough" earlier
+            steps_per_call: 2.0,     // keep low for per-frame budget
+            cooling_alpha: 0.997,    // slow cool — give it time
+            cooling_floor: 0.55,
+            energy_threshold: 0.05,  // hold off on halting until truly settled
         }
     }
 }

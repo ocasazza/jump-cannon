@@ -79,14 +79,11 @@ impl App {
             .and_then(|s| serde_json::from_str::<ui::AppState>(&s).ok())
             .unwrap_or_default();
 
-        // Migrate stale persisted layout settings from before the
-        // perf-rebalance. Old defaults shipped 8 steps/frame + a slow
-        // cool-down that kept the GPU saturated. Cap to safe ranges
-        // while preserving any user-set value that's already in-range.
-        let l = &mut state.layout;
-        l.steps_per_call    = l.steps_per_call.min(4.0);
-        l.cooling_alpha     = l.cooling_alpha.min(0.995);
-        l.energy_threshold  = l.energy_threshold.max(0.1);
+        // Migrate stale persisted layout settings from earlier defaults.
+        // Cap steps_per_call so old persisted 8.0 doesn't burn the GPU;
+        // leave the cooling/energy knobs alone so the user's tuned
+        // values survive and the new slower-cool defaults are reachable.
+        state.layout.steps_per_call = state.layout.steps_per_call.min(4.0);
 
         // Phase B: register GraphPipelines into eframe's wgpu callback resources.
         if let Some(wgpu_state) = cc.wgpu_render_state.as_ref() {
