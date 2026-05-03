@@ -73,11 +73,20 @@ impl App {
         ui::apply_theme(&cc.egui_ctx);
 
         // Restore persisted UI state (active section, slider values, etc).
-        let state = cc
+        let mut state: ui::AppState = cc
             .storage
             .and_then(|s| s.get_string(ui::STORAGE_KEY))
             .and_then(|s| serde_json::from_str::<ui::AppState>(&s).ok())
             .unwrap_or_default();
+
+        // Migrate stale persisted layout settings from before the
+        // perf-rebalance. Old defaults shipped 8 steps/frame + a slow
+        // cool-down that kept the GPU saturated. Cap to safe ranges
+        // while preserving any user-set value that's already in-range.
+        let l = &mut state.layout;
+        l.steps_per_call    = l.steps_per_call.min(4.0);
+        l.cooling_alpha     = l.cooling_alpha.min(0.995);
+        l.energy_threshold  = l.energy_threshold.max(0.1);
 
         // Phase B: register GraphPipelines into eframe's wgpu callback resources.
         if let Some(wgpu_state) = cc.wgpu_render_state.as_ref() {

@@ -174,41 +174,48 @@ impl LayoutPreset {
     /// the layout reaches a steady state instead of orbiting forever.
     pub fn apply_to(self, l: &mut LayoutState) {
         match self {
+            // Fast: low steps/frame + aggressive cooling. Best for big
+            // graphs where you want it settled and out of the way.
             LayoutPreset::Fast => {
                 l.repulsion = 150.0;
                 l.spring_k = 0.10;
                 l.spring_len = 25.0;
                 l.gravity = 0.005;
-                l.damping = 0.72;
+                l.damping = 0.85;
                 l.dt = 0.045;
-                l.steps_per_call = 12.0;
-                l.cooling_alpha = 0.995;
-                l.cooling_floor = 0.50;
-                l.energy_threshold = 0.05;
+                l.steps_per_call = 1.0;
+                l.cooling_alpha = 0.985;
+                l.cooling_floor = 0.70;
+                l.energy_threshold = 1.0;
             }
+            // Balanced (default): cosmograph-style 2 steps/frame, halt
+            // within a few seconds so the renderer can throttle paint.
             LayoutPreset::Balanced => {
                 l.repulsion = 200.0;
                 l.spring_k = 0.08;
                 l.spring_len = 30.0;
                 l.gravity = 0.005;
-                l.damping = 0.78;
+                l.damping = 0.85;
                 l.dt = 0.04;
-                l.steps_per_call = 8.0;
-                l.cooling_alpha = 0.998;
-                l.cooling_floor = 0.55;
-                l.energy_threshold = 0.05;
+                l.steps_per_call = 2.0;
+                l.cooling_alpha = 0.99;
+                l.cooling_floor = 0.65;
+                l.energy_threshold = 0.5;
             }
+            // Pretty: more steps + slower cool-down for nicer convergence
+            // on smaller graphs. Will still halt eventually, just spends
+            // more frames doing it.
             LayoutPreset::Pretty => {
                 l.repulsion = 300.0;
                 l.spring_k = 0.06;
                 l.spring_len = 40.0;
                 l.gravity = 0.008;
-                l.damping = 0.92;
+                l.damping = 0.90;
                 l.dt = 0.025;
                 l.steps_per_call = 4.0;
-                l.cooling_alpha = 0.999;
-                l.cooling_floor = 0.65;
-                l.energy_threshold = 0.05;
+                l.cooling_alpha = 0.997;
+                l.cooling_floor = 0.70;
+                l.energy_threshold = 0.1;
             }
         }
         l.preset = self;
@@ -246,21 +253,24 @@ fn default_energy_threshold() -> f32 { 0.05 }
 
 impl Default for LayoutState {
     fn default() -> Self {
-        // Tuned for 10k-node convergence: lower repulsion, stronger damping,
-        // higher steps_per_call, plus cooling. Without these the sim just
-        // orbits forever — kinetic energy never dissipates.
+        // Tuned for responsiveness over perfect convergence (cosmograph
+        // does the same — 1 step/frame, fast cool-down, halt quickly).
+        // 5000-node vaults were saturating the GPU swapchain at the old
+        // 8 steps/frame default; this keeps per-frame compute affordable
+        // and lets the sim reach `is_halted()` within a few seconds so
+        // the renderer's repaint-throttle path can engage.
         Self {
             preset: LayoutPreset::default(),
             repulsion: 200.0,
             spring_k: 0.08,
             spring_len: 30.0,
             gravity: 0.005,
-            damping: 0.78,
+            damping: 0.85,        // start a bit colder
             dt: 0.04,
-            steps_per_call: 8.0,
-            cooling_alpha: 0.998,
-            cooling_floor: 0.55,
-            energy_threshold: 0.05,
+            steps_per_call: 2.0,  // was 8 — 4× less compute per frame
+            cooling_alpha: 0.99,  // was 0.998 — halt in ~50 frames not ~170
+            cooling_floor: 0.65,  // was 0.55 — coast at higher damping
+            energy_threshold: 0.5, // was 0.05 — declare "good enough" earlier
         }
     }
 }
