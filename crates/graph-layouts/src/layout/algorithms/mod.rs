@@ -6,6 +6,8 @@ pub mod dagre;
 pub mod klay;
 pub mod nforce;
 pub mod gpu_force;
+pub mod random;
+pub mod circle;
 
 #[allow(unused_imports)]
 pub use gpu_force::{GpuForceLayout, GpuForceOptions};

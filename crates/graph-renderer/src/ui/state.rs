@@ -18,6 +18,7 @@ pub enum Section {
     Cursor,
     Stats,
     Instances,
+    Debug,
 }
 
 impl Section {
@@ -30,6 +31,7 @@ impl Section {
         Section::Cursor,
         Section::Stats,
         Section::Instances,
+        Section::Debug,
     ];
 
     pub fn title(self) -> &'static str {
@@ -42,6 +44,7 @@ impl Section {
             Section::Cursor => "Cursor",
             Section::Stats => "Stats",
             Section::Instances => "Instances",
+            Section::Debug => "Debug",
         }
     }
 }
@@ -159,168 +162,134 @@ impl Default for StyleState {
     }
 }
 
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
-pub enum LayoutPreset {
-    Fast,
-    #[default]
-    Balanced,
-    Pretty,
-}
-
-impl LayoutPreset {
-    /// Apply the canonical slider values for this preset. Tuned for
-    /// convergence on 10k-node vaults — the system bleeds kinetic energy
-    /// via cooling_alpha until damping bottoms out at cooling_floor, so
-    /// the layout reaches a steady state instead of orbiting forever.
-    pub fn apply_to(self, l: &mut LayoutState) {
-        match self {
-            // Fast: settle quickly, accept a less-spread layout. For big
-            // graphs (>10k) where you'd rather see structure now than
-            // wait for a perfect arrangement.
-            LayoutPreset::Fast => {
-                l.repulsion = 150.0;
-                l.spring_k = 0.10;
-                l.spring_len = 40.0;
-                l.gravity = 0.005;
-                l.damping = 0.85;
-                l.dt = 0.045;
-                l.steps_per_call = 1.0;
-                l.cooling_alpha = 0.99;
-                l.cooling_floor = 0.65;
-                l.energy_threshold = 0.5;
-            }
-            // Balanced (default): wide edges + strong repulsion + slow
-            // cool-down so the layout has time to spread into 3D and
-            // doesn't collapse into a ring. Per-frame compute stays low
-            // (steps_per_call=2) so it isn't perceived as slow.
-            LayoutPreset::Balanced => {
-                l.repulsion = 250.0;
-                l.spring_k = 0.06;
-                l.spring_len = 60.0;
-                l.gravity = 0.003;
-                l.damping = 0.90;
-                l.dt = 0.04;
-                l.steps_per_call = 2.0;
-                l.cooling_alpha = 0.997;
-                l.cooling_floor = 0.55;
-                l.energy_threshold = 0.05;
-            }
-            // Pretty: more iterations, even softer cool-down, finer dt.
-            // For small/medium graphs where the user wants the cleanest
-            // possible final layout.
-            LayoutPreset::Pretty => {
-                l.repulsion = 400.0;
-                l.spring_k = 0.05;
-                l.spring_len = 80.0;
-                l.gravity = 0.002;
-                l.damping = 0.92;
-                l.dt = 0.025;
-                l.steps_per_call = 4.0;
-                l.cooling_alpha = 0.999;
-                l.cooling_floor = 0.55;
-                l.energy_threshold = 0.02;
-            }
-        }
-        l.preset = self;
-    }
-}
-
-/// Repulsion backend mirror of `graph_layouts::RepulsionMode`. Lives in
-/// the UI state so it persists across sessions and so the UI doesn't have
-/// to depend on the layouts crate's enum directly.
+/// Persisted layout-section state.
 ///
-///   * **Grid** — uniform 3D voxel hash, 27-cell stencil. Default.
-///   * **BarnesHut** — GPU octree + θ-criterion approximation. Best for
-///     clustered graphs (Obsidian-style hub neighborhoods) at N ≥ 50k.
-///   * **NegativeSampling** — DRGraph-style stochastic O(n·K) repulsion.
-///     Skips spatial structure entirely; pairs with multilevel coarsening.
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
-pub enum RepulsionMode {
-    #[default]
-    Grid,
-    BarnesHut,
-    NegativeSampling,
-}
-
-impl RepulsionMode {
-    pub const ALL: &'static [RepulsionMode] = &[
-        RepulsionMode::Grid,
-        RepulsionMode::BarnesHut,
-        RepulsionMode::NegativeSampling,
-    ];
-    pub fn label(self) -> &'static str {
-        match self {
-            RepulsionMode::Grid => "Grid (27-cell)",
-            RepulsionMode::BarnesHut => "Barnes-Hut",
-            RepulsionMode::NegativeSampling => "Negative sampling",
-        }
-    }
-}
-
+/// The pre-refactor `LayoutState` carried every gpu-force slider as a
+/// dedicated typed field. Step 1 of the layout abstraction collapses all
+/// algorithm-specific knobs into a JSON-keyed bag so the registry can
+/// host arbitrary static + physics layouts without growing this struct.
+///
+/// `active` is the registered layout id (e.g. `"gpu-force"`).
+/// `settings[id]` is the algorithm-specific JSON block (decoded into the
+/// appropriate `Settings` type by the algorithm's UI module).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct LayoutState {
-    pub preset: LayoutPreset,
-    pub repulsion: f32,
-    pub spring_k: f32,
-    pub spring_len: f32,
-    pub gravity: f32,
-    pub damping: f32,
-    pub dt: f32,
-    pub steps_per_call: f32,
-    /// Multiplied into damping per `step_with_encoder` call, until damping
-    /// floors at `cooling_floor`. Drives the sim toward a steady state
-    /// instead of perpetual orbiting.
-    #[serde(default = "default_cooling_alpha")]
-    pub cooling_alpha: f32,
-    #[serde(default = "default_cooling_floor")]
-    pub cooling_floor: f32,
-    /// Auto-halt threshold on max per-node kinetic energy. 0.0 disables
-    /// auto-halt entirely (the sim runs forever); ~0.05 is a good
-    /// "settled" value for the default tuning. Drives `is_halted()` and
-    /// the Stats panel running/settled indicator.
-    #[serde(default = "default_energy_threshold")]
-    pub energy_threshold: f32,
-    /// Repulsion backend. Default Grid; flip to BarnesHut for clustered
-    /// graphs (Obsidian-style hub neighborhoods) where the 27-cell grid
-    /// degenerates into hundreds of pairs per voxel.
-    #[serde(default)]
-    pub repulsion_mode: RepulsionMode,
-    /// K — number of negative samples per node per step. Only consulted
-    /// when `repulsion_mode == NegativeSampling`. DRGraph reports good
-    /// quality at K in [5, 20]; default 8.
-    #[serde(default = "default_repulsion_samples")]
-    pub repulsion_samples: u32,
+    #[serde(default = "default_active_layout")]
+    pub active: String,
+    #[serde(default, deserialize_with = "deserialize_settings_with_migration")]
+    pub settings: std::collections::HashMap<String, serde_json::Value>,
 }
 
-fn default_cooling_alpha() -> f32 { 0.998 }
-fn default_cooling_floor() -> f32 { 0.55 }
-fn default_energy_threshold() -> f32 { 0.05 }
-fn default_repulsion_samples() -> u32 { 8 }
+fn default_active_layout() -> String { "gpu-force".to_string() }
 
 impl Default for LayoutState {
     fn default() -> Self {
-        // Per-frame compute is bounded by the low steps_per_call (2);
-        // the sim is allowed to keep running for many seconds so 3D
-        // structure has time to emerge (otherwise the sphere collapses
-        // to a planar ring before repulsion has spread it out).
-        // Bigger spring_len + repulsion give clusters more breathing
-        // room and push the layout into 3D rather than flattening.
         Self {
-            preset: LayoutPreset::default(),
-            repulsion: 250.0,        // mass-weighted; halved from 500 to compensate for hub amplification
-            spring_k: 0.06,          // softer springs let repulsion win
-            spring_len: 60.0,        // was 30 — wider edges
-            gravity: 0.003,          // was 0.005 — less inward pull
-            damping: 0.90,
-            dt: 0.04,
-            steps_per_call: 2.0,     // keep low for per-frame budget
-            cooling_alpha: 0.997,    // slow cool — give it time
-            cooling_floor: 0.55,
-            energy_threshold: 0.05,  // hold off on halting until truly settled
-            repulsion_mode: RepulsionMode::default(),
-            repulsion_samples: 8,
+            active: default_active_layout(),
+            settings: std::collections::HashMap::new(),
         }
     }
+}
+
+impl LayoutState {
+    /// Get-or-insert mutable JSON for the given layout id, falling back to
+    /// the supplied default factory when the key is missing.
+    pub fn settings_for_mut(
+        &mut self,
+        id: graph_layouts::LayoutId,
+        default_factory: impl FnOnce() -> serde_json::Value,
+    ) -> &mut serde_json::Value {
+        self.settings
+            .entry(id.to_string())
+            .or_insert_with(default_factory)
+    }
+}
+
+/// Migration shim: detects the *old* persisted shape (top-level
+/// `repulsion` / `spring_k` / etc. fields living next to a `preset`) and
+/// folds it into `settings["gpu-force"]`. New shape just deserialises a
+/// `HashMap<String, Value>` straight through.
+///
+/// The old shape was a sibling field of `settings`, which serde won't
+/// see when it parses `LayoutState` — so we hook in here, attempting to
+/// pull the legacy fields out of the parent `Value` is impractical from
+/// inside a per-field deserializer. The pragmatic compromise: try to
+/// parse settings as the new shape; if absent, return empty. Any actual
+/// migration of the old shape happens in `migrate_layout_state` below
+/// which the App calls during startup with the raw stored Value.
+fn deserialize_settings_with_migration<'de, D>(
+    deserializer: D,
+) -> Result<std::collections::HashMap<String, serde_json::Value>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use std::collections::HashMap;
+    HashMap::<String, serde_json::Value>::deserialize(deserializer)
+}
+
+/// Inspect a raw stored `AppState` JSON value and, if it carries a
+/// pre-refactor `LayoutState` (top-level `repulsion` / `spring_k` /
+/// `repulsion_mode` etc. on the `layout` object), rewrite it into the
+/// new `{ active, settings: { "gpu-force": {...} } }` shape.
+///
+/// Called once from `App::new` before deserialising into `AppState`.
+/// Returns the value mutated in place.
+pub fn migrate_layout_state(raw: &mut serde_json::Value) {
+    let Some(obj) = raw.as_object_mut() else { return };
+    let Some(layout) = obj.get_mut("layout").and_then(|v| v.as_object_mut()) else {
+        return;
+    };
+    // New shape already? Bail.
+    if layout.contains_key("active") && layout.contains_key("settings") {
+        return;
+    }
+    // Build a gpu-force settings object out of whatever legacy keys exist.
+    // We map each top-level key to its `GpuForceOptions` field name.
+    // `repulsion_mode` was a UI-side enum (Grid / BarnesHut / NegativeSampling)
+    // that GpuForceOptions's hand-rolled deser accepts as a lowercase
+    // snake_case string ("grid" / "barnes_hut" / "negative_sampling").
+    let mut gpu_force = serde_json::Map::new();
+    let copy_keys = [
+        "repulsion",
+        "spring_k",
+        "spring_len",
+        "gravity",
+        "damping",
+        "dt",
+        "cooling_alpha",
+        "cooling_floor",
+        "energy_threshold",
+        "repulsion_samples",
+    ];
+    for k in copy_keys {
+        if let Some(v) = layout.remove(k) {
+            gpu_force.insert(k.to_string(), v);
+        }
+    }
+    if let Some(v) = layout.remove("steps_per_call") {
+        // Old field was f32; GpuForceOptions wants u32. round + clamp.
+        let n = v.as_f64().unwrap_or(2.0).round().max(1.0) as u64;
+        gpu_force.insert("steps_per_call".to_string(), serde_json::json!(n));
+    }
+    if let Some(v) = layout.remove("repulsion_mode") {
+        // Old enum strings: "Grid" / "BarnesHut" / "NegativeSampling".
+        let mapped = match v.as_str() {
+            Some("BarnesHut") => "barnes_hut",
+            Some("NegativeSampling") => "negative_sampling",
+            _ => "grid",
+        };
+        gpu_force.insert("repulsion_mode".to_string(), serde_json::json!(mapped));
+    }
+    // Drop legacy preset key.
+    layout.remove("preset");
+    // Stamp new shape.
+    layout.insert("active".to_string(), serde_json::json!("gpu-force"));
+    let mut settings = serde_json::Map::new();
+    settings.insert(
+        "gpu-force".to_string(),
+        serde_json::Value::Object(gpu_force),
+    );
+    layout.insert("settings".to_string(), serde_json::Value::Object(settings));
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -448,7 +417,7 @@ impl Default for WorkspaceSettings {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AppState {
     pub active_section: Option<Section>,
     pub style: StyleState,
@@ -458,6 +427,11 @@ pub struct AppState {
     pub cursor: CursorState,
     #[serde(default)]
     pub workspace: WorkspaceSettings,
+    /// Dockable workspace (tabs + splits) for the central panel. Default
+    /// is a single Graph tab. Old persisted state predates this field —
+    /// `#[serde(default)]` keeps it loadable.
+    #[serde(default)]
+    pub dock: crate::ui::workspace::Workspace,
     #[serde(default)]
     pub sim_status: SimStatus,
     #[serde(default)]
@@ -466,8 +440,41 @@ pub struct AppState {
     /// startup; only the live instance list survives a reload).
     #[serde(default)]
     pub action_instances: Vec<crate::ui::actions::ActionInstance>,
+    /// Right-hand inspector sidebar open/collapsed flag. Default true so
+    /// new users see it immediately on first node click.
+    #[serde(default = "default_inspector_open")]
+    pub inspector_open: bool,
     #[serde(skip)]
     pub stats: LiveStats,
+    /// One-shot signal: the Layout sidebar's "Solve" button sets this to
+    /// `true`. `App::update` reads-and-clears it each frame and, if the
+    /// active layout is Static, dispatches `run_static_solve` against the
+    /// current settings (useful e.g. to re-roll a Random seed).
+    #[serde(skip)]
+    pub layout_solve_requested: bool,
 }
 
 pub const STORAGE_KEY: &str = "graph_renderer_app_state_v1";
+
+fn default_inspector_open() -> bool { true }
+
+impl Default for AppState {
+    fn default() -> Self {
+        Self {
+            active_section: None,
+            style: StyleState::default(),
+            layout: LayoutState::default(),
+            camera: CameraState::default(),
+            focus: FocusState::default(),
+            cursor: CursorState::default(),
+            workspace: WorkspaceSettings::default(),
+            dock: crate::ui::workspace::Workspace::default(),
+            sim_status: SimStatus::default(),
+            query: QueryModel::default(),
+            action_instances: Vec::new(),
+            inspector_open: default_inspector_open(),
+            stats: LiveStats::default(),
+            layout_solve_requested: false,
+        }
+    }
+}

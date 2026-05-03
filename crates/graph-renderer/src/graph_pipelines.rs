@@ -22,9 +22,13 @@ use crate::camera::Camera;
 use bytemuck::{Pod, Zeroable};
 use glam::Vec3;
 use graph_layouts::{
-    Edge as GlEdge, Graph as GlGraph, GpuForceLayout, GpuForceOptions, Node as GlNode,
+    BoxedPhysics, DynPhysicsLayout, Edge as GlEdge, Graph as GlGraph, GpuForceLayout,
+    GpuForceOptions, Node as GlNode,
 };
+use serde_json::Value;
 use wgpu::util::DeviceExt;
+
+use crate::ui::layout::registry::LayoutFactory;
 
 #[derive(Clone)]
 pub struct GraphData {
@@ -128,7 +132,11 @@ struct Buffers {
     node_bind_group: wgpu::BindGroup,
     edge_bind_group: wgpu::BindGroup,
 
-    layout: Option<GpuForceLayout>,
+    layout: Option<Box<dyn DynPhysicsLayout>>,
+    /// Cached graph the layout was initialised against. Needed so
+    /// `swap_physics_layout` can re-init a freshly-built layout against
+    /// the same topology without forcing the caller to re-supply it.
+    layout_graph: Option<GlGraph>,
     /// CPU mirrors. positions/sizes used for raycast + fit; colors_base
     /// is the per-node base RGBA so set_selected can multiply alpha
     /// without losing the underlying tint.
@@ -374,11 +382,19 @@ impl GraphPipelines {
         });
 
         // Initialise the GPU force layout against the same positions buffer.
-        let layout = match build_layout(device, queue, &graph.positions, &graph.edges, &positions) {
-            Ok(l) => Some(l),
-            Err(e) => {
-                log::warn!("[graph-renderer] init_layout failed: {e}");
-                None
+        // TODO(layout-step-3): take the active LayoutFactory in here so we
+        // can construct any registered physics backend, not just gpu-force.
+        let layout_graph = build_topology_graph(&graph.positions, &graph.edges);
+        let layout: Option<Box<dyn DynPhysicsLayout>> = {
+            let mut boxed: Box<dyn DynPhysicsLayout> = Box::new(BoxedPhysics::new(
+                GpuForceLayout::new(GpuForceOptions::default()),
+            ));
+            match boxed.init_with_device(device, queue, &layout_graph, &positions) {
+                Ok(()) => Some(boxed),
+                Err(e) => {
+                    log::warn!("[graph-renderer] init_layout failed: {e}");
+                    None
+                }
             }
         };
 
@@ -396,6 +412,7 @@ impl GraphPipelines {
             node_bind_group,
             edge_bind_group,
             layout,
+            layout_graph: Some(layout_graph),
             positions_cpu: graph.positions,
             sizes_cpu: graph.sizes,
             colors_base,
@@ -606,24 +623,164 @@ impl GraphPipelines {
     }
 
     /// Push the cursor force into the GPU layout. radius=0 disables.
+    ///
+    /// JSON round-trip per cursor move is wasteful — Step 1 punts on the
+    /// optimisation; a typed cursor sink trait method would let us skip
+    /// the deserialise/reserialise cycle.
     pub fn set_cursor_force(&mut self, world: [f32; 3], radius: f32, strength: f32) {
         let Some(b) = self.buffers.as_mut() else { return };
         let Some(l) = b.layout.as_mut() else { return };
-        let mut opts = l.options().clone();
-        opts.cursor_pos = world;
-        opts.cursor_radius = radius;
-        opts.cursor_strength = strength;
-        l.set_options(opts);
+        let json = l.settings_json();
+        if let Ok(mut opts) = serde_json::from_value::<GpuForceOptions>(json) {
+            opts.cursor_pos = world;
+            opts.cursor_radius = radius;
+            opts.cursor_strength = strength;
+            if let Ok(v) = serde_json::to_value(&opts) {
+                let _ = l.set_settings_json(&v);
+            }
+        }
         // Mirror the visual radius into the effects uniform so the
         // shader can render a hint ring at the cursor.
         self.effects.cursor_radius_visual = radius;
     }
 
-    /// Replace the entire layout option block. Wakes the sim.
+    /// Replace the entire physics layout settings block from JSON. The
+    /// `update_layout_options` wrapper below preserves typed access for
+    /// the cursor / cool-down paths still living in `app.rs`.
+    pub fn set_physics_layout_settings_json(&mut self, settings: &serde_json::Value) {
+        let Some(b) = self.buffers.as_mut() else { return };
+        let Some(l) = b.layout.as_mut() else { return };
+        if let Err(e) = l.set_settings_json(settings) {
+            log::warn!("[graph-renderer] set_physics_layout_settings_json: {e}");
+        }
+    }
+
+    /// Backward-compat wrapper. TODO(layout-step-3): drop in favour of
+    /// the JSON path once `app.rs` and `web.rs` (legacy renderer) no
+    /// longer need typed `GpuForceOptions`.
     pub fn update_layout_options(&mut self, opts: GpuForceOptions) {
         let Some(b) = self.buffers.as_mut() else { return };
         let Some(l) = b.layout.as_mut() else { return };
-        l.set_options(opts);
+        if let Ok(v) = serde_json::to_value(&opts) {
+            let _ = l.set_settings_json(&v);
+        }
+    }
+
+    /// Drop the existing physics layout and construct a new one via the
+    /// supplied factory + JSON settings. Re-initialises against the
+    /// current node topology and positions buffer.
+    ///
+    /// Step 1 only registers gpu-force, so this branch never fires in
+    /// practice — but the wiring is here so Step 3 (multi-backend swap)
+    /// is a one-line call.
+    pub fn swap_physics_layout(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        factory: &LayoutFactory,
+        settings: &serde_json::Value,
+    ) {
+        let Some(b) = self.buffers.as_mut() else { return };
+        let LayoutFactory::Physics { build, .. } = factory else {
+            log::warn!("[graph-renderer] swap_physics_layout: factory is not Physics");
+            return;
+        };
+        // Sync the cached topology graph's `position3` from the live CPU
+        // positions mirror, so a fresh physics layout's `init_with_device`
+        // (which uploads `precompute().initial_positions` straight from
+        // `node.position3`) resumes from whatever the previous layout
+        // — including a one-shot static solve — left behind, instead of
+        // jumping back to the bootstrap positions.
+        if let Some(graph) = b.layout_graph.as_mut() {
+            // The renderer-side helper `build_topology_graph` builds ids
+            // as zero-padded indices, so the same scheme indexes back in.
+            let n = b.n_nodes as usize;
+            let width = format!("{}", n.max(1) - 1).len().max(1);
+            for i in 0..n {
+                if i * 3 + 2 >= b.positions_cpu.len() {
+                    break;
+                }
+                let id = format!("{:0width$}", i, width = width);
+                if let Some(node) = graph.nodes.get_mut(&id) {
+                    node.position3 = Some([
+                        b.positions_cpu[i * 3],
+                        b.positions_cpu[i * 3 + 1],
+                        b.positions_cpu[i * 3 + 2],
+                    ]);
+                }
+            }
+        }
+        let Some(graph) = b.layout_graph.as_ref() else { return };
+        let mut new_layout = build(settings);
+        match new_layout.init_with_device(device, queue, graph, &b.positions) {
+            Ok(()) => {
+                b.layout = Some(new_layout);
+            }
+            Err(e) => {
+                log::warn!("[graph-renderer] swap_physics_layout init failed: {e}");
+            }
+        }
+    }
+
+    /// Run a one-shot Static layout against the cached topology graph and
+    /// upload the result into the shared positions buffer. Drops any
+    /// active physics layout so `compute_step` becomes a no-op until the
+    /// caller swaps a new physics backend in (e.g. by switching the
+    /// algorithm ComboBox back to "GPU force").
+    pub fn run_static_solve(
+        &mut self,
+        queue: &wgpu::Queue,
+        factory: &LayoutFactory,
+        settings: &Value,
+    ) -> Result<(), String> {
+        let LayoutFactory::Static { build, .. } = factory else {
+            return Err("run_static_solve: factory is not Static".to_string());
+        };
+        let b = self
+            .buffers
+            .as_mut()
+            .ok_or_else(|| "run_static_solve: no buffers loaded".to_string())?;
+        let graph = b
+            .layout_graph
+            .as_ref()
+            .ok_or_else(|| "run_static_solve: no cached topology graph".to_string())?;
+
+        let dyn_layout = build();
+        let positions = dyn_layout.solve_dyn(settings, graph)?;
+        let n_nodes = b.n_nodes as usize;
+        if positions.len() != n_nodes * 3 {
+            return Err(format!(
+                "run_static_solve: solver returned {} floats, expected {}",
+                positions.len(),
+                n_nodes * 3,
+            ));
+        }
+
+        // Re-pack into the vec4-padded layout the WGSL storage buffer
+        // expects (matches the format `load()` builds at bootstrap).
+        let mut padded: Vec<f32> = Vec::with_capacity(n_nodes * 4);
+        for i in 0..n_nodes {
+            padded.extend_from_slice(&[
+                positions[i * 3],
+                positions[i * 3 + 1],
+                positions[i * 3 + 2],
+                0.0,
+            ]);
+        }
+        if padded.is_empty() {
+            padded.extend_from_slice(&[0.0; 4]);
+        }
+        queue.write_buffer(&b.positions, 0, bytemuck::cast_slice(&padded));
+
+        // Refresh the CPU mirror so raycasts and `bounds()` see the new
+        // positions instead of the pre-solve state.
+        b.positions_cpu = positions;
+
+        // Tear down any active physics layout so `compute_step` doesn't
+        // immediately stomp the freshly-written positions.
+        b.layout = None;
+
+        Ok(())
     }
 
     /// True once the GPU force layout has settled (max-KE under the
@@ -651,11 +808,21 @@ impl GraphPipelines {
     }
 
     /// Current layout options snapshot, if a layout exists.
+    /// Returns `None` if the active layout's settings can't decode into
+    /// `GpuForceOptions` (e.g. once Step 3 swaps in a non-gpu-force
+    /// physics backend, callers will need a typed-per-backend path).
     pub fn layout_options(&self) -> Option<GpuForceOptions> {
+        let l = self.buffers.as_ref().and_then(|b| b.layout.as_ref())?;
+        serde_json::from_value::<GpuForceOptions>(l.settings_json()).ok()
+    }
+
+    /// Active physics layout's settings as raw JSON. Step 1 only needs
+    /// this for the change-detect hash in `App::layout_key`.
+    pub fn layout_settings_json(&self) -> Option<serde_json::Value> {
         self.buffers
             .as_ref()
             .and_then(|b| b.layout.as_ref())
-            .map(|l| l.options().clone())
+            .map(|l| l.settings_json())
     }
 
     /// Centroid of currently-loaded node positions (CPU mirror —
@@ -708,13 +875,11 @@ impl GraphPipelines {
     }
 }
 
-fn build_layout(
-    device: &wgpu::Device,
-    queue: &wgpu::Queue,
-    positions: &[f32],
-    edges: &[u32],
-    positions_buf: &wgpu::Buffer,
-) -> Result<GpuForceLayout, String> {
+/// Build a `graph_layouts::Graph` topology mirror from the renderer's
+/// flat position/edge buffers. The id padding scheme matches what the
+/// pre-refactor `build_layout` used so existing tests that probe the
+/// node id format keep passing.
+fn build_topology_graph(positions: &[f32], edges: &[u32]) -> GlGraph {
     let n = positions.len() / 3;
     let width = format!("{}", n.max(1) - 1).len().max(1);
 
@@ -741,10 +906,7 @@ fn build_layout(
         let tid = format!("{:0width$}", t, width = width);
         g.add_edge(GlEdge::new(format!("e{}", e_i), sid, tid));
     }
-
-    let mut layout = GpuForceLayout::new(GpuForceOptions::default());
-    layout.init_with_device(device, queue, &g, positions_buf)?;
-    Ok(layout)
+    g
 }
 
 fn uniform_entry(binding: u32, vis: wgpu::ShaderStages) -> wgpu::BindGroupLayoutEntry {

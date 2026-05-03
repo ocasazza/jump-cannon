@@ -125,6 +125,10 @@ pub enum BuiltinAction {
     FitCamera,
     ResetStyle,
     JumpToSection(Section),
+    /// Open a new Graph tab in the central workspace dock.
+    NewGraphTab,
+    /// Toggle the right-hand inspector sidebar open/collapsed.
+    ToggleInspector,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -800,6 +804,36 @@ pub fn seed_default_actions(reg: &mut ActionRegistry) {
         contextual: false,
         shortcut: Some("F".into()),
         handler: ActionHandler::Builtin(FitCamera),
+    });
+
+    reg.register(Action {
+        id: "new-graph-tab".into(),
+        title: "New Graph Tab".into(),
+        description: "Open a new Graph tab in the central workspace".into(),
+        keywords: words(&["new", "tab", "graph", "open", "workspace", "dock"]),
+        kind: ActionType::Singleton,
+        parameters: vec![],
+        parent_id: None,
+        children_ids: vec![],
+        category: Some("View".into()),
+        contextual: false,
+        shortcut: None,
+        handler: ActionHandler::Builtin(NewGraphTab),
+    });
+
+    reg.register(Action {
+        id: "toggle-inspector".into(),
+        title: "Toggle Inspector".into(),
+        description: "Show or hide the right-hand inspector panel".into(),
+        keywords: words(&["inspector", "sidebar", "panel", "toggle", "right"]),
+        kind: ActionType::Singleton,
+        parameters: vec![],
+        parent_id: None,
+        children_ids: vec![],
+        category: Some("View".into()),
+        contextual: false,
+        shortcut: None,
+        handler: ActionHandler::Builtin(ToggleInspector),
     });
 
     reg.register(Action {

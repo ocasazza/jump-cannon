@@ -19,6 +19,7 @@ pub mod data;
 pub mod fetch;
 pub mod graph_callback;
 pub mod graph_pipelines;
+pub mod perf;
 pub mod proto;
 pub mod ui;
 pub use app::App;

@@ -1,11 +1,15 @@
 pub mod actions;
 pub mod command_palette;
+pub mod document_viewer;
+pub mod inspector;
+pub mod layout;
 pub mod modal;
 pub mod query;
 pub mod sections;
 pub mod sidebar;
 pub mod state;
 pub mod theme;
+pub mod workspace;
 
 pub use actions::{
     Action, ActionHandler, ActionInstance, ActionRegistry, ActionType, BuiltinAction,

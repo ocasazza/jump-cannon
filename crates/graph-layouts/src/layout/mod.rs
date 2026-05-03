@@ -3,6 +3,7 @@ use crate::types::{Graph, LayoutAlgorithm};
 pub mod traits;
 pub mod algorithms;
 pub mod coarsen;
+pub mod layout_trait;
 
 #[allow(unused_imports)]
 pub use traits::*;

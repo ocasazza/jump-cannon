@@ -28,6 +28,8 @@ wasm    = [
 eframe   = { version = "0.30", default-features = false, features = ["default_fonts", "wgpu", "wayland", "x11", "persistence"] }
 egui     = "0.30"
 egui-wgpu = "0.30"
+egui_plot = "0.30"
+web-time = "1"
 log      = "0.4"
 include_dir = "0.7"
 wgpu     = { version = "23", default-features = false, features = ["webgpu", "webgl", "wgsl"] }
@@ -37,6 +39,13 @@ graph-layouts = { path = "../graph-layouts" }
 prost      = "0.13"
 serde      = { version = "1", features = ["derive"] }
 serde_json = "1"
+egui_dock  = { version = "0.15", features = ["serde"] }
+fuzzy-matcher = "0.3"
+# Syntect with the pure-Rust fancy-regex engine so the same dep tree builds
+# on wasm32 (the default `regex-onig` pulls a C library that doesn't ship to
+# wasm). `default-themes` keeps a few bundled themes; `default-syntaxes` keeps
+# the bundled syntax pack. No `dump-create*` features (we never re-dump caches).
+syntect = { version = "5", default-features = false, features = ["parsing", "default-syntaxes", "default-themes", "regex-fancy"] }
 
 console_error_panic_hook = { version = "0.1", optional = true }
 console_log              = { version = "1",  optional = true }

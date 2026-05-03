@@ -4,15 +4,16 @@ use std::sync::{Arc, Mutex};
 
 use crate::data::{self, Bootstrap, LoadState, SharedLoad};
 use crate::fetch::ApiClient;
-use crate::graph_callback::GraphCallback;
 use crate::graph_pipelines::{GraphData, GraphPipelines};
+use crate::perf::{PerfCollector, StageId};
 use crate::proto;
 use crate::ui;
 use crate::ui::actions::{self, ActionRegistry, BuiltinAction, ParamValue};
 use crate::ui::command_palette::PaletteOutcome;
+use crate::ui::layout::registry::LayoutRegistry;
 use crate::ui::query::EvalContext;
 use crate::ui::state::{ColorBy, FontFamilyChoice, SizeBy};
-use graph_layouts::{warmup_positions, GpuForceOptions, RepulsionMode};
+use graph_layouts::{warmup_positions, GpuForceOptions};
 
 /// Result of an async `/node/:id` fetch — Some(Ok) success, Some(Err) error,
 /// None means no fetch has completed since the last poll.
@@ -78,6 +79,21 @@ pub struct App {
     // -- command palette ---------------------------------------------------
     palette_state: ui::CommandPaletteState,
     actions: ActionRegistry,
+    /// Async slot for the palette's preview-fetch (separate from
+    /// `node_fetch` which feeds the modal). Holds (id, Result<NodeMeta>).
+    palette_preview_slot: Arc<Mutex<Option<(String, Result<proto::NodeMeta, String>)>>>,
+    /// Ids the palette has already requested previews for, to avoid
+    /// re-spawning fetches every frame while one is in-flight.
+    palette_inflight: HashSet<String>,
+
+    // -- layout registry ---------------------------------------------------
+    /// Registry of available layout algorithms. Step 1: gpu-force only.
+    /// Step 3 will register additional static + physics backends here.
+    layout_registry: LayoutRegistry,
+    /// Tracks the previously-active layout id so `apply_layout_to_gpu`
+    /// can detect a swap and call into `swap_physics_layout`. Step 1
+    /// only registers one factory so this never observes a change.
+    prev_active_layout_id: Option<String>,
 
     // -- auto-fit dedup ----------------------------------------------------
     /// Last canvas size we ran `fit_camera()` for. Auto-refit only fires
@@ -87,6 +103,14 @@ pub struct App {
     /// Manual refit via `F`, the Camera section button, or Ctrl+P → Fit
     /// Camera covers the rest.
     last_fit_screen: Option<egui::Vec2>,
+
+    /// Per-frame perf ring buffer (FPS, frame ms, per-stage ms, KE).
+    /// Surfaced in the Debug sidebar section.
+    pub perf: PerfCollector,
+
+    /// Currently-selected node idx for the right-hand inspector panel.
+    /// Session-only — not persisted.
+    selected_node_idx: Option<u32>,
 }
 
 impl App {
@@ -95,17 +119,28 @@ impl App {
         ui::apply_theme(&cc.egui_ctx);
 
         // Restore persisted UI state (active section, slider values, etc).
-        let mut state: ui::AppState = cc
+        // Run the layout-shape migration on the raw JSON value first so
+        // pre-refactor `LayoutState { repulsion, spring_k, ... }` blobs
+        // get folded into the new `{ active, settings: { "gpu-force":
+        // {...} } }` shape before serde decodes the typed struct.
+        let state: ui::AppState = cc
             .storage
             .and_then(|s| s.get_string(ui::STORAGE_KEY))
-            .and_then(|s| serde_json::from_str::<ui::AppState>(&s).ok())
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+            .map(|mut v| {
+                ui::state::migrate_layout_state(&mut v);
+                v
+            })
+            .and_then(|v| serde_json::from_value::<ui::AppState>(v).ok())
             .unwrap_or_default();
 
-        // Migrate stale persisted layout settings from earlier defaults.
-        // Cap steps_per_call so old persisted 8.0 doesn't burn the GPU;
-        // leave the cooling/energy knobs alone so the user's tuned
-        // values survive and the new slower-cool defaults are reachable.
-        state.layout.steps_per_call = state.layout.steps_per_call.min(4.0);
+        // Cap steps_per_call (gpu-force) so an old persisted 8 doesn't
+        // burn the GPU; the cooling / energy knobs are left alone so
+        // tuned values survive.
+        // No-op for fresh state (no settings entry yet).
+        // (Done lazily on first apply via the JSON path — kept here as
+        //  a TODO marker so we revisit once steps_per_call clamping
+        //  becomes a layout-side concern instead of an app-side one.)
 
         // Phase B: register GraphPipelines into eframe's wgpu callback resources.
         if let Some(wgpu_state) = cc.wgpu_render_state.as_ref() {
@@ -168,7 +203,44 @@ impl App {
             last_observed_max_ke: 0.0,
             palette_state: ui::CommandPaletteState::default(),
             actions,
+            palette_preview_slot: Arc::new(Mutex::new(None)),
+            palette_inflight: HashSet::new(),
+            layout_registry: LayoutRegistry::seed_default(),
+            prev_active_layout_id: None,
             last_fit_screen: None,
+            perf: PerfCollector::default(),
+            selected_node_idx: None,
+        }
+    }
+
+    /// Drain any completed palette preview fetches and kick off new ones
+    /// requested by the palette during the previous frame.
+    fn service_palette_preview(&mut self) {
+        let drained = self.palette_preview_slot.lock().unwrap().take();
+        if let Some((id, result)) = drained {
+            self.palette_inflight.remove(&id);
+            match result {
+                Ok(meta) => {
+                    self.palette_state.preview_cache.insert(id, meta);
+                }
+                Err(e) => {
+                    self.palette_state.preview_errors.insert(id, e);
+                }
+            }
+        }
+        if let Some(id) = self.palette_state.pending_preview_id.take() {
+            if !self.palette_state.preview_cache.contains_key(&id)
+                && !self.palette_state.preview_errors.contains_key(&id)
+                && self.palette_inflight.insert(id.clone())
+            {
+                let slot = self.palette_preview_slot.clone();
+                let client = ApiClient::new(self.base_url.clone());
+                let id_for_task = id.clone();
+                spawn_async(async move {
+                    let result = client.node(&id_for_task).await;
+                    *slot.lock().unwrap() = Some((id_for_task, result));
+                });
+            }
         }
     }
 
@@ -254,7 +326,18 @@ impl App {
         // random initial layout with a coarsened-cascade seed so the GPU
         // sim converges in a handful of frames instead of hundreds. No-op
         // for n_nodes < 64 (handled inside warmup_positions).
-        let spring_len = self.state.layout.spring_len.max(1.0);
+        // Pull spring_len from the active gpu-force settings JSON, falling
+        // back to defaults if absent (fresh install, non-gpu-force active).
+        let spring_len = self
+            .state
+            .layout
+            .settings
+            .get("gpu-force")
+            .and_then(|v| v.get("spring_len"))
+            .and_then(|v| v.as_f64())
+            .map(|f| f as f32)
+            .unwrap_or_else(|| GpuForceOptions::default().spring_len)
+            .max(1.0);
         let warmed = warmup_positions(n_nodes, &bootstrap.edges, spring_len, 0xC0A75E);
         if warmed.len() == bootstrap.positions.len() {
             bootstrap.positions = warmed;
@@ -347,6 +430,7 @@ impl eframe::App for App {
     }
 
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        self.perf.begin_frame();
         // Re-apply theme each frame so hot edits to theme.rs land without restart.
         ui::apply_theme(ctx);
 
@@ -374,7 +458,47 @@ impl eframe::App for App {
         }
 
         // Phase D sidebar (activity bar + section panel) on the left.
-        ui::show_sidebar(ctx, &mut self.state, &mut self.actions);
+        self.perf.begin_stage(StageId::UiChrome);
+        ui::show_sidebar(
+            ctx,
+            &mut self.state,
+            &mut self.actions,
+            &self.layout_registry,
+            &self.perf,
+        );
+
+        // Right-hand inspector panel — must run before the CentralPanel
+        // so the dock area auto-shrinks to fit. The inspector reads ids /
+        // metrics / edges from the cached bootstrap and can request a
+        // selection change which we drain immediately afterwards.
+        let mut requested_selection: Option<u32> = None;
+        {
+            // Snapshot a slice borrow from GraphPipelines edges — the
+            // call below releases the renderer lock before egui begins.
+            let edges_snapshot: Vec<u32> = if let Some(wgpu_state) = frame.wgpu_render_state() {
+                let renderer = wgpu_state.renderer.read();
+                renderer
+                    .callback_resources
+                    .get::<GraphPipelines>()
+                    .map(|p| p.edges_cpu().to_vec())
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+            let mut data = ui::inspector::InspectorData {
+                ids: &self.ids,
+                metrics: &self.metrics,
+                edges: &edges_snapshot,
+                selected_idx: self.selected_node_idx,
+                requested_selection: &mut requested_selection,
+            };
+            ui::inspector::show(ctx, &mut self.state, &mut data);
+        }
+
+        // Drain any palette preview-fetch result from the previous frame
+        // and kick off any new request the palette flagged. Done before
+        // re-rendering so a freshly-arrived NodeMeta paints the same frame.
+        self.service_palette_preview();
 
         // Command palette modal — runs above the sidebar, below the modal.
         let palette_outcome = ui::show_command_palette(
@@ -382,109 +506,75 @@ impl eframe::App for App {
             &mut self.palette_state,
             &mut self.actions,
             &self.state.workspace,
+            &self.ids,
         );
-        if let PaletteOutcome::Execute { action_id, params } = palette_outcome {
-            self.execute_action(frame, &action_id, params);
+        self.perf.end_stage(StageId::UiChrome);
+        match palette_outcome {
+            PaletteOutcome::Execute { action_id, params } => {
+                self.execute_action(frame, &action_id, params);
+            }
+            PaletteOutcome::OpenNode { id } => {
+                self.kick_off_node_fetch(id);
+            }
+            PaletteOutcome::None => {}
         }
 
-        // Phase B central panel — wgpu graph layer via egui_wgpu callback.
-        // Frame is transparent so the wgpu output isn't covered.
-        let mut click: Option<(egui::Rect, egui::Pos2)> = None;
-        let mut canvas_rect: Option<egui::Rect> = None;
-        let mut pointer_in_canvas: Option<egui::Pos2> = None;
-        let mut lmb_held = false;
-        let mut rmb_held = false;
-        // Snapshot the load message so we can render a progress overlay
-        // before the graph buffers exist. Cheap clone; the lock is brief.
+        // Phase B central panel — now hosts the dockable Workspace
+        // (tabs + splits via egui_dock). One initial "Graph" tab carries
+        // the wgpu callback; the Welcome tab kind exists so the splitting
+        // story is exercisable. Input/picking semantics match the pre-dock
+        // central panel — see `ui::workspace::WorkspaceViewer::draw_graph_tab`.
         let load_msg: Option<String> = {
             let guard = self.load.lock().unwrap();
-            match &*guard {
-                LoadState::Pending => Some("loading…".to_string()),
-                LoadState::Loading(m) => Some(m.clone()),
-                _ => None,
-            }
+            ui::workspace::load_status_message(&*guard)
         };
+        let mut wctx = ui::workspace::WorkspaceCtx {
+            frame,
+            loaded_into_gpu: self.loaded_into_gpu,
+            load_msg: load_msg.as_deref(),
+            invert_mouse_x: self.state.camera.invert_mouse_x,
+            invert_mouse_y: self.state.camera.invert_mouse_y,
+            canvas_rect: None,
+            pointer_in_canvas: None,
+            click: None,
+            lmb_held: false,
+            rmb_held: false,
+            add_tab_requests: Vec::new(),
+            split_requests: Vec::new(),
+        };
+        self.perf.begin_stage(StageId::EguiPaint);
         egui::CentralPanel::default()
             .frame(egui::Frame::none().fill(egui::Color32::TRANSPARENT))
             .show(ctx, |ui| {
-                let avail = ui.available_size();
-                let (rect, resp) =
-                    ui.allocate_exact_size(avail, egui::Sense::click_and_drag());
-                // Skip the wgpu graph callback entirely while the bootstrap
-                // is still loading — there's nothing to draw yet, and
-                // showing a progress label gives the user a signal that
-                // something is happening instead of a blank canvas.
-                if self.loaded_into_gpu {
-                    let cb = GraphCallback {
-                        screen_px: [rect.width().max(1.0), rect.height().max(1.0)],
-                    };
-                    ui.painter()
-                        .add(egui_wgpu::Callback::new_paint_callback(rect, cb));
-                } else if let Some(msg) = load_msg.as_ref() {
-                    // Centered white label at ~14px on the dark cosmograph
-                    // background (clear_color is set above the callback).
-                    ui.painter().text(
-                        rect.center(),
-                        egui::Align2::CENTER_CENTER,
-                        msg,
-                        egui::FontId::proportional(14.0),
-                        egui::Color32::WHITE,
-                    );
-                }
-                canvas_rect = Some(rect);
-
-                if let Some(pos) = resp.hover_pos().or_else(|| resp.interact_pointer_pos()) {
-                    if rect.contains(pos) {
-                        pointer_in_canvas = Some(pos);
-                    }
-                }
-
-                if resp.clicked() {
-                    if let Some(pos) = resp.interact_pointer_pos() {
-                        click = Some((rect, pos));
-                    }
-                }
-
-                // LMB / RMB held → cursor force tool. egui's response gives
-                // us drag state for the primary button; secondary is read
-                // from the pointer state.
-                lmb_held = resp.dragged_by(egui::PointerButton::Primary)
-                    || ui.input(|i| {
-                        i.pointer
-                            .button_down(egui::PointerButton::Primary)
-                            && resp.hovered()
-                    });
-                rmb_held = ui.input(|i| {
-                    i.pointer.button_down(egui::PointerButton::Secondary) && resp.hovered()
-                });
-
-                // Apply camera-invert toggles to drag deltas. We only
-                // touch the camera if the user is dragging inside the
-                // canvas, so the sidebar sliders aren't fighting it.
-                if resp.dragged_by(egui::PointerButton::Primary) && !lmb_held {
-                    // (no-op branch — see below; cursor force takes over LMB drag)
-                }
-                if resp.dragged_by(egui::PointerButton::Middle) {
-                    let d = resp.drag_delta();
-                    let mut dx = d.x;
-                    let mut dy = d.y;
-                    if self.state.camera.invert_mouse_x {
-                        dx = -dx;
-                    }
-                    if self.state.camera.invert_mouse_y {
-                        dy = -dy;
-                    }
-                    if let Some(wgpu_state) = frame.wgpu_render_state() {
-                        let mut renderer = wgpu_state.renderer.write();
-                        if let Some(pipes) =
-                            renderer.callback_resources.get_mut::<GraphPipelines>()
-                        {
-                            pipes.camera.rotate_yaw(dx * 0.005);
-                            pipes.camera.rotate_pitch(-dy * 0.005);
-                        }
-                    }
-                }
+                let mut viewer = ui::workspace::WorkspaceViewer { ctx: &mut wctx };
+                egui_dock::DockArea::new(&mut self.state.dock.dock_state)
+                    .show_add_buttons(true)
+                    .show_add_popup(true)
+                    .style(egui_dock::Style::from_egui(ui.style()))
+                    .show_inside(ui, &mut viewer);
             });
+        self.perf.end_stage(StageId::EguiPaint);
+
+        // Drain workspace requests collected during the DockArea pass.
+        for kind in wctx.add_tab_requests.drain(..) {
+            self.state.dock.push_tab(kind);
+        }
+        for req in wctx.split_requests.drain(..) {
+            let new_node =
+                egui_dock::Node::leaf(ui::workspace::Tab::new(req.new_tab));
+            self.state.dock.dock_state.split(
+                (req.surface, req.node),
+                req.split,
+                0.5,
+                new_node,
+            );
+        }
+
+        let click = wctx.click;
+        let canvas_rect = wctx.canvas_rect;
+        let pointer_in_canvas = wctx.pointer_in_canvas;
+        let lmb_held = wctx.lmb_held;
+        let rmb_held = wctx.rmb_held;
 
         self.prev_canvas_rect = canvas_rect;
         self.last_pointer_in_canvas = pointer_in_canvas;
@@ -515,8 +605,33 @@ impl eframe::App for App {
                         idx,
                         id
                     );
+                    self.selected_node_idx = Some(idx);
+                    // UX: surface the inspector if the user clicks a node
+                    // while it's collapsed. They almost certainly want to
+                    // see what they just clicked.
+                    if !self.state.inspector_open {
+                        self.state.inspector_open = true;
+                    }
                     self.kick_off_node_fetch(id);
                 }
+            }
+        }
+
+        // Inspector requested a different selection (clicked a community
+        // sibling or neighbor row). Drive the same path the canvas click
+        // uses: update selected idx + kick the /node/:id fetch.
+        if let Some(idx) = requested_selection.take() {
+            self.selected_node_idx = Some(idx);
+            if !self.state.inspector_open {
+                self.state.inspector_open = true;
+            }
+            if let Some(id) = self.id_for_idx(idx) {
+                log::info!(
+                    "[graph-renderer] inspector selected idx={} id={}",
+                    idx,
+                    id
+                );
+                self.kick_off_node_fetch(id);
             }
         }
 
@@ -531,14 +646,39 @@ impl eframe::App for App {
 
         // ---- Per-frame wiring loops -----------------------------------
         self.kick_off_pending_searches();
+
+        self.perf.begin_stage(StageId::ApplyStyle);
         self.apply_style_to_gpu(frame);
+        self.perf.end_stage(StageId::ApplyStyle);
+
+        self.perf.begin_stage(StageId::LayoutDispatch);
         self.apply_layout_to_gpu(frame);
+        self.perf.end_stage(StageId::LayoutDispatch);
+
+        self.perf.begin_stage(StageId::ApplyEffects);
         self.apply_focus_to_gpu(frame);
         self.apply_camera_to_gpu(frame);
         self.apply_cursor_force(frame);
         self.tick_post_click_cooldown(frame);
+        self.perf.end_stage(StageId::ApplyEffects);
+
+        self.perf.begin_stage(StageId::ApplySelection);
         self.apply_selection(frame);
+        self.perf.end_stage(StageId::ApplySelection);
+
+        self.perf.begin_stage(StageId::RefreshStats);
         self.refresh_stats(frame);
+        self.perf.end_stage(StageId::RefreshStats);
+
+        // Mirror sim/backend metadata into the perf collector for the
+        // Debug section's running/halted badge + backend label.
+        self.perf.last_halted = matches!(
+            self.state.sim_status,
+            ui::state::SimStatus::Settled
+        );
+        if self.perf.last_layout_id != self.state.layout.active {
+            self.perf.last_layout_id = self.state.layout.active.clone();
+        }
 
         // Drive continuous repaint only when something is actually
         // changing frame-to-frame. Otherwise let egui's input-driven
@@ -558,27 +698,22 @@ impl eframe::App for App {
                 || i.pointer.is_moving()
         });
         if needs_continuous {
-            // While the sim is warm (KE well above the halt threshold)
-            // the user can't perceive 60fps of layout shuffle. Throttle
-            // to ~20fps so we waste less GPU on imperceptible frames.
-            // Pointer input bypasses the throttle for snappy interaction.
-            let warm_threshold = self.state.layout.energy_threshold * 5.0;
-            let warm = self.loaded_into_gpu
-                && !sim_settled
-                && self.last_observed_max_ke > warm_threshold
-                && self.cursor_force_active.abs() == 0.0
-                && self.post_click_cooldown_frames == 0
-                && !has_user_input;
-            if warm {
-                ctx.request_repaint_after(std::time::Duration::from_millis(50));
-            } else {
-                ctx.request_repaint();
-            }
+            // Always repaint immediately while the sim or user is active.
+            // The earlier "warm-throttle" (drop to 20fps when KE is high)
+            // saved GPU but the user perceived the throttle on/off
+            // transition as the layout speeding up and slowing down. With
+            // a fixed sim dt + steps_per_call, frame interval changes
+            // translate directly into apparent motion velocity changes.
+            // Constant-cadence repainting is worth the extra GPU cycles.
+            let _ = has_user_input;
+            ctx.request_repaint();
         } else {
             // Light tick so a fresh user action (e.g. an action instance
             // mutating state) isn't held up for an arbitrary time.
             ctx.request_repaint_after(std::time::Duration::from_millis(250));
         }
+
+        self.perf.end_frame(self.last_observed_max_ke);
     }
 }
 
@@ -703,29 +838,22 @@ impl App {
         self.prev_selected_hash = None;
     }
 
+    /// Stable hash of the active layout id + its settings JSON. Drives the
+    /// per-frame change-detect that gates the JSON push to the GPU layout.
     fn layout_key(&self) -> u64 {
-        let l = &self.state.layout;
-        // Bit-pack the slider floats into a hash.
-        let bits = [
-            l.repulsion.to_bits(),
-            l.spring_k.to_bits(),
-            l.spring_len.to_bits(),
-            l.gravity.to_bits(),
-            l.damping.to_bits(),
-            l.dt.to_bits(),
-            l.steps_per_call.to_bits(),
-            l.cooling_alpha.to_bits(),
-            l.cooling_floor.to_bits(),
-            l.energy_threshold.to_bits(),
-            l.repulsion_mode as u32,
-            l.repulsion_samples,
-        ];
-        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-        for b in bits {
-            h ^= b as u64;
-            h = h.wrapping_mul(0x100_0000_01b3);
-        }
-        h
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        let mut h = DefaultHasher::new();
+        self.state.layout.active.hash(&mut h);
+        let json_str = self
+            .state
+            .layout
+            .settings
+            .get(&self.state.layout.active)
+            .and_then(|v| serde_json::to_string(v).ok())
+            .unwrap_or_default();
+        json_str.hash(&mut h);
+        h.finish()
     }
 
     fn apply_layout_to_gpu(&mut self, frame: &mut eframe::Frame) {
@@ -733,41 +861,91 @@ impl App {
             return;
         }
         let key = self.layout_key();
-        if self.prev_layout_key == Some(key) {
+        // A pending Solve must always run (re-roll Random with the same
+        // settings produces the same key), so don't short-circuit on it.
+        let solve_requested = std::mem::take(&mut self.state.layout_solve_requested);
+        if !solve_requested && self.prev_layout_key == Some(key) {
             return;
         }
         let Some(wgpu_state) = frame.wgpu_render_state() else { return };
+
+        let active_id = self.state.layout.active.clone();
+        // Lazy-init the JSON to the active factory's defaults if missing
+        // — fresh state has an empty settings map, and pushing `Null`
+        // into the layout would fail the deserialise on the other side.
+        if !self.state.layout.settings.contains_key(&active_id) {
+            if let Some(factory) = self.layout_registry.get(&active_id) {
+                self.state
+                    .layout
+                    .settings
+                    .insert(active_id.clone(), factory.default_settings());
+            }
+        }
+        // Snapshot the JSON once so we don't borrow `self.state` and the
+        // wgpu renderer at the same time.
+        let json_owned = self
+            .state
+            .layout
+            .settings
+            .get(&active_id)
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+
+        // For the gpu-force backend, derive `repulsion_radius` from the
+        // current `spring_len` exactly the way the legacy path did
+        // (4 * spring_len). Done by round-tripping through GpuForceOptions
+        // so we don't muck with arbitrary backend JSON.
+        let json_owned = if active_id == "gpu-force" {
+            match serde_json::from_value::<GpuForceOptions>(json_owned.clone()) {
+                Ok(mut opts) => {
+                    opts.repulsion_radius = (4.0 * opts.spring_len).max(1.0);
+                    serde_json::to_value(&opts).unwrap_or(json_owned)
+                }
+                Err(_) => json_owned,
+            }
+        } else {
+            json_owned
+        };
+
+        let active_changed = self
+            .prev_active_layout_id
+            .as_deref()
+            .map(|prev| prev != active_id.as_str())
+            .unwrap_or(false);
+
+        let device = wgpu_state.device.clone();
+        let queue = wgpu_state.queue.clone();
         let mut renderer = wgpu_state.renderer.write();
         if let Some(pipes) = renderer.callback_resources.get_mut::<GraphPipelines>() {
-            // Start from existing options so we keep cursor pos / grid_enabled / cooling.
-            let mut opts = pipes.layout_options().unwrap_or_else(GpuForceOptions::default);
-            let l = &self.state.layout;
-            opts.repulsion = l.repulsion;
-            opts.spring_k = l.spring_k;
-            opts.spring_len = l.spring_len;
-            opts.gravity = l.gravity;
-            opts.damping = l.damping;
-            opts.dt = l.dt;
-            opts.steps_per_call = l.steps_per_call.max(1.0) as u32;
-            // Cooling: damping decays toward floor each call so kinetic
-            // energy bleeds off and the layout reaches steady state.
-            opts.cooling_alpha = l.cooling_alpha;
-            opts.cooling_floor = l.cooling_floor;
-            opts.energy_threshold = l.energy_threshold;
-            // Repulsion radius scales with spring_len so the spatial-hash
-            // grid bounds per-pair work to a 27-cell neighborhood.
-            opts.repulsion_radius = (4.0 * l.spring_len).max(1.0);
-            // Map UI enum -> layouts crate enum. Default is Grid until
-            // we benchmark BH/NS on real vaults and flip the default.
-            opts.repulsion_mode = match l.repulsion_mode {
-                crate::ui::state::RepulsionMode::Grid => RepulsionMode::Grid,
-                crate::ui::state::RepulsionMode::BarnesHut => RepulsionMode::BarnesHut,
-                crate::ui::state::RepulsionMode::NegativeSampling => RepulsionMode::NegativeSampling,
-            };
-            opts.repulsion_samples = l.repulsion_samples.max(1);
-            pipes.update_layout_options(opts);
+            if let Some(factory) = self.layout_registry.get(&active_id) {
+                match factory.kind() {
+                    graph_layouts::LayoutKind::Physics => {
+                        if active_changed {
+                            pipes.swap_physics_layout(&device, &queue, factory, &json_owned);
+                        } else {
+                            pipes.set_physics_layout_settings_json(&json_owned);
+                        }
+                    }
+                    graph_layouts::LayoutKind::Static => {
+                        // Solve when the algorithm just changed to a static
+                        // backend, or when the Solve button was pressed.
+                        // Settings-only edits don't auto-solve — the user
+                        // hits Solve to commit them.
+                        if active_changed || solve_requested {
+                            if let Err(e) =
+                                pipes.run_static_solve(&queue, factory, &json_owned)
+                            {
+                                log::warn!(
+                                    "[graph-renderer] run_static_solve: {e}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
         }
         self.prev_layout_key = Some(key);
+        self.prev_active_layout_id = Some(active_id);
     }
 
     fn focus_key(&self) -> u64 {
@@ -1139,6 +1317,14 @@ impl App {
             JumpToSection(sec) => {
                 self.state.active_section = Some(sec);
                 serde_json::json!({ "section": sec.title() })
+            }
+            NewGraphTab => {
+                self.state.dock.push_tab(crate::ui::workspace::TabKind::Graph);
+                serde_json::json!({ "tab": "graph" })
+            }
+            ToggleInspector => {
+                self.state.inspector_open = !self.state.inspector_open;
+                serde_json::json!({ "inspector_open": self.state.inspector_open })
             }
         }
     }

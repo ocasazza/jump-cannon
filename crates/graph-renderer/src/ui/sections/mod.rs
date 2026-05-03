@@ -1,5 +1,6 @@
 pub mod camera;
 pub mod cursor;
+pub mod debug;
 pub mod filter;
 pub mod focus;
 pub mod instances;
@@ -10,8 +11,10 @@ pub mod style;
 use eframe::egui;
 
 use super::actions::ActionRegistry;
+use super::layout::registry::LayoutRegistry;
 use super::state::Section;
 use super::theme;
+use crate::perf::PerfCollector;
 
 /// Section header: uppercase letter-spaced title flanked by thin lines.
 ///
@@ -105,17 +108,20 @@ pub fn show(
     section: Section,
     state: &mut super::state::AppState,
     registry: &mut ActionRegistry,
+    layout_registry: &LayoutRegistry,
+    perf: &PerfCollector,
 ) {
     header(ui, section.title());
     match section {
         Section::Filter => filter::show(ui, state),
         Section::Style => style::show(ui, state),
-        Section::Layout => layout::show(ui, state),
+        Section::Layout => layout::show(ui, state, layout_registry),
         Section::Camera => camera::show(ui, state),
         Section::Focus => focus::show(ui, state),
         Section::Cursor => cursor::show(ui, state),
         Section::Stats => stats::show(ui, state),
         Section::Instances => instances::show(ui, state, registry),
+        Section::Debug => debug::show(ui, state, perf),
     }
     let _ = theme::accent::RED; // keep accent module referenced from here for tooling
 }

@@ -12,12 +12,19 @@
 use std::collections::HashMap;
 
 use eframe::egui;
+use fuzzy_matcher::skim::SkimMatcherV2;
+use fuzzy_matcher::FuzzyMatcher;
 
 use super::actions::{
     Action, ActionParameter, ActionRegistry, ParamValue, ParameterType,
 };
+use super::document_viewer::DocumentViewer;
 use super::state::WorkspaceSettings;
 use super::theme::accent;
+use crate::proto::NodeMeta;
+
+/// Maximum number of file/node matches surfaced under the action list.
+const FILE_MATCH_LIMIT: usize = 50;
 
 #[derive(Debug, Clone, Default)]
 pub struct CommandPaletteState {
@@ -31,6 +38,14 @@ pub struct CommandPaletteState {
     /// Set when a row is clicked mid-render so the outer return path can
     /// surface it after the ScrollArea closure returns.
     pub(crate) activated: Option<PaletteOutcome>,
+    /// File/node id whose preview the palette would like fetched. The host
+    /// (App) drains this every frame, kicks off a `/node/:id` fetch if not
+    /// cached, and writes the result into `preview_cache`.
+    pub pending_preview_id: Option<String>,
+    /// Successful previews keyed by node id.
+    pub preview_cache: HashMap<String, NodeMeta>,
+    /// Failed-fetch ids → error message; lets us avoid re-fetching forever.
+    pub preview_errors: HashMap<String, String>,
 }
 
 impl CommandPaletteState {
@@ -59,6 +74,11 @@ pub enum PaletteOutcome {
         action_id: String,
         params: HashMap<String, ParamValue>,
     },
+    /// User chose a fuzzy-matched vault file/node — host should open the
+    /// node-detail modal for it (existing `/node/:id` flow).
+    OpenNode {
+        id: String,
+    },
 }
 
 pub fn show(
@@ -66,6 +86,7 @@ pub fn show(
     state: &mut CommandPaletteState,
     registry: &mut ActionRegistry,
     workspace: &WorkspaceSettings,
+    nodes: &[String],
 ) -> PaletteOutcome {
     if !state.open {
         return PaletteOutcome::None;
@@ -83,12 +104,17 @@ pub fn show(
 
     let mut outcome = PaletteOutcome::None;
 
+    // Wider window when we'll be showing the file-preview pane.
+    let configuring = registry.configuring.is_some();
+    let two_pane = !configuring && !state.query.trim().is_empty() && !nodes.is_empty();
+    let width = if two_pane { 980.0 } else { 600.0 };
+
     egui::Window::new("command-palette")
         .title_bar(false)
         .resizable(false)
         .collapsible(false)
         .anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, ctx.screen_rect().height() * 0.18))
-        .fixed_size(egui::vec2(600.0, 0.0))
+        .fixed_size(egui::vec2(width, 0.0))
         .frame(
             egui::Frame::none()
                 .fill(egui::Color32::from_rgb(0x10, 0x12, 0x16))
@@ -96,10 +122,10 @@ pub fn show(
                 .inner_margin(egui::Margin::same(0.0)),
         )
         .show(ctx, |ui| {
-            if registry.configuring.is_some() {
+            if configuring {
                 outcome = render_param_form(ui, registry, workspace);
             } else {
-                outcome = render_search(ui, state, registry, workspace);
+                outcome = render_search(ui, state, registry, workspace, nodes);
             }
         });
 
@@ -108,11 +134,81 @@ pub fn show(
 
 // ----- search / list mode --------------------------------------------------
 
+/// One ranked vault node + the byte indices in its id that matched.
+#[derive(Debug, Clone)]
+struct FileMatch {
+    id: String,
+    score: i64,
+    indices: Vec<usize>,
+}
+
+fn rank_files(query: &str, nodes: &[String]) -> Vec<FileMatch> {
+    if query.trim().is_empty() || nodes.is_empty() {
+        return Vec::new();
+    }
+    let matcher = SkimMatcherV2::default().ignore_case();
+    let mut scored: Vec<FileMatch> = nodes
+        .iter()
+        .filter_map(|id| {
+            matcher
+                .fuzzy_indices(id, query)
+                .map(|(score, indices)| FileMatch {
+                    id: id.clone(),
+                    score,
+                    indices,
+                })
+        })
+        .collect();
+    scored.sort_by(|a, b| b.score.cmp(&a.score));
+    scored.truncate(FILE_MATCH_LIMIT);
+    scored
+}
+
+/// Synthesize a previewable "document" from a NodeMeta. We don't yet have
+/// a file-body endpoint (`/node/:id` only returns metadata), so the
+/// document viewer renders the metadata as YAML-ish text. When a body
+/// endpoint lands later, swap this for the body string + extension-derived
+/// language hint and the rest of the palette flow stays unchanged.
+fn preview_text_for(meta: &NodeMeta) -> String {
+    let mut s = String::new();
+    s.push_str(&format!("id:        {}\n", meta.id));
+    s.push_str(&format!("title:     {}\n", meta.title));
+    s.push_str(&format!("path:      {}\n", meta.path));
+    s.push_str(&format!("folder:    {}\n", meta.folder));
+    if let Some(dt) = &meta.doctype {
+        s.push_str(&format!("doctype:   {}\n", dt));
+    }
+    if !meta.tags.is_empty() {
+        s.push_str(&format!("tags:      [{}]\n", meta.tags.join(", ")));
+    }
+    s.push_str("\n# metrics\n");
+    s.push_str(&format!("degree:    {}\n", meta.degree));
+    s.push_str(&format!("indegree:  {}\n", meta.indegree));
+    s.push_str(&format!("outdegree: {}\n", meta.outdegree));
+    s.push_str(&format!("pagerank:  {:.6}\n", meta.pagerank));
+    s.push_str(&format!("kcore:     {}\n", meta.kcore));
+    s.push_str(&format!("community: {}\n", meta.community));
+    s.push_str(&format!("wcc:       {}\n", meta.wcc));
+    if !meta.frontmatter_json.is_empty() && meta.frontmatter_json != "{}" {
+        s.push_str("\n# frontmatter\n");
+        // Pretty-print best-effort.
+        match serde_json::from_str::<serde_json::Value>(&meta.frontmatter_json) {
+            Ok(v) => match serde_json::to_string_pretty(&v) {
+                Ok(pp) => s.push_str(&pp),
+                Err(_) => s.push_str(&meta.frontmatter_json),
+            },
+            Err(_) => s.push_str(&meta.frontmatter_json),
+        }
+    }
+    s
+}
+
 fn render_search(
     ui: &mut egui::Ui,
     state: &mut CommandPaletteState,
     registry: &mut ActionRegistry,
     workspace: &WorkspaceSettings,
+    nodes: &[String],
 ) -> PaletteOutcome {
     // Breadcrumb.
     if !state.breadcrumb.is_empty() {
@@ -140,15 +236,22 @@ fn render_search(
         ui.separator();
     }
 
-    // Search input.
+    // Search input. When the file-preview pane is in play, keep the input
+    // pinned to the left half so the right half is reserved for the preview.
     let input_id = egui::Id::new("command-palette-input");
+    let two_pane = !state.query.trim().is_empty() && !nodes.is_empty();
+    let input_width = if two_pane {
+        (ui.available_width() * 0.5) - 16.0
+    } else {
+        ui.available_width() - 16.0
+    };
     ui.horizontal(|ui| {
         ui.add_space(8.0);
         let resp = ui.add_sized(
-            [ui.available_width() - 8.0, 28.0],
+            [input_width, 28.0],
             egui::TextEdit::singleline(&mut state.query)
                 .id(input_id)
-                .hint_text("Type a command or search…"),
+                .hint_text("Type a command or fuzzy-search vault files…"),
         );
         if state.focus_input {
             resp.request_focus();
@@ -175,6 +278,16 @@ fn render_search(
         scored
     };
 
+    // File / node fuzzy matches (skim, FZF-style). Only on a non-empty
+    // query and only when there's no breadcrumb (drilled-in scopes are
+    // action-only).
+    let file_matches: Vec<FileMatch> = if state.breadcrumb.is_empty() {
+        rank_files(&state.query, nodes)
+    } else {
+        Vec::new()
+    };
+    let total_rows = ranked.len() + file_matches.len();
+
     // Keyboard navigation.
     let key_down = ui.input(|i| i.key_pressed(egui::Key::ArrowDown));
     let key_up = ui.input(|i| i.key_pressed(egui::Key::ArrowUp));
@@ -183,14 +296,14 @@ fn render_search(
     let key_backspace_empty =
         state.query.is_empty() && ui.input(|i| i.key_pressed(egui::Key::Backspace));
 
-    if !ranked.is_empty() {
+    if total_rows > 0 {
         if key_down {
-            state.selected_idx = (state.selected_idx + 1) % ranked.len();
+            state.selected_idx = (state.selected_idx + 1) % total_rows;
         }
         if key_up {
-            state.selected_idx = (state.selected_idx + ranked.len() - 1) % ranked.len();
+            state.selected_idx = (state.selected_idx + total_rows - 1) % total_rows;
         }
-        if state.selected_idx >= ranked.len() {
+        if state.selected_idx >= total_rows {
             state.selected_idx = 0;
         }
     }
@@ -199,9 +312,32 @@ fn render_search(
         state.selected_idx = 0;
     }
 
-    // Tab completes query with selected title.
-    if key_tab && !ranked.is_empty() {
-        state.query = ranked[state.selected_idx].0.title.clone();
+    // Tab completes query with selected title (actions) or file id.
+    if key_tab && total_rows > 0 {
+        if state.selected_idx < ranked.len() {
+            state.query = ranked[state.selected_idx].0.title.clone();
+        } else {
+            state.query = file_matches[state.selected_idx - ranked.len()].id.clone();
+        }
+    }
+
+    // Resolve which file id (if any) is selected for preview, and request a
+    // fetch if its NodeMeta isn't cached yet.
+    let selected_file_id: Option<String> = if state.selected_idx >= ranked.len()
+        && !file_matches.is_empty()
+    {
+        let i = state.selected_idx - ranked.len();
+        file_matches.get(i).map(|f| f.id.clone())
+    } else {
+        None
+    };
+    if let Some(id) = &selected_file_id {
+        if !state.preview_cache.contains_key(id)
+            && !state.preview_errors.contains_key(id)
+            && state.pending_preview_id.as_deref() != Some(id.as_str())
+        {
+            state.pending_preview_id = Some(id.clone());
+        }
     }
 
     // Group root entries by category when the user hasn't typed anything
@@ -209,89 +345,264 @@ fn render_search(
     // `category-section` block).
     let group_by_category = state.breadcrumb.is_empty() && state.query.trim().is_empty();
 
-    // Render list.
+    // Render list (left) + preview (right) when there are file matches.
     ui.add_space(4.0);
-    egui::ScrollArea::vertical()
-        .max_height(ctx_screen_h(ui.ctx()) * 0.6)
-        .show(ui, |ui| {
-            if ranked.is_empty() {
-                ui.add_space(16.0);
-                ui.vertical_centered(|ui| {
-                    ui.label(
-                        egui::RichText::new("No matching actions found")
-                            .color(egui::Color32::GRAY),
-                    );
-                });
-                ui.add_space(16.0);
-                return;
-            }
+    let max_h = ctx_screen_h(ui.ctx()) * 0.6;
+    let total_w = ui.available_width();
+    let two_pane = !file_matches.is_empty();
+    let list_w = if two_pane { (total_w * 0.5).max(280.0) } else { total_w };
 
-            let mut row_idx = 0usize;
-            let render_row = |ui: &mut egui::Ui,
-                              row_idx: &mut usize,
-                              action: &Action,
-                              mi: &MatchInfo,
-                              state: &mut CommandPaletteState,
-                              registry: &mut ActionRegistry,
-                              workspace: &WorkspaceSettings| {
-                let active = *row_idx == state.selected_idx;
-                let resp = render_action_row(ui, action, mi, active);
-                if resp.hovered() {
-                    state.selected_idx = *row_idx;
-                }
-                if resp.clicked() {
-                    let outcome = enter_action(action, state, registry, workspace);
-                    if !matches!(outcome, PaletteOutcome::None) {
-                        state.activated.replace(outcome);
-                    }
-                }
-                *row_idx += 1;
-            };
+    ui.horizontal_top(|ui| {
+        // ----- left: list -----
+        ui.allocate_ui_with_layout(
+            egui::vec2(list_w, max_h),
+            egui::Layout::top_down(egui::Align::Min),
+            |ui| {
+                egui::ScrollArea::vertical()
+                    .id_salt("command-palette-list")
+                    .max_height(max_h)
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        if total_rows == 0 {
+                            ui.add_space(16.0);
+                            ui.vertical_centered(|ui| {
+                                ui.label(
+                                    egui::RichText::new("No matching actions or files")
+                                        .color(egui::Color32::GRAY),
+                                );
+                            });
+                            ui.add_space(16.0);
+                            return;
+                        }
 
-            if group_by_category {
-                // Stable category order from registry; uncategorised last.
-                let mut by_cat: Vec<(String, Vec<(Action, MatchInfo)>)> = Vec::new();
-                let mut uncategorised: Vec<(Action, MatchInfo)> = Vec::new();
-                for (a, mi) in &ranked {
-                    match &a.category {
-                        Some(c) => {
-                            if let Some(slot) = by_cat.iter_mut().find(|(name, _)| name == c) {
-                                slot.1.push((a.clone(), mi.clone()));
+                        let mut row_idx = 0usize;
+
+                        // --- actions ---
+                        if !ranked.is_empty() {
+                            if group_by_category {
+                                // Stable category order; uncategorised last.
+                                let mut by_cat: Vec<(String, Vec<(Action, MatchInfo)>)> =
+                                    Vec::new();
+                                let mut uncategorised: Vec<(Action, MatchInfo)> = Vec::new();
+                                for (a, mi) in &ranked {
+                                    match &a.category {
+                                        Some(c) => {
+                                            if let Some(slot) =
+                                                by_cat.iter_mut().find(|(name, _)| name == c)
+                                            {
+                                                slot.1.push((a.clone(), mi.clone()));
+                                            } else {
+                                                by_cat.push((
+                                                    c.clone(),
+                                                    vec![(a.clone(), mi.clone())],
+                                                ));
+                                            }
+                                        }
+                                        None => uncategorised.push((a.clone(), mi.clone())),
+                                    }
+                                }
+                                for (cat, items) in &by_cat {
+                                    category_header(ui, cat);
+                                    for (a, mi) in items {
+                                        render_action_row_mut(
+                                            ui, &mut row_idx, a, mi, state, registry,
+                                            workspace,
+                                        );
+                                    }
+                                }
+                                if !uncategorised.is_empty() {
+                                    category_header(ui, "Other");
+                                    for (a, mi) in &uncategorised {
+                                        render_action_row_mut(
+                                            ui, &mut row_idx, a, mi, state, registry,
+                                            workspace,
+                                        );
+                                    }
+                                }
                             } else {
-                                by_cat.push((c.clone(), vec![(a.clone(), mi.clone())]));
+                                for (a, mi) in &ranked {
+                                    render_action_row_mut(
+                                        ui, &mut row_idx, a, mi, state, registry, workspace,
+                                    );
+                                }
                             }
                         }
-                        None => uncategorised.push((a.clone(), mi.clone())),
-                    }
-                }
-                for (cat, items) in &by_cat {
-                    category_header(ui, cat);
-                    for (a, mi) in items {
-                        render_row(ui, &mut row_idx, a, mi, state, registry, workspace);
-                    }
-                }
-                if !uncategorised.is_empty() {
-                    category_header(ui, "Other");
-                    for (a, mi) in &uncategorised {
-                        render_row(ui, &mut row_idx, a, mi, state, registry, workspace);
-                    }
-                }
-            } else {
-                for (a, mi) in &ranked {
-                    render_row(ui, &mut row_idx, a, mi, state, registry, workspace);
-                }
-            }
-        });
 
-    if key_enter && !ranked.is_empty() {
-        let action = ranked[state.selected_idx].0.clone();
-        let outcome = enter_action(&action, state, registry, workspace);
-        if !matches!(outcome, PaletteOutcome::None) {
-            return outcome;
+                        // --- file matches (FZF-style: actions first, then files) ---
+                        if !file_matches.is_empty() {
+                            if !ranked.is_empty() {
+                                ui.add_space(2.0);
+                                ui.separator();
+                            }
+                            category_header(ui, "Files / Nodes");
+                            for fm in &file_matches {
+                                let active = row_idx == state.selected_idx;
+                                let resp = render_file_row(ui, fm, active);
+                                if resp.hovered() {
+                                    state.selected_idx = row_idx;
+                                }
+                                if resp.clicked() {
+                                    state
+                                        .activated
+                                        .replace(PaletteOutcome::OpenNode { id: fm.id.clone() });
+                                }
+                                row_idx += 1;
+                            }
+                        }
+                    });
+            },
+        );
+
+        // ----- right: preview pane -----
+        if two_pane {
+            ui.separator();
+            let preview_w = ui.available_width().max(200.0);
+            ui.allocate_ui_with_layout(
+                egui::vec2(preview_w, max_h),
+                egui::Layout::top_down(egui::Align::Min),
+                |ui| {
+                    render_preview_pane(ui, state, &selected_file_id, max_h);
+                },
+            );
+        }
+    });
+
+    if key_enter && total_rows > 0 {
+        if state.selected_idx < ranked.len() {
+            let action = ranked[state.selected_idx].0.clone();
+            let outcome = enter_action(&action, state, registry, workspace);
+            if !matches!(outcome, PaletteOutcome::None) {
+                return outcome;
+            }
+        } else {
+            let i = state.selected_idx - ranked.len();
+            if let Some(fm) = file_matches.get(i) {
+                state.close();
+                return PaletteOutcome::OpenNode { id: fm.id.clone() };
+            }
         }
     }
 
     state.activated.take().unwrap_or(PaletteOutcome::None)
+}
+
+fn render_action_row_mut(
+    ui: &mut egui::Ui,
+    row_idx: &mut usize,
+    action: &Action,
+    mi: &MatchInfo,
+    state: &mut CommandPaletteState,
+    registry: &mut ActionRegistry,
+    workspace: &WorkspaceSettings,
+) {
+    let active = *row_idx == state.selected_idx;
+    let resp = render_action_row(ui, action, mi, active);
+    if resp.hovered() {
+        state.selected_idx = *row_idx;
+    }
+    if resp.clicked() {
+        let outcome = enter_action(action, state, registry, workspace);
+        if !matches!(outcome, PaletteOutcome::None) {
+            state.activated.replace(outcome);
+        }
+    }
+    *row_idx += 1;
+}
+
+fn render_file_row(ui: &mut egui::Ui, fm: &FileMatch, active: bool) -> egui::Response {
+    let bg = if active {
+        egui::Color32::from_rgb(0x22, 0x28, 0x34)
+    } else {
+        egui::Color32::TRANSPARENT
+    };
+    let frame = egui::Frame::none()
+        .fill(bg)
+        .inner_margin(egui::Margin::symmetric(12.0, 6.0));
+    let resp = frame
+        .show(ui, |ui| {
+            // The filename component (last `/`) is the "primary" label,
+            // the rest of the path is the secondary line.
+            let (folder, name) = match fm.id.rsplit_once('/') {
+                Some((dir, n)) => (dir, n),
+                None => ("", fm.id.as_str()),
+            };
+            ui.vertical(|ui| {
+                ui.label(highlighted_path(&fm.id, &fm.indices, name.len()));
+                if !folder.is_empty() {
+                    ui.label(
+                        egui::RichText::new(folder)
+                            .color(egui::Color32::from_gray(120))
+                            .size(10.0),
+                    );
+                }
+            });
+        })
+        .response;
+    resp.interact(egui::Sense::click())
+}
+
+/// Render the full path with skim-match indices highlighted. The `_name_len`
+/// hint isn't used yet but lets future work emphasise the filename portion.
+fn highlighted_path(path: &str, hits: &[usize], _name_len: usize) -> egui::WidgetText {
+    use egui::text::LayoutJob;
+    let mut job = LayoutJob::default();
+    let bytes = path.as_bytes();
+    let mut i = 0usize;
+    let in_hits = |idx: usize| hits.iter().any(|&h| h == idx);
+    while i < bytes.len() {
+        let start = i;
+        let hit_now = in_hits(i);
+        while i < bytes.len() && in_hits(i) == hit_now {
+            i += 1;
+        }
+        let chunk = &path[start..i];
+        let mut fmt = egui::TextFormat::default();
+        fmt.font_id = egui::FontId::monospace(12.0);
+        fmt.color = if hit_now {
+            accent::YELLOW
+        } else {
+            egui::Color32::WHITE
+        };
+        if hit_now {
+            fmt.background = egui::Color32::from_rgba_unmultiplied(0xff, 0xd5, 0x4a, 0x30);
+        }
+        job.append(chunk, 0.0, fmt);
+    }
+    egui::WidgetText::LayoutJob(job)
+}
+
+fn render_preview_pane(
+    ui: &mut egui::Ui,
+    state: &CommandPaletteState,
+    selected_id: &Option<String>,
+    max_h: f32,
+) {
+    let Some(id) = selected_id else {
+        ui.add_space(8.0);
+        ui.weak("(no file selected)");
+        return;
+    };
+    if let Some(err) = state.preview_errors.get(id) {
+        ui.add_space(8.0);
+        ui.colored_label(accent::RED, format!("preview error: {err}"));
+        return;
+    }
+    let Some(meta) = state.preview_cache.get(id) else {
+        ui.add_space(8.0);
+        ui.weak("loading…");
+        return;
+    };
+    let body = preview_text_for(meta);
+    // Match-position highlighting in the preview is reserved for when we
+    // have file bodies; for the metadata fallback, the path on the left
+    // already shows the fuzzy-match hits, so we pass an empty match list.
+    DocumentViewer::new(&body)
+        .language("yaml")
+        .matches(&[])
+        .max_height(max_h)
+        .line_numbers(false)
+        .wrap(false)
+        .show(ui);
 }
 
 fn current_scope<'a>(reg: &'a ActionRegistry, breadcrumb: &[String]) -> Vec<&'a Action> {

@@ -77,7 +77,11 @@ pub enum RepulsionMode {
 }
 
 impl Default for RepulsionMode {
-    fn default() -> Self { RepulsionMode::Grid }
+    // NS is the default: it skips the grid build entirely and operates
+    // directly on GPU positions (the BH path currently builds its octree
+    // from the stale `cpu_positions` mirror — see TODO in
+    // `rebuild_and_upload_octree`). NS is also the cheapest at N ≥ 10k.
+    fn default() -> Self { RepulsionMode::NegativeSampling }
 }
 
 impl RepulsionMode {
@@ -154,20 +158,26 @@ pub struct GpuForceOptions {
 impl Default for GpuForceOptions {
     fn default() -> Self {
         Self {
-            repulsion: 200.0,
-            spring_k: 0.08,
-            spring_len: 30.0,
-            gravity: 0.005,
-            damping: 0.78,
-            dt: 0.04,
+            // Spread-friendly defaults: real Obsidian vaults are big
+            // (10k+ nodes, dense hub clusters) so the sim needs strong
+            // repulsion + long springs to keep communities legible.
+            // repulsion_radius scales with spring_len so the spatial-hash
+            // grid actually exposes the long-range repulsion the layout
+            // needs (4× spring_len = 4 voxels of reach).
+            repulsion: 4000.0,
+            spring_k: 1.0,
+            spring_len: 400.0,
+            gravity: 0.01,
+            damping: 0.90,
+            dt: 0.10,
             cursor_pos: [0.0; 3],
             cursor_radius: 0.0,
             cursor_strength: 0.0,
             steps_per_call: 8,
-            repulsion_radius: 120.0,
-            cooling_alpha: 1.0,
-            cooling_floor: 0.5,
-            energy_threshold: 0.0,
+            repulsion_radius: 1600.0,
+            cooling_alpha: 0.997,
+            cooling_floor: 0.55,
+            energy_threshold: 0.05,
             grid_enabled: true,
             repulsion_mode: RepulsionMode::default(),
             theta: 0.7,
@@ -342,6 +352,15 @@ impl GpuForceLayout {
         self.halted = false;
         self.halt_streak = 0;
         self.steps_since_wake = 0;
+        // Reset effective_damping back to the user's configured `damping`.
+        // Without this, a backend swap / preset apply / cursor poke that
+        // arrives after the sim has cooled to the floor (e.g. 0.55) gets
+        // its fresh velocities crushed within a few steps and the user
+        // sees no movement. Restarting at the configured damping lets the
+        // cooling schedule run from the top again.
+        if let Some(s) = self.state.as_mut() {
+            s.effective_damping = self.options.damping;
+        }
     }
 
     /// True once the sim has been observed below `energy_threshold` for
@@ -2430,6 +2449,16 @@ impl GpuState {
     /// `oct_nodes_buf`. Updates `n_octree_used` so the next params write
     /// reflects the new tree size. Caller should only invoke this when
     /// `repulsion_mode == BarnesHut` to avoid the per-step build cost.
+    ///
+    /// TODO(perf/correctness): `cpu_positions` is only refreshed by the
+    /// legacy `run()` path's blocking readback; the renderer hot path
+    /// (`step_with_encoder`) leaves it at the initial seed. This means
+    /// the BH octree is rebuilt from stale data and forces are computed
+    /// against the seed layout, which causes the sim to settle into a
+    /// degenerate configuration almost immediately. Either (a) move the
+    /// build to GPU (see `shaders/octree.wgsl`) or (b) schedule a periodic
+    /// async readback. Until then BH is not a viable default — see
+    /// `RepulsionMode::default()`.
     fn rebuild_and_upload_octree(
         &mut self,
         queue: &wgpu::Queue,
@@ -2606,5 +2635,72 @@ mod tests {
             for k in 0..3 { if !p[k].is_finite() { all_finite = false; } }
         }
         assert!(all_finite, "BH path produced non-finite positions");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// PhysicsLayout trait impl — registers gpu-force into the layout registry.
+// ---------------------------------------------------------------------------
+
+impl crate::layout::layout_trait::PhysicsLayout for GpuForceLayout {
+    type Settings = GpuForceOptions;
+
+    fn descriptor() -> crate::layout::layout_trait::LayoutDescriptor {
+        crate::layout::layout_trait::LayoutDescriptor {
+            id: "gpu-force",
+            kind: crate::layout::layout_trait::LayoutKind::Physics,
+            display_name: "GPU force-directed",
+            description:
+                "wgpu compute repulsion + spring + gravity (Grid / BH / NS backends)",
+            requirements: crate::layout::layout_trait::LayoutRequirements {
+                needs_edges: true,
+                needs_cpu_positions: false,
+                needs_gpu_positions_buffer: true,
+            },
+        }
+    }
+
+    fn new(settings: Self::Settings) -> Self {
+        GpuForceLayout::new(settings)
+    }
+
+    fn init_with_device(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        graph: &crate::types::Graph,
+        positions_buf: &wgpu::Buffer,
+    ) -> Result<(), String> {
+        GpuForceLayout::init_with_device(self, device, queue, graph, positions_buf)
+    }
+
+    fn step_with_encoder(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        positions_buf: &wgpu::Buffer,
+    ) {
+        GpuForceLayout::step_with_encoder(self, device, queue, encoder, positions_buf)
+    }
+
+    fn set_settings(&mut self, settings: Self::Settings) {
+        self.set_options(settings)
+    }
+
+    fn settings(&self) -> &Self::Settings {
+        self.options()
+    }
+
+    fn is_halted(&self) -> bool {
+        GpuForceLayout::is_halted(self)
+    }
+
+    fn last_max_ke(&self) -> f32 {
+        GpuForceLayout::last_max_ke(self)
+    }
+
+    fn wake(&mut self) {
+        GpuForceLayout::wake(self)
     }
 }

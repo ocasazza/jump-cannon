@@ -10,6 +10,12 @@ use layout::LayoutEngine;
 pub use types::{Graph, Node, Edge, Id, MetadataValue, LayoutOptions};
 pub use layout::algorithms::fcose::{FcoseLayoutEngine, FcoseOptions};
 pub use layout::algorithms::gpu_force::{GpuForceLayout, GpuForceOptions, RepulsionMode};
+pub use layout::algorithms::random::{RandomLayout, RandomSettings};
+pub use layout::algorithms::circle::{CircleAxis, CircleLayout, CircleSettings};
+pub use layout::layout_trait::{
+    BoxedPhysics, BoxedStatic, DynPhysicsLayout, DynStaticLayout, LayoutDescriptor, LayoutId,
+    LayoutKind, LayoutRequirements, LayoutSettings, PhysicsLayout, StaticLayout,
+};
 pub use layout::coarsen::{coarsen, prolong, warmup_positions, CoarseLevel, Coarsening};
 pub use benchmark::{run_benchmark, run_all_benchmarks};
 use file_parsers::parse_graph_file;
