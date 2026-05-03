@@ -228,22 +228,31 @@ impl LayoutPreset {
 /// Repulsion backend mirror of `graph_layouts::RepulsionMode`. Lives in
 /// the UI state so it persists across sessions and so the UI doesn't have
 /// to depend on the layouts crate's enum directly.
+///
+///   * **Grid** — uniform 3D voxel hash, 27-cell stencil. Default.
+///   * **BarnesHut** — GPU octree + θ-criterion approximation. Best for
+///     clustered graphs (Obsidian-style hub neighborhoods) at N ≥ 50k.
+///   * **NegativeSampling** — DRGraph-style stochastic O(n·K) repulsion.
+///     Skips spatial structure entirely; pairs with multilevel coarsening.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
-pub enum RepulsionBackend {
+pub enum RepulsionMode {
     #[default]
     Grid,
     BarnesHut,
+    NegativeSampling,
 }
 
-impl RepulsionBackend {
-    pub const ALL: &'static [RepulsionBackend] = &[
-        RepulsionBackend::Grid,
-        RepulsionBackend::BarnesHut,
+impl RepulsionMode {
+    pub const ALL: &'static [RepulsionMode] = &[
+        RepulsionMode::Grid,
+        RepulsionMode::BarnesHut,
+        RepulsionMode::NegativeSampling,
     ];
     pub fn label(self) -> &'static str {
         match self {
-            RepulsionBackend::Grid => "Grid (27-cell)",
-            RepulsionBackend::BarnesHut => "Barnes-Hut",
+            RepulsionMode::Grid => "Grid (27-cell)",
+            RepulsionMode::BarnesHut => "Barnes-Hut",
+            RepulsionMode::NegativeSampling => "Negative sampling",
         }
     }
 }
@@ -275,12 +284,18 @@ pub struct LayoutState {
     /// graphs (Obsidian-style hub neighborhoods) where the 27-cell grid
     /// degenerates into hundreds of pairs per voxel.
     #[serde(default)]
-    pub repulsion_mode: RepulsionBackend,
+    pub repulsion_mode: RepulsionMode,
+    /// K — number of negative samples per node per step. Only consulted
+    /// when `repulsion_mode == NegativeSampling`. DRGraph reports good
+    /// quality at K in [5, 20]; default 8.
+    #[serde(default = "default_repulsion_samples")]
+    pub repulsion_samples: u32,
 }
 
 fn default_cooling_alpha() -> f32 { 0.998 }
 fn default_cooling_floor() -> f32 { 0.55 }
 fn default_energy_threshold() -> f32 { 0.05 }
+fn default_repulsion_samples() -> u32 { 8 }
 
 impl Default for LayoutState {
     fn default() -> Self {
@@ -302,7 +317,8 @@ impl Default for LayoutState {
             cooling_alpha: 0.997,    // slow cool — give it time
             cooling_floor: 0.55,
             energy_threshold: 0.05,  // hold off on halting until truly settled
-            repulsion_mode: RepulsionBackend::default(),
+            repulsion_mode: RepulsionMode::default(),
+            repulsion_samples: 8,
         }
     }
 }

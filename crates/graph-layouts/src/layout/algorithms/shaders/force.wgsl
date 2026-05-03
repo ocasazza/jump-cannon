@@ -47,18 +47,23 @@ struct SimParams {
     grid_origin: vec3<f32>,
     n_cells: u32,
     grid_dim: vec3<u32>,
-    // Repulsion backend: 0 = grid (legacy 27-cell), 1 = Barnes-Hut octree.
+    // Repulsion backend: 0 = grid (27-cell stencil), 1 = Barnes-Hut
+    // octree, 2 = negative-sampling (DRGraph-style).
     // Default 0; toggled per-frame via the host uniform.
     repulsion_mode: u32,
     // Barnes-Hut acceptance criterion. Borderline at θ≈0.7 — see
-    // Burtscher & Pingali 2011 §4.5. Compile-time constant in v1; will
-    // become a slider in v2 once we benchmark on real vaults.
+    // Burtscher & Pingali 2011 §4.5.
     bh_theta: f32,
-    // Number of populated octree slots (≤ 2N). Traversal halts when
-    // `next_idx == OCT_END`, so this is informational; sizing is driven
-    // by the host buffer length.
+    // Number of populated octree slots (≤ 2N). Only meaningful under
+    // BarnesHut mode.
     n_octree: u32,
-    _pad0: u32,
+    // K — random samples per node per step. Only consulted when
+    // repulsion_mode == 2.
+    repulsion_samples: u32,
+    // Monotonic dispatch counter — PRNG seed component for negative
+    // sampling. Mixed with node index to give each (i, step) a
+    // distinct K-set without per-node state.
+    step_index: u32,
 };
 
 @group(0) @binding(0) var<storage, read>       positions_in:    array<vec3<f32>>;
@@ -168,6 +173,16 @@ fn scatter_cells(@builtin(global_invocation_id) gid: vec3<u32>) {
     gb_cell_nodes[gb_cell_offsets[cell] + slot] = i;
 }
 
+// PCG output hash (pcg-random.org). One mul + xorshift — stateless,
+// deterministic, well-distributed. Used by the negative-sampling
+// repulsion path so consecutive (node_idx, iter, step_index) triples
+// don't correlate.
+fn pcg_hash(state: u32) -> u32 {
+    let s = state * 747796405u + 2891336453u;
+    let word = ((s >> ((s >> 28u) + 4u)) ^ s) * 277803737u;
+    return (word >> 22u) ^ word;
+}
+
 @compute @workgroup_size(64)
 fn force_step(@builtin(global_invocation_id) gid: vec3<u32>) {
     let i = gid.x;
@@ -234,6 +249,32 @@ fn force_step(@builtin(global_invocation_id) gid: vec3<u32>) {
             } else {
                 idx = n.links.y; // descend into first child
             }
+        }
+    } else if (params.repulsion_mode == 2u) {
+        // Stochastic negative sampling (DRGraph / UMAP-style). Each node
+        // samples K random others per step instead of visiting spatial
+        // neighbors. Skips the entire grid build (no atomics, no 27-cell
+        // loop). Higher per-step variance, but per-iter is ~3-5× cheaper
+        // at N>=10k. arxiv.org/abs/2008.07799
+        let k = params.repulsion_samples;
+        // Mix node index with step counter so the same node samples a
+        // different K-set every step — avoids systematic bias toward any
+        // particular pair across the run.
+        let base = i * 0x9E3779B9u + params.step_index * 0x85EBCA6Bu;
+        for (var iter: u32 = 0u; iter < k; iter = iter + 1u) {
+            let h = pcg_hash(base + iter);
+            // Modulo bias is fine — n_nodes is small relative to 2^32 and
+            // unbiased sampling would cost a rejection loop for no
+            // measurable layout-quality difference.
+            let j = h % params.n_nodes;
+            if (j == i) { continue; }
+            let d = pos - positions_in[j];
+            let dist2 = dot(d, d);
+            if (dist2 > r_clip2) { continue; }
+            let dist2c = max(dist2, 0.01);
+            // Same mass-weighted Coulomb form as the grid path so layout
+            // quality is comparable; only the *set* of j's changes.
+            force = force + d * (params.repulsion * mass[j] / dist2c);
         }
     } else if (params.grid_enabled == 1u) {
         // Walk 27 neighbor cells.

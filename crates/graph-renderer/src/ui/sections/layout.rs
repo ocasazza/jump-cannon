@@ -1,6 +1,6 @@
 use eframe::egui;
 
-use crate::ui::state::{AppState, LayoutPreset, RepulsionBackend};
+use crate::ui::state::{AppState, LayoutPreset, RepulsionMode};
 use crate::ui::theme::accent;
 
 use super::{hint_label, subgroup_label, subgroup_separator};
@@ -78,13 +78,21 @@ pub fn show(ui: &mut egui::Ui, state: &mut AppState) {
     subgroup_separator(ui);
 
     // Repulsion backend toggle. Default Grid; BarnesHut wins on
-    // clustered graphs at scale. See gpu_force.rs::RepulsionMode.
+    // clustered graphs ≥50k; NegativeSampling skips spatial structure
+    // entirely (best paired with multilevel coarsening).
     subgroup_label(ui, "Repulsion backend");
-    hint_label(ui, "BH wins on clustered N≥50k; Grid otherwise");
+    hint_label(ui, "Grid: dense small; BH: clustered; NS: huge");
     ui.add_space(4.0);
-    ui.horizontal(|ui| {
-        for mode in RepulsionBackend::ALL {
-            ui.selectable_value(&mut l.repulsion_mode, *mode, mode.label());
-        }
-    });
+    egui::ComboBox::from_id_salt("repulsion-mode")
+        .selected_text(l.repulsion_mode.label())
+        .show_ui(ui, |ui| {
+            for mode in RepulsionMode::ALL {
+                ui.selectable_value(&mut l.repulsion_mode, *mode, mode.label());
+            }
+        });
+    if matches!(l.repulsion_mode, RepulsionMode::NegativeSampling) {
+        ui.add_space(4.0);
+        // K — DRGraph reports good convergence at K in [5, 20]; default 8.
+        ui.add(egui::Slider::new(&mut l.repulsion_samples, 1..=32).text("K samples"));
+    }
 }

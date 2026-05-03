@@ -718,6 +718,7 @@ impl App {
             l.cooling_floor.to_bits(),
             l.energy_threshold.to_bits(),
             l.repulsion_mode as u32,
+            l.repulsion_samples,
         ];
         let mut h: u64 = 0xcbf2_9ce4_8422_2325;
         for b in bits {
@@ -757,11 +758,13 @@ impl App {
             // grid bounds per-pair work to a 27-cell neighborhood.
             opts.repulsion_radius = (4.0 * l.spring_len).max(1.0);
             // Map UI enum -> layouts crate enum. Default is Grid until
-            // we benchmark BH on real vaults and flip the default.
+            // we benchmark BH/NS on real vaults and flip the default.
             opts.repulsion_mode = match l.repulsion_mode {
-                crate::ui::state::RepulsionBackend::Grid => RepulsionMode::Grid,
-                crate::ui::state::RepulsionBackend::BarnesHut => RepulsionMode::BarnesHut,
+                crate::ui::state::RepulsionMode::Grid => RepulsionMode::Grid,
+                crate::ui::state::RepulsionMode::BarnesHut => RepulsionMode::BarnesHut,
+                crate::ui::state::RepulsionMode::NegativeSampling => RepulsionMode::NegativeSampling,
             };
+            opts.repulsion_samples = l.repulsion_samples.max(1);
             pipes.update_layout_options(opts);
         }
         self.prev_layout_key = Some(key);

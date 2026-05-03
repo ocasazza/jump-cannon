@@ -68,6 +68,12 @@ impl Default for EnergyReadback {
 pub enum RepulsionMode {
     Grid,
     BarnesHut,
+    /// DRGraph-style stochastic repulsion: each node samples K random
+    /// others per step instead of visiting spatial neighbors. Skips the
+    /// grid build entirely → ~3-5× cheaper per step at N ≥ 10k. Higher
+    /// per-step variance, converges in ~2× the iterations, but per-iter
+    /// is so much cheaper that wall time wins. arxiv.org/abs/2008.07799
+    NegativeSampling,
 }
 
 impl Default for RepulsionMode {
@@ -76,16 +82,25 @@ impl Default for RepulsionMode {
 
 impl RepulsionMode {
     fn as_u32(self) -> u32 {
-        match self { RepulsionMode::Grid => 0, RepulsionMode::BarnesHut => 1 }
+        match self {
+            RepulsionMode::Grid => 0,
+            RepulsionMode::BarnesHut => 1,
+            RepulsionMode::NegativeSampling => 2,
+        }
     }
     fn from_str(s: &str) -> Self {
         match s.to_ascii_lowercase().as_str() {
             "barneshut" | "barnes_hut" | "bh" => RepulsionMode::BarnesHut,
+            "negativesampling" | "negative_sampling" | "ns" => RepulsionMode::NegativeSampling,
             _ => RepulsionMode::Grid,
         }
     }
     fn to_str(self) -> &'static str {
-        match self { RepulsionMode::Grid => "grid", RepulsionMode::BarnesHut => "barnes_hut" }
+        match self {
+            RepulsionMode::Grid => "grid",
+            RepulsionMode::BarnesHut => "barnes_hut",
+            RepulsionMode::NegativeSampling => "negative_sampling",
+        }
     }
 }
 
@@ -131,6 +146,9 @@ pub struct GpuForceOptions {
     /// body when (cell_size / dist) < theta. 0.5..1.0 is the useful
     /// range; 0.7 is a common sweet spot per Burtscher & Pingali 2011.
     pub theta: f32,
+    /// K — random samples per node per step under `NegativeSampling`.
+    /// DRGraph reports good convergence at K in [5, 20]; default 8.
+    pub repulsion_samples: u32,
 }
 
 impl Default for GpuForceOptions {
@@ -153,6 +171,7 @@ impl Default for GpuForceOptions {
             grid_enabled: true,
             repulsion_mode: RepulsionMode::default(),
             theta: 0.7,
+            repulsion_samples: 8,
         }
     }
 }
@@ -163,7 +182,7 @@ impl Default for GpuForceOptions {
 impl serde::Serialize for GpuForceOptions {
     fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeStruct;
-        let mut st = s.serialize_struct("GpuForceOptions", 17)?;
+        let mut st = s.serialize_struct("GpuForceOptions", 18)?;
         st.serialize_field("repulsion", &self.repulsion)?;
         st.serialize_field("spring_k", &self.spring_k)?;
         st.serialize_field("spring_len", &self.spring_len)?;
@@ -181,6 +200,7 @@ impl serde::Serialize for GpuForceOptions {
         st.serialize_field("grid_enabled", &self.grid_enabled)?;
         st.serialize_field("repulsion_mode", self.repulsion_mode.to_str())?;
         st.serialize_field("theta", &self.theta)?;
+        st.serialize_field("repulsion_samples", &self.repulsion_samples)?;
         st.end()
     }
 }
@@ -223,6 +243,8 @@ impl<'de> serde::Deserialize<'de> for GpuForceOptions {
             repulsion_mode: Option<String>,
             #[serde(default)]
             theta: Option<f32>,
+            #[serde(default)]
+            repulsion_samples: Option<u32>,
         }
         let r = Raw::deserialize(d)?;
         let def = GpuForceOptions::default();
@@ -247,6 +269,7 @@ impl<'de> serde::Deserialize<'de> for GpuForceOptions {
                 .map(RepulsionMode::from_str)
                 .unwrap_or(def.repulsion_mode),
             theta: r.theta.unwrap_or(def.theta),
+            repulsion_samples: r.repulsion_samples.unwrap_or(def.repulsion_samples),
         })
     }
 }
@@ -275,6 +298,9 @@ pub struct GpuForceLayout {
     steps_since_wake: u32,
     /// Most recent max-KE reduction value (for diagnostics / stats UI).
     last_max_ke: f32,
+    /// Monotonic dispatch counter — fed into the WGSL PRNG seed so each
+    /// step picks a different K-set under negative sampling. Wraps fine.
+    step_index: u32,
 }
 
 /// How many consecutive low-KE readbacks we require before halting. With
@@ -297,6 +323,7 @@ impl GpuForceLayout {
             halt_streak: 0,
             steps_since_wake: 0,
             last_max_ke: 0.0,
+            step_index: 0,
         }
     }
 
@@ -401,21 +428,27 @@ impl GpuForceLayout {
         let floor = self.options.cooling_floor.clamp(0.0, 1.0);
         state.effective_damping = (state.effective_damping * alpha).max(floor.min(self.options.damping));
 
-        state.rebuild_and_upload_grid(&od.device, &od.queue, &self.options);
+        // Negative sampling skips the grid build entirely (no bbox, no
+        // bucket sort). That elision is the headline cost win.
+        let use_grid = matches!(self.options.repulsion_mode, RepulsionMode::Grid)
+            && self.options.grid_enabled;
+        if use_grid {
+            state.rebuild_and_upload_grid(&od.device, &od.queue, &self.options);
+        }
         if matches!(self.options.repulsion_mode, RepulsionMode::BarnesHut) {
             state.rebuild_and_upload_octree(&od.queue);
         } else {
             state.n_octree_used = 0;
         }
-        state.write_params(&od.queue, &self.options);
         let mut steps_done = 0u32;
         let total_steps = self.options.steps_per_call.max(1);
         for s in 0..total_steps {
-            // Build the grid only on the first step (matches borrowed path's
-            // "build once per call" cadence) and only if grid is enabled.
-            let build_grid = s == 0
-                && self.options.grid_enabled
-                && !matches!(self.options.repulsion_mode, RepulsionMode::BarnesHut);
+            // Re-write params per step so step_index advances under
+            // negative sampling (the WGSL PRNG keys off it). Grid path
+            // ignores step_index but the write is cheap.
+            state.write_params(&od.queue, &self.options, self.step_index);
+            self.step_index = self.step_index.wrapping_add(1);
+            let build_grid = s == 0 && use_grid;
             state.dispatch_step_direct(&od.device, &od.queue, build_grid);
             state.swap_position_buffers();
             steps_done += 1;
@@ -541,7 +574,13 @@ impl GpuForceLayout {
         let floor = self.options.cooling_floor.clamp(0.0, 1.0);
         state.effective_damping = (state.effective_damping * alpha).max(floor.min(self.options.damping));
 
-        state.rebuild_and_upload_grid(device, queue, &self.options);
+        // Negative sampling skips the grid + bucket sort entirely (no
+        // bbox, no atomics phase). That elision is the cost win.
+        let use_grid = matches!(self.options.repulsion_mode, RepulsionMode::Grid)
+            && self.options.grid_enabled;
+        if use_grid {
+            state.rebuild_and_upload_grid(device, queue, &self.options);
+        }
         // Build the BH octree CPU-side once per call (matches the grid's
         // "build once per call" cadence). The shader sees a freshly-uploaded
         // tree in `oct_nodes_buf` and `params.n_octree`. v2 will move this
@@ -551,20 +590,28 @@ impl GpuForceLayout {
         } else {
             state.n_octree_used = 0;
         }
-        state.write_params(queue, &self.options);
-        // GPU-side bucket sort of positions into spatial-hash cells. Done
-        // once per call (not per step), reading from whichever buffer is
-        // currently the "in" side of the ping-pong.
-        if self.options.grid_enabled
-            && !matches!(self.options.repulsion_mode, RepulsionMode::BarnesHut)
-        {
+        // First write_params with the *current* step_index — re-written
+        // per inner step below so the WGSL PRNG advances under negative
+        // sampling.
+        state.write_params(queue, &self.options, self.step_index);
+        if use_grid {
+            // GPU-side bucket sort of positions into spatial-hash cells.
+            // Done once per call (not per step), reading from whichever
+            // buffer is currently the "in" side of the ping-pong.
             state.encode_grid_build_borrowed(device, encoder, shared_buffer);
         }
         let steps = self.options.steps_per_call.max(1);
-        for _ in 0..steps {
+        for step_i in 0..steps {
+            if step_i > 0 {
+                self.step_index = self.step_index.wrapping_add(1);
+                state.write_params(queue, &self.options, self.step_index);
+            }
             state.dispatch_borrowed_step(device, encoder, shared_buffer);
             state.swap_position_buffers();
         }
+        // Bump once more so the next call's first step also gets a fresh
+        // seed (otherwise calls 1 and 2 would replay the same step_index).
+        self.step_index = self.step_index.wrapping_add(1);
         self.steps_since_wake = self.steps_since_wake.saturating_add(steps);
         // Make sure the shared (external/borrowed) buffer ends up holding
         // the latest result. Convention:
@@ -658,7 +705,8 @@ struct SimParamsRaw {
 
     bh_theta: f32,
     n_octree: u32,
-    _pad0: [u32; 2],
+    repulsion_samples: u32,   // K — only consulted when repulsion_mode == 2.
+    step_index: u32,          // PRNG seed component for negative sampling.
 }
 
 // Each vec3<f32> in a storage buffer occupies 16 bytes (vec3 has stride/align
@@ -1277,7 +1325,7 @@ impl GpuState {
         queue.write_buffer(shared, 0, bytemuck::cast_slice(&self.initial_positions));
     }
 
-    fn write_params(&self, queue: &wgpu::Queue, opts: &GpuForceOptions) {
+    fn write_params(&self, queue: &wgpu::Queue, opts: &GpuForceOptions, step_index: u32) {
         let raw = SimParamsRaw {
             repulsion: opts.repulsion,
             spring_k: opts.spring_k,
@@ -1299,7 +1347,8 @@ impl GpuState {
             repulsion_mode: opts.repulsion_mode.as_u32(),
             bh_theta: opts.theta.clamp(0.1, 2.0),
             n_octree: self.n_octree_used,
-            _pad0: [0, 0],
+            repulsion_samples: opts.repulsion_samples.max(1),
+            step_index,
         };
         queue.write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&raw));
     }
