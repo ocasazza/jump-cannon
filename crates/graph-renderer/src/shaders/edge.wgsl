@@ -41,7 +41,7 @@ struct EffectsUniform {
     edge_color:            vec4<f32>,
     edge_min_transparency: f32,
     edge_width:            f32,   // pixels — fat-line half-width × 2
-    _pad1:                 f32,
+    edge_fade_floor:       f32,   // long-distance asymptotic alpha floor
     _pad2:                 f32,
 };
 
@@ -49,12 +49,19 @@ struct EffectsUniform {
 @group(0) @binding(1) var<uniform> effects: EffectsUniform;
 @group(0) @binding(2) var<storage, read> positions: array<vec3<f32>>;
 @group(0) @binding(3) var<storage, read> edges:     array<vec2<u32>>;
+// Per-node focus dim factor (1.0 = in focus set / no focus active).
+// Edge alpha is multiplied by a function of (dim_src, dim_tgt):
+//   both 1.0          → 1.0   (full)
+//   exactly one 1.0   → 0.6   (mid)
+//   neither           → 0.15  (dim)
+@group(0) @binding(4) var<storage, read> dim_alpha: array<f32>;
 
 struct VertexOutput {
     @builtin(position) clip_pos:   vec4<f32>,
     @location(0)       world_z:    f32,
     @location(1)       edge_len:   f32,
     @location(2)       coc:        f32,
+    @location(3)       focus_mul:  f32,
 };
 
 @vertex
@@ -72,25 +79,26 @@ fn vs_main(@builtin(vertex_index) vid: u32) -> VertexOutput {
     let p     = select(p_src, p_tgt, endpoint);
     let edge_len = length(p_tgt - p_src);
 
-    var out: VertexOutput;
-
-    // LOD cull: at very long edge lengths the alpha-fade curve has settled
-    // to its floor (`edge_min_transparency * edge_alpha_mul * color.a`) —
-    // if that combined alpha falls below ~2 % the edge is invisible and
-    // we just pay rasterization + alpha-blend ROP for nothing. Push the
-    // endpoints outside the clip volume so the rasterizer drops the line.
-    let floor_alpha = effects.edge_color.a
-                    * effects.edge_alpha_mul
-                    * effects.edge_min_transparency;
-    let cull_thresh = effects.edge_dist_max * 4.0;
-    if ((floor_alpha < 0.02 && edge_len > effects.edge_dist_max)
-        || edge_len > cull_thresh) {
-        out.clip_pos = vec4<f32>(2.0, 2.0, 2.0, 1.0);
-        out.world_z  = 0.0;
-        out.edge_len = edge_len;
-        out.coc      = 0.0;
-        return out;
+    // Focus-set membership combinator (per spec). 1.0 sentinel = "in set".
+    let d_s = dim_alpha[edge.x];
+    let d_t = dim_alpha[edge.y];
+    let s_in = d_s >= 0.999;
+    let t_in = d_t >= 0.999;
+    var focus_mul: f32 = 1.0;
+    if (s_in && t_in) {
+        focus_mul = 1.0;
+    } else if (s_in || t_in) {
+        focus_mul = 0.6;
+    } else {
+        focus_mul = min(d_s, d_t);
     }
+
+    var out: VertexOutput;
+    out.focus_mul = focus_mul;
+
+    // No hard distance cull: long edges fade asymptotically toward
+    // `edge_fade_floor` in the fragment shader. Hard culls produced
+    // visible popping when nodes drifted across the boundary mid-sim.
 
     // CoC computation only runs when DoF is engaged (focus_thickness <
     // 1e6 sentinel). Skipping saves a mat-vec + a handful of scalar ops
@@ -113,9 +121,16 @@ fn vs_main(@builtin(vertex_index) vid: u32) -> VertexOutput {
     let clip_tgt = camera.view_proj * vec4<f32>(p_tgt, 1.0);
     let clip_p   = select(clip_src, clip_tgt, endpoint);
 
-    // To NDC for the screen-space perpendicular calc.
-    let ndc_src = clip_src.xy / max(clip_src.w, 1e-4);
-    let ndc_tgt = clip_tgt.xy / max(clip_tgt.w, 1e-4);
+    // To NDC for the screen-space perpendicular calc. If either endpoint
+    // sits at or behind the camera (clip.w ≤ 0) the perspective divide
+    // flips signs and the perpendicular spins, producing a single-frame
+    // flash across the screen. Guard with a positive-w clamp and zero the
+    // expansion when both endpoints are degenerate.
+    let w_src = max(clip_src.w, 1e-3);
+    let w_tgt = max(clip_tgt.w, 1e-3);
+    let w_p   = max(clip_p.w,   1e-3);
+    let ndc_src = clip_src.xy / w_src;
+    let ndc_tgt = clip_tgt.xy / w_tgt;
     var dir = ndc_tgt - ndc_src;
     let dlen = max(length(dir), 1e-4);
     dir = dir / dlen;
@@ -131,10 +146,14 @@ fn vs_main(@builtin(vertex_index) vid: u32) -> VertexOutput {
     );
     let signed = select(-1.0, 1.0, side);
     let offset_ndc = perp * vec2<f32>(half_w_ndc.x * aspect, half_w_ndc.y) * signed;
+    // Skip the expansion when the projected vertex is at/behind the
+    // camera — keeps the geometry stable instead of flicker-large.
+    let w_ok = (clip_src.w > 0.0) && (clip_tgt.w > 0.0) && (clip_p.w > 0.0);
+    let off_xy = select(vec2<f32>(0.0, 0.0), offset_ndc, w_ok);
     // Re-multiply by w so perspective interpolation stays correct.
     let clip_offset = vec4<f32>(
-        offset_ndc.x * clip_p.w,
-        offset_ndc.y * clip_p.w,
+        off_xy.x * w_p,
+        off_xy.y * w_p,
         0.0,
         0.0,
     );
@@ -148,21 +167,50 @@ fn vs_main(@builtin(vertex_index) vid: u32) -> VertexOutput {
 
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
-    // Cosmograph linkVisibilityDistanceRange: short edges fully visible,
-    // long edges fade toward edge_min_transparency (never disappearing
-    // entirely — they keep building density on the dark background).
-    let span = max(effects.edge_dist_max - effects.edge_dist_min, 0.001);
-    let t = clamp((in.edge_len - effects.edge_dist_min) / span, 0.0, 1.0);
-    let visibility = mix(1.0, effects.edge_min_transparency, t);
+    // Two-stage continuous fade — no hard cull, no popping.
+    //
+    //   stage 1: edge_len in [dist_min, dist_max]
+    //            visibility goes 1.0 → edge_min_transparency linearly.
+    //   stage 2: edge_len in [dist_max, dist_max * 5]
+    //            smoothstep-fades from edge_min_transparency down to
+    //            edge_fade_floor (an absolute, non-zero floor, e.g.
+    //            0.02 of color.a). C¹-continuous at dist_max.
+    //   stage 3: edge_len > dist_max * 5
+    //            asymptotic 1/(1+x) tail toward edge_fade_floor —
+    //            never reaches zero, never discontinuous.
+    let dist_min = effects.edge_dist_min;
+    let dist_max = effects.edge_dist_max;
+    let span1 = max(dist_max - dist_min, 0.001);
+    let t1 = clamp((in.edge_len - dist_min) / span1, 0.0, 1.0);
+    let near_vis = mix(1.0, effects.edge_min_transparency, t1);
+
+    let span2 = max(dist_max * 4.0, 0.001); // 4× run after dist_max
+    let t2 = clamp((in.edge_len - dist_max) / span2, 0.0, 1.0);
+    let s2 = t2 * t2 * (3.0 - 2.0 * t2); // smoothstep
+    let mid_vis = mix(effects.edge_min_transparency, effects.edge_fade_floor, s2);
+
+    // Asymptotic tail: ratio r ∈ [0, ∞) past the 5× boundary.
+    let tail_start = dist_max * 5.0;
+    let r = max((in.edge_len - tail_start) / max(dist_max, 0.001), 0.0);
+    // 1/(1+r) shrinks from 1 → 0; remap so we approach edge_fade_floor.
+    let tail_factor = 1.0 / (1.0 + r);
+    let tail_vis = effects.edge_fade_floor * tail_factor
+                 + effects.edge_fade_floor * (1.0 - tail_factor) * 0.5;
+
+    // Pick the active stage without branching.
+    let in_near = f32(in.edge_len <= dist_max);
+    let in_mid  = f32((in.edge_len > dist_max) && (in.edge_len <= tail_start));
+    let in_tail = f32(in.edge_len > tail_start);
+    let visibility = in_near * near_vis + in_mid * mid_vis + in_tail * tail_vis;
 
     // CoC fade — out-of-focus edges still drop alpha when DoF is engaged.
     let focus_atten = 1.0 / (1.0 + in.coc * 0.05);
 
     let alpha = effects.edge_color.a * effects.edge_alpha_mul
-              * visibility * focus_atten;
-    // Skip near-invisible fragments — saves alpha-blend ROP cost on dense
-    // overdrawn edge bundles. Threshold is chosen well below visible.
-    if (alpha < 0.02) {
+              * visibility * focus_atten * in.focus_mul;
+    // Threshold is below perceptual range — kept only to skip pure-zero
+    // ROP work, NOT to hide long edges. No popping at this level.
+    if (alpha < 1.0e-4) {
         discard;
     }
     return vec4<f32>(effects.edge_color.rgb, alpha);

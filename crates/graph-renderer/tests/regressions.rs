@@ -25,6 +25,7 @@ use egui_kittest::kittest::Queryable;
 
 use graph_renderer::perf::PerfCollector;
 use graph_renderer::ui::actions::ActionRegistry;
+use graph_renderer::ui::focus_set::{self, FocusCtx, FocusMode};
 use graph_renderer::ui::inspector::{self, InspectorData};
 use graph_renderer::ui::layout::registry::LayoutRegistry;
 use graph_renderer::ui::sections::{self, reset_row};
@@ -268,5 +269,34 @@ fn reset_row_button_clickable() {
         clicked.get(),
         "reset_row signature drift: the '↺ Reset' button no longer \
          reports clicks via the helper return value",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 7. focus_set_same_community
+// ---------------------------------------------------------------------------
+
+#[test]
+fn focus_set_same_community() {
+    // Fixture: 6 nodes in 2 communities — {0,1,2,5} = comm 0, {3,4} = comm 1.
+    // compute(idx=0, mode=SameCommunityId) must return exactly that set.
+    use std::collections::HashMap;
+    let mut metrics: HashMap<String, Vec<f32>> = HashMap::new();
+    metrics.insert("community".into(), vec![0.0, 0.0, 0.0, 1.0, 1.0, 0.0]);
+    let edges: Vec<u32> = vec![];
+    let ctx = FocusCtx {
+        n_nodes: 6,
+        metrics: &metrics,
+        edges: &edges,
+        node_meta: None,
+        query: None,
+    };
+    let set = focus_set::compute(0, FocusMode::SameCommunityId, &ctx);
+    let mut got: Vec<u32> = set.into_iter().collect();
+    got.sort();
+    assert_eq!(
+        got,
+        vec![0, 1, 2, 5],
+        "focus_set::compute(SameCommunityId) returned the wrong set",
     );
 }

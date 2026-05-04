@@ -40,8 +40,8 @@ struct EffectsUniform {
     edge_dist_max:         f32,
     edge_color:            vec4<f32>,
     edge_min_transparency: f32,
-    _pad0:                 f32,
-    _pad1:                 f32,
+    edge_width:            f32,
+    edge_fade_floor:       f32,
     _pad2:                 f32,
 };
 
@@ -50,6 +50,10 @@ struct EffectsUniform {
 @group(0) @binding(2) var<storage, read> positions: array<vec3<f32>>;
 @group(0) @binding(3) var<storage, read> colors:    array<vec4<f32>>;
 @group(0) @binding(4) var<storage, read> sizes:     array<f32>;
+// Per-node focus dim factor in [0..1]. 1.0 = full alpha (in the focus
+// set or no focus active), <1.0 = dimmed because focus mode is active
+// and this node isn't in the focused community.
+@group(0) @binding(5) var<storage, read> dim_alpha: array<f32>;
 
 struct VertexOutput {
     @builtin(position) clip_pos: vec4<f32>,
@@ -75,8 +79,11 @@ fn vs_main(
     let corner = corners[vid];
 
     let inst_pos   = positions[iid];
-    let inst_color = colors[iid];
+    var inst_color = colors[iid];
     let base_size  = sizes[iid];
+    // Apply per-node focus dim factor (multiplicative on alpha).
+    let dim = dim_alpha[iid];
+    inst_color.a = inst_color.a * dim;
 
     var out: VertexOutput;
     out.uv = corner;

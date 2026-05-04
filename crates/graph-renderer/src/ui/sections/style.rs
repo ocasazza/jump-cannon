@@ -65,4 +65,8 @@ pub fn show(ui: &mut egui::Ui, state: &mut AppState) {
     ui.add_space(8.0);
     subgroup_label(ui, "Edge min visibility");
     ui.add(egui::Slider::new(&mut state.style.edge_min_transparency, 0.0..=1.0).text(""));
+
+    ui.add_space(8.0);
+    subgroup_label(ui, "Long-distance fade floor");
+    ui.add(egui::Slider::new(&mut state.style.edge_fade_floor, 0.0..=0.5).text(""));
 }

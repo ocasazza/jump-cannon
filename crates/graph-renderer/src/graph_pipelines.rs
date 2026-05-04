@@ -69,7 +69,12 @@ struct EffectsUniform {
     /// 1.0 ≈ "old LineList" thickness; default 1.5 reads better on dense
     /// graphs without overpowering the stacked-alpha effect.
     edge_width: f32,
-    _pad1: f32,
+    /// Asymptotic alpha floor at very long edges. The fade curve smooths
+    /// from `edge_min_transparency` toward this value past `edge_dist_max`,
+    /// then 1/(1+x)-tails toward (but never reaches) it. Replaces what
+    /// used to be `_pad1`; offset is unchanged so the 64-byte uniform
+    /// layout stays bit-identical.
+    edge_fade_floor: f32,
     _pad2: f32,
 }
 
@@ -94,7 +99,7 @@ impl Default for EffectsUniform {
             edge_color: [0.227, 0.282, 0.502, 1.0],
             edge_min_transparency: 0.6,
             edge_width: 1.5,
-            _pad1: 0.0,
+            edge_fade_floor: 0.02,
             _pad2: 0.0,
         }
     }
@@ -132,6 +137,12 @@ struct Buffers {
     n_edges: u32,
     camera_uniform: wgpu::Buffer,
     effects_uniform: wgpu::Buffer,
+    /// Per-node alpha multiplier driven by Focus mode. 1.0 = full / not
+    /// focused. <1.0 = dim. Coexists with `colors_base`/`set_selected`
+    /// (the query path); they multiply on the GPU since this lives in a
+    /// separate storage buffer.
+    #[allow(dead_code)]
+    dim_alpha: wgpu::Buffer,
     node_bind_group: wgpu::BindGroup,
     edge_bind_group: wgpu::BindGroup,
 
@@ -162,6 +173,7 @@ impl GraphPipelines {
                 ro_storage_entry(2, wgpu::ShaderStages::VERTEX),
                 ro_storage_entry(3, wgpu::ShaderStages::VERTEX),
                 ro_storage_entry(4, wgpu::ShaderStages::VERTEX),
+                ro_storage_entry(5, wgpu::ShaderStages::VERTEX),
             ],
         });
         let edge_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -171,6 +183,7 @@ impl GraphPipelines {
                 uniform_entry(1, wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT),
                 ro_storage_entry(2, wgpu::ShaderStages::VERTEX),
                 ro_storage_entry(3, wgpu::ShaderStages::VERTEX),
+                ro_storage_entry(4, wgpu::ShaderStages::VERTEX),
             ],
         });
 
@@ -365,6 +378,15 @@ impl GraphPipelines {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
 
+        // Per-node focus dim factor — initialised to all-1.0 so the
+        // default state is "no focus, full alpha everywhere".
+        let dim_init: Vec<f32> = vec![1.0_f32; n_nodes.max(1) as usize];
+        let dim_alpha_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("dim_alpha_storage"),
+            contents: bytemuck::cast_slice(&dim_init),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        });
+
         let node_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("node bg"),
             layout: &self.node_bgl,
@@ -374,6 +396,7 @@ impl GraphPipelines {
                 bg_entry(2, &positions),
                 bg_entry(3, &colors_buf),
                 bg_entry(4, &sizes_buf),
+                bg_entry(5, &dim_alpha_buf),
             ],
         });
         let edge_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -384,6 +407,7 @@ impl GraphPipelines {
                 bg_entry(1, &effects_uniform),
                 bg_entry(2, &positions),
                 bg_entry(3, &edges_buf),
+                bg_entry(4, &dim_alpha_buf),
             ],
         });
 
@@ -415,6 +439,7 @@ impl GraphPipelines {
             n_edges,
             camera_uniform,
             effects_uniform,
+            dim_alpha: dim_alpha_buf,
             node_bind_group,
             edge_bind_group,
             layout,
@@ -597,6 +622,45 @@ impl GraphPipelines {
         queue.write_buffer(&b.colors, 0, bytemuck::cast_slice(&out));
     }
 
+    /// Push the per-node focus dim mask. `members` lists the node ids
+    /// that belong to the focused community (always includes the focused
+    /// node itself). When `focused` is `None` or `members` is empty the
+    /// buffer is reset to all-1.0 (no dimming).
+    ///
+    /// This path is independent from `set_selected` (the QueryModel
+    /// dimming): they multiply on the GPU because the node shader does
+    /// `color.a *= dim_alpha[i]` on top of the colors-buffer alpha.
+    pub fn set_focus_set(
+        &mut self,
+        queue: &wgpu::Queue,
+        focused: Option<u32>,
+        members: &std::collections::HashSet<u32>,
+    ) {
+        let Some(b) = self.buffers.as_mut() else { return };
+        let n = b.n_nodes as usize;
+        if n == 0 {
+            return;
+        }
+        let dim_others: f32 = 0.25;
+        let mut out: Vec<f32> = vec![1.0; n];
+        if focused.is_some() && !members.is_empty() {
+            for v in out.iter_mut() {
+                *v = dim_others;
+            }
+            for &m in members {
+                if (m as usize) < n {
+                    out[m as usize] = 1.0;
+                }
+            }
+            if let Some(f) = focused {
+                if (f as usize) < n {
+                    out[f as usize] = 1.0;
+                }
+            }
+        }
+        queue.write_buffer(&b.dim_alpha, 0, bytemuck::cast_slice(&out));
+    }
+
     /// Update the focal plane center + thickness (effects uniform).
     pub fn set_focus_plane(&mut self, z: f32, thickness: f32) {
         self.effects.focus_plane_z = z;
@@ -620,6 +684,7 @@ impl GraphPipelines {
         dist_range: (f32, f32),
         min_transparency: f32,
         width_px: f32,
+        fade_floor: f32,
     ) {
         self.effects.edge_color = color;
         self.effects.edge_alpha_mul = alpha_mul.max(0.0);
@@ -629,6 +694,9 @@ impl GraphPipelines {
         self.effects.edge_dist_max = hi;
         self.effects.edge_min_transparency = min_transparency.clamp(0.0, 1.0);
         self.effects.edge_width = width_px.max(0.0);
+        // Floor must stay below the long-distance asymptote, otherwise
+        // the smoothstep would invert. Clamp into a safe range.
+        self.effects.edge_fade_floor = fade_floor.clamp(0.0, 0.5);
     }
 
     /// Push the cursor force into the GPU layout. radius=0 disables.

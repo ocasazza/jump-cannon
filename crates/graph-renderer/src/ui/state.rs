@@ -139,6 +139,11 @@ pub struct StyleState {
     /// `linkVisibilityMinTransparency` — alpha floor at long edges.
     #[serde(default = "default_edge_min_transparency")]
     pub edge_min_transparency: f32,
+    /// Long-distance asymptotic alpha floor. The fade curve smooths from
+    /// `edge_min_transparency` toward this value past `edge_dist_max` and
+    /// then 1/(1+x)-tails toward (but never reaches) it. Default 0.02.
+    #[serde(default = "default_edge_fade_floor")]
+    pub edge_fade_floor: f32,
     /// Fat-line pixel width (vertex-shader quad expansion). 1.0 ≈ the
     /// old wgpu LineList thickness; default 1.5 for a slightly heavier
     /// stroke on dense graphs.
@@ -151,6 +156,7 @@ fn default_edge_alpha_mul() -> f32 { 0.6 }
 fn default_edge_dist_min() -> f32 { 10.0 }
 fn default_edge_dist_max() -> f32 { 400.0 }
 fn default_edge_min_transparency() -> f32 { 0.6 }
+fn default_edge_fade_floor() -> f32 { 0.02 }
 fn default_edge_width() -> f32 { 1.5 }
 
 impl Default for StyleState {
@@ -164,6 +170,7 @@ impl Default for StyleState {
             edge_dist_min: default_edge_dist_min(),
             edge_dist_max: default_edge_dist_max(),
             edge_min_transparency: default_edge_min_transparency(),
+            edge_fade_floor: default_edge_fade_floor(),
             edge_width: default_edge_width(),
         }
     }
@@ -334,6 +341,10 @@ pub struct FocusState {
     pub thickness: f32,
     pub blur: f32,
     pub max_coc: f32,
+    /// Membership criterion for hover/click focus dimming. See
+    /// [`crate::ui::focus_set::FocusMode`].
+    #[serde(default)]
+    pub focus_mode: crate::ui::focus_set::FocusMode,
 }
 
 impl Default for FocusState {
@@ -344,6 +355,7 @@ impl Default for FocusState {
             thickness: 50.0,
             blur: 0.5,
             max_coc: 8.0,
+            focus_mode: crate::ui::focus_set::FocusMode::default(),
         }
     }
 }

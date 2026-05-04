@@ -1,6 +1,7 @@
 pub mod actions;
 pub mod command_palette;
 pub mod document_viewer;
+pub mod focus_set;
 pub mod inspector;
 pub mod layout;
 pub mod modal;

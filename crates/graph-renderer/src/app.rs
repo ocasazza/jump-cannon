@@ -10,6 +10,7 @@ use crate::proto;
 use crate::ui;
 use crate::ui::actions::{self, ActionRegistry, BuiltinAction, ParamValue};
 use crate::ui::command_palette::PaletteOutcome;
+use crate::ui::focus_set::{self, FocusCtx, FocusMode};
 use crate::ui::layout::registry::LayoutRegistry;
 use crate::ui::progress::{Progress, ProgressSink};
 use crate::ui::query::EvalContext;
@@ -118,6 +119,23 @@ pub struct App {
     /// Session-only — not persisted.
     selected_node_idx: Option<u32>,
 
+    // -- focus mode (hover/click highlight + community dim) ---------------
+    /// Sticky focused node from a click. Click on empty canvas clears.
+    focus_sticky_idx: Option<u32>,
+    /// Transient hover focus. Lives only while the cursor is over a node;
+    /// released after `HOVER_HOLD_MS` of no hover. Sticky wins over hover.
+    focus_hover_idx: Option<u32>,
+    /// Last frame's focused-into-GPU node idx. Drives change detection
+    /// so we only re-upload the dim_alpha buffer when the membership
+    /// would actually differ.
+    focus_pushed_idx: Option<u32>,
+    focus_pushed_mode: Option<FocusMode>,
+    /// Throttle: most recent hover-raycast timestamp.
+    last_hover_raycast_at: Option<web_time::Instant>,
+    /// Hover release timer — once hover goes empty, hold the previous
+    /// focus for ~HOVER_HOLD_MS before clearing.
+    hover_clear_at: Option<web_time::Instant>,
+
     /// Per-frame progress / log surface. Populated by both on-thread
     /// callers (layout warmup, palette previews) and async tasks (the
     /// bootstrap fetch) via a clone-able `ProgressSink`. Drained at the
@@ -225,6 +243,12 @@ impl App {
             camera_pan_accel_t: 0.0,
             perf: PerfCollector::default(),
             selected_node_idx: None,
+            focus_sticky_idx: None,
+            focus_hover_idx: None,
+            focus_pushed_idx: None,
+            focus_pushed_mode: None,
+            last_hover_raycast_at: None,
+            hover_clear_at: None,
             progress,
         }
     }
@@ -664,6 +688,9 @@ impl eframe::App for App {
                         id
                     );
                     self.selected_node_idx = Some(idx);
+                    // Sticky focus: click locks focus on this node. Hover
+                    // is suppressed while sticky is set.
+                    self.focus_sticky_idx = Some(idx);
                     // UX: surface the inspector if the user clicks a node
                     // while it's collapsed. They almost certainly want to
                     // see what they just clicked.
@@ -672,8 +699,14 @@ impl eframe::App for App {
                     }
                     self.kick_off_node_fetch(id);
                 }
+            } else {
+                // Click on empty canvas → clear sticky focus.
+                self.focus_sticky_idx = None;
             }
         }
+
+        // Hover-driven focus (throttled). Sticky click takes precedence.
+        self.update_hover_focus(frame, pointer_in_canvas, canvas_rect);
 
         // Inspector requested a different selection (clicked a community
         // sibling or neighbor row). Drive the same path the canvas click
@@ -722,6 +755,7 @@ impl eframe::App for App {
 
         self.perf.begin_stage(StageId::ApplySelection);
         self.apply_selection(frame);
+        self.apply_focus_set_to_gpu(frame);
         self.perf.end_stage(StageId::ApplySelection);
 
         self.perf.begin_stage(StageId::RefreshStats);
@@ -867,6 +901,7 @@ impl App {
                     (s.edge_dist_min, s.edge_dist_max),
                     s.edge_min_transparency,
                     s.edge_width,
+                    s.edge_fade_floor,
                 );
             }
         }
@@ -1163,6 +1198,142 @@ impl App {
             // normal path on the next frame.
             self.prev_layout_key = None;
         }
+    }
+
+    /// Hover throttle interval — ~50ms gives a comfortable 20 Hz max
+    /// raycast cadence per the spec.
+    const HOVER_THROTTLE_MS: u64 = 50;
+    /// Hover-release hold — keep the previous hover focus engaged for
+    /// this long after the cursor leaves a node, so a brief jitter or
+    /// a quick gap between two nodes doesn't flash everything bright.
+    const HOVER_HOLD_MS: u64 = 250;
+
+    /// Throttled hover→focus pipeline. No-op while sticky-focus is set
+    /// (per spec: don't fight the user). Drives `focus_hover_idx`.
+    fn update_hover_focus(
+        &mut self,
+        frame: &mut eframe::Frame,
+        pointer_in_canvas: Option<egui::Pos2>,
+        canvas_rect: Option<egui::Rect>,
+    ) {
+        // Sticky wins; a sticky-focus user gesture overrides hover.
+        if self.focus_sticky_idx.is_some() {
+            self.focus_hover_idx = None;
+            self.hover_clear_at = None;
+            return;
+        }
+        // No focus mode work to do if there's no canvas to hover over.
+        let (Some(rect), Some(pos)) = (canvas_rect, pointer_in_canvas) else {
+            self.maybe_clear_hover_after_hold();
+            return;
+        };
+        let now = web_time::Instant::now();
+        let throttled = self
+            .last_hover_raycast_at
+            .map(|t| (now - t).as_millis() < Self::HOVER_THROTTLE_MS as u128)
+            .unwrap_or(false);
+        if throttled {
+            return;
+        }
+        self.last_hover_raycast_at = Some(now);
+
+        let ndc_x = (pos.x - rect.left()) / rect.width().max(1.0) * 2.0 - 1.0;
+        let ndc_y = -((pos.y - rect.top()) / rect.height().max(1.0) * 2.0 - 1.0);
+        let hit = self.raycast_idx(frame, ndc_x, ndc_y);
+        match hit {
+            Some(idx) => {
+                if self.focus_hover_idx != Some(idx) {
+                    self.focus_hover_idx = Some(idx);
+                }
+                // Hovering — cancel any pending clear timer.
+                self.hover_clear_at = None;
+            }
+            None => {
+                self.maybe_clear_hover_after_hold();
+            }
+        }
+    }
+
+    fn maybe_clear_hover_after_hold(&mut self) {
+        if self.focus_hover_idx.is_none() {
+            self.hover_clear_at = None;
+            return;
+        }
+        let now = web_time::Instant::now();
+        match self.hover_clear_at {
+            None => {
+                self.hover_clear_at = Some(now);
+            }
+            Some(t) if (now - t).as_millis() >= Self::HOVER_HOLD_MS as u128 => {
+                self.focus_hover_idx = None;
+                self.hover_clear_at = None;
+            }
+            _ => {}
+        }
+    }
+
+    /// Resolve the active focused-node idx (sticky beats hover) and push
+    /// the per-node `dim_alpha` mask to the GPU when it changes.
+    ///
+    /// Coexists with the QueryModel selection path
+    /// (`apply_selection`/`set_selected`): both write per-node alpha,
+    /// but through *separate* storage buffers — `colors` (selection-side)
+    /// and `dim_alpha` (focus-side). The node shader multiplies them, so
+    /// a focused node inside the selection set stays bright; out-of-set,
+    /// out-of-focus nodes drop multiplicatively dimmer. Documented at
+    /// the call site (`apply_focus_set_to_gpu` follows `apply_selection`
+    /// on purpose).
+    fn apply_focus_set_to_gpu(&mut self, frame: &mut eframe::Frame) {
+        if !self.loaded_into_gpu {
+            return;
+        }
+        let focused = self.focus_sticky_idx.or(self.focus_hover_idx);
+        let mode = self.state.focus.focus_mode;
+        // Change-detect to avoid pointless GPU writes (the dim_alpha buf
+        // is n_nodes f32s — cheap, but worth skipping on idle frames).
+        if self.focus_pushed_idx == focused && self.focus_pushed_mode == Some(mode) {
+            return;
+        }
+        let Some(wgpu_state) = frame.wgpu_render_state() else { return };
+        let edges_snapshot: Vec<u32> = {
+            let renderer = wgpu_state.renderer.read();
+            renderer
+                .callback_resources
+                .get::<GraphPipelines>()
+                .map(|p| p.edges_cpu().to_vec())
+                .unwrap_or_default()
+        };
+        let n_nodes = self.ids.len() as u32;
+        let members: HashSet<u32> = match focused {
+            None => HashSet::new(),
+            Some(idx) => {
+                let ctx = FocusCtx {
+                    n_nodes,
+                    metrics: &self.metrics,
+                    edges: &edges_snapshot,
+                    node_meta: None,
+                    query: Some(&self.state.query),
+                };
+                focus_set::compute(idx, mode, &ctx)
+            }
+        };
+        let queue = wgpu_state.queue.clone();
+        {
+            let mut renderer = wgpu_state.renderer.write();
+            if let Some(pipes) = renderer.callback_resources.get_mut::<GraphPipelines>() {
+                pipes.set_focus_set(&queue, focused, &members);
+            }
+        }
+        if focused.is_some() {
+            // One-shot info log per focus engagement — load-bearing for
+            // the e2e regression test (`hover_focus_dims_other_nodes`).
+            log::info!(
+                "[graph-renderer] focus: members={}",
+                members.len()
+            );
+        }
+        self.focus_pushed_idx = focused;
+        self.focus_pushed_mode = Some(mode);
     }
 
     fn apply_selection(&mut self, frame: &mut eframe::Frame) {
