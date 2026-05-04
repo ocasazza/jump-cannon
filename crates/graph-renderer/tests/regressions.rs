@@ -146,12 +146,15 @@ fn inspector_hidden_when_no_selection() {
             let metrics = std::collections::HashMap::new();
             let edges: Vec<u32> = Vec::new();
             let mut requested: Option<u32> = None;
+            let mut req_toggle: Option<(String, String)> = None;
             let mut data = InspectorData {
                 ids: &ids,
                 metrics: &metrics,
                 edges: &edges,
                 selected_idx: None,
                 requested_selection: &mut requested,
+                node_meta: None,
+                requested_filter_toggle: &mut req_toggle,
             };
             inspector::show(ctx, &mut state, &mut data);
         });
@@ -184,12 +187,15 @@ fn inspector_shown_when_selection() {
             let metrics = std::collections::HashMap::new();
             let edges: Vec<u32> = Vec::new();
             let mut requested: Option<u32> = None;
+            let mut req_toggle: Option<(String, String)> = None;
             let mut data = InspectorData {
                 ids: &ids,
                 metrics: &metrics,
                 edges: &edges,
                 selected_idx: Some(0),
                 requested_selection: &mut requested,
+                node_meta: None,
+                requested_filter_toggle: &mut req_toggle,
             };
             inspector::show(ctx, &mut state, &mut data);
         });
@@ -290,6 +296,7 @@ fn focus_set_same_community() {
         edges: &edges,
         node_meta: None,
         query: None,
+        field_index: None,
     };
     let set = focus_set::compute(0, FocusMode::SameCommunityId, &ctx);
     let mut got: Vec<u32> = set.into_iter().collect();
@@ -298,5 +305,108 @@ fn focus_set_same_community() {
         got,
         vec![0, 1, 2, 5],
         "focus_set::compute(SameCommunityId) returned the wrong set",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 8. field_index_matches_within_field_or
+// ---------------------------------------------------------------------------
+
+#[test]
+fn field_index_matches_within_field_or() {
+    use graph_renderer::ui::field_index::FieldIndex;
+    use graph_renderer::ui::query::ActiveFieldFilters;
+    use std::collections::HashMap;
+
+    let mut by_field: HashMap<String, HashMap<String, Vec<u32>>> = HashMap::new();
+    let mut tags = HashMap::new();
+    tags.insert("rust".to_string(), vec![0, 1, 2]);
+    tags.insert("egui".to_string(), vec![2, 3, 4]);
+    by_field.insert("tags".to_string(), tags);
+    let fi = FieldIndex { by_field };
+
+    let mut filters = ActiveFieldFilters::default();
+    let entry = filters.by_field.entry("tags".into()).or_default();
+    entry.insert("rust".into());
+    entry.insert("egui".into());
+    filters.insertion_order.push("tags".into());
+
+    let got = fi.matches(&filters).expect("Some(set)");
+    let mut v: Vec<u32> = got.into_iter().collect();
+    v.sort();
+    assert_eq!(v, vec![0, 1, 2, 3, 4], "within-field OR should union both buckets");
+}
+
+// ---------------------------------------------------------------------------
+// 9. field_index_matches_across_field_and
+// ---------------------------------------------------------------------------
+
+#[test]
+fn field_index_matches_across_field_and() {
+    use graph_renderer::ui::field_index::FieldIndex;
+    use graph_renderer::ui::query::ActiveFieldFilters;
+    use std::collections::HashMap;
+
+    let mut by_field: HashMap<String, HashMap<String, Vec<u32>>> = HashMap::new();
+    let mut tags = HashMap::new();
+    tags.insert("rust".to_string(), vec![0, 1, 2, 3]);
+    by_field.insert("tags".to_string(), tags);
+    let mut folder = HashMap::new();
+    folder.insert("notes".to_string(), vec![2, 3, 4, 5]);
+    by_field.insert("folder".to_string(), folder);
+    let fi = FieldIndex { by_field };
+
+    let mut filters = ActiveFieldFilters::default();
+    filters.by_field.entry("tags".into()).or_default().insert("rust".into());
+    filters.by_field.entry("folder".into()).or_default().insert("notes".into());
+    filters.insertion_order.push("tags".into());
+    filters.insertion_order.push("folder".into());
+
+    let got = fi.matches(&filters).expect("Some(set)");
+    let mut v: Vec<u32> = got.into_iter().collect();
+    v.sort();
+    assert_eq!(v, vec![2, 3], "across-field AND should intersect per-field unions");
+}
+
+// ---------------------------------------------------------------------------
+// 10. badge_toggle_updates_query_active_filters
+// ---------------------------------------------------------------------------
+
+#[test]
+fn badge_toggle_updates_query_active_filters() {
+    use graph_renderer::ui::badge::{Badge, BadgeAction, BadgeKind};
+    use graph_renderer::ui::query::QueryModel;
+    use std::cell::RefCell;
+
+    let model: RefCell<QueryModel> = RefCell::new(QueryModel::default());
+
+    // Build a harness that renders one Badge in a SidePanel, then
+    // synthesise a click via egui_kittest's accessibility tree.
+    let mut harness = Harness::builder()
+        .with_size(egui::vec2(400.0, 100.0))
+        .build(|ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let b = Badge::new("tags", "rust", BadgeKind::Tag);
+                let action = b.show(ui);
+                if let BadgeAction::Toggle { field, value } = action {
+                    model.borrow_mut().toggle_field_filter(&field, &value);
+                }
+            });
+        });
+
+    // Two settled frames so the badge has a stable rect, then click via
+    // the accessible label exposed by Badge::show.
+    harness.run();
+    harness.run();
+    harness.get_by_label("badge:tags=rust").click();
+    harness.run();
+    harness.run();
+
+    let m = model.borrow();
+    assert!(
+        m.is_filter_active("tags", "rust"),
+        "Badge click did not toggle (tags, rust) into QueryModel.active_filters; \
+         current filters: {:?}",
+        m.active_filters,
     );
 }

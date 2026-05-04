@@ -29,6 +29,7 @@ pub fn router(state: AppState) -> Router {
         .route("/graph/positions", get(graph_positions))
         .route("/graph/edges", get(graph_edges))
         .route("/graph/metrics/:name", get(graph_metric))
+        .route("/graph/meta_summary", get(graph_meta_summary))
         .route("/node/:id", get(node_meta))
         .route("/search", get(search))
         .with_state(state)
@@ -218,6 +219,122 @@ async fn graph_edges(State(s): State<AppState>) -> impl IntoResponse {
 
 async fn graph_metric(State(s): State<AppState>, Path(name): Path<String>) -> impl IntoResponse {
     cached_binary_response(&s, &name).into_response()
+}
+
+/// Returns a per-field inverted index covering the small handful of
+/// fields the renderer-side chip / badge UI cares about. Built once per
+/// process and cached as `Arc<[u8]>` in `binary_cache` under the
+/// reserved key "meta_summary".
+async fn graph_meta_summary(State(s): State<AppState>) -> impl IntoResponse {
+    if let Some(buf) = s.inner.binary_cache.get("meta_summary").cloned() {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::CONTENT_TYPE, HeaderValue::from_static(PROTOBUF_CT));
+        return (StatusCode::OK, headers, buf.to_vec()).into_response();
+    }
+    let bytes = build_meta_summary_bytes(&s.inner.graph);
+    let mut headers = HeaderMap::new();
+    headers.insert(header::CONTENT_TYPE, HeaderValue::from_static(PROTOBUF_CT));
+    (StatusCode::OK, headers, bytes).into_response()
+}
+
+/// Walk the graph once and build a [`proto::MetaSummary`]. The frontend
+/// uses this CSR-style payload (sorted node-idx vecs per (field, value)
+/// bucket) to compute filter intersections without per-click round-trips.
+pub fn build_meta_summary_bytes(graph: &vault_data::VaultGraph) -> Vec<u8> {
+    use std::collections::BTreeMap;
+    use serde_json::Value;
+
+    // Field name -> value -> sorted Vec<node_idx>.
+    let mut idx: BTreeMap<String, BTreeMap<String, Vec<u32>>> = BTreeMap::new();
+    fn push(idx: &mut BTreeMap<String, BTreeMap<String, Vec<u32>>>,
+            field: &str, value: &str, node: u32) {
+        let v = value.trim();
+        if v.is_empty() { return; }
+        idx.entry(field.to_string())
+            .or_default()
+            .entry(v.to_string())
+            .or_default()
+            .push(node);
+    }
+
+    for (i, (_id, node)) in graph.nodes.iter().enumerate() {
+        let ni = i as u32;
+        for t in &node.meta.tags {
+            push(&mut idx,"tags", t, ni);
+        }
+        if let Some(dt) = &node.meta.doctype {
+            push(&mut idx,"doctype", dt, ni);
+        }
+        push(&mut idx,"folder", &node.meta.folder, ni);
+        let fm = &node.meta.frontmatter;
+        // status — usually a scalar string.
+        if let Some(Value::String(v)) = fm.get("status") {
+            push(&mut idx,"status", v, ni);
+        }
+        // authors — comma-split string OR array.
+        if let Some(v) = fm.get("authors") {
+            for s in extract_strings(v) {
+                for part in s.split(',') {
+                    push(&mut idx,"authors", part, ni);
+                }
+            }
+        }
+        if let Some(v) = fm.get("entities") {
+            for s in extract_strings(v) {
+                push(&mut idx,"entities", &s, ni);
+            }
+        }
+        if let Some(v) = fm.get("key_topics") {
+            for s in extract_strings(v) {
+                push(&mut idx,"key_topics", &s, ni);
+            }
+        }
+        // related — wikilinks; strip the [[ ]] wrapper, split on |.
+        if let Some(v) = fm.get("related") {
+            for s in extract_strings(v) {
+                let t = s.trim();
+                let inner = t.strip_prefix("[[").and_then(|x| x.strip_suffix("]]")).unwrap_or(t);
+                let target = inner.split_once('|').map(|(p, _)| p).unwrap_or(inner).trim();
+                push(&mut idx,"related", target, ni);
+            }
+        }
+    }
+
+    let mut fields: Vec<String> = idx.keys().cloned().collect();
+    fields.sort();
+    let field_to_idx: std::collections::HashMap<&String, u32> = fields
+        .iter()
+        .enumerate()
+        .map(|(i, n)| (n, i as u32))
+        .collect();
+    let mut buckets: Vec<proto::FieldBucket> = Vec::new();
+    for (field, vmap) in &idx {
+        let fi = *field_to_idx.get(field).unwrap();
+        for (value, mut node_idx) in vmap.iter().map(|(k, v)| (k.clone(), v.clone())) {
+            node_idx.sort_unstable();
+            node_idx.dedup();
+            buckets.push(proto::FieldBucket {
+                field_idx: fi,
+                value,
+                node_idx,
+            });
+        }
+    }
+    let msg = proto::MetaSummary { fields, buckets };
+    let mut buf = Vec::with_capacity(msg.encoded_len());
+    msg.encode(&mut buf).expect("encode meta_summary");
+    buf
+}
+
+fn extract_strings(v: &serde_json::Value) -> Vec<String> {
+    match v {
+        serde_json::Value::String(s) => vec![s.clone()],
+        serde_json::Value::Array(arr) => arr
+            .iter()
+            .filter_map(|x| x.as_str().map(|s| s.to_string()))
+            .collect(),
+        _ => Vec::new(),
+    }
 }
 
 /// Look up a precomputed buffer in `AppState::binary_cache` and serve it

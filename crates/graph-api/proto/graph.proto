@@ -39,3 +39,16 @@ message SearchResults {
   repeated string ids = 1;
   uint32 total = 2;
 }
+
+// Per-field inverted index. Returned by /graph/meta_summary.
+// `fields[i]` names a field; each `FieldBucket.field_idx` indexes into it.
+message MetaSummary {
+  repeated string fields = 1;
+  repeated FieldBucket buckets = 2;
+}
+
+message FieldBucket {
+  uint32 field_idx = 1;
+  string value = 2;
+  repeated uint32 node_idx = 3 [packed=true];
+}

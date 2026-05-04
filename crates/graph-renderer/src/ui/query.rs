@@ -13,9 +13,22 @@
 //! `QueryModel::evaluate` is a stub that returns `None` (= no filter
 //! applied) so the rest of the renderer keeps working unchanged.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
+
+/// Active per-field filter selections driven by badge clicks. Within a
+/// single field, multiple values OR; across fields, AND.
+///
+/// `insertion_order` exists so the on-screen chip-strip can render
+/// fields in the order the user added them (BTreeMap orders by name,
+/// which would shuffle the strip every time a new field is touched).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ActiveFieldFilters {
+    pub by_field: BTreeMap<String, BTreeSet<String>>,
+    #[serde(default)]
+    pub insertion_order: Vec<String>,
+}
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum Op {
@@ -84,6 +97,10 @@ pub enum Card {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QueryModel {
     pub cards: Vec<Card>,
+    /// Badge-driven (field, value) toggles. Folded into evaluate() when
+    /// a `FieldIndex` is available via `EvalContext::field_index`.
+    #[serde(default)]
+    pub active_filters: ActiveFieldFilters,
 }
 
 impl Default for QueryModel {
@@ -94,7 +111,51 @@ impl Default for QueryModel {
                 value: String::new(),
                 regex: false,
             }],
+            active_filters: ActiveFieldFilters::default(),
         }
+    }
+}
+
+impl QueryModel {
+    /// Toggle inclusion of `(field, value)` in the active filter set.
+    pub fn toggle_field_filter(&mut self, field: &str, value: &str) {
+        let entry = self
+            .active_filters
+            .by_field
+            .entry(field.to_string())
+            .or_default();
+        if entry.contains(value) {
+            entry.remove(value);
+            if entry.is_empty() {
+                self.active_filters.by_field.remove(field);
+                self.active_filters
+                    .insertion_order
+                    .retain(|f| f != field);
+            }
+        } else {
+            entry.insert(value.to_string());
+            if !self.active_filters.insertion_order.iter().any(|f| f == field) {
+                self.active_filters.insertion_order.push(field.to_string());
+            }
+        }
+    }
+
+    pub fn clear_field(&mut self, field: &str) {
+        self.active_filters.by_field.remove(field);
+        self.active_filters.insertion_order.retain(|f| f != field);
+    }
+
+    pub fn clear_all_filters(&mut self) {
+        self.active_filters = ActiveFieldFilters::default();
+    }
+
+    /// Returns true if `(field, value)` is currently selected.
+    pub fn is_filter_active(&self, field: &str, value: &str) -> bool {
+        self.active_filters
+            .by_field
+            .get(field)
+            .map(|set| set.contains(value))
+            .unwrap_or(false)
     }
 }
 
@@ -106,6 +167,9 @@ pub struct EvalContext<'a> {
     pub ids: &'a [String],
     pub id_to_idx: &'a HashMap<String, u32>,
     pub search_results: &'a HashMap<String, HashSet<u32>>,
+    /// Optional inverted index used to resolve `active_filters` into a
+    /// node-idx set. When `None`, badge-driven filters are dormant.
+    pub field_index: Option<&'a crate::ui::field_index::FieldIndex>,
 }
 
 impl<'a> EvalContext<'a> {
@@ -118,7 +182,16 @@ impl<'a> EvalContext<'a> {
             ids,
             id_to_idx,
             search_results,
+            field_index: None,
         }
+    }
+
+    pub fn with_field_index(
+        mut self,
+        idx: Option<&'a crate::ui::field_index::FieldIndex>,
+    ) -> Self {
+        self.field_index = idx;
+        self
     }
 }
 
@@ -150,9 +223,15 @@ impl QueryModel {
     /// Returns the set of matching node indices, or `None` if the query
     /// has no resolvable constraint (= no filter applied).
     pub fn evaluate(&self, ctx: &EvalContext) -> Option<HashSet<u32>> {
+        // Fold-in active badge filters first; they intersect (AND) with
+        // whatever the card-stream produces below.
+        let badge_set: Option<HashSet<u32>> = match ctx.field_index {
+            Some(fi) => fi.matches(&self.active_filters),
+            None => None,
+        };
         let clauses = self.collect_clauses();
         if clauses.is_empty() {
-            return None;
+            return badge_set;
         }
 
         // If every clause is "unsupported" we have nothing to apply.
@@ -201,6 +280,10 @@ impl QueryModel {
                 ConnectorOp::And => acc.intersection(&next).copied().collect(),
                 ConnectorOp::Or => acc.union(&next).copied().collect(),
             };
+        }
+        // Intersect the badge-driven filter set on top.
+        if let Some(badges) = badge_set {
+            acc = acc.intersection(&badges).copied().collect();
         }
         Some(acc)
     }

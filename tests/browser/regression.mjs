@@ -279,6 +279,62 @@ try {
   }
 
   // ------------------------------------------------------------------
+  // 7. meta_summary_endpoint_responds_with_buckets
+  // ------------------------------------------------------------------
+  // Hits /graph/meta_summary and decodes just enough of the protobuf
+  // to count fields + buckets. The smoke vault produces at least
+  // `tags` / `folder` / `status` buckets — we assert non-empty.
+  {
+    let resp;
+    try {
+      resp = await page.page.evaluate(async (port) => {
+        const r = await fetch(`http://127.0.0.1:${port}/graph/meta_summary`);
+        if (!r.ok) return { ok: false, status: r.status };
+        const buf = await r.arrayBuffer();
+        const bytes = new Uint8Array(buf);
+        // Decode protobuf MetaSummary { repeated string fields = 1;
+        // repeated FieldBucket buckets = 2; }. We don't need a full
+        // decoder — just count tag-1 (fields) and tag-2 (buckets).
+        let i = 0;
+        let nFields = 0, nBuckets = 0;
+        while (i < bytes.length) {
+          // varint key
+          let k = 0, shift = 0;
+          while (true) {
+            const b = bytes[i++]; k |= (b & 0x7f) << shift;
+            if (!(b & 0x80)) break; shift += 7;
+          }
+          const tag = k >>> 3, wire = k & 7;
+          if (wire === 2) {
+            // length-delimited
+            let len = 0; shift = 0;
+            while (true) {
+              const b = bytes[i++]; len |= (b & 0x7f) << shift;
+              if (!(b & 0x80)) break; shift += 7;
+            }
+            if (tag === 1) nFields++;
+            else if (tag === 2) nBuckets++;
+            i += len;
+          } else if (wire === 0) {
+            while (bytes[i++] & 0x80) {}
+          } else {
+            return { ok: false, error: `unexpected wire type ${wire}` };
+          }
+        }
+        return { ok: true, size: bytes.length, nFields, nBuckets };
+      }, PORT);
+    } catch (e) {
+      resp = { ok: false, error: String(e) };
+    }
+    const ok = !!(resp && resp.ok && resp.nFields > 0 && resp.nBuckets > 0);
+    record('meta_summary_endpoint_responds_with_buckets', ok, {
+      ...resp,
+      msg: ok ? null
+        : 'meta_summary returned zero fields/buckets — server-side index is broken',
+    });
+  }
+
+  // ------------------------------------------------------------------
   // Aggregate
   // ------------------------------------------------------------------
   const failed = Object.entries(results).filter(([, r]) => !r.ok).map(([k]) => k);

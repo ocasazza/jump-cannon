@@ -1,6 +1,9 @@
 pub mod actions;
+pub mod badge;
 pub mod command_palette;
 pub mod document_viewer;
+pub mod field_index;
+pub mod filter_strip;
 pub mod focus_set;
 pub mod inspector;
 pub mod layout;

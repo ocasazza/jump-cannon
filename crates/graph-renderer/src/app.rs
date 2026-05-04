@@ -10,6 +10,7 @@ use crate::proto;
 use crate::ui;
 use crate::ui::actions::{self, ActionRegistry, BuiltinAction, ParamValue};
 use crate::ui::command_palette::PaletteOutcome;
+use crate::ui::field_index::FieldIndex;
 use crate::ui::focus_set::{self, FocusCtx, FocusMode};
 use crate::ui::layout::registry::LayoutRegistry;
 use crate::ui::progress::{Progress, ProgressSink};
@@ -136,6 +137,12 @@ pub struct App {
     /// focus for ~HOVER_HOLD_MS before clearing.
     hover_clear_at: Option<web_time::Instant>,
 
+    /// Inverted index of (field, value) -> node-idx buckets. Populated
+    /// by a one-shot async `/graph/meta_summary` fetch in `kick_off_bootstrap`.
+    field_index: Option<FieldIndex>,
+    /// Async slot the meta_summary fetch task writes into.
+    field_index_slot: Arc<Mutex<Option<Result<proto::MetaSummary, String>>>>,
+
     /// Per-frame progress / log surface. Populated by both on-thread
     /// callers (layout warmup, palette previews) and async tasks (the
     /// bootstrap fetch) via a clone-able `ProgressSink`. Drained at the
@@ -197,6 +204,19 @@ impl App {
         let progress_sink = progress.sink();
         kick_off_bootstrap(load.clone(), base_url.clone(), progress_sink);
 
+        // One-shot meta_summary fetch in parallel with the bootstrap.
+        // Used to power active-filter chips + SharedTag/Filter focus.
+        let field_index_slot: Arc<Mutex<Option<Result<proto::MetaSummary, String>>>> =
+            Arc::new(Mutex::new(None));
+        {
+            let slot = field_index_slot.clone();
+            let client = ApiClient::new(base_url.clone());
+            spawn_async(async move {
+                let res = client.meta_summary().await;
+                *slot.lock().unwrap() = Some(res);
+            });
+        }
+
         let mut actions = ActionRegistry::new();
         actions::seed_default_actions(&mut actions);
         // Rehydrate persisted ActionInstances. The registry is re-seeded
@@ -249,6 +269,8 @@ impl App {
             focus_pushed_mode: None,
             last_hover_raycast_at: None,
             hover_clear_at: None,
+            field_index: None,
+            field_index_slot,
             progress,
         }
     }
@@ -293,6 +315,30 @@ impl App {
             let result = client.node(&id).await;
             *slot.lock().unwrap() = Some(result);
         });
+    }
+
+    /// Drain a completed `/graph/meta_summary` fetch and decode it into
+    /// the local FieldIndex, if a result has landed.
+    fn drain_field_index(&mut self) {
+        if self.field_index.is_some() {
+            return;
+        }
+        let result_opt = self.field_index_slot.lock().unwrap().take();
+        let Some(result) = result_opt else { return };
+        match result {
+            Ok(meta) => {
+                let fi = FieldIndex::from_proto(&meta, &self.ids);
+                log::info!(
+                    "[graph-renderer] meta_summary: {} fields, {} buckets",
+                    fi.by_field.len(),
+                    fi.by_field.values().map(|m| m.len()).sum::<usize>(),
+                );
+                self.field_index = Some(fi);
+            }
+            Err(e) => {
+                log::warn!("[graph-renderer] meta_summary fetch failed: {e}");
+            }
+        }
     }
 
     /// Drain a completed `/node/:id` fetch into the modal state, if any.
@@ -515,6 +561,7 @@ impl eframe::App for App {
 
         // Drain any completed /node/:id fetch into the modal.
         self.drain_node_fetch();
+        self.drain_field_index();
 
         // Ctrl+P (or ⌘P on macOS) toggles the command palette.
         if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::P)) {
@@ -560,14 +607,22 @@ impl eframe::App for App {
             } else {
                 Vec::new()
             };
-            let mut data = ui::inspector::InspectorData {
-                ids: &self.ids,
-                metrics: &self.metrics,
-                edges: &edges_snapshot,
-                selected_idx: self.selected_node_idx,
-                requested_selection: &mut requested_selection,
-            };
-            ui::inspector::show(ctx, &mut self.state, &mut data);
+            let mut requested_filter_toggle: Option<(String, String)> = None;
+            {
+                let mut data = ui::inspector::InspectorData {
+                    ids: &self.ids,
+                    metrics: &self.metrics,
+                    edges: &edges_snapshot,
+                    selected_idx: self.selected_node_idx,
+                    requested_selection: &mut requested_selection,
+                    node_meta: None,
+                    requested_filter_toggle: &mut requested_filter_toggle,
+                };
+                ui::inspector::show(ctx, &mut self.state, &mut data);
+            }
+            if let Some((f, v)) = requested_filter_toggle {
+                self.state.query.toggle_field_filter(&f, &v);
+            }
         }
 
         // Drain any palette preview-fetch result from the previous frame
@@ -726,13 +781,32 @@ impl eframe::App for App {
             }
         }
 
+        // Filter chip strip — sits above the canvas, below the modal.
+        ui::filter_strip::show(ctx, &mut self.state.query);
+
         // Draw the modal — last so it stacks above the central panel.
-        let action = ui::show_modal(ctx, &mut self.modal);
+        let action = ui::modal::show_modal_with(
+            ctx,
+            &mut self.modal,
+            &self.state.query.active_filters,
+        );
         if let Some(target) = action.navigate_to {
             self.kick_off_node_fetch(target);
         }
         if let Some((field, value)) = action.toggle_filter {
-            self.append_filter_card(field, value);
+            self.state.query.toggle_field_filter(&field, &value);
+        }
+        if let Some(href) = action.open_url {
+            #[cfg(target_arch = "wasm32")]
+            {
+                if let Some(window) = web_sys::window() {
+                    let _ = window.open_with_url_and_target(&href, "_blank");
+                }
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                log::info!("[graph-renderer] open url (native no-op): {href}");
+            }
         }
 
         // ---- Per-frame wiring loops -----------------------------------
@@ -1305,7 +1379,15 @@ impl App {
         };
         let n_nodes = self.ids.len() as u32;
         let members: HashSet<u32> = match focused {
-            None => HashSet::new(),
+            None => {
+                // No node focus, but if filters are active, dim
+                // non-matching nodes via the same focus pipeline.
+                if let Some(fi) = self.field_index.as_ref() {
+                    fi.matches(&self.state.query.active_filters).unwrap_or_default()
+                } else {
+                    HashSet::new()
+                }
+            }
             Some(idx) => {
                 let ctx = FocusCtx {
                     n_nodes,
@@ -1313,6 +1395,7 @@ impl App {
                     edges: &edges_snapshot,
                     node_meta: None,
                     query: Some(&self.state.query),
+                    field_index: self.field_index.as_ref(),
                 };
                 focus_set::compute(idx, mode, &ctx)
             }
@@ -1341,7 +1424,8 @@ impl App {
             return;
         }
         let cache = self.search_cache.lock().unwrap().clone();
-        let ctx = EvalContext::new(&self.ids, &self.id_to_idx, &cache);
+        let ctx = EvalContext::new(&self.ids, &self.id_to_idx, &cache)
+            .with_field_index(self.field_index.as_ref());
         let selected = self.state.query.evaluate(&ctx);
         // hash for change-detect
         let h: u64 = match &selected {

@@ -78,6 +78,13 @@ impl AppState {
             }
         }
 
+        // meta_summary protobuf — same Arc<[u8]> serve path as the
+        // metric buffers above, but content-type is x-protobuf.
+        binary_cache.insert(
+            "meta_summary".into(),
+            Arc::from(crate::server::build_meta_summary_bytes(&graph)),
+        );
+
         Self {
             inner: Arc::new(AppStateInner {
                 vault_root,

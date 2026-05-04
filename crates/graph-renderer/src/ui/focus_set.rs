@@ -51,18 +51,16 @@ impl FocusMode {
             FocusMode::None => "None (single node)",
             FocusMode::SameCommunityId => "Same community id",
             FocusMode::SharedEdge => "Shared edge",
-            FocusMode::SharedTag => "Shared tag (needs vault meta cache)",
-            FocusMode::Filter => "Active filter (needs vault meta cache)",
+            FocusMode::SharedTag => "Shared tag",
+            FocusMode::Filter => "Active filter",
         }
     }
 
     /// Step-1 ships `None`, `SameCommunityId`, `SharedEdge`. The other
     /// two are surfaced in the UI but disabled with a tooltip.
     pub fn enabled(self) -> bool {
-        matches!(
-            self,
-            FocusMode::None | FocusMode::SameCommunityId | FocusMode::SharedEdge
-        )
+        // All modes enabled now that the field_index plumb-through lands.
+        true
     }
 }
 
@@ -80,6 +78,8 @@ pub struct FocusCtx<'a> {
     /// Active query model — Filter mode pulls its membership from here
     /// once the wiring lands.
     pub query: Option<&'a QueryModel>,
+    /// Inverted index for active-filter lookups + SharedTag fallback.
+    pub field_index: Option<&'a crate::ui::field_index::FieldIndex>,
 }
 
 /// Return the node-index set that belongs to the focused community
@@ -128,14 +128,27 @@ pub fn compute(focused_idx: u32, mode: FocusMode, ctx: &FocusCtx<'_>) -> HashSet
             set
         }
         FocusMode::SharedTag => {
-            // Stub: needs vault NodeMeta cache. Until then return only
-            // the focused node so the renderer still highlights it.
             set.insert(focused_idx);
+            // Reverse-lookup via field_index: union every `tags` bucket
+            // that contains `focused_idx`.
+            if let Some(fi) = ctx.field_index {
+                if let Some(buckets) = fi.by_field.get("tags") {
+                    for (_, idxs) in buckets {
+                        if idxs.binary_search(&focused_idx).is_ok() {
+                            for &i in idxs { set.insert(i); }
+                        }
+                    }
+                }
+            }
             set
         }
         FocusMode::Filter => {
-            // Stub: needs query evaluation context plumbed through.
             set.insert(focused_idx);
+            if let (Some(fi), Some(q)) = (ctx.field_index, ctx.query) {
+                if let Some(matched) = fi.matches(&q.active_filters) {
+                    for &i in &matched { set.insert(i); }
+                }
+            }
             set
         }
     }
@@ -153,6 +166,7 @@ mod tests {
             edges: &[],
             node_meta: None,
             query: None,
+            field_index: None,
         };
         let s = compute(2, FocusMode::None, &ctx);
         assert_eq!(s.len(), 1);
@@ -168,6 +182,7 @@ mod tests {
             edges: &edges,
             node_meta: None,
             query: None,
+            field_index: None,
         };
         let s = compute(0, FocusMode::SharedEdge, &ctx);
         assert!(s.contains(&0));

@@ -35,6 +35,14 @@ pub struct InspectorData<'a> {
     pub edges: &'a [u32], // packed [src, tgt, src, tgt, ...]
     pub selected_idx: Option<u32>,
     pub requested_selection: &'a mut Option<u32>,
+    /// Optional NodeMeta cache (id -> meta) for the badge row. The
+    /// inspector renders badge chips for tags / doctype / folder when
+    /// the meta for the selected node is present.
+    pub node_meta: Option<&'a HashMap<String, crate::proto::NodeMeta>>,
+    /// Mutable hook for badge clicks: when Some, the next badge toggle
+    /// writes (field, value) here for the App to forward into the
+    /// active filter set.
+    pub requested_filter_toggle: &'a mut Option<(String, String)>,
 }
 
 pub fn show(ctx: &egui::Context, state: &mut AppState, data: &mut InspectorData) {
@@ -135,6 +143,7 @@ fn show_expanded(ctx: &egui::Context, state: &mut AppState, data: &mut Inspector
                 .auto_shrink([false; 2])
                 .show(ui, |ui| {
                     show_metadata(ui, idx, data);
+                    show_badges(ui, idx, data);
                     ui.add_space(8.0);
                     show_community(ui, idx, data);
                     ui.add_space(8.0);
@@ -181,6 +190,43 @@ fn show_metadata(ui: &mut egui::Ui, idx: u32, data: &InspectorData) {
                 }
             }
         });
+}
+
+fn show_badges(ui: &mut egui::Ui, idx: u32, data: &mut InspectorData) {
+    use crate::ui::badge::{Badge, BadgeAction, BadgeKind};
+    let Some(map) = data.node_meta else { return };
+    let id = match data.ids.get(idx as usize) {
+        Some(s) => s,
+        None => return,
+    };
+    let Some(meta) = map.get(id) else { return };
+    if meta.tags.is_empty() && meta.folder.is_empty() && meta.doctype.is_none() {
+        return;
+    }
+    ui.add_space(4.0);
+    ui.horizontal_wrapped(|ui| {
+        for tag in &meta.tags {
+            if let BadgeAction::Toggle { field, value } =
+                Badge::new("tags", tag, BadgeKind::Tag).show(ui)
+            {
+                *data.requested_filter_toggle = Some((field, value));
+            }
+        }
+        if let Some(dt) = &meta.doctype {
+            if let BadgeAction::Toggle { field, value } =
+                Badge::new("doctype", dt, BadgeKind::Doctype).show(ui)
+            {
+                *data.requested_filter_toggle = Some((field, value));
+            }
+        }
+        if !meta.folder.is_empty() {
+            if let BadgeAction::Toggle { field, value } =
+                Badge::new("folder", &meta.folder, BadgeKind::Folder).show(ui)
+            {
+                *data.requested_filter_toggle = Some((field, value));
+            }
+        }
+    });
 }
 
 fn show_community(ui: &mut egui::Ui, idx: u32, data: &mut InspectorData) {

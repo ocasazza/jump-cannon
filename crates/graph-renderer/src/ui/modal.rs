@@ -16,6 +16,7 @@ use eframe::egui;
 use serde_json::Value;
 
 use crate::proto;
+use crate::ui::badge::{Badge, BadgeAction, BadgeKind};
 use crate::ui::theme::accent;
 
 /// Modal state stored on `App` (not persisted — open-state is ephemeral).
@@ -32,6 +33,7 @@ pub struct ModalState {
 pub struct ModalAction {
     pub navigate_to: Option<String>,
     pub toggle_filter: Option<(String, String)>,
+    pub open_url: Option<String>,
 }
 
 impl ModalAction {
@@ -39,12 +41,23 @@ impl ModalAction {
         Self {
             navigate_to: None,
             toggle_filter: None,
+            open_url: None,
         }
     }
 }
 
 /// Draw the modal. No-op if `!state.open` or no current node.
 pub fn show_modal(ctx: &egui::Context, state: &mut ModalState) -> ModalAction {
+    show_modal_with(ctx, state, &crate::ui::query::ActiveFieldFilters::default())
+}
+
+/// Variant that knows about the active filter set so badges paint with
+/// their selected/halo state.
+pub fn show_modal_with(
+    ctx: &egui::Context,
+    state: &mut ModalState,
+    filters: &crate::ui::query::ActiveFieldFilters,
+) -> ModalAction {
     let mut action = ModalAction::empty();
 
     if let Some(err) = state.fetch_error.clone() {
@@ -95,13 +108,50 @@ pub fn show_modal(ctx: &egui::Context, state: &mut ModalState) -> ModalAction {
         if !meta.tags.is_empty() {
             ui.horizontal_wrapped(|ui| {
                 for tag in &meta.tags {
-                    if tag_button(ui, tag).clicked() {
-                        action.toggle_filter = Some(("tag".into(), tag.clone()));
+                    let active = filters
+                        .by_field
+                        .get("tags")
+                        .map(|s| s.contains(tag))
+                        .unwrap_or(false);
+                    let b = Badge::new("tags", tag, BadgeKind::Tag).active(active);
+                    match b.show(ui) {
+                        BadgeAction::Toggle { field, value } => {
+                            action.toggle_filter = Some((field, value));
+                        }
+                        _ => {}
                     }
                 }
             });
             ui.separator();
         }
+        // doctype + folder badges row.
+        ui.horizontal_wrapped(|ui| {
+            if let Some(dt) = meta.doctype.as_ref() {
+                let active = filters
+                    .by_field
+                    .get("doctype")
+                    .map(|s| s.contains(dt))
+                    .unwrap_or(false);
+                if let BadgeAction::Toggle { field, value } =
+                    Badge::new("doctype", dt, BadgeKind::Doctype).active(active).show(ui)
+                {
+                    action.toggle_filter = Some((field, value));
+                }
+            }
+            if !meta.folder.is_empty() {
+                let active = filters
+                    .by_field
+                    .get("folder")
+                    .map(|s| s.contains(&meta.folder))
+                    .unwrap_or(false);
+                if let BadgeAction::Toggle { field, value } =
+                    Badge::new("folder", &meta.folder, BadgeKind::Folder).active(active).show(ui)
+                {
+                    action.toggle_filter = Some((field, value));
+                }
+            }
+        });
+        ui.separator();
 
         // frontmatter rows
         if !meta.frontmatter_json.is_empty() {
@@ -221,28 +271,33 @@ fn render_string_value(
     if let Some(target) = parse_wikilink(trimmed) {
         let (page, alias) = target;
         let label = alias.unwrap_or_else(|| page.clone());
-        if wikilink_button(ui, &label).clicked() {
-            action.navigate_to = Some(page);
+        let b = Badge::new(
+            field,
+            &label,
+            BadgeKind::Wikilink {
+                resolved: true,
+                target: page.clone(),
+            },
+        );
+        if let BadgeAction::Navigate { target } = b.show(ui) {
+            action.navigate_to = Some(target);
         }
         return;
     }
 
     // url
     if is_url(trimmed) {
-        if url_button(ui, trimmed).clicked() {
-            // Open in new tab on wasm. On native this is a no-op badge — clicking
-            // still doesn't open a browser, but we emit a filter intent so
-            // callers can hook it.
-            #[cfg(target_arch = "wasm32")]
-            {
-                if let Some(window) = web_sys::window() {
-                    let _ = window.open_with_url_and_target(trimmed, "_blank");
-                }
-            }
-            #[cfg(not(target_arch = "wasm32"))]
-            {
-                let _ = trimmed; // silence unused on native
-            }
+        let host = host_from_url(trimmed).unwrap_or_default();
+        let b = Badge::new(
+            field,
+            trimmed,
+            BadgeKind::Url {
+                href: trimmed.to_string(),
+                host,
+            },
+        );
+        if let BadgeAction::OpenUrl { href } = b.show(ui) {
+            action.open_url = Some(href);
         }
         return;
     }
@@ -306,6 +361,12 @@ fn parse_wikilink(s: &str) -> Option<(String, Option<String>)> {
     }
 }
 
+fn host_from_url(s: &str) -> Option<String> {
+    let rest = s.strip_prefix("https://").or_else(|| s.strip_prefix("http://"))?;
+    let host = rest.split(|c: char| c == '/' || c == ':' || c == '?').next()?;
+    Some(host.to_string())
+}
+
 fn is_url(s: &str) -> bool {
     (s.starts_with("http://") || s.starts_with("https://"))
         && !s.contains(char::is_whitespace)
@@ -367,6 +428,7 @@ fn status_color(s: &str) -> Option<egui::Color32> {
 
 // ---------- badge widgets ----------
 
+#[allow(dead_code)]
 fn tag_button(ui: &mut egui::Ui, label: &str) -> egui::Response {
     let txt = egui::RichText::new(label).monospace().small();
     ui.add(
@@ -387,6 +449,7 @@ fn plain_badge(ui: &mut egui::Ui, label: &str) -> egui::Response {
     )
 }
 
+#[allow(dead_code)]
 fn wikilink_button(ui: &mut egui::Ui, label: &str) -> egui::Response {
     // Wikilink chip: filled darker than tag badges to read distinctly.
     let txt = egui::RichText::new(format!("⟶ {label}"))
@@ -401,6 +464,7 @@ fn wikilink_button(ui: &mut egui::Ui, label: &str) -> egui::Response {
     )
 }
 
+#[allow(dead_code)]
 fn url_button(ui: &mut egui::Ui, url: &str) -> egui::Response {
     let display = if url.len() > 48 {
         format!("{}…", &url[..47])

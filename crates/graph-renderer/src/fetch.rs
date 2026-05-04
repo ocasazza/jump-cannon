@@ -58,6 +58,11 @@ impl ApiClient {
         proto::NodeMeta::decode(&*bytes).map_err(|e| format!("decode node: {e}"))
     }
 
+    pub async fn meta_summary(&self) -> Result<proto::MetaSummary, String> {
+        let bytes = http_get_bytes(&self.url("/graph/meta_summary")).await?;
+        proto::MetaSummary::decode(&*bytes).map_err(|e| format!("decode meta_summary: {e}"))
+    }
+
     pub async fn search(&self, q: &str) -> Result<proto::SearchResults, String> {
         let bytes = http_get_bytes(&self.url(&format!("/search?q={}", urlencode(q)))).await?;
         proto::SearchResults::decode(&*bytes).map_err(|e| format!("decode search: {e}"))
