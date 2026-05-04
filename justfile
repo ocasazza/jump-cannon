@@ -88,6 +88,25 @@ test-browser: wasm
     fi
     cd tests/browser && node run.mjs
 
+# Headless browser REGRESSION suite. Sibling to `test-browser`; shares
+# the same boot scaffolding (factored into tests/browser/harness.mjs)
+# but runs a handful of named UI regression checks instead of a single
+# canvas-bright smoke. Output: tests/browser/out/regression-*.png + a
+# JSON line on stdout. Exit 0 = ok, 1 = regression fired.
+regression-test: wasm
+    cargo build --release -p graph-api
+    @mkdir -p /tmp/test-vault
+    @if [ ! -f /tmp/test-vault/Alpha.md ]; then \
+        printf 'See [[Beta]] and [[Gamma]].\n' > /tmp/test-vault/Alpha.md; \
+        printf '[[Alpha]]\n' > /tmp/test-vault/Beta.md; \
+        printf '[[Alpha]] [[Beta]]\n' > /tmp/test-vault/Gamma.md; \
+    fi
+    @if [ ! -d tests/browser/node_modules ]; then \
+        echo "→ installing playwright npm package (one-time)…"; \
+        cd tests/browser && npm install --silent --no-audit --no-fund; \
+    fi
+    cd tests/browser && node regression.mjs
+
 # Headless browser PROFILER. Same setup as test-browser but instead of a
 # pass/fail screenshot check it captures rAF frame timings + a V8 CPU
 # profile (.cpuprofile) per phase (idle / palette-open / fit-camera).

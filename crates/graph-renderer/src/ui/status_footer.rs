@@ -29,6 +29,13 @@ pub fn show(
     open: &mut bool,
     progress: &mut Progress,
 ) {
+    // One-shot first-paint ping. The headless regression suite reads
+    // this to assert the footer mounts on boot — guards against the
+    // panel being hidden under another panel via stacking-order bugs.
+    static FOOTER_LOGGED: std::sync::Once = std::sync::Once::new();
+    FOOTER_LOGGED.call_once(|| {
+        log::info!("[graph-renderer] status footer mounted");
+    });
     let panel = egui::TopBottomPanel::bottom("status-footer")
         .resizable(*open)
         .show_separator_line(true);

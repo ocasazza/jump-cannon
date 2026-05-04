@@ -80,6 +80,13 @@ fn show_collapsed(ctx: &egui::Context, state: &mut AppState) {
 }
 
 fn show_expanded(ctx: &egui::Context, state: &mut AppState, data: &mut InspectorData) {
+    // One-shot ping per mount-with-selection. The headless regression
+    // suite asserts this fires after a node-click sweep — captures
+    // future regressions where the inspector silently fails to mount.
+    log::info!(
+        "[graph-renderer] inspector mounted: idx={}",
+        data.selected_idx.unwrap_or(u32::MAX),
+    );
     egui::SidePanel::right("inspector")
         .default_width(PANEL_W)
         .width_range(PANEL_W_MIN..=PANEL_W_MAX)

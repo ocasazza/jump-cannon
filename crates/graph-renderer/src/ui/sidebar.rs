@@ -69,7 +69,15 @@ fn show_activity_bar(ctx: &egui::Context, state: &mut AppState) {
                     for &section in Section::ALL {
                         let active = state.active_section == Some(section);
                         if activity_button(ui, section, active).clicked() {
-                            state.active_section = if active { None } else { Some(section) };
+                            let next = if active { None } else { Some(section) };
+                            // One-shot log per real change — used by the
+                            // headless regression suite to verify the
+                            // activity-bar click path stays wired up.
+                            log::info!(
+                                "[graph-renderer] active_section -> {:?}",
+                                next.map(|s| s.title()),
+                            );
+                            state.active_section = next;
                         }
                     }
                 });

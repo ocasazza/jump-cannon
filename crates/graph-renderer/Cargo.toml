@@ -25,7 +25,7 @@ wasm    = [
 ]
 
 [dependencies]
-eframe   = { version = "0.30", default-features = false, features = ["default_fonts", "wgpu", "wayland", "x11", "persistence"] }
+eframe   = { version = "0.30", default-features = false, features = ["default_fonts", "wgpu", "wayland", "x11", "persistence", "accesskit"] }
 egui     = "0.30"
 egui-wgpu = "0.30"
 egui_plot = "0.30"
@@ -81,3 +81,10 @@ features = [
 
 [build-dependencies]
 prost-build = "0.13"
+
+# Native-only dev deps. egui_kittest pins to the same egui minor (0.30)
+# we already use; it brings in `wgpu` 23 / `image` 0.25 from the existing
+# graph already, so no extra transitive cost. Wasm build path doesn't
+# pull dev-deps so this stays out of the trunk bundle.
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+egui_kittest = "0.30"

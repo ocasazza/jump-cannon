@@ -332,6 +332,15 @@ impl<'a, 'ctx> WorkspaceViewer<'a, 'ctx> {
         if yaw_d != 0.0 || pitch_d != 0.0 || pan_x != 0.0 || pan_y != 0.0
             || pan_z != 0.0 || zoom != 0.0
         {
+            // One-shot debug ping per non-zero camera-delta frame. Used by
+            // the headless `tests/browser/regression.mjs` regression suite
+            // to assert scroll-zoom + WASD pan stay wired up. Gated by the
+            // existing RUST_LOG=info default — no spam unless the user
+            // actually moves the camera.
+            log::info!(
+                "[graph-renderer] camera input: yaw={:.4} pitch={:.4} pan_xyz=[{:.2},{:.2},{:.2}] zoom={:.2}",
+                yaw_d, pitch_d, pan_x, pan_y, pan_z, zoom
+            );
             if let Some(wgpu_state) = self.ctx.frame.wgpu_render_state() {
                 let mut renderer = wgpu_state.renderer.write();
                 if let Some(pipes) = renderer.callback_resources.get_mut::<GraphPipelines>() {
