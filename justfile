@@ -35,9 +35,25 @@ run:
 build:
     cargo build --release --workspace
 
-# Run all tests.
-test:
-    cargo test --workspace
+# Run tests. `just test` runs everything; pass a target for one layer:
+#   just test            # all (cargo + browser smoke + regression e2e)
+#   just test cargo      # native unit + integration tests
+#   just test browser    # Playwright canvas-not-black smoke
+#   just test regression # Playwright UI regression suite
+#   just test perf       # headless perf gate (synth vault)
+#   just test profile    # diagnostic profiler (3-phase flame trace)
+test target='all':
+    #!/usr/bin/env bash
+    set -euo pipefail
+    case "{{target}}" in
+      all)        just test cargo && just test browser && just test regression ;;
+      cargo)      cargo test --workspace ;;
+      browser)    just _test-browser ;;
+      regression) just _test-regression ;;
+      perf)       just _test-perf ;;
+      profile)    just _test-profile ;;
+      *) echo "unknown test target: {{target}} (try: cargo, browser, regression, perf, profile)" >&2; exit 1 ;;
+    esac
 
 # Format the workspace.
 fmt:
@@ -69,7 +85,7 @@ clean-wasm:
 # isn't all-black + no console errors. Output:
 # tests/browser/out/screenshot.png and a JSON result on stdout.
 # Exit 0 = ok, 1 = canvas dark / page error / startup timeout.
-test-browser: wasm
+_test-browser: wasm
     @# Build graph-api binary if missing
     cargo build --release -p graph-api
     @# Tiny synthetic vault with three cross-linked notes
@@ -93,7 +109,7 @@ test-browser: wasm
 # but runs a handful of named UI regression checks instead of a single
 # canvas-bright smoke. Output: tests/browser/out/regression-*.png + a
 # JSON line on stdout. Exit 0 = ok, 1 = regression fired.
-regression-test: wasm
+_test-regression: wasm
     cargo build --release -p graph-api
     @mkdir -p /tmp/test-vault
     @if [ ! -f /tmp/test-vault/Alpha.md ]; then \
@@ -113,7 +129,7 @@ regression-test: wasm
 # Output: tests/browser/out/profile-*.{png,cpuprofile} + a JSON summary
 # on stdout (avg FPS, p50/p95/p99 frame time, jank pct, top-12 hot fns).
 # Drop the .cpuprofile into Chrome DevTools → Performance for a flame chart.
-profile-browser: wasm
+_test-profile: wasm
     cargo build --release -p graph-api
     @mkdir -p /tmp/test-vault
     @if [ ! -f /tmp/test-vault/Alpha.md ]; then \
@@ -135,7 +151,7 @@ profile-browser: wasm
 # PERF_MIN_FPS (50), PERF_MAX_P99_MS (25), PERF_MAX_JANK_PCT (5).
 # Side effect: writes tests/browser/out/perf-idle.flame.txt — an
 # AI-readable text flame graph of where time went.
-perf-test: wasm
+_test-perf: wasm
     cargo build --release -p graph-api
     @if [ ! -d tests/browser/node_modules ]; then \
         echo "→ installing playwright npm package (one-time)…"; \
