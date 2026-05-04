@@ -76,21 +76,32 @@ pub fn default_sizes(n: usize) -> Vec<f32> {
     vec![3.0; n]
 }
 
-/// 12-entry palette used to cycle through community / wcc ids. RGB
-/// triples in 0..1; alpha is appended downstream.
-const PALETTE: [[f32; 3]; 12] = [
-    [0.85, 0.90, 1.00],
-    [0.95, 0.62, 0.40],
-    [0.55, 0.80, 0.50],
-    [0.95, 0.85, 0.40],
-    [0.65, 0.55, 0.95],
-    [0.40, 0.85, 0.85],
-    [0.95, 0.55, 0.75],
-    [0.80, 0.40, 0.40],
-    [0.50, 0.65, 0.95],
-    [0.95, 0.95, 0.95],
-    [0.45, 0.95, 0.65],
-    [0.95, 0.40, 0.95],
+/// Tableau20 — kept in sync with `vault-data::color::PALETTE` so
+/// renderer-side colours match what the server announces in
+/// `/graph/init.palette`. Cosmograph's reference demo uses the same
+/// d3 categorical-20 family, so this also matches the Obsidian-vault
+/// look the user is calibrating against.
+const PALETTE: [[f32; 3]; 20] = [
+    [0.122, 0.471, 0.706],
+    [0.682, 0.780, 0.910],
+    [1.000, 0.498, 0.055],
+    [1.000, 0.733, 0.471],
+    [0.173, 0.627, 0.173],
+    [0.596, 0.875, 0.541],
+    [0.839, 0.153, 0.157],
+    [1.000, 0.596, 0.588],
+    [0.580, 0.404, 0.741],
+    [0.773, 0.690, 0.835],
+    [0.549, 0.337, 0.294],
+    [0.769, 0.612, 0.580],
+    [0.890, 0.467, 0.761],
+    [0.969, 0.714, 0.824],
+    [0.498, 0.498, 0.498],
+    [0.780, 0.780, 0.780],
+    [0.737, 0.741, 0.133],
+    [0.859, 0.859, 0.553],
+    [0.090, 0.745, 0.812],
+    [0.620, 0.855, 0.898],
 ];
 
 fn palette_color(idx: u32) -> [f32; 3] {

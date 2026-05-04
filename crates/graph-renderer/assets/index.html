@@ -21,5 +21,12 @@
 </head>
 <body>
   <div id="loader-strip"></div>
+  <script>
+    // Suppress the browser's default right-click menu on the page —
+    // we use RMB-drag to rotate the camera (3D-editor convention).
+    // Without this, Chromium opens its context menu on mousedown and
+    // egui never sees the secondary-button press.
+    window.addEventListener('contextmenu', e => e.preventDefault());
+  </script>
 </body>
 </html>
