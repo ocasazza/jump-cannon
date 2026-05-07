@@ -18,9 +18,16 @@ use crate::ui::query::EvalContext;
 use crate::ui::state::{ColorBy, FontFamilyChoice, SizeBy};
 use graph_layouts::{warmup_positions, GpuForceOptions};
 
-/// Result of an async `/node/:id` fetch — Some(Ok) success, Some(Err) error,
-/// None means no fetch has completed since the last poll.
-type NodeFetchSlot = Arc<Mutex<Option<Result<proto::NodeMeta, String>>>>;
+/// Result of an async `/node/:id` fetch.
+///
+/// Outer `Option` = "did a fetch complete since the last poll?". When the
+/// outer is `Some`, the inner `Result` is the fetch outcome:
+///   * `Ok(Some(meta))` — server returned a NodeMeta.
+///   * `Ok(None)`       — server returned 404 (id legitimately not in the
+///     in-memory graph and no Prisma fallback configured). Soft outcome:
+///     the renderer just skips opening the modal instead of logging.
+///   * `Err(e)`         — actual transport / decode failure.
+type NodeFetchSlot = Arc<Mutex<Option<Result<Option<proto::NodeMeta>, String>>>>;
 
 /// Shared cache of `/search?q=` results keyed by the query string.
 /// Async tasks push into it; the evaluator reads from it.
@@ -131,6 +138,19 @@ pub struct App {
     /// would actually differ.
     focus_pushed_idx: Option<u32>,
     focus_pushed_mode: Option<FocusMode>,
+    /// Saved [`FocusMode`] from the moment `active_filters` transitioned
+    /// empty→non-empty via a badge click. Restored when the filter set
+    /// drains back to empty so the user lands back on whatever mode they
+    /// had selected before the auto-flip. Session-only, never persisted —
+    /// an app reload starts with no snapshot, so a persisted non-empty
+    /// filter set won't trigger a phantom restore.
+    previous_focus_mode: Option<FocusMode>,
+    /// Tracks whether `active_filters` was non-empty on the previous
+    /// frame. Drives empty→non-empty (auto-flip) and non-empty→empty
+    /// (restore) transitions regardless of *which* surface mutated the
+    /// filter set (inspector badges, modal badges, filter chip strip,
+    /// query builder etc).
+    prev_filters_non_empty: bool,
     /// Throttle: most recent hover-raycast timestamp.
     last_hover_raycast_at: Option<web_time::Instant>,
     /// Hover release timer — once hover goes empty, hold the previous
@@ -267,6 +287,8 @@ impl App {
             focus_hover_idx: None,
             focus_pushed_idx: None,
             focus_pushed_mode: None,
+            previous_focus_mode: None,
+            prev_filters_non_empty: false,
             last_hover_raycast_at: None,
             hover_clear_at: None,
             field_index: None,
@@ -299,7 +321,15 @@ impl App {
                 let client = ApiClient::new(self.base_url.clone());
                 let id_for_task = id.clone();
                 spawn_async(async move {
-                    let result = client.node(&id_for_task).await;
+                    // `client.node(...)` returns Ok(None) on a 404. The
+                    // palette preview surface treats "not found" as an
+                    // error message rather than carrying a tri-state into
+                    // the cache; map None -> Err("not found") here.
+                    let result = match client.node(&id_for_task).await {
+                        Ok(Some(meta)) => Ok(meta),
+                        Ok(None) => Err("not found".to_string()),
+                        Err(e) => Err(e),
+                    };
                     *slot.lock().unwrap() = Some((id_for_task, result));
                 });
             }
@@ -342,15 +372,24 @@ impl App {
     }
 
     /// Drain a completed `/node/:id` fetch into the modal state, if any.
+    ///
+    /// `Ok(Some)` opens the modal as before. `Ok(None)` (server 404) is a
+    /// soft outcome — log at debug level only and leave the modal closed,
+    /// so we don't spam the console for ids that legitimately aren't in
+    /// the in-memory graph (these largely live in the Prisma DB now).
+    /// `Err(e)` is a real transport/decode failure and still surfaces.
     fn drain_node_fetch(&mut self) {
         let result_opt = self.node_fetch.lock().unwrap().take();
         let Some(result) = result_opt else { return };
         match result {
-            Ok(meta) => {
+            Ok(Some(meta)) => {
                 log::info!("[graph-renderer] modal: fetched node {}", meta.id);
                 self.modal.fetch_error = None;
                 self.modal.current = Some(meta);
                 self.modal.open = true;
+            }
+            Ok(None) => {
+                log::debug!("[graph-renderer] modal: node not found (404), no modal");
             }
             Err(e) => {
                 log::warn!("[graph-renderer] modal: fetch error: {e}");
@@ -733,6 +772,20 @@ impl eframe::App for App {
         }
 
         if let Some((rect, pos)) = click {
+            // Coordinate-space chain for the click → node-pick path:
+            // - `pos` is an egui::Pos2 in *logical* pixels, in screen-space
+            //   relative to the egui root (top-left = (0,0)).
+            // - `rect` is the *exact* tab-content rect that the wgpu callback
+            //   painted into this frame (captured in workspace.rs at click
+            //   time so it can't drift if the layout reflows next frame).
+            // - `ndc_x`, `ndc_y`: NDC of the cursor inside the canvas, in
+            //   [-1, 1] with y-up. NDC y is flipped from window y because
+            //   wgpu/glam clip space is y-up while egui pixels are y-down.
+            // The same rect's width/height feed `screen_px` in
+            // GraphPipelines, which also drives camera.aspect — so the
+            // projection matrix used by raycast() matches the rect we
+            // painted into and the rect we hit-test against. (See
+            // GraphPipelines::raycast for the projection / pick math.)
             let ndc_x = (pos.x - rect.left()) / rect.width().max(1.0) * 2.0 - 1.0;
             let ndc_y = -((pos.y - rect.top()) / rect.height().max(1.0) * 2.0 - 1.0);
             if let Some(idx) = self.raycast_idx(frame, ndc_x, ndc_y) {
@@ -826,6 +879,15 @@ impl eframe::App for App {
         self.apply_cursor_force(frame);
         self.tick_post_click_cooldown(frame);
         self.perf.end_stage(StageId::ApplyEffects);
+
+        // Detect filter-set empty<->non-empty transitions and auto-flip
+        // the user's FocusMode so a badge click engages focus dim the same
+        // way clicking a node does. Restore the saved mode when the filter
+        // set drains back to empty. Runs every frame so any surface that
+        // mutates `active_filters` (inspector badges, modal badges, filter
+        // chip strip, query builder) participates without per-call-site
+        // bookkeeping.
+        self.handle_filter_focus_auto_flip();
 
         self.perf.begin_stage(StageId::ApplySelection);
         self.apply_selection(frame);
@@ -1355,6 +1417,47 @@ impl App {
             }
             _ => {}
         }
+    }
+
+    /// Auto-flip the active [`FocusMode`] to [`FocusMode::Filter`] on
+    /// the empty→non-empty `active_filters` edge, and restore the saved
+    /// mode on the non-empty→empty edge.
+    ///
+    /// Conservative rule: we only snapshot at the empty→non-empty edge
+    /// and only restore at the non-empty→empty edge. Any manual mode
+    /// change made *while* filters are active is preserved (we never
+    /// re-flip mid-session), and the snapshot is session-only — an app
+    /// reload starts with `previous_focus_mode = None`, so a persisted
+    /// non-empty filter set produces no phantom restore on the first
+    /// non-empty→empty transition either (we'd just have nothing to
+    /// restore).
+    fn handle_filter_focus_auto_flip(&mut self) {
+        let now_non_empty =
+            !self.state.query.active_filters.by_field.is_empty();
+        match (self.prev_filters_non_empty, now_non_empty) {
+            (false, true) => {
+                let prev = self.state.focus.focus_mode;
+                self.previous_focus_mode = Some(prev);
+                if prev != FocusMode::Filter {
+                    self.state.focus.focus_mode = FocusMode::Filter;
+                    log::info!(
+                        "[graph-renderer] focus auto-flipped: prev={:?} -> Filter",
+                        prev
+                    );
+                }
+            }
+            (true, false) => {
+                if let Some(prev) = self.previous_focus_mode.take() {
+                    self.state.focus.focus_mode = prev;
+                    log::info!(
+                        "[graph-renderer] focus restored: -> {:?}",
+                        prev
+                    );
+                }
+            }
+            _ => {}
+        }
+        self.prev_filters_non_empty = now_non_empty;
     }
 
     /// Resolve the active focused-node idx (sticky beats hover) and push

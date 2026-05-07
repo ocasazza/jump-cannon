@@ -17,7 +17,7 @@ use serde_json::Value;
 
 use crate::proto;
 use crate::ui::badge::{Badge, BadgeAction, BadgeKind};
-use crate::ui::theme::accent;
+use crate::ui::theme::{accent, palette};
 
 /// Modal state stored on `App` (not persisted — open-state is ephemeral).
 #[derive(Default)]
@@ -433,7 +433,7 @@ fn tag_button(ui: &mut egui::Ui, label: &str) -> egui::Response {
     let txt = egui::RichText::new(label).monospace().small();
     ui.add(
         egui::Button::new(txt)
-            .stroke(egui::Stroke::new(1.0, egui::Color32::WHITE))
+            .stroke(egui::Stroke::new(1.0, palette::BORDER))
             .fill(egui::Color32::BLACK)
             .small(),
     )
@@ -443,7 +443,7 @@ fn plain_badge(ui: &mut egui::Ui, label: &str) -> egui::Response {
     let txt = egui::RichText::new(label).monospace().small();
     ui.add(
         egui::Button::new(txt)
-            .stroke(egui::Stroke::new(1.0, egui::Color32::WHITE))
+            .stroke(egui::Stroke::new(1.0, palette::BORDER))
             .fill(egui::Color32::BLACK)
             .small(),
     )
@@ -474,7 +474,7 @@ fn url_button(ui: &mut egui::Ui, url: &str) -> egui::Response {
     let txt = egui::RichText::new(display).monospace().small().underline();
     ui.add(
         egui::Button::new(txt)
-            .stroke(egui::Stroke::new(1.0, egui::Color32::WHITE))
+            .stroke(egui::Stroke::new(1.0, palette::BORDER))
             .fill(egui::Color32::BLACK)
             .small(),
     )

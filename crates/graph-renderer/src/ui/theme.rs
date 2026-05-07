@@ -136,10 +136,14 @@ pub fn apply(ctx: &egui::Context) {
     let v = &mut style.visuals;
 
     v.dark_mode = true;
-    v.override_text_color = Some(palette::WHITE);
+    // Default body text uses the softer off-white so widget labels read
+    // as ink rather than max-contrast LED-on-black.
+    v.override_text_color = Some(palette::TEXT);
     v.window_fill = palette::BLACK;
     v.panel_fill = palette::BLACK;
-    v.window_stroke = egui::Stroke::new(1.0, egui::Color32::WHITE);
+    // Chrome borders (windows, frames) ride the darker BORDER grey so
+    // they sit against the panel fill without fighting the canvas.
+    v.window_stroke = egui::Stroke::new(1.0, palette::BORDER);
     v.menu_rounding = egui::Rounding::ZERO;
     v.window_rounding = egui::Rounding::ZERO;
     v.widgets.noninteractive.rounding = egui::Rounding::ZERO;
@@ -150,20 +154,27 @@ pub fn apply(ctx: &egui::Context) {
 
     let bg = egui::Color32::BLACK;
     let fg = egui::Color32::WHITE;
-    let stroke = egui::Stroke::new(1.0, fg);
+    // Noninteractive / inactive chrome strokes use BORDER (separators,
+    // frame edges). The hovered / active states keep WHITE because they
+    // flip to a white-fill inverted look — the stroke must read max
+    // contrast against the dark surrounding chrome.
+    let chrome_stroke = egui::Stroke::new(1.0, palette::BORDER);
+    // fg_stroke for noninteractive / inactive is the body-text colour;
+    // egui uses it for label text on widgets like sliders.
+    let text_stroke = egui::Stroke::new(1.0, palette::TEXT);
     v.widgets.noninteractive.bg_fill = bg;
-    v.widgets.noninteractive.bg_stroke = stroke;
-    v.widgets.noninteractive.fg_stroke = stroke;
+    v.widgets.noninteractive.bg_stroke = chrome_stroke;
+    v.widgets.noninteractive.fg_stroke = text_stroke;
     v.widgets.inactive.bg_fill = bg;
-    v.widgets.inactive.bg_stroke = stroke;
-    v.widgets.inactive.fg_stroke = stroke;
+    v.widgets.inactive.bg_stroke = chrome_stroke;
+    v.widgets.inactive.fg_stroke = text_stroke;
     v.widgets.inactive.weak_bg_fill = bg;
     v.widgets.hovered.bg_fill = fg;
-    v.widgets.hovered.bg_stroke = stroke;
+    v.widgets.hovered.bg_stroke = egui::Stroke::new(1.0, fg);
     v.widgets.hovered.fg_stroke = egui::Stroke::new(1.0, bg);
     v.widgets.hovered.weak_bg_fill = fg;
     v.widgets.active.bg_fill = fg;
-    v.widgets.active.bg_stroke = stroke;
+    v.widgets.active.bg_stroke = egui::Stroke::new(1.0, fg);
     v.widgets.active.fg_stroke = egui::Stroke::new(1.0, bg);
     v.widgets.active.weak_bg_fill = fg;
     v.widgets.open.bg_fill = bg;

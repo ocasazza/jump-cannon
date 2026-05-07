@@ -66,7 +66,7 @@ fn draw_collapsed(ui: &mut egui::Ui, open: &mut bool, progress: &Progress) {
             ui.label(
                 egui::RichText::new(format!("{} › {}", task.group, task.label))
                     .small()
-                    .color(palette::WHITE),
+                    .color(palette::TEXT),
             );
         } else {
             ui.label(

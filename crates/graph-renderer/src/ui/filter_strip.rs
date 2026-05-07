@@ -9,6 +9,7 @@ use eframe::egui::{self, Align2};
 
 use crate::ui::badge::{Badge, BadgeAction, BadgeKind};
 use crate::ui::query::QueryModel;
+use crate::ui::theme::palette;
 
 pub fn show(ctx: &egui::Context, query: &mut QueryModel) {
     let total: usize = query
@@ -31,7 +32,7 @@ pub fn show(ctx: &egui::Context, query: &mut QueryModel) {
         .show(ctx, |ui| {
             egui::Frame::none()
                 .fill(egui::Color32::from_rgba_unmultiplied(5, 7, 16, 220))
-                .stroke(egui::Stroke::new(1.0, egui::Color32::from_gray(128)))
+                .stroke(egui::Stroke::new(1.0, palette::BORDER))
                 .rounding(egui::Rounding::same(6.0))
                 .inner_margin(egui::Margin::symmetric(10.0, 6.0))
                 .show(ui, |ui| {
@@ -47,7 +48,8 @@ pub fn show(ctx: &egui::Context, query: &mut QueryModel) {
                         for field in &order {
                             // Field-name lozenge with ✕.
                             let field_badge = Badge::new(field, field, BadgeKind::Generic)
-                                .with_x(true);
+                                .with_x(true)
+                                .small(true);
                             match field_badge.show(ui) {
                                 BadgeAction::Toggle { .. } => {
                                     to_clear_field = Some(field.clone());
@@ -59,7 +61,8 @@ pub fn show(ctx: &egui::Context, query: &mut QueryModel) {
                                     let kind = badge_kind_for(field, v);
                                     let b = Badge::new(field, v, kind)
                                         .active(true)
-                                        .with_x(true);
+                                        .with_x(true)
+                                        .small(true);
                                     match b.show(ui) {
                                         BadgeAction::Toggle { field, value } => {
                                             to_toggle = Some((field, value));

@@ -176,14 +176,21 @@ impl<'a, 'ctx> egui_dock::TabViewer for WorkspaceViewer<'a, 'ctx> {
     }
 }
 
-/// Sign-preserving response curve for mouse-rotate deltas: linear at
-/// small magnitudes (sub-pixel precision) and quadratic past ~6px so
-/// big sweeps fly while tiny corrections still land where you point.
-/// `dx + dx * |dx| / 24` — small `|dx|` ⇒ ~`dx`; large `|dx|` grows
-/// roughly with `dx²`. Matches the "shaped sensitivity" feel from
-/// Blender / Unreal viewport navigation.
+/// Sign-preserving response curve for mouse-rotate deltas. Goal: keep
+/// the linear floor for sub-2px nudges (so 1-pixel corrections stay 1-pixel)
+/// while ramping hard past ~10px so a real hand-sweep produces a full
+/// rotation without the user dragging across the entire screen.
+///
+/// Shape: `dx + sign(dx) * |dx|^2 / 12 + sign(dx) * |dx|^3 / 900`.
+/// - At `|dx|=1`: ≈ 1 + 0.083 + 0.001 ≈ 1.08 (essentially linear)
+/// - At `|dx|=2`: ≈ 2 + 0.33 + 0.009 ≈ 2.34 (still close to linear)
+/// - At `|dx|=10`: ≈ 10 + 8.33 + 1.11 ≈ 19.4 (~2× boost)
+/// - At `|dx|=25`: ≈ 25 + 52 + 17.4 ≈ 94 (~3.8× boost — sweeps fly)
+/// The cubic term provides the "hand sweep = full rotation" lift past
+/// the ~10px knee without touching small-delta precision.
 fn apply_rotate_curve(dx: f32) -> f32 {
-    dx + dx * dx.abs() / 24.0
+    let a = dx.abs();
+    dx + dx.signum() * a * a / 12.0 + dx.signum() * a * a * a / 900.0
 }
 
 impl<'a, 'ctx> WorkspaceViewer<'a, 'ctx> {
@@ -277,12 +284,11 @@ impl<'a, 'ctx> WorkspaceViewer<'a, 'ctx> {
             let mut dy = d.y;
             if self.ctx.invert_mouse_x { dx = -dx; }
             if self.ctx.invert_mouse_y { dy = -dy; }
-            // Sensitivity bumped from 0.005 → 0.0085 with a mild
-            // signed-quadratic curve so small drags stay precise but
-            // big sweeps fly. `apply_curve` keeps the sign and grows
-            // super-linearly past ~6px deltas.
-            yaw_d   += apply_rotate_curve(dx) * 0.0085;
-            pitch_d -= apply_rotate_curve(dy) * 0.0085;
+            // Sensitivity 0.0085 → 0.011 paired with a steeper
+            // quadratic+cubic curve (see `apply_rotate_curve`) so 1px
+            // corrections stay precise while hand-sweeps actually fly.
+            yaw_d   += apply_rotate_curve(dx) * 0.011;
+            pitch_d -= apply_rotate_curve(dy) * 0.011;
         }
 
         // Wheel + pinch zoom. `smooth_scroll_delta` is the egui-recommended
@@ -294,22 +300,34 @@ impl<'a, 'ctx> WorkspaceViewer<'a, 'ctx> {
         // the device-of-the-day picks whichever it has.
         if pointer_in_canvas {
             let (scroll, pinch) = ui.input(|i| (i.smooth_scroll_delta.y, i.zoom_delta()));
-            if scroll.abs() > 0.5 {
-                // sqrt curve preserves sign and feels responsive on
-                // small scrolls without flying on a hard flick.
-                zoom += scroll.signum() * scroll.abs().sqrt() * 18.0;
+            // De-double-count: many laptops emit the same two-finger
+            // gesture as both `smooth_scroll_delta` AND `zoom_delta` in
+            // the same frame. Pinch wins when present — it's the more
+            // intentional "zoom" signal — and we then drop scroll for
+            // this frame so the camera doesn't double up.
+            let pinch_active = (pinch - 1.0).abs() > 1e-3;
+            if pinch_active {
+                // `(pinch - 1.0)` is a small signed multiplier. Bumped
+                // from ×240 → ×320 so trackpad pinch feels closer to
+                // ctrl+wheel intensity. Still drained by egui itself.
+                zoom += (pinch - 1.0) * 320.0;
+                // Drain the wheel signal so it can't sneak through on
+                // a later frame as a phantom second contribution.
                 ui.ctx().input_mut(|i| {
                     i.smooth_scroll_delta = egui::Vec2::ZERO;
                     i.raw_scroll_delta = egui::Vec2::ZERO;
                 });
-            }
-            // Pinch: egui reports a multiplicative factor. Convert to
-            // an additive zoom-units delta so it lives on the same
-            // pipe as the wheel — `(pinch - 1.0)` is small and signed.
-            // egui resets `zoom_factor_delta` itself between frames so
-            // we don't need to clear it; just consume.
-            if (pinch - 1.0).abs() > 1e-3 {
-                zoom += (pinch - 1.0) * 240.0;
+            } else if scroll.abs() > 0.5 {
+                // Mixed curve: a linear floor (so 1-tick wheel notches
+                // and tiny trackpad swipes still feel proportional)
+                // plus a sqrt tail for hard flicks. Coefficient bumped
+                // from 18 → 26 so trackpad two-finger swipes don't
+                // feel under-driven.
+                zoom += scroll.signum() * (scroll.abs() * 0.6 + scroll.abs().sqrt() * 26.0);
+                ui.ctx().input_mut(|i| {
+                    i.smooth_scroll_delta = egui::Vec2::ZERO;
+                    i.raw_scroll_delta = egui::Vec2::ZERO;
+                });
             }
         }
 
@@ -380,7 +398,23 @@ impl<'a, 'ctx> WorkspaceViewer<'a, 'ctx> {
                     if pan_x != 0.0 || pan_y != 0.0 || pan_z != 0.0 {
                         pipes.camera.pan(pan_x, pan_y, pan_z);
                     }
-                    if zoom != 0.0 { pipes.camera.zoom(zoom); }
+                    if zoom != 0.0 {
+                        // Distance-aware zoom: when the camera is far
+                        // from the cluster a fixed `zoom += 50` barely
+                        // moves the view; when close, the same units
+                        // overshoot. Scale by `|position| / 1000`
+                        // clamped to [0.2, 5.0] so close-in stays
+                        // precise and far-out stays responsive. We use
+                        // `position.length()` as a stand-in for
+                        // distance-to-target since the camera currently
+                        // looks at the origin; the clamp keeps the
+                        // formula stable when the camera sits at or
+                        // very near the origin (lower bound 0.2 means
+                        // zoom never collapses to zero).
+                        let dist = pipes.camera.position.length();
+                        let dist_scale = (dist / 1000.0).clamp(0.2, 5.0);
+                        pipes.camera.zoom(zoom * dist_scale);
+                    }
                 }
             }
         }

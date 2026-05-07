@@ -109,28 +109,84 @@ async fn graph_init(State(s): State<AppState>) -> impl IntoResponse {
     proto_response(&msg)
 }
 
+/// `/node/:id` lookup.
+///
+/// Primary path: serve from the in-memory `VaultGraph`. Many ids the renderer
+/// renders (especially under `shared/knowledge-base/_ingested/...`) no longer
+/// live in the in-memory graph because the ingest pipeline migrated those
+/// documents into a Prisma-managed SQLite database. Returning 404 for those
+/// caused a noisy stream of console errors and an empty modal.
+///
+/// Stub fallback: when the id is not in the graph, return a *minimal*
+/// `NodeMeta` populated from the id alone (title = last path segment,
+/// `doctype = "external"`). The renderer treats `doctype = "external"` as a
+/// stub marker so it can render *something* useful instead of an error.
+///
+/// TODO(prisma): wire up an optional Prisma lookup *before* falling back to
+/// the stub. Concrete next steps:
+///   - Schema lives at:
+///       `~/Repositories/schrodinger/nixstation/projects/ingest/prisma/schema.prisma`
+///     (model `ObsidianDocument`, keyed on `vaultPath`).
+///   - The dev SQLite file is at:
+///       `~/Repositories/schrodinger/nixstation/projects/ingest/prisma/_dev.db`
+///     Production likely uses the same `DATABASE_URL` env var convention as
+///     the rest of the ingest pipeline.
+///   - Add a `--prisma-url <sqlite-url>` flag (and matching `Prisma` field on
+///     `AppStateInner`, populated at boot only when the flag is set) — keep
+///     this *optional* so the existing in-memory-only path keeps working.
+///   - Probably easiest to use `sqlx` (raw SQL against the small set of
+///     columns we need: `vault_path`, `title`, `lifecycle`, plus the per-doc
+///     join into `obsidian_documents_tags` for tags). `prisma-client-rust`
+///     is the "match the schema" option but adds a build-time codegen step.
+///   - On hit, populate `NodeMeta` with the real title/folder/tags from the
+///     row and leave the metric fields at zero (no PageRank for nodes that
+///     aren't in the layout graph).
 async fn node_meta(State(s): State<AppState>, Path(id): Path<String>) -> impl IntoResponse {
-    let Some(node) = s.inner.graph.nodes.get(&id) else {
-        return (StatusCode::NOT_FOUND, "no such node").into_response();
+    if let Some(node) = s.inner.graph.nodes.get(&id) {
+        let frontmatter_json = serde_json::to_string(&node.meta.frontmatter)
+            .unwrap_or_else(|_| "{}".into());
+        let msg = proto::NodeMeta {
+            id: id.clone(),
+            title: node.meta.title.clone(),
+            path: node.meta.path.clone(),
+            folder: node.meta.folder.clone(),
+            doctype: node.meta.doctype.clone(),
+            tags: node.meta.tags.clone(),
+            frontmatter_json,
+            degree: node.metrics.degree as u32,
+            indegree: node.metrics.indegree as u32,
+            outdegree: node.metrics.outdegree as u32,
+            pagerank: node.metrics.pagerank as f32,
+            betweenness: node.metrics.betweenness as f32,
+            kcore: node.metrics.kcore as u32,
+            community: node.metrics.community as u32,
+            wcc: node.metrics.wcc as u32,
+        };
+        return proto_response(&msg).into_response();
+    }
+
+    // Stub fallback. Best-effort title from the last path segment; folder is
+    // everything before it. `doctype = "external"` is the stub marker.
+    let (folder, title) = match id.rsplit_once('/') {
+        Some((f, t)) => (f.to_string(), t.to_string()),
+        None => (String::new(), id.clone()),
     };
-    let frontmatter_json = serde_json::to_string(&node.meta.frontmatter)
-        .unwrap_or_else(|_| "{}".into());
     let msg = proto::NodeMeta {
         id: id.clone(),
-        title: node.meta.title.clone(),
-        path: node.meta.path.clone(),
-        folder: node.meta.folder.clone(),
-        doctype: node.meta.doctype.clone(),
-        tags: node.meta.tags.clone(),
-        frontmatter_json,
-        degree: node.metrics.degree as u32,
-        indegree: node.metrics.indegree as u32,
-        outdegree: node.metrics.outdegree as u32,
-        pagerank: node.metrics.pagerank as f32,
-        betweenness: node.metrics.betweenness as f32,
-        kcore: node.metrics.kcore as u32,
-        community: node.metrics.community as u32,
-        wcc: node.metrics.wcc as u32,
+        title,
+        path: id.clone(),
+        folder,
+        doctype: Some("external".into()),
+        tags: Vec::new(),
+        frontmatter_json: "{}".into(),
+        degree: 0,
+        indegree: 0,
+        outdegree: 0,
+        pagerank: 0.0,
+        betweenness: 0.0,
+        kcore: 0,
+        community: 0,
+        wcc: 0,
     };
     proto_response(&msg).into_response()
 }

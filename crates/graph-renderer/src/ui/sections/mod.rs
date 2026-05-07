@@ -13,7 +13,7 @@ use eframe::egui;
 use super::actions::ActionRegistry;
 use super::layout::registry::LayoutRegistry;
 use super::state::Section;
-use super::theme;
+use super::theme::{self, palette};
 use crate::perf::PerfCollector;
 
 /// Section header: uppercase letter-spaced title flanked by thin lines.
@@ -33,8 +33,10 @@ pub fn header(ui: &mut egui::Ui, label: &str) {
         .join(" ");
 
     ui.horizontal(|ui| {
-        // Left rule.
-        let line_color = egui::Color32::from_gray(80);
+        // Left rule. ICON grey — matches the activity-bar inactive
+        // icon family so the header rule reads as part of the same
+        // chrome layer.
+        let line_color = palette::ICON;
         let rule_h = 1.0_f32;
         let (rule_rect, _) = ui.allocate_exact_size(
             egui::vec2(12.0, rule_h),
@@ -47,7 +49,7 @@ pub fn header(ui: &mut egui::Ui, label: &str) {
             egui::RichText::new(&spaced)
                 .size(11.0)
                 .strong()
-                .color(egui::Color32::WHITE),
+                .color(palette::TEXT),
         );
 
         // Right rule — expand to fill remainder.

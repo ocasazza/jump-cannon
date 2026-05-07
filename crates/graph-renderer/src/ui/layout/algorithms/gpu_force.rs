@@ -13,7 +13,7 @@ use serde_json::Value;
 
 use crate::ui::layout::registry::LayoutFactory;
 use crate::ui::sections::{hint_label, reset_row, subgroup_label, subgroup_separator};
-use crate::ui::theme::accent;
+use crate::ui::theme::{accent, palette};
 
 pub fn factory() -> LayoutFactory {
     LayoutFactory::Physics {
@@ -161,7 +161,7 @@ fn render_ui(ui: &mut egui::Ui, json: &mut Value) {
             let btn = egui::Button::new(text).stroke(if active {
                 egui::Stroke::new(1.0, accent::GREEN)
             } else {
-                egui::Stroke::new(1.0, egui::Color32::WHITE)
+                egui::Stroke::new(1.0, palette::BORDER)
             });
             if ui.add(btn).clicked() {
                 preset.apply_to(&mut opts);

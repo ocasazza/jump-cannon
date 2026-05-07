@@ -20,7 +20,7 @@
 
 use crate::camera::Camera;
 use bytemuck::{Pod, Zeroable};
-use glam::Vec3;
+use glam::{Mat4, Vec3, Vec4};
 use graph_layouts::{
     BoxedPhysics, DynPhysicsLayout, Edge as GlEdge, Graph as GlGraph, GpuForceLayout,
     GpuForceOptions, Node as GlNode,
@@ -529,13 +529,59 @@ impl GraphPipelines {
         }
     }
 
+    /// Screen-space picking. Coordinate spaces, spelled out:
+    ///
+    /// - `ndc_x`, `ndc_y`: normalized device coordinates of the cursor in
+    ///   [-1, 1], y-up. Caller (workspace.rs / app.rs) computes these from the
+    ///   *same egui rect that the wgpu callback painted into*:
+    ///       ndc_x =  (px - rect.left) / rect.width  * 2 - 1
+    ///       ndc_y = -((py - rect.top) / rect.height * 2 - 1)
+    ///   That rect's width/height also feeds `screen_px` here, and
+    ///   `set_screen` derives `camera.aspect` from the same numbers, so the
+    ///   projection matrix below matches the rect the user clicked in.
+    /// - `clip = view_proj * vec4(world, 1)`: 4D clip-space coordinate.
+    ///   `clip.w` is positive view-space depth (RH look_to_rh + perspective_rh).
+    /// - `node_ndc = clip.xy / clip.w`: NDC of the node center, in [-1,1].
+    /// - `dist_px`: Euclidean pixel distance between cursor and node center
+    ///   in the canvas's logical-pixel space (same units as `screen_px`).
+    ///
+    /// Picking algorithm:
+    ///   1. Project every node to NDC; skip if behind camera (`clip.w <= 0`)
+    ///      or far outside the viewport (with a small slop so nodes whose
+    ///      drawn quad straddles the edge are still hittable).
+    ///   2. Compute `dist_px` from cursor to node center.
+    ///   3. Keep candidates with `dist_px <= max(R_PICK_PX, node_radius_px)`.
+    ///   4. Among candidates, pick the one with the smallest `clip.w`
+    ///      (frontmost). Falls back to smallest `dist_px` if depths tie.
+    ///
+    /// Why screen-space, not world-space ray/sphere: with the N-aware physics
+    /// defaults pushing spring lengths past 400, a far node "near" the ray
+    /// in world units can win over the obviously-clicked near node, because
+    /// its scaled-by-distance world radius balloons. Screen-space distance
+    /// is the metric the user actually sees, so it's the metric we pick on.
     pub fn raycast(&self, ndc_x: f32, ndc_y: f32) -> Option<u32> {
         let b = self.buffers.as_ref()?;
-        let (origin, dir) = self.camera.raycast(ndc_x, ndc_y);
-        let mut best: Option<(f32, u32)> = None;
-        let tan_half = (self.camera.fov_y * 0.5).tan();
-        let screen_h = self.screen_px[1].max(1.0);
-        let two_tan_over_h = 2.0 * tan_half / screen_h;
+
+        // 24 logical-pixel pick tolerance. Default node draw radius is ~4 px;
+        // 24 px is roughly the size of a comfortable click target (Material
+        // and HIG both put minimum touch targets at 44, but desktop mouse
+        // input is much more precise — 24 gives forgiveness on a single-pixel
+        // node without letting clicks across blank space steal a hit).
+        // Per-node radius (pipes.sizes_cpu) overrides this floor for nodes
+        // drawn larger than 24 px so the "visible disc" is always hittable.
+        const R_PICK_PX: f32 = 24.0;
+
+        let view_proj = Mat4::from_cols_array_2d(&self.camera.view_proj());
+        let width_px = self.screen_px[0].max(1.0);
+        let height_px = self.screen_px[1].max(1.0);
+        // Half-extents convert NDC delta -> pixel delta (NDC spans 2 units).
+        let half_w = 0.5 * width_px;
+        let half_h = 0.5 * height_px;
+
+        // (dist_px, depth_w, idx) — we minimise on (depth_w, dist_px) so the
+        // frontmost node wins, with screen-space distance as the tiebreaker.
+        let mut best: Option<(f32, f32, u32)> = None;
+
         for i in 0..b.n_nodes as usize {
             if i * 3 + 2 >= b.positions_cpu.len() {
                 break;
@@ -545,22 +591,51 @@ impl GraphPipelines {
                 b.positions_cpu[i * 3 + 1],
                 b.positions_cpu[i * 3 + 2],
             );
-            let px = b.sizes_cpu.get(i).copied().unwrap_or(4.0);
-            let dist = (center - origin).length().max(1.0);
-            let r = (two_tan_over_h * dist * px).max(1.0);
-            let oc = origin - center;
-            let bb = oc.dot(dir);
-            let c = oc.dot(oc) - r * r;
-            let disc = bb * bb - c;
-            if disc < 0.0 {
+            // clip: 4D clip-space (pre-perspective-divide).
+            let clip: Vec4 = view_proj * Vec4::new(center.x, center.y, center.z, 1.0);
+            // Behind camera (or on the camera plane): not pickable.
+            if clip.w <= 1e-4 {
                 continue;
             }
-            let t = -bb - disc.sqrt();
-            if t > 0.0 && best.map(|(bt, _)| t < bt).unwrap_or(true) {
-                best = Some((t, i as u32));
+            let inv_w = 1.0 / clip.w;
+            // node_ndc_*: NDC of the node center, in [-1, 1].
+            let node_ndc_x = clip.x * inv_w;
+            let node_ndc_y = clip.y * inv_w;
+
+            // Pixel-space delta between cursor and node center.
+            let dx_px = (node_ndc_x - ndc_x) * half_w;
+            let dy_px = (node_ndc_y - ndc_y) * half_h;
+            let dist_px = (dx_px * dx_px + dy_px * dy_px).sqrt();
+
+            // Tolerance: max of the global pick floor and the node's own
+            // drawn radius (so a 40-px node is hittable across its whole disc).
+            let node_r_px = b.sizes_cpu.get(i).copied().unwrap_or(4.0);
+            let tol_px = R_PICK_PX.max(node_r_px);
+            if dist_px > tol_px {
+                continue;
             }
+
+            // Note: we deliberately don't hard-cull on `node_ndc.abs() > 1`,
+            // because a node whose center sits just outside the viewport
+            // can still have its drawn disc overlap the cursor — the
+            // `dist_px <= tol_px` test above already handles that case.
+
+            let candidate = (dist_px, clip.w, i as u32);
+            best = Some(match best {
+                None => candidate,
+                Some(prev) => {
+                    // Prefer smaller depth (frontmost). Tiebreak on dist_px.
+                    if clip.w < prev.1 - 1e-3 {
+                        candidate
+                    } else if (clip.w - prev.1).abs() <= 1e-3 && dist_px < prev.0 {
+                        candidate
+                    } else {
+                        prev
+                    }
+                }
+            });
         }
-        best.map(|(_, i)| i)
+        best.map(|(_, _, i)| i)
     }
 
     pub fn edges_cpu(&self) -> &[u32] {

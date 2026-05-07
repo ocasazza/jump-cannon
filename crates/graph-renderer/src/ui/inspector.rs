@@ -18,6 +18,7 @@ use eframe::egui;
 use std::collections::HashMap;
 
 use super::state::AppState;
+use super::theme::palette;
 
 // Default expanded width — user-resizable within `PANEL_W_RANGE`.
 const PANEL_W: f32 = 320.0;
@@ -66,15 +67,17 @@ fn show_collapsed(ctx: &egui::Context, state: &mut AppState) {
         .frame(
             egui::Frame::none()
                 .fill(egui::Color32::BLACK)
-                .stroke(egui::Stroke::new(1.0, egui::Color32::WHITE))
+                .stroke(egui::Stroke::new(1.0, palette::BORDER))
                 .inner_margin(egui::Margin::ZERO),
         )
         .show(ctx, |ui| {
             ui.vertical_centered(|ui| {
                 ui.add_space(6.0);
+                // Collapsed-strip chevron uses ICON grey (matches the
+                // activity-bar inactive icon family).
                 let resp = ui.add(
                     egui::Button::new(
-                        egui::RichText::new("\u{2039}").color(egui::Color32::WHITE),
+                        egui::RichText::new("\u{2039}").color(palette::ICON),
                     )
                     .frame(false)
                     .min_size(egui::vec2(COLLAPSED_W, 22.0)),
@@ -102,28 +105,29 @@ fn show_expanded(ctx: &egui::Context, state: &mut AppState, data: &mut Inspector
         .frame(
             egui::Frame::none()
                 .fill(egui::Color32::BLACK)
-                .stroke(egui::Stroke::new(1.0, egui::Color32::WHITE))
-                .inner_margin(egui::Margin {
-                    left: 14.0,
-                    right: 14.0,
-                    top: 12.0,
-                    bottom: 12.0,
-                }),
+                .stroke(egui::Stroke::new(1.0, palette::BORDER))
+                // Tightened from (14, 12) so the panel breathes less
+                // generously at the 240px lower bound, where every px
+                // of inner padding eats into the meta-grid value column.
+                .inner_margin(egui::Margin::symmetric(12.0, 10.0)),
         )
         .show(ctx, |ui| {
             // Header: title + collapse chevron.
             ui.horizontal(|ui| {
+                // Body-text title — TEXT (off-white) reads as ink.
                 ui.label(
                     egui::RichText::new("Inspector")
-                        .color(egui::Color32::WHITE)
+                        .color(palette::TEXT)
                         .strong(),
                 );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui
                         .add(
                             egui::Button::new(
+                                // Chevron icon → ICON grey to match
+                                // the activity-bar inactive family.
                                 egui::RichText::new("\u{203A}")
-                                    .color(egui::Color32::WHITE),
+                                    .color(palette::ICON),
                             )
                             .frame(false),
                         )
@@ -148,6 +152,9 @@ fn show_expanded(ctx: &egui::Context, state: &mut AppState, data: &mut Inspector
                     show_community(ui, idx, data);
                     ui.add_space(8.0);
                     show_neighbors(ui, idx, data);
+                    // Bottom breathing room so the last neighbour row
+                    // never sits flush against the panel border.
+                    ui.add_space(4.0);
                 });
         });
 }
@@ -157,7 +164,7 @@ fn show_metadata(ui: &mut egui::Ui, idx: u32, data: &InspectorData) {
     ui.add(
         egui::Label::new(
             egui::RichText::new(&id)
-                .color(egui::Color32::WHITE)
+                .color(palette::TEXT)
                 .strong()
                 .monospace(),
         )
@@ -165,31 +172,46 @@ fn show_metadata(ui: &mut egui::Ui, idx: u32, data: &InspectorData) {
     );
     ui.add_space(4.0);
 
-    egui::Grid::new("inspector-meta-grid")
-        .num_columns(2)
-        .spacing([10.0, 3.0])
-        .show(ui, |ui| {
-            ui.label(egui::RichText::new("idx").color(egui::Color32::from_gray(170)));
-            ui.label(format!("{}", idx));
-            ui.end_row();
-
-            for key in ["degree", "pagerank", "community", "kcore", "recency"] {
-                if let Some(vec) = data.metrics.get(key) {
-                    if let Some(&v) = vec.get(idx as usize) {
-                        ui.label(
-                            egui::RichText::new(key).color(egui::Color32::from_gray(170)),
-                        );
-                        let text = if key == "community" || key == "degree" || key == "kcore" {
-                            format!("{}", v as i64)
-                        } else {
-                            format!("{:.4}", v)
-                        };
-                        ui.label(text);
-                        ui.end_row();
-                    }
-                }
+    // Hand-rolled two-column rows. egui::Grid was inferring weird
+    // column widths once the value column held mixed monospace +
+    // proportional content, and the right column wouldn't expand to
+    // `available_width()` when the user dragged the panel wider.
+    let label_width: f32 = 72.0;
+    let row = |ui: &mut egui::Ui, key: &str, value: String, mono: bool| {
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 8.0;
+            let (rect, _) = ui.allocate_exact_size(
+                egui::vec2(label_width, ui.spacing().interact_size.y.min(18.0)),
+                egui::Sense::hover(),
+            );
+            ui.painter().text(
+                egui::pos2(rect.left(), rect.center().y),
+                egui::Align2::LEFT_CENTER,
+                key,
+                egui::FontId::monospace(11.0),
+                egui::Color32::from_gray(170),
+            );
+            let mut rt = egui::RichText::new(value).color(palette::TEXT);
+            if mono {
+                rt = rt.monospace();
             }
+            ui.add(egui::Label::new(rt).wrap());
         });
+    };
+
+    row(ui, "idx", format!("{}", idx), true);
+    for key in ["degree", "pagerank", "community", "kcore", "recency"] {
+        if let Some(vec) = data.metrics.get(key) {
+            if let Some(&v) = vec.get(idx as usize) {
+                let text = if key == "community" || key == "degree" || key == "kcore" {
+                    format!("{}", v as i64)
+                } else {
+                    format!("{:.4}", v)
+                };
+                row(ui, key, text, true);
+            }
+        }
+    }
 }
 
 fn show_badges(ui: &mut egui::Ui, idx: u32, data: &mut InspectorData) {
@@ -203,8 +225,21 @@ fn show_badges(ui: &mut egui::Ui, idx: u32, data: &mut InspectorData) {
     if meta.tags.is_empty() && meta.folder.is_empty() && meta.doctype.is_none() {
         return;
     }
-    ui.add_space(4.0);
+    // Thin BORDER-coloured rule sets the badges row apart from the
+    // meta grid above; `add_space` book-ends it for breathing room.
+    ui.add_space(6.0);
+    let sep_rect = ui
+        .allocate_exact_size(egui::vec2(ui.available_width(), 1.0), egui::Sense::hover())
+        .0;
+    ui.painter().rect_filled(sep_rect, 0.0, palette::BORDER);
+    ui.add_space(6.0);
     ui.horizontal_wrapped(|ui| {
+        // Pack chips tighter than the default item_spacing — a 240px
+        // panel with default 6px gaps wastes a chip's worth of width
+        // per row. 4px keeps chips readable while squeezing one more
+        // chip on most rows.
+        ui.spacing_mut().item_spacing.x = 4.0;
+        ui.spacing_mut().item_spacing.y = 4.0;
         for tag in &meta.tags {
             if let BadgeAction::Toggle { field, value } =
                 Badge::new("tags", tag, BadgeKind::Tag).show(ui)
@@ -258,7 +293,7 @@ fn show_community(ui: &mut egui::Ui, idx: u32, data: &mut InspectorData) {
 
     let header = format!("Community {} ({} members)", my_comm, siblings.len());
     egui::CollapsingHeader::new(
-        egui::RichText::new(header).color(egui::Color32::WHITE),
+        egui::RichText::new(header).color(palette::TEXT),
     )
     .default_open(true)
     .show(ui, |ui| {
@@ -292,7 +327,7 @@ fn show_neighbors(ui: &mut egui::Ui, idx: u32, data: &mut InspectorData) {
 
     let header = format!("Neighbors ({})", neighbors.len());
     egui::CollapsingHeader::new(
-        egui::RichText::new(header).color(egui::Color32::WHITE),
+        egui::RichText::new(header).color(palette::TEXT),
     )
     .default_open(true)
     .show(ui, |ui| {
@@ -310,44 +345,47 @@ fn show_neighbors(ui: &mut egui::Ui, idx: u32, data: &mut InspectorData) {
 
 fn clickable_list(
     ui: &mut egui::Ui,
-    id_source: &str,
+    _id_source: &str,
     items: &[u32],
     data: &mut InspectorData,
 ) {
-    egui::ScrollArea::vertical()
-        .id_salt(id_source)
-        .max_height(220.0)
-        .auto_shrink([false; 2])
-        .show(ui, |ui| {
-            // Cap entries rendered per pass; very large communities would
-            // otherwise hand egui thousands of widgets per frame.
-            const MAX: usize = 500;
-            let truncated = items.len() > MAX;
-            for &i in items.iter().take(MAX) {
-                let label = data
-                    .ids
-                    .get(i as usize)
-                    .map(|s| s.as_str())
-                    .unwrap_or("?");
-                let resp = ui.add(
-                    egui::Button::new(
-                        egui::RichText::new(label)
-                            .monospace()
-                            .color(egui::Color32::WHITE),
-                    )
-                    .frame(false)
-                    .wrap(),
-                );
-                if resp.clicked() {
-                    *data.requested_selection = Some(i);
-                }
-            }
-            if truncated {
-                ui.label(
-                    egui::RichText::new(format!("… {} more not shown", items.len() - MAX))
-                        .color(egui::Color32::from_gray(140))
-                        .italics(),
-                );
-            }
-        });
+    // No nested ScrollArea — the outer panel ScrollArea handles vertical
+    // scroll, so two scrollables don't fight for wheel events. The MAX
+    // cap below already prevents the per-frame widget blow-up that the
+    // inner scrollarea was originally guarding against. We constrain
+    // each row's max width to `available_width()` so a 50+ char node
+    // id wraps inside the panel instead of pushing out the resize
+    // handle.
+    const MAX: usize = 200;
+    let truncated = items.len() > MAX;
+    // Constrain row width to the panel's available_width so that long
+    // node ids wrap inside the panel rather than pushing past the
+    // resize handle. egui::Button::wrap() respects the surrounding
+    // ui's available width.
+    for &i in items.iter().take(MAX) {
+        let label = data
+            .ids
+            .get(i as usize)
+            .map(|s| s.as_str())
+            .unwrap_or("?");
+        let resp = ui.add(
+            egui::Button::new(
+                egui::RichText::new(label)
+                    .monospace()
+                    .color(palette::TEXT),
+            )
+            .frame(false)
+            .wrap(),
+        );
+        if resp.clicked() {
+            *data.requested_selection = Some(i);
+        }
+    }
+    if truncated {
+        ui.label(
+            egui::RichText::new(format!("… {} more not shown", items.len() - MAX))
+                .color(egui::Color32::from_gray(140))
+                .italics(),
+        );
+    }
 }

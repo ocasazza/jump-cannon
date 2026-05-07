@@ -129,11 +129,36 @@ pub struct GpuForceOptions {
     /// attractor at infinity). With grid_enabled this also lets us skip
     /// far-cell pairs cheaply. Default = 4 * spring_len = 120.
     pub repulsion_radius: f32,
-    /// Multiplied into `damping` once per `step_with_encoder` / `run` call.
-    /// 1.0 = no cooling. 0.998 cools toward `cooling_floor` over a few
-    /// hundred frames. Set <1.0 to enable.
+    /// Geometric per-call cooling factor applied to `effective_damping`.
+    /// 1.0 = no cooling. 0.997 cools toward `cooling_floor` over a few
+    /// hundred frames. Clamped to `[0.5, 1.0]` at use sites.
+    ///
+    /// Cooling formula (applied once per `run` / `step_with_encoder` call,
+    /// AFTER first-call init has set `effective_damping = options.damping`):
+    ///
+    /// ```text
+    /// effective_damping
+    ///     = (effective_damping * cooling_alpha).max(cooling_floor.min(damping))
+    /// ```
+    ///
+    /// Read the inner `min(floor, damping)` as **"the effective floor is
+    /// the configured floor, but never above the user's configured damping
+    /// — if the user already wants more friction than the floor allows,
+    /// honour that."** This is intentional, *not* a typo for `.max`:
+    ///
+    /// - `damping=0.90, floor=0.55`: cools `0.90 → 0.55` over time.
+    /// - `damping=0.30, floor=0.55`: stays pinned at `0.30`. Without the
+    ///   `.min`, we'd raise damping back to `0.55` against the user's
+    ///   explicit "be more frictional" choice.
+    ///
+    /// TODO(cooling): expose `effective_damping` for diagnostics/tests so
+    /// the validate/test phase can assert convergence on the formula
+    /// without having to peek at private state.
     pub cooling_alpha: f32,
-    /// Lower bound on damping under cooling. Below this we stop decaying.
+    /// Lower bound on `effective_damping` under cooling — but only when the
+    /// user's configured `damping` is itself above this floor. See
+    /// `cooling_alpha` for the full formula and the `damping < floor` edge
+    /// case.
     pub cooling_floor: f32,
     /// Average kinetic-energy threshold below which we consider the layout
     /// converged and short-circuit further dispatches. 0 disables.
@@ -156,6 +181,33 @@ pub struct GpuForceOptions {
 }
 
 impl GpuForceOptions {
+    /// Compare every field *except* the three cursor-pose fields
+    /// (`cursor_pos`, `cursor_radius`, `cursor_strength`). Used by
+    /// [`GpuForceLayout::set_options`] to decide whether an options swap
+    /// is "the user moved the cursor" (do not wake) or "the user changed
+    /// a slider / preset / backend" (wake).
+    ///
+    /// Bit-equality on f32s is fine here: the renderer either copies the
+    /// existing options through (no change → identical bits) or writes a
+    /// fresh value the user just produced (deliberately different).
+    pub fn eq_ignoring_cursor(&self, other: &Self) -> bool {
+        self.repulsion.to_bits()           == other.repulsion.to_bits()
+            && self.spring_k.to_bits()         == other.spring_k.to_bits()
+            && self.spring_len.to_bits()       == other.spring_len.to_bits()
+            && self.gravity.to_bits()          == other.gravity.to_bits()
+            && self.damping.to_bits()          == other.damping.to_bits()
+            && self.dt.to_bits()               == other.dt.to_bits()
+            && self.steps_per_call             == other.steps_per_call
+            && self.repulsion_radius.to_bits() == other.repulsion_radius.to_bits()
+            && self.cooling_alpha.to_bits()    == other.cooling_alpha.to_bits()
+            && self.cooling_floor.to_bits()    == other.cooling_floor.to_bits()
+            && self.energy_threshold.to_bits() == other.energy_threshold.to_bits()
+            && self.grid_enabled               == other.grid_enabled
+            && self.repulsion_mode             == other.repulsion_mode
+            && self.theta.to_bits()            == other.theta.to_bits()
+            && self.repulsion_samples          == other.repulsion_samples
+    }
+
     /// N-aware defaults. The hand-tuned `Default` block (repulsion 4000,
     /// spring_len 400) was anchored to a ~10k-node vault; using those
     /// numbers for a 100-node graph leaves the layout densely packed and
@@ -349,6 +401,12 @@ const HALT_FRAMES: u32 = 30;
 /// Minimum number of compute dispatches before halting becomes possible.
 /// Prevents premature halt in the early "everything is at uniform low velocity"
 /// phase that happens with random sphere seeding.
+///
+/// Sizing: with the default `steps_per_call = 8` at 60 fps that's
+/// `600 / (8 * 60) ≈ 1.25 s` of grace. With the post-click cool-down
+/// path's transient `steps_per_call = 2` it stretches to ~5 s, which
+/// matches the comment in `app.rs::apply_cursor_force`. Keep both call
+/// sites in sync if either knob shifts again.
 const HALT_GRACE_STEPS: u32 = 600;
 
 impl GpuForceLayout {
@@ -365,13 +423,34 @@ impl GpuForceLayout {
         }
     }
 
+    /// Replace the live options.
+    ///
+    /// **Wake policy.** A naive "always wake on any options change" is
+    /// wrong: the renderer pushes cursor pose into `cursor_pos /
+    /// cursor_radius / cursor_strength` every frame the user holds LMB
+    /// (and once more on release to zero them). Each of those flow
+    /// through `set_settings_json → set_settings → set_options`. If we
+    /// `wake()` on every cursor mutation, a halted sim restarts the
+    /// instant the user clicks anywhere on the canvas — even if the
+    /// click did nothing (no force radius, no actual perturbation) —
+    /// and the user sees the graph drift again from rest.
+    ///
+    /// Policy (option (a) per the bug ticket): hash the **non-cursor**
+    /// fields and only `wake()` when those change. Cursor fields are
+    /// always copied through (so the active force still applies on the
+    /// next dispatch), but a halted sim stays halted unless the cursor
+    /// is actually exerting force — in which case
+    /// `dispatch_borrowed_step` writes nonzero velocities and the
+    /// energy threshold will exit halt naturally on the next readback.
+    ///
+    /// Slider / preset / backend changes still hit `wake()` because they
+    /// alter the non-cursor hash.
     pub fn set_options(&mut self, options: GpuForceOptions) {
-        // Any param change wakes the sim — sliders/cursor force/preset switch
-        // are the user telling us "do work again". The cheap correctness-first
-        // policy is to always wake; the energy-halt logic will re-settle on
-        // its own once the new params produce a steady state.
+        let non_cursor_changed = !options.eq_ignoring_cursor(&self.options);
         self.options = options;
-        self.wake();
+        if non_cursor_changed {
+            self.wake();
+        }
     }
 
     /// Re-activate a halted sim. Call this from JS / cursor tool / preset
@@ -466,11 +545,19 @@ impl GpuForceLayout {
             .as_ref()
             .ok_or_else(|| "owned device missing".to_string())?;
         let state = self.state.as_mut().unwrap();
-        // First-call init for cooling.
+        // First-call init for cooling. `effective_damping` is constructed
+        // at 1.0 in `GpuState::new_*`; the `<= 0.0` branch also catches the
+        // edge case where someone explicitly set `damping = 0.0` ("freeze
+        // immediately"), in which case `effective_damping` stays 0.0 (the
+        // re-init writes 0.0 back). Idempotent — no oscillation.
+        // TODO(cooling): if a "freeze immediately" mode is ever a real UX
+        // affordance, replace this branch with a separate `frozen` flag.
         if state.effective_damping <= 0.0 || state.effective_damping > 1.0 {
             state.effective_damping = self.options.damping;
         }
-        // Cool damping per call (toward floor).
+        // Cool damping per call. See `GpuForceOptions::cooling_alpha` for
+        // the formula and the rationale behind the inner `floor.min(damping)`
+        // (it is *not* a typo for `.max` — see doc-comment).
         let alpha = self.options.cooling_alpha.clamp(0.5, 1.0);
         let floor = self.options.cooling_floor.clamp(0.0, 1.0);
         state.effective_damping = (state.effective_damping * alpha).max(floor.min(self.options.damping));
@@ -613,10 +700,12 @@ impl GpuForceLayout {
             return;
         }
 
-        // First-call init for cooling.
+        // First-call init for cooling. See twin comment in `run()` for the
+        // policy (idempotent re-init; no oscillation when damping=0.0).
         if state.effective_damping <= 0.0 || state.effective_damping > 1.0 {
             state.effective_damping = self.options.damping;
         }
+        // Cool per call. Formula documented on `GpuForceOptions::cooling_alpha`.
         let alpha = self.options.cooling_alpha.clamp(0.5, 1.0);
         let floor = self.options.cooling_floor.clamp(0.0, 1.0);
         state.effective_damping = (state.effective_damping * alpha).max(floor.min(self.options.damping));

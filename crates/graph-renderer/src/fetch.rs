@@ -53,9 +53,17 @@ impl ApiClient {
         bytes_to_f32(&bytes)
     }
 
-    pub async fn node(&self, id: &str) -> Result<proto::NodeMeta, String> {
-        let bytes = http_get_bytes(&self.url(&format!("/node/{id}"))).await?;
-        proto::NodeMeta::decode(&*bytes).map_err(|e| format!("decode node: {e}"))
+    /// `/node/:id` — `Ok(Some)` on a hit, `Ok(None)` when the server returns
+    /// 404 (the id isn't in the in-memory graph and no Prisma fallback is
+    /// configured). Treating 404 as a soft outcome keeps the browser console
+    /// quiet for ids that legitimately moved out of the layout graph.
+    pub async fn node(&self, id: &str) -> Result<Option<proto::NodeMeta>, String> {
+        match http_get_bytes_opt(&self.url(&format!("/node/{id}"))).await? {
+            Some(bytes) => proto::NodeMeta::decode(&*bytes)
+                .map(Some)
+                .map_err(|e| format!("decode node: {e}")),
+            None => Ok(None),
+        }
     }
 
     pub async fn meta_summary(&self) -> Result<proto::MetaSummary, String> {
@@ -142,4 +150,44 @@ async fn http_get_bytes(url: &str) -> Result<Vec<u8>, String> {
         .await
         .map_err(|e| format!("body {url}: {e}"))?;
     Ok(bytes.to_vec())
+}
+
+/// Like `http_get_bytes`, but maps HTTP 404 to `Ok(None)` instead of
+/// `Err`. Used by endpoints (currently `/node/:id`) where a missing
+/// resource is an expected, non-error outcome.
+#[cfg(target_arch = "wasm32")]
+async fn http_get_bytes_opt(url: &str) -> Result<Option<Vec<u8>>, String> {
+    use gloo_net::http::Request;
+    let resp = Request::get(url)
+        .send()
+        .await
+        .map_err(|e| format!("GET {url}: {e}"))?;
+    if resp.status() == 404 {
+        return Ok(None);
+    }
+    if !resp.ok() {
+        return Err(format!("GET {url}: HTTP {}", resp.status()));
+    }
+    resp.binary()
+        .await
+        .map(Some)
+        .map_err(|e| format!("body {url}: {e}"))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+async fn http_get_bytes_opt(url: &str) -> Result<Option<Vec<u8>>, String> {
+    let resp = reqwest::get(url)
+        .await
+        .map_err(|e| format!("GET {url}: {e}"))?;
+    if resp.status() == reqwest::StatusCode::NOT_FOUND {
+        return Ok(None);
+    }
+    if !resp.status().is_success() {
+        return Err(format!("GET {url}: HTTP {}", resp.status()));
+    }
+    let bytes = resp
+        .bytes()
+        .await
+        .map_err(|e| format!("body {url}: {e}"))?;
+    Ok(Some(bytes.to_vec()))
 }

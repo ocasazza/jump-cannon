@@ -9,6 +9,7 @@ use super::actions::ActionRegistry;
 use super::layout::registry::LayoutRegistry;
 use super::sections;
 use super::state::{AppState, Section};
+use super::theme::palette;
 use crate::perf::PerfCollector;
 
 // VSCode-style activity bar: 44px is the icon-rail width (40px touch
@@ -46,11 +47,13 @@ fn show_activity_bar(ctx: &egui::Context, state: &mut AppState) {
         )
         .show(ctx, |ui| {
             // Right border separating from section panel / central panel.
+            // BORDER (darker grey) so the rule sits against the panel
+            // fill without fighting the canvas.
             let rect = ui.max_rect();
             ui.painter().vline(
                 rect.right() - 0.5,
                 rect.y_range(),
-                egui::Stroke::new(1.0, egui::Color32::WHITE),
+                egui::Stroke::new(1.0, palette::BORDER),
             );
 
             ui.spacing_mut().item_spacing = egui::vec2(0.0, 2.0);
@@ -92,12 +95,16 @@ fn activity_button(ui: &mut egui::Ui, section: Section, active: bool) -> egui::R
     let hovered = response.hovered();
     let painter = ui.painter();
 
+    // Active flips to white-on-black ("inverted" hot state) → keep WHITE.
+    // Hovered also escalates to WHITE so the icon pops on its dark-grey
+    // hover fill. The default inactive state uses ICON (medium grey) so
+    // the activity rail feels quiet.
     let (bg, fg) = if active {
         (egui::Color32::WHITE, egui::Color32::BLACK)
     } else if hovered {
         (egui::Color32::from_gray(40), egui::Color32::WHITE)
     } else {
-        (egui::Color32::BLACK, egui::Color32::WHITE)
+        (egui::Color32::BLACK, palette::ICON)
     };
     painter.rect_filled(rect, 0.0, bg);
 
@@ -247,7 +254,7 @@ fn show_section_panel(
         .frame(
             egui::Frame::none()
                 .fill(egui::Color32::BLACK)
-                .stroke(egui::Stroke::new(1.0, egui::Color32::WHITE))
+                .stroke(egui::Stroke::new(1.0, palette::BORDER))
                 .inner_margin(egui::Margin {
                     left: 16.0,
                     right: 16.0,

@@ -37,6 +37,7 @@ pub struct Badge<'a> {
     pub kind: BadgeKind,
     pub active: bool,
     pub with_x: bool,
+    pub small: bool,
 }
 
 impl<'a> Badge<'a> {
@@ -47,6 +48,7 @@ impl<'a> Badge<'a> {
             kind,
             active: false,
             with_x: false,
+            small: false,
         }
     }
 
@@ -60,8 +62,30 @@ impl<'a> Badge<'a> {
         self
     }
 
+    /// Cramped variant for the filter-strip / chip-strip use where the
+    /// host frame already provides padding. Default (false) is the
+    /// roomier modal/inspector geometry that breathes around Courier
+    /// Prime descenders.
+    pub fn small(mut self, small: bool) -> Self {
+        self.small = small;
+        self
+    }
+
+    /// Stable hue derivation (0.0..1.0) for tag-like values. Extracted
+    /// so filter_strip and inspector can share the colour mapping and
+    /// so unit tests can assert determinism without rendering.
+    pub fn tag_hue(value: &str) -> f32 {
+        // FNV-1a 32-bit — small, deterministic, no extra deps.
+        let mut h: u32 = 0x811C_9DC5;
+        for b in value.as_bytes() {
+            h ^= *b as u32;
+            h = h.wrapping_mul(0x0100_0193);
+        }
+        (h % 360) as f32 / 360.0
+    }
+
     pub fn show(self, ui: &mut egui::Ui) -> BadgeAction {
-        let (bg, border, fg) = colors_for(&self.kind, self.active);
+        let (bg_base, border, fg) = colors_for(&self.kind, self.active);
 
         // Compute label text (kind-specific prefix where useful).
         let label = display_label(&self.kind, self.value);
@@ -70,8 +94,7 @@ impl<'a> Badge<'a> {
         let galley = ui.painter().layout_no_wrap(label.clone(), font.clone(), fg);
         let text_size = galley.size();
 
-        let pad_x = 8.0;
-        let pad_y = 2.0;
+        let (pad_x, pad_y) = if self.small { (6.0, 2.0) } else { (10.0, 4.0) };
         let x_w = if self.with_x { 12.0 } else { 0.0 };
         let total = Vec2::new(text_size.x + pad_x * 2.0 + x_w, text_size.y + pad_y * 2.0);
         let (rect, resp) = ui.allocate_exact_size(total, Sense::click());
@@ -80,21 +103,37 @@ impl<'a> Badge<'a> {
         let access_label = format!("badge:{}={}", self.field, self.value);
         resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, &access_label));
 
+        // Radius scales with content height instead of pretending to be
+        // infinite — keeps the pill shape crisp if the host UI scale
+        // changes (font-size resize, dpi flip).
+        let radius = text_size.y / 2.0 + pad_y;
+        let rounding = Rounding::same(radius);
+
+        // Hover lift: brighten the fill toward the border colour so
+        // click affordance reads independently from the active halo.
+        let bg = if resp.hovered() && !self.active {
+            tint_over(bg_base, border, 0.18)
+        } else {
+            bg_base
+        };
+
         let painter = ui.painter();
-        let rounding = Rounding::same(999.0);
 
-        // Hover glow — outer rect just outside the pill.
-        if resp.hovered() {
-            let outer = rect.expand(2.0);
-            painter.rect_filled(outer, Rounding::same(999.0), tint(border, 0.25));
-        }
-
-        // Active state: stack a wider purple-tinted halo behind the
-        // normal fill so the chip reads "selected" without losing its
-        // kind colour.
+        // Glow lives in the same paint pass (no stacked outer Frame),
+        // so it respects the ambient clip rect — no more bleed past
+        // the panel edge or behind sibling widgets.
         if self.active {
-            let halo = rect.expand(1.5);
-            painter.rect_filled(halo, Rounding::same(999.0), tint(palette::PURPLE, 0.40));
+            painter.rect_filled(
+                rect.expand(2.0),
+                Rounding::same(radius + 2.0),
+                tint(palette::PURPLE, 0.40),
+            );
+        } else if resp.hovered() {
+            painter.rect_filled(
+                rect.expand(2.0),
+                Rounding::same(radius + 2.0),
+                tint(border, 0.20),
+            );
         }
 
         painter.rect(rect, rounding, bg, Stroke::new(1.0, border));
@@ -176,6 +215,22 @@ fn tint(c: Color32, a: f32) -> Color32 {
     Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), a)
 }
 
+/// Opaquely blend `over` (at strength `a`) on top of `base`. Used for
+/// the hover lift so the lifted background reads as a subset of the
+/// border palette, not as the active halo's purple.
+fn tint_over(base: Color32, over: Color32, a: f32) -> Color32 {
+    let a = a.clamp(0.0, 1.0);
+    let mix = |b: u8, o: u8| -> u8 {
+        let v = b as f32 * (1.0 - a) + o as f32 * a;
+        v.round().clamp(0.0, 255.0) as u8
+    };
+    Color32::from_rgb(
+        mix(base.r(), over.r()),
+        mix(base.g(), over.g()),
+        mix(base.b(), over.b()),
+    )
+}
+
 fn colors_for(kind: &BadgeKind, active: bool) -> (Color32, Color32, Color32) {
     let (border, fg) = match kind {
         BadgeKind::Tag => (palette::PURPLE, palette::WHITE),
@@ -193,7 +248,10 @@ fn colors_for(kind: &BadgeKind, active: bool) -> (Color32, Color32, Color32) {
         BadgeKind::Url { .. } => (palette::GOOD, palette::GOOD),
         BadgeKind::Date => (palette::WARNING, palette::WHITE),
         BadgeKind::Status => (palette::GOOD, palette::WHITE),
-        BadgeKind::Generic => (palette::WHITE, palette::WHITE),
+        // Default chip border picks BORDER so an unstyled pill sits
+        // quietly against the dark panel; hover/active still escalate
+        // (hover halo + purple active halo are painted in `show()`).
+        BadgeKind::Generic => (palette::BORDER, palette::WHITE),
     };
     let bg = if active {
         tint(palette::PURPLE, 0.25)

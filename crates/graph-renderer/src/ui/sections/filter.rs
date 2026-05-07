@@ -11,7 +11,7 @@ use crate::ui::query::{
 };
 use crate::ui::sections::reset_row;
 use crate::ui::state::AppState;
-use crate::ui::theme::accent;
+use crate::ui::theme::{accent, palette};
 
 pub fn show(ui: &mut egui::Ui, state: &mut AppState) {
     if reset_row(ui) {
@@ -44,7 +44,7 @@ pub fn show(ui: &mut egui::Ui, state: &mut AppState) {
         // Tail "+" button: append a default Filter (preceded by AND).
         let plus = egui::Button::new(egui::RichText::new("+").monospace())
             .min_size(egui::vec2(24.0, 24.0))
-            .stroke(egui::Stroke::new(1.0, egui::Color32::WHITE))
+            .stroke(egui::Stroke::new(1.0, palette::BORDER))
             .fill(egui::Color32::BLACK);
         if ui.add(plus).on_hover_text("Add filter").clicked() {
             append_filter = true;
@@ -138,7 +138,7 @@ fn render_card(
     cycle_op_at: &mut Option<usize>,
 ) {
     let frame = egui::Frame::none()
-        .stroke(egui::Stroke::new(1.0, egui::Color32::WHITE))
+        .stroke(egui::Stroke::new(1.0, palette::BORDER))
         .fill(egui::Color32::BLACK)
         .inner_margin(egui::Margin::symmetric(4.0, 2.0));
 

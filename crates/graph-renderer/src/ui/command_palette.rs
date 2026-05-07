@@ -20,7 +20,7 @@ use super::actions::{
 };
 use super::document_viewer::DocumentViewer;
 use super::state::WorkspaceSettings;
-use super::theme::accent;
+use super::theme::{accent, palette};
 use crate::proto::NodeMeta;
 
 /// Maximum number of file/node matches surfaced under the action list.
@@ -127,7 +127,7 @@ pub fn show(
         .frame(
             egui::Frame::none()
                 .fill(egui::Color32::from_rgb(0x10, 0x12, 0x16))
-                .stroke(egui::Stroke::new(1.0, egui::Color32::WHITE))
+                .stroke(egui::Stroke::new(1.0, palette::BORDER))
                 .inner_margin(egui::Margin::same(0.0)),
         )
         .show(ctx, |ui| {
@@ -536,7 +536,7 @@ fn render_file_row(ui: &mut egui::Ui, fm: &FileMatch, active: bool) -> egui::Res
                 None => ("", fm.id.as_str()),
             };
             ui.vertical(|ui| {
-                ui.label(highlighted_path(&fm.id, &fm.indices, name.len()));
+                ui.label(highlighted_path(&fm.id, &fm.indices, name.len(), active));
                 if !folder.is_empty() {
                     ui.label(
                         egui::RichText::new(folder)
@@ -552,7 +552,9 @@ fn render_file_row(ui: &mut egui::Ui, fm: &FileMatch, active: bool) -> egui::Res
 
 /// Render the full path with skim-match indices highlighted. The `_name_len`
 /// hint isn't used yet but lets future work emphasise the filename portion.
-fn highlighted_path(path: &str, hits: &[usize], _name_len: usize) -> egui::WidgetText {
+fn highlighted_path(path: &str, hits: &[usize], _name_len: usize, focused: bool) -> egui::WidgetText {
+    // Same focus-aware contrast rule as highlighted_title.
+    let base = if focused { egui::Color32::WHITE } else { palette::TEXT };
     use egui::text::LayoutJob;
     let mut job = LayoutJob::default();
     let bytes = path.as_bytes();
@@ -570,7 +572,7 @@ fn highlighted_path(path: &str, hits: &[usize], _name_len: usize) -> egui::Widge
         fmt.color = if hit_now {
             accent::YELLOW
         } else {
-            egui::Color32::WHITE
+            base
         };
         if hit_now {
             fmt.background = egui::Color32::from_rgba_unmultiplied(0xff, 0xd5, 0x4a, 0x30);
@@ -998,8 +1000,10 @@ fn render_action_row(
         .show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.vertical(|ui| {
-                    // Title with fuzzy-match highlight.
-                    let title_layout = highlighted_title(&action.title, &mi.title_hits);
+                    // Title with fuzzy-match highlight. Focused row keeps
+                    // max-contrast WHITE; non-focused rows soften to
+                    // TEXT (off-white).
+                    let title_layout = highlighted_title(&action.title, &mi.title_hits, active);
                     ui.label(title_layout);
                     if !action.description.is_empty() {
                         ui.label(
@@ -1033,9 +1037,13 @@ fn render_action_row(
     resp.interact(egui::Sense::click())
 }
 
-fn highlighted_title(title: &str, hits: &[usize]) -> egui::WidgetText {
+fn highlighted_title(title: &str, hits: &[usize], focused: bool) -> egui::WidgetText {
+    // Focused row keeps WHITE (max contrast on the focused row's tinted
+    // bg). Non-focused rows pick the body TEXT colour so the list
+    // doesn't read as a wall of LED-on-black.
+    let base = if focused { egui::Color32::WHITE } else { palette::TEXT };
     if hits.is_empty() {
-        return egui::RichText::new(title).into();
+        return egui::RichText::new(title).color(base).into();
     }
     use egui::text::LayoutJob;
     let mut job = LayoutJob::default();
@@ -1054,7 +1062,7 @@ fn highlighted_title(title: &str, hits: &[usize]) -> egui::WidgetText {
             fmt.color = accent::BLUE;
             fmt.font_id = egui::FontId::proportional(12.0);
         } else {
-            fmt.color = egui::Color32::WHITE;
+            fmt.color = base;
             fmt.font_id = egui::FontId::proportional(12.0);
         }
         job.append(chunk, 0.0, fmt);
