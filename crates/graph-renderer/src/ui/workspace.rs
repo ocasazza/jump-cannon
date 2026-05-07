@@ -176,6 +176,16 @@ impl<'a, 'ctx> egui_dock::TabViewer for WorkspaceViewer<'a, 'ctx> {
     }
 }
 
+/// Sign-preserving response curve for mouse-rotate deltas: linear at
+/// small magnitudes (sub-pixel precision) and quadratic past ~6px so
+/// big sweeps fly while tiny corrections still land where you point.
+/// `dx + dx * |dx| / 24` — small `|dx|` ⇒ ~`dx`; large `|dx|` grows
+/// roughly with `dx²`. Matches the "shaped sensitivity" feel from
+/// Blender / Unreal viewport navigation.
+fn apply_rotate_curve(dx: f32) -> f32 {
+    dx + dx * dx.abs() / 24.0
+}
+
 impl<'a, 'ctx> WorkspaceViewer<'a, 'ctx> {
     fn draw_graph_tab(&mut self, ui: &mut egui::Ui) {
         let avail = ui.available_size();
@@ -267,22 +277,39 @@ impl<'a, 'ctx> WorkspaceViewer<'a, 'ctx> {
             let mut dy = d.y;
             if self.ctx.invert_mouse_x { dx = -dx; }
             if self.ctx.invert_mouse_y { dy = -dy; }
-            yaw_d += dx * 0.005;
-            pitch_d -= dy * 0.005;
+            // Sensitivity bumped from 0.005 → 0.0085 with a mild
+            // signed-quadratic curve so small drags stay precise but
+            // big sweeps fly. `apply_curve` keeps the sign and grows
+            // super-linearly past ~6px deltas.
+            yaw_d   += apply_rotate_curve(dx) * 0.0085;
+            pitch_d -= apply_rotate_curve(dy) * 0.0085;
         }
 
-        // Scroll-wheel zoom. smooth_scroll_delta is the egui-recommended
-        // accumulator (raw_scroll_delta resets too aggressively for our
-        // dispatch cadence). Eat the delta after consuming so a scroll
-        // over the canvas doesn't also scroll an underlying ScrollArea.
+        // Wheel + pinch zoom. `smooth_scroll_delta` is the egui-recommended
+        // accumulator for vertical scroll (mouse wheel + most trackpad
+        // two-finger gestures). `zoom_delta` is egui's normalised
+        // pinch-gesture multiplier (`1.0` = no pinch; >1 zooms in,
+        // <1 out) which trackpads + ctrl+wheel both produce in the
+        // browser. We feed both through the same camera.zoom path so
+        // the device-of-the-day picks whichever it has.
         if pointer_in_canvas {
-            let scroll = ui.input(|i| i.smooth_scroll_delta.y);
+            let (scroll, pinch) = ui.input(|i| (i.smooth_scroll_delta.y, i.zoom_delta()));
             if scroll.abs() > 0.5 {
-                zoom += scroll * 2.0;
+                // sqrt curve preserves sign and feels responsive on
+                // small scrolls without flying on a hard flick.
+                zoom += scroll.signum() * scroll.abs().sqrt() * 18.0;
                 ui.ctx().input_mut(|i| {
                     i.smooth_scroll_delta = egui::Vec2::ZERO;
                     i.raw_scroll_delta = egui::Vec2::ZERO;
                 });
+            }
+            // Pinch: egui reports a multiplicative factor. Convert to
+            // an additive zoom-units delta so it lives on the same
+            // pipe as the wheel — `(pinch - 1.0)` is small and signed.
+            // egui resets `zoom_factor_delta` itself between frames so
+            // we don't need to clear it; just consume.
+            if (pinch - 1.0).abs() > 1e-3 {
+                zoom += (pinch - 1.0) * 240.0;
             }
         }
 
@@ -292,10 +319,10 @@ impl<'a, 'ctx> WorkspaceViewer<'a, 'ctx> {
         // seconds of continuous input. Shift multiplies by SHIFT_MUL on
         // top of the eased value. Ramp resets on the first frame with no
         // pan input so a quick tap stays a tap.
-        const PAN_BASE: f32   = 1500.0;   // units/s at start of hold
-        const PAN_MAX: f32    = 12000.0;  // units/s after full ramp
-        const PAN_RAMP: f32   = 0.45;     // seconds to reach PAN_MAX
-        const SHIFT_MUL: f32  = 3.0;
+        const PAN_BASE: f32   = 2400.0;   // units/s at start of hold
+        const PAN_MAX: f32    = 24000.0;  // units/s after full ramp
+        const PAN_RAMP: f32   = 0.32;     // seconds to reach PAN_MAX
+        const SHIFT_MUL: f32  = 4.0;
         if pointer_in_canvas {
             let (dt, w, a, s, d, q, e, shift) = ui.input(|i| (
                 i.unstable_dt.min(0.05),

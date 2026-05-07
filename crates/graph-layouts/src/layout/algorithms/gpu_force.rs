@@ -155,6 +155,34 @@ pub struct GpuForceOptions {
     pub repulsion_samples: u32,
 }
 
+impl GpuForceOptions {
+    /// N-aware defaults. The hand-tuned `Default` block (repulsion 4000,
+    /// spring_len 400) was anchored to a ~10k-node vault; using those
+    /// numbers for a 100-node graph leaves the layout densely packed and
+    /// for a 100k-node graph leaves it cramped. Scale the magnitude
+    /// knobs against `cbrt(n)` (3D analog of the FR `sqrt(area/n)`
+    /// scaling) so the equilibrium edge length grows with the graph.
+    ///
+    /// Anchors:
+    ///   n =     4 → spring_len  ≈ 40  (clamp floor)
+    ///   n =   100 → spring_len  ≈ 86,  repulsion  ≈ 861
+    ///   n =  1000 → spring_len  ≈ 186, repulsion  ≈ 1857
+    ///   n = 10000 → spring_len  ≈ 400, repulsion  ≈ 4000  (user-tuned anchor)
+    ///   n =100000 → spring_len  ≈ 862, repulsion  ≈ 8617
+    pub fn for_n_nodes(n: usize) -> Self {
+        let mut o = Self::default();
+        let cbrt = (n.max(1) as f32).powf(1.0 / 3.0);
+        // Coefficient picked so cbrt(10000) * coeff ≈ 400 (the user's
+        // approved spring_len for ~10k nodes).
+        let len  = (18.57 * cbrt).clamp(40.0, 1500.0);
+        let repl = (185.7 * cbrt).clamp(200.0, 50_000.0);
+        o.spring_len = len;
+        o.repulsion  = repl;
+        o.repulsion_radius = (4.0 * len).max(160.0);
+        o
+    }
+}
+
 impl Default for GpuForceOptions {
     fn default() -> Self {
         Self {

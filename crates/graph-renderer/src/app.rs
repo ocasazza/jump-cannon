@@ -1043,10 +1043,21 @@ impl App {
         // into the layout would fail the deserialise on the other side.
         if !self.state.layout.settings.contains_key(&active_id) {
             if let Some(factory) = self.layout_registry.get(&active_id) {
+                // Seed JSON. For the gpu-force algorithm, swap the
+                // hand-anchored Default block for `for_n_nodes(N)` so
+                // the spring_len / repulsion match the loaded graph
+                // size instead of the ~10k-node anchor that produces
+                // a dense ball on smaller vaults.
+                let initial_json = if active_id == "gpu-force" {
+                    serde_json::to_value(GpuForceOptions::for_n_nodes(self.ids.len()))
+                        .unwrap_or_else(|_| factory.default_settings())
+                } else {
+                    factory.default_settings()
+                };
                 self.state
                     .layout
                     .settings
-                    .insert(active_id.clone(), factory.default_settings());
+                    .insert(active_id.clone(), initial_json);
             }
         }
         // Snapshot the JSON once so we don't borrow `self.state` and the
