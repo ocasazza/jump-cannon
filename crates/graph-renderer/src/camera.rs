@@ -90,7 +90,10 @@ impl Camera {
     pub fn fit_to_bounds(&mut self, min: Vec3, max: Vec3) {
         let center = (min + max) * 0.5;
         let radius = ((max - min) * 0.5).length().max(1.0);
-        let dist = radius * 1.4 / (self.fov_y * 0.5).sin();
+        // 1.7× padding (was 1.4× — felt too cramped). With fov_y=60°
+        // this lands at ≈ 3.4 × radius, giving the cluster ~25%
+        // breathing room on every edge of the viewport.
+        let dist = radius * 1.7 / (self.fov_y * 0.5).sin();
         // back off along world +Z, look toward center.
         self.position = center + Vec3::Z * dist;
         // recompute yaw/pitch to look at center

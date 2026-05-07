@@ -346,12 +346,16 @@ impl<'a, 'ctx> WorkspaceViewer<'a, 'ctx> {
             let eased = 1.0 - (1.0 - t).powi(3);
             let base_speed = PAN_BASE + (PAN_MAX - PAN_BASE) * eased;
             let speed = base_speed * if shift { SHIFT_MUL } else { 1.0 } * dt;
-            if w { pan_z += speed; }
-            if s { pan_z -= speed; }
+            // W/S = vertical (up/down), Q/E = forward/back, A/D = strafe
+            // — swapped from the conventional FPS layout per user
+            // preference (Minecraft-creative-style). Up on W matches
+            // mouse-rotate pitch direction so it feels coherent.
+            if w { pan_y += speed; }
+            if s { pan_y -= speed; }
             if d { pan_x += speed; }
             if a { pan_x -= speed; }
-            if q { pan_y += speed; }
-            if e { pan_y -= speed; }
+            if q { pan_z += speed; }
+            if e { pan_z -= speed; }
         } else {
             *self.ctx.pan_accel_t = 0.0;
         }

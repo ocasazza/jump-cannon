@@ -37,6 +37,19 @@ pub mod palette {
     pub const GREY:  Color32 = Color32::from_rgb(0x80, 0x80, 0x88);
     pub const WHITE: Color32 = Color32::WHITE;
 
+    /// Default chrome stroke (panel borders, separators). Darker than
+    /// pure WHITE so the high-contrast outlines don't fight the
+    /// canvas. Used by `apply()` for `widget.bg_stroke` and
+    /// `window_stroke`.
+    pub const BORDER: Color32 = Color32::from_rgb(0x40, 0x44, 0x4C);
+    /// Default icon stroke for the activity-bar glyphs and section
+    /// header rules — same darker-grey family as BORDER, slightly
+    /// lighter for readability on the dark panel fill.
+    pub const ICON:   Color32 = Color32::from_rgb(0x6A, 0x6E, 0x78);
+    /// Default body text colour. Just-slightly off-white so it reads
+    /// as "ink" rather than the maximum-contrast LED-on-black look.
+    pub const TEXT:   Color32 = Color32::from_rgb(0xD8, 0xD8, 0xDC);
+
     // Semantic. Derived at L=63%, S~45% (matching PURPLE's HSL anchor
     // so all four colors carry the same visual weight). See
     // `derive_semantic` for the math; values inlined here so this stays
