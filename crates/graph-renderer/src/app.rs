@@ -81,6 +81,16 @@ pub struct App {
     /// While > 0 we push a temporary options snapshot with stronger
     /// cooling so the brief perturbation halts fast.
     post_click_cooldown_frames: u32,
+    /// Have we already pushed the perturbed (high-cooling) opts for the
+    /// active cooldown window? Re-pushing them every frame compounds the
+    /// `cooling_alpha *= 0.95` and `energy_threshold *= 5.0` mutations
+    /// (since `layout_options()` reads back the *current* opts), and —
+    /// because those are non-cursor fields — re-trips `set_options`'s
+    /// wake-gating every frame, defeating the cooldown's whole purpose.
+    /// Apply once on the rising edge, then leave the in-pipeline opts
+    /// alone until `apply_layout_to_gpu` restores user values at the
+    /// trailing edge.
+    post_click_cooldown_applied: bool,
     /// Latest max-KE readback mirrored from GraphPipelines, used to
     /// pick render cadence (high KE → throttle repaint to ~20fps since
     /// the user can't visually parse 60fps of layout shuffle).
@@ -272,6 +282,7 @@ impl App {
             cursor_force_active: 0.0,
             prev_cursor_force_active: 0.0,
             post_click_cooldown_frames: 0,
+            post_click_cooldown_applied: false,
             last_observed_max_ke: 0.0,
             palette_state: ui::CommandPaletteState::default(),
             actions,
@@ -405,11 +416,21 @@ impl App {
     }
 
     /// Run a raycast against GraphPipelines and return the hit node index.
-    fn raycast_idx(&self, frame: &eframe::Frame, ndc_x: f32, ndc_y: f32) -> Option<u32> {
+    /// `screen_px` is the click-frame canvas rect width/height — passed in
+    /// so picking uses the *current* aspect even though the GraphCallback's
+    /// `prepare()` (which would update `pipes.screen_px`) doesn't run until
+    /// after `App::update` returns.
+    fn raycast_idx(
+        &self,
+        frame: &eframe::Frame,
+        ndc_x: f32,
+        ndc_y: f32,
+        screen_px: [f32; 2],
+    ) -> Option<u32> {
         let wgpu_state = frame.wgpu_render_state()?;
         let renderer = wgpu_state.renderer.read();
         let pipes = renderer.callback_resources.get::<GraphPipelines>()?;
-        pipes.raycast(ndc_x, ndc_y)
+        pipes.raycast(ndc_x, ndc_y, screen_px)
     }
 
     fn try_promote_bootstrap_to_gpu(&mut self, frame: &mut eframe::Frame) {
@@ -786,9 +807,11 @@ impl eframe::App for App {
             // projection matrix used by raycast() matches the rect we
             // painted into and the rect we hit-test against. (See
             // GraphPipelines::raycast for the projection / pick math.)
-            let ndc_x = (pos.x - rect.left()) / rect.width().max(1.0) * 2.0 - 1.0;
-            let ndc_y = -((pos.y - rect.top()) / rect.height().max(1.0) * 2.0 - 1.0);
-            if let Some(idx) = self.raycast_idx(frame, ndc_x, ndc_y) {
+            let rect_w = rect.width().max(1.0);
+            let rect_h = rect.height().max(1.0);
+            let ndc_x = (pos.x - rect.left()) / rect_w * 2.0 - 1.0;
+            let ndc_y = -((pos.y - rect.top()) / rect_h * 2.0 - 1.0);
+            if let Some(idx) = self.raycast_idx(frame, ndc_x, ndc_y, [rect_w, rect_h]) {
                 if let Some(id) = self.id_for_idx(idx) {
                     log::info!(
                         "[graph-renderer] click hit node idx={} id={}",
@@ -1287,6 +1310,7 @@ impl App {
             && self.cursor_force_active.abs() == 0.0
         {
             self.post_click_cooldown_frames = 30;
+            self.post_click_cooldown_applied = false;
         }
         self.prev_cursor_force_active = self.cursor_force_active;
         let key = self.cursor_key();
@@ -1325,6 +1349,14 @@ impl App {
     /// options snapshot with stronger cooling so the brief perturbation
     /// halts fast. When the window expires, clear `prev_layout_key` so
     /// the next `apply_layout_to_gpu` re-pushes the user's tuned values.
+    ///
+    /// We only push the perturbed opts on the *first* frame of the
+    /// window. Re-pushing every frame would (a) compound the multiplications
+    /// (`layout_options()` reads back the *current* opts, not the user's
+    /// configured ones) and (b) re-trip `set_options`'s wake-gating each
+    /// frame, defeating the cooldown. The post-cooldown
+    /// `prev_layout_key = None` reset lets `apply_layout_to_gpu` repaint
+    /// the user-configured opts in one shot.
     fn tick_post_click_cooldown(&mut self, frame: &mut eframe::Frame) {
         if self.post_click_cooldown_frames == 0 || !self.loaded_into_gpu {
             return;
@@ -1333,17 +1365,21 @@ impl App {
         let Some(wgpu_state) = frame.wgpu_render_state() else { return };
         let mut renderer = wgpu_state.renderer.write();
         if let Some(pipes) = renderer.callback_resources.get_mut::<GraphPipelines>() {
-            if let Some(mut opts) = pipes.layout_options() {
-                // Aggressive cooling tweaks — only for the cooldown window.
-                opts.cooling_alpha *= 0.95;
-                opts.energy_threshold *= 5.0;
-                pipes.update_layout_options(opts);
+            if !self.post_click_cooldown_applied {
+                if let Some(mut opts) = pipes.layout_options() {
+                    // Aggressive cooling tweaks — only for the cooldown window.
+                    opts.cooling_alpha *= 0.95;
+                    opts.energy_threshold *= 5.0;
+                    pipes.update_layout_options(opts);
+                    self.post_click_cooldown_applied = true;
+                }
             }
         }
         if self.post_click_cooldown_frames == 0 {
             // Restore the user's tuned values via apply_layout_to_gpu's
             // normal path on the next frame.
             self.prev_layout_key = None;
+            self.post_click_cooldown_applied = false;
         }
     }
 
@@ -1384,9 +1420,11 @@ impl App {
         }
         self.last_hover_raycast_at = Some(now);
 
-        let ndc_x = (pos.x - rect.left()) / rect.width().max(1.0) * 2.0 - 1.0;
-        let ndc_y = -((pos.y - rect.top()) / rect.height().max(1.0) * 2.0 - 1.0);
-        let hit = self.raycast_idx(frame, ndc_x, ndc_y);
+        let rect_w = rect.width().max(1.0);
+        let rect_h = rect.height().max(1.0);
+        let ndc_x = (pos.x - rect.left()) / rect_w * 2.0 - 1.0;
+        let ndc_y = -((pos.y - rect.top()) / rect_h * 2.0 - 1.0);
+        let hit = self.raycast_idx(frame, ndc_x, ndc_y, [rect_w, rect_h]);
         match hit {
             Some(idx) => {
                 if self.focus_hover_idx != Some(idx) {

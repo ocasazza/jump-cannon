@@ -559,7 +559,16 @@ impl GraphPipelines {
     /// in world units can win over the obviously-clicked near node, because
     /// its scaled-by-distance world radius balloons. Screen-space distance
     /// is the metric the user actually sees, so it's the metric we pick on.
-    pub fn raycast(&self, ndc_x: f32, ndc_y: f32) -> Option<u32> {
+    ///
+    /// Caller passes `screen_px` from the *click-frame's* egui rect
+    /// (workspace.rs captures this when consuming `resp.clicked()`). We do
+    /// **not** trust `self.screen_px` / `self.camera.aspect` here, because
+    /// those are written by the GraphCallback's `prepare()` which runs
+    /// *after* `App::update` returns — i.e. the click is consumed one tick
+    /// before this frame's `set_screen`. If the dock layout reflowed this
+    /// frame, the cached values would still describe the previous rect,
+    /// and the projection used here would be off-by-aspect.
+    pub fn raycast(&self, ndc_x: f32, ndc_y: f32, screen_px: [f32; 2]) -> Option<u32> {
         let b = self.buffers.as_ref()?;
 
         // 24 logical-pixel pick tolerance. Default node draw radius is ~4 px;
@@ -571,9 +580,23 @@ impl GraphPipelines {
         // drawn larger than 24 px so the "visible disc" is always hittable.
         const R_PICK_PX: f32 = 24.0;
 
-        let view_proj = Mat4::from_cols_array_2d(&self.camera.view_proj());
-        let width_px = self.screen_px[0].max(1.0);
-        let height_px = self.screen_px[1].max(1.0);
+        // Build a projection from the *click-frame* rect, independent of
+        // whatever aspect the cached camera currently holds.
+        let width_px = screen_px[0].max(1.0);
+        let height_px = screen_px[1].max(1.0);
+        let aspect = (width_px / height_px).max(0.0001);
+        let view = Mat4::look_to_rh(
+            self.camera.position,
+            self.camera.forward(),
+            Vec3::Y,
+        );
+        let proj = Mat4::perspective_rh(
+            self.camera.fov_y,
+            aspect,
+            self.camera.znear,
+            self.camera.zfar,
+        );
+        let view_proj = proj * view;
         // Half-extents convert NDC delta -> pixel delta (NDC spans 2 units).
         let half_w = 0.5 * width_px;
         let half_h = 0.5 * height_px;

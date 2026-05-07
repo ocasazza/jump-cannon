@@ -191,21 +191,67 @@ impl GpuForceOptions {
     /// existing options through (no change → identical bits) or writes a
     /// fresh value the user just produced (deliberately different).
     pub fn eq_ignoring_cursor(&self, other: &Self) -> bool {
-        self.repulsion.to_bits()           == other.repulsion.to_bits()
-            && self.spring_k.to_bits()         == other.spring_k.to_bits()
-            && self.spring_len.to_bits()       == other.spring_len.to_bits()
-            && self.gravity.to_bits()          == other.gravity.to_bits()
-            && self.damping.to_bits()          == other.damping.to_bits()
-            && self.dt.to_bits()               == other.dt.to_bits()
-            && self.steps_per_call             == other.steps_per_call
-            && self.repulsion_radius.to_bits() == other.repulsion_radius.to_bits()
-            && self.cooling_alpha.to_bits()    == other.cooling_alpha.to_bits()
-            && self.cooling_floor.to_bits()    == other.cooling_floor.to_bits()
-            && self.energy_threshold.to_bits() == other.energy_threshold.to_bits()
-            && self.grid_enabled               == other.grid_enabled
-            && self.repulsion_mode             == other.repulsion_mode
-            && self.theta.to_bits()            == other.theta.to_bits()
-            && self.repulsion_samples          == other.repulsion_samples
+        // Exhaustive destructure so adding a field to GpuForceOptions
+        // without classifying it here is a compile error rather than a
+        // silent "new field never wakes the sim" bug. If the new field
+        // is non-cursor, add it to the comparison below; if it's a new
+        // cursor-pose field, add it to the `_` ignore list and keep this
+        // method honest with the doc-comment.
+        let Self {
+            repulsion,
+            spring_k,
+            spring_len,
+            gravity,
+            damping,
+            dt,
+            cursor_pos: _,
+            cursor_radius: _,
+            cursor_strength: _,
+            steps_per_call,
+            repulsion_radius,
+            cooling_alpha,
+            cooling_floor,
+            energy_threshold,
+            grid_enabled,
+            repulsion_mode,
+            theta,
+            repulsion_samples,
+        } = self;
+        let Self {
+            repulsion: o_repulsion,
+            spring_k: o_spring_k,
+            spring_len: o_spring_len,
+            gravity: o_gravity,
+            damping: o_damping,
+            dt: o_dt,
+            cursor_pos: _,
+            cursor_radius: _,
+            cursor_strength: _,
+            steps_per_call: o_steps_per_call,
+            repulsion_radius: o_repulsion_radius,
+            cooling_alpha: o_cooling_alpha,
+            cooling_floor: o_cooling_floor,
+            energy_threshold: o_energy_threshold,
+            grid_enabled: o_grid_enabled,
+            repulsion_mode: o_repulsion_mode,
+            theta: o_theta,
+            repulsion_samples: o_repulsion_samples,
+        } = other;
+        repulsion.to_bits()           == o_repulsion.to_bits()
+            && spring_k.to_bits()         == o_spring_k.to_bits()
+            && spring_len.to_bits()       == o_spring_len.to_bits()
+            && gravity.to_bits()          == o_gravity.to_bits()
+            && damping.to_bits()          == o_damping.to_bits()
+            && dt.to_bits()               == o_dt.to_bits()
+            && steps_per_call             == o_steps_per_call
+            && repulsion_radius.to_bits() == o_repulsion_radius.to_bits()
+            && cooling_alpha.to_bits()    == o_cooling_alpha.to_bits()
+            && cooling_floor.to_bits()    == o_cooling_floor.to_bits()
+            && energy_threshold.to_bits() == o_energy_threshold.to_bits()
+            && grid_enabled               == o_grid_enabled
+            && repulsion_mode             == o_repulsion_mode
+            && theta.to_bits()            == o_theta.to_bits()
+            && repulsion_samples          == o_repulsion_samples
     }
 
     /// N-aware defaults. The hand-tuned `Default` block (repulsion 4000,
