@@ -26,7 +26,51 @@ use graph_layouts::{
     GpuForceOptions, Node as GlNode,
 };
 use serde_json::Value;
+use std::sync::{Arc, Mutex};
 use wgpu::util::DeviceExt;
+
+/// State of the asynchronous `positions` -> `positions_staging` readback.
+///
+/// Mirrors the `EnergyReadback` machine in `graph-layouts/src/layout/algorithms/gpu_force.rs`.
+/// Same re-entrancy contract: the `map_async` callback flips state ONLY
+/// — no wgpu access from inside the callback (on WASM it can fire
+/// synchronously inside an unrelated queue submit, and any wgpu re-entry
+/// from there panics with "recursive use of an object").
+///
+/// The actual buffer read happens in `drain_positions_readback` at the
+/// top of the next `compute_step`, when no other wgpu code is in flight.
+#[derive(Debug)]
+enum PositionsReadbackState {
+    /// No copy in flight; staging buffer is unmapped and idle.
+    Idle,
+    /// `copy_buffer_to_buffer` was recorded into the current frame's
+    /// encoder. We have NOT yet issued `map_async` — that has to wait
+    /// until eframe submits this frame's encoder. On the next
+    /// `compute_step` entry we issue `map_async` (the prior encoder is
+    /// now submitted, so the buffer is no longer in use from wgpu's
+    /// perspective).
+    CopyScheduled,
+    /// `map_async` issued; waiting for the driver/browser to fire our
+    /// callback. On WASM the callback can fire synchronously inside the
+    /// queue submit codepath — flipping state only is safe.
+    Mapping,
+    /// Callback fired. Ok = staging buffer is now mapped (drain must
+    /// `get_mapped_range` + `unmap`); Err = map failed (no unmap needed).
+    Done(Result<(), wgpu::BufferAsyncError>),
+}
+
+impl Default for PositionsReadbackState {
+    fn default() -> Self {
+        PositionsReadbackState::Idle
+    }
+}
+
+/// How many frames between scheduled positions readbacks. K=4 is ~66ms
+/// of stale-mirror lag at 60fps — well under human click reaction time
+/// (~250ms) and far cheaper than per-frame readback. The energy path uses
+/// per-frame because energy is one f32 per node; positions is a vec4 per
+/// node and crosses the GPU→CPU bus, so we throttle.
+const POSITIONS_READBACK_PERIOD: u64 = 4;
 
 use crate::ui::layout::registry::LayoutFactory;
 
@@ -159,6 +203,21 @@ struct Buffers {
     colors_base: Vec<f32>,
     sizes_base: Vec<f32>,
     edges_cpu: Vec<u32>,
+
+    /// MAP_READ | COPY_DST staging buffer for the async GPU→CPU
+    /// positions readback. Sized `n_nodes * 16` bytes (vec4 stride to
+    /// match the layout-side `array<vec3<f32>>` storage buffer).
+    positions_staging: wgpu::Buffer,
+    /// Async readback state machine. Shared with the `map_async`
+    /// callback via `Arc<Mutex<>>`; the callback only flips state.
+    positions_readback: Arc<Mutex<PositionsReadbackState>>,
+    /// Monotonic frame counter for cadence throttling (K-frame period).
+    /// Bumped at the top of every `compute_step`.
+    positions_frame_idx: u64,
+    /// Frame index of the last scheduled positions copy. We only record
+    /// a fresh `copy_buffer_to_buffer` when
+    /// `positions_frame_idx - last_positions_copy_frame >= POSITIONS_READBACK_PERIOD`.
+    last_positions_copy_frame: u64,
 }
 
 impl GraphPipelines {
@@ -428,6 +487,18 @@ impl GraphPipelines {
             }
         };
 
+        // Async positions readback staging buffer. Size matches the
+        // vec4-padded `positions` storage buffer (16B per node). At least
+        // 16B even for the empty-graph degenerate case so wgpu doesn't
+        // reject a zero-sized buffer.
+        let positions_staging_size = (n_nodes.max(1) as u64) * 16;
+        let positions_staging = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("positions_staging"),
+            size: positions_staging_size,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
         let colors_base = graph.colors.clone();
         let sizes_base = graph.sizes.clone();
         self.buffers = Some(Buffers {
@@ -449,6 +520,10 @@ impl GraphPipelines {
             colors_base,
             sizes_base,
             edges_cpu: graph.edges,
+            positions_staging,
+            positions_readback: Arc::new(Mutex::new(PositionsReadbackState::Idle)),
+            positions_frame_idx: 0,
+            last_positions_copy_frame: 0,
         });
 
         // Auto-fit the camera to the loaded graph so the bootstrap frame
@@ -477,7 +552,10 @@ impl GraphPipelines {
     }
 
     /// Called from `egui_wgpu::CallbackTrait::prepare`.
-    /// Records compute dispatch into the supplied encoder.
+    /// Records compute dispatch into the supplied encoder. Also drives
+    /// the async GPU→CPU positions readback so `positions_cpu` (used by
+    /// raycast picking and `bounds()`) tracks the live sim state instead
+    /// of stale boot-time positions.
     pub fn compute_step(
         &mut self,
         device: &wgpu::Device,
@@ -485,8 +563,162 @@ impl GraphPipelines {
         encoder: &mut wgpu::CommandEncoder,
     ) {
         let Some(b) = &mut self.buffers else { return };
+
+        // Drive any pending native callbacks. On WASM the browser drives
+        // `map_async` via the event loop; on native we have to poll.
+        // `Poll` is non-blocking — if no GPU work has finished yet this
+        // returns immediately and the callback fires on a later frame.
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            device.poll(wgpu::Maintain::Poll);
+        }
+
+        // Order matters here, mirroring the energy-readback path in
+        // gpu_force.rs::step_with_encoder:
+        //   1. drain any completed map (Done -> Idle, copy bytes into
+        //      positions_cpu)
+        //   2. if previous frame parked us at CopyScheduled, eframe has
+        //      since submitted that encoder, so it's safe to issue
+        //      map_async now
+        //   3. run the compute layout
+        //   4. if state is Idle and the throttle period elapsed, record
+        //      a fresh copy + park at CopyScheduled
+        Self::drain_positions_readback_inner(b);
+
+        let was_copy_scheduled = matches!(
+            b.positions_readback.lock().ok().as_deref(),
+            Some(PositionsReadbackState::CopyScheduled)
+        );
+        if was_copy_scheduled {
+            Self::issue_positions_map_inner(b);
+        }
+
         if let Some(l) = b.layout.as_mut() {
             l.step_with_encoder(device, queue, encoder, &b.positions);
+        }
+
+        // Throttle: only schedule a fresh readback once every
+        // POSITIONS_READBACK_PERIOD frames. Skip when a readback is
+        // already in flight (Mapping / CopyScheduled / Done) — re-mapping
+        // an already-mapped buffer panics in wgpu.
+        b.positions_frame_idx = b.positions_frame_idx.wrapping_add(1);
+        let elapsed = b.positions_frame_idx.wrapping_sub(b.last_positions_copy_frame);
+        if elapsed >= POSITIONS_READBACK_PERIOD {
+            let readback_idle = b
+                .positions_readback
+                .lock()
+                .map(|g| matches!(*g, PositionsReadbackState::Idle))
+                .unwrap_or(false);
+            if readback_idle {
+                Self::schedule_positions_copy_inner(b, encoder);
+                b.last_positions_copy_frame = b.positions_frame_idx;
+            }
+        }
+    }
+
+    /// Record a `positions -> positions_staging` copy and park the state
+    /// machine at `CopyScheduled`. The actual `map_async` request is
+    /// deferred to the *next* `compute_step` entry — by then eframe will
+    /// have submitted this frame's encoder, so the buffer is no longer
+    /// "in use by a pending submit". Mirrors `schedule_energy_copy`.
+    fn schedule_positions_copy_inner(b: &mut Buffers, encoder: &mut wgpu::CommandEncoder) {
+        let n_bytes = (b.n_nodes as u64) * 16;
+        if n_bytes == 0 {
+            return;
+        }
+        // Belt + braces: don't copy more than the staging can hold.
+        let copy_bytes = n_bytes.min(b.positions_staging.size());
+        encoder.copy_buffer_to_buffer(
+            &b.positions,
+            0,
+            &b.positions_staging,
+            0,
+            copy_bytes,
+        );
+        if let Ok(mut g) = b.positions_readback.lock() {
+            *g = PositionsReadbackState::CopyScheduled;
+        }
+    }
+
+    /// Issue the `map_async` request on `positions_staging`. The
+    /// callback ONLY flips state — no wgpu access from inside the
+    /// callback (re-entrancy contract; see `PositionsReadbackState`).
+    fn issue_positions_map_inner(b: &Buffers) {
+        // Flip to Mapping *before* we issue map_async. On WASM the
+        // callback can fire synchronously inside this call (or inside an
+        // unrelated queue submit), so the state must already be Mapping
+        // when the callback's `Done` write lands — otherwise the order
+        // `Done -> Mapping` would clobber the result.
+        if let Ok(mut g) = b.positions_readback.lock() {
+            *g = PositionsReadbackState::Mapping;
+        }
+        let shared = b.positions_readback.clone();
+        let slice = b.positions_staging.slice(..);
+        slice.map_async(wgpu::MapMode::Read, move |res| {
+            // Only mutate state. Do NOT touch any wgpu API here.
+            if let Ok(mut g) = shared.lock() {
+                *g = PositionsReadbackState::Done(res);
+            }
+        });
+    }
+
+    /// If a previous frame's `positions_staging` map_async has completed,
+    /// copy the bytes into `positions_cpu` (stripping the per-node vec4
+    /// padding back to vec3), unmap the staging buffer, and reset the
+    /// readback state to `Idle`. No-op if no completed map is waiting.
+    /// Mirrors `drain_energy_readback`.
+    fn drain_positions_readback_inner(b: &mut Buffers) {
+        // Briefly hold the lock to inspect state. We must NOT read the
+        // mapped range while holding the mutex, since the buffer view
+        // implicitly retains state inside wgpu and we want the lock
+        // dropped before re-entering wgpu APIs.
+        let map_succeeded = {
+            let Ok(mut guard) = b.positions_readback.lock() else { return };
+            match &*guard {
+                PositionsReadbackState::Done(Ok(())) => true,
+                PositionsReadbackState::Done(Err(_)) => {
+                    // Map failures are rare and self-recovering — silently
+                    // reset to Idle. No unmap needed (never mapped).
+                    *guard = PositionsReadbackState::Idle;
+                    return;
+                }
+                _ => return, // Idle / CopyScheduled / Mapping: nothing to drain.
+            }
+        };
+        if !map_succeeded {
+            return;
+        }
+
+        // Lock dropped — safe to enter wgpu again. The staging buffer is
+        // mapped: read, strip vec4 padding into the vec3 CPU mirror,
+        // then unmap.
+        let n = b.n_nodes as usize;
+        {
+            let slice = b.positions_staging.slice(..);
+            let view = slice.get_mapped_range();
+            let floats: &[f32] = bytemuck::cast_slice(&view);
+            // The GPU buffer is vec4-padded (stride 4 floats). The CPU
+            // mirror is a flat vec3 array. Strip the .w.
+            let want_floats = n.saturating_mul(3);
+            if b.positions_cpu.len() < want_floats {
+                b.positions_cpu.resize(want_floats, 0.0);
+            }
+            let avail_quads = floats.len() / 4;
+            let copy_n = n.min(avail_quads);
+            for i in 0..copy_n {
+                let src = i * 4;
+                let dst = i * 3;
+                b.positions_cpu[dst]     = floats[src];
+                b.positions_cpu[dst + 1] = floats[src + 1];
+                b.positions_cpu[dst + 2] = floats[src + 2];
+            }
+            // Drop the view BEFORE unmap — wgpu requires no outstanding
+            // mapped ranges when unmap is called.
+            drop(view);
+        }
+        b.positions_staging.unmap();
+        if let Ok(mut g) = b.positions_readback.lock() {
+            *g = PositionsReadbackState::Idle;
         }
     }
 

@@ -188,7 +188,7 @@ impl<'a, 'ctx> egui_dock::TabViewer for WorkspaceViewer<'a, 'ctx> {
 /// - At `|dx|=25`: ≈ 25 + 52 + 17.4 ≈ 94 (~3.8× boost — sweeps fly)
 /// The cubic term provides the "hand sweep = full rotation" lift past
 /// the ~10px knee without touching small-delta precision.
-fn apply_rotate_curve(dx: f32) -> f32 {
+pub fn apply_rotate_curve(dx: f32) -> f32 {
     let a = dx.abs();
     dx + dx.signum() * a * a / 12.0 + dx.signum() * a * a * a / 900.0
 }

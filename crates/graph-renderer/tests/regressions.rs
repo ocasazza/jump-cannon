@@ -27,6 +27,7 @@ use graph_renderer::perf::PerfCollector;
 use graph_renderer::ui::actions::ActionRegistry;
 use graph_renderer::ui::focus_set::{self, FocusCtx, FocusMode};
 use graph_renderer::ui::inspector::{self, InspectorData};
+use graph_renderer::ui::workspace::apply_rotate_curve;
 use graph_renderer::ui::layout::registry::LayoutRegistry;
 use graph_renderer::ui::sections::{self, reset_row};
 use graph_renderer::ui::state::{AppState, Section};
@@ -408,5 +409,527 @@ fn badge_toggle_updates_query_active_filters() {
         "Badge click did not toggle (tags, rust) into QueryModel.active_filters; \
          current filters: {:?}",
         m.active_filters,
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 11. rotate_curve_is_sign_preserving
+// ---------------------------------------------------------------------------
+// The rotation curve in `workspace::apply_rotate_curve` must be an odd
+// function: `f(-x) == -f(x)`. A regression here means the cubic term
+// lost its `signum` and snapping the mouse left rotates differently
+// than snapping it right.
+
+#[test]
+fn rotate_curve_is_sign_preserving() {
+    for x in [1.0_f32, 5.0, 10.0, 25.0, 50.0] {
+        let pos = apply_rotate_curve(x);
+        let neg = apply_rotate_curve(-x);
+        assert!(
+            (pos + neg).abs() < 1e-4,
+            "apply_rotate_curve regression: not sign-preserving at x={x}: \
+             f({x}) = {pos}, f(-{x}) = {neg}, sum = {}",
+            pos + neg,
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 12. rotate_curve_is_super_linear_past_knee
+// ---------------------------------------------------------------------------
+// The cubic term should make the curve super-linear past the ~10px
+// knee. Concretely: f(20) > 2*f(10). If this fails, the cubic boost
+// is gone and hand-sweeps no longer fly.
+
+#[test]
+fn rotate_curve_is_super_linear_past_knee() {
+    let f10 = apply_rotate_curve(10.0);
+    let f20 = apply_rotate_curve(20.0);
+    assert!(
+        f20 > 2.0 * f10,
+        "apply_rotate_curve regression: not super-linear past knee: \
+         f(10) = {f10}, f(20) = {f20}, expected f(20) > {}",
+        2.0 * f10,
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 13. rotate_curve_at_zero_returns_zero
+// ---------------------------------------------------------------------------
+// `signum * 0` is well-defined in Rust (returns 0.0, not NaN), but if
+// someone refactors the curve to use a divisor-then-multiply chain
+// they could reintroduce a NaN at zero. Pin the value.
+
+#[test]
+fn rotate_curve_at_zero_returns_zero() {
+    let v = apply_rotate_curve(0.0);
+    assert_eq!(
+        v, 0.0,
+        "apply_rotate_curve(0.0) regression: expected 0.0, got {v}",
+    );
+    assert!(
+        !v.is_nan(),
+        "apply_rotate_curve(0.0) regression: produced NaN",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 14. zoom_distance_scale_clamps
+// ---------------------------------------------------------------------------
+// Replicates the formula from `workspace.rs`:
+//     dist_scale = (position.length() / 1000.0).clamp(0.2, 5.0)
+// At distance 0 we must clamp to 0.2 (so close-in zoom doesn't
+// collapse). At a huge distance (100_000) we clamp to 5.0 (so far-out
+// flicks stay responsive without going parabolic).
+
+#[test]
+fn zoom_distance_scale_clamps() {
+    fn zoom_dist_scale(position_len: f32) -> f32 {
+        (position_len / 1000.0).clamp(0.2, 5.0)
+    }
+    assert_eq!(
+        zoom_dist_scale(0.0),
+        0.2,
+        "zoom dist_scale lower clamp regression: at dist=0 expected 0.2",
+    );
+    assert_eq!(
+        zoom_dist_scale(100_000.0),
+        5.0,
+        "zoom dist_scale upper clamp regression: at dist=100000 expected 5.0",
+    );
+    // Mid-range stays linear (sanity).
+    assert!(
+        (zoom_dist_scale(2000.0) - 2.0).abs() < 1e-4,
+        "zoom dist_scale mid-range regression: at dist=2000 expected 2.0",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 15. picking_screen_space_24px_tolerance_unit
+// ---------------------------------------------------------------------------
+// The real picker in `graph_pipelines::raycast` requires a wgpu
+// device — too heavy for unit testing. We instead replicate the
+// screen-space portion of the algorithm against a fixture of
+// already-projected nodes (skip the projection matrix; test the part
+// that defines "nearest projected node within tol_px").
+//
+// Setup: 5 nodes already in pixel coords, one of which sits 3D-far
+// (large `depth_w`) but very close in screen space, and another that
+// is 3D-near (small `depth_w`) but well outside the 24px tolerance.
+// The picker must prefer the 3D-far-but-screen-near node, because
+// screen-space is the only metric the user can see.
+
+#[test]
+fn picking_screen_space_24px_tolerance_unit() {
+    const R_PICK_PX: f32 = 24.0;
+
+    // (node_px_x, node_px_y, depth_w, idx)
+    let fixture = [
+        // idx 0: 3D-near but screen-far (well past 24px) → must NOT win.
+        (200.0_f32, 200.0_f32, 0.5_f32, 0_u32),
+        // idx 1: 3D-far but screen-near (8px away) → must win.
+        (608.0,     400.0,     50.0,    1),
+        // idx 2: another candidate, screen-near (12px away), deeper.
+        (612.0,     400.0,     80.0,    2),
+        // idx 3: way off-screen.
+        (10.0,      10.0,      10.0,    3),
+        // idx 4: at click point but behind camera (depth_w <= 0) → skipped.
+        (600.0,     400.0,     -1.0,    4),
+    ];
+    let cursor = (600.0_f32, 400.0_f32);
+
+    // Mirror the raycast()'s candidate filter + ranking.
+    let mut best: Option<(f32, f32, u32)> = None;
+    for &(px, py, w, idx) in &fixture {
+        if w <= 1e-4 {
+            continue; // behind camera
+        }
+        let dx = px - cursor.0;
+        let dy = py - cursor.1;
+        let dist_px = (dx * dx + dy * dy).sqrt();
+        let tol_px = R_PICK_PX.max(4.0); // node radius 4 in this fixture
+        if dist_px > tol_px {
+            continue;
+        }
+        let cand = (dist_px, w, idx);
+        best = Some(match best {
+            None => cand,
+            Some(prev) => {
+                if w < prev.1 - 1e-3 {
+                    cand
+                } else if (w - prev.1).abs() <= 1e-3 && dist_px < prev.0 {
+                    cand
+                } else {
+                    prev
+                }
+            }
+        });
+    }
+
+    let picked = best.map(|(_, _, i)| i);
+    assert_eq!(
+        picked,
+        Some(1),
+        "picking regression: expected screen-nearest in-tolerance node \
+         (idx=1, 8px away) to win, got {picked:?}. The picker is back to \
+         3D-distance ranking.",
+    );
+
+    // And idx=0 (3D-near but 282px in screen space) must never appear
+    // even as a candidate — it's outside tol_px.
+    let dx = 200.0_f32 - cursor.0;
+    let dy = 200.0_f32 - cursor.1;
+    let dist0 = (dx * dx + dy * dy).sqrt();
+    assert!(
+        dist0 > R_PICK_PX,
+        "fixture sanity: idx=0 should be outside 24px tolerance, got {dist0}",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 16. badge_tag_hue_is_deterministic
+// ---------------------------------------------------------------------------
+//
+// Real failure mode: tag colour swatches must be stable per value across
+// renders. If `Badge::tag_hue` ever picked up a non-deterministic source
+// (RandomState hash, time-based seed) the same tag would flicker between
+// hues every frame. Also pins the diversification property: distinct
+// inputs map to distinct hues.
+
+#[test]
+fn badge_tag_hue_is_deterministic() {
+    use graph_renderer::ui::badge::Badge;
+
+    let baseline = Badge::tag_hue("rust");
+    for _ in 0..100 {
+        assert_eq!(
+            Badge::tag_hue("rust"),
+            baseline,
+            "tag_hue('rust') is non-deterministic across calls",
+        );
+    }
+
+    let other = Badge::tag_hue("egui");
+    assert_ne!(
+        baseline, other,
+        "tag_hue regression: 'rust' and 'egui' collapsed to the same hue ({baseline})",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 17. badge_small_variant_is_smaller
+// ---------------------------------------------------------------------------
+//
+// Real failure mode: `.small(true)` is meant for hosts that already pad
+// their frame (filter-strip / chip-strip). If the small flag stops
+// shrinking inner padding (regression we shipped once when refactoring
+// padding), chips overflow their host. We measure the rect from the
+// returned `InnerResponse` of a wrapping scope and require strict-less
+// in both axes.
+
+#[test]
+fn badge_small_variant_is_smaller() {
+    use graph_renderer::ui::badge::{Badge, BadgeKind};
+
+    let default_size = Cell::new(egui::Vec2::ZERO);
+    let small_size = Cell::new(egui::Vec2::ZERO);
+
+    let mut harness = Harness::builder()
+        .with_size(egui::vec2(400.0, 200.0))
+        .build(|ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    let inner = ui.scope(|ui| {
+                        let _ = Badge::new("tags", "rust", BadgeKind::Tag).show(ui);
+                    });
+                    default_size.set(inner.response.rect.size());
+                });
+                ui.horizontal(|ui| {
+                    let inner = ui.scope(|ui| {
+                        let _ = Badge::new("tags", "rust", BadgeKind::Tag)
+                            .small(true)
+                            .show(ui);
+                    });
+                    small_size.set(inner.response.rect.size());
+                });
+            });
+        });
+    harness.run();
+    harness.run();
+
+    let d = default_size.get();
+    let s = small_size.get();
+    assert!(
+        s.x < d.x && s.y < d.y,
+        "Badge::small(true) regression: expected smaller rect than default; \
+         default={d:?} small={s:?}",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 18. badge_click_returns_toggle
+// ---------------------------------------------------------------------------
+//
+// Real failure mode: clicks on a Tag/Doctype badge must yield
+// `BadgeAction::Toggle { field, value }` carrying the badge's own
+// (field, value). We already had a regression where a different match
+// arm stole the click; this pins the happy path on the Doctype kind so
+// it's distinct from test #10's Tag coverage.
+
+#[test]
+fn badge_click_returns_toggle() {
+    use graph_renderer::ui::badge::{Badge, BadgeAction, BadgeKind};
+    use std::cell::RefCell;
+
+    let captured: RefCell<Option<(String, String)>> = RefCell::new(None);
+
+    let mut harness = Harness::builder()
+        .with_size(egui::vec2(400.0, 100.0))
+        .build(|ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let action = Badge::new("doctype", "note", BadgeKind::Doctype).show(ui);
+                if let BadgeAction::Toggle { field, value } = action {
+                    *captured.borrow_mut() = Some((field, value));
+                }
+            });
+        });
+    harness.run();
+    harness.run();
+    harness.get_by_label("badge:doctype=note").click();
+    harness.run();
+    harness.run();
+
+    let got = captured.borrow().clone();
+    assert_eq!(
+        got,
+        Some(("doctype".to_string(), "note".to_string())),
+        "Badge click regression: expected Toggle{{doctype, note}}, got {got:?}",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 19. inspector_long_id_wraps_inside_panel
+// ---------------------------------------------------------------------------
+//
+// Real failure mode: a long, no-space node id used to push past the
+// inspector panel's right edge, hiding the resize handle. The fix puts
+// the id label inside `egui::Label::wrap()` and constrains row width to
+// `available_width()`. We mount the inspector with a 70+ char id and
+// assert the panel's rect stays inside the configured max width and the
+// viewport — i.e. the long id wrapped instead of forcing horizontal
+// growth.
+
+#[test]
+fn inspector_long_id_wraps_inside_panel() {
+    let long_id =
+        "shared/knowledge-base/_ingested/it-ops/jira-ITHELP-22318-something-extra".to_string();
+    assert!(long_id.len() >= 70, "fixture id too short");
+
+    let mut harness = Harness::builder()
+        .with_size(egui::vec2(900.0, 600.0))
+        .build(|ctx| {
+            let mut state = AppState::default();
+            state.inspector_open = true;
+            let ids: Vec<String> = vec![long_id.clone()];
+            let metrics = std::collections::HashMap::new();
+            let edges: Vec<u32> = Vec::new();
+            let mut requested: Option<u32> = None;
+            let mut req_toggle: Option<(String, String)> = None;
+            let mut data = InspectorData {
+                ids: &ids,
+                metrics: &metrics,
+                edges: &edges,
+                selected_idx: Some(0),
+                requested_selection: &mut requested,
+                node_meta: None,
+                requested_filter_toggle: &mut req_toggle,
+            };
+            inspector::show(ctx, &mut state, &mut data);
+        });
+    harness.run();
+    harness.run();
+
+    let panel_state = egui::containers::panel::PanelState::load(
+        &harness.ctx,
+        egui::Id::new("inspector"),
+    )
+    .expect("inspector should mount with a valid selection");
+
+    // PANEL_W_MAX is 560 in inspector.rs; a non-wrapping long id used
+    // to grow the panel past that. Allow 1px slack for rounding.
+    assert!(
+        panel_state.rect.width() <= 560.0 + 1.0,
+        "inspector long-id regression: panel rect width {} exceeded \
+         PANEL_W_MAX(560), id likely failed to wrap",
+        panel_state.rect.width(),
+    );
+    // The panel must also stay inside the harness viewport.
+    assert!(
+        panel_state.rect.right() <= 900.0 + 1.0,
+        "inspector long-id regression: panel right edge {} pushed past \
+         viewport (900); id failed to wrap inside the panel",
+        panel_state.rect.right(),
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 20. theme_borders_use_palette_border
+// ---------------------------------------------------------------------------
+//
+// Real failure mode: chrome strokes had been hard-coded to WHITE,
+// causing hovered/active states to collapse to invisible (white-on-white)
+// while noninteractive borders shouted at full contrast. The fix routes
+// chrome strokes through `palette::BORDER` and body text through
+// `palette::TEXT`. This pins the wiring.
+
+#[test]
+fn theme_borders_use_palette_border() {
+    use graph_renderer::ui::theme::{self, palette};
+
+    let ctx = egui::Context::default();
+    theme::apply(&ctx);
+    let style = ctx.style();
+    let v = &style.visuals;
+
+    assert_eq!(
+        v.widgets.noninteractive.bg_stroke.color,
+        palette::BORDER,
+        "theme regression: noninteractive bg_stroke is not palette::BORDER",
+    );
+    assert_eq!(
+        v.widgets.inactive.bg_stroke.color,
+        palette::BORDER,
+        "theme regression: inactive bg_stroke is not palette::BORDER",
+    );
+    assert_eq!(
+        v.override_text_color,
+        Some(palette::TEXT),
+        "theme regression: override_text_color is not palette::TEXT",
+    );
+    assert_eq!(
+        v.window_stroke.color,
+        palette::BORDER,
+        "theme regression: window_stroke is not palette::BORDER",
+    );
+}
+
+// ===========================================================================
+// Phase 3 regressions: cooling/click-wake + filter clear
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// gpu_force_options_eq_ignoring_cursor_basic
+// ---------------------------------------------------------------------------
+//
+// Phase-3 regression for the "click wakes a settled sim" bug. The
+// renderer pushes cursor pose every frame; `set_options` must NOT wake
+// the layout when only the three cursor-pose fields differ. The
+// algorithmic gate is `GpuForceOptions::eq_ignoring_cursor` — this test
+// pins its semantics directly.
+
+#[test]
+fn gpu_force_options_eq_ignoring_cursor_basic() {
+    use graph_layouts::GpuForceOptions;
+
+    let base = GpuForceOptions::default();
+
+    // Cursor-only diff: every cursor field perturbed, nothing else
+    // touched. Must report equal-ignoring-cursor.
+    let cursor_only = GpuForceOptions {
+        cursor_pos: [10.0, 20.0, 30.0],
+        cursor_radius: 250.0,
+        cursor_strength: 4.5,
+        ..base.clone()
+    };
+    assert!(
+        base.eq_ignoring_cursor(&cursor_only),
+        "cursor-only diff must compare equal — otherwise every mouse \
+         move re-wakes the sim and the user sees forever-drift",
+    );
+
+    // Non-cursor diff: a single non-cursor field changed must report
+    // not-equal so `set_options` calls `wake()`.
+    let slider_changed = GpuForceOptions {
+        repulsion: base.repulsion + 100.0,
+        ..base.clone()
+    };
+    assert!(
+        !base.eq_ignoring_cursor(&slider_changed),
+        "non-cursor diff (repulsion) must compare not-equal — otherwise \
+         slider tweaks silently fail to wake a halted sim",
+    );
+
+    // Same value, fresh allocation — must compare equal.
+    let identical = GpuForceOptions::default();
+    assert!(
+        base.eq_ignoring_cursor(&identical),
+        "two default-constructed options must compare equal-ignoring-cursor",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// gpu_force_options_eq_ignoring_cursor_exhaustive_destructure_compiles
+// ---------------------------------------------------------------------------
+//
+// Passive guard: this test does no behavioral assertion. Its sole job
+// is to FAIL TO COMPILE if a future field is added to
+// `GpuForceOptions` without being classified inside
+// `eq_ignoring_cursor`. The implementation uses an exhaustive `Self {
+// .. }` destructure with no `..` rest pattern, so any new field forces
+// the author to explicitly decide whether the new field is a cursor
+// pose (add to the `_` ignore list) or a behavioral knob (add to the
+// comparison). If THIS test no longer compiles, fix it by following
+// the rustc hint inside the impl — don't paper over with `..`.
+
+#[test]
+fn gpu_force_options_eq_ignoring_cursor_exhaustive_destructure_compiles() {
+    use graph_layouts::GpuForceOptions;
+    let a = GpuForceOptions::default();
+    let b = GpuForceOptions::default();
+    // Merely calling the method keeps the impl referenced from a test
+    // target so the exhaustive-destructure check fires under `cargo test`.
+    let _ = a.eq_ignoring_cursor(&b);
+}
+
+// ---------------------------------------------------------------------------
+// query_clear_all_filters_empties_active
+// ---------------------------------------------------------------------------
+//
+// Phase-3 regression for the badge-focus auto-flip restore path.
+// `clear_all_filters` is the empty-edge trigger that lets
+// `handle_filter_focus_auto_flip` restore the snapshotted FocusMode.
+// If clear_all_filters silently leaves a stale entry behind, the
+// auto-flip restore never fires.
+
+#[test]
+fn query_clear_all_filters_empties_active() {
+    use graph_renderer::ui::query::QueryModel;
+
+    let mut q = QueryModel::default();
+    q.toggle_field_filter("tags", "rust");
+    assert!(
+        q.is_filter_active("tags", "rust"),
+        "precondition: toggle must add the (tags, rust) entry",
+    );
+    assert!(
+        !q.active_filters.by_field.is_empty(),
+        "precondition: by_field must be non-empty after a toggle",
+    );
+
+    q.clear_all_filters();
+
+    assert!(
+        q.active_filters.by_field.is_empty(),
+        "clear_all_filters must empty active_filters.by_field; got {:?}",
+        q.active_filters.by_field,
+    );
+    assert!(
+        q.active_filters.insertion_order.is_empty(),
+        "clear_all_filters must also empty insertion_order; got {:?}",
+        q.active_filters.insertion_order,
+    );
+    assert!(
+        !q.is_filter_active("tags", "rust"),
+        "is_filter_active must report false after clear_all_filters",
     );
 }

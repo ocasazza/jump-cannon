@@ -36,3 +36,10 @@ graph-renderer = { path = "../graph-renderer" }
 
 [build-dependencies]
 prost-build = "0.13"
+
+[dev-dependencies]
+# `tower` is already a runtime dep at 0.4, but the integration tests
+# below need `ServiceExt::oneshot` which lives behind the `util`
+# feature. Spelling the dep out explicitly here keeps the runtime
+# binary's feature footprint unchanged while making the test compile.
+tower = { version = "0.4", features = ["util"] }
