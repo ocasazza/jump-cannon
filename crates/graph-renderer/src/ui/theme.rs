@@ -83,7 +83,42 @@ pub fn hsl(h: f32, s: f32, l: f32) -> eframe::egui::Color32 {
     )
 }
 
+/// Install Courier Prime under both `Proportional` and `Monospace`
+/// family slots so every text style in egui resolves to it. Bundled
+/// from `assets/fonts/CourierPrime-{Regular,Bold}.ttf` — small enough
+/// (~70 KB each) to embed via `include_bytes!` without bloating the
+/// wasm bundle. The default egui fonts (ProggyClean / Hack) stay as
+/// glyph fallbacks so unicode coverage doesn't regress.
+fn install_fonts(ctx: &egui::Context) {
+    let mut fonts = egui::FontDefinitions::default();
+    fonts.font_data.insert(
+        "courier-prime".into(),
+        std::sync::Arc::new(egui::FontData::from_static(include_bytes!(
+            "../../assets/fonts/CourierPrime-Regular.ttf"
+        ))),
+    );
+    fonts.font_data.insert(
+        "courier-prime-bold".into(),
+        std::sync::Arc::new(egui::FontData::from_static(include_bytes!(
+            "../../assets/fonts/CourierPrime-Bold.ttf"
+        ))),
+    );
+    // Make Courier Prime the *first* candidate for both families. The
+    // fallback chain that egui already populated (ProggyClean for
+    // monospace, Ubuntu-Light / NotoEmoji for proportional) stays in
+    // place for any glyphs Courier Prime doesn't cover.
+    if let Some(list) = fonts.families.get_mut(&egui::FontFamily::Monospace) {
+        list.insert(0, "courier-prime".into());
+    }
+    if let Some(list) = fonts.families.get_mut(&egui::FontFamily::Proportional) {
+        list.insert(0, "courier-prime".into());
+    }
+    ctx.set_fonts(fonts);
+}
+
 pub fn apply(ctx: &egui::Context) {
+    install_fonts(ctx);
+
     let mut style = (*ctx.style()).clone();
     let v = &mut style.visuals;
 
@@ -129,18 +164,18 @@ pub fn apply(ctx: &egui::Context) {
     v.slider_trailing_fill = false;
     v.handle_shape = egui::style::HandleShape::Rect { aspect_ratio: 0.5 };
 
-    // Typography hierarchy.
-    // Section headers: 11px proportional (heading style).
-    // Body / slider labels: 11px monospace (body style).
-    // Small / hint text falls back to egui's default small size.
+    // Typography hierarchy. Courier Prime is now installed as both the
+    // Proportional and Monospace family (see `install_fonts` below), so
+    // every TextStyle inherits the same monospaced look — the user
+    // wants the IBM-CGA / terminal aesthetic everywhere.
     use egui::{FontFamily, FontId, TextStyle};
     style.text_styles.insert(
         TextStyle::Heading,
-        FontId::new(11.0, FontFamily::Proportional),
+        FontId::new(12.0, FontFamily::Monospace),
     );
     style.text_styles.insert(
         TextStyle::Body,
-        FontId::new(11.0, FontFamily::Proportional),
+        FontId::new(11.0, FontFamily::Monospace),
     );
     style.text_styles.insert(
         TextStyle::Monospace,
@@ -148,11 +183,11 @@ pub fn apply(ctx: &egui::Context) {
     );
     style.text_styles.insert(
         TextStyle::Button,
-        FontId::new(11.0, FontFamily::Proportional),
+        FontId::new(11.0, FontFamily::Monospace),
     );
     style.text_styles.insert(
         TextStyle::Small,
-        FontId::new(10.0, FontFamily::Proportional),
+        FontId::new(10.0, FontFamily::Monospace),
     );
 
     // Tighter vertical rhythm: 4px between items (slider-to-slider).
