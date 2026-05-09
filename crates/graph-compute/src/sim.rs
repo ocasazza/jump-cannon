@@ -3,20 +3,19 @@
 //! Holds the in-memory CSR graph + position/velocity buffers and advances them
 //! one tick at a time. Two backends:
 //!
-//!   - `Cuda` (feature = "cuda"): allocates GPU buffers via cudarc and is
-//!     intended to compile + launch a CUDA C force kernel via nvrtc. Phase 1
-//!     ships the allocation + (stub) kernel-source path; the launch site is
-//!     `unimplemented!()` so we don't pretend to do real GPU physics until the
-//!     Phase 2 port lands.
+//!   - `WgpuSim` (preferred): server-side wgpu compute pipeline running the
+//!     ForceAtlas2 shader from `crates/graph-layouts`. Brought up lazily via
+//!     `try_init_wgpu`; failure (no adapter, no Vulkan ICD, etc.) leaves the
+//!     slot empty and the loop falls back to `cpu_step`.
 //!
-//!   - `Cpu` (always available): a tiny serial reference integrator —
-//!     spring-only, no repulsion. Used by tests and as a fallback so the
-//!     end-to-end gRPC stream works on machines without a CUDA driver.
+//!   - `cpu_step` (fallback): tiny serial spring-only integrator — runs
+//!     anywhere, used by tests and on hosts without a GPU.
 
 use std::sync::Arc;
-use tokio::sync::{broadcast, RwLock};
+use tokio::sync::{broadcast, Mutex, RwLock};
 
 use crate::proto::PositionDelta;
+use crate::wgpu_sim::WgpuSim;
 
 /// Compressed-sparse-row graph. Edge `i` connects `src=node` (where
 /// `offsets[node] <= i < offsets[node+1]`) to `neighbors[i]`.
@@ -58,6 +57,10 @@ pub struct SimState {
     /// `Subscribe` handler subscribes to this; the simulation tick task is
     /// the sole producer. Lagging subscribers drop frames (log + continue).
     pub tx: broadcast::Sender<PositionDelta>,
+    /// Lazily-initialized wgpu integrator. `None` until `try_init_wgpu` succeeds;
+    /// if it fails (no adapter / no Vulkan ICD on the host) the run loop falls
+    /// back to `cpu_step` and this stays `None` for the lifetime of the process.
+    pub wgpu_sim: Mutex<Option<WgpuSim>>,
 }
 
 impl SimState {
@@ -80,7 +83,41 @@ impl SimState {
             positions: RwLock::new(positions),
             frame: RwLock::new(0),
             tx,
+            wgpu_sim: Mutex::new(None),
         })
+    }
+
+    /// Attempt to bring up the wgpu integrator. Returns `true` on success.
+    /// On failure the slot stays `None`, the caller logs the cause, and the
+    /// sim loop transparently falls back to `cpu_step`.
+    pub async fn try_init_wgpu(self: &Arc<Self>) -> bool {
+        let positions = self.positions.read().await.clone();
+        let graph = self.graph.clone();
+        // The wgpu device construction blocks on adapter request; do it on the
+        // blocking pool so we don't stall the runtime.
+        let init = tokio::task::spawn_blocking(move || WgpuSim::new(&graph, &positions))
+            .await
+            .expect("wgpu init task panicked");
+        match init {
+            Ok(sim) => {
+                tracing::info!(
+                    backend = ?sim.adapter_info.backend,
+                    name = %sim.adapter_info.name,
+                    device_type = ?sim.adapter_info.device_type,
+                    "wgpu adapter initialized; using GPU FA2 integrator"
+                );
+                let mut slot = self.wgpu_sim.lock().await;
+                *slot = Some(sim);
+                true
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "wgpu adapter not found, falling back to cpu_step"
+                );
+                false
+            }
+        }
     }
 }
 
@@ -120,79 +157,5 @@ pub fn cpu_step(graph: &CsrGraph, positions: &[f32], dt: f32) -> Vec<f32> {
         new_positions[3 * v + 2] = vz + dt * fz;
     }
     new_positions
-}
-
-/// Stub CUDA C kernel source — the spring-only equivalent of the wgsl in
-/// `crates/graph-layouts/src/layout/algorithms/shaders/force.wgsl`. Phase 2
-/// will port the full force model (repulsion modes, gravity, integration) and
-/// move the Barnes-Hut tree build onto the GPU (Karras 2012).
-#[cfg(feature = "cuda")]
-pub const FORCE_KERNEL_SRC: &str = r#"
-extern "C" __global__ void force_step(
-    const float* __restrict__ positions,
-    float*       __restrict__ new_positions,
-    const unsigned int* __restrict__ offsets,
-    const unsigned int* __restrict__ neighbors,
-    unsigned int n_nodes,
-    float dt,
-    float k_spring,
-    float rest_len)
-{
-    unsigned int v = blockIdx.x * blockDim.x + threadIdx.x;
-    if (v >= n_nodes) return;
-    float vx = positions[3*v + 0];
-    float vy = positions[3*v + 1];
-    float vz = positions[3*v + 2];
-    float fx = 0.0f, fy = 0.0f, fz = 0.0f;
-    unsigned int start = offsets[v];
-    unsigned int end   = offsets[v + 1];
-    for (unsigned int e = start; e < end; ++e) {
-        unsigned int u = neighbors[e];
-        float dx = positions[3*u + 0] - vx;
-        float dy = positions[3*u + 1] - vy;
-        float dz = positions[3*u + 2] - vz;
-        float dist = sqrtf(dx*dx + dy*dy + dz*dz);
-        if (dist < 1e-4f) dist = 1e-4f;
-        float f = k_spring * (dist - rest_len) / dist;
-        fx += f * dx;
-        fy += f * dy;
-        fz += f * dz;
-    }
-    new_positions[3*v + 0] = vx + dt * fx;
-    new_positions[3*v + 1] = vy + dt * fy;
-    new_positions[3*v + 2] = vz + dt * fz;
-}
-"#;
-
-#[cfg(feature = "cuda")]
-pub mod cuda_backend {
-    //! cudarc allocation scaffold. The kernel launch site is intentionally
-    //! unimplemented — Phase 2 wires up nvrtc compilation + actual launch.
-    use super::*;
-    use anyhow::Result;
-
-    pub struct CudaSim {
-        // Real types live behind the `cuda` feature; we keep the struct empty
-        // so the call sites compile without a CUDA toolkit during Phase 1.
-        // Phase 2 will replace these with `Arc<CudaDevice>` + `CudaSlice<f32>`.
-        pub n_nodes: u32,
-    }
-
-    impl CudaSim {
-        /// Initialize a CUDA context on device 0 and allocate buffers. Phase 1
-        /// stub: returns an error so callers fall back to the CPU integrator.
-        pub fn new(_graph: &CsrGraph) -> Result<Self> {
-            // Phase 2: cudarc::driver::CudaDevice::new(0)?, alloc positions /
-            // velocities / offsets / neighbors / mass on the device, compile
-            // FORCE_KERNEL_SRC via cudarc::nvrtc::compile_ptx.
-            anyhow::bail!("CUDA backend kernel launch not yet implemented (Phase 2)")
-        }
-
-        pub fn step(&mut self, _dt: f32) -> Result<Vec<f32>> {
-            // Phase 2: launch force_step kernel, copy positions back via pinned
-            // memory; for now we never get here because `new` errors out.
-            unimplemented!("graph-compute CUDA kernel launch is a Phase 2 deliverable")
-        }
-    }
 }
 

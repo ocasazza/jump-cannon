@@ -16,3 +16,6 @@ pub mod proto {
 
 pub mod sim;
 pub mod service;
+pub mod wgpu_sim;
+
+pub use wgpu_sim::WgpuSim;
