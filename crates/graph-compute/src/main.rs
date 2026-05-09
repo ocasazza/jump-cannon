@@ -27,6 +27,11 @@ async fn main() -> Result<()> {
     let graph = CsrGraph::path(1024);
     let state = SimState::new(graph);
 
+    // Try to bring up the wgpu FA2 integrator. On hosts without a Vulkan/Metal
+    // adapter (most CI runners), this returns false and we transparently fall
+    // back to `cpu_step` — `try_init_wgpu` already logs the cause.
+    let _ = state.try_init_wgpu().await;
+
     let bind: SocketAddr = std::env::var("GRAPH_COMPUTE_ADDR")
         .unwrap_or_else(|_| "[::1]:50051".to_string())
         .parse()?;

@@ -64,3 +64,83 @@ async fn delivers_at_least_one_position_delta() {
 
     server.abort();
 }
+
+/// Stronger end-to-end check: positions actually advance over time. Both the
+/// wgpu FA2 path and the CPU spring-only fallback produce non-zero motion on
+/// the deterministic ring seed, so this assertion holds either way.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn positions_advance_over_frames() {
+    let graph = CsrGraph::path(64);
+    let state = SimState::new(graph);
+    // Best-effort GPU init — if it fails the CPU fallback still produces motion.
+    let _ = state.try_init_wgpu().await;
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    drop(listener);
+
+    let sim_state = state.clone();
+    tokio::spawn(async move { run_sim_loop(sim_state, 60.0).await });
+
+    let svc = ComputeService::new(state);
+    let server = tokio::spawn(async move {
+        Server::builder()
+            .add_service(ComputeServer::new(svc))
+            .serve(addr)
+            .await
+            .unwrap();
+    });
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let endpoint = format!("http://{}", addr);
+    let mut client = ComputeClient::connect(endpoint)
+        .await
+        .expect("connect to compute server");
+
+    let mut stream = client
+        .subscribe(SubscribeRequest { graph_id: "test".into() })
+        .await
+        .expect("subscribe")
+        .into_inner();
+
+    // Pull frames; capture frame 1 and frame 30 (or whatever shows up
+    // ~500ms later at 60Hz, with safety margin).
+    let mut first: Option<Vec<f32>> = None;
+    let mut later: Option<Vec<f32>> = None;
+    let mut count: u32 = 0;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while tokio::time::Instant::now() < deadline {
+        let msg = tokio::time::timeout(Duration::from_secs(2), stream.message())
+            .await
+            .expect("timed out waiting for frame")
+            .expect("stream errored")
+            .expect("stream ended without a frame");
+        let positions: Vec<f32> = bytemuck::cast_slice::<u8, f32>(&msg.positions).to_vec();
+        count += 1;
+        if first.is_none() {
+            first = Some(positions);
+        } else if count >= 30 {
+            later = Some(positions);
+            break;
+        }
+    }
+
+    let first = first.expect("no first frame");
+    let later = later.expect("did not reach frame 30");
+    assert_eq!(first.len(), later.len());
+
+    let l2_sq: f32 = first
+        .iter()
+        .zip(later.iter())
+        .map(|(a, b)| (a - b) * (a - b))
+        .sum();
+    let l2 = l2_sq.sqrt();
+    assert!(
+        l2 > 0.0,
+        "positions did not advance over 30 frames (L2 = {})",
+        l2
+    );
+
+    server.abort();
+}

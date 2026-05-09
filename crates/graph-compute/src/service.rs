@@ -67,9 +67,9 @@ impl Compute for ComputeService {
     }
 }
 
-/// Drive the simulation forward. CPU integrator only in Phase 1 — the CUDA
-/// backend's `step` is `unimplemented!()` and we don't want the binary to
-/// panic on hosts without a GPU. Phase 2 swaps this for the cudarc path.
+/// Drive the simulation forward. Prefers the wgpu FA2 integrator when
+/// `SimState::wgpu_sim` is `Some`; otherwise falls back to the CPU
+/// reference integrator so CI hosts without a GPU still produce frames.
 pub async fn run_sim_loop(state: Arc<SimState>, tick_hz: f32) {
     let dt = 1.0 / tick_hz.max(1.0);
     let period = Duration::from_secs_f32(dt);
@@ -79,15 +79,27 @@ pub async fn run_sim_loop(state: Arc<SimState>, tick_hz: f32) {
     loop {
         interval.tick().await;
 
-        // Snapshot positions under the async lock, then run the integrator
-        // in spawn_blocking so a 1M-node graph doesn't stall the runtime.
-        // Phase 2: replace with cudarc launch.
-        let snapshot = state.positions.read().await.clone();
-        let graph = state.graph.clone();
-        let new_positions =
+        // Prefer the wgpu integrator. We take the WgpuSim out of the Mutex
+        // for the duration of the blocking dispatch + readback (so the lock
+        // doesn't sit across the join) and put it back afterwards. There's
+        // exactly one tick task, so contention here is impossible.
+        let taken_sim = state.wgpu_sim.lock().await.take();
+        let new_positions = if let Some(mut sim) = taken_sim {
+            let (positions, sim) = tokio::task::spawn_blocking(move || {
+                let positions = sim.step();
+                (positions, sim)
+            })
+            .await
+            .expect("wgpu sim step panicked");
+            *state.wgpu_sim.lock().await = Some(sim);
+            positions
+        } else {
+            let snapshot = state.positions.read().await.clone();
+            let graph = state.graph.clone();
             tokio::task::spawn_blocking(move || cpu_step(&graph, &snapshot, dt))
                 .await
-                .expect("sim step panicked");
+                .expect("cpu sim step panicked")
+        };
 
         // Commit + broadcast.
         {
