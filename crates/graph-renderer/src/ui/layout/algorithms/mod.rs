@@ -6,3 +6,4 @@ pub mod sphere;
 pub mod concentric;
 pub mod hilbert;
 pub mod force_atlas2;
+pub mod remote_fa2;

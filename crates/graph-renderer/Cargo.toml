@@ -57,13 +57,17 @@ console_log              = { version = "1",  optional = true }
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 env_logger = "0.11"
 reqwest    = { version = "0.12", default-features = false, features = ["rustls-tls"] }
-tokio      = { version = "1", features = ["rt", "rt-multi-thread", "macros"] }
+tokio      = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time", "net"] }
 pollster   = "0.4"
+# WS client for the RemoteFa2 layout (native). `connect` feature pulls
+# `connect_async` + URL parsing; rustls keeps the build TLS-portable.
+tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 wasm-bindgen         = { version = "0.2", optional = true }
 wasm-bindgen-futures = { version = "0.4", optional = true }
-gloo-net             = { version = "0.6", features = ["http"], optional = true }
+gloo-net             = { version = "0.6", features = ["http", "websocket"], optional = true }
+gloo-timers          = { version = "0.3", features = ["futures"] }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies.web-sys]
 version = "0.3"
