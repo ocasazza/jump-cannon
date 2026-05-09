@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use graph_compute::proto::compute_client::ComputeClient;
 use graph_compute::proto::compute_server::ComputeServer;
-use graph_compute::proto::SubscribeRequest;
+use graph_compute::proto::{HealthRequest, SubscribeRequest};
 use graph_compute::service::{run_sim_loop, ComputeService};
 use graph_compute::sim::{CsrGraph, SimState};
 use tonic::transport::Server;
@@ -143,4 +143,67 @@ async fn positions_advance_over_frames() {
     );
 
     server.abort();
+}
+
+/// Phase 2: validate that a CSR file written via `write_bin` and re-loaded
+/// via `load_bin` (the same path the binary takes when `GRAPH_COMPUTE_GRAPH_PATH`
+/// is set) drives the gRPC server's reported `n_nodes` correctly.
+///
+/// We don't shell out to the `graph-compute` binary here — that would couple
+/// this test to cargo's bin-output path. Instead we exercise the same code
+/// the binary's main runs: read env -> `CsrGraph::load_bin` -> SimState ->
+/// `Compute::Health`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn loads_graph_from_file_via_env() {
+    // 1. Write a 64-node path graph to a tempfile.
+    let original = CsrGraph::path(64);
+    let tmp = std::env::temp_dir().join(format!(
+        "graph-compute-env-load-{}.bin",
+        std::process::id()
+    ));
+    original.write_bin(&tmp).expect("write_bin");
+
+    // 2. Set the env var the binary reads, then mirror the binary's load path.
+    std::env::set_var("GRAPH_COMPUTE_GRAPH_PATH", &tmp);
+    let path = std::env::var("GRAPH_COMPUTE_GRAPH_PATH").unwrap();
+    let graph = CsrGraph::load_bin(&path).expect("load_bin from env");
+    assert_eq!(graph.n_nodes, 64);
+
+    let state = SimState::new(graph);
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    drop(listener);
+
+    let sim_state = state.clone();
+    tokio::spawn(async move { run_sim_loop(sim_state, 60.0).await });
+
+    let svc = ComputeService::new(state);
+    let server = tokio::spawn(async move {
+        Server::builder()
+            .add_service(ComputeServer::new(svc))
+            .serve(addr)
+            .await
+            .unwrap();
+    });
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let endpoint = format!("http://{}", addr);
+    let mut client = ComputeClient::connect(endpoint)
+        .await
+        .expect("connect to compute server");
+
+    // 3. Health check: n_nodes must reflect the on-disk graph.
+    let health = client
+        .health(HealthRequest {})
+        .await
+        .expect("health rpc")
+        .into_inner();
+    assert_eq!(health.n_nodes, 64);
+    assert!(health.ok);
+
+    server.abort();
+    std::env::remove_var("GRAPH_COMPUTE_GRAPH_PATH");
+    let _ = std::fs::remove_file(&tmp);
 }

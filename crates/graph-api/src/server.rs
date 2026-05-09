@@ -32,6 +32,7 @@ pub fn router(state: AppState) -> Router {
         .route("/graph/ids", get(graph_ids))
         .route("/graph/positions", get(graph_positions))
         .route("/graph/edges", get(graph_edges))
+        .route("/graph/csr.bin", get(graph_csr_bin))
         .route("/graph/metrics/:name", get(graph_metric))
         .route("/graph/meta_summary", get(graph_meta_summary))
         .route("/graph/layout/stream", get(graph_layout_stream))
@@ -276,6 +277,71 @@ async fn graph_positions(State(s): State<AppState>) -> impl IntoResponse {
 
 async fn graph_edges(State(s): State<AppState>) -> impl IntoResponse {
     cached_binary_response(&s, "edges").into_response()
+}
+
+/// Symmetrized CSR adjacency export consumed by `graph-compute` (and SkyPilot
+/// `file_mounts` pre-launch). Format is little-endian:
+///
+/// ```text
+/// [u32 n_nodes][u32 n_edges][u32 × (n_nodes+1) offsets][u32 × n_edges neighbors]
+/// ```
+///
+/// This is the on-disk format `graph_compute::sim::CsrGraph::load_bin` parses.
+/// Built fresh per request for now; if hot, fold into `binary_cache` like
+/// `/graph/edges`. Returns 503 if the in-memory graph hasn't loaded yet
+/// (mirrors `/graph/layout/stream`'s 503 pattern).
+async fn graph_csr_bin(State(s): State<AppState>) -> axum::response::Response {
+    let graph = &s.inner.graph;
+    if graph.nodes.is_empty() {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "graph not loaded",
+        )
+            .into_response();
+    }
+    let bytes = build_csr_bin(&s);
+    let mut headers = HeaderMap::new();
+    headers.insert(header::CONTENT_TYPE, HeaderValue::from_static(OCTET_CT));
+    (StatusCode::OK, headers, bytes).into_response()
+}
+
+/// Build the CSR byte buffer for `/graph/csr.bin`. Symmetrizes the edge list
+/// (force-sim neighbor lookup is undirected) using the same dense indexing
+/// `id_to_idx` already provides for the other binary endpoints.
+fn build_csr_bin(s: &AppState) -> Vec<u8> {
+    let n_nodes = s.inner.graph.nodes.len() as u32;
+    let mut adj: Vec<Vec<u32>> = vec![Vec::new(); n_nodes as usize];
+    for edge in &s.inner.graph.edges {
+        let (Some(&src), Some(&tgt)) = (
+            s.inner.id_to_idx.get(&edge.source),
+            s.inner.id_to_idx.get(&edge.target),
+        ) else {
+            continue;
+        };
+        if src == tgt {
+            continue;
+        }
+        adj[src as usize].push(tgt);
+        adj[tgt as usize].push(src);
+    }
+    let mut offsets: Vec<u32> = Vec::with_capacity(n_nodes as usize + 1);
+    let mut neighbors: Vec<u32> = Vec::new();
+    for bucket in &adj {
+        offsets.push(neighbors.len() as u32);
+        neighbors.extend_from_slice(bucket);
+    }
+    offsets.push(neighbors.len() as u32);
+    let n_edges = neighbors.len() as u32;
+    let mut out = Vec::with_capacity(8 + 4 * offsets.len() + 4 * neighbors.len());
+    out.extend_from_slice(&n_nodes.to_le_bytes());
+    out.extend_from_slice(&n_edges.to_le_bytes());
+    for v in &offsets {
+        out.extend_from_slice(&v.to_le_bytes());
+    }
+    for v in &neighbors {
+        out.extend_from_slice(&v.to_le_bytes());
+    }
+    out
 }
 
 async fn graph_metric(State(s): State<AppState>, Path(name): Path<String>) -> impl IntoResponse {
