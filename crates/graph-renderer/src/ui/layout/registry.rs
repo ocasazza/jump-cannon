@@ -93,6 +93,11 @@ impl LayoutRegistry {
         r.register(super::algorithms::gpu_force::factory());
         r.register(super::algorithms::random::factory());
         r.register(super::algorithms::circle::factory());
+        r.register(super::algorithms::grid::factory());
+        r.register(super::algorithms::sphere::factory());
+        r.register(super::algorithms::concentric::factory());
+        r.register(super::algorithms::hilbert::factory());
+        r.register(super::algorithms::force_atlas2::factory());
         r
     }
 }

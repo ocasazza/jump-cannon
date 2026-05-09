@@ -12,6 +12,11 @@ pub use layout::algorithms::fcose::{FcoseLayoutEngine, FcoseOptions};
 pub use layout::algorithms::gpu_force::{GpuForceLayout, GpuForceOptions, RepulsionMode};
 pub use layout::algorithms::random::{RandomLayout, RandomSettings};
 pub use layout::algorithms::circle::{CircleAxis, CircleLayout, CircleSettings};
+pub use layout::algorithms::grid::{GridLayout, GridSettings};
+pub use layout::algorithms::sphere::{SphereLayout, SphereSettings};
+pub use layout::algorithms::concentric_static::{ConcentricLayout, ConcentricMetric, ConcentricSettings};
+pub use layout::algorithms::hilbert::{HilbertLayout, HilbertSettings};
+pub use layout::algorithms::force_atlas2::{ForceAtlas2Layout, ForceAtlas2Settings};
 pub use layout::layout_trait::{
     BoxedPhysics, BoxedStatic, DynPhysicsLayout, DynStaticLayout, LayoutDescriptor, LayoutId,
     LayoutKind, LayoutRequirements, LayoutSettings, PhysicsLayout, StaticLayout,
