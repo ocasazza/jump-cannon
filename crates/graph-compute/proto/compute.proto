@@ -1,0 +1,23 @@
+syntax = "proto3";
+package graph_compute;
+
+service Compute {
+  rpc Subscribe(SubscribeRequest) returns (stream PositionDelta);
+  rpc Health(HealthRequest) returns (HealthResponse);
+}
+
+message SubscribeRequest { string graph_id = 1; }
+
+message PositionDelta {
+  uint64 frame = 1;
+  // raw little-endian f32 [x0,y0,z0,x1,y1,z1,...]
+  bytes positions = 2;
+  uint32 n_nodes = 3;
+}
+
+message HealthRequest {}
+message HealthResponse {
+  bool ok = 1;
+  uint32 n_nodes = 2;
+  uint64 frame = 3;
+}

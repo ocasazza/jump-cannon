@@ -5,13 +5,17 @@
 // at this server via a --backend-url flag (not yet implemented).
 
 use axum::{
-    extract::{Path, Query, State},
+    extract::{
+        ws::{Message, WebSocket, WebSocketUpgrade},
+        Path, Query, State,
+    },
     http::{header, HeaderMap, HeaderValue, StatusCode},
     response::IntoResponse,
     routing::get,
     Router,
 };
-use prost::Message;
+use tokio::sync::broadcast::error::RecvError;
+use prost::Message as ProstMessage;
 use serde::Deserialize;
 
 use crate::{proto, state::AppState};
@@ -30,6 +34,7 @@ pub fn router(state: AppState) -> Router {
         .route("/graph/edges", get(graph_edges))
         .route("/graph/metrics/:name", get(graph_metric))
         .route("/graph/meta_summary", get(graph_meta_summary))
+        .route("/graph/layout/stream", get(graph_layout_stream))
         .route("/node/:id", get(node_meta))
         .route("/search", get(search))
         .with_state(state)
@@ -255,7 +260,7 @@ async fn search(State(s): State<AppState>, Query(p): Query<SearchParams>) -> imp
     proto_response(&msg).into_response()
 }
 
-fn proto_response<M: Message>(msg: &M) -> impl IntoResponse {
+fn proto_response<M: ProstMessage>(msg: &M) -> impl IntoResponse {
     let mut buf = Vec::with_capacity(msg.encoded_len());
     msg.encode(&mut buf).expect("encode");
     let mut headers = HeaderMap::new();
@@ -398,6 +403,55 @@ fn extract_strings(v: &serde_json::Value) -> Vec<String> {
 /// so the response shares the buffer with the cache — no copy. The
 /// graph is immutable for the server's lifetime, so a long max-age is
 /// safe; `immutable` tells the browser not to revalidate on refresh.
+// --- Layout streaming (Phase 1 of the distributed-compute plan) -------------
+//
+// Subscribes to the configured graph-compute worker and forwards every
+// PositionDelta to the WebSocket as a single binary frame:
+//
+//   [u64 LE frame number][u32 LE n_nodes][raw f32 LE positions...]
+//
+// The WASM client reuses the same `positions` byte layout that
+// `/graph/positions` already serves, so the renderer's existing buffer-update
+// path can ingest these frames once a stream-consumer lands. WebTransport
+// upgrade is a Phase 4 deliverable; WebSocket is the contained Phase 1 choice.
+async fn graph_layout_stream(
+    State(s): State<AppState>,
+    ws: WebSocketUpgrade,
+) -> axum::response::Response {
+    let Some(rx) = s.inner.compute_broker.subscribe().await else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "compute worker not connected",
+        )
+            .into_response();
+    };
+    ws.on_upgrade(move |socket| layout_stream_loop(socket, rx))
+}
+
+async fn layout_stream_loop(
+    mut socket: WebSocket,
+    mut rx: tokio::sync::broadcast::Receiver<graph_compute::proto::PositionDelta>,
+) {
+    loop {
+        let frame = match rx.recv().await {
+            Ok(f) => f,
+            Err(RecvError::Lagged(n)) => {
+                tracing::warn!(skipped = n, "ws subscriber lagged");
+                continue;
+            }
+            Err(RecvError::Closed) => break,
+        };
+        let mut buf =
+            Vec::with_capacity(8 + 4 + frame.positions.len());
+        buf.extend_from_slice(&frame.frame.to_le_bytes());
+        buf.extend_from_slice(&frame.n_nodes.to_le_bytes());
+        buf.extend_from_slice(&frame.positions);
+        if socket.send(Message::Binary(buf)).await.is_err() {
+            break;
+        }
+    }
+}
+
 fn cached_binary_response(s: &AppState, key: &str) -> axum::response::Response {
     let Some(buf) = s.inner.binary_cache.get(key).cloned() else {
         return (StatusCode::NOT_FOUND, "unknown buffer").into_response();

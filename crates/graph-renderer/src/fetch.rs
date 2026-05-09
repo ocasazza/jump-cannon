@@ -9,6 +9,16 @@
 //!   GET /graph/metrics/:name     -> raw little-endian f32 [v,v,...]
 //!   GET /node/:id                -> protobuf NodeMeta
 //!   GET /search?q=…              -> protobuf SearchResults
+//
+// TODO(phase 1 stream-consumer): graph-api now exposes
+//   GET /graph/layout/stream  (WebSocket; binary frames of
+//                              [u64 LE frame][u32 LE n_nodes][f32 LE positions...])
+// When the user opts into the distributed backend, open a WS to that route
+// (web-sys::WebSocket on wasm32, tokio-tungstenite native), push positions
+// straight into `positions_buffer`, and skip the local `compute_step()` call
+// in `graph_pipelines.rs`. Left as a stub here so the WASM build keeps working
+// while the broker + worker scaffold lands; see plan
+// `/home/casazza/.claude/plans/federated-swinging-rainbow.md` Phase 1.
 
 use crate::proto;
 use prost::Message;

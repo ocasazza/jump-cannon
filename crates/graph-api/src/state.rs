@@ -9,6 +9,7 @@ use std::sync::Arc;
 
 use vault_data::VaultGraph;
 
+use crate::compute_broker::ComputeBroker;
 use crate::subprocess::VaultSearch;
 
 /// Immutable, shared backend state. Cloning `AppState` clones the inner Arc.
@@ -39,6 +40,10 @@ pub struct AppStateInner {
     /// hit. Keys: "positions", "edges", "degree", "pagerank", "kcore",
     /// "community", "wcc", "indegree", "outdegree", "betweenness".
     pub binary_cache: HashMap<String, Arc<[u8]>>,
+    /// Optional gRPC client to a `graph-compute` worker. When the dial at
+    /// boot fails, this is still present but `subscribe()` returns `None`,
+    /// and `/graph/layout/stream` returns 503.
+    pub compute_broker: ComputeBroker,
 }
 
 impl AppState {
@@ -47,6 +52,7 @@ impl AppState {
         graph: VaultGraph,
         vault_search: Option<Arc<VaultSearch>>,
         assets_dir: Option<PathBuf>,
+        compute_broker: ComputeBroker,
     ) -> Self {
         let mut id_to_idx = HashMap::with_capacity(graph.nodes.len());
         let mut idx_to_id = Vec::with_capacity(graph.nodes.len());
@@ -94,6 +100,7 @@ impl AppState {
                 vault_search,
                 assets_dir,
                 binary_cache,
+                compute_broker,
             }),
         }
     }

@@ -13,14 +13,18 @@ name = "graph_api"
 path = "src/lib.rs"
 
 [dependencies]
-axum               = "0.7"
+axum               = { version = "0.7", features = ["ws"] }
 tokio              = { workspace = true }
+tokio-stream       = "0.1"
 tower              = "0.4"
 tower-http         = { version = "0.5", features = ["fs", "trace"] }
 serde              = { workspace = true }
 serde_json         = { workspace = true }
 bytes              = "1"
 prost              = "0.13"
+tonic              = "0.12"
+anyhow             = "1"
+futures            = "0.3"
 tracing            = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 open               = "5"
@@ -33,6 +37,9 @@ vault-data     = { path = "../vault-data" }
 vault-links    = { path = "../vault-links" }
 graph-metrics  = { path = "../graph-metrics" }
 graph-renderer = { path = "../graph-renderer" }
+# graph-compute is native-only. graph-api links it for its gRPC client types
+# + generated proto bindings; the renderer (WASM) does not.
+graph-compute  = { path = "../graph-compute", default-features = false }
 
 [build-dependencies]
 prost-build = "0.13"

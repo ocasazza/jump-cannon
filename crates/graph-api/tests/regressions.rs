@@ -23,6 +23,7 @@ fn empty_state() -> AppState {
         VaultGraph::new(),
         None,
         None,
+        graph_api::compute_broker::ComputeBroker::new(),
     )
 }
 
@@ -92,6 +93,7 @@ fn _state_constructor_is_public() -> AppState {
         VaultGraph::new(),
         None,
         None,
+        graph_api::compute_broker::ComputeBroker::new(),
     )
 }
 

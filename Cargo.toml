@@ -5,6 +5,7 @@ members = [
     "crates/graph-metrics",
     "crates/graph-renderer",
     "crates/graph-api",
+    "crates/graph-compute",
     "crates/vault-data",
     "crates/vault-links",
     "crates/vault-search",

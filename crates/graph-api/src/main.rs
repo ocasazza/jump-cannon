@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use clap::Parser;
 
-use graph_api::{router, vault_loader, AppState};
+use graph_api::{compute_broker::ComputeBroker, router, vault_loader, AppState};
 
 /// Resolution order: CLI flag > env var (VAULT_ROOT) > .env file > current directory.
 //
@@ -65,7 +65,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(dir) = &args.assets_dir {
         tracing::info!(assets_dir = %dir.display(), "dev mode: serving assets from disk");
     }
-    let state = AppState::new(vault_root, graph, vault_search, args.assets_dir);
+
+    // Best-effort dial of the graph-compute worker. If unreachable, the
+    // /graph/layout/stream endpoint returns 503; existing endpoints are
+    // unaffected (clients run the local wgpu sim).
+    let compute_url = std::env::var("JUMP_CANNON_COMPUTE_URL")
+        .unwrap_or_else(|_| "http://[::1]:50051".to_string());
+    let compute_broker = ComputeBroker::new();
+    {
+        let broker = compute_broker.clone();
+        let url = compute_url.clone();
+        tokio::spawn(async move {
+            match broker.connect(url.clone()).await {
+                Ok(()) => tracing::info!(%url, "connected to graph-compute worker"),
+                Err(e) => tracing::warn!(
+                    %url,
+                    "graph-compute unreachable: {e}; /graph/layout/stream will return 503"
+                ),
+            }
+        });
+    }
+
+    let state = AppState::new(
+        vault_root,
+        graph,
+        vault_search,
+        args.assets_dir,
+        compute_broker,
+    );
 
     let app = router(state);
 
