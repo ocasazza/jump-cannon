@@ -2,7 +2,7 @@
 name = "graph-compute"
 version = "0.1.0"
 edition = "2021"
-description = "Single-GPU CUDA force-simulation worker. Exposes a tonic gRPC Subscribe stream of PositionDelta frames. Native-only (never compiles to wasm)."
+description = "Single-GPU wgpu force-simulation worker. Exposes a tonic gRPC Subscribe stream of PositionDelta frames. Native-only (never compiles to wasm)."
 
 # Native-only crate — never targeted at wasm32. The renderer's WASM build excludes
 # this from its dependency graph by simply not depending on it.
@@ -14,13 +14,6 @@ path = "src/main.rs"
 [lib]
 name = "graph_compute"
 path = "src/lib.rs"
-
-[features]
-# Default-on: build the cudarc paths. CI hosts without a CUDA toolkit/driver can
-# still exercise the proto + tonic server scaffold by running with
-# `--no-default-features` (kernel launch becomes `unimplemented!()`).
-default = ["cuda"]
-cuda = ["dep:cudarc"]
 
 [dependencies]
 tonic              = "0.12"
@@ -34,8 +27,10 @@ anyhow             = "1"
 async-stream       = "0.3"
 futures-core       = "0.3"
 
-# CUDA path. Gated so non-GPU CI hosts can still build the proto + server skeleton.
-cudarc = { version = "0.12", default-features = false, features = ["cuda-12060", "driver", "nvrtc"], optional = true }
+# Server-side wgpu force-sim. Native-only crate, so we let wgpu pick the default
+# backend set (vulkan/metal/dx12); no webgpu/webgl features needed.
+wgpu     = { version = "23", features = ["wgsl"] }
+pollster = "0.4"
 
 [build-dependencies]
 tonic-build = "0.12"
