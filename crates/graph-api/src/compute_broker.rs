@@ -5,11 +5,14 @@
 //! `PositionDelta` it receives onto a `tokio::sync::broadcast` channel that
 //! the WebSocket handler subscribes to.
 //!
-//! Boot semantics: the dial is best-effort. If the worker isn't reachable the
-//! broker stays in a `Disconnected` state and the `/graph/layout/stream`
-//! endpoint returns 503. A future revision should reconnect with backoff.
+//! Boot semantics: the broadcast channel is created up front so the WS
+//! endpoint never returns 503 for a transient worker outage. A background
+//! reconnect task keeps the gRPC stream alive across worker restarts using
+//! exponential backoff (1s → cap 30s, reset on a successful dial). This is
+//! the SkyPilot-pod-restart story; see infra/sky/README.md.
 
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::broadcast;
 use tonic::transport::Channel;
 
@@ -36,45 +39,106 @@ impl ComputeBroker {
         }
     }
 
-    /// Try to dial the compute worker. On success, spawn a forwarder task
-    /// that pumps the gRPC stream into a broadcast channel. The caller logs
-    /// the error path; the broker stays disconnected on failure.
+    /// Spawn a reconnecting forwarder task that dials the compute worker,
+    /// streams `PositionDelta`s onto a broadcast channel, and redials with
+    /// exponential backoff if the dial fails or the stream ends.
+    ///
+    /// Returns immediately — startup is never blocked on the worker being
+    /// reachable. The first successful dial validates `url`; an *invalid*
+    /// url (parse failure) is reported synchronously as an error.
+    ///
+    /// TODO(auth): wrap `ComputeClient` in a tonic interceptor that injects
+    /// a bearer token from `JUMP_CANNON_COMPUTE_TOKEN`.
     pub async fn connect(&self, url: String) -> anyhow::Result<()> {
-        let endpoint = Channel::from_shared(url.clone())
+        // Validate the URL eagerly so a typo fails the boot sequence loudly.
+        // The actual TCP dial happens inside the spawned reconnect loop.
+        let _ = Channel::from_shared(url.clone())
             .map_err(|e| anyhow::anyhow!("invalid compute url {url}: {e}"))?;
-        let channel = endpoint.connect().await?;
-        let mut client = ComputeClient::new(channel);
 
-        let stream = client
-            .subscribe(SubscribeRequest {
-                graph_id: String::new(),
-            })
-            .await?
-            .into_inner();
-
+        // Create the broadcast channel up front. WS clients can subscribe
+        // before the first dial succeeds; they'll just sit on an empty
+        // receiver until frames arrive (or after a worker restart).
         let (tx, _rx) = broadcast::channel::<PositionDelta>(64);
         *self.inner.tx.write().await = Some(tx.clone());
 
-        // Forwarder task: pull frames from the worker, fan out to WS clients.
-        // Lives as long as the gRPC stream stays open. If the worker dies,
-        // we drop the broadcast::Sender and `/graph/layout/stream` clients
-        // see Closed and disconnect.
+        // Reconnecting forwarder. Each iteration: dial, subscribe, pump
+        // frames until the stream ends or errors, then back off and retry.
         tokio::spawn(async move {
-            let mut stream = stream;
+            const BACKOFF_INITIAL: Duration = Duration::from_secs(1);
+            const BACKOFF_CAP: Duration = Duration::from_secs(30);
+            let mut backoff = BACKOFF_INITIAL;
+
             loop {
-                match stream.message().await {
-                    Ok(Some(frame)) => {
-                        let _ = tx.send(frame);
-                    }
-                    Ok(None) => {
-                        tracing::warn!("compute worker closed stream");
-                        break;
-                    }
+                tracing::info!(url = %url, "compute broker dialing worker");
+                let endpoint = match Channel::from_shared(url.clone()) {
+                    Ok(e) => e,
                     Err(e) => {
-                        tracing::warn!("compute stream error: {e}");
-                        break;
+                        // Should not happen — already validated above — but
+                        // be defensive so a future env-var refresh path is
+                        // safe.
+                        tracing::warn!("compute broker invalid url {url}: {e}");
+                        tokio::time::sleep(backoff).await;
+                        backoff = (backoff * 2).min(BACKOFF_CAP);
+                        continue;
+                    }
+                };
+
+                let channel = match endpoint.connect().await {
+                    Ok(c) => c,
+                    Err(e) => {
+                        tracing::warn!(
+                            url = %url,
+                            backoff_secs = backoff.as_secs(),
+                            "compute broker dial failed: {e}",
+                        );
+                        tokio::time::sleep(backoff).await;
+                        backoff = (backoff * 2).min(BACKOFF_CAP);
+                        continue;
+                    }
+                };
+
+                let mut client = ComputeClient::new(channel);
+                let stream = match client
+                    .subscribe(SubscribeRequest {
+                        graph_id: String::new(),
+                    })
+                    .await
+                {
+                    Ok(s) => s.into_inner(),
+                    Err(e) => {
+                        tracing::warn!(
+                            url = %url,
+                            backoff_secs = backoff.as_secs(),
+                            "compute broker subscribe failed: {e}",
+                        );
+                        tokio::time::sleep(backoff).await;
+                        backoff = (backoff * 2).min(BACKOFF_CAP);
+                        continue;
+                    }
+                };
+
+                tracing::info!(url = %url, "compute broker connected; streaming frames");
+                backoff = BACKOFF_INITIAL;
+
+                let mut stream = stream;
+                loop {
+                    match stream.message().await {
+                        Ok(Some(frame)) => {
+                            let _ = tx.send(frame);
+                        }
+                        Ok(None) => {
+                            tracing::warn!("compute worker closed stream; reconnecting");
+                            break;
+                        }
+                        Err(e) => {
+                            tracing::warn!("compute stream error: {e}; reconnecting");
+                            break;
+                        }
                     }
                 }
+
+                tokio::time::sleep(backoff).await;
+                backoff = (backoff * 2).min(BACKOFF_CAP);
             }
         });
 
