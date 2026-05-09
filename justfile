@@ -158,3 +158,17 @@ _test-perf: wasm
         cd tests/browser && npm install --silent --no-audit --no-fund; \
     fi
     cd tests/browser && node perf.mjs
+
+# Bring up the graph-compute worker on a SkyPilot-managed GPU node.
+# See infra/sky/README.md for prereqs.
+sky-up:
+    sky launch -c graph-compute infra/sky/graph-compute.yaml --yes
+
+# Tear down the SkyPilot graph-compute cluster.
+sky-down:
+    sky down graph-compute --yes
+
+# Print `JUMP_CANNON_COMPUTE_URL=http://<host>:50051` for the running cluster.
+# Export it in the shell where you run graph-api.
+sky-endpoint:
+    @sky status --endpoint 50051 graph-compute | awk '{print "JUMP_CANNON_COMPUTE_URL=http://" $0}'
