@@ -1,0 +1,32 @@
+# Launch the graph-compute worker on a cloud GPU node.
+# Usage:
+#   sky launch -c graph-compute infra/sky/graph-compute.yaml
+#   sky status --endpoint 50051 graph-compute   # prints public host:port
+#   export JUMP_CANNON_COMPUTE_URL=http://<host>:50051
+#   (then start graph-api locally; it will dial the worker)
+
+resources:
+  accelerators: L4:1   # or A100:1 — keep L4 as default for cost
+  ports:
+    - 50051
+
+file_mounts:
+  /opt/jump-cannon: .
+
+setup: |
+  # Rust toolchain (matrix matches workspace rust-toolchain.toml if present)
+  curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+  source $HOME/.cargo/env
+  # Vulkan loader for wgpu on NVIDIA cloud images
+  sudo apt-get update -y
+  sudo apt-get install -y libvulkan1 vulkan-tools mesa-vulkan-drivers
+  vulkaninfo --summary || echo "WARN: vulkaninfo not available; wgpu will fall back to CPU"
+  cd /opt/jump-cannon
+  cargo build --release -p graph-compute
+
+run: |
+  source $HOME/.cargo/env
+  cd /opt/jump-cannon
+  GRAPH_COMPUTE_TICK_HZ=${GRAPH_COMPUTE_TICK_HZ:-30} \
+  RUST_LOG=${RUST_LOG:-info} \
+  ./target/release/graph-compute
