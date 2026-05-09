@@ -21,10 +21,26 @@ async fn main() -> Result<()> {
         )
         .init();
 
-    // TODO(phase 2): load a real graph from `--graph <path>` (binary CSR file
-    // produced by graph-api at vault-load time). For now: a 1024-node path
-    // graph so the CPU integrator does something visible.
-    let graph = CsrGraph::path(1024);
+    // Phase 2: load a real graph from `GRAPH_COMPUTE_GRAPH_PATH` (binary CSR
+    // file produced by graph-api's `/graph/csr.bin` at vault-load time). When
+    // unset, fall back to a 1024-node path graph so unit tests / dev runs
+    // without a vault still produce visible motion.
+    let (graph, source) = match std::env::var("GRAPH_COMPUTE_GRAPH_PATH") {
+        Ok(path) if !path.is_empty() => {
+            let g = CsrGraph::load_bin(&path)?;
+            let n_edges = g.neighbors.len();
+            let src = format!(
+                "file: {} ({} nodes, {} edges)",
+                path, g.n_nodes, n_edges
+            );
+            (g, src)
+        }
+        _ => (
+            CsrGraph::path(1024),
+            "path-graph (1024 nodes)".to_string(),
+        ),
+    };
+    tracing::info!(target: "graph-compute", "graph source: {source}");
     let state = SimState::new(graph);
 
     // Try to bring up the wgpu FA2 integrator. On hosts without a Vulkan/Metal
