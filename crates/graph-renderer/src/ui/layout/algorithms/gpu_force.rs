@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::ui::layout::registry::LayoutFactory;
-use crate::ui::sections::{hint_label, reset_row, subgroup_label, subgroup_separator};
+use crate::ui::sections::{hint_label, reset_row, row, subgroup_label, subgroup_separator};
 use crate::ui::theme::{accent, palette};
 
 pub fn factory() -> LayoutFactory {
@@ -180,18 +180,29 @@ fn render_ui(ui: &mut egui::Ui, json: &mut Value) {
     // Log scale on the magnitude knobs (repulsion / spring_len / spring_k /
     // gravity) so big graphs that need 4000+ repulsion / 400+ spring_len
     // are reachable from the same slider that small graphs use at 50 / 30.
-    let resps = [
-        ui.add(egui::Slider::new(&mut opts.repulsion, 0.1..=100_000.0).logarithmic(true).text("repulsion")),
-        ui.add(egui::Slider::new(&mut opts.spring_k, 0.0001..=10.0).logarithmic(true).text("spring_k")),
-        ui.add(egui::Slider::new(&mut opts.spring_len, 1.0..=10_000.0).logarithmic(true).text("spring_len")),
-        ui.add(egui::Slider::new(&mut opts.gravity, 0.00001..=1.0).logarithmic(true).text("gravity")),
-        ui.add(egui::Slider::new(&mut opts.damping, 0.0..=1.0).text("damping")),
-        ui.add(egui::Slider::new(&mut opts.dt, 0.0001..=1.0).logarithmic(true).text("dt")),
-        ui.add(egui::Slider::new(&mut steps_f, 1.0..=64.0).text("steps/call")),
-    ];
-    for r in &resps {
-        if r.changed() { changed = true; }
-    }
+    let mut any = false;
+    row(ui, "repulsion", |ui| {
+        if ui.add(egui::Slider::new(&mut opts.repulsion, 0.1..=100_000.0).logarithmic(true)).changed() { any = true; }
+    });
+    row(ui, "spring_k", |ui| {
+        if ui.add(egui::Slider::new(&mut opts.spring_k, 0.0001..=10.0).logarithmic(true)).changed() { any = true; }
+    });
+    row(ui, "spring_len", |ui| {
+        if ui.add(egui::Slider::new(&mut opts.spring_len, 1.0..=10_000.0).logarithmic(true)).changed() { any = true; }
+    });
+    row(ui, "gravity", |ui| {
+        if ui.add(egui::Slider::new(&mut opts.gravity, 0.00001..=1.0).logarithmic(true)).changed() { any = true; }
+    });
+    row(ui, "damping", |ui| {
+        if ui.add(egui::Slider::new(&mut opts.damping, 0.0..=1.0)).changed() { any = true; }
+    });
+    row(ui, "dt", |ui| {
+        if ui.add(egui::Slider::new(&mut opts.dt, 0.0001..=1.0).logarithmic(true)).changed() { any = true; }
+    });
+    row(ui, "steps/call", |ui| {
+        if ui.add(egui::Slider::new(&mut steps_f, 1.0..=64.0)).changed() { any = true; }
+    });
+    if any { changed = true; }
     let new_steps = steps_f.round().max(1.0) as u32;
     if new_steps != opts.steps_per_call {
         opts.steps_per_call = new_steps;
@@ -204,9 +215,12 @@ fn render_ui(ui: &mut egui::Ui, json: &mut Value) {
     subgroup_label(ui, "Cooling");
     hint_label(ui, "Drives sim toward steady state");
     ui.add_space(4.0);
-    let r1 = ui.add(egui::Slider::new(&mut opts.cooling_alpha, 0.9..=1.0).text("cooling α"));
-    let r2 = ui.add(egui::Slider::new(&mut opts.cooling_floor, 0.0..=1.0).text("cooling floor"));
-    if r1.changed() || r2.changed() { changed = true; }
+    row(ui, "cooling α", |ui| {
+        if ui.add(egui::Slider::new(&mut opts.cooling_alpha, 0.9..=1.0)).changed() { changed = true; }
+    });
+    row(ui, "cooling floor", |ui| {
+        if ui.add(egui::Slider::new(&mut opts.cooling_floor, 0.0..=1.0)).changed() { changed = true; }
+    });
 
     subgroup_separator(ui);
 
@@ -214,12 +228,11 @@ fn render_ui(ui: &mut egui::Ui, json: &mut Value) {
     subgroup_label(ui, "Auto-halt");
     hint_label(ui, "Stop dispatching when truly settled");
     ui.add_space(4.0);
-    if ui
-        .add(egui::Slider::new(&mut opts.energy_threshold, 0.0..=1.0).text("energy halt threshold"))
-        .changed()
-    {
-        changed = true;
-    }
+    row(ui, "energy halt", |ui| {
+        if ui.add(egui::Slider::new(&mut opts.energy_threshold, 0.0..=1.0)).changed() {
+            changed = true;
+        }
+    });
 
     subgroup_separator(ui);
 
@@ -228,28 +241,29 @@ fn render_ui(ui: &mut egui::Ui, json: &mut Value) {
     hint_label(ui, "Grid: dense small; BH: clustered; NS: huge");
     ui.add_space(4.0);
     let mut mode = opts.repulsion_mode;
-    egui::ComboBox::from_id_salt("repulsion-mode")
-        .selected_text(repulsion_mode_label(mode))
-        .show_ui(ui, |ui| {
-            for (m, label) in REPULSION_MODES {
-                if ui.selectable_label(mode == *m, *label).clicked() {
-                    mode = *m;
+    row(ui, "mode", |ui| {
+        egui::ComboBox::from_id_salt("repulsion-mode")
+            .selected_text(repulsion_mode_label(mode))
+            .show_ui(ui, |ui| {
+                for (m, label) in REPULSION_MODES {
+                    if ui.selectable_label(mode == *m, *label).clicked() {
+                        mode = *m;
+                    }
                 }
-            }
-        });
+            });
+    });
     if mode != opts.repulsion_mode {
         opts.repulsion_mode = mode;
         changed = true;
     }
     if matches!(opts.repulsion_mode, RepulsionMode::NegativeSampling) {
         ui.add_space(4.0);
-        if ui
-            .add(egui::Slider::new(&mut samples_f, 1.0..=32.0).text("K samples"))
-            .changed()
-        {
-            opts.repulsion_samples = samples_f.round().max(1.0) as u32;
-            changed = true;
-        }
+        row(ui, "K samples", |ui| {
+            if ui.add(egui::Slider::new(&mut samples_f, 1.0..=32.0)).changed() {
+                opts.repulsion_samples = samples_f.round().max(1.0) as u32;
+                changed = true;
+            }
+        });
     }
 
     if changed {

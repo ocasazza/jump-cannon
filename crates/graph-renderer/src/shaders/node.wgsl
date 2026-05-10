@@ -42,7 +42,7 @@ struct EffectsUniform {
     edge_min_transparency: f32,
     edge_width:            f32,
     edge_fade_floor:       f32,
-    _pad2:                 f32,
+    shader_intensity:      f32,
 };
 
 @group(0) @binding(0) var<uniform> camera:  CameraUniform;
@@ -143,7 +143,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let dof_engaged = effects.focus_thickness < 1.0e6;
     if (!dof_engaged || in.coc_ratio > 0.985) {
         let edge = 1.0 - smoothstep(0.96, 1.0, r);
-        return vec4<f32>(in.color.rgb, in.color.a * edge);
+        return vec4<f32>(in.color.rgb, in.color.a * edge * effects.shader_intensity);
     }
 
     // Bokeh path for actually out-of-focus nodes.
@@ -154,5 +154,5 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     // means each pixel is dimmer. coc_ratio² ≈ area ratio.
     let intensity_mul = in.coc_ratio * in.coc_ratio;
 
-    return vec4<f32>(in.color.rgb, in.color.a * intensity_mul * edge);
+    return vec4<f32>(in.color.rgb, in.color.a * intensity_mul * edge * effects.shader_intensity);
 }

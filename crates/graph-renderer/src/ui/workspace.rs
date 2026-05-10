@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 use crate::data::LoadState;
 use crate::graph_callback::GraphCallback;
 use crate::graph_pipelines::GraphPipelines;
+use crate::ui::input::AppAction;
 
 /// What lives in a tab. New tab kinds (Stats, NodeInspector, QueryEditor,
 /// Logs, …) plug in here and pick up the tab strip / split UI for free.
@@ -88,6 +89,12 @@ pub struct WorkspaceCtx<'a> {
     /// Owned by `App` so it survives across frames; threaded through the
     /// per-frame ctx so the tab handler can ramp pan speed.
     pub pan_accel_t: &'a mut f32,
+
+    /// Semantic input events (jump-io) for camera pan / rotate / zoom.
+    /// Pulses (palette / cancel / fit) are already consumed in App;
+    /// this slice carries only `Axis1` / `Axis2` events relevant to
+    /// the canvas. Pointer-in-canvas gating happens in the consumer.
+    pub input_events: &'a [jump_io::Event<crate::ui::input::AppAction>],
 
     // Out: filled by the graph tab when it runs.
     pub canvas_rect: Option<egui::Rect>,
@@ -209,7 +216,7 @@ impl<'a, 'ctx> WorkspaceViewer<'a, 'ctx> {
                 rect.center(),
                 egui::Align2::CENTER_CENTER,
                 msg,
-                egui::FontId::proportional(14.0),
+                crate::ui::theme::mono(crate::ui::theme::font_size::DISPLAY),
                 egui::Color32::WHITE,
             );
         }
@@ -229,8 +236,10 @@ impl<'a, 'ctx> WorkspaceViewer<'a, 'ctx> {
         }
 
         // LMB held = cursor "attract" force. RMB held with Shift = cursor
-        // "repel" force. Plain RMB-drag rotates the camera (3D-editor
-        // convention) — see the rotation block below.
+        // "repel" force. Both stay as direct egui reads — they're
+        // held-tool toggles, not action events; modeling them as
+        // jump-io triggers would just push the same booleans through
+        // a thicker pipe.
         let pointer_in_canvas_for_btn = ui
             .input(|i| i.pointer.hover_pos())
             .map(|p| rect.contains(p))
@@ -247,8 +256,7 @@ impl<'a, 'ctx> WorkspaceViewer<'a, 'ctx> {
                     && pointer_in_canvas_for_btn
             });
 
-        // Aggregate per-frame camera deltas so we open the wgpu callback
-        // resources at most once.
+        // Camera deltas accumulated from jump-io semantic events.
         let mut yaw_d = 0.0_f32;
         let mut pitch_d = 0.0_f32;
         let mut pan_x = 0.0_f32;
@@ -265,117 +273,125 @@ impl<'a, 'ctx> WorkspaceViewer<'a, 'ctx> {
             .map(|p| rect.contains(p))
             .unwrap_or(false);
 
-        // Camera rotation — RMB-drag is the standard convention in 3D
-        // editors (Unity / Blender fly-mode / Unreal). Middle-drag also
-        // rotates as a fallback for trackpad users without a real RMB.
-        // RMB+Shift is reserved for the cursor "repel" tool above, so
-        // we only rotate on RMB *without* shift.
-        let rmb_drag_rotate = !shift_held
-            && pointer_in_canvas
-            && ui.input(|i| {
-                i.pointer.button_down(egui::PointerButton::Secondary)
-            });
-        let mid_dragging = resp.dragged_by(egui::PointerButton::Middle)
-            || (pointer_in_canvas
-                && ui.input(|i| i.pointer.button_down(egui::PointerButton::Middle)));
-        if rmb_drag_rotate || mid_dragging {
-            let d = ui.input(|i| i.pointer.delta());
-            let mut dx = d.x;
-            let mut dy = d.y;
-            if self.ctx.invert_mouse_x { dx = -dx; }
-            if self.ctx.invert_mouse_y { dy = -dy; }
-            // Sensitivity 0.0085 → 0.011 paired with a steeper
-            // quadratic+cubic curve (see `apply_rotate_curve`) so 1px
-            // corrections stay precise while hand-sweeps actually fly.
-            yaw_d   += apply_rotate_curve(dx) * 0.011;
-            pitch_d -= apply_rotate_curve(dy) * 0.011;
-        }
+        // WASDQE pan ramp. Starts at BASE units/s, ramps to MAX over
+        // RAMP seconds of continuous input. Shift multiplies on top.
+        // Resets on the first frame with no pan event so a quick tap
+        // stays a tap.
+        const PAN_BASE: f32 = 2400.0;
+        const PAN_MAX: f32 = 24000.0;
+        const PAN_RAMP: f32 = 0.32;
+        const SHIFT_MUL: f32 = 4.0;
+        let dt = ui.input(|i| i.unstable_dt.min(0.05));
 
-        // Wheel + pinch zoom. `smooth_scroll_delta` is the egui-recommended
-        // accumulator for vertical scroll (mouse wheel + most trackpad
-        // two-finger gestures). `zoom_delta` is egui's normalised
-        // pinch-gesture multiplier (`1.0` = no pinch; >1 zooms in,
-        // <1 out) which trackpads + ctrl+wheel both produce in the
-        // browser. We feed both through the same camera.zoom path so
-        // the device-of-the-day picks whichever it has.
-        if pointer_in_canvas {
-            let (scroll, pinch) = ui.input(|i| (i.smooth_scroll_delta.y, i.zoom_delta()));
-            // De-double-count: many laptops emit the same two-finger
-            // gesture as both `smooth_scroll_delta` AND `zoom_delta` in
-            // the same frame. Pinch wins when present — it's the more
-            // intentional "zoom" signal — and we then drop scroll for
-            // this frame so the camera doesn't double up.
-            let pinch_active = (pinch - 1.0).abs() > 1e-3;
-            if pinch_active {
-                // `(pinch - 1.0)` is a small signed multiplier. Bumped
-                // from ×240 → ×320 so trackpad pinch feels closer to
-                // ctrl+wheel intensity. Still drained by egui itself.
-                zoom += (pinch - 1.0) * 320.0;
-                // Drain the wheel signal so it can't sneak through on
-                // a later frame as a phantom second contribution.
-                ui.ctx().input_mut(|i| {
-                    i.smooth_scroll_delta = egui::Vec2::ZERO;
-                    i.raw_scroll_delta = egui::Vec2::ZERO;
-                });
-            } else if scroll.abs() > 0.5 {
-                // Mixed curve: a linear floor (so 1-tick wheel notches
-                // and tiny trackpad swipes still feel proportional)
-                // plus a sqrt tail for hard flicks. Coefficient bumped
-                // from 18 → 26 so trackpad two-finger swipes don't
-                // feel under-driven.
-                zoom += scroll.signum() * (scroll.abs() * 0.6 + scroll.abs().sqrt() * 26.0);
-                ui.ctx().input_mut(|i| {
-                    i.smooth_scroll_delta = egui::Vec2::ZERO;
-                    i.raw_scroll_delta = egui::Vec2::ZERO;
-                });
-            }
-        }
+        // Pre-scan events to drive the pan-accel timer and the
+        // pinch-vs-wheel arbitration before consuming each event.
+        let pan_event_active = self.ctx.input_events.iter().any(|ev| {
+            matches!(
+                ev,
+                jump_io::Event::Axis1(
+                    AppAction::PanX | AppAction::PanY | AppAction::PanZ,
+                    _,
+                )
+            )
+        });
+        let pinch_active = self.ctx.input_events.iter().any(|ev| {
+            matches!(ev, jump_io::Event::Axis1(AppAction::CameraZoomPinch, v) if v.abs() > 1e-3)
+        });
 
-        // WASDQE keyboard pan / vertical. Same pointer-over-canvas guard
-        // so typing into a sidebar text field doesn't fly the camera.
-        // Speed eases in: starts at BASE units/s, ramps to MAX over RAMP
-        // seconds of continuous input. Shift multiplies by SHIFT_MUL on
-        // top of the eased value. Ramp resets on the first frame with no
-        // pan input so a quick tap stays a tap.
-        const PAN_BASE: f32   = 2400.0;   // units/s at start of hold
-        const PAN_MAX: f32    = 24000.0;  // units/s after full ramp
-        const PAN_RAMP: f32   = 0.32;     // seconds to reach PAN_MAX
-        const SHIFT_MUL: f32  = 4.0;
-        if pointer_in_canvas {
-            let (dt, w, a, s, d, q, e, shift) = ui.input(|i| (
-                i.unstable_dt.min(0.05),
-                i.key_down(egui::Key::W),
-                i.key_down(egui::Key::A),
-                i.key_down(egui::Key::S),
-                i.key_down(egui::Key::D),
-                i.key_down(egui::Key::Q),
-                i.key_down(egui::Key::E),
-                i.modifiers.shift,
-            ));
-            let any = w || a || s || d || q || e;
-            if any {
-                *self.ctx.pan_accel_t = (*self.ctx.pan_accel_t + dt).min(PAN_RAMP);
-            } else {
-                *self.ctx.pan_accel_t = 0.0;
-            }
-            // Ease-out cubic: gentle start, steeper finish — feels like
-            // the camera "spools up" rather than ramping linearly.
-            let t = (*self.ctx.pan_accel_t / PAN_RAMP).clamp(0.0, 1.0);
-            let eased = 1.0 - (1.0 - t).powi(3);
-            let base_speed = PAN_BASE + (PAN_MAX - PAN_BASE) * eased;
-            let speed = base_speed * if shift { SHIFT_MUL } else { 1.0 } * dt;
-            // W/S = vertical (up/down), Q/E = forward/back, A/D = strafe
-            // — swapped from the conventional FPS layout per user
-            // preference (Minecraft-creative-style). Up on W matches
-            // mouse-rotate pitch direction so it feels coherent.
-            if w { pan_y += speed; }
-            if s { pan_y -= speed; }
-            if d { pan_x += speed; }
-            if a { pan_x -= speed; }
-            if q { pan_z += speed; }
-            if e { pan_z -= speed; }
+        if pointer_in_canvas && pan_event_active {
+            *self.ctx.pan_accel_t = (*self.ctx.pan_accel_t + dt).min(PAN_RAMP);
         } else {
             *self.ctx.pan_accel_t = 0.0;
+        }
+        // Ease-out cubic: gentle start, steeper finish — feels like
+        // the camera "spools up" rather than ramping linearly.
+        let pan_t = (*self.ctx.pan_accel_t / PAN_RAMP).clamp(0.0, 1.0);
+        let pan_eased = 1.0 - (1.0 - pan_t).powi(3);
+        let pan_base_speed = PAN_BASE + (PAN_MAX - PAN_BASE) * pan_eased;
+        let pan_speed = pan_base_speed * if shift_held { SHIFT_MUL } else { 1.0 };
+
+        // Walk the events. Pointer-in-canvas gates camera moves so a
+        // user dragging out of a sidebar text field can't fly the
+        // view. Shift-held suppresses CameraRotate so the cursor-repel
+        // tool above keeps RMB+Shift to itself.
+        let mut zoom_consumed = false;
+        for ev in self.ctx.input_events {
+            match ev {
+                jump_io::Event::Axis2(AppAction::CameraRotate, [dx, dy]) => {
+                    if shift_held || !pointer_in_canvas {
+                        continue;
+                    }
+                    let mut dx = *dx;
+                    let mut dy = *dy;
+                    if self.ctx.invert_mouse_x {
+                        dx = -dx;
+                    }
+                    if self.ctx.invert_mouse_y {
+                        dy = -dy;
+                    }
+                    // Sensitivity 0.0085 → 0.011 paired with the
+                    // mixed quadratic+cubic curve (see
+                    // `apply_rotate_curve`) so 1px corrections stay
+                    // precise while hand-sweeps actually fly.
+                    yaw_d += apply_rotate_curve(dx) * 0.011;
+                    pitch_d -= apply_rotate_curve(dy) * 0.011;
+                }
+                jump_io::Event::Axis1(AppAction::PanX, v) => {
+                    if pointer_in_canvas {
+                        // KeyHeld emits Axis1(action, dt * gain). Sign
+                        // is in `v`; `pan_speed` carries the eased
+                        // base speed + Shift multiplier.
+                        pan_x += v * pan_speed;
+                    }
+                }
+                jump_io::Event::Axis1(AppAction::PanY, v) => {
+                    if pointer_in_canvas {
+                        pan_y += v * pan_speed;
+                    }
+                }
+                jump_io::Event::Axis1(AppAction::PanZ, v) => {
+                    if pointer_in_canvas {
+                        pan_z += v * pan_speed;
+                    }
+                }
+                jump_io::Event::Axis1(AppAction::CameraZoomPinch, v) => {
+                    if !pointer_in_canvas || v.abs() <= 1e-3 {
+                        continue;
+                    }
+                    // Trigger::Pinch emits the *log* of pinch_delta —
+                    // for small gestures ln(1+x) ≈ x so this matches
+                    // the prior `(pinch - 1.0) * 320.0` to within
+                    // sub-percent of the original feel. Coefficient
+                    // 320 was chosen so trackpad pinch feels close to
+                    // ctrl+wheel intensity.
+                    zoom += v * 320.0;
+                    zoom_consumed = true;
+                }
+                jump_io::Event::Axis1(AppAction::CameraZoomWheel, v) => {
+                    if !pointer_in_canvas || pinch_active || v.abs() <= 0.5 {
+                        // De-double-count: many laptops emit the
+                        // same two-finger gesture as both pinch AND
+                        // smooth scroll in the same frame. Pinch
+                        // wins (more intentional "zoom" signal).
+                        continue;
+                    }
+                    // Mixed curve: linear floor (so 1-tick wheel
+                    // notches and tiny trackpad swipes feel
+                    // proportional) plus a sqrt tail for hard flicks.
+                    zoom += v.signum() * (v.abs() * 0.6 + v.abs().sqrt() * 26.0);
+                    zoom_consumed = true;
+                }
+                _ => {}
+            }
+        }
+
+        // Drain egui's scroll/zoom buffers when we consumed a zoom event
+        // so the next frame doesn't see a phantom carry-over.
+        if zoom_consumed {
+            ui.ctx().input_mut(|i| {
+                i.smooth_scroll_delta = egui::Vec2::ZERO;
+                i.raw_scroll_delta = egui::Vec2::ZERO;
+            });
         }
 
         if yaw_d != 0.0 || pitch_d != 0.0 || pan_x != 0.0 || pan_y != 0.0

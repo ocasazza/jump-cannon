@@ -12,12 +12,18 @@
 //!   * `toggle_filter((field, value))` is a hook for Phase F's query model;
 //!     for now the App just logs it.
 
+pub(crate) mod badges;
+pub(crate) mod detect;
+
 use eframe::egui;
 use serde_json::Value;
 
 use crate::proto;
 use crate::ui::badge::{Badge, BadgeAction, BadgeKind};
-use crate::ui::theme::{accent, palette};
+use crate::ui::theme::accent;
+
+use badges::{date_badge, plain_badge, status_color, status_pill, ticket_badge};
+use detect::{host_from_url, is_iso_date, is_url, parse_ticket_id, parse_wikilink};
 
 /// Modal state stored on `App` (not persisted — open-state is ephemeral).
 #[derive(Default)]
@@ -48,15 +54,19 @@ impl ModalAction {
 
 /// Draw the modal. No-op if `!state.open` or no current node.
 pub fn show_modal(ctx: &egui::Context, state: &mut ModalState) -> ModalAction {
-    show_modal_with(ctx, state, &crate::ui::query::ActiveFieldFilters::default())
+    show_modal_with(ctx, state, &crate::ui::query::ActiveFieldFilters::default(), None)
 }
 
 /// Variant that knows about the active filter set so badges paint with
-/// their selected/halo state.
+/// their selected/halo state. `node_tint` is the canvas-rendered colour
+/// for the focused node under the active `StyleState::color_by`; when
+/// `Some`, every metadata badge inherits it so the modal reads as part
+/// of the same colour cohort as the node it describes.
 pub fn show_modal_with(
     ctx: &egui::Context,
     state: &mut ModalState,
     filters: &crate::ui::query::ActiveFieldFilters,
+    node_tint: Option<egui::Color32>,
 ) -> ModalAction {
     let mut action = ModalAction::empty();
 
@@ -104,6 +114,20 @@ pub fn show_modal_with(
         }
         ui.separator();
 
+        // Active-color-by tinted badges: every chip for this node
+        // wears the same swatch the canvas paints the node with under
+        // the user's current `StyleState::color_by`. Falls back to the
+        // per-kind palette when the host couldn't resolve a colour.
+        let community_tint = node_tint;
+        // Free fn (not closure) to avoid the `'_`-lifetime mismatch
+        // when the closure tries to return Badge<'a> across two
+        // anonymous lifetimes — same fix as inspector::maybe_tint.
+        fn tint<'a>(b: Badge<'a>, c: Option<egui::Color32>) -> Badge<'a> {
+            match c {
+                Some(c) => b.override_color(c),
+                None => b,
+            }
+        }
         // tag list (top)
         if !meta.tags.is_empty() {
             ui.horizontal_wrapped(|ui| {
@@ -113,12 +137,9 @@ pub fn show_modal_with(
                         .get("tags")
                         .map(|s| s.contains(tag))
                         .unwrap_or(false);
-                    let b = Badge::new("tags", tag, BadgeKind::Tag).active(active);
-                    match b.show(ui) {
-                        BadgeAction::Toggle { field, value } => {
-                            action.toggle_filter = Some((field, value));
-                        }
-                        _ => {}
+                    let b = tint(Badge::new("tags", tag, BadgeKind::Tag).active(active), community_tint);
+                    if let BadgeAction::Toggle { field, value } = b.show(ui) {
+                        action.toggle_filter = Some((field, value));
                     }
                 }
             });
@@ -133,7 +154,7 @@ pub fn show_modal_with(
                     .map(|s| s.contains(dt))
                     .unwrap_or(false);
                 if let BadgeAction::Toggle { field, value } =
-                    Badge::new("doctype", dt, BadgeKind::Doctype).active(active).show(ui)
+                    tint(Badge::new("doctype", dt, BadgeKind::Doctype).active(active), community_tint).show(ui)
                 {
                     action.toggle_filter = Some((field, value));
                 }
@@ -145,7 +166,11 @@ pub fn show_modal_with(
                     .map(|s| s.contains(&meta.folder))
                     .unwrap_or(false);
                 if let BadgeAction::Toggle { field, value } =
-                    Badge::new("folder", &meta.folder, BadgeKind::Folder).active(active).show(ui)
+                    tint(
+                        Badge::new("folder", &meta.folder, BadgeKind::Folder).active(active),
+                        community_tint,
+                    )
+                    .show(ui)
                 {
                     action.toggle_filter = Some((field, value));
                 }
@@ -343,177 +368,6 @@ fn render_string_value(
     }
 }
 
-// ---------- type detection ----------
-
-fn parse_wikilink(s: &str) -> Option<(String, Option<String>)> {
-    let s = s.trim();
-    if !(s.starts_with("[[") && s.ends_with("]]") && s.len() >= 5) {
-        return None;
-    }
-    let inner = &s[2..s.len() - 2];
-    if inner.is_empty() {
-        return None;
-    }
-    if let Some((page, alias)) = inner.split_once('|') {
-        Some((page.trim().to_string(), Some(alias.trim().to_string())))
-    } else {
-        Some((inner.trim().to_string(), None))
-    }
-}
-
-fn host_from_url(s: &str) -> Option<String> {
-    let rest = s.strip_prefix("https://").or_else(|| s.strip_prefix("http://"))?;
-    let host = rest.split(|c: char| c == '/' || c == ':' || c == '?').next()?;
-    Some(host.to_string())
-}
-
-fn is_url(s: &str) -> bool {
-    (s.starts_with("http://") || s.starts_with("https://"))
-        && !s.contains(char::is_whitespace)
-        && s.len() < 2048
-}
-
-fn is_iso_date(s: &str) -> bool {
-    // YYYY-MM-DD with optional time tail. Strict on the date head.
-    if s.len() < 10 {
-        return false;
-    }
-    let bytes = s.as_bytes();
-    bytes[..4].iter().all(|b| b.is_ascii_digit())
-        && bytes[4] == b'-'
-        && bytes[5..7].iter().all(|b| b.is_ascii_digit())
-        && bytes[7] == b'-'
-        && bytes[8..10].iter().all(|b| b.is_ascii_digit())
-        && (s.len() == 10 || matches!(bytes[10], b'T' | b' '))
-}
-
-/// Parse a JIRA-style ticket id at the start of the string. Accepts:
-///   FOO-123
-///   FOO-123: subject
-///   FOO-123 — subject
-/// Returns the bare id (e.g. "FOO-123") or None.
-fn parse_ticket_id(s: &str) -> Option<String> {
-    let head: &str = s.split(|c: char| c == ':' || c == ' ').next()?;
-    if head.len() < 3 || head.len() > 24 {
-        return None;
-    }
-    let (prefix, rest) = head.split_once('-')?;
-    if prefix.is_empty() || prefix.len() > 16 {
-        return None;
-    }
-    let mut chars = prefix.chars();
-    let first = chars.next()?;
-    if !first.is_ascii_uppercase() {
-        return None;
-    }
-    if !chars.all(|c| c.is_ascii_uppercase() || c.is_ascii_digit()) {
-        return None;
-    }
-    if rest.is_empty() || !rest.chars().all(|c| c.is_ascii_digit()) {
-        return None;
-    }
-    Some(head.to_string())
-}
-
-fn status_color(s: &str) -> Option<egui::Color32> {
-    match s.to_ascii_lowercase().as_str() {
-        "active" | "done" | "ok" | "ready" | "passed" => Some(accent::GREEN),
-        "failed" | "blocked" | "broken" | "error" => Some(accent::RED),
-        "needs-review" | "needs-fetch" | "in-progress" | "wip" => Some(accent::YELLOW),
-        "draft" | "pending" => Some(accent::BLUE),
-        "archived" | "deprecated" | "stale" => Some(egui::Color32::WHITE),
-        _ => None,
-    }
-}
-
-// ---------- badge widgets ----------
-
-#[allow(dead_code)]
-fn tag_button(ui: &mut egui::Ui, label: &str) -> egui::Response {
-    let txt = egui::RichText::new(label).monospace().small();
-    ui.add(
-        egui::Button::new(txt)
-            .stroke(egui::Stroke::new(1.0, palette::BORDER))
-            .fill(egui::Color32::BLACK)
-            .small(),
-    )
-}
-
-fn plain_badge(ui: &mut egui::Ui, label: &str) -> egui::Response {
-    let txt = egui::RichText::new(label).monospace().small();
-    ui.add(
-        egui::Button::new(txt)
-            .stroke(egui::Stroke::new(1.0, palette::BORDER))
-            .fill(egui::Color32::BLACK)
-            .small(),
-    )
-}
-
-#[allow(dead_code)]
-fn wikilink_button(ui: &mut egui::Ui, label: &str) -> egui::Response {
-    // Wikilink chip: filled darker than tag badges to read distinctly.
-    let txt = egui::RichText::new(format!("⟶ {label}"))
-        .monospace()
-        .small()
-        .color(accent::BLUE);
-    ui.add(
-        egui::Button::new(txt)
-            .stroke(egui::Stroke::new(1.0, accent::BLUE))
-            .fill(egui::Color32::from_rgb(0x10, 0x10, 0x18))
-            .small(),
-    )
-}
-
-#[allow(dead_code)]
-fn url_button(ui: &mut egui::Ui, url: &str) -> egui::Response {
-    let display = if url.len() > 48 {
-        format!("{}…", &url[..47])
-    } else {
-        url.to_string()
-    };
-    let txt = egui::RichText::new(display).monospace().small().underline();
-    ui.add(
-        egui::Button::new(txt)
-            .stroke(egui::Stroke::new(1.0, palette::BORDER))
-            .fill(egui::Color32::BLACK)
-            .small(),
-    )
-    .on_hover_text(url)
-}
-
-fn date_badge(ui: &mut egui::Ui, label: &str) -> egui::Response {
-    let txt = egui::RichText::new(label).monospace().small();
-    ui.add(
-        egui::Button::new(txt)
-            .stroke(egui::Stroke::new(1.0, accent::YELLOW))
-            .fill(egui::Color32::BLACK)
-            .small(),
-    )
-}
-
-fn ticket_badge(ui: &mut egui::Ui, label: &str) -> egui::Response {
-    let txt = egui::RichText::new(label)
-        .monospace()
-        .small()
-        .color(accent::YELLOW);
-    ui.add(
-        egui::Button::new(txt)
-            .stroke(egui::Stroke::new(1.0, accent::YELLOW))
-            .fill(egui::Color32::BLACK)
-            .small(),
-    )
-}
-
-fn status_pill(ui: &mut egui::Ui, label: &str, color: egui::Color32) -> egui::Response {
-    let txt = egui::RichText::new(label).monospace().small().color(color);
-    ui.add(
-        egui::Button::new(txt)
-            .stroke(egui::Stroke::new(1.0, color))
-            .fill(egui::Color32::BLACK)
-            .small(),
-    )
-}
-
 // ---------- metric rows ----------
 
 fn metric_row(ui: &mut egui::Ui, label: &str, value: i64) {
@@ -530,59 +384,4 @@ fn metric_row_f(ui: &mut egui::Ui, label: &str, value: f32) {
             .small(),
     );
     ui.end_row();
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn wikilink_basic() {
-        assert_eq!(
-            parse_wikilink("[[Alpha]]"),
-            Some(("Alpha".into(), None))
-        );
-        assert_eq!(
-            parse_wikilink("[[Alpha|alias]]"),
-            Some(("Alpha".into(), Some("alias".into())))
-        );
-        assert_eq!(parse_wikilink("Alpha"), None);
-        assert_eq!(parse_wikilink("[[]]"), None);
-    }
-
-    #[test]
-    fn url_detect() {
-        assert!(is_url("https://example.com"));
-        assert!(is_url("http://luna.local:3000/d/x"));
-        assert!(!is_url("example.com"));
-        assert!(!is_url("not a url"));
-    }
-
-    #[test]
-    fn iso_date_detect() {
-        assert!(is_iso_date("2026-04-30"));
-        assert!(is_iso_date("2026-04-30T12:00:00Z"));
-        assert!(!is_iso_date("April 30"));
-        assert!(!is_iso_date("2026-4-1"));
-    }
-
-    #[test]
-    fn ticket_id_detect() {
-        assert_eq!(parse_ticket_id("ITHELP-1234"), Some("ITHELP-1234".into()));
-        assert_eq!(parse_ticket_id("JIRA-42: subject"), Some("JIRA-42".into()));
-        assert_eq!(parse_ticket_id("FOO-7 — body"), Some("FOO-7".into()));
-        assert_eq!(parse_ticket_id("not-a-ticket"), None);
-        assert_eq!(parse_ticket_id("foo-1"), None);
-    }
-
-    #[test]
-    fn status_palette() {
-        assert!(status_color("active").is_some());
-        assert!(status_color("DONE").is_some());
-        assert!(status_color("failed").is_some());
-        assert!(status_color("needs-review").is_some());
-        assert!(status_color("draft").is_some());
-        assert!(status_color("archived").is_some());
-        assert!(status_color("foobar").is_none());
-    }
 }

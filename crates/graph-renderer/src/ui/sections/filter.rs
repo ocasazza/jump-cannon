@@ -103,12 +103,12 @@ pub fn show(ui: &mut egui::Ui, state: &mut AppState) {
 
     // Secondary add-buttons row.
     ui.horizontal_wrapped(|ui| {
-        if ui.button("+ AND").clicked() {
+        if ui.button("+ and").clicked() {
             state.query.cards.push(Card::Connector {
                 op: ConnectorOp::And,
             });
         }
-        if ui.button("+ OR").clicked() {
+        if ui.button("+ or").clicked() {
             state.query.cards.push(Card::Connector {
                 op: ConnectorOp::Or,
             });
@@ -117,7 +117,7 @@ pub fn show(ui: &mut egui::Ui, state: &mut AppState) {
             state.query.cards.push(Card::ParenOpen);
             state.query.cards.push(Card::ParenClose);
         }
-        if ui.button("+ NOT").clicked() {
+        if ui.button("+ not").clicked() {
             state.query.cards.push(Card::Not);
         }
         let clear_text =
@@ -225,7 +225,7 @@ fn render_card(
                 }
             }
             Card::Not => {
-                ui.label(egui::RichText::new("NOT").monospace().strong());
+                ui.label(egui::RichText::new("not").monospace().strong());
                 if ui
                     .small_button(egui::RichText::new("×").monospace())
                     .on_hover_text("Delete NOT")

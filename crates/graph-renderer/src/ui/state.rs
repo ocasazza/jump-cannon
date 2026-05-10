@@ -119,11 +119,64 @@ impl ColorBy {
     }
 }
 
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Default, Hash)]
+pub enum EdgeColorBy {
+    /// Use the uniform `edge_color` (existing behaviour).
+    #[default]
+    None,
+    Community,
+    Folder,
+    Doctype,
+}
+
+impl EdgeColorBy {
+    pub const ALL: &'static [EdgeColorBy] = &[
+        EdgeColorBy::None,
+        EdgeColorBy::Community,
+        EdgeColorBy::Folder,
+        EdgeColorBy::Doctype,
+    ];
+    pub fn label(self) -> &'static str {
+        match self {
+            EdgeColorBy::None => "None (uniform)",
+            EdgeColorBy::Community => "Community",
+            EdgeColorBy::Folder => "Folder",
+            EdgeColorBy::Doctype => "Doctype",
+        }
+    }
+    /// `Bootstrap.metrics` key for the underlying categorical metric.
+    /// `None` returns an empty key (unused — the call site short-circuits).
+    pub fn metric_key(self) -> &'static str {
+        match self {
+            EdgeColorBy::None => "",
+            EdgeColorBy::Community => "community",
+            EdgeColorBy::Folder => "folder",
+            EdgeColorBy::Doctype => "doctype",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct StyleState {
     pub size_by: SizeBy,
     pub color_by: ColorBy,
+    /// Per-edge categorical tinting. `None` keeps the existing uniform
+    /// `edge_color` behaviour. Default `None` so persisted state and
+    /// existing users see no visual change.
+    #[serde(default)]
+    pub edge_color_by: EdgeColorBy,
     pub size_mul: f32,
+    /// Edge width multiplier applied on top of `edge_width`.
+    #[serde(default = "default_edge_size_mul")]
+    pub edge_size_mul: f32,
+    /// When true, both node and edge multipliers are interpreted as
+    /// `10^(slider - 1.0)` at the consumer site.
+    #[serde(default)]
+    pub log_scale_size: bool,
+    /// Post-process visual-intensity scalar (multiplies fragment alpha
+    /// in node + edge shaders). 1.0 = neutral.
+    #[serde(default = "default_shader_intensity")]
+    pub shader_intensity: f32,
     /// Cosmograph-style edge tint (RGBA, 0..1). Default #3a4880.
     #[serde(default = "default_edge_color")]
     pub edge_color: [f32; 4],
@@ -149,22 +202,38 @@ pub struct StyleState {
     /// stroke on dense graphs.
     #[serde(default = "default_edge_width")]
     pub edge_width: f32,
+    /// Active categorical palette for community / metric colouring.
+    /// Default `Tableau20` so existing persisted state is unchanged.
+    #[serde(default)]
+    pub palette: crate::data::PaletteId,
 }
 
 fn default_edge_color() -> [f32; 4] { [0.227, 0.282, 0.502, 1.0] }
-fn default_edge_alpha_mul() -> f32 { 0.6 }
-fn default_edge_dist_min() -> f32 { 10.0 }
-fn default_edge_dist_max() -> f32 { 400.0 }
-fn default_edge_min_transparency() -> f32 { 0.6 }
-fn default_edge_fade_floor() -> f32 { 0.02 }
-fn default_edge_width() -> f32 { 1.5 }
+fn default_edge_alpha_mul() -> f32 { 2.0 }
+// Bumped from 10 / 400 to 50 / 1600 to track the 800-unit Fibonacci-shell
+// spawn (data::spawn_on_unit_sphere). Typical edge lengths during settle
+// land in the few-hundred-to-low-thousand range, so the old 10..400 band
+// was clamping every edge to the long-distance fade floor.
+fn default_edge_dist_min() -> f32 { 50.0 }
+fn default_edge_dist_max() -> f32 { 1600.0 }
+fn default_edge_min_transparency() -> f32 { 1.0 }
+fn default_edge_fade_floor() -> f32 { 0.085 }
+fn default_edge_width() -> f32 { 2.1 }
+fn default_edge_size_mul() -> f32 { 1.0 }
+fn default_shader_intensity() -> f32 { 1.0 }
 
 impl Default for StyleState {
     fn default() -> Self {
         Self {
             size_by: SizeBy::default(),
             color_by: ColorBy::default(),
-            size_mul: 1.0,
+            edge_color_by: EdgeColorBy::default(),
+            // 0.5 = 0.67 × 0.75 rounded to a clean slider value (user
+            // requested ~25% smaller default node size).
+            size_mul: 0.5,
+            edge_size_mul: default_edge_size_mul(),
+            log_scale_size: false,
+            shader_intensity: default_shader_intensity(),
             edge_color: default_edge_color(),
             edge_alpha_mul: default_edge_alpha_mul(),
             edge_dist_min: default_edge_dist_min(),
@@ -172,6 +241,7 @@ impl Default for StyleState {
             edge_min_transparency: default_edge_min_transparency(),
             edge_fade_floor: default_edge_fade_floor(),
             edge_width: default_edge_width(),
+            palette: crate::data::PaletteId::default(),
         }
     }
 }
@@ -323,7 +393,7 @@ impl Default for CameraState {
             invert_mouse_y: false,
             invert_ad: false,
             invert_qe: false,
-            follow_centroid: false,
+            follow_centroid: true,
             fit_to_window: true,
         }
     }
@@ -463,6 +533,12 @@ pub struct AppState {
     /// new users see it immediately on first node click.
     #[serde(default = "default_inspector_open")]
     pub inspector_open: bool,
+    /// When true, the inspector renders as a draggable floating
+    /// `egui::Window` instead of a docked `SidePanel::right`. Default
+    /// `false` so existing users see no change. A pin/unpin icon in
+    /// the inspector header toggles this at runtime.
+    #[serde(default)]
+    pub inspector_floating: bool,
     /// Status footer open/collapsed flag. Default false so the footer
     /// stays as an unobtrusive 24px strip until the user expands it.
     #[serde(default)]
@@ -496,6 +572,7 @@ impl Default for AppState {
             query: QueryModel::default(),
             action_instances: Vec::new(),
             inspector_open: default_inspector_open(),
+            inspector_floating: false,
             status_footer_open: false,
             stats: LiveStats::default(),
             layout_solve_requested: false,

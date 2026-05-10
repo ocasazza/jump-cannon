@@ -5,6 +5,7 @@ use graph_layouts::{BoxedStatic, CircleAxis, CircleLayout, CircleSettings, DynSt
 use serde_json::Value;
 
 use crate::ui::layout::registry::LayoutFactory;
+use crate::ui::sections::row;
 
 pub fn factory() -> LayoutFactory {
     LayoutFactory::Static {
@@ -38,15 +39,13 @@ fn render_ui(ui: &mut egui::Ui, json: &mut Value) {
         serde_json::from_value(json.clone()).unwrap_or_else(|_| CircleSettings::default());
     let mut changed = false;
 
-    if ui
-        .add(egui::Slider::new(&mut s.radius, 1.0..=2000.0).text("radius"))
-        .changed()
-    {
-        changed = true;
-    }
+    row(ui, "radius", |ui| {
+        if ui.add(egui::Slider::new(&mut s.radius, 1.0..=2000.0)).changed() {
+            changed = true;
+        }
+    });
 
-    ui.horizontal(|ui| {
-        ui.label("axis");
+    row(ui, "axis", |ui| {
         let mut axis = s.axis;
         egui::ComboBox::from_id_salt("circle-axis")
             .selected_text(axis_label(axis))

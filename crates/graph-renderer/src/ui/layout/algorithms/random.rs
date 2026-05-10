@@ -9,6 +9,7 @@ use graph_layouts::{BoxedStatic, DynStaticLayout, RandomLayout, RandomSettings};
 use serde_json::Value;
 
 use crate::ui::layout::registry::LayoutFactory;
+use crate::ui::sections::row;
 
 pub fn factory() -> LayoutFactory {
     LayoutFactory::Static {
@@ -32,28 +33,26 @@ fn render_ui(ui: &mut egui::Ui, json: &mut Value) {
         serde_json::from_value(json.clone()).unwrap_or_else(|_| RandomSettings::default());
     let mut changed = false;
 
-    ui.horizontal(|ui| {
-        ui.label("seed");
-        let mut seed_val = s.seed;
-        let resp = ui.add(egui::DragValue::new(&mut seed_val).speed(1.0));
-        if resp.changed() {
-            s.seed = seed_val;
-            changed = true;
-        }
+    row(ui, "seed", |ui| {
         if ui.small_button("re-roll").clicked() {
             // Cheap hash-step: keeps the value deterministic but visibly
             // distinct after each click.
             s.seed = s.seed.wrapping_mul(6364136223846793005).wrapping_add(1);
             changed = true;
         }
+        let mut seed_val = s.seed;
+        let resp = ui.add(egui::DragValue::new(&mut seed_val).speed(1.0));
+        if resp.changed() {
+            s.seed = seed_val;
+            changed = true;
+        }
     });
 
-    if ui
-        .add(egui::Slider::new(&mut s.radius, 1.0..=2000.0).text("radius"))
-        .changed()
-    {
-        changed = true;
-    }
+    row(ui, "radius", |ui| {
+        if ui.add(egui::Slider::new(&mut s.radius, 1.0..=2000.0)).changed() {
+            changed = true;
+        }
+    });
 
     if changed {
         if let Ok(v) = serde_json::to_value(&s) {

@@ -42,7 +42,7 @@ struct EffectsUniform {
     edge_min_transparency: f32,
     edge_width:            f32,   // pixels — fat-line half-width × 2
     edge_fade_floor:       f32,   // long-distance asymptotic alpha floor
-    _pad2:                 f32,
+    shader_intensity:      f32,   // post-process visual-intensity scalar
 };
 
 @group(0) @binding(0) var<uniform> camera:  CameraUniform;
@@ -55,6 +55,11 @@ struct EffectsUniform {
 //   exactly one 1.0   → 0.6   (mid)
 //   neither           → 0.15  (dim)
 @group(0) @binding(4) var<storage, read> dim_alpha: array<f32>;
+// Per-edge RGBA multiplier. All-1.0 when EdgeColorBy::None so the
+// uniform `edge_color` flows through unchanged; otherwise the
+// community/folder/doctype swatch for edges whose endpoints share
+// that bucket, with `edge_color` as the bridging-edge fallback.
+@group(0) @binding(5) var<storage, read> edge_colors: array<vec4<f32>>;
 
 struct VertexOutput {
     @builtin(position) clip_pos:   vec4<f32>,
@@ -62,6 +67,7 @@ struct VertexOutput {
     @location(1)       edge_len:   f32,
     @location(2)       coc:        f32,
     @location(3)       focus_mul:  f32,
+    @location(4)       tint:       vec4<f32>,
 };
 
 @vertex
@@ -162,6 +168,7 @@ fn vs_main(@builtin(vertex_index) vid: u32) -> VertexOutput {
     out.world_z  = p.z;
     out.edge_len = edge_len;
     out.coc      = coc;
+    out.tint     = edge_colors[edge_idx];
     return out;
 }
 
@@ -206,12 +213,21 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     // CoC fade — out-of-focus edges still drop alpha when DoF is engaged.
     let focus_atten = 1.0 / (1.0 + in.coc * 0.05);
 
-    let alpha = effects.edge_color.a * effects.edge_alpha_mul
-              * visibility * focus_atten * in.focus_mul;
+    // Per-edge color: `tint.rgb` is the absolute edge color (the
+    // community swatch when endpoints share a bucket, otherwise the
+    // uniform `edge_color` fallback for bridging edges, OR the uniform
+    // `edge_color` for every edge when EdgeColorBy::None). `tint.a` is
+    // the source-alpha multiplier — equal to `effects.edge_color.a` so
+    // existing alpha logic stays unchanged.
+    let base_rgb = in.tint.rgb;
+    let base_a   = in.tint.a;
+    let alpha = base_a * effects.edge_alpha_mul
+              * visibility * focus_atten * in.focus_mul
+              * effects.shader_intensity;
     // Threshold is below perceptual range — kept only to skip pure-zero
     // ROP work, NOT to hide long edges. No popping at this level.
     if (alpha < 1.0e-4) {
         discard;
     }
-    return vec4<f32>(effects.edge_color.rgb, alpha);
+    return vec4<f32>(base_rgb, alpha);
 }

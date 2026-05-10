@@ -170,7 +170,7 @@ fn build_layout_job(
 
     let in_match = |byte: usize| matches.iter().any(|m| byte >= m.start && byte < m.start + m.len);
 
-    let mono = egui::FontId::monospace(12.0);
+    let mono = crate::ui::theme::mono(crate::ui::theme::font_size::BODY);
     let mut byte_cursor = 0usize;
     let mut line_no: usize = 1;
     let total_lines = text.lines().count().max(1);

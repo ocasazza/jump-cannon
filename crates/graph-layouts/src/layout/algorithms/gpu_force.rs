@@ -77,11 +77,13 @@ pub enum RepulsionMode {
 }
 
 impl Default for RepulsionMode {
-    // NS is the default: it skips the grid build entirely and operates
-    // directly on GPU positions (the BH path currently builds its octree
-    // from the stale `cpu_positions` mirror — see TODO in
-    // `rebuild_and_upload_octree`). NS is also the cheapest at N ≥ 10k.
-    fn default() -> Self { RepulsionMode::NegativeSampling }
+    // BH is the default: it gives the best visual result on general
+    // clustered graphs (the common case for Obsidian vaults — a few hubs
+    // + long sparse tails). Grid is fine for dense small graphs but
+    // collapses voxels on highly-clustered inputs; NS converges faster
+    // on huge graphs but adds visible per-step variance. BH is the
+    // honest middle ground for a fresh-install default.
+    fn default() -> Self { RepulsionMode::BarnesHut }
 }
 
 impl RepulsionMode {
@@ -943,6 +945,16 @@ struct GpuState {
     velocities: wgpu::Buffer,
     edge_offsets: wgpu::Buffer,
     edge_neighbors: wgpu::Buffer,
+    /// Hub-aware (Tigr) virtual-vertex CSR + per-virtual spring partials.
+    /// Built once at GpuState init from `edge_offsets`/`edge_neighbors`. See
+    /// `HUB_THRESHOLD` and `spring_step` in shaders/force.wgsl.
+    virt_real_idx_buf: wgpu::Buffer,
+    virt_edge_offsets_buf: wgpu::Buffer,
+    node_to_virt_offsets_buf: wgpu::Buffer,
+    spring_force_partial_buf: wgpu::Buffer,
+    n_virtual: u32,
+    spring_bind_group_layout: wgpu::BindGroupLayout,
+    spring_pipeline: wgpu::ComputePipeline,
     params_buf: wgpu::Buffer,
     /// Per-node mass (1 + log2(degree)). Static once built.
     mass_buf: wgpu::Buffer,
@@ -1016,6 +1028,12 @@ struct GpuState {
 
 /// CPU-side pre-compute: stable id ordering, initial positions
 /// (padded vec4 layout), velocities, and CSR adjacency arrays.
+/// Threshold above which a vertex is split into multiple "virtual vertices"
+/// for the spring kernel (Tigr, ASPLOS'18 §3.1). On a power-law graph this
+/// is the difference between one hub stalling its whole warp and the warp
+/// finishing in O(HUB_THRESHOLD) time.
+const HUB_THRESHOLD: u32 = 32;
+
 struct PreCompute {
     n_nodes: u32,
     n_edges: u32,
@@ -1026,6 +1044,11 @@ struct PreCompute {
     edge_neighbors: Vec<u32>,
     /// Per-node mass = 1 + log2(degree). Hubs end up heavier.
     mass: Vec<f32>,
+    /// Virtual-vertex CSR (Tigr) for the hub-aware spring kernel.
+    n_virtual: u32,
+    virt_real_idx: Vec<u32>,
+    virt_edge_offsets: Vec<u32>,
+    node_to_virt_offsets: Vec<u32>,
 }
 
 fn precompute(graph: &Graph) -> PreCompute {
@@ -1087,6 +1110,57 @@ fn precompute(graph: &Graph) -> PreCompute {
         .map(|ns| 1.0 + ((ns.len() as f32).max(1.0)).log2())
         .collect();
     let mass = if mass.is_empty() { vec![1.0f32] } else { mass };
+
+    // ---- Virtual-vertex CSR (Tigr) -----------------------------------------
+    // Each real vertex i contributes max(1, ceil(deg/HUB_THRESHOLD)) virtual
+    // vertices. The min-1 invariant keeps `node_to_virt_offsets` strictly
+    // monotonic so the gather loop in `force_step` is one trivial iteration
+    // for isolated nodes.
+    //
+    // virt_edge_offsets is the CSR-style offset array for virtual vertices:
+    //   virt_edge_offsets[v]   = first edge_neighbor index for virtual v
+    //   virt_edge_offsets[v+1] = one past last edge_neighbor index for v
+    // At a real-vertex boundary we patch the last entry so v+1's start
+    // equals the new real vertex's chunk start (covers the degree-0 case).
+    let mut virt_real_idx: Vec<u32> = Vec::with_capacity(n_nodes as usize);
+    let mut virt_edge_offsets: Vec<u32> = Vec::with_capacity(n_nodes as usize + 1);
+    let mut node_to_virt_offsets: Vec<u32> = Vec::with_capacity(n_nodes as usize + 1);
+    virt_edge_offsets.push(0);
+    node_to_virt_offsets.push(0);
+    let mut virt_count: u32 = 0;
+    for i in 0..n_nodes as usize {
+        let start = edge_offsets[i];
+        let end = edge_offsets[i + 1];
+        let deg = end - start;
+        let chunks = ((deg + HUB_THRESHOLD - 1) / HUB_THRESHOLD).max(1);
+        for c in 0..chunks {
+            let chunk_start = start + c * HUB_THRESHOLD;
+            let chunk_end = (chunk_start + HUB_THRESHOLD).min(end);
+            virt_real_idx.push(i as u32);
+            let last_idx = virt_edge_offsets.len() - 1;
+            if virt_edge_offsets[last_idx] != chunk_start {
+                virt_edge_offsets[last_idx] = chunk_start;
+            }
+            virt_edge_offsets.push(chunk_end);
+            virt_count += 1;
+        }
+        node_to_virt_offsets.push(virt_count);
+    }
+    if virt_real_idx.is_empty() {
+        virt_real_idx.push(0);
+    }
+    if virt_edge_offsets.len() < 2 {
+        virt_edge_offsets.clear();
+        virt_edge_offsets.push(0);
+        virt_edge_offsets.push(0);
+    }
+    if node_to_virt_offsets.len() < 2 {
+        node_to_virt_offsets.clear();
+        node_to_virt_offsets.push(0);
+        node_to_virt_offsets.push(0);
+    }
+    let n_virtual = virt_count.max(1);
+
     PreCompute {
         n_nodes,
         n_edges,
@@ -1096,6 +1170,10 @@ fn precompute(graph: &Graph) -> PreCompute {
         edge_offsets,
         edge_neighbors,
         mass,
+        n_virtual,
+        virt_real_idx,
+        virt_edge_offsets,
+        node_to_virt_offsets,
     }
 }
 
@@ -1211,6 +1289,11 @@ struct ForcePipelines {
     /// for both Grid and BarnesHut paths (WGSL requires every declared
     /// binding to be present); the Grid path simply doesn't touch it.
     oct_bgl: wgpu::BindGroupLayout,
+    /// Group(3): hub-aware (Tigr) virtual-vertex CSR + per-virtual spring
+    /// partials. Bound by both `spring_step` and `force_step`.
+    spring_bgl: wgpu::BindGroupLayout,
+    /// Standalone hub-aware spring kernel (one thread per virtual vertex).
+    spring_step: wgpu::ComputePipeline,
 }
 
 fn build_pipeline(device: &wgpu::Device) -> ForcePipelines {
@@ -1297,12 +1380,30 @@ fn build_pipeline(device: &wgpu::Device) -> ForcePipelines {
         entries: &[],
     });
 
+    // Group 3: hub-aware virtual-vertex CSR + per-virtual spring partials.
+    // Bound by both `spring_step` (writes partials) and `force_step` (reads).
+    let spring_bgl_entries = [
+        storage_entry(0, true),  // virt_real_idx
+        storage_entry(1, true),  // virt_edge_offsets
+        storage_entry(2, false), // spring_force_partial (rw)
+        storage_entry(3, true),  // node_to_virt_offsets
+    ];
+    let spring_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("gpu_force_spring_bgl"),
+        entries: &spring_bgl_entries,
+    });
+
     let pipeline_layout = device.create_pipeline_layout(
         &wgpu::PipelineLayoutDescriptor {
             label: Some("gpu_force_pl"),
-            // group 0 = main, group 1 = (unused by force_step, placeholder),
-            // group 2 = octree.
-            bind_group_layouts: &[&bind_group_layout, &force_empty_gb_bgl, &oct_bgl],
+            // group 0 = main, group 1 = placeholder, group 2 = octree,
+            // group 3 = hub-aware spring partials.
+            bind_group_layouts: &[
+                &bind_group_layout,
+                &force_empty_gb_bgl,
+                &oct_bgl,
+                &spring_bgl,
+            ],
             push_constant_ranges: &[],
         },
     );
@@ -1339,6 +1440,31 @@ fn build_pipeline(device: &wgpu::Device) -> ForcePipelines {
     let gb_scan = mk("scan_cell_offsets");
     let gb_scatter = mk("scatter_cells");
 
+    // Spring kernel pipeline. Reuses the main BGL at group(0) (uses
+    // positions_in/edge_neighbors/params; other entries unused). Octree
+    // BGL at group(2) is unused but must match the layout — we still bind
+    // the octree buffer at dispatch time.
+    let spring_pipeline_layout = device.create_pipeline_layout(
+        &wgpu::PipelineLayoutDescriptor {
+            label: Some("gpu_force_spring_pl"),
+            bind_group_layouts: &[
+                &bind_group_layout,
+                &force_empty_gb_bgl,
+                &oct_bgl,
+                &spring_bgl,
+            ],
+            push_constant_ranges: &[],
+        },
+    );
+    let spring_step = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+        label: Some("spring_step"),
+        layout: Some(&spring_pipeline_layout),
+        module: &shader,
+        entry_point: Some("spring_step"),
+        compilation_options: Default::default(),
+        cache: None,
+    });
+
     ForcePipelines {
         force_step,
         force_bgl: bind_group_layout,
@@ -1348,6 +1474,8 @@ fn build_pipeline(device: &wgpu::Device) -> ForcePipelines {
         gb_scatter,
         gb_bgl,
         oct_bgl,
+        spring_bgl,
+        spring_step,
     }
 }
 
@@ -1391,6 +1519,13 @@ impl GpuState {
             velocities: aux.vel,
             edge_offsets: aux.off,
             edge_neighbors: aux.neigh,
+            virt_real_idx_buf: aux.virt_real_idx,
+            virt_edge_offsets_buf: aux.virt_edge_offsets,
+            node_to_virt_offsets_buf: aux.node_to_virt_offsets,
+            spring_force_partial_buf: aux.spring_force_partial,
+            n_virtual: aux.n_virtual,
+            spring_bind_group_layout: pipelines.spring_bgl,
+            spring_pipeline: pipelines.spring_step,
             params_buf: aux.params,
             mass_buf: aux.mass,
             cell_offsets_buf: aux.cell_offsets,
@@ -1466,6 +1601,13 @@ impl GpuState {
             velocities: aux.vel,
             edge_offsets: aux.off,
             edge_neighbors: aux.neigh,
+            virt_real_idx_buf: aux.virt_real_idx,
+            virt_edge_offsets_buf: aux.virt_edge_offsets,
+            node_to_virt_offsets_buf: aux.node_to_virt_offsets,
+            spring_force_partial_buf: aux.spring_force_partial,
+            n_virtual: aux.n_virtual,
+            spring_bind_group_layout: pipelines.spring_bgl,
+            spring_pipeline: pipelines.spring_step,
             params_buf: aux.params,
             mass_buf: aux.mass,
             cell_offsets_buf: aux.cell_offsets,
@@ -1752,7 +1894,9 @@ impl GpuState {
             self.encode_grid_build(&mut encoder, &gb_bg);
         }
         let oct_bg = self.make_oct_bind_group(device);
-        self.encode_compute(&mut encoder, &bind_group, &oct_bg);
+        let spring_bg = self.make_spring_bind_group(device);
+        self.encode_spring_step(&mut encoder, &bind_group, &oct_bg, &spring_bg);
+        self.encode_compute(&mut encoder, &bind_group, &oct_bg, &spring_bg);
         queue.submit(Some(encoder.finish()));
     }
 
@@ -1769,7 +1913,9 @@ impl GpuState {
         let (pos_in, pos_out) = self.borrowed_in_out(shared);
         let bind_group = self.make_bind_group(device, pos_in, pos_out);
         let oct_bg = self.make_oct_bind_group(device);
-        self.encode_compute(encoder, &bind_group, &oct_bg);
+        let spring_bg = self.make_spring_bind_group(device);
+        self.encode_spring_step(encoder, &bind_group, &oct_bg, &spring_bg);
+        self.encode_compute(encoder, &bind_group, &oct_bg, &spring_bg);
     }
 
     /// Borrowed-mode wrapper around `encode_grid_build` — builds the bind
@@ -1785,21 +1931,22 @@ impl GpuState {
         self.encode_grid_build(encoder, &bg);
     }
 
-    fn encode_compute(&self, encoder: &mut wgpu::CommandEncoder, bind_group: &wgpu::BindGroup, oct_bg: &wgpu::BindGroup) {
+    fn encode_compute(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        bind_group: &wgpu::BindGroup,
+        oct_bg: &wgpu::BindGroup,
+        spring_bg: &wgpu::BindGroup,
+    ) {
         let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: Some("force_step_pass"),
             timestamp_writes: None,
         });
         cpass.set_pipeline(&self.pipeline);
         cpass.set_bind_group(0, bind_group, &[]);
-        // group(1) is unused by force_step (the WGSL declarations there are
-        // for the build pipelines), but pipeline-layout sets are positional
-        // — we don't need to set it. The pipeline layout uses an empty BGL
-        // at group(1) so wgpu accepts the missing bind group.
-        // Actually wgpu does require all referenced groups to be set; group
-        // (1) is *not* referenced by force_step's entry point so leaving it
-        // unset is fine.
+        // group(1) unused by force_step.
         cpass.set_bind_group(2, oct_bg, &[]);
+        cpass.set_bind_group(3, spring_bg, &[]);
         let groups = (self.n_nodes + 63) / 64;
         cpass.dispatch_workgroups(groups.max(1), 1, 1);
     }
@@ -1810,6 +1957,41 @@ impl GpuState {
             layout: &self.oct_bind_group_layout,
             entries: &[buf_entry(1, &self.oct_nodes_buf)],
         })
+    }
+
+    fn make_spring_bind_group(&self, device: &wgpu::Device) -> wgpu::BindGroup {
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("gpu_force_spring_bg"),
+            layout: &self.spring_bind_group_layout,
+            entries: &[
+                buf_entry(0, &self.virt_real_idx_buf),
+                buf_entry(1, &self.virt_edge_offsets_buf),
+                buf_entry(2, &self.spring_force_partial_buf),
+                buf_entry(3, &self.node_to_virt_offsets_buf),
+            ],
+        })
+    }
+
+    /// Record the hub-aware spring kernel — one thread per virtual vertex,
+    /// writing per-virtual partials into `spring_force_partial`. Must run
+    /// before `force_step` (which gathers the partials).
+    fn encode_spring_step(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        bind_group: &wgpu::BindGroup,
+        oct_bg: &wgpu::BindGroup,
+        spring_bg: &wgpu::BindGroup,
+    ) {
+        let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("spring_step_pass"),
+            timestamp_writes: None,
+        });
+        cpass.set_pipeline(&self.spring_pipeline);
+        cpass.set_bind_group(0, bind_group, &[]);
+        cpass.set_bind_group(2, oct_bg, &[]);
+        cpass.set_bind_group(3, spring_bg, &[]);
+        let groups = (self.n_virtual + 63) / 64;
+        cpass.dispatch_workgroups(groups.max(1), 1, 1);
     }
 
     fn swap_position_buffers(&mut self) {
@@ -2007,6 +2189,11 @@ struct AuxBuffers {
     vel: wgpu::Buffer,
     off: wgpu::Buffer,
     neigh: wgpu::Buffer,
+    virt_real_idx: wgpu::Buffer,
+    virt_edge_offsets: wgpu::Buffer,
+    node_to_virt_offsets: wgpu::Buffer,
+    spring_force_partial: wgpu::Buffer,
+    n_virtual: u32,
     params: wgpu::Buffer,
     mass: wgpu::Buffer,
     cell_offsets: wgpu::Buffer,
@@ -2040,6 +2227,30 @@ fn build_aux_buffers(device: &wgpu::Device, pc: &PreCompute) -> AuxBuffers {
         label: Some("edge_neighbors"),
         contents: bytemuck::cast_slice(&pc.edge_neighbors),
         usage: wgpu::BufferUsages::STORAGE,
+    });
+    // Hub-aware (Tigr) virtual-vertex CSR + per-virtual spring partials.
+    let virt_real_idx = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("virt_real_idx"),
+        contents: bytemuck::cast_slice(&pc.virt_real_idx),
+        usage: wgpu::BufferUsages::STORAGE,
+    });
+    let virt_edge_offsets = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("virt_edge_offsets"),
+        contents: bytemuck::cast_slice(&pc.virt_edge_offsets),
+        usage: wgpu::BufferUsages::STORAGE,
+    });
+    let node_to_virt_offsets = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("node_to_virt_offsets"),
+        contents: bytemuck::cast_slice(&pc.node_to_virt_offsets),
+        usage: wgpu::BufferUsages::STORAGE,
+    });
+    // Per-virtual partial spring forces — vec3<f32> stride = 16 bytes.
+    let spring_partial_bytes = (pc.n_virtual.max(1) as u64) * 16;
+    let spring_force_partial = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("spring_force_partial"),
+        size: spring_partial_bytes,
+        usage: wgpu::BufferUsages::STORAGE,
+        mapped_at_creation: false,
     });
     let params = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("sim_params"),
@@ -2115,6 +2326,11 @@ fn build_aux_buffers(device: &wgpu::Device, pc: &PreCompute) -> AuxBuffers {
         vel,
         off,
         neigh,
+        virt_real_idx,
+        virt_edge_offsets,
+        node_to_virt_offsets,
+        spring_force_partial,
+        n_virtual: pc.n_virtual,
         params,
         mass,
         cell_offsets,
@@ -2766,6 +2982,71 @@ mod tests {
         assert!(all_finite, "all positions must be finite");
         let span = (mx[0] - mn[0]).max(mx[1] - mn[1]).max(mx[2] - mn[2]);
         assert!(span > 50.0, "layout collapsed: span={span}");
+    }
+
+    /// Hub-aware spring kernel (Phase 0.3): a star graph with one degree-1000
+    /// hub stresses Tigr virtualization — without splitting, the hub's lane
+    /// would serially walk 1000 edges while sibling lanes finish instantly.
+    /// Asserts the run produces finite positions and the hub is roughly
+    /// centered relative to its leaves (springs pull leaves toward the hub
+    /// and gravity pulls everything to origin, so the hub stays near origin).
+    #[tokio::test(flavor = "current_thread")]
+    async fn unit_gpu_force_star_hub_stable() {
+        const N_LEAVES: usize = 1000;
+        let mut g = Graph::new();
+        let mut hub = Node::new("hub".to_string());
+        hub.position3 = Some([0.0, 0.0, 0.0]);
+        g.add_node(hub);
+        // Spread leaves on a sphere so initial positions aren't degenerate.
+        for i in 0..N_LEAVES {
+            let mut n = Node::new(format!("l{:04}", i));
+            let theta = (i as f32) * 0.137;
+            let phi = (i as f32) * 0.071;
+            let r = 50.0;
+            n.position3 = Some([
+                r * phi.cos() * theta.sin(),
+                r * phi.sin() * theta.sin(),
+                r * theta.cos(),
+            ]);
+            g.add_node(n);
+            g.add_edge(Edge::new(
+                format!("e{:04}", i),
+                "hub".to_string(),
+                format!("l{:04}", i),
+            ));
+        }
+        let mut layout = GpuForceLayout::new(GpuForceOptions {
+            steps_per_call: 50,
+            repulsion: 50.0,
+            spring_k: 0.5,
+            spring_len: 30.0,
+            gravity: 0.05,
+            ..Default::default()
+        });
+        match layout.run(&mut g).await {
+            Ok(()) => {}
+            Err(e) => { eprintln!("skipping (no gpu adapter): {e}"); return; }
+        }
+        let mut all_finite = true;
+        let mut hub_pos = [0.0f32; 3];
+        let mut leaf_extent = 0.0f32;
+        for (id, node) in g.nodes.iter() {
+            let p = node.position3.expect("position3 set");
+            for k in 0..3 { if !p[k].is_finite() { all_finite = false; } }
+            if id == "hub" {
+                hub_pos = p;
+            } else {
+                let r = (p[0]*p[0] + p[1]*p[1] + p[2]*p[2]).sqrt();
+                if r > leaf_extent { leaf_extent = r; }
+            }
+        }
+        assert!(all_finite, "star-hub run produced non-finite positions");
+        // Hub should be near origin (gravity + balanced spring pulls).
+        let hub_r = (hub_pos[0]*hub_pos[0] + hub_pos[1]*hub_pos[1] + hub_pos[2]*hub_pos[2]).sqrt();
+        assert!(hub_r < leaf_extent * 0.5 + 5.0,
+                "hub drifted too far: hub_r={hub_r} leaf_extent={leaf_extent}");
+        // Leaves should occupy a non-degenerate volume.
+        assert!(leaf_extent > 1.0, "leaves collapsed: extent={leaf_extent}");
     }
 
     #[tokio::test(flavor = "current_thread")]

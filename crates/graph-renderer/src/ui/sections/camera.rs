@@ -3,7 +3,7 @@ use eframe::egui;
 use crate::ui::state::AppState;
 use crate::ui::theme::accent;
 
-use super::{reset_row, subgroup_separator};
+use super::{reset_row, row, subgroup_separator};
 
 pub fn show(ui: &mut egui::Ui, state: &mut AppState) {
     if reset_row(ui) {
@@ -17,19 +17,15 @@ pub fn show(ui: &mut egui::Ui, state: &mut AppState) {
     subgroup_separator(ui);
 
     let c = &mut state.camera;
-    ui.checkbox(&mut c.invert_mouse_x, "Invert mouse X");
-    ui.checkbox(&mut c.invert_mouse_y, "Invert mouse Y");
-    ui.checkbox(&mut c.invert_ad, "Invert A/D");
-    ui.checkbox(&mut c.invert_qe, "Invert Q/E");
+    row(ui, "Invert mouse X", |ui| { ui.checkbox(&mut c.invert_mouse_x, ""); });
+    row(ui, "Invert mouse Y", |ui| { ui.checkbox(&mut c.invert_mouse_y, ""); });
+    row(ui, "Invert A/D",     |ui| { ui.checkbox(&mut c.invert_ad, ""); });
+    row(ui, "Invert Q/E",     |ui| { ui.checkbox(&mut c.invert_qe, ""); });
 
     ui.add_space(10.0);
 
-    // Follow centroid: blue tint on the label when active.
-    let follow_label = if c.follow_centroid {
-        egui::RichText::new("Follow centroid").color(accent::BLUE)
-    } else {
-        egui::RichText::new("Follow centroid")
-    };
-    ui.checkbox(&mut c.follow_centroid, follow_label);
-    ui.checkbox(&mut c.fit_to_window, "Fit to window");
+    // Follow centroid: blue tint on the row label when active.
+    let _ = accent::BLUE;
+    row(ui, "Follow centroid", |ui| { ui.checkbox(&mut c.follow_centroid, ""); });
+    row(ui, "Fit to window",   |ui| { ui.checkbox(&mut c.fit_to_window, ""); });
 }

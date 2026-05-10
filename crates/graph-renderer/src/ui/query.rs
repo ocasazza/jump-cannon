@@ -73,8 +73,8 @@ pub enum ConnectorOp {
 impl ConnectorOp {
     pub fn label(self) -> &'static str {
         match self {
-            ConnectorOp::And => "AND",
-            ConnectorOp::Or => "OR",
+            ConnectorOp::And => "and",
+            ConnectorOp::Or => "or",
         }
     }
 }

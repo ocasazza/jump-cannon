@@ -119,7 +119,10 @@ struct EffectsUniform {
     /// used to be `_pad1`; offset is unchanged so the 64-byte uniform
     /// layout stays bit-identical.
     edge_fade_floor: f32,
-    _pad2: f32,
+    /// Post-process visual-intensity multiplier (applied to fragment
+    /// alpha in node + edge shaders). 1.0 = neutral; 0 = invisible;
+    /// >1 = brighter (alpha clamps to 1 in the blend stage).
+    shader_intensity: f32,
 }
 
 impl Default for EffectsUniform {
@@ -138,13 +141,17 @@ impl Default for EffectsUniform {
             // density. distance range 10..400 with min-transparency 0.6
             // means long edges hold ~40% visibility, never disappearing.
             edge_alpha_mul: 0.6,
-            edge_dist_min: 10.0,
-            edge_dist_max: 400.0,
+            // 50..1600 tracks the 800-unit spawn shell — see
+            // ui::state::default_edge_dist_{min,max}. Old 10..400 band
+            // was tuned for the 2D-promoted layout that predated the
+            // sphere bootstrap.
+            edge_dist_min: 50.0,
+            edge_dist_max: 1600.0,
             edge_color: [0.227, 0.282, 0.502, 1.0],
             edge_min_transparency: 0.6,
             edge_width: 1.5,
             edge_fade_floor: 0.02,
-            _pad2: 0.0,
+            shader_intensity: 1.0,
         }
     }
 }
@@ -177,6 +184,11 @@ struct Buffers {
     sizes: wgpu::Buffer,
     #[allow(dead_code)]
     edges: wgpu::Buffer,
+    /// Per-edge RGBA buffer (length n_edges*4 floats). Sampled in
+    /// `edge.wgsl` and multiplied into the final fragment color.
+    /// All-1.0 when `EdgeColorBy::None` so the uniform `edge_color`
+    /// rules unchanged.
+    edge_colors: wgpu::Buffer,
     n_nodes: u32,
     n_edges: u32,
     camera_uniform: wgpu::Buffer,
@@ -243,6 +255,10 @@ impl GraphPipelines {
                 ro_storage_entry(2, wgpu::ShaderStages::VERTEX),
                 ro_storage_entry(3, wgpu::ShaderStages::VERTEX),
                 ro_storage_entry(4, wgpu::ShaderStages::VERTEX),
+                // Per-edge RGBA tint. When EdgeColorBy::None this is
+                // filled with all-1.0 so the uniform `edge_color` flows
+                // through unchanged.
+                ro_storage_entry(5, wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT),
             ],
         });
 
@@ -418,6 +434,22 @@ impl GraphPipelines {
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
         });
 
+        // Per-edge color buffer. Default = the uniform `edge_color` so
+        // the EdgeColorBy::None path renders correctly until the App
+        // pushes a real style update. App's `apply_style_to_gpu`
+        // overwrites this with community-tinted values when the user
+        // selects a non-`None` mode.
+        let init_rgba = self.effects.edge_color;
+        let mut edge_colors_init: Vec<f32> = Vec::with_capacity((n_edges.max(1) as usize) * 4);
+        for _ in 0..n_edges.max(1) {
+            edge_colors_init.extend_from_slice(&init_rgba);
+        }
+        let edge_colors_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("edge_colors_storage"),
+            contents: bytemuck::cast_slice(&edge_colors_init),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        });
+
         let cam_uniform_init = CameraUniform {
             view_proj: self.camera.view_proj(),
             view: self.camera.view(),
@@ -467,6 +499,7 @@ impl GraphPipelines {
                 bg_entry(2, &positions),
                 bg_entry(3, &edges_buf),
                 bg_entry(4, &dim_alpha_buf),
+                bg_entry(5, &edge_colors_buf),
             ],
         });
 
@@ -506,6 +539,7 @@ impl GraphPipelines {
             colors: colors_buf,
             sizes: sizes_buf,
             edges: edges_buf,
+            edge_colors: edge_colors_buf,
             n_nodes,
             n_edges,
             camera_uniform,
@@ -916,6 +950,26 @@ impl GraphPipelines {
         queue.write_buffer(&b.colors, 0, bytemuck::cast_slice(&colors));
     }
 
+    /// Replace the per-edge RGBA tint buffer. Length must equal
+    /// `n_edges * 4`. Pass an all-1.0 buffer to disable per-edge tinting
+    /// (uniform `edge_color` then rules).
+    pub fn update_edge_colors(&mut self, queue: &wgpu::Queue, colors: Vec<f32>) {
+        let Some(b) = self.buffers.as_mut() else { return };
+        let want = b.n_edges as usize * 4;
+        if want == 0 {
+            return;
+        }
+        if colors.len() != want {
+            log::warn!(
+                "[graph-renderer] update_edge_colors: len {} != m*4 {}",
+                colors.len(),
+                want
+            );
+            return;
+        }
+        queue.write_buffer(&b.edge_colors, 0, bytemuck::cast_slice(&colors));
+    }
+
     /// Replace per-node screen-space radius (px). Length must equal `n_nodes`.
     pub fn update_sizes(&mut self, queue: &wgpu::Queue, sizes: Vec<f32>) {
         let Some(b) = self.buffers.as_mut() else { return };
@@ -1027,6 +1081,12 @@ impl GraphPipelines {
         // Floor must stay below the long-distance asymptote, otherwise
         // the smoothstep would invert. Clamp into a safe range.
         self.effects.edge_fade_floor = fade_floor.clamp(0.0, 0.5);
+    }
+
+    /// Post-process visual-intensity multiplier (alpha scalar in node +
+    /// edge fragment shaders). Clamps to [0, 8] to avoid runaway values.
+    pub fn set_shader_intensity(&mut self, intensity: f32) {
+        self.effects.shader_intensity = intensity.clamp(0.0, 8.0);
     }
 
     /// Push the cursor force into the GPU layout. radius=0 disables.

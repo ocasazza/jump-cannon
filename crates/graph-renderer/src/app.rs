@@ -10,13 +10,28 @@ use crate::proto;
 use crate::ui;
 use crate::ui::actions::{self, ActionRegistry, BuiltinAction, ParamValue};
 use crate::ui::command_palette::PaletteOutcome;
+use crate::ui::input::{default_bindings, AppAction};
+use jump_io::{adapter::egui_raw, Event as InputEvent, InputCtx};
 use crate::ui::field_index::FieldIndex;
 use crate::ui::focus_set::{self, FocusCtx, FocusMode};
 use crate::ui::layout::registry::LayoutRegistry;
 use crate::ui::progress::{Progress, ProgressSink};
 use crate::ui::query::EvalContext;
-use crate::ui::state::{ColorBy, FontFamilyChoice, SizeBy};
+use crate::ui::state::{ColorBy, EdgeColorBy, FontFamilyChoice, SizeBy};
 use graph_layouts::{warmup_positions, GpuForceOptions};
+
+/// Translate a UI multiplier slider value into the actual scalar applied
+/// downstream. When `log_scale` is on, the slider is interpreted as
+/// `10^(value - 1.0)` so 1.0 → 1.0×, 2.0 → 10×, 0.0 → 0.1×. When off,
+/// the slider value is returned as-is.
+#[inline]
+fn apply_size_scale(slider: f32, log_scale: bool) -> f32 {
+    if log_scale {
+        10f32.powf(slider - 1.0)
+    } else {
+        slider
+    }
+}
 
 /// Result of an async `/node/:id` fetch.
 ///
@@ -62,7 +77,7 @@ pub struct App {
     search_inflight: HashSet<String>,
 
     // -- "previous-frame" trackers used to gate GPU writes -----------------
-    prev_style_key: Option<(SizeBy, ColorBy, u32)>,
+    prev_style_key: Option<(SizeBy, ColorBy, u32, u32, EdgeColorBy, [u32; 4], crate::data::PaletteId)>,
     prev_layout_key: Option<u64>,
     prev_focus_key: Option<u64>,
     prev_cursor_key: Option<u64>,
@@ -178,6 +193,14 @@ pub struct App {
     /// bootstrap fetch) via a clone-able `ProgressSink`. Drained at the
     /// top of each `update` so the footer renders fresh state.
     pub progress: Progress,
+
+    /// Semantic-action input dispatch (jump-io). Owns the binding set;
+    /// `update()` polls it once per frame and routes events to the
+    /// existing handlers (palette toggle, modal dismiss, fit-camera).
+    /// Pre-existing direct `egui::input` reads for camera drag/zoom
+    /// stay where they are until the next migration pass — see
+    /// `ui::input::AppAction` for the reserved variants.
+    input_ctx: InputCtx<AppAction>,
 }
 
 impl App {
@@ -305,6 +328,7 @@ impl App {
             field_index: None,
             field_index_slot,
             progress,
+            input_ctx: InputCtx::new(default_bindings()),
         }
     }
 
@@ -433,6 +457,93 @@ impl App {
         pipes.raycast(ndc_x, ndc_y, screen_px)
     }
 
+    /// Draw a 1px leader line from the floating-inspector window's
+    /// nearest corner to the on-canvas projection of the selected node.
+    ///
+    /// Reads the live CPU position mirror (kept fresh by the GPU→CPU
+    /// position readback so picking tracks the running force-sim) and
+    /// projects through the *current* `pipes.camera` view-projection.
+    /// The aspect we feed into the projection comes from `canvas_rect`
+    /// rather than `pipes.camera.aspect` — same reasoning as
+    /// `raycast_idx`: the GraphCallback's `prepare()` won't have run
+    /// yet on this frame, so the camera's stored aspect may lag the
+    /// freshly-painted canvas.
+    fn draw_inspector_leader_line(
+        &self,
+        ctx: &egui::Context,
+        frame: &eframe::Frame,
+        window_rect: egui::Rect,
+        canvas_rect: egui::Rect,
+        idx: u32,
+    ) {
+        let Some(wgpu_state) = frame.wgpu_render_state() else { return };
+        let renderer = wgpu_state.renderer.read();
+        let Some(pipes) = renderer.callback_resources.get::<GraphPipelines>() else { return };
+        let positions = pipes.positions_cpu();
+        let i3 = (idx as usize).saturating_mul(3);
+        if i3 + 2 >= positions.len() {
+            return;
+        }
+        let world = glam::Vec3::new(positions[i3], positions[i3 + 1], positions[i3 + 2]);
+
+        // Build a view-proj that uses the canvas rect's aspect (matches
+        // what the canvas was painted with this frame, even before the
+        // GraphCallback's `prepare()` runs and updates camera.aspect).
+        let cam = &pipes.camera;
+        let aspect = (canvas_rect.width() / canvas_rect.height().max(0.0001)).max(0.0001);
+        let view = glam::Mat4::look_to_rh(cam.position, cam.forward(), glam::Vec3::Y);
+        let proj = glam::Mat4::perspective_rh(cam.fov_y, aspect, cam.znear, cam.zfar);
+        let clip = (proj * view) * world.extend(1.0);
+        if clip.w <= 0.0 {
+            return; // Behind the camera.
+        }
+        let ndc_x = clip.x / clip.w;
+        let ndc_y = clip.y / clip.w;
+        if !(-1.0..=1.0).contains(&ndc_x) || !(-1.0..=1.0).contains(&ndc_y) {
+            return; // Off-screen; skip rather than clamp.
+        }
+        // NDC y is up; egui screen y is down — flip on the y axis.
+        let screen_x = canvas_rect.left() + (ndc_x * 0.5 + 0.5) * canvas_rect.width();
+        let screen_y = canvas_rect.top() + (1.0 - (ndc_y * 0.5 + 0.5)) * canvas_rect.height();
+        let node_screen = egui::pos2(screen_x, screen_y);
+
+        // Find the closest of the four window corners. Euclidean
+        // distance reads cleaner as a "shortest visual line" than
+        // Manhattan: the latter biases toward cardinal directions and
+        // would pick awkward corners when the node sits at a 45°
+        // bearing from the window centre.
+        let corners = [
+            window_rect.left_top(),
+            window_rect.right_top(),
+            window_rect.left_bottom(),
+            window_rect.right_bottom(),
+        ];
+        let mut best = corners[0];
+        let mut best_d2 = f32::INFINITY;
+        for &c in &corners {
+            let d2 = (c - node_screen).length_sq();
+            if d2 < best_d2 {
+                best_d2 = d2;
+                best = c;
+            }
+        }
+
+        // Foreground-layer painter sits above the canvas central panel
+        // but below the floating Window (egui draws windows on top of
+        // Order::Foreground via their own per-window layer). This gives
+        // the visual effect of the line "coming out from under" the
+        // window edge.
+        let painter = ctx.layer_painter(egui::LayerId::new(
+            egui::Order::Foreground,
+            egui::Id::new("inspector-leader"),
+        ));
+        painter.line_segment(
+            [best, node_screen],
+            egui::Stroke::new(1.0, crate::ui::theme::palette::BORDER),
+        );
+        painter.circle_filled(node_screen, 2.5, crate::ui::theme::palette::ICON);
+    }
+
     fn try_promote_bootstrap_to_gpu(&mut self, frame: &mut eframe::Frame) {
         if self.loaded_into_gpu {
             return;
@@ -508,12 +619,13 @@ impl App {
             self.state.style.color_by.metric_key(),
             &self.metrics,
             n_nodes,
+            self.state.style.palette,
         );
         let sizes = data::sizes_from_metric(
             self.state.style.size_by.metric_key(),
             &self.metrics,
             n_nodes,
-            self.state.style.size_mul,
+            apply_size_scale(self.state.style.size_mul, self.state.style.log_scale_size),
         );
         let graph = GraphData {
             positions: bootstrap.positions,
@@ -623,19 +735,41 @@ impl eframe::App for App {
         self.drain_node_fetch();
         self.drain_field_index();
 
-        // Ctrl+P (or ⌘P on macOS) toggles the command palette.
-        if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::P)) {
+        // Drain semantic input events for this frame. Pulses (Cmd+P,
+        // F, Esc) are consumed here; axis events (WASDQE pan, RMB/MMB
+        // rotate, wheel/pinch zoom) get partitioned into a per-frame
+        // Vec passed through `WorkspaceCtx` to ui::workspace.
+        //
+        // Esc is consumed below near the modal-close site so the
+        // palette's own internal Esc handler still wins.
+        let dt = ctx.input(|i| i.stable_dt);
+        let raw = ctx.input(|i| egui_raw(i, dt));
+        let want_kbd = ctx.wants_keyboard_input();
+        let mut want_open_palette = false;
+        let mut want_fit = false;
+        let mut want_cancel = false;
+        let mut camera_input_events: Vec<InputEvent<AppAction>> = Vec::new();
+        for ev in self.input_ctx.poll(&raw) {
+            match &ev {
+                InputEvent::Pulse(AppAction::OpenPalette) => want_open_palette = true,
+                // F-to-fit is suppressed while a text edit owns the
+                // keyboard so the user can type "F" into the palette
+                // search box without flying the camera.
+                InputEvent::Pulse(AppAction::FitCamera) if !want_kbd => want_fit = true,
+                InputEvent::Pulse(AppAction::FitCamera) => {}
+                InputEvent::Pulse(AppAction::Cancel) => want_cancel = true,
+                // Camera-axis events go to workspace.
+                _ => camera_input_events.push(ev),
+            }
+        }
+        // Stash for the WorkspaceCtx. WorkspaceCtx borrows the slice;
+        // we keep ownership on the stack here for the lifetime of
+        // this `update` call.
+        let camera_input_events = camera_input_events;
+        if want_open_palette {
             self.palette_state.toggle();
         }
-        // Bare F (no modifiers, no text-edit focus) fits the camera —
-        // mirrors the shortcut hint shown on the Fit Camera action.
-        let f_pressed = ctx.input(|i| {
-            i.key_pressed(egui::Key::F)
-                && !i.modifiers.command
-                && !i.modifiers.shift
-                && !i.modifiers.alt
-        });
-        if f_pressed && !ctx.wants_keyboard_input() {
+        if want_fit {
             self.execute_action(frame, "fit-camera", HashMap::new());
         }
 
@@ -668,20 +802,71 @@ impl eframe::App for App {
                 Vec::new()
             };
             let mut requested_filter_toggle: Option<(String, String)> = None;
+            let mut requested_navigate: Option<String> = None;
+            let mut requested_open_url: Option<String> = None;
             {
+                // Surface frontmatter-derived chips for the focused node.
+                // The modal's `current` is populated by `/node/:id` fetches
+                // and is keyed at the node we just selected — same source
+                // the modal renders from, so the inspector and modal show
+                // the same chip set for the same input.
+                let current_meta = self.modal.current.as_ref();
+                // Clone the active-filter snapshot so we can simultaneously
+                // hand `&mut self.state` to the inspector for its open-state
+                // / panel chrome — borrow checker won't let us reach into
+                // `self.state.query.active_filters` while a `&mut self.state`
+                // is in flight, and `ActiveFieldFilters` is cheap to clone
+                // (a few small BTrees with short string keys).
+                let active_filters_snapshot = self.state.query.active_filters.clone();
                 let mut data = ui::inspector::InspectorData {
                     ids: &self.ids,
                     metrics: &self.metrics,
                     edges: &edges_snapshot,
                     selected_idx: self.selected_node_idx,
                     requested_selection: &mut requested_selection,
-                    node_meta: None,
                     requested_filter_toggle: &mut requested_filter_toggle,
+                    color_by: self.state.style.color_by,
+                    palette: self.state.style.palette,
+                    current_meta,
+                    active_filters: &active_filters_snapshot,
+                    requested_navigate: &mut requested_navigate,
+                    requested_open_url: &mut requested_open_url,
                 };
-                ui::inspector::show(ctx, &mut self.state, &mut data);
+                let inspector_rect = ui::inspector::show(ctx, &mut self.state, &mut data);
+                // Floating-mode leader line: when the inspector is a
+                // floating window AND a node is selected AND the canvas
+                // is mounted, draw a 1px line from the window's nearest
+                // corner to the selected node's on-canvas position.
+                // Skipped when the node is off-screen (clip-w ≤ 0 or NDC
+                // outside [-1,1]) — simpler than clamping to the canvas
+                // edge and reads cleanly: line just disappears as the
+                // user pans the node out of view, reappears when it
+                // returns.
+                if let (Some(win_rect), Some(canvas_rect), Some(idx)) = (
+                    inspector_rect,
+                    self.prev_canvas_rect,
+                    self.selected_node_idx,
+                ) {
+                    self.draw_inspector_leader_line(ctx, frame, win_rect, canvas_rect, idx);
+                }
             }
             if let Some((f, v)) = requested_filter_toggle {
                 self.state.query.toggle_field_filter(&f, &v);
+            }
+            if let Some(target) = requested_navigate {
+                self.kick_off_node_fetch(target);
+            }
+            if let Some(href) = requested_open_url {
+                #[cfg(target_arch = "wasm32")]
+                {
+                    if let Some(window) = web_sys::window() {
+                        let _ = window.open_with_url_and_target(&href, "_blank");
+                    }
+                }
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    log::info!("[graph-renderer] open url (native no-op): {href}");
+                }
             }
         }
 
@@ -731,6 +916,7 @@ impl eframe::App for App {
             invert_mouse_x: self.state.camera.invert_mouse_x,
             invert_mouse_y: self.state.camera.invert_mouse_y,
             pan_accel_t: &mut self.camera_pan_accel_t,
+            input_events: &camera_input_events,
             canvas_rect: None,
             pointer_in_canvas: None,
             click: None,
@@ -785,8 +971,12 @@ impl eframe::App for App {
             0.0
         };
 
-        // Esc closes the modal.
-        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+        // Esc closes the modal — wired through the AppAction::Cancel
+        // pulse drained at the top of `update`. The palette has its
+        // own internal Esc handler (see ui::command_palette::show)
+        // and runs first via egui's hover/focus order, so this only
+        // fires when nothing else swallowed the press.
+        if want_cancel {
             self.modal.open = false;
             self.modal.current = None;
             self.modal.fetch_error = None;
@@ -861,10 +1051,23 @@ impl eframe::App for App {
         ui::filter_strip::show(ctx, &mut self.state.query);
 
         // Draw the modal — last so it stacks above the central panel.
+        // Resolve the canvas tint for the focused node so the modal's
+        // metadata badges match whatever swatch StyleState::color_by
+        // is painting it with on the canvas.
+        let modal_tint = self.modal.current.as_ref().and_then(|meta| {
+            let idx = self.ids.iter().position(|s| s == &meta.id)? as u32;
+            crate::data::node_color_for_key(
+                self.state.style.color_by.metric_key(),
+                idx,
+                &self.metrics,
+                self.state.style.palette,
+            )
+        });
         let action = ui::modal::show_modal_with(
             ctx,
             &mut self.modal,
             &self.state.query.active_filters,
+            modal_tint,
         );
         if let Some(target) = action.navigate_to {
             self.kick_off_node_fetch(target);
@@ -1032,11 +1235,21 @@ impl App {
         }
     }
 
-    fn style_key(&self) -> (SizeBy, ColorBy, u32) {
+    fn style_key(&self) -> (SizeBy, ColorBy, u32, u32, EdgeColorBy, [u32; 4], crate::data::PaletteId) {
+        let ec = self.state.style.edge_color;
         (
             self.state.style.size_by,
             self.state.style.color_by,
             self.state.style.size_mul.to_bits(),
+            (self.state.style.log_scale_size as u32),
+            self.state.style.edge_color_by,
+            [
+                ec[0].to_bits(),
+                ec[1].to_bits(),
+                ec[2].to_bits(),
+                ec[3].to_bits(),
+            ],
+            self.state.style.palette,
         )
     }
 
@@ -1059,9 +1272,10 @@ impl App {
                     s.edge_alpha_mul,
                     (s.edge_dist_min, s.edge_dist_max),
                     s.edge_min_transparency,
-                    s.edge_width,
+                    s.edge_width * apply_size_scale(s.edge_size_mul, s.log_scale_size),
                     s.edge_fade_floor,
                 );
+                pipes.set_shader_intensity(s.shader_intensity);
             }
         }
 
@@ -1074,17 +1288,43 @@ impl App {
             self.state.style.color_by.metric_key(),
             &self.metrics,
             n,
+            self.state.style.palette,
         );
         let sizes = data::sizes_from_metric(
             self.state.style.size_by.metric_key(),
             &self.metrics,
             n,
-            self.state.style.size_mul,
+            apply_size_scale(self.state.style.size_mul, self.state.style.log_scale_size),
         );
+        let edge_color_by = self.state.style.edge_color_by;
+        let edge_fallback = self.state.style.edge_color;
         let mut renderer = wgpu_state.renderer.write();
         if let Some(pipes) = renderer.callback_resources.get_mut::<GraphPipelines>() {
             pipes.update_colors(&queue, colors);
             pipes.update_sizes(&queue, sizes);
+            // Edge colors: when EdgeColorBy::None, push an all-1.0 buffer
+            // so the uniform `edge_color` rules unchanged. Otherwise build
+            // per-edge tints from the chosen categorical metric.
+            let n_edges = pipes.n_edges() as usize;
+            if n_edges > 0 {
+                let edge_colors = if edge_color_by == EdgeColorBy::None {
+                    let mut v = Vec::with_capacity(n_edges * 4);
+                    for _ in 0..n_edges {
+                        v.extend_from_slice(&edge_fallback);
+                    }
+                    v
+                } else {
+                    data::edge_colors_from_metric(
+                        edge_color_by.metric_key(),
+                        &self.metrics,
+                        n,
+                        pipes.edges_cpu(),
+                        edge_fallback,
+                        self.state.style.palette,
+                    )
+                };
+                pipes.update_edge_colors(&queue, edge_colors);
+            }
         }
         self.prev_style_key = Some(key);
         // Force a selection re-push so the dim alpha overlays the new colours.
@@ -1949,7 +2189,12 @@ fn kick_off_bootstrap(load: SharedLoad, base: String, prog: ProgressSink) {
             }
         }
 
-        let positions_3d = data::promote_2d_to_3d(&positions_2d, init.n_nodes as u64);
+        // Ignore the server's 2D positions for spawn — seed nodes on a
+        // hollow sphere shell so the force sim collapses outward from a
+        // clean, isotropic distribution instead of a flat ring. Radius
+        // ~800 wu lands the camera fit at a sensible zoom for graphs in
+        // the few-thousand-node range.
+        let positions_3d = data::spawn_on_unit_sphere(init.n_nodes as usize, 800.0);
 
         log::info!(
             "[graph-renderer] bootstrap fetched: {} ids, {} positions (2D), {} edges, {} metrics",

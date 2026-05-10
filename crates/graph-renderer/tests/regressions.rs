@@ -148,14 +148,22 @@ fn inspector_hidden_when_no_selection() {
             let edges: Vec<u32> = Vec::new();
             let mut requested: Option<u32> = None;
             let mut req_toggle: Option<(String, String)> = None;
+            let mut req_nav: Option<String> = None;
+            let mut req_url: Option<String> = None;
+            let active_filters = graph_renderer::ui::query::ActiveFieldFilters::default();
             let mut data = InspectorData {
                 ids: &ids,
                 metrics: &metrics,
                 edges: &edges,
                 selected_idx: None,
                 requested_selection: &mut requested,
-                node_meta: None,
                 requested_filter_toggle: &mut req_toggle,
+                color_by: graph_renderer::ui::state::ColorBy::default(),
+                palette: graph_renderer::data::PaletteId::default(),
+                current_meta: None,
+                active_filters: &active_filters,
+                requested_navigate: &mut req_nav,
+                requested_open_url: &mut req_url,
             };
             inspector::show(ctx, &mut state, &mut data);
         });
@@ -189,14 +197,22 @@ fn inspector_shown_when_selection() {
             let edges: Vec<u32> = Vec::new();
             let mut requested: Option<u32> = None;
             let mut req_toggle: Option<(String, String)> = None;
+            let mut req_nav: Option<String> = None;
+            let mut req_url: Option<String> = None;
+            let active_filters = graph_renderer::ui::query::ActiveFieldFilters::default();
             let mut data = InspectorData {
                 ids: &ids,
                 metrics: &metrics,
                 edges: &edges,
                 selected_idx: Some(0),
                 requested_selection: &mut requested,
-                node_meta: None,
                 requested_filter_toggle: &mut req_toggle,
+                color_by: graph_renderer::ui::state::ColorBy::default(),
+                palette: graph_renderer::data::PaletteId::default(),
+                current_meta: None,
+                active_filters: &active_filters,
+                requested_navigate: &mut req_nav,
+                requested_open_url: &mut req_url,
             };
             inspector::show(ctx, &mut state, &mut data);
         });
@@ -242,7 +258,7 @@ fn gpu_force_defaults_match_spec() {
     assert_eq!(d.steps_per_call, 8, "steps_per_call default drifted");
     assert_eq!(
         d.repulsion_mode,
-        RepulsionMode::NegativeSampling,
+        RepulsionMode::BarnesHut,
         "repulsion_mode default drifted"
     );
 }
@@ -735,14 +751,22 @@ fn inspector_long_id_wraps_inside_panel() {
             let edges: Vec<u32> = Vec::new();
             let mut requested: Option<u32> = None;
             let mut req_toggle: Option<(String, String)> = None;
+            let mut req_nav: Option<String> = None;
+            let mut req_url: Option<String> = None;
+            let active_filters = graph_renderer::ui::query::ActiveFieldFilters::default();
             let mut data = InspectorData {
                 ids: &ids,
                 metrics: &metrics,
                 edges: &edges,
                 selected_idx: Some(0),
                 requested_selection: &mut requested,
-                node_meta: None,
                 requested_filter_toggle: &mut req_toggle,
+                color_by: graph_renderer::ui::state::ColorBy::default(),
+                palette: graph_renderer::data::PaletteId::default(),
+                current_meta: None,
+                active_filters: &active_filters,
+                requested_navigate: &mut req_nav,
+                requested_open_url: &mut req_url,
             };
             inspector::show(ctx, &mut state, &mut data);
         });
@@ -787,7 +811,7 @@ fn theme_borders_use_palette_border() {
     use graph_renderer::ui::theme::{self, palette};
 
     let ctx = egui::Context::default();
-    theme::apply(&ctx);
+    theme::apply_default(&ctx);
     let style = ctx.style();
     let v = &style.visuals;
 

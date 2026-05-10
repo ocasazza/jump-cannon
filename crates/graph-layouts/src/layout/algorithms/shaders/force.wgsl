@@ -109,6 +109,20 @@ const OCT_BODY_INTERNAL: u32 = 0xFFFFFFFFu;
 @group(1) @binding(4) var<storage, read_write> gb_cell_offsets: array<u32>;
 @group(1) @binding(5) var<storage, read_write> gb_cell_nodes:   array<u32>;
 
+// ---- Hub-aware spring bindings (group 3) -----------------------------------
+//
+// Tigr-style virtual-vertex split: high-degree vertices are split into
+// chunks of HUB_THRESHOLD edges (CPU preprocessing). Each virtual vertex
+// runs `spring_step` independently and writes its partial spring force
+// into `spring_force_partial[virt_idx]`. `force_step` then gathers
+// partials via `node_to_virt_offsets[i..i+1]`. This converts a single
+// O(degree) loop on a hub thread into ceil(degree/HUB_THRESHOLD) parallel
+// O(HUB_THRESHOLD) lanes, eliminating the warp-stall on power-law graphs.
+@group(3) @binding(0) var<storage, read>       virt_real_idx:        array<u32>;
+@group(3) @binding(1) var<storage, read>       virt_edge_offsets:    array<u32>;
+@group(3) @binding(2) var<storage, read_write> spring_force_partial: array<vec3<f32>>;
+@group(3) @binding(3) var<storage, read>       node_to_virt_offsets: array<u32>;
+
 fn gb_cell_for(pos: vec3<f32>) -> u32 {
     let inv = 1.0 / gb_params.grid_cell_size;
     let rel = (pos - gb_params.grid_origin) * inv;
@@ -147,21 +161,68 @@ fn count_cells(@builtin(global_invocation_id) gid: vec3<u32>) {
     atomicAdd(&gb_cell_counts[cell], 1u);
 }
 
-// Single-workgroup, single-thread sequential exclusive prefix sum over
-// cell_counts → cell_offsets. n_cells is bounded (≤ 64^3 = 262144) so this
-// is fine: ~0.1ms for the worst case, dominated by memory ops not compute.
-// We do this on one thread to avoid a multi-pass GPU scan; the alternative
-// (CPU readback + upload) would force a mid-frame submit + map_async.
-@compute @workgroup_size(1)
-fn scan_cell_offsets(@builtin(global_invocation_id) gid: vec3<u32>) {
-    if (gid.x != 0u) { return; }
-    var acc: u32 = 0u;
+// Single-workgroup exclusive prefix sum (Hillis-Steele, 256 lanes) over
+// cell_counts → cell_offsets. n_cells is bounded by MAX_N_CELLS=262144
+// (64³), and each lane scans a contiguous chunk of CHUNK_SIZE=1024 cells,
+// so the kernel covers the worst case in one dispatch with no host-side
+// scan-tree.
+//
+// Phase 1: each lane reduces its chunk to a local_sum (serial within chunk).
+// Phase 2: Hillis-Steele inclusive scan over the 256 local_sums in shared
+//          memory (log2(256) = 8 barrier-bounded passes).
+// Phase 3: each lane writes the exclusive prefix outputs across its chunk
+//          using (inclusive - local_sum) as its base offset.
+//
+// Why not multi-workgroup decoupled-lookback: at n=262144 this single-WG
+// scan finishes in ~10 μs on a modern GPU and avoids the second scan-tree
+// dispatch + per-block-state buffer that decoupled-lookback would require.
+const SCAN_WG_SIZE: u32 = 256u;
+const SCAN_CHUNK_SIZE: u32 = 1024u; // SCAN_WG_SIZE * SCAN_CHUNK_SIZE = 262144
+
+var<workgroup> scan_partials: array<u32, 256>;
+
+@compute @workgroup_size(256)
+fn scan_cell_offsets(@builtin(local_invocation_id) lid: vec3<u32>) {
+    let tid = lid.x;
     let n = gb_params.n_cells;
-    for (var c: u32 = 0u; c < n; c = c + 1u) {
+    let start = tid * SCAN_CHUNK_SIZE;
+    var end = start + SCAN_CHUNK_SIZE;
+    if (end > n) { end = n; }
+    if (start > n) { end = start; } // empty chunk for out-of-range lanes
+
+    // Phase 1: per-lane reduction over its contiguous chunk.
+    var local_sum: u32 = 0u;
+    for (var c: u32 = start; c < end; c = c + 1u) {
+        local_sum = local_sum + atomicLoad(&gb_cell_counts[c]);
+    }
+    scan_partials[tid] = local_sum;
+    workgroupBarrier();
+
+    // Phase 2: Hillis-Steele inclusive scan over the 256 partials.
+    var step: u32 = 1u;
+    loop {
+        if (step >= SCAN_WG_SIZE) { break; }
+        var v: u32 = 0u;
+        if (tid >= step) { v = scan_partials[tid - step]; }
+        workgroupBarrier();
+        scan_partials[tid] = scan_partials[tid] + v;
+        workgroupBarrier();
+        step = step * 2u;
+    }
+    // Inclusive scan complete; exclusive = inclusive - local_sum.
+    let block_offset = scan_partials[tid] - local_sum;
+
+    // Phase 3: write exclusive prefix across this lane's chunk.
+    var acc: u32 = block_offset;
+    for (var c: u32 = start; c < end; c = c + 1u) {
         gb_cell_offsets[c] = acc;
         acc = acc + atomicLoad(&gb_cell_counts[c]);
     }
-    gb_cell_offsets[n] = acc;
+
+    // Total = inclusive scan of last lane = scan_partials[255].
+    if (tid == 0u) {
+        gb_cell_offsets[n] = scan_partials[SCAN_WG_SIZE - 1u];
+    }
 }
 
 @compute @workgroup_size(64)
@@ -181,6 +242,37 @@ fn pcg_hash(state: u32) -> u32 {
     let s = state * 747796405u + 2891336453u;
     let word = ((s >> ((s >> 28u) + 4u)) ^ s) * 277803737u;
     return (word >> 22u) ^ word;
+}
+
+// ---- Hub-aware spring kernel ----------------------------------------------
+//
+// One thread per virtual vertex. Each thread reads its real-vertex index
+// + edge slice [virt_edge_offsets[v], virt_edge_offsets[v+1]) from the
+// virtualized CSR, accumulates the spring contribution, and stores it in
+// `spring_force_partial[v]`. No atomics needed: each virtual vertex owns
+// exactly one slot, and `force_step` sums the slots that belong to each
+// real vertex via `node_to_virt_offsets`.
+@compute @workgroup_size(64)
+fn spring_step(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let v = gid.x;
+    // Re-derive n_virtual from node_to_virt_offsets[n_nodes].
+    let n_virtual = node_to_virt_offsets[params.n_nodes];
+    if (v >= n_virtual) { return; }
+
+    let i = virt_real_idx[v];
+    let pos = positions_in[i];
+    let estart = virt_edge_offsets[v];
+    let eend   = virt_edge_offsets[v + 1u];
+
+    var f = vec3<f32>(0.0, 0.0, 0.0);
+    for (var k: u32 = estart; k < eend; k = k + 1u) {
+        let other = edge_neighbors[k];
+        let d = positions_in[other] - pos;
+        let dist = max(length(d), 0.01);
+        let stretch = dist - params.spring_len;
+        f = f + (d / dist) * (params.spring_k * stretch);
+    }
+    spring_force_partial[v] = f;
 }
 
 @compute @workgroup_size(64)
@@ -322,15 +414,16 @@ fn force_step(@builtin(global_invocation_id) gid: vec3<u32>) {
         }
     }
 
-    // ---- Springs (O(degree)) -----------------------------------------------
-    let start = edge_offsets[i];
-    let end   = edge_offsets[i + 1u];
-    for (var k: u32 = start; k < end; k = k + 1u) {
-        let other = edge_neighbors[k];
-        let d = positions_in[other] - pos;
-        let dist = max(length(d), 0.01);
-        let stretch = dist - params.spring_len;
-        force = force + (d / dist) * (params.spring_k * stretch);
+    // ---- Springs (gather over virtual vertices) ----------------------------
+    // The hub-split spring_step kernel has already written per-virtual
+    // partials into `spring_force_partial`. Here we sum the partials that
+    // belong to real vertex `i`. For non-hub vertices this is one iteration;
+    // for a hub of degree D it is ceil(D/HUB_THRESHOLD) iterations — already
+    // computed in parallel in spring_step.
+    let v_start = node_to_virt_offsets[i];
+    let v_end   = node_to_virt_offsets[i + 1u];
+    for (var v: u32 = v_start; v < v_end; v = v + 1u) {
+        force = force + spring_force_partial[v];
     }
 
     // ---- Gravity towards origin --------------------------------------------

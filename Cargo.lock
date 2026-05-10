@@ -2200,6 +2200,7 @@ dependencies = [
  "gloo-timers",
  "graph-layouts",
  "include_dir",
+ "jump-io",
  "log",
  "pollster",
  "prost",
@@ -2826,6 +2827,14 @@ dependencies = [
  "futures-util",
  "once_cell",
  "wasm-bindgen",
+]
+
+[[package]]
+name = "jump-io"
+version = "0.1.0"
+dependencies = [
+ "egui",
+ "serde",
 ]
 
 [[package]]
