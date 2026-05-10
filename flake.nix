@@ -60,7 +60,7 @@
         src = pkgs.lib.fileset.toSource {
           root = ./.;
           fileset = pkgs.lib.fileset.unions [
-            (pkgs.lib.fileset.fileFilter (file: builtins.any file.hasExt [ "rs" "toml" "lock" "md" "html" "scss" "js" "ts" "json" "png" "ico" "sh" "csv" ]) ./.)
+            (pkgs.lib.fileset.fileFilter (file: builtins.any file.hasExt [ "rs" "toml" "lock" "md" "html" "scss" "js" "ts" "json" "png" "ico" "sh" "csv" "proto" "wgsl" ]) ./.)
           ];
         };
 
@@ -111,6 +111,115 @@
           nativeBuildInputs = [ pkgs.protobuf ];
         });
 
+        graph-compute = craneLib.buildPackage (commonArgs // {
+          cargoArtifacts = depsNative;
+          cargoExtraArgs = "--package graph-compute";
+          nativeBuildInputs = [ pkgs.protobuf ];
+        });
+
+        # ----- Distributed compute backend: single source of truth -----
+        # The same service spec drives both the local docker-compose stack
+        # (`just dev-up`) and the SkyPilot cloud task (`just sky-up`). Edit
+        # this attrset, then `nix run .#render-stack-configs` to regenerate
+        # both YAMLs.
+        graphComputeService = {
+          name        = "graph-compute";
+          port        = 50051;
+          tickHz      = 30;
+          rustLog     = "info";
+          # Cloud-only: SkyPilot accelerator request. Ignored locally.
+          accelerator = "L4:1";
+        };
+
+        # OCI image built from the Crane derivation — no Dockerfile needed.
+        graph-compute-image = pkgs.dockerTools.buildLayeredImage {
+          name     = graphComputeService.name;
+          tag      = "latest";
+          contents = [ graph-compute pkgs.cacert ];
+          config   = {
+            Cmd = [ "/bin/graph-compute" ];
+            ExposedPorts."${toString graphComputeService.port}/tcp" = {};
+            Env = [
+              "GRAPH_COMPUTE_TICK_HZ=${toString graphComputeService.tickHz}"
+              "RUST_LOG=${graphComputeService.rustLog}"
+            ];
+          };
+        };
+
+        yamlFmt = pkgs.formats.yaml {};
+
+        docker-compose-yaml = yamlFmt.generate "docker-compose.yml" {
+          services."${graphComputeService.name}" = {
+            image       = "${graphComputeService.name}:latest";
+            ports       = [ "${toString graphComputeService.port}:${toString graphComputeService.port}" ];
+            environment = {
+              GRAPH_COMPUTE_TICK_HZ = toString graphComputeService.tickHz;
+              RUST_LOG              = graphComputeService.rustLog;
+            };
+            restart = "unless-stopped";
+          };
+        };
+
+        sky-task-yaml = yamlFmt.generate "graph-compute.sky.yaml" {
+          resources = {
+            accelerators = graphComputeService.accelerator;
+            ports        = [ graphComputeService.port ];
+          };
+          file_mounts."/opt/jump-cannon" = ".";
+          setup = ''
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+            source $HOME/.cargo/env
+            sudo apt-get update -y
+            sudo apt-get install -y libvulkan1 vulkan-tools mesa-vulkan-drivers
+            vulkaninfo --summary || echo "WARN: no vulkan; wgpu falls back to CPU"
+            cd /opt/jump-cannon
+            cargo build --release -p graph-compute
+          '';
+          run = ''
+            source $HOME/.cargo/env
+            cd /opt/jump-cannon
+            GRAPH_COMPUTE_TICK_HZ=${toString graphComputeService.tickHz} \
+            RUST_LOG=${graphComputeService.rustLog} \
+            ./target/release/graph-compute
+          '';
+        };
+
+        # `nix run .#render-stack-configs` — regenerates both YAML files
+        # from the shared graphComputeService spec above.
+        render-stack-configs = pkgs.writeShellApplication {
+          name = "render-stack-configs";
+          runtimeInputs = [ pkgs.coreutils ];
+          text = ''
+            set -euo pipefail
+            install -m 0644 ${docker-compose-yaml} docker-compose.yml
+            install -d infra/sky
+            install -m 0644 ${sky-task-yaml} infra/sky/graph-compute.yaml
+            echo "rendered: docker-compose.yml + infra/sky/graph-compute.yaml"
+          '';
+        };
+
+        # `nix run .#dev-up` — load the Nix-built image into podman, start compose.
+        dev-up = pkgs.writeShellApplication {
+          name = "dev-up";
+          runtimeInputs = [ pkgs.podman pkgs.podman-compose ];
+          text = ''
+            set -euo pipefail
+            echo "loading ${graphComputeService.name}:latest into podman..."
+            podman load < ${graph-compute-image}
+            echo "starting compose stack..."
+            podman-compose up -d
+          '';
+        };
+
+        dev-down = pkgs.writeShellApplication {
+          name = "dev-down";
+          runtimeInputs = [ pkgs.podman-compose ];
+          text = ''
+            set -euo pipefail
+            podman-compose down
+          '';
+        };
+
         # ----- WASM packages -----
 
         graph-layouts-wasm = craneLibWasm.buildPackage (commonArgs // {
@@ -130,7 +239,14 @@
       in {
         packages = {
           default          = graph-api;
-          inherit vault-search graph-api graph-layouts-wasm tvix-wasm;
+          inherit vault-search graph-api graph-compute graph-layouts-wasm tvix-wasm;
+          inherit graph-compute-image docker-compose-yaml sky-task-yaml;
+        };
+
+        apps = {
+          render-stack-configs = { type = "app"; program = "${render-stack-configs}/bin/render-stack-configs"; };
+          dev-up   = { type = "app"; program = "${dev-up}/bin/dev-up"; };
+          dev-down = { type = "app"; program = "${dev-down}/bin/dev-down"; };
         };
 
         checks = {
@@ -203,6 +319,12 @@
             # PLAYWRIGHT_BROWSERS_PATH env var below points playwright at it.
             nodejs_22
             playwright-driver.browsers
+
+            # Local dev cluster (`just dev-up` / `just dev-down`). podman runs
+            # rootless on NixOS without enabling system docker; podman-compose
+            # parses the same docker-compose.yml.
+            podman
+            podman-compose
           ] ++ bevyLibs;
 
           # Point Playwright at the nix-provided browser bundle and skip its

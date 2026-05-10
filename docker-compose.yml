@@ -1,0 +1,9 @@
+services:
+  graph-compute:
+    environment:
+      GRAPH_COMPUTE_TICK_HZ: '30'
+      RUST_LOG: info
+    image: graph-compute:latest
+    ports:
+    - 50051:50051
+    restart: unless-stopped

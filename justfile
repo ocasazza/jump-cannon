@@ -172,3 +172,19 @@ sky-down:
 # Export it in the shell where you run graph-api.
 sky-endpoint:
     @sky status --endpoint 50051 graph-compute | awk '{print "JUMP_CANNON_COMPUTE_URL=http://" $0}'
+
+# Regenerate docker-compose.yml + infra/sky/graph-compute.yaml from the
+# shared `graphComputeService` attrset in flake.nix. Run this after editing
+# the service spec; commit the resulting YAMLs alongside the flake change.
+render-configs:
+    nix run .#render-stack-configs
+
+# Local dev cluster: build the graph-compute OCI image with Nix, load it
+# into podman, and start the compose stack on [::]:50051. The renderer +
+# graph-api can then dial it at localhost:50051 (the broker default).
+dev-up:
+    nix run .#dev-up
+
+# Tear down the local dev cluster.
+dev-down:
+    nix run .#dev-down

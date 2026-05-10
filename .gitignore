@@ -25,3 +25,4 @@ crates/graph-renderer/assets/dist/
 # Claude scratch + assorted local tooling
 .claude/
 .gc/
+result
