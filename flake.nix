@@ -127,6 +127,10 @@
           port        = 50051;
           tickHz      = 30;
           rustLog     = "info";
+          # Bind all interfaces inside the container/pod so external clients
+          # (broker, probe) can reach the gRPC port. The native default is
+          # `[::1]:50051` which works only for in-host loopback.
+          bindAddr    = "[::]:50051";
           # Cloud-only: SkyPilot accelerator request. Ignored locally.
           accelerator = "L4:1";
         };
@@ -141,6 +145,7 @@
             ExposedPorts."${toString graphComputeService.port}/tcp" = {};
             Env = [
               "GRAPH_COMPUTE_TICK_HZ=${toString graphComputeService.tickHz}"
+              "GRAPH_COMPUTE_ADDR=${graphComputeService.bindAddr}"
               "RUST_LOG=${graphComputeService.rustLog}"
             ];
           };
@@ -154,6 +159,7 @@
             ports       = [ "${toString graphComputeService.port}:${toString graphComputeService.port}" ];
             environment = {
               GRAPH_COMPUTE_TICK_HZ = toString graphComputeService.tickHz;
+              GRAPH_COMPUTE_ADDR    = graphComputeService.bindAddr;
               RUST_LOG              = graphComputeService.rustLog;
             };
             restart = "unless-stopped";
@@ -179,6 +185,7 @@
             source $HOME/.cargo/env
             cd /opt/jump-cannon
             GRAPH_COMPUTE_TICK_HZ=${toString graphComputeService.tickHz} \
+            GRAPH_COMPUTE_ADDR=${graphComputeService.bindAddr} \
             RUST_LOG=${graphComputeService.rustLog} \
             ./target/release/graph-compute
           '';

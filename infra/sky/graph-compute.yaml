@@ -10,6 +10,8 @@ run: 'source $HOME/.cargo/env
 
   GRAPH_COMPUTE_TICK_HZ=30 \
 
+  GRAPH_COMPUTE_ADDR=[::]:50051 \
+
   RUST_LOG=info \
 
   ./target/release/graph-compute
