@@ -188,3 +188,20 @@ dev-up:
 # Tear down the local dev cluster.
 dev-down:
     nix run .#dev-down
+
+# Layout-algorithm benchmarks (criterion). HTML reports land in
+# target/criterion/. Set BENCH_INCLUDE_1M=1 to also bench at 1M nodes.
+bench:
+    cargo run --release -p graph-layouts --example bench_static_layouts -- --bench
+
+# Parameterized regression sweep over (algorithm, settings, scale) for
+# every static layout. Asserts determinism + finiteness + bounds.
+regression:
+    cargo test -p graph-layouts --test regression --release
+
+# Live-cluster canary tests. Defaults to the local dev cluster on
+# `[::1]:50051`; override with `URL=http://host:port just canary`.
+# Override expected node count with NODES=N.
+canary URL='http://[::1]:50051' NODES='1024':
+    GRAPH_COMPUTE_CANARY_URL={{URL}} GRAPH_COMPUTE_EXPECTED_NODES={{NODES}} \
+        cargo test -p graph-compute --test canary -- --nocapture
