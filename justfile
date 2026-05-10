@@ -35,24 +35,34 @@ run:
 build:
     cargo build --release --workspace
 
-# Run tests. `just test` runs everything; pass a target for one layer:
-#   just test            # all (cargo + browser smoke + regression e2e)
-#   just test cargo      # native unit + integration tests
-#   just test browser    # Playwright canvas-not-black smoke
-#   just test regression # Playwright UI regression suite
-#   just test perf       # headless perf gate (synth vault)
-#   just test profile    # diagnostic profiler (3-phase flame trace)
-test target='all':
+# Run tests. `just test` runs everything; pass a target for one layer.
+# An optional ARG parameterizes targets that take a knob:
+#   just test                # all (cargo + browser smoke + regression e2e)
+#   just test cargo          # native unit + integration tests (incl. regression.rs + fuzz.rs at default volume)
+#   just test fuzz [N]       # property-based fuzz, N cases per layout (default 10000)
+#   just test bench          # criterion benches across layouts; HTML in target/criterion/
+#   just test canary [URL]   # live-cluster gRPC smoke (default URL: http://[::1]:50051)
+#   just test browser        # Playwright canvas-not-black smoke
+#   just test regression     # Playwright UI regression suite
+#   just test perf           # headless perf gate (synth vault)
+#   just test profile        # diagnostic profiler (3-phase flame trace)
+test target='all' arg='':
     #!/usr/bin/env bash
     set -euo pipefail
     case "{{target}}" in
       all)        just test cargo && just test browser && just test regression ;;
       cargo)      cargo test --workspace ;;
+      fuzz)       PROPTEST_CASES="${ARG:-{{arg}}}"; PROPTEST_CASES="${PROPTEST_CASES:-10000}" \
+                  cargo test -p graph-layouts --test fuzz --release ;;
+      bench)      cargo run --release -p graph-layouts --example bench_static_layouts -- --bench ;;
+      canary)     URL="${ARG:-{{arg}}}"; URL="${URL:-http://[::1]:50051}" \
+                  GRAPH_COMPUTE_CANARY_URL="$URL" \
+                  cargo test -p graph-compute --test canary -- --nocapture ;;
       browser)    just _test-browser ;;
       regression) just _test-regression ;;
       perf)       just _test-perf ;;
       profile)    just _test-profile ;;
-      *) echo "unknown test target: {{target}} (try: cargo, browser, regression, perf, profile)" >&2; exit 1 ;;
+      *) echo "unknown test target: {{target}} (try: cargo, fuzz, bench, canary, browser, regression, perf, profile)" >&2; exit 1 ;;
     esac
 
 # Format the workspace.
@@ -159,56 +169,20 @@ _test-perf: wasm
     fi
     cd tests/browser && node perf.mjs
 
-# Bring up the graph-compute worker on a SkyPilot-managed GPU node.
-# See infra/sky/README.md for prereqs.
-sky-up:
-    sky launch -c graph-compute infra/sky/graph-compute.yaml --yes
-
-# Tear down the SkyPilot graph-compute cluster.
-sky-down:
-    sky down graph-compute --yes
-
-# Print `JUMP_CANNON_COMPUTE_URL=http://<host>:50051` for the running cluster.
-# Export it in the shell where you run graph-api.
-sky-endpoint:
-    @sky status --endpoint 50051 graph-compute | awk '{print "JUMP_CANNON_COMPUTE_URL=http://" $0}'
-
-# Regenerate docker-compose.yml + infra/sky/graph-compute.yaml from the
-# shared `graphComputeService` attrset in flake.nix. Run this after editing
-# the service spec; commit the resulting YAMLs alongside the flake change.
-render-configs:
-    nix run .#render-stack-configs
-
-# Local dev cluster: build the graph-compute OCI image with Nix, load it
-# into podman, and start the compose stack on [::]:50051. The renderer +
-# graph-api can then dial it at localhost:50051 (the broker default).
-dev-up:
-    nix run .#dev-up
-
-# Tear down the local dev cluster.
-dev-down:
-    nix run .#dev-down
-
-# Layout-algorithm benchmarks (criterion). HTML reports land in
-# target/criterion/. Set BENCH_INCLUDE_1M=1 to also bench at 1M nodes.
-bench:
-    cargo run --release -p graph-layouts --example bench_static_layouts -- --bench
-
-# Parameterized regression sweep over (algorithm, settings, scale) for
-# every static layout. Asserts determinism + finiteness + bounds.
-regression:
-    cargo test -p graph-layouts --test regression --release
-
-# High-volume fuzz: proptest generates random settings + graph sizes for
-# every layout and asserts invariants. Counterexamples auto-shrink and
-# persist to crates/graph-layouts/proptest-regressions/ — commit those.
-# Override case count via CASES=N (default 10000).
-fuzz CASES='10000':
-    PROPTEST_CASES={{CASES}} cargo test -p graph-layouts --test fuzz --release
-
-# Live-cluster canary tests. Defaults to the local dev cluster on
-# `[::1]:50051`; override with `URL=http://host:port just canary`.
-# Override expected node count with NODES=N.
-canary URL='http://[::1]:50051' NODES='1024':
-    GRAPH_COMPUTE_CANARY_URL={{URL}} GRAPH_COMPUTE_EXPECTED_NODES={{NODES}} \
-        cargo test -p graph-compute --test canary -- --nocapture
+# Manage the graph-compute cluster. WHERE picks the backend.
+#   just cluster up [local|sky]      # default: local (podman) — also auto-renders configs
+#   just cluster down [local|sky]
+#   just cluster endpoint sky        # prints JUMP_CANNON_COMPUTE_URL=http://<host>:50051
+#   just cluster render              # regenerate docker-compose.yml + infra/sky/*.yaml from flake.nix
+cluster action='up' where='local':
+    #!/usr/bin/env bash
+    set -euo pipefail
+    case "{{action}}/{{where}}" in
+      up/local)       nix run .#render-stack-configs && nix run .#dev-up ;;
+      down/local)     nix run .#dev-down ;;
+      up/sky)         sky launch -c graph-compute infra/sky/graph-compute.yaml --yes ;;
+      down/sky)       sky down graph-compute --yes ;;
+      endpoint/sky)   sky status --endpoint 50051 graph-compute | awk '{print "JUMP_CANNON_COMPUTE_URL=http://" $0}' ;;
+      render/*)       nix run .#render-stack-configs ;;
+      *) echo "usage: just cluster {up|down|endpoint|render} [local|sky]" >&2; exit 1 ;;
+    esac
