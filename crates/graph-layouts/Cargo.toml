@@ -44,6 +44,7 @@ log = "0.4"
 wasm-bindgen-test = "0.3.34"
 tokio = { version = "1", features = ["macros", "rt"] }
 criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
+proptest = "1"
 
 # Run via `cargo run --release --example bench_static_layouts -p graph-layouts`
 # (or `just bench`). Lives as an example rather than a [[bench]] target so it

@@ -199,6 +199,13 @@ bench:
 regression:
     cargo test -p graph-layouts --test regression --release
 
+# High-volume fuzz: proptest generates random settings + graph sizes for
+# every layout and asserts invariants. Counterexamples auto-shrink and
+# persist to crates/graph-layouts/proptest-regressions/ — commit those.
+# Override case count via CASES=N (default 10000).
+fuzz CASES='10000':
+    PROPTEST_CASES={{CASES}} cargo test -p graph-layouts --test fuzz --release
+
 # Live-cluster canary tests. Defaults to the local dev cluster on
 # `[::1]:50051`; override with `URL=http://host:port just canary`.
 # Override expected node count with NODES=N.
