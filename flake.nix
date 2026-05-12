@@ -30,7 +30,11 @@
   };
 
   outputs = inputs: inputs.flake-parts.lib.mkFlake { inherit inputs; } {
-    systems = import inputs.systems;
+    # Explicit cross-platform system list. `nix-systems/default` would expose
+    # only the host's system, which breaks evaluating darwin outputs from a
+    # linux dev box (and vice versa). We need all four so CI on linux and
+    # devs on nix-darwin (M-series + Intel) can both build the workspace.
+    systems = [ "x86_64-linux" "aarch64-linux" "aarch64-darwin" "x86_64-darwin" ];
 
     perSystem = { pkgs, system, self', ... }:
       let
@@ -206,11 +210,22 @@
         };
 
         # `nix run .#dev-up` — load the Nix-built image into podman, start compose.
+        # On darwin, podman needs a Linux VM (`podman machine`) — preflight it
+        # so the script gives a clear actionable error instead of a confusing
+        # "Cannot connect to Podman" from `podman load`.
         dev-up = pkgs.writeShellApplication {
           name = "dev-up";
           runtimeInputs = [ pkgs.podman pkgs.podman-compose ];
           text = ''
             set -euo pipefail
+            if [ "$(uname -s)" = "Darwin" ]; then
+              if ! podman machine list --format '{{.Running}}' 2>/dev/null | grep -q true; then
+                echo "error: podman machine is not running on darwin." >&2
+                echo "  start it with: podman machine init && podman machine start" >&2
+                echo "  (one-time init; subsequent boots only need 'podman machine start')" >&2
+                exit 1
+              fi
+            fi
             echo "loading ${graphComputeService.name}:latest into podman..."
             podman load < ${graph-compute-image}
             echo "starting compose stack..."

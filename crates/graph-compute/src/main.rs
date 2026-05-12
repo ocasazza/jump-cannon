@@ -1,8 +1,11 @@
 //! graph-compute binary entrypoint.
 //!
-//! Phase 1 scope: a single-GPU worker exposing the `Compute` gRPC service over
-//! `[::1]:50051`. The graph is a synthetic path graph by default — Phase 2
-//! wires in a partition map loaded from disk + the `vault-data` ingestion path.
+//! Phase 1 scope: a single-GPU worker exposing the `Compute` gRPC service.
+//! Default bind is dual-stack `[::]:50051` so the service is reachable from
+//! external clients (broker, probe, the podman-machine VM on darwin); set
+//! `GRAPH_COMPUTE_ADDR` to override (e.g. `[::1]:50051` for in-host loopback
+//! only). The graph is a synthetic path graph by default — Phase 2 wires in a
+//! partition map loaded from disk + the `vault-data` ingestion path.
 
 use std::net::SocketAddr;
 
@@ -49,7 +52,7 @@ async fn main() -> Result<()> {
     let _ = state.try_init_wgpu().await;
 
     let bind: SocketAddr = std::env::var("GRAPH_COMPUTE_ADDR")
-        .unwrap_or_else(|_| "[::1]:50051".to_string())
+        .unwrap_or_else(|_| "[::]:50051".to_string())
         .parse()?;
 
     let tick_hz: f32 = std::env::var("GRAPH_COMPUTE_TICK_HZ")
