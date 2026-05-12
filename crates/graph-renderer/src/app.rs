@@ -964,20 +964,19 @@ impl eframe::App for App {
         let click = wctx.click;
         let canvas_rect = wctx.canvas_rect;
         let pointer_in_canvas = wctx.pointer_in_canvas;
-        let lmb_held = wctx.lmb_held;
-        let rmb_held = wctx.rmb_held;
 
         self.prev_canvas_rect = canvas_rect;
         self.last_pointer_in_canvas = pointer_in_canvas;
-        // Cursor force sign: LMB attract (negative), RMB repel (positive),
-        // matching the cheatsheet labels.
-        self.cursor_force_active = if lmb_held {
-            -1.0
-        } else if rmb_held {
-            1.0
-        } else {
-            0.0
-        };
+        // Cursor-as-force is disabled. On compact layouts (e.g. fresh
+        // topo-fisheye seeds, small graphs) attract-on-LMB pulls every
+        // visible node into a single point, blanking the canvas until
+        // spring + repulsion restore them. The GPU uniform plumbing and
+        // the WGSL force block stay live (cheap; well-tested), but no
+        // input ever sets `cursor_force_active`, so the radius=0 branch
+        // in `apply_cursor_force` keeps the GPU's `cursor_radius` at 0
+        // and the shader skips the cursor term entirely. To re-enable
+        // later, restore the lmb/rmb dispatch here.
+        self.cursor_force_active = 0.0;
 
         // Esc closes the modal — wired through the AppAction::Cancel
         // pulse drained at the top of `update`. The palette has its
