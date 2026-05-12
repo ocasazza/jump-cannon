@@ -18,7 +18,7 @@ use crate::ui::layout::registry::LayoutRegistry;
 use crate::ui::progress::{Progress, ProgressSink};
 use crate::ui::query::EvalContext;
 use crate::ui::state::{ColorBy, EdgeColorBy, FontFamilyChoice, SizeBy};
-use graph_layouts::{warmup_positions, GpuForceOptions};
+use graph_layouts::{warmup_positions, GpuForceOptions, SeedMode};
 
 /// Translate a UI multiplier slider value into the actual scalar applied
 /// downstream. When `log_scale` is on, the slider is interpreted as
@@ -79,6 +79,13 @@ pub struct App {
     // -- "previous-frame" trackers used to gate GPU writes -----------------
     prev_style_key: Option<(SizeBy, ColorBy, u32, u32, EdgeColorBy, [u32; 4], crate::data::PaletteId)>,
     prev_layout_key: Option<u64>,
+    /// Last-applied gpu-force seed mode. `set_options` only updates the
+    /// option struct in place — it does **not** re-run `precompute`, so a
+    /// pure settings push can't actually re-seed the layout. To make the
+    /// SeedMode combo in the sidebar functional we detect a change here
+    /// and force a `swap_physics_layout` (which rebuilds GpuState and
+    /// re-runs the seeder) instead of the cheap settings-only push.
+    prev_seed_mode: Option<SeedMode>,
     prev_focus_key: Option<u64>,
     prev_cursor_key: Option<u64>,
     prev_selected_hash: Option<u64>,
@@ -297,6 +304,7 @@ impl App {
             search_inflight: HashSet::new(),
             prev_style_key: None,
             prev_layout_key: None,
+            prev_seed_mode: None,
             prev_focus_key: None,
             prev_cursor_key: None,
             prev_selected_hash: None,
@@ -1417,6 +1425,24 @@ impl App {
             .map(|prev| prev != active_id.as_str())
             .unwrap_or(false);
 
+        // Decode the gpu-force seed_mode out of the JSON if applicable so we
+        // can detect a seed-mode change. `set_options` doesn't re-precompute,
+        // so a plain settings push can't actually re-seed — we have to force
+        // a swap.
+        let new_seed_mode: Option<SeedMode> = if active_id == "gpu-force" {
+            serde_json::from_value::<GpuForceOptions>(json_owned.clone())
+                .ok()
+                .map(|o| o.seed_mode)
+        } else {
+            None
+        };
+        let seed_mode_changed = match (&self.prev_seed_mode, &new_seed_mode) {
+            (Some(prev), Some(curr)) => prev != curr,
+            // First gpu-force apply, or moving onto gpu-force from elsewhere
+            // — covered by `active_changed`, no need to double-trigger.
+            _ => false,
+        };
+
         let device = wgpu_state.device.clone();
         let queue = wgpu_state.queue.clone();
         let mut renderer = wgpu_state.renderer.write();
@@ -1424,7 +1450,7 @@ impl App {
             if let Some(factory) = self.layout_registry.get(&active_id) {
                 match factory.kind() {
                     graph_layouts::LayoutKind::Physics => {
-                        if active_changed {
+                        if active_changed || seed_mode_changed {
                             pipes.swap_physics_layout(&device, &queue, factory, &json_owned);
                         } else {
                             pipes.set_physics_layout_settings_json(&json_owned);
@@ -1450,6 +1476,7 @@ impl App {
         }
         self.prev_layout_key = Some(key);
         self.prev_active_layout_id = Some(active_id);
+        self.prev_seed_mode = new_seed_mode;
     }
 
     fn focus_key(&self) -> u64 {
