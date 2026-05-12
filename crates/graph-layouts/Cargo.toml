@@ -40,6 +40,11 @@ pollster = "0.4"
 wasm-bindgen-futures = "0.4"
 log = "0.4"
 
+# 2-D Delaunay triangulation for the Gansner-Koren-North topological-fisheye
+# coarsener used as a `SeedMode` for the force-directed sim. Pure Rust, no
+# transitive deps, works on WASM.
+delaunator = "1.0"
+
 [dev-dependencies]
 wasm-bindgen-test = "0.3.34"
 tokio = { version = "1", features = ["macros", "rt"] }

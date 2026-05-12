@@ -86,6 +86,48 @@ impl Default for RepulsionMode {
     fn default() -> Self { RepulsionMode::BarnesHut }
 }
 
+/// How the force-directed sim seeds its initial node positions.
+///
+/// The sim itself runs in 3-D (xyz, with a vec4-padded GPU buffer); seeders
+/// must produce 3-D positions or the layout will collapse to a plane. All
+/// variants below are 3-D-safe.
+#[derive(Clone, Debug, PartialEq)]
+pub enum SeedMode {
+    /// Independent uniform-random samples in `[-radius, +radius]` per axis,
+    /// where `radius ∝ sqrt(n) * spring_len`. The historical default; cheap
+    /// but produces a noisy ball that the sim has to untangle from scratch.
+    Random,
+    /// Topological-fisheye multilevel seed (Gansner-Koren-North §4): build
+    /// a hierarchy of coarsened graphs whose candidate set is graph edges
+    /// ∪ filtered Delaunay edges, lay out the coarsest level with a tiny
+    /// CPU FR sim, then prolong + relax level-by-level back down. The sim
+    /// inherits a near-converged layout and spends its frame budget on
+    /// local refinement instead of global untangling.
+    TopoFisheye,
+}
+
+impl Default for SeedMode {
+    fn default() -> Self {
+        // Preserve historical behaviour; opt-in to topo-fisheye explicitly.
+        SeedMode::Random
+    }
+}
+
+impl SeedMode {
+    fn from_str(s: &str) -> Self {
+        match s.to_ascii_lowercase().as_str() {
+            "topo_fisheye" | "topofisheye" | "tf" | "fisheye" => SeedMode::TopoFisheye,
+            _ => SeedMode::Random,
+        }
+    }
+    fn to_str(&self) -> &'static str {
+        match self {
+            SeedMode::Random => "random",
+            SeedMode::TopoFisheye => "topo_fisheye",
+        }
+    }
+}
+
 impl RepulsionMode {
     fn as_u32(self) -> u32 {
         match self {
@@ -173,6 +215,9 @@ pub struct GpuForceOptions {
     /// on large clustered graphs where one voxel collects hundreds of
     /// bodies (real Obsidian vaults with hub neighborhoods).
     pub repulsion_mode: RepulsionMode,
+    /// Initial-position seeder. Default `Random` for back-compat. Pick
+    /// `TopoFisheye` to seed from the §4 multilevel coarsening pipeline.
+    pub seed_mode: SeedMode,
     /// Barnes-Hut acceptance criterion: treat a subtree as a single
     /// body when (cell_size / dist) < theta. 0.5..1.0 is the useful
     /// range; 0.7 is a common sweet spot per Burtscher & Pingali 2011.
@@ -216,6 +261,7 @@ impl GpuForceOptions {
             energy_threshold,
             grid_enabled,
             repulsion_mode,
+            seed_mode,
             theta,
             repulsion_samples,
         } = self;
@@ -236,6 +282,7 @@ impl GpuForceOptions {
             energy_threshold: o_energy_threshold,
             grid_enabled: o_grid_enabled,
             repulsion_mode: o_repulsion_mode,
+            seed_mode: o_seed_mode,
             theta: o_theta,
             repulsion_samples: o_repulsion_samples,
         } = other;
@@ -252,6 +299,7 @@ impl GpuForceOptions {
             && energy_threshold.to_bits() == o_energy_threshold.to_bits()
             && grid_enabled               == o_grid_enabled
             && repulsion_mode             == o_repulsion_mode
+            && seed_mode                  == o_seed_mode
             && theta.to_bits()            == o_theta.to_bits()
             && repulsion_samples          == o_repulsion_samples
     }
@@ -308,6 +356,7 @@ impl Default for GpuForceOptions {
             energy_threshold: 0.05,
             grid_enabled: true,
             repulsion_mode: RepulsionMode::default(),
+            seed_mode: SeedMode::default(),
             theta: 0.7,
             repulsion_samples: 8,
         }
@@ -320,7 +369,7 @@ impl Default for GpuForceOptions {
 impl serde::Serialize for GpuForceOptions {
     fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeStruct;
-        let mut st = s.serialize_struct("GpuForceOptions", 18)?;
+        let mut st = s.serialize_struct("GpuForceOptions", 19)?;
         st.serialize_field("repulsion", &self.repulsion)?;
         st.serialize_field("spring_k", &self.spring_k)?;
         st.serialize_field("spring_len", &self.spring_len)?;
@@ -337,6 +386,7 @@ impl serde::Serialize for GpuForceOptions {
         st.serialize_field("energy_threshold", &self.energy_threshold)?;
         st.serialize_field("grid_enabled", &self.grid_enabled)?;
         st.serialize_field("repulsion_mode", self.repulsion_mode.to_str())?;
+        st.serialize_field("seed_mode", self.seed_mode.to_str())?;
         st.serialize_field("theta", &self.theta)?;
         st.serialize_field("repulsion_samples", &self.repulsion_samples)?;
         st.end()
@@ -380,6 +430,8 @@ impl<'de> serde::Deserialize<'de> for GpuForceOptions {
             #[serde(default)]
             repulsion_mode: Option<String>,
             #[serde(default)]
+            seed_mode: Option<String>,
+            #[serde(default)]
             theta: Option<f32>,
             #[serde(default)]
             repulsion_samples: Option<u32>,
@@ -406,6 +458,10 @@ impl<'de> serde::Deserialize<'de> for GpuForceOptions {
                 .as_deref()
                 .map(RepulsionMode::from_str)
                 .unwrap_or(def.repulsion_mode),
+            seed_mode: r.seed_mode
+                .as_deref()
+                .map(SeedMode::from_str)
+                .unwrap_or(def.seed_mode),
             theta: r.theta.unwrap_or(def.theta),
             repulsion_samples: r.repulsion_samples.unwrap_or(def.repulsion_samples),
         })
@@ -585,7 +641,7 @@ impl GpuForceLayout {
                 self.owned_device = Some(OwnedDevice { device, queue });
             }
             let od = self.owned_device.as_ref().unwrap();
-            self.state = Some(GpuState::new_owned(&od.device, graph)?);
+            self.state = Some(GpuState::new_owned(&od.device, graph, &self.options)?);
         }
 
         let od = self
@@ -668,7 +724,7 @@ impl GpuForceLayout {
         graph: &Graph,
         positions_buffer: &wgpu::Buffer,
     ) -> Result<(), String> {
-        let state = GpuState::new_borrowed(device, graph, positions_buffer)?;
+        let state = GpuState::new_borrowed(device, graph, positions_buffer, &self.options)?;
         state.upload_initial_positions_to(queue, positions_buffer);
         self.state = Some(state);
         Ok(())
@@ -1051,7 +1107,7 @@ struct PreCompute {
     node_to_virt_offsets: Vec<u32>,
 }
 
-fn precompute(graph: &Graph) -> PreCompute {
+fn precompute(graph: &Graph, seed_mode: &SeedMode, spring_len: f32) -> PreCompute {
     let n_nodes = graph.nodes.len() as u32;
     let n_edges = graph.edges.len() as u32;
 
@@ -1064,17 +1120,61 @@ fn precompute(graph: &Graph) -> PreCompute {
         .collect();
 
     let radius = ((n_nodes as f32).max(1.0).sqrt()) * 5.0;
-    let mut positions: Vec<f32> = Vec::with_capacity(n_nodes as usize * 4);
-    let mut seed: u32 = 0x9E37_79B1;
-    let mut next = || {
-        seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
-        (seed as f32 / u32::MAX as f32) * 2.0 - 1.0
+    // Compute the seed in flat xyz form (the seeders share a buffer format),
+    // then expand to vec4-padded `[x,y,z,0]` for the GPU. Nodes with an
+    // author-supplied `position3` override the seeder for that slot.
+    let mut seeded: Vec<f32> = match seed_mode {
+        SeedMode::Random => {
+            let mut s: u32 = 0x9E37_79B1;
+            let mut next = || {
+                s = s.wrapping_mul(1664525).wrapping_add(1013904223);
+                (s as f32 / u32::MAX as f32) * 2.0 - 1.0
+            };
+            (0..n_nodes)
+                .flat_map(|_| [next() * radius, next() * radius, next() * radius])
+                .collect()
+        }
+        SeedMode::TopoFisheye => {
+            // Build a flat undirected edge list in id-sorted node order.
+            let mut edges: Vec<u32> = Vec::with_capacity(graph.edges.len() * 2);
+            for e in graph.edges.values() {
+                let (Some(&s), Some(&t)) = (
+                    id_to_idx.get(e.source.as_str()),
+                    id_to_idx.get(e.target.as_str()),
+                ) else {
+                    continue;
+                };
+                if s == t {
+                    continue;
+                }
+                edges.push(s);
+                edges.push(t);
+            }
+            crate::layout::topo_fisheye::seed_positions(
+                n_nodes as usize,
+                &edges,
+                spring_len.max(1.0),
+                0x9E37_79B1,
+                &crate::layout::topo_fisheye::CoarsenParams::default(),
+            )
+        }
     };
-    for id in &node_order {
+    // Defensive: if the seeder returned the wrong length (e.g. empty graph
+    // edge case), fall back to a zero ball so downstream sizing stays sane.
+    if seeded.len() != 3 * n_nodes as usize {
+        seeded = vec![0.0f32; 3 * n_nodes as usize];
+    }
+
+    let mut positions: Vec<f32> = Vec::with_capacity(n_nodes as usize * 4);
+    for (idx, id) in node_order.iter().enumerate() {
         let n = &graph.nodes[id];
-        let p = n
-            .position3
-            .unwrap_or_else(|| [next() * radius, next() * radius, next() * radius]);
+        let p = n.position3.unwrap_or_else(|| {
+            [
+                seeded[3 * idx],
+                seeded[3 * idx + 1],
+                seeded[3 * idx + 2],
+            ]
+        });
         positions.extend_from_slice(&[p[0], p[1], p[2], 0.0]);
     }
     let velocities: Vec<f32> = vec![0.0; n_nodes as usize * 4];
@@ -1481,8 +1581,12 @@ fn build_pipeline(device: &wgpu::Device) -> ForcePipelines {
 
 impl GpuState {
     /// Build state with caller-supplied device + owned positions buffers.
-    fn new_owned(device: &wgpu::Device, graph: &Graph) -> Result<Self, String> {
-        let pc = precompute(graph);
+    fn new_owned(
+        device: &wgpu::Device,
+        graph: &Graph,
+        options: &GpuForceOptions,
+    ) -> Result<Self, String> {
+        let pc = precompute(graph, &options.seed_mode, options.spring_len);
         let pos_buf_size = (pc.n_nodes as u64).max(1) * VEC3_STRIDE;
 
         let pos_a = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -1568,8 +1672,9 @@ impl GpuState {
         device: &wgpu::Device,
         graph: &Graph,
         positions_buffer: &wgpu::Buffer,
+        options: &GpuForceOptions,
     ) -> Result<Self, String> {
-        let pc = precompute(graph);
+        let pc = precompute(graph, &options.seed_mode, options.spring_len);
         let pos_buf_size = (pc.n_nodes as u64).max(1) * VEC3_STRIDE;
 
         // Internal ping-pong target. COPY_SRC so we can copy back to the
@@ -3079,6 +3184,121 @@ mod tests {
             for k in 0..3 { if !p[k].is_finite() { all_finite = false; } }
         }
         assert!(all_finite, "BH path produced non-finite positions");
+    }
+
+    // ---- SeedMode plumbing ------------------------------------------------
+    //
+    // These exercise `precompute` directly — the function the GPU sim calls
+    // to produce its initial-position buffer. We *cannot* preset `position3`
+    // on the nodes (which the other tests do for determinism) because that
+    // bypasses the seeder. Build seederless ring graphs and read the buffer
+    // back.
+
+    fn seederless_ring(n: usize) -> Graph {
+        let mut g = Graph::new();
+        for i in 0..n {
+            g.add_node(Node::new(format!("{:04}", i)));
+        }
+        for i in 0..n {
+            g.add_edge(Edge::new(
+                format!("e{i}"),
+                format!("{:04}", i),
+                format!("{:04}", (i + 1) % n),
+            ));
+        }
+        g
+    }
+
+    fn stddev_per_axis(positions: &[f32], n: usize) -> [f32; 3] {
+        // precompute returns vec4-padded `[x,y,z,0]` per node.
+        let mut means = [0.0f32; 3];
+        for i in 0..n {
+            for c in 0..3 {
+                means[c] += positions[4 * i + c];
+            }
+        }
+        for c in 0..3 {
+            means[c] /= n as f32;
+        }
+        let mut var = [0.0f32; 3];
+        for i in 0..n {
+            for c in 0..3 {
+                let d = positions[4 * i + c] - means[c];
+                var[c] += d * d;
+            }
+        }
+        [
+            (var[0] / n as f32).sqrt(),
+            (var[1] / n as f32).sqrt(),
+            (var[2] / n as f32).sqrt(),
+        ]
+    }
+
+    #[test]
+    fn precompute_random_seed_spreads_in_three_dimensions() {
+        let g = seederless_ring(96);
+        let opts = GpuForceOptions::default();
+        assert!(matches!(opts.seed_mode, SeedMode::Random));
+        let pc = precompute(&g, &opts.seed_mode, opts.spring_len);
+        let sd = stddev_per_axis(&pc.initial_positions, pc.n_nodes as usize);
+        assert!(sd[0] > 0.0 && sd[1] > 0.0 && sd[2] > 0.0);
+        let xy_max = sd[0].max(sd[1]);
+        assert!(
+            sd[2] > 0.1 * xy_max,
+            "Random seed flattened z: sx={} sy={} sz={}",
+            sd[0],
+            sd[1],
+            sd[2]
+        );
+    }
+
+    #[test]
+    fn precompute_topo_fisheye_seed_spreads_in_three_dimensions() {
+        let g = seederless_ring(128);
+        let mut opts = GpuForceOptions::default();
+        opts.seed_mode = SeedMode::TopoFisheye;
+        let pc = precompute(&g, &opts.seed_mode, opts.spring_len);
+        let sd = stddev_per_axis(&pc.initial_positions, pc.n_nodes as usize);
+        assert!(sd[0] > 0.0 && sd[1] > 0.0 && sd[2] > 0.0);
+        let xy_max = sd[0].max(sd[1]);
+        assert!(
+            sd[2] > 0.1 * xy_max,
+            "TopoFisheye seed flattened z: sx={} sy={} sz={}",
+            sd[0],
+            sd[1],
+            sd[2]
+        );
+    }
+
+    #[test]
+    fn precompute_seed_modes_produce_different_layouts() {
+        let g = seederless_ring(96);
+        let opts = GpuForceOptions::default();
+        let pc_rand = precompute(&g, &SeedMode::Random, opts.spring_len);
+        let pc_tf = precompute(&g, &SeedMode::TopoFisheye, opts.spring_len);
+        assert_eq!(pc_rand.initial_positions.len(), pc_tf.initial_positions.len());
+        // L2 between the two buffers must be substantial — otherwise the
+        // seeder dispatch is a no-op and `SeedMode` does nothing.
+        let l2_sq: f32 = pc_rand
+            .initial_positions
+            .iter()
+            .zip(pc_tf.initial_positions.iter())
+            .map(|(a, b)| (a - b) * (a - b))
+            .sum();
+        assert!(l2_sq.sqrt() > 1.0, "seed modes produced identical buffers");
+    }
+
+    #[test]
+    fn seed_mode_serde_round_trip() {
+        let mut opts = GpuForceOptions::default();
+        opts.seed_mode = SeedMode::TopoFisheye;
+        let json = serde_json::to_string(&opts).expect("serialize");
+        assert!(
+            json.contains("\"seed_mode\":\"topo_fisheye\""),
+            "missing seed_mode field in serialized JSON: {json}"
+        );
+        let back: GpuForceOptions = serde_json::from_str(&json).expect("deserialize");
+        assert!(matches!(back.seed_mode, SeedMode::TopoFisheye));
     }
 }
 
