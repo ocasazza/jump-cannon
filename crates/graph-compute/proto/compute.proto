@@ -4,6 +4,13 @@ package graph_compute;
 service Compute {
   rpc Subscribe(SubscribeRequest) returns (stream PositionDelta);
   rpc Health(HealthRequest) returns (HealthResponse);
+
+  // Topological-fisheye view (Gansner, Koren, North — IEEE InfoVis 2004).
+  // Bidirectional stream: the client sends FocusRequests as the user moves
+  // the focal node, and the server emits a fresh HybridFrame for each.
+  // The expensive multilevel hierarchy is built lazily on the first request
+  // and cached for the lifetime of the connection.
+  rpc TopoFisheye(stream FocusRequest) returns (stream HybridFrame);
 }
 
 message SubscribeRequest { string graph_id = 1; }
@@ -20,4 +27,51 @@ message HealthResponse {
   bool ok = 1;
   uint32 n_nodes = 2;
   uint64 frame = 3;
+}
+
+// Knobs for the §4 coarsening pass. All fields optional; zero/empty means
+// "use the server default" (see CoarsenParams::default() on the Rust side).
+message CoarsenSettings {
+  uint32 max_levels  = 1;
+  uint32 target_size = 2;
+  uint32 gt_max_hops = 3;
+  float w_proximity     = 4;
+  float w_size          = 5;
+  float w_connection    = 6;
+  float w_neighborhood  = 7;
+  float w_degree        = 8;
+}
+
+// One message per focus update on the client → server half of the
+// TopoFisheye stream. After the first message in a stream, only
+// `focal_node`, `capacities`, and `alpha` are honoured; `coarsen` is fixed
+// for the lifetime of the stream because the hierarchy is built once.
+message FocusRequest {
+  string graph_id = 1;
+  uint32 focal_node = 2;
+  // Paper §5 level capacities c_0, c_1, …. Empty = server default
+  // (c_0 = 64, doubling).
+  repeated uint32 capacities = 3;
+  // Paper §6 distortion exponent α. 0 disables distortion; 1 targets
+  // uniform density; >1 over-emphasises the focus.
+  float alpha = 4;
+  CoarsenSettings coarsen = 5;
+}
+
+// One message per server → client emission.
+message HybridFrame {
+  uint32 n_nodes = 1;
+  // Per node: (level, idx_at_level) packed as two little-endian u32s.
+  // Length = 8 * n_nodes bytes.
+  bytes node_refs = 2;
+  // Per node level (= the first u32 of each node_refs entry, broken out
+  // for fast colour upload). Length = 4 * n_nodes bytes.
+  bytes node_levels = 3;
+  // Interleaved x,y,z f32 little-endian. Length = 12 * n_nodes bytes.
+  bytes positions = 4;
+  // Flat undirected edge pairs as little-endian u32. Length = 8 * n_edges.
+  bytes edges = 5;
+  // Per-edge level (max of the two endpoint levels). Length = 4 * n_edges.
+  bytes edge_levels = 6;
+  uint32 n_edges = 7;
 }

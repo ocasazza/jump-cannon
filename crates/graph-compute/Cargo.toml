@@ -27,6 +27,19 @@ anyhow             = "1"
 async-stream       = "0.3"
 futures-core       = "0.3"
 
+# 2-D Delaunay triangulation. Used directly by `topo_fisheye::distort` for
+# the RNG-approximation density estimate. The §4 coarsening / hierarchy
+# logic itself lives in `graph-layouts` (the canonical home for layout
+# algorithms) — see the `graph-layouts` dep below.
+delaunator         = "1.0"
+
+# Canonical home of the topological-fisheye §4 coarsening + hierarchy
+# (`graph_layouts::layout::topo_fisheye`). graph-compute imports the
+# algorithm from here so the §5 hybrid + §6 distortion stages and the
+# `GpuForceOptions::seed_mode = TopoFisheye` seeder share one source of
+# truth. Native-only path: graph-layouts is cdylib+rlib; we link the rlib.
+graph-layouts      = { path = "../graph-layouts" }
+
 # Server-side wgpu force-sim. Native-only crate, so we let wgpu pick the default
 # backend set (vulkan/metal/dx12); no webgpu/webgl features needed.
 wgpu     = { version = "23", features = ["wgsl"] }
