@@ -28,14 +28,21 @@ dev-up:
     #!/usr/bin/env bash
     set -euo pipefail
 
-    # ---- Stage 1 (fast): WASM bundle + frontend served ASAP ----
-    # The trunk dist is what graph-api serves at `/`. If it already exists
-    # we skip the ~30s release WASM build entirely and the API can come up
-    # immediately. First-run cost only.
-    if [ ! -d crates/graph-renderer/assets/dist ]; then
-        echo "→ first-run trunk build…"
-        trunk build --release
-    fi
+    # ---- Stage 1: WASM bundle, always built ----
+    # The trunk dist is what graph-api serves at `/`. The previous
+    # "skip if dist exists" check meant any change in graph-renderer
+    # (the WASM half) was silently invisible after the first dev-up of
+    # the day — the user saw stale UI for hours wondering why their
+    # recent commits had no effect. Always run trunk; incremental
+    # builds are seconds, full ones ~30s. Worth the predictability.
+    echo "→ trunk build (WASM)…"
+    trunk build --release
+
+    # Background trunk watch so subsequent edits to graph-renderer
+    # rebuild the WASM bundle while dev-up is running. The user just
+    # refreshes the browser; no need to Ctrl-C + restart dev-up.
+    trunk watch &
+    TRUNK_PID=$!
 
     # ---- Stage 2 (parallel): everything else ----
     # Three independent builds/processes run concurrently so the user
@@ -45,7 +52,6 @@ dev-up:
     #   3. graph-api pre-build          (~10-30s cold; warms the cargo
     #      cache so `cargo watch`'s startup build is a no-op and the
     #      server starts serving the frontend within ms)
-    # cleanup() teardown traps both (1)+(2) on Ctrl-C / exit.
 
     echo "→ kicking off parallel builds + backend…"
     cargo build --release -p vault-search &
@@ -57,21 +63,22 @@ dev-up:
 
     cleanup() {
         echo
-        echo "→ tearing down (backend pid $BACKEND_PID, vault pid $VAULT_PID)…"
+        echo "→ tearing down (backend pid $BACKEND_PID, vault pid $VAULT_PID, trunk pid $TRUNK_PID)…"
         kill "$BACKEND_PID" 2>/dev/null || true
         kill "$VAULT_PID" 2>/dev/null || true
         kill "$API_BUILD_PID" 2>/dev/null || true
+        kill "$TRUNK_PID" 2>/dev/null || true
         # Idempotent: kills the native binary (darwin) or stops compose (linux).
         nix run .#dev-down 2>/dev/null || true
     }
     trap cleanup EXIT INT TERM
 
     # Wait for the api pre-build before handing off to cargo-watch. The
-    # other two (vault-search, backend) continue in the background — the
-    # frontend doesn't block on either.
+    # other three (vault-search, backend, trunk watch) continue in the
+    # background — the frontend doesn't block on any of them.
     wait "$API_BUILD_PID" || { echo "graph-api build failed"; exit 1; }
 
-    echo "→ graph-api built; starting hot-reload server (frontend live now)…"
+    echo "→ graph-api built; starting hot-reload server (frontend live now, WASM rebuilds on edit)…"
     cargo watch \
       -w crates/graph-api -w crates/vault-data -w crates/vault-links -w crates/graph-metrics \
       -x 'run -p graph-api -- --assets-dir crates/graph-renderer/assets/dist'
