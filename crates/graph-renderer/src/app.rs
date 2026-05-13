@@ -953,6 +953,7 @@ impl eframe::App for App {
                     requested_navigate: &mut requested_navigate,
                     requested_open_url: &mut requested_open_url,
                     requested_focus_node: &mut requested_focus_node,
+                    field_index: self.field_index.as_ref(),
                 };
                 let inspector_rect = ui::inspector::show(ctx, &mut self.state, &mut data);
                 // Floating-mode leader line: when the inspector is a

@@ -150,6 +150,7 @@ fn inspector_hidden_when_no_selection() {
             let mut req_toggle: Option<(String, String)> = None;
             let mut req_nav: Option<String> = None;
             let mut req_url: Option<String> = None;
+            let mut req_focus: Option<String> = None;
             let active_filters = graph_renderer::ui::query::ActiveFieldFilters::default();
             let mut data = InspectorData {
                 ids: &ids,
@@ -164,6 +165,8 @@ fn inspector_hidden_when_no_selection() {
                 active_filters: &active_filters,
                 requested_navigate: &mut req_nav,
                 requested_open_url: &mut req_url,
+                requested_focus_node: &mut req_focus,
+                field_index: None,
             };
             inspector::show(ctx, &mut state, &mut data);
         });
@@ -199,6 +202,7 @@ fn inspector_shown_when_selection() {
             let mut req_toggle: Option<(String, String)> = None;
             let mut req_nav: Option<String> = None;
             let mut req_url: Option<String> = None;
+            let mut req_focus: Option<String> = None;
             let active_filters = graph_renderer::ui::query::ActiveFieldFilters::default();
             let mut data = InspectorData {
                 ids: &ids,
@@ -213,6 +217,8 @@ fn inspector_shown_when_selection() {
                 active_filters: &active_filters,
                 requested_navigate: &mut req_nav,
                 requested_open_url: &mut req_url,
+                requested_focus_node: &mut req_focus,
+                field_index: None,
             };
             inspector::show(ctx, &mut state, &mut data);
         });
@@ -753,6 +759,7 @@ fn inspector_long_id_wraps_inside_panel() {
             let mut req_toggle: Option<(String, String)> = None;
             let mut req_nav: Option<String> = None;
             let mut req_url: Option<String> = None;
+            let mut req_focus: Option<String> = None;
             let active_filters = graph_renderer::ui::query::ActiveFieldFilters::default();
             let mut data = InspectorData {
                 ids: &ids,
@@ -767,6 +774,8 @@ fn inspector_long_id_wraps_inside_panel() {
                 active_filters: &active_filters,
                 requested_navigate: &mut req_nav,
                 requested_open_url: &mut req_url,
+                requested_focus_node: &mut req_focus,
+                field_index: None,
             };
             inspector::show(ctx, &mut state, &mut data);
         });

@@ -68,6 +68,12 @@ pub struct InspectorData<'a> {
     /// about); for wikilink/ticket badges it's the link target. The App
     /// drains this into `focus_node_by_id`.
     pub requested_focus_node: &'a mut Option<String>,
+    /// Vault-wide `(field, value, node_idxs)` inverse index, populated
+    /// by `/graph/meta_summary` at boot. Used by the empty-state tag
+    /// panel that renders when no node is selected — chips for the
+    /// top-N vault tags, sorted by frequency. `None` while the fetch
+    /// is in flight.
+    pub field_index: Option<&'a crate::ui::field_index::FieldIndex>,
 }
 
 /// Render the inspector. Returns the outer screen-space `Rect` of the
@@ -90,7 +96,16 @@ pub fn show(
         .map(|i| (i as usize) < data.ids.len())
         .unwrap_or(false);
     let has_active_filters = !data.active_filters.by_field.is_empty();
-    if !has_selection && !has_active_filters {
+    // Also mount the inspector when the vault has tags to surface in
+    // the empty-state browser — that's the "no node selected, no
+    // filters active" tag panel. Hide only when there's truly nothing
+    // to show.
+    let has_browse_tags = data
+        .field_index
+        .and_then(|fi| fi.by_field.get("tags"))
+        .map(|b| !b.is_empty())
+        .unwrap_or(false);
+    if !has_selection && !has_active_filters && !has_browse_tags {
         return None;
     }
 
@@ -264,12 +279,10 @@ fn render_body(ui: &mut egui::Ui, state: &mut AppState, data: &mut InspectorData
         .auto_shrink([false; 2])
         .show(ui, |ui| {
             let Some(idx) = valid_idx else {
-                ui.add_space(8.0);
-                ui.label(
-                    egui::RichText::new("(no node selected)")
-                        .color(egui::Color32::from_gray(140))
-                        .italics(),
-                );
+                // Empty-state: render the vault-wide tag panel so the
+                // sidebar has a useful default surface ("browse tags")
+                // when nothing's selected.
+                show_browse_tags(ui, data);
                 return;
             };
             show_metadata(ui, idx, data);
@@ -430,6 +443,82 @@ fn dispatch_inspector_badge(
         }
         BadgeAction::Hovered { .. } | BadgeAction::None => {}
     }
+}
+
+/// Empty-state tag browser. Renders when no node is selected so the
+/// inspector has a useful default surface — top-N vault tags as filter
+/// chips, click toggles the filter, active chips show the purple halo.
+///
+/// Hidden if `field_index` hasn't returned yet or has no tags. The
+/// caller already gates inspector mount on `has_browse_tags`, so we
+/// only get here when there's something to render.
+fn show_browse_tags(ui: &mut egui::Ui, data: &mut InspectorData) {
+    use crate::ui::badge::{Badge, BadgeAction, BadgeKind};
+    const MAX_CHIPS: usize = 50;
+    let Some(fi) = data.field_index else {
+        ui.add_space(8.0);
+        ui.label(
+            egui::RichText::new("(no node selected — loading tags…)")
+                .color(egui::Color32::from_gray(140))
+                .italics(),
+        );
+        return;
+    };
+    let Some(tag_buckets) = fi.by_field.get("tags") else {
+        ui.add_space(8.0);
+        ui.label(
+            egui::RichText::new("(no node selected)")
+                .color(egui::Color32::from_gray(140))
+                .italics(),
+        );
+        return;
+    };
+    if tag_buckets.is_empty() {
+        ui.add_space(8.0);
+        ui.label(
+            egui::RichText::new("(no node selected — vault has no tags)")
+                .color(egui::Color32::from_gray(140))
+                .italics(),
+        );
+        return;
+    }
+    let mut ranked: Vec<(&String, usize)> = tag_buckets
+        .iter()
+        .map(|(v, idxs)| (v, idxs.len()))
+        .collect();
+    ranked.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+    ranked.truncate(MAX_CHIPS);
+
+    ui.add_space(6.0);
+    ui.label(
+        egui::RichText::new(format!("Tags ({} total)", tag_buckets.len()))
+            .color(palette::TEXT)
+            .strong(),
+    );
+    ui.add_space(4.0);
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing.x = 4.0;
+        ui.spacing_mut().item_spacing.y = 4.0;
+        for (value, count) in &ranked {
+            let active = data
+                .active_filters
+                .by_field
+                .get("tags")
+                .map(|s| s.contains(*value))
+                .unwrap_or(false);
+            let label = format!("{} ({})", value, count);
+            let b = Badge::new("tags", &label, BadgeKind::Tag)
+                .active(active)
+                .small(true);
+            if let BadgeAction::Toggle { .. } = b.show(ui) {
+                // The badge's `value` carries the composite "name (count)"
+                // label; route the raw tag value through the filter
+                // toggle instead so subsequent renders re-match.
+                *data.requested_filter_toggle =
+                    Some(("tags".to_string(), (*value).clone()));
+            }
+        }
+    });
 }
 
 fn show_badges(ui: &mut egui::Ui, idx: u32, data: &mut InspectorData) {
