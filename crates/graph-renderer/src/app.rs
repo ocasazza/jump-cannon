@@ -1176,6 +1176,11 @@ impl eframe::App for App {
 
         // Filter chip strip — sits above the canvas, below the modal.
         ui::filter_strip::show(ctx, &mut self.state.query);
+        // Always-visible tag cloud — chips for every loaded vault tag,
+        // anchored top-left, exists from app boot independent of any
+        // node selection. This is the first-class chip surface the
+        // user sees on first load.
+        ui::tag_cloud::show(ctx, self.field_index.as_ref(), &mut self.state.query);
 
         // Draw the modal — last so it stacks above the central panel.
         // Resolve the canvas tint for the focused node so the modal's
