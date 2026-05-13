@@ -1092,10 +1092,30 @@ impl eframe::App for App {
             .frame(egui::Frame::none().fill(egui::Color32::TRANSPARENT))
             .show(ctx, |ui| {
                 let mut viewer = ui::workspace::WorkspaceViewer { ctx: &mut wctx };
+                // Hide the dock tab bar when only one tab is mounted —
+                // the user complained about "an empty grey bar at the
+                // top". With a single Graph tab, the tab strip has
+                // nothing to do but the add-tab button, and the strip
+                // bg colour reads as an unexplained ribbon above the
+                // canvas. Collapsing it to zero height removes the
+                // ribbon entirely; users who split the workspace pick
+                // up tabs from the splits' result and get the bar back
+                // automatically (n_tabs > 1).
+                let n_tabs: usize = self
+                    .state
+                    .dock
+                    .dock_state
+                    .iter_all_tabs()
+                    .count();
+                let mut style = egui_dock::Style::from_egui(ui.style());
+                if n_tabs <= 1 {
+                    style.tab_bar.height = 0.0;
+                    style.tab_bar.bg_fill = egui::Color32::TRANSPARENT;
+                }
                 egui_dock::DockArea::new(&mut self.state.dock.dock_state)
-                    .show_add_buttons(true)
-                    .show_add_popup(true)
-                    .style(egui_dock::Style::from_egui(ui.style()))
+                    .show_add_buttons(n_tabs > 1)
+                    .show_add_popup(n_tabs > 1)
+                    .style(style)
                     .show_inside(ui, &mut viewer);
             });
         self.perf.end_stage(StageId::EguiPaint);

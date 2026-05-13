@@ -6,8 +6,10 @@
 //! direct neighbors derived from the raw edge list.
 //!
 //! The panel sits to the right of the central dock area. Two states:
-//!   - Collapsed: a thin 24px strip with a chevron to expand.
-//!   - Expanded: 320px panel with sections.
+//!   - Closed: a floating "Inspector" pill anchored top-right of the
+//!     canvas (overlay; does not steal layout width).
+//!   - Open: 320px panel with sections (or a floating window when
+//!     `state.inspector_floating == true`).
 //!
 //! Communication back to `App` flows through `InspectorData::requested_selection`:
 //! clicking a row in either list writes that node's idx; `App::update`
@@ -27,10 +29,6 @@ use super::theme::palette;
 const PANEL_W: f32 = 320.0;
 const PANEL_W_MIN: f32 = 240.0;
 const PANEL_W_MAX: f32 = 560.0;
-// Collapsed strip is a fixed 24px thumb (chevron target only) — not a
-// stretchable layout.
-const COLLAPSED_W: f32 = 24.0;
-
 /// Read-only context the inspector uses to resolve node info, plus a
 /// single mutable out-channel for click-to-select.
 pub struct InspectorData<'a> {
@@ -105,12 +103,18 @@ pub fn show(
         .and_then(|fi| fi.by_field.get("tags"))
         .map(|b| !b.is_empty())
         .unwrap_or(false);
-    if !has_selection && !has_active_filters && !has_browse_tags {
+
+    // When the user has explicitly closed the inspector, always surface
+    // a floating "Open inspector" pill in the top-right of the canvas —
+    // even if the mount gate would otherwise hide the panel entirely.
+    // Without this, closing the inspector while nothing is selected and
+    // no filters are active strands the user with no way back.
+    if !state.inspector_open {
+        show_reopen_pill(ctx, state);
         return None;
     }
 
-    if !state.inspector_open {
-        show_collapsed(ctx, state);
+    if !has_selection && !has_active_filters && !has_browse_tags {
         return None;
     }
     if state.inspector_floating {
@@ -121,33 +125,39 @@ pub fn show(
     }
 }
 
-fn show_collapsed(ctx: &egui::Context, state: &mut AppState) {
-    egui::SidePanel::right("inspector")
-        .exact_width(COLLAPSED_W)
-        .resizable(false)
-        .frame(
-            egui::Frame::none()
-                .fill(egui::Color32::BLACK)
-                .stroke(egui::Stroke::new(1.0, palette::BORDER))
-                .inner_margin(egui::Margin::ZERO),
-        )
+/// Floating "Open inspector" pill mounted in the canvas's top-right
+/// corner whenever `!state.inspector_open`. Replaces the previous
+/// 24px collapsed SidePanel strip — that strip ate horizontal space
+/// permanently, and when the mount gate elided it (no selection / no
+/// filters / no tags) the user was left with no way to reopen the
+/// panel deliberately. A floating `egui::Area` overlays the canvas
+/// without stealing layout width and is always present when closed.
+fn show_reopen_pill(ctx: &egui::Context, state: &mut AppState) {
+    egui::Area::new(egui::Id::new("inspector-reopen-pill"))
+        .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-12.0, 12.0))
+        .order(egui::Order::Foreground)
+        .interactable(true)
         .show(ctx, |ui| {
-            ui.vertical_centered(|ui| {
-                ui.add_space(6.0);
-                // Collapsed-strip chevron uses ICON grey (matches the
-                // activity-bar inactive icon family).
-                let resp = ui.add(
-                    egui::Button::new(
-                        egui::RichText::new("\u{2039}").color(palette::ICON),
-                    )
-                    .frame(false)
-                    .min_size(egui::vec2(COLLAPSED_W, 22.0)),
-                )
-                .on_hover_text("Open inspector");
-                if resp.clicked() {
-                    state.inspector_open = true;
-                }
-            });
+            egui::Frame::none()
+                .fill(egui::Color32::from_black_alpha(220))
+                .stroke(egui::Stroke::new(1.0, palette::BORDER))
+                .rounding(egui::Rounding::same(6.0))
+                .inner_margin(egui::Margin::symmetric(10.0, 6.0))
+                .show(ui, |ui| {
+                    let resp = ui
+                        .add(
+                            egui::Button::new(
+                                egui::RichText::new("\u{2630}  Inspector")
+                                    .color(palette::TEXT),
+                            )
+                            .frame(false)
+                            .min_size(egui::vec2(96.0, 22.0)),
+                        )
+                        .on_hover_text("Open inspector");
+                    if resp.clicked() {
+                        state.inspector_open = true;
+                    }
+                });
         });
 }
 
@@ -226,16 +236,22 @@ fn render_body(ui: &mut egui::Ui, state: &mut AppState, data: &mut InspectorData
                 .strong(),
         );
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            // Collapse chevron stays right-most so its position is
-            // stable across the two render paths.
+            // Close button stays right-most so its position is
+            // stable across the two render paths. Uses ✕ (not the
+            // ambiguous › chevron, which on a right-side panel reads
+            // as "expand") with a 24x24 hit target so the affordance
+            // is unambiguously tappable.
             if ui
                 .add(
                     egui::Button::new(
-                        egui::RichText::new("\u{203A}").color(palette::ICON),
+                        egui::RichText::new("\u{2715}")
+                            .color(palette::TEXT)
+                            .strong(),
                     )
-                    .frame(false),
+                    .frame(false)
+                    .min_size(egui::vec2(24.0, 24.0)),
                 )
-                .on_hover_text("Collapse")
+                .on_hover_text("Hide inspector")
                 .clicked()
             {
                 state.inspector_open = false;
