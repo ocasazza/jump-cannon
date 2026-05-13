@@ -24,12 +24,26 @@ pub fn parse_note(path: &Path, text: &str) -> ParsedNote {
                 for (k, val) in m {
                     let key = k.as_str().unwrap_or("").to_string();
                     let json_val = yaml_to_json(val);
-                    if key == "tags" {
-                        if let serde_json::Value::Array(arr) = &json_val {
-                            tags = arr
-                                .iter()
-                                .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                                .collect();
+                    // Obsidian's `tags:` field shows up in many shapes in
+                    // the wild. The legacy code only accepted the YAML
+                    // array form (`tags: [a, b]`), silently dropping
+                    // every other form — which meant the API returned
+                    // empty `tags` for most vaults, the renderer's
+                    // `meta.tags.is_empty()` guard hid the badges, and
+                    // the user saw a chip-less sidebar.
+                    //
+                    // Accept (in order of common usage):
+                    //   - YAML array of strings: `tags: [a, b]`
+                    //   - Comma-separated scalar: `tags: a, b`
+                    //   - Single scalar:          `tags: a`
+                    // Also accept the singular `tag:` form some users
+                    // type. Strip leading `#` and surrounding quotes
+                    // (vault-search's `clean_tag` shape).
+                    if key == "tags" || key == "tag" {
+                        for t in extract_tags_from_value(&json_val) {
+                            if !tags.contains(&t) {
+                                tags.push(t);
+                            }
                         }
                     }
                     if key == "doctype" {
@@ -49,6 +63,14 @@ pub fn parse_note(path: &Path, text: &str) -> ParsedNote {
 
     let links = extract_wikilinks(&body);
 
+    // Inline `#tag` mentions in the body. Obsidian users mix frontmatter
+    // and inline tags freely; both should surface in the sidebar.
+    for t in extract_inline_tags(&body) {
+        if !tags.contains(&t) {
+            tags.push(t);
+        }
+    }
+
     ParsedNote {
         title,
         tags,
@@ -56,6 +78,107 @@ pub fn parse_note(path: &Path, text: &str) -> ParsedNote {
         doctype,
         links,
     }
+}
+
+/// Pull tag strings out of an arbitrary frontmatter JSON value.
+/// Accepts array-of-strings, comma-separated string, single string.
+/// Strips leading `#` and quotes, drops empties.
+fn extract_tags_from_value(v: &serde_json::Value) -> Vec<String> {
+    let mut out = Vec::new();
+    match v {
+        serde_json::Value::Array(arr) => {
+            for el in arr {
+                out.extend(extract_tags_from_value(el));
+            }
+        }
+        serde_json::Value::String(s) => {
+            // Comma-separated string: `tags: foo, bar`. Single-tag case
+            // (no comma) falls through naturally as one-element split.
+            for piece in s.split(',') {
+                let cleaned = clean_tag(piece);
+                if !cleaned.is_empty() {
+                    out.push(cleaned);
+                }
+            }
+        }
+        _ => {}
+    }
+    out
+}
+
+fn clean_tag(s: &str) -> String {
+    s.trim()
+        .trim_matches('"')
+        .trim_matches('\'')
+        .trim_matches('#')
+        .to_string()
+}
+
+/// Scan markdown body for inline `#tag` tokens (Obsidian's own format).
+/// Matches `#word-chars` where word-chars are alnum / `_` / `-` / `/`.
+/// Skips `#` that lives inside code spans / fenced blocks (cheap heuristic:
+/// drop the entire line if it starts with four+ leading spaces or sits
+/// inside a triple-backtick fence). Header lines (`#`, `##`, ...) are
+/// excluded by requiring at least one non-space char before the `#`, or
+/// alternatively a non-space directly after the `#` that isn't another `#`.
+fn extract_inline_tags(body: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut in_fence = false;
+    for line in body.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("```") {
+            in_fence = !in_fence;
+            continue;
+        }
+        if in_fence {
+            continue;
+        }
+        // Markdown ATX headings: skip — the leading `#`s aren't tags.
+        // (No false positives because a heading line starts with `#` then a space.)
+        if let Some(rest) = trimmed.strip_prefix('#') {
+            // Allow `#####` headings: drop more leading `#`s then require space.
+            let rest = rest.trim_start_matches('#');
+            if rest.starts_with(' ') {
+                continue;
+            }
+        }
+        let bytes = line.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] == b'#' {
+                // Must be at start of line OR preceded by whitespace /
+                // punctuation. Avoids matching `foo#bar` (anchor link
+                // or path fragment).
+                let preceded_ok = i == 0
+                    || matches!(bytes[i - 1], b' ' | b'\t' | b',' | b';' | b'(' | b'[' | b'{');
+                let mut j = i + 1;
+                while j < bytes.len() {
+                    let c = bytes[j];
+                    if c.is_ascii_alphanumeric() || matches!(c, b'_' | b'-' | b'/') {
+                        j += 1;
+                    } else {
+                        break;
+                    }
+                }
+                if preceded_ok && j > i + 1 {
+                    // Need at least one alphabetic char (skip `#1`,
+                    // `#123` — usually issue numbers / step counters,
+                    // not tags).
+                    let token = &line[i + 1..j];
+                    if token.chars().any(|c| c.is_ascii_alphabetic()) {
+                        let t = token.to_string();
+                        if !out.contains(&t) {
+                            out.push(t);
+                        }
+                    }
+                }
+                i = j;
+            } else {
+                i += 1;
+            }
+        }
+    }
+    out
 }
 
 /// Split `---\n…\n---\n` frontmatter from the rest of the file.
