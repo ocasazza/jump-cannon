@@ -761,43 +761,70 @@ fn clickable_list(
     items: &[u32],
     data: &mut InspectorData,
 ) {
+    use crate::ui::badge::{Badge, BadgeAction, BadgeClickKind, BadgeKind};
     // No nested ScrollArea — the outer panel ScrollArea handles vertical
     // scroll, so two scrollables don't fight for wheel events. The MAX
-    // cap below already prevents the per-frame widget blow-up that the
-    // inner scrollarea was originally guarding against. We constrain
-    // each row's max width to `available_width()` so a 50+ char node
-    // id wraps inside the panel instead of pushing out the resize
-    // handle.
+    // cap below prevents per-frame widget blow-up on huge communities.
     const MAX: usize = 200;
     let truncated = items.len() > MAX;
-    // Constrain row width to the panel's available_width so that long
-    // node ids wrap inside the panel rather than pushing past the
-    // resize handle. egui::Button::wrap() respects the surrounding
-    // ui's available width.
-    for &i in items.iter().take(MAX) {
-        let label = data
-            .ids
-            .get(i as usize)
-            .map(|s| s.as_str())
-            .unwrap_or("?");
-        let resp = ui.add(
-            egui::Button::new(
-                egui::RichText::new(label)
-                    .monospace()
-                    .color(palette::TEXT),
-            )
-            .frame(false)
-            .wrap(),
-        );
-        if resp.clicked() {
-            *data.requested_selection = Some(i);
+    // Render each neighbour / community sibling as a community-tinted
+    // pill (Badge). Body-click fires `requested_selection`, which the
+    // App folds into `focus_node_by_id` — camera slides, sticky-focus
+    // flips, modal refreshes. Wrap horizontally so a long community
+    // grid into a paragraph of chips instead of a column of one-per-row.
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing.x = 4.0;
+        ui.spacing_mut().item_spacing.y = 4.0;
+        for &i in items.iter().take(MAX) {
+            let label = data
+                .ids
+                .get(i as usize)
+                .map(|s| s.as_str())
+                .unwrap_or("?");
+            let short = short_id_for_pill(label);
+            let tint = crate::data::node_color_for_key(
+                data.color_by.metric_key(),
+                i,
+                data.metrics,
+                data.palette,
+            );
+            let mut b = Badge::new("node", &short, BadgeKind::Generic)
+                .small(true)
+                .click_kind(BadgeClickKind::Clicked);
+            if let Some(c) = tint {
+                b = b.override_color(c);
+            }
+            match b.show(ui) {
+                BadgeAction::Clicked { .. } => {
+                    *data.requested_selection = Some(i);
+                }
+                // No filter affordance here — the pill represents a node,
+                // not a (field, value) attribute. Other variants are not
+                // emitted by the configuration above.
+                _ => {}
+            }
         }
-    }
+    });
     if truncated {
         ui.label(
             egui::RichText::new(format!("… {} more not shown", items.len() - MAX))
                 .color(egui::Color32::from_gray(140))
                 .italics(),
         );
+    }
+}
+
+/// Truncate a node id to a single-line pill label. Long path-like ids
+/// ("notes/2025/projects/alpha.md") get the file-name tail; the
+/// directory prefix is implied by community colour anyway.
+fn short_id_for_pill(id: &str) -> String {
+    // Prefer the basename if the id looks path-like.
+    let basename = id.rsplit('/').next().unwrap_or(id);
+    const MAX: usize = 24;
+    if basename.chars().count() <= MAX {
+        basename.to_string()
+    } else {
+        let head: String = basename.chars().take(MAX - 1).collect();
+        format!("{head}…")
     }
 }

@@ -1107,8 +1107,10 @@ impl eframe::App for App {
         self.update_hover_focus(frame, pointer_in_canvas, canvas_rect);
 
         // Inspector requested a different selection (clicked a community
-        // sibling or neighbor row). Drive the same path the canvas click
-        // uses: update selected idx + kick the /node/:id fetch.
+        // sibling or neighbor pill). Drive the full focus path: camera
+        // slides to the node, sticky highlight follows, modal refreshes.
+        // `focus_node_by_id` internally calls kick_off_node_fetch, so the
+        // sidebar updates the same way it did before.
         if let Some(idx) = requested_selection.take() {
             self.selected_node_idx = Some(idx);
             if !self.state.inspector_open {
@@ -1120,7 +1122,7 @@ impl eframe::App for App {
                     idx,
                     id
                 );
-                self.kick_off_node_fetch(id);
+                self.focus_node_by_id(frame, &id);
             }
         }
 
