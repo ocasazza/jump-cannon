@@ -16,16 +16,45 @@ wasm:
 watch-wasm:
     trunk watch
 
-# All-in-one dev server. Builds WASM bundle if missing, then watches the API.
-dev:
-    @if [ ! -d crates/graph-renderer/assets/dist ]; then \
-        echo "→ first-run trunk build…"; \
-        trunk build --release; \
+#
+# Internals: backgrounds `nix run .#dev-up` (native binary on darwin,
+# podman+compose on linux) for the distributed compute backend, then runs
+# the API server with cargo-watch in the foreground. Ctrl-C tears down both
+# via a trap. `nix run .#dev-up` standalone still works for orchestration
+# (CI, deploy, integration tests) — this recipe is the contributor entry.
+
+# All-in-one dev stack: graph-compute backend + graph-api hot-reload.
+dev-up:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [ ! -d crates/graph-renderer/assets/dist ]; then
+        echo "→ first-run trunk build…"
+        trunk build --release
     fi
     cargo build --release -p vault-search
+    echo "→ starting graph-compute backend in the background…"
+    # Run the nix-managed backend (handles darwin / linux dispatch internally).
+    # `setsid` puts it in its own process group so the trap can clean up the
+    # podman container OR the native binary, whichever variant `dev-up` chose.
+    nix run .#dev-up &
+    BACKEND_PID=$!
+    cleanup() {
+        echo
+        echo "→ tearing down graph-compute backend (pid $BACKEND_PID)…"
+        kill "$BACKEND_PID" 2>/dev/null || true
+        # `dev-down` is idempotent: kills the native binary (darwin) or
+        # stops compose (linux). Either way leaves nothing running.
+        nix run .#dev-down 2>/dev/null || true
+    }
+    trap cleanup EXIT INT TERM
+    echo "→ starting graph-api with hot-reload in foreground…"
     cargo watch \
       -w crates/graph-api -w crates/vault-data -w crates/vault-links -w crates/graph-metrics \
       -x 'run -p graph-api -- --assets-dir crates/graph-renderer/assets/dist'
+
+# Symmetric teardown for `just dev-up`. Idempotent — safe to re-run.
+dev-down:
+    nix run .#dev-down
 
 # Run the production binary (embedded assets, no watch).
 run:
