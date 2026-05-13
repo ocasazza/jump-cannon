@@ -14,7 +14,6 @@ pub mod modal;
 pub mod progress;
 pub mod query;
 pub mod status_footer;
-pub mod tag_cloud;
 pub mod sections;
 pub mod sidebar;
 pub mod state;
