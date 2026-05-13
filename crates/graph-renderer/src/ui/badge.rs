@@ -39,6 +39,12 @@ pub enum BadgeAction {
     /// default click behaviour still emits `Toggle` so existing call
     /// sites (filter toggles) are unaffected.
     Clicked { field: String, value: String },
+    /// Emitted when the badge's explicit `+` affordance is clicked (the
+    /// caller opted into it via [`Badge::with_plus`]). Distinct from
+    /// `Toggle` so call sites can route body-clicks to "focus the node
+    /// this badge belongs to" and reserve `+` for "add this attribute
+    /// to the filter set".
+    AddFilter { field: String, value: String },
 }
 
 /// Selects the click semantics a [`Badge`] uses. Default is `Toggle`
@@ -57,6 +63,11 @@ pub struct Badge<'a> {
     pub kind: BadgeKind,
     pub active: bool,
     pub with_x: bool,
+    /// Adds an explicit `+` affordance on the trailing edge whose click
+    /// emits [`BadgeAction::AddFilter`]. Pairs with switching body-click
+    /// semantics via [`BadgeClickKind::Clicked`] so the body can drive
+    /// "focus this node" while `+` cleanly drives "add to filter".
+    pub with_plus: bool,
     pub small: bool,
     /// Override the per-kind base color. Used by the inspector + modal
     /// to tint every badge for a focused node with that node's
@@ -79,6 +90,7 @@ impl<'a> Badge<'a> {
             kind,
             active: false,
             with_x: false,
+            with_plus: false,
             small: false,
             override_color: None,
             click_kind: BadgeClickKind::Toggle,
@@ -108,6 +120,14 @@ impl<'a> Badge<'a> {
 
     pub fn with_x(mut self, with_x: bool) -> Self {
         self.with_x = with_x;
+        self
+    }
+
+    /// Show a trailing `+` whose click emits [`BadgeAction::AddFilter`].
+    /// Compose with [`Badge::click_kind`]`(BadgeClickKind::Clicked)` to
+    /// keep body-clicks distinct from filter-add.
+    pub fn with_plus(mut self, with_plus: bool) -> Self {
+        self.with_plus = with_plus;
         self
     }
 
@@ -168,7 +188,8 @@ impl<'a> Badge<'a> {
 
         let (pad_x, pad_y) = if self.small { (6.0, 2.0) } else { (10.0, 4.0) };
         let x_w = if self.with_x { 12.0 } else { 0.0 };
-        let total = Vec2::new(text_size.x + pad_x * 2.0 + x_w, text_size.y + pad_y * 2.0);
+        let plus_w = if self.with_plus { 12.0 } else { 0.0 };
+        let total = Vec2::new(text_size.x + pad_x * 2.0 + x_w + plus_w, text_size.y + pad_y * 2.0);
         let (rect, resp) = ui.allocate_exact_size(total, Sense::click());
         // Surface an accessible label so test harnesses (egui_kittest)
         // can find and synthesise clicks.
@@ -245,6 +266,46 @@ impl<'a> Badge<'a> {
         if x_clicked {
             // Treat ✕ as a toggle (which removes if currently active).
             return BadgeAction::Toggle {
+                field: self.field.to_string(),
+                value: self.value.to_string(),
+            };
+        }
+
+        // Optional + add-to-filter button. Sits to the left of ✕ when both
+        // are enabled, otherwise hugs the trailing edge.
+        let mut plus_clicked = false;
+        if self.with_plus {
+            // Trailing edge minus (✕ width if present) minus half-of-self.
+            let trailing_offset = if self.with_x { x_w } else { 0.0 };
+            let center_x =
+                rect.right() - pad_x - trailing_offset - plus_w / 2.0 + 4.0;
+            let plus_rect = egui::Rect::from_center_size(
+                egui::pos2(center_x, rect.center().y),
+                Vec2::new(plus_w, plus_w),
+            );
+            let plus_resp = ui.interact(
+                plus_rect,
+                ui.id().with(("badge-plus", self.field, self.value)),
+                Sense::click(),
+            );
+            let plus_color = if plus_resp.hovered() {
+                palette::WHITE
+            } else {
+                tint(fg, 0.7)
+            };
+            painter.text(
+                plus_rect.center(),
+                Align2::CENTER_CENTER,
+                "+",
+                crate::ui::theme::mono(crate::ui::theme::font_size::HEADING),
+                plus_color,
+            );
+            if plus_resp.clicked() {
+                plus_clicked = true;
+            }
+        }
+        if plus_clicked {
+            return BadgeAction::AddFilter {
                 field: self.field.to_string(),
                 value: self.value.to_string(),
             };

@@ -62,6 +62,12 @@ pub struct InspectorData<'a> {
     pub requested_navigate: &'a mut Option<String>,
     /// URL chip click → href to open in a new tab.
     pub requested_open_url: &'a mut Option<String>,
+    /// Badge body-click → node id to camera-focus + sidebar-update. For
+    /// non-link badges this is the currently-selected node (so the click
+    /// just slides the viewport over the node you're already reading
+    /// about); for wikilink/ticket badges it's the link target. The App
+    /// drains this into `focus_node_by_id`.
+    pub requested_focus_node: &'a mut Option<String>,
 }
 
 /// Render the inspector. Returns the outer screen-space `Rect` of the
@@ -400,8 +406,34 @@ fn show_metadata(ui: &mut egui::Ui, idx: u32, data: &InspectorData) {
     }
 }
 
+/// Route a single badge outcome into the inspector's out-channels.
+/// Mirrors the modal's `dispatch_badge` so call sites stay tiny.
+fn dispatch_inspector_badge(
+    action: crate::ui::badge::BadgeAction,
+    body_target: &str,
+    data: &mut InspectorData,
+) {
+    use crate::ui::badge::BadgeAction;
+    match action {
+        BadgeAction::Toggle { field, value } | BadgeAction::AddFilter { field, value } => {
+            *data.requested_filter_toggle = Some((field, value));
+        }
+        BadgeAction::Clicked { .. } => {
+            *data.requested_focus_node = Some(body_target.to_string());
+        }
+        BadgeAction::Navigate { target } => {
+            *data.requested_focus_node = Some(target.clone());
+            *data.requested_navigate = Some(target);
+        }
+        BadgeAction::OpenUrl { href } => {
+            *data.requested_open_url = Some(href);
+        }
+        BadgeAction::Hovered { .. } | BadgeAction::None => {}
+    }
+}
+
 fn show_badges(ui: &mut egui::Ui, idx: u32, data: &mut InspectorData) {
-    use crate::ui::badge::{Badge, BadgeAction, BadgeKind};
+    use crate::ui::badge::{Badge, BadgeClickKind, BadgeKind};
     // Single source of truth: the modal's NodeMeta cache for the
     // focused node (populated by `/node/:id` fetches). The inspector
     // and modal share this same record so the chip set stays in sync
@@ -460,36 +492,39 @@ fn show_badges(ui: &mut egui::Ui, idx: u32, data: &mut InspectorData) {
         // chip on most rows.
         ui.spacing_mut().item_spacing.x = 4.0;
         ui.spacing_mut().item_spacing.y = 4.0;
+        // Body-click on a content badge focuses the node the inspector
+        // is currently showing (camera + sticky highlight + sidebar
+        // refresh). The explicit `+` routes to the filter set.
+        let body_target = id.to_string();
         for tag in &meta.tags {
             let active = is_active("tags", tag);
-            if let BadgeAction::Toggle { field, value } =
-                maybe_tint(Badge::new("tags", tag, BadgeKind::Tag).active(active), community_tint)
-                    .show(ui)
-            {
-                *data.requested_filter_toggle = Some((field, value));
-            }
+            let b = maybe_tint(
+                Badge::new("tags", tag, BadgeKind::Tag).active(active),
+                community_tint,
+            )
+            .with_plus(true)
+            .click_kind(BadgeClickKind::Clicked);
+            dispatch_inspector_badge(b.show(ui), &body_target, data);
         }
         if let Some(dt) = &meta.doctype {
             let active = is_active("doctype", dt);
-            if let BadgeAction::Toggle { field, value } = maybe_tint(
+            let b = maybe_tint(
                 Badge::new("doctype", dt, BadgeKind::Doctype).active(active),
                 community_tint,
             )
-            .show(ui)
-            {
-                *data.requested_filter_toggle = Some((field, value));
-            }
+            .with_plus(true)
+            .click_kind(BadgeClickKind::Clicked);
+            dispatch_inspector_badge(b.show(ui), &body_target, data);
         }
         if !meta.folder.is_empty() {
             let active = is_active("folder", &meta.folder);
-            if let BadgeAction::Toggle { field, value } = maybe_tint(
+            let b = maybe_tint(
                 Badge::new("folder", &meta.folder, BadgeKind::Folder).active(active),
                 community_tint,
             )
-            .show(ui)
-            {
-                *data.requested_filter_toggle = Some((field, value));
-            }
+            .with_plus(true)
+            .click_kind(BadgeClickKind::Clicked);
+            dispatch_inspector_badge(b.show(ui), &body_target, data);
         }
         // Frontmatter chips — same detection rules the modal uses
         // (wikilinks, urls, status pills, dates, ticket ids, plain

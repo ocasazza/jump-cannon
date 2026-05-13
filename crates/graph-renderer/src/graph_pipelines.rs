@@ -568,6 +568,23 @@ impl GraphPipelines {
         Ok(())
     }
 
+    /// World-space position of node `idx` from the latest CPU mirror of
+    /// the GPU positions buffer. Returns `None` if the index is out of
+    /// range or positions haven't been seeded yet. Used by the badge →
+    /// focus-node flow to drive `Camera::look_at_point`.
+    pub fn position_of(&self, idx: u32) -> Option<glam::Vec3> {
+        let b = self.buffers.as_ref()?;
+        let base = idx as usize * 3;
+        if base + 2 >= b.positions_cpu.len() {
+            return None;
+        }
+        Some(glam::Vec3::new(
+            b.positions_cpu[base],
+            b.positions_cpu[base + 1],
+            b.positions_cpu[base + 2],
+        ))
+    }
+
     fn fit_to_loaded_bounds(&mut self) {
         let Some(b) = &self.buffers else { return };
         if b.positions_cpu.is_empty() {

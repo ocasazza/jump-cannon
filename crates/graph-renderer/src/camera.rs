@@ -87,6 +87,29 @@ impl Camera {
         self.position += f * factor;
     }
 
+    /// Re-aim the camera at `point` (no orientation change) while pulling
+    /// the position to `distance` along the current forward. Used by the
+    /// badge → focus-node flow so clicking a chip slides the viewport over
+    /// the corresponding node without rotating the user's chosen angle.
+    ///
+    /// `distance < znear` is clamped up; `distance.is_finite()` is required.
+    pub fn look_at_point(&mut self, point: Vec3, distance: f32) {
+        if !point.is_finite() || !distance.is_finite() {
+            return;
+        }
+        let d = distance.max(self.znear * 2.0);
+        let dir = self.forward();
+        self.position = point - dir * d;
+        // Snap yaw/pitch so forward exactly hits `point` even if `dir`
+        // came back not-quite-unit-length (precision creep over long
+        // sessions). One call into the same formula `forward()` uses.
+        let to = (point - self.position).normalize_or_zero();
+        if to != Vec3::ZERO {
+            self.pitch = to.y.asin();
+            self.yaw = to.z.atan2(to.x);
+        }
+    }
+
     pub fn fit_to_bounds(&mut self, min: Vec3, max: Vec3) {
         let center = (min + max) * 0.5;
         let radius = ((max - min) * 0.5).length().max(1.0);

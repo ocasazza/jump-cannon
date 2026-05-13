@@ -390,6 +390,46 @@ impl App {
         });
     }
 
+    /// Focus a node by id: slide the camera onto its world position, mark
+    /// it as the sticky-focused node (so community-dim/effects highlight
+    /// it), and refresh the modal/sidebar to show its details. No-op if
+    /// the id isn't in the loaded graph.
+    ///
+    /// Called from the badge → focus-node flow: every interactive badge
+    /// that knows what node it belongs to routes its body-click through
+    /// here so the user gets camera+sidebar+highlight in one motion.
+    fn focus_node_by_id(&mut self, frame: &mut eframe::Frame, id: &str) {
+        // Refresh the modal regardless of whether the camera move succeeds
+        // — the user expects clicking a badge to update the sidebar even
+        // if positions haven't streamed back yet.
+        self.kick_off_node_fetch(id.to_string());
+
+        let Some(&idx) = self.id_to_idx.get(id) else {
+            return;
+        };
+        self.focus_sticky_idx = Some(idx);
+
+        let Some(wgpu_state) = frame.wgpu_render_state() else {
+            return;
+        };
+        let mut renderer = wgpu_state.renderer.write();
+        let Some(pipes) = renderer.callback_resources.get_mut::<GraphPipelines>() else {
+            return;
+        };
+        let Some(pos) = pipes.position_of(idx) else {
+            return;
+        };
+        // Distance scales with graph radius so a small graph doesn't fly
+        // the camera way back and a huge graph still lets the node fill
+        // ~25% of the viewport. Falls back to a fixed value if bounds
+        // haven't been computed (eg. boot before first positions stream).
+        let distance = pipes
+            .bounds()
+            .map(|(mn, mx)| ((mx - mn) * 0.5).length().max(50.0) * 0.6)
+            .unwrap_or(500.0);
+        pipes.camera.look_at_point(pos, distance);
+    }
+
     /// Drain a completed `/graph/meta_summary` fetch and decode it into
     /// the local FieldIndex, if a result has landed.
     fn drain_field_index(&mut self) {
@@ -812,6 +852,7 @@ impl eframe::App for App {
             let mut requested_filter_toggle: Option<(String, String)> = None;
             let mut requested_navigate: Option<String> = None;
             let mut requested_open_url: Option<String> = None;
+            let mut requested_focus_node: Option<String> = None;
             {
                 // Surface frontmatter-derived chips for the focused node.
                 // The modal's `current` is populated by `/node/:id` fetches
@@ -839,6 +880,7 @@ impl eframe::App for App {
                     active_filters: &active_filters_snapshot,
                     requested_navigate: &mut requested_navigate,
                     requested_open_url: &mut requested_open_url,
+                    requested_focus_node: &mut requested_focus_node,
                 };
                 let inspector_rect = ui::inspector::show(ctx, &mut self.state, &mut data);
                 // Floating-mode leader line: when the inspector is a
@@ -861,7 +903,11 @@ impl eframe::App for App {
             if let Some((f, v)) = requested_filter_toggle {
                 self.state.query.toggle_field_filter(&f, &v);
             }
-            if let Some(target) = requested_navigate {
+            if let Some(id) = requested_focus_node {
+                // focus_node_by_id handles the modal refresh internally,
+                // so don't double-dispatch via `requested_navigate` below.
+                self.focus_node_by_id(frame, &id);
+            } else if let Some(target) = requested_navigate {
                 self.kick_off_node_fetch(target);
             }
             if let Some(href) = requested_open_url {
@@ -1076,7 +1122,13 @@ impl eframe::App for App {
             &self.state.query.active_filters,
             modal_tint,
         );
-        if let Some(target) = action.navigate_to {
+        // Prefer the focus_node channel — it folds camera + sidebar in one
+        // helper. Fall back to plain navigate (kick a fetch only) when the
+        // modal didn't tag a focus target (e.g. ticket-id chips that don't
+        // resolve to a graph node).
+        if let Some(id) = action.focus_node {
+            self.focus_node_by_id(frame, &id);
+        } else if let Some(target) = action.navigate_to {
             self.kick_off_node_fetch(target);
         }
         if let Some((field, value)) = action.toggle_filter {

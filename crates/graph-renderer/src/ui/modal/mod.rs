@@ -19,7 +19,7 @@ use eframe::egui;
 use serde_json::Value;
 
 use crate::proto;
-use crate::ui::badge::{Badge, BadgeAction, BadgeKind};
+use crate::ui::badge::{Badge, BadgeAction, BadgeClickKind, BadgeKind};
 use crate::ui::theme::accent;
 
 use badges::{date_badge, plain_badge, status_color, status_pill, ticket_badge};
@@ -40,6 +40,11 @@ pub struct ModalAction {
     pub navigate_to: Option<String>,
     pub toggle_filter: Option<(String, String)>,
     pub open_url: Option<String>,
+    /// A badge body was clicked (or a wikilink resolved). The App should
+    /// camera-center on this node id + sticky-focus it. Set by either
+    /// non-link badge body-clicks (target = the currently-displayed
+    /// modal node) or wikilink/ticket badges (target = the link target).
+    pub focus_node: Option<String>,
 }
 
 impl ModalAction {
@@ -48,7 +53,36 @@ impl ModalAction {
             navigate_to: None,
             toggle_filter: None,
             open_url: None,
+            focus_node: None,
         }
+    }
+}
+
+/// Route a single badge's outcome into the right [`ModalAction`] slot.
+/// `body_target` is the node id that a body-click should focus when the
+/// badge isn't a Wikilink/Url (eg. clicking a tag chip in the modal sets
+/// the camera onto the node the modal is currently showing).
+fn dispatch_badge(action: BadgeAction, body_target: &str, out: &mut ModalAction) {
+    match action {
+        BadgeAction::Toggle { field, value } => {
+            out.toggle_filter = Some((field, value));
+        }
+        BadgeAction::AddFilter { field, value } => {
+            out.toggle_filter = Some((field, value));
+        }
+        BadgeAction::Clicked { .. } => {
+            out.focus_node = Some(body_target.to_string());
+        }
+        BadgeAction::Navigate { target } => {
+            // The App folds focus + sidebar update into one helper, so we
+            // ship Navigate through the same focus_node channel.
+            out.focus_node = Some(target.clone());
+            out.navigate_to = Some(target);
+        }
+        BadgeAction::OpenUrl { href } => {
+            out.open_url = Some(href);
+        }
+        BadgeAction::Hovered { .. } | BadgeAction::None => {}
     }
 }
 
@@ -128,6 +162,11 @@ pub fn show_modal_with(
                 None => b,
             }
         }
+        // Body-click on any of these badges focuses the node the modal
+        // is currently showing (camera + sidebar sync). The explicit `+`
+        // affordance routes to the filter set without overloading body
+        // semantics. See `dispatch_badge`.
+        let body_target = meta.id.clone();
         // tag list (top)
         if !meta.tags.is_empty() {
             ui.horizontal_wrapped(|ui| {
@@ -137,10 +176,10 @@ pub fn show_modal_with(
                         .get("tags")
                         .map(|s| s.contains(tag))
                         .unwrap_or(false);
-                    let b = tint(Badge::new("tags", tag, BadgeKind::Tag).active(active), community_tint);
-                    if let BadgeAction::Toggle { field, value } = b.show(ui) {
-                        action.toggle_filter = Some((field, value));
-                    }
+                    let b = tint(Badge::new("tags", tag, BadgeKind::Tag).active(active), community_tint)
+                        .with_plus(true)
+                        .click_kind(BadgeClickKind::Clicked);
+                    dispatch_badge(b.show(ui), &body_target, &mut action);
                 }
             });
             ui.separator();
@@ -153,11 +192,10 @@ pub fn show_modal_with(
                     .get("doctype")
                     .map(|s| s.contains(dt))
                     .unwrap_or(false);
-                if let BadgeAction::Toggle { field, value } =
-                    tint(Badge::new("doctype", dt, BadgeKind::Doctype).active(active), community_tint).show(ui)
-                {
-                    action.toggle_filter = Some((field, value));
-                }
+                let b = tint(Badge::new("doctype", dt, BadgeKind::Doctype).active(active), community_tint)
+                    .with_plus(true)
+                    .click_kind(BadgeClickKind::Clicked);
+                dispatch_badge(b.show(ui), &body_target, &mut action);
             }
             if !meta.folder.is_empty() {
                 let active = filters
@@ -165,15 +203,13 @@ pub fn show_modal_with(
                     .get("folder")
                     .map(|s| s.contains(&meta.folder))
                     .unwrap_or(false);
-                if let BadgeAction::Toggle { field, value } =
-                    tint(
-                        Badge::new("folder", &meta.folder, BadgeKind::Folder).active(active),
-                        community_tint,
-                    )
-                    .show(ui)
-                {
-                    action.toggle_filter = Some((field, value));
-                }
+                let b = tint(
+                    Badge::new("folder", &meta.folder, BadgeKind::Folder).active(active),
+                    community_tint,
+                )
+                .with_plus(true)
+                .click_kind(BadgeClickKind::Clicked);
+                dispatch_badge(b.show(ui), &body_target, &mut action);
             }
         });
         ui.separator();
@@ -304,9 +340,10 @@ fn render_string_value(
                 target: page.clone(),
             },
         );
-        if let BadgeAction::Navigate { target } = b.show(ui) {
-            action.navigate_to = Some(target);
-        }
+        // body_target is unused for Wikilink (dispatch routes Navigate
+        // directly via the target it carries); pass `trimmed` as a stable
+        // placeholder.
+        dispatch_badge(b.show(ui), trimmed, action);
         return;
     }
 
@@ -321,9 +358,7 @@ fn render_string_value(
                 host,
             },
         );
-        if let BadgeAction::OpenUrl { href } = b.show(ui) {
-            action.open_url = Some(href);
-        }
+        dispatch_badge(b.show(ui), trimmed, action);
         return;
     }
 
