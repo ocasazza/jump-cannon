@@ -458,6 +458,31 @@ fn force_step(@builtin(global_invocation_id) gid: vec3<u32>) {
     let m = max(mass[i], 1.0);
     let accel = force / m;
     vel = (vel + accel * params.dt) * params.damping;
+
+    // Velocity clamp — belt-and-suspenders to the dist² floor above. The
+    // floor caps any *single-pair* repulsion, but a compact cluster of N
+    // close pairs still sums to O(N · max-pair-force) of acceleration per
+    // step. Without this cap the cluster shotguns outward by thousands of
+    // units per step (user saw this as "screen turns black on
+    // energy_threshold=0"). Bound the per-step displacement at one
+    // spring-length: `|vel * dt| ≤ spring_len` ⟹ `|vel| ≤ spring_len/dt`.
+    // Layout still moves freely — equilibrium positions are independent of
+    // the cap; only the speed at which the integrator approaches them is
+    // bounded.
+    let v_max = params.spring_len / max(params.dt, 1e-6);
+    let v_mag = length(vel);
+    if (v_mag > v_max) {
+        vel = vel * (v_max / v_mag);
+    }
+
+    // NaN/Inf guard — if anything upstream produced a non-finite value
+    // (degenerate normalize on a zero vector, etc.), drop velocity to
+    // zero rather than carry NaN forward and poison every subsequent
+    // step through cell sharing.
+    if (!all(vel == vel)) {  // wgsl: !(v == v) is the canonical NaN check
+        vel = vec3<f32>(0.0, 0.0, 0.0);
+    }
+
     let new_pos = pos + vel * params.dt;
 
     velocities[i] = vel;

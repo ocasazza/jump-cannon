@@ -505,11 +505,17 @@ pub fn seed_positions(
     // relax passes at each level dominate the final shape.
     let bootstrap = seeded_random_positions(n_nodes, spring_len, seed);
 
-    // Coarsening below ~64 nodes is pointless overhead — fall back to FR
-    // on the bootstrap directly.
-    if n_nodes < 64 {
+    // Coarsening below ~8 nodes is genuinely pointless — there's no
+    // hierarchy to build. Above that, even a single coarsening step
+    // visibly differs from the Random seed's relaxed ball, which is what
+    // the user expects when picking SeedMode::TopoFisheye. The previous
+    // threshold (<64) silently demoted small vaults to "random + 200 FR
+    // steps", indistinguishable from `SeedMode::Random`. The
+    // `build_hierarchy` recursion stops on its own when the coarsest
+    // level hits `params.target_size`, so we don't waste work either way.
+    if n_nodes < 8 {
         let mut p = bootstrap;
-        let radius = (n_nodes as f32).sqrt() * spring_len;
+        let radius = (n_nodes as f32).sqrt() * spring_len.max(1.0);
         cpu_fr_layout(&mut p, n_nodes, edges, radius, 200);
         return p;
     }

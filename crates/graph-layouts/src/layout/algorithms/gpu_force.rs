@@ -3300,6 +3300,119 @@ mod tests {
         let back: GpuForceOptions = serde_json::from_str(&json).expect("deserialize");
         assert!(matches!(back.seed_mode, SeedMode::TopoFisheye));
     }
+
+    // ---- Compact-seed stability ------------------------------------------
+    //
+    // Regression for "screen turns black on energy_threshold=0" and
+    // "force-directed physics isn't working". The other tests in this
+    // module either lower `repulsion` to 50-200 (`unit_gpu_force_*`) or
+    // start with a wide-spread position field (`random_graph`), so the
+    // catastrophic compact-seed × default-repulsion regime was never
+    // exercised. These two tests *do* exercise it.
+
+    fn ring_topology_graph(n: usize, spread_radius: f32) -> Graph {
+        // Compact pre-seeded positions to mimic a TopoFisheye §5 layout
+        // (multilevel coarsen + relax produces a tight cluster). Ring
+        // edges so every node has degree 2 — non-degenerate but cheap.
+        let mut g = Graph::new();
+        for i in 0..n {
+            let mut node = Node::new(format!("n{:04}", i));
+            let theta = (i as f32) / (n as f32) * std::f32::consts::TAU;
+            node.position3 = Some([
+                spread_radius * theta.cos(),
+                spread_radius * theta.sin(),
+                spread_radius * 0.1 * (i as f32 * 0.37).sin(),
+            ]);
+            g.add_node(node);
+        }
+        for i in 0..n {
+            let j = (i + 1) % n;
+            g.add_edge(Edge::new(
+                format!("e{i}"),
+                format!("n{:04}", i),
+                format!("n{:04}", j),
+            ));
+        }
+        g
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn unit_gpu_force_compact_seed_does_not_explode() {
+        // 100 nodes packed in a ~5-unit ball — the same regime a fresh
+        // TopoFisheye seed puts the layout in for a sub-100-node vault.
+        // Run the *default* GpuForceOptions (repulsion=4000, dt=0.1) for
+        // 32 steps and verify positions stay finite and bounded.
+        let mut graph = ring_topology_graph(100, 5.0);
+        let mut layout = GpuForceLayout::new(GpuForceOptions {
+            steps_per_call: 32,
+            ..Default::default()
+        });
+        if let Err(e) = layout.run(&mut graph).await {
+            eprintln!("skipping: {e}");
+            return;
+        }
+        let mut max_mag: f32 = 0.0;
+        let mut all_finite = true;
+        for id in graph.nodes.keys().cloned().collect::<Vec<_>>() {
+            let p = graph.nodes[&id].position3.expect("position3 set");
+            for c in p {
+                if !c.is_finite() {
+                    all_finite = false;
+                }
+                max_mag = max_mag.max(c.abs());
+            }
+        }
+        assert!(all_finite, "non-finite positions after compact-seed run");
+        // 1e4 is generous — `spring_len * 25` covers fully spread-out
+        // equilibria with headroom but rules out the "fly to infinity"
+        // failure mode (where 1e10+ appears within ~50 steps).
+        assert!(
+            max_mag < 1e4,
+            "compact seed exploded: max|p|={max_mag} (expected < 1e4)"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn unit_gpu_force_coincident_seed_recovers() {
+        // Tightest stress on the dist² floor + velocity clamp: every node
+        // starts at the origin. Whatever forces fire on step 1 must not
+        // produce NaN/Inf; the layout should spread to a non-trivial
+        // configuration within the integration budget.
+        let mut graph = ring_topology_graph(64, 0.0);
+        // Manually zero every position3 to be exact.
+        for id in graph.nodes.keys().cloned().collect::<Vec<_>>() {
+            if let Some(n) = graph.nodes.get_mut(&id) {
+                n.position3 = Some([0.0, 0.0, 0.0]);
+            }
+        }
+        let mut layout = GpuForceLayout::new(GpuForceOptions {
+            steps_per_call: 32,
+            ..Default::default()
+        });
+        if let Err(e) = layout.run(&mut graph).await {
+            eprintln!("skipping: {e}");
+            return;
+        }
+        let mut all_finite = true;
+        let mut max_mag: f32 = 0.0;
+        for id in graph.nodes.keys().cloned().collect::<Vec<_>>() {
+            let p = graph.nodes[&id].position3.expect("position3 set");
+            for c in p {
+                if !c.is_finite() {
+                    all_finite = false;
+                }
+                max_mag = max_mag.max(c.abs());
+            }
+        }
+        assert!(
+            all_finite,
+            "coincident seed produced NaN/Inf — dist² floor / velocity clamp insufficient"
+        );
+        assert!(
+            max_mag < 1e4,
+            "coincident seed exploded: max|p|={max_mag}"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
