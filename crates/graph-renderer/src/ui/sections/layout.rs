@@ -69,6 +69,33 @@ pub fn show(ui: &mut egui::Ui, state: &mut AppState, registry: &LayoutRegistry) 
                 }
             });
         }
+        // Physics layouts: a Wake button gives the user a recovery
+        // path when the auto-halt has triggered (KE under threshold
+        // for HALT_FRAMES consecutive readbacks). Without this, the
+        // only way to reignite a halted sim was to touch a non-cursor
+        // slider, which forces `set_options` to call `wake()`. Hitting
+        // the dedicated button is more discoverable and doesn't
+        // require nudging an unrelated knob.
+        if matches!(factory.kind(), graph_layouts::LayoutKind::Physics) {
+            subgroup_separator(ui);
+            ui.horizontal(|ui| {
+                if ui
+                    .button("Wake")
+                    .on_hover_text(
+                        "Re-energize the sim. Useful when the layout looks frozen \
+                         (KE below energy_threshold → auto-halt fired).",
+                    )
+                    .clicked()
+                {
+                    // `layout_solve_requested` is a one-shot flag drained
+                    // by `App::update`. For physics layouts the handler
+                    // routes the flag into `pipes.wake_physics_layout()`,
+                    // which forwards through the trait to the layout's
+                    // `wake()` impl.
+                    state.layout_solve_requested = true;
+                }
+            });
+        }
     } else {
         ui.label(egui::RichText::new(
             "No layout registered for active id — pick one above.",

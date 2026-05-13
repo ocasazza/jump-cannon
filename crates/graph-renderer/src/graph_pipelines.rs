@@ -1177,6 +1177,17 @@ impl GraphPipelines {
         }
     }
 
+    /// Force a halted physics layout back to running. Forwards through
+    /// to the layout's trait-side `wake()`, which resets the halt
+    /// streak + restores `effective_damping` to the user's configured
+    /// `damping` so the cooling schedule starts fresh. No-op if no
+    /// physics layout is mounted.
+    pub fn wake_physics_layout(&mut self) {
+        let Some(b) = self.buffers.as_mut() else { return };
+        let Some(l) = b.layout.as_mut() else { return };
+        l.wake();
+    }
+
     /// Backward-compat wrapper. TODO(layout-step-3): drop in favour of
     /// the JSON path once `app.rs` and `web.rs` (legacy renderer) no
     /// longer need typed `GpuForceOptions`.

@@ -327,6 +327,20 @@ impl GpuForceOptions {
         o.spring_len = len;
         o.repulsion  = repl;
         o.repulsion_radius = (4.0 * len).max(160.0);
+        // Scale the auto-halt energy threshold with the layout's
+        // natural length. The fixed default (0.05) was tuned for the
+        // ~10k-node anchor where `spring_len=400` and per-node KE
+        // routinely lands in the 1-10 range during the relax phase.
+        // On a small vault (`spring_len ~ 40`) KE never reaches that
+        // threshold, so the sim halts after `HALT_GRACE_STEPS` while
+        // still in the early everything-uniform phase — the user sees
+        // a frozen layout that "isn't moving."
+        //
+        // 1e-4 × spring_len matches the floor scale used in
+        // `force.wgsl::dist2_floor` (`spring_len² × 1e-4`) so a node
+        // that hasn't moved more than a small fraction of one spring
+        // length per step is what counts as "settled."
+        o.energy_threshold = (len * 1.0e-4).max(1.0e-6);
         o
     }
 }

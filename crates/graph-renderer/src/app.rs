@@ -1640,6 +1640,15 @@ impl App {
                         } else {
                             pipes.set_physics_layout_settings_json(&json_owned);
                         }
+                        // Physics-side Wake button reuses the
+                        // `layout_solve_requested` one-shot flag (we
+                        // share the channel between Solve and Wake to
+                        // avoid threading another bool through the
+                        // sidebar). For physics layouts the flag means
+                        // "reignite": call wake() on the active layout.
+                        if solve_requested {
+                            pipes.wake_physics_layout();
+                        }
                     }
                     graph_layouts::LayoutKind::Static => {
                         // Solve when the algorithm just changed to a static
