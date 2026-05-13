@@ -119,6 +119,53 @@ impl ColorBy {
     }
 }
 
+/// What attribute decides each node's rendered glyph shape.
+///
+/// Default `Doctype` so notes, code, and image nodes are visually
+/// distinguishable at a glance even when colour is being used for a
+/// different signal (community / folder / recency). The mapping from
+/// category bucket → primitive shape is handled by
+/// [`crate::data::shapes_from_metric`] (`value_hash % n_shapes`).
+///
+/// `Uniform` (every node is a circle) is the opt-out so a user who
+/// finds mixed-shape rendering noisy can fall back to disc-only.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub enum ShapeBy {
+    #[default]
+    Doctype,
+    Community,
+    Folder,
+    Uniform,
+}
+
+impl ShapeBy {
+    pub const ALL: &'static [ShapeBy] = &[
+        ShapeBy::Doctype,
+        ShapeBy::Community,
+        ShapeBy::Folder,
+        ShapeBy::Uniform,
+    ];
+    pub fn label(self) -> &'static str {
+        match self {
+            ShapeBy::Doctype => "Doctype",
+            ShapeBy::Community => "Community",
+            ShapeBy::Folder => "Folder",
+            ShapeBy::Uniform => "Uniform",
+        }
+    }
+    /// `Bootstrap.metrics` key for the underlying categorical metric.
+    /// `Uniform` returns the `"uniform"` sentinel that
+    /// [`crate::data::shapes_from_metric`] short-circuits to shape-id 0.
+    pub fn metric_key(self) -> &'static str {
+        match self {
+            ShapeBy::Doctype => "doctype",
+            ShapeBy::Community => "community",
+            ShapeBy::Folder => "folder",
+            ShapeBy::Uniform => "uniform",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Default, Hash)]
 pub enum EdgeColorBy {
     /// Use the uniform `edge_color` (existing behaviour).
@@ -160,6 +207,11 @@ impl EdgeColorBy {
 pub struct StyleState {
     pub size_by: SizeBy,
     pub color_by: ColorBy,
+    /// Categorical attribute that drives per-node sprite shape.
+    /// `#[serde(default)]` so pre-shape persisted state keeps loading
+    /// (defaults to `ShapeBy::Doctype`, i.e. doctype-keyed glyphs).
+    #[serde(default)]
+    pub shape_by: ShapeBy,
     /// Per-edge categorical tinting. `None` keeps the existing uniform
     /// `edge_color` behaviour. Default `None` so persisted state and
     /// existing users see no visual change.
@@ -227,6 +279,7 @@ impl Default for StyleState {
         Self {
             size_by: SizeBy::default(),
             color_by: ColorBy::default(),
+            shape_by: ShapeBy::default(),
             edge_color_by: EdgeColorBy::default(),
             // 0.5 = 0.67 × 0.75 rounded to a clean slider value (user
             // requested ~25% smaller default node size).

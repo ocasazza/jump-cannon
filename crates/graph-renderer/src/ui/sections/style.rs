@@ -1,7 +1,7 @@
 use eframe::egui;
 
 use crate::data::PaletteId;
-use crate::ui::state::{AppState, ColorBy, EdgeColorBy, SizeBy};
+use crate::ui::state::{AppState, ColorBy, EdgeColorBy, ShapeBy, SizeBy};
 
 use super::{reset_row, row};
 
@@ -26,6 +26,16 @@ pub fn show(ui: &mut egui::Ui, state: &mut AppState) {
             .show_ui(ui, |ui| {
                 for &v in ColorBy::ALL {
                     ui.selectable_value(&mut state.style.color_by, v, v.label());
+                }
+            });
+    });
+
+    row(ui, "Shape by", |ui| {
+        egui::ComboBox::from_id_salt("style-shape-by")
+            .selected_text(state.style.shape_by.label())
+            .show_ui(ui, |ui| {
+                for &v in ShapeBy::ALL {
+                    ui.selectable_value(&mut state.style.shape_by, v, v.label());
                 }
             });
     });

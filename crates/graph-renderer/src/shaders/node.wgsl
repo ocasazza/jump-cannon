@@ -54,6 +54,10 @@ struct EffectsUniform {
 // set or no focus active), <1.0 = dimmed because focus mode is active
 // and this node isn't in the focused community.
 @group(0) @binding(5) var<storage, read> dim_alpha: array<f32>;
+// Per-node shape primitive id. 0=circle, 1=square, 2=triangle,
+// 3=diamond, 4=hexagon. Forwarded as a flat-interpolated vertex output
+// so the fragment SDF switch is uniform across the sprite quad.
+@group(0) @binding(6) var<storage, read> shape_ids: array<u32>;
 
 struct VertexOutput {
     @builtin(position) clip_pos: vec4<f32>,
@@ -61,6 +65,7 @@ struct VertexOutput {
     @location(1) color:     vec4<f32>,
     @location(2) world_z:   f32,
     @location(3) coc_ratio: f32,  // base / effective; 1 = sharp, <1 = bokeh
+    @location(4) @interpolate(flat) shape_id: u32,
 };
 
 @vertex
@@ -89,6 +94,7 @@ fn vs_main(
     out.uv = corner;
     out.color = inst_color;
     out.world_z = inst_pos.z;
+    out.shape_id = shape_ids[iid];
 
     // Cheap rejects first — no transform math required for invisible
     // nodes. Saves a 4×4 mat-vec on culled instances.
@@ -129,16 +135,53 @@ fn vs_main(
     return out;
 }
 
+// Per-shape signed-distance value normalised so `< 1.0` is interior,
+// `1.0` is the edge, `> 1.0` is outside. All SDFs are computed in the
+// quad's [-1, 1] uv space; size scaling lives entirely in the vertex
+// stage. Using a single scalar lets the existing AA smoothstep work
+// uniformly across shapes.
+fn shape_sdf(uv: vec2<f32>, shape_id: u32) -> f32 {
+    // 0: Circle — historical default.
+    if (shape_id == 0u) {
+        return length(uv);
+    }
+    // 1: Square — axis-aligned, fills the quad.
+    if (shape_id == 1u) {
+        return max(abs(uv.x), abs(uv.y));
+    }
+    // 2: Triangle — equilateral, point-up. Constants are 1/cos(30°)
+    // and tan(30°) so the triangle inscribes the unit disc.
+    if (shape_id == 2u) {
+        let k = 1.1547005;  // 2 / sqrt(3) — scales so apex sits at uv.y = 1.
+        let q = vec2<f32>(abs(uv.x) - 0.5 * (1.0 - uv.y), -uv.y);
+        // Signed distance to the triangle, normalised so the bounding
+        // disc maps to ~[0, 1.05]. Bounded below by 0 to avoid negative
+        // SDF inside (the AA smoothstep only cares about the edge band).
+        return max(q.x * 0.8660254 + q.y * 0.5, -uv.y) * k;
+    }
+    // 3: Diamond — L1 / taxicab distance.
+    if (shape_id == 3u) {
+        return abs(uv.x) + abs(uv.y);
+    }
+    // 4: Hexagon — point-up, flat top/bottom.
+    if (shape_id == 4u) {
+        let q = abs(uv);
+        return max(q.x * 0.8660254 + q.y * 0.5, q.y);
+    }
+    // Unknown shape id — fall back to circle.
+    return length(uv);
+}
+
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
-    let r = length(in.uv);
+    let r = shape_sdf(in.uv, in.shape_id);
     if (r > 1.0) {
         discard;
     }
 
     // DoF is "off" by default — focus_thickness is set to ~1e9 so the
     // whole scene sits inside the focus band. In that mode every node
-    // takes the sharp path (cosmograph-style hard SDF disc, no halo).
+    // takes the sharp path (cosmograph-style hard SDF, no halo).
     // Bokeh only kicks in when the caller explicitly narrows the band.
     let dof_engaged = effects.focus_thickness < 1.0e6;
     if (!dof_engaged || in.coc_ratio > 0.985) {

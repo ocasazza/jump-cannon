@@ -574,9 +574,104 @@ pub fn sizes_from_metric(
     out
 }
 
+/// Number of distinct sprite primitives the node fragment shader knows
+/// how to draw. Kept small (5) so that even on graphs with many
+/// communities/folders each glyph stays visually distinct rather than
+/// degenerating into "lots of similar quads". The current intended
+/// mapping is:
+///
+/// | shape-id | primitive  |
+/// |----------|------------|
+/// | 0        | circle     |
+/// | 1        | square     |
+/// | 2        | triangle   |
+/// | 3        | diamond    |
+/// | 4        | hexagon    |
+///
+/// Consumed by [`shapes_from_metric`]; the WGSL switch on shape-id is
+/// the GPU-side follow-up (see report).
+pub const N_NODE_SHAPES: u32 = 5;
+
+/// Build a per-node shape-id buffer (`u32`-per-node) from a categorical
+/// metric. Each distinct bucket gets `bucket % N_NODE_SHAPES`, so e.g.
+/// markdown=0 (circle), code=1 (square), image=2 (triangle), … under
+/// `ShapeBy::Doctype`.
+///
+/// `"uniform"` short-circuits to all-zero (every node a disc). Missing
+/// or undersized metric → all zeros (graceful: matches today's disc
+/// behaviour). Non-finite values are clamped to bucket 0.
+///
+/// Returning `Vec<u32>` (rather than packing into the existing colors /
+/// sizes buffers) keeps the data flow explicit on the CPU side. The
+/// GPU-side follow-up can either:
+///   (a) upload it as a fifth storage buffer (puts node pipeline at
+///       binding(6) — within the 10-buffer per-stage cap, see
+///       `2425ca20`'s headroom note), or
+///   (b) pack low-byte of an existing `u32` style attribute, which
+///       requires widening one of the f32 buffers first; not worth it
+///       at this graph size.
+pub fn shapes_from_metric(
+    metric_key: &str,
+    metrics: &std::collections::HashMap<String, Vec<f32>>,
+    n: usize,
+) -> Vec<u32> {
+    if metric_key == "uniform" {
+        return vec![0u32; n];
+    }
+    let Some(v) = metrics.get(metric_key) else {
+        return vec![0u32; n];
+    };
+    if v.len() < n {
+        return vec![0u32; n];
+    }
+    let mut out = Vec::with_capacity(n);
+    for &x in v.iter().take(n) {
+        let bucket = if x.is_finite() { x.max(0.0) as u32 } else { 0 };
+        out.push(bucket % N_NODE_SHAPES);
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shapes_from_metric_uniform_is_all_zero() {
+        let metrics = std::collections::HashMap::new();
+        let out = shapes_from_metric("uniform", &metrics, 8);
+        assert_eq!(out, vec![0; 8]);
+    }
+
+    #[test]
+    fn shapes_from_metric_missing_metric_falls_back_to_zero() {
+        let metrics = std::collections::HashMap::new();
+        let out = shapes_from_metric("doctype", &metrics, 4);
+        assert_eq!(out, vec![0; 4]);
+    }
+
+    #[test]
+    fn shapes_from_metric_cycles_modulo_n_shapes() {
+        let mut metrics = std::collections::HashMap::new();
+        // Buckets 0,1,2,3,4,5,6 → 0,1,2,3,4,0,1 with N_NODE_SHAPES=5.
+        metrics.insert(
+            "doctype".to_string(),
+            vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+        );
+        let out = shapes_from_metric("doctype", &metrics, 7);
+        assert_eq!(out, vec![0, 1, 2, 3, 4, 0, 1]);
+    }
+
+    #[test]
+    fn shapes_from_metric_handles_non_finite() {
+        let mut metrics = std::collections::HashMap::new();
+        metrics.insert(
+            "doctype".to_string(),
+            vec![f32::NAN, f32::INFINITY, -1.0, 2.0],
+        );
+        let out = shapes_from_metric("doctype", &metrics, 4);
+        assert_eq!(out, vec![0, 0, 0, 2]);
+    }
 
     #[test]
     fn fibonacci_sphere_is_on_shell() {

@@ -17,7 +17,7 @@ use crate::ui::focus_set::{self, FocusCtx, FocusMode};
 use crate::ui::layout::registry::LayoutRegistry;
 use crate::ui::progress::{Progress, ProgressSink};
 use crate::ui::query::EvalContext;
-use crate::ui::state::{ColorBy, EdgeColorBy, FontFamilyChoice, SizeBy};
+use crate::ui::state::{ColorBy, EdgeColorBy, FontFamilyChoice, ShapeBy, SizeBy};
 use graph_layouts::{warmup_positions, GpuForceOptions, SeedMode};
 
 /// Translate a UI multiplier slider value into the actual scalar applied
@@ -77,7 +77,7 @@ pub struct App {
     search_inflight: HashSet<String>,
 
     // -- "previous-frame" trackers used to gate GPU writes -----------------
-    prev_style_key: Option<(SizeBy, ColorBy, u32, u32, EdgeColorBy, [u32; 4], crate::data::PaletteId)>,
+    prev_style_key: Option<(SizeBy, ColorBy, ShapeBy, u32, u32, EdgeColorBy, [u32; 4], crate::data::PaletteId)>,
     prev_layout_key: Option<u64>,
     /// Last-applied gpu-force seed mode. `set_options` only updates the
     /// option struct in place — it does **not** re-run `precompute`, so a
@@ -1376,11 +1376,12 @@ impl App {
         }
     }
 
-    fn style_key(&self) -> (SizeBy, ColorBy, u32, u32, EdgeColorBy, [u32; 4], crate::data::PaletteId) {
+    fn style_key(&self) -> (SizeBy, ColorBy, ShapeBy, u32, u32, EdgeColorBy, [u32; 4], crate::data::PaletteId) {
         let ec = self.state.style.edge_color;
         (
             self.state.style.size_by,
             self.state.style.color_by,
+            self.state.style.shape_by,
             self.state.style.size_mul.to_bits(),
             (self.state.style.log_scale_size as u32),
             self.state.style.edge_color_by,
@@ -1437,12 +1438,18 @@ impl App {
             n,
             apply_size_scale(self.state.style.size_mul, self.state.style.log_scale_size),
         );
+        let shapes = data::shapes_from_metric(
+            self.state.style.shape_by.metric_key(),
+            &self.metrics,
+            n,
+        );
         let edge_color_by = self.state.style.edge_color_by;
         let edge_fallback = self.state.style.edge_color;
         let mut renderer = wgpu_state.renderer.write();
         if let Some(pipes) = renderer.callback_resources.get_mut::<GraphPipelines>() {
             pipes.update_colors(&queue, colors);
             pipes.update_sizes(&queue, sizes);
+            pipes.update_shape_ids(&queue, shapes);
             // Edge colors: when EdgeColorBy::None, push an all-1.0 buffer
             // so the uniform `edge_color` rules unchanged. Otherwise build
             // per-edge tints from the chosen categorical metric.

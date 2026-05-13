@@ -189,6 +189,11 @@ struct Buffers {
     /// All-1.0 when `EdgeColorBy::None` so the uniform `edge_color`
     /// rules unchanged.
     edge_colors: wgpu::Buffer,
+    /// Per-node shape primitive id (u32 each). 0 = circle (default),
+    /// 1 = square, 2 = triangle, 3 = diamond, 4 = hexagon. Indexes
+    /// the switch in `node.wgsl::fs_main`. Driven by the user's
+    /// `StyleState::shape_by` choice via `data::shapes_from_metric`.
+    shape_ids: wgpu::Buffer,
     n_nodes: u32,
     n_edges: u32,
     camera_uniform: wgpu::Buffer,
@@ -245,6 +250,10 @@ impl GraphPipelines {
                 ro_storage_entry(3, wgpu::ShaderStages::VERTEX),
                 ro_storage_entry(4, wgpu::ShaderStages::VERTEX),
                 ro_storage_entry(5, wgpu::ShaderStages::VERTEX),
+                // Per-node shape primitive id (u32). Vertex stage reads
+                // it and forwards as `@interpolate(flat) shape_id` to the
+                // fragment SDF switch.
+                ro_storage_entry(6, wgpu::ShaderStages::VERTEX),
             ],
         });
         let edge_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -478,6 +487,17 @@ impl GraphPipelines {
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
         });
 
+        // Per-node shape primitive id. Default: all-zero (circle), so
+        // the initial render matches the historical disc-only look.
+        // `App::apply_style_to_gpu` writes a real shape buffer derived
+        // from `StyleState::shape_by` on the first frame that mounts.
+        let shape_ids_init: Vec<u32> = vec![0_u32; n_nodes.max(1) as usize];
+        let shape_ids_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("shape_ids_storage"),
+            contents: bytemuck::cast_slice(&shape_ids_init),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        });
+
         let node_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("node bg"),
             layout: &self.node_bgl,
@@ -488,6 +508,7 @@ impl GraphPipelines {
                 bg_entry(3, &colors_buf),
                 bg_entry(4, &sizes_buf),
                 bg_entry(5, &dim_alpha_buf),
+                bg_entry(6, &shape_ids_buf),
             ],
         });
         let edge_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -540,6 +561,7 @@ impl GraphPipelines {
             sizes: sizes_buf,
             edges: edges_buf,
             edge_colors: edge_colors_buf,
+            shape_ids: shape_ids_buf,
             n_nodes,
             n_edges,
             camera_uniform,
@@ -1001,6 +1023,22 @@ impl GraphPipelines {
         b.sizes_base = sizes.clone();
         b.sizes_cpu = sizes.clone();
         queue.write_buffer(&b.sizes, 0, bytemuck::cast_slice(&sizes));
+    }
+
+    /// Replace the per-node shape primitive id buffer. Length must
+    /// equal `n_nodes`. Driven by `StyleState::shape_by` →
+    /// `data::shapes_from_metric` whenever the style key changes.
+    pub fn update_shape_ids(&mut self, queue: &wgpu::Queue, shapes: Vec<u32>) {
+        let Some(b) = self.buffers.as_mut() else { return };
+        if shapes.len() != b.n_nodes as usize {
+            log::warn!(
+                "[graph-renderer] update_shape_ids: len {} != n {}",
+                shapes.len(),
+                b.n_nodes
+            );
+            return;
+        }
+        queue.write_buffer(&b.shape_ids, 0, bytemuck::cast_slice(&shapes));
     }
 
     /// Apply a per-node alpha multiplier from the query selection. When
