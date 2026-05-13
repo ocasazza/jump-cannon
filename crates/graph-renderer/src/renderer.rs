@@ -145,15 +145,24 @@ impl Renderer {
             .await
             .ok_or_else(|| "no compatible adapter".to_string())?;
 
-        // The compute pipeline binds 9 storage buffers in a single stage
-        // (positions in/out, velocities, edges via CSR (offsets+neighbors),
-        // mass, energy, cell_counts, cell_nodes). Default downlevel cap is 8;
-        // bump to at least 10. Adapter typically supports more on real GPUs.
+        // The compute pipeline (`force_step` + `spring_step`) binds 14
+        // storage buffers in a single stage — positions in/out,
+        // velocities, edges via CSR (offsets + neighbors), mass,
+        // virtual-vertex CSR, spring force partials, energy, plus the
+        // octree (nodes + ropes) for the Barnes-Hut path. Chrome's
+        // WebGPU default cap is 10, so the previous bump-to-10 left the
+        // pipeline silently invalid in the browser ("Invalid
+        // ComputePipeline 'force_step'") and the user saw a frozen
+        // canvas. Bump to 14 minimum; cap at adapter-reported max so we
+        // don't request more than the hardware can serve.
+        //
+        // If this number ever needs to grow again, also update the
+        // matching block in `main.rs` (native dev binary).
         let adapter_limits = adapter.limits();
         let mut limits = wgpu::Limits::downlevel_defaults().using_resolution(adapter_limits.clone());
         limits.max_storage_buffers_per_shader_stage = limits
             .max_storage_buffers_per_shader_stage
-            .max(10)
+            .max(14)
             .min(adapter_limits.max_storage_buffers_per_shader_stage);
 
         let (device, queue) = adapter

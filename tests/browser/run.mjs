@@ -151,8 +151,15 @@ try {
     await page.waitForTimeout(250);
   }
 
-  // Let the sim run a bit before the baseline screenshot.
-  await page.waitForTimeout(5_000);
+  // Let the sim run a bit before the first reference screenshot.
+  await page.waitForTimeout(3_000);
+  await page.screenshot({ path: `${OUT}/screenshot-early.png`, fullPage: false });
+
+  // Wait further then take the baseline. The two-screenshot delta below
+  // proves the force sim is actually animating positions, not just
+  // showing a frozen-but-non-black layout — regression for the user's
+  // "nothing is moving" report.
+  await page.waitForTimeout(3_000);
 
   await page.screenshot({ path: `${OUT}/screenshot.png`, fullPage: false });
 
@@ -184,6 +191,41 @@ try {
 
   const baselinePng = PNG.sync.read(await readFile(`${OUT}/screenshot.png`));
   const brightFrac  = brightFracOf(baselinePng);
+
+  // ---- check #2.5: the sim is actually animating ------------------------
+  //
+  // Regression for "force-directed physics isn't doing anything — nothing
+  // is moving." The smoke harness's earlier "canvas is bright enough"
+  // assertion is satisfied even when positions are frozen — a halted
+  // layout still shows the rendered node sprites. To catch a static-sim
+  // failure mode we compare the two timed screenshots (t=3s vs t=6s)
+  // and require a non-trivial fraction of pixels to have changed.
+  //
+  // Camera idleness is fine (no mouse events between the two grabs) —
+  // only nodes moving causes pixel differences in the canvas region.
+  // Threshold is intentionally generous (>= 0.5% of sampled pixels) so
+  // a near-converged layout that *is* refining still counts.
+  const earlyPng = PNG.sync.read(await readFile(`${OUT}/screenshot-early.png`));
+  const motionFrac = (() => {
+    if (
+      earlyPng.width !== baselinePng.width ||
+      earlyPng.height !== baselinePng.height
+    ) {
+      return 0;
+    }
+    const stride = 16;
+    let diff = 0;
+    let sampled = 0;
+    for (let i = 0; i < earlyPng.data.length; i += stride * 4) {
+      const dr = Math.abs(earlyPng.data[i]     - baselinePng.data[i]);
+      const dg = Math.abs(earlyPng.data[i + 1] - baselinePng.data[i + 1]);
+      const db = Math.abs(earlyPng.data[i + 2] - baselinePng.data[i + 2]);
+      if (dr + dg + db > 24) diff++;
+      sampled++;
+    }
+    return sampled === 0 ? 0 : diff / sampled;
+  })();
+  const simIsAnimating = motionFrac > 0.005;
 
   // ---- check #3: click does not blank the canvas ------------------------
   //
@@ -280,6 +322,7 @@ try {
     ok:
       ready &&
       brightFrac > 0.01 &&
+      simIsAnimating &&
       clickDidNotBlank &&
       tagsOk &&
       computeHealth.ok &&
@@ -291,6 +334,8 @@ try {
     consoleLines: consoleLines.slice(0, 50),
     canvasInfo,
     brightFrac: Number(brightFrac.toFixed(4)),
+    motionFrac: Number(motionFrac.toFixed(4)),
+    simIsAnimating,
     clickBrightFrac: Number(clickBrightFrac.toFixed(4)),
     clickDidNotBlank,
     clickedAt,
@@ -298,6 +343,7 @@ try {
     tagsOk,
     computeHealth,
     screenshot: `${OUT}/screenshot.png`,
+    screenshotEarly: `${OUT}/screenshot-early.png`,
     screenshotPostClick: `${OUT}/screenshot-post-click.png`,
   };
 } catch (e) {

@@ -6,27 +6,34 @@
 // Phase B+C wires the wgpu graph layer into eframe via egui_wgpu callbacks
 // (see `graph_pipelines` + `graph_callback`). The compute side
 // (graph-layouts::GpuForceLayout) needs `max_storage_buffers_per_shader_stage`
-// >= 9, which is above the WebGPU downlevel default of 8 — we override
-// eframe's wgpu_options device_descriptor below to request the bump.
+// >= 14 (the BH path added octree node + rope buffers), which is well
+// above the WebGPU downlevel default of 8 and the Chrome WebGPU runtime
+// default of 10 — we override eframe's wgpu_options device_descriptor
+// below to request the bump.
 
 use std::sync::Arc;
 
 /// Build a `wgpu::DeviceDescriptor` that bumps the storage-buffer limit
-/// to the value the GpuForceLayout compute shader needs (9). Falls back
+/// to the value the GpuForceLayout compute shader needs (14). Falls back
 /// to the adapter's max if it's lower than what we request.
 fn device_descriptor_factory(
 ) -> Arc<dyn Fn(&wgpu::Adapter) -> wgpu::DeviceDescriptor<'static> + Send + Sync> {
     Arc::new(|adapter: &wgpu::Adapter| {
         let adapter_limits = adapter.limits();
-        // Mirror the original standalone Renderer's limit derivation:
-        // downlevel_defaults (which supports compute) raised by the adapter,
-        // with max_storage_buffers_per_shader_stage bumped to 10 so the
-        // compute shader's 9-buffer binding doesn't trip validation.
+        // The `force_step` + `spring_step` compute pipeline binds 14
+        // storage buffers in a single stage (positions in/out,
+        // velocities, CSR offsets + neighbours, virtual-vertex CSR,
+        // mass, energy, spring partials, cell counts/nodes, octree
+        // nodes + ropes for the Barnes-Hut path). Chrome's WebGPU
+        // default cap is 10; the previous bump-to-10 left the
+        // pipeline silently invalid ("Invalid ComputePipeline
+        // 'force_step'") in the browser and the user saw a frozen
+        // canvas — physics literally never ran.
         let mut limits =
             wgpu::Limits::downlevel_defaults().using_resolution(adapter_limits.clone());
         limits.max_storage_buffers_per_shader_stage = limits
             .max_storage_buffers_per_shader_stage
-            .max(10)
+            .max(14)
             .min(adapter_limits.max_storage_buffers_per_shader_stage);
 
         wgpu::DeviceDescriptor {
