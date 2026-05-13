@@ -271,8 +271,17 @@ impl App {
         {
             let slot = field_index_slot.clone();
             let client = ApiClient::new(base_url.clone());
+            // Surface the fetch in the status footer so the user can tell
+            // metadata is still loading rather than guess from a blank
+            // sidebar.
+            let sink = progress.sink();
             spawn_async(async move {
+                let task = sink.start("meta", "fetching field index");
                 let res = client.meta_summary().await;
+                match &res {
+                    Ok(_) => sink.finish(task),
+                    Err(e) => sink.fail(task, e.clone()),
+                }
                 *slot.lock().unwrap() = Some(res);
             });
         }
@@ -363,7 +372,10 @@ impl App {
                 let slot = self.palette_preview_slot.clone();
                 let client = ApiClient::new(self.base_url.clone());
                 let id_for_task = id.clone();
+                let sink = self.progress.sink();
+                let label = format!("preview {}", short_id(&id_for_task));
                 spawn_async(async move {
+                    let task = sink.start("palette", label);
                     // `client.node(...)` returns Ok(None) on a 404. The
                     // palette preview surface treats "not found" as an
                     // error message rather than carrying a tri-state into
@@ -373,6 +385,10 @@ impl App {
                         Ok(None) => Err("not found".to_string()),
                         Err(e) => Err(e),
                     };
+                    match &result {
+                        Ok(_) => sink.finish(task),
+                        Err(e) => sink.fail(task, e.clone()),
+                    }
                     *slot.lock().unwrap() = Some((id_for_task, result));
                 });
             }
@@ -384,8 +400,16 @@ impl App {
     fn kick_off_node_fetch(&self, id: String) {
         let slot = self.node_fetch.clone();
         let client = ApiClient::new(self.base_url.clone());
+        let sink = self.progress.sink();
+        let label = format!("fetch node {}", short_id(&id));
+        let id_for_task = id.clone();
         spawn_async(async move {
-            let result = client.node(&id).await;
+            let task = sink.start("node", label);
+            let result = client.node(&id_for_task).await;
+            match &result {
+                Ok(_) => sink.finish(task),
+                Err(e) => sink.fail(task, e.clone()),
+            }
             *slot.lock().unwrap() = Some(result);
         });
     }
@@ -1273,7 +1297,10 @@ impl App {
             let id_to_idx = self.id_to_idx.clone();
             let client = ApiClient::new(self.base_url.clone());
             let q_owned = q.clone();
+            let sink = self.progress.sink();
+            let label = format!("search '{}'", short_label(&q_owned));
             spawn_async(async move {
+                let task = sink.start("search", label);
                 match client.search(&q_owned).await {
                     Ok(results) => {
                         let mut set: HashSet<u32> = HashSet::new();
@@ -1282,10 +1309,14 @@ impl App {
                                 set.insert(idx);
                             }
                         }
+                        let hits = set.len();
                         cache.lock().unwrap().insert(q_owned, set);
+                        sink.finish(task);
+                        sink.info("search", format!("{hits} hits"));
                     }
                     Err(e) => {
                         log::warn!("[graph-renderer] /search failed: {e}");
+                        sink.fail(task, e);
                         // Insert empty so we don't loop forever on bad query.
                         cache.lock().unwrap().insert(q_owned, HashSet::new());
                     }
@@ -2304,6 +2335,29 @@ fn kick_off_bootstrap(load: SharedLoad, base: String, prog: ProgressSink) {
     };
 
     spawn_async(task);
+}
+
+/// Short rendering of a node id for status-footer labels — long path-like
+/// ids ("notes/2025/projects/foo.md") would dominate the strip otherwise.
+/// Keeps the last 28 chars with an ellipsis on the front.
+fn short_id(id: &str) -> String {
+    const MAX: usize = 28;
+    if id.chars().count() <= MAX {
+        return id.to_string();
+    }
+    let suffix: String = id.chars().rev().take(MAX).collect::<Vec<_>>().into_iter().rev().collect();
+    format!("…{suffix}")
+}
+
+/// Short rendering for a search query (different policy than node ids:
+/// truncate from the *end* since the head is the meaningful prefix).
+fn short_label(s: &str) -> String {
+    const MAX: usize = 24;
+    if s.chars().count() <= MAX {
+        return s.to_string();
+    }
+    let head: String = s.chars().take(MAX).collect();
+    format!("{head}…")
 }
 
 fn set_status(load: &SharedLoad, msg: impl Into<String>) {
