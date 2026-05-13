@@ -282,7 +282,7 @@ fn render_body(ui: &mut egui::Ui, state: &mut AppState, data: &mut InspectorData
                 // Empty-state: render the vault-wide tag panel so the
                 // sidebar has a useful default surface ("browse tags")
                 // when nothing's selected.
-                show_browse_tags(ui, data);
+                show_browse_tags(ui, &mut state.tag_browser_query, data);
                 return;
             };
             show_metadata(ui, idx, data);
@@ -452,9 +452,25 @@ fn dispatch_inspector_badge(
 /// Hidden if `field_index` hasn't returned yet or has no tags. The
 /// caller already gates inspector mount on `has_browse_tags`, so we
 /// only get here when there's something to render.
-fn show_browse_tags(ui: &mut egui::Ui, data: &mut InspectorData) {
+/// Empty-state vault-wide tag browser. Renders when no node is selected
+/// so the right sidebar has a useful default. Top of the panel is a
+/// fuzzy search input — on a 7k-tag vault the unfiltered top-50 list
+/// can't surface a specific tag, so the search is the only practical
+/// affordance. Empty query falls back to "top N by frequency."
+///
+/// Persistence: the query lives on `AppState::tag_browser_query` so it
+/// survives between renders and across reloads.
+fn show_browse_tags(
+    ui: &mut egui::Ui,
+    query: &mut String,
+    data: &mut InspectorData,
+) {
     use crate::ui::badge::{Badge, BadgeAction, BadgeKind};
-    const MAX_CHIPS: usize = 50;
+    use fuzzy_matcher::skim::SkimMatcherV2;
+    use fuzzy_matcher::FuzzyMatcher;
+
+    const MAX_CHIPS: usize = 80;
+
     let Some(fi) = data.field_index else {
         ui.add_space(8.0);
         ui.label(
@@ -482,19 +498,80 @@ fn show_browse_tags(ui: &mut egui::Ui, data: &mut InspectorData) {
         );
         return;
     }
-    let mut ranked: Vec<(&String, usize)> = tag_buckets
-        .iter()
-        .map(|(v, idxs)| (v, idxs.len()))
-        .collect();
-    ranked.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
-    ranked.truncate(MAX_CHIPS);
+
+    let total = tag_buckets.len();
+    let trimmed = query.trim().to_string();
+
+    // Rank tags. Empty query → top-N by frequency desc, alpha asc as
+    // stable tiebreak. Non-empty query → SkimMatcherV2 fuzzy score with
+    // frequency as a secondary key, capped at MAX_CHIPS hits.
+    let ranked: Vec<(&String, usize)> = if trimmed.is_empty() {
+        let mut v: Vec<(&String, usize)> = tag_buckets
+            .iter()
+            .map(|(v, idxs)| (v, idxs.len()))
+            .collect();
+        v.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+        v.truncate(MAX_CHIPS);
+        v
+    } else {
+        let matcher = SkimMatcherV2::default().ignore_case();
+        let mut scored: Vec<(i64, &String, usize)> = tag_buckets
+            .iter()
+            .filter_map(|(value, idxs)| {
+                matcher
+                    .fuzzy_match(value, &trimmed)
+                    .map(|score| (score, value, idxs.len()))
+            })
+            .collect();
+        // Sort by fuzzy score desc, then frequency desc as tiebreak.
+        scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.2.cmp(&a.2)));
+        scored.truncate(MAX_CHIPS);
+        scored.into_iter().map(|(_, v, c)| (v, c)).collect()
+    };
 
     ui.add_space(6.0);
     ui.label(
-        egui::RichText::new(format!("Tags ({} total)", tag_buckets.len()))
+        egui::RichText::new(format!("Tags ({} total)", total))
             .color(palette::TEXT)
             .strong(),
     );
+
+    // Fuzzy search input. Use `desired_width` so the field stretches
+    // to the panel column instead of egui's default narrow look.
+    let avail = ui.available_width();
+    ui.horizontal(|ui| {
+        ui.add(
+            egui::TextEdit::singleline(query)
+                .desired_width(avail - 60.0)
+                .hint_text("filter tags…"),
+        );
+        if !query.is_empty() && ui.small_button("clear").clicked() {
+            query.clear();
+        }
+    });
+
+    if ranked.is_empty() {
+        ui.add_space(6.0);
+        ui.label(
+            egui::RichText::new(format!("(no tags match {:?})", trimmed))
+                .color(egui::Color32::from_gray(140))
+                .italics(),
+        );
+        return;
+    }
+
+    if !trimmed.is_empty() {
+        ui.label(
+            egui::RichText::new(format!(
+                "{} match{}",
+                ranked.len(),
+                if ranked.len() == 1 { "" } else { "es" }
+            ))
+            .small()
+            .color(egui::Color32::from_gray(140)),
+        );
+    }
+
     ui.add_space(4.0);
     ui.horizontal_wrapped(|ui| {
         ui.spacing_mut().item_spacing.x = 4.0;

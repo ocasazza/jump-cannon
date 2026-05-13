@@ -543,6 +543,12 @@ pub struct AppState {
     /// stays as an unobtrusive 24px strip until the user expands it.
     #[serde(default)]
     pub status_footer_open: bool,
+    /// Fuzzy-search query for the inspector's empty-state tag browser.
+    /// Persisted across reloads so a user returning to the app finds
+    /// their last filter still in place. Empty = show top-N by
+    /// frequency.
+    #[serde(default)]
+    pub tag_browser_query: String,
     #[serde(skip)]
     pub stats: LiveStats,
     /// One-shot signal: the Layout sidebar's "Solve" button sets this to
@@ -574,6 +580,7 @@ impl Default for AppState {
             inspector_open: default_inspector_open(),
             inspector_floating: false,
             status_footer_open: false,
+            tag_browser_query: String::new(),
             stats: LiveStats::default(),
             layout_solve_requested: false,
         }
