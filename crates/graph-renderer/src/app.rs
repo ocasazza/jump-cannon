@@ -189,6 +189,35 @@ pub struct App {
     /// focus for ~HOVER_HOLD_MS before clearing.
     hover_clear_at: Option<web_time::Instant>,
 
+    // -- Hover-preview card (delayed) ------------------------------------
+    //
+    // A small floating preview opens after the cursor lingers on a node
+    // for `HOVER_PREVIEW_DELAY_MS`. Distinct from `focus_hover_idx` —
+    // that drives the per-node highlight; the preview card needs the
+    // metadata (title / tags / body) from `/node/:id`, so it's stateful.
+    /// Node idx the preview is currently armed/showing for. Resets to
+    /// `None` whenever the cursor leaves a node or moves to a different
+    /// one.
+    hover_preview_idx: Option<u32>,
+    /// When the cursor first landed on `hover_preview_idx`. The card
+    /// opens once elapsed > `HOVER_PREVIEW_DELAY_MS`.
+    hover_preview_armed_at: Option<web_time::Instant>,
+    /// Cached NodeMeta + the id it was fetched for. Reused across
+    /// rapid hover-on/off cycles on the same node so we don't re-fire
+    /// `/node/:id` every flick.
+    hover_preview_meta: Option<proto::NodeMeta>,
+    /// Async slot for the in-flight /node/:id fetch.
+    hover_preview_fetch: Arc<Mutex<Option<Result<Option<proto::NodeMeta>, String>>>>,
+    /// True once the preview has been promoted from "armed" to "shown."
+    /// Distinct from `hover_preview_idx` because the idx is set
+    /// immediately on hover; the visibility flag flips only after the
+    /// delay elapses + the fetch returns.
+    hover_preview_open: bool,
+    /// Canvas-space cursor position when the preview was opened —
+    /// drives the floating Area's anchor. Persists between frames so a
+    /// jittery cursor doesn't make the card jitter.
+    hover_preview_pos: Option<egui::Pos2>,
+
     /// Inverted index of (field, value) -> node-idx buckets. Populated
     /// by a one-shot async `/graph/meta_summary` fetch in `kick_off_bootstrap`.
     field_index: Option<FieldIndex>,
@@ -390,6 +419,12 @@ impl App {
             prev_filters_non_empty: false,
             last_hover_raycast_at: None,
             hover_clear_at: None,
+            hover_preview_idx: None,
+            hover_preview_armed_at: None,
+            hover_preview_meta: None,
+            hover_preview_fetch: Arc::new(Mutex::new(None)),
+            hover_preview_open: false,
+            hover_preview_pos: None,
             field_index: None,
             field_index_slot,
             progress,
@@ -1154,6 +1189,11 @@ impl eframe::App for App {
 
         // Hover-driven focus (throttled). Sticky click takes precedence.
         self.update_hover_focus(frame, pointer_in_canvas, canvas_rect);
+        // Hover-preview card delay/fetch state machine. Reads
+        // `focus_hover_idx` set above. The actual paint happens in
+        // `show_hover_preview` at the end of `update` so it sits on
+        // top of the existing UI layers.
+        self.tick_hover_preview(pointer_in_canvas);
 
         // Inspector requested a different selection (clicked a community
         // sibling or neighbor pill). Drive the full focus path: camera
@@ -1239,6 +1279,11 @@ impl eframe::App for App {
         self.apply_cursor_force(frame);
         self.tick_post_click_cooldown(frame);
         self.perf.end_stage(StageId::ApplyEffects);
+
+        // Hover-preview card paint pass — runs after all other UI
+        // layers so the card sits on top of canvas + sidebars. Cheap:
+        // no-op when `hover_preview_open == false`.
+        self.show_hover_preview(ctx);
 
         // Detect filter-set empty<->non-empty transitions and auto-flip
         // the user's FocusMode so a badge click engages focus dim the same
@@ -1793,6 +1838,10 @@ impl App {
     /// Hover throttle interval — ~50ms gives a comfortable 20 Hz max
     /// raycast cadence per the spec.
     const HOVER_THROTTLE_MS: u64 = 50;
+    /// Delay between cursor-landed-on-node and the preview card opening.
+    /// 700ms is short enough to feel responsive, long enough that
+    /// sweeping across the canvas doesn't fire a card for every node.
+    const HOVER_PREVIEW_DELAY_MS: u64 = 700;
     /// Hover-release hold — keep the previous hover focus engaged for
     /// this long after the cursor leaves a node, so a brief jitter or
     /// a quick gap between two nodes doesn't flash everything bright.
@@ -1844,6 +1893,177 @@ impl App {
                 self.maybe_clear_hover_after_hold();
             }
         }
+    }
+
+    /// Drive the hover-preview state machine. Called each frame after
+    /// `update_hover_focus`. Three phases:
+    ///   1. Cursor lands on a new node → arm the delay timer; cancel
+    ///      any open card.
+    ///   2. Delay elapses while cursor is still on the same node →
+    ///      kick off `/node/:id` fetch and flip the card open. Cached
+    ///      meta from a prior fetch shortcuts the network hop.
+    ///   3. Cursor leaves the node OR moves to a different one → clear
+    ///      the card; the next landing arms a fresh timer.
+    fn tick_hover_preview(&mut self, pointer_in_canvas: Option<egui::Pos2>) {
+        // Sticky-focus mode (click selection) suppresses preview — the
+        // inspector / modal already cover that node's detail surface.
+        if self.focus_sticky_idx.is_some() {
+            self.close_hover_preview();
+            return;
+        }
+        let now = web_time::Instant::now();
+        match self.focus_hover_idx {
+            Some(idx) => {
+                // Transition: hover landed on a different node (or
+                // first-time landing). Reset arm timer; close any old
+                // card. The cached meta stays in case the user
+                // re-hovers the SAME id later — no fetch on re-entry.
+                if self.hover_preview_idx != Some(idx) {
+                    self.hover_preview_idx = Some(idx);
+                    self.hover_preview_armed_at = Some(now);
+                    self.hover_preview_open = false;
+                    self.hover_preview_pos = pointer_in_canvas;
+                    // If the cached meta is for this idx already, the
+                    // open path below will re-show it without a refetch.
+                    let want_id = self.id_for_idx(idx);
+                    let cached_for_same =
+                        self.hover_preview_meta.as_ref().and_then(|m| {
+                            want_id.as_deref().map(|wid| m.id == wid)
+                        }).unwrap_or(false);
+                    if !cached_for_same {
+                        self.hover_preview_meta = None;
+                    }
+                }
+                // Latch position from the last canvas-pointer reading
+                // so we don't anchor at the wrong spot if the pointer
+                // is None this frame (egui mid-drag etc).
+                if let Some(p) = pointer_in_canvas {
+                    self.hover_preview_pos = Some(p);
+                }
+                // Check delay → open path.
+                let armed_long_enough = self
+                    .hover_preview_armed_at
+                    .map(|t| (now - t).as_millis() >= Self::HOVER_PREVIEW_DELAY_MS as u128)
+                    .unwrap_or(false);
+                if armed_long_enough && !self.hover_preview_open {
+                    self.hover_preview_open = true;
+                    // Kick a fetch only if we don't already have meta
+                    // for this id. The result drains into modal/main
+                    // path lazily; we also poll the fetch slot below.
+                    let Some(id) = self.id_for_idx(idx) else { return };
+                    let has_cached = self
+                        .hover_preview_meta
+                        .as_ref()
+                        .map(|m| m.id == id)
+                        .unwrap_or(false);
+                    if !has_cached {
+                        let slot = self.hover_preview_fetch.clone();
+                        let client = ApiClient::new(self.base_url.clone());
+                        let sink = self.progress.sink();
+                        let label = format!("preview {}", short_id(&id));
+                        spawn_async(async move {
+                            let task = sink.start("hover", label);
+                            let res = client.node(&id).await;
+                            match &res {
+                                Ok(_) => sink.finish(task),
+                                Err(e) => sink.fail(task, e.clone()),
+                            }
+                            *slot.lock().unwrap() = Some(res);
+                        });
+                    }
+                }
+            }
+            None => self.close_hover_preview(),
+        }
+
+        // Drain any completed hover fetch into hover_preview_meta.
+        let drained = self.hover_preview_fetch.lock().unwrap().take();
+        if let Some(Ok(Some(meta))) = drained {
+            self.hover_preview_meta = Some(meta);
+        }
+    }
+
+    fn close_hover_preview(&mut self) {
+        self.hover_preview_idx = None;
+        self.hover_preview_armed_at = None;
+        self.hover_preview_open = false;
+        self.hover_preview_pos = None;
+    }
+
+    /// Draw the hover-preview card if armed. Anchored near the cursor
+    /// (offset right + down so the card doesn't sit *under* the
+    /// cursor, which would cause the cursor to immediately enter the
+    /// card and the chain to flicker).
+    fn show_hover_preview(&self, ctx: &egui::Context) {
+        if !self.hover_preview_open {
+            return;
+        }
+        let Some(meta) = self.hover_preview_meta.as_ref() else {
+            return;
+        };
+        let Some(pos) = self.hover_preview_pos else {
+            return;
+        };
+        let anchor = egui::pos2(pos.x + 16.0, pos.y + 16.0);
+        egui::Area::new(egui::Id::new("hover-preview"))
+            .fixed_pos(anchor)
+            .order(egui::Order::Tooltip)
+            .interactable(false)
+            .show(ctx, |ui| {
+                egui::Frame::none()
+                    .fill(egui::Color32::from_rgba_unmultiplied(8, 10, 20, 235))
+                    .stroke(egui::Stroke::new(
+                        1.0,
+                        crate::ui::theme::palette::BORDER,
+                    ))
+                    .rounding(egui::Rounding::same(6.0))
+                    .inner_margin(egui::Margin::symmetric(10.0, 8.0))
+                    .show(ui, |ui| {
+                        ui.set_max_width(360.0);
+                        // Title.
+                        let title = if meta.title.is_empty() {
+                            meta.id.clone()
+                        } else {
+                            meta.title.clone()
+                        };
+                        ui.label(
+                            egui::RichText::new(title)
+                                .strong()
+                                .color(crate::ui::theme::palette::TEXT),
+                        );
+                        // Path subtitle (small / weak).
+                        if !meta.path.is_empty() {
+                            ui.label(
+                                egui::RichText::new(&meta.path)
+                                    .small()
+                                    .weak()
+                                    .monospace(),
+                            );
+                        }
+                        // Tags row — comma-joined as plain text rather
+                        // than chips, since chip widgets carry click
+                        // semantics and this card is non-interactive.
+                        if !meta.tags.is_empty() {
+                            ui.add_space(2.0);
+                            ui.label(
+                                egui::RichText::new(meta.tags.join(", "))
+                                    .small()
+                                    .color(crate::ui::theme::palette::INFO),
+                            );
+                        }
+                        // First few lines of the body. Cap at ~280
+                        // chars or 6 lines, whichever comes first.
+                        if !meta.body.is_empty() {
+                            ui.separator();
+                            let snippet = body_snippet(&meta.body, 280, 6);
+                            ui.label(
+                                egui::RichText::new(snippet)
+                                    .small()
+                                    .color(crate::ui::theme::palette::TEXT),
+                            );
+                        }
+                    });
+            });
     }
 
     fn maybe_clear_hover_after_hold(&mut self) {
@@ -2243,6 +2463,45 @@ fn default_base_url() -> String {
     {
         std::env::var("GRAPH_API_URL").unwrap_or_else(|_| "http://127.0.0.1:4848".into())
     }
+}
+
+/// Truncate a markdown body to a hover-preview snippet: up to `max_chars`
+/// chars OR `max_lines` lines, whichever bound trips first. Appends "…"
+/// when truncated. Preserves line breaks so multi-paragraph snippets
+/// don't all run together on one line.
+fn body_snippet(body: &str, max_chars: usize, max_lines: usize) -> String {
+    let mut out = String::new();
+    let mut chars = 0usize;
+    let mut lines = 0usize;
+    for line in body.lines() {
+        if lines >= max_lines {
+            out.push('…');
+            return out;
+        }
+        // Skip leading blank lines so a body that starts with `\n` doesn't
+        // burn a snippet "line" on emptiness.
+        if out.is_empty() && line.trim().is_empty() {
+            continue;
+        }
+        let remaining = max_chars.saturating_sub(chars);
+        if remaining == 0 {
+            out.push('…');
+            return out;
+        }
+        let take = line.chars().count().min(remaining);
+        out.extend(line.chars().take(take));
+        if take < line.chars().count() {
+            out.push('…');
+            return out;
+        }
+        chars += take;
+        lines += 1;
+        if lines < max_lines && chars < max_chars {
+            out.push('\n');
+            chars += 1;
+        }
+    }
+    out.trim_end().to_string()
 }
 
 fn kick_off_bootstrap(load: SharedLoad, base: String, prog: ProgressSink) {
