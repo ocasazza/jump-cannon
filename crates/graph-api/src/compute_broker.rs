@@ -28,6 +28,14 @@ struct Inner {
     /// `None` until the dial succeeds. After connect, holds the broadcast
     /// sender used to fan PositionDeltas out to WS clients.
     tx: tokio::sync::RwLock<Option<broadcast::Sender<PositionDelta>>>,
+    /// Live status flag — flips `true` once a `Subscribe` stream is open
+    /// and `false` when the inner loop breaks out (worker closed, error,
+    /// dial failed). Exposed via `/compute/health` so the renderer can
+    /// surface the back-half-of-the-chain liveness in the footer log.
+    connected: std::sync::atomic::AtomicBool,
+    /// Last-known URL the loop is dialing. Set on `connect()`; read by
+    /// `/compute/health`.
+    url: tokio::sync::RwLock<Option<String>>,
 }
 
 impl ComputeBroker {
@@ -35,7 +43,22 @@ impl ComputeBroker {
         Self {
             inner: Arc::new(Inner {
                 tx: tokio::sync::RwLock::new(None),
+                connected: std::sync::atomic::AtomicBool::new(false),
+                url: tokio::sync::RwLock::new(None),
             }),
+        }
+    }
+
+    /// Snapshot of the broker's reachability to the compute worker.
+    /// Cheap (one atomic load + one read-lock async hop for the url).
+    pub async fn status(&self) -> BrokerStatus {
+        let url = self.inner.url.read().await.clone().unwrap_or_default();
+        BrokerStatus {
+            connected: self
+                .inner
+                .connected
+                .load(std::sync::atomic::Ordering::Relaxed),
+            url,
         }
     }
 
@@ -60,9 +83,11 @@ impl ComputeBroker {
         // receiver until frames arrive (or after a worker restart).
         let (tx, _rx) = broadcast::channel::<PositionDelta>(64);
         *self.inner.tx.write().await = Some(tx.clone());
+        *self.inner.url.write().await = Some(url.clone());
 
         // Reconnecting forwarder. Each iteration: dial, subscribe, pump
         // frames until the stream ends or errors, then back off and retry.
+        let inner = self.inner.clone();
         tokio::spawn(async move {
             const BACKOFF_INITIAL: Duration = Duration::from_secs(1);
             const BACKOFF_CAP: Duration = Duration::from_secs(30);
@@ -118,6 +143,9 @@ impl ComputeBroker {
                 };
 
                 tracing::info!(url = %url, "compute broker connected; streaming frames");
+                inner
+                    .connected
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
                 backoff = BACKOFF_INITIAL;
 
                 let mut stream = stream;
@@ -136,6 +164,9 @@ impl ComputeBroker {
                         }
                     }
                 }
+                inner
+                    .connected
+                    .store(false, std::sync::atomic::Ordering::Relaxed);
 
                 tokio::time::sleep(backoff).await;
                 backoff = (backoff * 2).min(BACKOFF_CAP);
@@ -150,6 +181,16 @@ impl ComputeBroker {
     pub async fn subscribe(&self) -> Option<broadcast::Receiver<PositionDelta>> {
         self.inner.tx.read().await.as_ref().map(|tx| tx.subscribe())
     }
+}
+
+/// Snapshot returned by [`ComputeBroker::status`] — fed to the
+/// `/compute/health` HTTP endpoint so the renderer can show the
+/// back-half-of-the-chain liveness in the footer log.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct BrokerStatus {
+    pub connected: bool,
+    /// May be empty if `connect()` was never called.
+    pub url: String,
 }
 
 impl Default for ComputeBroker {

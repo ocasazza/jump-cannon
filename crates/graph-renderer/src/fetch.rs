@@ -85,6 +85,22 @@ impl ApiClient {
         let bytes = http_get_bytes(&self.url(&format!("/search?q={}", urlencode(q)))).await?;
         proto::SearchResults::decode(&*bytes).map_err(|e| format!("decode search: {e}"))
     }
+
+    /// `GET /compute/health` — `{ connected: bool, url: String }`.
+    /// Used by the renderer to surface compute-broker liveness in the
+    /// footer log. Returns `connected=false` when graph-api is up but
+    /// the downstream gRPC dial to graph-compute is failing.
+    pub async fn compute_health(&self) -> Result<ComputeHealth, String> {
+        let bytes = http_get_bytes(&self.url("/compute/health")).await?;
+        serde_json::from_slice::<ComputeHealth>(&bytes)
+            .map_err(|e| format!("decode compute_health: {e}"))
+    }
+}
+
+#[derive(Clone, Debug, serde::Deserialize)]
+pub struct ComputeHealth {
+    pub connected: bool,
+    pub url: String,
 }
 
 fn bytes_to_f32(b: &[u8]) -> Result<Vec<f32>, String> {

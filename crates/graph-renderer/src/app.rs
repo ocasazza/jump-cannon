@@ -264,6 +264,54 @@ impl App {
         let progress_sink = progress.sink();
         kick_off_bootstrap(load.clone(), base_url.clone(), progress_sink);
 
+        // Long-lived compute-broker health watcher. Polls
+        // `/compute/health` every 2s and emits a footer-log event on
+        // every state transition (connected ↔ disconnected). Without
+        // this signal, a stalled Remote FA2 stream reads as a frontend
+        // bug — in fact graph-api is up but its gRPC dial to
+        // graph-compute is failing.
+        {
+            let sink = progress.sink();
+            let client = ApiClient::new(base_url.clone());
+            spawn_async(async move {
+                use std::time::Duration;
+                let mut last_known: Option<bool> = None;
+                loop {
+                    match client.compute_health().await {
+                        Ok(h) => {
+                            if last_known != Some(h.connected) {
+                                last_known = Some(h.connected);
+                                if h.connected {
+                                    sink.info(
+                                        "compute",
+                                        format!("broker connected to {}", h.url),
+                                    );
+                                } else {
+                                    sink.warn(
+                                        "compute",
+                                        format!(
+                                            "broker disconnected from {}",
+                                            if h.url.is_empty() { "(no url set)" } else { &h.url }
+                                        ),
+                                    );
+                                }
+                            }
+                        }
+                        Err(_) => {
+                            // graph-api itself is down or the route 404s.
+                            // Don't spam the log — only emit once on
+                            // transition.
+                            if last_known != Some(false) {
+                                last_known = Some(false);
+                                sink.warn("compute", "broker status unreachable");
+                            }
+                        }
+                    }
+                    sleep_async(Duration::from_secs(2)).await;
+                }
+            });
+        }
+
         // One-shot meta_summary fetch in parallel with the bootstrap.
         // Used to power active-filter chips + SharedTag/Filter focus.
         let field_index_slot: Arc<Mutex<Option<Result<proto::MetaSummary, String>>>> =
@@ -2370,6 +2418,18 @@ fn set_status(load: &SharedLoad, msg: impl Into<String>) {
 fn set_failed(load: &SharedLoad, msg: String) {
     log::error!("[graph-renderer] bootstrap failed: {msg}");
     *load.lock().unwrap() = LoadState::Failed(msg);
+}
+
+/// Cross-target async sleep. `tokio::time::sleep` only works inside a
+/// tokio runtime (native path); the wasm path needs `gloo_timers`.
+#[cfg(target_arch = "wasm32")]
+async fn sleep_async(d: std::time::Duration) {
+    gloo_timers::future::TimeoutFuture::new(d.as_millis() as u32).await;
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+async fn sleep_async(d: std::time::Duration) {
+    tokio::time::sleep(d).await;
 }
 
 #[cfg(target_arch = "wasm32")]

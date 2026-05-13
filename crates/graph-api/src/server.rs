@@ -38,7 +38,18 @@ pub fn router(state: AppState) -> Router {
         .route("/graph/layout/stream", get(graph_layout_stream))
         .route("/node/:id", get(node_meta))
         .route("/search", get(search))
+        .route("/compute/health", get(compute_health))
         .with_state(state)
+}
+
+/// Live status of the gRPC link to the `graph-compute` worker. The
+/// renderer polls this to surface back-half liveness in the footer log
+/// (the renderer's WS to *this* server stays connected even when the
+/// downstream gRPC stream is dead, so without this signal a stalled
+/// canvas reads as a frontend bug).
+async fn compute_health(State(s): State<AppState>) -> impl IntoResponse {
+    let status = s.inner.compute_broker.status().await;
+    axum::Json(status)
 }
 
 async fn index(State(s): State<AppState>) -> impl IntoResponse {
