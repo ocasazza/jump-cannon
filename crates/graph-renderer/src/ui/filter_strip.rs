@@ -1,11 +1,21 @@
-//! Top-center floating chip strip for active (field, value) filters.
+//! Active-filter chip bar.
 //!
-//! Anchored to `Align2::CENTER_TOP`. Hidden when no filters are active.
-//! Each chip is a [`super::badge::Badge`] with the ✕ tail enabled; the
-//! field-name lozenge sports its own ✕ that clears every value for that
-//! field.
+//! Previously rendered as a floating `egui::Area` anchored at
+//! `Align2::CENTER_TOP` with `y=12` — which on real apps overlapped
+//! (and was clipped by) any top panel egui_dock / eframe added above
+//! the canvas. The user's complaint: "the tag filter bar at the top
+//! is hidden / half off the top of the screen."
+//!
+//! Switched to `TopBottomPanel::top`. The panel participates in the
+//! layout flow so it always sits below the menu bar / window chrome
+//! and steals a few px from the canvas — never clipped. Mirrors the
+//! status-footer pattern (`TopBottomPanel::bottom`) for symmetry.
+//!
+//! Hidden when no filters are active. Each chip is a
+//! [`super::badge::Badge`] with the ✕ tail enabled; the field-name
+//! lozenge sports its own ✕ that clears every value for that field.
 
-use eframe::egui::{self, Align2};
+use eframe::egui;
 
 use crate::ui::badge::{Badge, BadgeAction, BadgeKind};
 use crate::ui::query::QueryModel;
@@ -26,17 +36,20 @@ pub fn show(ctx: &egui::Context, query: &mut QueryModel) {
     let mut to_toggle: Option<(String, String)> = None;
     let mut clear_all = false;
 
-    egui::Area::new("filter-chips".into())
-        .anchor(Align2::CENTER_TOP, egui::vec2(0.0, 12.0))
-        .order(egui::Order::Foreground)
-        .show(ctx, |ui| {
+    egui::TopBottomPanel::top("filter-chips")
+        .resizable(false)
+        .show_separator_line(true)
+        .frame(
             egui::Frame::none()
-                .fill(egui::Color32::from_rgba_unmultiplied(5, 7, 16, 220))
+                .fill(egui::Color32::from_rgba_unmultiplied(5, 7, 16, 235))
                 .stroke(egui::Stroke::new(1.0, palette::BORDER))
-                .rounding(egui::Rounding::same(6.0))
-                .inner_margin(egui::Margin::symmetric(10.0, 6.0))
-                .show(ui, |ui| {
-                    ui.horizontal_wrapped(|ui| {
+                .inner_margin(egui::Margin::symmetric(10.0, 6.0)),
+        )
+        .show(ctx, |ui| {
+            // Wrap the chip render in the same `ui` so the panel
+            // calls back exactly the way the floating Area did before.
+            {
+                ui.horizontal_wrapped(|ui| {
                         // Render fields in user-insertion order.
                         let order: Vec<String> = query
                             .active_filters
@@ -79,7 +92,7 @@ pub fn show(ctx: &egui::Context, query: &mut QueryModel) {
                             }
                         }
                     });
-                });
+            }
         });
 
     if clear_all {
