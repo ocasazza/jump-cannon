@@ -33,6 +33,12 @@ pub struct ModalState {
     pub pinned: bool,
     pub current: Option<proto::NodeMeta>,
     pub fetch_error: Option<String>,
+    /// Per-modal egui_commonmark layout cache. Holding it here (vs.
+    /// re-allocating per frame) lets the markdown viewer reuse parsed
+    /// AST + measured galleys between frames — critical for non-trivial
+    /// markdown bodies, where re-parsing every frame would spike the
+    /// egui thread.
+    pub markdown_cache: egui_commonmark::CommonMarkCache,
 }
 
 /// What happened in the modal during this frame. Empty when no badge clicked.
@@ -268,16 +274,18 @@ pub fn show_modal_with(
                     .strong(),
             );
             ui.add_space(4.0);
+            // CommonMark renderer: headings, lists, code blocks, links
+            // all paint properly instead of the plain-text fallback. We
+            // pass `state.markdown_cache` so the parsed AST + measured
+            // galleys persist between frames; without it, a non-trivial
+            // body would re-parse and re-layout every frame, spiking
+            // the egui thread.
             egui::ScrollArea::vertical()
                 .max_height(420.0)
                 .auto_shrink([false, true])
                 .show(ui, |ui| {
-                    ui.add(
-                        egui::TextEdit::multiline(&mut meta.body.clone())
-                            .desired_width(f32::INFINITY)
-                            .font(egui::TextStyle::Monospace)
-                            .interactive(false),
-                    );
+                    egui_commonmark::CommonMarkViewer::new()
+                        .show(ui, &mut state.markdown_cache, &meta.body);
                 });
         }
     });
