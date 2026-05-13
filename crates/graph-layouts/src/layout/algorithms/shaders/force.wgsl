@@ -292,6 +292,21 @@ fn force_step(@builtin(global_invocation_id) gid: vec3<u32>) {
     // far larger than any plausible distance² instead.
     let r_clip2 = select(1.0e+18, r_clip * r_clip, r_clip > 0.0);
 
+    // Repulsion-distance² floor.
+    //
+    // Without this, a coincident or near-coincident pair generates a
+    // single-pair force of `repulsion / dist²` with `dist² → 0` — at the
+    // default `repulsion=4000` and the previous hard-coded floor `0.01`,
+    // that's `4000/0.01 = 400_000` per pair. dt=0.1 × that = ~40k velocity
+    // per step → node ejected ~4k units → next iteration NaN propagates.
+    //
+    // Scale the floor with `spring_len` so the threshold matches the
+    // layout's natural unit (e.g. spring_len=400 → floor=1600 → max
+    // single-pair force ~ repulsion/1600 ≈ 2.5 for the defaults). Stable
+    // for both chaotic random-ball seeds and compact converged seeds (the
+    // latter being the failure mode the topo-fisheye seed mode hit).
+    let dist2_floor = max(params.spring_len * params.spring_len * 1e-4, 1e-4);
+
     // ---- Repulsion ---------------------------------------------------------
     // Backend selection: BarnesHut overrides the legacy grid path. Both
     // paths read positions_in[*]; the BH path additionally reads the
@@ -323,7 +338,7 @@ fn force_step(@builtin(global_invocation_id) gid: vec3<u32>) {
             if (body != OCT_BODY_INTERNAL) {
                 if (body != i) {
                     if (dist2 <= r_clip2 && mass_n > 0.0) {
-                        let dist2c = max(dist2, 0.01);
+                        let dist2c = max(dist2, dist2_floor);
                         force = force + d * (params.repulsion * mass_n / dist2c);
                     }
                 }
@@ -334,7 +349,7 @@ fn force_step(@builtin(global_invocation_id) gid: vec3<u32>) {
             // when (s/d)² < θ². Avoids the sqrt by squaring both sides.
             if (mass_n > 0.0 && dist2 > 0.0 && (s * s) < (theta2 * dist2)) {
                 if (dist2 <= r_clip2) {
-                    let dist2c = max(dist2, 0.01);
+                    let dist2c = max(dist2, dist2_floor);
                     force = force + d * (params.repulsion * mass_n / dist2c);
                 }
                 idx = n.links.z; // accepted → skip subtree
@@ -363,7 +378,7 @@ fn force_step(@builtin(global_invocation_id) gid: vec3<u32>) {
             let d = pos - positions_in[j];
             let dist2 = dot(d, d);
             if (dist2 > r_clip2) { continue; }
-            let dist2c = max(dist2, 0.01);
+            let dist2c = max(dist2, dist2_floor);
             // Same mass-weighted Coulomb form as the grid path so layout
             // quality is comparable; only the *set* of j's changes.
             force = force + d * (params.repulsion * mass[j] / dist2c);
@@ -397,7 +412,7 @@ fn force_step(@builtin(global_invocation_id) gid: vec3<u32>) {
                         let d = pos - positions_in[j];
                         let dist2 = dot(d, d);
                         if (dist2 > r_clip2) { continue; }
-                        let dist2c = max(dist2, 0.01);
+                        let dist2c = max(dist2, dist2_floor);
                         force = force + d * (params.repulsion * mass[j] / dist2c);
                     }
                 }
@@ -409,7 +424,7 @@ fn force_step(@builtin(global_invocation_id) gid: vec3<u32>) {
             let d = pos - positions_in[j];
             let dist2 = dot(d, d);
             if (dist2 > r_clip2) { continue; }
-            let dist2c = max(dist2, 0.01);
+            let dist2c = max(dist2, dist2_floor);
             force = force + d * (params.repulsion * mass[j] / dist2c);
         }
     }
