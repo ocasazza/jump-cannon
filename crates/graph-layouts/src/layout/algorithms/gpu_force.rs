@@ -1004,15 +1004,23 @@ struct GpuState {
     /// Hub-aware (Tigr) virtual-vertex CSR + per-virtual spring partials.
     /// Built once at GpuState init from `edge_offsets`/`edge_neighbors`. See
     /// `HUB_THRESHOLD` and `spring_step` in shaders/force.wgsl.
-    virt_real_idx_buf: wgpu::Buffer,
+    /// Packed `node_to_virt_offsets` (length n+1) + `virt_real_idx`
+    /// (length n_virtual) — one storage binding instead of two so the
+    /// pipeline fits Chrome WebGPU's per-stage cap of 10. See the
+    /// matching layout note in `build_aux_buffers`.
+    virt_csr_buf: wgpu::Buffer,
     virt_edge_offsets_buf: wgpu::Buffer,
-    node_to_virt_offsets_buf: wgpu::Buffer,
     spring_force_partial_buf: wgpu::Buffer,
     n_virtual: u32,
     spring_bind_group_layout: wgpu::BindGroupLayout,
     spring_pipeline: wgpu::ComputePipeline,
     params_buf: wgpu::Buffer,
     /// Per-node mass (1 + log2(degree)). Static once built.
+    /// Legacy mass storage buffer. Kept allocated for backwards-compat
+    /// with downstream code that still mutates `cpu_mass`; the shader
+    /// itself reads mass from positions[i].w now (commit reducing
+    /// per-stage storage-buffer count to fit Chrome WebGPU's cap of 10).
+    #[allow(dead_code)]
     mass_buf: wgpu::Buffer,
     /// Spatial-hash cells. (Re)allocated when capacity grows.
     cell_offsets_buf: wgpu::Buffer,
@@ -1209,6 +1217,18 @@ fn precompute(graph: &Graph, seed_mode: &SeedMode, spring_len: f32) -> PreComput
         .iter()
         .map(|ns| 1.0 + ((ns.len() as f32).max(1.0)).log2())
         .collect();
+    // Pack mass into positions[i].w. The WGSL `force_step` reads mass
+    // from the .w slot of each vec4 position so the standalone `mass`
+    // storage buffer can be dropped — see force.wgsl bindings 0/1 note
+    // for context (per-stage storage-buffer cap fits when this is
+    // packed). Mass values never change after this, so a single inject
+    // here is enough; the shader preserves .w on every position write.
+    for (i, m) in mass.iter().enumerate() {
+        let w_off = 4 * i + 3;
+        if w_off < positions.len() {
+            positions[w_off] = *m;
+        }
+    }
     let mass = if mass.is_empty() { vec![1.0f32] } else { mass };
 
     // ---- Virtual-vertex CSR (Tigr) -----------------------------------------
@@ -1419,9 +1439,15 @@ fn build_pipeline(device: &wgpu::Device) -> ForcePipelines {
             },
             count: None,
         },
-        storage_entry(6, true),  // cell_offsets
-        storage_entry(7, true),  // cell_nodes
-        storage_entry(8, true),  // mass
+        // Bindings 6 + 7 (cell_offsets / cell_nodes) were dropped from
+        // force_step to bring the per-stage storage-buffer count to 10
+        // (Chrome WebGPU's hard cap). The grid-build pipelines on group(1)
+        // still construct the buffers when Grid mode is selected; force_step
+        // just no longer consumes them and falls through to the naive
+        // O(n²) branch in that case.
+        //
+        // Binding 8 (mass) was also dropped — mass is now packed into
+        // positions[i].w (see force.wgsl preamble + precompute below).
         storage_entry(9, false), // energy_out
     ];
     let bind_group_layout = device.create_bind_group_layout(
@@ -1483,10 +1509,13 @@ fn build_pipeline(device: &wgpu::Device) -> ForcePipelines {
     // Group 3: hub-aware virtual-vertex CSR + per-virtual spring partials.
     // Bound by both `spring_step` (writes partials) and `force_step` (reads).
     let spring_bgl_entries = [
-        storage_entry(0, true),  // virt_real_idx
-        storage_entry(1, true),  // virt_edge_offsets
+        // virt_csr packs `node_to_virt_offsets` (length n+1) followed by
+        // `virt_real_idx` (length n_virtual). Saves one storage-binding
+        // slot vs the previous separate buffers, getting the per-stage
+        // count under Chrome WebGPU's cap of 10.
+        storage_entry(0, true),  // virt_csr (read)
+        storage_entry(1, true),  // virt_edge_offsets (read)
         storage_entry(2, false), // spring_force_partial (rw)
-        storage_entry(3, true),  // node_to_virt_offsets
     ];
     let spring_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
         label: Some("gpu_force_spring_bgl"),
@@ -1623,9 +1652,8 @@ impl GpuState {
             velocities: aux.vel,
             edge_offsets: aux.off,
             edge_neighbors: aux.neigh,
-            virt_real_idx_buf: aux.virt_real_idx,
+            virt_csr_buf: aux.virt_csr,
             virt_edge_offsets_buf: aux.virt_edge_offsets,
-            node_to_virt_offsets_buf: aux.node_to_virt_offsets,
             spring_force_partial_buf: aux.spring_force_partial,
             n_virtual: aux.n_virtual,
             spring_bind_group_layout: pipelines.spring_bgl,
@@ -1706,9 +1734,8 @@ impl GpuState {
             velocities: aux.vel,
             edge_offsets: aux.off,
             edge_neighbors: aux.neigh,
-            virt_real_idx_buf: aux.virt_real_idx,
+            virt_csr_buf: aux.virt_csr,
             virt_edge_offsets_buf: aux.virt_edge_offsets,
-            node_to_virt_offsets_buf: aux.node_to_virt_offsets,
             spring_force_partial_buf: aux.spring_force_partial,
             n_virtual: aux.n_virtual,
             spring_bind_group_layout: pipelines.spring_bgl,
@@ -1969,9 +1996,9 @@ impl GpuState {
                 buf_entry(3, &self.edge_offsets),
                 buf_entry(4, &self.edge_neighbors),
                 buf_entry(5, &self.params_buf),
-                buf_entry(6, &self.cell_offsets_buf),
-                buf_entry(7, &self.cell_nodes_buf),
-                buf_entry(8, &self.mass_buf),
+                // Bindings 6 + 7 omitted (cell_offsets / cell_nodes —
+                // see force.wgsl preamble). Binding 8 omitted (mass packed
+                // into positions[i].w).
                 buf_entry(9, &self.energy_buf),
             ],
         })
@@ -2069,10 +2096,9 @@ impl GpuState {
             label: Some("gpu_force_spring_bg"),
             layout: &self.spring_bind_group_layout,
             entries: &[
-                buf_entry(0, &self.virt_real_idx_buf),
+                buf_entry(0, &self.virt_csr_buf),
                 buf_entry(1, &self.virt_edge_offsets_buf),
                 buf_entry(2, &self.spring_force_partial_buf),
-                buf_entry(3, &self.node_to_virt_offsets_buf),
             ],
         })
     }
@@ -2294,9 +2320,10 @@ struct AuxBuffers {
     vel: wgpu::Buffer,
     off: wgpu::Buffer,
     neigh: wgpu::Buffer,
-    virt_real_idx: wgpu::Buffer,
+    /// Packs `node_to_virt_offsets` (length n+1) + `virt_real_idx`
+    /// (length n_virtual) into one u32 buffer. See `build_aux_buffers`.
+    virt_csr: wgpu::Buffer,
     virt_edge_offsets: wgpu::Buffer,
-    node_to_virt_offsets: wgpu::Buffer,
     spring_force_partial: wgpu::Buffer,
     n_virtual: u32,
     params: wgpu::Buffer,
@@ -2334,19 +2361,27 @@ fn build_aux_buffers(device: &wgpu::Device, pc: &PreCompute) -> AuxBuffers {
         usage: wgpu::BufferUsages::STORAGE,
     });
     // Hub-aware (Tigr) virtual-vertex CSR + per-virtual spring partials.
-    let virt_real_idx = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: Some("virt_real_idx"),
-        contents: bytemuck::cast_slice(&pc.virt_real_idx),
+    //
+    // `virt_csr` packs `node_to_virt_offsets` (length n_nodes+1) followed
+    // by `virt_real_idx` (length n_virtual) into a single storage buffer
+    // — saves one storage-binding slot per stage so the force_step
+    // pipeline fits under Chrome's WebGPU per-stage cap of 10.
+    //
+    // WGSL access pattern:
+    //   node_to_virt_offsets[i] → virt_csr[i]
+    //   virt_real_idx[v]        → virt_csr[(n_nodes + 1u) + v]
+    let mut virt_csr_packed: Vec<u32> =
+        Vec::with_capacity(pc.node_to_virt_offsets.len() + pc.virt_real_idx.len());
+    virt_csr_packed.extend_from_slice(&pc.node_to_virt_offsets);
+    virt_csr_packed.extend_from_slice(&pc.virt_real_idx);
+    let virt_csr = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("virt_csr"),
+        contents: bytemuck::cast_slice(&virt_csr_packed),
         usage: wgpu::BufferUsages::STORAGE,
     });
     let virt_edge_offsets = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("virt_edge_offsets"),
         contents: bytemuck::cast_slice(&pc.virt_edge_offsets),
-        usage: wgpu::BufferUsages::STORAGE,
-    });
-    let node_to_virt_offsets = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: Some("node_to_virt_offsets"),
-        contents: bytemuck::cast_slice(&pc.node_to_virt_offsets),
         usage: wgpu::BufferUsages::STORAGE,
     });
     // Per-virtual partial spring forces — vec3<f32> stride = 16 bytes.
@@ -2431,9 +2466,8 @@ fn build_aux_buffers(device: &wgpu::Device, pc: &PreCompute) -> AuxBuffers {
         vel,
         off,
         neigh,
-        virt_real_idx,
+        virt_csr,
         virt_edge_offsets,
-        node_to_virt_offsets,
         spring_force_partial,
         n_virtual: pc.n_virtual,
         params,

@@ -66,15 +66,27 @@ struct SimParams {
     step_index: u32,
 };
 
-@group(0) @binding(0) var<storage, read>       positions_in:    array<vec3<f32>>;
-@group(0) @binding(1) var<storage, read_write> positions_out:   array<vec3<f32>>;
+// Positions are stored as vec4 — xyz is the world-space position, w is
+// the per-node mass. Packing mass into the .w slot drops one storage-
+// binding slot vs a separate `mass` buffer; the underlying byte layout
+// is unchanged (the buffer was already vec4-padded for std140-style
+// 16-byte alignment, so the .w slot was previously 0.0). Every position
+// read uses `.xyz`; mass reads use `.w`. Writes to `positions_out` must
+// preserve the .w (see force_step's final store).
+@group(0) @binding(0) var<storage, read>       positions_in:    array<vec4<f32>>;
+@group(0) @binding(1) var<storage, read_write> positions_out:   array<vec4<f32>>;
 @group(0) @binding(2) var<storage, read_write> velocities:      array<vec3<f32>>;
 @group(0) @binding(3) var<storage, read>       edge_offsets:    array<u32>;
 @group(0) @binding(4) var<storage, read>       edge_neighbors:  array<u32>;
 @group(0) @binding(5) var<uniform>             params:          SimParams;
-@group(0) @binding(6) var<storage, read>       cell_offsets:    array<u32>;
-@group(0) @binding(7) var<storage, read>       cell_nodes:      array<u32>;
-@group(0) @binding(8) var<storage, read>       mass:            array<f32>;
+// Bindings 6 + 7 were `cell_offsets` / `cell_nodes` for the legacy
+// Grid repulsion path (group 0). Dropped to bring the per-stage storage-
+// buffer count down to the WebGPU runtime cap of 10. The grid-build
+// pipelines on group(1) still construct these buffers when the user
+// selects RepulsionMode::Grid, but `force_step` no longer consumes them —
+// the path falls through to the naive O(n²) repulsion branch instead.
+// Binding 8 used to be `mass: array<f32>` — now packed into positions_in[i].w
+// (see the comment on bindings 0/1). Removing it dropped one storage slot.
 @group(0) @binding(9) var<storage, read_write> energy_out:      array<f32>;
 
 // ---- Grid-build bindings (group 1) -----------------------------------------
@@ -118,10 +130,17 @@ const OCT_BODY_INTERNAL: u32 = 0xFFFFFFFFu;
 // partials via `node_to_virt_offsets[i..i+1]`. This converts a single
 // O(degree) loop on a hub thread into ceil(degree/HUB_THRESHOLD) parallel
 // O(HUB_THRESHOLD) lanes, eliminating the warp-stall on power-law graphs.
-@group(3) @binding(0) var<storage, read>       virt_real_idx:        array<u32>;
+// `virt_csr` packs `node_to_virt_offsets` (length n_nodes+1) followed
+// by `virt_real_idx` (length n_virtual) into one buffer. This saves one
+// storage-binding slot per stage so the force_step pipeline fits the
+// per-stage cap of 10 (Chrome WebGPU runtime limit).
+//
+// Access patterns:
+//   node_to_virt_offsets[i] → virt_csr[i]
+//   virt_real_idx[v]        → virt_csr[(params.n_nodes + 1u) + v]
+@group(3) @binding(0) var<storage, read>       virt_csr:             array<u32>;
 @group(3) @binding(1) var<storage, read>       virt_edge_offsets:    array<u32>;
 @group(3) @binding(2) var<storage, read_write> spring_force_partial: array<vec3<f32>>;
-@group(3) @binding(3) var<storage, read>       node_to_virt_offsets: array<u32>;
 
 fn gb_cell_for(pos: vec3<f32>) -> u32 {
     let inv = 1.0 / gb_params.grid_cell_size;
@@ -256,18 +275,21 @@ fn pcg_hash(state: u32) -> u32 {
 fn spring_step(@builtin(global_invocation_id) gid: vec3<u32>) {
     let v = gid.x;
     // Re-derive n_virtual from node_to_virt_offsets[n_nodes].
-    let n_virtual = node_to_virt_offsets[params.n_nodes];
+    // node_to_virt_offsets occupies the first n_nodes+1 entries of virt_csr.
+    let n_virtual = virt_csr[params.n_nodes];
     if (v >= n_virtual) { return; }
 
-    let i = virt_real_idx[v];
-    let pos = positions_in[i];
+    // virt_real_idx lives in the tail of virt_csr (after the n_nodes+1
+    // node_to_virt_offsets entries).
+    let i = virt_csr[params.n_nodes + 1u + v];
+    let pos = positions_in[i].xyz;
     let estart = virt_edge_offsets[v];
     let eend   = virt_edge_offsets[v + 1u];
 
     var f = vec3<f32>(0.0, 0.0, 0.0);
     for (var k: u32 = estart; k < eend; k = k + 1u) {
         let other = edge_neighbors[k];
-        let d = positions_in[other] - pos;
+        let d = positions_in[other].xyz - pos;
         let dist = max(length(d), 0.01);
         let stretch = dist - params.spring_len;
         f = f + (d / dist) * (params.spring_k * stretch);
@@ -282,7 +304,9 @@ fn force_step(@builtin(global_invocation_id) gid: vec3<u32>) {
         return;
     }
 
-    let pos = positions_in[i];
+    let pos_full = positions_in[i];
+    let pos = pos_full.xyz;
+    let self_mass = pos_full.w;
     var vel = velocities[i];
     var force = vec3<f32>(0.0, 0.0, 0.0);
 
@@ -375,57 +399,32 @@ fn force_step(@builtin(global_invocation_id) gid: vec3<u32>) {
             // measurable layout-quality difference.
             let j = h % params.n_nodes;
             if (j == i) { continue; }
-            let d = pos - positions_in[j];
+            let p_j = positions_in[j];
+            let d = pos - p_j.xyz;
             let dist2 = dot(d, d);
             if (dist2 > r_clip2) { continue; }
             let dist2c = max(dist2, dist2_floor);
             // Same mass-weighted Coulomb form as the grid path so layout
             // quality is comparable; only the *set* of j's changes.
-            force = force + d * (params.repulsion * mass[j] / dist2c);
-        }
-    } else if (params.grid_enabled == 1u) {
-        // Walk 27 neighbor cells.
-        let inv_cell = 1.0 / params.grid_cell_size;
-        let rel = (pos - params.grid_origin) * inv_cell;
-        let cx = i32(floor(rel.x));
-        let cy = i32(floor(rel.y));
-        let cz = i32(floor(rel.z));
-        let dim_x = i32(params.grid_dim.x);
-        let dim_y = i32(params.grid_dim.y);
-        let dim_z = i32(params.grid_dim.z);
-        for (var dz: i32 = -1; dz <= 1; dz = dz + 1) {
-            let nz = cz + dz;
-            if (nz < 0 || nz >= dim_z) { continue; }
-            for (var dy: i32 = -1; dy <= 1; dy = dy + 1) {
-                let ny = cy + dy;
-                if (ny < 0 || ny >= dim_y) { continue; }
-                for (var dx: i32 = -1; dx <= 1; dx = dx + 1) {
-                    let nx = cx + dx;
-                    if (nx < 0 || nx >= dim_x) { continue; }
-                    let cell_idx = u32(nx) + u32(ny) * params.grid_dim.x
-                        + u32(nz) * params.grid_dim.x * params.grid_dim.y;
-                    let start = cell_offsets[cell_idx];
-                    let end   = cell_offsets[cell_idx + 1u];
-                    for (var k: u32 = start; k < end; k = k + 1u) {
-                        let j = cell_nodes[k];
-                        if (j == i) { continue; }
-                        let d = pos - positions_in[j];
-                        let dist2 = dot(d, d);
-                        if (dist2 > r_clip2) { continue; }
-                        let dist2c = max(dist2, dist2_floor);
-                        force = force + d * (params.repulsion * mass[j] / dist2c);
-                    }
-                }
-            }
+            // Mass lives in positions_in[j].w (packed alongside xyz).
+            force = force + d * (params.repulsion * p_j.w / dist2c);
         }
     } else {
+        // Naive O(n²) fallback — also catches the legacy
+        // `RepulsionMode::Grid` path now that the grid branch has been
+        // removed (the `cell_offsets` / `cell_nodes` bindings live in
+        // the grid-build group, not the force-step group). For small
+        // graphs (< few thousand nodes) this is fine; BarnesHut is the
+        // default for larger ones.
         for (var j: u32 = 0u; j < params.n_nodes; j = j + 1u) {
             if (j == i) { continue; }
-            let d = pos - positions_in[j];
+            let p_j = positions_in[j];
+            let d = pos - p_j.xyz;
             let dist2 = dot(d, d);
             if (dist2 > r_clip2) { continue; }
             let dist2c = max(dist2, dist2_floor);
-            force = force + d * (params.repulsion * mass[j] / dist2c);
+            // Mass packed into .w of positions buffer.
+            force = force + d * (params.repulsion * p_j.w / dist2c);
         }
     }
 
@@ -435,8 +434,9 @@ fn force_step(@builtin(global_invocation_id) gid: vec3<u32>) {
     // belong to real vertex `i`. For non-hub vertices this is one iteration;
     // for a hub of degree D it is ceil(D/HUB_THRESHOLD) iterations — already
     // computed in parallel in spring_step.
-    let v_start = node_to_virt_offsets[i];
-    let v_end   = node_to_virt_offsets[i + 1u];
+    // node_to_virt_offsets lives in the first n_nodes+1 entries of virt_csr.
+    let v_start = virt_csr[i];
+    let v_end   = virt_csr[i + 1u];
     for (var v: u32 = v_start; v < v_end; v = v + 1u) {
         force = force + spring_force_partial[v];
     }
@@ -455,7 +455,8 @@ fn force_step(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
 
     // ---- Integrate (per-node mass) -----------------------------------------
-    let m = max(mass[i], 1.0);
+    // Mass packed into positions_in[i].w (captured earlier as `self_mass`).
+    let m = max(self_mass, 1.0);
     let accel = force / m;
     vel = (vel + accel * params.dt) * params.damping;
 
@@ -486,7 +487,10 @@ fn force_step(@builtin(global_invocation_id) gid: vec3<u32>) {
     let new_pos = pos + vel * params.dt;
 
     velocities[i] = vel;
-    positions_out[i] = new_pos;
+    // Preserve the .w mass slot — without this the next frame's force_step
+    // reads positions_in[i].w == 0, which divides by zero in the mass
+    // term and stalls every node tagged as a hub.
+    positions_out[i] = vec4<f32>(new_pos, self_mass);
 
     // Track per-node KE proxy = |vel|^2. CPU reduces.
     energy_out[i] = dot(vel, vel);
