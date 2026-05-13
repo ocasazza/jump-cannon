@@ -162,6 +162,12 @@ async fn node_meta(State(s): State<AppState>, Path(id): Path<String>) -> impl In
     if let Some(node) = s.inner.graph.nodes.get(&id) {
         let frontmatter_json = serde_json::to_string(&node.meta.frontmatter)
             .unwrap_or_else(|_| "{}".into());
+        // Read the full markdown body from disk. We don't pre-load
+        // every body into the in-memory graph (a 10k-node vault is
+        // ~50MB of text), so this is a lazy per-request file read.
+        // Strip the YAML frontmatter so the renderer doesn't render it
+        // twice — it's already in `frontmatter_json`.
+        let body = read_body(&s.inner.vault_root, &node.meta.path);
         let msg = proto::NodeMeta {
             id: id.clone(),
             title: node.meta.title.clone(),
@@ -178,6 +184,7 @@ async fn node_meta(State(s): State<AppState>, Path(id): Path<String>) -> impl In
             kcore: node.metrics.kcore as u32,
             community: node.metrics.community as u32,
             wcc: node.metrics.wcc as u32,
+            body,
         };
         return proto_response(&msg).into_response();
     }
@@ -204,8 +211,59 @@ async fn node_meta(State(s): State<AppState>, Path(id): Path<String>) -> impl In
         kcore: 0,
         community: 0,
         wcc: 0,
+        // External nodes have no corresponding markdown file in the
+        // vault, so no body is available. The renderer falls back to
+        // displaying just metadata.
+        body: String::new(),
     };
     proto_response(&msg).into_response()
+}
+
+/// Lazily read a note's markdown body from disk. `path_id` is the
+/// vault-links convention (relative path *without* `.md` extension).
+/// Frontmatter is stripped — the renderer already has it via
+/// `frontmatter_json`. Returns the empty string on any failure (missing
+/// file, IO error) rather than propagating an error: the caller treats
+/// "no body" as a soft fallback.
+fn read_body(vault_root: &std::path::Path, path_id: &str) -> String {
+    let abs = vault_root.join(format!("{path_id}.md"));
+    let raw = match std::fs::read_to_string(&abs) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::debug!(path = %abs.display(), error = %e, "body read failed");
+            return String::new();
+        }
+    };
+    // Strip leading `---\n…\n---` YAML frontmatter. Same shape as the
+    // splitter in vault-links/src/parser.rs but inline here so we don't
+    // pull in that crate just for the strip.
+    let rest = match raw.strip_prefix("---\n").or_else(|| raw.strip_prefix("---\r\n")) {
+        Some(r) => r,
+        None => return raw,
+    };
+    if let Some(end) = find_fm_close(rest) {
+        let after = &rest[end..];
+        let after = after
+            .strip_prefix("---\n")
+            .or_else(|| after.strip_prefix("---\r\n"))
+            .or_else(|| after.strip_prefix("---"))
+            .unwrap_or(after);
+        return after.trim_start_matches('\n').to_string();
+    }
+    raw
+}
+
+fn find_fm_close(s: &str) -> Option<usize> {
+    let mut start = 0;
+    while start < s.len() {
+        let line_end = s[start..].find('\n').map(|i| start + i).unwrap_or(s.len());
+        let line = s[start..line_end].trim_end_matches('\r');
+        if line == "---" {
+            return Some(start);
+        }
+        start = line_end + 1;
+    }
+    None
 }
 
 #[derive(Deserialize)]

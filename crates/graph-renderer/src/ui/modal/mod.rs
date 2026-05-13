@@ -134,7 +134,8 @@ pub fn show_modal_with(
     })
     .open(&mut open)
     .resizable(true)
-    .default_width(380.0)
+    .default_width(560.0)
+    .min_width(360.0)
     .show(ctx, |ui| {
         // path subtitle
         ui.label(
@@ -249,6 +250,36 @@ pub fn show_modal_with(
                 metric_row(ui, "community", meta.community as i64);
                 metric_row(ui, "wcc", meta.wcc as i64);
             });
+
+        // Markdown body — rendered as monospaced text in a scrollable
+        // panel for now. Frontmatter has already been stripped server-
+        // side (see graph-api `read_body`). When `body` is empty (e.g.
+        // an external node with no file, or a read failure), we just
+        // hide the section rather than show a noisy placeholder.
+        //
+        // TODO(commonmark): swap the plain-text view for an actual
+        // markdown renderer (`egui_commonmark`). Wikilinks in the body
+        // should resolve via the existing `Navigate` BadgeAction path.
+        if !meta.body.is_empty() {
+            ui.separator();
+            ui.label(
+                egui::RichText::new("Body")
+                    .color(crate::ui::theme::palette::TEXT)
+                    .strong(),
+            );
+            ui.add_space(4.0);
+            egui::ScrollArea::vertical()
+                .max_height(420.0)
+                .auto_shrink([false, true])
+                .show(ui, |ui| {
+                    ui.add(
+                        egui::TextEdit::multiline(&mut meta.body.clone())
+                            .desired_width(f32::INFINITY)
+                            .font(egui::TextStyle::Monospace)
+                            .interactive(false),
+                    );
+                });
+        }
     });
     state.open = open;
     if !state.open {

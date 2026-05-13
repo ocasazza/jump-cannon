@@ -32,6 +32,14 @@ message NodeMeta {
   uint32 kcore = 15;
   uint32 community = 16;
   uint32 wcc = 17;
+
+  // Full markdown body of the note (frontmatter stripped). Lazily read
+  // from disk on each `/node/:id` request — we don't pre-load every
+  // body into memory because a 10k-node vault would balloon the
+  // server's RSS. Empty for external nodes (no corresponding file) or
+  // when the read fails. Frontmatter is *not* duplicated here; it
+  // lives in `frontmatter_json` (field 7).
+  string body = 18;
 }
 
 // Search response. Returned by /search?q=…
