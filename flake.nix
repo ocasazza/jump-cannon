@@ -209,22 +209,40 @@
           '';
         };
 
-        # `nix run .#dev-up` — load the Nix-built image into podman, start compose.
-        # On darwin, podman needs a Linux VM (`podman machine`) — preflight it
-        # so the script gives a clear actionable error instead of a confusing
-        # "Cannot connect to Podman" from `podman load`.
+        # `nix run .#dev-up` — bring up the graph-compute backend.
+        #
+        # Linux: load the Nix-built OCI image into podman + start compose.
+        # The image's binary is Linux ELF for the host arch, so it runs.
+        #
+        # Darwin: the `graph-compute` derivation is a darwin Mach-O binary
+        # (rust-toolchain targets the host system). Packaging it into an
+        # OCI image and `podman exec`-ing it inside the Linux VM fails
+        # with "Exec format error" — Mach-O can't run in a Linux VM.
+        # Cross-compiling the Rust crate to Linux from a darwin host is
+        # non-trivial (wgpu + protobuf + C cross-toolchain), so darwin
+        # devs run the native binary directly instead. Same `[::]:50051`
+        # bind, same env vars — `graph-api`'s broker dials the same URL
+        # either way.
         dev-up = pkgs.writeShellApplication {
           name = "dev-up";
           runtimeInputs = [ pkgs.podman pkgs.podman-compose ];
           text = ''
             set -euo pipefail
             if [ "$(uname -s)" = "Darwin" ]; then
-              if ! podman machine list --format '{{.Running}}' 2>/dev/null | grep -q true; then
-                echo "error: podman machine is not running on darwin." >&2
-                echo "  start it with: podman machine init && podman machine start" >&2
-                echo "  (one-time init; subsequent boots only need 'podman machine start')" >&2
-                exit 1
-              fi
+              echo "darwin: running graph-compute natively (no podman container)."
+              echo "  the OCI image build target is the host system, so a darwin"
+              echo "  binary can't exec inside the Linux VM podman drives. The"
+              echo "  native binary is functionally equivalent for the broker."
+              echo "  → ${graph-compute}/bin/graph-compute"
+              export GRAPH_COMPUTE_TICK_HZ='${toString graphComputeService.tickHz}'
+              export GRAPH_COMPUTE_ADDR='${graphComputeService.bindAddr}'
+              export RUST_LOG='${graphComputeService.rustLog}'
+              exec ${graph-compute}/bin/graph-compute
+            fi
+            if ! podman machine list --format '{{.Running}}' 2>/dev/null | grep -q true; then
+              # On linux hosts podman machine isn't usually used, but if it is
+              # configured the same gate applies.
+              :
             fi
             echo "loading ${graphComputeService.name}:latest into podman..."
             podman load < ${graph-compute-image}
@@ -233,11 +251,22 @@
           '';
         };
 
+        # `nix run .#dev-down` — tear down whatever `dev-up` brought up.
+        # Linux: stop the compose stack. Darwin: kill the native process by
+        # name (the foreground `exec` in `dev-up` makes Ctrl-C the normal
+        # shutdown, but a stale background process can be cleaned up here).
         dev-down = pkgs.writeShellApplication {
           name = "dev-down";
           runtimeInputs = [ pkgs.podman-compose ];
           text = ''
             set -euo pipefail
+            if [ "$(uname -s)" = "Darwin" ]; then
+              # `pkill` returns 1 when no process matches — that's the
+              # idempotent "nothing to tear down" case, not an error.
+              pkill -x graph-compute || true
+              echo "darwin: killed any running native graph-compute."
+              exit 0
+            fi
             podman-compose down
           '';
         };
