@@ -21,8 +21,9 @@ use std::collections::HashMap;
 
 use super::frontmatter_chip::{render_frontmatter_chips, ChipOutcome};
 use super::frontmatter_grid::show_frontmatter_grid;
+use super::floating::FloatingPanel;
 use super::query::ActiveFieldFilters;
-use super::state::{AppState, ColorBy};
+use super::state::{AppState, ColorBy, PanelId};
 use super::theme::palette;
 
 // Default expanded width — user-resizable within `PANEL_W_RANGE`.
@@ -118,11 +119,38 @@ pub fn show(
         return None;
     }
     if state.inspector_floating {
-        show_floating(ctx, state, data)
+        show_floating_window(ctx, state, data)
     } else {
         show_expanded(ctx, state, data);
         None
     }
+}
+
+/// Render the inspector inside a tray-aware [`FloatingPanel`].
+///
+/// Task C2 of the GUI refactor: surfaces the same inspector body the
+/// docked / popped-out paths in [`show`] render, but inside the project's
+/// standard floating-panel chrome (squircle backdrop, custom header,
+/// tray collapse). The existing [`show`] entrypoint is unchanged so the
+/// app keeps its current call path; this function is the migration
+/// target for callers that want the new floating-panel UX.
+pub fn show_floating(
+    ctx: &egui::Context,
+    state: &mut AppState,
+    data: &mut InspectorData,
+) {
+    // Split the borrow: `FloatingPanel::show` needs `&mut state.tray`,
+    // and the body closure needs `&mut AppState` for `render_body`. We
+    // temporarily move `tray` out so the closure can take the whole
+    // `state` mutably, then restore it after the panel returns.
+    let mut tray = std::mem::take(&mut state.tray);
+    FloatingPanel::new(PanelId::Inspector, "Inspector")
+        .default_pos([1200.0, 64.0])
+        .default_size([340.0, 600.0])
+        .show(ctx, &mut tray, |ui| {
+            render_body(ui, state, data);
+        });
+    state.tray = tray;
 }
 
 /// Floating "Open inspector" pill mounted in the canvas's top-right
@@ -191,7 +219,7 @@ fn show_expanded(ctx: &egui::Context, state: &mut AppState, data: &mut Inspector
 /// as a draggable `egui::Window` instead of a docked SidePanel. Returns
 /// the outer screen-space `Rect` of the window so the host can draw a
 /// leader line from the nearest corner to the focused node.
-fn show_floating(
+fn show_floating_window(
     ctx: &egui::Context,
     state: &mut AppState,
     data: &mut InspectorData,

@@ -49,20 +49,37 @@ pub mod accent {
     pub const YELLOW: Color32 = Color32::from_rgb(0xff, 0xd8, 0x3b);
 }
 
-/// Core palette. Built around the user-chosen brand purple
-/// `#BC83BA` (HSL ≈ 302°, 30%, 63%). Semantic states (`good`, `bad`,
-/// `warning`, `info`) are derived from a single tuned chroma/lightness
-/// pair via [`palette::hsl`] so they sit at the same visual weight as
-/// PURPLE — no neon color clashing with the muted brand mark.
+/// Core palette. Built around a three-primary brand mark
+/// (`PRIMARY` red, `SECONDARY` green, `TERTIARY` blue) tuned to sit
+/// at the same muted-saturation anchor as the semantic states
+/// (`good`, `bad`, `warning`, `info`). Derived from a single tuned
+/// chroma/lightness pair via [`hsl`] so all brand + semantic colors
+/// carry roughly the same visual weight — no neon clashing with the
+/// dark-on-darker chrome.
 ///
 /// Pure NEUTRAL trio (`BLACK`, `GREY`, `WHITE`) for backgrounds and
 /// chrome.
 pub mod palette {
     use eframe::egui::Color32;
 
-    // Brand.
-    /// `#BC83BA` — primary brand mark / selection accent.
-    pub const PURPLE: Color32 = Color32::from_rgb(188, 131, 186);
+    // Brand. Three-primary palette tuned to sit at the same muted-
+    // saturation / mid-lightness anchor as the semantic GOOD/BAD/INFO
+    // colors below — no neon, no clash. Replaces the previous single
+    // `PURPLE` brand mark.
+    /// `#CC4444` — saturated-but-tasteful red. Primary brand mark and
+    /// selection accent.
+    pub const PRIMARY:   Color32 = Color32::from_rgb(0xCC, 0x44, 0x44);
+    /// `#44CC66` — green secondary, aligns with the GOOD `#83CC95`
+    /// aesthetic at a slightly punchier chroma.
+    pub const SECONDARY: Color32 = Color32::from_rgb(0x44, 0xCC, 0x66);
+    /// `#4488CC` — blue tertiary, aligns with INFO `#83B7CC`.
+    pub const TERTIARY:  Color32 = Color32::from_rgb(0x44, 0x88, 0xCC);
+
+    /// Back-compat alias for the old single-brand purple. Callers
+    /// outside this file (e.g. `badge.rs`) still reference
+    /// `palette::PURPLE`; aliasing it to `PRIMARY` keeps them
+    /// compiling while the GUI refactor is in flight.
+    pub const PURPLE: Color32 = PRIMARY;
 
     // Neutrals (kept square, no rounding).
     pub const BLACK: Color32 = Color32::from_rgb(0x05, 0x07, 0x10);
@@ -95,6 +112,30 @@ pub mod palette {
     pub const WARNING: Color32 = Color32::from_rgb(0xCC, 0xB4, 0x83);
     /// Sky blue — opposite-warm-cool (H≈200). "Info / hint".
     pub const INFO:    Color32 = Color32::from_rgb(0x83, 0xB7, 0xCC);
+}
+
+/// Floating panel/window backdrop — ~75% opaque black so the wgpu
+/// graph canvas shows through subtly behind floating chrome (inspector
+/// pop-out, modal, command palette). Premultiplied alpha: since RGB
+/// is (0,0,0), premultiplied == straight, so this is a valid value
+/// for egui's mesh blending either way.
+pub const FLOATING_BACKDROP: egui::Color32 = egui::Color32::from_rgba_premultiplied(0, 0, 0, 190);
+
+/// Frame preset for floating surfaces — translucent backdrop, 1px
+/// border in the chrome border color, square corners (callers paint
+/// squircles on top), 8px inner margin, no outer margin or shadow.
+///
+/// A3 only exposes this helper; existing floating callers (inspector
+/// pop-out, modal, command palette) opt in via task C4.
+pub fn floating_frame() -> egui::Frame {
+    egui::Frame {
+        fill: FLOATING_BACKDROP,
+        stroke: egui::Stroke::new(1.0, palette::BORDER),
+        rounding: egui::Rounding::ZERO,
+        inner_margin: egui::Margin::same(8.0),
+        outer_margin: egui::Margin::same(0.0),
+        shadow: egui::epaint::Shadow::NONE,
+    }
 }
 
 /// Typography size tokens. Every font construction in the project

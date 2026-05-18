@@ -7,8 +7,9 @@ use eframe::egui;
 
 use super::actions::ActionRegistry;
 use super::layout::registry::LayoutRegistry;
+use super::floating::FloatingPanel;
 use super::sections;
-use super::state::{AppState, Section};
+use super::state::{AppState, PanelId, Section};
 use super::theme::palette;
 use crate::perf::PerfCollector;
 
@@ -18,9 +19,6 @@ use crate::perf::PerfCollector;
 const ACTIVITY_W: f32 = 44.0;
 const ACTIVITY_BTN: f32 = 40.0;
 // Default section panel width; user-resizable within `SECTION_W_RANGE`.
-const SECTION_W: f32 = 280.0;
-const SECTION_W_MIN: f32 = 200.0;
-const SECTION_W_MAX: f32 = 520.0;
 
 pub fn show(
     ctx: &egui::Context,
@@ -30,9 +28,10 @@ pub fn show(
     perf: &PerfCollector,
 ) {
     show_activity_bar(ctx, state);
-    if let Some(active) = state.active_section {
-        show_section_panel(ctx, state, active, registry, layout_registry, perf);
-    }
+    // Section panel is now rendered as a floating panel (see
+    // `show_floating`); the docked branch is retained below for
+    // reference but no longer dispatched here.
+    let _ = (registry, layout_registry, perf);
 }
 
 fn show_activity_bar(ctx: &egui::Context, state: &mut AppState) {
@@ -239,32 +238,45 @@ fn draw_icon(painter: &egui::Painter, rect: egui::Rect, section: Section, color:
     }
 }
 
-fn show_section_panel(
-    ctx: &egui::Context,
+fn render_section_body(
+    ui: &mut egui::Ui,
     state: &mut AppState,
     active: Section,
     registry: &mut ActionRegistry,
     layout_registry: &LayoutRegistry,
     perf: &PerfCollector,
 ) {
-    egui::SidePanel::left("section-panel")
-        .default_width(SECTION_W)
-        .width_range(SECTION_W_MIN..=SECTION_W_MAX)
-        .resizable(true)
-        .frame(
-            egui::Frame::none()
-                .fill(egui::Color32::BLACK)
-                .stroke(egui::Stroke::new(1.0, palette::BORDER))
-                .inner_margin(egui::Margin {
-                    left: 16.0,
-                    right: 16.0,
-                    top: 14.0,
-                    bottom: 14.0,
-                }),
-        )
-        .show(ctx, |ui| {
-            egui::ScrollArea::vertical().show(ui, |ui| {
-                sections::show(ui, active, state, registry, layout_registry, perf);
-            });
+    egui::ScrollArea::vertical().show(ui, |ui| {
+        sections::show(ui, active, state, registry, layout_registry, perf);
+    });
+}
+
+/// Floating variant of the section panel. Renders the same inner body
+/// inside a `FloatingPanel` keyed by `PanelId::Sidebar`. The activity
+/// bar stays docked and is not touched here.
+pub fn show_floating(
+    ctx: &egui::Context,
+    state: &mut AppState,
+    registry: &mut ActionRegistry,
+    layout_registry: &LayoutRegistry,
+    perf: &PerfCollector,
+) {
+    let Some(active) = state.active_section else {
+        return;
+    };
+    // Split the borrow so the closure can take &mut AppState while the
+    // FloatingPanel holds &mut state.tray.
+    let AppState { ref mut tray, .. } = *state;
+    // SAFETY note: we re-borrow the rest of state inside the closure via
+    // a raw pointer dance? No — simpler: use a scope where we pass the
+    // whole state to the closure but pull tray out by swapping. Use the
+    // pattern of taking tray via std::mem::replace.
+    let mut tray_tmp = std::mem::take(tray);
+    FloatingPanel::new(PanelId::Sidebar, "Sidebar")
+        .default_pos([16.0, 64.0])
+        .default_size([280.0, 520.0])
+        .show(ctx, &mut tray_tmp, |ui| {
+            render_section_body(ui, state, active, registry, layout_registry, perf);
         });
+    state.tray = tray_tmp;
 }

@@ -602,6 +602,10 @@ pub struct AppState {
     /// frequency.
     #[serde(default)]
     pub tag_browser_query: String,
+    /// Collapsed-panel tray state. Default empty so existing visible
+    /// panels remain visible on first load.
+    #[serde(default)]
+    pub tray: TrayState,
     #[serde(skip)]
     pub stats: LiveStats,
     /// One-shot signal: the Layout sidebar's "Solve" button sets this to
@@ -610,6 +614,56 @@ pub struct AppState {
     /// current settings (useful e.g. to re-roll a Random seed).
     #[serde(skip)]
     pub layout_solve_requested: bool,
+}
+
+/// Identifies a floating/dockable panel that can be collapsed into the tray
+/// strip. Modal dialogs and the command palette stay non-collapsible and
+/// are intentionally absent from this enum.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub enum PanelId {
+    Sidebar,
+    Inspector,
+    FilterStrip,
+}
+
+impl PanelId {
+    pub fn label(self) -> &'static str {
+        match self {
+            PanelId::Sidebar => "Sidebar",
+            PanelId::Inspector => "Inspector",
+            PanelId::FilterStrip => "Filters",
+        }
+    }
+}
+
+/// Holds the ordered list of panels currently collapsed into the tray
+/// strip. Insertion order is preserved so the tray UI renders chips in
+/// the sequence the user collapsed them.
+#[derive(Default, Clone, Debug, Serialize, Deserialize)]
+pub struct TrayState {
+    #[serde(default)]
+    pub collapsed: Vec<PanelId>,
+}
+
+impl TrayState {
+    pub fn is_collapsed(&self, id: PanelId) -> bool {
+        self.collapsed.contains(&id)
+    }
+    pub fn collapse(&mut self, id: PanelId) {
+        if !self.is_collapsed(id) {
+            self.collapsed.push(id);
+        }
+    }
+    pub fn restore(&mut self, id: PanelId) {
+        self.collapsed.retain(|p| *p != id);
+    }
+    pub fn toggle(&mut self, id: PanelId) {
+        if self.is_collapsed(id) {
+            self.restore(id);
+        } else {
+            self.collapse(id);
+        }
+    }
 }
 
 pub const STORAGE_KEY: &str = "graph_renderer_app_state_v1";
@@ -634,6 +688,7 @@ impl Default for AppState {
             inspector_floating: false,
             status_footer_open: false,
             tag_browser_query: String::new(),
+            tray: TrayState::default(),
             stats: LiveStats::default(),
             layout_solve_requested: false,
         }

@@ -11,7 +11,8 @@
 use eframe::egui;
 
 use crate::ui::progress::{LogLevel, Progress, TaskStatus};
-use crate::ui::theme::palette;
+use crate::ui::state::AppState;
+use crate::ui::theme::{self, palette};
 
 /// Per-line height for the collapsed strip and each active-task row.
 const ROW_H: f32 = 18.0;
@@ -54,6 +55,66 @@ pub fn show(
             draw_collapsed(ui, open, progress);
         }
     });
+}
+
+/// Sticky Windows-taskbar-style tray strip across the bottom of the window.
+///
+/// Renders a small chip per collapsed `PanelId` (left-aligned, preserving
+/// `state.tray.collapsed` insertion order). Clicking a chip restores that
+/// panel. The right edge carries a compact running-task indicator: a
+/// spinner + "running N" when any task is in progress, otherwise a tiny
+/// grey dot.
+pub fn show_tray(ctx: &egui::Context, state: &mut AppState, progress: &Progress) {
+    let mut frame = theme::floating_frame();
+    frame.inner_margin = egui::Margin::symmetric(8.0, 4.0);
+    egui::TopBottomPanel::bottom("tray-strip")
+        .resizable(false)
+        .show_separator_line(false)
+        .exact_height(26.0)
+        .frame(frame)
+        .show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 4.0;
+                // Left: one chip per collapsed panel. Snapshot the list so
+                // the loop body can mutate `state.tray` on click without
+                // aliasing.
+                let chips: Vec<_> = state.tray.collapsed.clone();
+                for id in chips {
+                    let label = egui::RichText::new(id.label())
+                        .size(10.0)
+                        .color(palette::TEXT);
+                    let btn = egui::Button::new(label)
+                        .small()
+                        .stroke(egui::Stroke::new(1.0, palette::BORDER))
+                        .fill(egui::Color32::TRANSPARENT);
+                    if ui.add(btn).clicked() {
+                        state.tray.restore(id);
+                    }
+                }
+
+                // Right: running indicator.
+                ui.with_layout(
+                    egui::Layout::right_to_left(egui::Align::Center),
+                    |ui| {
+                        let n_running = progress.in_progress().count();
+                        if n_running > 0 {
+                            ui.label(
+                                egui::RichText::new(format!("running {n_running}"))
+                                    .size(10.0)
+                                    .color(palette::TEXT),
+                            );
+                            ui.add(egui::Spinner::new().size(10.0));
+                        } else {
+                            ui.label(
+                                egui::RichText::new("●")
+                                    .size(10.0)
+                                    .color(palette::GREY),
+                            );
+                        }
+                    },
+                );
+            });
+        });
 }
 
 fn draw_collapsed(ui: &mut egui::Ui, open: &mut bool, progress: &Progress) {

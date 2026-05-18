@@ -20,7 +20,8 @@ use serde_json::Value;
 
 use crate::proto;
 use crate::ui::badge::{Badge, BadgeAction, BadgeClickKind, BadgeKind};
-use crate::ui::theme::accent;
+use crate::ui::squircle;
+use crate::ui::theme::{self, accent, palette};
 
 use badges::{date_badge, plain_badge, status_color, status_pill, ticket_badge};
 use detect::{host_from_url, is_iso_date, is_url, parse_ticket_id, parse_wikilink};
@@ -112,11 +113,16 @@ pub fn show_modal_with(
 
     if let Some(err) = state.fetch_error.clone() {
         let mut open = state.open;
+        let frame = theme::floating_frame()
+            .fill(egui::Color32::TRANSPARENT)
+            .stroke(egui::Stroke::NONE);
         egui::Window::new("node fetch failed")
             .open(&mut open)
             .resizable(false)
             .default_width(360.0)
+            .frame(frame)
             .show(ctx, |ui| {
+                paint_modal_squircle(ui);
                 ui.colored_label(accent::RED, err);
             });
         state.open = open;
@@ -133,6 +139,9 @@ pub fn show_modal_with(
     let meta = state.current.as_ref().unwrap().clone();
 
     let mut open = state.open;
+    let frame = theme::floating_frame()
+        .fill(egui::Color32::TRANSPARENT)
+        .stroke(egui::Stroke::NONE);
     egui::Window::new(if meta.title.is_empty() {
         meta.id.clone()
     } else {
@@ -142,7 +151,9 @@ pub fn show_modal_with(
     .resizable(true)
     .default_width(560.0)
     .min_width(360.0)
+    .frame(frame)
     .show(ctx, |ui| {
+        paint_modal_squircle(ui);
         // path subtitle
         ui.label(
             egui::RichText::new(&meta.path)
@@ -294,6 +305,41 @@ pub fn show_modal_with(
         state.current = None;
     }
     action
+}
+
+// ---------- squircle backdrop ----------
+
+/// Paint the floating squircle backdrop behind the modal's content.
+///
+/// Mirrors `ui/floating.rs`: route the painter onto the
+/// `egui::Order::Background` layer within the same Area so the
+/// squircle sits behind every widget. We expand `ui.max_rect()` by the
+/// inner_margin so the visible shape includes the 8 px gutter, then
+/// further expand upward by a generous slug to cover egui's
+/// auto-rendered window title bar (the modal keeps its title bar +
+/// close X — this fills the chrome strip above content with the same
+/// translucent squircle so the title bar isn't a floating island).
+fn paint_modal_squircle(ui: &mut egui::Ui) {
+    let content = ui.max_rect();
+    // 8 px inner_margin + ~28 px title bar above. egui doesn't expose
+    // the title-bar rect directly here; this empirically covers the
+    // standard window title strip without leaking off the bottom.
+    let rect = egui::Rect::from_min_max(
+        egui::pos2(content.left() - 8.0, content.top() - 36.0),
+        egui::pos2(content.right() + 8.0, content.bottom() + 8.0),
+    );
+    let mut painter = ui.painter().clone();
+    painter.set_layer_id(egui::LayerId::new(
+        egui::Order::Background,
+        ui.layer_id().id,
+    ));
+    squircle::paint_squircle(
+        &painter,
+        rect,
+        12.0,
+        theme::FLOATING_BACKDROP,
+        egui::Stroke::new(1.0, palette::BORDER),
+    );
 }
 
 // ---------- cell helpers ----------

@@ -20,7 +20,8 @@ use super::actions::{
 };
 use super::document_viewer::DocumentViewer;
 use super::state::WorkspaceSettings;
-use super::theme::{accent, palette};
+use super::squircle;
+use super::theme::{self, accent, palette};
 use crate::proto::NodeMeta;
 
 use matching::{
@@ -120,19 +121,34 @@ pub fn show(
         600.0_f32.min(screen_w * 0.9)
     };
 
+    let frame = theme::floating_frame()
+        .fill(egui::Color32::TRANSPARENT)
+        .stroke(egui::Stroke::NONE)
+        .inner_margin(egui::Margin::same(0.0));
     egui::Window::new("command-palette")
         .title_bar(false)
         .resizable(false)
         .collapsible(false)
         .anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, ctx.screen_rect().height() * 0.18))
         .fixed_size(egui::vec2(width, 0.0))
-        .frame(
-            egui::Frame::none()
-                .fill(egui::Color32::from_rgb(0x10, 0x12, 0x16))
-                .stroke(egui::Stroke::new(1.0, palette::BORDER))
-                .inner_margin(egui::Margin::same(0.0)),
-        )
+        .frame(frame)
         .show(ctx, |ui| {
+            // Squircle backdrop on the Background layer beneath the
+            // palette body (mirrors `ui/floating.rs`). Painted first so
+            // every widget below renders on top.
+            let rect = ui.max_rect().expand(8.0);
+            let mut painter = ui.painter().clone();
+            painter.set_layer_id(egui::LayerId::new(
+                egui::Order::Background,
+                ui.layer_id().id,
+            ));
+            squircle::paint_squircle(
+                &painter,
+                rect,
+                12.0,
+                theme::FLOATING_BACKDROP,
+                egui::Stroke::new(1.0, palette::BORDER),
+            );
             if configuring {
                 outcome = render_param_form(ui, registry, workspace);
             } else {

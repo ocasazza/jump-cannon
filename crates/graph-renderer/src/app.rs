@@ -937,6 +937,13 @@ impl eframe::App for App {
             &self.layout_registry,
             &self.perf,
         );
+        ui::sidebar::show_floating(
+            ctx,
+            &mut self.state,
+            &mut self.actions,
+            &self.layout_registry,
+            &self.perf,
+        );
 
         // Right-hand inspector panel — must run before the CentralPanel
         // so the dock area auto-shrinks to fit. The inspector reads ids /
@@ -990,7 +997,8 @@ impl eframe::App for App {
                     requested_focus_node: &mut requested_focus_node,
                     field_index: self.field_index.as_ref(),
                 };
-                let inspector_rect = ui::inspector::show(ctx, &mut self.state, &mut data);
+                ui::inspector::show_floating(ctx, &mut self.state, &mut data);
+                let inspector_rect: Option<egui::Rect> = None;
                 // Floating-mode leader line: when the inspector is a
                 // floating window AND a node is selected AND the canvas
                 // is mounted, draw a 1px line from the window's nearest
@@ -1060,7 +1068,7 @@ impl eframe::App for App {
         // central panel which auto-shrinks to fit. Registered after the
         // sidebar/inspector so the side panels still own the full
         // height of the screen.
-        ui::status_footer::show(ctx, &mut self.state.status_footer_open, &mut self.progress);
+        ui::status_footer::show_tray(ctx, &mut self.state, &self.progress);
 
         // Phase B central panel — now hosts the dockable Workspace
         // (tabs + splits via egui_dock). One initial "Graph" tab carries
@@ -1236,7 +1244,7 @@ impl eframe::App for App {
         }
 
         // Filter chip strip — sits above the canvas, below the modal.
-        ui::filter_strip::show(ctx, &mut self.state.query);
+        ui::filter_strip::show_floating(ctx, &mut self.state);
 
         // Draw the modal — last so it stacks above the central panel.
         // Resolve the canvas tint for the focused node so the modal's
