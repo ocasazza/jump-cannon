@@ -64,16 +64,12 @@ pub fn show_floating(ctx: &egui::Context, state: &mut AppState) {
         return;
     }
 
-    // Split the borrow so the closure can mutate state.query while the
-    // FloatingPanel holds &mut state.tray. Same pattern as sidebar.
-    let mut tray_tmp = std::mem::take(&mut state.tray);
     FloatingPanel::new(PanelId::FilterStrip, "Filters")
         .default_pos([16.0, 620.0])
         .default_size([600.0, 80.0])
-        .show(ctx, &mut tray_tmp, |ui| {
+        .show(ctx, &mut state.filter_strip_open, |ui| {
             render_filter_chips(ui, &mut state.query);
         });
-    state.tray = tray_tmp;
 }
 
 fn render_filter_chips(ui: &mut Ui, query: &mut QueryModel) {

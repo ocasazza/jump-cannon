@@ -10,116 +10,13 @@ use super::layout::registry::LayoutRegistry;
 use super::floating::FloatingPanel;
 use super::sections;
 use super::state::{AppState, PanelId, Section};
-use super::theme::palette;
 use crate::perf::PerfCollector;
 
-// VSCode-style activity bar: 44px is the icon-rail width (40px touch
-// target + 4px breathing room on the right edge). Not a stretchable
-// layout — leaving as a fixed exact_width.
-const ACTIVITY_W: f32 = 44.0;
-const ACTIVITY_BTN: f32 = 40.0;
-// Default section panel width; user-resizable within `SECTION_W_RANGE`.
+// Section launchers live in `status_footer::show_tray` now; this
+// module owns icon rendering (`draw_icon`) + the floating section
+// panel (`show_floating`).
 
-pub fn show(
-    ctx: &egui::Context,
-    state: &mut AppState,
-    registry: &mut ActionRegistry,
-    layout_registry: &LayoutRegistry,
-    perf: &PerfCollector,
-) {
-    show_activity_bar(ctx, state);
-    // Section panel is now rendered as a floating panel (see
-    // `show_floating`); the docked branch is retained below for
-    // reference but no longer dispatched here.
-    let _ = (registry, layout_registry, perf);
-}
-
-fn show_activity_bar(ctx: &egui::Context, state: &mut AppState) {
-    egui::SidePanel::left("activity-bar")
-        .exact_width(ACTIVITY_W)
-        .resizable(false)
-        .frame(
-            egui::Frame::none()
-                .fill(egui::Color32::BLACK)
-                .stroke(egui::Stroke::NONE)
-                .inner_margin(egui::Margin::ZERO),
-        )
-        .show(ctx, |ui| {
-            // Right border separating from section panel / central panel.
-            // BORDER (darker grey) so the rule sits against the panel
-            // fill without fighting the canvas.
-            let rect = ui.max_rect();
-            ui.painter().vline(
-                rect.right() - 0.5,
-                rect.y_range(),
-                egui::Stroke::new(1.0, palette::BORDER),
-            );
-
-            ui.spacing_mut().item_spacing = egui::vec2(0.0, 2.0);
-
-            // 2px top padding before first button.
-            ui.add_space(2.0);
-
-            // Wrap in a vertical ScrollArea so the bottom buttons remain
-            // reachable on short viewports (9 sections × 42px overflows
-            // many browser window heights). Hide the scrollbar — users
-            // can flick with the mouse wheel.
-            egui::ScrollArea::vertical()
-                .auto_shrink([false; 2])
-                .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
-                .show(ui, |ui| {
-                    for &section in Section::ALL {
-                        let active = state.active_section == Some(section);
-                        if activity_button(ui, section, active).clicked() {
-                            let next = if active { None } else { Some(section) };
-                            // One-shot log per real change — used by the
-                            // headless regression suite to verify the
-                            // activity-bar click path stays wired up.
-                            log::info!(
-                                "[graph-renderer] active_section -> {:?}",
-                                next.map(|s| s.title()),
-                            );
-                            state.active_section = next;
-                        }
-                    }
-                });
-        });
-}
-
-fn activity_button(ui: &mut egui::Ui, section: Section, active: bool) -> egui::Response {
-    let (rect, response) = ui.allocate_exact_size(
-        egui::vec2(ACTIVITY_BTN, ACTIVITY_BTN),
-        egui::Sense::click(),
-    );
-    let hovered = response.hovered();
-    let painter = ui.painter();
-
-    // Active flips to white-on-black ("inverted" hot state) → keep WHITE.
-    // Hovered also escalates to WHITE so the icon pops on its dark-grey
-    // hover fill. The default inactive state uses ICON (medium grey) so
-    // the activity rail feels quiet.
-    let (bg, fg) = if active {
-        (egui::Color32::WHITE, egui::Color32::BLACK)
-    } else if hovered {
-        (egui::Color32::from_gray(40), egui::Color32::WHITE)
-    } else {
-        (egui::Color32::BLACK, palette::ICON)
-    };
-    painter.rect_filled(rect, 0.0, bg);
-
-    draw_icon(painter, rect, section, fg);
-
-    if active {
-        // 2px white stripe on the right edge as VSCode-style "active" indicator
-        let mut stripe = rect;
-        stripe.set_left(rect.right() - 2.0);
-        painter.rect_filled(stripe, 0.0, fg);
-    }
-
-    response.on_hover_text(section.title())
-}
-
-fn draw_icon(painter: &egui::Painter, rect: egui::Rect, section: Section, color: egui::Color32) {
+pub(crate) fn draw_icon(painter: &egui::Painter, rect: egui::Rect, section: Section, color: egui::Color32) {
     // Icons are drawn in an 18×18 cell centered in the button rect.
     let center = rect.center();
     let s = egui::Stroke::new(1.5, color);
@@ -264,19 +161,14 @@ pub fn show_floating(
     let Some(active) = state.active_section else {
         return;
     };
-    // Split the borrow so the closure can take &mut AppState while the
-    // FloatingPanel holds &mut state.tray.
-    let AppState { ref mut tray, .. } = *state;
-    // SAFETY note: we re-borrow the rest of state inside the closure via
-    // a raw pointer dance? No — simpler: use a scope where we pass the
-    // whole state to the closure but pull tray out by swapping. Use the
-    // pattern of taking tray via std::mem::replace.
-    let mut tray_tmp = std::mem::take(tray);
-    FloatingPanel::new(PanelId::Sidebar, "Sidebar")
+    let mut open = true;
+    FloatingPanel::new(PanelId::Sidebar, active.title())
         .default_pos([16.0, 64.0])
         .default_size([280.0, 520.0])
-        .show(ctx, &mut tray_tmp, |ui| {
+        .show(ctx, &mut open, |ui| {
             render_section_body(ui, state, active, registry, layout_registry, perf);
         });
-    state.tray = tray_tmp;
+    if !open {
+        state.active_section = None;
+    }
 }

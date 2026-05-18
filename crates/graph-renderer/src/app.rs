@@ -930,13 +930,6 @@ impl eframe::App for App {
 
         // Phase D sidebar (activity bar + section panel) on the left.
         self.perf.begin_stage(StageId::UiChrome);
-        ui::show_sidebar(
-            ctx,
-            &mut self.state,
-            &mut self.actions,
-            &self.layout_registry,
-            &self.perf,
-        );
         ui::sidebar::show_floating(
             ctx,
             &mut self.state,

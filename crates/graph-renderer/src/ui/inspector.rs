@@ -139,18 +139,15 @@ pub fn show_floating(
     state: &mut AppState,
     data: &mut InspectorData,
 ) {
-    // Split the borrow: `FloatingPanel::show` needs `&mut state.tray`,
-    // and the body closure needs `&mut AppState` for `render_body`. We
-    // temporarily move `tray` out so the closure can take the whole
-    // `state` mutably, then restore it after the panel returns.
-    let mut tray = std::mem::take(&mut state.tray);
+    // Bool is Copy — borrow-split by copy-and-restore.
+    let mut open = state.inspector_open;
     FloatingPanel::new(PanelId::Inspector, "Inspector")
         .default_pos([1200.0, 64.0])
         .default_size([340.0, 600.0])
-        .show(ctx, &mut tray, |ui| {
+        .show(ctx, &mut open, |ui| {
             render_body(ui, state, data);
         });
-    state.tray = tray;
+    state.inspector_open = open;
 }
 
 /// Floating "Open inspector" pill mounted in the canvas's top-right

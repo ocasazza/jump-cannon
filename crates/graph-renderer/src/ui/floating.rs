@@ -3,25 +3,21 @@
 //! Wraps an `egui::Window` with the project's standard floating chrome:
 //! squircle background painted in `FLOATING_BACKDROP` with a 1px
 //! `palette::BORDER` stroke, a custom header row (label + close `X`
-//! button) replacing the default title bar, and tray-aware
-//! show/hide based on [`TrayState`].
+//! button) replacing the default title bar, and an `&mut bool`
+//! open/closed flag driven by the X button and the tray launcher row.
 //!
-//! Collapsing a panel via the `X` calls `tray.collapse(id)`; the panel
-//! then renders nothing. The tray strip (rendered elsewhere) is
-//! responsible for restoring panels — that is intentionally not the
-//! panel's job.
+//! All floating panels in the app go through this type — adding a new
+//! one should be a 5-line builder call, not a copy of `egui::Window`
+//! plumbing.
 
 use eframe::egui::{self, Color32, Id, Rect, Stroke};
 
 use crate::ui::squircle;
-use crate::ui::state::{PanelId, TrayState};
+use crate::ui::state::PanelId;
 use crate::ui::theme::{self, palette};
 
-/// Builder for a tray-aware, squircle-backed floating panel.
-///
-/// Construct with [`FloatingPanel::new`], optionally configure
-/// `default_pos` / `default_size`, then call [`FloatingPanel::show`]
-/// with the egui context, the app's `TrayState`, and the body closure.
+/// Builder for a squircle-backed floating panel whose visibility is
+/// driven by a caller-owned `&mut bool`.
 pub struct FloatingPanel {
     id: PanelId,
     title: &'static str,
@@ -30,8 +26,6 @@ pub struct FloatingPanel {
 }
 
 impl FloatingPanel {
-    /// New floating-panel wrapper for `id`. `title` is rendered into
-    /// the custom header row.
     pub fn new(id: PanelId, title: &'static str) -> Self {
         Self {
             id,
@@ -41,38 +35,28 @@ impl FloatingPanel {
         }
     }
 
-    /// Initial window position (egui only honours this on first
-    /// appearance; subsequent positions come from the egui memory
-    /// keyed by the panel id).
     pub fn default_pos(mut self, pos: [f32; 2]) -> Self {
         self.default_pos = Some(pos);
         self
     }
 
-    /// Initial window size. Same first-appearance-only semantics as
-    /// `default_pos`.
     pub fn default_size(mut self, size: [f32; 2]) -> Self {
         self.default_size = Some(size);
         self
     }
 
-    /// Render the panel. If `tray.is_collapsed(id)`, the closure is
-    /// not invoked and no window is drawn. Otherwise the window opens
-    /// with the custom squircle backdrop and header row, and `body`
-    /// runs below a separator.
+    /// Render the panel. Skips entirely when `!*open`. The X button in
+    /// the custom header sets `*open = false`.
     pub fn show<R>(
         self,
         ctx: &egui::Context,
-        tray: &mut TrayState,
+        open: &mut bool,
         body: impl FnOnce(&mut egui::Ui) -> R,
     ) -> Option<R> {
-        if tray.is_collapsed(self.id) {
+        if !*open {
             return None;
         }
 
-        // Custom frame: start from the project's floating preset, then
-        // null out fill + stroke so the squircle painted underneath
-        // does all the visible work. Keeps inner_margin / no-shadow.
         let frame = theme::floating_frame()
             .fill(Color32::TRANSPARENT)
             .stroke(Stroke::NONE);
@@ -92,16 +76,9 @@ impl FloatingPanel {
             window = window.default_size(size);
         }
 
-        let id = self.id;
         let title = self.title;
 
         let response = window.show(ctx, |ui| {
-            // Paint the squircle backdrop behind the content. We use
-            // a painter scoped to the entire window rect (ui.max_rect
-            // here is the post-margin content rect; the parent frame
-            // is transparent, so painting onto the layer at this rect
-            // covers the inner area — the 8px inner_margin keeps
-            // content from touching the squircle stroke).
             let rect: Rect = ui.max_rect().expand(theme::spacing::SECTION_GAP);
             let mut painter = ui.painter().clone();
             painter.set_layer_id(egui::LayerId::new(
@@ -116,7 +93,6 @@ impl FloatingPanel {
                 Stroke::new(1.0, palette::BORDER),
             );
 
-            // Custom header row: title left, close button right.
             ui.horizontal(|ui| {
                 ui.label(
                     egui::RichText::new(title)
@@ -127,7 +103,7 @@ impl FloatingPanel {
                     egui::Layout::right_to_left(egui::Align::Center),
                     |ui| {
                         if ui.small_button("X").clicked() {
-                            tray.collapse(id);
+                            *open = false;
                         }
                     },
                 );

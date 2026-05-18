@@ -29,6 +29,5 @@ pub use actions::{
 };
 pub use command_palette::{show as show_command_palette, CommandPaletteState, PaletteOutcome};
 pub use modal::{show_modal, ModalAction, ModalState};
-pub use sidebar::show as show_sidebar;
 pub use state::{AppState, Section, STORAGE_KEY};
 pub use theme::apply_default as apply_theme;

@@ -59,40 +59,50 @@ pub fn show(
 
 /// Sticky Windows-taskbar-style tray strip across the bottom of the window.
 ///
-/// Renders a small chip per collapsed `PanelId` (left-aligned, preserving
-/// `state.tray.collapsed` insertion order). Clicking a chip restores that
-/// panel. The right edge carries a compact running-task indicator: a
-/// spinner + "running N" when any task is in progress, otherwise a tiny
-/// grey dot.
+/// Renders the launcher row: one icon per `Section` (matches the old
+/// activity bar), then a divider, then dedicated Inspector + Filters
+/// icons. Clicking an icon toggles the corresponding floating panel's
+/// open state. Right edge carries the running-task indicator.
 pub fn show_tray(ctx: &egui::Context, state: &mut AppState, progress: &Progress) {
+    use crate::ui::sidebar::draw_icon;
+    use crate::ui::state::Section;
+
     let mut frame = theme::floating_frame();
-    frame.inner_margin = egui::Margin::symmetric(8.0, 4.0);
+    frame.inner_margin = egui::Margin::symmetric(8.0, 2.0);
     egui::TopBottomPanel::bottom("tray-strip")
         .resizable(false)
         .show_separator_line(false)
-        .exact_height(26.0)
+        .exact_height(28.0)
         .frame(frame)
         .show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = 4.0;
-                // Left: one chip per collapsed panel. Snapshot the list so
-                // the loop body can mutate `state.tray` on click without
-                // aliasing.
-                let chips: Vec<_> = state.tray.collapsed.clone();
-                for id in chips {
-                    let label = egui::RichText::new(id.label())
-                        .size(10.0)
-                        .color(palette::TEXT);
-                    let btn = egui::Button::new(label)
-                        .small()
-                        .stroke(egui::Stroke::new(1.0, palette::BORDER))
-                        .fill(egui::Color32::TRANSPARENT);
-                    if ui.add(btn).clicked() {
-                        state.tray.restore(id);
+            ui.horizontal_centered(|ui| {
+                ui.spacing_mut().item_spacing.x = 2.0;
+                for &section in Section::ALL {
+                    let active = state.active_section == Some(section);
+                    if tray_icon_button(ui, |painter, rect, color| {
+                        draw_icon(painter, rect, section, color);
+                    }, active, section.title())
+                    .clicked()
+                    {
+                        state.active_section = if active { None } else { Some(section) };
                     }
                 }
 
-                // Right: running indicator.
+                ui.add_space(8.0);
+                ui.separator();
+                ui.add_space(4.0);
+
+                if tray_icon_button(ui, draw_inspector_icon, state.inspector_open, "Inspector")
+                    .clicked()
+                {
+                    state.inspector_open = !state.inspector_open;
+                }
+                if tray_icon_button(ui, draw_filter_icon, state.filter_strip_open, "Filters")
+                    .clicked()
+                {
+                    state.filter_strip_open = !state.filter_strip_open;
+                }
+
                 ui.with_layout(
                     egui::Layout::right_to_left(egui::Align::Center),
                     |ui| {
@@ -115,6 +125,69 @@ pub fn show_tray(ctx: &egui::Context, state: &mut AppState, progress: &Progress)
                 );
             });
         });
+}
+
+/// Compact 22×22 tray icon button. Caller supplies a paint closure that
+/// draws the icon glyph into the given rect. Active = white-on-black;
+/// hovered = grey-40 bg with white glyph; idle = transparent with icon-grey
+/// glyph. Returns the click response.
+fn tray_icon_button(
+    ui: &mut egui::Ui,
+    paint: impl FnOnce(&egui::Painter, egui::Rect, egui::Color32),
+    active: bool,
+    tooltip: &str,
+) -> egui::Response {
+    let (rect, response) =
+        ui.allocate_exact_size(egui::vec2(22.0, 22.0), egui::Sense::click());
+    let hovered = response.hovered();
+    let (bg, fg) = if active {
+        (egui::Color32::WHITE, egui::Color32::BLACK)
+    } else if hovered {
+        (egui::Color32::from_gray(40), egui::Color32::WHITE)
+    } else {
+        (egui::Color32::TRANSPARENT, palette::ICON)
+    };
+    let painter = ui.painter();
+    painter.rect_filled(rect, 3.0, bg);
+    paint(painter, rect, fg);
+    response.on_hover_text(tooltip)
+}
+
+fn draw_inspector_icon(painter: &egui::Painter, rect: egui::Rect, color: egui::Color32) {
+    // Eye glyph: ellipse outline + pupil.
+    let center = rect.center();
+    let s = egui::Stroke::new(1.2, color);
+    let ellipse = egui::Rect::from_center_size(center, egui::vec2(14.0, 8.0));
+    // Approximate ellipse with two arcs (egui has no ellipse primitive).
+    let mut pts = Vec::with_capacity(32);
+    for i in 0..=24 {
+        let t = (i as f32 / 24.0) * std::f32::consts::TAU;
+        pts.push(egui::pos2(
+            center.x + 7.0 * t.cos(),
+            center.y + 4.0 * t.sin(),
+        ));
+    }
+    painter.add(egui::Shape::line(pts, s));
+    let _ = ellipse;
+    painter.circle_filled(center, 2.0, color);
+}
+
+fn draw_filter_icon(painter: &egui::Painter, rect: egui::Rect, color: egui::Color32) {
+    // Funnel glyph.
+    let center = rect.center();
+    let s = egui::Stroke::new(1.2, color);
+    let tl = egui::pos2(center.x - 7.0, center.y - 6.0);
+    let tr = egui::pos2(center.x + 7.0, center.y - 6.0);
+    let ml = egui::pos2(center.x - 2.0, center.y + 1.0);
+    let mr = egui::pos2(center.x + 2.0, center.y + 1.0);
+    let bl = egui::pos2(center.x - 2.0, center.y + 7.0);
+    let br = egui::pos2(center.x + 2.0, center.y + 7.0);
+    painter.line_segment([tl, tr], s);
+    painter.line_segment([tl, ml], s);
+    painter.line_segment([tr, mr], s);
+    painter.line_segment([ml, bl], s);
+    painter.line_segment([mr, br], s);
+    painter.line_segment([bl, br], s);
 }
 
 fn draw_collapsed(ui: &mut egui::Ui, open: &mut bool, progress: &Progress) {

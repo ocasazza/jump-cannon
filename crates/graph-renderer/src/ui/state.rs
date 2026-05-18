@@ -602,10 +602,10 @@ pub struct AppState {
     /// frequency.
     #[serde(default)]
     pub tag_browser_query: String,
-    /// Collapsed-panel tray state. Default empty so existing visible
-    /// panels remain visible on first load.
-    #[serde(default)]
-    pub tray: TrayState,
+    /// Visibility flag for the floating filter-strip panel. Default
+    /// true so users see active filters as soon as they're applied.
+    #[serde(default = "default_true")]
+    pub filter_strip_open: bool,
     #[serde(skip)]
     pub stats: LiveStats,
     /// One-shot signal: the Layout sidebar's "Solve" button sets this to
@@ -636,39 +636,15 @@ impl PanelId {
     }
 }
 
-/// Holds the ordered list of panels currently collapsed into the tray
-/// strip. Insertion order is preserved so the tray UI renders chips in
-/// the sequence the user collapsed them.
-#[derive(Default, Clone, Debug, Serialize, Deserialize)]
-pub struct TrayState {
-    #[serde(default)]
-    pub collapsed: Vec<PanelId>,
-}
-
-impl TrayState {
-    pub fn is_collapsed(&self, id: PanelId) -> bool {
-        self.collapsed.contains(&id)
-    }
-    pub fn collapse(&mut self, id: PanelId) {
-        if !self.is_collapsed(id) {
-            self.collapsed.push(id);
-        }
-    }
-    pub fn restore(&mut self, id: PanelId) {
-        self.collapsed.retain(|p| *p != id);
-    }
-    pub fn toggle(&mut self, id: PanelId) {
-        if self.is_collapsed(id) {
-            self.restore(id);
-        } else {
-            self.collapse(id);
-        }
-    }
-}
+// Per-panel `*_open` bools on `AppState` drive visibility now; the
+// previous `TrayState` collapsed-chips list was removed when the tray
+// became a persistent launcher row rather than a parking lot for
+// X-ed panels.
 
 pub const STORAGE_KEY: &str = "graph_renderer_app_state_v1";
 
 fn default_inspector_open() -> bool { true }
+fn default_true() -> bool { true }
 
 impl Default for AppState {
     fn default() -> Self {
@@ -688,7 +664,7 @@ impl Default for AppState {
             inspector_floating: false,
             status_footer_open: false,
             tag_browser_query: String::new(),
-            tray: TrayState::default(),
+            filter_strip_open: true,
             stats: LiveStats::default(),
             layout_solve_requested: false,
         }
