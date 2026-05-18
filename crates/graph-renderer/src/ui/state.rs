@@ -606,6 +606,13 @@ pub struct AppState {
     /// true so users see active filters as soon as they're applied.
     #[serde(default = "default_true")]
     pub filter_strip_open: bool,
+    /// Where the wgpu graph canvas is currently mounted. Driven by the
+    /// tray "pop-out" toggle + the floating window's X. State machine
+    /// lives in [`CanvasMount`] — UI code must transition through the
+    /// `pop_canvas_out` / `dock_canvas_back` / `toggle_canvas_mount`
+    /// methods on [`AppState`], not by mutating this field directly.
+    #[serde(default)]
+    pub canvas_mount: CanvasMount,
     #[serde(skip)]
     pub stats: LiveStats,
     /// One-shot signal: the Layout sidebar's "Solve" button sets this to
@@ -616,6 +623,27 @@ pub struct AppState {
     pub layout_solve_requested: bool,
 }
 
+/// Where the wgpu graph canvas is currently mounted. The canvas has
+/// exactly two modes: it's either the persistent CentralPanel
+/// background, or it's hosted inside a floating window. Mutate via
+/// the transition methods on [`AppState`].
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub enum CanvasMount {
+    /// Canvas paints into the CentralPanel — full-bleed behind every
+    /// floating panel. Default for new sessions.
+    #[default]
+    Background,
+    /// Canvas paints into the body of a floating `egui::Window`. The
+    /// CentralPanel renders a flat dark fill in this mode.
+    Floating,
+}
+
+impl CanvasMount {
+    pub fn is_floating(self) -> bool {
+        matches!(self, CanvasMount::Floating)
+    }
+}
+
 /// Identifies a floating/dockable panel that can be collapsed into the tray
 /// strip. Modal dialogs and the command palette stay non-collapsible and
 /// are intentionally absent from this enum.
@@ -624,6 +652,7 @@ pub enum PanelId {
     Sidebar,
     Inspector,
     FilterStrip,
+    Canvas,
 }
 
 impl PanelId {
@@ -632,6 +661,7 @@ impl PanelId {
             PanelId::Sidebar => "Sidebar",
             PanelId::Inspector => "Inspector",
             PanelId::FilterStrip => "Filters",
+            PanelId::Canvas => "Graph",
         }
     }
 }
@@ -645,6 +675,21 @@ pub const STORAGE_KEY: &str = "graph_renderer_app_state_v1";
 
 fn default_inspector_open() -> bool { true }
 fn default_true() -> bool { true }
+
+impl AppState {
+    pub fn pop_canvas_out(&mut self) {
+        self.canvas_mount = CanvasMount::Floating;
+    }
+    pub fn dock_canvas_back(&mut self) {
+        self.canvas_mount = CanvasMount::Background;
+    }
+    pub fn toggle_canvas_mount(&mut self) {
+        self.canvas_mount = match self.canvas_mount {
+            CanvasMount::Background => CanvasMount::Floating,
+            CanvasMount::Floating => CanvasMount::Background,
+        };
+    }
+}
 
 impl Default for AppState {
     fn default() -> Self {
@@ -665,6 +710,7 @@ impl Default for AppState {
             status_footer_open: false,
             tag_browser_query: String::new(),
             filter_strip_open: true,
+            canvas_mount: CanvasMount::default(),
             stats: LiveStats::default(),
             layout_solve_requested: false,
         }

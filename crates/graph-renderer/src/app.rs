@@ -1089,36 +1089,64 @@ impl eframe::App for App {
             split_requests: Vec::new(),
         };
         self.perf.begin_stage(StageId::EguiPaint);
-        egui::CentralPanel::default()
-            .frame(egui::Frame::none().fill(egui::Color32::TRANSPARENT))
-            .show(ctx, |ui| {
+        if self.state.canvas_mount.is_floating() {
+            // Floating-canvas mode: CentralPanel is a flat dark fill,
+            // the wgpu paint callback is invoked from inside the
+            // floating "Graph" window. While popped out the egui_dock
+            // tab strip is intentionally hidden — v1 limitation.
+            egui::CentralPanel::default()
+                .frame(
+                    egui::Frame::none()
+                        .fill(crate::ui::theme::palette::BLACK),
+                )
+                .show(ctx, |_ui| {});
+
+            let mut canvas_open = true;
+            crate::ui::floating::FloatingPanel::new(
+                ui::state::PanelId::Canvas,
+                "Graph",
+            )
+            .default_pos([120.0, 80.0])
+            .default_size([900.0, 600.0])
+            .show(ctx, &mut canvas_open, |ui| {
                 let mut viewer = ui::workspace::WorkspaceViewer { ctx: &mut wctx };
-                // Hide the dock tab bar when only one tab is mounted —
-                // the user complained about "an empty grey bar at the
-                // top". With a single Graph tab, the tab strip has
-                // nothing to do but the add-tab button, and the strip
-                // bg colour reads as an unexplained ribbon above the
-                // canvas. Collapsing it to zero height removes the
-                // ribbon entirely; users who split the workspace pick
-                // up tabs from the splits' result and get the bar back
-                // automatically (n_tabs > 1).
-                let n_tabs: usize = self
-                    .state
-                    .dock
-                    .dock_state
-                    .iter_all_tabs()
-                    .count();
-                let mut style = egui_dock::Style::from_egui(ui.style());
-                if n_tabs <= 1 {
-                    style.tab_bar.height = 0.0;
-                    style.tab_bar.bg_fill = egui::Color32::TRANSPARENT;
-                }
-                egui_dock::DockArea::new(&mut self.state.dock.dock_state)
-                    .show_add_buttons(n_tabs > 1)
-                    .show_add_popup(n_tabs > 1)
-                    .style(style)
-                    .show_inside(ui, &mut viewer);
+                viewer.draw_graph_tab(ui);
             });
+            if !canvas_open {
+                self.state.dock_canvas_back();
+            }
+        } else {
+            egui::CentralPanel::default()
+                .frame(egui::Frame::none().fill(egui::Color32::TRANSPARENT))
+                .show(ctx, |ui| {
+                    let mut viewer = ui::workspace::WorkspaceViewer { ctx: &mut wctx };
+                    // Hide the dock tab bar when only one tab is mounted —
+                    // the user complained about "an empty grey bar at the
+                    // top". With a single Graph tab, the tab strip has
+                    // nothing to do but the add-tab button, and the strip
+                    // bg colour reads as an unexplained ribbon above the
+                    // canvas. Collapsing it to zero height removes the
+                    // ribbon entirely; users who split the workspace pick
+                    // up tabs from the splits' result and get the bar back
+                    // automatically (n_tabs > 1).
+                    let n_tabs: usize = self
+                        .state
+                        .dock
+                        .dock_state
+                        .iter_all_tabs()
+                        .count();
+                    let mut style = egui_dock::Style::from_egui(ui.style());
+                    if n_tabs <= 1 {
+                        style.tab_bar.height = 0.0;
+                        style.tab_bar.bg_fill = egui::Color32::TRANSPARENT;
+                    }
+                    egui_dock::DockArea::new(&mut self.state.dock.dock_state)
+                        .show_add_buttons(n_tabs > 1)
+                        .show_add_popup(n_tabs > 1)
+                        .style(style)
+                        .show_inside(ui, &mut viewer);
+                });
+        }
         self.perf.end_stage(StageId::EguiPaint);
 
         // Drain workspace requests collected during the DockArea pass.

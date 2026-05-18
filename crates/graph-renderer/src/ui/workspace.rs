@@ -201,7 +201,7 @@ pub fn apply_rotate_curve(dx: f32) -> f32 {
 }
 
 impl<'a, 'ctx> WorkspaceViewer<'a, 'ctx> {
-    fn draw_graph_tab(&mut self, ui: &mut egui::Ui) {
+    pub(crate) fn draw_graph_tab(&mut self, ui: &mut egui::Ui) {
         let avail = ui.available_size();
         let (rect, resp) = ui.allocate_exact_size(avail, egui::Sense::click_and_drag());
 

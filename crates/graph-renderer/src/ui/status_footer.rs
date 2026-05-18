@@ -103,6 +103,21 @@ pub fn show_tray(ctx: &egui::Context, state: &mut AppState, progress: &Progress)
                     state.filter_strip_open = !state.filter_strip_open;
                 }
 
+                ui.add_space(8.0);
+                ui.separator();
+                ui.add_space(4.0);
+
+                if tray_icon_button(
+                    ui,
+                    draw_popout_icon,
+                    state.canvas_mount.is_floating(),
+                    "Pop out graph canvas",
+                )
+                .clicked()
+                {
+                    state.toggle_canvas_mount();
+                }
+
                 ui.with_layout(
                     egui::Layout::right_to_left(egui::Align::Center),
                     |ui| {
@@ -170,6 +185,29 @@ fn draw_inspector_icon(painter: &egui::Painter, rect: egui::Rect, color: egui::C
     painter.add(egui::Shape::line(pts, s));
     let _ = ellipse;
     painter.circle_filled(center, 2.0, color);
+}
+
+fn draw_popout_icon(painter: &egui::Painter, rect: egui::Rect, color: egui::Color32) {
+    // Window-pop-out glyph: a larger rect with a smaller rect overlapping
+    // its top-right corner, suggesting "this becomes a window".
+    let center = rect.center();
+    let s = egui::Stroke::new(1.2, color);
+    // Larger (background) rect, offset slightly down-left.
+    let big = egui::Rect::from_center_size(
+        egui::pos2(center.x - 2.0, center.y + 2.0),
+        egui::vec2(11.0, 9.0),
+    );
+    painter.rect_stroke(big, 1.5, s);
+    // Smaller (foreground) rect, offset up-right; punch a small notch
+    // out of the big rect by overdrawing its bg first.
+    let small = egui::Rect::from_center_size(
+        egui::pos2(center.x + 3.0, center.y - 3.0),
+        egui::vec2(9.0, 7.0),
+    );
+    // Clear under the small rect with the button bg so it reads as
+    // "on top". Use a transparent overdraw — the button background is
+    // already painted before this fn runs, so a simple stroke suffices.
+    painter.rect_stroke(small, 1.5, s);
 }
 
 fn draw_filter_icon(painter: &egui::Painter, rect: egui::Rect, color: egui::Color32) {
