@@ -49,6 +49,42 @@ impl Section {
     }
 }
 
+/// How the filter chip set affects the rendered graph.
+///
+/// - `Filter` (default): non-matching nodes are *discarded* via the
+///   shader's per-node filter mask (the path added by commit
+///   `ca7d40d7`). Edges touching them disappear too.
+/// - `Focus`: non-matching nodes remain visible but dim to ~0.25
+///   alpha via the focus-set path. Useful for keeping the broader
+///   structure on screen while highlighting matches.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub enum FilterBehavior {
+    #[default]
+    Filter,
+    Focus,
+}
+
+impl FilterBehavior {
+    pub fn label(self) -> &'static str {
+        match self {
+            FilterBehavior::Filter => "Filter",
+            FilterBehavior::Focus => "Focus",
+        }
+    }
+    pub fn tooltip(self) -> &'static str {
+        match self {
+            FilterBehavior::Filter => "Hide non-matching nodes and the edges that touch them.",
+            FilterBehavior::Focus => "Keep non-matches on screen but dim them to ~25% alpha.",
+        }
+    }
+    pub fn toggled(self) -> Self {
+        match self {
+            FilterBehavior::Filter => FilterBehavior::Focus,
+            FilterBehavior::Focus => FilterBehavior::Filter,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub enum SizeBy {
     #[default]
@@ -606,6 +642,9 @@ pub struct AppState {
     /// true so users see active filters as soon as they're applied.
     #[serde(default = "default_true")]
     pub filter_strip_open: bool,
+    /// How active filter chips affect rendering. See [`FilterBehavior`].
+    #[serde(default)]
+    pub filter_behavior: FilterBehavior,
     /// Where the wgpu graph canvas is currently mounted. Driven by the
     /// tray "pop-out" toggle + the floating window's X. State machine
     /// lives in [`CanvasMount`] — UI code must transition through the
@@ -710,6 +749,7 @@ impl Default for AppState {
             status_footer_open: false,
             tag_browser_query: String::new(),
             filter_strip_open: true,
+            filter_behavior: FilterBehavior::default(),
             canvas_mount: CanvasMount::default(),
             stats: LiveStats::default(),
             layout_solve_requested: false,

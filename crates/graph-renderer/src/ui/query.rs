@@ -61,7 +61,7 @@ impl Combinator {
 /// `insertion_order` exists so the on-screen chip-strip can render
 /// fields in the order the user added them (BTreeMap orders by name,
 /// which would shuffle the strip every time a new field is touched).
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ActiveFieldFilters {
     pub by_field: BTreeMap<String, BTreeSet<String>>,
     #[serde(default)]
@@ -77,6 +77,21 @@ pub struct ActiveFieldFilters {
 
 fn default_cross_field_combinator() -> Combinator {
     Combinator::All
+}
+
+impl Default for ActiveFieldFilters {
+    // NB: cross-field default is `All` (AND), not the `Combinator`
+    // type default — that's `Any`, which makes more sense at the
+    // per-field level (OR within a field, AND across fields was the
+    // pre-combinator behavior).
+    fn default() -> Self {
+        Self {
+            by_field: BTreeMap::new(),
+            insertion_order: Vec::new(),
+            field_combinator: BTreeMap::new(),
+            cross_field_combinator: default_cross_field_combinator(),
+        }
+    }
 }
 
 impl ActiveFieldFilters {
@@ -207,6 +222,7 @@ impl QueryModel {
     pub fn clear_field(&mut self, field: &str) {
         self.active_filters.by_field.remove(field);
         self.active_filters.insertion_order.retain(|f| f != field);
+        self.active_filters.field_combinator.remove(field);
     }
 
     pub fn clear_all_filters(&mut self) {

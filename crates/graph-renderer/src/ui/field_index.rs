@@ -2,15 +2,17 @@
 //! server's `/graph/meta_summary` payload; queried per-frame to fold the
 //! UI's active (field, value) selections into a node-idx set.
 //!
-//! Semantics: within-field OR (the union of all value-buckets selected
-//! for that field), across-field AND (intersect each field's union).
+//! Semantics: each field combines its selected value-buckets according
+//! to its per-field [`Combinator`] (default `Any` = OR/union, `All` =
+//! AND/intersection). Field-level results combine according to the
+//! filter set's `cross_field_combinator` (default `All` = AND).
 
 #[cfg(test)]
 use std::collections::BTreeMap;
 use std::collections::{HashMap, HashSet};
 
 use crate::proto;
-use crate::ui::query::ActiveFieldFilters;
+use crate::ui::query::{ActiveFieldFilters, Combinator};
 
 #[derive(Debug, Default, Clone)]
 pub struct FieldIndex {
@@ -48,22 +50,59 @@ impl FieldIndex {
         for (field, values) in &filters.by_field {
             if values.is_empty() { continue; }
             let Some(buckets) = self.by_field.get(field) else { continue };
-            let mut union: HashSet<u32> = HashSet::new();
+            let combinator = filters.combinator_for(field);
+            // Resolve each selected value to its bucket. Skip unknown
+            // values rather than treating them as the empty set —
+            // otherwise stale persisted state would tank intersections.
+            let mut buckets_for_field: Vec<&Vec<u32>> = Vec::new();
             for v in values {
                 if let Some(idxs) = buckets.get(v) {
-                    union.extend(idxs.iter().copied());
+                    buckets_for_field.push(idxs);
                 }
             }
-            per_field.push(union);
+            if buckets_for_field.is_empty() { continue; }
+            let combined: HashSet<u32> = match combinator {
+                Combinator::Any => {
+                    let mut union: HashSet<u32> = HashSet::new();
+                    for b in &buckets_for_field {
+                        union.extend(b.iter().copied());
+                    }
+                    union
+                }
+                Combinator::All => {
+                    // Intersect smallest first.
+                    let mut sorted = buckets_for_field.clone();
+                    sorted.sort_by_key(|b| b.len());
+                    let mut acc: HashSet<u32> = sorted[0].iter().copied().collect();
+                    for b in sorted.iter().skip(1) {
+                        let bset: HashSet<u32> = b.iter().copied().collect();
+                        acc.retain(|x| bset.contains(x));
+                    }
+                    acc
+                }
+            };
+            per_field.push(combined);
         }
         if per_field.is_empty() { return None; }
-        // Intersect smallest first.
-        per_field.sort_by_key(|s| s.len());
-        let mut iter = per_field.into_iter();
-        let mut acc = iter.next().unwrap();
-        for next in iter {
-            acc.retain(|x| next.contains(x));
-        }
+        let acc: HashSet<u32> = match filters.cross_field_combinator {
+            Combinator::All => {
+                // Intersect smallest first.
+                per_field.sort_by_key(|s| s.len());
+                let mut iter = per_field.into_iter();
+                let mut acc = iter.next().unwrap();
+                for next in iter {
+                    acc.retain(|x| next.contains(x));
+                }
+                acc
+            }
+            Combinator::Any => {
+                let mut acc: HashSet<u32> = HashSet::new();
+                for s in per_field {
+                    acc.extend(s.into_iter());
+                }
+                acc
+            }
+        };
         Some(acc)
     }
 

@@ -1070,9 +1070,12 @@ impl GraphPipelines {
     }
 
     /// Push the per-node focus dim mask. `members` lists the node ids
-    /// that belong to the focused community (always includes the focused
-    /// node itself). When `focused` is `None` or `members` is empty the
-    /// buffer is reset to all-1.0 (no dimming).
+    /// that should stay bright (alpha 1.0); every other node dims to
+    /// 0.25. When `focused` is `Some`, that node is force-included in
+    /// the bright set. When `focused` is `None` but `members` is
+    /// non-empty (the filter-as-focus path), `members` alone defines
+    /// the bright set. When `members` is empty and `focused` is `None`,
+    /// the buffer is reset to all-1.0 (no dimming).
     ///
     /// This path is independent from `set_selected` (the QueryModel
     /// dimming): they multiply on the GPU because the node shader does
@@ -1090,7 +1093,7 @@ impl GraphPipelines {
         }
         let dim_others: f32 = 0.25;
         let mut out: Vec<f32> = vec![1.0; n];
-        if focused.is_some() && !members.is_empty() {
+        if !members.is_empty() || focused.is_some() {
             for v in out.iter_mut() {
                 *v = dim_others;
             }

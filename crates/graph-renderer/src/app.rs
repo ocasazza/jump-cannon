@@ -2226,7 +2226,14 @@ impl App {
             for (k, vs) in self.state.query.active_filters.by_field.iter() {
                 k.hash(&mut h);
                 for v in vs.iter() { v.hash(&mut h); }
+                // Per-field combinator participates so toggling it
+                // re-runs the GPU push.
+                (self.state.query.active_filters.combinator_for(k) as u8).hash(&mut h);
             }
+            (self.state.query.active_filters.cross_field_combinator as u8).hash(&mut h);
+            // FilterBehavior changes which GPU path we take — include
+            // it so flipping the toggle forces a re-write.
+            (self.state.filter_behavior as u8).hash(&mut h);
             h.finish()
         };
         // Change-detect to avoid pointless GPU writes (dim_alpha = n_nodes
@@ -2269,16 +2276,36 @@ impl App {
                 log::info!("[graph-renderer] focus: members={}", members.len());
             }
             None => {
-                // No node-focus. If filters are active, use the
-                // discard-on-non-match path (`set_filter_mask`). Otherwise
-                // clear the mask back to all 1.0.
+                // No node-focus. If filters are active, dispatch on
+                // `state.filter_behavior`:
+                //   - `Filter`: discard non-matches via `set_filter_mask`.
+                //   - `Focus`:  dim non-matches via `set_focus_set` (the
+                //               pre-ca7d40d7 behavior).
+                // Always clear the *other* path so toggling between
+                // modes doesn't leave stale state on the GPU.
                 let matching: Option<HashSet<u32>> = self
                     .field_index
                     .as_ref()
                     .and_then(|fi| fi.matches(&self.state.query.active_filters));
+                let behavior = self.state.filter_behavior;
                 let mut renderer = wgpu_state.renderer.write();
                 if let Some(pipes) = renderer.callback_resources.get_mut::<GraphPipelines>() {
-                    pipes.set_filter_mask(&queue, matching.as_ref());
+                    match behavior {
+                        crate::ui::state::FilterBehavior::Filter => {
+                            // Reset the focus dim mask, then push the
+                            // hard filter mask.
+                            pipes.set_focus_set(&queue, None, &HashSet::new());
+                            pipes.set_filter_mask(&queue, matching.as_ref());
+                        }
+                        crate::ui::state::FilterBehavior::Focus => {
+                            // Clear the hard filter mask, then dim via
+                            // focus_set. Empty matching → no dim (all
+                            // visible).
+                            pipes.set_filter_mask(&queue, None);
+                            let members: HashSet<u32> = matching.unwrap_or_default();
+                            pipes.set_focus_set(&queue, None, &members);
+                        }
+                    }
                 }
             }
         }
