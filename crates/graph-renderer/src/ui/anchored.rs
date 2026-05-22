@@ -117,12 +117,18 @@ pub struct AnchoredPanel<'a> {
 }
 
 /// Outcome of [`AnchoredPanel::show`]. `drag_delta` carries the
-/// per-frame drag delta from the outer area's response so the caller
-/// can accumulate it into a persistent per-node soft-tether offset.
+/// per-frame drag delta from the *caller-supplied header response*
+/// (NOT the outer area), so the caller can accumulate it into a
+/// persistent per-node soft-tether offset without scroll-drag inside
+/// the body bubbling up and moving the panel. `header_double_clicked`
+/// mirrors the header response's `double_clicked()` so the caller can
+/// wire re-snap on header double-click without re-querying the
+/// response after `show` returns.
 pub struct AnchoredOutput<R> {
     pub result: AnchoredResult,
     pub inner: Option<InnerResponse<R>>,
     pub drag_delta: Vec2,
+    pub header_double_clicked: bool,
 }
 
 impl<'a> AnchoredPanel<'a> {
@@ -175,10 +181,22 @@ impl<'a> AnchoredPanel<'a> {
     /// override; the *tether* still aims at the live re-projected
     /// anchor, so the visible string between panel and node stays
     /// truthful while the panel position is allowed to lead/lag.
+    ///
+    /// `add_contents` returns `(R, egui::Response)` — the second tuple
+    /// element is the *drag-sensing header response*, allocated by the
+    /// caller with `Sense::click_and_drag()`. AnchoredPanel reads
+    /// `drag_delta()` and `double_clicked()` from that response and
+    /// exposes them on `AnchoredOutput`. This prevents drag-vs-scroll
+    /// conflicts: body widgets (e.g. a ScrollArea over markdown) sense
+    /// their own drag without it bubbling up to move the panel. If a
+    /// caller has no header (transient hover-preview style), pass a
+    /// non-draggable dummy response (e.g. allocate a zero-size rect
+    /// with `Sense::hover()`); the caller can also simply ignore
+    /// `drag_delta`.
     pub fn show<R>(
         self,
         ctx: &egui::Context,
-        add_contents: impl FnOnce(&mut egui::Ui) -> R,
+        add_contents: impl FnOnce(&mut egui::Ui) -> (R, egui::Response),
     ) -> AnchoredOutput<R> {
         let outcome = project_world_to_canvas(self.camera, self.canvas_rect, self.world_pos);
         let (projected_screen, on_screen) = match outcome {
@@ -187,6 +205,7 @@ impl<'a> AnchoredPanel<'a> {
                     result: AnchoredResult::BehindCamera,
                     inner: None,
                     drag_delta: Vec2::ZERO,
+                    header_double_clicked: false,
                 };
             }
             ProjectionOutcome::OnScreen { screen, .. } => (screen, true),
@@ -262,6 +281,8 @@ impl<'a> AnchoredPanel<'a> {
                 ),
             );
 
+            // body.inner is (R, header_response). Return both so we
+            // can read header drag/double-click outside the closure.
             body.inner
         });
 
@@ -306,11 +327,22 @@ impl<'a> AnchoredPanel<'a> {
         } else {
             AnchoredResult::OffScreen
         };
-        let drag_delta = inner.response.drag_delta();
+        // Split the inner tuple: we expose `InnerResponse<R>` to the
+        // caller, but the drag/double-click come from the
+        // *caller-supplied header response* — NOT `inner.response`
+        // (which is the outer Area's response, and would pick up
+        // scroll-drag inside any body widget).
+        let InnerResponse {
+            inner: (user_value, header_resp),
+            response: area_resp,
+        } = inner;
+        let drag_delta = header_resp.drag_delta();
+        let header_double_clicked = header_resp.double_clicked();
         AnchoredOutput {
             result,
-            inner: Some(inner),
+            inner: Some(InnerResponse::new(user_value, area_resp)),
             drag_delta,
+            header_double_clicked,
         }
     }
 }

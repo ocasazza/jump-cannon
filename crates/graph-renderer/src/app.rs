@@ -2434,50 +2434,59 @@ impl App {
         let output = panel.show(ctx, |ui| {
             ui.set_max_width(360.0);
 
-            // Header row: drag handle text on the left, re-snap +
-            // (promoted) close on the right. The whole panel area
-            // catches the drag delta (see AnchoredOutput::drag_delta);
-            // the visible "≡" glyph just signals draggability.
-            ui.horizontal(|ui| {
-                ui.label(
-                    egui::RichText::new("\u{2630}")
-                        .small()
-                        .color(crate::ui::theme::palette::ICON),
-                );
-                let title = if meta.title.is_empty() {
-                    meta.id.clone()
-                } else {
-                    meta.title.clone()
-                };
-                let title_resp = ui.add(egui::Label::new(
-                    egui::RichText::new(title)
-                        .strong()
-                        .color(crate::ui::theme::palette::TEXT),
-                ).sense(egui::Sense::click()));
-                if title_resp.double_clicked() {
-                    resnap_flag.set(true);
-                }
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if promoted {
+            // Header is a dedicated drag-sensing strip. Allocate it
+            // first as a click_and_drag rect of fixed height; lay the
+            // glyphs/buttons over it via a `UiBuilder` at the same
+            // rect. The returned `header_resp` is what AnchoredPanel
+            // reads `drag_delta()` / `double_clicked()` from — body
+            // widgets (e.g. the markdown ScrollArea) sense their own
+            // gestures without their drag bubbling up to move the
+            // panel.
+            let header_height = 22.0;
+            let header_resp = ui.allocate_response(
+                egui::vec2(ui.available_width(), header_height),
+                egui::Sense::click_and_drag(),
+            );
+            let header_rect = header_resp.rect;
+            ui.allocate_new_ui(egui::UiBuilder::new().max_rect(header_rect), |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new("\u{2630}")
+                            .small()
+                            .color(crate::ui::theme::palette::ICON),
+                    );
+                    let title = if meta.title.is_empty() {
+                        meta.id.clone()
+                    } else {
+                        meta.title.clone()
+                    };
+                    ui.label(
+                        egui::RichText::new(title)
+                            .strong()
+                            .color(crate::ui::theme::palette::TEXT),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if promoted {
+                            if ui
+                                .small_button(egui::RichText::new("\u{2715}").color(
+                                    crate::ui::theme::palette::ICON,
+                                ))
+                                .on_hover_text("Close")
+                                .clicked()
+                            {
+                                close_flag.set(true);
+                            }
+                        }
                         if ui
-                            .small_button(egui::RichText::new("\u{2715}").color(
+                            .small_button(egui::RichText::new("\u{21BA}").color(
                                 crate::ui::theme::palette::ICON,
                             ))
-                            .on_hover_text("Close")
+                            .on_hover_text("Re-snap to anchor")
                             .clicked()
                         {
-                            close_flag.set(true);
+                            resnap_flag.set(true);
                         }
-                    }
-                    if ui
-                        .small_button(egui::RichText::new("\u{21BA}").color(
-                            crate::ui::theme::palette::ICON,
-                        ))
-                        .on_hover_text("Re-snap to anchor")
-                        .clicked()
-                    {
-                        resnap_flag.set(true);
-                    }
+                    });
                 });
             });
 
@@ -2500,7 +2509,12 @@ impl App {
             if !meta.body.is_empty() {
                 ui.separator();
                 if promoted {
-                    // Promoted variant: full body, scrollable.
+                    // Promoted variant: full body, scrollable. We
+                    // keep `drag_to_scroll` enabled (default) so the
+                    // user can click+drag inside the body to scroll;
+                    // the header is the only drag-sensing surface
+                    // upstream, so this drag stays inside ScrollArea
+                    // and never reaches AnchoredPanel.
                     egui::ScrollArea::vertical()
                         .max_height(360.0)
                         .show(ui, |ui| {
@@ -2519,18 +2533,28 @@ impl App {
                     );
                 }
             }
+
+            // Hand the header response back to AnchoredPanel — that's
+            // what its `drag_delta` / `header_double_clicked` come
+            // from.
+            ((), header_resp)
         });
 
-        // Accumulate drag delta into per-node offset. Zero-vector
-        // delta on idle frames is a free no-op; we still write so a
-        // freshly-promoted (no prior entry) node gets initialised at
-        // zero on its first drag.
-        if output.drag_delta != egui::Vec2::ZERO {
+        // Accumulate drag delta into per-node offset — only for the
+        // promoted variant. The hover preview is a transient peek
+        // that vanishes on cursor-leave; a drag there would be lost
+        // immediately, and we'd rather not pollute the per-node
+        // offset map with hover-induced jitter.
+        if promoted && output.drag_delta != egui::Vec2::ZERO {
             let entry = self
                 .anchored_drag_offsets
                 .entry(idx)
                 .or_insert(egui::Vec2::ZERO);
             *entry += output.drag_delta;
+        }
+        // Header double-click is the canonical re-snap gesture.
+        if output.header_double_clicked {
+            resnap_flag.set(true);
         }
         if resnap_flag.get() {
             self.anchored_drag_offsets.remove(&idx);
