@@ -666,7 +666,11 @@ pub struct AppState {
 /// exactly two modes: it's either the persistent CentralPanel
 /// background, or it's hosted inside a floating window. Mutate via
 /// the transition methods on [`AppState`].
-#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+///
+/// The `Floating` variant carries observational state for the popped-out
+/// window so future commands (e.g. "reset position", multi-tab dock
+/// restore) can read it without going through egui's window memory.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Default)]
 pub enum CanvasMount {
     /// Canvas paints into the CentralPanel — full-bleed behind every
     /// floating panel. Default for new sessions.
@@ -674,12 +678,53 @@ pub enum CanvasMount {
     Background,
     /// Canvas paints into the body of a floating `egui::Window`. The
     /// CentralPanel renders a flat dark fill in this mode.
-    Floating,
+    Floating {
+        /// Last-known content rect of the floating canvas window.
+        /// `None` until the window first reports it (guards against
+        /// feeding `Rect::NOTHING` to the wgpu paint callback).
+        /// Serialized as `[f32; 4]` (`min.x, min.y, max.x, max.y`) so
+        /// the format survives an egui `Rect` type change.
+        #[serde(default, with = "rect_opt_serde")]
+        rect: Option<egui::Rect>,
+        /// Whether the egui_dock tab strip was visible at the moment
+        /// of pop-out. v1 doesn't act on this (single-tab is the
+        /// common path), but the bool is persisted so a future
+        /// multi-tab restore on `dock_canvas_back` is non-breaking.
+        #[serde(default)]
+        was_dock_visible: bool,
+    },
 }
 
 impl CanvasMount {
     pub fn is_floating(self) -> bool {
-        matches!(self, CanvasMount::Floating)
+        matches!(self, CanvasMount::Floating { .. })
+    }
+}
+
+/// Serde adapter for `Option<egui::Rect>` ↔ `Option<[f32; 4]>`. egui's
+/// `Rect` does not implement `Serialize`/`Deserialize` directly; storing
+/// the four extremities (`min.x, min.y, max.x, max.y`) future-proofs the
+/// blob against any internal `Rect` type change.
+mod rect_opt_serde {
+    use eframe::egui;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<S>(value: &Option<egui::Rect>, ser: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let opt = value.map(|r| [r.min.x, r.min.y, r.max.x, r.max.y]);
+        opt.serialize(ser)
+    }
+
+    pub fn deserialize<'de, D>(de: D) -> Result<Option<egui::Rect>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let opt = Option::<[f32; 4]>::deserialize(de)?;
+        Ok(opt.map(|[x0, y0, x1, y1]| {
+            egui::Rect::from_min_max(egui::pos2(x0, y0), egui::pos2(x1, y1))
+        }))
     }
 }
 
@@ -710,23 +755,42 @@ impl PanelId {
 // became a persistent launcher row rather than a parking lot for
 // X-ed panels.
 
-pub const STORAGE_KEY: &str = "graph_renderer_app_state_v1";
+// Bumped from `_v1` → `_v2` when `CanvasMount::Floating` gained a
+// `{ rect, was_dock_visible }` payload. Old persisted blobs encode the
+// variant as the unit string `"Floating"`, which serde refuses to
+// deserialize into the new struct variant. A version bump invalidates
+// the cached AppState exactly once per user — preferable to carrying a
+// custom deserializer for what is purely session-scoped state.
+pub const STORAGE_KEY: &str = "graph_renderer_app_state_v2";
 
 fn default_inspector_open() -> bool { true }
 fn default_true() -> bool { true }
 
 impl AppState {
     pub fn pop_canvas_out(&mut self) {
-        self.canvas_mount = CanvasMount::Floating;
+        // Snapshot dock visibility *before* the transition — once
+        // `canvas_mount` flips to `Floating`, the renderer hides the
+        // dock strip and we'd lose the prior signal. Today the only
+        // case where the strip was actually visible is >1 tab; with a
+        // single tab the renderer collapses the strip to zero height
+        // (see app.rs `n_tabs <= 1`).
+        let was_dock_visible = self.dock.has_multiple_tabs();
+        self.canvas_mount = CanvasMount::Floating { rect: None, was_dock_visible };
     }
     pub fn dock_canvas_back(&mut self) {
+        // TODO(multi-tab dock restore): when `was_dock_visible` is true,
+        // re-show the egui_dock tab strip / restore any extra tabs that
+        // were hidden by the pop-out. v1 is single-tab so this is a no-op.
         self.canvas_mount = CanvasMount::Background;
     }
     pub fn toggle_canvas_mount(&mut self) {
-        self.canvas_mount = match self.canvas_mount {
-            CanvasMount::Background => CanvasMount::Floating,
-            CanvasMount::Floating => CanvasMount::Background,
-        };
+        match self.canvas_mount {
+            CanvasMount::Background => self.pop_canvas_out(),
+            CanvasMount::Floating { .. } => self.dock_canvas_back(),
+        }
+    }
+    pub fn canvas_is_floating(&self) -> bool {
+        matches!(self.canvas_mount, CanvasMount::Floating { .. })
     }
 }
 

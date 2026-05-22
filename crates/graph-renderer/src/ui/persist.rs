@@ -47,6 +47,12 @@ pub fn install_beforeunload_hook() {
     // No-op on native.
 }
 
+/// Native: no-op. The WASM build's debounced-flush path mirrors the
+/// sessionStorage half of `save_to_eframe`; on native the eframe-side
+/// auto-save is the only persistence path, so there's nothing to do here.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn save_to_sessionstorage_only(_state: &AppState) {}
+
 // -----------------------------------------------------------------------------
 // WASM
 // -----------------------------------------------------------------------------
@@ -107,6 +113,21 @@ pub fn save_to_eframe(storage: &mut dyn eframe::Storage, state: &AppState) {
     *LAST_SERIALIZED.lock().unwrap() = Some(json.clone());
     // Mirror to eframe storage for compatibility (test harnesses, etc).
     storage.set_string(STORAGE_KEY, json);
+}
+
+/// WASM-only: serialize `state` and push to sessionStorage WITHOUT
+/// touching `eframe::Storage`. Used between eframe's ~30s auto-save
+/// firings so a fast tab reload preserves the most recent UI state.
+/// Also updates `LAST_SERIALIZED` so the `beforeunload` flush has a
+/// fresh blob to re-write.
+#[cfg(target_arch = "wasm32")]
+pub fn save_to_sessionstorage_only(state: &AppState) {
+    let Ok(json) = serde_json::to_string(state) else { return };
+    if let Err(e) = session_storage_set(STORAGE_KEY, &json) {
+        log::warn!("[persist] sessionStorage write (debounced) failed: {e}");
+        return;
+    }
+    *LAST_SERIALIZED.lock().unwrap() = Some(json);
 }
 
 /// Install a one-shot `beforeunload` window listener that re-flushes the

@@ -241,12 +241,24 @@ pub struct App {
     /// Sticky-promoted anchored panel idx. Set on click; cleared on X.
     /// Distinct from `selected_node_idx` so promoted previews can
     /// coexist with a different inspector selection.
-    ///
-    /// TODO(promote-ui): wire a click handler in `tick_hover_preview`
-    /// (or the canvas click dispatch) to set this; today the field is
-    /// plumbed but no caller mutates it.
-    #[allow(dead_code)]
     promoted_anchored_idx: Option<u32>,
+    /// Per-node soft-tether drag offsets in screen pixels. The user
+    /// grabs the panel header and drags; the per-frame delta is
+    /// accumulated here. Cleared per-node on a "re-snap" click. The
+    /// hover preview shares the map with the promoted panel, keyed by
+    /// node idx, so promoting a hovered-and-dragged panel preserves
+    /// the user's offset.
+    anchored_drag_offsets: HashMap<u32, egui::Vec2>,
+    /// NodeMeta for the currently-promoted anchored panel. Filled by
+    /// `promoted_anchored_fetch`. Cleared when `promoted_anchored_idx`
+    /// changes to a different id.
+    promoted_anchored_meta: Option<proto::NodeMeta>,
+    /// Async slot for the in-flight /node/:id fetch backing the
+    /// promoted anchored panel. Distinct from `hover_preview_fetch`
+    /// because the promoted panel survives a hover end and may need
+    /// its own fetch lifecycle when the user clicks before the hover
+    /// preview's fetch completes.
+    promoted_anchored_fetch: Arc<Mutex<Option<Result<Option<proto::NodeMeta>, String>>>>,
 
     /// Inverted index of (field, value) -> node-idx buckets. Populated
     /// by a one-shot async `/graph/meta_summary` fetch in `kick_off_bootstrap`.
@@ -267,6 +279,27 @@ pub struct App {
     /// stay where they are until the next migration pass — see
     /// `ui::input::AppAction` for the reserved variants.
     input_ctx: InputCtx<AppAction>,
+
+    // -- WASM debounced sessionStorage persistence ---------------------
+    //
+    // Eframe's auto-save fires roughly every 30s; a reload between
+    // firings would otherwise drop everything done since the last
+    // tick. We hash AppState each frame, mark dirty on change, and
+    // flush at most once per `PERSIST_DEBOUNCE` window. Native is
+    // unaffected — the eframe path is still the only writer there.
+    /// Last-frame hash of AppState (JSON-bytes hashed via DefaultHasher).
+    /// `None` on the first frame so the very first compare marks dirty
+    /// and we get one startup-flush to populate sessionStorage.
+    #[cfg(target_arch = "wasm32")]
+    state_pushed_hash: Option<u64>,
+    /// Set whenever the per-frame hash differs from `state_pushed_hash`.
+    /// Cleared once the next debounced flush lands in sessionStorage.
+    #[cfg(target_arch = "wasm32")]
+    state_dirty: bool,
+    /// Most recent debounced flush time. `None` means "never flushed";
+    /// the next dirty frame will flush immediately.
+    #[cfg(target_arch = "wasm32")]
+    last_persist_at: Option<web_time::Instant>,
 }
 
 impl App {
@@ -464,10 +497,20 @@ impl App {
             hover_preview_pos: None,
             last_anchored_screen_pos: HashMap::new(),
             promoted_anchored_idx: None,
+            anchored_drag_offsets: HashMap::new(),
+            promoted_anchored_meta: None,
+            promoted_anchored_fetch: Arc::new(Mutex::new(None)),
             field_index: None,
             field_index_slot,
             progress,
             input_ctx: InputCtx::new(default_bindings()),
+
+            #[cfg(target_arch = "wasm32")]
+            state_pushed_hash: None,
+            #[cfg(target_arch = "wasm32")]
+            state_dirty: false,
+            #[cfg(target_arch = "wasm32")]
+            last_persist_at: None,
         }
     }
 
@@ -515,6 +558,25 @@ impl App {
                 });
             }
         }
+    }
+
+    /// Spawn a `/node/:id` fetch dedicated to the promoted anchored
+    /// panel. Distinct slot so the modal-side `node_fetch` drain logic
+    /// keeps owning that slot and we don't fight it for ownership.
+    fn kick_off_promoted_anchored_fetch(&self, id: String) {
+        let slot = self.promoted_anchored_fetch.clone();
+        let client = ApiClient::new(self.base_url.clone());
+        let sink = self.progress.sink();
+        let label = format!("promote {}", short_id(&id));
+        spawn_async(async move {
+            let task = sink.start("anchored", label);
+            let res = client.node(&id).await;
+            match &res {
+                Ok(_) => sink.finish(task),
+                Err(e) => sink.fail(task, e.clone()),
+            }
+            *slot.lock().unwrap() = Some(res);
+        });
     }
 
     /// Spawn an async `/node/:id` fetch. The result lands in `self.node_fetch`
@@ -1152,6 +1214,21 @@ impl eframe::App for App {
                 let mut viewer = ui::workspace::WorkspaceViewer { ctx: &mut wctx };
                 viewer.draw_graph_tab(ui);
             });
+            // Snapshot the floating window's last-known rect back onto
+            // `AppState::canvas_mount`. `FloatingPanel::show` only
+            // returns the body inner; the window's outer rect lives in
+            // egui's area memory under the same id the panel
+            // constructs (`("floating", PanelId::Canvas)`). Observational
+            // only — nothing reads this field yet (future "reset position"
+            // command and cross-reload persistence).
+            if let ui::state::CanvasMount::Floating { rect, .. } =
+                &mut self.state.canvas_mount
+            {
+                let id = egui::Id::new(("floating", ui::state::PanelId::Canvas));
+                if let Some(area_rect) = ctx.memory(|m| m.area_rect(id)) {
+                    *rect = Some(area_rect);
+                }
+            }
             if !canvas_open {
                 self.state.dock_canvas_back();
             }
@@ -1262,6 +1339,27 @@ impl eframe::App for App {
                     // Sticky focus: click locks focus on this node. Hover
                     // is suppressed while sticky is set.
                     self.focus_sticky_idx = Some(idx);
+                    // Promote the anchored panel: clicking a node makes
+                    // the floating card sticky (interactable, persists
+                    // until X-ed). Option semantics handle swap-on-other-
+                    // node automatically. We intentionally do NOT clear
+                    // `promoted_anchored_idx` in the background-click
+                    // branch below — clicking empty canvas should not
+                    // dismiss a promoted panel.
+                    let prev_promoted = self.promoted_anchored_idx;
+                    self.promoted_anchored_idx = Some(idx);
+                    if prev_promoted != Some(idx) {
+                        // Swap: drop the old meta + kick a fetch for
+                        // the new id. Reuse the hover preview's cached
+                        // meta when it already matches to avoid an
+                        // immediate empty-render flash.
+                        self.promoted_anchored_meta = self
+                            .hover_preview_meta
+                            .as_ref()
+                            .filter(|m| m.id == id)
+                            .cloned();
+                        self.kick_off_promoted_anchored_fetch(id.clone());
+                    }
                     // UX: surface the inspector if the user clicks a node
                     // while it's collapsed. They almost certainly want to
                     // see what they just clicked.
@@ -1435,6 +1533,43 @@ impl eframe::App for App {
             // Light tick so a fresh user action (e.g. an action instance
             // mutating state) isn't held up for an arbitrary time.
             ctx.request_repaint_after(std::time::Duration::from_millis(250));
+        }
+
+        // -- WASM debounced sessionStorage persistence -----------------
+        //
+        // Detect a state mutation via JSON-hash diff (cheap enough for a
+        // panel-state-sized struct; revisit if it shows up in profiles)
+        // and, when dirty, flush at most once per PERSIST_DEBOUNCE window
+        // to sessionStorage only. `App::save` still mirrors to
+        // eframe::Storage on eframe's own ~30s cadence.
+        #[cfg(target_arch = "wasm32")]
+        {
+            use std::hash::{Hash, Hasher};
+            use std::time::Duration;
+            const PERSIST_DEBOUNCE: Duration = Duration::from_millis(800);
+
+            if let Ok(json) = serde_json::to_string(&self.state) {
+                let mut h = std::collections::hash_map::DefaultHasher::new();
+                json.hash(&mut h);
+                let now_hash = h.finish();
+                if Some(now_hash) != self.state_pushed_hash {
+                    self.state_dirty = true;
+                    self.state_pushed_hash = Some(now_hash);
+                }
+            }
+
+            if self.state_dirty {
+                let now = web_time::Instant::now();
+                let elapsed = self
+                    .last_persist_at
+                    .map(|t| now.duration_since(t))
+                    .unwrap_or(Duration::from_secs(10));
+                if elapsed > PERSIST_DEBOUNCE {
+                    ui::persist::save_to_sessionstorage_only(&self.state);
+                    self.state_dirty = false;
+                    self.last_persist_at = Some(now);
+                }
+            }
         }
 
         self.perf.end_frame(self.last_observed_max_ke);
@@ -2140,19 +2275,76 @@ impl App {
     /// is the node, not the cursor — the user can move the cursor
     /// freely between node and card.
     fn show_hover_preview(&mut self, ctx: &egui::Context, frame: &eframe::Frame) {
-        if !self.hover_preview_open {
-            return;
+        // Drain the promoted-anchored fetch slot first so we have
+        // fresh meta available for this frame's paint.
+        if let Some(Ok(Some(meta))) =
+            self.promoted_anchored_fetch.lock().unwrap().take()
+        {
+            self.promoted_anchored_meta = Some(meta);
         }
-        let Some(meta) = self.hover_preview_meta.clone() else {
-            return;
-        };
-        let Some(idx) = self.hover_preview_idx else {
-            return;
-        };
+
         let Some(canvas_rect) = self.prev_canvas_rect else {
             return;
         };
 
+        // Two anchored panels can be live in one frame: a hovered
+        // preview (transient, non-promoted) and a sticky promoted
+        // panel. Render both, but skip the hover preview when its
+        // idx matches the promoted idx — they'd render at the same
+        // anchor and the user would see a doubled card.
+        let hover_idx = if self.hover_preview_open {
+            self.hover_preview_idx
+        } else {
+            None
+        };
+        let promoted_idx = self.promoted_anchored_idx;
+
+        // Render promoted first (it's "below" in semantic stack —
+        // the hover preview is the more transient layer). Both use
+        // egui::Area::order(Foreground); paint order within the
+        // layer falls in call order, but they have different ids and
+        // never overlap (we skip hover when idx matches).
+        if let Some(pidx) = promoted_idx {
+            if let Some(meta) = self.promoted_anchored_meta.clone() {
+                self.render_anchored_panel(ctx, frame, canvas_rect, pidx, meta, true);
+            }
+        }
+
+        if let Some(hidx) = hover_idx {
+            if Some(hidx) != promoted_idx {
+                if let Some(meta) = self.hover_preview_meta.clone() {
+                    self.render_anchored_panel(ctx, frame, canvas_rect, hidx, meta, false);
+                }
+            }
+        }
+    }
+
+    /// Render a single anchored panel for `idx`.
+    ///
+    /// `promoted = true` enables the X close button (clears
+    /// `promoted_anchored_idx`) and makes the body scrollable. Both
+    /// variants share the EMA-smoothed positioning + soft-tether drag
+    /// pipeline: project once, blend into `last_anchored_screen_pos`,
+    /// hand the smoothed value to AnchoredPanel as
+    /// `screen_pos_override`, then accumulate any per-frame drag
+    /// delta into `anchored_drag_offsets[idx]`.
+    ///
+    /// The header is built inside the body closure (egui doesn't give
+    /// AnchoredPanel a separate header surface), which means the
+    /// "header drag" is detected via the OUTER area's drag_delta in
+    /// `AnchoredOutput` — egui's Area drag handling moves the area
+    /// when *anywhere on it* is dragged, but we only use the delta to
+    /// update our per-node offset; the Area itself is `fixed_pos`,
+    /// so this won't conflict.
+    fn render_anchored_panel(
+        &mut self,
+        ctx: &egui::Context,
+        frame: &eframe::Frame,
+        canvas_rect: egui::Rect,
+        idx: u32,
+        meta: proto::NodeMeta,
+        promoted: bool,
+    ) {
         // Pull world position + camera snapshot out of the wgpu
         // callback resources, then drop the read lock before opening
         // any egui Area. Camera is cloned (small, all-Copy fields)
@@ -2175,21 +2367,17 @@ impl App {
             (world, pipes.camera.clone())
         };
 
-        // EMA_ALPHA = 0.4: blend 40% of the new frame into the
-        // running average. Below 0.4 the card visibly lags fast
-        // camera pans; above 0.6 the jitter reappears. 0.4 is the
-        // empirical sweet spot. AnchoredPanel re-projects internally
-        // for the actual placement; we cache the smoothed screen
-        // pos here for a future soft-tether drag UI to anchor off
-        // of.
+        // Project + EMA-smooth. EMA_ALPHA = 0.4: blend 40% of the
+        // new frame into the running average. Below 0.4 the card
+        // visibly lags fast camera pans; above 0.6 the jitter
+        // reappears. We re-checked 0.4 after wiring the smoothed
+        // value through `screen_pos_override` (so the user actually
+        // sees the smoothed position drive placement, not the
+        // projected one); 0.4 still reads as crisp without jitter.
         const EMA_ALPHA: f32 = 0.4;
-        {
+        let smoothed: Option<egui::Pos2> = {
             let aspect = (canvas_rect.width() / canvas_rect.height().max(0.0001)).max(0.0001);
-            let view = glam::Mat4::look_to_rh(
-                camera.position,
-                camera.forward(),
-                glam::Vec3::Y,
-            );
+            let view = glam::Mat4::look_to_rh(camera.position, camera.forward(), glam::Vec3::Y);
             let proj = glam::Mat4::perspective_rh(
                 camera.fov_y,
                 aspect,
@@ -2204,38 +2392,95 @@ impl App {
                 let sy = canvas_rect.top()
                     + (1.0 - (ndc_y * 0.5 + 0.5)) * canvas_rect.height();
                 let projected = egui::pos2(sx, sy);
-                let smoothed = match self.last_anchored_screen_pos.get(&idx).copied() {
+                let s = match self.last_anchored_screen_pos.get(&idx).copied() {
                     Some(p) => egui::pos2(
                         p.x + (projected.x - p.x) * EMA_ALPHA,
                         p.y + (projected.y - p.y) * EMA_ALPHA,
                     ),
                     None => projected,
                 };
-                self.last_anchored_screen_pos.insert(idx, smoothed);
+                self.last_anchored_screen_pos.insert(idx, s);
+                Some(s)
+            } else {
+                None
             }
-        }
+        };
 
+        // Soft-tether: per-node drag offset accumulated across frames.
+        // Mutates only inside the closure on click; passed in as a
+        // value here so AnchoredPanel sees the current snapshot.
+        let drag_offset = self.anchored_drag_offsets.get(&idx).copied();
+
+        // resnap_requested is set by the header's "↺" button or a
+        // double-click. We can't write back to self inside the
+        // closure (mutable borrow of self), so we capture into a
+        // Cell. Pattern mirrors how modal close buttons forward
+        // intents up through the show() call.
+        let resnap_flag = std::cell::Cell::new(false);
+        let close_flag = std::cell::Cell::new(false);
+
+        let panel_id_tag = if promoted { "anchored-promoted" } else { "hover-preview" };
         let panel = crate::ui::anchored::AnchoredPanel::new(
-            egui::Id::new(("hover-preview", idx)),
+            egui::Id::new((panel_id_tag, idx)),
             world,
             canvas_rect,
             &camera,
         )
         .offset(egui::vec2(18.0, 18.0))
-        .interactable(true);
+        .interactable(true)
+        .anchor_pixels(drag_offset)
+        .screen_pos_override(smoothed);
 
-        panel.show(ctx, |ui| {
+        let output = panel.show(ctx, |ui| {
             ui.set_max_width(360.0);
-            let title = if meta.title.is_empty() {
-                meta.id.clone()
-            } else {
-                meta.title.clone()
-            };
-            ui.label(
-                egui::RichText::new(title)
-                    .strong()
-                    .color(crate::ui::theme::palette::TEXT),
-            );
+
+            // Header row: drag handle text on the left, re-snap +
+            // (promoted) close on the right. The whole panel area
+            // catches the drag delta (see AnchoredOutput::drag_delta);
+            // the visible "≡" glyph just signals draggability.
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new("\u{2630}")
+                        .small()
+                        .color(crate::ui::theme::palette::ICON),
+                );
+                let title = if meta.title.is_empty() {
+                    meta.id.clone()
+                } else {
+                    meta.title.clone()
+                };
+                let title_resp = ui.add(egui::Label::new(
+                    egui::RichText::new(title)
+                        .strong()
+                        .color(crate::ui::theme::palette::TEXT),
+                ).sense(egui::Sense::click()));
+                if title_resp.double_clicked() {
+                    resnap_flag.set(true);
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if promoted {
+                        if ui
+                            .small_button(egui::RichText::new("\u{2715}").color(
+                                crate::ui::theme::palette::ICON,
+                            ))
+                            .on_hover_text("Close")
+                            .clicked()
+                        {
+                            close_flag.set(true);
+                        }
+                    }
+                    if ui
+                        .small_button(egui::RichText::new("\u{21BA}").color(
+                            crate::ui::theme::palette::ICON,
+                        ))
+                        .on_hover_text("Re-snap to anchor")
+                        .clicked()
+                    {
+                        resnap_flag.set(true);
+                    }
+                });
+            });
+
             if !meta.path.is_empty() {
                 ui.label(
                     egui::RichText::new(&meta.path)
@@ -2254,14 +2499,49 @@ impl App {
             }
             if !meta.body.is_empty() {
                 ui.separator();
-                let snippet = body_snippet(&meta.body, 280, 6);
-                ui.label(
-                    egui::RichText::new(snippet)
-                        .small()
-                        .color(crate::ui::theme::palette::TEXT),
-                );
+                if promoted {
+                    // Promoted variant: full body, scrollable.
+                    egui::ScrollArea::vertical()
+                        .max_height(360.0)
+                        .show(ui, |ui| {
+                            ui.label(
+                                egui::RichText::new(&meta.body)
+                                    .small()
+                                    .color(crate::ui::theme::palette::TEXT),
+                            );
+                        });
+                } else {
+                    let snippet = body_snippet(&meta.body, 280, 6);
+                    ui.label(
+                        egui::RichText::new(snippet)
+                            .small()
+                            .color(crate::ui::theme::palette::TEXT),
+                    );
+                }
             }
         });
+
+        // Accumulate drag delta into per-node offset. Zero-vector
+        // delta on idle frames is a free no-op; we still write so a
+        // freshly-promoted (no prior entry) node gets initialised at
+        // zero on its first drag.
+        if output.drag_delta != egui::Vec2::ZERO {
+            let entry = self
+                .anchored_drag_offsets
+                .entry(idx)
+                .or_insert(egui::Vec2::ZERO);
+            *entry += output.drag_delta;
+        }
+        if resnap_flag.get() {
+            self.anchored_drag_offsets.remove(&idx);
+        }
+        if close_flag.get() && promoted {
+            self.promoted_anchored_idx = None;
+            self.promoted_anchored_meta = None;
+            // Don't clear the drag offset — if the user later
+            // re-promotes this node, restoring their offset is the
+            // friendlier default.
+        }
     }
 
     fn maybe_clear_hover_after_hold(&mut self) {

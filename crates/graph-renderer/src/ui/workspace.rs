@@ -72,6 +72,14 @@ impl Workspace {
     pub fn push_tab(&mut self, kind: TabKind) {
         self.dock_state.push_to_focused_leaf(Tab::new(kind));
     }
+
+    /// True when the dock has more than one tab open. Used by
+    /// `AppState::pop_canvas_out` to snapshot whether the dock tab
+    /// strip was visible at the moment of pop-out (the renderer
+    /// collapses the strip to zero height when only one tab exists).
+    pub fn has_multiple_tabs(&self) -> bool {
+        self.dock_state.iter_all_tabs().count() > 1
+    }
 }
 
 /// Per-frame context passed into the TabViewer. Carries everything the

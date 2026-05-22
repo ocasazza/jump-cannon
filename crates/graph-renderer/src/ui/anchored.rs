@@ -85,10 +85,12 @@ fn project_world_to_canvas(
 ///
 /// `offset` is the auto-position delta (e.g. nudge the panel below-and-
 /// right of the projected anchor so the cursor / node glyph isn't
-/// covered). `anchor_pixels` is reserved for a future soft-tether
-/// drag UI: the user grabs the panel, drags it, and the delta lives
-/// here so the panel stays put relative to the anchor across camera
-/// motion. Today no UI populates it; pass `None` and ignore.
+/// covered). `anchor_pixels` is the soft-tether user-drag delta in
+/// screen pixels (persists per node). `screen_pos_override`, when
+/// supplied, replaces the internal re-projection for *panel placement*
+/// (e.g. an EMA-smoothed value) while the tether arrow is always drawn
+/// to the freshly re-projected anchor — so the arrow tracks the true
+/// node while the panel sits at the smoothed point.
 pub struct AnchoredPanel<'a> {
     pub id: Id,
     pub world_pos: glam::Vec3,
@@ -96,11 +98,12 @@ pub struct AnchoredPanel<'a> {
     pub camera: &'a Camera,
     pub offset: Vec2,
     /// User-drag delta in screen pixels (persists per node).
-    ///
-    /// TODO(soft-tether): wire a drag UI on the panel header so the
-    /// user can re-position the card and the arrow keeps tracking the
-    /// projected anchor. Plumbed but unused for now.
     pub anchor_pixels: Option<Vec2>,
+    /// EMA-smoothed projected screen position. When `Some`, used in
+    /// place of the freshly re-projected anchor for *panel placement*
+    /// (the tether arrow still uses the live projection). When `None`,
+    /// the panel falls back to the internal projection.
+    pub screen_pos_override: Option<Pos2>,
     /// Inset (px) from the viewport edge when the panel is clamped
     /// because the anchor is off-screen. 40 px keeps the squircle
     /// fully on-canvas with room for the arrow stub.
@@ -113,6 +116,15 @@ pub struct AnchoredPanel<'a> {
     pub interactable: bool,
 }
 
+/// Outcome of [`AnchoredPanel::show`]. `drag_delta` carries the
+/// per-frame drag delta from the outer area's response so the caller
+/// can accumulate it into a persistent per-node soft-tether offset.
+pub struct AnchoredOutput<R> {
+    pub result: AnchoredResult,
+    pub inner: Option<InnerResponse<R>>,
+    pub drag_delta: Vec2,
+}
+
 impl<'a> AnchoredPanel<'a> {
     pub fn new(id: Id, world_pos: glam::Vec3, canvas_rect: Rect, camera: &'a Camera) -> Self {
         Self {
@@ -122,6 +134,7 @@ impl<'a> AnchoredPanel<'a> {
             camera,
             offset: Vec2::new(16.0, 16.0),
             anchor_pixels: None,
+            screen_pos_override: None,
             clamp_margin: 40.0,
             inner_margin: 8.0,
             corner_radius: 10.0,
@@ -139,37 +152,64 @@ impl<'a> AnchoredPanel<'a> {
         self
     }
 
+    pub fn anchor_pixels(mut self, anchor_pixels: Option<Vec2>) -> Self {
+        self.anchor_pixels = anchor_pixels;
+        self
+    }
+
+    pub fn screen_pos_override(mut self, screen_pos: Option<Pos2>) -> Self {
+        self.screen_pos_override = screen_pos;
+        self
+    }
+
     /// Render the panel.
     ///
-    /// On `BehindCamera`, returns `(BehindCamera, None)` without
-    /// opening an Area. Otherwise opens a foreground-layer Area at
-    /// the (clamped, if off-screen) anchor + offset, paints the
-    /// squircle backdrop, invokes `add_contents`, and draws a tether
-    /// from the panel edge back to the projected anchor (or an arrow
-    /// stub at the clamped edge pointing toward the off-screen
-    /// anchor).
+    /// On `BehindCamera`, returns a no-op output. Otherwise opens a
+    /// foreground-layer Area at the (clamped, if off-screen) anchor +
+    /// offset, paints the squircle backdrop, invokes `add_contents`,
+    /// and draws a tether from the panel edge back to the projected
+    /// anchor (or an arrow stub at the clamped edge pointing toward
+    /// the off-screen anchor).
+    ///
+    /// When `screen_pos_override` is set, *panel placement* uses the
+    /// override; the *tether* still aims at the live re-projected
+    /// anchor, so the visible string between panel and node stays
+    /// truthful while the panel position is allowed to lead/lag.
     pub fn show<R>(
         self,
         ctx: &egui::Context,
         add_contents: impl FnOnce(&mut egui::Ui) -> R,
-    ) -> (AnchoredResult, Option<InnerResponse<R>>) {
+    ) -> AnchoredOutput<R> {
         let outcome = project_world_to_canvas(self.camera, self.canvas_rect, self.world_pos);
         let (projected_screen, on_screen) = match outcome {
-            ProjectionOutcome::BehindCamera => return (AnchoredResult::BehindCamera, None),
+            ProjectionOutcome::BehindCamera => {
+                return AnchoredOutput {
+                    result: AnchoredResult::BehindCamera,
+                    inner: None,
+                    drag_delta: Vec2::ZERO,
+                };
+            }
             ProjectionOutcome::OnScreen { screen, .. } => (screen, true),
             ProjectionOutcome::OffScreen { screen, .. } => (screen, false),
         };
 
+        // Panel placement source: smoothed override if the caller
+        // supplied one, otherwise the live re-projection. The tether
+        // below always uses `projected_screen` so it tracks the real
+        // node position.
+        let placement_anchor = self.screen_pos_override.unwrap_or(projected_screen);
+
         let user_delta = self.anchor_pixels.unwrap_or(Vec2::ZERO);
-        let raw_pos = projected_screen + self.offset + user_delta;
+        let raw_pos = placement_anchor + self.offset + user_delta;
 
         // Clamp the panel into the viewport (with margin) when the
-        // anchor itself is off-screen. We don't clamp on-screen
-        // anchors — the panel is allowed to spill slightly past the
-        // canvas edge as the user pans, since egui will auto-place
-        // tooltips relative to the screen anyway.
+        // anchor itself is off-screen AND the caller hasn't supplied
+        // an explicit placement override. With an override, trust the
+        // caller — they've already decided where the panel goes, and
+        // a user-drag delta is allowed to push it near (or past) the
+        // edge intentionally.
         let clamp_rect = self.canvas_rect.shrink(self.clamp_margin);
-        let panel_pos = if on_screen {
+        let panel_pos = if on_screen || self.screen_pos_override.is_some() {
             raw_pos
         } else {
             egui::pos2(
@@ -266,7 +306,12 @@ impl<'a> AnchoredPanel<'a> {
         } else {
             AnchoredResult::OffScreen
         };
-        (result, Some(inner))
+        let drag_delta = inner.response.drag_delta();
+        AnchoredOutput {
+            result,
+            inner: Some(inner),
+            drag_delta,
+        }
     }
 }
 
