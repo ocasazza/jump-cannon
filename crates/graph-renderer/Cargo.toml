@@ -88,6 +88,9 @@ features = [
   "HtmlCanvasElement",
   "CssStyleDeclaration",
   "HtmlElement",
+  "Storage",
+  "Event",
+  "EventTarget",
 ]
 
 [build-dependencies]

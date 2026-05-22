@@ -254,20 +254,23 @@ impl App {
         ui::apply_theme(&cc.egui_ctx);
 
         // Restore persisted UI state (active section, slider values, etc).
-        // Run the layout-shape migration on the raw JSON value first so
-        // pre-refactor `LayoutState { repulsion, spring_k, ... }` blobs
-        // get folded into the new `{ active, settings: { "gpu-force":
-        // {...} } }` shape before serde decodes the typed struct.
-        let state: ui::AppState = cc
-            .storage
-            .and_then(|s| s.get_string(ui::STORAGE_KEY))
-            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
-            .map(|mut v| {
-                ui::state::migrate_layout_state(&mut v);
-                v
-            })
-            .and_then(|v| serde_json::from_value::<ui::AppState>(v).ok())
-            .unwrap_or_default();
+        //
+        // The `ui::persist` module owns the load/save logic with cfg-gated
+        // bodies for wasm vs native:
+        //   * Native: reads `eframe::Storage` (platform-dirs JSON blob).
+        //   * WASM: reads browser `sessionStorage` — a tab reload preserves
+        //     state; a brand-new tab starts fresh. First-load migration
+        //     pulls any pre-existing `eframe::Storage` blob over into
+        //     sessionStorage so the cutover is non-destructive.
+        // The migration shim for the pre-refactor `LayoutState` shape runs
+        // inside `persist`, so callers don't need to mind it here.
+        let state: ui::AppState = ui::persist::load_from_eframe(cc.storage);
+
+        // Install the WASM-only beforeunload hook once: it flushes the
+        // most-recently-serialized AppState JSON to sessionStorage on
+        // tab close / reload, so changes made between the eframe periodic
+        // saves aren't lost. No-op on native.
+        ui::persist::install_beforeunload_hook();
 
         // Cap steps_per_call (gpu-force) so an old persisted 8 doesn't
         // burn the GPU; the cooling / energy knobs are left alone so
@@ -879,9 +882,10 @@ impl eframe::App for App {
     }
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
-        if let Ok(json) = serde_json::to_string(&self.state) {
-            storage.set_string(ui::STORAGE_KEY, json);
-        }
+        // On WASM the source of truth is sessionStorage; we still mirror
+        // to `eframe::Storage` so test harnesses that introspect that key
+        // keep working. On native, this writes the platform-dirs blob.
+        ui::persist::save_to_eframe(storage, &self.state);
     }
 
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {

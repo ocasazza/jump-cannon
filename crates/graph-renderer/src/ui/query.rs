@@ -17,8 +17,46 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 
-/// Active per-field filter selections driven by badge clicks. Within a
-/// single field, multiple values OR; across fields, AND.
+/// How multiple selections combine. `Any` = union (OR), `All` =
+/// intersect (AND). Used both per-field (how to combine the value
+/// buckets within a single field) and cross-field (how to combine
+/// each field's resulting set).
+///
+/// Per-field `All` is meaningful for multi-valued fields like `tags`
+/// ("nodes that have BOTH tags rust AND egui"). For single-valued
+/// fields like `Author` it degenerates to a no-op: every node has at
+/// most one author, so intersecting two distinct authors yields
+/// `∅`. We surface the toggle anyway and let the user discover that
+/// degenerate case — hiding it would lie about how the data is
+/// structured.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub enum Combinator {
+    /// Union — match any of the selected values.
+    #[default]
+    Any,
+    /// Intersect — match all selected values.
+    All,
+}
+
+impl Combinator {
+    pub fn label(self) -> &'static str {
+        match self {
+            Combinator::Any => "any",
+            Combinator::All => "all",
+        }
+    }
+    pub fn toggled(self) -> Self {
+        match self {
+            Combinator::Any => Combinator::All,
+            Combinator::All => Combinator::Any,
+        }
+    }
+}
+
+/// Active per-field filter selections driven by badge clicks.
+///
+/// Defaults: per-field `Any` (OR within a field), cross-field `All`
+/// (AND across fields) — preserves the pre-combinator behavior.
 ///
 /// `insertion_order` exists so the on-screen chip-strip can render
 /// fields in the order the user added them (BTreeMap orders by name,
@@ -28,6 +66,31 @@ pub struct ActiveFieldFilters {
     pub by_field: BTreeMap<String, BTreeSet<String>>,
     #[serde(default)]
     pub insertion_order: Vec<String>,
+    /// Per-field combinator override. Missing key = `Any` (OR).
+    #[serde(default)]
+    pub field_combinator: BTreeMap<String, Combinator>,
+    /// How field-level results combine. Default `All` (AND) so
+    /// existing persisted state behaves as before.
+    #[serde(default = "default_cross_field_combinator")]
+    pub cross_field_combinator: Combinator,
+}
+
+fn default_cross_field_combinator() -> Combinator {
+    Combinator::All
+}
+
+impl ActiveFieldFilters {
+    pub fn combinator_for(&self, field: &str) -> Combinator {
+        self.field_combinator.get(field).copied().unwrap_or(Combinator::Any)
+    }
+    pub fn set_combinator_for(&mut self, field: &str, c: Combinator) {
+        // Keep the map sparse: drop the default to avoid serde bloat.
+        if matches!(c, Combinator::Any) {
+            self.field_combinator.remove(field);
+        } else {
+            self.field_combinator.insert(field.to_string(), c);
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -131,6 +194,7 @@ impl QueryModel {
                 self.active_filters
                     .insertion_order
                     .retain(|f| f != field);
+                self.active_filters.field_combinator.remove(field);
             }
         } else {
             entry.insert(value.to_string());

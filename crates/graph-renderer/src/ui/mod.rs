@@ -12,6 +12,7 @@ pub mod frontmatter_grid;
 pub mod inspector;
 pub mod layout;
 pub mod modal;
+pub mod persist;
 pub mod progress;
 pub mod query;
 pub mod status_footer;
