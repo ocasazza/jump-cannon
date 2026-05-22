@@ -11,12 +11,12 @@ use axum::{
     },
     http::{header, HeaderMap, HeaderValue, StatusCode},
     response::IntoResponse,
-    routing::get,
-    Router,
+    routing::{get, put},
+    Json, Router,
 };
 use tokio::sync::broadcast::error::RecvError;
 use prost::Message as ProstMessage;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::{proto, state::AppState};
 use vault_data::color::PALETTE;
@@ -39,7 +39,240 @@ pub fn router(state: AppState) -> Router {
         .route("/node/:id", get(node_meta))
         .route("/search", get(search))
         .route("/compute/health", get(compute_health))
+        .route("/vault/page", put(vault_page_put))
         .with_state(state)
+}
+
+// --- Vault write endpoint ---
+//
+// PUT /vault/page  Body: { "path": "...", "body": "..." }
+//
+// `path` follows the vault-links convention (relative, no `.md` extension,
+// matching `meta.path` in NodeMeta). `body` is the *body-only* markdown —
+// the on-disk YAML frontmatter block (if any) is preserved verbatim. This
+// keeps the editor's source surface focused on prose while frontmatter
+// editing continues to flow through the chip strip surface. See the
+// `page_viewer` module on the renderer side for the matching client.
+//
+// SECURITY: no authentication. The graph-api server is a local-dev tool
+// (the README only documents `127.0.0.1` binding and no auth on /search,
+// /node/:id, etc.). Adding auth here without doing it everywhere would be
+// security theatre. The path-traversal guard below is the only line of
+// defence; if this server ever binds to a non-loopback address, the
+// auth story must be revisited *for every endpoint*, not just this one.
+
+/// Cap on accepted write body. 5 MiB is well above any sane Obsidian
+/// note (~50 KiB typical) but bounded enough that a runaway client
+/// can't OOM the server.
+const MAX_PAGE_BYTES: usize = 5 * 1024 * 1024;
+
+#[derive(Deserialize)]
+struct VaultPagePutReq {
+    /// vault-links id convention: relative path without `.md` extension.
+    path: String,
+    /// New body content (frontmatter is NOT part of this — the on-disk
+    /// frontmatter block is preserved verbatim).
+    body: String,
+}
+
+#[derive(Serialize)]
+struct VaultPagePutResp {
+    ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+fn put_err(status: StatusCode, msg: impl Into<String>) -> axum::response::Response {
+    let msg = msg.into();
+    tracing::warn!(error = %msg, "vault page put rejected");
+    (
+        status,
+        Json(VaultPagePutResp { ok: false, error: Some(msg) }),
+    )
+        .into_response()
+}
+
+/// Validate the relative `path` before joining with the vault root.
+///
+/// Rejects:
+///   - empty / whitespace-only
+///   - absolute paths (`/foo`)
+///   - any component that is `..` or contains a NUL byte
+///   - windows drive letters (`C:\…`)
+///
+/// On success returns the absolute file path (`<vault_root>/<path>.md`).
+/// Canonicalization is deferred to the caller — we canonicalize the
+/// parent directory (which must exist) and verify the result still
+/// starts with the canonicalized vault root.
+fn resolve_vault_path(
+    vault_root: &std::path::Path,
+    rel: &str,
+) -> Result<std::path::PathBuf, String> {
+    let trimmed = rel.trim();
+    if trimmed.is_empty() {
+        return Err("path is empty".into());
+    }
+    if trimmed.contains('\0') {
+        return Err("path contains NUL byte".into());
+    }
+    let p = std::path::Path::new(trimmed);
+    if p.is_absolute() {
+        return Err("path must be relative".into());
+    }
+    for comp in p.components() {
+        use std::path::Component;
+        match comp {
+            Component::ParentDir => return Err("path contains `..`".into()),
+            Component::Prefix(_) | Component::RootDir => {
+                return Err("path must be relative".into());
+            }
+            Component::CurDir | Component::Normal(_) => {}
+        }
+    }
+    Ok(vault_root.join(format!("{trimmed}.md")))
+}
+
+async fn vault_page_put(
+    State(s): State<AppState>,
+    Json(req): Json<VaultPagePutReq>,
+) -> axum::response::Response {
+    if req.body.len() > MAX_PAGE_BYTES {
+        return put_err(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!("body exceeds {MAX_PAGE_BYTES} bytes"),
+        );
+    }
+    let vault_root = s.inner.vault_root.clone();
+    let abs = match resolve_vault_path(&vault_root, &req.path) {
+        Ok(p) => p,
+        Err(e) => return put_err(StatusCode::BAD_REQUEST, e),
+    };
+
+    // Canonicalize the parent directory (it must exist for the path to
+    // be a real vault page) and re-verify the prefix. Canonicalizing
+    // the file itself would fail when writing to a brand-new path, but
+    // for this endpoint the file must already exist (we don't create
+    // new pages — there's no graph-side affordance for that yet).
+    let canonical_root = match tokio::fs::canonicalize(&vault_root).await {
+        Ok(p) => p,
+        Err(e) => return put_err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("canonicalize vault_root: {e}"),
+        ),
+    };
+    let parent = match abs.parent() {
+        Some(p) => p.to_path_buf(),
+        None => return put_err(StatusCode::BAD_REQUEST, "path has no parent"),
+    };
+    let canonical_parent = match tokio::fs::canonicalize(&parent).await {
+        Ok(p) => p,
+        Err(e) => return put_err(
+            StatusCode::BAD_REQUEST,
+            format!("parent dir not found: {e}"),
+        ),
+    };
+    if !canonical_parent.starts_with(&canonical_root) {
+        return put_err(
+            StatusCode::BAD_REQUEST,
+            "resolved path escapes vault root",
+        );
+    }
+    let final_path = canonical_parent.join(
+        abs.file_name().ok_or_else(|| "missing filename").unwrap_or_default(),
+    );
+
+    // Read the existing file to preserve its YAML frontmatter block.
+    // The wire format is *body only*; the on-disk file keeps whatever
+    // frontmatter was already there. If the file is missing, we refuse
+    // — page creation is not supported here.
+    let existing = match tokio::fs::read_to_string(&final_path).await {
+        Ok(s) => s,
+        Err(e) => return put_err(
+            StatusCode::NOT_FOUND,
+            format!("read {}: {e}", final_path.display()),
+        ),
+    };
+    let frontmatter_block = extract_frontmatter_block(&existing);
+
+    let mut new_contents = String::with_capacity(
+        frontmatter_block.len() + req.body.len() + 1,
+    );
+    new_contents.push_str(&frontmatter_block);
+    // Ensure a single newline between frontmatter and body when a
+    // frontmatter block exists and the new body doesn't already start
+    // with one. When there's no frontmatter, just write the body
+    // verbatim.
+    if !frontmatter_block.is_empty() && !req.body.starts_with('\n') {
+        new_contents.push('\n');
+    }
+    new_contents.push_str(&req.body);
+
+    // Atomic write: write to `<file>.tmp` (same dir, so rename is atomic
+    // on the same filesystem), then rename over the destination. If the
+    // tmp write fails halfway through, the original file is untouched.
+    let tmp_path = {
+        let mut t = final_path.clone();
+        let name = final_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("page");
+        t.set_file_name(format!(".{name}.tmp"));
+        t
+    };
+    if let Err(e) = tokio::fs::write(&tmp_path, new_contents.as_bytes()).await {
+        return put_err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("write tmp {}: {e}", tmp_path.display()),
+        );
+    }
+    if let Err(e) = tokio::fs::rename(&tmp_path, &final_path).await {
+        // Best-effort cleanup of the tmp file so we don't leave detritus.
+        let _ = tokio::fs::remove_file(&tmp_path).await;
+        return put_err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("rename tmp -> {}: {e}", final_path.display()),
+        );
+    }
+    tracing::info!(
+        path = %final_path.display(),
+        bytes = new_contents.len(),
+        "vault page saved",
+    );
+    (
+        StatusCode::OK,
+        Json(VaultPagePutResp { ok: true, error: None }),
+    )
+        .into_response()
+}
+
+/// Return the raw YAML frontmatter block (`---\n…---\n`) from `text`, or
+/// the empty string when there is no leading frontmatter. The trailing
+/// newline after the closing `---` IS included so callers can splice the
+/// body directly after.
+fn extract_frontmatter_block(text: &str) -> String {
+    let rest = match text.strip_prefix("---\n").or_else(|| text.strip_prefix("---\r\n")) {
+        Some(_) => text,
+        None => return String::new(),
+    };
+    let after_open = rest.strip_prefix("---\n")
+        .or_else(|| rest.strip_prefix("---\r\n"))
+        .unwrap_or(rest);
+    let consumed = rest.len() - after_open.len();
+    if let Some(end) = find_fm_close(after_open) {
+        // `end` is the byte offset (inside after_open) of the closing
+        // `---` line. Include the closing marker + its trailing newline.
+        let mut block_end = consumed + end + 3; // `---`
+        // Account for the newline (or CRLF) after the closing fence.
+        let tail = &rest[block_end..];
+        if tail.starts_with("\r\n") {
+            block_end += 2;
+        } else if tail.starts_with('\n') {
+            block_end += 1;
+        }
+        rest[..block_end].to_string()
+    } else {
+        String::new()
+    }
 }
 
 /// Live status of the gRPC link to the `graph-compute` worker. The

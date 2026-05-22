@@ -86,6 +86,33 @@ impl ApiClient {
         proto::SearchResults::decode(&*bytes).map_err(|e| format!("decode search: {e}"))
     }
 
+    /// `PUT /vault/page` — save the body of an obsidian-page node to disk.
+    ///
+    /// `path` follows the vault-links convention (the same string the
+    /// renderer received in `NodeMeta.path` — relative, no `.md`
+    /// extension). `body` is the body-only markdown; the server
+    /// preserves the on-disk YAML frontmatter block verbatim.
+    ///
+    /// Returns `Ok(())` on a 200 response with `{ "ok": true }`, and
+    /// `Err(...)` on any non-2xx status or `{ "ok": false }` payload.
+    pub async fn save_page(&self, path: &str, body: &str) -> Result<(), String> {
+        #[derive(serde::Serialize)]
+        struct Req<'a> { path: &'a str, body: &'a str }
+        #[derive(serde::Deserialize)]
+        struct Resp { ok: bool, error: Option<String> }
+        let url = self.url("/vault/page");
+        let req = Req { path, body };
+        let bytes = http_put_json(&url, &serde_json::to_vec(&req).map_err(|e| e.to_string())?)
+            .await?;
+        let resp: Resp =
+            serde_json::from_slice(&bytes).map_err(|e| format!("decode save: {e}"))?;
+        if resp.ok {
+            Ok(())
+        } else {
+            Err(resp.error.unwrap_or_else(|| "save failed".into()))
+        }
+    }
+
     /// `GET /compute/health` — `{ connected: bool, url: String }`.
     /// Used by the renderer to surface compute-broker liveness in the
     /// footer log. Returns `connected=false` when graph-api is up but
@@ -181,6 +208,39 @@ async fn http_get_bytes(url: &str) -> Result<Vec<u8>, String> {
 /// Like `http_get_bytes`, but maps HTTP 404 to `Ok(None)` instead of
 /// `Err`. Used by endpoints (currently `/node/:id`) where a missing
 /// resource is an expected, non-error outcome.
+#[cfg(target_arch = "wasm32")]
+async fn http_put_json(url: &str, body: &[u8]) -> Result<Vec<u8>, String> {
+    use gloo_net::http::Request;
+    let resp = Request::put(url)
+        .header("content-type", "application/json")
+        .body(body.to_vec())
+        .map_err(|e| format!("build PUT {url}: {e}"))?
+        .send()
+        .await
+        .map_err(|e| format!("PUT {url}: {e}"))?;
+    if !resp.ok() {
+        return Err(format!("PUT {url}: HTTP {}", resp.status()));
+    }
+    resp.binary().await.map_err(|e| format!("body {url}: {e}"))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+async fn http_put_json(url: &str, body: &[u8]) -> Result<Vec<u8>, String> {
+    let client = reqwest::Client::new();
+    let resp = client
+        .put(url)
+        .header("content-type", "application/json")
+        .body(body.to_vec())
+        .send()
+        .await
+        .map_err(|e| format!("PUT {url}: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("PUT {url}: HTTP {}", resp.status()));
+    }
+    let bytes = resp.bytes().await.map_err(|e| format!("body {url}: {e}"))?;
+    Ok(bytes.to_vec())
+}
+
 #[cfg(target_arch = "wasm32")]
 async fn http_get_bytes_opt(url: &str) -> Result<Option<Vec<u8>>, String> {
     use gloo_net::http::Request;

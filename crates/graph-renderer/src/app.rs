@@ -260,6 +260,20 @@ pub struct App {
     /// preview's fetch completes.
     promoted_anchored_fetch: Arc<Mutex<Option<Result<Option<proto::NodeMeta>, String>>>>,
 
+    /// Per-node editor state for the inline page viewer. Keyed by
+    /// `meta.id`. Switching between obsidian pages preserves each
+    /// page's in-progress edits / mode / save state. Never persisted —
+    /// it's an ephemeral edit buffer.
+    page_viewer_states: HashMap<String, ui::page_viewer::PageViewerState>,
+    /// CommonMark layout cache for the page-viewer's Rendered mode.
+    /// Separate from `modal.markdown_cache` so the two surfaces don't
+    /// invalidate each other's parsed-AST cache when both are open.
+    page_viewer_markdown_cache: egui_commonmark::CommonMarkCache,
+    /// In-flight `/vault/page` PUT result. Tagged with `(node_id, new_body)`
+    /// so the drain logic can update the right `PageViewerState` AND the
+    /// cached `promoted_anchored_meta.body` on success.
+    save_in_flight: Arc<Mutex<Option<(String, String, Result<(), String>)>>>,
+
     /// Inverted index of (field, value) -> node-idx buckets. Populated
     /// by a one-shot async `/graph/meta_summary` fetch in `kick_off_bootstrap`.
     field_index: Option<FieldIndex>,
@@ -500,6 +514,9 @@ impl App {
             anchored_drag_offsets: HashMap::new(),
             promoted_anchored_meta: None,
             promoted_anchored_fetch: Arc::new(Mutex::new(None)),
+            page_viewer_states: HashMap::new(),
+            page_viewer_markdown_cache: egui_commonmark::CommonMarkCache::default(),
+            save_in_flight: Arc::new(Mutex::new(None)),
             field_index: None,
             field_index_slot,
             progress,
@@ -576,6 +593,25 @@ impl App {
                 Err(e) => sink.fail(task, e.clone()),
             }
             *slot.lock().unwrap() = Some(res);
+        });
+    }
+
+    /// Spawn an async `PUT /vault/page` save. Result lands in
+    /// `save_in_flight`, tagged with `(node_id, body)` so the drain
+    /// step can route the outcome back to the right `PageViewerState`.
+    fn kick_off_page_save(&self, node_id: String, path: String, body: String) {
+        let slot = self.save_in_flight.clone();
+        let client = ApiClient::new(self.base_url.clone());
+        let sink = self.progress.sink();
+        let label = format!("save {}", short_id(&path));
+        spawn_async(async move {
+            let task = sink.start("save", label);
+            let res = client.save_page(&path, &body).await;
+            match &res {
+                Ok(_) => sink.finish(task),
+                Err(e) => sink.fail(task, e.clone()),
+            }
+            *slot.lock().unwrap() = Some((node_id, body, res));
         });
     }
 
@@ -2283,6 +2319,30 @@ impl App {
             self.promoted_anchored_meta = Some(meta);
         }
 
+        // Drain any completed page-save result and route the outcome
+        // back to the matching PageViewerState. On success, also
+        // refresh the cached `promoted_anchored_meta.body` so the
+        // dirty-detector resets.
+        if let Some((node_id, body, result)) =
+            self.save_in_flight.lock().unwrap().take()
+        {
+            if let Some(state) = self.page_viewer_states.get_mut(&node_id) {
+                match &result {
+                    Ok(()) => {
+                        state.note_saved(body.clone());
+                    }
+                    Err(e) => state.note_save_error(e.clone()),
+                }
+            }
+            if result.is_ok() {
+                if let Some(meta) = self.promoted_anchored_meta.as_mut() {
+                    if meta.id == node_id {
+                        meta.body = body;
+                    }
+                }
+            }
+        }
+
         let Some(canvas_rect) = self.prev_canvas_rect else {
             return;
         };
@@ -2506,7 +2566,38 @@ impl App {
                         .color(crate::ui::theme::palette::INFO),
                 );
             }
-            if !meta.body.is_empty() {
+            // Obsidian-page promoted panel: route the body slot to the
+            // editable page-viewer (Rendered / Source tabs + Save). For
+            // hover-preview (non-promoted) and non-page nodes, fall back
+            // to the original inline markdown/snippet view.
+            let use_page_viewer =
+                promoted && crate::ui::page_viewer::is_obsidian_page(&meta);
+            if use_page_viewer {
+                ui.separator();
+                let state = self
+                    .page_viewer_states
+                    .entry(meta.id.clone())
+                    .or_default();
+                let mut save_request: Option<(String, String)> = None;
+                {
+                    let mut on_save = |path: &str, body: &str| {
+                        save_request = Some((path.to_string(), body.to_string()));
+                    };
+                    let mut actions = crate::ui::page_viewer::PageViewerActions {
+                        markdown_cache: &mut self.page_viewer_markdown_cache,
+                        on_save: &mut on_save,
+                    };
+                    crate::ui::page_viewer::show_in_panel(
+                        ui,
+                        state,
+                        &meta,
+                        &mut actions,
+                    );
+                }
+                if let Some((path, body)) = save_request {
+                    self.kick_off_page_save(meta.id.clone(), path, body);
+                }
+            } else if !meta.body.is_empty() {
                 ui.separator();
                 if promoted {
                     // Promoted variant: full body, scrollable. We
