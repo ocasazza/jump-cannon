@@ -4,6 +4,7 @@
 
 use glam::{Mat4, Vec3};
 
+#[derive(Clone)]
 pub struct Camera {
     pub position: Vec3,
     pub yaw: f32,   // radians, around world up (Y)

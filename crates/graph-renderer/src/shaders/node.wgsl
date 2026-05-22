@@ -44,9 +44,9 @@ struct EffectsUniform {
     edge_fade_floor:       f32,
     shader_intensity:      f32,
     hovered_node:          u32,
+    hovered_edge:          u32,   // u32::MAX = no edge hover (unused in node.wgsl)
     _pad_hover0:           u32,
     _pad_hover1:           u32,
-    _pad_hover2:           u32,
 };
 
 @group(0) @binding(0) var<uniform> camera:  CameraUniform;

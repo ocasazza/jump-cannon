@@ -1,4 +1,5 @@
 pub mod actions;
+pub mod anchored;
 pub mod badge;
 pub mod command_palette;
 pub mod document_viewer;

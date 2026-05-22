@@ -44,9 +44,9 @@ struct EffectsUniform {
     edge_fade_floor:       f32,   // long-distance asymptotic alpha floor
     shader_intensity:      f32,   // post-process visual-intensity scalar
     hovered_node:          u32,   // u32::MAX = no hover (unused in edge.wgsl)
+    hovered_edge:          u32,   // u32::MAX = no edge hover
     _pad_hover0:           u32,
     _pad_hover1:           u32,
-    _pad_hover2:           u32,
 };
 
 @group(0) @binding(0) var<uniform> camera:  CameraUniform;
@@ -72,6 +72,7 @@ struct VertexOutput {
     @location(2)       coc:        f32,
     @location(3)       focus_mul:  f32,
     @location(4)       tint:       vec4<f32>,
+    @location(5) @interpolate(flat) edge_index: u32,
 };
 
 @vertex
@@ -180,6 +181,7 @@ fn vs_main(@builtin(vertex_index) vid: u32) -> VertexOutput {
     out.edge_len = edge_len;
     out.coc      = coc;
     out.tint     = edge_colors[edge_idx];
+    out.edge_index = edge_idx;
     return out;
 }
 
@@ -230,11 +232,22 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     // `edge_color` for every edge when EdgeColorBy::None). `tint.a` is
     // the source-alpha multiplier — equal to `effects.edge_color.a` so
     // existing alpha logic stays unchanged.
-    let base_rgb = in.tint.rgb;
+    var base_rgb = in.tint.rgb;
     let base_a   = in.tint.a;
-    let alpha = base_a * effects.edge_alpha_mul
+    var alpha = base_a * effects.edge_alpha_mul
               * visibility * focus_atten * in.focus_mul
               * effects.shader_intensity;
+
+    // Hover treatment: brighten toward white and force full alpha so
+    // the hovered edge pops above the stacked-alpha herd. Matched
+    // against `effects.hovered_edge` (u32::MAX = no hover).
+    let is_hovered = (effects.hovered_edge != 0xFFFFFFFFu)
+                  && (in.edge_index == effects.hovered_edge);
+    if (is_hovered) {
+        base_rgb = mix(base_rgb, vec3<f32>(1.0, 1.0, 1.0), 0.5);
+        alpha = 1.0;
+    }
+
     // Threshold is below perceptual range — kept only to skip pure-zero
     // ROP work, NOT to hide long edges. No popping at this level.
     if (alpha < 1.0e-4) {

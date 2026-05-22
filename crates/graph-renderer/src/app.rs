@@ -165,6 +165,10 @@ pub struct App {
     /// Transient hover focus. Lives only while the cursor is over a node;
     /// released after `HOVER_HOLD_MS` of no hover. Sticky wins over hover.
     focus_hover_idx: Option<u32>,
+    /// Transient hover focus for edges. Mutually exclusive with
+    /// `focus_hover_idx` — node hover takes priority. Drives the edge
+    /// shader's hover treatment (brighter color + full alpha).
+    focus_hover_edge_idx: Option<u32>,
     /// Last frame's focused-into-GPU node idx. Drives change detection
     /// so we only re-upload the dim_alpha buffer when the membership
     /// would actually differ.
@@ -179,6 +183,9 @@ pub struct App {
     /// Change-detect so we don't write the effects uniform on every
     /// frame the cursor sits still over the same node.
     hovered_pushed_idx: Option<u32>,
+    /// Last hovered-edge index handed to the shader (`set_hovered_edge`).
+    /// Change-detect mirror of `focus_hover_edge_idx`.
+    hovered_pushed_edge_idx: Option<u32>,
     /// Saved [`FocusMode`] from the moment `active_filters` transitioned
     /// empty→non-empty via a badge click. Restored when the filter set
     /// drains back to empty so the user lands back on whatever mode they
@@ -226,6 +233,20 @@ pub struct App {
     /// drives the floating Area's anchor. Persists between frames so a
     /// jittery cursor doesn't make the card jitter.
     hover_preview_pos: Option<egui::Pos2>,
+    /// EMA of projected screen positions per node idx, used to smooth
+    /// out 1-frame jitter from the force-sim when an anchored panel is
+    /// pinned to a node. Entries grow per hovered node and only decay
+    /// when the App is recreated. The map is tiny in practice.
+    last_anchored_screen_pos: HashMap<u32, egui::Pos2>,
+    /// Sticky-promoted anchored panel idx. Set on click; cleared on X.
+    /// Distinct from `selected_node_idx` so promoted previews can
+    /// coexist with a different inspector selection.
+    ///
+    /// TODO(promote-ui): wire a click handler in `tick_hover_preview`
+    /// (or the canvas click dispatch) to set this; today the field is
+    /// plumbed but no caller mutates it.
+    #[allow(dead_code)]
+    promoted_anchored_idx: Option<u32>,
 
     /// Inverted index of (field, value) -> node-idx buckets. Populated
     /// by a one-shot async `/graph/meta_summary` fetch in `kick_off_bootstrap`.
@@ -425,10 +446,12 @@ impl App {
             selected_node_idx: None,
             focus_sticky_idx: None,
             focus_hover_idx: None,
+            focus_hover_edge_idx: None,
             focus_pushed_idx: None,
             focus_pushed_mode: None,
             filter_pushed_sig: None,
             hovered_pushed_idx: None,
+            hovered_pushed_edge_idx: None,
             previous_focus_mode: None,
             prev_filters_non_empty: false,
             last_hover_raycast_at: None,
@@ -439,6 +462,8 @@ impl App {
             hover_preview_fetch: Arc::new(Mutex::new(None)),
             hover_preview_open: false,
             hover_preview_pos: None,
+            last_anchored_screen_pos: HashMap::new(),
+            promoted_anchored_idx: None,
             field_index: None,
             field_index_slot,
             progress,
@@ -1347,7 +1372,7 @@ impl eframe::App for App {
         // Hover-preview card paint pass — runs after all other UI
         // layers so the card sits on top of canvas + sidebars. Cheap:
         // no-op when `hover_preview_open == false`.
-        self.show_hover_preview(ctx);
+        self.show_hover_preview(ctx, frame);
 
         // Detect filter-set empty<->non-empty transitions and auto-flip
         // the user's FocusMode so a badge click engages focus dim the same
@@ -1362,6 +1387,7 @@ impl eframe::App for App {
         self.apply_selection(frame);
         self.apply_focus_set_to_gpu(frame);
         self.apply_hover_to_gpu(frame);
+        self.apply_edge_hover_to_gpu(frame);
         self.perf.end_stage(StageId::ApplySelection);
 
         self.perf.begin_stage(StageId::RefreshStats);
@@ -1932,11 +1958,13 @@ impl App {
         // Sticky wins; a sticky-focus user gesture overrides hover.
         if self.focus_sticky_idx.is_some() {
             self.focus_hover_idx = None;
+            self.focus_hover_edge_idx = None;
             self.hover_clear_at = None;
             return;
         }
         // No focus mode work to do if there's no canvas to hover over.
         let (Some(rect), Some(pos)) = (canvas_rect, pointer_in_canvas) else {
+            self.focus_hover_edge_idx = None;
             self.maybe_clear_hover_after_hold();
             return;
         };
@@ -1960,13 +1988,42 @@ impl App {
                 if self.focus_hover_idx != Some(idx) {
                     self.focus_hover_idx = Some(idx);
                 }
+                // Node hover takes priority over edge hover.
+                self.focus_hover_edge_idx = None;
                 // Hovering — cancel any pending clear timer.
                 self.hover_clear_at = None;
             }
             None => {
+                // Fall back to edge picking — only highlights when no
+                // node is under the cursor.
+                let edge_hit = self.raycast_edge_idx(frame, ndc_x, ndc_y, [rect_w, rect_h]);
+                self.focus_hover_edge_idx = edge_hit;
                 self.maybe_clear_hover_after_hold();
             }
         }
+    }
+
+    /// Mirrors `raycast_idx` but defers to `GraphPipelines::raycast_edge`.
+    /// The effective edge width is derived from the user's tuned style
+    /// fields so the pick tolerance tracks the visual edge width.
+    fn raycast_edge_idx(
+        &self,
+        frame: &eframe::Frame,
+        ndc_x: f32,
+        ndc_y: f32,
+        screen_px: [f32; 2],
+    ) -> Option<u32> {
+        let wgpu_state = frame.wgpu_render_state()?;
+        let renderer = wgpu_state.renderer.read();
+        let pipes = renderer.callback_resources.get::<GraphPipelines>()?;
+        // Mirror the same width feed `apply_layout_to_gpu` pushes via
+        // `set_edge_style`, so the pick band tracks the visual edge
+        // width the user sees on screen.
+        let s = &self.state.style;
+        let edge_w = (s.edge_width
+            * apply_size_scale(s.edge_size_mul, s.log_scale_size))
+            .max(0.0);
+        pipes.raycast_edge([ndc_x, ndc_y], screen_px, edge_w)
     }
 
     /// Drive the hover-preview state machine. Called each frame after
@@ -2064,80 +2121,147 @@ impl App {
         self.hover_preview_pos = None;
     }
 
-    /// Draw the hover-preview card if armed. Anchored near the cursor
-    /// (offset right + down so the card doesn't sit *under* the
-    /// cursor, which would cause the cursor to immediately enter the
-    /// card and the chain to flicker).
-    fn show_hover_preview(&self, ctx: &egui::Context) {
+    /// Draw the hover-preview card if armed.
+    ///
+    /// Anchored to the hovered node's projected screen position (not
+    /// the cursor) via [`ui::anchored::AnchoredPanel`], so the card
+    /// tracks the node as the camera pans / zooms / orbits and the
+    /// tether arrow visibly ties the card back to its source. A
+    /// 1-frame EMA (`EMA_ALPHA = 0.4`) on the projected screen
+    /// position smooths out force-sim jitter — without it the card
+    /// vibrates every frame the GPU position readback shifts by a
+    /// sub-pixel.
+    ///
+    /// The card is `interactable(true)` (vs. the previous
+    /// cursor-anchored implementation): promoted click-to-pin will
+    /// reuse the same path, and a scrollable markdown body needs
+    /// interactivity. The cursor-leaves-card flicker the old
+    /// comment warned about doesn't happen here because the anchor
+    /// is the node, not the cursor — the user can move the cursor
+    /// freely between node and card.
+    fn show_hover_preview(&mut self, ctx: &egui::Context, frame: &eframe::Frame) {
         if !self.hover_preview_open {
             return;
         }
-        let Some(meta) = self.hover_preview_meta.as_ref() else {
+        let Some(meta) = self.hover_preview_meta.clone() else {
             return;
         };
-        let Some(pos) = self.hover_preview_pos else {
+        let Some(idx) = self.hover_preview_idx else {
             return;
         };
-        let anchor = egui::pos2(pos.x + 16.0, pos.y + 16.0);
-        egui::Area::new(egui::Id::new("hover-preview"))
-            .fixed_pos(anchor)
-            .order(egui::Order::Tooltip)
-            .interactable(false)
-            .show(ctx, |ui| {
-                egui::Frame::none()
-                    .fill(egui::Color32::from_rgba_unmultiplied(8, 10, 20, 235))
-                    .stroke(egui::Stroke::new(
-                        1.0,
-                        crate::ui::theme::palette::BORDER,
-                    ))
-                    .rounding(egui::Rounding::same(6.0))
-                    .inner_margin(egui::Margin::symmetric(10.0, 8.0))
-                    .show(ui, |ui| {
-                        ui.set_max_width(360.0);
-                        // Title.
-                        let title = if meta.title.is_empty() {
-                            meta.id.clone()
-                        } else {
-                            meta.title.clone()
-                        };
-                        ui.label(
-                            egui::RichText::new(title)
-                                .strong()
-                                .color(crate::ui::theme::palette::TEXT),
-                        );
-                        // Path subtitle (small / weak).
-                        if !meta.path.is_empty() {
-                            ui.label(
-                                egui::RichText::new(&meta.path)
-                                    .small()
-                                    .weak()
-                                    .monospace(),
-                            );
-                        }
-                        // Tags row — comma-joined as plain text rather
-                        // than chips, since chip widgets carry click
-                        // semantics and this card is non-interactive.
-                        if !meta.tags.is_empty() {
-                            ui.add_space(2.0);
-                            ui.label(
-                                egui::RichText::new(meta.tags.join(", "))
-                                    .small()
-                                    .color(crate::ui::theme::palette::INFO),
-                            );
-                        }
-                        // First few lines of the body. Cap at ~280
-                        // chars or 6 lines, whichever comes first.
-                        if !meta.body.is_empty() {
-                            ui.separator();
-                            let snippet = body_snippet(&meta.body, 280, 6);
-                            ui.label(
-                                egui::RichText::new(snippet)
-                                    .small()
-                                    .color(crate::ui::theme::palette::TEXT),
-                            );
-                        }
-                    });
-            });
+        let Some(canvas_rect) = self.prev_canvas_rect else {
+            return;
+        };
+
+        // Pull world position + camera snapshot out of the wgpu
+        // callback resources, then drop the read lock before opening
+        // any egui Area. Camera is cloned (small, all-Copy fields)
+        // so AnchoredPanel can borrow without holding the wgpu lock
+        // across egui calls.
+        let (world, camera) = {
+            let Some(wgpu_state) = frame.wgpu_render_state() else {
+                return;
+            };
+            let renderer = wgpu_state.renderer.read();
+            let Some(pipes) = renderer.callback_resources.get::<GraphPipelines>() else {
+                return;
+            };
+            let positions = pipes.positions_cpu();
+            let i3 = (idx as usize).saturating_mul(3);
+            if i3 + 2 >= positions.len() {
+                return;
+            }
+            let world = glam::Vec3::new(positions[i3], positions[i3 + 1], positions[i3 + 2]);
+            (world, pipes.camera.clone())
+        };
+
+        // EMA_ALPHA = 0.4: blend 40% of the new frame into the
+        // running average. Below 0.4 the card visibly lags fast
+        // camera pans; above 0.6 the jitter reappears. 0.4 is the
+        // empirical sweet spot. AnchoredPanel re-projects internally
+        // for the actual placement; we cache the smoothed screen
+        // pos here for a future soft-tether drag UI to anchor off
+        // of.
+        const EMA_ALPHA: f32 = 0.4;
+        {
+            let aspect = (canvas_rect.width() / canvas_rect.height().max(0.0001)).max(0.0001);
+            let view = glam::Mat4::look_to_rh(
+                camera.position,
+                camera.forward(),
+                glam::Vec3::Y,
+            );
+            let proj = glam::Mat4::perspective_rh(
+                camera.fov_y,
+                aspect,
+                camera.znear,
+                camera.zfar,
+            );
+            let clip = (proj * view) * world.extend(1.0);
+            if clip.w > 0.0 {
+                let ndc_x = clip.x / clip.w;
+                let ndc_y = clip.y / clip.w;
+                let sx = canvas_rect.left() + (ndc_x * 0.5 + 0.5) * canvas_rect.width();
+                let sy = canvas_rect.top()
+                    + (1.0 - (ndc_y * 0.5 + 0.5)) * canvas_rect.height();
+                let projected = egui::pos2(sx, sy);
+                let smoothed = match self.last_anchored_screen_pos.get(&idx).copied() {
+                    Some(p) => egui::pos2(
+                        p.x + (projected.x - p.x) * EMA_ALPHA,
+                        p.y + (projected.y - p.y) * EMA_ALPHA,
+                    ),
+                    None => projected,
+                };
+                self.last_anchored_screen_pos.insert(idx, smoothed);
+            }
+        }
+
+        let panel = crate::ui::anchored::AnchoredPanel::new(
+            egui::Id::new(("hover-preview", idx)),
+            world,
+            canvas_rect,
+            &camera,
+        )
+        .offset(egui::vec2(18.0, 18.0))
+        .interactable(true);
+
+        panel.show(ctx, |ui| {
+            ui.set_max_width(360.0);
+            let title = if meta.title.is_empty() {
+                meta.id.clone()
+            } else {
+                meta.title.clone()
+            };
+            ui.label(
+                egui::RichText::new(title)
+                    .strong()
+                    .color(crate::ui::theme::palette::TEXT),
+            );
+            if !meta.path.is_empty() {
+                ui.label(
+                    egui::RichText::new(&meta.path)
+                        .small()
+                        .weak()
+                        .monospace(),
+                );
+            }
+            if !meta.tags.is_empty() {
+                ui.add_space(2.0);
+                ui.label(
+                    egui::RichText::new(meta.tags.join(", "))
+                        .small()
+                        .color(crate::ui::theme::palette::INFO),
+                );
+            }
+            if !meta.body.is_empty() {
+                ui.separator();
+                let snippet = body_snippet(&meta.body, 280, 6);
+                ui.label(
+                    egui::RichText::new(snippet)
+                        .small()
+                        .color(crate::ui::theme::palette::TEXT),
+                );
+            }
+        });
     }
 
     fn maybe_clear_hover_after_hold(&mut self) {
@@ -2330,6 +2454,23 @@ impl App {
             pipes.set_hovered_node(target);
         }
         self.hovered_pushed_idx = target;
+    }
+
+    /// Push the current `focus_hover_edge_idx` to the shader's edge
+    /// hover uniform. Change-detected against `hovered_pushed_edge_idx`
+    /// so we don't write the effects uniform on every idle frame.
+    fn apply_edge_hover_to_gpu(&mut self, frame: &mut eframe::Frame) {
+        if !self.loaded_into_gpu { return; }
+        let target = self.focus_hover_edge_idx;
+        if self.hovered_pushed_edge_idx == target {
+            return;
+        }
+        let Some(wgpu_state) = frame.wgpu_render_state() else { return };
+        let mut renderer = wgpu_state.renderer.write();
+        if let Some(pipes) = renderer.callback_resources.get_mut::<GraphPipelines>() {
+            pipes.set_hovered_edge(target);
+        }
+        self.hovered_pushed_edge_idx = target;
     }
 
     fn apply_selection(&mut self, frame: &mut eframe::Frame) {

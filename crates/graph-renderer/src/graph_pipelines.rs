@@ -128,7 +128,11 @@ struct EffectsUniform {
     /// `u32::MAX` if nothing is hovered. The node fragment shader uses
     /// this to brighten the fill and paint a white inner rim.
     hovered_node: u32,
-    _pad_hover: [u32; 3],
+    /// Edge index (vid / 6) of the edge under the cursor when no node is
+    /// hovered, or `u32::MAX` if no edge is hovered. The edge fragment
+    /// shader brightens this edge and forces alpha to 1.0.
+    hovered_edge: u32,
+    _pad_hover: [u32; 2],
 }
 
 impl Default for EffectsUniform {
@@ -159,7 +163,8 @@ impl Default for EffectsUniform {
             edge_fade_floor: 0.02,
             shader_intensity: 1.0,
             hovered_node: u32::MAX,
-            _pad_hover: [0; 3],
+            hovered_edge: u32::MAX,
+            _pad_hover: [0; 2],
         }
     }
 }
@@ -974,6 +979,121 @@ impl GraphPipelines {
         best.map(|(_, _, i)| i)
     }
 
+    /// Screen-space edge picking. For each edge, project its endpoints
+    /// to screen pixel space, compute the perpendicular distance from
+    /// the cursor (in pixel space) to the segment, and pick the edge
+    /// with the smallest distance within
+    /// `edge_width_px * 0.5 + 2.0` slack. Ties on distance fall back to
+    /// the edge whose midpoint is closer to the camera (smaller NDC z).
+    ///
+    /// Returns `edge_idx` such that `edges_cpu()[edge_idx*2 .. edge_idx*2+2]`
+    /// is the (src, tgt) pair — i.e. it matches the `vid / 6u` quad index
+    /// used by `edge.wgsl`.
+    pub fn raycast_edge(
+        &self,
+        ndc: [f32; 2],
+        screen_px: [f32; 2],
+        edge_width_px: f32,
+    ) -> Option<u32> {
+        let b = self.buffers.as_ref()?;
+        if b.edges_cpu.is_empty() {
+            return None;
+        }
+
+        let width_px = screen_px[0].max(1.0);
+        let height_px = screen_px[1].max(1.0);
+        let aspect = (width_px / height_px).max(0.0001);
+        let view = Mat4::look_to_rh(
+            self.camera.position,
+            self.camera.forward(),
+            Vec3::Y,
+        );
+        let proj = Mat4::perspective_rh(
+            self.camera.fov_y,
+            aspect,
+            self.camera.znear,
+            self.camera.zfar,
+        );
+        let view_proj = proj * view;
+
+        // Cursor in pixel space (origin top-left).
+        let cursor_x = (ndc[0] * 0.5 + 0.5) * width_px;
+        let cursor_y = (1.0 - (ndc[1] * 0.5 + 0.5)) * height_px;
+
+        let tol_px = (edge_width_px.max(0.0) * 0.5) + 2.0;
+
+        // (dist_px, ndc_z_mid, edge_idx)
+        let mut best: Option<(f32, f32, u32)> = None;
+
+        let n_edges = b.edges_cpu.len() / 2;
+        for e in 0..n_edges {
+            let src = b.edges_cpu[e * 2] as usize;
+            let tgt = b.edges_cpu[e * 2 + 1] as usize;
+            if src * 3 + 2 >= b.positions_cpu.len()
+                || tgt * 3 + 2 >= b.positions_cpu.len()
+            {
+                continue;
+            }
+            let p_src = Vec3::new(
+                b.positions_cpu[src * 3],
+                b.positions_cpu[src * 3 + 1],
+                b.positions_cpu[src * 3 + 2],
+            );
+            let p_tgt = Vec3::new(
+                b.positions_cpu[tgt * 3],
+                b.positions_cpu[tgt * 3 + 1],
+                b.positions_cpu[tgt * 3 + 2],
+            );
+            let c_src: Vec4 = view_proj * Vec4::new(p_src.x, p_src.y, p_src.z, 1.0);
+            let c_tgt: Vec4 = view_proj * Vec4::new(p_tgt.x, p_tgt.y, p_tgt.z, 1.0);
+            if c_src.w <= 1e-4 || c_tgt.w <= 1e-4 {
+                continue;
+            }
+            let inv_ws = 1.0 / c_src.w;
+            let inv_wt = 1.0 / c_tgt.w;
+            // Screen pixel coords (origin top-left).
+            let sx = (c_src.x * inv_ws * 0.5 + 0.5) * width_px;
+            let sy = (1.0 - (c_src.y * inv_ws * 0.5 + 0.5)) * height_px;
+            let tx = (c_tgt.x * inv_wt * 0.5 + 0.5) * width_px;
+            let ty = (1.0 - (c_tgt.y * inv_wt * 0.5 + 0.5)) * height_px;
+
+            // Point-to-segment distance in pixel space.
+            let dx = tx - sx;
+            let dy = ty - sy;
+            let len2 = dx * dx + dy * dy;
+            let t = if len2 > 1e-6 {
+                (((cursor_x - sx) * dx + (cursor_y - sy) * dy) / len2).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            let px = sx + dx * t;
+            let py = sy + dy * t;
+            let ex = cursor_x - px;
+            let ey = cursor_y - py;
+            let dist_px = (ex * ex + ey * ey).sqrt();
+            if dist_px > tol_px {
+                continue;
+            }
+
+            // Tiebreak metric: midpoint NDC z (smaller = closer to camera).
+            let mid_ndc_z = 0.5 * (c_src.z * inv_ws + c_tgt.z * inv_wt);
+            let candidate = (dist_px, mid_ndc_z, e as u32);
+            best = Some(match best {
+                None => candidate,
+                Some(prev) => {
+                    if dist_px < prev.0 - 1e-3 {
+                        candidate
+                    } else if (dist_px - prev.0).abs() <= 1e-3 && mid_ndc_z < prev.1 {
+                        candidate
+                    } else {
+                        prev
+                    }
+                }
+            });
+        }
+        best.map(|(_, _, i)| i)
+    }
+
     pub fn edges_cpu(&self) -> &[u32] {
         self.buffers.as_ref().map(|b| b.edges_cpu.as_slice()).unwrap_or(&[])
     }
@@ -1161,6 +1281,12 @@ impl GraphPipelines {
     /// every frame in `prepare`, so no explicit queue write here.
     pub fn set_hovered_node(&mut self, idx: Option<u32>) {
         self.effects.hovered_node = idx.unwrap_or(u32::MAX);
+    }
+
+    /// Stash the currently-hovered edge index (vid / 6) for the edge
+    /// fragment shader's hover treatment. `None` → `u32::MAX`.
+    pub fn set_hovered_edge(&mut self, idx: Option<u32>) {
+        self.effects.hovered_edge = idx.unwrap_or(u32::MAX);
     }
 
     /// Update the focal plane center + thickness (effects uniform).
