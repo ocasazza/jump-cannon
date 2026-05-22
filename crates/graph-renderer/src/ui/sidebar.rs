@@ -148,9 +148,14 @@ fn render_section_body(
     });
 }
 
-/// Floating variant of the section panel. Renders the same inner body
-/// inside a `FloatingPanel` keyed by `PanelId::Sidebar`. The activity
-/// bar stays docked and is not touched here.
+/// Floating section panels. Each `Section` whose `section_open[s]`
+/// flag is true renders as an independent `FloatingPanel` keyed by
+/// `PanelId::Section(s)` — egui persists each panel's position by id, so
+/// once the user drags a section it stays where they put it.
+///
+/// Default positions cascade from `[16, 64]` (24px down + 12px right per
+/// index in `Section::ALL`) so that several panels opened in quick
+/// succession don't stack atop one another on first reveal.
 pub fn show_floating(
     ctx: &egui::Context,
     state: &mut AppState,
@@ -158,17 +163,20 @@ pub fn show_floating(
     layout_registry: &LayoutRegistry,
     perf: &PerfCollector,
 ) {
-    let Some(active) = state.active_section else {
-        return;
-    };
-    let mut open = true;
-    FloatingPanel::new(PanelId::Sidebar, active.title())
-        .default_pos([16.0, 64.0])
-        .default_size([280.0, 520.0])
-        .show(ctx, &mut open, |ui| {
-            render_section_body(ui, state, active, registry, layout_registry, perf);
-        });
-    if !open {
-        state.active_section = None;
+    for (idx, &section) in Section::ALL.iter().enumerate() {
+        if !state.is_section_open(section) {
+            continue;
+        }
+        let mut open = true;
+        let pos = [16.0 + idx as f32 * 12.0, 64.0 + idx as f32 * 24.0];
+        FloatingPanel::new(PanelId::Section(section), section.title())
+            .default_pos(pos)
+            .default_size([280.0, 520.0])
+            .show(ctx, &mut open, |ui| {
+                render_section_body(ui, state, section, registry, layout_registry, perf);
+            });
+        if !open {
+            state.set_section_open(section, false);
+        }
     }
 }

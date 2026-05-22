@@ -6,11 +6,14 @@
 use eframe::egui;
 
 use crate::ui::actions::{ActionRegistry, ParamValue};
-use crate::ui::state::AppState;
+use crate::ui::state::{self, AppState};
 
 use super::{hint_label, subgroup_label, subgroup_separator};
 
-pub fn show(ui: &mut egui::Ui, _state: &mut AppState, registry: &mut ActionRegistry) {
+pub fn show(ui: &mut egui::Ui, state: &mut AppState, registry: &mut ActionRegistry) {
+    yaml_io_panel(ui, state);
+    subgroup_separator(ui);
+
     if registry.instances.is_empty() {
         hint_label(
             ui,
@@ -68,6 +71,111 @@ pub fn show(ui: &mut egui::Ui, _state: &mut AppState, registry: &mut ActionRegis
     for id in to_remove {
         registry.remove_instance(id);
     }
+}
+
+/// Import / Export YAML sub-region. Lives at the top of the Instances
+/// section so the user can dump every UI setting as YAML and paste it
+/// back in. The full `AppState` is round-tripped (every Serialize field),
+/// not just `action_instances`.
+fn yaml_io_panel(ui: &mut egui::Ui, state: &mut AppState) {
+    subgroup_label(ui, "Import / Export YAML");
+
+    // ---- Export row ------------------------------------------------------
+    ui.horizontal(|ui| {
+        if ui.button("Export").clicked() {
+            match state::export_state_yaml(state) {
+                Ok(s) => state.yaml_export_buffer = s,
+                Err(e) => state.yaml_export_buffer = format!("# export error: {e}"),
+            }
+        }
+        let has_export = !state.yaml_export_buffer.is_empty();
+        if ui
+            .add_enabled(has_export, egui::Button::new("Copy"))
+            .clicked()
+        {
+            let yaml = state.yaml_export_buffer.clone();
+            ui.output_mut(|o| o.copied_text = yaml);
+        }
+        if ui
+            .add_enabled(has_export, egui::Button::new("✕"))
+            .on_hover_text("Clear export buffer")
+            .clicked()
+        {
+            state.yaml_export_buffer.clear();
+        }
+    });
+
+    if !state.yaml_export_buffer.is_empty() {
+        ui.add(
+            egui::TextEdit::multiline(&mut state.yaml_export_buffer.as_str())
+                .font(egui::TextStyle::Monospace)
+                .desired_width(f32::INFINITY)
+                .desired_rows(12),
+        );
+    }
+
+    ui.add_space(6.0);
+
+    // ---- Import row ------------------------------------------------------
+    subgroup_label(ui, "Paste YAML to import");
+    ui.add(
+        egui::TextEdit::multiline(&mut state.yaml_import_buffer)
+            .font(egui::TextStyle::Monospace)
+            .desired_width(f32::INFINITY)
+            .desired_rows(12)
+            .hint_text("Paste an AppState YAML document here, then click Load."),
+    );
+
+    ui.horizontal(|ui| {
+        let has_import = !state.yaml_import_buffer.trim().is_empty();
+        if ui
+            .add_enabled(has_import, egui::Button::new("Load"))
+            .clicked()
+        {
+            match state::import_state_yaml(&state.yaml_import_buffer) {
+                Ok(imported) => {
+                    // Full replacement — including which panels are open,
+                    // active section, query, etc. That's the "every
+                    // setting" contract.
+                    *state = imported;
+                }
+                Err(e) => {
+                    state.yaml_import_error = Some(e);
+                }
+            }
+        }
+        if ui.button("Clear").clicked() {
+            state.yaml_import_buffer.clear();
+            state.yaml_import_error = None;
+        }
+    });
+
+    if let Some(err) = &state.yaml_import_error {
+        ui.colored_label(egui::Color32::from_rgb(220, 70, 70), format!("Parse error: {err}"));
+    }
+
+    ui.add_space(6.0);
+
+    // ---- Reset to defaults (two-step) -----------------------------------
+    ui.horizontal(|ui| {
+        let (label, color) = if state.yaml_reset_armed {
+            ("Confirm reset", egui::Color32::from_rgb(220, 70, 70))
+        } else {
+            ("Reset to defaults", egui::Color32::from_rgb(170, 60, 60))
+        };
+        let btn = egui::Button::new(egui::RichText::new(label).color(egui::Color32::WHITE).small())
+            .fill(color);
+        if ui.add(btn).clicked() {
+            if state.yaml_reset_armed {
+                *state = AppState::default();
+            } else {
+                state.yaml_reset_armed = true;
+            }
+        }
+        if state.yaml_reset_armed && ui.small_button("Cancel").clicked() {
+            state.yaml_reset_armed = false;
+        }
+    });
 }
 
 fn param_value_display(v: &ParamValue) -> String {

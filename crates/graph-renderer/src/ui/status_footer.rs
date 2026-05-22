@@ -78,13 +78,13 @@ pub fn show_tray(ctx: &egui::Context, state: &mut AppState, progress: &Progress)
             ui.horizontal_centered(|ui| {
                 ui.spacing_mut().item_spacing.x = 2.0;
                 for &section in Section::ALL {
-                    let active = state.active_section == Some(section);
+                    let active = state.is_section_open(section);
                     if tray_icon_button(ui, |painter, rect, color| {
                         draw_icon(painter, rect, section, color);
                     }, active, section.title())
                     .clicked()
                     {
-                        state.active_section = if active { None } else { Some(section) };
+                        state.toggle_section(section);
                     }
                 }
 

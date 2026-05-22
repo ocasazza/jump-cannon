@@ -1633,7 +1633,7 @@ impl App {
             op: crate::ui::query::Op::Eq,
             value,
         });
-        self.state.active_section = Some(ui::Section::Filter);
+        self.state.set_section_open(ui::Section::Filter, true);
     }
 
     /// Walk the QueryModel and spawn a /search?q= fetch for any Search
@@ -3074,7 +3074,7 @@ impl App {
                 serde_json::json!({ "style": "reset" })
             }
             JumpToSection(sec) => {
-                self.state.active_section = Some(sec);
+                self.state.set_section_open(sec, true);
                 serde_json::json!({ "section": sec.title() })
             }
             NewGraphTab => {

@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::ui::query::QueryModel;
 
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Section {
     Filter,
     Style,
@@ -597,7 +597,11 @@ impl Default for WorkspaceSettings {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AppState {
-    pub active_section: Option<Section>,
+    /// Per-section floating panel visibility. Each `Section` is an
+    /// independent floating panel (matches Inspector/Filter/Canvas
+    /// behaviour). Missing key = closed. Default empty.
+    #[serde(default)]
+    pub section_open: std::collections::BTreeMap<Section, bool>,
     pub style: StyleState,
     pub layout: LayoutState,
     pub camera: CameraState,
@@ -660,6 +664,41 @@ pub struct AppState {
     /// current settings (useful e.g. to re-roll a Random seed).
     #[serde(skip)]
     pub layout_solve_requested: bool,
+    /// Snapshot of the YAML export from the Instances section. Populated
+    /// by clicking "Export" — not round-tripped through the YAML itself
+    /// (ephemeral UI scratch).
+    #[serde(skip)]
+    pub yaml_export_buffer: String,
+    /// User-editable YAML pasted into the Instances import textarea.
+    #[serde(skip)]
+    pub yaml_import_buffer: String,
+    /// Most recent YAML parse error, shown below the import textarea.
+    #[serde(skip)]
+    pub yaml_import_error: Option<String>,
+    /// Two-step confirmation for "Reset to defaults". First click arms,
+    /// second click commits. Cleared on any section change implicitly by
+    /// being re-evaluated each frame.
+    #[serde(skip)]
+    pub yaml_reset_armed: bool,
+}
+
+/// Serialize the entire `AppState` to a YAML document.
+///
+/// Round-trip stability depends on `AppState`'s `Serialize`/`Deserialize`
+/// symmetry, which is already exercised by the sessionStorage and
+/// `eframe::Storage` persistence paths. Fields marked `#[serde(skip)]`
+/// (including the YAML UI buffers themselves) are intentionally omitted.
+pub fn export_state_yaml(state: &AppState) -> Result<String, String> {
+    serde_yml::to_string(state).map_err(|e| e.to_string())
+}
+
+/// Deserialize an `AppState` from a YAML document.
+///
+/// Unknown fields are silently ignored (serde default) so configs from
+/// future versions of the app degrade gracefully. Round-trip stability
+/// matches the sessionStorage path.
+pub fn import_state_yaml(yaml: &str) -> Result<AppState, String> {
+    serde_yml::from_str(yaml).map_err(|e| e.to_string())
 }
 
 /// Where the wgpu graph canvas is currently mounted. The canvas has
@@ -733,7 +772,9 @@ mod rect_opt_serde {
 /// are intentionally absent from this enum.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub enum PanelId {
-    Sidebar,
+    /// Section panels are now per-`Section` floating panels — each gets
+    /// its own egui memory key (`("floating", PanelId::Section(s))`).
+    Section(Section),
     Inspector,
     FilterStrip,
     Canvas,
@@ -742,7 +783,7 @@ pub enum PanelId {
 impl PanelId {
     pub fn label(self) -> &'static str {
         match self {
-            PanelId::Sidebar => "Sidebar",
+            PanelId::Section(s) => s.title(),
             PanelId::Inspector => "Inspector",
             PanelId::FilterStrip => "Filters",
             PanelId::Canvas => "Graph",
@@ -761,12 +802,32 @@ impl PanelId {
 // deserialize into the new struct variant. A version bump invalidates
 // the cached AppState exactly once per user — preferable to carrying a
 // custom deserializer for what is purely session-scoped state.
-pub const STORAGE_KEY: &str = "graph_renderer_app_state_v2";
+// Bumped `_v2` → `_v3` when `active_section: Option<Section>` was
+// replaced by `section_open: BTreeMap<Section, bool>` so each section is
+// an independent floating panel. Old persisted blobs carry the removed
+// field, which serde would either error on or silently drop — bumping
+// invalidates the cached AppState exactly once per user.
+pub const STORAGE_KEY: &str = "graph_renderer_app_state_v3";
 
 fn default_inspector_open() -> bool { true }
 fn default_true() -> bool { true }
 
 impl AppState {
+    /// Whether the given section's floating panel is currently open.
+    pub fn is_section_open(&self, s: Section) -> bool {
+        self.section_open.get(&s).copied().unwrap_or(false)
+    }
+    /// Toggle the given section's open flag.
+    pub fn toggle_section(&mut self, s: Section) {
+        let v = self.is_section_open(s);
+        self.section_open.insert(s, !v);
+    }
+    /// Explicit set helper — replaces the old `active_section = Some(s)`
+    /// pattern at every call site.
+    pub fn set_section_open(&mut self, s: Section, open: bool) {
+        self.section_open.insert(s, open);
+    }
+
     pub fn pop_canvas_out(&mut self) {
         // Snapshot dock visibility *before* the transition — once
         // `canvas_mount` flips to `Floating`, the renderer hides the
@@ -797,7 +858,7 @@ impl AppState {
 impl Default for AppState {
     fn default() -> Self {
         Self {
-            active_section: None,
+            section_open: std::collections::BTreeMap::new(),
             style: StyleState::default(),
             layout: LayoutState::default(),
             camera: CameraState::default(),
@@ -817,6 +878,10 @@ impl Default for AppState {
             canvas_mount: CanvasMount::default(),
             stats: LiveStats::default(),
             layout_solve_requested: false,
+            yaml_export_buffer: String::new(),
+            yaml_import_buffer: String::new(),
+            yaml_import_error: None,
+            yaml_reset_armed: false,
         }
     }
 }
