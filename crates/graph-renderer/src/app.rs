@@ -170,6 +170,15 @@ pub struct App {
     /// would actually differ.
     focus_pushed_idx: Option<u32>,
     focus_pushed_mode: Option<FocusMode>,
+    /// Hash signature of the last `active_filters` set pushed to the
+    /// `dim_alpha` buffer via `set_filter_mask`. Lets `apply_focus_set_to_gpu`
+    /// skip GPU re-uploads on idle frames when neither focus nor filters
+    /// changed. `None` = nothing pushed yet (forces first write).
+    filter_pushed_sig: Option<u64>,
+    /// Last hovered-node index handed to the shader (`set_hovered_node`).
+    /// Change-detect so we don't write the effects uniform on every
+    /// frame the cursor sits still over the same node.
+    hovered_pushed_idx: Option<u32>,
     /// Saved [`FocusMode`] from the moment `active_filters` transitioned
     /// empty→non-empty via a badge click. Restored when the filter set
     /// drains back to empty so the user lands back on whatever mode they
@@ -415,6 +424,8 @@ impl App {
             focus_hover_idx: None,
             focus_pushed_idx: None,
             focus_pushed_mode: None,
+            filter_pushed_sig: None,
+            hovered_pushed_idx: None,
             previous_focus_mode: None,
             prev_filters_non_empty: false,
             last_hover_raycast_at: None,
@@ -1346,6 +1357,7 @@ impl eframe::App for App {
         self.perf.begin_stage(StageId::ApplySelection);
         self.apply_selection(frame);
         self.apply_focus_set_to_gpu(frame);
+        self.apply_hover_to_gpu(frame);
         self.perf.end_stage(StageId::ApplySelection);
 
         self.perf.begin_stage(StageId::RefreshStats);
@@ -2200,32 +2212,43 @@ impl App {
         }
         let focused = self.focus_sticky_idx.or(self.focus_hover_idx);
         let mode = self.state.focus.focus_mode;
-        // Change-detect to avoid pointless GPU writes (the dim_alpha buf
-        // is n_nodes f32s — cheap, but worth skipping on idle frames).
-        if self.focus_pushed_idx == focused && self.focus_pushed_mode == Some(mode) {
+        // Stable signature of the current active-filter set so a chip
+        // toggle re-runs this function even when `focused` is unchanged.
+        // BTreeMap iteration is deterministic, so the hash is stable.
+        let filter_sig: u64 = {
+            use std::collections::hash_map::DefaultHasher;
+            use std::hash::{Hash, Hasher};
+            let mut h = DefaultHasher::new();
+            for (k, vs) in self.state.query.active_filters.by_field.iter() {
+                k.hash(&mut h);
+                for v in vs.iter() { v.hash(&mut h); }
+            }
+            h.finish()
+        };
+        // Change-detect to avoid pointless GPU writes (dim_alpha = n_nodes
+        // f32s — cheap, but worth skipping on idle frames).
+        if self.focus_pushed_idx == focused
+            && self.focus_pushed_mode == Some(mode)
+            && self.filter_pushed_sig == Some(filter_sig)
+        {
             return;
         }
         let Some(wgpu_state) = frame.wgpu_render_state() else { return };
-        let edges_snapshot: Vec<u32> = {
-            let renderer = wgpu_state.renderer.read();
-            renderer
-                .callback_resources
-                .get::<GraphPipelines>()
-                .map(|p| p.edges_cpu().to_vec())
-                .unwrap_or_default()
-        };
-        let n_nodes = self.ids.len() as u32;
-        let members: HashSet<u32> = match focused {
-            None => {
-                // No node focus, but if filters are active, dim
-                // non-matching nodes via the same focus pipeline.
-                if let Some(fi) = self.field_index.as_ref() {
-                    fi.matches(&self.state.query.active_filters).unwrap_or_default()
-                } else {
-                    HashSet::new()
-                }
-            }
+        let queue = wgpu_state.queue.clone();
+        match focused {
             Some(idx) => {
+                // Node-focus path: compute the community membership and
+                // write it via `set_focus_set` (non-zero dims, keeps the
+                // graph visible but faded).
+                let edges_snapshot: Vec<u32> = {
+                    let renderer = wgpu_state.renderer.read();
+                    renderer
+                        .callback_resources
+                        .get::<GraphPipelines>()
+                        .map(|p| p.edges_cpu().to_vec())
+                        .unwrap_or_default()
+                };
+                let n_nodes = self.ids.len() as u32;
                 let ctx = FocusCtx {
                     n_nodes,
                     metrics: &self.metrics,
@@ -2234,26 +2257,48 @@ impl App {
                     query: Some(&self.state.query),
                     field_index: self.field_index.as_ref(),
                 };
-                focus_set::compute(idx, mode, &ctx)
+                let members = focus_set::compute(idx, mode, &ctx);
+                let mut renderer = wgpu_state.renderer.write();
+                if let Some(pipes) = renderer.callback_resources.get_mut::<GraphPipelines>() {
+                    pipes.set_focus_set(&queue, focused, &members);
+                }
+                log::info!("[graph-renderer] focus: members={}", members.len());
             }
-        };
-        let queue = wgpu_state.queue.clone();
-        {
-            let mut renderer = wgpu_state.renderer.write();
-            if let Some(pipes) = renderer.callback_resources.get_mut::<GraphPipelines>() {
-                pipes.set_focus_set(&queue, focused, &members);
+            None => {
+                // No node-focus. If filters are active, use the
+                // discard-on-non-match path (`set_filter_mask`). Otherwise
+                // clear the mask back to all 1.0.
+                let matching: Option<HashSet<u32>> = self
+                    .field_index
+                    .as_ref()
+                    .and_then(|fi| fi.matches(&self.state.query.active_filters));
+                let mut renderer = wgpu_state.renderer.write();
+                if let Some(pipes) = renderer.callback_resources.get_mut::<GraphPipelines>() {
+                    pipes.set_filter_mask(&queue, matching.as_ref());
+                }
             }
-        }
-        if focused.is_some() {
-            // One-shot info log per focus engagement — load-bearing for
-            // the e2e regression test (`hover_focus_dims_other_nodes`).
-            log::info!(
-                "[graph-renderer] focus: members={}",
-                members.len()
-            );
         }
         self.focus_pushed_idx = focused;
         self.focus_pushed_mode = Some(mode);
+        self.filter_pushed_sig = Some(filter_sig);
+    }
+
+    /// Push the current `focus_hover_idx` to the shader's hover-glow
+    /// uniform. Change-detected against `hovered_pushed_idx` so we
+    /// don't write the effects uniform when the cursor sits still over
+    /// the same node.
+    fn apply_hover_to_gpu(&mut self, frame: &mut eframe::Frame) {
+        if !self.loaded_into_gpu { return; }
+        let target = self.focus_hover_idx;
+        if self.hovered_pushed_idx == target {
+            return;
+        }
+        let Some(wgpu_state) = frame.wgpu_render_state() else { return };
+        let mut renderer = wgpu_state.renderer.write();
+        if let Some(pipes) = renderer.callback_resources.get_mut::<GraphPipelines>() {
+            pipes.set_hovered_node(target);
+        }
+        self.hovered_pushed_idx = target;
     }
 
     fn apply_selection(&mut self, frame: &mut eframe::Frame) {

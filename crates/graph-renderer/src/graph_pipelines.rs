@@ -94,8 +94,9 @@ struct CameraUniform {
 }
 
 // Mirrors `EffectsUniform` in shaders/{node,edge}.wgsl byte-for-byte.
-// Total size: 16 f32 = 64 bytes. The vec4 (`edge_color`) sits at offset 32
-// so its 16-byte WGSL alignment is naturally satisfied.
+// Layout: 16 f32 (64 B) base + 4 u32 (16 B) hover tail = 80 bytes total.
+// `edge_color` (vec4) sits at offset 32 → 16-byte aligned. The hover
+// tail starts at offset 64, also 16-byte aligned.
 #[repr(C)]
 #[derive(Copy, Clone, Pod, Zeroable)]
 struct EffectsUniform {
@@ -123,6 +124,11 @@ struct EffectsUniform {
     /// alpha in node + edge shaders). 1.0 = neutral; 0 = invisible;
     /// >1 = brighter (alpha clamps to 1 in the blend stage).
     shader_intensity: f32,
+    /// Instance index of the node currently under the cursor, or
+    /// `u32::MAX` if nothing is hovered. The node fragment shader uses
+    /// this to brighten the fill and paint a white inner rim.
+    hovered_node: u32,
+    _pad_hover: [u32; 3],
 }
 
 impl Default for EffectsUniform {
@@ -152,6 +158,8 @@ impl Default for EffectsUniform {
             edge_width: 1.5,
             edge_fade_floor: 0.02,
             shader_intensity: 1.0,
+            hovered_node: u32::MAX,
+            _pad_hover: [0; 3],
         }
     }
 }
@@ -1098,6 +1106,58 @@ impl GraphPipelines {
             }
         }
         queue.write_buffer(&b.dim_alpha, 0, bytemuck::cast_slice(&out));
+    }
+
+    /// Push the per-node filter mask. Unlike [`set_focus_set`], this writes
+    /// a *hard* 0.0 for non-matching nodes, which the node/edge shaders
+    /// interpret as "discard" — non-matching nodes (and edges touching
+    /// them) disappear entirely rather than dimming.
+    ///
+    /// - `matching == None`: filter cleared → all 1.0.
+    /// - `matching == Some(set)` with non-empty set: 1.0 for indices in
+    ///   the set, 0.0 otherwise.
+    /// - `matching == Some(empty)`: treat as a no-op (all 1.0) so the user
+    ///   doesn't end up with a black screen when a filter accidentally
+    ///   matches zero nodes. A warning is logged.
+    pub fn set_filter_mask(
+        &mut self,
+        queue: &wgpu::Queue,
+        matching: Option<&std::collections::HashSet<u32>>,
+    ) {
+        let Some(b) = self.buffers.as_mut() else { return };
+        let n = b.n_nodes as usize;
+        if n == 0 {
+            return;
+        }
+        let mut out: Vec<f32> = vec![1.0; n];
+        match matching {
+            None => {}
+            Some(set) if set.is_empty() => {
+                log::warn!(
+                    "[graph-renderer] set_filter_mask: empty match set; \
+                     leaving all nodes visible to avoid a black screen"
+                );
+            }
+            Some(set) => {
+                for v in out.iter_mut() {
+                    *v = 0.0;
+                }
+                for &m in set {
+                    if (m as usize) < n {
+                        out[m as usize] = 1.0;
+                    }
+                }
+            }
+        }
+        queue.write_buffer(&b.dim_alpha, 0, bytemuck::cast_slice(&out));
+    }
+
+    /// Stash the currently-hovered node index for the shader's hover
+    /// glow / inner-rim treatment. `None` → `u32::MAX` (no hover).
+    /// The mutation goes through the effects uniform which is rewritten
+    /// every frame in `prepare`, so no explicit queue write here.
+    pub fn set_hovered_node(&mut self, idx: Option<u32>) {
+        self.effects.hovered_node = idx.unwrap_or(u32::MAX);
     }
 
     /// Update the focal plane center + thickness (effects uniform).

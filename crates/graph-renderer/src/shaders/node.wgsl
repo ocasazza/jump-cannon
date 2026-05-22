@@ -43,6 +43,10 @@ struct EffectsUniform {
     edge_width:            f32,
     edge_fade_floor:       f32,
     shader_intensity:      f32,
+    hovered_node:          u32,
+    _pad_hover0:           u32,
+    _pad_hover1:           u32,
+    _pad_hover2:           u32,
 };
 
 @group(0) @binding(0) var<uniform> camera:  CameraUniform;
@@ -66,6 +70,7 @@ struct VertexOutput {
     @location(2) world_z:   f32,
     @location(3) coc_ratio: f32,  // base / effective; 1 = sharp, <1 = bokeh
     @location(4) @interpolate(flat) shape_id: u32,
+    @location(5) @interpolate(flat) instance_id: u32,
 };
 
 @vertex
@@ -95,6 +100,7 @@ fn vs_main(
     out.color = inst_color;
     out.world_z = inst_pos.z;
     out.shape_id = shape_ids[iid];
+    out.instance_id = iid;
 
     // Cheap rejects first — no transform math required for invisible
     // nodes. Saves a 4×4 mat-vec on culled instances.
@@ -179,6 +185,23 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         discard;
     }
 
+    // Hover treatment: when this fragment belongs to the hovered node,
+    // (a) brighten the fill toward white, and (b) paint a hard white
+    // inner rim in the annulus r ∈ [0.80, 0.95]. Painted inside the
+    // existing SDF disc so we don't need to expand the quad. Reads as
+    // an unmistakable selection ring on the hovered glyph.
+    let is_hovered = in.instance_id == effects.hovered_node
+                  && effects.hovered_node != 0xFFFFFFFFu;
+    var fill_rgb = in.color.rgb;
+    if (is_hovered) {
+        fill_rgb = mix(in.color.rgb, vec3<f32>(1.0, 1.0, 1.0), 0.35);
+        if (r > 0.80 && r < 0.95) {
+            // White rim, opaque, multiplied by shader_intensity to
+            // honor the global intensity scalar.
+            return vec4<f32>(1.0, 1.0, 1.0, effects.shader_intensity);
+        }
+    }
+
     // DoF is "off" by default — focus_thickness is set to ~1e9 so the
     // whole scene sits inside the focus band. In that mode every node
     // takes the sharp path (cosmograph-style hard SDF, no halo).
@@ -186,7 +209,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let dof_engaged = effects.focus_thickness < 1.0e6;
     if (!dof_engaged || in.coc_ratio > 0.985) {
         let edge = 1.0 - smoothstep(0.96, 1.0, r);
-        return vec4<f32>(in.color.rgb, in.color.a * edge * effects.shader_intensity);
+        return vec4<f32>(fill_rgb, in.color.a * edge * effects.shader_intensity);
     }
 
     // Bokeh path for actually out-of-focus nodes.
@@ -197,5 +220,5 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     // means each pixel is dimmer. coc_ratio² ≈ area ratio.
     let intensity_mul = in.coc_ratio * in.coc_ratio;
 
-    return vec4<f32>(in.color.rgb, in.color.a * intensity_mul * edge * effects.shader_intensity);
+    return vec4<f32>(fill_rgb, in.color.a * intensity_mul * edge * effects.shader_intensity);
 }

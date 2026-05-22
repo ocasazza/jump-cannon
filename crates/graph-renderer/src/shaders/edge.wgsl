@@ -43,6 +43,10 @@ struct EffectsUniform {
     edge_width:            f32,   // pixels — fat-line half-width × 2
     edge_fade_floor:       f32,   // long-distance asymptotic alpha floor
     shader_intensity:      f32,   // post-process visual-intensity scalar
+    hovered_node:          u32,   // u32::MAX = no hover (unused in edge.wgsl)
+    _pad_hover0:           u32,
+    _pad_hover1:           u32,
+    _pad_hover2:           u32,
 };
 
 @group(0) @binding(0) var<uniform> camera:  CameraUniform;
@@ -86,12 +90,19 @@ fn vs_main(@builtin(vertex_index) vid: u32) -> VertexOutput {
     let edge_len = length(p_tgt - p_src);
 
     // Focus-set membership combinator (per spec). 1.0 sentinel = "in set".
+    // Special-case: an endpoint with dim_alpha < 0.001 means **filtered
+    // out** by the active filter chip selection — collapse focus_mul to
+    // 0 so the fragment-shader discard at the bottom culls the edge
+    // entirely. Distinct from the 0.25 community-dim path which keeps
+    // edges visible but faded.
     let d_s = dim_alpha[edge.x];
     let d_t = dim_alpha[edge.y];
     let s_in = d_s >= 0.999;
     let t_in = d_t >= 0.999;
     var focus_mul: f32 = 1.0;
-    if (s_in && t_in) {
+    if (d_s < 0.001 || d_t < 0.001) {
+        focus_mul = 0.0;
+    } else if (s_in && t_in) {
         focus_mul = 1.0;
     } else if (s_in || t_in) {
         focus_mul = 0.6;
