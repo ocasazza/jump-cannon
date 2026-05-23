@@ -841,7 +841,13 @@ impl App {
                 log::info!("[graph-renderer] modal: fetched node {}", meta.id);
                 self.modal.fetch_error = None;
                 self.modal.current = Some(meta);
-                self.modal.open = true;
+                // The free-standing modal window is no longer auto-opened
+                // — the anchored panel (compact on hover, expandable to
+                // the full inspector body via the header toggle) is the
+                // unified node-view surface. `modal.current` is still
+                // populated for InspectorData.current_meta consumers, and
+                // a future cmd+P / explicit-open path can flip
+                // `modal.open` if a separate full window is ever wanted.
             }
             Ok(None) => {
                 log::debug!("[graph-renderer] modal: node not found (404), no modal");
@@ -2596,7 +2602,21 @@ impl App {
         .interactable(true)
         .anchor_pixels(drag_offset)
         .screen_pos_override(smoothed)
-        .expanded(expanded);
+        .expanded(expanded)
+        // In expanded mode, tell AnchoredPanel the body's full reserved
+        // footprint so it can clamp the position to keep the whole rect
+        // on-canvas — fixes the bug where expanding near the right/
+        // bottom edge sent the panel off-screen. Compact panels skip
+        // this; they're small and the legacy anchor-based clamp is
+        // sufficient.
+        .reserved_size(if expanded {
+            egui::vec2(480.0, 640.0)
+        } else {
+            // 360 wide × generous height estimate so hover previews
+            // anchored near the bottom don't overflow either. Tracks
+            // the `set_max_width(360.0)` below.
+            egui::vec2(360.0, 240.0)
+        });
 
         let output = panel.show(ctx, |ui| {
             // Compact = 360px wide (legacy hover/preview width).

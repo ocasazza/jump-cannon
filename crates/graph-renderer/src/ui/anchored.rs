@@ -124,6 +124,15 @@ pub struct AnchoredPanel<'a> {
     /// physically larger is a side effect of the larger body the
     /// caller renders, not a size override at this layer.)
     pub expanded: bool,
+    /// Expected panel size in pixels (width, height). When `Some`, the
+    /// panel position is pre-clamped so the rect from `panel_pos` to
+    /// `panel_pos + reserved_size` stays within
+    /// `canvas_rect.shrink(clamp_margin)` — prevents the expanded body
+    /// from running off the right/bottom edge when the anchor sits near
+    /// the viewport corner. `None` falls back to anchor-based clamping
+    /// only (the legacy behavior for hover-preview-sized panels that
+    /// don't risk overflow).
+    pub reserved_size: Option<Vec2>,
 }
 
 /// Outcome of [`AnchoredPanel::show`]. `drag_delta` carries the
@@ -162,11 +171,21 @@ impl<'a> AnchoredPanel<'a> {
             corner_radius: 10.0,
             interactable: true,
             expanded: false,
+            reserved_size: None,
         }
     }
 
     pub fn expanded(mut self, expanded: bool) -> Self {
         self.expanded = expanded;
+        self
+    }
+
+    /// Tell the panel its expected pixel size so its position can be
+    /// pre-clamped to keep the whole rect inside the viewport. Required
+    /// for the expanded body (large) so a node near the right/bottom
+    /// edge doesn't push the panel off-screen.
+    pub fn reserved_size(mut self, size: Vec2) -> Self {
+        self.reserved_size = Some(size);
         self
     }
 
@@ -244,14 +263,34 @@ impl<'a> AnchoredPanel<'a> {
         let user_delta = self.anchor_pixels.unwrap_or(Vec2::ZERO);
         let raw_pos = placement_anchor + self.offset + user_delta;
 
-        // Clamp the panel into the viewport (with margin) when the
-        // anchor itself is off-screen AND the caller hasn't supplied
-        // an explicit placement override. With an override, trust the
-        // caller — they've already decided where the panel goes, and
-        // a user-drag delta is allowed to push it near (or past) the
-        // edge intentionally.
+        // Clamp the panel into the viewport (with margin). Two regimes:
+        //
+        // 1. `reserved_size` is Some (expanded body): clamp so the full
+        //    expected rect — `panel_pos .. panel_pos + reserved_size` —
+        //    fits inside `canvas.shrink(clamp_margin)`. Without this,
+        //    expanding a panel anchored near the right/bottom edge sends
+        //    the body off-screen.
+        // 2. `reserved_size` is None (hover preview / compact): clamp
+        //    only when the anchor itself is off-screen AND no explicit
+        //    override is set. With an override, trust the caller; with
+        //    an on-screen anchor and a small panel, the chance of
+        //    overflow is negligible and clamping fights soft-tether
+        //    drag intent.
         let clamp_rect = self.canvas_rect.shrink(self.clamp_margin);
-        let panel_pos = if on_screen || self.screen_pos_override.is_some() {
+        let panel_pos = if let Some(size) = self.reserved_size {
+            // The right/bottom edge of the panel must stay inside
+            // clamp_rect. Push the top-left in by however much overflow
+            // we'd otherwise have. min after subtraction guards against
+            // a panel larger than the viewport (rare; we leave it
+            // top-left aligned in that case rather than clipping the
+            // header off the top).
+            let max_x = (clamp_rect.right() - size.x).max(clamp_rect.left());
+            let max_y = (clamp_rect.bottom() - size.y).max(clamp_rect.top());
+            egui::pos2(
+                raw_pos.x.clamp(clamp_rect.left(), max_x),
+                raw_pos.y.clamp(clamp_rect.top(), max_y),
+            )
+        } else if on_screen || self.screen_pos_override.is_some() {
             raw_pos
         } else {
             egui::pos2(
