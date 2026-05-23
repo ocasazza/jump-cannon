@@ -13,6 +13,8 @@ use super::{hint_label, subgroup_label, subgroup_separator};
 pub fn show(ui: &mut egui::Ui, state: &mut AppState, registry: &mut ActionRegistry) {
     yaml_io_panel(ui, state);
     subgroup_separator(ui);
+    state_timeline_panel(ui, state);
+    subgroup_separator(ui);
 
     if registry.instances.is_empty() {
         hint_label(
@@ -136,8 +138,15 @@ fn yaml_io_panel(ui: &mut egui::Ui, state: &mut AppState) {
                 Ok(imported) => {
                     // Full replacement — including which panels are open,
                     // active section, query, etc. That's the "every
-                    // setting" contract.
+                    // setting" contract. Preserve the in-memory snapshot
+                    // ring across the swap (it's `#[serde(skip)]` and
+                    // would otherwise be wiped) and stamp the import as
+                    // its own entry so the user sees the YAML load in
+                    // the timeline.
+                    let ring = std::mem::take(&mut state.snapshots);
                     *state = imported;
+                    state.snapshots = ring;
+                    state.snapshot_now("import yaml");
                 }
                 Err(e) => {
                     state.yaml_import_error = Some(e);
@@ -167,7 +176,12 @@ fn yaml_io_panel(ui: &mut egui::Ui, state: &mut AppState) {
             .fill(color);
         if ui.add(btn).clicked() {
             if state.yaml_reset_armed {
+                // Preserve the timeline across the reset so the user
+                // can roll back. Tag the reset as its own entry.
+                let ring = std::mem::take(&mut state.snapshots);
                 *state = AppState::default();
+                state.snapshots = ring;
+                state.snapshot_now("reset to defaults");
             } else {
                 state.yaml_reset_armed = true;
             }
@@ -176,6 +190,107 @@ fn yaml_io_panel(ui: &mut egui::Ui, state: &mut AppState) {
             state.yaml_reset_armed = false;
         }
     });
+}
+
+/// Render the live snapshot timeline (newest first), with one
+/// "Restore" button per row plus a footer with capacity + clear.
+///
+/// Restore deserialises the snapshot's stored JSON back into
+/// `AppState`, preserves the in-memory ring across the swap, and
+/// pushes a `restore @ <orig_timestamp>` entry — so the restore
+/// itself becomes a timeline event the user can undo.
+fn state_timeline_panel(ui: &mut egui::Ui, state: &mut AppState) {
+    subgroup_label(ui, "State timeline");
+
+    // Capacity / clear row.
+    let len = state.snapshots.entries.len();
+    let cap = state.snapshots.max;
+    ui.horizontal(|ui| {
+        ui.label(
+            egui::RichText::new(format!("{len} / {cap}"))
+                .size(11.0)
+                .color(egui::Color32::GRAY),
+        );
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            // "Clear timeline" leaves capacity untouched and reseeds
+            // a single `cleared` snapshot of the current state so the
+            // panel never becomes empty mid-session (otherwise the
+            // very next mutation would silently become the "earliest"
+            // visible entry with nothing to restore back to).
+            if ui.small_button("Clear timeline").clicked() {
+                state.snapshots.entries.clear();
+                state.snapshot_now("cleared");
+            }
+        });
+    });
+
+    if state.snapshots.entries.is_empty() {
+        hint_label(ui, "Timeline empty.");
+        return;
+    }
+
+    // Decide which (if any) entry to restore after the immutable
+    // borrow ends. We can't mutate `state` from inside the iteration
+    // because we're already holding a borrow of `state.snapshots`.
+    let mut to_restore: Option<usize> = None;
+    let entries = state.snapshots.entries.clone();
+
+    egui::ScrollArea::vertical()
+        .max_height(220.0)
+        .id_salt("state_timeline_scroll")
+        .show(ui, |ui| {
+            for (idx, entry) in entries.iter().enumerate().rev() {
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new(format_timestamp_ms(entry.timestamp_ms))
+                            .monospace()
+                            .size(11.0)
+                            .color(egui::Color32::GRAY),
+                    );
+                    ui.label(egui::RichText::new(&entry.source).size(12.0));
+                    ui.with_layout(
+                        egui::Layout::right_to_left(egui::Align::Center),
+                        |ui| {
+                            if ui.small_button("Restore").clicked() {
+                                to_restore = Some(idx);
+                            }
+                        },
+                    );
+                });
+            }
+        });
+
+    if let Some(idx) = to_restore {
+        let entry = entries[idx].clone();
+        match serde_json::from_str::<AppState>(&entry.state_json) {
+            Ok(imported) => {
+                // Preserve the timeline across the swap (it's
+                // `#[serde(skip)]` and would otherwise be wiped), then
+                // stamp the restore so it's itself in the timeline.
+                let ring = std::mem::take(&mut state.snapshots);
+                *state = imported;
+                state.snapshots = ring;
+                state.snapshot_now(format!(
+                    "restore @ {}",
+                    format_timestamp_ms(entry.timestamp_ms)
+                ));
+            }
+            Err(e) => {
+                state.yaml_import_error = Some(format!("restore failed: {e}"));
+            }
+        }
+    }
+}
+
+/// Format a Unix-epoch-millis timestamp as `HH:MM:SS.mmm` in UTC.
+/// Tiny by-hand helper — we don't want a chrono dep for one label.
+fn format_timestamp_ms(ms: u64) -> String {
+    let secs = ms / 1000;
+    let millis = ms % 1000;
+    let h = (secs / 3600) % 24;
+    let m = (secs / 60) % 60;
+    let s = secs % 60;
+    format!("{h:02}:{m:02}:{s:02}.{millis:03}")
 }
 
 fn param_value_display(v: &ParamValue) -> String {

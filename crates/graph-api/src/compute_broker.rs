@@ -70,6 +70,15 @@ impl ComputeBroker {
     /// reachable. The first successful dial validates `url`; an *invalid*
     /// url (parse failure) is reported synchronously as an error.
     ///
+    /// IMPORTANT: callers must only invoke `connect()` when a compute URL
+    /// was explicitly configured (CLI flag or `JUMP_CANNON_COMPUTE_URL`).
+    /// The loop dials forever with exponential backoff and warns on every
+    /// failure; previously graph-api defaulted the URL to
+    /// `http://[::1]:50051`, which made every dev session without a local
+    /// graph-compute worker emit `compute broker dial failed ...` at
+    /// `backoff_secs=30` indefinitely. `main.rs` now skips this call when
+    /// the URL is `None`. Do not reintroduce a default URL here.
+    ///
     /// TODO(auth): wrap `ComputeClient` in a tonic interceptor that injects
     /// a bearer token from `JUMP_CANNON_COMPUTE_TOKEN`.
     pub async fn connect(&self, url: String) -> anyhow::Result<()> {

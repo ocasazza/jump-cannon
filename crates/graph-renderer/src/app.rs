@@ -341,6 +341,27 @@ pub struct App {
     /// the next dirty frame will flush immediately.
     #[cfg(target_arch = "wasm32")]
     last_persist_at: Option<web_time::Instant>,
+
+    // -- Snapshot timeline (always-on, native + WASM) -----------------
+    //
+    // The Instances panel doubles as a live timeline of every UI state
+    // change. We reuse the same JSON-hash diff trick as the WASM
+    // persistence layer, but cross-platform and on a separate cadence.
+    /// JSON-hash of `state` from the previous frame. `None` means
+    /// "never sampled" — the very first tick after `App::new` sets it
+    /// and does not push a snapshot (the `default` + `restored` entries
+    /// were already pushed during `App::new`).
+    snapshot_hash: Option<u64>,
+    /// Wall-clock instant of the most recent snapshot push. Used to
+    /// throttle the auto-snapshotter — bursts of per-frame slider
+    /// drags coalesce into one entry per `SNAPSHOT_INTERVAL` window.
+    last_snapshot_at: Option<web_time::Instant>,
+    /// Best-effort attribution label for the next auto-snapshot.
+    /// Mutation sites set this before they mutate; the frame-tail
+    /// detector drains it on every tick (whether or not a diff is
+    /// observed) so a stale label from a no-op call never lands on a
+    /// later unrelated diff. `None` falls back to `"misc"`.
+    snapshot_source: Option<String>,
 }
 
 impl App {
@@ -359,7 +380,33 @@ impl App {
         //     sessionStorage so the cutover is non-destructive.
         // The migration shim for the pre-refactor `LayoutState` shape runs
         // inside `persist`, so callers don't need to mind it here.
-        let state: ui::AppState = ui::persist::load_from_eframe(cc.storage);
+        // Snapshot the pristine `AppState::default()` as the very first
+        // timeline entry BEFORE loading from persistence — this is the
+        // explicit "INCLUDING THE DEFAULT STATE" requirement on the
+        // Instances timeline. We capture the default by hand (rather
+        // than calling `snapshot_now` on a throwaway value) so that
+        // when we subsequently overwrite `state` with the persisted
+        // blob, the entry rides along on the loaded state's ring.
+        let default_state_json =
+            serde_json::to_string(&ui::AppState::default()).unwrap_or_default();
+        let default_timestamp_ms = web_time::SystemTime::now()
+            .duration_since(web_time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+
+        let mut state: ui::AppState = ui::persist::load_from_eframe(cc.storage);
+        // Seed the in-memory ring with `default` first, then push a
+        // `restored` snapshot for the just-loaded state. If load_from_eframe
+        // returned the bare default (no prior session), the two entries
+        // will have identical state_json — that's fine, the timeline is
+        // about user-visible events, and "started fresh" is one.
+        state.snapshots.entries.clear();
+        state.snapshots.entries.push(ui::state::StateSnapshot {
+            timestamp_ms: default_timestamp_ms,
+            source: "default".to_string(),
+            state_json: default_state_json,
+        });
+        state.snapshot_now("restored");
 
         // Install the WASM-only beforeunload hook once: it flushes the
         // most-recently-serialized AppState JSON to sessionStorage on
@@ -557,6 +604,10 @@ impl App {
             state_dirty: false,
             #[cfg(target_arch = "wasm32")]
             last_persist_at: None,
+
+            snapshot_hash: None,
+            last_snapshot_at: None,
+            snapshot_source: None,
         }
     }
 
@@ -1272,6 +1323,16 @@ impl eframe::App for App {
         self.perf.end_stage(StageId::UiChrome);
         match palette_outcome {
             PaletteOutcome::Execute { action_id, params } => {
+                // Attribute the next auto-snapshot to the palette action.
+                // Prefer the action's human-readable `title` over its id;
+                // the id is e.g. `"focus.fit"` while the title is
+                // `"Focus: fit"` which reads better in the timeline.
+                let label = self
+                    .actions
+                    .get(&action_id)
+                    .map(|a| a.title.clone())
+                    .unwrap_or_else(|| action_id.clone());
+                self.snapshot_source = Some(format!("palette: {label}"));
                 self.execute_action(frame, &action_id, params);
             }
             PaletteOutcome::OpenNode { id } => {
@@ -1656,6 +1717,16 @@ impl eframe::App for App {
             ctx.request_repaint_after(std::time::Duration::from_millis(250));
         }
 
+        // -- Auto-snapshot timeline (cross-platform) -------------------
+        //
+        // Hash AppState (the same JSON-hash the wasm persistence layer
+        // uses) and, on a debounced cadence, push a snapshot whenever
+        // the hash diffs from the previously-observed value. We drain
+        // `snapshot_source` every tick — whether or not a diff lands —
+        // so a label set by a no-op call doesn't get stuck and tag the
+        // next unrelated change with the wrong source.
+        self.tick_snapshots();
+
         // -- WASM debounced sessionStorage persistence -----------------
         //
         // Detect a state mutation via JSON-hash diff (cheap enough for a
@@ -1698,6 +1769,60 @@ impl eframe::App for App {
 }
 
 impl App {
+    /// Auto-snapshot the current `AppState` if it differs from the
+    /// previously observed hash, throttled by `SNAPSHOT_INTERVAL`. The
+    /// label is drained from `snapshot_source` (set by mutation sites
+    /// that bother to attribute themselves) or falls back to `"misc"`.
+    ///
+    /// `snapshot_source` is drained on every call regardless of
+    /// whether a diff is observed, so a label set by a no-op mutation
+    /// never lingers to mislabel a later, unrelated diff.
+    fn tick_snapshots(&mut self) {
+        use std::hash::{Hash, Hasher};
+        use std::time::Duration;
+        const SNAPSHOT_INTERVAL: Duration = Duration::from_millis(250);
+
+        // Drain attribution label up-front. Even if the diff check
+        // below decides not to snapshot, we don't want a stale label
+        // bleeding into the next genuine mutation.
+        let drained_source = self.snapshot_source.take();
+
+        let json = match serde_json::to_string(&self.state) {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        json.hash(&mut h);
+        let now_hash = h.finish();
+
+        let prev = self.snapshot_hash;
+        self.snapshot_hash = Some(now_hash);
+
+        // First observation: seed the hash but don't push — the
+        // `default` / `restored` entries from `App::new` cover the
+        // starting state.
+        if prev.is_none() || prev == Some(now_hash) {
+            return;
+        }
+
+        // Debounce bursts of slider-drag style mutations.
+        let now = web_time::Instant::now();
+        if let Some(last) = self.last_snapshot_at {
+            if now.duration_since(last) < SNAPSHOT_INTERVAL {
+                // Restore the drained label so the next eligible
+                // tick within the same burst can still pick it up.
+                if self.snapshot_source.is_none() {
+                    self.snapshot_source = drained_source;
+                }
+                return;
+            }
+        }
+
+        let source = drained_source.unwrap_or_else(|| "misc".to_string());
+        self.state.snapshot_now(source);
+        self.last_snapshot_at = Some(now);
+    }
+
     /// Append a Filter card from a modal badge click. If the last card
     /// isn't already a connector or paren-open, prepend an AND connector
     /// so the new filter joins the chain. Auto-focuses the Filter section

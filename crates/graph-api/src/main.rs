@@ -25,6 +25,13 @@ struct Args {
     /// pass --assets-dir.
     #[arg(long, env = "GRAPH_RENDERER_ASSETS_DIR")]
     assets_dir: Option<PathBuf>,
+    /// URL of the graph-compute gRPC worker (e.g. `http://[::1]:50051`).
+    /// When unset, the compute broker is disabled: `/compute/health`
+    /// reports `connected: false` and `/graph/layout/stream` returns 503,
+    /// but graph-api stops trying to dial — useful for local sessions
+    /// that run the in-browser wgpu sim and don't need a remote worker.
+    #[arg(long, env = "JUMP_CANNON_COMPUTE_URL")]
+    compute_url: Option<String>,
 }
 
 #[tokio::main]
@@ -66,24 +73,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tracing::info!(assets_dir = %dir.display(), "dev mode: serving assets from disk");
     }
 
-    // Best-effort dial of the graph-compute worker. If unreachable, the
-    // /graph/layout/stream endpoint returns 503; existing endpoints are
-    // unaffected (clients run the local wgpu sim).
-    let compute_url = std::env::var("JUMP_CANNON_COMPUTE_URL")
-        .unwrap_or_else(|_| "http://[::1]:50051".to_string());
+    // Best-effort dial of the graph-compute worker. The broker is OPT-IN:
+    // we only spawn the reconnect loop when `--compute-url` / the env var
+    // `JUMP_CANNON_COMPUTE_URL` is set. Previously this defaulted to
+    // `http://[::1]:50051`, which produced a `WARN compute broker dial
+    // failed ... backoff_secs=30` line every 30s in every dev session
+    // that wasn't also running graph-compute. When unset:
+    //   * `/compute/health` reports `connected: false` with empty url.
+    //   * `/graph/layout/stream` returns 503 (existing behavior).
+    //   * No background dial loop runs — silent.
+    // Clients running the in-browser wgpu sim are unaffected.
     let compute_broker = ComputeBroker::new();
-    {
+    if let Some(compute_url) = args.compute_url.clone() {
         let broker = compute_broker.clone();
-        let url = compute_url.clone();
         tokio::spawn(async move {
-            match broker.connect(url.clone()).await {
-                Ok(()) => tracing::info!(%url, "connected to graph-compute worker"),
+            match broker.connect(compute_url.clone()).await {
+                Ok(()) => tracing::info!(url = %compute_url, "connected to graph-compute worker"),
                 Err(e) => tracing::warn!(
-                    %url,
+                    url = %compute_url,
                     "graph-compute unreachable: {e}; /graph/layout/stream will return 503"
                 ),
             }
         });
+    } else {
+        tracing::info!(
+            "compute broker disabled (no --compute-url / JUMP_CANNON_COMPUTE_URL); \
+             /graph/layout/stream will return 503"
+        );
     }
 
     let state = AppState::new(

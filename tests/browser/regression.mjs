@@ -123,8 +123,11 @@ try {
   // wgpu canvas are unreliable across successive shots — every
   // post-boot screenshot we captured had identical bytes regardless
   // of state changes. We pivoted to a log-based observation:
-  // sidebar.rs emits `[graph-renderer] active_section -> Some("…")`
-  // whenever the user clicks an activity-bar icon. Clicks are
+  // state.rs::toggle_section emits
+  // `[graph-renderer] section_open -> <Section> = <bool>` whenever a
+  // tray-strip launcher fires (the old activity-bar `active_section ->
+  // Some("…")` line was removed when sections became independent
+  // floating panels). Clicks are
   // dispatched as DOM PointerEvents on the canvas (eframe's
   // virtual-mouse pickup has been brittle in this harness too). If
   // the click path or the section toggle wiring breaks, the log
@@ -149,7 +152,7 @@ try {
         c.dispatchEvent(new MouseEvent('click', opts));
       }, { x: ACTIVITY_X, y });
       await page.page.waitForTimeout(250);
-      const needle = `active_section -> Some("${name}")`;
+      const needle = `section_open -> ${name} =`;
       if (consoleLines.some((l) => l.includes(needle))) {
         seenSections.add(name);
       }

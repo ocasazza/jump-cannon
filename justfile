@@ -79,7 +79,15 @@ dev-up:
     wait "$API_BUILD_PID" || { echo "graph-api build failed"; exit 1; }
 
     echo "→ graph-api built; starting hot-reload server (frontend live now, WASM rebuilds on edit)…"
-    cargo watch \
+    # graph-api's compute broker is now opt-in (no default URL), so dev-up
+    # must explicitly point it at the local graph-compute worker that
+    # `nix run .#dev-up` boots on [::1]:50051. Standalone `cargo run -p
+    # graph-api` without this env var simply runs broker-disabled and
+    # logs no warnings — exactly what we want outside dev-up.
+    # TODO: if `nix run .#dev-up` is ever made optional (e.g. a flag to
+    # skip the backend for frontend-only iteration), gate this env var
+    # accordingly.
+    JUMP_CANNON_COMPUTE_URL=http://[::1]:50051 cargo watch \
       -w crates/graph-api -w crates/vault-data -w crates/vault-links -w crates/graph-metrics \
       -x 'run -p graph-api -- --assets-dir crates/graph-renderer/assets/dist'
 

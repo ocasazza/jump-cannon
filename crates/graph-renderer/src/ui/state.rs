@@ -641,6 +641,40 @@ impl Default for WorkspaceSettings {
     }
 }
 
+/// One entry in the [`SnapshotRing`] timeline. Captures the full
+/// `AppState` (minus the ring itself, which is `#[serde(skip)]`) as a
+/// JSON string so it can round-trip back through serde at restore time.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct StateSnapshot {
+    /// Unix epoch milliseconds at the moment of capture. Monotonic
+    /// within a single session; not guaranteed across restarts.
+    pub timestamp_ms: u64,
+    /// Short human-readable description of what caused the snapshot
+    /// (e.g. `"default"`, `"palette: focus-fit"`, `"Style"`, `"misc"`).
+    pub source: String,
+    /// Serialized `AppState` JSON. Because `AppState::snapshots` is
+    /// `#[serde(skip)]`, the blob is naturally free of recursive ring
+    /// bloat — no special elision needed.
+    pub state_json: String,
+}
+
+/// In-memory ring of [`StateSnapshot`]s. Per-session only — not
+/// persisted across reloads (the ring itself is `#[serde(skip)]` on
+/// `AppState`). The user can YAML-export an interesting state to keep
+/// it long-term.
+#[derive(Clone, Debug)]
+pub struct SnapshotRing {
+    pub entries: Vec<StateSnapshot>,
+    /// Cap on the timeline length. Oldest evicted on push.
+    pub max: usize,
+}
+
+impl Default for SnapshotRing {
+    fn default() -> Self {
+        Self { entries: Vec::new(), max: 50 }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AppState {
     /// Per-section floating panel visibility. Each `Section` is an
@@ -726,6 +760,35 @@ pub struct AppState {
     /// being re-evaluated each frame.
     #[serde(skip)]
     pub yaml_reset_armed: bool,
+    /// Versioned timeline of UI state changes. Each entry holds a JSON
+    /// serialization of the entire `AppState` at the time of capture
+    /// (the ring itself is `#[serde(skip)]`, so no recursion). The
+    /// Instances section renders the timeline and exposes per-entry
+    /// "Restore" buttons. In-memory only — lost on full app restart.
+    #[serde(skip)]
+    pub snapshots: SnapshotRing,
+}
+
+impl AppState {
+    /// Push a snapshot of the current state into the timeline, tagged
+    /// with `source`. Caller invokes from any mutation site (command
+    /// palette, section UI, filter chip click, frame-tail diff
+    /// detector). Because `snapshots` is `#[serde(skip)]`, serializing
+    /// `self` directly is safe — the ring won't appear in the blob.
+    pub fn snapshot_now(&mut self, source: impl Into<String>) {
+        let source = source.into();
+        let state_json = serde_json::to_string(self).unwrap_or_default();
+        let timestamp_ms = web_time::SystemTime::now()
+            .duration_since(web_time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let entry = StateSnapshot { timestamp_ms, source, state_json };
+        self.snapshots.entries.push(entry);
+        let max = self.snapshots.max.max(1);
+        while self.snapshots.entries.len() > max {
+            self.snapshots.entries.remove(0);
+        }
+    }
 }
 
 /// Serialize the entire `AppState` to a YAML document.
@@ -866,6 +929,7 @@ impl AppState {
     /// Toggle the given section's open flag.
     pub fn toggle_section(&mut self, s: Section) {
         let v = self.is_section_open(s);
+        log::info!("[graph-renderer] section_open -> {:?} = {}", s, !v);
         self.section_open.insert(s, !v);
     }
     /// Explicit set helper — replaces the old `active_section = Some(s)`
@@ -928,6 +992,7 @@ impl Default for AppState {
             yaml_import_buffer: String::new(),
             yaml_import_error: None,
             yaml_reset_armed: false,
+            snapshots: SnapshotRing::default(),
         }
     }
 }
