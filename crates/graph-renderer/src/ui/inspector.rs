@@ -860,15 +860,31 @@ fn show_frontmatter_section(ui: &mut egui::Ui, idx: u32, data: &InspectorData) {
 fn show_page_content(ui: &mut egui::Ui, idx: u32, data: &mut InspectorData) {
     let id = match data.ids.get(idx as usize) {
         Some(s) => s.as_str(),
-        None => return,
+        None => {
+            log::info!(
+                "[graph-renderer] show_page_content skip: ids.get({idx}) is None"
+            );
+            return;
+        }
     };
     let Some(meta) = data.current_meta else {
+        log::info!(
+            "[graph-renderer] show_page_content skip: current_meta is None (id={id})"
+        );
         return;
     };
     if !meta.id.is_empty() && meta.id != id {
+        log::info!(
+            "[graph-renderer] show_page_content skip: meta.id={:?} != selected id={:?}",
+            meta.id, id
+        );
         return;
     }
     if !page_viewer::is_obsidian_page(meta) {
+        log::info!(
+            "[graph-renderer] show_page_content skip: not obsidian page (id={id}, path={:?}, doctype={:?}, body_len={})",
+            meta.path, meta.doctype, meta.body.len()
+        );
         return;
     }
     // We need ALL three editor handles to render anything useful. If any
@@ -878,6 +894,9 @@ fn show_page_content(ui: &mut egui::Ui, idx: u32, data: &mut InspectorData) {
         data.page_viewer_states.as_deref_mut(),
         data.markdown_cache.as_deref_mut(),
     ) else {
+        log::info!(
+            "[graph-renderer] show_page_content skip: page_viewer_states or markdown_cache is None (id={id})"
+        );
         return;
     };
 

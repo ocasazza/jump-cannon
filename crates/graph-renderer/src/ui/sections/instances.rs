@@ -11,9 +11,15 @@ use crate::ui::state::{self, AppState};
 use super::{hint_label, subgroup_label, subgroup_separator};
 
 pub fn show(ui: &mut egui::Ui, state: &mut AppState, registry: &mut ActionRegistry) {
-    yaml_io_panel(ui, state);
-    subgroup_separator(ui);
+    // Order matters: the State timeline is the most-frequently-useful
+    // sub-region (the user expects to see `default` + `restored` the
+    // instant the panel opens), so it sits ABOVE the YAML import/export
+    // block — which dwarfs the panel with two ~12-row TextEdits and was
+    // pushing the timeline below the visible fold of the default
+    // [280, 520] floating panel.
     state_timeline_panel(ui, state);
+    subgroup_separator(ui);
+    yaml_io_panel(ui, state);
     subgroup_separator(ui);
 
     if registry.instances.is_empty() {

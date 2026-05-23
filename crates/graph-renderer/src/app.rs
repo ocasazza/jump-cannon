@@ -407,6 +407,10 @@ impl App {
             state_json: default_state_json,
         });
         state.snapshot_now("restored");
+        log::info!(
+            "[graph-renderer] timeline seeded with {} entries",
+            state.snapshots.entries.len()
+        );
 
         // Install the WASM-only beforeunload hook once: it flushes the
         // most-recently-serialized AppState JSON to sessionStorage on

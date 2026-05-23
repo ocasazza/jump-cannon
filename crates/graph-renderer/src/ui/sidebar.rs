@@ -169,9 +169,17 @@ pub fn show_floating(
         }
         let mut open = true;
         let pos = [16.0 + idx as f32 * 12.0, 64.0 + idx as f32 * 24.0];
+        // Instances packs a State timeline AND a YAML import/export
+        // block (two ~12-row TextEdits) under one roof — give it more
+        // vertical room so both sub-regions are reachable without
+        // scrolling. Other panels keep the compact default.
+        let default_size = match section {
+            Section::Instances => [320.0, 680.0],
+            _ => [280.0, 520.0],
+        };
         FloatingPanel::new(PanelId::Section(section), section.title())
             .default_pos(pos)
-            .default_size([280.0, 520.0])
+            .default_size(default_size)
             .show(ctx, &mut open, |ui| {
                 render_section_body(ui, state, section, registry, layout_registry, perf);
             });
