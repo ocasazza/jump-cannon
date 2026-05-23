@@ -10,11 +10,13 @@
 pub mod binary;
 pub mod browser;
 pub mod compute_broker;
+pub mod progress;
 pub mod proto;
 pub mod server;
 pub mod state;
 pub mod subprocess;
 pub mod vault_loader;
+pub mod watcher;
 
 pub use server::router;
 pub use state::AppState;

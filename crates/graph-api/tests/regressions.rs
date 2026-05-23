@@ -24,6 +24,7 @@ fn empty_state() -> AppState {
         None,
         None,
         graph_api::compute_broker::ComputeBroker::new(),
+        Arc::new(graph_api::progress::ProgressLog::new()),
     )
 }
 
@@ -94,6 +95,7 @@ fn _state_constructor_is_public() -> AppState {
         None,
         None,
         graph_api::compute_broker::ComputeBroker::new(),
+        Arc::new(graph_api::progress::ProgressLog::new()),
     )
 }
 

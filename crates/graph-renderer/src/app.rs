@@ -451,6 +451,13 @@ impl App {
         let progress_sink = progress.sink();
         kick_off_bootstrap(load.clone(), base_url.clone(), progress_sink);
 
+        // Long-lived poller for server-side progress (vault ingest /
+        // watcher reloads / search reindex). Mirrors backend
+        // `ProgressEvent`s into the same `Progress` sink the bootstrap
+        // fetch uses, so the existing footer UI surfaces ingest task
+        // bars without any extra glue.
+        kick_off_progress_poll(base_url.clone(), progress.sink());
+
         // Long-lived compute-broker health watcher. Polls
         // `/compute/health` every 2s and emits a footer-log event on
         // every state transition (connected ↔ disconnected). Without
@@ -3596,6 +3603,135 @@ fn kick_off_bootstrap(load: SharedLoad, base: String, prog: ProgressSink) {
     };
 
     spawn_async(task);
+}
+
+/// Server-side progress poller. Long-lived: polls `/progress?since=<seq>`
+/// every 250ms (adaptive — backs off to 2s when the server has been idle
+/// for a few polls in a row) and replays each backend `ProgressEvent`
+/// into the renderer's local sink.
+///
+/// Wire shape (matches `graph_api::progress::ProgressResponse`):
+/// ```json
+/// { "next_seq": N, "server_ms": <unix-ms>,
+///   "events": [ { "seq": S, "ts_ms": <unix-ms>,
+///                 "event": { "kind": "start", "id": …, "group": …, "label": … } }, … ] }
+/// ```
+///
+/// Server `id` / `seq` live in separate name-spaces from the
+/// frontend-issued ones (the backend's `start` allocates server-side
+/// task ids, the frontend's `Progress::start` allocates its own); to
+/// avoid collisions we hash the server's `(group, id)` into a new
+/// frontend task id maintained in a small per-poller map.
+fn kick_off_progress_poll(base: String, prog: ProgressSink) {
+    use std::collections::HashMap;
+    use std::time::Duration;
+
+    #[derive(serde::Deserialize)]
+    struct Resp {
+        next_seq: u64,
+        #[allow(dead_code)]
+        server_ms: u64,
+        events: Vec<Stamped>,
+    }
+    // Server-side `seq` / `ts_ms` are parsed by serde from the JSON
+    // payload but not yet used on the client: elapsed-time badges are
+    // derived from `Instant::now()` at receipt, which is fine for live
+    // reloads but loses sub-poll resolution for events that completed
+    // before the first poll. Acceptable trade-off; reconsider if the
+    // footer ever needs absolute timestamps.
+    #[derive(serde::Deserialize)]
+    struct Stamped {
+        #[allow(dead_code)]
+        seq: u64,
+        #[allow(dead_code)]
+        ts_ms: u64,
+        event: BackendEvent,
+    }
+    #[derive(serde::Deserialize)]
+    #[serde(tag = "kind", rename_all = "snake_case")]
+    enum BackendEvent {
+        Start { id: u64, group: String, label: String },
+        SetProgress { id: u64, progress: f32 },
+        UpdateLabel { id: u64, label: String },
+        Finish { id: u64 },
+        Fail { id: u64, reason: String },
+        Log { level: String, group: String, message: String },
+    }
+
+    let client = ApiClient::new(base);
+    spawn_async(async move {
+        // Map: backend task id -> local frontend task id we allocated
+        // through `prog.start(...)`. Live for the life of the session.
+        let mut id_map: HashMap<u64, u64> = HashMap::new();
+        let mut cursor: u64 = 0;
+        let mut idle_polls: u32 = 0;
+        loop {
+            match client.progress(cursor).await {
+                Ok(bytes) => match serde_json::from_slice::<Resp>(&bytes) {
+                    Ok(resp) => {
+                        if resp.events.is_empty() {
+                            idle_polls = idle_polls.saturating_add(1);
+                        } else {
+                            idle_polls = 0;
+                            for stamped in resp.events {
+                                match stamped.event {
+                                    BackendEvent::Start { id, group, label } => {
+                                        let local = prog.start(group, label);
+                                        id_map.insert(id, local);
+                                    }
+                                    BackendEvent::SetProgress { id, progress } => {
+                                        if let Some(&local) = id_map.get(&id) {
+                                            prog.set_progress(local, progress);
+                                        }
+                                    }
+                                    BackendEvent::UpdateLabel { id, label } => {
+                                        if let Some(&local) = id_map.get(&id) {
+                                            prog.update_label(local, label);
+                                        }
+                                    }
+                                    BackendEvent::Finish { id } => {
+                                        if let Some(local) = id_map.remove(&id) {
+                                            prog.finish(local);
+                                        }
+                                    }
+                                    BackendEvent::Fail { id, reason } => {
+                                        if let Some(local) = id_map.remove(&id) {
+                                            prog.fail(local, reason);
+                                        }
+                                    }
+                                    BackendEvent::Log { level, group, message } => {
+                                        match level.as_str() {
+                                            "warn" => prog.warn(group, message),
+                                            "error" => prog.error(group, message),
+                                            _ => prog.info(group, message),
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        cursor = resp.next_seq;
+                    }
+                    Err(_) => {
+                        // Old server (no /progress)? Back off hard so we
+                        // don't spin against a 404. Future server upgrades
+                        // re-bind the route and pick up on the next loop.
+                        idle_polls = idle_polls.saturating_add(8);
+                    }
+                },
+                Err(_) => {
+                    idle_polls = idle_polls.saturating_add(4);
+                }
+            }
+            // 250ms while live, back off to 2s if 8 polls in a row brought
+            // nothing new.
+            let delay = if idle_polls >= 8 {
+                Duration::from_millis(2000)
+            } else {
+                Duration::from_millis(250)
+            };
+            sleep_async(delay).await;
+        }
+    });
 }
 
 /// Short rendering of a node id for status-footer labels — long path-like

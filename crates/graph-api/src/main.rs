@@ -1,12 +1,16 @@
 use std::path::PathBuf;
+use std::sync::Arc;
 use clap::Parser;
 
-use graph_api::{compute_broker::ComputeBroker, router, vault_loader, AppState};
+use graph_api::{
+    compute_broker::ComputeBroker,
+    progress::ProgressLog,
+    router,
+    vault_loader,
+    AppState,
+};
 
 /// Resolution order: CLI flag > env var (VAULT_ROOT) > .env file > current directory.
-//
-// Future: --backend-url for a remote graph-api split deploy; --config-file for
-// TOML config in ~/.config/jump-cannon/.
 #[derive(Parser)]
 #[command(name = "graph-api")]
 struct Args {
@@ -16,27 +20,29 @@ struct Args {
     /// Listen port (0 = OS picks). Override with $GRAPH_API_PORT.
     #[arg(short, long, env = "GRAPH_API_PORT", default_value_t = 0)]
     port: u16,
+    /// Listen host. Defaults to 127.0.0.1; set 0.0.0.0 (or [::]) for
+    /// container bind. `$GRAPH_API_HOST` is the matching env var.
+    #[arg(long, env = "GRAPH_API_HOST", default_value = "127.0.0.1")]
+    host: String,
     /// Don't auto-open the browser. Override with $GRAPH_API_NO_BROWSER=1.
     #[arg(long, env = "GRAPH_API_NO_BROWSER")]
     no_browser: bool,
     /// Dev mode: serve /assets and / from this directory at request time
-    /// instead of from the embedded bundle. JS/CSS/HTML edits show up on
-    /// browser refresh without rebuild. Set $GRAPH_RENDERER_ASSETS_DIR or
-    /// pass --assets-dir.
+    /// instead of from the embedded bundle.
     #[arg(long, env = "GRAPH_RENDERER_ASSETS_DIR")]
     assets_dir: Option<PathBuf>,
-    /// URL of the graph-compute gRPC worker (e.g. `http://[::1]:50051`).
-    /// When unset, the compute broker is disabled: `/compute/health`
-    /// reports `connected: false` and `/graph/layout/stream` returns 503,
-    /// but graph-api stops trying to dial — useful for local sessions
-    /// that run the in-browser wgpu sim and don't need a remote worker.
+    /// URL of the graph-compute gRPC worker. When unset, the compute broker
+    /// is disabled.
     #[arg(long, env = "JUMP_CANNON_COMPUTE_URL")]
     compute_url: Option<String>,
+    /// Disable the filesystem watcher. Useful for one-shot CLI usage; the
+    /// docker container leaves this unset so live reload works.
+    #[arg(long, env = "GRAPH_API_NO_WATCH")]
+    no_watch: bool,
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Load .env if present in cwd or any parent. No error if missing.
     let _ = dotenvy::dotenv();
 
     tracing_subscriber::fmt()
@@ -51,20 +57,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .vault_root
         .unwrap_or_else(|| std::env::current_dir().unwrap());
 
-    let graph = vault_loader::load(&vault_root);
+    // Shared progress log. Surfaces "Scanning vault / Computing metrics /
+    // Seeding positions / Rebuilding search index" task bars to the
+    // frontend footer via GET /progress.
+    let progress = Arc::new(ProgressLog::new());
+
+    // Initial vault load — emit progress events so the bootstrap fetch
+    // sees a populated /progress response on the first poll.
+    let graph = vault_loader::load_with_progress(&vault_root, Some(&progress));
 
     // Spawn vault-search before binding so /search can proxy to it.
-    // Falls back gracefully to title-contains if the binary isn't on PATH
-    // or fails to start (see crates/graph-api/src/server.rs::search).
+    let vault_search_id = progress.start("ingest", "Spawning vault-search");
     let vault_search = match graph_api::subprocess::VaultSearch::spawn(&vault_root).await {
         Ok(vs) => {
             tracing::info!(port = vs.port, "vault-search subprocess up");
+            progress.finish(vault_search_id);
             Some(std::sync::Arc::new(vs))
         }
         Err(e) => {
             tracing::warn!(
                 "vault-search unavailable: {e}; /search falls back to title-contains"
             );
+            progress.fail(vault_search_id, format!("{e}"));
             None
         }
     };
@@ -73,16 +87,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tracing::info!(assets_dir = %dir.display(), "dev mode: serving assets from disk");
     }
 
-    // Best-effort dial of the graph-compute worker. The broker is OPT-IN:
-    // we only spawn the reconnect loop when `--compute-url` / the env var
-    // `JUMP_CANNON_COMPUTE_URL` is set. Previously this defaulted to
-    // `http://[::1]:50051`, which produced a `WARN compute broker dial
-    // failed ... backoff_secs=30` line every 30s in every dev session
-    // that wasn't also running graph-compute. When unset:
-    //   * `/compute/health` reports `connected: false` with empty url.
-    //   * `/graph/layout/stream` returns 503 (existing behavior).
-    //   * No background dial loop runs — silent.
-    // Clients running the in-browser wgpu sim are unaffected.
     let compute_broker = ComputeBroker::new();
     if let Some(compute_url) = args.compute_url.clone() {
         let broker = compute_broker.clone();
@@ -103,16 +107,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let state = AppState::new(
-        vault_root,
+        vault_root.clone(),
         graph,
         vault_search,
         args.assets_dir,
         compute_broker,
+        progress.clone(),
     );
+
+    // Live reload: watch $VAULT_ROOT for `.md` changes and atomically
+    // swap a new GraphSnapshot into AppState. Skipped if --no-watch.
+    if !args.no_watch {
+        graph_api::watcher::spawn(state.clone());
+    } else {
+        tracing::info!("filesystem watcher disabled (--no-watch)");
+    }
 
     let app = router(state);
 
-    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], args.port));
+    let host: std::net::IpAddr = args.host.parse().unwrap_or_else(|_| {
+        tracing::warn!(host = %args.host, "invalid --host, defaulting to 127.0.0.1");
+        std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1))
+    });
+    let addr = std::net::SocketAddr::new(host, args.port);
     let listener = tokio::net::TcpListener::bind(addr).await?;
     let bound = listener.local_addr()?;
     let url = format!("http://{}/", bound);

@@ -43,6 +43,7 @@ pub fn router(state: AppState) -> Router {
         .route("/search", get(search))
         .route("/compute/health", get(compute_health))
         .route("/vault/page", put(vault_page_put))
+        .route("/progress", get(progress_poll))
         .with_state(state)
 }
 
@@ -288,6 +289,24 @@ async fn compute_health(State(s): State<AppState>) -> impl IntoResponse {
     axum::Json(status)
 }
 
+/// `GET /progress?since=<seq>` — tail of the server-side progress event
+/// log. The renderer polls this every ~250ms while it has any in-flight
+/// task and folds the events into its `Progress` sink (same enum, same
+/// footer UI). See `crate::progress` for the wire shape.
+#[derive(serde::Deserialize)]
+struct ProgressQuery {
+    #[serde(default)]
+    since: Option<u64>,
+}
+
+async fn progress_poll(
+    State(s): State<AppState>,
+    Query(p): Query<ProgressQuery>,
+) -> impl IntoResponse {
+    let resp = s.inner.progress.since(p.since.unwrap_or(0));
+    axum::Json(resp)
+}
+
 async fn index(State(s): State<AppState>) -> impl IntoResponse {
     asset_response(&s, "index.html")
 }
@@ -346,11 +365,13 @@ fn mime_for(path: &str) -> &'static str {
 /// to `/node/:id` without a translation step.
 async fn graph_ids(State(s): State<AppState>) -> impl IntoResponse {
     use axum::Json;
-    Json(s.inner.idx_to_id.clone())
+    let snap = s.snapshot();
+    Json(snap.idx_to_id.clone())
 }
 
 async fn graph_init(State(s): State<AppState>) -> impl IntoResponse {
-    let g = &s.inner.graph;
+    let snap = s.snapshot();
+    let g = &snap.graph;
     let palette: Vec<f32> = PALETTE.iter().flat_map(|rgb| rgb.iter().copied()).collect();
     let msg = proto::Init {
         n_nodes: g.node_count() as u32,
@@ -395,7 +416,8 @@ async fn graph_init(State(s): State<AppState>) -> impl IntoResponse {
 ///     row and leave the metric fields at zero (no PageRank for nodes that
 ///     aren't in the layout graph).
 async fn node_meta(State(s): State<AppState>, Path(id): Path<String>) -> impl IntoResponse {
-    if let Some(node) = s.inner.graph.nodes.get(&id) {
+    let snap = s.snapshot();
+    if let Some(node) = snap.graph.nodes.get(&id) {
         let frontmatter_json = serde_json::to_string(&node.meta.frontmatter)
             .unwrap_or_else(|_| "{}".into());
         // Read the full markdown body from disk. We don't pre-load
@@ -557,7 +579,8 @@ struct SearchParams {
 async fn search(State(s): State<AppState>, Query(p): Query<SearchParams>) -> impl IntoResponse {
     let limit = p.limit.unwrap_or(50);
     // Fast path: proxy to vault-search's /ids endpoint (Tantivy BM25).
-    if let Some(vs) = &s.inner.vault_search {
+    let vs_opt = s.inner.vault_search.load_full();
+    if let Some(vs) = vs_opt.as_deref() {
         let url = format!(
             "{}/ids?q={}&limit={}",
             vs.url(),
@@ -593,9 +616,9 @@ async fn search(State(s): State<AppState>, Query(p): Query<SearchParams>) -> imp
     }
 
     // Fallback: naive title-contains scan when vault-search isn't running.
+    let snap = s.snapshot();
     let q = p.q.to_lowercase();
-    let mut ids: Vec<String> = s
-        .inner
+    let mut ids: Vec<String> = snap
         .graph
         .nodes
         .iter()
@@ -641,15 +664,15 @@ async fn graph_edges(State(s): State<AppState>) -> impl IntoResponse {
 /// `/graph/edges`. Returns 503 if the in-memory graph hasn't loaded yet
 /// (mirrors `/graph/layout/stream`'s 503 pattern).
 async fn graph_csr_bin(State(s): State<AppState>) -> axum::response::Response {
-    let graph = &s.inner.graph;
-    if graph.nodes.is_empty() {
+    let snap = s.snapshot();
+    if snap.graph.nodes.is_empty() {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             "graph not loaded",
         )
             .into_response();
     }
-    let bytes = build_csr_bin(&s);
+    let bytes = build_csr_bin(&snap);
     let mut headers = HeaderMap::new();
     headers.insert(header::CONTENT_TYPE, HeaderValue::from_static(OCTET_CT));
     (StatusCode::OK, headers, bytes).into_response()
@@ -658,13 +681,13 @@ async fn graph_csr_bin(State(s): State<AppState>) -> axum::response::Response {
 /// Build the CSR byte buffer for `/graph/csr.bin`. Symmetrizes the edge list
 /// (force-sim neighbor lookup is undirected) using the same dense indexing
 /// `id_to_idx` already provides for the other binary endpoints.
-fn build_csr_bin(s: &AppState) -> Vec<u8> {
-    let n_nodes = s.inner.graph.nodes.len() as u32;
+fn build_csr_bin(snap: &crate::state::GraphSnapshot) -> Vec<u8> {
+    let n_nodes = snap.graph.nodes.len() as u32;
     let mut adj: Vec<Vec<u32>> = vec![Vec::new(); n_nodes as usize];
-    for edge in &s.inner.graph.edges {
+    for edge in &snap.graph.edges {
         let (Some(&src), Some(&tgt)) = (
-            s.inner.id_to_idx.get(&edge.source),
-            s.inner.id_to_idx.get(&edge.target),
+            snap.id_to_idx.get(&edge.source),
+            snap.id_to_idx.get(&edge.target),
         ) else {
             continue;
         };
@@ -703,12 +726,13 @@ async fn graph_metric(State(s): State<AppState>, Path(name): Path<String>) -> im
 /// process and cached as `Arc<[u8]>` in `binary_cache` under the
 /// reserved key "meta_summary".
 async fn graph_meta_summary(State(s): State<AppState>) -> impl IntoResponse {
-    if let Some(buf) = s.inner.binary_cache.get("meta_summary").cloned() {
+    let snap = s.snapshot();
+    if let Some(buf) = snap.binary_cache.get("meta_summary").cloned() {
         let mut headers = HeaderMap::new();
         headers.insert(header::CONTENT_TYPE, HeaderValue::from_static(PROTOBUF_CT));
         return (StatusCode::OK, headers, buf.to_vec()).into_response();
     }
-    let bytes = build_meta_summary_bytes(&s.inner.graph);
+    let bytes = build_meta_summary_bytes(&snap.graph);
     let mut headers = HeaderMap::new();
     headers.insert(header::CONTENT_TYPE, HeaderValue::from_static(PROTOBUF_CT));
     (StatusCode::OK, headers, bytes).into_response()
@@ -869,7 +893,8 @@ async fn layout_stream_loop(
 }
 
 fn cached_binary_response(s: &AppState, key: &str) -> axum::response::Response {
-    let Some(buf) = s.inner.binary_cache.get(key).cloned() else {
+    let snap = s.snapshot();
+    let Some(buf) = snap.binary_cache.get(key).cloned() else {
         return (StatusCode::NOT_FOUND, "unknown buffer").into_response();
     };
     let mut headers = HeaderMap::new();

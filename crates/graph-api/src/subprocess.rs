@@ -15,8 +15,22 @@ pub struct VaultSearch {
 
 impl VaultSearch {
     /// Spawn vault-search on a free port. Blocks until the server responds
-    /// to a probe (or times out after ~10s).
+    /// to a probe (or times out after ~10s). `rebuild = true` passes
+    /// `--rebuild`, forcing a clean reindex (used by the watcher path
+    /// after a vault reload).
     pub async fn spawn(vault_root: &Path) -> Result<Self, String> {
+        Self::spawn_inner(vault_root, false).await
+    }
+
+    /// Like [`spawn`] but passes `--rebuild` to force a clean reindex.
+    /// GUESS: vault-search has no explicit "refresh" RPC, so the
+    /// reload path drops the old child and spawns a fresh one with
+    /// `--rebuild`. If a refresh hook lands later, prefer that.
+    pub async fn spawn_rebuild(vault_root: &Path) -> Result<Self, String> {
+        Self::spawn_inner(vault_root, true).await
+    }
+
+    async fn spawn_inner(vault_root: &Path, rebuild: bool) -> Result<Self, String> {
         // Pick a free port up-front so we can both pass it as --port and
         // know what to probe. There's a tiny TOCTOU window between drop
         // and child bind, but it's fine in practice for localhost dev.
@@ -27,8 +41,11 @@ impl VaultSearch {
             .arg("--port")
             .arg(port.to_string())
             .arg("--host")
-            .arg("127.0.0.1")
-            .stdout(Stdio::piped())
+            .arg("127.0.0.1");
+        if rebuild {
+            cmd.arg("--rebuild");
+        }
+        cmd.stdout(Stdio::piped())
             .stderr(Stdio::piped());
         let child = cmd
             .spawn()

@@ -113,6 +113,13 @@ impl ApiClient {
         }
     }
 
+    /// `GET /progress?since=<seq>` — tail of the server-side progress
+    /// event log. Returns the response untyped (just bytes); decoding
+    /// is the caller's job (see `app::kick_off_progress_poll`).
+    pub async fn progress(&self, since: u64) -> Result<Vec<u8>, String> {
+        http_get_bytes(&self.url(&format!("/progress?since={since}"))).await
+    }
+
     /// `GET /compute/health` — `{ connected: bool, url: String }`.
     /// Used by the renderer to surface compute-broker liveness in the
     /// footer log. Returns `connected=false` when graph-api is up but

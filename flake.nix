@@ -240,6 +240,46 @@
           };
         };
 
+        # ----- graph-api service -----
+        #
+        # The graph-api container ingests $VAULT_ROOT at startup and watches
+        # for changes via inotify; progress is surfaced to the frontend
+        # footer via `GET /progress`. The compose service below bind-mounts
+        # the host's $VAULT_ROOT into /vault, and the pre-built trunk
+        # dist directory (`crates/graph-renderer/assets/dist`) into
+        # /assets. The latter is a PRECONDITION: there is currently no
+        # `graph-renderer-web` flake output (see the test-browser-rust
+        # note above), so the operator must `just wasm` once before
+        # `just dev-up` / `podman-compose up`. When that follow-up lands,
+        # the bind-mount becomes an internal Nix copy.
+        graphApiService = {
+          name = "graph-api";
+          port = 8765;
+          rustLog = "info";
+        };
+
+        graph-api-image = pkgs.dockerTools.buildLayeredImage {
+          name     = graphApiService.name;
+          tag      = "latest";
+          # vault-search is a sibling binary that graph-api spawns as a
+          # subprocess at startup. Bake it into the image's PATH alongside
+          # graph-api itself so the in-container spawn works without
+          # needing a separate sidecar.
+          contents = [ graph-api vault-search pkgs.cacert ];
+          config   = {
+            Cmd = [ "/bin/graph-api" ];
+            ExposedPorts."${toString graphApiService.port}/tcp" = {};
+            Env = [
+              "GRAPH_API_HOST=0.0.0.0"
+              "GRAPH_API_PORT=${toString graphApiService.port}"
+              "GRAPH_API_NO_BROWSER=1"
+              "GRAPH_RENDERER_ASSETS_DIR=/assets"
+              "VAULT_ROOT=/vault"
+              "RUST_LOG=${graphApiService.rustLog}"
+            ];
+          };
+        };
+
         yamlFmt = pkgs.formats.yaml {};
 
         docker-compose-yaml = yamlFmt.generate "docker-compose.yml" {
@@ -252,6 +292,35 @@
               RUST_LOG              = graphComputeService.rustLog;
             };
             restart = "unless-stopped";
+          };
+          # graph-api: ingests $VAULT_ROOT on boot, watches for changes,
+          # surfaces progress to the renderer via GET /progress.
+          services."${graphApiService.name}" = {
+            image       = "${graphApiService.name}:latest";
+            ports       = [ "${toString graphApiService.port}:${toString graphApiService.port}" ];
+            # Bind-mount the host vault read-only (the renderer's PUT
+            # /vault/page editor surface would need rw — flip to `:rw` if
+            # you're using that). Bind-mount the pre-built trunk dist
+            # so the in-container graph-api can serve / and /assets.
+            # `VAULT_ROOT` and `ASSETS_DIR` are host-side env vars; default
+            # both to the canonical in-repo paths.
+            volumes = [
+              # rw, not ro: the renderer's PUT /vault/page editor surface
+              # (commit c629cd7f) needs to write back to the vault.
+              "\${VAULT_ROOT:-./vault}:/vault:rw"
+              "\${ASSETS_DIR:-./crates/graph-renderer/assets/dist}:/assets:ro"
+            ];
+            environment = {
+              GRAPH_API_HOST              = "0.0.0.0";
+              GRAPH_API_PORT              = toString graphApiService.port;
+              GRAPH_API_NO_BROWSER        = "1";
+              GRAPH_RENDERER_ASSETS_DIR   = "/assets";
+              VAULT_ROOT                  = "/vault";
+              JUMP_CANNON_COMPUTE_URL     = "http://${graphComputeService.name}:${toString graphComputeService.port}";
+              RUST_LOG                    = graphApiService.rustLog;
+            };
+            depends_on = [ graphComputeService.name ];
+            restart    = "unless-stopped";
           };
         };
 
@@ -331,6 +400,22 @@
             fi
             echo "loading ${graphComputeService.name}:latest into podman..."
             podman load < ${graph-compute-image}
+            echo "loading ${graphApiService.name}:latest into podman..."
+            podman load < ${graph-api-image}
+            # graph-api in-container serves the trunk dist from /assets.
+            # Until graph-renderer-web is wired into crane, that path must
+            # exist on the host before compose starts.
+            ASSETS_DIR_DEFAULT="$PWD/crates/graph-renderer/assets/dist"
+            ASSETS_DIR="''${ASSETS_DIR:-$ASSETS_DIR_DEFAULT}"
+            if [ ! -f "$ASSETS_DIR/index.html" ]; then
+              echo "warn: no trunk dist at $ASSETS_DIR — graph-api will serve 404 for /" >&2
+              echo "  run 'just wasm' (or 'trunk build --release') first" >&2
+            fi
+            if [ -z "''${VAULT_ROOT:-}" ]; then
+              echo "warn: VAULT_ROOT not set; the compose mount will resolve to ./vault" >&2
+              echo "  export VAULT_ROOT=/abs/path/to/vault before 'just dev-up' for a real ingest" >&2
+            fi
+            export ASSETS_DIR
             echo "starting compose stack..."
             podman-compose up -d
           '';
@@ -376,7 +461,7 @@
         packages = {
           default          = graph-api;
           inherit vault-search graph-api graph-compute graph-layouts-wasm tvix-wasm;
-          inherit graph-compute-image docker-compose-yaml sky-task-yaml;
+          inherit graph-compute-image graph-api-image docker-compose-yaml sky-task-yaml;
           inherit test-browser;
         };
 
