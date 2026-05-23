@@ -117,7 +117,11 @@ fn section_panel_renders_each_section() {
         // header). Every other section has sliders / pickers / labels
         // and clears 100px easily. We assert > 30 for Instances and
         // >= 100 for everything else.
-        let threshold = if matches!(section, Section::Instances) { 30.0 } else { 100.0 };
+        // Section bodies no longer emit their own `─── Title ───`
+        // header rule (the chrome owns that now), so the legacy
+        // thresholds were lowered by roughly one header row (~20 px)
+        // to keep this assertion meaningful but not flaky.
+        let threshold = if matches!(section, Section::Instances) { 15.0 } else { 80.0 };
         assert!(
             advanced >= threshold,
             "section {:?} only advanced {advanced}px (threshold {threshold}) \
@@ -151,6 +155,7 @@ fn inspector_hidden_when_no_selection() {
             let mut req_nav: Option<String> = None;
             let mut req_url: Option<String> = None;
             let mut req_focus: Option<String> = None;
+            let mut req_page_save: Option<(String, String, String)> = None;
             let active_filters = graph_renderer::ui::query::ActiveFieldFilters::default();
             let mut data = InspectorData {
                 ids: &ids,
@@ -167,6 +172,9 @@ fn inspector_hidden_when_no_selection() {
                 requested_open_url: &mut req_url,
                 requested_focus_node: &mut req_focus,
                 field_index: None,
+                page_viewer_states: None,
+                markdown_cache: None,
+                requested_page_save: &mut req_page_save,
             };
             inspector::show(ctx, &mut state, &mut data);
         });
@@ -203,6 +211,7 @@ fn inspector_shown_when_selection() {
             let mut req_nav: Option<String> = None;
             let mut req_url: Option<String> = None;
             let mut req_focus: Option<String> = None;
+            let mut req_page_save: Option<(String, String, String)> = None;
             let active_filters = graph_renderer::ui::query::ActiveFieldFilters::default();
             let mut data = InspectorData {
                 ids: &ids,
@@ -219,6 +228,9 @@ fn inspector_shown_when_selection() {
                 requested_open_url: &mut req_url,
                 requested_focus_node: &mut req_focus,
                 field_index: None,
+                page_viewer_states: None,
+                markdown_cache: None,
+                requested_page_save: &mut req_page_save,
             };
             inspector::show(ctx, &mut state, &mut data);
         });
@@ -760,6 +772,7 @@ fn inspector_long_id_wraps_inside_panel() {
             let mut req_nav: Option<String> = None;
             let mut req_url: Option<String> = None;
             let mut req_focus: Option<String> = None;
+            let mut req_page_save: Option<(String, String, String)> = None;
             let active_filters = graph_renderer::ui::query::ActiveFieldFilters::default();
             let mut data = InspectorData {
                 ids: &ids,
@@ -776,6 +789,9 @@ fn inspector_long_id_wraps_inside_panel() {
                 requested_open_url: &mut req_url,
                 requested_focus_node: &mut req_focus,
                 field_index: None,
+                page_viewer_states: None,
+                markdown_cache: None,
+                requested_page_save: &mut req_page_save,
             };
             inspector::show(ctx, &mut state, &mut data);
         });

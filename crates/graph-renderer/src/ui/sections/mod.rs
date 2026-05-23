@@ -30,7 +30,10 @@ pub fn show(
     layout_registry: &LayoutRegistry,
     perf: &PerfCollector,
 ) {
-    header(ui, section.title());
+    // Title is rendered by the surrounding chrome (the `FloatingPanel`
+    // header in production, the SidePanel host in tests). Don't emit
+    // another `header(...)` rule here — it duplicates the title and
+    // adds noise to the dock surface.
     match section {
         Section::Filter => filter::show(ui, state),
         Section::Style => style::show(ui, state),

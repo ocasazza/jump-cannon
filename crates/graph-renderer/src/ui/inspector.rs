@@ -22,6 +22,7 @@ use std::collections::HashMap;
 use super::frontmatter_chip::{render_frontmatter_chips, ChipOutcome};
 use super::frontmatter_grid::show_frontmatter_grid;
 use super::floating::FloatingPanel;
+use super::page_viewer::{self, PageViewerActions, PageViewerState};
 use super::query::ActiveFieldFilters;
 use super::state::{AppState, ColorBy, PanelId};
 use super::theme::palette;
@@ -73,6 +74,22 @@ pub struct InspectorData<'a> {
     /// top-N vault tags, sorted by frequency. `None` while the fetch
     /// is in flight.
     pub field_index: Option<&'a crate::ui::field_index::FieldIndex>,
+    /// Per-node editor state for the embedded page viewer. Shared with
+    /// `app.rs::render_anchored_panel` — both surfaces mutate the same
+    /// `HashMap<NodeId, PageViewerState>` so an unsaved edit started in
+    /// one panel survives a hop to the other. `None` disables the page
+    /// viewer entirely (used in tests that don't wire the cache).
+    pub page_viewer_states: Option<&'a mut HashMap<String, PageViewerState>>,
+    /// Shared CommonMark cache so the markdown renderer keeps its parsed
+    /// AST + galley layout between frames. Same instance the anchored
+    /// panel uses.
+    pub markdown_cache: Option<&'a mut egui_commonmark::CommonMarkCache>,
+    /// Save request channel. Inspector writes `Some((node_id, path, body))`
+    /// when the user clicks Save (or Cmd+S). App drains and forwards into
+    /// `kick_off_page_save` — same plumbing the anchored panel uses, just
+    /// surfaced through a channel instead of a closure to keep the borrow
+    /// graph simple.
+    pub requested_page_save: &'a mut Option<(String, String, String)>,
 }
 
 /// Render the inspector. Returns the outer screen-space `Rect` of the
@@ -252,14 +269,12 @@ fn show_floating_window(
 /// (`show_floating`) renderers. Holds header (title + pin/collapse buttons),
 /// active-filter chip strip, and the scrollable section list.
 fn render_body(ui: &mut egui::Ui, state: &mut AppState, data: &mut InspectorData) {
-    // Header: title + pin/dock toggle + collapse chevron.
+    // Action row: pin/dock toggle + close chevron. The panel title is
+    // owned by the surrounding chrome (the `FloatingPanel` header in
+    // production, the host SidePanel/Window in the legacy paths) so
+    // we don't emit "Inspector" here — that produced a duplicated
+    // header stacked under the panel's own title bar.
     ui.horizontal(|ui| {
-        // Body-text title — TEXT (off-white) reads as ink.
-        ui.label(
-            egui::RichText::new("Inspector")
-                .color(palette::TEXT)
-                .strong(),
-        );
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             // Close button stays right-most so its position is
             // stable across the two render paths. Uses ✕ (not the
@@ -329,6 +344,7 @@ fn render_body(ui: &mut egui::Ui, state: &mut AppState, data: &mut InspectorData
             show_metadata(ui, idx, data);
             show_badges(ui, idx, data);
             show_frontmatter_section(ui, idx, data);
+            show_page_content(ui, idx, data);
             ui.add_space(8.0);
             // Compute neighbours once so `show_community` can
             // decide whether to fold them into the Community
@@ -823,6 +839,71 @@ fn show_frontmatter_section(ui: &mut egui::Ui, idx: u32, data: &InspectorData) {
         .show(ui, |ui| {
             show_frontmatter_grid(ui, &map, "inspector-frontmatter-grid");
         });
+}
+
+/// Render the editable Obsidian page-viewer for the focused node.
+///
+/// Mirrors the surface `app.rs::render_anchored_panel` paints for the
+/// click-promoted anchored card so the user gets the same editor whether
+/// they read the inspector or the anchored panel. Hidden when:
+///   * the node isn't a vault page (`page_viewer::is_obsidian_page`
+///     returns false — verified against `graph-api::server.rs`: real
+///     vault pages carry the on-disk doctype or `None`, and the
+///     stub-fallback for unknown ids carries `doctype = Some("external")`,
+///     which we want to skip),
+///   * `current_meta` is stale (its id has drifted from the selected
+///     node's id — same guard `show_badges` / `show_frontmatter_section`
+///     use to avoid painting against the wrong page),
+///   * the caller didn't wire `page_viewer_states` + `markdown_cache`
+///     (e.g. headless tests construct the inspector without the App's
+///     editor scaffolding).
+fn show_page_content(ui: &mut egui::Ui, idx: u32, data: &mut InspectorData) {
+    let id = match data.ids.get(idx as usize) {
+        Some(s) => s.as_str(),
+        None => return,
+    };
+    let Some(meta) = data.current_meta else {
+        return;
+    };
+    if !meta.id.is_empty() && meta.id != id {
+        return;
+    }
+    if !page_viewer::is_obsidian_page(meta) {
+        return;
+    }
+    // We need ALL three editor handles to render anything useful. If any
+    // is absent (test harness, missing wiring), bail silently — the
+    // inspector still shows metadata / badges / frontmatter above.
+    let (Some(states), Some(cache)) = (
+        data.page_viewer_states.as_deref_mut(),
+        data.markdown_cache.as_deref_mut(),
+    ) else {
+        return;
+    };
+
+    ui.add_space(8.0);
+    egui::CollapsingHeader::new(
+        egui::RichText::new("Page content").color(palette::TEXT),
+    )
+    .default_open(true)
+    .id_salt(("inspector-page-content", id))
+    .show(ui, |ui| {
+        let state = states.entry(meta.id.clone()).or_default();
+        let mut save_request: Option<(String, String)> = None;
+        {
+            let mut on_save = |path: &str, body: &str| {
+                save_request = Some((path.to_string(), body.to_string()));
+            };
+            let mut actions = PageViewerActions {
+                markdown_cache: cache,
+                on_save: &mut on_save,
+            };
+            page_viewer::show_in_panel(ui, state, meta, &mut actions);
+        }
+        if let Some((path, body)) = save_request {
+            *data.requested_page_save = Some((meta.id.clone(), path, body));
+        }
+    });
 }
 
 /// Apply the community tint to a badge if a tint is available,

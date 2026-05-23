@@ -119,10 +119,11 @@ test target='all' arg='':
                   GRAPH_COMPUTE_CANARY_URL="$URL" \
                   cargo test -p graph-compute --test canary -- --nocapture ;;
       browser)    just _test-browser ;;
+      browser-rust) just _test-browser-rust ;;
       regression) just _test-regression ;;
       perf)       just _test-perf ;;
       profile)    just _test-profile ;;
-      *) echo "unknown test target: {{target}} (try: cargo, fuzz, bench, canary, browser, regression, perf, profile)" >&2; exit 1 ;;
+      *) echo "unknown test target: {{target}} (try: cargo, fuzz, bench, canary, browser, browser-rust, regression, perf, profile)" >&2; exit 1 ;;
     esac
 
 # Format the workspace.
@@ -173,6 +174,14 @@ _test-browser: wasm
         cd tests/browser && npm install --silent --no-audit --no-fund; \
     fi
     cd tests/browser && node run.mjs
+
+# Rust-driven browser smoke test (foundation). Sibling to _test-browser
+# but the harness is a Rust binary (crates/test-browser) driving chromium
+# via CDP. The legacy Playwright suite is kept as a fallback while the
+# Rust assertion set grows. Output: target/test-browser-rust/{boot.png,
+# report.json}.
+_test-browser-rust: wasm
+    nix run .#test-browser-rust
 
 # Headless browser REGRESSION suite. Sibling to `test-browser`; shares
 # the same boot scaffolding (factored into tests/browser/harness.mjs)

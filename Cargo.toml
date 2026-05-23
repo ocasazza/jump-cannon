@@ -10,6 +10,7 @@ members = [
     "crates/vault-links",
     "crates/vault-search",
     "crates/tvix-wasm",
+    "crates/test-browser",
 ]
 
 [workspace.package]

@@ -77,7 +77,17 @@ pub struct App {
     search_inflight: HashSet<String>,
 
     // -- "previous-frame" trackers used to gate GPU writes -----------------
-    prev_style_key: Option<(SizeBy, ColorBy, ShapeBy, u32, u32, EdgeColorBy, [u32; 4], crate::data::PaletteId)>,
+    prev_style_key: Option<(
+        SizeBy,
+        ColorBy,
+        ShapeBy,
+        u32,
+        u32,
+        EdgeColorBy,
+        [u32; 4],
+        crate::data::PaletteId,
+        crate::ui::state::CommunitySource,
+    )>,
     prev_layout_key: Option<u64>,
     /// Last-applied gpu-force seed mode. `set_options` only updates the
     /// option struct in place — it does **not** re-run `precompute`, so a
@@ -274,11 +284,28 @@ pub struct App {
     /// cached `promoted_anchored_meta.body` on success.
     save_in_flight: Arc<Mutex<Option<(String, String, Result<(), String>)>>>,
 
+    /// One-shot pending-mode flag: when the hover-preview "Open editor"
+    /// button promotes a node, set this to the node id so the next
+    /// `show_in_panel` for that node force-switches to `ViewMode::Source`
+    /// (overriding the per-state default of `Rendered`). Consumed on use.
+    page_viewer_force_source: Option<String>,
+
     /// Inverted index of (field, value) -> node-idx buckets. Populated
     /// by a one-shot async `/graph/meta_summary` fetch in `kick_off_bootstrap`.
     field_index: Option<FieldIndex>,
     /// Async slot the meta_summary fetch task writes into.
     field_index_slot: Arc<Mutex<Option<Result<proto::MetaSummary, String>>>>,
+
+    /// Client-derived per-node categorical metric: hash of each node's
+    /// **first-sorted tag** (lexicographic byte order). Built once when
+    /// `field_index` first lands and used by:
+    ///   - `ColorBy::Tag` / `EdgeColorBy::Tag` (metric key `"tag"`)
+    ///   - the `community_source == Tag` override (substituted for the
+    ///     server's `community` metric when active).
+    ///
+    /// `None` until the meta_summary fetch lands. Nodes with no tags get
+    /// bucket id `0`.
+    tag_community_metric: Option<Vec<f32>>,
 
     /// Per-frame progress / log surface. Populated by both on-thread
     /// callers (layout warmup, palette previews) and async tasks (the
@@ -517,8 +544,10 @@ impl App {
             page_viewer_states: HashMap::new(),
             page_viewer_markdown_cache: egui_commonmark::CommonMarkCache::default(),
             save_in_flight: Arc::new(Mutex::new(None)),
+            page_viewer_force_source: None,
             field_index: None,
             field_index_slot,
+            tag_community_metric: None,
             progress,
             input_ctx: InputCtx::new(default_bindings()),
 
@@ -690,12 +719,54 @@ impl App {
                     fi.by_field.len(),
                     fi.by_field.values().map(|m| m.len()).sum::<usize>(),
                 );
+                // Precompute the tag-derived per-node metric (used by
+                // ColorBy::Tag, EdgeColorBy::Tag, and the
+                // `community_source == Tag` override). Re-derived once
+                // here so the per-frame `apply_style_to_gpu` doesn't pay
+                // the cost on every recompute.
+                self.tag_community_metric = fi.tag_primary_metric(self.ids.len());
                 self.field_index = Some(fi);
+                // Force a style recompute so the new metric flows into
+                // the GPU buffers without waiting for the user to wiggle
+                // a slider.
+                self.prev_style_key = None;
             }
             Err(e) => {
                 log::warn!("[graph-renderer] meta_summary fetch failed: {e}");
             }
         }
+    }
+
+    /// Build a per-style view of `self.metrics` that honours both the
+    /// `ColorBy::Tag` / `EdgeColorBy::Tag` metric key AND the
+    /// `community_source == Tag` override. When neither path needs the
+    /// tag-derived metric, the original `&self.metrics` is reused with
+    /// zero clones (Cow::Borrowed).
+    ///
+    /// Tag tiebreaker: each node's primary tag is the **first tag in
+    /// lexicographic byte order** drawn from its `tags` set. Untagged
+    /// nodes get bucket id `0`. See
+    /// `crate::ui::field_index::FieldIndex::tag_primary_metric`.
+    fn metrics_view(&self) -> std::borrow::Cow<'_, HashMap<String, Vec<f32>>> {
+        let Some(tag_m) = self.tag_community_metric.as_ref() else {
+            return std::borrow::Cow::Borrowed(&self.metrics);
+        };
+        let override_community =
+            self.state.style.community_source == crate::ui::state::CommunitySource::Tag;
+        // Skip the clone if no consumer needs the tag metric. The
+        // categorical-key list mirrors `colors_from_metric` /
+        // `edge_colors_from_metric` / `shapes_from_metric`.
+        let needs_tag_key = self.state.style.color_by == ColorBy::Tag
+            || self.state.style.edge_color_by == EdgeColorBy::Tag;
+        if !override_community && !needs_tag_key {
+            return std::borrow::Cow::Borrowed(&self.metrics);
+        }
+        let mut m = self.metrics.clone();
+        m.insert("tag".to_string(), tag_m.clone());
+        if override_community {
+            m.insert("community".to_string(), tag_m.clone());
+        }
+        std::borrow::Cow::Owned(m)
     }
 
     /// Drain a completed `/node/:id` fetch into the modal state, if any.
@@ -907,9 +978,12 @@ impl App {
         }
 
         // Initial colors / sizes from the user's persisted style choice.
+        // `metrics_view` substitutes the tag-derived metric for the
+        // `"tag"` key and (when `community_source == Tag`) for `"community"`.
+        let mv = self.metrics_view();
         let colors = data::colors_from_metric(
             self.state.style.color_by.metric_key(),
-            &self.metrics,
+            mv.as_ref(),
             n_nodes,
             self.state.style.palette,
         );
@@ -919,6 +993,7 @@ impl App {
             n_nodes,
             apply_size_scale(self.state.style.size_mul, self.state.style.log_scale_size),
         );
+        drop(mv);
         let graph = GraphData {
             positions: bootstrap.positions,
             edges: bootstrap.edges,
@@ -1098,6 +1173,10 @@ impl eframe::App for App {
             let mut requested_navigate: Option<String> = None;
             let mut requested_open_url: Option<String> = None;
             let mut requested_focus_node: Option<String> = None;
+            // (node_id, path, body) — drained below into `kick_off_page_save`
+            // so the embedded page viewer inside the inspector shares the
+            // same save plumbing as the anchored panel.
+            let mut requested_page_save: Option<(String, String, String)> = None;
             {
                 // Surface frontmatter-derived chips for the focused node.
                 // The modal's `current` is populated by `/node/:id` fetches
@@ -1127,6 +1206,9 @@ impl eframe::App for App {
                     requested_open_url: &mut requested_open_url,
                     requested_focus_node: &mut requested_focus_node,
                     field_index: self.field_index.as_ref(),
+                    page_viewer_states: Some(&mut self.page_viewer_states),
+                    markdown_cache: Some(&mut self.page_viewer_markdown_cache),
+                    requested_page_save: &mut requested_page_save,
                 };
                 ui::inspector::show_floating(ctx, &mut self.state, &mut data);
                 let inspector_rect: Option<egui::Rect> = None;
@@ -1156,6 +1238,9 @@ impl eframe::App for App {
                 self.focus_node_by_id(frame, &id);
             } else if let Some(target) = requested_navigate {
                 self.kick_off_node_fetch(target);
+            }
+            if let Some((node_id, path, body)) = requested_page_save {
+                self.kick_off_page_save(node_id, path, body);
             }
             if let Some(href) = requested_open_url {
                 #[cfg(target_arch = "wasm32")]
@@ -1683,7 +1768,17 @@ impl App {
         }
     }
 
-    fn style_key(&self) -> (SizeBy, ColorBy, ShapeBy, u32, u32, EdgeColorBy, [u32; 4], crate::data::PaletteId) {
+    fn style_key(&self) -> (
+        SizeBy,
+        ColorBy,
+        ShapeBy,
+        u32,
+        u32,
+        EdgeColorBy,
+        [u32; 4],
+        crate::data::PaletteId,
+        crate::ui::state::CommunitySource,
+    ) {
         let ec = self.state.style.edge_color;
         (
             self.state.style.size_by,
@@ -1699,6 +1794,7 @@ impl App {
                 ec[3].to_bits(),
             ],
             self.state.style.palette,
+            self.state.style.community_source,
         )
     }
 
@@ -1733,9 +1829,12 @@ impl App {
         }
         let queue = wgpu_state.queue.clone();
         let n = self.ids.len();
+        // Metrics view honours `ColorBy::Tag` / `EdgeColorBy::Tag` and
+        // the `community_source == Tag` override in one shot.
+        let mv = self.metrics_view();
         let colors = data::colors_from_metric(
             self.state.style.color_by.metric_key(),
-            &self.metrics,
+            mv.as_ref(),
             n,
             self.state.style.palette,
         );
@@ -1747,7 +1846,7 @@ impl App {
         );
         let shapes = data::shapes_from_metric(
             self.state.style.shape_by.metric_key(),
-            &self.metrics,
+            mv.as_ref(),
             n,
         );
         let edge_color_by = self.state.style.edge_color_by;
@@ -1771,7 +1870,7 @@ impl App {
                 } else {
                     data::edge_colors_from_metric(
                         edge_color_by.metric_key(),
-                        &self.metrics,
+                        mv.as_ref(),
                         n,
                         pipes.edges_cpu(),
                         edge_fallback,
@@ -1781,6 +1880,7 @@ impl App {
                 pipes.update_edge_colors(&queue, edge_colors);
             }
         }
+        drop(mv);
         self.prev_style_key = Some(key);
         // Force a selection re-push so the dim alpha overlays the new colours.
         self.prev_selected_hash = None;
@@ -2478,6 +2578,9 @@ impl App {
         // intents up through the show() call.
         let resnap_flag = std::cell::Cell::new(false);
         let close_flag = std::cell::Cell::new(false);
+        // Set by the hover-preview "Open editor" affordance: promote this
+        // node + force the page viewer into Source mode on the next frame.
+        let open_editor_flag = std::cell::Cell::new(false);
 
         let panel_id_tag = if promoted { "anchored-promoted" } else { "hover-preview" };
         let panel = crate::ui::anchored::AnchoredPanel::new(
@@ -2546,6 +2649,23 @@ impl App {
                         {
                             resnap_flag.set(true);
                         }
+                        // Hover-preview affordance: when this is a vault
+                        // page, surface a one-click path into the editable
+                        // Source tab. Without this, the only way into the
+                        // editor is to click the node (which promotes the
+                        // panel) — discoverability problem the hover-only
+                        // path silently failed.
+                        if !promoted
+                            && crate::ui::page_viewer::is_obsidian_page(&meta)
+                            && ui
+                                .small_button(egui::RichText::new("edit").color(
+                                    crate::ui::theme::palette::ICON,
+                                ))
+                                .on_hover_text("Open editor (Source tab)")
+                                .clicked()
+                        {
+                            open_editor_flag.set(true);
+                        }
                     });
                 });
             });
@@ -2574,10 +2694,22 @@ impl App {
                 promoted && crate::ui::page_viewer::is_obsidian_page(&meta);
             if use_page_viewer {
                 ui.separator();
+                // Consume any pending force-source request keyed on this
+                // node id (set by the hover-preview "Open editor" button).
+                let force_source = matches!(
+                    self.page_viewer_force_source.as_deref(),
+                    Some(id) if id == meta.id.as_str()
+                );
+                if force_source {
+                    self.page_viewer_force_source = None;
+                }
                 let state = self
                     .page_viewer_states
                     .entry(meta.id.clone())
                     .or_default();
+                if force_source {
+                    state.mode = crate::ui::page_viewer::ViewMode::Source;
+                }
                 let mut save_request: Option<(String, String)> = None;
                 {
                     let mut on_save = |path: &str, body: &str| {
@@ -2656,6 +2788,19 @@ impl App {
             // Don't clear the drag offset — if the user later
             // re-promotes this node, restoring their offset is the
             // friendlier default.
+        }
+        // Hover-preview → editor handoff. Promote this idx (so the
+        // page viewer branch fires next frame), seed the cached meta
+        // from the hover slot to avoid an empty-render flash, and
+        // queue the force-source flag for `meta.id`.
+        if open_editor_flag.get() && !promoted {
+            let prev_promoted = self.promoted_anchored_idx;
+            self.promoted_anchored_idx = Some(idx);
+            if prev_promoted != Some(idx) {
+                self.promoted_anchored_meta = Some(meta.clone());
+                self.kick_off_promoted_anchored_fetch(meta.id.clone());
+            }
+            self.page_viewer_force_source = Some(meta.id.clone());
         }
     }
 

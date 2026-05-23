@@ -94,11 +94,21 @@ impl FloatingPanel {
             );
 
             ui.horizontal(|ui| {
+                // Panel toggles — left. The drag glyph is a passive
+                // affordance; the actual drag is handled by the outer
+                // egui::Window. Showing it tells the user where to
+                // grab the panel.
+                ui.label(
+                    egui::RichText::new("\u{2261}")
+                        .font(theme::mono(theme::font_size::HEADING))
+                        .color(palette::GREY),
+                );
                 ui.label(
                     egui::RichText::new(title)
                         .font(theme::mono(theme::font_size::HEADING))
                         .color(palette::TEXT),
                 );
+                // View controls — right.
                 ui.with_layout(
                     egui::Layout::right_to_left(egui::Align::Center),
                     |ui| {

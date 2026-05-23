@@ -29,12 +29,21 @@ eframe   = { version = "0.30", default-features = false, features = ["default_fo
 egui     = "0.30"
 egui-wgpu = "0.30"
 egui_plot = "0.30"
-# Markdown rendering for the node-detail modal body. egui_commonmark
-# tracks egui's version line — 0.18 is the release built against
-# egui 0.30. Default features include pulldown-cmark parsing + syntect
-# code-block highlighting; we disable syntect features so we don't
-# double-link the syntect crate already in our dep graph.
-egui_commonmark = { version = "0.19", default-features = false, features = ["pulldown_cmark"] }
+# Used for syntax-highlighted code in the page viewer (Source tab + rendered
+# preview code blocks). The `syntect` feature pulls syntect with the
+# `default-fancy` preset, which selects `regex-fancy` (pure Rust) so the
+# wasm32 build stays C-library-free. The existing top-level `syntect` dep
+# enables `regex-fancy` too, so Cargo's feature unification doesn't pull
+# `regex-onig` into the graph.
+egui_extras = { version = "0.30", default-features = false, features = ["syntect"] }
+# Markdown rendering for the node-detail modal body and the page-viewer
+# `Rendered` tab. `better_syntax_highlighting` enables syntect-driven
+# highlighting of fenced code blocks. The backend feature pulls
+# syntect with `default-fancy` (regex-fancy, pure Rust) so the wasm32
+# build stays C-library-free — same syntect flavour the top-level
+# `syntect` and `egui_extras/syntect` deps use, so Cargo's feature
+# unification keeps the dep graph single-flavour.
+egui_commonmark = { version = "0.19", default-features = false, features = ["pulldown_cmark", "better_syntax_highlighting"] }
 web-time = "1"
 log      = "0.4"
 include_dir = "0.7"

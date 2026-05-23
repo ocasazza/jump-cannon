@@ -1,0 +1,23 @@
+[package]
+name = "test-browser"
+version = "0.1.0"
+edition = "2021"
+
+# Foundation for the Rust-driven browser regression suite. The legacy
+# tests/browser/*.mjs Playwright suite remains as a fallback while this
+# matures.
+[[bin]]
+name = "test-browser"
+path = "src/main.rs"
+
+[dependencies]
+chromiumoxide = { version = "0.9", default-features = false }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "process", "fs", "time", "sync", "net", "io-util"] }
+futures = "0.3"
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+base64 = "0.22"

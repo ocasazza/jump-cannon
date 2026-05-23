@@ -128,6 +128,9 @@ pub enum ColorBy {
     Folder,
     Recency,
     Doctype,
+    /// Categorical tint by primary tag (first-sorted-tag hash, computed
+    /// client-side from the MetaSummary `tags` field index).
+    Tag,
 }
 
 impl ColorBy {
@@ -136,6 +139,7 @@ impl ColorBy {
         ColorBy::Folder,
         ColorBy::Recency,
         ColorBy::Doctype,
+        ColorBy::Tag,
     ];
     pub fn label(self) -> &'static str {
         match self {
@@ -143,6 +147,7 @@ impl ColorBy {
             ColorBy::Folder => "Folder",
             ColorBy::Recency => "Recency",
             ColorBy::Doctype => "Doctype",
+            ColorBy::Tag => "Tag",
         }
     }
     pub fn metric_key(self) -> &'static str {
@@ -151,6 +156,7 @@ impl ColorBy {
             ColorBy::Folder => "folder",
             ColorBy::Recency => "recency",
             ColorBy::Doctype => "doctype",
+            ColorBy::Tag => "tag",
         }
     }
 }
@@ -210,6 +216,10 @@ pub enum EdgeColorBy {
     Community,
     Folder,
     Doctype,
+    /// Categorical tint by primary tag (first-sorted-tag hash). Edges
+    /// whose endpoints share a primary tag get the tag's palette swatch;
+    /// "bridging" edges fall back to the uniform `edge_color`.
+    Tag,
 }
 
 impl EdgeColorBy {
@@ -218,6 +228,7 @@ impl EdgeColorBy {
         EdgeColorBy::Community,
         EdgeColorBy::Folder,
         EdgeColorBy::Doctype,
+        EdgeColorBy::Tag,
     ];
     pub fn label(self) -> &'static str {
         match self {
@@ -225,6 +236,7 @@ impl EdgeColorBy {
             EdgeColorBy::Community => "Community",
             EdgeColorBy::Folder => "Folder",
             EdgeColorBy::Doctype => "Doctype",
+            EdgeColorBy::Tag => "Tag",
         }
     }
     /// `Bootstrap.metrics` key for the underlying categorical metric.
@@ -235,6 +247,33 @@ impl EdgeColorBy {
             EdgeColorBy::Community => "community",
             EdgeColorBy::Folder => "folder",
             EdgeColorBy::Doctype => "doctype",
+            EdgeColorBy::Tag => "tag",
+        }
+    }
+}
+
+/// Whether the `community` categorical metric (consumed by
+/// `ColorBy::Community`, `EdgeColorBy::Community`, `ShapeBy::Community`)
+/// is sourced from the server-side Louvain result or derived
+/// client-side from each node's primary tag (first sorted tag's hash).
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Default, Hash)]
+pub enum CommunitySource {
+    /// Server's `metrics["community"]` (Louvain). Default — preserves
+    /// existing behaviour for persisted state.
+    #[default]
+    Computed,
+    /// Client-side override: replace the `community` metric with a hash
+    /// of each node's first-sorted-tag. Untagged nodes hash to bucket 0.
+    Tag,
+}
+
+impl CommunitySource {
+    pub const ALL: &'static [CommunitySource] =
+        &[CommunitySource::Computed, CommunitySource::Tag];
+    pub fn label(self) -> &'static str {
+        match self {
+            CommunitySource::Computed => "Computed (Louvain)",
+            CommunitySource::Tag => "By tag",
         }
     }
 }
@@ -294,6 +333,12 @@ pub struct StyleState {
     /// Default `Tableau20` so existing persisted state is unchanged.
     #[serde(default)]
     pub palette: crate::data::PaletteId,
+    /// Whether `community`-keyed visuals (ColorBy/EdgeColorBy/ShapeBy)
+    /// use the server's Louvain output (default) or a client-side
+    /// override derived from each node's primary tag. New field; old
+    /// persisted blobs load as `Computed`.
+    #[serde(default)]
+    pub community_source: CommunitySource,
 }
 
 fn default_edge_color() -> [f32; 4] { [0.227, 0.282, 0.502, 1.0] }
@@ -331,6 +376,7 @@ impl Default for StyleState {
             edge_fade_floor: default_edge_fade_floor(),
             edge_width: default_edge_width(),
             palette: crate::data::PaletteId::default(),
+            community_source: CommunitySource::default(),
         }
     }
 }

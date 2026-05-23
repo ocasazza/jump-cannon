@@ -396,7 +396,7 @@ pub fn node_color_for_key(
     if i >= v.len() {
         return None;
     }
-    let categorical = matches!(metric_key, "community" | "wcc" | "doctype" | "folder");
+    let categorical = matches!(metric_key, "community" | "wcc" | "doctype" | "folder" | "tag");
     let (r, g, b) = if categorical {
         let bucket = v[i].max(0.0) as u32;
         let c = palette_color(bucket, palette);
@@ -443,7 +443,7 @@ pub fn colors_from_metric(
     if v.len() < n {
         return default_colors(n);
     }
-    let categorical = matches!(metric_key, "community" | "wcc" | "doctype" | "folder");
+    let categorical = matches!(metric_key, "community" | "wcc" | "doctype" | "folder" | "tag");
     let mut out = Vec::with_capacity(n * 4);
     if categorical {
         for i in 0..n {

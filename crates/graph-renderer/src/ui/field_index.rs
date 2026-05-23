@@ -106,6 +106,48 @@ impl FieldIndex {
         Some(acc)
     }
 
+    /// Build a per-node categorical f32 metric where each node's value is
+    /// the bucket id derived from its **primary tag** — the first tag in
+    /// the node's `tags` set after sorting the tag strings
+    /// lexicographically (case-sensitive byte order, the same order
+    /// `BTreeMap` iteration would yield). This is the deterministic
+    /// tiebreaker for nodes with multiple tags.
+    ///
+    /// The bucket id is `hash(primary_tag) as u32` truncated to non-negative
+    /// f32-representable range (the palette consumer `% palette.len()`
+    /// cycles it anyway). Untagged nodes get bucket `0`.
+    ///
+    /// Returned vec has length `n_nodes`. Returns `None` if the index
+    /// has no `tags` field at all (no node carries any tag).
+    pub fn tag_primary_metric(&self, n_nodes: usize) -> Option<Vec<f32>> {
+        let tags = self.by_field.get("tags")?;
+        // Walk the (value -> [node_idx]) buckets in **sorted value order**
+        // so the first bucket that claims a node defines that node's
+        // primary tag — matching the "first sorted tag" tiebreaker.
+        let mut sorted: Vec<(&String, &Vec<u32>)> = tags.iter().collect();
+        sorted.sort_by(|a, b| a.0.cmp(b.0));
+        let mut out = vec![0.0_f32; n_nodes];
+        let mut assigned = vec![false; n_nodes];
+        for (value, idxs) in sorted {
+            // Hash the tag string to a u32 bucket id. Default Hasher is
+            // non-portable across rustc versions but stable within a
+            // process run — fine, we never persist the metric.
+            use std::collections::hash_map::DefaultHasher;
+            use std::hash::{Hash, Hasher};
+            let mut h = DefaultHasher::new();
+            value.hash(&mut h);
+            let bucket = (h.finish() as u32) as f32;
+            for &i in idxs {
+                let i = i as usize;
+                if i < n_nodes && !assigned[i] {
+                    out[i] = bucket;
+                    assigned[i] = true;
+                }
+            }
+        }
+        Some(out)
+    }
+
     pub fn values_for<'a>(&'a self, field: &str) -> Box<dyn Iterator<Item = &'a str> + 'a> {
         match self.by_field.get(field) {
             Some(map) => Box::new(map.keys().map(|s| s.as_str())),

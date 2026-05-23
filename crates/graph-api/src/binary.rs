@@ -32,6 +32,16 @@ pub fn edges_buffer(graph: &VaultGraph, id_to_idx: &HashMap<String, u32>) -> Vec
 }
 
 /// Per-metric flat f32 buffer. Returns None if the metric name is unknown.
+///
+/// The `tag` metric is a per-node categorical bucket id derived from the
+/// node's **primary tag** — the first tag in lexicographic byte order
+/// drawn from `node.meta.tags`. We pick the first sorted tag (rather
+/// than the array's natural order, which mirrors frontmatter authoring
+/// order) so the bucket assignment is deterministic regardless of how
+/// the user wrote the YAML. Untagged nodes hash to bucket `0`. The
+/// renderer mirrors this tiebreaker in
+/// `crate::ui::field_index::FieldIndex::tag_primary_metric` so the
+/// client-side and server-side derivations agree.
 pub fn metric_buffer(graph: &VaultGraph, name: &str) -> Option<Vec<u8>> {
     let mut out = Vec::with_capacity(graph.nodes.len() * 4);
     for node in graph.nodes.values() {
@@ -44,9 +54,25 @@ pub fn metric_buffer(graph: &VaultGraph, name: &str) -> Option<Vec<u8>> {
             "kcore"       => node.metrics.kcore as f32,
             "community"   => node.metrics.community as f32,
             "wcc"         => node.metrics.wcc as f32,
+            "tag"         => primary_tag_bucket(&node.meta.tags),
             _ => return None,
         };
         out.extend_from_slice(&v.to_le_bytes());
     }
     Some(out)
+}
+
+/// Hash the lexicographically-first tag in `tags` to a `u32` bucket id
+/// (cast to f32 for the wire format). Empty list → bucket `0`. The
+/// hasher (`DefaultHasher`) is **not** stable across rustc versions —
+/// we never persist these values, so process-stable is sufficient.
+fn primary_tag_bucket(tags: &[String]) -> f32 {
+    let mut sorted: Vec<&str> = tags.iter().map(|s| s.as_str()).collect();
+    sorted.sort_unstable();
+    let Some(primary) = sorted.first() else { return 0.0 };
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut h = DefaultHasher::new();
+    primary.hash(&mut h);
+    (h.finish() as u32) as f32
 }

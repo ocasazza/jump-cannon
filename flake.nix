@@ -121,6 +121,91 @@
           nativeBuildInputs = [ pkgs.protobuf ];
         });
 
+        # Foundation of the Rust-driven browser regression suite. The
+        # `test-browser` binary speaks CDP directly via chromiumoxide —
+        # no chromedriver, no playwright, no JS. It expects an already-
+        # running graph-api server and a chromium executable on the CLI.
+        # The `test-browser-rust` app below wires the full stack.
+        test-browser = craneLib.buildPackage (commonArgs // {
+          cargoArtifacts = depsNative;
+          cargoExtraArgs = "--package test-browser";
+        });
+
+        # `nix run .#test-browser-rust` — bring up graph-api + open the
+        # page in chromium with WebGPU enabled + run the Rust smoke test.
+        #
+        # NOTE: this wrapper currently depends on:
+        #   1. A pre-built trunk dist at `crates/graph-renderer/assets/dist`
+        #      (run `just wasm` or `trunk build --release` first). There is
+        #      no `graph-renderer-web` flake output yet — wiring trunk into
+        #      crane is a follow-up.
+        #   2. A test vault at /tmp/test-vault (auto-seeded by `just`
+        #      recipes; this wrapper also seeds a minimal one).
+        # The wrapper bails with a clear error if (1) is missing.
+        test-browser-rust = pkgs.writeShellApplication {
+          name = "test-browser-rust";
+          runtimeInputs = [
+            graph-api
+            test-browser
+            pkgs.chromium
+            pkgs.curl
+            pkgs.coreutils
+          ];
+          text = ''
+            set -euo pipefail
+
+            REPO_ROOT="''${REPO_ROOT:-$PWD}"
+            ASSETS_DIR="''${ASSETS_DIR:-$REPO_ROOT/crates/graph-renderer/assets/dist}"
+            VAULT="''${VAULT_ROOT:-/tmp/test-vault}"
+            PORT="''${TEST_PORT:-47896}"
+            OUT_DIR="''${OUT_DIR:-$REPO_ROOT/target/test-browser-rust}"
+
+            if [ ! -f "$ASSETS_DIR/index.html" ]; then
+              echo "error: no trunk dist at $ASSETS_DIR" >&2
+              echo "hint: run 'just wasm' (or 'trunk build --release') first." >&2
+              echo "  trunk-as-nix-derivation is not yet wired into the flake." >&2
+              exit 2
+            fi
+
+            mkdir -p "$VAULT" "$OUT_DIR"
+            if [ ! -f "$VAULT/Alpha.md" ]; then
+              printf 'See [[Beta]] and [[Gamma]].\n' > "$VAULT/Alpha.md"
+              printf '[[Alpha]]\n'                   > "$VAULT/Beta.md"
+              printf '[[Alpha]] [[Beta]]\n'          > "$VAULT/Gamma.md"
+            fi
+
+            # Software vulkan ICD for WebGPU on headless linux — mirrors the
+            # devshell's VK_ICD_FILENAMES setting.
+            if [ -z "''${VK_ICD_FILENAMES:-}" ] && [ -d ${pkgs.mesa}/share/vulkan/icd.d ]; then
+              export VK_ICD_FILENAMES=${pkgs.mesa}/share/vulkan/icd.d/lvp_icd.x86_64.json
+            fi
+
+            echo "→ starting graph-api on port $PORT…"
+            graph-api \
+              --vault-root "$VAULT" \
+              --port "$PORT" \
+              --no-browser \
+              --assets-dir "$ASSETS_DIR" &
+            SERVER_PID=$!
+            trap 'kill "$SERVER_PID" 2>/dev/null || true' EXIT
+
+            # Wait for /
+            for _ in $(seq 1 30); do
+              if curl -sf "http://127.0.0.1:$PORT/" > /dev/null; then
+                break
+              fi
+              sleep 1
+            done
+
+            echo "→ running test-browser…"
+            test-browser \
+              --base-url "http://127.0.0.1:$PORT" \
+              --chromium ${pkgs.chromium}/bin/chromium \
+              --out-dir "$OUT_DIR" \
+              --timeout-secs 60
+          '';
+        };
+
         # ----- Distributed compute backend: single source of truth -----
         # The same service spec drives both the local docker-compose stack
         # (`just dev-up`) and the SkyPilot cloud task (`just sky-up`). Edit
@@ -292,12 +377,14 @@
           default          = graph-api;
           inherit vault-search graph-api graph-compute graph-layouts-wasm tvix-wasm;
           inherit graph-compute-image docker-compose-yaml sky-task-yaml;
+          inherit test-browser;
         };
 
         apps = {
           render-stack-configs = { type = "app"; program = "${render-stack-configs}/bin/render-stack-configs"; };
           dev-up   = { type = "app"; program = "${dev-up}/bin/dev-up"; };
           dev-down = { type = "app"; program = "${dev-down}/bin/dev-down"; };
+          test-browser-rust = { type = "app"; program = "${test-browser-rust}/bin/test-browser-rust"; };
         };
 
         checks = {

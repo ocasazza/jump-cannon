@@ -1,7 +1,7 @@
 use eframe::egui;
 
 use crate::data::PaletteId;
-use crate::ui::state::{AppState, ColorBy, EdgeColorBy, ShapeBy, SizeBy};
+use crate::ui::state::{AppState, ColorBy, CommunitySource, EdgeColorBy, ShapeBy, SizeBy};
 
 use super::{reset_row, row};
 
@@ -26,6 +26,19 @@ pub fn show(ui: &mut egui::Ui, state: &mut AppState) {
             .show_ui(ui, |ui| {
                 for &v in ColorBy::ALL {
                     ui.selectable_value(&mut state.style.color_by, v, v.label());
+                }
+            });
+    });
+
+    // "Community source" override. Always-shown for discoverability —
+    // the underlying override is a no-op unless at least one of
+    // color_by / edge_color_by / shape_by is set to Community.
+    row(ui, "Community source", |ui| {
+        egui::ComboBox::from_id_salt("style-community-source")
+            .selected_text(state.style.community_source.label())
+            .show_ui(ui, |ui| {
+                for &v in CommunitySource::ALL {
+                    ui.selectable_value(&mut state.style.community_source, v, v.label());
                 }
             });
     });

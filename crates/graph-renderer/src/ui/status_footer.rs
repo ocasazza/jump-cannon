@@ -103,21 +103,10 @@ pub fn show_tray(ctx: &egui::Context, state: &mut AppState, progress: &Progress)
                     state.filter_strip_open = !state.filter_strip_open;
                 }
 
-                ui.add_space(8.0);
-                ui.separator();
-                ui.add_space(4.0);
-
-                if tray_icon_button(
-                    ui,
-                    draw_popout_icon,
-                    state.canvas_mount.is_floating(),
-                    "Pop out graph canvas",
-                )
-                .clicked()
-                {
-                    state.toggle_canvas_mount();
-                }
-
+                // View controls — right side. Within `right_to_left`,
+                // widgets render rightmost-first, so the running
+                // indicator comes first in the closure, then the
+                // separator, then the canvas pop-out icon.
                 ui.with_layout(
                     egui::Layout::right_to_left(egui::Align::Center),
                     |ui| {
@@ -135,6 +124,21 @@ pub fn show_tray(ctx: &egui::Context, state: &mut AppState, progress: &Progress)
                                     .size(10.0)
                                     .color(palette::GREY),
                             );
+                        }
+
+                        ui.add_space(4.0);
+                        ui.separator();
+                        ui.add_space(4.0);
+
+                        if tray_icon_button(
+                            ui,
+                            draw_popout_icon,
+                            state.canvas_mount.is_floating(),
+                            "Pop out graph canvas",
+                        )
+                        .clicked()
+                        {
+                            state.toggle_canvas_mount();
                         }
                     },
                 );

@@ -99,6 +99,17 @@ pub mod palette {
     /// as "ink" rather than the maximum-contrast LED-on-black look.
     pub const TEXT:   Color32 = Color32::from_rgb(0xD8, 0xD8, 0xDC);
 
+    /// Code-editor backdrop — a hair lighter than `BLACK` so the
+    /// Source tab in `page_viewer::show_in_panel` is visually
+    /// distinct from the surrounding panel chrome. Keeps the same
+    /// muted indigo cast as the rest of the neutrals so it doesn't
+    /// read as a foreign surface.
+    pub const EDITOR_BG: Color32 = Color32::from_rgb(0x10, 0x12, 0x1C);
+    /// Gutter fill — sits to the left of the code area, ~10% darker
+    /// than `EDITOR_BG` so line numbers float on their own surface
+    /// without a separator stroke.
+    pub const EDITOR_GUTTER_BG: Color32 = Color32::from_rgb(0x0A, 0x0C, 0x14);
+
     // Semantic. Derived at L=63%, S~45% (matching PURPLE's HSL anchor
     // so all four colors carry the same visual weight). See
     // `derive_semantic` for the math; values inlined here so this stays
