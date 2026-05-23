@@ -17,10 +17,39 @@ The test harness under `tests/browser/*.mjs` and `crates/test-browser/` is the o
 | `crates/graph-api` | axum HTTP server. Loads the vault, serves `/graph/*`, `/node/*id`, `/search`, `/vault/page` (editor PUT), `/progress`, etc. Watches `$VAULT_ROOT` via `notify` and atomically swaps the in-memory `GraphSnapshot` through `arc-swap`. |
 | `crates/graph-renderer` | Rust + wgpu + egui via eframe. Native binary + WASM (trunk-built). **All UI lives here**: the floating panel system (`ui/floating.rs`), inspector, editable page viewer (`ui/page_viewer.rs`), anchored hover/click cards (`ui/anchored.rs`), Instances panel with YAML export/import + state-snapshot timeline. |
 | `crates/graph-layouts` | wgpu compute force-sim. Native + WASM. |
-| `crates/graph-compute` | Optional standalone layout solver, gRPC on `[::1]:50051`. Opt-in via `--compute-url` / `GRAPH_API_COMPUTE_URL` — unset means the broker is never dialed. |
-| `crates/graph-metrics` | PageRank, Louvain, k-core, etc. |
-| `crates/vault-data`, `crates/vault-links`, `crates/vault-search` | Vault data pipeline: markdown parsing, link extraction, Tantivy index. |
-| `crates/test-browser` | Rust-only Chromium driver (chromiumoxide) for the foundational browser regression suite. |
+| `crates/graph-compute` | Optional standalone layout solver, gRPC on `[::1]:50051`. Opt-in via `--compute-url` / `GRAPH_API_COMPUTE_URL` — unset means the broker is never dialed. Deployable as the docker-compose service or via Sky-Pilot (`infra/sky/`). |
+| `crates/graph-metrics` | PageRank, Louvain, k-core, betweenness, weakly-connected-components. Stateless functions over `vault-data::Graph`. |
+| `crates/vault-data` | Shared domain types: `Node`, `Edge`, `Graph`, `FieldSchema`, the categorical color palette. Every other vault crate depends on it; no I/O. |
+| `crates/vault-links` | Wikilink extractor. Walks an Obsidian vault on disk, parses markdown + frontmatter, and produces a `VaultGraph`. The startup loader inside graph-api lives here. |
+| `crates/vault-search` | Standalone HTTP service. Tantivy-backed full-text + field search over the vault. Spawned by graph-api as a subprocess; respawned with `--rebuild` on every watcher-driven reload. |
+| `crates/jump-io` | Platform-agnostic input layer: semantic actions, rebindable triggers, per-device sensitivity. Decouples "what should happen" (e.g. `Pan`, `Zoom`, `Select`) from raw mouse/keyboard/touch events. Consumed by graph-renderer. |
+| `crates/tvix-wasm` | `tvix-eval` bridge — native + WASM Nix expression evaluator. Enables Nix expressions in the UI/data pipeline without shelling out. |
+| `crates/test-browser` | Rust-only Chromium driver (chromiumoxide) for the foundational browser regression suite. Spawned by `just test browser-rust` / `nix run .#test-browser-rust`. |
+
+## Data flow
+
+```
+$VAULT_ROOT (.md files)
+       │
+       ├──► vault-links ──► vault-data::Graph ──► graph-api (in-memory ArcSwap<GraphSnapshot>)
+       │                                                  │
+       │                                                  ├──► graph-metrics (computed once + on reload)
+       │                                                  │
+       │                                                  ├──► HTTP /graph/* /node/*id /vault/page /progress
+       │                                                  │           │
+       │                                                  │           ▼
+       │                                                  │     graph-renderer (WASM in browser, or native)
+       │                                                  │           │
+       │                                                  │           └──► graph-layouts (wgpu compute, in-process)
+       │                                                  │
+       │                                                  └──► graph-compute (optional gRPC, out-of-process layout)
+       │
+       └──► vault-search subprocess ──► tantivy index ──► HTTP /search
+
+graph-api notify watcher ──► debounce 400ms ──► rebuild Graph + respawn vault-search ──► emit /progress events
+```
+
+`jump-io` sits inside graph-renderer between raw egui input events and the semantic actions the UI consumes. `tvix-wasm` is the cross-target Nix evaluator (not yet on the hot path; available for future config surfaces).
 
 ## Build & development
 
