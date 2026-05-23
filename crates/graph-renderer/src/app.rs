@@ -2712,15 +2712,15 @@ impl App {
             if expanded {
                 // Expanded promoted panel: full inspector body
                 // (metrics + neighbours + community + frontmatter +
-                // editable page viewer when applicable), inside a
-                // bounded ScrollArea. `inspector::render_body` owns
-                // every section — same input contract the old
-                // free-standing inspector used.
+                // editable page viewer when applicable).
+                // `inspector::render_body` owns its own ScrollArea
+                // internally — don't wrap it in another one or two
+                // scrollbars + ambiguous wheel routing. Cap the
+                // height by setting `max_height` on `ui` and let
+                // render_body's inner ScrollArea fit inside it.
                 ui.separator();
-                egui::ScrollArea::vertical()
-                    .max_height(640.0)
-                    .auto_shrink([false; 2])
-                    .show(ui, |ui| {
+                ui.set_max_height(640.0);
+                {
                         let mut data = crate::ui::inspector::InspectorData {
                             ids: &self.ids,
                             metrics: &self.metrics,
@@ -2745,7 +2745,7 @@ impl App {
                             &mut self.state.tag_browser_query,
                             &mut data,
                         );
-                    });
+                }
             } else if !meta.body.is_empty() {
                 // Compact mode (both hover and promoted-but-collapsed):
                 // brief metadata snippet, no editor / no inspector body.
