@@ -16,7 +16,8 @@ use super::{subgroup_label, subgroup_separator};
 const CHART_HEIGHT: f32 = 70.0;
 const CHART_WINDOW_SECS: f64 = 10.0;
 
-pub fn show(ui: &mut egui::Ui, state: &AppState, perf: &PerfCollector) {
+pub fn show(ui: &mut egui::Ui, state: &mut AppState, perf: &PerfCollector) {
+    state.snapshot_source = Some("Debug".into());
     // Halted / running badge ------------------------------------------------
     let (dot_color, label) = if perf.last_halted {
         (accent::YELLOW, "halted")

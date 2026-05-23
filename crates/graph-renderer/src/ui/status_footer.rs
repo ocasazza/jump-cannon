@@ -60,9 +60,13 @@ pub fn show(
 /// Sticky Windows-taskbar-style tray strip across the bottom of the window.
 ///
 /// Renders the launcher row: one icon per `Section` (matches the old
-/// activity bar), then a divider, then dedicated Inspector + Filters
-/// icons. Clicking an icon toggles the corresponding floating panel's
-/// open state. Right edge carries the running-task indicator.
+/// activity bar), then a divider, then a dedicated Filters icon.
+/// Clicking an icon toggles the corresponding floating panel's open
+/// state. Right edge carries the running-task indicator. The right-side
+/// Inspector tray icon used to live next to Filters; it was removed
+/// when the inspector collapsed into the unified click-promoted
+/// anchored panel (expand/contract toggle in the panel header is the
+/// new "open inspector" affordance).
 pub fn show_tray(ctx: &egui::Context, state: &mut AppState, progress: &Progress) {
     use crate::ui::sidebar::draw_icon;
     use crate::ui::state::Section;
@@ -92,11 +96,6 @@ pub fn show_tray(ctx: &egui::Context, state: &mut AppState, progress: &Progress)
                 ui.separator();
                 ui.add_space(4.0);
 
-                if tray_icon_button(ui, draw_inspector_icon, state.inspector_open, "Inspector")
-                    .clicked()
-                {
-                    state.inspector_open = !state.inspector_open;
-                }
                 if tray_icon_button(ui, draw_filter_icon, state.filter_strip_open, "Filters")
                     .clicked()
                 {
@@ -170,25 +169,6 @@ fn tray_icon_button(
     painter.rect_filled(rect, 3.0, bg);
     paint(painter, rect, fg);
     response.on_hover_text(tooltip)
-}
-
-fn draw_inspector_icon(painter: &egui::Painter, rect: egui::Rect, color: egui::Color32) {
-    // Eye glyph: ellipse outline + pupil.
-    let center = rect.center();
-    let s = egui::Stroke::new(1.2, color);
-    let ellipse = egui::Rect::from_center_size(center, egui::vec2(14.0, 8.0));
-    // Approximate ellipse with two arcs (egui has no ellipse primitive).
-    let mut pts = Vec::with_capacity(32);
-    for i in 0..=24 {
-        let t = (i as f32 / 24.0) * std::f32::consts::TAU;
-        pts.push(egui::pos2(
-            center.x + 7.0 * t.cos(),
-            center.y + 4.0 * t.sin(),
-        ));
-    }
-    painter.add(egui::Shape::line(pts, s));
-    let _ = ellipse;
-    painter.circle_filled(center, 2.0, color);
 }
 
 fn draw_popout_icon(painter: &egui::Painter, rect: egui::Rect, color: egui::Color32) {

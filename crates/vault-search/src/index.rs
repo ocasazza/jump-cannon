@@ -14,6 +14,7 @@ use tantivy::{
 };
 
 use crate::walker::{list_markdown, parse_note, Note};
+use std::time::SystemTime;
 
 /// Tantivy index field handles, kept together so handlers don't have to
 /// re-resolve them on every request.
@@ -220,6 +221,66 @@ pub fn incremental_index(
     }
 
     Ok((added, updated, removed))
+}
+
+/// Incrementally refresh `paths` (each vault-relative, e.g. `foo/bar.md` or
+/// `foo/bar`). For each path:
+///   * file exists at `vault/<path>` → delete-by-id-term + add fresh doc.
+///   * file missing → delete-by-id-term only.
+/// Caller is responsible for `commit()` and `reader.reload()`.
+/// Returns `(updated, deleted, skipped)`. `updated` includes both adds and
+/// in-place replacements (no need to distinguish here — the writer treats
+/// them the same).
+pub fn refresh_paths(
+    writer: &mut IndexWriter,
+    fields: &Fields,
+    vault: &Path,
+    paths: &[String],
+) -> Result<(usize, usize, usize)> {
+    let mut updated = 0;
+    let mut deleted = 0;
+    let mut skipped = 0;
+    for p in paths {
+        // Canonicalize: strip leading `./`, strip `.md` extension to match
+        // the id scheme used by `walker::list_markdown`.
+        let cleaned = p.trim_start_matches("./").replace('\\', "/");
+        let id = cleaned
+            .strip_suffix(".md")
+            .unwrap_or(&cleaned)
+            .to_string();
+        // Always delete first so a "missing" path also removes a prior
+        // doc — and adding back over a delete in the same writer batch
+        // works correctly in Tantivy.
+        writer.delete_term(Term::from_field_text(fields.id, &id));
+
+        let abs = vault.join(format!("{id}.md"));
+        match std::fs::metadata(&abs) {
+            Ok(meta) => {
+                let mtime = meta
+                    .modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                match parse_note(&id, &abs, mtime) {
+                    Ok(note) => {
+                        add_doc(writer, fields, &note);
+                        updated += 1;
+                    }
+                    Err(e) => {
+                        tracing::warn!(?abs, error = %e, "refresh: skip unparseable");
+                        skipped += 1;
+                    }
+                }
+            }
+            Err(_) => {
+                // File doesn't exist (or unreadable) — the delete above
+                // is the whole story.
+                deleted += 1;
+            }
+        }
+    }
+    Ok((updated, deleted, skipped))
 }
 
 fn add_doc(writer: &IndexWriter, fields: &Fields, note: &Note) {

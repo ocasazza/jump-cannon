@@ -6,6 +6,7 @@ use crate::ui::theme::accent;
 use super::{reset_row, row, subgroup_separator};
 
 pub fn show(ui: &mut egui::Ui, state: &mut AppState) {
+    state.snapshot_source = Some("Camera".into());
     if reset_row(ui) {
         state.camera = Default::default();
     }

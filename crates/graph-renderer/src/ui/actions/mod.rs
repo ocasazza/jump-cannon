@@ -127,8 +127,6 @@ pub enum BuiltinAction {
     JumpToSection(Section),
     /// Open a new Graph tab in the central workspace dock.
     NewGraphTab,
-    /// Toggle the right-hand inspector sidebar open/collapsed.
-    ToggleInspector,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

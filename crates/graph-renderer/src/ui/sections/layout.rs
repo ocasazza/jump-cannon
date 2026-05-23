@@ -12,6 +12,7 @@ use crate::ui::state::AppState;
 use super::subgroup_separator;
 
 pub fn show(ui: &mut egui::Ui, state: &mut AppState, registry: &LayoutRegistry) {
+    state.snapshot_source = Some("Layout".into());
     // Algorithm picker. Step 1 only registers gpu-force, so the combo is
     // effectively a one-item list — but the wiring is here for Steps 2/3.
     let active_id = state.layout.active.clone();

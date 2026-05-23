@@ -65,6 +65,12 @@ pub fn show_floating(ctx: &egui::Context, state: &mut AppState) {
         return;
     }
 
+    // Attribute any mutations made inside the floating filter chip
+    // panel (chip toggles, combinator flips, behavior toggle, clear-
+    // all). `tick_snapshots` drains this every frame so a hover with
+    // no actual mutation can't bleed onto a later unrelated diff.
+    state.snapshot_source = Some("Filter: chip".into());
+
     FloatingPanel::new(PanelId::FilterStrip, "Filters")
         .default_pos([16.0, 620.0])
         .default_size([420.0, 360.0])

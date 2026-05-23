@@ -29,6 +29,7 @@
 //! events are heavily debounced by the virtualization layer — a 1-2s
 //! lag is normal.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -49,9 +50,12 @@ pub fn spawn(state: AppState) {
 
     // Reload signal channel. The notify callback runs on the notify
     // worker thread (sync); we hop into the tokio runtime via a
-    // bounded mpsc. `capacity = 1` because all we need is "dirty"
-    // signaling — bursts of events still collapse to a single reload.
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<()>(1);
+    // bounded mpsc. Each message is the set of relevant vault-relative
+    // `.md` paths that changed in this debounce window. A second burst
+    // arriving while the reload task is busy gets unioned in via the
+    // `try_recv` drain at the top of the reload loop so no edits are
+    // dropped.
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<HashSet<String>>(8);
 
     // The debouncer's handler runs on notify's worker thread. Keep it
     // tiny: filter, then try_send (drop if the channel already has a
@@ -70,9 +74,17 @@ pub fn spawn(state: AppState) {
                     return;
                 }
             };
-            let any_md = events.iter().any(|e| is_relevant(&watch_root, &e.path));
-            if any_md {
-                let _ = tx_evt.try_send(());
+            let mut paths: HashSet<String> = HashSet::new();
+            for e in &events {
+                if !is_relevant(&watch_root, &e.path) {
+                    continue;
+                }
+                if let Some(rel) = relative_md_path(&watch_root, &e.path) {
+                    paths.insert(rel);
+                }
+            }
+            if !paths.is_empty() {
+                let _ = tx_evt.try_send(paths);
             }
         },
     );
@@ -104,27 +116,78 @@ pub fn spawn(state: AppState) {
     // as the task does (dropping it stops the watch).
     tokio::spawn(async move {
         let _debouncer = debouncer; // keep alive
-        while rx.recv().await.is_some() {
-            // Drain any additional pending signals that arrived while
+        while let Some(mut paths) = rx.recv().await {
+            // Drain any additional pending batches that arrived while
             // we were blocked. try_recv loop coalesces a burst of
-            // edits into a single reload.
-            while rx.try_recv().is_ok() {}
+            // edits into a single reload, unioning their path sets so
+            // nothing is lost.
+            while let Ok(more) = rx.try_recv() {
+                paths.extend(more);
+            }
 
-            reload(&state).await;
+            reload_with_paths(&state, &paths).await;
         }
     });
 }
 
-/// Run one full reload: rebuild snapshot + respawn vault-search.
+/// Run one reload with a known set of changed `.md` paths (vault-relative).
+/// Rebuilds the graph snapshot, then attempts an incremental refresh of the
+/// vault-search index against just those paths. If refresh fails (no child
+/// running, HTTP error, lock poisoned, etc.) we fall back to a full
+/// `spawn_rebuild`, logging a warning so regressions are visible.
+pub async fn reload_with_paths(state: &AppState, paths: &HashSet<String>) {
+    rebuild_snapshot(state).await;
+
+    let progress = state.inner.progress.clone();
+    let path_vec: Vec<String> = paths.iter().cloned().collect();
+    let n = path_vec.len();
+
+    // Try incremental refresh first. We hold the current `Arc<VaultSearch>`
+    // across the await — the worst case is we POST to a child that's
+    // already been swapped out, the request fails, and we fall back.
+    let current = state.inner.vault_search.load();
+    if let Some(vs) = current.as_ref() {
+        let refresh_id = progress.start("ingest", format!("Refreshing search index ({n})"));
+        match vs.refresh(&path_vec).await {
+            Ok((updated, deleted, skipped)) => {
+                progress.info(
+                    "ingest",
+                    format!("search refresh: {updated} upserted, {deleted} deleted, {skipped} skipped"),
+                );
+                progress.finish(refresh_id);
+                return;
+            }
+            Err(e) => {
+                progress.warn(
+                    "ingest",
+                    format!("incremental refresh failed, falling back to rebuild: {e}"),
+                );
+                progress.fail(refresh_id, "refresh failed");
+                tracing::warn!(error = %e, "vault-search refresh failed; respawning");
+            }
+        }
+    }
+
+    // Fallback: full respawn with --rebuild.
+    respawn_search(state).await;
+}
+
+/// Run one full reload: rebuild snapshot + respawn vault-search. Used at
+/// startup-style code paths where there's no known change set.
 pub async fn reload(state: &AppState) {
+    rebuild_snapshot(state).await;
+    respawn_search(state).await;
+}
+
+/// Reload the in-memory `GraphSnapshot` from disk and atomically swap it
+/// into `state`. Does NOT touch vault-search.
+async fn rebuild_snapshot(state: &AppState) {
     let vault_root = state.inner.vault_root.clone();
     let progress = state.inner.progress.clone();
 
     let reload_id = progress.start("ingest", "Reloading vault");
     progress.info("ingest", "vault change detected");
 
-    // Heavy work — block on a worker thread so we don't stall the
-    // tokio runtime.
     let progress_load = progress.clone();
     let new_graph = tokio::task::spawn_blocking(move || {
         crate::vault_loader::load_with_progress(&vault_root, Some(&progress_load))
@@ -154,13 +217,16 @@ pub async fn reload(state: &AppState) {
     progress.finish(snap_id);
 
     state.inner.snapshot.store(snapshot);
+    progress.finish(reload_id);
+}
 
-    // Respawn vault-search against the new vault state. We can't keep
-    // the old child running (its index is stale) and vault-search has
-    // no in-place refresh hook today.
+/// Full respawn of the vault-search subprocess with `--rebuild`. Used as
+/// the fallback when incremental refresh fails or at startup-style paths.
+async fn respawn_search(state: &AppState) {
+    let progress = state.inner.progress.clone();
     let search_id = progress.start("ingest", "Rebuilding search index");
-    let vault_root2 = state.inner.vault_root.clone();
-    match crate::subprocess::VaultSearch::spawn_rebuild(&vault_root2).await {
+    let vault_root = state.inner.vault_root.clone();
+    match crate::subprocess::VaultSearch::spawn_rebuild(&vault_root).await {
         Ok(vs) => {
             state.inner.vault_search.store(Some(Arc::new(vs)));
             progress.finish(search_id);
@@ -169,8 +235,19 @@ pub async fn reload(state: &AppState) {
             progress.fail(search_id, format!("vault-search respawn: {e}"));
         }
     }
+}
 
-    progress.finish(reload_id);
+/// Convert an absolute event path to the vault-relative form vault-search
+/// expects (forward slashes, with `.md` extension preserved). Returns
+/// `None` if the path can't be made relative.
+fn relative_md_path(vault_root: &Path, path: &Path) -> Option<String> {
+    let rel = path.strip_prefix(vault_root).ok()?;
+    let s = rel.to_string_lossy().replace('\\', "/");
+    if s.is_empty() {
+        None
+    } else {
+        Some(s)
+    }
 }
 
 /// Filter: only `.md` files under `vault_root` whose path doesn't

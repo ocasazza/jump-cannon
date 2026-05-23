@@ -702,16 +702,6 @@ pub struct AppState {
     /// startup; only the live instance list survives a reload).
     #[serde(default)]
     pub action_instances: Vec<crate::ui::actions::ActionInstance>,
-    /// Right-hand inspector sidebar open/collapsed flag. Default true so
-    /// new users see it immediately on first node click.
-    #[serde(default = "default_inspector_open")]
-    pub inspector_open: bool,
-    /// When true, the inspector renders as a draggable floating
-    /// `egui::Window` instead of a docked `SidePanel::right`. Default
-    /// `false` so existing users see no change. A pin/unpin icon in
-    /// the inspector header toggles this at runtime.
-    #[serde(default)]
-    pub inspector_floating: bool,
     /// Status footer open/collapsed flag. Default false so the footer
     /// stays as an unobtrusive 24px strip until the user expands it.
     #[serde(default)]
@@ -767,6 +757,15 @@ pub struct AppState {
     /// "Restore" buttons. In-memory only — lost on full app restart.
     #[serde(skip)]
     pub snapshots: SnapshotRing,
+    /// Best-effort attribution label for the next auto-snapshot. UI
+    /// mutation sites (sections, palette, filter chips) set this before
+    /// they mutate; `App::tick_snapshots` drains it every frame so a
+    /// stale label from a no-op call never lingers to mislabel a later
+    /// unrelated diff. `None` falls back to `"misc"`. Skipped from
+    /// serialization so it never perturbs the hash-based diff in
+    /// `tick_snapshots` (and is never persisted).
+    #[serde(skip)]
+    pub snapshot_source: Option<String>,
 }
 
 impl AppState {
@@ -884,7 +883,6 @@ pub enum PanelId {
     /// Section panels are now per-`Section` floating panels — each gets
     /// its own egui memory key (`("floating", PanelId::Section(s))`).
     Section(Section),
-    Inspector,
     FilterStrip,
     Canvas,
 }
@@ -893,7 +891,6 @@ impl PanelId {
     pub fn label(self) -> &'static str {
         match self {
             PanelId::Section(s) => s.title(),
-            PanelId::Inspector => "Inspector",
             PanelId::FilterStrip => "Filters",
             PanelId::Canvas => "Graph",
         }
@@ -916,9 +913,13 @@ impl PanelId {
 // an independent floating panel. Old persisted blobs carry the removed
 // field, which serde would either error on or silently drop — bumping
 // invalidates the cached AppState exactly once per user.
-pub const STORAGE_KEY: &str = "graph_renderer_app_state_v3";
+// Bumped `_v3` → `_v4` when `inspector_open` + `inspector_floating` fields
+// were removed (right-side Inspector folded into the unified anchored
+// panel). Old persisted blobs carry the removed fields; serde would
+// silently drop them, but bumping the key keeps the invariant that
+// schema-breaking changes invalidate the cached blob exactly once.
+pub const STORAGE_KEY: &str = "graph_renderer_app_state_v4";
 
-fn default_inspector_open() -> bool { true }
 fn default_true() -> bool { true }
 
 impl AppState {
@@ -979,8 +980,6 @@ impl Default for AppState {
             sim_status: SimStatus::default(),
             query: QueryModel::default(),
             action_instances: Vec::new(),
-            inspector_open: default_inspector_open(),
-            inspector_floating: false,
             status_footer_open: false,
             tag_browser_query: String::new(),
             filter_strip_open: true,
@@ -993,6 +992,7 @@ impl Default for AppState {
             yaml_import_error: None,
             yaml_reset_armed: false,
             snapshots: SnapshotRing::default(),
+            snapshot_source: None,
         }
     }
 }

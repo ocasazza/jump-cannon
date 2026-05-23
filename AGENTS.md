@@ -58,7 +58,7 @@ The whole repo builds through **nix + crane + trunk**. No `npm install`, no `was
 - `nix build` — deployable bundle (server binary + WASM).
 - `just dev-up` — full dev stack: graph-api with file watcher, graph-compute optional, hot-reload via trunk watch.
 - `just dev-down` — symmetric teardown.
-- `just wasm` — `trunk build --release`. Required once before `just dev-up` until `graph-renderer-web` becomes a flake output.
+- `just wasm` — `trunk build --release`. Convenience for fast frontend iteration (pair with `ASSETS_DIR=$PWD/crates/graph-renderer/assets/dist just dev-up`). `dev-up` itself no longer requires it — the compose stack defaults to the nix-built `graph-renderer-web` derivation.
 - `just watch-wasm` — `trunk watch` (rebuilds WASM on change; pair with `just dev-up`).
 - `just run` — production binary, embedded assets, no watch.
 - `just kill` — purge stray graph-api / vault-search processes from prior runs.

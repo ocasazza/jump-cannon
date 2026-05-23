@@ -16,8 +16,8 @@ use tower_http::cors::{Any, CorsLayer};
 
 use crate::error::ApiError;
 use crate::index::{
-    full_index, incremental_index, lookup_node, read_existing_mtimes, run_search, IndexState,
-    IndexStatus,
+    full_index, incremental_index, lookup_node, read_existing_mtimes, refresh_paths, run_search,
+    IndexState, IndexStatus,
 };
 
 const DEFAULT_LIMIT: usize = 200;
@@ -35,6 +35,7 @@ pub fn router(state: IndexState) -> Router {
         .route("/ids", get(ids))
         .route("/node/:id", get(node))
         .route("/reindex", post(reindex))
+        .route("/refresh", post(refresh))
         .layer(cors)
         .with_state(Arc::new(state))
 }
@@ -130,6 +131,53 @@ async fn node(
         return Err(ApiError::NotFound);
     };
     Ok(Json(doc_to_json(&state, &doc)))
+}
+
+#[derive(Deserialize)]
+struct RefreshBody {
+    paths: Vec<String>,
+}
+
+/// Incrementally re-index the given vault-relative paths. For each path:
+///   * file exists → re-parse + upsert (delete-by-id-term, add).
+///   * file missing → delete-by-id-term only.
+///
+/// Returns `{ ok: true, updated, deleted, skipped }`. `updated` counts
+/// any path that resulted in an `add_document` (added or replaced);
+/// `deleted` counts paths whose docs were removed because the file
+/// vanished; `skipped` counts unparseable entries.
+async fn refresh(
+    State(state): State<Arc<IndexState>>,
+    Json(body): Json<RefreshBody>,
+) -> Result<Json<Value>, ApiError> {
+    // Don't gate on Ready — refreshes are safe to interleave with the
+    // initial index because they serialize on the writer lock. But the
+    // /search and /node endpoints will still surface NotReady if a
+    // request lands mid-rebuild.
+    let st = state.clone();
+    let (updated, deleted, skipped) = task::spawn_blocking(move || {
+        let mut writer = st.writer.write();
+        let res = refresh_paths(&mut writer, &st.fields, &st.vault, &body.paths);
+        if res.is_ok() {
+            let _ = writer.commit();
+        }
+        res
+    })
+    .await
+    .map_err(|e| ApiError::Internal(format!("join: {e}")))?
+    .map_err(|e| ApiError::Internal(format!("refresh: {e}")))?;
+
+    if let Err(e) = state.reader.reload() {
+        tracing::warn!(error = %e, "reader reload after refresh failed");
+    }
+    tracing::info!(updated, deleted, skipped, "refresh complete");
+
+    Ok(Json(json!({
+        "ok": true,
+        "updated": updated,
+        "deleted": deleted,
+        "skipped": skipped,
+    })))
 }
 
 async fn reindex(State(state): State<Arc<IndexState>>) -> impl IntoResponse {

@@ -6,6 +6,7 @@ use crate::ui::state::AppState;
 use super::{hint_label, reset_row, row, subgroup_label, subgroup_separator};
 
 pub fn show(ui: &mut egui::Ui, state: &mut AppState) {
+    state.snapshot_source = Some("Focus".into());
     if reset_row(ui) {
         state.focus = Default::default();
     }

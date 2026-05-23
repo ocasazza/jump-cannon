@@ -436,21 +436,6 @@ pub fn seed_default_actions(reg: &mut ActionRegistry) {
     });
 
     reg.register(Action {
-        id: "toggle-inspector".into(),
-        title: "Toggle Inspector".into(),
-        description: "Show or hide the right-hand inspector panel".into(),
-        keywords: words(&["inspector", "sidebar", "panel", "toggle", "right"]),
-        kind: ActionType::Singleton,
-        parameters: vec![],
-        parent_id: None,
-        children_ids: vec![],
-        category: Some("View".into()),
-        contextual: false,
-        shortcut: None,
-        handler: ActionHandler::Builtin(ToggleInspector),
-    });
-
-    reg.register(Action {
         id: "reset-style".into(),
         title: "Reset Style".into(),
         description: "Reset all node and edge style settings to defaults".into(),

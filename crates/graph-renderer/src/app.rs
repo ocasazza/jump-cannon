@@ -252,6 +252,14 @@ pub struct App {
     /// Distinct from `selected_node_idx` so promoted previews can
     /// coexist with a different inspector selection.
     promoted_anchored_idx: Option<u32>,
+    /// Per-node expanded/compact flag for the promoted anchored panel.
+    /// Toggled by the ⤢ / ⤡ button in the panel header. Lives on App
+    /// rather than AppState because it tracks an ephemeral UI gesture
+    /// keyed by `u32` indices that aren't stable across vault reloads
+    /// — the promoted panel itself is session-scoped (so is
+    /// `promoted_anchored_idx`), so the expanded map shares that
+    /// lifetime. Not serialized.
+    anchored_expanded: HashMap<u32, bool>,
     /// Per-node soft-tether drag offsets in screen pixels. The user
     /// grabs the panel header and drags; the per-frame delta is
     /// accumulated here. Cleared per-node on a "re-snap" click. The
@@ -283,12 +291,6 @@ pub struct App {
     /// so the drain logic can update the right `PageViewerState` AND the
     /// cached `promoted_anchored_meta.body` on success.
     save_in_flight: Arc<Mutex<Option<(String, String, Result<(), String>)>>>,
-
-    /// One-shot pending-mode flag: when the hover-preview "Open editor"
-    /// button promotes a node, set this to the node id so the next
-    /// `show_in_panel` for that node force-switches to `ViewMode::Source`
-    /// (overriding the per-state default of `Rendered`). Consumed on use.
-    page_viewer_force_source: Option<String>,
 
     /// Inverted index of (field, value) -> node-idx buckets. Populated
     /// by a one-shot async `/graph/meta_summary` fetch in `kick_off_bootstrap`.
@@ -356,12 +358,6 @@ pub struct App {
     /// throttle the auto-snapshotter — bursts of per-frame slider
     /// drags coalesce into one entry per `SNAPSHOT_INTERVAL` window.
     last_snapshot_at: Option<web_time::Instant>,
-    /// Best-effort attribution label for the next auto-snapshot.
-    /// Mutation sites set this before they mutate; the frame-tail
-    /// detector drains it on every tick (whether or not a diff is
-    /// observed) so a stale label from a no-op call never lands on a
-    /// later unrelated diff. `None` falls back to `"misc"`.
-    snapshot_source: Option<String>,
 }
 
 impl App {
@@ -596,13 +592,13 @@ impl App {
             hover_preview_pos: None,
             last_anchored_screen_pos: HashMap::new(),
             promoted_anchored_idx: None,
+            anchored_expanded: HashMap::new(),
             anchored_drag_offsets: HashMap::new(),
             promoted_anchored_meta: None,
             promoted_anchored_fetch: Arc::new(Mutex::new(None)),
             page_viewer_states: HashMap::new(),
             page_viewer_markdown_cache: egui_commonmark::CommonMarkCache::default(),
             save_in_flight: Arc::new(Mutex::new(None)),
-            page_viewer_force_source: None,
             field_index: None,
             field_index_slot,
             tag_community_metric: None,
@@ -618,7 +614,6 @@ impl App {
 
             snapshot_hash: None,
             last_snapshot_at: None,
-            snapshot_source: None,
         }
     }
 
@@ -882,93 +877,6 @@ impl App {
         pipes.raycast(ndc_x, ndc_y, screen_px)
     }
 
-    /// Draw a 1px leader line from the floating-inspector window's
-    /// nearest corner to the on-canvas projection of the selected node.
-    ///
-    /// Reads the live CPU position mirror (kept fresh by the GPU→CPU
-    /// position readback so picking tracks the running force-sim) and
-    /// projects through the *current* `pipes.camera` view-projection.
-    /// The aspect we feed into the projection comes from `canvas_rect`
-    /// rather than `pipes.camera.aspect` — same reasoning as
-    /// `raycast_idx`: the GraphCallback's `prepare()` won't have run
-    /// yet on this frame, so the camera's stored aspect may lag the
-    /// freshly-painted canvas.
-    fn draw_inspector_leader_line(
-        &self,
-        ctx: &egui::Context,
-        frame: &eframe::Frame,
-        window_rect: egui::Rect,
-        canvas_rect: egui::Rect,
-        idx: u32,
-    ) {
-        let Some(wgpu_state) = frame.wgpu_render_state() else { return };
-        let renderer = wgpu_state.renderer.read();
-        let Some(pipes) = renderer.callback_resources.get::<GraphPipelines>() else { return };
-        let positions = pipes.positions_cpu();
-        let i3 = (idx as usize).saturating_mul(3);
-        if i3 + 2 >= positions.len() {
-            return;
-        }
-        let world = glam::Vec3::new(positions[i3], positions[i3 + 1], positions[i3 + 2]);
-
-        // Build a view-proj that uses the canvas rect's aspect (matches
-        // what the canvas was painted with this frame, even before the
-        // GraphCallback's `prepare()` runs and updates camera.aspect).
-        let cam = &pipes.camera;
-        let aspect = (canvas_rect.width() / canvas_rect.height().max(0.0001)).max(0.0001);
-        let view = glam::Mat4::look_to_rh(cam.position, cam.forward(), glam::Vec3::Y);
-        let proj = glam::Mat4::perspective_rh(cam.fov_y, aspect, cam.znear, cam.zfar);
-        let clip = (proj * view) * world.extend(1.0);
-        if clip.w <= 0.0 {
-            return; // Behind the camera.
-        }
-        let ndc_x = clip.x / clip.w;
-        let ndc_y = clip.y / clip.w;
-        if !(-1.0..=1.0).contains(&ndc_x) || !(-1.0..=1.0).contains(&ndc_y) {
-            return; // Off-screen; skip rather than clamp.
-        }
-        // NDC y is up; egui screen y is down — flip on the y axis.
-        let screen_x = canvas_rect.left() + (ndc_x * 0.5 + 0.5) * canvas_rect.width();
-        let screen_y = canvas_rect.top() + (1.0 - (ndc_y * 0.5 + 0.5)) * canvas_rect.height();
-        let node_screen = egui::pos2(screen_x, screen_y);
-
-        // Find the closest of the four window corners. Euclidean
-        // distance reads cleaner as a "shortest visual line" than
-        // Manhattan: the latter biases toward cardinal directions and
-        // would pick awkward corners when the node sits at a 45°
-        // bearing from the window centre.
-        let corners = [
-            window_rect.left_top(),
-            window_rect.right_top(),
-            window_rect.left_bottom(),
-            window_rect.right_bottom(),
-        ];
-        let mut best = corners[0];
-        let mut best_d2 = f32::INFINITY;
-        for &c in &corners {
-            let d2 = (c - node_screen).length_sq();
-            if d2 < best_d2 {
-                best_d2 = d2;
-                best = c;
-            }
-        }
-
-        // Foreground-layer painter sits above the canvas central panel
-        // but below the floating Window (egui draws windows on top of
-        // Order::Foreground via their own per-window layer). This gives
-        // the visual effect of the line "coming out from under" the
-        // window edge.
-        let painter = ctx.layer_painter(egui::LayerId::new(
-            egui::Order::Foreground,
-            egui::Id::new("inspector-leader"),
-        ));
-        painter.line_segment(
-            [best, node_screen],
-            egui::Stroke::new(1.0, crate::ui::theme::palette::BORDER),
-        );
-        painter.circle_filled(node_screen, 2.5, crate::ui::theme::palette::ICON);
-    }
-
     fn try_promote_bootstrap_to_gpu(&mut self, frame: &mut eframe::Frame) {
         if self.loaded_into_gpu {
             return;
@@ -1213,110 +1121,12 @@ impl eframe::App for App {
             &self.perf,
         );
 
-        // Right-hand inspector panel — must run before the CentralPanel
-        // so the dock area auto-shrinks to fit. The inspector reads ids /
-        // metrics / edges from the cached bootstrap and can request a
-        // selection change which we drain immediately afterwards.
-        let mut requested_selection: Option<u32> = None;
-        {
-            // Snapshot a slice borrow from GraphPipelines edges — the
-            // call below releases the renderer lock before egui begins.
-            let edges_snapshot: Vec<u32> = if let Some(wgpu_state) = frame.wgpu_render_state() {
-                let renderer = wgpu_state.renderer.read();
-                renderer
-                    .callback_resources
-                    .get::<GraphPipelines>()
-                    .map(|p| p.edges_cpu().to_vec())
-                    .unwrap_or_default()
-            } else {
-                Vec::new()
-            };
-            let mut requested_filter_toggle: Option<(String, String)> = None;
-            let mut requested_navigate: Option<String> = None;
-            let mut requested_open_url: Option<String> = None;
-            let mut requested_focus_node: Option<String> = None;
-            // (node_id, path, body) — drained below into `kick_off_page_save`
-            // so the embedded page viewer inside the inspector shares the
-            // same save plumbing as the anchored panel.
-            let mut requested_page_save: Option<(String, String, String)> = None;
-            {
-                // Surface frontmatter-derived chips for the focused node.
-                // The modal's `current` is populated by `/node/:id` fetches
-                // and is keyed at the node we just selected — same source
-                // the modal renders from, so the inspector and modal show
-                // the same chip set for the same input.
-                let current_meta = self.modal.current.as_ref();
-                // Clone the active-filter snapshot so we can simultaneously
-                // hand `&mut self.state` to the inspector for its open-state
-                // / panel chrome — borrow checker won't let us reach into
-                // `self.state.query.active_filters` while a `&mut self.state`
-                // is in flight, and `ActiveFieldFilters` is cheap to clone
-                // (a few small BTrees with short string keys).
-                let active_filters_snapshot = self.state.query.active_filters.clone();
-                let mut data = ui::inspector::InspectorData {
-                    ids: &self.ids,
-                    metrics: &self.metrics,
-                    edges: &edges_snapshot,
-                    selected_idx: self.selected_node_idx,
-                    requested_selection: &mut requested_selection,
-                    requested_filter_toggle: &mut requested_filter_toggle,
-                    color_by: self.state.style.color_by,
-                    palette: self.state.style.palette,
-                    current_meta,
-                    active_filters: &active_filters_snapshot,
-                    requested_navigate: &mut requested_navigate,
-                    requested_open_url: &mut requested_open_url,
-                    requested_focus_node: &mut requested_focus_node,
-                    field_index: self.field_index.as_ref(),
-                    page_viewer_states: Some(&mut self.page_viewer_states),
-                    markdown_cache: Some(&mut self.page_viewer_markdown_cache),
-                    requested_page_save: &mut requested_page_save,
-                };
-                ui::inspector::show_floating(ctx, &mut self.state, &mut data);
-                let inspector_rect: Option<egui::Rect> = None;
-                // Floating-mode leader line: when the inspector is a
-                // floating window AND a node is selected AND the canvas
-                // is mounted, draw a 1px line from the window's nearest
-                // corner to the selected node's on-canvas position.
-                // Skipped when the node is off-screen (clip-w ≤ 0 or NDC
-                // outside [-1,1]) — simpler than clamping to the canvas
-                // edge and reads cleanly: line just disappears as the
-                // user pans the node out of view, reappears when it
-                // returns.
-                if let (Some(win_rect), Some(canvas_rect), Some(idx)) = (
-                    inspector_rect,
-                    self.prev_canvas_rect,
-                    self.selected_node_idx,
-                ) {
-                    self.draw_inspector_leader_line(ctx, frame, win_rect, canvas_rect, idx);
-                }
-            }
-            if let Some((f, v)) = requested_filter_toggle {
-                self.state.query.toggle_field_filter(&f, &v);
-            }
-            if let Some(id) = requested_focus_node {
-                // focus_node_by_id handles the modal refresh internally,
-                // so don't double-dispatch via `requested_navigate` below.
-                self.focus_node_by_id(frame, &id);
-            } else if let Some(target) = requested_navigate {
-                self.kick_off_node_fetch(target);
-            }
-            if let Some((node_id, path, body)) = requested_page_save {
-                self.kick_off_page_save(node_id, path, body);
-            }
-            if let Some(href) = requested_open_url {
-                #[cfg(target_arch = "wasm32")]
-                {
-                    if let Some(window) = web_sys::window() {
-                        let _ = window.open_with_url_and_target(&href, "_blank");
-                    }
-                }
-                #[cfg(not(target_arch = "wasm32"))]
-                {
-                    log::info!("[graph-renderer] open url (native no-op): {href}");
-                }
-            }
-        }
+        // The inspector body is no longer rendered as a standalone
+        // panel — it now lives inside the unified anchored panel
+        // (`render_anchored_panel`, called from `show_hover_preview`
+        // near the end of `update`). The channel-drain logic that
+        // used to live here moved to *after* `show_hover_preview`
+        // — see "post-anchored-panel inspector channel drain" below.
 
         // Drain any palette preview-fetch result from the previous frame
         // and kick off any new request the palette flagged. Done before
@@ -1343,7 +1153,7 @@ impl eframe::App for App {
                     .get(&action_id)
                     .map(|a| a.title.clone())
                     .unwrap_or_else(|| action_id.clone());
-                self.snapshot_source = Some(format!("palette: {label}"));
+                self.state.snapshot_source = Some(format!("palette: {label}"));
                 self.execute_action(frame, &action_id, params);
             }
             PaletteOutcome::OpenNode { id } => {
@@ -1553,12 +1363,11 @@ impl eframe::App for App {
                             .cloned();
                         self.kick_off_promoted_anchored_fetch(id.clone());
                     }
-                    // UX: surface the inspector if the user clicks a node
-                    // while it's collapsed. They almost certainly want to
-                    // see what they just clicked.
-                    if !self.state.inspector_open {
-                        self.state.inspector_open = true;
-                    }
+                    // (Previously: if the right-side inspector was
+                    // collapsed, a node-click force-opened it. The inspector
+                    // no longer exists as a separate surface — the promoted
+                    // anchored panel is the post-click default — so this
+                    // branch is gone.)
                     self.kick_off_node_fetch(id);
                 }
             } else {
@@ -1575,25 +1384,10 @@ impl eframe::App for App {
         // top of the existing UI layers.
         self.tick_hover_preview(pointer_in_canvas);
 
-        // Inspector requested a different selection (clicked a community
-        // sibling or neighbor pill). Drive the full focus path: camera
-        // slides to the node, sticky highlight follows, modal refreshes.
-        // `focus_node_by_id` internally calls kick_off_node_fetch, so the
-        // sidebar updates the same way it did before.
-        if let Some(idx) = requested_selection.take() {
-            self.selected_node_idx = Some(idx);
-            if !self.state.inspector_open {
-                self.state.inspector_open = true;
-            }
-            if let Some(id) = self.id_for_idx(idx) {
-                log::info!(
-                    "[graph-renderer] inspector selected idx={} id={}",
-                    idx,
-                    id
-                );
-                self.focus_node_by_id(frame, &id);
-            }
-        }
+        // (Inspector-requested selection drain moved to after
+        //  `show_hover_preview` — the inspector body is now embedded
+        //  in the anchored panel, so its channels are populated
+        //  during that paint pass and drained afterwards.)
 
         // Filter chip strip — sits above the canvas, below the modal.
         ui::filter_strip::show_floating(ctx, &mut self.state);
@@ -1663,7 +1457,48 @@ impl eframe::App for App {
         // Hover-preview card paint pass — runs after all other UI
         // layers so the card sits on top of canvas + sidebars. Cheap:
         // no-op when `hover_preview_open == false`.
-        self.show_hover_preview(ctx, frame);
+        //
+        // The unified anchored panel may render the inspector body in
+        // its expanded mode, which writes back through the same channels
+        // the old free-standing inspector used. Declare the channel
+        // bundle here, hand it to the paint pass, and drain afterwards.
+        let mut anchored_channels = AnchoredChannels::default();
+        self.show_hover_preview(ctx, frame, &mut anchored_channels);
+
+        // Post-anchored-panel inspector channel drain.
+        if let Some(idx) = anchored_channels.requested_selection.take() {
+            self.selected_node_idx = Some(idx);
+            if let Some(id) = self.id_for_idx(idx) {
+                log::info!(
+                    "[graph-renderer] inspector selected idx={} id={}",
+                    idx, id,
+                );
+                self.focus_node_by_id(frame, &id);
+            }
+        }
+        if let Some((f, v)) = anchored_channels.requested_filter_toggle.take() {
+            self.state.query.toggle_field_filter(&f, &v);
+        }
+        if let Some(id) = anchored_channels.requested_focus_node.take() {
+            self.focus_node_by_id(frame, &id);
+        } else if let Some(target) = anchored_channels.requested_navigate.take() {
+            self.kick_off_node_fetch(target);
+        }
+        if let Some((node_id, path, body)) = anchored_channels.requested_page_save.take() {
+            self.kick_off_page_save(node_id, path, body);
+        }
+        if let Some(href) = anchored_channels.requested_open_url.take() {
+            #[cfg(target_arch = "wasm32")]
+            {
+                if let Some(window) = web_sys::window() {
+                    let _ = window.open_with_url_and_target(&href, "_blank");
+                }
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                log::info!("[graph-renderer] open url (native no-op): {href}");
+            }
+        }
 
         // Detect filter-set empty<->non-empty transitions and auto-flip
         // the user's FocusMode so a badge click engages focus dim the same
@@ -1796,7 +1631,7 @@ impl App {
         // Drain attribution label up-front. Even if the diff check
         // below decides not to snapshot, we don't want a stale label
         // bleeding into the next genuine mutation.
-        let drained_source = self.snapshot_source.take();
+        let drained_source = self.state.snapshot_source.take();
 
         let json = match serde_json::to_string(&self.state) {
             Ok(s) => s,
@@ -1822,8 +1657,8 @@ impl App {
             if now.duration_since(last) < SNAPSHOT_INTERVAL {
                 // Restore the drained label so the next eligible
                 // tick within the same burst can still pick it up.
-                if self.snapshot_source.is_none() {
-                    self.snapshot_source = drained_source;
+                if self.state.snapshot_source.is_none() {
+                    self.state.snapshot_source = drained_source;
                 }
                 return;
             }
@@ -2546,7 +2381,12 @@ impl App {
     /// comment warned about doesn't happen here because the anchor
     /// is the node, not the cursor — the user can move the cursor
     /// freely between node and card.
-    fn show_hover_preview(&mut self, ctx: &egui::Context, frame: &eframe::Frame) {
+    fn show_hover_preview(
+        &mut self,
+        ctx: &egui::Context,
+        frame: &eframe::Frame,
+        channels: &mut AnchoredChannels,
+    ) {
         // Drain the promoted-anchored fetch slot first so we have
         // fresh meta available for this frame's paint.
         if let Some(Ok(Some(meta))) =
@@ -2602,14 +2442,16 @@ impl App {
         // never overlap (we skip hover when idx matches).
         if let Some(pidx) = promoted_idx {
             if let Some(meta) = self.promoted_anchored_meta.clone() {
-                self.render_anchored_panel(ctx, frame, canvas_rect, pidx, meta, true);
+                self.render_anchored_panel(ctx, frame, canvas_rect, pidx, meta, true, channels);
             }
         }
 
         if let Some(hidx) = hover_idx {
             if Some(hidx) != promoted_idx {
                 if let Some(meta) = self.hover_preview_meta.clone() {
-                    self.render_anchored_panel(ctx, frame, canvas_rect, hidx, meta, false);
+                    self.render_anchored_panel(
+                        ctx, frame, canvas_rect, hidx, meta, false, channels,
+                    );
                 }
             }
         }
@@ -2640,7 +2482,16 @@ impl App {
         idx: u32,
         meta: proto::NodeMeta,
         promoted: bool,
+        channels: &mut AnchoredChannels,
     ) {
+        // Per-node expand/contract flag. Only meaningful for the
+        // promoted variant — hover previews are always compact (the
+        // expand toggle is omitted from the hover header). Reads default
+        // to `false` (compact) so a newly-promoted panel opens in the
+        // hover-preview shape and the user opts into the full inspector
+        // body explicitly.
+        let expanded = promoted
+            && self.anchored_expanded.get(&idx).copied().unwrap_or(false);
         // Pull world position + camera snapshot out of the wgpu
         // callback resources, then drop the read lock before opening
         // any egui Area. Camera is cloned (small, all-Copy fields)
@@ -2714,9 +2565,25 @@ impl App {
         // intents up through the show() call.
         let resnap_flag = std::cell::Cell::new(false);
         let close_flag = std::cell::Cell::new(false);
-        // Set by the hover-preview "Open editor" affordance: promote this
-        // node + force the page viewer into Source mode on the next frame.
-        let open_editor_flag = std::cell::Cell::new(false);
+        // Toggled by the ⤢ / ⤡ expand button in the promoted header.
+        // Drained after `panel.show` to flip `anchored_expanded[idx]`.
+        let toggle_expand_flag = std::cell::Cell::new(false);
+
+        // Hoist edges + active-filter snapshots for the expanded path.
+        // The compact path doesn't need them, but cloning is cheap and
+        // doing it unconditionally keeps the borrow graph simple — the
+        // alternative is two divergent borrow scopes inside the closure.
+        let edges_snapshot: Vec<u32> = if let Some(wgpu_state) = frame.wgpu_render_state() {
+            let renderer = wgpu_state.renderer.read();
+            renderer
+                .callback_resources
+                .get::<GraphPipelines>()
+                .map(|p| p.edges_cpu().to_vec())
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        let active_filters_snapshot = self.state.query.active_filters.clone();
 
         let panel_id_tag = if promoted { "anchored-promoted" } else { "hover-preview" };
         let panel = crate::ui::anchored::AnchoredPanel::new(
@@ -2728,10 +2595,19 @@ impl App {
         .offset(egui::vec2(18.0, 18.0))
         .interactable(true)
         .anchor_pixels(drag_offset)
-        .screen_pos_override(smoothed);
+        .screen_pos_override(smoothed)
+        .expanded(expanded);
 
         let output = panel.show(ctx, |ui| {
-            ui.set_max_width(360.0);
+            // Compact = 360px wide (legacy hover/preview width).
+            // Expanded = 480px wide; the body also gets a 640px max
+            // scroll height so the full inspector (metrics + neighbours
+            // + frontmatter + page editor) has room to breathe. These
+            // numbers came from the task brief; they read well against
+            // the categorical-palette badges without dominating the
+            // canvas on a 1280-wide viewport.
+            let max_w = if expanded { 480.0 } else { 360.0 };
+            ui.set_max_width(max_w);
 
             // Header is a dedicated drag-sensing strip. Allocate it
             // first as a click_and_drag rect of fixed height; lay the
@@ -2785,22 +2661,32 @@ impl App {
                         {
                             resnap_flag.set(true);
                         }
-                        // Hover-preview affordance: when this is a vault
-                        // page, surface a one-click path into the editable
-                        // Source tab. Without this, the only way into the
-                        // editor is to click the node (which promotes the
-                        // panel) — discoverability problem the hover-only
-                        // path silently failed.
-                        if !promoted
-                            && crate::ui::page_viewer::is_obsidian_page(&meta)
-                            && ui
-                                .small_button(egui::RichText::new("edit").color(
-                                    crate::ui::theme::palette::ICON,
-                                ))
-                                .on_hover_text("Open editor (Source tab)")
+                        // Expand / contract toggle. Only visible on the
+                        // promoted variant — hover previews are meant to
+                        // be transient and don't need the affordance.
+                        // U+2922 (NORTH EAST AND SOUTH WEST ARROW) reads
+                        // as "expand"; U+2921 (NORTH WEST AND SOUTH EAST
+                        // ARROW) reads as "contract". Tooltip flips with
+                        // state so the glyph is unambiguous. Replaces the
+                        // old hover-preview "edit" button — clicking the
+                        // node still promotes the panel + opens the
+                        // editor when the user expands.
+                        if promoted {
+                            let (glyph, tip) = if expanded {
+                                ("\u{2921}", "Contract")
+                            } else {
+                                ("\u{2922}", "Expand")
+                            };
+                            if ui
+                                .small_button(
+                                    egui::RichText::new(glyph)
+                                        .color(crate::ui::theme::palette::ICON),
+                                )
+                                .on_hover_text(tip)
                                 .clicked()
-                        {
-                            open_editor_flag.set(true);
+                            {
+                                toggle_expand_flag.set(true);
+                            }
                         }
                     });
                 });
@@ -2822,75 +2708,55 @@ impl App {
                         .color(crate::ui::theme::palette::INFO),
                 );
             }
-            // Obsidian-page promoted panel: route the body slot to the
-            // editable page-viewer (Rendered / Source tabs + Save). For
-            // hover-preview (non-promoted) and non-page nodes, fall back
-            // to the original inline markdown/snippet view.
-            let use_page_viewer =
-                promoted && crate::ui::page_viewer::is_obsidian_page(&meta);
-            if use_page_viewer {
+
+            if expanded {
+                // Expanded promoted panel: full inspector body
+                // (metrics + neighbours + community + frontmatter +
+                // editable page viewer when applicable), inside a
+                // bounded ScrollArea. `inspector::render_body` owns
+                // every section — same input contract the old
+                // free-standing inspector used.
                 ui.separator();
-                // Consume any pending force-source request keyed on this
-                // node id (set by the hover-preview "Open editor" button).
-                let force_source = matches!(
-                    self.page_viewer_force_source.as_deref(),
-                    Some(id) if id == meta.id.as_str()
-                );
-                if force_source {
-                    self.page_viewer_force_source = None;
-                }
-                let state = self
-                    .page_viewer_states
-                    .entry(meta.id.clone())
-                    .or_default();
-                if force_source {
-                    state.mode = crate::ui::page_viewer::ViewMode::Source;
-                }
-                let mut save_request: Option<(String, String)> = None;
-                {
-                    let mut on_save = |path: &str, body: &str| {
-                        save_request = Some((path.to_string(), body.to_string()));
-                    };
-                    let mut actions = crate::ui::page_viewer::PageViewerActions {
-                        markdown_cache: &mut self.page_viewer_markdown_cache,
-                        on_save: &mut on_save,
-                    };
-                    crate::ui::page_viewer::show_in_panel(
-                        ui,
-                        state,
-                        &meta,
-                        &mut actions,
-                    );
-                }
-                if let Some((path, body)) = save_request {
-                    self.kick_off_page_save(meta.id.clone(), path, body);
-                }
+                egui::ScrollArea::vertical()
+                    .max_height(640.0)
+                    .auto_shrink([false; 2])
+                    .show(ui, |ui| {
+                        let mut data = crate::ui::inspector::InspectorData {
+                            ids: &self.ids,
+                            metrics: &self.metrics,
+                            edges: &edges_snapshot,
+                            selected_idx: Some(idx),
+                            requested_selection: &mut channels.requested_selection,
+                            requested_filter_toggle: &mut channels.requested_filter_toggle,
+                            color_by: self.state.style.color_by,
+                            palette: self.state.style.palette,
+                            current_meta: Some(&meta),
+                            active_filters: &active_filters_snapshot,
+                            requested_navigate: &mut channels.requested_navigate,
+                            requested_open_url: &mut channels.requested_open_url,
+                            requested_focus_node: &mut channels.requested_focus_node,
+                            field_index: self.field_index.as_ref(),
+                            page_viewer_states: Some(&mut self.page_viewer_states),
+                            markdown_cache: Some(&mut self.page_viewer_markdown_cache),
+                            requested_page_save: &mut channels.requested_page_save,
+                        };
+                        crate::ui::inspector::render_body(
+                            ui,
+                            &mut self.state.tag_browser_query,
+                            &mut data,
+                        );
+                    });
             } else if !meta.body.is_empty() {
+                // Compact mode (both hover and promoted-but-collapsed):
+                // brief metadata snippet, no editor / no inspector body.
+                // Same shape the legacy hover preview rendered.
                 ui.separator();
-                if promoted {
-                    // Promoted variant: full body, scrollable. We
-                    // keep `drag_to_scroll` enabled (default) so the
-                    // user can click+drag inside the body to scroll;
-                    // the header is the only drag-sensing surface
-                    // upstream, so this drag stays inside ScrollArea
-                    // and never reaches AnchoredPanel.
-                    egui::ScrollArea::vertical()
-                        .max_height(360.0)
-                        .show(ui, |ui| {
-                            ui.label(
-                                egui::RichText::new(&meta.body)
-                                    .small()
-                                    .color(crate::ui::theme::palette::TEXT),
-                            );
-                        });
-                } else {
-                    let snippet = body_snippet(&meta.body, 280, 6);
-                    ui.label(
-                        egui::RichText::new(snippet)
-                            .small()
-                            .color(crate::ui::theme::palette::TEXT),
-                    );
-                }
+                let snippet = body_snippet(&meta.body, 280, 6);
+                ui.label(
+                    egui::RichText::new(snippet)
+                        .small()
+                        .color(crate::ui::theme::palette::TEXT),
+                );
             }
 
             // Hand the header response back to AnchoredPanel — that's
@@ -2923,20 +2789,15 @@ impl App {
             self.promoted_anchored_meta = None;
             // Don't clear the drag offset — if the user later
             // re-promotes this node, restoring their offset is the
-            // friendlier default.
+            // friendlier default. The expand flag is similarly
+            // preserved so re-promoting returns to the same mode.
         }
-        // Hover-preview → editor handoff. Promote this idx (so the
-        // page viewer branch fires next frame), seed the cached meta
-        // from the hover slot to avoid an empty-render flash, and
-        // queue the force-source flag for `meta.id`.
-        if open_editor_flag.get() && !promoted {
-            let prev_promoted = self.promoted_anchored_idx;
-            self.promoted_anchored_idx = Some(idx);
-            if prev_promoted != Some(idx) {
-                self.promoted_anchored_meta = Some(meta.clone());
-                self.kick_off_promoted_anchored_fetch(meta.id.clone());
-            }
-            self.page_viewer_force_source = Some(meta.id.clone());
+        // Expand/contract toggle. Flip the per-node flag; next frame
+        // the panel re-renders in the new mode (compact body vs.
+        // inspector body) and the size adjusts accordingly.
+        if toggle_expand_flag.get() && promoted {
+            let cur = self.anchored_expanded.get(&idx).copied().unwrap_or(false);
+            self.anchored_expanded.insert(idx, !cur);
         }
     }
 
@@ -3362,12 +3223,29 @@ impl App {
                 self.state.dock.push_tab(crate::ui::workspace::TabKind::Graph);
                 serde_json::json!({ "tab": "graph" })
             }
-            ToggleInspector => {
-                self.state.inspector_open = !self.state.inspector_open;
-                serde_json::json!({ "inspector_open": self.state.inspector_open })
-            }
         }
     }
+}
+
+/// Per-frame request channels populated by the unified anchored panel
+/// (the expanded body, which routes through `inspector::render_body`).
+/// `App::update` declares one of these on the stack each frame and
+/// drains it after `show_hover_preview` returns.
+///
+/// Why a struct: `render_anchored_panel` can mount the inspector body,
+/// which needs the same outgoing channels the old free-standing inspector
+/// used (`requested_selection`, `requested_filter_toggle`, navigate, url,
+/// focus-node, page-save). Bundling them keeps the call signature short
+/// and the drain block symmetrical with what `inspector::show_floating`
+/// used to write.
+#[derive(Default)]
+struct AnchoredChannels {
+    requested_selection: Option<u32>,
+    requested_filter_toggle: Option<(String, String)>,
+    requested_navigate: Option<String>,
+    requested_open_url: Option<String>,
+    requested_focus_node: Option<String>,
+    requested_page_save: Option<(String, String, String)>,
 }
 
 /// Tiny indirection so the match in `execute_action` doesn't need to

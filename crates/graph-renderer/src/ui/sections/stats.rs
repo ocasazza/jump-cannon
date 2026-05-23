@@ -6,6 +6,7 @@ use crate::ui::theme::accent;
 use super::{subgroup_label, subgroup_separator};
 
 pub fn show(ui: &mut egui::Ui, state: &mut AppState) {
+    state.snapshot_source = Some("Stats".into());
     // Status dot.
     let (dot_color, label) = match state.sim_status {
         SimStatus::Running => (accent::GREEN, "running"),

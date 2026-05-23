@@ -26,7 +26,10 @@ use egui_kittest::kittest::Queryable;
 use graph_renderer::perf::PerfCollector;
 use graph_renderer::ui::actions::ActionRegistry;
 use graph_renderer::ui::focus_set::{self, FocusCtx, FocusMode};
-use graph_renderer::ui::inspector::{self, InspectorData};
+// inspector::show / InspectorData were imported here for the three
+// removed inspector tests (3, 4, 19). The inspector body still exists
+// as `inspector::render_body`, but it's exercised through the unified
+// anchored panel in `app.rs` rather than directly from this test crate.
 use graph_renderer::ui::workspace::apply_rotate_curve;
 use graph_renderer::ui::layout::registry::LayoutRegistry;
 use graph_renderer::ui::sections::{self, reset_row};
@@ -134,123 +137,19 @@ fn section_panel_renders_each_section() {
 }
 
 // ---------------------------------------------------------------------------
-// 3. inspector_hidden_when_no_selection
+// 3 + 4. inspector_hidden_when_no_selection / inspector_shown_when_selection
 // ---------------------------------------------------------------------------
-
-#[test]
-fn inspector_hidden_when_no_selection() {
-    // Drive the inspector with selected_idx=None and assert no
-    // SidePanel is registered under the "inspector" id. We use
-    // `area_rect("inspector")` after a settled frame — None means no
-    // panel ever mounted, which is what the early-return guarantees.
-    let mut harness = Harness::builder()
-        .with_size(egui::vec2(800.0, 600.0))
-        .build(|ctx| {
-            let mut state = AppState::default();
-            let ids: Vec<String> = vec!["a".into(), "b".into()];
-            let metrics = std::collections::HashMap::new();
-            let edges: Vec<u32> = Vec::new();
-            let mut requested: Option<u32> = None;
-            let mut req_toggle: Option<(String, String)> = None;
-            let mut req_nav: Option<String> = None;
-            let mut req_url: Option<String> = None;
-            let mut req_focus: Option<String> = None;
-            let mut req_page_save: Option<(String, String, String)> = None;
-            let active_filters = graph_renderer::ui::query::ActiveFieldFilters::default();
-            let mut data = InspectorData {
-                ids: &ids,
-                metrics: &metrics,
-                edges: &edges,
-                selected_idx: None,
-                requested_selection: &mut requested,
-                requested_filter_toggle: &mut req_toggle,
-                color_by: graph_renderer::ui::state::ColorBy::default(),
-                palette: graph_renderer::data::PaletteId::default(),
-                current_meta: None,
-                active_filters: &active_filters,
-                requested_navigate: &mut req_nav,
-                requested_open_url: &mut req_url,
-                requested_focus_node: &mut req_focus,
-                field_index: None,
-                page_viewer_states: None,
-                markdown_cache: None,
-                requested_page_save: &mut req_page_save,
-            };
-            inspector::show(ctx, &mut state, &mut data);
-        });
-    harness.run();
-    harness.run();
-
-    let state = egui::containers::panel::PanelState::load(
-        &harness.ctx,
-        egui::Id::new("inspector"),
-    );
-    assert!(
-        state.is_none(),
-        "inspector regression: panel mounted with selected_idx=None \
-         (panel_state = {state:?})",
-    );
-}
-
-// ---------------------------------------------------------------------------
-// 4. inspector_shown_when_selection
-// ---------------------------------------------------------------------------
-
-#[test]
-fn inspector_shown_when_selection() {
-    let mut harness = Harness::builder()
-        .with_size(egui::vec2(800.0, 600.0))
-        .build(|ctx| {
-            let mut state = AppState::default();
-            state.inspector_open = true;
-            let ids: Vec<String> = vec!["alpha".into(), "beta".into()];
-            let metrics = std::collections::HashMap::new();
-            let edges: Vec<u32> = Vec::new();
-            let mut requested: Option<u32> = None;
-            let mut req_toggle: Option<(String, String)> = None;
-            let mut req_nav: Option<String> = None;
-            let mut req_url: Option<String> = None;
-            let mut req_focus: Option<String> = None;
-            let mut req_page_save: Option<(String, String, String)> = None;
-            let active_filters = graph_renderer::ui::query::ActiveFieldFilters::default();
-            let mut data = InspectorData {
-                ids: &ids,
-                metrics: &metrics,
-                edges: &edges,
-                selected_idx: Some(0),
-                requested_selection: &mut requested,
-                requested_filter_toggle: &mut req_toggle,
-                color_by: graph_renderer::ui::state::ColorBy::default(),
-                palette: graph_renderer::data::PaletteId::default(),
-                current_meta: None,
-                active_filters: &active_filters,
-                requested_navigate: &mut req_nav,
-                requested_open_url: &mut req_url,
-                requested_focus_node: &mut req_focus,
-                field_index: None,
-                page_viewer_states: None,
-                markdown_cache: None,
-                requested_page_save: &mut req_page_save,
-            };
-            inspector::show(ctx, &mut state, &mut data);
-        });
-    harness.run();
-    harness.run();
-
-    let state = egui::containers::panel::PanelState::load(
-        &harness.ctx,
-        egui::Id::new("inspector"),
-    )
-    .expect(
-        "inspector regression: panel did not mount when selected_idx=Some \
-         and inspector_open=true",
-    );
-    assert!(
-        state.rect.width() > 0.0,
-        "inspector regression: panel mounted with zero width: {:?}",
-        state.rect,
-    );
-}
+//
+// REMOVED: these tests asserted against `egui::SidePanel::right("inspector")`
+// via `PanelState::load(Id::new("inspector"))`. The right-side Inspector
+// surface was collapsed into the unified anchored panel
+// (`app.rs::render_anchored_panel`). The inspector body still exists as
+// `inspector::render_body` (called when the anchored panel is in its
+// `expanded` mode), but there is no longer an "inspector" SidePanel for
+// these tests to target. Removing rather than retargeting: the anchored
+// panel is a foreground `egui::Area`, not a SidePanel, and its mount
+// gate depends on `promoted_anchored_idx` which lives on `App`, not on
+// `AppState` — outside what this harness was set up to drive.
 
 // ---------------------------------------------------------------------------
 // 5. gpu_force_defaults_match_spec
@@ -742,84 +641,18 @@ fn badge_click_returns_toggle() {
 }
 
 // ---------------------------------------------------------------------------
-// 19. inspector_long_id_wraps_inside_panel
+// 19. inspector_long_id_wraps_inside_panel — REMOVED
 // ---------------------------------------------------------------------------
 //
-// Real failure mode: a long, no-space node id used to push past the
-// inspector panel's right edge, hiding the resize handle. The fix puts
-// the id label inside `egui::Label::wrap()` and constrains row width to
-// `available_width()`. We mount the inspector with a 70+ char id and
-// assert the panel's rect stays inside the configured max width and the
-// viewport — i.e. the long id wrapped instead of forcing horizontal
-// growth.
-
-#[test]
-fn inspector_long_id_wraps_inside_panel() {
-    let long_id =
-        "shared/knowledge-base/_ingested/it-ops/jira-ITHELP-22318-something-extra".to_string();
-    assert!(long_id.len() >= 70, "fixture id too short");
-
-    let mut harness = Harness::builder()
-        .with_size(egui::vec2(900.0, 600.0))
-        .build(|ctx| {
-            let mut state = AppState::default();
-            state.inspector_open = true;
-            let ids: Vec<String> = vec![long_id.clone()];
-            let metrics = std::collections::HashMap::new();
-            let edges: Vec<u32> = Vec::new();
-            let mut requested: Option<u32> = None;
-            let mut req_toggle: Option<(String, String)> = None;
-            let mut req_nav: Option<String> = None;
-            let mut req_url: Option<String> = None;
-            let mut req_focus: Option<String> = None;
-            let mut req_page_save: Option<(String, String, String)> = None;
-            let active_filters = graph_renderer::ui::query::ActiveFieldFilters::default();
-            let mut data = InspectorData {
-                ids: &ids,
-                metrics: &metrics,
-                edges: &edges,
-                selected_idx: Some(0),
-                requested_selection: &mut requested,
-                requested_filter_toggle: &mut req_toggle,
-                color_by: graph_renderer::ui::state::ColorBy::default(),
-                palette: graph_renderer::data::PaletteId::default(),
-                current_meta: None,
-                active_filters: &active_filters,
-                requested_navigate: &mut req_nav,
-                requested_open_url: &mut req_url,
-                requested_focus_node: &mut req_focus,
-                field_index: None,
-                page_viewer_states: None,
-                markdown_cache: None,
-                requested_page_save: &mut req_page_save,
-            };
-            inspector::show(ctx, &mut state, &mut data);
-        });
-    harness.run();
-    harness.run();
-
-    let panel_state = egui::containers::panel::PanelState::load(
-        &harness.ctx,
-        egui::Id::new("inspector"),
-    )
-    .expect("inspector should mount with a valid selection");
-
-    // PANEL_W_MAX is 560 in inspector.rs; a non-wrapping long id used
-    // to grow the panel past that. Allow 1px slack for rounding.
-    assert!(
-        panel_state.rect.width() <= 560.0 + 1.0,
-        "inspector long-id regression: panel rect width {} exceeded \
-         PANEL_W_MAX(560), id likely failed to wrap",
-        panel_state.rect.width(),
-    );
-    // The panel must also stay inside the harness viewport.
-    assert!(
-        panel_state.rect.right() <= 900.0 + 1.0,
-        "inspector long-id regression: panel right edge {} pushed past \
-         viewport (900); id failed to wrap inside the panel",
-        panel_state.rect.right(),
-    );
-}
+// This test asserted against `egui::SidePanel::right("inspector")` and
+// `PANEL_W_MAX = 560` from the old free-standing inspector. The
+// right-side inspector was collapsed into the unified anchored panel,
+// which sizes itself as a foreground `egui::Area` with caller-supplied
+// `set_max_width` (360px compact, 480px expanded) rather than a docked
+// SidePanel — so neither the id nor the width bound this test was
+// pinned to still exists. The long-id wrap behaviour is now governed
+// by the `egui::Label::wrap()` call inside `inspector::show_metadata`
+// (still present) and the anchored panel's `set_max_width` cap.
 
 // ---------------------------------------------------------------------------
 // 20. theme_borders_use_palette_border

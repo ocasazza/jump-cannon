@@ -114,6 +114,16 @@ pub struct AnchoredPanel<'a> {
     pub corner_radius: f32,
     /// If false, the area is non-interactable (e.g. hover preview).
     pub interactable: bool,
+    /// When `true`, the panel is in "expanded" mode: the caller is
+    /// expected to render the full inspector body (metrics + neighbours
+    /// + frontmatter + page editor) and the panel auto-sizes to a
+    /// larger default. AnchoredPanel itself only forwards this flag
+    /// through `AnchoredOutput::expanded` for caller-side branching —
+    /// the squircle chrome, tether, drag handling, and EMA-smoothed
+    /// placement are identical in both modes. (The panel growing
+    /// physically larger is a side effect of the larger body the
+    /// caller renders, not a size override at this layer.)
+    pub expanded: bool,
 }
 
 /// Outcome of [`AnchoredPanel::show`]. `drag_delta` carries the
@@ -129,6 +139,12 @@ pub struct AnchoredOutput<R> {
     pub inner: Option<InnerResponse<R>>,
     pub drag_delta: Vec2,
     pub header_double_clicked: bool,
+    /// Echoes the panel's `expanded` flag. Useful for callers that
+    /// dispatch on the same flag for post-show bookkeeping (e.g.
+    /// "if expanded, request a larger frame" — currently unused, but
+    /// kept symmetrical with the input so future state writes don't
+    /// need to re-thread the bool through a separate channel).
+    pub expanded: bool,
 }
 
 impl<'a> AnchoredPanel<'a> {
@@ -145,7 +161,13 @@ impl<'a> AnchoredPanel<'a> {
             inner_margin: 8.0,
             corner_radius: 10.0,
             interactable: true,
+            expanded: false,
         }
+    }
+
+    pub fn expanded(mut self, expanded: bool) -> Self {
+        self.expanded = expanded;
+        self
     }
 
     pub fn offset(mut self, offset: Vec2) -> Self {
@@ -206,6 +228,7 @@ impl<'a> AnchoredPanel<'a> {
                     inner: None,
                     drag_delta: Vec2::ZERO,
                     header_double_clicked: false,
+                    expanded: self.expanded,
                 };
             }
             ProjectionOutcome::OnScreen { screen, .. } => (screen, true),
@@ -343,6 +366,7 @@ impl<'a> AnchoredPanel<'a> {
             inner: Some(InnerResponse::new(user_value, area_resp)),
             drag_delta,
             header_double_clicked,
+            expanded: self.expanded,
         }
     }
 }

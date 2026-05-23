@@ -5,6 +5,7 @@ use crate::ui::state::AppState;
 use super::{hint_label, reset_row, row};
 
 pub fn show(ui: &mut egui::Ui, state: &mut AppState) {
+    state.snapshot_source = Some("Cursor".into());
     if reset_row(ui) {
         state.cursor = Default::default();
     }

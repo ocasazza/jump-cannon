@@ -6,6 +6,7 @@ use crate::ui::state::{AppState, ColorBy, CommunitySource, EdgeColorBy, ShapeBy,
 use super::{reset_row, row};
 
 pub fn show(ui: &mut egui::Ui, state: &mut AppState) {
+    state.snapshot_source = Some("Style".into());
     if reset_row(ui) {
         state.style = Default::default();
     }

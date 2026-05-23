@@ -14,6 +14,7 @@ use crate::ui::state::AppState;
 use crate::ui::theme::{accent, palette};
 
 pub fn show(ui: &mut egui::Ui, state: &mut AppState) {
+    state.snapshot_source = Some("Filter".into());
     if reset_row(ui) {
         state.query = Default::default();
     }

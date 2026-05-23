@@ -65,6 +65,38 @@ impl VaultSearch {
     pub fn url(&self) -> String {
         format!("http://127.0.0.1:{}", self.port)
     }
+
+    /// Ask vault-search to incrementally re-index the given vault-relative
+    /// paths via `POST /refresh`. On success, returns
+    /// `(updated, deleted, skipped)`. On any failure (HTTP, JSON, non-2xx)
+    /// returns `Err` so the caller can fall back to a full respawn.
+    pub async fn refresh(&self, paths: &[String]) -> Result<(usize, usize, usize), String> {
+        let url = format!("{}/refresh", self.url());
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(30))
+            .build()
+            .map_err(|e| format!("client: {e}"))?;
+        let body = serde_json::json!({ "paths": paths });
+        let resp = client
+            .post(&url)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| format!("POST {url}: {e}"))?;
+        let status = resp.status();
+        if !status.is_success() {
+            let text = resp.text().await.unwrap_or_default();
+            return Err(format!("refresh HTTP {status}: {text}"));
+        }
+        let v: serde_json::Value = resp
+            .json()
+            .await
+            .map_err(|e| format!("decode refresh response: {e}"))?;
+        let updated = v.get("updated").and_then(|x| x.as_u64()).unwrap_or(0) as usize;
+        let deleted = v.get("deleted").and_then(|x| x.as_u64()).unwrap_or(0) as usize;
+        let skipped = v.get("skipped").and_then(|x| x.as_u64()).unwrap_or(0) as usize;
+        Ok((updated, deleted, skipped))
+    }
 }
 
 impl Drop for VaultSearch {

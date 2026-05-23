@@ -1,15 +1,17 @@
-//! Right-hand collapsible inspector sidebar.
+//! Inspector body renderer.
 //!
 //! Shows the currently-selected node's metadata (id, degree, pagerank,
 //! community, kcore — whatever lives in the per-node `metrics` map),
 //! plus a clickable list of community siblings and a clickable list of
 //! direct neighbors derived from the raw edge list.
 //!
-//! The panel sits to the right of the central dock area. Two states:
-//!   - Closed: a floating "Inspector" pill anchored top-right of the
-//!     canvas (overlay; does not steal layout width).
-//!   - Open: 320px panel with sections (or a floating window when
-//!     `state.inspector_floating == true`).
+//! **There is no longer a free-standing inspector surface.** The
+//! right-side `SidePanel` / floating `egui::Window` / "reopen pill"
+//! UX was collapsed into the unified anchored panel (see
+//! `app.rs::render_anchored_panel`). What remains here is the *body*
+//! renderer — `render_body` — which the anchored panel calls in its
+//! `expanded` mode. The `InspectorData` struct is the stable input
+//! contract.
 //!
 //! Communication back to `App` flows through `InspectorData::requested_selection`:
 //! clicking a row in either list writes that node's idx; `App::update`
@@ -21,16 +23,10 @@ use std::collections::HashMap;
 
 use super::frontmatter_chip::{render_frontmatter_chips, ChipOutcome};
 use super::frontmatter_grid::show_frontmatter_grid;
-use super::floating::FloatingPanel;
 use super::page_viewer::{self, PageViewerActions, PageViewerState};
 use super::query::ActiveFieldFilters;
-use super::state::{AppState, ColorBy, PanelId};
+use super::state::ColorBy;
 use super::theme::palette;
-
-// Default expanded width — user-resizable within `PANEL_W_RANGE`.
-const PANEL_W: f32 = 320.0;
-const PANEL_W_MIN: f32 = 240.0;
-const PANEL_W_MAX: f32 = 560.0;
 /// Read-only context the inspector uses to resolve node info, plus a
 /// single mutable out-channel for click-to-select.
 pub struct InspectorData<'a> {
@@ -92,233 +88,21 @@ pub struct InspectorData<'a> {
     pub requested_page_save: &'a mut Option<(String, String, String)>,
 }
 
-/// Render the inspector. Returns the outer screen-space `Rect` of the
-/// floating window when `state.inspector_floating == true` and the
-/// window was actually rendered this frame; `None` for the docked /
-/// collapsed cases. The host (`App::update`) uses the returned rect to
-/// draw a leader line from the floating window's nearest corner to the
-/// selected node's on-canvas position.
-pub fn show(
-    ctx: &egui::Context,
-    state: &mut AppState,
-    data: &mut InspectorData,
-) -> Option<egui::Rect> {
-    // The inspector mounts when there's either a focused node OR an
-    // active filter set — the active-filter chip strip lives at the top
-    // of the panel and exists independently of selection, so we don't
-    // want to hide it just because nothing is currently focused.
-    let has_selection = data
-        .selected_idx
-        .map(|i| (i as usize) < data.ids.len())
-        .unwrap_or(false);
-    let has_active_filters = !data.active_filters.by_field.is_empty();
-    // Also mount the inspector when the vault has tags to surface in
-    // the empty-state browser — that's the "no node selected, no
-    // filters active" tag panel. Hide only when there's truly nothing
-    // to show.
-    let has_browse_tags = data
-        .field_index
-        .and_then(|fi| fi.by_field.get("tags"))
-        .map(|b| !b.is_empty())
-        .unwrap_or(false);
-
-    // When the user has explicitly closed the inspector, always surface
-    // a floating "Open inspector" pill in the top-right of the canvas —
-    // even if the mount gate would otherwise hide the panel entirely.
-    // Without this, closing the inspector while nothing is selected and
-    // no filters are active strands the user with no way back.
-    if !state.inspector_open {
-        show_reopen_pill(ctx, state);
-        return None;
-    }
-
-    if !has_selection && !has_active_filters && !has_browse_tags {
-        return None;
-    }
-    if state.inspector_floating {
-        show_floating_window(ctx, state, data)
-    } else {
-        show_expanded(ctx, state, data);
-        None
-    }
-}
-
-/// Render the inspector inside a tray-aware [`FloatingPanel`].
-///
-/// Task C2 of the GUI refactor: surfaces the same inspector body the
-/// docked / popped-out paths in [`show`] render, but inside the project's
-/// standard floating-panel chrome (squircle backdrop, custom header,
-/// tray collapse). The existing [`show`] entrypoint is unchanged so the
-/// app keeps its current call path; this function is the migration
-/// target for callers that want the new floating-panel UX.
-pub fn show_floating(
-    ctx: &egui::Context,
-    state: &mut AppState,
+/// Render the inspector body content. The unified anchored panel in
+/// `app.rs::render_anchored_panel` calls this when its `expanded` flag
+/// is set; the anchored panel's header owns the chrome (title, close,
+/// re-snap, expand/contract toggle) so this function emits only the
+/// active-filter chip strip + metadata/badges/frontmatter/page-content/
+/// community/neighbours sections.
+pub(crate) fn render_body(
+    ui: &mut egui::Ui,
+    tag_browser_query: &mut String,
     data: &mut InspectorData,
 ) {
-    // Bool is Copy — borrow-split by copy-and-restore.
-    let mut open = state.inspector_open;
-    FloatingPanel::new(PanelId::Inspector, "Inspector")
-        .default_pos([1200.0, 64.0])
-        .default_size([340.0, 600.0])
-        .show(ctx, &mut open, |ui| {
-            render_body(ui, state, data);
-        });
-    state.inspector_open = open;
-}
-
-/// Floating "Open inspector" pill mounted in the canvas's top-right
-/// corner whenever `!state.inspector_open`. Replaces the previous
-/// 24px collapsed SidePanel strip — that strip ate horizontal space
-/// permanently, and when the mount gate elided it (no selection / no
-/// filters / no tags) the user was left with no way to reopen the
-/// panel deliberately. A floating `egui::Area` overlays the canvas
-/// without stealing layout width and is always present when closed.
-fn show_reopen_pill(ctx: &egui::Context, state: &mut AppState) {
-    egui::Area::new(egui::Id::new("inspector-reopen-pill"))
-        .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-12.0, 12.0))
-        .order(egui::Order::Foreground)
-        .interactable(true)
-        .show(ctx, |ui| {
-            egui::Frame::none()
-                .fill(egui::Color32::from_black_alpha(220))
-                .stroke(egui::Stroke::new(1.0, palette::BORDER))
-                .rounding(egui::Rounding::same(6.0))
-                .inner_margin(egui::Margin::symmetric(10.0, 6.0))
-                .show(ui, |ui| {
-                    let resp = ui
-                        .add(
-                            egui::Button::new(
-                                egui::RichText::new("\u{2630}  Inspector")
-                                    .color(palette::TEXT),
-                            )
-                            .frame(false)
-                            .min_size(egui::vec2(96.0, 22.0)),
-                        )
-                        .on_hover_text("Open inspector");
-                    if resp.clicked() {
-                        state.inspector_open = true;
-                    }
-                });
-        });
-}
-
-fn show_expanded(ctx: &egui::Context, state: &mut AppState, data: &mut InspectorData) {
-    // One-shot ping per mount-with-selection. The headless regression
-    // suite asserts this fires after a node-click sweep — captures
-    // future regressions where the inspector silently fails to mount.
     log::info!(
-        "[graph-renderer] inspector mounted: idx={}",
+        "[graph-renderer] inspector body rendered: idx={}",
         data.selected_idx.unwrap_or(u32::MAX),
     );
-    egui::SidePanel::right("inspector")
-        .default_width(PANEL_W)
-        .width_range(PANEL_W_MIN..=PANEL_W_MAX)
-        .resizable(true)
-        .frame(
-            egui::Frame::none()
-                .fill(egui::Color32::BLACK)
-                .stroke(egui::Stroke::new(1.0, palette::BORDER))
-                // Tightened from (14, 12) so the panel breathes less
-                // generously at the 240px lower bound, where every px
-                // of inner padding eats into the meta-grid value column.
-                .inner_margin(egui::Margin::symmetric(12.0, 10.0)),
-        )
-        .show(ctx, |ui| {
-            render_body(ui, state, data);
-        });
-}
-
-/// Floating-mode renderer. Identical body to `show_expanded` but mounts
-/// as a draggable `egui::Window` instead of a docked SidePanel. Returns
-/// the outer screen-space `Rect` of the window so the host can draw a
-/// leader line from the nearest corner to the focused node.
-fn show_floating_window(
-    ctx: &egui::Context,
-    state: &mut AppState,
-    data: &mut InspectorData,
-) -> Option<egui::Rect> {
-    log::info!(
-        "[graph-renderer] inspector mounted (floating): idx={}",
-        data.selected_idx.unwrap_or(u32::MAX),
-    );
-    let resp = egui::Window::new("inspector")
-        .title_bar(false)
-        .resizable(true)
-        .default_width(PANEL_W)
-        .min_width(PANEL_W_MIN)
-        // Floating mode reads as a popup — let the user pull it
-        // wider than the docked max so prose-heavy chips wrap nicely.
-        .max_width(PANEL_W_MAX * 1.5)
-        .frame(
-            egui::Frame::none()
-                .fill(egui::Color32::BLACK)
-                .stroke(egui::Stroke::new(1.0, palette::BORDER))
-                .inner_margin(egui::Margin::symmetric(12.0, 10.0)),
-        )
-        .show(ctx, |ui| {
-            render_body(ui, state, data);
-        });
-    // egui's `Window::show` returns `Option<InnerResponse<Option<R>>>`.
-    // The outer `response.rect` is the window's screen-space rect (frame
-    // + content), which is what we want for the leader-line corner math.
-    resp.map(|r| r.response.rect)
-}
-
-/// Shared body content used by both docked (`show_expanded`) and floating
-/// (`show_floating`) renderers. Holds header (title + pin/collapse buttons),
-/// active-filter chip strip, and the scrollable section list.
-fn render_body(ui: &mut egui::Ui, state: &mut AppState, data: &mut InspectorData) {
-    // Action row: pin/dock toggle + close chevron. The panel title is
-    // owned by the surrounding chrome (the `FloatingPanel` header in
-    // production, the host SidePanel/Window in the legacy paths) so
-    // we don't emit "Inspector" here — that produced a duplicated
-    // header stacked under the panel's own title bar.
-    ui.horizontal(|ui| {
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            // Close button stays right-most so its position is
-            // stable across the two render paths. Uses ✕ (not the
-            // ambiguous › chevron, which on a right-side panel reads
-            // as "expand") with a 24x24 hit target so the affordance
-            // is unambiguously tappable.
-            if ui
-                .add(
-                    egui::Button::new(
-                        egui::RichText::new("\u{2715}")
-                            .color(palette::TEXT)
-                            .strong(),
-                    )
-                    .frame(false)
-                    .min_size(egui::vec2(24.0, 24.0)),
-                )
-                .on_hover_text("Hide inspector")
-                .clicked()
-            {
-                state.inspector_open = false;
-            }
-            // Pin toggle. \u{29C9} (TWO JOINED SQUARES) reads as
-            // "two windows" → pop out / dock back. Tooltip text
-            // flips with state so the affordance is unambiguous.
-            let (glyph, tip) = if state.inspector_floating {
-                ("\u{29C9}", "Dock to side")
-            } else {
-                ("\u{29C9}", "Pop out as window")
-            };
-            if ui
-                .add(
-                    egui::Button::new(
-                        egui::RichText::new(glyph).color(palette::ICON),
-                    )
-                    .frame(false),
-                )
-                .on_hover_text(tip)
-                .clicked()
-            {
-                state.inspector_floating = !state.inspector_floating;
-            }
-        });
-    });
-    ui.separator();
 
     // Active filter chip-strip — visible whenever any filter is
     // active, regardless of whether a node is currently focused.
@@ -338,7 +122,7 @@ fn render_body(ui: &mut egui::Ui, state: &mut AppState, data: &mut InspectorData
                 // Empty-state: render the vault-wide tag panel so the
                 // sidebar has a useful default surface ("browse tags")
                 // when nothing's selected.
-                show_browse_tags(ui, &mut state.tag_browser_query, data);
+                show_browse_tags(ui, tag_browser_query, data);
                 return;
             };
             show_metadata(ui, idx, data);

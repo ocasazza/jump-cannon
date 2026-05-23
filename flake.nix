@@ -134,11 +134,10 @@
         # `nix run .#test-browser-rust` — bring up graph-api + open the
         # page in chromium with WebGPU enabled + run the Rust smoke test.
         #
-        # NOTE: this wrapper currently depends on:
-        #   1. A pre-built trunk dist at `crates/graph-renderer/assets/dist`
-        #      (run `just wasm` or `trunk build --release` first). There is
-        #      no `graph-renderer-web` flake output yet — wiring trunk into
-        #      crane is a follow-up.
+        # NOTE: this wrapper depends on:
+        #   1. A trunk dist. Defaults to the nix-built graph-renderer-web
+        #      store path; override with ASSETS_DIR for fast iteration
+        #      against a local `trunk watch` build.
         #   2. A test vault at /tmp/test-vault (auto-seeded by `just`
         #      recipes; this wrapper also seeds a minimal one).
         # The wrapper bails with a clear error if (1) is missing.
@@ -155,15 +154,15 @@
             set -euo pipefail
 
             REPO_ROOT="''${REPO_ROOT:-$PWD}"
-            ASSETS_DIR="''${ASSETS_DIR:-$REPO_ROOT/crates/graph-renderer/assets/dist}"
+            ASSETS_DIR="''${ASSETS_DIR:-${graph-renderer-web}}"
             VAULT="''${VAULT_ROOT:-/tmp/test-vault}"
             PORT="''${TEST_PORT:-47896}"
             OUT_DIR="''${OUT_DIR:-$REPO_ROOT/target/test-browser-rust}"
 
             if [ ! -f "$ASSETS_DIR/index.html" ]; then
               echo "error: no trunk dist at $ASSETS_DIR" >&2
-              echo "hint: run 'just wasm' (or 'trunk build --release') first." >&2
-              echo "  trunk-as-nix-derivation is not yet wired into the flake." >&2
+              echo "hint: unset ASSETS_DIR to use the nix-built graph-renderer-web," >&2
+              echo "  or run 'just wasm' and point ASSETS_DIR at the trunk-watch dist." >&2
               exit 2
             fi
 
@@ -245,13 +244,11 @@
         # The graph-api container ingests $VAULT_ROOT at startup and watches
         # for changes via inotify; progress is surfaced to the frontend
         # footer via `GET /progress`. The compose service below bind-mounts
-        # the host's $VAULT_ROOT into /vault, and the pre-built trunk
-        # dist directory (`crates/graph-renderer/assets/dist`) into
-        # /assets. The latter is a PRECONDITION: there is currently no
-        # `graph-renderer-web` flake output (see the test-browser-rust
-        # note above), so the operator must `just wasm` once before
-        # `just dev-up` / `podman-compose up`. When that follow-up lands,
-        # the bind-mount becomes an internal Nix copy.
+        # the host's $VAULT_ROOT into /vault and the trunk dist into
+        # /assets. $ASSETS_DIR defaults to the nix-built graph-renderer-web
+        # derivation, so `just dev-up` works without a prior `just wasm`;
+        # set it explicitly when iterating on the frontend with
+        # `trunk watch`.
         graphApiService = {
           name = "graph-api";
           port = 8765;
@@ -308,6 +305,11 @@
               # rw, not ro: the renderer's PUT /vault/page editor surface
               # (commit c629cd7f) needs to write back to the vault.
               "\${VAULT_ROOT:-./vault}:/vault:rw"
+              # ASSETS_DIR is set by `nix run .#dev-up` to the nix-built
+              # graph-renderer-web store path. Direct `podman-compose up`
+              # users can either export ASSETS_DIR=$(nix build --no-link
+              # --print-out-paths .#graph-renderer-web) or point it at
+              # their local `trunk watch` dist for fast iteration.
               "\${ASSETS_DIR:-./crates/graph-renderer/assets/dist}:/assets:ro"
             ];
             environment = {
@@ -403,13 +405,14 @@
             echo "loading ${graphApiService.name}:latest into podman..."
             podman load < ${graph-api-image}
             # graph-api in-container serves the trunk dist from /assets.
-            # Until graph-renderer-web is wired into crane, that path must
-            # exist on the host before compose starts.
-            ASSETS_DIR_DEFAULT="$PWD/crates/graph-renderer/assets/dist"
+            # The default is the nix-built graph-renderer-web store path,
+            # so a fresh `nix run .#dev-up` works without a prior
+            # `just wasm`. Set ASSETS_DIR to point at a local trunk-watch
+            # dist when iterating on the frontend.
+            ASSETS_DIR_DEFAULT="${graph-renderer-web}"
             ASSETS_DIR="''${ASSETS_DIR:-$ASSETS_DIR_DEFAULT}"
             if [ ! -f "$ASSETS_DIR/index.html" ]; then
               echo "warn: no trunk dist at $ASSETS_DIR — graph-api will serve 404 for /" >&2
-              echo "  run 'just wasm' (or 'trunk build --release') first" >&2
             fi
             if [ -z "''${VAULT_ROOT:-}" ]; then
               echo "warn: VAULT_ROOT not set; the compose mount will resolve to ./vault" >&2
@@ -457,10 +460,57 @@
           nativeBuildInputs = [ pkgs.wasm-bindgen-cli ];
         });
 
+        # ----- graph-renderer-web: trunk-built WASM frontend -----
+        #
+        # Produces the `dist/` directory (index.html, hashed wasm/js, assets)
+        # as a Nix store path. Lets `dev-up` and the compose stack consume the
+        # built bundle without requiring a prior `just wasm` on the host.
+        #
+        # Trunk needs wasm-bindgen-cli whose version matches the wasm-bindgen
+        # crate in Cargo.lock. The lockfile pins 0.2.120; nixpkgs ships up to
+        # 0.2.118. The two-patch gap normally works because .cargo/config.toml
+        # disables the wasm `reference-types` feature that was the load-bearing
+        # incompatibility (see wasm-bindgen #4211 / #4654). If a future bump
+        # breaks this, override `wasm-bindgen-cli` with a custom build of
+        # 0.2.120 — the source hash is already known via `nix-prefetch-url`.
+        # Renderer-only WASM deps cache. The workspace's broader `depsWasm`
+        # is scoped to `graph-layouts` + `tvix-wasm` because the wasm32
+        # target choke-points (e.g. getrandom-0.3 requiring the wasm_js
+        # cfg) only affect packages the renderer pulls in. Restricting
+        # this build to `--package graph-renderer` matches what trunk
+        # itself drives.
+        depsWasmRenderer = craneLibWasm.buildDepsOnly (commonArgs // {
+          CARGO_BUILD_TARGET = "wasm32-unknown-unknown";
+          cargoExtraArgs = "--package graph-renderer";
+          # graph-renderer's build.rs reuses the graph-api .proto definitions
+          # via prost-build, which shells out to protoc.
+          nativeBuildInputs = [ pkgs.protobuf ];
+          # getrandom 0.3 on wasm32-unknown-unknown needs the wasm_js cfg
+          # to pick the JS-backed entropy source. Without it the build
+          # fails with the same compile_error the renderer would hit at
+          # `trunk build` time outside the sandbox.
+          RUSTFLAGS = "--cfg getrandom_backend=\"wasm_js\" -C target-feature=+reference-types";
+        });
+
+        graph-renderer-web = craneLib.buildTrunkPackage (commonArgs // {
+          pname = "graph-renderer-web";
+          cargoArtifacts = depsWasmRenderer;
+          CARGO_BUILD_TARGET = "wasm32-unknown-unknown";
+          RUSTFLAGS = "--cfg getrandom_backend=\"wasm_js\" -C target-feature=+reference-types";
+          # Trunk.toml at the repo root drives target/dist; the index lives
+          # under crates/graph-renderer/assets/. buildTrunkPackage copies
+          # `$(dirname trunkIndexPath)/dist` to $out, so the on-disk dist
+          # path the justfile expects matches what the derivation produces.
+          trunkIndexPath = "crates/graph-renderer/assets/index.html";
+          cargoExtraArgs = "--package graph-renderer";
+          nativeBuildInputs = [ pkgs.protobuf ];
+          wasm-bindgen-cli = pkgs.wasm-bindgen-cli_0_2_118;
+        });
+
       in {
         packages = {
           default          = graph-api;
-          inherit vault-search graph-api graph-compute graph-layouts-wasm tvix-wasm;
+          inherit vault-search graph-api graph-compute graph-layouts-wasm tvix-wasm graph-renderer-web;
           inherit graph-compute-image graph-api-image docker-compose-yaml sky-task-yaml;
           inherit test-browser;
         };
