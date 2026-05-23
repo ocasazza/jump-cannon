@@ -422,6 +422,51 @@ async fn node_meta(State(s): State<AppState>, Path(id): Path<String>) -> impl In
         return proto_response(&msg).into_response();
     }
 
+    // Filesystem fallback: ids in the search index / Prisma DB but not in
+    // the in-memory `VaultGraph` may still map to a real markdown file
+    // under `vault_root`. Treat the leading `vault/` as a namespace prefix
+    // and look for `<stripped>.md` on disk. Emits a real vault page
+    // (doctype = None) rather than the `external` stub so the renderer's
+    // editor opens normally.
+    let stripped = id.strip_prefix("vault/").unwrap_or(&id);
+    let candidate = s.inner.vault_root.join(format!("{stripped}.md"));
+    if candidate.is_file() {
+        // Path-safety: canonicalize both sides and ensure the resolved
+        // file stays inside the vault root. Defeats `..` escapes.
+        let safe = match (candidate.canonicalize(), s.inner.vault_root.canonicalize()) {
+            (Ok(c), Ok(root)) => c.starts_with(&root),
+            _ => false,
+        };
+        if safe {
+            let body = read_body(&s.inner.vault_root, stripped);
+            let (folder, title) = match stripped.rsplit_once('/') {
+                Some((f, t)) => (f.to_string(), t.to_string()),
+                None => (String::new(), stripped.to_string()),
+            };
+            let msg = proto::NodeMeta {
+                id: id.clone(),
+                title,
+                path: format!("{stripped}.md"),
+                folder,
+                // Not "external" — this is a real vault page that just
+                // isn't in the layout graph.
+                doctype: None,
+                tags: Vec::new(),
+                frontmatter_json: "{}".into(),
+                degree: 0,
+                indegree: 0,
+                outdegree: 0,
+                pagerank: 0.0,
+                betweenness: 0.0,
+                kcore: 0,
+                community: 0,
+                wcc: 0,
+                body,
+            };
+            return proto_response(&msg).into_response();
+        }
+    }
+
     // Stub fallback. Best-effort title from the last path segment; folder is
     // everything before it. `doctype = "external"` is the stub marker.
     let (folder, title) = match id.rsplit_once('/') {
