@@ -36,7 +36,10 @@ pub fn router(state: AppState) -> Router {
         .route("/graph/metrics/:name", get(graph_metric))
         .route("/graph/meta_summary", get(graph_meta_summary))
         .route("/graph/layout/stream", get(graph_layout_stream))
-        .route("/node/:id", get(node_meta))
+        // `*id` (wildcard) instead of `:id` so multi-segment ids like
+        // `vault/shared/knowledge-base/...` match. The captured String
+        // includes the full path tail without a leading slash.
+        .route("/node/*id", get(node_meta))
         .route("/search", get(search))
         .route("/compute/health", get(compute_health))
         .route("/vault/page", put(vault_page_put))
