@@ -215,7 +215,11 @@ impl TileWorkspace {
             .map(|(id, _)| id);
 
         if let Some(target) = split_target {
-            self.split_pane_with(target, pane, SplitDir::Horizontal);
+            // Snap-to-fit UX: new panes join the largest existing pane
+            // as a **tab** by default. Splits are user-driven via the
+            // header ⊟ / ⊞ buttons. Tab-stacking keeps every pane at
+            // full width instead of crushing them all down.
+            self.stack_as_tab(target, pane);
             return;
         }
 
@@ -223,6 +227,49 @@ impl TileWorkspace {
         // root().is_none() above). Insert as the root anyway.
         let new_id = self.tree.tiles.insert_pane(pane);
         self.tree.root = Some(new_id);
+    }
+
+    /// Tab-stack `new_pane` onto `existing`. If `existing`'s parent is
+    /// already a `Container::Tabs`, just add the new pane as a sibling
+    /// child of that container; otherwise wrap `existing` in a fresh
+    /// Tabs container holding `[existing, new_pane]` and splice it back
+    /// into the tree where `existing` used to live.
+    fn stack_as_tab(&mut self, existing: egui_tiles::TileId, new_pane: PaneKind) {
+        let new_id = self.tree.tiles.insert_pane(new_pane);
+        let parent = self.tree.tiles.parent_of(existing);
+        if let Some(parent_id) = parent {
+            if let Some(egui_tiles::Tile::Container(egui_tiles::Container::Tabs(tabs))) =
+                self.tree.tiles.get_mut(parent_id)
+            {
+                tabs.add_child(new_id);
+                tabs.set_active(new_id);
+                return;
+            }
+        }
+        // Wrap-in-Tabs path: build a Tabs container holding both, then
+        // splice into the parent (or replace the root).
+        let tabs_id = self.tree.tiles.insert_tab_tile(vec![existing, new_id]);
+        if let Some(parent_id) = parent {
+            if let Some(egui_tiles::Tile::Container(c)) = self.tree.tiles.get_mut(parent_id) {
+                let kids = c.children_vec();
+                let mut new_kids: Vec<egui_tiles::TileId> = Vec::with_capacity(kids.len());
+                for k in &kids {
+                    if *k == existing {
+                        new_kids.push(tabs_id);
+                    } else {
+                        new_kids.push(*k);
+                    }
+                }
+                for k in c.children_vec() {
+                    c.remove_child(k);
+                }
+                for k in new_kids {
+                    c.add_child(k);
+                }
+            }
+        } else {
+            self.tree.root = Some(tabs_id);
+        }
     }
 
     /// Split `existing` into a binary container holding `existing` on
@@ -401,7 +448,14 @@ impl<'a> egui_tiles::Behavior<PaneKind> for TileBehavior<'a> {
         }
 
         // Header row: title + split-h / split-v / float / close.
-        ui.horizontal(|ui| {
+        // The InnerResponse's `response` covers the whole horizontal
+        // strip — we attach a `click_and_drag` sense to its background
+        // so dragging the header (avoiding the labelled buttons on the
+        // right) initiates an egui_tiles pane drag. Returning
+        // `UiResponse::DragStarted` from this method is what unlocks
+        // drag-to-reorder, drag-to-tab, and drag-between-containers in
+        // egui_tiles — without it the tree is static.
+        let header_response = ui.horizontal(|ui| {
             ui.label(
                 egui::RichText::new(pane.title())
                     .font(theme::mono(theme::font_size::HEADING))
@@ -433,6 +487,19 @@ impl<'a> egui_tiles::Behavior<PaneKind> for TileBehavior<'a> {
                 },
             );
         });
+        // Promote the header strip to a drag handle. We re-interpret
+        // its rect with a fresh `click_and_drag` sense; egui will fold
+        // this into the existing widget's interaction so the labelled
+        // buttons inside still win for click events (button hits are
+        // sensed earlier in the layout pass), while empty header space
+        // — title text, gaps — becomes a grab handle.
+        let header_rect = header_response.response.rect;
+        let drag_response =
+            ui.interact(header_rect, header_response.response.id.with("drag"), egui::Sense::click_and_drag());
+        let drag_started = drag_response.drag_started();
+        if drag_response.hovered() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
+        }
         ui.separator();
 
         // Body.
@@ -481,7 +548,11 @@ impl<'a> egui_tiles::Behavior<PaneKind> for TileBehavior<'a> {
                 egui::Stroke::new(3.0, palette::PRIMARY),
             );
         }
-        egui_tiles::UiResponse::None
+        if drag_started {
+            egui_tiles::UiResponse::DragStarted
+        } else {
+            egui_tiles::UiResponse::None
+        }
     }
 }
 
