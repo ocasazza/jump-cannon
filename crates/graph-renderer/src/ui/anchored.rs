@@ -1,5 +1,16 @@
 //! 3D-anchored floating panel.
 //!
+//! TODO(egui_tiles migration): The expanded + maximized states here are
+//! a precursor to a tileable workspace. Once we add `egui_tiles` (rerun-
+//! io/egui_tiles), the expanded body should live inside a `tiles::Tree`
+//! whose root is either a leaf (today's single-panel expanded view) or a
+//! split/grid container hosting multiple expanded node-views side by side
+//! Niri/Aerospace-style. `maximized_rect` becomes "swap the tree root
+//! with a single-pane tree for this leaf" while the rest of the workspace
+//! is hidden — Tree state is `serde`-friendly so it slots into AppState
+//! for per-session persistence. Out of scope for this round (styling +
+//! maximize); tracked separately.
+//!
 //! Projects a world-space anchor through the same view-projection the
 //! graph canvas was painted with, then opens an `egui::Area` at the
 //! resulting screen point with the project's standard floating chrome
@@ -21,7 +32,7 @@
 //! sourced from `canvas_rect` rather than `camera.aspect` — same
 //! one-frame-lag trap that `draw_inspector_leader_line` documents.
 
-use eframe::egui::{self, Color32, Id, InnerResponse, LayerId, Order, Pos2, Rect, Stroke, Vec2};
+use eframe::egui::{self, Id, InnerResponse, LayerId, Order, Pos2, Rect, Stroke, Vec2};
 
 use crate::camera::Camera;
 use crate::ui::{squircle, theme};
@@ -133,6 +144,13 @@ pub struct AnchoredPanel<'a> {
     /// only (the legacy behavior for hover-preview-sized panels that
     /// don't risk overflow).
     pub reserved_size: Option<Vec2>,
+    /// When `Some`, the panel is in "maximized" mode: position is fixed
+    /// to `rect.left_top()`, effective size is `rect.size()`, the
+    /// projection-based placement / EMA / soft-tether drag are bypassed,
+    /// and the tether line / off-screen arrow are NOT drawn (irrelevant
+    /// when the panel covers the whole canvas). Callers compute the rect
+    /// as `canvas_rect.shrink(margin)`.
+    pub maximized_rect: Option<Rect>,
 }
 
 /// Outcome of [`AnchoredPanel::show`]. `drag_delta` carries the
@@ -172,11 +190,19 @@ impl<'a> AnchoredPanel<'a> {
             interactable: true,
             expanded: false,
             reserved_size: None,
+            maximized_rect: None,
         }
     }
 
     pub fn expanded(mut self, expanded: bool) -> Self {
         self.expanded = expanded;
+        self
+    }
+
+    /// Switch the panel into maximized mode covering `rect`. Bypasses
+    /// projection-based placement and suppresses the tether/arrow.
+    pub fn maximized_rect(mut self, rect: Option<Rect>) -> Self {
+        self.maximized_rect = rect;
         self
     }
 
@@ -239,19 +265,26 @@ impl<'a> AnchoredPanel<'a> {
         ctx: &egui::Context,
         add_contents: impl FnOnce(&mut egui::Ui) -> (R, egui::Response),
     ) -> AnchoredOutput<R> {
-        let outcome = project_world_to_canvas(self.camera, self.canvas_rect, self.world_pos);
-        let (projected_screen, on_screen) = match outcome {
-            ProjectionOutcome::BehindCamera => {
-                return AnchoredOutput {
-                    result: AnchoredResult::BehindCamera,
-                    inner: None,
-                    drag_delta: Vec2::ZERO,
-                    header_double_clicked: false,
-                    expanded: self.expanded,
-                };
+        // Maximized branch: skip projection / EMA / soft-tether entirely.
+        // Position is the maximized rect's top-left; effective size is
+        // its full rect; no tether or off-screen arrow is drawn.
+        let (projected_screen, on_screen, maximized) = if let Some(rect) = self.maximized_rect {
+            (rect.center(), true, true)
+        } else {
+            let outcome = project_world_to_canvas(self.camera, self.canvas_rect, self.world_pos);
+            match outcome {
+                ProjectionOutcome::BehindCamera => {
+                    return AnchoredOutput {
+                        result: AnchoredResult::BehindCamera,
+                        inner: None,
+                        drag_delta: Vec2::ZERO,
+                        header_double_clicked: false,
+                        expanded: self.expanded,
+                    };
+                }
+                ProjectionOutcome::OnScreen { screen, .. } => (screen, true, false),
+                ProjectionOutcome::OffScreen { screen, .. } => (screen, false, false),
             }
-            ProjectionOutcome::OnScreen { screen, .. } => (screen, true),
-            ProjectionOutcome::OffScreen { screen, .. } => (screen, false),
         };
 
         // Panel placement source: smoothed override if the caller
@@ -277,7 +310,11 @@ impl<'a> AnchoredPanel<'a> {
         //    overflow is negligible and clamping fights soft-tether
         //    drag intent.
         let clamp_rect = self.canvas_rect.shrink(self.clamp_margin);
-        let panel_pos = if let Some(size) = self.reserved_size {
+        let panel_pos = if let Some(rect) = self.maximized_rect {
+            // Maximized: position is the rect's top-left, no clamping or
+            // user-drag/EMA offsetting.
+            rect.left_top()
+        } else if let Some(size) = self.reserved_size {
             // The right/bottom edge of the panel must stay inside
             // clamp_rect. Push the top-left in by however much overflow
             // we'd otherwise have. min after subtraction guards against
@@ -339,7 +376,7 @@ impl<'a> AnchoredPanel<'a> {
                         squircle::DEFAULT_SEGMENTS_PER_CORNER,
                     ),
                     theme::FLOATING_BACKDROP,
-                    Stroke::new(1.0, Color32::WHITE),
+                    Stroke::new(1.0, theme::palette::BORDER),
                 ),
             );
 
@@ -358,7 +395,9 @@ impl<'a> AnchoredPanel<'a> {
         let panel_rect = inner.response.rect;
         let stroke = Stroke::new(1.0, theme::palette::BORDER);
 
-        if on_screen {
+        if maximized {
+            // Maximized covers the whole canvas; a tether is meaningless.
+        } else if on_screen {
             let edge = closest_edge_midpoint(panel_rect, projected_screen);
             painter.line_segment([edge, projected_screen], stroke);
             painter.circle_filled(projected_screen, 2.5, theme::palette::ICON);

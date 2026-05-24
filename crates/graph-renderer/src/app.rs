@@ -260,6 +260,13 @@ pub struct App {
     /// `promoted_anchored_idx`), so the expanded map shares that
     /// lifetime. Not serialized.
     anchored_expanded: HashMap<u32, bool>,
+    /// Per-node maximize flag for the expanded promoted anchored panel.
+    /// Only meaningful when the corresponding `anchored_expanded` entry
+    /// is true (maximize is a third state on top of expanded). When set,
+    /// the panel grows to fill `canvas_rect.shrink(24.0)`, centered, and
+    /// the tether arrow is suppressed. Session-scoped, not persisted —
+    /// same lifetime as `anchored_expanded`.
+    anchored_maximized: HashMap<u32, bool>,
     /// Per-node soft-tether drag offsets in screen pixels. The user
     /// grabs the panel header and drags; the per-frame delta is
     /// accumulated here. Cleared per-node on a "re-snap" click. The
@@ -593,6 +600,7 @@ impl App {
             last_anchored_screen_pos: HashMap::new(),
             promoted_anchored_idx: None,
             anchored_expanded: HashMap::new(),
+            anchored_maximized: HashMap::new(),
             anchored_drag_offsets: HashMap::new(),
             promoted_anchored_meta: None,
             promoted_anchored_fetch: Arc::new(Mutex::new(None)),
@@ -2498,6 +2506,20 @@ impl App {
         // body explicitly.
         let expanded = promoted
             && self.anchored_expanded.get(&idx).copied().unwrap_or(false);
+        // Maximize is a third state on top of expanded: only meaningful
+        // when the expanded body is being rendered. Restoring expanded ->
+        // false implicitly hides the maximize affordance again.
+        let maximized = expanded
+            && self.anchored_maximized.get(&idx).copied().unwrap_or(false);
+        // Maximized rect: 24px inset from canvas edges, covers the whole
+        // viewport (centered by virtue of the symmetric shrink). Passed
+        // to AnchoredPanel via `maximized_rect`; bypasses projection +
+        // tether + soft-tether drag.
+        let max_rect = if maximized {
+            Some(canvas_rect.shrink(24.0))
+        } else {
+            None
+        };
         // Pull world position + camera snapshot out of the wgpu
         // callback resources, then drop the read lock before opening
         // any egui Area. Camera is cloned (small, all-Copy fields)
@@ -2574,6 +2596,9 @@ impl App {
         // Toggled by the ⤢ / ⤡ expand button in the promoted header.
         // Drained after `panel.show` to flip `anchored_expanded[idx]`.
         let toggle_expand_flag = std::cell::Cell::new(false);
+        // Toggled by the ⤢ / ⤡ maximize button in the expanded header.
+        // Drained after `panel.show` to flip `anchored_maximized[idx]`.
+        let toggle_maximize_flag = std::cell::Cell::new(false);
 
         // Hoist edges + active-filter snapshots for the expanded path.
         // The compact path doesn't need them, but cloning is cheap and
@@ -2603,13 +2628,17 @@ impl App {
         .anchor_pixels(drag_offset)
         .screen_pos_override(smoothed)
         .expanded(expanded)
+        .maximized_rect(max_rect)
         // In expanded mode, tell AnchoredPanel the body's full reserved
         // footprint so it can clamp the position to keep the whole rect
         // on-canvas — fixes the bug where expanding near the right/
         // bottom edge sent the panel off-screen. Compact panels skip
         // this; they're small and the legacy anchor-based clamp is
-        // sufficient.
-        .reserved_size(if expanded {
+        // sufficient. Maximized bypasses both — AnchoredPanel uses the
+        // explicit rect.
+        .reserved_size(if let Some(r) = max_rect {
+            r.size()
+        } else if expanded {
             egui::vec2(480.0, 640.0)
         } else {
             // 360 wide × generous height estimate so hover previews
@@ -2626,7 +2655,17 @@ impl App {
             // numbers came from the task brief; they read well against
             // the categorical-palette badges without dominating the
             // canvas on a 1280-wide viewport.
-            let max_w = if expanded { 480.0 } else { 360.0 };
+            // Width:
+            //   maximized → rect.width()
+            //   expanded  → 480 px (legacy)
+            //   compact   → 360 px (legacy hover preview)
+            let max_w = if let Some(r) = max_rect {
+                r.width()
+            } else if expanded {
+                480.0
+            } else {
+                360.0
+            };
             ui.set_max_width(max_w);
 
             // Header is a dedicated drag-sensing strip. Allocate it
@@ -2645,70 +2684,164 @@ impl App {
             let header_rect = header_resp.rect;
             ui.allocate_new_ui(egui::UiBuilder::new().max_rect(header_rect), |ui| {
                 ui.horizontal(|ui| {
-                    ui.label(
-                        egui::RichText::new("\u{2630}")
-                            .small()
-                            .color(crate::ui::theme::palette::ICON),
-                    );
-                    let title = if meta.title.is_empty() {
+                    // Title resolution: meta.title → derived filename
+                    // (path stem) → meta.id → "Node". The expanded
+                    // variant uses this for display parity with the
+                    // other FloatingPanel-wrapped surfaces.
+                    let title = if !meta.title.is_empty() {
+                        meta.title.clone()
+                    } else if !meta.path.is_empty() {
+                        std::path::Path::new(&meta.path)
+                            .file_stem()
+                            .and_then(|s| s.to_str())
+                            .map(str::to_string)
+                            .unwrap_or_else(|| meta.id.clone())
+                    } else if !meta.id.is_empty() {
                         meta.id.clone()
                     } else {
-                        meta.title.clone()
+                        "Node".to_string()
                     };
-                    ui.label(
-                        egui::RichText::new(title)
-                            .strong()
-                            .color(crate::ui::theme::palette::TEXT),
-                    );
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if promoted {
-                            if ui
-                                .small_button(egui::RichText::new("\u{2715}").color(
-                                    crate::ui::theme::palette::ICON,
+
+                    if expanded {
+                        // Full FloatingPanel parity: ≡ drag glyph in
+                        // HEADING-size mono GREY, then title in
+                        // HEADING-size mono TEXT, then right-aligned
+                        // ↻ ⤢/⤡ X. Matches `FloatingPanel::show` byte-
+                        // for-byte (modulo the maximize button, which
+                        // FloatingPanel doesn't have).
+                        ui.label(
+                            egui::RichText::new("\u{2261}")
+                                .font(crate::ui::theme::mono(
+                                    crate::ui::theme::font_size::HEADING,
                                 ))
-                                .on_hover_text("Close")
-                                .clicked()
-                            {
-                                close_flag.set(true);
-                            }
-                        }
-                        if ui
-                            .small_button(egui::RichText::new("\u{21BA}").color(
-                                crate::ui::theme::palette::ICON,
-                            ))
-                            .on_hover_text("Re-snap to anchor")
-                            .clicked()
-                        {
-                            resnap_flag.set(true);
-                        }
-                        // Expand / contract toggle. Only visible on the
-                        // promoted variant — hover previews are meant to
-                        // be transient and don't need the affordance.
-                        // U+2922 (NORTH EAST AND SOUTH WEST ARROW) reads
-                        // as "expand"; U+2921 (NORTH WEST AND SOUTH EAST
-                        // ARROW) reads as "contract". Tooltip flips with
-                        // state so the glyph is unambiguous. Replaces the
-                        // old hover-preview "edit" button — clicking the
-                        // node still promotes the panel + opens the
-                        // editor when the user expands.
-                        if promoted {
-                            let (glyph, tip) = if expanded {
-                                ("\u{2921}", "Contract")
-                            } else {
-                                ("\u{2922}", "Expand")
-                            };
-                            if ui
-                                .small_button(
-                                    egui::RichText::new(glyph)
-                                        .color(crate::ui::theme::palette::ICON),
-                                )
-                                .on_hover_text(tip)
-                                .clicked()
-                            {
-                                toggle_expand_flag.set(true);
-                            }
-                        }
-                    });
+                                .color(crate::ui::theme::palette::GREY),
+                        );
+                        ui.label(
+                            egui::RichText::new(&title)
+                                .font(crate::ui::theme::mono(
+                                    crate::ui::theme::font_size::HEADING,
+                                ))
+                                .color(crate::ui::theme::palette::TEXT),
+                        );
+                        ui.with_layout(
+                            egui::Layout::right_to_left(egui::Align::Center),
+                            |ui| {
+                                // right_to_left adds in reverse visual
+                                // order, so add X first (rightmost),
+                                // then maximize, then re-snap. Visual:
+                                //   ↻ ⤢ X
+                                if ui
+                                    .small_button(
+                                        egui::RichText::new("X")
+                                            .color(crate::ui::theme::palette::ICON),
+                                    )
+                                    .on_hover_text("Close")
+                                    .clicked()
+                                {
+                                    close_flag.set(true);
+                                }
+                                // Maximize / restore. U+2922 (NORTH
+                                // EAST AND SOUTH WEST ARROW) reads as
+                                // "expand to fill"; U+2921 (NORTH WEST
+                                // AND SOUTH EAST ARROW) reads as
+                                // "restore". Only renders on the
+                                // expanded variant — meaningless on
+                                // the compact body.
+                                let (mglyph, mtip) = if maximized {
+                                    ("\u{2921}", "Restore")
+                                } else {
+                                    ("\u{2922}", "Maximize")
+                                };
+                                if ui
+                                    .small_button(
+                                        egui::RichText::new(mglyph)
+                                            .color(crate::ui::theme::palette::ICON),
+                                    )
+                                    .on_hover_text(mtip)
+                                    .clicked()
+                                {
+                                    toggle_maximize_flag.set(true);
+                                }
+                                if ui
+                                    .small_button(
+                                        egui::RichText::new("\u{21BA}")
+                                            .color(crate::ui::theme::palette::ICON),
+                                    )
+                                    .on_hover_text("Re-snap to anchor")
+                                    .clicked()
+                                {
+                                    resnap_flag.set(true);
+                                }
+                                // Contract back to compact. U+2212 MINUS
+                                // SIGN reads as "collapse to less". A
+                                // dedicated glyph avoids collision with
+                                // the maximize/restore arrow pair.
+                                if ui
+                                    .small_button(
+                                        egui::RichText::new("\u{2212}")
+                                            .color(crate::ui::theme::palette::ICON),
+                                    )
+                                    .on_hover_text("Contract")
+                                    .clicked()
+                                {
+                                    toggle_expand_flag.set(true);
+                                }
+                            },
+                        );
+                    } else {
+                        // Compact (hover preview / promoted-but-not-
+                        // expanded) header — lighter chrome by design.
+                        // Unchanged from the legacy shape.
+                        ui.label(
+                            egui::RichText::new("\u{2630}")
+                                .small()
+                                .color(crate::ui::theme::palette::ICON),
+                        );
+                        ui.label(
+                            egui::RichText::new(&title)
+                                .strong()
+                                .color(crate::ui::theme::palette::TEXT),
+                        );
+                        ui.with_layout(
+                            egui::Layout::right_to_left(egui::Align::Center),
+                            |ui| {
+                                if promoted {
+                                    if ui
+                                        .small_button(
+                                            egui::RichText::new("\u{2715}")
+                                                .color(crate::ui::theme::palette::ICON),
+                                        )
+                                        .on_hover_text("Close")
+                                        .clicked()
+                                    {
+                                        close_flag.set(true);
+                                    }
+                                }
+                                if ui
+                                    .small_button(
+                                        egui::RichText::new("\u{21BA}")
+                                            .color(crate::ui::theme::palette::ICON),
+                                    )
+                                    .on_hover_text("Re-snap to anchor")
+                                    .clicked()
+                                {
+                                    resnap_flag.set(true);
+                                }
+                                if promoted {
+                                    if ui
+                                        .small_button(
+                                            egui::RichText::new("\u{2922}")
+                                                .color(crate::ui::theme::palette::ICON),
+                                        )
+                                        .on_hover_text("Expand")
+                                        .clicked()
+                                    {
+                                        toggle_expand_flag.set(true);
+                                    }
+                                }
+                            },
+                        );
+                    }
                 });
             });
 
@@ -2739,7 +2872,15 @@ impl App {
                 // height by setting `max_height` on `ui` and let
                 // render_body's inner ScrollArea fit inside it.
                 ui.separator();
-                ui.set_max_height(640.0);
+                // Maximize: the body should fill the canvas-sized rect
+                // minus the chrome we already laid out (header +
+                // separator + small slack for inner margin).
+                let body_max_h = if let Some(r) = max_rect {
+                    (r.height() - header_height - 24.0).max(120.0)
+                } else {
+                    640.0
+                };
+                ui.set_max_height(body_max_h);
                 {
                         let mut data = crate::ui::inspector::InspectorData {
                             ids: &self.ids,
@@ -2818,6 +2959,20 @@ impl App {
         if toggle_expand_flag.get() && promoted {
             let cur = self.anchored_expanded.get(&idx).copied().unwrap_or(false);
             self.anchored_expanded.insert(idx, !cur);
+            // Contracting also drops maximize state — maximize is
+            // meaningless on the compact body, and re-expanding should
+            // start from the standard expanded size, not silently
+            // re-maximize.
+            if cur {
+                self.anchored_maximized.remove(&idx);
+            }
+        }
+        // Maximize toggle. Only fires on the expanded variant (the
+        // button only renders there); flip the per-node flag and let
+        // the next frame route through the maximized branch.
+        if toggle_maximize_flag.get() && promoted && expanded {
+            let cur = self.anchored_maximized.get(&idx).copied().unwrap_or(false);
+            self.anchored_maximized.insert(idx, !cur);
         }
     }
 
