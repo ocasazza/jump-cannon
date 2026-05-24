@@ -13,7 +13,7 @@
 use eframe::egui::{self, Color32, Id, Rect, Stroke};
 
 use crate::ui::squircle;
-use crate::ui::state::PanelId;
+use crate::ui::state::{FocusedPanel, PanelId};
 use crate::ui::theme::{self, palette};
 use crate::ui::tiles::Placement;
 
@@ -31,6 +31,14 @@ pub struct FloatingPanel<'p> {
     /// workspace tree on the next frame via
     /// `ui::tiles::sync_tree_with_open_state`).
     placement: Option<&'p mut Placement>,
+    /// Optional focus channel. When `Some`, the panel renders its
+    /// outer chrome with a `palette::PRIMARY` 3px stroke when
+    /// `*focused == Some(my_id)`, and writes `my_id` into the channel
+    /// when the user interacts with the panel (header click or drag,
+    /// or a body click). This drives the "currently focused window"
+    /// concept that gates canvas-scroll-zoom while panel scroll is
+    /// active.
+    focus: Option<(&'p mut Option<FocusedPanel>, FocusedPanel)>,
 }
 
 impl<'p> FloatingPanel<'p> {
@@ -41,7 +49,18 @@ impl<'p> FloatingPanel<'p> {
             default_pos: None,
             default_size: None,
             placement: None,
+            focus: None,
         }
+    }
+
+    /// Plumb a focus channel through the panel. See [`Self::focus`].
+    pub fn with_focus(
+        mut self,
+        focused: &'p mut Option<FocusedPanel>,
+        my_id: FocusedPanel,
+    ) -> Self {
+        self.focus = Some((focused, my_id));
+        self
     }
 
     pub fn default_pos(mut self, pos: [f32; 2]) -> Self {
@@ -95,6 +114,20 @@ impl<'p> FloatingPanel<'p> {
         let title = self.title;
         let mut placement = self.placement;
 
+        // Decide focus stroke up front so the squircle paint inside the
+        // closure can read it without re-borrowing self.focus. The
+        // write-back (when the user clicks the panel) happens after
+        // the window closure returns.
+        let is_focused = match &self.focus {
+            Some((focused, my_id)) => focused.as_ref() == Some(my_id),
+            None => false,
+        };
+        let outer_stroke = if is_focused {
+            Stroke::new(3.0, palette::PRIMARY)
+        } else {
+            Stroke::new(1.0, palette::BORDER)
+        };
+
         let response = window.show(ctx, |ui| {
             let rect: Rect = ui.max_rect().expand(theme::spacing::SECTION_GAP);
             let mut painter = ui.painter().clone();
@@ -107,7 +140,7 @@ impl<'p> FloatingPanel<'p> {
                 rect,
                 10.0,
                 theme::FLOATING_BACKDROP,
-                Stroke::new(1.0, palette::BORDER),
+                outer_stroke,
             );
 
             ui.horizontal(|ui| {
@@ -157,6 +190,31 @@ impl<'p> FloatingPanel<'p> {
 
             body(ui)
         });
+
+        // Write-back focus on user interaction with this panel. The
+        // outer `egui::Window` response surfaces clicks and drags
+        // anywhere over the window's area (header, body, chrome). We
+        // also probe `ctx.input` for a pointer-down inside the panel's
+        // area rect as a belt-and-suspenders: some body widgets
+        // (TextEdit, ScrollArea) consume the click before the area
+        // response sees it.
+        if let (Some(r), Some((focused, my_id))) = (response.as_ref(), self.focus) {
+            let outer = &r.response;
+            let area_rect = outer.rect;
+            let pointer_down_inside = ctx.input(|i| {
+                i.pointer.any_pressed()
+                    && i.pointer
+                        .interact_pos()
+                        .map(|p| area_rect.contains(p))
+                        .unwrap_or(false)
+            });
+            let acquired = outer.clicked()
+                || outer.drag_started()
+                || pointer_down_inside;
+            if acquired && *focused != Some(my_id) {
+                *focused = Some(my_id);
+            }
+        }
 
         response.and_then(|r| r.inner)
     }

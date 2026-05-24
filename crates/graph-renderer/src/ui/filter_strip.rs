@@ -22,7 +22,7 @@ use eframe::egui::Ui;
 use crate::ui::badge::{Badge, BadgeAction, BadgeKind};
 use crate::ui::floating::FloatingPanel;
 use crate::ui::query::{Combinator, QueryModel};
-use crate::ui::state::{AppState, FilterBehavior, FrontendEventLog, PanelId};
+use crate::ui::state::{AppState, FilterBehavior, FocusedPanel, FrontendEventLog, PanelId};
 use crate::ui::theme::palette;
 
 pub fn show(ctx: &egui::Context, query: &mut QueryModel) {
@@ -77,10 +77,12 @@ pub fn show_floating(ctx: &egui::Context, state: &mut AppState) {
 
     let mut placement = state.filter_strip_placement;
     let placement_before = placement;
+    let mut focused = std::mem::take(&mut state.focused_panel);
     FloatingPanel::new(PanelId::FilterStrip, "Filters")
         .default_pos([16.0, 620.0])
         .default_size([420.0, 360.0])
         .with_placement(&mut placement)
+        .with_focus(&mut focused, FocusedPanel::FilterStrip)
         .show(ctx, &mut state.filter_strip_open, |ui| {
             render_floating_body(
                 ui,
@@ -89,6 +91,11 @@ pub fn show_floating(ctx: &egui::Context, state: &mut AppState) {
                 &mut state.frontend_events,
             );
         });
+    state.focused_panel = focused;
+    // Closing the focused filter strip drops focus to the canvas.
+    if !state.filter_strip_open && state.focused_panel == Some(FocusedPanel::FilterStrip) {
+        state.focused_panel = None;
+    }
     if placement != placement_before {
         state.filter_strip_placement = placement;
         if placement == crate::ui::tiles::Placement::Tiled {

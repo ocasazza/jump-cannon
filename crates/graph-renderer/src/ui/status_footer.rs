@@ -98,6 +98,19 @@ pub fn show_tray(ctx: &egui::Context, state: &mut AppState, progress: &Progress)
                             crate::ui::tiles::PaneKind::Section(section),
                             new_open,
                         );
+                        // Tray-driven open moves focus to the new
+                        // panel; tray-driven close drops focus back
+                        // to the canvas (if it pointed at this panel).
+                        let my_focus = if matches!(section, Section::Debug) {
+                            crate::ui::state::FocusedPanel::Debug
+                        } else {
+                            crate::ui::state::FocusedPanel::Section(section)
+                        };
+                        if new_open {
+                            state.focused_panel = Some(my_focus);
+                        } else if state.focused_panel == Some(my_focus) {
+                            state.focused_panel = None;
+                        }
                     }
                 }
 
@@ -114,6 +127,12 @@ pub fn show_tray(ctx: &egui::Context, state: &mut AppState, progress: &Progress)
                         crate::ui::tiles::PaneKind::FilterStrip,
                         new_open,
                     );
+                    let my_focus = crate::ui::state::FocusedPanel::FilterStrip;
+                    if new_open {
+                        state.focused_panel = Some(my_focus);
+                    } else if state.focused_panel == Some(my_focus) {
+                        state.focused_panel = None;
+                    }
                 }
 
                 // View controls — right side. Within `right_to_left`,

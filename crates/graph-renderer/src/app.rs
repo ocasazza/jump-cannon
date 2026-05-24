@@ -1221,6 +1221,7 @@ impl eframe::App for App {
             invert_mouse_y: self.state.camera.invert_mouse_y,
             pan_accel_t: &mut self.camera_pan_accel_t,
             input_events: &camera_input_events,
+            focused_panel: self.state.focused_panel,
             canvas_rect: None,
             pointer_in_canvas: None,
             click: None,
@@ -1343,9 +1344,17 @@ impl eframe::App for App {
         // and runs first via egui's hover/focus order, so this only
         // fires when nothing else swallowed the press.
         if want_cancel {
-            self.modal.open = false;
-            self.modal.current = None;
-            self.modal.fetch_error = None;
+            // Esc precedence: if the modal is open, close it;
+            // otherwise, if a panel is focused, defocus it (return
+            // scroll routing to the canvas). Single Esc does one
+            // thing so the gesture stays predictable.
+            if self.modal.open {
+                self.modal.open = false;
+                self.modal.current = None;
+                self.modal.fetch_error = None;
+            } else if self.state.focused_panel.is_some() {
+                self.state.focused_panel = None;
+            }
         }
 
         if let Some((rect, pos)) = click {
@@ -1398,6 +1407,13 @@ impl eframe::App for App {
                     // Sticky focus: click locks focus on this node. Hover
                     // is suppressed while sticky is set.
                     self.focus_sticky_idx = Some(idx);
+                    // Promote the anchored panel for this node into
+                    // the focused window — scroll wheel events will
+                    // route to its inner ScrollArea (when expanded),
+                    // not to the canvas zoom path.
+                    self.state.focused_panel = Some(
+                        crate::ui::state::FocusedPanel::AnchoredNode(idx),
+                    );
                     // Promote the anchored panel: clicking a node makes
                     // the floating card sticky (interactable, persists
                     // until X-ed). Option semantics handle swap-on-other-
@@ -1431,8 +1447,12 @@ impl eframe::App for App {
                     self.kick_off_node_fetch(id);
                 }
             } else {
-                // Click on empty canvas → clear sticky focus.
+                // Click on empty canvas → clear sticky focus AND
+                // defocus any panel so the canvas regains scroll
+                // routing (focused_panel = None means "canvas is the
+                // focused surface" per the gate in ui::workspace).
                 self.focus_sticky_idx = None;
+                self.state.focused_panel = None;
             }
         }
 
@@ -2689,6 +2709,14 @@ impl App {
         let active_filters_snapshot = self.state.query.active_filters.clone();
 
         let panel_id_tag = if promoted { "anchored-promoted" } else { "hover-preview" };
+        // Focused border only for the promoted variant — the hover
+        // preview is transient and never logically focused. Compare
+        // against the app-wide `focused_panel` channel.
+        let is_focused = promoted
+            && matches!(
+                self.state.focused_panel,
+                Some(crate::ui::state::FocusedPanel::AnchoredNode(i)) if i == idx
+            );
         let panel = crate::ui::anchored::AnchoredPanel::new(
             egui::Id::new((panel_id_tag, idx)),
             world,
@@ -2700,6 +2728,7 @@ impl App {
         .anchor_pixels(drag_offset)
         .screen_pos_override(smoothed)
         .expanded(expanded)
+        .focused(is_focused)
         .maximized_rect(max_rect)
         // In expanded mode, tell AnchoredPanel the body's full reserved
         // footprint so it can clamp the position to keep the whole rect
@@ -2998,6 +3027,33 @@ impl App {
             ((), header_resp)
         });
 
+        // Acquire focus for the promoted variant when the user
+        // interacts with it (header click/drag, body click, or any
+        // pointer-press inside the area rect). The hover preview never
+        // takes focus — it's a transient peek that vanishes on
+        // cursor-leave, and focusing it would steal scroll routing
+        // for a panel about to disappear.
+        if promoted {
+            if let Some(inner) = output.inner.as_ref() {
+                let area_rect = inner.response.rect;
+                let pointer_down_inside = ctx.input(|i| {
+                    i.pointer.any_pressed()
+                        && i.pointer
+                            .interact_pos()
+                            .map(|p| area_rect.contains(p))
+                            .unwrap_or(false)
+                });
+                if inner.response.clicked()
+                    || inner.response.drag_started()
+                    || output.drag_delta != egui::Vec2::ZERO
+                    || pointer_down_inside
+                {
+                    self.state.focused_panel =
+                        Some(crate::ui::state::FocusedPanel::AnchoredNode(idx));
+                }
+            }
+        }
+
         // Accumulate drag delta into per-node offset — only for the
         // promoted variant. The hover preview is a transient peek
         // that vanishes on cursor-leave; a drag there would be lost
@@ -3020,6 +3076,13 @@ impl App {
         if close_flag.get() && promoted {
             self.promoted_anchored_idx = None;
             self.promoted_anchored_meta = None;
+            // Closing the focused panel returns focus to the canvas.
+            if matches!(
+                self.state.focused_panel,
+                Some(crate::ui::state::FocusedPanel::AnchoredNode(i)) if i == idx
+            ) {
+                self.state.focused_panel = None;
+            }
             // Don't clear the drag offset — if the user later
             // re-promotes this node, restoring their offset is the
             // friendlier default. The expand flag is similarly

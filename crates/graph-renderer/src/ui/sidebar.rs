@@ -9,7 +9,7 @@ use super::actions::ActionRegistry;
 use super::layout::registry::LayoutRegistry;
 use super::floating::FloatingPanel;
 use super::sections;
-use super::state::{AppState, PanelId, Section};
+use super::state::{AppState, FocusedPanel, PanelId, Section};
 use crate::perf::PerfCollector;
 
 // Section launchers live in `status_footer::show_tray` now; this
@@ -163,13 +163,23 @@ pub fn show_floating(
         };
         let mut placement = crate::ui::tiles::section_placement(state, section);
         let placement_before = placement;
+        // The focus channel uses an indirection: we temporarily take
+        // `focused_panel` out of `state` so the closure body can hold
+        // `&mut state` exclusively, then put it back after `show`.
+        let mut focused = std::mem::take(&mut state.focused_panel);
+        let my_focus_id = match section {
+            Section::Debug => FocusedPanel::Debug,
+            other => FocusedPanel::Section(other),
+        };
         FloatingPanel::new(PanelId::Section(section), section.title())
             .default_pos(pos)
             .default_size(default_size)
             .with_placement(&mut placement)
+            .with_focus(&mut focused, my_focus_id)
             .show(ctx, &mut open, |ui| {
                 render_section_body(ui, state, section, registry, layout_registry, perf);
             });
+        state.focused_panel = focused;
         if placement != placement_before {
             state.section_placement.insert(section, placement);
             if placement == crate::ui::tiles::Placement::Tiled {
@@ -180,6 +190,10 @@ pub fn show_floating(
         }
         if !open {
             state.set_section_open(section, false);
+            // Closing the focused panel drops focus back to the canvas.
+            if state.focused_panel == Some(my_focus_id) {
+                state.focused_panel = None;
+            }
         }
     }
 }

@@ -151,6 +151,13 @@ pub struct AnchoredPanel<'a> {
     /// when the panel covers the whole canvas). Callers compute the rect
     /// as `canvas_rect.shrink(margin)`.
     pub maximized_rect: Option<Rect>,
+    /// When `true`, render the squircle backdrop's outer stroke at
+    /// `palette::PRIMARY` (3px) instead of the standard 1px
+    /// `palette::BORDER` — visual indicator that this panel is the
+    /// currently focused window (scroll/text input goes here, not the
+    /// canvas). Caller derives the bool by comparing the panel's id to
+    /// `AppState::focused_panel`.
+    pub focused: bool,
 }
 
 /// Outcome of [`AnchoredPanel::show`]. `drag_delta` carries the
@@ -191,11 +198,20 @@ impl<'a> AnchoredPanel<'a> {
             expanded: false,
             reserved_size: None,
             maximized_rect: None,
+            focused: false,
         }
     }
 
     pub fn expanded(mut self, expanded: bool) -> Self {
         self.expanded = expanded;
+        self
+    }
+
+    /// Mark this panel as the focused window. Drives the
+    /// `palette::PRIMARY` red 3px outer stroke that distinguishes the
+    /// focused panel from the standard `palette::BORDER` chrome.
+    pub fn focused(mut self, focused: bool) -> Self {
+        self.focused = focused;
         self
     }
 
@@ -339,6 +355,11 @@ impl<'a> AnchoredPanel<'a> {
         let area_id = self.id;
         let corner_radius = self.corner_radius;
         let inner_margin = self.inner_margin;
+        let outer_stroke = if self.focused {
+            Stroke::new(3.0, theme::palette::PRIMARY)
+        } else {
+            Stroke::new(1.0, theme::palette::BORDER)
+        };
 
         let area = egui::Area::new(area_id)
             .order(Order::Foreground)
@@ -376,7 +397,7 @@ impl<'a> AnchoredPanel<'a> {
                         squircle::DEFAULT_SEGMENTS_PER_CORNER,
                     ),
                     theme::FLOATING_BACKDROP,
-                    Stroke::new(1.0, theme::palette::BORDER),
+                    outer_stroke,
                 ),
             );
 

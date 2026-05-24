@@ -841,6 +841,16 @@ pub struct AppState {
     /// log is intentionally session-scoped).
     #[serde(skip)]
     pub frontend_events: FrontendEventLog,
+    /// Currently logically-focused non-canvas panel. `None` means the
+    /// canvas is focused (the always-receiving fallback). Drives:
+    ///   * Scroll-wheel zoom gating in `ui::workspace` — when a panel
+    ///     is focused, wheel events belong to its inner `ScrollArea`
+    ///     and don't double-zoom the canvas.
+    ///   * Per-panel "focused" visual chrome — `palette::PRIMARY` red
+    ///     border instead of the standard 1px `palette::BORDER`.
+    /// Session-scoped, never persisted.
+    #[serde(skip)]
+    pub focused_panel: Option<FocusedPanel>,
 }
 
 impl AppState {
@@ -948,6 +958,25 @@ mod rect_opt_serde {
             egui::Rect::from_min_max(egui::pos2(x0, y0), egui::pos2(x1, y1))
         }))
     }
+}
+
+/// Logical "focused window" identifier. Tracks which non-canvas panel
+/// currently owns scroll / text input so wheel events scrolled inside an
+/// inspector body don't simultaneously zoom the canvas.
+///
+/// `None` (the absence) means the canvas is focused — the canvas is the
+/// always-receiving fallback. Session-scoped, never persisted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum FocusedPanel {
+    /// Promoted anchored panel for the given node idx.
+    AnchoredNode(u32),
+    /// Floating or tiled section panel.
+    Section(Section),
+    FilterStrip,
+    /// The debug console (right-justified by default — handled like a
+    /// section via `Section::Debug`, kept as a dedicated variant for
+    /// future divergence).
+    Debug,
 }
 
 /// Identifies a floating/dockable panel that can be collapsed into the tray
@@ -1094,6 +1123,7 @@ impl Default for AppState {
             snapshot_source: None,
             debug_view_mode: DebugViewMode::default(),
             frontend_events: FrontendEventLog::default(),
+            focused_panel: None,
         }
     }
 }

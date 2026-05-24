@@ -37,7 +37,7 @@ use serde::{Deserialize, Serialize};
 use crate::perf::PerfCollector;
 use crate::ui::actions::ActionRegistry;
 use crate::ui::layout::registry::LayoutRegistry;
-use crate::ui::state::{AppState, Section};
+use crate::ui::state::{AppState, FocusedPanel, Section};
 use crate::ui::theme::{self, palette};
 
 /// Placement mode for a toggleable panel. `Floating` keeps the panel in
@@ -313,6 +313,9 @@ pub enum PaneOp {
     Float(egui_tiles::TileId, PaneKind),
     /// Close this tile and mark the underlying pane closed.
     Close(egui_tiles::TileId, PaneKind),
+    /// User clicked inside this tile's body or header — promote it to
+    /// the focused window.
+    Focus(FocusedPanel),
 }
 
 /// The `Behavior` implementation that paints each tile's body. Holds
@@ -325,6 +328,23 @@ pub struct TileBehavior<'a> {
     pub layout_registry: &'a LayoutRegistry,
     pub perf: &'a PerfCollector,
     pub ops: Vec<PaneOp>,
+    /// Snapshot of the app-wide focused panel at the start of the
+    /// frame. Drives the focused-tile border. Updated via queued
+    /// `PaneOp::Focus` after the tree walk.
+    pub focused_panel: Option<FocusedPanel>,
+}
+
+impl<'a> TileBehavior<'a> {
+    /// Map a `PaneKind` to its `FocusedPanel` discriminator (None for
+    /// the Empty placeholder, which is never focusable).
+    fn focus_id_for(pane: &PaneKind) -> Option<FocusedPanel> {
+        match pane {
+            PaneKind::Section(Section::Debug) => Some(FocusedPanel::Debug),
+            PaneKind::Section(s) => Some(FocusedPanel::Section(*s)),
+            PaneKind::FilterStrip => Some(FocusedPanel::FilterStrip),
+            PaneKind::Empty => None,
+        }
+    }
 }
 
 impl<'a> egui_tiles::Behavior<PaneKind> for TileBehavior<'a> {
@@ -354,6 +374,32 @@ impl<'a> egui_tiles::Behavior<PaneKind> for TileBehavior<'a> {
         tile_id: egui_tiles::TileId,
         pane: &mut PaneKind,
     ) -> egui_tiles::UiResponse {
+        // Pane outer rect — used below to paint the focused-tile
+        // border AND to detect a pointer-press anywhere inside the
+        // tile (header or body) for focus acquisition.
+        let pane_rect = ui.max_rect();
+        let my_focus = Self::focus_id_for(pane);
+        let is_focused = matches!((my_focus, self.focused_panel),
+            (Some(a), Some(b)) if a == b);
+
+        // Detect a focus-acquire interaction: any pointer-press that
+        // landed inside this pane's rect this frame. Cheaper than
+        // sensing a dedicated invisible widget over the whole tile,
+        // and works regardless of which child widget consumed the
+        // click.
+        if let Some(focus_id) = my_focus {
+            let pressed_inside = ui.ctx().input(|i| {
+                i.pointer.any_pressed()
+                    && i.pointer
+                        .interact_pos()
+                        .map(|p| pane_rect.contains(p))
+                        .unwrap_or(false)
+            });
+            if pressed_inside && self.focused_panel != Some(focus_id) {
+                self.ops.push(PaneOp::Focus(focus_id));
+            }
+        }
+
         // Header row: title + split-h / split-v / float / close.
         ui.horizontal(|ui| {
             ui.label(
@@ -425,6 +471,16 @@ impl<'a> egui_tiles::Behavior<PaneKind> for TileBehavior<'a> {
                 );
             }
         }
+        // Focused-tile highlight: paint a `palette::PRIMARY` 3px
+        // border on top of the tile body for the focused pane.
+        // Painted last so it overlays the body content cleanly.
+        if is_focused {
+            ui.painter().rect_stroke(
+                pane_rect,
+                0.0,
+                egui::Stroke::new(3.0, palette::PRIMARY),
+            );
+        }
         egui_tiles::UiResponse::None
     }
 }
@@ -453,11 +509,21 @@ pub fn apply_pane_ops(
             }
             PaneOp::Close(target, pane) => {
                 tree.tree.tiles.remove(target);
+                // Closing the focused tile returns focus to the canvas.
+                let was_focused = TileBehavior::focus_id_for(&pane)
+                    .map(|f| state.focused_panel == Some(f))
+                    .unwrap_or(false);
                 match &pane {
                     PaneKind::Section(s) => state.set_section_open(*s, false),
                     PaneKind::FilterStrip => state.filter_strip_open = false,
                     PaneKind::Empty => {}
                 }
+                if was_focused {
+                    state.focused_panel = None;
+                }
+            }
+            PaneOp::Focus(focus_id) => {
+                state.focused_panel = Some(focus_id);
             }
         }
     }
@@ -577,12 +643,14 @@ pub fn show_workspace_panel(
             // AppState mutably. Put it back unconditionally below.
             let mut workspace = std::mem::take(&mut state.tiles);
             let ops = {
+                let focused_panel = state.focused_panel;
                 let mut behavior = TileBehavior {
                     state,
                     registry,
                     layout_registry,
                     perf,
                     ops: Vec::new(),
+                    focused_panel,
                 };
                 workspace.tree.ui(&mut behavior, ui);
                 behavior.ops

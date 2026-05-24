@@ -104,6 +104,13 @@ pub struct WorkspaceCtx<'a> {
     /// the canvas. Pointer-in-canvas gating happens in the consumer.
     pub input_events: &'a [jump_io::Event<crate::ui::input::AppAction>],
 
+    /// When `Some`, a non-canvas panel logically owns scroll input —
+    /// wheel-zoom events are not consumed by the canvas. Plumbed from
+    /// `AppState::focused_panel` so the gating logic in `draw_graph_tab`
+    /// matches the rest of the UI's notion of focus. `None` means the
+    /// canvas is the focused surface and zoom routes here as normal.
+    pub focused_panel: Option<crate::ui::state::FocusedPanel>,
+
     // Out: filled by the graph tab when it runs.
     pub canvas_rect: Option<egui::Rect>,
     pub pointer_in_canvas: Option<egui::Pos2>,
@@ -322,6 +329,17 @@ impl<'a, 'ctx> WorkspaceViewer<'a, 'ctx> {
         // user dragging out of a sidebar text field can't fly the
         // view. Shift-held suppresses CameraRotate so the cursor-repel
         // tool above keeps RMB+Shift to itself.
+        //
+        // "Currently focused window" gate: when any non-canvas panel
+        // (inspector / section / filter strip / debug) is focused, the
+        // scroll wheel belongs to its inner ScrollArea — the canvas
+        // must NOT also consume the wheel as a zoom event. Without
+        // this, scrolling inside an expanded inspector body both
+        // scrolled the body AND zoomed the camera. The gate applies to
+        // wheel + pinch zoom AND to scroll-driven PanZ (same input
+        // stream). Camera-rotate (RMB drag) and WASDQE pan stay live
+        // — they don't conflict with panel scroll.
+        let panel_owns_scroll = self.ctx.focused_panel.is_some();
         let mut zoom_consumed = false;
         for ev in self.ctx.input_events {
             match ev {
@@ -358,12 +376,14 @@ impl<'a, 'ctx> WorkspaceViewer<'a, 'ctx> {
                     }
                 }
                 jump_io::Event::Axis1(AppAction::PanZ, v) => {
-                    if pointer_in_canvas {
+                    // PanZ also rides the scroll stream on some
+                    // bindings — skip when a panel owns scroll.
+                    if pointer_in_canvas && !panel_owns_scroll {
                         pan_z += v * pan_speed;
                     }
                 }
                 jump_io::Event::Axis1(AppAction::CameraZoomPinch, v) => {
-                    if !pointer_in_canvas || v.abs() <= 1e-3 {
+                    if !pointer_in_canvas || panel_owns_scroll || v.abs() <= 1e-3 {
                         continue;
                     }
                     // Trigger::Pinch emits the *log* of pinch_delta —
@@ -376,7 +396,7 @@ impl<'a, 'ctx> WorkspaceViewer<'a, 'ctx> {
                     zoom_consumed = true;
                 }
                 jump_io::Event::Axis1(AppAction::CameraZoomWheel, v) => {
-                    if !pointer_in_canvas || pinch_active || v.abs() <= 0.5 {
+                    if !pointer_in_canvas || panel_owns_scroll || pinch_active || v.abs() <= 0.5 {
                         // De-double-count: many laptops emit the
                         // same two-finger gesture as both pinch AND
                         // smooth scroll in the same frame. Pinch
