@@ -1006,7 +1006,7 @@ impl PanelId {
 // (BTreeMap<Section, …>); serde refuses to deserialize an unknown enum
 // discriminant, so the bump invalidates the cached AppState exactly once
 // per user rather than silently corrupting state.
-pub const STORAGE_KEY: &str = "graph_renderer_app_state_v6";
+pub const STORAGE_KEY: &str = "graph_renderer_app_state_v7";
 
 fn default_true() -> bool { true }
 

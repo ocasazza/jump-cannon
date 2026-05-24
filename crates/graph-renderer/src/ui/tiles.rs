@@ -43,10 +43,16 @@ use crate::ui::theme::{self, palette};
 /// Placement mode for a toggleable panel. `Floating` keeps the panel in
 /// the historical `FloatingPanel` chrome; `Tiled` puts it into the
 /// workspace tree on the right.
+///
+/// Default is **Tiled** — opening a panel from the tray immediately
+/// snaps it into the workspace so the tiling story is the discoverable
+/// path. Users who want a free-roaming window flip the placement via
+/// the ⤢ toggle in the panel header (FloatingPanel's `with_placement`
+/// affordance).
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub enum Placement {
-    #[default]
     Floating,
+    #[default]
     Tiled,
 }
 
@@ -83,7 +89,7 @@ pub struct TileWorkspace {
     pub width: f32,
 }
 
-fn default_width() -> f32 { 420.0 }
+fn default_width() -> f32 { 480.0 }
 
 impl Default for TileWorkspace {
     fn default() -> Self {
@@ -559,7 +565,7 @@ pub fn show_workspace_panel(
     let response = egui::SidePanel::right("tile-workspace")
         .resizable(true)
         .default_width(initial_width)
-        .min_width(220.0)
+        .min_width(280.0)
         .frame(
             egui::Frame::none()
                 .fill(theme::FLOATING_BACKDROP)
