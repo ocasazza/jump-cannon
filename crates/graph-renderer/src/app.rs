@@ -1345,7 +1345,27 @@ impl eframe::App for App {
             let rect_h = rect.height().max(1.0);
             let ndc_x = (pos.x - rect.left()) / rect_w * 2.0 - 1.0;
             let ndc_y = -((pos.y - rect.top()) / rect_h * 2.0 - 1.0);
-            if let Some(idx) = self.raycast_idx(frame, ndc_x, ndc_y, [rect_w, rect_h]) {
+            let click_hit = self
+                .raycast_idx(frame, ndc_x, ndc_y, [rect_w, rect_h])
+                .filter(|&idx| {
+                    // Same gate as hover: in Filter mode, clicks on
+                    // filtered-out nodes are no-ops. Without this, the
+                    // user can sticky-focus a filtered node and the
+                    // promoted anchored card opens for an invisible
+                    // target — same "reappears via panel chrome" bug.
+                    if !matches!(
+                        self.state.filter_behavior,
+                        crate::ui::state::FilterBehavior::Filter
+                    ) {
+                        return true;
+                    }
+                    self.field_index
+                        .as_ref()
+                        .and_then(|fi| fi.matches(&self.state.query.active_filters))
+                        .map(|set| set.contains(&idx))
+                        .unwrap_or(true)
+                });
+            if let Some(idx) = click_hit {
                 if let Some(id) = self.id_for_idx(idx) {
                     log::info!(
                         "[graph-renderer] click hit node idx={} id={}",
@@ -2238,7 +2258,33 @@ impl App {
         let rect_h = rect.height().max(1.0);
         let ndc_x = (pos.x - rect.left()) / rect_w * 2.0 - 1.0;
         let ndc_y = -((pos.y - rect.top()) / rect_h * 2.0 - 1.0);
-        let hit = self.raycast_idx(frame, ndc_x, ndc_y, [rect_w, rect_h]);
+        let raw_hit = self.raycast_idx(frame, ndc_x, ndc_y, [rect_w, rect_h]);
+        // Filter-out gate: when the user has the filter behavior set to
+        // `Filter` (discard non-matches) AND a non-empty filter set is
+        // active, raycast hits on filtered-out nodes must be ignored —
+        // otherwise the hover-preview panel + its tether line render
+        // for an invisible node, making the filtered node visually
+        // reappear (via the panel chrome, not the wgpu shader — the
+        // shader correctly culls). For `FilterBehavior::Focus`
+        // (non-matches dimmed but visible) filtered nodes stay
+        // hoverable — that's the whole point of focus mode.
+        let hit = match raw_hit {
+            Some(idx)
+                if matches!(
+                    self.state.filter_behavior,
+                    crate::ui::state::FilterBehavior::Filter
+                ) =>
+            {
+                let allowed = self
+                    .field_index
+                    .as_ref()
+                    .and_then(|fi| fi.matches(&self.state.query.active_filters))
+                    .map(|set| set.contains(&idx))
+                    .unwrap_or(true);
+                if allowed { Some(idx) } else { None }
+            }
+            other => other,
+        };
         match hit {
             Some(idx) => {
                 if self.focus_hover_idx != Some(idx) {
