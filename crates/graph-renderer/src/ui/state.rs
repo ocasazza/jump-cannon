@@ -1006,7 +1006,11 @@ impl PanelId {
 // (BTreeMap<Section, …>); serde refuses to deserialize an unknown enum
 // discriminant, so the bump invalidates the cached AppState exactly once
 // per user rather than silently corrupting state.
-pub const STORAGE_KEY: &str = "graph_renderer_app_state_v7";
+// Single stable key. Pre-alpha: breaking serde changes are expected;
+// the load path in `ui::persist` already falls back to AppState::default
+// when deserialization fails, so a schema break just resets to defaults
+// on next reload. No version ceremony.
+pub const STORAGE_KEY: &str = "graph_renderer_app_state";
 
 fn default_true() -> bool { true }
 
