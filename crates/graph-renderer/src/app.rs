@@ -1292,14 +1292,17 @@ impl eframe::App for App {
                         .dock_state
                         .iter_all_tabs()
                         .count();
+                    let force_show = self.state.dock_tab_strip_force_show;
+                    self.state.dock_tab_strip_force_show = false;
+                    let show_tab = force_show || n_tabs > 1;
                     let mut style = egui_dock::Style::from_egui(ui.style());
-                    if n_tabs <= 1 {
+                    if !show_tab {
                         style.tab_bar.height = 0.0;
                         style.tab_bar.bg_fill = egui::Color32::TRANSPARENT;
                     }
                     egui_dock::DockArea::new(&mut self.state.dock.dock_state)
-                        .show_add_buttons(n_tabs > 1)
-                        .show_add_popup(n_tabs > 1)
+                        .show_add_buttons(show_tab)
+                        .show_add_popup(show_tab)
                         .style(style)
                         .show_inside(ui, &mut viewer);
                 });
@@ -2009,6 +2012,14 @@ impl App {
             match serde_json::from_value::<GpuForceOptions>(json_owned.clone()) {
                 Ok(mut opts) => {
                     opts.repulsion_radius = (4.0 * opts.spring_len).max(1.0);
+                    // Cap steps_per_call to prevent excessive GPU load and overheating
+                    // Persisted high values from older configurations can cause sustained
+                    // GPU usage leading to thermal issues. This cap ensures tuned values
+                    // survive while preventing excessive values.
+                    const MAX_STEPS_PER_CALL: u32 = 16;
+                    if opts.steps_per_call > MAX_STEPS_PER_CALL {
+                        opts.steps_per_call = MAX_STEPS_PER_CALL;
+                    }
                     serde_json::to_value(&opts).unwrap_or(json_owned)
                 }
                 Err(_) => json_owned,
