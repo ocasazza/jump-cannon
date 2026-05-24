@@ -80,7 +80,7 @@ pub fn show_tray(ctx: &egui::Context, state: &mut AppState, progress: &Progress)
         .frame(frame)
         .show(ctx, |ui| {
             ui.horizontal_centered(|ui| {
-                ui.spacing_mut().item_spacing.x = 2.0;
+                ui.spacing_mut().item_spacing.x = 4.0;
                 for &section in Section::ALL {
                     let active = state.is_section_open(section);
                     if tray_icon_button(ui, |painter, rect, color| {
@@ -159,10 +159,20 @@ pub fn show_tray(ctx: &egui::Context, state: &mut AppState, progress: &Progress)
         });
 }
 
-/// Compact 22×22 tray icon button. Caller supplies a paint closure that
-/// draws the icon glyph into the given rect. Active = white-on-black;
-/// hovered = grey-40 bg with white glyph; idle = transparent with icon-grey
-/// glyph. Returns the click response.
+/// Compact 18×18 tray icon button (≈3/4 the previous 22 px footprint).
+/// Caller supplies a paint closure that draws the icon glyph into the
+/// **inner** rect (the button rect shrunk by 2 px so the glyph never
+/// touches the border).
+///
+/// Color scheme:
+/// - active = `palette::PRIMARY` background (the red highlight) +
+///   white glyph — toggled panels POP against the tray.
+/// - hovered = grey-40 background + white glyph.
+/// - idle = transparent background + `palette::ICON` glyph.
+///
+/// Every state renders a 1 px `palette::BORDER` stroke around the
+/// rounded button so the icon footprint reads as a discrete control
+/// even when idle.
 fn tray_icon_button(
     ui: &mut egui::Ui,
     paint: impl FnOnce(&egui::Painter, egui::Rect, egui::Color32),
@@ -170,18 +180,23 @@ fn tray_icon_button(
     tooltip: &str,
 ) -> egui::Response {
     let (rect, response) =
-        ui.allocate_exact_size(egui::vec2(22.0, 22.0), egui::Sense::click());
+        ui.allocate_exact_size(egui::vec2(18.0, 18.0), egui::Sense::click());
     let hovered = response.hovered();
     let (bg, fg) = if active {
-        (egui::Color32::WHITE, egui::Color32::BLACK)
+        (palette::PRIMARY, egui::Color32::WHITE)
     } else if hovered {
         (egui::Color32::from_gray(40), egui::Color32::WHITE)
     } else {
         (egui::Color32::TRANSPARENT, palette::ICON)
     };
     let painter = ui.painter();
-    painter.rect_filled(rect, 3.0, bg);
-    paint(painter, rect, fg);
+    let corner = 3.0;
+    painter.rect_filled(rect, corner, bg);
+    painter.rect_stroke(rect, corner, egui::Stroke::new(1.0, palette::BORDER));
+    // Inner glyph rect: 2 px inset on every side so the icon never
+    // touches the border. draw_icon's offsets are absolute from the
+    // rect center, so this just nudges the glyph inward.
+    paint(painter, rect.shrink(2.0), fg);
     response.on_hover_text(tooltip)
 }
 

@@ -1177,11 +1177,20 @@ impl eframe::App for App {
             PaletteOutcome::None => {}
         }
 
-        // Status footer — sits at the bottom of the screen, above the
-        // central panel which auto-shrinks to fit. Registered after the
-        // sidebar/inspector so the side panels still own the full
-        // height of the screen.
+        // Bottom-of-screen panel stack: egui stacks bottom panels in
+        // registration order with the FIRST being outermost. So:
+        //   1. Tray strip (always-visible icon launcher, fixed height).
+        //   2. Status footer (expand/contract sticky panel, sits ABOVE
+        //      the tray, shows task list + log buffer when expanded).
+        // The user wants the tray pinned to the absolute bottom while
+        // the status footer collapses/expands without ever covering the
+        // tray. Register tray first.
         ui::status_footer::show_tray(ctx, &mut self.state, &self.progress);
+        ui::status_footer::show(
+            ctx,
+            &mut self.state.status_footer_open,
+            &mut self.progress,
+        );
 
         // Tileable workspace — mounts a right-side panel hosting the
         // `egui_tiles::Tree` when at least one section / filter strip is
