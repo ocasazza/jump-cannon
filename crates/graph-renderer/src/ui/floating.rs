@@ -15,23 +15,32 @@ use eframe::egui::{self, Color32, Id, Rect, Stroke};
 use crate::ui::squircle;
 use crate::ui::state::PanelId;
 use crate::ui::theme::{self, palette};
+use crate::ui::tiles::Placement;
 
 /// Builder for a squircle-backed floating panel whose visibility is
 /// driven by a caller-owned `&mut bool`.
-pub struct FloatingPanel {
+pub struct FloatingPanel<'p> {
     id: PanelId,
     title: &'static str,
     default_pos: Option<[f32; 2]>,
     default_size: Option<[f32; 2]>,
+    /// Optional placement toggle plumbed through the header. When
+    /// `Some`, a small `⊟` button appears between the title and the
+    /// close X; clicking it flips the placement to `Tiled` (the caller
+    /// is expected to react by snap-inserting the panel into the
+    /// workspace tree on the next frame via
+    /// `ui::tiles::sync_tree_with_open_state`).
+    placement: Option<&'p mut Placement>,
 }
 
-impl FloatingPanel {
+impl<'p> FloatingPanel<'p> {
     pub fn new(id: PanelId, title: &'static str) -> Self {
         Self {
             id,
             title,
             default_pos: None,
             default_size: None,
+            placement: None,
         }
     }
 
@@ -42,6 +51,13 @@ impl FloatingPanel {
 
     pub fn default_size(mut self, size: [f32; 2]) -> Self {
         self.default_size = Some(size);
+        self
+    }
+
+    /// Plumb a `Placement` reference through the header. Adds a tile-
+    /// snap glyph next to the X.
+    pub fn with_placement(mut self, p: &'p mut Placement) -> Self {
+        self.placement = Some(p);
         self
     }
 
@@ -77,6 +93,7 @@ impl FloatingPanel {
         }
 
         let title = self.title;
+        let mut placement = self.placement;
 
         let response = window.show(ctx, |ui| {
             let rect: Rect = ui.max_rect().expand(theme::spacing::SECTION_GAP);
@@ -114,6 +131,24 @@ impl FloatingPanel {
                     |ui| {
                         if ui.small_button("X").clicked() {
                             *open = false;
+                        }
+                        if let Some(p) = placement.as_deref_mut() {
+                            // ⊟ when currently floating → click to tile;
+                            // ⤢ when currently tiled → click to float.
+                            // (When tiled, this branch usually isn't
+                            // rendered because the panel goes through
+                            // the tile chrome instead, but we keep the
+                            // toggle symmetrical for completeness.)
+                            let (glyph, tip) = match p {
+                                Placement::Floating => ("\u{229F}", "Snap into tile workspace"),
+                                Placement::Tiled => ("\u{2922}", "Float (un-tile)"),
+                            };
+                            if ui.small_button(glyph).on_hover_text(tip).clicked() {
+                                *p = match *p {
+                                    Placement::Floating => Placement::Tiled,
+                                    Placement::Tiled => Placement::Floating,
+                                };
+                            }
                         }
                     },
                 );

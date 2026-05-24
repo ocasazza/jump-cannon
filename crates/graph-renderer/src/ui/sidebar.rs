@@ -68,41 +68,6 @@ pub(crate) fn draw_icon(painter: &egui::Painter, rect: egui::Rect, section: Sect
             );
             painter.rect_stroke(bump, 0.0, s);
         }
-        // Focus: concentric circles.
-        Section::Focus => {
-            painter.circle_stroke(center, 9.0, s);
-            painter.circle_stroke(center, 5.0, s);
-            painter.circle_filled(center, 1.5, color);
-        }
-        // Cursor: crosshair.
-        Section::Cursor => {
-            painter.circle_stroke(center, 8.0, s);
-            painter.line_segment(
-                [egui::pos2(center.x - 11.0, center.y), egui::pos2(center.x - 4.0, center.y)],
-                s,
-            );
-            painter.line_segment(
-                [egui::pos2(center.x + 4.0, center.y), egui::pos2(center.x + 11.0, center.y)],
-                s,
-            );
-            painter.line_segment(
-                [egui::pos2(center.x, center.y - 11.0), egui::pos2(center.x, center.y - 4.0)],
-                s,
-            );
-            painter.line_segment(
-                [egui::pos2(center.x, center.y + 4.0), egui::pos2(center.x, center.y + 11.0)],
-                s,
-            );
-        }
-        // Stats: lowercase i in a circle.
-        Section::Stats => {
-            painter.circle_stroke(center, 9.0, s);
-            painter.circle_filled(center + egui::vec2(0.0, -4.0), 1.5, color);
-            painter.line_segment(
-                [center + egui::vec2(0.0, -1.0), center + egui::vec2(0.0, 5.0)],
-                s,
-            );
-        }
         // Debug: a tiny line chart (sparkline).
         Section::Debug => {
             let pts = [
@@ -167,22 +132,52 @@ pub fn show_floating(
         if !state.is_section_open(section) {
             continue;
         }
+        // Tiled panels live in the workspace tree; skip the floating
+        // chrome for them. The workspace SidePanel renders them.
+        if crate::ui::tiles::section_placement(state, section)
+            == crate::ui::tiles::Placement::Tiled
+        {
+            continue;
+        }
         let mut open = true;
-        let pos = [16.0 + idx as f32 * 12.0, 64.0 + idx as f32 * 24.0];
-        // Instances packs a State timeline AND a YAML import/export
-        // block (two ~12-row TextEdits) under one roof — give it more
-        // vertical room so both sub-regions are reachable without
-        // scrolling. Other panels keep the compact default.
+        // Debug is right-justified on first open (the user wants the
+        // console hugging the right edge of the canvas so it doesn't
+        // overlap the section panels cascading from the left). Other
+        // panels keep the cascading default.
         let default_size = match section {
             Section::Instances => [320.0, 680.0],
+            Section::Debug => [360.0, 520.0],
             _ => [280.0, 520.0],
         };
+        let pos = if matches!(section, Section::Debug) {
+            let screen = ctx.screen_rect();
+            let panel_w = default_size[0];
+            let margin = 16.0;
+            if screen.width() > panel_w + margin {
+                [screen.right() - panel_w - margin, 64.0]
+            } else {
+                [16.0 + idx as f32 * 12.0, 64.0 + idx as f32 * 24.0]
+            }
+        } else {
+            [16.0 + idx as f32 * 12.0, 64.0 + idx as f32 * 24.0]
+        };
+        let mut placement = crate::ui::tiles::section_placement(state, section);
+        let placement_before = placement;
         FloatingPanel::new(PanelId::Section(section), section.title())
             .default_pos(pos)
             .default_size(default_size)
+            .with_placement(&mut placement)
             .show(ctx, &mut open, |ui| {
                 render_section_body(ui, state, section, registry, layout_registry, perf);
             });
+        if placement != placement_before {
+            state.section_placement.insert(section, placement);
+            if placement == crate::ui::tiles::Placement::Tiled {
+                let mut ws = std::mem::take(&mut state.tiles);
+                ws.snap_insert(crate::ui::tiles::PaneKind::Section(section));
+                state.tiles = ws;
+            }
+        }
         if !open {
             state.set_section_open(section, false);
         }

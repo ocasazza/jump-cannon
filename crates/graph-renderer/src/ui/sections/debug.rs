@@ -1,14 +1,19 @@
-//! Debug / perf section.
+//! Debug console.
 //!
-//! Reads from the `PerfCollector` ring buffer the App fills each frame
-//! and renders a stack of compact line charts via `egui_plot`. The
-//! collector is owned by `App`; we only borrow `&PerfCollector` here.
+//! Two-mode panel: an [`Events`](super::super::state::DebugViewMode::Events)
+//! view that scrolls the rolling frontend-event log, and a
+//! [`Stats`](super::super::state::DebugViewMode::Stats) view that holds the
+//! perf charts plus the engine-status summary previously hosted by the
+//! standalone Stats section.
+//!
+//! The Stats view borrows a `&PerfCollector` filled by `App` each frame
+//! and renders a stack of compact line charts via `egui_plot`.
 
 use eframe::egui;
 use egui_plot::{Corner, Legend, Line, Plot, PlotPoints};
 
 use crate::perf::{PerfCollector, StageId};
-use crate::ui::state::AppState;
+use crate::ui::state::{AppState, DebugViewMode, SimStatus};
 use crate::ui::theme::accent;
 
 use super::{subgroup_label, subgroup_separator};
@@ -18,7 +23,147 @@ const CHART_WINDOW_SECS: f64 = 10.0;
 
 pub fn show(ui: &mut egui::Ui, state: &mut AppState, perf: &PerfCollector) {
     state.snapshot_source = Some("Debug".into());
-    // Halted / running badge ------------------------------------------------
+
+    // Mode toggle ----------------------------------------------------------
+    ui.horizontal(|ui| {
+        let mut mode = state.debug_view_mode;
+        for option in [DebugViewMode::Events, DebugViewMode::Stats] {
+            let label = match option {
+                DebugViewMode::Events => "Events",
+                DebugViewMode::Stats => "Stats",
+            };
+            if ui
+                .selectable_label(mode == option, label)
+                .clicked()
+                && mode != option
+            {
+                mode = option;
+                let to_label = match option {
+                    DebugViewMode::Events => "events",
+                    DebugViewMode::Stats => "stats",
+                };
+                state.frontend_events.push(
+                    "debug",
+                    format!("mode -> {to_label}"),
+                );
+            }
+        }
+        if mode != state.debug_view_mode {
+            state.debug_view_mode = mode;
+        }
+    });
+    ui.add_space(6.0);
+
+    match state.debug_view_mode {
+        DebugViewMode::Events => show_events(ui, state),
+        DebugViewMode::Stats => show_stats(ui, state, perf),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Events view
+// ---------------------------------------------------------------------------
+
+fn show_events(ui: &mut egui::Ui, state: &mut AppState) {
+    let total = state.frontend_events.entries.len();
+    ui.label(
+        egui::RichText::new(format!(
+            "{total} event(s) (cap {})",
+            state.frontend_events.cap
+        ))
+        .monospace()
+        .size(11.0)
+        .color(egui::Color32::from_gray(160)),
+    );
+    ui.add_space(4.0);
+
+    egui::ScrollArea::vertical()
+        .auto_shrink([false, false])
+        .max_height(ui.available_height() - 30.0)
+        .show(ui, |ui| {
+            if state.frontend_events.entries.is_empty() {
+                ui.label(
+                    egui::RichText::new("(no events yet — try the palette, a chip, or a section)")
+                        .italics()
+                        .size(11.0)
+                        .color(egui::Color32::from_gray(140)),
+                );
+                return;
+            }
+            // Newest first.
+            for ev in state.frontend_events.entries.iter().rev() {
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new(format_hms(ev.timestamp_ms))
+                            .monospace()
+                            .size(11.0)
+                            .color(egui::Color32::from_gray(140)),
+                    );
+                    ui.label(
+                        egui::RichText::new(&ev.source)
+                            .monospace()
+                            .size(11.0)
+                            .color(accent::GREEN),
+                    );
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(&ev.message)
+                                .monospace()
+                                .size(11.0)
+                                .color(egui::Color32::from_gray(210)),
+                        )
+                        .wrap(),
+                    );
+                });
+            }
+        });
+
+    ui.add_space(4.0);
+    ui.horizontal(|ui| {
+        if ui
+            .small_button("Clear")
+            .on_hover_text("Drop all event log entries")
+            .clicked()
+        {
+            state.frontend_events.clear();
+        }
+    });
+}
+
+fn format_hms(ms: u64) -> String {
+    let secs_in_day = (ms / 1000) % 86_400;
+    let h = secs_in_day / 3600;
+    let m = (secs_in_day % 3600) / 60;
+    let s = secs_in_day % 60;
+    format!("{h:02}:{m:02}:{s:02}")
+}
+
+// ---------------------------------------------------------------------------
+// Stats view (previously `sections/stats.rs` + the perf charts that already
+// lived here). Widgets and labels are preserved verbatim — only the host
+// section has changed.
+// ---------------------------------------------------------------------------
+
+fn show_stats(ui: &mut egui::Ui, state: &mut AppState, perf: &PerfCollector) {
+    // Engine status dot (was in stats.rs).
+    let (sim_color, sim_label) = match state.sim_status {
+        SimStatus::Running => (accent::GREEN, "running"),
+        SimStatus::Settled => (accent::YELLOW, "settled"),
+        SimStatus::Error => (accent::RED, "error"),
+    };
+    ui.horizontal(|ui| {
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
+        ui.painter().rect_filled(rect, 0.0, sim_color);
+        ui.label(
+            egui::RichText::new(sim_label)
+                .monospace()
+                .size(11.0)
+                .color(egui::Color32::from_gray(180)),
+        );
+    });
+
+    // Halted / running badge from the perf collector (was at the top of
+    // the old debug section).
     let (dot_color, label) = if perf.last_halted {
         (accent::YELLOW, "halted")
     } else {
@@ -43,16 +188,21 @@ pub fn show(ui: &mut egui::Ui, state: &mut AppState, perf: &PerfCollector) {
 
     ui.add_space(4.0);
     let s = &state.stats;
+    let n = if s.n_nodes == 0 { "—".to_string() } else { s.n_nodes.to_string() };
+    let m = if s.n_edges == 0 { "—".to_string() } else { s.n_edges.to_string() };
+    let c = if s.n_communities == 0 {
+        "—".to_string()
+    } else {
+        s.n_communities.to_string()
+    };
+    ui.label(egui::RichText::new(format!("nodes       {n}")).monospace());
+    ui.label(egui::RichText::new(format!("edges       {m}")).monospace());
+    ui.label(egui::RichText::new(format!("communities {c}")).monospace());
     ui.label(
-        egui::RichText::new(format!(
-            "nodes {}  edges {}  samples {}",
-            s.n_nodes,
-            s.n_edges,
-            perf.len()
-        ))
-        .monospace()
-        .size(11.0)
-        .color(egui::Color32::from_gray(180)),
+        egui::RichText::new(format!("samples     {}", perf.len()))
+            .monospace()
+            .size(11.0)
+            .color(egui::Color32::from_gray(180)),
     );
 
     subgroup_separator(ui);
@@ -85,11 +235,7 @@ pub fn show(ui: &mut egui::Ui, state: &mut AppState, perf: &PerfCollector) {
     subgroup_label(ui, "Stage timings (ms)");
     ui.add_space(2.0);
     let plot_id = ui.id().with("perf-chart-stages");
-    let plot_x_max = perf
-        .samples()
-        .last()
-        .map(|s| s.t)
-        .unwrap_or(0.0);
+    let plot_x_max = perf.samples().last().map(|s| s.t).unwrap_or(0.0);
     let plot_x_min = (plot_x_max - CHART_WINDOW_SECS).max(0.0);
     Plot::new(plot_id)
         .width(ui.available_width())
@@ -98,8 +244,6 @@ pub fn show(ui: &mut egui::Ui, state: &mut AppState, perf: &PerfCollector) {
         .allow_drag(false)
         .allow_scroll(false)
         .show_axes([false, true])
-        // Pin the legend to a corner so it stays inside the plot rect
-        // instead of spilling out the right edge on a narrow sidebar.
         .legend(
             Legend::default()
                 .background_alpha(0.4)
@@ -121,15 +265,9 @@ pub fn show(ui: &mut egui::Ui, state: &mut AppState, perf: &PerfCollector) {
             }
         });
 
-    // Per-stage avg/p99/max readout. Two lines per stage on narrow
-    // panels: label on top with the colour swatch, stats wrapped under.
-    // The previous single-line `{:<22}` monospace pad assumed a wide
-    // panel and overflowed at the default 280px section width.
     ui.add_space(4.0);
     for stage in StageId::ALL {
-        let stats = PerfCollector::stats(
-            perf.samples().map(|s| s.stages[stage.idx()]),
-        );
+        let stats = PerfCollector::stats(perf.samples().map(|s| s.stages[stage.idx()]));
         let [r, g, b] = stage.color();
         ui.horizontal(|ui| {
             let (rect, _) =
@@ -171,6 +309,35 @@ pub fn show(ui: &mut egui::Ui, state: &mut AppState, perf: &PerfCollector) {
         egui::Color32::from_rgb(255, 120, 200),
         "perf-chart-ke",
     );
+
+    // Cheatsheet (relocated from sections/stats.rs).
+    subgroup_separator(ui);
+    subgroup_label(ui, "Cheatsheet");
+    ui.add_space(4.0);
+    let lines = [
+        "WASD   pan",
+        "Q/E    up / down",
+        "F+drag focal plane",
+        "LMB    attract",
+        "RMB    repel",
+        "Space  pause sim",
+    ];
+    for l in lines {
+        ui.label(egui::RichText::new(l).monospace().size(11.0));
+    }
+
+    // Danger zone (relocated from sections/stats.rs).
+    ui.add_space(20.0);
+    ui.separator();
+    ui.label(egui::RichText::new("Danger zone").color(accent::RED).small());
+    ui.horizontal(|ui| {
+        if ui
+            .button(egui::RichText::new("Reset everything").color(accent::RED))
+            .clicked()
+        {
+            *state = AppState::default();
+        }
+    });
 }
 
 fn chart_block(
@@ -210,9 +377,6 @@ fn chart_block(
 }
 
 fn fps_stats_label((avg, p99, max): (f32, f32, f32)) -> String {
-    // For FPS the "p99" we want is actually the *low* end (worst frame
-    // pacing) — but we keep symmetry with the ms label and just report
-    // avg / p99 / max as computed.
     format!("avg {:.1} | p99 {:.1} | max {:.1}", avg, p99, max)
 }
 

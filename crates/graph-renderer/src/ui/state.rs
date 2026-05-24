@@ -14,9 +14,6 @@ pub enum Section {
     Style,
     Layout,
     Camera,
-    Focus,
-    Cursor,
-    Stats,
     Instances,
     Debug,
 }
@@ -27,9 +24,6 @@ impl Section {
         Section::Style,
         Section::Layout,
         Section::Camera,
-        Section::Focus,
-        Section::Cursor,
-        Section::Stats,
         Section::Instances,
         Section::Debug,
     ];
@@ -40,12 +34,71 @@ impl Section {
             Section::Style => "Style",
             Section::Layout => "Layout",
             Section::Camera => "Camera",
-            Section::Focus => "Focus",
-            Section::Cursor => "Cursor",
-            Section::Stats => "Stats",
             Section::Instances => "Instances",
             Section::Debug => "Debug",
         }
+    }
+}
+
+/// Which view the Debug section is showing: the live frontend event log
+/// or the perf / engine stats charts.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub enum DebugViewMode {
+    #[default]
+    Events,
+    Stats,
+}
+
+/// A single entry in the rolling frontend-event log surfaced by the
+/// Debug console. Captured at mutation sites (palette execute, chip
+/// toggle, section open/close, anchored promote/expand).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct FrontendEvent {
+    /// Unix epoch milliseconds at the moment the event fired.
+    pub timestamp_ms: u64,
+    /// Short tag for where the event came from, e.g. `"palette"`,
+    /// `"filter-strip"`, `"section"`, `"anchored:promote"`.
+    pub source: String,
+    /// Human-readable one-liner.
+    pub message: String,
+}
+
+/// Rolling buffer of [`FrontendEvent`]s. Capped at [`Self::cap`]; oldest
+/// evicted on push. Not persisted — `#[serde(skip)]` on [`AppState`].
+#[derive(Clone, Debug)]
+pub struct FrontendEventLog {
+    pub entries: std::collections::VecDeque<FrontendEvent>,
+    pub cap: usize,
+}
+
+impl Default for FrontendEventLog {
+    fn default() -> Self {
+        Self { entries: std::collections::VecDeque::new(), cap: 500 }
+    }
+}
+
+impl FrontendEventLog {
+    /// Append a new event tagged with `source` + `message`. Caller is
+    /// any UI mutation site — the helper handles the timestamp and the
+    /// cap-driven eviction.
+    pub fn push(&mut self, source: impl Into<String>, message: impl Into<String>) {
+        let timestamp_ms = web_time::SystemTime::now()
+            .duration_since(web_time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        self.entries.push_back(FrontendEvent {
+            timestamp_ms,
+            source: source.into(),
+            message: message.into(),
+        });
+        let cap = self.cap.max(1);
+        while self.entries.len() > cap {
+            self.entries.pop_front();
+        }
+    }
+
+    pub fn clear(&mut self) {
+        self.entries.clear();
     }
 }
 
@@ -682,6 +735,18 @@ pub struct AppState {
     /// behaviour). Missing key = closed. Default empty.
     #[serde(default)]
     pub section_open: std::collections::BTreeMap<Section, bool>,
+    /// Per-section placement: Floating (default) or Tiled. Missing key
+    /// = Floating. See [`crate::ui::tiles::Placement`].
+    #[serde(default)]
+    pub section_placement: std::collections::BTreeMap<Section, crate::ui::tiles::Placement>,
+    /// Placement of the filter strip panel. Default Floating preserves
+    /// the historical chrome.
+    #[serde(default)]
+    pub filter_strip_placement: crate::ui::tiles::Placement,
+    /// Tile-tree workspace (`egui_tiles`). Hidden when zero tiled
+    /// panels are present.
+    #[serde(default)]
+    pub tiles: crate::ui::tiles::TileWorkspace,
     pub style: StyleState,
     pub layout: LayoutState,
     pub camera: CameraState,
@@ -766,6 +831,16 @@ pub struct AppState {
     /// `tick_snapshots` (and is never persisted).
     #[serde(skip)]
     pub snapshot_source: Option<String>,
+    /// Which body the Debug console renders below its mode toggle.
+    /// Defaults to [`DebugViewMode::Events`] so a returning user sees
+    /// the live action feed first; the Stats charts are one click away.
+    #[serde(default)]
+    pub debug_view_mode: DebugViewMode,
+    /// Rolling buffer of frontend actions / events surfaced by the
+    /// Debug console's Events view. Not persisted across reloads (the
+    /// log is intentionally session-scoped).
+    #[serde(skip)]
+    pub frontend_events: FrontendEventLog,
 }
 
 impl AppState {
@@ -918,7 +993,20 @@ impl PanelId {
 // panel). Old persisted blobs carry the removed fields; serde would
 // silently drop them, but bumping the key keeps the invariant that
 // schema-breaking changes invalidate the cached blob exactly once.
-pub const STORAGE_KEY: &str = "graph_renderer_app_state_v4";
+// Bumped `_v4` → `_v5` with the addition of `section_placement`,
+// `filter_strip_placement`, and the `tiles` workspace tree. New fields
+// all have `#[serde(default)]` so the bump is precautionary — but
+// `TileWorkspace` ships an `egui_tiles::Tree` whose internal id
+// counter is per-instance and would prefer a clean slate over a
+// half-deserialized partial.
+// Bumped `_v5` → `_v6` when `Section::Focus` and `Section::Cursor` were
+// removed from the enum (Focus folded into Camera as a subgroup; Cursor
+// dropped entirely from the section tray). Old persisted blobs encode
+// these variants as map keys in `section_open` / `section_placement`
+// (BTreeMap<Section, …>); serde refuses to deserialize an unknown enum
+// discriminant, so the bump invalidates the cached AppState exactly once
+// per user rather than silently corrupting state.
+pub const STORAGE_KEY: &str = "graph_renderer_app_state_v6";
 
 fn default_true() -> bool { true }
 
@@ -932,6 +1020,10 @@ impl AppState {
         let v = self.is_section_open(s);
         log::info!("[graph-renderer] section_open -> {:?} = {}", s, !v);
         self.section_open.insert(s, !v);
+        self.frontend_events.push(
+            "section",
+            format!("{}: {}", s.title(), if !v { "open" } else { "close" }),
+        );
     }
     /// Explicit set helper — replaces the old `active_section = Some(s)`
     /// pattern at every call site.
@@ -970,6 +1062,9 @@ impl Default for AppState {
     fn default() -> Self {
         Self {
             section_open: std::collections::BTreeMap::new(),
+            section_placement: std::collections::BTreeMap::new(),
+            filter_strip_placement: crate::ui::tiles::Placement::default(),
+            tiles: crate::ui::tiles::TileWorkspace::default(),
             style: StyleState::default(),
             layout: LayoutState::default(),
             camera: CameraState::default(),
@@ -993,6 +1088,8 @@ impl Default for AppState {
             yaml_reset_armed: false,
             snapshots: SnapshotRing::default(),
             snapshot_source: None,
+            debug_view_mode: DebugViewMode::default(),
+            frontend_events: FrontendEventLog::default(),
         }
     }
 }

@@ -1,11 +1,8 @@
 pub mod camera;
-pub mod cursor;
 pub mod debug;
 pub mod filter;
-pub mod focus;
 pub mod instances;
 pub mod layout;
-pub mod stats;
 pub mod style;
 
 use eframe::egui;
@@ -39,9 +36,6 @@ pub fn show(
         Section::Style => style::show(ui, state),
         Section::Layout => layout::show(ui, state, layout_registry),
         Section::Camera => camera::show(ui, state),
-        Section::Focus => focus::show(ui, state),
-        Section::Cursor => cursor::show(ui, state),
-        Section::Stats => stats::show(ui, state),
         Section::Instances => instances::show(ui, state, registry),
         Section::Debug => debug::show(ui, state, perf),
     }

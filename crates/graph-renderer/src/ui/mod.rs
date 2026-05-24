@@ -23,6 +23,7 @@ pub mod sidebar;
 pub mod squircle;
 pub mod state;
 pub mod theme;
+pub mod tiles;
 pub mod widgets;
 pub mod workspace;
 

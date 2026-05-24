@@ -59,6 +59,10 @@ serde_json = "1"
 # Used for YAML import/export of AppState in the Instances sidebar section.
 serde_yml  = "0.0.12"
 egui_dock  = { version = "0.15", features = ["serde"] }
+# Tileable workspace (sections + filter strip can live as tiles instead
+# of free-floating panels). 0.11 is the last release compatible with the
+# pinned egui 0.30 family (0.12+ tracks egui 0.31+).
+egui_tiles = { version = "0.11", features = ["serde"] }
 fuzzy-matcher = "0.3"
 # Syntect with the pure-Rust fancy-regex engine so the same dep tree builds
 # on wasm32 (the default `regex-onig` pulls a C library that doesn't ship to

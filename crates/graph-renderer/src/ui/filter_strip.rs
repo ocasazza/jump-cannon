@@ -22,7 +22,7 @@ use eframe::egui::Ui;
 use crate::ui::badge::{Badge, BadgeAction, BadgeKind};
 use crate::ui::floating::FloatingPanel;
 use crate::ui::query::{Combinator, QueryModel};
-use crate::ui::state::{AppState, FilterBehavior, PanelId};
+use crate::ui::state::{AppState, FilterBehavior, FrontendEventLog, PanelId};
 use crate::ui::theme::palette;
 
 pub fn show(ctx: &egui::Context, query: &mut QueryModel) {
@@ -64,6 +64,10 @@ pub fn show_floating(ctx: &egui::Context, state: &mut AppState) {
     if total == 0 {
         return;
     }
+    // Tiled mode → workspace tree owns the rendering, bail.
+    if state.filter_strip_placement == crate::ui::tiles::Placement::Tiled {
+        return;
+    }
 
     // Attribute any mutations made inside the floating filter chip
     // panel (chip toggles, combinator flips, behavior toggle, clear-
@@ -71,12 +75,55 @@ pub fn show_floating(ctx: &egui::Context, state: &mut AppState) {
     // no actual mutation can't bleed onto a later unrelated diff.
     state.snapshot_source = Some("Filter: chip".into());
 
+    let mut placement = state.filter_strip_placement;
+    let placement_before = placement;
     FloatingPanel::new(PanelId::FilterStrip, "Filters")
         .default_pos([16.0, 620.0])
         .default_size([420.0, 360.0])
+        .with_placement(&mut placement)
         .show(ctx, &mut state.filter_strip_open, |ui| {
-            render_floating_body(ui, &mut state.query, &mut state.filter_behavior);
+            render_floating_body(
+                ui,
+                &mut state.query,
+                &mut state.filter_behavior,
+                &mut state.frontend_events,
+            );
         });
+    if placement != placement_before {
+        state.filter_strip_placement = placement;
+        if placement == crate::ui::tiles::Placement::Tiled {
+            let mut ws = std::mem::take(&mut state.tiles);
+            ws.snap_insert(crate::ui::tiles::PaneKind::FilterStrip);
+            state.tiles = ws;
+        }
+    }
+}
+
+/// Tiled-mode body for the filter strip — same content as the floating
+/// variant, but with no FloatingPanel wrapper (egui_tiles owns the
+/// chrome).
+pub fn render_tiled_body(ui: &mut Ui, state: &mut AppState) {
+    let total: usize = state
+        .query
+        .active_filters
+        .by_field
+        .values()
+        .map(|s| s.len())
+        .sum();
+    if total == 0 {
+        ui.label(
+            egui::RichText::new("no active filters")
+                .color(palette::GREY)
+                .small(),
+        );
+        return;
+    }
+    render_floating_body(
+        ui,
+        &mut state.query,
+        &mut state.filter_behavior,
+        &mut state.frontend_events,
+    );
 }
 
 /// Header (cross-field combinator + behavior toggle) followed by the
@@ -86,14 +133,15 @@ fn render_floating_body(
     ui: &mut Ui,
     query: &mut QueryModel,
     behavior: &mut FilterBehavior,
+    events: &mut FrontendEventLog,
 ) {
-    render_header(ui, query, behavior);
+    render_header(ui, query, behavior, events);
     ui.add_space(4.0);
     ui.separator();
     egui::ScrollArea::vertical()
         .auto_shrink([false, false])
         .show(ui, |ui| {
-            render_grouped_chips(ui, query);
+            render_grouped_chips(ui, query, events);
         });
 }
 
@@ -101,6 +149,7 @@ fn render_header(
     ui: &mut Ui,
     query: &mut QueryModel,
     behavior: &mut FilterBehavior,
+    events: &mut FrontendEventLog,
 ) {
     ui.horizontal(|ui| {
         ui.label(egui::RichText::new("match").color(palette::TEXT));
@@ -114,6 +163,13 @@ fn render_header(
         if cross_resp.clicked() {
             query.active_filters.cross_field_combinator =
                 query.active_filters.cross_field_combinator.toggled();
+            events.push(
+                "filter-strip",
+                format!(
+                    "cross-field combinator -> {}",
+                    query.active_filters.cross_field_combinator.label()
+                ),
+            );
         }
 
         ui.separator();
@@ -125,6 +181,10 @@ fn render_header(
             .on_hover_text(behavior.tooltip());
         if beh_resp.clicked() {
             *behavior = behavior.toggled();
+            events.push(
+                "filter-strip",
+                format!("behavior -> {}", behavior.label()),
+            );
         }
 
         // Clear-all on the right.
@@ -137,6 +197,7 @@ fn render_header(
                 .sum();
             if total >= 2 && ui.small_button("clear filters").clicked() {
                 query.clear_all_filters();
+                events.push("filter-strip", "clear all filters");
             }
         });
     });
@@ -145,7 +206,7 @@ fn render_header(
 /// One row per field: `field_name [any|all] [chip] [chip] ...`. Each
 /// row wraps inside its own `horizontal_wrapped` block, so chip lines
 /// reflow with the panel width independently per field.
-fn render_grouped_chips(ui: &mut Ui, query: &mut QueryModel) {
+fn render_grouped_chips(ui: &mut Ui, query: &mut QueryModel, events: &mut FrontendEventLog) {
     let mut to_clear_field: Option<String> = None;
     let mut to_toggle: Option<(String, String)> = None;
     let mut to_set_combinator: Option<(String, Combinator)> = None;
@@ -220,12 +281,18 @@ fn render_grouped_chips(ui: &mut Ui, query: &mut QueryModel) {
     }
 
     if let Some(f) = to_clear_field {
+        events.push("filter-strip", format!("clear field {f}"));
         query.clear_field(&f);
     }
     if let Some((f, c)) = to_set_combinator {
+        events.push(
+            "filter-strip",
+            format!("{f} combinator -> {}", c.label()),
+        );
         query.active_filters.set_combinator_for(&f, c);
     }
     if let Some((f, v)) = to_toggle {
+        events.push("filter-strip", format!("toggle chip {f}={v}"));
         query.toggle_field_filter(&f, &v);
     }
 }

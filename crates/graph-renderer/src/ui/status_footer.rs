@@ -88,7 +88,16 @@ pub fn show_tray(ctx: &egui::Context, state: &mut AppState, progress: &Progress)
                     }, active, section.title())
                     .clicked()
                     {
-                        state.toggle_section(section);
+                        // Toggle + (if opening a Tiled panel) auto-snap.
+                        // Closing a tiled panel here flips section_open
+                        // to false; `sync_tree_with_open_state` next
+                        // frame yanks it out of the tree.
+                        let new_open = !active;
+                        crate::ui::tiles::toggle_panel_with_snap(
+                            state,
+                            crate::ui::tiles::PaneKind::Section(section),
+                            new_open,
+                        );
                     }
                 }
 
@@ -99,7 +108,12 @@ pub fn show_tray(ctx: &egui::Context, state: &mut AppState, progress: &Progress)
                 if tray_icon_button(ui, draw_filter_icon, state.filter_strip_open, "Filters")
                     .clicked()
                 {
-                    state.filter_strip_open = !state.filter_strip_open;
+                    let new_open = !state.filter_strip_open;
+                    crate::ui::tiles::toggle_panel_with_snap(
+                        state,
+                        crate::ui::tiles::PaneKind::FilterStrip,
+                        new_open,
+                    );
                 }
 
                 // View controls — right side. Within `right_to_left`,

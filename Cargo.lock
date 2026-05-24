@@ -1639,6 +1639,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "egui_tiles"
+version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "588dcf9028464fb4d23baf1f7805c13927fb540f2f9096f7d177b814848645a3"
+dependencies = [
+ "ahash",
+ "egui",
+ "itertools 0.13.0",
+ "log",
+ "serde",
+]
+
+[[package]]
 name = "either"
 version = "1.15.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2449,6 +2462,7 @@ dependencies = [
  "egui_extras",
  "egui_kittest",
  "egui_plot",
+ "egui_tiles",
  "env_logger",
  "futures",
  "fuzzy-matcher",
@@ -3015,6 +3029,15 @@ name = "itertools"
 version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ba291022dbbd398a455acf126c1e341954079855bc60dfdda641363bd6922569"
+dependencies = [
+ "either",
+]
+
+[[package]]
+name = "itertools"
+version = "0.13.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "413ee7dfc52ee1a4949ceeb7dbc8a33f2d6c088194d9f922fb8318faf1f01186"
 dependencies = [
  "either",
 ]

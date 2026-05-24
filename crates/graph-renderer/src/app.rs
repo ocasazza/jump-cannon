@@ -1168,6 +1168,7 @@ impl eframe::App for App {
                     .map(|a| a.title.clone())
                     .unwrap_or_else(|| action_id.clone());
                 self.state.snapshot_source = Some(format!("palette: {label}"));
+                self.state.frontend_events.push("palette", label.clone());
                 self.execute_action(frame, &action_id, params);
             }
             PaletteOutcome::OpenNode { id } => {
@@ -1181,6 +1182,18 @@ impl eframe::App for App {
         // sidebar/inspector so the side panels still own the full
         // height of the screen.
         ui::status_footer::show_tray(ctx, &mut self.state, &self.progress);
+
+        // Tileable workspace — mounts a right-side panel hosting the
+        // `egui_tiles::Tree` when at least one section / filter strip is
+        // in `Placement::Tiled`. When zero panels are tiled, the side
+        // panel is hidden so the canvas keeps full width.
+        ui::tiles::show_workspace_panel(
+            ctx,
+            &mut self.state,
+            &mut self.actions,
+            &self.layout_registry,
+            &self.perf,
+        );
 
         // Phase B central panel — now hosts the dockable Workspace
         // (tabs + splits via egui_dock). One initial "Graph" tab carries
@@ -1386,6 +1399,10 @@ impl eframe::App for App {
                     let prev_promoted = self.promoted_anchored_idx;
                     self.promoted_anchored_idx = Some(idx);
                     if prev_promoted != Some(idx) {
+                        self.state.frontend_events.push(
+                            "anchored:promote",
+                            format!("idx={idx} id={id}"),
+                        );
                         // Swap: drop the old meta + kick a fetch for
                         // the new id. Reuse the hover preview's cached
                         // meta when it already matches to avoid an
@@ -3005,6 +3022,10 @@ impl App {
         if toggle_expand_flag.get() && promoted {
             let cur = self.anchored_expanded.get(&idx).copied().unwrap_or(false);
             self.anchored_expanded.insert(idx, !cur);
+            self.state.frontend_events.push(
+                "anchored:expand",
+                format!("idx={idx} -> {}", if !cur { "expanded" } else { "compact" }),
+            );
             // Contracting also drops maximize state — maximize is
             // meaningless on the compact body, and re-expanding should
             // start from the standard expanded size, not silently
