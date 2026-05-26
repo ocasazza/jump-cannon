@@ -1,6 +1,0 @@
-# Coder: rig-scoped implementer. One instance per registered crate/rig.
-# Receives work from the mayor and writes Rust code in-place.
-# Auto-routes — implementation tasks tolerate node variability.
-# To pin a specific coder to the local GPU, set model = "qwen3-coder-desk-nxst-001".
-provider        = "litellm-local"
-option_defaults = { model = "local-coder", permission_mode = "auto" }

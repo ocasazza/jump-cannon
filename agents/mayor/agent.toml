@@ -1,5 +1,0 @@
-# Mayor: city-scoped coordinator. Routes work to rig-scoped coders,
-# manages task queues, and synthesises cross-crate decisions.
-# Pinned to desk-nxst-001 vLLM — large context window, no cold-node latency.
-provider        = "litellm-pinned"
-option_defaults = { model = "qwen3-coder-desk-nxst-001", permission_mode = "plan" }

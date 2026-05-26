@@ -98,6 +98,39 @@ pub fn show_modal(ctx: &egui::Context, state: &mut ModalState) -> ModalAction {
     show_modal_with(ctx, state, &crate::ui::query::ActiveFieldFilters::default(), None)
 }
 
+/// Process Wikilinks in markdown body, replacing them with standard markdown links
+/// that point to a custom scheme, and collect the destinations for hook setup.
+fn process_wikilinks_in_body(body: &str) -> (String, Vec<String>) {
+    use std::collections::HashSet;
+    let mut destinations = HashSet::new();
+    let mut result = String::with_capacity(body.len());
+    let mut chars = body.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '[' && chars.peek() == Some(&'[') {
+            chars.next(); // consume second '['
+            let mut link_content = String::new();
+            while let Some(ch) = chars.next() {
+                if ch == ']' && chars.peek() == Some(&']') {
+                    chars.next(); // consume second ']'
+                    break;
+                }
+                link_content.push(ch);
+            }
+            let (page, alias) = match link_content.split_once('|') {
+                Some((page, alias)) => (page.to_string(), Some(alias.to_string())),
+                None => (link_content.to_string(), None),
+            };
+            destinations.insert(page.clone());
+            let display = alias.as_deref().unwrap_or(&page);
+            result.push_str(&format!("[{display}](wikilink://{page})"));
+        } else {
+            result.push(ch);
+        }
+    }
+    (result, destinations.into_iter().collect())
+}
+
+
 /// Variant that knows about the active filter set so badges paint with
 /// their selected/halo state. `node_tint` is the canvas-rendered colour
 /// for the focused node under the active `StyleState::color_by`; when
@@ -273,10 +306,6 @@ pub fn show_modal_with(
         // side (see graph-api `read_body`). When `body` is empty (e.g.
         // an external node with no file, or a read failure), we just
         // hide the section rather than show a noisy placeholder.
-        //
-        // TODO(commonmark): swap the plain-text view for an actual
-        // markdown renderer (`egui_commonmark`). Wikilinks in the body
-        // should resolve via the existing `Navigate` BadgeAction path.
         if !meta.body.is_empty() {
             ui.separator();
             ui.label(
@@ -291,13 +320,28 @@ pub fn show_modal_with(
             // galleys persist between frames; without it, a non-trivial
             // body would re-parse and re-layout every frame, spiking
             // the egui thread.
+            // Process Wikilinks in the body to make them navigable.
+            let (processed_body, wikilink_destinations) = process_wikilinks_in_body(&meta.body);
+            // Add link hooks for each Wikilink destination.
+            for dest in &wikilink_destinations {
+                state.markdown_cache.add_link_hook(dest);
+            }
+            // Render the processed body. Wikilinks will appear as links that,
+            // when clicked, set the corresponding link hook.
             egui::ScrollArea::vertical()
                 .max_height(420.0)
                 .auto_shrink([false, true])
                 .show(ui, |ui| {
                     egui_commonmark::CommonMarkViewer::new()
-                        .show(ui, &mut state.markdown_cache, &meta.body);
+                        .show(ui, &mut state.markdown_cache, &processed_body);
                 });
+            // Check if any Wikilink was clicked and trigger navigation.
+            for dest in &wikilink_destinations {
+                if let Some(true) = state.markdown_cache.get_link_hook(dest) {
+                    action.navigate_to = Some(dest.clone());
+                    action.focus_node = Some(dest.clone());
+                }
+            }
         }
     });
     state.open = open;

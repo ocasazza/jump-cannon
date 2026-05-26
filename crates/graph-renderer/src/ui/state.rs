@@ -759,6 +759,9 @@ pub struct AppState {
     /// `#[serde(default)]` keeps it loadable.
     #[serde(default)]
     pub dock: crate::ui::workspace::Workspace,
+    /// If true, the dock tab strip should be forced visible on the next dock render.
+    #[serde(default)]
+    pub dock_tab_strip_force_show: bool,
     #[serde(default)]
     pub sim_status: SimStatus,
     #[serde(default)]
@@ -1075,10 +1078,15 @@ impl AppState {
         self.canvas_mount = CanvasMount::Floating { rect: None, was_dock_visible };
     }
     pub fn dock_canvas_back(&mut self) {
-        // TODO(multi-tab dock restore): when `was_dock_visible` is true,
-        // re-show the egui_dock tab strip / restore any extra tabs that
-        // were hidden by the pop-out. v1 is single-tab so this is a no-op.
+        let was_dock_visible = if let CanvasMount::Floating { was_dock_visible, .. } = self.canvas_mount {
+            was_dock_visible
+        } else {
+            false
+        };
         self.canvas_mount = CanvasMount::Background;
+        if was_dock_visible {
+            self.dock_tab_strip_force_show = true;
+        }
     }
     pub fn toggle_canvas_mount(&mut self) {
         match self.canvas_mount {
@@ -1105,6 +1113,7 @@ impl Default for AppState {
             cursor: CursorState::default(),
             workspace: WorkspaceSettings::default(),
             dock: crate::ui::workspace::Workspace::default(),
+            dock_tab_strip_force_show: false,
             sim_status: SimStatus::default(),
             query: QueryModel::default(),
             action_instances: Vec::new(),

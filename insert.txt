@@ -1,0 +1,83 @@
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn start_layout_stream_native(&self) -> tokio::task::JoinHandle<()> {
+        let base = self.base.clone();
+        let positions_latch = self.positions_latch.clone();
+        tokio::spawn(async move {
+            let ws_url = format!("{}/graph/layout/stream", base.trim_end_matches('/'));
+            let ws_stream = match connect_async(ws_url).await {
+                Ok((stream, _)) => stream,
+                Err(e) => {
+                    eprintln!("Failed to connect to layout stream: {e}");
+                    return;
+                }
+            };
+            eprintln!("Connected to layout stream");
+            let (mut write, mut read) = ws_stream.split();
+            while let Some(msg) = read.next().await {
+                match msg {
+                    Ok(Message::Binary(data)) => {
+                        if let Some((_frame, _n, positions)) = parse_layout_frame(&data) {
+                            let mut latch = positions_latch.lock().unwrap();
+                            *latch = Some(positions);
+                        }
+                    }
+                    Ok(Message::Close(_)) => {
+                        eprintln!("Layout stream closed");
+                        break;
+                    }
+                    Err(e) => {
+                        eprintln!("Layout stream error: {e}");
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+        })
+    }
+    
+    #[cfg(target_arch = "wasm32")]
+    pub fn start_layout_stream_wasm(&self) {
+        let base = self.base.clone();
+        let positions_latch = self.positions_latch.clone();
+        wasm_bindgen_futures::spawn_local(async move {
+            let ws_url = format!("{}/graph/layout/stream", base.trim_end_matches('/'));
+            let ws = match WebSocket::new(&ws_url) {
+                Ok(ws) => ws,
+                Err(e) => {
+                    eprintln!("Failed to connect to layout stream: {e}");
+                    return;
+                }
+            };
+            eprintln!("Connected to layout stream (WASM)");
+            let mut rx = ws.message_stream();
+            while let Some(msg) = rx.next().await {
+                match msg {
+                    Ok(web_sys::MessageEvent { data, .. }) => {
+                        if let Ok(array) = data.dyn_into::<js_sys::Uint8Array>() {
+                            let mut vec = vec![0u8; array.length() as usize];
+                            array.copy_to(&mut vec);
+                            if let Some((_frame, _n, positions)) = parse_layout_frame(&vec) {
+                                let mut latch = positions_latch.lock().unwrap();
+                                *latch = Some(positions);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("Layout stream error: {e}");
+                        break;
+                    }
+                }
+            }
+        });
+    }
+    
+    pub fn start_layout_stream(&self) {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.start_layout_stream_native();
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            self.start_layout_stream_wasm();
+        }
+    }

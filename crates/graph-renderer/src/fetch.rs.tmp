@@ -3,33 +3,38 @@
 //!
 //! Endpoints:
 //!   GET /graph/init              -> protobuf Init
-//!   GET /graph/ids               -> Vec<String>
-//!   GET /graph/positions         -> Vec<f32>
-//!   GET /graph/edges             -> Vec<u32>
-//!   GET /graph/metrics/:name     -> Vec<f32>
-//!   GET /node/:id                -> protobuf NodeMeta (or None on 404)
-//!   GET /graph/meta_summary      -> protobuf MetaSummary
-//!   GET /search?q=:q             -> protobuf SearchResults
-//!   PUT /vault/page              -> { ok: bool }
-//!   GET /progress?since=<seq>    -> raw bytes (progress events)
-//!   GET /compute/health          -> ComputeHealth
-//!   WebSocket /graph/layout/stream -> binary positions stream
-
-use std::sync::{Arc, Mutex};
-
-#[cfg(not(target_arch = "wasm32"))]
-use tokio_tungstenite::{connect_async, tungstenite::protocol::Message as TungsteniteMessage};
-
-#[cfg(target_arch = "wasm32")]
-use {
-    wasm_bindgen_futures::spawn_local,
-    web_sys::{MessageEvent, WebSocket},
-    js_sys::{Uint8Array},
-};
+//!   GET /graph/ids               -> JSON [string]
+//!   GET /graph/positions         -> raw little-endian f32 [x,y,x,y,...] (2D)
+//!   GET /graph/edges             -> raw little-endian u32 [s,t,s,t,...]
+//!   GET /graph/metrics/:name     -> raw little-endian f32 [v,v,...]
+//!   GET /node/:id                -> protobuf NodeMeta
+//!   GET /search?q=…              -> protobuf SearchResults
+//
+// TODO(phase 1 stream-consumer): graph-api now exposes
+//   GET /graph/layout/stream  (WebSocket; binary frames of
+//                              [u64 LE frame][u32 LE n_nodes][f32 LE positions...])
+// When the user opts into the distributed backend, open a WS to that route
+// (web-sys::WebSocket on wasm32, tokio-tungstenite native), push positions
+// straight into `positions_buffer`, and skip the local `compute_step()` call
+// in `graph_pipelines.rs`. Left as a stub here so the WASM build keeps working
+// while the broker + worker scaffold lands; see plan
+// `/home/casazza/.claude/plans/federated-swinging-rainbow.md` Phase 1.
 
 use crate::proto;
-
+use prost::Message;
+use std::sync::{Arc, Mutex};
+#[cfg(not(target_arch = "wasm32"))]
+use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
+#[cfg(target_arch = "wasm32")]
+use gloo_net::websocket::WebSocket;
+#[cfg(target_arch = "wasm32")]
 use futures::StreamExt;
+#[cfg(target_arch = "wasm32")]
+use wasm_bindgen_futures::spawn_local;
+#[cfg(target_arch = "wasm32")]
+use web_sys::{MessageEvent};
+#[cfg(target_arch = "wasm32")]
+use js_sys::{Uint8Array};
 
 #[derive(Clone)]
 pub struct ApiClient {
@@ -52,7 +57,7 @@ impl ApiClient {
 
     pub async fn init(&self) -> Result<proto::Init, String> {
         let bytes = http_get_bytes(&self.url("/graph/init")).await?;
-        <proto::Init as prost::Message>::decode(&*bytes).map_err(|e| format!("decode init: {e}"))
+        proto::Init::decode(&*bytes).map_err(|e| format!("decode init: {e}"))
     }
 
     pub async fn ids(&self) -> Result<Vec<String>, String> {
@@ -81,7 +86,7 @@ impl ApiClient {
     /// quiet for ids that legitimately moved out of the layout graph.
     pub async fn node(&self, id: &str) -> Result<Option<proto::NodeMeta>, String> {
         match http_get_bytes_opt(&self.url(&format!("/node/{id}"))).await? {
-            Some(bytes) => <proto::NodeMeta as prost::Message>::decode(&*bytes)
+            Some(bytes) => proto::NodeMeta::decode(&*bytes)
                 .map(Some)
                 .map_err(|e| format!("decode node: {e}")),
             None => Ok(None),
@@ -90,12 +95,12 @@ impl ApiClient {
 
     pub async fn meta_summary(&self) -> Result<proto::MetaSummary, String> {
         let bytes = http_get_bytes(&self.url("/graph/meta_summary")).await?;
-        <proto::MetaSummary as prost::Message>::decode(&*bytes).map_err(|e| format!("decode meta_summary: {e}"))
+        proto::MetaSummary::decode(&*bytes).map_err(|e| format!("decode meta_summary: {e}"))
     }
 
     pub async fn search(&self, q: &str) -> Result<proto::SearchResults, String> {
         let bytes = http_get_bytes(&self.url(&format!("/search?q={}", urlencode(q)))).await?;
-        <proto::SearchResults as prost::Message>::decode(&*bytes).map_err(|e| format!("decode search: {e}"))
+        proto::SearchResults::decode(&*bytes).map_err(|e| format!("decode search: {e}"))
     }
 
     /// `PUT /vault/page` — save the body of an obsidian-page node to disk.
@@ -109,15 +114,9 @@ impl ApiClient {
     /// `Err(...)` on any non-2xx status or `{ "ok": false }` payload.
     pub async fn save_page(&self, path: &str, body: &str) -> Result<(), String> {
         #[derive(serde::Serialize)]
-        struct Req<'a> {
-            path: &'a str,
-            body: &'a str
-        }
+        struct Req<'a> { path: &'a str, body: &'a str }
         #[derive(serde::Deserialize)]
-        struct Resp {
-            ok: bool,
-            error: Option<String>
-        }
+        struct Resp { ok: bool, error: Option<String> }
         let url = self.url("/vault/page");
         let req = Req { path, body };
         let bytes = http_put_json(&url, &serde_json::to_vec(&req).map_err(|e| e.to_string())?)
@@ -146,91 +145,6 @@ impl ApiClient {
         let bytes = http_get_bytes(&self.url("/compute/health")).await?;
         serde_json::from_slice::<ComputeHealth>(&bytes)
             .map_err(|e| format!("decode compute_health: {e}"))
-    }
-
-    #[cfg(not(target_arch = "wasm32"))]
-    pub fn start_layout_stream_native(&self) -> tokio::task::JoinHandle<()> {
-        let base = self.base.clone();
-        let positions_latch = self.positions_latch.clone();
-        tokio::spawn(async move {
-            let ws_url = format!("{}/graph/layout/stream", base.trim_end_matches('/'));
-            let ws_stream = match connect_async(ws_url).await {
-                Ok((stream, _)) => stream,
-                Err(e) => {
-                    eprintln!("Failed to connect to layout stream: {e}");
-                    return;
-                }
-            };
-            eprintln!("Connected to layout stream");
-let (_write, mut read) = ws_stream.split();
-            let mut read: futures::stream::SplitStream<_> = read;
-            while let Some(msg) = read.next().await {
-                match msg {
-                    Ok(TungsteniteMessage::Binary(data)) => {
-                        if let Some((_frame, _n, positions)) = parse_layout_frame(&data) {
-                            let mut latch = positions_latch.lock().unwrap();
-                            *latch = Some(positions);
-                        }
-                    }
-                    Ok(TungsteniteMessage::Close(_)) => {
-                        eprintln!("Layout stream closed");
-                        break;
-                    }
-                    Err(e) => {
-                        eprintln!("Layout stream error: {e}");
-                        break;
-                    }
-                    _ => {}
-                }
-            }
-        })
-    }
-
-    #[cfg(target_arch = "wasm32")]
-    pub fn start_layout_stream_wasm(&self) {
-        let base = self.base.clone();
-        let positions_latch = self.positions_latch.clone();
-        wasm_bindgen_futures::spawn_local(async move {
-            let ws_url = format!("{}/graph/layout/stream", base.trim_end_matches('/'));
-            let ws = match WebSocket::new(&ws_url) {
-                Ok(ws) => ws,
-                Err(e) => {
-                    eprintln!("Failed to connect to layout stream: {e}");
-                    return;
-                }
-            };
-            eprintln!("Connected to layout stream (WASM)");
-            let mut rx = ws.message_stream();
-            while let Some(msg) = rx.next().await {
-                match msg {
-                    Ok(web_sys::MessageEvent { data, .. }) => {
-                        if let Ok(array) = data.dyn_into::<js_sys::Uint8Array>() {
-                            let mut vec = vec![0u8; array.length() as usize];
-                            array.copy_to(&mut vec);
-                            if let Some((_frame, _n, positions)) = parse_layout_frame(&vec) {
-                                let mut latch = positions_latch.lock().unwrap();
-                                *latch = Some(positions);
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        eprintln!("Layout stream error: {e}");
-                        break;
-                    }
-                }
-            }
-        });
-    }
-
-    pub fn start_layout_stream(&self) {
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            self.start_layout_stream_native();
-        }
-        #[cfg(target_arch = "wasm32")]
-        {
-            self.start_layout_stream_wasm();
-        }
     }
 }
 
@@ -346,7 +260,7 @@ async fn http_put_json(url: &str, body: &[u8]) -> Result<Vec<u8>, String> {
     let resp = Request::put(url)
         .header("content-type", "application/json")
         .body(body.to_vec())
-        .map_err(|e| format!("build PUT {url}: {e}"))
+        .map_err(|e| format!("build PUT {url}: {e}"))?
         .send()
         .await
         .map_err(|e| format!("PUT {url}: {e}"))?;
@@ -408,4 +322,88 @@ async fn http_get_bytes_opt(url: &str) -> Result<Option<Vec<u8>>, String> {
         .await
         .map_err(|e| format!("body {url}: {e}"))?;
     Ok(Some(bytes.to_vec()))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub fn start_layout_stream_native(&self) -> tokio::task::JoinHandle<()> {
+    let base = self.base.clone();
+    let positions_latch = self.positions_latch.clone();
+    tokio::spawn(async move {
+        let ws_url = format!("{}/graph/layout/stream", base.trim_end_matches('/'));
+        let ws_stream = match connect_async(ws_url).await {
+            Ok((stream, _)) => stream,
+            Err(e) => {
+                eprintln!("Failed to connect to layout stream: {e}");
+                return;
+            }
+        };
+        eprintln!("Connected to layout stream");
+        let (mut write, mut read) = ws_stream.split();
+        while let Some(msg) = read.next().await {
+            match msg {
+                Ok(Message::Binary(data)) => {
+                    if let Some((_frame, _n, positions)) = parse_layout_frame(&data) {
+                        let mut latch = positions_latch.lock().unwrap();
+                        *latch = Some(positions);
+                    }
+                }
+                Ok(Message::Close(_)) => {
+                    eprintln!("Layout stream closed");
+                    break;
+                }
+                Err(e) => {
+                    eprintln!("Layout stream error: {e}");
+                    break;
+                }
+                _ => {}
+            }
+        }
+    })
+}
+
+#[cfg(target_arch = "wasm32")]
+pub fn start_layout_stream_wasm(&self) {
+    let base = self.base.clone();
+    let positions_latch = self.positions_latch.clone();
+    wasm_bindgen_futures::spawn_local(async move {
+        let ws_url = format!("{}/graph/layout/stream", base.trim_end_matches('/'));
+        let ws = match WebSocket::new(&ws_url) {
+            Ok(ws) => ws,
+            Err(e) => {
+                eprintln!("Failed to connect to layout stream: {e}");
+                return;
+            }
+        };
+        eprintln!("Connected to layout stream (WASM)");
+        let mut rx = ws.message_stream();
+        while let Some(msg) = rx.next().await {
+            match msg {
+                Ok(web_sys::MessageEvent { data, .. }) => {
+                    if let Ok(array) = data.dyn_into::<js_sys::Uint8Array>() {
+                        let mut vec = vec![0u8; array.length() as usize];
+                        array.copy_to(&mut vec);
+                        if let Some((_frame, _n, positions)) = parse_layout_frame(&vec) {
+                            let mut latch = positions_latch.lock().unwrap();
+                            *latch = Some(positions);
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Layout stream error: {e}");
+                    break;
+                }
+            }
+        }
+    });
+}
+
+pub fn start_layout_stream(&self) {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        self.start_layout_stream_native();
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        self.start_layout_stream_wasm();
+    }
 }

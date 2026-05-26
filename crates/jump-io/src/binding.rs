@@ -136,11 +136,6 @@ impl<A: Action> BindingSet<A> {
         Self::default()
     }
 
-    pub fn from_iter(it: impl IntoIterator<Item = Binding<A>>) -> Self {
-        Self {
-            bindings: it.into_iter().collect(),
-        }
-    }
 
     pub fn push(&mut self, b: Binding<A>) -> &mut Self {
         self.bindings.push(b);
@@ -167,5 +162,12 @@ impl<A: Action> BindingSet<A> {
     /// UI before installing a replacement.
     pub fn clear_action(&mut self, action: &A) {
         self.bindings.retain(|b| &b.action != action);
+    }
+}
+impl<A: Action> FromIterator<Binding<A>> for BindingSet<A> {
+    fn from_iter<I: IntoIterator<Item = Binding<A>>>(it: I) -> Self {
+        Self {
+            bindings: it.into_iter().collect(),
+        }
     }
 }

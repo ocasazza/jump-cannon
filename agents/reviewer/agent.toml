@@ -1,6 +1,0 @@
-# Reviewer: rig-scoped code reviewer. Reads diffs, checks Rust idioms,
-# and gates merges via review beads.
-# Pinned to desk-nxst-001 — review requires full diff context without
-# token-limit variability from remote exo nodes.
-provider        = "litellm-pinned"
-option_defaults = { model = "qwen3-coder-desk-nxst-001", permission_mode = "plan" }
