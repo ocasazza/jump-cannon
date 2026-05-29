@@ -40,6 +40,7 @@ pub enum EdgeLengthLens {
 pub struct LensConfig {
     pub url: String,
     pub reconnect_backoff_ms: u32,
+    pub use_gpu: bool,
     
     pub class: ClassLens,
     pub coordination: CoordinationLens,
@@ -61,6 +62,7 @@ impl Default for LensConfig {
         Self {
             url: "ws://127.0.0.1:8080/graph/layout/stream".to_string(),
             reconnect_backoff_ms: 1000,
+            use_gpu: false,
             class: ClassLens::Uniform,
             coordination: CoordinationLens::Uniform(0),
             mass: MassLens::Uniform,

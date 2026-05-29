@@ -24,7 +24,19 @@ pub fn factory() -> LayoutFactory {
 }
 
 fn default_settings_json() -> Value {
-    serde_json::to_value(LensConfig::default()).unwrap_or(Value::Null)
+    let mut config = LensConfig::default();
+    // On WASM, default to the same host we were loaded from.
+    #[cfg(target_arch = "wasm32")]
+    {
+        if let Some(window) = web_sys::window() {
+            if let Ok(location) = window.location().origin() {
+                let ws_protocol = if location.starts_with("https") { "wss" } else { "ws" };
+                let host = location.strip_prefix("http://").or_else(|| location.strip_prefix("https://")).unwrap_or(&location);
+                config.url = format!("{}://{}/graph/layout/stream", ws_protocol, host);
+            }
+        }
+    }
+    serde_json::to_value(config).unwrap_or(Value::Null)
 }
 
 fn build_layout(json: &Value) -> Box<dyn DynPhysicsLayout> {
@@ -60,7 +72,8 @@ impl PhysicsLayout for RemoteGeometricLayout {
             id: LAYOUT_ID,
             kind: LayoutKind::Physics,
             display_name: "Geometric Engine",
-            description: "Remote geometric constraint solver via graph-api.",
+            description: "Remote geometric constraint solver via graph-api. Supports both CPU \
+                          and GPU-accelerated backends.",
             requirements: LayoutRequirements {
                 needs_edges: false,
                 needs_cpu_positions: false,
@@ -80,9 +93,10 @@ impl PhysicsLayout for RemoteGeometricLayout {
     ) -> Result<(), String> {
         self.n_nodes = graph.nodes.len() as u32;
 
+        let backend_id = if self.settings.use_gpu { "geometric-gpu" } else { "geometric" };
         let lens_json = serde_json::to_string(&self.settings).unwrap_or_default();
         let encoded_lens = urlencoding::encode(&lens_json);
-        let url = format!("{}?layout_id=geometric&lens={}", self.settings.url, encoded_lens);
+        let url = format!("{}?layout_id={}&lens={}", self.settings.url, backend_id, encoded_lens);
 
         if self.spawned_url.as_deref() == Some(url.as_str()) {
             return Ok(());
@@ -90,8 +104,6 @@ impl PhysicsLayout for RemoteGeometricLayout {
         self.spawned_url = Some(url.clone());
         let backoff_ms = self.settings.reconnect_backoff_ms.max(100);
         let latch = Arc::clone(&self.latch);
-        // We reuse the remote_fa2 WS consumer logic here since it's identical
-        // Phase D will customize the connection to send the layout config.
         crate::ui::layout::algorithms::remote_fa2::spawn_ws_consumer(url, backoff_ms, latch);
         Ok(())
     }
@@ -166,6 +178,19 @@ fn render_ui(ui: &mut egui::Ui, json: &mut Value) {
         opts = LensConfig::default();
         changed = true;
     }
+
+    subgroup_label(ui, "Connection");
+    row(ui, "URL", |ui| {
+        if ui.add(egui::TextEdit::singleline(&mut opts.url).desired_width(f32::INFINITY)).changed() { changed = true; }
+    });
+    row(ui, "Reconnect", |ui| {
+        if ui.add(egui::DragValue::new(&mut opts.reconnect_backoff_ms).range(100..=30000).suffix("ms")).changed() { changed = true; }
+    });
+    row(ui, "GPU Acceleration", |ui| {
+        if ui.checkbox(&mut opts.use_gpu, "Enabled").on_hover_text("Use the WGPU/WGSL backend on the solver node (geometric-gpu).").changed() { changed = true; }
+    });
+
+    subgroup_separator(ui);
 
     subgroup_label(ui, "Presets");
     ui.horizontal_wrapped(|ui| {
