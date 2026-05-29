@@ -55,6 +55,7 @@ jump-io       = { path = "../jump-io" }
 prost      = "0.13"
 serde      = { version = "1", features = ["derive"] }
 serde_json = "1"
+urlencoding = "2"
 # Maintained fork of serde_yaml (dtolnay's crate was archived March 2024).
 # Used for YAML import/export of AppState in the Instances sidebar section.
 serde_yml  = "0.0.12"

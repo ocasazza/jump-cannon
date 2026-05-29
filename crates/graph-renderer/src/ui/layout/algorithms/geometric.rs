@@ -79,7 +79,11 @@ impl PhysicsLayout for RemoteGeometricLayout {
         _positions_buf: &wgpu::Buffer,
     ) -> Result<(), String> {
         self.n_nodes = graph.nodes.len() as u32;
-        let url = self.settings.url.clone();
+
+        let lens_json = serde_json::to_string(&self.settings).unwrap_or_default();
+        let encoded_lens = urlencoding::encode(&lens_json);
+        let url = format!("{}?layout_id=geometric&lens={}", self.settings.url, encoded_lens);
+
         if self.spawned_url.as_deref() == Some(url.as_str()) {
             return Ok(());
         }

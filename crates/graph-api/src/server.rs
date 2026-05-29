@@ -18,7 +18,8 @@ use tokio::sync::broadcast::error::RecvError;
 use prost::Message as ProstMessage;
 use serde::{Deserialize, Serialize};
 
-use crate::{proto, state::AppState};
+use crate::{attribute_resolver, proto, state::AppState};
+use graph_layouts::geometric::LensConfig;
 use vault_data::color::PALETTE;
 
 const PROTOBUF_CT: &str = "application/x-protobuf";
@@ -856,8 +857,31 @@ fn extract_strings(v: &serde_json::Value) -> Vec<String> {
 // upgrade is a Phase 4 deliverable; WebSocket is the contained Phase 1 choice.
 async fn graph_layout_stream(
     State(s): State<AppState>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
     ws: WebSocketUpgrade,
 ) -> axum::response::Response {
+    if let Some(layout_id) = params.get("layout_id") {
+        let mut selection = crate::compute_broker::RemoteLayout {
+            layout_id: layout_id.clone(),
+            ..Default::default()
+        };
+
+        if layout_id == "geometric" {
+            if let Some(lens_str) = params.get("lens") {
+                if let Ok(lens) = serde_json::from_str::<LensConfig>(lens_str) {
+                    let snap = s.snapshot();
+                    let (settings, attrs) = attribute_resolver::resolve(&lens, &snap);
+                    selection.params = Some(serde_json::to_value(settings).unwrap());
+                    selection.attributes = Some(attribute_resolver::encode_proto(attrs));
+                    selection.lens = Some(lens);
+                }
+            }
+        }
+        
+        // Update global broker selection
+        s.inner.compute_broker.set_selection(selection);
+    }
+
     let Some(rx) = s.inner.compute_broker.subscribe().await else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,

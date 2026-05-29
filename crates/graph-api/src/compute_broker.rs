@@ -13,6 +13,7 @@
 
 use std::sync::Arc;
 use std::time::Duration;
+use arc_swap::ArcSwap;
 use tokio::sync::broadcast;
 use tonic::transport::Channel;
 
@@ -31,7 +32,7 @@ pub struct ComputeBroker {
 /// worker's startup default); `params` is the JSON-shaped engine settings
 /// object (`None` ⇒ engine defaults), serialized on the wire as
 /// `google.protobuf.Struct`.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct RemoteLayout {
     pub layout_id: String,
     pub params: Option<serde_json::Value>,
@@ -81,6 +82,8 @@ struct Inner {
     /// Last-known URL the loop is dialing. Set on `connect()`; read by
     /// `/compute/health`.
     url: tokio::sync::RwLock<Option<String>>,
+    /// Current layout selection.
+    selection: ArcSwap<RemoteLayout>,
 }
 
 impl ComputeBroker {
@@ -90,6 +93,7 @@ impl ComputeBroker {
                 tx: tokio::sync::RwLock::new(None),
                 connected: std::sync::atomic::AtomicBool::new(false),
                 url: tokio::sync::RwLock::new(None),
+                selection: ArcSwap::new(Arc::new(RemoteLayout::default())),
             }),
         }
     }
@@ -107,62 +111,35 @@ impl ComputeBroker {
         }
     }
 
+    /// Update the layout selection.
+    pub fn set_selection(&self, selection: RemoteLayout) {
+        self.inner.selection.store(Arc::new(selection));
+    }
+
+    pub fn selection(&self) -> Arc<RemoteLayout> {
+        self.inner.selection.load_full()
+    }
+
     /// Spawn a reconnecting forwarder task that dials the compute worker,
     /// streams `PositionDelta`s onto a broadcast channel, and redials with
     /// exponential backoff if the dial fails or the stream ends.
-    ///
-    /// Returns immediately — startup is never blocked on the worker being
-    /// reachable. The first successful dial validates `url`; an *invalid*
-    /// url (parse failure) is reported synchronously as an error.
-    ///
-    /// IMPORTANT: callers must only invoke `connect()` when a compute URL
-    /// was explicitly configured (CLI flag or `JUMP_CANNON_COMPUTE_URL`).
-    /// The loop dials forever with exponential backoff and warns on every
-    /// failure; previously graph-api defaulted the URL to
-    /// `http://[::1]:50051`, which made every dev session without a local
-    /// graph-compute worker emit `compute broker dial failed ...` at
-    /// `backoff_secs=30` indefinitely. `main.rs` now skips this call when
-    /// the URL is `None`. Do not reintroduce a default URL here.
-    ///
-    /// TODO(auth): wrap `ComputeClient` in a tonic interceptor that injects
-    /// a bearer token from `JUMP_CANNON_COMPUTE_TOKEN`.
-    ///
-    /// `selection` (ADR-002) picks + tunes the remote layout engine via the
-    /// `Subscribe` request's `layout_id` + `params` fields. `None` (or a
-    /// default-valued selection) leaves the worker on its startup default
-    /// engine. The selection is captured once here and replayed on every
-    /// reconnect so a worker restart resumes the same engine.
     pub async fn connect(&self, url: String) -> anyhow::Result<()> {
-        self.connect_with(url, RemoteLayout::default()).await
+        self.connect_with(url, RemoteLayout::from_env()).await
     }
 
     /// Like [`connect`](Self::connect) but with an explicit remote-layout
-    /// selection. Splitting these keeps the bare `connect(url)` callers (and
-    /// the env-driven `main.rs` path) simple while exposing the ADR-002
-    /// layout_id/params controls for callers that have them.
+    /// selection.
     pub async fn connect_with(&self, url: String, selection: RemoteLayout) -> anyhow::Result<()> {
-        // Validate the URL eagerly so a typo fails the boot sequence loudly.
-        // The actual TCP dial happens inside the spawned reconnect loop.
         let _ = Channel::from_shared(url.clone())
             .map_err(|e| anyhow::anyhow!("invalid compute url {url}: {e}"))?;
 
-        // Create the broadcast channel up front. WS clients can subscribe
-        // before the first dial succeeds; they'll just sit on an empty
-        // receiver until frames arrive (or after a worker restart).
+        self.set_selection(selection);
+
         let (tx, _rx) = broadcast::channel::<PositionDelta>(64);
         *self.inner.tx.write().await = Some(tx.clone());
         *self.inner.url.write().await = Some(url.clone());
 
-        // Reconnecting forwarder. Each iteration: dial, subscribe, pump
-        // frames until the stream ends or errors, then back off and retry.
         let inner = self.inner.clone();
-        // Pre-build the params Struct once (it's identical on every reconnect).
-        let req_layout_id = selection.layout_id.clone();
-        let req_params = match selection.params {
-            Some(v) => Some(json_to_struct(v)),
-            None => None,
-        };
-        let req_attributes = selection.attributes.clone();
         tokio::spawn(async move {
             const BACKOFF_INITIAL: Duration = Duration::from_secs(1);
             const BACKOFF_CAP: Duration = Duration::from_secs(30);
@@ -172,11 +149,7 @@ impl ComputeBroker {
                 tracing::info!(url = %url, "compute broker dialing worker");
                 let endpoint = match Channel::from_shared(url.clone()) {
                     Ok(e) => e,
-                    Err(e) => {
-                        // Should not happen — already validated above — but
-                        // be defensive so a future env-var refresh path is
-                        // safe.
-                        tracing::warn!("compute broker invalid url {url}: {e}");
+                    Err(_) => {
                         tokio::time::sleep(backoff).await;
                         backoff = (backoff * 2).min(BACKOFF_CAP);
                         continue;
@@ -186,11 +159,7 @@ impl ComputeBroker {
                 let channel = match endpoint.connect().await {
                     Ok(c) => c,
                     Err(e) => {
-                        tracing::warn!(
-                            url = %url,
-                            backoff_secs = backoff.as_secs(),
-                            "compute broker dial failed: {e}",
-                        );
+                        tracing::warn!(url = %url, "compute broker dial failed: {e}");
                         tokio::time::sleep(backoff).await;
                         backoff = (backoff * 2).min(BACKOFF_CAP);
                         continue;
@@ -198,22 +167,25 @@ impl ComputeBroker {
                 };
 
                 let mut client = ComputeClient::new(channel);
+                
+                // Get current selection
+                let selection = inner.selection.load();
+                let req_layout_id = selection.layout_id.clone();
+                let req_params = selection.params.as_ref().map(|v| json_to_struct(v.clone()));
+                let req_attributes = selection.attributes.clone();
+
                 let stream = match client
                     .subscribe(SubscribeRequest {
                         graph_id: String::new(),
-                        layout_id: req_layout_id.clone(),
-                        params: req_params.clone(),
-                        attributes: req_attributes.clone(),
+                        layout_id: req_layout_id,
+                        params: req_params,
+                        attributes: req_attributes,
                     })
                     .await
                 {
                     Ok(s) => s.into_inner(),
                     Err(e) => {
-                        tracing::warn!(
-                            url = %url,
-                            backoff_secs = backoff.as_secs(),
-                            "compute broker subscribe failed: {e}",
-                        );
+                        tracing::warn!(url = %url, "compute broker subscribe failed: {e}");
                         tokio::time::sleep(backoff).await;
                         backoff = (backoff * 2).min(BACKOFF_CAP);
                         continue;
@@ -221,30 +193,36 @@ impl ComputeBroker {
                 };
 
                 tracing::info!(url = %url, "compute broker connected; streaming frames");
-                inner
-                    .connected
-                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                inner.connected.store(true, std::sync::atomic::Ordering::Relaxed);
                 backoff = BACKOFF_INITIAL;
 
                 let mut stream = stream;
                 loop {
-                    match stream.message().await {
-                        Ok(Some(frame)) => {
+                    // Check if selection changed
+                    if **inner.selection.load() != **selection {
+                        tracing::info!("selection changed, re-subscribing");
+                        break;
+                    }
+
+                    match tokio::time::timeout(Duration::from_millis(100), stream.message()).await {
+                        Ok(Ok(Some(frame))) => {
                             let _ = tx.send(frame);
                         }
-                        Ok(None) => {
+                        Ok(Ok(None)) => {
                             tracing::warn!("compute worker closed stream; reconnecting");
                             break;
                         }
-                        Err(e) => {
+                        Ok(Err(e)) => {
                             tracing::warn!("compute stream error: {e}; reconnecting");
                             break;
                         }
+                        Err(_) => {
+                            // Timeout: just loop and check selection
+                            continue;
+                        }
                     }
                 }
-                inner
-                    .connected
-                    .store(false, std::sync::atomic::Ordering::Relaxed);
+                inner.connected.store(false, std::sync::atomic::Ordering::Relaxed);
 
                 tokio::time::sleep(backoff).await;
                 backoff = (backoff * 2).min(BACKOFF_CAP);
