@@ -217,17 +217,17 @@ impl LayoutEngine for GeometricGpuEngine {
 
         let coord_angles_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("geom_coord_angles"),
-            contents: bytemuck::cast_slice(&self.settings.coordination_angles),
+            contents: if self.settings.coordination_angles.is_empty() { bytemuck::cast_slice(&[0.0f32]) } else { bytemuck::cast_slice(&self.settings.coordination_angles) },
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
         });
         let class_radius_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("geom_class_radius"),
-            contents: bytemuck::cast_slice(&self.settings.class_radius),
+            contents: if self.settings.class_radius.is_empty() { bytemuck::cast_slice(&[0.0f32]) } else { bytemuck::cast_slice(&self.settings.class_radius) },
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
         });
         let class_affinity_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("geom_class_affinity"),
-            contents: bytemuck::cast_slice(&self.settings.class_affinity),
+            contents: if self.settings.class_affinity.is_empty() { bytemuck::cast_slice(&[0.0f32]) } else { bytemuck::cast_slice(&self.settings.class_affinity) },
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
         });
 
@@ -552,5 +552,41 @@ impl OctreeBuild {
         node.meta[1] = first_child;
         node.meta[2] = skip;
         idx as u32
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sim::CsrGraph;
+
+    #[test]
+    fn smoke_geometric_gpu_init_and_step() {
+        let mut ctx = EngineCtx::try_new_gpu();
+        if ctx.gpu.is_none() {
+            eprintln!("Skipping geometric-gpu smoke test (no GPU)");
+            return;
+        }
+
+        let mut engine = GeometricGpuEngine::new();
+        let graph = CsrGraph::path(10);
+        let shard = CsrShard::whole(&graph);
+        let mut positions = vec![0.0f32; 30];
+        for i in 0..10 {
+            positions[3 * i] = i as f32;
+        }
+
+        engine.init(&mut ctx, &shard, &positions).expect("init failed");
+        let out = engine.step(&mut ctx);
+        assert_eq!(out.positions.len(), 30);
+        // Smoke: positions should have moved (non-zero velocity/forces)
+        let mut moved = false;
+        for (i, &p) in out.positions.iter().enumerate() {
+            if (p - positions[i]).abs() > 1e-6 {
+                moved = true;
+                break;
+            }
+        }
+        assert!(moved, "nodes should have moved after one step");
     }
 }

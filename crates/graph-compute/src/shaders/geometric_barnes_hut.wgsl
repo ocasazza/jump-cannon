@@ -126,8 +126,8 @@ fn geometric_step(@builtin(global_invocation_id) gid: vec3<u32>) {
             let pos_j = positions[other].xyz;
             let d = pos_j - pos_i;
             let r = max(length(d), 1e-6);
-            let target = target_lens[e];
-            let f = params.edge_stiffness * (r - target) / r;
+            let t_len = target_lens[e];
+            let f = params.edge_stiffness * (r - t_len) / r;
             force = force + d * f;
         }
     }
