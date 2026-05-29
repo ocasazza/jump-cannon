@@ -34,8 +34,8 @@ pub mod topo_fisheye;
 pub mod wgpu_sim;
 
 pub use engines::{
-    CpuSpringEngine, CsrShard, EngineCtx, EngineRegistry, Fa2BruteEngine, GpuCtx, HaloUpdate,
-    LayoutEngine, ShardMeta, StepOutput,
+    CpuSpringEngine, CsrShard, EngineCtx, EngineRegistry, Fa2BruteEngine, GeometricEngine,
+    GpuCtx, GraphAttributes, HaloUpdate, LayoutEngine, ShardMeta, StepOutput,
 };
 pub use partition::{
     partition_csr, run_superstep, run_superstep_local, HaloDelta, HaloTransport, LocalTransport,
