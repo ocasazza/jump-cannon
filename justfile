@@ -23,10 +23,26 @@ watch-wasm:
 # via a trap. `nix run .#dev-up` standalone still works for orchestration
 # (CI, deploy, integration tests) — this recipe is the contributor entry.
 
-# All-in-one dev stack: graph-compute backend + graph-api hot-reload.
-dev-up:
+# Notes: `gpu` selects the Barnes-Hut wgpu engine (fa2-bh), `cpu` selects
+# SGD-stress (sgd-stress). The worker hosts every engine regardless — this only
+# sets the broker's INITIAL pick; switch live from the UI's "Remote engine"
+# picker. On a host with no usable GPU adapter the GPU engines fail init — use
+# `cpu` there.
+# All-in-one dev stack + hot-reload; backend = gpu (default) | cpu.
+dev-up backend="gpu":
     #!/usr/bin/env bash
     set -euo pipefail
+
+    # ---- Stage 0: resolve the requested compute backend ----
+    case "{{backend}}" in
+      gpu) COMPUTE_ENGINE="fa2-bh"     ;;  # GPU: Barnes-Hut ForceAtlas2 (wgpu)
+      cpu) COMPUTE_ENGINE="sgd-stress" ;;  # CPU: SGD stress-majorization
+      *)
+        echo "dev-up: unknown backend '{{backend}}' (expected 'gpu' or 'cpu')" >&2
+        exit 2
+        ;;
+    esac
+    echo "→ compute backend: {{backend}} (engine: $COMPUTE_ENGINE)"
 
     # ---- Stage 1: WASM bundle, always built ----
     # The trunk dist is what graph-api serves at `/`. The previous
@@ -87,7 +103,11 @@ dev-up:
     # TODO: if `nix run .#dev-up` is ever made optional (e.g. a flag to
     # skip the backend for frontend-only iteration), gate this env var
     # accordingly.
-    JUMP_CANNON_COMPUTE_URL=http://[::1]:50051 cargo watch \
+    # JUMP_CANNON_COMPUTE_LAYOUT_ID picks the broker's initial remote engine
+    # (read by RemoteLayout::from_env); the UI's "Remote engine" picker can
+    # change it at runtime via PUT /compute/layout.
+    JUMP_CANNON_COMPUTE_URL=http://[::1]:50051 \
+    JUMP_CANNON_COMPUTE_LAYOUT_ID="$COMPUTE_ENGINE" cargo watch \
       -w crates/graph-api -w crates/vault-data -w crates/vault-links -w crates/graph-metrics \
       -x 'run -p graph-api -- --assets-dir crates/graph-renderer/assets/dist'
 
