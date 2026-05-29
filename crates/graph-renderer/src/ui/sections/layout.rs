@@ -8,8 +8,9 @@ use eframe::egui;
 
 use crate::ui::layout::registry::LayoutRegistry;
 use crate::ui::state::AppState;
+use crate::ui::theme::palette;
 
-use super::subgroup_separator;
+use super::{subgroup_label, subgroup_separator};
 
 pub fn show(ui: &mut egui::Ui, state: &mut AppState, registry: &LayoutRegistry) {
     state.snapshot_source = Some("Layout".into());
@@ -102,4 +103,88 @@ pub fn show(ui: &mut egui::Ui, state: &mut AppState, registry: &LayoutRegistry) 
             "No layout registered for active id — pick one above.",
         ));
     }
+
+    subgroup_separator(ui);
+    show_remote_engine_picker(ui, state);
+}
+
+/// "Remote engine" picker — surfaces the engines advertised by the
+/// graph-compute worker (via graph-api `/compute/engines`) and lets the
+/// user switch which one drives the `/graph/layout/stream`. The actual
+/// HTTP calls happen in `App::update`, which drains the one-shot flags on
+/// `state.compute`; this fn is purely view + intent-raising.
+fn show_remote_engine_picker(ui: &mut egui::Ui, state: &mut AppState) {
+    subgroup_label(ui, "Remote engine");
+
+    // Lazy first fetch: kick off exactly once when the section is first
+    // rendered. Subsequent refreshes are user-driven (the ↻ button) — we
+    // never poll every frame.
+    if !state.compute.requested_once {
+        state.compute.requested_once = true;
+        state.compute.refresh_requested = true;
+    }
+
+    let snapshot = state.compute.current();
+
+    ui.horizontal(|ui| {
+        match &snapshot {
+            Some(Ok(eng)) if eng.connected => {
+                let active = eng.active.clone();
+                let selected_label = eng
+                    .engines
+                    .iter()
+                    .find(|e| e.id == active)
+                    .map(|e| e.display_name.clone())
+                    .unwrap_or_else(|| {
+                        if active.is_empty() {
+                            "(none)".to_string()
+                        } else {
+                            active.clone()
+                        }
+                    });
+
+                egui::ComboBox::from_id_salt("compute-engine")
+                    .selected_text(selected_label)
+                    .show_ui(ui, |ui| {
+                        for e in &eng.engines {
+                            let resp = ui
+                                .selectable_label(e.id == active, &e.display_name)
+                                .on_hover_text(if e.description.is_empty() {
+                                    e.kind.clone()
+                                } else {
+                                    format!("{} — {}", e.kind, e.description)
+                                });
+                            if resp.clicked() && e.id != active {
+                                state.compute.select = Some(e.id.clone());
+                            }
+                        }
+                    });
+            }
+            Some(Ok(_)) => {
+                // Reached graph-api, but the broker has no worker.
+                ui.colored_label(palette::WARNING, "no compute worker");
+            }
+            Some(Err(_)) => {
+                ui.colored_label(palette::BAD, "engines unavailable");
+            }
+            None => {
+                ui.colored_label(palette::GREY, "loading…");
+            }
+        }
+
+        ui.add_space(8.0);
+        if ui
+            .small_button("↻")
+            .on_hover_text("Refresh remote engine list")
+            .clicked()
+        {
+            state.compute.refresh_requested = true;
+        }
+    });
+
+    super::hint_label(
+        ui,
+        "Drives the Remote (compute) layout's stream. Select the local \
+         layout \"Remote (compute)\" above to view it.",
+    );
 }

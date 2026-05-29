@@ -1530,6 +1530,11 @@ impl eframe::App for App {
         self.apply_layout_to_gpu(frame);
         self.perf.end_stage(StageId::LayoutDispatch);
 
+        // Remote-engine picker (Layout section) — drain one-shot intent
+        // flags into async HTTP. Cheap no-op on the common frame where no
+        // flag is set.
+        self.drain_compute_engine_requests();
+
         self.perf.begin_stage(StageId::ApplyEffects);
         self.apply_focus_to_gpu(frame);
         self.apply_camera_to_gpu(ctx, frame);
@@ -1956,6 +1961,50 @@ impl App {
             .unwrap_or_default();
         json_str.hash(&mut h);
         h.finish()
+    }
+
+    /// Drain the Layout section's "Remote engine" picker intents. The
+    /// section can't reach the `ApiClient` (it only gets `&mut AppState`),
+    /// so it raises one-shot flags on `state.compute` and we service them
+    /// here against the shared snapshot latch.
+    ///
+    /// - `refresh_requested` → GET `/compute/engines`, store result.
+    /// - `select` → PUT `/compute/layout` then re-fetch engines so the
+    ///   combo reflects the new `active`.
+    fn drain_compute_engine_requests(&mut self) {
+        let refresh = std::mem::take(&mut self.state.compute.refresh_requested);
+        let select = self.state.compute.select.take();
+
+        if select.is_none() && !refresh {
+            return;
+        }
+
+        let slot = self.state.compute.snapshot.clone();
+        let base = self.base_url.clone();
+
+        if let Some(layout_id) = select {
+            // Switch engine, then refresh the list regardless of switch
+            // outcome so the UI shows the resulting `active` (or surfaces
+            // a stale state the user can retry).
+            spawn_async(async move {
+                let client = ApiClient::new(base);
+                if let Err(e) = client.set_compute_layout(&layout_id, None).await {
+                    log::warn!("set_compute_layout({layout_id}) failed: {e}");
+                }
+                let res = client.list_compute_engines().await;
+                if let Ok(mut g) = slot.lock() {
+                    *g = Some(res);
+                }
+            });
+        } else if refresh {
+            spawn_async(async move {
+                let client = ApiClient::new(base);
+                let res = client.list_compute_engines().await;
+                if let Ok(mut g) = slot.lock() {
+                    *g = Some(res);
+                }
+            });
+        }
     }
 
     fn apply_layout_to_gpu(&mut self, frame: &mut eframe::Frame) {

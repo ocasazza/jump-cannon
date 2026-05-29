@@ -70,9 +70,11 @@ impl PhysicsLayout for RemoteFa2Layout {
         LayoutDescriptor {
             id: LAYOUT_ID,
             kind: LayoutKind::Physics,
-            display_name: "Remote FA2 (WS)",
+            display_name: "Remote (compute)",
             description:
-                "Stream FA2 positions from a remote graph-compute worker over WebSocket.",
+                "Stream positions from the remote graph-compute worker over WebSocket. \
+                 The actual engine (FA2, etc.) is chosen separately via the \
+                 \"Remote engine\" picker in this section.",
             requirements: LayoutRequirements {
                 needs_edges: false,
                 needs_cpu_positions: false,

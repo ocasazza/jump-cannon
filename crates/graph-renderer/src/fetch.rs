@@ -13,6 +13,8 @@
 //!   PUT /vault/page              -> { ok: bool }
 //!   GET /progress?since=<seq>    -> raw bytes (progress events)
 //!   GET /compute/health          -> ComputeHealth
+//!   GET /compute/engines         -> ComputeEngines
+//!   PUT /compute/layout          -> { ok: bool, error: string|null }
 //!   WebSocket /graph/layout/stream -> binary positions stream
 
 use std::sync::{Arc, Mutex};
@@ -149,6 +151,54 @@ impl ApiClient {
             .map_err(|e| format!("decode compute_health: {e}"))
     }
 
+    /// `GET /compute/engines` — the set of layout engines exposed by the
+    /// remote graph-compute worker, plus which one is currently active.
+    ///
+    /// When the broker is disabled/unreachable the server returns HTTP
+    /// 200 with `{ connected: false, active: "", engines: [] }` (NOT an
+    /// error) — so `Ok(ComputeEngines { connected: false, .. })` is the
+    /// normal "no worker" state, distinct from `Err` (graph-api itself
+    /// down or the route 404ing).
+    pub async fn list_compute_engines(&self) -> Result<ComputeEngines, String> {
+        let bytes = http_get_bytes(&self.url("/compute/engines")).await?;
+        serde_json::from_slice::<ComputeEngines>(&bytes)
+            .map_err(|e| format!("decode compute_engines: {e}"))
+    }
+
+    /// `PUT /compute/layout` — switch the remote engine driving the
+    /// `/graph/layout/stream`. Body is `{ layout_id, params }`; `params`
+    /// is `None` to let the worker apply the engine's defaults.
+    ///
+    /// Returns `Ok(())` on `{ ok: true }`, `Err(...)` on `{ ok: false }`
+    /// or any non-2xx status.
+    pub async fn set_compute_layout(
+        &self,
+        layout_id: &str,
+        params: Option<serde_json::Value>,
+    ) -> Result<(), String> {
+        #[derive(serde::Serialize)]
+        struct Req<'a> {
+            layout_id: &'a str,
+            params: Option<serde_json::Value>,
+        }
+        #[derive(serde::Deserialize)]
+        struct Resp {
+            ok: bool,
+            error: Option<String>,
+        }
+        let url = self.url("/compute/layout");
+        let req = Req { layout_id, params };
+        let bytes =
+            http_put_json(&url, &serde_json::to_vec(&req).map_err(|e| e.to_string())?).await?;
+        let resp: Resp =
+            serde_json::from_slice(&bytes).map_err(|e| format!("decode set_layout: {e}"))?;
+        if resp.ok {
+            Ok(())
+        } else {
+            Err(resp.error.unwrap_or_else(|| "set layout failed".into()))
+        }
+    }
+
     #[cfg(not(target_arch = "wasm32"))]
     pub fn start_layout_stream_native(&self) -> tokio::task::JoinHandle<()> {
         let base = self.base.clone();
@@ -237,6 +287,31 @@ let (_write, mut read) = ws_stream.split();
 pub struct ComputeHealth {
     pub connected: bool,
     pub url: String,
+}
+
+/// Response of `GET /compute/engines`. `connected` reflects whether the
+/// broker is wired to a worker; `active` is the currently-selected remote
+/// engine id (`""` if none); `engines` is the worker's advertised set.
+#[derive(Clone, Debug, Default, serde::Deserialize)]
+pub struct ComputeEngines {
+    #[serde(default)]
+    pub connected: bool,
+    #[serde(default)]
+    pub active: String,
+    #[serde(default)]
+    pub engines: Vec<EngineInfo>,
+}
+
+/// One remote layout engine descriptor (mirror of the gRPC/HTTP
+/// `EngineDescriptor`). `kind` is `"Physics"` or `"Static"`.
+#[derive(Clone, Debug, serde::Deserialize)]
+pub struct EngineInfo {
+    pub id: String,
+    pub display_name: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub kind: String,
 }
 
 fn bytes_to_f32(b: &[u8]) -> Result<Vec<f32>, String> {

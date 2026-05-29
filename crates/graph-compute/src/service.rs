@@ -26,8 +26,8 @@ use tonic::{Request, Response, Status};
 use crate::partition::HaloDelta as HostHaloDelta;
 use crate::proto::compute_server::Compute;
 use crate::proto::{
-    CoarsenSettings, FocusRequest, HaloDelta, HealthRequest, HealthResponse, HybridFrame,
-    PositionDelta, SubscribeRequest,
+    CoarsenSettings, EngineDescriptor, FocusRequest, HaloDelta, HealthRequest, HealthResponse,
+    HybridFrame, ListEnginesRequest, ListEnginesResponse, PositionDelta, SubscribeRequest,
 };
 use crate::sim::{CsrGraph, SimState};
 use crate::topo_fisheye::{
@@ -90,6 +90,16 @@ type TopoFisheyeStream =
     Pin<Box<dyn Stream<Item = Result<HybridFrame, Status>> + Send + 'static>>;
 type ExchangeHaloStream =
     Pin<Box<dyn Stream<Item = Result<HaloDelta, Status>> + Send + 'static>>;
+
+/// String form of a `LayoutKind` for the `EngineDescriptor.kind` wire field
+/// (FROZEN CONTRACT: "Physics" | "Static"). The renderer keys its picker off
+/// these exact strings.
+fn layout_kind_str(kind: graph_layouts::LayoutKind) -> &'static str {
+    match kind {
+        graph_layouts::LayoutKind::Physics => "Physics",
+        graph_layouts::LayoutKind::Static => "Static",
+    }
+}
 
 /// Decode a proto `HaloDelta` (frame + owner_id + raw-LE byte blobs) into the
 /// host-readable [`HostHaloDelta`]. Bulk numeric fields ride raw LE per the
@@ -180,6 +190,28 @@ impl Compute for ComputeService {
             ok: true,
             n_nodes: self.state.graph.n_nodes,
             frame,
+        }))
+    }
+
+    async fn list_engines(
+        &self,
+        _req: Request<ListEnginesRequest>,
+    ) -> Result<Response<ListEnginesResponse>, Status> {
+        let engines = self
+            .state
+            .registry
+            .descriptors()
+            .iter()
+            .map(|d| EngineDescriptor {
+                id: d.id.to_string(),
+                display_name: d.display_name.to_string(),
+                description: d.description.to_string(),
+                kind: layout_kind_str(d.kind).to_string(),
+            })
+            .collect();
+        Ok(Response::new(ListEnginesResponse {
+            engines,
+            default_id: self.state.registry.default_id().to_string(),
         }))
     }
 

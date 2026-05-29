@@ -7,6 +7,11 @@ service Compute {
   rpc Subscribe(SubscribeRequest) returns (stream PositionDelta);
   rpc Health(HealthRequest) returns (HealthResponse);
 
+  // ADR-002: enumerate the worker's selectable layout engines (the
+  // EngineRegistry). The broker exposes this over HTTP as /compute/engines so
+  // the renderer's layout picker is engine-location agnostic.
+  rpc ListEngines(ListEnginesRequest) returns (ListEnginesResponse);
+
   // Topological-fisheye view (Gansner, Koren, North — IEEE InfoVis 2004).
   // Bidirectional stream: the client sends FocusRequests as the user moves
   // the focal node, and the server emits a fresh HybridFrame for each.
@@ -50,6 +55,24 @@ message HaloDelta {
   uint32 owner_id = 2;           // partition id that owns these nodes
   bytes  node_ids  = 3;          // raw little-endian u32 global ids
   bytes  positions = 4;          // raw little-endian f32 [x0,y0,z0,...], parallel to node_ids
+}
+
+// One selectable layout engine in the worker's EngineRegistry (ADR-002).
+// `kind` is the string form of `LayoutKind`: "Physics" (continuous sim) or
+// "Static" (one-shot solver).
+message EngineDescriptor {
+  string id = 1;
+  string display_name = 2;
+  string description = 3;
+  string kind = 4;
+}
+
+message ListEnginesRequest {}
+message ListEnginesResponse {
+  repeated EngineDescriptor engines = 1;
+  // Registry key used when a Subscribe omits `layout_id`
+  // (EngineRegistry::default_id()).
+  string default_id = 2;
 }
 
 message HealthRequest {}

@@ -844,6 +844,12 @@ pub struct AppState {
     /// log is intentionally session-scoped).
     #[serde(skip)]
     pub frontend_events: FrontendEventLog,
+    /// Remote-engine picker state for the Layout section. Holds the last
+    /// `/compute/engines` snapshot plus one-shot flags drained by
+    /// `App::update` (which owns the `ApiClient` the section can't reach).
+    /// Session-scoped, never persisted.
+    #[serde(skip)]
+    pub compute: ComputeEngineState,
     /// Currently logically-focused non-canvas panel. `None` means the
     /// canvas is focused (the always-receiving fallback). Drives:
     ///   * Scroll-wheel zoom gating in `ui::workspace` — when a panel
@@ -1132,7 +1138,47 @@ impl Default for AppState {
             snapshot_source: None,
             debug_view_mode: DebugViewMode::default(),
             frontend_events: FrontendEventLog::default(),
+            compute: ComputeEngineState::default(),
             focused_panel: None,
         }
+    }
+}
+
+/// Renderer-side state for the Layout section's "Remote engine" picker.
+///
+/// The Layout section (`ui::sections::layout`) renders the dropdown but
+/// has no access to the `ApiClient` / base url — those live on `App`. So
+/// this struct is the seam: the section reads `snapshot` to draw the
+/// combo and raises one-shot flags (`refresh_requested`, `select`), and
+/// `App::update` drains those flags, performs the async HTTP call, and
+/// writes the result back into `snapshot` via the shared `Arc<Mutex<..>>`.
+///
+/// `#[serde(skip)]` on the `AppState` field — never persisted.
+#[derive(Clone, Default, Debug)]
+pub struct ComputeEngineState {
+    /// Latest `/compute/engines` result. `None` until the first fetch
+    /// resolves; the inner `Result` distinguishes a server error (route
+    /// 404 / graph-api down) from a successful "no worker" snapshot
+    /// (`connected: false`). Shared with the async fetch task on `App`.
+    pub snapshot: std::sync::Arc<
+        std::sync::Mutex<Option<Result<crate::fetch::ComputeEngines, String>>>,
+    >,
+    /// True once a fetch has been kicked off, so the lazy auto-refresh on
+    /// panel open fires exactly once per session unless the user hits the
+    /// manual refresh button (which clears nothing — it just re-requests).
+    pub requested_once: bool,
+    /// One-shot: the section wants a fresh `/compute/engines` fetch.
+    /// Drained by `App::update`.
+    pub refresh_requested: bool,
+    /// One-shot: the user picked engine id `Some(..)` in the combo.
+    /// `App::update` PUTs `/compute/layout` then re-requests engines.
+    pub select: Option<String>,
+}
+
+impl ComputeEngineState {
+    /// Snapshot the current engines result (cloned out of the shared
+    /// latch) for read-only rendering. `None` = not yet fetched.
+    pub fn current(&self) -> Option<Result<crate::fetch::ComputeEngines, String>> {
+        self.snapshot.lock().ok().and_then(|g| g.clone())
     }
 }

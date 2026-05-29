@@ -42,6 +42,8 @@ pub fn router(state: AppState) -> Router {
         .route("/node/*id", get(node_meta))
         .route("/search", get(search))
         .route("/compute/health", get(compute_health))
+        .route("/compute/engines", get(compute_engines))
+        .route("/compute/layout", put(compute_layout_put))
         .route("/vault/page", put(vault_page_put))
         .route("/progress", get(progress_poll))
         .with_state(state)
@@ -287,6 +289,63 @@ fn extract_frontmatter_block(text: &str) -> String {
 async fn compute_health(State(s): State<AppState>) -> impl IntoResponse {
     let status = s.inner.compute_broker.status().await;
     axum::Json(status)
+}
+
+/// `GET /compute/engines` (FROZEN CONTRACT). Enumerates the worker's
+/// selectable layout engines (its `EngineRegistry`) via the broker's
+/// one-shot `ListEngines` gRPC, plus the broker's currently-selected
+/// engine as `active`. Degrades to `{ connected:false, active:"",
+/// engines:[] }` (HTTP 200) when the broker is disabled or the worker is
+/// unreachable — same graceful posture as `/compute/health`. So the
+/// renderer's layout picker is engine-location agnostic.
+async fn compute_engines(State(s): State<AppState>) -> impl IntoResponse {
+    let view = s.inner.compute_broker.list_engines().await;
+    axum::Json(view)
+}
+
+/// `PUT /compute/layout` (FROZEN CONTRACT). Switches the active remote
+/// layout engine: the broker stores the new selection, tears down the old
+/// forwarder, and resubscribes so subsequent `/graph/layout/stream` frames
+/// come from the newly-selected engine. Body:
+/// `{ "layout_id": "fa2-bh", "params": { … } | null }`. Responds
+/// `{ "ok": bool, "error": string|null }` (HTTP 200; `ok:false` on a
+/// validation or dial failure rather than a non-200 status, mirroring
+/// `/vault/page`'s soft-error envelope for the renderer).
+#[derive(Deserialize)]
+struct ComputeLayoutPutReq {
+    layout_id: String,
+    #[serde(default)]
+    params: Option<serde_json::Value>,
+}
+
+#[derive(Serialize)]
+struct ComputeLayoutPutResp {
+    ok: bool,
+    error: Option<String>,
+}
+
+async fn compute_layout_put(
+    State(s): State<AppState>,
+    Json(req): Json<ComputeLayoutPutReq>,
+) -> impl IntoResponse {
+    let layout_id = req.layout_id.trim().to_string();
+    if layout_id.is_empty() {
+        return axum::Json(ComputeLayoutPutResp {
+            ok: false,
+            error: Some("layout_id must be non-empty".into()),
+        });
+    }
+    let selection = crate::compute_broker::RemoteLayout {
+        layout_id,
+        params: req.params,
+    };
+    match s.inner.compute_broker.reselect(selection).await {
+        Ok(()) => axum::Json(ComputeLayoutPutResp { ok: true, error: None }),
+        Err(e) => {
+            tracing::warn!(error = %e, "compute layout reselect failed");
+            axum::Json(ComputeLayoutPutResp { ok: false, error: Some(e.to_string()) })
+        }
+    }
 }
 
 /// `GET /progress?since=<seq>` — tail of the server-side progress event
