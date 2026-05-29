@@ -23,10 +23,11 @@ use tokio::sync::Mutex;
 use tokio_stream::StreamExt;
 use tonic::{Request, Response, Status};
 
+use crate::engines::GraphAttributes as HostGraphAttributes;
 use crate::partition::HaloDelta as HostHaloDelta;
 use crate::proto::compute_server::Compute;
 use crate::proto::{
-    CoarsenSettings, FocusRequest, HaloDelta, HealthRequest, HealthResponse, HybridFrame,
+    CoarsenSettings, FocusRequest, GraphAttributes as ProtoGraphAttributes, HaloDelta, HealthRequest, HealthResponse, HybridFrame,
     PositionDelta, SubscribeRequest,
 };
 use crate::sim::{CsrGraph, SimState};
@@ -111,6 +112,41 @@ fn host_to_proto(d: &HostHaloDelta) -> HaloDelta {
     }
 }
 
+/// Decode a proto `GraphAttributes` into the host `GraphAttributes`.
+fn proto_attrs_to_host(a: ProtoGraphAttributes) -> Result<HostGraphAttributes, Status> {
+    let cast_u32 = |name: &str, bytes: &[u8]| -> Result<Option<Vec<u32>>, Status> {
+        if bytes.is_empty() {
+            return Ok(None);
+        }
+        if bytes.len() % 4 != 0 {
+            return Err(Status::invalid_argument(format!(
+                "GraphAttributes.{name} misaligned: len {} is not a multiple of 4",
+                bytes.len()
+            )));
+        }
+        Ok(Some(bytemuck::cast_slice::<u8, u32>(bytes).to_vec()))
+    };
+    let cast_f32 = |name: &str, bytes: &[u8]| -> Result<Option<Vec<f32>>, Status> {
+        if bytes.is_empty() {
+            return Ok(None);
+        }
+        if bytes.len() % 4 != 0 {
+            return Err(Status::invalid_argument(format!(
+                "GraphAttributes.{name} misaligned: len {} is not a multiple of 4",
+                bytes.len()
+            )));
+        }
+        Ok(Some(bytemuck::cast_slice::<u8, f32>(bytes).to_vec()))
+    };
+
+    Ok(HostGraphAttributes {
+        node_class: cast_u32("node_class", &a.node_class)?,
+        node_coordination: cast_u32("node_coordination", &a.node_coordination)?,
+        node_mass: cast_f32("node_mass", &a.node_mass)?,
+        edge_len: cast_f32("edge_len", &a.edge_len)?,
+    })
+}
+
 #[tonic::async_trait]
 impl Compute for ComputeService {
     type SubscribeStream = SubscribeStream;
@@ -142,9 +178,14 @@ impl Compute for ComputeService {
                 .params
                 .map(struct_to_json)
                 .unwrap_or(serde_json::Value::Null);
+            let attributes = if let Some(a) = req.attributes {
+                Some(proto_attrs_to_host(a)?)
+            } else {
+                None
+            };
             let running = self
                 .state
-                .init_engine(&req.layout_id, params)
+                .init_engine(&req.layout_id, params, attributes)
                 .await
                 .map_err(|e| Status::internal(format!("engine init failed: {e}")))?;
             tracing::info!(
@@ -501,5 +542,35 @@ pub async fn run_sim_loop(state: Arc<SimState>, _tick_hz: f32) {
         };
         // ignore send errors; broadcast returns Err if no receivers — that's fine.
         let _ = state.tx.send(delta);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_proto_attrs_to_host() {
+        // Valid case
+        let valid = ProtoGraphAttributes {
+            node_class: vec![1, 0, 0, 0], // one u32
+            node_coordination: vec![], // empty is fine
+            node_mass: vec![0, 0, 128, 63], // 1.0f32
+            edge_len: vec![0, 0, 0, 64], // 2.0f32
+        };
+        let host = proto_attrs_to_host(valid).expect("should succeed");
+        assert_eq!(host.node_class, Some(vec![1]));
+        assert_eq!(host.node_coordination, None);
+        assert_eq!(host.node_mass, Some(vec![1.0]));
+        assert_eq!(host.edge_len, Some(vec![2.0]));
+
+        // Misaligned case
+        let misaligned = ProtoGraphAttributes {
+            node_class: vec![1, 0, 0], // 3 bytes, not multiple of 4
+            ..Default::default()
+        };
+        let err = proto_attrs_to_host(misaligned).unwrap_err();
+        assert_eq!(err.code(), Status::invalid_argument("").code());
+        assert!(err.message().contains("misaligned"));
     }
 }

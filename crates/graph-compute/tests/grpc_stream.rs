@@ -19,7 +19,7 @@ async fn delivers_at_least_one_position_delta() {
     let state = SimState::new(graph);
     // Init the layout engine (registry default `"fa2-brute"`, falling back to
     // the CPU spring engine on GPU-less hosts) so the sim loop produces frames.
-    let _ = state.init_engine("", serde_json::Value::Null).await;
+    let _ = state.init_engine("", serde_json::Value::Null, None).await;
 
     // Bind to an ephemeral port. Tonic's `Server::serve` doesn't surface the
     // bound port, so we bind a std listener first and pull the port out.
@@ -78,7 +78,7 @@ async fn positions_advance_over_frames() {
     let state = SimState::new(graph);
     // Init the layout engine — the wgpu FA2 engine if a GPU is present, else
     // the CPU spring fallback. Both produce non-zero motion on the ring seed.
-    let _ = state.init_engine("", serde_json::Value::Null).await;
+    let _ = state.init_engine("", serde_json::Value::Null, None).await;
 
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();

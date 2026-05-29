@@ -33,6 +33,18 @@ message SubscribeRequest {
   // Maps directly to/from serde_json::Value on the Rust side, so the one
   // serde settings struct per engine stays the single source of truth.
   google.protobuf.Struct params = 3;
+  GraphAttributes attributes = 4;  // NEW; absent ⇒ structural/standalone path
+}
+
+// Injected per-node / per-edge geometric attributes (parallel to the backend
+// graph's id-sorted node order; edge_len parallel to CSR neighbors). Bulk
+// numeric ⇒ raw little-endian per the repo wire rule. Each field optional:
+// empty bytes = absent (engine falls back to a structural source).
+message GraphAttributes {
+  bytes node_class        = 1;  // raw LE u32, len n_nodes
+  bytes node_coordination = 2;  // raw LE u32, len n_nodes
+  bytes node_mass         = 3;  // raw LE f32, len n_nodes
+  bytes edge_len          = 4;  // raw LE f32, len neighbors.len()
 }
 
 message PositionDelta {

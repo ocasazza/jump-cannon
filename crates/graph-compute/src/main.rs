@@ -54,7 +54,7 @@ async fn main() -> Result<()> {
     // (the `layout_id` wire field) lands in Phase 3.
     let layout_id = std::env::var("GRAPH_COMPUTE_LAYOUT_ID").unwrap_or_default();
     match state
-        .init_engine(&layout_id, serde_json::Value::Null)
+        .init_engine(&layout_id, serde_json::Value::Null, None)
         .await
     {
         Ok(id) => tracing::info!(engine = id, "layout engine initialized"),
