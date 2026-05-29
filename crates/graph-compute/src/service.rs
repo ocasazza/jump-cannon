@@ -23,16 +23,36 @@ use tokio::sync::Mutex;
 use tokio_stream::StreamExt;
 use tonic::{Request, Response, Status};
 
+use crate::partition::HaloDelta as HostHaloDelta;
 use crate::proto::compute_server::Compute;
 use crate::proto::{
-    CoarsenSettings, FocusRequest, HealthRequest, HealthResponse, HybridFrame, PositionDelta,
-    SubscribeRequest,
+    CoarsenSettings, FocusRequest, HaloDelta, HealthRequest, HealthResponse, HybridFrame,
+    PositionDelta, SubscribeRequest,
 };
 use crate::sim::{CsrGraph, SimState};
 use crate::topo_fisheye::{
     build_hierarchy, build_hybrid, distort_radial, CoarsenParams, DistortParams, HybridParams,
     MatchWeights, TopoHierarchy,
 };
+
+/// Source of this worker's outgoing boundary halo for the distributed BSP
+/// exchange (docs/compute-architecture.md §4, step c). The `ExchangeHalo` RPC
+/// asks the provider, per inbound frame, "what boundary positions do I owe the
+/// peer for this frame?" and streams the answer back.
+///
+/// This is the seam that keeps the gRPC handler honest without baking a full
+/// distributed runtime into the service: a real worker installs a provider
+/// backed by its [`Partition`](crate::partition::Partition) + live owned
+/// positions; the single-process default installs none (the RPC then reports
+/// `unimplemented`). `inbound` is the peer's delta for that frame, so a
+/// provider may also use it to drive its own `apply_halo` before replying.
+pub trait HaloProvider: Send + Sync {
+    /// Boundary deltas this worker owns and the peer needs for `frame`. The
+    /// peer's inbound delta for the same frame is supplied for context (e.g.
+    /// to fold into the local engine before answering). Returning an empty Vec
+    /// is legal (this worker owes the peer nothing this frame).
+    fn outgoing_for(&self, frame: u64, inbound: &HostHaloDelta) -> Vec<HostHaloDelta>;
+}
 
 pub struct ComputeService {
     pub state: Arc<SimState>,
@@ -41,6 +61,9 @@ pub struct ComputeService {
     /// subsequent focus changes (and across reconnecting clients) since
     /// the hierarchy depends only on the input topology + initial layout.
     hierarchies: Arc<Mutex<HashMap<String, Arc<TopoHierarchy>>>>,
+    /// Distributed BSP halo source for `ExchangeHalo` (doc §4). `None` for the
+    /// single-process default — the RPC then returns `unimplemented`.
+    halo: Option<Arc<dyn HaloProvider>>,
 }
 
 impl ComputeService {
@@ -48,7 +71,16 @@ impl ComputeService {
         Self {
             state,
             hierarchies: Arc::new(Mutex::new(HashMap::new())),
+            halo: None,
         }
+    }
+
+    /// Install a [`HaloProvider`] so this service answers the distributed
+    /// `ExchangeHalo` RPC (doc §4). Without one, `ExchangeHalo` is
+    /// `unimplemented`.
+    pub fn with_halo_provider(mut self, provider: Arc<dyn HaloProvider>) -> Self {
+        self.halo = Some(provider);
+        self
     }
 }
 
@@ -56,11 +88,34 @@ type SubscribeStream =
     Pin<Box<dyn Stream<Item = Result<PositionDelta, Status>> + Send + 'static>>;
 type TopoFisheyeStream =
     Pin<Box<dyn Stream<Item = Result<HybridFrame, Status>> + Send + 'static>>;
+type ExchangeHaloStream =
+    Pin<Box<dyn Stream<Item = Result<HaloDelta, Status>> + Send + 'static>>;
+
+/// Decode a proto `HaloDelta` (frame + owner_id + raw-LE byte blobs) into the
+/// host-readable [`HostHaloDelta`]. Bulk numeric fields ride raw LE per the
+/// repo wire rule; `decode_bytes` enforces alignment + the positions↔node_ids
+/// length invariant.
+fn proto_to_host(d: HaloDelta) -> Result<HostHaloDelta, Status> {
+    HostHaloDelta::decode_bytes(d.frame, d.owner_id, &d.node_ids, &d.positions)
+        .map_err(|e| Status::invalid_argument(format!("malformed HaloDelta: {e}")))
+}
+
+/// Encode a host [`HostHaloDelta`] into the proto wire form (raw-LE bytes).
+fn host_to_proto(d: &HostHaloDelta) -> HaloDelta {
+    let (node_ids, positions) = d.encode_bytes();
+    HaloDelta {
+        frame: d.frame,
+        owner_id: d.owner_id,
+        node_ids,
+        positions,
+    }
+}
 
 #[tonic::async_trait]
 impl Compute for ComputeService {
     type SubscribeStream = SubscribeStream;
     type TopoFisheyeStream = TopoFisheyeStream;
+    type ExchangeHaloStream = ExchangeHaloStream;
 
     async fn subscribe(
         &self,
@@ -146,6 +201,41 @@ impl Compute for ComputeService {
 
                 let frame = build_frame(&h, &focus);
                 yield frame;
+            }
+        };
+        Ok(Response::new(Box::pin(out)))
+    }
+
+    /// Distributed BSP halo exchange (doc §4, step c). For each boundary
+    /// `HaloDelta` the peer streams in (the positions IT owns for some frame),
+    /// this worker replies with the boundary `HaloDelta`s IT owns and the peer
+    /// needs for that same frame, sourced from the installed [`HaloProvider`].
+    ///
+    /// Real transport, not the in-memory double: the bytes cross the tonic
+    /// codec both ways. Without a provider installed the RPC is `unimplemented`
+    /// (the single-process default uses [`LocalTransport`](crate::partition::LocalTransport)).
+    async fn exchange_halo(
+        &self,
+        req: Request<tonic::Streaming<HaloDelta>>,
+    ) -> Result<Response<Self::ExchangeHaloStream>, Status> {
+        let provider = self.halo.clone().ok_or_else(|| {
+            Status::unimplemented(
+                "ExchangeHalo requires a HaloProvider; this worker runs single-process \
+                 (LocalTransport). See docs/compute-architecture.md §4.",
+            )
+        })?;
+        let mut in_stream = req.into_inner();
+
+        let out = async_stream::try_stream! {
+            while let Some(msg) = in_stream.next().await {
+                let proto = msg
+                    .map_err(|e| Status::internal(format!("peer halo stream error: {e}")))?;
+                let frame = proto.frame;
+                let inbound = proto_to_host(proto)?;
+                // Reply with what this worker owes the peer for the SAME frame.
+                for owed in provider.outgoing_for(frame, &inbound) {
+                    yield host_to_proto(&owed);
+                }
             }
         };
         Ok(Response::new(Box::pin(out)))

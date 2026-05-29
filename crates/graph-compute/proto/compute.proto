@@ -13,6 +13,14 @@ service Compute {
   // The expensive multilevel hierarchy is built lazily on the first request
   // and cached for the lifetime of the connection.
   rpc TopoFisheye(stream FocusRequest) returns (stream HybridFrame);
+
+  // Distributed BSP halo exchange (docs/compute-architecture.md §4, step c).
+  // A peer worker streams the boundary HaloDeltas it owns for each superstep;
+  // this worker replies, per inbound frame, with the boundary HaloDeltas IT
+  // owns and the peer needs for that same frame. This is the real network
+  // transport behind the `HaloTransport` trait seam — `TonicHaloTransport`
+  // drives the client end, `LocalTransport` stays the single-process double.
+  rpc ExchangeHalo(stream HaloDelta) returns (stream HaloDelta);
 }
 
 message SubscribeRequest {

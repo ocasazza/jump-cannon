@@ -73,6 +73,17 @@ pub struct Partition {
     /// Number of owned (integrated) nodes; they occupy local indices
     /// `[0, n_owned)`.
     pub n_owned: u32,
+    /// **Boundary** global ids: the subset of owned nodes that appear in *some
+    /// other* partition's ghost table — i.e. the only owned positions a peer
+    /// actually needs each superstep (doc §4: "exchange only boundary
+    /// positions"). Interior owned nodes (referenced by no peer) are omitted, so
+    /// the BSP halo ships strictly less than every owned position.
+    ///
+    /// Stored in ascending global order. By the edge-cut symmetry of
+    /// [`partition_csr`], `v` is in this partition's boundary iff `v` is owned
+    /// here and is some peer's ghost, which holds exactly when `v` has a neighbor
+    /// owned by another partition.
+    pub boundary: Vec<u32>,
 }
 
 impl Partition {
@@ -84,6 +95,44 @@ impl Partition {
     /// Global ids of ghost nodes (local indices `[n_owned, n_nodes)`).
     pub fn ghost_global_ids(&self) -> &[u32] {
         &self.global_ids[self.n_owned as usize..]
+    }
+
+    /// Global ids of this partition's boundary nodes (owned here, ghost on some
+    /// peer). See [`Partition::boundary`].
+    pub fn boundary_global_ids(&self) -> &[u32] {
+        &self.boundary
+    }
+
+    /// Build the outgoing [`HaloDelta`] for this superstep from the engine's
+    /// owned-position slice, shipping ONLY the boundary nodes (doc §4).
+    ///
+    /// `owned_positions` is interleaved `x,y,z`, parallel to
+    /// [`Partition::owned_global_ids`] (so `owned_positions.len() == 3 *
+    /// n_owned`). Each boundary global id is mapped to its slot in the owned
+    /// block via the ascending owned order, and only that node's `x,y,z` triple
+    /// is copied into the delta. Interior owned positions are never sent.
+    fn boundary_delta(&self, frame: u64, owned_positions: &[f32]) -> HaloDelta {
+        let owned = self.owned_global_ids();
+        let mut node_ids = Vec::with_capacity(self.boundary.len());
+        let mut positions = Vec::with_capacity(3 * self.boundary.len());
+        for &g in &self.boundary {
+            // `owned` is ascending; boundary ids are a subset of it.
+            if let Ok(idx) = owned.binary_search(&g) {
+                let base = 3 * idx;
+                if base + 2 < owned_positions.len() {
+                    node_ids.push(g);
+                    positions.push(owned_positions[base]);
+                    positions.push(owned_positions[base + 1]);
+                    positions.push(owned_positions[base + 2]);
+                }
+            }
+        }
+        HaloDelta {
+            frame,
+            owner_id: self.partition_id,
+            node_ids,
+            positions,
+        }
     }
 
     /// Package the owned/ghost split as a foundation [`ShardMeta`] so this
@@ -127,6 +176,7 @@ pub fn partition_csr(graph: &CsrGraph, n_partitions: u32) -> Vec<Partition> {
                 },
                 global_ids: Vec::new(),
                 n_owned: 0,
+                boundary: Vec::new(),
             })
             .collect();
     }
@@ -235,17 +285,33 @@ fn build_partition(
 
     // Discover ghosts: neighbors of owned nodes that are owned by *other*
     // partitions. Appended after the owned block, in first-seen order.
+    //
+    // In the same pass derive the BOUNDARY set: an owned node is a boundary node
+    // iff it has a neighbor owned elsewhere. By edge-cut symmetry that owned
+    // node is then a ghost on the partition owning that neighbor, so this is
+    // exactly { owned v : v is some peer's ghost } (asserted independently in
+    // `boundary_equals_peers_ghosts`). `owned_ids` is ascending, so pushing in
+    // iteration order keeps `boundary` ascending for `boundary_delta`'s
+    // binary_search.
     let mut ghost_ids: Vec<u32> = Vec::new();
+    let mut boundary: Vec<u32> = Vec::new();
     for &g in &owned_ids {
         let gv = g as usize;
         let start = graph.offsets[gv] as usize;
         let end = graph.offsets[gv + 1] as usize;
+        let mut is_boundary = false;
         for &u in &graph.neighbors[start..end] {
-            if owner[u as usize] != pid && !global_to_local.contains_key(&u) {
-                let li = (n_owned as usize + ghost_ids.len()) as u32;
-                global_to_local.insert(u, li);
-                ghost_ids.push(u);
+            if owner[u as usize] != pid {
+                is_boundary = true;
+                if !global_to_local.contains_key(&u) {
+                    let li = (n_owned as usize + ghost_ids.len()) as u32;
+                    global_to_local.insert(u, li);
+                    ghost_ids.push(u);
+                }
             }
+        }
+        if is_boundary {
+            boundary.push(g);
         }
     }
     global_ids.extend_from_slice(&ghost_ids);
@@ -286,6 +352,7 @@ fn build_partition(
         },
         global_ids,
         n_owned,
+        boundary,
     }
 }
 
@@ -443,6 +510,177 @@ impl HaloTransport for LocalTransport {
 }
 
 // ---------------------------------------------------------------------------
+// gRPC halo transport (real cross-process exchange — doc §4 step c)
+// ---------------------------------------------------------------------------
+
+/// A real [`HaloTransport`] that exchanges boundary positions with a peer
+/// worker over the `Compute::ExchangeHalo` bidirectional stream
+/// (docs/compute-architecture.md §4). This is the production counterpart to the
+/// in-process [`LocalTransport`] double: every published delta is encoded to the
+/// proto wire form, streamed to the peer's `ExchangeHalo` handler, and the
+/// peer's reply deltas are decoded back into [`HaloDelta`]s for `collect`.
+///
+/// ## Sync trait over an async stream
+///
+/// The [`HaloTransport`] trait is synchronous (the BSP loop in
+/// [`run_superstep`] is plain blocking code), but a tonic client is async. We
+/// bridge by spawning a driver task on a supplied [`tokio::runtime::Handle`]
+/// that owns the bidi stream: `publish` pushes onto a request `mpsc` (the driver
+/// forwards it to the peer), and `collect` blocks the calling thread on a
+/// response `mpsc` until the peer's deltas for the requested frame arrive,
+/// buffering any out-of-order frames. This keeps `run_superstep` transport
+/// agnostic — it never sees the runtime.
+///
+/// `TODO(barrier-policy):` `collect` currently blocks indefinitely for the
+/// frame's reply. A production deployment wants a timeout + peer-failure policy
+/// (doc §4's "barrier with a failure policy").
+pub struct TonicHaloTransport {
+    self_id: u32,
+    /// Outbound proto deltas → the driver task → the peer's stream.
+    tx: tokio::sync::mpsc::UnboundedSender<crate::proto::HaloDelta>,
+    /// Inbound peer deltas, decoded back to host form by the driver task.
+    rx: tokio::sync::mpsc::UnboundedReceiver<HaloDelta>,
+    /// Frames received from the peer but not yet handed out by `collect`
+    /// (out-of-order buffering across the BSP barrier).
+    pending: std::collections::HashMap<u64, Vec<HaloDelta>>,
+}
+
+impl TonicHaloTransport {
+    /// Connect this worker (`self_id`) to a peer's `ExchangeHalo` stream over an
+    /// existing tonic [`Channel`](tonic::transport::Channel) (or any compatible
+    /// gRPC channel), driving the stream on `handle`.
+    ///
+    /// The bidi stream is opened immediately; published deltas flow to the peer
+    /// and the peer's replies are pumped into the inbound queue by a background
+    /// task. `collect(frame)` blocks the BSP thread until that frame's replies
+    /// land.
+    pub fn connect<T>(
+        self_id: u32,
+        mut client: crate::proto::compute_client::ComputeClient<T>,
+        handle: tokio::runtime::Handle,
+    ) -> Result<Self, String>
+    where
+        T: tonic::client::GrpcService<tonic::body::BoxBody> + Send + 'static,
+        T::Error: Into<tonic::codegen::StdError>,
+        T::ResponseBody: tonic::codegen::Body<Data = tonic::codegen::Bytes> + Send + 'static,
+        <T::ResponseBody as tonic::codegen::Body>::Error: Into<tonic::codegen::StdError> + Send,
+        T::Future: Send,
+    {
+        let (out_tx, out_rx) =
+            tokio::sync::mpsc::unbounded_channel::<crate::proto::HaloDelta>();
+        let (in_tx, in_rx) = tokio::sync::mpsc::unbounded_channel::<HaloDelta>();
+
+        // Driver task: own the bidi stream. Forward outbound deltas to the peer
+        // and decode the peer's replies into the inbound queue. Decode errors
+        // and stream end simply close the inbound channel (collect then drains
+        // whatever was buffered and returns empty for missing frames).
+        handle.spawn(async move {
+            let req_stream = tokio_stream::wrappers::UnboundedReceiverStream::new(out_rx);
+            let mut resp = match client.exchange_halo(req_stream).await {
+                Ok(r) => r.into_inner(),
+                Err(e) => {
+                    tracing::warn!(error = %e, "ExchangeHalo open failed");
+                    return;
+                }
+            };
+            loop {
+                match resp.message().await {
+                    Ok(Some(proto)) => {
+                        match HaloDelta::decode_bytes(
+                            proto.frame,
+                            proto.owner_id,
+                            &proto.node_ids,
+                            &proto.positions,
+                        ) {
+                            Ok(d) => {
+                                if in_tx.send(d).is_err() {
+                                    break; // receiver (transport) dropped
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!(error = %e, "dropping malformed peer HaloDelta");
+                            }
+                        }
+                    }
+                    Ok(None) => break, // peer closed the stream
+                    Err(e) => {
+                        tracing::warn!(error = %e, "ExchangeHalo recv error");
+                        break;
+                    }
+                }
+            }
+        });
+
+        Ok(Self {
+            self_id,
+            tx: out_tx,
+            rx: in_rx,
+            pending: std::collections::HashMap::new(),
+        })
+    }
+
+    /// This transport's partition id.
+    pub fn self_id(&self) -> u32 {
+        self.self_id
+    }
+}
+
+impl HaloTransport for TonicHaloTransport {
+    fn publish(&mut self, frame: u64, mut delta: HaloDelta) {
+        // Stamp the frame so the peer keys its reply to the same superstep.
+        delta.frame = frame;
+        let proto = {
+            let (node_ids, positions) = delta.encode_bytes();
+            crate::proto::HaloDelta {
+                frame: delta.frame,
+                owner_id: delta.owner_id,
+                node_ids,
+                positions,
+            }
+        };
+        // Best-effort: a closed channel means the peer/driver is gone; the BSP
+        // barrier will then collect nothing for this frame.
+        let _ = self.tx.send(proto);
+    }
+
+    fn collect(&mut self, frame: u64) -> Vec<HaloDelta> {
+        // Hand out anything already buffered for this frame first.
+        if let Some(v) = self.pending.remove(&frame) {
+            if !v.is_empty() {
+                return v.into_iter().filter(|d| d.owner_id != self.self_id).collect();
+            }
+        }
+        // Block the BSP thread until the peer's reply(ies) for `frame` arrive,
+        // buffering any other frames we see in the meantime. Returns empty once
+        // the inbound channel closes (peer gone / stream ended).
+        loop {
+            match self.rx.blocking_recv() {
+                Some(d) if d.frame == frame => {
+                    let mut out = vec![d];
+                    // Greedily drain any further replies already queued for this
+                    // frame without blocking.
+                    while let Ok(extra) = self.rx.try_recv() {
+                        if extra.frame == frame {
+                            out.push(extra);
+                        } else {
+                            self.pending.entry(extra.frame).or_default().push(extra);
+                        }
+                    }
+                    return out
+                        .into_iter()
+                        .filter(|d| d.owner_id != self.self_id)
+                        .collect();
+                }
+                Some(other) => {
+                    self.pending.entry(other.frame).or_default().push(other);
+                }
+                None => return Vec::new(), // stream closed
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // BSP superstep skeleton
 // ---------------------------------------------------------------------------
 
@@ -469,11 +707,12 @@ pub struct Worker<E: crate::engines::LayoutEngine> {
 ///
 /// The boundary slice shipped to peers is taken from `StepOutput.boundary` when
 /// the engine produced one; otherwise this falls back to deriving it from the
-/// owned positions + the partition's ghost membership as seen by peers —
-/// `TODO(boundary-derivation):` a real engine should emit `StepOutput.boundary`
-/// itself (it knows which of its owned nodes are some peer's ghost). The
-/// scaffold's fallback ships *all* owned positions, which is correct but
-/// over-communicates.
+/// owned positions + the partition's precomputed boundary set
+/// ([`Partition::boundary`]). The fallback ships ONLY the boundary nodes — the
+/// owned nodes that are some peer's ghost — not every owned position, matching
+/// doc §4's "exchange only boundary positions". A real engine may still emit
+/// `StepOutput.boundary` itself; `TODO(boundary-derivation)` if an engine wants
+/// to override the partition-derived set.
 pub fn run_superstep<E: crate::engines::LayoutEngine, T: HaloTransport>(
     frame: u64,
     worker: &mut Worker<E>,
@@ -483,18 +722,11 @@ pub fn run_superstep<E: crate::engines::LayoutEngine, T: HaloTransport>(
     // a/b — local forces + integrate.
     let out = worker.engine.step(ctx);
 
-    // c — publish boundary positions for peers.
+    // c — publish boundary positions for peers. Fallback ships ONLY the
+    // boundary subset of owned positions (doc §4), not every owned node.
     let outgoing = match out.boundary {
         Some(ref halo) => HaloDelta::from_halo(halo),
-        None => {
-            // Fallback: ship all owned positions tagged with their global ids.
-            HaloDelta {
-                frame,
-                owner_id: worker.partition.partition_id,
-                node_ids: worker.partition.owned_global_ids().to_vec(),
-                positions: out.positions.clone(),
-            }
-        }
+        None => worker.partition.boundary_delta(frame, &out.positions),
     };
     transport.publish(frame, outgoing);
 
@@ -531,14 +763,10 @@ pub fn run_superstep_local<E: crate::engines::LayoutEngine>(
         // Phase 1: every worker steps + publishes (the BSP compute + send).
         for (w, ctx) in workers.iter_mut().zip(ctxs.iter_mut()) {
             let out = w.engine.step(ctx);
+            // Fallback ships ONLY the boundary subset (doc §4), not all owned.
             let delta = match out.boundary {
                 Some(ref halo) => HaloDelta::from_halo(halo),
-                None => HaloDelta {
-                    frame,
-                    owner_id: w.partition.partition_id,
-                    node_ids: w.partition.owned_global_ids().to_vec(),
-                    positions: out.positions.clone(),
-                },
+                None => w.partition.boundary_delta(frame, &out.positions),
             };
             mailbox.entry(frame).or_default().push(delta);
             last[w.partition.partition_id as usize] = out.positions;
@@ -724,6 +952,217 @@ mod tests {
             assert_eq!(w.engine.steps, n_supersteps);
             // With 2 partitions each receives 1 peer halo per superstep.
             assert_eq!(w.engine.halos_received, n_supersteps);
+        }
+    }
+
+    /// (a) The precomputed boundary set equals EXACTLY the owned nodes that are
+    /// some peer's ghost — computed here independently from the per-partition
+    /// ghost lists, never from `Partition::boundary`.
+    #[test]
+    fn boundary_equals_peers_ghosts() {
+        use std::collections::HashSet;
+
+        // Undirected ring 0—1—…—(n-1)—0: more than one cut per multi-way split,
+        // exercising partitions with >1 boundary node (no `grid` ctor exists).
+        fn ring(n: u32) -> CsrGraph {
+            let mut offsets = Vec::with_capacity((n + 1) as usize);
+            let mut neighbors = Vec::new();
+            for i in 0..n {
+                offsets.push(neighbors.len() as u32);
+                neighbors.push((i + n - 1) % n);
+                neighbors.push((i + 1) % n);
+            }
+            offsets.push(neighbors.len() as u32);
+            CsrGraph {
+                n_nodes: n,
+                offsets,
+                neighbors,
+            }
+        }
+
+        // A few graphs to exercise the property over different cut shapes.
+        for g in [CsrGraph::path(6), CsrGraph::path(11), ring(8)] {
+            for np in [2u32, 3, 4] {
+                let parts = partition_csr(&g, np);
+
+                // Independent ground truth: a global id is "wanted" if it shows
+                // up in ANY partition's ghost list. For partition p, the boundary
+                // is { v owned by p : v is wanted } — i.e. v is some peer's ghost.
+                // (A ghost in partition q is by construction owned by some p != q.)
+                let mut all_ghosts: HashSet<u32> = HashSet::new();
+                for p in &parts {
+                    for &gid in p.ghost_global_ids() {
+                        all_ghosts.insert(gid);
+                    }
+                }
+
+                for p in &parts {
+                    let expected: HashSet<u32> = p
+                        .owned_global_ids()
+                        .iter()
+                        .copied()
+                        .filter(|v| all_ghosts.contains(v))
+                        .collect();
+                    let got: HashSet<u32> = p.boundary_global_ids().iter().copied().collect();
+                    assert_eq!(
+                        got, expected,
+                        "graph n={} np={} part {}: boundary != owned-that-are-peer-ghosts",
+                        g.n_nodes, np, p.partition_id
+                    );
+
+                    // Boundary is a subset of owned, kept in ascending order.
+                    let owned: HashSet<u32> = p.owned_global_ids().iter().copied().collect();
+                    assert!(p.boundary.iter().all(|b| owned.contains(b)));
+                    assert!(
+                        p.boundary.windows(2).all(|w| w[0] < w[1]),
+                        "boundary must be ascending for binary_search"
+                    );
+                }
+            }
+        }
+    }
+
+    /// (b) A superstep round on a small graph with interior nodes ships strictly
+    /// FEWER node ids than the owned count: the boundary delta omits interior
+    /// owned nodes.
+    #[test]
+    fn superstep_ships_fewer_than_owned_when_interior_exists() {
+        // path(6) split in two => each side owns 3 nodes (0,1,2 | 3,4,5) with a
+        // single boundary node at the cut (2 | 3). Interior nodes 0,1 / 4,5 must
+        // NOT be shipped.
+        let g = CsrGraph::path(6);
+        let parts = partition_csr(&g, 2);
+
+        // Sanity: at least one partition has interior (non-boundary) owned nodes.
+        assert!(
+            parts
+                .iter()
+                .any(|p| (p.boundary.len() as u32) < p.n_owned),
+            "test graph must have interior owned nodes to be meaningful"
+        );
+
+        for p in &parts {
+            // Fake owned positions: one distinct xyz per owned node.
+            let owned = p.owned_global_ids();
+            let mut pos = Vec::with_capacity(3 * owned.len());
+            for (i, _) in owned.iter().enumerate() {
+                pos.extend_from_slice(&[i as f32, i as f32 + 0.5, i as f32 + 0.25]);
+            }
+            let delta = p.boundary_delta(0, &pos);
+
+            // Strictly fewer ids than owned (because interior nodes exist here).
+            if (p.boundary.len() as u32) < p.n_owned {
+                assert!(
+                    (delta.node_ids.len() as u32) < p.n_owned,
+                    "part {} shipped {} ids >= owned {}",
+                    p.partition_id,
+                    delta.node_ids.len(),
+                    p.n_owned
+                );
+            }
+            // Shipped ids are exactly the boundary set, and positions stay
+            // parallel + correctly mapped from the owned slice.
+            assert_eq!(delta.node_ids, p.boundary);
+            assert_eq!(delta.positions.len(), 3 * delta.node_ids.len());
+            for (k, &gid) in delta.node_ids.iter().enumerate() {
+                let oi = owned.iter().position(|&o| o == gid).unwrap();
+                assert_eq!(delta.positions[3 * k], pos[3 * oi]);
+                assert_eq!(delta.positions[3 * k + 1], pos[3 * oi + 1]);
+                assert_eq!(delta.positions[3 * k + 2], pos[3 * oi + 2]);
+            }
+        }
+    }
+
+    /// (c) Positions still propagate correctly across the boundary: an engine
+    /// that integrates its owned nodes and folds in received halos must, after a
+    /// superstep, hold the peer's boundary positions for exactly its ghost nodes
+    /// — proving the boundary-only delta still carries everything peers need.
+    #[test]
+    fn boundary_only_halo_propagates_positions() {
+        use crate::engines::{CsrShard, EngineCtx, HaloUpdate, LayoutEngine, StepOutput};
+        use graph_layouts::{LayoutDescriptor, LayoutKind, LayoutRequirements};
+        use std::collections::HashMap;
+
+        /// Sets each owned node's x to its global id (constant per step) and
+        /// records, per received halo, the (global id -> x) it was handed. This
+        /// lets the test confirm the boundary delta delivered real positions for
+        /// the right nodes.
+        struct PosProbe {
+            descriptor: LayoutDescriptor,
+            owned: Vec<u32>,
+            // global id -> x received via apply_halo.
+            received: HashMap<u32, f32>,
+        }
+        impl LayoutEngine for PosProbe {
+            fn descriptor(&self) -> &LayoutDescriptor {
+                &self.descriptor
+            }
+            fn init(
+                &mut self,
+                _ctx: &mut EngineCtx,
+                _g: &CsrShard,
+                _p: &[f32],
+            ) -> Result<(), String> {
+                Ok(())
+            }
+            fn step(&mut self, _ctx: &mut EngineCtx) -> StepOutput {
+                // x = global id, y = z = 0, in owned (ascending) order.
+                let mut pos = Vec::with_capacity(3 * self.owned.len());
+                for &g in &self.owned {
+                    pos.extend_from_slice(&[g as f32, 0.0, 0.0]);
+                }
+                StepOutput::positions_only(pos)
+            }
+            fn apply_halo(&mut self, h: &HaloUpdate) {
+                for (i, &gid) in h.node_ids.iter().enumerate() {
+                    self.received.insert(gid, h.positions[3 * i]);
+                }
+            }
+        }
+
+        let g = CsrGraph::path(6);
+        let parts = partition_csr(&g, 2);
+        let descriptor = LayoutDescriptor {
+            id: "posprobe",
+            kind: LayoutKind::Physics,
+            display_name: "posprobe",
+            description: "test",
+            requirements: LayoutRequirements::default(),
+        };
+
+        let mut workers: Vec<Worker<PosProbe>> = parts
+            .iter()
+            .map(|p| Worker {
+                partition: p.clone(),
+                engine: PosProbe {
+                    descriptor: descriptor.clone(),
+                    owned: p.owned_global_ids().to_vec(),
+                    received: HashMap::new(),
+                },
+            })
+            .collect();
+        let mut ctxs: Vec<EngineCtx> = (0..workers.len()).map(|_| EngineCtx::cpu_only()).collect();
+
+        run_superstep_local(&mut workers, &mut ctxs, 1);
+
+        // Each worker must have received x == global id for EXACTLY its ghost
+        // nodes (and nothing else): the boundary-only delta carried precisely
+        // the peer-owned boundary positions this worker's ghosts mirror.
+        for w in &workers {
+            let ghosts: std::collections::HashSet<u32> =
+                w.partition.ghost_global_ids().iter().copied().collect();
+            let got: std::collections::HashSet<u32> =
+                w.engine.received.keys().copied().collect();
+            assert_eq!(
+                got, ghosts,
+                "part {} received halo ids != its ghost set",
+                w.partition.partition_id
+            );
+            for (&gid, &x) in &w.engine.received {
+                assert_eq!(x, gid as f32, "ghost {gid} position not propagated");
+            }
+            // And there is at least one ghost, so this actually exercised a hop.
+            assert!(!ghosts.is_empty());
         }
     }
 }

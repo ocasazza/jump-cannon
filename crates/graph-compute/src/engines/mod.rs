@@ -238,6 +238,29 @@ pub trait LayoutEngine: Send + Sync {
         positions: &[f32],
     ) -> Result<(), String>;
 
+    /// Re-bind an *already-initialized* engine to a different graph + seed
+    /// positions, reusing the live instance instead of constructing a fresh one.
+    ///
+    /// This is the hook the multilevel wrapper uses to drive a SINGLE inner
+    /// engine across the cascade's levels (coarsest → finest): each level has a
+    /// different graph and a different node count, but logically it is the same
+    /// solver continuing the descent. Reconstructing a fresh engine per level
+    /// throws away any reusable state and (for GPU engines) forces a full buffer
+    /// rebuild every level.
+    ///
+    /// The default implementation simply forwards to [`init`], so existing
+    /// engines need no change and observe identical behavior to a fresh
+    /// construct-then-`init`. GPU engines may later override this to resize /
+    /// reuse their buffers in place rather than tearing them down (doc §4).
+    fn reinit(
+        &mut self,
+        ctx: &mut EngineCtx,
+        graph: &CsrShard,
+        positions: &[f32],
+    ) -> Result<(), String> {
+        self.init(ctx, graph, positions)
+    }
+
     /// Advance one tick and return the owned nodes' host-readable positions for
     /// broadcast (plus the boundary slice when sharded).
     fn step(&mut self, ctx: &mut EngineCtx) -> StepOutput;
@@ -256,6 +279,60 @@ pub trait LayoutEngine: Send + Sync {
 /// Constructor for a registered engine. Called once per worker to mint a fresh,
 /// uninitialized engine instance (before `set_params`/`init`).
 pub type EngineConstructor = fn() -> Box<dyn LayoutEngine>;
+
+/// The stable id of every NON-multilevel ("leaf") engine this worker ships, in
+/// registration order. This is the SINGLE source of truth for "which engines can
+/// be wrapped / registered as a leaf" — both [`EngineRegistry::builtin`] and the
+/// `multilevel` wrapper derive their tables from [`construct_leaf`], so there is
+/// no hand-maintained second copy to drift out of sync.
+pub const LEAF_ENGINE_IDS: &[LayoutId] = &[
+    Fa2BruteEngine::ID,
+    CpuSpringEngine::ID,
+    Fa2BhEngine::ID,
+    SgdStressEngine::ID,
+];
+
+/// Construct a fresh, uninitialized **leaf** (non-multilevel) engine by id.
+///
+/// This is the ONE place that maps a leaf engine id to its constructor.
+/// `EngineRegistry::builtin` builds its leaf entries from here, and the
+/// `multilevel` wrapper calls this to mint its inner solver — neither keeps its
+/// own copy of the table, so adding a new leaf engine here registers it
+/// everywhere at once.
+///
+/// `multilevel` itself is intentionally NOT constructible here: it is a wrapper,
+/// not a leaf, and excluding it both prevents recursive self-wrapping and avoids
+/// any registry↔multilevel construction cycle. Returns `None` for `"multilevel"`
+/// and for unknown ids.
+pub fn construct_leaf(id: &str) -> Option<Box<dyn LayoutEngine>> {
+    match id {
+        Fa2BruteEngine::ID => Some(Box::new(Fa2BruteEngine::new())),
+        CpuSpringEngine::ID => Some(Box::new(CpuSpringEngine::new())),
+        Fa2BhEngine::ID => Some(Box::new(Fa2BhEngine::new())),
+        SgdStressEngine::ID => Some(Box::new(SgdStressEngine::new())),
+        _ => None,
+    }
+}
+
+/// Map a leaf engine id to a non-capturing [`EngineConstructor`] fn pointer for
+/// the registry.
+///
+/// `EngineConstructor` is a bare `fn()` (no captures), so the registry can't
+/// store a closure over `id`. To keep [`construct_leaf`] the SOLE place that
+/// actually calls each engine's `::new`, each arm here just forwards to
+/// `construct_leaf` with its own id and unwraps (the id is statically known to
+/// be a leaf). No `::new` calls are duplicated; only the id↔fn pairing lives
+/// here, and it is exhaustively checked against [`LEAF_ENGINE_IDS`] in tests.
+/// Panics on an unknown id (callers pass ids from `LEAF_ENGINE_IDS`).
+fn leaf_ctor_for(id: &str) -> EngineConstructor {
+    match id {
+        Fa2BruteEngine::ID => || construct_leaf(Fa2BruteEngine::ID).unwrap(),
+        CpuSpringEngine::ID => || construct_leaf(CpuSpringEngine::ID).unwrap(),
+        Fa2BhEngine::ID => || construct_leaf(Fa2BhEngine::ID).unwrap(),
+        SgdStressEngine::ID => || construct_leaf(SgdStressEngine::ID).unwrap(),
+        _ => panic!("leaf_ctor_for: unknown leaf engine id {id:?}"),
+    }
+}
 
 /// The worker's engine registry: a `LayoutId -> constructor` map built once at
 /// startup. `Subscribe` selects an engine by `layout_id`; the sim loop calls
@@ -292,29 +369,44 @@ impl EngineRegistry {
         }
     }
 
-    /// The built-in registry: the ported brute-force FA2 (`"fa2-brute"`,
-    /// default) plus the CPU spring fallback (`"cpu-spring"`).
+    /// The built-in registry: every leaf engine (the ported brute-force FA2
+    /// `"fa2-brute"` default, the CPU spring fallback `"cpu-spring"`, BH FA2, and
+    /// SGD stress) plus the `multilevel` wrapper.
+    ///
+    /// The leaf entries are NOT spelled out here — they are derived from
+    /// [`LEAF_ENGINE_IDS`] / [`construct_leaf`] so the registry and the
+    /// `multilevel` wrapper share one constructor table and cannot drift apart.
+    /// Only the `multilevel` wrapper (which `construct_leaf` deliberately refuses
+    /// to build) is registered explicitly.
     pub fn builtin() -> Self {
-        Self::new(
-            &[
-                (Fa2BruteEngine::ID, || {
-                    Box::new(Fa2BruteEngine::new()) as Box<dyn LayoutEngine>
-                }),
-                (CpuSpringEngine::ID, || {
-                    Box::new(CpuSpringEngine::new()) as Box<dyn LayoutEngine>
-                }),
-                (Fa2BhEngine::ID, || {
-                    Box::new(Fa2BhEngine::new()) as Box<dyn LayoutEngine>
-                }),
-                (SgdStressEngine::ID, || {
-                    Box::new(SgdStressEngine::new()) as Box<dyn LayoutEngine>
-                }),
-                (MultilevelEngine::ID, || {
-                    Box::new(MultilevelEngine::new()) as Box<dyn LayoutEngine>
-                }),
-            ],
-            Fa2BruteEngine::ID,
-        )
+        let mut constructors: HashMap<LayoutId, EngineConstructor> = HashMap::new();
+        let mut descriptors = Vec::new();
+
+        // Leaf engines: single source of truth is `construct_leaf`. We probe each
+        // id once for its descriptor; the stored constructor re-routes through
+        // `construct_leaf` (every id here is guaranteed constructible).
+        for &id in LEAF_ENGINE_IDS {
+            let probe = construct_leaf(id)
+                .unwrap_or_else(|| panic!("LEAF_ENGINE_IDS lists unconstructible id {id:?}"));
+            descriptors.push(probe.descriptor().clone());
+            let ctor: EngineConstructor = leaf_ctor_for(id);
+            constructors.insert(id, ctor);
+        }
+
+        // The multilevel wrapper is not a leaf and not built by `construct_leaf`.
+        let ml = Box::new(MultilevelEngine::new()) as Box<dyn LayoutEngine>;
+        descriptors.push(ml.descriptor().clone());
+        constructors.insert(MultilevelEngine::ID, || {
+            Box::new(MultilevelEngine::new()) as Box<dyn LayoutEngine>
+        });
+
+        let default_id = Fa2BruteEngine::ID;
+        debug_assert!(constructors.contains_key(default_id));
+        Self {
+            constructors,
+            descriptors,
+            default_id,
+        }
     }
 
     pub fn default_id(&self) -> LayoutId {
@@ -346,5 +438,60 @@ impl EngineRegistry {
 impl Default for EngineRegistry {
     fn default() -> Self {
         Self::builtin()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `construct_leaf` is the single source of truth for leaf engines: every id
+    /// in `LEAF_ENGINE_IDS` must be constructible, and the constructed engine's
+    /// descriptor id must round-trip back to the same id.
+    #[test]
+    fn construct_leaf_covers_all_leaf_ids() {
+        for &id in LEAF_ENGINE_IDS {
+            let engine = construct_leaf(id)
+                .unwrap_or_else(|| panic!("construct_leaf returned None for listed id {id:?}"));
+            assert_eq!(
+                engine.descriptor().id,
+                id,
+                "leaf engine descriptor id must match its registry id"
+            );
+        }
+    }
+
+    /// `multilevel` is a wrapper, not a leaf: `construct_leaf` must refuse it
+    /// (this both prevents recursive self-wrapping and avoids a registry↔
+    /// multilevel construction cycle).
+    #[test]
+    fn construct_leaf_rejects_multilevel_and_unknown() {
+        assert!(construct_leaf(MultilevelEngine::ID).is_none());
+        assert!(construct_leaf("no-such-engine").is_none());
+    }
+
+    /// The builtin registry derives its leaf entries from the same source, so it
+    /// registers exactly the leaf ids plus the multilevel wrapper — no more, no
+    /// less. Guards against the registry table drifting from `construct_leaf`.
+    #[test]
+    fn builtin_registers_leaves_plus_multilevel() {
+        let reg = EngineRegistry::builtin();
+        for &id in LEAF_ENGINE_IDS {
+            assert!(reg.contains(id), "builtin registry missing leaf {id:?}");
+        }
+        assert!(reg.contains(MultilevelEngine::ID));
+        // Exactly the leaves + the wrapper.
+        assert_eq!(reg.descriptors().len(), LEAF_ENGINE_IDS.len() + 1);
+    }
+
+    /// `leaf_ctor_for` (the fn-pointer table behind the registry) must agree with
+    /// `construct_leaf` for every leaf id.
+    #[test]
+    fn leaf_ctor_for_matches_construct_leaf() {
+        for &id in LEAF_ENGINE_IDS {
+            let via_ctor = leaf_ctor_for(id)();
+            let via_construct = construct_leaf(id).unwrap();
+            assert_eq!(via_ctor.descriptor().id, via_construct.descriptor().id);
+        }
     }
 }

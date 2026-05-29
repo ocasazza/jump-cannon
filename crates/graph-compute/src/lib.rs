@@ -39,6 +39,7 @@ pub use engines::{
 };
 pub use partition::{
     partition_csr, run_superstep, run_superstep_local, HaloDelta, HaloTransport, LocalTransport,
-    Partition, Worker,
+    Partition, TonicHaloTransport, Worker,
 };
+pub use service::HaloProvider;
 pub use wgpu_sim::WgpuSim;

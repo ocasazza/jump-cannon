@@ -57,6 +57,12 @@ tonic-build = "0.12"
 
 [dev-dependencies]
 tokio = { workspace = true }
+tokio-stream = { version = "0.1", features = ["sync"] }
 tonic = "0.12"
 serde_json = "1.0"
 bytemuck = { version = "1", features = ["derive"] }
+# In-process gRPC transport for the ExchangeHalo round-trip test: a tokio
+# DuplexStream wrapped in hyper-util's TokioIo, connected via a tower
+# service_fn connector (the standard tonic in-memory pattern — no TCP socket).
+hyper-util = { version = "0.1", features = ["tokio"] }
+tower = "0.5"
