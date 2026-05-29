@@ -1,6 +1,8 @@
 syntax = "proto3";
 package graph_compute;
 
+import "google/protobuf/struct.proto";
+
 service Compute {
   rpc Subscribe(SubscribeRequest) returns (stream PositionDelta);
   rpc Health(HealthRequest) returns (HealthResponse);
@@ -13,13 +15,33 @@ service Compute {
   rpc TopoFisheye(stream FocusRequest) returns (stream HybridFrame);
 }
 
-message SubscribeRequest { string graph_id = 1; }
+message SubscribeRequest {
+  string graph_id = 1;
+  // ADR-002: registry key, e.g. "fa2-brute", "cpu-spring". Empty ⇒ the
+  // server's default engine (EngineRegistry::default_id()).
+  string layout_id = 2;
+  // ADR-002: dynamic engine settings carried as google.protobuf.Struct
+  // (protobuf's native JSON-shaped type). Empty/absent ⇒ engine defaults.
+  // Maps directly to/from serde_json::Value on the Rust side, so the one
+  // serde settings struct per engine stays the single source of truth.
+  google.protobuf.Struct params = 3;
+}
 
 message PositionDelta {
   uint64 frame = 1;
   // raw little-endian f32 [x0,y0,z0,x1,y1,z1,...]
   bytes positions = 2;
   uint32 n_nodes = 3;
+}
+
+// Boundary-position exchange payload for the distributed BSP model
+// (docs/compute-architecture.md §4). A labeled generalization of
+// PositionDelta: only the subset of boundary nodes a peer needs.
+message HaloDelta {
+  uint64 frame = 1;
+  uint32 owner_id = 2;           // partition id that owns these nodes
+  bytes  node_ids  = 3;          // raw little-endian u32 global ids
+  bytes  positions = 4;          // raw little-endian f32 [x0,y0,z0,...], parallel to node_ids
 }
 
 message HealthRequest {}

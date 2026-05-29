@@ -18,6 +18,11 @@ path = "src/lib.rs"
 [dependencies]
 tonic              = "0.12"
 prost              = "0.13"
+# Well-known types (google.protobuf.Struct/Value/ListValue) referenced by
+# SubscribeRequest.params. tonic-build/prost emit `::prost_types::Struct`
+# for these by default (compile_well_known_types is off), so the generated
+# code links against this crate rather than re-deriving the WKTs.
+prost-types        = "0.13"
 tokio              = { workspace = true }
 tokio-stream       = { version = "0.1", features = ["sync"] }
 tracing            = "0.1"
@@ -26,6 +31,8 @@ bytemuck           = { version = "1", features = ["derive"] }
 anyhow             = "1"
 async-stream       = "0.3"
 futures-core       = "0.3"
+serde              = { version = "1.0", features = ["derive"] }
+serde_json         = "1.0"
 
 # 2-D Delaunay triangulation. Used directly by `topo_fisheye::distort` for
 # the RNG-approximation density estimate. The §4 coarsening / hierarchy
@@ -51,3 +58,5 @@ tonic-build = "0.12"
 [dev-dependencies]
 tokio = { workspace = true }
 tonic = "0.12"
+serde_json = "1.0"
+bytemuck = { version = "1", features = ["derive"] }

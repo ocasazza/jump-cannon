@@ -1,21 +1,21 @@
 //! Simulation core.
 //!
-//! Holds the in-memory CSR graph + position/velocity buffers and advances them
-//! one tick at a time. Two backends:
+//! Holds the in-memory CSR graph + position buffers and advances them one tick
+//! at a time by driving the **selected layout engine** from the
+//! [`crate::engines`] registry (ADR-001). `SimState::init_engine` constructs the
+//! requested engine (default `"fa2-brute"`), tries wgpu bring-up once via
+//! [`EngineCtx`], and falls back to the `"cpu-spring"` engine when no adapter is
+//! available. The hardcoded `WgpuSim`/`cpu_step` dichotomy is gone — both are
+//! now engines behind one trait.
 //!
-//!   - `WgpuSim` (preferred): server-side wgpu compute pipeline running the
-//!     ForceAtlas2 shader from `crates/graph-layouts`. Brought up lazily via
-//!     `try_init_wgpu`; failure (no adapter, no Vulkan ICD, etc.) leaves the
-//!     slot empty and the loop falls back to `cpu_step`.
-//!
-//!   - `cpu_step` (fallback): tiny serial spring-only integrator — runs
-//!     anywhere, used by tests and on hosts without a GPU.
+//! `cpu_step` itself remains here as the reference integrator the
+//! `CpuSpringEngine` wraps (and that tests call directly).
 
 use std::sync::Arc;
 use tokio::sync::{broadcast, Mutex, RwLock};
 
+use crate::engines::{CsrShard, EngineCtx, EngineRegistry, LayoutEngine};
 use crate::proto::PositionDelta;
-use crate::wgpu_sim::WgpuSim;
 
 /// Compressed-sparse-row graph. Edge `i` connects `src=node` (where
 /// `offsets[node] <= i < offsets[node+1]`) to `neighbors[i]`.
@@ -170,21 +170,33 @@ mod tests {
     }
 }
 
+/// The live, initialized layout engine plus the execution context it runs on.
+/// Owned by the sim loop (via `SimState`) and taken out of the `Mutex` for the
+/// duration of each blocking `step`.
+pub struct ActiveEngine {
+    pub engine: Box<dyn LayoutEngine>,
+    pub ctx: EngineCtx,
+}
+
 /// State shared between the simulation tick task and the gRPC service.
 pub struct SimState {
     pub graph: CsrGraph,
-    /// Interleaved x,y,z f32 positions, length `3 * n_nodes`. Host copy —
-    /// the CUDA backend mirrors this on the device and copies back each tick.
+    /// Interleaved x,y,z f32 positions, length `3 * n_nodes`. Host copy that
+    /// the active engine seeds from at `init` and that each tick overwrites
+    /// with the engine's `StepOutput`.
     pub positions: RwLock<Vec<f32>>,
     pub frame: RwLock<u64>,
     /// Broadcast channel of per-tick `PositionDelta` snapshots. The gRPC
     /// `Subscribe` handler subscribes to this; the simulation tick task is
     /// the sole producer. Lagging subscribers drop frames (log + continue).
     pub tx: broadcast::Sender<PositionDelta>,
-    /// Lazily-initialized wgpu integrator. `None` until `try_init_wgpu` succeeds;
-    /// if it fails (no adapter / no Vulkan ICD on the host) the run loop falls
-    /// back to `cpu_step` and this stays `None` for the lifetime of the process.
-    pub wgpu_sim: Mutex<Option<WgpuSim>>,
+    /// The engine registry — built once at startup. `Subscribe` selects an
+    /// engine by `layout_id`; today the worker initializes one engine for the
+    /// whole process (Phase 1).
+    pub registry: EngineRegistry,
+    /// The active, initialized engine + its context. `None` until
+    /// `init_engine` runs. Taken out of the `Mutex` across each blocking step.
+    pub active: Mutex<Option<ActiveEngine>>,
 }
 
 impl SimState {
@@ -207,39 +219,76 @@ impl SimState {
             positions: RwLock::new(positions),
             frame: RwLock::new(0),
             tx,
-            wgpu_sim: Mutex::new(None),
+            registry: EngineRegistry::builtin(),
+            active: Mutex::new(None),
         })
     }
 
-    /// Attempt to bring up the wgpu integrator. Returns `true` on success.
-    /// On failure the slot stays `None`, the caller logs the cause, and the
-    /// sim loop transparently falls back to `cpu_step`.
-    pub async fn try_init_wgpu(self: &Arc<Self>) -> bool {
+    /// Construct, parameterize, and initialize the engine selected by
+    /// `layout_id` (empty ⇒ registry default), then install it as the active
+    /// engine. Tries wgpu bring-up once; if the requested engine fails `init`
+    /// for lack of a GPU, transparently falls back to the `"cpu-spring"`
+    /// engine. Returns the `LayoutId` actually running.
+    ///
+    /// All wgpu device construction + engine `init` run on the blocking pool so
+    /// the async runtime isn't stalled.
+    pub async fn init_engine(
+        self: &Arc<Self>,
+        layout_id: &str,
+        params: serde_json::Value,
+    ) -> Result<&'static str, String> {
         let positions = self.positions.read().await.clone();
         let graph = self.graph.clone();
-        // The wgpu device construction blocks on adapter request; do it on the
-        // blocking pool so we don't stall the runtime.
-        let init = tokio::task::spawn_blocking(move || WgpuSim::new(&graph, &positions))
-            .await
-            .expect("wgpu init task panicked");
-        match init {
-            Ok(sim) => {
-                tracing::info!(
-                    backend = ?sim.adapter_info.backend,
-                    name = %sim.adapter_info.name,
-                    device_type = ?sim.adapter_info.device_type,
-                    "wgpu adapter initialized; using GPU FA2 integrator"
-                );
-                let mut slot = self.wgpu_sim.lock().await;
-                *slot = Some(sim);
-                true
+        // Construct the engine on the async thread (cheap), then move it +
+        // context to the blocking pool for init.
+        let mut engine = self
+            .registry
+            .construct(layout_id)
+            .ok_or_else(|| format!("unknown layout_id {layout_id:?}"))?;
+        engine.set_params(&params)?;
+        let chosen_id = engine.descriptor().id;
+        let fallback_id = crate::engines::CpuSpringEngine::ID;
+        let registry_has_fallback = self.registry.contains(fallback_id);
+
+        let result = tokio::task::spawn_blocking(move || {
+            let mut ctx = EngineCtx::try_new_gpu();
+            let shard = CsrShard::whole(&graph);
+            match engine.init(&mut ctx, &shard, &positions) {
+                Ok(()) => Ok(ActiveEngine { engine, ctx }),
+                Err(e) => Err((e, ctx, graph, positions)),
             }
-            Err(e) => {
-                tracing::warn!(
-                    error = %e,
-                    "wgpu adapter not found, falling back to cpu_step"
-                );
-                false
+        })
+        .await
+        .map_err(|e| format!("engine init task panicked: {e}"))?;
+
+        match result {
+            Ok(active) => {
+                *self.active.lock().await = Some(active);
+                Ok(chosen_id)
+            }
+            Err((init_err, mut ctx, graph, positions)) => {
+                if chosen_id != fallback_id && registry_has_fallback {
+                    tracing::warn!(
+                        engine = chosen_id,
+                        error = %init_err,
+                        "engine init failed; falling back to {fallback_id}"
+                    );
+                    let mut fallback = self
+                        .registry
+                        .construct(fallback_id)
+                        .expect("fallback engine registered");
+                    let shard = CsrShard::whole(&graph);
+                    fallback
+                        .init(&mut ctx, &shard, &positions)
+                        .map_err(|e| format!("fallback engine init failed: {e}"))?;
+                    *self.active.lock().await = Some(ActiveEngine {
+                        engine: fallback,
+                        ctx,
+                    });
+                    Ok(fallback_id)
+                } else {
+                    Err(format!("engine {chosen_id} init failed: {init_err}"))
+                }
             }
         }
     }

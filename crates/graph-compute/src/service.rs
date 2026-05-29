@@ -28,7 +28,7 @@ use crate::proto::{
     CoarsenSettings, FocusRequest, HealthRequest, HealthResponse, HybridFrame, PositionDelta,
     SubscribeRequest,
 };
-use crate::sim::{cpu_step, CsrGraph, SimState};
+use crate::sim::{CsrGraph, SimState};
 use crate::topo_fisheye::{
     build_hierarchy, build_hybrid, distort_radial, CoarsenParams, DistortParams, HybridParams,
     MatchWeights, TopoHierarchy,
@@ -64,8 +64,41 @@ impl Compute for ComputeService {
 
     async fn subscribe(
         &self,
-        _req: Request<SubscribeRequest>,
+        req: Request<SubscribeRequest>,
     ) -> Result<Response<Self::SubscribeStream>, Status> {
+        let req = req.into_inner();
+
+        // ADR-002: a Subscribe may select + tune the layout engine. An empty
+        // `layout_id` with no `params` means "leave whatever the worker is
+        // already running" (the Phase-1 startup default). Otherwise we (re)init
+        // the active engine from the registry. Single-worker model: there is
+        // one active engine per process, so a select swaps it for everyone.
+        let want_select = !req.layout_id.is_empty() || req.params.is_some();
+        if want_select {
+            if !req.layout_id.is_empty() && !self.state.registry.contains(&req.layout_id) {
+                return Err(Status::invalid_argument(format!(
+                    "unknown layout_id {:?}",
+                    req.layout_id
+                )));
+            }
+            // google.protobuf.Struct -> serde_json::Value (Null when absent ⇒
+            // the engine uses its built-in defaults).
+            let params = req
+                .params
+                .map(struct_to_json)
+                .unwrap_or(serde_json::Value::Null);
+            let running = self
+                .state
+                .init_engine(&req.layout_id, params)
+                .await
+                .map_err(|e| Status::internal(format!("engine init failed: {e}")))?;
+            tracing::info!(
+                requested = %req.layout_id,
+                running,
+                "Subscribe selected layout engine"
+            );
+        }
+
         // Subscribe BEFORE returning so we don't miss the next tick.
         let mut rx = self.state.tx.subscribe();
         let stream = async_stream::try_stream! {
@@ -250,11 +283,84 @@ fn csr_to_edge_pairs(g: &CsrGraph) -> Vec<u32> {
     out
 }
 
-/// Drive the simulation forward. Prefers the wgpu FA2 integrator when
-/// `SimState::wgpu_sim` is `Some`; otherwise falls back to the CPU
-/// reference integrator so CI hosts without a GPU still produce frames.
-pub async fn run_sim_loop(state: Arc<SimState>, tick_hz: f32) {
-    let dt = 1.0 / tick_hz.max(1.0);
+/// Convert a `google.protobuf.Struct` (top-level engine params object) into a
+/// `serde_json::Value` so it can be fed to `LayoutEngine::set_params`. This is
+/// the receiving half of the ADR-002 `serde_json::Value ↔ prost_types::Struct`
+/// mapping; the sending half (`json_to_struct`) lives alongside it for the
+/// broker/renderer client path. The two are exact inverses for the JSON value
+/// domain (object/array/number/string/bool/null).
+pub fn struct_to_json(s: prost_types::Struct) -> serde_json::Value {
+    serde_json::Value::Object(
+        s.fields
+            .into_iter()
+            .map(|(k, v)| (k, prost_value_to_json(v)))
+            .collect(),
+    )
+}
+
+/// Inverse of [`struct_to_json`]. A non-object JSON value can't be a protobuf
+/// `Struct` (whose top level is always a map), so anything that isn't a JSON
+/// object — including `Null` — maps to an empty `Struct`. Callers that want
+/// "no params" should send `None` for the field rather than an empty struct,
+/// but an empty struct is treated identically (engine defaults) on receipt.
+pub fn json_to_struct(v: serde_json::Value) -> prost_types::Struct {
+    match v {
+        serde_json::Value::Object(map) => prost_types::Struct {
+            fields: map
+                .into_iter()
+                .map(|(k, v)| (k, json_to_prost_value(v)))
+                .collect(),
+        },
+        _ => prost_types::Struct::default(),
+    }
+}
+
+fn prost_value_to_json(v: prost_types::Value) -> serde_json::Value {
+    use prost_types::value::Kind;
+    match v.kind {
+        None | Some(Kind::NullValue(_)) => serde_json::Value::Null,
+        Some(Kind::NumberValue(n)) => serde_json::Number::from_f64(n)
+            .map(serde_json::Value::Number)
+            .unwrap_or(serde_json::Value::Null),
+        Some(Kind::StringValue(s)) => serde_json::Value::String(s),
+        Some(Kind::BoolValue(b)) => serde_json::Value::Bool(b),
+        Some(Kind::StructValue(s)) => struct_to_json(s),
+        Some(Kind::ListValue(l)) => serde_json::Value::Array(
+            l.values.into_iter().map(prost_value_to_json).collect(),
+        ),
+    }
+}
+
+fn json_to_prost_value(v: serde_json::Value) -> prost_types::Value {
+    use prost_types::value::Kind;
+    let kind = match v {
+        serde_json::Value::Null => Kind::NullValue(0),
+        serde_json::Value::Bool(b) => Kind::BoolValue(b),
+        // serde_json numbers (incl. integers) collapse to f64 — the only
+        // numeric type protobuf's Value carries. Lossless for the f32/u32
+        // engine settings we transport (well within f64's exact-int range).
+        serde_json::Value::Number(n) => Kind::NumberValue(n.as_f64().unwrap_or(0.0)),
+        serde_json::Value::String(s) => Kind::StringValue(s),
+        serde_json::Value::Array(a) => Kind::ListValue(prost_types::ListValue {
+            values: a.into_iter().map(json_to_prost_value).collect(),
+        }),
+        serde_json::Value::Object(m) => Kind::StructValue(prost_types::Struct {
+            fields: m
+                .into_iter()
+                .map(|(k, v)| (k, json_to_prost_value(v)))
+                .collect(),
+        }),
+    };
+    prost_types::Value { kind: Some(kind) }
+}
+
+/// Drive the simulation forward by stepping the active layout engine from the
+/// registry (ADR-001). The engine — wgpu FA2 (`"fa2-brute"`) or the CPU spring
+/// fallback (`"cpu-spring"`) — is chosen by `SimState::init_engine`; this loop
+/// is engine-agnostic. If no engine has been initialized yet (or it self-halts)
+/// the loop ticks idle without producing frames.
+pub async fn run_sim_loop(state: Arc<SimState>, _tick_hz: f32) {
+    let dt = 1.0 / _tick_hz.max(1.0);
     let period = Duration::from_secs_f32(dt);
     let mut interval = tokio::time::interval(period);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -262,27 +368,30 @@ pub async fn run_sim_loop(state: Arc<SimState>, tick_hz: f32) {
     loop {
         interval.tick().await;
 
-        // Prefer the wgpu integrator. We take the WgpuSim out of the Mutex
-        // for the duration of the blocking dispatch + readback (so the lock
-        // doesn't sit across the join) and put it back afterwards. There's
-        // exactly one tick task, so contention here is impossible.
-        let taken_sim = state.wgpu_sim.lock().await.take();
-        let new_positions = if let Some(mut sim) = taken_sim {
-            let (positions, sim) = tokio::task::spawn_blocking(move || {
-                let positions = sim.step();
-                (positions, sim)
-            })
-            .await
-            .expect("wgpu sim step panicked");
-            *state.wgpu_sim.lock().await = Some(sim);
-            positions
-        } else {
-            let snapshot = state.positions.read().await.clone();
-            let graph = state.graph.clone();
-            tokio::task::spawn_blocking(move || cpu_step(&graph, &snapshot, dt))
-                .await
-                .expect("cpu sim step panicked")
+        // Take the active engine out of the Mutex for the duration of the
+        // blocking step (so the lock doesn't sit across the join) and put it
+        // back afterwards. There's exactly one tick task, so taking it here is
+        // contention-free. If no engine is installed yet, skip this tick.
+        let taken = state.active.lock().await.take();
+        let mut active = match taken {
+            Some(a) => a,
+            None => continue,
         };
+        if active.engine.is_halted() {
+            // Engine converged: reinstall and idle (still answer Subscribe with
+            // the last broadcast frame).
+            *state.active.lock().await = Some(active);
+            continue;
+        }
+
+        let (output, active) = tokio::task::spawn_blocking(move || {
+            let out = active.engine.step(&mut active.ctx);
+            (out, active)
+        })
+        .await
+        .expect("engine step panicked");
+        *state.active.lock().await = Some(active);
+        let new_positions = output.positions;
 
         // Commit + broadcast.
         {

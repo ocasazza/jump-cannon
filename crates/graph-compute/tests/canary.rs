@@ -80,7 +80,7 @@ async fn canary_subscribe_streams_frames() {
 
     let mut client = connect(&url).await;
     let mut s = client
-        .subscribe(SubscribeRequest { graph_id: String::new() })
+        .subscribe(SubscribeRequest { graph_id: String::new(), ..Default::default() })
         .await
         .expect("subscribe")
         .into_inner();
@@ -136,7 +136,7 @@ async fn canary_positions_are_changing() {
 
     let mut client = connect(&url).await;
     let mut s = client
-        .subscribe(SubscribeRequest { graph_id: String::new() })
+        .subscribe(SubscribeRequest { graph_id: String::new(), ..Default::default() })
         .await
         .expect("subscribe")
         .into_inner();

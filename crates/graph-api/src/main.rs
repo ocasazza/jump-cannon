@@ -3,7 +3,7 @@ use std::sync::Arc;
 use clap::Parser;
 
 use graph_api::{
-    compute_broker::ComputeBroker,
+    compute_broker::{ComputeBroker, RemoteLayout},
     progress::ProgressLog,
     router,
     vault_loader,
@@ -90,8 +90,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let compute_broker = ComputeBroker::new();
     if let Some(compute_url) = args.compute_url.clone() {
         let broker = compute_broker.clone();
+        // ADR-002: pick + tune the remote layout engine from env. Empty/unset
+        // ⇒ the worker's startup default (backward compatible).
+        let remote_layout = RemoteLayout::from_env();
         tokio::spawn(async move {
-            match broker.connect(compute_url.clone()).await {
+            match broker
+                .connect_with(compute_url.clone(), remote_layout)
+                .await
+            {
                 Ok(()) => tracing::info!(url = %compute_url, "connected to graph-compute worker"),
                 Err(e) => tracing::warn!(
                     url = %compute_url,

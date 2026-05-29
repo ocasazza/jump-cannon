@@ -1,28 +1,31 @@
-//! Server-side wgpu ForceAtlas2 integrator.
+//! Brute-force ForceAtlas2 layout engine (`"fa2-brute"`).
 //!
-//! Brute-force O(n²) repulsion + linear-scan attraction shader, ported byte-for-byte
-//! from `crates/graph-layouts/src/layout/algorithms/force_atlas2.rs` on
-//! `worktree-agent-a52adc39`. Owns its own buffers; one dispatch per `step`.
+//! The first engine in the registry (ADR-001). This is the EXISTING
+//! `wgpu_sim::WgpuSim` lifted, behavior-for-behavior, behind the
+//! [`LayoutEngine`] trait: O(n²) repulsion + linear-scan attraction + gravity +
+//! Euler, one dispatch per `step`, host-readback each tick. The shader is
+//! unchanged (`shaders/force_atlas2.wgsl`, ported byte-for-byte from
+//! `crates/graph-layouts/src/layout/algorithms/force_atlas2.rs`).
 //!
-//! NOTE: the O(n²) repulsion caps useful graph size at ~10–50k nodes. The
-//! Barnes-Hut octree that fixes it already exists in
-//! `crates/graph-layouts/src/layout/algorithms/shaders/octree.wgsl`. The plan to
-//! lift this single hardcoded sim into a registry of selectable layout engines
-//! (Barnes-Hut FA2, SGD-stress, maxent, a multilevel wrapper, …) lives in
-//! `docs/compute-architecture.md`; the algorithm survey behind those choices is
-//! in `docs/layout-algorithms.md`.
+//! The O(n²) repulsion caps useful graph size at ~10–50k nodes; the Barnes-Hut
+//! octree that fixes it (`graph-layouts/.../shaders/octree.wgsl`) lands as a
+//! separate engine in a later phase (`docs/compute-architecture.md` §2, Phase 2).
 //!
-//! `step` blocks (via `pollster`) on a positions readback because the gRPC
-//! sim loop drives this from `tokio::task::spawn_blocking` and needs the
-//! host-side `Vec<f32>` to broadcast.
+//! Unlike the old `WgpuSim` — which requested its own adapter+device — this
+//! engine takes the shared device/queue from [`EngineCtx::gpu`] at `init`, so a
+//! worker brings up wgpu exactly once for all GPU engines.
 
 use std::borrow::Cow;
 
-use anyhow::{anyhow, Context, Result};
 use bytemuck::{Pod, Zeroable};
+use graph_layouts::{LayoutDescriptor, LayoutKind, LayoutRequirements};
+use serde::{Deserialize, Serialize};
 use wgpu::util::DeviceExt;
 
-use crate::sim::CsrGraph;
+use super::{CsrShard, EngineCtx, LayoutEngine, StepOutput};
+
+/// Stable registry key for this engine.
+pub const LAYOUT_ID: &str = "fa2-brute";
 
 const WORKGROUP_SIZE: u32 = 64;
 
@@ -43,10 +46,13 @@ struct Fa2ParamsRaw {
     _pad1: u32,
 }
 
-/// FA2 tunables baked into the params uniform. Defaults mirror
-/// `ForceAtlas2Settings::default` from graph-layouts.
-#[derive(Clone, Debug)]
-pub struct WgpuSimSettings {
+/// FA2 tunables. Serde-roundtrippable so they ride on the wire as
+/// `google.protobuf.Struct` (ADR-002). Defaults mirror
+/// `ForceAtlas2Settings::default` from graph-layouts (and the old
+/// `WgpuSimSettings::default`), so behavior is identical to the pre-refactor sim.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Fa2Settings {
     pub gravity: f32,
     pub strong_gravity: bool,
     pub scaling_ratio: f32,
@@ -57,7 +63,7 @@ pub struct WgpuSimSettings {
     pub time_step: f32,
 }
 
-impl Default for WgpuSimSettings {
+impl Default for Fa2Settings {
     fn default() -> Self {
         Self {
             gravity: 1.0,
@@ -72,83 +78,111 @@ impl Default for WgpuSimSettings {
     }
 }
 
-pub struct WgpuSim {
-    device: wgpu::Device,
-    queue: wgpu::Queue,
+/// GPU state, built once at `init`. Mirrors the old `WgpuSim`'s buffer set.
+struct Gpu {
+    device: std::sync::Arc<wgpu::Device>,
+    queue: std::sync::Arc<wgpu::Queue>,
     pipeline: wgpu::ComputePipeline,
     bind_group: wgpu::BindGroup,
-
     positions_buf: wgpu::Buffer,
     _velocities_buf: wgpu::Buffer,
     _edges_buf: wgpu::Buffer,
     _edge_weights_buf: wgpu::Buffer,
     _degrees_buf: wgpu::Buffer,
     params_buf: wgpu::Buffer,
-    /// MAP_READ staging buffer for positions readback. Sized to `n_nodes * 16` (vec4<f32>).
     readback_buf: wgpu::Buffer,
-
     n_nodes: u32,
     cached_n_edges: u32,
-    settings: WgpuSimSettings,
     /// `n_nodes * 16` — bytes of the positions storage buffer (vec4 per node).
     positions_byte_len: u64,
-    /// Reusable adapter info for diagnostics.
-    pub adapter_info: wgpu::AdapterInfo,
 }
 
-impl WgpuSim {
-    /// Try to bring up a wgpu device and upload the graph + positions. Returns
-    /// `Err` if no adapter is available (CI fall-through to `cpu_step`).
-    pub fn new(graph: &CsrGraph, initial_positions: &[f32]) -> Result<Self> {
-        Self::new_with_settings(graph, initial_positions, WgpuSimSettings::default())
+/// Brute-force FA2 engine. Uninitialized until [`LayoutEngine::init`].
+pub struct Fa2BruteEngine {
+    descriptor: LayoutDescriptor,
+    settings: Fa2Settings,
+    gpu: Option<Gpu>,
+}
+
+impl Fa2BruteEngine {
+    pub const ID: &'static str = LAYOUT_ID;
+
+    pub fn new() -> Self {
+        Self {
+            descriptor: Self::descriptor_static(),
+            settings: Fa2Settings::default(),
+            gpu: None,
+        }
     }
 
-    pub fn new_with_settings(
-        graph: &CsrGraph,
-        initial_positions: &[f32],
-        settings: WgpuSimSettings,
-    ) -> Result<Self> {
+    fn descriptor_static() -> LayoutDescriptor {
+        LayoutDescriptor {
+            id: LAYOUT_ID,
+            kind: LayoutKind::Physics,
+            display_name: "ForceAtlas2 (brute force)",
+            description: "O(n²) repulsion + linear-scan attraction ForceAtlas2 on wgpu. \
+                          Caps out around 10-50k nodes; Barnes-Hut is the scalable variant.",
+            requirements: LayoutRequirements {
+                needs_edges: true,
+                needs_cpu_positions: true,
+                needs_gpu_positions_buffer: false,
+            },
+        }
+    }
+}
+
+impl Default for Fa2BruteEngine {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl LayoutEngine for Fa2BruteEngine {
+    fn descriptor(&self) -> &LayoutDescriptor {
+        &self.descriptor
+    }
+
+    fn set_params(&mut self, params: &serde_json::Value) -> Result<(), String> {
+        if params.is_null() {
+            return Ok(());
+        }
+        let typed: Fa2Settings = serde_json::from_value(params.clone())
+            .map_err(|e| format!("decode fa2-brute settings: {e}"))?;
+        self.settings = typed;
+        Ok(())
+    }
+
+    fn init(
+        &mut self,
+        ctx: &mut EngineCtx,
+        graph: &CsrShard,
+        positions: &[f32],
+    ) -> Result<(), String> {
+        let gpu_ctx = ctx
+            .gpu
+            .as_ref()
+            .ok_or_else(|| "fa2-brute requires a wgpu device but none is available".to_string())?;
+        let device = gpu_ctx.device.clone();
+        let queue = gpu_ctx.queue.clone();
+
+        let graph = graph.graph;
         let n_nodes = graph.n_nodes;
         let n = n_nodes as usize;
-        if initial_positions.len() != 3 * n {
-            return Err(anyhow!(
-                "initial_positions length {} != 3 * n_nodes {}",
-                initial_positions.len(),
+        if positions.len() != 3 * n {
+            return Err(format!(
+                "initial positions length {} != 3 * n_nodes {}",
+                positions.len(),
                 3 * n
             ));
         }
-
-        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
-            backends: wgpu::Backends::PRIMARY,
-            ..Default::default()
-        });
-        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-            power_preference: wgpu::PowerPreference::HighPerformance,
-            force_fallback_adapter: false,
-            compatible_surface: None,
-        }))
-        .ok_or_else(|| anyhow!("no wgpu adapter available"))?;
-
-        let adapter_info = adapter.get_info();
-
-        let (device, queue) = pollster::block_on(adapter.request_device(
-            &wgpu::DeviceDescriptor {
-                label: Some("graph-compute-device"),
-                required_features: wgpu::Features::empty(),
-                required_limits: wgpu::Limits::default(),
-                memory_hints: wgpu::MemoryHints::default(),
-            },
-            None,
-        ))
-        .context("failed to request wgpu device")?;
 
         // ---- Build CPU-side buffers --------------------------------------
         // Positions as vec4<f32> (xyz + 0 pad) — the shader reads `positions[i].xyz`.
         let mut positions_vec4: Vec<f32> = Vec::with_capacity(n * 4);
         for i in 0..n {
-            positions_vec4.push(initial_positions[3 * i]);
-            positions_vec4.push(initial_positions[3 * i + 1]);
-            positions_vec4.push(initial_positions[3 * i + 2]);
+            positions_vec4.push(positions[3 * i]);
+            positions_vec4.push(positions[3 * i + 1]);
+            positions_vec4.push(positions[3 * i + 2]);
             positions_vec4.push(0.0);
         }
         if positions_vec4.is_empty() {
@@ -216,7 +250,7 @@ impl WgpuSim {
             usage: wgpu::BufferUsages::STORAGE,
         });
 
-        let params_init = build_params_raw(n_nodes, n_edges, &settings);
+        let params_init = build_params_raw(n_nodes, n_edges, &self.settings);
         let params_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("fa2_params"),
             contents: bytemuck::bytes_of(&params_init),
@@ -234,7 +268,7 @@ impl WgpuSim {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("fa2_shader"),
             source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(include_str!(
-                "shaders/force_atlas2.wgsl"
+                "../shaders/force_atlas2.wgsl"
             ))),
         });
 
@@ -322,16 +356,34 @@ impl WgpuSim {
             label: Some("fa2_bind_group"),
             layout: &bgl,
             entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: positions_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 1, resource: velocities_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 2, resource: edges_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 3, resource: edge_weights_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 4, resource: params_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 5, resource: degrees_buf.as_entire_binding() },
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: positions_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: velocities_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: edges_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: edge_weights_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: params_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: degrees_buf.as_entire_binding(),
+                },
             ],
         });
 
-        Ok(Self {
+        self.gpu = Some(Gpu {
             device,
             queue,
             pipeline,
@@ -345,22 +397,25 @@ impl WgpuSim {
             readback_buf,
             n_nodes,
             cached_n_edges: n_edges,
-            settings,
             positions_byte_len,
-            adapter_info,
-        })
+        });
+        Ok(())
     }
 
-    /// Encode one fa2_step dispatch, copy positions into the MAP_READ staging
-    /// buffer, submit, and block until the host can read them back.
-    pub fn step(&mut self) -> Vec<f32> {
-        // Refresh params uniform — settings can change between calls; n_edges is
-        // fixed for the lifetime of the WgpuSim and lives in `cached_n_edges`.
-        let params = build_params_raw(self.n_nodes, self.cached_n_edges, &self.settings);
-        self.queue
-            .write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&params));
+    fn step(&mut self, _ctx: &mut EngineCtx) -> StepOutput {
+        let settings = self.settings.clone();
+        let gpu = self
+            .gpu
+            .as_mut()
+            .expect("fa2-brute step called before successful init");
 
-        let mut encoder = self
+        // Refresh params uniform — settings can change between calls; n_edges is
+        // fixed for the lifetime of the engine and lives in `cached_n_edges`.
+        let params = build_params_raw(gpu.n_nodes, gpu.cached_n_edges, &settings);
+        gpu.queue
+            .write_buffer(&gpu.params_buf, 0, bytemuck::bytes_of(&params));
+
+        let mut encoder = gpu
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("fa2_encoder"),
@@ -371,30 +426,30 @@ impl WgpuSim {
                 label: Some("fa2_pass"),
                 timestamp_writes: None,
             });
-            pass.set_pipeline(&self.pipeline);
-            pass.set_bind_group(0, &self.bind_group, &[]);
-            let workgroups = (self.n_nodes + WORKGROUP_SIZE - 1) / WORKGROUP_SIZE;
+            pass.set_pipeline(&gpu.pipeline);
+            pass.set_bind_group(0, &gpu.bind_group, &[]);
+            let workgroups = (gpu.n_nodes + WORKGROUP_SIZE - 1) / WORKGROUP_SIZE;
             pass.dispatch_workgroups(workgroups.max(1), 1, 1);
         }
 
         encoder.copy_buffer_to_buffer(
-            &self.positions_buf,
+            &gpu.positions_buf,
             0,
-            &self.readback_buf,
+            &gpu.readback_buf,
             0,
-            self.positions_byte_len,
+            gpu.positions_byte_len,
         );
 
-        self.queue.submit(std::iter::once(encoder.finish()));
+        gpu.queue.submit(std::iter::once(encoder.finish()));
 
         // Map + read back.
-        let slice = self.readback_buf.slice(..);
+        let slice = gpu.readback_buf.slice(..);
         let (tx, rx) = std::sync::mpsc::channel();
         slice.map_async(wgpu::MapMode::Read, move |res| {
             let _ = tx.send(res);
         });
         // Drive the device until the map callback fires.
-        self.device.poll(wgpu::Maintain::Wait);
+        gpu.device.poll(wgpu::Maintain::Wait);
         rx.recv()
             .expect("map_async channel closed")
             .expect("buffer map failed");
@@ -402,7 +457,7 @@ impl WgpuSim {
         let data = slice.get_mapped_range();
         let vec4_floats: &[f32] = bytemuck::cast_slice(&data);
         // Strip the pad lane: take xyz of each vec4.
-        let n = self.n_nodes as usize;
+        let n = gpu.n_nodes as usize;
         let mut out = Vec::with_capacity(3 * n);
         for i in 0..n {
             out.push(vec4_floats[4 * i]);
@@ -410,14 +465,14 @@ impl WgpuSim {
             out.push(vec4_floats[4 * i + 2]);
         }
         drop(data);
-        self.readback_buf.unmap();
-        out
+        gpu.readback_buf.unmap();
+        StepOutput::positions_only(out)
     }
 }
 
-/// Build a params uniform payload. `n_edges` is fixed at `WgpuSim::new` time
-/// and cached in `WgpuSim::cached_n_edges`; settings can mutate per-step.
-fn build_params_raw(n_nodes: u32, n_edges: u32, s: &WgpuSimSettings) -> Fa2ParamsRaw {
+/// Build a params uniform payload. `n_edges` is fixed at `init` time and cached;
+/// settings can mutate per-step via `set_params`.
+fn build_params_raw(n_nodes: u32, n_edges: u32, s: &Fa2Settings) -> Fa2ParamsRaw {
     Fa2ParamsRaw {
         n_nodes,
         n_edges,

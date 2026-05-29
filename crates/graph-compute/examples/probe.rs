@@ -17,7 +17,14 @@ async fn main() -> anyhow::Result<()> {
     let h = client.health(HealthRequest{}).await?.into_inner();
     println!("HEALTH: frame={} n_nodes={}", h.frame, h.n_nodes);
 
-    let mut s = client.subscribe(SubscribeRequest{ graph_id: String::new() }).await?.into_inner();
+    let mut s = client
+        .subscribe(SubscribeRequest {
+            graph_id: String::new(),
+            layout_id: String::new(),
+            params: None,
+        })
+        .await?
+        .into_inner();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
     let mut count = 0;
     while count < 3 {

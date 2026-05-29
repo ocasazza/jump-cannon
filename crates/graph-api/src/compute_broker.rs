@@ -18,10 +18,47 @@ use tonic::transport::Channel;
 
 use graph_compute::proto::compute_client::ComputeClient;
 use graph_compute::proto::{PositionDelta, SubscribeRequest};
+use graph_compute::service::json_to_struct;
 
 #[derive(Clone)]
 pub struct ComputeBroker {
     inner: Arc<Inner>,
+}
+
+/// Remote layout-engine selection forwarded to graph-compute on the
+/// `Subscribe` request (ADR-002). `layout_id` is a registry key (empty ⇒ the
+/// worker's startup default); `params` is the JSON-shaped engine settings
+/// object (`None` ⇒ engine defaults), serialized on the wire as
+/// `google.protobuf.Struct`.
+#[derive(Clone, Debug, Default)]
+pub struct RemoteLayout {
+    pub layout_id: String,
+    pub params: Option<serde_json::Value>,
+}
+
+impl RemoteLayout {
+    /// Build a selection from the env vars `main.rs` reads. Returns the
+    /// default (empty) selection when unset, so existing single-engine
+    /// deployments are unaffected.
+    ///
+    /// - `JUMP_CANNON_COMPUTE_LAYOUT_ID` — registry key.
+    /// - `JUMP_CANNON_COMPUTE_LAYOUT_PARAMS` — a JSON object string.
+    pub fn from_env() -> Self {
+        let layout_id = std::env::var("JUMP_CANNON_COMPUTE_LAYOUT_ID").unwrap_or_default();
+        let params = std::env::var("JUMP_CANNON_COMPUTE_LAYOUT_PARAMS")
+            .ok()
+            .and_then(|s| {
+                serde_json::from_str::<serde_json::Value>(&s)
+                    .map_err(|e| {
+                        tracing::warn!(
+                            "ignoring JUMP_CANNON_COMPUTE_LAYOUT_PARAMS (not valid JSON): {e}"
+                        );
+                        e
+                    })
+                    .ok()
+            });
+        Self { layout_id, params }
+    }
 }
 
 struct Inner {
@@ -81,7 +118,21 @@ impl ComputeBroker {
     ///
     /// TODO(auth): wrap `ComputeClient` in a tonic interceptor that injects
     /// a bearer token from `JUMP_CANNON_COMPUTE_TOKEN`.
+    ///
+    /// `selection` (ADR-002) picks + tunes the remote layout engine via the
+    /// `Subscribe` request's `layout_id` + `params` fields. `None` (or a
+    /// default-valued selection) leaves the worker on its startup default
+    /// engine. The selection is captured once here and replayed on every
+    /// reconnect so a worker restart resumes the same engine.
     pub async fn connect(&self, url: String) -> anyhow::Result<()> {
+        self.connect_with(url, RemoteLayout::default()).await
+    }
+
+    /// Like [`connect`](Self::connect) but with an explicit remote-layout
+    /// selection. Splitting these keeps the bare `connect(url)` callers (and
+    /// the env-driven `main.rs` path) simple while exposing the ADR-002
+    /// layout_id/params controls for callers that have them.
+    pub async fn connect_with(&self, url: String, selection: RemoteLayout) -> anyhow::Result<()> {
         // Validate the URL eagerly so a typo fails the boot sequence loudly.
         // The actual TCP dial happens inside the spawned reconnect loop.
         let _ = Channel::from_shared(url.clone())
@@ -97,6 +148,12 @@ impl ComputeBroker {
         // Reconnecting forwarder. Each iteration: dial, subscribe, pump
         // frames until the stream ends or errors, then back off and retry.
         let inner = self.inner.clone();
+        // Pre-build the params Struct once (it's identical on every reconnect).
+        let req_layout_id = selection.layout_id.clone();
+        let req_params = match selection.params {
+            Some(v) => Some(json_to_struct(v)),
+            None => None,
+        };
         tokio::spawn(async move {
             const BACKOFF_INITIAL: Duration = Duration::from_secs(1);
             const BACKOFF_CAP: Duration = Duration::from_secs(30);
@@ -135,6 +192,8 @@ impl ComputeBroker {
                 let stream = match client
                     .subscribe(SubscribeRequest {
                         graph_id: String::new(),
+                        layout_id: req_layout_id.clone(),
+                        params: req_params.clone(),
                     })
                     .await
                 {

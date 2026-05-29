@@ -46,10 +46,20 @@ async fn main() -> Result<()> {
     tracing::info!(target: "graph-compute", "graph source: {source}");
     let state = SimState::new(graph);
 
-    // Try to bring up the wgpu FA2 integrator. On hosts without a Vulkan/Metal
-    // adapter (most CI runners), this returns false and we transparently fall
-    // back to `cpu_step` — `try_init_wgpu` already logs the cause.
-    let _ = state.try_init_wgpu().await;
+    // Initialize the layout engine. Phase 1: the worker runs one engine for the
+    // whole process — the registry default (`"fa2-brute"`), overridable via
+    // `GRAPH_COMPUTE_LAYOUT_ID`. `init_engine` tries wgpu bring-up once and, on
+    // a host without a Vulkan/Metal adapter (most CI runners), transparently
+    // falls back to the `"cpu-spring"` engine. Per-`Subscribe` engine selection
+    // (the `layout_id` wire field) lands in Phase 3.
+    let layout_id = std::env::var("GRAPH_COMPUTE_LAYOUT_ID").unwrap_or_default();
+    match state
+        .init_engine(&layout_id, serde_json::Value::Null)
+        .await
+    {
+        Ok(id) => tracing::info!(engine = id, "layout engine initialized"),
+        Err(e) => tracing::error!(error = %e, "failed to initialize layout engine"),
+    }
 
     let bind: SocketAddr = std::env::var("GRAPH_COMPUTE_ADDR")
         .unwrap_or_else(|_| "[::]:50051".to_string())

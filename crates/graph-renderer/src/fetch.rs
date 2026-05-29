@@ -24,7 +24,8 @@ use tokio_tungstenite::{connect_async, tungstenite::protocol::Message as Tungste
 use {
     wasm_bindgen_futures::spawn_local,
     web_sys::{MessageEvent, WebSocket},
-    js_sys::{Uint8Array},
+    js_sys,
+    wasm_bindgen::JsCast,
 };
 
 use crate::proto;
@@ -190,32 +191,30 @@ let (_write, mut read) = ws_stream.split();
     pub fn start_layout_stream_wasm(&self) {
         let base = self.base.clone();
         let positions_latch = self.positions_latch.clone();
-        wasm_bindgen_futures::spawn_local(async move {
+        spawn_local(async move {
             let ws_url = format!("{}/graph/layout/stream", base.trim_end_matches('/'));
             let ws = match WebSocket::new(&ws_url) {
                 Ok(ws) => ws,
                 Err(e) => {
-                    eprintln!("Failed to connect to layout stream: {e}");
+                    eprintln!("Failed to connect to layout stream: {:?}", e);
                     return;
                 }
             };
             eprintln!("Connected to layout stream (WASM)");
-            let mut rx = ws.message_stream();
-            while let Some(msg) = rx.next().await {
-                match msg {
-                    Ok(web_sys::MessageEvent { data, .. }) => {
-                        if let Ok(array) = data.dyn_into::<js_sys::Uint8Array>() {
-                            let mut vec = vec![0u8; array.length() as usize];
-                            array.copy_to(&mut vec);
-                            if let Some((_frame, _n, positions)) = parse_layout_frame(&vec) {
-                                let mut latch = positions_latch.lock().unwrap();
-                                *latch = Some(positions);
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        eprintln!("Layout stream error: {e}");
-                        break;
+            
+            let (tx, mut rx) = futures::channel::mpsc::unbounded();
+            let on_message = wasm_bindgen::closure::Closure::<dyn FnMut(MessageEvent)>::new(move |e: MessageEvent| {
+                let _ = tx.unbounded_send(e);
+            });
+            ws.set_onmessage(Some(on_message.as_ref().unchecked_ref()));
+            on_message.forget(); // Keep the closure alive
+
+            while let Some(e) = rx.next().await {
+                if let Ok(array) = e.data().dyn_into::<js_sys::Uint8Array>() {
+                    let vec = array.to_vec();
+                    if let Some((_frame, _n, positions)) = parse_layout_frame(&vec) {
+                        let mut latch = positions_latch.lock().unwrap();
+                        *latch = Some(positions);
                     }
                 }
             }
@@ -346,7 +345,7 @@ async fn http_put_json(url: &str, body: &[u8]) -> Result<Vec<u8>, String> {
     let resp = Request::put(url)
         .header("content-type", "application/json")
         .body(body.to_vec())
-        .map_err(|e| format!("build PUT {url}: {e}"))
+        .map_err(|e| format!("build PUT {url}: {e}"))?
         .send()
         .await
         .map_err(|e| format!("PUT {url}: {e}"))?;

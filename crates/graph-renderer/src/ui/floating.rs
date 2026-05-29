@@ -125,7 +125,8 @@ impl<'p> FloatingPanel<'p> {
         let outer_stroke = if is_focused {
             Stroke::new(3.0, palette::PRIMARY)
         } else {
-            Stroke::new(1.0, palette::BORDER)
+            // New window implementation uses 2.0px borders
+            Stroke::new(2.0, palette::BORDER)
         };
 
         let response = window.show(ctx, |ui| {
@@ -144,46 +145,41 @@ impl<'p> FloatingPanel<'p> {
             );
 
             ui.horizontal(|ui| {
-                // Panel toggles — left. The drag glyph is a passive
-                // affordance; the actual drag is handled by the outer
-                // egui::Window. Showing it tells the user where to
-                // grab the panel.
-                ui.label(
-                    egui::RichText::new("\u{2261}")
-                        .font(theme::mono(theme::font_size::HEADING))
-                        .color(palette::GREY),
-                );
+                // Traffic light controls (left-aligned)
+                ui.spacing_mut().item_spacing.x = 6.0;
+                let circle = |ui: &mut egui::Ui, color: Color32, action: &mut bool, tooltip: &str| {
+                    let (rect, response) = ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::click());
+                    ui.painter().circle_filled(rect.center(), 5.0, color);
+                    if response.on_hover_text(tooltip).clicked() {
+                        *action = true;
+                    }
+                };
+
+                let mut close = false;
+                let mut minimize = false;
+                circle(ui, Color32::from_rgb(255, 96, 92), &mut close, "Close");
+                circle(ui, Color32::from_rgb(255, 189, 68), &mut minimize, "Minimize");
+                
+                if close { *open = false; }
+                if minimize { *open = false; /* Add actual minimize logic here if desired */ }
+
+                if let Some(p) = placement.as_deref_mut() {
+                    let color = Color32::from_rgb(0, 202, 78);
+                    let (rect, response) = ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::click());
+                    ui.painter().circle_filled(rect.center(), 5.0, color);
+                    if response.on_hover_text("Toggle Tile/Float").clicked() {
+                        *p = match *p {
+                            Placement::Floating => Placement::Tiled,
+                            Placement::Tiled => Placement::Floating,
+                        };
+                    }
+                }
+
+                ui.add_space(8.0);
                 ui.label(
                     egui::RichText::new(title)
                         .font(theme::mono(theme::font_size::HEADING))
                         .color(palette::TEXT),
-                );
-                // View controls — right.
-                ui.with_layout(
-                    egui::Layout::right_to_left(egui::Align::Center),
-                    |ui| {
-                        if ui.small_button("X").clicked() {
-                            *open = false;
-                        }
-                        if let Some(p) = placement.as_deref_mut() {
-                            // ⊟ when currently floating → click to tile;
-                            // ⤢ when currently tiled → click to float.
-                            // (When tiled, this branch usually isn't
-                            // rendered because the panel goes through
-                            // the tile chrome instead, but we keep the
-                            // toggle symmetrical for completeness.)
-                            let (glyph, tip) = match p {
-                                Placement::Floating => ("\u{229F}", "Snap into tile workspace"),
-                                Placement::Tiled => ("\u{2922}", "Float (un-tile)"),
-                            };
-                            if ui.small_button(glyph).on_hover_text(tip).clicked() {
-                                *p = match *p {
-                                    Placement::Floating => Placement::Tiled,
-                                    Placement::Tiled => Placement::Floating,
-                                };
-                            }
-                        }
-                    },
                 );
             });
             ui.separator();

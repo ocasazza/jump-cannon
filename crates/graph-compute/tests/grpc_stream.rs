@@ -17,6 +17,9 @@ use tonic::transport::Server;
 async fn delivers_at_least_one_position_delta() {
     let graph = CsrGraph::path(64);
     let state = SimState::new(graph);
+    // Init the layout engine (registry default `"fa2-brute"`, falling back to
+    // the CPU spring engine on GPU-less hosts) so the sim loop produces frames.
+    let _ = state.init_engine("", serde_json::Value::Null).await;
 
     // Bind to an ephemeral port. Tonic's `Server::serve` doesn't surface the
     // bound port, so we bind a std listener first and pull the port out.
@@ -47,6 +50,7 @@ async fn delivers_at_least_one_position_delta() {
     let mut stream = client
         .subscribe(SubscribeRequest {
             graph_id: "test".into(),
+            ..Default::default()
         })
         .await
         .expect("subscribe")
@@ -72,8 +76,9 @@ async fn delivers_at_least_one_position_delta() {
 async fn positions_advance_over_frames() {
     let graph = CsrGraph::path(64);
     let state = SimState::new(graph);
-    // Best-effort GPU init — if it fails the CPU fallback still produces motion.
-    let _ = state.try_init_wgpu().await;
+    // Init the layout engine — the wgpu FA2 engine if a GPU is present, else
+    // the CPU spring fallback. Both produce non-zero motion on the ring seed.
+    let _ = state.init_engine("", serde_json::Value::Null).await;
 
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
@@ -99,7 +104,7 @@ async fn positions_advance_over_frames() {
         .expect("connect to compute server");
 
     let mut stream = client
-        .subscribe(SubscribeRequest { graph_id: "test".into() })
+        .subscribe(SubscribeRequest { graph_id: "test".into(), ..Default::default() })
         .await
         .expect("subscribe")
         .into_inner();
