@@ -38,6 +38,7 @@ pub mod fa2_bh;
 pub mod sgd_stress;
 pub mod multilevel;
 pub mod geometric;
+pub mod geometric_gpu;
 
 pub use cpu_spring::CpuSpringEngine;
 pub use fa2_brute::Fa2BruteEngine;
@@ -45,6 +46,7 @@ pub use fa2_bh::Fa2BhEngine;
 pub use sgd_stress::SgdStressEngine;
 pub use multilevel::MultilevelEngine;
 pub use geometric::GeometricEngine;
+pub use geometric_gpu::GeometricGpuEngine;
 
 /// Per-worker execution context shared by all engines.
 ///
@@ -389,6 +391,7 @@ pub const LEAF_ENGINE_IDS: &[LayoutId] = &[
     Fa2BhEngine::ID,
     SgdStressEngine::ID,
     GeometricEngine::ID,
+    GeometricGpuEngine::ID,
 ];
 
 /// Construct a fresh, uninitialized **leaf** (non-multilevel) engine by id.
@@ -410,6 +413,7 @@ pub fn construct_leaf(id: &str) -> Option<Box<dyn LayoutEngine>> {
         Fa2BhEngine::ID => Some(Box::new(Fa2BhEngine::new())),
         SgdStressEngine::ID => Some(Box::new(SgdStressEngine::new())),
         GeometricEngine::ID => Some(Box::new(GeometricEngine::new())),
+        GeometricGpuEngine::ID => Some(Box::new(GeometricGpuEngine::new())),
         _ => None,
     }
 }
@@ -431,6 +435,7 @@ fn leaf_ctor_for(id: &str) -> EngineConstructor {
         Fa2BhEngine::ID => || construct_leaf(Fa2BhEngine::ID).unwrap(),
         SgdStressEngine::ID => || construct_leaf(SgdStressEngine::ID).unwrap(),
         GeometricEngine::ID => || construct_leaf(GeometricEngine::ID).unwrap(),
+        GeometricGpuEngine::ID => || construct_leaf(GeometricGpuEngine::ID).unwrap(),
         _ => panic!("leaf_ctor_for: unknown leaf engine id {id:?}"),
     }
 }

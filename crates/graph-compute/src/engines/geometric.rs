@@ -273,10 +273,10 @@ impl Default for GeometricSettings {
 
 /// A unique undirected edge with its resolved geometry, built once at `init`.
 #[derive(Clone, Debug)]
-struct ResolvedEdge {
-    a: u32,
-    b: u32,
-    target_len: f32,
+pub struct ResolvedEdge {
+    pub a: u32,
+    pub b: u32,
+    pub target_len: f32,
 }
 
 /// Everything the force kernels need, resolved from the chosen sources once at
