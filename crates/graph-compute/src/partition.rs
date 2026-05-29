@@ -111,7 +111,7 @@ impl Partition {
     /// n_owned`). Each boundary global id is mapped to its slot in the owned
     /// block via the ascending owned order, and only that node's `x,y,z` triple
     /// is copied into the delta. Interior owned positions are never sent.
-    fn boundary_delta(&self, frame: u64, owned_positions: &[f32]) -> HaloDelta {
+    pub(crate) fn boundary_delta(&self, frame: u64, owned_positions: &[f32]) -> HaloDelta {
         let owned = self.owned_global_ids();
         let mut node_ids = Vec::with_capacity(self.boundary.len());
         let mut positions = Vec::with_capacity(3 * self.boundary.len());
@@ -161,6 +161,10 @@ impl Partition {
 /// `TODO(metis):` replace the BFS heuristic with METIS-style recursive
 /// bisection + k-way refinement for a smaller edge cut (fewer ghosts ⇒ less
 /// halo traffic). The return type is unaffected.
+///
+/// For a cheap, drop-in *improvement* over the raw BFS cut without a heavyweight
+/// library, see [`partition_csr_refined`] / [`refine_partitions`], which run a
+/// Kernighan–Lin / Fiduccia–Mattheyses boundary-refinement pass on top of this.
 pub fn partition_csr(graph: &CsrGraph, n_partitions: u32) -> Vec<Partition> {
     let n = graph.n_nodes as usize;
     let p = n_partitions.max(1);
@@ -182,7 +186,15 @@ pub fn partition_csr(graph: &CsrGraph, n_partitions: u32) -> Vec<Partition> {
     }
 
     let owner = assign_owners_bfs(graph, p);
+    build_partitions_from_owner(graph, &owner, p)
+}
 
+/// Materialize the full `Vec<Partition>` (local CSR + ghost table + boundary
+/// set) from an owner assignment. Shared by [`partition_csr`] and the
+/// FM-refinement path so the boundary/ghost derivation has exactly one source of
+/// truth (the task requires boundary + ghost tables to be **recomputed** after
+/// refinement — this is that recomputation).
+fn build_partitions_from_owner(graph: &CsrGraph, owner: &[u32], p: u32) -> Vec<Partition> {
     // Bucket owned global ids per partition (ascending global order — keeps the
     // local index ↔ global id mapping deterministic).
     let mut owned: Vec<Vec<u32>> = vec![Vec::new(); p as usize];
@@ -193,9 +205,7 @@ pub fn partition_csr(graph: &CsrGraph, n_partitions: u32) -> Vec<Partition> {
     owned
         .into_iter()
         .enumerate()
-        .map(|(pid, owned_ids)| {
-            build_partition(graph, &owner, pid as u32, p, owned_ids)
-        })
+        .map(|(pid, owned_ids)| build_partition(graph, owner, pid as u32, p, owned_ids))
         .collect()
 }
 
@@ -354,6 +364,207 @@ fn build_partition(
         n_owned,
         boundary,
     }
+}
+
+// ---------------------------------------------------------------------------
+// Partition quality: edge-cut metric + KL/FM boundary refinement
+// ---------------------------------------------------------------------------
+
+/// Number of **cut edges**: undirected edges whose two endpoints are owned by
+/// different partitions. This is the standard graph-partitioning objective
+/// (Kernighan & Lin, "An Efficient Heuristic Procedure for Partitioning
+/// Graphs", *Bell System Technical Journal* 49(2), 1970) and directly bounds the
+/// distributed halo traffic (doc §4: each cut edge becomes one owned↔ghost
+/// reference refreshed every superstep).
+///
+/// The graph's CSR is symmetric (an undirected edge `{u,v}` appears as both
+/// `u→v` and `v→u`, cf. [`CsrGraph::path`]), so each cut edge is seen twice
+/// during a full adjacency scan; we count only the `u < v` orientation to return
+/// the count of *undirected* cut edges. Self-loops (`u == v`) are never cut and
+/// are ignored.
+pub fn edge_cut(parts: &[Partition], graph: &CsrGraph) -> usize {
+    let owner = owner_from_partitions(parts, graph.n_nodes as usize);
+    edge_cut_owner(graph, &owner)
+}
+
+/// Cut count straight from an owner array (the form refinement mutates).
+fn edge_cut_owner(graph: &CsrGraph, owner: &[u32]) -> usize {
+    let mut cut = 0usize;
+    let n = graph.n_nodes as usize;
+    for u in 0..n {
+        let start = graph.offsets[u] as usize;
+        let end = graph.offsets[u + 1] as usize;
+        for &v in &graph.neighbors[start..end] {
+            let v = v as usize;
+            // Count each undirected edge once; skip self-loops.
+            if u < v && owner[u] != owner[v] {
+                cut += 1;
+            }
+        }
+    }
+    cut
+}
+
+/// Recover `owner[global_id] -> partition_id` from a built partition set. Defined
+/// for every global id (nodes appear as the owned block of exactly one
+/// partition, by [`partition_csr`]'s construction).
+fn owner_from_partitions(parts: &[Partition], n: usize) -> Vec<u32> {
+    let mut owner = vec![0u32; n];
+    for p in parts {
+        for &g in p.owned_global_ids() {
+            owner[g as usize] = p.partition_id;
+        }
+    }
+    owner
+}
+
+/// Balance tolerance for refinement: a partition may grow to at most
+/// `ceil((1 + tol) * n / P)` owned nodes. 0.10 ⇒ ±10% of the ideal `n/P`.
+const REFINE_BALANCE_TOL: f64 = 0.10;
+
+/// Cap on refinement passes. Each pass is a full single-node FM sweep; the cut
+/// is monotone non-increasing across passes and converges quickly, so a small
+/// bound suffices and keeps the work deterministic + cheap.
+const REFINE_MAX_PASSES: usize = 8;
+
+/// Partition `graph` into `n_partitions` blocks **with** a Kernighan–Lin /
+/// Fiduccia–Mattheyses boundary-refinement pass applied on top of the v1 BFS cut
+/// ([`partition_csr`]). Opt-in: callers that want the cheap raw BFS cut keep
+/// using [`partition_csr`]; this is the lower-edge-cut variant.
+///
+/// The returned partitions are fully rebuilt from the refined owner assignment,
+/// so every `Partition`'s `local` CSR, ghost table, and `boundary` set reflect
+/// the post-refinement ownership (the boundary/ghost invariants asserted in the
+/// tests still hold).
+pub fn partition_csr_refined(graph: &CsrGraph, n_partitions: u32) -> Vec<Partition> {
+    let parts = partition_csr(graph, n_partitions);
+    refine_partitions(graph, parts)
+}
+
+/// Kernighan–Lin / Fiduccia–Mattheyses boundary refinement.
+///
+/// Given an existing partition (e.g. the BFS-region cut from [`partition_csr`]),
+/// reduce the [`edge_cut`] by repeatedly **moving boundary nodes to a neighboring
+/// partition** when the move lowers the cut and keeps sizes within
+/// [`REFINE_BALANCE_TOL`] of the ideal `n/P`. This is the single-node-move,
+/// reduced-neighborhood form of FM (Fiduccia & Mattheyses, "A Linear-Time
+/// Heuristic for Improving Network Partitions", *19th Design Automation
+/// Conference*, 1982), which generalizes the pairwise-swap KL procedure (Kernighan
+/// & Lin, 1970) to k-way partitions:
+///
+///   * **Gain.** Moving node `v` from its partition `a` to partition `b` changes
+///     the cut by `gain = external_b(v) - internal(v)`, where `internal(v)` is
+///     the number of `v`'s neighbors owned by `a` and `external_b(v)` is the
+///     number owned by `b`. A positive gain strictly lowers the cut.
+///   * **Reduced neighborhood.** Only *boundary* nodes (some neighbor owned
+///     elsewhere) can have positive gain, so each pass scans the boundary only —
+///     the linear-time idea behind FM.
+///   * **Balance.** A move is rejected if it would push the destination above the
+///     size cap or drain the source below the matching floor, keeping the cut
+///     reduction balanced (the KL/FM balance constraint).
+///
+/// **Determinism.** No RNG. Nodes are scanned in ascending global id; among
+/// candidate destinations the one with the largest gain wins, ties broken by the
+/// smallest destination partition id. Passes repeat until a pass makes no move or
+/// [`REFINE_MAX_PASSES`] is hit; the cut is monotone non-increasing (only
+/// strictly-positive-gain moves are applied), so the result never exceeds the
+/// input cut.
+///
+/// The input `parts` are consumed only to recover the owner assignment; the
+/// returned partitions are freshly built from the refined owners, so boundary +
+/// ghost tables are recomputed correctly.
+pub fn refine_partitions(graph: &CsrGraph, parts: Vec<Partition>) -> Vec<Partition> {
+    let n = graph.n_nodes as usize;
+    let p = if let Some(first) = parts.first() {
+        first.n_partitions
+    } else {
+        return parts;
+    };
+    if n == 0 || p <= 1 {
+        return parts;
+    }
+
+    let mut owner = owner_from_partitions(&parts, n);
+
+    // Per-partition owned-node counts, kept in sync as nodes move.
+    let mut sizes = vec![0usize; p as usize];
+    for &o in &owner {
+        sizes[o as usize] += 1;
+    }
+
+    // Balance window around the ideal n/P (KL/FM balance constraint).
+    let ideal = n as f64 / p as f64;
+    let max_size = ((1.0 + REFINE_BALANCE_TOL) * ideal).ceil() as usize;
+    // Floor mirrors the cap so draining a partition can't unbalance the other side.
+    let min_size = ((1.0 - REFINE_BALANCE_TOL) * ideal).floor() as usize;
+
+    for _pass in 0..REFINE_MAX_PASSES {
+        let mut moved = false;
+
+        // Scan candidate movers in ascending global id (deterministic order).
+        for v in 0..n {
+            let a = owner[v];
+            let start = graph.offsets[v] as usize;
+            let end = graph.offsets[v + 1] as usize;
+
+            // Tally neighbor counts per partition: internal (own a) vs external.
+            let mut internal = 0usize;
+            let mut ext = vec![0usize; p as usize];
+            for &u in &graph.neighbors[start..end] {
+                let u = u as usize;
+                if u == v {
+                    continue; // ignore self-loops
+                }
+                let o = owner[u];
+                if o == a {
+                    internal += 1;
+                } else {
+                    ext[o as usize] += 1;
+                }
+            }
+
+            // Interior node (no external neighbor) can never improve the cut.
+            // Best destination = max external degree; gain = ext_b - internal.
+            // Tie-break by smallest partition id for determinism.
+            let mut best_dest: Option<u32> = None;
+            let mut best_ext = 0usize;
+            for (b, &e) in ext.iter().enumerate() {
+                if b as u32 == a || e == 0 {
+                    continue;
+                }
+                if e > best_ext {
+                    best_ext = e;
+                    best_dest = Some(b as u32);
+                }
+            }
+            let Some(b) = best_dest else { continue };
+
+            let gain = best_ext as isize - internal as isize;
+            if gain <= 0 {
+                continue; // only strictly-cut-reducing moves (monotone)
+            }
+
+            // Balance: don't overfill the destination or drain the source.
+            if sizes[b as usize] + 1 > max_size {
+                continue;
+            }
+            if sizes[a as usize].saturating_sub(1) < min_size {
+                continue;
+            }
+
+            // Apply the move.
+            owner[v] = b;
+            sizes[a as usize] -= 1;
+            sizes[b as usize] += 1;
+            moved = true;
+        }
+
+        if !moved {
+            break; // converged: no positive-gain, balance-feasible move remains
+        }
+    }
+
+    build_partitions_from_owner(graph, &owner, p)
 }
 
 // ---------------------------------------------------------------------------
@@ -1163,6 +1374,293 @@ mod tests {
             }
             // And there is at least one ghost, so this actually exercised a hop.
             assert!(!ghosts.is_empty());
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // KL/FM edge-cut refinement
+    // -----------------------------------------------------------------------
+
+    /// Undirected ring 0—1—…—(n-1)—0 (mirrors the helper in
+    /// `boundary_equals_peers_ghosts`).
+    fn ring(n: u32) -> CsrGraph {
+        let mut offsets = Vec::with_capacity((n + 1) as usize);
+        let mut neighbors = Vec::new();
+        for i in 0..n {
+            offsets.push(neighbors.len() as u32);
+            neighbors.push((i + n - 1) % n);
+            neighbors.push((i + 1) % n);
+        }
+        offsets.push(neighbors.len() as u32);
+        CsrGraph {
+            n_nodes: n,
+            offsets,
+            neighbors,
+        }
+    }
+
+    /// Build a symmetric (undirected) CSR from an edge list.
+    fn undirected(n: u32, edges: &[(u32, u32)]) -> CsrGraph {
+        let mut adj: Vec<Vec<u32>> = vec![Vec::new(); n as usize];
+        for &(u, v) in edges {
+            adj[u as usize].push(v);
+            adj[v as usize].push(u);
+        }
+        let mut offsets = Vec::with_capacity((n + 1) as usize);
+        let mut neighbors = Vec::new();
+        for a in &mut adj {
+            a.sort_unstable();
+            offsets.push(neighbors.len() as u32);
+            neighbors.extend_from_slice(a);
+        }
+        offsets.push(neighbors.len() as u32);
+        CsrGraph {
+            n_nodes: n,
+            offsets,
+            neighbors,
+        }
+    }
+
+    /// Independent edge-cut over an owner map derived straight from the built
+    /// partitions, computed without touching `edge_cut`/`edge_cut_owner` (ground
+    /// truth: a global id's owner is the partition whose owned block contains it).
+    fn ground_truth_cut(parts: &[Partition], g: &CsrGraph) -> usize {
+        use std::collections::HashMap;
+        let mut owner: HashMap<u32, u32> = HashMap::new();
+        for p in parts {
+            for &gid in p.owned_global_ids() {
+                owner.insert(gid, p.partition_id);
+            }
+        }
+        let mut cut = 0usize;
+        for u in 0..g.n_nodes {
+            let s = g.offsets[u as usize] as usize;
+            let e = g.offsets[u as usize + 1] as usize;
+            for &v in &g.neighbors[s..e] {
+                if u < v && owner[&u] != owner[&v] {
+                    cut += 1;
+                }
+            }
+        }
+        cut
+    }
+
+    /// Reusable post-refine invariant check: every node owned once, local CSR
+    /// self-contained, owned+ghost == local, and the boundary set equals exactly
+    /// the owned nodes that are some peer's ghost (the `boundary_equals_peers_ghosts`
+    /// property recomputed independently).
+    fn assert_partition_invariants(parts: &[Partition], g: &CsrGraph) {
+        use std::collections::HashSet;
+
+        // Every global node owned exactly once.
+        let mut owned_all: Vec<u32> = parts
+            .iter()
+            .flat_map(|p| p.owned_global_ids().iter().copied())
+            .collect();
+        owned_all.sort_unstable();
+        let expect: Vec<u32> = (0..g.n_nodes).collect();
+        assert_eq!(owned_all, expect, "every node owned exactly once");
+
+        // Local CSR self-contained + owned/ghost accounting.
+        for p in parts {
+            for &nb in &p.local.neighbors {
+                assert!(nb < p.local.n_nodes, "ghost neighbor index out of range");
+            }
+            assert_eq!(
+                p.n_owned as usize + p.ghost_global_ids().len(),
+                p.local.n_nodes as usize
+            );
+        }
+
+        // boundary == owned-that-are-some-peer's-ghost, recomputed independently.
+        let mut all_ghosts: HashSet<u32> = HashSet::new();
+        for p in parts {
+            for &gid in p.ghost_global_ids() {
+                all_ghosts.insert(gid);
+            }
+        }
+        for p in parts {
+            let expected: HashSet<u32> = p
+                .owned_global_ids()
+                .iter()
+                .copied()
+                .filter(|v| all_ghosts.contains(v))
+                .collect();
+            let got: HashSet<u32> = p.boundary_global_ids().iter().copied().collect();
+            assert_eq!(
+                got, expected,
+                "part {}: post-refine boundary != owned-that-are-peer-ghosts",
+                p.partition_id
+            );
+            // Boundary stays ascending (binary_search precondition).
+            assert!(
+                p.boundary.windows(2).all(|w| w[0] < w[1]),
+                "post-refine boundary must be ascending"
+            );
+        }
+    }
+
+    /// Owned-node counts per partition, indexed by partition id.
+    fn sizes_of(parts: &[Partition]) -> Vec<usize> {
+        let mut s = vec![0usize; parts.len()];
+        for p in parts {
+            s[p.partition_id as usize] = p.n_owned as usize;
+        }
+        s
+    }
+
+    /// `edge_cut` agrees with an independent owner-map count, and matches
+    /// `ground_truth_cut`.
+    #[test]
+    fn edge_cut_matches_ground_truth() {
+        for g in [CsrGraph::path(6), CsrGraph::path(11), ring(8)] {
+            for np in [2u32, 3, 4] {
+                let parts = partition_csr(&g, np);
+                assert_eq!(
+                    edge_cut(&parts, &g),
+                    ground_truth_cut(&parts, &g),
+                    "edge_cut disagrees with ground truth (n={}, np={})",
+                    g.n_nodes,
+                    np
+                );
+            }
+        }
+    }
+
+    /// (a) Refinement never increases the cut on path(N) and a ring (cut is
+    /// monotone non-increasing — only positive-gain moves are applied).
+    #[test]
+    fn refine_does_not_increase_cut() {
+        for g in [CsrGraph::path(6), CsrGraph::path(12), ring(8), ring(12)] {
+            for np in [2u32, 3, 4] {
+                let before = partition_csr(&g, np);
+                let cut_before = edge_cut(&before, &g);
+                let after = refine_partitions(&g, before);
+                let cut_after = edge_cut(&after, &g);
+                assert!(
+                    cut_after <= cut_before,
+                    "refine increased cut on n={} np={}: {} -> {}",
+                    g.n_nodes,
+                    np,
+                    cut_before,
+                    cut_after
+                );
+            }
+        }
+    }
+
+    /// (b) On a graph where BFS-region growth produces a suboptimal cut,
+    /// refinement strictly reduces it.
+    ///
+    /// This 8-node graph is constructed so the balanced BFS regions strand node 7
+    /// on the wrong side: BFS yields owner [0,0,1,0,0,1,1,1] (balanced 4|4, cut
+    /// 3), but node 7's only same-partition neighbor is 6 while it has two
+    /// neighbors (3, 4) owned by partition 0. FM moves 7 into partition 0,
+    /// dropping the cut to 1 with a still-in-tolerance 5|3 split (ideal 4, ±10%
+    /// ⇒ [3, 5]). (Found by exhaustive search over the BFS/FM behavior; values
+    /// are pinned so a regression in either heuristic is caught.)
+    #[test]
+    fn refine_strictly_reduces_when_bfs_suboptimal() {
+        let g = undirected(
+            8,
+            &[
+                (0, 3),
+                (0, 4),
+                (1, 3),
+                (2, 4),
+                (2, 5),
+                (3, 4),
+                (3, 7),
+                (4, 7),
+                (5, 6),
+            ],
+        );
+
+        let before = partition_csr(&g, 2);
+        let cut_before = edge_cut(&before, &g);
+        assert_eq!(cut_before, 3, "BFS cut precondition changed");
+
+        let after = refine_partitions(&g, before);
+        let cut_after = edge_cut(&after, &g);
+
+        assert!(
+            cut_after < cut_before,
+            "FM failed to improve a BFS-suboptimal cut: {cut_before} -> {cut_after}"
+        );
+        assert_eq!(cut_after, 1, "expected FM to reach the optimal 1-edge cut");
+
+        // Balance stays within ±10% of the ideal n/P (= 4): sizes in [3, 5].
+        for &s in &sizes_of(&after) {
+            assert!((3..=5).contains(&s), "post-refine size {s} out of [3,5]");
+        }
+        assert_partition_invariants(&after, &g);
+    }
+
+    /// (c) Refinement keeps partition sizes within the balance tolerance.
+    #[test]
+    fn refine_stays_balanced() {
+        for g in [CsrGraph::path(12), ring(12), ring(16)] {
+            for np in [2u32, 3, 4] {
+                let n = g.n_nodes as usize;
+                let after = refine_partitions(&g, partition_csr(&g, np));
+                let ideal = n as f64 / np as f64;
+                let max_size = ((1.0 + REFINE_BALANCE_TOL) * ideal).ceil() as usize;
+                let min_size = ((1.0 - REFINE_BALANCE_TOL) * ideal).floor() as usize;
+                for (pid, &s) in sizes_of(&after).iter().enumerate() {
+                    assert!(
+                        s <= max_size,
+                        "part {pid} oversize: {s} > {max_size} (n={n}, np={np})"
+                    );
+                    assert!(
+                        s >= min_size,
+                        "part {pid} undersize: {s} < {min_size} (n={n}, np={np})"
+                    );
+                }
+            }
+        }
+    }
+
+    /// (d) All boundary/ghost invariants still hold after refinement (reuses the
+    /// `boundary_equals_peers_ghosts` style independent recomputation).
+    #[test]
+    fn refine_preserves_boundary_ghost_invariants() {
+        for g in [CsrGraph::path(6), CsrGraph::path(13), ring(8), ring(12)] {
+            for np in [2u32, 3, 4] {
+                let after = refine_partitions(&g, partition_csr(&g, np));
+                assert_partition_invariants(&after, &g);
+            }
+        }
+    }
+
+    /// `partition_csr_refined` is the opt-in convenience: same partition count,
+    /// invariants intact, cut no worse than the raw BFS cut.
+    #[test]
+    fn partition_csr_refined_is_opt_in_and_no_worse() {
+        let g = ring(12);
+        let raw = partition_csr(&g, 3);
+        let refined = partition_csr_refined(&g, 3);
+        assert_eq!(refined.len(), 3);
+        assert!(edge_cut(&refined, &g) <= edge_cut(&raw, &g));
+        assert_partition_invariants(&refined, &g);
+    }
+
+    /// Refinement is a no-op (cleanly) for degenerate P=1 / empty graphs.
+    #[test]
+    fn refine_handles_degenerate_inputs() {
+        let g = CsrGraph::path(5);
+        let one = refine_partitions(&g, partition_csr(&g, 1));
+        assert_eq!(one.len(), 1);
+        assert_eq!(one[0].n_owned, 5);
+
+        let empty = CsrGraph {
+            n_nodes: 0,
+            offsets: vec![0],
+            neighbors: vec![],
+        };
+        let parts = refine_partitions(&empty, partition_csr(&empty, 3));
+        assert_eq!(parts.len(), 3);
+        for p in &parts {
+            assert_eq!(p.n_owned, 0);
         }
     }
 }

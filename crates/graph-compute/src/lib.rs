@@ -26,6 +26,7 @@ pub mod proto {
     tonic::include_proto!("graph_compute");
 }
 
+pub mod bsp;
 pub mod engines;
 pub mod partition;
 pub mod sim;
@@ -41,5 +42,6 @@ pub use partition::{
     partition_csr, run_superstep, run_superstep_local, HaloDelta, HaloTransport, LocalTransport,
     Partition, TonicHaloTransport, Worker,
 };
+pub use bsp::{run_bsp_mesh, BspWorker, LiveHaloProvider, MeshTransport};
 pub use service::HaloProvider;
 pub use wgpu_sim::WgpuSim;

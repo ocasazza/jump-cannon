@@ -6,7 +6,12 @@
 //! self-consistent, focus changes produce different layouts). Also asserts
 //! the per-graph hierarchy cache by sending two requests rapidly and
 //! confirming the second comes back faster than a typical cold build.
+//!
+//! Transport: an in-process `tokio::io::duplex` pipe (the same pattern proven
+//! in `tests/exchange_halo_grpc.rs`) rather than a real TCP socket, so the
+//! tests run under the sandbox. No port is bound.
 
+use std::future::ready;
 use std::time::Duration;
 
 use graph_compute::proto::compute_client::ComputeClient;
@@ -14,37 +19,45 @@ use graph_compute::proto::compute_server::ComputeServer;
 use graph_compute::proto::FocusRequest;
 use graph_compute::service::{run_sim_loop, ComputeService};
 use graph_compute::sim::{CsrGraph, SimState};
+use hyper_util::rt::TokioIo;
 use tokio_stream::StreamExt;
-use tonic::transport::Server;
+use tonic::transport::{Channel, Endpoint, Server, Uri};
 
-async fn boot_server(graph: CsrGraph) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+/// Stand up the server over a single in-memory duplex connection (no TCP bind)
+/// and return a `Channel` connected through the other end of the same pipe.
+async fn boot_server(graph: CsrGraph) -> Channel {
     let state = SimState::new(graph);
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let addr = listener.local_addr().unwrap();
-    drop(listener);
 
     let sim_state = state.clone();
     tokio::spawn(async move { run_sim_loop(sim_state, 60.0).await });
 
     let svc = ComputeService::new(state);
-    let server = tokio::spawn(async move {
+    let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+
+    let incoming = tokio_stream::once(Ok::<_, std::io::Error>(server_io));
+    tokio::spawn(async move {
         Server::builder()
             .add_service(ComputeServer::new(svc))
-            .serve(addr)
+            .serve_with_incoming(incoming)
             .await
             .unwrap();
     });
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    (addr, server)
+
+    let mut client_io = Some(client_io);
+    Endpoint::try_from("http://[::]:50051")
+        .unwrap()
+        .connect_with_connector(tower::service_fn(move |_: Uri| {
+            let io = client_io.take().expect("connector invoked more than once");
+            ready(Ok::<_, std::io::Error>(TokioIo::new(io)))
+        }))
+        .await
+        .expect("connect over in-memory duplex")
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn topo_fisheye_returns_a_well_formed_hybrid_frame() {
-    let (addr, server) = boot_server(CsrGraph::path(64)).await;
-    let endpoint = format!("http://{}", addr);
-    let mut client = ComputeClient::connect(endpoint)
-        .await
-        .expect("connect to compute server");
+    let channel = boot_server(CsrGraph::path(64)).await;
+    let mut client = ComputeClient::new(channel);
 
     // mpsc channel → tonic request stream.
     let (tx, rx) = tokio::sync::mpsc::channel::<FocusRequest>(4);
@@ -81,15 +94,12 @@ async fn topo_fisheye_returns_a_well_formed_hybrid_frame() {
     // Decode node levels — at least one should be 0 (the focus region).
     let levels: &[u32] = bytemuck::cast_slice(&frame.node_levels);
     assert!(levels.iter().any(|&l| l == 0), "no level-0 (focus) nodes");
-
-    server.abort();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn moving_focus_changes_the_layout() {
-    let (addr, server) = boot_server(CsrGraph::path(128)).await;
-    let endpoint = format!("http://{}", addr);
-    let mut client = ComputeClient::connect(endpoint).await.unwrap();
+    let channel = boot_server(CsrGraph::path(128)).await;
+    let mut client = ComputeClient::new(channel);
 
     let (tx, rx) = tokio::sync::mpsc::channel::<FocusRequest>(4);
     let request_stream = tokio_stream::wrappers::ReceiverStream::new(rx);
@@ -150,15 +160,12 @@ async fn moving_focus_changes_the_layout() {
         s1, s2,
         "level-0 set should differ when the focus moves to the opposite end of the path"
     );
-
-    server.abort();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn edges_reference_valid_nodes() {
-    let (addr, server) = boot_server(CsrGraph::path(64)).await;
-    let endpoint = format!("http://{}", addr);
-    let mut client = ComputeClient::connect(endpoint).await.unwrap();
+    let channel = boot_server(CsrGraph::path(64)).await;
+    let mut client = ComputeClient::new(channel);
 
     let (tx, rx) = tokio::sync::mpsc::channel::<FocusRequest>(1);
     let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
@@ -193,6 +200,4 @@ async fn edges_reference_valid_nodes() {
     }
     let edge_levels: &[u32] = bytemuck::cast_slice(&frame.edge_levels);
     assert_eq!(edge_levels.len(), frame.n_edges as usize);
-
-    server.abort();
 }

@@ -3,7 +3,15 @@
 //!
 //! Uses the CPU integrator so it runs anywhere — CUDA-only paths are gated
 //! out for Phase 1.
+//!
+//! Transport: an in-process `tokio::io::duplex` pipe (the same pattern proven
+//! in `tests/exchange_halo_grpc.rs`) — the server end is fed to
+//! `Server::serve_with_incoming` and the client connects through the other end
+//! via `Endpoint::connect_with_connector` + a `tower::service_fn` connector
+//! (the duplex wrapped in `hyper_util::rt::TokioIo`). No TCP port is bound, so
+//! these run under the sandbox.
 
+use std::future::ready;
 use std::time::Duration;
 
 use graph_compute::proto::compute_client::ComputeClient;
@@ -11,7 +19,35 @@ use graph_compute::proto::compute_server::ComputeServer;
 use graph_compute::proto::{HealthRequest, SubscribeRequest};
 use graph_compute::service::{run_sim_loop, ComputeService};
 use graph_compute::sim::{CsrGraph, SimState};
-use tonic::transport::Server;
+use hyper_util::rt::TokioIo;
+use tonic::transport::{Channel, Endpoint, Server, Uri};
+
+/// Serve `svc` over a single in-memory duplex connection (no TCP bind) and
+/// return a `Channel` connected through the other end of the same pipe. The
+/// `Uri` handed to the connector is a dummy — the connector ignores it and
+/// always hands back our in-memory client end.
+async fn connect_in_process(svc: ComputeService) -> Channel {
+    let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+
+    let incoming = tokio_stream::once(Ok::<_, std::io::Error>(server_io));
+    tokio::spawn(async move {
+        Server::builder()
+            .add_service(ComputeServer::new(svc))
+            .serve_with_incoming(incoming)
+            .await
+            .unwrap();
+    });
+
+    let mut client_io = Some(client_io);
+    Endpoint::try_from("http://[::]:50051")
+        .unwrap()
+        .connect_with_connector(tower::service_fn(move |_: Uri| {
+            let io = client_io.take().expect("connector invoked more than once");
+            ready(Ok::<_, std::io::Error>(TokioIo::new(io)))
+        }))
+        .await
+        .expect("connect over in-memory duplex")
+}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn delivers_at_least_one_position_delta() {
@@ -21,31 +57,12 @@ async fn delivers_at_least_one_position_delta() {
     // the CPU spring engine on GPU-less hosts) so the sim loop produces frames.
     let _ = state.init_engine("", serde_json::Value::Null).await;
 
-    // Bind to an ephemeral port. Tonic's `Server::serve` doesn't surface the
-    // bound port, so we bind a std listener first and pull the port out.
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let addr = listener.local_addr().unwrap();
-    drop(listener);
-
     let sim_state = state.clone();
     tokio::spawn(async move { run_sim_loop(sim_state, 60.0).await });
 
     let svc = ComputeService::new(state);
-    let server = tokio::spawn(async move {
-        Server::builder()
-            .add_service(ComputeServer::new(svc))
-            .serve(addr)
-            .await
-            .unwrap();
-    });
-
-    // Give the server a beat to bind.
-    tokio::time::sleep(Duration::from_millis(200)).await;
-
-    let endpoint = format!("http://{}", addr);
-    let mut client = ComputeClient::connect(endpoint)
-        .await
-        .expect("connect to compute server");
+    let channel = connect_in_process(svc).await;
+    let mut client = ComputeClient::new(channel);
 
     let mut stream = client
         .subscribe(SubscribeRequest {
@@ -65,8 +82,6 @@ async fn delivers_at_least_one_position_delta() {
     assert_eq!(frame.n_nodes, 64);
     assert_eq!(frame.positions.len(), 64 * 3 * 4); // n * xyz * f32
     assert!(frame.frame >= 1);
-
-    server.abort();
 }
 
 /// Stronger end-to-end check: positions actually advance over time. Both the
@@ -80,28 +95,12 @@ async fn positions_advance_over_frames() {
     // the CPU spring fallback. Both produce non-zero motion on the ring seed.
     let _ = state.init_engine("", serde_json::Value::Null).await;
 
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let addr = listener.local_addr().unwrap();
-    drop(listener);
-
     let sim_state = state.clone();
     tokio::spawn(async move { run_sim_loop(sim_state, 60.0).await });
 
     let svc = ComputeService::new(state);
-    let server = tokio::spawn(async move {
-        Server::builder()
-            .add_service(ComputeServer::new(svc))
-            .serve(addr)
-            .await
-            .unwrap();
-    });
-
-    tokio::time::sleep(Duration::from_millis(200)).await;
-
-    let endpoint = format!("http://{}", addr);
-    let mut client = ComputeClient::connect(endpoint)
-        .await
-        .expect("connect to compute server");
+    let channel = connect_in_process(svc).await;
+    let mut client = ComputeClient::new(channel);
 
     let mut stream = client
         .subscribe(SubscribeRequest { graph_id: "test".into(), ..Default::default() })
@@ -146,8 +145,6 @@ async fn positions_advance_over_frames() {
         "positions did not advance over 30 frames (L2 = {})",
         l2
     );
-
-    server.abort();
 }
 
 /// Phase 2: validate that a CSR file written via `write_bin` and re-loaded
@@ -176,28 +173,12 @@ async fn loads_graph_from_file_via_env() {
 
     let state = SimState::new(graph);
 
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let addr = listener.local_addr().unwrap();
-    drop(listener);
-
     let sim_state = state.clone();
     tokio::spawn(async move { run_sim_loop(sim_state, 60.0).await });
 
     let svc = ComputeService::new(state);
-    let server = tokio::spawn(async move {
-        Server::builder()
-            .add_service(ComputeServer::new(svc))
-            .serve(addr)
-            .await
-            .unwrap();
-    });
-
-    tokio::time::sleep(Duration::from_millis(200)).await;
-
-    let endpoint = format!("http://{}", addr);
-    let mut client = ComputeClient::connect(endpoint)
-        .await
-        .expect("connect to compute server");
+    let channel = connect_in_process(svc).await;
+    let mut client = ComputeClient::new(channel);
 
     // 3. Health check: n_nodes must reflect the on-disk graph.
     let health = client
@@ -208,7 +189,6 @@ async fn loads_graph_from_file_via_env() {
     assert_eq!(health.n_nodes, 64);
     assert!(health.ok);
 
-    server.abort();
     std::env::remove_var("GRAPH_COMPUTE_GRAPH_PATH");
     let _ = std::fs::remove_file(&tmp);
 }
