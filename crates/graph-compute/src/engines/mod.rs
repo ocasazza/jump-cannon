@@ -100,16 +100,28 @@ impl EngineCtx {
 fn build_gpu_ctx() -> anyhow::Result<GpuCtx> {
     use anyhow::{anyhow, Context};
 
+    // Vendor-agnostic by construction: wgpu picks the backend per platform, so
+    // the same code drives Apple GPUs (Metal), and NVIDIA/AMD/Intel via Vulkan
+    // (Linux), DX12 (Windows), or the Metal driver (Intel Macs). We default to
+    // `all()` (PRIMARY + the GL secondary fallback for older NVIDIA/AMD without
+    // Vulkan) and let `WGPU_BACKEND` override it. `HighPerformance` prefers the
+    // discrete GPU when an integrated one is also present (e.g. NVIDIA/AMD over
+    // an iGPU); `WGPU_POWER_PREF` can override.
+    let backends =
+        wgpu::util::backend_bits_from_env().unwrap_or_else(wgpu::Backends::all);
+    let power_preference = wgpu::util::power_preference_from_env()
+        .unwrap_or(wgpu::PowerPreference::HighPerformance);
+
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
-        backends: wgpu::Backends::PRIMARY,
+        backends,
         ..Default::default()
     });
     let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-        power_preference: wgpu::PowerPreference::HighPerformance,
+        power_preference,
         force_fallback_adapter: false,
         compatible_surface: None,
     }))
-    .ok_or_else(|| anyhow!("no wgpu adapter available"))?;
+    .ok_or_else(|| anyhow!("no wgpu adapter available (backends: {backends:?})"))?;
 
     let adapter_info = adapter.get_info();
 

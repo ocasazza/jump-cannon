@@ -831,7 +831,11 @@ impl OctreeBuild {
             outer_skip: OCT_END,
         });
 
-        let mut prev_visited: Option<u32> = None;
+        // Seed with the root (node 0): the first child we pick must become the
+        // root's `next` (descend) pointer. Starting from `None` left `next[0]`
+        // unset (OCT_END), so the WGSL walk descended from the root into nothing
+        // and skipped ALL repulsion — every node saw zero repulsive force.
+        let mut prev_visited: Option<u32> = Some(0);
 
         while stack.last().is_some() {
             let top = stack.last_mut().unwrap();
@@ -880,5 +884,148 @@ impl OctreeBuild {
             self.nodes[i].meta[1] = next[i];
             self.nodes[i].meta[2] = skip[i];
         }
+    }
+}
+
+#[cfg(test)]
+mod octree_tests {
+    //! CPU-side correctness for the Barnes-Hut octree + a faithful replica of
+    //! the WGSL rope walk (`fa2_barnes_hut.wgsl`). No GPU needed, so this runs
+    //! in-sandbox and pins down whether a layout discrepancy is in the host
+    //! build or the shader. With `theta = 0` the walk must reproduce brute-force
+    //! repulsion exactly.
+
+    use super::*;
+
+    /// Deterministic, non-coincident spiral seed in vec4 stride (x,y,z,pad).
+    fn positions_vec4(n: usize) -> Vec<f32> {
+        let ga = std::f32::consts::PI * (3.0 - 5.0_f32.sqrt());
+        let mut p = Vec::with_capacity(n * 4);
+        for i in 0..n {
+            let r = (i as f32 + 1.0).sqrt();
+            let a = i as f32 * ga;
+            p.extend_from_slice(&[r * a.cos(), r * a.sin(), 0.0, 0.0]);
+        }
+        p
+    }
+
+    /// Brute-force FA2 repulsion on body `i`: sum over j != i of
+    /// `d * scaling * deg_i * mass[j] / r²`, with `d = pos_i - pos_j`.
+    fn brute_repulsion(pos4: &[f32], mass: &[f32], i: usize, scaling: f32) -> [f32; 3] {
+        let n = mass.len();
+        let pi = [pos4[i * 4], pos4[i * 4 + 1], pos4[i * 4 + 2]];
+        let deg_i = mass[i];
+        let mut f = [0.0f32; 3];
+        for j in 0..n {
+            if j == i {
+                continue;
+            }
+            let d = [
+                pi[0] - pos4[j * 4],
+                pi[1] - pos4[j * 4 + 1],
+                pi[2] - pos4[j * 4 + 2],
+            ];
+            let r2 = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).max(1.0e-4);
+            let c = scaling * deg_i * mass[j] / r2;
+            f[0] += d[0] * c;
+            f[1] += d[1] * c;
+            f[2] += d[2] * c;
+        }
+        f
+    }
+
+    /// Faithful CPU replica of the WGSL rope walk in `fa2_barnes_hut.wgsl`.
+    fn walk_repulsion(
+        nodes: &[OctNodeRaw],
+        pos_i: [f32; 3],
+        i: u32,
+        deg_i: f32,
+        scaling: f32,
+        theta: f32,
+    ) -> [f32; 3] {
+        let theta2 = theta * theta;
+        let mut force = [0.0f32; 3];
+        if nodes.is_empty() {
+            return force;
+        }
+        let mut idx = 0u32;
+        let cap = (nodes.len() as u32 * 4).max(16);
+        let mut walk = 0u32;
+        loop {
+            if idx == OCT_END || walk >= cap {
+                break;
+            }
+            walk += 1;
+            let node = nodes[idx as usize];
+            let body = node.meta[0];
+            let com = [node.com_mass[0], node.com_mass[1], node.com_mass[2]];
+            let mass_n = node.com_mass[3];
+            let s = node.pos_size[3] * 2.0;
+            let d = [pos_i[0] - com[0], pos_i[1] - com[1], pos_i[2] - com[2]];
+            let r2 = d[0] * d[0] + d[1] * d[1] + d[2] * d[2];
+            if body != OCT_BODY_INTERNAL {
+                if body != i && mass_n > 0.0 {
+                    let r2c = r2.max(1.0e-4);
+                    let c = scaling * deg_i * mass_n / r2c;
+                    force[0] += d[0] * c;
+                    force[1] += d[1] * c;
+                    force[2] += d[2] * c;
+                }
+                idx = node.meta[2]; // skip
+                continue;
+            }
+            if mass_n > 0.0 && r2 > 0.0 && (s * s) < (theta2 * r2) {
+                let r2c = r2.max(1.0e-4);
+                let c = scaling * deg_i * mass_n / r2c;
+                force[0] += d[0] * c;
+                force[1] += d[1] * c;
+                force[2] += d[2] * c;
+                idx = node.meta[2]; // accept => skip subtree
+            } else {
+                idx = node.meta[1]; // descend
+            }
+        }
+        force
+    }
+
+    #[test]
+    fn octree_walk_theta0_matches_brute_force() {
+        let n = 16usize;
+        let pos4 = positions_vec4(n);
+        let mass: Vec<f32> = (0..n).map(|i| (i % 3) as f32 + 1.0).collect();
+        let scaling = 2.0f32;
+
+        let mut build = OctreeBuild::default();
+        let used = build.rebuild(&pos4, &mass, n as u32, (2 * n as u32) + 8);
+        assert!(used > 0, "octree should be non-empty (used={used})");
+
+        // Sanity: total leaf mass == sum of body masses (no bodies dropped).
+        let leaf_mass: f32 = build
+            .nodes
+            .iter()
+            .filter(|nd| nd.meta[0] != OCT_BODY_INTERNAL)
+            .map(|nd| nd.com_mass[3])
+            .sum();
+        let want_mass: f32 = mass.iter().sum();
+        assert!(
+            (leaf_mass - want_mass).abs() < 1e-3,
+            "every body must be a leaf: leaf_mass={leaf_mass} want={want_mass}"
+        );
+
+        // theta = 0 ⇒ the walk visits every leaf ⇒ exact brute-force repulsion.
+        let mut max_rel = 0.0f32;
+        for i in 0..n {
+            let pi = [pos4[i * 4], pos4[i * 4 + 1], pos4[i * 4 + 2]];
+            let bh = walk_repulsion(&build.nodes, pi, i as u32, mass[i], scaling, 0.0);
+            let bf = brute_repulsion(&pos4, &mass, i, scaling);
+            for k in 0..3 {
+                let denom = bf[k].abs().max(1.0);
+                max_rel = max_rel.max((bh[k] - bf[k]).abs() / denom);
+            }
+        }
+        assert!(
+            max_rel < 1e-3,
+            "Barnes-Hut walk (theta=0) must equal brute force; max rel diff = {max_rel}"
+        );
     }
 }
