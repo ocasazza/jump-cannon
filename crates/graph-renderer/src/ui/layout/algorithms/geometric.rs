@@ -1,95 +1,18 @@
 //! UI factory + widgets for the `geometric` constraint engine.
 
 use std::sync::{Arc, Mutex};
-use eframe::egui;
 use graph_layouts::{
     BoxedPhysics, DynPhysicsLayout, Graph, LayoutDescriptor, LayoutId, LayoutKind,
     LayoutRequirements, PhysicsLayout,
 };
-use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::ui::layout::registry::LayoutFactory;
 use crate::ui::sections::{reset_row, row, subgroup_label, subgroup_separator};
 
+use graph_layouts::geometric::{ClassLens, CoordinationLens, EdgeLengthLens, LensConfig, MassLens};
+
 const LAYOUT_ID: LayoutId = "geometric";
-
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-#[serde(tag = "kind", content = "value")]
-pub enum ClassLens {
-    Uniform,
-    DegreeBuckets,
-    Louvain,
-    Field(String),
-    Tag(String),
-    NodeType,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-#[serde(tag = "kind", content = "value")]
-pub enum CoordinationLens {
-    Degree,
-    Uniform(u32),
-    Field(String),
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-#[serde(tag = "kind", content = "value")]
-pub enum MassLens {
-    Uniform,
-    Degree,
-    PageRank,
-    Field(String),
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-#[serde(tag = "kind", content = "value")]
-pub enum EdgeLengthLens {
-    Uniform,
-    Weight,
-    EdgeType,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-pub struct LensConfig {
-    pub url: String,
-    pub reconnect_backoff_ms: u32,
-    
-    pub class: ClassLens,
-    pub coordination: CoordinationLens,
-    pub mass: MassLens,
-    pub edge_length: EdgeLengthLens,
-
-    pub edge_stiffness: f32,
-    pub angle_stiffness: f32,
-    pub exclusion_strength: f32,
-    pub affinity_strength: f32,
-    pub gravity: f32,
-    pub coordination_angles: Vec<f32>,
-    pub class_radius: Vec<f32>,
-    pub class_affinity: Vec<f32>,
-}
-
-impl Default for LensConfig {
-    fn default() -> Self {
-        Self {
-            url: "ws://127.0.0.1:8080/graph/layout/stream".to_string(),
-            reconnect_backoff_ms: 1000,
-            class: ClassLens::Uniform,
-            coordination: CoordinationLens::Uniform(0),
-            mass: MassLens::Uniform,
-            edge_length: EdgeLengthLens::Uniform,
-            edge_stiffness: 0.1,
-            angle_stiffness: 0.05,
-            exclusion_strength: 100.0,
-            affinity_strength: 0.0,
-            gravity: 0.005,
-            coordination_angles: vec![],
-            class_radius: vec![],
-            class_affinity: vec![],
-        }
-    }
-}
 
 pub fn factory() -> LayoutFactory {
     LayoutFactory::Physics {
@@ -317,23 +240,5 @@ fn render_ui(ui: &mut egui::Ui, json: &mut Value) {
         if let Ok(v) = serde_json::to_value(&opts) {
             *json = v;
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn lens_config_serde_roundtrip() {
-        let mut config = LensConfig::default();
-        config.class = ClassLens::Louvain;
-        config.exclusion_strength = 1337.0;
-
-        let json = serde_json::to_string(&config).unwrap();
-        let decoded: LensConfig = serde_json::from_str(&json).unwrap();
-        
-        assert_eq!(decoded.class, ClassLens::Louvain);
-        assert_eq!(decoded.exclusion_strength, 1337.0);
     }
 }

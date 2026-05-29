@@ -17,8 +17,9 @@ use tokio::sync::broadcast;
 use tonic::transport::Channel;
 
 use graph_compute::proto::compute_client::ComputeClient;
-use graph_compute::proto::{PositionDelta, SubscribeRequest};
+use graph_compute::proto::{GraphAttributes as ProtoGraphAttributes, PositionDelta, SubscribeRequest};
 use graph_compute::service::json_to_struct;
+use graph_layouts::geometric::LensConfig;
 
 #[derive(Clone)]
 pub struct ComputeBroker {
@@ -34,6 +35,8 @@ pub struct ComputeBroker {
 pub struct RemoteLayout {
     pub layout_id: String,
     pub params: Option<serde_json::Value>,
+    pub lens: Option<LensConfig>,
+    pub attributes: Option<ProtoGraphAttributes>,
 }
 
 impl RemoteLayout {
@@ -57,7 +60,12 @@ impl RemoteLayout {
                     })
                     .ok()
             });
-        Self { layout_id, params }
+        Self {
+            layout_id,
+            params,
+            lens: None,
+            attributes: None,
+        }
     }
 }
 
@@ -154,6 +162,7 @@ impl ComputeBroker {
             Some(v) => Some(json_to_struct(v)),
             None => None,
         };
+        let req_attributes = selection.attributes.clone();
         tokio::spawn(async move {
             const BACKOFF_INITIAL: Duration = Duration::from_secs(1);
             const BACKOFF_CAP: Duration = Duration::from_secs(30);
@@ -194,6 +203,7 @@ impl ComputeBroker {
                         graph_id: String::new(),
                         layout_id: req_layout_id.clone(),
                         params: req_params.clone(),
+                        attributes: req_attributes.clone(),
                     })
                     .await
                 {

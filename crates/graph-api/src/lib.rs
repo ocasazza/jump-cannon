@@ -20,3 +20,4 @@ pub mod watcher;
 
 pub use server::router;
 pub use state::AppState;
+pub mod attribute_resolver;

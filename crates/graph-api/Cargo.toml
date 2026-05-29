@@ -21,6 +21,7 @@ tower-http         = { version = "0.5", features = ["fs", "trace"] }
 serde              = { workspace = true }
 serde_json         = { workspace = true }
 bytes              = "1"
+bytemuck           = { version = "1", features = ["derive"] }
 prost              = "0.13"
 tonic              = "0.12"
 anyhow             = "1"
@@ -38,6 +39,7 @@ notify-debouncer-mini = "0.4"
 
 vault-data     = { path = "../vault-data" }
 vault-links    = { path = "../vault-links" }
+graph-layouts  = { path = "../graph-layouts" }
 graph-metrics  = { path = "../graph-metrics" }
 graph-renderer = { path = "../graph-renderer" }
 # graph-compute is native-only. graph-api links it for its gRPC client types
