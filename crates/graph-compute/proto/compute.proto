@@ -62,6 +62,7 @@ message HaloDelta {
   uint32 owner_id = 2;           // partition id that owns these nodes
   bytes  node_ids  = 3;          // raw little-endian u32 global ids
   bytes  positions = 4;          // raw little-endian f32 [x0,y0,z0,...], parallel to node_ids
+  GraphAttributes attributes = 5; // Optional attributes for the boundary nodes
 }
 
 message HealthRequest {}

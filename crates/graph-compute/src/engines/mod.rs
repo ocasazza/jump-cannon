@@ -305,6 +305,9 @@ pub struct HaloUpdate {
     pub node_ids: Vec<u32>,
     /// Interleaved `x,y,z` f32, parallel to `node_ids`.
     pub positions: Vec<f32>,
+    /// Optional attributes for the halo nodes (e.g. class/mass needed for
+    /// repulsion).
+    pub attributes: Option<GraphAttributes>,
 }
 
 /// A server-side layout solver. Scale-out-first: see the module docs and

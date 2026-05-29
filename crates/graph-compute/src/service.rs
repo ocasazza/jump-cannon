@@ -97,19 +97,13 @@ type ExchangeHaloStream =
 /// repo wire rule; `decode_bytes` enforces alignment + the positions↔node_ids
 /// length invariant.
 fn proto_to_host(d: HaloDelta) -> Result<HostHaloDelta, Status> {
-    HostHaloDelta::decode_bytes(d.frame, d.owner_id, &d.node_ids, &d.positions)
+    HostHaloDelta::decode_bytes(d.frame, d.owner_id, &d.node_ids, &d.positions, d.attributes)
         .map_err(|e| Status::invalid_argument(format!("malformed HaloDelta: {e}")))
 }
 
 /// Encode a host [`HostHaloDelta`] into the proto wire form (raw-LE bytes).
 fn host_to_proto(d: &HostHaloDelta) -> HaloDelta {
-    let (node_ids, positions) = d.encode_bytes();
-    HaloDelta {
-        frame: d.frame,
-        owner_id: d.owner_id,
-        node_ids,
-        positions,
-    }
+    d.encode_proto()
 }
 
 /// Decode a proto `GraphAttributes` into the host `GraphAttributes`.

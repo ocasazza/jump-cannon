@@ -45,6 +45,7 @@ impl HaloProvider for FixedHaloProvider {
             owner_id: self.owner_id,
             node_ids: self.node_ids.clone(),
             positions: self.positions.clone(),
+            attributes: None,
         }]
     }
 }
@@ -52,7 +53,7 @@ impl HaloProvider for FixedHaloProvider {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn exchange_halo_round_trips_boundary_positions() {
     // Two-worker partition of path(6): part 0 owns {0,1,2}, part 1 owns {3,4,5}.
-    let parts = partition_csr(&CsrGraph::path(6), 2);
+    let parts = partition_csr(&CsrGraph::path(6), None, 2);
     assert_eq!(parts.len(), 2);
     let p1 = &parts[1];
     assert!(
@@ -115,6 +116,7 @@ async fn exchange_halo_round_trips_boundary_positions() {
         owner_id: p0.partition_id,
         node_ids: vec![p0_boundary],
         positions: vec![9.0, 9.0, 9.0],
+        attributes: None,
     }
     .encode_bytes();
     let request = HaloDelta {
@@ -122,6 +124,7 @@ async fn exchange_halo_round_trips_boundary_positions() {
         owner_id: p0.partition_id,
         node_ids: out_node_ids,
         positions: out_positions,
+        attributes: None,
     };
 
     let req_stream = tokio_stream::once(request);
@@ -139,7 +142,7 @@ async fn exchange_halo_round_trips_boundary_positions() {
 
     // Decode the reply and assert it is partition 1's boundary delta, intact.
     let decoded =
-        HostHaloDelta::decode_bytes(reply.frame, reply.owner_id, &reply.node_ids, &reply.positions)
+        HostHaloDelta::decode_bytes(reply.frame, reply.owner_id, &reply.node_ids, &reply.positions, reply.attributes)
             .expect("decode reply HaloDelta");
     assert_eq!(decoded.frame, 7, "reply must echo the request frame");
     assert_eq!(decoded.owner_id, p1.partition_id);
