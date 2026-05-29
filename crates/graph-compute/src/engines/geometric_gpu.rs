@@ -43,6 +43,7 @@ struct GeometricParamsRaw {
     cutoff_scale: f32,
 }
 
+#[allow(dead_code)]
 struct Gpu {
     device: Arc<wgpu::Device>,
     queue: Arc<wgpu::Queue>,
@@ -471,8 +472,6 @@ impl OctreeBuild {
             if child_node.meta[0] != OCT_BODY_INTERNAL {
                 if self.nodes.len() as u32 >= capacity { return; }
                 let old_body = child_node.meta[0];
-                let old_pos = &positions[4 * old_body as usize..4 * old_body as usize + 3];
-                let old_mass = mass[old_body as usize];
                 
                 self.nodes[child as usize].meta[0] = OCT_BODY_INTERNAL;
                 self.nodes[child as usize].com_mass = [0.0, 0.0, 0.0, 0.0];

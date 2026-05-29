@@ -121,7 +121,10 @@ fn build_gpu_ctx() -> anyhow::Result<GpuCtx> {
         &wgpu::DeviceDescriptor {
             label: Some("graph-compute-device"),
             required_features: wgpu::Features::empty(),
-            required_limits: wgpu::Limits::default(),
+            required_limits: wgpu::Limits {
+                max_storage_buffers_per_shader_stage: 12,
+                ..wgpu::Limits::default()
+            },
             memory_hints: wgpu::MemoryHints::default(),
         },
         None,

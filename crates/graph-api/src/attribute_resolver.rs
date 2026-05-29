@@ -171,7 +171,7 @@ impl CategoricalEncoder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use vault_data::{NodeMeta, NodeMetrics, VaultNode, VaultGraph};
+    use vault_data::{NodeMetrics, VaultNode, VaultGraph};
     use std::collections::HashMap;
 
     #[test]
