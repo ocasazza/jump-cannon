@@ -100,12 +100,13 @@ impl Default for SgdStressSettings {
 /// SplitMix64 — a tiny, allocation-free PRNG used for pivot selection and pair
 /// sampling so this engine needs no `rand` dependency. (Vigna, "Further
 /// scramblings of Marsaglia's xorshift generators".) Deterministic given `seed`.
-struct SplitMix64 {
+/// Shared with the GPU port ([`super::sgd_stress_gpu`]) for identical pivots.
+pub(crate) struct SplitMix64 {
     state: u64,
 }
 
 impl SplitMix64 {
-    fn new(seed: u64) -> Self {
+    pub(crate) fn new(seed: u64) -> Self {
         Self { state: seed }
     }
 
@@ -118,16 +119,56 @@ impl SplitMix64 {
     }
 
     /// Uniform `usize` in `[0, n)` (n > 0).
-    fn below(&mut self, n: usize) -> usize {
+    pub(crate) fn below(&mut self, n: usize) -> usize {
         (self.next_u64() % (n as u64)) as usize
     }
 }
 
 /// Per-pivot distance row: `dist[v]` is the BFS distance from this pivot to node
 /// `v`, or `u32::MAX` if `v` is unreachable.
-struct PivotRow {
-    pivot: u32,
-    dist: Vec<u32>,
+pub(crate) struct PivotRow {
+    pub(crate) pivot: u32,
+    pub(crate) dist: Vec<u32>,
+}
+
+/// Choose `k = clamp(n_pivots, 1..=n)` landmark pivots via maxmin
+/// farthest-point sampling (Ortmann et al.): random first pivot, then
+/// iteratively the node maximizing its minimum distance to the chosen set.
+/// Each returned row carries the pivot's full BFS distance vector.
+///
+/// `rng` is advanced in place so the CPU engine can keep using it for pair
+/// sampling afterward (preserving its exact stochastic sequence); the GPU port
+/// passes a throwaway rng. Shared between both engines so they pick identical
+/// pivots for a given seed.
+pub(crate) fn select_pivots(g: &CsrGraph, n_pivots: u32, rng: &mut SplitMix64) -> Vec<PivotRow> {
+    let n = g.n_nodes as usize;
+    let k = (n_pivots as usize).clamp(if n == 0 { 0 } else { 1 }, n);
+    let mut pivots: Vec<PivotRow> = Vec::with_capacity(k);
+    if n == 0 || k == 0 {
+        return pivots;
+    }
+
+    let mut min_dist_to_pivots = vec![u32::MAX; n];
+    let mut next_pivot = rng.below(n) as u32;
+    for _ in 0..k {
+        let dist = bfs_distances(g, next_pivot);
+        let mut best_node = next_pivot;
+        let mut best_dist = 0u32;
+        for v in 0..n {
+            let d = dist[v];
+            if d != u32::MAX && d < min_dist_to_pivots[v] {
+                min_dist_to_pivots[v] = d;
+            }
+            let cover = min_dist_to_pivots[v];
+            if cover != u32::MAX && cover > best_dist {
+                best_dist = cover;
+                best_node = v as u32;
+            }
+        }
+        pivots.push(PivotRow { pivot: next_pivot, dist });
+        next_pivot = best_node;
+    }
+    pivots
 }
 
 /// Initialized solver state, built once at `init`.
@@ -212,44 +253,11 @@ impl LayoutEngine for SgdStressEngine {
             ));
         }
 
+        // Maxmin farthest-point pivot selection (shared with the GPU port). The
+        // rng is advanced past selection and then reused for pair sampling, so
+        // this engine's stochastic sequence is exactly as before the refactor.
         let mut rng = SplitMix64::new(self.settings.seed);
-
-        // ---- Choose pivots via maxmin farthest-point sampling -------------
-        // (Ortmann et al.): pick a random first pivot, then iteratively add the
-        // node that maximizes its minimum distance to the already-chosen pivots.
-        // Spreads landmarks across the graph far better than uniform-random.
-        let k = (self.settings.n_pivots as usize).clamp(if n == 0 { 0 } else { 1 }, n);
-        let mut pivots: Vec<PivotRow> = Vec::with_capacity(k);
-
-        if n > 0 && k > 0 {
-            // `min_dist_to_pivots[v]` = shortest BFS distance from v to any chosen
-            // pivot so far (u32::MAX before any pivot covers it).
-            let mut min_dist_to_pivots = vec![u32::MAX; n];
-            let mut next_pivot = rng.below(n) as u32;
-
-            for _ in 0..k {
-                let dist = bfs_distances(g, next_pivot);
-                // Fold this pivot's distances into the running minimum and find
-                // the farthest still-reachable node to serve as the next pivot.
-                let mut best_node = next_pivot;
-                let mut best_dist = 0u32;
-                for v in 0..n {
-                    let d = dist[v];
-                    if d != u32::MAX && d < min_dist_to_pivots[v] {
-                        min_dist_to_pivots[v] = d;
-                    }
-                    // Candidate = node currently worst-covered (largest min dist,
-                    // ignoring the unreachable sentinel).
-                    let cover = min_dist_to_pivots[v];
-                    if cover != u32::MAX && cover > best_dist {
-                        best_dist = cover;
-                        best_node = v as u32;
-                    }
-                }
-                pivots.push(PivotRow { pivot: next_pivot, dist });
-                next_pivot = best_node;
-            }
-        }
+        let pivots = select_pivots(g, self.settings.n_pivots, &mut rng);
 
         self.state = Some(State {
             n,
@@ -310,7 +318,7 @@ impl LayoutEngine for SgdStressEngine {
 /// s_gd2 step-size schedule: anneal `η` exponentially from `eta_max` to
 /// `eta_min` over `n_anneal_steps` sweeps, then hold at `eta_min`.
 /// (Zheng/Pawar/Goodman use `η_t = η_max · (η_min/η_max)^(t/T)`.)
-fn anneal_eta(sweep: u64, eta_max: f32, eta_min: f32, n_anneal_steps: u32) -> f32 {
+pub(crate) fn anneal_eta(sweep: u64, eta_max: f32, eta_min: f32, n_anneal_steps: u32) -> f32 {
     if n_anneal_steps == 0 {
         return eta_min;
     }
@@ -358,7 +366,7 @@ fn sgd_pair_update(positions: &mut [f32], i: usize, j: usize, d_ij: f32, eta: f3
 /// `u32::MAX` marks nodes unreachable from `source` (different component).
 /// O(n + m). This is the per-pivot shortest-path primitive of the sparse-stress
 /// model (Ortmann et al.).
-fn bfs_distances(graph: &CsrGraph, source: u32) -> Vec<u32> {
+pub(crate) fn bfs_distances(graph: &CsrGraph, source: u32) -> Vec<u32> {
     let n = graph.n_nodes as usize;
     let mut dist = vec![u32::MAX; n];
     if n == 0 {
