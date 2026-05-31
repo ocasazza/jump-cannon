@@ -150,22 +150,24 @@ fn fcose_quality() -> impl Strategy<Value = FcoseQuality> {
 }
 
 fn fcose_settings() -> impl Strategy<Value = FcoseSettings> {
-    (100.0f64..=10_000.0, 10.0f64..=300.0, 0.0f64..=100.0, fcose_quality()).prop_map(
-        |(node_repulsion, ideal_edge_length, node_overlap, quality)| FcoseSettings {
+    (100.0f64..=10_000.0, 10.0f64..=300.0, 0.0f64..=100.0, fcose_quality(), any::<u64>()).prop_map(
+        |(node_repulsion, ideal_edge_length, node_overlap, quality, seed)| FcoseSettings {
             node_repulsion,
             ideal_edge_length,
             node_overlap,
             quality,
+            seed,
         },
     )
 }
 
 fn cose_bilkent_settings() -> impl Strategy<Value = CoseBilkentSettings> {
-    (100.0f64..=10_000.0, 10.0f64..=300.0, 0u32..=120).prop_map(
-        |(node_repulsion, ideal_edge_length, iterations)| CoseBilkentSettings {
+    (100.0f64..=10_000.0, 10.0f64..=300.0, 0u32..=120, any::<u64>()).prop_map(
+        |(node_repulsion, ideal_edge_length, iterations, seed)| CoseBilkentSettings {
             node_repulsion,
             ideal_edge_length,
             iterations,
+            seed,
         },
     )
 }
@@ -302,21 +304,20 @@ proptest! {
         prop_assert!(r_xy >= 0.0);
     }
 
-    // fcose / cose_bilkent seed from `thread_rng`, so they are not
-    // deterministic run-to-run — we assert only the finite-output invariant
-    // (no NaN/Inf, correct length, no panic). Small N keeps the O(n²) force
-    // loops fast.
+    // fcose / cose_bilkent now seed from a fixed `seed` (StdRng), so they are
+    // deterministic: assert full determinism + finiteness. Small N keeps the
+    // O(n²) force loops fast.
     #[test]
     fn fuzz_fcose(s in fcose_settings(), n in tiny_n()) {
         let g = path_graph(n);
-        let out = FcoseLayout::solve(&s, &g).map_err(|e| TestCaseError::fail(format!("fcose solve: {e}")))?;
+        let out = assert_deterministic(&s, &g, FcoseLayout::solve, "fcose").map_err(TestCaseError::fail)?;
         assert_finite(&out, n, "fcose").map_err(TestCaseError::fail)?;
     }
 
     #[test]
     fn fuzz_cose_bilkent(s in cose_bilkent_settings(), n in tiny_n()) {
         let g = path_graph(n);
-        let out = CoseBilkentLayout::solve(&s, &g).map_err(|e| TestCaseError::fail(format!("cose_bilkent solve: {e}")))?;
+        let out = assert_deterministic(&s, &g, CoseBilkentLayout::solve, "cose_bilkent").map_err(TestCaseError::fail)?;
         assert_finite(&out, n, "cose_bilkent").map_err(TestCaseError::fail)?;
     }
 

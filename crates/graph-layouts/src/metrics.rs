@@ -94,6 +94,41 @@ pub fn edge_length_cv(positions: &[f32], edges: &[(u32, u32)]) -> f32 {
     (var.sqrt() / mean) as f32
 }
 
+/// Number of pairs of edges whose 2D (xy) segments properly cross. Edges that
+/// share an endpoint are never counted. O(E²) — intended for small/medium
+/// graphs or on-demand use. Fewer crossings is the canonical readability
+/// aesthetic (Purchase). Collinear/touching-only cases are treated as
+/// non-crossing (strict proper-intersection test).
+pub fn edge_crossings(positions: &[f32], edges: &[(u32, u32)]) -> u32 {
+    fn pt(positions: &[f32], i: u32) -> (f64, f64) {
+        (positions[3 * i as usize] as f64, positions[3 * i as usize + 1] as f64)
+    }
+    // Signed area of triangle (a, b, c); sign = orientation.
+    fn ccw(a: (f64, f64), b: (f64, f64), c: (f64, f64)) -> f64 {
+        (b.0 - a.0) * (c.1 - a.1) - (b.1 - a.1) * (c.0 - a.0)
+    }
+    let mut count = 0u32;
+    for i in 0..edges.len() {
+        let (a0, a1) = edges[i];
+        let (p1, p2) = (pt(positions, a0), pt(positions, a1));
+        for &(b0, b1) in edges.iter().skip(i + 1) {
+            if a0 == b0 || a0 == b1 || a1 == b0 || a1 == b1 {
+                continue; // shared endpoint — adjacent, not a crossing
+            }
+            let (p3, p4) = (pt(positions, b0), pt(positions, b1));
+            let d1 = ccw(p3, p4, p1);
+            let d2 = ccw(p3, p4, p2);
+            let d3 = ccw(p1, p2, p3);
+            let d4 = ccw(p1, p2, p4);
+            // Proper crossing: each segment straddles the other's line.
+            if (d1 > 0.0) != (d2 > 0.0) && (d3 > 0.0) != (d4 > 0.0) {
+                count += 1;
+            }
+        }
+    }
+    count
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -131,5 +166,30 @@ mod tests {
         let pos = [0.0, 0.0, 0.0, 2.0, 0.0, 0.0, 1.0, 3.0f32.sqrt(), 0.0];
         let edges = [(0u32, 1u32), (1, 2), (2, 0)];
         assert!(edge_length_cv(&pos, &edges) < 1e-4);
+    }
+
+    #[test]
+    fn crossing_diagonals_count_one() {
+        // A(0,0) B(2,2) C(2,0) D(0,2): edges A-B and C-D are the two diagonals
+        // of a square → they cross once, sharing no endpoint.
+        let pos = [0.0, 0.0, 0.0, 2.0, 2.0, 0.0, 2.0, 0.0, 0.0, 0.0, 2.0, 0.0];
+        let edges = [(0u32, 1u32), (2, 3)];
+        assert_eq!(edge_crossings(&pos, &edges), 1);
+    }
+
+    #[test]
+    fn parallel_edges_no_crossing() {
+        // Two horizontal, vertically-offset segments — never cross.
+        let pos = [0.0, 0.0, 0.0, 2.0, 0.0, 0.0, 0.0, 1.0, 0.0, 2.0, 1.0, 0.0];
+        let edges = [(0u32, 1u32), (2, 3)];
+        assert_eq!(edge_crossings(&pos, &edges), 0);
+    }
+
+    #[test]
+    fn adjacent_edges_not_counted() {
+        // Two edges sharing endpoint 0 — adjacent, never a crossing.
+        let pos = [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0];
+        let edges = [(0u32, 1u32), (0, 2)];
+        assert_eq!(edge_crossings(&pos, &edges), 0);
     }
 }

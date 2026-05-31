@@ -8,7 +8,8 @@
 
 use std::collections::HashMap;
 
-use rand::Rng;
+use rand::rngs::StdRng;
+use rand::{Rng, SeedableRng};
 use serde::{Deserialize, Serialize};
 
 use crate::layout::layout_trait::{
@@ -22,6 +23,14 @@ pub struct CoseBilkentSettings {
     pub ideal_edge_length: f64,
     /// Force-iteration count (the legacy engine hard-coded 50).
     pub iterations: u32,
+    /// Seed for the initial-placement RNG — fixed for reproducible layouts
+    /// (consistent with `random`/`sphere`).
+    #[serde(default = "default_cose_bilkent_seed")]
+    pub seed: u64,
+}
+
+fn default_cose_bilkent_seed() -> u64 {
+    0x5EED_C05E
 }
 
 impl Default for CoseBilkentSettings {
@@ -30,6 +39,7 @@ impl Default for CoseBilkentSettings {
             node_repulsion: 4500.0,
             ideal_edge_length: 50.0,
             iterations: 50,
+            seed: default_cose_bilkent_seed(),
         }
     }
 }
@@ -68,8 +78,9 @@ impl StaticLayout for CoseBilkentLayout {
             .map(|(i, id)| (id.as_str(), i))
             .collect();
 
-        // Seed positions in a disc of radius 100 (matches the legacy engine).
-        let mut rng = rand::thread_rng();
+        // Seed positions in a disc of radius 100, from a fixed seed for
+        // reproducibility.
+        let mut rng = StdRng::seed_from_u64(settings.seed);
         let mut pos: Vec<(f64, f64)> = Vec::with_capacity(n);
         for _ in 0..n {
             let angle = rng.gen::<f64>() * 2.0 * std::f64::consts::PI;

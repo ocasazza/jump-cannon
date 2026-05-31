@@ -9,7 +9,8 @@
 
 use std::collections::HashMap;
 
-use rand::Rng;
+use rand::rngs::StdRng;
+use rand::{Rng, SeedableRng};
 use serde::{Deserialize, Serialize};
 
 use crate::layout::layout_trait::{
@@ -43,6 +44,15 @@ pub struct FcoseSettings {
     pub ideal_edge_length: f64,
     pub node_overlap: f64,
     pub quality: FcoseQuality,
+    /// Seed for the initial-placement RNG. Fixed (not `thread_rng`) so the
+    /// layout is reproducible run-to-run — consistent with the other seeded
+    /// static layouts (`random`, `sphere`).
+    #[serde(default = "default_fcose_seed")]
+    pub seed: u64,
+}
+
+fn default_fcose_seed() -> u64 {
+    0x5EED_F0CE
 }
 
 impl Default for FcoseSettings {
@@ -52,6 +62,7 @@ impl Default for FcoseSettings {
             ideal_edge_length: 50.0,
             node_overlap: 10.0,
             quality: FcoseQuality::Default,
+            seed: default_fcose_seed(),
         }
     }
 }
@@ -92,8 +103,9 @@ impl StaticLayout for FcoseLayout {
             .map(|(i, id)| (id.as_str(), i))
             .collect();
 
-        // Seed positions in a disc of radius 100 (matches the legacy engine).
-        let mut rng = rand::thread_rng();
+        // Seed positions in a disc of radius 100 (matches the legacy engine),
+        // from a fixed seed so the layout is reproducible.
+        let mut rng = StdRng::seed_from_u64(settings.seed);
         let mut pos: Vec<(f64, f64)> = Vec::with_capacity(n);
         for _ in 0..n {
             let angle = rng.gen::<f64>() * 2.0 * std::f64::consts::PI;
