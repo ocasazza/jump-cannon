@@ -2026,44 +2026,6 @@ impl App {
     /// metrics always; the O(n²) full-stress pass only when explicitly requested
     /// AND the graph is small enough to keep the UI responsive.
     fn drain_metrics_request(&mut self, frame: &mut eframe::Frame) {
-        // Local: all-pairs scale-normalized stress via BFS over the edge list.
-        fn all_pairs_normalized_stress(positions: &[f32], edges: &[(u32, u32)], n: usize) -> f32 {
-            let mut adj: Vec<Vec<u32>> = vec![Vec::new(); n];
-            for &(a, b) in edges {
-                let (a, b) = (a as usize, b as usize);
-                if a < n && b < n {
-                    adj[a].push(b as u32);
-                    adj[b].push(a as u32);
-                }
-            }
-            let mut terms: Vec<(u32, u32, f32)> = Vec::new();
-            let mut dist = vec![u32::MAX; n];
-            let mut q: std::collections::VecDeque<u32> = std::collections::VecDeque::new();
-            for s in 0..n {
-                for d in dist.iter_mut() {
-                    *d = u32::MAX;
-                }
-                dist[s] = 0;
-                q.clear();
-                q.push_back(s as u32);
-                while let Some(v) = q.pop_front() {
-                    let dv = dist[v as usize];
-                    for &u in &adj[v as usize] {
-                        if dist[u as usize] == u32::MAX {
-                            dist[u as usize] = dv + 1;
-                            q.push_back(u);
-                        }
-                    }
-                }
-                for (t, &dst) in dist.iter().enumerate().skip(s + 1) {
-                    if dst != u32::MAX && dst != 0 {
-                        terms.push((s as u32, t as u32, dst as f32));
-                    }
-                }
-            }
-            graph_layouts::metrics::scale_normalized_stress(positions, &terms)
-        }
-
         // Live mode recomputes the cheap (edge-based) metrics every frame.
         let want = std::mem::take(&mut self.state.metrics.compute_requested) || self.state.metrics.auto;
         let want_full = std::mem::take(&mut self.state.metrics.compute_full_requested);
@@ -2085,11 +2047,10 @@ impl App {
             edges.chunks_exact(2).map(|c| (c[0], c[1])).collect();
 
         // Cheap, O(E): edge-length CV + edge-only scale-normalized stress
-        // (unit target distance per edge).
+        // (uniform unit target — no per-frame terms allocation).
         let edge_length_cv = graph_layouts::metrics::edge_length_cv(positions, &edge_pairs);
-        let edge_terms: Vec<(u32, u32, f32)> =
-            edge_pairs.iter().map(|&(a, b)| (a, b, 1.0)).collect();
-        let edge_stress = graph_layouts::metrics::scale_normalized_stress(positions, &edge_terms);
+        let edge_stress =
+            graph_layouts::metrics::scale_normalized_stress_uniform(positions, &edge_pairs);
 
         // Expensive metrics (O(n²) stress, O(E²) crossings) only on the explicit
         // "+ full stress" request, each gated by size; otherwise preserve the
@@ -2098,7 +2059,11 @@ impl App {
         const MAX_CROSSING_EDGES: usize = 20_000;
         let (full_stress, crossings) = if want_full {
             let fs = if n > 0 && n <= MAX_FULL_NODES {
-                Some(all_pairs_normalized_stress(positions, &edge_pairs, n))
+                Some(graph_layouts::metrics::all_pairs_normalized_stress(
+                    positions,
+                    &edge_pairs,
+                    n,
+                ))
             } else {
                 None
             };

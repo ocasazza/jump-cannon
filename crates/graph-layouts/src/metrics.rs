@@ -75,6 +75,75 @@ pub fn stress(positions: &[f32], terms: &[(u32, u32, f32)]) -> f32 {
     s as f32
 }
 
+/// Scale-normalized stress over `edges` with a UNIFORM target distance of 1
+/// (every edge "wants" the same length). Identical to [`scale_normalized_stress`]
+/// with all `d_ij = 1`, but without materializing a terms vector — for the cheap
+/// per-frame edge-stress readout.
+pub fn scale_normalized_stress_uniform(positions: &[f32], edges: &[(u32, u32)]) -> f32 {
+    // d = 1, w = 1/d² = 1 for every edge ⇒ sum w*d² = edge count.
+    let (mut num, mut den) = (0.0f64, 0.0f64);
+    for &(i, j) in edges {
+        let big = euclid(positions, i as usize, j as usize);
+        num += big; // Σ w·d·D = Σ D
+        den += big * big; // Σ w·D² = Σ D²
+    }
+    let m = edges.len() as f64;
+    if den <= 0.0 || m <= 0.0 {
+        return 0.0;
+    }
+    let alpha = num / den;
+    let mut s = 0.0f64;
+    for &(i, j) in edges {
+        let r = alpha * euclid(positions, i as usize, j as usize) - 1.0;
+        s += r * r;
+    }
+    (s / m) as f32
+}
+
+/// Scale-normalized stress over ALL node pairs, with target distances = graph
+/// (hop) distances found by BFS from every node over `edges`. O(n²); the caller
+/// gates by size. Unreachable / self pairs are skipped. Shared by the renderer's
+/// on-demand "full stress" readout and the solver tests.
+pub fn all_pairs_normalized_stress(positions: &[f32], edges: &[(u32, u32)], n: usize) -> f32 {
+    if n == 0 {
+        return 0.0;
+    }
+    let mut adj: Vec<Vec<u32>> = vec![Vec::new(); n];
+    for &(a, b) in edges {
+        let (a, b) = (a as usize, b as usize);
+        if a < n && b < n {
+            adj[a].push(b as u32);
+            adj[b].push(a as u32);
+        }
+    }
+    let mut terms: Vec<(u32, u32, f32)> = Vec::new();
+    let mut dist = vec![u32::MAX; n];
+    let mut q: std::collections::VecDeque<u32> = std::collections::VecDeque::new();
+    for s in 0..n {
+        for d in dist.iter_mut() {
+            *d = u32::MAX;
+        }
+        dist[s] = 0;
+        q.clear();
+        q.push_back(s as u32);
+        while let Some(v) = q.pop_front() {
+            let dv = dist[v as usize];
+            for &u in &adj[v as usize] {
+                if dist[u as usize] == u32::MAX {
+                    dist[u as usize] = dv + 1;
+                    q.push_back(u);
+                }
+            }
+        }
+        for (t, &dst) in dist.iter().enumerate().skip(s + 1) {
+            if dst != u32::MAX && dst != 0 {
+                terms.push((s as u32, t as u32, dst as f32));
+            }
+        }
+    }
+    scale_normalized_stress(positions, &terms)
+}
+
 /// Coefficient of variation of edge lengths (`stddev / mean`) over `edges`.
 /// `0` = all edges identical length (a common drawing-aesthetic goal); scale
 /// invariant. Returns `0.0` for fewer than two edges or a degenerate mean.
@@ -191,5 +260,24 @@ mod tests {
         let pos = [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0];
         let edges = [(0u32, 1u32), (0, 2)];
         assert_eq!(edge_crossings(&pos, &edges), 0);
+    }
+
+    #[test]
+    fn path_all_pairs_stress_is_zero() {
+        // Colinear path 0-1-2-3: every Euclidean distance equals the hop
+        // distance ⇒ all-pairs normalized stress is exactly 0.
+        let pos = [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 2.0, 0.0, 0.0, 3.0, 0.0, 0.0];
+        let edges = [(0u32, 1u32), (1, 2), (2, 3)];
+        assert!(all_pairs_normalized_stress(&pos, &edges, 4) < 1e-5);
+    }
+
+    #[test]
+    fn uniform_matches_terms_with_unit_distance() {
+        let pos = [0.0, 0.0, 0.0, 1.3, 0.4, 0.0, 2.1, -0.2, 0.0];
+        let edges = [(0u32, 1u32), (1, 2)];
+        let terms: Vec<(u32, u32, f32)> = edges.iter().map(|&(a, b)| (a, b, 1.0)).collect();
+        let uniform = scale_normalized_stress_uniform(&pos, &edges);
+        let viaterms = scale_normalized_stress(&pos, &terms);
+        assert!((uniform - viaterms).abs() < 1e-5, "{uniform} vs {viaterms}");
     }
 }

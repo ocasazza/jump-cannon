@@ -64,12 +64,6 @@ pub fn show(ui: &mut egui::Ui, state: &mut AppState) {
 }
 
 fn metric_row(ui: &mut egui::Ui, state: &mut AppState, m: MetricKind, snap: &MetricsSnapshot) {
-    let value = match m {
-        MetricKind::EdgeLengthCv => Some(snap.edge_length_cv),
-        MetricKind::EdgeStress => Some(snap.edge_stress),
-        MetricKind::FullStress => snap.full_stress,
-        MetricKind::Crossings => snap.crossings.map(|c| c as f32),
-    };
     let resp = ui
         .horizontal(|ui| {
             let pinned = state.metrics.pinned.contains(&m);
@@ -85,11 +79,13 @@ fn metric_row(ui: &mut egui::Ui, state: &mut AppState, m: MetricKind, snap: &Met
                 }
             }
             ui.label(m.label());
-            match value {
-                Some(v) if matches!(m, MetricKind::Crossings) => ui.monospace(format!("{}", v as u32)),
-                Some(v) => ui.monospace(format!("{v:.4}")),
-                None => ui.weak("— (press + full stress)"),
-            };
+            // Shared value/format logic lives on MetricKind (see state.rs).
+            let text = m.format_value(snap);
+            if m.value(snap).is_some() {
+                ui.monospace(text);
+            } else {
+                ui.weak(text);
+            }
         })
         .response;
     resp.on_hover_text(m.hint());

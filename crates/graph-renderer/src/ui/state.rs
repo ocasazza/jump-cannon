@@ -87,6 +87,29 @@ impl MetricKind {
             }
         }
     }
+
+    /// This metric's raw value from a snapshot, if computed. Crossings is
+    /// surfaced through the same `f32` channel; [`format_value`](Self::format_value)
+    /// renders it as an integer.
+    pub fn value(self, snap: &MetricsSnapshot) -> Option<f32> {
+        match self {
+            MetricKind::EdgeLengthCv => Some(snap.edge_length_cv),
+            MetricKind::EdgeStress => Some(snap.edge_stress),
+            MetricKind::FullStress => snap.full_stress,
+            MetricKind::Crossings => snap.crossings.map(|c| c as f32),
+        }
+    }
+
+    /// Display string for this metric's value, or `"—"` when not yet computed.
+    /// Crossings render as an integer; everything else as a 3-decimal float.
+    /// Single source of truth shared by the panel and the always-on HUD.
+    pub fn format_value(self, snap: &MetricsSnapshot) -> String {
+        match self.value(snap) {
+            None => "—".to_string(),
+            Some(v) if matches!(self, MetricKind::Crossings) => format!("{}", v as u32),
+            Some(v) => format!("{v:.3}"),
+        }
+    }
 }
 
 /// Latest computed layout-quality values for the active layout.
