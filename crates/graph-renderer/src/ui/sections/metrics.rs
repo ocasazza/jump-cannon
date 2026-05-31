@@ -25,13 +25,15 @@ pub fn show(ui: &mut egui::Ui, state: &mut AppState) {
         }
         if ui
             .button("+ full stress")
-            .on_hover_text("Also compute all-pairs scale-normalized stress (O(n²); small graphs only)")
+            .on_hover_text("Also compute all-pairs stress (O(n²)) and crossings (O(E²)); small graphs only")
             .clicked()
         {
             state.metrics.compute_requested = true;
             state.metrics.compute_full_requested = true;
         }
     });
+    ui.checkbox(&mut state.metrics.auto, "Live")
+        .on_hover_text("Recompute the cheap (edge-based) metrics every frame");
     subgroup_separator(ui);
 
     let Some(snap) = state.metrics.last else {
@@ -66,6 +68,7 @@ fn metric_row(ui: &mut egui::Ui, state: &mut AppState, m: MetricKind, snap: &Met
         MetricKind::EdgeLengthCv => Some(snap.edge_length_cv),
         MetricKind::EdgeStress => Some(snap.edge_stress),
         MetricKind::FullStress => snap.full_stress,
+        MetricKind::Crossings => snap.crossings.map(|c| c as f32),
     };
     let resp = ui
         .horizontal(|ui| {
@@ -83,6 +86,7 @@ fn metric_row(ui: &mut egui::Ui, state: &mut AppState, m: MetricKind, snap: &Met
             }
             ui.label(m.label());
             match value {
+                Some(v) if matches!(m, MetricKind::Crossings) => ui.monospace(format!("{}", v as u32)),
                 Some(v) => ui.monospace(format!("{v:.4}")),
                 None => ui.weak("— (press + full stress)"),
             };

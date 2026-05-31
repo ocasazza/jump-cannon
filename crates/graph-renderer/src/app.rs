@@ -2064,7 +2064,8 @@ impl App {
             graph_layouts::metrics::scale_normalized_stress(positions, &terms)
         }
 
-        let want = std::mem::take(&mut self.state.metrics.compute_requested);
+        // Live mode recomputes the cheap (edge-based) metrics every frame.
+        let want = std::mem::take(&mut self.state.metrics.compute_requested) || self.state.metrics.auto;
         let want_full = std::mem::take(&mut self.state.metrics.compute_full_requested);
         if !want {
             return;
@@ -2090,17 +2091,26 @@ impl App {
             edge_pairs.iter().map(|&(a, b)| (a, b, 1.0)).collect();
         let edge_stress = graph_layouts::metrics::scale_normalized_stress(positions, &edge_terms);
 
-        // Full all-pairs scale-normalized stress: O(n²) BFS, gated by node count.
+        // Expensive metrics (O(n²) stress, O(E²) crossings) only on the explicit
+        // "+ full stress" request, each gated by size; otherwise preserve the
+        // last computed values across cheap/auto recomputes.
         const MAX_FULL_NODES: usize = 2000;
-        let full_stress = if want_full {
-            if n > 0 && n <= MAX_FULL_NODES {
+        const MAX_CROSSING_EDGES: usize = 20_000;
+        let (full_stress, crossings) = if want_full {
+            let fs = if n > 0 && n <= MAX_FULL_NODES {
                 Some(all_pairs_normalized_stress(positions, &edge_pairs, n))
             } else {
                 None
-            }
+            };
+            let cr = if edge_pairs.len() <= MAX_CROSSING_EDGES {
+                Some(graph_layouts::metrics::edge_crossings(positions, &edge_pairs))
+            } else {
+                None
+            };
+            (fs, cr)
         } else {
-            // Preserve any previously-computed full value across cheap recomputes.
-            self.state.metrics.last.and_then(|s| s.full_stress)
+            let prev = self.state.metrics.last;
+            (prev.and_then(|s| s.full_stress), prev.and_then(|s| s.crossings))
         };
 
         self.state.metrics.last = Some(crate::ui::state::MetricsSnapshot {
@@ -2109,6 +2119,7 @@ impl App {
             edge_length_cv,
             edge_stress,
             full_stress,
+            crossings,
         });
     }
 

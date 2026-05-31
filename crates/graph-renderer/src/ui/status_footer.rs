@@ -170,6 +170,44 @@ pub fn show_tray(ctx: &egui::Context, state: &mut AppState, progress: &Progress)
                         {
                             state.toggle_canvas_mount();
                         }
+
+                        // Pinned-metrics HUD — always visible. Shows the user's
+                        // pinned layout-quality metrics from the last computed
+                        // snapshot (right_to_left: add separator first so it sits
+                        // just left of the view-controls, then labels in reverse
+                        // so they read left-to-right in pin order).
+                        let pinned = state.metrics.pinned.clone();
+                        if !pinned.is_empty() {
+                            ui.add_space(4.0);
+                            ui.separator();
+                            ui.add_space(4.0);
+                            let snap = state.metrics.last;
+                            for m in pinned.iter().rev() {
+                                use crate::ui::state::MetricKind;
+                                let txt = match snap {
+                                    None => format!("{}: —", m.label()),
+                                    Some(s) => match m {
+                                        MetricKind::EdgeLengthCv => {
+                                            format!("{}: {:.3}", m.label(), s.edge_length_cv)
+                                        }
+                                        MetricKind::EdgeStress => {
+                                            format!("{}: {:.3}", m.label(), s.edge_stress)
+                                        }
+                                        MetricKind::FullStress => s.full_stress.map_or_else(
+                                            || format!("{}: —", m.label()),
+                                            |v| format!("{}: {:.3}", m.label(), v),
+                                        ),
+                                        MetricKind::Crossings => s.crossings.map_or_else(
+                                            || format!("{}: —", m.label()),
+                                            |v| format!("{}: {}", m.label(), v),
+                                        ),
+                                    },
+                                };
+                                ui.label(
+                                    egui::RichText::new(txt).size(10.0).color(palette::TEXT),
+                                );
+                            }
+                        }
                     },
                 );
             });

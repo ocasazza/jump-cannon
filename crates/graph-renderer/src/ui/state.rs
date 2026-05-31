@@ -49,17 +49,23 @@ pub enum MetricKind {
     EdgeLengthCv,
     EdgeStress,
     FullStress,
+    Crossings,
 }
 
 impl MetricKind {
-    pub const ALL: &'static [MetricKind] =
-        &[MetricKind::EdgeLengthCv, MetricKind::EdgeStress, MetricKind::FullStress];
+    pub const ALL: &'static [MetricKind] = &[
+        MetricKind::EdgeLengthCv,
+        MetricKind::EdgeStress,
+        MetricKind::FullStress,
+        MetricKind::Crossings,
+    ];
 
     pub fn label(self) -> &'static str {
         match self {
             MetricKind::EdgeLengthCv => "Edge-length CV",
             MetricKind::EdgeStress => "Edge stress (norm.)",
             MetricKind::FullStress => "Full stress (norm.)",
+            MetricKind::Crossings => "Edge crossings",
         }
     }
 
@@ -75,6 +81,10 @@ impl MetricKind {
                 "Scale-normalized stress over ALL node pairs (graph-theoretic distances). \
                  O(n²) — computed on demand and only for small graphs."
             }
+            MetricKind::Crossings => {
+                "Number of edge pairs that cross in 2D — fewer is more readable. \
+                 O(E²), so computed on demand alongside full stress."
+            }
         }
     }
 }
@@ -89,6 +99,8 @@ pub struct MetricsSnapshot {
     /// `None` until a full-stress compute is requested (and the graph is small
     /// enough that the O(n²) pass is allowed).
     pub full_stress: Option<f32>,
+    /// Edge-crossing count — `None` until the on-demand O(E²) pass runs.
+    pub crossings: Option<u32>,
 }
 
 /// Metrics-panel state: pinned metrics (persisted) + last computed snapshot +
@@ -100,6 +112,9 @@ pub struct MetricsState {
     pub pinned: Vec<MetricKind>,
     #[serde(default)]
     pub last: Option<MetricsSnapshot>,
+    /// Live mode: recompute the cheap (edge-based) metrics every frame.
+    #[serde(default)]
+    pub auto: bool,
     #[serde(default, skip)]
     pub compute_requested: bool,
     #[serde(default, skip)]
