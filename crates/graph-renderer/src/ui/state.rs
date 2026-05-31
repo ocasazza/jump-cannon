@@ -16,6 +16,7 @@ pub enum Section {
     Camera,
     Instances,
     Debug,
+    Metrics,
 }
 
 impl Section {
@@ -26,6 +27,7 @@ impl Section {
         Section::Camera,
         Section::Instances,
         Section::Debug,
+        Section::Metrics,
     ];
 
     pub fn title(self) -> &'static str {
@@ -36,8 +38,72 @@ impl Section {
             Section::Camera => "Camera",
             Section::Instances => "Instances",
             Section::Debug => "Debug",
+            Section::Metrics => "Metrics",
         }
     }
+}
+
+/// A layout-quality metric the Metrics panel can display and pin.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum MetricKind {
+    EdgeLengthCv,
+    EdgeStress,
+    FullStress,
+}
+
+impl MetricKind {
+    pub const ALL: &'static [MetricKind] =
+        &[MetricKind::EdgeLengthCv, MetricKind::EdgeStress, MetricKind::FullStress];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            MetricKind::EdgeLengthCv => "Edge-length CV",
+            MetricKind::EdgeStress => "Edge stress (norm.)",
+            MetricKind::FullStress => "Full stress (norm.)",
+        }
+    }
+
+    pub fn hint(self) -> &'static str {
+        match self {
+            MetricKind::EdgeLengthCv => {
+                "Coefficient of variation of edge lengths. 0 = perfectly uniform. Cheap, O(E)."
+            }
+            MetricKind::EdgeStress => {
+                "Scale-normalized stress over edges only (target distance 1). Cheap, O(E)."
+            }
+            MetricKind::FullStress => {
+                "Scale-normalized stress over ALL node pairs (graph-theoretic distances). \
+                 O(n²) — computed on demand and only for small graphs."
+            }
+        }
+    }
+}
+
+/// Latest computed layout-quality values for the active layout.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
+pub struct MetricsSnapshot {
+    pub n_nodes: u32,
+    pub n_edges: u32,
+    pub edge_length_cv: f32,
+    pub edge_stress: f32,
+    /// `None` until a full-stress compute is requested (and the graph is small
+    /// enough that the O(n²) pass is allowed).
+    pub full_stress: Option<f32>,
+}
+
+/// Metrics-panel state: pinned metrics (persisted) + last computed snapshot +
+/// one-shot request flags drained by `App::update` (mirrors
+/// `layout_solve_requested`). Request flags are `skip`-ped from persistence.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct MetricsState {
+    #[serde(default)]
+    pub pinned: Vec<MetricKind>,
+    #[serde(default)]
+    pub last: Option<MetricsSnapshot>,
+    #[serde(default, skip)]
+    pub compute_requested: bool,
+    #[serde(default, skip)]
+    pub compute_full_requested: bool,
 }
 
 /// Which view the Debug section is showing: the live frontend event log
@@ -752,6 +818,9 @@ pub struct AppState {
     pub camera: CameraState,
     pub focus: FocusState,
     pub cursor: CursorState,
+    /// Metrics-panel state (pinned metrics + last computed snapshot).
+    #[serde(default)]
+    pub metrics: MetricsState,
     #[serde(default)]
     pub workspace: WorkspaceSettings,
     /// Dockable workspace (tabs + splits) for the central panel. Default
@@ -1117,6 +1186,7 @@ impl Default for AppState {
             camera: CameraState::default(),
             focus: FocusState::default(),
             cursor: CursorState::default(),
+            metrics: MetricsState::default(),
             workspace: WorkspaceSettings::default(),
             dock: crate::ui::workspace::Workspace::default(),
             dock_tab_strip_force_show: false,

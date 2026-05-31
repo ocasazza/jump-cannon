@@ -3,6 +3,7 @@ pub mod debug;
 pub mod filter;
 pub mod instances;
 pub mod layout;
+pub mod metrics;
 pub mod style;
 
 use eframe::egui;
@@ -38,6 +39,7 @@ pub fn show(
         Section::Camera => camera::show(ui, state),
         Section::Instances => instances::show(ui, state, registry),
         Section::Debug => debug::show(ui, state, perf),
+        Section::Metrics => metrics::show(ui, state),
     }
     let _ = theme::accent::RED; // keep accent module referenced from here for tooling
 }

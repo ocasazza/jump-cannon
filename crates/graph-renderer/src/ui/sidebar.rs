@@ -97,6 +97,19 @@ pub(crate) fn draw_icon(painter: &egui::Painter, rect: egui::Rect, section: Sect
                 painter.rect_stroke(rect, 0.0, s);
             }
         }
+        // Metrics: a bar chart (three vertical bars + baseline).
+        Section::Metrics => {
+            let base = center.y + 7.0;
+            let bar = egui::Stroke::new(2.5, color);
+            for (i, h) in [6.0f32, 12.0, 9.0].iter().enumerate() {
+                let x = center.x - 6.0 + i as f32 * 6.0;
+                painter.line_segment([egui::pos2(x, base), egui::pos2(x, base - h)], bar);
+            }
+            painter.line_segment(
+                [egui::pos2(center.x - 9.0, base), egui::pos2(center.x + 8.0, base)],
+                egui::Stroke::new(1.0, color),
+            );
+        }
     }
 }
 

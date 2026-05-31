@@ -1539,6 +1539,10 @@ impl eframe::App for App {
         self.apply_layout_to_gpu(frame);
         self.perf.end_stage(StageId::LayoutDispatch);
 
+        // Metrics panel: drain its one-shot compute flag (no-op unless the user
+        // pressed Compute), reading positions/edges from the live pipeline.
+        self.drain_metrics_request(frame);
+
         // Remote-engine picker (Layout section) — drain one-shot intent
         // flags into async HTTP. Cheap no-op on the common frame where no
         // flag is set.
@@ -2014,6 +2018,98 @@ impl App {
                 }
             });
         }
+    }
+
+    /// Drain the Metrics-panel one-shot compute flags: read CPU positions +
+    /// edges from the live pipeline and compute layout-quality metrics into
+    /// `AppState`. Mirrors the `layout_solve_requested` pattern. Cheap edge
+    /// metrics always; the O(n²) full-stress pass only when explicitly requested
+    /// AND the graph is small enough to keep the UI responsive.
+    fn drain_metrics_request(&mut self, frame: &mut eframe::Frame) {
+        // Local: all-pairs scale-normalized stress via BFS over the edge list.
+        fn all_pairs_normalized_stress(positions: &[f32], edges: &[(u32, u32)], n: usize) -> f32 {
+            let mut adj: Vec<Vec<u32>> = vec![Vec::new(); n];
+            for &(a, b) in edges {
+                let (a, b) = (a as usize, b as usize);
+                if a < n && b < n {
+                    adj[a].push(b as u32);
+                    adj[b].push(a as u32);
+                }
+            }
+            let mut terms: Vec<(u32, u32, f32)> = Vec::new();
+            let mut dist = vec![u32::MAX; n];
+            let mut q: std::collections::VecDeque<u32> = std::collections::VecDeque::new();
+            for s in 0..n {
+                for d in dist.iter_mut() {
+                    *d = u32::MAX;
+                }
+                dist[s] = 0;
+                q.clear();
+                q.push_back(s as u32);
+                while let Some(v) = q.pop_front() {
+                    let dv = dist[v as usize];
+                    for &u in &adj[v as usize] {
+                        if dist[u as usize] == u32::MAX {
+                            dist[u as usize] = dv + 1;
+                            q.push_back(u);
+                        }
+                    }
+                }
+                for (t, &dst) in dist.iter().enumerate().skip(s + 1) {
+                    if dst != u32::MAX && dst != 0 {
+                        terms.push((s as u32, t as u32, dst as f32));
+                    }
+                }
+            }
+            graph_layouts::metrics::scale_normalized_stress(positions, &terms)
+        }
+
+        let want = std::mem::take(&mut self.state.metrics.compute_requested);
+        let want_full = std::mem::take(&mut self.state.metrics.compute_full_requested);
+        if !want {
+            return;
+        }
+
+        let Some(wgpu_state) = frame.wgpu_render_state() else {
+            return;
+        };
+        let renderer = wgpu_state.renderer.read();
+        let Some(pipes) = renderer.callback_resources.get::<GraphPipelines>() else {
+            return;
+        };
+        let positions = pipes.positions_cpu();
+        let edges = pipes.edges_cpu();
+        let n = positions.len() / 3;
+        let edge_pairs: Vec<(u32, u32)> =
+            edges.chunks_exact(2).map(|c| (c[0], c[1])).collect();
+
+        // Cheap, O(E): edge-length CV + edge-only scale-normalized stress
+        // (unit target distance per edge).
+        let edge_length_cv = graph_layouts::metrics::edge_length_cv(positions, &edge_pairs);
+        let edge_terms: Vec<(u32, u32, f32)> =
+            edge_pairs.iter().map(|&(a, b)| (a, b, 1.0)).collect();
+        let edge_stress = graph_layouts::metrics::scale_normalized_stress(positions, &edge_terms);
+
+        // Full all-pairs scale-normalized stress: O(n²) BFS, gated by node count.
+        const MAX_FULL_NODES: usize = 2000;
+        let full_stress = if want_full {
+            if n > 0 && n <= MAX_FULL_NODES {
+                Some(all_pairs_normalized_stress(positions, &edge_pairs, n))
+            } else {
+                None
+            }
+        } else {
+            // Preserve any previously-computed full value across cheap recomputes.
+            self.state.metrics.last.and_then(|s| s.full_stress)
+        };
+
+        self.state.metrics.last = Some(crate::ui::state::MetricsSnapshot {
+            n_nodes: n as u32,
+            n_edges: edge_pairs.len() as u32,
+            edge_length_cv,
+            edge_stress,
+            full_stress,
+        });
     }
 
     fn apply_layout_to_gpu(&mut self, frame: &mut eframe::Frame) {
