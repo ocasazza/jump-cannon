@@ -356,7 +356,7 @@ impl LayoutEngine for SgdStressGpuEngine {
         }
 
         let sweeps = settings.sweeps_per_step.max(1);
-        let workgroups = ((n + WORKGROUP_SIZE - 1) / WORKGROUP_SIZE).max(1);
+        let workgroups = n.div_ceil(WORKGROUP_SIZE).max(1);
 
         // One eta for the whole step. Annealing within a single step (≤ a few
         // dozen sweeps) is negligible, and a constant eta lets us record ALL
@@ -516,9 +516,9 @@ mod tests {
             let mut t = Vec::new();
             for i in 0..n {
                 let d = bfs_distances(&g, i as u32);
-                for j in (i + 1)..n {
-                    if d[j] != u32::MAX && d[j] != 0 {
-                        t.push((i as u32, j as u32, d[j] as f32));
+                for (j, &dij) in d.iter().enumerate().skip(i + 1) {
+                    if dij != u32::MAX && dij != 0 {
+                        t.push((i as u32, j as u32, dij as f32));
                     }
                 }
             }

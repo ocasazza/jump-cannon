@@ -110,7 +110,7 @@ fn longest_path_ranking(ids: &[&String], edges: &[(String, String)]) -> Vec<Vec<
 
 /// Move nodes to adjacent layers when doing so shortens incident edges, keeping
 /// the layering a valid DAG ordering. (Simplified network-simplex refinement.)
-fn optimize_ranking(layers: &mut Vec<Vec<String>>, edges: &[(String, String)]) {
+fn optimize_ranking(layers: &mut [Vec<String>], edges: &[(String, String)]) {
     let mut node_to_layer: HashMap<String, usize> = HashMap::new();
     for (idx, layer) in layers.iter().enumerate() {
         for node in layer {
@@ -132,8 +132,7 @@ fn optimize_ranking(layers: &mut Vec<Vec<String>>, edges: &[(String, String)]) {
                         if *s == node_id || *t == node_id {
                             let other = if *s == node_id { t } else { s };
                             if let Some(ol) = n2l.get(other) {
-                                let diff = if at > *ol { at - *ol } else { *ol - at };
-                                sum = sum.saturating_add(diff);
+                                sum = sum.saturating_add(at.abs_diff(*ol));
                             }
                         }
                     }
@@ -175,9 +174,7 @@ fn optimize_ranking(layers: &mut Vec<Vec<String>>, edges: &[(String, String)]) {
                         node_to_layer.insert(node, new_idx);
                         improved = true;
                         moved = true;
-                        if i > 0 {
-                            i -= 1;
-                        }
+                        i = i.saturating_sub(1);
                         break;
                     }
                 }
