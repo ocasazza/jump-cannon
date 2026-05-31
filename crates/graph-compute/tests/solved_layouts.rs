@@ -30,6 +30,61 @@
 use graph_compute::engines::{CsrShard, EngineCtx, LayoutEngine, SgdStressEngine, SgdStressGpuEngine};
 use graph_compute::sim::CsrGraph;
 
+/// Throughput benchmark: CPU s_gd2 vs the GPU Jacobi port at a size where GPU
+/// parallelism can pay off, with `sweeps_per_step` high to amortize the GPU's
+/// per-step readback. Ignored by default — this is perf (hardware-dependent),
+/// not correctness, so it REPORTS numbers rather than asserting "GPU is faster".
+/// Run: `cargo test -p graph-compute --test solved_layouts bench_sgd -- --ignored --nocapture`
+#[test]
+#[ignore = "perf benchmark; run with --ignored --nocapture"]
+fn bench_sgd_cpu_vs_gpu() {
+    use std::time::Instant;
+
+    let mut ctx = EngineCtx::try_new_gpu();
+    if ctx.gpu.is_none() {
+        eprintln!("no GPU adapter; skipping sgd bench");
+        return;
+    }
+
+    let settings = serde_json::json!({ "sweeps_per_step": 30, "n_pivots": 50 });
+    const STEPS: usize = 20;
+    let sweeps = (STEPS * 30) as f64;
+
+    // Sweep a few sizes to find where (if anywhere) GPU parallelism overtakes
+    // the very fast O(k·n) CPU sparse-pivot SGD given the fixed per-step readback.
+    for side in [50usize, 150, 300] {
+        let g = grid(side, side);
+        let n = g.n_nodes as usize;
+        let init = seed(n, 50.0);
+
+        let mut cpu = SgdStressEngine::new();
+        cpu.set_params(&settings).unwrap();
+        let mut cctx = EngineCtx::cpu_only();
+        cpu.init(&mut cctx, &CsrShard::whole(&g), &init).unwrap();
+        let t = Instant::now();
+        for _ in 0..STEPS {
+            let _ = cpu.step(&mut cctx);
+        }
+        let cpu_dt = t.elapsed();
+
+        let mut gpu = SgdStressGpuEngine::new();
+        gpu.set_params(&settings).unwrap();
+        gpu.init(&mut ctx, &CsrShard::whole(&g), &init).unwrap();
+        let t = Instant::now();
+        for _ in 0..STEPS {
+            let _ = gpu.step(&mut ctx);
+        }
+        let gpu_dt = t.elapsed();
+
+        eprintln!(
+            "n={n:>6}  CPU {:>7.0} sweeps/s   GPU {:>7.0} sweeps/s   CPU/GPU {:.2}x",
+            sweeps / cpu_dt.as_secs_f64(),
+            sweeps / gpu_dt.as_secs_f64(),
+            cpu_dt.as_secs_f64() / gpu_dt.as_secs_f64().max(1e-9)
+        );
+    }
+}
+
 // ---- Canonical graph builders (CSR, ascending neighbour lists) -------------
 
 fn cycle(n: usize) -> CsrGraph {

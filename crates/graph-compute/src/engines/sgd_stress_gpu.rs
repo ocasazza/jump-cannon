@@ -355,22 +355,31 @@ impl LayoutEngine for SgdStressGpuEngine {
             return StepOutput::positions_only(Vec::new());
         }
 
+        let sweeps = settings.sweeps_per_step.max(1);
         let workgroups = ((n + WORKGROUP_SIZE - 1) / WORKGROUP_SIZE).max(1);
-        for _ in 0..settings.sweeps_per_step.max(1) {
-            let eta = anneal_eta(
-                gpu.sweep,
-                settings.eta_max,
-                settings.eta_min,
-                settings.n_anneal_steps,
-            );
-            let params = ParamsRaw { n, k: gpu.k, eta, _pad: 0.0 };
-            gpu.queue
-                .write_buffer(&gpu.params_buf, 0, bytemuck::bytes_of(&params));
 
-            let bind_group = if gpu.cur == 0 { &gpu.bg_a_to_b } else { &gpu.bg_b_to_a };
-            let mut encoder = gpu
-                .device
-                .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        // One eta for the whole step. Annealing within a single step (≤ a few
+        // dozen sweeps) is negligible, and a constant eta lets us record ALL
+        // sweeps + the readback copy in ONE command encoder / ONE submit —
+        // instead of a submit per sweep, which dominated GPU wall-time. Adjacent
+        // compute passes in one encoder get an automatic storage barrier, so the
+        // ping-pong dependency between sweeps is honored.
+        let eta = anneal_eta(
+            gpu.sweep,
+            settings.eta_max,
+            settings.eta_min,
+            settings.n_anneal_steps,
+        );
+        let params = ParamsRaw { n, k: gpu.k, eta, _pad: 0.0 };
+        gpu.queue
+            .write_buffer(&gpu.params_buf, 0, bytemuck::bytes_of(&params));
+
+        let mut encoder = gpu
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        let mut cur = gpu.cur;
+        for _ in 0..sweeps {
+            let bind_group = if cur == 0 { &gpu.bg_a_to_b } else { &gpu.bg_b_to_a };
             {
                 let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                     label: None,
@@ -380,19 +389,15 @@ impl LayoutEngine for SgdStressGpuEngine {
                 pass.set_bind_group(0, bind_group, &[]);
                 pass.dispatch_workgroups(workgroups, 1, 1);
             }
-            gpu.queue.submit(std::iter::once(encoder.finish()));
-
-            gpu.cur ^= 1;
-            gpu.sweep = gpu.sweep.wrapping_add(1);
+            cur ^= 1;
         }
 
-        // Read back whichever buffer now holds the live positions.
-        let live = if gpu.cur == 0 { &gpu.pos_a } else { &gpu.pos_b };
-        let mut encoder = gpu
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        // Read back whichever buffer now holds the live positions (same encoder).
+        let live = if cur == 0 { &gpu.pos_a } else { &gpu.pos_b };
         encoder.copy_buffer_to_buffer(live, 0, &gpu.readback_buf, 0, gpu.positions_byte_len);
         gpu.queue.submit(std::iter::once(encoder.finish()));
+        gpu.cur = cur;
+        gpu.sweep = gpu.sweep.wrapping_add(sweeps as u64);
 
         let slice = gpu.readback_buf.slice(..);
         let (tx, rx) = std::sync::mpsc::channel();
