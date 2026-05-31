@@ -1125,7 +1125,7 @@ impl Default for AppState {
             action_instances: Vec::new(),
             status_footer_open: false,
             tag_browser_query: String::new(),
-            filter_strip_open: true,
+            filter_strip_open: false,
             filter_behavior: FilterBehavior::default(),
             canvas_mount: CanvasMount::default(),
             stats: LiveStats::default(),

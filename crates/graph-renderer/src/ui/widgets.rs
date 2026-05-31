@@ -11,7 +11,7 @@ use eframe::egui;
 use super::theme::{
     self,
     palette,
-    spacing::{DIVIDER_GAP, SECTION_GAP},
+    spacing::{DIVIDER_GAP, ITEM_GAP, SECTION_GAP},
 };
 
 /// Section header: title flanked by thin rules.
@@ -53,13 +53,14 @@ pub fn header(ui: &mut egui::Ui, label: &str) {
     ui.add_space(SECTION_GAP);
 }
 
-/// Subgroup label — small, dim, plain case.
+/// Subgroup label — plain case, readable contrast.
 pub fn subgroup_label(ui: &mut egui::Ui, label: &str) {
     ui.label(
         egui::RichText::new(label)
-            .size(theme::font_size::SMALL)
-            .color(theme::subgroup_label_color()),
+            .size(theme::font_size::BODY)
+            .color(palette::GREY)  // More contrast than the dim 0.6 alpha
     );
+    ui.add_space(ITEM_GAP / 2.0);  // Small gap after label
 }
 
 /// Faint horizontal rule between sub-groups within a section.
@@ -101,26 +102,30 @@ pub fn reset_row(ui: &mut egui::Ui) -> bool {
 /// — it pulls from `style.spacing.slider_width` (default ~100 px).
 /// To make the slider span the gap between the label and the panel
 /// edge we override `slider_width` *inside* the right-aligned closure
-/// with the remaining width minus a small padding for the value text.
+/// with the remaining width minus padding for the value text.
 /// Combo-boxes, color pickers, and checkboxes ignore `slider_width`,
 /// so they just sit flush right at their natural size.
+///
+/// Adds `ITEM_GAP` spacing after each row for visual separation.
 pub fn row(ui: &mut egui::Ui, label: &str, add_control: impl FnOnce(&mut egui::Ui)) {
     ui.horizontal(|ui| {
         if !label.is_empty() {
             ui.label(
                 egui::RichText::new(label)
-                    .size(theme::font_size::SMALL)
-                    .color(theme::subgroup_label_color()),
+                    .size(theme::font_size::BODY)  // Larger, more readable
+                    .color(palette::TEXT),          // Full brightness, not dim
             );
         }
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            // Reserve ~48 px for the slider's trailing value text so the
-            // numeric readout doesn't get clipped against the panel edge.
+            // Reserve 56px for slider's trailing value text to prevent clipping
+            // Increased from 48px to accommodate larger font + breathing room
             let avail = ui.available_width();
-            ui.style_mut().spacing.slider_width = (avail - 48.0).max(60.0);
+            ui.style_mut().spacing.slider_width = (avail - 56.0).max(80.0);
             add_control(ui);
         });
     });
+    // Add breathing room between controls
+    ui.add_space(ITEM_GAP);
 }
 
 /// Hint / help text — 10 px, italic, dim.

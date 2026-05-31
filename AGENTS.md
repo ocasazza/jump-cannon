@@ -161,3 +161,39 @@ cp -rf source dest
 ```
 
 Other tools: `scp` / `ssh` need `-o BatchMode=yes`; `apt-get` needs `-y`; `brew` needs `HOMEBREW_NO_AUTO_UPDATE=1`.
+
+## Recent UI fixes (2026-05-31)
+
+### CollapsingHeader ID conflicts
+Fixed egui v0.27.0+ bug where duplicate `CollapsingHeader` names caused ID collisions (only bottom-most section clickable). All inspector sections (`Frontmatter`, `Community`, `Neighbours`) now have unique `.id_salt()` IDs.
+
+**Files**: `crates/graph-renderer/src/ui/inspector.rs` lines 622, 788, 825, 854
+
+### Filter panel UX consistency
+Removed auto-hide logic from floating filter strip so it behaves like other panels (Style, Layout, Camera). Filter panel now:
+- Shows "no active filters" when empty (doesn't disappear)
+- Starts closed by default (`filter_strip_open: false`)
+- Consistent UX across floating and tiled modes
+
+**Files**: `crates/graph-renderer/src/ui/filter_strip.rs` line 56, `crates/graph-renderer/src/ui/state.rs` line 1122
+
+### High-contrast theme improvements
+Reworked GUI control layout and styling for minimal high-contrast theme:
+
+**Tab bar styling** (`app.rs` line 1300):
+- Black background instead of grey (`palette::BLACK`)
+- Border color matches theme (`palette::BORDER`)
+
+**Control spacing & readability** (`widgets.rs`):
+- `row()`: Labels now use `BODY` font size (was `SMALL`) at full `TEXT` brightness (was dim 0.6 alpha)
+- Added `ITEM_GAP` (4px) spacing between controls to prevent cramped layout
+- Increased slider width reserve from 48px → 56px to prevent value text clipping
+- `subgroup_label()`: Uses `GREY` color (more contrast) instead of 0.6 alpha, adds spacing
+
+**Result**: Controls are no longer cramped, labels are readable, titles don't get cut off, clear visual separation between GUI elements.
+
+### Known egui limitations
+- **SidePanel auto-shrink glitch**: When `CollapsingHeader` toggles inside `SidePanel`, panel may visually jump (egui issue #1262, open since 2022, no fix)
+- **Single-pass frame delay**: Centered windows may be invisible on first frame or shift when content changes (architectural limitation)
+- **Panel ordering rule**: `CentralPanel` must ALWAYS be added last after all other panels to avoid layout hierarchy bugs
+- **Expand to tile**: Anchored panel expand button currently just enlarges the floating panel (can go off-screen). Should transition to tiled workspace instead (Niri-style) - tracked in `anchored.rs` TODO

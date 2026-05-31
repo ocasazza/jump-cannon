@@ -1296,6 +1296,9 @@ impl eframe::App for App {
                     self.state.dock_tab_strip_force_show = false;
                     let show_tab = force_show || n_tabs > 1;
                     let mut style = egui_dock::Style::from_egui(ui.style());
+                    // High-contrast theme overrides for tab bar
+                    style.tab_bar.bg_fill = crate::ui::theme::palette::BLACK;
+                    style.tab_bar.hline_color = crate::ui::theme::palette::BORDER;
                     if !show_tab {
                         style.tab_bar.height = 0.0;
                         style.tab_bar.bg_fill = egui::Color32::TRANSPARENT;

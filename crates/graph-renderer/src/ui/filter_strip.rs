@@ -54,16 +54,6 @@ pub fn show(ctx: &egui::Context, query: &mut QueryModel) {
 /// inside a `FloatingPanel` keyed by `PanelId::FilterStrip`. Hidden when
 /// no filters are active (matches the docked variant).
 pub fn show_floating(ctx: &egui::Context, state: &mut AppState) {
-    let total: usize = state
-        .query
-        .active_filters
-        .by_field
-        .values()
-        .map(|s| s.len())
-        .sum();
-    if total == 0 {
-        return;
-    }
     // Tiled mode → workspace tree owns the rendering, bail.
     if state.filter_strip_placement == crate::ui::tiles::Placement::Tiled {
         return;

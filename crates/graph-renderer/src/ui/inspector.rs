@@ -139,7 +139,7 @@ pub(crate) fn render_body(
             let community_handled_neighbors = show_community(ui, idx, data, &neighbors);
             if !community_handled_neighbors {
                 ui.add_space(8.0);
-                show_neighbors_section(ui, &neighbors, data);
+                show_neighbors_section(ui, idx, &neighbors, data);
             }
             // Bottom breathing room so the last neighbour row
             // never sits flush against the panel border.
@@ -620,6 +620,7 @@ fn show_frontmatter_section(ui: &mut egui::Ui, idx: u32, data: &InspectorData) {
     ui.add_space(6.0);
     egui::CollapsingHeader::new(egui::RichText::new("Frontmatter").color(palette::TEXT))
         .default_open(false)
+        .id_salt("inspector-frontmatter")
         .show(ui, |ui| {
             show_frontmatter_grid(ui, &map, "inspector-frontmatter-grid");
         });
@@ -785,6 +786,7 @@ fn show_community(
         let header = format!("Community ({} members, neighbours)", neighbors.len());
         egui::CollapsingHeader::new(egui::RichText::new(header).color(palette::TEXT))
             .default_open(true)
+            .id_salt(("inspector-community-neighbors", idx))
             .show(ui, |ui| {
                 if neighbors.is_empty() {
                     ui.label(
@@ -821,6 +823,7 @@ fn show_community(
     let header = format!("Community {} ({} members)", my_comm, siblings.len());
     egui::CollapsingHeader::new(egui::RichText::new(header).color(palette::TEXT))
         .default_open(true)
+        .id_salt(("inspector-community", idx, my_comm))
         .show(ui, |ui| {
             if siblings.is_empty() {
                 ui.label(
@@ -842,12 +845,14 @@ fn show_community(
 
 fn show_neighbors_section(
     ui: &mut egui::Ui,
+    idx: u32,
     neighbors: &[u32],
     data: &mut InspectorData,
 ) {
     let header = format!("Neighbours ({})", neighbors.len());
     egui::CollapsingHeader::new(egui::RichText::new(header).color(palette::TEXT))
         .default_open(true)
+        .id_salt(("inspector-neighbors", idx))
         .show(ui, |ui| {
             if neighbors.is_empty() {
                 ui.label(
