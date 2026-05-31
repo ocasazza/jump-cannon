@@ -103,55 +103,21 @@ fn all_pairs(g: &CsrGraph) -> Vec<u32> {
     d
 }
 
-fn euclid(pos: &[f32], i: usize, j: usize) -> f32 {
-    let (dx, dy, dz) = (
-        pos[3 * i] - pos[3 * j],
-        pos[3 * i + 1] - pos[3 * j + 1],
-        pos[3 * i + 2] - pos[3 * j + 2],
-    );
-    (dx * dx + dy * dy + dz * dz).sqrt()
-}
-
-/// Scale-normalized stress in `[0, ~1]`: minimize stress over a global scale
-/// `alpha` (closed form), then normalize by `sum w*d^2` so it is dimensionless
-/// and scale-invariant. 0 ⇒ the layout reproduces graph distances exactly (up to
-/// a uniform scale). This is the metric the GD-metrics literature recommends for
-/// comparing layouts (raw stress is scale-sensitive).
+/// Scale-normalized stress over all reachable pairs — delegates to the shared,
+/// unit-tested `graph_layouts::metrics` implementation (scale-invariant; raw
+/// stress is scale-sensitive). Builds the `(i, j, d_ij)` terms from the
+/// all-pairs distance matrix.
 fn scale_normalized_stress(pos: &[f32], d: &[u32], n: usize) -> f32 {
-    let (mut num, mut den, mut wd2) = (0.0f64, 0.0f64, 0.0f64);
+    let mut terms = Vec::new();
     for i in 0..n {
         for j in (i + 1)..n {
             let dij = d[i * n + j];
-            if dij == u32::MAX || dij == 0 {
-                continue;
+            if dij != u32::MAX && dij != 0 {
+                terms.push((i as u32, j as u32, dij as f32));
             }
-            let dij = dij as f64;
-            let w = 1.0 / (dij * dij);
-            let big_d = euclid(pos, i, j) as f64;
-            num += w * dij * big_d; // sum w*d*D
-            den += w * big_d * big_d; // sum w*D^2
-            wd2 += w * dij * dij; // sum w*d^2
         }
     }
-    if den <= 0.0 || wd2 <= 0.0 {
-        return 0.0;
-    }
-    let alpha = num / den;
-    let mut s = 0.0f64;
-    for i in 0..n {
-        for j in (i + 1)..n {
-            let dij = d[i * n + j];
-            if dij == u32::MAX || dij == 0 {
-                continue;
-            }
-            let dij = dij as f64;
-            let w = 1.0 / (dij * dij);
-            let big_d = euclid(pos, i, j) as f64;
-            let r = alpha * big_d - dij;
-            s += w * r * r;
-        }
-    }
-    (s / wd2) as f32
+    graph_layouts::metrics::scale_normalized_stress(pos, &terms)
 }
 
 // ---- Seeds + relaxation ----------------------------------------------------
@@ -160,7 +126,7 @@ fn scale_normalized_stress(pos: &[f32], d: &[u32], n: usize) -> f32 {
 /// planar start) via an integer hash — stable across machines/runs.
 fn seed(n: usize, spread: f32) -> Vec<f32> {
     let mut p = vec![0.0f32; 3 * n];
-    let mut hash = |k: u64| -> f32 {
+    let hash = |k: u64| -> f32 {
         let mut z = k.wrapping_add(0x9E37_79B9_7F4A_7C15);
         z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
         z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);

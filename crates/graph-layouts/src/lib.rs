@@ -6,6 +6,10 @@ mod benchmark;
 mod file_parsers;
 mod utils;
 
+/// Representation-agnostic layout-quality metrics (scale-normalized stress,
+/// edge-length CV). Usable from the native solver tests and the WASM renderer.
+pub mod metrics;
+
 pub use types::{Graph, Node, Edge, Id, MetadataValue, LayoutOptions};
 pub use layout::algorithms::fcose::{FcoseLayout, FcoseQuality, FcoseSettings};
 pub use layout::algorithms::cose_bilkent::{CoseBilkentLayout, CoseBilkentSettings};

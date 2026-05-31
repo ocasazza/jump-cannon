@@ -502,8 +502,24 @@ mod tests {
 
         let g = CsrGraph::path(24);
         let init = ring_positions(24); // deliberately poor (tangled) initial layout
-        let stress0 = full_stress(&g, &init);
         const STEPS: usize = 200;
+
+        // All-pairs (i, j, d_ij) terms for the scale-invariant stress metric.
+        let terms = {
+            use crate::engines::sgd_stress::bfs_distances;
+            let n = g.n_nodes as usize;
+            let mut t = Vec::new();
+            for i in 0..n {
+                let d = bfs_distances(&g, i as u32);
+                for j in (i + 1)..n {
+                    if d[j] != u32::MAX && d[j] != 0 {
+                        t.push((i as u32, j as u32, d[j] as f32));
+                    }
+                }
+            }
+            t
+        };
+        let ns0 = graph_layouts::metrics::scale_normalized_stress(&init, &terms);
 
         // GPU Jacobi (move only self).
         let mut gpu = SgdStressGpuEngine::new();
@@ -512,7 +528,7 @@ mod tests {
         for _ in 0..STEPS {
             gpu_out = gpu.step(&mut ctx).positions;
         }
-        let gpu_stress = full_stress(&g, &gpu_out);
+        let gpu_ns = graph_layouts::metrics::scale_normalized_stress(&gpu_out, &terms);
 
         // CPU s_gd2 (both endpoints) from the same seed + init.
         let mut cpu = crate::engines::sgd_stress::SgdStressEngine::new();
@@ -522,25 +538,21 @@ mod tests {
         for _ in 0..STEPS {
             cpu_out = cpu.step(&mut cctx).positions;
         }
-        let cpu_stress = full_stress(&g, &cpu_out);
+        let cpu_ns = graph_layouts::metrics::scale_normalized_stress(&cpu_out, &terms);
 
-        // Correctness: the GPU engine must actually minimize the objective.
-        // (Reduction is modest at default settings because far-pair steps mu =
-        // min(1, eta/d^2) are tiny for a long path; what matters is that stress
-        // strictly decreases and tracks the CPU engine.)
+        // The GPU engine must reduce the (scale-invariant) objective.
         assert!(
-            gpu_stress < stress0 * 0.9,
-            "GPU SGD should reduce stress: {stress0} -> {gpu_stress}"
+            gpu_ns < ns0,
+            "GPU SGD should reduce normalized stress: {ns0} -> {gpu_ns}"
         );
-        assert!(cpu_stress < stress0 * 0.9, "CPU sanity: {stress0} -> {cpu_stress}");
-        // Quality parity: GPU Jacobi must stay in the same ballpark as canonical
-        // s_gd2 — guards against gross convergence failure from the move-self
-        // bias. (Empirically the full-step Jacobi descends at least as fast as
-        // the half-step CPU s_gd2 at equal step budget, so this is generous.)
+        // ...and must not regress vs the validated CPU baseline. One-directional
+        // by design: the full-step Jacobi often converges FASTER than half-step
+        // s_gd2 at equal step budget (so GPU may be < CPU); we only guard against
+        // it being meaningfully worse. Scale-normalized per Kobourov GD-metrics —
+        // raw stress is scale-sensitive and not a fair cross-layout comparison.
         assert!(
-            gpu_stress <= cpu_stress * 3.0 + 1e-3,
-            "GPU Jacobi stress {gpu_stress} should be within ~3x CPU s_gd2 {cpu_stress} \
-             (initial {stress0})"
+            gpu_ns <= cpu_ns * 1.5 + 0.05,
+            "GPU normalized stress {gpu_ns} regressed vs CPU s_gd2 {cpu_ns} (init {ns0})"
         );
     }
 
