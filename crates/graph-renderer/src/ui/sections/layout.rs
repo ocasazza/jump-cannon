@@ -78,7 +78,14 @@ pub fn show(ui: &mut egui::Ui, state: &mut AppState, registry: &LayoutRegistry) 
         // slider, which forces `set_options` to call `wake()`. Hitting
         // the dedicated button is more discoverable and doesn't
         // require nudging an unrelated knob.
-        if matches!(factory.kind(), graph_layouts::LayoutKind::Physics) {
+        //
+        // NOTE: we hide this for remote layouts (geometric, remote-fa2)
+        // because they don't support local auto-halt/waking; the sim is
+        // always "playing" as long as the websocket is connected.
+        if matches!(factory.kind(), graph_layouts::LayoutKind::Physics)
+            && active_id != "geometric"
+            && active_id != "remote-fa2"
+        {
             subgroup_separator(ui);
             ui.horizontal(|ui| {
                 if ui

@@ -48,7 +48,7 @@
 
 use std::collections::VecDeque;
 
-use crate::engines::{HaloUpdate, ShardMeta};
+use crate::engines::{GraphAttributes, HaloUpdate, ShardMeta};
 use crate::sim::CsrGraph;
 
 /// One partition's worth of data the coordinator hands to a worker.
@@ -68,6 +68,8 @@ pub struct Partition {
     /// included so local force kernels can read ghost adjacency, but ghosts are
     /// never integrated (their positions arrive via `apply_halo`).
     pub local: CsrGraph,
+    /// Local-index attributes, parallel to `local`.
+    pub attributes: Option<GraphAttributes>,
     /// `global_ids[local_idx] -> global node id`. Length `local.n_nodes`.
     pub global_ids: Vec<u32>,
     /// Number of owned (integrated) nodes; they occupy local indices
@@ -115,6 +117,9 @@ impl Partition {
         let owned = self.owned_global_ids();
         let mut node_ids = Vec::with_capacity(self.boundary.len());
         let mut positions = Vec::with_capacity(3 * self.boundary.len());
+
+        let mut boundary_attributes = self.attributes.as_ref().map(|_| GraphAttributes::default());
+
         for &g in &self.boundary {
             // `owned` is ascending; boundary ids are a subset of it.
             if let Ok(idx) = owned.binary_search(&g) {
@@ -124,6 +129,19 @@ impl Partition {
                     positions.push(owned_positions[base]);
                     positions.push(owned_positions[base + 1]);
                     positions.push(owned_positions[base + 2]);
+
+                    // Slice attributes for this boundary node
+                    if let (Some(la), Some(ba)) = (self.attributes.as_ref(), boundary_attributes.as_mut()) {
+                        if let Some(v) = &la.node_class {
+                            ba.node_class.get_or_insert_with(Vec::new).push(v[idx]);
+                        }
+                        if let Some(v) = &la.node_coordination {
+                            ba.node_coordination.get_or_insert_with(Vec::new).push(v[idx]);
+                        }
+                        if let Some(v) = &la.node_mass {
+                            ba.node_mass.get_or_insert_with(Vec::new).push(v[idx]);
+                        }
+                    }
                 }
             }
         }
@@ -132,6 +150,7 @@ impl Partition {
             owner_id: self.partition_id,
             node_ids,
             positions,
+            attributes: boundary_attributes,
         }
     }
 
@@ -165,7 +184,11 @@ impl Partition {
 /// For a cheap, drop-in *improvement* over the raw BFS cut without a heavyweight
 /// library, see [`partition_csr_refined`] / [`refine_partitions`], which run a
 /// Kernighan–Lin / Fiduccia–Mattheyses boundary-refinement pass on top of this.
-pub fn partition_csr(graph: &CsrGraph, n_partitions: u32) -> Vec<Partition> {
+pub fn partition_csr(
+    graph: &CsrGraph,
+    attributes: Option<&GraphAttributes>,
+    n_partitions: u32,
+) -> Vec<Partition> {
     let n = graph.n_nodes as usize;
     let p = n_partitions.max(1);
     if n == 0 {
@@ -178,6 +201,7 @@ pub fn partition_csr(graph: &CsrGraph, n_partitions: u32) -> Vec<Partition> {
                     offsets: vec![0],
                     neighbors: Vec::new(),
                 },
+                attributes: None,
                 global_ids: Vec::new(),
                 n_owned: 0,
                 boundary: Vec::new(),
@@ -186,7 +210,7 @@ pub fn partition_csr(graph: &CsrGraph, n_partitions: u32) -> Vec<Partition> {
     }
 
     let owner = assign_owners_bfs(graph, p);
-    build_partitions_from_owner(graph, &owner, p)
+    build_partitions_from_owner(graph, attributes, &owner, p)
 }
 
 /// Materialize the full `Vec<Partition>` (local CSR + ghost table + boundary
@@ -194,7 +218,12 @@ pub fn partition_csr(graph: &CsrGraph, n_partitions: u32) -> Vec<Partition> {
 /// FM-refinement path so the boundary/ghost derivation has exactly one source of
 /// truth (the task requires boundary + ghost tables to be **recomputed** after
 /// refinement — this is that recomputation).
-fn build_partitions_from_owner(graph: &CsrGraph, owner: &[u32], p: u32) -> Vec<Partition> {
+fn build_partitions_from_owner(
+    graph: &CsrGraph,
+    attributes: Option<&GraphAttributes>,
+    owner: &[u32],
+    p: u32,
+) -> Vec<Partition> {
     // Bucket owned global ids per partition (ascending global order — keeps the
     // local index ↔ global id mapping deterministic).
     let mut owned: Vec<Vec<u32>> = vec![Vec::new(); p as usize];
@@ -205,7 +234,7 @@ fn build_partitions_from_owner(graph: &CsrGraph, owner: &[u32], p: u32) -> Vec<P
     owned
         .into_iter()
         .enumerate()
-        .map(|(pid, owned_ids)| build_partition(graph, owner, pid as u32, p, owned_ids))
+        .map(|(pid, owned_ids)| build_partition(graph, attributes, owner, pid as u32, p, owned_ids))
         .collect()
 }
 
@@ -277,6 +306,7 @@ fn assign_owners_bfs(graph: &CsrGraph, p: u32) -> Vec<u32> {
 /// table from the global graph and the owner assignment.
 fn build_partition(
     graph: &CsrGraph,
+    attributes: Option<&GraphAttributes>,
     owner: &[u32],
     pid: u32,
     n_partitions: u32,
@@ -328,6 +358,42 @@ fn build_partition(
 
     let n_local = global_ids.len();
 
+    // Slice attributes if present. Local attributes are parallel to `global_ids`.
+    let local_attributes = attributes.map(|ga| {
+        let mut la = GraphAttributes::default();
+        if let Some(v) = &ga.node_class {
+            la.node_class = Some(global_ids.iter().map(|&g| v[g as usize]).collect());
+        }
+        if let Some(v) = &ga.node_coordination {
+            la.node_coordination = Some(global_ids.iter().map(|&g| v[g as usize]).collect());
+        }
+        if let Some(v) = &ga.node_mass {
+            la.node_mass = Some(global_ids.iter().map(|&g| v[g as usize]).collect());
+        }
+        // edge_len is parallel to graph.neighbors. We must re-build it for the local neighbors.
+        if let Some(v) = &ga.edge_len {
+            let mut local_edge_len = Vec::new();
+            for li in 0..n_local {
+                if li < n_owned as usize {
+                    let g = global_ids[li] as usize;
+                    let start = graph.offsets[g] as usize;
+                    let end = graph.offsets[g + 1] as usize;
+                    for &u in &graph.neighbors[start..end] {
+                        if global_to_local.contains_key(&u) {
+                            // Find the original edge index in the global neighbors list
+                            // This is slightly inefficient but correct.
+                            // Better would be to track it during neighbor iteration.
+                            let global_edge_idx = start + graph.neighbors[start..end].iter().position(|&nb| nb == u).unwrap();
+                            local_edge_len.push(v[global_edge_idx]);
+                        }
+                    }
+                }
+            }
+            la.edge_len = Some(local_edge_len);
+        }
+        la
+    });
+
     // Build the local CSR. Owned rows carry full (remapped) adjacency — edges
     // to other owned nodes and to ghosts. Ghost rows are emitted EMPTY: ghosts
     // are read-only boundary copies, not integrated, so their outgoing
@@ -360,6 +426,7 @@ fn build_partition(
             offsets,
             neighbors,
         },
+        attributes: local_attributes,
         global_ids,
         n_owned,
         boundary,
@@ -437,7 +504,10 @@ const REFINE_MAX_PASSES: usize = 8;
 /// the post-refinement ownership (the boundary/ghost invariants asserted in the
 /// tests still hold).
 pub fn partition_csr_refined(graph: &CsrGraph, n_partitions: u32) -> Vec<Partition> {
-    let parts = partition_csr(graph, n_partitions);
+    // Attribute sharding across refined partitions is Phase F (see
+    // docs/geometric-engine-plan.md §8); the FM-refinement path carries no
+    // injected attributes yet.
+    let parts = partition_csr(graph, None, n_partitions);
     refine_partitions(graph, parts)
 }
 
@@ -564,7 +634,8 @@ pub fn refine_partitions(graph: &CsrGraph, parts: Vec<Partition>) -> Vec<Partiti
         }
     }
 
-    build_partitions_from_owner(graph, &owner, p)
+    // Refinement path carries no injected attributes yet (Phase F).
+    build_partitions_from_owner(graph, None, &owner, p)
 }
 
 // ---------------------------------------------------------------------------
@@ -591,6 +662,8 @@ pub struct HaloDelta {
     /// Interleaved `x,y,z` f32, parallel to `node_ids` (so `positions.len() ==
     /// 3 * node_ids.len()`).
     pub positions: Vec<f32>,
+    /// Optional attributes for the boundary nodes.
+    pub attributes: Option<GraphAttributes>,
 }
 
 impl HaloDelta {
@@ -601,6 +674,7 @@ impl HaloDelta {
             owner_id: h.owner_id,
             node_ids: h.node_ids.clone(),
             positions: h.positions.clone(),
+            attributes: h.attributes.clone(),
         }
     }
 
@@ -611,6 +685,27 @@ impl HaloDelta {
             owner_id: self.owner_id,
             node_ids: self.node_ids,
             positions: self.positions,
+            attributes: self.attributes,
+        }
+    }
+
+    /// Encode the bulk arrays and optional attributes to proto wire form.
+    pub fn encode_proto(&self) -> crate::proto::HaloDelta {
+        let (node_ids, positions) = self.encode_bytes();
+        let attributes = self.attributes.as_ref().map(|ga| {
+            crate::proto::GraphAttributes {
+                node_class: ga.node_class.as_ref().map(|v| bytemuck::cast_slice::<u32, u8>(v).to_vec()).unwrap_or_default(),
+                node_coordination: ga.node_coordination.as_ref().map(|v| bytemuck::cast_slice::<u32, u8>(v).to_vec()).unwrap_or_default(),
+                node_mass: ga.node_mass.as_ref().map(|v| bytemuck::cast_slice::<f32, u8>(v).to_vec()).unwrap_or_default(),
+                edge_len: ga.edge_len.as_ref().map(|v| bytemuck::cast_slice::<f32, u8>(v).to_vec()).unwrap_or_default(),
+            }
+        });
+        crate::proto::HaloDelta {
+            frame: self.frame,
+            owner_id: self.owner_id,
+            node_ids,
+            positions,
+            attributes,
         }
     }
 
@@ -631,6 +726,7 @@ impl HaloDelta {
         owner_id: u32,
         node_ids_le: &[u8],
         positions_le: &[u8],
+        attributes: Option<crate::proto::GraphAttributes>,
     ) -> Result<Self, String> {
         if node_ids_le.len() % 4 != 0 {
             return Err(format!(
@@ -653,11 +749,30 @@ impl HaloDelta {
                 node_ids.len()
             ));
         }
+
+        let host_attributes = attributes.map(|pa| {
+            let mut ga = GraphAttributes::default();
+            if !pa.node_class.is_empty() {
+                ga.node_class = Some(bytemuck::cast_slice::<u8, u32>(&pa.node_class).to_vec());
+            }
+            if !pa.node_coordination.is_empty() {
+                ga.node_coordination = Some(bytemuck::cast_slice::<u8, u32>(&pa.node_coordination).to_vec());
+            }
+            if !pa.node_mass.is_empty() {
+                ga.node_mass = Some(bytemuck::cast_slice::<u8, f32>(&pa.node_mass).to_vec());
+            }
+            if !pa.edge_len.is_empty() {
+                ga.edge_len = Some(bytemuck::cast_slice::<u8, f32>(&pa.edge_len).to_vec());
+            }
+            ga
+        });
+
         Ok(Self {
             frame,
             owner_id,
             node_ids,
             positions,
+            attributes: host_attributes,
         })
     }
 }
@@ -802,6 +917,7 @@ impl TonicHaloTransport {
                             proto.owner_id,
                             &proto.node_ids,
                             &proto.positions,
+                            proto.attributes,
                         ) {
                             Ok(d) => {
                                 if in_tx.send(d).is_err() {
@@ -840,15 +956,7 @@ impl HaloTransport for TonicHaloTransport {
     fn publish(&mut self, frame: u64, mut delta: HaloDelta) {
         // Stamp the frame so the peer keys its reply to the same superstep.
         delta.frame = frame;
-        let proto = {
-            let (node_ids, positions) = delta.encode_bytes();
-            crate::proto::HaloDelta {
-                frame: delta.frame,
-                owner_id: delta.owner_id,
-                node_ids,
-                positions,
-            }
-        };
+        let proto = delta.encode_proto();
         // Best-effort: a closed channel means the peer/driver is gone; the BSP
         // barrier will then collect nothing for this frame.
         let _ = self.tx.send(proto);
@@ -1004,7 +1112,7 @@ mod tests {
     #[test]
     fn partition_path_two_ways() {
         let g = CsrGraph::path(6);
-        let parts = partition_csr(&g, 2);
+        let parts = partition_csr(&g, None, 2);
         assert_eq!(parts.len(), 2);
 
         // Every global node owned exactly once.
@@ -1038,7 +1146,7 @@ mod tests {
     #[test]
     fn partition_meta_roundtrips_owned_ghost() {
         let g = CsrGraph::path(6);
-        let parts = partition_csr(&g, 2);
+        let parts = partition_csr(&g, None, 2);
         for p in &parts {
             let m = p.meta();
             assert_eq!(m.partition_id, p.partition_id);
@@ -1054,7 +1162,7 @@ mod tests {
             offsets: vec![0],
             neighbors: vec![],
         };
-        let parts = partition_csr(&g, 3);
+        let parts = partition_csr(&g, None, 3);
         assert_eq!(parts.len(), 3);
         for p in &parts {
             assert_eq!(p.n_owned, 0);
@@ -1069,9 +1177,10 @@ mod tests {
             owner_id: 2,
             node_ids: vec![10, 20, 30],
             positions: vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0],
+            attributes: None,
         };
         let (ids_le, pos_le) = d.encode_bytes();
-        let back = HaloDelta::decode_bytes(d.frame, d.owner_id, &ids_le, &pos_le).unwrap();
+        let back = HaloDelta::decode_bytes(d.frame, d.owner_id, &ids_le, &pos_le, None).unwrap();
         assert_eq!(d, back);
     }
 
@@ -1080,7 +1189,7 @@ mod tests {
         // positions has 2 floats but 1 node => expects 3.
         let pos_le: Vec<u8> = bytemuck::cast_slice(&[1.0f32, 2.0f32]).to_vec();
         let ids_le: Vec<u8> = bytemuck::cast_slice(&[5u32]).to_vec();
-        assert!(HaloDelta::decode_bytes(0, 0, &ids_le, &pos_le).is_err());
+        assert!(HaloDelta::decode_bytes(0, 0, &ids_le, &pos_le, None).is_err());
     }
 
     #[test]
@@ -1090,6 +1199,7 @@ mod tests {
             owner_id: 1,
             node_ids: vec![1, 2],
             positions: vec![0.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+            attributes: None,
         };
         let h = d.clone().into_halo();
         assert_eq!(HaloDelta::from_halo(&h), d);
@@ -1133,7 +1243,7 @@ mod tests {
         }
 
         let g = CsrGraph::path(6);
-        let parts = partition_csr(&g, 2);
+        let parts = partition_csr(&g, None, 2);
         let descriptor = LayoutDescriptor {
             id: "probe",
             kind: LayoutKind::Physics,
@@ -1194,7 +1304,7 @@ mod tests {
         // A few graphs to exercise the property over different cut shapes.
         for g in [CsrGraph::path(6), CsrGraph::path(11), ring(8)] {
             for np in [2u32, 3, 4] {
-                let parts = partition_csr(&g, np);
+                let parts = partition_csr(&g, None, np);
 
                 // Independent ground truth: a global id is "wanted" if it shows
                 // up in ANY partition's ghost list. For partition p, the boundary
@@ -1242,7 +1352,7 @@ mod tests {
         // single boundary node at the cut (2 | 3). Interior nodes 0,1 / 4,5 must
         // NOT be shipped.
         let g = CsrGraph::path(6);
-        let parts = partition_csr(&g, 2);
+        let parts = partition_csr(&g, None, 2);
 
         // Sanity: at least one partition has interior (non-boundary) owned nodes.
         assert!(
@@ -1332,7 +1442,7 @@ mod tests {
         }
 
         let g = CsrGraph::path(6);
-        let parts = partition_csr(&g, 2);
+        let parts = partition_csr(&g, None, 2);
         let descriptor = LayoutDescriptor {
             id: "posprobe",
             kind: LayoutKind::Physics,
@@ -1515,7 +1625,7 @@ mod tests {
     fn edge_cut_matches_ground_truth() {
         for g in [CsrGraph::path(6), CsrGraph::path(11), ring(8)] {
             for np in [2u32, 3, 4] {
-                let parts = partition_csr(&g, np);
+                let parts = partition_csr(&g, None, np);
                 assert_eq!(
                     edge_cut(&parts, &g),
                     ground_truth_cut(&parts, &g),
@@ -1533,7 +1643,7 @@ mod tests {
     fn refine_does_not_increase_cut() {
         for g in [CsrGraph::path(6), CsrGraph::path(12), ring(8), ring(12)] {
             for np in [2u32, 3, 4] {
-                let before = partition_csr(&g, np);
+                let before = partition_csr(&g, None, np);
                 let cut_before = edge_cut(&before, &g);
                 let after = refine_partitions(&g, before);
                 let cut_after = edge_cut(&after, &g);
@@ -1576,7 +1686,7 @@ mod tests {
             ],
         );
 
-        let before = partition_csr(&g, 2);
+        let before = partition_csr(&g, None, 2);
         let cut_before = edge_cut(&before, &g);
         assert_eq!(cut_before, 3, "BFS cut precondition changed");
 
@@ -1602,7 +1712,7 @@ mod tests {
         for g in [CsrGraph::path(12), ring(12), ring(16)] {
             for np in [2u32, 3, 4] {
                 let n = g.n_nodes as usize;
-                let after = refine_partitions(&g, partition_csr(&g, np));
+                let after = refine_partitions(&g, partition_csr(&g, None, np));
                 let ideal = n as f64 / np as f64;
                 let max_size = ((1.0 + REFINE_BALANCE_TOL) * ideal).ceil() as usize;
                 let min_size = ((1.0 - REFINE_BALANCE_TOL) * ideal).floor() as usize;
@@ -1626,7 +1736,7 @@ mod tests {
     fn refine_preserves_boundary_ghost_invariants() {
         for g in [CsrGraph::path(6), CsrGraph::path(13), ring(8), ring(12)] {
             for np in [2u32, 3, 4] {
-                let after = refine_partitions(&g, partition_csr(&g, np));
+                let after = refine_partitions(&g, partition_csr(&g, None, np));
                 assert_partition_invariants(&after, &g);
             }
         }
@@ -1637,7 +1747,7 @@ mod tests {
     #[test]
     fn partition_csr_refined_is_opt_in_and_no_worse() {
         let g = ring(12);
-        let raw = partition_csr(&g, 3);
+        let raw = partition_csr(&g, None, 3);
         let refined = partition_csr_refined(&g, 3);
         assert_eq!(refined.len(), 3);
         assert!(edge_cut(&refined, &g) <= edge_cut(&raw, &g));
@@ -1648,7 +1758,7 @@ mod tests {
     #[test]
     fn refine_handles_degenerate_inputs() {
         let g = CsrGraph::path(5);
-        let one = refine_partitions(&g, partition_csr(&g, 1));
+        let one = refine_partitions(&g, partition_csr(&g, None, 1));
         assert_eq!(one.len(), 1);
         assert_eq!(one[0].n_owned, 5);
 
@@ -1657,7 +1767,7 @@ mod tests {
             offsets: vec![0],
             neighbors: vec![],
         };
-        let parts = refine_partitions(&empty, partition_csr(&empty, 3));
+        let parts = refine_partitions(&empty, partition_csr(&empty, None, 3));
         assert_eq!(parts.len(), 3);
         for p in &parts {
             assert_eq!(p.n_owned, 0);

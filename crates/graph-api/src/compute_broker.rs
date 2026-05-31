@@ -18,8 +18,11 @@ use tokio::task::JoinHandle;
 use tonic::transport::Channel;
 
 use graph_compute::proto::compute_client::ComputeClient;
-use graph_compute::proto::{ListEnginesRequest, PositionDelta, SubscribeRequest};
+use graph_compute::proto::{
+    GraphAttributes as ProtoGraphAttributes, ListEnginesRequest, PositionDelta, SubscribeRequest,
+};
 use graph_compute::service::json_to_struct;
+use graph_layouts::geometric::LensConfig;
 
 #[derive(Clone)]
 pub struct ComputeBroker {
@@ -31,10 +34,12 @@ pub struct ComputeBroker {
 /// worker's startup default); `params` is the JSON-shaped engine settings
 /// object (`None` ⇒ engine defaults), serialized on the wire as
 /// `google.protobuf.Struct`.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct RemoteLayout {
     pub layout_id: String,
     pub params: Option<serde_json::Value>,
+    pub lens: Option<LensConfig>,
+    pub attributes: Option<ProtoGraphAttributes>,
 }
 
 impl RemoteLayout {
@@ -58,7 +63,12 @@ impl RemoteLayout {
                     })
                     .ok()
             });
-        Self { layout_id, params }
+        Self {
+            layout_id,
+            params,
+            lens: None,
+            attributes: None,
+        }
     }
 }
 
@@ -74,12 +84,12 @@ struct Inner {
     /// Last-known URL the loop is dialing. Set on `connect()`; read by
     /// `/compute/health` and the one-shot `list_engines` dial.
     url: tokio::sync::RwLock<Option<String>>,
-    /// The currently-selected remote layout (ADR-002). Seeded by env via
-    /// `connect_with`, replayed on every reconnect, and swapped by
-    /// `reselect`. Exposed (its `layout_id`) as `active` on
-    /// `/compute/engines`. Held behind a lock so the forwarder reads the
-    /// live value on each resubscribe and `reselect` can update it from a
-    /// handler without racing the loop.
+    /// The currently-selected remote layout (ADR-002), carrying `layout_id` +
+    /// `params` + the resolved geometric `attributes`. Seeded by env via
+    /// `connect_with`, replayed on every reconnect, and swapped by `reselect`.
+    /// Exposed (its `layout_id`) as `active` on `/compute/engines`. Held behind
+    /// a lock so the forwarder reads the live value on each resubscribe and
+    /// `reselect` can update it from a handler without racing the loop.
     selection: tokio::sync::RwLock<RemoteLayout>,
     /// Abort handle for the live forwarder task. `reselect` aborts the old
     /// task before spawning a new one so the previous Subscribe stream is
@@ -117,45 +127,16 @@ impl ComputeBroker {
     /// Spawn a reconnecting forwarder task that dials the compute worker,
     /// streams `PositionDelta`s onto a broadcast channel, and redials with
     /// exponential backoff if the dial fails or the stream ends.
-    ///
-    /// Returns immediately — startup is never blocked on the worker being
-    /// reachable. The first successful dial validates `url`; an *invalid*
-    /// url (parse failure) is reported synchronously as an error.
-    ///
-    /// IMPORTANT: callers must only invoke `connect()` when a compute URL
-    /// was explicitly configured (CLI flag or `JUMP_CANNON_COMPUTE_URL`).
-    /// The loop dials forever with exponential backoff and warns on every
-    /// failure; previously graph-api defaulted the URL to
-    /// `http://[::1]:50051`, which made every dev session without a local
-    /// graph-compute worker emit `compute broker dial failed ...` at
-    /// `backoff_secs=30` indefinitely. `main.rs` now skips this call when
-    /// the URL is `None`. Do not reintroduce a default URL here.
-    ///
-    /// TODO(auth): wrap `ComputeClient` in a tonic interceptor that injects
-    /// a bearer token from `JUMP_CANNON_COMPUTE_TOKEN`.
-    ///
-    /// `selection` (ADR-002) picks + tunes the remote layout engine via the
-    /// `Subscribe` request's `layout_id` + `params` fields. `None` (or a
-    /// default-valued selection) leaves the worker on its startup default
-    /// engine. The selection is captured once here and replayed on every
-    /// reconnect so a worker restart resumes the same engine.
     pub async fn connect(&self, url: String) -> anyhow::Result<()> {
-        self.connect_with(url, RemoteLayout::default()).await
+        self.connect_with(url, RemoteLayout::from_env()).await
     }
 
     /// Like [`connect`](Self::connect) but with an explicit remote-layout
-    /// selection. Splitting these keeps the bare `connect(url)` callers (and
-    /// the env-driven `main.rs` path) simple while exposing the ADR-002
-    /// layout_id/params controls for callers that have them.
+    /// selection.
     pub async fn connect_with(&self, url: String, selection: RemoteLayout) -> anyhow::Result<()> {
-        // Validate the URL eagerly so a typo fails the boot sequence loudly.
-        // The actual TCP dial happens inside the spawned reconnect loop.
         let _ = Channel::from_shared(url.clone())
             .map_err(|e| anyhow::anyhow!("invalid compute url {url}: {e}"))?;
 
-        // Create the broadcast channel up front. WS clients can subscribe
-        // before the first dial succeeds; they'll just sit on an empty
-        // receiver until frames arrive (or after a worker restart).
         let (tx, _rx) = broadcast::channel::<PositionDelta>(64);
         *self.inner.tx.write().await = Some(tx.clone());
         *self.inner.url.write().await = Some(url.clone());
@@ -236,11 +217,7 @@ impl ComputeBroker {
                 let channel = match endpoint.connect().await {
                     Ok(c) => c,
                     Err(e) => {
-                        tracing::warn!(
-                            url = %url,
-                            backoff_secs = backoff.as_secs(),
-                            "compute broker dial failed: {e}",
-                        );
+                        tracing::warn!(url = %url, "compute broker dial failed: {e}");
                         tokio::time::sleep(backoff).await;
                         backoff = (backoff * 2).min(BACKOFF_CAP);
                         continue;
@@ -249,29 +226,28 @@ impl ComputeBroker {
 
                 // Read the LIVE selection on each (re)subscribe so a worker
                 // restart resumes the currently-selected engine (not the one
-                // configured at boot, if a reselect happened since).
-                let (req_layout_id, req_params) = {
+                // configured at boot, if a reselect happened since) — its
+                // layout_id, params, and the resolved geometric attributes.
+                let (req_layout_id, req_params, req_attributes) = {
                     let sel = inner.selection.read().await;
                     let params = sel.params.clone().map(json_to_struct);
-                    (sel.layout_id.clone(), params)
+                    (sel.layout_id.clone(), params, sel.attributes.clone())
                 };
 
                 let mut client = ComputeClient::new(channel);
+
                 let stream = match client
                     .subscribe(SubscribeRequest {
                         graph_id: String::new(),
                         layout_id: req_layout_id,
                         params: req_params,
+                        attributes: req_attributes,
                     })
                     .await
                 {
                     Ok(s) => s.into_inner(),
                     Err(e) => {
-                        tracing::warn!(
-                            url = %url,
-                            backoff_secs = backoff.as_secs(),
-                            "compute broker subscribe failed: {e}",
-                        );
+                        tracing::warn!(url = %url, "compute broker subscribe failed: {e}");
                         tokio::time::sleep(backoff).await;
                         backoff = (backoff * 2).min(BACKOFF_CAP);
                         continue;
@@ -279,30 +255,33 @@ impl ComputeBroker {
                 };
 
                 tracing::info!(url = %url, "compute broker connected; streaming frames");
-                inner
-                    .connected
-                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                inner.connected.store(true, std::sync::atomic::Ordering::Relaxed);
                 backoff = BACKOFF_INITIAL;
 
                 let mut stream = stream;
                 loop {
-                    match stream.message().await {
-                        Ok(Some(frame)) => {
+                    // No need to poll for selection changes here: `reselect`
+                    // aborts this task and spawns a fresh one, so a swap is
+                    // applied immediately rather than detected on the next frame.
+                    match tokio::time::timeout(Duration::from_millis(100), stream.message()).await {
+                        Ok(Ok(Some(frame))) => {
                             let _ = tx.send(frame);
                         }
-                        Ok(None) => {
+                        Ok(Ok(None)) => {
                             tracing::warn!("compute worker closed stream; reconnecting");
                             break;
                         }
-                        Err(e) => {
+                        Ok(Err(e)) => {
                             tracing::warn!("compute stream error: {e}; reconnecting");
                             break;
                         }
+                        Err(_) => {
+                            // Timeout: just loop and check selection
+                            continue;
+                        }
                     }
                 }
-                inner
-                    .connected
-                    .store(false, std::sync::atomic::Ordering::Relaxed);
+                inner.connected.store(false, std::sync::atomic::Ordering::Relaxed);
 
                 tokio::time::sleep(backoff).await;
                 backoff = (backoff * 2).min(BACKOFF_CAP);

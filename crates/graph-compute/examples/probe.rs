@@ -22,6 +22,7 @@ async fn main() -> anyhow::Result<()> {
             graph_id: String::new(),
             layout_id: String::new(),
             params: None,
+            attributes: None,
         })
         .await?
         .into_inner();

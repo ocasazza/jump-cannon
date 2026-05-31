@@ -47,6 +47,7 @@ async fn reselect_updates_stored_selection() {
         .reselect(RemoteLayout {
             layout_id: "fa2-bh".to_string(),
             params: Some(params.clone()),
+            ..Default::default()
         })
         .await
         .expect("reselect against a connected broker succeeds");
@@ -71,6 +72,7 @@ async fn reselect_errors_without_connect() {
         .reselect(RemoteLayout {
             layout_id: "fa2-bh".to_string(),
             params: None,
+            ..Default::default()
         })
         .await
         .expect_err("reselect with no configured URL must error");

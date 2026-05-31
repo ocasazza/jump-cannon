@@ -18,7 +18,8 @@ use tokio::sync::broadcast::error::RecvError;
 use prost::Message as ProstMessage;
 use serde::{Deserialize, Serialize};
 
-use crate::{proto, state::AppState};
+use crate::{attribute_resolver, proto, state::AppState};
+use graph_layouts::geometric::LensConfig;
 use vault_data::color::PALETTE;
 
 const PROTOBUF_CT: &str = "application/x-protobuf";
@@ -338,6 +339,7 @@ async fn compute_layout_put(
     let selection = crate::compute_broker::RemoteLayout {
         layout_id,
         params: req.params,
+        ..Default::default()
     };
     match s.inner.compute_broker.reselect(selection).await {
         Ok(()) => axum::Json(ComputeLayoutPutResp { ok: true, error: None }),
@@ -915,8 +917,36 @@ fn extract_strings(v: &serde_json::Value) -> Vec<String> {
 // upgrade is a Phase 4 deliverable; WebSocket is the contained Phase 1 choice.
 async fn graph_layout_stream(
     State(s): State<AppState>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
     ws: WebSocketUpgrade,
 ) -> axum::response::Response {
+    if let Some(layout_id) = params.get("layout_id") {
+        let mut selection = crate::compute_broker::RemoteLayout {
+            layout_id: layout_id.clone(),
+            ..Default::default()
+        };
+
+        if layout_id == "geometric" {
+            if let Some(lens_str) = params.get("lens") {
+                if let Ok(lens) = serde_json::from_str::<LensConfig>(lens_str) {
+                    let snap = s.snapshot();
+                    let (settings, attrs) = attribute_resolver::resolve(&lens, &snap);
+                    selection.params = Some(serde_json::to_value(settings).unwrap());
+                    selection.attributes = Some(attribute_resolver::encode_proto(attrs));
+                    selection.lens = Some(lens);
+                }
+            }
+        }
+        
+        // Apply the selection to the global broker. `reselect` restarts the
+        // forwarder so subsequent frames come from the chosen engine (+ resolved
+        // attributes); ignore the error when the broker is disabled (the
+        // `subscribe` below then simply yields no stream).
+        if let Err(e) = s.inner.compute_broker.reselect(selection).await {
+            tracing::warn!(error = %e, "compute reselect from layout stream failed");
+        }
+    }
+
     let Some(rx) = s.inner.compute_broker.subscribe().await else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,

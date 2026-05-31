@@ -55,7 +55,7 @@ async fn delivers_at_least_one_position_delta() {
     let state = SimState::new(graph);
     // Init the layout engine (registry default `"fa2-brute"`, falling back to
     // the CPU spring engine on GPU-less hosts) so the sim loop produces frames.
-    let _ = state.init_engine("", serde_json::Value::Null).await;
+    let _ = state.init_engine("", serde_json::Value::Null, None).await;
 
     let sim_state = state.clone();
     tokio::spawn(async move { run_sim_loop(sim_state, 60.0).await });
@@ -93,7 +93,7 @@ async fn positions_advance_over_frames() {
     let state = SimState::new(graph);
     // Init the layout engine — the wgpu FA2 engine if a GPU is present, else
     // the CPU spring fallback. Both produce non-zero motion on the ring seed.
-    let _ = state.init_engine("", serde_json::Value::Null).await;
+    let _ = state.init_engine("", serde_json::Value::Null, None).await;
 
     let sim_state = state.clone();
     tokio::spawn(async move { run_sim_loop(sim_state, 60.0).await });

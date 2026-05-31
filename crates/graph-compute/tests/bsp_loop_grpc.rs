@@ -215,7 +215,7 @@ fn close(a: [f32; 3], b: [f32; 3]) -> bool {
 /// assert (a) every worker's ghost nodes converge to the owner's positions and
 /// (b) the partitioned layout matches the single-worker reference.
 async fn run_and_assert(g: CsrGraph, np: u32, k: u64) {
-    let parts = partition_csr(&g, np);
+    let parts = partition_csr(&g, None, np);
     assert_eq!(parts.len() as u32, np);
     // Precondition: there ARE ghosts to exchange (otherwise the test is vacuous).
     assert!(

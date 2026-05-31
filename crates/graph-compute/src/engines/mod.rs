@@ -32,17 +32,21 @@ use graph_layouts::{LayoutDescriptor, LayoutId};
 
 use crate::sim::CsrGraph;
 
-pub mod fa2_brute;
 pub mod cpu_spring;
 pub mod fa2_bh;
-pub mod sgd_stress;
+pub mod fa2_brute;
+pub mod geometric;
+pub mod geometric_gpu;
 pub mod multilevel;
+pub mod sgd_stress;
 
 pub use cpu_spring::CpuSpringEngine;
-pub use fa2_brute::Fa2BruteEngine;
 pub use fa2_bh::Fa2BhEngine;
-pub use sgd_stress::SgdStressEngine;
+pub use fa2_brute::Fa2BruteEngine;
+pub use geometric::{EnergyBreakdown, GeometricEngine, GeometricObservables, GeometricSettings};
+pub use geometric_gpu::GeometricGpuEngine;
 pub use multilevel::MultilevelEngine;
+pub use sgd_stress::SgdStressEngine;
 
 /// Per-worker execution context shared by all engines.
 ///
@@ -129,7 +133,10 @@ fn build_gpu_ctx() -> anyhow::Result<GpuCtx> {
         &wgpu::DeviceDescriptor {
             label: Some("graph-compute-device"),
             required_features: wgpu::Features::empty(),
-            required_limits: wgpu::Limits::default(),
+            required_limits: wgpu::Limits {
+                max_storage_buffers_per_shader_stage: 12,
+                ..wgpu::Limits::default()
+            },
             memory_hints: wgpu::MemoryHints::default(),
         },
         None,
@@ -159,12 +166,108 @@ fn build_gpu_ctx() -> anyhow::Result<GpuCtx> {
 pub struct CsrShard<'a> {
     pub graph: &'a CsrGraph,
     pub shard: Option<ShardMeta>,
+    /// Optional per-node / per-edge attribute vectors injected from upstream
+    /// (the metadata-rich frontend), parallel to `graph`. CSR itself is pure
+    /// topology — tags, types, weights, and precomputed community/centrality
+    /// never reach this worker through the CSR buffer — so any engine that wants
+    /// to drive geometry from *semantic* attributes (rather than topology alone)
+    /// reads them here. `None` ⇒ no injected attributes; engines fall back to
+    /// structural sources they can derive from `graph` itself (degree,
+    /// label-propagation community, PageRank). See [`GraphAttributes`] and
+    /// [`geometric::GeometricEngine`].
+    pub attributes: Option<&'a GraphAttributes>,
 }
 
 impl<'a> CsrShard<'a> {
-    /// Wrap a whole graph as an unsharded (single-worker) shard.
+    /// Wrap a whole graph as an unsharded (single-worker) shard with no injected
+    /// attributes.
     pub fn whole(graph: &'a CsrGraph) -> Self {
-        Self { graph, shard: None }
+        Self {
+            graph,
+            shard: None,
+            attributes: None,
+        }
+    }
+
+    /// Wrap a whole graph together with injected attribute vectors (the wire
+    /// path for semantic, frontend-resolved attributes — see [`GraphAttributes`]).
+    pub fn whole_with_attributes(graph: &'a CsrGraph, attributes: &'a GraphAttributes) -> Self {
+        Self {
+            graph,
+            shard: None,
+            attributes: Some(attributes),
+        }
+    }
+}
+
+/// Injected per-node / per-edge attribute vectors that travel *alongside* the
+/// CSR topology (doc §3, the wire extension). Each field is independently
+/// optional: an engine resolves the attributes it needs either from here (when
+/// present) or from a structural source it derives from the graph.
+///
+/// Why this exists: the CSR buffer is pure topology (`offsets` + `neighbors`).
+/// Semantic attributes — a node's tag/type/community, an edge's weight/type —
+/// live only in the frontend's rich graph model. The frontend resolves a user's
+/// chosen mapping (e.g. "community = the `folder` frontmatter field",
+/// "edge length = `weight`") into these compact numeric vectors and ships them
+/// raw (little-endian, per the repo wire rule) for the backend solver to consume
+/// without ever knowing what "folder" meant. A molecular force field is the same
+/// mechanism with `node_class = element` and `edge_len = bond length`.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct GraphAttributes {
+    /// Per-node class id, length `n_nodes`. Indexes the geometric class table
+    /// (exclusion radius + inter-class affinity). Frontend-resolved from
+    /// community / tag / type.
+    pub node_class: Option<Vec<u32>>,
+    /// Per-node coordination-geometry id, length `n_nodes`. Indexes the
+    /// preferred-angle table. Frontend-resolved (usually from degree, but any
+    /// attribute can drive it).
+    pub node_coordination: Option<Vec<u32>>,
+    /// Per-node mass, length `n_nodes`. Scales gravity pull + integration
+    /// inertia. Frontend-resolved from centrality (PageRank/degree/…).
+    pub node_mass: Option<Vec<f32>>,
+    /// Per-edge target length, **parallel to `graph.neighbors`** (length
+    /// `neighbors.len()`): `edge_len[e]` is the rest length of the CSR entry at
+    /// neighbor index `e`. Using the canonical `neighbors` order (rather than a
+    /// synthesized unique-edge order) keeps the mapping unambiguous across the
+    /// wire. Frontend-resolved from edge weight / type.
+    pub edge_len: Option<Vec<f32>>,
+}
+
+impl GraphAttributes {
+    /// Validate that every present vector has the length its kind requires for
+    /// `graph`. Returns `Err` with a human-readable mismatch on the first bad
+    /// field. An all-`None` `GraphAttributes` is always valid.
+    pub fn validate(&self, graph: &CsrGraph) -> Result<(), String> {
+        let n = graph.n_nodes as usize;
+        let m = graph.neighbors.len();
+        let check_node = |name: &str, len: usize| -> Result<(), String> {
+            if len != n {
+                Err(format!(
+                    "GraphAttributes.{name} length {len} != n_nodes {n}"
+                ))
+            } else {
+                Ok(())
+            }
+        };
+        if let Some(v) = &self.node_class {
+            check_node("node_class", v.len())?;
+        }
+        if let Some(v) = &self.node_coordination {
+            check_node("node_coordination", v.len())?;
+        }
+        if let Some(v) = &self.node_mass {
+            check_node("node_mass", v.len())?;
+        }
+        if let Some(v) = &self.edge_len {
+            if v.len() != m {
+                return Err(format!(
+                    "GraphAttributes.edge_len length {} != neighbors.len() {m}",
+                    v.len()
+                ));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -217,6 +320,9 @@ pub struct HaloUpdate {
     pub node_ids: Vec<u32>,
     /// Interleaved `x,y,z` f32, parallel to `node_ids`.
     pub positions: Vec<f32>,
+    /// Optional attributes for the halo nodes (e.g. class/mass needed for
+    /// repulsion).
+    pub attributes: Option<GraphAttributes>,
 }
 
 /// A server-side layout solver. Scale-out-first: see the module docs and
@@ -302,6 +408,8 @@ pub const LEAF_ENGINE_IDS: &[LayoutId] = &[
     CpuSpringEngine::ID,
     Fa2BhEngine::ID,
     SgdStressEngine::ID,
+    GeometricEngine::ID,
+    GeometricGpuEngine::ID,
 ];
 
 /// Construct a fresh, uninitialized **leaf** (non-multilevel) engine by id.
@@ -322,6 +430,8 @@ pub fn construct_leaf(id: &str) -> Option<Box<dyn LayoutEngine>> {
         CpuSpringEngine::ID => Some(Box::new(CpuSpringEngine::new())),
         Fa2BhEngine::ID => Some(Box::new(Fa2BhEngine::new())),
         SgdStressEngine::ID => Some(Box::new(SgdStressEngine::new())),
+        GeometricEngine::ID => Some(Box::new(GeometricEngine::new())),
+        GeometricGpuEngine::ID => Some(Box::new(GeometricGpuEngine::new())),
         _ => None,
     }
 }
@@ -342,6 +452,8 @@ fn leaf_ctor_for(id: &str) -> EngineConstructor {
         CpuSpringEngine::ID => || construct_leaf(CpuSpringEngine::ID).unwrap(),
         Fa2BhEngine::ID => || construct_leaf(Fa2BhEngine::ID).unwrap(),
         SgdStressEngine::ID => || construct_leaf(SgdStressEngine::ID).unwrap(),
+        GeometricEngine::ID => || construct_leaf(GeometricEngine::ID).unwrap(),
+        GeometricGpuEngine::ID => || construct_leaf(GeometricGpuEngine::ID).unwrap(),
         _ => panic!("leaf_ctor_for: unknown leaf engine id {id:?}"),
     }
 }

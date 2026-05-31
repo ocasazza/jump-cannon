@@ -644,8 +644,10 @@ impl GpuForceLayout {
                         &wgpu::DeviceDescriptor {
                             label: Some("graph-layouts/gpu_force"),
                             required_features: wgpu::Features::empty(),
-                            required_limits: wgpu::Limits::downlevel_defaults()
-                                .using_resolution(adapter.limits()),
+                            required_limits: wgpu::Limits {
+                                max_storage_buffers_per_shader_stage: 8,
+                                ..wgpu::Limits::downlevel_defaults().using_resolution(adapter.limits())
+                            },
                             memory_hints: wgpu::MemoryHints::Performance,
                         },
                         None,

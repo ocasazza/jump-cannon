@@ -160,7 +160,7 @@ fn parse_frame(bytes: &[u8]) -> Option<(u64, u32, Vec<f32>)> {
 // ---- WS consumer task ------------------------------------------------------
 
 #[cfg(not(target_arch = "wasm32"))]
-fn spawn_ws_consumer(url: String, backoff_ms: u32, latch: Latch) {
+pub fn spawn_ws_consumer(url: String, backoff_ms: u32, latch: Latch) {
     // Use a dedicated background thread driving a current-thread tokio
     // runtime. We don't assume a global runtime exists — the renderer's
     // tokio usage in `fetch.rs` is per-request via reqwest's blocking
@@ -220,7 +220,7 @@ async fn ws_consumer_loop(url: String, base_backoff_ms: u32, latch: Latch) {
 }
 
 #[cfg(target_arch = "wasm32")]
-fn spawn_ws_consumer(url: String, backoff_ms: u32, latch: Latch) {
+pub fn spawn_ws_consumer(url: String, backoff_ms: u32, latch: Latch) {
     wasm_bindgen_futures::spawn_local(async move {
         ws_consumer_loop(url, backoff_ms, latch).await;
     });

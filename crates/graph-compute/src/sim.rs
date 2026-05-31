@@ -14,7 +14,7 @@
 use std::sync::Arc;
 use tokio::sync::{broadcast, Mutex, RwLock};
 
-use crate::engines::{CsrShard, EngineCtx, EngineRegistry, LayoutEngine};
+use crate::engines::{CsrShard, EngineCtx, EngineRegistry, GraphAttributes, LayoutEngine};
 use crate::proto::PositionDelta;
 
 /// Compressed-sparse-row graph. Edge `i` connects `src=node` (where
@@ -168,6 +168,36 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         assert!(format!("{err}").contains("length mismatch"));
     }
+
+    #[tokio::test]
+    async fn init_engine_with_attributes() {
+        let n = 4;
+        let graph = CsrGraph::path(n);
+        let state = SimState::new(graph);
+
+        // Inject node_class vector
+        let attrs = GraphAttributes {
+            node_class: Some(vec![1, 2, 1, 2]),
+            ..Default::default()
+        };
+
+        // Use a test-friendly engine like geometric
+        let params = serde_json::json!({
+            "class_source": {"kind": "injected"},
+        });
+
+        let id = state
+            .init_engine("geometric", params, Some(attrs))
+            .await
+            .expect("init_engine should succeed");
+        
+        assert_eq!(id, "geometric");
+        let mut active = state.active.lock().await;
+        let mut active = active.take().unwrap();
+        // Just run one step to prove it didn't panic and accepted the attributes
+        let out = active.engine.step(&mut active.ctx);
+        assert_eq!(out.positions.len(), (n * 3) as usize);
+    }
 }
 
 /// The live, initialized layout engine plus the execution context it runs on.
@@ -236,6 +266,7 @@ impl SimState {
         self: &Arc<Self>,
         layout_id: &str,
         params: serde_json::Value,
+        attributes: Option<GraphAttributes>,
     ) -> Result<&'static str, String> {
         let positions = self.positions.read().await.clone();
         let graph = self.graph.clone();
@@ -252,21 +283,25 @@ impl SimState {
 
         let result = tokio::task::spawn_blocking(move || {
             let mut ctx = EngineCtx::try_new_gpu();
-            let shard = CsrShard::whole(&graph);
+            let shard = if let Some(attrs) = &attributes {
+                CsrShard::whole_with_attributes(&graph, attrs)
+            } else {
+                CsrShard::whole(&graph)
+            };
             match engine.init(&mut ctx, &shard, &positions) {
-                Ok(()) => Ok(ActiveEngine { engine, ctx }),
-                Err(e) => Err((e, ctx, graph, positions)),
+                Ok(()) => Ok((ActiveEngine { engine, ctx }, attributes)),
+                Err(e) => Err((e, ctx, graph, positions, attributes)),
             }
         })
         .await
         .map_err(|e| format!("engine init task panicked: {e}"))?;
 
         match result {
-            Ok(active) => {
+            Ok((active, _attrs)) => {
                 *self.active.lock().await = Some(active);
                 Ok(chosen_id)
             }
-            Err((init_err, mut ctx, graph, positions)) => {
+            Err((init_err, mut ctx, graph, positions, attributes)) => {
                 if chosen_id != fallback_id && registry_has_fallback {
                     tracing::warn!(
                         engine = chosen_id,
@@ -277,7 +312,11 @@ impl SimState {
                         .registry
                         .construct(fallback_id)
                         .expect("fallback engine registered");
-                    let shard = CsrShard::whole(&graph);
+                    let shard = if let Some(attrs) = &attributes {
+                        CsrShard::whole_with_attributes(&graph, attrs)
+                    } else {
+                        CsrShard::whole(&graph)
+                    };
                     fallback
                         .init(&mut ctx, &shard, &positions)
                         .map_err(|e| format!("fallback engine init failed: {e}"))?;

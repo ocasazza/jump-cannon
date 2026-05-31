@@ -130,6 +130,8 @@ build:
 #   just test fuzz [N]       # property-based fuzz, N cases per layout (default 10000)
 #   just test bench          # criterion benches across layouts; HTML in target/criterion/
 #   just test canary [URL]   # live-cluster gRPC smoke (default URL: http://[::1]:50051)
+#   just test geometric      # geometric engine: solved-case canary + regression golden + perf
+#   just test geometric-golden # regenerate the geometric regression golden (intentional baseline bump)
 #   just test browser        # Playwright canvas-not-black smoke
 #   just test regression     # Playwright UI regression suite
 #   just test perf           # headless perf gate (synth vault)
@@ -146,12 +148,15 @@ test target='all' arg='':
       canary)     URL="${ARG:-{{arg}}}"; URL="${URL:-http://[::1]:50051}" \
                   GRAPH_COMPUTE_CANARY_URL="$URL" \
                   cargo test -p graph-compute --test canary -- --nocapture ;;
+      geometric)  cargo test -p graph-compute --test geometric_solver -- --nocapture ;;
+      geometric-golden) UPDATE_GEOMETRIC_GOLDEN=1 \
+                  cargo test -p graph-compute --test geometric_solver regression_golden_master -- --nocapture ;;
       browser)    just _test-browser ;;
       browser-rust) just _test-browser-rust ;;
       regression) just _test-regression ;;
       perf)       just _test-perf ;;
       profile)    just _test-profile ;;
-      *) echo "unknown test target: {{target}} (try: cargo, fuzz, bench, canary, browser, browser-rust, regression, perf, profile)" >&2; exit 1 ;;
+      *) echo "unknown test target: {{target}} (try: cargo, fuzz, bench, canary, geometric, geometric-golden, browser, browser-rust, regression, perf, profile)" >&2; exit 1 ;;
     esac
 
 # Format the workspace.
