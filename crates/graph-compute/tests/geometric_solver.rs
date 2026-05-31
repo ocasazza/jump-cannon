@@ -28,7 +28,7 @@
 //!      or complexity regression trips the test without it being timing-flaky.
 
 use graph_compute::engines::geometric::{CoordinationSource, GeometricEngine, GeometricSettings};
-use graph_compute::engines::{CsrShard, EngineCtx, LayoutEngine};
+use graph_compute::engines::{CsrShard, EngineCtx, GeometricGpuEngine, LayoutEngine};
 use graph_compute::sim::CsrGraph;
 use std::time::{Duration, Instant};
 
@@ -436,6 +436,102 @@ fn canary_solves_known_problems() {
         });
         (case.check)(&r.final_positions);
         eprintln!("solved [{}] in {at} steps — {}", case.name, case.validates);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 1b. CANARY (GPU) — the same known problems must solve on `geometric-gpu`
+// ---------------------------------------------------------------------------
+//
+// The solved-case `check` closures assert closed-form *geometry* (distances),
+// which is invariant to the rigid rotation/translation a different backend may
+// settle into — so they are the natural CPU↔GPU equivalence gate: the GPU engine
+// must relax each known problem to the same analytical answer the CPU engine
+// does. Skips cleanly (loudly) when no wgpu adapter is present (CI / sandbox);
+// run it on a GPU host (e.g. `cargo test -- --nocapture`, sandbox off).
+//
+// NOTE: the GPU WGSL kernel (`geometric_barnes_hut.wgsl`) implements edge
+// springs + class exclusion/affinity + gravity but NOT the angle (coordination)
+// term, so any case that needs the angle term (e.g. the square) is not yet a GPU
+// case. It is listed here as an explicit, named gap rather than silently
+// dropped, and is the next GPU work item (port the angle pass + CSR adjacency).
+
+/// True if a case relies on the angle (coordination) term, which the GPU kernel
+/// does not yet implement.
+fn needs_angle(s: &GeometricSettings) -> bool {
+    s.angle_stiffness != 0.0
+}
+
+/// Run an arbitrary engine for a fixed number of steps and return the final
+/// positions. Generic over the `LayoutEngine` trait so CPU and GPU engines share
+/// it. (The GPU engine has no `observe()`, so convergence isn't sampled here — a
+/// generous fixed budget is used and the closed-form `check` is the oracle.)
+fn run_steps(
+    engine: &mut dyn LayoutEngine,
+    ctx: &mut EngineCtx,
+    graph: &CsrGraph,
+    settings: &GeometricSettings,
+    seed: &[f32],
+    steps: usize,
+) -> Vec<f32> {
+    engine
+        .set_params(&serde_json::to_value(settings).expect("serialize settings"))
+        .expect("set_params");
+    let shard = CsrShard::whole(graph);
+    engine.init(ctx, &shard, seed).expect("init");
+    let mut pos = seed.to_vec();
+    for _ in 0..steps {
+        pos = engine.step(ctx).positions;
+    }
+    pos
+}
+
+#[test]
+fn canary_gpu_solves_known_problems() {
+    let mut ctx = EngineCtx::try_new_gpu();
+    if ctx.gpu.is_none() {
+        eprintln!(
+            "SKIP canary_gpu_solves_known_problems: no wgpu adapter \
+             (run sandbox-off on a GPU host)"
+        );
+        return;
+    }
+    let backend = ctx.gpu.as_ref().map(|g| g.adapter_info.backend);
+    eprintln!("canary_gpu: adapter backend = {backend:?}");
+
+    // Budget generously (the CPU equivalents converge in ~20 steps and a settled
+    // system stays put); kept modest because each GPU step reads positions back.
+    const GPU_STEPS: usize = 1_500;
+    let mut ran = 0usize;
+    let mut skipped_angle = Vec::new();
+    for case in solved_cases() {
+        if needs_angle(&case.settings) {
+            skipped_angle.push(case.name);
+            continue;
+        }
+        let mut engine = GeometricGpuEngine::new();
+        let pos = run_steps(
+            &mut engine,
+            &mut ctx,
+            &case.graph,
+            &case.settings,
+            &case.seed,
+            GPU_STEPS,
+        );
+        (case.check)(&pos);
+        eprintln!("gpu solved [{}] — {}", case.name, case.validates);
+        ran += 1;
+    }
+    assert!(
+        ran > 0,
+        "expected at least one GPU-supported solved case to run"
+    );
+    if !skipped_angle.is_empty() {
+        eprintln!(
+            "canary_gpu: {} case(s) need the angle term the GPU kernel lacks (gap): {:?}",
+            skipped_angle.len(),
+            skipped_angle
+        );
     }
 }
 

@@ -402,11 +402,31 @@ the default `affinity_strength = 0` and still shows up in the residual.)
 | **Regression** (golden master) | A 5×5 grid under the full default force set, fixed seed, fixed 600 steps → robust scalars (potential, residual, radius of gyration) match a committed golden within a relative+absolute tolerance. | Captures the *whole* engine (springs + degree-angle + exclusion + gravity) as one fingerprint. Deterministic (no RNG; a SplitMix64 hash seeds positions). Regenerate intentionally with `UPDATE_GEOMETRIC_GOLDEN=1`; a first run with no golden writes one. |
 | **Performance** | Throughput (steps/sec) on a 12×12 grid asserted above a *generous* floor (50 steps/sec vs. ~7k observed), plus a **steps-to-converge** budget on the triangle canary (< 4000 vs. 16 observed). | A wall-clock floor alone misses an algorithm that still converges but in 10× the iterations; the iteration budget catches that. The floor is loose enough not to be timing-flaky on CI yet trips on a complexity regression (e.g. the O(n²) exclusion pass blowing up). |
 
+### CPU↔GPU equivalence gate
+
+Because each solved case's `check` asserts closed-form *geometry* (distances),
+which is invariant to the rigid rotation/translation a different backend settles
+into, the *same* library is the CPU↔GPU equivalence gate:
+`canary_gpu_solves_known_problems` runs each problem on the `geometric-gpu`
+engine and asserts it relaxes to the same analytical answer. It skips cleanly
+(loudly) when no wgpu adapter is present; on Metal (Apple M3 Pro) the four
+angle-free problems — single spring, spring+gravity, equilateral triangle,
+regular tetrahedron — all pass, so the GPU edge-spring, gravity, and
+octree-exclusion kernels are validated against closed-form answers.
+
+**Known GPU gap (next work item):** `shaders/geometric_barnes_hut.wgsl`
+implements springs + exclusion/affinity + gravity but **not** the angle
+(coordination) term, so the `square-90deg` case is not yet a GPU case — it is
+listed as an explicit, named gap rather than silently dropped. Closing it means
+porting the angle pass (and the per-node neighbour enumeration it needs) to WGSL;
+the square then becomes the GPU canary that the angle term works.
+
 ### Running it
 
 ```sh
-just test geometric          # canary + regression + perf (prints perf numbers)
+just test geometric          # canary + GPU gate + regression + perf (prints numbers)
 just test geometric-golden   # regenerate the regression golden (intentional baseline bump)
+# GPU cases need a wgpu adapter; run on a GPU host (e.g. sandbox-off on macOS/Metal).
 ```
 
 ### Follow-ups this enables
