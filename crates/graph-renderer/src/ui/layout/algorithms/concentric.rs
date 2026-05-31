@@ -29,6 +29,7 @@ const METRICS: &[(ConcentricMetric, &str)] = &[
     (ConcentricMetric::Degree, "Degree (in + out)"),
     (ConcentricMetric::InDegree, "In-degree"),
     (ConcentricMetric::OutDegree, "Out-degree"),
+    (ConcentricMetric::Alphabetical, "Alphabetical (by id)"),
 ];
 
 fn metric_label(m: ConcentricMetric) -> &'static str {

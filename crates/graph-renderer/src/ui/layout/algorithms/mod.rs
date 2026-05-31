@@ -5,7 +5,6 @@ pub mod grid;
 pub mod sphere;
 pub mod concentric;
 pub mod hilbert;
-pub mod force_atlas2;
 pub mod fcose;
 pub mod cose_bilkent;
 pub mod cise;

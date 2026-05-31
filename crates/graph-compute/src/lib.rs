@@ -13,9 +13,9 @@
 //! The remaining roadmap — Barnes-Hut, SGD-stress, maxent, a multilevel wrapper,
 //! and a CSR-partition + ghost-node halo-exchange model for horizontal scaling —
 //! is documented in `docs/compute-architecture.md`, and the algorithm research
-//! behind it in `docs/layout-algorithms.md`. The legacy standalone [`WgpuSim`]
-//! is retained for reference but no longer drives the loop; the FA2 engine
-//! (`engines::Fa2BruteEngine`) is the port that does.
+//! behind it in `docs/layout-algorithms.md`. The FA2 engine
+//! (`engines::Fa2BruteEngine`) is the port that drives the loop (it superseded
+//! an earlier standalone `WgpuSim` scaffold, now removed).
 //!
 //! (Historical note: an earlier scaffold targeted CUDA + NCCL; the project
 //! standardized on wgpu/WGSL so the same kernels run natively and in the
@@ -32,7 +32,6 @@ pub mod partition;
 pub mod sim;
 pub mod service;
 pub mod topo_fisheye;
-pub mod wgpu_sim;
 
 pub use engines::{
     CpuSpringEngine, CsrShard, EngineCtx, EngineRegistry, Fa2BruteEngine, GeometricEngine,
@@ -44,4 +43,3 @@ pub use partition::{
 };
 pub use bsp::{run_bsp_mesh, BspWorker, LiveHaloProvider, MeshTransport};
 pub use service::HaloProvider;
-pub use wgpu_sim::WgpuSim;

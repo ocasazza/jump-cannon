@@ -1,8 +1,10 @@
 //! Layout sidebar.
 //!
-//! Step 1 of the layout abstraction: this section is now a thin shell
-//! that picks an active layout from a `LayoutRegistry` and delegates
-//! the slider rendering to the algorithm-specific UI fn keyed by id.
+//! A thin shell that picks an active layout from the `LayoutRegistry` and
+//! delegates settings rendering to the algorithm-specific UI fn keyed by id.
+//! Entirely data-driven: every registered layout (static solvers, the local
+//! GPU physics sim, and the remote-compute bridge) appears in the picker
+//! automatically — there is no hardcoded algorithm list here.
 
 use eframe::egui;
 
@@ -14,8 +16,7 @@ use super::{subgroup_label, subgroup_separator};
 
 pub fn show(ui: &mut egui::Ui, state: &mut AppState, registry: &LayoutRegistry) {
     state.snapshot_source = Some("Layout".into());
-    // Algorithm picker. Step 1 only registers gpu-force, so the combo is
-    // effectively a one-item list — but the wiring is here for Steps 2/3.
+    // Algorithm picker — populated from the registry's full set.
     let active_id = state.layout.active.clone();
     let active_label = registry
         .get(&active_id)

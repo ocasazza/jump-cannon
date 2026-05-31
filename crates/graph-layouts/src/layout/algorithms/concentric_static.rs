@@ -24,6 +24,9 @@ pub enum ConcentricMetric {
     Degree,
     InDegree,
     OutDegree,
+    /// Rank by id (alphabetical): the first id lands on the innermost ring.
+    /// Replaces the legacy `concentric_by = "id"` mode.
+    Alphabetical,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -100,6 +103,9 @@ impl StaticLayout for ConcentricLayout {
                 ConcentricMetric::Degree => in_d.saturating_add(out_d),
                 ConcentricMetric::InDegree => in_d,
                 ConcentricMetric::OutDegree => out_d,
+                // node_order is id-sorted, so `i` is the alphabetical rank;
+                // invert it so the first id scores highest → innermost ring.
+                ConcentricMetric::Alphabetical => (n - 1 - i) as u32,
             };
             scored.push((i, score));
         }
@@ -224,5 +230,23 @@ mod tests {
         let s = ConcentricSettings::default();
         let out = ConcentricLayout::solve(&s, &g).expect("solve");
         assert!(out.is_empty());
+    }
+
+    #[test]
+    fn alphabetical_puts_first_id_innermost() {
+        // No edges, so degree can't differentiate — alphabetical ordering does.
+        let mut g = Graph::new();
+        for id in ["a", "b", "c"] {
+            g.add_node(Node::new(id));
+        }
+        let s = ConcentricSettings {
+            metric: ConcentricMetric::Alphabetical,
+            ..ConcentricSettings::default()
+        };
+        let out = ConcentricLayout::solve(&s, &g).expect("solve");
+        // id-sorted order is [a, b, c]; "a" ranks highest → innermost ring.
+        let r = |i: usize| (out[i * 3] * out[i * 3] + out[i * 3 + 1] * out[i * 3 + 1]).sqrt();
+        assert!((r(0) - s.min_radius).abs() < 1e-3, "a should be innermost");
+        assert!(r(1) > r(0) && r(2) > r(1), "rings should grow with id order");
     }
 }
