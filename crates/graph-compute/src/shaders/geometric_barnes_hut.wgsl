@@ -54,6 +54,38 @@ fn get_affinity(class_i: u32, class_j: u32) -> f32 {
     return class_affinity[class_i * dim + class_j];
 }
 
+// Preferred neighbour angle (radians) for a coordination id, clamped to the
+// table. Empty table ⇒ 120° (matches the CPU `lookup_angle` default).
+fn get_coord_angle(coord_id: u32) -> f32 {
+    let len = arrayLength(&coord_angles);
+    if (len == 0u) {
+        return 2.0943951; // 120° in radians
+    }
+    var id = coord_id;
+    if (id >= len) {
+        id = len - 1u;
+    }
+    return radians(coord_angles[id]);
+}
+
+// Force on endpoint `pj` for the bond-angle triple (center `pc`, endpoints
+// `pj`,`pk`) relaxing toward `ideal` radians, for `E = ½·k·(θ−ideal)²`. This is
+// the negative gradient w.r.t. `pj`, identical to the CPU `apply_angle_pair`
+// term — so CPU and GPU minimise the same angle energy.
+fn angle_endpoint_force(pc: vec3<f32>, pj: vec3<f32>, pk: vec3<f32>, ideal: f32, k: f32) -> vec3<f32> {
+    let a = pj - pc;
+    let b = pk - pc;
+    let la = max(length(a), 1e-6);
+    let lb = max(length(b), 1e-6);
+    let ua = a / la;
+    let ub = b / lb;
+    let cos_t = clamp(dot(ua, ub), -1.0, 1.0);
+    let theta = acos(cos_t);
+    let sin_t = max(sqrt(1.0 - cos_t * cos_t), 1e-4);
+    let coef = k * (theta - ideal);
+    return (coef / (sin_t * la)) * (ub - cos_t * ua);
+}
+
 @compute @workgroup_size(64)
 fn geometric_step(@builtin(global_invocation_id) gid: vec3<u32>) {
     let i = gid.x;
@@ -129,6 +161,77 @@ fn geometric_step(@builtin(global_invocation_id) gid: vec3<u32>) {
             let t_len = target_lens[e];
             let f = params.edge_stiffness * (r - t_len) / r;
             force = force + d * f;
+        }
+    }
+
+    // ---- 3. Angle (coordination) constraints -----------------------------
+    // No CSR adjacency is uploaded, so neighbours are gathered from the edge
+    // list (bounded to MAX_DEG). Each thread sums the NET angle force on its own
+    // node i across every triple it participates in:
+    //   • as the CENTER  (c = i): the reaction −(F_j+F_k) for each neighbour
+    //     pair {j,k},
+    //   • as an ENDPOINT (j = i): the force F_j for the triple (c; i, k) at each
+    //     neighbouring center c with another neighbour k.
+    // Summed, this is the gradient of the same Σ ½·k·(θ−ideal)² energy the CPU
+    // minimises (so the CPU↔GPU equivalence gate's square case agrees). Cost is
+    // O(deg²·E) per node via the edge scans — fine for the small/validation
+    // graphs; uploading CSR adjacency is the perf follow-up.
+    if (params.angle_stiffness != 0.0) {
+        let ak = params.angle_stiffness;
+        var nbr_i: array<u32, 16>;
+        var nbr_c: array<u32, 16>;
+
+        // Gather i's neighbours (bounded).
+        var deg_i: u32 = 0u;
+        for (var e: u32 = 0u; e < params.n_edges; e = e + 1u) {
+            let edge = edges[e];
+            var other: u32 = 0xffffffffu;
+            if (edge.x == i) { other = edge.y; }
+            else if (edge.y == i) { other = edge.x; }
+            if (other != 0xffffffffu && other != i && deg_i < 16u) {
+                nbr_i[deg_i] = other;
+                deg_i = deg_i + 1u;
+            }
+        }
+
+        // ROLE A — i is the center: reaction force for each neighbour pair.
+        if (deg_i >= 2u) {
+            let ideal_i = get_coord_angle(node_coord[i]);
+            for (var aa: u32 = 0u; aa < deg_i; aa = aa + 1u) {
+                for (var bb: u32 = aa + 1u; bb < deg_i; bb = bb + 1u) {
+                    let pj = positions[nbr_i[aa]].xyz;
+                    let pk = positions[nbr_i[bb]].xyz;
+                    let fj = angle_endpoint_force(pos_i, pj, pk, ideal_i, ak);
+                    let fk = angle_endpoint_force(pos_i, pk, pj, ideal_i, ak);
+                    force = force - (fj + fk);
+                }
+            }
+        }
+
+        // ROLE B — i is an endpoint of each neighbouring center c.
+        for (var aa: u32 = 0u; aa < deg_i; aa = aa + 1u) {
+            let c = nbr_i[aa];
+            let pc = positions[c].xyz;
+            let ideal_c = get_coord_angle(node_coord[c]);
+            // Gather c's neighbours.
+            var deg_c: u32 = 0u;
+            for (var e: u32 = 0u; e < params.n_edges; e = e + 1u) {
+                let edge = edges[e];
+                var other: u32 = 0xffffffffu;
+                if (edge.x == c) { other = edge.y; }
+                else if (edge.y == c) { other = edge.x; }
+                if (other != 0xffffffffu && other != c && deg_c < 16u) {
+                    nbr_c[deg_c] = other;
+                    deg_c = deg_c + 1u;
+                }
+            }
+            if (deg_c < 2u) { continue; }
+            for (var bb: u32 = 0u; bb < deg_c; bb = bb + 1u) {
+                let k = nbr_c[bb];
+                if (k != i) {
+                    force = force + angle_endpoint_force(pc, pos_i, positions[k].xyz, ideal_c, ak);
+                }
+            }
         }
     }
 

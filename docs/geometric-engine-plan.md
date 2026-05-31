@@ -409,17 +409,27 @@ which is invariant to the rigid rotation/translation a different backend settles
 into, the *same* library is the CPU↔GPU equivalence gate:
 `canary_gpu_solves_known_problems` runs each problem on the `geometric-gpu`
 engine and asserts it relaxes to the same analytical answer. It skips cleanly
-(loudly) when no wgpu adapter is present; on Metal (Apple M3 Pro) the four
-angle-free problems — single spring, spring+gravity, equilateral triangle,
-regular tetrahedron — all pass, so the GPU edge-spring, gravity, and
-octree-exclusion kernels are validated against closed-form answers.
+(loudly) when no wgpu adapter is present; on Metal (Apple M3 Pro) **all five**
+problems pass, so the GPU edge-spring, gravity, octree-exclusion, **and angle
+(coordination)** kernels are all validated against closed-form answers.
 
-**Known GPU gap (next work item):** `shaders/geometric_barnes_hut.wgsl`
-implements springs + exclusion/affinity + gravity but **not** the angle
-(coordination) term, so the `square-90deg` case is not yet a GPU case — it is
-listed as an explicit, named gap rather than silently dropped. Closing it means
-porting the angle pass (and the per-node neighbour enumeration it needs) to WGSL;
-the square then becomes the GPU canary that the angle term works.
+**Angle term on GPU.** `shaders/geometric_barnes_hut.wgsl` now ports the angle
+constraint (previously CPU-only). With no CSR adjacency on the device, each
+thread gathers its neighbours from the existing `edges` buffer and sums the net
+angle force on its own node across the two roles it plays — *center* (reaction
+`−(F_j+F_k)` for each neighbour pair) and *endpoint* (`F_j` for the triple
+`(c; i, k)` at each neighbouring center `c`) — which is exactly the gradient of
+the same `Σ ½·k·(θ−ideal)²` energy the CPU minimises. So the **square** is now a
+GPU case and serves as the GPU canary for the angle gradient: if it regresses,
+`square-90deg` fails on GPU while the spring/gravity cases still pass.
+
+Cost is `O(deg²·E)` per node via the edge scans — fine for the validation graphs;
+**uploading CSR adjacency** (offsets+neighbours) to replace the edge scan is the
+perf follow-up (the device's 12-storage-buffer limit is the constraint to work
+around). The GPU engine also still resolves `node_coordination` only from
+injected attributes (defaulting to bucket 0); wiring structural coordination
+(degree) on the GPU is a separate follow-up — it doesn't affect the square
+(uniform coordination) but would for a degree-driven angle layout.
 
 ### Running it
 
