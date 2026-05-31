@@ -13,9 +13,11 @@
 //! shrunk repro stays in CI forever.
 
 use graph_layouts::{
-    CircleAxis, CircleLayout, CircleSettings, ConcentricLayout, ConcentricMetric,
-    ConcentricSettings, Graph, GridLayout, GridSettings, HilbertLayout, HilbertSettings, Node,
-    RandomLayout, RandomSettings, SphereLayout, SphereSettings, StaticLayout,
+    CircleAxis, CircleLayout, CircleSettings, CiseLayout, CiseSettings, ConcentricLayout,
+    ConcentricMetric, ConcentricSettings, CoseBilkentLayout, CoseBilkentSettings, DagreLayout,
+    DagreRanker, DagreSettings, FcoseLayout, FcoseQuality, FcoseSettings, Graph, GridLayout,
+    GridSettings, HilbertLayout, HilbertSettings, KlayLayout, KlaySettings, Node, RandomLayout,
+    RandomSettings, RankDirection, SphereLayout, SphereSettings, StaticLayout,
 };
 use proptest::prelude::*;
 
@@ -45,6 +47,13 @@ fn small_n() -> impl Strategy<Value = usize> {
         4 => 1usize..=128,
         1 => 128usize..=1024,
     ]
+}
+
+/// Small-N strategy for the O(n²)-per-iteration force layouts (fcose,
+/// cose_bilkent) and the layered solvers (dagre, klay) whose crossing
+/// minimization is super-linear. Keeps `cargo test` fast.
+fn tiny_n() -> impl Strategy<Value = usize> {
+    1usize..=48
 }
 
 // ---- Invariant helpers -----------------------------------------------------
@@ -130,6 +139,76 @@ fn concentric_settings() -> impl Strategy<Value = ConcentricSettings> {
             bucket_count,
         },
     )
+}
+
+fn fcose_quality() -> impl Strategy<Value = FcoseQuality> {
+    prop_oneof![
+        Just(FcoseQuality::Draft),
+        Just(FcoseQuality::Default),
+        Just(FcoseQuality::Proof),
+    ]
+}
+
+fn fcose_settings() -> impl Strategy<Value = FcoseSettings> {
+    (100.0f64..=10_000.0, 10.0f64..=300.0, 0.0f64..=100.0, fcose_quality()).prop_map(
+        |(node_repulsion, ideal_edge_length, node_overlap, quality)| FcoseSettings {
+            node_repulsion,
+            ideal_edge_length,
+            node_overlap,
+            quality,
+        },
+    )
+}
+
+fn cose_bilkent_settings() -> impl Strategy<Value = CoseBilkentSettings> {
+    (100.0f64..=10_000.0, 10.0f64..=300.0, 0u32..=120).prop_map(
+        |(node_repulsion, ideal_edge_length, iterations)| CoseBilkentSettings {
+            node_repulsion,
+            ideal_edge_length,
+            iterations,
+        },
+    )
+}
+
+fn cise_settings() -> impl Strategy<Value = CiseSettings> {
+    (1.0f64..=200.0).prop_map(|circle_spacing| CiseSettings {
+        clusters: Vec::new(),
+        circle_spacing,
+    })
+}
+
+fn rank_direction() -> impl Strategy<Value = RankDirection> {
+    prop_oneof![
+        Just(RankDirection::TB),
+        Just(RankDirection::BT),
+        Just(RankDirection::LR),
+        Just(RankDirection::RL),
+    ]
+}
+
+fn dagre_ranker() -> impl Strategy<Value = DagreRanker> {
+    prop_oneof![
+        Just(DagreRanker::NetworkSimplex),
+        Just(DagreRanker::TightTree),
+        Just(DagreRanker::LongestPath),
+    ]
+}
+
+fn dagre_settings() -> impl Strategy<Value = DagreSettings> {
+    (rank_direction(), dagre_ranker(), 10.0f64..=300.0, 10.0f64..=300.0, any::<bool>()).prop_map(
+        |(rank_direction, ranker, rank_separation, node_separation, acyclic)| DagreSettings {
+            rank_direction,
+            ranker,
+            rank_separation,
+            node_separation,
+            acyclic,
+        },
+    )
+}
+
+fn klay_settings() -> impl Strategy<Value = KlaySettings> {
+    (10.0f64..=300.0, 10.0f64..=300.0)
+        .prop_map(|(layer_spacing, node_spacing)| KlaySettings { layer_spacing, node_spacing })
 }
 
 // ---- Property tests --------------------------------------------------------
@@ -221,5 +300,55 @@ proptest! {
         // Radii are non-negative.
         let r_xy = max_radius_xy(&out);
         prop_assert!(r_xy >= 0.0);
+    }
+
+    // fcose / cose_bilkent seed from `thread_rng`, so they are not
+    // deterministic run-to-run — we assert only the finite-output invariant
+    // (no NaN/Inf, correct length, no panic). Small N keeps the O(n²) force
+    // loops fast.
+    #[test]
+    fn fuzz_fcose(s in fcose_settings(), n in tiny_n()) {
+        let g = path_graph(n);
+        let out = FcoseLayout::solve(&s, &g).map_err(|e| TestCaseError::fail(format!("fcose solve: {e}")))?;
+        assert_finite(&out, n, "fcose").map_err(TestCaseError::fail)?;
+    }
+
+    #[test]
+    fn fuzz_cose_bilkent(s in cose_bilkent_settings(), n in tiny_n()) {
+        let g = path_graph(n);
+        let out = CoseBilkentLayout::solve(&s, &g).map_err(|e| TestCaseError::fail(format!("cose_bilkent solve: {e}")))?;
+        assert_finite(&out, n, "cose_bilkent").map_err(TestCaseError::fail)?;
+    }
+
+    // cise / dagre / klay are deterministic: full determinism + finiteness,
+    // and the 2D solvers keep z = 0.
+    #[test]
+    fn fuzz_cise(s in cise_settings(), n in small_n()) {
+        let g = path_graph(n);
+        let out = assert_deterministic(&s, &g, CiseLayout::solve, "cise").map_err(TestCaseError::fail)?;
+        assert_finite(&out, n, "cise").map_err(TestCaseError::fail)?;
+        for (i, chunk) in out.chunks(3).enumerate() {
+            prop_assert!(chunk[2].abs() < 1e-4, "cise: pos[{}].z = {} ≠ 0", i, chunk[2]);
+        }
+    }
+
+    #[test]
+    fn fuzz_dagre(s in dagre_settings(), n in tiny_n()) {
+        let g = path_graph(n);
+        let out = assert_deterministic(&s, &g, DagreLayout::solve, "dagre").map_err(TestCaseError::fail)?;
+        assert_finite(&out, n, "dagre").map_err(TestCaseError::fail)?;
+        for (i, chunk) in out.chunks(3).enumerate() {
+            prop_assert!(chunk[2].abs() < 1e-4, "dagre: pos[{}].z = {} ≠ 0", i, chunk[2]);
+        }
+    }
+
+    #[test]
+    fn fuzz_klay(s in klay_settings(), n in tiny_n()) {
+        let g = path_graph(n);
+        let out = assert_deterministic(&s, &g, KlayLayout::solve, "klay").map_err(TestCaseError::fail)?;
+        assert_finite(&out, n, "klay").map_err(TestCaseError::fail)?;
+        for (i, chunk) in out.chunks(3).enumerate() {
+            prop_assert!(chunk[2].abs() < 1e-4, "klay: pos[{}].z = {} ≠ 0", i, chunk[2]);
+        }
     }
 }
