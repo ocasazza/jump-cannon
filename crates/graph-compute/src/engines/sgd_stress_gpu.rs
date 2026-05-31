@@ -11,9 +11,28 @@
 //! two position buffers ping-pong between sweeps. Unlike the CPU engine (which
 //! moves *both* endpoints of a sampled pair, Gauss-Seidel), moving only the
 //! optimized node makes every write target distinct → no atomics, no races, the
-//! whole graph updates in one dispatch. It minimizes the same sparse-stress
-//! objective; it is not bit-identical to the CPU path (different update order),
-//! which is expected and fine — stress is the invariant, not coordinates.
+//! whole graph updates in one dispatch.
+//!
+//! ## Why Jacobi-move-self (design rationale, lit-checked)
+//!
+//! The canonical s_gd2 update (Zheng/Pawar/Goodman, TVCG 2019) moves *both*
+//! endpoints symmetrically — an in-place Gauss-Seidel step. Reproducing that on
+//! the GPU race-free would need either f32 atomic accumulation (NOT available in
+//! core WebGPU/WGSL — only i32/u32 atomics) or a CYCLADES-style conflict-graph
+//! coloring schedule. Conflict-free Jacobi is the pragmatic WebGPU fit, and it
+//! sits in HOGWILD!'s favourable regime (lock-free async SGD converges
+//! near-optimally when updates are *sparse* — pivot-stress per-node updates are).
+//! The known cost is that moving only one endpoint and reading stale
+//! within-sweep pivot positions can slow convergence vs the both-endpoint step.
+//!
+//! Value proposition: this engine's edge over the CPU path is **parallel
+//! throughput + robustness to poor initial layouts**, NOT lower final stress —
+//! SGD does not beat full majorization on quality once initialization fixes the
+//! global arrangement (Börsig/Brandes/Pásztor, GD 2020). A good seed (e.g.
+//! PivotMDS/spectral) matters more than the choice of minimizer. The
+//! `gpu_stress_comparable_to_cpu_sgd` test pins the GPU/CPU quality gap.
+//! Escalation path if quality lags: CYCLADES batching or same-endpoint thread
+//! allocation (JCADC 2023) to recover the both-endpoint update.
 //!
 //! See `super::sgd_stress` for the algorithm/citations.
 
@@ -81,10 +100,13 @@ impl SgdStressGpuEngine {
                 id: LAYOUT_ID,
                 kind: LayoutKind::Physics,
                 display_name: "SGD stress (GPU, pivot)",
-                description: "GPU-accelerated stress majorization (s_gd2 + Ortmann sparse \
-                              pivots). One thread per node runs the conflict-free Jacobi pivot \
-                              update in WGSL; honors shortest-path distances like the CPU \
-                              sgd-stress engine.",
+                description: "GPU-parallel stress majorization (s_gd2 SGD + Ortmann sparse \
+                              pivots). One thread per node runs a conflict-free Jacobi pivot \
+                              update in WGSL (WebGPU has no f32 atomics, so it moves only the \
+                              optimized node, not both pair endpoints). Honors shortest-path \
+                              distances. Its edge over CPU sgd-stress is parallel throughput and \
+                              robustness to poor initial layouts — not lower final stress, which \
+                              matches majorization given a good seed.",
                 requirements: LayoutRequirements {
                     needs_edges: true,
                     needs_cpu_positions: true,
@@ -459,6 +481,66 @@ mod tests {
         assert!(
             stress_after < stress_before,
             "GPU SGD stress should decrease: before={stress_before} after={stress_after}"
+        );
+    }
+
+    /// Empirical quality gap between the GPU Jacobi update (move-only-self) and
+    /// the canonical CPU s_gd2 (both-endpoint Gauss-Seidel). The literature
+    /// (s_gd2 TVCG'19; conflict-free parallel SGD JCADC'23) predicts Jacobi may
+    /// converge slower / land at slightly higher stress, but no published
+    /// benchmark isolates it for pivot stress — so we measure it here. Both run
+    /// from the SAME seed + initial layout; both must reduce stress substantially
+    /// and the GPU result must stay in the same quality ballpark (generous bound,
+    /// since the update order differs by design).
+    #[test]
+    fn gpu_stress_comparable_to_cpu_sgd() {
+        let mut ctx = EngineCtx::try_new_gpu();
+        if ctx.gpu.is_none() {
+            eprintln!("Skipping sgd-stress-gpu parity test (no GPU)");
+            return;
+        }
+
+        let g = CsrGraph::path(24);
+        let init = ring_positions(24); // deliberately poor (tangled) initial layout
+        let stress0 = full_stress(&g, &init);
+        const STEPS: usize = 200;
+
+        // GPU Jacobi (move only self).
+        let mut gpu = SgdStressGpuEngine::new();
+        gpu.init(&mut ctx, &CsrShard::whole(&g), &init).expect("gpu init");
+        let mut gpu_out = init.clone();
+        for _ in 0..STEPS {
+            gpu_out = gpu.step(&mut ctx).positions;
+        }
+        let gpu_stress = full_stress(&g, &gpu_out);
+
+        // CPU s_gd2 (both endpoints) from the same seed + init.
+        let mut cpu = crate::engines::sgd_stress::SgdStressEngine::new();
+        let mut cctx = EngineCtx::cpu_only();
+        cpu.init(&mut cctx, &CsrShard::whole(&g), &init).expect("cpu init");
+        let mut cpu_out = init.clone();
+        for _ in 0..STEPS {
+            cpu_out = cpu.step(&mut cctx).positions;
+        }
+        let cpu_stress = full_stress(&g, &cpu_out);
+
+        // Correctness: the GPU engine must actually minimize the objective.
+        // (Reduction is modest at default settings because far-pair steps mu =
+        // min(1, eta/d^2) are tiny for a long path; what matters is that stress
+        // strictly decreases and tracks the CPU engine.)
+        assert!(
+            gpu_stress < stress0 * 0.9,
+            "GPU SGD should reduce stress: {stress0} -> {gpu_stress}"
+        );
+        assert!(cpu_stress < stress0 * 0.9, "CPU sanity: {stress0} -> {cpu_stress}");
+        // Quality parity: GPU Jacobi must stay in the same ballpark as canonical
+        // s_gd2 — guards against gross convergence failure from the move-self
+        // bias. (Empirically the full-step Jacobi descends at least as fast as
+        // the half-step CPU s_gd2 at equal step budget, so this is generous.)
+        assert!(
+            gpu_stress <= cpu_stress * 3.0 + 1e-3,
+            "GPU Jacobi stress {gpu_stress} should be within ~3x CPU s_gd2 {cpu_stress} \
+             (initial {stress0})"
         );
     }
 
