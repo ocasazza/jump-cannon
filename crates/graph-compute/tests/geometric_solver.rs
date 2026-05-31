@@ -10,11 +10,14 @@
 //!
 //! Three complementary layers:
 //!
-//!   1. **CANARY (solved cases).** Tiny graphs whose equilibrium is known
-//!      *analytically* — a single spring relaxes to its rest length; three equal
-//!      springs relax to an equilateral triangle. The engine MUST reach that
-//!      geometry and the residual MUST fall below tolerance. These are the loud,
-//!      fast "the solver is broken" alarms.
+//!   1. **CANARY (solved cases).** A library of "known problems" whose
+//!      equilibrium is known *analytically* — a single spring → rest length; a
+//!      spring under gravity → the closed-form balance `d* = 2kL/(2k+gm)`; three
+//!      equal springs → an equilateral triangle; a 4-cycle with a 90° angle → a
+//!      square; K4 with equal springs → a regular tetrahedron (3D). Chosen so
+//!      the set collectively pins down every force term (edge, gravity, angle)
+//!      in 2D and 3D. The engine MUST relax to each known solution within
+//!      tolerance — the loud, fast "the solver is broken" alarm.
 //!   2. **REGRESSION (golden master).** A fixed scenario run for a fixed number
 //!      of steps from a fixed seed; robust scalars of the final state (energy,
 //!      residual, radius of gyration) are compared against a committed golden
@@ -200,6 +203,43 @@ fn triangle() -> CsrGraph {
     }
 }
 
+/// An `n`-cycle (ring): each node joined to its two ring neighbours, CSR with
+/// ascending neighbour lists. `cycle(4)` is the square's 4-cycle.
+fn cycle(n: usize) -> CsrGraph {
+    let mut offsets = vec![0u32];
+    let mut neighbors = Vec::new();
+    for v in 0..n {
+        let mut nb = [((v + n - 1) % n) as u32, ((v + 1) % n) as u32];
+        nb.sort_unstable();
+        neighbors.extend_from_slice(&nb);
+        offsets.push(neighbors.len() as u32);
+    }
+    CsrGraph {
+        n_nodes: n as u32,
+        offsets,
+        neighbors,
+    }
+}
+
+/// The complete graph on 4 vertices (all 6 edges) — the tetrahedron's topology.
+fn k4() -> CsrGraph {
+    CsrGraph {
+        n_nodes: 4,
+        offsets: vec![0, 3, 6, 9, 12],
+        neighbors: vec![1, 2, 3, 0, 2, 3, 0, 1, 3, 0, 1, 2],
+    }
+}
+
+/// Assert `actual ≈ expected` within absolute `tol`, with a descriptive message.
+fn approx(what: &str, actual: f32, expected: f32, tol: f32) {
+    assert!(
+        (actual - expected).abs() <= tol,
+        "{what}: {actual} != expected {expected} (Δ={:.2e} > tol {:.2e})",
+        (actual - expected).abs(),
+        tol
+    );
+}
+
 /// A `w × h` 4-neighbour grid graph (node `r*w + c`), CSR with ascending
 /// neighbour lists. Exercises springs + angle + exclusion at a useful scale.
 fn grid(w: usize, h: usize) -> CsrGraph {
@@ -233,66 +273,169 @@ fn grid(w: usize, h: usize) -> CsrGraph {
 }
 
 // ---------------------------------------------------------------------------
-// 1. CANARY — solved cases with analytically known equilibria
+// 1. CANARY — a library of "known problems" with closed-form solutions
 // ---------------------------------------------------------------------------
+//
+// FEP is validated against a *set* of solved systems, not one. Likewise: each
+// case below has an *analytically known* equilibrium, chosen so the set
+// collectively pins down every force term against a closed-form answer — edge
+// springs, the gravity balance (quantitatively), the angle constraint, and a 3D
+// case. If any fails to relax to its known solution within tolerance the solver
+// is broken; together they are the loud, fast canary.
 
-#[test]
-fn canary_single_spring_relaxes_to_rest_length() {
-    // One spring, seeded 3× too long. The only equilibrium is the two nodes
-    // exactly `rest_len` apart with zero residual force and zero energy.
-    let rest = 2.0;
-    let scn = Scenario {
+/// A problem whose relaxed geometry is known in closed form.
+struct SolvedCase {
+    name: &'static str,
+    /// What this case pins down — surfaced in the pass log and failure message.
+    validates: &'static str,
+    graph: CsrGraph,
+    settings: GeometricSettings,
+    seed: Vec<f32>,
+    max_steps: usize,
+    residual_tol: f32,
+    /// Assert the relaxed layout matches the known solution.
+    check: Box<dyn Fn(&[f32])>,
+}
+
+/// The known-problem library. Order is irrelevant; each entry is independent.
+fn solved_cases() -> Vec<SolvedCase> {
+    let mut cases = Vec::new();
+
+    // 1. Single spring (edge term). Seeded 3× too long; the only equilibrium is
+    //    the two nodes exactly `l` apart.
+    let l = 2.0;
+    cases.push(SolvedCase {
         name: "single-spring",
+        validates: "edge spring → rest length",
         graph: single_edge(),
-        settings: springs_only(rest),
-        seed: vec![0.0, 0.0, 0.0, 3.0 * rest, 0.0, 0.0],
-    };
+        settings: springs_only(l),
+        seed: vec![0.0, 0.0, 0.0, 3.0 * l, 0.0, 0.0],
+        max_steps: 5_000,
+        residual_tol: 1e-3,
+        check: Box::new(move |p| approx("spring length", dist(p, 0, 1), l, 5e-3)),
+    });
 
-    let r = relax(&scn, 5_000, 1e-3, 1);
-    let at = r
-        .converged_at
-        .expect("single spring must reach residual < 1e-3");
+    // 2. Spring + gravity (gravity term, *quantitative*). Gravity pulls both
+    //    nodes to the origin, compressing the spring to a closed-form
+    //    separation: balancing k(2x−L) + g·m·x = 0 about the origin gives
+    //    d* = 2x = 2kL / (2k + g·m), with the centroid at the origin.
+    let (l, k, g, m) = (3.0f32, 0.3f32, 0.05f32, 1.0f32);
+    let d_star = 2.0 * k * l / (2.0 * k + g * m);
+    let mut grav = springs_only(l);
+    grav.edge_stiffness = k;
+    grav.gravity = g; // re-enable gravity for this case
+    cases.push(SolvedCase {
+        name: "spring-gravity",
+        validates: "spring/gravity balance d*=2kL/(2k+gm)",
+        graph: single_edge(),
+        settings: grav,
+        seed: vec![-2.0 * l, 0.5, 0.0, 2.0 * l, -0.5, 0.0],
+        max_steps: 12_000,
+        residual_tol: 1e-3,
+        check: Box::new(move |p| {
+            approx("gravity-balanced separation", dist(p, 0, 1), d_star, 5e-3);
+            let c = ((p[0] + p[3]) / 2.0)
+                .hypot((p[1] + p[4]) / 2.0)
+                .hypot((p[2] + p[5]) / 2.0);
+            assert!(c < 5e-3, "centroid should sit at the origin, |c|={c:.2e}");
+        }),
+    });
 
-    let d = dist(&r.final_positions, 0, 1);
-    assert!(
-        (d - rest).abs() < 5e-3,
-        "equilibrium length {d} != rest {rest} (Δ={:.2e})",
-        (d - rest).abs()
-    );
-    let pot = r.trajectory.last().unwrap().potential;
-    assert!(
-        pot < 1e-4,
-        "spring potential should vanish at equilibrium, got {pot:.2e}"
-    );
-    assert!(
-        at < 2_000,
-        "single spring converged suspiciously slowly at step {at}"
-    );
+    // 3. Equilateral triangle (edge term, 2D). Three equal springs on a 3-cycle:
+    //    the unique zero-energy state (up to rigid motion) is equilateral.
+    let l = 1.5;
+    cases.push(SolvedCase {
+        name: "equilateral-triangle",
+        validates: "3 equal springs → equilateral",
+        graph: triangle(),
+        settings: springs_only(l),
+        seed: vec![0.0, 0.0, 0.0, l * 0.5, 0.0, 0.0, 0.2, 0.3, 0.0],
+        max_steps: 8_000,
+        residual_tol: 2e-3,
+        check: Box::new(move |p| {
+            for (a, b) in [(0, 1), (1, 2), (2, 0)] {
+                approx(&format!("triangle side {a}-{b}"), dist(p, a, b), l, 5e-3);
+            }
+        }),
+    });
+
+    // 4. Square (angle term, 2D). A 4-cycle under springs *alone* is a floppy
+    //    rhombus (sides L, angle free). The 90° coordination angle pins it to a
+    //    square: sides L, diagonals L√2. This is the case that fails if the
+    //    angle term regresses.
+    let l = 1.0;
+    let mut square = springs_only(l);
+    square.coordination_source = CoordinationSource::Uniform { bucket: 0 };
+    square.coordination_angles = vec![90.0];
+    square.angle_stiffness = 0.15;
+    cases.push(SolvedCase {
+        name: "square-90deg",
+        validates: "edge + 90° angle → square",
+        graph: cycle(4),
+        settings: square,
+        seed: vec![
+            1.1, 0.0, 0.0, // 0
+            0.1, 0.9, 0.0, // 1
+            -1.0, 0.2, 0.0, // 2
+            0.0, -1.2, 0.0, // 3
+        ],
+        max_steps: 30_000,
+        residual_tol: 4e-3,
+        check: Box::new(move |p| {
+            for (a, b) in [(0, 1), (1, 2), (2, 3), (3, 0)] {
+                approx(&format!("square side {a}-{b}"), dist(p, a, b), l, 2e-2);
+            }
+            let diag = l * std::f32::consts::SQRT_2;
+            approx("square diagonal 0-2", dist(p, 0, 2), diag, 3e-2);
+            approx("square diagonal 1-3", dist(p, 1, 3), diag, 3e-2);
+        }),
+    });
+
+    // 5. Regular tetrahedron (edge term, 3D). K4 with 6 equal springs has the
+    //    regular tetrahedron as its unique zero-energy 3D embedding — every one
+    //    of the 6 pairwise distances equals L.
+    let l = 2.0;
+    cases.push(SolvedCase {
+        name: "regular-tetrahedron",
+        validates: "K4 equal springs → regular tetrahedron (3D)",
+        graph: k4(),
+        settings: springs_only(l),
+        seed: deterministic_seed(4, 1.5),
+        max_steps: 10_000,
+        residual_tol: 2e-3,
+        check: Box::new(move |p| {
+            for (a, b) in [(0, 1), (0, 2), (0, 3), (1, 2), (1, 3), (2, 3)] {
+                approx(&format!("tetrahedron edge {a}-{b}"), dist(p, a, b), l, 1e-2);
+            }
+        }),
+    });
+
+    cases
 }
 
 #[test]
-fn canary_triangle_relaxes_to_equilateral() {
-    // Three equal springs on a 3-cycle: the unique zero-energy state (up to
-    // rigid motion) is the equilateral triangle with every side == rest_len.
-    let rest = 1.5;
-    let scn = Scenario {
-        name: "triangle",
-        graph: triangle(),
-        // Seed a deliberately skewed, non-equilateral triangle.
-        seed: vec![0.0, 0.0, 0.0, rest * 0.5, 0.0, 0.0, 0.2, 0.3, 0.0],
-        settings: springs_only(rest),
-    };
-
-    let r = relax(&scn, 8_000, 2e-3, 1);
-    r.converged_at.expect("triangle must reach residual < 2e-3");
-
-    for (a, b) in [(0, 1), (1, 2), (2, 0)] {
-        let d = dist(&r.final_positions, a, b);
-        assert!(
-            (d - rest).abs() < 5e-3,
-            "side {a}-{b} = {d} should equal rest {rest} (Δ={:.2e})",
-            (d - rest).abs()
-        );
+fn canary_solves_known_problems() {
+    for case in solved_cases() {
+        let scn = Scenario {
+            name: case.name,
+            graph: case.graph,
+            settings: case.settings,
+            seed: case.seed,
+        };
+        let r = relax(&scn, case.max_steps, case.residual_tol, 1);
+        let at = r.converged_at.unwrap_or_else(|| {
+            let last = r
+                .trajectory
+                .last()
+                .map(|s| s.max_residual)
+                .unwrap_or(f32::NAN);
+            panic!(
+                "[{}] ({}) did not reach equilibrium: residual {:.3e} > tol {:.3e} after {} steps",
+                case.name, case.validates, last, case.residual_tol, case.max_steps
+            );
+        });
+        (case.check)(&r.final_positions);
+        eprintln!("solved [{}] in {at} steps — {}", case.name, case.validates);
     }
 }
 

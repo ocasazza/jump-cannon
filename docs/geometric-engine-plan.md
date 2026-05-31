@@ -398,7 +398,7 @@ the default `affinity_strength = 0` and still shows up in the residual.)
 
 | Layer | What it asserts | Why it's robust |
 |---|---|---|
-| **Canary** (solved cases) | A single spring relaxes to its rest length; three equal springs relax to an equilateral triangle (every side == `rest_len`); a damped run sheds total energy monotonically and the potential falls to its floor. | The equilibria are *exact analytical* answers, so the tolerances (geometry < 5e-3, residual < 2e-3) are physics, not curve-fitting. If the solver is broken these fail loudly and fast (triangle converges in ~16 steps). |
+| **Canary** (solved cases) | A **library of known problems**, each relaxing to a closed-form equilibrium: single spring → rest length; **spring + gravity → `d* = 2kL/(2k+gm)`** (the balance is verified quantitatively, centroid at origin); three equal springs → equilateral triangle; **4-cycle + 90° angle → square** (sides `L`, diagonals `L√2`); **K4 equal springs → regular tetrahedron** (all 6 distances `L`, 3D). Plus a damped run that sheds total energy monotonically. | The equilibria are *exact analytical* answers, so the tolerances are physics, not curve-fitting — and the set is chosen to pin down **every force term** (edge, gravity, angle) in 2D *and* 3D, so a regression in any one term fails a specific named case. All converge fast (16–23 steps). The angle term, untested by springs-only cases (a 4-cycle is a floppy rhombus without it), is what the square case exists to catch. |
 | **Regression** (golden master) | A 5×5 grid under the full default force set, fixed seed, fixed 600 steps → robust scalars (potential, residual, radius of gyration) match a committed golden within a relative+absolute tolerance. | Captures the *whole* engine (springs + degree-angle + exclusion + gravity) as one fingerprint. Deterministic (no RNG; a SplitMix64 hash seeds positions). Regenerate intentionally with `UPDATE_GEOMETRIC_GOLDEN=1`; a first run with no golden writes one. |
 | **Performance** | Throughput (steps/sec) on a 12×12 grid asserted above a *generous* floor (50 steps/sec vs. ~7k observed), plus a **steps-to-converge** budget on the triangle canary (< 4000 vs. 16 observed). | A wall-clock floor alone misses an algorithm that still converges but in 10× the iterations; the iteration budget catches that. The floor is loose enough not to be timing-flaky on CI yet trips on a complexity regression (e.g. the O(n²) exclusion pass blowing up). |
 
@@ -411,9 +411,13 @@ just test geometric-golden   # regenerate the regression golden (intentional bas
 
 ### Follow-ups this enables
 
-- When the **GPU port** (Phase E) lands, point the *same* canaries + golden at
-  the GPU engine: the residual-force tolerance is exactly the cross-backend
-  equivalence check (CPU vs. GPU must agree to within solver tolerance), mirroring
-  how `fa2-bh` was validated against `fa2-brute`.
+- When the **GPU port** (Phase E) lands, point the *same* solved-case library +
+  golden at the GPU engine: every known problem must still relax to its
+  closed-form answer, and the residual-force tolerance is exactly the
+  cross-backend equivalence check (CPU vs. GPU must agree to within solver
+  tolerance), mirroring how `fa2-bh` was validated against `fa2-brute`.
+- New engine variants / force terms slot in as new `SolvedCase` rows — a
+  constrained motif with a known target geometry is the cheapest possible proof
+  that a term does what it claims.
 - A per-engine convergence read-out (`observe()`) is also what a UI "settled /
   still relaxing" indicator would consume — no new backend work needed.
