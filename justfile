@@ -80,12 +80,20 @@ dev-up backend="gpu":
     cleanup() {
         echo
         echo "→ tearing down (backend pid $BACKEND_PID, vault pid $VAULT_PID, trunk pid $TRUNK_PID)…"
+        # Kill tracked PIDs first
         kill "$BACKEND_PID" 2>/dev/null || true
         kill "$VAULT_PID" 2>/dev/null || true
         kill "$API_BUILD_PID" 2>/dev/null || true
         kill "$TRUNK_PID" 2>/dev/null || true
+        # Kill cargo-watch (starts after trap, so not in a tracked PID var)
+        pkill -f "cargo watch.*graph-api" 2>/dev/null || true
+        # Comprehensive fallback: kill any stragglers by process name
+        pkill -f "trunk watch" 2>/dev/null || true
+        pkill -f "graph-compute" 2>/dev/null || true
+        pkill -f "graph-api" 2>/dev/null || true
         # Idempotent: kills the native binary (darwin) or stops compose (linux).
         nix run .#dev-down 2>/dev/null || true
+        echo "→ teardown complete"
     }
     trap cleanup EXIT INT TERM
 
@@ -107,7 +115,8 @@ dev-up backend="gpu":
     # (read by RemoteLayout::from_env); the UI's "Remote engine" picker can
     # change it at runtime via PUT /compute/layout.
     JUMP_CANNON_COMPUTE_URL=http://[::1]:50051 \
-    JUMP_CANNON_COMPUTE_LAYOUT_ID="$COMPUTE_ENGINE" cargo watch \
+    JUMP_CANNON_COMPUTE_LAYOUT_ID="$COMPUTE_ENGINE" \
+    exec cargo watch \
       -w crates/graph-api -w crates/vault-data -w crates/vault-links -w crates/graph-metrics \
       -x 'run -p graph-api -- --assets-dir crates/graph-renderer/assets/dist'
 
