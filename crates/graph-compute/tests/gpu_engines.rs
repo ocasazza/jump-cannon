@@ -33,6 +33,13 @@ fn seed(n: usize) -> Vec<f32> {
     p
 }
 
+/// Serializes GPU tests in this binary — concurrent wgpu device creation trips
+/// Metal validation errors under load (cargo serializes across binaries).
+static GPU_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+fn gpu_guard() -> std::sync::MutexGuard<'static, ()> {
+    GPU_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner())
+}
+
 /// Bring up a GPU context, or print a skip note and return `None` (so the test
 /// passes trivially on sandboxed/headless hosts with no adapter).
 fn gpu_or_skip(test: &str) -> Option<EngineCtx> {
@@ -65,6 +72,7 @@ fn run(
 
 #[test]
 fn gpu_engines_run_and_move() {
+    let _g = gpu_guard();
     let Some(mut ctx) = gpu_or_skip("gpu_engines_run_and_move") else {
         return;
     };
@@ -100,6 +108,7 @@ fn gpu_engines_run_and_move() {
 // purpose until the octree repulsion is fixed; do not #[ignore] it.
 #[test]
 fn barnes_hut_matches_brute_force_single_step() {
+    let _g = gpu_guard();
     let Some(mut ctx) = gpu_or_skip("barnes_hut_matches_brute_force_single_step") else {
         return;
     };
@@ -125,5 +134,73 @@ fn barnes_hut_matches_brute_force_single_step() {
         max_diff < 5e-2,
         "Barnes-Hut (theta=0) must match brute force up to float summation order; \
          max per-coordinate diff = {max_diff}"
+    );
+}
+
+// ---- Solved-case canaries (fa2-brute) -------------------------------------
+//
+// Force-directed equilibria depend on the FULL model (attraction + repulsion +
+// gravity), so we do NOT assert a specific rest length — the GD literature
+// refutes "an edge settles at the ideal length" once repulsion is present. What
+// IS robust is SYMMETRY + stability, invariant to rotation / translation /
+// uniform scale: a symmetric graph relaxes to a symmetric configuration. We
+// canary the reliable brute-force engine.
+
+fn triangle() -> CsrGraph {
+    CsrGraph { n_nodes: 3, offsets: vec![0, 2, 4, 6], neighbors: vec![1, 2, 0, 2, 0, 1] }
+}
+
+fn dist(p: &[f32], i: usize, j: usize) -> f32 {
+    let (dx, dy, dz) = (p[3 * i] - p[3 * j], p[3 * i + 1] - p[3 * j + 1], p[3 * i + 2] - p[3 * j + 2]);
+    (dx * dx + dy * dy + dz * dz).sqrt()
+}
+
+/// A single edge must stay FINITE (never NaN/Inf) over a long run.
+///
+/// KNOWN LIMITATION (documented by this canary, not asserted away): fa2-brute
+/// is numerically *unstable* on a 2-node graph — with no swing/speed damping,
+/// the 1/dist repulsion singularity flings the pair apart, attraction yanks them
+/// back, and the separation oscillates wildly (observed band ≈ [0.1, 80]) rather
+/// than settling. Two nodes is a pathological case for FA2; 3+ nodes stabilize
+/// (see the equilateral-triangle canary). So we only guard the floor here: the
+/// step must not produce non-finite coordinates. Tightening this to a bounded
+/// band would require porting FA2's adaptive-speed (swing) control — a separate
+/// algorithm task, flagged as a follow-up.
+#[test]
+fn fa2_single_edge_stays_finite() {
+    let _g = gpu_guard();
+    let Some(mut ctx) = gpu_or_skip("fa2_single_edge_stays_finite") else {
+        return;
+    };
+    let graph = CsrGraph::path(2);
+    let s = vec![0.0, 0.0, 0.0, 5.0, 0.0, 0.0];
+    let mut e = Fa2BruteEngine::new();
+    e.init(&mut ctx, &CsrShard::whole(&graph), &s).expect("init");
+    for _ in 0..400 {
+        let p = e.step(&mut ctx).positions;
+        assert!(p.iter().all(|x| x.is_finite()), "single-edge step produced non-finite coords");
+    }
+}
+
+/// K3 (triangle) relaxes toward EQUILATERAL — equal side lengths — regardless of
+/// orientation/scale. Asymmetric seed; a correct symmetric force model equalizes
+/// the sides.
+#[test]
+fn fa2_triangle_relaxes_to_equilateral() {
+    let _g = gpu_guard();
+    let Some(mut ctx) = gpu_or_skip("fa2_triangle_relaxes_to_equilateral") else {
+        return;
+    };
+    let g = triangle();
+    let s = vec![0.0, 0.0, 0.0, 10.0, 0.0, 0.0, 3.0, 4.0, 0.0]; // scalene seed
+    let out = run(&mut Fa2BruteEngine::new(), &mut ctx, &g, &s, 600);
+    let (d01, d12, d20) = (dist(&out, 0, 1), dist(&out, 1, 2), dist(&out, 2, 0));
+    let mean = (d01 + d12 + d20) / 3.0;
+    let max_dev = [d01, d12, d20].iter().map(|d| (d - mean).abs()).fold(0.0, f32::max);
+    assert!(mean > 1e-3, "triangle should not collapse: mean side {mean}");
+    assert!(
+        max_dev / mean < 0.15,
+        "K3 should relax ~equilateral: sides {d01:.3}, {d12:.3}, {d20:.3} (dev {:.1}%)",
+        100.0 * max_dev / mean
     );
 }
