@@ -926,13 +926,33 @@ async fn graph_layout_stream(
             ..Default::default()
         };
 
-        if layout_id == "geometric" {
+        // Resolve the lens for BOTH geometric backends — the renderer sends
+        // "geometric-gpu" when GPU acceleration is on, and that path needs the
+        // injected attributes (class / edge-strength rest lengths) just as much
+        // as the CPU one. Resolving only "geometric" silently dropped the lens on
+        // the GPU backend.
+        if layout_id == "geometric" || layout_id == "geometric-gpu" {
             if let Some(lens_str) = params.get("lens") {
                 if let Ok(lens) = serde_json::from_str::<LensConfig>(lens_str) {
                     let snap = s.snapshot();
                     let (settings, attrs) = attribute_resolver::resolve(&lens, &snap);
-                    selection.params = Some(serde_json::to_value(settings).unwrap());
+                    let settings_json = serde_json::to_value(settings).unwrap();
                     selection.attributes = Some(attribute_resolver::encode_proto(attrs));
+
+                    if lens.use_multilevel {
+                        // Wrap the geometric engine in the multilevel cascade: the
+                        // selected geometric backend becomes the inner solver. The
+                        // resolved GeometricSettings ride as `inner_params`.
+                        let ml = graph_compute::engines::MultilevelSettings {
+                            inner: layout_id.clone(),
+                            inner_params: settings_json,
+                            ..Default::default()
+                        };
+                        selection.layout_id = "multilevel".to_string();
+                        selection.params = Some(serde_json::to_value(ml).unwrap());
+                    } else {
+                        selection.params = Some(settings_json);
+                    }
                     selection.lens = Some(lens);
                 }
             }

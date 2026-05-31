@@ -543,6 +543,22 @@ mod tests {
         assert_eq!(e.settings.inner, "sgd-stress");
     }
 
+    /// The multilevel wrapper must accept the GPU geometric engine as its inner
+    /// solver — this is the "hierarchical layout mode × geometric algorithm"
+    /// composition the frontend's `use_multilevel` toggle routes through.
+    /// `construct_leaf` succeeds without a GPU (the device is only needed at
+    /// `init`), so `set_params` validates the pairing here.
+    #[test]
+    fn accepts_geometric_gpu_inner() {
+        let mut e = MultilevelEngine::new();
+        let params = serde_json::json!({
+            "inner": "geometric-gpu",
+            "inner_params": { "edge_stiffness": 0.2 }
+        });
+        assert!(e.set_params(&params).is_ok());
+        assert_eq!(e.settings.inner, "geometric-gpu");
+    }
+
     #[test]
     fn fold_up_averages_children() {
         // Two children of one super-node at (0,0,0) and (2,0,0) → super at (1,0,0).

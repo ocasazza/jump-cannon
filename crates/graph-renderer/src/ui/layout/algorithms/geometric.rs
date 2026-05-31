@@ -158,6 +158,10 @@ impl LensPreset {
                 c.class = ClassLens::Louvain;
                 c.affinity_strength = -50.0;
                 c.angle_stiffness = 0.01;
+                // De-hairball: let global shortcut edges stretch so communities
+                // can pull apart (small-world layout fix).
+                c.edge_length = EdgeLengthLens::JaccardStrength;
+                c.edge_strength_spread = 3.0;
             }
             LensPreset::CorePeriphery => {
                 c.mass = MassLens::PageRank;
@@ -188,6 +192,9 @@ fn render_ui(ui: &mut egui::Ui, json: &mut Value) {
     });
     row(ui, "GPU Acceleration", |ui| {
         if ui.checkbox(&mut opts.use_gpu, "Enabled").on_hover_text("Use the WGPU/WGSL backend on the solver node (geometric-gpu).").changed() { changed = true; }
+    });
+    row(ui, "Multilevel", |ui| {
+        if ui.checkbox(&mut opts.use_multilevel, "Enabled").on_hover_text("Wrap the geometric engine in the coarsen→solve→prolong→refine cascade (Walshaw/FM³/sfdp) for faster convergence on large graphs.").changed() { changed = true; }
     });
 
     subgroup_separator(ui);
@@ -243,8 +250,19 @@ fn render_ui(ui: &mut egui::Ui, json: &mut Value) {
                 if ui.selectable_value(&mut opts.edge_length, EdgeLengthLens::Uniform, "Uniform").clicked() { changed = true; }
                 if ui.selectable_value(&mut opts.edge_length, EdgeLengthLens::Weight, "Weight").clicked() { changed = true; }
                 if ui.selectable_value(&mut opts.edge_length, EdgeLengthLens::EdgeType, "EdgeType").clicked() { changed = true; }
+                if ui.selectable_value(&mut opts.edge_length, EdgeLengthLens::JaccardStrength, "Strength (Jaccard)").on_hover_text("De-hairball: short rest length for intra-cluster edges, long for global shortcuts.").clicked() { changed = true; }
+                if ui.selectable_value(&mut opts.edge_length, EdgeLengthLens::CorrectedOverlapStrength, "Strength (corrected)").on_hover_text("Edge strength via Batagelj corrected overlap; damps tiny-dense-subgraph over-emphasis.").clicked() { changed = true; }
             });
     });
+    // Stretch factor only matters for the structural-strength edge-length lenses.
+    if matches!(
+        opts.edge_length,
+        EdgeLengthLens::JaccardStrength | EdgeLengthLens::CorrectedOverlapStrength
+    ) {
+        row(ui, "Strength Spread", |ui| {
+            if ui.add(egui::Slider::new(&mut opts.edge_strength_spread, 0.0..=8.0)).on_hover_text("Shortcut edges target rest_len·(1+spread); 0 disables the de-hairball effect.").changed() { changed = true; }
+        });
+    }
 
     subgroup_separator(ui);
 

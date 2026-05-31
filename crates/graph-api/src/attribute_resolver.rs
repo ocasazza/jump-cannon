@@ -6,6 +6,7 @@ use graph_compute::engines::GraphAttributes;
 use graph_layouts::geometric::{
     ClassLens, CoordinationLens, EdgeLengthLens, LensConfig, MassLens,
 };
+use graph_metrics::{compute_edge_strength, EdgeStrengthKind};
 use crate::state::GraphSnapshot;
 
 pub fn resolve(
@@ -93,16 +94,34 @@ pub fn resolve(
     attrs.node_mass = Some(node_mass);
     settings.mass_source = MassSource::Injected;
 
-    // 2. Resolve Edge Attributes (Edge Length)
+    // 2. Resolve Edge Attributes (Edge Length).
+    //
+    // For the structural-strength lenses we compute a per-edge neighbourhood
+    // overlap metric (parallel to `graph.edges`) once, then map it to a spring
+    // rest length — embedded intra-cluster edges short, global shortcuts long —
+    // so small-world communities separate instead of collapsing into a hairball.
+    // See docs/small-world-layout-research.md.
+    let edge_rest_lens: Option<Vec<f32>> = match &lens.edge_length {
+        EdgeLengthLens::JaccardStrength => Some(
+            compute_edge_strength(&snapshot.graph, EdgeStrengthKind::Jaccard)
+                .to_rest_lengths(settings.edge_rest_len, lens.edge_strength_spread),
+        ),
+        EdgeLengthLens::CorrectedOverlapStrength => Some(
+            compute_edge_strength(&snapshot.graph, EdgeStrengthKind::CorrectedOverlap)
+                .to_rest_lengths(settings.edge_rest_len, lens.edge_strength_spread),
+        ),
+        // VaultEdge carries no weight/type yet → uniform rest length.
+        EdgeLengthLens::Uniform | EdgeLengthLens::Weight | EdgeLengthLens::EdgeType => None,
+    };
+
     let mut adj_lens = vec![Vec::new(); n];
-    for edge in &snapshot.graph.edges {
+    for (i, edge) in snapshot.graph.edges.iter().enumerate() {
         let (Some(&src), Some(&tgt)) = (snapshot.id_to_idx.get(&edge.source), snapshot.id_to_idx.get(&edge.target)) else { continue };
         if src == tgt { continue }
-        
-        let len = match &lens.edge_length {
-            EdgeLengthLens::Uniform => 1.0,
-            _ => 1.0, // VaultEdge has no weight/type yet
-        };
+
+        // `edge_rest_lens` is parallel to graph.edges (index `i`); fall back to
+        // the uniform rest length when no strength lens is active.
+        let len = edge_rest_lens.as_ref().map_or(settings.edge_rest_len, |v| v[i]);
         adj_lens[src as usize].push(len);
         adj_lens[tgt as usize].push(len);
     }
@@ -171,7 +190,7 @@ impl CategoricalEncoder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use vault_data::{NodeMetrics, VaultNode, VaultGraph};
+    use vault_data::{NodeMetrics, VaultEdge, VaultNode, VaultGraph};
     use std::collections::HashMap;
 
     #[test]
@@ -198,5 +217,73 @@ mod tests {
         assert_eq!(attrs.node_coordination, Some(vec![0]));
         assert_eq!(attrs.node_mass, Some(vec![1.0]));
         assert_eq!(settings.class_radius.len(), 1);
+    }
+
+    /// End-to-end: the JaccardStrength edge-length lens turns per-edge structural
+    /// overlap into injected `edge_len`, stretching global shortcuts while keeping
+    /// embedded intra-cluster edges at the base rest length. Two triangles joined
+    /// by a single bridge: triangle edges → ~base, bridge → base·(1+spread).
+    #[test]
+    fn jaccard_strength_lens_stretches_shortcuts() {
+        let mut graph = VaultGraph::default();
+        for id in ["a", "b", "c", "d", "e", "f"] {
+            graph.nodes.insert(
+                id.to_string(),
+                VaultNode {
+                    id: id.to_string(),
+                    ..Default::default()
+                },
+            );
+        }
+        for (s, t) in [
+            ("a", "b"),
+            ("b", "c"),
+            ("c", "a"),
+            ("d", "e"),
+            ("e", "f"),
+            ("f", "d"),
+            ("c", "d"), // the global shortcut
+        ] {
+            graph.add_edge(VaultEdge {
+                source: s.to_string(),
+                target: t.to_string(),
+            });
+        }
+
+        let idx_to_id: Vec<String> = ["a", "b", "c", "d", "e", "f"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let id_to_idx: HashMap<String, u32> = idx_to_id
+            .iter()
+            .enumerate()
+            .map(|(i, id)| (id.clone(), i as u32))
+            .collect();
+        let snap = GraphSnapshot {
+            graph,
+            id_to_idx,
+            idx_to_id,
+            binary_cache: HashMap::new(),
+        };
+
+        let mut lens = LensConfig::default();
+        lens.edge_length = EdgeLengthLens::JaccardStrength;
+        lens.edge_strength_spread = 3.0;
+        let (settings, attrs) = resolve(&lens, &snap);
+
+        let edge_len = attrs.edge_len.expect("edge_len present");
+        // 7 undirected edges → each pushed to both endpoints → 14 CSR entries.
+        assert_eq!(edge_len.len(), 14);
+        let min = edge_len.iter().cloned().fold(f32::MAX, f32::min);
+        let max = edge_len.iter().cloned().fold(f32::MIN, f32::max);
+        assert!(
+            (min - 1.0).abs() < 1e-3,
+            "embedded edges should sit at base rest length, got {min}"
+        );
+        assert!(
+            (max - 4.0).abs() < 1e-3,
+            "shortcut should stretch to base·(1+spread)=4.0, got {max}"
+        );
+        assert_eq!(settings.edge_length_source, EdgeLengthSource::Injected);
     }
 }

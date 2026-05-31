@@ -46,7 +46,7 @@ pub use fa2_bh::Fa2BhEngine;
 pub use fa2_brute::Fa2BruteEngine;
 pub use geometric::{EnergyBreakdown, GeometricEngine, GeometricObservables, GeometricSettings};
 pub use geometric_gpu::GeometricGpuEngine;
-pub use multilevel::MultilevelEngine;
+pub use multilevel::{MultilevelEngine, MultilevelSettings, SweepSchedule};
 pub use sgd_stress::SgdStressEngine;
 pub use sgd_stress_gpu::SgdStressGpuEngine;
 

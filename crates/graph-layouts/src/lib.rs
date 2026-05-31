@@ -19,6 +19,7 @@ pub use layout::algorithms::grid::{GridLayout, GridSettings};
 pub use layout::algorithms::sphere::{SphereLayout, SphereSettings};
 pub use layout::algorithms::concentric_static::{ConcentricLayout, ConcentricMetric, ConcentricSettings};
 pub use layout::algorithms::hilbert::{HilbertLayout, HilbertSettings};
+pub use layout::algorithms::spectral::{SpectralLayout, SpectralSettings};
 pub use layout::layout_trait::{
     BoxedPhysics, BoxedStatic, DynPhysicsLayout, DynStaticLayout, LayoutDescriptor, LayoutId,
     LayoutKind, LayoutRequirements, LayoutSettings, PhysicsLayout, StaticLayout,
