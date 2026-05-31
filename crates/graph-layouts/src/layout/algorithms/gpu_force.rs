@@ -3021,9 +3021,27 @@ impl GpuState {
 // ---------- Tests ------------------------------------------------------------
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
+// The GPU tests below hold `GPU_TEST_LOCK` across `.await` to serialize wgpu
+// device use (see the static's doc). Each runs on its own current-thread
+// runtime, so this is safe — the lint is a false positive here.
+#[allow(clippy::await_holding_lock)]
 mod tests {
     use super::*;
     use crate::types::{Edge, Node};
+
+    /// Serializes the GPU tests in THIS binary: running all six concurrently
+    /// creates six wgpu devices at once, which trips Metal validation errors
+    /// under load (an intermittent CI flake). cargo already serializes across
+    /// test binaries, so a per-binary lock is sufficient. A plain
+    /// `std::sync::Mutex` (not tokio's — its `sync` feature isn't enabled in
+    /// dev-deps); held across `.await`, which is safe on a current-thread
+    /// runtime and simply blocks the next test's harness thread. Poison is
+    /// recovered so one failing GPU test doesn't cascade.
+    static GPU_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn gpu_test_guard() -> std::sync::MutexGuard<'static, ()> {
+        GPU_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner())
+    }
 
     fn triangle() -> Graph {
         let mut g = Graph::new();
@@ -3038,6 +3056,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn unit_gpu_force_runs_and_moves_nodes() {
+        let _gpu = gpu_test_guard();
         let mut graph = triangle();
         // Seed deterministic-ish initial positions.
         for (i, id) in ["a", "b", "c"].iter().enumerate() {
@@ -3107,6 +3126,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn unit_gpu_force_grid_produces_reasonable_layout() {
+        let _gpu = gpu_test_guard();
         // 100 random nodes, 200 random edges. Run 10 steps with grid on.
         let mut g = random_graph(100, 200);
         let mut layout = GpuForceLayout::new(GpuForceOptions {
@@ -3147,6 +3167,7 @@ mod tests {
     /// and gravity pulls everything to origin, so the hub stays near origin).
     #[tokio::test(flavor = "current_thread")]
     async fn unit_gpu_force_star_hub_stable() {
+        let _gpu = gpu_test_guard();
         const N_LEAVES: usize = 1000;
         let mut g = Graph::new();
         let mut hub = Node::new("hub".to_string());
@@ -3206,6 +3227,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn unit_gpu_force_barnes_hut_runs_on_small_graph() {
+        let _gpu = gpu_test_guard();
         // 4-node graph, BH mode. Verify it doesn't crash and produces
         // a sensible layout (all positions finite, some movement).
         let mut g = Graph::new();
@@ -3388,6 +3410,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn unit_gpu_force_compact_seed_does_not_explode() {
+        let _gpu = gpu_test_guard();
         // 100 nodes packed in a ~5-unit ball — the same regime a fresh
         // TopoFisheye seed puts the layout in for a sub-100-node vault.
         // Run the *default* GpuForceOptions (repulsion=4000, dt=0.1) for
@@ -3424,6 +3447,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn unit_gpu_force_coincident_seed_recovers() {
+        let _gpu = gpu_test_guard();
         // Tightest stress on the dist² floor + velocity clamp: every node
         // starts at the origin. Whatever forces fire on step 1 must not
         // produce NaN/Inf; the layout should spread to a non-trivial
