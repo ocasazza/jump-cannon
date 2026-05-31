@@ -1296,10 +1296,15 @@ impl eframe::App for App {
                     self.state.dock_tab_strip_force_show = false;
                     let show_tab = force_show || n_tabs > 1;
                     let mut style = egui_dock::Style::from_egui(ui.style());
-                    // Override tab bar background to match theme
+                    // Override ALL dock styling to match high-contrast theme
                     style.tab_bar.bg_fill = crate::ui::theme::palette::BLACK;
                     style.tab_bar.hline_color = crate::ui::theme::palette::BORDER;
                     style.tab_bar.fill_tab_bar = true;
+                    // Kill any grey separators or borders
+                    style.separator.color_idle = crate::ui::theme::palette::BORDER;
+                    style.separator.color_hovered = crate::ui::theme::palette::WHITE;
+                    style.separator.color_dragged = crate::ui::theme::palette::WHITE;
+                    style.main_surface_border_stroke = egui::Stroke::new(0.0, egui::Color32::TRANSPARENT);
                     if !show_tab {
                         style.tab_bar.height = 0.0;
                         style.tab_bar.bg_fill = egui::Color32::TRANSPARENT;

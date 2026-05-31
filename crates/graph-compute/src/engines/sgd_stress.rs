@@ -165,11 +165,7 @@ impl SgdStressEngine {
             id: LAYOUT_ID,
             kind: LayoutKind::Physics,
             display_name: "SGD stress (s_gd2, pivot)",
-            description: "Stress majorization by stochastic gradient descent over node \
-                          pairs (Zheng/Pawar/Goodman s_gd2), using k landmark pivots \
-                          (Ortmann sparse stress) for O(k·n) scaling. Honors \
-                          shortest-path distances — untangles structure FA2 leaves clumped. \
-                          CPU engine; GPU port is a follow-up.",
+            description: "Stress majorization by stochastic gradient descent over node pairs (Zheng/Pawar/Goodman s_gd2), using k landmark pivots (Ortmann sparse stress) for O(k·n) scaling. Honors shortest-path distances — untangles structure FA2 leaves clumped. CPU engine; GPU port is a follow-up.",
             requirements: LayoutRequirements {
                 needs_edges: true,
                 needs_cpu_positions: true,
