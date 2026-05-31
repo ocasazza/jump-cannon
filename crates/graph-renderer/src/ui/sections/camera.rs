@@ -12,9 +12,11 @@ pub fn show(ui: &mut egui::Ui, state: &mut AppState) {
         state.camera = Default::default();
     }
     ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 6.0;
         let _ = ui.button("Fit");
         let _ = ui.button("Reset");
     });
+    ui.add_space(4.0);
 
     subgroup_separator(ui);
 

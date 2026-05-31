@@ -12,7 +12,7 @@ use crate::ui::layout::registry::LayoutRegistry;
 use crate::ui::state::AppState;
 use crate::ui::theme::palette;
 
-use super::{subgroup_label, subgroup_separator};
+use super::{row, subgroup_label, subgroup_separator};
 
 pub fn show(ui: &mut egui::Ui, state: &mut AppState, registry: &LayoutRegistry) {
     state.snapshot_source = Some("Layout".into());
@@ -23,8 +23,7 @@ pub fn show(ui: &mut egui::Ui, state: &mut AppState, registry: &LayoutRegistry) 
         .map(|f| f.descriptor().display_name)
         .unwrap_or("(unknown)");
 
-    ui.horizontal(|ui| {
-        ui.label("Algorithm:");
+    row(ui, "Algorithm", |ui| {
         egui::ComboBox::from_id_salt("layout-algo")
             .selected_text(active_label)
             .show_ui(ui, |ui| {
@@ -41,8 +40,8 @@ pub fn show(ui: &mut egui::Ui, state: &mut AppState, registry: &LayoutRegistry) 
                     }
                 }
             });
-        ui.add_space(8.0);
-        if ui.small_button("↺ Reset").clicked() {
+        ui.add_space(4.0);
+        if ui.small_button("↺").on_hover_text("Reset to defaults").clicked() {
             if let Some(factory) = registry.get(&state.layout.active) {
                 state
                     .layout
@@ -66,7 +65,7 @@ pub fn show(ui: &mut egui::Ui, state: &mut AppState, registry: &LayoutRegistry) 
         // flag; `App::update` reads-and-clears it and dispatches.
         if matches!(factory.kind(), graph_layouts::LayoutKind::Static) {
             subgroup_separator(ui);
-            ui.horizontal(|ui| {
+            row(ui, "", |ui| {
                 if ui.button("Solve").clicked() {
                     state.layout_solve_requested = true;
                 }
@@ -88,7 +87,7 @@ pub fn show(ui: &mut egui::Ui, state: &mut AppState, registry: &LayoutRegistry) 
             && active_id != "remote-fa2"
         {
             subgroup_separator(ui);
-            ui.horizontal(|ui| {
+            row(ui, "", |ui| {
                 if ui
                     .button("Wake")
                     .on_hover_text(
@@ -134,7 +133,8 @@ fn show_remote_engine_picker(ui: &mut egui::Ui, state: &mut AppState) {
 
     let snapshot = state.compute.current();
 
-    ui.horizontal(|ui| {
+    // Use row() for consistent spacing/padding with other controls
+    row(ui, "", |ui| {
         match &snapshot {
             Some(Ok(eng)) if eng.connected => {
                 let active = eng.active.clone();
@@ -180,7 +180,7 @@ fn show_remote_engine_picker(ui: &mut egui::Ui, state: &mut AppState) {
             }
         }
 
-        ui.add_space(8.0);
+        ui.add_space(4.0);
         if ui
             .small_button("↻")
             .on_hover_text("Refresh remote engine list")
