@@ -6,9 +6,12 @@ mod benchmark;
 mod file_parsers;
 mod utils;
 
-use layout::LayoutEngine;
 pub use types::{Graph, Node, Edge, Id, MetadataValue, LayoutOptions};
-pub use layout::algorithms::fcose::{FcoseLayoutEngine, FcoseOptions};
+pub use layout::algorithms::fcose::{FcoseLayout, FcoseQuality, FcoseSettings};
+pub use layout::algorithms::cose_bilkent::{CoseBilkentLayout, CoseBilkentSettings};
+pub use layout::algorithms::cise::{CiseLayout, CiseSettings};
+pub use layout::algorithms::dagre::{DagreLayout, DagreRanker, DagreSettings, RankDirection};
+pub use layout::algorithms::klay::{KlayLayout, KlaySettings};
 pub use layout::algorithms::gpu_force::{GpuForceLayout, GpuForceOptions, RepulsionMode, SeedMode};
 pub use layout::algorithms::random::{RandomLayout, RandomSettings};
 pub use layout::algorithms::circle::{CircleAxis, CircleLayout, CircleSettings};
@@ -90,20 +93,6 @@ impl LayoutManager {
         self.graph.remove_edge(&id);
     }
 
-    /// Apply the fCoSE layout algorithm
-    pub fn apply_fcose_layout(&mut self, options_json: String) -> Result<String, JsValue> {
-        let options: FcoseOptions = serde_json::from_str(&options_json)
-            .map_err(|e| JsValue::from_str(&format!("Failed to parse options: {}", e)))?;
-        
-        FcoseLayoutEngine::new(options)
-            .apply_layout(&mut self.graph)
-            .map_err(|e| JsValue::from_str(&format!("Layout error: {}", e)))?;
-        
-        // Return the updated graph as JSON
-        serde_json::to_string(&self.graph)
-            .map_err(|e| JsValue::from_str(&format!("Failed to serialize graph: {}", e)))
-    }
-
     /// Get the current graph state as JSON
     pub fn get_graph_json(&self) -> Result<String, JsValue> {
         serde_json::to_string(&self.graph)
@@ -123,12 +112,6 @@ impl LayoutManager {
             .map_err(|e| JsValue::from_str(&format!("Failed to parse file: {}", e)))?;
         Ok(())
     }
-}
-
-/// Native (non-WASM) entry point — no wasm_bindgen, safe to call from native binaries.
-pub fn run_fcose_layout_native(graph: &mut Graph, options: &FcoseOptions) -> Result<(), String> {
-    use layout::LayoutEngine;
-    FcoseLayoutEngine::new(options.clone()).apply_layout(graph)
 }
 
 /// Convenience native helper: spin up a one-shot GPU force layout, run

@@ -46,29 +46,20 @@ manager.add_node("1", null, null);  // Position will be set by layout
 manager.add_node("2", null, null);
 manager.add_edge("e1", "1", "2");
 
-// Configure and apply fCoSE layout
-const options = {
-  base: {
-    padding: 30
-  },
-  quality: "default",
-  node_repulsion: 4500,
-  ideal_edge_length: 50,
-  node_overlap: 10
-};
-
-// Apply layout and get the result
-const result = manager.apply_fcose_layout(JSON.stringify(options));
-const graph = JSON.parse(result);
-
-// Access node positions
-console.log(graph.nodes["1"].position);  // [x, y] coordinates
+// Layouts run through the `StaticLayout` / `PhysicsLayout` registry rather
+// than per-algorithm WASM entry points. See the renderer's layout registry
+// and the `LayoutManager` GPU-force bindings for the live integration path.
 ```
 
 ### In Rust
 
+Each algorithm implements the `StaticLayout` trait: a one-shot `solve(&settings,
+&graph)` that returns positions packed as `[x0,y0,z0, x1,y1,z1, …]` in the
+graph's id-sorted node order.
+
 ```rust
-use rust_graph_layouts::{Graph, Node, Edge, FcoseLayoutEngine, FcoseOptions};
+use rust_graph_layouts::{Graph, Node, Edge, FcoseLayout, FcoseSettings};
+use rust_graph_layouts::StaticLayout;
 
 // Create a new graph
 let mut graph = Graph::new();
@@ -78,15 +69,10 @@ graph.add_node(Node::new("1"));
 graph.add_node(Node::new("2"));
 graph.add_edge(Edge::new("e1", "1", "2"));
 
-// Configure and apply layout
-let options = FcoseOptions::default();
-let engine = FcoseLayoutEngine::new(options);
-engine.apply_layout(&mut graph).unwrap();
-
-// Access node positions
-if let Some(pos) = graph.nodes.get("1").unwrap().position {
-    println!("Node 1 position: ({}, {})", pos.0, pos.1);
-}
+// Configure and solve — `packed` is [x,y,z] per node, id-sorted.
+let settings = FcoseSettings::default();
+let packed = FcoseLayout::solve(&settings, &graph).unwrap();
+println!("Node 1 position: ({}, {})", packed[0], packed[1]);
 ```
 
 ## Layout Algorithms

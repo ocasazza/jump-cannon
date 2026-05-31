@@ -1,509 +1,404 @@
-#![allow(dead_code)]
+//! Dagre hierarchical (layered DAG) static layout.
+//!
+//! One-shot CPU solver on the System-B [`StaticLayout`] trait (replacing the
+//! legacy `DagreLayoutEngine`). Phases, preserved from the original: rank nodes
+//! into layers (longest-path, or network-simplex / tight-tree refinements),
+//! optionally break backward edges, reduce crossings by adjacent swaps, then
+//! assign coordinates honoring the rank direction. Computes into local
+//! structures; the graph is never mutated.
+
 use std::collections::{HashMap, HashSet};
-use crate::types::{Graph, DagreLayoutOptions};
-use crate::layout::traits::{LayoutEngine, LayeredLayout};
 
-/// Dagre layout engine implementation
-pub struct DagreLayoutEngine {
-    options: DagreLayoutOptions,
+use serde::{Deserialize, Serialize};
+
+use crate::layout::layout_trait::{
+    LayoutDescriptor, LayoutKind, LayoutRequirements, StaticLayout,
+};
+use crate::types::Graph;
+
+/// Rank (layer) growth direction.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub enum RankDirection {
+    #[default]
+    TB,
+    BT,
+    LR,
+    RL,
 }
 
-impl DagreLayoutEngine {
-    /// Create a new Dagre layout engine with the given options
-    pub fn new(options: DagreLayoutOptions) -> Self {
-        Self { options }
-    }
+/// Ranking strategy.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub enum DagreRanker {
+    #[default]
+    NetworkSimplex,
+    TightTree,
+    LongestPath,
 }
 
-impl LayoutEngine for DagreLayoutEngine {
-    fn apply_layout(&self, graph: &mut Graph) -> Result<(), String> {
-        // Step 1: Assign nodes to ranks (layers)
-        let mut layers = self.assign_layers(graph)?;
-        
-        // Step 2: Break cycles if needed (if acyclic option is enabled)
-        if self.options.acyclic {
-            self.break_cycles(graph, &mut layers)?;
-        }
-        
-        // Step 3: Order nodes within ranks to minimize crossings
-        self.minimize_crossings(&mut layers, graph)?;
-        
-        // Step 4: Assign coordinates based on rank and position
-        self.assign_coordinates(graph, &layers)
-    }
-    
-    fn name(&self) -> &'static str {
-        "Dagre"
-    }
-    
-    fn description(&self) -> &'static str {
-        "Directed graph layout algorithm optimized for hierarchical visualizations"
-    }
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DagreSettings {
+    pub rank_direction: RankDirection,
+    pub ranker: DagreRanker,
+    pub rank_separation: f64,
+    pub node_separation: f64,
+    pub acyclic: bool,
 }
 
-impl LayeredLayout for DagreLayoutEngine {
-    fn assign_layers(&self, graph: &Graph) -> Result<Vec<Vec<String>>, String> {
-        match self.options.ranker.as_str() {
-            "network-simplex" => self.network_simplex_ranking(graph),
-            "tight-tree" => self.tight_tree_ranking(graph),
-            "longest-path" => self.longest_path_ranking(graph),
-            _ => self.longest_path_ranking(graph), // Default to longest-path if unknown
+impl Default for DagreSettings {
+    fn default() -> Self {
+        Self {
+            rank_direction: RankDirection::TB,
+            ranker: DagreRanker::NetworkSimplex,
+            rank_separation: 50.0,
+            node_separation: 50.0,
+            acyclic: true,
         }
     }
-    
-    fn break_cycles(&self, graph: &mut Graph, layers: &mut Vec<Vec<String>>) -> Result<(), String> {
-        // Find edges that point to nodes in previous layers
-        let edges_to_reverse: Vec<String> = graph.edges.values()
-            .filter(|edge| {
-                let source_layer = layers.iter().position(|layer| layer.contains(&edge.source));
-                let target_layer = layers.iter().position(|layer| layer.contains(&edge.target));
-                
-                if let (Some(sl), Some(tl)) = (source_layer, target_layer) {
-                    sl > tl // Edge points backwards
-                } else {
-                    false
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct DagreLayout;
+
+/// Longest-path layering: roots (no incoming edge) on layer 0, then BFS along
+/// edges. Node ids are processed in sorted order for determinism.
+fn longest_path_ranking(ids: &[&String], edges: &[(String, String)]) -> Vec<Vec<String>> {
+    let mut layers: Vec<Vec<String>> = Vec::new();
+    let mut assigned: HashSet<String> = HashSet::new();
+
+    let mut roots: Vec<String> = ids
+        .iter()
+        .filter(|id| !edges.iter().any(|(_, t)| t == **id))
+        .map(|id| (*id).clone())
+        .collect();
+    if roots.is_empty() && !ids.is_empty() {
+        roots.push(ids[0].clone());
+    }
+
+    for r in &roots {
+        assigned.insert(r.clone());
+    }
+    layers.push(roots);
+
+    let mut current = 0;
+    while current < layers.len() {
+        let mut next: Vec<String> = Vec::new();
+        for node in &layers[current] {
+            for (s, t) in edges {
+                if s == node && !assigned.contains(t) {
+                    next.push(t.clone());
+                    assigned.insert(t.clone());
                 }
-            })
-            .map(|edge| edge.id.clone())
-            .collect();
-        
-        // Reverse the identified edges
-        for edge_id in edges_to_reverse {
-            if let Some(edge) = graph.edges.get_mut(&edge_id) {
-                std::mem::swap(&mut edge.source, &mut edge.target);
             }
         }
-        
-        Ok(())
+        if !next.is_empty() {
+            layers.push(next);
+        }
+        current += 1;
     }
-    
-    fn minimize_crossings(&self, layers: &mut Vec<Vec<String>>, graph: &Graph) -> Result<(), String> {
-        // For each pair of adjacent layers
-        for i in 0..layers.len().saturating_sub(1) {
-            let mut improved = true;
-            
-            // Keep trying to improve until no more improvements can be made
-            while improved {
-                improved = false;
-                
-                // Clone the current layer for comparison
-                let current_layer = layers[i].clone();
-                
-                // Get mutable reference to the next layer
-                let next_layer = &mut layers[i + 1];
-                
-                // Count crossings between current positions
-                let mut best_crossings = self.count_crossings(&current_layer, next_layer, graph);
-                
-                // Try swapping adjacent nodes in the next layer
-                for j in 0..next_layer.len().saturating_sub(1) {
-                    next_layer.swap(j, j + 1);
-                    
-                    let new_crossings = self.count_crossings(&current_layer, next_layer, graph);
-                    if new_crossings < best_crossings {
-                        best_crossings = new_crossings;
+
+    let remaining: Vec<String> = ids
+        .iter()
+        .filter(|id| !assigned.contains(**id))
+        .map(|id| (*id).clone())
+        .collect();
+    if !remaining.is_empty() {
+        layers.push(remaining);
+    }
+
+    layers
+}
+
+/// Move nodes to adjacent layers when doing so shortens incident edges, keeping
+/// the layering a valid DAG ordering. (Simplified network-simplex refinement.)
+fn optimize_ranking(layers: &mut Vec<Vec<String>>, edges: &[(String, String)]) {
+    let mut node_to_layer: HashMap<String, usize> = HashMap::new();
+    for (idx, layer) in layers.iter().enumerate() {
+        for node in layer {
+            node_to_layer.insert(node.clone(), idx);
+        }
+    }
+
+    let mut improved = true;
+    while improved {
+        improved = false;
+        for layer_idx in 0..layers.len() {
+            let mut i = 0;
+            while i < layers[layer_idx].len() {
+                let node_id = layers[layer_idx][i].clone();
+
+                let edge_len_sum = |at: usize, n2l: &HashMap<String, usize>| -> usize {
+                    let mut sum = 0usize;
+                    for (s, t) in edges {
+                        if *s == node_id || *t == node_id {
+                            let other = if *s == node_id { t } else { s };
+                            if let Some(ol) = n2l.get(other) {
+                                let diff = if at > *ol { at - *ol } else { *ol - at };
+                                sum = sum.saturating_add(diff);
+                            }
+                        }
+                    }
+                    sum
+                };
+
+                let current_sum = edge_len_sum(layer_idx, &node_to_layer);
+
+                let mut moved = false;
+                for new_idx in [layer_idx.saturating_sub(1), layer_idx + 1] {
+                    if new_idx >= layers.len() || new_idx == layer_idx {
+                        continue;
+                    }
+
+                    // Preserve DAG validity for every edge touching this node.
+                    let valid = edges.iter().all(|(s, t)| {
+                        if *s != node_id && *t != node_id {
+                            return true;
+                        }
+                        let sl = if *s == node_id {
+                            new_idx
+                        } else {
+                            *node_to_layer.get(s).unwrap_or(&new_idx)
+                        };
+                        let tl = if *t == node_id {
+                            new_idx
+                        } else {
+                            *node_to_layer.get(t).unwrap_or(&new_idx)
+                        };
+                        sl < tl
+                    });
+                    if !valid {
+                        continue;
+                    }
+
+                    if edge_len_sum(new_idx, &node_to_layer) < current_sum {
+                        let node = layers[layer_idx].remove(i);
+                        layers[new_idx].push(node.clone());
+                        node_to_layer.insert(node, new_idx);
                         improved = true;
-                    } else {
-                        // Swap back if no improvement
-                        next_layer.swap(j, j + 1);
+                        moved = true;
+                        if i > 0 {
+                            i -= 1;
+                        }
+                        break;
                     }
                 }
-            }
-        }
-        
-        Ok(())
-    }
-    
-    fn count_crossings(&self, layer1: &[String], layer2: &[String], graph: &Graph) -> usize {
-        let mut crossings = 0;
-        
-        // For each pair of edges between the layers
-        for (i1, n1) in layer1.iter().enumerate() {
-            for (i2, n2) in layer1.iter().enumerate().skip(i1 + 1) {
-                for edge1 in graph.edges.values() {
-                    if edge1.source != *n1 { continue; }
-                    
-                    for edge2 in graph.edges.values() {
-                        if edge2.source != *n2 { continue; }
-                        
-                        let j1 = layer2.iter().position(|n| *n == edge1.target);
-                        let j2 = layer2.iter().position(|n| *n == edge2.target);
-                        
-                        if let (Some(j1), Some(j2)) = (j1, j2) {
-                            // Check if edges cross
-                            if (i1 < i2 && j1 > j2) || (i1 > i2 && j1 < j2) {
-                                crossings += 1;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        
-        crossings
-    }
-}
-
-impl DagreLayoutEngine {
-    /// Assign coordinates to nodes based on their layer and position
-    fn assign_coordinates(&self, graph: &mut Graph, layers: &[Vec<String>]) -> Result<(), String> {
-        let is_horizontal = self.options.rank_direction == "LR" || self.options.rank_direction == "RL";
-        let is_reversed = self.options.rank_direction == "BT" || self.options.rank_direction == "RL";
-        
-        let rank_separation = self.options.rank_separation;
-        let node_separation = self.options.node_separation;
-        
-        // Assign coordinates based on rank direction
-        for (layer_idx, layer) in layers.iter().enumerate() {
-        let layer_pos = if is_reversed && layers.len() > 0 {
-            // Ensure we don't underflow when calculating the reversed position
-            if layer_idx < layers.len() {
-                let reversed_idx = layers.len() - 1 - layer_idx;
-                reversed_idx as f64 * rank_separation
-            } else {
-                0.0 // Default position if layer_idx is out of bounds
-            }
-        } else {
-            layer_idx as f64 * rank_separation
-        };
-            
-            // Assign positions within layer
-            let layer_width = if layer.len() > 0 {
-                (layer.len() - 1) as f64 * node_separation
-            } else {
-                0.0
-            };
-            let start_pos = -layer_width / 2.0;
-            
-            for (node_idx, node_id) in layer.iter().enumerate() {
-                if let Some(node) = graph.nodes.get_mut(node_id) {
-                    let node_pos = start_pos + node_idx as f64 * node_separation;
-                    
-                    // Set position based on rank direction
-                    if is_horizontal {
-                        node.position = Some((layer_pos, node_pos));
-                    } else {
-                        node.position = Some((node_pos, layer_pos));
-                    }
-                }
-            }
-        }
-        
-        Ok(())
-    }
-    
-    /// Longest path ranking algorithm
-    fn longest_path_ranking(&self, graph: &Graph) -> Result<Vec<Vec<String>>, String> {
-        let mut layers: Vec<Vec<String>> = Vec::new();
-        let mut assigned = HashSet::new();
-        
-        // Find root nodes (nodes with no incoming edges)
-        let mut roots: Vec<String> = graph.nodes.keys()
-            .filter(|node_id| !graph.edges.values().any(|e| e.target == **node_id))
-            .cloned()
-            .collect();
-        
-        // If no root nodes found, start with any node
-        if roots.is_empty() && !graph.nodes.is_empty() {
-            roots.push(graph.nodes.keys().next().unwrap().clone());
-        }
-        
-        // Assign initial nodes to layer 0
-        layers.push(roots.clone());
-        for root in &roots {
-            assigned.insert(root.clone());
-        }
-        
-        // Build subsequent layers
-        let mut current_layer = 0;
-        while current_layer < layers.len() {
-            let mut next_layer = Vec::new();
-            
-            for node_id in &layers[current_layer] {
-                // Find all unassigned nodes that this node points to
-                for edge in graph.edges.values() {
-                    if edge.source == *node_id && !assigned.contains(&edge.target) {
-                        next_layer.push(edge.target.clone());
-                        assigned.insert(edge.target.clone());
-                    }
-                }
-            }
-            
-            if !next_layer.is_empty() {
-                layers.push(next_layer);
-            }
-            
-            current_layer += 1;
-        }
-        
-        // Handle any remaining nodes (disconnected or in cycles)
-        let remaining: Vec<String> = graph.nodes.keys()
-            .filter(|node_id| !assigned.contains(*node_id))
-            .cloned()
-            .collect();
-        
-        if !remaining.is_empty() {
-            layers.push(remaining);
-        }
-        
-        Ok(layers)
-    }
-    
-    /// Network simplex ranking algorithm (simplified version)
-    fn network_simplex_ranking(&self, graph: &Graph) -> Result<Vec<Vec<String>>, String> {
-        // For simplicity, we'll use a modified longest path algorithm
-        // A full network simplex implementation would be more complex
-        
-        // First, get initial ranking using longest path
-        let mut layers = self.longest_path_ranking(graph)?;
-        
-        // Then, try to optimize the ranking to minimize edge lengths
-        self.optimize_ranking(&mut layers, graph)?;
-        
-        Ok(layers)
-    }
-    
-    /// Tight tree ranking algorithm
-    fn tight_tree_ranking(&self, graph: &Graph) -> Result<Vec<Vec<String>>, String> {
-        // Similar to longest path but with tighter constraints
-        let mut layers = self.longest_path_ranking(graph)?;
-        
-        // Try to make the tree more compact
-        self.compact_layers(&mut layers, graph)?;
-        
-        Ok(layers)
-    }
-    
-    /// Optimize node ranking to minimize edge lengths
-    fn optimize_ranking(&self, layers: &mut Vec<Vec<String>>, graph: &Graph) -> Result<(), String> {
-        // Create a map of node to layer
-        let mut node_to_layer = HashMap::new();
-        for (layer_idx, layer) in layers.iter().enumerate() {
-            for node_id in layer {
-                node_to_layer.insert(node_id.clone(), layer_idx);
-            }
-        }
-        
-        // Try to move nodes to minimize edge lengths
-        let mut improved = true;
-        while improved {
-            improved = false;
-            
-            for layer_idx in 0..layers.len() {
-                let mut i = 0;
-                while i < layers[layer_idx].len() {
-                    let node_id = &layers[layer_idx][i];
-                    
-                    // Calculate current edge length sum
-                    let mut current_sum: usize = 0;
-                    for edge in graph.edges.values() {
-                        if edge.source == *node_id || edge.target == *node_id {
-                            let other_node = if edge.source == *node_id { &edge.target } else { &edge.source };
-                            if let Some(other_layer) = node_to_layer.get(other_node) {
-                                // Safely calculate the absolute difference to avoid overflow
-                                let diff = if layer_idx > *other_layer {
-                                    layer_idx - *other_layer
-                                } else {
-                                    *other_layer - layer_idx
-                                };
-                                current_sum = current_sum.saturating_add(diff);
-                            }
-                        }
-                    }
-                    
-                    // Try moving to adjacent layers
-                    for new_layer_idx in [layer_idx.saturating_sub(1), layer_idx + 1] {
-                        if new_layer_idx >= layers.len() {
-                            continue;
-                        }
-
-                        // Check that the move preserves DAG layering:
-                        // for every directed edge u->v, u must be in a strictly
-                        // lower-indexed layer than v.
-                        let move_is_valid = graph.edges.values().all(|edge| {
-                            let (src_node, tgt_node) = (&edge.source, &edge.target);
-                            let src_layer = if src_node == node_id {
-                                new_layer_idx
-                            } else {
-                                *node_to_layer.get(src_node).unwrap_or(&new_layer_idx)
-                            };
-                            let tgt_layer = if tgt_node == node_id {
-                                new_layer_idx
-                            } else {
-                                *node_to_layer.get(tgt_node).unwrap_or(&new_layer_idx)
-                            };
-                            // Only enforce constraint for edges touching this node
-                            if src_node == node_id || tgt_node == node_id {
-                                src_layer < tgt_layer
-                            } else {
-                                true
-                            }
-                        });
-
-                        if !move_is_valid {
-                            continue;
-                        }
-
-                        // Calculate new edge length sum if moved
-                        let mut new_sum: usize = 0;
-                        for edge in graph.edges.values() {
-                            if edge.source == *node_id || edge.target == *node_id {
-                                let other_node = if edge.source == *node_id { &edge.target } else { &edge.source };
-                                if let Some(other_layer) = node_to_layer.get(other_node) {
-                                    // Safely calculate the absolute difference to avoid overflow
-                                    let diff = if new_layer_idx > *other_layer {
-                                        new_layer_idx - *other_layer
-                                    } else {
-                                        *other_layer - new_layer_idx
-                                    };
-                                    new_sum = new_sum.saturating_add(diff);
-                                }
-                            }
-                        }
-
-                        // If moving improves the sum, do it
-                        if new_sum < current_sum {
-                            let node = layers[layer_idx].remove(i);
-                            layers[new_layer_idx].push(node.clone());
-                            node_to_layer.insert(node, new_layer_idx);
-                            improved = true;
-
-                            // Adjust index only if i > 0 to avoid underflow
-                            if i > 0 {
-                                i -= 1;
-                            }
-                            break;
-                        }
-                    }
-                    
+                if !moved {
                     i += 1;
                 }
             }
         }
-        
-        Ok(())
-    }
-    
-    /// Make layers more compact
-    fn compact_layers(&self, layers: &mut Vec<Vec<String>>, _graph: &Graph) -> Result<(), String> {
-        // Remove empty layers
-        layers.retain(|layer| !layer.is_empty());
-        
-        Ok(())
     }
 }
 
-/// Public interface for applying the Dagre layout algorithm
-pub fn apply_layout(graph: &mut Graph, options: &DagreLayoutOptions) -> Result<(), String> {
-    let engine = DagreLayoutEngine::new(options.clone());
-    engine.apply_layout(graph)
+fn count_crossings(layer1: &[String], layer2: &[String], edges: &[(String, String)]) -> usize {
+    let mut crossings = 0;
+    for (i1, n1) in layer1.iter().enumerate() {
+        for (i2, n2) in layer1.iter().enumerate().skip(i1 + 1) {
+            for (s1, t1) in edges {
+                if s1 != n1 {
+                    continue;
+                }
+                for (s2, t2) in edges {
+                    if s2 != n2 {
+                        continue;
+                    }
+                    let j1 = layer2.iter().position(|n| n == t1);
+                    let j2 = layer2.iter().position(|n| n == t2);
+                    if let (Some(j1), Some(j2)) = (j1, j2) {
+                        if (i1 < i2 && j1 > j2) || (i1 > i2 && j1 < j2) {
+                            crossings += 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    crossings
+}
+
+fn minimize_crossings(layers: &mut [Vec<String>], edges: &[(String, String)]) {
+    for i in 0..layers.len().saturating_sub(1) {
+        let mut improved = true;
+        while improved {
+            improved = false;
+            let current = layers[i].clone();
+            let next = &mut layers[i + 1];
+            let mut best = count_crossings(&current, next, edges);
+            for j in 0..next.len().saturating_sub(1) {
+                next.swap(j, j + 1);
+                let c = count_crossings(&current, next, edges);
+                if c < best {
+                    best = c;
+                    improved = true;
+                } else {
+                    next.swap(j, j + 1);
+                }
+            }
+        }
+    }
+}
+
+/// Reverse edges that point from a later layer back to an earlier one.
+fn break_cycles(edges: &mut [(String, String)], layers: &[Vec<String>]) {
+    let layer_of = |id: &str| layers.iter().position(|l| l.iter().any(|n| n == id));
+    for (s, t) in edges.iter_mut() {
+        if let (Some(sl), Some(tl)) = (layer_of(s), layer_of(t)) {
+            if sl > tl {
+                std::mem::swap(s, t);
+            }
+        }
+    }
+}
+
+impl StaticLayout for DagreLayout {
+    type Settings = DagreSettings;
+
+    fn descriptor() -> LayoutDescriptor {
+        LayoutDescriptor {
+            id: "dagre",
+            kind: LayoutKind::Static,
+            display_name: "Hierarchical (Dagre)",
+            description: "Directed-graph layout optimized for hierarchical visualizations.",
+            requirements: LayoutRequirements {
+                needs_edges: true,
+                needs_cpu_positions: false,
+                needs_gpu_positions_buffer: true,
+            },
+        }
+    }
+
+    fn solve(settings: &Self::Settings, graph: &Graph) -> Result<Vec<f32>, String> {
+        let mut ids: Vec<&String> = graph.nodes.keys().collect();
+        ids.sort();
+        let n = ids.len();
+        if n == 0 {
+            return Ok(Vec::new());
+        }
+
+        let mut edges: Vec<(String, String)> = graph
+            .edges
+            .values()
+            .map(|e| (e.source.clone(), e.target.clone()))
+            .collect();
+
+        // Phase 1: rank into layers.
+        let mut layers = match settings.ranker {
+            DagreRanker::LongestPath => longest_path_ranking(&ids, &edges),
+            DagreRanker::NetworkSimplex => {
+                let mut l = longest_path_ranking(&ids, &edges);
+                optimize_ranking(&mut l, &edges);
+                l
+            }
+            DagreRanker::TightTree => {
+                let mut l = longest_path_ranking(&ids, &edges);
+                l.retain(|layer| !layer.is_empty());
+                l
+            }
+        };
+
+        // Phase 2: break cycles (after ranking, matching the original order).
+        if settings.acyclic {
+            break_cycles(&mut edges, &layers);
+        }
+
+        // Phase 3: reduce crossings.
+        minimize_crossings(&mut layers, &edges);
+
+        // Phase 4: coordinate assignment.
+        let is_horizontal =
+            matches!(settings.rank_direction, RankDirection::LR | RankDirection::RL);
+        let is_reversed =
+            matches!(settings.rank_direction, RankDirection::BT | RankDirection::RL);
+        let rank_sep = settings.rank_separation;
+        let node_sep = settings.node_separation;
+
+        let mut xy: HashMap<&str, (f64, f64)> = HashMap::with_capacity(n);
+        let num_layers = layers.len();
+        for (layer_idx, layer) in layers.iter().enumerate() {
+            let layer_pos = if is_reversed {
+                (num_layers - 1 - layer_idx) as f64 * rank_sep
+            } else {
+                layer_idx as f64 * rank_sep
+            };
+            let layer_width = (layer.len().saturating_sub(1)) as f64 * node_sep;
+            let start = -layer_width / 2.0;
+            for (node_idx, node_id) in layer.iter().enumerate() {
+                let node_pos = start + node_idx as f64 * node_sep;
+                let coord = if is_horizontal {
+                    (layer_pos, node_pos)
+                } else {
+                    (node_pos, layer_pos)
+                };
+                xy.insert(node_id.as_str(), coord);
+            }
+        }
+
+        let mut out = Vec::with_capacity(n * 3);
+        for id in &ids {
+            let (x, y) = xy.get(id.as_str()).copied().unwrap_or((0.0, 0.0));
+            out.push(x as f32);
+            out.push(y as f32);
+            out.push(0.0);
+        }
+        Ok(out)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{Node, Edge};
+    use crate::types::{Edge, Node};
 
-    #[test]
-    fn test_simple_chain() {
-        let mut graph = Graph::new();
-        
-        let node_a = Node::new("A");
-        let node_b = Node::new("B");
-        let node_c = Node::new("C");
-        
-        graph.add_node(node_a)
-             .add_node(node_b)
-             .add_node(node_c);
-        
-        let edge1 = Edge::new("e1", "A", "B");
-        let edge2 = Edge::new("e2", "B", "C");
-        
-        graph.add_edge(edge1)
-             .add_edge(edge2);
-        
-        let engine = DagreLayoutEngine::new(DagreLayoutOptions::default());
-        engine.apply_layout(&mut graph).unwrap();
-        
-        // For top-to-bottom layout, y-coordinates should increase
-        let a_pos = graph.nodes.get("A").unwrap().position.unwrap();
-        let b_pos = graph.nodes.get("B").unwrap().position.unwrap();
-        let c_pos = graph.nodes.get("C").unwrap().position.unwrap();
-        
-        assert!(a_pos.1 < b_pos.1);
-        assert!(b_pos.1 < c_pos.1);
+    fn pos(g: &Graph, out: &[f32], id: &str) -> (f32, f32) {
+        let mut ids: Vec<&String> = g.nodes.keys().collect();
+        ids.sort();
+        let i = ids.iter().position(|s| s.as_str() == id).unwrap();
+        (out[i * 3], out[i * 3 + 1])
+    }
+
+    fn chain() -> Graph {
+        let mut g = Graph::new();
+        g.add_node(Node::new("A"));
+        g.add_node(Node::new("B"));
+        g.add_node(Node::new("C"));
+        g.add_edge(Edge::new("e1", "A", "B"));
+        g.add_edge(Edge::new("e2", "B", "C"));
+        g
     }
 
     #[test]
-    fn test_left_to_right_direction() {
-        let mut graph = Graph::new();
-        
-        let node_a = Node::new("A");
-        let node_b = Node::new("B");
-        let node_c = Node::new("C");
-        
-        graph.add_node(node_a)
-             .add_node(node_b)
-             .add_node(node_c);
-        
-        let edge1 = Edge::new("e1", "A", "B");
-        let edge2 = Edge::new("e2", "B", "C");
-        
-        graph.add_edge(edge1)
-             .add_edge(edge2);
-        
-        // Create options with left-to-right direction
-        let mut options = DagreLayoutOptions::default();
-        options.rank_direction = "LR".to_string();
-        
-        let engine = DagreLayoutEngine::new(options);
-        engine.apply_layout(&mut graph).unwrap();
-        
-        // For left-to-right layout, x-coordinates should increase
-        let a_pos = graph.nodes.get("A").unwrap().position.unwrap();
-        let b_pos = graph.nodes.get("B").unwrap().position.unwrap();
-        let c_pos = graph.nodes.get("C").unwrap().position.unwrap();
-        
-        assert!(a_pos.0 < b_pos.0);
-        assert!(b_pos.0 < c_pos.0);
+    fn tb_chain_increases_y() {
+        let g = chain();
+        let out = DagreLayout::solve(&DagreSettings::default(), &g).unwrap();
+        let a = pos(&g, &out, "A");
+        let b = pos(&g, &out, "B");
+        let c = pos(&g, &out, "C");
+        assert!(a.1 < b.1 && b.1 < c.1, "TB ranks should increase in y");
     }
-    
+
     #[test]
-    fn test_cycle_breaking() {
-        let mut graph = Graph::new();
-        
-        let node_a = Node::new("A");
-        let node_b = Node::new("B");
-        
-        graph.add_node(node_a)
-             .add_node(node_b);
-        
-        let edge1 = Edge::new("e1", "A", "B");
-        let edge2 = Edge::new("e2", "B", "A");
-        
-        graph.add_edge(edge1)
-             .add_edge(edge2);
-        
-        let mut options = DagreLayoutOptions::default();
-        options.acyclic = true;
-        
-        let engine = DagreLayoutEngine::new(options);
-        let mut layers = engine.assign_layers(&graph).unwrap();
-        engine.break_cycles(&mut graph, &mut layers).unwrap();
-        
-        // After cycle breaking, we should have either all A->B or all B->A
-        let mut forward_count = 0;
-        let mut backward_count = 0;
-        
-        for edge in graph.edges.values() {
-            if edge.source == "A" && edge.target == "B" {
-                forward_count += 1;
-            } else if edge.source == "B" && edge.target == "A" {
-                backward_count += 1;
-            }
-        }
-        
-        assert_eq!(forward_count + backward_count, 2);
-        assert!(forward_count == 2 || backward_count == 2);
+    fn lr_chain_increases_x() {
+        let g = chain();
+        let s = DagreSettings { rank_direction: RankDirection::LR, ..DagreSettings::default() };
+        let out = DagreLayout::solve(&s, &g).unwrap();
+        let a = pos(&g, &out, "A");
+        let b = pos(&g, &out, "B");
+        let c = pos(&g, &out, "C");
+        assert!(a.0 < b.0 && b.0 < c.0, "LR ranks should increase in x");
+    }
+
+    #[test]
+    fn empty_graph_yields_empty_output() {
+        let g = Graph::new();
+        let out = DagreLayout::solve(&DagreSettings::default(), &g).unwrap();
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn all_nodes_get_finite_positions_with_isolated_node() {
+        let mut g = chain();
+        g.add_node(Node::new("Z")); // isolated
+        let out = DagreLayout::solve(&DagreSettings::default(), &g).unwrap();
+        assert_eq!(out.len(), 4 * 3);
+        assert!(out.iter().all(|v| v.is_finite()));
     }
 }

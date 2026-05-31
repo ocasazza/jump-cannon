@@ -1,193 +1,180 @@
-#![allow(dead_code)]
-use crate::types::{Graph, CoseBilkentLayoutOptions};
-use crate::layout::traits::{LayoutEngine, ForceDirectedLayout};
+//! CoSE-Bilkent static layout.
+//!
+//! One-shot CPU force-directed solver on the System-B [`StaticLayout`] trait
+//! (replacing the legacy `CoseBilkentLayoutEngine`). Same force model as
+//! [`super::fcose`] — inverse-square repulsion, edge springs toward
+//! `ideal_edge_length`, damping 0.1 — but with a fixed (configurable)
+//! iteration count and no overlap-removal pass, matching the original.
 
-pub struct CoseBilkentLayoutEngine {
-    options: CoseBilkentLayoutOptions,
+use std::collections::HashMap;
+
+use rand::Rng;
+use serde::{Deserialize, Serialize};
+
+use crate::layout::layout_trait::{
+    LayoutDescriptor, LayoutKind, LayoutRequirements, StaticLayout,
+};
+use crate::types::Graph;
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CoseBilkentSettings {
+    pub node_repulsion: f64,
+    pub ideal_edge_length: f64,
+    /// Force-iteration count (the legacy engine hard-coded 50).
+    pub iterations: u32,
 }
 
-impl CoseBilkentLayoutEngine {
-    pub fn new(options: CoseBilkentLayoutOptions) -> Self {
-        Self { options }
-    }
-}
-
-impl LayoutEngine for CoseBilkentLayoutEngine {
-    fn apply_layout(&self, graph: &mut Graph) -> Result<(), String> {
-        // Initialize node positions if not already set
-        self.initialize_positions(graph);
-        
-        // Run the force-directed algorithm for a fixed number of iterations
-        let max_iterations = 50;
-        for _ in 0..max_iterations {
-            // Calculate repulsive forces between all pairs of nodes
-            let repulsion_forces = self.calculate_repulsion(graph);
-            
-            // Calculate attractive forces along edges
-            let attraction_forces = self.calculate_attraction(graph);
-            
-            // Combine forces
-            let mut combined_forces = vec![(0.0, 0.0); graph.nodes.len()];
-            for i in 0..graph.nodes.len() {
-                combined_forces[i] = (
-                    repulsion_forces[i].0 + attraction_forces[i].0,
-                    repulsion_forces[i].1 + attraction_forces[i].1
-                );
-            }
-            
-            // Apply forces to update node positions
-            self.apply_forces(graph, &combined_forces)?;
+impl Default for CoseBilkentSettings {
+    fn default() -> Self {
+        Self {
+            node_repulsion: 4500.0,
+            ideal_edge_length: 50.0,
+            iterations: 50,
         }
-        
-        Ok(())
-    }
-    
-    fn name(&self) -> &'static str {
-        "CoSE Bilkent"
-    }
-    
-    fn description(&self) -> &'static str {
-        "Compound Spring Embedder layout algorithm from Bilkent University"
     }
 }
 
-impl ForceDirectedLayout for CoseBilkentLayoutEngine {
-    fn calculate_repulsion(&self, graph: &Graph) -> Vec<(f64, f64)> {
-        let node_count = graph.nodes.len();
-        let mut forces = vec![(0.0, 0.0); node_count];
-        let node_repulsion = self.options.node_repulsion;
-        
-        // Get node positions as a vector for easier indexing
-        let nodes: Vec<(&String, &crate::types::Node)> = graph.nodes.iter().collect();
-        
-        // Calculate repulsive forces between all pairs of nodes
-        for i in 0..node_count {
-            let (_id_i, node_i) = nodes[i];
-            let pos_i = node_i.position.unwrap_or((0.0, 0.0));
-            
-            for j in 0..node_count {
-                if i == j { continue; }
-                
-                let (_, node_j) = nodes[j];
-                let pos_j = node_j.position.unwrap_or((0.0, 0.0));
-                
-                // Calculate distance between nodes
-                let dx = pos_i.0 - pos_j.0;
-                let dy = pos_i.1 - pos_j.1;
-                let distance_squared = dx * dx + dy * dy;
-                
-                // Avoid division by zero
-                if distance_squared < 0.1 {
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CoseBilkentLayout;
+
+impl StaticLayout for CoseBilkentLayout {
+    type Settings = CoseBilkentSettings;
+
+    fn descriptor() -> LayoutDescriptor {
+        LayoutDescriptor {
+            id: "cose_bilkent",
+            kind: LayoutKind::Static,
+            display_name: "CoSE-Bilkent",
+            description: "Compound Spring Embedder layout (Bilkent University).",
+            requirements: LayoutRequirements {
+                needs_edges: true,
+                needs_cpu_positions: false,
+                needs_gpu_positions_buffer: true,
+            },
+        }
+    }
+
+    fn solve(settings: &Self::Settings, graph: &Graph) -> Result<Vec<f32>, String> {
+        let mut ids: Vec<&String> = graph.nodes.keys().collect();
+        ids.sort();
+        let n = ids.len();
+        if n == 0 {
+            return Ok(Vec::new());
+        }
+
+        let index: HashMap<&str, usize> = ids
+            .iter()
+            .enumerate()
+            .map(|(i, id)| (id.as_str(), i))
+            .collect();
+
+        // Seed positions in a disc of radius 100 (matches the legacy engine).
+        let mut rng = rand::thread_rng();
+        let mut pos: Vec<(f64, f64)> = Vec::with_capacity(n);
+        for _ in 0..n {
+            let angle = rng.gen::<f64>() * 2.0 * std::f64::consts::PI;
+            let dist = rng.gen::<f64>() * 100.0;
+            pos.push((dist * angle.cos(), dist * angle.sin()));
+        }
+
+        let edges: Vec<(usize, usize)> = graph
+            .edges
+            .values()
+            .filter_map(|e| Some((*index.get(e.source.as_str())?, *index.get(e.target.as_str())?)))
+            .collect();
+
+        let node_repulsion = settings.node_repulsion;
+        let ideal = settings.ideal_edge_length;
+        let damping = 0.1;
+
+        for _ in 0..settings.iterations {
+            let mut force = vec![(0.0f64, 0.0f64); n];
+
+            for i in 0..n {
+                for j in 0..n {
+                    if i == j {
+                        continue;
+                    }
+                    let dx = pos[i].0 - pos[j].0;
+                    let dy = pos[i].1 - pos[j].1;
+                    let d2 = dx * dx + dy * dy;
+                    if d2 < 0.1 {
+                        continue;
+                    }
+                    let f = node_repulsion / d2;
+                    let inv = d2.sqrt();
+                    force[i].0 += f * dx / inv;
+                    force[i].1 += f * dy / inv;
+                }
+            }
+
+            for &(s, t) in &edges {
+                let dx = pos[t].0 - pos[s].0;
+                let dy = pos[t].1 - pos[s].1;
+                let dist = (dx * dx + dy * dy).sqrt();
+                if dist < 0.1 {
                     continue;
                 }
-                
-                // Calculate repulsive force (inverse square law)
-                let force = node_repulsion / distance_squared;
-                
-                // Calculate force components
-                let force_x = force * dx / distance_squared.sqrt();
-                let force_y = force * dy / distance_squared.sqrt();
-                
-                // Add to total forces for node i
-                forces[i] = (forces[i].0 + force_x, forces[i].1 + force_y);
+                let f = (dist - ideal) / 3.0;
+                let fx = f * dx / dist;
+                let fy = f * dy / dist;
+                force[s].0 += fx;
+                force[s].1 += fy;
+                force[t].0 -= fx;
+                force[t].1 -= fy;
+            }
+
+            for i in 0..n {
+                pos[i].0 += force[i].0 * damping;
+                pos[i].1 += force[i].1 * damping;
             }
         }
-        
-        forces
-    }
-    
-    fn calculate_attraction(&self, graph: &Graph) -> Vec<(f64, f64)> {
-        let node_count = graph.nodes.len();
-        let mut forces = vec![(0.0, 0.0); node_count];
-        let ideal_edge_length = self.options.ideal_edge_length;
-        
-        // Get node positions and create a map from ID to index
-        let nodes: Vec<(&String, &crate::types::Node)> = graph.nodes.iter().collect();
-        let mut id_to_index = std::collections::HashMap::new();
-        for (i, (id, _)) in nodes.iter().enumerate() {
-            id_to_index.insert(*id, i);
+
+        let mut out = Vec::with_capacity(n * 3);
+        for (x, y) in pos {
+            out.push(x as f32);
+            out.push(y as f32);
+            out.push(0.0);
         }
-        
-        // Calculate attractive forces along edges
-        for edge in graph.edges.values() {
-            if let (Some(&source_idx), Some(&target_idx)) = (id_to_index.get(&edge.source), id_to_index.get(&edge.target)) {
-                let source_pos = nodes[source_idx].1.position.unwrap_or((0.0, 0.0));
-                let target_pos = nodes[target_idx].1.position.unwrap_or((0.0, 0.0));
-                
-                // Calculate distance and direction
-                let dx = target_pos.0 - source_pos.0;
-                let dy = target_pos.1 - source_pos.1;
-                let distance = (dx * dx + dy * dy).sqrt();
-                
-                // Avoid division by zero
-                if distance < 0.1 {
-                    continue;
-                }
-                
-                // Calculate attractive force (spring force)
-                let force = (distance - ideal_edge_length) / 3.0;
-                
-                // Calculate force components
-                let force_x = force * dx / distance;
-                let force_y = force * dy / distance;
-                
-                // Apply to both nodes in opposite directions
-                forces[source_idx] = (forces[source_idx].0 + force_x, forces[source_idx].1 + force_y);
-                forces[target_idx] = (forces[target_idx].0 - force_x, forces[target_idx].1 - force_y);
-            }
-        }
-        
-        forces
-    }
-    
-    fn apply_forces(&self, graph: &mut Graph, forces: &[(f64, f64)]) -> Result<(), String> {
-        // Get mutable references to nodes
-        let mut nodes: Vec<(&String, &mut crate::types::Node)> = graph.nodes.iter_mut().collect();
-        
-        // Apply forces to update positions
-        for (i, (_, node)) in nodes.iter_mut().enumerate() {
-            if i >= forces.len() {
-                break;
-            }
-            
-            let (force_x, force_y) = forces[i];
-            let current_pos = node.position.unwrap_or((0.0, 0.0));
-            
-            // Update position with damping
-            let damping = 0.1;
-            let new_x = current_pos.0 + force_x * damping;
-            let new_y = current_pos.1 + force_y * damping;
-            
-            node.position = Some((new_x, new_y));
-        }
-        
-        Ok(())
+        Ok(out)
     }
 }
 
-impl CoseBilkentLayoutEngine {
-    /// Initialize random positions for nodes that don't have positions
-    fn initialize_positions(&self, graph: &mut Graph) {
-        let radius = 100.0;
-        
-        for node in graph.nodes.values_mut() {
-            if node.position.is_none() {
-                // Generate random angle and distance from center
-                let angle = rand::random::<f64>() * 2.0 * std::f64::consts::PI;
-                let distance = rand::random::<f64>() * radius;
-                
-                // Convert to Cartesian coordinates
-                let x = distance * angle.cos();
-                let y = distance * angle.sin();
-                
-                node.position = Some((x, y));
-            }
-        }
-    }
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::{Edge, Node};
 
-/// Public interface for applying the CoSE Bilkent layout algorithm
-pub fn apply_layout(graph: &mut Graph, options: &CoseBilkentLayoutOptions) -> Result<(), String> {
-    let engine = CoseBilkentLayoutEngine::new(options.clone());
-    engine.apply_layout(graph)
+    #[test]
+    fn empty_graph_yields_empty_output() {
+        let g = Graph::new();
+        let out = CoseBilkentLayout::solve(&CoseBilkentSettings::default(), &g).unwrap();
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn packs_finite_triples_for_every_node() {
+        let mut g = Graph::new();
+        for i in 0..4 {
+            g.add_node(Node::new(format!("n{i}")));
+        }
+        g.add_edge(Edge::new("e0", "n0", "n1"));
+        g.add_edge(Edge::new("e1", "n1", "n2"));
+        g.add_edge(Edge::new("e2", "n2", "n3"));
+        let out = CoseBilkentLayout::solve(&CoseBilkentSettings::default(), &g).unwrap();
+        assert_eq!(out.len(), 4 * 3);
+        assert!(out.iter().all(|v| v.is_finite()));
+    }
+
+    #[test]
+    fn iterations_setting_is_honored() {
+        // A zero-iteration solve just returns the seed positions, still finite.
+        let mut g = Graph::new();
+        g.add_node(Node::new("a"));
+        g.add_node(Node::new("b"));
+        let s = CoseBilkentSettings { iterations: 0, ..CoseBilkentSettings::default() };
+        let out = CoseBilkentLayout::solve(&s, &g).unwrap();
+        assert_eq!(out.len(), 2 * 3);
+        assert!(out.iter().all(|v| v.is_finite()));
+    }
 }

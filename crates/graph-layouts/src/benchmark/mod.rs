@@ -6,7 +6,8 @@ use chrono::Utc;
 use serde_json;
 
 use crate::types::{Graph, GraphFile};
-use crate::layout::algorithms::fcose::{FcoseOptions, apply_layout};
+use crate::layout::algorithms::fcose::{FcoseLayout, FcoseSettings};
+use crate::layout::layout_trait::StaticLayout;
 
 pub struct BenchmarkResult {
     pub graph_name: String,
@@ -121,10 +122,18 @@ pub fn run_benchmark(graph_path: &str) -> Result<BenchmarkResult, String> {
         .unwrap_or("unknown")
         .to_string();
 
-    // Run layout with default options
-    let options = FcoseOptions::default();
+    // Run layout with default settings, then write packed positions back into
+    // the graph (id-sorted order) so the metrics pass can read them.
+    let settings = FcoseSettings::default();
     let start_time = std::time::Instant::now();
-    apply_layout(&mut graph, &options)?;
+    let packed = FcoseLayout::solve(&settings, &graph)?;
+    let mut ids: Vec<String> = graph.nodes.keys().cloned().collect();
+    ids.sort();
+    for (i, id) in ids.iter().enumerate() {
+        if let Some(node) = graph.nodes.get_mut(id) {
+            node.position = Some((packed[i * 3] as f64, packed[i * 3 + 1] as f64));
+        }
+    }
     let execution_time = start_time.elapsed();
 
     // Calculate metrics

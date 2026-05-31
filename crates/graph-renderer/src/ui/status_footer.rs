@@ -115,8 +115,6 @@ pub fn show_tray(ctx: &egui::Context, state: &mut AppState, progress: &Progress)
                 }
 
                 ui.add_space(8.0);
-                ui.separator();
-                ui.add_space(4.0);
 
                 if tray_icon_button(ui, draw_filter_icon, state.filter_strip_open, "Filters")
                     .clicked()

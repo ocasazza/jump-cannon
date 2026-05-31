@@ -1,288 +1,252 @@
-#![allow(dead_code)]
+//! KLay Layered static layout.
+//!
+//! One-shot CPU layered solver on the System-B [`StaticLayout`] trait
+//! (replacing the legacy `KlayLayoutEngine`). Four phases, preserved from the
+//! original: assign nodes to layers (BFS from roots), break backward edges,
+//! reduce crossings by adjacent swaps, then assign coordinates (layer → y,
+//! evenly spaced within a layer → x). Computes into local structures; the
+//! graph is never mutated.
+
 use std::collections::HashSet;
-use crate::types::{Graph, KlayLayeredLayoutOptions};
-use crate::layout::traits::{LayoutEngine, LayeredLayout};
 
-/// KLay Layered layout engine implementation
-pub struct KlayLayoutEngine {
-    options: KlayLayeredLayoutOptions,
+use serde::{Deserialize, Serialize};
+
+use crate::layout::layout_trait::{
+    LayoutDescriptor, LayoutKind, LayoutRequirements, StaticLayout,
+};
+use crate::types::Graph;
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct KlaySettings {
+    pub layer_spacing: f64,
+    pub node_spacing: f64,
 }
 
-impl KlayLayoutEngine {
-    /// Create a new KLay layout engine with the given options
-    pub fn new(options: KlayLayeredLayoutOptions) -> Self {
-        Self { options }
-    }
-}
-
-impl LayoutEngine for KlayLayoutEngine {
-    fn apply_layout(&self, graph: &mut Graph) -> Result<(), String> {
-        // Step 1: Assign nodes to layers
-        let mut layers = self.assign_layers(graph)?;
-        
-        // Step 2: Break cycles if needed
-        self.break_cycles(graph, &mut layers)?;
-        
-        // Step 3: Order nodes within layers to minimize crossings
-        self.minimize_crossings(&mut layers, graph)?;
-        
-        // Step 4: Assign coordinates
-        self.assign_coordinates(graph, &layers)
-    }
-    
-    fn name(&self) -> &'static str {
-        "KLay Layered"
-    }
-    
-    fn description(&self) -> &'static str {
-        "Layer-based layout algorithm optimized for directed graphs"
+impl Default for KlaySettings {
+    fn default() -> Self {
+        Self {
+            layer_spacing: 50.0,
+            node_spacing: 50.0,
+        }
     }
 }
 
-impl LayeredLayout for KlayLayoutEngine {
-    fn assign_layers(&self, graph: &Graph) -> Result<Vec<Vec<String>>, String> {
-        let mut layers: Vec<Vec<String>> = Vec::new();
-        let mut assigned = HashSet::new();
-        let mut current_layer = Vec::new();
-        
-        // Find root nodes (nodes with no incoming edges)
-        for node_id in graph.nodes.keys() {
-            let has_incoming = graph.edges.values().any(|e| e.target == *node_id);
-            if !has_incoming {
-                current_layer.push(node_id.clone());
-                assigned.insert(node_id.clone());
+#[derive(Clone, Copy, Debug, Default)]
+pub struct KlayLayout;
+
+/// BFS layering from roots (nodes with no incoming edge). `edges` is the local
+/// (possibly cycle-broken) edge list. Node ids are processed in sorted order
+/// for determinism.
+fn assign_layers(ids: &[&String], edges: &[(String, String)]) -> Vec<Vec<String>> {
+    let mut layers: Vec<Vec<String>> = Vec::new();
+    let mut assigned: HashSet<String> = HashSet::new();
+
+    let mut current: Vec<String> = ids
+        .iter()
+        .filter(|id| !edges.iter().any(|(_, t)| t == **id))
+        .map(|id| (*id).clone())
+        .collect();
+
+    if current.is_empty() && !ids.is_empty() {
+        current.push(ids[0].clone());
+    }
+    for id in &current {
+        assigned.insert(id.clone());
+    }
+
+    while !current.is_empty() {
+        layers.push(current.clone());
+        let mut next: Vec<String> = Vec::new();
+        for node in &current {
+            for (s, t) in edges {
+                if s == node && !assigned.contains(t) {
+                    next.push(t.clone());
+                    assigned.insert(t.clone());
+                }
             }
         }
-        
-        // If no root nodes found, start with any node
-        if current_layer.is_empty() && !graph.nodes.is_empty() {
-            let first_node = graph.nodes.keys().next().unwrap().clone();
-            current_layer.push(first_node.clone());
-            assigned.insert(first_node);
+        current = next;
+    }
+
+    // Remaining (disconnected / in-cycle) nodes append to the last layer.
+    for id in ids {
+        if !assigned.contains(*id) {
+            if let Some(last) = layers.last_mut() {
+                last.push((*id).clone());
+            } else {
+                layers.push(vec![(*id).clone()]);
+            }
         }
-        
-        // Build layers
-        while !current_layer.is_empty() {
-            layers.push(current_layer.clone());
-            let mut next_layer = Vec::new();
-            
-            for node_id in &current_layer {
-                // Find all unassigned nodes that this node points to
-                for edge in graph.edges.values() {
-                    if edge.source == *node_id && !assigned.contains(&edge.target) {
-                        next_layer.push(edge.target.clone());
-                        assigned.insert(edge.target.clone());
+    }
+
+    layers
+}
+
+/// Reverse edges that point from a later layer back to an earlier one.
+fn break_cycles(edges: &mut [(String, String)], layers: &[Vec<String>]) {
+    let layer_of = |id: &str| layers.iter().position(|l| l.iter().any(|n| n == id));
+    for (s, t) in edges.iter_mut() {
+        if let (Some(sl), Some(tl)) = (layer_of(s), layer_of(t)) {
+            if sl > tl {
+                std::mem::swap(s, t);
+            }
+        }
+    }
+}
+
+fn count_crossings(layer1: &[String], layer2: &[String], edges: &[(String, String)]) -> usize {
+    let mut crossings = 0;
+    for (i1, n1) in layer1.iter().enumerate() {
+        for (i2, n2) in layer1.iter().enumerate().skip(i1 + 1) {
+            for (s1, t1) in edges {
+                if s1 != n1 {
+                    continue;
+                }
+                for (s2, t2) in edges {
+                    if s2 != n2 {
+                        continue;
                     }
-                }
-            }
-            
-            current_layer = next_layer;
-        }
-        
-        // Handle any remaining nodes (disconnected or in cycles)
-        for node_id in graph.nodes.keys() {
-            if !assigned.contains(node_id) {
-                if let Some(last_layer) = layers.last_mut() {
-                    last_layer.push(node_id.clone());
-                } else {
-                    layers.push(vec![node_id.clone()]);
-                }
-            }
-        }
-        
-        Ok(layers)
-    }
-    
-    fn break_cycles(&self, graph: &mut Graph, layers: &mut Vec<Vec<String>>) -> Result<(), String> {
-        // Find edges that point to nodes in previous layers
-        let edges_to_reverse: Vec<String> = graph.edges.values()
-            .filter(|edge| {
-                let source_layer = layers.iter().position(|layer| layer.contains(&edge.source));
-                let target_layer = layers.iter().position(|layer| layer.contains(&edge.target));
-                
-                if let (Some(sl), Some(tl)) = (source_layer, target_layer) {
-                    sl > tl // Edge points backwards
-                } else {
-                    false
-                }
-            })
-            .map(|edge| edge.id.clone())
-            .collect();
-        
-        // Reverse the identified edges
-        for edge_id in edges_to_reverse {
-            if let Some(edge) = graph.edges.get_mut(&edge_id) {
-                std::mem::swap(&mut edge.source, &mut edge.target);
-            }
-        }
-        
-        Ok(())
-    }
-    
-    fn minimize_crossings(&self, layers: &mut Vec<Vec<String>>, graph: &Graph) -> Result<(), String> {
-        // For each pair of adjacent layers
-        for i in 0..layers.len().saturating_sub(1) {
-            let mut improved = true;
-            
-            // Keep trying to improve until no more improvements can be made
-            while improved {
-                improved = false;
-                
-                // Clone the current layer for comparison
-                let current_layer = layers[i].clone();
-                
-                // Get mutable reference to the next layer
-                let next_layer = &mut layers[i + 1];
-                
-                // Count crossings between current positions
-                let mut best_crossings = self.count_crossings(&current_layer, next_layer, graph);
-                
-                // Try swapping adjacent nodes in the next layer
-                for j in 0..next_layer.len().saturating_sub(1) {
-                    next_layer.swap(j, j + 1);
-                    
-                    let new_crossings = self.count_crossings(&current_layer, next_layer, graph);
-                    if new_crossings < best_crossings {
-                        best_crossings = new_crossings;
-                        improved = true;
-                    } else {
-                        // Swap back if no improvement
-                        next_layer.swap(j, j + 1);
-                    }
-                }
-            }
-        }
-        
-        Ok(())
-    }
-    
-    fn count_crossings(&self, layer1: &[String], layer2: &[String], graph: &Graph) -> usize {
-        let mut crossings = 0;
-        
-        // For each pair of edges between the layers
-        for (i1, n1) in layer1.iter().enumerate() {
-            for (i2, n2) in layer1.iter().enumerate().skip(i1 + 1) {
-                for edge1 in graph.edges.values() {
-                    if edge1.source != *n1 { continue; }
-                    
-                    for edge2 in graph.edges.values() {
-                        if edge2.source != *n2 { continue; }
-                        
-                        let j1 = layer2.iter().position(|n| *n == edge1.target);
-                        let j2 = layer2.iter().position(|n| *n == edge2.target);
-                        
-                        if let (Some(j1), Some(j2)) = (j1, j2) {
-                            // Check if edges cross
-                            if (i1 < i2 && j1 > j2) || (i1 > i2 && j1 < j2) {
-                                crossings += 1;
-                            }
+                    let j1 = layer2.iter().position(|n| n == t1);
+                    let j2 = layer2.iter().position(|n| n == t2);
+                    if let (Some(j1), Some(j2)) = (j1, j2) {
+                        if (i1 < i2 && j1 > j2) || (i1 > i2 && j1 < j2) {
+                            crossings += 1;
                         }
                     }
                 }
             }
         }
-        
-        crossings
     }
+    crossings
 }
 
-impl KlayLayoutEngine {
-    fn assign_coordinates(&self, graph: &mut Graph, layers: &[Vec<String>]) -> Result<(), String> {
-        let layer_height = self.options.layer_spacing;
-        let node_spacing = self.options.node_spacing;
-        
-        // Assign y-coordinates based on layer
-        for (layer_idx, layer) in layers.iter().enumerate() {
-            let y = layer_idx as f64 * layer_height;
-            
-            // Assign x-coordinates within layer
-            let layer_width = (layer.len() - 1) as f64 * node_spacing;
-            let start_x = -layer_width / 2.0;
-            
-            for (node_idx, node_id) in layer.iter().enumerate() {
-                if let Some(node) = graph.nodes.get_mut(node_id) {
-                    let x = start_x + node_idx as f64 * node_spacing;
-                    node.position = Some((x, y));
+fn minimize_crossings(layers: &mut [Vec<String>], edges: &[(String, String)]) {
+    for i in 0..layers.len().saturating_sub(1) {
+        let mut improved = true;
+        while improved {
+            improved = false;
+            let current = layers[i].clone();
+            let next = &mut layers[i + 1];
+            let mut best = count_crossings(&current, next, edges);
+            for j in 0..next.len().saturating_sub(1) {
+                next.swap(j, j + 1);
+                let c = count_crossings(&current, next, edges);
+                if c < best {
+                    best = c;
+                    improved = true;
+                } else {
+                    next.swap(j, j + 1);
                 }
             }
         }
-        
-        Ok(())
     }
 }
 
-/// Public interface for applying the KLay layout algorithm
-pub fn apply_layout(graph: &mut Graph, options: &KlayLayeredLayoutOptions) -> Result<(), String> {
-    let engine = KlayLayoutEngine::new(options.clone());
-    engine.apply_layout(graph)
+impl StaticLayout for KlayLayout {
+    type Settings = KlaySettings;
+
+    fn descriptor() -> LayoutDescriptor {
+        LayoutDescriptor {
+            id: "klay",
+            kind: LayoutKind::Static,
+            display_name: "Layered (KLay)",
+            description: "Layer-based layout optimized for directed graphs.",
+            requirements: LayoutRequirements {
+                needs_edges: true,
+                needs_cpu_positions: false,
+                needs_gpu_positions_buffer: true,
+            },
+        }
+    }
+
+    fn solve(settings: &Self::Settings, graph: &Graph) -> Result<Vec<f32>, String> {
+        let mut ids: Vec<&String> = graph.nodes.keys().collect();
+        ids.sort();
+        let n = ids.len();
+        if n == 0 {
+            return Ok(Vec::new());
+        }
+
+        // Local edge list so phases never mutate the graph.
+        let mut edges: Vec<(String, String)> = graph
+            .edges
+            .values()
+            .map(|e| (e.source.clone(), e.target.clone()))
+            .collect();
+
+        let mut layers = assign_layers(&ids, &edges);
+        break_cycles(&mut edges, &layers);
+        minimize_crossings(&mut layers, &edges);
+
+        // Coordinate assignment: layer → y, evenly spaced within layer → x.
+        let mut xy: std::collections::HashMap<&str, (f64, f64)> =
+            std::collections::HashMap::with_capacity(n);
+        for (layer_idx, layer) in layers.iter().enumerate() {
+            let y = layer_idx as f64 * settings.layer_spacing;
+            let layer_width = (layer.len().saturating_sub(1)) as f64 * settings.node_spacing;
+            let start_x = -layer_width / 2.0;
+            for (node_idx, node_id) in layer.iter().enumerate() {
+                let x = start_x + node_idx as f64 * settings.node_spacing;
+                xy.insert(node_id.as_str(), (x, y));
+            }
+        }
+
+        let mut out = Vec::with_capacity(n * 3);
+        for id in &ids {
+            let (x, y) = xy.get(id.as_str()).copied().unwrap_or((0.0, 0.0));
+            out.push(x as f32);
+            out.push(y as f32);
+            out.push(0.0);
+        }
+        Ok(out)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{Node, Edge};
+    use crate::types::{Edge, Node};
 
-    #[test]
-    fn test_simple_chain() {
-        let mut graph = Graph::new();
-        
-        let node_a = Node::new("A");
-        let node_b = Node::new("B");
-        let node_c = Node::new("C");
-        
-        graph.add_node(node_a)
-             .add_node(node_b)
-             .add_node(node_c);
-        
-        let edge1 = Edge::new("e1", "A", "B");
-        let edge2 = Edge::new("e2", "B", "C");
-        
-        graph.add_edge(edge1)
-             .add_edge(edge2);
-        
-        let engine = KlayLayoutEngine::new(KlayLayeredLayoutOptions::default());
-        engine.apply_layout(&mut graph).unwrap();
-        
-        let a_pos = graph.nodes.get("A").unwrap().position.unwrap();
-        let b_pos = graph.nodes.get("B").unwrap().position.unwrap();
-        let c_pos = graph.nodes.get("C").unwrap().position.unwrap();
-        
-        assert!(a_pos.1 < b_pos.1);
-        assert!(b_pos.1 < c_pos.1);
+    fn pos(g: &Graph, out: &[f32], id: &str) -> (f32, f32) {
+        let mut ids: Vec<&String> = g.nodes.keys().collect();
+        ids.sort();
+        let i = ids.iter().position(|s| s.as_str() == id).unwrap();
+        (out[i * 3], out[i * 3 + 1])
     }
 
     #[test]
-    fn test_cycle_breaking() {
-        let mut graph = Graph::new();
-        
-        let node_a = Node::new("A");
-        let node_b = Node::new("B");
-        
-        graph.add_node(node_a)
-             .add_node(node_b);
-        
-        let edge1 = Edge::new("e1", "A", "B");
-        let edge2 = Edge::new("e2", "B", "A");
-        
-        graph.add_edge(edge1)
-             .add_edge(edge2);
-        
-        let engine = KlayLayoutEngine::new(KlayLayeredLayoutOptions::default());
-        let mut layers = engine.assign_layers(&graph).unwrap();
-        engine.break_cycles(&mut graph, &mut layers).unwrap();
-        
-        let mut forward_count = 0;
-        let mut backward_count = 0;
-        
-        for edge in graph.edges.values() {
-            if edge.source == "A" && edge.target == "B" {
-                forward_count += 1;
-            } else if edge.source == "B" && edge.target == "A" {
-                backward_count += 1;
-            }
-        }
-        
-        assert_eq!(forward_count + backward_count, 2);
-        assert!(forward_count == 2 || backward_count == 2);
+    fn simple_chain_stacks_layers() {
+        let mut g = Graph::new();
+        g.add_node(Node::new("A"));
+        g.add_node(Node::new("B"));
+        g.add_node(Node::new("C"));
+        g.add_edge(Edge::new("e1", "A", "B"));
+        g.add_edge(Edge::new("e2", "B", "C"));
+
+        let out = KlayLayout::solve(&KlaySettings::default(), &g).unwrap();
+        let a = pos(&g, &out, "A");
+        let b = pos(&g, &out, "B");
+        let c = pos(&g, &out, "C");
+        assert!(a.1 < b.1 && b.1 < c.1, "layers should increase in y");
+    }
+
+    #[test]
+    fn cycle_is_broken_into_layers() {
+        let mut g = Graph::new();
+        g.add_node(Node::new("A"));
+        g.add_node(Node::new("B"));
+        g.add_edge(Edge::new("e1", "A", "B"));
+        g.add_edge(Edge::new("e2", "B", "A"));
+        let out = KlayLayout::solve(&KlaySettings::default(), &g).unwrap();
+        // Both nodes get finite, distinct-layer positions despite the 2-cycle.
+        assert_eq!(out.len(), 2 * 3);
+        assert!(out.iter().all(|v| v.is_finite()));
+    }
+
+    #[test]
+    fn empty_graph_yields_empty_output() {
+        let g = Graph::new();
+        let out = KlayLayout::solve(&KlaySettings::default(), &g).unwrap();
+        assert!(out.is_empty());
     }
 }

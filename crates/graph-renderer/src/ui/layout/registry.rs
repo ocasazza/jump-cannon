@@ -98,6 +98,11 @@ impl LayoutRegistry {
         r.register(super::algorithms::concentric::factory());
         r.register(super::algorithms::hilbert::factory());
         r.register(super::algorithms::force_atlas2::factory());
+        r.register(super::algorithms::fcose::factory());
+        r.register(super::algorithms::cose_bilkent::factory());
+        r.register(super::algorithms::cise::factory());
+        r.register(super::algorithms::dagre::factory());
+        r.register(super::algorithms::klay::factory());
         r.register(super::algorithms::remote_fa2::factory());
         r.register(super::algorithms::geometric::factory());
         r

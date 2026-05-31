@@ -1,198 +1,248 @@
-#![allow(dead_code)]
-use crate::types::{Graph, CiseLayoutOptions};
-use crate::layout::traits::{LayoutEngine, CircularLayout};
+//! CiSE (Circular Spring Embedder) static layout.
+//!
+//! One-shot CPU solver on the System-B [`StaticLayout`] trait (replacing the
+//! legacy `CiseLayoutEngine`). Nodes are grouped into clusters and each cluster
+//! is placed on its own circle. Clusters may be supplied explicitly via
+//! [`CiseSettings::clusters`]; when none are given they are derived from the
+//! graph's connected components (union-find over edges), so the layout is
+//! meaningful with no manual configuration. Cluster centers ride an outer ring;
+//! nodes ride an inner circle of radius 100 around their cluster center.
 
-pub struct CiseLayoutEngine {
-    options: CiseLayoutOptions,
+use std::collections::HashMap;
+
+use serde::{Deserialize, Serialize};
+
+use crate::layout::layout_trait::{
+    LayoutDescriptor, LayoutKind, LayoutRequirements, StaticLayout,
+};
+use crate::types::Graph;
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CiseSettings {
+    /// Explicit clusters (each a list of node ids). Empty ⇒ clusters are
+    /// derived from connected components. Kept for API/wire compatibility; the
+    /// interactive UI does not edit it.
+    #[serde(default)]
+    pub clusters: Vec<Vec<String>>,
+    /// Gap between adjacent cluster circles.
+    pub circle_spacing: f64,
 }
 
-impl CiseLayoutEngine {
-    pub fn new(options: CiseLayoutOptions) -> Self {
-        Self { options }
-    }
-}
-
-impl LayoutEngine for CiseLayoutEngine {
-    fn apply_layout(&self, graph: &mut Graph) -> Result<(), String> {
-        // Step 1: Arrange nodes in clusters on circles
-        self.arrange_clusters(graph)?;
-        
-        // Step 2: Optimize node ordering to minimize edge crossings
-        self.optimize_ordering(graph)?;
-        
-        Ok(())
-    }
-    
-    fn name(&self) -> &'static str {
-        "CiSE"
-    }
-    
-    fn description(&self) -> &'static str {
-        "Circular Spring Embedder layout algorithm"
-    }
-}
-
-impl CircularLayout for CiseLayoutEngine {
-    fn arrange_circle(&self, graph: &mut Graph, radius: f64) -> Result<(), String> {
-        let node_count = graph.nodes.len();
-        if node_count == 0 {
-            return Ok(());
+impl Default for CiseSettings {
+    fn default() -> Self {
+        Self {
+            clusters: Vec::new(),
+            circle_spacing: 20.0,
         }
-        
-        let angle_step = 2.0 * std::f64::consts::PI / node_count as f64;
-        
-        for (i, node) in graph.nodes.values_mut().enumerate() {
-            let angle = angle_step * i as f64;
-            let x = radius * angle.cos();
-            let y = radius * angle.sin();
-            node.position = Some((x, y));
-        }
-        
-        Ok(())
     }
-    
-    fn optimize_ordering(&self, graph: &mut Graph) -> Result<(), String> {
-        // This is a simplified implementation
-        // A full implementation would use a more sophisticated algorithm
-        // to minimize edge crossings
-        
-        // For now, we'll just sort nodes by their degree
-        let mut node_degrees: Vec<(String, usize)> = graph.nodes.keys()
-            .map(|id| {
-                let degree = graph.edges.values()
-                    .filter(|e| e.source == *id || e.target == *id)
-                    .count();
-                (id.clone(), degree)
-            })
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CiseLayout;
+
+/// Union-find root with path compression.
+fn find(parent: &mut [usize], mut x: usize) -> usize {
+    while parent[x] != x {
+        parent[x] = parent[parent[x]];
+        x = parent[x];
+    }
+    x
+}
+
+impl StaticLayout for CiseLayout {
+    type Settings = CiseSettings;
+
+    fn descriptor() -> LayoutDescriptor {
+        LayoutDescriptor {
+            id: "cise",
+            kind: LayoutKind::Static,
+            display_name: "Circular (CiSE)",
+            description:
+                "Circular Spring Embedder — groups nodes into clusters, each on its own circle.",
+            requirements: LayoutRequirements {
+                needs_edges: true,
+                needs_cpu_positions: false,
+                needs_gpu_positions_buffer: true,
+            },
+        }
+    }
+
+    fn solve(settings: &Self::Settings, graph: &Graph) -> Result<Vec<f32>, String> {
+        let mut ids: Vec<&String> = graph.nodes.keys().collect();
+        ids.sort();
+        let n = ids.len();
+        if n == 0 {
+            return Ok(Vec::new());
+        }
+
+        let index: HashMap<&str, usize> = ids
+            .iter()
+            .enumerate()
+            .map(|(i, id)| (id.as_str(), i))
             .collect();
-        
-        node_degrees.sort_by_key(|(_, degree)| *degree);
-        
-        // Rearrange nodes in a circle based on the sorted order
-        let node_count = node_degrees.len();
-        if node_count == 0 {
-            return Ok(());
-        }
-        
-        let angle_step = 2.0 * std::f64::consts::PI / node_count as f64;
-        let radius = 100.0; // Default radius
-        
-        for (i, (id, _)) in node_degrees.iter().enumerate() {
-            if let Some(node) = graph.nodes.get_mut(id) {
-                let angle = angle_step * i as f64;
-                let x = radius * angle.cos();
-                let y = radius * angle.sin();
-                node.position = Some((x, y));
-            }
-        }
-        
-        Ok(())
-    }
-}
 
-impl CiseLayoutEngine {
-    /// Arrange nodes in clusters on circles
-    fn arrange_clusters(&self, graph: &mut Graph) -> Result<(), String> {
-        // If no clusters are defined, arrange all nodes in a single circle
-        if self.options.clusters.is_empty() {
-            return self.arrange_circle(graph, 100.0);
-        }
-        
-        // Arrange each cluster in its own circle
-        let cluster_count = self.options.clusters.len();
-        let cluster_radius = 100.0;
-        let circle_spacing = self.options.circle_spacing;
-        
-        // Calculate positions for cluster centers
-        let outer_radius = cluster_radius * 2.0 + circle_spacing;
-        let angle_step = 2.0 * std::f64::consts::PI / cluster_count as f64;
-        
-        for (cluster_idx, cluster) in self.options.clusters.iter().enumerate() {
-            // Skip empty clusters
-            if cluster.is_empty() {
-                continue;
+        // Build clusters as lists of node indices (id-sorted within each).
+        let clusters: Vec<Vec<usize>> = if !settings.clusters.is_empty() {
+            let mut out: Vec<Vec<usize>> = Vec::new();
+            let mut placed = vec![false; n];
+            for cluster in &settings.clusters {
+                let mut members: Vec<usize> = cluster
+                    .iter()
+                    .filter_map(|id| index.get(id.as_str()).copied())
+                    .collect();
+                members.sort_unstable();
+                for &m in &members {
+                    placed[m] = true;
+                }
+                if !members.is_empty() {
+                    out.push(members);
+                }
             }
-            
-            // Calculate cluster center
-            let angle = angle_step * cluster_idx as f64;
-            let center_x = outer_radius * angle.cos();
-            let center_y = outer_radius * angle.sin();
-            
-            // Arrange nodes in this cluster
-            let node_count = cluster.len();
-            let inner_angle_step = 2.0 * std::f64::consts::PI / node_count as f64;
-            
-            for (node_idx, node_id) in cluster.iter().enumerate() {
-                if let Some(node) = graph.nodes.get_mut(node_id) {
-                    let inner_angle = inner_angle_step * node_idx as f64;
-                    let x = center_x + cluster_radius * inner_angle.cos();
-                    let y = center_y + cluster_radius * inner_angle.sin();
-                    node.position = Some((x, y));
+            // Any node not named in an explicit cluster becomes its own ring entry,
+            // collected into one leftover cluster.
+            let leftover: Vec<usize> = (0..n).filter(|&i| !placed[i]).collect();
+            if !leftover.is_empty() {
+                out.push(leftover);
+            }
+            out
+        } else {
+            // Derive clusters from connected components.
+            let mut parent: Vec<usize> = (0..n).collect();
+            for e in graph.edges.values() {
+                if let (Some(&s), Some(&t)) =
+                    (index.get(e.source.as_str()), index.get(e.target.as_str()))
+                {
+                    let rs = find(&mut parent, s);
+                    let rt = find(&mut parent, t);
+                    if rs != rt {
+                        parent[rs] = rt;
+                    }
+                }
+            }
+            let mut by_root: HashMap<usize, Vec<usize>> = HashMap::new();
+            for i in 0..n {
+                let r = find(&mut parent, i);
+                by_root.entry(r).or_default().push(i);
+            }
+            // Deterministic cluster order: by each cluster's smallest member.
+            let mut groups: Vec<Vec<usize>> = by_root.into_values().collect();
+            for g in &mut groups {
+                g.sort_unstable();
+            }
+            groups.sort_by_key(|g| g[0]);
+            groups
+        };
+
+        let cluster_radius = 100.0_f64;
+        let mut pos = vec![(0.0f64, 0.0f64); n];
+        let tau = 2.0 * std::f64::consts::PI;
+
+        if clusters.len() <= 1 {
+            // Single cluster (the common connected-graph case): one circle at the
+            // origin, matching the legacy single-circle arrangement.
+            let members = clusters.into_iter().next().unwrap_or_default();
+            let count = members.len().max(1) as f64;
+            for (k, idx) in members.iter().enumerate() {
+                let angle = tau * k as f64 / count;
+                pos[*idx] = (cluster_radius * angle.cos(), cluster_radius * angle.sin());
+            }
+        } else {
+            let circle_spacing = settings.circle_spacing;
+            let outer_radius = cluster_radius * 2.0 + circle_spacing;
+            let cluster_count = clusters.len() as f64;
+            for (cluster_idx, members) in clusters.iter().enumerate() {
+                let center_angle = tau * cluster_idx as f64 / cluster_count;
+                let cx = outer_radius * center_angle.cos();
+                let cy = outer_radius * center_angle.sin();
+                let count = members.len().max(1) as f64;
+                for (k, idx) in members.iter().enumerate() {
+                    let inner = tau * k as f64 / count;
+                    pos[*idx] = (cx + cluster_radius * inner.cos(), cy + cluster_radius * inner.sin());
                 }
             }
         }
-        
-        // Handle nodes not in any cluster
-        let unclustered = graph.nodes.keys()
-            .filter(|id| !self.options.clusters.iter().any(|cluster| cluster.contains(id)))
-            .cloned()
-            .collect::<Vec<_>>();
-        
-        if !unclustered.is_empty() {
-            let unclustered_count = unclustered.len();
-            let unclustered_angle_step = 2.0 * std::f64::consts::PI / unclustered_count as f64;
-            
-            for (idx, id) in unclustered.iter().enumerate() {
-                if let Some(node) = graph.nodes.get_mut(id) {
-                    let angle = unclustered_angle_step * idx as f64;
-                    let x = (outer_radius + cluster_radius) * angle.cos();
-                    let y = (outer_radius + cluster_radius) * angle.sin();
-                    node.position = Some((x, y));
-                }
-            }
-        }
-        
-        Ok(())
-    }
-}
 
-/// Public interface for applying the CiSE layout algorithm
-pub fn apply_layout(graph: &mut Graph, options: &CiseLayoutOptions) -> Result<(), String> {
-    let engine = CiseLayoutEngine::new(options.clone());
-    engine.apply_layout(graph)
+        let mut out = Vec::with_capacity(n * 3);
+        for (x, y) in pos {
+            out.push(x as f32);
+            out.push(y as f32);
+            out.push(0.0);
+        }
+        Ok(out)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{Node, Edge};
+    use crate::types::{Edge, Node};
+
+    fn radius(out: &[f32], i: usize) -> f32 {
+        (out[i * 3] * out[i * 3] + out[i * 3 + 1] * out[i * 3 + 1]).sqrt()
+    }
 
     #[test]
-    fn test_circular_arrangement() {
-        let mut graph = Graph::new();
-        
-        // Create a simple circular graph
+    fn empty_graph_yields_empty_output() {
+        let g = Graph::new();
+        let out = CiseLayout::solve(&CiseSettings::default(), &g).unwrap();
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn single_component_sits_on_one_circle() {
+        let mut g = Graph::new();
         for i in 0..4 {
-            let node = Node::new(format!("node{}", i));
-            graph.add_node(node);
+            g.add_node(Node::new(format!("n{i}")));
         }
-        
-        // Connect nodes in a circle
         for i in 0..4 {
-            let edge = Edge::new(
-                format!("edge{}", i),
-                format!("node{}", i),
-                format!("node{}", (i + 1) % 4),
-            );
-            graph.add_edge(edge);
+            g.add_edge(Edge::new(format!("e{i}"), format!("n{i}"), format!("n{}", (i + 1) % 4)));
         }
-        
-        let engine = CiseLayoutEngine::new(CiseLayoutOptions::default());
-        engine.arrange_circle(&mut graph, 100.0).unwrap();
-        
-        // Verify all nodes have positions
-        for node in graph.nodes.values() {
-            assert!(node.position.is_some());
+        let out = CiseLayout::solve(&CiseSettings::default(), &g).unwrap();
+        assert_eq!(out.len(), 4 * 3);
+        for i in 0..4 {
+            assert!((radius(&out, i) - 100.0).abs() < 1e-3, "node {i} off the unit circle");
         }
+    }
+
+    #[test]
+    fn two_components_land_on_separate_circles() {
+        let mut g = Graph::new();
+        // Triangle A
+        for c in ["a0", "a1", "a2"] {
+            g.add_node(Node::new(c));
+        }
+        g.add_edge(Edge::new("ea0", "a0", "a1"));
+        g.add_edge(Edge::new("ea1", "a1", "a2"));
+        g.add_edge(Edge::new("ea2", "a2", "a0"));
+        // Triangle B (disjoint)
+        for c in ["b0", "b1", "b2"] {
+            g.add_node(Node::new(c));
+        }
+        g.add_edge(Edge::new("eb0", "b0", "b1"));
+        g.add_edge(Edge::new("eb1", "b1", "b2"));
+        g.add_edge(Edge::new("eb2", "b2", "b0"));
+
+        let out = CiseLayout::solve(&CiseSettings::default(), &g).unwrap();
+        assert_eq!(out.len(), 6 * 3);
+
+        let mut ids: Vec<&String> = g.nodes.keys().collect();
+        ids.sort();
+        let centroid = |prefix: &str| -> (f32, f32) {
+            let mut sx = 0.0;
+            let mut sy = 0.0;
+            let mut c = 0.0;
+            for (i, id) in ids.iter().enumerate() {
+                if id.starts_with(prefix) {
+                    sx += out[i * 3];
+                    sy += out[i * 3 + 1];
+                    c += 1.0;
+                }
+            }
+            (sx / c, sy / c)
+        };
+        let (ax, ay) = centroid("a");
+        let (bx, by) = centroid("b");
+        let sep = ((ax - bx).powi(2) + (ay - by).powi(2)).sqrt();
+        assert!(sep > 100.0, "clusters not separated (sep = {sep})");
     }
 }
