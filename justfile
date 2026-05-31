@@ -72,8 +72,12 @@ dev-up backend="gpu":
     echo "→ kicking off parallel builds + backend…"
     cargo build --release -p vault-search &
     VAULT_PID=$!
-    nix run .#dev-up &
+
+    # Start compute backend. Redirecting output prevents nix's exec from
+    # breaking when backgrounded (nix run .#dev-up uses exec on Darwin).
+    nix run .#dev-up > /tmp/graph-compute.log 2>&1 &
     BACKEND_PID=$!
+
     cargo build -p graph-api &
     API_BUILD_PID=$!
 
