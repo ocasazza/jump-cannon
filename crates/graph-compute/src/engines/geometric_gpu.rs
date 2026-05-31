@@ -52,8 +52,7 @@ struct Gpu {
 
     positions_buf: wgpu::Buffer,
     velocities_buf: wgpu::Buffer,
-    edges_buf: wgpu::Buffer,
-    target_lens_buf: wgpu::Buffer,
+    csr_target_lens_buf: wgpu::Buffer,
     params_buf: wgpu::Buffer,
     node_class_buf: wgpu::Buffer,
     node_coord_buf: wgpu::Buffer,
@@ -176,18 +175,10 @@ impl LayoutEngine for GeometricGpuEngine {
         let node_coord: Vec<u32> = resolved.coordination;
         let node_mass: Vec<f32> = resolved.mass;
 
-        // Flatten the resolved unique edges (a < b, with target lengths) into the
-        // GPU's parallel pair / length buffers.
-        let mut edges_pairs: Vec<[u32; 2]> = Vec::with_capacity(resolved.edges.len());
-        let mut target_lens: Vec<f32> = Vec::with_capacity(resolved.edges.len());
-        for e in &resolved.edges {
-            edges_pairs.push([e.a, e.b]);
-            target_lens.push(e.target_len);
-        }
-        let n_edges = edges_pairs.len() as u32;
+        let n_edges = resolved.edges.len() as u32;
 
-        // Packed CSR adjacency for the angle neighbour-gather, in ONE buffer to
-        // respect the one-free-storage-slot limit. Layout:
+        // Packed CSR adjacency for BOTH the angle gather and the edge-spring pass,
+        // in ONE buffer to respect the storage-slot budget. Layout:
         //   csr[0 ..= n]        = offsets, each PRE-SHIFTED by (n+1) so it points
         //                         directly into the neighbours region below.
         //   csr[n+1 + k]        = the k-th neighbour (global CSR neighbour list).
@@ -199,6 +190,37 @@ impl LayoutEngine for GeometricGpuEngine {
             csr.push(graph.offsets[v] + header);
         }
         csr.extend_from_slice(&graph.neighbors);
+
+        // Per-CSR-entry target lengths, parallel to the neighbours region of `csr`
+        // (i.e. to graph.neighbors). The edge-spring pass reads the target length
+        // for the neighbour at csr index `aa` as csr_target_lens[aa - (n+1)] (the
+        // WGSL recovers n+1 as csr[0], since offsets[0] == 0). Built from the
+        // resolved unique edges (a < b); a missing key (e.g. a self-loop) falls
+        // back to the rest length. Together with the CSR ids this replaces the old
+        // O(E)/node edge scan AND the separate edges/target_lens buffers.
+        let mut len_map: std::collections::HashMap<(u32, u32), f32> =
+            std::collections::HashMap::with_capacity(resolved.edges.len());
+        for e in &resolved.edges {
+            len_map.insert((e.a, e.b), e.target_len);
+        }
+        let mut csr_target_lens: Vec<f32> = Vec::with_capacity(graph.neighbors.len());
+        for v in 0..n {
+            let start = graph.offsets[v] as usize;
+            let end = graph.offsets[v + 1] as usize;
+            for &u in &graph.neighbors[start..end] {
+                let key = if (v as u32) < u {
+                    (v as u32, u)
+                } else {
+                    (u, v as u32)
+                };
+                csr_target_lens.push(
+                    len_map
+                        .get(&key)
+                        .copied()
+                        .unwrap_or(self.settings.edge_rest_len),
+                );
+            }
+        }
 
         // ---- GPU Buffers ----
         let positions_byte_len = (positions_vec4.len() as u64) * 4;
@@ -214,14 +236,15 @@ impl LayoutEngine for GeometricGpuEngine {
             contents: bytemuck::cast_slice(&vec![0.0f32; n * 4]),
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
         });
-        let edges_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("geom_edges"),
-            contents: bytemuck::cast_slice(&edges_pairs),
-            usage: wgpu::BufferUsages::STORAGE,
-        });
-        let target_lens_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("geom_target_lens"),
-            contents: bytemuck::cast_slice(&target_lens),
+        let csr_target_lens_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("geom_csr_target_lens"),
+            // Never read when a node has no neighbours, but keep ≥1 element so the
+            // storage binding is non-empty (edge-free graph).
+            contents: if csr_target_lens.is_empty() {
+                bytemuck::cast_slice(&[0.0f32])
+            } else {
+                bytemuck::cast_slice(&csr_target_lens)
+            },
             usage: wgpu::BufferUsages::STORAGE,
         });
         let node_class_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -340,8 +363,7 @@ impl LayoutEngine for GeometricGpuEngine {
             entries: &[
                 storage_rw(0),
                 storage_rw(1),
-                storage_ro(2),
-                storage_ro(3),
+                storage_ro(2), // csr_target_lens (was: edges; binding 3/target_lens removed)
                 uniform(4),
                 storage_ro(5),
                 storage_ro(6),
@@ -383,11 +405,7 @@ impl LayoutEngine for GeometricGpuEngine {
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
-                    resource: edges_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: target_lens_buf.as_entire_binding(),
+                    resource: csr_target_lens_buf.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 4,
@@ -435,8 +453,7 @@ impl LayoutEngine for GeometricGpuEngine {
             bind_group,
             positions_buf,
             velocities_buf,
-            edges_buf,
-            target_lens_buf,
+            csr_target_lens_buf,
             params_buf,
             node_class_buf,
             node_coord_buf,

@@ -24,8 +24,10 @@ struct OctNode {
 
 @group(0) @binding(0) var<storage, read_write> positions:    array<vec4<f32>>;
 @group(0) @binding(1) var<storage, read_write> velocities:   array<vec4<f32>>;
-@group(0) @binding(2) var<storage, read>       edges:        array<vec2<u32>>;
-@group(0) @binding(3) var<storage, read>       target_lens:  array<f32>;
+// Per-CSR-entry edge target lengths, parallel to the neighbours region of `csr`
+// (binding 12). The target length for the neighbour at csr index `aa` is
+// csr_target_lens[aa - csr[0]] (csr[0] = n_nodes+1 = start of that region).
+@group(0) @binding(2) var<storage, read>       csr_target_lens: array<f32>;
 @group(0) @binding(4) var<uniform>             params:       GeometricParams;
 @group(0) @binding(5) var<storage, read>       node_class:   array<u32>;
 @group(0) @binding(6) var<storage, read>       node_coord:   array<u32>;
@@ -152,19 +154,22 @@ fn geometric_step(@builtin(global_invocation_id) gid: vec3<u32>) {
         }
     }
 
-    // ---- 2. Attraction (Edges) -------------------------------------------
-    for (var e: u32 = 0u; e < params.n_edges; e = e + 1u) {
-        let edge = edges[e];
-        var other: u32 = 0u;
-        var matched = false;
-        if (edge.x == i) { other = edge.y; matched = true; }
-        else if (edge.y == i) { other = edge.x; matched = true; }
-        
-        if (matched) {
+    // ---- 2. Attraction (edge-length springs) — via CSR adjacency ---------
+    // Walk node i's neighbours directly (O(deg)) instead of scanning the whole
+    // edge list (O(E)). Each undirected edge {i,j} appears once in i's CSR list,
+    // so the spring force on i is applied exactly once — same as the old
+    // unique-edge scan. Target length for the neighbour at csr index `aa` is
+    // csr_target_lens[aa - header] (header = csr[0] = neighbours-region start).
+    {
+        let beg = csr[i];
+        let end = csr[i + 1u];
+        let header = csr[0u];
+        for (var aa: u32 = beg; aa < end; aa = aa + 1u) {
+            let other = csr[aa];
             let pos_j = positions[other].xyz;
             let d = pos_j - pos_i;
             let r = max(length(d), 1e-6);
-            let t_len = target_lens[e];
+            let t_len = csr_target_lens[aa - header];
             let f = params.edge_stiffness * (r - t_len) / r;
             force = force + d * f;
         }
