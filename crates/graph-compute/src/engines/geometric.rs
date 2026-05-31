@@ -367,14 +367,10 @@ impl GeometricEngine {
                 .iter()
                 .map(|&d| bucket_by_thresholds(d, thresholds))
                 .collect(),
-            ClassSource::Community { passes } => {
-                label_propagation(graph, *passes)
-            }
-            ClassSource::Injected => attrs
-                .and_then(|a| a.node_class.clone())
-                .ok_or_else(|| {
-                    "class_source = injected but GraphAttributes.node_class is absent".to_string()
-                })?,
+            ClassSource::Community { passes } => label_propagation(graph, *passes),
+            ClassSource::Injected => attrs.and_then(|a| a.node_class.clone()).ok_or_else(|| {
+                "class_source = injected but GraphAttributes.node_class is absent".to_string()
+            })?,
         };
 
         // ---- coordination ------------------------------------------------
@@ -405,11 +401,9 @@ impl GeometricEngine {
                 let pr = pagerank(graph, damping, (*iters).max(1));
                 normalize_to_range(&pr, settings.mass_min, settings.mass_max)
             }
-            MassSource::Injected => attrs
-                .and_then(|a| a.node_mass.clone())
-                .ok_or_else(|| {
-                    "mass_source = injected but GraphAttributes.node_mass is absent".to_string()
-                })?,
+            MassSource::Injected => attrs.and_then(|a| a.node_mass.clone()).ok_or_else(|| {
+                "mass_source = injected but GraphAttributes.node_mass is absent".to_string()
+            })?,
         };
         // Mass must be strictly positive (it divides force in integration).
         let mass: Vec<f32> = mass
@@ -420,14 +414,12 @@ impl GeometricEngine {
         // ---- edges (unique, a<b) with target lengths ---------------------
         let injected_len = match settings.edge_length_source {
             EdgeLengthSource::Uniform => None,
-            EdgeLengthSource::Injected => Some(
-                attrs
-                    .and_then(|a| a.edge_len.clone())
-                    .ok_or_else(|| {
-                        "edge_length_source = injected but GraphAttributes.edge_len is absent"
-                            .to_string()
-                    })?,
-            ),
+            EdgeLengthSource::Injected => {
+                Some(attrs.and_then(|a| a.edge_len.clone()).ok_or_else(|| {
+                    "edge_length_source = injected but GraphAttributes.edge_len is absent"
+                        .to_string()
+                })?)
+            }
         };
         let edges = build_unique_edges(graph, settings.edge_rest_len, injected_len.as_deref());
 
@@ -443,6 +435,108 @@ impl GeometricEngine {
 impl Default for GeometricEngine {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Potential energy of the engine's *conservative* terms, decomposed by source.
+///
+/// The negative gradient of each field below is exactly the force the integrator
+/// applies, so a relaxing layout drives [`total`](Self::total) toward a local
+/// minimum. One deliberate omission: **class affinity** (a constant-magnitude,
+/// hard-cutoff attraction) is not a clean potential, so it is excluded from the
+/// energy scalar — it is inactive at the default `affinity_strength = 0`, and
+/// even when enabled it still contributes to the residual force, which is what
+/// the convergence check actually keys on.
+#[derive(Clone, Copy, Debug, Default, serde::Serialize, serde::Deserialize)]
+pub struct EnergyBreakdown {
+    /// Harmonic edge-length springs: `Σ ½·k·(‖edge‖ − target)²`.
+    pub edge: f32,
+    /// Neighbour-angle (coordination) constraints: `Σ ½·k·(θ − ideal)²`.
+    pub angle: f32,
+    /// Short-range class exclusion (soft overlap penalty), integrated.
+    pub exclusion: f32,
+    /// Mass-scaled pull toward the origin: `Σ ½·gravity·mᵢ·‖rᵢ‖²`.
+    pub gravity: f32,
+}
+
+impl EnergyBreakdown {
+    /// Total conservative potential energy.
+    pub fn total(&self) -> f32 {
+        self.edge + self.angle + self.exclusion + self.gravity
+    }
+}
+
+/// A non-destructive snapshot of the solver's current state — the geometric
+/// analogue of reading the energy + forces of a molecular configuration without
+/// stepping the dynamics. At a *solved* (equilibrium) layout the residual force
+/// `‖∇E‖ → 0` and the potential sits at a local minimum; that is precisely the
+/// signal the canary / regression / performance harness keys on.
+#[derive(Clone, Copy, Debug, Default, serde::Serialize, serde::Deserialize)]
+pub struct GeometricObservables {
+    /// Number of nodes.
+    pub n: usize,
+    /// Decomposed conservative potential energy.
+    pub energy: EnergyBreakdown,
+    /// `energy.total()`, hoisted for convenience.
+    pub potential: f32,
+    /// Kinetic energy `Σ ½·mᵢ·‖vᵢ‖²`. Trends to 0 as a damped layout settles.
+    pub kinetic: f32,
+    /// Largest per-node net force magnitude `maxᵢ ‖Fᵢ‖` — the strictest
+    /// convergence signal (everything is at rest only when this is ~0).
+    pub max_residual: f32,
+    /// Root-mean-square per-node net force magnitude. Less sensitive to a single
+    /// frustrated node than [`max_residual`](Self::max_residual).
+    pub rms_residual: f32,
+}
+
+impl GeometricEngine {
+    /// Inspect the current layout without advancing it: decomposed potential
+    /// energy, kinetic energy, and the residual force `‖∇E‖`. Returns `None`
+    /// before a successful [`init`](LayoutEngine::init).
+    ///
+    /// This is the observable the geometric-solver test framework is built on —
+    /// it lets a test assert *convergence to a solved structure* (residual below
+    /// a tolerance, energy at its floor) rather than only the qualitative
+    /// "did it move the right way" checks.
+    pub fn observe(&self) -> Option<GeometricObservables> {
+        let st = self.state.as_ref()?;
+        let energy = potential_energy(st, &self.settings);
+        let force = compute_forces(st, &self.settings);
+
+        let (mut max2, mut sum2) = (0.0f64, 0.0f64);
+        for i in 0..st.n {
+            let (fx, fy, fz) = (
+                force[3 * i] as f64,
+                force[3 * i + 1] as f64,
+                force[3 * i + 2] as f64,
+            );
+            let m2 = fx * fx + fy * fy + fz * fz;
+            max2 = max2.max(m2);
+            sum2 += m2;
+        }
+        let mut kinetic = 0.0f64;
+        for i in 0..st.n {
+            let m = st.resolved.mass[i] as f64;
+            let (vx, vy, vz) = (
+                st.velocities[3 * i] as f64,
+                st.velocities[3 * i + 1] as f64,
+                st.velocities[3 * i + 2] as f64,
+            );
+            kinetic += 0.5 * m * (vx * vx + vy * vy + vz * vz);
+        }
+
+        Some(GeometricObservables {
+            n: st.n,
+            potential: energy.total(),
+            energy,
+            kinetic: kinetic as f32,
+            max_residual: max2.sqrt() as f32,
+            rms_residual: if st.n > 0 {
+                (sum2 / st.n as f64).sqrt() as f32
+            } else {
+                0.0
+            },
+        })
     }
 }
 
@@ -508,17 +602,118 @@ impl LayoutEngine for GeometricEngine {
 /// One explicit integration step: accumulate all geometric forces, then advance
 /// velocities (mass-scaled, damped) and positions.
 fn step_forces(st: &mut State, s: &GeometricSettings) {
-    let n = st.n;
-    let mut force = vec![0.0f32; 3 * n];
+    let force = compute_forces(st, s);
+    integrate(st, &force, s);
+}
 
-    accumulate_edge_forces(&mut force, &st.positions, &st.resolved.edges, s.edge_stiffness);
+/// Accumulate every geometric force into a fresh `3n` vector **without**
+/// integrating. Shared by [`step_forces`] (which then advances state) and by
+/// [`GeometricEngine::observe`] (which inspects the residual `‖∇E‖` to tell
+/// whether the layout has reached equilibrium) — so the residual the observable
+/// reports is, to the last bit, the force the integrator would apply.
+fn compute_forces(st: &State, s: &GeometricSettings) -> Vec<f32> {
+    let mut force = vec![0.0f32; 3 * st.n];
+    accumulate_edge_forces(
+        &mut force,
+        &st.positions,
+        &st.resolved.edges,
+        s.edge_stiffness,
+    );
     if s.angle_stiffness != 0.0 {
         accumulate_angle_forces(&mut force, st, s);
     }
     accumulate_exclusion_affinity(&mut force, st, s);
     accumulate_gravity(&mut force, &st.positions, &st.resolved.mass, s.gravity);
+    force
+}
 
-    integrate(st, &force, s);
+/// Decomposed conservative potential energy of the current layout. Each term is
+/// the integral of its force law, so `-∇(this) == compute_forces` for the
+/// conservative terms (affinity excepted — see [`EnergyBreakdown`]). Accumulated
+/// in `f64` for numerical stability over large pair counts, returned as `f32`.
+fn potential_energy(st: &State, s: &GeometricSettings) -> EnergyBreakdown {
+    let pos = &st.positions;
+
+    // Edge springs: ½·k·(d − target)².
+    let mut edge = 0.0f64;
+    for e in &st.resolved.edges {
+        let dl = (pair_dist(pos, e.a as usize, e.b as usize) - e.target_len) as f64;
+        edge += 0.5 * s.edge_stiffness as f64 * dl * dl;
+    }
+
+    // Angle: ½·k·(θ − ideal)² over the SAME kept triples the force pass uses.
+    let mut angle = 0.0f64;
+    if s.angle_stiffness != 0.0 {
+        let k = s.angle_stiffness as f64;
+        for_each_angle_triple(st, s, |c, j, kn, ideal_rad| {
+            let d = triple_angle(pos, c, j, kn) as f64 - ideal_rad as f64;
+            angle += 0.5 * k * d * d;
+        });
+    }
+
+    // Exclusion: the integral of the soft repulsion force S·(σ/d − 1) (for
+    // d < σ), i.e. S·(σ·ln(σ/d) − (σ − d)). Zero at and beyond σ. The force's
+    // distance cutoff (cutoff_scale·σ ≥ σ) never clips a repulsion pair, so this
+    // is exact regardless of `cutoff_scale`.
+    let mut exclusion = 0.0f64;
+    let class = &st.resolved.class;
+    for i in 0..st.n {
+        let ri = lookup_radius(&s.class_radius, class[i] as usize, s.default_radius);
+        for j in (i + 1)..st.n {
+            let rj = lookup_radius(&s.class_radius, class[j] as usize, s.default_radius);
+            let sigma = (ri + rj).max(1e-3) as f64;
+            let d = pair_dist(pos, i, j).max(1e-4) as f64;
+            if d < sigma {
+                exclusion += s.exclusion_strength as f64 * (sigma * (sigma / d).ln() - (sigma - d));
+            }
+        }
+    }
+
+    // Gravity: ½·gravity·mᵢ·‖rᵢ‖².
+    let mut gravity = 0.0f64;
+    if s.gravity != 0.0 {
+        for i in 0..st.n {
+            let r2 = (pos[3 * i] * pos[3 * i]
+                + pos[3 * i + 1] * pos[3 * i + 1]
+                + pos[3 * i + 2] * pos[3 * i + 2]) as f64;
+            gravity += 0.5 * s.gravity as f64 * st.resolved.mass[i] as f64 * r2;
+        }
+    }
+
+    EnergyBreakdown {
+        edge: edge as f32,
+        angle: angle as f32,
+        exclusion: exclusion as f32,
+        gravity: gravity as f32,
+    }
+}
+
+/// Euclidean distance between nodes `i` and `j` in an interleaved x,y,z buffer.
+fn pair_dist(pos: &[f32], i: usize, j: usize) -> f32 {
+    let dx = pos[3 * j] - pos[3 * i];
+    let dy = pos[3 * j + 1] - pos[3 * i + 1];
+    let dz = pos[3 * j + 2] - pos[3 * i + 2];
+    (dx * dx + dy * dy + dz * dz).sqrt()
+}
+
+/// Angle (radians) at center `c` subtended by neighbours `j` and `kn` — the same
+/// `θ` [`apply_angle_pair`] differentiates, so the energy and force agree.
+fn triple_angle(pos: &[f32], c: usize, j: usize, kn: usize) -> f32 {
+    let (ax, ay, az) = (
+        pos[3 * j] - pos[3 * c],
+        pos[3 * j + 1] - pos[3 * c + 1],
+        pos[3 * j + 2] - pos[3 * c + 2],
+    );
+    let (bx, by, bz) = (
+        pos[3 * kn] - pos[3 * c],
+        pos[3 * kn + 1] - pos[3 * c + 1],
+        pos[3 * kn + 2] - pos[3 * c + 2],
+    );
+    let la = (ax * ax + ay * ay + az * az).sqrt().max(1e-6);
+    let lb = (bx * bx + by * by + bz * bz).sqrt().max(1e-6);
+    ((ax * bx + ay * by + az * bz) / (la * lb))
+        .clamp(-1.0, 1.0)
+        .acos()
 }
 
 /// Harmonic edge-length springs: each unique edge pulls/pushes its endpoints
@@ -546,11 +741,24 @@ fn accumulate_edge_forces(force: &mut [f32], pos: &[f32], edges: &[ResolvedEdge]
 /// toward the node's preferred angle. This is the term that makes motifs
 /// "crystallize" — degree-3 nodes drive their three neighbours to 120°, etc.
 fn accumulate_angle_forces(force: &mut [f32], st: &State, s: &GeometricSettings) {
-    let g = &st.graph;
-    let pos = &st.positions;
     let k = s.angle_stiffness;
-    let cap = s.max_angle_pairs as usize;
+    for_each_angle_triple(st, s, |c, j, kn, ideal_rad| {
+        apply_angle_pair(force, &st.positions, c, j, kn, ideal_rad, k);
+    });
+}
 
+/// Visit each *kept* neighbour-pair triple (center `c`, neighbours `j` and `kn`,
+/// with the center's ideal angle in radians), honouring the per-node degree cap
+/// and deterministic stride. Single source of truth for which pairs the angle
+/// term acts on, shared by the force pass ([`accumulate_angle_forces`]) and the
+/// energy ([`potential_energy`]) so the two never drift out of agreement.
+fn for_each_angle_triple(
+    st: &State,
+    s: &GeometricSettings,
+    mut visit: impl FnMut(usize, usize, usize, f32),
+) {
+    let g = &st.graph;
+    let cap = s.max_angle_pairs as usize;
     for c in 0..st.n {
         let deg_id = st.resolved.coordination[c] as usize;
         // Terminal coordinations (no meaningful angle) and isolated/degree-1
@@ -561,8 +769,7 @@ fn accumulate_angle_forces(force: &mut [f32], st: &State, s: &GeometricSettings)
         if neigh.len() < 2 {
             continue;
         }
-        let ideal = lookup_angle(&s.coordination_angles, deg_id);
-        let ideal_rad = ideal.to_radians();
+        let ideal_rad = lookup_angle(&s.coordination_angles, deg_id).to_radians();
 
         // Enumerate neighbour pairs (j,k), capped + strided for high degree.
         let m = neigh.len();
@@ -586,7 +793,7 @@ fn accumulate_angle_forces(force: &mut [f32], st: &State, s: &GeometricSettings)
                 if j == c || kn == c || j == kn {
                     continue;
                 }
-                apply_angle_pair(force, pos, c, j, kn, ideal_rad, k);
+                visit(c, j, kn, ideal_rad);
             }
         }
     }
@@ -745,9 +952,7 @@ fn integrate(st: &mut State, force: &[f32], s: &GeometricSettings) {
 /// CSR out-degree per node (= number of stored neighbours).
 fn compute_degree(g: &CsrGraph) -> Vec<u32> {
     let n = g.n_nodes as usize;
-    (0..n)
-        .map(|v| g.offsets[v + 1] - g.offsets[v])
-        .collect()
+    (0..n).map(|v| g.offsets[v + 1] - g.offsets[v]).collect()
 }
 
 /// Bucket a value by how many ascending `thresholds` it meets or exceeds.
@@ -815,7 +1020,11 @@ fn normalize_to_range(values: &[f32], lo: f32, hi: f32) -> Vec<f32> {
 /// lengths. When `injected_len` is `Some` (parallel to `g.neighbors`), the
 /// length is read from the CSR entry the edge was discovered at; otherwise every
 /// edge gets `rest_len`.
-fn build_unique_edges(g: &CsrGraph, rest_len: f32, injected_len: Option<&[f32]>) -> Vec<ResolvedEdge> {
+fn build_unique_edges(
+    g: &CsrGraph,
+    rest_len: f32,
+    injected_len: Option<&[f32]>,
+) -> Vec<ResolvedEdge> {
     let n = g.n_nodes as usize;
     let mut edges = Vec::new();
     for v in 0..n {
@@ -977,7 +1186,10 @@ mod tests {
     fn dumbbell() -> CsrGraph {
         // adjacency:
         // 0:1,2  1:0,2  2:0,1,3  3:2,4,5  4:3,5  5:3,4
-        let neighbors = vec![1, 2, /*0*/ 0, 2, /*1*/ 0, 1, 3, /*2*/ 2, 4, 5, /*3*/ 3, 5, /*4*/ 3, 4 /*5*/];
+        let neighbors = vec![
+            1, 2, /*0*/ 0, 2, /*1*/ 0, 1, 3, /*2*/ 2, 4, 5, /*3*/ 3, 5,
+            /*4*/ 3, 4, /*5*/
+        ];
         let offsets = vec![0, 2, 4, 7, 10, 12, 14];
         CsrGraph {
             n_nodes: 6,
@@ -1016,13 +1228,18 @@ mod tests {
         // We assert the dense-compaction invariant and that the bridge doesn't
         // collapse everything to a single community OR explode to 6.
         let k = comm.iter().copied().max().unwrap() + 1;
-        assert!((1..=3).contains(&k), "unexpected community count {k}: {comm:?}");
+        assert!(
+            (1..=3).contains(&k),
+            "unexpected community count {k}: {comm:?}"
+        );
     }
 
     #[test]
     fn pagerank_ranks_hub_highest() {
         // Star: node 0 connected to 1,2,3,4 (undirected).
-        let neighbors = vec![1, 2, 3, 4, /*0*/ 0, /*1*/ 0, /*2*/ 0, /*3*/ 0 /*4*/];
+        let neighbors = vec![
+            1, 2, 3, 4, /*0*/ 0, /*1*/ 0, /*2*/ 0, /*3*/ 0, /*4*/
+        ];
         let offsets = vec![0, 4, 5, 6, 7, 8];
         let g = CsrGraph {
             n_nodes: 5,
@@ -1271,8 +1488,8 @@ mod tests {
                     ];
                     let la = (a[0] * a[0] + a[1] * a[1] + a[2] * a[2]).sqrt().max(1e-6);
                     let lb = (b[0] * b[0] + b[1] * b[1] + b[2] * b[2]).sqrt().max(1e-6);
-                    let cos = ((a[0] * b[0] + a[1] * b[1] + a[2] * b[2]) / (la * lb))
-                        .clamp(-1.0, 1.0);
+                    let cos =
+                        ((a[0] * b[0] + a[1] * b[1] + a[2] * b[2]) / (la * lb)).clamp(-1.0, 1.0);
                     total += (cos.acos() - ideal).abs();
                     count += 1;
                 }

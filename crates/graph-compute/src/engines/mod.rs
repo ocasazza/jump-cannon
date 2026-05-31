@@ -32,21 +32,21 @@ use graph_layouts::{LayoutDescriptor, LayoutId};
 
 use crate::sim::CsrGraph;
 
-pub mod fa2_brute;
 pub mod cpu_spring;
 pub mod fa2_bh;
-pub mod sgd_stress;
-pub mod multilevel;
+pub mod fa2_brute;
 pub mod geometric;
 pub mod geometric_gpu;
+pub mod multilevel;
+pub mod sgd_stress;
 
 pub use cpu_spring::CpuSpringEngine;
-pub use fa2_brute::Fa2BruteEngine;
 pub use fa2_bh::Fa2BhEngine;
-pub use sgd_stress::SgdStressEngine;
-pub use multilevel::MultilevelEngine;
-pub use geometric::GeometricEngine;
+pub use fa2_brute::Fa2BruteEngine;
+pub use geometric::{EnergyBreakdown, GeometricEngine, GeometricObservables, GeometricSettings};
 pub use geometric_gpu::GeometricGpuEngine;
+pub use multilevel::MultilevelEngine;
+pub use sgd_stress::SgdStressEngine;
 
 /// Per-worker execution context shared by all engines.
 ///

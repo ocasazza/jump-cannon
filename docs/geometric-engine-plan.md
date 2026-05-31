@@ -359,3 +359,61 @@ Attributes shard with the partition:
 
 File the remaining phases as `bd` issues (the repo's tracker; unavailable in the
 current sandbox) before the next session.
+
+---
+
+## 11. Validation / regression / performance harness
+
+> Landed alongside the backend solver. Lives in
+> `crates/graph-compute/tests/geometric_solver.rs`, built on one engine
+> observable.
+
+A geometric solver, like a molecular-dynamics / FEP engine, is only trustworthy
+if you can answer three questions on every change: *is it still correct, did its
+behaviour drift, and is it still fast?* The borrowed idea from FEP validation is
+to anchor on **solved cases** — there, experimentally-measured binding free
+energies; here, **analytically-known equilibrium geometries** — and a scalar
+that says how relaxed a structure is.
+
+### The observable: `GeometricEngine::observe()`
+
+`step()` returns only positions, which can't tell you whether a layout has
+*converged*. So the engine gained a non-destructive
+
+```rust
+pub fn observe(&self) -> Option<GeometricObservables>
+//  → { potential energy (decomposed: edge / angle / exclusion / gravity),
+//      kinetic energy, max & RMS residual force ‖∇E‖ }
+```
+
+The residual force is computed through the **same** `compute_forces` the
+integrator uses (extracted so the two can't drift), and each energy term is the
+integral of its force law — so `-∇(potential) == force` for the conservative
+terms. At a solved (equilibrium) layout the residual → 0 and the potential sits
+at a local minimum. (Class *affinity* — a constant-magnitude, cutoff force — is
+not a clean potential and is omitted from the energy scalar; it is inactive at
+the default `affinity_strength = 0` and still shows up in the residual.)
+
+### Three layers, all on that observable
+
+| Layer | What it asserts | Why it's robust |
+|---|---|---|
+| **Canary** (solved cases) | A single spring relaxes to its rest length; three equal springs relax to an equilateral triangle (every side == `rest_len`); a damped run sheds total energy monotonically and the potential falls to its floor. | The equilibria are *exact analytical* answers, so the tolerances (geometry < 5e-3, residual < 2e-3) are physics, not curve-fitting. If the solver is broken these fail loudly and fast (triangle converges in ~16 steps). |
+| **Regression** (golden master) | A 5×5 grid under the full default force set, fixed seed, fixed 600 steps → robust scalars (potential, residual, radius of gyration) match a committed golden within a relative+absolute tolerance. | Captures the *whole* engine (springs + degree-angle + exclusion + gravity) as one fingerprint. Deterministic (no RNG; a SplitMix64 hash seeds positions). Regenerate intentionally with `UPDATE_GEOMETRIC_GOLDEN=1`; a first run with no golden writes one. |
+| **Performance** | Throughput (steps/sec) on a 12×12 grid asserted above a *generous* floor (50 steps/sec vs. ~7k observed), plus a **steps-to-converge** budget on the triangle canary (< 4000 vs. 16 observed). | A wall-clock floor alone misses an algorithm that still converges but in 10× the iterations; the iteration budget catches that. The floor is loose enough not to be timing-flaky on CI yet trips on a complexity regression (e.g. the O(n²) exclusion pass blowing up). |
+
+### Running it
+
+```sh
+just test geometric          # canary + regression + perf (prints perf numbers)
+just test geometric-golden   # regenerate the regression golden (intentional baseline bump)
+```
+
+### Follow-ups this enables
+
+- When the **GPU port** (Phase E) lands, point the *same* canaries + golden at
+  the GPU engine: the residual-force tolerance is exactly the cross-backend
+  equivalence check (CPU vs. GPU must agree to within solver tolerance), mirroring
+  how `fa2-bh` was validated against `fa2-brute`.
+- A per-engine convergence read-out (`observe()`) is also what a UI "settled /
+  still relaxing" indicator would consume — no new backend work needed.
