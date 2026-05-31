@@ -80,17 +80,17 @@ dev-up backend="gpu":
     cleanup() {
         echo
         echo "→ tearing down (backend pid $BACKEND_PID, vault pid $VAULT_PID, trunk pid $TRUNK_PID)…"
-        # Kill tracked PIDs first
-        kill "$BACKEND_PID" 2>/dev/null || true
-        kill "$VAULT_PID" 2>/dev/null || true
-        kill "$API_BUILD_PID" 2>/dev/null || true
-        kill "$TRUNK_PID" 2>/dev/null || true
+        # Kill tracked PIDs first with SIGKILL (-9) for immediate termination
+        kill -9 "$BACKEND_PID" 2>/dev/null || true
+        kill -9 "$VAULT_PID" 2>/dev/null || true
+        kill -9 "$API_BUILD_PID" 2>/dev/null || true
+        kill -9 "$TRUNK_PID" 2>/dev/null || true
         # Kill cargo-watch (starts after trap, so not in a tracked PID var)
-        pkill -f "cargo watch.*graph-api" 2>/dev/null || true
+        pkill -9 -f "cargo-watch.*graph-api" 2>/dev/null || true
         # Comprehensive fallback: kill any stragglers by process name
-        pkill -f "trunk watch" 2>/dev/null || true
-        pkill -f "graph-compute" 2>/dev/null || true
-        pkill -f "graph-api" 2>/dev/null || true
+        pkill -9 -f "trunk watch" 2>/dev/null || true
+        pkill -9 -f "graph-compute" 2>/dev/null || true
+        pkill -9 -f "graph-api" 2>/dev/null || true
         # Idempotent: kills the native binary (darwin) or stops compose (linux).
         nix run .#dev-down 2>/dev/null || true
         echo "→ teardown complete"
