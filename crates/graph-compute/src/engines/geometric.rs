@@ -281,16 +281,22 @@ pub struct ResolvedEdge {
 
 /// Everything the force kernels need, resolved from the chosen sources once at
 /// `init` (so `step` is pure arithmetic over fixed arrays).
-struct Resolved {
+///
+/// Public so the GPU engine ([`super::geometric_gpu`]) can share the exact same
+/// source-resolution path via [`GeometricEngine::resolve`] instead of
+/// re-implementing it (and silently defaulting structural sources to bucket 0 /
+/// unit values). The fields are the four per-node / per-edge vectors the kernels
+/// consume on either backend.
+pub struct Resolved {
     /// Per-node class id (already mapped into the class/affinity tables' domain
     /// by lookup-time fallback, so this may exceed the table sizes).
-    class: Vec<u32>,
+    pub class: Vec<u32>,
     /// Per-node coordination id (clamped to the angle table at lookup).
-    coordination: Vec<u32>,
+    pub coordination: Vec<u32>,
     /// Per-node mass (> 0).
-    mass: Vec<f32>,
+    pub mass: Vec<f32>,
     /// Unique undirected edges (a < b) with target lengths.
-    edges: Vec<ResolvedEdge>,
+    pub edges: Vec<ResolvedEdge>,
 }
 
 struct State {
@@ -348,7 +354,12 @@ impl GeometricEngine {
     /// from injected [`GraphAttributes`] for `Injected` sources (erroring if the
     /// required vector is absent or the wrong length) and computes structural
     /// sources from the CSR.
-    fn resolve(
+    ///
+    /// Public so the GPU engine can call the *same* resolver — both backends must
+    /// honour structural sources (degree / community / PageRank) identically, not
+    /// just injected attributes. The CPU engine's [`init`](LayoutEngine::init)
+    /// behaviour is unchanged.
+    pub fn resolve(
         settings: &GeometricSettings,
         graph: &CsrGraph,
         attrs: Option<&GraphAttributes>,

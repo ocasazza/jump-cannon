@@ -34,6 +34,12 @@ struct OctNode {
 @group(0) @binding(9) var<storage, read>       coord_angles: array<f32>;
 @group(0) @binding(10) var<storage, read>      class_radius: array<f32>;
 @group(0) @binding(11) var<storage, read>      class_affinity: array<f32>;
+// Packed CSR adjacency in ONE buffer (built host-side in geometric_gpu.rs):
+//   csr[0 ..= n_nodes] = offsets, each PRE-SHIFTED by (n_nodes+1) so it already
+//                        points into the neighbours region.
+//   csr[off .. ]       = neighbour node ids.
+// Neighbours of node v are csr[csr[v] .. csr[v+1]].
+@group(0) @binding(12) var<storage, read>      csr:            array<u32>;
 
 const OCT_END: u32 = 0xFFFFFFFFu;
 const OCT_BODY_INTERNAL: u32 = 0xFFFFFFFFu;
@@ -165,70 +171,54 @@ fn geometric_step(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
 
     // ---- 3. Angle (coordination) constraints -----------------------------
-    // No CSR adjacency is uploaded, so neighbours are gathered from the edge
-    // list (bounded to MAX_DEG). Each thread sums the NET angle force on its own
-    // node i across every triple it participates in:
+    // Neighbours come from the packed CSR adjacency (binding 12): the neighbours
+    // of node v are csr[csr[v] .. csr[v+1]] (offsets are pre-shifted to point
+    // into the neighbours region). This replaces the old O(deg²·E) edge-list
+    // scans with direct O(deg) reads — no MAX_DEG cap needed. The physics is
+    // unchanged: each thread sums the NET angle force on its own node i across
+    // every triple it participates in:
     //   • as the CENTER  (c = i): the reaction −(F_j+F_k) for each neighbour
     //     pair {j,k},
     //   • as an ENDPOINT (j = i): the force F_j for the triple (c; i, k) at each
     //     neighbouring center c with another neighbour k.
     // Summed, this is the gradient of the same Σ ½·k·(θ−ideal)² energy the CPU
-    // minimises (so the CPU↔GPU equivalence gate's square case agrees). Cost is
-    // O(deg²·E) per node via the edge scans — fine for the small/validation
-    // graphs; uploading CSR adjacency is the perf follow-up.
+    // minimises (so the CPU↔GPU equivalence gate's square case agrees).
     if (params.angle_stiffness != 0.0) {
         let ak = params.angle_stiffness;
-        var nbr_i: array<u32, 16>;
-        var nbr_c: array<u32, 16>;
 
-        // Gather i's neighbours (bounded).
-        var deg_i: u32 = 0u;
-        for (var e: u32 = 0u; e < params.n_edges; e = e + 1u) {
-            let edge = edges[e];
-            var other: u32 = 0xffffffffu;
-            if (edge.x == i) { other = edge.y; }
-            else if (edge.y == i) { other = edge.x; }
-            if (other != 0xffffffffu && other != i && deg_i < 16u) {
-                nbr_i[deg_i] = other;
-                deg_i = deg_i + 1u;
-            }
-        }
+        // i's neighbour range in CSR.
+        let i_beg = csr[i];
+        let i_end = csr[i + 1u];
 
         // ROLE A — i is the center: reaction force for each neighbour pair.
-        if (deg_i >= 2u) {
-            let ideal_i = get_coord_angle(node_coord[i]);
-            for (var aa: u32 = 0u; aa < deg_i; aa = aa + 1u) {
-                for (var bb: u32 = aa + 1u; bb < deg_i; bb = bb + 1u) {
-                    let pj = positions[nbr_i[aa]].xyz;
-                    let pk = positions[nbr_i[bb]].xyz;
-                    let fj = angle_endpoint_force(pos_i, pj, pk, ideal_i, ak);
-                    let fk = angle_endpoint_force(pos_i, pk, pj, ideal_i, ak);
-                    force = force - (fj + fk);
-                }
+        let ideal_i = get_coord_angle(node_coord[i]);
+        for (var aa: u32 = i_beg; aa < i_end; aa = aa + 1u) {
+            let nj = csr[aa];
+            if (nj == i) { continue; } // skip self-loops (matches CPU)
+            let pj = positions[nj].xyz;
+            for (var bb: u32 = aa + 1u; bb < i_end; bb = bb + 1u) {
+                let nk = csr[bb];
+                if (nk == i || nk == nj) { continue; }
+                let pk = positions[nk].xyz;
+                let fj = angle_endpoint_force(pos_i, pj, pk, ideal_i, ak);
+                let fk = angle_endpoint_force(pos_i, pk, pj, ideal_i, ak);
+                force = force - (fj + fk);
             }
         }
 
         // ROLE B — i is an endpoint of each neighbouring center c.
-        for (var aa: u32 = 0u; aa < deg_i; aa = aa + 1u) {
-            let c = nbr_i[aa];
+        for (var aa: u32 = i_beg; aa < i_end; aa = aa + 1u) {
+            let c = csr[aa];
+            if (c == i) { continue; } // self-loop: i is not an endpoint of itself
             let pc = positions[c].xyz;
             let ideal_c = get_coord_angle(node_coord[c]);
-            // Gather c's neighbours.
-            var deg_c: u32 = 0u;
-            for (var e: u32 = 0u; e < params.n_edges; e = e + 1u) {
-                let edge = edges[e];
-                var other: u32 = 0xffffffffu;
-                if (edge.x == c) { other = edge.y; }
-                else if (edge.y == c) { other = edge.x; }
-                if (other != 0xffffffffu && other != c && deg_c < 16u) {
-                    nbr_c[deg_c] = other;
-                    deg_c = deg_c + 1u;
-                }
-            }
-            if (deg_c < 2u) { continue; }
-            for (var bb: u32 = 0u; bb < deg_c; bb = bb + 1u) {
-                let k = nbr_c[bb];
-                if (k != i) {
+            let c_beg = csr[c];
+            let c_end = csr[c + 1u];
+            for (var bb: u32 = c_beg; bb < c_end; bb = bb + 1u) {
+                let k = csr[bb];
+                // Triple (center c; endpoints i, k): skip self-loops and i==k
+                // (matches the CPU j==c||kn==c||j==kn guards).
+                if (k != i && k != c) {
                     force = force + angle_endpoint_force(pc, pos_i, positions[k].xyz, ideal_c, ak);
                 }
             }

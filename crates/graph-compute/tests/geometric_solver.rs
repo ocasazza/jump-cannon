@@ -28,7 +28,9 @@
 //!      or complexity regression trips the test without it being timing-flaky.
 
 use graph_compute::engines::geometric::{CoordinationSource, GeometricEngine, GeometricSettings};
-use graph_compute::engines::{CsrShard, EngineCtx, GeometricGpuEngine, LayoutEngine};
+use graph_compute::engines::{
+    CsrShard, EngineCtx, GeometricGpuEngine, GraphAttributes, LayoutEngine,
+};
 use graph_compute::sim::CsrGraph;
 use std::time::{Duration, Instant};
 
@@ -516,6 +518,100 @@ fn canary_gpu_solves_known_problems() {
         ran > 0,
         "expected at least one GPU-supported solved case to run"
     );
+}
+
+/// A star: hub node 0 joined to `leaves` leaf nodes (undirected). The hub has
+/// degree `leaves`; every leaf has degree 1 — i.e. degrees differ, so a
+/// degree-based coordination source resolves to a *non-uniform* vector.
+fn star(leaves: usize) -> CsrGraph {
+    let n = leaves + 1;
+    let mut offsets = vec![0u32];
+    let mut neighbors = Vec::new();
+    // hub (node 0): neighbours 1..=leaves
+    for l in 1..=leaves {
+        neighbors.push(l as u32);
+    }
+    offsets.push(neighbors.len() as u32);
+    // each leaf: single neighbour 0
+    for _ in 0..leaves {
+        neighbors.push(0);
+        offsets.push(neighbors.len() as u32);
+    }
+    CsrGraph {
+        n_nodes: n as u32,
+        offsets,
+        neighbors,
+    }
+}
+
+/// Read back the per-node coordination ids the GPU engine uploaded. The GPU
+/// engine keeps no observable, so this drives it through a real wgpu device and
+/// maps the `node_coord` storage buffer it built in `init` — exactly what the
+/// WGSL angle pass indexes. `None` if no wgpu adapter is present.
+fn gpu_resolved_coordination(
+    graph: &CsrGraph,
+    settings: &GeometricSettings,
+    attrs: Option<&GraphAttributes>,
+) -> Option<Vec<u32>> {
+    let mut ctx = EngineCtx::try_new_gpu();
+    ctx.gpu.as_ref()?;
+    let n = graph.n_nodes as usize;
+    let mut engine = GeometricGpuEngine::new();
+    engine
+        .set_params(&serde_json::to_value(settings).expect("serialize settings"))
+        .expect("set_params");
+    let shard = match attrs {
+        Some(a) => CsrShard::whole_with_attributes(graph, a),
+        None => CsrShard::whole(graph),
+    };
+    let seed = deterministic_seed(n, 2.0);
+    engine.init(&mut ctx, &shard, &seed).expect("gpu init");
+    Some(engine.debug_node_coordination())
+}
+
+/// Regression for the "GPU ignored structural sources" bug: with
+/// [`CoordinationSource::Degree`] on a non-uniform graph (a star, where the hub's
+/// degree differs from every leaf's), the resolved per-node coordination MUST be
+/// the node degrees — the old GPU init read injected attributes only and silently
+/// produced all-zeros. The CPU resolver assertion always runs; the GPU side is
+/// gated on a wgpu adapter (prints SKIP otherwise), since it is the path that was
+/// wrong.
+#[test]
+fn degree_coordination_resolves_same_on_cpu_and_gpu() {
+    let graph = star(5); // hub degree 5, five leaves degree 1
+    let expected_degrees: Vec<u32> = vec![5, 1, 1, 1, 1, 1];
+    let settings = GeometricSettings {
+        coordination_source: CoordinationSource::Degree,
+        ..GeometricSettings::default()
+    };
+
+    // CPU resolver — the single shared source of truth. Always runs.
+    let cpu = GeometricEngine::resolve(&settings, &graph, None).expect("cpu resolve");
+    assert_eq!(
+        cpu.coordination, expected_degrees,
+        "CPU degree coordination must equal node degrees (non-uniform)"
+    );
+    // Sanity: this graph really is non-uniform, so an all-zeros default would be
+    // detectably wrong (the exact failure the old GPU init exhibited).
+    assert!(
+        cpu.coordination.iter().any(|&c| c != cpu.coordination[0]),
+        "test graph must have differing degrees to be meaningful"
+    );
+
+    // GPU side: assert the engine uploaded the SAME coordination vector, not the
+    // old vec![0; n] default.
+    match gpu_resolved_coordination(&graph, &settings, None) {
+        Some(gpu) => {
+            assert_eq!(
+                gpu, cpu.coordination,
+                "GPU degree coordination diverged from CPU (the structural-source bug)"
+            );
+            eprintln!("gpu degree coordination matches cpu: {gpu:?}");
+        }
+        None => eprintln!(
+            "SKIP gpu half of degree_coordination_resolves_same_on_cpu_and_gpu: no wgpu adapter"
+        ),
+    }
 }
 
 #[test]
