@@ -3,5 +3,6 @@
   "steps": 600,
   "potential": 24.541039,
   "max_residual": 2.9418035,
-  "radius_of_gyration": 2.1558752
+  "radius_of_gyration": 2.1558752,
+  "edge_length_cv": 0.38987944
 }

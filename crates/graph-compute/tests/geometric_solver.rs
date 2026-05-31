@@ -675,6 +675,25 @@ struct Golden {
     potential: f32,
     max_residual: f32,
     radius_of_gyration: f32,
+    /// Edge-length coefficient of variation (drawing-aesthetic uniformity) via
+    /// the shared `graph_layouts::metrics`. `#[serde(default)]` so a pre-existing
+    /// golden without this field still parses (regenerate to populate it).
+    #[serde(default)]
+    edge_length_cv: f32,
+}
+
+/// Unique undirected edges `(a, b)` with `a < b` from a CSR graph.
+fn unique_edges(g: &CsrGraph) -> Vec<(u32, u32)> {
+    let mut e = Vec::new();
+    for v in 0..g.n_nodes as usize {
+        let (a, b) = (g.offsets[v] as usize, g.offsets[v + 1] as usize);
+        for &u in &g.neighbors[a..b] {
+            if (v as u32) < u {
+                e.push((v as u32, u));
+            }
+        }
+    }
+    e
 }
 
 /// The regression fixture: a 5×5 grid relaxed under the *default* force set
@@ -711,6 +730,10 @@ fn regression_golden_master() {
         potential: last.potential,
         max_residual: last.max_residual,
         radius_of_gyration: radius_of_gyration(&r.final_positions),
+        edge_length_cv: graph_layouts::metrics::edge_length_cv(
+            &r.final_positions,
+            &unique_edges(&scn.graph),
+        ),
     };
 
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -749,6 +772,13 @@ fn regression_golden_master() {
         "radius_of_gyration",
         actual.radius_of_gyration,
         golden.radius_of_gyration,
+        1e-3,
+        1e-3,
+    );
+    approx_eq(
+        "edge_length_cv",
+        actual.edge_length_cv,
+        golden.edge_length_cv,
         1e-3,
         1e-3,
     );
