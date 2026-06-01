@@ -72,15 +72,15 @@ pub fn show_tray(ctx: &egui::Context, state: &mut AppState, progress: &Progress)
     use crate::ui::state::Section;
 
     let mut frame = theme::floating_frame();
-    frame.inner_margin = egui::Margin::symmetric(8.0, 2.0);
+    frame.inner_margin = egui::Margin::symmetric(12.0, 4.0);
     egui::TopBottomPanel::bottom("tray-strip")
         .resizable(false)
         .show_separator_line(false)
-        .exact_height(28.0)
+        .exact_height(32.0)
         .frame(frame)
         .show(ctx, |ui| {
             ui.horizontal_centered(|ui| {
-                ui.spacing_mut().item_spacing.x = 4.0;
+                ui.spacing_mut().item_spacing.x = 6.0;
                 for &section in Section::ALL {
                     let active = state.is_section_open(section);
                     if tray_icon_button(ui, |painter, rect, color| {
@@ -114,8 +114,7 @@ pub fn show_tray(ctx: &egui::Context, state: &mut AppState, progress: &Progress)
                     }
                 }
 
-                ui.add_space(8.0);
-
+                // Filter icon uses same spacing as section icons - no special gap
                 if tray_icon_button(ui, draw_filter_icon, state.filter_strip_open, "Filters")
                     .clicked()
                 {
@@ -199,7 +198,7 @@ pub fn show_tray(ctx: &egui::Context, state: &mut AppState, progress: &Progress)
         });
 }
 
-/// Compact 18×18 tray icon button (≈3/4 the previous 22 px footprint).
+/// Compact 20×20 tray icon button with consistent spacing.
 /// Caller supplies a paint closure that draws the icon glyph into the
 /// **inner** rect (the button rect shrunk by 2 px so the glyph never
 /// touches the border).
@@ -220,7 +219,7 @@ fn tray_icon_button(
     tooltip: &str,
 ) -> egui::Response {
     let (rect, response) =
-        ui.allocate_exact_size(egui::vec2(18.0, 18.0), egui::Sense::click());
+        ui.allocate_exact_size(egui::vec2(20.0, 20.0), egui::Sense::click());
     let hovered = response.hovered();
     let (bg, fg) = if active {
         (palette::PRIMARY, egui::Color32::WHITE)
