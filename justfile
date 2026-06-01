@@ -73,13 +73,19 @@ dev-up backend="gpu":
     cargo build --release -p vault-search &
     VAULT_PID=$!
 
-    # Start compute backend. Redirecting output prevents nix's exec from
-    # breaking when backgrounded (nix run .#dev-up uses exec on Darwin).
-    nix run .#dev-up > /tmp/graph-compute.log 2>&1 &
-    BACKEND_PID=$!
+    # Build graph-compute (release for GPU backends to work properly)
+    cargo build --release -p graph-compute &
+    COMPUTE_BUILD_PID=$!
 
     cargo build -p graph-api &
     API_BUILD_PID=$!
+
+    # Wait for compute build before starting it
+    wait "$COMPUTE_BUILD_PID" || { echo "graph-compute build failed"; exit 1; }
+
+    # Start graph-compute natively (avoids nix remote-build SSH issues)
+    RUST_LOG=info GRAPH_COMPUTE_TICK_HZ=30 ./target/release/graph-compute > /tmp/graph-compute.log 2>&1 &
+    BACKEND_PID=$!
 
     cleanup() {
         echo
