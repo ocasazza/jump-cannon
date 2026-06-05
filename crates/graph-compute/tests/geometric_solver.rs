@@ -1631,6 +1631,220 @@ fn bending_off_by_default_leaves_directors_static() {
 }
 
 // ---------------------------------------------------------------------------
+// PHASE C2 — measure the bending modulus κ (physical + tunable)
+// ---------------------------------------------------------------------------
+//
+// Phase C added a splay-bend torque (a director-only quadratic-in-curvature cost).
+// C2 validates it is a PHYSICAL, TUNABLE bending rigidity by *measuring* an
+// effective bending modulus κ on a flat membrane patch and checking the two things
+// the research's JCP checklist + PRE benchmark ask for:
+//
+//   (a) κ rises MONOTONICALLY with the bending-stiffness knob (`kappa_bend`), and
+//   (b) κ lands in / brackets the physically sensible 3–30 k_BT band (docs/
+//       self-assembly-plan.md §4: a correct fluid bilayer has κ in 3–30 k_BT).
+//
+// HOW κ IS MEASURED (curvature-energy response, the brief's first option):
+// impose a KNOWN uniform curvature on a flat patch — tilt each normal about a fixed
+// axis by an angle proportional to its in-plane coordinate, so every neighbour pair's
+// normals differ by a fixed relative tilt Δc (the discrete mean curvature) — and
+// measure the bending energy ΔE the term assigns to that configuration. The Helfrich
+// form is ΔE = ½ κ (Δc)² A, so κ = 2 ΔE / ((Δc)² A).
+//
+// The bending term is a TORQUE (it is deliberately NOT in the energy scalar, to keep
+// −∇E == compute_forces and the golden master byte-identical), so ΔE is recovered by
+// INTEGRATING THE ENGINE'S OWN TORQUE along the bend: the engine's per-step director
+// change at temperature 0 is Δnᵢ = dt·μ_bend·τᵢ where τᵢ is the perpendicular
+// splay-bend torque it computes (μ_bend = min(kappa_bend,1)). We probe τᵢ directly
+// from one engine step and do the work integral W = −∫ Σᵢ τᵢ·dnᵢ over a straight path
+// from flat to the imposed curvature. Because τ = −∂E/∂n, W is exactly the bending
+// energy ΔE — measured THROUGH the engine, not re-derived from the settings.
+
+/// Read the per-node splay-bend torque the engine produces for a given director
+/// configuration, by stepping the bending engine ONE step at temperature 0 and
+/// recovering τᵢ from the director change: Δnᵢ = dt·μ_bend·τᵢ (the only motion at
+/// T=0, anisotropy=0). Returns the torque vectors (interleaved x,y,z, length 3n).
+/// `dt` and `mu_bend` undo the integrator's scaling so the raw torque is returned.
+fn measure_bend_torque(
+    pos: &[f32],
+    dirs: &[f32],
+    radius: f32,
+    kappa_bend: f32,
+    c0: f32,
+) -> Vec<f32> {
+    let n = pos.len() / 3;
+    let (mut e, mut ctx) = bending_engine(pos, dirs, radius, kappa_bend, c0);
+    let dt = 0.2f32; // matches bending_engine's time_step
+    let mu_bend = kappa_bend.min(1.0); // matches integrate_directors' bend_mobility
+    let _ = e.step(&mut ctx);
+    let after = e.directors().unwrap();
+    let mut tau = vec![0.0f32; 3 * n];
+    let inv = 1.0 / (dt * mu_bend).max(1e-12);
+    for k in 0..3 * n {
+        tau[k] = (after[k] - dirs[k]) * inv;
+    }
+    tau
+}
+
+/// Impose a uniform curvature on a flat (z=0) patch: tilt each node's normal away
+/// from +z about the +y axis by an angle proportional to its x coordinate, so the
+/// inter-normal tilt between neighbours one `spacing` apart along x is exactly
+/// `delta_c` (radians). Returns the interleaved unit directors. (Curvature about y
+/// ⇒ normals fan in the x–z plane, a cylindrical bend — the cleanest single-axis
+/// curvature with a known Δc per neighbour spacing.)
+fn impose_curvature_directors(pos: &[f32], spacing: f32, delta_c: f32) -> Vec<f32> {
+    let n = pos.len() / 3;
+    let mut d = vec![0.0f32; 3 * n];
+    let rate = delta_c / spacing; // radians of tilt per unit x
+    for i in 0..n {
+        let x = pos[3 * i];
+        let ang = rate * x;
+        d[3 * i] = ang.sin();
+        d[3 * i + 1] = 0.0;
+        d[3 * i + 2] = ang.cos();
+    }
+    d
+}
+
+/// Measure the effective bending modulus κ of the splay-bend term on a flat patch,
+/// in reduced (k_BT-style) energy units, by the curvature-energy response.
+///
+/// Integrates the engine's OWN torque along a straight path in director space from
+/// the flat field to a field with a known uniform inter-normal tilt `delta_c`,
+/// recovering the bending energy ΔE = −∫ Σ τ·dn (τ = −∂E/∂n). Then inverts the
+/// Helfrich form ΔE = ½ κ (Δc)² A to get κ = 2 ΔE / ((Δc)² A), with the patch area
+/// A = (#nodes)·spacing² (one node per spacing² of membrane).
+fn measure_bending_modulus(spacing: f32, kappa_bend: f32, delta_c: f32) -> f32 {
+    let radius = 0.5f32;
+    let pos = flat_patch_positions(spacing);
+    let n = pos.len() / 3;
+    let flat: Vec<f32> = (0..n).flat_map(|_| [0.0f32, 0.0, 1.0]).collect();
+    let curved = impose_curvature_directors(&pos, spacing, delta_c);
+
+    // Work integral W = −∫ Σ τ·dn along the straight path n(s) = flat + s·(curved−flat),
+    // renormalised to the unit sphere at each sample (directors are unit vectors).
+    // Midpoint rule over `steps` segments: dn for segment k is (n_{k+1} − n_k); the
+    // torque is sampled at the segment midpoint. Negative because τ = −∂E/∂n.
+    const STEPS: usize = 64;
+    let lerp_unit = |s: f32| -> Vec<f32> {
+        let mut v = vec![0.0f32; 3 * n];
+        for i in 0..n {
+            for k in 0..3 {
+                v[3 * i + k] = flat[3 * i + k] + s * (curved[3 * i + k] - flat[3 * i + k]);
+            }
+            let len = (v[3 * i] * v[3 * i] + v[3 * i + 1] * v[3 * i + 1] + v[3 * i + 2] * v[3 * i + 2])
+                .sqrt()
+                .max(1e-9);
+            for k in 0..3 {
+                v[3 * i + k] /= len;
+            }
+        }
+        v
+    };
+
+    let mut work = 0.0f64;
+    for seg in 0..STEPS {
+        let s0 = seg as f32 / STEPS as f32;
+        let s1 = (seg + 1) as f32 / STEPS as f32;
+        let n0 = lerp_unit(s0);
+        let n1 = lerp_unit(s1);
+        let smid = 0.5 * (s0 + s1);
+        let nmid = lerp_unit(smid);
+        let tau = measure_bend_torque(&pos, &nmid, radius, kappa_bend, 0.0);
+        // dE = −Σ τ·dn over this segment.
+        for k in 0..3 * n {
+            work -= tau[k] as f64 * (n1[k] - n0[k]) as f64;
+        }
+    }
+    let area = n as f32 * spacing * spacing;
+    let de = work as f32; // ΔE = W (work done against the bending torque)
+    2.0 * de / (delta_c * delta_c * area)
+}
+
+#[test]
+fn bending_modulus_is_monotonic_and_in_physical_band() {
+    // C2 validation: the splay-bend term is a PHYSICAL, TUNABLE bending rigidity.
+    //   (a) the measured effective modulus κ rises MONOTONICALLY with kappa_bend;
+    //   (b) κ can be tuned into / brackets the physically sensible 3–30 k_BT band
+    //       (docs/self-assembly-plan.md §4, PRE fluid-bilayer benchmark).
+    // κ is measured by the curvature-energy response, integrating the engine's own
+    // torque along an imposed-curvature path (see measure_bending_modulus).
+    let spacing = 0.9f32; // σ = 1.0 ⇒ neighbours within the cohesion well
+    let delta_c = 0.10f32; // small inter-normal tilt (radians) — linear-response regime
+
+    // Sweep the stiffness knob; the well depth here is 2.0 (set by bending_engine),
+    // and the patch is at unit kT scale, so κ is read directly in reduced units.
+    let knobs = [0.05f32, 0.1, 0.2, 0.4, 0.8];
+    let kappas: Vec<f32> = knobs
+        .iter()
+        .map(|&k| measure_bending_modulus(spacing, k, delta_c))
+        .collect();
+
+    eprintln!("C2 bending modulus sweep (kappa_bend -> measured κ, reduced units):");
+    for (k, kap) in knobs.iter().zip(kappas.iter()) {
+        eprintln!("    kappa_bend = {k:.2}  ->  κ = {kap:.3} k_BT");
+    }
+
+    // Every measured modulus must be positive (a real stiffness, not noise).
+    for (k, kap) in knobs.iter().zip(kappas.iter()) {
+        assert!(
+            *kap > 0.0,
+            "measured κ must be positive at kappa_bend={k}: got {kap}"
+        );
+    }
+
+    // (a) Strictly monotone increasing in the knob: stiffer knob ⇒ stiffer membrane.
+    for w in kappas.windows(2) {
+        assert!(
+            w[1] > w[0] * 1.05,
+            "κ must increase monotonically with kappa_bend: {:?}",
+            kappas
+        );
+    }
+
+    // The response is linear in the knob (the torque scales ∝ kappa_bend), so the
+    // measured κ ∝ kappa_bend — doubling the knob roughly doubles κ. Check the two
+    // largest knobs (0.4 → 0.8) give ≈ ×2 (loose band absorbs the small-angle +
+    // quadrature error), confirming κ is a clean linear function of the knob, hence
+    // tunable to ANY target by scaling kappa_bend.
+    let ratio = kappas[4] / kappas[3];
+    assert!(
+        (ratio - 2.0).abs() < 0.5,
+        "κ should scale ~linearly with kappa_bend (0.4→0.8 ratio {ratio:.2}, expect ≈2)"
+    );
+
+    // (b) Physical band: demonstrate κ values that land WITHIN and BRACKET 3–30 k_BT.
+    // κ is linear in kappa_bend, so the knob needed to hit the band centre (~10 k_BT)
+    // is knob_10 = 10 · (kappa_bend / κ) read off the sweep; assemble three target
+    // knobs and confirm the measured κ brackets the band end-to-end.
+    let slope = kappas[2] / knobs[2]; // κ per unit knob (use a mid sample)
+    let knob_for = |target: f32| target / slope;
+    let lo = measure_bending_modulus(spacing, knob_for(3.0), delta_c);
+    let mid = measure_bending_modulus(spacing, knob_for(10.0), delta_c);
+    let hi = measure_bending_modulus(spacing, knob_for(30.0), delta_c);
+    eprintln!(
+        "C2 tuned into the 3–30 k_BT band: κ(target 3) = {lo:.2}, κ(target 10) = {mid:.2}, \
+         κ(target 30) = {hi:.2} k_BT  (knobs {:.3}, {:.3}, {:.3})",
+        knob_for(3.0),
+        knob_for(10.0),
+        knob_for(30.0)
+    );
+    // The low target lands at/below the band's lower edge, the high target at/above
+    // its upper edge, and the mid lands inside — the term brackets 3–30 k_BT.
+    assert!(
+        (1.5..=5.0).contains(&lo),
+        "tuned-low κ should sit near the 3 k_BT band edge, got {lo:.2}"
+    );
+    assert!(
+        (3.0..=30.0).contains(&mid),
+        "tuned-mid κ should sit INSIDE the 3–30 k_BT band, got {mid:.2}"
+    );
+    assert!(
+        hi >= 20.0,
+        "tuned-high κ should reach the 30 k_BT band edge, got {hi:.2}"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // PHASE O — self-assembly order parameters (observe_assembly)
 // ---------------------------------------------------------------------------
 //
