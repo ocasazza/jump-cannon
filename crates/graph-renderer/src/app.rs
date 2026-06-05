@@ -1732,6 +1732,10 @@ impl eframe::App for App {
         self.apply_layout_to_gpu(frame);
         self.perf.end_stage(StageId::LayoutDispatch);
 
+        // Initial-seed section (Layout panel): drain freshly evaluated seed
+        // positions, if any, into the live GPU positions buffer.
+        self.drain_seed_positions(frame);
+
         // Metrics panel: drain its one-shot compute flag (no-op unless the user
         // pressed Compute), reading positions/edges from the live pipeline.
         self.drain_metrics_request(frame);
@@ -2417,6 +2421,35 @@ impl App {
         self.prev_layout_key = Some(key);
         self.prev_active_layout_id = Some(active_id);
         self.prev_seed_mode = new_seed_mode;
+    }
+
+    /// Drain the Initial-seed section's one-shot: if the user applied a seed
+    /// (built-in or custom Nix), `state.seed.pending` holds the freshly
+    /// evaluated `[x,y,z]` positions. Write them straight into the live GPU
+    /// positions buffer via `GraphPipelines::set_positions`, which also
+    /// re-initialises the active physics layout so the sim resumes from the
+    /// seed. The "No seed" strategy never sets `pending`, so this is a no-op.
+    fn drain_seed_positions(&mut self, frame: &mut eframe::Frame) {
+        if !self.loaded_into_gpu {
+            return;
+        }
+        let Some(positions) = self.state.seed.pending.take() else {
+            return;
+        };
+        // Flatten [[x,y,z]] -> [x,y,z,...].
+        let flat: Vec<f32> = positions.iter().flat_map(|p| p.iter().copied()).collect();
+
+        let Some(wgpu_state) = frame.wgpu_render_state() else { return };
+        let device = wgpu_state.device.clone();
+        let queue = wgpu_state.queue.clone();
+        let mut renderer = wgpu_state.renderer.write();
+        if let Some(pipes) = renderer.callback_resources.get_mut::<GraphPipelines>() {
+            if let Err(e) = pipes.set_positions(&device, &queue, &flat) {
+                log::warn!("[graph-renderer] drain_seed_positions: {e}");
+                self.state.seed.editor.error = Some(e);
+                self.state.seed.editor.status = None;
+            }
+        }
     }
 
     fn focus_key(&self) -> u64 {

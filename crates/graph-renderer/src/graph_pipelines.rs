@@ -1444,6 +1444,81 @@ impl GraphPipelines {
         }
     }
 
+    /// Write an externally-supplied set of initial positions into the live
+    /// positions buffer — the "initial seed" path. `positions` is a flat
+    /// `[x,y,z, ...]` slice and must have exactly `3 * n_nodes` entries.
+    ///
+    /// This is the seed analogue of `run_static_solve`: it overwrites the GPU
+    /// positions, refreshes the CPU mirror, and (if a physics layout is active)
+    /// re-initialises it from the new positions so the force sim *resumes* from
+    /// the seed rather than freezing. Unlike `run_static_solve` it does NOT tear
+    /// the layout down — seeding is about choosing a starting point for the
+    /// running sim.
+    pub fn set_positions(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        positions: &[f32],
+    ) -> Result<(), String> {
+        let b = self
+            .buffers
+            .as_mut()
+            .ok_or_else(|| "set_positions: no buffers loaded".to_string())?;
+        let n_nodes = b.n_nodes as usize;
+        if positions.len() != n_nodes * 3 {
+            return Err(format!(
+                "set_positions: got {} floats, expected {} (3 * n_nodes)",
+                positions.len(),
+                n_nodes * 3,
+            ));
+        }
+
+        // Re-pack into the vec4-padded layout the WGSL storage buffer expects.
+        let mut padded: Vec<f32> = Vec::with_capacity(n_nodes * 4);
+        for i in 0..n_nodes {
+            padded.extend_from_slice(&[
+                positions[i * 3],
+                positions[i * 3 + 1],
+                positions[i * 3 + 2],
+                0.0,
+            ]);
+        }
+        if padded.is_empty() {
+            padded.extend_from_slice(&[0.0; 4]);
+        }
+        queue.write_buffer(&b.positions, 0, bytemuck::cast_slice(&padded));
+
+        // Refresh the CPU mirror so raycasts / bounds() see the seed.
+        b.positions_cpu = positions.to_vec();
+
+        // Sync the cached topology graph's `position3` from the new positions
+        // (same id scheme as swap_physics_layout) and re-init the active
+        // physics layout so the GPU sim resumes from the seed.
+        if let Some(graph) = b.layout_graph.as_mut() {
+            let width = format!("{}", n_nodes.max(1) - 1).len().max(1);
+            for i in 0..n_nodes {
+                let id = format!("{:0width$}", i, width = width);
+                if let Some(node) = graph.nodes.get_mut(&id) {
+                    node.position3 = Some([
+                        positions[i * 3],
+                        positions[i * 3 + 1],
+                        positions[i * 3 + 2],
+                    ]);
+                }
+            }
+        }
+        if let Some(mut layout) = b.layout.take() {
+            if let Some(graph) = b.layout_graph.as_ref() {
+                if let Err(e) = layout.init_with_device(device, queue, graph, &b.positions) {
+                    log::warn!("[graph-renderer] set_positions: layout re-init failed: {e}");
+                }
+            }
+            b.layout = Some(layout);
+        }
+
+        Ok(())
+    }
+
     /// Run a one-shot Static layout against the cached topology graph and
     /// upload the result into the shared positions buffer. Drops any
     /// active physics layout so `compute_step` becomes a no-op until the

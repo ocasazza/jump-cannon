@@ -1004,6 +1004,13 @@ pub struct AppState {
     /// shared `LoadState`. Session-scoped, never persisted.
     #[serde(skip)]
     pub generate: GenerateState,
+    /// Initial-seed section state (Layout panel): the picked seed strategy, the
+    /// Custom-Nix editor, and a one-shot of freshly evaluated seed positions
+    /// awaiting application to the live GPU graph. Drained by `App::update`,
+    /// which writes the positions straight into the positions buffer.
+    /// Session-scoped, never persisted (`#[serde(skip)]`).
+    #[serde(skip)]
+    pub seed: SeedState,
 }
 
 /// State for the `Section::Generate` ("Generate (tvix)") panel.
@@ -1018,15 +1025,9 @@ pub struct AppState {
 /// `source` buffer is session scratch like the YAML import/export buffers.)
 #[derive(Clone, Default, Debug)]
 pub struct GenerateState {
-    /// The editable Nix expression. Prefilled with a star-graph demo by
-    /// `GenerateState::default`.
-    pub source: String,
-    /// Node/edge counts from the last successful evaluation, shown as a
-    /// readout. `None` until the user evaluates once.
-    pub last_counts: Option<(usize, usize)>,
-    /// Most recent evaluation error, rendered as red labels. `None` when
-    /// the last evaluation succeeded (or none has run yet).
-    pub error: Option<String>,
+    /// The shared Nix-editor component state (source buffer, error, status).
+    /// Reused by `ui::nix_extension::NixExtension`.
+    pub editor: crate::ui::nix_extension::NixEditorState,
     /// One-shot: a freshly evaluated graph awaiting promotion to the GPU.
     /// Set by the panel on a successful "Evaluate"; taken by `App::update`,
     /// which converts it to a `Bootstrap` and replaces the live graph.
@@ -1050,7 +1051,61 @@ in
 impl GenerateState {
     fn with_demo() -> Self {
         GenerateState {
-            source: GENERATE_DEMO_EXPR.to_string(),
+            editor: crate::ui::nix_extension::NixEditorState::with_source(GENERATE_DEMO_EXPR),
+            ..Default::default()
+        }
+    }
+}
+
+/// State for the Layout panel's "Initial seed" section.
+///
+/// Mirrors `GenerateState`'s one-shot-handoff shape. The seed section picks a
+/// strategy (No seed / a built-in / Custom Nix); on Apply it evaluates a Nix
+/// expression implementing the seed interface via `tvix_wasm::eval_seed` and
+/// stashes the resulting positions in `pending`. `App::update` drains it and
+/// writes the positions straight into the live GPU positions buffer.
+///
+/// `#[serde(skip)]` on the `AppState` field — never persisted (session scratch,
+/// like the generate editor). The selected strategy + custom source therefore
+/// reset on a new tab, which is fine: seeding is an explicit one-shot action.
+#[derive(Clone, Default, Debug)]
+pub struct SeedState {
+    /// The currently picked seed strategy.
+    pub strategy: SeedStrategy,
+    /// The shared Nix-editor component state for the Custom (Nix) strategy.
+    pub editor: crate::ui::nix_extension::NixEditorState,
+    /// One-shot: freshly evaluated seed positions awaiting application to the
+    /// live GPU graph. `Vec<[f32;3]>`; an empty vec is never stored here (the
+    /// "No seed" path simply never sets `pending`). Taken by `App::update`.
+    pub pending: Option<Vec<[f32; 3]>>,
+}
+
+/// Which initial-seed strategy the Layout panel applies. `BuiltIn` carries the
+/// embedded `seed_demos()` expression by index; `Custom` uses the editor.
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub enum SeedStrategy {
+    /// Apply no seed — leave the current positions untouched.
+    #[default]
+    None,
+    /// One of the embedded `tvix_wasm::seed_demos()` strategies, by index.
+    BuiltIn(usize),
+    /// A user-authored Nix expression implementing the seed interface.
+    Custom,
+}
+
+/// Default Custom-strategy source: a runnable template for the seed interface.
+pub const SEED_CUSTOM_EXPR: &str = r#"# Implement the seed interface, then press Apply seed.
+#   seed : { n, ... } -> [ { x; y; z; } ]
+# `n` (the live node count) is bound for you. Return exactly n positions,
+# or [] to apply no seed. The embedded library has built-ins to build on:
+let s = import /jc/src/seed.nix {};
+in s.sphere { inherit n; radius = 800.0; }
+"#;
+
+impl SeedState {
+    pub fn with_template() -> Self {
+        SeedState {
+            editor: crate::ui::nix_extension::NixEditorState::with_source(SEED_CUSTOM_EXPR),
             ..Default::default()
         }
     }
@@ -1353,6 +1408,7 @@ impl Default for AppState {
             focused_panel: None,
             collapsed_panels: std::collections::HashSet::new(),
             generate: GenerateState::with_demo(),
+            seed: SeedState::with_template(),
         }
     }
 }

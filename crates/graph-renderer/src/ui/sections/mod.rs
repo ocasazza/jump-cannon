@@ -5,6 +5,7 @@ pub mod generate;
 pub mod instances;
 pub mod layout;
 pub mod metrics;
+pub mod seed;
 pub mod style;
 
 use eframe::egui;

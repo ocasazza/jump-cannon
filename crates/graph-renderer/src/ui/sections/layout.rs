@@ -233,6 +233,12 @@ pub fn show(ui: &mut egui::Ui, state: &mut AppState, registry: &LayoutRegistry) 
 
     subgroup_separator(ui);
 
+    // Initial-seed section: pick where nodes START before the sim runs
+    // (No seed / a built-in / a custom Nix seed). Modular — its own module.
+    super::seed::show(ui, state);
+
+    subgroup_separator(ui);
+
     let id = state.layout.active.clone();
     if let Some(factory) = registry.get(&id) {
         let default_factory = || factory.default_settings();

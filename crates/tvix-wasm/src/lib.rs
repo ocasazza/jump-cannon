@@ -59,6 +59,10 @@ embed_nix_files! {
     "/jc/src/birds.nix"             => "nix/birds.nix",
     "/jc/src/graph.nix"             => "nix/graph.nix",
     "/jc/src/graph-combinators.nix" => "nix/graph-combinators.nix",
+    // The initial-position SEED interface + built-in implementations.
+    // Self-contained (no birds.nix import) so it dodges the tvix
+    // closure-across-imports bug.
+    "/jc/src/seed.nix"              => "nix/seed.nix",
 }
 
 /// The virtual directory the embedded library lives in. User code is evaluated
@@ -284,6 +288,127 @@ pub fn eval_graph(expr: &str) -> Result<GeneratedGraph, String> {
     Ok(GeneratedGraph { nodes, edges })
 }
 
+// ── Seed evaluation ─────────────────────────────────────────────────────────
+//
+// The SEED use case (alongside `eval_graph`): a user Nix expression implements
+// the abstract seed interface documented in `seed.nix` and returns initial
+// per-node positions. The interface is:
+//
+//   seed : { n, ... } -> [ { x; y; z; } ]
+//
+// The host appends `{ n = <count>; }` application context by passing `n` to the
+// VFS expression via a `let`-binding, evaluates with the same deepSeq+toJSON +
+// output-cap machinery as `eval_graph`, then validates that the returned list
+// has exactly `n` entries (the empty list is the special "no seed" sentinel).
+
+/// Cap on the number of seed positions accepted (mirrors `MAX_NODES`).
+const MAX_SEED_POINTS: usize = MAX_NODES;
+
+/// A single `{ x; y; z; }` position. Numbers may be ints or floats in Nix;
+/// serde + `f32` coerce either.
+#[derive(Deserialize)]
+struct RawPos {
+    x: f32,
+    y: f32,
+    z: f32,
+}
+
+/// Evaluate a Nix expression implementing the seed interface into per-node
+/// positions.
+///
+/// `n` is the live graph's node count. It is injected into the evaluation as a
+/// top-level `let n = <n>;` binding, so a custom expression can reference `n`
+/// directly, and the built-in seeds are typically applied as
+/// `(import /jc/src/seed.nix {}).sphere { inherit n; }`.
+///
+/// The expression must evaluate to a list of `{ x; y; z; }` attrsets. Returns:
+///   * `Ok(vec)` with `vec.len() == n` for a normal seed,
+///   * `Ok(vec![])` (empty) for the "no seed" sentinel (the `none` impl), which
+///     the caller interprets as "leave positions as-is",
+///   * `Err(_)` for an eval error, a non-list / wrong-shape result, or a list
+///     whose length is neither `0` nor `n`.
+pub fn eval_seed(expr: &str, n: usize) -> Result<Vec<[f32; 3]>, String> {
+    // Inject `n` so the expression (and the built-in seeds) can reference it.
+    let wrapped = format!("let n = {n}; in (\n{expr}\n)");
+    let json = eval_to_json(&wrapped)?;
+
+    let raw: Vec<RawPos> = serde_json::from_str(&json).map_err(|e| {
+        format!(
+            "seed result is not a list of {{ x; y; z; }} positions: {e}\n\
+             (the seed interface is: seed : {{ n, ... }} -> [ {{ x; y; z; }} ])"
+        )
+    })?;
+
+    // Empty list is the "no seed" sentinel — accept it regardless of n.
+    if raw.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    if raw.len() > MAX_SEED_POINTS {
+        return Err(format!(
+            "seed too large: {} positions exceeds the {MAX_SEED_POINTS} cap",
+            raw.len()
+        ));
+    }
+
+    if raw.len() != n {
+        return Err(format!(
+            "seed returned {} positions but the graph has {n} nodes \
+             (a seed must return exactly n positions, or [] for no seed)",
+            raw.len()
+        ));
+    }
+
+    Ok(raw.into_iter().map(|p| [p.x, p.y, p.z]).collect())
+}
+
+/// Built-in seed example expressions for the Layout panel's seed picker. Each
+/// evaluates against the embedded `seed.nix` library. `name` doubles as the
+/// strategy label. Every entry is verified by the `all_seed_demos_evaluate`
+/// test.
+pub fn seed_demos() -> &'static [Demo] {
+    SEED_DEMOS
+}
+
+const SEED_DEMOS: &[Demo] = &[
+    Demo {
+        name: "Sphere (Fibonacci shell)",
+        expr: r#"# Fibonacci sphere shell — matches the renderer's default seed.
+let s = import /jc/src/seed.nix {};
+in s.sphere { inherit n; radius = 800.0; }
+"#,
+    },
+    Demo {
+        name: "Random (ball)",
+        expr: r#"# Deterministic pseudo-random points in a cube.
+let s = import /jc/src/seed.nix {};
+in s.random { inherit n; radius = 800.0; seed = 1; }
+"#,
+    },
+    Demo {
+        name: "Grid (cubic lattice)",
+        expr: r#"# Axis-aligned cubic lattice, side = ceil(cbrt n).
+let s = import /jc/src/seed.nix {};
+in s.grid { inherit n; spacing = 60.0; }
+"#,
+    },
+    Demo {
+        name: "No seed",
+        expr: r#"# No seed: leave the current positions untouched.
+let s = import /jc/src/seed.nix {};
+in s.none { inherit n; }
+"#,
+    },
+    Demo {
+        name: "Custom (flat line)",
+        expr: r#"# Author your own: a flat line along x. The interface is
+#   seed : { n, ... } -> [ { x; y; z; } ]
+# `n` is bound for you. Return exactly n positions (or [] for no seed).
+builtins.genList (i: { x = i * 20.0; y = 0.0; z = 0.0; }) n
+"#,
+    },
+];
+
 // ── Demo catalog ──────────────────────────────────────────────────────────────
 
 /// A named example expression for the Generate panel's demo picker.
@@ -493,6 +618,89 @@ mod tests {
                     e.source,
                     e.target
                 );
+            }
+        }
+    }
+
+    // ── Seed interface ────────────────────────────────────────────────────
+
+    #[test]
+    fn seed_sphere_returns_n_positions() {
+        let expr = "let s = import /jc/src/seed.nix {}; in s.sphere { inherit n; }";
+        let pts = eval_seed(expr, 32).expect("sphere seed should evaluate");
+        assert_eq!(pts.len(), 32, "sphere returns n positions");
+        // Every point should sit ~on the radius-800 shell (our sqrt/trig are
+        // approximate, so allow a loose tolerance).
+        for p in &pts {
+            let r = (p[0] * p[0] + p[1] * p[1] + p[2] * p[2]).sqrt();
+            assert!(
+                (r - 800.0).abs() < 80.0,
+                "point off the shell: r={r} ({p:?})"
+            );
+        }
+    }
+
+    #[test]
+    fn seed_random_returns_n_positions() {
+        let expr = "let s = import /jc/src/seed.nix {}; in s.random { inherit n; }";
+        let pts = eval_seed(expr, 50).expect("random seed should evaluate");
+        assert_eq!(pts.len(), 50);
+        // Determinism: the same expr + n yields identical output.
+        let pts2 = eval_seed(expr, 50).unwrap();
+        assert_eq!(pts, pts2, "random seed is deterministic");
+    }
+
+    #[test]
+    fn seed_grid_returns_n_positions() {
+        let expr = "let s = import /jc/src/seed.nix {}; in s.grid { inherit n; }";
+        let pts = eval_seed(expr, 27).expect("grid seed should evaluate");
+        assert_eq!(pts.len(), 27);
+    }
+
+    #[test]
+    fn seed_none_returns_empty() {
+        let expr = "let s = import /jc/src/seed.nix {}; in s.none { inherit n; }";
+        // The "no seed" sentinel: empty list, accepted regardless of n.
+        let pts = eval_seed(expr, 100).expect("none seed should evaluate");
+        assert!(pts.is_empty(), "none returns the empty sentinel");
+    }
+
+    #[test]
+    fn seed_custom_inline_works() {
+        // A user-authored seed referencing the injected `n`.
+        let expr = "builtins.genList (i: { x = i * 1.0; y = 0.0; z = 0.0; }) n";
+        let pts = eval_seed(expr, 8).expect("custom seed should evaluate");
+        assert_eq!(pts.len(), 8);
+        assert_eq!(pts[0], [0.0, 0.0, 0.0]);
+        assert_eq!(pts[7], [7.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn seed_wrong_length_is_err() {
+        // Returns 3 positions but graph has 5 → error.
+        let expr = "[ { x = 0; y = 0; z = 0; } { x = 1; y = 0; z = 0; } { x = 2; y = 0; z = 0; } ]";
+        let err = eval_seed(expr, 5).unwrap_err();
+        assert!(err.contains("exactly n"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn seed_bad_expr_is_err() {
+        assert!(eval_seed("let x = in", 4).is_err());
+        // Valid Nix, wrong shape (not a list of {x;y;z}).
+        assert!(eval_seed("42", 4).is_err());
+    }
+
+    #[test]
+    fn all_seed_demos_evaluate() {
+        // Every seed demo must evaluate for a representative n. "No seed"
+        // yields the empty sentinel; the rest yield exactly n positions.
+        for d in seed_demos() {
+            let pts = eval_seed(d.expr, 24)
+                .unwrap_or_else(|e| panic!("seed demo {:?} failed: {e}", d.name));
+            if d.name == "No seed" {
+                assert!(pts.is_empty(), "No seed must be empty");
+            } else {
+                assert_eq!(pts.len(), 24, "seed demo {:?} must return n positions", d.name);
             }
         }
     }

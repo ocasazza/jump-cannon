@@ -13,6 +13,7 @@ pub mod frontmatter_grid;
 pub mod inspector;
 pub mod layout;
 pub mod modal;
+pub mod nix_extension;
 pub mod page_viewer;
 pub mod persist;
 pub mod progress;
