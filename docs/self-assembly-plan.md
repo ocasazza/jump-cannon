@@ -205,7 +205,7 @@ fixed RNG seed for reproducibility):
 Tick these off as they land; each is one self-contained PR.
 
 - [x] **Phase T** — geometric: Langevin thermostat (temperature + OU noise) + equipartition canary
-- [ ] **Phase W** — geometric: tunable-range cosine² attractive well (`w_c`); fold into `EnergyBreakdown`
+- [x] **Phase W** — geometric: tunable-range cosine² attractive well (`well_depth` ε / `well_width` w_c), folded into `EnergyBreakdown::cohesion`; canaries: bound-pair → contact σ, finite range, −∇E==F, deeper-ε ⇒ faster binding, loose-cloud condensation
 - [ ] **Phase A** — geometric: per-node orientation/director + patchy (orientation-dependent) pair potential
 - [ ] **Phase O** — compute interface: promote `EngineObservables` onto `LayoutEngine` (nematic S, cluster-size, R_g)
 - [ ] **Phase S** — geometric: self-assembly statistical canaries (ideal-chain R_g²∝N, morphology ladder)

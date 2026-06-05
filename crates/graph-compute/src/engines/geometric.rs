@@ -210,8 +210,29 @@ pub struct GeometricSettings {
     /// Strength multiplier on the long-range class affinity term.
     pub affinity_strength: f32,
     /// Exclusion / affinity ignored beyond `cutoff_scale × (rᵢ+rⱼ)`. Bounds the
-    /// constant in the `O(n²)` pair scan.
+    /// constant in the `O(n²)` pair scan. (The attractive well extends the
+    /// effective cutoff to `max(cutoff_scale·σ, σ + well_width)` so its tail is
+    /// never clipped — see [`well_depth`](Self::well_depth).)
     pub cutoff_scale: f32,
+
+    // --- tunable-range attractive well (Cooke–Deserno cohesion) ---
+    /// Depth `ε` of the soft attractive well that sits *outside* the short-range
+    /// exclusion: WCA-style repulsion up to contact `σ = rᵢ+rⱼ`, then a cosine²
+    /// attractive tail reaching width [`well_width`](Self::well_width). `0` ⇒ OFF
+    /// (no cohesion term ⇒ default-settings behaviour is byte-identical, the
+    /// golden-master regression is untouched). `> 0` lets monomers *condense*:
+    /// unlike the constant-magnitude `class_affinity`, this is a **clean
+    /// potential** (force is its exact negative gradient), so it folds into
+    /// [`EnergyBreakdown::cohesion`] and `observe()` tracks it. The energy minimum
+    /// of repulsion + well sits at contact `σ`, so a bound pair relaxes to `≈σ`.
+    /// This is the Cooke–Deserno mechanism whose *width* is the dominant knob for
+    /// self-assembly (see `docs/self-assembly-plan.md` §4).
+    pub well_depth: f32,
+    /// Width `w_c` of the attractive well: the cosine² tail spans `σ … σ+w_c`,
+    /// decaying from `−ε` at contact to `0` at `σ+w_c`. The single dominant
+    /// control parameter for the fluid-membrane regime (wider ⇒ longer-range
+    /// cohesion). Ignored when [`well_depth`](Self::well_depth) `== 0`.
+    pub well_width: f32,
 
     // --- mass / gravity / integration ---
     /// Lower bound of the normalized mass range (structural mass sources).
@@ -274,6 +295,13 @@ impl Default for GeometricSettings {
             exclusion_strength: 1.0,
             affinity_strength: 0.0,
             cutoff_scale: 6.0,
+
+            // Default OFF: ε=0 ⇒ no cohesion term ⇒ default behaviour is
+            // byte-identical (golden-master regression unaffected). well_width is
+            // a sensible non-zero default so enabling the well only takes setting
+            // well_depth.
+            well_depth: 0.0,
+            well_width: 1.0,
 
             mass_min: 1.0,
             mass_max: 1.0,
@@ -493,6 +521,11 @@ pub struct EnergyBreakdown {
     pub angle: f32,
     /// Short-range class exclusion (soft overlap penalty), integrated.
     pub exclusion: f32,
+    /// Tunable-range attractive well (Cooke–Deserno cohesion): the cosine²
+    /// attractive tail just outside contact. A *clean* potential (unlike the old
+    /// constant-magnitude affinity), so `−∇(cohesion) == its force`. `≤ 0`
+    /// (attractive lowers energy); always `0` at the default `well_depth = 0`.
+    pub cohesion: f32,
     /// Mass-scaled pull toward the origin: `Σ ½·gravity·mᵢ·‖rᵢ‖²`.
     pub gravity: f32,
 }
@@ -500,7 +533,7 @@ pub struct EnergyBreakdown {
 impl EnergyBreakdown {
     /// Total conservative potential energy.
     pub fn total(&self) -> f32 {
-        self.edge + self.angle + self.exclusion + self.gravity
+        self.edge + self.angle + self.exclusion + self.cohesion + self.gravity
     }
 }
 
@@ -695,8 +728,17 @@ fn potential_energy(st: &State, s: &GeometricSettings) -> EnergyBreakdown {
     // d < σ), i.e. S·(σ·ln(σ/d) − (σ − d)). Zero at and beyond σ. The force's
     // distance cutoff (cutoff_scale·σ ≥ σ) never clips a repulsion pair, so this
     // is exact regardless of `cutoff_scale`.
+    //
+    // Cohesion: the cosine² attractive well, the exact integral of its force so
+    // `−∇(cohesion) == its force`. V = −ε for d<σ, −ε·cos²(π(d−σ)/(2 w_c)) for
+    // σ≤d≤σ+w_c, 0 beyond. Only the σ≤d≤σ+w_c branch can be sampled by a relaxed
+    // pair (d<σ is held off by exclusion), but the flat −ε branch is included so
+    // the potential is continuous and consistent across the whole domain.
     let mut exclusion = 0.0f64;
+    let mut cohesion = 0.0f64;
     let class = &st.resolved.class;
+    let nc = s.class_affinity_dim as usize;
+    let wc = s.well_width.max(1e-4) as f64;
     for i in 0..st.n {
         let ri = lookup_radius(&s.class_radius, class[i] as usize, s.default_radius);
         for j in (i + 1)..st.n {
@@ -705,6 +747,15 @@ fn potential_energy(st: &State, s: &GeometricSettings) -> EnergyBreakdown {
             let d = pair_dist(pos, i, j).max(1e-4) as f64;
             if d < sigma {
                 exclusion += s.exclusion_strength as f64 * (sigma * (sigma / d).ln() - (sigma - d));
+            }
+            let eps = pair_well_depth(s, nc, class[i] as usize, class[j] as usize) as f64;
+            if eps > 0.0 {
+                if d < sigma {
+                    cohesion -= eps;
+                } else if d <= sigma + wc {
+                    let c = (std::f64::consts::FRAC_PI_2 * (d - sigma) / wc).cos();
+                    cohesion -= eps * c * c;
+                }
             }
         }
     }
@@ -724,6 +775,7 @@ fn potential_energy(st: &State, s: &GeometricSettings) -> EnergyBreakdown {
         edge: edge as f32,
         angle: angle as f32,
         exclusion: exclusion as f32,
+        cohesion: cohesion as f32,
         gravity: gravity as f32,
     }
 }
@@ -904,12 +956,16 @@ fn accumulate_exclusion_affinity(force: &mut [f32], st: &State, s: &GeometricSet
     let class = &st.resolved.class;
     let nc = s.class_affinity_dim as usize;
 
+    let wc = s.well_width.max(1e-4);
     for i in 0..n {
         let ri = lookup_radius(&s.class_radius, class[i] as usize, s.default_radius);
         for j in (i + 1)..n {
             let rj = lookup_radius(&s.class_radius, class[j] as usize, s.default_radius);
             let sigma = (ri + rj).max(1e-3);
-            let cutoff = s.cutoff_scale * sigma;
+            // The attractive well's tail reaches σ + w_c, which may exceed the
+            // exclusion/affinity cutoff — extend so the well is never clipped.
+            let eps = pair_well_depth(s, nc, class[i] as usize, class[j] as usize);
+            let cutoff = (s.cutoff_scale * sigma).max(if eps > 0.0 { sigma + wc } else { 0.0 });
 
             let dx = pos[3 * j] - pos[3 * i];
             let dy = pos[3 * j + 1] - pos[3 * i + 1];
@@ -933,8 +989,20 @@ fn accumulate_exclusion_affinity(force: &mut [f32], st: &State, s: &GeometricSet
             let aff = lookup_affinity(&s.class_affinity, nc, class[i] as usize, class[j] as usize);
             let attract = aff * s.affinity_strength;
 
+            // Tunable-range cosine² attractive well (cohesion), a *clean*
+            // potential. V_att = −ε for d<σ (flat ⇒ no force there; WCA handles
+            // d<σ), −ε·cos²(π(d−σ)/(2 w_c)) for σ≤d≤σ+w_c, 0 beyond. The
+            // attractive force toward j is −dV/dd = −ε·(π/(2 w_c))·sin(π(d−σ)/w_c)
+            // for σ≤d≤σ+w_c (positive ⇒ pulls together), 0 otherwise.
+            let cohere = if eps > 0.0 && dist >= sigma && dist <= sigma + wc {
+                let x = std::f32::consts::PI * (dist - sigma) / wc;
+                eps * std::f32::consts::FRAC_PI_2 / wc * x.sin()
+            } else {
+                0.0
+            };
+
             // net_toward_j applied to i (and the negative to j).
-            let net = attract - repel;
+            let net = attract + cohere - repel;
             let (fx, fy, fz) = (net * ux, net * uy, net * uz);
             force[3 * i] += fx;
             force[3 * i + 1] += fy;
@@ -1081,6 +1149,29 @@ fn lookup_affinity(matrix: &[f32], n: usize, a: usize, b: usize) -> f32 {
         return 0.0;
     }
     matrix.get(a * n + b).copied().unwrap_or(0.0)
+}
+
+/// Per-pair attractive-well depth `ε` for the cohesion term, gated by class.
+///
+/// `well_depth` is the base depth; the affinity matrix (when present) modulates
+/// it so heads/tails can cohere differently: a positive `class_affinity[a][b]`
+/// scales the well up, a non-positive one switches it off for that class pair
+/// (so a repulsive class pair never also attracts via cohesion). With no affinity
+/// matrix (`class_affinity_dim == 0`) the well applies uniformly at full depth —
+/// the simple monomer case. Returns `0` (OFF) whenever `well_depth == 0`.
+fn pair_well_depth(s: &GeometricSettings, nc: usize, a: usize, b: usize) -> f32 {
+    if s.well_depth <= 0.0 {
+        return 0.0;
+    }
+    if nc == 0 {
+        return s.well_depth;
+    }
+    let aff = lookup_affinity(&s.class_affinity, nc, a, b);
+    if aff > 0.0 {
+        s.well_depth * aff
+    } else {
+        0.0
+    }
 }
 
 /// Linearly normalize `values` into `[lo, hi]`. Constant input maps to `lo`.

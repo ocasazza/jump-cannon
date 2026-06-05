@@ -917,6 +917,244 @@ fn thermostat_off_is_a_pure_minimizer() {
 }
 
 // ---------------------------------------------------------------------------
+// 1c. ATTRACTIVE WELL — tunable-range cohesion (Cooke–Deserno) canaries
+// ---------------------------------------------------------------------------
+//
+// The exclusion term alone only *prevents* overlap; nothing makes two unbonded
+// monomers stick. Phase W adds a soft attractive well (WCA repulsion to contact
+// σ, then a cosine² tail of depth ε out to σ+w_c). It is a *clean* potential, so
+// the minimum of repulsion+well sits exactly at contact σ — two particles
+// starting *outside* σ but within the well must condense to a bound pair at ≈σ.
+// And because the well lowers the system's energy, a multi-particle droplet must
+// compactify *monotonically* as the well deepens. These are the closed-form
+// (separation → σ) and ordinal (deeper ε ⇒ smaller R_g) canaries for cohesion.
+
+/// Settings isolating the attractive well on a free (unbonded) pair/cluster:
+/// no edges, no gravity, no angle/affinity — just WCA exclusion + the cohesion
+/// well, with a fixed radius so σ = 2·radius is known.
+fn cohesion_only(radius: f32, well_depth: f32, well_width: f32) -> GeometricSettings {
+    GeometricSettings {
+        edge_stiffness: 0.0,
+        angle_stiffness: 0.0,
+        affinity_strength: 0.0,
+        gravity: 0.0,
+        exclusion_strength: 1.0,
+        class_radius: vec![radius],
+        default_radius: radius,
+        well_depth,
+        well_width,
+        damping: 0.6,
+        time_step: 1.0,
+        max_step: 0.5,
+        temperature: 0.0, // deterministic minimizer: the pair must settle, not jiggle
+        ..GeometricSettings::default()
+    }
+}
+
+#[test]
+fn well_off_by_default_is_noncohesive() {
+    // Guard: with well_depth = 0 (the default) two particles seeded apart feel NO
+    // attraction — they stay put (only exclusion acts, and they're already past
+    // σ). This is the byte-identical-default guarantee for the new term.
+    let radius = 0.5f32;
+    let sigma = 2.0 * radius;
+    let start = sigma + 0.8; // inside what *would* be the well, but well is OFF
+    let scn = Scenario {
+        name: "well-off",
+        graph: no_edges(2),
+        seed: vec![0.0, 0.0, 0.0, start, 0.0, 0.0],
+        settings: cohesion_only(radius, 0.0, 1.0),
+    };
+    let r = relax(&scn, 1_000, 0.0, 50);
+    let d = dist(&r.final_positions, 0, 1);
+    approx("non-cohesive separation unchanged", d, start, 1e-3);
+}
+
+#[test]
+fn well_binds_a_pair_to_contact() {
+    // Two particles seeded *outside* contact σ but within the attractive well
+    // (σ < d₀ < σ + w_c) must attract and relax to a bound pair at the well's
+    // energy minimum, which (repulsion + cohesion) sits exactly at contact σ.
+    let radius = 0.5f32;
+    let sigma = 2.0 * radius; // = 1.0
+    let well_width = 1.5f32;
+    let start = sigma + 0.9; // inside the well (0.9 < w_c) but well beyond σ
+    let scn = Scenario {
+        name: "well-bind",
+        graph: no_edges(2),
+        seed: vec![0.0, 0.0, 0.0, start, 0.0, 0.0],
+        settings: cohesion_only(radius, 1.0, well_width),
+    };
+    let r = relax(&scn, 4_000, 0.0, 50);
+    let d = dist(&r.final_positions, 0, 1);
+    // It must have moved *inward* from the seed (real attraction)…
+    assert!(
+        d < start - 0.3,
+        "pair should be drawn inward by the well: {start} -> {d}"
+    );
+    // …and settle at the energy minimum = contact σ.
+    approx("bound-pair separation", d, sigma, 3e-2);
+}
+
+#[test]
+fn well_does_not_reach_beyond_its_width() {
+    // The well has finite range: a pair seeded *past* σ + w_c feels nothing and
+    // stays put. Confirms the tail truly vanishes at σ + w_c (no spurious
+    // long-range pull leaking past the cutoff).
+    let radius = 0.5f32;
+    let sigma = 2.0 * radius;
+    let well_width = 0.8f32;
+    let start = sigma + well_width + 0.5; // strictly outside the well
+    let scn = Scenario {
+        name: "well-out-of-range",
+        graph: no_edges(2),
+        seed: vec![0.0, 0.0, 0.0, start, 0.0, 0.0],
+        settings: cohesion_only(radius, 1.0, well_width),
+    };
+    let r = relax(&scn, 1_000, 0.0, 50);
+    let d = dist(&r.final_positions, 0, 1);
+    approx("out-of-range separation unchanged", d, start, 1e-3);
+}
+
+#[test]
+fn well_energy_matches_negative_gradient() {
+    // The cohesion well is advertised as a *clean* potential: −∇(cohesion) must
+    // equal the force the integrator applies. Verify numerically — central finite
+    // difference of EnergyBreakdown.cohesion vs the residual along the pair axis,
+    // at a separation inside the well. (Exclusion off so cohesion is the only
+    // pairwise term; the residual is then purely the well force.)
+    let radius = 0.5f32;
+    let sigma = 2.0 * radius;
+    let d0 = sigma + 0.4; // inside the well
+    let mut s = cohesion_only(radius, 1.0, 1.5);
+    s.exclusion_strength = 0.0; // isolate cohesion (d0 > σ so exclusion is 0 anyway)
+
+    let energy_at = |sep: f32| -> f32 {
+        let mut e = GeometricEngine::new();
+        e.set_params(&serde_json::to_value(&s).unwrap()).unwrap();
+        let mut ctx = EngineCtx::cpu_only();
+        let g = no_edges(2);
+        let pos = vec![0.0, 0.0, 0.0, sep, 0.0, 0.0];
+        e.init(&mut ctx, &CsrShard::whole(&g), &pos).unwrap();
+        e.observe().unwrap().energy.cohesion
+    };
+
+    // Residual force on node 0 along +x at d0 (observe reports ‖F‖; the well is
+    // attractive so node 0 is pulled toward +x, node 1 toward −x).
+    let mut e = GeometricEngine::new();
+    e.set_params(&serde_json::to_value(&s).unwrap()).unwrap();
+    let mut ctx = EngineCtx::cpu_only();
+    let g = no_edges(2);
+    let pos = vec![0.0, 0.0, 0.0, d0, 0.0, 0.0];
+    e.init(&mut ctx, &CsrShard::whole(&g), &pos).unwrap();
+    let f_mag = e.observe().unwrap().max_residual;
+    assert!(f_mag > 1e-3, "well should exert a force at d0; got {f_mag}");
+
+    // dE/dd via central difference; the magnitude of the pair force is |dE/dd|.
+    let h = 1e-3f32;
+    let de_dd = (energy_at(d0 + h) - energy_at(d0 - h)) / (2.0 * h);
+    approx("|−∇E| == |F| for the well", f_mag, de_dd.abs(), 5e-3);
+}
+
+#[test]
+fn deeper_well_binds_a_pair_faster_monotonically() {
+    // Monotonicity canary (closed-form, deterministic): the well force scales
+    // linearly with ε, so from a *fixed* starting separation inside the well a
+    // deeper well drives the pair to contact in strictly *fewer* steps. This is
+    // the unambiguous "deeper ⇒ tighter/faster binding" check the plan asks for
+    // — no thermal sampling, no kinetic-trap confound (a many-body droplet at
+    // intermediate ε can sit in a metastable open shell, so binding *speed* is
+    // the robust monotone order parameter, not a finite-cluster R_g).
+    let radius = 0.5f32;
+    let sigma = 2.0 * radius; // = 1.0
+    let well_width = 1.5f32;
+    let start = sigma + 1.0; // inside the well, same for every ε
+
+    // Steps until the pair first reaches (near) contact, T=0 minimizer.
+    let steps_to_bind = |eps: f32| -> usize {
+        let mut s = cohesion_only(radius, eps, well_width); // temperature stays 0
+        // Overdamped + small step + UNCAPPED: drift speed ∝ force ∝ ε, so binding
+        // time falls cleanly with ε. A displacement clamp would saturate the deep
+        // wells and erase the monotone gradient, so disable it here.
+        s.damping = 0.2;
+        s.time_step = 0.2;
+        s.max_step = 0.0;
+        let mut e = GeometricEngine::new();
+        e.set_params(&serde_json::to_value(&s).unwrap()).unwrap();
+        let mut ctx = EngineCtx::cpu_only();
+        let g = no_edges(2);
+        let seed = vec![0.0, 0.0, 0.0, start, 0.0, 0.0];
+        e.init(&mut ctx, &CsrShard::whole(&g), &seed).unwrap();
+        let target = sigma + 0.05; // "bound" once within 5% of contact
+        for step in 0..20_000 {
+            let pos = e.step(&mut ctx).positions;
+            if dist(&pos, 0, 1) <= target {
+                return step;
+            }
+        }
+        usize::MAX // never bound within budget
+    };
+
+    let t05 = steps_to_bind(0.5);
+    let t15 = steps_to_bind(1.5);
+    let t30 = steps_to_bind(3.0);
+    eprintln!("well binding time: ε=0.5 → {t05}, 1.5 → {t15}, 3.0 → {t30} steps");
+
+    assert!(
+        t05 < usize::MAX && t15 < usize::MAX && t30 < usize::MAX,
+        "every well depth must bind the pair within budget"
+    );
+    // Strictly monotone: deeper well ⇒ faster binding.
+    assert!(t15 < t05, "ε 0.5→1.5 should bind faster: {t05} -> {t15}");
+    assert!(t30 < t15, "ε 1.5→3.0 should bind faster: {t15} -> {t30}");
+}
+
+#[test]
+fn well_condenses_a_loose_cloud() {
+    // The multi-particle condensation signature: a deterministic minimizer turns
+    // a loose cubic cloud (neighbours spaced *beyond* contact but *within* the
+    // well) into a tight droplet, whereas with the well OFF only exclusion acts —
+    // particles past σ feel nothing and the cloud stays loose. So R_g(well) must
+    // be clearly below R_g(no well). T=0 (pure minimizer) keeps it reproducible
+    // and free of any thermal-evaporation confound.
+    let radius = 0.5f32;
+    let n = 27usize; // 3×3×3 loose cubic cloud
+    let spacing = 1.4f32; // > σ = 1.0 (loose) but neighbours within σ + w_c
+    let mut seed = vec![0.0f32; 3 * n];
+    let mut k = 0usize;
+    for ix in 0..3 {
+        for iy in 0..3 {
+            for iz in 0..3 {
+                seed[3 * k] = (ix as f32 - 1.0) * spacing;
+                seed[3 * k + 1] = (iy as f32 - 1.0) * spacing;
+                seed[3 * k + 2] = (iz as f32 - 1.0) * spacing;
+                k += 1;
+            }
+        }
+    }
+
+    let relax_rg = |eps: f32| -> f32 {
+        let s = cohesion_only(radius, eps, 1.5); // temperature 0: pure minimizer
+        let scn = Scenario {
+            name: "cloud",
+            graph: no_edges(n),
+            seed: seed.clone(),
+            settings: s,
+        };
+        let r = relax(&scn, 4_000, 0.0, 4_000);
+        radius_of_gyration(&r.final_positions)
+    };
+
+    let rg_off = relax_rg(0.0); // no well: cloud stays loose
+    let rg_on = relax_rg(2.0); // well on: cloud condenses
+    eprintln!("cloud R_g: well off → {rg_off:.3}, well on → {rg_on:.3}");
+    assert!(
+        rg_on < rg_off - 0.2,
+        "the attractive well must condense the loose cloud: off={rg_off:.3} on={rg_on:.3}"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // 2. REGRESSION — golden master of a fixed, force-rich scenario
 // ---------------------------------------------------------------------------
 
