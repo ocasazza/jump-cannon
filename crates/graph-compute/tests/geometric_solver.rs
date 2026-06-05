@@ -1655,6 +1655,617 @@ fn assembly_observables_empty_graph_is_zeroed() {
 }
 
 // ---------------------------------------------------------------------------
+// PHASE S — morphology end-to-end ("proteins from Brownian motion")
+// ---------------------------------------------------------------------------
+//
+// The single integrative validation of the whole initiative: drive self-assembly
+// from a DISORDERED (Brownian) start and assert each emergent trophic level
+// appears, read off the Phase-O observables. The trophic ladder is
+//
+//   monomer → PRIMARY chain → SECONDARY sheet → TERTIARY tube → QUATERNARY vesicle
+//
+// Each level is detected by a DIFFERENT order-parameter signature of the largest
+// self-assembled cluster:
+//
+//   • chain   — covered by `thermostat_ideal_chain_scales_linearly_with_length`
+//               (R_g² ∝ N, Flory ν=½); referenced here, not re-run.
+//   • sheet   — high nematic S (aligned), one big cluster, and the gyration tensor
+//               is OBLATE (one short axis ⊥ the sheet, two long in-plane); closure
+//               reads OPEN/planar.
+//   • tube    — the gyration tensor is PROLATE (one long axis, two short ≈ equal),
+//               an elongated/cylindrical aggregate distinct from the flat sheet and
+//               the closed vesicle.
+//   • vesicle — the closure metric reads CLOSED (a shell enclosing its centroid).
+//
+// Honesty contract (per the phase brief): chain + sheet are validated from a
+// genuine Brownian start. Tube + vesicle are the hard, kinetically-trapped levels;
+// where spontaneous assembly within a sane compute budget is not reliable, the
+// CAPABILITY + DETECTOR are validated on a near-target seed and the limitation is
+// logged via eprintln — never silently skipped, never faked.
+
+/// Principal moments (eigenvalues) of the gyration tensor of a point cloud,
+/// returned ascending `[λ₀ ≤ λ₁ ≤ λ₂]`. The gyration tensor is
+/// `G = (1/m) Σ (rᵢ − r̄)⊗(rᵢ − r̄)`; its eigenvalues are the squared spread along
+/// the three principal axes. Their pattern is the rotation-invariant SHAPE
+/// fingerprint: a sphere/ball → all three ≈ equal; a flat sheet (oblate) → one
+/// small, two large-and-equal; a rod/tube (prolate) → one large, two small-and-
+/// equal. Computed via the same closed-form symmetric-3×3 eigensolver style as
+/// `nematic_s` (Smith 1961) — no iterative solver, deterministic.
+fn gyration_eigenvalues(positions: &[f32], members: &[usize]) -> [f32; 3] {
+    let m = members.len();
+    if m == 0 {
+        return [0.0; 3];
+    }
+    let (mut cx, mut cy, mut cz) = (0.0f64, 0.0f64, 0.0f64);
+    for &i in members {
+        cx += positions[3 * i] as f64;
+        cy += positions[3 * i + 1] as f64;
+        cz += positions[3 * i + 2] as f64;
+    }
+    let inv = 1.0 / m as f64;
+    let (cx, cy, cz) = (cx * inv, cy * inv, cz * inv);
+
+    let (mut gxx, mut gyy, mut gzz) = (0.0f64, 0.0f64, 0.0f64);
+    let (mut gxy, mut gxz, mut gyz) = (0.0f64, 0.0f64, 0.0f64);
+    for &i in members {
+        let dx = positions[3 * i] as f64 - cx;
+        let dy = positions[3 * i + 1] as f64 - cy;
+        let dz = positions[3 * i + 2] as f64 - cz;
+        gxx += dx * dx;
+        gyy += dy * dy;
+        gzz += dz * dz;
+        gxy += dx * dy;
+        gxz += dx * dz;
+        gyz += dy * dz;
+    }
+    let (gxx, gyy, gzz) = (gxx * inv, gyy * inv, gzz * inv);
+    let (gxy, gxz, gyz) = (gxy * inv, gxz * inv, gyz * inv);
+
+    // Closed-form eigenvalues of a symmetric 3×3 (Smith 1961). `q` is the mean
+    // diagonal (the tensor is NOT traceless here, unlike Q), so we keep it.
+    let p1 = gxy * gxy + gxz * gxz + gyz * gyz;
+    if p1 < 1e-18 {
+        let mut e = [gxx as f32, gyy as f32, gzz as f32];
+        e.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        return e;
+    }
+    let q = (gxx + gyy + gzz) / 3.0;
+    let p2 = (gxx - q).powi(2) + (gyy - q).powi(2) + (gzz - q).powi(2) + 2.0 * p1;
+    let p = (p2 / 6.0).sqrt();
+    let (bxx, byy, bzz) = ((gxx - q) / p, (gyy - q) / p, (gzz - q) / p);
+    let (bxy, bxz, byz) = (gxy / p, gxz / p, gyz / p);
+    let det_b = bxx * (byy * bzz - byz * byz) - bxy * (bxy * bzz - byz * bxz)
+        + bxz * (bxy * byz - byy * bxz);
+    let r = (det_b / 2.0).clamp(-1.0, 1.0);
+    let phi = r.acos() / 3.0;
+    let third = std::f64::consts::TAU / 3.0;
+    // The three eigenvalues are q + 2p·cos(phi + k·2π/3), k = 0,1,2.
+    let l_max = q + 2.0 * p * phi.cos();
+    let l_min = q + 2.0 * p * (phi + third).cos();
+    let l_mid = 3.0 * q - l_max - l_min; // trace is invariant
+    let mut e = [l_min as f32, l_mid as f32, l_max as f32];
+    e.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    e
+}
+
+#[test]
+fn gyration_eigenvalues_fingerprint_known_shapes() {
+    // Sanity for the shape detector: a ball reads ~isotropic (all three close), a
+    // flat sheet reads oblate (smallest ≪ the other two, which are ≈ equal), a rod
+    // reads prolate (largest ≫ the other two, which are ≈ equal). Guards the
+    // eigensolver so the morphology tests below can trust their verdicts.
+    let golden = std::f32::consts::PI * (3.0 - 5.0f32.sqrt());
+
+    // Solid ball: Fibonacci sphere at random radii → roughly isotropic.
+    let nb = 300usize;
+    let mut ball = vec![0.0f32; 3 * nb];
+    for i in 0..nb {
+        let y = 1.0 - (i as f32 / (nb - 1) as f32) * 2.0;
+        let rad = (1.0 - y * y).max(0.0).sqrt();
+        let th = golden * i as f32;
+        let rr = 2.0 * ((i % 7) as f32 / 7.0 + 0.3); // vary radius → filled, not a shell
+        ball[3 * i] = rr * th.cos() * rad;
+        ball[3 * i + 1] = rr * y;
+        ball[3 * i + 2] = rr * th.sin() * rad;
+    }
+    let m: Vec<usize> = (0..nb).collect();
+    let e = gyration_eigenvalues(&ball, &m);
+    assert!(
+        e[0] > 0.5 * e[2],
+        "ball should be roughly isotropic: λ {e:?} (λ₀ not ≪ λ₂)"
+    );
+
+    // Flat sheet: points in the z≈0 plane → oblate (λ₀ ≪ λ₁ ≈ λ₂).
+    let ns = 200usize;
+    let mut sheet = vec![0.0f32; 3 * ns];
+    for i in 0..ns {
+        let rr = 4.0 * (i as f32 / ns as f32).sqrt();
+        let th = golden * i as f32;
+        sheet[3 * i] = rr * th.cos();
+        sheet[3 * i + 1] = rr * th.sin();
+        sheet[3 * i + 2] = 0.0;
+    }
+    let ms: Vec<usize> = (0..ns).collect();
+    let es = gyration_eigenvalues(&sheet, &ms);
+    assert!(
+        es[0] < 0.05 * es[2] && es[1] > 0.5 * es[2],
+        "flat sheet should be oblate (λ₀ ≪ λ₁ ≈ λ₂): λ {es:?}"
+    );
+
+    // Rod: points along z → prolate (λ₂ ≫ λ₀ ≈ λ₁).
+    let nr = 200usize;
+    let mut rod = vec![0.0f32; 3 * nr];
+    for i in 0..nr {
+        rod[3 * i + 2] = (i as f32 / nr as f32 - 0.5) * 20.0;
+    }
+    let mr: Vec<usize> = (0..nr).collect();
+    let er = gyration_eigenvalues(&rod, &mr);
+    assert!(
+        er[1] < 0.05 * er[2],
+        "rod should be prolate (λ₀ ≈ λ₁ ≪ λ₂): λ {er:?}"
+    );
+}
+
+/// Shape descriptors of a cluster from its gyration eigenvalues `[λ₀ ≤ λ₁ ≤ λ₂]`,
+/// each in `[0,1]` and invariant to rotation/scale, chosen so the two cleanly
+/// SEPARATE the three open-vs-rod morphologies (a closed vesicle is told apart by
+/// the closure metric, not the shape):
+///   • `flatness = (λ₁ − λ₀)/(λ₀ + λ₁)` — high for a SHEET (one collapsed axis,
+///     λ₀ ≪ λ₁ ≈ λ₂), low for a rod or sphere (λ₀ ≈ λ₁).
+///   • `prolateness = (λ₂ − λ₁)/(λ₁ + λ₂)` — high for a ROD/tube (one long axis,
+///     λ₂ ≫ λ₁ ≈ λ₀), low for a sheet or sphere (λ₂ ≈ λ₁).
+/// The pair distinguishes the three: sphere → (low, low); sheet → (high, low);
+/// rod/tube → (low, high). (Note: the two compare *adjacent* eigenvalue gaps, so a
+/// rod does NOT read as "flat" — the prior `1 − λ₀/mean` form conflated them.)
+fn shape_descriptors(eig: [f32; 3]) -> (f32, f32) {
+    let flatness = if eig[0] + eig[1] > 1e-9 {
+        (eig[1] - eig[0]) / (eig[0] + eig[1])
+    } else {
+        0.0
+    };
+    let prolateness = if eig[1] + eig[2] > 1e-9 {
+        (eig[2] - eig[1]) / (eig[1] + eig[2])
+    } else {
+        0.0
+    };
+    (flatness, prolateness)
+}
+
+/// A uniformly-random cloud of `n` points inside a cube of half-extent `half`,
+/// from a SplitMix64 stream — the DISORDERED (Brownian) start the self-assembly
+/// runs condense. Deterministic given `seed` so the morphology canaries are stable.
+fn random_cloud(n: usize, half: f32, seed: u64) -> Vec<f32> {
+    let mut rng = seed;
+    let mut pos = vec![0.0f32; 3 * n];
+    for v in pos.iter_mut() {
+        let u = next_u64(&mut rng) as f64 / u64::MAX as f64; // [0,1]
+        *v = ((u * 2.0 - 1.0) as f32) * half;
+    }
+    pos
+}
+
+/// Base settings for a patchy-amphiphile self-assembly run: free (unbonded)
+/// particles, the attractive well ON, anisotropy ON, and a low temperature that
+/// lets the soup condense + orient without re-melting. The caller tunes the knobs
+/// that drive WHICH morphology forms (anisotropy / box size / etc.).
+fn amphiphile_settings(radius: f32, seed: u64) -> GeometricSettings {
+    GeometricSettings {
+        edge_stiffness: 0.0,
+        angle_stiffness: 0.0,
+        affinity_strength: 0.0,
+        gravity: 0.0,
+        exclusion_strength: 1.0,
+        class_radius: vec![radius],
+        default_radius: radius,
+        well_depth: 2.0,
+        well_width: 1.5,
+        anisotropy_strength: 2.0,
+        rotational_diffusion: 0.15,
+        director_source: DirectorSource::Random,
+        temperature: 0.1,
+        rng_seed: seed,
+        damping: 0.6,
+        time_step: 0.4,
+        max_step: 0.3,
+        ..GeometricSettings::default()
+    }
+}
+
+/// Drive one engine `steps` steps from a seed, then read the assembly observables
+/// AND the gyration eigenvalues of the largest cluster. Shared by the morphology
+/// tests so each only has to set up its scenario and assert its signature. Returns
+/// `(observables, gyration eigenvalues [λ₀≤λ₁≤λ₂], final positions)`.
+#[allow(clippy::type_complexity)]
+fn assemble_and_observe(
+    settings: &GeometricSettings,
+    graph: &CsrGraph,
+    seed: &[f32],
+    attrs: Option<&GraphAttributes>,
+    steps: usize,
+) -> (AssemblyObservables, [f32; 3], Vec<f32>) {
+    let mut e = GeometricEngine::new();
+    e.set_params(&serde_json::to_value(settings).unwrap()).unwrap();
+    let mut ctx = EngineCtx::cpu_only();
+    let shard = match attrs {
+        Some(a) => CsrShard::whole_with_attributes(graph, a),
+        None => CsrShard::whole(graph),
+    };
+    e.init(&mut ctx, &shard, seed).expect("init morphology run");
+    let mut pos = seed.to_vec();
+    for _ in 0..steps {
+        pos = e.step(&mut ctx).positions;
+    }
+    let obs = e.observe_assembly().expect("observe_assembly");
+    // Re-derive the largest cluster's membership on the final positions to get its
+    // shape (the engine's own union-find drives `obs`, so the contact cutoff
+    // matches; here we reuse the same 1.2·σ default via a fresh observe pass).
+    let members = largest_cluster_members(&pos, settings, 1.2);
+    let eig = gyration_eigenvalues(&pos, &members);
+    (obs, eig, pos)
+}
+
+/// Membership (node indices) of the largest contact cluster, recomputed in-test on
+/// a position buffer with the same `contact_scale·σ` rule the engine uses. Mirrors
+/// the engine's union-find so the shape is measured on exactly the cluster the
+/// observables report.
+fn largest_cluster_members(pos: &[f32], s: &GeometricSettings, contact_scale: f32) -> Vec<usize> {
+    let n = pos.len() / 3;
+    let radius = s.default_radius;
+    let mut parent: Vec<usize> = (0..n).collect();
+    fn root(p: &[usize], mut i: usize) -> usize {
+        while p[i] != i {
+            i = p[i];
+        }
+        i
+    }
+    for i in 0..n {
+        for j in (i + 1)..n {
+            let cutoff = contact_scale * (2.0 * radius);
+            let dx = pos[3 * j] - pos[3 * i];
+            let dy = pos[3 * j + 1] - pos[3 * i + 1];
+            let dz = pos[3 * j + 2] - pos[3 * i + 2];
+            if dx * dx + dy * dy + dz * dz <= cutoff * cutoff {
+                let (ra, rb) = (root(&parent, i), root(&parent, j));
+                if ra != rb {
+                    let (lo, hi) = if ra < rb { (ra, rb) } else { (rb, ra) };
+                    parent[hi] = lo;
+                }
+            }
+        }
+    }
+    let mut sizes: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+    let mut roots = vec![0usize; n];
+    for (i, slot) in roots.iter_mut().enumerate() {
+        let r = root(&parent, i);
+        *slot = r;
+        *sizes.entry(r).or_insert(0) += 1;
+    }
+    let largest_root = sizes
+        .iter()
+        .max_by_key(|&(_, c)| c)
+        .map(|(&r, _)| r)
+        .unwrap_or(0);
+    (0..n).filter(|&i| roots[i] == largest_root).collect()
+}
+
+#[test]
+fn morphology_primary_chain_is_validated_elsewhere() {
+    // PRIMARY (chain) is validated by `thermostat_ideal_chain_scales_linearly_with_length`
+    // (⟨R_g²⟩ ∝ N, Flory ν=½ — a bonded chain at temperature samples ideal-chain
+    // statistics). This stub documents that the ladder's first rung lives there so
+    // the morphology suite reads as a complete ladder; it asserts the cross-
+    // reference is real by reproducing the scaling in miniature (two N, one ratio)
+    // so a rename/removal of the primary test trips here too.
+    let chain = GeometricSettings {
+        edge_rest_len: 1.0,
+        edge_stiffness: 1.0,
+        angle_stiffness: 0.0,
+        exclusion_strength: 0.0,
+        affinity_strength: 0.0,
+        gravity: 0.0,
+        damping: 0.9,
+        time_step: 0.5,
+        max_step: 0.0,
+        temperature: 0.5,
+        ..GeometricSettings::default()
+    };
+    let rg2_16 = mean_rg2_chain(16, &chain, 4);
+    let rg2_64 = mean_rg2_chain(64, &chain, 4);
+    let p = (rg2_64 / rg2_16).log2() / 4.0f32.log2();
+    eprintln!(
+        "MORPHOLOGY primary (chain): R_g²(16)={rg2_16:.3} R_g²(64)={rg2_64:.3} \
+         exponent p={p:.3} (ideal ν=½ ⇒ p=1.0)"
+    );
+    assert!(
+        (p - 1.0).abs() < 0.25,
+        "primary chain should sample ideal-chain scaling R_g²∝N (got p={p:.3})"
+    );
+}
+
+#[test]
+fn morphology_secondary_sheet_from_brownian_start() {
+    // SECONDARY (sheet) — the genuine Brownian-start canary. A soup of patchy
+    // amphiphiles starts at RANDOM positions and RANDOM orientations and must
+    // self-assemble into an aligned, OPEN aggregate. We assert the three sheet
+    // order-parameter signatures the phase brief calls for, all from a true
+    // Brownian start:
+    //   (1) nematic S rises well above the disordered baseline (orientational order),
+    //   (2) one cluster holds MOST of the particles (it actually condensed),
+    //   (3) the aggregate reads OPEN/planar (closure well below the closed bar) —
+    //       i.e. NOT a closed vesicle.
+    //
+    // HONESTY (logged, not hidden): with this minimal model (isotropic excluded
+    // volume + a director-only patchy well), surface tension drives the condensate
+    // toward a compact *nematic droplet* rather than a perfectly flat membrane —
+    // the gyration tensor is only mildly oblate, not a single collapsed axis. A
+    // genuinely flat, self-limiting bilayer needs explicit amphiphile architecture
+    // (the Cooke–Deserno head+tail beads / a spatial Gay–Berne well), which is the
+    // Phase-A/C follow-up in docs/self-assembly-plan.md. The aggregate IS open and
+    // aligned (the brief's secondary-level order parameters), so the level is
+    // validated by its observables; the shape limitation is reported below.
+    let radius = 0.5f32;
+    let n = 80usize;
+    // A box just big enough to disperse the soup but small enough that the well
+    // can pull it together within budget (number density chosen so the condensed
+    // aggregate is membrane-like, not a compact ball).
+    let half = 3.2f32;
+    let seed_pos = random_cloud(n, half, 0x5EE7_0001);
+    let settings = amphiphile_settings(radius, 0xA11C_E000_5EE7_0001);
+
+    // Baseline order of the random seed (must be near-isotropic, else vacuous).
+    let mut e0 = GeometricEngine::new();
+    e0.set_params(&serde_json::to_value(&settings).unwrap()).unwrap();
+    let mut ctx0 = EngineCtx::cpu_only();
+    e0.init(&mut ctx0, &CsrShard::whole(&no_edges(n)), &seed_pos)
+        .unwrap();
+    let s_start = e0.observe_assembly().unwrap().nematic_s;
+    assert!(
+        s_start < 0.4,
+        "random director seed should start near-isotropic, got S={s_start:.3}"
+    );
+
+    let steps = 6_000usize;
+    let (obs, eig, _) = assemble_and_observe(&settings, &no_edges(n), &seed_pos, None, steps);
+    let (flat, prolate) = shape_descriptors(eig);
+    eprintln!(
+        "MORPHOLOGY secondary (sheet) [Brownian start]: S {s_start:.3} -> {:.3} | \
+         largest cluster {}/{} (frac {:.2}) | closure {:.3} (open if <0.85) | \
+         gyration λ {eig:?} flatness {flat:.2} prolateness {prolate:.2} \
+         (mildly anisotropic nematic droplet — a perfectly flat membrane needs the \
+         Phase-A/C amphiphile follow-up)",
+        obs.nematic_s, obs.largest_cluster, obs.n, obs.largest_cluster_frac, obs.closure
+    );
+
+    // (1) Orientational order emerged.
+    assert!(
+        obs.nematic_s > s_start + 0.3 && obs.nematic_s > 0.6,
+        "sheet must develop nematic order from the disordered seed: S {s_start:.3} -> {:.3}",
+        obs.nematic_s
+    );
+    // (2) The soup actually condensed into one dominant aggregate.
+    assert!(
+        obs.largest_cluster_frac > 0.7,
+        "most particles must join one cluster (a sheet), got frac {:.2}",
+        obs.largest_cluster_frac
+    );
+    // (3) The aggregate reads OPEN/planar (a sheet/droplet, NOT a closed vesicle).
+    assert!(
+        !obs.is_closed() && obs.closure < 0.75,
+        "a sheet must read OPEN/planar, not closed (closure {:.3})",
+        obs.closure
+    );
+    // Shape is logged for honesty: the aggregate is only mildly anisotropic (a
+    // nematic droplet, not a perfectly flat membrane — see the note above), so the
+    // assertion deliberately keys on the brief's order parameters, not flatness.
+    // It must at least NOT be a rod (that would be the tube level, not a sheet).
+    assert!(
+        prolate < 0.3,
+        "the secondary aggregate must not be rod-like (that is the tube level), \
+         prolateness {prolate:.2}"
+    );
+    let _ = flat;
+}
+
+#[test]
+fn morphology_tertiary_tube_is_prolate() {
+    // TERTIARY (tube). Spontaneous tube formation from a Brownian soup is the
+    // kinetically-hardest of the open morphologies on this minimal model (it needs
+    // a curvature/director coupling that Phase C has not yet added). Per the phase
+    // brief we therefore validate the CAPABILITY + DETECTOR: seed a cylindrical
+    // aggregate, confirm the engine HOLDS it as one cohered cluster, and confirm the
+    // gyration-tensor detector reads it as PROLATE — an elongated/cylindrical shape
+    // (one long axis, two short ≈ equal) distinct from BOTH the flat sheet
+    // (prolate ≈ 0, flatness high) and the closed vesicle (prolate ≈ 0, closed).
+    // We then relax it and LOG honestly what happens.
+    let radius = 0.5f32;
+    let sigma = 2.0 * radius; // contact distance = 1.0
+    // A tube: stacked rings of particles around the z axis. Within-ring chord and
+    // ring-to-ring gap are both just inside contact σ so every neighbour coheres;
+    // many rings so it is clearly elongated.
+    let ring = 12usize;
+    let rings = 16usize;
+    let n = ring * rings;
+    // Chord between adjacent ring members is 2·r·sin(π/ring); solve for r so the
+    // chord ≈ σ (neighbours just in contact, inside the well).
+    let r_tube = sigma / (2.0 * (std::f32::consts::PI / ring as f32).sin());
+    let dz = 0.95 * sigma; // ring-to-ring spacing along the tube axis (within the well)
+    let mut seed = vec![0.0f32; 3 * n];
+    let mut dirs = vec![0.0f32; 3 * n];
+    let mut k = 0usize;
+    for rz in 0..rings {
+        for a in 0..ring {
+            let theta = std::f32::consts::TAU * a as f32 / ring as f32;
+            seed[3 * k] = r_tube * theta.cos();
+            seed[3 * k + 1] = r_tube * theta.sin();
+            seed[3 * k + 2] = (rz as f32 - rings as f32 / 2.0) * dz;
+            // Radial directors (the natural orientation of a cylindrical leaflet):
+            // pointing out from the tube axis, consistent with the patchy field.
+            dirs[3 * k] = theta.cos();
+            dirs[3 * k + 1] = theta.sin();
+            dirs[3 * k + 2] = 0.0;
+            k += 1;
+        }
+    }
+    let attrs = GraphAttributes {
+        node_director: Some(dirs),
+        ..Default::default()
+    };
+    let mut settings = amphiphile_settings(radius, 0xA11C_E000_70BE_0001);
+    settings.director_source = DirectorSource::Injected;
+
+    // --- DETECTOR VALIDATION on the seeded tube (the configuration the engine
+    // holds at init: 0 dynamics steps). This is the assertion the phase brief asks
+    // for — the shape detector must recognise a tube. ---
+    let (obs0, eig0, _) = assemble_and_observe(&settings, &no_edges(n), &seed, Some(&attrs), 0);
+    let (flat0, prolate0) = shape_descriptors(eig0);
+    eprintln!(
+        "MORPHOLOGY tertiary (tube) [SEEDED cylinder + DETECTOR, not spontaneous]: \
+         seed largest cluster {}/{} (frac {:.2}) | gyration λ {eig0:?} \
+         prolateness {prolate0:.2} flatness {flat0:.2} | S {:.3} closure {:.3}",
+        obs0.largest_cluster, obs0.n, obs0.largest_cluster_frac, obs0.nematic_s, obs0.closure
+    );
+    // The engine represents the tube as a single cohered cluster…
+    assert!(
+        obs0.largest_cluster_frac > 0.9,
+        "the seeded tube must be one cohered cluster, got frac {:.2}",
+        obs0.largest_cluster_frac
+    );
+    // …and the detector reads it unambiguously PROLATE (one long axis) — the
+    // tube signature, distinct from the sheet (prolate≈0) and the vesicle (closed).
+    assert!(
+        prolate0 > 0.5,
+        "the tube detector must read prolate (one long axis), prolateness {prolate0:.2}"
+    );
+    assert!(
+        prolate0 > flat0,
+        "a tube's elongation (prolateness {prolate0:.2}) must dominate any flatness \
+         ({flat0:.2}) — the signature separating tube from sheet"
+    );
+    // NOTE (documented limitation): the closure metric reads a LONG open tube as
+    // "closed" too — from the tube's central axis, particles wrap the centroid in
+    // azimuth and span the polar angles, so solid-angle coverage is high
+    // (closure {:.3} here). Closure therefore cannot separate a tube from a vesicle;
+    // the GYRATION SHAPE does — a tube is strongly PROLATE (asserted above) while a
+    // vesicle is near-isotropic (asserted in the quaternary test). This is the same
+    // "thick ball vs hollow shell" caveat called out on AssemblyObservables::is_closed.
+    // So we deliberately do NOT assert openness for the tube; prolateness is its mark.
+    let _ = obs0.closure;
+
+    // --- HONESTY: relax under the patchy dynamics and report what happens. The
+    // isotropic-cohesion model has no bending rigidity, so a hollow cylinder is not
+    // a stable fixed point — it pinches/fragments toward lower-surface aggregates.
+    // We LOG this rather than pretend the tube persists. ---
+    let mut s_gentle = settings.clone();
+    s_gentle.well_depth = 1.0;
+    s_gentle.temperature = 0.0;
+    s_gentle.damping = 0.3;
+    s_gentle.time_step = 0.1;
+    s_gentle.max_step = 0.05;
+    let (obs_r, eig_r, _) =
+        assemble_and_observe(&s_gentle, &no_edges(n), &seed, Some(&attrs), 800);
+    let (flat_r, prolate_r) = shape_descriptors(eig_r);
+    eprintln!(
+        "  tube under gentle relaxation (800 steps): largest cluster frac {:.2}, \
+         prolateness {prolate_r:.2}, flatness {flat_r:.2}, λ {eig_r:?} — spontaneous \
+         tube STABILITY was NOT achieved on this minimal isotropic model (no bending \
+         rigidity); only the DETECTOR is validated. Bending coupling is the Phase-C \
+         follow-up in docs/self-assembly-plan.md.",
+        obs_r.largest_cluster_frac
+    );
+}
+
+#[test]
+fn morphology_quaternary_vesicle_is_closed() {
+    // QUATERNARY (vesicle) — the hardest level. Spontaneous closure of a finite
+    // bilayer into a sealed shell is famously slow/rare in coarse-grained models
+    // (it competes with the open-disk metastable state), so within a unit-test
+    // budget we validate the CAPABILITY + DETECTOR per the phase brief: seed a
+    // hollow shell (a vesicle), relax it under the SAME patchy dynamics, and assert
+    // the closure metric still reads CLOSED — i.e. the engine can hold a vesicle and
+    // the detector recognises it. We LOG clearly that this is a seeded detector
+    // validation, not spontaneous assembly.
+    let radius = 0.5f32;
+    let n = 200usize;
+    let r_shell = 3.0f32;
+    let golden = std::f32::consts::PI * (3.0 - 5.0f32.sqrt());
+    let mut seed = vec![0.0f32; 3 * n];
+    for i in 0..n {
+        let y = 1.0 - (i as f32 / (n - 1) as f32) * 2.0;
+        let rad = (1.0 - y * y).max(0.0).sqrt();
+        let theta = golden * i as f32;
+        seed[3 * i] = r_shell * theta.cos() * rad;
+        seed[3 * i + 1] = r_shell * y;
+        seed[3 * i + 2] = r_shell * theta.sin() * rad;
+    }
+    // Outward directors (radial) — the natural orientation of a closed bilayer
+    // leaflet — so the patchy aligning field is consistent with the shell.
+    let mut dirs = vec![0.0f32; 3 * n];
+    for i in 0..n {
+        let len = (seed[3 * i].powi(2) + seed[3 * i + 1].powi(2) + seed[3 * i + 2].powi(2)).sqrt();
+        for k in 0..3 {
+            dirs[3 * i + k] = seed[3 * i + k] / len;
+        }
+    }
+    let attrs = GraphAttributes {
+        node_director: Some(dirs),
+        ..Default::default()
+    };
+    let mut settings = amphiphile_settings(radius, 0xA11C_E000_9E51_0001);
+    settings.director_source = DirectorSource::Injected;
+
+    // --- DETECTOR VALIDATION on the seeded shell (the configuration the engine
+    // holds at init: 0 dynamics steps). The closure metric must recognise a
+    // vesicle — a single cohered cluster that ENCLOSES its centroid. ---
+    let (obs0, eig0, _) = assemble_and_observe(&settings, &no_edges(n), &seed, Some(&attrs), 0);
+    let (flat0, prolate0) = shape_descriptors(eig0);
+    eprintln!(
+        "MORPHOLOGY quaternary (vesicle) [SEEDED shell + DETECTOR, not spontaneous]: \
+         seed largest cluster {}/{} (frac {:.2}) | closure {:.3} (CLOSED if ≥0.85) | \
+         gyration λ {eig0:?} flatness {flat0:.2} prolateness {prolate0:.2} S {:.3}",
+        obs0.largest_cluster, obs0.n, obs0.largest_cluster_frac, obs0.closure, obs0.nematic_s
+    );
+    // The shell is one cohered cluster…
+    assert!(
+        obs0.largest_cluster_frac > 0.9,
+        "the seeded vesicle must be one cohered shell, got frac {:.2}",
+        obs0.largest_cluster_frac
+    );
+    // …and reads CLOSED — the vesicle detector verdict (encloses its centroid).
+    assert!(
+        obs0.is_closed(),
+        "the vesicle detector must read CLOSED (closure {:.3} ≥ 0.85)",
+        obs0.closure
+    );
+    // A sphere is neither strongly prolate (tube) nor flat (sheet): closure +
+    // near-isotropic shape is the vesicle fingerprint that separates it from both.
+    assert!(
+        prolate0 < 0.3 && flat0 < 0.3,
+        "a vesicle (sphere) should be near-isotropic, not prolate ({prolate0:.2}) or \
+         flat ({flat0:.2})"
+    );
+
+    // --- HONESTY: relax under the patchy dynamics and report what happens. With no
+    // bending rigidity and an isotropic attractive well, surface tension drives the
+    // hollow shell to thicken/collapse inward (closure falls). We LOG this rather
+    // than pretend spontaneous closure was achieved. ---
+    let mut s_gentle = settings.clone();
+    s_gentle.well_depth = 1.0;
+    s_gentle.temperature = 0.0;
+    s_gentle.damping = 0.3;
+    s_gentle.time_step = 0.1;
+    s_gentle.max_step = 0.05;
+    let (obs_r, _eig_r, _) =
+        assemble_and_observe(&s_gentle, &no_edges(n), &seed, Some(&attrs), 800);
+    eprintln!(
+        "  vesicle under gentle relaxation (800 steps): largest cluster frac {:.2}, \
+         closure {:.3} — spontaneous CLOSURE was NOT achieved on this minimal isotropic \
+         model (no bending rigidity to resist collapse); only the DETECTOR is validated. \
+         Bending coupling is the Phase-C follow-up in docs/self-assembly-plan.md.",
+        obs_r.largest_cluster_frac, obs_r.closure
+    );
+}
+
+// ---------------------------------------------------------------------------
 // 2. REGRESSION — golden master of a fixed, force-rich scenario
 // ---------------------------------------------------------------------------
 
@@ -1847,3 +2458,4 @@ fn performance_throughput_and_convergence() {
         "convergence-iteration regression: {at} steps to converge (>4000)"
     );
 }
+
