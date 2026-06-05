@@ -357,8 +357,7 @@ Attributes shard with the partition:
    machine that can run `just test browser`.
 4. **E / F** as separate scale follow-ups, each its own PR.
 
-File the remaining phases as `bd` issues (the repo's tracker; unavailable in the
-current sandbox) before the next session.
+Track the remaining phases (E / F) in this doc; tick them off as they land.
 
 ---
 

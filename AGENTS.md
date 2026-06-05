@@ -114,37 +114,20 @@ Progress for each reload stage emits to `crates/graph-api/src/progress.rs` and s
 - No new logic in `tests/browser/*.js` beyond the test harness itself.
 - Match the existing palette/font: `palette::*` constants from `theme.rs`, Courier Prime monospace, squircle-backed floating panels.
 
-## Workflow: `bd` (beads) for issue tracking
-
-This project uses **bd** for issue tracking. Run `bd prime` for the full workflow.
-
-```bash
-bd ready              # find available work
-bd show <id>          # view issue details
-bd update <id> --claim  # claim work atomically
-bd close <id>         # complete work
-bd dolt push          # push beads data to remote
-```
-
-- Use `bd` for ALL task tracking — do **not** use TodoWrite, TaskCreate, or markdown TODO lists.
-- Use `bd remember` for persistent knowledge — do **not** create `MEMORY.md` files.
-
 ## Session completion (mandatory)
 
 Work is **not complete until `git push` succeeds**. Before ending a session:
 
-1. File issues for remaining work via `bd`.
+1. Record remaining work for the next session (in the relevant `docs/*.md` plan, or the handoff note below).
 2. Run quality gates (`cargo check --workspace --tests`, `just test browser` if visual).
-3. Update issue status (close finished work, update in-progress items).
-4. Push:
+3. Push:
    ```bash
    git pull --rebase
-   bd dolt push
    git push
    git status   # MUST show "up to date with origin"
    ```
-5. Clean up stashes; prune remote branches.
-6. Hand off context for the next session.
+4. Clean up stashes; prune remote branches.
+5. Hand off context for the next session.
 
 If `git push` fails, resolve and retry. Never stop before pushing.
 

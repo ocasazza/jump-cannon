@@ -663,6 +663,137 @@ fn canary_energy_descends_to_minimum() {
 }
 
 // ---------------------------------------------------------------------------
+// 1b. THERMOSTAT — Langevin (Brownian) dynamics canaries
+// ---------------------------------------------------------------------------
+//
+// The canaries above pin the *zero-temperature* minimizer. Self-assembly needs
+// the engine to instead sample a *thermal ensemble* (Brownian motion). The
+// closed-form check for that is **equipartition**: a free particle's steady
+// state has `⟨½ m v²⟩ = ½ kT` per degree of freedom, independent of the time
+// step — so a gas of N free particles at temperature `kT` must hold mean
+// per-particle kinetic energy `≈ 1.5 kT`. This is the statistical analogue of
+// the spring canary and the keystone for everything in
+// `docs/self-assembly-plan.md`.
+
+/// `n` isolated nodes (no edges). The free-gas substrate for the thermostat
+/// canaries: with every force off, the only dynamics is the OU thermostat, so
+/// the steady state is *exactly* the Maxwell–Boltzmann velocity distribution.
+fn no_edges(n: usize) -> CsrGraph {
+    CsrGraph {
+        n_nodes: n as u32,
+        offsets: vec![0u32; n + 1],
+        neighbors: Vec::new(),
+    }
+}
+
+/// All forces off; the engine reduces to the bare integrator. Used to isolate
+/// the thermostat (free gas) and so the steady state is analytic.
+fn free_gas(temperature: f32, damping: f32) -> GeometricSettings {
+    GeometricSettings {
+        edge_stiffness: 0.0,
+        angle_stiffness: 0.0,
+        exclusion_strength: 0.0,
+        affinity_strength: 0.0,
+        gravity: 0.0,
+        damping,
+        time_step: 1.0,
+        max_step: 0.0, // uncapped: a displacement clamp would bias the KE estimate
+        temperature,
+        ..GeometricSettings::default()
+    }
+}
+
+#[test]
+fn thermostat_free_gas_obeys_equipartition() {
+    // A free gas at temperature kT must equilibrate to ⟨KE⟩/particle ≈ 1.5 kT
+    // (3 translational DOF × ½ kT), regardless of dt. `observe().kinetic` is the
+    // total Σ ½ m v², so dividing by N gives the per-particle mean.
+    let kt = 1.0f32;
+    let n = 1024;
+    let scn = Scenario {
+        name: "free-gas-equipartition",
+        graph: no_edges(n),
+        seed: vec![0.0f32; 3 * n], // start at rest; the thermostat fills in motion
+        settings: free_gas(kt, 0.9),
+    };
+
+    // Burn in to steady state (velocity autocorrelation time ~ 1/(1−damping) ≈ 10
+    // steps), then time-average the per-particle KE to beat down sampling noise.
+    let r = relax(&scn, 4_000, 0.0, 10);
+    let burn_in = 1_000usize;
+    let tail: Vec<f32> = r
+        .trajectory
+        .iter()
+        .filter(|s| s.step >= burn_in)
+        .map(|s| s.kinetic / n as f32)
+        .collect();
+    assert!(!tail.is_empty(), "no post-burn-in samples");
+    let mean_ke = tail.iter().sum::<f32>() / tail.len() as f32;
+
+    let expected = 1.5 * kt;
+    // ~1024 particles × ~300 time samples is a large ensemble; 8% absorbs the
+    // residual sampling + discrete-OU bias without hiding a real miscalibration.
+    assert!(
+        (mean_ke - expected).abs() < 0.08 * expected,
+        "equipartition: mean per-particle KE {mean_ke:.4} should be ≈ 1.5 kT = {expected:.4}"
+    );
+}
+
+#[test]
+fn thermostat_temperature_scales_kinetic_energy() {
+    // Equipartition is linear in kT: doubling the temperature must double the
+    // steady-state kinetic energy. Tests the *calibration*, not just presence.
+    let measure = |kt: f32| -> f32 {
+        let n = 1024;
+        let scn = Scenario {
+            name: "free-gas-scaling",
+            graph: no_edges(n),
+            seed: vec![0.0f32; 3 * n],
+            settings: free_gas(kt, 0.9),
+        };
+        let r = relax(&scn, 3_000, 0.0, 10);
+        let tail: Vec<f32> = r
+            .trajectory
+            .iter()
+            .filter(|s| s.step >= 800)
+            .map(|s| s.kinetic / n as f32)
+            .collect();
+        tail.iter().sum::<f32>() / tail.len() as f32
+    };
+    let lo = measure(0.5);
+    let hi = measure(2.0);
+    let ratio = hi / lo;
+    // kT goes 0.5 → 2.0 (×4), so KE must scale ×4.
+    assert!(
+        (ratio - 4.0).abs() < 0.4,
+        "KE should scale linearly with kT: ratio {ratio:.3} (expected ≈ 4.0)"
+    );
+}
+
+#[test]
+fn thermostat_off_is_a_pure_minimizer() {
+    // temperature == 0 must inject ZERO noise: a free gas seeded at rest with no
+    // forces stays at rest (KE stays 0). This is the guard that the historical
+    // zero-temperature behaviour — and the golden-master regression — are
+    // byte-identical with the thermostat compiled in.
+    let n = 64;
+    let scn = Scenario {
+        name: "free-gas-cold",
+        graph: no_edges(n),
+        seed: vec![0.0f32; 3 * n],
+        settings: free_gas(0.0, 0.9),
+    };
+    let r = relax(&scn, 200, 0.0, 50);
+    for s in &r.trajectory {
+        assert_eq!(
+            s.kinetic, 0.0,
+            "cold free gas must stay at rest (no noise at T=0); KE={} at step {}",
+            s.kinetic, s.step
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
 // 2. REGRESSION — golden master of a fixed, force-rich scenario
 // ---------------------------------------------------------------------------
 

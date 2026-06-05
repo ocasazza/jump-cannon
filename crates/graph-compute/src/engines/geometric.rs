@@ -222,13 +222,31 @@ pub struct GeometricSettings {
     /// compact and lets heavy nodes settle central.
     pub gravity: f32,
     /// Velocity damping per step in `[0,1]` (1 = frictionless, 0 = fully
-    /// damped). Keeps the explicit integrator stable.
+    /// damped). Keeps the explicit integrator stable. Doubles as the Langevin
+    /// **friction** coefficient: with `temperature > 0`, the fluctuation term is
+    /// balanced against this dissipation so the steady state is a thermal
+    /// ensemble (fluctuation–dissipation).
     pub damping: f32,
     /// Integration time step.
     pub time_step: f32,
     /// Hard cap on per-step displacement magnitude per node (after integration),
     /// a stability guard against transient large forces. `0` ⇒ uncapped.
     pub max_step: f32,
+
+    // --- Langevin thermostat (Brownian motion) ---
+    /// Thermal energy `kT` in reduced units. `0` ⇒ the engine is a pure damped
+    /// **minimizer** (descends to the nearest equilibrium — the historical
+    /// behaviour, byte-identical to before this knob existed). `> 0` adds an
+    /// Ornstein–Uhlenbeck velocity kick each step so the dynamics sample a
+    /// **thermal ensemble** — Brownian motion — and structure can *emerge* from
+    /// disorder instead of freezing into the seed's nearest minimum. This is the
+    /// keystone for self-assembly (see `docs/self-assembly-plan.md`). At steady
+    /// state a free particle obeys equipartition: `⟨½ m v²⟩ = ½ kT` per DOF.
+    pub temperature: f32,
+    /// Seed for the thermostat's deterministic RNG. Fixing it makes a
+    /// `temperature > 0` run reproducible (so the statistical canaries are
+    /// stable). Unused when `temperature == 0`.
+    pub rng_seed: u64,
 }
 
 impl Default for GeometricSettings {
@@ -263,6 +281,12 @@ impl Default for GeometricSettings {
             damping: 0.9,
             time_step: 1.0,
             max_step: 10.0,
+
+            // Default OFF: the engine stays a deterministic minimizer unless a
+            // caller dials in a temperature. Keeps every zero-temperature canary
+            // and the golden-master regression byte-identical.
+            temperature: 0.0,
+            rng_seed: 0x5EED_1234_ABCD_F00D,
         }
     }
 }
@@ -308,6 +332,9 @@ struct State {
     /// CSR adjacency (owned copy) for the per-node angle pass.
     graph: CsrGraph,
     resolved: Resolved,
+    /// Langevin thermostat RNG state (SplitMix64). Advanced once per stochastic
+    /// degree of freedom in `integrate`; inert when `temperature == 0`.
+    rng: u64,
 }
 
 /// Geometric constraint engine. Uninitialized until [`LayoutEngine::init`].
@@ -588,6 +615,8 @@ impl LayoutEngine for GeometricEngine {
             velocities: vec![0.0f32; 3 * n],
             graph: g.clone(),
             resolved,
+            // Offset off zero so a `rng_seed` of 0 is still a usable stream.
+            rng: self.settings.rng_seed ^ 0x9E37_79B9_7F4A_7C15,
         });
         Ok(())
     }
@@ -933,17 +962,42 @@ fn accumulate_gravity(force: &mut [f32], pos: &[f32], mass: &[f32], gravity: f32
 
 /// Advance velocities (mass-scaled accel, damped) and positions, with an
 /// optional per-node displacement clamp for stability.
+///
+/// With `temperature > 0` this is a **Langevin** integrator: the deterministic
+/// `v ← damping·(v + dt·a)` half (the dissipation) is followed by an
+/// Ornstein–Uhlenbeck fluctuation kick `+ √((1 − damping²)·kT/m)·ξ`, `ξ~N(0,1)`.
+/// For a free particle (`a = 0`) the stationary velocity variance is exactly
+/// `kT/m`, so `⟨½ m v²⟩ = ½ kT` per DOF — equipartition, independent of `dt`.
+/// At `temperature == 0` the kick vanishes and this is the original pure damped
+/// minimizer (no RNG is even consumed).
 fn integrate(st: &mut State, force: &[f32], s: &GeometricSettings) {
     let dt = s.time_step;
     let damping = s.damping.clamp(0.0, 1.0);
     let max_step = s.max_step;
+    let kt = s.temperature.max(0.0);
+    // OU kick is balanced against the friction `damping` (fluctuation–
+    // dissipation): variance √(1 − damping²) so the steady state hits `kT/m`.
+    let noise_base = if kt > 0.0 {
+        ((1.0 - damping * damping).max(0.0) * kt).sqrt()
+    } else {
+        0.0
+    };
     let n = st.n;
     for i in 0..n {
         let m = st.resolved.mass[i];
+        // Per-DOF thermal speed scale: √((1 − damping²)·kT/m).
+        let sigma = if noise_base > 0.0 {
+            noise_base / m.sqrt()
+        } else {
+            0.0
+        };
         for d in 0..3 {
             let idx = 3 * i + d;
             let a = force[idx] / m;
             let mut v = (st.velocities[idx] + dt * a) * damping;
+            if sigma > 0.0 {
+                v += sigma * next_gaussian(&mut st.rng);
+            }
             // Clamp displacement (not velocity directly) for an intuitive cap.
             let mut disp = dt * v;
             if max_step > 0.0 && disp.abs() > max_step {
@@ -954,6 +1008,33 @@ fn integrate(st: &mut State, force: &[f32], s: &GeometricSettings) {
             st.positions[idx] += disp;
         }
     }
+}
+
+/// One SplitMix64 step: advance `state` in place and return a scrambled `u64`.
+/// Deterministic and WASM-safe (no `getrandom`); the same generator the test
+/// seed helper uses, so the thermostat stream is reproducible from `rng_seed`.
+fn splitmix64(state: &mut u64) -> u64 {
+    *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    let mut z = *state;
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}
+
+/// A uniform `f64` in `[0, 1)` from the top 53 bits of a SplitMix64 draw.
+fn next_uniform(state: &mut u64) -> f64 {
+    (splitmix64(state) >> 11) as f64 / (1u64 << 53) as f64
+}
+
+/// A standard-normal sample via Box–Muller (one variate per call; the paired
+/// variate is discarded for simplicity — the thermostat is not RNG-hot relative
+/// to the `O(n²)` force pass).
+fn next_gaussian(state: &mut u64) -> f32 {
+    // Guard the log against an exact-zero draw.
+    let u1 = next_uniform(state).max(1e-12);
+    let u2 = next_uniform(state);
+    let r = (-2.0 * u1.ln()).sqrt();
+    (r * (std::f64::consts::TAU * u2).cos()) as f32
 }
 
 // ---------------------------------------------------------------------------
