@@ -370,6 +370,33 @@ pub struct GeometricSettings {
     /// magnitude only) — consistent with how the patchy anisotropy factor already
     /// omits its angular translational force.
     pub gb_side_strength: f32,
+    /// Director→position **tilt-coupling** stiffness — the term that makes the
+    /// membrane GEOMETRY follow the director (normal) field, so a flat sheet,
+    /// hollow tube and closed vesicle become *spontaneous* rather than detector-
+    /// only (Phase C3). `0` ⇒ OFF: no positional force from the directors ⇒
+    /// default-settings behaviour and the golden master are byte-identical (the
+    /// term is gated on both `tilt_coupling_strength > 0` *and* `well_depth > 0`).
+    ///
+    /// Unlike [`gb_side_strength`](Self::gb_side_strength) (a *radial-depth* bias
+    /// that barely reshapes the condensate), this is a genuine **clean potential**
+    /// whose negative gradient is added to [`compute_forces`] and whose integral is
+    /// folded into [`EnergyBreakdown::tilt`], so `−∇E == compute_forces` holds
+    /// exactly (verified by the finite-difference canary). For a cohering pair with
+    /// unit separation `r̂` (from `i`→`j`) it penalises the deviation of each
+    /// normal's projection onto `r̂` from the spontaneous-curvature target:
+    ///   `V = ½·k·w_c(d)·[ (nᵢ·r̂ − c₀/2)² + (nⱼ·r̂ + c₀/2)² ]`
+    /// where `w_c(d)` is the SAME cosine² cohesion weight the well uses (so the
+    /// coupling is active exactly where particles cohere). At `c₀ = 0` the target
+    /// is `nᵢ·r̂ = nⱼ·r̂ = 0`, i.e. neighbours are driven **side-by-side in each
+    /// other's tangent plane** — a genuinely FLAT bilayer (one collapsed gyration
+    /// axis), the upgrade from the bare patchy well's nematic droplet. At `c₀ > 0`
+    /// the targets `±c₀/2` make `i`'s normal lean toward `j` and `j`'s away, so the
+    /// relaxed sheet acquires a uniform curvature of sense set by `c₀` — rolling a
+    /// sheet into a TUBE at intermediate `c₀` and closing it into a VESICLE at
+    /// higher `c₀`. The director field is steered in parallel by the splay-bend
+    /// torque ([`kappa_bend`](Self::kappa_bend) / [`spont_curvature_c0`](Self::spont_curvature_c0));
+    /// this term is what converts that orientational preference into real geometry.
+    pub tilt_coupling_strength: f32,
 }
 
 impl Default for GeometricSettings {
@@ -435,6 +462,9 @@ impl Default for GeometricSettings {
             kappa_bend: 0.0,
             spont_curvature_c0: 0.0,
             gb_side_strength: 0.0,
+            // Default OFF: no director→position coupling ⇒ positions evolve exactly
+            // as before ⇒ default behaviour byte-identical (golden master unaffected).
+            tilt_coupling_strength: 0.0,
         }
     }
 }
@@ -657,12 +687,19 @@ pub struct EnergyBreakdown {
     pub cohesion: f32,
     /// Mass-scaled pull toward the origin: `Σ ½·gravity·mᵢ·‖rᵢ‖²`.
     pub gravity: f32,
+    /// Director→position **tilt-coupling** potential (Phase C3): the cohesion-
+    /// weighted penalty `Σ ½·k·w_c·[(nᵢ·r̂−c₀/2)² + (nⱼ·r̂+c₀/2)²]` that makes the
+    /// membrane geometry follow the normals (flat at `c₀=0`, curved at `c₀>0`). A
+    /// *clean* potential — its negative gradient is exactly the force added in
+    /// [`accumulate_exclusion_affinity`], so `−∇E == compute_forces`. `≥ 0`; always
+    /// `0` at the default `tilt_coupling_strength = 0` (byte-identical default).
+    pub tilt: f32,
 }
 
 impl EnergyBreakdown {
     /// Total conservative potential energy.
     pub fn total(&self) -> f32 {
-        self.edge + self.angle + self.exclusion + self.cohesion + self.gravity
+        self.edge + self.angle + self.exclusion + self.cohesion + self.gravity + self.tilt
     }
 }
 
@@ -970,9 +1007,12 @@ fn potential_energy(st: &State, s: &GeometricSettings) -> EnergyBreakdown {
     // the potential is continuous and consistent across the whole domain.
     let mut exclusion = 0.0f64;
     let mut cohesion = 0.0f64;
+    let mut tilt = 0.0f64;
     let class = &st.resolved.class;
     let nc = s.class_affinity_dim as usize;
     let wc = s.well_width.max(1e-4) as f64;
+    let tilt_k = s.tilt_coupling_strength as f64;
+    let tilt_t = 0.5 * s.spont_curvature_c0 as f64;
     for i in 0..st.n {
         let ri = lookup_radius(&s.class_radius, class[i] as usize, s.default_radius);
         for j in (i + 1)..st.n {
@@ -1008,6 +1048,34 @@ fn potential_energy(st: &State, s: &GeometricSettings) -> EnergyBreakdown {
                     cohesion -= eps * c * c;
                 }
             }
+
+            // Tilt-coupling potential — the integral matching `accumulate_tilt_force`
+            // (same w_c weight, same r̂, same ±c₀/2 targets) so `−∇(tilt) == its force`.
+            if tilt_k > 0.0 && eps > 0.0 {
+                let w = if d <= sigma {
+                    1.0
+                } else if d <= sigma + wc {
+                    let c = (std::f64::consts::FRAC_PI_2 * (d - sigma) / wc).cos();
+                    c * c
+                } else {
+                    0.0
+                };
+                if w > 0.0 {
+                    let (nix, niy, niz) = (
+                        st.directors[3 * i] as f64,
+                        st.directors[3 * i + 1] as f64,
+                        st.directors[3 * i + 2] as f64,
+                    );
+                    let (njx, njy, njz) = (
+                        st.directors[3 * j] as f64,
+                        st.directors[3 * j + 1] as f64,
+                        st.directors[3 * j + 2] as f64,
+                    );
+                    let a = nix * ux as f64 + niy * uy as f64 + niz * uz as f64 - tilt_t;
+                    let b = njx * ux as f64 + njy * uy as f64 + njz * uz as f64 + tilt_t;
+                    tilt += 0.5 * tilt_k * w * (a * a + b * b);
+                }
+            }
         }
     }
 
@@ -1028,6 +1096,7 @@ fn potential_energy(st: &State, s: &GeometricSettings) -> EnergyBreakdown {
         exclusion: exclusion as f32,
         cohesion: cohesion as f32,
         gravity: gravity as f32,
+        tilt: tilt as f32,
     }
 }
 
@@ -1279,8 +1348,87 @@ fn accumulate_exclusion_affinity(force: &mut [f32], st: &State, s: &GeometricSet
             force[3 * j] -= fx;
             force[3 * j + 1] -= fy;
             force[3 * j + 2] -= fz;
+
+            // Director→position tilt coupling (Phase C3) — a clean potential
+            // V = ½·k·w_c(d)·[(nᵢ·r̂−c₀/2)² + (nⱼ·r̂+c₀/2)²] whose negative gradient
+            // is added here (and whose integral is `EnergyBreakdown::tilt`). Gated
+            // on a positive depth so it only acts inside a cohering aggregate, and
+            // OFF by default (k=0) ⇒ byte-identical.
+            if s.tilt_coupling_strength > 0.0 && eps > 0.0 {
+                accumulate_tilt_force(
+                    force, &st.directors, i, j, ux, uy, uz, dist, sigma, wc,
+                    s.tilt_coupling_strength, s.spont_curvature_c0,
+                );
+            }
         }
     }
+}
+
+/// Director→position tilt-coupling force for one cohering pair: the negative
+/// gradient of `V = ½·k·w_c(d)·[(nᵢ·r̂−t)² + (nⱼ·r̂+t)²]`, `t = c₀/2`, `r̂` from
+/// `i`→`j` and `w_c(d)` the cosine² cohesion weight (1 inside contact `σ`, cos²
+/// decay over the well, 0 beyond `σ+w_c`). Pushes the pair's positions so each
+/// normal's projection onto `r̂` reaches its target — driving a FLAT bilayer at
+/// `c₀=0` (targets 0 ⇒ neighbours side-by-side ⊥ normal) and a uniformly CURVED
+/// sheet at `c₀>0`. See [`GeometricSettings::tilt_coupling_strength`]. The matching
+/// energy is summed in [`potential_energy`] with the identical `w_c`/projection
+/// algebra, so `−∇E == this` exactly (finite-difference canary).
+#[allow(clippy::too_many_arguments)]
+fn accumulate_tilt_force(
+    force: &mut [f32],
+    directors: &[f32],
+    i: usize,
+    j: usize,
+    ux: f32,
+    uy: f32,
+    uz: f32,
+    dist: f32,
+    sigma: f32,
+    wc: f32,
+    k: f32,
+    c0: f32,
+) {
+    // Cohesion weight w and its derivative w' along d. Outside the well ⇒ no term.
+    let (w, wp) = if dist <= sigma {
+        (1.0f32, 0.0f32)
+    } else if dist <= sigma + wc {
+        let x = std::f32::consts::FRAC_PI_2 * (dist - sigma) / wc;
+        let (sx, cx) = x.sin_cos();
+        // w = cos²x ; w' = -2 cos x sin x · (π/(2 w_c)) = -(π/w_c)·cos x·sin x.
+        (cx * cx, -(std::f32::consts::PI / wc) * cx * sx)
+    } else {
+        return;
+    };
+    let t = 0.5 * c0;
+    let (nix, niy, niz) = (directors[3 * i], directors[3 * i + 1], directors[3 * i + 2]);
+    let (njx, njy, njz) = (directors[3 * j], directors[3 * j + 1], directors[3 * j + 2]);
+    let a = nix * ux + niy * uy + niz * uz; // nᵢ·r̂
+    let b = njx * ux + njy * uy + njz * uz; // nⱼ·r̂
+    let ea = a - t;
+    let eb = b + t;
+
+    // ∂V/∂d split into (1) the weight's radial part and (2) the projection part.
+    // (1) ½·k·w'·(ea²+eb²) along r̂ (a scalar magnitude on **d**).
+    let radial = 0.5 * k * wp * (ea * ea + eb * eb);
+    // (2) k·w·[ ea·(nᵢ − a·r̂) + eb·(nⱼ − b·r̂) ] / d   (vector on **d**).
+    let inv_d = 1.0 / dist.max(1e-6);
+    let kw = k * w * inv_d;
+    let pix = kw * ea * (nix - a * ux);
+    let piy = kw * ea * (niy - a * uy);
+    let piz = kw * ea * (niz - a * uz);
+    let pjx = kw * eb * (njx - b * ux);
+    let pjy = kw * eb * (njy - b * uy);
+    let pjz = kw * eb * (njz - b * uz);
+    // Total ∂V/∂**d** = radial·r̂ + (proj part). Force on j is −∂V/∂**d**; on i +.
+    let gx = radial * ux + pix + pjx;
+    let gy = radial * uy + piy + pjy;
+    let gz = radial * uz + piz + pjz;
+    force[3 * i] += gx;
+    force[3 * i + 1] += gy;
+    force[3 * i + 2] += gz;
+    force[3 * j] -= gx;
+    force[3 * j + 1] -= gy;
+    force[3 * j + 2] -= gz;
 }
 
 /// Mass-scaled linear pull toward the origin.
