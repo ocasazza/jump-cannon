@@ -64,6 +64,38 @@ impl RemoteGeometricLayout {
     }
 }
 
+impl RemoteGeometricLayout {
+    /// The stream URL implied by the *current* settings. The worker engine is
+    /// self-selected from `?layout_id=` (`geometric` vs `geometric-gpu`), and
+    /// the resolved lens rides in `?lens=`, so this string fully determines
+    /// which backend + parameters the stream produces.
+    fn stream_url(&self) -> String {
+        let backend_id = if self.settings.use_gpu { "geometric-gpu" } else { "geometric" };
+        let lens_json = serde_json::to_string(&self.settings).unwrap_or_default();
+        let encoded_lens = urlencoding::encode(&lens_json);
+        format!("{}?layout_id={}&lens={}", self.settings.url, backend_id, encoded_lens)
+    }
+
+    /// Spawn the WS consumer for `url` unless it already matches the one we
+    /// last spawned. Returns immediately on a no-op. This is the single place
+    /// the bridge (re)opens a stream, so both `init_with_device` and a
+    /// settings-only change (CPU↔GPU toggle, lens/preset edits) route through
+    /// it and correctly respawn against the new `?layout_id=`/`?lens=`.
+    fn ensure_stream(&mut self) {
+        if self.n_nodes == 0 {
+            return; // not initialised against a graph yet
+        }
+        let url = self.stream_url();
+        if self.spawned_url.as_deref() == Some(url.as_str()) {
+            return;
+        }
+        self.spawned_url = Some(url.clone());
+        let backoff_ms = self.settings.reconnect_backoff_ms.max(100);
+        let latch = Arc::clone(&self.latch);
+        crate::ui::layout::algorithms::remote_fa2::spawn_ws_consumer(url, backoff_ms, latch);
+    }
+}
+
 impl PhysicsLayout for RemoteGeometricLayout {
     type Settings = LensConfig;
 
@@ -92,19 +124,7 @@ impl PhysicsLayout for RemoteGeometricLayout {
         _positions_buf: &wgpu::Buffer,
     ) -> Result<(), String> {
         self.n_nodes = graph.nodes.len() as u32;
-
-        let backend_id = if self.settings.use_gpu { "geometric-gpu" } else { "geometric" };
-        let lens_json = serde_json::to_string(&self.settings).unwrap_or_default();
-        let encoded_lens = urlencoding::encode(&lens_json);
-        let url = format!("{}?layout_id={}&lens={}", self.settings.url, backend_id, encoded_lens);
-
-        if self.spawned_url.as_deref() == Some(url.as_str()) {
-            return Ok(());
-        }
-        self.spawned_url = Some(url.clone());
-        let backoff_ms = self.settings.reconnect_backoff_ms.max(100);
-        let latch = Arc::clone(&self.latch);
-        crate::ui::layout::algorithms::remote_fa2::spawn_ws_consumer(url, backoff_ms, latch);
+        self.ensure_stream();
         Ok(())
     }
 
@@ -115,6 +135,14 @@ impl PhysicsLayout for RemoteGeometricLayout {
         _encoder: &mut wgpu::CommandEncoder,
         positions_buf: &wgpu::Buffer,
     ) {
+        // Respawn the stream if the effective URL changed since we last spawned.
+        // The renderer pushes a settings-only update (no layout re-init) when the
+        // active layout id is unchanged — which is exactly the case when toggling
+        // CPU↔GPU (both are the `geometric` bridge) or editing the lens. Without
+        // this, `use_gpu`/lens edits would never reach a new `?layout_id=`/`?lens=`
+        // stream and the backend swap would be silently ignored.
+        self.ensure_stream();
+
         let positions = match self.latch.lock() {
             Ok(mut g) => g.take(),
             Err(_) => return,
