@@ -770,6 +770,129 @@ fn thermostat_temperature_scales_kinetic_energy() {
     );
 }
 
+/// A stateful SplitMix64 stream (the test seed helper is stateless per-index;
+/// a random walk needs a running stream). Same generator as the engine's
+/// thermostat, so the canaries stay in one RNG family.
+fn next_u64(state: &mut u64) -> u64 {
+    *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    let mut z = *state;
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}
+
+/// A uniformly-distributed unit vector (Marsaglia's method) for the random-walk
+/// chain seed.
+fn random_unit(state: &mut u64) -> [f32; 3] {
+    loop {
+        let u = next_u64(state) as f64 / u64::MAX as f64 * 2.0 - 1.0;
+        let v = next_u64(state) as f64 / u64::MAX as f64 * 2.0 - 1.0;
+        let s = u * u + v * v;
+        if s < 1.0 && s > 1e-9 {
+            let f = 2.0 * (1.0 - s).sqrt();
+            return [(u * f) as f32, (v * f) as f32, (1.0 - 2.0 * s) as f32];
+        }
+    }
+}
+
+/// A freely-jointed random-walk seed: `n` beads, each one `step` away from the
+/// previous in a uniformly random direction. This *is* an ideal-chain ensemble
+/// sample, so the chain canary doesn't have to wait out the (∝N²) Rouse time to
+/// reach equilibrium — it starts at a typical configuration and the thermostat
+/// just fluctuates around it.
+fn random_walk_seed(n: usize, step: f32, seed: u64) -> Vec<f32> {
+    let mut pos = vec![0.0f32; 3 * n];
+    let mut rng = seed;
+    let (mut x, mut y, mut z) = (0.0f32, 0.0f32, 0.0f32);
+    for i in 0..n {
+        pos[3 * i] = x;
+        pos[3 * i + 1] = y;
+        pos[3 * i + 2] = z;
+        let d = random_unit(&mut rng);
+        x += step * d[0];
+        y += step * d[1];
+        z += step * d[2];
+    }
+    pos
+}
+
+/// Time- and ensemble-averaged squared radius of gyration of a thermalized
+/// linear chain of `n` beads: average over `chains` independent random-walk
+/// seeds, each relaxed and sampled after a burn-in.
+fn mean_rg2_chain(n: usize, settings: &GeometricSettings, chains: u64) -> f32 {
+    let g = CsrGraph::path(n as u32);
+    let (steps, burn_in, every) = (2_000usize, 400usize, 8usize);
+    let mut acc = 0.0f64;
+    let mut count = 0u64;
+    for c in 0..chains {
+        let seed = random_walk_seed(n, settings.edge_rest_len, 0xC0FFEE ^ (c + 1) * 2_654_435_761);
+        // Each chain gets an INDEPENDENT thermostat stream — otherwise the runs
+        // share noise, the ensemble average barely shrinks the variance, and a
+        // single chain's fluctuation can skew the fitted exponent.
+        let mut settings = settings.clone();
+        settings.rng_seed ^= (c + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        let mut e = GeometricEngine::new();
+        e.set_params(&serde_json::to_value(&settings).unwrap()).unwrap();
+        let mut ctx = EngineCtx::cpu_only();
+        e.init(&mut ctx, &CsrShard::whole(&g), &seed).unwrap();
+        for step in 0..steps {
+            let p = e.step(&mut ctx).positions;
+            if step >= burn_in && step % every == 0 {
+                let rg = radius_of_gyration(&p);
+                acc += (rg * rg) as f64;
+                count += 1;
+            }
+        }
+    }
+    (acc / count as f64) as f32
+}
+
+#[test]
+fn thermostat_ideal_chain_scales_linearly_with_length() {
+    // An ideal (freely-jointed, no excluded-volume) polymer at temperature obeys
+    // ⟨R_g²⟩ ∝ N — the Flory exponent ν = 1/2 (R_g ∝ N^ν, R_g² ∝ N^{2ν} = N¹).
+    // This validates the thermostat AND the bond springs *together* against a
+    // textbook scaling law. It's a *ratio* test, so any N-independent prefactor
+    // bias in the integrator's configurational sampling cancels out — only the
+    // exponent is asserted. Excluded volume is OFF (it would swell the chain to
+    // the self-avoiding ν ≈ 0.588, a different exponent).
+    let chain = GeometricSettings {
+        edge_rest_len: 1.0,
+        edge_stiffness: 1.0,
+        angle_stiffness: 0.0,
+        exclusion_strength: 0.0, // ideal chain: NO excluded volume
+        affinity_strength: 0.0,
+        gravity: 0.0,
+        damping: 0.9,
+        time_step: 0.5,
+        max_step: 0.0,
+        temperature: 0.5,
+        ..GeometricSettings::default()
+    };
+
+    let rg2_16 = mean_rg2_chain(16, &chain, 4);
+    let rg2_32 = mean_rg2_chain(32, &chain, 4);
+    let rg2_64 = mean_rg2_chain(64, &chain, 4);
+
+    // Each doubling of N should roughly double ⟨R_g²⟩.
+    let r1 = rg2_32 / rg2_16;
+    let r2 = rg2_64 / rg2_32;
+    // Fit the exponent: R_g² ∝ N^p ⇒ p = log2(rg2_64 / rg2_16) / log2(64/16).
+    let p = (rg2_64 / rg2_16).log2() / 4.0f32.log2();
+
+    eprintln!(
+        "ideal chain: R_g²(16)={rg2_16:.3} R_g²(32)={rg2_32:.3} R_g²(64)={rg2_64:.3} \
+         | ratios {r1:.2}, {r2:.2} | exponent p={p:.3} (ideal=1.0)"
+    );
+    // Generous band: sampling noise + finite-N corrections (the exact form is
+    // ∝ (N − 1/N)) keep this from being exactly 1.0, but a self-avoiding (~1.18)
+    // or collapsed/rod regime would fall well outside.
+    assert!(
+        (p - 1.0).abs() < 0.22,
+        "ideal-chain R_g² should scale ~ N¹ (got exponent {p:.3})"
+    );
+}
+
 #[test]
 fn thermostat_off_is_a_pure_minimizer() {
     // temperature == 0 must inject ZERO noise: a free gas seeded at rest with no

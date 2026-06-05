@@ -181,10 +181,12 @@ The existing canaries assert *zero-temperature* closed-form geometry. Self-
 assembly needs *statistical* canaries (assert distributions / scaling, with a
 fixed RNG seed for reproducibility):
 
-- **Equipartition** (lands in Phase T): `⟨KE⟩ → 1.5 kT`.
-- **Ideal-chain scaling:** a bonded chain at temperature should show
-  `⟨R_g²⟩ ∝ N` (Gaussian) within tolerance — validates bonds + thermostat
-  together.
+- **Equipartition** (landed in Phase T): `⟨KE⟩ → 1.5 kT`. ✅
+- **Ideal-chain scaling** (landed): a bonded chain (no excluded volume) at
+  temperature shows `⟨R_g²⟩ ∝ N` — Flory ν=½ — validating bonds + thermostat
+  together. Fitted exponent ≈ 0.93. ✅ Note the test learning: each chain in the
+  ensemble needs an *independent* `rng_seed`, else the shared noise stream barely
+  shrinks the variance and a single chain skews the fit.
 - **Morphology ladder:** with the well + anisotropy, a parameter sweep must
   reproduce the *ordered* sequence chain → sheet → tube → vesicle (the primary
   qualitative benchmark), detected by `S` + cluster-size + curvature/genus.
