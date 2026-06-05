@@ -54,6 +54,12 @@ pub struct App {
     /// Once we successfully push a Bootstrap into GraphPipelines we flip
     /// this so we don't retry the (expensive) buffer creation.
     loaded_into_gpu: bool,
+    /// One-shot request to `fit_camera()` after the next successful GPU
+    /// load. Set by `drain_generated_graph` so a regenerated graph is
+    /// framed in view (the freshly-loaded graph has new bounds and the
+    /// idle auto-refit only fires on a window resize). Cleared after the
+    /// fit fires.
+    pending_fit_on_load: bool,
     /// Set once we emit the readiness console-log line (used by the test harness).
     logged_ready: bool,
     /// Phase E: ephemeral modal state. Not persisted — open-state is per-session.
@@ -547,6 +553,7 @@ impl App {
             state,
             load,
             loaded_into_gpu: false,
+            pending_fit_on_load: false,
             logged_ready: false,
             modal: ui::ModalState::default(),
             node_fetch: Arc::new(Mutex::new(None)),
@@ -908,6 +915,72 @@ impl App {
         self.loaded_into_gpu = false;
         // Force a fresh ready-log line for the regenerated graph.
         self.logged_ready = false;
+        // Frame the regenerated graph once it lands on the GPU.
+        self.pending_fit_on_load = true;
+        // Drop all node-idx-keyed session state: the replacement graph
+        // renumbers (or removes) every index, so any carried-over
+        // selection / focus / hover / picking / GPU-write-gate would now
+        // point at the wrong node (or out of bounds).
+        self.reset_session_state_for_new_graph();
+    }
+
+    /// Clear every piece of per-graph session state so a freshly loaded
+    /// graph starts clean. Node indices are only meaningful relative to a
+    /// single loaded graph; replacing the graph invalidates every cached
+    /// `u32` idx (selection, focus, hover, anchored panels) AND every
+    /// "already pushed to GPU" change-detection tracker (so the new
+    /// buffers get re-seeded with style / colors / focus on the next
+    /// frame instead of being skipped as unchanged). Mirrors the relevant
+    /// `App::new` defaults; does NOT touch persisted `AppState` or async
+    /// fetch slots tied to id strings that survive a graph swap.
+    fn reset_session_state_for_new_graph(&mut self) {
+        // Selection / inspector.
+        self.selected_node_idx = None;
+        // Focus mode (sticky + hover + edge hover).
+        self.focus_sticky_idx = None;
+        self.focus_hover_idx = None;
+        self.focus_hover_edge_idx = None;
+        self.hover_clear_at = None;
+        self.last_hover_raycast_at = None;
+        // Hover-preview card.
+        self.hover_preview_idx = None;
+        self.hover_preview_armed_at = None;
+        self.hover_preview_meta = None;
+        self.hover_preview_open = false;
+        self.hover_preview_pos = None;
+        // Anchored / promoted panels (all idx-keyed).
+        self.promoted_anchored_idx = None;
+        self.promoted_anchored_meta = None;
+        self.last_anchored_screen_pos.clear();
+        self.anchored_expanded.clear();
+        self.anchored_maximized.clear();
+        self.anchored_drag_offsets.clear();
+        // GPU-write change-detection gates: force a fresh push into the
+        // newly allocated buffers (otherwise an unchanged key skips the
+        // re-upload and the new graph renders against stale GPU state).
+        self.prev_style_key = None;
+        self.prev_layout_key = None;
+        self.prev_seed_mode = None;
+        self.prev_focus_key = None;
+        self.prev_cursor_key = None;
+        self.prev_selected_hash = None;
+        self.prev_active_layout_id = None;
+        self.focus_pushed_idx = None;
+        self.focus_pushed_mode = None;
+        self.filter_pushed_sig = None;
+        self.hovered_pushed_idx = None;
+        self.hovered_pushed_edge_idx = None;
+        // Cursor-force / post-click cooldown bookkeeping.
+        self.cursor_force_active = 0.0;
+        self.prev_cursor_force_active = 0.0;
+        self.post_click_cooldown_frames = 0;
+        self.post_click_cooldown_applied = false;
+        self.last_observed_max_ke = 0.0;
+        // Tag-derived metric is rebuilt from the field index, which is
+        // server-backed and absent for tvix-generated graphs; clear it so
+        // a stale (wrong-length) tag metric can't reach colors_from_metric.
+        self.tag_community_metric = None;
+        self.field_index = None;
     }
 
     fn try_promote_bootstrap_to_gpu(&mut self, frame: &mut eframe::Frame) {
@@ -1018,6 +1091,12 @@ impl App {
                             pipes.n_nodes(),
                             pipes.n_edges()
                         );
+                        // Frame a regenerated graph in view (its bounds
+                        // differ from the previous graph's; the idle
+                        // auto-refit only fires on a window resize).
+                        if self.pending_fit_on_load {
+                            pipes.fit_camera();
+                        }
                         load_result = Ok(Some((pipes.n_nodes(), pipes.n_edges())));
                     }
                     Err(e) => {
@@ -1035,6 +1114,16 @@ impl App {
                     format!("GPU buffers ready: {n_nodes_g} nodes, {n_edges_g} edges"),
                 );
                 self.loaded_into_gpu = true;
+                // The fit (if requested) already ran while we held the
+                // pipes write lock above. Disarm the one-shot and reset the
+                // auto-refit baseline to `None` — the idle handler treats
+                // `None` as "initial fit already done, skip" (it only
+                // refits on a measured screen-size change), so we won't
+                // double-fit on the next frame.
+                if self.pending_fit_on_load {
+                    self.last_fit_screen = None;
+                    self.pending_fit_on_load = false;
+                }
             }
             Ok(None) => {
                 drop(upload);
