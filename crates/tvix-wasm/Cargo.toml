@@ -2,7 +2,7 @@
 name = "tvix-wasm"
 version = "0.1.0"
 edition = "2021"
-description = "tvix-eval bridge — native + WASM Nix expression evaluator"
+description = "tvix-eval bridge — native + WASM Nix graph-expression evaluator"
 
 [lib]
 crate-type = ["cdylib", "rlib"]
@@ -12,12 +12,17 @@ default = []
 wasm = ["wasm-bindgen", "js-sys", "console_error_panic_hook"]
 
 [dependencies]
-wasm-bindgen           = { version = "0.2", optional = true }
+wasm-bindgen           = { workspace = true, optional = true }
 js-sys                 = { version = "0.3", optional = true }
 console_error_panic_hook = { version = "0.1", optional = true }
 serde      = { workspace = true }
 serde_json = { workspace = true }
+bytes      = "1"
 
-# tvix-eval — native only (wasm32 path stubs out where tvix-eval can't compile)
-[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-tvix-eval = { git = "https://github.com/tvlfyi/tvix", rev = "1dbdd85ab1acdc0c28641f6dfdf8b88d9eda89ed", default-features = false }
+# tvix-eval is an UNCONDITIONAL dependency. default-features=false drops the
+# impure / arbitrary / nix_tests features, making evaluation pure by
+# construction and letting the crate compile for wasm32-unknown-unknown.
+[dependencies.tvix-eval]
+git = "https://github.com/tvlfyi/tvix"
+rev = "1dbdd85ab1acdc0c28641f6dfdf8b88d9eda89ed"
+default-features = false
