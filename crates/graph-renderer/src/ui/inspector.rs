@@ -94,10 +94,20 @@ pub struct InspectorData<'a> {
 /// re-snap, expand/contract toggle) so this function emits only the
 /// active-filter chip strip + metadata/badges/frontmatter/page-content/
 /// community/neighbours sections.
+///
+/// `max_height` bounds the inner `ScrollArea` so content that exceeds the
+/// host panel's height scrolls *within* the panel instead of overflowing
+/// its bounds. Inside an auto-sizing `egui::Area` (the anchored card),
+/// `ui.set_max_height` alone doesn't give the ScrollArea a finite
+/// `available_height` to clip against — the Area grows to fit content, so
+/// the ScrollArea never actually scrolls. Passing an explicit `Some(h)`
+/// here pins the ScrollArea's `max_height` so it clips + scrolls. `None`
+/// keeps the legacy auto-sizing behaviour for any unbounded host.
 pub(crate) fn render_body(
     ui: &mut egui::Ui,
     tag_browser_query: &mut String,
     data: &mut InspectorData,
+    max_height: Option<f32>,
 ) {
     log::info!(
         "[graph-renderer] inspector body rendered: idx={}",
@@ -115,8 +125,13 @@ pub(crate) fn render_body(
         .selected_idx
         .filter(|i| (*i as usize) < data.ids.len());
 
-    egui::ScrollArea::vertical()
-        .auto_shrink([false; 2])
+    let mut scroll = egui::ScrollArea::vertical().auto_shrink([false; 2]);
+    if let Some(h) = max_height {
+        // Bound the viewport so overflowing content scrolls within the
+        // panel instead of growing the host Area past its bounds.
+        scroll = scroll.max_height(h);
+    }
+    scroll
         .show(ui, |ui| {
             let Some(idx) = valid_idx else {
                 // Empty-state: render the vault-wide tag panel so the

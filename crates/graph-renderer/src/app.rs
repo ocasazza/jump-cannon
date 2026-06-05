@@ -3195,17 +3195,28 @@ impl App {
                 // editable page viewer when applicable).
                 // `inspector::render_body` owns its own ScrollArea
                 // internally — don't wrap it in another one or two
-                // scrollbars + ambiguous wheel routing. Cap the
-                // height by setting `max_height` on `ui` and let
-                // render_body's inner ScrollArea fit inside it.
+                // scrollbars + ambiguous wheel routing. We pass the
+                // body's height budget down as the ScrollArea's explicit
+                // `max_height` so overflowing content (long frontmatter,
+                // a tall page preview, a big neighbour list) clips +
+                // scrolls *inside* the panel instead of overflowing its
+                // bounds. `ui.set_max_height` alone is insufficient here:
+                // the anchored card lives in an auto-sizing `egui::Area`
+                // that grows to fit content, so the inner ScrollArea
+                // would otherwise see an effectively unbounded
+                // `available_height` and never scroll.
                 ui.separator();
                 // Maximize: the body should fill the canvas-sized rect
                 // minus the chrome we already laid out (header +
-                // separator + small slack for inner margin).
+                // separator + small slack for inner margin). Expanded
+                // (non-maximized): the 640px budget that matches the
+                // panel's reserved footprint (480 × 640) minus the same
+                // chrome slack, so the bounded rect the panel was
+                // clamped into is what the ScrollArea clips against.
                 let body_max_h = if let Some(r) = max_rect {
                     (r.height() - header_height - 24.0).max(120.0)
                 } else {
-                    640.0
+                    (640.0 - header_height - 24.0).max(120.0)
                 };
                 ui.set_max_height(body_max_h);
                 {
@@ -3232,6 +3243,7 @@ impl App {
                             ui,
                             &mut self.state.tag_browser_query,
                             &mut data,
+                            Some(body_max_h),
                         );
                 }
             } else if !meta.body.is_empty() {
