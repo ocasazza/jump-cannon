@@ -630,6 +630,67 @@ pub struct GeometricObservables {
     pub rms_residual: f32,
 }
 
+/// Order-parameter observables that **detect the emergent self-assembly level**
+/// of the current particle cloud (Phase O — see `docs/self-assembly-plan.md` §6).
+///
+/// These are *order parameters*, not phase labels: each is a continuous scalar
+/// read non-destructively from the live positions / directors. They are what the
+/// statistical-mechanics canaries (Phase S) and the renderer HUD key on to tell a
+/// monomer soup from a chain from a sheet from a closed vesicle, without meshing
+/// and without hard-coding phase thresholds (that framing was refuted in the
+/// research — report the continuous values and let the caller interpret them).
+#[derive(Clone, Copy, Debug, Default, serde::Serialize, serde::Deserialize)]
+pub struct AssemblyObservables {
+    /// Number of nodes.
+    pub n: usize,
+    /// **Nematic order parameter** `S = (3/2)·λ_max(Q)`, where `Q = ⟨n⊗n⟩ − I/3`
+    /// is the traceless second-moment tensor of the per-node directors. Continuous
+    /// in `[0, 1]`: `0` isotropic (random orientations), `1` perfectly aligned. It
+    /// is head–tail symmetric (does not distinguish `n` from `−n`), the physically
+    /// correct nematic measure. **Not** binned into phase thresholds — reported raw.
+    pub nematic_s: f32,
+    /// Number of connected components ("clusters") under a contact graph: two
+    /// nodes are linked when their separation is `≤ contact_scale·(rᵢ+rⱼ)`. Many
+    /// singletons (a monomer gas) ⇒ `≈ n`; one condensed aggregate ⇒ `1`.
+    pub cluster_count: usize,
+    /// Size (node count) of the **largest** cluster. The CMC analogue: it jumps
+    /// from `1` (dispersed) toward `n` (a single aggregate) as cohesion condenses
+    /// the soup.
+    pub largest_cluster: usize,
+    /// Fraction of nodes in the largest cluster, `largest_cluster / n` in `[0, 1]`.
+    pub largest_cluster_frac: f32,
+    /// **Closure metric** for the largest cluster: the fraction of solid angle
+    /// (around the cluster centroid) that is *covered* by a particle, in `[0, 1]`.
+    /// A hollow shell wrapping the centroid covers nearly the whole sphere
+    /// (`→ 1` ⇒ **closed**, e.g. a vesicle); a flat disk or open sheet leaves the
+    /// two faces of the plane uncovered (`≈ 0.5` or less ⇒ **open**). See
+    /// [`is_closed`](Self::is_closed) for the heuristic's documented limits.
+    pub closure: f32,
+    /// Radius of gyration of the largest cluster (its spatial extent). `0` for a
+    /// single-particle cluster. Reported for scale context alongside `closure`.
+    pub largest_cluster_rg: f32,
+}
+
+impl AssemblyObservables {
+    /// Heuristic verdict from [`closure`](Self::closure): the largest cluster
+    /// **encloses** its centroid (a closed vesicle/shell) when solid-angle
+    /// coverage clears a high bar. The bar is intentionally a *caller-side*
+    /// interpretation, not baked into the observable.
+    ///
+    /// Limits of the heuristic (documented honestly): coverage is estimated by
+    /// bucketing each particle's direction-from-centroid into a fixed angular grid
+    /// and asking what fraction of buckets are hit. It therefore (a) needs enough
+    /// particles to populate the grid — a tiny cluster reads as "open" regardless;
+    /// (b) cannot distinguish a *thick* filled ball from a hollow shell (both cover
+    /// the full sphere) — but in self-assembly the alternatives are open sheets vs.
+    /// closed shells, where coverage cleanly separates the two; (c) a sheet folded
+    /// past a hemisphere but not closed reads as a marginal value. It is a cheap,
+    /// mesh-free screen, not a genus computation.
+    pub fn is_closed(&self) -> bool {
+        self.closure >= 0.85
+    }
+}
+
 impl GeometricEngine {
     /// Inspect the current layout without advancing it: decomposed potential
     /// energy, kinetic energy, and the residual force `‖∇E‖`. Returns `None`
@@ -688,6 +749,31 @@ impl GeometricEngine {
     /// live orientation field — the Phase-O observable, computed in-test for now.
     pub fn directors(&self) -> Option<&[f32]> {
         self.state.as_ref().map(|st| st.directors.as_slice())
+    }
+
+    /// Compute the self-assembly **order parameters** (nematic `S`, cluster-size
+    /// distribution, closure/curvature) on the live configuration, without
+    /// advancing it. Returns `None` before a successful [`init`](LayoutEngine::init).
+    ///
+    /// This is the Phase-O observable (`docs/self-assembly-plan.md` §6): the signal
+    /// that *detects* each emergent level (monomer → chain → sheet → vesicle).
+    /// Kept separate from [`observe`](Self::observe) (energy / residual) because it
+    /// answers a different question — *what did the dynamics build?*, not *has it
+    /// converged?* — and is `O(n²)` for the contact pass like the force kernels.
+    ///
+    /// The contact cutoff for clustering is `contact_scale·(rᵢ+rⱼ)`, i.e. the
+    /// per-pair exclusion onset scaled out a little so a relaxed (near-`σ`) bond
+    /// counts as a contact. `1.2` is a sensible default (just past contact, well
+    /// inside the attractive well).
+    pub fn observe_assembly(&self) -> Option<AssemblyObservables> {
+        self.observe_assembly_with(1.2)
+    }
+
+    /// [`observe_assembly`](Self::observe_assembly) with an explicit contact-cutoff
+    /// scale (the multiple of `σ = rᵢ+rⱼ` below which two nodes are "in contact").
+    pub fn observe_assembly_with(&self, contact_scale: f32) -> Option<AssemblyObservables> {
+        let st = self.state.as_ref()?;
+        Some(assembly_observables(st, &self.settings, contact_scale))
     }
 }
 
@@ -1293,6 +1379,239 @@ fn integrate_directors(st: &mut State, s: &GeometricSettings) {
             st.directors[3 * i + 2] = az / len;
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Self-assembly order parameters (Phase O)
+// ---------------------------------------------------------------------------
+
+/// Compute every [`AssemblyObservables`] field from the live state. Non-
+/// destructive (reads positions/directors, mutates nothing). `O(n²)` for the
+/// contact pass — the same class as the exclusion force kernel.
+fn assembly_observables(
+    st: &State,
+    s: &GeometricSettings,
+    contact_scale: f32,
+) -> AssemblyObservables {
+    let n = st.n;
+    if n == 0 {
+        return AssemblyObservables::default();
+    }
+
+    let nematic_s = nematic_order(&st.directors);
+
+    // ---- cluster-size distribution (union-find over the contact graph) -----
+    let parent = contact_components(st, s, contact_scale);
+    // Tally component sizes by representative root.
+    let mut sizes: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+    let mut roots = vec![0usize; n];
+    for i in 0..n {
+        let r = find_root(&parent, i);
+        roots[i] = r;
+        *sizes.entry(r).or_insert(0) += 1;
+    }
+    let cluster_count = sizes.len();
+    let (largest_root, largest_cluster) = sizes
+        .iter()
+        .map(|(&r, &c)| (r, c))
+        .max_by_key(|&(_, c)| c)
+        .unwrap_or((0, 0));
+    let largest_cluster_frac = largest_cluster as f32 / n as f32;
+
+    // ---- largest-cluster geometry: centroid, R_g, closure ------------------
+    let members: Vec<usize> = (0..n).filter(|&i| roots[i] == largest_root).collect();
+    let (largest_cluster_rg, closure) = cluster_geometry(&st.positions, &members);
+
+    AssemblyObservables {
+        n,
+        nematic_s,
+        cluster_count,
+        largest_cluster,
+        largest_cluster_frac,
+        closure,
+        largest_cluster_rg,
+    }
+}
+
+/// Nematic order parameter `S = (3/2)·λ_max(Q)`, `Q = ⟨n⊗n⟩ − I/3` over the
+/// per-node directors (interleaved x,y,z). `0` isotropic, `1` perfectly aligned;
+/// head–tail symmetric. The largest eigenvalue of the symmetric traceless 3×3 is
+/// found by the closed-form trigonometric method (Smith 1961) — no iterative
+/// solver, WASM-safe.
+fn nematic_order(directors: &[f32]) -> f32 {
+    let n = directors.len() / 3;
+    if n == 0 {
+        return 0.0;
+    }
+    let (mut qxx, mut qyy, mut qzz) = (0.0f64, 0.0f64, 0.0f64);
+    let (mut qxy, mut qxz, mut qyz) = (0.0f64, 0.0f64, 0.0f64);
+    for i in 0..n {
+        let (x, y, z) = (
+            directors[3 * i] as f64,
+            directors[3 * i + 1] as f64,
+            directors[3 * i + 2] as f64,
+        );
+        qxx += x * x;
+        qyy += y * y;
+        qzz += z * z;
+        qxy += x * y;
+        qxz += x * z;
+        qyz += y * z;
+    }
+    let inv = 1.0 / n as f64;
+    let third = 1.0 / 3.0;
+    let (qxx, qyy, qzz) = (qxx * inv - third, qyy * inv - third, qzz * inv - third);
+    let (qxy, qxz, qyz) = (qxy * inv, qxz * inv, qyz * inv);
+
+    let p1 = qxy * qxy + qxz * qxz + qyz * qyz;
+    if p1 < 1e-18 {
+        // Already diagonal: the largest diagonal entry is the largest eigenvalue.
+        return (1.5 * qxx.max(qyy).max(qzz)) as f32;
+    }
+    let q = (qxx + qyy + qzz) / 3.0; // = 0 (traceless), kept for generality
+    let p2 = (qxx - q).powi(2) + (qyy - q).powi(2) + (qzz - q).powi(2) + 2.0 * p1;
+    let p = (p2 / 6.0).sqrt();
+    let (bxx, byy, bzz) = ((qxx - q) / p, (qyy - q) / p, (qzz - q) / p);
+    let (bxy, bxz, byz) = (qxy / p, qxz / p, qyz / p);
+    let det_b = bxx * (byy * bzz - byz * byz) - bxy * (bxy * bzz - byz * bxz)
+        + bxz * (bxy * byz - byy * bxz);
+    let r = (det_b / 2.0).clamp(-1.0, 1.0);
+    let phi = r.acos() / 3.0;
+    (1.5 * (q + 2.0 * p * phi.cos())) as f32
+}
+
+/// Union-find over the **contact graph**: nodes `i,j` are linked when their
+/// separation is `≤ contact_scale·(rᵢ+rⱼ)`. Returns the parent array, walked by
+/// [`find_root`] to read each node's component root. `O(n²)` — mirrors the
+/// exclusion scan (so the contact cutoff lives in the same coordinate frame).
+fn contact_components(st: &State, s: &GeometricSettings, contact_scale: f32) -> Vec<usize> {
+    let n = st.n;
+    let pos = &st.positions;
+    let class = &st.resolved.class;
+    let scale = contact_scale.max(0.0);
+    let mut parent: Vec<usize> = (0..n).collect();
+    for i in 0..n {
+        let ri = lookup_radius(&s.class_radius, class[i] as usize, s.default_radius);
+        for j in (i + 1)..n {
+            let rj = lookup_radius(&s.class_radius, class[j] as usize, s.default_radius);
+            let cutoff = scale * (ri + rj).max(1e-3);
+            let dx = pos[3 * j] - pos[3 * i];
+            let dy = pos[3 * j + 1] - pos[3 * i + 1];
+            let dz = pos[3 * j + 2] - pos[3 * i + 2];
+            if dx * dx + dy * dy + dz * dz <= cutoff * cutoff {
+                union(&mut parent, i, j);
+            }
+        }
+    }
+    parent
+}
+
+/// Walk to a node's component root. Read-only (no path compression) so it borrows
+/// `parent` immutably — the trees stay shallow because [`union`] always reparents
+/// the larger root index, and `n` is the `O(n²)` force-pass scale anyway.
+fn find_root(parent: &[usize], mut i: usize) -> usize {
+    while parent[i] != i {
+        i = parent[i];
+    }
+    i
+}
+
+/// Union by attaching the larger root index under the smaller (keeps roots
+/// deterministic regardless of visitation order).
+fn union(parent: &mut [usize], a: usize, b: usize) {
+    let ra = {
+        let mut i = a;
+        while parent[i] != i {
+            i = parent[i];
+        }
+        i
+    };
+    let rb = {
+        let mut i = b;
+        while parent[i] != i {
+            i = parent[i];
+        }
+        i
+    };
+    if ra == rb {
+        return;
+    }
+    let (lo, hi) = if ra < rb { (ra, rb) } else { (rb, ra) };
+    parent[hi] = lo;
+}
+
+/// Geometry of one cluster (given its member indices): radius of gyration and the
+/// **closure** metric (solid-angle coverage around the centroid).
+///
+/// Closure: place a fixed angular grid on the unit sphere (latitude×longitude
+/// buckets), bin each member's direction-from-centroid into a bucket weighted by
+/// its solid angle, and return the fraction of the total sphere solid angle whose
+/// buckets are hit. A hollow shell wrapping the centroid hits buckets all around
+/// (`→ 1`); a flat sheet/disk only points *outward in the plane*, leaving the two
+/// polar caps empty (`≈ 0.5` or less). Mesh-free and `O(members)`. Limits are
+/// documented on [`AssemblyObservables::is_closed`].
+fn cluster_geometry(positions: &[f32], members: &[usize]) -> (f32, f32) {
+    let m = members.len();
+    if m == 0 {
+        return (0.0, 0.0);
+    }
+    // Centroid.
+    let (mut cx, mut cy, mut cz) = (0.0f64, 0.0f64, 0.0f64);
+    for &i in members {
+        cx += positions[3 * i] as f64;
+        cy += positions[3 * i + 1] as f64;
+        cz += positions[3 * i + 2] as f64;
+    }
+    let inv = 1.0 / m as f64;
+    let (cx, cy, cz) = (cx * inv, cy * inv, cz * inv);
+
+    // Radius of gyration: sqrt(mean squared distance to centroid).
+    let mut r2 = 0.0f64;
+    for &i in members {
+        let dx = positions[3 * i] as f64 - cx;
+        let dy = positions[3 * i + 1] as f64 - cy;
+        let dz = positions[3 * i + 2] as f64 - cz;
+        r2 += dx * dx + dy * dy + dz * dz;
+    }
+    let rg = (r2 * inv).sqrt() as f32;
+
+    // Solid-angle coverage. A latitude (polar, `n_theta`) × longitude (azimuth,
+    // `n_phi`) grid. Each cell's solid angle is `Δφ·(cosθ₀ − cosθ₁)`; summing the
+    // hit cells' solid angle over the full `4π` gives the covered fraction. The
+    // resolution is coarse on purpose: it must register a face as "covered" from
+    // only a handful of particles, and read a sheet's two open caps as empty.
+    const N_THETA: usize = 6;
+    const N_PHI: usize = 12;
+    let mut hit = [[false; N_PHI]; N_THETA];
+    for &i in members {
+        let dx = positions[3 * i] as f64 - cx;
+        let dy = positions[3 * i + 1] as f64 - cy;
+        let dz = positions[3 * i + 2] as f64 - cz;
+        let len = (dx * dx + dy * dy + dz * dz).sqrt();
+        if len < 1e-9 {
+            continue; // a particle at the centroid carries no direction
+        }
+        let theta = (dz / len).clamp(-1.0, 1.0).acos(); // [0, π]
+        let phi = dy.atan2(dx) + std::f64::consts::PI; // [0, 2π)
+        let it = ((theta / std::f64::consts::PI) * N_THETA as f64) as usize;
+        let ip = ((phi / std::f64::consts::TAU) * N_PHI as f64) as usize;
+        hit[it.min(N_THETA - 1)][ip.min(N_PHI - 1)] = true;
+    }
+    // Covered solid angle / 4π.
+    let mut covered = 0.0f64;
+    let dphi = std::f64::consts::TAU / N_PHI as f64;
+    for it in 0..N_THETA {
+        let t0 = (it as f64 / N_THETA as f64) * std::f64::consts::PI;
+        let t1 = ((it + 1) as f64 / N_THETA as f64) * std::f64::consts::PI;
+        let band = dphi * (t0.cos() - t1.cos()); // solid angle of one cell in this band
+        for ip in 0..N_PHI {
+            if hit[it][ip] {
+                covered += band;
+            }
+        }
+    }
+    let closure = (covered / (4.0 * std::f64::consts::PI)) as f32;
+    (rg, closure.clamp(0.0, 1.0))
 }
 
 /// One SplitMix64 step: advance `state` in place and return a scrambled `u64`.

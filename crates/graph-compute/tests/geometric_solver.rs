@@ -28,7 +28,7 @@
 //!      or complexity regression trips the test without it being timing-flaky.
 
 use graph_compute::engines::geometric::{
-    CoordinationSource, DirectorSource, GeometricEngine, GeometricSettings,
+    AssemblyObservables, CoordinationSource, DirectorSource, GeometricEngine, GeometricSettings,
 };
 use graph_compute::engines::{
     CsrShard, EngineCtx, GeometricGpuEngine, GraphAttributes, LayoutEngine,
@@ -1423,6 +1423,235 @@ fn directors_do_not_affect_forces_without_anisotropy() {
         random_dirs, aligned_dirs,
         "with anisotropy == 0 the director field must not affect positions"
     );
+}
+
+// ---------------------------------------------------------------------------
+// PHASE O — self-assembly order parameters (observe_assembly)
+// ---------------------------------------------------------------------------
+//
+// These exercise the ENGINE's observable (GeometricEngine::observe_assembly) on
+// synthetic point clouds whose answers are known by construction: a perfectly
+// aligned director lattice → S≈1, random directors → S≈0; one dense blob → a
+// single cluster, a scattered gas → many singletons; a hollow sphere → "closed",
+// a flat disk → "open". They pin every Phase-O field against ground truth so a
+// later regression in the eigensolver / union-find / closure heuristic trips
+// loudly. Directors are supplied via injected GraphAttributes so the test
+// controls them exactly (the dynamics are not run — these are pure observables).
+
+/// Build an inited engine over `n` unbonded nodes at the given `positions`, with
+/// the given per-node `directors` (interleaved x,y,z) injected verbatim, and a
+/// uniform contact radius. No dynamics are stepped; the engine exists only so
+/// `observe_assembly` can read the configuration.
+fn assembly_engine(
+    positions: &[f32],
+    directors: &[f32],
+    radius: f32,
+) -> GeometricEngine {
+    let n = positions.len() / 3;
+    let settings = GeometricSettings {
+        edge_stiffness: 0.0,
+        angle_stiffness: 0.0,
+        exclusion_strength: 0.0,
+        affinity_strength: 0.0,
+        gravity: 0.0,
+        well_depth: 0.0,
+        temperature: 0.0,
+        class_radius: vec![radius],
+        default_radius: radius,
+        director_source: DirectorSource::Injected,
+        ..GeometricSettings::default()
+    };
+    let attrs = GraphAttributes {
+        node_director: Some(directors.to_vec()),
+        ..Default::default()
+    };
+    let mut e = GeometricEngine::new();
+    e.set_params(&serde_json::to_value(&settings).unwrap()).unwrap();
+    let mut ctx = EngineCtx::cpu_only();
+    let g = no_edges(n);
+    e.init(&mut ctx, &CsrShard::whole_with_attributes(&g, &attrs), positions)
+        .expect("init assembly engine");
+    e
+}
+
+#[test]
+fn assembly_nematic_s_spans_aligned_to_random() {
+    // Aligned lattice of directors → S ≈ 1; an isotropic (axis-balanced) field →
+    // S ≈ 0. This is the same eigensolver the in-test `nematic_s` checks, but read
+    // through the ENGINE's observe_assembly so the wiring is validated end to end.
+    let n = 64usize;
+    let pos = vec![0.0f32; 3 * n]; // positions irrelevant to S
+    let aligned: Vec<f32> = (0..n).flat_map(|_| [0.0f32, 0.0, 1.0]).collect();
+    let s_aligned = assembly_engine(&pos, &aligned, 0.5)
+        .observe_assembly()
+        .unwrap()
+        .nematic_s;
+    assert!(
+        (s_aligned - 1.0).abs() < 1e-3,
+        "aligned directors should give S≈1, got {s_aligned}"
+    );
+
+    // Equal thirds along x/y/z ⇒ Q = 0 ⇒ S = 0.
+    let mut iso = Vec::new();
+    for axis in 0..3 {
+        for _ in 0..(n / 3) {
+            let mut v = [0.0f32; 3];
+            v[axis] = 1.0;
+            iso.extend_from_slice(&v);
+        }
+    }
+    let n_iso = iso.len() / 3;
+    let pos_iso = vec![0.0f32; 3 * n_iso];
+    let s_iso = assembly_engine(&pos_iso, &iso, 0.5)
+        .observe_assembly()
+        .unwrap()
+        .nematic_s;
+    assert!(s_iso < 0.05, "isotropic directors should give S≈0, got {s_iso}");
+}
+
+#[test]
+fn assembly_cluster_count_singletons_vs_one_blob() {
+    // A scattered gas (spacing ≫ contact cutoff) → n singleton clusters; a tight
+    // blob (spacing ≪ cutoff) → exactly one cluster spanning all nodes.
+    let radius = 0.5f32; // σ = 1.0; default contact cutoff = 1.2·σ = 1.2
+    let n = 27usize;
+
+    // Gas: 3×3×3 grid spaced far apart (5.0 ≫ 1.2) ⇒ every node isolated.
+    let mut gas = vec![0.0f32; 3 * n];
+    let mut k = 0usize;
+    for ix in 0..3 {
+        for iy in 0..3 {
+            for iz in 0..3 {
+                gas[3 * k] = ix as f32 * 5.0;
+                gas[3 * k + 1] = iy as f32 * 5.0;
+                gas[3 * k + 2] = iz as f32 * 5.0;
+                k += 1;
+            }
+        }
+    }
+    let dirs = [0.0f32, 0.0, 1.0].repeat(n);
+    let gas_obs = assembly_engine(&gas, &dirs, radius)
+        .observe_assembly()
+        .unwrap();
+    assert_eq!(
+        gas_obs.cluster_count, n,
+        "a dispersed gas should be all singletons, got {} clusters",
+        gas_obs.cluster_count
+    );
+    assert_eq!(gas_obs.largest_cluster, 1, "no two gas nodes are in contact");
+
+    // Blob: same grid spaced 1.0 (< 1.2 cutoff) ⇒ a single connected cluster.
+    let mut blob = vec![0.0f32; 3 * n];
+    let mut k = 0usize;
+    for ix in 0..3 {
+        for iy in 0..3 {
+            for iz in 0..3 {
+                blob[3 * k] = ix as f32 * 1.0;
+                blob[3 * k + 1] = iy as f32 * 1.0;
+                blob[3 * k + 2] = iz as f32 * 1.0;
+                k += 1;
+            }
+        }
+    }
+    let blob_obs = assembly_engine(&blob, &dirs, radius)
+        .observe_assembly()
+        .unwrap();
+    assert_eq!(
+        blob_obs.cluster_count, 1,
+        "a tight blob should be one cluster, got {}",
+        blob_obs.cluster_count
+    );
+    assert_eq!(blob_obs.largest_cluster, n, "the blob should contain every node");
+    approx("blob largest-cluster frac", blob_obs.largest_cluster_frac, 1.0, 1e-6);
+}
+
+#[test]
+fn assembly_closure_distinguishes_shell_from_disk() {
+    // A hollow sphere of points wrapping its centroid reads as CLOSED (solid-angle
+    // coverage → 1); a flat disk leaves both polar caps empty and reads as OPEN
+    // (coverage ≈ ½). This is the mesh-free open-sheet-vs-closed-vesicle screen.
+
+    // Hollow sphere: a Fibonacci-sphere of points all at distance R from origin.
+    let n_sphere = 200usize;
+    let r = 3.0f32;
+    let mut sphere = vec![0.0f32; 3 * n_sphere];
+    let golden = std::f32::consts::PI * (3.0 - 5.0f32.sqrt()); // golden angle
+    for i in 0..n_sphere {
+        let y = 1.0 - (i as f32 / (n_sphere - 1) as f32) * 2.0; // [1, -1]
+        let rad = (1.0 - y * y).max(0.0).sqrt();
+        let theta = golden * i as f32;
+        sphere[3 * i] = r * theta.cos() * rad;
+        sphere[3 * i + 1] = r * y;
+        sphere[3 * i + 2] = r * theta.sin() * rad;
+    }
+    // Make every point a contact neighbour of the next so they form ONE cluster
+    // (the closure metric runs on the largest cluster). Use a big radius so the
+    // shell is connected; the closure metric itself is radius-independent.
+    let dirs = [0.0f32, 0.0, 1.0].repeat(n_sphere);
+    let shell_obs = assembly_engine(&sphere, &dirs, 5.0)
+        .observe_assembly()
+        .unwrap();
+    assert_eq!(
+        shell_obs.largest_cluster, n_sphere,
+        "the shell must be one cluster for the closure metric to see all of it"
+    );
+    assert!(
+        shell_obs.is_closed(),
+        "a hollow sphere should read as CLOSED (closure={:.3})",
+        shell_obs.closure
+    );
+    assert!(
+        shell_obs.closure > 0.85,
+        "hollow sphere closure should be near 1, got {:.3}",
+        shell_obs.closure
+    );
+
+    // Flat disk in the z=0 plane: points only point outward in-plane, so the two
+    // polar caps (±z) of the centroid's view sphere are never covered ⇒ ~½ at most.
+    let n_disk = 200usize;
+    let mut disk = vec![0.0f32; 3 * n_disk];
+    for i in 0..n_disk {
+        // A filled disk via the sunflower (Vogel) spiral.
+        let rr = 3.0 * (i as f32 / n_disk as f32).sqrt();
+        let theta = golden * i as f32;
+        disk[3 * i] = rr * theta.cos();
+        disk[3 * i + 1] = rr * theta.sin();
+        // z stays 0 → flat.
+    }
+    let dirs_d = [0.0f32, 0.0, 1.0].repeat(n_disk);
+    let disk_obs = assembly_engine(&disk, &dirs_d, 5.0)
+        .observe_assembly()
+        .unwrap();
+    assert_eq!(disk_obs.largest_cluster, n_disk, "the disk must be one cluster");
+    assert!(
+        !disk_obs.is_closed(),
+        "a flat disk should read as OPEN (closure={:.3})",
+        disk_obs.closure
+    );
+    assert!(
+        disk_obs.closure < 0.6,
+        "flat-disk closure should be well below a shell's, got {:.3}",
+        disk_obs.closure
+    );
+    // And the gap between the two must be unambiguous, not a marginal split.
+    assert!(
+        shell_obs.closure - disk_obs.closure > 0.3,
+        "closure must clearly separate shell ({:.3}) from disk ({:.3})",
+        shell_obs.closure,
+        disk_obs.closure
+    );
+}
+
+#[test]
+fn assembly_observables_empty_graph_is_zeroed() {
+    // Guard the degenerate path: zero nodes ⇒ all-zero observables, no panic.
+    let e = assembly_engine(&[], &[], 0.5);
+    let obs: AssemblyObservables = e.observe_assembly().unwrap();
+    assert_eq!(obs.n, 0);
+    assert_eq!(obs.cluster_count, 0);
+    assert_eq!(obs.largest_cluster, 0);
+    assert_eq!(obs.nematic_s, 0.0);
+    assert_eq!(obs.closure, 0.0);
 }
 
 // ---------------------------------------------------------------------------

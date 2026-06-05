@@ -207,7 +207,7 @@ Tick these off as they land; each is one self-contained PR.
 - [x] **Phase T** — geometric: Langevin thermostat (temperature + OU noise) + equipartition canary
 - [x] **Phase W** — geometric: tunable-range cosine² attractive well (`well_depth` ε / `well_width` w_c), folded into `EnergyBreakdown::cohesion`; canaries: bound-pair → contact σ, finite range, −∇E==F, deeper-ε ⇒ faster binding, loose-cloud condensation
 - [ ] **Phase A** — geometric: per-node orientation/director + patchy (orientation-dependent) pair potential
-- [ ] **Phase O** — compute interface: promote `EngineObservables` onto `LayoutEngine` (nematic S, cluster-size, R_g)
+- [x] **Phase O** — geometric: `observe_assembly()` → `AssemblyObservables` (nematic `S`, cluster-size via union-find over a contact cutoff, mesh-free **closure** = solid-angle coverage of the centroid to tell open sheet from closed vesicle, largest-cluster `R_g`); unit tests on synthetic configs with known answers (aligned→S≈1, random→S≈0, gas→n singletons / blob→1 cluster, hollow sphere→closed / flat disk→open). Promoting onto a shared `LayoutEngine` trait method is deferred to the interface-standardization follow-up.
 - [ ] **Phase S** — geometric: self-assembly statistical canaries (ideal-chain R_g²∝N, morphology ladder)
 - [ ] **Phase C** — geometric: curvature/genus from point cloud (open sheet vs closed vesicle)
 - [ ] **Phase G** — geometric-gpu: port thermostat + attractive well + director to WGSL
