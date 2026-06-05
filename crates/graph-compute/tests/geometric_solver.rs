@@ -27,7 +27,9 @@
 //!      fixed graphs, asserted against *generous* budgets so a real algorithmic
 //!      or complexity regression trips the test without it being timing-flaky.
 
-use graph_compute::engines::geometric::{CoordinationSource, GeometricEngine, GeometricSettings};
+use graph_compute::engines::geometric::{
+    CoordinationSource, DirectorSource, GeometricEngine, GeometricSettings,
+};
 use graph_compute::engines::{
     CsrShard, EngineCtx, GeometricGpuEngine, GraphAttributes, LayoutEngine,
 };
@@ -1151,6 +1153,275 @@ fn well_condenses_a_loose_cloud() {
     assert!(
         rg_on < rg_off - 0.2,
         "the attractive well must condense the loose cloud: off={rg_off:.3} on={rg_on:.3}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 1d. DIRECTOR / PATCHY — per-node orientation + orientation-dependent well
+// ---------------------------------------------------------------------------
+//
+// Phase A adds a per-node unit director, integrated under rotational Brownian
+// motion, and makes the cohesion well orientation-dependent (patchy): the well's
+// depth for a pair scales with `1 + anisotropy_strength·(nᵢ·nⱼ)`, so ALIGNED
+// directors attract more. The orientational ground state is therefore a
+// mutually-aligned (nematic) aggregate — the bilayer-sheet precursor. The
+// closed-form-ish detector is the **nematic order parameter** S = largest
+// eigenvalue of Q = ⟨nn⟩ − I/3 (S→0 isotropic, S→1 perfectly aligned). The
+// canary: starting from a disordered (random) director field, the well +
+// anisotropy + rotational thermostat must drive S clearly upward.
+
+/// Nematic order parameter S = (3/2)·λ_max(Q), where Q = ⟨n⊗n⟩ − I/3 is the
+/// traceless orientation tensor; computed in-test (the Phase-O observable, local
+/// for now). `directors` is interleaved x,y,z. The 3/2 normalisation gives the
+/// textbook range S ∈ [0,1]: 0 isotropic, 1 perfectly aligned (S is head-tail
+/// symmetric — it does not distinguish n from −n, the physically correct nematic
+/// measure). (λ_max alone tops out at 2/3 for a perfectly aligned field.)
+fn nematic_s(directors: &[f32]) -> f32 {
+    let n = directors.len() / 3;
+    if n == 0 {
+        return 0.0;
+    }
+    // Build symmetric Q = (1/N) Σ nn - I/3 (six unique entries).
+    let (mut qxx, mut qyy, mut qzz) = (0.0f64, 0.0f64, 0.0f64);
+    let (mut qxy, mut qxz, mut qyz) = (0.0f64, 0.0f64, 0.0f64);
+    for i in 0..n {
+        let (x, y, z) = (
+            directors[3 * i] as f64,
+            directors[3 * i + 1] as f64,
+            directors[3 * i + 2] as f64,
+        );
+        qxx += x * x;
+        qyy += y * y;
+        qzz += z * z;
+        qxy += x * y;
+        qxz += x * z;
+        qyz += y * z;
+    }
+    let inv = 1.0 / n as f64;
+    let third = 1.0 / 3.0;
+    let (qxx, qyy, qzz) = (qxx * inv - third, qyy * inv - third, qzz * inv - third);
+    let (qxy, qxz, qyz) = (qxy * inv, qxz * inv, qyz * inv);
+
+    // Largest eigenvalue of the symmetric 3×3 via the closed-form trigonometric
+    // method (Smith 1961). Q is traceless, but the formula holds generally.
+    let p1 = qxy * qxy + qxz * qxz + qyz * qyz;
+    if p1 < 1e-18 {
+        // Diagonal already: largest diagonal entry is the largest eigenvalue.
+        return (1.5 * qxx.max(qyy).max(qzz)) as f32;
+    }
+    let q = (qxx + qyy + qzz) / 3.0; // = 0 (traceless), kept for generality
+    let p2 = (qxx - q).powi(2) + (qyy - q).powi(2) + (qzz - q).powi(2) + 2.0 * p1;
+    let p = (p2 / 6.0).sqrt();
+    // B = (1/p)(Q - qI); det(B)/2 = cos(3φ).
+    let (bxx, byy, bzz) = ((qxx - q) / p, (qyy - q) / p, (qzz - q) / p);
+    let (bxy, bxz, byz) = (qxy / p, qxz / p, qyz / p);
+    let det_b = bxx * (byy * bzz - byz * byz) - bxy * (bxy * bzz - byz * bxz)
+        + bxz * (bxy * byz - byy * bxz);
+    let r = (det_b / 2.0).clamp(-1.0, 1.0);
+    let phi = r.acos() / 3.0;
+    // Largest eigenvalue = q + 2p·cos(phi); S = (3/2)·λ_max.
+    (1.5 * (q + 2.0 * p * phi.cos())) as f32
+}
+
+#[test]
+fn nematic_s_detects_known_order() {
+    // Sanity for the in-test observable: a perfectly aligned field → S = 1, an
+    // isotropic field (axes) → S ≈ 0. Guards against a broken eigensolver giving
+    // a false "ordering" signal in the patchy canary below.
+    let aligned: Vec<f32> = (0..50).flat_map(|_| [0.0f32, 0.0, 1.0]).collect();
+    let s_aligned = nematic_s(&aligned);
+    assert!(
+        (s_aligned - 1.0).abs() < 1e-3,
+        "aligned field should give S≈1, got {s_aligned}"
+    );
+    // Equal thirds along x, y, z ⇒ Q = 0 ⇒ S = 0.
+    let mut iso = Vec::new();
+    for axis in 0..3 {
+        for _ in 0..20 {
+            let mut v = [0.0f32; 3];
+            v[axis] = 1.0;
+            iso.extend_from_slice(&v);
+        }
+    }
+    let s_iso = nematic_s(&iso);
+    assert!(s_iso < 0.05, "isotropic field should give S≈0, got {s_iso}");
+}
+
+#[test]
+fn patchy_well_drives_nematic_alignment() {
+    // A population of patchy particles in a small box: the attractive well + the
+    // orientation anisotropy + the rotational thermostat must take a DISORDERED
+    // (random-director) seed to a clearly ALIGNED aggregate — the nematic order
+    // parameter S rises from ~0 toward a high value.
+    let radius = 0.5f32;
+    let n = 64usize;
+
+    // Pack into a 4×4×4 grid spaced *within* the well so every neighbour cohering
+    // pair exerts an aligning torque (the spatial overlap the patchy term needs).
+    let spacing = 1.2f32; // > σ = 1.0 but inside σ + w_c
+    let mut seed = vec![0.0f32; 3 * n];
+    let mut k = 0usize;
+    for ix in 0..4 {
+        for iy in 0..4 {
+            for iz in 0..4 {
+                seed[3 * k] = (ix as f32 - 1.5) * spacing;
+                seed[3 * k + 1] = (iy as f32 - 1.5) * spacing;
+                seed[3 * k + 2] = (iz as f32 - 1.5) * spacing;
+                k += 1;
+            }
+        }
+    }
+
+    let settings = GeometricSettings {
+        // Free (unbonded) particles — alignment must come from the patchy well,
+        // not from bonds.
+        edge_stiffness: 0.0,
+        angle_stiffness: 0.0,
+        affinity_strength: 0.0,
+        gravity: 0.0,
+        exclusion_strength: 1.0,
+        class_radius: vec![radius],
+        default_radius: radius,
+        // Patchy well ON: deep + wide enough to bind, strongly anisotropic so the
+        // aligned configuration is clearly favoured.
+        well_depth: 2.0,
+        well_width: 1.5,
+        anisotropy_strength: 2.0,
+        // Modest rotational diffusion: enough to let directors escape the random
+        // seed and explore, but well below the aligning torque so the nematic
+        // ground state wins (the order/disorder balance is the coupling/noise
+        // ratio — too much noise melts the alignment).
+        rotational_diffusion: 0.15,
+        director_source: DirectorSource::Random, // DISORDERED seed
+        // Low temperature: enough to let positions/directors settle out of the
+        // random seed, cold enough that the nematic aggregate does not re-melt.
+        temperature: 0.1,
+        rng_seed: 0xA11C_E000_1234_5678,
+        damping: 0.6,
+        time_step: 0.4,
+        max_step: 0.3,
+        ..GeometricSettings::default()
+    };
+
+    let mut e = GeometricEngine::new();
+    e.set_params(&serde_json::to_value(&settings).unwrap()).unwrap();
+    let mut ctx = EngineCtx::cpu_only();
+    e.init(&mut ctx, &CsrShard::whole(&no_edges(n)), &seed)
+        .expect("init");
+
+    // The random seed must actually be disordered (else the test is vacuous).
+    let s_start = nematic_s(e.directors().expect("directors present"));
+    assert!(
+        s_start < 0.35,
+        "random director seed should start near-isotropic, got S={s_start:.3}"
+    );
+
+    // Relax; time-average S over the tail to read the ordered steady state past
+    // the thermal jitter.
+    let steps = 4_000usize;
+    let burn_in = 2_000usize;
+    let mut s_tail = Vec::new();
+    for step in 0..steps {
+        let _ = e.step(&mut ctx);
+        if step >= burn_in && step % 25 == 0 {
+            s_tail.push(nematic_s(e.directors().unwrap()));
+        }
+    }
+    let s_end = s_tail.iter().sum::<f32>() / s_tail.len() as f32;
+    eprintln!(
+        "patchy alignment: S {s_start:.3} (disordered seed) -> {s_end:.3} (aligned aggregate)"
+    );
+
+    // The aligned aggregate must be clearly more ordered than the disordered seed.
+    // The steady-state S sits near 0.97 here; require a large, unambiguous rise so
+    // a regression that breaks the orientation coupling (or the patchy well) trips
+    // this loudly rather than passing on a marginal fluctuation.
+    assert!(
+        s_end > s_start + 0.4 && s_end > 0.7,
+        "patchy well should drive nematic alignment: S {s_start:.3} -> {s_end:.3}"
+    );
+}
+
+#[test]
+fn directors_are_static_at_zero_temperature() {
+    // Determinism guard: at temperature 0 the rotational thermostat injects ZERO
+    // noise, so the director field is frozen at its seed even with the patchy well
+    // and anisotropy fully ON. (The aligning torque alone could still rotate
+    // directors, but a *pure minimizer* at T=0 must reach a static configuration —
+    // here the seed is already a uniform-z fixed point of the aligning field, so
+    // nothing moves.) This is the rotational analogue of the T=0 pure-minimizer
+    // guarantee for positions.
+    let radius = 0.5f32;
+    let n = 16usize;
+    let mut seed = vec![0.0f32; 3 * n];
+    for i in 0..n {
+        seed[3 * i] = (i as f32) * 0.9; // a loose line, some pairs within the well
+    }
+    let mut s = cohesion_only(radius, 2.0, 1.5);
+    s.temperature = 0.0; // no rotational noise
+    s.anisotropy_strength = 1.0;
+    s.director_source = DirectorSource::AlignedZ; // a fixed point of the torque
+    let mut e = GeometricEngine::new();
+    e.set_params(&serde_json::to_value(&s).unwrap()).unwrap();
+    let mut ctx = EngineCtx::cpu_only();
+    e.init(&mut ctx, &CsrShard::whole(&no_edges(n)), &seed)
+        .unwrap();
+    let before = e.directors().unwrap().to_vec();
+    for _ in 0..200 {
+        let _ = e.step(&mut ctx);
+    }
+    let after = e.directors().unwrap().to_vec();
+    assert_eq!(
+        before, after,
+        "directors must be static at temperature == 0 (no rotational noise)"
+    );
+}
+
+#[test]
+fn directors_do_not_affect_forces_without_anisotropy() {
+    // Backward-compat guarantee: with anisotropy 0 (the default) the director
+    // field — however it is seeded or however it rotates under the thermostat —
+    // has NO effect on the dynamics. A random director field and a uniform one
+    // must produce *byte-identical* positions, because the well's orientation
+    // factor is identically 1. This is what keeps the golden master untouched.
+    let radius = 0.5f32;
+    let n = 27usize;
+    let spacing = 1.2f32;
+    let mut seed = vec![0.0f32; 3 * n];
+    let mut k = 0usize;
+    for ix in 0..3 {
+        for iy in 0..3 {
+            for iz in 0..3 {
+                seed[3 * k] = (ix as f32 - 1.0) * spacing;
+                seed[3 * k + 1] = (iy as f32 - 1.0) * spacing;
+                seed[3 * k + 2] = (iz as f32 - 1.0) * spacing;
+                k += 1;
+            }
+        }
+    }
+
+    let run = |director_source: DirectorSource| -> Vec<f32> {
+        let mut s = cohesion_only(radius, 2.0, 1.5);
+        s.temperature = 0.0; // deterministic positions
+        s.anisotropy_strength = 0.0; // patchy OFF ⇒ orientation must be irrelevant
+        s.director_source = director_source;
+        let mut e = GeometricEngine::new();
+        e.set_params(&serde_json::to_value(&s).unwrap()).unwrap();
+        let mut ctx = EngineCtx::cpu_only();
+        e.init(&mut ctx, &CsrShard::whole(&no_edges(n)), &seed)
+            .unwrap();
+        let mut pos = seed.clone();
+        for _ in 0..300 {
+            pos = e.step(&mut ctx).positions;
+        }
+        pos
+    };
+
+    let random_dirs = run(DirectorSource::Random);
+    let aligned_dirs = run(DirectorSource::AlignedZ);
+    assert_eq!(
+        random_dirs, aligned_dirs,
+        "with anisotropy == 0 the director field must not affect positions"
     );
 }
 

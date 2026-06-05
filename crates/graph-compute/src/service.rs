@@ -149,6 +149,10 @@ fn proto_attrs_to_host(a: ProtoGraphAttributes) -> Result<HostGraphAttributes, S
         node_coordination: cast_u32("node_coordination", &a.node_coordination)?,
         node_mass: cast_f32("node_mass", &a.node_mass)?,
         edge_len: cast_f32("edge_len", &a.edge_len)?,
+        // No wire field yet for the per-node director (the proto is a follow-up
+        // phase); injected directors are not reachable over the wire today, so
+        // this stays `None` and the engine falls back to its structural source.
+        node_director: None,
     })
 }
 

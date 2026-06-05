@@ -234,6 +234,11 @@ pub struct GraphAttributes {
     /// synthesized unique-edge order) keeps the mapping unambiguous across the
     /// wire. Frontend-resolved from edge weight / type.
     pub edge_len: Option<Vec<f32>>,
+    /// Per-node unit director (orientation), **interleaved x,y,z**, length
+    /// `3·n_nodes`. Drives the geometric engine's orientation-dependent (patchy)
+    /// cohesion well. Frontend-resolved from an orientation field; consumed only
+    /// when the engine's `director_source = injected`.
+    pub node_director: Option<Vec<f32>>,
 }
 
 impl GraphAttributes {
@@ -266,6 +271,15 @@ impl GraphAttributes {
                 return Err(format!(
                     "GraphAttributes.edge_len length {} != neighbors.len() {m}",
                     v.len()
+                ));
+            }
+        }
+        if let Some(v) = &self.node_director {
+            if v.len() != 3 * n {
+                return Err(format!(
+                    "GraphAttributes.node_director length {} != 3 * n_nodes {}",
+                    v.len(),
+                    3 * n
                 ));
             }
         }

@@ -138,6 +138,29 @@ impl Default for MassSource {
     }
 }
 
+/// How each node's **director** (the per-node unit orientation that drives the
+/// patchy / orientation-dependent cohesion well) is initialised.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum DirectorSource {
+    /// Random unit vectors drawn from the engine's seeded RNG (a disordered
+    /// orientation field — the natural seed for a self-assembly run, where the
+    /// rotational thermostat then drives them toward an aligned ground state).
+    Random,
+    /// Every node's director points along `+z` (a pre-aligned field — useful to
+    /// seed a configuration that is already nematic, e.g. for stability tests).
+    AlignedZ,
+    /// Read per-node directors (interleaved x,y,z, length `3n`) from the injected
+    /// [`GraphAttributes`]. Semantic — the frontend resolved an orientation field.
+    Injected,
+}
+
+impl Default for DirectorSource {
+    fn default() -> Self {
+        DirectorSource::Random
+    }
+}
+
 /// How each edge's **target length** is chosen.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -170,6 +193,8 @@ pub struct GeometricSettings {
     pub coordination_source: CoordinationSource,
     pub mass_source: MassSource,
     pub edge_length_source: EdgeLengthSource,
+    /// How each node's orientation **director** is initialised (patchy well).
+    pub director_source: DirectorSource,
 
     // --- edge length constraint ---
     /// Target length for [`EdgeLengthSource::Uniform`] (and the fallback for any
@@ -268,6 +293,33 @@ pub struct GeometricSettings {
     /// `temperature > 0` run reproducible (so the statistical canaries are
     /// stable). Unused when `temperature == 0`.
     pub rng_seed: u64,
+
+    // --- per-node orientation (director) + patchy pair term ---
+    /// Anisotropy strength of the orientation-dependent (patchy) cohesion well.
+    /// `0` ⇒ OFF: the well is fully **isotropic** (orientation factor ≡ 1), so
+    /// default-settings behaviour — and the golden-master regression — is
+    /// byte-identical to before directors existed. `> 0` makes the attractive
+    /// well **orientation-dependent**: the effective depth of a pair's well is
+    /// scaled by `1 + anisotropy_strength·(nᵢ·nⱼ)` (clamped ≥ 0), so pairs whose
+    /// directors are **aligned** (`nᵢ·nⱼ → +1`) attract *more* and **anti-aligned**
+    /// pairs attract *less* (or not at all). With the directors free to rotate
+    /// under rotational Brownian motion, the system's low-energy state is a
+    /// mutually-aligned (nematic) aggregate — a flat bilayer-like sheet — which is
+    /// the prerequisite for the later curvature coupling (tube/vesicle). See
+    /// `docs/self-assembly-plan.md` §5. Gated on [`well_depth`](Self::well_depth) `> 0`
+    /// (no well ⇒ nothing to modulate).
+    pub anisotropy_strength: f32,
+    /// Rotational diffusion coefficient for the per-node director's Brownian
+    /// motion, as a fraction of the *translational* thermal scale. At
+    /// `temperature > 0` each director takes a small random rotation per step
+    /// whose angular variance is `rotational_diffusion · kT · dt` (an
+    /// Ornstein–Uhlenbeck-style step on the orientation), then is renormalised to
+    /// a unit vector. `0` (or `temperature == 0`) ⇒ directors are **static** (the
+    /// orientation field is frozen at its initial values, preserving determinism).
+    /// This is the rotational analogue of the translational thermostat; it lets
+    /// orientations explore so a patchy aggregate can find its aligned ground
+    /// state rather than freezing into the random seed.
+    pub rotational_diffusion: f32,
 }
 
 impl Default for GeometricSettings {
@@ -277,6 +329,7 @@ impl Default for GeometricSettings {
             coordination_source: CoordinationSource::default(),
             mass_source: MassSource::default(),
             edge_length_source: EdgeLengthSource::default(),
+            director_source: DirectorSource::default(),
 
             edge_rest_len: 1.0,
             edge_stiffness: 0.3,
@@ -315,6 +368,14 @@ impl Default for GeometricSettings {
             // and the golden-master regression byte-identical.
             temperature: 0.0,
             rng_seed: 0x5EED_1234_ABCD_F00D,
+
+            // Default OFF: anisotropy 0 ⇒ the well is isotropic (orientation
+            // factor ≡ 1) ⇒ default behaviour is byte-identical (golden-master
+            // unaffected). rotational_diffusion has a sensible non-zero default so
+            // enabling the patchy well only takes setting anisotropy_strength (the
+            // directors then explore toward their aligned ground state).
+            anisotropy_strength: 0.0,
+            rotational_diffusion: 1.0,
         }
     }
 }
@@ -360,9 +421,18 @@ struct State {
     /// CSR adjacency (owned copy) for the per-node angle pass.
     graph: CsrGraph,
     resolved: Resolved,
+    /// Per-node unit directors (interleaved x,y,z, length `3n`) — the orientation
+    /// field the patchy cohesion well couples to. Rotated by `integrate_directors`
+    /// under rotational Brownian motion; static at `temperature == 0`.
+    directors: Vec<f32>,
     /// Langevin thermostat RNG state (SplitMix64). Advanced once per stochastic
     /// degree of freedom in `integrate`; inert when `temperature == 0`.
     rng: u64,
+    /// Independent RNG stream for the *rotational* thermostat (director Brownian
+    /// motion). Kept separate from `rng` so the director integration never
+    /// perturbs the translational thermostat's stream — every existing
+    /// temperature>0 canary (equipartition, ideal-chain) stays byte-identical.
+    rot_rng: u64,
 }
 
 /// Geometric constraint engine. Uninitialized until [`LayoutEngine::init`].
@@ -611,6 +681,16 @@ impl GeometricEngine {
     }
 }
 
+impl GeometricEngine {
+    /// The current per-node director field (interleaved x,y,z, length `3n`), or
+    /// `None` before [`init`](LayoutEngine::init). Exposed so the validation
+    /// harness can compute orientational order parameters (the nematic `S`) on the
+    /// live orientation field — the Phase-O observable, computed in-test for now.
+    pub fn directors(&self) -> Option<&[f32]> {
+        self.state.as_ref().map(|st| st.directors.as_slice())
+    }
+}
+
 impl LayoutEngine for GeometricEngine {
     fn descriptor(&self) -> &LayoutDescriptor {
         &self.descriptor
@@ -642,14 +722,22 @@ impl LayoutEngine for GeometricEngine {
             ));
         }
         let resolved = Self::resolve(&self.settings, g, graph.attributes)?;
+        // Director RNG: a stream distinct from the thermostat's (different fixed
+        // mix constant) so building the orientation field can't shift the
+        // translational thermostat stream — backward-compat for every T>0 canary.
+        let mut director_rng = self.settings.rng_seed ^ 0xD1EC_70F0_FACE_B00C;
+        let directors =
+            resolve_directors(&self.settings, n, graph.attributes, &mut director_rng)?;
         self.state = Some(State {
             n,
             positions: positions.to_vec(),
             velocities: vec![0.0f32; 3 * n],
             graph: g.clone(),
             resolved,
+            directors,
             // Offset off zero so a `rng_seed` of 0 is still a usable stream.
             rng: self.settings.rng_seed ^ 0x9E37_79B9_7F4A_7C15,
+            rot_rng: director_rng,
         });
         Ok(())
     }
@@ -677,6 +765,7 @@ impl LayoutEngine for GeometricEngine {
 fn step_forces(st: &mut State, s: &GeometricSettings) {
     let force = compute_forces(st, s);
     integrate(st, &force, s);
+    integrate_directors(st, s);
 }
 
 /// Accumulate every geometric force into a fresh `3n` vector **without**
@@ -748,7 +837,9 @@ fn potential_energy(st: &State, s: &GeometricSettings) -> EnergyBreakdown {
             if d < sigma {
                 exclusion += s.exclusion_strength as f64 * (sigma * (sigma / d).ln() - (sigma - d));
             }
-            let eps = pair_well_depth(s, nc, class[i] as usize, class[j] as usize) as f64;
+            let eps = (pair_well_depth(s, nc, class[i] as usize, class[j] as usize)
+                * orientation_factor(&st.directors, s.anisotropy_strength, i, j))
+                as f64;
             if eps > 0.0 {
                 if d < sigma {
                     cohesion -= eps;
@@ -964,7 +1055,10 @@ fn accumulate_exclusion_affinity(force: &mut [f32], st: &State, s: &GeometricSet
             let sigma = (ri + rj).max(1e-3);
             // The attractive well's tail reaches σ + w_c, which may exceed the
             // exclusion/affinity cutoff — extend so the well is never clipped.
-            let eps = pair_well_depth(s, nc, class[i] as usize, class[j] as usize);
+            // The orientation (patchy) factor scales the well depth per pair: at
+            // anisotropy 0 it is 1 (isotropic ⇒ byte-identical default).
+            let eps = pair_well_depth(s, nc, class[i] as usize, class[j] as usize)
+                * orientation_factor(&st.directors, s.anisotropy_strength, i, j);
             let cutoff = (s.cutoff_scale * sigma).max(if eps > 0.0 { sigma + wc } else { 0.0 });
 
             let dx = pos[3 * j] - pos[3 * i];
@@ -1078,6 +1172,129 @@ fn integrate(st: &mut State, force: &[f32], s: &GeometricSettings) {
     }
 }
 
+/// Evolve the per-node directors one step under rotational Brownian motion plus
+/// an *aligning* mean-field torque from the patchy interaction.
+///
+/// This is the rotational analogue of [`integrate`]. Two ingredients, both gated
+/// so they vanish in the default configuration:
+///
+///  - **Aligning field.** For each node `i` we accumulate a Lebwohl–Lasher-style
+///    mean-field `hᵢ = Σⱼ wᵢⱼ·nⱼ` over neighbours `j` within the well's range,
+///    weighted `wᵢⱼ` by how strongly the well couples that pair (depth × a smooth
+///    distance falloff). The torque rotates `nᵢ` toward `hᵢ` (its component
+///    perpendicular to `nᵢ`), so directors of nearby cohering particles align —
+///    the orientational ground state of the patchy potential. Active only when
+///    `anisotropy_strength > 0` (no patchiness ⇒ no preferred orientation).
+///  - **Rotational noise.** A small isotropic random kick scaled by
+///    `√(rotational_diffusion·kT·dt)`, then renormalise to a unit vector — the
+///    fluctuation that lets the field explore rather than freeze into the seed.
+///    Active only when `temperature > 0` (so `temperature == 0` keeps directors
+///    perfectly static and deterministic).
+///
+/// With both off (the default: anisotropy 0 **and/or** temperature 0) the
+/// directors are untouched and never affect the forces, so default-settings
+/// behaviour — and the golden master — is byte-identical.
+fn integrate_directors(st: &mut State, s: &GeometricSettings) {
+    let kt = s.temperature.max(0.0);
+    let noise_on = kt > 0.0 && s.rotational_diffusion > 0.0;
+    let align_on = s.anisotropy_strength > 0.0 && s.well_depth > 0.0;
+    if !noise_on && !align_on {
+        return; // directors are static — nothing (incl. RNG) is consumed
+    }
+    let n = st.n;
+    let dt = s.time_step;
+    let nc = s.class_affinity_dim as usize;
+    let class = &st.resolved.class;
+    let pos = &st.positions;
+    // Read from a snapshot so the update is synchronous (every node integrates
+    // against the previous step's orientation field, matching the force passes).
+    let dir = st.directors.clone();
+
+    // --- aligning mean-field h_i = Σ_j w_ij n_j (perpendicular part applied) ---
+    // Computed into a scratch buffer first so the update is synchronous (every
+    // node sees the *previous* step's directors, like the other force passes).
+    let mut field = vec![0.0f32; 3 * n];
+    if align_on {
+        let wc = s.well_width.max(1e-4);
+        for i in 0..n {
+            let ri = lookup_radius(&s.class_radius, class[i] as usize, s.default_radius);
+            for j in (i + 1)..n {
+                let rj = lookup_radius(&s.class_radius, class[j] as usize, s.default_radius);
+                let sigma = (ri + rj).max(1e-3);
+                let depth = pair_well_depth(s, nc, class[i] as usize, class[j] as usize);
+                if depth <= 0.0 {
+                    continue;
+                }
+                let d = pair_dist(pos, i, j);
+                // Smooth distance weight: full inside contact, cosine² decay over
+                // the well, zero beyond σ + w_c (matches the well's own range).
+                let w = if d <= sigma {
+                    depth
+                } else if d <= sigma + wc {
+                    let c = (std::f32::consts::FRAC_PI_2 * (d - sigma) / wc).cos();
+                    depth * c * c
+                } else {
+                    0.0
+                };
+                if w == 0.0 {
+                    continue;
+                }
+                for k in 0..3 {
+                    field[3 * i + k] += w * dir[3 * j + k];
+                    field[3 * j + k] += w * dir[3 * i + k];
+                }
+            }
+        }
+    }
+
+    // --- integrate each director: align toward its field + rotational noise ---
+    // Overdamped rotational step toward the field's *direction*: the aligning
+    // field h is normalised to a unit target before use, so the per-step rotation
+    // increment is bounded (∝ dt·μ) regardless of how many neighbours summed into
+    // h — an unbounded raw `μ·h` overshoots and makes the director oscillate, the
+    // head-to-head sign-flips that show up as a volatile, never-settling S.
+    let mobility = s.anisotropy_strength.min(1.0); // bounded align rate
+    let noise_sigma = if noise_on {
+        (s.rotational_diffusion * kt * dt).sqrt()
+    } else {
+        0.0
+    };
+    for i in 0..n {
+        let (nx, ny, nz) = (dir[3 * i], dir[3 * i + 1], dir[3 * i + 2]);
+        let (mut ax, mut ay, mut az) = (nx, ny, nz);
+
+        if align_on {
+            let (hx, hy, hz) = (field[3 * i], field[3 * i + 1], field[3 * i + 2]);
+            let hlen = (hx * hx + hy * hy + hz * hz).sqrt();
+            if hlen > 1e-6 {
+                // Unit alignment target, then its component perpendicular to n (a
+                // pure rotation toward the target, no stretch). The patchy energy
+                // `1 + a·(nᵢ·nⱼ)` is *polar* — it rewards same-direction alignment —
+                // so the field's own direction is the target (no hemisphere flip).
+                let (tx, ty, tz) = (hx / hlen, hy / hlen, hz / hlen);
+                let tdot = tx * nx + ty * ny + tz * nz;
+                let (px, py, pz) = (tx - tdot * nx, ty - tdot * ny, tz - tdot * nz);
+                ax += dt * mobility * px;
+                ay += dt * mobility * py;
+                az += dt * mobility * pz;
+            }
+        }
+        if noise_sigma > 0.0 {
+            ax += noise_sigma * next_gaussian(&mut st.rot_rng);
+            ay += noise_sigma * next_gaussian(&mut st.rot_rng);
+            az += noise_sigma * next_gaussian(&mut st.rot_rng);
+        }
+
+        // Renormalise back to the unit sphere (degenerate ⇒ keep the old director).
+        let len = (ax * ax + ay * ay + az * az).sqrt();
+        if len > 1e-6 {
+            st.directors[3 * i] = ax / len;
+            st.directors[3 * i + 1] = ay / len;
+            st.directors[3 * i + 2] = az / len;
+        }
+    }
+}
+
 /// One SplitMix64 step: advance `state` in place and return a scrambled `u64`.
 /// Deterministic and WASM-safe (no `getrandom`); the same generator the test
 /// seed helper uses, so the thermostat stream is reproducible from `rng_seed`.
@@ -1103,6 +1320,66 @@ fn next_gaussian(state: &mut u64) -> f32 {
     let u2 = next_uniform(state);
     let r = (-2.0 * u1.ln()).sqrt();
     (r * (std::f64::consts::TAU * u2).cos()) as f32
+}
+
+/// A uniformly-distributed point on the unit sphere (Marsaglia's method), drawn
+/// from the given SplitMix64 stream. Used to seed random directors.
+fn random_unit_vector(state: &mut u64) -> [f32; 3] {
+    loop {
+        let u = next_uniform(state) * 2.0 - 1.0;
+        let v = next_uniform(state) * 2.0 - 1.0;
+        let s = u * u + v * v;
+        if s < 1.0 && s > 1e-9 {
+            let f = 2.0 * (1.0 - s).sqrt();
+            return [(u * f) as f32, (v * f) as f32, (1.0 - 2.0 * s) as f32];
+        }
+    }
+}
+
+/// Build the per-node director field (interleaved x,y,z, length `3n`) from the
+/// chosen [`DirectorSource`]. Random directors consume `rng`; injected directors
+/// are normalised to unit length (a zero/non-finite injected vector falls back to
+/// `+z`). The field is built unconditionally — but it only enters the forces when
+/// `anisotropy_strength > 0`, so a default run (anisotropy 0) is byte-identical.
+fn resolve_directors(
+    s: &GeometricSettings,
+    n: usize,
+    attrs: Option<&GraphAttributes>,
+    rng: &mut u64,
+) -> Result<Vec<f32>, String> {
+    let mut d = vec![0.0f32; 3 * n];
+    match &s.director_source {
+        DirectorSource::Random => {
+            for i in 0..n {
+                let u = random_unit_vector(rng);
+                d[3 * i] = u[0];
+                d[3 * i + 1] = u[1];
+                d[3 * i + 2] = u[2];
+            }
+        }
+        DirectorSource::AlignedZ => {
+            for i in 0..n {
+                d[3 * i + 2] = 1.0;
+            }
+        }
+        DirectorSource::Injected => {
+            let src = attrs.and_then(|a| a.node_director.clone()).ok_or_else(|| {
+                "director_source = injected but GraphAttributes.node_director is absent".to_string()
+            })?;
+            for i in 0..n {
+                let (x, y, z) = (src[3 * i], src[3 * i + 1], src[3 * i + 2]);
+                let len = (x * x + y * y + z * z).sqrt();
+                if len.is_finite() && len > 1e-6 {
+                    d[3 * i] = x / len;
+                    d[3 * i + 1] = y / len;
+                    d[3 * i + 2] = z / len;
+                } else {
+                    d[3 * i + 2] = 1.0; // degenerate ⇒ default +z
+                }
+            }
+        }
+    }
+    Ok(d)
 }
 
 // ---------------------------------------------------------------------------
@@ -1159,6 +1436,24 @@ fn lookup_affinity(matrix: &[f32], n: usize, a: usize, b: usize) -> f32 {
 /// (so a repulsive class pair never also attracts via cohesion). With no affinity
 /// matrix (`class_affinity_dim == 0`) the well applies uniformly at full depth —
 /// the simple monomer case. Returns `0` (OFF) whenever `well_depth == 0`.
+/// Orientation (patchy) factor multiplying a pair's cohesion-well depth.
+///
+/// Returns `max(0, 1 + anisotropy_strength·(nᵢ·nⱼ))`: at `anisotropy_strength == 0`
+/// it is identically `1` (isotropic — the byte-identical default). Otherwise pairs
+/// whose directors are **aligned** (`nᵢ·nⱼ → +1`) get a deeper well (attract more)
+/// and **anti-aligned** pairs a shallower/zero well, so the system's low-energy
+/// state is a mutually-aligned (nematic) aggregate — the bilayer-sheet precursor.
+/// Clamped at 0 so the well never *inverts* into a spurious repulsion.
+fn orientation_factor(directors: &[f32], anisotropy: f32, i: usize, j: usize) -> f32 {
+    if anisotropy == 0.0 {
+        return 1.0;
+    }
+    let dot = directors[3 * i] * directors[3 * j]
+        + directors[3 * i + 1] * directors[3 * j + 1]
+        + directors[3 * i + 2] * directors[3 * j + 2];
+    (1.0 + anisotropy * dot).max(0.0)
+}
+
 fn pair_well_depth(s: &GeometricSettings, nc: usize, a: usize, b: usize) -> f32 {
     if s.well_depth <= 0.0 {
         return 0.0;
