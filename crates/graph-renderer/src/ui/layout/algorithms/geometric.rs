@@ -24,6 +24,9 @@ pub fn factory() -> LayoutFactory {
 }
 
 fn default_settings_json() -> Value {
+    // `mut` is only needed on the wasm32 branch below (which overrides
+    // `config.url`); on native nothing mutates it.
+    #[cfg_attr(not(target_arch = "wasm32"), allow(unused_mut))]
     let mut config = LensConfig::default();
     // On WASM, default to the same host we were loaded from.
     #[cfg(target_arch = "wasm32")]

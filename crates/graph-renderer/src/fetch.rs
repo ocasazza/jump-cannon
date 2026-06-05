@@ -213,7 +213,7 @@ impl ApiClient {
                 }
             };
             eprintln!("Connected to layout stream");
-let (_write, mut read) = ws_stream.split();
+            let (_write, read) = ws_stream.split();
             let mut read: futures::stream::SplitStream<_> = read;
             while let Some(msg) = read.next().await {
                 match msg {
