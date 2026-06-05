@@ -481,9 +481,16 @@ fn prost_value_to_json(v: prost_types::Value) -> serde_json::Value {
     use prost_types::value::Kind;
     match v.kind {
         None | Some(Kind::NullValue(_)) => serde_json::Value::Null,
-        Some(Kind::NumberValue(n)) => serde_json::Number::from_f64(n)
-            .map(serde_json::Value::Number)
-            .unwrap_or(serde_json::Value::Null),
+        // A protobuf `Struct` carries EVERY number as an f64 (it has no integer
+        // kind). If we hand that straight back as a float `serde_json::Number`,
+        // serde's integer-field decoders REJECT it — e.g. decoding
+        // `GeometricSettings { class_affinity_dim: u32, max_angle_pairs: u32,
+        // rng_seed: u64, … }` fails with "invalid type: floating point `1.0`,
+        // expected u32", which silently broke the geometric engine's Subscribe
+        // init over the wire. So coerce a whole-valued, in-range double back to a
+        // JSON integer here. This is safe for float fields too: serde happily
+        // deserializes an integer JSON number into f32/f64.
+        Some(Kind::NumberValue(n)) => number_value_to_json(n),
         Some(Kind::StringValue(s)) => serde_json::Value::String(s),
         Some(Kind::BoolValue(b)) => serde_json::Value::Bool(b),
         Some(Kind::StructValue(s)) => struct_to_json(s),
@@ -491,6 +498,24 @@ fn prost_value_to_json(v: prost_types::Value) -> serde_json::Value {
             l.values.into_iter().map(prost_value_to_json).collect(),
         ),
     }
+}
+
+/// Map a protobuf `Struct` number (always f64) back to a `serde_json` number,
+/// preferring an INTEGER representation when the value is whole and in range so
+/// integer-typed engine settings (`u32`/`u64`/`i64`) decode. Non-integers and
+/// out-of-range / non-finite values fall back to the f64 form.
+fn number_value_to_json(n: f64) -> serde_json::Value {
+    if n.is_finite() && n.fract() == 0.0 {
+        if n >= 0.0 && n <= u64::MAX as f64 {
+            return serde_json::Value::Number((n as u64).into());
+        }
+        if n >= i64::MIN as f64 && n <= i64::MAX as f64 {
+            return serde_json::Value::Number((n as i64).into());
+        }
+    }
+    serde_json::Number::from_f64(n)
+        .map(serde_json::Value::Number)
+        .unwrap_or(serde_json::Value::Null)
 }
 
 fn json_to_prost_value(v: serde_json::Value) -> prost_types::Value {
@@ -579,6 +604,74 @@ pub async fn run_sim_loop(state: Arc<SimState>, _tick_hz: f32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// REGRESSION (the bug the user hit): geometric engine settings must survive
+    /// the full wire round-trip `serde_json::Value → prost Struct → Value` and
+    /// still decode. A protobuf `Struct` flattens every number to f64, so before
+    /// the `number_value_to_json` integer-coercion this failed with
+    /// "decode geometric settings: invalid type: floating point `1.0`,
+    /// expected u32" and the geometric Subscribe init never succeeded. This test
+    /// exercises the EXACT path graph-api uses (json_to_struct on send,
+    /// struct_to_json on receive) for both the CPU and GPU geometric engines —
+    /// the coverage the direct-struct unit tests were missing.
+    #[test]
+    fn geometric_settings_survive_struct_roundtrip_and_decode() {
+        use crate::engines::geometric::{ClassSource, GeometricSettings, MassSource};
+        use crate::engines::{GeometricEngine, GeometricGpuEngine, LayoutEngine};
+
+        // Settings with integer-typed fields populated (u32 + u64 + nested enum
+        // u32s) — exactly what tripped the f64-only Struct.
+        let settings = GeometricSettings {
+            max_angle_pairs: 64,
+            class_affinity_dim: 2,
+            class_affinity: vec![1.0, -1.0, -1.0, 1.0],
+            rng_seed: 42,
+            class_source: ClassSource::Community { passes: 8 },
+            mass_source: MassSource::PageRank {
+                damping_milli: 850,
+                iters: 40,
+            },
+            ..GeometricSettings::default()
+        };
+
+        // Send side (graph-api): Value → Struct (numbers collapse to f64).
+        let value = serde_json::to_value(&settings).expect("serialize settings");
+        let wire_struct = json_to_struct(value);
+        // Receive side (graph-compute service.rs): Struct → Value.
+        let decoded_value = struct_to_json(wire_struct);
+
+        // Both engines must accept the round-tripped params (this is where the
+        // original "invalid type: floating point `1.0`, expected u32" fired).
+        GeometricEngine::new()
+            .set_params(&decoded_value)
+            .expect("CPU geometric must decode round-tripped settings");
+        GeometricGpuEngine::new()
+            .set_params(&decoded_value)
+            .expect("GPU geometric must decode round-tripped settings");
+
+        // And the integer values must survive intact.
+        let back: GeometricSettings =
+            serde_json::from_value(decoded_value).expect("re-decode settings");
+        assert_eq!(back.max_angle_pairs, 64);
+        assert_eq!(back.class_affinity_dim, 2);
+        assert_eq!(back.rng_seed, 42);
+        assert_eq!(back.class_source, ClassSource::Community { passes: 8 });
+        assert_eq!(
+            back.mass_source,
+            MassSource::PageRank { damping_milli: 850, iters: 40 }
+        );
+    }
+
+    #[test]
+    fn number_value_coercion_keeps_floats_and_ints() {
+        // Whole values → integer JSON numbers (so u32/u64 decode); fractional →
+        // float (so f32 fields keep precision).
+        assert_eq!(number_value_to_json(1.0), serde_json::json!(1));
+        assert!(number_value_to_json(1.0).is_u64());
+        assert_eq!(number_value_to_json(0.0), serde_json::json!(0));
+        assert!(number_value_to_json(1.5).as_f64().unwrap() == 1.5);
+        assert!(number_value_to_json(-3.0).as_i64() == Some(-3));
+    }
 
     #[test]
     fn test_proto_attrs_to_host() {
