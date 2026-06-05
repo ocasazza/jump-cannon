@@ -456,6 +456,31 @@ impl<'a> egui_tiles::Behavior<PaneKind> for TileBehavior<'a> {
         // drag-to-reorder, drag-to-tab, and drag-between-containers in
         // egui_tiles — without it the tree is static.
         let header_response = ui.horizontal(|ui| {
+            // Traffic-light cluster (top-left) via the shared helper, so
+            // tiled panes match the floating chrome. For a tiled pane:
+            //   red    close    → Close the pane
+            //   yellow minimize → Float (un-tile back to a floating
+            //                     window) — collapse out of the grid,
+            //                     distinct from close
+            //   green  maximize → omitted (a pane has no maximize state;
+            //                     the green dot would have nothing sane to
+            //                     toggle). Tiling-specific split controls
+            //                     stay on the right.
+            // Empty placeholders are scaffolding, not windows: only the
+            // red close dot (remove placeholder) is meaningful.
+            let is_empty = matches!(pane, PaneKind::Empty);
+            let lights = crate::ui::traffic_lights::TrafficLights::all()
+                .show_minimize(!is_empty)
+                .show_maximize(false);
+            let action = crate::ui::traffic_lights::show(ui, lights);
+            if action.close {
+                self.ops.push(PaneOp::Close(tile_id, pane.clone()));
+            }
+            if action.minimize {
+                self.ops.push(PaneOp::Float(tile_id, pane.clone()));
+            }
+
+            ui.add_space(8.0);
             ui.label(
                 egui::RichText::new(pane.title())
                     .font(theme::mono(theme::font_size::HEADING))
@@ -464,20 +489,8 @@ impl<'a> egui_tiles::Behavior<PaneKind> for TileBehavior<'a> {
             ui.with_layout(
                 egui::Layout::right_to_left(egui::Align::Center),
                 |ui| {
-                    if matches!(pane, PaneKind::Empty) {
-                        // Empty placeholders only show split buttons; X
-                        // removes the placeholder, float is meaningless.
-                        if ui.small_button("X").on_hover_text("Remove placeholder").clicked() {
-                            self.ops.push(PaneOp::Close(tile_id, pane.clone()));
-                        }
-                    } else {
-                        if ui.small_button("X").on_hover_text("Close panel").clicked() {
-                            self.ops.push(PaneOp::Close(tile_id, pane.clone()));
-                        }
-                        if ui.small_button("\u{2922}").on_hover_text("Float (un-tile)").clicked() {
-                            self.ops.push(PaneOp::Float(tile_id, pane.clone()));
-                        }
-                    }
+                    // Tiling-specific affordances (not window chrome):
+                    // split this pane vertically / horizontally.
                     if ui.small_button("\u{229E}").on_hover_text("Split vertically").clicked() {
                         self.ops.push(PaneOp::SplitV(tile_id));
                     }

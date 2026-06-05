@@ -970,6 +970,14 @@ pub struct AppState {
     /// Session-scoped, never persisted.
     #[serde(skip)]
     pub focused_panel: Option<FocusedPanel>,
+    /// Floating panels the user "minimized" (yellow traffic light) —
+    /// rendered as just their header chrome (title + traffic lights),
+    /// body suppressed, until the green/yellow light expands them again.
+    /// Session-scoped scratch: never persisted (`#[serde(skip)]`) so it
+    /// doesn't require a persist-version bump, and a fresh tab starts
+    /// with everything expanded.
+    #[serde(skip)]
+    pub collapsed_panels: std::collections::HashSet<PanelId>,
     /// Generate-section state: the editable Nix expression plus one-shot
     /// outputs (last node/edge counts, last eval error, and the pending
     /// generated graph awaiting promotion to the GPU). The
@@ -1309,6 +1317,7 @@ impl Default for AppState {
             frontend_events: FrontendEventLog::default(),
             compute: ComputeEngineState::default(),
             focused_panel: None,
+            collapsed_panels: std::collections::HashSet::new(),
             generate: GenerateState::with_demo(),
         }
     }

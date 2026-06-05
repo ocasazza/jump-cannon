@@ -16,6 +16,7 @@ use crate::ui::squircle;
 use crate::ui::state::{FocusedPanel, PanelId};
 use crate::ui::theme::{self, palette};
 use crate::ui::tiles::Placement;
+use crate::ui::traffic_lights;
 
 /// Builder for a squircle-backed floating panel whose visibility is
 /// driven by a caller-owned `&mut bool`.
@@ -39,6 +40,13 @@ pub struct FloatingPanel<'p> {
     /// concept that gates canvas-scroll-zoom while panel scroll is
     /// active.
     focus: Option<(&'p mut Option<FocusedPanel>, FocusedPanel)>,
+    /// Optional collapse channel driven by the yellow "minimize" traffic
+    /// light. When `Some`, clicking minimize toggles `*collapsed`; while
+    /// `*collapsed` the panel renders only its header chrome (title +
+    /// traffic lights) and suppresses `body`. When `None`, the minimize
+    /// dot is hidden — a panel with no collapse target shouldn't claim
+    /// to have one.
+    collapsed: Option<&'p mut bool>,
 }
 
 impl<'p> FloatingPanel<'p> {
@@ -50,7 +58,16 @@ impl<'p> FloatingPanel<'p> {
             default_size: None,
             placement: None,
             focus: None,
+            collapsed: None,
         }
+    }
+
+    /// Plumb a collapse flag through the header. Enables the yellow
+    /// "minimize" traffic light, which collapses the panel to just its
+    /// header row.
+    pub fn with_collapsed(mut self, collapsed: &'p mut bool) -> Self {
+        self.collapsed = Some(collapsed);
+        self
     }
 
     /// Plumb a focus channel through the panel. See [`Self::focus`].
@@ -113,6 +130,13 @@ impl<'p> FloatingPanel<'p> {
 
         let title = self.title;
         let mut placement = self.placement;
+        let mut collapsed = self.collapsed;
+        // Snapshot collapse state for the body gate below. The traffic-
+        // light helper toggles `*collapsed` in place during the header
+        // draw, so capture the pre-draw value to decide whether to run
+        // `body` this frame (toggling collapse takes effect next frame —
+        // standard egui single-pass behavior).
+        let is_collapsed = collapsed.as_deref().copied().unwrap_or(false);
 
         // Decide focus stroke up front so the squircle paint inside the
         // closure can read it without re-borrowing self.focus. The
@@ -145,29 +169,26 @@ impl<'p> FloatingPanel<'p> {
             );
 
             ui.horizontal(|ui| {
-                // Traffic light controls (left-aligned)
-                ui.spacing_mut().item_spacing.x = 6.0;
-                let circle = |ui: &mut egui::Ui, color: Color32, action: &mut bool, tooltip: &str| {
-                    let (rect, response) = ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::click());
-                    ui.painter().circle_filled(rect.center(), 5.0, color);
-                    if response.on_hover_text(tooltip).clicked() {
-                        *action = true;
+                // Traffic light cluster (left-aligned), via the shared
+                // helper so every panel's chrome matches. Minimize is
+                // only offered when a collapse channel is wired; the
+                // green maximize dot doubles as the tile/float toggle.
+                let lights = traffic_lights::TrafficLights::all()
+                    .show_minimize(collapsed.is_some())
+                    .show_maximize(placement.is_some())
+                    .maximize_tip("Toggle Tile/Float");
+                let action = traffic_lights::show(ui, lights);
+
+                if action.close {
+                    *open = false;
+                }
+                if action.minimize {
+                    if let Some(c) = collapsed.as_deref_mut() {
+                        *c = !*c;
                     }
-                };
-
-                let mut close = false;
-                let mut minimize = false;
-                circle(ui, Color32::from_rgb(255, 96, 92), &mut close, "Close");
-                circle(ui, Color32::from_rgb(255, 189, 68), &mut minimize, "Minimize");
-                
-                if close { *open = false; }
-                if minimize { *open = false; /* Add actual minimize logic here if desired */ }
-
-                if let Some(p) = placement.as_deref_mut() {
-                    let color = Color32::from_rgb(0, 202, 78);
-                    let (rect, response) = ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::click());
-                    ui.painter().circle_filled(rect.center(), 5.0, color);
-                    if response.on_hover_text("Toggle Tile/Float").clicked() {
+                }
+                if action.maximize {
+                    if let Some(p) = placement.as_deref_mut() {
                         *p = match *p {
                             Placement::Floating => Placement::Tiled,
                             Placement::Tiled => Placement::Floating,
@@ -182,9 +203,14 @@ impl<'p> FloatingPanel<'p> {
                         .color(palette::TEXT),
                 );
             });
+
+            // Collapsed: render header chrome only, suppress the body.
+            if is_collapsed {
+                return None;
+            }
             ui.separator();
 
-            body(ui)
+            Some(body(ui))
         });
 
         // Write-back focus on user interaction with this panel. The
@@ -212,6 +238,9 @@ impl<'p> FloatingPanel<'p> {
             }
         }
 
-        response.and_then(|r| r.inner)
+        // Window `show` returns `Option<InnerResponse<Option<R>>>` —
+        // the inner `Option` is `None` when the panel was collapsed
+        // (body suppressed). Flatten both layers.
+        response.and_then(|r| r.inner).flatten()
     }
 }

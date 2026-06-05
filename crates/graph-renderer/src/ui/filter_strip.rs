@@ -68,11 +68,13 @@ pub fn show_floating(ctx: &egui::Context, state: &mut AppState) {
     let mut placement = state.filter_strip_placement;
     let placement_before = placement;
     let mut focused = std::mem::take(&mut state.focused_panel);
+    let mut collapsed = state.collapsed_panels.contains(&PanelId::FilterStrip);
     FloatingPanel::new(PanelId::FilterStrip, "Filters")
         .default_pos([16.0, 620.0])
         .default_size([420.0, 360.0])
         .with_placement(&mut placement)
         .with_focus(&mut focused, FocusedPanel::FilterStrip)
+        .with_collapsed(&mut collapsed)
         .show(ctx, &mut state.filter_strip_open, |ui| {
             render_floating_body(
                 ui,
@@ -82,6 +84,11 @@ pub fn show_floating(ctx: &egui::Context, state: &mut AppState) {
             );
         });
     state.focused_panel = focused;
+    if collapsed {
+        state.collapsed_panels.insert(PanelId::FilterStrip);
+    } else {
+        state.collapsed_panels.remove(&PanelId::FilterStrip);
+    }
     // Closing the focused filter strip drops focus to the canvas.
     if !state.filter_strip_open && state.focused_panel == Some(FocusedPanel::FilterStrip) {
         state.focused_panel = None;

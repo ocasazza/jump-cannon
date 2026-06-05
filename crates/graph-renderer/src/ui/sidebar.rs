@@ -196,15 +196,23 @@ pub fn show_floating(
             Section::Debug => FocusedPanel::Debug,
             other => FocusedPanel::Section(other),
         };
-        FloatingPanel::new(PanelId::Section(section), section.title())
+        let panel_id = PanelId::Section(section);
+        let mut collapsed = state.collapsed_panels.contains(&panel_id);
+        FloatingPanel::new(panel_id, section.title())
             .default_pos(pos)
             .default_size(default_size)
             .with_placement(&mut placement)
             .with_focus(&mut focused, my_focus_id)
+            .with_collapsed(&mut collapsed)
             .show(ctx, &mut open, |ui| {
                 render_section_body(ui, state, section, registry, layout_registry, perf);
             });
         state.focused_panel = focused;
+        if collapsed {
+            state.collapsed_panels.insert(panel_id);
+        } else {
+            state.collapsed_panels.remove(&panel_id);
+        }
         if placement != placement_before {
             state.section_placement.insert(section, placement);
             if placement == crate::ui::tiles::Placement::Tiled {

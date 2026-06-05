@@ -1356,16 +1356,26 @@ impl eframe::App for App {
                 .show(ctx, |_ui| {});
 
             let mut canvas_open = true;
+            let mut canvas_collapsed = self
+                .state
+                .collapsed_panels
+                .contains(&ui::state::PanelId::Canvas);
             crate::ui::floating::FloatingPanel::new(
                 ui::state::PanelId::Canvas,
                 "Graph",
             )
             .default_pos([120.0, 80.0])
             .default_size([900.0, 600.0])
+            .with_collapsed(&mut canvas_collapsed)
             .show(ctx, &mut canvas_open, |ui| {
                 let mut viewer = ui::workspace::WorkspaceViewer { ctx: &mut wctx };
                 viewer.draw_graph_tab(ui);
             });
+            if canvas_collapsed {
+                self.state.collapsed_panels.insert(ui::state::PanelId::Canvas);
+            } else {
+                self.state.collapsed_panels.remove(&ui::state::PanelId::Canvas);
+            }
             // Snapshot the floating window's last-known rect back onto
             // `AppState::canvas_mount`. `FloatingPanel::show` only
             // returns the body inner; the window's outer rect lives in
@@ -3057,19 +3067,30 @@ impl App {
                     };
 
                     if expanded {
-                        // Full FloatingPanel parity: ≡ drag glyph in
-                        // HEADING-size mono GREY, then title in
-                        // HEADING-size mono TEXT, then right-aligned
-                        // ↻ ⤢/⤡ X. Matches `FloatingPanel::show` byte-
-                        // for-byte (modulo the maximize button, which
-                        // FloatingPanel doesn't have).
-                        ui.label(
-                            egui::RichText::new("\u{2261}")
-                                .font(crate::ui::theme::mono(
-                                    crate::ui::theme::font_size::HEADING,
-                                ))
-                                .color(crate::ui::theme::palette::GREY),
-                        );
+                        // FloatingPanel parity: macOS traffic-light
+                        // cluster top-LEFT via the shared helper, then
+                        // the title in HEADING-size mono. The anchored-
+                        // specific "↻ re-snap to anchor" affordance is
+                        // NOT window chrome, so it stays as a right-
+                        // aligned small button.
+                        //   red    close    → close the card
+                        //   yellow minimize → contract back to compact
+                        //   green  maximize → maximize / restore (tip
+                        //                     flips on the current state)
+                        let lights = crate::ui::traffic_lights::TrafficLights::all()
+                            .maximize_tip(if maximized { "Restore" } else { "Maximize" });
+                        let tl = crate::ui::traffic_lights::show(ui, lights);
+                        if tl.close {
+                            close_flag.set(true);
+                        }
+                        if tl.minimize {
+                            toggle_expand_flag.set(true);
+                        }
+                        if tl.maximize {
+                            toggle_maximize_flag.set(true);
+                        }
+
+                        ui.add_space(8.0);
                         ui.label(
                             egui::RichText::new(&title)
                                 .font(crate::ui::theme::mono(
@@ -3080,42 +3101,6 @@ impl App {
                         ui.with_layout(
                             egui::Layout::right_to_left(egui::Align::Center),
                             |ui| {
-                                // right_to_left adds in reverse visual
-                                // order, so add X first (rightmost),
-                                // then maximize, then re-snap. Visual:
-                                //   ↻ ⤢ X
-                                if ui
-                                    .small_button(
-                                        egui::RichText::new("X")
-                                            .color(crate::ui::theme::palette::ICON),
-                                    )
-                                    .on_hover_text("Close")
-                                    .clicked()
-                                {
-                                    close_flag.set(true);
-                                }
-                                // Maximize / restore. U+2922 (NORTH
-                                // EAST AND SOUTH WEST ARROW) reads as
-                                // "expand to fill"; U+2921 (NORTH WEST
-                                // AND SOUTH EAST ARROW) reads as
-                                // "restore". Only renders on the
-                                // expanded variant — meaningless on
-                                // the compact body.
-                                let (mglyph, mtip) = if maximized {
-                                    ("\u{2921}", "Restore")
-                                } else {
-                                    ("\u{2922}", "Maximize")
-                                };
-                                if ui
-                                    .small_button(
-                                        egui::RichText::new(mglyph)
-                                            .color(crate::ui::theme::palette::ICON),
-                                    )
-                                    .on_hover_text(mtip)
-                                    .clicked()
-                                {
-                                    toggle_maximize_flag.set(true);
-                                }
                                 if ui
                                     .small_button(
                                         egui::RichText::new("\u{21BA}")
@@ -3126,31 +3111,40 @@ impl App {
                                 {
                                     resnap_flag.set(true);
                                 }
-                                // Contract back to compact. U+2212 MINUS
-                                // SIGN reads as "collapse to less". A
-                                // dedicated glyph avoids collision with
-                                // the maximize/restore arrow pair.
-                                if ui
-                                    .small_button(
-                                        egui::RichText::new("\u{2212}")
-                                            .color(crate::ui::theme::palette::ICON),
-                                    )
-                                    .on_hover_text("Contract")
-                                    .clicked()
-                                {
-                                    toggle_expand_flag.set(true);
-                                }
                             },
                         );
                     } else {
-                        // Compact (hover preview / promoted-but-not-
-                        // expanded) header — lighter chrome by design.
-                        // Unchanged from the legacy shape.
-                        ui.label(
-                            egui::RichText::new("\u{2630}")
-                                .small()
-                                .color(crate::ui::theme::palette::ICON),
-                        );
+                        // Compact header. The transient hover preview
+                        // (`!promoted`) is not a window the user manages
+                        // — it vanishes on cursor-leave — so it keeps the
+                        // lightweight drag-glyph + title chrome with no
+                        // window controls. The PROMOTED-but-compact card
+                        // IS a managed window, so it gets the same macOS
+                        // traffic-light cluster top-LEFT as every other
+                        // panel:
+                        //   red    close    → close the card
+                        //   yellow minimize → omitted (compact is already
+                        //                     the smallest state)
+                        //   green  maximize → expand to the full body
+                        if promoted {
+                            let lights = crate::ui::traffic_lights::TrafficLights::all()
+                                .show_minimize(false)
+                                .maximize_tip("Expand");
+                            let tl = crate::ui::traffic_lights::show(ui, lights);
+                            if tl.close {
+                                close_flag.set(true);
+                            }
+                            if tl.maximize {
+                                toggle_expand_flag.set(true);
+                            }
+                            ui.add_space(6.0);
+                        } else {
+                            ui.label(
+                                egui::RichText::new("\u{2630}")
+                                    .small()
+                                    .color(crate::ui::theme::palette::ICON),
+                            );
+                        }
                         ui.label(
                             egui::RichText::new(&title)
                                 .strong()
@@ -3159,18 +3153,9 @@ impl App {
                         ui.with_layout(
                             egui::Layout::right_to_left(egui::Align::Center),
                             |ui| {
-                                if promoted {
-                                    if ui
-                                        .small_button(
-                                            egui::RichText::new("\u{2715}")
-                                                .color(crate::ui::theme::palette::ICON),
-                                        )
-                                        .on_hover_text("Close")
-                                        .clicked()
-                                    {
-                                        close_flag.set(true);
-                                    }
-                                }
+                                // Re-snap to anchor is anchored-specific,
+                                // not window chrome — keep it right-
+                                // aligned on every compact variant.
                                 if ui
                                     .small_button(
                                         egui::RichText::new("\u{21BA}")
@@ -3180,18 +3165,6 @@ impl App {
                                     .clicked()
                                 {
                                     resnap_flag.set(true);
-                                }
-                                if promoted {
-                                    if ui
-                                        .small_button(
-                                            egui::RichText::new("\u{2922}")
-                                                .color(crate::ui::theme::palette::ICON),
-                                        )
-                                        .on_hover_text("Expand")
-                                        .clicked()
-                                    {
-                                        toggle_expand_flag.set(true);
-                                    }
                                 }
                             },
                         );
