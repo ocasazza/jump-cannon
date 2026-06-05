@@ -52,6 +52,12 @@ bytemuck = { version = "1", features = ["derive"] }
 glam     = "0.29"
 graph-layouts = { path = "../graph-layouts" }
 jump-io       = { path = "../jump-io" }
+# Client-side Nix graph generation (tvix-eval). Depended on as an rlib only;
+# tvix-wasm has NO dependency on graph-renderer, so this is a one-way edge
+# (no cycle). The `Generate (tvix)` panel uses it to evaluate a Nix
+# expression into a `GeneratedGraph`, which `generate::adapter` turns into a
+# `data::Bootstrap`.
+tvix-wasm     = { path = "../tvix-wasm" }
 prost      = "0.13"
 serde      = { version = "1", features = ["derive"] }
 serde_json = "1"
