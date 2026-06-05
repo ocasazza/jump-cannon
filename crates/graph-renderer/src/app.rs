@@ -258,21 +258,11 @@ pub struct App {
     /// Distinct from `selected_node_idx` so promoted previews can
     /// coexist with a different inspector selection.
     promoted_anchored_idx: Option<u32>,
-    /// Per-node expanded/compact flag for the promoted anchored panel.
-    /// Toggled by the ⤢ / ⤡ button in the panel header. Lives on App
-    /// rather than AppState because it tracks an ephemeral UI gesture
-    /// keyed by `u32` indices that aren't stable across vault reloads
-    /// — the promoted panel itself is session-scoped (so is
-    /// `promoted_anchored_idx`), so the expanded map shares that
-    /// lifetime. Not serialized.
-    anchored_expanded: HashMap<u32, bool>,
-    /// Per-node maximize flag for the expanded promoted anchored panel.
-    /// Only meaningful when the corresponding `anchored_expanded` entry
-    /// is true (maximize is a third state on top of expanded). When set,
-    /// the panel grows to fill `canvas_rect.shrink(24.0)`, centered, and
-    /// the tether arrow is suppressed. Session-scoped, not persisted —
-    /// same lifetime as `anchored_expanded`.
-    anchored_maximized: HashMap<u32, bool>,
+    /// Per-node collapsed flag for the promoted-node `FloatingPanel`.
+    /// Toggled by the yellow traffic light. Keyed by node idx (the
+    /// promoted panel is session-scoped, like `promoted_anchored_idx`).
+    /// Not serialized.
+    node_panel_collapsed: HashMap<u32, bool>,
     /// Per-node soft-tether drag offsets in screen pixels. The user
     /// grabs the panel header and drags; the per-frame delta is
     /// accumulated here. Cleared per-node on a "re-snap" click. The
@@ -606,8 +596,7 @@ impl App {
             hover_preview_pos: None,
             last_anchored_screen_pos: HashMap::new(),
             promoted_anchored_idx: None,
-            anchored_expanded: HashMap::new(),
-            anchored_maximized: HashMap::new(),
+            node_panel_collapsed: HashMap::new(),
             anchored_drag_offsets: HashMap::new(),
             promoted_anchored_meta: None,
             promoted_anchored_fetch: Arc::new(Mutex::new(None)),
@@ -952,8 +941,7 @@ impl App {
         self.promoted_anchored_idx = None;
         self.promoted_anchored_meta = None;
         self.last_anchored_screen_pos.clear();
-        self.anchored_expanded.clear();
-        self.anchored_maximized.clear();
+        self.node_panel_collapsed.clear();
         self.anchored_drag_offsets.clear();
         // GPU-write change-detection gates: force a fresh push into the
         // newly allocated buffers (otherwise an unchanged key skips the
@@ -1304,17 +1292,100 @@ impl eframe::App for App {
             &mut self.progress,
         );
 
+        // Channel bundle for the inspector body (shared between the
+        // promoted-node FloatingPanel and the tiled Node pane). Declared
+        // here so the tiled Node pane — rendered inside the workspace
+        // SidePanel below — can write back through it; drained after all
+        // panel paints near the end of `update`.
+        let mut anchored_channels = AnchoredChannels::default();
+
+        // Drain async node-meta / page-save slots before any Node-panel
+        // paint so fresh data shows the same frame.
+        self.drain_node_fetches();
+
+        // Mirror "a node is promoted" onto AppState so the workspace's
+        // open-state sync can mount/unmount the Node tile.
+        self.state.node_panel_open = self.promoted_anchored_idx.is_some();
+
         // Tileable workspace — mounts a right-side panel hosting the
-        // `egui_tiles::Tree` when at least one section / filter strip is
-        // in `Placement::Tiled`. When zero panels are tiled, the side
-        // panel is hidden so the canvas keeps full width.
-        ui::tiles::show_workspace_panel(
-            ctx,
-            &mut self.state,
-            &mut self.actions,
-            &self.layout_registry,
-            &self.perf,
-        );
+        // `egui_tiles::Tree` when at least one section / filter strip /
+        // the Node panel is in `Placement::Tiled`. When zero panels are
+        // tiled, the side panel is hidden so the canvas keeps full width.
+        //
+        // The Node tile's body needs App-owned data the workspace can't
+        // borrow, so we hand it in as a closure. Built only when a node
+        // is promoted AND tiled; otherwise the tile (if present) shows
+        // its empty-state hint.
+        {
+            let node_promoted = self.promoted_anchored_idx;
+            let node_tiled = self.state.node_panel_placement
+                == crate::ui::tiles::Placement::Tiled;
+            let node_meta = if node_tiled {
+                self.promoted_anchored_meta.clone()
+            } else {
+                None
+            };
+            let edges_snapshot = if node_meta.is_some() {
+                self.edges_snapshot(frame)
+            } else {
+                Vec::new()
+            };
+            let active_filters_snapshot = self.state.query.active_filters.clone();
+            let color_by = self.state.style.color_by;
+            let palette = self.state.style.palette;
+            let mut tag_query = self.state.tag_browser_query.clone();
+
+            // Destructure disjoint App fields so the node-body closure
+            // borrows only those, leaving `self.state` free to hand to the
+            // workspace mutably.
+            let App {
+                state,
+                actions,
+                layout_registry,
+                perf,
+                ids,
+                metrics,
+                field_index,
+                page_viewer_states,
+                page_viewer_markdown_cache,
+                ..
+            } = self;
+            let ids = &*ids;
+            let metrics = &*metrics;
+            let field_index = field_index.as_ref();
+
+            let mut node_body = |ui: &mut egui::Ui| {
+                let (Some(idx), Some(meta)) = (node_promoted, node_meta.as_ref()) else {
+                    return;
+                };
+                let max_h = (ui.available_height() - 8.0).max(120.0);
+                render_node_body(
+                    ui, max_h, idx, meta, ids, metrics, &edges_snapshot, color_by,
+                    palette, &active_filters_snapshot, field_index,
+                    page_viewer_states, page_viewer_markdown_cache, &mut tag_query,
+                    &mut anchored_channels,
+                );
+            };
+            let node_body_opt: Option<&mut dyn FnMut(&mut egui::Ui)> =
+                if node_tiled { Some(&mut node_body) } else { None };
+            ui::tiles::show_workspace_panel(
+                ctx,
+                state,
+                actions,
+                layout_registry,
+                perf,
+                node_body_opt,
+            );
+            // Write back the (possibly edited) tag-browser query.
+            self.state.tag_browser_query = tag_query;
+        }
+
+        // A node-tile close inside the workspace queued a dismissal.
+        if std::mem::take(&mut self.state.node_panel_close_requested) {
+            if let Some(idx) = self.promoted_anchored_idx {
+                self.dismiss_promoted_node(idx);
+            }
+        }
 
         // Phase B central panel — now hosts the dockable Workspace
         // (tabs + splits via egui_dock). One initial "Graph" tab carries
@@ -1677,16 +1748,15 @@ impl eframe::App for App {
         self.tick_post_click_cooldown(frame);
         self.perf.end_stage(StageId::ApplyEffects);
 
+        // Promoted-node FloatingPanel paint pass (floating placement only;
+        // the tiled placement rendered in the workspace SidePanel above).
+        // Writes back through the same `anchored_channels` declared earlier.
+        self.render_node_panel_floating(ctx, frame, &mut anchored_channels);
+
         // Hover-preview card paint pass — runs after all other UI
         // layers so the card sits on top of canvas + sidebars. Cheap:
         // no-op when `hover_preview_open == false`.
-        //
-        // The unified anchored panel may render the inspector body in
-        // its expanded mode, which writes back through the same channels
-        // the old free-standing inspector used. Declare the channel
-        // bundle here, hand it to the paint pass, and drain afterwards.
-        let mut anchored_channels = AnchoredChannels::default();
-        self.show_hover_preview(ctx, frame, &mut anchored_channels);
+        self.show_hover_preview(ctx, frame);
 
         // Post-anchored-panel inspector channel drain.
         if let Some(idx) = anchored_channels.requested_selection.take() {
@@ -2732,6 +2802,37 @@ impl App {
         self.hover_preview_pos = None;
     }
 
+    /// Drain async slots backing the promoted-node panel: the
+    /// `/node/:id` meta fetch and any completed `/vault/page` save. Run
+    /// before the panel paints so a freshly-arrived NodeMeta / saved body
+    /// shows the same frame. (Previously inlined at the top of
+    /// `show_hover_preview`, which ran after the Node panel rendered.)
+    fn drain_node_fetches(&mut self) {
+        if let Some(Ok(Some(meta))) =
+            self.promoted_anchored_fetch.lock().unwrap().take()
+        {
+            self.promoted_anchored_meta = Some(meta);
+        }
+
+        if let Some((node_id, body, result)) =
+            self.save_in_flight.lock().unwrap().take()
+        {
+            if let Some(state) = self.page_viewer_states.get_mut(&node_id) {
+                match &result {
+                    Ok(()) => state.note_saved(body.clone()),
+                    Err(e) => state.note_save_error(e.clone()),
+                }
+            }
+            if result.is_ok() {
+                if let Some(meta) = self.promoted_anchored_meta.as_mut() {
+                    if meta.id == node_id {
+                        meta.body = body;
+                    }
+                }
+            }
+        }
+    }
+
     /// Draw the hover-preview card if armed.
     ///
     /// Anchored to the hovered node's projected screen position (not
@@ -2754,49 +2855,19 @@ impl App {
         &mut self,
         ctx: &egui::Context,
         frame: &eframe::Frame,
-        channels: &mut AnchoredChannels,
     ) {
-        // Drain the promoted-anchored fetch slot first so we have
-        // fresh meta available for this frame's paint.
-        if let Some(Ok(Some(meta))) =
-            self.promoted_anchored_fetch.lock().unwrap().take()
-        {
-            self.promoted_anchored_meta = Some(meta);
-        }
-
-        // Drain any completed page-save result and route the outcome
-        // back to the matching PageViewerState. On success, also
-        // refresh the cached `promoted_anchored_meta.body` so the
-        // dirty-detector resets.
-        if let Some((node_id, body, result)) =
-            self.save_in_flight.lock().unwrap().take()
-        {
-            if let Some(state) = self.page_viewer_states.get_mut(&node_id) {
-                match &result {
-                    Ok(()) => {
-                        state.note_saved(body.clone());
-                    }
-                    Err(e) => state.note_save_error(e.clone()),
-                }
-            }
-            if result.is_ok() {
-                if let Some(meta) = self.promoted_anchored_meta.as_mut() {
-                    if meta.id == node_id {
-                        meta.body = body;
-                    }
-                }
-            }
-        }
-
         let Some(canvas_rect) = self.prev_canvas_rect else {
             return;
         };
 
-        // Two anchored panels can be live in one frame: a hovered
-        // preview (transient, non-promoted) and a sticky promoted
-        // panel. Render both, but skip the hover preview when its
-        // idx matches the promoted idx — they'd render at the same
-        // anchor and the user would see a doubled card.
+        // The promoted node no longer renders here — it is a unified
+        // `FloatingPanel` (or a workspace tile), rendered by
+        // `render_node_panel_floating` / the Node tile so it shares the
+        // exact panel component + float/tile traffic-light chrome as
+        // Layout/Filters/Camera. The
+        // only anchored card left in this pass is the transient HOVER
+        // preview tether, which is a legitimately world-anchored
+        // affordance. Skip it when it would double the promoted node.
         let hover_idx = if self.hover_preview_open {
             self.hover_preview_idx
         } else {
@@ -2804,45 +2875,25 @@ impl App {
         };
         let promoted_idx = self.promoted_anchored_idx;
 
-        // Render promoted first (it's "below" in semantic stack —
-        // the hover preview is the more transient layer). Both use
-        // egui::Area::order(Foreground); paint order within the
-        // layer falls in call order, but they have different ids and
-        // never overlap (we skip hover when idx matches).
-        if let Some(pidx) = promoted_idx {
-            if let Some(meta) = self.promoted_anchored_meta.clone() {
-                self.render_anchored_panel(ctx, frame, canvas_rect, pidx, meta, true, channels);
-            }
-        }
-
         if let Some(hidx) = hover_idx {
             if Some(hidx) != promoted_idx {
                 if let Some(meta) = self.hover_preview_meta.clone() {
                     self.render_anchored_panel(
-                        ctx, frame, canvas_rect, hidx, meta, false, channels,
+                        ctx, frame, canvas_rect, hidx, meta,
                     );
                 }
             }
         }
     }
 
-    /// Render a single anchored panel for `idx`.
+    /// Render the transient HOVER preview card for `idx`.
     ///
-    /// `promoted = true` enables the X close button (clears
-    /// `promoted_anchored_idx`) and makes the body scrollable. Both
-    /// variants share the EMA-smoothed positioning + soft-tether drag
-    /// pipeline: project once, blend into `last_anchored_screen_pos`,
-    /// hand the smoothed value to AnchoredPanel as
-    /// `screen_pos_override`, then accumulate any per-frame drag
-    /// delta into `anchored_drag_offsets[idx]`.
-    ///
-    /// The header is built inside the body closure (egui doesn't give
-    /// AnchoredPanel a separate header surface), which means the
-    /// "header drag" is detected via the OUTER area's drag_delta in
-    /// `AnchoredOutput` — egui's Area drag handling moves the area
-    /// when *anywhere on it* is dragged, but we only use the delta to
-    /// update our per-node offset; the Area itself is `fixed_pos`,
-    /// so this won't conflict.
+    /// This is the world-anchored tether affordance only — the promoted /
+    /// expanded node now renders as a `FloatingPanel` via
+    /// [`Self::render_node_panel_floating`]. The hover card uses the EMA-smoothed
+    /// positioning + tether pipeline: project once, blend into
+    /// `last_anchored_screen_pos`, hand the smoothed value to
+    /// AnchoredPanel as `screen_pos_override`.
     fn render_anchored_panel(
         &mut self,
         ctx: &egui::Context,
@@ -2850,31 +2901,10 @@ impl App {
         canvas_rect: egui::Rect,
         idx: u32,
         meta: proto::NodeMeta,
-        promoted: bool,
-        channels: &mut AnchoredChannels,
     ) {
-        // Per-node expand/contract flag. Only meaningful for the
-        // promoted variant — hover previews are always compact (the
-        // expand toggle is omitted from the hover header). Reads default
-        // to `false` (compact) so a newly-promoted panel opens in the
-        // hover-preview shape and the user opts into the full inspector
-        // body explicitly.
-        let expanded = promoted
-            && self.anchored_expanded.get(&idx).copied().unwrap_or(false);
-        // Maximize is a third state on top of expanded: only meaningful
-        // when the expanded body is being rendered. Restoring expanded ->
-        // false implicitly hides the maximize affordance again.
-        let maximized = expanded
-            && self.anchored_maximized.get(&idx).copied().unwrap_or(false);
-        // Maximized rect: 24px inset from canvas edges, covers the whole
-        // viewport (centered by virtue of the symmetric shrink). Passed
-        // to AnchoredPanel via `maximized_rect`; bypasses projection +
-        // tether + soft-tether drag.
-        let max_rect = if maximized {
-            Some(canvas_rect.shrink(24.0))
-        } else {
-            None
-        };
+        // Hover preview is always compact (no expand/maximize, no window
+        // chrome, no channels) — those moved to the FloatingPanel-based
+        // Node panel. This path is purely the world-anchored tether card.
         // Pull world position + camera snapshot out of the wgpu
         // callback resources, then drop the read lock before opening
         // any egui Area. Camera is cloned (small, all-Copy fields)
@@ -2936,240 +2966,49 @@ impl App {
             }
         };
 
-        // Soft-tether: per-node drag offset accumulated across frames.
-        // Mutates only inside the closure on click; passed in as a
-        // value here so AnchoredPanel sees the current snapshot.
-        let drag_offset = self.anchored_drag_offsets.get(&idx).copied();
-
-        // resnap_requested is set by the header's "↺" button or a
-        // double-click. We can't write back to self inside the
-        // closure (mutable borrow of self), so we capture into a
-        // Cell. Pattern mirrors how modal close buttons forward
-        // intents up through the show() call.
-        let resnap_flag = std::cell::Cell::new(false);
-        let close_flag = std::cell::Cell::new(false);
-        // Toggled by the ⤢ / ⤡ expand button in the promoted header.
-        // Drained after `panel.show` to flip `anchored_expanded[idx]`.
-        let toggle_expand_flag = std::cell::Cell::new(false);
-        // Toggled by the ⤢ / ⤡ maximize button in the expanded header.
-        // Drained after `panel.show` to flip `anchored_maximized[idx]`.
-        let toggle_maximize_flag = std::cell::Cell::new(false);
-
-        // Hoist edges + active-filter snapshots for the expanded path.
-        // The compact path doesn't need them, but cloning is cheap and
-        // doing it unconditionally keeps the borrow graph simple — the
-        // alternative is two divergent borrow scopes inside the closure.
-        let edges_snapshot: Vec<u32> = if let Some(wgpu_state) = frame.wgpu_render_state() {
-            let renderer = wgpu_state.renderer.read();
-            renderer
-                .callback_resources
-                .get::<GraphPipelines>()
-                .map(|p| p.edges_cpu().to_vec())
-                .unwrap_or_default()
-        } else {
-            Vec::new()
-        };
-        let active_filters_snapshot = self.state.query.active_filters.clone();
-
-        let panel_id_tag = if promoted { "anchored-promoted" } else { "hover-preview" };
-        // Focused border only for the promoted variant — the hover
-        // preview is transient and never logically focused. Compare
-        // against the app-wide `focused_panel` channel.
-        let is_focused = promoted
-            && matches!(
-                self.state.focused_panel,
-                Some(crate::ui::state::FocusedPanel::AnchoredNode(i)) if i == idx
-            );
         let panel = crate::ui::anchored::AnchoredPanel::new(
-            egui::Id::new((panel_id_tag, idx)),
+            egui::Id::new(("hover-preview", idx)),
             world,
             canvas_rect,
             &camera,
         )
         .offset(egui::vec2(18.0, 18.0))
         .interactable(true)
-        .anchor_pixels(drag_offset)
         .screen_pos_override(smoothed)
-        .expanded(expanded)
-        .focused(is_focused)
-        .maximized_rect(max_rect)
-        // In expanded mode, tell AnchoredPanel the body's full reserved
-        // footprint so it can clamp the position to keep the whole rect
-        // on-canvas — fixes the bug where expanding near the right/
-        // bottom edge sent the panel off-screen. Compact panels skip
-        // this; they're small and the legacy anchor-based clamp is
-        // sufficient. Maximized bypasses both — AnchoredPanel uses the
-        // explicit rect.
-        .reserved_size(if let Some(r) = max_rect {
-            r.size()
-        } else if expanded {
-            egui::vec2(480.0, 640.0)
-        } else {
-            // 360 wide × generous height estimate so hover previews
-            // anchored near the bottom don't overflow either. Tracks
-            // the `set_max_width(360.0)` below.
-            egui::vec2(360.0, 240.0)
-        });
+        // 360 wide × generous height estimate so hover previews anchored
+        // near the bottom don't overflow. Tracks `set_max_width(360.0)`.
+        .reserved_size(egui::vec2(360.0, 240.0));
 
-        let output = panel.show(ctx, |ui| {
-            // Compact = 360px wide (legacy hover/preview width).
-            // Expanded = 480px wide; the body also gets a 640px max
-            // scroll height so the full inspector (metrics + neighbours
-            // + frontmatter + page editor) has room to breathe. These
-            // numbers came from the task brief; they read well against
-            // the categorical-palette badges without dominating the
-            // canvas on a 1280-wide viewport.
-            // Width:
-            //   maximized → rect.width()
-            //   expanded  → 480 px (legacy)
-            //   compact   → 360 px (legacy hover preview)
-            let max_w = if let Some(r) = max_rect {
-                r.width()
-            } else if expanded {
-                480.0
-            } else {
-                360.0
-            };
-            ui.set_max_width(max_w);
+        let _output = panel.show(ctx, |ui| {
+            ui.set_max_width(360.0);
 
-            // Header is a dedicated drag-sensing strip. Allocate it
-            // first as a click_and_drag rect of fixed height; lay the
-            // glyphs/buttons over it via a `UiBuilder` at the same
-            // rect. The returned `header_resp` is what AnchoredPanel
-            // reads `drag_delta()` / `double_clicked()` from — body
-            // widgets (e.g. the markdown ScrollArea) sense their own
-            // gestures without their drag bubbling up to move the
-            // panel.
-            let header_height = 22.0;
-            let header_resp = ui.allocate_response(
-                egui::vec2(ui.available_width(), header_height),
-                egui::Sense::click_and_drag(),
-            );
-            let header_rect = header_resp.rect;
-            ui.allocate_new_ui(egui::UiBuilder::new().max_rect(header_rect), |ui| {
-                ui.horizontal(|ui| {
-                    // Title resolution: meta.title → derived filename
-                    // (path stem) → meta.id → "Node". The expanded
-                    // variant uses this for display parity with the
-                    // other FloatingPanel-wrapped surfaces.
-                    let title = if !meta.title.is_empty() {
-                        meta.title.clone()
-                    } else if !meta.path.is_empty() {
-                        std::path::Path::new(&meta.path)
-                            .file_stem()
-                            .and_then(|s| s.to_str())
-                            .map(str::to_string)
-                            .unwrap_or_else(|| meta.id.clone())
-                    } else if !meta.id.is_empty() {
-                        meta.id.clone()
-                    } else {
-                        "Node".to_string()
-                    };
-
-                    if expanded {
-                        // FloatingPanel parity: macOS traffic-light
-                        // cluster top-LEFT via the shared helper, then
-                        // the title in HEADING-size mono. The anchored-
-                        // specific "↻ re-snap to anchor" affordance is
-                        // NOT window chrome, so it stays as a right-
-                        // aligned small button.
-                        //   red    close    → close the card
-                        //   yellow minimize → contract back to compact
-                        //   green  maximize → maximize / restore (tip
-                        //                     flips on the current state)
-                        let lights = crate::ui::traffic_lights::TrafficLights::all()
-                            .maximize_tip(if maximized { "Restore" } else { "Maximize" });
-                        let tl = crate::ui::traffic_lights::show(ui, lights);
-                        if tl.close {
-                            close_flag.set(true);
-                        }
-                        if tl.minimize {
-                            toggle_expand_flag.set(true);
-                        }
-                        if tl.maximize {
-                            toggle_maximize_flag.set(true);
-                        }
-
-                        ui.add_space(8.0);
-                        ui.label(
-                            egui::RichText::new(&title)
-                                .font(crate::ui::theme::mono(
-                                    crate::ui::theme::font_size::HEADING,
-                                ))
-                                .color(crate::ui::theme::palette::TEXT),
-                        );
-                        ui.with_layout(
-                            egui::Layout::right_to_left(egui::Align::Center),
-                            |ui| {
-                                if ui
-                                    .small_button(
-                                        egui::RichText::new("\u{21BA}")
-                                            .color(crate::ui::theme::palette::ICON),
-                                    )
-                                    .on_hover_text("Re-snap to anchor")
-                                    .clicked()
-                                {
-                                    resnap_flag.set(true);
-                                }
-                            },
-                        );
-                    } else {
-                        // Compact header. The transient hover preview
-                        // (`!promoted`) is not a window the user manages
-                        // — it vanishes on cursor-leave — so it keeps the
-                        // lightweight drag-glyph + title chrome with no
-                        // window controls. The PROMOTED-but-compact card
-                        // IS a managed window, so it gets the same macOS
-                        // traffic-light cluster top-LEFT as every other
-                        // panel:
-                        //   red    close    → close the card
-                        //   yellow minimize → omitted (compact is already
-                        //                     the smallest state)
-                        //   green  maximize → expand to the full body
-                        if promoted {
-                            let lights = crate::ui::traffic_lights::TrafficLights::all()
-                                .show_minimize(false)
-                                .maximize_tip("Expand");
-                            let tl = crate::ui::traffic_lights::show(ui, lights);
-                            if tl.close {
-                                close_flag.set(true);
-                            }
-                            if tl.maximize {
-                                toggle_expand_flag.set(true);
-                            }
-                            ui.add_space(6.0);
-                        } else {
-                            ui.label(
-                                egui::RichText::new("\u{2630}")
-                                    .small()
-                                    .color(crate::ui::theme::palette::ICON),
-                            );
-                        }
-                        ui.label(
-                            egui::RichText::new(&title)
-                                .strong()
-                                .color(crate::ui::theme::palette::TEXT),
-                        );
-                        ui.with_layout(
-                            egui::Layout::right_to_left(egui::Align::Center),
-                            |ui| {
-                                // Re-snap to anchor is anchored-specific,
-                                // not window chrome — keep it right-
-                                // aligned on every compact variant.
-                                if ui
-                                    .small_button(
-                                        egui::RichText::new("\u{21BA}")
-                                            .color(crate::ui::theme::palette::ICON),
-                                    )
-                                    .on_hover_text("Re-snap to anchor")
-                                    .clicked()
-                                {
-                                    resnap_flag.set(true);
-                                }
-                            },
-                        );
-                    }
-                });
+            // Lightweight, non-interactive header: drag glyph + title.
+            // The hover preview vanishes on cursor-leave, so it carries
+            // no window chrome (that lives on the promoted FloatingPanel).
+            ui.horizontal(|ui| {
+                let title = if !meta.title.is_empty() {
+                    meta.title.clone()
+                } else if !meta.path.is_empty() {
+                    std::path::Path::new(&meta.path)
+                        .file_stem()
+                        .and_then(|s| s.to_str())
+                        .map(str::to_string)
+                        .unwrap_or_else(|| meta.id.clone())
+                } else if !meta.id.is_empty() {
+                    meta.id.clone()
+                } else {
+                    "Node".to_string()
+                };
+                ui.label(
+                    egui::RichText::new("\u{2630}")
+                        .small()
+                        .color(crate::ui::theme::palette::ICON),
+                );
+                ui.label(
+                    egui::RichText::new(&title)
+                        .strong()
+                        .color(crate::ui::theme::palette::TEXT),
+                );
             });
 
             if !meta.path.is_empty() {
@@ -3188,68 +3027,7 @@ impl App {
                         .color(crate::ui::theme::palette::INFO),
                 );
             }
-
-            if expanded {
-                // Expanded promoted panel: full inspector body
-                // (metrics + neighbours + community + frontmatter +
-                // editable page viewer when applicable).
-                // `inspector::render_body` owns its own ScrollArea
-                // internally — don't wrap it in another one or two
-                // scrollbars + ambiguous wheel routing. We pass the
-                // body's height budget down as the ScrollArea's explicit
-                // `max_height` so overflowing content (long frontmatter,
-                // a tall page preview, a big neighbour list) clips +
-                // scrolls *inside* the panel instead of overflowing its
-                // bounds. `ui.set_max_height` alone is insufficient here:
-                // the anchored card lives in an auto-sizing `egui::Area`
-                // that grows to fit content, so the inner ScrollArea
-                // would otherwise see an effectively unbounded
-                // `available_height` and never scroll.
-                ui.separator();
-                // Maximize: the body should fill the canvas-sized rect
-                // minus the chrome we already laid out (header +
-                // separator + small slack for inner margin). Expanded
-                // (non-maximized): the 640px budget that matches the
-                // panel's reserved footprint (480 × 640) minus the same
-                // chrome slack, so the bounded rect the panel was
-                // clamped into is what the ScrollArea clips against.
-                let body_max_h = if let Some(r) = max_rect {
-                    (r.height() - header_height - 24.0).max(120.0)
-                } else {
-                    (640.0 - header_height - 24.0).max(120.0)
-                };
-                ui.set_max_height(body_max_h);
-                {
-                        let mut data = crate::ui::inspector::InspectorData {
-                            ids: &self.ids,
-                            metrics: &self.metrics,
-                            edges: &edges_snapshot,
-                            selected_idx: Some(idx),
-                            requested_selection: &mut channels.requested_selection,
-                            requested_filter_toggle: &mut channels.requested_filter_toggle,
-                            color_by: self.state.style.color_by,
-                            palette: self.state.style.palette,
-                            current_meta: Some(&meta),
-                            active_filters: &active_filters_snapshot,
-                            requested_navigate: &mut channels.requested_navigate,
-                            requested_open_url: &mut channels.requested_open_url,
-                            requested_focus_node: &mut channels.requested_focus_node,
-                            field_index: self.field_index.as_ref(),
-                            page_viewer_states: Some(&mut self.page_viewer_states),
-                            markdown_cache: Some(&mut self.page_viewer_markdown_cache),
-                            requested_page_save: &mut channels.requested_page_save,
-                        };
-                        crate::ui::inspector::render_body(
-                            ui,
-                            &mut self.state.tag_browser_query,
-                            &mut data,
-                            Some(body_max_h),
-                        );
-                }
-            } else if !meta.body.is_empty() {
-                // Compact mode (both hover and promoted-but-collapsed):
-                // brief metadata snippet, no editor / no inspector body.
-                // Same shape the legacy hover preview rendered.
+            if !meta.body.is_empty() {
                 ui.separator();
                 let snippet = body_snippet(&meta.body, 280, 6);
                 ui.label(
@@ -3259,97 +3037,157 @@ impl App {
                 );
             }
 
-            // Hand the header response back to AnchoredPanel — that's
-            // what its `drag_delta` / `header_double_clicked` come
-            // from.
-            ((), header_resp)
+            // The hover preview has no draggable header; hand back a
+            // non-draggable dummy response (AnchoredPanel only reads
+            // drag/double-click from it, which the transient card ignores).
+            let dummy = ui.allocate_response(egui::Vec2::ZERO, egui::Sense::hover());
+            ((), dummy)
         });
+    }
 
-        // Acquire focus for the promoted variant when the user
-        // interacts with it (header click/drag, body click, or any
-        // pointer-press inside the area rect). The hover preview never
-        // takes focus — it's a transient peek that vanishes on
-        // cursor-leave, and focusing it would steal scroll routing
-        // for a panel about to disappear.
-        if promoted {
-            if let Some(inner) = output.inner.as_ref() {
-                let area_rect = inner.response.rect;
-                let pointer_down_inside = ctx.input(|i| {
-                    i.pointer.any_pressed()
-                        && i.pointer
-                            .interact_pos()
-                            .map(|p| area_rect.contains(p))
-                            .unwrap_or(false)
-                });
-                if inner.response.clicked()
-                    || inner.response.drag_started()
-                    || output.drag_delta != egui::Vec2::ZERO
-                    || pointer_down_inside
-                {
-                    self.state.focused_panel =
-                        Some(crate::ui::state::FocusedPanel::AnchoredNode(idx));
-                }
-            }
+    /// Render the promoted-node ("Node") panel in its FLOATING form, via
+    /// the SHARED [`crate::ui::floating::FloatingPanel`] component.
+    ///
+    /// This is the unified replacement for the old expanded/maximized
+    /// AnchoredPanel path. The promoted node gets the same macOS
+    /// traffic-light chrome as every other panel: red close, yellow
+    /// collapse, and the GREEN Float⇄Tile toggle (`with_placement`). The
+    /// body is `inspector::render_body` (via `render_node_body`). The
+    /// TILED form is rendered by the workspace SidePanel as a
+    /// `PaneKind::Node` tile (the `node_body` closure handed to the
+    /// `show_workspace_panel` call in `update`). Exactly one form renders
+    /// per frame — floating XOR tiled
+    /// — and the hover preview is skipped when its idx matches the
+    /// promoted idx, so the old "compact card behind the expanded card"
+    /// overlap is structurally impossible.
+    ///
+    /// No-op unless a node is promoted AND its placement is Floating.
+    fn render_node_panel_floating(
+        &mut self,
+        ctx: &egui::Context,
+        frame: &eframe::Frame,
+        channels: &mut AnchoredChannels,
+    ) {
+        let Some(idx) = self.promoted_anchored_idx else {
+            return;
+        };
+        if self.state.node_panel_placement != crate::ui::tiles::Placement::Floating {
+            return; // tiled form renders in the workspace
         }
+        let Some(meta) = self.promoted_anchored_meta.clone() else {
+            return;
+        };
 
-        // Accumulate drag delta into per-node offset — only for the
-        // promoted variant. The hover preview is a transient peek
-        // that vanishes on cursor-leave; a drag there would be lost
-        // immediately, and we'd rather not pollute the per-node
-        // offset map with hover-induced jitter.
-        if promoted && output.drag_delta != egui::Vec2::ZERO {
-            let entry = self
-                .anchored_drag_offsets
-                .entry(idx)
-                .or_insert(egui::Vec2::ZERO);
-            *entry += output.drag_delta;
+        let edges_snapshot = self.edges_snapshot(frame);
+        let placement_before = self.state.node_panel_placement;
+
+        let active_filters_snapshot = self.state.query.active_filters.clone();
+        let color_by = self.state.style.color_by;
+        let palette = self.state.style.palette;
+        let mut tag_query = self.state.tag_browser_query.clone();
+        let title = node_title(&meta);
+
+        let panel_id = crate::ui::state::PanelId::Node;
+        let mut open = true;
+        let mut placement = placement_before;
+        let mut collapsed =
+            self.node_panel_collapsed.get(&idx).copied().unwrap_or(false);
+        let mut focused = std::mem::take(&mut self.state.focused_panel);
+        let my_focus = crate::ui::state::FocusedPanel::AnchoredNode(idx);
+
+        // Destructure disjoint App fields so the body closure borrows only
+        // what it needs (not `self`).
+        let App {
+            ids,
+            metrics,
+            field_index,
+            page_viewer_states,
+            page_viewer_markdown_cache,
+            ..
+        } = self;
+        let ids = &*ids;
+        let metrics = &*metrics;
+        let field_index = field_index.as_ref();
+        let meta_ref = &meta;
+        let edges_ref = &edges_snapshot;
+
+        crate::ui::floating::FloatingPanel::new(panel_id, "Node")
+            .default_pos([320.0, 96.0])
+            .default_size([480.0, 600.0])
+            .with_placement(&mut placement)
+            .with_focus(&mut focused, my_focus)
+            .with_collapsed(&mut collapsed)
+            .show(ctx, &mut open, |ui| {
+                ui.set_max_width(460.0);
+                ui.label(
+                    egui::RichText::new(&title)
+                        .strong()
+                        .color(crate::ui::theme::palette::TEXT),
+                );
+                // The FloatingPanel lives in an auto-sizing window; give the
+                // inner ScrollArea an explicit budget so it clips+scrolls.
+                let avail = ui.available_height();
+                let max_h = if avail.is_finite() && avail > 4.0 && avail < 4000.0 {
+                    (avail - 8.0).max(160.0)
+                } else {
+                    520.0
+                };
+                render_node_body(
+                    ui, max_h, idx, meta_ref, ids, metrics, edges_ref, color_by,
+                    palette, &active_filters_snapshot, field_index,
+                    page_viewer_states, page_viewer_markdown_cache, &mut tag_query,
+                    channels,
+                );
+            });
+
+        self.state.focused_panel = focused;
+        self.state.tag_browser_query = tag_query;
+        if collapsed {
+            self.node_panel_collapsed.insert(idx, true);
+        } else {
+            self.node_panel_collapsed.remove(&idx);
         }
-        // Header double-click is the canonical re-snap gesture.
-        if output.header_double_clicked {
-            resnap_flag.set(true);
-        }
-        if resnap_flag.get() {
-            self.anchored_drag_offsets.remove(&idx);
-        }
-        if close_flag.get() && promoted {
-            self.promoted_anchored_idx = None;
-            self.promoted_anchored_meta = None;
-            // Closing the focused panel returns focus to the canvas.
-            if matches!(
-                self.state.focused_panel,
-                Some(crate::ui::state::FocusedPanel::AnchoredNode(i)) if i == idx
-            ) {
-                self.state.focused_panel = None;
+        // Green-dot toggle flipped placement → snap into the tree so the
+        // workspace renders the tile next frame.
+        if placement != placement_before {
+            self.state.node_panel_placement = placement;
+            if placement == crate::ui::tiles::Placement::Tiled {
+                let mut ws = std::mem::take(&mut self.state.tiles);
+                ws.snap_insert(crate::ui::tiles::PaneKind::Node);
+                self.state.tiles = ws;
             }
-            // Don't clear the drag offset — if the user later
-            // re-promotes this node, restoring their offset is the
-            // friendlier default. The expand flag is similarly
-            // preserved so re-promoting returns to the same mode.
         }
-        // Expand/contract toggle. Flip the per-node flag; next frame
-        // the panel re-renders in the new mode (compact body vs.
-        // inspector body) and the size adjusts accordingly.
-        if toggle_expand_flag.get() && promoted {
-            let cur = self.anchored_expanded.get(&idx).copied().unwrap_or(false);
-            self.anchored_expanded.insert(idx, !cur);
-            self.state.frontend_events.push(
-                "anchored:expand",
-                format!("idx={idx} -> {}", if !cur { "expanded" } else { "compact" }),
-            );
-            // Contracting also drops maximize state — maximize is
-            // meaningless on the compact body, and re-expanding should
-            // start from the standard expanded size, not silently
-            // re-maximize.
-            if cur {
-                self.anchored_maximized.remove(&idx);
-            }
+        // Red close → dismiss the promoted node entirely.
+        if !open {
+            self.dismiss_promoted_node(idx);
         }
-        // Maximize toggle. Only fires on the expanded variant (the
-        // button only renders there); flip the per-node flag and let
-        // the next frame route through the maximized branch.
-        if toggle_maximize_flag.get() && promoted && expanded {
-            let cur = self.anchored_maximized.get(&idx).copied().unwrap_or(false);
-            self.anchored_maximized.insert(idx, !cur);
+    }
+
+    /// Read-only mirror of the GPU edge buffer (packed [src, tgt, ...]).
+    fn edges_snapshot(&self, frame: &eframe::Frame) -> Vec<u32> {
+        if let Some(wgpu_state) = frame.wgpu_render_state() {
+            let renderer = wgpu_state.renderer.read();
+            renderer
+                .callback_resources
+                .get::<GraphPipelines>()
+                .map(|p| p.edges_cpu().to_vec())
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Clear the promoted node + its focus (shared by the floating close
+    /// button and the tiled-tile close).
+    fn dismiss_promoted_node(&mut self, idx: u32) {
+        self.promoted_anchored_idx = None;
+        self.promoted_anchored_meta = None;
+        self.state.node_panel_open = false;
+        if matches!(
+            self.state.focused_panel,
+            Some(crate::ui::state::FocusedPanel::AnchoredNode(i)) if i == idx
+        ) {
+            self.state.focused_panel = None;
         }
     }
 
@@ -3779,17 +3617,18 @@ impl App {
     }
 }
 
-/// Per-frame request channels populated by the unified anchored panel
-/// (the expanded body, which routes through `inspector::render_body`).
-/// `App::update` declares one of these on the stack each frame and
-/// drains it after `show_hover_preview` returns.
+/// Per-frame request channels populated by the promoted-node panel's
+/// inspector body (`inspector::render_body`), in either its floating
+/// (`render_node_panel_floating`) or tiled (`PaneKind::Node`) form.
+/// `App::update` declares one of these on the stack each frame and drains
+/// it near the end of `update`.
 ///
-/// Why a struct: `render_anchored_panel` can mount the inspector body,
-/// which needs the same outgoing channels the old free-standing inspector
-/// used (`requested_selection`, `requested_filter_toggle`, navigate, url,
-/// focus-node, page-save). Bundling them keeps the call signature short
-/// and the drain block symmetrical with what `inspector::show_floating`
-/// used to write.
+/// Why a struct: `render_node_body` mounts the inspector body, which needs
+/// the same outgoing channels the old free-standing inspector used
+/// (`requested_selection`, `requested_filter_toggle`, navigate, url,
+/// focus-node, page-save). Bundling them keeps the signatures short and
+/// the drain block symmetrical with what `inspector::show_floating` used
+/// to write.
 #[derive(Default)]
 struct AnchoredChannels {
     requested_selection: Option<u32>,
@@ -3844,6 +3683,86 @@ fn default_base_url() -> String {
     {
         std::env::var("GRAPH_API_URL").unwrap_or_else(|_| "http://127.0.0.1:4848".into())
     }
+}
+
+/// Display title for a node: `meta.title` → filename stem → `meta.id` →
+/// "Node".
+fn node_title(meta: &proto::NodeMeta) -> String {
+    if !meta.title.is_empty() {
+        meta.title.clone()
+    } else if !meta.path.is_empty() {
+        std::path::Path::new(&meta.path)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .map(str::to_string)
+            .unwrap_or_else(|| meta.id.clone())
+    } else if !meta.id.is_empty() {
+        meta.id.clone()
+    } else {
+        "Node".to_string()
+    }
+}
+
+/// Shared body of the promoted-node panel: path + tags header, then the
+/// full inspector body (`inspector::render_body`). Used by BOTH the
+/// floating `FloatingPanel` and the tiled `PaneKind::Node` so the two
+/// placements render identically. `max_h` bounds the inner ScrollArea.
+#[allow(clippy::too_many_arguments)]
+fn render_node_body(
+    ui: &mut egui::Ui,
+    max_h: f32,
+    idx: u32,
+    meta: &proto::NodeMeta,
+    ids: &[String],
+    metrics: &HashMap<String, Vec<f32>>,
+    edges: &[u32],
+    color_by: crate::ui::state::ColorBy,
+    palette: crate::data::PaletteId,
+    active_filters: &crate::ui::query::ActiveFieldFilters,
+    field_index: Option<&FieldIndex>,
+    page_viewer_states: &mut HashMap<String, ui::page_viewer::PageViewerState>,
+    markdown_cache: &mut egui_commonmark::CommonMarkCache,
+    tag_query: &mut String,
+    channels: &mut AnchoredChannels,
+) {
+    if !meta.path.is_empty() {
+        ui.label(
+            egui::RichText::new(&meta.path)
+                .small()
+                .weak()
+                .monospace(),
+        );
+    }
+    if !meta.tags.is_empty() {
+        ui.add_space(2.0);
+        ui.label(
+            egui::RichText::new(meta.tags.join(", "))
+                .small()
+                .color(crate::ui::theme::palette::INFO),
+        );
+    }
+    ui.separator();
+    ui.set_max_height(max_h);
+    let mut data = crate::ui::inspector::InspectorData {
+        ids,
+        metrics,
+        edges,
+        selected_idx: Some(idx),
+        requested_selection: &mut channels.requested_selection,
+        requested_filter_toggle: &mut channels.requested_filter_toggle,
+        color_by,
+        palette,
+        current_meta: Some(meta),
+        active_filters,
+        requested_navigate: &mut channels.requested_navigate,
+        requested_open_url: &mut channels.requested_open_url,
+        requested_focus_node: &mut channels.requested_focus_node,
+        field_index,
+        page_viewer_states: Some(page_viewer_states),
+        markdown_cache: Some(markdown_cache),
+        requested_page_save: &mut channels.requested_page_save,
+    };
+    crate::ui::inspector::render_body(ui, tag_query, &mut data, Some(max_h));
 }
 
 /// Truncate a markdown body to a hover-preview snippet: up to `max_chars`

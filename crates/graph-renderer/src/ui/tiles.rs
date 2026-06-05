@@ -61,6 +61,13 @@ pub enum Placement {
 pub enum PaneKind {
     Section(Section),
     FilterStrip,
+    /// The promoted-node inspector ("Node" panel). The body is rendered
+    /// by `App` (it needs App-owned data the workspace can't reach) via
+    /// the optional `NodePaneCtx` injected into [`TileBehavior`]; when no
+    /// node is promoted the pane renders an empty-state hint. There is at
+    /// most one such pane in the tree at a time (the workspace de-dups by
+    /// `PaneKind`).
+    Node,
     /// Placeholder leaf — renders a dashed "drop here" rect. Reserved
     /// snap targets that the user (or auto-open) can fill.
     Empty,
@@ -71,6 +78,7 @@ impl PaneKind {
         match self {
             PaneKind::Section(s) => s.title().to_string(),
             PaneKind::FilterStrip => "Filters".to_string(),
+            PaneKind::Node => "Node".to_string(),
             PaneKind::Empty => "empty".to_string(),
         }
     }
@@ -369,7 +377,7 @@ pub enum PaneOp {
 /// `&mut` access to the state shards a pane body might need — the
 /// `tree` itself is removed from AppState before `tree.ui` is called so
 /// the borrow checker is satisfied.
-pub struct TileBehavior<'a> {
+pub struct TileBehavior<'a, 'b> {
     pub state: &'a mut AppState,
     pub registry: &'a mut ActionRegistry,
     pub layout_registry: &'a LayoutRegistry,
@@ -379,9 +387,20 @@ pub struct TileBehavior<'a> {
     /// frame. Drives the focused-tile border. Updated via queued
     /// `PaneOp::Focus` after the tree walk.
     pub focused_panel: Option<FocusedPanel>,
+    /// Body renderer for the `PaneKind::Node` pane. The promoted-node
+    /// inspector needs App-owned data (NodeMeta, edges, page-viewer
+    /// state, async channels) that this workspace can't borrow, so `App`
+    /// hands the body in as a closure. `None` when no node is promoted —
+    /// the pane then renders its empty-state hint.
+    ///
+    /// Carries an independent lifetime `'b` (distinct from `'a`, the
+    /// AppState borrow) so the borrow checker doesn't tie the closure's
+    /// lifetime to `state`'s — letting `show_workspace_panel` touch
+    /// `state.tiles.width` after the workspace render.
+    pub node_body: Option<&'b mut dyn FnMut(&mut egui::Ui)>,
 }
 
-impl<'a> TileBehavior<'a> {
+impl<'a, 'b> TileBehavior<'a, 'b> {
     /// Map a `PaneKind` to its `FocusedPanel` discriminator (None for
     /// the Empty placeholder, which is never focusable).
     fn focus_id_for(pane: &PaneKind) -> Option<FocusedPanel> {
@@ -389,12 +408,17 @@ impl<'a> TileBehavior<'a> {
             PaneKind::Section(Section::Debug) => Some(FocusedPanel::Debug),
             PaneKind::Section(s) => Some(FocusedPanel::Section(*s)),
             PaneKind::FilterStrip => Some(FocusedPanel::FilterStrip),
+            // The Node pane's focus is keyed by node idx (AnchoredNode),
+            // which `focus_id_for` can't know from the PaneKind alone.
+            // Focus for the Node pane is acquired by App when it renders
+            // the body, so the workspace doesn't drive a focus id here.
+            PaneKind::Node => None,
             PaneKind::Empty => None,
         }
     }
 }
 
-impl<'a> egui_tiles::Behavior<PaneKind> for TileBehavior<'a> {
+impl<'a, 'b> egui_tiles::Behavior<PaneKind> for TileBehavior<'a, 'b> {
     fn tab_title_for_pane(&mut self, pane: &PaneKind) -> egui::WidgetText {
         pane.title().into()
     }
@@ -532,6 +556,20 @@ impl<'a> egui_tiles::Behavior<PaneKind> for TileBehavior<'a> {
             PaneKind::FilterStrip => {
                 crate::ui::filter_strip::render_tiled_body(ui, self.state);
             }
+            PaneKind::Node => {
+                if let Some(body) = self.node_body.as_deref_mut() {
+                    body(ui);
+                } else {
+                    // No node promoted — render an empty-state hint so the
+                    // pane reads as "this is where the inspected node will
+                    // appear" rather than a blank tile.
+                    ui.add_space(8.0);
+                    ui.label(
+                        egui::RichText::new("Click a node to inspect it here")
+                            .color(palette::GREY),
+                    );
+                }
+            }
             PaneKind::Empty => {
                 let avail = ui.available_rect_before_wrap();
                 let painter = ui.painter();
@@ -588,6 +626,11 @@ pub fn apply_pane_ops(
                 match &pane {
                     PaneKind::Section(s) => state.set_section_open(*s, true),
                     PaneKind::FilterStrip => state.filter_strip_open = true,
+                    // Floating the Node pane just flips its placement; the
+                    // panel stays "open" as long as a node is promoted
+                    // (App owns that flag). App renders the floating Node
+                    // FloatingPanel next frame.
+                    PaneKind::Node => state.node_panel_open = true,
                     PaneKind::Empty => {}
                 }
             }
@@ -600,6 +643,13 @@ pub fn apply_pane_ops(
                 match &pane {
                     PaneKind::Section(s) => state.set_section_open(*s, false),
                     PaneKind::FilterStrip => state.filter_strip_open = false,
+                    // Closing the Node tile dismisses the promoted node.
+                    // App reads `node_panel_close_requested` after the tree
+                    // walk and clears `promoted_anchored_idx`.
+                    PaneKind::Node => {
+                        state.node_panel_open = false;
+                        state.node_panel_close_requested = true;
+                    }
                     PaneKind::Empty => {}
                 }
                 if was_focused {
@@ -621,6 +671,9 @@ pub fn set_placement(state: &mut AppState, pane: &PaneKind, p: Placement) {
         }
         PaneKind::FilterStrip => {
             state.filter_strip_placement = p;
+        }
+        PaneKind::Node => {
+            state.node_panel_placement = p;
         }
         PaneKind::Empty => {}
     }
@@ -654,6 +707,10 @@ pub fn sync_tree_with_open_state(state: &mut AppState) {
                 PaneKind::FilterStrip => (
                     state.filter_strip_open,
                     state.filter_strip_placement,
+                ),
+                PaneKind::Node => (
+                    state.node_panel_open,
+                    state.node_panel_placement,
                 ),
                 PaneKind::Empty => return None,
             };
@@ -689,6 +746,12 @@ pub fn sync_tree_with_open_state(state: &mut AppState) {
             wanted.push(p);
         }
     }
+    if state.node_panel_open && state.node_panel_placement == Placement::Tiled {
+        let p = PaneKind::Node;
+        if !already.contains(&p) {
+            wanted.push(p);
+        }
+    }
     for p in wanted {
         workspace.snap_insert(p);
     }
@@ -704,6 +767,7 @@ pub fn show_workspace_panel(
     registry: &mut ActionRegistry,
     layout_registry: &LayoutRegistry,
     perf: &PerfCollector,
+    node_body: Option<&mut dyn FnMut(&mut egui::Ui)>,
 ) {
     sync_tree_with_open_state(state);
 
@@ -722,6 +786,12 @@ pub fn show_workspace_panel(
                 .stroke(egui::Stroke::new(1.0, palette::BORDER))
                 .inner_margin(egui::Margin::same(4.0)),
         )
+        // `node_body` is captured by-move (it's consumed into
+        // `TileBehavior`); `state`/`registry`/etc. are captured by
+        // mutable reference. The independent `'b` lifetime on
+        // `TileBehavior.node_body` keeps the closure's borrow from being
+        // tied to `state`, so the post-closure `state.tiles.width` access
+        // below is allowed.
         .show(ctx, |ui| {
             // Pull the tree out so the Behavior can borrow the rest of
             // AppState mutably. Put it back unconditionally below.
@@ -735,6 +805,7 @@ pub fn show_workspace_panel(
                     perf,
                     ops: Vec::new(),
                     focused_panel,
+                    node_body,
                 };
                 workspace.tree.ui(&mut behavior, ui);
                 behavior.ops
@@ -759,11 +830,13 @@ pub fn toggle_panel_with_snap(state: &mut AppState, pane: PaneKind, new_open: bo
     match &pane {
         PaneKind::Section(s) => state.set_section_open(*s, new_open),
         PaneKind::FilterStrip => state.filter_strip_open = new_open,
+        PaneKind::Node => state.node_panel_open = new_open,
         PaneKind::Empty => return,
     }
     let placement = match &pane {
         PaneKind::Section(s) => section_placement(state, *s),
         PaneKind::FilterStrip => state.filter_strip_placement,
+        PaneKind::Node => state.node_panel_placement,
         PaneKind::Empty => Placement::Floating,
     };
     if new_open && placement == Placement::Tiled {

@@ -850,6 +850,24 @@ pub struct AppState {
     /// the historical chrome.
     #[serde(default)]
     pub filter_strip_placement: crate::ui::tiles::Placement,
+    /// Placement of the promoted-node ("Node") panel: Floating (default)
+    /// keeps it as a free-roaming `FloatingPanel`; Tiled snaps it into
+    /// the workspace tree. Toggled via the green traffic light, exactly
+    /// like every other panel. Floating by default so promoting a node
+    /// pops a window rather than re-laying-out the workspace.
+    #[serde(default = "default_node_placement")]
+    pub node_panel_placement: crate::ui::tiles::Placement,
+    /// Mirror of "a node is currently promoted" (App owns the actual
+    /// `promoted_anchored_idx`). App writes this every frame before the
+    /// workspace sync so `sync_tree_with_open_state` can mount/unmount
+    /// the Node pane. Session-scoped, never persisted.
+    #[serde(skip)]
+    pub node_panel_open: bool,
+    /// One-shot: set when the user closes the Node tile via its red
+    /// traffic light inside the workspace. App reads-and-clears it after
+    /// the workspace renders and dismisses the promoted node.
+    #[serde(skip)]
+    pub node_panel_close_requested: bool,
     /// Tile-tree workspace (`egui_tiles`). Hidden when zero tiled
     /// panels are present.
     #[serde(default)]
@@ -1174,6 +1192,10 @@ pub enum PanelId {
     Section(Section),
     FilterStrip,
     Canvas,
+    /// The promoted-node inspector window. One logical panel showing the
+    /// currently-promoted node; its egui memory (position/size) persists
+    /// per this id like every other floating panel.
+    Node,
 }
 
 impl PanelId {
@@ -1182,6 +1204,7 @@ impl PanelId {
             PanelId::Section(s) => s.title(),
             PanelId::FilterStrip => "Filters",
             PanelId::Canvas => "Graph",
+            PanelId::Node => "Node",
         }
     }
 }
@@ -1227,6 +1250,14 @@ impl PanelId {
 pub const STORAGE_KEY: &str = "graph_renderer_app_state";
 
 fn default_true() -> bool { true }
+
+/// Default placement for the promoted-node ("Node") panel. Floating —
+/// unlike the section panels (which default Tiled) we keep node previews
+/// as free-roaming windows so a click pops a card rather than mounting
+/// the workspace side panel.
+fn default_node_placement() -> crate::ui::tiles::Placement {
+    crate::ui::tiles::Placement::Floating
+}
 
 impl AppState {
     /// Whether the given section's floating panel is currently open.
@@ -1287,6 +1318,9 @@ impl Default for AppState {
             section_open: std::collections::BTreeMap::new(),
             section_placement: std::collections::BTreeMap::new(),
             filter_strip_placement: crate::ui::tiles::Placement::default(),
+            node_panel_placement: default_node_placement(),
+            node_panel_open: false,
+            node_panel_close_requested: false,
             tiles: crate::ui::tiles::TileWorkspace::default(),
             style: StyleState::default(),
             layout: LayoutState::default(),
