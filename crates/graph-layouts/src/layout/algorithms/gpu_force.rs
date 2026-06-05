@@ -104,6 +104,17 @@ pub enum SeedMode {
     /// inherits a near-converged layout and spends its frame budget on
     /// local refinement instead of global untangling.
     TopoFisheye,
+    /// Keep whatever positions already live in the shared buffer — generate
+    /// no seed and, on `init_with_device`, skip the `write_buffer` that would
+    /// otherwise overwrite the buffer. Use this when the caller has already
+    /// placed *meaningful* positions in the buffer (a generated graph's sphere,
+    /// an explicitly-applied "Initial seed", or a previous sim's settled state)
+    /// and wants the force sim to *resume* from them rather than re-seed.
+    ///
+    /// This is deliberately **not** the default: a fresh vault whose server
+    /// positions are all-zero (the `/graph/positions` endpoint is 2-D x,y and
+    /// can be degenerate) still needs `Random`/`TopoFisheye` to spread it out.
+    None,
 }
 
 impl Default for SeedMode {
@@ -117,6 +128,7 @@ impl SeedMode {
     fn from_str(s: &str) -> Self {
         match s.to_ascii_lowercase().as_str() {
             "topo_fisheye" | "topofisheye" | "tf" | "fisheye" => SeedMode::TopoFisheye,
+            "none" | "keep" | "keep_current" => SeedMode::None,
             _ => SeedMode::Random,
         }
     }
@@ -124,6 +136,7 @@ impl SeedMode {
         match self {
             SeedMode::Random => "random",
             SeedMode::TopoFisheye => "topo_fisheye",
+            SeedMode::None => "none",
         }
     }
 }
@@ -741,7 +754,15 @@ impl GpuForceLayout {
         positions_buffer: &wgpu::Buffer,
     ) -> Result<(), String> {
         let state = GpuState::new_borrowed(device, graph, positions_buffer, &self.options)?;
-        state.upload_initial_positions_to(queue, positions_buffer);
+        // SeedMode::None means "keep whatever is already in the shared buffer":
+        // skip the write_buffer that would clobber meaningful caller-supplied
+        // positions (generated sphere, applied seed, prior settled state). The
+        // grid/repulsion bookkeeping is still seeded from the precomputed
+        // `cpu_positions` mirror, which `new_borrowed` filled from the graph's
+        // `position3` (synced from the live buffer by the caller).
+        if !matches!(self.options.seed_mode, SeedMode::None) {
+            state.upload_initial_positions_to(queue, positions_buffer);
+        }
         self.state = Some(state);
         Ok(())
     }
@@ -1182,6 +1203,11 @@ fn precompute(graph: &Graph, seed_mode: &SeedMode, spring_len: f32) -> PreComput
                 &crate::layout::topo_fisheye::CoarsenParams::default(),
             )
         }
+        // No generated seed: zeros as a base. Every node carries a meaningful
+        // `position3` in this mode (the caller synced it from the live buffer),
+        // so the override below replaces these zeros for the CPU mirror, and
+        // `init_with_device` skips the GPU upload entirely.
+        SeedMode::None => vec![0.0f32; 3 * n_nodes as usize],
     };
     // Defensive: if the seeder returned the wrong length (e.g. empty graph
     // edge case), fall back to a zero ball so downstream sizing stays sane.
@@ -3371,6 +3397,68 @@ mod tests {
         );
         let back: GpuForceOptions = serde_json::from_str(&json).expect("deserialize");
         assert!(matches!(back.seed_mode, SeedMode::TopoFisheye));
+    }
+
+    #[test]
+    fn seed_mode_none_serde_round_trip() {
+        let mut opts = GpuForceOptions::default();
+        opts.seed_mode = SeedMode::None;
+        let json = serde_json::to_string(&opts).expect("serialize");
+        assert!(
+            json.contains("\"seed_mode\":\"none\""),
+            "missing seed_mode=none in serialized JSON: {json}"
+        );
+        let back: GpuForceOptions = serde_json::from_str(&json).expect("deserialize");
+        assert!(matches!(back.seed_mode, SeedMode::None));
+        // Aliases also resolve to None.
+        assert!(matches!(SeedMode::from_str("keep"), SeedMode::None));
+        assert!(matches!(SeedMode::from_str("keep_current"), SeedMode::None));
+    }
+
+    #[test]
+    fn precompute_none_seed_preserves_meaningful_positions() {
+        // A graph whose nodes already carry meaningful `position3` (the
+        // generated-sphere / applied-seed / resumed-sim case). Under
+        // SeedMode::None, precompute's initial_positions must reproduce those
+        // positions exactly — no random ball, no flattening.
+        let mut g = seederless_ring(32);
+        let n = g.nodes.len();
+        let mut want: Vec<f32> = Vec::with_capacity(n * 3);
+        for (i, id) in {
+            let mut ids: Vec<String> = g.nodes.keys().cloned().collect();
+            ids.sort();
+            ids
+        }
+        .into_iter()
+        .enumerate()
+        {
+            let p = [i as f32 * 1.5, i as f32 * -2.5, i as f32 * 3.5];
+            want.extend_from_slice(&p);
+            g.nodes.get_mut(&id).unwrap().position3 = Some(p);
+        }
+        let pc = precompute(&g, &SeedMode::None, GpuForceOptions::default().spring_len);
+        assert_eq!(pc.initial_positions.len(), n * 4);
+        for i in 0..n {
+            assert_eq!(pc.initial_positions[4 * i], want[3 * i], "x[{i}]");
+            assert_eq!(pc.initial_positions[4 * i + 1], want[3 * i + 1], "y[{i}]");
+            assert_eq!(pc.initial_positions[4 * i + 2], want[3 * i + 2], "z[{i}]");
+        }
+    }
+
+    #[test]
+    fn precompute_none_seed_without_position3_is_zeros() {
+        // No author positions + None mode => zero base. The GPU upload is
+        // skipped in init_with_device for this mode, so the (degenerate) base
+        // never reaches the buffer; this just pins the documented contract.
+        let g = seederless_ring(16);
+        let pc = precompute(&g, &SeedMode::None, GpuForceOptions::default().spring_len);
+        // The .w slot of each vec4 carries packed node mass, so only assert the
+        // x/y/z lanes are zero.
+        for i in 0..pc.n_nodes as usize {
+            assert_eq!(pc.initial_positions[4 * i], 0.0, "x[{i}]");
+            assert_eq!(pc.initial_positions[4 * i + 1], 0.0, "y[{i}]");
+            assert_eq!(pc.initial_positions[4 * i + 2], 0.0, "z[{i}]");
+        }
     }
 
     // ---- Compact-seed stability ------------------------------------------

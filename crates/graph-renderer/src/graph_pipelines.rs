@@ -1738,3 +1738,37 @@ fn bg_entry(binding: u32, buf: &wgpu::Buffer) -> wgpu::BindGroupEntry<'_> {
         resource: buf.as_entire_binding(),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The topology graph handed to `init_with_device` must carry every node's
+    /// position in `position3`. This is what makes loaded/seeded positions
+    /// survive the layout re-init: precompute's per-node `position3` override
+    /// wins over any generated seed (and SeedMode::None skips the upload
+    /// entirely). A generated graph's sphere — or any meaningful seed — would be
+    /// clobbered by the random ball if this regressed to leaving position3 None.
+    #[test]
+    fn build_topology_graph_carries_position3() {
+        // Three nodes with distinct positions, one edge 0->2.
+        let positions = vec![
+            1.0, 2.0, 3.0, // node 0
+            -4.0, 5.0, -6.0, // node 1
+            7.0, -8.0, 9.0, // node 2
+        ];
+        let edges = vec![0u32, 2u32];
+        let g = build_topology_graph(&positions, &edges);
+
+        assert_eq!(g.nodes.len(), 3);
+        // ids are zero-padded indices ("0".."2", width 1 here).
+        for (i, id) in ["0", "1", "2"].iter().enumerate() {
+            let node = g.nodes.get(*id).expect("node present");
+            let p = node.position3.expect("position3 set from positions");
+            assert_eq!(p[0], positions[i * 3], "x[{i}]");
+            assert_eq!(p[1], positions[i * 3 + 1], "y[{i}]");
+            assert_eq!(p[2], positions[i * 3 + 2], "z[{i}]");
+        }
+        assert_eq!(g.edges.len(), 1, "single edge survives");
+    }
+}

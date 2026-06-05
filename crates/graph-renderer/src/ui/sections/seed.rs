@@ -80,6 +80,10 @@ pub fn show(ui: &mut egui::Ui, state: &mut AppState) {
                     state.seed.strategy = SeedStrategy::None;
                     state.seed.editor.error = None;
                     state.seed.editor.status = None;
+                    // "No seed" = keep the current buffer: flip the active
+                    // gpu-force layout into SeedMode::None so the re-init the
+                    // settings change provokes doesn't re-roll a random ball.
+                    set_gpu_force_seed_mode(state, true);
                 }
                 // Built-in Nix seeds.
                 for &i in &demo_indices {
@@ -143,7 +147,13 @@ pub fn show(ui: &mut egui::Ui, state: &mut AppState) {
             if let Some(positions) =
                 component.show(ui, &mut state.seed.editor, |src| tvix_wasm::eval_seed(src, n))
             {
+                let applied = !positions.is_empty();
                 set_pending(&mut state.seed.editor, &mut state.seed.pending, positions);
+                if applied {
+                    // The applied positions are now meaningful — keep them
+                    // through the sim re-init (SeedMode::None).
+                    set_gpu_force_seed_mode(state, true);
+                }
             }
         }
     }
@@ -161,7 +171,12 @@ fn apply_button(ui: &mut egui::Ui, state: &mut AppState, expr: &str, n: usize) {
         match tvix_wasm::eval_seed(expr, n) {
             Ok(positions) => {
                 state.seed.editor.error = None;
+                let applied = !positions.is_empty();
                 set_pending(&mut state.seed.editor, &mut state.seed.pending, positions);
+                if applied {
+                    // Keep the just-applied positions through the sim re-init.
+                    set_gpu_force_seed_mode(state, true);
+                }
             }
             Err(err) => {
                 state.seed.editor.error = Some(err);
@@ -175,6 +190,37 @@ fn apply_button(ui: &mut egui::Ui, state: &mut AppState, expr: &str, n: usize) {
         for line in err.lines() {
             ui.colored_label(super::super::theme::accent::RED, line);
         }
+    }
+}
+
+/// Write the gpu-force layout's `seed_mode` so the running force sim treats the
+/// current/applied positions correctly:
+///
+///   * `keep == true` ("No seed", or right after an explicit seed Apply) sets
+///     `seed_mode = "none"`, which makes `init_with_device` *skip* the buffer
+///     upload — so the positions already in the buffer (the bootstrap sphere, a
+///     just-applied seed, or a settled sim) survive the re-init that the
+///     seed-mode change triggers via `apply_layout_to_gpu`.
+///   * `keep == false` restores `seed_mode = "random"` (the historical default)
+///     so a future *fresh* load still spreads a degenerate vault.
+///
+/// Only the `gpu-force` settings block is touched, and only its `seed_mode`
+/// key — every other tuned field is left intact. If the block doesn't exist
+/// yet, `apply_layout_to_gpu` will lazy-init it; we still record the intent so
+/// the value sticks once it does.
+fn set_gpu_force_seed_mode(state: &mut AppState, keep: bool) {
+    let mode = if keep { "none" } else { "random" };
+    // Seed a freshly-created block with size-tuned defaults so we don't strand
+    // the layout on the dense-ball anchor defaults — mirrors the lazy-init in
+    // `App::apply_layout_to_gpu`. (In practice the block already exists by the
+    // time this section is usable, but be defensive.)
+    let n = state.stats.n_nodes as usize;
+    let entry = state.layout.settings.entry("gpu-force".to_string()).or_insert_with(|| {
+        serde_json::to_value(graph_layouts::GpuForceOptions::for_n_nodes(n))
+            .unwrap_or_else(|_| serde_json::json!({}))
+    });
+    if let Some(obj) = entry.as_object_mut() {
+        obj.insert("seed_mode".to_string(), serde_json::json!(mode));
     }
 }
 
