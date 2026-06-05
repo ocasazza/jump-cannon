@@ -11,7 +11,10 @@
 //!   * dense node indices via a stable `id -> idx` map (first-seen order),
 //!   * edges rewritten as `Vec<u32>` index pairs `[s, t, s, t, ...]`,
 //!   * positions seeded with [`data::spawn_on_unit_sphere`],
-//!   * a synthesized [`proto::Init`] (`n_nodes`, `n_edges`, default palette).
+//!   * a synthesized [`proto::Init`] (`n_nodes`, `n_edges`, default palette),
+//!   * client-side metric buffers — `degree` (continuous) and `wcc`
+//!     (weakly-connected component, categorical) — computed here so a generated
+//!     graph supports colour-by / size-by without a server round-trip.
 //!
 //! The dependency direction is one-way: `graph-renderer -> tvix-wasm`.
 //! `tvix-wasm` never depends on `graph-renderer`, so there is no cycle and the
@@ -43,9 +46,12 @@ const SPAWN_RADIUS: f32 = 800.0;
 /// Positions: seeded on a sphere shell via [`data::spawn_on_unit_sphere`]
 /// (`3 * n_nodes` floats). The force sim takes over within a few frames.
 ///
-/// `metrics` is empty (no server-side metric buffers for a generated graph);
-/// the renderer's style code already falls back to defaults when a metric is
-/// absent.
+/// Metrics: generated graphs get no server-computed metrics (PageRank, Louvain
+/// community, …), but two are cheap to derive from the topology here and make
+/// the Style panel's colour-by / size-by useful immediately: `degree`
+/// (continuous) and `wcc` (weakly-connected component id, categorical — keyed
+/// the same way the server path keys it, so it cycles the palette). Other metric
+/// keys remain absent and the renderer's style code falls back to defaults.
 pub fn bootstrap_from_generated(graph: &GeneratedGraph) -> Bootstrap {
     // Dense id -> idx, first-seen order. Dedup collapses repeated ids.
     let mut id_to_idx: std::collections::HashMap<&str, u32> =
@@ -77,9 +83,18 @@ pub fn bootstrap_from_generated(graph: &GeneratedGraph) -> Bootstrap {
 
     let positions = data::spawn_on_unit_sphere(n_nodes, SPAWN_RADIUS);
 
+    // Client-side metrics derived from the topology (no server round-trip).
+    let degree = degrees(n_nodes, &edges);
+    let (wcc, num_wcc) = wcc_labels(n_nodes, &edges);
+    let mut metrics: std::collections::HashMap<String, Vec<f32>> =
+        std::collections::HashMap::new();
+    metrics.insert("degree".to_string(), degree);
+    metrics.insert("wcc".to_string(), wcc);
+
     // Synthesize a minimal Init. Palette matches the renderer's default
-    // (Tableau20) so canvas swatches line up with the rest of the app; there
-    // are no community/wcc partitions for a freshly generated graph.
+    // (Tableau20) so canvas swatches line up with the rest of the app. No
+    // community partition is computed client-side (Louvain is server-only), but
+    // wcc is, so `num_wcc` reflects the real component count.
     let palette: Vec<f32> = data::palette_table(data::PaletteId::Tableau20)
         .iter()
         .flat_map(|rgb| rgb.iter().copied())
@@ -88,7 +103,7 @@ pub fn bootstrap_from_generated(graph: &GeneratedGraph) -> Bootstrap {
         n_nodes: n_nodes as u32,
         n_edges,
         num_communities: 0,
-        num_wcc: 0,
+        num_wcc,
         palette,
     };
 
@@ -97,8 +112,61 @@ pub fn bootstrap_from_generated(graph: &GeneratedGraph) -> Bootstrap {
         ids,
         positions,
         edges,
-        metrics: std::collections::HashMap::new(),
+        metrics,
     }
+}
+
+/// Per-node undirected degree as an `f32` metric buffer (each edge increments
+/// both endpoints).
+fn degrees(n_nodes: usize, edges: &[u32]) -> Vec<f32> {
+    let mut d = vec![0.0f32; n_nodes];
+    for pair in edges.chunks_exact(2) {
+        d[pair[0] as usize] += 1.0;
+        d[pair[1] as usize] += 1.0;
+    }
+    d
+}
+
+/// Weakly-connected-component label per node — dense `[0, k)` ids as `f32` plus
+/// the component count `k` — via union-find over the undirected edge set.
+/// Isolated nodes each form their own component.
+fn wcc_labels(n_nodes: usize, edges: &[u32]) -> (Vec<f32>, u32) {
+    let mut parent: Vec<u32> = (0..n_nodes as u32).collect();
+    fn find(parent: &mut [u32], x: u32) -> u32 {
+        let mut root = x;
+        while parent[root as usize] != root {
+            root = parent[root as usize];
+        }
+        // Path compression.
+        let mut cur = x;
+        while parent[cur as usize] != root {
+            let next = parent[cur as usize];
+            parent[cur as usize] = root;
+            cur = next;
+        }
+        root
+    }
+    for pair in edges.chunks_exact(2) {
+        let a = find(&mut parent, pair[0]);
+        let b = find(&mut parent, pair[1]);
+        if a != b {
+            parent[a as usize] = b;
+        }
+    }
+    // Compact roots to dense [0, k) in first-seen order.
+    let mut remap: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
+    let mut labels = vec![0.0f32; n_nodes];
+    let mut next = 0u32;
+    for i in 0..n_nodes as u32 {
+        let root = find(&mut parent, i);
+        let id = *remap.entry(root).or_insert_with(|| {
+            let v = next;
+            next += 1;
+            v
+        });
+        labels[i as usize] = id as f32;
+    }
+    (labels, next)
 }
 
 #[cfg(test)]
@@ -128,7 +196,16 @@ mod tests {
         assert_eq!(bs.ids.len(), 5);
         assert_eq!(bs.positions.len(), 5 * 3);
         assert_eq!(bs.edges.len(), 4 * 2);
-        assert!(bs.metrics.is_empty());
+
+        // Client-side metrics: degree (hub=4, each spoke=1) and a single wcc.
+        let n0_pos = bs.ids.iter().position(|s| s == "n0").unwrap();
+        let degree = bs.metrics.get("degree").expect("degree metric present");
+        assert_eq!(degree.len(), 5);
+        assert_eq!(degree[n0_pos], 4.0, "hub degree");
+        assert_eq!(degree.iter().filter(|&&d| d == 1.0).count(), 4, "four spokes deg 1");
+        let wcc = bs.metrics.get("wcc").expect("wcc metric present");
+        assert!(wcc.iter().all(|&c| c == 0.0), "star is one connected component");
+        assert_eq!(bs.init.as_ref().unwrap().num_wcc, 1);
 
         // The center node "n0" gets index 0 (first-seen), and every edge in a
         // star originates from the center -> its source index is 0.
@@ -203,6 +280,31 @@ mod tests {
 
         assert_eq!(bs.ids, vec!["a", "b"], "duplicate id collapsed");
         assert_eq!(bs.edges, vec![0, 1]);
+    }
+
+    #[test]
+    fn wcc_metric_separates_components() {
+        // Two disjoint edges a-b and c-d => two weakly-connected components.
+        let expr = r#"{
+            nodes = [ { id = "a"; } { id = "b"; } { id = "c"; } { id = "d"; } ];
+            links = [
+              { source = "a"; target = "b"; }
+              { source = "c"; target = "d"; }
+            ];
+        }"#;
+        let graph = eval_graph(expr).expect("inline graph parses");
+        let bs = bootstrap_from_generated(&graph);
+
+        let wcc = bs.metrics.get("wcc").expect("wcc present");
+        assert_eq!(bs.init.as_ref().unwrap().num_wcc, 2, "two components");
+        // a,b share a label; c,d share a different label.
+        assert_eq!(wcc[0], wcc[1], "a,b same component");
+        assert_eq!(wcc[2], wcc[3], "c,d same component");
+        assert_ne!(wcc[0], wcc[2], "the two edges are separate components");
+
+        // Every node has degree 1 here.
+        let degree = bs.metrics.get("degree").unwrap();
+        assert!(degree.iter().all(|&d| d == 1.0));
     }
 
     #[test]
