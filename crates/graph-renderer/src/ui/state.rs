@@ -1442,6 +1442,10 @@ pub struct ComputeEngineState {
     /// One-shot: the user picked engine id `Some(..)` in the combo.
     /// `App::update` PUTs `/compute/layout` then re-requests engines.
     pub select: Option<String>,
+    /// `egui` time (seconds) of the last `/compute/engines` fetch attempt.
+    /// Throttles the auto-retry-while-unavailable loop in the Layout section
+    /// (see `RETRY_SECS`). `0.0` = never attempted.
+    pub last_attempt: f64,
 }
 
 impl ComputeEngineState {

@@ -134,11 +134,32 @@ fn selected_text(state: &AppState, registry: &LayoutRegistry) -> String {
 pub fn show(ui: &mut egui::Ui, state: &mut AppState, registry: &LayoutRegistry) {
     state.snapshot_source = Some("Layout".into());
 
-    // Lazy first fetch of the remote engine list — exactly once per
-    // session. Subsequent refreshes are user-driven (the ↻ button).
-    if !state.compute.requested_once {
+    // Fetch the remote engine list, and KEEP RETRYING (throttled) while it is
+    // unavailable. A single one-shot fetch loses to the common race where the
+    // first request lands during a graph-api cold start / cargo-watch restart
+    // (or before the broker has dialed the worker) — leaving the picker stuck on
+    // "engines unavailable" until the user manually hits ↻, even though dev-up is
+    // running. Retrying every RETRY_SECS self-heals: it picks up the worker the
+    // moment graph-api + the broker are up, then stops once connected.
+    const RETRY_SECS: f64 = 2.0;
+    let now = ui.ctx().input(|i| i.time);
+    let needs_fetch = match state.compute.current() {
+        None => !state.compute.requested_once, // initial fetch
+        Some(Ok(eng)) => !eng.connected,       // reached api but no worker yet
+        Some(Err(_)) => true,                  // request failed (api restarting)
+    };
+    if needs_fetch
+        && !state.compute.refresh_requested
+        && now - state.compute.last_attempt >= RETRY_SECS
+    {
         state.compute.requested_once = true;
+        state.compute.last_attempt = now;
         state.compute.refresh_requested = true;
+    }
+    // Keep the retry loop ticking even when the UI is otherwise idle.
+    if needs_fetch {
+        ui.ctx()
+            .request_repaint_after(std::time::Duration::from_secs_f64(RETRY_SECS));
     }
 
     let active_id = state.layout.active.clone();

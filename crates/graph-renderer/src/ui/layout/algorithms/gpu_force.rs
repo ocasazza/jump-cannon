@@ -6,7 +6,7 @@
 
 use eframe::egui;
 use graph_layouts::{
-    BoxedPhysics, DynPhysicsLayout, GpuForceLayout, GpuForceOptions, RepulsionMode, SeedMode,
+    BoxedPhysics, DynPhysicsLayout, GpuForceLayout, GpuForceOptions, RepulsionMode,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -132,20 +132,10 @@ fn repulsion_mode_label(m: RepulsionMode) -> &'static str {
         .unwrap_or("Grid (27-cell)")
 }
 
-// ---- Seed-mode combo helpers ----------------------------------------------
-
-const SEED_MODES: &[(SeedMode, &str)] = &[
-    (SeedMode::Random, "Random (ball)"),
-    (SeedMode::TopoFisheye, "Topological fisheye (GKN §4)"),
-];
-
-fn seed_mode_label(m: &SeedMode) -> &'static str {
-    SEED_MODES
-        .iter()
-        .find(|(mode, _)| mode == m)
-        .map(|(_, l)| *l)
-        .unwrap_or("Random (ball)")
-}
+// Initial-position seeding is now chosen in the unified "Initial seed" section
+// of the Layout panel (`ui::sections::seed`), not per-layout here. The
+// `GpuForceOptions::seed_mode` field stays at its default; the duplicate combo
+// that used to live in this panel was removed.
 
 // ---- Sidebar widgets -------------------------------------------------------
 
@@ -279,30 +269,6 @@ fn render_ui(ui: &mut egui::Ui, json: &mut Value) {
                 changed = true;
             }
         });
-    }
-
-    subgroup_separator(ui);
-
-    // Initial-position seeder. Picks what the sim starts from before the
-    // force model takes over.
-    subgroup_label(ui, "Initial seed");
-    hint_label(ui, "Random: cheap ball • Topo fisheye: multilevel coarsen + relax");
-    ui.add_space(4.0);
-    let mut seed = opts.seed_mode.clone();
-    row(ui, "seed", |ui| {
-        egui::ComboBox::from_id_salt("seed-mode")
-            .selected_text(seed_mode_label(&seed))
-            .show_ui(ui, |ui| {
-                for (m, label) in SEED_MODES {
-                    if ui.selectable_label(seed == *m, *label).clicked() {
-                        seed = m.clone();
-                    }
-                }
-            });
-    });
-    if seed != opts.seed_mode {
-        opts.seed_mode = seed;
-        changed = true;
     }
 
     if changed {
