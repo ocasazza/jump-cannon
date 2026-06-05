@@ -320,6 +320,56 @@ pub struct GeometricSettings {
     /// orientations explore so a patchy aggregate can find its aligned ground
     /// state rather than freezing into the random seed.
     pub rotational_diffusion: f32,
+
+    // --- bending rigidity + spontaneous curvature (Phase C) ---
+    //
+    // NORMAL CONVENTION (pinned once, here): the per-node director `nᵢ` is the
+    // membrane **NORMAL** — perpendicular to the local sheet, *not* tangent to
+    // it. Every bending term below is written in that frame: a flat sheet has all
+    // normals parallel; a uniformly curved sheet has neighbouring normals tilted
+    // by a fixed angle about their in-plane separation axis.
+    /// Splay-bend stiffness — the **bending modulus** knob (κ). `0` ⇒ OFF: no
+    /// bending torque is applied, so the director field evolves exactly as it did
+    /// before this knob existed (default-settings behaviour and the golden master
+    /// are byte-identical; the term is gated on both `kappa_bend > 0` *and*
+    /// `well_depth > 0`, since with no cohesion well there is no membrane to bend).
+    /// `> 0` adds, inside [`integrate_directors`], a torque that penalises
+    /// *misalignment of neighbouring normals away from the preferred relative tilt*
+    /// — a quadratic-in-local-curvature cost, i.e. a genuine bending rigidity. It
+    /// is a **torque only**: it never enters [`compute_forces`] /
+    /// [`potential_energy`], so the residual invariant `−∇E == compute_forces` and
+    /// the golden master are untouched (bending is validated via order parameters
+    /// and relaxation stability, not via the energy scalar — see
+    /// `docs/self-assembly-plan.md` §4's JCP checklist). An `EnergyBreakdown::bending`
+    /// field with a matching conservative force is a deferred, non-golden-critical
+    /// increment.
+    pub kappa_bend: f32,
+    /// Spontaneous curvature `c₀` — the preferred **relative tilt** between
+    /// neighbouring normals (Proposal 2's curvature knob, expressed as a director
+    /// tilt rather than bead geometry). `0` ⇒ parallel normals are the ground
+    /// state ⇒ the relaxed sheet is **flat**. `> 0` ⇒ each neighbour pair wants its
+    /// normals tilted by `c₀` (radians, small-angle) about their in-plane
+    /// separation axis, so a relaxed sheet is uniformly **curved** with radius
+    /// `R ≈ (neighbour spacing)/c₀` — the flat→tube→vesicle selector. Only acts
+    /// when `kappa_bend > 0` (no bending stiffness ⇒ no curvature preference to
+    /// impose). Sign is applied consistently across each pair (the partner sees the
+    /// separation axis negated) so `c₀` imposes one coherent curvature sense.
+    pub spont_curvature_c0: f32,
+    /// Flat-membrane (Gay–Berne-style side-by-side) selector. `0` ⇒ OFF: the well
+    /// depth is unmodified (byte-identical default). `> 0` biases a pair's well
+    /// depth toward **side-by-side** packing — neighbours sitting in each other's
+    /// tangent plane (`r̂ ⊥ normal`) — by the factor
+    /// `1 + gb_side_strength·(1 − (nᵢ·r̂)²)·(1 − (nⱼ·r̂)²)`. This rewards spreading
+    /// into a self-limiting lamella instead of stacking into the mildly-anisotropic
+    /// nematic droplet the bare patchy well condenses to. It is applied ONLY as a
+    /// per-pair **depth scalar** at the single `orientation_factor` chokepoint, so
+    /// the radial force law and its energy integral both see the same scalar and the
+    /// `−∇E == compute_forces` relationship is preserved exactly. The *tangential*
+    /// derivative of this depth bias is intentionally NOT added to
+    /// [`compute_forces`] in the first cut (the bias acts through the well's radial
+    /// magnitude only) — consistent with how the patchy anisotropy factor already
+    /// omits its angular translational force.
+    pub gb_side_strength: f32,
 }
 
 impl Default for GeometricSettings {
@@ -376,6 +426,15 @@ impl Default for GeometricSettings {
             // directors then explore toward their aligned ground state).
             anisotropy_strength: 0.0,
             rotational_diffusion: 1.0,
+
+            // Default OFF: κ=0 ⇒ no bending torque ⇒ the director field evolves
+            // exactly as before ⇒ default behaviour byte-identical (golden master
+            // unaffected). c₀=0 ⇒ flat is the ground state; gb_side=0 ⇒ the well
+            // depth is unmodified (orientation_factor returns its pre-Phase-C value
+            // exactly).
+            kappa_bend: 0.0,
+            spont_curvature_c0: 0.0,
+            gb_side_strength: 0.0,
         }
     }
 }
@@ -919,13 +978,28 @@ fn potential_energy(st: &State, s: &GeometricSettings) -> EnergyBreakdown {
         for j in (i + 1)..st.n {
             let rj = lookup_radius(&s.class_radius, class[j] as usize, s.default_radius);
             let sigma = (ri + rj).max(1e-3) as f64;
-            let d = pair_dist(pos, i, j).max(1e-4) as f64;
+            let ddx = pos[3 * j] - pos[3 * i];
+            let ddy = pos[3 * j + 1] - pos[3 * i + 1];
+            let ddz = pos[3 * j + 2] - pos[3 * i + 2];
+            let d = ((ddx * ddx + ddy * ddy + ddz * ddz).sqrt().max(1e-4)) as f64;
             if d < sigma {
                 exclusion += s.exclusion_strength as f64 * (sigma * (sigma / d).ln() - (sigma - d));
             }
+            // Same r̂ the force pass uses, so the GB-side depth scalar (and hence
+            // the cohesion energy) matches the radial force's depth exactly.
+            let invd = 1.0 / (d as f32).max(1e-4);
+            let (ux, uy, uz) = (ddx * invd, ddy * invd, ddz * invd);
             let eps = (pair_well_depth(s, nc, class[i] as usize, class[j] as usize)
-                * orientation_factor(&st.directors, s.anisotropy_strength, i, j))
-                as f64;
+                * orientation_factor(
+                    &st.directors,
+                    s.anisotropy_strength,
+                    s.gb_side_strength,
+                    ux,
+                    uy,
+                    uz,
+                    i,
+                    j,
+                )) as f64;
             if eps > 0.0 {
                 if d < sigma {
                     cohesion -= eps;
@@ -1139,23 +1213,38 @@ fn accumulate_exclusion_affinity(force: &mut [f32], st: &State, s: &GeometricSet
         for j in (i + 1)..n {
             let rj = lookup_radius(&s.class_radius, class[j] as usize, s.default_radius);
             let sigma = (ri + rj).max(1e-3);
-            // The attractive well's tail reaches σ + w_c, which may exceed the
-            // exclusion/affinity cutoff — extend so the well is never clipped.
-            // The orientation (patchy) factor scales the well depth per pair: at
-            // anisotropy 0 it is 1 (isotropic ⇒ byte-identical default).
-            let eps = pair_well_depth(s, nc, class[i] as usize, class[j] as usize)
-                * orientation_factor(&st.directors, s.anisotropy_strength, i, j);
-            let cutoff = (s.cutoff_scale * sigma).max(if eps > 0.0 { sigma + wc } else { 0.0 });
 
+            // Separation + unit direction up front: the orientation factor's
+            // Gay–Berne side-by-side term needs r̂, so the well depth (which sets
+            // the cutoff) must be computed against the same r̂ the force uses.
             let dx = pos[3 * j] - pos[3 * i];
             let dy = pos[3 * j + 1] - pos[3 * i + 1];
             let dz = pos[3 * j + 2] - pos[3 * i + 2];
             let dist2 = dx * dx + dy * dy + dz * dz;
+            let dist = dist2.sqrt().max(1e-4);
+            let (ux, uy, uz) = (dx / dist, dy / dist, dz / dist);
+
+            // The attractive well's tail reaches σ + w_c, which may exceed the
+            // exclusion/affinity cutoff — extend so the well is never clipped.
+            // The orientation (patchy + GB-side) factor scales the well depth per
+            // pair: at anisotropy 0 and gb_side 0 it is 1 (isotropic ⇒
+            // byte-identical default).
+            let eps = pair_well_depth(s, nc, class[i] as usize, class[j] as usize)
+                * orientation_factor(
+                    &st.directors,
+                    s.anisotropy_strength,
+                    s.gb_side_strength,
+                    ux,
+                    uy,
+                    uz,
+                    i,
+                    j,
+                );
+            let cutoff = (s.cutoff_scale * sigma).max(if eps > 0.0 { sigma + wc } else { 0.0 });
+
             if dist2 > cutoff * cutoff {
                 continue;
             }
-            let dist = dist2.sqrt().max(1e-4);
-            let (ux, uy, uz) = (dx / dist, dy / dist, dz / dist);
 
             // Short-range soft exclusion: zero at dist = sigma, growing as the
             // pair approaches. Positive `repel` pushes them apart.
@@ -1276,15 +1365,26 @@ fn integrate(st: &mut State, force: &[f32], s: &GeometricSettings) {
 ///    fluctuation that lets the field explore rather than freeze into the seed.
 ///    Active only when `temperature > 0` (so `temperature == 0` keeps directors
 ///    perfectly static and deterministic).
+///  - **Splay-bend torque (bending rigidity, Phase C).** When `kappa_bend > 0`
+///    (and a cohesion well exists), each neighbour pair accumulates a second
+///    scratch field that drives `nⱼ` toward the *preferred relative tilt* of `nᵢ`
+///    — parallel normals (flat) when `spont_curvature_c0 == 0`, or normals tilted
+///    by `c₀` about the in-plane separation axis (uniformly curved) when `c₀ > 0`.
+///    This is the bending modulus: a quadratic-in-local-curvature director
+///    misalignment cost. It is a TORQUE ONLY — it never enters [`compute_forces`]
+///    / [`potential_energy`], so the residual invariant and the golden master are
+///    untouched (the term mutates only `st.directors`, which `observe()` never
+///    reads). Gated on `kappa_bend > 0 && well_depth > 0`, mirroring `align_on`.
 ///
-/// With both off (the default: anisotropy 0 **and/or** temperature 0) the
-/// directors are untouched and never affect the forces, so default-settings
+/// With everything off (the default: anisotropy 0 / temperature 0 / kappa_bend 0)
+/// the directors are untouched and never affect the forces, so default-settings
 /// behaviour — and the golden master — is byte-identical.
 fn integrate_directors(st: &mut State, s: &GeometricSettings) {
     let kt = s.temperature.max(0.0);
     let noise_on = kt > 0.0 && s.rotational_diffusion > 0.0;
     let align_on = s.anisotropy_strength > 0.0 && s.well_depth > 0.0;
-    if !noise_on && !align_on {
+    let bend_on = s.kappa_bend > 0.0 && s.well_depth > 0.0;
+    if !noise_on && !align_on && !bend_on {
         return; // directors are static — nothing (incl. RNG) is consumed
     }
     let n = st.n;
@@ -1333,6 +1433,65 @@ fn integrate_directors(st: &mut State, s: &GeometricSettings) {
         }
     }
 
+    // --- splay-bend field b_i: drive n_j toward n_i's preferred tilt ----------
+    // Same i<j neighbour loop, same well distance falloff w as the aligning
+    // field. For pair (i,j) with in-plane separation r̂, the target for n_j is
+    // n_i tilted toward r̂ by the spontaneous-curvature angle c₀ (small-angle):
+    //   t_ij = n_i + c₀·(r̂ − (r̂·n_i)·n_i)   (renormalised)
+    // and symmetrically the target for n_i uses r̂ negated, so c₀ imposes ONE
+    // coherent curvature sign across the pair. The torque on n_j is the
+    // perpendicular-to-n_j component of κ·w·(t_ij − n_j); accumulate it (and the
+    // symmetric term on n_i) into bend_field. c₀==0 ⇒ t_ij == n_i ⇒ this reduces
+    // to a pure alignment torque (flat ground state).
+    let mut bend_field = vec![0.0f32; 3 * n];
+    if bend_on {
+        let kappa = s.kappa_bend;
+        let c0 = s.spont_curvature_c0;
+        let wc = s.well_width.max(1e-4);
+        for i in 0..n {
+            let ri = lookup_radius(&s.class_radius, class[i] as usize, s.default_radius);
+            for j in (i + 1)..n {
+                let rj = lookup_radius(&s.class_radius, class[j] as usize, s.default_radius);
+                let sigma = (ri + rj).max(1e-3);
+                let depth = pair_well_depth(s, nc, class[i] as usize, class[j] as usize);
+                if depth <= 0.0 {
+                    continue;
+                }
+                let dx = pos[3 * j] - pos[3 * i];
+                let dy = pos[3 * j + 1] - pos[3 * i + 1];
+                let dz = pos[3 * j + 2] - pos[3 * i + 2];
+                let d = (dx * dx + dy * dy + dz * dz).sqrt();
+                // Distance weight: full inside contact, cosine² decay over the
+                // well, zero beyond σ + w_c (matches the cohesion well's range).
+                let w = if d <= sigma {
+                    1.0
+                } else if d <= sigma + wc {
+                    let c = (std::f32::consts::FRAC_PI_2 * (d - sigma) / wc).cos();
+                    c * c
+                } else {
+                    0.0
+                };
+                if w == 0.0 || d < 1e-6 {
+                    continue;
+                }
+                let inv = 1.0 / d;
+                let (rx, ry, rz) = (dx * inv, dy * inv, dz * inv); // r̂ from i→j
+                let (nix, niy, niz) = (dir[3 * i], dir[3 * i + 1], dir[3 * i + 2]);
+                let (njx, njy, njz) = (dir[3 * j], dir[3 * j + 1], dir[3 * j + 2]);
+                let kw = kappa * w;
+
+                // Target for n_j: tilt n_i toward r̂ (in-plane part of r̂) by c₀.
+                accumulate_bend_torque(
+                    &mut bend_field, j, nix, niy, niz, rx, ry, rz, njx, njy, njz, c0, kw,
+                );
+                // Target for n_i: tilt n_j toward −r̂ by c₀ (consistent sign).
+                accumulate_bend_torque(
+                    &mut bend_field, i, njx, njy, njz, -rx, -ry, -rz, nix, niy, niz, c0, kw,
+                );
+            }
+        }
+    }
+
     // --- integrate each director: align toward its field + rotational noise ---
     // Overdamped rotational step toward the field's *direction*: the aligning
     // field h is normalised to a unit target before use, so the per-step rotation
@@ -1340,6 +1499,10 @@ fn integrate_directors(st: &mut State, s: &GeometricSettings) {
     // h — an unbounded raw `μ·h` overshoots and makes the director oscillate, the
     // head-to-head sign-flips that show up as a volatile, never-settling S.
     let mobility = s.anisotropy_strength.min(1.0); // bounded align rate
+    // Bounded bending rate, reusing the same min(.,1) overshoot guard the align
+    // rate uses (the splay-bend torque is already an accumulated sum over
+    // neighbours, so an unbounded κ would overshoot and oscillate the director).
+    let bend_mobility = s.kappa_bend.min(1.0);
     let noise_sigma = if noise_on {
         (s.rotational_diffusion * kt * dt).sqrt()
     } else {
@@ -1365,6 +1528,15 @@ fn integrate_directors(st: &mut State, s: &GeometricSettings) {
                 az += dt * mobility * pz;
             }
         }
+        if bend_on {
+            // bend_field is already the perpendicular-to-nᵢ torque (κ·w·perp),
+            // summed over neighbours. Apply it with the bounded bend mobility,
+            // mirroring the aligning step. c₀==0 makes this a pure flat-alignment
+            // torque; c₀>0 drives a uniform inter-normal tilt (curvature).
+            ax += dt * bend_mobility * bend_field[3 * i];
+            ay += dt * bend_mobility * bend_field[3 * i + 1];
+            az += dt * bend_mobility * bend_field[3 * i + 2];
+        }
         if noise_sigma > 0.0 {
             ax += noise_sigma * next_gaussian(&mut st.rot_rng);
             ay += noise_sigma * next_gaussian(&mut st.rot_rng);
@@ -1379,6 +1551,54 @@ fn integrate_directors(st: &mut State, s: &GeometricSettings) {
             st.directors[3 * i + 2] = az / len;
         }
     }
+}
+
+/// Accumulate the splay-bend torque on node `target` whose director is
+/// `(nx, ny, nz)`, driving it toward the *preferred relative tilt* of the
+/// reference normal `(refx, refy, refz)` about the in-plane separation axis
+/// `(rx, ry, rz)` (a unit vector) by the spontaneous-curvature angle `c0`, scaled
+/// by `kw = κ·w`.
+///
+/// The target orientation is the reference normal tilted toward `r̂` in the plane
+/// they span (small-angle): `t = ref + c0·(r̂ − (r̂·ref)·ref)`, renormalised. The
+/// torque is the component of `kw·(t − n)` perpendicular to `n` — a pure rotation
+/// toward `t`, no stretch. `c0 == 0` ⇒ `t == ref` ⇒ a pure alignment torque (the
+/// flat ground state). Accumulated into `bend_field[target]`.
+#[allow(clippy::too_many_arguments)]
+fn accumulate_bend_torque(
+    bend_field: &mut [f32],
+    target: usize,
+    refx: f32,
+    refy: f32,
+    refz: f32,
+    rx: f32,
+    ry: f32,
+    rz: f32,
+    nx: f32,
+    ny: f32,
+    nz: f32,
+    c0: f32,
+    kw: f32,
+) {
+    // In-plane part of r̂ relative to the reference normal: r̂ − (r̂·ref)·ref.
+    let rdotn = rx * refx + ry * refy + rz * refz;
+    let (ipx, ipy, ipz) = (rx - rdotn * refx, ry - rdotn * refy, rz - rdotn * refz);
+    // Preferred target = ref tilted toward the in-plane axis by c0, renormalised.
+    let (mut tx, mut ty, mut tz) = (refx + c0 * ipx, refy + c0 * ipy, refz + c0 * ipz);
+    let tlen = (tx * tx + ty * ty + tz * tz).sqrt();
+    if tlen < 1e-9 {
+        return;
+    }
+    let invt = 1.0 / tlen;
+    tx *= invt;
+    ty *= invt;
+    tz *= invt;
+    // Torque = kw·(t − n) projected perpendicular to n (rotation toward t).
+    let tdot = tx * nx + ty * ny + tz * nz;
+    let (px, py, pz) = (tx - tdot * nx, ty - tdot * ny, tz - tdot * nz);
+    bend_field[3 * target] += kw * px;
+    bend_field[3 * target + 1] += kw * py;
+    bend_field[3 * target + 2] += kw * pz;
 }
 
 // ---------------------------------------------------------------------------
@@ -1757,20 +1977,60 @@ fn lookup_affinity(matrix: &[f32], n: usize, a: usize, b: usize) -> f32 {
 /// the simple monomer case. Returns `0` (OFF) whenever `well_depth == 0`.
 /// Orientation (patchy) factor multiplying a pair's cohesion-well depth.
 ///
-/// Returns `max(0, 1 + anisotropy_strength·(nᵢ·nⱼ))`: at `anisotropy_strength == 0`
-/// it is identically `1` (isotropic — the byte-identical default). Otherwise pairs
-/// whose directors are **aligned** (`nᵢ·nⱼ → +1`) get a deeper well (attract more)
-/// and **anti-aligned** pairs a shallower/zero well, so the system's low-energy
-/// state is a mutually-aligned (nematic) aggregate — the bilayer-sheet precursor.
-/// Clamped at 0 so the well never *inverts* into a spurious repulsion.
-fn orientation_factor(directors: &[f32], anisotropy: f32, i: usize, j: usize) -> f32 {
-    if anisotropy == 0.0 {
+/// Two multiplicative contributions, both default-off (returning exactly `1.0` so
+/// the well depth — and therefore both the radial force *and* its energy integral
+/// — is byte-identical to before either knob existed):
+///
+///  - **Patchy / polar (`anisotropy`):** `max(0, 1 + anisotropy·(nᵢ·nⱼ))`. Pairs
+///    whose directors (normals) are **aligned** (`nᵢ·nⱼ → +1`) get a deeper well
+///    (attract more), anti-aligned pairs a shallower/zero well — the
+///    mutually-aligned (nematic) aggregate is the bilayer-sheet precursor. Clamped
+///    at 0 so the well never *inverts* into a spurious repulsion.
+///  - **Gay–Berne side-by-side (`gb_side`):** `1 + gb_side·(1 − (nᵢ·r̂)²)·(1 − (nⱼ·r̂)²)`,
+///    where `r̂` is the unit separation `(uⱼ − uᵢ)/‖·‖`. With the director as the
+///    membrane NORMAL, `(1 − (n·r̂)²)` is largest when the separation lies in the
+///    tangent plane (`r̂ ⊥ n`), so this *rewards neighbours sitting side-by-side in
+///    each other's plane* — spreading into a self-limiting lamella rather than
+///    stacking into a nematic droplet. Applied here, the one place the well depth
+///    is scaled, so it feeds the radial force and its energy integral identically
+///    (the `−∇E == compute_forces` relationship is preserved). Its tangential
+///    derivative is intentionally not added to the translational force in this cut.
+///
+/// `r̂` is passed as its three unit components `(rx, ry, rz)`; callers that only
+/// need the patchy factor (none currently) may pass any unit vector when
+/// `gb_side == 0`, as that branch is then skipped.
+fn orientation_factor(
+    directors: &[f32],
+    anisotropy: f32,
+    gb_side: f32,
+    rx: f32,
+    ry: f32,
+    rz: f32,
+    i: usize,
+    j: usize,
+) -> f32 {
+    if anisotropy == 0.0 && gb_side == 0.0 {
         return 1.0;
     }
-    let dot = directors[3 * i] * directors[3 * j]
-        + directors[3 * i + 1] * directors[3 * j + 1]
-        + directors[3 * i + 2] * directors[3 * j + 2];
-    (1.0 + anisotropy * dot).max(0.0)
+    let (nix, niy, niz) = (directors[3 * i], directors[3 * i + 1], directors[3 * i + 2]);
+    let (njx, njy, njz) = (directors[3 * j], directors[3 * j + 1], directors[3 * j + 2]);
+
+    let mut f = if anisotropy != 0.0 {
+        let dot = nix * njx + niy * njy + niz * njz;
+        (1.0 + anisotropy * dot).max(0.0)
+    } else {
+        1.0
+    };
+
+    if gb_side != 0.0 {
+        // (1 − (n·r̂)²) ∈ [0,1]: 1 when the normal is perpendicular to the
+        // separation (side-by-side), 0 when parallel (stacked face-to-face).
+        let ir = nix * rx + niy * ry + niz * rz;
+        let jr = njx * rx + njy * ry + njz * rz;
+        let side = (1.0 - ir * ir) * (1.0 - jr * jr);
+        f *= 1.0 + gb_side * side;
+    }
+    f
 }
 
 fn pair_well_depth(s: &GeometricSettings, nc: usize, a: usize, b: usize) -> f32 {

@@ -1426,6 +1426,211 @@ fn directors_do_not_affect_forces_without_anisotropy() {
 }
 
 // ---------------------------------------------------------------------------
+// PHASE C — bending rigidity + spontaneous curvature (splay-bend torque)
+// ---------------------------------------------------------------------------
+//
+// The director is the membrane NORMAL. The splay-bend torque (inside
+// integrate_directors, gated on kappa_bend>0 && well_depth>0) drives neighbouring
+// normals toward a preferred relative tilt c₀ — parallel (flat) at c₀=0, fanned
+// out by a fixed inter-normal angle at c₀>0. It is a torque only: positions and
+// the energy scalar are untouched. These micro-tests pin the claimed behaviour on
+// a small flat patch with known geometry, run deterministically (temperature=0).
+
+/// Build an engine over `n` unbonded nodes at `positions` whose directors are
+/// injected verbatim, with a flat (z=0) cohesion patch held at contact spacing so
+/// every node is a well-range neighbour of the others. The bending knobs are set
+/// by the caller via `settings`. No thermostat (temperature stays 0) ⇒ the only
+/// motion of the directors is the deterministic bending torque.
+fn bending_engine(
+    positions: &[f32],
+    directors: &[f32],
+    radius: f32,
+    kappa_bend: f32,
+    c0: f32,
+) -> (GeometricEngine, EngineCtx) {
+    let n = positions.len() / 3;
+    let settings = GeometricSettings {
+        edge_stiffness: 0.0,
+        angle_stiffness: 0.0,
+        // A cohesion well is required (the bend torque is gated on it), but it acts
+        // only on directors here; we freeze positions by not stepping far / keeping
+        // them at contact, and read directors before any drift matters.
+        well_depth: 2.0,
+        well_width: 1.5,
+        exclusion_strength: 1.0,
+        affinity_strength: 0.0,
+        gravity: 0.0,
+        temperature: 0.0, // deterministic: no rotational noise, no OU kick
+        anisotropy_strength: 0.0, // isolate the bending torque from the align torque
+        kappa_bend,
+        spont_curvature_c0: c0,
+        class_radius: vec![radius],
+        default_radius: radius,
+        director_source: DirectorSource::Injected,
+        time_step: 0.2,
+        max_step: 0.0,
+        ..GeometricSettings::default()
+    };
+    let attrs = GraphAttributes {
+        node_director: Some(directors.to_vec()),
+        ..Default::default()
+    };
+    let mut e = GeometricEngine::new();
+    e.set_params(&serde_json::to_value(&settings).unwrap()).unwrap();
+    let mut ctx = EngineCtx::cpu_only();
+    let g = no_edges(n);
+    e.init(&mut ctx, &CsrShard::whole_with_attributes(&g, &attrs), positions)
+        .expect("init bending engine");
+    (e, ctx)
+}
+
+/// A flat 3×3 patch of nodes in the z=0 plane at the given spacing (all within the
+/// well range), returned as interleaved positions.
+fn flat_patch_positions(spacing: f32) -> Vec<f32> {
+    let mut p = Vec::new();
+    for ix in 0..3i32 {
+        for iy in 0..3i32 {
+            p.push(ix as f32 * spacing);
+            p.push(iy as f32 * spacing);
+            p.push(0.0);
+        }
+    }
+    p
+}
+
+/// Max angular deviation (degrees) of any director from +z.
+fn max_tilt_from_z(directors: &[f32]) -> f32 {
+    let n = directors.len() / 3;
+    let mut worst = 0.0f32;
+    for i in 0..n {
+        let nz = directors[3 * i + 2].clamp(-1.0, 1.0);
+        worst = worst.max(nz.acos().to_degrees());
+    }
+    worst
+}
+
+#[test]
+fn bending_flat_aligned_patch_is_a_fixed_point() {
+    // With c₀=0 the preferred relative tilt is zero ⇒ a flat patch whose normals
+    // are all parallel (+z) is the bending ground state: the splay-bend torque is
+    // identically zero, so the directors must not move at all.
+    let n = 9usize;
+    let pos = flat_patch_positions(0.9); // σ = 1.0 ⇒ within the well
+    let dirs: Vec<f32> = (0..n).flat_map(|_| [0.0f32, 0.0, 1.0]).collect();
+
+    let (mut e, mut ctx) = bending_engine(&pos, &dirs, 0.5, 0.5, 0.0);
+    for _ in 0..200 {
+        let _ = e.step(&mut ctx);
+    }
+    let after = e.directors().unwrap();
+    let tilt = max_tilt_from_z(after);
+    assert!(
+        tilt < 1e-2,
+        "flat aligned patch must be a bending fixed point at c₀=0, got max tilt {tilt:.4}°"
+    );
+}
+
+#[test]
+fn bending_restores_a_perturbed_normal_toward_flat() {
+    // A flat patch (c₀=0) with ONE normal tipped over: the bending torque from its
+    // flat neighbours must rotate it BACK toward +z (a flat membrane resists being
+    // bent). The perturbed director's tilt-from-flat must shrink monotonically-ish
+    // and end far smaller than it started.
+    let n = 9usize;
+    let pos = flat_patch_positions(0.9);
+    let mut dirs: Vec<f32> = (0..n).flat_map(|_| [0.0f32, 0.0, 1.0]).collect();
+    // Tip the centre node (index 4 in the 3×3) by ~40° in the x–z plane.
+    let ang = 40.0f32.to_radians();
+    dirs[3 * 4] = ang.sin();
+    dirs[3 * 4 + 1] = 0.0;
+    dirs[3 * 4 + 2] = ang.cos();
+
+    let (mut e, mut ctx) = bending_engine(&pos, &dirs, 0.5, 0.5, 0.0);
+    let centre_tilt = |d: &[f32]| -> f32 { d[3 * 4 + 2].clamp(-1.0, 1.0).acos().to_degrees() };
+    let start = centre_tilt(e.directors().unwrap());
+    assert!(
+        (start - 40.0).abs() < 1.0,
+        "sanity: perturbed centre should start ~40° off flat, got {start:.2}°"
+    );
+    for _ in 0..400 {
+        let _ = e.step(&mut ctx);
+    }
+    let end = centre_tilt(e.directors().unwrap());
+    assert!(
+        end < 5.0 && end < start * 0.25,
+        "bending must restore the perturbed normal toward flat: {start:.2}° → {end:.2}°"
+    );
+}
+
+#[test]
+fn spontaneous_curvature_fans_a_flat_patch_out() {
+    // With c₀>0 each neighbour pair PREFERS a fixed inter-normal tilt, so an
+    // initially flat (all +z) patch is NO LONGER the ground state: the bending
+    // torque must drive the normals to fan out (a uniformly curved sheet). The max
+    // tilt-from-flat must grow from 0 to a clearly non-zero spread, and a larger c₀
+    // must produce a larger fan — proving c₀ is the curvature knob.
+    let n = 9usize;
+    let pos = flat_patch_positions(0.9);
+    let flat: Vec<f32> = (0..n).flat_map(|_| [0.0f32, 0.0, 1.0]).collect();
+
+    let relax_tilt = |c0: f32| -> f32 {
+        let (mut e, mut ctx) = bending_engine(&pos, &flat, 0.5, 0.5, c0);
+        // Sanity: a perfectly flat seed starts at exactly zero tilt.
+        assert!(max_tilt_from_z(e.directors().unwrap()) < 1e-4);
+        for _ in 0..400 {
+            let _ = e.step(&mut ctx);
+        }
+        max_tilt_from_z(e.directors().unwrap())
+    };
+
+    let tilt_small = relax_tilt(0.15);
+    let tilt_large = relax_tilt(0.40);
+    eprintln!(
+        "spontaneous curvature: max fan-out c₀=0.15 → {tilt_small:.2}°, c₀=0.40 → {tilt_large:.2}°"
+    );
+    assert!(
+        tilt_small > 1.0,
+        "c₀>0 must bend a flat patch (curvature emerges), got only {tilt_small:.3}°"
+    );
+    assert!(
+        tilt_large > tilt_small * 1.5,
+        "larger c₀ must impose larger curvature: {tilt_small:.2}° (c₀=0.15) vs \
+         {tilt_large:.2}° (c₀=0.40)"
+    );
+}
+
+#[test]
+fn bending_off_by_default_leaves_directors_static() {
+    // Backward-compat: at the default kappa_bend=0 (even with a cohesion well and
+    // an injected non-flat director field) the bending torque is gated off; with
+    // temperature=0 and anisotropy=0 the directors must be perfectly static.
+    let n = 9usize;
+    let pos = flat_patch_positions(0.9);
+    // A deliberately non-flat field (so any motion would show up).
+    let dirs: Vec<f32> = (0..n)
+        .flat_map(|i| {
+            let a = (i as f32) * 0.3; // sin²+cos² = 1 ⇒ already unit
+            [a.sin(), 0.0, a.cos()]
+        })
+        .collect();
+    let before = dirs.clone();
+
+    let (mut e, mut ctx) = bending_engine(&pos, &dirs, 0.5, 0.0, 0.0); // kappa_bend = 0
+    for _ in 0..200 {
+        let _ = e.step(&mut ctx);
+    }
+    let after = e.directors().unwrap();
+    for k in 0..before.len() {
+        assert!(
+            (after[k] - before[k]).abs() < 1e-6,
+            "kappa_bend=0 must leave directors static (idx {k}: {} → {})",
+            before[k],
+            after[k]
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
 // PHASE O — self-assembly order parameters (observe_assembly)
 // ---------------------------------------------------------------------------
 //
