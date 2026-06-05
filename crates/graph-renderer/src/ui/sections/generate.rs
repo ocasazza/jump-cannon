@@ -33,6 +33,26 @@ pub fn show(ui: &mut egui::Ui, state: &mut AppState) {
     );
     subgroup_separator(ui);
 
+    // ---- Example picker --------------------------------------------------
+    // Loads a built-in example into the editor (the user then presses
+    // Evaluate). Stateless: no persisted selection — picking an entry just
+    // overwrites the source. Every example is verified to evaluate by
+    // `tvix_wasm`'s `all_demos_evaluate` test.
+    subgroup_label(ui, "Examples");
+    egui::ComboBox::from_id_salt("generate-demo-picker")
+        .selected_text("Load an example…")
+        .show_ui(ui, |ui| {
+            for demo in tvix_wasm::demos() {
+                if ui.selectable_label(false, demo.name).clicked() {
+                    state.generate.source = demo.expr.to_string();
+                    state.generate.error = None;
+                    state.generate.last_counts = None;
+                }
+            }
+        });
+
+    subgroup_separator(ui);
+
     // ---- Expression editor ----------------------------------------------
     subgroup_label(ui, "Nix expression");
     ui.add(

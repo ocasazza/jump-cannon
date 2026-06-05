@@ -284,6 +284,101 @@ pub fn eval_graph(expr: &str) -> Result<GeneratedGraph, String> {
     Ok(GeneratedGraph { nodes, edges })
 }
 
+// ── Demo catalog ──────────────────────────────────────────────────────────────
+
+/// A named example expression for the Generate panel's demo picker.
+#[derive(Debug, Clone, Copy)]
+pub struct Demo {
+    pub name: &'static str,
+    pub expr: &'static str,
+}
+
+/// Built-in example expressions, each evaluating to a `toGraphJSON`-shaped graph
+/// against the embedded library. Selecting one loads its source into the editor.
+/// Every entry is verified to evaluate by the `all_demos_evaluate` test, so the
+/// picker can never offer a broken example.
+pub fn demos() -> &'static [Demo] {
+    DEMOS
+}
+
+const DEMOS: &[Demo] = &[
+    Demo {
+        name: "Star (hub)",
+        expr: r#"# Star: one hub connected to N spokes.
+let
+  g  = import /jc/src/graph.nix {};
+  gc = import /jc/src/graph-combinators.nix { graph = g; };
+in
+  g.toGraphJSON (gc.starGen { nodes = 12; prefix = "n"; })
+"#,
+    },
+    Demo {
+        name: "Chain (path)",
+        expr: r#"# Chain: a linear path — the primary self-assembly seed.
+let
+  g  = import /jc/src/graph.nix {};
+  gc = import /jc/src/graph-combinators.nix { graph = g; };
+in
+  g.toGraphJSON (gc.pathGen { nodes = 16; prefix = "p"; })
+"#,
+    },
+    Demo {
+        name: "Ring (cycle)",
+        expr: r#"# Ring: a closed cycle.
+let
+  g  = import /jc/src/graph.nix {};
+  gc = import /jc/src/graph-combinators.nix { graph = g; };
+in
+  g.toGraphJSON (gc.cycleGen { nodes = 16; prefix = "c"; })
+"#,
+    },
+    Demo {
+        name: "Grid (sheet)",
+        expr: r#"# Grid: a 2-D lattice — a flat "sheet" patch.
+let
+  g  = import /jc/src/graph.nix {};
+  gc = import /jc/src/graph-combinators.nix { graph = g; };
+in
+  g.toGraphJSON (gc.gridGen { rows = 6; cols = 6; prefix = "g"; })
+"#,
+    },
+    Demo {
+        name: "Complete (K6)",
+        expr: r#"# Complete: every node connected to every other.
+let
+  g  = import /jc/src/graph.nix {};
+  gc = import /jc/src/graph-combinators.nix { graph = g; };
+in
+  g.toGraphJSON (gc.completeGen { nodes = 6; prefix = "k"; })
+"#,
+    },
+    Demo {
+        name: "Bridged stars",
+        expr: r#"# Composition: two stars merged and joined by one bridge edge.
+let
+  g  = import /jc/src/graph.nix {};
+  gc = import /jc/src/graph-combinators.nix { graph = g; };
+  a = gc.starGen { nodes = 6; prefix = "a"; };
+  b = gc.starGen { nodes = 6; prefix = "b"; };
+in
+  g.toGraphJSON (g.addEdge "bridge" "a0" "b0" true (g.merge a b))
+"#,
+    },
+    Demo {
+        name: "Custom (edge list)",
+        expr: r#"# Author your own: build a graph from an explicit edge list.
+let
+  g = import /jc/src/graph.nix {};
+in
+  g.toGraphJSON (g.fromEdgeList [
+    { source = "x"; target = "y"; }
+    { source = "y"; target = "z"; }
+    { source = "z"; target = "x"; }
+  ])
+"#,
+    },
+];
+
 // ── WASM API ────────────────────────────────────────────────────────────────
 
 /// Evaluate a Nix expression and return the generated graph as JSON:
@@ -377,6 +472,29 @@ mod tests {
         );
         let err = eval_graph(&expr).unwrap_err();
         assert!(err.contains("node cap"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn all_demos_evaluate() {
+        // Every catalog demo must evaluate to a non-empty graph — the picker
+        // can then never offer a broken example.
+        for d in demos() {
+            let g = eval_graph(d.expr)
+                .unwrap_or_else(|e| panic!("demo {:?} failed to evaluate: {e}", d.name));
+            assert!(!g.nodes.is_empty(), "demo {:?} produced no nodes", d.name);
+            // Every edge endpoint must reference a declared node id.
+            let ids: std::collections::HashSet<&str> =
+                g.nodes.iter().map(|n| n.id.as_str()).collect();
+            for e in &g.edges {
+                assert!(
+                    ids.contains(e.source.as_str()) && ids.contains(e.target.as_str()),
+                    "demo {:?} has a dangling edge {} -> {}",
+                    d.name,
+                    e.source,
+                    e.target
+                );
+            }
+        }
     }
 
     #[test]
