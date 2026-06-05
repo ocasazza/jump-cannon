@@ -190,12 +190,9 @@ fn render_ui(ui: &mut egui::Ui, json: &mut Value) {
     row(ui, "Reconnect", |ui| {
         if ui.add(egui::DragValue::new(&mut opts.reconnect_backoff_ms).range(100..=30000).suffix("ms")).changed() { changed = true; }
     });
-    row(ui, "GPU Acceleration", |ui| {
-        if ui.checkbox(&mut opts.use_gpu, "Enabled").on_hover_text("Use the WGPU/WGSL backend on the solver node (geometric-gpu).").changed() { changed = true; }
-    });
-    row(ui, "Multilevel", |ui| {
-        if ui.checkbox(&mut opts.use_multilevel, "Enabled").on_hover_text("Wrap the geometric engine in the coarsen→solve→prolong→refine cascade (Walshaw/FM³/sfdp) for faster convergence on large graphs.").changed() { changed = true; }
-    });
+    // NOTE: GPU / Multilevel are no longer checkboxes here — they are now
+    // distinct entries in the unified Engine picker (geometric-gpu, etc.).
+    // The fields are still set on `LensConfig` by that picker.
 
     subgroup_separator(ui);
 

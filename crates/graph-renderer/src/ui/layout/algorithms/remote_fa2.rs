@@ -25,13 +25,24 @@ const LAYOUT_ID: LayoutId = "remote-fa2";
 pub struct RemoteFa2Settings {
     pub url: String,
     pub reconnect_backoff_ms: u32,
+    /// The graph-compute worker engine id this generic bridge should
+    /// request via the `?layout_id=` query on the stream URL. The
+    /// `/graph/layout/stream` handler self-selects the worker engine
+    /// per-connection from this id, so the UI never needs to PUT
+    /// `/compute/layout`. `#[serde(default)]` keeps older persisted
+    /// sessionStorage blobs (which predate this field) deserializing.
+    #[serde(default = "default_layout_id")]
+    pub layout_id: String,
 }
+
+fn default_layout_id() -> String { "fa2-bh".to_string() }
 
 impl Default for RemoteFa2Settings {
     fn default() -> Self {
         Self {
             url: "ws://127.0.0.1:8080/graph/layout/stream".to_string(),
             reconnect_backoff_ms: 1000,
+            layout_id: default_layout_id(),
         }
     }
 }
@@ -73,8 +84,8 @@ impl PhysicsLayout for RemoteFa2Layout {
             display_name: "Remote (compute)",
             description:
                 "Stream positions from the remote graph-compute worker over WebSocket. \
-                 The actual engine (FA2, etc.) is chosen separately via the \
-                 \"Remote engine\" picker in this section.",
+                 The worker engine is requested per-connection via the stream's \
+                 `?layout_id=` query.",
             requirements: LayoutRequirements {
                 needs_edges: false,
                 needs_cpu_positions: false,
@@ -95,11 +106,20 @@ impl PhysicsLayout for RemoteFa2Layout {
         self.n_nodes = graph.nodes.len() as u32;
 
         // Only spawn one consumer per (re)used url. If the user changed
-        // the url via settings, allow a re-spawn (the previous task will
-        // continue running its inner reconnect loop pointing at the old
-        // url; this is leaky but acceptable for now — settings churn is
-        // rare and the connection is small).
-        let url = self.settings.url.clone();
+        // the url OR the engine (layout_id) via settings, allow a re-spawn
+        // (the previous task will continue running its inner reconnect loop
+        // pointing at the old url; this is leaky but acceptable for now —
+        // settings churn is rare and the connection is small).
+        //
+        // The engine selection rides in the `?layout_id=` query — the
+        // stream handler self-selects the worker engine from it. We fold
+        // it into the spawn url so the dedup key respawns the consumer
+        // whenever the picked engine changes.
+        let sep = if self.settings.url.contains('?') { '&' } else { '?' };
+        let url = format!(
+            "{}{}layout_id={}",
+            self.settings.url, sep, self.settings.layout_id
+        );
         if self.spawned_url.as_deref() == Some(url.as_str()) {
             return Ok(());
         }
