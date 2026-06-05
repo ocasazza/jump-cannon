@@ -110,6 +110,18 @@ pub(crate) fn draw_icon(painter: &egui::Painter, rect: egui::Rect, section: Sect
                 egui::Stroke::new(1.0, color),
             );
         }
+        // Generate: a star/hub — central node with radiating spokes to a
+        // ring of leaves (the prefilled starGen demo, visually).
+        Section::Generate => {
+            let leaves = 6;
+            for i in 0..leaves {
+                let theta = std::f32::consts::TAU * (i as f32) / (leaves as f32);
+                let leaf = center + egui::vec2(theta.cos(), theta.sin()) * r * 0.85;
+                painter.line_segment([center, leaf], s);
+                painter.circle_filled(leaf, 1.8, color);
+            }
+            painter.circle_filled(center, 2.5, color);
+        }
     }
 }
 

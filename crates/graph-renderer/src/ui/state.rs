@@ -17,6 +17,7 @@ pub enum Section {
     Instances,
     Debug,
     Metrics,
+    Generate,
 }
 
 impl Section {
@@ -28,6 +29,7 @@ impl Section {
         Section::Instances,
         Section::Debug,
         Section::Metrics,
+        Section::Generate,
     ];
 
     pub fn title(self) -> &'static str {
@@ -39,6 +41,7 @@ impl Section {
             Section::Instances => "Instances",
             Section::Debug => "Debug",
             Section::Metrics => "Metrics",
+            Section::Generate => "Generate (tvix)",
         }
     }
 }
@@ -967,6 +970,64 @@ pub struct AppState {
     /// Session-scoped, never persisted.
     #[serde(skip)]
     pub focused_panel: Option<FocusedPanel>,
+    /// Generate-section state: the editable Nix expression plus one-shot
+    /// outputs (last node/edge counts, last eval error, and the pending
+    /// generated graph awaiting promotion to the GPU). The
+    /// [`crate::generate::GeneratedGraph`] one-shot is drained by
+    /// `App::update`, converted to a `Bootstrap`, and pushed into the
+    /// shared `LoadState`. Session-scoped, never persisted.
+    #[serde(skip)]
+    pub generate: GenerateState,
+}
+
+/// State for the `Section::Generate` ("Generate (tvix)") panel.
+///
+/// The panel (`ui::sections::generate`) owns no access to the renderer's
+/// `SharedLoad` / GPU pipelines, mirroring the metrics/compute sections'
+/// one-shot-flag pattern: it evaluates the Nix expression, stashes the
+/// resulting `GeneratedGraph` in `pending`, and `App::update` drains it —
+/// converting to a `Bootstrap` and triggering a live graph replace.
+///
+/// `#[serde(skip)]` on the `AppState` field — never persisted. (The
+/// `source` buffer is session scratch like the YAML import/export buffers.)
+#[derive(Clone, Default, Debug)]
+pub struct GenerateState {
+    /// The editable Nix expression. Prefilled with a star-graph demo by
+    /// `GenerateState::default`.
+    pub source: String,
+    /// Node/edge counts from the last successful evaluation, shown as a
+    /// readout. `None` until the user evaluates once.
+    pub last_counts: Option<(usize, usize)>,
+    /// Most recent evaluation error, rendered as red labels. `None` when
+    /// the last evaluation succeeded (or none has run yet).
+    pub error: Option<String>,
+    /// One-shot: a freshly evaluated graph awaiting promotion to the GPU.
+    /// Set by the panel on a successful "Evaluate"; taken by `App::update`,
+    /// which converts it to a `Bootstrap` and replaces the live graph.
+    pub pending: Option<tvix_wasm::GeneratedGraph>,
+}
+
+/// A star-graph demo authored against the embedded tvix graph library. It
+/// emits `toGraphJSON`'s `{ nodes, links }` shape (NOT `star-graph.nix`'s
+/// ad-hoc `{ nodes, edges, hub_degree }`). `graph-combinators.nix` takes
+/// `{ graph }` explicitly — the tvix closure-across-imports workaround —
+/// so it is threaded through verbatim.
+pub const GENERATE_DEMO_EXPR: &str = r#"# Edit this Nix expression, then press Evaluate.
+# It must produce toGraphJSON's { nodes = [...]; links = [...]; } shape.
+let
+  g  = import /jc/src/graph.nix {};
+  gc = import /jc/src/graph-combinators.nix { graph = g; };
+in
+  g.toGraphJSON (gc.starGen { nodes = 12; prefix = "n"; })
+"#;
+
+impl GenerateState {
+    fn with_demo() -> Self {
+        GenerateState {
+            source: GENERATE_DEMO_EXPR.to_string(),
+            ..Default::default()
+        }
+    }
 }
 
 impl AppState {
@@ -1248,6 +1309,7 @@ impl Default for AppState {
             frontend_events: FrontendEventLog::default(),
             compute: ComputeEngineState::default(),
             focused_panel: None,
+            generate: GenerateState::with_demo(),
         }
     }
 }

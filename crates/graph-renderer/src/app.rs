@@ -891,6 +891,25 @@ impl App {
         pipes.raycast(ndc_x, ndc_y, screen_px)
     }
 
+    /// Take a pending graph produced by the Generate (tvix) panel, convert
+    /// it to a [`Bootstrap`], publish it as `LoadState::Ready`, and reset the
+    /// GPU load latch so `try_promote_bootstrap_to_gpu` re-loads it this
+    /// frame — replacing the live graph. The panel itself has no access to
+    /// `self.load` / GPU pipelines, so it hands off through the one-shot
+    /// `state.generate.pending` field (set on a successful "Evaluate").
+    fn drain_generated_graph(&mut self) {
+        let Some(graph) = self.state.generate.pending.take() else {
+            return;
+        };
+        let bootstrap = crate::generate::bootstrap_from_generated(&graph);
+        *self.load.lock().unwrap() = LoadState::Ready(bootstrap);
+        // Re-arm the one-shot upload latch so the new bootstrap is promoted
+        // (GraphPipelines::load reallocates all buffers fresh each call).
+        self.loaded_into_gpu = false;
+        // Force a fresh ready-log line for the regenerated graph.
+        self.logged_ready = false;
+    }
+
     fn try_promote_bootstrap_to_gpu(&mut self, frame: &mut eframe::Frame) {
         if self.loaded_into_gpu {
             return;
@@ -1078,6 +1097,10 @@ impl eframe::App for App {
         // Drain progress events posted by async tasks before any UI runs
         // so the footer renders fresh state this frame.
         self.progress.drain_sink();
+
+        // Drain a freshly generated (tvix) graph, if any, into the shared
+        // load slot so the promote path below replaces the live graph.
+        self.drain_generated_graph();
 
         // Pump the data pipeline.
         self.try_promote_bootstrap_to_gpu(frame);

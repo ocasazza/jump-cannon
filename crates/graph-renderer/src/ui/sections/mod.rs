@@ -1,6 +1,7 @@
 pub mod camera;
 pub mod debug;
 pub mod filter;
+pub mod generate;
 pub mod instances;
 pub mod layout;
 pub mod metrics;
@@ -40,6 +41,7 @@ pub fn show(
         Section::Instances => instances::show(ui, state, registry),
         Section::Debug => debug::show(ui, state, perf),
         Section::Metrics => metrics::show(ui, state),
+        Section::Generate => generate::show(ui, state),
     }
     let _ = theme::accent::RED; // keep accent module referenced from here for tooling
 }
