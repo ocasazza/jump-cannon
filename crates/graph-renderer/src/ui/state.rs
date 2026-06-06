@@ -946,6 +946,18 @@ pub struct AppState {
     /// being re-evaluated each frame.
     #[serde(skip)]
     pub yaml_reset_armed: bool,
+    /// Last "Copy share link" output (the full link on WASM, the bare hash
+    /// on native), shown read-only below the button. UI scratch — never
+    /// persisted (it's derived from the rest of the state on demand).
+    #[serde(skip)]
+    pub share_link_buffer: String,
+    /// User-pasted share hash/link in the Instances "Load from link" input.
+    /// UI scratch — never persisted.
+    #[serde(skip)]
+    pub share_import_buffer: String,
+    /// Most recent share-link decode error, shown below the input. UI scratch.
+    #[serde(skip)]
+    pub share_import_error: Option<String>,
     /// Versioned timeline of UI state changes. Each entry holds a JSON
     /// serialization of the entire `AppState` at the time of capture
     /// (the ring itself is `#[serde(skip)]`, so no recursion). The
@@ -996,20 +1008,26 @@ pub struct AppState {
     /// with everything expanded.
     #[serde(skip)]
     pub collapsed_panels: std::collections::HashSet<PanelId>,
-    /// Generate-section state: the editable Nix expression plus one-shot
-    /// outputs (last node/edge counts, last eval error, and the pending
-    /// generated graph awaiting promotion to the GPU). The
-    /// [`crate::generate::GeneratedGraph`] one-shot is drained by
-    /// `App::update`, converted to a `Bootstrap`, and pushed into the
-    /// shared `LoadState`. Session-scoped, never persisted.
-    #[serde(skip)]
+    /// Generate-section state: the editable Nix generator expression plus a
+    /// one-shot `pending` graph awaiting promotion to the GPU.
+    ///
+    /// The `editor.source` is a genuine user PARAMETER — an exported state /
+    /// share link / example preset must be able to carry a generator expression
+    /// so the UI can be driven headlessly. It therefore round-trips
+    /// (`#[serde(default)]` with a template factory so old blobs / fresh tabs
+    /// still get the runnable demo). The `pending` one-shot inside
+    /// `GenerateState` is `#[serde(skip)]` (drained by `App::update`).
+    #[serde(default = "GenerateState::with_demo")]
     pub generate: GenerateState,
-    /// Initial-seed section state (Layout panel): the picked seed strategy, the
-    /// Custom-Nix editor, and a one-shot of freshly evaluated seed positions
-    /// awaiting application to the live GPU graph. Drained by `App::update`,
-    /// which writes the positions straight into the positions buffer.
-    /// Session-scoped, never persisted (`#[serde(skip)]`).
-    #[serde(skip)]
+    /// Initial-seed section state (Layout panel): the picked seed strategy + the
+    /// Custom-Nix editor source, plus a one-shot of freshly evaluated positions.
+    ///
+    /// The `strategy` + `editor.source` are user PARAMETERS and round-trip so a
+    /// share link / example preset can set the initial-seed regime headlessly
+    /// (`#[serde(default)]` with a template factory so old blobs / fresh tabs
+    /// still get the runnable template). The `pending` positions one-shot is
+    /// `#[serde(skip)]` (drained by `App::update`).
+    #[serde(default = "SeedState::with_template")]
     pub seed: SeedState,
 }
 
@@ -1021,16 +1039,23 @@ pub struct AppState {
 /// resulting `GeneratedGraph` in `pending`, and `App::update` drains it —
 /// converting to a `Bootstrap` and triggering a live graph replace.
 ///
-/// `#[serde(skip)]` on the `AppState` field — never persisted. (The
-/// `source` buffer is session scratch like the YAML import/export buffers.)
-#[derive(Clone, Default, Debug)]
+/// The `editor.source` (the authored Nix generator expression) is a user
+/// PARAMETER and round-trips via `Serialize`/`Deserialize` so an exported state
+/// / share link / example preset can carry a generator. `pending` is a
+/// one-shot handoff slot (a freshly-evaluated graph awaiting GPU promotion) and
+/// is `#[serde(skip)]` — meaningless to persist.
+#[derive(Clone, Default, Debug, Serialize, Deserialize)]
 pub struct GenerateState {
     /// The shared Nix-editor component state (source buffer, error, status).
-    /// Reused by `ui::nix_extension::NixExtension`.
+    /// Reused by `ui::nix_extension::NixExtension`. `source` round-trips;
+    /// `error`/`status` are `#[serde(skip)]` inside `NixEditorState`.
+    #[serde(default)]
     pub editor: crate::ui::nix_extension::NixEditorState,
     /// One-shot: a freshly evaluated graph awaiting promotion to the GPU.
     /// Set by the panel on a successful "Evaluate"; taken by `App::update`,
     /// which converts it to a `Bootstrap` and replaces the live graph.
+    /// Transient handoff slot — never persisted.
+    #[serde(skip)]
     pub pending: Option<tvix_wasm::GeneratedGraph>,
 }
 
@@ -1049,7 +1074,7 @@ in
 "#;
 
 impl GenerateState {
-    fn with_demo() -> Self {
+    pub fn with_demo() -> Self {
         GenerateState {
             editor: crate::ui::nix_extension::NixEditorState::with_source(GENERATE_DEMO_EXPR),
             ..Default::default()
@@ -1065,24 +1090,30 @@ impl GenerateState {
 /// stashes the resulting positions in `pending`. `App::update` drains it and
 /// writes the positions straight into the live GPU positions buffer.
 ///
-/// `#[serde(skip)]` on the `AppState` field — never persisted (session scratch,
-/// like the generate editor). The selected strategy + custom source therefore
-/// reset on a new tab, which is fine: seeding is an explicit one-shot action.
-#[derive(Clone, Default, Debug)]
+/// The picked `strategy` + Custom-editor `source` are user PARAMETERS and
+/// round-trip via `Serialize`/`Deserialize`, so an exported state / share link /
+/// example preset can carry an initial-seed choice. `pending` is the one-shot
+/// positions-handoff slot and is `#[serde(skip)]`.
+#[derive(Clone, Default, Debug, Serialize, Deserialize)]
 pub struct SeedState {
-    /// The currently picked seed strategy.
+    /// The currently picked seed strategy. User-facing parameter — round-trips.
+    #[serde(default)]
     pub strategy: SeedStrategy,
     /// The shared Nix-editor component state for the Custom (Nix) strategy.
+    /// `source` round-trips; `error`/`status` are skipped.
+    #[serde(default)]
     pub editor: crate::ui::nix_extension::NixEditorState,
     /// One-shot: freshly evaluated seed positions awaiting application to the
     /// live GPU graph. `Vec<[f32;3]>`; an empty vec is never stored here (the
     /// "No seed" path simply never sets `pending`). Taken by `App::update`.
+    /// Transient handoff slot — never persisted.
+    #[serde(skip)]
     pub pending: Option<Vec<[f32; 3]>>,
 }
 
 /// Which initial-seed strategy the Layout panel applies. `BuiltIn` carries the
 /// embedded `seed_demos()` expression by index; `Custom` uses the editor.
-#[derive(Clone, Debug, PartialEq, Eq, Default)]
+#[derive(Clone, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum SeedStrategy {
     /// Apply no seed — leave the current positions untouched.
     #[default]
@@ -1131,6 +1162,49 @@ impl AppState {
             self.snapshots.entries.remove(0);
         }
     }
+}
+
+/// Recursively map non-finite-derived JSON `null`s back to a deserializable
+/// `0.0`, but ONLY for the coordinate keys (`"x"` / `"y"`) where they originate.
+///
+/// Why: egui's nested types (`egui_dock::DockState`, `egui_tiles::Tree`) cache a
+/// `Rect` per node, and an unlaid-out node's rect is `Rect::NOTHING` (`±∞`
+/// extremities). `serde_json` renders a non-finite `f32` as JSON `null`, and
+/// `f32`'s `Deserialize` then *rejects* `null` — so a plain JSON round-trip of
+/// the default `AppState` (which ships a `dock` Graph tab whose rect is
+/// `NOTHING`) already fails, and the persistence path silently resets to
+/// default. egui's rects always live under `{"min":{"x":..,"y":..},"max":{..}}`
+/// (and `viewport`), so the `±∞` nulls only ever appear at `"x"`/`"y"` keys.
+///
+/// Scoping the substitution to those keys is what makes it safe: a legitimate
+/// `Option::None` (e.g. an `Option<usize>` field elsewhere) also serializes to
+/// `null`, and zeroing *those* would corrupt the value (`0.0` is not a valid
+/// `usize`). Such fields are never named `x`/`y`, so they're left untouched.
+/// Rects are derived UI geometry egui recomputes on the next layout pass, so
+/// zeroing the stale extents preserves all user intent.
+pub fn sanitize_nonfinite(v: &mut serde_json::Value) {
+    match v {
+        serde_json::Value::Array(a) => a.iter_mut().for_each(sanitize_nonfinite),
+        serde_json::Value::Object(o) => {
+            for (k, val) in o.iter_mut() {
+                if val.is_null() && (k == "x" || k == "y") {
+                    *val = serde_json::json!(0.0);
+                } else {
+                    sanitize_nonfinite(val);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Serialize `AppState` to a JSON string with non-finite floats sanitized so the
+/// blob deserializes back losslessly (see [`sanitize_nonfinite`]). The single
+/// canonical JSON-encode entry point for the persistence + share-link paths.
+pub fn to_json_sanitized(state: &AppState) -> Result<String, String> {
+    let mut value = serde_json::to_value(state).map_err(|e| e.to_string())?;
+    sanitize_nonfinite(&mut value);
+    serde_json::to_string(&value).map_err(|e| e.to_string())
 }
 
 /// Serialize the entire `AppState` to a YAML document.
@@ -1400,6 +1474,9 @@ impl Default for AppState {
             yaml_import_buffer: String::new(),
             yaml_import_error: None,
             yaml_reset_armed: false,
+            share_link_buffer: String::new(),
+            share_import_buffer: String::new(),
+            share_import_error: None,
             snapshots: SnapshotRing::default(),
             snapshot_source: None,
             debug_view_mode: DebugViewMode::default(),

@@ -65,6 +65,11 @@ urlencoding = "2"
 # Maintained fork of serde_yaml (dtolnay's crate was archived March 2024).
 # Used for YAML import/export of AppState in the Instances sidebar section.
 serde_yml  = "0.0.12"
+# Shareable state hash/link codec (Instances panel): compact JSON → DEFLATE →
+# base64url → a short fragment string. Both pure-Rust so the wasm32 trunk build
+# stays C-library-free; both already in the transitive dep graph.
+base64      = "0.22"
+miniz_oxide = "0.8"
 egui_dock  = { version = "0.15", features = ["serde"] }
 # Tileable workspace (sections + filter strip can live as tiles instead
 # of free-floating panels). 0.11 is the last release compatible with the

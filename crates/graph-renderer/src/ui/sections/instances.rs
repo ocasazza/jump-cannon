@@ -19,6 +19,8 @@ pub fn show(ui: &mut egui::Ui, state: &mut AppState, registry: &mut ActionRegist
     // [280, 520] floating panel.
     state_timeline_panel(ui, state);
     subgroup_separator(ui);
+    share_link_panel(ui, state);
+    subgroup_separator(ui);
     yaml_io_panel(ui, state);
     subgroup_separator(ui);
 
@@ -196,6 +198,100 @@ fn yaml_io_panel(ui: &mut egui::Ui, state: &mut AppState) {
             state.yaml_reset_armed = false;
         }
     });
+}
+
+/// Shareable hash / link sub-region. "Copy share link" encodes the current
+/// `AppState` (compact JSON → DEFLATE → base64url) into a short token and copies
+/// `<origin>/#s=<hash>` on WASM (or the bare hash on native). "Load from link /
+/// hash" decodes a pasted token/link back into the full `AppState`.
+fn share_link_panel(ui: &mut egui::Ui, state: &mut AppState) {
+    use crate::ui::share;
+
+    subgroup_label(ui, "Share link");
+
+    // ---- Produce row -----------------------------------------------------
+    ui.horizontal(|ui| {
+        if ui
+            .button("Copy share link")
+            .on_hover_text("Encode the entire UI state into a short hash and copy a shareable link")
+            .clicked()
+        {
+            match share::encode(state) {
+                Ok(hash) => {
+                    let link = current_origin()
+                        .map(|o| share::link_for(&o, &hash))
+                        .unwrap_or(hash);
+                    ui.output_mut(|o| o.copied_text = link.clone());
+                    state.share_link_buffer = link;
+                }
+                Err(e) => state.share_link_buffer = format!("encode error: {e}"),
+            }
+        }
+        let has = !state.share_link_buffer.is_empty();
+        if ui
+            .add_enabled(has, egui::Button::new("✕"))
+            .on_hover_text("Clear")
+            .clicked()
+        {
+            state.share_link_buffer.clear();
+        }
+    });
+
+    if !state.share_link_buffer.is_empty() {
+        ui.add(
+            egui::TextEdit::multiline(&mut state.share_link_buffer.as_str())
+                .font(egui::TextStyle::Monospace)
+                .desired_width(f32::INFINITY)
+                .desired_rows(2),
+        );
+    }
+
+    ui.add_space(4.0);
+
+    // ---- Load row --------------------------------------------------------
+    subgroup_label(ui, "Load from link / hash");
+    ui.add(
+        egui::TextEdit::singleline(&mut state.share_import_buffer)
+            .font(egui::TextStyle::Monospace)
+            .desired_width(f32::INFINITY)
+            .hint_text("Paste a share link or #s=<hash>, then Load."),
+    );
+    ui.horizontal(|ui| {
+        let has = !state.share_import_buffer.trim().is_empty();
+        if ui.add_enabled(has, egui::Button::new("Load")).clicked() {
+            match share::decode(&state.share_import_buffer) {
+                Ok(imported) => {
+                    let ring = std::mem::take(&mut state.snapshots);
+                    *state = imported;
+                    state.snapshots = ring;
+                    state.snapshot_now("load share link");
+                }
+                Err(e) => state.share_import_error = Some(e),
+            }
+        }
+        if ui.button("Clear").clicked() {
+            state.share_import_buffer.clear();
+            state.share_import_error = None;
+        }
+    });
+    if let Some(err) = &state.share_import_error {
+        ui.colored_label(
+            egui::Color32::from_rgb(220, 70, 70),
+            format!("Decode error: {err}"),
+        );
+    }
+}
+
+/// The page origin on WASM (`https://host`), or `None` on native — the panel
+/// then shows the bare hash instead of a full link.
+#[cfg(target_arch = "wasm32")]
+fn current_origin() -> Option<String> {
+    web_sys::window()?.location().origin().ok()
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn current_origin() -> Option<String> {
+    None
 }
 
 /// Render the live snapshot timeline (newest first), with one

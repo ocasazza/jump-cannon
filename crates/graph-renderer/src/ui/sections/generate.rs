@@ -19,11 +19,21 @@
 
 use eframe::egui;
 
+use super::super::examples;
 use super::super::nix_extension::{NixExample, NixExtension};
 use super::super::state::AppState;
+use super::subgroup_separator;
 
 pub fn show(ui: &mut egui::Ui, state: &mut AppState) {
     state.snapshot_source = Some("Generate".into());
+
+    // ── Example UI-states (self-assembly demos) ──────────────────────────
+    // A one-click loader for the full Brownian self-assembly demos: each entry
+    // builds a complete AppState (validated bonding regime + Geometric (GPU) +
+    // soup generator + matching seed + camera/style) and REPLACES the live
+    // state, mirroring the share-link / YAML import path.
+    examples_picker(ui, state);
+    subgroup_separator(ui);
 
     // Built-in examples come straight from the embedded demo catalog. Every
     // entry is verified to evaluate by `tvix_wasm`'s `all_demos_evaluate` test.
@@ -49,5 +59,44 @@ pub fn show(ui: &mut egui::Ui, state: &mut AppState) {
         state.generate.editor.status =
             Some(format!("{} nodes, {} edges", graph.nodes.len(), graph.edges.len()));
         state.generate.pending = Some(graph);
+    }
+}
+
+/// Examples picker: a combo of the self-assembly example UI-states. Selecting
+/// one builds its full `AppState` and replaces the live state (preserving the
+/// in-memory snapshot ring), then stamps a labelled timeline entry — exactly the
+/// share-link / YAML load contract.
+fn examples_picker(ui: &mut egui::Ui, state: &mut AppState) {
+    super::subgroup_label(ui, "Examples (self-assembly)");
+    super::hint_label(
+        ui,
+        "Load a full demo state: Geometric (GPU) + validated bonding regime + \
+         soup generator + seed. After loading, press Evaluate to spawn the soup.",
+    );
+
+    let mut to_load: Option<&'static examples::Example> = None;
+    egui::ComboBox::from_id_salt("examples-picker")
+        .selected_text("Load an example…")
+        .width(f32::INFINITY)
+        .show_ui(ui, |ui| {
+            for ex in examples::catalog() {
+                if ui
+                    .selectable_label(false, ex.name)
+                    .on_hover_text(ex.description)
+                    .clicked()
+                {
+                    to_load = Some(ex);
+                }
+            }
+        });
+
+    if let Some(ex) = to_load {
+        let imported = ex.build_state();
+        // Preserve the in-memory snapshot ring across the swap (it is
+        // `#[serde(skip)]` and would otherwise be wiped), then stamp the load.
+        let ring = std::mem::take(&mut state.snapshots);
+        *state = imported;
+        state.snapshots = ring;
+        state.snapshot_now(format!("example: {}", ex.name));
     }
 }

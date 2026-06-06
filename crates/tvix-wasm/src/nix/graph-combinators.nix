@@ -99,6 +99,19 @@ let
     if n <= 1 then path
     else addEdge (last + "->" + first) last first true path;
 
+  # soupGen : { nodes, prefix } -> graph
+  # An UNBONDED particle soup: n isolated nodes, zero edges. This is the
+  # canonical initial condition for the dynamic-bonding self-assembly engine —
+  # the geometric solver grows bonds (chains → sheets → tubes → vesicles) from a
+  # disconnected soup at runtime, so the generator must NOT pre-wire any edges.
+  soupGen = params:
+    let
+      n = params.nodes or 200;
+      p = params.prefix or "s";
+      ids = builtins.genList (i: p + str i) n;
+    in
+    builtins.foldl' (g: nid: addNode nid "particle" g) emptyGraph ids;
+
   # gridGen : { rows, cols, prefix } -> graph
   # 2D lattice: each node connects right and down
   gridGen = params:
@@ -297,7 +310,7 @@ let
   };
 
 in {
-  inherit pathGen starGen completeGen cycleGen gridGen;
+  inherit pathGen starGen completeGen cycleGen gridGen soupGen;
   inherit subdivideRule hubRule reverseEdgesRule contractRule composeOps;
   inherit identityGraph constGraph edgePair dupArg flipOps parallelMerge makeSelfLoop;
   inherit graphIdentity warblerKestrelIdentity;

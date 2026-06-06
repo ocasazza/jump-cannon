@@ -27,16 +27,24 @@ use super::theme::accent;
 /// Kept deliberately small and `Default`-able so a section can hang it off its
 /// own state struct (persisted or `#[serde(skip)]`). The component never holds
 /// state of its own across frames.
-#[derive(Clone, Debug, Default)]
+///
+/// `source` is a genuine user PARAMETER (the authored Nix expression) and so
+/// `Serialize`/`Deserialize`: it must round-trip through an exported state /
+/// share link so an agent can hand a generator/seed expression in headlessly.
+/// `error` / `status` are transient one-shot display scratch — `#[serde(skip)]`.
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct NixEditorState {
-    /// The editable Nix expression.
+    /// The editable Nix expression. User-facing parameter — round-trips.
+    #[serde(default)]
     pub source: String,
     /// Most recent evaluation error, rendered as red labels. `None` on success
-    /// (or before the first evaluation).
+    /// (or before the first evaluation). Transient — never persisted.
+    #[serde(skip)]
     pub error: Option<String>,
     /// A short success/status line (e.g. "12 nodes, 11 edges" or "applied 200
     /// positions"). `None` until the caller sets one. The component renders it
-    /// dimmed when present.
+    /// dimmed when present. Transient — never persisted.
+    #[serde(skip)]
     pub status: Option<String>,
 }
 

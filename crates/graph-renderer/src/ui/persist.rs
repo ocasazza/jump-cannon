@@ -215,6 +215,11 @@ fn deserialize_with_migration(raw: &str) -> Option<AppState> {
         }
     };
     migrate_layout_state(&mut value);
+    // Map egui's non-finite Rect coordinates (serialized as JSON `null`) back to
+    // a deserializable `0.0`. Without this, a persisted blob whose `dock`/`tiles`
+    // carries an unlaid-out `Rect::NOTHING` (the common case — the default dock
+    // ships a Graph tab) fails the typed decode and silently resets to default.
+    crate::ui::state::sanitize_nonfinite(&mut value);
     match serde_json::from_value::<AppState>(value) {
         Ok(s) => Some(s),
         Err(e) => {

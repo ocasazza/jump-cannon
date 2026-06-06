@@ -490,6 +490,18 @@ in
 "#,
     },
     Demo {
+        name: "Soup (self-assembly seed)",
+        expr: r#"# Unbonded particle soup: N isolated nodes, zero edges. The
+# initial condition for the dynamic-bonding self-assembly engine — bonds
+# (chains → sheets → tubes → vesicles) grow at runtime from this soup.
+let
+  g  = import /jc/src/graph.nix {};
+  gc = import /jc/src/graph-combinators.nix { graph = g; };
+in
+  g.toGraphJSON (gc.soupGen { nodes = 200; prefix = "s"; })
+"#,
+    },
+    Demo {
         name: "Custom (edge list)",
         expr: r#"# Author your own: build a graph from an explicit edge list.
 let
@@ -703,6 +715,22 @@ mod tests {
                 assert_eq!(pts.len(), 24, "seed demo {:?} must return n positions", d.name);
             }
         }
+    }
+
+    #[test]
+    fn soup_gen_is_unbonded() {
+        // The self-assembly soup must be N nodes with ZERO edges — bonds are
+        // grown at runtime by the geometric engine, not pre-wired.
+        let expr = r#"
+            let
+              g  = import /jc/src/graph.nix {};
+              gc = import /jc/src/graph-combinators.nix { graph = g; };
+            in g.toGraphJSON (gc.soupGen { nodes = 64; prefix = "s"; })
+        "#;
+        let graph = eval_graph(expr).expect("soup eval should succeed");
+        assert_eq!(graph.nodes.len(), 64, "soup must have n nodes");
+        assert!(graph.edges.is_empty(), "soup must have no edges");
+        assert_eq!(graph.nodes[0].kind.as_deref(), Some("particle"));
     }
 
     #[test]

@@ -394,6 +394,20 @@ impl App {
             .unwrap_or(0);
 
         let mut state: ui::AppState = ui::persist::load_from_eframe(cc.storage);
+
+        // Share-link bootstrap: if the page was opened with a `#s=<hash>` URL
+        // fragment, decode it and let it OVERRIDE the persisted/default state.
+        // Guarded so a normal load (no fragment) is unaffected. No-op on native.
+        if let Some(hash) = ui::share::fragment_from_location() {
+            match ui::share::decode(&hash) {
+                Ok(shared) => {
+                    log::info!("[graph-renderer] restored state from #s= share fragment");
+                    state = shared;
+                }
+                Err(e) => log::warn!("[graph-renderer] #s= share fragment decode failed: {e}"),
+            }
+        }
+
         // Seed the in-memory ring with `default` first, then push a
         // `restored` snapshot for the just-loaded state. If load_from_eframe
         // returned the bare default (no prior session), the two entries

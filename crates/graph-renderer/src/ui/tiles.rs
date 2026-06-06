@@ -90,6 +90,16 @@ impl PaneKind {
 pub struct TileWorkspace {
     /// `egui_tiles::Tree` carries the actual layout. `Tree<Pane>: Serde`
     /// when `Pane: Serde` + the `serde` feature is on (it is).
+    ///
+    /// egui_tiles stores each tile's cached `Rect`, whose extremities are `±∞`
+    /// for an unlaid-out tile (`Rect::NOTHING`). `serde_json` renders a
+    /// non-finite `f32` as JSON `null`, which then refuses to deserialize back
+    /// into the `f32` Rect field. The JSON persistence + share-link paths route
+    /// the whole `AppState` through [`crate::ui::state::sanitize_nonfinite`]
+    /// before decode (and after encode) so those nulls become `0.0`; rects are
+    /// derived UI geometry egui recomputes on the next layout pass, so the
+    /// substitution is lossless for user intent. (egui_dock's `DockState` has
+    /// the identical quirk and is covered by the same shared sanitizer.)
     pub tree: egui_tiles::Tree<PaneKind>,
     /// Last-known side-panel width. Persisted so a reload keeps the
     /// user's chosen split between canvas and workspace.
