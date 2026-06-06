@@ -408,6 +408,11 @@ pub struct TileBehavior<'a, 'b> {
     /// lifetime to `state`'s — letting `show_workspace_panel` touch
     /// `state.tiles.width` after the workspace render.
     pub node_body: Option<&'b mut dyn FnMut(&mut egui::Ui)>,
+    /// Display title for the `PaneKind::Node` pane header. When `Some`,
+    /// the promoted node's name is shown in the tile header instead of the
+    /// generic "Node" — matching the floating panel, whose chrome title is
+    /// the node name. `None` (no node promoted) falls back to `pane.title()`.
+    pub node_title: Option<String>,
 }
 
 impl<'a, 'b> TileBehavior<'a, 'b> {
@@ -515,8 +520,17 @@ impl<'a, 'b> egui_tiles::Behavior<PaneKind> for TileBehavior<'a, 'b> {
             }
 
             ui.add_space(8.0);
+            // For the Node pane, prefer the promoted node's name (matches
+            // the floating panel chrome). Falls back to the generic title.
+            let header_title = match pane {
+                PaneKind::Node => self
+                    .node_title
+                    .clone()
+                    .unwrap_or_else(|| pane.title()),
+                _ => pane.title(),
+            };
             ui.label(
-                egui::RichText::new(pane.title())
+                egui::RichText::new(header_title)
                     .font(theme::mono(theme::font_size::HEADING))
                     .color(palette::TEXT),
             );
@@ -778,6 +792,7 @@ pub fn show_workspace_panel(
     layout_registry: &LayoutRegistry,
     perf: &PerfCollector,
     node_body: Option<&mut dyn FnMut(&mut egui::Ui)>,
+    node_title: Option<String>,
 ) {
     sync_tree_with_open_state(state);
 
@@ -816,6 +831,7 @@ pub fn show_workspace_panel(
                     ops: Vec::new(),
                     focused_panel,
                     node_body,
+                    node_title,
                 };
                 workspace.tree.ui(&mut behavior, ui);
                 behavior.ops

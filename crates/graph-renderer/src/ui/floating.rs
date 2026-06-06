@@ -10,6 +10,8 @@
 //! one should be a 5-line builder call, not a copy of `egui::Window`
 //! plumbing.
 
+use std::borrow::Cow;
+
 use eframe::egui::{self, Color32, Id, Rect, Stroke};
 
 use crate::ui::squircle;
@@ -18,11 +20,19 @@ use crate::ui::theme::{self, palette};
 use crate::ui::tiles::Placement;
 use crate::ui::traffic_lights;
 
+/// Vertical padding above the header row. Lifts the traffic-light cluster
+/// out of the window's top-edge resize zone and gives the header room.
+const HEADER_TOP_PAD: f32 = 6.0;
+/// Horizontal padding left of the header row. Lifts the (left-aligned)
+/// traffic lights out of the top-LEFT corner resize handle, which would
+/// otherwise intercept their clicks.
+const HEADER_LEFT_PAD: f32 = 6.0;
+
 /// Builder for a squircle-backed floating panel whose visibility is
 /// driven by a caller-owned `&mut bool`.
 pub struct FloatingPanel<'p> {
     id: PanelId,
-    title: &'static str,
+    title: Cow<'static, str>,
     default_pos: Option<[f32; 2]>,
     default_size: Option<[f32; 2]>,
     /// Optional placement toggle plumbed through the header. When
@@ -50,10 +60,10 @@ pub struct FloatingPanel<'p> {
 }
 
 impl<'p> FloatingPanel<'p> {
-    pub fn new(id: PanelId, title: &'static str) -> Self {
+    pub fn new(id: PanelId, title: impl Into<Cow<'static, str>>) -> Self {
         Self {
             id,
-            title,
+            title: title.into(),
             default_pos: None,
             default_size: None,
             placement: None,
@@ -113,7 +123,15 @@ impl<'p> FloatingPanel<'p> {
             .fill(Color32::TRANSPARENT)
             .stroke(Stroke::NONE);
 
-        let mut window = egui::Window::new(self.title)
+        // The window NAME is decoupled from the displayed title: the title
+        // bar is hidden (`title_bar(false)`) and the egui id is set
+        // explicitly below, so `Window::new`'s string is otherwise unused.
+        // Feeding it the display title made egui emit a SECOND accessible
+        // title node (window-name + the chrome label), reading as a
+        // duplicate title to screen readers / the test harness. A stable
+        // per-id name keeps the visible chrome label the sole title.
+        let window_name = format!("floating-panel-{:?}", self.id);
+        let mut window = egui::Window::new(window_name)
             .id(Id::new(("floating", self.id)))
             .title_bar(false)
             .frame(frame)
@@ -168,7 +186,17 @@ impl<'p> FloatingPanel<'p> {
                 outer_stroke,
             );
 
+            // Inset the header off the window's top-left corner. egui's
+            // `resizable(true)` window reserves an interactive resize zone
+            // along every edge/corner; the top-left corner handle sits
+            // exactly over the traffic-light cluster and steals its clicks.
+            // A few px of top + left padding pushes the dots out of that
+            // corner zone so they stay hit-testable, and the vertical
+            // breathing room stops the header from cramming against the
+            // body's first row.
+            ui.add_space(HEADER_TOP_PAD);
             ui.horizontal(|ui| {
+                ui.add_space(HEADER_LEFT_PAD);
                 // Traffic light cluster (left-aligned), via the shared
                 // helper so every panel's chrome matches. Minimize is
                 // only offered when a collapse channel is wired; the
@@ -198,7 +226,7 @@ impl<'p> FloatingPanel<'p> {
 
                 ui.add_space(8.0);
                 ui.label(
-                    egui::RichText::new(title)
+                    egui::RichText::new(title.as_ref())
                         .font(theme::mono(theme::font_size::HEADING))
                         .color(palette::TEXT),
                 );

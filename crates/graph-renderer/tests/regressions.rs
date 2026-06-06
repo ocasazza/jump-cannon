@@ -780,6 +780,130 @@ fn gpu_force_options_eq_ignoring_cursor_exhaustive_destructure_compiles() {
 }
 
 // ---------------------------------------------------------------------------
+// node_panel_header_traffic_lights_clickable_and_title_once
+// ---------------------------------------------------------------------------
+//
+// Regression for the promoted-node ("Node") panel header bug: the header
+// drew TWO titles (the `FloatingPanel` chrome literal "Node" PLUS a body
+// label re-emitting the node name) and the top-left traffic-light cluster
+// was UNCLICKABLE — the auto-sizing resizable `egui::Window`'s top-left
+// corner resize handle sat over the dots and ate their clicks.
+//
+// The fix: (1) the panel chrome title IS the node name (single title, body
+// no longer re-emits it); (2) the header is inset off the window's
+// top-left corner so the dots clear the resize zone; (3) the dots carry
+// AccessKit labels so they're real, hit-testable buttons.
+//
+// This test mounts the shared `FloatingPanel` exactly as the promoted-node
+// path does — chrome title = the node name, body = path/tags labels (NO
+// title) — and asserts all three properties HEADLESSLY:
+//   * the close / minimize / maximize dots each exist exactly once and the
+//     close dot is hit-testable (a real cursor click at its center, via
+//     `simulate_click`, flips the panel's `open` flag false — a covered or
+//     intercepted dot would never register the click),
+//   * the node title text appears EXACTLY ONCE (no duplicate title).
+
+#[test]
+fn node_panel_header_traffic_lights_clickable_and_title_once() {
+    use graph_renderer::ui::floating::FloatingPanel;
+    use graph_renderer::ui::state::{FocusedPanel, PanelId};
+    use graph_renderer::ui::tiles::Placement;
+    use std::cell::Cell;
+
+    const NODE_TITLE: &str = "MyDistinctiveNode";
+
+    // Driven across frames: the close dot must be able to flip this false.
+    let open = Cell::new(true);
+    // Channels the FloatingPanel mutates in place; kept alive across frames.
+    let collapsed = Cell::new(false);
+    let placement = Cell::new(Placement::Floating);
+    let focused: Cell<Option<FocusedPanel>> = Cell::new(None);
+
+    let mut harness = Harness::builder()
+        .with_size(egui::vec2(900.0, 700.0))
+        .build(|ctx| {
+            graph_renderer::ui::theme::apply_default(ctx);
+
+            let mut open_local = open.get();
+            let mut collapsed_local = collapsed.get();
+            let mut placement_local = placement.get();
+            let mut focused_local = focused.get();
+
+            FloatingPanel::new(PanelId::Node, NODE_TITLE.to_string())
+                .default_pos([200.0, 120.0])
+                .default_size([460.0, 480.0])
+                .with_placement(&mut placement_local)
+                .with_collapsed(&mut collapsed_local)
+                .with_focus(
+                    &mut focused_local,
+                    FocusedPanel::AnchoredNode(0),
+                )
+                .show(ctx, &mut open_local, |ui| {
+                    // Body mirrors `render_node_body`: path + tags, and
+                    // crucially NO title label (the chrome owns the title).
+                    ui.label(
+                        egui::RichText::new("vault/notes/my-node.md")
+                            .small()
+                            .weak()
+                            .monospace(),
+                    );
+                    ui.label("rust, egui");
+                    ui.separator();
+                    ui.label("Body paragraph that stands in for the inspector.");
+                });
+
+            open.set(open_local);
+            collapsed.set(collapsed_local);
+            placement.set(placement_local);
+            focused.set(focused_local);
+        });
+
+    // Settle the auto-sizing window (single-pass egui needs a couple of
+    // frames for a fresh window to reach a stable rect).
+    harness.run();
+    harness.run();
+
+    // --- Title appears EXACTLY ONCE -------------------------------------
+    let title_hits = harness.query_all_by_label(NODE_TITLE).count();
+    assert_eq!(
+        title_hits, 1,
+        "node-panel title regression: expected the node title {NODE_TITLE:?} \
+         to appear exactly once, found {title_hits}. A second hit means the \
+         body is re-emitting the title under the chrome's title (the \
+         original double-title bug).",
+    );
+
+    // --- All three traffic-light dots exist ----------------------------
+    for (label, n) in [
+        ("Close", harness.query_all_by_label("Close").count()),
+        ("Minimize", harness.query_all_by_label("Minimize").count()),
+        ("Toggle Tile/Float", harness.query_all_by_label("Toggle Tile/Float").count()),
+    ] {
+        assert_eq!(
+            n, 1,
+            "node-panel header regression: expected exactly one {label:?} \
+             traffic-light dot, found {n}.",
+        );
+    }
+
+    // --- Close dot is HIT-TESTABLE -------------------------------------
+    // `simulate_click` moves the real cursor to the dot center and presses
+    // the primary button. If anything (the window's top-left corner resize
+    // handle, an overlapping squircle, a squashed body row) sat over the
+    // dot, the click would land on that instead and `open` would stay true.
+    assert!(open.get(), "precondition: panel starts open");
+    harness.get_by_label("Close").simulate_click();
+    harness.run();
+    harness.run();
+    assert!(
+        !open.get(),
+        "node-panel header regression: clicking the close traffic-light dot \
+         did NOT close the panel — its hit area is obstructed (resize handle \
+         over the cluster / overlapping header). open is still true.",
+    );
+}
+
+// ---------------------------------------------------------------------------
 // query_clear_all_filters_empties_active
 // ---------------------------------------------------------------------------
 //

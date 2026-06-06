@@ -1486,6 +1486,10 @@ impl eframe::App for App {
             };
             let node_body_opt: Option<&mut dyn FnMut(&mut egui::Ui)> =
                 if node_tiled { Some(&mut node_body) } else { None };
+            // Title for the tiled Node pane header — the promoted node's
+            // name, matching the floating panel chrome.
+            let node_title_opt =
+                node_meta.as_ref().map(node_title);
             ui::tiles::show_workspace_panel(
                 ctx,
                 state,
@@ -1493,6 +1497,7 @@ impl eframe::App for App {
                 layout_registry,
                 perf,
                 node_body_opt,
+                node_title_opt,
             );
             // Write back the (possibly edited) tag-browser query.
             self.state.tag_browser_query = tag_query;
@@ -3262,7 +3267,10 @@ impl App {
         let meta_ref = &meta;
         let edges_ref = &edges_snapshot;
 
-        crate::ui::floating::FloatingPanel::new(panel_id, "Node")
+        // The panel chrome title IS the node title, so the title renders
+        // exactly once. (Previously the chrome showed a literal "Node" AND
+        // the body re-drew `title`, reading as two stacked titles.)
+        crate::ui::floating::FloatingPanel::new(panel_id, title)
             .default_pos([320.0, 96.0])
             .default_size([480.0, 600.0])
             .with_placement(&mut placement)
@@ -3270,11 +3278,6 @@ impl App {
             .with_collapsed(&mut collapsed)
             .show(ctx, &mut open, |ui| {
                 ui.set_max_width(460.0);
-                ui.label(
-                    egui::RichText::new(&title)
-                        .strong()
-                        .color(crate::ui::theme::palette::TEXT),
-                );
                 // The FloatingPanel lives in an auto-sizing window; give the
                 // inner ScrollArea an explicit budget so it clips+scrolls.
                 let avail = ui.available_height();

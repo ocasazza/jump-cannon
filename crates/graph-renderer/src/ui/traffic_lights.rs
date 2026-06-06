@@ -108,6 +108,13 @@ pub fn show(ui: &mut egui::Ui, lights: TrafficLights) -> TrafficAction {
             color
         };
         ui.painter().circle_filled(rect.center(), DOT_RADIUS, draw);
+        // Name the dot as a labeled button in the accessibility tree. The
+        // glyph-less circle carries no text, so without this it's invisible
+        // to AccessKit (and to the headless egui_kittest harness, which
+        // hit-tests the cluster by label). The label matches the tooltip.
+        response.widget_info(|| {
+            egui::WidgetInfo::labeled(egui::WidgetType::Button, true, tip)
+        });
         response.on_hover_text(tip).clicked()
     };
 
