@@ -1489,6 +1489,20 @@ fn integrate(st: &mut State, force: &[f32], s: &GeometricSettings) {
                 disp = disp.signum() * max_step;
                 v = disp / dt;
             }
+            // Non-finite guard: a degenerate upstream (a non-finite injected
+            // position, or an overflow accumulated over many steps) can make the
+            // force — and hence `v`/`disp` — NaN/Inf. The `max_step` clamp above
+            // does NOT catch it (`NaN.abs() > max_step` is false), so a poisoned
+            // value would propagate into every later step through the O(n²) pair
+            // scan. Drop the step to rest rather than carry the non-finite value
+            // forward. Never fires on well-conditioned inputs (all finite ⇒ both
+            // branches skipped ⇒ byte-identical to the unguarded path).
+            if !v.is_finite() {
+                v = 0.0;
+            }
+            if !disp.is_finite() {
+                disp = 0.0;
+            }
             st.velocities[idx] = v;
             st.positions[idx] += disp;
         }
@@ -2410,6 +2424,211 @@ mod tests {
         let shard = CsrShard::whole(g);
         e.init(&mut ctx, &shard, pos).expect("init");
         e
+    }
+
+    // -----------------------------------------------------------------------
+    // Numerical-stability hardening: degenerate geometry must never produce
+    // NaN/Inf. Each case enables EVERY force term that has a singularity
+    // (exclusion + cohesion well + patchy anisotropy + GB-side + tilt coupling
+    // + bending + a thermostat) so the coincident-particle / zero-length /
+    // collinear / single-node guards are actually exercised, then steps several
+    // times and asserts every position AND velocity stays finite.
+    // -----------------------------------------------------------------------
+
+    /// A maximally-hazardous settings block: all the divide-by-distance,
+    /// normalize, acos, and sqrt force terms are turned ON at once.
+    fn hardening_settings() -> GeometricSettings {
+        GeometricSettings {
+            coordination_source: CoordinationSource::Degree,
+            director_source: DirectorSource::Random,
+            edge_rest_len: 1.0,
+            edge_stiffness: 0.3,
+            angle_stiffness: 0.2,
+            // exclusion + cohesion well (radial divide-by-distance + cos²)
+            default_radius: 0.5,
+            exclusion_strength: 1.0,
+            well_depth: 1.0,
+            well_width: 1.0,
+            // orientation-dependent depth (patchy + Gay–Berne side-by-side)
+            anisotropy_strength: 0.8,
+            gb_side_strength: 0.5,
+            // director→position tilt coupling + bending torque + curvature
+            tilt_coupling_strength: 0.4,
+            kappa_bend: 0.3,
+            spont_curvature_c0: 0.2,
+            // a thermostat so the sqrt(kT/m) + Box–Muller paths run too
+            temperature: 0.5,
+            rotational_diffusion: 1.0,
+            gravity: 0.02,
+            damping: 0.9,
+            time_step: 1.0,
+            max_step: 10.0,
+            ..GeometricSettings::default()
+        }
+    }
+
+    /// Run `steps` and assert no position or velocity is ever non-finite.
+    fn assert_finite_after_steps(mut e: GeometricEngine, steps: usize, label: &str) {
+        let mut ctx = EngineCtx::cpu_only();
+        for s in 0..steps {
+            let out = e.step(&mut ctx);
+            for (i, &p) in out.positions.iter().enumerate() {
+                assert!(
+                    p.is_finite(),
+                    "{label}: non-finite position[{i}] = {p} at step {s}"
+                );
+            }
+            if let Some(st) = e.state.as_ref() {
+                for (i, &v) in st.velocities.iter().enumerate() {
+                    assert!(
+                        v.is_finite(),
+                        "{label}: non-finite velocity[{i}] = {v} at step {s}"
+                    );
+                }
+                for (i, &d) in st.directors.iter().enumerate() {
+                    assert!(
+                        d.is_finite(),
+                        "{label}: non-finite director[{i}] = {d} at step {s}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn degenerate_coincident_pair_stays_finite() {
+        // Two nodes at the EXACT same position (zero separation) — the canonical
+        // divide-by-distance / normalize-zero-vector singularity.
+        let g = single_edge_csr();
+        let pos = vec![0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+        let e = init_engine(&g, hardening_settings(), &pos);
+        assert_finite_after_steps(e, 20, "coincident-pair");
+    }
+
+    #[test]
+    fn degenerate_zero_length_edge_stays_finite() {
+        // An edge whose endpoints coincide: the spring's `(dist - target)/dist`
+        // with dist → 0 plus exclusion at zero distance.
+        let g = triangle(); // every node has degree 2 (angle term active)
+        let pos = vec![
+            1.0, 1.0, 1.0, // node 0
+            1.0, 1.0, 1.0, // node 1 — coincident with 0 ⇒ zero-length edge 0-1
+            2.0, 0.0, 0.0, // node 2
+        ];
+        let e = init_engine(&g, hardening_settings(), &pos);
+        assert_finite_after_steps(e, 20, "zero-length-edge");
+    }
+
+    #[test]
+    fn degenerate_all_same_position_cluster_stays_finite() {
+        // A tight cluster of many nodes ALL at the same point: every pair is a
+        // zero-distance exclusion/cohesion pair simultaneously.
+        let n = 8;
+        let g = no_edges_csr(n);
+        let pos = vec![0.0f32; 3 * n];
+        let e = init_engine(&g, hardening_settings(), &pos);
+        assert_finite_after_steps(e, 20, "all-same-position-cluster");
+    }
+
+    #[test]
+    fn degenerate_collinear_angle_triple_stays_finite() {
+        // A degree-2 center with two neighbours exactly collinear through it
+        // (θ = π, sin θ = 0): the angle-gradient `coef / sin_t` singularity.
+        // node 1 is the center; 0 and 2 are antiparallel about it.
+        let g = path_csr(3); // 0-1-2, node 1 has degree 2
+        let pos = vec![
+            -1.0, 0.0, 0.0, // node 0
+            0.0, 0.0, 0.0, // node 1 (center)
+            1.0, 0.0, 0.0, // node 2 — exactly collinear ⇒ θ = π
+        ];
+        let mut s = hardening_settings();
+        s.temperature = 0.0; // keep it deterministically collinear at step 0
+        let e = init_engine(&g, s, &pos);
+        assert_finite_after_steps(e, 20, "collinear-angle-triple");
+    }
+
+    #[test]
+    fn degenerate_single_node_stays_finite() {
+        let g = no_edges_csr(1);
+        let pos = vec![0.3, -0.4, 0.5];
+        let e = init_engine(&g, hardening_settings(), &pos);
+        assert_finite_after_steps(e, 10, "single-node");
+    }
+
+    #[test]
+    fn degenerate_empty_graph_steps_cleanly() {
+        let g = no_edges_csr(0);
+        let pos: Vec<f32> = Vec::new();
+        let mut e = init_engine(&g, hardening_settings(), &pos);
+        let mut ctx = EngineCtx::cpu_only();
+        // The empty-graph fast path returns an empty buffer without dividing by n.
+        let out = e.step(&mut ctx);
+        assert!(out.positions.is_empty(), "empty graph ⇒ no positions");
+    }
+
+    #[test]
+    fn extreme_temperature_stays_finite() {
+        // A very large kT for a few steps: the sqrt(kT/m) thermal kick + the
+        // max_step clamp + the new non-finite integrator guard together must
+        // keep everything bounded and finite.
+        let g = triangle();
+        let pos = deterministic_spread(3, 0.5);
+        let mut s = hardening_settings();
+        s.temperature = 1.0e6; // extreme thermostat
+        let e = init_engine(&g, s, &pos);
+        assert_finite_after_steps(e, 30, "extreme-temperature");
+    }
+
+    // --- small graph + seed builders used by the hardening tests ---------
+
+    /// Single undirected edge 0-1.
+    fn single_edge_csr() -> CsrGraph {
+        CsrGraph {
+            n_nodes: 2,
+            offsets: vec![0, 1, 2],
+            neighbors: vec![1, 0],
+        }
+    }
+
+    /// Undirected path 0-1-2-…-(n-1).
+    fn path_csr(n: usize) -> CsrGraph {
+        let mut offsets = vec![0u32];
+        let mut neighbors = Vec::new();
+        for v in 0..n {
+            if v > 0 {
+                neighbors.push(v as u32 - 1);
+            }
+            if v + 1 < n {
+                neighbors.push(v as u32 + 1);
+            }
+            offsets.push(neighbors.len() as u32);
+        }
+        CsrGraph {
+            n_nodes: n as u32,
+            offsets,
+            neighbors,
+        }
+    }
+
+    /// `n` isolated nodes (no edges) — the exclusion/cohesion-only fixture.
+    fn no_edges_csr(n: usize) -> CsrGraph {
+        CsrGraph {
+            n_nodes: n as u32,
+            offsets: vec![0u32; n + 1],
+            neighbors: Vec::new(),
+        }
+    }
+
+    /// A deterministic, mildly-spread seed (interleaved x,y,z).
+    fn deterministic_spread(n: usize, spread: f32) -> Vec<f32> {
+        let mut p = vec![0.0f32; 3 * n];
+        for i in 0..n {
+            let t = i as f32;
+            p[3 * i] = (t * 1.7).sin() * spread;
+            p[3 * i + 1] = (t * 2.3).cos() * spread;
+            p[3 * i + 2] = (t * 0.9).sin() * spread;
+        }
+        p
     }
 
     #[test]
