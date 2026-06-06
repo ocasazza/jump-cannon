@@ -1153,6 +1153,29 @@ pub struct GenerateState {
     /// handoff slot — never persisted.
     #[serde(skip)]
     pub request: Option<String>,
+    /// Which executor evaluates the generate expression. `Auto` (the default)
+    /// lets `App` pick: Server when graph-api is reachable, else LocalWorker on
+    /// wasm / Inline on native. An explicit pick from the panel/Debug dropdown
+    /// overrides that. Round-trips so a share link can pin a backend.
+    #[serde(default)]
+    pub backend: GenerateBackendChoice,
+}
+
+/// The user-facing dispatch choice for the Generate panel. `Auto` defers to
+/// `App`'s reachability-based default; the others force a specific
+/// [`crate::job::ExecutionBackend`]. Mirrors the local-vs-remote *layout*
+/// engine picker.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum GenerateBackendChoice {
+    /// Server when reachable, else a local fallback (the sensible default).
+    #[default]
+    Auto,
+    /// Force the Inline executor (native thread / wasm paint-first).
+    Inline,
+    /// Force the Server executor (async HTTP to graph-api `/generate`).
+    Server,
+    /// Force the Local Worker executor (feasibility-gated).
+    LocalWorker,
 }
 
 /// A star-graph demo authored against the embedded tvix graph library. It

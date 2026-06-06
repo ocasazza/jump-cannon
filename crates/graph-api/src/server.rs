@@ -46,6 +46,7 @@ pub fn router(state: AppState) -> Router {
         .route("/compute/engines", get(compute_engines))
         .route("/compute/layout", put(compute_layout_put))
         .route("/vault/page", put(vault_page_put))
+        .route("/generate", axum::routing::post(generate_post))
         .route("/progress", get(progress_poll))
         .with_state(state)
 }
@@ -250,6 +251,92 @@ async fn vault_page_put(
         Json(VaultPagePutResp { ok: true, error: None }),
     )
         .into_response()
+}
+
+// --- Generate (server-side tvix) endpoint ---
+//
+// POST /generate  Body: { "expr": "<nix>" }
+//
+// Evaluates a Nix generate-expression with `tvix_wasm::eval_graph` NATIVELY and
+// returns the resulting `{ nodes, links }` graph JSON. This is the PRIMARY
+// non-freeze path for the WASM renderer: the (potentially long) synchronous
+// `eval_graph` runs here on a blocking server thread instead of on the browser's
+// single egui thread, and the client calls it over async HTTP.
+//
+// Response (soft-error envelope, mirroring /vault/page):
+//   { "ok": true,  "graph": { "nodes": [...], "links": [...] } }
+//   { "ok": false, "error": "<eval error>" }
+// Both are HTTP 200 — `ok` carries success; the client surfaces `error` inline.
+
+/// Cap on the accepted expression source. A Nix generator is tiny (KiB); 1 MiB
+/// is far above any sane authored expression while bounding a runaway client.
+const MAX_GENERATE_EXPR_BYTES: usize = 1024 * 1024;
+
+#[derive(Deserialize)]
+struct GeneratePostReq {
+    /// The Nix expression to evaluate (must produce toGraphJSON's
+    /// `{ nodes = [...]; links = [...]; }` shape).
+    expr: String,
+}
+
+#[derive(Serialize)]
+struct GeneratePostResp {
+    ok: bool,
+    /// The evaluated graph as `{ nodes, links }` — present only on success.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    graph: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+fn generate_err(msg: impl Into<String>) -> axum::response::Response {
+    let msg = msg.into();
+    tracing::warn!(error = %msg, "generate eval failed");
+    // Soft error: HTTP 200 with `ok:false` so the client surfaces the eval
+    // message inline in the Generate panel exactly like the local path.
+    Json(GeneratePostResp {
+        ok: false,
+        graph: None,
+        error: Some(msg),
+    })
+    .into_response()
+}
+
+async fn generate_post(Json(req): Json<GeneratePostReq>) -> axum::response::Response {
+    if req.expr.len() > MAX_GENERATE_EXPR_BYTES {
+        return generate_err(format!(
+            "expression too large: {} bytes exceeds the {MAX_GENERATE_EXPR_BYTES} byte cap",
+            req.expr.len()
+        ));
+    }
+
+    // `tvix_wasm::eval_graph` is synchronous and CPU-bound (and uses non-Send
+    // `Rc` internals), so run it on a blocking thread. Only the `expr` String
+    // and the returned JSON cross the boundary — both are `Send`.
+    let expr = req.expr;
+    let result = tokio::task::spawn_blocking(move || {
+        tvix_wasm::eval_graph(&expr).map(|g| tvix_wasm::to_graph_json(&g))
+    })
+    .await;
+
+    match result {
+        Ok(Ok(graph_json)) => {
+            // `graph_json` is already canonical `{ nodes, links }` JSON; embed it
+            // as a value so the response is one well-formed JSON document.
+            let graph: serde_json::Value = match serde_json::from_str(&graph_json) {
+                Ok(v) => v,
+                Err(e) => return generate_err(format!("internal: re-encode graph: {e}")),
+            };
+            Json(GeneratePostResp {
+                ok: true,
+                graph: Some(graph),
+                error: None,
+            })
+            .into_response()
+        }
+        Ok(Err(eval_err)) => generate_err(eval_err),
+        Err(join_err) => generate_err(format!("evaluation task failed: {join_err}")),
+    }
 }
 
 /// Return the raw YAML frontmatter block (`---\n…---\n`) from `text`, or

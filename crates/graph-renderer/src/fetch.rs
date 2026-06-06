@@ -134,6 +134,51 @@ impl ApiClient {
         }
     }
 
+    /// `POST /generate` — evaluate a Nix generate-expression SERVER-SIDE and
+    /// return the resulting graph.
+    ///
+    /// This is the non-freeze path on WASM: the (potentially long) synchronous
+    /// `tvix_wasm::eval_graph` runs on the server's blocking pool, and this
+    /// client call is fully async (gloo-net on wasm / reqwest native), so the
+    /// browser's egui thread is never blocked. The server returns the canonical
+    /// `{ nodes, links }` JSON wire, which we parse straight back into the same
+    /// [`GeneratedGraph`] a local `eval_graph` would yield — so the result flows
+    /// into the identical promotion path.
+    ///
+    /// Soft-error envelope: an eval failure comes back as HTTP 200 with
+    /// `{ ok:false, error }`, surfaced here as `Err(error)`.
+    pub async fn generate_remote(
+        &self,
+        expr: &str,
+    ) -> Result<tvix_wasm::GeneratedGraph, String> {
+        #[derive(serde::Serialize)]
+        struct Req<'a> {
+            expr: &'a str,
+        }
+        #[derive(serde::Deserialize)]
+        struct Resp {
+            ok: bool,
+            // The server embeds the `{ nodes, links }` graph as a JSON value;
+            // capture it raw and re-serialise to a string for `parse_graph_json`,
+            // which is the shared parse half of `eval_graph`.
+            graph: Option<serde_json::Value>,
+            error: Option<String>,
+        }
+        let url = self.url("/generate");
+        let body = serde_json::to_vec(&Req { expr }).map_err(|e| e.to_string())?;
+        let bytes = http_post_json(&url, &body).await?;
+        let resp: Resp =
+            serde_json::from_slice(&bytes).map_err(|e| format!("decode generate: {e}"))?;
+        if !resp.ok {
+            return Err(resp.error.unwrap_or_else(|| "generate failed".into()));
+        }
+        let graph = resp
+            .graph
+            .ok_or_else(|| "generate: missing graph in ok response".to_string())?;
+        let graph_json = serde_json::to_string(&graph).map_err(|e| e.to_string())?;
+        tvix_wasm::parse_graph_json(&graph_json)
+    }
+
     /// `GET /progress?since=<seq>` — tail of the server-side progress
     /// event log. Returns the response untyped (just bytes); decoding
     /// is the caller's job (see `app::kick_off_progress_poll`).
@@ -448,6 +493,39 @@ async fn http_put_json(url: &str, body: &[u8]) -> Result<Vec<u8>, String> {
 }
 
 #[cfg(target_arch = "wasm32")]
+async fn http_post_json(url: &str, body: &[u8]) -> Result<Vec<u8>, String> {
+    use gloo_net::http::Request;
+    let resp = Request::post(url)
+        .header("content-type", "application/json")
+        .body(body.to_vec())
+        .map_err(|e| format!("build POST {url}: {e}"))?
+        .send()
+        .await
+        .map_err(|e| format!("POST {url}: {e}"))?;
+    if !resp.ok() {
+        return Err(format!("POST {url}: HTTP {}", resp.status()));
+    }
+    resp.binary().await.map_err(|e| format!("body {url}: {e}"))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+async fn http_post_json(url: &str, body: &[u8]) -> Result<Vec<u8>, String> {
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(url)
+        .header("content-type", "application/json")
+        .body(body.to_vec())
+        .send()
+        .await
+        .map_err(|e| format!("POST {url}: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("POST {url}: HTTP {}", resp.status()));
+    }
+    let bytes = resp.bytes().await.map_err(|e| format!("body {url}: {e}"))?;
+    Ok(bytes.to_vec())
+}
+
+#[cfg(target_arch = "wasm32")]
 async fn http_get_bytes_opt(url: &str) -> Result<Option<Vec<u8>>, String> {
     use gloo_net::http::Request;
     let resp = Request::get(url)
@@ -482,4 +560,61 @@ async fn http_get_bytes_opt(url: &str) -> Result<Option<Vec<u8>>, String> {
         .await
         .map_err(|e| format!("body {url}: {e}"))?;
     Ok(Some(bytes.to_vec()))
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    /// Spawn a one-shot HTTP/1.1 server that, on the first connection, reads the
+    /// (POST) request, then writes back `body` as a 200 JSON response. Returns
+    /// the bound `http://127.0.0.1:<port>` base URL. Used to drive the native
+    /// `ApiClient::generate_remote` end to end without graph-api (which would be
+    /// a dependency cycle).
+    async fn spawn_canned_json_server(body: &'static str) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            // Drain the request (best-effort; we only need to consume enough to
+            // let the client finish sending before we reply).
+            let mut buf = [0u8; 4096];
+            let _ = sock.read(&mut buf).await;
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            sock.write_all(resp.as_bytes()).await.unwrap();
+            let _ = sock.shutdown().await;
+        });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn generate_remote_parses_ok_envelope() {
+        // The canonical { ok, graph: { nodes, links } } success envelope the
+        // server emits — `type` carried on one node, absent on another.
+        let body = r#"{"ok":true,"graph":{"nodes":[{"id":"a","type":"x"},{"id":"b"}],"links":[{"source":"a","target":"b"}]}}"#;
+        let base = spawn_canned_json_server(body).await;
+        let client = ApiClient::new(base);
+        let graph = client.generate_remote("ignored").await.expect("ok envelope");
+        assert_eq!(graph.nodes.len(), 2);
+        assert_eq!(graph.edges.len(), 1);
+        assert_eq!(graph.nodes[0].kind.as_deref(), Some("x"));
+        assert_eq!(graph.nodes[1].kind, None);
+        assert_eq!(graph.edges[0].source, "a");
+        assert_eq!(graph.edges[0].target, "b");
+    }
+
+    #[tokio::test]
+    async fn generate_remote_surfaces_soft_error() {
+        let body = r#"{"ok":false,"error":"boom: bad expr"}"#;
+        let base = spawn_canned_json_server(body).await;
+        let client = ApiClient::new(base);
+        let err = client.generate_remote("ignored").await.unwrap_err();
+        assert_eq!(err, "boom: bad expr");
+    }
 }

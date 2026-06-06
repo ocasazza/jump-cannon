@@ -83,6 +83,12 @@ pub struct App {
     metrics: HashMap<String, Vec<f32>>,
     /// Base URL for `/node/:id` follow-up fetches.
     base_url: String,
+    /// Whether graph-api is currently reachable. Set by the long-lived
+    /// compute-health watcher (an `Ok` reply means graph-api answered; an `Err`
+    /// means it's down / the route 404s). Drives the `GenerateBackendChoice::Auto`
+    /// default: Server when reachable, else a local fallback. Starts `true`
+    /// (optimistic) — the first probe corrects it within ~2s.
+    server_reachable: Arc<Mutex<bool>>,
     /// Async-shared `/search?q=` result cache.
     search_cache: SearchCache,
     /// Search queries we've already kicked off (avoid double-fire).
@@ -500,15 +506,19 @@ impl App {
         // this signal, a stalled Remote FA2 stream reads as a frontend
         // bug — in fact graph-api is up but its gRPC dial to
         // graph-compute is failing.
+        let server_reachable: Arc<Mutex<bool>> = Arc::new(Mutex::new(true));
         {
             let sink = progress.sink();
             let client = ApiClient::new(base_url.clone());
+            let reachable = server_reachable.clone();
             spawn_async(async move {
                 use std::time::Duration;
                 let mut last_known: Option<bool> = None;
                 loop {
                     match client.compute_health().await {
                         Ok(h) => {
+                            // graph-api answered → reachable for /generate.
+                            *reachable.lock().unwrap() = true;
                             if last_known != Some(h.connected) {
                                 last_known = Some(h.connected);
                                 if h.connected {
@@ -528,7 +538,9 @@ impl App {
                             }
                         }
                         Err(_) => {
-                            // graph-api itself is down or the route 404s.
+                            // graph-api itself is down or the route 404s →
+                            // /generate is not reachable; Auto falls back local.
+                            *reachable.lock().unwrap() = false;
                             // Don't spam the log — only emit once on
                             // transition.
                             if last_known != Some(false) {
@@ -589,6 +601,7 @@ impl App {
             id_to_idx: HashMap::new(),
             metrics: HashMap::new(),
             base_url,
+            server_reachable,
             search_cache: Arc::new(Mutex::new(HashMap::new())),
             search_inflight: HashSet::new(),
             prev_style_key: None,
@@ -942,30 +955,67 @@ impl App {
     /// native, paint-first-then-run on WASM (see the job module docs) — with
     /// coarse progress (`queued → evaluating → done + counts`) surfacing in
     /// the footer task list and the debug console.
+    /// Resolve the concrete [`crate::job::ExecutionBackend`] for the next
+    /// generate, honouring the panel's `GenerateBackendChoice` and the `Auto`
+    /// default. `Auto` picks **Server when graph-api is reachable**, else a
+    /// local fallback (LocalWorker on wasm — currently the same local executor
+    /// as Inline until the worker bundle is feasible — Inline on native). This
+    /// mirrors the local-vs-remote layout-engine default.
+    fn resolve_generate_backend(&self) -> crate::job::ExecutionBackend {
+        let reachable = *self.server_reachable.lock().unwrap();
+        resolve_generate_backend(
+            self.state.generate.backend,
+            reachable,
+            cfg!(target_arch = "wasm32"),
+        )
+    }
+
     fn pump_generate_job(&mut self) {
         // 1. Kick off a job from a pending request (one job at a time — the
         //    panel guards against re-requesting while `request` is set, and we
-        //    only spawn when no job is in flight).
+        //    only spawn when no job is in flight). The chosen ExecutionBackend
+        //    routes WHERE the work runs; the spawn/poll interface + progress UI
+        //    are identical across backends.
         if self.generate_job.is_none() {
             if let Some(src) = self.state.generate.request.take() {
-                let job = crate::job::BackgroundJob::spawn(
-                    self.progress.sink(),
-                    "generate",
-                    "evaluate expression",
-                    move |s| {
-                        s.info("generate", "evaluating Nix expression…");
-                        let graph = tvix_wasm::eval_graph(&src)?;
-                        s.info(
+                let backend = self.resolve_generate_backend();
+                let job = match backend {
+                    crate::job::ExecutionBackend::Server => {
+                        // PRIMARY non-freeze: eval runs server-side; the client
+                        // call is async, so the egui thread never blocks.
+                        let client = ApiClient::new(self.base_url.clone());
+                        crate::job::BackgroundJob::spawn_future(
+                            self.progress.sink(),
                             "generate",
-                            format!(
-                                "evaluated: {} nodes, {} edges — building graph",
-                                graph.nodes.len(),
-                                graph.edges.len()
-                            ),
-                        );
-                        Ok(graph)
-                    },
-                );
+                            "evaluate expression (server)",
+                            async move { client.generate_remote(&src).await },
+                        )
+                    }
+                    // Inline AND LocalWorker (until the worker bundle is
+                    // feasible) both run the closure locally via the original
+                    // backend: native thread / wasm paint-first-then-run.
+                    crate::job::ExecutionBackend::Inline
+                    | crate::job::ExecutionBackend::LocalWorker => {
+                        crate::job::BackgroundJob::spawn(
+                            self.progress.sink(),
+                            "generate",
+                            "evaluate expression (local)",
+                            move |s| {
+                                s.info("generate", "evaluating Nix expression…");
+                                let graph = tvix_wasm::eval_graph(&src)?;
+                                s.info(
+                                    "generate",
+                                    format!(
+                                        "evaluated: {} nodes, {} edges — building graph",
+                                        graph.nodes.len(),
+                                        graph.edges.len()
+                                    ),
+                                );
+                                Ok(graph)
+                            },
+                        )
+                    }
+                };
                 self.generate_job = Some(job);
             }
         }
@@ -4404,6 +4454,34 @@ fn set_failed(load: &SharedLoad, msg: String) {
     *load.lock().unwrap() = LoadState::Failed(msg);
 }
 
+/// Pure backend-routing decision for the Generate dispatch (extracted so it is
+/// unit-testable without an `App`). An explicit `GenerateBackendChoice` forces
+/// its backend; `Auto` picks **Server when graph-api is reachable**, else a
+/// local fallback — LocalWorker on wasm, Inline on native. This mirrors the
+/// local-vs-remote layout-engine default.
+fn resolve_generate_backend(
+    choice: crate::ui::state::GenerateBackendChoice,
+    server_reachable: bool,
+    is_wasm: bool,
+) -> crate::job::ExecutionBackend {
+    use crate::job::ExecutionBackend as Be;
+    use crate::ui::state::GenerateBackendChoice as Choice;
+    match choice {
+        Choice::Inline => Be::Inline,
+        Choice::Server => Be::Server,
+        Choice::LocalWorker => Be::LocalWorker,
+        Choice::Auto => {
+            if server_reachable {
+                Be::Server
+            } else if is_wasm {
+                Be::LocalWorker
+            } else {
+                Be::Inline
+            }
+        }
+    }
+}
+
 /// Cross-target async sleep. `tokio::time::sleep` only works inside a
 /// tokio runtime (native path); the wasm path needs `gloo_timers`.
 #[cfg(target_arch = "wasm32")]
@@ -4417,12 +4495,12 @@ async fn sleep_async(d: std::time::Duration) {
 }
 
 #[cfg(target_arch = "wasm32")]
-fn spawn_async<F: std::future::Future<Output = ()> + 'static>(f: F) {
+pub(crate) fn spawn_async<F: std::future::Future<Output = ()> + 'static>(f: F) {
     wasm_bindgen_futures::spawn_local(f);
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-fn spawn_async<F: std::future::Future<Output = ()> + Send + 'static>(f: F) {
+pub(crate) fn spawn_async<F: std::future::Future<Output = ()> + Send + 'static>(f: F) {
     use std::sync::OnceLock;
     static RT: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
     let rt = RT.get_or_init(|| {
@@ -4433,4 +4511,61 @@ fn spawn_async<F: std::future::Future<Output = ()> + Send + 'static>(f: F) {
             .expect("tokio runtime")
     });
     rt.spawn(f);
+}
+
+#[cfg(test)]
+mod dispatch_tests {
+    use super::resolve_generate_backend;
+    use crate::job::ExecutionBackend as Be;
+    use crate::ui::state::GenerateBackendChoice as Choice;
+
+    #[test]
+    fn explicit_choices_are_forced_regardless_of_reachability() {
+        for &reachable in &[true, false] {
+            for &is_wasm in &[true, false] {
+                assert_eq!(
+                    resolve_generate_backend(Choice::Inline, reachable, is_wasm),
+                    Be::Inline
+                );
+                assert_eq!(
+                    resolve_generate_backend(Choice::Server, reachable, is_wasm),
+                    Be::Server
+                );
+                assert_eq!(
+                    resolve_generate_backend(Choice::LocalWorker, reachable, is_wasm),
+                    Be::LocalWorker
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn auto_prefers_server_when_reachable() {
+        assert_eq!(
+            resolve_generate_backend(Choice::Auto, true, true),
+            Be::Server
+        );
+        assert_eq!(
+            resolve_generate_backend(Choice::Auto, true, false),
+            Be::Server
+        );
+    }
+
+    #[test]
+    fn auto_falls_back_local_when_unreachable() {
+        // wasm → LocalWorker, native → Inline.
+        assert_eq!(
+            resolve_generate_backend(Choice::Auto, false, true),
+            Be::LocalWorker
+        );
+        assert_eq!(
+            resolve_generate_backend(Choice::Auto, false, false),
+            Be::Inline
+        );
+    }
+
+    #[test]
+    fn default_choice_is_auto() {
+        assert_eq!(Choice::default(), Choice::Auto);
+    }
 }

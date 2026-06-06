@@ -42,6 +42,11 @@ vault-links    = { path = "../vault-links" }
 graph-layouts  = { path = "../graph-layouts" }
 graph-metrics  = { path = "../graph-metrics" }
 graph-renderer = { path = "../graph-renderer" }
+# tvix-wasm is native+wasm; default-features=false builds the native (pure)
+# tvix-eval evaluator. graph-api links it to evaluate Nix generate-expressions
+# SERVER-SIDE (POST /generate), so the WASM client's `eval_graph` runs off the
+# browser thread entirely (async HTTP, non-freezing).
+tvix-wasm      = { path = "../tvix-wasm", default-features = false }
 # graph-compute is native-only. graph-api links it for its gRPC client types
 # + generated proto bindings; the renderer (WASM) does not.
 graph-compute  = { path = "../graph-compute", default-features = false }

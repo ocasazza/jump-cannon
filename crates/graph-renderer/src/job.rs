@@ -60,6 +60,73 @@ use std::sync::{Arc, Mutex};
 
 use crate::ui::progress::{ProgressSink, TaskId};
 
+/// Which executor runs a [`BackgroundJob`]'s work.
+///
+/// The job's `spawn`/`poll` interface and the footer/console progress UI are
+/// IDENTICAL across backends — routing only picks where the work runs. This
+/// mirrors the local-vs-remote *layout* engine pattern already in the repo.
+///
+/// * [`Inline`](ExecutionBackend::Inline) — the original fallback:
+///   native runs the closure on a real [`std::thread`] (genuinely off-thread);
+///   WASM runs it paint-first-then-run inside the first `poll` (the single
+///   synchronous call still blocks the frame it runs on, but the UI paints a
+///   busy frame + progress first). See [`BackgroundJob::spawn`].
+/// * [`Server`](ExecutionBackend::Server) — the PRIMARY WASM non-freeze: the
+///   work is an async future (an HTTP call to graph-api's `/generate`), driven
+///   off the egui thread via `spawn_local`/tokio. On WASM this genuinely does
+///   NOT block the browser thread because the eval runs server-side and the
+///   client call is async. See [`BackgroundJob::spawn_future`].
+/// * [`LocalWorker`](ExecutionBackend::LocalWorker) — a standalone/offline Web
+///   Worker hosting a second wasm instance running `eval_graph` off the main
+///   thread, message-passing only (no SharedArrayBuffer / COOP-COEP / atomics).
+///
+///   FEASIBILITY (honest): this variant is wired (picker entry + routing) but
+///   currently FALLS BACK to the local executor — it does NOT yet drive a real
+///   worker. The blocker is a pinned-toolchain version skew: the build pins
+///   `wasm-bindgen` 0.2.120 in `Cargo.lock` but the nix `wasm-bindgen-cli`
+///   ships 0.2.118 (see `flake.nix` `graph-renderer-web` + the wasm-bindgen
+///   #4211 / #4654 note). The single main-bundle works only because
+///   `.cargo/config.toml` + RUSTFLAGS carefully manage the `reference-types`
+///   feature across that two-patch gap. A trunk `data-type="worker"` bundle
+///   would add a SECOND wasm-bindgen invocation with worker-specific codegen
+///   (a distinct entry shape), which is exactly the surface that gap breaks —
+///   and the trunk worker loader would also need hand-written JS glue beyond
+///   the ≤50-line shim (an explicit blocker under the Rust-only rule unless the
+///   glue is fully trunk/gloo-generated). Unblocking it means overriding
+///   `wasm-bindgen-cli` with a 0.2.120 build (the source hash is already known)
+///   so a `tvix-worker` bin + `gloo-worker` glue can be generated cleanly. The
+///   Server + Inline backends already deliver the non-freeze, so this is a
+///   follow-up, not a blocker.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum ExecutionBackend {
+    /// Run on the local executor (native thread / wasm paint-first).
+    Inline,
+    /// Evaluate server-side over async HTTP (the non-freezing default when a
+    /// graph-api/compute URL is reachable).
+    #[default]
+    Server,
+    /// Run in a local Web Worker (offline). Feasibility-gated.
+    LocalWorker,
+}
+
+impl ExecutionBackend {
+    /// All variants, for a UI picker.
+    pub const ALL: [ExecutionBackend; 3] = [
+        ExecutionBackend::Server,
+        ExecutionBackend::LocalWorker,
+        ExecutionBackend::Inline,
+    ];
+
+    /// Short human label for the picker.
+    pub fn label(self) -> &'static str {
+        match self {
+            ExecutionBackend::Inline => "Inline (local)",
+            ExecutionBackend::Server => "Server (graph-api)",
+            ExecutionBackend::LocalWorker => "Local worker",
+        }
+    }
+}
+
 /// The shared result slot. `None` = still running; `Some(Ok/Err)` = done.
 type Slot<T> = Arc<Mutex<Option<Result<T, String>>>>;
 
@@ -211,6 +278,161 @@ impl<T: Send + 'static> BackgroundJob<T> {
         }
     }
 
+    /// Spawn a background job whose work is an **async future** — the
+    /// [`ExecutionBackend::Server`] path. The future is driven off the egui
+    /// thread (`spawn_local` on wasm, the shared tokio runtime on native), and
+    /// its `Result` lands in the SAME slot `poll` reads. The `spawn`/`poll`
+    /// interface and the footer/console progress are unchanged.
+    ///
+    /// This is the genuine WASM non-freeze: because the future is an async HTTP
+    /// call to graph-api (where the heavy `eval_graph` actually runs), the
+    /// browser's single egui thread is never blocked. A determinate footer bar
+    /// is opened immediately and finished/failed when the future resolves.
+    ///
+    /// On native the future runs on the shared tokio runtime; `poll` picks the
+    /// result up on a later frame, exactly like the threaded `spawn` path.
+    #[cfg(target_arch = "wasm32")]
+    pub fn spawn_future<Fut>(
+        sink: ProgressSink,
+        group: impl Into<String>,
+        label: impl Into<String>,
+        fut: Fut,
+    ) -> Self
+    where
+        Fut: std::future::Future<Output = Result<T, String>> + 'static,
+    {
+        Self::spawn_future_impl(sink, group, label, fut)
+    }
+
+    /// Native variant: the shared tokio runtime requires a `Send` future (the
+    /// `reqwest` client used by `generate_remote` is `Send`, so this holds).
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn spawn_future<Fut>(
+        sink: ProgressSink,
+        group: impl Into<String>,
+        label: impl Into<String>,
+        fut: Fut,
+    ) -> Self
+    where
+        Fut: std::future::Future<Output = Result<T, String>> + Send + 'static,
+    {
+        Self::spawn_future_impl(sink, group, label, fut)
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn spawn_future_impl<Fut>(
+        sink: ProgressSink,
+        group: impl Into<String>,
+        label: impl Into<String>,
+        fut: Fut,
+    ) -> Self
+    where
+        Fut: std::future::Future<Output = Result<T, String>> + 'static,
+    {
+        Self::spawn_future_body(sink, group, label, fut)
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn spawn_future_impl<Fut>(
+        sink: ProgressSink,
+        group: impl Into<String>,
+        label: impl Into<String>,
+        fut: Fut,
+    ) -> Self
+    where
+        Fut: std::future::Future<Output = Result<T, String>> + Send + 'static,
+    {
+        Self::spawn_future_body(sink, group, label, fut)
+    }
+
+    /// Shared body. The `spawn_job_future` it calls is the cfg-gated boundary:
+    /// `spawn_local` on wasm (no `Send` needed), the tokio runtime on native
+    /// (requires `Send`, which the callers' bounds guarantee).
+    #[cfg(target_arch = "wasm32")]
+    fn spawn_future_body<Fut>(
+        sink: ProgressSink,
+        group: impl Into<String>,
+        label: impl Into<String>,
+        fut: Fut,
+    ) -> Self
+    where
+        Fut: std::future::Future<Output = Result<T, String>> + 'static,
+    {
+        let slot: Slot<T> = Arc::new(Mutex::new(None));
+        let group = group.into();
+        let label = label.into();
+
+        // Open the footer task now so it appears the instant the job is spawned;
+        // seed a small determinate fraction so the bar shows immediately.
+        let task = sink.start(group, label);
+        sink.set_progress(task, 0.1);
+
+        let slot_t = slot.clone();
+        let sink_t = sink.clone();
+        spawn_job_future(async move {
+            let result = fut.await;
+            match &result {
+                Ok(_) => {
+                    sink_t.set_progress(task, 1.0);
+                    sink_t.finish(task);
+                }
+                Err(e) => sink_t.fail(task, e.clone()),
+            }
+            if let Ok(mut g) = slot_t.lock() {
+                *g = Some(result);
+            }
+        });
+
+        Self {
+            slot,
+            #[cfg(target_arch = "wasm32")]
+            deferred: None,
+            consumed: false,
+        }
+    }
+
+    /// Native counterpart of [`Self::spawn_future_body`] (Send-bounded for the
+    /// tokio runtime). Identical body; the trait bound differs per target so it
+    /// can't be one function.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn spawn_future_body<Fut>(
+        sink: ProgressSink,
+        group: impl Into<String>,
+        label: impl Into<String>,
+        fut: Fut,
+    ) -> Self
+    where
+        Fut: std::future::Future<Output = Result<T, String>> + Send + 'static,
+    {
+        let slot: Slot<T> = Arc::new(Mutex::new(None));
+        let group = group.into();
+        let label = label.into();
+
+        let task = sink.start(group, label);
+        sink.set_progress(task, 0.1);
+
+        let slot_t = slot.clone();
+        let sink_t = sink.clone();
+        spawn_job_future(async move {
+            let result = fut.await;
+            match &result {
+                Ok(_) => {
+                    sink_t.set_progress(task, 1.0);
+                    sink_t.finish(task);
+                }
+                Err(e) => sink_t.fail(task, e.clone()),
+            }
+            if let Ok(mut g) = slot_t.lock() {
+                *g = Some(result);
+            }
+        });
+
+        Self {
+            slot,
+            consumed: false,
+        }
+    }
+
     /// Poll for completion. Returns `Some(result)` exactly once, on the first
     /// poll after the work finishes; `None` while still running (or after the
     /// result has already been taken).
@@ -247,6 +469,20 @@ impl<T: Send + 'static> BackgroundJob<T> {
     pub fn is_consumed(&self) -> bool {
         self.consumed
     }
+}
+
+/// Cross-target future spawner for the [`ExecutionBackend::Server`] path.
+/// Delegates to the shared `app::spawn_async` (`spawn_local` on wasm, a
+/// long-lived tokio runtime on native) so the async work runs off the egui
+/// thread and its result lands in the job's slot.
+#[cfg(target_arch = "wasm32")]
+fn spawn_job_future<F: std::future::Future<Output = ()> + 'static>(f: F) {
+    crate::app::spawn_async(f);
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn spawn_job_future<F: std::future::Future<Output = ()> + Send + 'static>(f: F) {
+    crate::app::spawn_async(f);
 }
 
 #[cfg(test)]

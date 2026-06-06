@@ -35,6 +35,14 @@ pub fn show(ui: &mut egui::Ui, state: &mut AppState) {
     examples_picker(ui, state);
     subgroup_separator(ui);
 
+    // ── Execution backend picker ─────────────────────────────────────────
+    // Routes WHERE the (potentially long) eval runs. Auto = Server when
+    // graph-api is reachable, else a local fallback — the non-freeze default
+    // on WASM (server-side eval over async HTTP). Mirrors the layout-engine
+    // local-vs-remote picker.
+    backend_picker(ui, state);
+    subgroup_separator(ui);
+
     // Built-in examples come straight from the embedded demo catalog. Every
     // entry is verified to evaluate by `tvix_wasm`'s `all_demos_evaluate` test.
     let examples: Vec<NixExample> = tvix_wasm::demos().iter().copied().map(Into::into).collect();
@@ -69,6 +77,44 @@ pub fn show(ui: &mut egui::Ui, state: &mut AppState) {
             state.generate.request = Some(src);
         }
     }
+}
+
+/// Execution-backend picker: a combo over [`GenerateBackendChoice`]. Selecting
+/// a backend routes where the eval runs (Server = async HTTP to graph-api, the
+/// WASM non-freeze path; Inline = local; Auto = reachability-based default).
+fn backend_picker(ui: &mut egui::Ui, state: &mut AppState) {
+    use super::super::state::GenerateBackendChoice as Choice;
+    super::subgroup_label(ui, "Execution backend");
+    super::hint_label(
+        ui,
+        "Where the expression is evaluated. Server (async HTTP to graph-api) \
+         keeps the browser responsive for large graphs. Auto uses Server when \
+         reachable, else a local fallback.",
+    );
+
+    let label = |c: Choice| match c {
+        Choice::Auto => "Auto (server if reachable)",
+        Choice::Server => "Server (graph-api)",
+        Choice::Inline => "Inline (local)",
+        Choice::LocalWorker => "Local worker",
+    };
+
+    let cur = state.generate.backend;
+    egui::ComboBox::from_id_salt("generate-backend-picker")
+        .selected_text(label(cur))
+        .width(f32::INFINITY)
+        .show_ui(ui, |ui| {
+            for choice in [Choice::Auto, Choice::Server, Choice::Inline, Choice::LocalWorker] {
+                let resp = ui.selectable_value(&mut state.generate.backend, choice, label(choice));
+                if choice == Choice::LocalWorker {
+                    resp.on_hover_text(
+                        "Offline Web Worker eval. Currently falls back to the local \
+                         executor — the trunk worker bundle is feasibility-gated \
+                         (see tvix-worker).",
+                    );
+                }
+            }
+        });
 }
 
 /// Examples picker: a combo of the self-assembly example UI-states. Selecting
