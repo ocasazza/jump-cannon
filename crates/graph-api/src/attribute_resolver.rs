@@ -150,6 +150,33 @@ pub fn resolve(
         settings.class_affinity_dim = (lens.class_affinity.len() as f32).sqrt() as u32;
     }
 
+    // 4. Dynamic-bond (self-assembly) knobs. All gated on `bonding_enabled`;
+    //    when it is false (the default) the engine never reads the rest, so the
+    //    resolved settings remain byte-identical to the no-bonding path. The
+    //    fields map 1:1 onto the geometric engine's P1–P3 dynamic-bond knobs.
+    settings.bonding_enabled = lens.bonding_enabled;
+    if lens.bonding_enabled {
+        settings.r_bond = lens.r_bond;
+        settings.r_break = lens.r_break;
+        settings.bond_every = lens.bond_every;
+        settings.bond_stiffness = lens.bond_stiffness;
+        settings.default_max_valence = lens.default_max_valence;
+        settings.default_bond_angle = lens.default_bond_angle;
+        settings.line_tension = lens.line_tension;
+        settings.spont_curvature = lens.spont_curvature;
+
+        // Membrane / thermostat knobs the validated self-assembly regimes need
+        // (cohesion well + Langevin temperature + patchy alignment + flattening
+        // + tilt coupling). Forwarded only inside the bonding branch so the
+        // no-bonding default path stays byte-identical.
+        settings.well_depth = lens.well_depth;
+        settings.well_width = lens.well_width;
+        settings.temperature = lens.temperature;
+        settings.anisotropy_strength = lens.anisotropy_strength;
+        settings.gb_side_strength = lens.gb_side_strength;
+        settings.tilt_coupling_strength = lens.tilt_coupling_strength;
+    }
+
     (settings, attrs)
 }
 
@@ -285,5 +312,62 @@ mod tests {
             "shortcut should stretch to base·(1+spread)=4.0, got {max}"
         );
         assert_eq!(settings.edge_length_source, EdgeLengthSource::Injected);
+    }
+
+    fn one_node_snapshot() -> GraphSnapshot {
+        let mut graph = VaultGraph::default();
+        graph.nodes.insert(
+            "n".to_string(),
+            VaultNode {
+                id: "n".to_string(),
+                ..Default::default()
+            },
+        );
+        GraphSnapshot {
+            graph,
+            id_to_idx: [("n".to_string(), 0)].into_iter().collect(),
+            idx_to_id: vec!["n".to_string()],
+            binary_cache: HashMap::new(),
+        }
+    }
+
+    /// The default lens (bonding OFF) must leave the resolved engine settings'
+    /// `bonding_enabled` false — the byte-identical default path.
+    #[test]
+    fn bonding_off_by_default_in_resolved_settings() {
+        let (settings, _) = resolve(&LensConfig::default(), &one_node_snapshot());
+        assert!(!settings.bonding_enabled);
+        assert!(settings.max_valence.is_empty());
+        assert_eq!(settings.default_max_valence, 0);
+        assert_eq!(settings.line_tension, 0.0);
+        assert_eq!(settings.spont_curvature, 0.0);
+    }
+
+    /// With `bonding_enabled`, every dynamic-bond knob is forwarded 1:1 onto the
+    /// resolved `GeometricSettings` so a UI/tvix preset actually drives the
+    /// self-assembly stage.
+    #[test]
+    fn bonding_knobs_pass_through_when_enabled() {
+        let mut lens = LensConfig::default();
+        lens.bonding_enabled = true;
+        lens.r_bond = 1.1;
+        lens.r_break = 1.5;
+        lens.bond_every = 4;
+        lens.bond_stiffness = 0.4;
+        lens.default_max_valence = 3;
+        lens.default_bond_angle = 120.0;
+        lens.line_tension = 4.0;
+        lens.spont_curvature = 0.5;
+
+        let (settings, _) = resolve(&lens, &one_node_snapshot());
+        assert!(settings.bonding_enabled);
+        assert_eq!(settings.r_bond, 1.1);
+        assert_eq!(settings.r_break, 1.5);
+        assert_eq!(settings.bond_every, 4);
+        assert_eq!(settings.bond_stiffness, 0.4);
+        assert_eq!(settings.default_max_valence, 3);
+        assert_eq!(settings.default_bond_angle, 120.0);
+        assert_eq!(settings.line_tension, 4.0);
+        assert_eq!(settings.spont_curvature, 0.5);
     }
 }

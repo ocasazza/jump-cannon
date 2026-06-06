@@ -205,6 +205,138 @@ impl LensPreset {
     }
 }
 
+/// Self-assembly example presets — each sets `bonding_enabled` plus the
+/// PARAMETER REGIME validated in `crates/graph-compute/tests/geometric_solver.rs`
+/// (`soup_settings` / `p2_*` / `p3_*`) for a morphology on the dynamic-edge
+/// engine. These map onto the lipid → sheet → tube → sphere demo ladder
+/// (`docs/dynamic-edge-bonding-plan.md` §5).
+///
+/// HONESTY: chains (valence-2) and honeycomb sheets (valence-3 @120°) form
+/// SPONTANEOUSLY from a soup in the validated budget. Full tube/vesicle closure
+/// is a kinetic trap in a single-leaflet point model — the tube/vesicle presets
+/// dial in the validated curvature / rim-line-tension regime (P3
+/// `p3_line_tension_closes_a_seeded_disk`, γ=4, c₀=0.5) that FOLDS a seeded
+/// bonded patch toward closure; spontaneous soup→vesicle closure is logged as
+/// not reached. Pair the tube/vesicle preset with a sheet/disk Initial-seed.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum SelfAssemblyPreset {
+    LipidChain,
+    HoneycombSheet,
+    Tube,
+    Vesicle,
+}
+
+impl SelfAssemblyPreset {
+    pub const ALL: [SelfAssemblyPreset; 4] = [
+        SelfAssemblyPreset::LipidChain,
+        SelfAssemblyPreset::HoneycombSheet,
+        SelfAssemblyPreset::Tube,
+        SelfAssemblyPreset::Vesicle,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            SelfAssemblyPreset::LipidChain => "Lipid chains (valence 2)",
+            SelfAssemblyPreset::HoneycombSheet => "Honeycomb sheet (valence 3 @120°)",
+            SelfAssemblyPreset::Tube => "Tube (curved sheet)",
+            SelfAssemblyPreset::Vesicle => "Vesicle (rim seam + curvature)",
+        }
+    }
+
+    pub fn tooltip(self) -> &'static str {
+        match self {
+            SelfAssemblyPreset::LipidChain => {
+                "P2 valence-2 @180°. Spontaneous from a cohering Brownian soup."
+            }
+            SelfAssemblyPreset::HoneycombSheet => {
+                "P2 valence-3 @120° + membrane flattening (anisotropy + GB-side + \
+                 tilt). Honeycomb patches form spontaneously."
+            }
+            SelfAssemblyPreset::Tube => {
+                "Sheet regime + spontaneous curvature → a rolled tube. Seed a \
+                 disk/sheet; full closure is a kinetic trap (logged)."
+            }
+            SelfAssemblyPreset::Vesicle => {
+                "P3 rim line-tension (γ=4) + curvature (c₀=0.5): folds a seeded \
+                 bonded disk toward a shell. Spontaneous soup→vesicle not reached \
+                 (logged) — seed a disk."
+            }
+        }
+    }
+
+    /// Apply the validated self-assembly regime to a [`LensConfig`]. All values
+    /// are the ones the `graph-compute` solver canaries validate for the
+    /// morphology (see the doc comment on the enum).
+    pub fn apply_to(self, c: &mut LensConfig) {
+        // Common dynamic-bond + Brownian-soup base (matches the validated
+        // `soup_settings` regime: σ=1.0 contact, cohesion well, thermostat).
+        c.bonding_enabled = true;
+        c.exclusion_strength = 1.0;
+        c.gravity = 0.1;
+        c.r_bond = 1.1; // just past contact σ=1.0
+        c.r_break = 1.5; // ≈1.36·r_bond hysteresis band
+        c.bond_stiffness = 0.4;
+        c.bond_every = 4;
+        c.well_depth = 2.0;
+        c.well_width = 1.0;
+        c.temperature = 0.2;
+        // Default the membrane terms OFF; the sheet/tube/vesicle regimes turn
+        // them on below.
+        c.anisotropy_strength = 0.0;
+        c.gb_side_strength = 0.0;
+        c.tilt_coupling_strength = 0.0;
+        c.spont_curvature = 0.0;
+        c.line_tension = 0.0;
+
+        match self {
+            // P2 valence-2 @180° (soup_settings + cap 2, angle 0.15, 180°).
+            SelfAssemblyPreset::LipidChain => {
+                c.default_max_valence = 2;
+                c.default_bond_angle = 180.0;
+                c.angle_stiffness = 0.15;
+            }
+            // P2 valence-3 @120° honeycomb (p2_valence_three_120deg...).
+            SelfAssemblyPreset::HoneycombSheet => {
+                c.default_max_valence = 3;
+                c.default_bond_angle = 120.0;
+                c.angle_stiffness = 0.3;
+                c.well_depth = 2.5;
+                c.anisotropy_strength = 1.0;
+                c.gb_side_strength = 1.5;
+                c.tilt_coupling_strength = 1.0;
+                c.spont_curvature = 0.0; // flat target
+                c.gravity = 0.05;
+            }
+            // Sheet regime + spontaneous curvature (rolls a sheet into a tube).
+            SelfAssemblyPreset::Tube => {
+                c.default_max_valence = 3;
+                c.default_bond_angle = 120.0;
+                c.angle_stiffness = 0.3;
+                c.well_depth = 2.5;
+                c.anisotropy_strength = 1.0;
+                c.gb_side_strength = 1.5;
+                c.tilt_coupling_strength = 1.0;
+                c.spont_curvature = 0.25; // intermediate c₀ → tube curvature
+                c.gravity = 0.05;
+            }
+            // P3 rim line-tension + curvature (p3_line_tension_closes_a_seeded_disk
+            // validated γ=4, c₀=0.5: folds a seeded bonded disk toward a shell).
+            SelfAssemblyPreset::Vesicle => {
+                c.default_max_valence = 3;
+                c.default_bond_angle = 120.0;
+                c.angle_stiffness = 0.3;
+                c.well_depth = 2.5;
+                c.anisotropy_strength = 1.0;
+                c.gb_side_strength = 1.5;
+                c.tilt_coupling_strength = 1.0;
+                c.spont_curvature = 0.5; // validated closure curvature
+                c.line_tension = 4.0; // validated rim seam strength
+                c.gravity = 0.05;
+            }
+        }
+    }
+}
+
 fn render_ui(ui: &mut egui::Ui, json: &mut Value) {
     let mut opts: LensConfig = serde_json::from_value(json.clone()).unwrap_or_default();
     let mut changed = false;
@@ -311,9 +443,170 @@ fn render_ui(ui: &mut egui::Ui, json: &mut Value) {
         if ui.add(egui::Slider::new(&mut opts.gravity, 0.0..=0.1)).changed() { changed = true; }
     });
 
+    subgroup_separator(ui);
+
+    // ── Self-assembly (dynamic bonding) ──────────────────────────────────
+    subgroup_label(ui, "Self-assembly");
+    row(ui, "Bonding", |ui| {
+        if ui
+            .checkbox(&mut opts.bonding_enabled, "enabled")
+            .on_hover_text(
+                "Add/remove edges (bonds) each step under a proximity + class \
+                 + valence + angle constraint, so chains → sheets → tubes → \
+                 vesicles emerge on an evolving graph. OFF = byte-identical \
+                 default engine behaviour.",
+            )
+            .changed()
+        {
+            changed = true;
+        }
+    });
+
+    // Example presets: lipid → sheet → tube → sphere. Each sets the validated
+    // parameter regime (and enables bonding).
+    ui.horizontal_wrapped(|ui| {
+        for preset in SelfAssemblyPreset::ALL {
+            if ui.button(preset.label()).on_hover_text(preset.tooltip()).clicked() {
+                preset.apply_to(&mut opts);
+                changed = true;
+            }
+        }
+    });
+
+    if opts.bonding_enabled {
+        row(ui, "r_bond", |ui| {
+            if ui.add(egui::Slider::new(&mut opts.r_bond, 0.5..=3.0).suffix("σ")).on_hover_text("Bond creation cutoff: a compatible pair closer than this bonds.").changed() { changed = true; }
+        });
+        row(ui, "r_break", |ui| {
+            if ui.add(egui::Slider::new(&mut opts.r_break, 0.5..=4.0)).on_hover_text("Bond break cutoff (hysteresis ≈1.2–1.5·r_bond, prevents flicker).").changed() { changed = true; }
+        });
+        row(ui, "Bond stiffness", |ui| {
+            if ui.add(egui::Slider::new(&mut opts.bond_stiffness, 0.0..=1.0)).changed() { changed = true; }
+        });
+        row(ui, "Bond every", |ui| {
+            if ui.add(egui::DragValue::new(&mut opts.bond_every).range(1..=64)).on_hover_text("Rebuild the bond set every N steps (Verlet amortisation).").changed() { changed = true; }
+        });
+        row(ui, "Max valence", |ui| {
+            if ui.add(egui::DragValue::new(&mut opts.default_max_valence).range(0..=8)).on_hover_text("Per-node bond cap: 0=uncapped, 2=chain, 3=honeycomb, 4=square net.").changed() { changed = true; }
+        });
+        row(ui, "Bond angle", |ui| {
+            if ui.add(egui::Slider::new(&mut opts.default_bond_angle, 60.0..=180.0).suffix("°")).on_hover_text("Target angle between a node's bonds: 180=chain, 120=honeycomb, 90=square.").changed() { changed = true; }
+        });
+        row(ui, "Line tension", |ui| {
+            if ui.add(egui::Slider::new(&mut opts.line_tension, 0.0..=8.0)).on_hover_text("Rim seam force on under-coordinated boundary nodes — closes an open sheet (needs a valence cap). 0=OFF.").changed() { changed = true; }
+        });
+        row(ui, "Spont. curvature", |ui| {
+            if ui.add(egui::Slider::new(&mut opts.spont_curvature, 0.0..=1.0)).on_hover_text("Preferred tilt across each bond (radians): 0=flat, intermediate=tube, higher=vesicle.").changed() { changed = true; }
+        });
+
+        subgroup_label(ui, "Membrane");
+        row(ui, "Well depth", |ui| {
+            if ui.add(egui::Slider::new(&mut opts.well_depth, 0.0..=5.0)).on_hover_text("Cooke–Deserno cohesion-well depth ε — condenses the soup so bonds can form. 0=no cohesion.").changed() { changed = true; }
+        });
+        row(ui, "Well width", |ui| {
+            if ui.add(egui::Slider::new(&mut opts.well_width, 0.5..=2.5)).changed() { changed = true; }
+        });
+        row(ui, "Temperature", |ui| {
+            if ui.add(egui::Slider::new(&mut opts.temperature, 0.0..=1.0)).on_hover_text("Langevin kT — the Brownian drive self-assembly emerges from. 0=deterministic minimizer.").changed() { changed = true; }
+        });
+        row(ui, "Anisotropy", |ui| {
+            if ui.add(egui::Slider::new(&mut opts.anisotropy_strength, 0.0..=3.0)).on_hover_text("Patchy-well orientation anisotropy — drives nematic/membrane order.").changed() { changed = true; }
+        });
+        row(ui, "GB side bias", |ui| {
+            if ui.add(egui::Slider::new(&mut opts.gb_side_strength, 0.0..=3.0)).on_hover_text("Gay–Berne side-by-side packing bias — flat lamella over a droplet.").changed() { changed = true; }
+        });
+        row(ui, "Tilt coupling", |ui| {
+            if ui.add(egui::Slider::new(&mut opts.tilt_coupling_strength, 0.0..=3.0)).on_hover_text("Director→position coupling — turns the orientational preference into real (flat/curved) geometry.").changed() { changed = true; }
+        });
+    }
+
     if changed {
         if let Ok(v) = serde_json::to_value(&opts) {
             *json = v;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every self-assembly preset must enable bonding and round-trip through the
+    /// JSON `Value` form `AppState.layout.settings` stores — i.e. a preset
+    /// deserializes back into a `LensConfig` with `bonding_enabled == true` and
+    /// its knobs intact. This is the unit-test stand-in for the (headless-
+    /// unverifiable) UI click-through.
+    #[test]
+    fn presets_enable_bonding_and_roundtrip() {
+        for preset in SelfAssemblyPreset::ALL {
+            let mut cfg = LensConfig::default();
+            assert!(!cfg.bonding_enabled, "default lens must start OFF");
+            preset.apply_to(&mut cfg);
+            assert!(
+                cfg.bonding_enabled,
+                "{:?} must enable bonding",
+                preset
+            );
+
+            // Round-trip through the Value form the UI persists.
+            let v = serde_json::to_value(&cfg).unwrap();
+            let back: LensConfig = serde_json::from_value(v).unwrap();
+            assert_eq!(back, cfg, "{:?} must survive the JSON round-trip", preset);
+        }
+    }
+
+    /// The presets carry the PARAMETER REGIMES validated by the graph-compute
+    /// solver canaries (`p2_*` / `p3_*` in `tests/geometric_solver.rs`). Pinning
+    /// the load-bearing knobs here guards against silent drift away from the
+    /// validated values.
+    #[test]
+    fn preset_values_match_validated_regimes() {
+        // P2 valence-2 chain (soup_settings + cap 2, angle 0.15 @180°).
+        let mut chain = LensConfig::default();
+        SelfAssemblyPreset::LipidChain.apply_to(&mut chain);
+        assert_eq!(chain.default_max_valence, 2);
+        assert_eq!(chain.default_bond_angle, 180.0);
+        assert_eq!(chain.angle_stiffness, 0.15);
+        assert_eq!(chain.r_bond, 1.1);
+        assert_eq!(chain.r_break, 1.5);
+        assert_eq!(chain.bond_stiffness, 0.4);
+        assert_eq!(chain.bond_every, 4);
+        assert_eq!(chain.well_depth, 2.0);
+        assert_eq!(chain.temperature, 0.2);
+        assert_eq!(chain.line_tension, 0.0);
+        assert_eq!(chain.spont_curvature, 0.0);
+
+        // P2 valence-3 @120° honeycomb sheet (membrane regime, flat).
+        let mut sheet = LensConfig::default();
+        SelfAssemblyPreset::HoneycombSheet.apply_to(&mut sheet);
+        assert_eq!(sheet.default_max_valence, 3);
+        assert_eq!(sheet.default_bond_angle, 120.0);
+        assert_eq!(sheet.angle_stiffness, 0.3);
+        assert_eq!(sheet.well_depth, 2.5);
+        assert_eq!(sheet.anisotropy_strength, 1.0);
+        assert_eq!(sheet.gb_side_strength, 1.5);
+        assert_eq!(sheet.tilt_coupling_strength, 1.0);
+        assert_eq!(sheet.spont_curvature, 0.0); // flat
+        assert_eq!(sheet.line_tension, 0.0);
+
+        // Tube: sheet regime + intermediate spontaneous curvature, no seam.
+        let mut tube = LensConfig::default();
+        SelfAssemblyPreset::Tube.apply_to(&mut tube);
+        assert_eq!(tube.default_max_valence, 3);
+        assert!(
+            tube.spont_curvature > 0.0 && tube.spont_curvature < 0.5,
+            "tube curvature should be intermediate, got {}",
+            tube.spont_curvature
+        );
+        assert_eq!(tube.line_tension, 0.0, "a tube rolls, it does not seam");
+
+        // Vesicle: P3 validated rim line-tension (γ=4) + curvature (c₀=0.5).
+        let mut vesicle = LensConfig::default();
+        SelfAssemblyPreset::Vesicle.apply_to(&mut vesicle);
+        assert_eq!(vesicle.default_max_valence, 3);
+        assert_eq!(vesicle.line_tension, 4.0);
+        assert_eq!(vesicle.spont_curvature, 0.5);
+        assert_eq!(vesicle.well_depth, 2.5);
+        assert_eq!(vesicle.tilt_coupling_strength, 1.0);
     }
 }
