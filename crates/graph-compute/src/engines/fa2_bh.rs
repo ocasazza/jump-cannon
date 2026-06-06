@@ -110,8 +110,12 @@ struct Gpu {
     device: std::sync::Arc<wgpu::Device>,
     queue: std::sync::Arc<wgpu::Queue>,
     pipeline: wgpu::ComputePipeline,
-    bind_group: wgpu::BindGroup,
+    /// Ping-pong bind groups for deterministic position double-buffering
+    /// (timeline P2): `[0]` reads A→writes B, `[1]` reads B→writes A.
+    bind_groups: [wgpu::BindGroup; 2],
+    read_idx: usize,
     positions_buf: wgpu::Buffer,
+    positions_buf_b: wgpu::Buffer,
     _velocities_buf: wgpu::Buffer,
     _edges_buf: wgpu::Buffer,
     _edge_weights_buf: wgpu::Buffer,
@@ -268,7 +272,16 @@ impl LayoutEngine for Fa2BhEngine {
         let positions_byte_len = (positions_vec4.len() as u64) * 4;
 
         let positions_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("fa2bh_positions"),
+            label: Some("fa2bh_positions_a"),
+            contents: bytemuck::cast_slice(&positions_vec4),
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_SRC
+                | wgpu::BufferUsages::COPY_DST,
+        });
+        // Second position buffer for the deterministic ping-pong (read-in /
+        // write-out). Seeded identically so a 0-step read is also correct.
+        let positions_buf_b = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("fa2bh_positions_b"),
             contents: bytemuck::cast_slice(&positions_vec4),
             usage: wgpu::BufferUsages::STORAGE
                 | wgpu::BufferUsages::COPY_SRC
@@ -363,13 +376,14 @@ impl LayoutEngine for Fa2BhEngine {
         let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("fa2bh_bgl"),
             entries: &[
-                storage_rw(0), // positions
+                storage_ro(0), // positions_in (read-only this step)
                 storage_rw(1), // velocities
                 storage_ro(2), // edges
                 storage_ro(3), // edge_weights
                 uniform(4),    // params
                 storage_ro(5), // degrees
                 storage_ro(6), // oct_nodes
+                storage_rw(7), // positions_out (write-only this step)
             ],
         });
 
@@ -387,47 +401,35 @@ impl LayoutEngine for Fa2BhEngine {
             cache: None,
         });
 
-        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("fa2bh_bind_group"),
-            layout: &bgl,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: positions_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: velocities_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: edges_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: edge_weights_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 4,
-                    resource: params_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 5,
-                    resource: degrees_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 6,
-                    resource: oct_nodes_buf.as_entire_binding(),
-                },
-            ],
-        });
+        let make_bg = |in_buf: &wgpu::Buffer, out_buf: &wgpu::Buffer, label: &str| {
+            device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some(label),
+                layout: &bgl,
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: in_buf.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 1, resource: velocities_buf.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 2, resource: edges_buf.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 3, resource: edge_weights_buf.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 4, resource: params_buf.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 5, resource: degrees_buf.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 6, resource: oct_nodes_buf.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 7, resource: out_buf.as_entire_binding() },
+                ],
+            })
+        };
+        let bind_groups = [
+            make_bg(&positions_buf, &positions_buf_b, "fa2bh_bg_a_to_b"),
+            make_bg(&positions_buf_b, &positions_buf, "fa2bh_bg_b_to_a"),
+        ];
 
         self.gpu = Some(Gpu {
             device,
             queue,
             pipeline,
-            bind_group,
+            bind_groups,
+            read_idx: 0,
             positions_buf,
+            positions_buf_b,
             _velocities_buf: velocities_buf,
             _edges_buf: edges_buf,
             _edge_weights_buf: edge_weights_buf,
@@ -487,18 +489,18 @@ impl LayoutEngine for Fa2BhEngine {
                 timestamp_writes: None,
             });
             pass.set_pipeline(&gpu.pipeline);
-            pass.set_bind_group(0, &gpu.bind_group, &[]);
+            pass.set_bind_group(0, &gpu.bind_groups[gpu.read_idx], &[]);
             let workgroups = (gpu.n_nodes + WORKGROUP_SIZE - 1) / WORKGROUP_SIZE;
             pass.dispatch_workgroups(workgroups.max(1), 1, 1);
         }
 
-        encoder.copy_buffer_to_buffer(
-            &gpu.positions_buf,
-            0,
-            &gpu.readback_buf,
-            0,
-            gpu.positions_byte_len,
-        );
+        // OUT buffer for this step: group 0 wrote B, group 1 wrote A.
+        let out_buf = if gpu.read_idx == 0 {
+            &gpu.positions_buf_b
+        } else {
+            &gpu.positions_buf
+        };
+        encoder.copy_buffer_to_buffer(out_buf, 0, &gpu.readback_buf, 0, gpu.positions_byte_len);
 
         gpu.queue.submit(std::iter::once(encoder.finish()));
 
@@ -529,6 +531,8 @@ impl LayoutEngine for Fa2BhEngine {
         }
         drop(data);
         gpu.readback_buf.unmap();
+        // Flip ping-pong: this step's OUT is next step's IN.
+        gpu.read_idx ^= 1;
         StepOutput::positions_only(out)
     }
 }

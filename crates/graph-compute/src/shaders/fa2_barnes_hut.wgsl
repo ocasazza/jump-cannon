@@ -60,7 +60,14 @@ struct OctNode {
     links:    vec4<u32>,
 };
 
-@group(0) @binding(0) var<storage, read_write> positions:    array<vec4<f32>>;
+// Determinism (timeline P2): positions are DOUBLE-BUFFERED — read start-of-step
+// from `positions` (read-only), write only this thread's node to
+// `positions_out`. Reading + writing one read_write buffer races neighbour
+// reads against self-writes (intra-dispatch read-after-write), which made the
+// same seed diverge run-to-run on Metal. Ping-pong (host flips in/out per step)
+// removes the hazard and makes the step a clean Jacobi update.
+@group(0) @binding(0) var<storage, read>       positions:     array<vec4<f32>>;
+@group(0) @binding(7) var<storage, read_write> positions_out: array<vec4<f32>>;
 @group(0) @binding(1) var<storage, read_write> velocities:   array<vec4<f32>>;
 @group(0) @binding(2) var<storage, read>       edges:        array<vec2<u32>>;
 @group(0) @binding(3) var<storage, read>       edge_weights: array<f32>;
@@ -172,5 +179,5 @@ fn fa2_step(@builtin(global_invocation_id) gid: vec3<u32>) {
     let new_pos = pos_i + vel * params.time_step;
 
     velocities[i] = vec4<f32>(vel, 0.0);
-    positions[i]  = vec4<f32>(new_pos, 0.0);
+    positions_out[i]  = vec4<f32>(new_pos, 0.0);
 }

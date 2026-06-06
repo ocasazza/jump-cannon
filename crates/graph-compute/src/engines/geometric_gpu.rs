@@ -48,9 +48,14 @@ struct Gpu {
     device: Arc<wgpu::Device>,
     queue: Arc<wgpu::Queue>,
     pipeline: wgpu::ComputePipeline,
-    bind_group: wgpu::BindGroup,
+    /// Two bind groups for position double-buffering (timeline P2 determinism):
+    /// `bind_groups[0]` reads buf A → writes buf B; `bind_groups[1]` reads B →
+    /// writes A. `read_idx` selects which one to dispatch this step, then flips.
+    bind_groups: [wgpu::BindGroup; 2],
+    read_idx: usize,
 
     positions_buf: wgpu::Buffer,
+    positions_buf_b: wgpu::Buffer,
     velocities_buf: wgpu::Buffer,
     csr_target_lens_buf: wgpu::Buffer,
     params_buf: wgpu::Buffer,
@@ -225,7 +230,16 @@ impl LayoutEngine for GeometricGpuEngine {
         // ---- GPU Buffers ----
         let positions_byte_len = (positions_vec4.len() as u64) * 4;
         let positions_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("geom_positions"),
+            label: Some("geom_positions_a"),
+            contents: bytemuck::cast_slice(&positions_vec4),
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_SRC
+                | wgpu::BufferUsages::COPY_DST,
+        });
+        // Second position buffer for the deterministic ping-pong (read-in /
+        // write-out). Seeded identically so a 0-step read is also correct.
+        let positions_buf_b = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("geom_positions_b"),
             contents: bytemuck::cast_slice(&positions_vec4),
             usage: wgpu::BufferUsages::STORAGE
                 | wgpu::BufferUsages::COPY_SRC
@@ -361,9 +375,10 @@ impl LayoutEngine for GeometricGpuEngine {
         let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("geom_bgl"),
             entries: &[
-                storage_rw(0),
-                storage_rw(1),
-                storage_ro(2), // csr_target_lens (was: edges; binding 3/target_lens removed)
+                storage_ro(0), // positions_in  (read-only this step)
+                storage_rw(1), // velocities
+                storage_ro(2), // csr_target_lens
+                storage_rw(3), // positions_out (write-only this step)
                 uniform(4),
                 storage_ro(5),
                 storage_ro(6),
@@ -391,67 +406,43 @@ impl LayoutEngine for GeometricGpuEngine {
             cache: None,
         });
 
-        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("geom_bg"),
-            layout: &bgl,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: positions_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: velocities_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: csr_target_lens_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 4,
-                    resource: params_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 5,
-                    resource: node_class_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 6,
-                    resource: node_coord_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 7,
-                    resource: node_mass_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 8,
-                    resource: oct_nodes_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 9,
-                    resource: coord_angles_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 10,
-                    resource: class_radius_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 11,
-                    resource: class_affinity_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 12,
-                    resource: csr_buf.as_entire_binding(),
-                },
-            ],
-        });
+        // Two ping-pong bind groups. `make_bg(in_buf, out_buf)` binds 0=in
+        // (read), 3=out (write); everything else is shared. Group 0 reads A,
+        // writes B; group 1 reads B, writes A.
+        let make_bg = |in_buf: &wgpu::Buffer, out_buf: &wgpu::Buffer, label: &str| {
+            device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some(label),
+                layout: &bgl,
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: in_buf.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 1, resource: velocities_buf.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 2, resource: csr_target_lens_buf.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 3, resource: out_buf.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 4, resource: params_buf.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 5, resource: node_class_buf.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 6, resource: node_coord_buf.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 7, resource: node_mass_buf.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 8, resource: oct_nodes_buf.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 9, resource: coord_angles_buf.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 10, resource: class_radius_buf.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 11, resource: class_affinity_buf.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 12, resource: csr_buf.as_entire_binding() },
+                ],
+            })
+        };
+        let bind_groups = [
+            make_bg(&positions_buf, &positions_buf_b, "geom_bg_a_to_b"),
+            make_bg(&positions_buf_b, &positions_buf, "geom_bg_b_to_a"),
+        ];
 
         self.gpu = Some(Gpu {
             device,
             queue,
             pipeline,
-            bind_group,
+            bind_groups,
+            read_idx: 0,
             positions_buf,
+            positions_buf_b,
             velocities_buf,
             csr_target_lens_buf,
             params_buf,
@@ -487,6 +478,18 @@ impl LayoutEngine for GeometricGpuEngine {
             gpu.oct_capacity,
         );
         if used > 0 {
+            // Determinism (timeline P2): pad the upload to the FULL buffer
+            // capacity with zeroed `OctNodeRaw`s. The shader's paranoia walk
+            // cap (`max(n_octree*4,16)`) can, on a malformed/short rope, step
+            // past `used` into octree slots this step never wrote — those
+            // slots otherwise hold UNDEFINED GPU memory that differs between
+            // buffer allocations, making the same seed diverge run-to-run.
+            // A leaf with body==OCT_BODY_INTERNAL/mass 0 contributes no force
+            // and ends the walk, so zero-padding is force-neutral AND
+            // bit-stable. Cheap: one extra contiguous write per step.
+            gpu.oct_build
+                .nodes
+                .resize(gpu.oct_capacity as usize, OctNodeRaw::zeroed());
             gpu.queue.write_buffer(
                 &gpu.oct_nodes_buf,
                 0,
@@ -507,17 +510,19 @@ impl LayoutEngine for GeometricGpuEngine {
                 timestamp_writes: None,
             });
             pass.set_pipeline(&gpu.pipeline);
-            pass.set_bind_group(0, &gpu.bind_group, &[]);
+            // read_idx selects in→out direction; group 0 writes B, group 1 writes A.
+            pass.set_bind_group(0, &gpu.bind_groups[gpu.read_idx], &[]);
             let workgroups = (gpu.n_nodes + WORKGROUP_SIZE - 1) / WORKGROUP_SIZE;
             pass.dispatch_workgroups(workgroups.max(1), 1, 1);
         }
-        encoder.copy_buffer_to_buffer(
-            &gpu.positions_buf,
-            0,
-            &gpu.readback_buf,
-            0,
-            gpu.positions_byte_len,
-        );
+        // The OUT buffer for this step holds the new positions: group 0 wrote B,
+        // group 1 wrote A.
+        let out_buf = if gpu.read_idx == 0 {
+            &gpu.positions_buf_b
+        } else {
+            &gpu.positions_buf
+        };
+        encoder.copy_buffer_to_buffer(out_buf, 0, &gpu.readback_buf, 0, gpu.positions_byte_len);
         gpu.queue.submit(std::iter::once(encoder.finish()));
 
         let slice = gpu.readback_buf.slice(..);
@@ -540,6 +545,10 @@ impl LayoutEngine for GeometricGpuEngine {
         }
         drop(data);
         gpu.readback_buf.unmap();
+        // Flip the ping-pong: this step's OUT becomes next step's IN. velocities
+        // and the octree (rebuilt from cpu_positions = the new positions) carry
+        // forward unchanged.
+        gpu.read_idx ^= 1;
         StepOutput::positions_only(out)
     }
 }

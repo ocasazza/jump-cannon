@@ -14,7 +14,9 @@
 //! its repulsion must equal the brute-force O(n²) engine up to floating-point
 //! summation order — the property that proves the tree traversal is correct.
 
-use graph_compute::engines::{Fa2BhEngine, Fa2BruteEngine};
+use graph_compute::engines::{
+    Fa2BhEngine, Fa2BruteEngine, GeometricGpuEngine, GeometricSettings, SgdStressGpuEngine,
+};
 use graph_compute::sim::CsrGraph;
 use graph_compute::{CsrShard, EngineCtx, LayoutEngine};
 
@@ -203,4 +205,227 @@ fn fa2_triangle_relaxes_to_equilateral() {
         "K3 should relax ~equilateral: sides {d01:.3}, {d12:.3}, {d20:.3} (dev {:.1}%)",
         100.0 * max_dev / mean
     );
+}
+
+// ===========================================================================
+// Run-to-run GPU determinism (timeline plan P2 — precondition for bit-exact
+// GPU replay).
+// ===========================================================================
+//
+// AUDIT (docs/reversible-timeline-plan.md §2; ORNL SC'24 arXiv:2408.05148 +
+// NVIDIA CCCL): float non-associativity + UNORDERED GPU atomics/reductions are
+// the only documented source of run-to-run bit-divergence on the SAME device.
+// The fix prescribed by the plan is a FIXED reduction order. Our GPU engines
+// turn out to ALREADY satisfy that, by construction — these tests lock that
+// property down so a future change that introduces an unordered reduction
+// (an `atomicAdd` force accumulation, a scheduler-order workgroup reduction)
+// is caught immediately:
+//
+//   • geometric-gpu — one WGSL thread per node accumulates its force in a
+//     private register over FIXED iteration orders (CSR springs, the octree
+//     rope walk, the angle gather). The Barnes-Hut COM/mass reduction is built
+//     HOST-SIDE (`OctreeBuild::compute_com_and_rope`, recursive, fixed child
+//     order 0..8, fixed body-insert order) and uploaded — no GPU reduction.
+//     No atomics, no RNG.
+//   • fa2-bh — same shape: host-side post-order COM aggregate
+//     (`aggregate_com_postorder`, fixed child order), per-node private-register
+//     force accumulation over the rope walk + edge scan in the WGSL kernel.
+//   • sgd-stress-gpu — conflict-free Jacobi: each thread reads `pos_in` and
+//     writes only its own `pos_out[i]`; no cross-thread accumulation at all.
+//
+// The grid-build atomics in graph-layouts' force.wgsl (count/scatter cursor)
+// are NOT in this crate and, crucially, are DEAD for the force calc (force_step
+// no longer binds `cell_nodes`); the per-node KE `energy_out` readback is a
+// MAX (order-independent) used only for the auto-halt heuristic — it never
+// feeds back into positions. So nothing here needed a code fix; the audit
+// outcome is "already order-deterministic", proven below.
+//
+// SCOPE CAVEAT (research, plan §5): GPU bit-exactness is guaranteed only on the
+// SAME device + driver + kernel config. Cross-device divergence is EXPECTED,
+// not a bug. These tests run twice on the SAME adapter in one process, so they
+// are exactly in-scope. On a host with no wgpu adapter they SKIP loudly.
+
+/// A small 2-D lattice graph (`dim`×`dim`), 4-neighbour connectivity. Gives the
+/// geometric engine real spring + angle structure plus a non-trivial octree so
+/// the determinism check exercises the Barnes-Hut COM path, not just a path.
+fn grid2d(dim: u32) -> CsrGraph {
+    let n = dim * dim;
+    let mut offsets = vec![0u32];
+    let mut neighbors = Vec::new();
+    for y in 0..dim {
+        for x in 0..dim {
+            if x > 0 {
+                neighbors.push(y * dim + (x - 1));
+            }
+            if x + 1 < dim {
+                neighbors.push(y * dim + (x + 1));
+            }
+            if y > 0 {
+                neighbors.push((y - 1) * dim + x);
+            }
+            if y + 1 < dim {
+                neighbors.push((y + 1) * dim + x);
+            }
+            offsets.push(neighbors.len() as u32);
+        }
+    }
+    CsrGraph { n_nodes: n, offsets, neighbors }
+}
+
+/// First index where two f32 slices differ bitwise, or None if identical.
+fn first_bit_diff(a: &[f32], b: &[f32]) -> Option<usize> {
+    assert_eq!(a.len(), b.len(), "position vectors must be the same length");
+    a.iter()
+        .zip(b)
+        .position(|(x, y)| x.to_bits() != y.to_bits())
+}
+
+/// Geometric-GPU: two identically-seeded N-step runs on the SAME device must
+/// produce BITWISE-IDENTICAL final positions. This is the headline P2 gate —
+/// it covers the most complex GPU engine (Barnes-Hut COM + class
+/// exclusion/affinity + the angle/coordination gradient + edge springs), so a
+/// regression in any reduction's order surfaces here. Bit-exactness is scoped
+/// to this device + driver (see the module note); cross-device drift is
+/// expected and out of scope.
+#[test]
+fn geometric_gpu_is_run_to_run_bit_exact() {
+    let _g = gpu_guard();
+    let Some(mut ctx) = gpu_or_skip("geometric_gpu_is_run_to_run_bit_exact") else {
+        return;
+    };
+    let backend = ctx.gpu.as_ref().map(|g| g.adapter_info.backend);
+    eprintln!("geometric_gpu determinism: adapter backend = {backend:?}");
+
+    let graph = grid2d(7); // 49 nodes, real spring+angle structure + an octree
+    let s = seed(49);
+    // Exercise every force term so the test bites on all reductions: springs,
+    // Barnes-Hut exclusion/affinity (theta>0 => the octree COM path is used),
+    // the angle gradient, and gravity.
+    let settings = GeometricSettings {
+        edge_stiffness: 0.3,
+        angle_stiffness: 0.2,
+        exclusion_strength: 1.0,
+        gravity: 0.01,
+        damping: 0.9,
+        ..GeometricSettings::default()
+    };
+    let settings_json = serde_json::to_value(&settings).expect("serialize settings");
+
+    let run_once = |ctx: &mut EngineCtx| -> Vec<f32> {
+        let mut engine = GeometricGpuEngine::new();
+        engine.set_params(&settings_json).expect("set_params");
+        engine
+            .init(ctx, &CsrShard::whole(&graph), &s)
+            .expect("geometric-gpu init");
+        let mut out = s.clone();
+        for _ in 0..120 {
+            out = engine.step(ctx).positions;
+        }
+        out
+    };
+
+    let a = run_once(&mut ctx);
+    let b = run_once(&mut ctx);
+
+    assert!(
+        a.iter().all(|x| x.is_finite()),
+        "geometric-gpu produced non-finite positions"
+    );
+    match first_bit_diff(&a, &b) {
+        None => eprintln!(
+            "geometric-gpu: 120 steps × 49 nodes BIT-IDENTICAL across two runs ({backend:?})"
+        ),
+        Some(i) => panic!(
+            "geometric-gpu NOT run-to-run bit-exact at coord {i}: \
+             {:#010x} vs {:#010x} (backend {backend:?}). An unordered GPU \
+             reduction was introduced — see the audit note in this module.",
+            a[i].to_bits(),
+            b[i].to_bits()
+        ),
+    }
+}
+
+/// FA2 Barnes-Hut: two identically-seeded runs must be bitwise identical. Covers
+/// the host-built octree COM aggregate + the WGSL rope-walk repulsion + the
+/// linear edge-scan attraction. theta>0 so the COM (far-field) path is taken.
+#[test]
+fn fa2_bh_is_run_to_run_bit_exact() {
+    let _g = gpu_guard();
+    let Some(mut ctx) = gpu_or_skip("fa2_bh_is_run_to_run_bit_exact") else {
+        return;
+    };
+    let backend = ctx.gpu.as_ref().map(|g| g.adapter_info.backend);
+    eprintln!("fa2_bh determinism: adapter backend = {backend:?}");
+
+    let graph = grid2d(6); // 36 nodes
+    let s = seed(36);
+
+    let run_once = |ctx: &mut EngineCtx| -> Vec<f32> {
+        let mut engine = Fa2BhEngine::new();
+        engine
+            .set_params(&serde_json::json!({ "theta": 0.7 }))
+            .expect("set theta");
+        engine
+            .init(ctx, &CsrShard::whole(&graph), &s)
+            .expect("fa2-bh init");
+        let mut out = s.clone();
+        for _ in 0..60 {
+            out = engine.step(ctx).positions;
+        }
+        out
+    };
+
+    let a = run_once(&mut ctx);
+    let b = run_once(&mut ctx);
+    assert!(a.iter().all(|x| x.is_finite()), "fa2-bh non-finite");
+    match first_bit_diff(&a, &b) {
+        None => eprintln!("fa2-bh: 60 steps × 36 nodes BIT-IDENTICAL across two runs ({backend:?})"),
+        Some(i) => panic!(
+            "fa2-bh NOT run-to-run bit-exact at coord {i}: {:#010x} vs {:#010x} ({backend:?})",
+            a[i].to_bits(),
+            b[i].to_bits()
+        ),
+    }
+}
+
+/// SGD stress (GPU): conflict-free Jacobi — each thread writes only its own
+/// position from start-of-sweep reads, so there is no cross-thread accumulation
+/// to reorder. Two identically-seeded runs must be bitwise identical.
+#[test]
+fn sgd_stress_gpu_is_run_to_run_bit_exact() {
+    let _g = gpu_guard();
+    let Some(mut ctx) = gpu_or_skip("sgd_stress_gpu_is_run_to_run_bit_exact") else {
+        return;
+    };
+    let backend = ctx.gpu.as_ref().map(|g| g.adapter_info.backend);
+    eprintln!("sgd_stress_gpu determinism: adapter backend = {backend:?}");
+
+    let graph = grid2d(6); // 36 nodes
+    let s = seed(36);
+
+    let run_once = |ctx: &mut EngineCtx| -> Vec<f32> {
+        let mut engine = SgdStressGpuEngine::new();
+        engine
+            .init(ctx, &CsrShard::whole(&graph), &s)
+            .expect("sgd-stress-gpu init");
+        let mut out = s.clone();
+        for _ in 0..100 {
+            out = engine.step(ctx).positions;
+        }
+        out
+    };
+
+    let a = run_once(&mut ctx);
+    let b = run_once(&mut ctx);
+    assert!(a.iter().all(|x| x.is_finite()), "sgd-stress-gpu non-finite");
+    match first_bit_diff(&a, &b) {
+        None => eprintln!(
+            "sgd-stress-gpu: 100 steps × 36 nodes BIT-IDENTICAL across two runs ({backend:?})"
+        ),
+        Some(i) => panic!(
+            "sgd-stress-gpu NOT run-to-run bit-exact at coord {i}: {:#010x} vs {:#010x} ({backend:?})",
+            a[i].to_bits(),
+            b[i].to_bits()
+        ),
+    }
 }

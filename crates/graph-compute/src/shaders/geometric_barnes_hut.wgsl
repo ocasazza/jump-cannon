@@ -22,7 +22,17 @@ struct OctNode {
     links:    vec4<u32>,
 };
 
-@group(0) @binding(0) var<storage, read_write> positions:    array<vec4<f32>>;
+// Determinism (timeline P2): positions are DOUBLE-BUFFERED. Every thread reads
+// the START-OF-STEP positions from `positions_in` (read-only) and writes only
+// its own node to `positions_out`. Reading and writing the SAME read_write
+// buffer (the old design) is an intra-dispatch read-after-write race — whether a
+// neighbour's position is observed pre- or post-update depends on workgroup
+// scheduling, which made the same seed diverge ~1 ULP/step run-to-run (and
+// compounded chaotically). Ping-ponging in/out (the SGD / force.wgsl pattern)
+// removes the hazard, so the step is order-deterministic AND its physics is a
+// clean Jacobi update (all forces evaluated at the start-of-step config).
+@group(0) @binding(0) var<storage, read>       positions:     array<vec4<f32>>;
+@group(0) @binding(3) var<storage, read_write> positions_out: array<vec4<f32>>;
 @group(0) @binding(1) var<storage, read_write> velocities:   array<vec4<f32>>;
 // Per-CSR-entry edge target lengths, parallel to the neighbours region of `csr`
 // (binding 12). The target length for the neighbour at csr index `aa` is
@@ -245,5 +255,5 @@ fn geometric_step(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
     
     velocities[i] = vec4<f32>(vel, 0.0);
-    positions[i] = vec4<f32>(pos_i + disp, 0.0);
+    positions_out[i] = vec4<f32>(pos_i + disp, 0.0);
 }
