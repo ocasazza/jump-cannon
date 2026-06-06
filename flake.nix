@@ -669,5 +669,29 @@
         };
       };
     };
+
+    # Hydra jobs — what the nixstation Hydra (pdx-nxst-001) builds per merge to
+    # main, as a flake-type jobset. Restricted to the two systems Hydra has
+    # builders for: x86_64-linux (pdx-nxst-00x) and aarch64-darwin (gfr-osx26).
+    #
+    #   x86_64-linux: the full check set, including the `tests-gpu` correctness
+    #     gate — on Linux it runs the WGSL kernels under lavapipe software-Vulkan
+    #     (sandbox-safe), so GPU correctness gates every merge.
+    #   aarch64-darwin: all checks except `tests-gpu` (real-Metal correctness +
+    #     perf benches need an impure / __noChroot build to reach the GPU from
+    #     the Nix sandbox — a follow-up), plus the native graph-compute (Metal)
+    #     package build so the darwin binary is verified.
+    flake.hydraJobs =
+      let
+        lib = inputs.nixpkgs.lib;
+      in {
+        x86_64-linux = inputs.self.checks.x86_64-linux or { };
+        aarch64-darwin =
+          (lib.filterAttrs (n: _: n != "tests-gpu")
+            (inputs.self.checks.aarch64-darwin or { }))
+          // {
+            graph-compute = inputs.self.packages.aarch64-darwin.graph-compute;
+          };
+      };
   };
 }
