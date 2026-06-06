@@ -36,4 +36,4 @@ filter = "test(/e2e::/)"
 [profile.gpu]
 fail-fast = false
 test-threads = 1
-default-filter = "binary(/gpu_pagerank/) | binary(gpu_engines)"
+default-filter = "binary(/gpu_/)"
