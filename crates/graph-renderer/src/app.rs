@@ -958,15 +958,43 @@ impl App {
     /// Resolve the concrete [`crate::job::ExecutionBackend`] for the next
     /// generate, honouring the panel's `GenerateBackendChoice` and the `Auto`
     /// default. `Auto` picks **Server when graph-api is reachable**, else a
-    /// local fallback (LocalWorker on wasm — currently the same local executor
-    /// as Inline until the worker bundle is feasible — Inline on native). This
-    /// mirrors the local-vs-remote layout-engine default.
+    /// local fallback (LocalWorker on wasm — a real Web Worker, see
+    /// [`crate::worker`] — Inline on native). This mirrors the local-vs-remote
+    /// layout-engine default.
     fn resolve_generate_backend(&self) -> crate::job::ExecutionBackend {
         let reachable = *self.server_reachable.lock().unwrap();
         resolve_generate_backend(
             self.state.generate.backend,
             reachable,
             cfg!(target_arch = "wasm32"),
+        )
+    }
+
+    /// Spawn a Generate eval on the LOCAL executor (native thread / wasm
+    /// paint-first-then-run). Shared by the `Inline` backend and the native
+    /// `LocalWorker` fallback (native has no Web Worker; Inline already runs on
+    /// a real thread).
+    fn spawn_local_eval(
+        &self,
+        src: String,
+    ) -> crate::job::BackgroundJob<tvix_wasm::GeneratedGraph> {
+        crate::job::BackgroundJob::spawn(
+            self.progress.sink(),
+            "generate",
+            "evaluate expression (local)",
+            move |s| {
+                s.info("generate", "evaluating Nix expression…");
+                let graph = tvix_wasm::eval_graph(&src)?;
+                s.info(
+                    "generate",
+                    format!(
+                        "evaluated: {} nodes, {} edges — building graph",
+                        graph.nodes.len(),
+                        graph.edges.len()
+                    ),
+                );
+                Ok(graph)
+            },
         )
     }
 
@@ -991,29 +1019,30 @@ impl App {
                             async move { client.generate_remote(&src).await },
                         )
                     }
-                    // Inline AND LocalWorker (until the worker bundle is
-                    // feasible) both run the closure locally via the original
-                    // backend: native thread / wasm paint-first-then-run.
-                    crate::job::ExecutionBackend::Inline
-                    | crate::job::ExecutionBackend::LocalWorker => {
-                        crate::job::BackgroundJob::spawn(
-                            self.progress.sink(),
-                            "generate",
-                            "evaluate expression (local)",
-                            move |s| {
-                                s.info("generate", "evaluating Nix expression…");
-                                let graph = tvix_wasm::eval_graph(&src)?;
-                                s.info(
-                                    "generate",
-                                    format!(
-                                        "evaluated: {} nodes, {} edges — building graph",
-                                        graph.nodes.len(),
-                                        graph.edges.len()
-                                    ),
-                                );
-                                Ok(graph)
-                            },
-                        )
+                    // Inline: run the closure on the local executor — native
+                    // thread (genuinely off-thread) / wasm paint-first-then-run
+                    // (the single synchronous eval still blocks its frame).
+                    crate::job::ExecutionBackend::Inline => self.spawn_local_eval(src),
+                    // LocalWorker: on wasm, evaluate inside the `tvix-worker`
+                    // Web Worker — a second wasm instance in a browser-owned
+                    // thread, so the egui thread never blocks (the OFFLINE
+                    // non-freeze, no graph-api needed). On native there is no
+                    // Web Worker and Inline already runs on a real thread, so
+                    // it falls back to the same local executor.
+                    crate::job::ExecutionBackend::LocalWorker => {
+                        #[cfg(target_arch = "wasm32")]
+                        {
+                            crate::job::BackgroundJob::spawn_future(
+                                self.progress.sink(),
+                                "generate",
+                                "evaluate expression (worker)",
+                                crate::worker::eval_in_worker(src),
+                            )
+                        }
+                        #[cfg(not(target_arch = "wasm32"))]
+                        {
+                            self.spawn_local_eval(src)
+                        }
                     }
                 };
                 self.generate_job = Some(job);

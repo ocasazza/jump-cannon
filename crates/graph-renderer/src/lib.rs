@@ -25,6 +25,9 @@ pub mod perf;
 pub mod proto;
 pub mod timeline;
 pub mod ui;
+/// Local Web Worker client for the `LocalWorker` generate backend (wasm-only).
+#[cfg(target_arch = "wasm32")]
+pub mod worker;
 pub use app::App;
 
 /// Test-support re-exports. Doc-hidden, not part of the stable public

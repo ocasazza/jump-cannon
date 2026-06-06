@@ -79,24 +79,20 @@ use crate::ui::progress::{ProgressSink, TaskId};
 /// * [`LocalWorker`](ExecutionBackend::LocalWorker) — a standalone/offline Web
 ///   Worker hosting a second wasm instance running `eval_graph` off the main
 ///   thread, message-passing only (no SharedArrayBuffer / COOP-COEP / atomics).
+///   This is the OFFLINE non-freeze: like `Server` it keeps the egui thread
+///   responsive, but without a reachable graph-api.
 ///
-///   FEASIBILITY (honest): this variant is wired (picker entry + routing) but
-///   currently FALLS BACK to the local executor — it does NOT yet drive a real
-///   worker. The blocker is a pinned-toolchain version skew: the build pins
-///   `wasm-bindgen` 0.2.120 in `Cargo.lock` but the nix `wasm-bindgen-cli`
-///   ships 0.2.118 (see `flake.nix` `graph-renderer-web` + the wasm-bindgen
-///   #4211 / #4654 note). The single main-bundle works only because
-///   `.cargo/config.toml` + RUSTFLAGS carefully manage the `reference-types`
-///   feature across that two-patch gap. A trunk `data-type="worker"` bundle
-///   would add a SECOND wasm-bindgen invocation with worker-specific codegen
-///   (a distinct entry shape), which is exactly the surface that gap breaks —
-///   and the trunk worker loader would also need hand-written JS glue beyond
-///   the ≤50-line shim (an explicit blocker under the Rust-only rule unless the
-///   glue is fully trunk/gloo-generated). Unblocking it means overriding
-///   `wasm-bindgen-cli` with a 0.2.120 build (the source hash is already known)
-///   so a `tvix-worker` bin + `gloo-worker` glue can be generated cleanly. The
-///   Server + Inline backends already deliver the non-freeze, so this is a
-///   follow-up, not a blocker.
+///   IMPLEMENTED on wasm: the worker is the `tvix-worker` bundle (built by
+///   trunk via `data-type="worker"` from `crates/tvix-worker`, see
+///   `assets/index.html`); the renderer spawns it from a Blob bootstrap and
+///   exchanges plain strings (expr → `{nodes,links}` JSON) — see
+///   [`crate::worker`]. No hand-written `.js` file: trunk generates the worker
+///   glue and the bootstrap is a Rust string whose only logic is "load wasm".
+///   The earlier blocker (a presumed `wasm-bindgen` toolchain skew) did not
+///   actually gate this path — `just wasm`/trunk manages its own wasm-bindgen
+///   and builds both bundles cleanly; the nix `wasm-bindgen-cli` pin only
+///   affects `nix build`. On NATIVE there is no Web Worker, so `LocalWorker`
+///   falls back to the `Inline` executor (which already runs on a real thread).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ExecutionBackend {
     /// Run on the local executor (native thread / wasm paint-first).
@@ -105,7 +101,8 @@ pub enum ExecutionBackend {
     /// graph-api/compute URL is reachable).
     #[default]
     Server,
-    /// Run in a local Web Worker (offline). Feasibility-gated.
+    /// Run in a local Web Worker (offline non-freeze on wasm; falls back to
+    /// the local executor on native). See [`crate::worker`].
     LocalWorker,
 }
 

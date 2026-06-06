@@ -123,6 +123,12 @@ features = [
   "MessageEvent",
   "WebSocket",
   "ErrorEvent",
+  # tvix-worker (LocalWorker generate backend): spawn a classic Web Worker
+  # from a Blob bootstrap so eval runs off the egui thread (see src/worker.rs).
+  "Worker",
+  "Blob",
+  "BlobPropertyBag",
+  "Url",
 ]
 
 [build-dependencies]

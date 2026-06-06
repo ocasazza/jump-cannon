@@ -18,6 +18,12 @@
     }
   </style>
   <link data-trunk rel="rust" href="../Cargo.toml" data-bin="graph-renderer" data-cargo-features="wasm" />
+  <!-- Offline non-freeze: the tvix-worker bundle hosts a second wasm instance
+       that runs `eval_graph` in a real Web Worker thread. Built into the same
+       dist/ as `tvix-worker.js` + `tvix-worker_bg.wasm`. `Trunk.toml` sets
+       `filehash=false` so the renderer can spawn the stable URL
+       `/assets/tvix-worker.js` (see job.rs `ExecutionBackend::LocalWorker`). -->
+  <link data-trunk rel="rust" href="../../tvix-worker/Cargo.toml" data-bin="tvix-worker" data-type="worker" data-cargo-features="wasm" />
 </head>
 <body>
   <div id="loader-strip"></div>
