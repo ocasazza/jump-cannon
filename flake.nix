@@ -125,6 +125,35 @@
           nativeBuildInputs = [ pkgs.protobuf ];
         });
 
+        # Perf benches (REPORT-ONLY, never gates a merge). Runs the criterion
+        # bench_pagerank example and captures its JSON/HTML to $out as a Hydra
+        # build product. `__noChroot` so the build reaches the real GPU — only
+        # meaningful on the aarch64-darwin Metal builders (perf under Linux
+        # lavapipe is software and meaningless), so hydraJobs wires this on
+        # darwin only. Timing output varies run-to-run ⇒ it never caches; that's
+        # intended for a per-merge perf signal. Requires the darwin Hydra
+        # builders to permit __noChroot (nix.settings extra-sandbox / trusted).
+        bench-pagerank = craneLib.mkCargoDerivation (commonArgs // {
+          cargoArtifacts = depsNative;
+          pname = "graph-compute-bench-pagerank";
+          version = "0.1.0";
+          __noChroot = true;
+          nativeBuildInputs = [ pkgs.pkg-config pkgs.protobuf ];
+          buildInputs = bevyLibs;
+          buildPhaseCargoCommand = ''
+            cargo run --release -p graph-compute --example bench_pagerank -- \
+              --bench --noplot --save-baseline hydra
+          '';
+          doInstallCargoArtifacts = false;
+          doCheck = false;
+          installPhaseCommand = ''
+            mkdir -p $out/nix-support
+            if [ -d target/criterion ]; then cp -r target/criterion $out/criterion; fi
+            # Surface the criterion dir as a Hydra build product for the report.
+            echo "report criterion $out/criterion" > $out/nix-support/hydra-build-products
+          '';
+        });
+
         # Foundation of the Rust-driven browser regression suite. The
         # `test-browser` binary speaks CDP directly via chromiumoxide —
         # no chromedriver, no playwright, no JS. It expects an already-
@@ -515,6 +544,7 @@
         packages = {
           default          = graph-api;
           inherit vault-search graph-api graph-compute graph-layouts-wasm tvix-wasm graph-renderer-web;
+          inherit bench-pagerank;
           inherit graph-compute-image graph-api-image docker-compose-yaml sky-task-yaml;
           inherit test-browser;
         };
@@ -691,6 +721,8 @@
             (inputs.self.checks.aarch64-darwin or { }))
           // {
             graph-compute = inputs.self.packages.aarch64-darwin.graph-compute;
+            # report-only perf bench (real Metal via __noChroot)
+            bench-pagerank = inputs.self.packages.aarch64-darwin.bench-pagerank;
           };
       };
   };
