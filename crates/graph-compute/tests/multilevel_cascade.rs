@@ -38,8 +38,8 @@
 //! sandbox.
 
 use graph_compute::engines::MultilevelEngine;
-use graph_compute::{CsrShard, EngineCtx, LayoutEngine};
 use graph_compute::sim::CsrGraph;
+use graph_compute::{CsrShard, EngineCtx, LayoutEngine};
 
 /// A connected ring 0—1—…—(n-1)—0 as a symmetric CSR graph. A ring has a clean
 /// 1-D intrinsic structure (like a path but with no endpoints), which the stress
@@ -56,7 +56,11 @@ fn ring(n: u32) -> CsrGraph {
         neighbors.push(next);
         offsets.push(neighbors.len() as u32);
     }
-    CsrGraph { n_nodes: n, offsets, neighbors }
+    CsrGraph {
+        n_nodes: n,
+        offsets,
+        neighbors,
+    }
 }
 
 /// Deterministic, well-separated seed positions on a unit circle (interleaved

@@ -103,7 +103,10 @@ async fn positions_advance_over_frames() {
     let mut client = ComputeClient::new(channel);
 
     let mut stream = client
-        .subscribe(SubscribeRequest { graph_id: "test".into(), ..Default::default() })
+        .subscribe(SubscribeRequest {
+            graph_id: "test".into(),
+            ..Default::default()
+        })
         .await
         .expect("subscribe")
         .into_inner();
@@ -159,10 +162,8 @@ async fn positions_advance_over_frames() {
 async fn loads_graph_from_file_via_env() {
     // 1. Write a 64-node path graph to a tempfile.
     let original = CsrGraph::path(64);
-    let tmp = std::env::temp_dir().join(format!(
-        "graph-compute-env-load-{}.bin",
-        std::process::id()
-    ));
+    let tmp =
+        std::env::temp_dir().join(format!("graph-compute-env-load-{}.bin", std::process::id()));
     original.write_bin(&tmp).expect("write_bin");
 
     // 2. Set the env var the binary reads, then mirror the binary's load path.

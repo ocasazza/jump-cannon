@@ -97,9 +97,7 @@ async fn exchange_halo_round_trips_boundary_positions() {
     let channel = Endpoint::try_from("http://[::]:50051")
         .unwrap()
         .connect_with_connector(tower::service_fn(move |_: Uri| {
-            let io = client_io
-                .take()
-                .expect("connector invoked more than once");
+            let io = client_io.take().expect("connector invoked more than once");
             ready(Ok::<_, std::io::Error>(TokioIo::new(io)))
         }))
         .await
@@ -141,9 +139,14 @@ async fn exchange_halo_round_trips_boundary_positions() {
         .expect("server closed without a reply");
 
     // Decode the reply and assert it is partition 1's boundary delta, intact.
-    let decoded =
-        HostHaloDelta::decode_bytes(reply.frame, reply.owner_id, &reply.node_ids, &reply.positions, reply.attributes)
-            .expect("decode reply HaloDelta");
+    let decoded = HostHaloDelta::decode_bytes(
+        reply.frame,
+        reply.owner_id,
+        &reply.node_ids,
+        &reply.positions,
+        reply.attributes,
+    )
+    .expect("decode reply HaloDelta");
     assert_eq!(decoded.frame, 7, "reply must echo the request frame");
     assert_eq!(decoded.owner_id, p1.partition_id);
     assert_eq!(decoded.node_ids, vec![boundary_id]);

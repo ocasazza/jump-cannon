@@ -24,11 +24,17 @@ fn canary_url() -> Option<String> {
 }
 
 fn env_u64(name: &str, default: u64) -> u64 {
-    std::env::var(name).ok().and_then(|s| s.parse().ok()).unwrap_or(default)
+    std::env::var(name)
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(default)
 }
 
 fn env_u32(name: &str, default: u32) -> u32 {
-    std::env::var(name).ok().and_then(|s| s.parse().ok()).unwrap_or(default)
+    std::env::var(name)
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(default)
 }
 
 async fn connect(url: &str) -> ComputeClient<tonic::transport::Channel> {
@@ -47,9 +53,18 @@ async fn canary_health_responds_quickly() {
     let max_ms = env_u64("GRAPH_COMPUTE_MAX_HEALTH_MS", 250);
     let mut client = connect(&url).await;
     let start = Instant::now();
-    let h = client.health(HealthRequest {}).await.expect("health rpc").into_inner();
+    let h = client
+        .health(HealthRequest {})
+        .await
+        .expect("health rpc")
+        .into_inner();
     let elapsed = start.elapsed();
-    println!("HEALTH: frame={} n_nodes={} elapsed_ms={}", h.frame, h.n_nodes, elapsed.as_millis());
+    println!(
+        "HEALTH: frame={} n_nodes={} elapsed_ms={}",
+        h.frame,
+        h.n_nodes,
+        elapsed.as_millis()
+    );
     assert!(
         elapsed.as_millis() <= max_ms as u128,
         "health rpc took {}ms (>{}ms)",
@@ -63,7 +78,11 @@ async fn canary_node_count_matches() {
     let Some(url) = canary_url() else { return };
     let expected = env_u32("GRAPH_COMPUTE_EXPECTED_NODES", 1024);
     let mut client = connect(&url).await;
-    let h = client.health(HealthRequest {}).await.expect("health").into_inner();
+    let h = client
+        .health(HealthRequest {})
+        .await
+        .expect("health")
+        .into_inner();
     assert_eq!(
         h.n_nodes, expected,
         "node count mismatch: server reports {} expected {}",
@@ -80,7 +99,10 @@ async fn canary_subscribe_streams_frames() {
 
     let mut client = connect(&url).await;
     let mut s = client
-        .subscribe(SubscribeRequest { graph_id: String::new(), ..Default::default() })
+        .subscribe(SubscribeRequest {
+            graph_id: String::new(),
+            ..Default::default()
+        })
         .await
         .expect("subscribe")
         .into_inner();
@@ -116,7 +138,11 @@ async fn canary_subscribe_streams_frames() {
     // Each delta must carry n_nodes * 3 * 4 bytes.
     let expect_bytes = (expected_nodes as usize) * 3 * 4;
     for d in &frames {
-        assert_eq!(d.n_nodes, expected_nodes, "delta n_nodes={}, expected {}", d.n_nodes, expected_nodes);
+        assert_eq!(
+            d.n_nodes, expected_nodes,
+            "delta n_nodes={}, expected {}",
+            d.n_nodes, expected_nodes
+        );
         assert_eq!(
             d.positions.len(),
             expect_bytes,
@@ -136,7 +162,10 @@ async fn canary_positions_are_changing() {
 
     let mut client = connect(&url).await;
     let mut s = client
-        .subscribe(SubscribeRequest { graph_id: String::new(), ..Default::default() })
+        .subscribe(SubscribeRequest {
+            graph_id: String::new(),
+            ..Default::default()
+        })
         .await
         .expect("subscribe")
         .into_inner();
@@ -175,5 +204,8 @@ async fn canary_positions_are_changing() {
         .sqrt();
 
     println!("L2 distance over ~5 frames: {l2:.6}");
-    assert!(l2 > 0.0, "positions unchanged across 5 frames — sim appears stuck");
+    assert!(
+        l2 > 0.0,
+        "positions unchanged across 5 frames — sim appears stuck"
+    );
 }

@@ -15,8 +15,9 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use graph_compute::analytics::gpu_pagerank;
 use graph_compute::sim::CsrGraph;
-use graph_compute::EngineCtx;
 use vault_data::{VaultEdge, VaultGraph, VaultNode};
+
+mod common;
 
 /// Deterministic connected simple graph on `n` nodes, no self-loops, no
 /// dangling: a base ring (guarantees connectivity + degree ≥ 2) plus
@@ -67,9 +68,10 @@ fn csr_from_edges(n: u32, edges: &BTreeSet<(u32, u32)>) -> CsrGraph {
 fn vault_from_edges(n: u32, edges: &BTreeSet<(u32, u32)>) -> VaultGraph {
     let mut vg = VaultGraph::new();
     for i in 0..n {
-        let mut node = VaultNode::default();
-        node.id = i.to_string();
-        vg.add_node(node);
+        vg.add_node(VaultNode {
+            id: i.to_string(),
+            ..Default::default()
+        });
     }
     for &(u, v) in edges {
         vg.add_edge(VaultEdge {
@@ -86,11 +88,9 @@ fn vault_from_edges(n: u32, edges: &BTreeSet<(u32, u32)>) -> VaultGraph {
 
 #[test]
 fn gpu_pagerank_matches_graph_metrics_oracle() {
-    let ctx = EngineCtx::try_new_gpu();
-    if ctx.gpu.is_none() {
-        eprintln!("Skipping cross-oracle test (no GPU adapter)");
+    let Some(ctx) = common::gpu_ctx_or_skip("gpu_pagerank_cross_oracle") else {
         return;
-    }
+    };
 
     let n: u32 = 300;
     let edges = build_edges(n);

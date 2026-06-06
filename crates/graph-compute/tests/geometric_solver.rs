@@ -829,14 +829,19 @@ fn mean_rg2_chain(n: usize, settings: &GeometricSettings, chains: u64) -> f32 {
     let mut acc = 0.0f64;
     let mut count = 0u64;
     for c in 0..chains {
-        let seed = random_walk_seed(n, settings.edge_rest_len, 0xC0FFEE ^ (c + 1) * 2_654_435_761);
+        let seed = random_walk_seed(
+            n,
+            settings.edge_rest_len,
+            0xC0FFEE ^ (c + 1) * 2_654_435_761,
+        );
         // Each chain gets an INDEPENDENT thermostat stream — otherwise the runs
         // share noise, the ensemble average barely shrinks the variance, and a
         // single chain's fluctuation can skew the fitted exponent.
         let mut settings = settings.clone();
         settings.rng_seed ^= (c + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15);
         let mut e = GeometricEngine::new();
-        e.set_params(&serde_json::to_value(&settings).unwrap()).unwrap();
+        e.set_params(&serde_json::to_value(&settings).unwrap())
+            .unwrap();
         let mut ctx = EngineCtx::cpu_only();
         e.init(&mut ctx, &CsrShard::whole(&g), &seed).unwrap();
         for step in 0..steps {
@@ -1077,9 +1082,9 @@ fn deeper_well_binds_a_pair_faster_monotonically() {
     // Steps until the pair first reaches (near) contact, T=0 minimizer.
     let steps_to_bind = |eps: f32| -> usize {
         let mut s = cohesion_only(radius, eps, well_width); // temperature stays 0
-        // Overdamped + small step + UNCAPPED: drift speed ∝ force ∝ ε, so binding
-        // time falls cleanly with ε. A displacement clamp would saturate the deep
-        // wells and erase the monotone gradient, so disable it here.
+                                                            // Overdamped + small step + UNCAPPED: drift speed ∝ force ∝ ε, so binding
+                                                            // time falls cleanly with ε. A displacement clamp would saturate the deep
+                                                            // wells and erase the monotone gradient, so disable it here.
         s.damping = 0.2;
         s.time_step = 0.2;
         s.max_step = 0.0;
@@ -1306,7 +1311,8 @@ fn patchy_well_drives_nematic_alignment() {
     };
 
     let mut e = GeometricEngine::new();
-    e.set_params(&serde_json::to_value(&settings).unwrap()).unwrap();
+    e.set_params(&serde_json::to_value(&settings).unwrap())
+        .unwrap();
     let mut ctx = EngineCtx::cpu_only();
     e.init(&mut ctx, &CsrShard::whole(&no_edges(n)), &seed)
         .expect("init");
@@ -1462,7 +1468,7 @@ fn bending_engine(
         exclusion_strength: 1.0,
         affinity_strength: 0.0,
         gravity: 0.0,
-        temperature: 0.0, // deterministic: no rotational noise, no OU kick
+        temperature: 0.0,         // deterministic: no rotational noise, no OU kick
         anisotropy_strength: 0.0, // isolate the bending torque from the align torque
         kappa_bend,
         spont_curvature_c0: c0,
@@ -1478,11 +1484,16 @@ fn bending_engine(
         ..Default::default()
     };
     let mut e = GeometricEngine::new();
-    e.set_params(&serde_json::to_value(&settings).unwrap()).unwrap();
+    e.set_params(&serde_json::to_value(&settings).unwrap())
+        .unwrap();
     let mut ctx = EngineCtx::cpu_only();
     let g = no_edges(n);
-    e.init(&mut ctx, &CsrShard::whole_with_attributes(&g, &attrs), positions)
-        .expect("init bending engine");
+    e.init(
+        &mut ctx,
+        &CsrShard::whole_with_attributes(&g, &attrs),
+        positions,
+    )
+    .expect("init bending engine");
     (e, ctx)
 }
 
@@ -1723,10 +1734,15 @@ fn tilt_coupling_energy_matches_negative_gradient() {
     let mut s_off = s.clone();
     s_off.tilt_coupling_strength = 0.0;
     let mut e2 = GeometricEngine::new();
-    e2.set_params(&serde_json::to_value(&s_off).unwrap()).unwrap();
-    let mut ctx2 = EngineCtx::cpu_only();
-    e2.init(&mut ctx2, &CsrShard::whole_with_attributes(&g, &attrs), &pos)
+    e2.set_params(&serde_json::to_value(&s_off).unwrap())
         .unwrap();
+    let mut ctx2 = EngineCtx::cpu_only();
+    e2.init(
+        &mut ctx2,
+        &CsrShard::whole_with_attributes(&g, &attrs),
+        &pos,
+    )
+    .unwrap();
     let f_without = e2.observe().unwrap().max_residual;
     let tilt_force_axial = (f_with - f_without).abs();
 
@@ -1737,8 +1753,16 @@ fn tilt_coupling_energy_matches_negative_gradient() {
         de_dd.abs(),
         tilt_force_axial
     );
-    assert!(de_dd.abs() > 1e-3, "tilt must exert a force at d0; got dE/dd={de_dd}");
-    approx("|−∇(tilt)| == |F_tilt|", tilt_force_axial, de_dd.abs(), 3e-3);
+    assert!(
+        de_dd.abs() > 1e-3,
+        "tilt must exert a force at d0; got dE/dd={de_dd}"
+    );
+    approx(
+        "|−∇(tilt)| == |F_tilt|",
+        tilt_force_axial,
+        de_dd.abs(),
+        3e-3,
+    );
 }
 
 #[test]
@@ -1763,7 +1787,10 @@ fn tilt_coupling_off_by_default_is_byte_identical() {
     e.init(&mut ctx, &CsrShard::whole_with_attributes(&g, &attrs), &pos)
         .unwrap();
     let o = e.observe().unwrap();
-    assert_eq!(o.energy.tilt, 0.0, "tilt energy must be exactly 0 when the knob is off");
+    assert_eq!(
+        o.energy.tilt, 0.0,
+        "tilt energy must be exactly 0 when the knob is off"
+    );
 }
 
 #[test]
@@ -1788,8 +1815,12 @@ fn tilt_coupling_drives_neighbours_side_by_side() {
     e.set_params(&serde_json::to_value(&s).unwrap()).unwrap();
     let mut ctx = EngineCtx::cpu_only();
     let g = no_edges(2);
-    e.init(&mut ctx, &CsrShard::whole_with_attributes(&g, &attrs), &start)
-        .unwrap();
+    e.init(
+        &mut ctx,
+        &CsrShard::whole_with_attributes(&g, &attrs),
+        &start,
+    )
+    .unwrap();
     let cos_to_z = |p: &[f32]| -> f32 {
         let (dx, dy, dz) = (p[3] - p[0], p[4] - p[1], p[5] - p[2]);
         let len = (dx * dx + dy * dy + dz * dz).sqrt().max(1e-6);
@@ -1801,9 +1832,7 @@ fn tilt_coupling_drives_neighbours_side_by_side() {
         pos = e.step(&mut ctx).positions;
     }
     let end_align = cos_to_z(&pos);
-    eprintln!(
-        "tilt side-by-side: |r̂·ẑ| {start_align:.3} -> {end_align:.3} (→0 = side-by-side)"
-    );
+    eprintln!("tilt side-by-side: |r̂·ẑ| {start_align:.3} -> {end_align:.3} (→0 = side-by-side)");
     assert!(
         end_align < start_align - 0.3 && end_align < 0.4,
         "tilt coupling (c₀=0) must roll a stacked pair toward side-by-side \
@@ -1884,7 +1913,7 @@ fn thermal_bend_engine(
         class_radius: vec![radius],
         default_radius: radius,
         director_source: DirectorSource::Injected,
-        damping: 1.0,    // no translational thermal kick (FDT: √(1−d²)=0)
+        damping: 1.0, // no translational thermal kick (FDT: √(1−d²)=0)
         time_step: 0.2,
         max_step: 0.0,
         ..GeometricSettings::default()
@@ -1897,11 +1926,16 @@ fn thermal_bend_engine(
     let mut settings = settings;
     settings.mass_source = MassSource::Injected;
     let mut e = GeometricEngine::new();
-    e.set_params(&serde_json::to_value(&settings).unwrap()).unwrap();
+    e.set_params(&serde_json::to_value(&settings).unwrap())
+        .unwrap();
     let mut ctx = EngineCtx::cpu_only();
     let g = no_edges(n);
-    e.init(&mut ctx, &CsrShard::whole_with_attributes(&g, &attrs), positions)
-        .expect("init thermal bending engine");
+    e.init(
+        &mut ctx,
+        &CsrShard::whole_with_attributes(&g, &attrs),
+        positions,
+    )
+    .expect("init thermal bending engine");
     (e, ctx)
 }
 
@@ -2017,7 +2051,9 @@ fn bending_modulus_emerges_from_thermal_undulations() {
          ensemble of 10 seeds):"
     );
     for ((k, m), kp) in knobs.iter().zip(msq.iter()).zip(kappa.iter()) {
-        eprintln!("    kappa_bend = {k:5.1}  ->  <θ²> = {m:.4} rad²   κ_node = 2kT/<θ²> = {kp:.3} k_BT");
+        eprintln!(
+            "    kappa_bend = {k:5.1}  ->  <θ²> = {m:.4} rad²   κ_node = 2kT/<θ²> = {kp:.3} k_BT"
+        );
     }
 
     // Every emergent modulus must be positive (a real restoring stiffness, not noise),
@@ -2026,7 +2062,10 @@ fn bending_modulus_emerges_from_thermal_undulations() {
     // actual stiff membrane, not a decorrelated gas of directors.
     let iso_ceiling = std::f32::consts::PI * std::f32::consts::PI / 3.0;
     for ((k, m), kp) in knobs.iter().zip(msq.iter()).zip(kappa.iter()) {
-        assert!(*kp > 0.0, "κ_node must be positive at kappa_bend={k}: got {kp}");
+        assert!(
+            *kp > 0.0,
+            "κ_node must be positive at kappa_bend={k}: got {kp}"
+        );
         assert!(
             *m < iso_ceiling * 0.9,
             "undulation amplitude at kappa_bend={k} must sit below the isotropic ceiling \
@@ -2141,11 +2180,7 @@ fn undulations_stiffen_with_membrane_geometry() {
 /// the given per-node `directors` (interleaved x,y,z) injected verbatim, and a
 /// uniform contact radius. No dynamics are stepped; the engine exists only so
 /// `observe_assembly` can read the configuration.
-fn assembly_engine(
-    positions: &[f32],
-    directors: &[f32],
-    radius: f32,
-) -> GeometricEngine {
+fn assembly_engine(positions: &[f32], directors: &[f32], radius: f32) -> GeometricEngine {
     let n = positions.len() / 3;
     let settings = GeometricSettings {
         edge_stiffness: 0.0,
@@ -2165,11 +2200,16 @@ fn assembly_engine(
         ..Default::default()
     };
     let mut e = GeometricEngine::new();
-    e.set_params(&serde_json::to_value(&settings).unwrap()).unwrap();
+    e.set_params(&serde_json::to_value(&settings).unwrap())
+        .unwrap();
     let mut ctx = EngineCtx::cpu_only();
     let g = no_edges(n);
-    e.init(&mut ctx, &CsrShard::whole_with_attributes(&g, &attrs), positions)
-        .expect("init assembly engine");
+    e.init(
+        &mut ctx,
+        &CsrShard::whole_with_attributes(&g, &attrs),
+        positions,
+    )
+    .expect("init assembly engine");
     e
 }
 
@@ -2205,7 +2245,10 @@ fn assembly_nematic_s_spans_aligned_to_random() {
         .observe_assembly()
         .unwrap()
         .nematic_s;
-    assert!(s_iso < 0.05, "isotropic directors should give S≈0, got {s_iso}");
+    assert!(
+        s_iso < 0.05,
+        "isotropic directors should give S≈0, got {s_iso}"
+    );
 }
 
 #[test]
@@ -2237,7 +2280,10 @@ fn assembly_cluster_count_singletons_vs_one_blob() {
         "a dispersed gas should be all singletons, got {} clusters",
         gas_obs.cluster_count
     );
-    assert_eq!(gas_obs.largest_cluster, 1, "no two gas nodes are in contact");
+    assert_eq!(
+        gas_obs.largest_cluster, 1,
+        "no two gas nodes are in contact"
+    );
 
     // Blob: same grid spaced 1.0 (< 1.2 cutoff) ⇒ a single connected cluster.
     let mut blob = vec![0.0f32; 3 * n];
@@ -2260,8 +2306,16 @@ fn assembly_cluster_count_singletons_vs_one_blob() {
         "a tight blob should be one cluster, got {}",
         blob_obs.cluster_count
     );
-    assert_eq!(blob_obs.largest_cluster, n, "the blob should contain every node");
-    approx("blob largest-cluster frac", blob_obs.largest_cluster_frac, 1.0, 1e-6);
+    assert_eq!(
+        blob_obs.largest_cluster, n,
+        "the blob should contain every node"
+    );
+    approx(
+        "blob largest-cluster frac",
+        blob_obs.largest_cluster_frac,
+        1.0,
+        1e-6,
+    );
 }
 
 #[test]
@@ -2321,7 +2375,10 @@ fn assembly_closure_distinguishes_shell_from_disk() {
     let disk_obs = assembly_engine(&disk, &dirs_d, 5.0)
         .observe_assembly()
         .unwrap();
-    assert_eq!(disk_obs.largest_cluster, n_disk, "the disk must be one cluster");
+    assert_eq!(
+        disk_obs.largest_cluster, n_disk,
+        "the disk must be one cluster"
+    );
     assert!(
         !disk_obs.is_closed(),
         "a flat disk should read as OPEN (closure={:.3})",
@@ -2625,7 +2682,8 @@ fn assemble_and_observe(
     steps: usize,
 ) -> (AssemblyObservables, [f32; 3], Vec<f32>) {
     let mut e = GeometricEngine::new();
-    e.set_params(&serde_json::to_value(settings).unwrap()).unwrap();
+    e.set_params(&serde_json::to_value(settings).unwrap())
+        .unwrap();
     let mut ctx = EngineCtx::cpu_only();
     let shard = match attrs {
         Some(a) => CsrShard::whole_with_attributes(graph, a),
@@ -2771,7 +2829,8 @@ fn morphology_secondary_sheet_from_brownian_start() {
 
         // Baseline order of the random seed (must be near-isotropic, else vacuous).
         let mut e0 = GeometricEngine::new();
-        e0.set_params(&serde_json::to_value(&settings).unwrap()).unwrap();
+        e0.set_params(&serde_json::to_value(&settings).unwrap())
+            .unwrap();
         let mut ctx0 = EngineCtx::cpu_only();
         e0.init(&mut ctx0, &CsrShard::whole(&no_edges(n)), &seed_pos)
             .unwrap();
@@ -2851,9 +2910,9 @@ fn morphology_tertiary_tube_is_prolate() {
     // We then relax it and LOG honestly what happens.
     let radius = 0.5f32;
     let sigma = 2.0 * radius; // contact distance = 1.0
-    // A tube: stacked rings of particles around the z axis. Within-ring chord and
-    // ring-to-ring gap are both just inside contact σ so every neighbour coheres;
-    // many rings so it is clearly elongated.
+                              // A tube: stacked rings of particles around the z axis. Within-ring chord and
+                              // ring-to-ring gap are both just inside contact σ so every neighbour coheres;
+                              // many rings so it is clearly elongated.
     let ring = 12usize;
     let rings = 16usize;
     let n = ring * rings;
@@ -2973,7 +3032,8 @@ fn morphology_tertiary_tube_is_prolate() {
     assert!(
         obs_curl.closure > obs_flat.closure + 0.08 && obs_curl.closure > 0.6,
         "spontaneous curvature must curl the flat strip (closure {:.3} -> {:.3})",
-        obs_flat.closure, obs_curl.closure
+        obs_flat.closure,
+        obs_curl.closure
     );
     // HONESTY (logged, not faked): the curled strip is a partly-rolled trough, not a
     // fully-closed hollow PROLATE cylinder — stable hollow-tube topology is not a
@@ -3115,7 +3175,8 @@ fn morphology_quaternary_vesicle_is_closed() {
     assert!(
         obs_cup.closure > obs_flat.closure + 0.3 && obs_cup.closure > 0.6,
         "spontaneous curvature must wrap the flat disk into a deep cup (closure {:.3} -> {:.3})",
-        obs_flat.closure, obs_cup.closure
+        obs_flat.closure,
+        obs_cup.closure
     );
     // HONESTY (logged, not faked): the deep cup does NOT reliably reach FULL closure
     // (closure ≥ 0.85, a sealed shell) and HOLD it as a stable T=0 fixed point — the
@@ -3203,7 +3264,10 @@ fn replay_from_a_restored_keyframe_is_bit_exact() {
     let reference = e.snapshot().unwrap();
 
     // The scenario must actually evolve — else the round-trip is vacuous.
-    assert_ne!(key, reference, "the soup must evolve over 60 steps (non-trivial replay)");
+    assert_ne!(
+        key, reference,
+        "the soup must evolve over 60 steps (non-trivial replay)"
+    );
 
     // Restore the keyframe and replay the SAME number of steps.
     e.restore(&key).expect("restore");
@@ -3488,8 +3552,8 @@ fn soup_settings(bonding: bool, seed: u64) -> GeometricSettings {
         rng_seed: seed,
         // Dynamic bonding (the variable under test).
         bonding_enabled: bonding,
-        r_bond: 1.1,   // just past contact σ=1.0 (a cohering pair bonds)
-        r_break: 1.5,  // ≈1.36·r_bond hysteresis band
+        r_bond: 1.1,  // just past contact σ=1.0 (a cohering pair bonds)
+        r_break: 1.5, // ≈1.36·r_bond hysteresis band
         bond_stiffness: 0.4,
         bond_every: 4,
         ..GeometricSettings::default()
@@ -3627,7 +3691,8 @@ fn cell_list_finds_same_candidates_as_brute_and_is_subquadratic() {
     let mut e = GeometricEngine::new();
     e.set_params(&serde_json::to_value(&s).unwrap()).unwrap();
     let mut ctx = EngineCtx::cpu_only();
-    e.init(&mut ctx, &CsrShard::whole(&no_edges(n)), &pos).unwrap();
+    e.init(&mut ctx, &CsrShard::whole(&no_edges(n)), &pos)
+        .unwrap();
     e.step(&mut ctx); // one bond stage on the frozen geometry
     let mut engine_bonds = e.dynamic_bonds().unwrap();
     engine_bonds.sort();
@@ -3648,7 +3713,8 @@ fn cell_list_finds_same_candidates_as_brute_and_is_subquadratic() {
     }
     brute.sort();
     assert_eq!(
-        engine_bonds, brute,
+        engine_bonds,
+        brute,
         "the bond stage must bond exactly the brute in-range pair set \
          (engine {} bonds, brute {})",
         engine_bonds.len(),
@@ -3681,7 +3747,8 @@ fn cell_list_finds_same_candidates_as_brute_and_is_subquadratic() {
         let mut e = GeometricEngine::new();
         e.set_params(&serde_json::to_value(&s).unwrap()).unwrap();
         let mut ctx = EngineCtx::cpu_only();
-        e.init(&mut ctx, &CsrShard::whole(&no_edges(n)), &pos).unwrap();
+        e.init(&mut ctx, &CsrShard::whole(&no_edges(n)), &pos)
+            .unwrap();
         // Time ONLY the bond stage (cell-list build + add/remove sweep) — NOT a
         // whole `step`, whose separate O(n²) pair-force pass would mask the bond
         // stage's O(n) scaling entirely. Warm up one rebuild, then time the next.
@@ -3694,9 +3761,15 @@ fn cell_list_finds_same_candidates_as_brute_and_is_subquadratic() {
     let density = 0.3f32; // particles per unit volume (sparse ⇒ small candidate sets)
     let small = 2_000usize;
     let big = 8_000usize; // 4× the nodes
-    // Take the min over a few reps to suppress scheduler noise on the floor.
-    let t_small = (0..3).map(|_| time_one_bond_stage(small, density)).min().unwrap();
-    let t_big = (0..3).map(|_| time_one_bond_stage(big, density)).min().unwrap();
+                          // Take the min over a few reps to suppress scheduler noise on the floor.
+    let t_small = (0..3)
+        .map(|_| time_one_bond_stage(small, density))
+        .min()
+        .unwrap();
+    let t_big = (0..3)
+        .map(|_| time_one_bond_stage(big, density))
+        .min()
+        .unwrap();
     let ratio = t_big.as_secs_f64() / t_small.as_secs_f64().max(1e-9);
     eprintln!(
         "P1 cell-list perf: {small} nodes = {:.2} ms, {big} nodes (4×) = {:.2} ms \
@@ -4079,10 +4152,15 @@ fn bonded_disk_engine(
         ..Default::default()
     };
     let mut e = GeometricEngine::new();
-    e.set_params(&serde_json::to_value(settings).unwrap()).unwrap();
+    e.set_params(&serde_json::to_value(settings).unwrap())
+        .unwrap();
     let mut ctx = EngineCtx::cpu_only();
-    e.init(&mut ctx, &CsrShard::whole_with_attributes(&no_edges(n), &attrs), pos)
-        .expect("init bonded disk");
+    e.init(
+        &mut ctx,
+        &CsrShard::whole_with_attributes(&no_edges(n), &attrs),
+        pos,
+    )
+    .expect("init bonded disk");
     (e, ctx)
 }
 
@@ -4138,12 +4216,12 @@ fn p3_rim_is_the_under_coordinated_boundary() {
     let radius = 0.5f32;
     let sp = 1.0f32; // = σ (= 2·radius): the exclusion equilibrium ⇒ lattice holds
     let (pos, dirs, n) = hex_disk_seed(4, sp); // 4 rings ⇒ 61 nodes
-    // Rim-detection settings: the cohesion well is OFF and exclusion holds the
-    // lattice at spacing σ, so the disk does NOT collapse/over-bond — the bonded
-    // graph keeps its triangular structure and its boundary is a true rim. A tight
-    // r_bond/r_break (just past σ, well short of the second neighbour ring at √3·σ)
-    // means only the 6 nearest neighbours bond, so interior nodes reach valence 6
-    // (full) while boundary nodes have fewer ⇒ rim.
+                                               // Rim-detection settings: the cohesion well is OFF and exclusion holds the
+                                               // lattice at spacing σ, so the disk does NOT collapse/over-bond — the bonded
+                                               // graph keeps its triangular structure and its boundary is a true rim. A tight
+                                               // r_bond/r_break (just past σ, well short of the second neighbour ring at √3·σ)
+                                               // means only the 6 nearest neighbours bond, so interior nodes reach valence 6
+                                               // (full) while boundary nodes have fewer ⇒ rim.
     let mut s = disk_closure_settings(radius, sp, 0x_C0DE_F00D_0001);
     s.well_depth = 0.0; // no cohesion ⇒ the flat lattice is mechanically stable
     s.anisotropy_strength = 0.0;
@@ -4195,9 +4273,7 @@ fn p3_rim_is_the_under_coordinated_boundary() {
         }
         (cx / n as f32, cy / n as f32)
     };
-    let radius_of = |i: usize| -> f32 {
-        (p[3 * i] - centre.0).hypot(p[3 * i + 1] - centre.1)
-    };
+    let radius_of = |i: usize| -> f32 { (p[3 * i] - centre.0).hypot(p[3 * i + 1] - centre.1) };
     let rim_set: std::collections::HashSet<u32> = rim.iter().copied().collect();
     let (mut rim_r, mut rim_c) = (0.0f32, 0u32);
     let (mut int_r, mut int_c) = (0.0f32, 0u32);
@@ -4356,8 +4432,16 @@ fn p3_closure_is_hysteretic() {
 
     // FORWARD branch: from the FLAT disk, hold the intermediate driver. The flat
     // state is (meta)stable at γ_mid ⇒ closure stays low.
-    let (fwd_obs, _fwd_rg) =
-        run_disk_closure(&pos, &dirs, radius, sp, 0x_415_7E5_15, gamma_mid, c0_mid, 12_000);
+    let (fwd_obs, _fwd_rg) = run_disk_closure(
+        &pos,
+        &dirs,
+        radius,
+        sp,
+        0x_415_7E5_15,
+        gamma_mid,
+        c0_mid,
+        12_000,
+    );
 
     // REVERSE branch: first FOLD the disk at a HIGH driver…
     let mut hi = disk_closure_settings(radius, sp, 0x_415_7E5_16);
@@ -4454,8 +4538,12 @@ fn p3_spontaneous_closure_from_a_soup_is_logged_honestly() {
     let mut e = GeometricEngine::new();
     e.set_params(&serde_json::to_value(&s).unwrap()).unwrap();
     let mut ctx = EngineCtx::cpu_only();
-    e.init(&mut ctx, &CsrShard::whole_with_attributes(&no_edges(n), &attrs), &seed)
-        .unwrap();
+    e.init(
+        &mut ctx,
+        &CsrShard::whole_with_attributes(&no_edges(n), &attrs),
+        &seed,
+    )
+    .unwrap();
     for _ in 0..20_000 {
         e.step(&mut ctx);
     }
@@ -4508,7 +4596,6 @@ fn p3_spontaneous_closure_from_a_soup_is_logged_honestly() {
     );
 }
 
-
 // ---------------------------------------------------------------------------
 // PHASE P4 — GPU port of the bonding stage + CPU<->GPU equivalence
 // ---------------------------------------------------------------------------
@@ -4546,7 +4633,8 @@ fn cpu_frozen_bonds(settings: &GeometricSettings, pos: &[f32], classes: &[u32]) 
         ..Default::default()
     };
     let mut e = GeometricEngine::new();
-    e.set_params(&serde_json::to_value(&settings).unwrap()).unwrap();
+    e.set_params(&serde_json::to_value(&settings).unwrap())
+        .unwrap();
     let mut ctx = EngineCtx::cpu_only();
     let g = no_edges(n);
     e.init(&mut ctx, &CsrShard::whole_with_attributes(&g, &attrs), pos)
@@ -4593,7 +4681,14 @@ fn p4_gpu_grid_candidates_match_brute() {
     let r_bond = 1.0f32;
     let r_break = 1.4f32;
 
-    let gpu_pairs = gpu_candidate_pairs(&gpu, &frozen_bond_settings(), &pos, &classes, r_break, r_bond * r_bond);
+    let gpu_pairs = gpu_candidate_pairs(
+        &gpu,
+        &frozen_bond_settings(),
+        &pos,
+        &classes,
+        r_break,
+        r_bond * r_bond,
+    );
 
     // Brute reference: every unordered pair within r_bond (no class matrix ⇒ all
     // compatible), canonical + sorted.
@@ -4610,7 +4705,11 @@ fn p4_gpu_grid_candidates_match_brute() {
         }
     }
     brute.sort_unstable();
-    eprintln!("p4 grid: {} gpu candidates vs {} brute", gpu_pairs.len(), brute.len());
+    eprintln!(
+        "p4 grid: {} gpu candidates vs {} brute",
+        gpu_pairs.len(),
+        brute.len()
+    );
     assert_eq!(
         gpu_pairs, brute,
         "GPU sort-based grid candidate set must equal the O(n²) brute in-range set"
@@ -4636,9 +4735,19 @@ fn p4_gpu_bonds_match_cpu_uncapped() {
 
     let cpu = cpu_frozen_bonds(&s, &pos, &classes);
     let gpu_bonds = gpu_dynamic_bonds(&gpu, &s, &pos, &classes, &[]);
-    eprintln!("p4 uncapped: cpu {} bonds, gpu {} bonds", cpu.len(), gpu_bonds.len());
-    assert_eq!(gpu_bonds, cpu, "GPU and CPU bond sets must be identical (uncapped P1)");
-    assert!(!cpu.is_empty(), "the soup must actually form bonds (non-trivial test)");
+    eprintln!(
+        "p4 uncapped: cpu {} bonds, gpu {} bonds",
+        cpu.len(),
+        gpu_bonds.len()
+    );
+    assert_eq!(
+        gpu_bonds, cpu,
+        "GPU and CPU bond sets must be identical (uncapped P1)"
+    );
+    assert!(
+        !cpu.is_empty(),
+        "the soup must actually form bonds (non-trivial test)"
+    );
 }
 
 #[test]
@@ -4666,15 +4775,24 @@ fn p4_gpu_bonds_match_cpu_valence_capped() {
     // HARD cap: neither backend exceeds valence 2.
     let max_deg = |b: &[(u32, u32)]| -> u32 {
         let mut d = vec![0u32; n];
-        for &(a, c) in b { d[a as usize] += 1; d[c as usize] += 1; }
+        for &(a, c) in b {
+            d[a as usize] += 1;
+            d[c as usize] += 1;
+        }
         d.iter().copied().max().unwrap_or(0)
     };
     eprintln!(
         "p4 capped: cpu {} bonds (max deg {}), gpu {} bonds (max deg {})",
-        cpu.len(), max_deg(&cpu), gpu_bonds.len(), max_deg(&gpu_bonds)
+        cpu.len(),
+        max_deg(&cpu),
+        gpu_bonds.len(),
+        max_deg(&gpu_bonds)
     );
     assert!(max_deg(&gpu_bonds) <= 2, "GPU valence-2 cap exceeded");
-    assert_eq!(gpu_bonds, cpu, "GPU and CPU bond sets must be identical under a valence-2 cap");
+    assert_eq!(
+        gpu_bonds, cpu,
+        "GPU and CPU bond sets must be identical under a valence-2 cap"
+    );
     assert!(!cpu.is_empty(), "the capped soup must still form bonds");
 }
 
@@ -4703,10 +4821,20 @@ fn p4_gpu_bonds_match_cpu_class_compatibility() {
     let gpu_bonds = gpu_dynamic_bonds(&gpu, &s, &pos, &classes, &[]);
     // Every GPU bond must be a cross-class pair (the compatibility rule).
     for &(a, b) in &gpu_bonds {
-        assert_ne!(classes[a as usize], classes[b as usize], "GPU bonded an incompatible same-class pair");
+        assert_ne!(
+            classes[a as usize], classes[b as usize],
+            "GPU bonded an incompatible same-class pair"
+        );
     }
-    eprintln!("p4 class-compat: cpu {} bonds, gpu {} bonds", cpu.len(), gpu_bonds.len());
-    assert_eq!(gpu_bonds, cpu, "GPU and CPU class-compatible bond sets must be identical");
+    eprintln!(
+        "p4 class-compat: cpu {} bonds, gpu {} bonds",
+        cpu.len(),
+        gpu_bonds.len()
+    );
+    assert_eq!(
+        gpu_bonds, cpu,
+        "GPU and CPU class-compatible bond sets must be identical"
+    );
     assert!(!cpu.is_empty(), "cross-class pairs must form bonds");
 }
 
@@ -4751,7 +4879,8 @@ fn p4_gpu_bond_hysteresis_matches_cpu_over_a_trajectory() {
     let mut cpu_ctx = EngineCtx::cpu_only();
     let mut e = GeometricEngine::new();
     e.set_params(&serde_json::to_value(&s).unwrap()).unwrap();
-    e.init(&mut cpu_ctx, &CsrShard::whole(&no_edges(n)), &pos0).unwrap();
+    e.init(&mut cpu_ctx, &CsrShard::whole(&no_edges(n)), &pos0)
+        .unwrap();
 
     let mut prior_gpu_bonds: Vec<(u32, u32)> = Vec::new();
     let mut checks = 0usize;
@@ -4780,7 +4909,10 @@ fn p4_gpu_bond_hysteresis_matches_cpu_over_a_trajectory() {
         prior_gpu_bonds = gpu_bonds;
     }
     eprintln!("p4 hysteresis: bond set agreed for 40 steps, changed on {checks} of them");
-    assert!(checks >= 3, "the trajectory must exercise real create/break churn, not a static set");
+    assert!(
+        checks >= 3,
+        "the trajectory must exercise real create/break churn, not a static set"
+    );
 }
 
 #[test]
@@ -4830,14 +4962,19 @@ fn p4_cpu_gpu_relax_a_bonded_chain_to_same_geometry() {
     // on this set — covered by the equivalence tests above); take that set once.
     let bonds = gpu_dynamic_bonds(&gpu, &s, &pos, &classes, &[]);
     // Each interior bead has 2 bonds; ends have 1. n-1 bonds in a chain.
-    assert_eq!(bonds.len(), n - 1, "a valence-2 chain seed should bond consecutive beads");
+    assert_eq!(
+        bonds.len(),
+        n - 1,
+        "a valence-2 chain seed should bond consecutive beads"
+    );
 
     // --- CPU relax: drive the engine with the SAME static bond set by running the
     // full engine (its bond stage reforms the identical chain each step). ---
     let mut cpu_ctx = EngineCtx::cpu_only();
     let mut e = GeometricEngine::new();
     e.set_params(&serde_json::to_value(&s).unwrap()).unwrap();
-    e.init(&mut cpu_ctx, &CsrShard::whole(&no_edges(n)), &pos).unwrap();
+    e.init(&mut cpu_ctx, &CsrShard::whole(&no_edges(n)), &pos)
+        .unwrap();
     const STEPS: usize = 400;
     for _ in 0..STEPS {
         e.step(&mut cpu_ctx);
@@ -4859,7 +4996,22 @@ fn p4_cpu_gpu_relax_a_bonded_chain_to_same_geometry() {
     let cpu_s = mean_spacing(&cpu_pos);
     let gpu_s = mean_spacing(&gpu_pos);
     eprintln!("p4 chain relax: cpu spacing {cpu_s:.4}, gpu spacing {gpu_s:.4}, r_bond {r_bond}");
-    approx("cpu bonded-chain spacing relaxes to r_bond", cpu_s, r_bond, 0.05);
-    approx("gpu bonded-chain spacing relaxes to r_bond", gpu_s, r_bond, 0.05);
-    approx("cpu↔gpu bonded-chain spacing equivalence", gpu_s, cpu_s, 0.02);
+    approx(
+        "cpu bonded-chain spacing relaxes to r_bond",
+        cpu_s,
+        r_bond,
+        0.05,
+    );
+    approx(
+        "gpu bonded-chain spacing relaxes to r_bond",
+        gpu_s,
+        r_bond,
+        0.05,
+    );
+    approx(
+        "cpu↔gpu bonded-chain spacing equivalence",
+        gpu_s,
+        cpu_s,
+        0.02,
+    );
 }

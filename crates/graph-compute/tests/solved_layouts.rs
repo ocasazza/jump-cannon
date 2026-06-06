@@ -27,7 +27,9 @@
 //!
 //! Stress: `s(X) = sum_{i<j} w_ij (||x_i - x_j|| - d_ij)^2`, `w_ij = 1/d_ij^2`.
 
-use graph_compute::engines::{CsrShard, EngineCtx, LayoutEngine, SgdStressEngine, SgdStressGpuEngine};
+use graph_compute::engines::{
+    CsrShard, EngineCtx, LayoutEngine, SgdStressEngine, SgdStressGpuEngine,
+};
 use graph_compute::sim::CsrGraph;
 
 /// Throughput benchmark: CPU s_gd2 vs the GPU Jacobi port at a size where GPU
@@ -96,7 +98,11 @@ fn cycle(n: usize) -> CsrGraph {
         neighbors.extend_from_slice(&nb);
         offsets.push(neighbors.len() as u32);
     }
-    CsrGraph { n_nodes: n as u32, offsets, neighbors }
+    CsrGraph {
+        n_nodes: n as u32,
+        offsets,
+        neighbors,
+    }
 }
 
 fn complete(n: usize) -> CsrGraph {
@@ -110,7 +116,11 @@ fn complete(n: usize) -> CsrGraph {
         }
         offsets.push(neighbors.len() as u32);
     }
-    CsrGraph { n_nodes: n as u32, offsets, neighbors }
+    CsrGraph {
+        n_nodes: n as u32,
+        offsets,
+        neighbors,
+    }
 }
 
 /// `w × h` 4-neighbour grid graph, node id `r*w + c`.
@@ -121,16 +131,28 @@ fn grid(w: usize, h: usize) -> CsrGraph {
     for r in 0..h {
         for c in 0..w {
             let mut nb = Vec::new();
-            if c > 0 { nb.push(idx(r, c - 1)); }
-            if c + 1 < w { nb.push(idx(r, c + 1)); }
-            if r > 0 { nb.push(idx(r - 1, c)); }
-            if r + 1 < h { nb.push(idx(r + 1, c)); }
+            if c > 0 {
+                nb.push(idx(r, c - 1));
+            }
+            if c + 1 < w {
+                nb.push(idx(r, c + 1));
+            }
+            if r > 0 {
+                nb.push(idx(r - 1, c));
+            }
+            if r + 1 < h {
+                nb.push(idx(r + 1, c));
+            }
             nb.sort_unstable();
             neighbors.extend_from_slice(&nb);
             offsets.push(neighbors.len() as u32);
         }
     }
-    CsrGraph { n_nodes: (w * h) as u32, offsets, neighbors }
+    CsrGraph {
+        n_nodes: (w * h) as u32,
+        offsets,
+        neighbors,
+    }
 }
 
 // ---- Distances + stress ----------------------------------------------------
@@ -146,7 +168,10 @@ fn all_pairs(g: &CsrGraph) -> Vec<u32> {
         let mut q = std::collections::VecDeque::from([s as u32]);
         while let Some(v) = q.pop_front() {
             let dv = row[v as usize];
-            let (a, b) = (g.offsets[v as usize] as usize, g.offsets[v as usize + 1] as usize);
+            let (a, b) = (
+                g.offsets[v as usize] as usize,
+                g.offsets[v as usize + 1] as usize,
+            );
             for &u in &g.neighbors[a..b] {
                 if row[u as usize] == u32::MAX {
                     row[u as usize] = dv + 1;
@@ -198,7 +223,8 @@ fn seed(n: usize, spread: f32) -> Vec<f32> {
 fn relax_cpu(g: &CsrGraph, init: &[f32], steps: usize) -> Vec<f32> {
     let mut e = SgdStressEngine::new();
     let mut ctx = EngineCtx::cpu_only();
-    e.init(&mut ctx, &CsrShard::whole(g), init).expect("cpu init");
+    e.init(&mut ctx, &CsrShard::whole(g), init)
+        .expect("cpu init");
     let mut out = init.to_vec();
     for _ in 0..steps {
         out = e.step(&mut ctx).positions;
@@ -211,7 +237,8 @@ fn relax_gpu(g: &CsrGraph, init: &[f32], steps: usize) -> Option<Vec<f32>> {
     let mut ctx = EngineCtx::try_new_gpu();
     ctx.gpu.as_ref()?;
     let mut e = SgdStressGpuEngine::new();
-    e.init(&mut ctx, &CsrShard::whole(g), init).expect("gpu init");
+    e.init(&mut ctx, &CsrShard::whole(g), init)
+        .expect("gpu init");
     let mut out = init.to_vec();
     for _ in 0..steps {
         out = e.step(&mut ctx).positions;
@@ -248,7 +275,10 @@ fn path_zero_stress_is_a_fixed_point_cpu() {
     }
     let out = relax_cpu(&g, &init, 150);
     let ns = scale_normalized_stress(&out, &d, n);
-    assert!(ns < 0.05, "CPU sgd-stress should relax the path back near optimum: NS={ns}");
+    assert!(
+        ns < 0.05,
+        "CPU sgd-stress should relax the path back near optimum: NS={ns}"
+    );
 }
 
 #[test]
@@ -269,7 +299,10 @@ fn path_zero_stress_is_a_fixed_point_gpu() {
         return;
     };
     let ns = scale_normalized_stress(&out, &d, n);
-    assert!(ns < 0.05, "GPU sgd-stress should relax the path back near optimum: NS={ns}");
+    assert!(
+        ns < 0.05,
+        "GPU sgd-stress should relax the path back near optimum: NS={ns}"
+    );
 }
 
 /// CPU↔GPU quality guard on the scale-invariant metric, across canonical graphs.
@@ -306,7 +339,10 @@ fn gpu_not_worse_than_cpu_on_normalized_stress() {
         };
         let ns_gpu = scale_normalized_stress(&gpu, &d, n);
 
-        assert!(ns_cpu.is_finite() && ns_gpu.is_finite(), "{name}: non-finite stress");
+        assert!(
+            ns_cpu.is_finite() && ns_gpu.is_finite(),
+            "{name}: non-finite stress"
+        );
         // GPU must not be meaningfully worse than CPU (generous slack for the
         // update-order difference). Catches a real GPU-port quality regression
         // without being flaky on the expected rate asymmetry.
@@ -349,5 +385,8 @@ fn cycle_stays_roughly_regular_cpu() {
     let mean = radii.iter().sum::<f32>() / n as f32;
     let var = radii.iter().map(|r| (r - mean).powi(2)).sum::<f32>() / n as f32;
     let cv = var.sqrt() / mean.max(1e-6);
-    assert!(cv < 0.25, "cycle should stay roughly regular: radius CV={cv} (mean r={mean})");
+    assert!(
+        cv < 0.25,
+        "cycle should stay roughly regular: radius CV={cv} (mean r={mean})"
+    );
 }

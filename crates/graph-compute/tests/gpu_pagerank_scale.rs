@@ -12,7 +12,8 @@ use std::time::Instant;
 
 use graph_compute::analytics::gpu_pagerank;
 use graph_compute::sim::CsrGraph;
-use graph_compute::EngineCtx;
+
+mod common;
 
 /// Undirected `k`-nearest-ring on `n` nodes: node i links to i±1..=±k (mod n).
 /// Symmetric, every node has degree exactly `2k` (no dangling), and the
@@ -38,16 +39,22 @@ fn k_ring(n: u32, k: u32) -> CsrGraph {
 
 #[test]
 fn gpu_pagerank_millions_scale_stable() {
-    let ctx = EngineCtx::try_new_gpu();
-    if ctx.gpu.is_none() {
-        eprintln!("Skipping gpu_pagerank scale test (no GPU adapter)");
+    let Some(ctx) = common::gpu_ctx_or_skip("gpu_pagerank_scale") else {
         return;
-    }
+    };
 
     // 2M nodes × degree 8 (k=4) = 16M directed edges. neighbors ≈ 64 MB,
     // offsets ≈ 8 MB, rank buffers ≈ 8 MB each — all under wgpu's default
     // 128 MiB max_storage_buffer_binding_size.
-    let n: u32 = 2_000_000;
+    //
+    // Size is env-tunable so the same test serves both runners: a real-Metal
+    // builder runs the full 2M (GPU_PAGERANK_SCALE_N unset), while the Linux
+    // lavapipe (software-Vulkan) CI sandbox sets a smaller N so it completes
+    // quickly. The kernel path exercised is identical either way.
+    let n: u32 = std::env::var("GPU_PAGERANK_SCALE_N")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(2_000_000);
     let k: u32 = 4;
     let build = Instant::now();
     let g = k_ring(n, k);

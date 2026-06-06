@@ -86,7 +86,10 @@ fn gpu_engines_run_and_move() {
             "fa2-brute",
             Box::new(Fa2BruteEngine::new()) as Box<dyn LayoutEngine>,
         ),
-        ("fa2-bh", Box::new(Fa2BhEngine::new()) as Box<dyn LayoutEngine>),
+        (
+            "fa2-bh",
+            Box::new(Fa2BhEngine::new()) as Box<dyn LayoutEngine>,
+        ),
     ] {
         let out = run(engine.as_mut(), &mut ctx, &graph, &s, 30);
         assert_eq!(out.len(), s.len(), "{name}: position count preserved");
@@ -149,11 +152,19 @@ fn barnes_hut_matches_brute_force_single_step() {
 // canary the reliable brute-force engine.
 
 fn triangle() -> CsrGraph {
-    CsrGraph { n_nodes: 3, offsets: vec![0, 2, 4, 6], neighbors: vec![1, 2, 0, 2, 0, 1] }
+    CsrGraph {
+        n_nodes: 3,
+        offsets: vec![0, 2, 4, 6],
+        neighbors: vec![1, 2, 0, 2, 0, 1],
+    }
 }
 
 fn dist(p: &[f32], i: usize, j: usize) -> f32 {
-    let (dx, dy, dz) = (p[3 * i] - p[3 * j], p[3 * i + 1] - p[3 * j + 1], p[3 * i + 2] - p[3 * j + 2]);
+    let (dx, dy, dz) = (
+        p[3 * i] - p[3 * j],
+        p[3 * i + 1] - p[3 * j + 1],
+        p[3 * i + 2] - p[3 * j + 2],
+    );
     (dx * dx + dy * dy + dz * dz).sqrt()
 }
 
@@ -177,10 +188,14 @@ fn fa2_single_edge_stays_finite() {
     let graph = CsrGraph::path(2);
     let s = vec![0.0, 0.0, 0.0, 5.0, 0.0, 0.0];
     let mut e = Fa2BruteEngine::new();
-    e.init(&mut ctx, &CsrShard::whole(&graph), &s).expect("init");
+    e.init(&mut ctx, &CsrShard::whole(&graph), &s)
+        .expect("init");
     for _ in 0..400 {
         let p = e.step(&mut ctx).positions;
-        assert!(p.iter().all(|x| x.is_finite()), "single-edge step produced non-finite coords");
+        assert!(
+            p.iter().all(|x| x.is_finite()),
+            "single-edge step produced non-finite coords"
+        );
     }
 }
 
@@ -198,8 +213,14 @@ fn fa2_triangle_relaxes_to_equilateral() {
     let out = run(&mut Fa2BruteEngine::new(), &mut ctx, &g, &s, 600);
     let (d01, d12, d20) = (dist(&out, 0, 1), dist(&out, 1, 2), dist(&out, 2, 0));
     let mean = (d01 + d12 + d20) / 3.0;
-    let max_dev = [d01, d12, d20].iter().map(|d| (d - mean).abs()).fold(0.0, f32::max);
-    assert!(mean > 1e-3, "triangle should not collapse: mean side {mean}");
+    let max_dev = [d01, d12, d20]
+        .iter()
+        .map(|d| (d - mean).abs())
+        .fold(0.0, f32::max);
+    assert!(
+        mean > 1e-3,
+        "triangle should not collapse: mean side {mean}"
+    );
     assert!(
         max_dev / mean < 0.15,
         "K3 should relax ~equilateral: sides {d01:.3}, {d12:.3}, {d20:.3} (dev {:.1}%)",
@@ -269,7 +290,11 @@ fn grid2d(dim: u32) -> CsrGraph {
             offsets.push(neighbors.len() as u32);
         }
     }
-    CsrGraph { n_nodes: n, offsets, neighbors }
+    CsrGraph {
+        n_nodes: n,
+        offsets,
+        neighbors,
+    }
 }
 
 /// First index where two f32 slices differ bitwise, or None if identical.
@@ -379,7 +404,9 @@ fn fa2_bh_is_run_to_run_bit_exact() {
     let b = run_once(&mut ctx);
     assert!(a.iter().all(|x| x.is_finite()), "fa2-bh non-finite");
     match first_bit_diff(&a, &b) {
-        None => eprintln!("fa2-bh: 60 steps × 36 nodes BIT-IDENTICAL across two runs ({backend:?})"),
+        None => {
+            eprintln!("fa2-bh: 60 steps × 36 nodes BIT-IDENTICAL across two runs ({backend:?})")
+        }
         Some(i) => panic!(
             "fa2-bh NOT run-to-run bit-exact at coord {i}: {:#010x} vs {:#010x} ({backend:?})",
             a[i].to_bits(),

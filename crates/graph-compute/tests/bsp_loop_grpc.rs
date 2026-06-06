@@ -112,7 +112,11 @@ impl LayoutEngine for RelaxEngine {
         for (i, &gid) in h.node_ids.iter().enumerate() {
             self.received.insert(
                 gid,
-                [h.positions[3 * i], h.positions[3 * i + 1], h.positions[3 * i + 2]],
+                [
+                    h.positions[3 * i],
+                    h.positions[3 * i + 1],
+                    h.positions[3 * i + 2],
+                ],
             );
         }
     }
@@ -264,15 +268,12 @@ async fn run_and_assert(g: CsrGraph, np: u32, k: u64) {
     for w in &workers {
         for &ghost in w.worker.partition.ghost_global_ids() {
             total_ghosts += 1;
-            let got = w
-                .worker
-                .engine
-                .received
-                .get(&ghost)
-                .unwrap_or_else(|| panic!(
+            let got = w.worker.engine.received.get(&ghost).unwrap_or_else(|| {
+                panic!(
                     "part {} never received a halo for ghost {ghost} (np={np})",
                     w.worker.partition.partition_id
-                ));
+                )
+            });
             let owner_pos = dist[&ghost];
             assert!(
                 close(*got, owner_pos),

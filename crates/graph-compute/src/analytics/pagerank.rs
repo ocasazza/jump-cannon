@@ -90,7 +90,9 @@ pub fn gpu_pagerank(
     }
 
     // Host-precompute inv_deg; reject dangling nodes (degree 0) for this version.
+    // (range loop: `v` indexes both the offsets pair and inv_deg in lock-step.)
     let mut inv_deg = vec![0.0f32; n];
+    #[allow(clippy::needless_range_loop)]
     for v in 0..n {
         let deg = graph.offsets[v + 1] - graph.offsets[v];
         if deg == 0 {
@@ -305,6 +307,8 @@ pub fn cpu_pagerank(g: &CsrGraph, damping: f32, iters: u32) -> Vec<f32> {
     for _ in 0..iters {
         let mut next = vec![0.0f32; n];
         let mut dangling = 0.0f32;
+        // range loop: `v` indexes out_deg, rank, and the offsets pair together.
+        #[allow(clippy::needless_range_loop)]
         for v in 0..n {
             if out_deg[v] == 0.0 {
                 dangling += rank[v];
@@ -316,8 +320,8 @@ pub fn cpu_pagerank(g: &CsrGraph, damping: f32, iters: u32) -> Vec<f32> {
             }
         }
         let dangling_share = damping * dangling * inv_n;
-        for v in 0..n {
-            next[v] = teleport + dangling_share + damping * next[v];
+        for r in next.iter_mut() {
+            *r = teleport + dangling_share + damping * *r;
         }
         rank = next;
     }

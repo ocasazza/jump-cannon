@@ -169,11 +169,7 @@ async fn edges_reference_valid_nodes() {
 
     let (tx, rx) = tokio::sync::mpsc::channel::<FocusRequest>(1);
     let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
-    let mut response = client
-        .topo_fisheye(stream)
-        .await
-        .unwrap()
-        .into_inner();
+    let mut response = client.topo_fisheye(stream).await.unwrap().into_inner();
 
     tx.send(FocusRequest {
         graph_id: "".into(),

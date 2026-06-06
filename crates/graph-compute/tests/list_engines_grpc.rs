@@ -65,7 +65,13 @@ async fn list_engines_enumerates_builtin_registry() {
     let by_id: HashMap<&str, &graph_compute::proto::EngineDescriptor> =
         resp.engines.iter().map(|e| (e.id.as_str(), e)).collect();
 
-    for id in ["fa2-brute", "fa2-bh", "sgd-stress", "multilevel", "cpu-spring"] {
+    for id in [
+        "fa2-brute",
+        "fa2-bh",
+        "sgd-stress",
+        "multilevel",
+        "cpu-spring",
+    ] {
         let d = by_id
             .get(id)
             .unwrap_or_else(|| panic!("ListEngines missing known engine {id:?}"));
