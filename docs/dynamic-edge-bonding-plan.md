@@ -121,7 +121,25 @@ attraction** (you get droplets). Closure needs a **rim LINE-TENSION** and/or ben
    ball-vs-shell-blind closure metric reads as "closed"). The CAPABILITY + DETECTOR are
    validated on the seeded disk + the hysteresis loop; spontaneity is logged as not reached.
 4. **P4 — GPU port**: sort-based atomics-free grid build, stream-compacted edge buffer, share
-   the grid with Barnes-Hut; benchmark O(n) scaling toward ~1M.
+   the grid with Barnes-Hut; benchmark O(n) scaling toward ~1M. **LANDED.** WGSL
+   `shaders/geometric_bonding.wgsl` + driver `engines/geometric_bonding_gpu.rs`. The device runs
+   the parallel work — the O(n) cell hash (`calc_hash`) and the O(n·27) candidate scan over the
+   3×3×3 neighbour-cell stencil (`scan_candidates`, sort-based uniform grid, **no f32/u32
+   atomics**). The host does the inherently-serial counting sort (`radix/counting-sort →
+   findCellStart`, kept host-side so it is exactly reproducible), the hysteretic break of
+   over-stretched bonds, and the conflict-free valence-cap accept/reject (one deterministic pass
+   over the sorted candidate keys — the WebGPU-safe pattern, design §2.4). A companion
+   `spring_step` kernel relaxes a seeded bond config (the dynamic-edge harmonic spring) on GPU.
+   CPU↔GPU **equivalence gate** (`tests/geometric_solver.rs`, `p4_*`): the same frozen configs /
+   canaries produce the *same* canonical bond set (uncapped P1, valence-2 cap, class
+   compatibility, multi-rebuild hysteresis) and a valence-2 bonded chain relaxes to the same
+   nearest-neighbour spacing (→ r_bond) on both backends. GPU tests SKIP cleanly (loudly) with no
+   wgpu adapter. **CPU-only (gated, logged honestly):** the per-step *integration* of GPU bonds
+   into `GeometricGpuEngine::step` (the single-shader force pass would need a dynamic-CSR rebuild
+   each rebuild) is NOT yet wired — P4 ports + validates the bonding STAGE and the dynamic-edge
+   spring as standalone, equivalence-gated GPU pipelines; the full in-engine GPU self-assembly
+   loop (and grid-sharing with Barnes-Hut) is the next increment. The angle/line-tension/curvature
+   *bond* terms remain CPU-only on the GPU path for now.
 5. **P5 — UI + tvix presets** (ties to the YAML-state + tvix-generator features): the lipid →
    sheet → tube → sphere example states that now actually CLOSE.
 

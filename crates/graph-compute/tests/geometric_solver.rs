@@ -28,11 +28,12 @@
 //!      or complexity regression trips the test without it being timing-flaky.
 
 use graph_compute::engines::geometric::{
-    AssemblyObservables, CoordinationSource, DirectorSource, GeometricEngine, GeometricSettings,
-    MassSource,
+    AssemblyObservables, ClassSource, CoordinationSource, DirectorSource, GeometricEngine,
+    GeometricSettings, MassSource,
 };
 use graph_compute::engines::{
-    CsrShard, EngineCtx, GeometricGpuEngine, GraphAttributes, LayoutEngine,
+    gpu_candidate_pairs, gpu_dynamic_bonds, gpu_relax_bonds, CsrShard, EngineCtx,
+    GeometricGpuEngine, GraphAttributes, LayoutEngine,
 };
 use graph_compute::sim::CsrGraph;
 use std::time::{Duration, Instant};
@@ -4404,3 +4405,358 @@ fn p3_spontaneous_closure_from_a_soup_is_logged_honestly() {
     );
 }
 
+
+// ---------------------------------------------------------------------------
+// PHASE P4 — GPU port of the bonding stage + CPU<->GPU equivalence
+// ---------------------------------------------------------------------------
+//
+// P4 ports the dynamic-edge (self-assembly) bonding STAGE to GPU (WGSL +
+// wgpu), atomics-free and deterministic (`docs/dynamic-edge-bonding-plan.md`
+// §1/§4). The device runs the embarrassingly-parallel work — the O(n) cell hash
+// (`calc_hash`) and the O(n·27) candidate scan over the 3×3×3 neighbour-cell
+// stencil (`scan_candidates`, sort-based uniform grid, no f32/u32 atomics). The
+// host does the inherently-serial counting sort (the design's
+// `radix/counting-sort → findCellStart`), the hysteretic break of over-stretched
+// bonds, and the conflict-free valence-cap accept/reject (one deterministic pass
+// over the sorted candidate keys — the WebGPU-safe pattern). A companion
+// `spring_step` kernel relaxes a seeded bond config on the GPU.
+//
+// The EQUIVALENCE GATE (solved-case style): the SAME frozen configs / canaries
+// must produce the SAME bond set (closed-form distances / coordination histogram /
+// candidate pairs) on CPU and GPU, within tolerance (for the bond SET: exact
+// match — both backends apply the identical create/break/cap rule). Every GPU
+// test SKIPS CLEANLY (loudly) when no wgpu adapter is present.
+
+/// CPU bond set for a frozen configuration: one bond stage on the seed geometry
+/// (no motion — `bond_stiffness = 0`, `max_step = 0`, `temperature = 0`), via the
+/// public `run_bond_stage_for_test` hook. The per-node `classes` are injected via
+/// [`GraphAttributes`] + [`ClassSource::Injected`] so the CPU engine resolves the
+/// EXACT same per-node class ids the GPU bond stage is handed — otherwise the CPU
+/// would default to `ClassSource::Uniform` (all class 0) and class-compatibility
+/// equivalence would be meaningless. Returns the canonical bonds, sorted.
+fn cpu_frozen_bonds(settings: &GeometricSettings, pos: &[f32], classes: &[u32]) -> Vec<(u32, u32)> {
+    let n = pos.len() / 3;
+    let mut settings = settings.clone();
+    settings.class_source = ClassSource::Injected;
+    let attrs = GraphAttributes {
+        node_class: Some(classes.to_vec()),
+        ..Default::default()
+    };
+    let mut e = GeometricEngine::new();
+    e.set_params(&serde_json::to_value(&settings).unwrap()).unwrap();
+    let mut ctx = EngineCtx::cpu_only();
+    let g = no_edges(n);
+    e.init(&mut ctx, &CsrShard::whole_with_attributes(&g, &attrs), pos)
+        .unwrap();
+    e.run_bond_stage_for_test();
+    let mut b = e.dynamic_bonds().unwrap();
+    b.sort_unstable();
+    b
+}
+
+/// A frozen-bond settings template (no spring motion) so the bond stage runs on
+/// the exact seed geometry on both backends.
+fn frozen_bond_settings() -> GeometricSettings {
+    GeometricSettings {
+        edge_stiffness: 0.0,
+        angle_stiffness: 0.0,
+        exclusion_strength: 0.0,
+        well_depth: 0.0,
+        gravity: 0.0,
+        temperature: 0.0,
+        bonding_enabled: true,
+        bond_stiffness: 0.0,
+        bond_every: 1,
+        max_step: 0.0,
+        ..GeometricSettings::default()
+    }
+}
+
+#[test]
+fn p4_gpu_grid_candidates_match_brute() {
+    // The sort-based uniform grid (calc_hash → host counting-sort → cell_start →
+    // scan_candidates) must emit EXACTLY the in-range candidate pairs the O(n²)
+    // brute scan would, on a frozen disordered cloud — the GPU grid-build oracle.
+    let mut ctx = EngineCtx::try_new_gpu();
+    let Some(gpu) = ctx.gpu.take() else {
+        eprintln!("SKIP p4_gpu_grid_candidates_match_brute: no wgpu adapter");
+        return;
+    };
+    eprintln!("p4 grid: adapter backend = {:?}", gpu.adapter_info.backend);
+
+    let n = 400usize;
+    let pos = soup_seed(n, 8.0, 0xEEE_1234);
+    let classes = vec![0u32; n];
+    let r_bond = 1.0f32;
+    let r_break = 1.4f32;
+
+    let gpu_pairs = gpu_candidate_pairs(&gpu, &frozen_bond_settings(), &pos, &classes, r_break, r_bond * r_bond);
+
+    // Brute reference: every unordered pair within r_bond (no class matrix ⇒ all
+    // compatible), canonical + sorted.
+    let r2 = r_bond * r_bond;
+    let mut brute: Vec<(u32, u32)> = Vec::new();
+    for i in 0..n {
+        for j in (i + 1)..n {
+            let dx = pos[3 * j] - pos[3 * i];
+            let dy = pos[3 * j + 1] - pos[3 * i + 1];
+            let dz = pos[3 * j + 2] - pos[3 * i + 2];
+            if dx * dx + dy * dy + dz * dz <= r2 {
+                brute.push((i as u32, j as u32));
+            }
+        }
+    }
+    brute.sort_unstable();
+    eprintln!("p4 grid: {} gpu candidates vs {} brute", gpu_pairs.len(), brute.len());
+    assert_eq!(
+        gpu_pairs, brute,
+        "GPU sort-based grid candidate set must equal the O(n²) brute in-range set"
+    );
+}
+
+#[test]
+fn p4_gpu_bonds_match_cpu_uncapped() {
+    // EQUIVALENCE (P1, uncapped): the full GPU bond stage (grid + candidate scan +
+    // create) must produce the SAME canonical bond set as the CPU bond stage on the
+    // same frozen soup. No valence cap, no class matrix — the bare add path.
+    let mut ctx = EngineCtx::try_new_gpu();
+    let Some(gpu) = ctx.gpu.take() else {
+        eprintln!("SKIP p4_gpu_bonds_match_cpu_uncapped: no wgpu adapter");
+        return;
+    };
+    let n = 300usize;
+    let pos = soup_seed(n, 6.0, 0xB0_1D_F00D);
+    let classes = vec![0u32; n];
+    let mut s = frozen_bond_settings();
+    s.r_bond = 1.1;
+    s.r_break = 1.5;
+
+    let cpu = cpu_frozen_bonds(&s, &pos, &classes);
+    let gpu_bonds = gpu_dynamic_bonds(&gpu, &s, &pos, &classes, &[]);
+    eprintln!("p4 uncapped: cpu {} bonds, gpu {} bonds", cpu.len(), gpu_bonds.len());
+    assert_eq!(gpu_bonds, cpu, "GPU and CPU bond sets must be identical (uncapped P1)");
+    assert!(!cpu.is_empty(), "the soup must actually form bonds (non-trivial test)");
+}
+
+#[test]
+fn p4_gpu_bonds_match_cpu_valence_capped() {
+    // EQUIVALENCE (P2, conflict-free valence cap): the GPU accept/reject (sorted
+    // candidate keys + per-node counters, host-serial, no atomics) must select the
+    // SAME bonds as the CPU under a valence-2 cap. This is the WebGPU-safe cap
+    // pattern's correctness gate — a different accept order would diverge.
+    let mut ctx = EngineCtx::try_new_gpu();
+    let Some(gpu) = ctx.gpu.take() else {
+        eprintln!("SKIP p4_gpu_bonds_match_cpu_valence_capped: no wgpu adapter");
+        return;
+    };
+    let n = 300usize;
+    let pos = soup_seed(n, 5.0, 0xCA9_F00D);
+    let classes = vec![0u32; n];
+    let mut s = frozen_bond_settings();
+    s.r_bond = 1.2;
+    s.r_break = 1.6;
+    s.default_max_valence = 2; // chains: every node ≤ 2 bonds
+
+    let cpu = cpu_frozen_bonds(&s, &pos, &classes);
+    let gpu_bonds = gpu_dynamic_bonds(&gpu, &s, &pos, &classes, &[]);
+
+    // HARD cap: neither backend exceeds valence 2.
+    let max_deg = |b: &[(u32, u32)]| -> u32 {
+        let mut d = vec![0u32; n];
+        for &(a, c) in b { d[a as usize] += 1; d[c as usize] += 1; }
+        d.iter().copied().max().unwrap_or(0)
+    };
+    eprintln!(
+        "p4 capped: cpu {} bonds (max deg {}), gpu {} bonds (max deg {})",
+        cpu.len(), max_deg(&cpu), gpu_bonds.len(), max_deg(&gpu_bonds)
+    );
+    assert!(max_deg(&gpu_bonds) <= 2, "GPU valence-2 cap exceeded");
+    assert_eq!(gpu_bonds, cpu, "GPU and CPU bond sets must be identical under a valence-2 cap");
+    assert!(!cpu.is_empty(), "the capped soup must still form bonds");
+}
+
+#[test]
+fn p4_gpu_bonds_match_cpu_class_compatibility() {
+    // EQUIVALENCE (class compatibility): with a 2×2 affinity matrix where only
+    // class 0↔1 attract (off-diagonal +1, diagonal −1), GPU and CPU must bond the
+    // SAME cross-class pairs and skip the SAME same-class pairs.
+    let mut ctx = EngineCtx::try_new_gpu();
+    let Some(gpu) = ctx.gpu.take() else {
+        eprintln!("SKIP p4_gpu_bonds_match_cpu_class_compatibility: no wgpu adapter");
+        return;
+    };
+    let n = 300usize;
+    let pos = soup_seed(n, 5.0, 0x0A11_17E);
+    // Alternate classes so cross-class neighbours exist throughout the cloud.
+    let classes: Vec<u32> = (0..n).map(|i| (i % 2) as u32).collect();
+    let mut s = frozen_bond_settings();
+    s.r_bond = 1.3;
+    s.r_break = 1.7;
+    // Only 0↔1 attract (> 0 ⇒ may bond); same-class repel (≤ 0 ⇒ incompatible).
+    s.class_affinity = vec![-1.0, 1.0, 1.0, -1.0];
+    s.class_affinity_dim = 2;
+
+    let cpu = cpu_frozen_bonds(&s, &pos, &classes);
+    let gpu_bonds = gpu_dynamic_bonds(&gpu, &s, &pos, &classes, &[]);
+    // Every GPU bond must be a cross-class pair (the compatibility rule).
+    for &(a, b) in &gpu_bonds {
+        assert_ne!(classes[a as usize], classes[b as usize], "GPU bonded an incompatible same-class pair");
+    }
+    eprintln!("p4 class-compat: cpu {} bonds, gpu {} bonds", cpu.len(), gpu_bonds.len());
+    assert_eq!(gpu_bonds, cpu, "GPU and CPU class-compatible bond sets must be identical");
+    assert!(!cpu.is_empty(), "cross-class pairs must form bonds");
+}
+
+#[test]
+fn p4_gpu_bond_hysteresis_matches_cpu_over_a_trajectory() {
+    // EQUIVALENCE (hysteresis / break): bonds must persist between r_bond and
+    // r_break and break only past r_break, IDENTICALLY on both backends across a
+    // multi-rebuild trajectory. We drive the CPU engine (which moves under its
+    // spring) and, at each rebuild, recompute the GPU bond set from the CPU's
+    // current positions seeded with the CPU's PRIOR bond set — both backends see
+    // the same geometry + the same prior bonds, so they must agree step for step.
+    let mut ctx = EngineCtx::try_new_gpu();
+    let Some(gpu) = ctx.gpu.take() else {
+        eprintln!("SKIP p4_gpu_bond_hysteresis_matches_cpu_over_a_trajectory: no wgpu adapter");
+        return;
+    };
+    let n = 200usize;
+    let pos0 = soup_seed(n, 4.0, 0x4444_2222);
+    let classes = vec![0u32; n];
+    let mut s = GeometricSettings {
+        edge_stiffness: 0.0,
+        angle_stiffness: 0.0,
+        exclusion_strength: 1.0,
+        default_radius: 0.5,
+        well_depth: 1.0,
+        well_width: 1.0,
+        gravity: 0.05,
+        damping: 0.9,
+        time_step: 0.4,
+        max_step: 0.5,
+        temperature: 0.0, // deterministic motion for a reproducible trajectory
+        bonding_enabled: true,
+        r_bond: 1.1,
+        r_break: 1.5,
+        bond_stiffness: 0.3,
+        bond_every: 1,
+        default_max_valence: 3,
+        ..GeometricSettings::default()
+    };
+    s.rng_seed = 0xABCD;
+
+    let mut cpu_ctx = EngineCtx::cpu_only();
+    let mut e = GeometricEngine::new();
+    e.set_params(&serde_json::to_value(&s).unwrap()).unwrap();
+    e.init(&mut cpu_ctx, &CsrShard::whole(&no_edges(n)), &pos0).unwrap();
+
+    let mut prior_gpu_bonds: Vec<(u32, u32)> = Vec::new();
+    let mut checks = 0usize;
+    for step in 0..40 {
+        // Snapshot the CPU positions BEFORE this step's bond stage so the GPU sees
+        // the exact geometry the CPU bond stage will run on, and seed the GPU with
+        // the bonds the CPU carried INTO this step (its prior dynamic edges).
+        let pre_pos = current_positions(&e);
+        let cpu_prior = e.dynamic_bonds().unwrap();
+        let gpu_bonds = gpu_dynamic_bonds(&gpu, &s, &pre_pos, &classes, &cpu_prior);
+
+        // Advance the CPU one step (runs its own bond stage on `pre_pos`, then
+        // integrates) and read back the bonds it produced this step.
+        e.step(&mut cpu_ctx);
+        let mut cpu_bonds = e.dynamic_bonds().unwrap();
+        cpu_bonds.sort_unstable();
+
+        assert_eq!(
+            gpu_bonds, cpu_bonds,
+            "step {step}: GPU and CPU bond sets diverged (hysteresis/cap mismatch)"
+        );
+        // Sanity: the bond set is actually churning (not trivially empty/static).
+        if gpu_bonds != prior_gpu_bonds {
+            checks += 1;
+        }
+        prior_gpu_bonds = gpu_bonds;
+    }
+    eprintln!("p4 hysteresis: bond set agreed for 40 steps, changed on {checks} of them");
+    assert!(checks >= 3, "the trajectory must exercise real create/break churn, not a static set");
+}
+
+#[test]
+fn p4_cpu_gpu_relax_a_bonded_chain_to_same_geometry() {
+    // SOLVED-CASE EQUIVALENCE: a valence-2 bonded chain (the morphology ladder's
+    // first rung) relaxed by the dynamic-edge spring must reach the SAME
+    // nearest-neighbour spacing (→ r_bond rest length) on CPU and GPU. Distances
+    // are rotation/translation-invariant, so this is a clean backend oracle.
+    let mut ctx = EngineCtx::try_new_gpu();
+    let Some(gpu) = ctx.gpu.take() else {
+        eprintln!("SKIP p4_cpu_gpu_relax_a_bonded_chain_to_same_geometry: no wgpu adapter");
+        return;
+    };
+    let n = 12usize;
+    let r_bond = 1.0f32;
+    // A straight chain laid out at 0.85·r_bond spacing (inside r_bond=1.0 so the
+    // bond stage links consecutive beads) — the dynamic-edge spring then pushes
+    // them out to the rest length r_bond. (Non-consecutive beads are >r_bond apart
+    // so only the chain edges form.)
+    let spacing = 0.85f32;
+    let mut pos = vec![0.0f32; 3 * n];
+    for i in 0..n {
+        pos[3 * i] = i as f32 * spacing;
+    }
+    let classes = vec![0u32; n];
+    let mut s = GeometricSettings {
+        edge_stiffness: 0.0,
+        angle_stiffness: 0.0,
+        exclusion_strength: 0.0,
+        well_depth: 0.0,
+        gravity: 0.0,
+        temperature: 0.0,
+        bonding_enabled: true,
+        r_bond,
+        r_break: 1.5,
+        bond_stiffness: 0.3,
+        bond_every: 1,
+        max_step: 0.5,
+        damping: 0.9,
+        time_step: 1.0,
+        default_max_valence: 2, // chain
+        ..GeometricSettings::default()
+    };
+    s.rng_seed = 1;
+
+    // The bond stage forms the chain edges on the frozen seed (both backends agree
+    // on this set — covered by the equivalence tests above); take that set once.
+    let bonds = gpu_dynamic_bonds(&gpu, &s, &pos, &classes, &[]);
+    // Each interior bead has 2 bonds; ends have 1. n-1 bonds in a chain.
+    assert_eq!(bonds.len(), n - 1, "a valence-2 chain seed should bond consecutive beads");
+
+    // --- CPU relax: drive the engine with the SAME static bond set by running the
+    // full engine (its bond stage reforms the identical chain each step). ---
+    let mut cpu_ctx = EngineCtx::cpu_only();
+    let mut e = GeometricEngine::new();
+    e.set_params(&serde_json::to_value(&s).unwrap()).unwrap();
+    e.init(&mut cpu_ctx, &CsrShard::whole(&no_edges(n)), &pos).unwrap();
+    const STEPS: usize = 400;
+    for _ in 0..STEPS {
+        e.step(&mut cpu_ctx);
+    }
+    let cpu_pos = current_positions(&e);
+
+    // --- GPU relax: the spring_step kernel over the same bond set. ---
+    let gpu_pos = gpu_relax_bonds(&gpu, &s, &pos, &bonds, STEPS);
+
+    // Compare nearest-neighbour spacings (rotation/translation invariant). Both
+    // should relax toward r_bond.
+    let mean_spacing = |p: &[f32]| -> f32 {
+        let mut tot = 0.0f32;
+        for &(a, b) in &bonds {
+            tot += dist(p, a as usize, b as usize);
+        }
+        tot / bonds.len() as f32
+    };
+    let cpu_s = mean_spacing(&cpu_pos);
+    let gpu_s = mean_spacing(&gpu_pos);
+    eprintln!("p4 chain relax: cpu spacing {cpu_s:.4}, gpu spacing {gpu_s:.4}, r_bond {r_bond}");
+    approx("cpu bonded-chain spacing relaxes to r_bond", cpu_s, r_bond, 0.05);
+    approx("gpu bonded-chain spacing relaxes to r_bond", gpu_s, r_bond, 0.05);
+    approx("cpu↔gpu bonded-chain spacing equivalence", gpu_s, cpu_s, 0.02);
+}
