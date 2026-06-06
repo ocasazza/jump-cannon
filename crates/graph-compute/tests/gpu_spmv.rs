@@ -5,7 +5,7 @@
 //! PageRank pull-step expressed as an SpMV matches the analytic. Gates on a
 //! real adapter (Metal locally; lavapipe in CI).
 
-use graph_compute::analytics::{cpu_spmv, gpu_spmv, WeightedCsr};
+use graph_compute::analytics::{cpu_spmv, gpu_spmv, gpu_spmv_f16, WeightedCsr};
 use proptest::prelude::*;
 
 mod common;
@@ -56,6 +56,47 @@ fn small_known_matrix() {
     assert!((y[0] - 5.0).abs() < 1e-5, "{}", y[0]);
     assert!((y[1] - 6.0).abs() < 1e-5, "{}", y[1]);
     assert!((y[2] - 13.0).abs() < 1e-5, "{}", y[2]);
+}
+
+#[test]
+fn f16_matches_f32_within_tolerance() {
+    let Some(ctx) = common::gpu_ctx_or_skip("spmv_f16") else {
+        return;
+    };
+    // Packed-f16 (unpack2x16float) works on any adapter — no device feature.
+    let a = WeightedCsr {
+        n_nodes: 3,
+        offsets: vec![0, 2, 3, 5],
+        neighbors: vec![0, 2, 1, 0, 2],
+        weights: vec![2.0, 1.0, 3.0, 1.0, 4.0],
+    };
+    let x = vec![1.0, 2.0, 3.0]; // exact in f16
+                                 // Expected (f32): [5, 6, 13]; f16 storage of these small exact values is lossless.
+    let y = gpu_spmv_f16(&ctx, &a, &x).expect("gpu spmv f16");
+    let cpu = cpu_spmv(&a, &x);
+    for (g, c) in y.iter().zip(cpu.iter()) {
+        assert!((g - c).abs() < 1e-2, "f16 {g} vs f32 {c}");
+    }
+
+    // Fractional, non-f16-exact values to actually exercise the rounding path.
+    let af = WeightedCsr {
+        n_nodes: 4,
+        offsets: vec![0, 2, 4, 6, 8],
+        neighbors: vec![1, 3, 0, 2, 1, 3, 0, 2],
+        weights: vec![0.1, 0.7, 0.3333, 0.9, 0.123, 0.456, 0.789, 0.246],
+    };
+    let xf = vec![0.31, 1.27, -0.55, 2.01];
+    let yf = gpu_spmv_f16(&ctx, &af, &xf).expect("gpu spmv f16 frac");
+    let cpuf = cpu_spmv(&af, &xf);
+    let max_dev = yf
+        .iter()
+        .zip(cpuf.iter())
+        .map(|(g, c)| (g - c).abs())
+        .fold(0.0f32, f32::max);
+    // f16 rounds to ~3 sig figs; products of unit-scale values stay within ~3e-2.
+    assert!(max_dev < 3e-2, "f16 deviation {max_dev} too large");
+    // ...but it IS lossy — not bit-identical to f32 (sanity that f16 is in play).
+    assert!(max_dev > 0.0, "expected some f16 rounding error");
 }
 
 proptest! {

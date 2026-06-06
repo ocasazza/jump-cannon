@@ -115,10 +115,9 @@ fn build_gpu_ctx() -> anyhow::Result<GpuCtx> {
     // Vulkan) and let `WGPU_BACKEND` override it. `HighPerformance` prefers the
     // discrete GPU when an integrated one is also present (e.g. NVIDIA/AMD over
     // an iGPU); `WGPU_POWER_PREF` can override.
-    let backends =
-        wgpu::util::backend_bits_from_env().unwrap_or_else(wgpu::Backends::all);
-    let power_preference = wgpu::util::power_preference_from_env()
-        .unwrap_or(wgpu::PowerPreference::HighPerformance);
+    let backends = wgpu::util::backend_bits_from_env().unwrap_or_else(wgpu::Backends::all);
+    let power_preference =
+        wgpu::util::power_preference_from_env().unwrap_or(wgpu::PowerPreference::HighPerformance);
 
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
         backends,
@@ -136,6 +135,10 @@ fn build_gpu_ctx() -> anyhow::Result<GpuCtx> {
     let (device, queue) = pollster::block_on(adapter.request_device(
         &wgpu::DeviceDescriptor {
             label: Some("graph-compute-device"),
+            // Note: native WGSL f16 (`enable f16;` / SHADER_F16) is not yet
+            // implemented by Naga in wgpu 23, so we don't request it. The f16
+            // SpMV variant instead packs two halves per u32 and decodes with the
+            // core `unpack2x16float` builtin — no device feature needed.
             required_features: wgpu::Features::empty(),
             required_limits: wgpu::Limits {
                 max_storage_buffers_per_shader_stage: 12,

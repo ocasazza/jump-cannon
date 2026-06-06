@@ -2,15 +2,19 @@
 //! unifying primitive the graph analytics reduce to (PageRank, CC, BFS are all
 //! this SpMV with different semirings). Hardware-agnostic (Metal/Vulkan/DX12).
 //!
-//! Values accumulate in **f32**. The f16-storage variant (half-precision
-//! `weights`/`x`, f32 accumulate — the real memory win for weighted
-//! chemical-sim matrices) is gated behind `wgpu::Features::SHADER_F16` and is a
-//! follow-up; this f32 primitive is the foundation + the correctness oracle for
-//! it.
+//! Two value precisions:
+//!   - [`gpu_spmv`] — f32 storage + f32 accumulate (the foundation + oracle).
+//!   - [`gpu_spmv_f16`] — f16 *storage* (half the footprint — the win for large
+//!     weighted matrices like chemical-sim graphs), f32 *accumulate*. Stored as
+//!     two halves per u32 + decoded with the core `unpack2x16float` builtin, so
+//!     it needs no `SHADER_F16` device feature (which Naga doesn't implement in
+//!     wgpu 23 anyway). This is the `Vec<precision>` knob — on the *weighted*
+//!     primitive, not PageRank's ranks (which underflow f16 at scale).
 
 use std::borrow::Cow;
 
 use bytemuck::{Pod, Zeroable};
+use half::f16;
 use wgpu::util::DeviceExt;
 
 use crate::engines::EngineCtx;
@@ -57,6 +61,27 @@ fn storage_f32(device: &wgpu::Device, label: &str, data: &[f32], copy_src: bool)
         contents: bytemuck::cast_slice(bytes),
         usage,
     })
+}
+
+/// Pack f32 values to f16 stored two-per-u32 (low 16 bits = even index, high =
+/// odd), matching the shader's `unpack2x16float(packed[i>>1])[i&1]` decode.
+fn pack_f16_pairs(vals: &[f32]) -> Vec<u32> {
+    let mut out = Vec::with_capacity(vals.len().div_ceil(2).max(1));
+    let mut i = 0;
+    while i < vals.len() {
+        let lo = f16::from_f32(vals[i]).to_bits() as u32;
+        let hi = if i + 1 < vals.len() {
+            f16::from_f32(vals[i + 1]).to_bits() as u32
+        } else {
+            0
+        };
+        out.push(lo | (hi << 16));
+        i += 2;
+    }
+    if out.is_empty() {
+        out.push(0);
+    }
+    out
 }
 
 /// CPU reference SpMV — the test oracle + no-GPU fallback.
@@ -250,6 +275,195 @@ pub fn gpu_spmv(ctx: &EngineCtx, a: &WeightedCsr, x: &[f32]) -> Result<Vec<f32>,
     rx.recv()
         .map_err(|e| format!("spmv readback channel: {e}"))?
         .map_err(|e| format!("spmv readback map: {e:?}"))?;
+    let data = slice.get_mapped_range();
+    let out: Vec<f32> = bytemuck::cast_slice::<u8, f32>(&data).to_vec();
+    drop(data);
+    readback.unmap();
+    Ok(out)
+}
+
+/// Half-precision `y = A·x`: `weights` and `x` are stored as **f16** (half the
+/// footprint — the win for large weighted matrices) packed two-per-u32 and
+/// decoded in-shader via `unpack2x16float`, while products accumulate in
+/// **f32**. Works on any wgpu adapter (no SHADER_F16 device feature — that
+/// path is unimplemented in Naga on wgpu 23). Results match the f32 path to
+/// within f16 rounding (~1e-2 for unit-scale values), not exactly — that's the
+/// precision/footprint trade.
+pub fn gpu_spmv_f16(ctx: &EngineCtx, a: &WeightedCsr, x: &[f32]) -> Result<Vec<f32>, String> {
+    let gpu = ctx
+        .gpu
+        .as_ref()
+        .ok_or_else(|| "gpu_spmv_f16 requires a wgpu device".to_string())?;
+    let device = gpu.device.clone();
+    let queue = gpu.queue.clone();
+
+    let n = a.n_nodes as usize;
+    if n == 0 {
+        return Ok(Vec::new());
+    }
+    if a.offsets.len() != n + 1 {
+        return Err(format!(
+            "offsets length {} != n + 1 ({})",
+            a.offsets.len(),
+            n + 1
+        ));
+    }
+    if a.neighbors.len() != a.weights.len() {
+        return Err(format!(
+            "neighbors ({}) and weights ({}) length mismatch",
+            a.neighbors.len(),
+            a.weights.len()
+        ));
+    }
+    if x.len() != n {
+        return Err(format!("x length {} != n ({n})", x.len()));
+    }
+
+    let weights_packed = pack_f16_pairs(&a.weights);
+    let x_packed = pack_f16_pairs(x);
+
+    let offsets_buf = storage_u32(&device, "spmv16_offsets", &a.offsets);
+    let neighbors_buf = storage_u32(&device, "spmv16_neighbors", &a.neighbors);
+    let weights_buf = storage_u32(&device, "spmv16_weights", &weights_packed);
+    let x_buf = storage_u32(&device, "spmv16_x", &x_packed);
+    let y_buf = storage_f32(&device, "spmv16_y", &vec![0.0f32; n], true);
+
+    let params = ParamsRaw {
+        n: n as u32,
+        _p0: 0,
+        _p1: 0,
+        _p2: 0,
+    };
+    let params_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("spmv16_params"),
+        contents: bytemuck::bytes_of(&params),
+        usage: wgpu::BufferUsages::UNIFORM,
+    });
+
+    let y_bytes = (n * std::mem::size_of::<f32>()) as u64;
+    let readback = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("spmv16_readback"),
+        size: y_bytes,
+        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+
+    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("spmv16_shader"),
+        source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(include_str!("../shaders/spmv_f16.wgsl"))),
+    });
+
+    let storage_ro = |binding: u32| wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::COMPUTE,
+        ty: wgpu::BindingType::Buffer {
+            ty: wgpu::BufferBindingType::Storage { read_only: true },
+            has_dynamic_offset: false,
+            min_binding_size: None,
+        },
+        count: None,
+    };
+    let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("spmv16_bgl"),
+        entries: &[
+            storage_ro(0),
+            storage_ro(1),
+            storage_ro(2),
+            storage_ro(3),
+            wgpu::BindGroupLayoutEntry {
+                binding: 4,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only: false },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 5,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+        ],
+    });
+
+    let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+        label: Some("spmv16_pipeline"),
+        layout: Some(
+            &device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("spmv16_layout"),
+                bind_group_layouts: &[&bgl],
+                push_constant_ranges: &[],
+            }),
+        ),
+        module: &shader,
+        entry_point: Some("spmv_f16"),
+        compilation_options: Default::default(),
+        cache: None,
+    });
+
+    let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("spmv16_bg"),
+        layout: &bgl,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: offsets_buf.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: neighbors_buf.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: weights_buf.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: x_buf.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 4,
+                resource: y_buf.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 5,
+                resource: params_buf.as_entire_binding(),
+            },
+        ],
+    });
+
+    let workgroups = (n as u32).div_ceil(64).max(1);
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("spmv16_encoder"),
+    });
+    {
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: None,
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(&pipeline);
+        pass.set_bind_group(0, &bind_group, &[]);
+        pass.dispatch_workgroups(workgroups, 1, 1);
+    }
+    encoder.copy_buffer_to_buffer(&y_buf, 0, &readback, 0, y_bytes);
+    queue.submit(std::iter::once(encoder.finish()));
+
+    let slice = readback.slice(..);
+    let (tx, rx) = std::sync::mpsc::channel();
+    slice.map_async(wgpu::MapMode::Read, move |res| {
+        let _ = tx.send(res);
+    });
+    device.poll(wgpu::Maintain::Wait);
+    rx.recv()
+        .map_err(|e| format!("spmv16 readback channel: {e}"))?
+        .map_err(|e| format!("spmv16 readback map: {e:?}"))?;
     let data = slice.get_mapped_range();
     let out: Vec<f32> = bytemuck::cast_slice::<u8, f32>(&data).to_vec();
     drop(data);

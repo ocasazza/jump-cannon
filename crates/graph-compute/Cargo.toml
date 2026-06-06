@@ -35,6 +35,10 @@ tokio-stream       = { version = "0.1", features = ["sync"] }
 tracing            = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 bytemuck           = { version = "1", features = ["derive"] }
+# Half-precision (f16) packing for the SHADER_F16 SpMV storage variant. The
+# `bytemuck` feature makes `half::f16` Pod so it casts straight into a wgpu
+# buffer.
+half               = { version = "2", default-features = false, features = ["bytemuck"] }
 anyhow             = "1"
 async-stream       = "0.3"
 futures-core       = "0.3"
