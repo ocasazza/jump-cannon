@@ -122,6 +122,22 @@ pub(crate) fn draw_icon(painter: &egui::Painter, rect: egui::Rect, section: Sect
             }
             painter.circle_filled(center, 2.5, color);
         }
+        // Timeline: a scrub track (horizontal line) with a playhead knob and
+        // a play triangle — the transport metaphor.
+        Section::Timeline => {
+            let track_y = center.y + 4.0;
+            painter.line_segment(
+                [egui::pos2(center.x - 8.0, track_y), egui::pos2(center.x + 8.0, track_y)],
+                s,
+            );
+            painter.circle_filled(egui::pos2(center.x + 1.0, track_y), 2.2, color);
+            let tip = center + egui::vec2(4.0, -5.0);
+            let a = center + egui::vec2(-3.0, -8.0);
+            let b = center + egui::vec2(-3.0, -2.0);
+            painter.line_segment([a, b], s);
+            painter.line_segment([b, tip], s);
+            painter.line_segment([tip, a], s);
+        }
     }
 }
 

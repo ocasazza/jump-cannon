@@ -367,6 +367,23 @@ pub struct App {
     /// throttle the auto-snapshotter — bursts of per-frame slider
     /// drags coalesce into one entry per `SNAPSHOT_INTERVAL` window.
     last_snapshot_at: Option<web_time::Instant>,
+
+    // -- Scrubbable simulation timeline (Phase P3) --------------------------
+    //
+    // A bounded, delta-compressed ring of node-position frames captured from
+    // the live sim (the CPU mirror in `GraphPipelines::positions_cpu`). The
+    // Timeline section scrubs over this; while paused we push the selected
+    // buffered frame to the GPU via `set_positions`. Session-only — never
+    // persisted (the ring is large and meaningless across reloads).
+    frame_ring: crate::timeline::FrameRing,
+    /// Frame counter for the capture stride (`state.timeline.stride`).
+    timeline_capture_idx: u64,
+    /// Last (depth, stride) we configured the ring with, so a knob change
+    /// reconfigures the ring without rebuilding it every frame.
+    timeline_prev_knobs: Option<(usize, usize)>,
+    /// Last paused index we pushed to the GPU, so we only re-`set_positions`
+    /// when the scrub target actually moves (or a seek is flagged dirty).
+    timeline_pushed_idx: Option<usize>,
 }
 
 impl App {
@@ -639,6 +656,14 @@ impl App {
 
             snapshot_hash: None,
             last_snapshot_at: None,
+
+            // Ring built at the persisted/default depth + a 1-keyframe-every-8
+            // cadence (delta-compress 7 of every 8 frames). `tick_timeline`
+            // reconciles the depth/stride knobs each frame.
+            frame_ring: crate::timeline::FrameRing::new(300, 8),
+            timeline_capture_idx: 0,
+            timeline_prev_knobs: None,
+            timeline_pushed_idx: None,
         }
     }
 
@@ -1859,6 +1884,11 @@ impl eframe::App for App {
         // positions, if any, into the live GPU positions buffer.
         self.drain_seed_positions(frame);
 
+        // Scrubbable-timeline tick: capture live positions into the ring (when
+        // live) + push the scrubbed frame to the GPU (when paused). Runs after
+        // seed drain so a fresh seed lands before we capture this frame.
+        self.tick_timeline(frame);
+
         // Metrics panel: drain its one-shot compute flag (no-op unless the user
         // pressed Compute), reading positions/edges from the live pipeline.
         self.drain_metrics_request(frame);
@@ -1958,7 +1988,10 @@ impl eframe::App for App {
         let needs_continuous = !sim_settled
             || self.palette_state.open
             || !self.loaded_into_gpu
-            || self.cursor_force_active.abs() > 0.0;
+            || self.cursor_force_active.abs() > 0.0
+            // While paused-scrubbing we re-push the scrub frame each frame to
+            // hold the canvas against the still-running sim — keep repainting.
+            || self.state.timeline.is_paused();
         // Treat "any pointer activity this frame" as user input — force
         // an immediate next-frame repaint so input feels snappy even if
         // the warm-throttle below would otherwise slow us down.
@@ -2544,6 +2577,106 @@ impl App {
         self.prev_layout_key = Some(key);
         self.prev_active_layout_id = Some(active_id);
         self.prev_seed_mode = new_seed_mode;
+    }
+
+    /// Scrubbable-timeline tick (Phase P3). Runs every frame:
+    ///
+    /// 1. Reconcile the ring's depth with `state.timeline.depth` (a knob change
+    ///    evicts oldest frames immediately).
+    /// 2. Mirror the ring's frame count + byte budget into `state.timeline` so
+    ///    the section can size the scrub slider + render the readout.
+    /// 3. While **live**, capture the current CPU positions into the ring on the
+    ///    capture stride. While **paused**, do NOT capture — we freeze the
+    ///    visible buffer head so the user can scrub the existing history without
+    ///    the incoming stream sliding it out from under them. (The live sim
+    ///    keeps running on the GPU; we simply stop *consuming* it into the ring,
+    ///    keeping pause/resume simple + correct per the task constraint.)
+    /// 4. While **paused**, write the selected buffered frame to the GPU via
+    ///    `GraphPipelines::set_positions` so the canvas shows that moment. On
+    ///    resume, push the live head once so the canvas snaps back to "now".
+    fn tick_timeline(&mut self, frame: &mut eframe::Frame) {
+        // 1. Reconcile capture knobs.
+        let depth = self.state.timeline.depth.max(1);
+        let stride = self.state.timeline.stride.max(1);
+        if self.timeline_prev_knobs != Some((depth, stride)) {
+            self.frame_ring.set_depth(depth);
+            self.timeline_prev_knobs = Some((depth, stride));
+        }
+
+        if !self.loaded_into_gpu {
+            self.state.timeline.buffered_len = self.frame_ring.len();
+            self.state.timeline.buffered_bytes = self.frame_ring.approx_bytes();
+            return;
+        }
+
+        let paused = self.state.timeline.is_paused();
+
+        // 3. Capture from the live CPU position mirror (only while live).
+        if !paused {
+            self.timeline_capture_idx = self.timeline_capture_idx.wrapping_add(1);
+            if self.timeline_capture_idx % stride as u64 == 0 {
+                if let Some(wgpu_state) = frame.wgpu_render_state() {
+                    let renderer = wgpu_state.renderer.read();
+                    if let Some(pipes) = renderer.callback_resources.get::<GraphPipelines>() {
+                        let positions = pipes.positions_cpu();
+                        if !positions.is_empty() {
+                            self.frame_ring.push(positions);
+                        }
+                    }
+                }
+            }
+        }
+
+        // 2. Mirror buffer stats back for the section UI.
+        self.state.timeline.buffered_len = self.frame_ring.len();
+        self.state.timeline.buffered_bytes = self.frame_ring.approx_bytes();
+
+        // 4. Apply a scrubbed frame to the GPU.
+        //
+        // While paused we re-push the selected frame EVERY frame. The GPU sim
+        // is still stepping (`compute_step` always runs), so `set_positions`
+        // both holds the canvas on the scrub frame and re-seeds the layout from
+        // it — without this the sim would drift away from the frozen frame
+        // between pushes. This is the simple+correct first slice; a future
+        // "halt the layout while paused" optimization avoids the per-frame
+        // re-init for large graphs.
+        let seek_dirty = std::mem::take(&mut self.state.timeline.seek_dirty);
+        if paused {
+            let max = self.frame_ring.len().saturating_sub(1);
+            let idx = self.state.timeline.current_idx().min(max);
+            if self.frame_ring.len() > 0 {
+                if let Some(positions) = self.frame_ring.get(idx) {
+                    self.push_positions_to_gpu(frame, &positions);
+                    self.timeline_pushed_idx = Some(idx);
+                }
+            }
+            let _ = seek_dirty; // paused path always pushes; flag is irrelevant
+        } else {
+            // Live: if we just resumed from a paused scrub, snap the canvas
+            // back to the newest buffered frame so the visible state matches
+            // the still-running sim instead of the frozen scrub frame.
+            if seek_dirty {
+                if let Some(positions) = self.frame_ring.latest() {
+                    self.push_positions_to_gpu(frame, &positions);
+                }
+            }
+            self.timeline_pushed_idx = None;
+        }
+    }
+
+    /// Write an absolute position frame straight into the live GPU positions
+    /// buffer via `GraphPipelines::set_positions`. Shared by the timeline scrub
+    /// path; mirrors `drain_seed_positions`'s wgpu access pattern.
+    fn push_positions_to_gpu(&mut self, frame: &mut eframe::Frame, positions: &[f32]) {
+        let Some(wgpu_state) = frame.wgpu_render_state() else { return };
+        let device = wgpu_state.device.clone();
+        let queue = wgpu_state.queue.clone();
+        let mut renderer = wgpu_state.renderer.write();
+        if let Some(pipes) = renderer.callback_resources.get_mut::<GraphPipelines>() {
+            if let Err(e) = pipes.set_positions(&device, &queue, positions) {
+                log::warn!("[graph-renderer] timeline scrub set_positions: {e}");
+            }
+        }
     }
 
     /// Drain the Initial-seed section's one-shot: if the user applied a seed

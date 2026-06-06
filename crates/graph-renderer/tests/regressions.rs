@@ -945,3 +945,154 @@ fn query_clear_all_filters_empties_active() {
         "is_filter_active must report false after clear_all_filters",
     );
 }
+
+// ---------------------------------------------------------------------------
+// Timeline scrub controls (Phase P3)
+// ---------------------------------------------------------------------------
+//
+// The Timeline section renders transport controls (play/pause/step) + a scrub
+// slider over the buffered frame range. These headless tests drive the egui
+// pass and assert the controls exist and mutate `state.timeline.scrub`. The
+// ring-buffer reconstruct logic is unit-tested separately in
+// `graph_renderer::timeline::tests`.
+
+use graph_renderer::timeline::ScrubState;
+
+/// Build a one-shot harness that renders the Timeline section against `state`,
+/// then return it. Wraps the shared `sections::show` call the same way test 2
+/// does so the section's accessible widgets are queryable.
+fn timeline_harness<'a>(
+    state: &'a mut AppState,
+    registry: &'a mut ActionRegistry,
+    layout_registry: &'a LayoutRegistry,
+    perf: &'a PerfCollector,
+) -> Harness<'a> {
+    Harness::builder()
+        .with_size(egui::vec2(360.0, 520.0))
+        .build(|ctx| {
+            egui::SidePanel::left("timeline-test")
+                .exact_width(340.0)
+                .show(ctx, |ui| {
+                    sections::show(
+                        ui,
+                        Section::Timeline,
+                        state,
+                        registry,
+                        layout_registry,
+                        perf,
+                    );
+                });
+        })
+}
+
+#[test]
+fn timeline_pause_toggles_scrub_state() {
+    let mut state = AppState::default();
+    // Simulate a filled ring so the transport controls render.
+    state.timeline.buffered_len = 50;
+    let mut registry = ActionRegistry::new();
+    let layout_registry = LayoutRegistry::seed_default();
+    let perf = PerfCollector::default();
+
+    assert_eq!(
+        state.timeline.scrub,
+        ScrubState::Live,
+        "precondition: a fresh timeline starts Live"
+    );
+
+    {
+        let mut h = timeline_harness(&mut state, &mut registry, &layout_registry, &perf);
+        h.get_by_label("⏸ Pause").click();
+        h.run();
+    }
+    assert!(
+        matches!(state.timeline.scrub, ScrubState::Paused { .. }),
+        "clicking Pause must move scrub to Paused; got {:?}",
+        state.timeline.scrub
+    );
+
+    // Now the toggle reads "▶ Play" and clicking it resumes Live.
+    {
+        let mut h = timeline_harness(&mut state, &mut registry, &layout_registry, &perf);
+        h.get_by_label("▶ Play").click();
+        h.run();
+    }
+    assert_eq!(
+        state.timeline.scrub,
+        ScrubState::Live,
+        "clicking Play must resume Live; got {:?}",
+        state.timeline.scrub
+    );
+}
+
+#[test]
+fn timeline_step_back_updates_frame_index() {
+    let mut state = AppState::default();
+    state.timeline.buffered_len = 50;
+    // Start paused at the head so a step-back lands on a deterministic index.
+    state.timeline.pause_at(49);
+    state.timeline.seek_dirty = false; // clear the pause's flag
+    let mut registry = ActionRegistry::new();
+    let layout_registry = LayoutRegistry::seed_default();
+    let perf = PerfCollector::default();
+
+    let before = state.timeline.current_idx();
+    assert_eq!(before, 49, "precondition: paused at head (49)");
+
+    {
+        let mut h = timeline_harness(&mut state, &mut registry, &layout_registry, &perf);
+        h.get_by_label("⏮ Step −").click();
+        h.run();
+    }
+
+    assert_eq!(
+        state.timeline.current_idx(),
+        48,
+        "Step − must decrement the scrub frame index by one"
+    );
+    assert!(
+        state.timeline.seek_dirty,
+        "a step must flag a fresh seek so the App pushes the frame to the GPU"
+    );
+}
+
+#[test]
+fn timeline_step_forward_past_head_returns_live() {
+    let mut state = AppState::default();
+    state.timeline.buffered_len = 10;
+    state.timeline.pause_at(9); // head
+    let mut registry = ActionRegistry::new();
+    let layout_registry = LayoutRegistry::seed_default();
+    let perf = PerfCollector::default();
+
+    {
+        let mut h = timeline_harness(&mut state, &mut registry, &layout_registry, &perf);
+        h.get_by_label("Step + ⏭").click();
+        h.run();
+    }
+
+    assert_eq!(
+        state.timeline.scrub,
+        ScrubState::Live,
+        "stepping forward past the head must return to Live; got {:?}",
+        state.timeline.scrub
+    );
+}
+
+#[test]
+fn timeline_empty_buffer_shows_no_transport() {
+    // With an empty ring the section shows only the hint + capture knobs — no
+    // Pause control to click.
+    let mut state = AppState::default();
+    state.timeline.buffered_len = 0;
+    let mut registry = ActionRegistry::new();
+    let layout_registry = LayoutRegistry::seed_default();
+    let perf = PerfCollector::default();
+
+    let mut h = timeline_harness(&mut state, &mut registry, &layout_registry, &perf);
+    h.run();
+    assert!(
+        h.query_by_label("⏸ Pause").is_none(),
+        "empty timeline must not render the Pause transport control"
+    );
+}

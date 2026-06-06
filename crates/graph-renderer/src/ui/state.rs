@@ -18,6 +18,7 @@ pub enum Section {
     Debug,
     Metrics,
     Generate,
+    Timeline,
 }
 
 impl Section {
@@ -30,6 +31,7 @@ impl Section {
         Section::Debug,
         Section::Metrics,
         Section::Generate,
+        Section::Timeline,
     ];
 
     pub fn title(self) -> &'static str {
@@ -42,6 +44,7 @@ impl Section {
             Section::Debug => "Debug",
             Section::Metrics => "Metrics",
             Section::Generate => "Generate (tvix)",
+            Section::Timeline => "Timeline",
         }
     }
 }
@@ -1029,6 +1032,91 @@ pub struct AppState {
     /// `#[serde(skip)]` (drained by `App::update`).
     #[serde(default = "SeedState::with_template")]
     pub seed: SeedState,
+    /// Timeline section state (Phase P3): the scrub/playback UI's transient
+    /// position in the live frame-buffer ring plus the user-tunable capture
+    /// knobs (ring depth, capture stride). See [`TimelineState`].
+    #[serde(default)]
+    pub timeline: TimelineState,
+}
+
+/// State for the `Section::Timeline` ("Timeline") panel — the scrubbable
+/// simulation frame buffer.
+///
+/// The buffered frames themselves live on `App` (the `FrameRing`, fed from the
+/// GPU positions readback each frame) — NOT here, because they're large and
+/// purely session-scoped. This struct holds:
+///
+/// * the **capture knobs** (`depth`, `stride`) — genuine user PARAMETERS, so
+///   they round-trip via serde (a share link / preset can pin the buffer size);
+/// * the live **scrub position** (`scrub`) — `#[serde(skip)]`, since a paused-
+///   at-frame-N position is meaningless once the ring is gone.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TimelineState {
+    /// Max retained frames in the ring. Trades memory for scrub history; see
+    /// the memory budget table in `crate::timeline`.
+    pub depth: usize,
+    /// Capture every `stride`-th live frame into the ring. `1` = every frame.
+    /// Raising this stretches the buffered time window at the cost of temporal
+    /// resolution (and keeps large graphs in memory budget).
+    pub stride: usize,
+    /// Live playback / scrub position. Session-only; never persisted.
+    #[serde(skip)]
+    pub scrub: crate::timeline::ScrubState,
+    /// Mirror of the live ring's frame count, written by `App::update` each
+    /// frame so the section can size the scrub slider. Session-only.
+    #[serde(skip)]
+    pub buffered_len: usize,
+    /// Mirror of the live ring's approximate byte budget, for the readout.
+    #[serde(skip)]
+    pub buffered_bytes: usize,
+    /// One-shot: while the scrub UI is paused, the user pressed a
+    /// step/play/slider control. `App` reads `scrub` each frame regardless;
+    /// this flag just lets the App know a fresh seek should be pushed to the
+    /// GPU even if the index didn't change (e.g. re-pausing). Set by the
+    /// section, cleared by `App`.
+    #[serde(skip)]
+    pub seek_dirty: bool,
+}
+
+impl Default for TimelineState {
+    fn default() -> Self {
+        TimelineState {
+            depth: 300,
+            stride: 1,
+            scrub: crate::timeline::ScrubState::Live,
+            buffered_len: 0,
+            buffered_bytes: 0,
+            seek_dirty: false,
+        }
+    }
+}
+
+impl TimelineState {
+    /// Logical index the scrub UI currently points at: the paused frame when
+    /// paused, else the head (newest buffered frame).
+    pub fn current_idx(&self) -> usize {
+        match self.scrub {
+            crate::timeline::ScrubState::Paused { idx } => idx,
+            crate::timeline::ScrubState::Live => self.buffered_len.saturating_sub(1),
+        }
+    }
+
+    pub fn is_paused(&self) -> bool {
+        matches!(self.scrub, crate::timeline::ScrubState::Paused { .. })
+    }
+
+    /// Pause at `idx`, clamped to the buffered range, and flag a seek.
+    pub fn pause_at(&mut self, idx: usize) {
+        let max = self.buffered_len.saturating_sub(1);
+        self.scrub = crate::timeline::ScrubState::Paused { idx: idx.min(max) };
+        self.seek_dirty = true;
+    }
+
+    /// Resume live playback.
+    pub fn resume_live(&mut self) {
+        self.scrub = crate::timeline::ScrubState::Live;
+        self.seek_dirty = true;
+    }
 }
 
 /// State for the `Section::Generate` ("Generate (tvix)") panel.
@@ -1494,6 +1582,7 @@ impl Default for AppState {
             collapsed_panels: std::collections::HashSet::new(),
             generate: GenerateState::with_demo(),
             seed: SeedState::with_template(),
+            timeline: TimelineState::default(),
         }
     }
 }

@@ -7,6 +7,7 @@ pub mod layout;
 pub mod metrics;
 pub mod seed;
 pub mod style;
+pub mod timeline;
 
 use eframe::egui;
 
@@ -43,6 +44,7 @@ pub fn show(
         Section::Debug => debug::show(ui, state, perf),
         Section::Metrics => metrics::show(ui, state),
         Section::Generate => generate::show(ui, state),
+        Section::Timeline => timeline::show(ui, state),
     }
     let _ = theme::accent::RED; // keep accent module referenced from here for tooling
 }
