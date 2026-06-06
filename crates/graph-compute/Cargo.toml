@@ -11,6 +11,13 @@ description = "Single-GPU wgpu force-simulation worker. Exposes a tonic gRPC Sub
 name = "graph-compute"
 path = "src/main.rs"
 
+# One-shot PageRank over a CSR file — the GPU analytics entrypoint the lavender
+# notebooks shell out to (replacing the cuGraph diagnostic). Uses the wgpu
+# kernel when an adapter is present, else the CPU reference.
+[[bin]]
+name = "graph-pagerank"
+path = "src/bin/pagerank.rs"
+
 [lib]
 name = "graph_compute"
 path = "src/lib.rs"
@@ -66,3 +73,8 @@ bytemuck = { version = "1", features = ["derive"] }
 # service_fn connector (the standard tonic in-memory pattern — no TCP socket).
 hyper-util = { version = "0.1", features = ["tokio"] }
 tower = "0.5"
+# CPU PageRank reference for the cross-oracle test (`gpu_pagerank` vs the
+# implementation the lavender notebooks used). No dependency cycle: neither
+# vault-data nor graph-metrics depends on graph-compute.
+vault-data = { path = "../vault-data" }
+graph-metrics = { path = "../graph-metrics" }

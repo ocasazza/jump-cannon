@@ -282,45 +282,51 @@ pub fn gpu_pagerank(
     Ok(out)
 }
 
+/// CPU PageRank — the push form from `engines::geometric::pagerank`, reproduced
+/// here as the public reference + the CPU fallback for hosts without a wgpu
+/// adapter (the `pagerank` bin uses it when `EngineCtx::try_new_gpu` finds no
+/// GPU). Unlike [`gpu_pagerank`] it handles dangling (degree-0) nodes by
+/// redistributing their mass uniformly, so it is always correct; the GPU path
+/// rejects dangling nodes until that redistribution is ported to a kernel.
+///
+/// On a symmetrized CSR with no dangling nodes it is numerically identical to
+/// [`gpu_pagerank`] (the cross-oracle for the GPU kernel).
+pub fn cpu_pagerank(g: &CsrGraph, damping: f32, iters: u32) -> Vec<f32> {
+    let n = g.n_nodes as usize;
+    if n == 0 {
+        return Vec::new();
+    }
+    let inv_n = 1.0 / n as f32;
+    let mut rank = vec![inv_n; n];
+    let out_deg: Vec<f32> = (0..n)
+        .map(|v| (g.offsets[v + 1] - g.offsets[v]) as f32)
+        .collect();
+    let teleport = (1.0 - damping) * inv_n;
+    for _ in 0..iters {
+        let mut next = vec![0.0f32; n];
+        let mut dangling = 0.0f32;
+        for v in 0..n {
+            if out_deg[v] == 0.0 {
+                dangling += rank[v];
+                continue;
+            }
+            let share = rank[v] / out_deg[v];
+            for e in g.offsets[v] as usize..g.offsets[v + 1] as usize {
+                next[g.neighbors[e] as usize] += share;
+            }
+        }
+        let dangling_share = damping * dangling * inv_n;
+        for v in 0..n {
+            next[v] = teleport + dangling_share + damping * next[v];
+        }
+        rank = next;
+    }
+    rank
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// CPU oracle — the push form from `engines::geometric::pagerank`, inlined
-    /// here (it's private there) so the test is self-contained. Identical to the
-    /// GPU pull form on a symmetrized CSR.
-    fn cpu_pagerank(g: &CsrGraph, damping: f32, iters: u32) -> Vec<f32> {
-        let n = g.n_nodes as usize;
-        if n == 0 {
-            return Vec::new();
-        }
-        let inv_n = 1.0 / n as f32;
-        let mut rank = vec![inv_n; n];
-        let out_deg: Vec<f32> = (0..n)
-            .map(|v| (g.offsets[v + 1] - g.offsets[v]) as f32)
-            .collect();
-        let teleport = (1.0 - damping) * inv_n;
-        for _ in 0..iters {
-            let mut next = vec![0.0f32; n];
-            let mut dangling = 0.0f32;
-            for v in 0..n {
-                if out_deg[v] == 0.0 {
-                    dangling += rank[v];
-                    continue;
-                }
-                let share = rank[v] / out_deg[v];
-                for e in g.offsets[v] as usize..g.offsets[v + 1] as usize {
-                    next[g.neighbors[e] as usize] += share;
-                }
-            }
-            let dangling_share = damping * dangling * inv_n;
-            for v in 0..n {
-                next[v] = teleport + dangling_share + damping * next[v];
-            }
-            rank = next;
-        }
-        rank
-    }
 
     /// Undirected ring 0—1—…—(n-1)—0 (every node degree 2, no dangling).
     fn ring(n: u32) -> CsrGraph {

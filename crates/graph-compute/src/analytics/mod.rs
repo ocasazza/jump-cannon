@@ -12,4 +12,4 @@
 
 mod pagerank;
 
-pub use pagerank::gpu_pagerank;
+pub use pagerank::{cpu_pagerank, gpu_pagerank};

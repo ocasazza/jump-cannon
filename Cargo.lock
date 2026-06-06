@@ -2402,6 +2402,7 @@ dependencies = [
  "delaunator",
  "futures-core",
  "graph-layouts",
+ "graph-metrics",
  "hyper-util",
  "pollster",
  "prost",
@@ -2415,6 +2416,7 @@ dependencies = [
  "tower 0.5.3",
  "tracing",
  "tracing-subscriber",
+ "vault-data",
  "wgpu",
 ]
 
