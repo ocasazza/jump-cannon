@@ -13,7 +13,9 @@
 mod bfs;
 mod connected_components;
 mod pagerank;
+mod spmv;
 
 pub use bfs::{cpu_bfs, gpu_bfs, UNREACHABLE};
 pub use connected_components::{cpu_connected_components, gpu_connected_components};
 pub use pagerank::{cpu_pagerank, gpu_pagerank};
+pub use spmv::{cpu_spmv, gpu_spmv, WeightedCsr};
