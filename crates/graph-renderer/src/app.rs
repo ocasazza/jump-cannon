@@ -911,7 +911,19 @@ impl App {
         let Some(graph) = self.state.generate.pending.take() else {
             return;
         };
-        let bootstrap = crate::generate::bootstrap_from_generated(&graph);
+        let mut bootstrap = crate::generate::bootstrap_from_generated(&graph);
+        // Honour the Initial-seed strategy for the generated graph's INITIAL
+        // positions, instead of always imposing the default sphere shell. With
+        // "No seed" selected this is a minimal jitter (the force sim builds the
+        // layout from there) — so "No seed" actually means no pre-arranged seed,
+        // even on generation. A chosen built-in/custom seed places the new nodes
+        // accordingly.
+        let n = bootstrap.positions.len() / 3;
+        bootstrap.positions = crate::generate::seed_positions_for(
+            &self.state.seed.strategy,
+            &self.state.seed.editor.source,
+            n,
+        );
         *self.load.lock().unwrap() = LoadState::Ready(bootstrap);
         // Re-arm the one-shot upload latch so the new bootstrap is promoted
         // (GraphPipelines::load reallocates all buffers fresh each call).

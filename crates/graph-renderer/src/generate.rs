@@ -22,6 +22,7 @@
 
 use crate::data::{self, Bootstrap};
 use crate::proto;
+use crate::ui::state::SeedStrategy;
 use tvix_wasm::GeneratedGraph;
 
 /// Radius of the seed sphere shell, matching the network-bootstrap path in
@@ -113,6 +114,50 @@ pub fn bootstrap_from_generated(graph: &GeneratedGraph) -> Bootstrap {
         positions,
         edges,
         metrics,
+    }
+}
+
+/// Minimal "No seed" placement for a freshly generated graph: a small
+/// deterministic jitter so nodes aren't coincident (degenerate), WITHOUT the big
+/// pre-spread sphere — the force sim builds the layout from here. Radius is a few
+/// units, growing slowly with `n` so a large graph isn't pathologically dense.
+fn jitter_positions(n: usize) -> Vec<f32> {
+    let r = 2.0 + (n as f32).max(1.0).cbrt();
+    let mut out = vec![0.0f32; 3 * n];
+    for (i, slot) in out.iter_mut().enumerate() {
+        // SplitMix64 finaliser on the index → deterministic unit in [0,1).
+        let mut z = (i as u64).wrapping_add(0x9E37_79B9_7F4A_7C15);
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^= z >> 31;
+        let unit = (z >> 40) as f32 / (1u64 << 24) as f32;
+        *slot = (unit * 2.0 - 1.0) * r;
+    }
+    out
+}
+
+/// Resolve the INITIAL positions for a freshly generated graph of `n` nodes from
+/// the active Initial-seed `strategy` (Layout panel) — instead of always applying
+/// the default sphere shell. This is what makes "No seed" actually mean *no
+/// pre-arranged seed* on generation:
+///   - `None` → a minimal jitter (the sim arranges from there),
+///   - `BuiltIn(i)` → the embedded `seed_demos()[i]` strategy via `eval_seed`,
+///   - `Custom` → the user's Nix seed expression via `eval_seed`.
+/// Any eval failure / wrong-length result falls back to the jitter.
+pub fn seed_positions_for(strategy: &SeedStrategy, custom_source: &str, n: usize) -> Vec<f32> {
+    let expr: Option<String> = match strategy {
+        SeedStrategy::None => None,
+        SeedStrategy::BuiltIn(i) => {
+            tvix_wasm::seed_demos().get(*i).map(|d| d.expr.to_string())
+        }
+        SeedStrategy::Custom => Some(custom_source.to_string()),
+    };
+    match expr {
+        None => jitter_positions(n),
+        Some(src) => match tvix_wasm::eval_seed(&src, n) {
+            Ok(p) if p.len() == n => p.into_iter().flatten().collect(),
+            _ => jitter_positions(n),
+        },
     }
 }
 
@@ -305,6 +350,35 @@ mod tests {
         // Every node has degree 1 here.
         let degree = bs.metrics.get("degree").unwrap();
         assert!(degree.iter().all(|&d| d == 1.0));
+    }
+
+    #[test]
+    fn no_seed_generates_minimal_jitter_not_the_big_sphere() {
+        // The bug: generation always applied an 800-radius sphere regardless of
+        // the Initial-seed strategy. "No seed" must NOT impose that — a minimal
+        // jitter near the origin instead, with distinct (non-coincident) nodes.
+        let n = 64;
+        let pos = seed_positions_for(&SeedStrategy::None, "", n);
+        assert_eq!(pos.len(), 3 * n);
+        let max_abs = pos.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+        assert!(max_abs < 50.0, "No-seed jitter must be small, not the 800 sphere (max {max_abs})");
+        // Non-degenerate: not all nodes at the same point.
+        assert!(pos[0..3] != pos[3..6], "jittered nodes must be distinct");
+    }
+
+    #[test]
+    fn builtin_seed_strategy_drives_generated_positions() {
+        // A chosen built-in seed (sphere) places the generated nodes via eval_seed,
+        // producing n positions at a real (non-jitter) radius.
+        let sphere_idx = tvix_wasm::seed_demos()
+            .iter()
+            .position(|d| d.name.to_lowercase().contains("sphere"))
+            .expect("a sphere seed demo exists");
+        let n = 48;
+        let pos = seed_positions_for(&SeedStrategy::BuiltIn(sphere_idx), "", n);
+        assert_eq!(pos.len(), 3 * n);
+        let max_abs = pos.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+        assert!(max_abs > 50.0, "the sphere seed should place nodes at its real radius (max {max_abs})");
     }
 
     #[test]
