@@ -64,7 +64,11 @@
         src = pkgs.lib.fileset.toSource {
           root = ./.;
           fileset = pkgs.lib.fileset.unions [
-            (pkgs.lib.fileset.fileFilter (file: builtins.any file.hasExt [ "rs" "toml" "lock" "md" "html" "scss" "js" "ts" "json" "png" "ico" "sh" "csv" "proto" "wgsl" ]) ./.)
+            # "nix" is required: tvix-wasm embeds crates/tvix-wasm/src/nix/*.nix
+            # via include_str!, so those files must be in the crane source or any
+            # build that compiles tvix-wasm natively (e.g. the graph-compute
+            # gpu tests' Nix-fixture corpus) fails to compile.
+            (pkgs.lib.fileset.fileFilter (file: builtins.any file.hasExt [ "rs" "toml" "lock" "md" "html" "scss" "js" "ts" "json" "png" "ico" "sh" "csv" "proto" "wgsl" "nix" ]) ./.)
           ];
         };
 
@@ -526,19 +530,22 @@
           # Native: clippy + tests + fmt
           clippy = craneLib.cargoClippy (commonArgs // {
             cargoArtifacts = depsNative;
+            # graph-compute's build.rs runs tonic-build → needs protoc.
+            nativeBuildInputs = [ pkgs.pkg-config pkgs.protobuf ];
+            buildInputs = bevyLibs;
             cargoClippyExtraArgs = "--all-targets -- -D warnings";
           });
           tests-unit = craneLib.cargoNextest (commonArgs // {
             cargoArtifacts = depsNative;
             cargoNextestExtraArgs = "--profile unit";
-            nativeBuildInputs = [ pkgs.pkg-config ];
+            nativeBuildInputs = [ pkgs.pkg-config pkgs.protobuf ];
             buildInputs = bevyLibs;
           });
 
           tests-integration = craneLib.cargoNextest (commonArgs // {
             cargoArtifacts = depsNative;
             cargoNextestExtraArgs = "--profile integration";
-            nativeBuildInputs = [ pkgs.pkg-config ];
+            nativeBuildInputs = [ pkgs.pkg-config pkgs.protobuf ];
             buildInputs = bevyLibs;
           });
 
@@ -546,7 +553,7 @@
             cargoArtifacts = depsNative;
             cargoNextestExtraArgs = "--profile e2e";
             # E2E needs display server libs for headless Bevy
-            nativeBuildInputs = [ pkgs.pkg-config ];
+            nativeBuildInputs = [ pkgs.pkg-config pkgs.protobuf ];
             buildInputs = bevyLibs;
           });
           # GPU analytics correctness (gpu_pagerank_* + gpu_engines). The kernels
@@ -559,7 +566,7 @@
           tests-gpu = craneLib.cargoNextest (commonArgs // {
             cargoArtifacts = depsNative;
             cargoNextestExtraArgs = "--profile gpu -p graph-compute";
-            nativeBuildInputs = [ pkgs.pkg-config ];
+            nativeBuildInputs = [ pkgs.pkg-config pkgs.protobuf ];
             buildInputs = bevyLibs;
             GPU_PAGERANK_SCALE_N = "200000";
           } // pkgs.lib.optionalAttrs pkgs.stdenv.isLinux {
