@@ -406,6 +406,44 @@ pub struct GeometricSettings {
     /// §1). Ignored when `bonding_enabled == false`.
     pub bond_every: u32,
 
+    // --- dynamic bonding (self-assembly P2): valence cap + bond angle ---
+    /// Per-**class** maximum dynamic-bond **valence** (coordination cap): a node of
+    /// class `c` accepts at most `max_valence[c]` dynamic bonds. This is the knob
+    /// that selects morphology together with [`bond_target_angle`](Self::bond_target_angle):
+    /// `2 ⇒ chain`, `3 ⇒ honeycomb sheet`, `4 ⇒ square net` (design §0). When a bond
+    /// would push *either* endpoint past its cap it is **rejected**; the cap is
+    /// enforced conflict-free and deterministically (sorted candidate ordering +
+    /// per-node valence counters + accept/reject — WebGPU-safe, design §2.4). Class
+    /// ids beyond this table fall back to [`default_max_valence`](Self::default_max_valence).
+    /// **Empty ⇒ no cap** (every class uses the fallback). At the default
+    /// `bonding_enabled == false` this is never read, so the default behaviour stays
+    /// byte-identical.
+    pub max_valence: Vec<u32>,
+    /// Fallback valence cap for class ids beyond [`max_valence`](Self::max_valence)
+    /// (and for *every* class when that table is empty). `0` ⇒ **uncapped** — the
+    /// P1 behaviour (no valence limit), so an empty `max_valence` + a `0` fallback
+    /// is byte-identical to P1. Set this (e.g. `2`) to cap a uniform soup into
+    /// chains without per-class tables.
+    pub default_max_valence: u32,
+    /// Per-**class** preferred **dynamic-bond angle** in **degrees** — the target
+    /// angle the coordination constraint drives a node's *bonded* neighbour pairs
+    /// toward (`180 ⇒ chain`, `120 ⇒ honeycomb sheet`, `90 ⇒ square net`). This is
+    /// the bond-geometry half of the morphology ladder: the valence cap sets *how
+    /// many* bonds, this sets the *angle between* them. Indexed by the node's class
+    /// id, clamped to the table; empty ⇒ [`default_bond_angle`](Self::default_bond_angle)
+    /// for every class. The angle term over dynamic bonds reuses the SAME
+    /// harmonic-angle force the static coordination constraint uses
+    /// ([`accumulate_angle_forces`]), at [`angle_stiffness`](Self::angle_stiffness),
+    /// but acts on the *dynamic-bond* adjacency rather than the static CSR. Active
+    /// only when `bonding_enabled` AND `angle_stiffness != 0`; never read at the
+    /// default `bonding_enabled == false` (byte-identical default).
+    pub bond_target_angle: Vec<f32>,
+    /// Fallback dynamic-bond angle (degrees) for class ids beyond
+    /// [`bond_target_angle`](Self::bond_target_angle) (and for every class when that
+    /// table is empty). Defaults to `180°` (a straight chain) — the natural
+    /// valence-2 geometry.
+    pub default_bond_angle: f32,
+
     /// Director→position **tilt-coupling** stiffness — the term that makes the
     /// membrane GEOMETRY follow the director (normal) field, so a flat sheet,
     /// hollow tube and closed vesicle become *spontaneous* rather than detector-
@@ -514,6 +552,17 @@ impl Default for GeometricSettings {
             r_break: 1.3,
             bond_stiffness: 0.3,
             bond_every: 8,
+
+            // Default OFF for P2: an empty `max_valence` + a `0` fallback ⇒ no
+            // valence cap (the P1 add/remove behaviour). `bond_target_angle` empty
+            // ⇒ `default_bond_angle` (180°, a chain) for every class — but the
+            // dynamic-bond angle term only acts when `bonding_enabled` AND
+            // `angle_stiffness != 0`, and `bonding_enabled` is false by default, so
+            // none of this is ever read at the default ⇒ byte-identical.
+            max_valence: Vec::new(),
+            default_max_valence: 0,
+            bond_target_angle: Vec::new(),
+            default_bond_angle: 180.0,
         }
     }
 }
@@ -911,6 +960,16 @@ impl GeometricEngine {
             .map(|st| st.dynamic_edges.iter().map(|e| (e.a, e.b)).collect())
     }
 
+    /// The engine's current interleaved x,y,z positions (length `3n`), or an empty
+    /// slice before [`init`](LayoutEngine::init). A read-only accessor so the
+    /// validation harness can measure the *shape* (gyration tensor) of an
+    /// assembled patch on the live positions without stepping (which the public
+    /// `StepOutput` path would otherwise require).
+    #[doc(hidden)]
+    pub fn positions_for_test(&self) -> &[f32] {
+        self.state.as_ref().map(|st| st.positions.as_slice()).unwrap_or(&[])
+    }
+
     /// Run *only* the dynamic-bond stage (cell-list build + add/remove sweep) on
     /// the current positions, without computing forces or integrating. Exposed so
     /// the validation harness can benchmark the bond stage's O(n) scaling in
@@ -1076,6 +1135,16 @@ fn compute_forces(st: &State, s: &GeometricSettings) -> Vec<f32> {
     }
     if s.angle_stiffness != 0.0 {
         accumulate_angle_forces(&mut force, st, s);
+        // Dynamic bonds (self-assembly P2) feed the SAME harmonic-angle force as
+        // the static coordination constraint, but over the *dynamic-bond*
+        // adjacency and toward the per-class `bond_target_angle` (so bonded
+        // neighbours are driven to e.g. 180°⇒chain, 120°⇒sheet). Empty unless
+        // `bonding_enabled` produced bonds ⇒ a default run adds nothing here
+        // (byte-identical). Gated on the same `angle_stiffness != 0` as the static
+        // term so disabling angles disables both.
+        if !st.dynamic_edges.is_empty() {
+            accumulate_bond_angle_forces(&mut force, st, s);
+        }
     }
     accumulate_exclusion_affinity(&mut force, st, s);
     accumulate_gravity(&mut force, &st.positions, &st.resolved.mass, s.gravity);
@@ -1376,6 +1445,59 @@ fn apply_angle_pair(
     force[3 * c] -= fjx + fkx;
     force[3 * c + 1] -= fjy + fky;
     force[3 * c + 2] -= fjz + fkz;
+}
+
+/// Dynamic-bond angle (coordination) constraint (self-assembly P2): for each node,
+/// push its *bonded* neighbour pairs toward the node's per-class
+/// [`bond_target_angle`](GeometricSettings::bond_target_angle) — the bond-geometry
+/// half of the morphology ladder (180°⇒chain, 120°⇒honeycomb sheet, 90°⇒square
+/// net). Identical harmonic-angle gradient as the static
+/// [`accumulate_angle_forces`] (via [`apply_angle_pair`]), but it acts on the
+/// *dynamic-bond* adjacency built from [`State::dynamic_edges`] rather than the
+/// static CSR. The per-node degree cap / decimation stride from `max_angle_pairs`
+/// is reused so a transiently-over-bonded hub can't blow up the `O(deg²)` work.
+fn accumulate_bond_angle_forces(force: &mut [f32], st: &State, s: &GeometricSettings) {
+    let k = s.angle_stiffness;
+    let cap = s.max_angle_pairs as usize;
+    // Per-node bonded-neighbour adjacency from the dynamic edge set. Built fresh
+    // each force pass (cheap: the bond set is small relative to n²). Deterministic:
+    // `dynamic_edges` is kept sorted by `(a, b)`, so each node's neighbour list is
+    // in ascending order ⇒ the kept-pair stride is stable run-to-run.
+    let mut adj: Vec<Vec<u32>> = vec![Vec::new(); st.n];
+    for e in &st.dynamic_edges {
+        adj[e.a as usize].push(e.b);
+        adj[e.b as usize].push(e.a);
+    }
+    for c in 0..st.n {
+        let neigh = &adj[c];
+        if neigh.len() < 2 {
+            continue; // terminal / single-bond node ⇒ no angle to constrain
+        }
+        let ideal_rad = lookup_bond_angle(s, st.resolved.class[c] as usize).to_radians();
+        let m = neigh.len();
+        let total_pairs = m * (m - 1) / 2;
+        let stride = if cap != 0 && total_pairs > cap {
+            (total_pairs / cap).max(1)
+        } else {
+            1
+        };
+        let mut pair_idx = 0usize;
+        for jj in 0..m {
+            for kk in (jj + 1)..m {
+                let keep = stride == 1 || pair_idx % stride == 0;
+                pair_idx += 1;
+                if !keep {
+                    continue;
+                }
+                let j = neigh[jj] as usize;
+                let kn = neigh[kk] as usize;
+                if j == c || kn == c || j == kn {
+                    continue;
+                }
+                apply_angle_pair(force, &st.positions, c, j, kn, ideal_rad, k);
+            }
+        }
+    }
 }
 
 /// Pairwise class exclusion (overlap prevention) + inter-class affinity
@@ -1688,7 +1810,7 @@ fn update_dynamic_bonds(st: &mut State, s: &GeometricSettings) {
         keep
     });
 
-    // --- 2. create new in-range, compatible, unbonded bonds --------------
+    // --- 2. gather in-range, compatible, unbonded candidate pairs --------
     let grid = CellList::build(pos, n, r_break);
     let mut new_bonds: Vec<(u32, u32)> = Vec::new();
     for i in 0..n {
@@ -1708,10 +1830,46 @@ fn update_dynamic_bonds(st: &mut State, s: &GeometricSettings) {
             }
         });
     }
+
+    // --- 3. valence-capped, conflict-free accept/reject (P2) -------------
+    //
+    // Sort candidates by `(a, b)` so the accept/reject decision is a single
+    // deterministic pass independent of cell-iteration order (no atomics, no
+    // race-dependent results — the WebGPU-safe pattern from design §2.4). Each
+    // node carries a running valence counter seeded from the bonds that survived
+    // the break step; a candidate is accepted only when BOTH endpoints are still
+    // under their class cap, and accepting it bumps both counters so later
+    // candidates see the spent capacity. `default_max_valence == 0` (and an empty
+    // table) ⇒ uncapped ⇒ the P1 behaviour (every in-range pair is accepted).
+    new_bonds.sort_unstable();
+    new_bonds.dedup();
+
+    let capped = s.default_max_valence != 0 || !s.max_valence.is_empty();
+    let mut valence: Vec<u32> = vec![0; n];
+    if capped {
+        for e in &st.dynamic_edges {
+            valence[e.a as usize] += 1;
+            valence[e.b as usize] += 1;
+        }
+    }
+
     for key in new_bonds {
-        // `insert` returns false if the pair was already added this sweep (e.g.
-        // discovered from both endpoints' cells) — guards against duplicate edges.
+        let (a, b) = (key.0 as usize, key.1 as usize);
+        if capped {
+            let cap_a = lookup_max_valence(s, class[a] as usize);
+            let cap_b = lookup_max_valence(s, class[b] as usize);
+            if valence[a] >= cap_a || valence[b] >= cap_b {
+                continue; // either endpoint at its valence cap ⇒ reject
+            }
+        }
+        // `insert` returns false only if the pair was somehow already present
+        // (it cannot be here — candidates are deduped and exclude bonded pairs —
+        // but the guard keeps the edge/counter accounting exact).
         if st.bonded.insert(key) {
+            if capped {
+                valence[a] += 1;
+                valence[b] += 1;
+            }
             st.dynamic_edges.push(ResolvedEdge {
                 a: key.0,
                 b: key.1,
@@ -1722,6 +1880,28 @@ fn update_dynamic_bonds(st: &mut State, s: &GeometricSettings) {
 
     // Deterministic force-pass order regardless of break/create history.
     st.dynamic_edges.sort_by_key(|e| (e.a, e.b));
+}
+
+/// Look up a class's dynamic-bond valence cap, falling back to
+/// [`GeometricSettings::default_max_valence`] beyond the table (or for every class
+/// when the table is empty). `0` means **uncapped**; callers treat `valence >= cap`
+/// with a `0` cap by never reaching this path (the `capped` gate skips it).
+fn lookup_max_valence(s: &GeometricSettings, class: usize) -> u32 {
+    let v = s.max_valence.get(class).copied().unwrap_or(s.default_max_valence);
+    // A per-class entry of 0 inherits the fallback (so a partially-filled table
+    // doesn't accidentally pin some classes to "no bonds at all" unless the
+    // fallback itself is 0). When both are 0 the `capped` gate is off anyway.
+    if v == 0 { s.default_max_valence } else { v }
+}
+
+/// Look up a class's preferred dynamic-bond angle (degrees), clamped to the
+/// [`GeometricSettings::bond_target_angle`] table; empty table ⇒
+/// [`GeometricSettings::default_bond_angle`].
+fn lookup_bond_angle(s: &GeometricSettings, class: usize) -> f32 {
+    if s.bond_target_angle.is_empty() {
+        return s.default_bond_angle;
+    }
+    s.bond_target_angle[class.min(s.bond_target_angle.len() - 1)]
 }
 
 /// Advance velocities (mass-scaled accel, damped) and positions, with an
@@ -3427,6 +3607,165 @@ mod tests {
             e2.dynamic_bonds().unwrap(),
             vec![(0, 1)],
             "an affinity>0 class pair within range should bond"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Dynamic bonding (P2) — per-class valence cap + bond angle
+    // -----------------------------------------------------------------------
+
+    /// Degree (dynamic-bond valence) histogram over `n` nodes from a bond list.
+    fn bond_degree_histogram(n: usize, bonds: &[(u32, u32)]) -> Vec<u32> {
+        let mut deg = vec![0u32; n];
+        for &(a, b) in bonds {
+            deg[a as usize] += 1;
+            deg[b as usize] += 1;
+        }
+        deg
+    }
+
+    #[test]
+    fn valence_cap_rejects_bonds_past_the_class_cap() {
+        // A central node 0 surrounded by FOUR equidistant partners all well within
+        // r_bond. With a uniform valence cap of 2, node 0 must end up with EXACTLY
+        // 2 dynamic bonds — never 3 or 4 — and the accept/reject must be
+        // deterministic (sorted candidate order ⇒ the two lowest-index partners
+        // win). No partner exceeds the cap either.
+        let g = no_edges_csr(5);
+        // node 0 at origin; 1..4 at ±0.3 on x and y (all dist 0.3 < r_bond 1.0,
+        // and partners are ≥ 0.42 apart from each other ... but several partner
+        // pairs are also < r_bond, so the cap must hold globally, not just at 0).
+        let pos = vec![
+            0.0, 0.0, 0.0, // 0 (center)
+            0.3, 0.0, 0.0, // 1
+            -0.3, 0.0, 0.0, // 2
+            0.0, 0.3, 0.0, // 3
+            0.0, -0.3, 0.0, // 4
+        ];
+        let mut s = bonding_settings(1.0, 1.5);
+        s.default_max_valence = 2;
+        let mut e = init_engine(&g, s, &pos);
+        let mut ctx = EngineCtx::cpu_only();
+        e.step(&mut ctx);
+        let bonds = e.dynamic_bonds().unwrap();
+        let deg = bond_degree_histogram(5, &bonds);
+        assert!(
+            deg.iter().all(|&d| d <= 2),
+            "no node may exceed the valence cap of 2, got degrees {deg:?} (bonds {bonds:?})"
+        );
+        // Determinism: re-run from scratch on the identical config ⇒ identical set.
+        let mut e2 = init_engine(&g, {
+            let mut s2 = bonding_settings(1.0, 1.5);
+            s2.default_max_valence = 2;
+            s2
+        }, &pos);
+        e2.step(&mut ctx);
+        assert_eq!(
+            bonds,
+            e2.dynamic_bonds().unwrap(),
+            "valence-capped bond set must be deterministic across runs"
+        );
+    }
+
+    #[test]
+    fn valence_cap_zero_is_uncapped_p1_behaviour() {
+        // default_max_valence = 0 and an empty table ⇒ NO cap ⇒ identical to P1:
+        // every in-range pair bonds. A tight 4-cluster (all pairs in range) bonds
+        // into the complete graph K4 (6 edges, every node degree 3).
+        let g = no_edges_csr(4);
+        let pos = vec![
+            0.0, 0.0, 0.0, 0.2, 0.0, 0.0, 0.0, 0.2, 0.0, 0.0, 0.0, 0.2,
+        ];
+        let e = {
+            let mut e = init_engine(&g, bonding_settings(1.0, 1.5), &pos);
+            let mut ctx = EngineCtx::cpu_only();
+            e.step(&mut ctx);
+            e
+        };
+        let bonds = e.dynamic_bonds().unwrap();
+        assert_eq!(bonds.len(), 6, "uncapped tight 4-cluster ⇒ K4 (6 bonds), got {bonds:?}");
+        let deg = bond_degree_histogram(4, &bonds);
+        assert!(deg.iter().all(|&d| d == 3), "K4 ⇒ every node degree 3, got {deg:?}");
+    }
+
+    #[test]
+    fn valence_cap_is_per_class() {
+        // Two classes with different caps via an injected class vector. Node 0 is
+        // class 0 (cap 1); nodes 1,2,3 are class 1 (cap 3). All four mutually in
+        // range. The affinity matrix is all-positive so every pair is compatible.
+        // Node 0 must accept at most 1 bond despite three willing partners.
+        let g = no_edges_csr(4);
+        let pos = vec![
+            0.0, 0.0, 0.0, 0.2, 0.0, 0.0, 0.0, 0.2, 0.0, 0.0, 0.0, 0.2,
+        ];
+        let mut s = bonding_settings(1.0, 1.5);
+        s.class_source = ClassSource::Injected;
+        s.class_affinity_dim = 2;
+        s.class_affinity = vec![1.0, 1.0, 1.0, 1.0]; // all classes compatible
+        s.max_valence = vec![1, 3]; // class 0 cap 1, class 1 cap 3
+        let attrs = GraphAttributes {
+            node_class: Some(vec![0, 1, 1, 1]),
+            ..Default::default()
+        };
+        let mut e = GeometricEngine::new();
+        e.set_params(&serde_json::to_value(&s).unwrap()).unwrap();
+        let mut ctx = EngineCtx::cpu_only();
+        e.init(&mut ctx, &CsrShard::whole_with_attributes(&g, &attrs), &pos)
+            .unwrap();
+        e.step(&mut ctx);
+        let bonds = e.dynamic_bonds().unwrap();
+        let deg = bond_degree_histogram(4, &bonds);
+        assert!(
+            deg[0] <= 1,
+            "class-0 node must respect its cap of 1, got degree {} (bonds {bonds:?})",
+            deg[0]
+        );
+        assert!(
+            deg[1..].iter().all(|&d| d <= 3),
+            "class-1 nodes must respect their cap of 3, got {deg:?}"
+        );
+    }
+
+    #[test]
+    fn dynamic_bond_angle_term_acts_on_bonded_triple() {
+        // Three nodes bonded into a bent chain 1-0-2 (node 0 is the center, bonded
+        // to 1 and 2). With a 180° target bond angle the angle term must push the
+        // two outer nodes apart (straighten the chain). We verify the FORCE on the
+        // bent triple is non-trivial and straightening: compare θ after a few steps
+        // against the bent start — it should increase toward 180°.
+        let g = no_edges_csr(3);
+        // Bent: 1 at (-1,0,0), 0 at origin, 2 at (0.6,0.8,0) ⇒ angle ≈ 127°.
+        let pos = vec![
+            0.0, 0.0, 0.0, // 0 center
+            -1.0, 0.0, 0.0, // 1
+            0.6, 0.8, 0.0, // 2
+        ];
+        let mut s = bonding_settings(1.3, 1.8);
+        s.angle_stiffness = 0.3;
+        s.bond_stiffness = 0.0; // isolate the angle term (no length spring)
+        s.default_bond_angle = 180.0;
+        s.bond_every = 1;
+        s.time_step = 0.2;
+        let mut e = init_engine(&g, s, &pos);
+        let mut ctx = EngineCtx::cpu_only();
+        e.step(&mut ctx); // forms 0-1 and 0-2 bonds, applies angle force
+
+        let theta0 = {
+            // initial angle 1-0-2
+            super::triple_angle(&pos, 0, 1, 2).to_degrees()
+        };
+        for _ in 0..40 {
+            e.step(&mut ctx);
+        }
+        let st = e.state.as_ref().unwrap();
+        // Confirm the bonded triple still exists (center degree 2).
+        let bonds = e.dynamic_bonds().unwrap();
+        assert_eq!(bonds.len(), 2, "center should be bonded to both ends, got {bonds:?}");
+        let theta1 = super::triple_angle(&st.positions, 0, 1, 2).to_degrees();
+        assert!(
+            theta1 > theta0 + 2.0,
+            "the 180° bond-angle term should STRAIGHTEN the bent chain: \
+             θ went {theta0:.1}° → {theta1:.1}° (expected to increase toward 180°)"
         );
     }
 

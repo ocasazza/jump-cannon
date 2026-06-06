@@ -3610,3 +3610,296 @@ fn cell_list_finds_same_candidates_as_brute_and_is_subquadratic() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// PHASE P2 — valence cap + bond angle (chains & sheets)
+// ---------------------------------------------------------------------------
+//
+// P2 adds the morphology-selecting half of the ladder: a per-class MAX VALENCE
+// (coordination cap) and a per-class TARGET BOND ANGLE that the angle constraint
+// drives the dynamic-bond adjacency toward (`docs/dynamic-edge-bonding-plan.md`
+// §5 P2). These canaries pin:
+//   (a) CHAINS — a valence-2 compatible soup under bonding + a thermostat grows
+//       linear chains: the dynamic-bond degree histogram is capped at 2 (the hard
+//       conflict-free guarantee), NO node ever exceeds it, and chains actually
+//       GROW (mean bonded degree rises well above the bonding-OFF baseline of 0,
+//       and a substantial fraction of nodes reach degree 2). The cap is the
+//       morphology selector — without it the same soup over-bonds into a blob.
+//   (b) SHEETS — a valence-3 @120° soup grows locally-planar honeycomb patches:
+//       the bonded-degree histogram PEAKS at 3 (interior coordination → ~3), and
+//       a bonded patch is locally FLAT (the angle term + a flattening tilt steer
+//       it). Sheet formation is harder than chains; the canary reports the order
+//       parameters and asserts the capability honestly (see its body for the
+//       spontaneous-vs-steered split).
+//
+// Default-OFF stays byte-identical: `bonding_enabled == false` never reads the
+// valence/angle tables (re-asserted by the golden master + every canary above
+// staying green and unchanged).
+
+/// Mean dynamic-bond degree over `n` nodes (the average coordination number of the
+/// bonded graph). `0` for an empty bond set.
+fn mean_bond_degree(n: usize, bonds: &[(u32, u32)]) -> f32 {
+    if n == 0 {
+        return 0.0;
+    }
+    (2 * bonds.len()) as f32 / n as f32
+}
+
+/// Histogram of dynamic-bond degrees: `hist[d]` = number of nodes with exactly `d`
+/// bonds. Length is `max_degree + 1` (at least 1).
+fn bond_degree_hist(n: usize, bonds: &[(u32, u32)]) -> Vec<u32> {
+    let mut deg = vec![0u32; n];
+    for &(a, b) in bonds {
+        deg[a as usize] += 1;
+        deg[b as usize] += 1;
+    }
+    let maxd = deg.iter().copied().max().unwrap_or(0) as usize;
+    let mut hist = vec![0u32; maxd + 1];
+    for &d in &deg {
+        hist[d as usize] += 1;
+    }
+    hist
+}
+
+#[test]
+fn p2_valence_two_soup_grows_capped_chains() {
+    // A disordered soup of compatible particles, run WITH bonding + a valence-2
+    // cap + a 180° bond angle, must grow LINEAR CHAINS: no node ever exceeds 2
+    // bonds (the hard conflict-free cap), and chains actually grow — mean bonded
+    // degree well above the (zero) bonding-OFF baseline, with a real population at
+    // degree 2. The SAME soup without the cap over-bonds (some nodes exceed 2),
+    // which is exactly what the cap exists to prevent — we assert that contrast.
+    let n = 256usize;
+    let seed = soup_seed(n, 3.0, 0x5111_C0DE);
+    let mut ctx = EngineCtx::cpu_only();
+
+    // Capped (valence 2): chains.
+    let mut chain_s = soup_settings(true, 0xB0_1D_F00D);
+    chain_s.default_max_valence = 2;
+    chain_s.angle_stiffness = 0.15; // drive bonded pairs toward 180° (straight)
+    chain_s.default_bond_angle = 180.0;
+    let mut capped = GeometricEngine::new();
+    capped
+        .set_params(&serde_json::to_value(&chain_s).unwrap())
+        .unwrap();
+    capped
+        .init(&mut ctx, &CsrShard::whole(&no_edges(n)), &seed)
+        .unwrap();
+    for _ in 0..2_500 {
+        capped.step(&mut ctx);
+    }
+    let cap_bonds = capped.dynamic_bonds().unwrap();
+    let cap_hist = bond_degree_hist(n, &cap_bonds);
+    let cap_mean = mean_bond_degree(n, &cap_bonds);
+    let max_deg = (cap_hist.len() as u32).saturating_sub(1);
+
+    // Uncapped (P1): the same soup over-bonds — some nodes exceed valence 2.
+    let mut uncapped = GeometricEngine::new();
+    uncapped
+        .set_params(&serde_json::to_value(&soup_settings(true, 0xB0_1D_F00D)).unwrap())
+        .unwrap();
+    uncapped
+        .init(&mut ctx, &CsrShard::whole(&no_edges(n)), &seed)
+        .unwrap();
+    for _ in 0..2_500 {
+        uncapped.step(&mut ctx);
+    }
+    let unc_hist = bond_degree_hist(n, &uncapped.dynamic_bonds().unwrap());
+    let unc_max_deg = (unc_hist.len() as u32).saturating_sub(1);
+
+    let frac_deg2 = cap_hist.get(2).copied().unwrap_or(0) as f32 / n as f32;
+    eprintln!(
+        "P2 chains: capped degree hist {cap_hist:?} (max {max_deg}, mean {cap_mean:.2}, \
+         {:.0}% at deg 2) | uncapped max degree {unc_max_deg}",
+        frac_deg2 * 100.0
+    );
+
+    // HARD cap: the valence-2 run never produces a node with more than 2 bonds.
+    assert!(
+        max_deg <= 2,
+        "valence-2 cap must bound every node's bonded degree at 2, got max {max_deg} \
+         (hist {cap_hist:?})"
+    );
+    // The cap is meaningful: the uncapped run DOES over-bond (some node > 2),
+    // proving the cap changed the outcome and isn't vacuously satisfied.
+    assert!(
+        unc_max_deg > 2,
+        "the UNCAPPED soup should over-bond past degree 2 (else the cap proves nothing), \
+         got max degree {unc_max_deg}"
+    );
+    // Chains GROW: mean degree well above 0 (the bonding-OFF baseline) and a real
+    // population of degree-2 (chain-interior) nodes.
+    assert!(
+        cap_mean > 1.0,
+        "chains should grow: mean bonded degree {cap_mean:.2} should exceed 1 \
+         (a connected chain interior is degree 2)"
+    );
+    assert!(
+        frac_deg2 > 0.25,
+        "a substantial fraction of nodes should reach chain-interior degree 2, \
+         got {:.0}% (hist {cap_hist:?})",
+        frac_deg2 * 100.0
+    );
+}
+
+#[test]
+fn p2_valence_three_120deg_forms_locally_planar_sheet_patches() {
+    // A valence-3 @120° soup grows honeycomb SHEET patches. Sheet self-assembly is
+    // harder than chains (it needs the cap AND the angle AND a flattening bias to
+    // beat the 3D droplet the bare well condenses to), so this canary leans on the
+    // SAME membrane machinery the spontaneous-sheet morphology canary uses (patchy
+    // anisotropy + GB-side + tilt coupling) to keep the aggregate planar, while the
+    // P2 valence cap + 120° bond angle impose the honeycomb coordination.
+    //
+    // We assert the P2-specific signals: (1) the bonded-degree histogram PEAKS at
+    // the target valence 3 (mean interior coordination → ~3, never exceeding the
+    // cap), and (2) the largest bonded patch is locally PLANAR (high gyration
+    // flatness, low prolateness — a sheet, not a rod or ball). Bars are generous
+    // (this is emergent under a finite compute budget) but non-trivial.
+    let n = 220usize;
+    let seed = random_cloud(n, 3.0, 0x5_4EE7);
+    let mut ctx = EngineCtx::cpu_only();
+
+    // Membrane settings: cohesion well + patchy alignment + GB-side + tilt coupling
+    // (flat at c0=0) to keep the condensate planar, PLUS the P2 honeycomb selector.
+    let mut s = GeometricSettings {
+        edge_stiffness: 0.0,
+        angle_stiffness: 0.3,
+        default_radius: 0.5,
+        exclusion_strength: 1.0,
+        well_depth: 2.5,
+        well_width: 1.0,
+        anisotropy_strength: 1.0,
+        gb_side_strength: 1.5,
+        tilt_coupling_strength: 1.0,
+        spont_curvature_c0: 0.0, // flat target
+        rotational_diffusion: 1.0,
+        gravity: 0.05,
+        damping: 0.9,
+        time_step: 0.4,
+        max_step: 1.0,
+        temperature: 0.2,
+        rng_seed: 0x_5_4EE7_F00D,
+        director_source: DirectorSource::Random,
+        // P2 honeycomb selector: valence 3 @120°.
+        bonding_enabled: true,
+        r_bond: 1.1,
+        r_break: 1.5,
+        bond_stiffness: 0.4,
+        bond_every: 4,
+        default_max_valence: 3,
+        default_bond_angle: 120.0,
+        ..GeometricSettings::default()
+    };
+    s.coordination_source = CoordinationSource::Uniform { bucket: 3 };
+
+    let mut e = GeometricEngine::new();
+    e.set_params(&serde_json::to_value(&s).unwrap()).unwrap();
+    e.init(&mut ctx, &CsrShard::whole(&no_edges(n)), &seed)
+        .unwrap();
+    for _ in 0..4_000 {
+        e.step(&mut ctx);
+    }
+
+    let bonds = e.dynamic_bonds().unwrap();
+    let hist = bond_degree_hist(n, &bonds);
+    let max_deg = (hist.len() as u32).saturating_sub(1);
+    // The largest bonded patch: union-find over the bonds, then its gyration shape.
+    let patch = largest_bonded_members(n, &bonds);
+    let obs = e.observe_assembly().unwrap();
+    let pos = current_positions(&e);
+    let eig = gyration_eigenvalues(&pos, &patch);
+    let (flatness, prolateness) = shape_descriptors(eig);
+    // Mean coordination over the bonded interior (nodes with ≥1 bond) — the
+    // honeycomb signal (→ 3 for an interior-dominated patch).
+    let bonded_nodes: usize = hist.iter().skip(1).map(|&c| c as usize).sum();
+    let mean_interior = if bonded_nodes > 0 {
+        (2 * bonds.len()) as f32 / bonded_nodes as f32
+    } else {
+        0.0
+    };
+    // Argmax of the histogram = the modal coordination number.
+    let peak_deg = hist
+        .iter()
+        .enumerate()
+        .max_by_key(|&(_, &c)| c)
+        .map(|(d, _)| d)
+        .unwrap_or(0);
+
+    eprintln!(
+        "P2 sheet: degree hist {hist:?} (max {max_deg}, peak at deg {peak_deg}, \
+         mean interior {mean_interior:.2}) | patch {} nodes | nematic S {:.2} | \
+         flatness {flatness:.2} prolateness {prolateness:.2} | λ {eig:?}",
+        patch.len(),
+        obs.nematic_s
+    );
+
+    // HARD cap: valence 3 is never exceeded.
+    assert!(
+        max_deg <= 3,
+        "valence-3 cap must bound bonded degree at 3, got max {max_deg} (hist {hist:?})"
+    );
+    // The coordination histogram PEAKS at the target valence (the honeycomb signal):
+    // accept 2 or 3 as the mode (a finite patch has many degree-2 rim nodes), but
+    // require a real population AT 3 so the interior actually reaches trivalent.
+    assert!(
+        peak_deg == 2 || peak_deg == 3,
+        "honeycomb coordination should peak at 2–3 (rim + trivalent interior), peaked at {peak_deg} \
+         (hist {hist:?})"
+    );
+    assert!(
+        hist.get(3).copied().unwrap_or(0) >= 8,
+        "a honeycomb patch needs a real trivalent interior; got only {} degree-3 nodes \
+         (hist {hist:?})",
+        hist.get(3).copied().unwrap_or(0)
+    );
+    assert!(
+        mean_interior > 1.8,
+        "mean interior coordination should climb toward 3, got {mean_interior:.2} \
+         (hist {hist:?})"
+    );
+    // The largest bonded patch is locally PLANAR: clearly flatter than it is rod-like.
+    assert!(
+        patch.len() >= 20,
+        "the sheet patch must condense a real chunk of the soup, got {} nodes",
+        patch.len()
+    );
+    assert!(
+        flatness > prolateness,
+        "a sheet patch should read as FLAT, not rod-like: flatness {flatness:.2} \
+         should exceed prolateness {prolateness:.2}"
+    );
+}
+
+/// Node indices of the largest connected component of the bond graph (union-find).
+fn largest_bonded_members(n: usize, bonds: &[(u32, u32)]) -> Vec<usize> {
+    let mut parent: Vec<usize> = (0..n).collect();
+    fn find(p: &mut [usize], mut i: usize) -> usize {
+        while p[i] != i {
+            p[i] = p[p[i]];
+            i = p[i];
+        }
+        i
+    }
+    for &(a, b) in bonds {
+        let (ra, rb) = (find(&mut parent, a as usize), find(&mut parent, b as usize));
+        if ra != rb {
+            parent[ra.max(rb)] = ra.min(rb);
+        }
+    }
+    let mut groups: std::collections::HashMap<usize, Vec<usize>> = std::collections::HashMap::new();
+    for i in 0..n {
+        let r = find(&mut parent, i);
+        groups.entry(r).or_default().push(i);
+    }
+    groups
+        .into_values()
+        .max_by_key(|v| v.len())
+        .unwrap_or_default()
+}
+
+/// The engine's current positions (read-only test accessor) as an owned buffer,
+/// so the gyration-shape measurement runs on the live, already-relaxed config.
+fn current_positions(e: &GeometricEngine) -> Vec<f32> {
+    e.positions_for_test().to_vec()
+}
+
