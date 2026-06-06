@@ -26,20 +26,21 @@ pub mod proto {
     tonic::include_proto!("graph_compute");
 }
 
+pub mod analytics;
 pub mod bsp;
 pub mod engines;
 pub mod partition;
-pub mod sim;
 pub mod service;
+pub mod sim;
 pub mod topo_fisheye;
 
+pub use bsp::{run_bsp_mesh, BspWorker, LiveHaloProvider, MeshTransport};
 pub use engines::{
-    CpuSpringEngine, CsrShard, EngineCtx, EngineRegistry, Fa2BruteEngine, GeometricEngine,
-    GpuCtx, GraphAttributes, HaloUpdate, LayoutEngine, ShardMeta, StepOutput,
+    CpuSpringEngine, CsrShard, EngineCtx, EngineRegistry, Fa2BruteEngine, GeometricEngine, GpuCtx,
+    GraphAttributes, HaloUpdate, LayoutEngine, ShardMeta, StepOutput,
 };
 pub use partition::{
     partition_csr, run_superstep, run_superstep_local, HaloDelta, HaloTransport, LocalTransport,
     Partition, TonicHaloTransport, Worker,
 };
-pub use bsp::{run_bsp_mesh, BspWorker, LiveHaloProvider, MeshTransport};
 pub use service::HaloProvider;
