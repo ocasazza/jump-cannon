@@ -471,6 +471,52 @@ pub struct GeometricSettings {
     /// torque ([`kappa_bend`](Self::kappa_bend) / [`spont_curvature_c0`](Self::spont_curvature_c0));
     /// this term is what converts that orientational preference into real geometry.
     pub tilt_coupling_strength: f32,
+
+    // --- dynamic bonding (self-assembly P3): rim line-tension + bond-tilt ---
+    /// Rim **line-tension** strength — the term that closes an open dynamic-bond
+    /// sheet/disk into a shell (the Phase-C / vesicle unlock). `0` ⇒ OFF (the
+    /// default): no line-tension force is ever applied, so default-settings
+    /// behaviour — and the golden master — is byte-identical. `> 0` (and
+    /// `bonding_enabled`) adds an **attractive force between RIM nodes** — the
+    /// under-coordinated boundary nodes whose dynamic-bond valence is *below* their
+    /// class cap (a fully-coordinated interior node is NOT on the rim). Research
+    /// (Noguchi; Cooke–Deserno) shows open membranes do not close under isotropic
+    /// attraction (you get droplets); closure needs a one-dimensional tension along
+    /// the exposed *edge*. The dynamic-edge model gives that rim for free: pulling
+    /// the under-coordinated boundary nodes together shrinks the open edge, driving
+    /// a disk → bowl → vesicle first-order closure (with hysteresis). The force is
+    /// a soft attraction `line_tension·(1 − d/r_cut)` between rim pairs within
+    /// `line_tension_cutoff` (so it only seams *nearby* rim segments, never the far
+    /// side of the cluster). Requires a valence cap to define the rim
+    /// ([`default_max_valence`](Self::default_max_valence) or
+    /// [`max_valence`](Self::max_valence) set); with no cap every node is "full" so
+    /// there is no rim and this term is inert. Never read at the default
+    /// `bonding_enabled == false`.
+    pub line_tension: f32,
+    /// Cutoff distance for the rim [`line_tension`](Self::line_tension) attraction:
+    /// two rim nodes feel the seam force only when closer than this. Keeps the
+    /// closure force *local* to the open edge (a long-range rim attraction would
+    /// just collapse the disk into a ball, not seam its boundary). Falls back to
+    /// `2.5 · r_bond` when set non-positive/non-finite. Ignored when
+    /// `line_tension == 0`.
+    pub line_tension_cutoff: f32,
+    /// Spontaneous **curvature / tilt** between *bonded* neighbours (self-assembly
+    /// P3) — the preferred director (normal) tilt across each DYNAMIC bond, the
+    /// curvature half of the closure mechanism. `0` ⇒ OFF (the default): no
+    /// bond-tilt torque ⇒ byte-identical default behaviour and golden master. `> 0`
+    /// (and `bonding_enabled`) adds, inside [`integrate_directors`], a torque over
+    /// the dynamic-bond adjacency that drives each bonded pair's normals to tilt by
+    /// `spont_curvature` (radians, small-angle) about their in-plane separation
+    /// axis — exactly the splay-bend / spontaneous-curvature mechanism
+    /// ([`accumulate_bend_torque`]) but keyed on the *bond graph* rather than the
+    /// cohesion-well neighbour scan. A relaxed bonded sheet then acquires a uniform
+    /// curvature (radius `R ≈ bond-length / spont_curvature`), so with the
+    /// [`tilt_coupling_strength`](Self::tilt_coupling_strength) converting that
+    /// orientational preference into geometry, a flat bonded patch rolls toward a
+    /// tube/shell. It is a TORQUE ONLY (mutates `st.directors`), so the residual
+    /// invariant and golden master are untouched. Never read at the default
+    /// `bonding_enabled == false`.
+    pub spont_curvature: f32,
 }
 
 impl Default for GeometricSettings {
@@ -563,6 +609,16 @@ impl Default for GeometricSettings {
             default_max_valence: 0,
             bond_target_angle: Vec::new(),
             default_bond_angle: 180.0,
+
+            // Default OFF for P3: line_tension = 0 ⇒ no rim seam force, and
+            // spont_curvature = 0 ⇒ no bond-tilt torque. Both are additionally
+            // gated on `bonding_enabled` (false by default), so none of this is
+            // ever read at the default ⇒ byte-identical (golden + canaries
+            // unaffected). The cutoff carries a sensible non-zero default so
+            // enabling line-tension only takes setting `line_tension`.
+            line_tension: 0.0,
+            line_tension_cutoff: 0.0,
+            spont_curvature: 0.0,
         }
     }
 }
@@ -960,6 +1016,17 @@ impl GeometricEngine {
             .map(|st| st.dynamic_edges.iter().map(|e| (e.a, e.b)).collect())
     }
 
+    /// The current **rim** nodes of the dynamic-bond graph (self-assembly P3): the
+    /// under-coordinated boundary nodes the rim line-tension acts on (dynamic-bond
+    /// valence `≥ 1` but strictly below the class cap). Ascending node indices, or
+    /// an empty vec when there is no valence cap / no bonds. `None` before
+    /// [`init`](LayoutEngine::init). Exposed so the validation harness can assert
+    /// the rim is correctly identified (a flat disk's boundary, not its interior).
+    #[doc(hidden)]
+    pub fn rim_nodes_for_test(&self) -> Option<Vec<u32>> {
+        self.state.as_ref().map(|st| rim_nodes(st, &self.settings))
+    }
+
     /// The engine's current interleaved x,y,z positions (length `3n`), or an empty
     /// slice before [`init`](LayoutEngine::init). A read-only accessor so the
     /// validation harness can measure the *shape* (gyration tensor) of an
@@ -1147,6 +1214,14 @@ fn compute_forces(st: &State, s: &GeometricSettings) -> Vec<f32> {
         }
     }
     accumulate_exclusion_affinity(&mut force, st, s);
+    // Rim line-tension (self-assembly P3): an attractive seam force between the
+    // under-coordinated boundary ("rim") nodes of the dynamic-bond graph, which
+    // closes an open bonded sheet/disk into a shell. Empty unless `bonding_enabled`
+    // produced bonds AND `line_tension > 0` AND a valence cap defines a rim ⇒ a
+    // default run adds nothing here (byte-identical).
+    if s.bonding_enabled && s.line_tension > 0.0 && !st.dynamic_edges.is_empty() {
+        accumulate_line_tension_forces(&mut force, st, s);
+    }
     accumulate_gravity(&mut force, &st.positions, &st.resolved.mass, s.gravity);
     force
 }
@@ -1496,6 +1571,102 @@ fn accumulate_bond_angle_forces(force: &mut [f32], st: &State, s: &GeometricSett
                 }
                 apply_angle_pair(force, &st.positions, c, j, kn, ideal_rad, k);
             }
+        }
+    }
+}
+
+/// Per-node dynamic-bond **valence** (count of dynamic edges incident to each
+/// node). Deterministic; the same counter the bond stage's valence cap maintains,
+/// re-derived here for the force pass / rim detection.
+fn dynamic_bond_valence(st: &State) -> Vec<u32> {
+    let mut v = vec![0u32; st.n];
+    for e in &st.dynamic_edges {
+        v[e.a as usize] += 1;
+        v[e.b as usize] += 1;
+    }
+    v
+}
+
+/// The **rim** of the dynamic-bond graph: the under-coordinated boundary nodes
+/// whose dynamic-bond valence is *strictly below* their class cap (a fully-
+/// coordinated interior node is NOT on the rim). A node with zero bonds is not a
+/// rim node either — the rim is the exposed *edge of a bonded patch*, so it must
+/// carry at least one bond. Returns the node indices, ascending (deterministic).
+///
+/// Requires a valence cap to be meaningful: with no cap (`default_max_valence == 0`
+/// and an empty table) every bonded node counts as "full" and the rim is empty, so
+/// the caller's line-tension term is inert (documented on
+/// [`GeometricSettings::line_tension`]).
+fn rim_nodes(st: &State, s: &GeometricSettings) -> Vec<u32> {
+    let capped = s.default_max_valence != 0 || !s.max_valence.is_empty();
+    if !capped {
+        return Vec::new();
+    }
+    let valence = dynamic_bond_valence(st);
+    let class = &st.resolved.class;
+    (0..st.n)
+        .filter(|&i| {
+            let v = valence[i];
+            // Bonded but under-coordinated ⇒ on the boundary of the bonded patch.
+            v >= 1 && v < lookup_max_valence(s, class[i] as usize)
+        })
+        .map(|i| i as u32)
+        .collect()
+}
+
+/// Rim **line-tension** (self-assembly P3): a soft attractive seam force between
+/// nearby rim (under-coordinated) nodes of the dynamic-bond graph. This is the
+/// closure mechanism — pulling the exposed boundary of an open bonded sheet/disk
+/// together shrinks its rim, driving disk → bowl → vesicle (Noguchi rim line-
+/// tension; design §3).
+///
+/// For each pair of rim nodes within `line_tension_cutoff` the force is the
+/// negative gradient of a soft triangular potential `V = ½·γ·(r_cut − d)²/r_cut`
+/// (so the magnitude `γ·(1 − d/r_cut)` falls linearly from `γ` at contact to `0`
+/// at the cutoff). It is attractive (pulls the two rim nodes together). The cutoff
+/// keeps it LOCAL to the open edge — a long-range rim attraction would just
+/// collapse the patch into a ball rather than seam its boundary. `O(rim²)`, which
+/// is small (the rim is a 1-D boundary, `≈ √n` of the patch).
+fn accumulate_line_tension_forces(force: &mut [f32], st: &State, s: &GeometricSettings) {
+    let rim = rim_nodes(st, s);
+    if rim.len() < 2 {
+        return;
+    }
+    let r_cut = if s.line_tension_cutoff.is_finite() && s.line_tension_cutoff > 1e-4 {
+        s.line_tension_cutoff
+    } else {
+        2.5 * s.r_bond.max(1e-3)
+    };
+    let r_cut2 = r_cut * r_cut;
+    let gamma = s.line_tension;
+    let pos = &st.positions;
+    for ai in 0..rim.len() {
+        let i = rim[ai] as usize;
+        for bi in (ai + 1)..rim.len() {
+            let j = rim[bi] as usize;
+            // Skip pairs already bonded: their bond spring already holds them; the
+            // rim tension is for seaming *unbonded* boundary segments together.
+            if st.bonded.contains(&canon_pair(i, j)) {
+                continue;
+            }
+            let dx = pos[3 * j] - pos[3 * i];
+            let dy = pos[3 * j + 1] - pos[3 * i + 1];
+            let dz = pos[3 * j + 2] - pos[3 * i + 2];
+            let dist2 = dx * dx + dy * dy + dz * dz;
+            if dist2 >= r_cut2 {
+                continue;
+            }
+            let dist = dist2.sqrt().max(1e-4);
+            // Attractive magnitude γ·(1 − d/r_cut) (∈ [0, γ]); +toward j on i.
+            let mag = gamma * (1.0 - dist / r_cut);
+            let f = mag / dist;
+            let (fx, fy, fz) = (f * dx, f * dy, f * dz);
+            force[3 * i] += fx;
+            force[3 * i + 1] += fy;
+            force[3 * i + 2] += fz;
+            force[3 * j] -= fx;
+            force[3 * j + 1] -= fy;
+            force[3 * j + 2] -= fz;
         }
     }
 }
@@ -2005,7 +2176,11 @@ fn integrate_directors(st: &mut State, s: &GeometricSettings) {
     let noise_on = kt > 0.0 && s.rotational_diffusion > 0.0;
     let align_on = s.anisotropy_strength > 0.0 && s.well_depth > 0.0;
     let bend_on = s.kappa_bend > 0.0 && s.well_depth > 0.0;
-    if !noise_on && !align_on && !bend_on {
+    // Bond-tilt (P3): a curvature torque over the DYNAMIC-bond adjacency, gated on
+    // `bonding_enabled` AND a non-zero `spont_curvature` AND the presence of bonds.
+    let bond_tilt_on =
+        s.bonding_enabled && s.spont_curvature != 0.0 && !st.dynamic_edges.is_empty();
+    if !noise_on && !align_on && !bend_on && !bond_tilt_on {
         return; // directors are static — nothing (incl. RNG) is consumed
     }
     let n = st.n;
@@ -2113,6 +2288,42 @@ fn integrate_directors(st: &mut State, s: &GeometricSettings) {
         }
     }
 
+    // --- bond-tilt field (P3): curvature torque over the DYNAMIC-bond graph -----
+    // The same splay-bend / spontaneous-curvature mechanism as above, but keyed on
+    // the explicit dynamic-bond adjacency rather than the cohesion-well neighbour
+    // scan — so a bonded sheet (not just a cohering droplet) acquires a uniform
+    // inter-normal tilt of `spont_curvature` radians, the curvature that (with the
+    // tilt coupling) rolls a flat bonded patch toward a tube/shell. No distance
+    // falloff (bonds are explicit topology); the per-bond torque weight is unit, so
+    // `spont_curvature` alone sets the tilt magnitude. Accumulated into its own
+    // field so it has an independent mobility (it must act even when `kappa_bend`,
+    // the cohesion-well bend modulus, is 0).
+    let mut bond_tilt_field = vec![0.0f32; 3 * n];
+    if bond_tilt_on {
+        let c0 = s.spont_curvature;
+        for e in &st.dynamic_edges {
+            let (i, j) = (e.a as usize, e.b as usize);
+            let dx = pos[3 * j] - pos[3 * i];
+            let dy = pos[3 * j + 1] - pos[3 * i + 1];
+            let dz = pos[3 * j + 2] - pos[3 * i + 2];
+            let d = (dx * dx + dy * dy + dz * dz).sqrt();
+            if d < 1e-6 {
+                continue;
+            }
+            let inv = 1.0 / d;
+            let (rx, ry, rz) = (dx * inv, dy * inv, dz * inv); // r̂ from i→j
+            let (nix, niy, niz) = (dir[3 * i], dir[3 * i + 1], dir[3 * i + 2]);
+            let (njx, njy, njz) = (dir[3 * j], dir[3 * j + 1], dir[3 * j + 2]);
+            // Target for n_j: tilt n_i toward r̂ by c₀; for n_i: tilt n_j toward −r̂.
+            accumulate_bend_torque(
+                &mut bond_tilt_field, j, nix, niy, niz, rx, ry, rz, njx, njy, njz, c0, 1.0,
+            );
+            accumulate_bend_torque(
+                &mut bond_tilt_field, i, njx, njy, njz, -rx, -ry, -rz, nix, niy, niz, c0, 1.0,
+            );
+        }
+    }
+
     // --- integrate each director: align toward its field + rotational noise ---
     // Overdamped rotational step toward the field's *direction*: the aligning
     // field h is normalised to a unit target before use, so the per-step rotation
@@ -2124,6 +2335,10 @@ fn integrate_directors(st: &mut State, s: &GeometricSettings) {
     // rate uses (the splay-bend torque is already an accumulated sum over
     // neighbours, so an unbounded κ would overshoot and oscillate the director).
     let bend_mobility = s.kappa_bend.min(1.0);
+    // Bounded bond-tilt rate (P3), same min(.,1) overshoot guard: `spont_curvature`
+    // is the tilt *angle*, so the rate is fixed at 1 (full overdamped step toward
+    // the bond-tilt target), clamped so the per-step rotation can't overshoot.
+    let bond_tilt_mobility = if bond_tilt_on { 1.0f32 } else { 0.0 };
     let noise_sigma = if noise_on {
         (s.rotational_diffusion * kt * dt).sqrt()
     } else {
@@ -2157,6 +2372,13 @@ fn integrate_directors(st: &mut State, s: &GeometricSettings) {
             ax += dt * bend_mobility * bend_field[3 * i];
             ay += dt * bend_mobility * bend_field[3 * i + 1];
             az += dt * bend_mobility * bend_field[3 * i + 2];
+        }
+        if bond_tilt_on {
+            // bond_tilt_field is already the perpendicular-to-nᵢ curvature torque
+            // (summed over the node's dynamic bonds). Apply it like the bend step.
+            ax += dt * bond_tilt_mobility * bond_tilt_field[3 * i];
+            ay += dt * bond_tilt_mobility * bond_tilt_field[3 * i + 1];
+            az += dt * bond_tilt_mobility * bond_tilt_field[3 * i + 2];
         }
         if noise_sigma > 0.0 {
             ax += noise_sigma * next_gaussian(&mut st.rot_rng);

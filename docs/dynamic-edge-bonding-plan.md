@@ -104,7 +104,22 @@ attraction** (you get droplets). Closure needs a **rim LINE-TENSION** and/or ben
    valence) + nematic S.
 3. **P3 — rim line-tension + spontaneous curvature/tilt** → **tubes & vesicles**. Validate the
    R_g closure jump + curvature/closure order parameter; reproduce the disk→bowl→vesicle
-   first-order transition (hysteresis).
+   first-order transition (hysteresis). **LANDED** (CPU). Two default-OFF knobs:
+   `line_tension` (an attractive seam force between the under-coordinated *rim* nodes — those
+   whose dynamic-bond valence is below their class cap; both gated on `bonding_enabled`) and
+   `spont_curvature` (a director-tilt torque over the *dynamic-bond* adjacency, the curvature
+   half). Canaries in `tests/geometric_solver.rs`: `p3_rim_is_the_under_coordinated_boundary`
+   (rim = the geometric boundary of a bonded hex disk, valence-6 interior excluded),
+   `p3_line_tension_closes_a_seeded_disk` (line-tension + curvature fold a flat bonded disk
+   from closure 0.25→0.59), `p3_closure_is_hysteretic` (BISTABILITY: at one intermediate
+   line-tension γ_mid the from-flat branch stays OPEN ≈0.23 while the from-folded branch stays
+   CLOSED ≈0.63 — the first-order loop; rim tension does not fold a flat disk but HOLDS a
+   folded one shut), `p3_spontaneous_closure_from_a_soup_is_logged_honestly`.
+   **Honesty (logged, not faked):** full *stable* seal (closure ≥0.85 held as a T=0 fixed
+   point) and *spontaneous* soup→vesicle closure are NOT reached in a unit-test budget — the
+   open-disk/vesicle kinetic trap (and a Brownian soup condenses a dense BALL, which the
+   ball-vs-shell-blind closure metric reads as "closed"). The CAPABILITY + DETECTOR are
+   validated on the seeded disk + the hysteresis loop; spontaneity is logged as not reached.
 4. **P4 — GPU port**: sort-based atomics-free grid build, stream-compacted edge buffer, share
    the grid with Barnes-Hut; benchmark O(n) scaling toward ~1M.
 5. **P5 — UI + tvix presets** (ties to the YAML-state + tvix-generator features): the lipid →
