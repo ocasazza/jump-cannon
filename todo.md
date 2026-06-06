@@ -34,3 +34,21 @@ Integration still owed in jump-cannon proper:
       out-degree `inv_deg`) and global dangling-mass redistribution are the
       follow-on needed before it can fully replace cuGraph's *directed* path in
       lavender's `backend.py`.
+
+## Testing / CI (found while wiring the Hydra regression suite)
+
+- [ ] **nextest profile `filter` key is silently ignored.** `.config/nextest.toml`
+      uses `filter = "..."` on the `unit`/`integration`/`e2e` profiles, but
+      nextest does not recognize that key (it warns: "ignoring unknown
+      configuration keys: profile.unit.filter ..."). So those profiles do **not**
+      scope their test sets — they only differ in fail-fast/test-threads, and the
+      `tests-unit`/`tests-integration`/`tests-e2e` crane checks all run the same
+      full suite (GPU/cluster tests just skip in the sandbox). The correct key is
+      `default-filter` (used by the new `gpu` profile). Migrate the others, or
+      collapse the redundant checks.
+- [ ] **Confirm Metal works inside the aarch64-darwin Nix build sandbox.** The
+      `tests-gpu` check + any bench-as-derivation rely on a wgpu adapter being
+      reachable from within a `nix build` on the darwin Hydra builders. If the
+      sandbox blocks Metal/IOKit, those jobs would need `__noChroot`/an impure
+      runner (or run via the nix-darwin GitHub Actions runner instead). The Linux
+      lavapipe path is sandbox-safe and is the gating correctness path regardless.

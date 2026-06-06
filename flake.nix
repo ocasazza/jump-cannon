@@ -549,6 +549,27 @@
             nativeBuildInputs = [ pkgs.pkg-config ];
             buildInputs = bevyLibs;
           });
+          # GPU analytics correctness (gpu_pagerank_* + gpu_engines). The kernels
+          # run on a real wgpu adapter: Metal on the aarch64-darwin builders, and
+          # lavapipe software-Vulkan in the Linux sandbox so the WGSL actually
+          # executes (not just compiles). Linux sets GPU_PAGERANK_REQUIRE_ADAPTER
+          # so a missing/misconfigured adapter is a hard failure rather than a
+          # silent skip. Scale test runs a small N here; the millions-scale
+          # timing is a report-only bench on the Metal builders.
+          tests-gpu = craneLib.cargoNextest (commonArgs // {
+            cargoArtifacts = depsNative;
+            cargoNextestExtraArgs = "--profile gpu -p graph-compute";
+            nativeBuildInputs = [ pkgs.pkg-config ];
+            buildInputs = bevyLibs;
+            GPU_PAGERANK_SCALE_N = "200000";
+          } // pkgs.lib.optionalAttrs pkgs.stdenv.isLinux {
+            VK_ICD_FILENAMES =
+              "${pkgs.mesa}/share/vulkan/icd.d/lvp_icd.x86_64.json";
+            LD_LIBRARY_PATH =
+              pkgs.lib.makeLibraryPath (bevyLibsLinux ++ [ pkgs.vulkan-loader ]);
+            GPU_PAGERANK_REQUIRE_ADAPTER = "1";
+          });
+
           fmt = craneLib.cargoFmt { inherit src; };
 
           # WASM: clippy only (no test runner for wasm32 in CI)

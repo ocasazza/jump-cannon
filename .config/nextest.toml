@@ -22,3 +22,18 @@ filter = "test(/integration::/)"
 fail-fast = false
 test-threads = 1
 filter = "test(/e2e::/)"
+
+# GPU analytics correctness: the gpu_pagerank_* suites + gpu_engines. Needs a
+# wgpu adapter — real Metal on the darwin builder, or lavapipe software-Vulkan
+# in the Linux sandbox (VK_ICD_FILENAMES). The `tests-gpu` crane check runs this
+# profile with GPU_PAGERANK_REQUIRE_ADAPTER=1 so a missing adapter fails loudly
+# instead of silently skipping. Single-threaded: one GPU device, avoid contention.
+#
+# NOTE: `default-filter` is the correct key — the `filter` key used by the
+# unit/integration/e2e profiles below is NOT recognized by nextest and is
+# silently ignored (so those profiles currently do not scope their test sets;
+# they only differ in fail-fast/test-threads). Tracked in todo.md.
+[profile.gpu]
+fail-fast = false
+test-threads = 1
+default-filter = "binary(/gpu_pagerank/) | binary(gpu_engines)"
