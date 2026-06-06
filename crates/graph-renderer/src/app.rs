@@ -66,6 +66,12 @@ pub struct App {
     modal: ui::ModalState,
     /// Async slot the fetch task writes the NodeMeta into.
     node_fetch: NodeFetchSlot,
+    /// In-flight Generate (tvix) evaluation, if any. Spawned from
+    /// `state.generate.request` so `tvix_wasm::eval_graph` runs OFF the
+    /// click-handler (native: a real thread; WASM: paint-first-then-run).
+    /// Polled each frame by `drain_generated_graph`; the `Ok` graph lands in
+    /// `state.generate.pending` for the existing promotion path.
+    generate_job: Option<crate::job::BackgroundJob<tvix_wasm::GeneratedGraph>>,
     /// Cached idx -> string id table (from Bootstrap.ids), used to resolve
     /// raycast hits to node ids. Populated when bootstrap promotes to GPU.
     ids: Vec<String>,
@@ -561,6 +567,7 @@ impl App {
             logged_ready: false,
             modal: ui::ModalState::default(),
             node_fetch: Arc::new(Mutex::new(None)),
+            generate_job: None,
             ids: Vec::new(),
             id_to_idx: HashMap::new(),
             metrics: HashMap::new(),
@@ -901,12 +908,87 @@ impl App {
         pipes.raycast(ndc_x, ndc_y, screen_px)
     }
 
-    /// Take a pending graph produced by the Generate (tvix) panel, convert
+    /// Drive the Generate (tvix) evaluation job: kick one off when the panel
+    /// has recorded a `request`, then poll an in-flight job and route its
+    /// result back through the existing `state.generate.pending` handoff.
+    ///
+    /// This is what keeps a large `eval_graph` off the click-handler. The
+    /// work runs via [`crate::job::BackgroundJob`] — genuinely off-thread on
+    /// native, paint-first-then-run on WASM (see the job module docs) — with
+    /// coarse progress (`queued → evaluating → done + counts`) surfacing in
+    /// the footer task list and the debug console.
+    fn pump_generate_job(&mut self) {
+        // 1. Kick off a job from a pending request (one job at a time — the
+        //    panel guards against re-requesting while `request` is set, and we
+        //    only spawn when no job is in flight).
+        if self.generate_job.is_none() {
+            if let Some(src) = self.state.generate.request.take() {
+                let job = crate::job::BackgroundJob::spawn(
+                    self.progress.sink(),
+                    "generate",
+                    "evaluate expression",
+                    move |s| {
+                        s.info("generate", "evaluating Nix expression…");
+                        let graph = tvix_wasm::eval_graph(&src)?;
+                        s.info(
+                            "generate",
+                            format!(
+                                "evaluated: {} nodes, {} edges — building graph",
+                                graph.nodes.len(),
+                                graph.edges.len()
+                            ),
+                        );
+                        Ok(graph)
+                    },
+                );
+                self.generate_job = Some(job);
+            }
+        }
+
+        // 2. Poll an in-flight job. On WASM the first poll runs the (deferred)
+        //    work — egui painted the "queued" frame between spawn and now.
+        if let Some(job) = self.generate_job.as_mut() {
+            if let Some(result) = job.poll() {
+                self.generate_job = None;
+                match result {
+                    Ok(graph) => {
+                        self.state.generate.editor.error = None;
+                        self.state.generate.editor.status = Some(format!(
+                            "{} nodes, {} edges",
+                            graph.nodes.len(),
+                            graph.edges.len()
+                        ));
+                        // Hand to the existing promotion path below.
+                        self.state.generate.pending = Some(graph);
+                    }
+                    Err(err) => {
+                        // Surface the eval error inline in the panel, exactly
+                        // as the old inline path did.
+                        self.state.generate.editor.status = None;
+                        self.state.generate.editor.error = Some(err);
+                    }
+                }
+            } else {
+                // Still running — keep the frame loop alive so we re-poll
+                // (and on WASM actually drive the deferred work) next frame.
+                // The caller (`update`) requests a repaint when a job is live.
+            }
+        }
+    }
+
+    /// `true` while a Generate evaluation job is in flight — used by `update`
+    /// to keep requesting repaints so the job keeps getting polled.
+    fn generate_job_active(&self) -> bool {
+        self.generate_job.is_some() || self.state.generate.request.is_some()
+    }
+
+    /// Take a pending graph produced by the Generate (tvix) eval job, convert
     /// it to a [`Bootstrap`], publish it as `LoadState::Ready`, and reset the
     /// GPU load latch so `try_promote_bootstrap_to_gpu` re-loads it this
     /// frame — replacing the live graph. The panel itself has no access to
     /// `self.load` / GPU pipelines, so it hands off through the one-shot
-    /// `state.generate.pending` field (set on a successful "Evaluate").
+    /// `state.generate.pending` field (set by `pump_generate_job` when the
+    /// background eval completes).
     fn drain_generated_graph(&mut self) {
         let Some(graph) = self.state.generate.pending.take() else {
             return;
@@ -1200,6 +1282,16 @@ impl eframe::App for App {
         // Drain progress events posted by async tasks before any UI runs
         // so the footer renders fresh state this frame.
         self.progress.drain_sink();
+
+        // Pump the Generate (tvix) eval job: spawn one from a pending panel
+        // request, poll an in-flight one, and route its result into
+        // `state.generate.pending`. While a job is live we keep requesting
+        // repaints so it stays polled (on WASM the first poll runs the
+        // deferred work after a paint-first frame).
+        self.pump_generate_job();
+        if self.generate_job_active() {
+            ctx.request_repaint();
+        }
 
         // Drain a freshly generated (tvix) graph, if any, into the shared
         // load slot so the promote path below replaces the live graph.

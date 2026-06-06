@@ -1052,11 +1052,19 @@ pub struct GenerateState {
     #[serde(default)]
     pub editor: crate::ui::nix_extension::NixEditorState,
     /// One-shot: a freshly evaluated graph awaiting promotion to the GPU.
-    /// Set by the panel on a successful "Evaluate"; taken by `App::update`,
-    /// which converts it to a `Bootstrap` and replaces the live graph.
-    /// Transient handoff slot — never persisted.
+    /// Set by `App::update` once the background eval job completes; taken on
+    /// the next frame, converted to a `Bootstrap`, and used to replace the
+    /// live graph. Transient handoff slot — never persisted.
     #[serde(skip)]
     pub pending: Option<tvix_wasm::GeneratedGraph>,
+    /// One-shot: a request to evaluate this Nix source OFF the click-handler.
+    /// Set by the panel when the user presses "Evaluate"; taken by
+    /// `App::update`, which spawns a [`crate::job::BackgroundJob`] running
+    /// `tvix_wasm::eval_graph` so a large graph doesn't freeze the UI (native:
+    /// off-thread; WASM: paint-first-then-run with coarse progress). Transient
+    /// handoff slot — never persisted.
+    #[serde(skip)]
+    pub request: Option<String>,
 }
 
 /// A star-graph demo authored against the embedded tvix graph library. It

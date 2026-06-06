@@ -51,14 +51,23 @@ pub fn show(ui: &mut egui::Ui, state: &mut AppState) {
         rows: 14,
     };
 
-    if let Some(graph) =
-        component.show(ui, &mut state.generate.editor, |src| tvix_wasm::eval_graph(src))
-    {
-        // Success: record a count readout and hand the graph to App::update for
-        // promotion to the GPU.
-        state.generate.editor.status =
-            Some(format!("{} nodes, {} edges", graph.nodes.len(), graph.edges.len()));
-        state.generate.pending = Some(graph);
+    // The evaluation no longer runs inline on this click-handler — that froze
+    // the tab for a large graph. Instead the button records a one-shot
+    // `request` (the source to evaluate); `App::update` spawns a
+    // `crate::job::BackgroundJob` to run `tvix_wasm::eval_graph` off the
+    // click-handler (native: a real thread; WASM: paint-first-then-run, with
+    // coarse progress in the footer + debug console). The component's
+    // `evaluate` callback therefore just hands back the source string and
+    // never errors here — real eval errors arrive later via the job and are
+    // written back into `editor.error` by `App`.
+    let already_running = state.generate.request.is_some();
+    if let Some(src) = component.show(ui, &mut state.generate.editor, |src| {
+        Ok::<String, String>(src.to_string())
+    }) {
+        if !already_running {
+            state.generate.editor.status = Some("queued…".into());
+            state.generate.request = Some(src);
+        }
     }
 }
 

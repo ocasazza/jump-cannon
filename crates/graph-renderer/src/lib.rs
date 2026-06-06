@@ -20,6 +20,7 @@ pub mod fetch;
 pub mod generate;
 pub mod graph_callback;
 pub mod graph_pipelines;
+pub mod job;
 pub mod perf;
 pub mod proto;
 pub mod ui;
