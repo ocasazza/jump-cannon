@@ -628,7 +628,7 @@ impl Default for GeometricSettings {
 // ---------------------------------------------------------------------------
 
 /// A unique undirected edge with its resolved geometry, built once at `init`.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct ResolvedEdge {
     pub a: u32,
     pub b: u32,
@@ -1084,6 +1084,80 @@ impl GeometricEngine {
     pub fn observe_assembly_with(&self, contact_scale: f32) -> Option<AssemblyObservables> {
         let st = self.state.as_ref()?;
         Some(assembly_observables(st, &self.settings, contact_scale))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Reversible timeline: snapshot / restore (record + deterministic replay)
+// ---------------------------------------------------------------------------
+
+/// A keyframe of the engine's *evolving* state — everything a `step` mutates.
+///
+/// The CPU geometric engine is deterministic (SplitMix64 RNG, no atomics), so
+/// restoring a snapshot and re-stepping reproduces the recorded trajectory
+/// **bit-exactly**. This is the GGPO / `rr` / MD-checkpoint primitive the
+/// scrubbable timeline is built on (see `docs/reversible-timeline-plan.md`):
+/// seek = restore the nearest keyframe, then replay forward.
+///
+/// Only mutable state is captured — the immutable `graph`, resolved attribute
+/// vectors, and `GeometricSettings` are fixed at `init`/`set_params` and so are
+/// NOT part of a keyframe (restore targets the same engine instance). Capturing
+/// *every* evolving field is load-bearing: the round-trip test exercises a
+/// stochastic + dynamic-bonding scenario, so a snapshot that misses any field
+/// (rng, rot_rng, directors, the bond set, step_count, …) diverges and fails.
+#[derive(Clone, Debug, PartialEq)]
+pub struct EngineSnapshot {
+    positions: Vec<f32>,
+    velocities: Vec<f32>,
+    directors: Vec<f32>,
+    rng: u64,
+    rot_rng: u64,
+    dynamic_edges: Vec<ResolvedEdge>,
+    bonded: std::collections::HashSet<(u32, u32)>,
+    step_count: u64,
+}
+
+impl GeometricEngine {
+    /// Capture a keyframe of the current evolving state. `None` before a
+    /// successful [`init`](LayoutEngine::init).
+    pub fn snapshot(&self) -> Option<EngineSnapshot> {
+        let st = self.state.as_ref()?;
+        Some(EngineSnapshot {
+            positions: st.positions.clone(),
+            velocities: st.velocities.clone(),
+            directors: st.directors.clone(),
+            rng: st.rng,
+            rot_rng: st.rot_rng,
+            dynamic_edges: st.dynamic_edges.clone(),
+            bonded: st.bonded.clone(),
+            step_count: st.step_count,
+        })
+    }
+
+    /// Restore a keyframe captured by [`snapshot`](Self::snapshot). Re-stepping
+    /// from here reproduces the recorded trajectory bit-exactly. Errors before
+    /// `init` or on a node-count mismatch (a snapshot from a different graph).
+    pub fn restore(&mut self, snap: &EngineSnapshot) -> Result<(), String> {
+        let st = self
+            .state
+            .as_mut()
+            .ok_or_else(|| "restore before init".to_string())?;
+        if snap.positions.len() != st.positions.len() {
+            return Err(format!(
+                "snapshot positions length {} != engine {}",
+                snap.positions.len(),
+                st.positions.len()
+            ));
+        }
+        st.positions.clone_from(&snap.positions);
+        st.velocities.clone_from(&snap.velocities);
+        st.directors.clone_from(&snap.directors);
+        st.rng = snap.rng;
+        st.rot_rng = snap.rot_rng;
+        st.dynamic_edges.clone_from(&snap.dynamic_edges);
+        st.bonded.clone_from(&snap.bonded);
+        st.step_count = snap.step_count;
+        Ok(())
     }
 }
 

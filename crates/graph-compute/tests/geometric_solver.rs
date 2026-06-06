@@ -3139,6 +3139,109 @@ fn morphology_quaternary_vesicle_is_closed() {
 }
 
 // ---------------------------------------------------------------------------
+// 1c. TIMELINE — deterministic snapshot/restore (bit-exact replay)
+// ---------------------------------------------------------------------------
+//
+// The scrubbable timeline (docs/reversible-timeline-plan.md) is built on record +
+// deterministic replay (the GGPO / rr / MD-checkpoint pattern): seek = restore the
+// nearest keyframe, then replay forward. The CPU engine is deterministic, so this
+// MUST be bit-exact. These canaries run a stochastic + dynamic-bonding +
+// anisotropic soup so every evolving field (positions, velocities, directors,
+// rng, rot_rng, the dynamic bond set, step_count) is in play — a snapshot/restore
+// that drops any field would diverge here.
+
+/// Soup with the thermostat + dynamic bonding + director anisotropy ALL active,
+/// so every mutable engine field evolves each step.
+fn replay_soup_settings() -> GeometricSettings {
+    GeometricSettings {
+        bonding_enabled: true,
+        r_bond: 1.0,
+        r_break: 1.3,
+        bond_stiffness: 0.3,
+        bond_every: 4,
+        default_max_valence: 3,
+        default_bond_angle: 120.0,
+        well_depth: 1.0,
+        well_width: 1.0,
+        exclusion_strength: 1.0,
+        anisotropy_strength: 1.0,
+        temperature: 0.5,
+        rng_seed: 0x00A1_1CE5,
+        gravity: 0.0,
+        max_step: 0.0,
+        ..GeometricSettings::default()
+    }
+}
+
+fn fresh_soup_engine(n: usize) -> (GeometricEngine, EngineCtx) {
+    let g = no_edges(n);
+    let mut e = GeometricEngine::new();
+    e.set_params(&serde_json::to_value(&replay_soup_settings()).unwrap())
+        .expect("set_params");
+    let mut ctx = EngineCtx::cpu_only();
+    e.init(&mut ctx, &CsrShard::whole(&g), &deterministic_seed(n, 5.0))
+        .expect("init");
+    // (g is cloned into the engine's State at init, so dropping it here is fine.)
+    (e, ctx)
+}
+
+#[test]
+fn replay_from_a_restored_keyframe_is_bit_exact() {
+    let n = 200;
+    let (mut e, mut ctx) = fresh_soup_engine(n);
+
+    // Warm up to a non-trivial state (bonds formed, directors rotated, RNG advanced).
+    for _ in 0..40 {
+        e.step(&mut ctx);
+    }
+    let key = e.snapshot().expect("snapshot after init");
+
+    // Run forward and capture the reference final state.
+    for _ in 0..60 {
+        e.step(&mut ctx);
+    }
+    let reference = e.snapshot().unwrap();
+
+    // The scenario must actually evolve — else the round-trip is vacuous.
+    assert_ne!(key, reference, "the soup must evolve over 60 steps (non-trivial replay)");
+
+    // Restore the keyframe and replay the SAME number of steps.
+    e.restore(&key).expect("restore");
+    for _ in 0..60 {
+        e.step(&mut ctx);
+    }
+    let replayed = e.snapshot().unwrap();
+
+    // Bit-exact: the WHOLE snapshot (positions/velocities/directors/rng/rot_rng/
+    // bond set/step_count) must match. A snapshot/restore that dropped any field
+    // would diverge and fail this.
+    assert_eq!(
+        reference, replayed,
+        "replay from a restored keyframe must reproduce the trajectory bit-exactly"
+    );
+}
+
+#[test]
+fn same_seed_runs_are_bit_identical() {
+    // The replay precondition: the CPU engine has no hidden global / wall-clock
+    // nondeterminism, so two fresh runs from the same seed + settings produce
+    // bit-identical state.
+    let n = 200;
+    let run = || {
+        let (mut e, mut ctx) = fresh_soup_engine(n);
+        for _ in 0..80 {
+            e.step(&mut ctx);
+        }
+        e.snapshot().unwrap()
+    };
+    assert_eq!(
+        run(),
+        run(),
+        "two identical-seed CPU runs must be bit-identical (deterministic replay precondition)"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // 2. REGRESSION — golden master of a fixed, force-rich scenario
 // ---------------------------------------------------------------------------
 
