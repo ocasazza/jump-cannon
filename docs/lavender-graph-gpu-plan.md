@@ -260,6 +260,16 @@ fn gpu_pagerank_scales_to_millions() {
 }
 ```
 
+### Precision (storage vs accumulate)
+
+The kernel is generic over **storage** precision, never over accumulation. WGSL/WebGPU/Metal support **f32** and **f16** (`enable f16;` + the adapter's `shader-f16` feature) but have **no f64** — and Apple GPUs have no fp64 hardware regardless. So:
+
+- **Storage precision** = `S: GpuFloat` ∈ `{f32, f16}` for the matrix values / edge weights. `gpu_pagerank::<S: GpuFloat>(ctx, &CsrGraph, damping, iters) -> Vec<f32>`. f32 is the default; f16 is opt-in, **gated on `wgpu::Features::SHADER_F16`** with automatic f32 fallback (the shader variant is chosen at pipeline creation).
+- **Accumulation is always f32.** WGSL loads f16, widens to f32 for the `Σ r[u]/deg(u)` reduction and the damping/teleport finalize, then narrows on store. (`shader-f16` is a feature; two compiled variants or an override-constant `STORE_F16` select the path.)
+- **Memory payoff at scale.** f16 halves the dominant **edge-value** term — a weighted CSR entry goes 8 → 6 B/edge (4 B `u32` index + **2 B** f16 value) and the value array halves; combined with ~2× f16 throughput on Apple GPUs this is the difference between fitting and partitioning near the §4 ceiling (matters for weighted/chemical SpMV; for *unweighted* PageRank the win is bandwidth, not capacity).
+- **f16 rank-underflow rule (correctness, load-bearing).** At 8M nodes the ranks are ≈ `1/n ≈ 1.3e-7`, **below f16's smallest normal (~6.1e-5)** → they underflow. Therefore **the rank vector stays f32 even when the matrix is f16** (mixed mode), or ranks are rescaled (track `n·r` near 1.0). `gpu_pagerank` defaults to *f16-matrix / f32-rank* for large `n`; pure-f16 ranks are allowed only for small graphs and must pass the oracle tolerance.
+- **`Vec<precision>` return.** f16/f32 are genuine GPU-compute precisions; a `Vec<f64>` return is a host-side widening *convenience only* (carries no double-precision compute — documented as such). True f64 would require a NVIDIA-only `cudarc` kernel and is explicitly out of scope for the hardware-agnostic path.
+
 ### Milestones (Part A)
 
 - **P0 — primitive + kernel.** Add the `analytics` module (`mod.rs`, `pagerank.rs`, `spmv.rs`) + `pagerank.wgsl` with the three entry points; implement the `CsrCompute` buffer builder reusing `geometric_gpu.rs` single-buffer packing + host-precomputed `deg`; wire `pr_dangling_sum` + `pr_spmv` + `pr_finalize` with `r_a`/`r_b` ping-pong and per-iter params write; add `lib.rs` export + dev-deps; unit test (in `pagerank.rs #[cfg(test)]`) vs an inlined copy of `geometric::pagerank` on triangle/dumbbell.
