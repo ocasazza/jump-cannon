@@ -370,6 +370,42 @@ pub struct GeometricSettings {
     /// magnitude only) — consistent with how the patchy anisotropy factor already
     /// omits its angular translational force.
     pub gb_side_strength: f32,
+    // --- dynamic bonding (self-assembly P1) ---
+    /// Master switch for the dynamic-bond stage. `false` ⇒ OFF (the default): no
+    /// dynamic edges are ever created, the bond stage never runs, and the engine
+    /// behaves *byte-identically* to before this feature existed — the geometric
+    /// golden master and every canary stay green and unchanged. `true` ⇒ every
+    /// [`bond_every`](Self::bond_every) steps the engine runs a uniform cell-list
+    /// neighbour search and adds/removes **dynamic edges** (bonds) under a
+    /// proximity + class-compatibility constraint, so the graph topology *evolves*
+    /// and self-assembly (chains → sheets → tubes → vesicles) can emerge from
+    /// Brownian motion. The dynamic edges are consumed by the SAME harmonic
+    /// edge-length spring the static edges use, *in addition to* the static edges
+    /// (the static topology is never mutated; bonds are a parallel, churny edge
+    /// set). See `docs/dynamic-edge-bonding-plan.md` §2.
+    pub bonding_enabled: bool,
+    /// Bond **creation** cutoff: an unbonded, class-compatible pair within this
+    /// distance becomes a dynamic bond. Ignored when `bonding_enabled == false`.
+    /// Sensible to set near the cohesion-well contact `σ` so a cohering pair bonds.
+    pub r_bond: f32,
+    /// Bond **break** cutoff (hysteresis): an existing dynamic bond whose length
+    /// exceeds this is removed. Should be `≈ 1.2–1.5 · r_bond` so a bond near
+    /// contact does not flicker create/break each rebuild. When set `≤ r_bond` (or
+    /// non-finite) the engine falls back to `1.3 · r_bond`. The uniform cell-list's
+    /// cell size is `r_break` (so the 27-cell stencil covers every candidate pair).
+    pub r_break: f32,
+    /// Harmonic stiffness of the dynamic-bond spring (the same spring law as
+    /// [`edge_stiffness`](Self::edge_stiffness), applied to dynamic edges). The
+    /// dynamic bond's rest length is `r_bond` (it relaxes a fresh bond toward the
+    /// creation distance). Ignored when `bonding_enabled == false`.
+    pub bond_stiffness: f32,
+    /// Rebuild cadence: the bond stage (cell-list build + add/remove sweep) runs
+    /// every `bond_every` steps (clamped to `≥ 1`). Between rebuilds the existing
+    /// dynamic edges are held fixed and only their springs are integrated — the
+    /// Verlet-style amortisation from the design (`docs/dynamic-edge-bonding-plan.md`
+    /// §1). Ignored when `bonding_enabled == false`.
+    pub bond_every: u32,
+
     /// Director→position **tilt-coupling** stiffness — the term that makes the
     /// membrane GEOMETRY follow the director (normal) field, so a flat sheet,
     /// hollow tube and closed vesicle become *spontaneous* rather than detector-
@@ -465,6 +501,19 @@ impl Default for GeometricSettings {
             // Default OFF: no director→position coupling ⇒ positions evolve exactly
             // as before ⇒ default behaviour byte-identical (golden master unaffected).
             tilt_coupling_strength: 0.0,
+
+            // Default OFF: bonding_enabled = false ⇒ no dynamic edges are ever
+            // created and the bond stage never runs ⇒ default behaviour is
+            // byte-identical (golden master + every canary unaffected). The other
+            // knobs carry sensible non-zero defaults so enabling dynamic bonding
+            // only takes flipping `bonding_enabled`.
+            bonding_enabled: false,
+            r_bond: 1.0,
+            // r_break ≤ r_bond is invalid (no hysteresis band) ⇒ the engine falls
+            // back to 1.3·r_bond; this default already encodes that ratio.
+            r_break: 1.3,
+            bond_stiffness: 0.3,
+            bond_every: 8,
         }
     }
 }
@@ -522,6 +571,18 @@ struct State {
     /// perturbs the translational thermostat's stream — every existing
     /// temperature>0 canary (equipartition, ideal-chain) stays byte-identical.
     rot_rng: u64,
+    /// Dynamic bonds (self-assembly): the evolving edge set the bond stage
+    /// add/removes each rebuild. Consumed by the harmonic edge spring *in addition
+    /// to* `resolved.edges` (the static topology is never mutated). Empty unless
+    /// `bonding_enabled`. Each entry is canonical (`a < b`) with rest length
+    /// `r_bond`. Stored sorted by `(a, b)` so the force pass is deterministic.
+    dynamic_edges: Vec<ResolvedEdge>,
+    /// Set of currently-bonded canonical pairs `(a, b)` with `a < b`, mirroring
+    /// `dynamic_edges` — the fast membership test the bond stage uses to avoid
+    /// double-bonding a pair. Kept in sync with `dynamic_edges`.
+    bonded: std::collections::HashSet<(u32, u32)>,
+    /// Steps taken so far (drives the `bond_every` rebuild cadence).
+    step_count: u64,
 }
 
 /// Geometric constraint engine. Uninitialized until [`LayoutEngine::init`].
@@ -839,6 +900,33 @@ impl GeometricEngine {
 }
 
 impl GeometricEngine {
+    /// The current dynamic bonds (self-assembly P1) as canonical `(a, b)` pairs
+    /// with `a < b`, sorted by `(a, b)`. Empty unless `bonding_enabled` and at
+    /// least one bond stage has run. Exposed so the validation harness can assert
+    /// the bond set directly (which pairs bonded, how many). `None` before
+    /// [`init`](LayoutEngine::init).
+    pub fn dynamic_bonds(&self) -> Option<Vec<(u32, u32)>> {
+        self.state
+            .as_ref()
+            .map(|st| st.dynamic_edges.iter().map(|e| (e.a, e.b)).collect())
+    }
+
+    /// Run *only* the dynamic-bond stage (cell-list build + add/remove sweep) on
+    /// the current positions, without computing forces or integrating. Exposed so
+    /// the validation harness can benchmark the bond stage's O(n) scaling in
+    /// isolation from the engine's separate O(n²) pair-force pass (which would
+    /// otherwise dominate any whole-`step` timing). A no-op before
+    /// [`init`](LayoutEngine::init) or when `bonding_enabled == false`.
+    #[doc(hidden)]
+    pub fn run_bond_stage_for_test(&mut self) {
+        if !self.settings.bonding_enabled {
+            return;
+        }
+        if let Some(st) = self.state.as_mut() {
+            update_dynamic_bonds(st, &self.settings);
+        }
+    }
+
     /// The current per-node director field (interleaved x,y,z, length `3n`), or
     /// `None` before [`init`](LayoutEngine::init). Exposed so the validation
     /// harness can compute orientational order parameters (the nematic `S`) on the
@@ -920,6 +1008,9 @@ impl LayoutEngine for GeometricEngine {
             // Offset off zero so a `rng_seed` of 0 is still a usable stream.
             rng: self.settings.rng_seed ^ 0x9E37_79B9_7F4A_7C15,
             rot_rng: director_rng,
+            dynamic_edges: Vec::new(),
+            bonded: std::collections::HashSet::new(),
+            step_count: 0,
         });
         Ok(())
     }
@@ -942,12 +1033,25 @@ impl LayoutEngine for GeometricEngine {
 // Force integration
 // ---------------------------------------------------------------------------
 
-/// One explicit integration step: accumulate all geometric forces, then advance
-/// velocities (mass-scaled, damped) and positions.
+/// One explicit integration step: optionally run the dynamic-bond stage, then
+/// accumulate all geometric forces and advance velocities/positions/directors.
+///
+/// The bond stage runs *before* the force pass (so the freshly created/removed
+/// dynamic edges are felt this same step) and only every `bond_every` steps when
+/// `bonding_enabled` (the Verlet-style amortisation). With bonding OFF (the
+/// default) nothing here changes: `dynamic_edges` stays empty and the force pass
+/// sees exactly the static edges it always did — byte-identical.
 fn step_forces(st: &mut State, s: &GeometricSettings) {
+    if s.bonding_enabled {
+        let every = s.bond_every.max(1) as u64;
+        if st.step_count % every == 0 {
+            update_dynamic_bonds(st, s);
+        }
+    }
     let force = compute_forces(st, s);
     integrate(st, &force, s);
     integrate_directors(st, s);
+    st.step_count += 1;
 }
 
 /// Accumulate every geometric force into a fresh `3n` vector **without**
@@ -963,6 +1067,13 @@ fn compute_forces(st: &State, s: &GeometricSettings) -> Vec<f32> {
         &st.resolved.edges,
         s.edge_stiffness,
     );
+    // Dynamic bonds (self-assembly) ride the SAME harmonic spring as the static
+    // edges, at `bond_stiffness`. Empty unless `bonding_enabled`, so a default run
+    // adds nothing here (byte-identical). The bond stage keeps each entry's
+    // `target_len = r_bond`, so a fresh bond relaxes toward the creation distance.
+    if !st.dynamic_edges.is_empty() {
+        accumulate_edge_forces(&mut force, &st.positions, &st.dynamic_edges, s.bond_stiffness);
+    }
     if s.angle_stiffness != 0.0 {
         accumulate_angle_forces(&mut force, st, s);
     }
@@ -1443,6 +1554,174 @@ fn accumulate_gravity(force: &mut [f32], pos: &[f32], mass: &[f32], gravity: f32
         force[3 * i + 1] -= g * pos[3 * i + 1];
         force[3 * i + 2] -= g * pos[3 * i + 2];
     }
+}
+
+// ---------------------------------------------------------------------------
+// Dynamic bonding (self-assembly P1): uniform cell-list + bond add/remove
+// ---------------------------------------------------------------------------
+
+/// A bond's class-compatibility test (P1): a pair *may* bond when the inter-class
+/// affinity is **positive** (`affinity > 0 ⇒ attract ⇒ may bond`), reusing the
+/// existing `class_affinity` matrix sign convention. With no affinity matrix
+/// (`class_affinity_dim == 0`) every pair is compatible (the simple monomer soup),
+/// matching how `pair_well_depth` treats the no-matrix case (uniform cohesion).
+fn bond_compatible(s: &GeometricSettings, ca: usize, cb: usize) -> bool {
+    let nc = s.class_affinity_dim as usize;
+    if nc == 0 {
+        return true;
+    }
+    lookup_affinity(&s.class_affinity, nc, ca, cb) > 0.0
+}
+
+/// Effective break cutoff with the hysteresis fallback: a valid `r_break` must be
+/// finite and strictly greater than `r_bond` (a non-degenerate hysteresis band);
+/// otherwise fall back to `1.3 · r_bond` (the documented default ratio).
+fn effective_r_break(s: &GeometricSettings) -> f32 {
+    if s.r_break.is_finite() && s.r_break > s.r_bond {
+        s.r_break
+    } else {
+        1.3 * s.r_bond
+    }
+}
+
+/// Canonical ordering of an undirected pair (`a < b`).
+fn canon_pair(i: usize, j: usize) -> (u32, u32) {
+    if i < j {
+        (i as u32, j as u32)
+    } else {
+        (j as u32, i as u32)
+    }
+}
+
+/// A uniform cell list over the current positions, cell size = `r_break`. Maps
+/// each node into an integer cell and supports scanning the 3×3×3 = 27 neighbour
+/// cells around any node — the O(n) candidate-pair generator from the design
+/// (`docs/dynamic-edge-bonding-plan.md` §1, NVIDIA *Particles* whitepaper).
+///
+/// Build is O(n) (hash bucketing, *no* per-node `log n` map lookup) and each
+/// cell's bucket preserves node-insertion (ascending index) order. Determinism of
+/// the *resulting bond set* does not depend on cell iteration order: the `j > i`
+/// candidate filter dedupes pairs, a [`std::collections::HashSet`] dedupes
+/// creations, and [`update_dynamic_bonds`] sorts `dynamic_edges` by `(a, b)`
+/// before the force pass — so the force-pass edge order is stable run-to-run.
+struct CellList {
+    /// cell size (= r_break), > 0.
+    cell: f32,
+    /// node index buckets keyed by integer cell coordinate (ix, iy, iz).
+    cells: std::collections::HashMap<(i32, i32, i32), Vec<u32>>,
+}
+
+impl CellList {
+    /// Build a cell list over `pos` (interleaved x,y,z, length `3n`) with the given
+    /// `cell` size. A non-positive/non-finite cell size is clamped to a small
+    /// positive value so the grid is always well-defined. O(n).
+    fn build(pos: &[f32], n: usize, cell: f32) -> CellList {
+        let cell = if cell.is_finite() && cell > 1e-4 { cell } else { 1e-4 };
+        let inv = 1.0 / cell;
+        let mut cells: std::collections::HashMap<(i32, i32, i32), Vec<u32>> =
+            std::collections::HashMap::with_capacity(n);
+        for i in 0..n {
+            let key = Self::cell_of(pos, i, inv);
+            cells.entry(key).or_default().push(i as u32);
+        }
+        CellList { cell, cells }
+    }
+
+    /// Integer cell coordinate of node `i`. `inv = 1/cell`. `floor` (not truncate)
+    /// so negative coordinates bucket correctly.
+    fn cell_of(pos: &[f32], i: usize, inv: f32) -> (i32, i32, i32) {
+        let cx = (pos[3 * i] * inv).floor() as i32;
+        let cy = (pos[3 * i + 1] * inv).floor() as i32;
+        let cz = (pos[3 * i + 2] * inv).floor() as i32;
+        (cx, cy, cz)
+    }
+
+    /// Visit each candidate node `j > i` in the 27 cells around `i` (i.e. each
+    /// unordered candidate pair exactly once). The `i < j` filter dedupes the pair
+    /// regardless of which cell each falls in.
+    fn for_each_candidate(&self, pos: &[f32], i: usize, mut visit: impl FnMut(usize)) {
+        let inv = 1.0 / self.cell;
+        let (cx, cy, cz) = Self::cell_of(pos, i, inv);
+        for dx in -1..=1 {
+            for dy in -1..=1 {
+                for dz in -1..=1 {
+                    if let Some(bucket) = self.cells.get(&(cx + dx, cy + dy, cz + dz)) {
+                        for &j in bucket {
+                            let j = j as usize;
+                            if j > i {
+                                visit(j);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// The dynamic-bond stage (run every `bond_every` steps when `bonding_enabled`):
+///
+///  1. **break** every existing dynamic bond whose current length exceeds
+///     `r_break` (hysteresis — a bond persists between `r_bond` and `r_break`).
+///  2. **create** a dynamic bond for every unbonded, class-compatible candidate
+///     pair within `r_bond`, found via the uniform cell list (cell = `r_break`,
+///     27-cell scan ⇒ O(n) candidates). No valence cap in P1.
+///
+/// Determinism: candidates are produced in ascending-index order by the cell list
+/// and the resulting `dynamic_edges` is re-sorted by `(a, b)`, so the force pass
+/// reads a stable edge order run-to-run (no atomics, no hashing in the hot path).
+fn update_dynamic_bonds(st: &mut State, s: &GeometricSettings) {
+    let n = st.n;
+    let r_bond = s.r_bond.max(0.0);
+    let r_break = effective_r_break(s);
+    let r_bond2 = r_bond * r_bond;
+    let r_break2 = r_break * r_break;
+    let pos = &st.positions;
+    let class = &st.resolved.class;
+
+    // --- 1. break over-stretched bonds (hysteresis) ----------------------
+    st.dynamic_edges.retain(|e| {
+        let keep = pair_dist(pos, e.a as usize, e.b as usize).powi(2) <= r_break2;
+        if !keep {
+            st.bonded.remove(&(e.a, e.b));
+        }
+        keep
+    });
+
+    // --- 2. create new in-range, compatible, unbonded bonds --------------
+    let grid = CellList::build(pos, n, r_break);
+    let mut new_bonds: Vec<(u32, u32)> = Vec::new();
+    for i in 0..n {
+        grid.for_each_candidate(pos, i, |j| {
+            let key = canon_pair(i, j);
+            if st.bonded.contains(&key) {
+                return; // already bonded
+            }
+            if !bond_compatible(s, class[i] as usize, class[j] as usize) {
+                return; // class-incompatible (affinity not positive)
+            }
+            let dx = pos[3 * j] - pos[3 * i];
+            let dy = pos[3 * j + 1] - pos[3 * i + 1];
+            let dz = pos[3 * j + 2] - pos[3 * i + 2];
+            if dx * dx + dy * dy + dz * dz <= r_bond2 {
+                new_bonds.push(key);
+            }
+        });
+    }
+    for key in new_bonds {
+        // `insert` returns false if the pair was already added this sweep (e.g.
+        // discovered from both endpoints' cells) — guards against duplicate edges.
+        if st.bonded.insert(key) {
+            st.dynamic_edges.push(ResolvedEdge {
+                a: key.0,
+                b: key.1,
+                target_len: r_bond,
+            });
+        }
+    }
+
+    // Deterministic force-pass order regardless of break/create history.
+    st.dynamic_edges.sort_by_key(|e| (e.a, e.b));
 }
 
 /// Advance velocities (mass-scaled accel, damped) and positions, with an
@@ -2950,5 +3229,224 @@ mod tests {
         } else {
             total / count as f32
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Dynamic bonding (P1) — cell-list neighbour search internals
+    // -----------------------------------------------------------------------
+
+    /// Brute O(n²) candidate set: every unordered pair within `cutoff` (the same
+    /// geometric question the cell list answers, by exhaustive scan). Returns
+    /// canonical `(a, b)` pairs sorted — the reference the cell list must match.
+    fn brute_pairs_within(pos: &[f32], n: usize, cutoff: f32) -> Vec<(u32, u32)> {
+        let c2 = cutoff * cutoff;
+        let mut out = Vec::new();
+        for i in 0..n {
+            for j in (i + 1)..n {
+                let dx = pos[3 * j] - pos[3 * i];
+                let dy = pos[3 * j + 1] - pos[3 * i + 1];
+                let dz = pos[3 * j + 2] - pos[3 * i + 2];
+                if dx * dx + dy * dy + dz * dz <= c2 {
+                    out.push((i as u32, j as u32));
+                }
+            }
+        }
+        out.sort();
+        out
+    }
+
+    /// All candidate pairs the cell list yields within `cutoff`, with cell =
+    /// `cutoff` (the design's invariant: cell size = the cutoff ⇒ the 27-cell
+    /// stencil covers every pair). Canonical + sorted, like the brute reference.
+    fn celllist_pairs_within(pos: &[f32], n: usize, cutoff: f32) -> Vec<(u32, u32)> {
+        let grid = CellList::build(pos, n, cutoff);
+        let c2 = cutoff * cutoff;
+        let mut out = Vec::new();
+        for i in 0..n {
+            grid.for_each_candidate(pos, i, |j| {
+                let dx = pos[3 * j] - pos[3 * i];
+                let dy = pos[3 * j + 1] - pos[3 * i + 1];
+                let dz = pos[3 * j + 2] - pos[3 * i + 2];
+                if dx * dx + dy * dy + dz * dz <= c2 {
+                    out.push(canon_pair(i, j));
+                }
+            });
+        }
+        out.sort();
+        out
+    }
+
+    #[test]
+    fn celllist_matches_brute_candidate_set() {
+        // The cell list (cell = cutoff, 27-cell scan) must find EXACTLY the same
+        // in-range pair set as the O(n²) brute scan — across a deterministic cloud
+        // with both positive and negative coordinates (floor-vs-truncate cell
+        // bucketing) at several cutoffs.
+        let n = 200usize;
+        let pos = deterministic_spread(n, 6.0);
+        for &cutoff in &[0.5f32, 1.0, 1.3, 2.0, 3.5] {
+            let brute = brute_pairs_within(&pos, n, cutoff);
+            let cells = celllist_pairs_within(&pos, n, cutoff);
+            assert_eq!(
+                cells, brute,
+                "cell-list candidate set must equal brute scan at cutoff {cutoff} \
+                 (brute {} pairs, cells {} pairs)",
+                brute.len(),
+                cells.len()
+            );
+        }
+    }
+
+    #[test]
+    fn celllist_handles_coincident_and_single_node() {
+        // Degenerate clouds: all-coincident (every pair in range) and a single
+        // node (no pairs). The cell list must still match the brute set.
+        let coincident = vec![0.0f32; 3 * 5];
+        assert_eq!(
+            celllist_pairs_within(&coincident, 5, 1.0),
+            brute_pairs_within(&coincident, 5, 1.0)
+        );
+        let single = vec![0.3f32, -0.4, 0.5];
+        assert!(celllist_pairs_within(&single, 1, 1.0).is_empty());
+    }
+
+    /// A geometric helper to drive the bond stage on a hand-built configuration.
+    fn bonding_settings(r_bond: f32, r_break: f32) -> GeometricSettings {
+        GeometricSettings {
+            bonding_enabled: true,
+            r_bond,
+            r_break,
+            bond_stiffness: 0.3,
+            bond_every: 1,
+            // Hold positions essentially still so the test controls geometry: no
+            // springs (no static edges anyway), no exclusion/cohesion, no gravity,
+            // no thermostat. The bond stage is what we are validating.
+            edge_stiffness: 0.0,
+            angle_stiffness: 0.0,
+            exclusion_strength: 0.0,
+            well_depth: 0.0,
+            gravity: 0.0,
+            temperature: 0.0,
+            ..GeometricSettings::default()
+        }
+    }
+
+    #[test]
+    fn bonds_form_in_range_and_break_past_r_break() {
+        // Hand-built 3-node line on the x-axis. With r_bond = 1.0, r_break = 1.5:
+        //   0 at x=0, 1 at x=0.8 (within r_bond of 0), 2 at x=2.0 (1.2 from 1,
+        //   2.0 from 0). Expect exactly the 0-1 bond to form (0.8 ≤ 1.0); 1-2 is
+        //   1.2 > 1.0 (no bond); 0-2 is 2.0 (no bond).
+        let g = no_edges_csr(3);
+        let pos = vec![0.0, 0.0, 0.0, 0.8, 0.0, 0.0, 2.0, 0.0, 0.0];
+        let mut e = init_engine(&g, bonding_settings(1.0, 1.5), &pos);
+        let mut ctx = EngineCtx::cpu_only();
+        e.step(&mut ctx); // runs the bond stage (bond_every = 1)
+        let bonds = e.dynamic_bonds().unwrap();
+        assert_eq!(bonds, vec![(0, 1)], "only the in-range 0-1 pair should bond");
+
+        // Now pull node 1 far past r_break of node 0 (and away from node 2) by
+        // mutating its position and stepping again: the 0-1 bond must BREAK
+        // (hysteresis upper edge) and no new bond should form.
+        {
+            let st = e.state.as_mut().unwrap();
+            st.positions[3] = -2.0; // node 1 → x=-2.0: dist(0,1)=2.0 > r_break 1.5,
+                                    // dist(1,2)=4.0 (no new bond)
+        }
+        e.step(&mut ctx);
+        let bonds = e.dynamic_bonds().unwrap();
+        assert!(
+            bonds.is_empty(),
+            "the 0-1 bond must break past r_break, got {bonds:?}"
+        );
+    }
+
+    #[test]
+    fn bond_persists_inside_hysteresis_band() {
+        // A bond formed at r_bond must NOT break while r_bond < dist ≤ r_break —
+        // the no-flicker guarantee. Form 0-1 at 0.9 (< r_bond 1.0), then stretch
+        // to 1.3 (between r_bond 1.0 and r_break 1.5): the bond persists; it does
+        // NOT re-create either (already bonded), and it does not break.
+        let g = no_edges_csr(2);
+        let pos = vec![0.0, 0.0, 0.0, 0.9, 0.0, 0.0];
+        let mut e = init_engine(&g, bonding_settings(1.0, 1.5), &pos);
+        let mut ctx = EngineCtx::cpu_only();
+        e.step(&mut ctx);
+        assert_eq!(e.dynamic_bonds().unwrap(), vec![(0, 1)]);
+        {
+            let st = e.state.as_mut().unwrap();
+            st.positions[3] = 1.3; // inside (r_bond, r_break]
+        }
+        e.step(&mut ctx);
+        assert_eq!(
+            e.dynamic_bonds().unwrap(),
+            vec![(0, 1)],
+            "a bond in the hysteresis band must persist (no flicker)"
+        );
+    }
+
+    #[test]
+    fn bonds_respect_class_compatibility() {
+        // Two nodes well within r_bond but with a NEGATIVE inter-class affinity
+        // (class 0 vs class 1, affinity[0][1] = -1) must NOT bond. The positive
+        // self-affinity 0-0 case bonds, confirming the sign gate works both ways.
+        let g = no_edges_csr(2);
+        let pos = vec![0.0, 0.0, 0.0, 0.5, 0.0, 0.0]; // dist 0.5 < r_bond 1.0
+
+        // Incompatible: class [0,1], affinity[0][1] = -1 ⇒ no bond.
+        let mut s = bonding_settings(1.0, 1.5);
+        s.class_source = ClassSource::Injected;
+        s.class_affinity_dim = 2;
+        s.class_affinity = vec![1.0, -1.0, -1.0, 1.0];
+        let attrs = GraphAttributes {
+            node_class: Some(vec![0, 1]),
+            ..Default::default()
+        };
+        let mut e = GeometricEngine::new();
+        e.set_params(&serde_json::to_value(&s).unwrap()).unwrap();
+        let mut ctx = EngineCtx::cpu_only();
+        e.init(&mut ctx, &CsrShard::whole_with_attributes(&g, &attrs), &pos)
+            .unwrap();
+        e.step(&mut ctx);
+        assert!(
+            e.dynamic_bonds().unwrap().is_empty(),
+            "an affinity<0 class pair must not bond"
+        );
+
+        // Compatible: same matrix but both class 0 ⇒ affinity[0][0] = +1 ⇒ bond.
+        let attrs0 = GraphAttributes {
+            node_class: Some(vec![0, 0]),
+            ..Default::default()
+        };
+        let mut e2 = GeometricEngine::new();
+        e2.set_params(&serde_json::to_value(&s).unwrap()).unwrap();
+        e2.init(&mut ctx, &CsrShard::whole_with_attributes(&g, &attrs0), &pos)
+            .unwrap();
+        e2.step(&mut ctx);
+        assert_eq!(
+            e2.dynamic_bonds().unwrap(),
+            vec![(0, 1)],
+            "an affinity>0 class pair within range should bond"
+        );
+    }
+
+    #[test]
+    fn bonding_disabled_creates_no_dynamic_edges() {
+        // The hard default-OFF guarantee: with bonding_enabled = false, even a
+        // tight cluster (every pair in range) produces ZERO dynamic edges, so the
+        // force pass sees only static edges (byte-identical default behaviour).
+        let g = no_edges_csr(6);
+        let pos = vec![0.0f32; 3 * 6]; // all coincident ⇒ all in range if enabled
+        let mut s = bonding_settings(1.0, 1.5);
+        s.bonding_enabled = false;
+        let mut e = init_engine(&g, s, &pos);
+        let mut ctx = EngineCtx::cpu_only();
+        for _ in 0..10 {
+            e.step(&mut ctx);
+        }
+        assert!(
+            e.dynamic_bonds().unwrap().is_empty(),
+            "bonding disabled must never create dynamic edges"
+        );
     }
 }

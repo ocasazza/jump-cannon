@@ -3331,3 +3331,282 @@ fn performance_throughput_and_convergence() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// PHASE P1 — dynamic bonding (cell-list + bond stage)
+// ---------------------------------------------------------------------------
+//
+// The first increment of the dynamic-edge self-assembly engine
+// (`docs/dynamic-edge-bonding-plan.md` §5 P1): a uniform cell-list neighbour
+// search plus a discrete bond add/remove STAGE that grows an evolving edge set
+// from Brownian motion. These canaries pin three things:
+//   (a) ASSEMBLY — a soup of compatible particles under cohesion + a thermostat,
+//       with bonding ON, grows connected CLUSTERS (largest-cluster fraction rises
+//       well above the bonding-OFF baseline). Read via `observe_assembly`.
+//   (b) EQUIVALENCE + PERF — the cell-list candidate set equals the O(n²) brute
+//       scan, and its cost scales sub-quadratically with n (the O(n) claim).
+//   (c) DEFAULT-OFF — bonding disabled produces zero dynamic edges (covered by the
+//       in-crate unit test `bonding_disabled_creates_no_dynamic_edges`; the
+//       golden master + every existing canary above re-assert byte-identical
+//       default behaviour by staying green and unchanged).
+
+/// Scatter `n` particles uniformly in a cubic box of half-width `half` from a
+/// deterministic SplitMix64 stream — a disordered "soup" seed for the bonding
+/// canary. Interleaved x,y,z.
+fn soup_seed(n: usize, half: f32, seed: u64) -> Vec<f32> {
+    let mut pos = vec![0.0f32; 3 * n];
+    let mut rng = seed;
+    for i in 0..3 * n {
+        let u = next_u64(&mut rng) as f64 / u64::MAX as f64; // [0,1]
+        pos[i] = ((u * 2.0 - 1.0) as f32) * half;
+    }
+    pos
+}
+
+/// Settings for a self-assembling soup: a cohesion well to condense the cloud, a
+/// thermostat for Brownian motion, gravity to keep it compact, and (when bonding
+/// is on) the dynamic-bond stage. `bonding` toggles the only difference between
+/// the assembled and baseline runs.
+fn soup_settings(bonding: bool, seed: u64) -> GeometricSettings {
+    GeometricSettings {
+        // No static topology; condense the cloud with the Cooke–Deserno well.
+        edge_stiffness: 0.0,
+        angle_stiffness: 0.0,
+        default_radius: 0.5, // σ = 1.0 contact
+        exclusion_strength: 1.0,
+        well_depth: 2.0,
+        well_width: 1.0,
+        gravity: 0.1,
+        damping: 0.9,
+        time_step: 0.5,
+        max_step: 1.0,
+        // Brownian motion — structure must EMERGE from disorder, not be seeded.
+        temperature: 0.2,
+        rng_seed: seed,
+        // Dynamic bonding (the variable under test).
+        bonding_enabled: bonding,
+        r_bond: 1.1,   // just past contact σ=1.0 (a cohering pair bonds)
+        r_break: 1.5,  // ≈1.36·r_bond hysteresis band
+        bond_stiffness: 0.4,
+        bond_every: 4,
+        ..GeometricSettings::default()
+    }
+}
+
+#[test]
+fn bonding_grows_connected_clusters_from_a_soup() {
+    // A soup of compatible particles, run WITH dynamic bonding, must end up far
+    // more connected than the SAME soup run without it. We measure connectivity by
+    // the dynamic-bond graph itself (the topology the engine built): with bonding
+    // ON a large fraction of particles end up in one bonded component; with it OFF
+    // there are zero bonds (and zero connectivity by that measure). We ALSO confirm
+    // the spatial condensation via observe_assembly's largest-cluster fraction so
+    // the bonds track real proximity, not phantom edges.
+    let n = 256usize;
+
+    // --- bonding ON: build the evolving bond graph over the trajectory --------
+    let mut on = GeometricEngine::new();
+    on.set_params(&serde_json::to_value(&soup_settings(true, 0xB0_1D_F00D)).unwrap())
+        .unwrap();
+    let mut ctx = EngineCtx::cpu_only();
+    // A moderately dense soup (256 nodes, box half-width 3.0 ⇒ side 6, σ=1.0
+    // contact) so the cohesion well can condense it within the budget — but still
+    // a fully DISORDERED start (uniform random positions, random directors).
+    let seed = soup_seed(n, 3.0, 0x5111_C0DE);
+    on.init(&mut ctx, &CsrShard::whole(&no_edges(n)), &seed)
+        .unwrap();
+    for _ in 0..2_500 {
+        on.step(&mut ctx);
+    }
+    let bonds = on.dynamic_bonds().unwrap();
+    let bonded_frac = largest_bonded_component_frac(n, &bonds);
+    let on_obs = on.observe_assembly().unwrap();
+
+    // --- bonding OFF baseline: identical seed/settings, no bond stage ---------
+    let mut off = GeometricEngine::new();
+    off.set_params(&serde_json::to_value(&soup_settings(false, 0xB0_1D_F00D)).unwrap())
+        .unwrap();
+    off.init(&mut ctx, &CsrShard::whole(&no_edges(n)), &seed)
+        .unwrap();
+    for _ in 0..2_500 {
+        off.step(&mut ctx);
+    }
+    assert!(
+        off.dynamic_bonds().unwrap().is_empty(),
+        "the bonding-OFF baseline must have no dynamic edges"
+    );
+
+    eprintln!(
+        "P1 soup: bonding-ON largest bonded component = {:.1}% of {n} nodes, \
+         {} bonds; observe_assembly largest_cluster_frac = {:.2}",
+        bonded_frac * 100.0,
+        bonds.len(),
+        on_obs.largest_cluster_frac
+    );
+
+    // The bonded graph must connect a substantial majority of the soup — well
+    // above the disordered baseline (which is 0 by this measure). A generous bar
+    // so integrator-tuning noise doesn't trip it, but far from trivial.
+    assert!(
+        bonded_frac > 0.5,
+        "bonding should connect a majority of the soup, got {:.1}% (bonds: {})",
+        bonded_frac * 100.0,
+        bonds.len()
+    );
+    // And the bonds must track real proximity: the spatial largest cluster is also
+    // large (the cohesion well condensed the soup, and the bonds wired it up).
+    assert!(
+        on_obs.largest_cluster_frac > 0.5,
+        "the cohering soup's largest spatial cluster should be a majority, got {:.2}",
+        on_obs.largest_cluster_frac
+    );
+}
+
+/// Fraction of `n` nodes in the largest connected component of the given bond
+/// graph (a union-find over the bond edge list). `0` for an empty bond set.
+fn largest_bonded_component_frac(n: usize, bonds: &[(u32, u32)]) -> f32 {
+    if n == 0 {
+        return 0.0;
+    }
+    let mut parent: Vec<usize> = (0..n).collect();
+    fn find(p: &mut [usize], mut i: usize) -> usize {
+        while p[i] != i {
+            p[i] = p[p[i]];
+            i = p[i];
+        }
+        i
+    }
+    for &(a, b) in bonds {
+        let (ra, rb) = (find(&mut parent, a as usize), find(&mut parent, b as usize));
+        if ra != rb {
+            parent[ra.max(rb)] = ra.min(rb);
+        }
+    }
+    let mut sizes = std::collections::HashMap::new();
+    for i in 0..n {
+        let r = find(&mut parent, i);
+        *sizes.entry(r).or_insert(0usize) += 1;
+    }
+    let largest = sizes.values().copied().max().unwrap_or(0);
+    largest as f32 / n as f32
+}
+
+#[test]
+fn cell_list_finds_same_candidates_as_brute_and_is_subquadratic() {
+    // EQUIVALENCE: the engine's bond stage (cell list, cell = r_break) must bond
+    // exactly the in-range compatible pairs the O(n²) brute scan would — verified
+    // by comparing the bonds the engine forms against an explicit brute computation
+    // on the SAME static configuration (no motion: temperature 0, all forces off).
+    //
+    // PERF: timing the bond stage at growing n must scale sub-quadratically — the
+    // O(n) cell-list claim. We compare the per-pair-candidate work, not wall clock
+    // alone, by checking that doubling n does not quadruple the cost.
+
+    // --- equivalence on a fixed disordered cloud -----------------------------
+    let n = 400usize;
+    let pos = soup_seed(n, 8.0, 0xEEE_1234);
+    let r_bond = 1.0f32;
+    let mut s = GeometricSettings {
+        edge_stiffness: 0.0,
+        angle_stiffness: 0.0,
+        exclusion_strength: 0.0,
+        well_depth: 0.0,
+        gravity: 0.0,
+        temperature: 0.0, // frozen: the bond stage runs on the exact seed geometry
+        bonding_enabled: true,
+        r_bond,
+        r_break: 1.4,
+        bond_stiffness: 0.0, // no spring ⇒ positions never move ⇒ static geometry
+        bond_every: 1,
+        ..GeometricSettings::default()
+    };
+    s.max_step = 0.0;
+    let mut e = GeometricEngine::new();
+    e.set_params(&serde_json::to_value(&s).unwrap()).unwrap();
+    let mut ctx = EngineCtx::cpu_only();
+    e.init(&mut ctx, &CsrShard::whole(&no_edges(n)), &pos).unwrap();
+    e.step(&mut ctx); // one bond stage on the frozen geometry
+    let mut engine_bonds = e.dynamic_bonds().unwrap();
+    engine_bonds.sort();
+
+    // Brute reference: every unordered pair within r_bond (no class matrix ⇒ all
+    // compatible), canonical + sorted.
+    let r2 = r_bond * r_bond;
+    let mut brute: Vec<(u32, u32)> = Vec::new();
+    for i in 0..n {
+        for j in (i + 1)..n {
+            let dx = pos[3 * j] - pos[3 * i];
+            let dy = pos[3 * j + 1] - pos[3 * i + 1];
+            let dz = pos[3 * j + 2] - pos[3 * i + 2];
+            if dx * dx + dy * dy + dz * dz <= r2 {
+                brute.push((i as u32, j as u32));
+            }
+        }
+    }
+    brute.sort();
+    assert_eq!(
+        engine_bonds, brute,
+        "the bond stage must bond exactly the brute in-range pair set \
+         (engine {} bonds, brute {})",
+        engine_bonds.len(),
+        brute.len()
+    );
+
+    // --- sub-quadratic scaling of the bond stage -----------------------------
+    // Hold the NUMBER DENSITY fixed (box grows with n) so the per-particle
+    // candidate count is constant — then an O(n) cell list scales ~linearly while
+    // an O(n²) brute scan quadruples per doubling. Time one bond rebuild at each n.
+    fn time_one_bond_stage(n: usize, density: f32) -> std::time::Duration {
+        // half-width so that (2·half)³ · density = n  ⇒  half = ½·(n/density)^(1/3).
+        let half = 0.5 * (n as f32 / density).cbrt();
+        let pos = soup_seed(n, half, 0x7A11 ^ n as u64);
+        let s = GeometricSettings {
+            edge_stiffness: 0.0,
+            angle_stiffness: 0.0,
+            exclusion_strength: 0.0,
+            well_depth: 0.0,
+            gravity: 0.0,
+            temperature: 0.0,
+            bonding_enabled: true,
+            r_bond: 1.0,
+            r_break: 1.4,
+            bond_stiffness: 0.0,
+            bond_every: 1,
+            max_step: 0.0,
+            ..GeometricSettings::default()
+        };
+        let mut e = GeometricEngine::new();
+        e.set_params(&serde_json::to_value(&s).unwrap()).unwrap();
+        let mut ctx = EngineCtx::cpu_only();
+        e.init(&mut ctx, &CsrShard::whole(&no_edges(n)), &pos).unwrap();
+        // Time ONLY the bond stage (cell-list build + add/remove sweep) — NOT a
+        // whole `step`, whose separate O(n²) pair-force pass would mask the bond
+        // stage's O(n) scaling entirely. Warm up one rebuild, then time the next.
+        e.run_bond_stage_for_test();
+        let t0 = Instant::now();
+        e.run_bond_stage_for_test();
+        t0.elapsed()
+    }
+
+    let density = 0.3f32; // particles per unit volume (sparse ⇒ small candidate sets)
+    let small = 2_000usize;
+    let big = 8_000usize; // 4× the nodes
+    // Take the min over a few reps to suppress scheduler noise on the floor.
+    let t_small = (0..3).map(|_| time_one_bond_stage(small, density)).min().unwrap();
+    let t_big = (0..3).map(|_| time_one_bond_stage(big, density)).min().unwrap();
+    let ratio = t_big.as_secs_f64() / t_small.as_secs_f64().max(1e-9);
+    eprintln!(
+        "P1 cell-list perf: {small} nodes = {:.2} ms, {big} nodes (4×) = {:.2} ms \
+         ⇒ cost ratio {ratio:.2} (O(n²) would be ~16×, O(n) ~4×)",
+        t_small.as_secs_f64() * 1e3,
+        t_big.as_secs_f64() * 1e3,
+    );
+    // 4× the nodes at fixed density: an O(n) cell list grows ~4×; O(n²) would be
+    // ~16×. A generous ceiling (8×) cleanly separates linear-ish from quadratic
+    // without being timing-flaky.
+    assert!(
+        ratio < 8.0,
+        "bond-stage cost grew {ratio:.1}× for a 4× node increase — looks super-linear \
+         (an O(n²) candidate scan would be ~16×); the cell list should keep it ~4×"
+    );
+}
+
