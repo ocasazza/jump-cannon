@@ -27,6 +27,15 @@ pub mod timeline;
 pub mod ui;
 pub use app::App;
 
+/// Test-support re-exports. Doc-hidden, not part of the stable public
+/// API — they exist so the headless `tests/regressions.rs` harness can
+/// mount the GENUINE promoted-node body (`render_node_body`) rather than
+/// a hand-copied mirror that could silently drift from production.
+#[doc(hidden)]
+pub mod test_support {
+    pub use crate::app::{render_node_body, AnchoredChannels};
+}
+
 // Static asset bundle is still embedded so graph-api can serve the
 // trunk-built dist/ when run with embedded assets.
 use include_dir::{include_dir, Dir};

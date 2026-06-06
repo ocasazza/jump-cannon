@@ -1096,3 +1096,115 @@ fn timeline_empty_buffer_shows_no_transport() {
         "empty timeline must not render the Pause transport control"
     );
 }
+
+// ---------------------------------------------------------------------------
+// promoted_node_body_renders_path_exactly_once
+// ---------------------------------------------------------------------------
+//
+// Real-screenshot regression: the promoted/expanded node-preview panel
+// rendered a DUPLICATED, OVERLAPPING body — the node's path string showed
+// up TWICE (once dim/small from the panel's path header, once bold/bright
+// from the inspector's `show_metadata` id row), with the metric rows
+// interleaved between them and the whole top band squashed over the
+// traffic-light dots.
+//
+// Why the *other* node-panel test (`node_panel_header_traffic_lights_…`)
+// didn't catch it: that test mounts the `FloatingPanel` with a STAND-IN
+// body (two hand-written `ui.label`s), so it never exercised the real
+// `render_node_body → inspector::render_body → show_metadata` path where
+// the duplication actually lives.
+//
+// This test mounts the GENUINE `app::render_node_body` (re-exported via
+// `graph_renderer::test_support`) — not a hand-copied mirror — so it
+// exercises the exact production path: `render_node_body →
+// inspector::render_body → show_metadata`. For a vault node whose `id`
+// equals its `path` (the common Obsidian case, exactly as in the
+// screenshot's `shared/knowledge-base/.../jira-ITHELP-32104`) it asserts
+// the path string appears EXACTLY ONCE.
+//
+// Pre-fix `render_node_body` pre-drew a `meta.path` header on top of the
+// inspector's id row (== path) → 2 hits. Post-fix the pre-header is gone
+// (the body owns the id/tags) → 1 hit. Because it calls the real
+// function, re-introducing any path pre-header makes this fail again.
+
+#[test]
+fn promoted_node_body_renders_path_exactly_once() {
+    use eframe::egui;
+    use graph_renderer::proto::NodeMeta;
+    use graph_renderer::test_support::{render_node_body, AnchoredChannels};
+    use graph_renderer::ui::query::ActiveFieldFilters;
+    use graph_renderer::ui::state::ColorBy;
+    use std::collections::HashMap;
+
+    // Mirror the screenshot: the node's id IS its path.
+    const PATH: &str = "shared/knowledge-base/it/tickets/jira-ITHELP-32104";
+
+    // One node; id == path. Metrics populate the idx/degree/community rows
+    // so the body matches the screenshot's shape.
+    let ids = vec![PATH.to_string()];
+    let mut metrics: HashMap<String, Vec<f32>> = HashMap::new();
+    metrics.insert("degree".into(), vec![9.0]);
+    metrics.insert("pagerank".into(), vec![0.0]);
+    metrics.insert("community".into(), vec![633.0]);
+    metrics.insert("kcore".into(), vec![0.0]);
+    let edges: Vec<u32> = vec![];
+
+    let meta = NodeMeta {
+        id: PATH.to_string(),
+        title: String::new(),
+        path: PATH.to_string(),
+        folder: String::new(),
+        doctype: None,
+        tags: vec!["inventory-management".into(), "it".into()],
+        frontmatter_json: String::new(),
+        body: String::new(),
+        ..Default::default()
+    };
+
+    let active_filters = ActiveFieldFilters::default();
+    let mut tag_query = String::new();
+    let mut page_states = HashMap::new();
+    let mut md_cache = egui_commonmark::CommonMarkCache::default();
+    let mut channels = AnchoredChannels::default();
+
+    let mut harness = Harness::builder()
+        .with_size(egui::vec2(900.0, 700.0))
+        .build(|ctx| {
+            graph_renderer::ui::theme::apply_default(ctx);
+            egui::CentralPanel::default().show(ctx, |ui| {
+                ui.set_max_width(460.0);
+                // Genuine production body — same call `render_node_panel_floating`
+                // hands to the FloatingPanel.
+                render_node_body(
+                    ui,
+                    480.0,
+                    0,
+                    &meta,
+                    &ids,
+                    &metrics,
+                    &edges,
+                    ColorBy::default(),
+                    graph_renderer::data::PaletteId::default(),
+                    &active_filters,
+                    None,
+                    &mut page_states,
+                    &mut md_cache,
+                    &mut tag_query,
+                    &mut channels,
+                );
+            });
+        });
+
+    harness.run();
+    harness.run();
+
+    let path_hits = harness.query_all_by_label(PATH).count();
+    assert_eq!(
+        path_hits, 1,
+        "promoted-node body regression: the node path {PATH:?} appears \
+         {path_hits} times. render_node_body must NOT pre-draw a path \
+         header on top of the inspector's id row (id == path for this \
+         vault node) — that produced the duplicated/overlapping body from \
+         the screenshot. Expected exactly one.",
+    );
+}

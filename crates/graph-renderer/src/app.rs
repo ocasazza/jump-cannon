@@ -3916,8 +3916,13 @@ impl App {
 /// focus-node, page-save). Bundling them keeps the signatures short and
 /// the drain block symmetrical with what `inspector::show_floating` used
 /// to write.
+// `pub` so the regression test crate can construct one (via `Default`)
+// and drive the real `render_node_body` rather than a hand-copied mirror
+// that could drift from production. Doc-hidden: not part of the stable
+// public API surface, only the test harness reaches for it.
+#[doc(hidden)]
 #[derive(Default)]
-struct AnchoredChannels {
+pub struct AnchoredChannels {
     requested_selection: Option<u32>,
     requested_filter_toggle: Option<(String, String)>,
     requested_navigate: Option<String>,
@@ -3994,8 +3999,11 @@ fn node_title(meta: &proto::NodeMeta) -> String {
 /// full inspector body (`inspector::render_body`). Used by BOTH the
 /// floating `FloatingPanel` and the tiled `PaneKind::Node` so the two
 /// placements render identically. `max_h` bounds the inner ScrollArea.
+// `pub` (doc-hidden) so the regression test can mount the genuine
+// promoted-node body instead of a hand-copied mirror.
+#[doc(hidden)]
 #[allow(clippy::too_many_arguments)]
-fn render_node_body(
+pub fn render_node_body(
     ui: &mut egui::Ui,
     max_h: f32,
     idx: u32,
@@ -4012,23 +4020,16 @@ fn render_node_body(
     tag_query: &mut String,
     channels: &mut AnchoredChannels,
 ) {
-    if !meta.path.is_empty() {
-        ui.label(
-            egui::RichText::new(&meta.path)
-                .small()
-                .weak()
-                .monospace(),
-        );
-    }
-    if !meta.tags.is_empty() {
-        ui.add_space(2.0);
-        ui.label(
-            egui::RichText::new(meta.tags.join(", "))
-                .small()
-                .color(crate::ui::theme::palette::INFO),
-        );
-    }
-    ui.separator();
+    // NOTE: do NOT pre-draw a path/tags header here. The inspector body
+    // below (`inspector::render_body`) already renders the node's id —
+    // which for vault nodes IS the path — as its strong title row
+    // (`show_metadata`), and the tags as interactive chips
+    // (`show_badges`). The panel CHROME title (`node_title`) shows the
+    // node name. A pre-header here re-drew the path a SECOND time (dim,
+    // above the bright id row) and the tags a second time (plain text,
+    // above the chips), which read as a duplicated/overlapping body that
+    // squashed over the traffic-light dots (real-screenshot bug). The
+    // body owns the metadata; this function just bounds + delegates.
     ui.set_max_height(max_h);
     let mut data = crate::ui::inspector::InspectorData {
         ids,

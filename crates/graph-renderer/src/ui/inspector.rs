@@ -103,7 +103,7 @@ pub struct InspectorData<'a> {
 /// the ScrollArea never actually scrolls. Passing an explicit `Some(h)`
 /// here pins the ScrollArea's `max_height` so it clips + scrolls. `None`
 /// keeps the legacy auto-sizing behaviour for any unbounded host.
-pub(crate) fn render_body(
+pub fn render_body(
     ui: &mut egui::Ui,
     tag_browser_query: &mut String,
     data: &mut InspectorData,
