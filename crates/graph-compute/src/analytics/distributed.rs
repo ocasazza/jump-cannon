@@ -20,9 +20,14 @@
 //! a per-worker GPU (`gpu_spmv`) for true multi-GPU scale-out — both build on
 //! this same owned/ghost/boundary partition structure.
 //!
-//! Like [`super::gpu_pagerank`], the current version assumes **no dangling
-//! (degree-0) nodes**; dangling-mass redistribution needs a global reduction
-//! across partitions and is a follow-up.
+//! Dangling (degree-0 / isolated) nodes are handled exactly as in
+//! [`super::cpu_pagerank`]: each superstep the **global** dangling mass —
+//! Σ over *all* owned degree-0 nodes of their current rank — is reduced across
+//! partitions (the BSP all-reduce: a single global f64/f32 sum, then broadcast)
+//! and `damping · dangling_mass / n_global` is added uniformly to every owned
+//! node's next rank in the same teleport step. So a degree-0 node's mass is
+//! redistributed rather than leaked, and the result matches the single-process
+//! oracle even on graphs with isolated nodes.
 
 use crate::analytics::{gpu_spmv, WeightedCsr};
 use crate::engines::EngineCtx;
@@ -76,8 +81,22 @@ pub fn distributed_pagerank(
         .collect();
 
     for _ in 0..iters {
+        // BSP all-reduce: global dangling mass = Σ over ALL owned degree-0 nodes
+        // of their CURRENT rank (sum across partitions, then broadcast). f64
+        // accumulator keeps the cross-partition sum order-independent.
+        let mut dangling: f64 = 0.0;
+        for (pi, p) in parts.iter().enumerate() {
+            for (li, &g) in p.owned_global_ids().iter().enumerate() {
+                if inv_deg_global[g as usize] == 0.0 {
+                    dangling += ranks[pi][li] as f64;
+                }
+            }
+        }
+        let dangling_share = (damping as f64 * dangling * inv_n as f64) as f32;
+
         // Phase 1: each partition computes next owned ranks from current ranks
-        // (owned + ghost), gathering over its local CSR.
+        // (owned + ghost), gathering over its local CSR, then applies teleport +
+        // the (broadcast) dangling-mass share.
         let mut next_owned: Vec<Vec<f32>> = Vec::with_capacity(parts.len());
         for (pi, p) in parts.iter().enumerate() {
             let r = &ranks[pi];
@@ -89,7 +108,7 @@ pub fn distributed_pagerank(
                     let u_global = p.global_ids[u_local] as usize;
                     acc += r[u_local] * inv_deg_global[u_global];
                 }
-                *slot = teleport + damping * acc;
+                *slot = teleport + dangling_share + damping * acc;
             }
             next_owned.push(no);
         }
@@ -196,13 +215,26 @@ pub fn distributed_pagerank_gpu(
         .collect();
 
     for _ in 0..iters {
-        // Phase 1: each partition gathers via GPU SpMV, then applies teleport.
+        // BSP all-reduce: global dangling mass = Σ over ALL owned degree-0 nodes
+        // of their CURRENT rank (sum across partitions, then broadcast).
+        let mut dangling: f64 = 0.0;
+        for (pi, p) in parts.iter().enumerate() {
+            for (li, &g) in p.owned_global_ids().iter().enumerate() {
+                if inv_deg_global[g as usize] == 0.0 {
+                    dangling += ranks[pi][li] as f64;
+                }
+            }
+        }
+        let dangling_share = (damping as f64 * dangling * inv_n as f64) as f32;
+
+        // Phase 1: each partition gathers via GPU SpMV, then applies teleport +
+        // the (broadcast) dangling-mass share.
         let mut next_owned: Vec<Vec<f32>> = Vec::with_capacity(parts.len());
         for (pi, p) in parts.iter().enumerate() {
             let y = gpu_spmv(ctx, &mats[pi], &ranks[pi])?;
             let no: Vec<f32> = y[..p.n_owned as usize]
                 .iter()
-                .map(|&acc| teleport + damping * acc)
+                .map(|&acc| teleport + dangling_share + damping * acc)
                 .collect();
             next_owned.push(no);
         }
@@ -314,6 +346,65 @@ mod tests {
         let single = cpu_pagerank(&g, 0.85, 50);
         for (a, b) in dist.iter().zip(single.iter()) {
             assert!((a - b).abs() < 1e-5);
+        }
+    }
+
+    /// A `chorded_ring(core)` connected component plus `n_isolated` appended
+    /// degree-0 (dangling) nodes. Global ids `[core, core + n_isolated)` are
+    /// isolated, exercising the global dangling-mass redistribution across
+    /// whatever partitions they land in.
+    fn ring_with_isolated(core: u32, n_isolated: u32) -> CsrGraph {
+        let base = chorded_ring(core);
+        let total = core + n_isolated;
+        let mut offsets = base.offsets.clone();
+        // Each appended isolated node contributes an empty row (offset repeats).
+        let last = *offsets.last().unwrap();
+        for _ in 0..n_isolated {
+            offsets.push(last);
+        }
+        CsrGraph {
+            n_nodes: total,
+            offsets,
+            neighbors: base.neighbors,
+        }
+    }
+
+    /// Distributed PageRank must match `cpu_pagerank` on graphs WITH dangling
+    /// (degree-0 / isolated) nodes, for several partition counts — the global
+    /// dangling-mass redistribution is the contract this pins.
+    #[test]
+    fn distributed_matches_single_process_with_dangling() {
+        // A few isolated nodes appended to a connected component, and a graph
+        // that is *mostly* isolated nodes.
+        for g in [
+            ring_with_isolated(40, 5),
+            ring_with_isolated(80, 1),
+            ring_with_isolated(20, 30),
+        ] {
+            // sanity: the construction really has dangling nodes.
+            let n_dangling = (0..g.n_nodes as usize)
+                .filter(|&v| g.offsets[v + 1] == g.offsets[v])
+                .count();
+            assert!(n_dangling > 0, "test graph has no dangling nodes");
+
+            let single = cpu_pagerank(&g, 0.85, 80);
+            for p in [1u32, 2, 3] {
+                let dist = distributed_pagerank(&g, p, 0.85, 80);
+                assert_eq!(dist.len(), single.len());
+                let max_dev = dist
+                    .iter()
+                    .zip(single.iter())
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0.0f32, f32::max);
+                assert!(
+                    max_dev < 1e-4,
+                    "n={} p={p}: distributed-with-dangling vs single max dev {max_dev}",
+                    g.n_nodes
+                );
+                // Dangling mass is redistributed, not leaked → total mass ≈ 1.
+                let mass: f64 = dist.iter().map(|&r| r as f64).sum();
+                assert!((mass - 1.0).abs() < 1e-3, "p={p}: mass {mass}");
+            }
         }
     }
 }
