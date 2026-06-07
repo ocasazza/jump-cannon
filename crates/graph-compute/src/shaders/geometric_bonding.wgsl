@@ -94,8 +94,11 @@ fn bond_compatible(ci: u32, cj: u32) -> bool {
 
 // ---- 1. hash each node into its linear cell id -----------------------------
 @compute @workgroup_size(64)
-fn calc_hash(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let i = gid.x;
+fn calc_hash(@builtin(global_invocation_id) gid: vec3<u32>,
+             @builtin(num_workgroups) nwg: vec3<u32>) {
+    // 2-D-tiled dispatch: linear node index (host tiles into y past the 65535
+    // per-dim cap, so the lipid sim scales past ~4.2M particles).
+    let i = gid.y * nwg.x * 64u + gid.x;
     if (i >= params.n_nodes) { return; }
     cell_hash[i] = linear_cell(cell_coord(positions[i].xyz));
 }
@@ -104,8 +107,10 @@ fn calc_hash(@builtin(global_invocation_id) gid: vec3<u32>) {
 // (Step 2, the counting sort + find_cell_start, is done host-side from the
 //  hashes; cell_start/cell_end/sorted_nodes arrive as inputs.)
 @compute @workgroup_size(64)
-fn scan_candidates(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let i = gid.x;
+fn scan_candidates(@builtin(global_invocation_id) gid: vec3<u32>,
+                   @builtin(num_workgroups) nwg: vec3<u32>) {
+    // 2-D-tiled dispatch: linear node index (see calc_hash).
+    let i = gid.y * nwg.x * 64u + gid.x;
     if (i >= params.n_nodes) { return; }
 
     let pi = positions[i].xyz;
@@ -173,8 +178,10 @@ struct SpringParams {
 @group(0) @binding(4) var<storage, read>       bond_adj:      array<u32>;
 
 @compute @workgroup_size(64)
-fn spring_step(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let i = gid.x;
+fn spring_step(@builtin(global_invocation_id) gid: vec3<u32>,
+               @builtin(num_workgroups) nwg: vec3<u32>) {
+    // 2-D-tiled dispatch: linear node index (see calc_hash).
+    let i = gid.y * nwg.x * 64u + gid.x;
     if (i >= sp_params.n_nodes) { return; }
     let pi = sp_positions[i].xyz;
     var force = vec3<f32>(0.0, 0.0, 0.0);

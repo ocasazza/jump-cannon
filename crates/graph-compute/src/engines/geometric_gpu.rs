@@ -513,7 +513,10 @@ impl LayoutEngine for GeometricGpuEngine {
             // read_idx selects in→out direction; group 0 writes B, group 1 writes A.
             pass.set_bind_group(0, &gpu.bind_groups[gpu.read_idx], &[]);
             let workgroups = (gpu.n_nodes + WORKGROUP_SIZE - 1) / WORKGROUP_SIZE;
-            pass.dispatch_workgroups(workgroups.max(1), 1, 1);
+            // Tile into 2-D when workgroups exceed wgpu's 65535 per-dim cap so the
+            // sim scales past ~4.2M particles; the WGSL recovers the linear index.
+            let (wg_x, wg_y, wg_z) = crate::analytics::workgroup_dims_2d(workgroups.max(1));
+            pass.dispatch_workgroups(wg_x, wg_y, wg_z);
         }
         // The OUT buffer for this step holds the new positions: group 0 wrote B,
         // group 1 wrote A.

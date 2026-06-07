@@ -105,8 +105,12 @@ fn angle_endpoint_force(pc: vec3<f32>, pj: vec3<f32>, pk: vec3<f32>, ideal: f32,
 }
 
 @compute @workgroup_size(64)
-fn geometric_step(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let i = gid.x;
+fn geometric_step(@builtin(global_invocation_id) gid: vec3<u32>,
+                  @builtin(num_workgroups) nwg: vec3<u32>) {
+    // 2-D-tiled dispatch: linear node index across rows of nwg.x·64 invocations
+    // (the host tiles into y when workgroups exceed wgpu's 65535 per-dim cap, so
+    // the geometric/lipid sim scales past ~4.2M particles).
+    let i = gid.y * nwg.x * 64u + gid.x;
     if (i >= params.n_nodes) {
         return;
     }

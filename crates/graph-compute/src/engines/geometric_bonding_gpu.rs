@@ -351,7 +351,10 @@ pub fn gpu_candidate_pairs(
             pass.set_pipeline(&pipeline);
             pass.set_bind_group(0, &bg, &[]);
             let wg = (n as u32 + WORKGROUP_SIZE - 1) / WORKGROUP_SIZE;
-            pass.dispatch_workgroups(wg.max(1), 1, 1);
+            // Tile into 2-D past wgpu's 65535 per-dim cap (scales past ~4.2M
+            // particles); the WGSL recovers the linear node index.
+            let (wg_x, wg_y, wg_z) = crate::analytics::workgroup_dims_2d(wg.max(1));
+            pass.dispatch_workgroups(wg_x, wg_y, wg_z);
         }
         enc.copy_buffer_to_buffer(&cell_hash_buf, 0, &hash_readback, 0, (n * 4) as u64);
         queue.submit(std::iter::once(enc.finish()));
@@ -447,7 +450,10 @@ pub fn gpu_candidate_pairs(
             pass.set_pipeline(&pipeline);
             pass.set_bind_group(0, &bg, &[]);
             let wg = (n as u32 + WORKGROUP_SIZE - 1) / WORKGROUP_SIZE;
-            pass.dispatch_workgroups(wg.max(1), 1, 1);
+            // Tile into 2-D past wgpu's 65535 per-dim cap (scales past ~4.2M
+            // particles); the WGSL recovers the linear node index.
+            let (wg_x, wg_y, wg_z) = crate::analytics::workgroup_dims_2d(wg.max(1));
+            pass.dispatch_workgroups(wg_x, wg_y, wg_z);
         }
         enc.copy_buffer_to_buffer(&cand_buf, 0, &cand_readback, 0, (cand_len * 4) as u64);
         enc.copy_buffer_to_buffer(&candc_buf, 0, &candc_readback, 0, (n * 4) as u64);
@@ -616,7 +622,10 @@ pub fn gpu_relax_bonds(
             });
             pass.set_pipeline(&pipeline);
             pass.set_bind_group(0, &bg, &[]);
-            pass.dispatch_workgroups(wg.max(1), 1, 1);
+            // Tile into 2-D past wgpu's 65535 per-dim cap (scales past ~4.2M
+            // particles); the WGSL recovers the linear node index.
+            let (wg_x, wg_y, wg_z) = crate::analytics::workgroup_dims_2d(wg.max(1));
+            pass.dispatch_workgroups(wg_x, wg_y, wg_z);
         }
         queue.submit(std::iter::once(enc.finish()));
     }
