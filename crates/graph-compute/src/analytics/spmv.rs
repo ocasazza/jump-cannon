@@ -251,6 +251,7 @@ pub fn gpu_spmv(ctx: &EngineCtx, a: &WeightedCsr, x: &[f32]) -> Result<Vec<f32>,
     });
 
     let workgroups = (n as u32).div_ceil(64).max(1);
+    let (wg_x, wg_y, wg_z) = super::workgroup_dims_2d(workgroups);
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
         label: Some("spmv_encoder"),
     });
@@ -261,7 +262,7 @@ pub fn gpu_spmv(ctx: &EngineCtx, a: &WeightedCsr, x: &[f32]) -> Result<Vec<f32>,
         });
         pass.set_pipeline(&pipeline);
         pass.set_bind_group(0, &bind_group, &[]);
-        pass.dispatch_workgroups(workgroups, 1, 1);
+        pass.dispatch_workgroups(wg_x, wg_y, wg_z);
     }
     encoder.copy_buffer_to_buffer(&y_buf, 0, &readback, 0, y_bytes);
     queue.submit(std::iter::once(encoder.finish()));
@@ -440,6 +441,7 @@ pub fn gpu_spmv_f16(ctx: &EngineCtx, a: &WeightedCsr, x: &[f32]) -> Result<Vec<f
     });
 
     let workgroups = (n as u32).div_ceil(64).max(1);
+    let (wg_x, wg_y, wg_z) = super::workgroup_dims_2d(workgroups);
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
         label: Some("spmv16_encoder"),
     });
@@ -450,7 +452,7 @@ pub fn gpu_spmv_f16(ctx: &EngineCtx, a: &WeightedCsr, x: &[f32]) -> Result<Vec<f
         });
         pass.set_pipeline(&pipeline);
         pass.set_bind_group(0, &bind_group, &[]);
-        pass.dispatch_workgroups(workgroups, 1, 1);
+        pass.dispatch_workgroups(wg_x, wg_y, wg_z);
     }
     encoder.copy_buffer_to_buffer(&y_buf, 0, &readback, 0, y_bytes);
     queue.submit(std::iter::once(encoder.finish()));
@@ -641,6 +643,7 @@ pub fn gpu_spmv_hybrid(ctx: &EngineCtx, a: &WeightedCsr, x: &[f32]) -> Result<Ve
     // One workgroup per row — that is the load-balancing knob. The 64 lanes of
     // each workgroup cooperatively reduce that one row.
     let workgroups = n as u32;
+    let (wg_x, wg_y, wg_z) = super::workgroup_dims_2d(workgroups);
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
         label: Some("spmvh_encoder"),
     });
@@ -651,7 +654,7 @@ pub fn gpu_spmv_hybrid(ctx: &EngineCtx, a: &WeightedCsr, x: &[f32]) -> Result<Ve
         });
         pass.set_pipeline(&pipeline);
         pass.set_bind_group(0, &bind_group, &[]);
-        pass.dispatch_workgroups(workgroups, 1, 1);
+        pass.dispatch_workgroups(wg_x, wg_y, wg_z);
     }
     encoder.copy_buffer_to_buffer(&y_buf, 0, &readback, 0, y_bytes);
     queue.submit(std::iter::once(encoder.finish()));

@@ -25,8 +25,10 @@ struct Params {
 @group(0) @binding(5) var<uniform>              params:    Params;
 
 @compute @workgroup_size(64)
-fn cc_step(@builtin(global_invocation_id) gid: vec3<u32>) {
-  let v = gid.x;
+fn cc_step(@builtin(global_invocation_id) gid: vec3<u32>,
+          @builtin(num_workgroups) nwg: vec3<u32>) {
+  // 2-D-tiled dispatch: linear index across rows of nwg.x·64 invocations.
+  let v = gid.y * nwg.x * 64u + gid.x;
   if (v >= params.n) { return; }
 
   let self_label = label_in[v];

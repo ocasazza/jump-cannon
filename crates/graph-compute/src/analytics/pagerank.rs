@@ -242,6 +242,8 @@ pub fn gpu_pagerank(
     let bg_b_to_a = make_bg("pr_bg_b_to_a", &rank_b, &rank_a);
 
     let workgroups = (n as u32).div_ceil(WORKGROUP_SIZE).max(1);
+    // 2-D tile when > 65535 workgroups (the WGSL recovers the linear index).
+    let (wg_x, wg_y, wg_z) = super::workgroup_dims_2d(workgroups);
 
     // All iterations + the readback copy in ONE encoder / ONE submit. Adjacent
     // compute passes in one encoder get an automatic storage barrier, so the
@@ -259,7 +261,7 @@ pub fn gpu_pagerank(
             });
             pass.set_pipeline(&pipeline);
             pass.set_bind_group(0, bg, &[]);
-            pass.dispatch_workgroups(workgroups, 1, 1);
+            pass.dispatch_workgroups(wg_x, wg_y, wg_z);
         }
         cur ^= 1;
     }

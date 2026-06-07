@@ -235,6 +235,7 @@ pub fn gpu_connected_components(ctx: &EngineCtx, graph: &CsrGraph) -> Result<Vec
     let bg_b_to_a = make_bg("cc_bg_b_to_a", &label_b, &label_a);
 
     let workgroups = (n as u32).div_ceil(WORKGROUP_SIZE).max(1);
+    let (wg_x, wg_y, wg_z) = super::workgroup_dims_2d(workgroups);
 
     // Iterate min-propagation until no label changes. One submit + flag readback
     // per step (a sync point) — fine since convergence is O(diameter); capped at
@@ -254,7 +255,7 @@ pub fn gpu_connected_components(ctx: &EngineCtx, graph: &CsrGraph) -> Result<Vec
             });
             pass.set_pipeline(&pipeline);
             pass.set_bind_group(0, bg, &[]);
-            pass.dispatch_workgroups(workgroups, 1, 1);
+            pass.dispatch_workgroups(wg_x, wg_y, wg_z);
         }
         encoder.copy_buffer_to_buffer(&changed, 0, &flag_readback, 0, 4);
         queue.submit(std::iter::once(encoder.finish()));

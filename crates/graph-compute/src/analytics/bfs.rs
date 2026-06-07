@@ -234,6 +234,7 @@ pub fn gpu_bfs(ctx: &EngineCtx, graph: &CsrGraph, source: u32) -> Result<Vec<u32
     let bg_b_to_a = make_bg("bfs_bg_b_to_a", &dist_b, &dist_a);
 
     let workgroups = (n as u32).div_ceil(WORKGROUP_SIZE).max(1);
+    let (wg_x, wg_y, wg_z) = super::workgroup_dims_2d(workgroups);
 
     let mut cur = 0u32;
     for _ in 0..n {
@@ -249,7 +250,7 @@ pub fn gpu_bfs(ctx: &EngineCtx, graph: &CsrGraph, source: u32) -> Result<Vec<u32
             });
             pass.set_pipeline(&pipeline);
             pass.set_bind_group(0, bg, &[]);
-            pass.dispatch_workgroups(workgroups, 1, 1);
+            pass.dispatch_workgroups(wg_x, wg_y, wg_z);
         }
         encoder.copy_buffer_to_buffer(&changed, 0, &flag_readback, 0, 4);
         queue.submit(std::iter::once(encoder.finish()));

@@ -28,8 +28,11 @@ struct Params {
 @group(0) @binding(5) var<uniform>             params:    Params;
 
 @compute @workgroup_size(64)
-fn pr_step(@builtin(global_invocation_id) gid: vec3<u32>) {
-  let v = gid.x;
+fn pr_step(@builtin(global_invocation_id) gid: vec3<u32>,
+           @builtin(num_workgroups) nwg: vec3<u32>) {
+  // Linear node index from a (possibly 2-D-tiled) dispatch: rows of nwg.x·64
+  // invocations stacked in y (the host tiles into y when workgroups > 65535).
+  let v = gid.y * nwg.x * 64u + gid.x;
   if (v >= params.n) { return; }
 
   let start = offsets[v];

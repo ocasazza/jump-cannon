@@ -42,8 +42,9 @@ var<workgroup> partials: array<f32, 64>;
 fn spmv_hybrid(
   @builtin(workgroup_id)        wid: vec3<u32>,
   @builtin(local_invocation_id) lid: vec3<u32>,
+  @builtin(num_workgroups)      nwg: vec3<u32>,
 ) {
-  let v = wid.x;          // one workgroup == one row
+  let v = wid.y * nwg.x + wid.x;  // 2-D-tiled: one workgroup == one row          // one workgroup == one row
   let lane = lid.x;       // 0 .. WG-1
 
   // Out-of-range rows: still participate in the barriers so control flow is

@@ -132,6 +132,15 @@ fn build_gpu_ctx() -> anyhow::Result<GpuCtx> {
 
     let adapter_info = adapter.get_info();
 
+    // Raise the storage-buffer size limits to the adapter's maximum. WebGPU's
+    // conservative defaults (`max_storage_buffer_binding_size` = 128 MiB,
+    // `max_buffer_size` = 256 MiB) cap a single buffer long before the device
+    // runs out of memory — a vec4 position buffer hits 128 MiB at only ~8M
+    // nodes, and the CSR `neighbors` buffer at ~32M edges — which artificially
+    // bounds the 10–20M+ node regime the M-series unified memory can hold.
+    // Requesting the adapter's own max is always valid (it's a ceiling, not an
+    // allocation) and Metal / desktop Vulkan back it with multi-GB buffers.
+    let adapter_limits = adapter.limits();
     let (device, queue) = pollster::block_on(adapter.request_device(
         &wgpu::DeviceDescriptor {
             label: Some("graph-compute-device"),
@@ -142,13 +151,31 @@ fn build_gpu_ctx() -> anyhow::Result<GpuCtx> {
             required_features: wgpu::Features::empty(),
             required_limits: wgpu::Limits {
                 max_storage_buffers_per_shader_stage: 12,
+                max_storage_buffer_binding_size: adapter_limits.max_storage_buffer_binding_size,
+                max_buffer_size: adapter_limits.max_buffer_size,
+                // A 1-D dispatch of one thread per node hits WebGPU's default
+                // 65535 workgroups-per-dimension cap at ~4.2M nodes
+                // (65535 × 64). Raise to the adapter max so a single linear
+                // dispatch addresses the 10–20M regime; Metal/Vulkan allow far
+                // more per dimension. (Portability note: an adapter that truly
+                // caps at 65535 would still need 2-D tiling — a follow-up.)
+                max_compute_workgroups_per_dimension:
+                    adapter_limits.max_compute_workgroups_per_dimension,
                 ..wgpu::Limits::default()
             },
-            memory_hints: wgpu::MemoryHints::default(),
+            // Prefer few large allocations over many small ones — the working
+            // set is a handful of big per-node/per-edge arrays.
+            memory_hints: wgpu::MemoryHints::Performance,
         },
         None,
     ))
     .context("failed to request wgpu device")?;
+
+    tracing::info!(
+        max_storage_buffer_binding_size = device.limits().max_storage_buffer_binding_size,
+        max_buffer_size = device.limits().max_buffer_size,
+        "wgpu device limits (raised to adapter max for large graphs)"
+    );
 
     Ok(GpuCtx {
         device: std::sync::Arc::new(device),
