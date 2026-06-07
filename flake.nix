@@ -600,6 +600,11 @@
             buildInputs = bevyLibs;
             GPU_PAGERANK_SCALE_N = "200000";
           } // pkgs.lib.optionalAttrs pkgs.stdenv.isLinux {
+            # Force the Vulkan backend so wgpu uses lavapipe and never touches the
+            # GL/EGL backend — on a headless builder (no display) wgpu-hal's GLES
+            # EGL init panics (`unwrap()` on None in gles/egl.rs), which fails
+            # every GPU test before lavapipe is even tried.
+            WGPU_BACKEND = "vulkan";
             VK_ICD_FILENAMES =
               "${pkgs.mesa}/share/vulkan/icd.d/lvp_icd.x86_64.json";
             LD_LIBRARY_PATH =
