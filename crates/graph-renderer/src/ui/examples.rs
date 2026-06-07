@@ -145,6 +145,19 @@ impl Example {
     pub fn share_hash(&self) -> Result<String, String> {
         crate::ui::share::encode(&self.build_state())
     }
+
+    /// Stable kebab-case id for this example — the shipped config-preset filename
+    /// (`configs/<slug>.yaml`) and its `file_io::PRESET_NAMES` entry, which the
+    /// Instances panel's Presets buttons load. Keyed off the morphology so it
+    /// stays stable even if the display name is reworded.
+    pub fn slug(&self) -> &'static str {
+        match self.preset {
+            SelfAssemblyPreset::LipidChain => "membrane-chains",
+            SelfAssemblyPreset::HoneycombSheet => "membrane-sheet",
+            SelfAssemblyPreset::Tube => "membrane-tube",
+            SelfAssemblyPreset::Vesicle => "membrane-vesicle",
+        }
+    }
 }
 
 #[cfg(test)]
@@ -212,6 +225,42 @@ mod tests {
                 "{}: share round-trip",
                 ex.name
             );
+        }
+    }
+
+    /// Dev tool (NOT a CI assertion): regenerate the shipped membrane config
+    /// presets from the catalog. Writes `configs/<slug>.yaml` for each example
+    /// via the real `export_state_yaml` serializer, so the loadable presets can
+    /// never drift from `build_state()`. Gated behind `WRITE_MEMBRANE_PRESETS`
+    /// (mirrors the `UPDATE_GEOMETRIC_GOLDEN` golden-file pattern); a normal test
+    /// run skips it. After running, the shipped files are re-validated by
+    /// `state::config_presets::all_preset_configs_parse`.
+    ///
+    ///     WRITE_MEMBRANE_PRESETS=1 cargo test -p graph-renderer write_membrane_presets
+    #[test]
+    fn write_membrane_presets() {
+        if std::env::var("WRITE_MEMBRANE_PRESETS").is_err() {
+            return;
+        }
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("configs");
+        for ex in catalog() {
+            let state = ex.build_state();
+            let yaml = crate::ui::state::export_state_yaml(&state)
+                .unwrap_or_else(|e| panic!("{}: serialize: {e}", ex.name));
+            // Must round-trip back to an AppState before we ship it.
+            crate::ui::state::import_state_yaml(&yaml)
+                .unwrap_or_else(|e| panic!("{}: round-trip: {e}", ex.name));
+            let body = format!(
+                "# {} — {}\n\
+                 # Auto-generated from examples::catalog() by the dev tool\n\
+                 #   WRITE_MEMBRANE_PRESETS=1 cargo test -p graph-renderer write_membrane_presets\n\
+                 # Do not hand-edit; change the Example / SelfAssemblyPreset instead.\n\
+                 {}",
+                ex.name, ex.description, yaml
+            );
+            let path = dir.join(format!("{}.yaml", ex.slug()));
+            std::fs::write(&path, body).unwrap_or_else(|e| panic!("write {path:?}: {e}"));
+            eprintln!("wrote {path:?}");
         }
     }
 

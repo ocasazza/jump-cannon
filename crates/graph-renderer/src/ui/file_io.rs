@@ -147,4 +147,15 @@ pub fn take_preset() -> Option<Result<String, String>> {
 
 /// The dev-server preset names the Instances page offers. Matches the files in
 /// `crates/graph-renderer/configs/` served by graph-api at `/configs/<name>`.
-pub const PRESET_NAMES: &[&str] = &["default", "showcase-gpu", "lavender"];
+pub const PRESET_NAMES: &[&str] = &[
+    "default",
+    "showcase-gpu",
+    "lavender",
+    // Lipid-membrane self-assembly demos (examples::catalog → generated YAML):
+    // a Brownian particle soup the Geometric (GPU) engine bonds into the named
+    // morphology. Load, evaluate the staged soup generator, then run the layout.
+    "membrane-chains",
+    "membrane-sheet",
+    "membrane-tube",
+    "membrane-vesicle",
+];
