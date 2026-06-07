@@ -50,7 +50,7 @@ const CATALOG: &[Example] = &[
         description: "Valence-2 @180° bonding on a Brownian soup → spontaneous chains. \
                       Geometric (GPU). Sphere seed.",
         preset: SelfAssemblyPreset::LipidChain,
-        soup_nodes: 200,
+        soup_nodes: 5_000,
         seed_index: 0, // Sphere shell
     },
     Example {
@@ -58,7 +58,7 @@ const CATALOG: &[Example] = &[
         description: "Valence-3 @120° + membrane flattening → spontaneous honeycomb patches. \
                       Geometric (GPU). Sphere seed.",
         preset: SelfAssemblyPreset::HoneycombSheet,
-        soup_nodes: 256,
+        soup_nodes: 50_000,
         seed_index: 0,
     },
     Example {
@@ -66,7 +66,7 @@ const CATALOG: &[Example] = &[
         description: "Sheet regime + spontaneous curvature folds a patch into a tube. \
                       Geometric (GPU). Grid seed (start as a flat-ish disc).",
         preset: SelfAssemblyPreset::Tube,
-        soup_nodes: 256,
+        soup_nodes: 20_000,
         seed_index: 2, // Grid — a flat-ish starting patch the curvature can roll
     },
     Example {
@@ -74,7 +74,7 @@ const CATALOG: &[Example] = &[
         description: "P3 rim line-tension (γ=4) + curvature (c₀=0.5) folds a seeded bonded \
                       disc toward a shell. Geometric (GPU). Grid seed.",
         preset: SelfAssemblyPreset::Vesicle,
-        soup_nodes: 256,
+        soup_nodes: 20_000,
         seed_index: 2,
     },
 ];

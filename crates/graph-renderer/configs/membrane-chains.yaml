@@ -176,13 +176,13 @@ generate:
   editor:
     source: |
       # Lipid chains (self-assembly) — initial particle soup for the dynamic-bonding engine.
-      # Evaluate to spawn 200 unbonded particles; the Geometric (GPU)
+      # Evaluate to spawn 5000 unbonded particles; the Geometric (GPU)
       # engine grows bonds at runtime into the target morphology.
       let
         g  = import /jc/src/graph.nix {};
         gc = import /jc/src/graph-combinators.nix { graph = g; };
       in
-        g.toGraphJSON (gc.soupGen { nodes = 200; prefix = "s"; })
+        g.toGraphJSON (gc.soupGen { nodes = 5000; prefix = "s"; })
   backend: Auto
 seed:
   strategy: !BuiltIn 0
