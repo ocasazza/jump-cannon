@@ -18,6 +18,18 @@ path = "src/main.rs"
 name = "graph-pagerank"
 path = "src/bin/pagerank.rs"
 
+# One-shot connected components over a CSR file — the lavender notebooks' GPU
+# component-labeling diagnostic, mirroring graph-pagerank.
+[[bin]]
+name = "graph-cc"
+path = "src/bin/cc.rs"
+
+# One-shot single-source BFS over a CSR file — the lavender notebooks' GPU
+# distance diagnostic, mirroring graph-pagerank.
+[[bin]]
+name = "graph-bfs"
+path = "src/bin/bfs.rs"
+
 [lib]
 name = "graph_compute"
 path = "src/lib.rs"
