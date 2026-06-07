@@ -9,7 +9,7 @@ test-threads = 4
 # Unit tests: fast, no I/O
 [profile.unit]
 fail-fast = false
-default-filter = "test(/unit::/ | package(tvix-wasm) | package(vault-search))"
+default-filter = "test(/unit::/) | package(tvix-wasm) | package(vault-search)"
 
 # Integration tests: may do file I/O
 [profile.integration]
