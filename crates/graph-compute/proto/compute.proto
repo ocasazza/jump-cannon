@@ -26,6 +26,28 @@ service Compute {
   // transport behind the `HaloTransport` trait seam — `TonicHaloTransport`
   // drives the client end, `LocalTransport` stays the single-process double.
   rpc ExchangeHalo(stream HaloDelta) returns (stream HaloDelta);
+
+  // Hot-swap the worker's active graph (e.g. a server-synthesized particle soup
+  // for the self-assembly demos, instead of the disk graph loaded at startup).
+  // The next Subscribe re-inits the engine on the new graph; any in-flight
+  // stream sees the new node count once it re-subscribes.
+  rpc LoadGraph(LoadGraphRequest) returns (LoadGraphResponse);
+}
+
+// Replace the active graph. `csr` is the canonical binary CSR (identical to
+// graph-api's /graph/csr.bin and CsrGraph::to_bin):
+//   [u32 n_nodes][u32 n_edges][u32×(n+1) offsets][u32×n_edges neighbors]  (LE)
+// `positions` is optional interleaved x,y,z f32 LE of length 3*n_nodes — empty
+// ⇒ the worker seeds deterministically.
+message LoadGraphRequest {
+  bytes csr       = 1;
+  bytes positions = 2;
+}
+
+message LoadGraphResponse {
+  bool   ok      = 1;
+  uint32 n_nodes = 2;
+  string error   = 3;
 }
 
 message SubscribeRequest {

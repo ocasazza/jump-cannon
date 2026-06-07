@@ -29,7 +29,7 @@ use crate::proto::compute_server::Compute;
 use crate::proto::{
     CoarsenSettings, EngineDescriptor, FocusRequest, GraphAttributes as ProtoGraphAttributes,
     HaloDelta, HealthRequest, HealthResponse, HybridFrame, ListEnginesRequest, ListEnginesResponse,
-    PositionDelta, SubscribeRequest,
+    LoadGraphRequest, LoadGraphResponse, PositionDelta, SubscribeRequest,
 };
 use crate::sim::{CsrGraph, SimState};
 use crate::topo_fisheye::{
@@ -86,12 +86,9 @@ impl ComputeService {
     }
 }
 
-type SubscribeStream =
-    Pin<Box<dyn Stream<Item = Result<PositionDelta, Status>> + Send + 'static>>;
-type TopoFisheyeStream =
-    Pin<Box<dyn Stream<Item = Result<HybridFrame, Status>> + Send + 'static>>;
-type ExchangeHaloStream =
-    Pin<Box<dyn Stream<Item = Result<HaloDelta, Status>> + Send + 'static>>;
+type SubscribeStream = Pin<Box<dyn Stream<Item = Result<PositionDelta, Status>> + Send + 'static>>;
+type TopoFisheyeStream = Pin<Box<dyn Stream<Item = Result<HybridFrame, Status>> + Send + 'static>>;
+type ExchangeHaloStream = Pin<Box<dyn Stream<Item = Result<HaloDelta, Status>> + Send + 'static>>;
 
 /// String form of a `LayoutKind` for the `EngineDescriptor.kind` wire field
 /// (FROZEN CONTRACT: "Physics" | "Static"). The renderer keys its picker off
@@ -228,9 +225,54 @@ impl Compute for ComputeService {
         let frame = *self.state.frame.read().await;
         Ok(Response::new(HealthResponse {
             ok: true,
-            n_nodes: self.state.graph.n_nodes,
+            n_nodes: self.state.graph.read().await.n_nodes,
             frame,
         }))
+    }
+
+    /// Hot-swap the worker's active graph (the self-assembly soup path). `csr` is
+    /// the canonical binary CSR; optional `positions` seed the new layout. The
+    /// next Subscribe re-inits the engine on it.
+    async fn load_graph(
+        &self,
+        req: Request<LoadGraphRequest>,
+    ) -> Result<Response<LoadGraphResponse>, Status> {
+        let req = req.into_inner();
+        let err = |e: String| {
+            Ok(Response::new(LoadGraphResponse {
+                ok: false,
+                n_nodes: 0,
+                error: e,
+            }))
+        };
+        let graph = match CsrGraph::from_bin_bytes(&req.csr) {
+            Ok(g) => g,
+            Err(e) => return err(format!("decode CSR: {e}")),
+        };
+        let positions = if req.positions.is_empty() {
+            None
+        } else {
+            if req.positions.len() % 4 != 0 {
+                return err("positions byte length not a multiple of 4".into());
+            }
+            Some(
+                req.positions
+                    .chunks_exact(4)
+                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                    .collect::<Vec<f32>>(),
+            )
+        };
+        match self.state.load_graph(graph, positions).await {
+            Ok(n) => {
+                tracing::info!(n_nodes = n, "LoadGraph: swapped active graph");
+                Ok(Response::new(LoadGraphResponse {
+                    ok: true,
+                    n_nodes: n,
+                    error: String::new(),
+                }))
+            }
+            Err(e) => err(e),
+        }
     }
 
     async fn list_engines(
@@ -331,7 +373,7 @@ async fn ensure_hierarchy(
     }
     // Snapshot the current positions + graph, then build off-runtime.
     let positions = state.positions.read().await.clone();
-    let graph = state.graph.clone();
+    let graph = state.graph.read().await.clone(); // Arc clone
     let coarsen = coarsen_params_from_proto(&focus.coarsen);
     let h = tokio::task::spawn_blocking(move || {
         let edges = csr_to_edge_pairs(&graph);
@@ -494,9 +536,9 @@ fn prost_value_to_json(v: prost_types::Value) -> serde_json::Value {
         Some(Kind::StringValue(s)) => serde_json::Value::String(s),
         Some(Kind::BoolValue(b)) => serde_json::Value::Bool(b),
         Some(Kind::StructValue(s)) => struct_to_json(s),
-        Some(Kind::ListValue(l)) => serde_json::Value::Array(
-            l.values.into_iter().map(prost_value_to_json).collect(),
-        ),
+        Some(Kind::ListValue(l)) => {
+            serde_json::Value::Array(l.values.into_iter().map(prost_value_to_json).collect())
+        }
     }
 }
 
@@ -593,8 +635,10 @@ pub async fn run_sim_loop(state: Arc<SimState>, _tick_hz: f32) {
         let bytes = bytemuck::cast_slice::<f32, u8>(&new_positions).to_vec();
         let delta = PositionDelta {
             frame,
+            // Derive from the stepped output so the count always matches the
+            // positions, even right after a LoadGraph swap (no graph lock here).
+            n_nodes: (new_positions.len() / 3) as u32,
             positions: bytes,
-            n_nodes: state.graph.n_nodes,
         };
         // ignore send errors; broadcast returns Err if no receivers — that's fine.
         let _ = state.tx.send(delta);
@@ -658,7 +702,10 @@ mod tests {
         assert_eq!(back.class_source, ClassSource::Community { passes: 8 });
         assert_eq!(
             back.mass_source,
-            MassSource::PageRank { damping_milli: 850, iters: 40 }
+            MassSource::PageRank {
+                damping_milli: 850,
+                iters: 40
+            }
         );
     }
 
@@ -677,10 +724,10 @@ mod tests {
     fn test_proto_attrs_to_host() {
         // Valid case
         let valid = ProtoGraphAttributes {
-            node_class: vec![1, 0, 0, 0], // one u32
-            node_coordination: vec![], // empty is fine
+            node_class: vec![1, 0, 0, 0],   // one u32
+            node_coordination: vec![],      // empty is fine
             node_mass: vec![0, 0, 128, 63], // 1.0f32
-            edge_len: vec![0, 0, 0, 64], // 2.0f32
+            edge_len: vec![0, 0, 0, 64],    // 2.0f32
         };
         let host = proto_attrs_to_host(valid).expect("should succeed");
         assert_eq!(host.node_class, Some(vec![1]));

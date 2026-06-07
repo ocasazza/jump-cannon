@@ -70,7 +70,8 @@ async fn main() -> Result<()> {
         .and_then(|s| s.parse().ok())
         .unwrap_or(30.0);
 
-    tracing::info!(%bind, tick_hz, n_nodes = state.graph.n_nodes, "graph-compute starting");
+    let n_nodes = state.graph.read().await.n_nodes;
+    tracing::info!(%bind, tick_hz, n_nodes, "graph-compute starting");
 
     // Sim loop runs in the background; gRPC server runs in the foreground.
     let sim_state = state.clone();

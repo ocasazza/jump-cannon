@@ -42,7 +42,11 @@ impl CsrGraph {
             }
         }
         offsets.push(neighbors.len() as u32);
-        Self { n_nodes: n, offsets, neighbors }
+        Self {
+            n_nodes: n,
+            offsets,
+            neighbors,
+        }
     }
 
     /// Load a CSR graph from disk. Wire format (all little-endian):
@@ -57,39 +61,45 @@ impl CsrGraph {
         let path = path.as_ref();
         let bytes = std::fs::read(path)
             .map_err(|e| anyhow::anyhow!("failed to read CSR file {}: {}", path.display(), e))?;
+        Self::from_bin_bytes(&bytes)
+            .map_err(|e| anyhow::anyhow!("CSR file {}: {}", path.display(), e))
+    }
+
+    /// Parse the same binary CSR format `load_bin` reads, from an in-memory
+    /// byte slice — the wire form of the `LoadGraph` gRPC and graph-api's
+    /// `/graph/csr.bin`. Alignment-safe (the gRPC buffer is `u8`-aligned), so it
+    /// reads u32s via `from_le_bytes` rather than a cast.
+    pub fn from_bin_bytes(bytes: &[u8]) -> anyhow::Result<Self> {
         if bytes.len() < 8 {
-            anyhow::bail!(
-                "CSR file {} truncated: {} bytes < 8-byte header",
-                path.display(),
-                bytes.len()
-            );
+            anyhow::bail!("CSR truncated: {} bytes < 8-byte header", bytes.len());
         }
-        let header: &[u32] = bytemuck::cast_slice(&bytes[..8]);
-        let n_nodes = header[0];
-        let n_edges = header[1];
-        let expected = 4usize
-            + 4
-            + 4 * (n_nodes as usize + 1)
-            + 4 * (n_edges as usize);
+        let rd =
+            |o: usize| u32::from_le_bytes([bytes[o], bytes[o + 1], bytes[o + 2], bytes[o + 3]]);
+        let n_nodes = rd(0);
+        let n_edges = rd(4);
+        let expected = 8 + 4 * (n_nodes as usize + 1) + 4 * (n_edges as usize);
         if bytes.len() != expected {
             anyhow::bail!(
-                "CSR file {} length mismatch: got {} bytes, expected {} (n_nodes={}, n_edges={})",
-                path.display(),
+                "CSR length mismatch: got {} bytes, expected {} (n_nodes={}, n_edges={})",
                 bytes.len(),
                 expected,
                 n_nodes,
                 n_edges
             );
         }
+        let read_u32s = |start: usize, count: usize| -> Vec<u32> {
+            bytes[start..start + 4 * count]
+                .chunks_exact(4)
+                .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect()
+        };
         let offsets_start = 8usize;
-        let offsets_end = offsets_start + 4 * (n_nodes as usize + 1);
-        let neighbors_end = offsets_end + 4 * (n_edges as usize);
-        let offsets: &[u32] = bytemuck::cast_slice(&bytes[offsets_start..offsets_end]);
-        let neighbors: &[u32] = bytemuck::cast_slice(&bytes[offsets_end..neighbors_end]);
+        let offsets = read_u32s(offsets_start, n_nodes as usize + 1);
+        let neighbors = read_u32s(offsets_start + 4 * (n_nodes as usize + 1), n_edges as usize);
         Ok(Self {
             n_nodes,
-            offsets: offsets.to_vec(),
-            neighbors: neighbors.to_vec(),
+            offsets,
+            neighbors,
         })
     }
 
@@ -108,9 +118,7 @@ impl CsrGraph {
     /// touching the disk.
     pub fn to_bin(&self) -> Vec<u8> {
         let n_edges = self.neighbors.len() as u32;
-        let mut out = Vec::with_capacity(
-            8 + 4 * (self.offsets.len()) + 4 * (self.neighbors.len()),
-        );
+        let mut out = Vec::with_capacity(8 + 4 * (self.offsets.len()) + 4 * (self.neighbors.len()));
         out.extend_from_slice(&self.n_nodes.to_le_bytes());
         out.extend_from_slice(&n_edges.to_le_bytes());
         out.extend_from_slice(bytemuck::cast_slice(&self.offsets));
@@ -190,13 +198,78 @@ mod tests {
             .init_engine("geometric", params, Some(attrs))
             .await
             .expect("init_engine should succeed");
-        
+
         assert_eq!(id, "geometric");
         let mut active = state.active.lock().await;
         let mut active = active.take().unwrap();
         // Just run one step to prove it didn't panic and accepted the attributes
         let out = active.engine.step(&mut active.ctx);
         assert_eq!(out.positions.len(), (n * 3) as usize);
+    }
+
+    #[tokio::test]
+    async fn load_graph_swaps_and_engine_reinits_on_new_graph() {
+        // Start on a tiny 4-node path, then hot-swap to a 64-node particle soup
+        // (0 edges) — the self-assembly LoadGraph path.
+        let state = SimState::new(CsrGraph::path(4));
+        state.init_engine("geometric", serde_json::Value::Null, None)
+            .await
+            .expect("init on the original graph");
+        assert!(state.active.lock().await.is_some());
+
+        let soup = CsrGraph {
+            n_nodes: 64,
+            offsets: vec![0u32; 65], // every row empty → no edges
+            neighbors: Vec::new(),
+        };
+        // Deterministic scattered seed positions in a small ball.
+        let pos: Vec<f32> = (0..64u64 * 3)
+            .map(|i| ((i.wrapping_mul(2654435761) % 1000) as f32) / 100.0 - 5.0)
+            .collect();
+
+        let n = state
+            .load_graph(soup, Some(pos.clone()))
+            .await
+            .expect("load_graph");
+        assert_eq!(n, 64);
+        // Swap is observable: graph + positions replaced, frame reset, active cleared.
+        assert_eq!(state.graph.read().await.n_nodes, 64);
+        assert_eq!(state.positions.read().await.len(), 64 * 3);
+        assert_eq!(*state.frame.read().await, 0);
+        assert!(
+            state.active.lock().await.is_none(),
+            "LoadGraph must clear the active engine so Subscribe re-inits"
+        );
+
+        // Re-init on the NEW graph and step: the engine must run on the 64-node
+        // soup (not the stale 4-node graph) — the key correctness property.
+        state
+            .init_engine("geometric", serde_json::Value::Null, None)
+            .await
+            .expect("re-init on the soup");
+        let mut active = state.active.lock().await;
+        let mut active = active.take().unwrap();
+        let out = active.engine.step(&mut active.ctx);
+        assert_eq!(out.positions.len(), 64 * 3, "engine ran on the swapped graph");
+        assert!(out.positions.iter().all(|v| v.is_finite()));
+    }
+
+    #[test]
+    fn from_bin_bytes_roundtrips_to_bin() {
+        let g = CsrGraph::path(16);
+        let parsed = CsrGraph::from_bin_bytes(&g.to_bin()).expect("from_bin_bytes");
+        assert_eq!(parsed.n_nodes, g.n_nodes);
+        assert_eq!(parsed.offsets, g.offsets);
+        assert_eq!(parsed.neighbors, g.neighbors);
+        // A soup (0 edges) also round-trips.
+        let soup = CsrGraph {
+            n_nodes: 100,
+            offsets: vec![0u32; 101],
+            neighbors: Vec::new(),
+        };
+        let parsed = CsrGraph::from_bin_bytes(&soup.to_bin()).expect("soup round-trip");
+        assert_eq!(parsed.n_nodes, 100);
+        assert!(parsed.neighbors.is_empty());
     }
 }
 
@@ -208,9 +281,25 @@ pub struct ActiveEngine {
     pub ctx: EngineCtx,
 }
 
+/// Deterministic unit-ring seed positions for `n` nodes (same convention as
+/// crates/graph-api/src/vault_loader.rs). The engine seeds from these at init.
+fn ring_seed(n: usize) -> Vec<f32> {
+    let mut positions = vec![0.0f32; 3 * n];
+    for i in 0..n {
+        let t = (i as f32) / (n.max(1) as f32) * std::f32::consts::TAU;
+        positions[3 * i] = t.cos();
+        positions[3 * i + 1] = t.sin();
+        positions[3 * i + 2] = 0.0;
+    }
+    positions
+}
+
 /// State shared between the simulation tick task and the gRPC service.
 pub struct SimState {
-    pub graph: CsrGraph,
+    /// The active graph. Behind an `RwLock<Arc<…>>` so `LoadGraph` can hot-swap
+    /// it: `init_engine` clones the `Arc` (cheap) into the engine context, so a
+    /// swap is only observed at the next Subscribe re-init — never mid-step.
+    pub graph: RwLock<Arc<CsrGraph>>,
     /// Interleaved x,y,z f32 positions, length `3 * n_nodes`. Host copy that
     /// the active engine seeds from at `init` and that each tick overwrites
     /// with the engine's `StepOutput`.
@@ -231,27 +320,47 @@ pub struct SimState {
 
 impl SimState {
     pub fn new(graph: CsrGraph) -> Arc<Self> {
-        let n = graph.n_nodes as usize;
-        // Deterministic ring seed: same convention as
-        // crates/graph-api/src/vault_loader.rs.
-        let mut positions = vec![0.0f32; 3 * n];
-        for i in 0..n {
-            let t = (i as f32) / (n.max(1) as f32) * std::f32::consts::TAU;
-            positions[3 * i] = t.cos();
-            positions[3 * i + 1] = t.sin();
-            positions[3 * i + 2] = 0.0;
-        }
+        let positions = ring_seed(graph.n_nodes as usize);
         // 32-frame ring buffer; bigger than typical RTT so a brief client
         // hiccup doesn't drop a frame.
         let (tx, _rx) = broadcast::channel(32);
         Arc::new(Self {
-            graph,
+            graph: RwLock::new(Arc::new(graph)),
             positions: RwLock::new(positions),
             frame: RwLock::new(0),
             tx,
             registry: EngineRegistry::builtin(),
             active: Mutex::new(None),
         })
+    }
+
+    /// Hot-swap the active graph (the `LoadGraph` RPC). Replaces the graph +
+    /// positions, resets the frame counter, and clears the active engine so the
+    /// next Subscribe re-inits it on the new graph. `positions` must be length
+    /// `3 * n_nodes` if provided; `None` ⇒ a deterministic ring seed. Returns the
+    /// new node count.
+    pub async fn load_graph(
+        &self,
+        graph: CsrGraph,
+        positions: Option<Vec<f32>>,
+    ) -> Result<u32, String> {
+        let n = graph.n_nodes as usize;
+        let pos = match positions {
+            Some(p) if p.len() == 3 * n => p,
+            Some(p) => {
+                return Err(format!(
+                    "positions length {} != 3 * n_nodes ({})",
+                    p.len(),
+                    3 * n
+                ))
+            }
+            None => ring_seed(n),
+        };
+        *self.graph.write().await = Arc::new(graph);
+        *self.positions.write().await = pos;
+        *self.frame.write().await = 0;
+        *self.active.lock().await = None; // next Subscribe re-inits on the new graph
+        Ok(n as u32)
     }
 
     /// Construct, parameterize, and initialize the engine selected by
@@ -269,7 +378,7 @@ impl SimState {
         attributes: Option<GraphAttributes>,
     ) -> Result<&'static str, String> {
         let positions = self.positions.read().await.clone();
-        let graph = self.graph.clone();
+        let graph = self.graph.read().await.clone(); // Arc clone — cheap
         // Construct the engine on the async thread (cheap), then move it +
         // context to the blocking pool for init.
         let mut engine = self
@@ -370,4 +479,3 @@ pub fn cpu_step(graph: &CsrGraph, positions: &[f32], dt: f32) -> Vec<f32> {
     }
     new_positions
 }
-
