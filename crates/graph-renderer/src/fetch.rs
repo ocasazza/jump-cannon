@@ -24,10 +24,10 @@ use tokio_tungstenite::{connect_async, tungstenite::protocol::Message as Tungste
 
 #[cfg(target_arch = "wasm32")]
 use {
-    wasm_bindgen_futures::spawn_local,
-    web_sys::{MessageEvent, WebSocket},
     js_sys,
     wasm_bindgen::JsCast,
+    wasm_bindgen_futures::spawn_local,
+    web_sys::{MessageEvent, WebSocket},
 };
 
 use crate::proto;
@@ -56,6 +56,33 @@ impl ApiClient {
     pub async fn init(&self) -> Result<proto::Init, String> {
         let bytes = http_get_bytes(&self.url("/graph/init")).await?;
         <proto::Init as prost::Message>::decode(&*bytes).map_err(|e| format!("decode init: {e}"))
+    }
+
+    /// `POST /compute/soup` — synthesize + host a particle soup of `n` nodes and
+    /// have the worker assemble it with the named membrane `morphology`
+    /// (chains/sheet/tube/vesicle). Returns the worker's new node count. After
+    /// this, `/graph/init` + the layout stream reflect the assembling soup.
+    pub async fn compute_soup(&self, n: u32, morphology: &str) -> Result<u32, String> {
+        #[derive(serde::Serialize)]
+        struct Req<'a> {
+            n: u32,
+            morphology: &'a str,
+        }
+        #[derive(serde::Deserialize)]
+        struct Resp {
+            ok: bool,
+            n_nodes: u32,
+            error: Option<String>,
+        }
+        let body = serde_json::to_vec(&Req { n, morphology }).map_err(|e| e.to_string())?;
+        let bytes = http_post_json(&self.url("/compute/soup"), &body).await?;
+        let resp: Resp =
+            serde_json::from_slice(&bytes).map_err(|e| format!("decode compute/soup: {e}"))?;
+        if resp.ok {
+            Ok(resp.n_nodes)
+        } else {
+            Err(resp.error.unwrap_or_else(|| "compute/soup failed".into()))
+        }
     }
 
     pub async fn ids(&self) -> Result<Vec<String>, String> {
@@ -93,12 +120,14 @@ impl ApiClient {
 
     pub async fn meta_summary(&self) -> Result<proto::MetaSummary, String> {
         let bytes = http_get_bytes(&self.url("/graph/meta_summary")).await?;
-        <proto::MetaSummary as prost::Message>::decode(&*bytes).map_err(|e| format!("decode meta_summary: {e}"))
+        <proto::MetaSummary as prost::Message>::decode(&*bytes)
+            .map_err(|e| format!("decode meta_summary: {e}"))
     }
 
     pub async fn search(&self, q: &str) -> Result<proto::SearchResults, String> {
         let bytes = http_get_bytes(&self.url(&format!("/search?q={}", urlencode(q)))).await?;
-        <proto::SearchResults as prost::Message>::decode(&*bytes).map_err(|e| format!("decode search: {e}"))
+        <proto::SearchResults as prost::Message>::decode(&*bytes)
+            .map_err(|e| format!("decode search: {e}"))
     }
 
     /// `PUT /vault/page` — save the body of an obsidian-page node to disk.
@@ -114,19 +143,18 @@ impl ApiClient {
         #[derive(serde::Serialize)]
         struct Req<'a> {
             path: &'a str,
-            body: &'a str
+            body: &'a str,
         }
         #[derive(serde::Deserialize)]
         struct Resp {
             ok: bool,
-            error: Option<String>
+            error: Option<String>,
         }
         let url = self.url("/vault/page");
         let req = Req { path, body };
-        let bytes = http_put_json(&url, &serde_json::to_vec(&req).map_err(|e| e.to_string())?)
-            .await?;
-        let resp: Resp =
-            serde_json::from_slice(&bytes).map_err(|e| format!("decode save: {e}"))?;
+        let bytes =
+            http_put_json(&url, &serde_json::to_vec(&req).map_err(|e| e.to_string())?).await?;
+        let resp: Resp = serde_json::from_slice(&bytes).map_err(|e| format!("decode save: {e}"))?;
         if resp.ok {
             Ok(())
         } else {
@@ -147,10 +175,7 @@ impl ApiClient {
     ///
     /// Soft-error envelope: an eval failure comes back as HTTP 200 with
     /// `{ ok:false, error }`, surfaced here as `Err(error)`.
-    pub async fn generate_remote(
-        &self,
-        expr: &str,
-    ) -> Result<tvix_wasm::GeneratedGraph, String> {
+    pub async fn generate_remote(&self, expr: &str) -> Result<tvix_wasm::GeneratedGraph, String> {
         #[derive(serde::Serialize)]
         struct Req<'a> {
             expr: &'a str,
@@ -296,11 +321,13 @@ impl ApiClient {
                 }
             };
             eprintln!("Connected to layout stream (WASM)");
-            
+
             let (tx, mut rx) = futures::channel::mpsc::unbounded();
-            let on_message = wasm_bindgen::closure::Closure::<dyn FnMut(MessageEvent)>::new(move |e: MessageEvent| {
-                let _ = tx.unbounded_send(e);
-            });
+            let on_message = wasm_bindgen::closure::Closure::<dyn FnMut(MessageEvent)>::new(
+                move |e: MessageEvent| {
+                    let _ = tx.unbounded_send(e);
+                },
+            );
             ws.set_onmessage(Some(on_message.as_ref().unchecked_ref()));
             on_message.forget(); // Keep the closure alive
 
@@ -367,7 +394,12 @@ fn bytes_to_f32(b: &[u8]) -> Result<Vec<f32>, String> {
     let mut out = Vec::with_capacity(n);
     for i in 0..n {
         let off = i * 4;
-        out.push(f32::from_le_bytes([b[off], b[off + 1], b[off + 2], b[off + 3]]));
+        out.push(f32::from_le_bytes([
+            b[off],
+            b[off + 1],
+            b[off + 2],
+            b[off + 3],
+        ]));
     }
     Ok(out)
 }
@@ -380,7 +412,12 @@ fn bytes_to_u32(b: &[u8]) -> Result<Vec<u32>, String> {
     let mut out = Vec::with_capacity(n);
     for i in 0..n {
         let off = i * 4;
-        out.push(u32::from_le_bytes([b[off], b[off + 1], b[off + 2], b[off + 3]]));
+        out.push(u32::from_le_bytes([
+            b[off],
+            b[off + 1],
+            b[off + 2],
+            b[off + 3],
+        ]));
     }
     Ok(out)
 }
@@ -449,10 +486,7 @@ async fn http_get_bytes(url: &str) -> Result<Vec<u8>, String> {
     if !resp.status().is_success() {
         return Err(format!("GET {url}: HTTP {}", resp.status()));
     }
-    let bytes = resp
-        .bytes()
-        .await
-        .map_err(|e| format!("body {url}: {e}"))?;
+    let bytes = resp.bytes().await.map_err(|e| format!("body {url}: {e}"))?;
     Ok(bytes.to_vec())
 }
 
@@ -555,10 +589,7 @@ async fn http_get_bytes_opt(url: &str) -> Result<Option<Vec<u8>>, String> {
     if !resp.status().is_success() {
         return Err(format!("GET {url}: HTTP {}", resp.status()));
     }
-    let bytes = resp
-        .bytes()
-        .await
-        .map_err(|e| format!("body {url}: {e}"))?;
+    let bytes = resp.bytes().await.map_err(|e| format!("body {url}: {e}"))?;
     Ok(Some(bytes.to_vec()))
 }
 
@@ -600,7 +631,10 @@ mod tests {
         let body = r#"{"ok":true,"graph":{"nodes":[{"id":"a","type":"x"},{"id":"b"}],"links":[{"source":"a","target":"b"}]}}"#;
         let base = spawn_canned_json_server(body).await;
         let client = ApiClient::new(base);
-        let graph = client.generate_remote("ignored").await.expect("ok envelope");
+        let graph = client
+            .generate_remote("ignored")
+            .await
+            .expect("ok envelope");
         assert_eq!(graph.nodes.len(), 2);
         assert_eq!(graph.edges.len(), 1);
         assert_eq!(graph.nodes[0].kind.as_deref(), Some("x"));

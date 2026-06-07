@@ -4175,6 +4175,23 @@ fn kick_off_bootstrap(load: SharedLoad, base: String, prog: ProgressSink) {
     let client = ApiClient::new(base);
 
     let task = async move {
+        // Boot-trigger: `?soup=<n>[&morphology=…]` in the page URL synthesizes a
+        // particle soup server-side and hosts it as the active graph BEFORE the
+        // bootstrap fetch below, so /graph/init + the layout stream come back as
+        // the assembling soup instead of the vault graph. The dev server thus
+        // boots straight into a self-assembling membrane demo.
+        if let Some((n, morphology)) = crate::ui::share::soup_request_from_location() {
+            set_status(&load, &format!("synthesizing {n}-particle {morphology} soup…"));
+            match client.compute_soup(n, &morphology).await {
+                Ok(wn) => log::info!(
+                    "[graph-renderer] compute/soup hosted {wn} particles ({morphology}); assembling"
+                ),
+                Err(e) => {
+                    log::warn!("[graph-renderer] compute/soup failed: {e}; using server graph")
+                }
+            }
+        }
+
         set_status(&load, "fetching /graph/init…");
         let t_init = prog.start("bootstrap", "fetching /graph/init");
         let init = match client.init().await {

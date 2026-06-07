@@ -113,6 +113,33 @@ pub fn fragment_from_location() -> Option<String> {
     None
 }
 
+/// Parse `?soup=<n>[&morphology=<m>]` from the page URL — the boot trigger that
+/// makes the dev server come up already assembling a particle soup (n particles,
+/// morphology chains|sheet|tube|vesicle, default "sheet"). Returns `None` when
+/// absent, on native, or when `n` doesn't parse, so a normal load is unaffected.
+#[cfg(target_arch = "wasm32")]
+pub fn soup_request_from_location() -> Option<(u32, String)> {
+    let window = web_sys::window()?;
+    let search = window.location().search().ok()?; // e.g. "?soup=50000&morphology=sheet"
+    let q = search.trim_start_matches('?');
+    let mut n = None;
+    let mut morphology = String::from("sheet");
+    for kv in q.split('&') {
+        let mut it = kv.splitn(2, '=');
+        match (it.next(), it.next()) {
+            (Some("soup"), Some(v)) => n = v.trim().parse::<u32>().ok(),
+            (Some("morphology"), Some(v)) if !v.is_empty() => morphology = v.to_string(),
+            _ => {}
+        }
+    }
+    n.map(|n| (n, morphology))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub fn soup_request_from_location() -> Option<(u32, String)> {
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -129,9 +156,10 @@ mod tests {
         s.status_footer_open = true;
         s.tag_browser_query = "cooking".to_string();
         s.layout.active = "geometric".to_string();
-        s.layout
-            .settings
-            .insert("geometric".to_string(), serde_json::json!({ "use_gpu": true }));
+        s.layout.settings.insert(
+            "geometric".to_string(),
+            serde_json::json!({ "use_gpu": true }),
+        );
         s.generate.editor.source = "# my generator\n{ nodes = []; links = []; }".to_string();
         s.seed.strategy = crate::ui::state::SeedStrategy::BuiltIn(2);
         s.seed.editor.source = "# my seed\n[]".to_string();
@@ -179,7 +207,8 @@ mod tests {
         let hash = encode(&original).unwrap();
         // base64url alphabet only: no `+`, `/`, `=`, or whitespace.
         assert!(
-            hash.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'),
+            hash.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'),
             "hash must be base64url: {hash}"
         );
         // DEFLATE on a JSON blob this size should beat the raw text. (Sanity,
