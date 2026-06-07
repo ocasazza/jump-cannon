@@ -34,4 +34,8 @@ default-filter = "test(/e2e::/)"
 [profile.gpu]
 fail-fast = false
 test-threads = 1
-default-filter = "binary(/gpu_/)"
+# The GPU *analytics* correctness suite. Excludes gpu_engines (the pre-existing
+# layout-engine GPU tests): Barnes-Hut theta=0 vs brute-force diverges under
+# lavapipe's software FP (max diff ~27), so those gate on a real-Metal builder,
+# not the Linux software-Vulkan path.
+default-filter = "binary(/gpu_/) & not binary(gpu_engines)"
