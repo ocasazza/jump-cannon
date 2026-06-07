@@ -108,9 +108,20 @@ let
     let
       n = params.nodes or 200;
       p = params.prefix or "s";
-      ids = builtins.genList (i: p + str i) n;
     in
-    builtins.foldl' (g: nid: addNode nid "particle" g) emptyGraph ids;
+    # Build the whole node attrset in ONE listToAttrs (O(n)) rather than n
+    # successive `addNode`s — each `addNode` does a `nodes // { … }` merge that
+    # copies the growing set, so foldl'-ing it is O(n²) (50k nodes took >10s
+    # server-side, and the demo wants millions). Same shape addNode produces:
+    # nodes keyed by id → { id; type; metadata }. A soup has zero edges.
+    emptyGraph // {
+      nodes = builtins.listToAttrs (builtins.genList
+        (i: let id = p + str i; in {
+          name = id;
+          value = { id = id; type = "particle"; metadata = { }; };
+        })
+        n);
+    };
 
   # gridGen : { rows, cols, prefix } -> graph
   # 2D lattice: each node connects right and down

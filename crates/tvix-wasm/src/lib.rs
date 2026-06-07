@@ -29,8 +29,31 @@ use wasm_bindgen::prelude::*;
 // for now (a Web Worker + timeout is a later follow-up), but we cap the *output*
 // size with a clear error. A node id is unbounded in length so this is not a
 // hard memory bound, but it stops the common runaway cases cheaply.
-const MAX_NODES: usize = 50_000;
-const MAX_EDGES: usize = 200_000;
+//
+// The caps are env-tunable so the NATIVE server (graph-api) can raise them for
+// the large self-assembly demos — the geometric GPU engine + 2-D dispatch tiling
+// scales to millions of particles, and `soupGen` now builds in O(n). The default
+// (50k) still protects a browser tab on the wasm path, where `std::env::var`
+// always returns `Err` (no env) and the default holds.
+const DEFAULT_MAX_NODES: usize = 50_000;
+const DEFAULT_MAX_EDGES: usize = 200_000;
+
+fn env_cap(var: &str, default: usize) -> usize {
+    std::env::var(var)
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(default)
+}
+
+/// Output cap on node count. Override with `JC_MAX_NODES` (native server only).
+fn max_nodes() -> usize {
+    env_cap("JC_MAX_NODES", DEFAULT_MAX_NODES)
+}
+
+/// Output cap on edge count. Override with `JC_MAX_EDGES` (native server only).
+fn max_edges() -> usize {
+    env_cap("JC_MAX_EDGES", DEFAULT_MAX_EDGES)
+}
 
 // ── Virtual filesystem ──────────────────────────────────────────────────────
 //
@@ -273,15 +296,17 @@ pub fn parse_graph_json(json: &str) -> Result<GeneratedGraph, String> {
         format!("result is not a {{ nodes, links }} graph (toGraphJSON shape): {e}")
     })?;
 
-    if raw.nodes.len() > MAX_NODES {
+    let max_nodes = max_nodes();
+    if raw.nodes.len() > max_nodes {
         return Err(format!(
-            "graph too large: {} nodes exceeds the {MAX_NODES} node cap",
+            "graph too large: {} nodes exceeds the {max_nodes} node cap",
             raw.nodes.len()
         ));
     }
-    if raw.links.len() > MAX_EDGES {
+    let max_edges = max_edges();
+    if raw.links.len() > max_edges {
         return Err(format!(
-            "graph too large: {} edges exceeds the {MAX_EDGES} edge cap",
+            "graph too large: {} edges exceeds the {max_edges} edge cap",
             raw.links.len()
         ));
     }
@@ -346,8 +371,10 @@ pub fn to_graph_json(graph: &GeneratedGraph) -> String {
 // output-cap machinery as `eval_graph`, then validates that the returned list
 // has exactly `n` entries (the empty list is the special "no seed" sentinel).
 
-/// Cap on the number of seed positions accepted (mirrors `MAX_NODES`).
-const MAX_SEED_POINTS: usize = MAX_NODES;
+/// Cap on the number of seed positions accepted (mirrors `max_nodes()`).
+fn max_seed_points() -> usize {
+    max_nodes()
+}
 
 /// A single `{ x; y; z; }` position. Numbers may be ints or floats in Nix;
 /// serde + `f32` coerce either.
@@ -389,9 +416,10 @@ pub fn eval_seed(expr: &str, n: usize) -> Result<Vec<[f32; 3]>, String> {
         return Ok(Vec::new());
     }
 
-    if raw.len() > MAX_SEED_POINTS {
+    let max_seed_points = max_seed_points();
+    if raw.len() > max_seed_points {
         return Err(format!(
-            "seed too large: {} positions exceeds the {MAX_SEED_POINTS} cap",
+            "seed too large: {} positions exceeds the {max_seed_points} cap",
             raw.len()
         ));
     }
@@ -690,10 +718,11 @@ mod tests {
 
     #[test]
     fn node_cap_triggers() {
-        // genList of MAX_NODES + 1 trivial nodes, no links.
+        // genList of (default cap + 1) trivial nodes, no links. Uses the default
+        // (env unset) so the test stays cheap and deterministic.
         let expr = format!(
             "{{ nodes = builtins.genList (i: {{ id = builtins.toString i; }}) {}; links = []; }}",
-            MAX_NODES + 1
+            DEFAULT_MAX_NODES + 1
         );
         let err = eval_graph(&expr).unwrap_err();
         assert!(err.contains("node cap"), "unexpected error: {err}");
@@ -825,7 +854,7 @@ mod tests {
     fn edge_cap_triggers() {
         let expr = format!(
             "{{ nodes = []; links = builtins.genList (i: {{ source = \"a\"; target = \"b\"; }}) {}; }}",
-            MAX_EDGES + 1
+            DEFAULT_MAX_EDGES + 1
         );
         let err = eval_graph(&expr).unwrap_err();
         assert!(err.contains("edge cap"), "unexpected error: {err}");
