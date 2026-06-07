@@ -49,6 +49,10 @@ pub fn router(state: AppState) -> Router {
         .route("/compute/health", get(compute_health))
         .route("/compute/engines", get(compute_engines))
         .route("/compute/layout", put(compute_layout_put))
+        // Self-assembly demo: synthesize a particle soup, host it as the active
+        // graph, and push it to the compute worker so the geometric engine
+        // assembles it (instead of the vault graph).
+        .route("/compute/soup", axum::routing::post(compute_soup_post))
         .route("/vault/page", put(vault_page_put))
         .route("/generate", axum::routing::post(generate_post))
         .route("/progress", get(progress_poll))
@@ -458,6 +462,183 @@ async fn compute_layout_put(
             })
         }
     }
+}
+
+// ─── /compute/soup — server-side particle-soup self-assembly demo ────────────
+//
+// Synthesizes a particle soup (n isolated nodes, zero edges), hosts it as
+// graph-api's active graph (so the renderer fetches the soup's node set), and
+// pushes it to the compute worker via the LoadGraph RPC + selects the geometric
+// engine with a membrane regime — so the worker assembles the soup instead of
+// the vault graph. No tvix, no JSON graph: the soup is synthesized natively and
+// shipped as a binary CSR + positions blob, instant even at large n.
+
+/// Upper bound on soup size — graph-api rebuilds a full GraphSnapshot (metrics)
+/// per swap, so keep it sane. The demo runs at ~50k; this caps pathological
+/// requests.
+const MAX_SOUP_NODES: u32 = 1_000_000;
+
+#[derive(Deserialize)]
+struct ComputeSoupReq {
+    /// Number of particles.
+    n: u32,
+    /// Half-extent of the initial scatter cube (default 40).
+    #[serde(default)]
+    radius: Option<f32>,
+    /// Deterministic seed for the scatter (default 1).
+    #[serde(default)]
+    seed: Option<u64>,
+    /// Self-assembly regime: "chains" | "sheet" (default) | "tube" | "vesicle".
+    #[serde(default)]
+    morphology: Option<String>,
+}
+
+#[derive(Serialize)]
+struct ComputeSoupResp {
+    ok: bool,
+    n_nodes: u32,
+    error: Option<String>,
+}
+
+/// Binary CSR (the LoadGraph DTO) for a soup of `n` isolated nodes:
+/// `[u32 n][u32 0][u32×(n+1) offsets all 0][]` — no neighbors.
+fn soup_csr_bytes(n: u32) -> Vec<u8> {
+    let mut out = Vec::with_capacity(8 + 4 * (n as usize + 1));
+    out.extend_from_slice(&n.to_le_bytes());
+    out.extend_from_slice(&0u32.to_le_bytes());
+    for _ in 0..=n {
+        out.extend_from_slice(&0u32.to_le_bytes());
+    }
+    out
+}
+
+/// Deterministic scattered seed positions in a cube of half-extent `radius`,
+/// interleaved x,y,z f32 LE (the LoadGraph positions blob). xorshift so the same
+/// (n, seed) always produces the same soup.
+fn soup_positions_bytes(n: u32, radius: f32, seed: u64) -> Vec<u8> {
+    let mut s = seed ^ 0x9E37_79B9_7F4A_7C15;
+    let mut next = || {
+        s ^= s << 13;
+        s ^= s >> 7;
+        s ^= s << 17;
+        s
+    };
+    let mut out = Vec::with_capacity(12 * n as usize);
+    for _ in 0..n {
+        for _ in 0..3 {
+            let u = (next() % 2_000_001) as f32 / 1_000_000.0 - 1.0; // [-1, 1]
+            out.extend_from_slice(&(u * radius).to_le_bytes());
+        }
+    }
+    out
+}
+
+/// The validated membrane LensConfig for a `morphology`, mirroring the renderer's
+/// `SelfAssemblyPreset::apply_to` (the single source of truth there; duplicated
+/// here so the server can drive the demo without the renderer).
+fn membrane_lens(morphology: &str) -> LensConfig {
+    let mut c = LensConfig {
+        use_gpu: true,
+        bonding_enabled: true,
+        exclusion_strength: 1.0,
+        gravity: 0.05,
+        r_bond: 1.1,
+        r_break: 1.5,
+        bond_stiffness: 0.4,
+        bond_every: 4,
+        well_depth: 2.5,
+        well_width: 1.0,
+        temperature: 0.2,
+        default_max_valence: 3,
+        default_bond_angle: 120.0,
+        angle_stiffness: 0.3,
+        anisotropy_strength: 1.0,
+        gb_side_strength: 1.5,
+        tilt_coupling_strength: 1.0,
+        ..LensConfig::default()
+    };
+    match morphology {
+        "chains" => {
+            c.default_max_valence = 2;
+            c.default_bond_angle = 180.0;
+            c.angle_stiffness = 0.15;
+            c.well_depth = 2.0;
+            c.anisotropy_strength = 0.0;
+            c.gb_side_strength = 0.0;
+            c.tilt_coupling_strength = 0.0;
+            c.gravity = 0.1;
+        }
+        "tube" => c.spont_curvature = 0.25,
+        "vesicle" => {
+            c.spont_curvature = 0.5;
+            c.line_tension = 4.0;
+        }
+        _ => {} // "sheet" — the flat-bilayer base above.
+    }
+    c
+}
+
+async fn compute_soup_post(
+    State(s): State<AppState>,
+    Json(req): Json<ComputeSoupReq>,
+) -> impl IntoResponse {
+    let err = |msg: String| {
+        axum::Json(ComputeSoupResp {
+            ok: false,
+            n_nodes: 0,
+            error: Some(msg),
+        })
+    };
+    let n = req.n;
+    if n == 0 || n > MAX_SOUP_NODES {
+        return err(format!("n must be in 1..={MAX_SOUP_NODES} (got {n})"));
+    }
+    let radius = req.radius.unwrap_or(40.0);
+    let seed = req.seed.unwrap_or(1);
+    let morphology = req.morphology.as_deref().unwrap_or("sheet").to_string();
+
+    // 1. Host the soup as graph-api's active graph so the renderer fetches its
+    //    node set (matching the streamed positions). Synthesized directly.
+    let mut vg = vault_data::VaultGraph::new();
+    for i in 0..n {
+        vg.add_node(vault_data::VaultNode {
+            id: format!("s{i}"),
+            ..Default::default()
+        });
+    }
+    let snapshot = crate::state::GraphSnapshot::build(vg);
+    s.inner.snapshot.store(std::sync::Arc::new(snapshot));
+
+    // 2. Push the same soup to the compute worker (binary CSR + positions).
+    let csr = soup_csr_bytes(n);
+    let positions = soup_positions_bytes(n, radius, seed);
+    let worker_n = match s.inner.compute_broker.load_graph(csr, positions).await {
+        Ok(wn) => wn,
+        Err(e) => return err(format!("worker LoadGraph: {e}")),
+    };
+    if worker_n != n {
+        return err(format!("worker node count {worker_n} != requested {n}"));
+    }
+
+    // 3. Select the geometric (GPU) engine with the membrane regime so the worker
+    //    assembles the soup. The renderer's WS lens would also drive this, but
+    //    setting it here makes the demo assemble the moment the soup loads.
+    let params = serde_json::to_value(membrane_lens(&morphology)).ok();
+    let selection = crate::compute_broker::RemoteLayout {
+        layout_id: "geometric-gpu".to_string(),
+        params,
+        ..Default::default()
+    };
+    if let Err(e) = s.inner.compute_broker.reselect(selection).await {
+        return err(format!("select geometric engine: {e}"));
+    }
+
+    tracing::info!(n, morphology, "compute/soup: hosting + assembling a soup");
+    axum::Json(ComputeSoupResp {
+        ok: true,
+        n_nodes: n,
+        error: None,
+    })
 }
 
 /// `GET /progress?since=<seq>` — tail of the server-side progress event

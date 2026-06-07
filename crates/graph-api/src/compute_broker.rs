@@ -19,7 +19,8 @@ use tonic::transport::Channel;
 
 use graph_compute::proto::compute_client::ComputeClient;
 use graph_compute::proto::{
-    GraphAttributes as ProtoGraphAttributes, ListEnginesRequest, PositionDelta, SubscribeRequest,
+    GraphAttributes as ProtoGraphAttributes, ListEnginesRequest, LoadGraphRequest, PositionDelta,
+    SubscribeRequest,
 };
 use graph_compute::service::json_to_struct;
 use graph_layouts::geometric::LensConfig;
@@ -144,6 +145,31 @@ impl ComputeBroker {
 
         self.spawn_forwarder(url, tx).await;
         Ok(())
+    }
+
+    /// Hot-swap the worker's active graph (the `LoadGraph` RPC) — used by the
+    /// `/compute/soup` self-assembly endpoint to push a server-synthesized
+    /// particle soup into the worker. One-shot unary call on a fresh connection
+    /// to the stored worker URL (the forwarder's streaming channel is for
+    /// `Subscribe`). `csr` is the binary CSR DTO, `positions` optional
+    /// interleaved-xyz f32 LE. Returns the worker's new node count.
+    pub async fn load_graph(&self, csr: Vec<u8>, positions: Vec<u8>) -> anyhow::Result<u32> {
+        let url = self.inner.url.read().await.clone().ok_or_else(|| {
+            anyhow::anyhow!("compute broker not connected (no worker URL configured)")
+        })?;
+        let mut client = ComputeClient::connect(url)
+            .await
+            .map_err(|e| anyhow::anyhow!("dial worker for LoadGraph: {e}"))?;
+        let resp = client
+            .load_graph(LoadGraphRequest { csr, positions })
+            .await
+            .map_err(|e| anyhow::anyhow!("LoadGraph RPC: {e}"))?
+            .into_inner();
+        if resp.ok {
+            Ok(resp.n_nodes)
+        } else {
+            anyhow::bail!("worker rejected LoadGraph: {}", resp.error)
+        }
     }
 
     /// Switch the active remote layout engine (ADR-002, the `/compute/layout`
