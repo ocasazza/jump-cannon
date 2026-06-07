@@ -121,59 +121,49 @@ fn yaml_io_panel(ui: &mut egui::Ui, state: &mut AppState) {
         }
     }
 
-    // ---- Export row ------------------------------------------------------
+    // The export buffer is a LIVE mirror of the current AppState: re-serialized
+    // every frame the panel is open, so what you see / copy / download always
+    // reflects the present UI state — no stale "click Export first" snapshot.
+    // (`yaml_export_buffer` is `#[serde(skip)]`, so this doesn't recurse.)
+    state.yaml_export_buffer =
+        state::export_state_yaml(state).unwrap_or_else(|e| format!("# export error: {e}"));
+
+    // ---- Export row (live) ----------------------------------------------
     ui.horizontal(|ui| {
-        if ui.button("Export").clicked() {
-            match state::export_state_yaml(state) {
-                Ok(s) => state.yaml_export_buffer = s,
-                Err(e) => state.yaml_export_buffer = format!("# export error: {e}"),
-            }
-        }
-        // Download the current state straight to a .yaml file (exports fresh —
-        // no need to click Export first).
+        ui.label(
+            egui::RichText::new("Live state")
+                .italics()
+                .color(egui::Color32::from_rgb(150, 130, 200)),
+        );
         if ui
-            .button("⬇ File")
-            .on_hover_text("Download the entire app state as a .yaml file")
-            .clicked()
-        {
-            match state::export_state_yaml(state) {
-                Ok(yaml) => {
-                    if let Err(e) = file_io::download_text(
-                        "jump-cannon-appstate.yaml",
-                        "application/yaml",
-                        &yaml,
-                    ) {
-                        state.yaml_import_error = Some(format!("download: {e}"));
-                    }
-                }
-                Err(e) => state.yaml_import_error = Some(format!("export: {e}")),
-            }
-        }
-        let has_export = !state.yaml_export_buffer.is_empty();
-        if ui
-            .add_enabled(has_export, egui::Button::new("Copy"))
+            .button("Copy")
+            .on_hover_text("Copy the current state as YAML")
             .clicked()
         {
             let yaml = state.yaml_export_buffer.clone();
             ui.output_mut(|o| o.copied_text = yaml);
         }
         if ui
-            .add_enabled(has_export, egui::Button::new("✕"))
-            .on_hover_text("Clear export buffer")
+            .button("⬇ File")
+            .on_hover_text("Download the entire current app state as a .yaml file")
             .clicked()
         {
-            state.yaml_export_buffer.clear();
+            if let Err(e) = file_io::download_text(
+                "jump-cannon-appstate.yaml",
+                "application/yaml",
+                &state.yaml_export_buffer,
+            ) {
+                state.yaml_import_error = Some(format!("download: {e}"));
+            }
         }
     });
 
-    if !state.yaml_export_buffer.is_empty() {
-        ui.add(
-            egui::TextEdit::multiline(&mut state.yaml_export_buffer.as_str())
-                .font(egui::TextStyle::Monospace)
-                .desired_width(f32::INFINITY)
-                .desired_rows(12),
-        );
-    }
+    ui.add(
+        egui::TextEdit::multiline(&mut state.yaml_export_buffer.as_str())
+            .font(egui::TextStyle::Monospace)
+            .desired_width(f32::INFINITY)
+            .desired_rows(12),
+    );
 
     ui.add_space(6.0);
 
