@@ -470,3 +470,204 @@ pub fn gpu_spmv_f16(ctx: &EngineCtx, a: &WeightedCsr, x: &[f32]) -> Result<Vec<f
     readback.unmap();
     Ok(out)
 }
+
+/// Hub-aware (load-balanced) `y = A·x` for **power-law** graphs — same result as
+/// [`gpu_spmv`] (up to f32 summation-order tolerance), but it does not let one
+/// thread serialize a giant hub row.
+///
+/// The baseline [`gpu_spmv`] is thread-per-row: a hub row of degree ~`n` is
+/// reduced by a *single* thread while its 63 workgroup neighbours sit idle — the
+/// long pole on a scale-free graph (a handful of rows touch almost every column).
+/// This variant is **workgroup-per-row** (a warp/CTA-per-row segmented
+/// reduction): it dispatches `n` workgroups, and the 64 lanes of row `v`'s
+/// workgroup cooperatively walk that row (lane `l` strides edges `start+l`,
+/// `start+l+64`, …) into private accumulators, then a workgroup-shared tree
+/// reduction collapses them to `y[v]`. Long hub rows get the whole workgroup;
+/// short rows just leave most lanes idle for one cheap pass. f32 accumulate
+/// throughout, so it is oracle-equivalent — not an approximation. (The summation
+/// order differs from the serial baseline, hence the ~1e-4 tolerance in tests.)
+pub fn gpu_spmv_hybrid(ctx: &EngineCtx, a: &WeightedCsr, x: &[f32]) -> Result<Vec<f32>, String> {
+    let gpu = ctx
+        .gpu
+        .as_ref()
+        .ok_or_else(|| "gpu_spmv_hybrid requires a wgpu device".to_string())?;
+    let device = gpu.device.clone();
+    let queue = gpu.queue.clone();
+
+    let n = a.n_nodes as usize;
+    if n == 0 {
+        return Ok(Vec::new());
+    }
+    if a.offsets.len() != n + 1 {
+        return Err(format!(
+            "offsets length {} != n + 1 ({})",
+            a.offsets.len(),
+            n + 1
+        ));
+    }
+    if a.neighbors.len() != a.weights.len() {
+        return Err(format!(
+            "neighbors ({}) and weights ({}) length mismatch",
+            a.neighbors.len(),
+            a.weights.len()
+        ));
+    }
+    if x.len() != n {
+        return Err(format!("x length {} != n ({n})", x.len()));
+    }
+
+    let offsets_buf = storage_u32(&device, "spmvh_offsets", &a.offsets);
+    let neighbors_buf = storage_u32(&device, "spmvh_neighbors", &a.neighbors);
+    let weights_buf = storage_f32(&device, "spmvh_weights", &a.weights, false);
+    let x_buf = storage_f32(&device, "spmvh_x", x, false);
+    let y_buf = storage_f32(&device, "spmvh_y", &vec![0.0f32; n], true);
+
+    let params = ParamsRaw {
+        n: n as u32,
+        _p0: 0,
+        _p1: 0,
+        _p2: 0,
+    };
+    let params_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("spmvh_params"),
+        contents: bytemuck::bytes_of(&params),
+        usage: wgpu::BufferUsages::UNIFORM,
+    });
+
+    let y_bytes = (n * std::mem::size_of::<f32>()) as u64;
+    let readback = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("spmvh_readback"),
+        size: y_bytes,
+        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+
+    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("spmvh_shader"),
+        source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(include_str!(
+            "../shaders/spmv_hybrid.wgsl"
+        ))),
+    });
+
+    let storage_ro = |binding: u32| wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::COMPUTE,
+        ty: wgpu::BindingType::Buffer {
+            ty: wgpu::BufferBindingType::Storage { read_only: true },
+            has_dynamic_offset: false,
+            min_binding_size: None,
+        },
+        count: None,
+    };
+    let storage_rw = |binding: u32| wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::COMPUTE,
+        ty: wgpu::BindingType::Buffer {
+            ty: wgpu::BufferBindingType::Storage { read_only: false },
+            has_dynamic_offset: false,
+            min_binding_size: None,
+        },
+        count: None,
+    };
+    let uniform = |binding: u32| wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::COMPUTE,
+        ty: wgpu::BindingType::Buffer {
+            ty: wgpu::BufferBindingType::Uniform,
+            has_dynamic_offset: false,
+            min_binding_size: None,
+        },
+        count: None,
+    };
+
+    let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("spmvh_bgl"),
+        entries: &[
+            storage_ro(0),
+            storage_ro(1),
+            storage_ro(2),
+            storage_ro(3),
+            storage_rw(4),
+            uniform(5),
+        ],
+    });
+
+    let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+        label: Some("spmvh_pipeline"),
+        layout: Some(
+            &device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("spmvh_layout"),
+                bind_group_layouts: &[&bgl],
+                push_constant_ranges: &[],
+            }),
+        ),
+        module: &shader,
+        entry_point: Some("spmv_hybrid"),
+        compilation_options: Default::default(),
+        cache: None,
+    });
+
+    let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("spmvh_bg"),
+        layout: &bgl,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: offsets_buf.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: neighbors_buf.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: weights_buf.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: x_buf.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 4,
+                resource: y_buf.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 5,
+                resource: params_buf.as_entire_binding(),
+            },
+        ],
+    });
+
+    // One workgroup per row — that is the load-balancing knob. The 64 lanes of
+    // each workgroup cooperatively reduce that one row.
+    let workgroups = n as u32;
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("spmvh_encoder"),
+    });
+    {
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: None,
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(&pipeline);
+        pass.set_bind_group(0, &bind_group, &[]);
+        pass.dispatch_workgroups(workgroups, 1, 1);
+    }
+    encoder.copy_buffer_to_buffer(&y_buf, 0, &readback, 0, y_bytes);
+    queue.submit(std::iter::once(encoder.finish()));
+
+    let slice = readback.slice(..);
+    let (tx, rx) = std::sync::mpsc::channel();
+    slice.map_async(wgpu::MapMode::Read, move |res| {
+        let _ = tx.send(res);
+    });
+    device.poll(wgpu::Maintain::Wait);
+    rx.recv()
+        .map_err(|e| format!("spmvh readback channel: {e}"))?
+        .map_err(|e| format!("spmvh readback map: {e:?}"))?;
+    let data = slice.get_mapped_range();
+    let out: Vec<f32> = bytemuck::cast_slice::<u8, f32>(&data).to_vec();
+    drop(data);
+    readback.unmap();
+    Ok(out)
+}
