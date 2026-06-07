@@ -126,9 +126,12 @@
         });
 
         # Perf benches (REPORT-ONLY, never gates a merge). Runs the criterion
-        # bench_pagerank example and captures its JSON/HTML to $out as a Hydra
-        # build product. `__noChroot` so the build reaches the real GPU — only
-        # meaningful on the aarch64-darwin Metal builders (perf under Linux
+        # bench_pagerank example (size sweep) **and** bench_scaling (the
+        # degree × structure / sparse↔dense matrix), capturing all criterion
+        # JSON/HTML to $out as a Hydra build product — both write into the same
+        # target/criterion tree, so one copy archives every group per merge for
+        # over-time tracking. `__noChroot` so the build reaches the real GPU —
+        # only meaningful on the aarch64-darwin Metal builders (perf under Linux
         # lavapipe is software and meaningless), so hydraJobs wires this on
         # darwin only. Timing output varies run-to-run ⇒ it never caches; that's
         # intended for a per-merge perf signal. Requires the darwin Hydra
@@ -142,6 +145,8 @@
           buildInputs = bevyLibs;
           buildPhaseCargoCommand = ''
             cargo run --release -p graph-compute --example bench_pagerank -- \
+              --bench --noplot --save-baseline hydra
+            cargo run --release -p graph-compute --example bench_scaling -- \
               --bench --noplot --save-baseline hydra
           '';
           doInstallCargoArtifacts = false;
