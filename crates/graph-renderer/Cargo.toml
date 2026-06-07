@@ -129,6 +129,13 @@ features = [
   "Blob",
   "BlobPropertyBag",
   "Url",
+  # Instances-page YAML import/export: anchor-download, <input type=file>
+  # upload + FileReader (src/ui/file_io.rs).
+  "HtmlAnchorElement",
+  "HtmlInputElement",
+  "FileReader",
+  "File",
+  "FileList",
 ]
 
 [build-dependencies]

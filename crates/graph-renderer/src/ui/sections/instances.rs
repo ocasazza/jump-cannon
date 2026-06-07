@@ -6,7 +6,20 @@
 use eframe::egui;
 
 use crate::ui::actions::{ActionRegistry, ParamValue};
+use crate::ui::file_io;
 use crate::ui::state::{self, AppState};
+
+/// Apply an imported AppState YAML to the live state — a full replacement that
+/// preserves the in-memory snapshot ring (it's `#[serde(skip)]`), then stamps a
+/// timeline entry. Shared by the paste-Load, file-Upload, and server-preset paths.
+fn apply_imported_yaml(state: &mut AppState, yaml: &str) -> Result<(), String> {
+    let imported = state::import_state_yaml(yaml)?;
+    let ring = std::mem::take(&mut state.snapshots);
+    *state = imported;
+    state.snapshots = ring;
+    state.snapshot_now("import yaml");
+    Ok(())
+}
 
 use super::{hint_label, subgroup_label, subgroup_separator};
 
@@ -90,12 +103,50 @@ pub fn show(ui: &mut egui::Ui, state: &mut AppState, registry: &mut ActionRegist
 fn yaml_io_panel(ui: &mut egui::Ui, state: &mut AppState) {
     subgroup_label(ui, "Import / Export YAML");
 
+    // Drain async results from file-upload + server-preset fetch (they arrive
+    // across frames via static slots). Applying here keeps the buttons trivial.
+    if let Some(text) = file_io::take_upload() {
+        match apply_imported_yaml(state, &text) {
+            Ok(()) => state.yaml_import_error = None,
+            Err(e) => state.yaml_import_error = Some(format!("upload parse: {e}")),
+        }
+    }
+    if let Some(res) = file_io::take_preset() {
+        match res {
+            Ok(yaml) => match apply_imported_yaml(state, &yaml) {
+                Ok(()) => state.yaml_import_error = None,
+                Err(e) => state.yaml_import_error = Some(format!("preset parse: {e}")),
+            },
+            Err(e) => state.yaml_import_error = Some(format!("preset fetch: {e}")),
+        }
+    }
+
     // ---- Export row ------------------------------------------------------
     ui.horizontal(|ui| {
         if ui.button("Export").clicked() {
             match state::export_state_yaml(state) {
                 Ok(s) => state.yaml_export_buffer = s,
                 Err(e) => state.yaml_export_buffer = format!("# export error: {e}"),
+            }
+        }
+        // Download the current state straight to a .yaml file (exports fresh —
+        // no need to click Export first).
+        if ui
+            .button("⬇ File")
+            .on_hover_text("Download the entire app state as a .yaml file")
+            .clicked()
+        {
+            match state::export_state_yaml(state) {
+                Ok(yaml) => {
+                    if let Err(e) = file_io::download_text(
+                        "jump-cannon-appstate.yaml",
+                        "application/yaml",
+                        &yaml,
+                    ) {
+                        state.yaml_import_error = Some(format!("download: {e}"));
+                    }
+                }
+                Err(e) => state.yaml_import_error = Some(format!("export: {e}")),
             }
         }
         let has_export = !state.yaml_export_buffer.is_empty();
@@ -168,8 +219,36 @@ fn yaml_io_panel(ui: &mut egui::Ui, state: &mut AppState) {
     });
 
     if let Some(err) = &state.yaml_import_error {
-        ui.colored_label(egui::Color32::from_rgb(220, 70, 70), format!("Parse error: {err}"));
+        ui.colored_label(
+            egui::Color32::from_rgb(220, 70, 70),
+            format!("Parse error: {err}"),
+        );
     }
+
+    ui.add_space(6.0);
+
+    // ---- Load from file / dev-server preset -----------------------------
+    subgroup_label(ui, "Load from file or dev-server preset");
+    ui.horizontal_wrapped(|ui| {
+        if ui
+            .button("⬆ Upload .yaml")
+            .on_hover_text("Pick a YAML file and load the full app state from it")
+            .clicked()
+        {
+            file_io::open_upload(".yaml,.yml,application/yaml");
+        }
+        ui.separator();
+        ui.label("Presets:");
+        for &name in file_io::PRESET_NAMES {
+            if ui
+                .button(name)
+                .on_hover_text(format!("Load /configs/{name} from the dev server"))
+                .clicked()
+            {
+                file_io::fetch_preset(name);
+            }
+        }
+    });
 
     ui.add_space(6.0);
 
@@ -180,8 +259,12 @@ fn yaml_io_panel(ui: &mut egui::Ui, state: &mut AppState) {
         } else {
             ("Reset to defaults", egui::Color32::from_rgb(170, 60, 60))
         };
-        let btn = egui::Button::new(egui::RichText::new(label).color(egui::Color32::WHITE).small())
-            .fill(color);
+        let btn = egui::Button::new(
+            egui::RichText::new(label)
+                .color(egui::Color32::WHITE)
+                .small(),
+        )
+        .fill(color);
         if ui.add(btn).clicked() {
             if state.yaml_reset_armed {
                 // Preserve the timeline across the reset so the user
@@ -350,14 +433,11 @@ fn state_timeline_panel(ui: &mut egui::Ui, state: &mut AppState) {
                             .color(egui::Color32::GRAY),
                     );
                     ui.label(egui::RichText::new(&entry.source).size(12.0));
-                    ui.with_layout(
-                        egui::Layout::right_to_left(egui::Align::Center),
-                        |ui| {
-                            if ui.small_button("Restore").clicked() {
-                                to_restore = Some(idx);
-                            }
-                        },
-                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.small_button("Restore").clicked() {
+                            to_restore = Some(idx);
+                        }
+                    });
                 });
             }
         });

@@ -14,9 +14,9 @@ use axum::{
     routing::{get, put},
     Json, Router,
 };
-use tokio::sync::broadcast::error::RecvError;
 use prost::Message as ProstMessage;
 use serde::{Deserialize, Serialize};
+use tokio::sync::broadcast::error::RecvError;
 
 use crate::{attribute_resolver, proto, state::AppState};
 use graph_layouts::geometric::LensConfig;
@@ -29,6 +29,10 @@ pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/", get(index))
         .route("/assets/*path", get(asset))
+        // App-state config presets (the instances-page import/export feature):
+        // `/configs` lists shipped presets; `/configs/:name` returns one as YAML.
+        .route("/configs", get(configs_list))
+        .route("/configs/:name", get(config_get))
         .route("/graph/init", get(graph_init))
         .route("/graph/ids", get(graph_ids))
         .route("/graph/positions", get(graph_positions))
@@ -95,7 +99,10 @@ fn put_err(status: StatusCode, msg: impl Into<String>) -> axum::response::Respon
     tracing::warn!(error = %msg, "vault page put rejected");
     (
         status,
-        Json(VaultPagePutResp { ok: false, error: Some(msg) }),
+        Json(VaultPagePutResp {
+            ok: false,
+            error: Some(msg),
+        }),
     )
         .into_response()
 }
@@ -163,10 +170,12 @@ async fn vault_page_put(
     // new pages — there's no graph-side affordance for that yet).
     let canonical_root = match tokio::fs::canonicalize(&vault_root).await {
         Ok(p) => p,
-        Err(e) => return put_err(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("canonicalize vault_root: {e}"),
-        ),
+        Err(e) => {
+            return put_err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("canonicalize vault_root: {e}"),
+            )
+        }
     };
     let parent = match abs.parent() {
         Some(p) => p.to_path_buf(),
@@ -174,19 +183,20 @@ async fn vault_page_put(
     };
     let canonical_parent = match tokio::fs::canonicalize(&parent).await {
         Ok(p) => p,
-        Err(e) => return put_err(
-            StatusCode::BAD_REQUEST,
-            format!("parent dir not found: {e}"),
-        ),
+        Err(e) => {
+            return put_err(
+                StatusCode::BAD_REQUEST,
+                format!("parent dir not found: {e}"),
+            )
+        }
     };
     if !canonical_parent.starts_with(&canonical_root) {
-        return put_err(
-            StatusCode::BAD_REQUEST,
-            "resolved path escapes vault root",
-        );
+        return put_err(StatusCode::BAD_REQUEST, "resolved path escapes vault root");
     }
     let final_path = canonical_parent.join(
-        abs.file_name().ok_or_else(|| "missing filename").unwrap_or_default(),
+        abs.file_name()
+            .ok_or_else(|| "missing filename")
+            .unwrap_or_default(),
     );
 
     // Read the existing file to preserve its YAML frontmatter block.
@@ -195,16 +205,16 @@ async fn vault_page_put(
     // — page creation is not supported here.
     let existing = match tokio::fs::read_to_string(&final_path).await {
         Ok(s) => s,
-        Err(e) => return put_err(
-            StatusCode::NOT_FOUND,
-            format!("read {}: {e}", final_path.display()),
-        ),
+        Err(e) => {
+            return put_err(
+                StatusCode::NOT_FOUND,
+                format!("read {}: {e}", final_path.display()),
+            )
+        }
     };
     let frontmatter_block = extract_frontmatter_block(&existing);
 
-    let mut new_contents = String::with_capacity(
-        frontmatter_block.len() + req.body.len() + 1,
-    );
+    let mut new_contents = String::with_capacity(frontmatter_block.len() + req.body.len() + 1);
     new_contents.push_str(&frontmatter_block);
     // Ensure a single newline between frontmatter and body when a
     // frontmatter block exists and the new body doesn't already start
@@ -248,7 +258,10 @@ async fn vault_page_put(
     );
     (
         StatusCode::OK,
-        Json(VaultPagePutResp { ok: true, error: None }),
+        Json(VaultPagePutResp {
+            ok: true,
+            error: None,
+        }),
     )
         .into_response()
 }
@@ -344,11 +357,15 @@ async fn generate_post(Json(req): Json<GeneratePostReq>) -> axum::response::Resp
 /// newline after the closing `---` IS included so callers can splice the
 /// body directly after.
 fn extract_frontmatter_block(text: &str) -> String {
-    let rest = match text.strip_prefix("---\n").or_else(|| text.strip_prefix("---\r\n")) {
+    let rest = match text
+        .strip_prefix("---\n")
+        .or_else(|| text.strip_prefix("---\r\n"))
+    {
         Some(_) => text,
         None => return String::new(),
     };
-    let after_open = rest.strip_prefix("---\n")
+    let after_open = rest
+        .strip_prefix("---\n")
         .or_else(|| rest.strip_prefix("---\r\n"))
         .unwrap_or(rest);
     let consumed = rest.len() - after_open.len();
@@ -356,7 +373,7 @@ fn extract_frontmatter_block(text: &str) -> String {
         // `end` is the byte offset (inside after_open) of the closing
         // `---` line. Include the closing marker + its trailing newline.
         let mut block_end = consumed + end + 3; // `---`
-        // Account for the newline (or CRLF) after the closing fence.
+                                                // Account for the newline (or CRLF) after the closing fence.
         let tail = &rest[block_end..];
         if tail.starts_with("\r\n") {
             block_end += 2;
@@ -429,10 +446,16 @@ async fn compute_layout_put(
         ..Default::default()
     };
     match s.inner.compute_broker.reselect(selection).await {
-        Ok(()) => axum::Json(ComputeLayoutPutResp { ok: true, error: None }),
+        Ok(()) => axum::Json(ComputeLayoutPutResp {
+            ok: true,
+            error: None,
+        }),
         Err(e) => {
             tracing::warn!(error = %e, "compute layout reselect failed");
-            axum::Json(ComputeLayoutPutResp { ok: false, error: Some(e.to_string()) })
+            axum::Json(ComputeLayoutPutResp {
+                ok: false,
+                error: Some(e.to_string()),
+            })
         }
     }
 }
@@ -463,6 +486,79 @@ async fn asset(State(s): State<AppState>, Path(path): Path<String>) -> impl Into
     asset_response(&s, &path)
 }
 
+// --- App-state config presets -------------------------------------------------
+//
+// The renderer's instances page imports/exports the entire AppState as YAML.
+// These endpoints let the dev-server ship named preset configs so a user can
+// load a known configuration (and share `?config=<name>` links). The presets
+// live in `crates/graph-renderer/configs/*.yaml`; we resolve that dir relative
+// to the dev `--assets-dir` (…/graph-renderer/assets/dist → …/graph-renderer/
+// configs). Only available in dev (when assets are served from disk).
+
+fn configs_dir(s: &AppState) -> Option<std::path::PathBuf> {
+    let dist = s.inner.assets_dir.as_ref()?; // …/crates/graph-renderer/assets/dist
+    Some(dist.parent()?.parent()?.join("configs"))
+}
+
+/// `GET /configs` → `[{ "name": "...", "description": "..." }, …]` (sorted).
+/// Description is the file's first `# …` comment line, if any.
+async fn configs_list(State(s): State<AppState>) -> impl IntoResponse {
+    let Some(dir) = configs_dir(&s) else {
+        return (
+            StatusCode::NOT_FOUND,
+            "configs unavailable (not in dev mode)",
+        )
+            .into_response();
+    };
+    let mut items: Vec<serde_json::Value> = Vec::new();
+    if let Ok(rd) = std::fs::read_dir(&dir) {
+        for entry in rd.flatten() {
+            let p = entry.path();
+            if p.extension().and_then(|e| e.to_str()) != Some("yaml") {
+                continue;
+            }
+            let Some(name) = p.file_stem().and_then(|x| x.to_str()) else {
+                continue;
+            };
+            let description = std::fs::read_to_string(&p).ok().and_then(|c| {
+                c.lines()
+                    .find(|l| l.trim_start().starts_with("# "))
+                    .map(|l| l.trim_start().trim_start_matches("# ").trim().to_string())
+            });
+            items.push(serde_json::json!({ "name": name, "description": description }));
+        }
+    }
+    items.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
+    Json(items).into_response()
+}
+
+/// `GET /configs/:name` → the preset's YAML (`name` without the `.yaml`).
+async fn config_get(State(s): State<AppState>, Path(name): Path<String>) -> impl IntoResponse {
+    // Reject path traversal / nested paths.
+    if name.is_empty() || name.contains('/') || name.contains('\\') || name.contains("..") {
+        return (StatusCode::BAD_REQUEST, "invalid config name").into_response();
+    }
+    let Some(dir) = configs_dir(&s) else {
+        return (
+            StatusCode::NOT_FOUND,
+            "configs unavailable (not in dev mode)",
+        )
+            .into_response();
+    };
+    let path = dir.join(format!("{name}.yaml"));
+    match std::fs::read_to_string(&path) {
+        Ok(body) => (
+            [(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("application/yaml"),
+            )],
+            body,
+        )
+            .into_response(),
+        Err(_) => (StatusCode::NOT_FOUND, "no such config").into_response(),
+    }
+}
+
 /// Dev mode (assets_dir set): read from disk every request — refresh browser
 /// to see JS/CSS/HTML edits without rebuild.
 /// Release mode (assets_dir None): serve from the include_dir!() embedded bundle.
@@ -476,7 +572,10 @@ fn asset_response(s: &AppState, path: &str) -> axum::response::Response {
                 headers.insert(header::CONTENT_TYPE, HeaderValue::from_str(mime).unwrap());
                 (StatusCode::OK, headers, bytes).into_response()
             }
-            Err(_) => (StatusCode::NOT_FOUND, format!("not found: {}", full.display()))
+            Err(_) => (
+                StatusCode::NOT_FOUND,
+                format!("not found: {}", full.display()),
+            )
                 .into_response(),
         }
     } else {
@@ -493,15 +592,15 @@ fn asset_response(s: &AppState, path: &str) -> axum::response::Response {
 
 fn mime_for(path: &str) -> &'static str {
     match path.rsplit('.').next().unwrap_or("") {
-        "html"  => "text/html; charset=utf-8",
-        "js"    => "application/javascript",
-        "wasm"  => "application/wasm",
-        "css"   => "text/css",
-        "json"  => "application/json",
+        "html" => "text/html; charset=utf-8",
+        "js" => "application/javascript",
+        "wasm" => "application/wasm",
+        "css" => "text/css",
+        "json" => "application/json",
         "proto" => "text/plain; charset=utf-8",
-        "png"   => "image/png",
-        "svg"   => "image/svg+xml",
-        _       => "application/octet-stream",
+        "png" => "image/png",
+        "svg" => "image/svg+xml",
+        _ => "application/octet-stream",
     }
 }
 
@@ -566,8 +665,8 @@ async fn graph_init(State(s): State<AppState>) -> impl IntoResponse {
 async fn node_meta(State(s): State<AppState>, Path(id): Path<String>) -> impl IntoResponse {
     let snap = s.snapshot();
     if let Some(node) = snap.graph.nodes.get(&id) {
-        let frontmatter_json = serde_json::to_string(&node.meta.frontmatter)
-            .unwrap_or_else(|_| "{}".into());
+        let frontmatter_json =
+            serde_json::to_string(&node.meta.frontmatter).unwrap_or_else(|_| "{}".into());
         // Read the full markdown body from disk. We don't pre-load
         // every body into the in-memory graph (a 10k-node vault is
         // ~50MB of text), so this is a lazy per-request file read.
@@ -688,7 +787,10 @@ fn read_body(vault_root: &std::path::Path, path_id: &str) -> String {
     // Strip leading `---\n…\n---` YAML frontmatter. Same shape as the
     // splitter in vault-links/src/parser.rs but inline here so we don't
     // pull in that crate just for the strip.
-    let rest = match raw.strip_prefix("---\n").or_else(|| raw.strip_prefix("---\r\n")) {
+    let rest = match raw
+        .strip_prefix("---\n")
+        .or_else(|| raw.strip_prefix("---\r\n"))
+    {
         Some(r) => r,
         None => return raw,
     };
@@ -814,11 +916,7 @@ async fn graph_edges(State(s): State<AppState>) -> impl IntoResponse {
 async fn graph_csr_bin(State(s): State<AppState>) -> axum::response::Response {
     let snap = s.snapshot();
     if snap.graph.nodes.is_empty() {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            "graph not loaded",
-        )
-            .into_response();
+        return (StatusCode::SERVICE_UNAVAILABLE, "graph not loaded").into_response();
     }
     let bytes = build_csr_bin(&snap);
     let mut headers = HeaderMap::new();
@@ -890,15 +988,21 @@ async fn graph_meta_summary(State(s): State<AppState>) -> impl IntoResponse {
 /// uses this CSR-style payload (sorted node-idx vecs per (field, value)
 /// bucket) to compute filter intersections without per-click round-trips.
 pub fn build_meta_summary_bytes(graph: &vault_data::VaultGraph) -> Vec<u8> {
-    use std::collections::BTreeMap;
     use serde_json::Value;
+    use std::collections::BTreeMap;
 
     // Field name -> value -> sorted Vec<node_idx>.
     let mut idx: BTreeMap<String, BTreeMap<String, Vec<u32>>> = BTreeMap::new();
-    fn push(idx: &mut BTreeMap<String, BTreeMap<String, Vec<u32>>>,
-            field: &str, value: &str, node: u32) {
+    fn push(
+        idx: &mut BTreeMap<String, BTreeMap<String, Vec<u32>>>,
+        field: &str,
+        value: &str,
+        node: u32,
+    ) {
         let v = value.trim();
-        if v.is_empty() { return; }
+        if v.is_empty() {
+            return;
+        }
         idx.entry(field.to_string())
             .or_default()
             .entry(v.to_string())
@@ -909,42 +1013,49 @@ pub fn build_meta_summary_bytes(graph: &vault_data::VaultGraph) -> Vec<u8> {
     for (i, (_id, node)) in graph.nodes.iter().enumerate() {
         let ni = i as u32;
         for t in &node.meta.tags {
-            push(&mut idx,"tags", t, ni);
+            push(&mut idx, "tags", t, ni);
         }
         if let Some(dt) = &node.meta.doctype {
-            push(&mut idx,"doctype", dt, ni);
+            push(&mut idx, "doctype", dt, ni);
         }
-        push(&mut idx,"folder", &node.meta.folder, ni);
+        push(&mut idx, "folder", &node.meta.folder, ni);
         let fm = &node.meta.frontmatter;
         // status — usually a scalar string.
         if let Some(Value::String(v)) = fm.get("status") {
-            push(&mut idx,"status", v, ni);
+            push(&mut idx, "status", v, ni);
         }
         // authors — comma-split string OR array.
         if let Some(v) = fm.get("authors") {
             for s in extract_strings(v) {
                 for part in s.split(',') {
-                    push(&mut idx,"authors", part, ni);
+                    push(&mut idx, "authors", part, ni);
                 }
             }
         }
         if let Some(v) = fm.get("entities") {
             for s in extract_strings(v) {
-                push(&mut idx,"entities", &s, ni);
+                push(&mut idx, "entities", &s, ni);
             }
         }
         if let Some(v) = fm.get("key_topics") {
             for s in extract_strings(v) {
-                push(&mut idx,"key_topics", &s, ni);
+                push(&mut idx, "key_topics", &s, ni);
             }
         }
         // related — wikilinks; strip the [[ ]] wrapper, split on |.
         if let Some(v) = fm.get("related") {
             for s in extract_strings(v) {
                 let t = s.trim();
-                let inner = t.strip_prefix("[[").and_then(|x| x.strip_suffix("]]")).unwrap_or(t);
-                let target = inner.split_once('|').map(|(p, _)| p).unwrap_or(inner).trim();
-                push(&mut idx,"related", target, ni);
+                let inner = t
+                    .strip_prefix("[[")
+                    .and_then(|x| x.strip_suffix("]]"))
+                    .unwrap_or(t);
+                let target = inner
+                    .split_once('|')
+                    .map(|(p, _)| p)
+                    .unwrap_or(inner)
+                    .trim();
+                push(&mut idx, "related", target, ni);
             }
         }
     }
@@ -1044,7 +1155,7 @@ async fn graph_layout_stream(
                 }
             }
         }
-        
+
         // Apply the selection to the global broker. `reselect` restarts the
         // forwarder so subsequent frames come from the chosen engine (+ resolved
         // attributes); ignore the error when the broker is disabled (the
@@ -1077,8 +1188,7 @@ async fn layout_stream_loop(
             }
             Err(RecvError::Closed) => break,
         };
-        let mut buf =
-            Vec::with_capacity(8 + 4 + frame.positions.len());
+        let mut buf = Vec::with_capacity(8 + 4 + frame.positions.len());
         buf.extend_from_slice(&frame.frame.to_le_bytes());
         buf.extend_from_slice(&frame.n_nodes.to_le_bytes());
         buf.extend_from_slice(&frame.positions);

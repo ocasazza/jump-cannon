@@ -183,7 +183,10 @@ pub struct FrontendEventLog {
 
 impl Default for FrontendEventLog {
     fn default() -> Self {
-        Self { entries: std::collections::VecDeque::new(), cap: 500 }
+        Self {
+            entries: std::collections::VecDeque::new(),
+            cap: 500,
+        }
     }
 }
 
@@ -431,8 +434,7 @@ pub enum CommunitySource {
 }
 
 impl CommunitySource {
-    pub const ALL: &'static [CommunitySource] =
-        &[CommunitySource::Computed, CommunitySource::Tag];
+    pub const ALL: &'static [CommunitySource] = &[CommunitySource::Computed, CommunitySource::Tag];
     pub fn label(self) -> &'static str {
         match self {
             CommunitySource::Computed => "Computed (Louvain)",
@@ -504,19 +506,37 @@ pub struct StyleState {
     pub community_source: CommunitySource,
 }
 
-fn default_edge_color() -> [f32; 4] { [0.227, 0.282, 0.502, 1.0] }
-fn default_edge_alpha_mul() -> f32 { 2.0 }
+fn default_edge_color() -> [f32; 4] {
+    [0.227, 0.282, 0.502, 1.0]
+}
+fn default_edge_alpha_mul() -> f32 {
+    2.0
+}
 // Bumped from 10 / 400 to 50 / 1600 to track the 800-unit Fibonacci-shell
 // spawn (data::spawn_on_unit_sphere). Typical edge lengths during settle
 // land in the few-hundred-to-low-thousand range, so the old 10..400 band
 // was clamping every edge to the long-distance fade floor.
-fn default_edge_dist_min() -> f32 { 50.0 }
-fn default_edge_dist_max() -> f32 { 1600.0 }
-fn default_edge_min_transparency() -> f32 { 1.0 }
-fn default_edge_fade_floor() -> f32 { 0.085 }
-fn default_edge_width() -> f32 { 2.1 }
-fn default_edge_size_mul() -> f32 { 1.0 }
-fn default_shader_intensity() -> f32 { 1.0 }
+fn default_edge_dist_min() -> f32 {
+    50.0
+}
+fn default_edge_dist_max() -> f32 {
+    1600.0
+}
+fn default_edge_min_transparency() -> f32 {
+    1.0
+}
+fn default_edge_fade_floor() -> f32 {
+    0.085
+}
+fn default_edge_width() -> f32 {
+    2.1
+}
+fn default_edge_size_mul() -> f32 {
+    1.0
+}
+fn default_shader_intensity() -> f32 {
+    1.0
+}
 
 impl Default for StyleState {
     fn default() -> Self {
@@ -562,7 +582,9 @@ pub struct LayoutState {
     pub settings: std::collections::HashMap<String, serde_json::Value>,
 }
 
-fn default_active_layout() -> String { "gpu-force".to_string() }
+fn default_active_layout() -> String {
+    "gpu-force".to_string()
+}
 
 impl Default for LayoutState {
     fn default() -> Self {
@@ -617,7 +639,9 @@ where
 /// Called once from `App::new` before deserialising into `AppState`.
 /// Returns the value mutated in place.
 pub fn migrate_layout_state(raw: &mut serde_json::Value) {
-    let Some(obj) = raw.as_object_mut() else { return };
+    let Some(obj) = raw.as_object_mut() else {
+        return;
+    };
     let Some(layout) = obj.get_mut("layout").and_then(|v| v.as_object_mut()) else {
         return;
     };
@@ -834,7 +858,10 @@ pub struct SnapshotRing {
 
 impl Default for SnapshotRing {
     fn default() -> Self {
-        Self { entries: Vec::new(), max: 50 }
+        Self {
+            entries: Vec::new(),
+            max: 50,
+        }
     }
 }
 
@@ -1274,7 +1301,11 @@ impl AppState {
             .duration_since(web_time::UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0);
-        let entry = StateSnapshot { timestamp_ms, source, state_json };
+        let entry = StateSnapshot {
+            timestamp_ms,
+            source,
+            state_json,
+        };
         self.snapshots.entries.push(entry);
         let max = self.snapshots.max.max(1);
         while self.snapshots.entries.len() > max {
@@ -1497,7 +1528,9 @@ impl PanelId {
 // on next reload. No version ceremony.
 pub const STORAGE_KEY: &str = "graph_renderer_app_state";
 
-fn default_true() -> bool { true }
+fn default_true() -> bool {
+    true
+}
 
 /// Default placement for the promoted-node ("Node") panel. Floating —
 /// unlike the section panels (which default Tiled) we keep node previews
@@ -1536,10 +1569,16 @@ impl AppState {
         // single tab the renderer collapses the strip to zero height
         // (see app.rs `n_tabs <= 1`).
         let was_dock_visible = self.dock.has_multiple_tabs();
-        self.canvas_mount = CanvasMount::Floating { rect: None, was_dock_visible };
+        self.canvas_mount = CanvasMount::Floating {
+            rect: None,
+            was_dock_visible,
+        };
     }
     pub fn dock_canvas_back(&mut self) {
-        let was_dock_visible = if let CanvasMount::Floating { was_dock_visible, .. } = self.canvas_mount {
+        let was_dock_visible = if let CanvasMount::Floating {
+            was_dock_visible, ..
+        } = self.canvas_mount
+        {
             was_dock_visible
         } else {
             false
@@ -1626,9 +1665,8 @@ pub struct ComputeEngineState {
     /// resolves; the inner `Result` distinguishes a server error (route
     /// 404 / graph-api down) from a successful "no worker" snapshot
     /// (`connected: false`). Shared with the async fetch task on `App`.
-    pub snapshot: std::sync::Arc<
-        std::sync::Mutex<Option<Result<crate::fetch::ComputeEngines, String>>>,
-    >,
+    pub snapshot:
+        std::sync::Arc<std::sync::Mutex<Option<Result<crate::fetch::ComputeEngines, String>>>>,
     /// True once a fetch has been kicked off, so the lazy auto-refresh on
     /// panel open fires exactly once per session unless the user hits the
     /// manual refresh button (which clears nothing — it just re-requests).
@@ -1650,5 +1688,32 @@ impl ComputeEngineState {
     /// latch) for read-only rendering. `None` = not yet fetched.
     pub fn current(&self) -> Option<Result<crate::fetch::ComputeEngines, String>> {
         self.snapshot.lock().ok().and_then(|g| g.clone())
+    }
+}
+
+#[cfg(test)]
+mod config_presets {
+    //! Guards that every shipped preset in `configs/*.yaml` round-trips through
+    //! `import_state_yaml` — so a malformed preset (bad enum key, etc.) is caught
+    //! in CI, not by a user clicking "Load preset".
+    #[test]
+    fn all_preset_configs_parse() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("configs");
+        let mut count = 0;
+        for entry in std::fs::read_dir(&dir).expect("configs dir") {
+            let p = entry.unwrap().path();
+            if p.extension().and_then(|e| e.to_str()) == Some("yaml") {
+                let yaml = std::fs::read_to_string(&p).unwrap();
+                let r = super::import_state_yaml(&yaml);
+                assert!(
+                    r.is_ok(),
+                    "preset {:?} failed: {:?}",
+                    p.file_name(),
+                    r.err()
+                );
+                count += 1;
+            }
+        }
+        assert!(count >= 1, "no preset configs found in {dir:?}");
     }
 }

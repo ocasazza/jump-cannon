@@ -1,0 +1,157 @@
+# Lavender — glowing lavender edges to match the notebook theme; Style panel open.
+section_open:
+  Style: true
+section_placement: {}
+filter_strip_placement: Tiled
+node_panel_placement: Floating
+tiles:
+  tree:
+    id: 11662056226323563437
+    root: null
+    tiles:
+      next_tile_id: 1
+      tiles: {}
+      invisible: []
+    height: null
+    width: null
+  width: 480.0
+style:
+  size_by: PageRank
+  color_by: Community
+  shape_by: Doctype
+  edge_color_by: None
+  size_mul: 0.5
+  edge_size_mul: 1.0
+  log_scale_size: false
+  shader_intensity: 1.3
+  edge_color:
+  - 0.72
+  - 0.58
+  - 0.96
+  - 1.0
+  edge_alpha_mul: 3.0
+  edge_dist_min: 50.0
+  edge_dist_max: 1600.0
+  edge_min_transparency: 1.0
+  edge_fade_floor: 0.085
+  edge_width: 2.8
+  palette: Tableau20
+  community_source: Computed
+layout:
+  active: gpu-force
+  settings: {}
+camera:
+  invert_mouse_x: false
+  invert_mouse_y: false
+  invert_ad: false
+  invert_qe: false
+  follow_centroid: true
+  fit_to_window: true
+focus:
+  dof_enabled: false
+  distance: 100.0
+  thickness: 50.0
+  blur: 0.5
+  max_coc: 8.0
+  focus_mode: SameCommunityId
+cursor:
+  radius: 80.0
+  strength: 1.0
+  depth: 50.0
+metrics:
+  pinned: []
+  last: null
+  auto: false
+workspace:
+  font_size: 14.0
+  font_family: Monospace
+  show_line_numbers: true
+dock:
+  dock_state:
+    surfaces:
+    - !Main
+      nodes:
+      - !Leaf
+        rect:
+          min:
+            x: .inf
+            'y': .inf
+          max:
+            x: -.inf
+            'y': -.inf
+        viewport:
+          min:
+            x: .inf
+            'y': .inf
+          max:
+            x: -.inf
+            'y': -.inf
+        tabs:
+        - kind: Graph
+          title: Graph
+        active: 0
+        scroll: 0.0
+        collapsed: false
+      focused_node: null
+      collapsed: false
+      collapsed_leaf_count: 0
+    focused_surface: null
+    translations:
+      tab_context_menu:
+        close_button: Close
+        eject_button: Eject
+      leaf:
+        close_button_disabled_tooltip: This leaf contains non-closable tabs.
+        close_all_button: Close window
+        close_all_button_menu_hint: Right click to close this window.
+        close_all_button_modifier_hint: Press modifier keys (Shift by default) to close this window.
+        close_all_button_modifier_menu_hint: Press modifier keys (Shift by default) or right click to close this window.
+        close_all_button_disabled_tooltip: This window contains non-closable tabs.
+        minimize_button: Minimize window
+        minimize_button_menu_hint: Right click to minimize this window.
+        minimize_button_modifier_hint: Press modifier keys (Shift by default) to minimize this window.
+        minimize_button_modifier_menu_hint: Press modifier keys (Shift by default) or right click to minimize this window.
+dock_tab_strip_force_show: false
+sim_status: Settled
+query:
+  cards:
+  - !Search
+    value: ''
+    regex: false
+  active_filters:
+    by_field: {}
+    insertion_order: []
+    field_combinator: {}
+    cross_field_combinator: All
+action_instances: []
+status_footer_open: false
+tag_browser_query: ''
+filter_strip_open: false
+filter_behavior: Filter
+canvas_mount: Background
+debug_view_mode: Events
+generate:
+  editor:
+    source: |
+      # Edit this Nix expression, then press Evaluate.
+      # It must produce toGraphJSON's { nodes = [...]; links = [...]; } shape.
+      let
+        g  = import /jc/src/graph.nix {};
+        gc = import /jc/src/graph-combinators.nix { graph = g; };
+      in
+        g.toGraphJSON (gc.starGen { nodes = 12; prefix = "n"; })
+  backend: Auto
+seed:
+  strategy: None
+  editor:
+    source: |
+      # Implement the seed interface, then press Apply seed.
+      #   seed : { n, ... } -> [ { x; y; z; } ]
+      # `n` (the live node count) is bound for you. Return exactly n positions,
+      # or [] to apply no seed. The embedded library has built-ins to build on:
+      let s = import /jc/src/seed.nix {};
+      in s.sphere { inherit n; radius = 800.0; }
+timeline:
+  depth: 300
+  stride: 1
+
