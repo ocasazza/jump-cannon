@@ -141,7 +141,7 @@
           pname = "graph-compute-bench-pagerank";
           version = "0.1.0";
           __noChroot = true;
-          nativeBuildInputs = [ pkgs.pkg-config pkgs.protobuf pkgs.jq ];
+          nativeBuildInputs = [ pkgs.pkg-config pkgs.protobuf ];
           buildInputs = bevyLibs;
           buildPhaseCargoCommand = ''
             cargo run --release -p graph-compute --example bench_pagerank -- \
@@ -156,31 +156,6 @@
             if [ -d target/criterion ]; then cp -r target/criterion $out/criterion; fi
             # Surface the criterion dir as a Hydra build product for the report.
             echo "report criterion $out/criterion" > $out/nix-support/hydra-build-products
-
-            # Translate every criterion benchmark into a Hydra build metric so
-            # Hydra plots it over time per job (the native time-series store —
-            # one point per merge, no external dashboard). Format is fixed by
-            # Hydra's parser: `<name> <value> [<unit>]`, whitespace-separated,
-            # name ∈ [a-zA-Z0-9._-]+, unit ∈ [a-zA-Z0-9._%-]+ (so NO `/` in a
-            # unit — `Melem-s`, not `Melem/s`, or the line is silently dropped).
-            # We read only `*/new/estimates.json` (the just-run result; any
-            # stray `base/` from a local tree is ignored) and emit both the
-            # mean time (ns, lower=better) and derived throughput (Melem-s).
-            metrics="$out/nix-support/hydra-metrics"
-            : > "$metrics"
-            find target/criterion -path '*/new/estimates.json' | sort | while read -r est; do
-              dir=$(dirname "$est"); bench="$dir/benchmark.json"
-              [ -f "$bench" ] || continue
-              id=$(jq -r '.full_id' "$bench")
-              name=$(printf '%s' "$id" | sed 's#[^a-zA-Z0-9._-]#.#g')
-              ns=$(jq -r '.mean.point_estimate' "$est")
-              printf '%s.time_ns %s ns\n' "$name" "$ns" >> "$metrics"
-              elems=$(jq -r '.throughput.Elements // empty' "$bench")
-              if [ -n "$elems" ]; then
-                mps=$(jq -n --argjson e "$elems" --argjson t "$ns" '$e * 1000 / $t')
-                printf '%s.throughput %s Melem-s\n' "$name" "$mps" >> "$metrics"
-              fi
-            done
           '';
         });
 
