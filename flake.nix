@@ -125,29 +125,82 @@
           nativeBuildInputs = [ pkgs.protobuf ];
         });
 
-        # Perf benches (REPORT-ONLY, never gates a merge). Runs the criterion
-        # bench_pagerank example (size sweep) **and** bench_scaling (the
-        # degree × structure / sparse↔dense matrix), capturing all criterion
-        # JSON/HTML to $out as a Hydra build product — both write into the same
-        # target/criterion tree, so one copy archives every group per merge for
-        # over-time tracking. `__noChroot` so the build reaches the real GPU —
-        # only meaningful on the aarch64-darwin Metal builders (perf under Linux
-        # lavapipe is software and meaningless), so hydraJobs wires this on
-        # darwin only. Timing output varies run-to-run ⇒ it never caches; that's
-        # intended for a per-merge perf signal. Requires the darwin Hydra
-        # builders to permit __noChroot (nix.settings extra-sandbox / trusted).
+        # Bencher CLI, pinned to a release binary (no nixpkgs package exists).
+        # macOS arm64 only — the bench job below is aarch64-darwin (Metal)
+        # exclusive, so that's the only platform that needs it.
+        bencherCli = pkgs.runCommand "bencher-0.6.6" { } ''
+          mkdir -p $out/bin
+          cp ${pkgs.fetchurl {
+            url = "https://github.com/bencherdev/bencher/releases/download/v0.6.6/bencher-v0.6.6-macos-arm-64";
+            hash = "sha256-a2VOXkm6LscJ8/l+lenSX4GzBCxEwFAOEGNcyyY8Ouo=";
+          }} $out/bin/bencher
+          chmod +x $out/bin/bencher
+        '';
+
+        # Perf benches on real Metal — the perf-regression gate. Runs the
+        # criterion bench_pagerank (size sweep) + bench_scaling (degree ×
+        # structure / sparse↔dense matrix) and feeds them to our self-hosted
+        # Bencher (continuous benchmarking) for over-time tracking and
+        # statistical regression detection.
+        #
+        # Bencher integration: `bencher run` wraps each criterion command,
+        # parses its output via the rust_criterion adapter, uploads the result
+        # to BENCHER_HOST under project `jump-cannon` / testbed `metal`, and
+        # with `--err` exits non-zero when a measure crosses the t-test
+        # threshold — i.e. a perf regression FAILS the build. The API token is
+        # read from a file on the builder (provisioned out-of-band via the
+        # nixstation host config, e.g. sops). When the token file is absent the
+        # job degrades to a plain criterion run + build-product archive, so the
+        # build keeps working before the token is provisioned and on any
+        # builder that isn't wired to Bencher.
+        #
+        # `__noChroot` so the build reaches the real GPU AND the network (the
+        # Bencher upload + the token file on the builder). Darwin-only: perf
+        # under Linux lavapipe is software and meaningless, so hydraJobs wires
+        # this on darwin only. Timing varies run-to-run ⇒ never caches; that's
+        # the intended per-merge perf signal. Requires the darwin Hydra builders
+        # to permit __noChroot (nix.settings extra-sandbox / trusted).
         bench-pagerank = craneLib.mkCargoDerivation (commonArgs // {
           cargoArtifacts = depsNative;
           pname = "graph-compute-bench-pagerank";
           version = "0.1.0";
           __noChroot = true;
-          nativeBuildInputs = [ pkgs.pkg-config pkgs.protobuf ];
+          nativeBuildInputs = [ pkgs.pkg-config pkgs.protobuf bencherCli ];
           buildInputs = bevyLibs;
+          # Defaults for the self-hosted instance; overridable on the builder.
+          BENCHER_HOST = "http://bencher-api.pdx-nxst-001.schrodinger.com:8080";
+          BENCHER_PROJECT = "jump-cannon";
+          BENCHER_TESTBED = "metal";
+          BENCHER_TOKEN_FILE = "/etc/bencher/ci-token";
           buildPhaseCargoCommand = ''
-            cargo run --release -p graph-compute --example bench_pagerank -- \
-              --bench --noplot --save-baseline hydra
-            cargo run --release -p graph-compute --example bench_scaling -- \
-              --bench --noplot --save-baseline hydra
+            # Run a criterion example under Bencher when a token is available,
+            # else run it directly. `bench_one <example>` keeps the two paths
+            # in one place. `--err` is the regression gate.
+            bench_one() {
+              local ex="$1"
+              local cmd="cargo run --release -p graph-compute --example $ex -- --bench --noplot --save-baseline hydra"
+              if [ -n "''${BENCHER_HOST:-}" ] && [ -r "''${BENCHER_TOKEN_FILE:-}" ]; then
+                bencher run \
+                  --host "$BENCHER_HOST" \
+                  --token "$(cat "$BENCHER_TOKEN_FILE")" \
+                  --project "$BENCHER_PROJECT" \
+                  --testbed "$BENCHER_TESTBED" \
+                  --branch main \
+                  --adapter rust_criterion \
+                  --threshold-measure latency \
+                  --threshold-test t_test \
+                  --threshold-max-sample-size 64 \
+                  --threshold-upper-boundary 0.99 \
+                  --thresholds-reset \
+                  --err \
+                  -- "$cmd"
+              else
+                echo "bencher: BENCHER_HOST or token file ($BENCHER_TOKEN_FILE) absent — running criterion without upload"
+                eval "$cmd"
+              fi
+            }
+            bench_one bench_pagerank
+            bench_one bench_scaling
           '';
           doInstallCargoArtifacts = false;
           doCheck = false;
