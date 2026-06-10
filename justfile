@@ -56,8 +56,11 @@ app-proto:
 # sets the broker's INITIAL pick; switch live from the UI's "Remote engine"
 # picker. On a host with no usable GPU adapter the GPU engines fail init — use
 # `cpu` there.
-# All-in-one dev stack + hot-reload; backend = gpu (default) | cpu.
-dev-up backend="gpu":
+# All-in-one dev stack + hot-reload; backend = gpu (default) | cpu;
+# frontend = egui (default, crates/graph-renderer) | app (Dioxus, app/ui —
+# served by graph-api at :8765 in the browser, and what `just app-dev`'s
+# Tauri shell connects to).
+dev-up backend="gpu" frontend="egui":
     #!/usr/bin/env bash
     set -euo pipefail
 
@@ -72,20 +75,31 @@ dev-up backend="gpu":
     esac
     echo "→ compute backend: {{backend}} (engine: $COMPUTE_ENGINE)"
 
+    # ---- Stage 0b: resolve the frontend ----
+    case "{{frontend}}" in
+      egui) TRUNK_DIR="."   ; ASSETS="crates/graph-renderer/assets/dist" ;;
+      app)  TRUNK_DIR="app" ; ASSETS="app/ui/dist" ;;
+      *)
+        echo "dev-up: unknown frontend '{{frontend}}' (expected 'egui' or 'app')" >&2
+        exit 2
+        ;;
+    esac
+    echo "→ frontend: {{frontend}} (dist: $ASSETS)"
+
     # ---- Stage 1: WASM bundle, always built ----
     # The trunk dist is what graph-api serves at `/`. The previous
-    # "skip if dist exists" check meant any change in graph-renderer
+    # "skip if dist exists" check meant any change in the frontend
     # (the WASM half) was silently invisible after the first dev-up of
     # the day — the user saw stale UI for hours wondering why their
     # recent commits had no effect. Always run trunk; incremental
     # builds are seconds, full ones ~30s. Worth the predictability.
     echo "→ trunk build (WASM)…"
-    trunk build --release
+    (cd "$TRUNK_DIR" && trunk build --release)
 
-    # Background trunk watch so subsequent edits to graph-renderer
-    # rebuild the WASM bundle while dev-up is running. The user just
-    # refreshes the browser; no need to Ctrl-C + restart dev-up.
-    trunk watch &
+    # Background trunk watch so subsequent frontend edits rebuild the
+    # WASM bundle while dev-up is running. The user just refreshes the
+    # browser; no need to Ctrl-C + restart dev-up.
+    (cd "$TRUNK_DIR" && exec trunk watch) &
     TRUNK_PID=$!
 
     # ---- Stage 2 (parallel): everything else ----
@@ -156,7 +170,7 @@ dev-up backend="gpu":
     JUMP_CANNON_COMPUTE_LAYOUT_ID="$COMPUTE_ENGINE" \
     exec cargo watch \
       -w crates/graph-api -w crates/vault-data -w crates/vault-links -w crates/graph-metrics \
-      -x 'run -p graph-api -- --assets-dir crates/graph-renderer/assets/dist'
+      -x "run -p graph-api -- --assets-dir $ASSETS"
 
 # Symmetric teardown for `just dev-up`. Idempotent — safe to re-run.
 dev-down:

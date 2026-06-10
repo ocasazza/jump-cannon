@@ -56,7 +56,22 @@ pub fn router(state: AppState) -> Router {
         .route("/vault/page", put(vault_page_put))
         .route("/generate", axum::routing::post(generate_post))
         .route("/progress", get(progress_poll))
+        // Permissive CORS: the Dioxus/Tauri app (app/) loads from its own
+        // origin (tauri dev server / tauri:// in release) and fetches this API
+        // cross-origin. Consistent with the local-dev no-auth stance documented
+        // on /vault/page below — revisit both together if this ever binds
+        // beyond loopback.
+        .layer(tower_http::cors::CorsLayer::permissive())
+        // Root-level static fallback: the egui dist prefixes its files with
+        // /assets/ (root Trunk.toml public_url), but the Dioxus dist (app/)
+        // links its hashed wasm/js at the root. Serving unmatched paths from
+        // the assets dir lets graph-api host either frontend unchanged.
+        .fallback(get(asset_fallback))
         .with_state(state)
+}
+
+async fn asset_fallback(State(s): State<AppState>, uri: axum::http::Uri) -> impl IntoResponse {
+    asset_response(&s, uri.path().trim_start_matches('/'))
 }
 
 // --- Vault write endpoint ---
