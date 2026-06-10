@@ -1234,7 +1234,7 @@ dependencies = [
 
 [[package]]
 name = "graph-api"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -1270,7 +1270,7 @@ dependencies = [
 
 [[package]]
 name = "graph-compute"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -1302,7 +1302,7 @@ dependencies = [
 
 [[package]]
 name = "graph-layouts"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "bytemuck",
  "chrono",
@@ -1329,7 +1329,7 @@ dependencies = [
 
 [[package]]
 name = "graph-metrics"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "petgraph",
  "rand 0.8.6",
@@ -3599,7 +3599,7 @@ dependencies = [
 
 [[package]]
 name = "test-browser"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "base64",
@@ -4127,7 +4127,7 @@ dependencies = [
 
 [[package]]
 name = "tvix-wasm"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "bytes",
  "console_error_panic_hook",
@@ -4254,7 +4254,7 @@ checksum = "ba73ea9cf16a25df0c8caa16c51acb937d5712a8429db78a3ee29d5dcacd3a65"
 
 [[package]]
 name = "vault-data"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "indexmap 2.14.0",
  "petgraph",
@@ -4264,7 +4264,7 @@ dependencies = [
 
 [[package]]
 name = "vault-links"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "ignore",
@@ -4278,7 +4278,7 @@ dependencies = [
 
 [[package]]
 name = "vault-search"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "axum",

@@ -1,6 +1,6 @@
 [package]
 name = "vault-search"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2021"
 description = "HTTP full-text search backend for an Obsidian vault (Tantivy-backed)"
 license = "MIT"

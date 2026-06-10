@@ -1987,7 +1987,7 @@ dependencies = [
 
 [[package]]
 name = "graph-layouts"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "bytemuck",
  "console_error_panic_hook",
@@ -2574,7 +2574,7 @@ dependencies = [
 
 [[package]]
 name = "jump-cannon-app"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -2586,7 +2586,7 @@ dependencies = [
 
 [[package]]
 name = "jump-cannon-ui"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "bytemuck",
  "dioxus",

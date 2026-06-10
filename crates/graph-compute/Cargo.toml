@@ -1,6 +1,6 @@
 [package]
 name = "graph-compute"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2021"
 description = "Single-GPU wgpu force-simulation worker. Exposes a tonic gRPC Subscribe stream of PositionDelta frames. Native-only (never compiles to wasm)."
 

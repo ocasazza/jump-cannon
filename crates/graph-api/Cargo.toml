@@ -1,6 +1,6 @@
 [package]
 name = "graph-api"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2021"
 description = "axum HTTP API: serves the Dioxus frontend dist (app/) plus protobuf + binary endpoints for the vault graph."
 
