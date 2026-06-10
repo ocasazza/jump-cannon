@@ -51,8 +51,10 @@ const STAGES: &[(&str, &str)] = &[
 /// Mirror of `state.rs::DebugViewMode`.
 #[derive(Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 enum ViewMode {
-    #[default]
     Events,
+    // Stats first: the perf time-series charts are the view people open
+    // the Debug panel for (FPS / frame ms / render cost / KE).
+    #[default]
     Stats,
 }
 

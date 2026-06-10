@@ -46,6 +46,7 @@ pub fn router(state: AppState) -> Router {
         // includes the full path tail without a leading slash.
         .route("/node/*id", get(node_meta))
         .route("/search", get(search))
+        .route("/search/rich", get(search_rich))
         .route("/compute/health", get(compute_health))
         .route("/compute/engines", get(compute_engines))
         .route("/compute/layout", put(compute_layout_put))
@@ -1020,6 +1021,52 @@ struct SearchParams {
     q: String,
     #[serde(default)]
     limit: Option<u32>,
+}
+
+/// `GET /search/rich?q=…` — full-text search with highlighted body snippets.
+///
+/// Passthrough of vault-search's `/search` (BM25 + Tantivy SnippetGenerator;
+/// `{"total": N, "results": [{"id", "score", "snippet"}]}` where `snippet` is
+/// match-highlighted HTML using `<b>` tags around hits). JSON, not protobuf:
+/// snippets are display-ready HTML fragments for the Dioxus node browser, not
+/// hot-path bulk data. Falls back to the same title-contains scan as `/search`
+/// (empty snippets) when vault-search isn't running.
+async fn search_rich(State(s): State<AppState>, Query(p): Query<SearchParams>) -> impl IntoResponse {
+    let limit = p.limit.unwrap_or(50);
+    let vs_opt = s.inner.vault_search.load_full();
+    if let Some(vs) = vs_opt.as_deref() {
+        let url = format!(
+            "{}/search?q={}&limit={}",
+            vs.url(),
+            urlencoding::encode(&p.q),
+            limit
+        );
+        let resp = match reqwest::get(&url).await {
+            Ok(r) => r,
+            Err(e) => {
+                return (StatusCode::BAD_GATEWAY, format!("vault-search proxy: {e}"))
+                    .into_response()
+            }
+        };
+        return match resp.json::<serde_json::Value>().await {
+            Ok(v) => Json(v).into_response(),
+            Err(e) => {
+                (StatusCode::BAD_GATEWAY, format!("vault-search decode: {e}")).into_response()
+            }
+        };
+    }
+
+    let snap = s.snapshot();
+    let q = p.q.to_lowercase();
+    let results: Vec<serde_json::Value> = snap
+        .graph
+        .nodes
+        .iter()
+        .filter(|(_, n)| n.meta.title.to_lowercase().contains(&q))
+        .take(limit as usize)
+        .map(|(id, _)| serde_json::json!({ "id": id, "score": 0.0, "snippet": "" }))
+        .collect();
+    Json(serde_json::json!({ "total": results.len(), "results": results })).into_response()
 }
 
 async fn search(State(s): State<AppState>, Query(p): Query<SearchParams>) -> impl IntoResponse {

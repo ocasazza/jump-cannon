@@ -5,6 +5,7 @@
 //! and styles under its own anchor block in assets/app.css.
 
 pub mod layout;
+pub mod nodes;
 pub mod style;
 pub mod camera;
 pub mod filter;

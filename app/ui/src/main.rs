@@ -71,7 +71,6 @@ fn main() {
 pub(crate) enum Panel {
     Graph,
     Nodes,
-    Search,
     Inspector,
     Document,
     Progress,
@@ -95,7 +94,6 @@ impl panel_kit::PanelKind for Panel {
         match self {
             Panel::Graph => "Graph",
             Panel::Nodes => "Nodes",
-            Panel::Search => "Search",
             Panel::Inspector => "Inspector",
             Panel::Document => "Document",
             Panel::Progress => "Progress",
@@ -143,8 +141,7 @@ fn default_layout() -> Vec<PanelWin<Panel>> {
     // clamp_to_viewport pulls the right column in on narrower screens.
     v.extend([
         b.at(Panel::Graph, 12.0, 44.0, 920.0, 620.0),
-        b.at(Panel::Nodes, 940.0, 44.0, 290.0, 290.0),
-        b.at(Panel::Search, 940.0, 342.0, 290.0, 322.0),
+        b.at(Panel::Nodes, 940.0, 44.0, 290.0, 620.0),
         b.at(Panel::Inspector, 1238.0, 44.0, 330.0, 300.0),
         b.at(Panel::Document, 1238.0, 352.0, 330.0, 460.0),
         b.at(Panel::Progress, 12.0, 672.0, 920.0, 200.0),
@@ -236,7 +233,6 @@ pub(crate) struct Ctx {
     pub(crate) results: Signal<Vec<String>>,
     pub(crate) result_total: Signal<u32>,
     pub(crate) searching: Signal<bool>,
-    pub(crate) filter: Signal<String>,
     pub(crate) server: Signal<String>,
     pub(crate) tasks: Signal<Vec<TaskRow>>,
     pub(crate) logs: Signal<Vec<LogRow>>,
@@ -262,10 +258,10 @@ fn render_markdown(md: &str) -> String {
 
 #[component]
 fn App() -> Element {
-    // _v2: bumped when the default layout changed shape (graph view 2x +
-    // tray-parity panels docked) — the merge-missing-kinds reconciliation
-    // can't resize panels a stale saved layout already contains.
-    let ws = panel_kit::use_workspace("jc_layout_v2", default_layout);
+    // _v3: Search merged into the unified Nodes browser (the Search variant
+    // is gone, which breaks old saved-layout deserialization) — and v2 had
+    // bumped for the 2x graph view + docked tray panels.
+    let ws = panel_kit::use_workspace("jc_layout_v3", default_layout);
 
     let ctx = Ctx {
         graph: use_signal(|| None),
@@ -279,7 +275,6 @@ fn App() -> Element {
         results: use_signal(Vec::new),
         result_total: use_signal(|| 0),
         searching: use_signal(|| false),
-        filter: use_signal(String::new),
         server: use_signal(api::server_url),
         tasks: use_signal(Vec::new),
         logs: use_signal(Vec::new),
@@ -472,8 +467,7 @@ fn panel_body(kind: Panel, _maximized: bool, ctx: Ctx) -> Element {
                 rsx! { div { class: "skeleton", Spinner { label: "loading graph…" } } }
             }
         }
-        Panel::Nodes => nodes_panel(ctx),
-        Panel::Search => search_panel(ctx),
+        Panel::Nodes => panels::nodes::panel(ctx),
         Panel::Inspector => inspector_panel(ctx),
         Panel::Document => document_panel(ctx),
         Panel::Progress => progress_panel(ctx),
@@ -491,131 +485,13 @@ fn panel_body(kind: Panel, _maximized: bool, ctx: Ctx) -> Element {
         Panel::Help => rsx! {
             div { class: "help",
                 p { "canvas: drag rotate · wheel zoom · WASD pan · QE fwd/back · Shift boost · F fit · click select" }
-                p { "search: Enter to run · click result to inspect" }
+                p { "nodes: type → fuzzy files + content matches + filter chips" }
                 hr {}
                 p { "🔴 tiling ⇄ floating" }
                 p { "🟡 minimize → dock" }
                 p { "🟢 maximize ⇄ restore" }
             }
         },
-    }
-}
-
-/// Browse the raw node list (same order as the canvas buffers), with a
-/// substring filter. Capped render — the canvas and search are the real
-/// navigation surfaces for big vaults.
-fn nodes_panel(ctx: Ctx) -> Element {
-    let Ctx { graph, mut selected, mut filter, .. } = ctx;
-    let g = graph.read();
-    let Some(g) = g.as_ref() else {
-        return rsx! { div { class: "empty", "—" } };
-    };
-    let needle = filter.read().to_lowercase();
-    let matched: Vec<&String> = g
-        .ids
-        .iter()
-        .filter(|id| needle.is_empty() || id.to_lowercase().contains(&needle))
-        .collect();
-    let total = matched.len();
-    let shown: Vec<String> = matched.into_iter().take(300).cloned().collect();
-    rsx! {
-        div { class: "browse",
-            input {
-                class: "filter",
-                placeholder: "filter {g.ids.len()} nodes…",
-                value: "{filter}",
-                oninput: move |e| filter.set(e.value()),
-            }
-            nav { class: "queue",
-                for id in shown {
-                    {
-                        let active = selected.read().as_deref() == Some(id.as_str());
-                        let id_click = id.clone();
-                        rsx! {
-                            button {
-                                key: "{id}",
-                                class: if active { "queue-item active" } else { "queue-item" },
-                                onclick: move |_| selected.set(Some(id_click.clone())),
-                                span { class: "qi-id", "{id}" }
-                            }
-                        }
-                    }
-                }
-                if total > 300 {
-                    div { class: "more", "… {total - 300} more (refine the filter)" }
-                }
-            }
-        }
-    }
-}
-
-/// Full-text search via /search (Tantivy BM25 behind graph-api). Results
-/// double as canvas highlights.
-fn search_panel(ctx: Ctx) -> Element {
-    let Ctx { mut query, mut results, mut result_total, mut searching, mut selected, .. } = ctx;
-    let mut run = move || {
-        let q = query.read().clone();
-        if q.trim().is_empty() {
-            results.set(Vec::new());
-            result_total.set(0);
-            return;
-        }
-        searching.set(true);
-        spawn(async move {
-            match api::search(&q, 100).await {
-                Ok(r) => {
-                    result_total.set(r.total);
-                    results.set(r.ids);
-                }
-                Err(_) => {
-                    result_total.set(0);
-                    results.set(Vec::new());
-                }
-            }
-            searching.set(false);
-        });
-    };
-    let mut run_key = run;
-    let res = results.read().clone();
-    let total = *result_total.read();
-    rsx! {
-        div { class: "search",
-            div { class: "search-bar",
-                input {
-                    class: "filter",
-                    placeholder: "full-text search…",
-                    value: "{query}",
-                    oninput: move |e| query.set(e.value()),
-                    onkeydown: move |e: KeyboardEvent| {
-                        if e.key() == Key::Enter { run_key(); }
-                    },
-                }
-                button { class: "btn", onclick: move |_| run(), "go" }
-            }
-            if *searching.read() {
-                div { class: "skeleton", Spinner { label: "searching…" } }
-            } else if res.is_empty() {
-                div { class: "empty", "no results" }
-            } else {
-                div { class: "result-count", "{res.len()} shown · {total} total · highlighted on canvas" }
-                nav { class: "queue",
-                    for id in res {
-                        {
-                            let active = selected.read().as_deref() == Some(id.as_str());
-                            let id_click = id.clone();
-                            rsx! {
-                                button {
-                                    key: "{id}",
-                                    class: if active { "queue-item active" } else { "queue-item" },
-                                    onclick: move |_| selected.set(Some(id_click.clone())),
-                                    span { class: "qi-id", "{id}" }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
     }
 }
 

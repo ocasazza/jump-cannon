@@ -37,6 +37,27 @@ input.filter:focus { outline:none; border-color:var(--fg); }
 .btn:hover { border-color:var(--fg); }
 .btn:disabled { opacity:.4; cursor:default; }
 
+/* Unified node browser: fuzzy file hits, content snippets, filter chips */
+.browse-results { display:flex; flex-direction:column; gap:.3rem; overflow:auto; min-height:0; }
+.browse-group { color:var(--dim); font-size:.66rem; text-transform:uppercase; letter-spacing:.06em;
+  border-top:1px solid var(--line); padding-top:.4rem; margin-top:.2rem;
+  display:flex; align-items:center; gap:.5rem; }
+.queue-item.rich { flex-direction:column; align-items:flex-start; gap:.1rem; }
+.qi-snippet { display:block; color:var(--dim); font-size:10.5px; line-height:1.45;
+  white-space:normal; max-height:3.2em; overflow:hidden; }
+.qi-snippet b, .qi-fuzzy b { color:var(--accent); font-weight:600; font-style:normal; }
+.queue-item.active .qi-snippet, .queue-item.active .qi-snippet b,
+.queue-item.active .qi-fuzzy b { color:var(--inv-fg); }
+.sugg-row { display:flex; gap:.3rem; flex-wrap:wrap; }
+.sugg { background:var(--bg); color:var(--fg); border:1px solid var(--line2); border-radius:999px;
+  padding:.15rem .55rem; font-size:11px; cursor:pointer; white-space:nowrap; }
+.sugg:hover { border-color:var(--accent); }
+.sugg.on { background:var(--inv-bg); color:var(--inv-fg); border-color:var(--inv-bg); font-weight:600; }
+.sugg-field { color:var(--dim); }
+.sugg.on .sugg-field { color:var(--inv-fg); }
+.sugg-count { color:var(--dim); font-size:.64rem; }
+.sugg.on .sugg-count { color:var(--inv-fg); }
+
 /* Inspector */
 .inspector { display:flex; flex-direction:column; gap:.4rem; }
 .node-title { font-size:.95rem; margin:0; }

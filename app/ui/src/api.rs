@@ -124,8 +124,34 @@ pub async fn node_meta(id: &str) -> ApiResult<proto::NodeMeta> {
 }
 
 /// `/search?q=…` — BM25 full-text search (vault-search) with title fallback.
+#[allow(dead_code)] // the node browser uses search_rich; kept for wire parity with the egui client
 pub async fn search(q: &str, limit: u32) -> ApiResult<proto::SearchResults> {
     get_proto(&format!("/search?q={}&limit={limit}", urlencoding::encode(q))).await
+}
+
+/// One `/search/rich` hit. `snippet` is server-built HTML: the matched body
+/// region with `<b>` around hits (Tantivy SnippetGenerator output — source
+/// text is escaped server-side, the only markup is the highlight tags).
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+pub struct RichHit {
+    pub id: String,
+    #[serde(default)]
+    pub score: f32,
+    #[serde(default)]
+    pub snippet: String,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Default)]
+pub struct RichResults {
+    #[serde(default)]
+    pub total: u64,
+    #[serde(default)]
+    pub results: Vec<RichHit>,
+}
+
+/// `/search/rich?q=…` — full-text search with highlighted body snippets.
+pub async fn search_rich(q: &str, limit: u32) -> ApiResult<RichResults> {
+    get_json(&format!("/search/rich?q={}&limit={limit}", urlencoding::encode(q))).await
 }
 
 // --- vault writes ---------------------------------------------------------------
