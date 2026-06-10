@@ -45,7 +45,9 @@ Workflow: `just dev-up` (backend) + `just app-dev` (desktop app, hot-reload). `j
 
 Nix integration: `nix build .#app-web` builds the frontend dist through crane + trunk (same machinery as `graph-renderer-web`; it's also a flake check, so `nix flake check` gates it). `wasm-bindgen` is pinned to `=0.2.118` in `app/Cargo.toml` to match the nixpkgs CLI exactly. The Tauri shell itself stays a devshell build — bundling needs platform signing toolchains nix can't usefully sandbox on macOS.
 
-Scope rule: the compute layer (`graph-compute`, gRPC broker, Sky-Pilot orchestration) is **not** part of this app — it stays behind graph-api's interfaces. Planned follow-ups: port the wgpu graph pipeline from `crates/graph-renderer` into a canvas in `app/ui` (Canvas2D is the interim renderer), then retire the egui frontend; publish `panel-kit` for apple-notes-ocr-flow to consume.
+Scope rule: the compute layer (`graph-compute`, gRPC broker, Sky-Pilot orchestration) is **not** part of this app — it stays behind graph-api's interfaces.
+
+**Parity contract:** the migration target is *identical features* — same wgpu renderer, same layout engines, same settings — with only the UI framework changing. The phase plan and full feature inventory live in [`docs/dioxus-migration.md`](docs/dioxus-migration.md); don't mark a feature migrated unless its behavior matches `crates/graph-renderer`.
 
 ## Data flow
 

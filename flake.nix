@@ -443,11 +443,15 @@
             echo "loading ${graphApiService.name}:latest into podman..."
             podman load < ${graph-api-image}
             # graph-api in-container serves the trunk dist from /assets.
-            # The default is the nix-built graph-renderer-web store path,
-            # so a fresh `nix run .#dev-up` works without a prior
-            # `just wasm`. Set ASSETS_DIR to point at a local trunk-watch
-            # dist when iterating on the frontend.
-            ASSETS_DIR_DEFAULT="${graph-renderer-web}"
+            # FRONTEND=egui (default) serves the nix-built graph-renderer-web;
+            # FRONTEND=app serves the Dioxus frontend (app-web) — graph-api's
+            # root-asset fallback route hosts either dist unchanged. Set
+            # ASSETS_DIR explicitly to point at a local trunk-watch dist when
+            # iterating on a frontend.
+            case "''${FRONTEND:-egui}" in
+              app) ASSETS_DIR_DEFAULT="${app-web}" ;;
+              *)   ASSETS_DIR_DEFAULT="${graph-renderer-web}" ;;
+            esac
             ASSETS_DIR="''${ASSETS_DIR:-$ASSETS_DIR_DEFAULT}"
             if [ ! -f "$ASSETS_DIR/index.html" ]; then
               echo "warn: no trunk dist at $ASSETS_DIR — graph-api will serve 404 for /" >&2
@@ -549,27 +553,49 @@
         #
         # The app/ workspace is deliberately separate from this one (it owns
         # the Tauri/Dioxus dependency tree), but its WASM frontend builds
-        # through the same crane + trunk machinery. The workspace is fully
-        # self-contained: the prost output is checked in (app/ui/src/proto/),
-        # so no protoc and no reach outside app/ — the source filter below is
-        # all it needs. wasm-bindgen is pinned to =0.2.118 in app/Cargo.toml
-        # to match the nixpkgs CLI exactly (no version-skew caveats like the
-        # graph-renderer-web note above).
+        # through the same crane + trunk machinery. The prost output is
+        # checked in (app/ui/src/proto/), so no protoc — but the workspace is
+        # no longer fully self-contained: jump-cannon-ui's wgpu renderer
+        # drives the GPU force layout via a path dependency on
+        # crates/graph-layouts (which has no path deps of its own), so the
+        # source root is the repo root with a fileset union of app/ + that
+        # crate. `sourceRoot` drops the build into app/ where Trunk.toml and
+        # the workspace manifest live; the relative ../../crates/graph-layouts
+        # path then resolves inside the union. wasm-bindgen is pinned to
+        # =0.2.118 in app/Cargo.toml to match the nixpkgs CLI exactly (no
+        # version-skew caveats like the graph-renderer-web note above).
         #
         # The Tauri shell itself stays a devshell build (`just app-dev` /
         # `just app-build`): bundling needs platform signing toolchains that
         # nix can't usefully sandbox on macOS.
         appSrc = pkgs.lib.fileset.toSource {
-          root = ./app;
-          fileset = pkgs.lib.fileset.fileFilter
-            (file: builtins.any file.hasExt [ "rs" "toml" "lock" "html" "css" ])
-            ./app;
+          root = ./.;
+          fileset = pkgs.lib.fileset.unions [
+            # wgsl: the ported renderer embeds its node/edge shaders via
+            # include_str! (app/ui/src/shaders/).
+            (pkgs.lib.fileset.fileFilter
+              (file: builtins.any file.hasExt [ "rs" "toml" "lock" "html" "css" "wgsl" ])
+              ./app)
+            # graph-layouts embeds its compute WGSL via include_str!.
+            (pkgs.lib.fileset.fileFilter
+              (file: builtins.any file.hasExt [ "rs" "toml" "lock" "wgsl" ])
+              ./crates/graph-layouts)
+          ];
         };
 
         depsAppWasm = craneLibWasm.buildDepsOnly {
           pname = "app-web-deps";
           version = "0.1.0";
           src = appSrc;
+          sourceRoot = "source/app";
+          # No Cargo.lock at the union root: point crane's vendoring at the
+          # app workspace's lockfile, and drop a copy where `cargo --locked`
+          # (running with cwd source/app in the dummy source) expects it.
+          cargoLock = ./app/Cargo.lock;
+          extraDummyScript = ''
+            mkdir -p $out/app
+            cp ${./app/Cargo.lock} $out/app/Cargo.lock
+          '';
           strictDeps = true;
           CARGO_BUILD_TARGET = "wasm32-unknown-unknown";
           cargoExtraArgs = "--package jump-cannon-ui";
@@ -580,6 +606,8 @@
           pname = "app-web";
           version = "0.1.0";
           src = appSrc;
+          sourceRoot = "source/app";
+          cargoLock = ./app/Cargo.lock;
           strictDeps = true;
           cargoArtifacts = depsAppWasm;
           CARGO_BUILD_TARGET = "wasm32-unknown-unknown";

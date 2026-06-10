@@ -18,14 +18,20 @@ use serde::{Deserialize, Serialize};
 use crate::proto;
 
 const URL_KEY: &str = "jc_server_url";
-// 127.0.0.1, not "localhost": on macOS `localhost` resolves to ::1 (IPv6)
-// first, but the dev server binds IPv4. 8765 is the `just dev-up` compose port.
-pub const DEFAULT_URL: &str = "http://127.0.0.1:8765";
+
+/// Default API base. 127.0.0.1, not "localhost": on macOS `localhost`
+/// resolves to ::1 (IPv6) first, but the dev server binds IPv4. 8765 is the
+/// `just dev-up` compose port; set `JC_SERVER_URL` at build time (e.g.
+/// `JC_SERVER_URL=http://127.0.0.1:8766 just app-dev`) to point a dev build
+/// elsewhere without touching localStorage.
+pub fn default_url() -> String {
+    option_env!("JC_SERVER_URL").unwrap_or("http://127.0.0.1:8765").to_string()
+}
 
 pub fn server_url() -> String {
-    let v: String = LocalStorage::get(URL_KEY).unwrap_or_else(|_| DEFAULT_URL.to_string());
+    let v: String = LocalStorage::get(URL_KEY).unwrap_or_else(|_| default_url());
     if v.trim().is_empty() {
-        DEFAULT_URL.to_string()
+        default_url()
     } else {
         v.trim_end_matches('/').to_string()
     }
@@ -92,6 +98,12 @@ pub async fn ids() -> ApiResult<Vec<String>> {
 }
 
 /// `/graph/positions` — flat [x0, y0, x1, y1, …] f32 buffer.
+///
+/// Unused since the wgpu renderer landed: it seeds its own 3D positions
+/// (sphere shell + multilevel coarsening warm-up, like the egui app) and
+/// the GPU force sim takes over from there. Kept for parity with the
+/// server's endpoint surface.
+#[allow(dead_code)]
 pub async fn positions() -> ApiResult<Vec<f32>> {
     Ok(f32s(&get_bytes("/graph/positions").await?))
 }

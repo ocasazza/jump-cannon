@@ -15,6 +15,7 @@
 mod api;
 mod graph_canvas;
 mod proto;
+mod render;
 
 use std::collections::HashSet;
 
@@ -161,7 +162,6 @@ struct Ctx {
     server: Signal<String>,
     tasks: Signal<Vec<TaskRow>>,
     logs: Signal<Vec<LogRow>>,
-    view: graph_canvas::View,
 }
 
 async fn reload_graph(mut ctx: Ctx) {
@@ -202,11 +202,6 @@ fn App() -> Element {
         server: use_signal(api::server_url),
         tasks: use_signal(Vec::new),
         logs: use_signal(Vec::new),
-        view: graph_canvas::View {
-            zoom: use_signal(|| 1.0),
-            pan: use_signal(|| (0.0, 0.0)),
-            drag: use_signal(|| None),
-        },
     };
 
     // Resilient initial load: retry until the backend answers, so a server
@@ -285,43 +280,28 @@ fn App() -> Element {
         });
     }
 
-    // Canvas redraw: reactively on data/view/selection changes…
+    // Selection + search highlights → wgpu renderer. The renderer's own
+    // rAF loop handles per-frame drawing and panel resizes; these effects
+    // only push state when the signals actually change.
     {
         let graph = ctx.graph;
         let selected = ctx.selected;
         let results = ctx.results;
-        let zoom = ctx.view.zoom;
-        let pan = ctx.view.pan;
         use_effect(move || {
             let g = graph.read();
             let sel = selected.read();
-            let res = results.read();
-            let z = *zoom.read();
-            let p = *pan.read();
             if let Some(g) = g.as_ref() {
                 let sel_idx = sel.as_ref().and_then(|id| g.id_to_idx.get(id)).copied();
-                let hl: HashSet<u32> =
-                    res.iter().filter_map(|id| g.id_to_idx.get(id)).copied().collect();
-                graph_canvas::draw(g, sel_idx, &hl, z, p);
+                render::set_selected_node(sel_idx);
             }
         });
-        // …plus a slow ticker to catch panel resizes (panel geometry isn't a
-        // dependency of the effect above; the canvas re-fits on the next tick).
-        use_future(move || async move {
-            loop {
-                gloo_timers::future::TimeoutFuture::new(400).await;
-                let g = graph.peek();
-                if let Some(g) = g.as_ref() {
-                    let sel = selected.peek();
-                    let sel_idx = sel.as_ref().and_then(|id| g.id_to_idx.get(id)).copied();
-                    let hl: HashSet<u32> = results
-                        .peek()
-                        .iter()
-                        .filter_map(|id| g.id_to_idx.get(id))
-                        .copied()
-                        .collect();
-                    graph_canvas::draw(g, sel_idx, &hl, *zoom.peek(), *pan.peek());
-                }
+        use_effect(move || {
+            let g = graph.read();
+            let res = results.read();
+            if let Some(g) = g.as_ref() {
+                let hl: HashSet<u32> =
+                    res.iter().filter_map(|id| g.id_to_idx.get(id)).copied().collect();
+                render::set_search_highlights(Some(hl));
             }
         });
     }
@@ -342,6 +322,33 @@ fn App() -> Element {
             autofocus: true,
             onmousemove: move |e| ws.handle_mouse_move(&e),
             onmouseup: move |_| ws.handle_mouse_up(),
+            // WASDQE camera pan + Shift boost + F fit, fed to the wgpu
+            // renderer's held-key state. Single-key shortcuts must not
+            // fire while the user is typing in an input/textarea.
+            onkeydown: move |e: KeyboardEvent| {
+                if panel_kit::is_editing() {
+                    render::clear_keys();
+                    return;
+                }
+                match e.key() {
+                    Key::Shift => render::key_event("Shift", true),
+                    Key::Character(c) => {
+                        if c.eq_ignore_ascii_case("f") {
+                            render::fit_camera();
+                        } else {
+                            render::key_event(&c, true);
+                        }
+                    }
+                    _ => {}
+                }
+            },
+            onkeyup: move |e: KeyboardEvent| {
+                match e.key() {
+                    Key::Shift => render::key_event("Shift", false),
+                    Key::Character(c) => render::key_event(&c, false),
+                    _ => {}
+                }
+            },
 
             header { class: "topbar",
                 h1 { "JUMP CANNON" }
@@ -373,7 +380,7 @@ fn panel_body(kind: Panel, _maximized: bool, ctx: Ctx) -> Element {
     match kind {
         Panel::Graph => {
             if ctx.graph.read().is_some() {
-                graph_canvas::graph_canvas(ctx.graph, ctx.selected, ctx.view)
+                rsx! { graph_canvas::GraphCanvas { graph: ctx.graph, selected: ctx.selected } }
             } else if let Some(e) = ctx.load_error.read().clone() {
                 rsx! { div { class: "skeleton", Spinner { label: "retrying: {e}" } } }
             } else {
@@ -388,7 +395,7 @@ fn panel_body(kind: Panel, _maximized: bool, ctx: Ctx) -> Element {
         Panel::Settings => settings_panel(ctx),
         Panel::Help => rsx! {
             div { class: "help",
-                p { "canvas: drag pan · wheel zoom · click select" }
+                p { "canvas: drag rotate · wheel zoom · WASD pan · QE fwd/back · Shift boost · F fit · click select" }
                 p { "search: Enter to run · click result to inspect" }
                 hr {}
                 p { "🔴 tiling ⇄ floating" }

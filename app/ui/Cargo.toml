@@ -21,9 +21,19 @@ wasm-bindgen-futures = "0.4"
 prost = "0.13"
 urlencoding = "2"
 pulldown-cmark = { version = "0.12", default-features = false, features = ["html"] }
+# wgpu renderer (ported from crates/graph-renderer): node/edge WGSL pipelines,
+# 6DoF camera, in-process GPU force layout bound to the shared positions buffer.
+wgpu = { workspace = true }
+glam = { workspace = true }
+bytemuck = { workspace = true }
+js-sys = "0.3"
+# The GPU force-sim compute layout (same crate the egui renderer drives).
+# Reaches outside app/ deliberately — the nix appSrc fileset includes
+# crates/graph-layouts for exactly this dependency.
+graph-layouts = { path = "../../crates/graph-layouts" }
 web-sys = { workspace = true, features = [
     "Window", "Document", "Element", "Event", "EventTarget",
-    "HtmlCanvasElement", "CanvasRenderingContext2d",
+    "HtmlCanvasElement",
 ] }
 tracing = "0.1"
 tracing-wasm = "0.2"

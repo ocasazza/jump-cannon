@@ -26,3 +26,13 @@ web-sys = "0.3"
 # Pinned to the wasm-bindgen-cli version nixpkgs ships, so the crane/trunk
 # nix build (`nix build .#app-web`) and host builds produce identical output.
 wasm-bindgen = "=0.2.118"
+# wgpu graph renderer (ported from crates/graph-renderer). Versions match
+# graph-renderer's Cargo.toml exactly so the WGSL pipelines + GpuForceLayout
+# compute path behave identically across both frontends.
+# `fragile-send-sync-non-atomic-wasm` makes wgpu handles Send+Sync on
+# single-threaded wasm — graph-layouts' `PhysicsLayout: Send + Sync` bound
+# requires it. The egui app gets the same feature implicitly through
+# egui-wgpu's defaults, so this matches its effective configuration.
+wgpu = { version = "23", default-features = false, features = ["webgpu", "wgsl", "fragile-send-sync-non-atomic-wasm"] }
+glam = "0.29"
+bytemuck = { version = "1", features = ["derive"] }
