@@ -1,23 +1,22 @@
 # test-browser
 
-Rust-driven browser smoke test for the graph-renderer WASM bundle.
-Foundation crate — the assertion set is deliberately minimal while the
-frontend stabilizes.
+Rust-driven browser smoke test for the Dioxus frontend (app/ui) WASM
+bundle. Foundation crate — the assertion set is deliberately minimal
+while the frontend stabilizes.
 
 ## What it asserts today
 
 1. The page at `--base-url` responds with HTTP 200.
 2. Headless Chromium launches with WebGPU flags and navigates.
-3. The boot log line `[graph-renderer] status footer mounted` appears
-   on the JS console within `--timeout-secs`.
-4. The `#graph-canvas` element exists with non-zero width and height.
+3. The boot log line `[jump-cannon-ui] boot` appears on the JS console
+   within `--timeout-secs` (logged from `app/ui/src/main.rs`).
+4. The graph `<canvas>` element exists with non-zero width and height.
 5. A screenshot is written to `<out-dir>/boot.png`. **Pixel content is
-   not asserted** — that's the flaky part the legacy
-   `tests/browser/run.mjs` suite handles.
+   not asserted** — that's the flaky part.
 
-Future additions (motion deltas, click-doesn't-blank, tag round-trips,
-`/compute/health` shape, etc.) will be ported from `run.mjs` as the
-frontend stops thrashing.
+Future additions: motion deltas, click-doesn't-blank, tag round-trips,
+`/compute/health` shape, etc. (The egui-era Playwright suite that held
+those checks was removed with the egui frontend — see git history.)
 
 ## Running locally
 
@@ -27,10 +26,10 @@ just test browser-rust
 nix run .#test-browser-rust
 ```
 
-The wrapper script (`flake.nix#test-browser-rust`) expects a trunk-built
-dist at `crates/graph-renderer/assets/dist`. Run `just wasm` first if
-you haven't. There is no `graph-renderer-web` flake derivation yet —
-wiring trunk into crane is a follow-up.
+The wrapper script (`flake.nix#test-browser-rust`) serves the nix-built
+`app-web` dist by default; override with `ASSETS_DIR=app/ui/dist` after
+a local `cd app && trunk build --release` if you want to test local
+edits.
 
 Output lands in `target/test-browser-rust/`:
 - `boot.png` — screenshot at the moment all assertions passed
@@ -46,11 +45,3 @@ test-browser \
   --out-dir target/test-browser-rust \
   --timeout-secs 60
 ```
-
-## Relationship to the legacy suite
-
-`tests/browser/*.mjs` (Playwright) remains in place as a side-by-side
-fallback so coverage doesn't drop while the Rust suite matures.
-`just test browser` runs the JS version; `just test browser-rust` runs
-this one. Both should pass — once the Rust suite covers the same
-assertions, the JS suite can be retired.

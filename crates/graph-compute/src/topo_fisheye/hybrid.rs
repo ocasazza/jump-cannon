@@ -83,7 +83,10 @@ pub fn build_hybrid(h: &TopoHierarchy, p: &HybridParams) -> HybridGraph {
     for &i in &order {
         while remaining == 0 && current_level < max_level {
             current_level += 1;
-            remaining = caps.get(current_level as usize).copied().unwrap_or(u32::MAX);
+            remaining = caps
+                .get(current_level as usize)
+                .copied()
+                .unwrap_or(u32::MAX);
         }
         wish[i as usize] = current_level;
         if remaining > 0 && current_level < max_level {

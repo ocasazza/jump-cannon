@@ -18,7 +18,10 @@ use graph_api::compute_broker::{ComputeBroker, RemoteLayout};
 async fn list_engines_degrades_when_disabled() {
     let broker = ComputeBroker::new();
     let view = broker.list_engines().await;
-    assert!(!view.connected, "disabled broker must report connected:false");
+    assert!(
+        !view.connected,
+        "disabled broker must report connected:false"
+    );
     assert_eq!(view.active, "", "disabled broker has no active engine");
     assert!(view.engines.is_empty(), "disabled broker lists no engines");
 }
@@ -53,8 +56,15 @@ async fn reselect_updates_stored_selection() {
         .expect("reselect against a connected broker succeeds");
 
     let sel = broker.selection().await;
-    assert_eq!(sel.layout_id, "fa2-bh", "reselect must store the new layout_id");
-    assert_eq!(sel.params, Some(params), "reselect must store the new params");
+    assert_eq!(
+        sel.layout_id, "fa2-bh",
+        "reselect must store the new layout_id"
+    );
+    assert_eq!(
+        sel.params,
+        Some(params),
+        "reselect must store the new params"
+    );
 
     // The degraded engines view still reflects the active selection even when
     // the worker is unreachable (connected:false because the dial fails, but

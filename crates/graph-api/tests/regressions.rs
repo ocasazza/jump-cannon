@@ -58,7 +58,10 @@ async fn node_meta_stub_for_missing_id() {
         .and_then(|v| v.to_str().ok())
         .unwrap_or("")
         .to_string();
-    assert_eq!(ct, "application/x-protobuf", "stub must be served as protobuf");
+    assert_eq!(
+        ct, "application/x-protobuf",
+        "stub must be served as protobuf"
+    );
 
     let bytes = to_bytes(resp.into_body(), 1 << 20).await.expect("body");
     let meta = NodeMeta::decode(bytes.as_ref()).expect("decode NodeMeta");
@@ -76,7 +79,10 @@ async fn node_meta_stub_for_missing_id() {
     assert_eq!(meta.pagerank, 0.0, "stub pagerank must be zero");
     assert_eq!(meta.degree, 0, "stub degree must be zero");
     assert_eq!(meta.community, 0, "stub community must be zero");
-    assert_eq!(meta.id, decoded_id, "stub id must echo the (decoded) request path");
+    assert_eq!(
+        meta.id, decoded_id,
+        "stub id must echo the (decoded) request path"
+    );
     // Title = last path segment, folder = everything before. Pin both so
     // a future "smarter" id-splitter doesn't silently drift.
     assert_eq!(meta.title, "Missing.md");

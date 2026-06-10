@@ -60,7 +60,7 @@ The crate is the right *home* but the wrong *implementation*:
   `Err("tvix-eval: native only")`, behind a comment asserting tvix cannot compile
   on wasm. **This belief is unverified and the reference proves it false.**
 
-It is also **not wired** into `graph-renderer` or `graph-api` — grep finds no
+It is also **not wired** into the frontend or `graph-api` — grep finds no
 usage. So the panel is greenfield wiring on top of an existing bridge + a proven
 reference pattern.
 
@@ -73,9 +73,10 @@ reference pattern.
   is a pure per-node `Lens` dispatch table.
 - `crates/graph-compute` / `crates/graph-layouts` — the `LayoutEngine` trait +
   `EngineRegistry` (`engines/mod.rs`).
-- `crates/graph-renderer` — egui/wgpu WASM frontend; `data::Bootstrap`,
-  `data::spawn_on_unit_sphere`, the `Section` enum + tray/floating/tiled panel
-  chrome, the `loaded_into_gpu` one-shot load latch.
+- `app/ui` — the Dioxus/wgpu WASM frontend; graph bootstrap + panel chrome.
+  (This plan was originally written against the egui renderer's
+  `data::Bootstrap` / `Section` enum / `loaded_into_gpu` latch — egui-era;
+  superseded by app/ui — see git history.)
 
 ### 1.3 The plugin seams that already exist (verified)
 
@@ -160,13 +161,15 @@ the same stack as jump-cannon and demonstrates the proven path:
 
 ## 3. Deliverable 1 — the Generate (tvix) panel
 
-A new `Section::Generate` (label "Generate (tvix)") in `graph-renderer`. Concrete
-wiring touches exactly five existing dispatch sites plus one new file.
+A new Generate panel (label "Generate (tvix)") in the frontend — today that is
+`app/ui/src/panels/generate.rs`. (The file paths and dispatch sites below are
+egui-era — `Section::Generate` + `sections/generate.rs` in graph-renderer;
+superseded by app/ui — see git history.)
 
-### 3.1 UI (egui only — AGENTS.md forbids JS editors, so no Monaco)
+### 3.1 UI (Rust-native widgets only — AGENTS.md forbids JS editors, so no Monaco)
 
-New file `crates/graph-renderer/src/ui/sections/generate.rs` exposing
-`pub fn show(ui, state)`:
+New file `crates/graph-renderer/src/ui/sections/generate.rs` (egui-era; the
+app/ui equivalent is `panels/generate.rs`) exposing `pub fn show(ui, state)`:
 
 - `egui::TextEdit::multiline` for the Nix expression (monospace, code font from
   `FontFamilyChoice`).
@@ -349,8 +352,8 @@ the only real cost is the `EngineConstructor` fn-pointer → boxed-closure chang
 
 - A `trait PipelineHook` family (one per stage, typed context + serde-roundtrippable
   params), registered in a `HookRegistry` mapping `Stage → ordered Vec<Box<dyn Hook>>`
-  with `.before()`/`.after()` labels. Split client-side (in `graph-renderer`,
-  beside `LayoutRegistry`: Ingest/AttributeResolve/Frame) and server-side (in
+  with `.before()`/`.after()` labels. Split client-side (in the frontend,
+  app/ui, beside `LayoutRegistry`: Ingest/AttributeResolve/Frame) and server-side (in
   `graph-compute`, beside `EngineRegistry`: EngineSelect/PreStep/PostStep/Observe),
   sharing a descriptor/id vocabulary the way ADR-001 made engines
   location-agnostic.
@@ -416,10 +419,11 @@ counts, native **and** wasm.
 
 ### Phase 3 — the panel (browser-only)
 
-Add `Section::Generate` (enum + ALL + title + `sections/mod.rs` arm + sidebar
-icon) and `sections/generate.rs` (TextEdit + Evaluate + demo ComboBox + egui error
-labels). Add `tvix-wasm { features = ["wasm"] }` + `vault-data` deps to
-`graph-renderer/Cargo.toml`.
+Add the Generate panel (TextEdit + Evaluate + demo picker + error labels) and
+the `tvix-wasm { features = ["wasm"] }` + `vault-data` deps to the frontend.
+(Written against egui-era files — `Section::Generate`, `sections/generate.rs`,
+`graph-renderer/Cargo.toml`; superseded by app/ui's `panels/generate.rs` — see
+git history.)
 **Verify:** panel opens from the tray; evaluating a demo prints node/edge counts;
 a deliberate syntax error surfaces as a red label.
 
@@ -488,9 +492,10 @@ one hardcoded demo is fine):
    inline that emits the **`toGraphJSON` `{nodes, links}` schema** — do **not**
    reuse `star-graph.nix` verbatim (it emits a different ad-hoc shape).
 3. (Phase 2, minimal) `GeneratedGraph` → `data::Bootstrap` adapter.
-4. (Phase 3) `Section::Generate` + `sections/generate.rs` with a TextEdit
-   prefilled with the demo, an Evaluate button, an egui error label. Add
-   `tvix-wasm` + `vault-data` deps to graph-renderer.
+4. (Phase 3) the Generate panel with a TextEdit prefilled with the demo, an
+   Evaluate button, an error label. Add `tvix-wasm` + `vault-data` deps to the
+   frontend (egui-era wording; app/ui's `panels/generate.rs` is the live
+   implementation — see git history).
 5. (Phase 4) Reset `loaded_into_gpu` on a fresh `LoadState::Ready` so the
    generated graph renders (the one load-bearing edit; `load()` is already
    re-loadable).

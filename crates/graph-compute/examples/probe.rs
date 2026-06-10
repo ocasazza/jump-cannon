@@ -1,12 +1,13 @@
 //! Live probe: subscribes to an external graph-compute and prints frames.
 //! Usage: `cargo run --release -p graph-compute --example probe`
 //! Reads URL from `GRAPH_COMPUTE_PROBE_URL` (default `http://[::1]:50051`).
-use std::time::Duration;
 use graph_compute::proto::{compute_client::ComputeClient, HealthRequest, SubscribeRequest};
+use std::time::Duration;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let url = std::env::var("GRAPH_COMPUTE_PROBE_URL").unwrap_or_else(|_| "http://[::1]:50051".into());
+    let url =
+        std::env::var("GRAPH_COMPUTE_PROBE_URL").unwrap_or_else(|_| "http://[::1]:50051".into());
     println!("dialing {url}");
     let chan = tonic::transport::Channel::from_shared(url)?
         .timeout(Duration::from_secs(2))
@@ -14,7 +15,7 @@ async fn main() -> anyhow::Result<()> {
         .await?;
     let mut client = ComputeClient::new(chan);
 
-    let h = client.health(HealthRequest{}).await?.into_inner();
+    let h = client.health(HealthRequest {}).await?.into_inner();
     println!("HEALTH: frame={} n_nodes={}", h.frame, h.n_nodes);
 
     let mut s = client
@@ -32,7 +33,12 @@ async fn main() -> anyhow::Result<()> {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         match tokio::time::timeout(remaining, s.message()).await {
             Ok(Ok(Some(d))) => {
-                println!("FRAME: {} n={} bytes={}", d.frame, d.n_nodes, d.positions.len());
+                println!(
+                    "FRAME: {} n={} bytes={}",
+                    d.frame,
+                    d.n_nodes,
+                    d.positions.len()
+                );
                 count += 1;
             }
             _ => break,

@@ -1,7 +1,7 @@
 //! HTTP API. axum router + route handlers.
 //
-// Future: when split across machines, this server runs on luna; the renderer
-// (graph-renderer) is served from any static host and points its fetch URLs
+// Future: when split across machines, this server runs on luna; the Dioxus
+// frontend (app/) is served from any static host and points its fetch URLs
 // at this server via a --backend-url flag (not yet implemented).
 
 use axum::{
@@ -685,15 +685,15 @@ async fn asset(State(s): State<AppState>, Path(path): Path<String>) -> impl Into
 
 // --- App-state config presets -------------------------------------------------
 //
-// The renderer's instances page imports/exports the entire AppState as YAML.
 // These endpoints let the dev-server ship named preset configs so a user can
-// load a known configuration (and share `?config=<name>` links). The presets
-// live in `crates/graph-renderer/configs/*.yaml`; we resolve that dir relative
-// to the dev `--assets-dir` (…/graph-renderer/assets/dist → …/graph-renderer/
-// configs). Only available in dev (when assets are served from disk).
+// load a known configuration (and share `?config=<name>` links). Presets are
+// optional: the endpoints 404 unless a `configs/` dir exists adjacent to the
+// assets dir's parent (resolved as `<assets-dir>/../../configs`). The egui-era
+// preset YAMLs were deleted with the old renderer crate; drop new YAMLs in
+// such a dir to re-enable. Only available when assets are served from disk.
 
 fn configs_dir(s: &AppState) -> Option<std::path::PathBuf> {
-    let dist = s.inner.assets_dir.as_ref()?; // …/crates/graph-renderer/assets/dist
+    let dist = s.inner.assets_dir.as_ref()?; // e.g. …/app/ui/dist
     Some(dist.parent()?.parent()?.join("configs"))
 }
 
@@ -756,9 +756,12 @@ async fn config_get(State(s): State<AppState>, Path(name): Path<String>) -> impl
     }
 }
 
-/// Dev mode (assets_dir set): read from disk every request — refresh browser
-/// to see JS/CSS/HTML edits without rebuild.
-/// Release mode (assets_dir None): serve from the include_dir!() embedded bundle.
+/// Serve the frontend dist from disk (assets_dir): read every request —
+/// refresh browser to see JS/CSS/HTML edits without rebuild.
+///
+/// There is no embedded fallback anymore (the egui renderer's include_dir!()
+/// bundle was retired with that crate): the frontend dist is always served
+/// from `--assets-dir` / `JUMP_CANNON_ASSETS_DIR`; without it, assets 404.
 fn asset_response(s: &AppState, path: &str) -> axum::response::Response {
     let mime = mime_for(path);
     if let Some(dir) = &s.inner.assets_dir {
@@ -776,14 +779,11 @@ fn asset_response(s: &AppState, path: &str) -> axum::response::Response {
                 .into_response(),
         }
     } else {
-        match graph_renderer::assets().get_file(path) {
-            Some(file) => {
-                let mut headers = HeaderMap::new();
-                headers.insert(header::CONTENT_TYPE, HeaderValue::from_str(mime).unwrap());
-                (StatusCode::OK, headers, file.contents().to_vec()).into_response()
-            }
-            None => (StatusCode::NOT_FOUND, "not found").into_response(),
-        }
+        (
+            StatusCode::NOT_FOUND,
+            "no assets dir configured (start with --assets-dir or JUMP_CANNON_ASSETS_DIR)",
+        )
+            .into_response()
     }
 }
 

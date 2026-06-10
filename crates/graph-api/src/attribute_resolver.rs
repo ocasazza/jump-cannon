@@ -1,13 +1,11 @@
-use std::collections::BTreeMap;
+use crate::state::GraphSnapshot;
 use graph_compute::engines::geometric::{
     ClassSource, CoordinationSource, EdgeLengthSource, GeometricSettings, MassSource,
 };
 use graph_compute::engines::GraphAttributes;
-use graph_layouts::geometric::{
-    ClassLens, CoordinationLens, EdgeLengthLens, LensConfig, MassLens,
-};
+use graph_layouts::geometric::{ClassLens, CoordinationLens, EdgeLengthLens, LensConfig, MassLens};
 use graph_metrics::{compute_edge_strength, EdgeStrengthKind};
-use crate::state::GraphSnapshot;
+use std::collections::BTreeMap;
 
 pub fn resolve(
     lens: &LensConfig,
@@ -30,22 +28,25 @@ pub fn resolve(
         // Class
         let class_val = match &lens.class {
             ClassLens::Uniform => 0,
-            ClassLens::DegreeBuckets => {
-                node.metrics.community as u32
-            }
+            ClassLens::DegreeBuckets => node.metrics.community as u32,
             ClassLens::Louvain => node.metrics.community as u32,
             ClassLens::Field(f) => {
-                let val = node.meta.frontmatter.get(f)
+                let val = node
+                    .meta
+                    .frontmatter
+                    .get(f)
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
                 class_encoder.encode(val)
             }
             ClassLens::Tag(t) => {
-                if node.meta.tags.iter().any(|tag| tag == t) { 1 } else { 0 }
+                if node.meta.tags.iter().any(|tag| tag == t) {
+                    1
+                } else {
+                    0
+                }
             }
-            ClassLens::NodeType => {
-                class_encoder.encode(node.meta.doctype.as_deref().unwrap_or(""))
-            }
+            ClassLens::NodeType => class_encoder.encode(node.meta.doctype.as_deref().unwrap_or("")),
         };
         node_class.push(class_val);
 
@@ -53,12 +54,13 @@ pub fn resolve(
         let coord_val = match &lens.coordination {
             CoordinationLens::Degree => node.metrics.degree as u32,
             CoordinationLens::Uniform(u) => *u,
-            CoordinationLens::Field(f) => {
-                node.meta.frontmatter.get(f)
-                    .and_then(|v| v.as_u64())
-                    .map(|v| v as u32)
-                    .unwrap_or(0)
-            }
+            CoordinationLens::Field(f) => node
+                .meta
+                .frontmatter
+                .get(f)
+                .and_then(|v| v.as_u64())
+                .map(|v| v as u32)
+                .unwrap_or(0),
         };
         node_coordination.push(coord_val);
 
@@ -67,19 +69,20 @@ pub fn resolve(
             MassLens::Uniform => 1.0,
             MassLens::Degree => node.metrics.degree as f32,
             MassLens::PageRank => node.metrics.pagerank as f32,
-            MassLens::Field(f) => {
-                node.meta.frontmatter.get(f)
-                    .and_then(|v| v.as_f64())
-                    .map(|v| v as f32)
-                    .unwrap_or(1.0)
-            }
+            MassLens::Field(f) => node
+                .meta
+                .frontmatter
+                .get(f)
+                .and_then(|v| v.as_f64())
+                .map(|v| v as f32)
+                .unwrap_or(1.0),
         };
         node_mass.push(mass_val);
     }
 
     attrs.node_class = Some(node_class);
     settings.class_source = ClassSource::Injected;
-    
+
     let num_classes = class_encoder.map.len().max(1);
     settings.class_radius = vec![lens.exclusion_strength / 10.0; num_classes];
     settings.class_affinity_dim = num_classes as u32;
@@ -116,16 +119,25 @@ pub fn resolve(
 
     let mut adj_lens = vec![Vec::new(); n];
     for (i, edge) in snapshot.graph.edges.iter().enumerate() {
-        let (Some(&src), Some(&tgt)) = (snapshot.id_to_idx.get(&edge.source), snapshot.id_to_idx.get(&edge.target)) else { continue };
-        if src == tgt { continue }
+        let (Some(&src), Some(&tgt)) = (
+            snapshot.id_to_idx.get(&edge.source),
+            snapshot.id_to_idx.get(&edge.target),
+        ) else {
+            continue;
+        };
+        if src == tgt {
+            continue;
+        }
 
         // `edge_rest_lens` is parallel to graph.edges (index `i`); fall back to
         // the uniform rest length when no strength lens is active.
-        let len = edge_rest_lens.as_ref().map_or(settings.edge_rest_len, |v| v[i]);
+        let len = edge_rest_lens
+            .as_ref()
+            .map_or(settings.edge_rest_len, |v| v[i]);
         adj_lens[src as usize].push(len);
         adj_lens[tgt as usize].push(len);
     }
-    
+
     let mut flat_edge_len = Vec::new();
     for bucket in adj_lens {
         flat_edge_len.extend(bucket);
@@ -185,16 +197,20 @@ pub fn encode_proto(
     attrs: graph_compute::engines::GraphAttributes,
 ) -> graph_compute::proto::GraphAttributes {
     graph_compute::proto::GraphAttributes {
-        node_class: attrs.node_class
+        node_class: attrs
+            .node_class
             .map(|v| bytemuck::cast_slice::<u32, u8>(&v).to_vec())
             .unwrap_or_default(),
-        node_coordination: attrs.node_coordination
+        node_coordination: attrs
+            .node_coordination
             .map(|v| bytemuck::cast_slice::<u32, u8>(&v).to_vec())
             .unwrap_or_default(),
-        node_mass: attrs.node_mass
+        node_mass: attrs
+            .node_mass
             .map(|v| bytemuck::cast_slice::<f32, u8>(&v).to_vec())
             .unwrap_or_default(),
-        edge_len: attrs.edge_len
+        edge_len: attrs
+            .edge_len
             .map(|v| bytemuck::cast_slice::<f32, u8>(&v).to_vec())
             .unwrap_or_default(),
     }
@@ -206,7 +222,9 @@ struct CategoricalEncoder {
 
 impl CategoricalEncoder {
     fn new() -> Self {
-        Self { map: BTreeMap::new() }
+        Self {
+            map: BTreeMap::new(),
+        }
     }
     fn encode(&mut self, s: &str) -> u32 {
         let n = self.map.len() as u32;
@@ -217,19 +235,26 @@ impl CategoricalEncoder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use vault_data::{NodeMetrics, VaultEdge, VaultNode, VaultGraph};
     use std::collections::HashMap;
+    use vault_data::{NodeMetrics, VaultEdge, VaultGraph, VaultNode};
 
     #[test]
     fn test_resolve_uniform() {
         let mut graph = VaultGraph::default();
         let node_id = "node1".to_string();
-        graph.nodes.insert(node_id.clone(), VaultNode {
-            id: node_id.clone(),
-            metrics: NodeMetrics { degree: 5, community: 1, ..Default::default() },
-            ..Default::default()
-        });
-        
+        graph.nodes.insert(
+            node_id.clone(),
+            VaultNode {
+                id: node_id.clone(),
+                metrics: NodeMetrics {
+                    degree: 5,
+                    community: 1,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+
         let snap = GraphSnapshot {
             graph,
             id_to_idx: [("node1".to_string(), 0)].into_iter().collect(),

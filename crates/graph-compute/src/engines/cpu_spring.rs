@@ -32,7 +32,9 @@ impl Default for CpuSpringSettings {
     fn default() -> Self {
         // Matches the old sim-loop dt for a 30 Hz tick — preserves prior
         // behavior when no params are supplied.
-        Self { time_step: 1.0 / 30.0 }
+        Self {
+            time_step: 1.0 / 30.0,
+        }
     }
 }
 

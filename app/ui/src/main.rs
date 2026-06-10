@@ -59,6 +59,10 @@ fn main() {
             }
         }
     }));
+    // Boot marker for crates/test-browser: it greps the console for this
+    // exact line to know the wasm app booted. console.log directly (NOT
+    // tracing) — tracing is filtered to WARN above.
+    web_sys::console::log_1(&"[jump-cannon-ui] boot".into());
     launch(App);
 }
 

@@ -4,14 +4,14 @@
 //!
 //!   1. The page at `--base-url` responds (HTTP 200).
 //!   2. Headless Chromium launches with WebGPU flags and navigates.
-//!   3. The boot log line `[graph-renderer] status footer mounted`
-//!      appears on the JS console within `--timeout-secs`.
-//!   4. The `#graph-canvas` element exists with non-zero width/height.
+//!   3. The boot log line `[jump-cannon-ui] boot` appears on the JS
+//!      console within `--timeout-secs`.
+//!   4. The graph `<canvas>` element exists with non-zero width/height.
 //!   5. A screenshot is saved to `<out-dir>/boot.png` for visual review.
 //!
 //! Anything flaky (pixel brightness, motion deltas, click recovery) is
-//! deliberately deferred — those live in the legacy Playwright suite at
-//! `tests/browser/run.mjs` until the frontend stabilizes.
+//! deliberately deferred. (The legacy egui-era Playwright suite that held
+//! those checks was removed with the egui frontend — see git history.)
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -27,8 +27,8 @@ use tokio::sync::Mutex;
 use std::sync::Arc;
 
 /// The single readiness signal we wait for. Logged from
-/// `crates/graph-renderer/src/ui/status_footer.rs` on first paint.
-const BOOT_LOG_NEEDLE: &str = "[graph-renderer] status footer mounted";
+/// `app/ui/src/main.rs` (fn main) right before the Dioxus app launches.
+const BOOT_LOG_NEEDLE: &str = "[jump-cannon-ui] boot";
 
 #[derive(Parser, Debug)]
 #[command(name = "test-browser", about = "Rust-driven browser smoke test")]
@@ -254,8 +254,10 @@ async fn drive_page(
     }
 
     // ---- 4. canvas exists with non-zero size -----------------------------
+    // The Dioxus app's graph canvas is `<canvas class="graph-canvas">`
+    // (app/ui/src/graph_canvas.rs); fall back to any canvas on the page.
     let dims_js = r#"(() => {
-        const c = document.getElementById('graph-canvas')
+        const c = document.querySelector('canvas.graph-canvas')
           || document.querySelector('canvas');
         if (!c) return { w: 0, h: 0 };
         const r = c.getBoundingClientRect();

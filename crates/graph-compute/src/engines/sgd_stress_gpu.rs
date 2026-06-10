@@ -200,7 +200,11 @@ impl LayoutEngine for SgdStressGpuEngine {
         for (t, row) in pivots.iter().enumerate() {
             for i in 0..n {
                 let d = row.dist[i];
-                dist[i * k + t] = if d == u32::MAX || d == 0 { 0.0 } else { d as f32 };
+                dist[i * k + t] = if d == u32::MAX || d == 0 {
+                    0.0
+                } else {
+                    d as f32
+                };
             }
         }
 
@@ -314,11 +318,26 @@ impl LayoutEngine for SgdStressGpuEngine {
                 label: Some(label),
                 layout: &bgl,
                 entries: &[
-                    wgpu::BindGroupEntry { binding: 0, resource: in_buf.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 1, resource: out_buf.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 2, resource: pivot_nodes_buf.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 3, resource: dist_buf.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 4, resource: params_buf.as_entire_binding() },
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: in_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: out_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: pivot_nodes_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: dist_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 4,
+                        resource: params_buf.as_entire_binding(),
+                    },
                 ],
             })
         };
@@ -370,7 +389,12 @@ impl LayoutEngine for SgdStressGpuEngine {
             settings.eta_min,
             settings.n_anneal_steps,
         );
-        let params = ParamsRaw { n, k: gpu.k, eta, _pad: 0.0 };
+        let params = ParamsRaw {
+            n,
+            k: gpu.k,
+            eta,
+            _pad: 0.0,
+        };
         gpu.queue
             .write_buffer(&gpu.params_buf, 0, bytemuck::bytes_of(&params));
 
@@ -379,7 +403,11 @@ impl LayoutEngine for SgdStressGpuEngine {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
         let mut cur = gpu.cur;
         for _ in 0..sweeps {
-            let bind_group = if cur == 0 { &gpu.bg_a_to_b } else { &gpu.bg_b_to_a };
+            let bind_group = if cur == 0 {
+                &gpu.bg_a_to_b
+            } else {
+                &gpu.bg_b_to_a
+            };
             {
                 let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                     label: None,
@@ -481,7 +509,10 @@ mod tests {
             out = engine.step(&mut ctx).positions;
         }
         assert_eq!(out.len(), positions.len());
-        assert!(out.iter().all(|v| v.is_finite()), "positions must stay finite");
+        assert!(
+            out.iter().all(|v| v.is_finite()),
+            "positions must stay finite"
+        );
         let stress_after = full_stress(&g, &out);
         assert!(
             stress_after < stress_before,
@@ -528,7 +559,8 @@ mod tests {
 
         // GPU Jacobi (move only self).
         let mut gpu = SgdStressGpuEngine::new();
-        gpu.init(&mut ctx, &CsrShard::whole(&g), &init).expect("gpu init");
+        gpu.init(&mut ctx, &CsrShard::whole(&g), &init)
+            .expect("gpu init");
         let mut gpu_out = init.clone();
         for _ in 0..STEPS {
             gpu_out = gpu.step(&mut ctx).positions;
@@ -538,7 +570,8 @@ mod tests {
         // CPU s_gd2 (both endpoints) from the same seed + init.
         let mut cpu = crate::engines::sgd_stress::SgdStressEngine::new();
         let mut cctx = EngineCtx::cpu_only();
-        cpu.init(&mut cctx, &CsrShard::whole(&g), &init).expect("cpu init");
+        cpu.init(&mut cctx, &CsrShard::whole(&g), &init)
+            .expect("cpu init");
         let mut cpu_out = init.clone();
         for _ in 0..STEPS {
             cpu_out = cpu.step(&mut cctx).positions;

@@ -1,13 +1,11 @@
+use clap::Parser;
 use std::path::PathBuf;
 use std::sync::Arc;
-use clap::Parser;
 
 use graph_api::{
     compute_broker::{ComputeBroker, RemoteLayout},
     progress::ProgressLog,
-    router,
-    vault_loader,
-    AppState,
+    router, vault_loader, AppState,
 };
 
 /// Resolution order: CLI flag > env var (VAULT_ROOT) > .env file > current directory.
@@ -27,9 +25,9 @@ struct Args {
     /// Don't auto-open the browser. Override with $GRAPH_API_NO_BROWSER=1.
     #[arg(long, env = "GRAPH_API_NO_BROWSER")]
     no_browser: bool,
-    /// Dev mode: serve /assets and / from this directory at request time
-    /// instead of from the embedded bundle.
-    #[arg(long, env = "GRAPH_RENDERER_ASSETS_DIR")]
+    /// Serve /assets and / from this directory at request time (the
+    /// frontend dist, e.g. app/ui/dist). Without it, assets 404.
+    #[arg(long, env = "JUMP_CANNON_ASSETS_DIR")]
     assets_dir: Option<PathBuf>,
     /// URL of the graph-compute gRPC worker. When unset, the compute broker
     /// is disabled.
@@ -75,9 +73,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Some(std::sync::Arc::new(vs))
         }
         Err(e) => {
-            tracing::warn!(
-                "vault-search unavailable: {e}; /search falls back to title-contains"
-            );
+            tracing::warn!("vault-search unavailable: {e}; /search falls back to title-contains");
             progress.fail(vault_search_id, format!("{e}"));
             None
         }

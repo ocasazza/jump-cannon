@@ -165,7 +165,10 @@ pub(crate) fn select_pivots(g: &CsrGraph, n_pivots: u32, rng: &mut SplitMix64) -
                 best_node = v as u32;
             }
         }
-        pivots.push(PivotRow { pivot: next_pivot, dist });
+        pivots.push(PivotRow {
+            pivot: next_pivot,
+            dist,
+        });
         next_pivot = best_node;
     }
     pivots

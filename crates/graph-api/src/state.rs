@@ -62,8 +62,14 @@ impl GraphSnapshot {
             Arc::from(crate::binary::edges_buffer(&graph, &id_to_idx)),
         );
         for name in [
-            "degree", "indegree", "outdegree", "pagerank",
-            "betweenness", "kcore", "community", "wcc",
+            "degree",
+            "indegree",
+            "outdegree",
+            "pagerank",
+            "betweenness",
+            "kcore",
+            "community",
+            "wcc",
         ] {
             if let Some(buf) = crate::binary::metric_buffer(&graph, name) {
                 binary_cache.insert(name.to_string(), Arc::from(buf));
@@ -74,7 +80,12 @@ impl GraphSnapshot {
             Arc::from(crate::server::build_meta_summary_bytes(&graph)),
         );
 
-        Self { graph, id_to_idx, idx_to_id, binary_cache }
+        Self {
+            graph,
+            id_to_idx,
+            idx_to_id,
+            binary_cache,
+        }
     }
 }
 

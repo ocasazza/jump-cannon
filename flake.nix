@@ -76,34 +76,14 @@
         commonArgs = { inherit src; strictDeps = true; };
 
         # Dependency caches — built once, reused per target
-        # protobuf is needed for graph-api's prost-build; pkg-config + bevyLibs
-        # remain for graph-layouts/graph-renderer (Bevy is still in graph-renderer's tree as historical/example bin? — keep until we drop it).
+        # protobuf is needed for graph-api's / graph-compute's prost/tonic builds.
         depsNative = craneLib.buildDepsOnly (commonArgs // {
-          nativeBuildInputs = [ pkgs.pkg-config pkgs.protobuf ];
-          buildInputs = bevyLibs;
+          nativeBuildInputs = [ pkgs.protobuf ];
         });
         depsWasm   = craneLibWasm.buildDepsOnly (commonArgs // {
           CARGO_BUILD_TARGET = "wasm32-unknown-unknown";
           cargoExtraArgs = "--package graph-layouts --package tvix-wasm";
         });
-
-        # System deps for Bevy — platform-split so the flake works on both Linux and macOS
-        bevyLibsLinux = with pkgs; lib.optionals stdenv.isLinux [
-          libGL
-          vulkan-loader
-          alsa-lib
-          udev
-          wayland
-          libxkbcommon
-          libx11
-          libxcursor
-          libxrandr
-          libxi
-        ];
-        # macOS: Bevy uses Metal via wgpu. Frameworks (Metal, CoreAudio, AppKit, etc.)
-        # are provided by the Xcode CLT and don't need to be listed here — adding them
-        # via darwin.apple_sdk breaks on nixpkgs-unstable (apple_sdk_11_0 removed).
-        bevyLibs = bevyLibsLinux;
 
         # ----- Native packages -----
 
@@ -141,8 +121,7 @@
           pname = "graph-compute-bench-pagerank";
           version = "0.1.0";
           __noChroot = true;
-          nativeBuildInputs = [ pkgs.pkg-config pkgs.protobuf ];
-          buildInputs = bevyLibs;
+          nativeBuildInputs = [ pkgs.protobuf ];
           buildPhaseCargoCommand = ''
             cargo run --release -p graph-compute --example bench_pagerank -- \
               --bench --noplot --save-baseline hydra
@@ -173,9 +152,9 @@
         # page in chromium with WebGPU enabled + run the Rust smoke test.
         #
         # NOTE: this wrapper depends on:
-        #   1. A trunk dist. Defaults to the nix-built graph-renderer-web
-        #      store path; override with ASSETS_DIR for fast iteration
-        #      against a local `trunk watch` build.
+        #   1. A trunk dist. Defaults to the nix-built app-web (the Dioxus
+        #      frontend) store path; override with ASSETS_DIR for fast
+        #      iteration against a local `trunk watch` build in app/.
         #   2. A test vault at /tmp/test-vault (auto-seeded by `just`
         #      recipes; this wrapper also seeds a minimal one).
         # The wrapper bails with a clear error if (1) is missing.
@@ -192,15 +171,15 @@
             set -euo pipefail
 
             REPO_ROOT="''${REPO_ROOT:-$PWD}"
-            ASSETS_DIR="''${ASSETS_DIR:-${graph-renderer-web}}"
+            ASSETS_DIR="''${ASSETS_DIR:-${app-web}}"
             VAULT="''${VAULT_ROOT:-/tmp/test-vault}"
             PORT="''${TEST_PORT:-47896}"
             OUT_DIR="''${OUT_DIR:-$REPO_ROOT/target/test-browser-rust}"
 
             if [ ! -f "$ASSETS_DIR/index.html" ]; then
               echo "error: no trunk dist at $ASSETS_DIR" >&2
-              echo "hint: unset ASSETS_DIR to use the nix-built graph-renderer-web," >&2
-              echo "  or run 'just wasm' and point ASSETS_DIR at the trunk-watch dist." >&2
+              echo "hint: unset ASSETS_DIR to use the nix-built app-web, or run" >&2
+              echo "  'cd app && trunk build --release' and point ASSETS_DIR at app/ui/dist." >&2
               exit 2
             fi
 
@@ -280,13 +259,13 @@
         # ----- graph-api service -----
         #
         # The graph-api container ingests $VAULT_ROOT at startup and watches
-        # for changes via inotify; progress is surfaced to the frontend
-        # footer via `GET /progress`. The compose service below bind-mounts
-        # the host's $VAULT_ROOT into /vault and the trunk dist into
-        # /assets. $ASSETS_DIR defaults to the nix-built graph-renderer-web
-        # derivation, so `just dev-up` works without a prior `just wasm`;
-        # set it explicitly when iterating on the frontend with
-        # `trunk watch`.
+        # for changes via inotify; progress is surfaced to the frontend's
+        # Progress panel via `GET /progress`. The compose service below
+        # bind-mounts the host's $VAULT_ROOT into /vault and the trunk dist
+        # into /assets. $ASSETS_DIR defaults to the nix-built app-web (the
+        # Dioxus frontend) derivation, so `just dev-up` works without a
+        # prior trunk build; set it explicitly when iterating on the
+        # frontend with `trunk watch` in app/.
         graphApiService = {
           name = "graph-api";
           port = 8765;
@@ -308,7 +287,7 @@
               "GRAPH_API_HOST=0.0.0.0"
               "GRAPH_API_PORT=${toString graphApiService.port}"
               "GRAPH_API_NO_BROWSER=1"
-              "GRAPH_RENDERER_ASSETS_DIR=/assets"
+              "JUMP_CANNON_ASSETS_DIR=/assets"
               "VAULT_ROOT=/vault"
               "RUST_LOG=${graphApiService.rustLog}"
             ];
@@ -329,32 +308,30 @@
             restart = "unless-stopped";
           };
           # graph-api: ingests $VAULT_ROOT on boot, watches for changes,
-          # surfaces progress to the renderer via GET /progress.
+          # surfaces progress to the frontend via GET /progress.
           services."${graphApiService.name}" = {
             image       = "${graphApiService.name}:latest";
             ports       = [ "${toString graphApiService.port}:${toString graphApiService.port}" ];
-            # Bind-mount the host vault read-only (the renderer's PUT
-            # /vault/page editor surface would need rw — flip to `:rw` if
-            # you're using that). Bind-mount the pre-built trunk dist
-            # so the in-container graph-api can serve / and /assets.
-            # `VAULT_ROOT` and `ASSETS_DIR` are host-side env vars; default
-            # both to the canonical in-repo paths.
+            # Bind-mount the host vault (rw — see below). Bind-mount the
+            # pre-built trunk dist so the in-container graph-api can serve
+            # / and /assets. `VAULT_ROOT` and `ASSETS_DIR` are host-side
+            # env vars; default both to the canonical in-repo paths.
             volumes = [
-              # rw, not ro: the renderer's PUT /vault/page editor surface
-              # (commit c629cd7f) needs to write back to the vault.
+              # rw, not ro: the frontend's PUT /vault/page editor surface
+              # needs to write back to the vault.
               "\${VAULT_ROOT:-./vault}:/vault:rw"
               # ASSETS_DIR is set by `nix run .#dev-up` to the nix-built
-              # graph-renderer-web store path. Direct `podman-compose up`
-              # users can either export ASSETS_DIR=$(nix build --no-link
-              # --print-out-paths .#graph-renderer-web) or point it at
-              # their local `trunk watch` dist for fast iteration.
-              "\${ASSETS_DIR:-./crates/graph-renderer/assets/dist}:/assets:ro"
+              # app-web store path. Direct `podman-compose up` users can
+              # either export ASSETS_DIR=$(nix build --no-link
+              # --print-out-paths .#app-web) or point it at their local
+              # `trunk watch` dist (app/ui/dist) for fast iteration.
+              "\${ASSETS_DIR:-./app/ui/dist}:/assets:ro"
             ];
             environment = {
               GRAPH_API_HOST              = "0.0.0.0";
               GRAPH_API_PORT              = toString graphApiService.port;
               GRAPH_API_NO_BROWSER        = "1";
-              GRAPH_RENDERER_ASSETS_DIR   = "/assets";
+              JUMP_CANNON_ASSETS_DIR      = "/assets";
               VAULT_ROOT                  = "/vault";
               JUMP_CANNON_COMPUTE_URL     = "http://${graphComputeService.name}:${toString graphComputeService.port}";
               RUST_LOG                    = graphApiService.rustLog;
@@ -443,15 +420,10 @@
             echo "loading ${graphApiService.name}:latest into podman..."
             podman load < ${graph-api-image}
             # graph-api in-container serves the trunk dist from /assets.
-            # FRONTEND=egui (default) serves the nix-built graph-renderer-web;
-            # FRONTEND=app serves the Dioxus frontend (app-web) — graph-api's
-            # root-asset fallback route hosts either dist unchanged. Set
-            # ASSETS_DIR explicitly to point at a local trunk-watch dist when
-            # iterating on a frontend.
-            case "''${FRONTEND:-egui}" in
-              app) ASSETS_DIR_DEFAULT="${app-web}" ;;
-              *)   ASSETS_DIR_DEFAULT="${graph-renderer-web}" ;;
-            esac
+            # The Dioxus frontend (app-web) is the frontend; set ASSETS_DIR
+            # explicitly to point at a local trunk-watch dist (app/ui/dist)
+            # when iterating on it.
+            ASSETS_DIR_DEFAULT="${app-web}"
             ASSETS_DIR="''${ASSETS_DIR:-$ASSETS_DIR_DEFAULT}"
             if [ ! -f "$ASSETS_DIR/index.html" ]; then
               echo "warn: no trunk dist at $ASSETS_DIR — graph-api will serve 404 for /" >&2
@@ -502,53 +474,6 @@
           nativeBuildInputs = [ pkgs.wasm-bindgen-cli ];
         });
 
-        # ----- graph-renderer-web: trunk-built WASM frontend -----
-        #
-        # Produces the `dist/` directory (index.html, hashed wasm/js, assets)
-        # as a Nix store path. Lets `dev-up` and the compose stack consume the
-        # built bundle without requiring a prior `just wasm` on the host.
-        #
-        # Trunk needs wasm-bindgen-cli whose version matches the wasm-bindgen
-        # crate in Cargo.lock. The lockfile pins 0.2.120; nixpkgs ships up to
-        # 0.2.118. The two-patch gap normally works because .cargo/config.toml
-        # disables the wasm `reference-types` feature that was the load-bearing
-        # incompatibility (see wasm-bindgen #4211 / #4654). If a future bump
-        # breaks this, override `wasm-bindgen-cli` with a custom build of
-        # 0.2.120 — the source hash is already known via `nix-prefetch-url`.
-        # Renderer-only WASM deps cache. The workspace's broader `depsWasm`
-        # is scoped to `graph-layouts` + `tvix-wasm` because the wasm32
-        # target choke-points (e.g. getrandom-0.3 requiring the wasm_js
-        # cfg) only affect packages the renderer pulls in. Restricting
-        # this build to `--package graph-renderer` matches what trunk
-        # itself drives.
-        depsWasmRenderer = craneLibWasm.buildDepsOnly (commonArgs // {
-          CARGO_BUILD_TARGET = "wasm32-unknown-unknown";
-          cargoExtraArgs = "--package graph-renderer";
-          # graph-renderer's build.rs reuses the graph-api .proto definitions
-          # via prost-build, which shells out to protoc.
-          nativeBuildInputs = [ pkgs.protobuf ];
-          # getrandom 0.3 on wasm32-unknown-unknown needs the wasm_js cfg
-          # to pick the JS-backed entropy source. Without it the build
-          # fails with the same compile_error the renderer would hit at
-          # `trunk build` time outside the sandbox.
-          RUSTFLAGS = "--cfg getrandom_backend=\"wasm_js\" -C target-feature=+reference-types";
-        });
-
-        graph-renderer-web = craneLib.buildTrunkPackage (commonArgs // {
-          pname = "graph-renderer-web";
-          cargoArtifacts = depsWasmRenderer;
-          CARGO_BUILD_TARGET = "wasm32-unknown-unknown";
-          RUSTFLAGS = "--cfg getrandom_backend=\"wasm_js\" -C target-feature=+reference-types";
-          # Trunk.toml at the repo root drives target/dist; the index lives
-          # under crates/graph-renderer/assets/. buildTrunkPackage copies
-          # `$(dirname trunkIndexPath)/dist` to $out, so the on-disk dist
-          # path the justfile expects matches what the derivation produces.
-          trunkIndexPath = "crates/graph-renderer/assets/index.html";
-          cargoExtraArgs = "--package graph-renderer";
-          nativeBuildInputs = [ pkgs.protobuf ];
-          wasm-bindgen-cli = pkgs.wasm-bindgen-cli_0_2_118;
-        });
-
         # ----- app-web: the Dioxus frontend (app/ workspace), trunk-built -----
         #
         # The app/ workspace is deliberately separate from this one (it owns
@@ -563,7 +488,7 @@
         # the workspace manifest live; the relative ../../crates/graph-layouts
         # path then resolves inside the union. wasm-bindgen is pinned to
         # =0.2.118 in app/Cargo.toml to match the nixpkgs CLI exactly (no
-        # version-skew caveats like the graph-renderer-web note above).
+        # CLI/crate version-skew caveats).
         #
         # The Tauri shell itself stays a devshell build (`just app-dev` /
         # `just app-build`): bundling needs platform signing toolchains that
@@ -619,7 +544,7 @@
       in {
         packages = {
           default          = graph-api;
-          inherit vault-search graph-api graph-compute graph-layouts-wasm tvix-wasm graph-renderer-web app-web;
+          inherit vault-search graph-api graph-compute graph-layouts-wasm tvix-wasm app-web;
           inherit bench-pagerank;
           inherit graph-compute-image graph-api-image docker-compose-yaml sky-task-yaml;
           inherit test-browser;
@@ -641,30 +566,25 @@
           clippy = craneLib.cargoClippy (commonArgs // {
             cargoArtifacts = depsNative;
             # graph-compute's build.rs runs tonic-build → needs protoc.
-            nativeBuildInputs = [ pkgs.pkg-config pkgs.protobuf ];
-            buildInputs = bevyLibs;
+            nativeBuildInputs = [ pkgs.protobuf ];
             cargoClippyExtraArgs = "--all-targets -- -D warnings";
           });
           tests-unit = craneLib.cargoNextest (commonArgs // {
             cargoArtifacts = depsNative;
             cargoNextestExtraArgs = "--profile unit";
-            nativeBuildInputs = [ pkgs.pkg-config pkgs.protobuf ];
-            buildInputs = bevyLibs;
+            nativeBuildInputs = [ pkgs.protobuf ];
           });
 
           tests-integration = craneLib.cargoNextest (commonArgs // {
             cargoArtifacts = depsNative;
             cargoNextestExtraArgs = "--profile integration";
-            nativeBuildInputs = [ pkgs.pkg-config pkgs.protobuf ];
-            buildInputs = bevyLibs;
+            nativeBuildInputs = [ pkgs.protobuf ];
           });
 
           tests-e2e = craneLib.cargoNextest (commonArgs // {
             cargoArtifacts = depsNative;
             cargoNextestExtraArgs = "--profile e2e";
-            # E2E needs display server libs for headless Bevy
-            nativeBuildInputs = [ pkgs.pkg-config pkgs.protobuf ];
-            buildInputs = bevyLibs;
+            nativeBuildInputs = [ pkgs.protobuf ];
           });
           # GPU analytics correctness (gpu_pagerank_* + gpu_engines). The kernels
           # run on a real wgpu adapter: Metal on the aarch64-darwin builders, and
@@ -676,8 +596,7 @@
           tests-gpu = craneLib.cargoNextest (commonArgs // {
             cargoArtifacts = depsNative;
             cargoNextestExtraArgs = "--profile gpu -p graph-compute";
-            nativeBuildInputs = [ pkgs.pkg-config pkgs.protobuf ];
-            buildInputs = bevyLibs;
+            nativeBuildInputs = [ pkgs.protobuf ];
             GPU_PAGERANK_SCALE_N = "200000";
           } // pkgs.lib.optionalAttrs pkgs.stdenv.isLinux {
             # Force the Vulkan backend so wgpu uses lavapipe and never touches the
@@ -688,7 +607,7 @@
             VK_ICD_FILENAMES =
               "${pkgs.mesa}/share/vulkan/icd.d/lvp_icd.x86_64.json";
             LD_LIBRARY_PATH =
-              pkgs.lib.makeLibraryPath (bevyLibsLinux ++ [ pkgs.vulkan-loader ]);
+              pkgs.lib.makeLibraryPath [ pkgs.vulkan-loader ];
             GPU_PAGERANK_REQUIRE_ADAPTER = "1";
           });
 
@@ -731,30 +650,12 @@
             # Dev workflow
             just
 
-            # Headless browser test (`just test-browser`).
-            # nodejs runs the Playwright script; playwright-driver.browsers
-            # provides a Chromium that's already wired up for both Linux and
-            # macOS — no `npx playwright install` needed at runtime. The
-            # PLAYWRIGHT_BROWSERS_PATH env var below points playwright at it.
-            nodejs_22
-            playwright-driver.browsers
-
             # Local dev cluster (`just dev-up` / `just dev-down`). podman runs
             # rootless on NixOS without enabling system docker; podman-compose
             # parses the same docker-compose.yml.
             podman
             podman-compose
-          ] ++ bevyLibs;
-
-          # Point Playwright at the nix-provided browser bundle and skip its
-          # post-install download step (which fails in the pure devshell).
-          PLAYWRIGHT_BROWSERS_PATH = "${pkgs.playwright-driver.browsers}";
-          PLAYWRIGHT_SKIP_VALIDATE_HOST_REQUIREMENTS = "true";
-          PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD = "true";
-
-          # Linux: make Bevy's dynamic libs findable at runtime
-          LD_LIBRARY_PATH = pkgs.lib.optionalString pkgs.stdenv.isLinux
-            (pkgs.lib.makeLibraryPath bevyLibsLinux);
+          ];
 
           # Linux: Vulkan software renderer fallback (headless CI / no GPU)
           VK_ICD_FILENAMES = pkgs.lib.optionalString pkgs.stdenv.isLinux

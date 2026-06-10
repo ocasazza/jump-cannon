@@ -107,10 +107,7 @@ pub fn spawn(state: AppState) {
         return;
     }
 
-    progress.info(
-        "watch",
-        format!("watching vault: {}", vault_root.display()),
-    );
+    progress.info("watch", format!("watching vault: {}", vault_root.display()));
 
     // Move the debouncer into the background task so it lives as long
     // as the task does (dropping it stops the watch).
@@ -152,7 +149,9 @@ pub async fn reload_with_paths(state: &AppState, paths: &HashSet<String>) {
             Ok((updated, deleted, skipped)) => {
                 progress.info(
                     "ingest",
-                    format!("search refresh: {updated} upserted, {deleted} deleted, {skipped} skipped"),
+                    format!(
+                        "search refresh: {updated} upserted, {deleted} deleted, {skipped} skipped"
+                    ),
                 );
                 progress.finish(refresh_id);
                 return;

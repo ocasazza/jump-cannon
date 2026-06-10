@@ -406,14 +406,38 @@ impl LayoutEngine for Fa2BhEngine {
                 label: Some(label),
                 layout: &bgl,
                 entries: &[
-                    wgpu::BindGroupEntry { binding: 0, resource: in_buf.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 1, resource: velocities_buf.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 2, resource: edges_buf.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 3, resource: edge_weights_buf.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 4, resource: params_buf.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 5, resource: degrees_buf.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 6, resource: oct_nodes_buf.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 7, resource: out_buf.as_entire_binding() },
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: in_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: velocities_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: edges_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: edge_weights_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 4,
+                        resource: params_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 5,
+                        resource: degrees_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 6,
+                        resource: oct_nodes_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 7,
+                        resource: out_buf.as_entire_binding(),
+                    },
                 ],
             })
         };
@@ -597,13 +621,7 @@ impl OctreeBuild {
     /// On overflow (capacity exceeded) returns the partial count — a partial
     /// tree is still a valid (slightly weaker) repulsion field rather than a
     /// crash. Returns 0 when there is nothing to build.
-    fn rebuild(
-        &mut self,
-        positions: &[f32],
-        mass: &[f32],
-        n_bodies: u32,
-        max_nodes: u32,
-    ) -> u32 {
+    fn rebuild(&mut self, positions: &[f32], mass: &[f32], n_bodies: u32, max_nodes: u32) -> u32 {
         self.nodes.clear();
         self.children.clear();
         if n_bodies == 0 || positions.len() < (n_bodies as usize) * 4 || max_nodes == 0 {
@@ -867,8 +885,7 @@ impl OctreeBuild {
                     }
                 }
                 skip[next_child as usize] = child_outer_skip;
-                let is_internal =
-                    self.nodes[next_child as usize].meta[0] == OCT_BODY_INTERNAL;
+                let is_internal = self.nodes[next_child as usize].meta[0] == OCT_BODY_INTERNAL;
                 stack.push(Frame {
                     children_left: if is_internal {
                         self.children[next_child as usize]

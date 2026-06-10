@@ -45,8 +45,7 @@ impl VaultSearch {
         if rebuild {
             cmd.arg("--rebuild");
         }
-        cmd.stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+        cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
         let child = cmd
             .spawn()
             .map_err(|e| format!("spawn vault-search: {e}"))?;
@@ -107,8 +106,7 @@ impl Drop for VaultSearch {
 }
 
 fn pick_port() -> Result<u16, String> {
-    let listener =
-        std::net::TcpListener::bind("127.0.0.1:0").map_err(|e| format!("bind: {e}"))?;
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").map_err(|e| format!("bind: {e}"))?;
     let port = listener
         .local_addr()
         .map_err(|e| format!("local_addr: {e}"))?

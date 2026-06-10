@@ -260,11 +260,7 @@ mod tests {
             })
             .collect();
         let mut order: Vec<usize> = (0..g.nodes.len()).collect();
-        order.sort_by(|&a, &b| {
-            original_radii[a]
-                .partial_cmp(&original_radii[b])
-                .unwrap()
-        });
+        order.sort_by(|&a, &b| original_radii[a].partial_cmp(&original_radii[b]).unwrap());
         distort_radial(&mut g, &DistortParams::default());
         let new_radii: Vec<f32> = (0..g.nodes.len())
             .map(|i| {
@@ -290,20 +286,21 @@ mod tests {
     fn distort_preserves_angles() {
         let mut g = synthetic_dense_center();
         let pre_angles: Vec<f32> = (0..g.nodes.len())
-            .map(|i| {
-                g.positions[3 * i + 1].atan2(g.positions[3 * i])
-            })
+            .map(|i| g.positions[3 * i + 1].atan2(g.positions[3 * i]))
             .collect();
         distort_radial(&mut g, &DistortParams::default());
         let post_angles: Vec<f32> = (0..g.nodes.len())
-            .map(|i| {
-                g.positions[3 * i + 1].atan2(g.positions[3 * i])
-            })
+            .map(|i| g.positions[3 * i + 1].atan2(g.positions[3 * i]))
             .collect();
         for i in 0..g.nodes.len() {
             // Angles within a tiny ULP — only float error on cos/sin round-trip.
             let diff = (pre_angles[i] - post_angles[i]).abs();
-            assert!(diff < 1e-3, "angle drift at {i}: {} vs {}", pre_angles[i], post_angles[i]);
+            assert!(
+                diff < 1e-3,
+                "angle drift at {i}: {} vs {}",
+                pre_angles[i],
+                post_angles[i]
+            );
         }
     }
 

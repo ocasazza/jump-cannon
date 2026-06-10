@@ -1034,7 +1034,10 @@ impl GeometricEngine {
     /// `StepOutput` path would otherwise require).
     #[doc(hidden)]
     pub fn positions_for_test(&self) -> &[f32] {
-        self.state.as_ref().map(|st| st.positions.as_slice()).unwrap_or(&[])
+        self.state
+            .as_ref()
+            .map(|st| st.positions.as_slice())
+            .unwrap_or(&[])
     }
 
     /// Run *only* the dynamic-bond stage (cell-list build + add/remove sweep) on
@@ -1196,8 +1199,7 @@ impl LayoutEngine for GeometricEngine {
         // mix constant) so building the orientation field can't shift the
         // translational thermostat stream — backward-compat for every T>0 canary.
         let mut director_rng = self.settings.rng_seed ^ 0xD1EC_70F0_FACE_B00C;
-        let directors =
-            resolve_directors(&self.settings, n, graph.attributes, &mut director_rng)?;
+        let directors = resolve_directors(&self.settings, n, graph.attributes, &mut director_rng)?;
         self.state = Some(State {
             n,
             positions: positions.to_vec(),
@@ -1272,7 +1274,12 @@ fn compute_forces(st: &State, s: &GeometricSettings) -> Vec<f32> {
     // adds nothing here (byte-identical). The bond stage keeps each entry's
     // `target_len = r_bond`, so a fresh bond relaxes toward the creation distance.
     if !st.dynamic_edges.is_empty() {
-        accumulate_edge_forces(&mut force, &st.positions, &st.dynamic_edges, s.bond_stiffness);
+        accumulate_edge_forces(
+            &mut force,
+            &st.positions,
+            &st.dynamic_edges,
+            s.bond_stiffness,
+        );
     }
     if s.angle_stiffness != 0.0 {
         accumulate_angle_forces(&mut force, st, s);
@@ -1834,8 +1841,18 @@ fn accumulate_exclusion_affinity(force: &mut [f32], st: &State, s: &GeometricSet
             // OFF by default (k=0) ⇒ byte-identical.
             if s.tilt_coupling_strength > 0.0 && eps > 0.0 {
                 accumulate_tilt_force(
-                    force, &st.directors, i, j, ux, uy, uz, dist, sigma, wc,
-                    s.tilt_coupling_strength, s.spont_curvature_c0,
+                    force,
+                    &st.directors,
+                    i,
+                    j,
+                    ux,
+                    uy,
+                    uz,
+                    dist,
+                    sigma,
+                    wc,
+                    s.tilt_coupling_strength,
+                    s.spont_curvature_c0,
                 );
             }
         }
@@ -1983,7 +2000,11 @@ impl CellList {
     /// `cell` size. A non-positive/non-finite cell size is clamped to a small
     /// positive value so the grid is always well-defined. O(n).
     fn build(pos: &[f32], n: usize, cell: f32) -> CellList {
-        let cell = if cell.is_finite() && cell > 1e-4 { cell } else { 1e-4 };
+        let cell = if cell.is_finite() && cell > 1e-4 {
+            cell
+        } else {
+            1e-4
+        };
         let inv = 1.0 / cell;
         let mut cells: std::collections::HashMap<(i32, i32, i32), Vec<u32>> =
             std::collections::HashMap::with_capacity(n);
@@ -2132,11 +2153,19 @@ fn update_dynamic_bonds(st: &mut State, s: &GeometricSettings) {
 /// when the table is empty). `0` means **uncapped**; callers treat `valence >= cap`
 /// with a `0` cap by never reaching this path (the `capped` gate skips it).
 fn lookup_max_valence(s: &GeometricSettings, class: usize) -> u32 {
-    let v = s.max_valence.get(class).copied().unwrap_or(s.default_max_valence);
+    let v = s
+        .max_valence
+        .get(class)
+        .copied()
+        .unwrap_or(s.default_max_valence);
     // A per-class entry of 0 inherits the fallback (so a partially-filled table
     // doesn't accidentally pin some classes to "no bonds at all" unless the
     // fallback itself is 0). When both are 0 the `capped` gate is off anyway.
-    if v == 0 { s.default_max_valence } else { v }
+    if v == 0 {
+        s.default_max_valence
+    } else {
+        v
+    }
 }
 
 /// Look up a class's preferred dynamic-bond angle (degrees), clamped to the
@@ -2352,11 +2381,35 @@ fn integrate_directors(st: &mut State, s: &GeometricSettings) {
 
                 // Target for n_j: tilt n_i toward r̂ (in-plane part of r̂) by c₀.
                 accumulate_bend_torque(
-                    &mut bend_field, j, nix, niy, niz, rx, ry, rz, njx, njy, njz, c0, kw,
+                    &mut bend_field,
+                    j,
+                    nix,
+                    niy,
+                    niz,
+                    rx,
+                    ry,
+                    rz,
+                    njx,
+                    njy,
+                    njz,
+                    c0,
+                    kw,
                 );
                 // Target for n_i: tilt n_j toward −r̂ by c₀ (consistent sign).
                 accumulate_bend_torque(
-                    &mut bend_field, i, njx, njy, njz, -rx, -ry, -rz, nix, niy, niz, c0, kw,
+                    &mut bend_field,
+                    i,
+                    njx,
+                    njy,
+                    njz,
+                    -rx,
+                    -ry,
+                    -rz,
+                    nix,
+                    niy,
+                    niz,
+                    c0,
+                    kw,
                 );
             }
         }
@@ -2390,10 +2443,34 @@ fn integrate_directors(st: &mut State, s: &GeometricSettings) {
             let (njx, njy, njz) = (dir[3 * j], dir[3 * j + 1], dir[3 * j + 2]);
             // Target for n_j: tilt n_i toward r̂ by c₀; for n_i: tilt n_j toward −r̂.
             accumulate_bend_torque(
-                &mut bond_tilt_field, j, nix, niy, niz, rx, ry, rz, njx, njy, njz, c0, 1.0,
+                &mut bond_tilt_field,
+                j,
+                nix,
+                niy,
+                niz,
+                rx,
+                ry,
+                rz,
+                njx,
+                njy,
+                njz,
+                c0,
+                1.0,
             );
             accumulate_bend_torque(
-                &mut bond_tilt_field, i, njx, njy, njz, -rx, -ry, -rz, nix, niy, niz, c0, 1.0,
+                &mut bond_tilt_field,
+                i,
+                njx,
+                njy,
+                njz,
+                -rx,
+                -ry,
+                -rz,
+                nix,
+                niy,
+                niz,
+                c0,
+                1.0,
             );
         }
     }
@@ -2405,9 +2482,9 @@ fn integrate_directors(st: &mut State, s: &GeometricSettings) {
     // h — an unbounded raw `μ·h` overshoots and makes the director oscillate, the
     // head-to-head sign-flips that show up as a volatile, never-settling S.
     let mobility = s.anisotropy_strength.min(1.0); // bounded align rate
-    // Bounded bending rate, reusing the same min(.,1) overshoot guard the align
-    // rate uses (the splay-bend torque is already an accumulated sum over
-    // neighbours, so an unbounded κ would overshoot and oscillate the director).
+                                                   // Bounded bending rate, reusing the same min(.,1) overshoot guard the align
+                                                   // rate uses (the splay-bend torque is already an accumulated sum over
+                                                   // neighbours, so an unbounded κ would overshoot and oscillate the director).
     let bend_mobility = s.kappa_bend.min(1.0);
     // Bounded bond-tilt rate (P3), same min(.,1) overshoot guard: `spont_curvature`
     // is the tilt *angle*, so the rate is fixed at 1 (full overdamped step toward
@@ -3764,7 +3841,8 @@ mod tests {
             let brute = brute_pairs_within(&pos, n, cutoff);
             let cells = celllist_pairs_within(&pos, n, cutoff);
             assert_eq!(
-                cells, brute,
+                cells,
+                brute,
                 "cell-list candidate set must equal brute scan at cutoff {cutoff} \
                  (brute {} pairs, cells {} pairs)",
                 brute.len(),
@@ -3819,7 +3897,11 @@ mod tests {
         let mut ctx = EngineCtx::cpu_only();
         e.step(&mut ctx); // runs the bond stage (bond_every = 1)
         let bonds = e.dynamic_bonds().unwrap();
-        assert_eq!(bonds, vec![(0, 1)], "only the in-range 0-1 pair should bond");
+        assert_eq!(
+            bonds,
+            vec![(0, 1)],
+            "only the in-range 0-1 pair should bond"
+        );
 
         // Now pull node 1 far past r_break of node 0 (and away from node 2) by
         // mutating its position and stepping again: the 0-1 bond must BREAK
@@ -3896,8 +3978,12 @@ mod tests {
         };
         let mut e2 = GeometricEngine::new();
         e2.set_params(&serde_json::to_value(&s).unwrap()).unwrap();
-        e2.init(&mut ctx, &CsrShard::whole_with_attributes(&g, &attrs0), &pos)
-            .unwrap();
+        e2.init(
+            &mut ctx,
+            &CsrShard::whole_with_attributes(&g, &attrs0),
+            &pos,
+        )
+        .unwrap();
         e2.step(&mut ctx);
         assert_eq!(
             e2.dynamic_bonds().unwrap(),
@@ -3950,11 +4036,15 @@ mod tests {
             "no node may exceed the valence cap of 2, got degrees {deg:?} (bonds {bonds:?})"
         );
         // Determinism: re-run from scratch on the identical config ⇒ identical set.
-        let mut e2 = init_engine(&g, {
-            let mut s2 = bonding_settings(1.0, 1.5);
-            s2.default_max_valence = 2;
-            s2
-        }, &pos);
+        let mut e2 = init_engine(
+            &g,
+            {
+                let mut s2 = bonding_settings(1.0, 1.5);
+                s2.default_max_valence = 2;
+                s2
+            },
+            &pos,
+        );
         e2.step(&mut ctx);
         assert_eq!(
             bonds,
@@ -3969,9 +4059,7 @@ mod tests {
         // every in-range pair bonds. A tight 4-cluster (all pairs in range) bonds
         // into the complete graph K4 (6 edges, every node degree 3).
         let g = no_edges_csr(4);
-        let pos = vec![
-            0.0, 0.0, 0.0, 0.2, 0.0, 0.0, 0.0, 0.2, 0.0, 0.0, 0.0, 0.2,
-        ];
+        let pos = vec![0.0, 0.0, 0.0, 0.2, 0.0, 0.0, 0.0, 0.2, 0.0, 0.0, 0.0, 0.2];
         let e = {
             let mut e = init_engine(&g, bonding_settings(1.0, 1.5), &pos);
             let mut ctx = EngineCtx::cpu_only();
@@ -3979,9 +4067,16 @@ mod tests {
             e
         };
         let bonds = e.dynamic_bonds().unwrap();
-        assert_eq!(bonds.len(), 6, "uncapped tight 4-cluster ⇒ K4 (6 bonds), got {bonds:?}");
+        assert_eq!(
+            bonds.len(),
+            6,
+            "uncapped tight 4-cluster ⇒ K4 (6 bonds), got {bonds:?}"
+        );
         let deg = bond_degree_histogram(4, &bonds);
-        assert!(deg.iter().all(|&d| d == 3), "K4 ⇒ every node degree 3, got {deg:?}");
+        assert!(
+            deg.iter().all(|&d| d == 3),
+            "K4 ⇒ every node degree 3, got {deg:?}"
+        );
     }
 
     #[test]
@@ -3991,9 +4086,7 @@ mod tests {
         // range. The affinity matrix is all-positive so every pair is compatible.
         // Node 0 must accept at most 1 bond despite three willing partners.
         let g = no_edges_csr(4);
-        let pos = vec![
-            0.0, 0.0, 0.0, 0.2, 0.0, 0.0, 0.0, 0.2, 0.0, 0.0, 0.0, 0.2,
-        ];
+        let pos = vec![0.0, 0.0, 0.0, 0.2, 0.0, 0.0, 0.0, 0.2, 0.0, 0.0, 0.0, 0.2];
         let mut s = bonding_settings(1.0, 1.5);
         s.class_source = ClassSource::Injected;
         s.class_affinity_dim = 2;
@@ -4056,7 +4149,11 @@ mod tests {
         let st = e.state.as_ref().unwrap();
         // Confirm the bonded triple still exists (center degree 2).
         let bonds = e.dynamic_bonds().unwrap();
-        assert_eq!(bonds.len(), 2, "center should be bonded to both ends, got {bonds:?}");
+        assert_eq!(
+            bonds.len(),
+            2,
+            "center should be bonded to both ends, got {bonds:?}"
+        );
         let theta1 = super::triple_angle(&st.positions, 0, 1, 2).to_degrees();
         assert!(
             theta1 > theta0 + 2.0,

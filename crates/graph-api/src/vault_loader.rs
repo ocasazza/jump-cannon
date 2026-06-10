@@ -19,10 +19,7 @@ pub fn load(vault_root: &Path) -> VaultGraph {
 
 /// Like [`load`] but emits per-stage progress into a [`ProgressLog`].
 /// Stages: "Scanning vault", "Computing metrics", "Seeding positions".
-pub fn load_with_progress(
-    vault_root: &Path,
-    progress: Option<&Arc<ProgressLog>>,
-) -> VaultGraph {
+pub fn load_with_progress(vault_root: &Path, progress: Option<&Arc<ProgressLog>>) -> VaultGraph {
     tracing::info!(vault_root = %vault_root.display(), "extracting vault");
     let scan_id = progress.map(|p| p.start("ingest", "Scanning vault"));
 

@@ -23,7 +23,11 @@ fn ring(n: u32) -> CsrGraph {
         neighbors.push((i + 1) % n);
     }
     offsets.push(neighbors.len() as u32);
-    CsrGraph { n_nodes: n, offsets, neighbors }
+    CsrGraph {
+        n_nodes: n,
+        offsets,
+        neighbors,
+    }
 }
 
 /// Connected, no-dangling: a ring + deterministic chords.
@@ -49,7 +53,11 @@ fn chorded_ring(n: u32) -> CsrGraph {
         neighbors.extend_from_slice(a);
         offsets.push(neighbors.len() as u32);
     }
-    CsrGraph { n_nodes: n, offsets, neighbors }
+    CsrGraph {
+        n_nodes: n,
+        offsets,
+        neighbors,
+    }
 }
 
 #[test]
@@ -60,7 +68,8 @@ fn gpu_distributed_matches_single_and_cpu_distributed() {
     for g in [ring(60), chorded_ring(120)] {
         let single = cpu_pagerank(&g, 0.85, 80);
         for p in [1u32, 2, 3, 5, 8] {
-            let gpu_dist = distributed_pagerank_gpu(&ctx, &g, p, 0.85, 80).expect("gpu distributed");
+            let gpu_dist =
+                distributed_pagerank_gpu(&ctx, &g, p, 0.85, 80).expect("gpu distributed");
             assert_eq!(gpu_dist.len(), single.len());
 
             // (a) GPU-distributed == single-process cpu_pagerank.
@@ -82,7 +91,11 @@ fn gpu_distributed_matches_single_and_cpu_distributed() {
                 .zip(cpu_dist.iter())
                 .map(|(a, b)| (a - b).abs())
                 .fold(0.0f32, f32::max);
-            assert!(dev_cpu < 1e-4, "n={} p={p}: gpu vs cpu distributed dev {dev_cpu}", g.n_nodes);
+            assert!(
+                dev_cpu < 1e-4,
+                "n={} p={p}: gpu vs cpu distributed dev {dev_cpu}",
+                g.n_nodes
+            );
 
             // (c) Mass conserved across partitions.
             let mass: f64 = gpu_dist.iter().map(|&r| r as f64).sum();

@@ -3,14 +3,12 @@ resolver = "2"
 members = [
     "crates/graph-layouts",
     "crates/graph-metrics",
-    "crates/graph-renderer",
     "crates/graph-api",
     "crates/graph-compute",
     "crates/vault-data",
     "crates/vault-links",
     "crates/vault-search",
     "crates/tvix-wasm",
-    "crates/tvix-worker",
     "crates/test-browser",
 ]
 
@@ -23,7 +21,6 @@ name = "jump-cannon"
 
 [workspace.dependencies]
 # Shared versions — crates reference these with `workspace = true`
-bevy       = { version = "0.16", default-features = false }
 serde      = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio      = { version = "1", features = ["full"] }

@@ -75,11 +75,19 @@ Exact ports of `ui/sections/`:
 - `AppState` (de)serialization parity: YAML/JSON round-trip, sessionStorage
   persistence, instances import/export, `?config=<name>` presets.
 
-## Phase 5 — retirement ⬜
+## Phase 5 — retirement ✅
 
-When phases 1–4 hold: retire `crates/graph-renderer`, the root Trunk.toml,
-the Playwright harness's egui assumptions; point `just dev-up`'s default
-frontend at `app`; move browser regression coverage to the Dioxus app.
+Executed 2026-06-09. Removed: `crates/graph-renderer` (the egui frontend),
+its orphan dependencies `crates/jump-io` (input layer) and
+`crates/tvix-worker` (LocalWorker bundle), the root `Trunk.toml`, the legacy
+Playwright suite (`tests/browser/`), the `graph-renderer-web` nix derivation
+and bevy system libs, and the `just wasm` / `watch-wasm` recipes. `just
+dev-up` and the compose stack now serve the Dioxus app (`app-web`)
+unconditionally; graph-api's embedded-asset fallback is gone (assets always
+come from `--assets-dir` / `JUMP_CANNON_ASSETS_DIR`, renamed from
+`GRAPH_RENDERER_ASSETS_DIR`); browser regression coverage is
+`crates/test-browser`, which waits for the app's `[jump-cannon-ui] boot`
+console marker. The egui implementation lives in git history.
 
 ## Non-goals
 

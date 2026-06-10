@@ -38,7 +38,7 @@ and distributed follow-ups.
 The renderer does **not** speak gRPC to `graph-compute`. The path is:
 
 ```
-graph-renderer (WASM, egui)            has: the lens CHOICE (UI)
+app/ui (WASM, Dioxus)                  has: the lens CHOICE (UI)
       │  WS /graph/layout/stream  (engine params incl. lens config)
       ▼
 graph-api  compute_broker              has: VaultGraph metadata + graph-metrics
@@ -185,12 +185,15 @@ them through.
 
 ---
 
-## 4. Phase B — UI scaffolding (egui)
+## 4. Phase B — UI scaffolding
 
-**Goal:** the mapping panel as a `render_ui(ui, &mut Value)` for the geometric
-engine — the centerpiece. The repo auto-generates **no** settings UI (descriptors
-carry no param metadata), so this is hand-written, matching the existing
-per-layout panels under `graph-renderer/src/ui/layout/algorithms/`.
+**Goal:** the mapping panel as a settings UI for the geometric engine — the
+centerpiece. The repo auto-generates **no** settings UI (descriptors carry no
+param metadata), so this is hand-written, matching the existing per-engine
+sections of the app's Layout panel (`app/ui/src/panels/layout.rs`). (This
+phase was originally written against egui-era files under
+`graph-renderer/src/ui/layout/algorithms/` — egui-era; superseded by app/ui —
+see git history.)
 
 ### B.1 A frontend `LensConfig`
 

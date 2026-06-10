@@ -6,7 +6,7 @@ services:
       GRAPH_API_HOST: 0.0.0.0
       GRAPH_API_NO_BROWSER: '1'
       GRAPH_API_PORT: '8765'
-      GRAPH_RENDERER_ASSETS_DIR: /assets
+      JUMP_CANNON_ASSETS_DIR: /assets
       JUMP_CANNON_COMPUTE_URL: http://graph-compute:50051
       RUST_LOG: info
       VAULT_ROOT: /vault
@@ -16,7 +16,7 @@ services:
     restart: unless-stopped
     volumes:
     - ${VAULT_ROOT:-./vault}:/vault:rw
-    - ${ASSETS_DIR:-./crates/graph-renderer/assets/dist}:/assets:ro
+    - ${ASSETS_DIR:-./app/ui/dist}:/assets:ro
   graph-compute:
     environment:
       GRAPH_COMPUTE_ADDR: '[::]:50051'

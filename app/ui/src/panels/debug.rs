@@ -312,29 +312,25 @@ fn stats_view(graph: Signal<Option<GraphData>>) -> Element {
 
         div { class: "dbg-sep" }
 
-        // FPS ------------------------------------------------------------
-        {chart_block("FPS", fps_stats_label(fps_stats), &fps_pts, "rgb(120,220,120)", false)}
-
-        // Frame time ms ----------------------------------------------------
-        {chart_block("Frame ms", ms_stats_label(frame_stats), &frame_pts, "rgb(255,220,120)", false)}
-
-        // Render cost: CPU side of RenderHost::frame() (encode + submit +
+        // Performance — one overlaid multi-axis chart (the egui overlay
+        // style): every series is normalized to its OWN y-scale so FPS,
+        // millisecond costs, and kinetic energy share the canvas without
+        // dwarfing each other; the legend carries per-series stats + y-max.
+        //
+        // Render cost = CPU side of RenderHost::frame() (encode + submit +
         // present). PARITY GAP: the egui PerfCollector overlaid per-stage
         // CPU timings (StageId begin/end around each frame phase); this
         // single-pass renderer exposes one frame-cost series — finer GPU
         // stage splits need timestamp queries neither app has.
-        {chart_block("Render cost ms", ms_stats_label(cost_stats), &cost_pts, "rgb(120,180,255)", false)}
-
-        div { class: "dbg-sep" }
-
-        // KE history -------------------------------------------------------
-        {chart_block(
-            "max KE",
-            format!("avg {:.2} | p99 {:.2} | max {:.2}", ke_stats.0, ke_stats.1, ke_stats.2),
-            &ke_pts,
-            "rgb(255,120,200)",
-            false,
-        )}
+        div { class: "dbg-grouplabel", "Performance" }
+        {multi_chart(&[
+            ("FPS", "rgb(120,220,120)", fps_stats_label(fps_stats), &fps_pts),
+            ("frame ms", "rgb(255,220,120)", ms_stats_label(frame_stats), &frame_pts),
+            ("render cost ms", "rgb(120,180,255)", ms_stats_label(cost_stats), &cost_pts),
+            ("max KE", "rgb(255,120,200)",
+                format!("avg {:.2} | p99 {:.2} | max {:.2}", ke_stats.0, ke_stats.1, ke_stats.2),
+                &ke_pts),
+        ])}
 
         // Cheatsheet (relocated from sections/stats.rs in the egui app).
         div { class: "dbg-sep" }
@@ -382,44 +378,69 @@ fn reset_everything() {
 
 // --- chart helpers ---------------------------------------------------------------
 
-/// Compact line chart: fixed window of the last [`CHART_WINDOW_SECS`],
-/// y locked to include 0 (the egui plots' `include_y(0.0)`).
-fn chart_block(
-    title: &str,
-    sub: String,
-    points: &[[f64; 2]],
-    color: &'static str,
-    tall: bool,
-) -> Element {
-    let x_max = points.last().map(|p| p[0]).unwrap_or(0.0);
-    let x_min = (x_max - CHART_WINDOW_SECS).max(0.0);
-    let visible: Vec<&[f64; 2]> = points.iter().filter(|p| p[0] >= x_min).collect();
-    let y_max = visible.iter().map(|p| p[1]).fold(0.0_f64, f64::max).max(1e-9);
-    let span = (x_max - x_min).max(1e-9);
-    let pts: String = visible
+/// Overlaid multi-axis line chart: every series is drawn over the same
+/// [`CHART_WINDOW_SECS`] x-window but normalized to its own y-scale
+/// (include-y-0, like the egui plots), so heterogeneous units share one
+/// canvas. The legend below the chart carries each series' swatch, stats
+/// line, and its private y-max so the independent axes stay readable.
+fn multi_chart(series: &[(&str, &'static str, String, &[[f64; 2]])]) -> Element {
+    // Shared x-window across all series (they sample on the same ticker,
+    // but take the global max so a stalled series doesn't freeze the axis).
+    let x_max = series
         .iter()
-        .map(|p| {
-            let x = (p[0] - x_min) / span * 100.0;
-            let y = 100.0 - (p[1] / y_max * 100.0).clamp(0.0, 100.0);
-            format!("{x:.2},{y:.2} ")
+        .filter_map(|(_, _, _, pts)| pts.last().map(|p| p[0]))
+        .fold(0.0_f64, f64::max);
+    let x_min = (x_max - CHART_WINDOW_SECS).max(0.0);
+    let span = (x_max - x_min).max(1e-9);
+
+    let lines: Vec<(String, &'static str)> = series
+        .iter()
+        .map(|(_, color, _, pts)| {
+            let visible: Vec<&[f64; 2]> = pts.iter().filter(|p| p[0] >= x_min).collect();
+            let y_max = visible.iter().map(|p| p[1]).fold(0.0_f64, f64::max).max(1e-9);
+            let line: String = visible
+                .iter()
+                .map(|p| {
+                    let x = (p[0] - x_min) / span * 100.0;
+                    let y = 100.0 - (p[1] / y_max * 100.0).clamp(0.0, 100.0);
+                    format!("{x:.2},{y:.2} ")
+                })
+                .collect();
+            (line, *color)
         })
         .collect();
+    let y_maxes: Vec<f64> = series
+        .iter()
+        .map(|(_, _, _, pts)| {
+            pts.iter().filter(|p| p[0] >= x_min).map(|p| p[1]).fold(0.0_f64, f64::max)
+        })
+        .collect();
+
     rsx! {
-        div { class: "dbg-grouplabel", "{title}" }
-        div { class: "dbg-sub", "{sub}" }
         svg {
-            class: if tall { "dbg-chart tall" } else { "dbg-chart" },
+            class: "dbg-chart tall",
             view_box: "0 0 100 100",
             preserve_aspect_ratio: "none",
-            polyline {
-                points: "{pts}",
-                fill: "none",
-                stroke: "{color}",
-                stroke_width: "1.5",
-                vector_effect: "non-scaling-stroke",
+            for (pts , color) in lines {
+                polyline {
+                    points: "{pts}",
+                    fill: "none",
+                    stroke: "{color}",
+                    stroke_width: "1.2",
+                    vector_effect: "non-scaling-stroke",
+                }
             }
         }
-        div { class: "dbg-chartmax", {format!("y max {:.2}", if visible.is_empty() { 0.0 } else { y_max })} }
+        div { class: "dbg-legend",
+            for (i , (name , color , stats , _)) in series.iter().enumerate() {
+                div { key: "{name}", class: "dbg-legend-row",
+                    span { class: "dbg-swatch", style: "background:{color}" }
+                    span { class: "dbg-legend-name", "{name}" }
+                    span { class: "dbg-legend-stats", "{stats}" }
+                    span { class: "dbg-legend-ymax", { format!("y max {:.2}", y_maxes[i]) } }
+                }
+            }
+        }
     }
 }
 

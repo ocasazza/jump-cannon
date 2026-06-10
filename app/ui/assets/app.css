@@ -390,3 +390,10 @@ input.inst-line:focus { outline:none; border-color:var(--fg); }
   text-overflow:ellipsis; }
 .dbg-stage .dbg-sub { color:#8c8c8c; }
 .dbg-danger-label { color:#ff3b3b; font-size:.7rem; }
+
+/* Debug: multi-axis performance chart legend */
+.dbg-legend { display:flex; flex-direction:column; gap:.12rem; margin-top:.25rem; }
+.dbg-legend-row { display:flex; align-items:center; gap:.45rem; font-size:10.5px; }
+.dbg-legend-name { flex:0 0 7.5rem; color:var(--fg); }
+.dbg-legend-stats { flex:1; color:var(--dim); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.dbg-legend-ymax { color:var(--dim); font-variant-numeric:tabular-nums; flex:0 0 auto; }

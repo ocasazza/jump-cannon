@@ -58,7 +58,9 @@
 //! sees the layout coarsen-to-fine "snap" into place). Once level 0 is reached
 //! the wrapper just forwards to the inner engine forever (continuous refine).
 
-use graph_layouts::{coarsen, prolong, Coarsening, LayoutDescriptor, LayoutKind, LayoutRequirements};
+use graph_layouts::{
+    coarsen, prolong, Coarsening, LayoutDescriptor, LayoutKind, LayoutRequirements,
+};
 use serde::{Deserialize, Serialize};
 
 use super::{construct_leaf, CsrShard, EngineCtx, Fa2BruteEngine, LayoutEngine, StepOutput};
@@ -386,7 +388,12 @@ impl LayoutEngine for MultilevelEngine {
         }
 
         // REUSE the shared coarsening cascade (FM³/sfdp matching contraction).
-        let cascade = coarsen(n, &edges, self.settings.max_levels, self.settings.target_size);
+        let cascade = coarsen(
+            n,
+            &edges,
+            self.settings.max_levels,
+            self.settings.target_size,
+        );
 
         // Seed the coarsest level by folding the caller's finest-level seed up
         // through the parent maps (average of children). This keeps the wrapper

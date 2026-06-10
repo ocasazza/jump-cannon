@@ -1,4 +1,5 @@
-//! Backend mirror of `graph-renderer::ui::progress::ProgressEvent`.
+//! Backend mirror of the frontend's progress sink (app/ui Progress panel;
+//! originally mirrored from the egui renderer).
 //!
 //! Wire shape: `GET /progress?since=<seq>` returns JSON
 //!
@@ -42,18 +43,38 @@ pub enum LogLevel {
     Error,
 }
 
-/// Tagged-union mirror of `graph-renderer::ui::progress::ProgressEvent`.
-/// Field names match the renderer's enum so the frontend can deserialize
-/// straight into the existing sink path.
+/// Tagged-union mirror of the frontend's progress sink event type (app/ui
+/// Progress panel; originally mirrored from the egui renderer). Field names
+/// match the frontend's enum so it can deserialize straight into the
+/// existing sink path.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ProgressEvent {
-    Start { id: TaskId, group: String, label: String },
-    SetProgress { id: TaskId, progress: f32 },
-    UpdateLabel { id: TaskId, label: String },
-    Finish { id: TaskId },
-    Fail { id: TaskId, reason: String },
-    Log { level: LogLevel, group: String, message: String },
+    Start {
+        id: TaskId,
+        group: String,
+        label: String,
+    },
+    SetProgress {
+        id: TaskId,
+        progress: f32,
+    },
+    UpdateLabel {
+        id: TaskId,
+        label: String,
+    },
+    Finish {
+        id: TaskId,
+    },
+    Fail {
+        id: TaskId,
+        reason: String,
+    },
+    Log {
+        level: LogLevel,
+        group: String,
+        message: String,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -136,7 +157,10 @@ impl ProgressLog {
     }
 
     pub fn update_label(&self, id: TaskId, label: impl Into<String>) {
-        self.push(ProgressEvent::UpdateLabel { id, label: label.into() });
+        self.push(ProgressEvent::UpdateLabel {
+            id,
+            label: label.into(),
+        });
     }
 
     pub fn finish(&self, id: TaskId) {
@@ -144,7 +168,10 @@ impl ProgressLog {
     }
 
     pub fn fail(&self, id: TaskId, reason: impl Into<String>) {
-        self.push(ProgressEvent::Fail { id, reason: reason.into() });
+        self.push(ProgressEvent::Fail {
+            id,
+            reason: reason.into(),
+        });
     }
 
     pub fn info(&self, group: impl Into<String>, message: impl Into<String>) {

@@ -6,8 +6,8 @@
 // Future: when backend lives on luna, these endpoints stay binary; the wire
 // cost (and parse cost) is ~10x lower than JSON.
 
-use vault_data::VaultGraph;
 use std::collections::HashMap;
+use vault_data::VaultGraph;
 
 /// Flat [x0, y0, x1, y1, ...] little-endian f32 buffer.
 pub fn positions_buffer(graph: &VaultGraph) -> Vec<u8> {
@@ -46,15 +46,15 @@ pub fn metric_buffer(graph: &VaultGraph, name: &str) -> Option<Vec<u8>> {
     let mut out = Vec::with_capacity(graph.nodes.len() * 4);
     for node in graph.nodes.values() {
         let v: f32 = match name {
-            "degree"      => node.metrics.degree as f32,
-            "indegree"    => node.metrics.indegree as f32,
-            "outdegree"   => node.metrics.outdegree as f32,
-            "pagerank"    => node.metrics.pagerank as f32,
+            "degree" => node.metrics.degree as f32,
+            "indegree" => node.metrics.indegree as f32,
+            "outdegree" => node.metrics.outdegree as f32,
+            "pagerank" => node.metrics.pagerank as f32,
             "betweenness" => node.metrics.betweenness as f32,
-            "kcore"       => node.metrics.kcore as f32,
-            "community"   => node.metrics.community as f32,
-            "wcc"         => node.metrics.wcc as f32,
-            "tag"         => primary_tag_bucket(&node.meta.tags),
+            "kcore" => node.metrics.kcore as f32,
+            "community" => node.metrics.community as f32,
+            "wcc" => node.metrics.wcc as f32,
+            "tag" => primary_tag_bucket(&node.meta.tags),
             _ => return None,
         };
         out.extend_from_slice(&v.to_le_bytes());
@@ -69,7 +69,9 @@ pub fn metric_buffer(graph: &VaultGraph, name: &str) -> Option<Vec<u8>> {
 fn primary_tag_bucket(tags: &[String]) -> f32 {
     let mut sorted: Vec<&str> = tags.iter().map(|s| s.as_str()).collect();
     sorted.sort_unstable();
-    let Some(primary) = sorted.first() else { return 0.0 };
+    let Some(primary) = sorted.first() else {
+        return 0.0;
+    };
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
     let mut h = DefaultHasher::new();

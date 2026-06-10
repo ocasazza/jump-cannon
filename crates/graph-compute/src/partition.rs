@@ -131,12 +131,16 @@ impl Partition {
                     positions.push(owned_positions[base + 2]);
 
                     // Slice attributes for this boundary node
-                    if let (Some(la), Some(ba)) = (self.attributes.as_ref(), boundary_attributes.as_mut()) {
+                    if let (Some(la), Some(ba)) =
+                        (self.attributes.as_ref(), boundary_attributes.as_mut())
+                    {
                         if let Some(v) = &la.node_class {
                             ba.node_class.get_or_insert_with(Vec::new).push(v[idx]);
                         }
                         if let Some(v) = &la.node_coordination {
-                            ba.node_coordination.get_or_insert_with(Vec::new).push(v[idx]);
+                            ba.node_coordination
+                                .get_or_insert_with(Vec::new)
+                                .push(v[idx]);
                         }
                         if let Some(v) = &la.node_mass {
                             ba.node_mass.get_or_insert_with(Vec::new).push(v[idx]);
@@ -254,11 +258,7 @@ fn assign_owners_bfs(graph: &CsrGraph, p: u32) -> Vec<u32> {
 
     for pid in 0..p {
         // Last partition takes whatever remains (handles rounding).
-        let cap = if pid + 1 == p {
-            usize::MAX
-        } else {
-            target
-        };
+        let cap = if pid + 1 == p { usize::MAX } else { target };
         let mut count = 0usize;
         let mut queue: VecDeque<usize> = VecDeque::new();
 
@@ -383,7 +383,11 @@ fn build_partition(
                             // Find the original edge index in the global neighbors list
                             // This is slightly inefficient but correct.
                             // Better would be to track it during neighbor iteration.
-                            let global_edge_idx = start + graph.neighbors[start..end].iter().position(|&nb| nb == u).unwrap();
+                            let global_edge_idx = start
+                                + graph.neighbors[start..end]
+                                    .iter()
+                                    .position(|&nb| nb == u)
+                                    .unwrap();
                             local_edge_len.push(v[global_edge_idx]);
                         }
                     }
@@ -692,14 +696,31 @@ impl HaloDelta {
     /// Encode the bulk arrays and optional attributes to proto wire form.
     pub fn encode_proto(&self) -> crate::proto::HaloDelta {
         let (node_ids, positions) = self.encode_bytes();
-        let attributes = self.attributes.as_ref().map(|ga| {
-            crate::proto::GraphAttributes {
-                node_class: ga.node_class.as_ref().map(|v| bytemuck::cast_slice::<u32, u8>(v).to_vec()).unwrap_or_default(),
-                node_coordination: ga.node_coordination.as_ref().map(|v| bytemuck::cast_slice::<u32, u8>(v).to_vec()).unwrap_or_default(),
-                node_mass: ga.node_mass.as_ref().map(|v| bytemuck::cast_slice::<f32, u8>(v).to_vec()).unwrap_or_default(),
-                edge_len: ga.edge_len.as_ref().map(|v| bytemuck::cast_slice::<f32, u8>(v).to_vec()).unwrap_or_default(),
-            }
-        });
+        let attributes = self
+            .attributes
+            .as_ref()
+            .map(|ga| crate::proto::GraphAttributes {
+                node_class: ga
+                    .node_class
+                    .as_ref()
+                    .map(|v| bytemuck::cast_slice::<u32, u8>(v).to_vec())
+                    .unwrap_or_default(),
+                node_coordination: ga
+                    .node_coordination
+                    .as_ref()
+                    .map(|v| bytemuck::cast_slice::<u32, u8>(v).to_vec())
+                    .unwrap_or_default(),
+                node_mass: ga
+                    .node_mass
+                    .as_ref()
+                    .map(|v| bytemuck::cast_slice::<f32, u8>(v).to_vec())
+                    .unwrap_or_default(),
+                edge_len: ga
+                    .edge_len
+                    .as_ref()
+                    .map(|v| bytemuck::cast_slice::<f32, u8>(v).to_vec())
+                    .unwrap_or_default(),
+            });
         crate::proto::HaloDelta {
             frame: self.frame,
             owner_id: self.owner_id,
@@ -756,7 +777,8 @@ impl HaloDelta {
                 ga.node_class = Some(bytemuck::cast_slice::<u8, u32>(&pa.node_class).to_vec());
             }
             if !pa.node_coordination.is_empty() {
-                ga.node_coordination = Some(bytemuck::cast_slice::<u8, u32>(&pa.node_coordination).to_vec());
+                ga.node_coordination =
+                    Some(bytemuck::cast_slice::<u8, u32>(&pa.node_coordination).to_vec());
             }
             if !pa.node_mass.is_empty() {
                 ga.node_mass = Some(bytemuck::cast_slice::<u8, f32>(&pa.node_mass).to_vec());
@@ -830,7 +852,11 @@ impl HaloTransport for LocalTransport {
     fn collect(&mut self, frame: u64) -> Vec<HaloDelta> {
         self.inbox
             .remove(&frame)
-            .map(|v| v.into_iter().filter(|d| d.owner_id != self.self_id).collect())
+            .map(|v| {
+                v.into_iter()
+                    .filter(|d| d.owner_id != self.self_id)
+                    .collect()
+            })
             .unwrap_or_default()
     }
 }
@@ -892,8 +918,7 @@ impl TonicHaloTransport {
         <T::ResponseBody as tonic::codegen::Body>::Error: Into<tonic::codegen::StdError> + Send,
         T::Future: Send,
     {
-        let (out_tx, out_rx) =
-            tokio::sync::mpsc::unbounded_channel::<crate::proto::HaloDelta>();
+        let (out_tx, out_rx) = tokio::sync::mpsc::unbounded_channel::<crate::proto::HaloDelta>();
         let (in_tx, in_rx) = tokio::sync::mpsc::unbounded_channel::<HaloDelta>();
 
         // Driver task: own the bidi stream. Forward outbound deltas to the peer
@@ -966,7 +991,10 @@ impl HaloTransport for TonicHaloTransport {
         // Hand out anything already buffered for this frame first.
         if let Some(v) = self.pending.remove(&frame) {
             if !v.is_empty() {
-                return v.into_iter().filter(|d| d.owner_id != self.self_id).collect();
+                return v
+                    .into_iter()
+                    .filter(|d| d.owner_id != self.self_id)
+                    .collect();
             }
         }
         // Block the BSP thread until the peer's reply(ies) for `frame` arrive,
@@ -1356,9 +1384,7 @@ mod tests {
 
         // Sanity: at least one partition has interior (non-boundary) owned nodes.
         assert!(
-            parts
-                .iter()
-                .any(|p| (p.boundary.len() as u32) < p.n_owned),
+            parts.iter().any(|p| (p.boundary.len() as u32) < p.n_owned),
             "test graph must have interior owned nodes to be meaningful"
         );
 
@@ -1472,8 +1498,7 @@ mod tests {
         for w in &workers {
             let ghosts: std::collections::HashSet<u32> =
                 w.partition.ghost_global_ids().iter().copied().collect();
-            let got: std::collections::HashSet<u32> =
-                w.engine.received.keys().copied().collect();
+            let got: std::collections::HashSet<u32> = w.engine.received.keys().copied().collect();
             assert_eq!(
                 got, ghosts,
                 "part {} received halo ids != its ghost set",

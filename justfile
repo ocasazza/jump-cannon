@@ -8,14 +8,6 @@ set positional-arguments
 default:
     @just --list
 
-# Build the trunk-managed Rust+egui+wgpu frontend.
-wasm:
-    trunk build --release
-
-# Watch + auto-rebuild on Rust source changes.
-watch-wasm:
-    trunk watch
-
 #
 # Dioxus + Tauri desktop app (the app/ workspace). The shell is a pure
 # webview container — start the backend separately (`just dev-up`) and the
@@ -56,11 +48,10 @@ app-proto:
 # sets the broker's INITIAL pick; switch live from the UI's "Remote engine"
 # picker. On a host with no usable GPU adapter the GPU engines fail init — use
 # `cpu` there.
-# All-in-one dev stack + hot-reload; backend = gpu (default) | cpu;
-# frontend = egui (default, crates/graph-renderer) | app (Dioxus, app/ui —
-# served by graph-api at :8765 in the browser, and what `just app-dev`'s
-# Tauri shell connects to).
-dev-up backend="gpu" frontend="egui":
+# All-in-one dev stack + hot-reload; backend = gpu (default) | cpu.
+# The frontend is the Dioxus app (app/ui) — served by graph-api at :8765
+# in the browser, and what `just app-dev`'s Tauri shell connects to.
+dev-up backend="gpu":
     #!/usr/bin/env bash
     set -euo pipefail
 
@@ -75,16 +66,9 @@ dev-up backend="gpu" frontend="egui":
     esac
     echo "→ compute backend: {{backend}} (engine: $COMPUTE_ENGINE)"
 
-    # ---- Stage 0b: resolve the frontend ----
-    case "{{frontend}}" in
-      egui) TRUNK_DIR="."   ; ASSETS="crates/graph-renderer/assets/dist" ;;
-      app)  TRUNK_DIR="app" ; ASSETS="app/ui/dist" ;;
-      *)
-        echo "dev-up: unknown frontend '{{frontend}}' (expected 'egui' or 'app')" >&2
-        exit 2
-        ;;
-    esac
-    echo "→ frontend: {{frontend}} (dist: $ASSETS)"
+    TRUNK_DIR="app"
+    ASSETS="app/ui/dist"
+    echo "→ frontend: app (Dioxus, dist: $ASSETS)"
 
     # ---- Stage 1: WASM bundle, always built ----
     # The trunk dist is what graph-api serves at `/`. The previous
@@ -176,9 +160,11 @@ dev-up backend="gpu" frontend="egui":
 dev-down:
     nix run .#dev-down
 
-# Run the production binary (embedded assets, no watch).
+# Run the production binary (no watch). Assets are no longer embedded in
+# the binary — build the app dist first and serve it via --assets-dir.
 run:
-    cargo run --release -p graph-api
+    cd app && trunk build --release
+    cargo run --release -p graph-api -- --assets-dir app/ui/dist
 
 # Build everything in release mode.
 build:
@@ -186,22 +172,19 @@ build:
 
 # Run tests. `just test` runs everything; pass a target for one layer.
 # An optional ARG parameterizes targets that take a knob:
-#   just test                # all (cargo + browser smoke + regression e2e)
+#   just test                # all (cargo + Rust browser smoke)
 #   just test cargo          # native unit + integration tests (incl. regression.rs + fuzz.rs at default volume)
 #   just test fuzz [N]       # property-based fuzz, N cases per layout (default 10000)
 #   just test bench          # criterion benches across layouts; HTML in target/criterion/
 #   just test canary [URL]   # live-cluster gRPC smoke (default URL: http://[::1]:50051)
 #   just test geometric      # geometric engine: solved-case canary + regression golden + perf
 #   just test geometric-golden # regenerate the geometric regression golden (intentional baseline bump)
-#   just test browser        # Playwright canvas-not-black smoke
-#   just test regression     # Playwright UI regression suite
-#   just test perf           # headless perf gate (synth vault)
-#   just test profile        # diagnostic profiler (3-phase flame trace)
+#   just test browser-rust   # Rust-driven browser smoke (crates/test-browser via CDP)
 test target='all' arg='':
     #!/usr/bin/env bash
     set -euo pipefail
     case "{{target}}" in
-      all)        just test cargo && just test browser && just test regression ;;
+      all)        just test cargo && just test browser-rust ;;
       cargo)      cargo test --workspace ;;
       fuzz)       PROPTEST_CASES="${ARG:-{{arg}}}"; PROPTEST_CASES="${PROPTEST_CASES:-10000}" \
                   cargo test -p graph-layouts --test fuzz --release ;;
@@ -212,12 +195,8 @@ test target='all' arg='':
       geometric)  cargo test -p graph-compute --test geometric_solver -- --nocapture ;;
       geometric-golden) UPDATE_GEOMETRIC_GOLDEN=1 \
                   cargo test -p graph-compute --test geometric_solver regression_golden_master -- --nocapture ;;
-      browser)    just _test-browser ;;
       browser-rust) just _test-browser-rust ;;
-      regression) just _test-regression ;;
-      perf)       just _test-perf ;;
-      profile)    just _test-profile ;;
-      *) echo "unknown test target: {{target}} (try: cargo, fuzz, bench, canary, geometric, geometric-golden, browser, browser-rust, regression, perf, profile)" >&2; exit 1 ;;
+      *) echo "unknown test target: {{target}} (try: cargo, fuzz, bench, canary, geometric, geometric-golden, browser-rust)" >&2; exit 1 ;;
     esac
 
 # Format the workspace.
@@ -243,94 +222,15 @@ kill:
 
 # Nuke the trunk dist to force a full rebuild.
 clean-wasm:
-    rm -rf crates/graph-renderer/assets/dist
+    rm -rf app/ui/dist
 
-# Headless browser test. Spins up graph-api against a tiny test vault, opens
-# it in Chromium with WebGPU enabled, screenshots the canvas, asserts it
-# isn't all-black + no console errors. Output:
-# tests/browser/out/screenshot.png and a JSON result on stdout.
-# Exit 0 = ok, 1 = canvas dark / page error / startup timeout.
-_test-browser: wasm
-    @# Build graph-api binary if missing
-    cargo build --release -p graph-api
-    @# Tiny synthetic vault with three cross-linked notes
-    @mkdir -p /tmp/test-vault
-    @if [ ! -f /tmp/test-vault/Alpha.md ]; then \
-        printf 'See [[Beta]] and [[Gamma]].\n' > /tmp/test-vault/Alpha.md; \
-        printf '[[Alpha]]\n' > /tmp/test-vault/Beta.md; \
-        printf '[[Alpha]] [[Beta]]\n' > /tmp/test-vault/Gamma.md; \
-    fi
-    @# One-time playwright install. PLAYWRIGHT_BROWSERS_PATH (set in the
-    @# nix devshell) points at the nix-provided Chromium bundle, so the
-    @# install is just the npm package — no browser download.
-    @if [ ! -d tests/browser/node_modules ]; then \
-        echo "→ installing playwright npm package (one-time)…"; \
-        cd tests/browser && npm install --silent --no-audit --no-fund; \
-    fi
-    cd tests/browser && node run.mjs
-
-# Rust-driven browser smoke test (foundation). Sibling to _test-browser
-# but the harness is a Rust binary (crates/test-browser) driving chromium
-# via CDP. The legacy Playwright suite is kept as a fallback while the
-# Rust assertion set grows. Output: target/test-browser-rust/{boot.png,
-# report.json}.
-_test-browser-rust: wasm
+# Rust-driven browser smoke test: a Rust binary (crates/test-browser)
+# drives headless chromium via CDP against the Dioxus app. No local trunk
+# build needed — the flake wrapper serves the nix-built app-web dist by
+# default (override with ASSETS_DIR=...). Output:
+# target/test-browser-rust/{boot.png, report.json}.
+_test-browser-rust:
     nix run .#test-browser-rust
-
-# Headless browser REGRESSION suite. Sibling to `test-browser`; shares
-# the same boot scaffolding (factored into tests/browser/harness.mjs)
-# but runs a handful of named UI regression checks instead of a single
-# canvas-bright smoke. Output: tests/browser/out/regression-*.png + a
-# JSON line on stdout. Exit 0 = ok, 1 = regression fired.
-_test-regression: wasm
-    cargo build --release -p graph-api
-    @mkdir -p /tmp/test-vault
-    @if [ ! -f /tmp/test-vault/Alpha.md ]; then \
-        printf 'See [[Beta]] and [[Gamma]].\n' > /tmp/test-vault/Alpha.md; \
-        printf '[[Alpha]]\n' > /tmp/test-vault/Beta.md; \
-        printf '[[Alpha]] [[Beta]]\n' > /tmp/test-vault/Gamma.md; \
-    fi
-    @if [ ! -d tests/browser/node_modules ]; then \
-        echo "→ installing playwright npm package (one-time)…"; \
-        cd tests/browser && npm install --silent --no-audit --no-fund; \
-    fi
-    cd tests/browser && node regression.mjs
-
-# Headless browser PROFILER. Same setup as test-browser but instead of a
-# pass/fail screenshot check it captures rAF frame timings + a V8 CPU
-# profile (.cpuprofile) per phase (idle / palette-open / fit-camera).
-# Output: tests/browser/out/profile-*.{png,cpuprofile} + a JSON summary
-# on stdout (avg FPS, p50/p95/p99 frame time, jank pct, top-12 hot fns).
-# Drop the .cpuprofile into Chrome DevTools → Performance for a flame chart.
-_test-profile: wasm
-    cargo build --release -p graph-api
-    @mkdir -p /tmp/test-vault
-    @if [ ! -f /tmp/test-vault/Alpha.md ]; then \
-        printf 'See [[Beta]] and [[Gamma]].\n' > /tmp/test-vault/Alpha.md; \
-        printf '[[Alpha]]\n' > /tmp/test-vault/Beta.md; \
-        printf '[[Alpha]] [[Beta]]\n' > /tmp/test-vault/Gamma.md; \
-    fi
-    @if [ ! -d tests/browser/node_modules ]; then \
-        echo "→ installing playwright npm package (one-time)…"; \
-        cd tests/browser && npm install --silent --no-audit --no-fund; \
-    fi
-    cd tests/browser && node profile.mjs
-
-# Headless perf gate. Defaults to a synth 1000-node vault — that's our
-# defended floor (gates against regression below 60 fps / 25ms p99).
-# For stress measurements at higher node counts, set PERF_VAULT_NODES
-# manually; expect the gate to fail above ~3000 nodes until further
-# render-side optimization lands. Tunables (env): PERF_VAULT_NODES (1000),
-# PERF_MIN_FPS (50), PERF_MAX_P99_MS (25), PERF_MAX_JANK_PCT (5).
-# Side effect: writes tests/browser/out/perf-idle.flame.txt — an
-# AI-readable text flame graph of where time went.
-_test-perf: wasm
-    cargo build --release -p graph-api
-    @if [ ! -d tests/browser/node_modules ]; then \
-        echo "→ installing playwright npm package (one-time)…"; \
-        cd tests/browser && npm install --silent --no-audit --no-fund; \
-    fi
-    cd tests/browser && node perf.mjs
 
 # Manage the graph-compute cluster. WHERE picks the backend.
 #   just cluster up [local|sky]      # default: local (podman) — also auto-renders configs
