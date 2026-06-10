@@ -9,10 +9,12 @@ target = "ui/index.html"
 dist = "ui/dist"
 
 # Watch the path dependencies too — trunk's default only covers the bin
-# crate's directory, so panel-kit / graph-layouts edits otherwise never
-# trigger a rebuild and the dev server serves stale wasm.
+# crate's directory, so graph-layouts edits otherwise never trigger a
+# rebuild and the dev server serves stale wasm. (panel-kit is a git
+# dependency now; when developing it locally via [patch], add its checkout
+# here too.)
 [watch]
-watch = ["ui", "panel-kit", "../crates/graph-layouts"]
+watch = ["ui", "../crates/graph-layouts"]
 
 [serve]
 port = 8081

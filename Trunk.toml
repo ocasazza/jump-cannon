@@ -1,9 +1,0 @@
-[build]
-target = "crates/graph-renderer/assets/index.html"
-dist = "crates/graph-renderer/assets/dist"
-filehash = false
-# graph-api serves index at "/" and other assets at "/assets/*path".
-# Make the trunk-injected <script> / <link> point at the same prefix.
-public_url = "/assets/"
-
-

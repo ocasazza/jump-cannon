@@ -1,15 +1,18 @@
 # Cargo workspace for the Dioxus + Tauri full-stack app:
-#   panel-kit  — generic, app-agnostic panel/dock workspace library (shared
-#                with apple-notes-ocr-flow; designed to be consumed as a git
-#                dependency from other repos)
 #   ui         — jump-cannon's Dioxus frontend (talks HTTP to graph-api)
 #   src-tauri  — Tauri v2 shell (pure webview container, no IPC commands)
+#
+# The panel-workspace library lives in its own repo now —
+# https://github.com/ocasazza/panel-kit — consumed as a git dependency and
+# shared with apple-notes-ocr-flow. Develop against a local checkout with:
+#   [patch."https://github.com/ocasazza/panel-kit"]
+#   panel-kit = { path = "../../panel-kit" }
 #
 # Deliberately a *separate* workspace from the repo root: the main workspace
 # builds through nix + crane and must not absorb the Tauri/Dioxus dependency
 # tree.
 [workspace]
-members = ["panel-kit", "ui", "src-tauri"]
+members = ["ui", "src-tauri"]
 resolver = "2"
 
 [workspace.package]

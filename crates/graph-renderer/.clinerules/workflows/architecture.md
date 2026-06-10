@@ -1,3 +1,0 @@
-When starting a task, read the entire contents of `./docs/architecture.md` to understand more about the current project.
-
-When completing a task, please update `./docs/architecture.md` to accomidate any changes that were made to the project as part of the task that was completed. Before adding these changes please propose the changes to the user in 'plan mode' and prompt the user for confirmation that the proposed changes are correct.
