@@ -1,0 +1,25 @@
+[package]
+name = "jump-cannon-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Jump Cannon — vault graph workspace (Dioxus + Tauri shell)"
+
+[lib]
+# Tauri v2 mobile requires the app entrypoint in a lib so iOS/Android can call it.
+name = "jump_cannon_app_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-shell = "2"
+tauri-plugin-http = "2"        # lets the webview reach a LAN/Tailscale graph-api host
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[features]
+# Used by `tauri dev` to enable devtools etc.
+custom-protocol = ["tauri/custom-protocol"]

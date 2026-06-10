@@ -13,6 +13,9 @@ dist
 # Rebuilt locally via `just wasm` (or `trunk build`).
 crates/graph-renderer/assets/dist/
 
+# Tauri-generated permission schemas (app/ Dioxus+Tauri workspace).
+app/src-tauri/gen/
+
 # Beads / Dolt files (added by bd init)
 .dolt/
 *.db

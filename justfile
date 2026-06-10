@@ -17,6 +17,25 @@ watch-wasm:
     trunk watch
 
 #
+# Dioxus + Tauri desktop app (the app/ workspace). The shell is a pure
+# webview container — start the backend separately (`just dev-up`) and the
+# app connects to graph-api over HTTP (default http://127.0.0.1:8765,
+# configurable in its Settings panel).
+
+# Run the desktop app with hot-reload (trunk serve behind tauri dev).
+app-dev:
+    cd app && cargo tauri dev
+
+# Build the release bundle (.dmg / .AppImage / .msi per platform).
+app-build:
+    cd app && cargo tauri build
+
+# Type-check the app workspace: WASM frontend + native Tauri shell.
+app-check:
+    cd app && cargo check --target wasm32-unknown-unknown -p panel-kit -p jump-cannon-ui
+    cd app && cargo check -p jump-cannon-app
+
+#
 # Internals: backgrounds `nix run .#dev-up` (native binary on darwin,
 # podman+compose on linux) for the distributed compute backend, then runs
 # the API server with cargo-watch in the foreground. Ctrl-C tears down both

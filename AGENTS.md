@@ -4,7 +4,12 @@ This file provides guidance to AI coding agents (Claude Code, Copilot, Cursor, e
 
 ## Hard repo rule: Rust everywhere
 
-The frontend is **Rust + wgpu + egui** compiled to WebAssembly. The backend is **Rust + axum**. No JavaScript, no TypeScript, no React, no Vue, no DOM frameworks, no virtual DOM. The single allowed JS shim is `crates/graph-renderer/assets/main.js`, which **must stay under 50 lines** and do exactly one thing: load the WASM module and hand control to Rust. No DOM manipulation, no event handlers, no fetch helpers, no protobuf decoding, no UI state.
+Every surface is Rust. The backend is **Rust + axum**. There are two frontend stacks during the Dioxus migration (see "Dioxus + Tauri app" below):
+
+- `app/` — **Rust + Dioxus** compiled to WASM, shipped in a **Tauri v2** shell. This is the successor full-stack frontend.
+- `crates/graph-renderer` — the original **Rust + wgpu + egui** WASM frontend; stays until the wgpu graph canvas is ported into the Dioxus app.
+
+No hand-written JavaScript, no TypeScript, no React/Vue, no JS bundlers. The single allowed JS shim is `crates/graph-renderer/assets/main.js`, which **must stay under 50 lines** and do exactly one thing: load the WASM module and hand control to Rust. No DOM manipulation, no event handlers, no fetch helpers, no protobuf decoding, no UI state.
 
 If you're tempted to "just add a quick JS function" — stop. Add it in Rust. The egui surface in `graph-renderer/src/ui/` is where UI goes; `graph-renderer/src/web.rs` is where browser-side event hooks live.
 
@@ -25,6 +30,20 @@ The test harness under `tests/browser/*.mjs` and `crates/test-browser/` is the o
 | `crates/jump-io` | Platform-agnostic input layer: semantic actions, rebindable triggers, per-device sensitivity. Decouples "what should happen" (e.g. `Pan`, `Zoom`, `Select`) from raw mouse/keyboard/touch events. Consumed by graph-renderer. |
 | `crates/tvix-wasm` | `tvix-eval` bridge — native + WASM Nix expression evaluator. Enables Nix expressions in the UI/data pipeline without shelling out. |
 | `crates/test-browser` | Rust-only Chromium driver (chromiumoxide) for the foundational browser regression suite. Spawned by `just test browser-rust` / `nix run .#test-browser-rust`. |
+
+## Dioxus + Tauri app (`app/`)
+
+The full-stack frontend migration target, modeled 1:1 on `apple-notes-ocr-flow`. A **separate Cargo workspace** (`app/Cargo.toml`) so the main nix + crane workspace never absorbs the Tauri/Dioxus dependency tree:
+
+| Crate | Role |
+|---|---|
+| `app/panel-kit` | **Generic, app-agnostic** panel-workspace library: floating/tiling panels, macOS traffic lights, drag/resize, minimize-to-dock, localStorage layout persistence, base CSS theme (`panel_kit::CSS`). Factored out of apple-notes-ocr-flow's UI; designed to be consumed by that repo as a git dependency so both apps share one component/styling library. Apps implement `panel_kit::PanelKind` on an enum and call `use_workspace` + `ws.render(body_fn)`. |
+| `app/ui` | jump-cannon's Dioxus 0.6 frontend (trunk-built WASM, port 8081). Panels: Graph (Canvas2D pan/zoom/click-select view of the vault graph), Nodes, Search, Inspector, Document (editor → `PUT /vault/page`), Progress (polls `/progress`), Settings, Help. Talks to graph-api with the same three wire formats the egui renderer uses: JSON, protobuf (prost over the shared `crates/graph-api/proto/graph.proto`, generated at build time — needs protoc from the devshell), and raw LE f32/u32 buffers. |
+| `app/src-tauri` | Tauri v2 shell. Pure webview container — **no IPC commands**; the frontend reaches graph-api over HTTP (`tauri-plugin-http` allows LAN/Tailscale hosts). Lib+main split for iOS/Android entrypoints. |
+
+Workflow: `just dev-up` (backend) + `just app-dev` (desktop app, hot-reload). `just app-check` type-checks both targets; `just app-build` makes release bundles. Default server URL is `http://127.0.0.1:8765` (the compose port), changeable in the Settings panel and persisted to localStorage.
+
+Scope rule: the compute layer (`graph-compute`, gRPC broker, Sky-Pilot orchestration) is **not** part of this app — it stays behind graph-api's interfaces. Planned follow-ups: port the wgpu graph pipeline from `crates/graph-renderer` into a canvas in `app/ui` (Canvas2D is the interim renderer), then retire the egui frontend; publish `panel-kit` for apple-notes-ocr-flow to consume.
 
 ## Data flow
 

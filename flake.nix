@@ -646,6 +646,9 @@
             wasm-bindgen-cli
             trunk
 
+            # Dioxus + Tauri app (app/ workspace): `just app-dev` / `just app-build`
+            cargo-tauri
+
             # Build tools
             pkg-config
             protobuf

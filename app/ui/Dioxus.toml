@@ -1,0 +1,9 @@
+[application]
+name = "jump-cannon-ui"
+default_platform = "web"
+
+[web.app]
+title = "Jump Cannon"
+
+[web.watcher]
+watch_path = ["src", "assets", "../panel-kit/src", "../panel-kit/assets"]

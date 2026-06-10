@@ -1,0 +1,33 @@
+[package]
+name = "jump-cannon-ui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+# Dioxus 0.6 — all-Rust UI, compiled to WASM and rendered in Tauri's webview.
+dioxus = { workspace = true }
+panel-kit = { path = "../panel-kit" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+# WASM-side HTTP to graph-api (the frontend always runs in a webview).
+gloo-net = { version = "0.6", features = ["http"] }
+gloo-storage = { workspace = true }   # persist the server URL + layout between sessions
+gloo-timers = { version = "0.3", features = ["futures"] }  # pollers + redraw ticker
+wasm-bindgen = { workspace = true }
+wasm-bindgen-futures = "0.4"
+# graph-api's structured endpoints speak protobuf (same schema as the server).
+prost = "0.13"
+urlencoding = "2"
+pulldown-cmark = { version = "0.12", default-features = false, features = ["html"] }
+web-sys = { workspace = true, features = [
+    "Window", "Document", "Element", "Event", "EventTarget",
+    "HtmlCanvasElement", "CanvasRenderingContext2d",
+] }
+tracing = "0.1"
+tracing-wasm = "0.2"
+
+[build-dependencies]
+# Single schema lives in crates/graph-api/proto/graph.proto — prost-build
+# emits the matching Rust here at build time (protoc comes from the devshell).
+prost-build = "0.13"
