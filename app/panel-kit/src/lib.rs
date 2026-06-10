@@ -122,21 +122,28 @@ fn front_z<K>(ps: &[PanelWin<K>]) -> i32 {
     ps.iter().map(|p| p.z).max().unwrap_or(0) + 1
 }
 
-/// Keep every floating panel inside the workspace: shrink it if it's larger
-/// than the viewport, then pull its position back so the whole panel stays
-/// on-screen (e.g. a layout saved on a wider screen).
-fn clamp_to_viewport<K>(panels: &mut [PanelWin<K>]) {
+fn viewport_size() -> (f64, f64) {
     let win = web_sys::window();
     let vw = win.as_ref().and_then(|w| w.inner_width().ok()).and_then(|v| v.as_f64()).unwrap_or(1280.0);
     let vh = win.and_then(|w| w.inner_height().ok()).and_then(|v| v.as_f64()).unwrap_or(800.0);
+    (vw, vh)
+}
+
+/// The on-screen geometry for a floating panel: shrunk if larger than the
+/// viewport, pulled back so the whole panel stays visible.
+///
+/// This is a render-time projection — the stored `PanelWin` keeps the
+/// user's intended geometry untouched. Mutating state here instead (the
+/// original behavior) made clamping one-way: shrink the window once and
+/// every panel stayed crushed after the window grew back.
+fn effective_rect<K>(p: &PanelWin<K>, vw: f64, vh: f64) -> (f64, f64, f64, f64) {
     let ws_w = (vw - 4.0).max(220.0);
     let ws_h = (vh - 66.0).max(180.0); // minus topbar (~36) + dock (~30)
-    for p in panels.iter_mut() {
-        p.w = p.w.min(ws_w - 12.0).max(180.0);
-        p.h = p.h.min(ws_h - 12.0).max(110.0);
-        p.x = p.x.min(ws_w - p.w - 6.0).max(0.0);
-        p.y = p.y.min(ws_h - p.h - 6.0).max(0.0);
-    }
+    let w = p.w.min(ws_w - 12.0).max(180.0);
+    let h = p.h.min(ws_h - 12.0).max(110.0);
+    let x = p.x.min(ws_w - w - 6.0).max(0.0);
+    let y = p.y.min(ws_h - h - 6.0).max(0.0);
+    (x, y, w, h)
 }
 
 /// Narrow viewport -> mobile shell (static stacked tiling instead of the
@@ -196,6 +203,9 @@ pub struct Workspace<K: PanelKind> {
     /// panel while set live-shuffles the dragged panel into that slot.
     pub tile_drag: Signal<Option<K>>,
     pub is_mobile: Signal<bool>,
+    /// Live window size — render() subscribes so floating panels re-project
+    /// through [`effective_rect`] on every resize (both directions).
+    pub viewport: Signal<(f64, f64)>,
 }
 
 impl<K: PanelKind> Clone for Workspace<K> {
@@ -213,26 +223,23 @@ pub fn use_workspace<K: PanelKind>(
     defaults: fn() -> Vec<PanelWin<K>>,
 ) -> Workspace<K> {
     let saved = load_layout(storage_key, &defaults());
-    let panels = use_signal(|| {
-        let mut p = saved.as_ref().map(|(p, _)| p.clone()).unwrap_or_else(defaults);
-        clamp_to_viewport(&mut p);
-        p
-    });
+    let panels =
+        use_signal(|| saved.as_ref().map(|(p, _)| p.clone()).unwrap_or_else(defaults));
     let mode = use_signal(|| saved.as_ref().map(|(_, m)| *m).unwrap_or(Mode::Floating));
     let drag = use_signal(|| Option::<Drag>::None);
     let tile_drag = use_signal(|| Option::<K>::None);
     let is_mobile = use_signal(viewport_is_mobile);
+    let viewport = use_signal(viewport_size);
 
     use_hook(|| {
         use wasm_bindgen::closure::Closure;
         use wasm_bindgen::JsCast;
-        let mut panels = panels;
+        let mut viewport = viewport;
         let mut is_mobile = is_mobile;
         let cb = Closure::wrap(Box::new(move |_e: web_sys::Event| {
-            {
-                let mut ps = panels.write();
-                clamp_to_viewport(&mut ps);
-            }
+            // Stored panel geometry is never touched on resize — render()
+            // re-projects it through effective_rect from this signal.
+            viewport.set(viewport_size());
             is_mobile.set(viewport_is_mobile());
         }) as Box<dyn FnMut(web_sys::Event)>);
         if let Some(w) = web_sys::window() {
@@ -250,7 +257,7 @@ pub fn use_workspace<K: PanelKind>(
         }
     });
 
-    Workspace { panels, mode, drag, tile_drag, is_mobile }
+    Workspace { panels, mode, drag, tile_drag, is_mobile, viewport }
 }
 
 impl<K: PanelKind> Workspace<K> {
@@ -276,7 +283,19 @@ impl<K: PanelKind> Workspace<K> {
     /// Start a move/resize drag from a mousedown, capturing panel geometry.
     pub fn begin_drag(&self, idx: usize, kind: DragKind, e: &MouseEvent) {
         let c = e.client_coordinates();
-        let p = self.panels.read()[idx];
+        // Normalize-on-grab: what the user grabbed is the *clamped* on-screen
+        // rect (effective_rect), which can differ from the stored geometry
+        // after a window shrink. Writing it back on grab keeps the drag math
+        // anchored to what's visible — no jump on the first mousemove.
+        let (vw, vh) = *self.viewport.read();
+        let mut panels = self.panels;
+        let p = {
+            let mut ps = panels.write();
+            let Some(p) = ps.get_mut(idx) else { return };
+            let (x, y, w, h) = effective_rect(p, vw, vh);
+            (p.x, p.y, p.w, p.h) = (x, y, w, h);
+            *p
+        };
         let mut drag = self.drag;
         drag.set(Some(Drag {
             idx,
@@ -374,8 +393,13 @@ impl<K: PanelKind> Workspace<K> {
                         let style = if maximized.is_some() {
                             "position:absolute; inset:0;".to_string()
                         } else if floating {
-                            format!("position:absolute; left:{}px; top:{}px; width:{}px; height:{}px; z-index:{};",
-                                p.x, p.y, p.w, p.h, p.z)
+                            // Project through the viewport clamp at render
+                            // time — stored geometry stays intact, so panels
+                            // spring back when the window grows again.
+                            let (vw, vh) = *ws.viewport.read();
+                            let (x, y, w, h) = effective_rect(&p, vw, vh);
+                            format!("position:absolute; left:{x}px; top:{y}px; width:{w}px; height:{h}px; z-index:{};",
+                                p.z)
                         } else {
                             String::new()
                         };
