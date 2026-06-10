@@ -472,6 +472,18 @@ fn persist() {
     let _ = LocalStorage::set(STORE_KEY, &p);
 }
 
+/// AppState round-trip seam (`crate::appstate`): the live query model +
+/// behavior (egui's `query` / `filter_behavior` AppState fields).
+pub(crate) fn state_snapshot() -> (QueryModel, FilterBehavior) {
+    (QUERY.read().clone(), *BEHAVIOR.read())
+}
+
+/// AppState round-trip seam: write the imported filter state straight to
+/// localStorage; the apply path's reload re-seeds the signals.
+pub(crate) fn state_restore(query: &QueryModel, behavior: FilterBehavior) {
+    let _ = LocalStorage::set(STORE_KEY, &Persisted { query: query.clone(), behavior });
+}
+
 /// One-shot `/graph/meta_summary` fetch — called from both panels' render
 /// paths so whichever opens first arms it (the egui app fetches at boot).
 pub(crate) fn ensure_field_index() {
@@ -543,22 +555,24 @@ pub(crate) fn sync_gpu() {
 /// not wired — `render::set_search_highlights` (the `set_selected` port)
 /// is owned by main.rs's Search-panel effect and would be clobbered.
 ///
-/// PARITY GAP: no `snapshot_source` / `FrontendEventLog` attribution — the
-/// egui AppState snapshot-diff subsystem has no Dioxus counterpart yet;
-/// chip mutations log via `tracing` instead.
 fn edit_cards(f: impl FnOnce(&mut QueryModel)) {
+    // Auto-snapshot attribution — the egui Filter section stamps
+    // `snapshot_source = Some("Filter")` every frame it renders.
+    crate::appstate::note_source("Filter");
     f(&mut QUERY.write());
     persist();
 }
 
 /// Active-filter mutation: persist + re-push the GPU mask.
 pub(crate) fn edit_filters(f: impl FnOnce(&mut QueryModel)) {
+    crate::appstate::note_source("Filter");
     f(&mut QUERY.write());
     persist();
     sync_gpu();
 }
 
 pub(crate) fn toggle_behavior() {
+    crate::appstate::note_source("Filter");
     let next = BEHAVIOR.peek().toggled();
     *BEHAVIOR.write() = next;
     persist();
@@ -597,6 +611,7 @@ fn append_filter(q: &mut QueryModel) {
 
 pub fn panel(_ctx: Ctx) -> Element {
     ensure_field_index();
+    crate::appstate::ensure_init();
     let q = QUERY.read().clone();
     let cards = q.cards.clone();
     let active_total: usize = q.active_filters.by_field.values().map(|s| s.len()).sum();

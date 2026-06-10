@@ -13,16 +13,18 @@
 //!
 //! The egui app fed the ring from `App::tick_timeline` every rendered frame.
 //! There is no per-frame App hook in the Dioxus shell, so this module owns the
-//! tick itself: a `spawn_forever` ticker (started on first panel mount, alive
-//! for the page) captures `positions_cpu()` from the render host while live and
+//! tick itself: a `spawn_forever` ticker (armed by `appstate::ensure_init`
+//! from whichever panel renders first, then alive for the page) captures
+//! `positions_cpu()` from the render host while live and
 //! re-pushes the scrubbed frame through `GraphPipelines::set_positions` while
 //! paused — the same hold-against-the-running-sim semantics as the egui app.
 //!
 //! Panel-local state lives in `GlobalSignal`s inside this module (not on
 //! `crate::Ctx`); the capture knobs (depth, stride) persist to localStorage
-//! under `jc_timeline_v1` — the Dioxus stand-in for their serde round-trip on
-//! the egui `TimelineState`. The scrub position is session-only, exactly like
-//! the egui `#[serde(skip)]` fields.
+//! under `jc_timeline_v1` and round-trip through `crate::appstate` exports /
+//! share links / presets, like their serde round-trip on the egui
+//! `TimelineState`. The scrub position is session-only, exactly like the
+//! egui `#[serde(skip)]` fields.
 
 use std::cell::{Cell, RefCell};
 
@@ -239,12 +241,11 @@ const STORE_KEY: &str = "jc_timeline_v1";
 
 /// Persisted capture knobs — the user PARAMETERS that round-tripped via serde
 /// on the egui `TimelineState` (depth, stride). Scrub state is session-only.
-///
-/// PARITY GAP: the egui values also round-tripped through AppState exports /
-/// share links / presets; the Dioxus app has no state-export surface yet, so
-/// these persist via localStorage only.
-#[derive(Clone, Copy, Serialize, Deserialize)]
-struct PersistedKnobs {
+/// `pub(crate)`: this is also `crate::appstate`'s `timeline` field, so the
+/// knobs round-trip through AppState exports / share links / presets exactly
+/// like the egui `TimelineState` (same serde names: `depth`, `stride`).
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub(crate) struct PersistedKnobs {
     depth: usize,
     stride: usize,
 }
@@ -265,6 +266,18 @@ fn save_knobs() {
         STORE_KEY,
         PersistedKnobs { depth: *DEPTH.peek(), stride: *STRIDE.peek() },
     );
+}
+
+/// AppState round-trip seam (`crate::appstate`): the live capture knobs.
+pub(crate) fn state_snapshot() -> PersistedKnobs {
+    PersistedKnobs { depth: *DEPTH.read(), stride: *STRIDE.read() }
+}
+
+/// AppState round-trip seam: write imported knobs straight to localStorage;
+/// the apply path's reload re-seeds the signals (and the ring's depth
+/// reconciles on the next tick).
+pub(crate) fn state_restore(k: &PersistedKnobs) {
+    let _ = LocalStorage::set(STORE_KEY, k);
 }
 
 /// Max retained frames in the ring (memory ↔ scrub history trade).
@@ -322,17 +335,15 @@ fn resume_live() {
 /// Start the capture/scrub ticker once, on the root scope so it outlives the
 /// panel (capture keeps buffering while the panel is minimized, like the egui
 /// App). ~16ms cadence approximates the egui per-rendered-frame tick.
-///
-/// PARITY GAP: the egui App ticks the timeline from launch; here capture only
-/// starts on the panel's first mount (there is no per-frame App hook outside
-/// the render module, which is off-limits to this panel) — frames before the
-/// panel is first opened are not buffered.
+/// `pub(crate)`: `appstate::ensure_init` arms it from the FIRST panel that
+/// renders (Nodes is open in the default layout), so capture effectively
+/// starts at launch like the egui App — not on this panel's first mount.
 ///
 /// PARITY GAP: capture cadence is a ~16ms timer, not the renderer's frame
 /// clock — `stride` counts ticker ticks, so on non-60Hz displays or under
 /// load the buffered time window differs slightly from the egui
 /// per-rendered-frame capture.
-fn ensure_ticker() {
+pub(crate) fn ensure_ticker() {
     if TICKER_STARTED.with(|t| t.replace(true)) {
         return;
     }
@@ -454,6 +465,7 @@ fn push_positions_to_gpu(positions: &[f32]) {
 
 pub fn panel(_ctx: Ctx) -> Element {
     ensure_ticker();
+    crate::appstate::ensure_init();
 
     let len = *BUFFERED_LEN.read();
 

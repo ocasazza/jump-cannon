@@ -129,6 +129,7 @@ fn run_search(ctx: Ctx) {
 // --- panel ----------------------------------------------------------------------
 
 pub fn panel(ctx: Ctx) -> Element {
+    crate::appstate::ensure_init();
     let Ctx { graph, mut selected, mut query, searching, result_total, .. } = ctx;
     let g = graph.read();
     let Some(g) = g.as_ref() else {
@@ -234,9 +235,11 @@ pub fn panel(ctx: Ctx) -> Element {
                                             key: "{field}:{value}",
                                             class: if active { "sugg on" } else { "sugg" },
                                             title: "toggle filter {field} = {value} ({count} nodes)",
+                                            // Through `edit_filters` so the toggle
+                                            // persists + stamps the snapshot source,
+                                            // like a Filter-panel chip.
                                             onclick: move |_| {
-                                                filter::QUERY.write().toggle_field_filter(&f, &v);
-                                                filter::sync_gpu();
+                                                filter::edit_filters(|q| q.toggle_field_filter(&f, &v));
                                             },
                                             span { class: "sugg-field", "{field}:" }
                                             " {value} "

@@ -12,9 +12,12 @@
 //! Build: `cargo tauri dev` inside `app/` (nix devshell provides trunk +
 //! protoc + cargo-tauri).
 
+mod anchored;
 mod api;
+mod appstate;
 mod badges;
 mod graph_canvas;
+mod palette;
 mod panels;
 mod proto;
 mod render;
@@ -251,21 +254,38 @@ async fn reload_graph(mut ctx: Ctx) {
     }
 }
 
-fn render_markdown(md: &str) -> String {
-    let parser = pulldown_cmark::Parser::new(md);
-    let mut html = String::new();
-    pulldown_cmark::html::push_html(&mut html, parser);
-    html
-}
-
 // --- app ---------------------------------------------------------------------
+
+/// Open-panel request bridge: modules that can't reach the workspace hook
+/// (the command palette's jump-to-section actions) park a `Panel` here; the
+/// drain effect in [`App`] restores + raises it. The egui analog is
+/// `AppAction::JumpToSection` mutating `state.sections`.
+pub(crate) static OPEN_PANEL: GlobalSignal<Option<Panel>> = Signal::global(|| None);
 
 #[component]
 fn App() -> Element {
+    // Arm the AppState system (snapshot ticker, `#s=`/`?config=` boot
+    // handling, style/camera loops) before any panel renders — a saved
+    // layout with every panel minimized must still process boot presets.
+    appstate::ensure_init();
     // _v3: Search merged into the unified Nodes browser (the Search variant
     // is gone, which breaks old saved-layout deserialization) — and v2 had
     // bumped for the 2x graph view + docked tray panels.
     let ws = panel_kit::use_workspace("jc_layout_v3", default_layout);
+
+    // Drain palette jump-to-section requests into the workspace, logging
+    // the same `("section", "<title>: open")` event the egui app pushed.
+    use_effect(move || {
+        let req = *OPEN_PANEL.read();
+        if let Some(kind) = req {
+            ws.restore(kind);
+            appstate::note_mutation(
+                "section",
+                &format!("{}: open", panel_kit::PanelKind::title(kind)),
+            );
+            *OPEN_PANEL.write() = None;
+        }
+    });
 
     let ctx = Ctx {
         graph: use_signal(|| None),
@@ -408,6 +428,11 @@ fn App() -> Element {
             // renderer's held-key state. Single-key shortcuts must not
             // fire while the user is typing in an input/textarea.
             onkeydown: move |e: KeyboardEvent| {
+                // Palette chord first: it must open even while an input has
+                // focus, and a consumed event never reaches the camera.
+                if palette::handle_key(&e, ctx) {
+                    return;
+                }
                 if panel_kit::is_editing() {
                     render::clear_keys();
                     return;
@@ -454,6 +479,10 @@ fn App() -> Element {
             {ws.render(move |kind, maximized| panel_body(kind, maximized, ctx))}
 
             {ws.dock()}
+
+            // Phase-4 overlays: both render empty until active.
+            {palette::overlay(ctx)}
+            {anchored::overlay(ctx)}
         }
     }
 }
@@ -472,8 +501,8 @@ fn panel_body(kind: Panel, _maximized: bool, ctx: Ctx) -> Element {
             }
         }
         Panel::Nodes => panels::nodes::panel(ctx),
-        Panel::Inspector => inspector_panel(ctx),
-        Panel::Document => document_panel(ctx),
+        Panel::Inspector => panels::inspector::panel(ctx),
+        Panel::Document => panels::document::panel(ctx),
         Panel::Progress => progress_panel(ctx),
         Panel::Settings => settings_panel(ctx),
         Panel::Layout => panels::layout::panel(ctx),
@@ -496,102 +525,6 @@ fn panel_body(kind: Panel, _maximized: bool, ctx: Ctx) -> Element {
                 p { "🟢 maximize ⇄ restore" }
             }
         },
-    }
-}
-
-/// Node metadata: identity, tags, graph metrics, raw frontmatter.
-fn inspector_panel(ctx: Ctx) -> Element {
-    let Ctx { meta, meta_busy, selected, .. } = ctx;
-    if *meta_busy.read() {
-        return rsx! { div { class: "skeleton", Spinner { label: "loading node…" } } };
-    }
-    let m = meta.read();
-    let Some(m) = m.as_ref() else {
-        return rsx! { div { class: "empty",
-            if selected.read().is_some() { "node failed to load" } else { "select a node" }
-        } };
-    };
-    let fm_pretty = serde_json::from_str::<serde_json::Value>(&m.frontmatter_json)
-        .ok()
-        .filter(|v| v.as_object().map(|o| !o.is_empty()).unwrap_or(true))
-        .and_then(|v| serde_json::to_string_pretty(&v).ok());
-    rsx! {
-        div { class: "inspector",
-            h2 { class: "node-title", "{m.title}" }
-            div { class: "kv", span { class: "k", "path" } span { class: "v", "{m.path}" } }
-            div { class: "kv", span { class: "k", "folder" } span { class: "v", "{m.folder}" } }
-            if let Some(dt) = m.doctype.as_ref() {
-                div { class: "kv", span { class: "k", "doctype" } span { class: "v", "{dt}" } }
-            }
-            if !m.tags.is_empty() {
-                div { class: "tags",
-                    for t in m.tags.iter() {
-                        span { key: "{t}", class: "tag", "#{t}" }
-                    }
-                }
-            }
-            div { class: "metrics-grid",
-                div { class: "kv", span { class: "k", "degree" } span { class: "v", "{m.degree} ({m.indegree} in / {m.outdegree} out)" } }
-                div { class: "kv", span { class: "k", "pagerank" } span { class: "v", { format!("{:.5}", m.pagerank) } } }
-                div { class: "kv", span { class: "k", "betweenness" } span { class: "v", { format!("{:.5}", m.betweenness) } } }
-                div { class: "kv", span { class: "k", "k-core" } span { class: "v", "{m.kcore}" } }
-                div { class: "kv", span { class: "k", "community" } span { class: "v", "{m.community}" } }
-                div { class: "kv", span { class: "k", "wcc" } span { class: "v", "{m.wcc}" } }
-            }
-            if let Some(fm) = fm_pretty {
-                details {
-                    summary { "frontmatter" }
-                    pre { class: "code", "{fm}" }
-                }
-            }
-        }
-    }
-}
-
-/// Markdown body editor + rendered preview. Saves through PUT /vault/page
-/// (body-only; on-disk frontmatter is preserved by the server).
-fn document_panel(ctx: Ctx) -> Element {
-    let Ctx { meta, mut draft, mut save_msg, .. } = ctx;
-    let m = meta.read();
-    let Some(m) = m.as_ref() else {
-        return rsx! { div { class: "empty", "select a node" } };
-    };
-    let path = m.path.clone();
-    let external = m.body.is_empty() && m.doctype.as_deref() == Some("external");
-    if external {
-        return rsx! { div { class: "empty", "external node — no file on disk" } };
-    }
-    let msg = save_msg.read().clone();
-    rsx! {
-        div { class: "doc",
-            textarea {
-                class: "md",
-                spellcheck: false,
-                value: "{draft}",
-                oninput: move |e| draft.set(e.value()),
-            }
-            div { class: "doc-actions",
-                button { class: "btn",
-                    onclick: move |_| {
-                        let path = path.clone();
-                        spawn(async move {
-                            save_msg.set("saving…".into());
-                            match api::put_page(&path, &draft.read().clone()).await {
-                                Ok(r) if r.ok => save_msg.set("saved ✓ (vault reload will follow)".into()),
-                                Ok(r) => save_msg.set(format!("rejected: {}", r.error.unwrap_or_default())),
-                                Err(e) => save_msg.set(format!("save failed: {e}")),
-                            }
-                        });
-                    },
-                    "Save"
-                }
-                span { class: "save-msg", "{msg}" }
-            }
-            details {
-                summary { "preview" }
-                div { class: "rendered-md", dangerous_inner_html: render_markdown(&draft.read()) }
-            }
-        }
     }
 }
 

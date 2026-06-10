@@ -505,6 +505,13 @@
             (pkgs.lib.fileset.fileFilter
               (file: builtins.any file.hasExt [ "rs" "toml" "lock" "wgsl" ])
               ./crates/graph-layouts)
+            # tvix-wasm: client-side Nix eval for Layout seeds + Generate
+            # Inline executor (phase 4) — second path dep outside app/.
+            # "nix": the crate embeds its demo catalog via include_str!
+            # (src/nix/*.nix).
+            (pkgs.lib.fileset.fileFilter
+              (file: builtins.any file.hasExt [ "rs" "toml" "lock" "nix" ])
+              ./crates/tvix-wasm)
           ];
         };
 

@@ -16,7 +16,7 @@ Nodes/Search/Inspector/Document/Progress/Settings/Help panel skeletons,
 Tauri shell, nix + crane build (`nix build .#app-web`), compose/dev-up
 frontend selection (`just dev-up gpu app`, `FRONTEND=app nix run .#dev-up`).
 
-## Phase 1 — the real renderer 🚧
+## Phase 1 — the real renderer ✅
 
 Port the wgpu pipeline from `crates/graph-renderer` into `app/ui/src/render/`,
 replacing the interim Canvas2D view (which was a placeholder, not the target):
@@ -34,7 +34,7 @@ replacing the interim Canvas2D view (which was a placeholder, not the target):
 - Same node color/size derivation as `data.rs` (community → palette, metric
   sizing); same pick math (proj*view projection, nearest-on-screen).
 
-## Phase 2 — layout system ⬜
+## Phase 2 — layout system ✅
 
 Source: `ui/layout/registry.rs` + `ui/layout/algorithms/*`, panel:
 `ui/sections/layout.rs` (grouped Engine picker — see memory/layout-engine-picker).
@@ -49,7 +49,7 @@ Source: `ui/layout/registry.rs` + `ui/layout/algorithms/*`, panel:
 - Per-engine parameter UIs, run/pause/reset, engine grouping identical to the
   egui picker.
 
-## Phase 3 — settings panels ⬜
+## Phase 3 — settings panels ✅
 
 Exact ports of `ui/sections/`:
 
@@ -63,17 +63,41 @@ Exact ports of `ui/sections/`:
 - `seed.rs`, `debug.rs`, `generate.rs` (tvix-expr Generate panel + worker),
   `timeline.rs` (AppState snapshots, 250 ms debounce, restore).
 
-## Phase 4 — interaction surfaces ⬜
+## Phase 4 — interaction surfaces ✅
 
-- Command palette (`ui/command_palette/`, actions/builtins).
-- Anchored hover/click cards (`ui/anchored.rs`) — world-space anchor projected
-  through the same proj*view, EMA smoothing, edge clamping.
-- Inspector parity (`ui/inspector.rs` — sections, neighbours, community).
-- Page viewer editing semantics (`ui/page_viewer.rs`), frontmatter chip grid
-  (`ui/frontmatter_grid.rs`), document viewer, focus sets, query/field index,
-  modal/badges, status footer task list.
-- `AppState` (de)serialization parity: YAML/JSON round-trip, sessionStorage
-  persistence, instances import/export, `?config=<name>` presets.
+Executed 2026-06-10 (five parallel ports against the egui reference at
+723af10):
+
+- Command palette (`app/ui/src/palette.rs`): ActionRegistry + all builtins,
+  Ctrl/Cmd+P, fuzzy matching with title/path highlighting, param forms,
+  two-pane node preview, category grouping. Jump-to-section actions open
+  panels through `main.rs::OPEN_PANEL` → `panel_kit::Workspace::restore`.
+- Anchored hover/click cards (`app/ui/src/anchored.rs`): 50 ms raycast
+  throttle, 700 ms preview arm, sticky-beats-hover, EMA(0.4) placement,
+  reserved-size edge clamping, tether line + off-screen arrow, promoted
+  click card with fly-to (`render::look_at_node`). Focus sets
+  (`FocusMode` × 5) push GPU dim masks; the Camera panel's picker drives
+  them.
+- Inspector parity (`panels/inspector.rs`): active-filter strip, empty-state
+  tag browser, badge rows via `badges.rs`, frontmatter leftover grid,
+  neighbour pills (+ in/out direction), community fold rules.
+- Document/page viewer (`panels/document.rs`): per-node edit buffers,
+  dirty/save/retry semantics, Rendered/Source tabs, Cmd+F find strip,
+  Tab soft-indent, line gutter, frontmatter chip strip.
+- `AppState` round-trip (`app/ui/src/appstate.rs`): egui-shaped struct over
+  the `jc_*` keys, YAML/JSON export-import, share codec (JSON → DEFLATE →
+  base64url, `#s=`), sessionStorage snapshot ring (cap 50, 250 ms ticker),
+  `?config=<name>` boot presets, `note_mutation`/`note_source` attribution
+  feeding the Debug event log.
+- Client-side tvix eval (`panels/{layout,generate}.rs`): built-in + custom
+  Nix seed expressions via `tvix_wasm::eval_seed`; Generate Inline executor
+  via `eval_graph` with Auto server→inline transport fallback.
+
+Remaining `PARITY GAP` annotations (grep `app/ui/src` for the full list):
+new-graph-tab (single Graph panel by design), LocalWorker executor
+(tvix-worker retired; Inline covers it), client-side degree/wcc buffers for
+generated graphs, per-stage perf overlay, syntect source highlighting,
+edge-hover width from Style state, soft-tether card drag offsets.
 
 ## Phase 5 — retirement ✅
 

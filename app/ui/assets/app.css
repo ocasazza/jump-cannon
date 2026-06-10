@@ -68,8 +68,6 @@ input.filter:focus { outline:none; border-color:var(--fg); }
 .metrics-grid { border-top:1px solid var(--line); padding-top:.4rem; margin-top:.2rem;
   display:flex; flex-direction:column; gap:.15rem; }
 .tags { display:flex; gap:.3rem; flex-wrap:wrap; }
-.tag { border:1px solid var(--line2); border-radius:3px; padding:.05rem .4rem;
-  font-size:.7rem; color:var(--accent); }
 pre.code { white-space:pre-wrap; background:#060606; color:var(--fg);
   border:1px solid var(--line); border-radius:3px; padding:.5rem; font-size:11px; }
 details summary { color:var(--dim); font-size:.7rem; cursor:pointer; }
@@ -244,20 +242,7 @@ textarea.md:focus { outline:none; border-color:var(--fg); }
 .fst-rows { display:flex; flex-direction:column; gap:.3rem; overflow:auto; min-height:0; }
 .fst-row { display:flex; flex-wrap:wrap; gap:.3rem; align-items:center; }
 .fst-comb.dim { color:var(--dim); border-color:transparent; background:transparent; }
-.fst-chip { display:inline-flex; align-items:center; gap:.3rem; border-radius:3px;
-  border:1px solid #40444C; background:none; color:var(--fg); font-size:11px;
-  padding:.1rem .4rem; cursor:pointer; }
-.fst-chip .fst-x { opacity:.7; }
-.fst-chip:hover .fst-x { opacity:1; }
-/* BadgeKind tints (ui/badge.rs::colors_for + ui/theme.rs palette). Light
-   fills flip to dark ink, matching the perceived-brightness rule. */
-.fst-chip.chip-tag.active { background:#CC4444; border-color:#CC4444; color:#fff; }
-.fst-chip.chip-doctype.active, .fst-chip.chip-author.active {
-  background:#83B7CC; border-color:#83B7CC; color:#050710; }
-.fst-chip.chip-folder.active { background:#808088; border-color:#808088; color:#050710; }
-.fst-chip.chip-entity.active { background:#CCB483; border-color:#CCB483; color:#050710; }
-.fst-chip.chip-status.active { background:#83CC95; border-color:#83CC95; color:#050710; }
-.fst-chip.chip-generic.active { background:#40444C; border-color:#40444C; color:#fff; }
+/* Chips are panel-kit badges (`.badge-*` classes ship in panel_kit::CSS). */
 
 /* === panel: metrics (owned by panels/metrics.rs) === */
 .metrics-panel { display:flex; flex-direction:column; gap:.35rem; font-size:11.5px; }
@@ -397,3 +382,210 @@ input.inst-line:focus { outline:none; border-color:var(--fg); }
 .dbg-legend-name { flex:0 0 7.5rem; color:var(--fg); }
 .dbg-legend-stats { flex:1; color:var(--dim); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 .dbg-legend-ymax { color:var(--dim); font-variant-numeric:tabular-nums; flex:0 0 auto; }
+
+/* ====================================================================== */
+/* phase-4 anchor: appstate (instances/timeline/debug/filter attribution) */
+/* — the AppState agent owns this block —                                 */
+/* ====================================================================== */
+
+/* ActionInstance cards (Instances panel ← command-palette registry) */
+.inst-action-card { display:flex; flex-direction:column; gap:.2rem; margin:.3rem 0; }
+.inst-action-head { display:flex; align-items:center; gap:.45rem; }
+.inst-action-title { font-weight:600; }
+.inst-action-id { color:var(--dim); font-size:10px; margin-left:auto; }
+.inst-action-x { background:none; border:none; color:var(--dim); cursor:pointer; font-size:11px; }
+.inst-action-x:hover { color:var(--fg); }
+.inst-action-param { font-size:11px; color:var(--dim); padding-left:.5rem; }
+.inst-sep { border:none; border-top:1px solid var(--line, #333); margin:.35rem 0; }
+
+/* ====================================================================== */
+/* phase-4 anchor: command palette                                        */
+/* — the palette agent owns this block —                                  */
+/* ====================================================================== */
+
+/* Overlay shell: anchored center-top at 18% of the viewport, same as the
+   egui Window anchor; the panel mirrors theme::floating_frame (translucent
+   black backdrop, 1px BORDER stroke, 12px squircle radius). */
+.cp-overlay { position:fixed; inset:0; z-index:5000; pointer-events:none;
+  display:flex; justify-content:center; align-items:flex-start; }
+.cp-panel { pointer-events:auto; margin-top:18vh; width:600px; max-width:90vw;
+  background:rgba(0,0,0,.75); border:1px solid #40444c; border-radius:12px;
+  padding:8px; box-shadow:0 12px 40px rgba(0,0,0,.55);
+  font-family:var(--mono); display:flex; flex-direction:column; }
+.cp-panel.wide { width:980px; }
+
+.cp-crumbs { display:flex; align-items:center; gap:.15rem; padding:.2rem .4rem .35rem; }
+.cp-crumb { background:none; border:none; padding:0; color:var(--accent);
+  font:inherit; font-size:11.5px; cursor:pointer; }
+.cp-crumb:hover { text-decoration:underline; }
+.cp-crumb + .cp-crumb::before { content:" / "; color:var(--dim); margin:0 .25rem; }
+
+.cp-input { width:100%; box-sizing:border-box; height:28px; background:var(--bg);
+  color:var(--fg); border:1px solid var(--line); border-radius:3px;
+  padding:.3rem .5rem; font-family:var(--mono); font-size:12px; }
+.cp-input:focus { outline:none; border-color:var(--fg); }
+.cp-panel.wide .cp-input { width:calc(50% - 8px); }
+
+.cp-body { display:flex; align-items:flex-start; gap:.4rem; margin-top:.3rem; min-height:0; }
+.cp-list { flex:1 1 auto; max-height:60vh; overflow-y:auto; min-width:0; }
+.cp-panel.wide .cp-list { flex:0 0 50%; min-width:280px; }
+
+/* Rows: active bg #222834, focused title white, others soft TEXT. */
+.cp-row { display:flex; justify-content:space-between; align-items:flex-start;
+  gap:.6rem; padding:8px 12px; cursor:pointer; }
+.cp-row.file { padding:6px 12px; }
+.cp-row.active { background:#222834; }
+.cp-row.disabled { opacity:.45; cursor:default; }
+.cp-main { min-width:0; }
+.cp-title { color:#d8d8dc; font-size:12px; white-space:nowrap; overflow:hidden;
+  text-overflow:ellipsis; }
+.cp-row.active .cp-title { color:#fff; }
+.cp-hit { color:#3b9bff; }
+.cp-desc { color:#8c8c8c; font-size:10px; margin-top:.1rem; }
+.cp-side { display:flex; align-items:center; gap:.5rem; flex:none; }
+.cp-shortcut { color:#b4b4b4; font-size:10px; font-family:var(--mono); }
+.cp-kind { color:#8c8c8c; font-size:9px; }
+.cp-child { color:#8c8c8c; }
+
+.cp-cat { color:#8c8c8c; font-size:10px; font-weight:600; padding:4px 12px 2px; }
+.cp-sep { border-top:1px solid var(--line); margin:.3rem 0; }
+.cp-empty { color:#8c8c8c; text-align:center; padding:16px 0; font-size:12px; }
+
+/* File rows: full path with skim hits (yellow on a translucent yellow bg),
+   folder as the dim secondary line — matching.rs::highlighted_path. */
+.cp-path { color:#d8d8dc; font-size:12px; word-break:break-all; }
+.cp-row.active .cp-path { color:#fff; }
+.cp-path-hit { color:#ffd83b; background:rgba(255,213,74,.19); }
+.cp-folder { color:#787878; font-size:10px; margin-top:.1rem; }
+
+/* Right pane: NodeMeta rendered as YAML-ish text, mono, no wrap. */
+.cp-preview { flex:1 1 auto; max-height:60vh; overflow:auto; min-width:200px;
+  border-left:1px solid var(--line); padding-left:.4rem; }
+.cp-preview-doc { margin:0; font-family:var(--mono); font-size:11px; line-height:1.5;
+  color:var(--fg); white-space:pre; }
+.cp-preview-hint { color:var(--dim); font-size:11px; padding:8px; }
+.cp-preview-err { color:#ff3b3b; font-size:11px; padding:8px; }
+
+/* Parameter form mode. */
+.cp-form { display:flex; flex-direction:column; gap:.25rem; padding:10px 12px; }
+.cp-form-title { font-size:13px; font-weight:600; color:var(--fg); }
+.cp-form-label { font-size:12px; font-weight:600; color:var(--fg); margin-top:.3rem; }
+.cp-form-in { background:var(--bg); color:var(--fg); border:1px solid var(--line);
+  border-radius:3px; padding:.3rem .5rem; font-family:var(--mono); font-size:12px;
+  margin-top:.25rem; max-width:100%; }
+.cp-form-in:focus { outline:none; border-color:var(--fg); }
+.cp-form-in.num { width:7rem; }
+.cp-form-check { display:flex; align-items:center; gap:.4rem; font-size:12px;
+  color:var(--fg); margin-top:.25rem; cursor:pointer; }
+.cp-form-multi { display:flex; flex-direction:column; gap:.15rem; }
+.cp-err { color:#ff3b3b; font-size:10px; margin-top:.15rem; }
+.cp-form-btns { display:flex; justify-content:flex-end; gap:.4rem; margin-top:.6rem; }
+
+/* ====================================================================== */
+/* phase-4 anchor: anchored hover/click cards + focus sets                */
+/* — the anchored-cards agent owns this block —                           */
+/* ====================================================================== */
+
+/* World-anchored node cards (anchored.rs). The layer is hit-transparent;
+   the cards themselves take pointer events (egui interactable(true)). */
+.anch-layer { position:fixed; inset:0; pointer-events:none; z-index:2500; }
+.anch-card { position:fixed; width:360px; box-sizing:border-box; pointer-events:auto;
+  background:color-mix(in srgb, var(--bg) 92%, transparent);
+  border:1px solid var(--line2); border-radius:10px; /* corner_radius parity */
+  padding:8px; font-size:11.5px; color:var(--fg);
+  box-shadow:0 6px 24px rgba(0,0,0,.35); }
+.anch-card.promoted { width:380px; }
+.anch-title { display:flex; align-items:center; gap:.45rem; min-width:0; }
+.anch-glyph { color:var(--dim); font-size:10px; }
+.anch-name { font-weight:600; flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.anch-close { background:none; border:none; color:var(--dim); cursor:pointer;
+  font-size:12px; padding:0 .15rem; line-height:1; }
+.anch-close:hover { color:var(--fg); }
+.anch-path { color:var(--dim); font-family:var(--mono); font-size:10px; margin-top:.15rem;
+  overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.anch-tags { color:var(--accent); font-size:10.5px; margin-top:2px; }
+.anch-sep { border:none; border-top:1px solid var(--line); margin:.4rem 0; }
+.anch-body { white-space:pre-wrap; color:var(--fg); font-size:10.5px; line-height:1.45;
+  max-height:11em; overflow:hidden; word-break:break-word; }
+.anch-metrics { display:grid; grid-template-columns:repeat(2, 1fr); gap:.1rem .8rem; margin-top:.35rem; }
+.anch-metric { display:flex; justify-content:space-between; gap:.5rem; font-size:10.5px; }
+.anch-metric .k { color:var(--dim); }
+.anch-metric .v { font-variant-numeric:tabular-nums; }
+.anch-actions { display:flex; gap:.4rem; margin-top:.45rem; }
+
+/* Tether (card → live projected anchor) and its endpoints. The line is a
+   1px div rotated about its left edge; the off-screen arrow is a CSS
+   triangle rotated to the anchor's bearing. */
+.anch-tether { position:fixed; height:1px; background:var(--line2);
+  transform-origin:0 50%; pointer-events:none; z-index:2499; }
+.anch-dot { position:fixed; width:5px; height:5px; border-radius:50%; background:var(--fg);
+  transform:translate(-50%,-50%); pointer-events:none; z-index:2499; }
+.anch-arrow { position:fixed; width:0; height:0;
+  border-top:5px solid transparent; border-bottom:5px solid transparent;
+  border-left:10px solid var(--line2);
+  transform-origin:0 50%; pointer-events:none; z-index:2499; }
+
+/* ====================================================================== */
+/* phase-4 anchor: inspector + document parity                            */
+/* — the inspector agent owns this block —                                */
+/* ====================================================================== */
+
+/* Inspector: active-filter strip, tag browser, sections, node pills. */
+.ins-id { font-weight:700; font-size:12.5px; word-break:break-all; }
+.ins-strip { display:flex; flex-wrap:wrap; gap:4px; }
+.ins-rule { border-top:1px solid var(--line); margin:.35rem 0; }
+.ins-note { color:var(--dim); font-style:italic; font-size:11px; padding:.2rem 0; }
+.ins-count { color:var(--dim); font-size:10.5px; }
+.ins-tagbrowse { display:flex; flex-direction:column; gap:.35rem; }
+.ins-tagtitle { font-weight:600; font-size:12px; }
+.ins-search { display:flex; gap:.4rem; align-items:center; }
+.ins-search input.filter { flex:1; }
+.ins-chips, .ins-pills { display:flex; flex-wrap:wrap; gap:4px; }
+.ins-pill { display:inline-flex; }
+.ins-section { margin-top:.4rem; }
+.ins-section summary { cursor:pointer; font-size:11.5px; color:var(--fg); user-select:none; }
+.ins-section[open] summary { margin-bottom:.3rem; }
+
+/* Inspector: leftover-frontmatter grid (long text / nested JSON / nulls). */
+.ins-fmgrid { display:flex; flex-direction:column; gap:.25rem; }
+.ins-fmrow { display:flex; gap:.5rem; font-size:11px; }
+.ins-fmkey { flex:0 0 6.5rem; color:var(--dim); font-size:10.5px; overflow:hidden;
+  text-overflow:ellipsis; }
+.ins-fmtext { max-height:120px; overflow:auto; white-space:pre-wrap; flex:1; }
+.ins-fmjson { max-height:160px; overflow:auto; white-space:pre-wrap; flex:1; margin:0;
+  background:#060606; padding:.3rem .45rem; border-radius:3px; font-size:10.5px; }
+
+/* Document: page-viewer tab strip, save row, source editor + gutter. */
+.docv { display:flex; flex-direction:column; gap:.45rem; height:100%; min-height:0; }
+.doc-tabs { display:flex; gap:.3rem; align-items:center; }
+.doc-tab { background:var(--bg); color:var(--dim); border:1px solid var(--line2);
+  border-radius:3px; padding:.15rem .55rem; cursor:pointer; font:inherit; font-size:11px; }
+.doc-tab.active { color:var(--fg); border-color:var(--fg); }
+.doc-status { margin-left:auto; display:inline-flex; align-items:center; gap:.35rem;
+  font-size:10.5px; }
+.doc-dim { color:var(--dim); font-size:10.5px; }
+.doc-unsaved { color:var(--yellow); font-size:10.5px; }
+.doc-saved { color:var(--green); font-size:10.5px; animation:doc-saved-fade 2s forwards; }
+@keyframes doc-saved-fade { from { opacity:1; } to { opacity:0; } }
+.doc-saverow { display:flex; align-items:center; gap:.5rem;
+  border-bottom:1px solid var(--line); padding-bottom:.4rem; }
+.doc-retry { color:var(--red); border-color:var(--red); }
+.doc-err { color:var(--red); font-size:10.5px; overflow:hidden; text-overflow:ellipsis;
+  white-space:nowrap; }
+.doc-stats { margin-left:auto; color:var(--dim); font-size:10.5px;
+  font-variant-numeric:tabular-nums; white-space:nowrap; }
+.doc-find { display:flex; align-items:center; gap:.45rem; }
+.doc-find input.doc-findin { flex:0 1 180px; }
+.doc-body { flex:1; min-height:0; overflow:auto; }
+.doc-srcwrap { display:flex; align-items:flex-start; background:#060606; border-radius:3px; }
+.doc-gutter { margin:0; padding:.35rem .35rem .35rem .5rem; text-align:right; color:#6e6e6e;
+  background:#0b0b0b; user-select:none; font-size:12px; line-height:1.55; min-width:2.5ch; }
+textarea.doc-src { flex:1; resize:none; overflow:hidden; border:0; background:transparent;
+  color:var(--fg); font-family:var(--mono); font-size:12px; line-height:1.55;
+  padding:.35rem .5rem; }
+textarea.doc-src:focus { outline:none; }
+
+/* ====================================================================== */
+/* phase-4 anchor: client-side tvix eval (layout seeds, generate inline)  */
+/* — the tvix agent owns this block —                                     */
+/* ====================================================================== */

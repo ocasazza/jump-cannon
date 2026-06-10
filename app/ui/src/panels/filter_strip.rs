@@ -12,23 +12,11 @@
 //! persistence + the GPU mask push stay in one place.
 
 use dioxus::prelude::*;
+use panel_kit::badge::{Badge, BadgeKind};
 
+use crate::badges::badge_kind_for;
 use crate::panels::filter;
 use crate::Ctx;
-
-/// Chip tint per field — port of filter_strip.rs::badge_kind_for + the
-/// badge.rs color table (classes live under this panel's CSS anchor).
-fn chip_class(field: &str) -> &'static str {
-    match field {
-        "tags" | "tag" => "chip-tag",
-        "doctype" => "chip-doctype",
-        "folder" => "chip-folder",
-        "authors" => "chip-author",
-        "entities" => "chip-entity",
-        "status" => "chip-status",
-        _ => "chip-generic",
-    }
-}
 
 pub fn panel(_ctx: Ctx) -> Element {
     // Opening the strip alone must still arm the meta_summary fetch — the
@@ -121,13 +109,16 @@ fn field_row(q: &filter::QueryModel, field: String) -> Element {
     rsx! {
         div { class: "fst-row", key: "{field}",
             // Field-name lozenge with ✕ — clears the whole field.
-            button { class: "fst-chip chip-generic active", title: "Clear this field",
-                onclick: move |_| {
+            Badge {
+                field: "{field}",
+                value: "{field}",
+                kind: BadgeKind::Generic,
+                active: true,
+                with_x: true,
+                on_action: move |_| {
                     tracing::info!("[filter-strip] clear field {f_clear}");
                     filter::edit_filters(|q| q.clear_field(&f_clear));
                 },
-                span { "{field}" }
-                span { class: "fst-x", "×" }
             }
             button {
                 class: if multi { "fst-toggle fst-comb" } else { "fst-toggle fst-comb dim" },
@@ -148,16 +139,20 @@ fn field_row(q: &filter::QueryModel, field: String) -> Element {
 }
 
 fn chip(field: String, value: String) -> Element {
-    let class = format!("fst-chip {} active", chip_class(&field));
-    let label = value.clone();
+    let kind = badge_kind_for(&field);
+    let (f, v) = (field.clone(), value.clone());
     rsx! {
-        button { key: "{label}", class: "{class}", title: "Remove this filter",
-            onclick: move |_| {
-                tracing::info!("[filter-strip] toggle chip {field}={value}");
-                filter::edit_filters(|q| q.toggle_field_filter(&field, &value));
+        Badge {
+            key: "{value}",
+            field: "{field}",
+            value: "{value}",
+            kind,
+            active: true,
+            with_x: true,
+            on_action: move |_| {
+                tracing::info!("[filter-strip] toggle chip {f}={v}");
+                filter::edit_filters(|q| q.toggle_field_filter(&f, &v));
             },
-            span { "{label}" }
-            span { class: "fst-x", "×" }
         }
     }
 }

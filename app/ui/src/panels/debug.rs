@@ -48,9 +48,11 @@ const STAGES: &[(&str, &str)] = &[
 
 // --- panel-local state ------------------------------------------------------
 
-/// Mirror of `state.rs::DebugViewMode`.
-#[derive(Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-enum ViewMode {
+/// Mirror of `state.rs::DebugViewMode`. `pub(crate)` so `crate::appstate`
+/// can carry it as the round-trip `debug_view_mode` field (same serde
+/// variant names as the egui enum).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub(crate) enum ViewMode {
     Events,
     // Stats first: the perf time-series charts are the view people open
     // the Debug panel for (FPS / frame ms / render cost / KE).
@@ -99,8 +101,9 @@ static PERF: GlobalSignal<Perf> = Signal::global(Perf::default);
 static T0_MS: GlobalSignal<f64> = Signal::global(js_sys::Date::now);
 
 /// Mirror of `FrontendEventLog::push` (timestamp + cap-driven eviction).
-/// Only this panel feeds the log — see the PARITY GAP note in `panel`.
-fn push_event(source: &str, message: String) {
+/// Fed from every UI mutation site via `appstate::note_mutation` (the egui
+/// `state.frontend_events.push` path) plus this panel's own mode toggle.
+pub(crate) fn push_event(source: &str, message: String) {
     let mut ev = EVENTS.write();
     ev.push(DbgEvent {
         timestamp_ms: js_sys::Date::now() as u64,
@@ -115,12 +118,22 @@ fn push_event(source: &str, message: String) {
 
 // --- entry -------------------------------------------------------------------
 
-// PARITY GAP: `state.snapshot_source = Some("Debug")` (egui snapshot-name
-// plumbing) has no Dioxus counterpart.
-// PARITY GAP: the egui event log is fed from every UI mutation site
-// (palette execute, chip toggle, section open/close, anchored promote);
-// sibling panels own those files here, so only this panel pushes events.
+/// AppState round-trip seam (`crate::appstate`): the live view mode.
+pub(crate) fn state_snapshot() -> ViewMode {
+    *VIEW.read()
+}
+
+/// AppState round-trip seam: write the imported view mode straight to
+/// localStorage; the apply path's reload re-seeds [`VIEW`].
+pub(crate) fn state_restore(mode: ViewMode) {
+    let _ = LocalStorage::set(STORE_KEY, mode);
+}
+
+// PARITY GAP: the egui event log also receives section open/close events
+// ("section" entries from `AppState::toggle_section`); panel open/close
+// belongs to panel-kit / main.rs here, which this file may not touch.
 pub fn panel(ctx: Ctx) -> Element {
+    crate::appstate::ensure_init();
     rsx! { DebugPanel { graph: ctx.graph } }
 }
 
@@ -190,6 +203,9 @@ fn DebugPanel(graph: Signal<Option<GraphData>>) -> Element {
                             if *VIEW.read() != m {
                                 *VIEW.write() = m;
                                 let _ = LocalStorage::set(STORE_KEY, m);
+                                // egui stamps "Debug" + pushes a "debug"
+                                // mode-toggle event (sections/debug.rs).
+                                crate::appstate::note_source("Debug");
                                 push_event("debug", format!("mode -> {to}"));
                             }
                         },
@@ -358,22 +374,12 @@ fn stats_view(graph: Signal<Option<GraphData>>) -> Element {
     }
 }
 
-/// Dioxus analogue of egui's `*state = AppState::default()` — every panel
-/// persists under a `jc_*` localStorage key, so drop those and reload to
-/// re-initialize the whole frontend from defaults.
+/// Dioxus analogue of egui's `*state = AppState::default()`: a full
+/// default-state apply through the round-trip system, so the reset lands in
+/// the snapshot timeline (and is restorable) before the reload re-seeds
+/// every panel from defaults.
 fn reset_everything() {
-    let raw = LocalStorage::raw();
-    let len = raw.length().unwrap_or(0);
-    let keys: Vec<String> = (0..len)
-        .filter_map(|i| raw.key(i).ok().flatten())
-        .filter(|k| k.starts_with("jc_"))
-        .collect();
-    for k in keys {
-        let _ = raw.remove_item(&k);
-    }
-    // `web-sys` lacks the `Location` feature here (Cargo.toml is owned
-    // elsewhere) — reload via the JS global instead.
-    let _ = js_sys::eval("location.reload()");
+    crate::appstate::apply(&crate::appstate::AppState::default(), "reset to defaults");
 }
 
 // --- chart helpers ---------------------------------------------------------------

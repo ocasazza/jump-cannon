@@ -2,14 +2,19 @@
 //! (the tvix-expr Generate panel; graph conversion ported from
 //! crates/graph-renderer/src/generate.rs::bootstrap_from_generated).
 //!
-//! Two graph-api endpoints back this panel:
+//! Two execution paths evaluate the expression:
 //!   - `POST /generate { expr }` → `{ ok, graph: { nodes, links }, error }` —
 //!     the egui panel's Server execution backend (`GenerateBackendChoice::Server`).
 //!     The server evaluates the Nix expression with the same embedded tvix
-//!     library the egui app bundles, so the demo catalog below evaluates
-//!     identically. `/generate` does NOT host the result; on success the graph
-//!     is converted client-side and replaces the live canvas graph — the same
-//!     contract as the egui `App::update` drain of `state.generate.pending`.
+//!     library this app bundles, so the demo catalog evaluates identically.
+//!     `/generate` does NOT host the result; on success the graph is converted
+//!     client-side and replaces the live canvas graph — the same contract as
+//!     the egui `App::update` drain of `state.generate.pending`.
+//!   - `tvix_wasm::eval_graph` in the browser — the egui Inline executor
+//!     (`ExecutionBackend::Inline`). Auto prefers Server and falls back to
+//!     Inline when graph-api is unreachable.
+//!
+//! One further endpoint backs the self-assembly examples:
 //!   - `POST /compute/soup { n, radius, seed, morphology }` — the self-assembly
 //!     particle-soup demo. The server hosts the soup as its active graph AND
 //!     selects the Geometric (GPU) engine with the validated membrane regime,
@@ -36,11 +41,6 @@ use crate::Ctx;
 
 // --- constants (verbatim from the egui app) -----------------------------------
 
-/// Radius of the seed sphere shell for a freshly generated graph — matches
-/// `crates/graph-renderer/src/generate.rs::SPAWN_RADIUS` (and this app's
-/// network-bootstrap path) so the result fits the camera the same way.
-const SPAWN_RADIUS: f32 = 800.0;
-
 /// Client-side mirror of the server's `MAX_SOUP_NODES` cap so an out-of-range
 /// `n` is rejected before the round-trip.
 const MAX_SOUP_NODES: u32 = 1_000_000;
@@ -56,105 +56,14 @@ in
   g.toGraphJSON (gc.starGen { nodes = 12; prefix = "n"; })
 "#;
 
-/// A named example expression for the editor's demo picker.
-struct Demo {
-    name: &'static str,
-    expr: &'static str,
+/// The built-in editor examples come straight from `tvix_wasm::demos()` — the
+/// same embedded catalog the egui app offered. The server embeds the same
+/// library, so every entry evaluates identically over `POST /generate` and
+/// through the Inline executor, and the catalog is covered by tvix-wasm's
+/// `all_demos_evaluate` test.
+fn demos() -> &'static [tvix_wasm::Demo] {
+    tvix_wasm::demos()
 }
-
-/// The built-in editor examples — verbatim `tvix_wasm::demos()` (this crate
-/// does not depend on tvix-wasm; the server embeds the same library, so every
-/// entry evaluates over `POST /generate` exactly as it does locally in the
-/// egui app, and the catalog is covered by tvix-wasm's `all_demos_evaluate`).
-const DEMOS: &[Demo] = &[
-    Demo {
-        name: "Star (hub)",
-        expr: r#"# Star: one hub connected to N spokes.
-let
-  g  = import /jc/src/graph.nix {};
-  gc = import /jc/src/graph-combinators.nix { graph = g; };
-in
-  g.toGraphJSON (gc.starGen { nodes = 12; prefix = "n"; })
-"#,
-    },
-    Demo {
-        name: "Chain (path)",
-        expr: r#"# Chain: a linear path — the primary self-assembly seed.
-let
-  g  = import /jc/src/graph.nix {};
-  gc = import /jc/src/graph-combinators.nix { graph = g; };
-in
-  g.toGraphJSON (gc.pathGen { nodes = 16; prefix = "p"; })
-"#,
-    },
-    Demo {
-        name: "Ring (cycle)",
-        expr: r#"# Ring: a closed cycle.
-let
-  g  = import /jc/src/graph.nix {};
-  gc = import /jc/src/graph-combinators.nix { graph = g; };
-in
-  g.toGraphJSON (gc.cycleGen { nodes = 16; prefix = "c"; })
-"#,
-    },
-    Demo {
-        name: "Grid (sheet)",
-        expr: r#"# Grid: a 2-D lattice — a flat "sheet" patch.
-let
-  g  = import /jc/src/graph.nix {};
-  gc = import /jc/src/graph-combinators.nix { graph = g; };
-in
-  g.toGraphJSON (gc.gridGen { rows = 6; cols = 6; prefix = "g"; })
-"#,
-    },
-    Demo {
-        name: "Complete (K6)",
-        expr: r#"# Complete: every node connected to every other.
-let
-  g  = import /jc/src/graph.nix {};
-  gc = import /jc/src/graph-combinators.nix { graph = g; };
-in
-  g.toGraphJSON (gc.completeGen { nodes = 6; prefix = "k"; })
-"#,
-    },
-    Demo {
-        name: "Bridged stars",
-        expr: r#"# Composition: two stars merged and joined by one bridge edge.
-let
-  g  = import /jc/src/graph.nix {};
-  gc = import /jc/src/graph-combinators.nix { graph = g; };
-  a = gc.starGen { nodes = 6; prefix = "a"; };
-  b = gc.starGen { nodes = 6; prefix = "b"; };
-in
-  g.toGraphJSON (g.addEdge "bridge" "a0" "b0" true (g.merge a b))
-"#,
-    },
-    Demo {
-        name: "Soup (self-assembly seed)",
-        expr: r#"# Unbonded particle soup: N isolated nodes, zero edges. The
-# initial condition for the dynamic-bonding self-assembly engine — bonds
-# (chains → sheets → tubes → vesicles) grow at runtime from this soup.
-let
-  g  = import /jc/src/graph.nix {};
-  gc = import /jc/src/graph-combinators.nix { graph = g; };
-in
-  g.toGraphJSON (gc.soupGen { nodes = 200; prefix = "s"; })
-"#,
-    },
-    Demo {
-        name: "Custom (edge list)",
-        expr: r#"# Author your own: build a graph from an explicit edge list.
-let
-  g = import /jc/src/graph.nix {};
-in
-  g.toGraphJSON (g.fromEdgeList [
-    { source = "x"; target = "y"; }
-    { source = "y"; target = "z"; }
-    { source = "z"; target = "x"; }
-  ])
-"#,
-    },
-];
 
 /// One self-assembly example — mirrors `crates/graph-renderer/src/ui/examples.rs`
 /// (`examples::catalog()`), keyed to the server's `/compute/soup` morphology
@@ -217,13 +126,15 @@ fn generator_expr(ex: &SoupExample) -> String {
 
 // --- execution backend ---------------------------------------------------------
 
-/// Port of `GenerateBackendChoice` (ui/state.rs). All four egui choices stay
-/// selectable so a persisted/staged pick round-trips, but only the Server path
-/// is wired in this build.
-// PARITY GAP: Inline and LocalWorker eval (tvix-wasm in the browser / the
-// tvix-worker Web Worker) are out of scope here — picking them surfaces an
-// inline error instead of evaluating. Auto's "else a local fallback" half is
-// likewise unavailable: Auto behaves as Server.
+/// Port of `GenerateBackendChoice` (ui/state.rs). Server evaluates over async
+/// HTTP to graph-api; Inline runs `tvix_wasm::eval_graph` in the browser; Auto
+/// prefers Server and falls back to Inline when graph-api is unreachable
+/// (`app.rs::resolve_generate_backend`, with Inline standing in for the
+/// retired wasm LocalWorker fallback).
+// PARITY GAP: the LocalWorker executor (tvix in a Web Worker via the deleted
+// crates/tvix-worker) stays retired — picking it falls back to the Inline
+// executor, the same fallback the egui native build used. Inline covers
+// client-side eval.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 enum Backend {
     #[default]
@@ -304,6 +215,9 @@ fn restore() -> Persisted {
 }
 
 fn persist() {
+    // Attribute the auto-snapshot — egui sections/generate.rs stamps
+    // `snapshot_source = Some("Generate")`.
+    crate::appstate::note_source("Generate");
     let p = Persisted {
         source: SOURCE.read().clone(),
         backend: *BACKEND.read(),
@@ -385,15 +299,56 @@ struct GenerateResp {
     error: Option<String>,
 }
 
-async fn generate(expr: &str) -> Result<GeneratedGraph, String> {
-    let resp: GenerateResp =
-        post_json("/generate", &serde_json::json!({ "expr": expr })).await?;
-    if resp.ok {
-        resp.graph
-            .ok_or_else(|| "server returned ok without a graph".to_string())
-    } else {
-        Err(resp.error.unwrap_or_else(|| "evaluation failed".to_string()))
+/// Server eval outcome, split so the Auto backend can distinguish "graph-api
+/// answered with an eval error" (surfaced, never falls back) from "graph-api
+/// is unreachable" (Auto's cue to fall back to the Inline executor — the egui
+/// `resolve_generate_backend` reachability probe, folded into the request
+/// itself since this app has no startup probe).
+enum ServerEval {
+    Graph(GeneratedGraph),
+    EvalErr(String),
+    Unreachable(String),
+}
+
+async fn generate_server(expr: &str) -> ServerEval {
+    match post_json::<_, GenerateResp>("/generate", &serde_json::json!({ "expr": expr })).await {
+        Err(e) => ServerEval::Unreachable(e),
+        Ok(resp) if resp.ok => match resp.graph {
+            Some(g) => ServerEval::Graph(g),
+            None => ServerEval::EvalErr("server returned ok without a graph".to_string()),
+        },
+        Ok(resp) => {
+            ServerEval::EvalErr(resp.error.unwrap_or_else(|| "evaluation failed".to_string()))
+        }
     }
+}
+
+async fn generate(expr: &str) -> Result<GeneratedGraph, String> {
+    match generate_server(expr).await {
+        ServerEval::Graph(g) => Ok(g),
+        ServerEval::EvalErr(e) | ServerEval::Unreachable(e) => Err(e),
+    }
+}
+
+/// Inline executor — `tvix_wasm::eval_graph` in the browser, the egui
+/// `ExecutionBackend::Inline` path. The egui wasm job ran paint-first-then-run
+/// (one queued frame so the busy chrome paints, then the synchronous eval
+/// blocks its frame); the 0 ms timer yield here is the same strategy — the
+/// "evaluating…" status flushes to the DOM before the blocking call.
+async fn eval_inline(expr: &str) -> Result<GeneratedGraph, String> {
+    gloo_timers::future::TimeoutFuture::new(0).await;
+    let g = tvix_wasm::eval_graph(expr)?;
+    Ok(GeneratedGraph {
+        nodes: g.nodes.into_iter().map(|n| GenNode { id: n.id }).collect(),
+        links: g
+            .edges
+            .into_iter()
+            .map(|e| GenLink {
+                source: e.source,
+                target: e.target,
+            })
+            .collect(),
+    })
 }
 
 /// `POST /compute/soup` — same soft-error contract.
@@ -441,18 +396,20 @@ fn wcc_count(n_nodes: usize, edges: &[u32]) -> u32 {
 }
 
 /// Convert a freshly evaluated graph into this app's `GraphData`, mirroring
-/// `bootstrap_from_generated`: dense first-seen `id -> idx` (duplicate ids
-/// collapse), edges kept only when both endpoints resolve (missing-endpoint
-/// edges silently dropped), positions seeded on the 800-radius sphere shell,
-/// `num_communities` 0 (Louvain is server-only) with a real `num_wcc`.
+/// `bootstrap_from_generated` + the `App::drain_generated_graph` position
+/// override: dense first-seen `id -> idx` (duplicate ids collapse), edges kept
+/// only when both endpoints resolve (missing-endpoint edges silently dropped),
+/// positions resolved from the Layout panel's Initial-seed strategy
+/// (`seed_positions_for`: jitter / built-in / custom Nix seed via
+/// `tvix_wasm::eval_seed`), `num_communities` 0 (Louvain is server-only) with
+/// a real `num_wcc`.
 // PARITY GAP: the egui path also derives client-side `degree` + `wcc` metric
-// BUFFERS so Style colour-by/size-by works without a server round-trip;
-// `GraphData` carries no metrics map, so colors/sizes fall back to defaults
-// (which is also what the egui defaults — community/pagerank — resolve to on
-// a generated graph).
-// PARITY GAP: the egui app seeds positions from the Layout panel's
-// Initial-seed strategy (`seed_positions_for`: jitter / built-in / custom Nix
-// seed); seed eval is tvix-local, so the sphere shell stands in here.
+// BUFFERS (Bootstrap.metrics) so Style colour-by/size-by works without a
+// server round-trip; this app has no client metrics home — `GraphData`
+// carries no metrics map and the Style panel's cache is fetched from
+// `/graph/metrics/:name` (both files outside this panel). Colors/sizes fall
+// back to defaults, which is also what the egui defaults — community /
+// pagerank — resolve to on a generated graph.
 fn graph_data_from_generated(g: &GeneratedGraph) -> GraphData {
     let mut id_to_idx: HashMap<String, u32> = HashMap::with_capacity(g.nodes.len());
     let mut ids: Vec<String> = Vec::with_capacity(g.nodes.len());
@@ -474,7 +431,11 @@ fn graph_data_from_generated(g: &GeneratedGraph) -> GraphData {
     }
     let n_edges = (edges.len() / 2) as u32;
 
-    let positions = render::data::spawn_on_unit_sphere(n, SPAWN_RADIUS);
+    // Honour the Layout panel's Initial-seed strategy for the generated
+    // graph's INITIAL positions, instead of always imposing the default sphere
+    // shell — so "No seed" actually means no pre-arranged seed on generation
+    // (the egui `drain_generated_graph` contract).
+    let positions = super::layout::seed_positions_for_generated(n);
     let metrics: HashMap<String, Vec<f32>> = HashMap::new();
     let colors = render::data::colors_from_metric("community", &metrics, n);
     let sizes = render::data::sizes_from_metric("pagerank", &metrics, n, 0.5);
@@ -506,34 +467,51 @@ pub fn panel(ctx: Ctx) -> Element {
     let soup_idx = (*SOUP_EXAMPLE.read()).min(SOUP_EXAMPLES.len() - 1);
 
     // Evaluate — the egui flow queues a one-shot request and `App::update`
-    // dispatches it to the picked `ExecutionBackend`; here the Server backend
-    // is the only wired executor, dispatched as an async task off the click.
+    // dispatches it to the picked `ExecutionBackend`; here the dispatch is an
+    // async task off the click. Server evaluates over async HTTP; Inline runs
+    // tvix-wasm in the browser; Auto prefers Server and falls back to Inline
+    // when graph-api is unreachable.
     let evaluate = move |_| {
         if *RUNNING.read() || SOURCE.read().trim().is_empty() {
             return;
         }
-        match *BACKEND.read() {
-            Backend::Inline | Backend::LocalWorker => {
-                // PARITY GAP: local executors (tvix-wasm inline / tvix-worker)
-                // are not bundled in the Dioxus build — Server is the target.
-                *ERROR.write() = Some(
-                    "local eval (Inline / Local worker) is not available in this \
-                     build yet — pick Server (graph-api) or Auto"
-                        .to_string(),
-                );
-                *STATUS.write() = None;
-                return;
-            }
-            Backend::Auto | Backend::Server => {}
-        }
+        let backend = *BACKEND.read();
         let src = SOURCE.read().clone();
         *RUNNING.write() = true;
         *ERROR.write() = None;
         *STATUS.write() = Some("queued…".to_string());
         let mut graph = ctx.graph;
         spawn(async move {
-            *STATUS.write() = Some("evaluating on the server…".to_string());
-            match generate(&src).await {
+            let result = match backend {
+                Backend::Server => {
+                    *STATUS.write() = Some("evaluating on the server…".to_string());
+                    generate(&src).await
+                }
+                // PARITY GAP: LocalWorker (tvix in a Web Worker via the
+                // deleted crates/tvix-worker) stays retired — it falls back
+                // to the Inline executor, like the egui native build did.
+                Backend::Inline | Backend::LocalWorker => {
+                    *STATUS.write() = Some("evaluating locally…".to_string());
+                    eval_inline(&src).await
+                }
+                Backend::Auto => {
+                    *STATUS.write() = Some("evaluating on the server…".to_string());
+                    match generate_server(&src).await {
+                        ServerEval::Graph(g) => Ok(g),
+                        // A real eval error from a reachable server — surface
+                        // it; falling back would just re-pay the eval.
+                        ServerEval::EvalErr(e) => Err(e),
+                        // Unreachable → the local fallback (egui
+                        // resolve_generate_backend with Auto).
+                        ServerEval::Unreachable(_) => {
+                            *STATUS.write() =
+                                Some("server unreachable — evaluating locally…".to_string());
+                            eval_inline(&src).await
+                        }
+                    }
+                }
+            };
+            match result {
                 Ok(g) => {
                     // Replace the live graph client-side (the egui pending →
                     // Bootstrap → GPU promotion path). `/generate` does not
@@ -732,9 +710,8 @@ pub fn panel(ctx: Ctx) -> Element {
                         key: "{b.key()}",
                         value: "{b.key()}",
                         title: if b == Backend::LocalWorker {
-                            "Offline Web Worker eval. Currently falls back to the local \
-                             executor — the trunk worker bundle is feasibility-gated \
-                             (see tvix-worker)."
+                            "Offline Web Worker eval. Falls back to the Inline executor — \
+                             the tvix-worker crate is retired."
                         } else {
                             ""
                         },
@@ -757,7 +734,7 @@ pub fn panel(ctx: Ctx) -> Element {
                 value: "",
                 onchange: move |e| {
                     if let Ok(i) = e.value().parse::<usize>() {
-                        if let Some(d) = DEMOS.get(i) {
+                        if let Some(d) = demos().get(i) {
                             *SOURCE.write() = d.expr.to_string();
                             *ERROR.write() = None;
                             *STATUS.write() = None;
@@ -766,7 +743,7 @@ pub fn panel(ctx: Ctx) -> Element {
                     }
                 },
                 option { value: "", disabled: true, selected: true, "Load an example…" }
-                for (i, d) in DEMOS.iter().enumerate() {
+                for (i, d) in demos().iter().enumerate() {
                     option { key: "{d.name}", value: "{i}", "{d.name}" }
                 }
             }

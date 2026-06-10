@@ -347,29 +347,119 @@ pub fn pick(x: f32, y: f32) -> Option<u32> {
     .flatten()
 }
 
-/// Hover feedback: node hover wins; otherwise edge hover; both flow into
-/// the effects uniform (white rim / brightened edge in the shaders).
-pub fn update_hover(x: f32, y: f32) {
+/// Edge pick at canvas-local CSS-pixel coords. Mirrors the egui app's
+/// `raycast_edge_idx` feed; 1.5 px is the default `edge_width` in
+/// EffectsUniform (the same constant the old `update_hover` used).
+pub fn pick_edge(x: f32, y: f32) -> Option<u32> {
     with_host(|h| {
         let (w, hgt) = h.logical_size();
-        let screen = [w.max(1.0), hgt.max(1.0)];
         let ndc = to_ndc(x, y, w, hgt);
-        let node = h.pipes.raycast(ndc[0], ndc[1], screen);
+        h.pipes.raycast_edge(ndc, [w.max(1.0), hgt.max(1.0)], 1.5)
+    })
+    .flatten()
+}
+
+/// Hover feedback to the shaders (white node rim / brightened edge).
+/// Pure GPU-state write — the picking, 50 ms throttle, and 250 ms
+/// release-hold policy live in `crate::anchored`, which owns the hover
+/// pipeline (port of the egui app's `update_hover_focus`).
+pub fn set_hover_feedback(node: Option<u32>, edge: Option<u32>) {
+    with_host(|h| {
         h.pipes.set_hovered_node(node);
-        let edge = if node.is_none() {
-            // 1.5 = the default `edge_width` in EffectsUniform.
-            h.pipes.raycast_edge(ndc, screen, 1.5)
-        } else {
-            None
-        };
         h.pipes.set_hovered_edge(edge);
     });
 }
 
-pub fn clear_hover() {
+// --- anchored-card projection / focus-set accessors (phase 4) -----------------
+
+/// Project node `idx`'s world position through the same proj*view the
+/// renderer draws with (port of the egui `project_world_to_canvas`,
+/// crates/graph-renderer/src/ui/anchored.rs at 723af10). Returns
+/// canvas-local CSS-pixel coords plus whether the NDC point sits inside
+/// the viewport; `None` = behind camera (`clip.w <= 0`), no host, or no
+/// such node. The aspect comes from the live canvas size — the rAF tick
+/// keeps `camera.aspect` in sync here (no egui one-frame-lag trap), but
+/// deriving it from the same `logical_size` the raycast uses keeps the
+/// two code paths trivially identical.
+pub fn project_node(idx: u32) -> Option<(f32, f32, bool)> {
     with_host(|h| {
-        h.pipes.set_hovered_node(None);
-        h.pipes.set_hovered_edge(None);
+        let world = h.pipes.position_of(idx)?;
+        if !world.is_finite() {
+            return None;
+        }
+        let (w, hgt) = h.logical_size();
+        let (w, hgt) = (w.max(1.0), hgt.max(1.0));
+        let aspect = (w / hgt).max(0.0001);
+        let cam = &h.pipes.camera;
+        let view = glam::Mat4::look_to_rh(cam.position, cam.forward(), glam::Vec3::Y);
+        let proj = glam::Mat4::perspective_rh(cam.fov_y, aspect, cam.znear, cam.zfar);
+        let clip = (proj * view) * world.extend(1.0);
+        if clip.w <= 0.0 {
+            return None;
+        }
+        let ndc_x = clip.x / clip.w;
+        let ndc_y = clip.y / clip.w;
+        // NDC y is up; CSS pixel y is down — flip on y.
+        let sx = (ndc_x * 0.5 + 0.5) * w;
+        let sy = (1.0 - (ndc_y * 0.5 + 0.5)) * hgt;
+        let on_screen = (-1.0..=1.0).contains(&ndc_x) && (-1.0..=1.0).contains(&ndc_y);
+        Some((sx, sy, on_screen))
+    })
+    .flatten()
+}
+
+/// Canvas bounding rect in *viewport* CSS pixels: (left, top, width,
+/// height). The anchored-card overlay renders `position:fixed` at the app
+/// root, so canvas-local projected coords need this offset.
+///
+/// web-sys's typed `get_bounding_client_rect` needs the `DomRect` cargo
+/// feature, which the workspace web-sys doesn't enable (and Cargo.toml is
+/// frozen for this phase) — go through `js_sys::Reflect` instead.
+pub fn canvas_rect() -> Option<(f32, f32, f32, f32)> {
+    let el = canvas_el()?;
+    let func = js_sys::Reflect::get(el.as_ref(), &JsValue::from_str("getBoundingClientRect")).ok()?;
+    let func: js_sys::Function = func.dyn_into().ok()?;
+    let rect = func.call0(el.as_ref()).ok()?;
+    let get = |k: &str| {
+        js_sys::Reflect::get(&rect, &JsValue::from_str(k))
+            .ok()
+            .and_then(|v| v.as_f64())
+    };
+    Some((
+        get("left")? as f32,
+        get("top")? as f32,
+        get("width")? as f32,
+        get("height")? as f32,
+    ))
+}
+
+/// Push the per-node focus dim mask (hover/click community focus — the
+/// `anchored` module's `apply_focus_set_to_gpu` arm). Coexists with the
+/// filter panel's `sync_gpu` writes: both go through `set_focus_set`, and
+/// `anchored` defers to `panels::filter::sync_gpu()` whenever no node is
+/// focused, matching the egui dispatch.
+pub fn push_focus_set(focused: Option<u32>, members: &HashSet<u32>) {
+    with_host(|h| {
+        let (pipes, queue) = h.pipes_and_queue();
+        pipes.set_focus_set(queue, focused, members);
+    });
+}
+
+/// Fly the camera to look at node `idx` (port of the egui
+/// `focus_node_by_id` camera move, app.rs:794 at 723af10). Distance
+/// scales with graph radius so a small graph doesn't fly way back and a
+/// huge one still lets the node fill ~25% of the viewport.
+pub fn look_at_node(idx: u32) {
+    with_host(|h| {
+        let Some(pos) = h.pipes.position_of(idx) else {
+            return;
+        };
+        let distance = h
+            .pipes
+            .bounds()
+            .map(|(mn, mx)| ((mx - mn) * 0.5).length().max(50.0) * 0.6)
+            .unwrap_or(500.0);
+        h.pipes.camera.look_at_point(pos, distance);
     });
 }
 

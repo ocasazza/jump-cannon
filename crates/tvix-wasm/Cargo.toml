@@ -11,12 +11,16 @@ crate-type = ["cdylib", "rlib"]
 default = []
 wasm = ["wasm-bindgen", "js-sys", "console_error_panic_hook"]
 
+# Concrete versions, NOT `workspace = true`: app/ui consumes this crate as a
+# path dependency from the app workspace's nix build, where the repo-root
+# workspace manifest is outside the source fileset (same rule graph-layouts
+# follows). Keep these in sync with [workspace.dependencies] at the root.
 [dependencies]
-wasm-bindgen           = { workspace = true, optional = true }
+wasm-bindgen           = { version = "0.2", optional = true }
 js-sys                 = { version = "0.3", optional = true }
 console_error_panic_hook = { version = "0.1", optional = true }
-serde      = { workspace = true }
-serde_json = { workspace = true }
+serde      = { version = "1", features = ["derive"] }
+serde_json = "1"
 bytes      = "1"
 
 # tvix-eval is an UNCONDITIONAL dependency. default-features=false drops the

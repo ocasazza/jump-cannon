@@ -217,9 +217,10 @@ impl CommunitySource {
 
 /// Verbatim field-for-field port of ui/state.rs::StyleState, including the
 /// serde defaults so persisted blobs survive field additions. All fields
-/// are `Copy` so the loop mirror below can live in a `Cell`.
+/// are `Copy` so the loop mirror below can live in a `Cell`. `pub(crate)`
+/// so `crate::appstate` can carry it as the round-trip `style` field.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
-struct StyleState {
+pub(crate) struct StyleState {
     size_by: SizeBy,
     color_by: ColorBy,
     #[serde(default)]
@@ -736,6 +737,9 @@ thread_local! {
 }
 
 fn update(mutate: impl FnOnce(&mut StyleState)) {
+    // Attribute the auto-snapshot like the egui section, which stamps
+    // `snapshot_source = Some("Style")` every frame it renders.
+    crate::appstate::note_source("Style");
     let snap = {
         let mut s = STYLE.write();
         mutate(&mut s);
@@ -745,6 +749,24 @@ fn update(mutate: impl FnOnce(&mut StyleState)) {
     STYLE_MIRROR.with(|c| c.set(snap));
     ensure_metrics(&snap);
     apply_now();
+}
+
+/// AppState round-trip seam (`crate::appstate`): the live style state.
+pub(crate) fn state_snapshot() -> StyleState {
+    *STYLE.read()
+}
+
+/// Reset to the egui defaults — the palette's `reset-style` builtin
+/// (the same swap the panel's own "↺ defaults" button performs).
+pub(crate) fn reset_to_defaults() {
+    update(|s| *s = StyleState::default());
+}
+
+/// AppState round-trip seam: write an imported style straight to
+/// localStorage. The apply path reloads the page, and the boot re-seed of
+/// [`STYLE`] is the live swap — no signal write needed here.
+pub(crate) fn state_restore(s: &StyleState) {
+    let _ = LocalStorage::set(STORE_KEY, s);
 }
 
 /// Kick off fetches for every server-served metric the current style needs
@@ -889,18 +911,16 @@ fn apply_now() {
     }
 }
 
-fn ensure_init() {
+/// `pub(crate)`: `appstate::ensure_init` arms this loop from the FIRST
+/// panel that renders (Nodes is open in the default layout), so style
+/// applies from effective app start like the egui update loop — not only
+/// once the Style panel itself first opens.
+pub(crate) fn ensure_init() {
     if INIT.with(|c| c.replace(true)) {
         return;
     }
     let s = *STYLE.read();
     STYLE_MIRROR.with(|c| c.set(s));
-    // PARITY GAP: the egui app applies style from app start (its update
-    // loop owns apply_style_to_gpu); this loop only starts once the Style
-    // panel first renders (the panel module is the only code this file may
-    // own). Until then the canvas shows graph_canvas::load()'s defaults,
-    // which equal StyleState::default().
-    //
     // PARITY GAP: after a loop-triggered recompute with the panel closed
     // (Graph panel minimize → restore), the selection-emphasis re-push is
     // skipped (stale mirror) — emphasis/dim return on the next selection or
@@ -995,6 +1015,7 @@ fn hex_rgb(s: &str) -> Option<[f32; 3]> {
 
 pub fn panel(ctx: Ctx) -> Element {
     ensure_init();
+    crate::appstate::ensure_init();
     // Selection mirror for the post-recompute overlay re-push. Kept fresh
     // for as long as the panel renders (the workspace re-renders open
     // panels whenever the selection signal changes).

@@ -24,8 +24,11 @@ const STORE_KEY: &str = "jc_camera_v1";
 
 // --- state (mirrors ui/state.rs::{CameraState, FocusState}) -------------------
 
-#[derive(Clone, Copy, PartialEq, Serialize, Deserialize)]
-struct CameraState {
+// `CameraState` / `FocusState` are `pub(crate)` so `crate::appstate` can
+// carry them as the round-trip `camera` / `focus` fields (the same two
+// top-level fields the egui AppState persists).
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub(crate) struct CameraState {
     invert_mouse_x: bool,
     invert_mouse_y: bool,
     invert_ad: bool,
@@ -47,8 +50,8 @@ impl Default for CameraState {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Serialize, Deserialize)]
-struct FocusState {
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub(crate) struct FocusState {
     /// Master DoF toggle. When false, the shader runs the sharp path
     /// for every node (no bokeh halo, no fragment-area inflation) —
     /// this is the cosmograph baseline. When true, the configured
@@ -142,12 +145,28 @@ thread_local! {
 }
 
 fn update(mutate: impl FnOnce(&mut Persisted)) {
+    // Attribute the auto-snapshot like the egui section, which stamps
+    // `snapshot_source = Some("Camera")` every frame it renders.
+    crate::appstate::note_source("Camera");
     let snap = {
         let mut s = STATE.write();
         mutate(&mut s);
         *s
     };
     sync(&snap);
+}
+
+/// AppState round-trip seam (`crate::appstate`): the live camera + focus
+/// states (egui's two top-level AppState fields).
+pub(crate) fn state_snapshot() -> (CameraState, FocusState) {
+    let s = *STATE.read();
+    (s.camera, s.focus)
+}
+
+/// AppState round-trip seam: write imported camera + focus straight to
+/// localStorage; the apply path's reload re-seeds [`STATE`].
+pub(crate) fn state_restore(camera: &CameraState, focus: &FocusState) {
+    let _ = LocalStorage::set(STORE_KEY, &Persisted { camera: *camera, focus: *focus });
 }
 
 fn sync(s: &Persisted) {
@@ -172,15 +191,21 @@ fn push_focus(f: &FocusState) {
     });
 }
 
-fn ensure_init() {
+/// `pub(crate)`: `appstate::ensure_init` arms this loop from the FIRST
+/// panel that renders (Nodes is open in the default layout), so
+/// follow-centroid / fit-to-window run from effective app start like the
+/// egui update loop — not only once the Camera panel itself first opens.
+pub(crate) fn ensure_init() {
     if INIT.with(|c| c.replace(true)) {
         return;
     }
     let s = *STATE.read();
     sync(&s);
-    // PARITY GAP: the egui app runs follow-centroid / fit-to-window from
-    // app start; this loop only starts once the Camera panel first renders
-    // (the panel module is the only code this file may own).
+    // Push the persisted focus mode into the hover/click focus engine
+    // (anchored.rs) — variant order is identical by construction.
+    if let Some(i) = FocusMode::ALL.iter().position(|m| *m == s.focus.focus_mode) {
+        crate::anchored::set_focus_mode(crate::anchored::FocusMode::ALL[i]);
+    }
     wasm_bindgen_futures::spawn_local(async move {
         let mut last_fit_screen: Option<(f64, f64)> = None;
         loop {
@@ -297,6 +322,7 @@ fn slider_row(
 
 pub fn panel(_ctx: Ctx) -> Element {
     ensure_init();
+    crate::appstate::ensure_init();
     let s = *STATE.read();
     let c = s.camera;
     let f = s.focus;
@@ -351,15 +377,16 @@ pub fn panel(_ctx: Ctx) -> Element {
 
             div { class: "cam-row",
                 span { class: "cam-label", "Focus mode" }
-                // PARITY GAP: the hover/click → focus-set computation
-                // (focus_set::compute → set_focus_set) hasn't been ported to
-                // the Dioxus shell yet; the selected mode is stored for it.
                 select { class: "cam-select",
                     onchange: move |e| {
                         if let Ok(i) = e.value().parse::<usize>() {
                             if let Some(&m) = FocusMode::ALL.get(i) {
                                 if m.enabled() {
                                     update(|s| s.focus.focus_mode = m);
+                                    // Same variant order on both enums.
+                                    crate::anchored::set_focus_mode(
+                                        crate::anchored::FocusMode::ALL[i],
+                                    );
                                 }
                             }
                         }

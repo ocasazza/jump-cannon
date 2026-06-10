@@ -108,8 +108,10 @@ struct MetricsSnapshot {
 
 /// localStorage shape — the same fields egui's `MetricsState` persists
 /// (the one-shot request flags it `skip`s are direct calls here).
+/// `pub(crate)` so `crate::appstate` can carry it as the round-trip
+/// `metrics` field.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
-struct Persisted {
+pub(crate) struct Persisted {
     #[serde(default)]
     pinned: Vec<MetricKind>,
     #[serde(default)]
@@ -131,6 +133,17 @@ fn persist() {
         STORE_KEY,
         Persisted { pinned: PINNED.read().clone(), last: *SNAP.read(), auto: *AUTO.read() },
     );
+}
+
+/// AppState round-trip seam (`crate::appstate`): the live metrics state.
+pub(crate) fn state_snapshot() -> Persisted {
+    Persisted { pinned: PINNED.read().clone(), last: *SNAP.read(), auto: *AUTO.read() }
+}
+
+/// AppState round-trip seam: write imported metrics state straight to
+/// localStorage; the apply path's reload re-seeds the signals.
+pub(crate) fn state_restore(s: &Persisted) {
+    let _ = LocalStorage::set(STORE_KEY, s);
 }
 
 /// Mirror of `App::drain_metrics_request`: cheap O(E) metrics always; the
@@ -181,6 +194,7 @@ fn compute(full: bool) {
 // --- view ------------------------------------------------------------------------
 
 pub fn panel(_ctx: Ctx) -> Element {
+    crate::appstate::ensure_init();
     rsx! { MetricsPanel {} }
 }
 

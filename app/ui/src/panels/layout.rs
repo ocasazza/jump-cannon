@@ -57,7 +57,7 @@ const BRIDGE_REMOTE_FA2: &str = "remote-fa2";
 // --- panel-local state ---------------------------------------------------------
 
 /// Mirror of the egui `SeedStrategy` (ui/state.rs). `BuiltIn(i)` indexes
-/// [`SEED_BUILTIN_NAMES`].
+/// `tvix_wasm::seed_demos()` (via [`builtin_demo_indices`]).
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 enum SeedStrategy {
     #[default]
@@ -94,6 +94,9 @@ fn load_state() -> PanelState {
 }
 
 fn persist(s: &PanelState) {
+    // Attribute the auto-snapshot — egui sections/layout.rs stamps
+    // `snapshot_source = Some("Layout")`.
+    crate::appstate::note_source("Layout");
     let _ = LocalStorage::set(STORE_KEY, s);
 }
 
@@ -1037,75 +1040,18 @@ impl SelfAssemblyPreset {
 
 // --- initial seed (port of ui/sections/seed.rs) --------------------------------------
 
-/// Built-in strategies from `tvix_wasm::seed_demos()` ("No seed" and
-/// "Custom…" entries are surfaced via the dedicated picker options instead).
-const SEED_BUILTIN_NAMES: &[&str] = &[
-    "Sphere (Fibonacci shell)",
-    "Random (ball)",
-    "Grid (cubic lattice)",
-];
-
-/// Native ports of the seed.nix built-ins (same parameters the demo
-/// expressions pass: sphere r=800, random r=800 seed=1, grid spacing=60).
-// PARITY GAP: the egui app evaluates these through tvix_wasm::eval_seed; the
-// app workspace can't depend on crates/tvix-wasm (the nix appSrc fileset only
-// includes crates/graph-layouts), so the built-ins are computed natively.
-// Sphere matches exactly (same Fibonacci lattice); random/grid match the
-// seed.nix math (LCG cube / cubic lattice) up to tvix's Taylor-series trig.
-fn builtin_seed_flat(i: usize, n: usize) -> Vec<f32> {
-    match i {
-        0 => render::data::spawn_on_unit_sphere(n, 800.0),
-        1 => seed_random_cube(n, 800.0, 1),
-        2 => seed_grid_lattice(n, 60.0),
-        _ => Vec::new(),
-    }
-}
-
-/// seed.nix `random`: per-index 16-bit LCG (ranqd1 params), 3 chained
-/// rounds per axis, points in a cube of half-extent `radius`.
-fn seed_random_cube(n: usize, radius: f32, seed: i64) -> Vec<f32> {
-    const M: i64 = 65536;
-    fn modm(v: i64) -> i64 {
-        ((v % M) + M) % M
-    }
-    fn lcg(s: i64) -> i64 {
-        modm(s * 25173 + 13849)
-    }
-    let hash = |i: i64, salt: i64| -> f32 {
-        let a = lcg(seed * 977 + i * 131 + salt * 31);
-        let b = lcg(a + i * 17 + salt * 7);
-        let c = lcg(b + i);
-        c as f32 / M as f32
-    };
-    let mut out = Vec::with_capacity(n * 3);
-    for i in 0..n {
-        let i = i as i64;
-        out.push((hash(i, 1) - 0.5) * 2.0 * radius);
-        out.push((hash(i, 2) - 0.5) * 2.0 * radius);
-        out.push((hash(i, 3) - 0.5) * 2.0 * radius);
-    }
-    out
-}
-
-/// seed.nix `grid`: axis-aligned cubic lattice, side = ceil(cbrt n), centred.
-fn seed_grid_lattice(n: usize, spacing: f32) -> Vec<f32> {
-    let nn = n.max(1);
-    let mut side = (nn as f64).cbrt().ceil() as usize;
-    side = side.max(1);
-    if side * side * side < nn {
-        side += 1;
-    }
-    let half = (side as f32 - 1.0) * spacing / 2.0;
-    let mut out = Vec::with_capacity(nn * 3);
-    for i in 0..nn {
-        let ix = i % side;
-        let iy = (i / side) % side;
-        let iz = i / (side * side);
-        out.push(ix as f32 * spacing - half);
-        out.push(iy as f32 * spacing - half);
-        out.push(iz as f32 * spacing - half);
-    }
-    out
+/// Indices into `tvix_wasm::seed_demos()` that are exposed as first-class
+/// "built-in" strategies in the picker. The catalog also ships a "No seed" and
+/// a "Custom (flat line)" entry, but those are surfaced via the dedicated
+/// `No seed` and `Custom (Nix)` picker options instead, so they are excluded
+/// here by name (verbatim `seed.rs::builtin_demo_indices`).
+fn builtin_demo_indices() -> Vec<usize> {
+    tvix_wasm::seed_demos()
+        .iter()
+        .enumerate()
+        .filter(|(_, d)| d.name != "No seed" && !d.name.starts_with("Custom"))
+        .map(|(i, _)| i)
+        .collect()
 }
 
 /// Write the gpu-force layout's `seed_mode` so the running sim treats the
@@ -1142,24 +1088,94 @@ fn set_seed_strategy(s: SeedStrategy) {
 }
 
 fn apply_builtin_seed(i: usize) {
+    let expr = tvix_wasm::seed_demos()
+        .get(i)
+        .map(|d| d.expr.to_string())
+        .unwrap_or_default();
+    apply_seed_expr(&expr);
+}
+
+/// Evaluate a seed expression via `tvix_wasm::eval_seed` against the live node
+/// count and write the result into the GPU positions buffer — the egui
+/// `seed.rs::apply_button` + `set_pending` semantics, with the renderer host
+/// standing in for the `state.seed.pending` → `App::update` drain:
+///   * `Ok(non-empty)` applies the positions and flips the gpu-force
+///     `seed_mode` to `"none"` so they survive the sim re-init,
+///   * `Ok(empty)` is the "no seed" sentinel — status only, nothing applied,
+///   * `Err` lands in the panel's error chrome.
+/// The eval runs synchronously on the click handler, the same cost the egui
+/// app paid (its seed path never went through a background job).
+fn apply_seed_expr(expr: &str) {
     let Some(n) = render::with_host(|h| h.pipes.n_nodes() as usize) else {
         *SEED_ERROR.write() = Some("renderer not mounted — open the Graph panel first".to_string());
         return;
     };
-    let flat = builtin_seed_flat(i, n);
-    if flat.len() != n * 3 {
-        *SEED_ERROR.write() = Some("seed generation failed".to_string());
-        return;
-    }
-    match render::with_host(|h| h.apply_positions(&flat)) {
-        Some(Ok(())) => {
+    match tvix_wasm::eval_seed(expr, n) {
+        Ok(positions) => {
             *SEED_ERROR.write() = None;
-            *SEED_STATUS.write() = Some(format!("applied {n} positions"));
-            // Keep the just-applied positions through the sim re-init.
-            set_gpu_force_seed_mode(true);
+            if positions.is_empty() {
+                *SEED_STATUS.write() = Some("no seed applied (empty result)".to_string());
+                return;
+            }
+            let flat: Vec<f32> = positions.into_iter().flatten().collect();
+            match render::with_host(|h| h.apply_positions(&flat)) {
+                Some(Ok(())) => {
+                    *SEED_STATUS.write() = Some(format!("applied {n} positions"));
+                    // Keep the just-applied positions through the sim re-init.
+                    set_gpu_force_seed_mode(true);
+                }
+                Some(Err(e)) => *SEED_ERROR.write() = Some(e),
+                None => *SEED_ERROR.write() = Some("renderer not mounted".to_string()),
+            }
         }
-        Some(Err(e)) => *SEED_ERROR.write() = Some(e),
-        None => *SEED_ERROR.write() = Some("renderer not mounted".to_string()),
+        Err(err) => *SEED_ERROR.write() = Some(err),
+    }
+}
+
+/// Minimal "No seed" placement for a freshly generated graph: a small
+/// deterministic jitter so nodes aren't coincident (degenerate), WITHOUT the
+/// big pre-spread sphere — the force sim builds the layout from here. Radius
+/// is a few units, growing slowly with `n` so a large graph isn't
+/// pathologically dense (verbatim `generate.rs::jitter_positions`).
+fn jitter_positions(n: usize) -> Vec<f32> {
+    let r = 2.0 + (n as f32).max(1.0).cbrt();
+    let mut out = vec![0.0f32; 3 * n];
+    for (i, slot) in out.iter_mut().enumerate() {
+        // SplitMix64 finaliser on the index → deterministic unit in [0,1).
+        let mut z = (i as u64).wrapping_add(0x9E37_79B9_7F4A_7C15);
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^= z >> 31;
+        let unit = (z >> 40) as f32 / (1u64 << 24) as f32;
+        *slot = (unit * 2.0 - 1.0) * r;
+    }
+    out
+}
+
+/// Resolve the INITIAL positions for a freshly generated graph of `n` nodes
+/// from this panel's active Initial-seed strategy — instead of always applying
+/// the default sphere shell. Port of the egui
+/// `crates/graph-renderer/src/generate.rs::seed_positions_for` (called by the
+/// Generate panel, the `App::drain_generated_graph` contract):
+///   - `None` → a minimal jitter (the sim arranges from there),
+///   - `BuiltIn(i)` → the embedded `seed_demos()[i]` strategy via `eval_seed`,
+///   - `Custom` → the user's Nix seed expression via `eval_seed`.
+/// Any eval failure / wrong-length result falls back to the jitter.
+pub(crate) fn seed_positions_for_generated(n: usize) -> Vec<f32> {
+    let st = STATE.read().clone();
+    let expr: Option<String> = match st.seed_strategy {
+        SeedStrategy::None => None,
+        SeedStrategy::BuiltIn(i) => tvix_wasm::seed_demos()
+            .get(i)
+            .map(|d| d.expr.to_string()),
+        SeedStrategy::Custom => Some(st.seed_custom),
+    };
+    match expr {
+        None => jitter_positions(n),
+        Some(src) => match tvix_wasm::eval_seed(&src, n) {
+            Ok(p) if p.len() == n => p.into_iter().flatten().collect(),
+            _ => jitter_positions(n),
+        },
     }
 }
 
@@ -1598,15 +1614,8 @@ fn seed_section() -> Element {
                     class: "lay-btn",
                     title: "Evaluate the seed expression and place the nodes",
                     onclick: move |_| {
-                        // PARITY GAP: the egui app evaluates custom seeds via
-                        // tvix_wasm::eval_seed; tvix-wasm is outside the app
-                        // workspace's nix fileset, so custom Nix seeds can't
-                        // run here yet.
-                        *SEED_ERROR.write() = Some(
-                            "custom Nix seeds need tvix-wasm, which is not wired into the \
-                             Dioxus app yet — use a built-in seed (PARITY GAP)"
-                                .to_string(),
-                        );
+                        let src = STATE.read().seed_custom.clone();
+                        apply_seed_expr(&src);
                     },
                     "Apply seed"
                 }
@@ -1645,12 +1654,12 @@ fn seed_section() -> Element {
                     selected: matches!(strategy, SeedStrategy::None),
                     "No seed"
                 }
-                for (i, name) in SEED_BUILTIN_NAMES.iter().enumerate() {
+                for i in builtin_demo_indices() {
                     option {
                         key: "{i}",
                         value: "b{i}",
                         selected: strategy == SeedStrategy::BuiltIn(i),
-                        "{name}"
+                        {tvix_wasm::seed_demos()[i].name}
                     }
                 }
                 option {

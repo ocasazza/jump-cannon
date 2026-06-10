@@ -46,3 +46,15 @@ web-sys = { workspace = true, features = [
 ] }
 tracing = "0.1"
 tracing-wasm = "0.2"
+# AppState round-trip (phase 4): YAML import/export in the Instances panel
+# (serde_yml is the maintained fork of the archived serde_yaml) and the
+# share-link codec (JSON → DEFLATE → base64url) — same crates the egui
+# app used. Both pure-Rust, wasm32-clean.
+serde_yml = "0.0.12"
+base64 = "0.22"
+miniz_oxide = "0.8"
+# Client-side Nix evaluation (phase 4): the Layout panel's custom seed
+# expressions and the Generate panel's Inline executor. One-way edge —
+# tvix-wasm never depends on app code. Same path dep the egui app carried;
+# the nix appSrc fileset must include crates/tvix-wasm for this.
+tvix-wasm = { path = "../../crates/tvix-wasm" }
