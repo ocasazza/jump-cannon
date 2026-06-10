@@ -6,8 +6,8 @@
   "build": {
     "frontendDist": "../ui/dist",
     "devUrl": "http://localhost:8081",
-    "beforeDevCommand": { "script": "trunk serve", "cwd": "../ui", "wait": false },
-    "beforeBuildCommand": { "script": "trunk build --release", "cwd": "../ui" }
+    "beforeDevCommand": { "script": "trunk serve", "cwd": "..", "wait": false },
+    "beforeBuildCommand": { "script": "trunk build --release", "cwd": ".." }
   },
   "app": {
     "withGlobalTauri": true,

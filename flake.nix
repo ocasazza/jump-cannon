@@ -545,10 +545,53 @@
           wasm-bindgen-cli = pkgs.wasm-bindgen-cli_0_2_118;
         });
 
+        # ----- app-web: the Dioxus frontend (app/ workspace), trunk-built -----
+        #
+        # The app/ workspace is deliberately separate from this one (it owns
+        # the Tauri/Dioxus dependency tree), but its WASM frontend builds
+        # through the same crane + trunk machinery. The workspace is fully
+        # self-contained: the prost output is checked in (app/ui/src/proto/),
+        # so no protoc and no reach outside app/ — the source filter below is
+        # all it needs. wasm-bindgen is pinned to =0.2.118 in app/Cargo.toml
+        # to match the nixpkgs CLI exactly (no version-skew caveats like the
+        # graph-renderer-web note above).
+        #
+        # The Tauri shell itself stays a devshell build (`just app-dev` /
+        # `just app-build`): bundling needs platform signing toolchains that
+        # nix can't usefully sandbox on macOS.
+        appSrc = pkgs.lib.fileset.toSource {
+          root = ./app;
+          fileset = pkgs.lib.fileset.fileFilter
+            (file: builtins.any file.hasExt [ "rs" "toml" "lock" "html" "css" ])
+            ./app;
+        };
+
+        depsAppWasm = craneLibWasm.buildDepsOnly {
+          pname = "app-web-deps";
+          version = "0.1.0";
+          src = appSrc;
+          strictDeps = true;
+          CARGO_BUILD_TARGET = "wasm32-unknown-unknown";
+          cargoExtraArgs = "--package jump-cannon-ui";
+          doCheck = false;
+        };
+
+        app-web = craneLib.buildTrunkPackage {
+          pname = "app-web";
+          version = "0.1.0";
+          src = appSrc;
+          strictDeps = true;
+          cargoArtifacts = depsAppWasm;
+          CARGO_BUILD_TARGET = "wasm32-unknown-unknown";
+          trunkIndexPath = "ui/index.html";
+          cargoExtraArgs = "--package jump-cannon-ui";
+          wasm-bindgen-cli = pkgs.wasm-bindgen-cli_0_2_118;
+        };
+
       in {
         packages = {
           default          = graph-api;
-          inherit vault-search graph-api graph-compute graph-layouts-wasm tvix-wasm graph-renderer-web;
+          inherit vault-search graph-api graph-compute graph-layouts-wasm tvix-wasm graph-renderer-web app-web;
           inherit bench-pagerank;
           inherit graph-compute-image graph-api-image docker-compose-yaml sky-task-yaml;
           inherit test-browser;
@@ -562,6 +605,10 @@
         };
 
         checks = {
+          # The Dioxus frontend (app/ workspace) builds reproducibly — this
+          # also type-checks panel-kit and jump-cannon-ui for wasm32.
+          inherit app-web;
+
           # Native: clippy + tests + fmt
           clippy = craneLib.cargoClippy (commonArgs // {
             cargoArtifacts = depsNative;

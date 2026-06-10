@@ -31,9 +31,18 @@ app-build:
     cd app && cargo tauri build
 
 # Type-check the app workspace: WASM frontend + native Tauri shell.
+# (The frontend also builds reproducibly via `nix build .#app-web`.)
 app-check:
     cd app && cargo check --target wasm32-unknown-unknown -p panel-kit -p jump-cannon-ui
     cd app && cargo check -p jump-cannon-app
+
+# Regenerate the checked-in prost output (app/ui/src/proto/) after editing
+# crates/graph-api/proto/graph.proto. Checked in (instead of a build.rs) so
+# the app workspace is self-contained — no protoc, pure crane/nix build.
+app-proto:
+    cargo check -p graph-api
+    cp -f "$(ls -t target/debug/build/graph-api-*/out/jumpcannon.graph.rs | head -1)" app/ui/src/proto/jumpcannon.graph.rs
+    @echo "regenerated app/ui/src/proto/jumpcannon.graph.rs"
 
 #
 # Internals: backgrounds `nix run .#dev-up` (native binary on darwin,

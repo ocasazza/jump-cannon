@@ -1,0 +1,12 @@
+# Trunk drives the Dioxus crate (ui/) to WASM. Lives at the workspace root —
+# trunk needs a Trunk.toml in its cwd to resolve the target crate from the
+# index.html rust link rather than the (virtual) workspace manifest; both the
+# crane derivation (nix build .#app-web) and `cargo tauri dev` run trunk here.
+#
+# Port 8081 so it can run alongside apple-notes-ocr-flow (8080).
+[build]
+target = "ui/index.html"
+dist = "ui/dist"
+
+[serve]
+port = 8081

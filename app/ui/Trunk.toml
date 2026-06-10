@@ -1,9 +1,0 @@
-# Trunk builds the Dioxus crate to WASM and emits to ui/dist, which Tauri's
-# frontendDist points at. Port 8081 so it can run alongside apple-notes-ocr-flow
-# (which serves its UI on 8080).
-[build]
-target = "index.html"
-dist = "dist"
-
-[serve]
-port = 8081

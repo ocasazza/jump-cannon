@@ -4,6 +4,9 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
     <title>Jump Cannon</title>
+    <!-- Name the crate explicitly: trunk is driven from the workspace root in
+         the nix (crane) build, where the virtual manifest has no root package. -->
+    <link data-trunk rel="rust" href="Cargo.toml" data-bin="jump-cannon-ui" />
   </head>
   <body>
     <div id="main"></div>
