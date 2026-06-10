@@ -13,7 +13,9 @@
 //! protoc + cargo-tauri).
 
 mod api;
+mod badges;
 mod graph_canvas;
+mod panels;
 mod proto;
 mod render;
 
@@ -27,14 +29,46 @@ use serde::{Deserialize, Serialize};
 use graph_canvas::GraphData;
 
 fn main() {
-    tracing_wasm::set_as_global_default();
+    // WARN, not the tracing-wasm default (TRACE): at TRACE every Dioxus VDOM
+    // diff and signal write hits console.log — tens of thousands of calls per
+    // second, which reads as a frozen UI.
+    tracing_wasm::set_as_global_default_with_config(
+        tracing_wasm::WASMLayerConfigBuilder::new()
+            .set_max_level(tracing::Level::WARN)
+            .build(),
+    );
+    // A wasm panic kills the whole app silently (frozen UI, dead canvas).
+    // Surface it: console.error + a red banner so the failure names itself
+    // instead of presenting as "the app froze".
+    std::panic::set_hook(Box::new(|info| {
+        let msg = info.to_string();
+        web_sys::console::error_1(&msg.clone().into());
+        if let Some(doc) = web_sys::window().and_then(|w| w.document()) {
+            if let Ok(div) = doc.create_element("div") {
+                let _ = div.set_attribute(
+                    "style",
+                    "position:fixed;top:0;left:0;right:0;z-index:99999;background:#7a1010;\
+                     color:#fff;font:12px ui-monospace,monospace;padding:6px 10px;white-space:pre-wrap;",
+                );
+                div.set_text_content(Some(&format!(
+                    "wasm panic — the app is dead, reload the window:\n{msg}"
+                )));
+                if let Some(body) = doc.body() {
+                    let _ = body.append_child(&div);
+                }
+            }
+        }
+    }));
     launch(App);
 }
 
 // --- panels -------------------------------------------------------------------
 
+/// One variant per panel. The first block is app plumbing; the second block
+/// mirrors the egui app's footer tray — its `Section` enum plus the filter
+/// chip strip (`crates/graph-renderer/src/ui/state.rs::{Section, PanelId}`).
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Serialize, Deserialize)]
-enum Panel {
+pub(crate) enum Panel {
     Graph,
     Nodes,
     Search,
@@ -43,6 +77,17 @@ enum Panel {
     Progress,
     Settings,
     Help,
+    // egui-tray parity panels (see docs/dioxus-migration.md phases 2-3):
+    Layout,
+    Style,
+    Camera,
+    Filter,
+    FilterStrip,
+    Metrics,
+    Instances,
+    Generate,
+    Timeline,
+    Debug,
 }
 
 impl panel_kit::PanelKind for Panel {
@@ -56,6 +101,16 @@ impl panel_kit::PanelKind for Panel {
             Panel::Progress => "Progress",
             Panel::Settings => "Settings",
             Panel::Help => "Help",
+            Panel::Layout => "Layout",
+            Panel::Style => "Style",
+            Panel::Camera => "Camera",
+            Panel::Filter => "Filter",
+            Panel::FilterStrip => "Filters",
+            Panel::Metrics => "Metrics",
+            Panel::Instances => "Instances",
+            Panel::Generate => "Generate",
+            Panel::Timeline => "Timeline",
+            Panel::Debug => "Debug",
         }
     }
 }
@@ -64,23 +119,46 @@ impl panel_kit::PanelKind for Panel {
 /// middle column; inspector + document on the right; progress along the bottom.
 fn default_layout() -> Vec<PanelWin<Panel>> {
     let mut b = LayoutBuilder::new();
-    vec![
-        b.at(Panel::Graph, 12.0, 44.0, 700.0, 540.0),
-        b.at(Panel::Nodes, 720.0, 44.0, 300.0, 264.0),
-        b.at(Panel::Search, 720.0, 316.0, 300.0, 268.0),
-        b.at(Panel::Inspector, 1028.0, 44.0, 400.0, 300.0),
-        b.at(Panel::Document, 1028.0, 352.0, 400.0, 460.0),
-        b.at(Panel::Progress, 12.0, 592.0, 700.0, 240.0),
-        b.at(Panel::Settings, 720.0, 592.0, 300.0, 240.0),
-        b.at(Panel::Help, 1028.0, 820.0, 400.0, 150.0),
-    ]
+    // The tray-parity panels start minimized: the dock is this app's
+    // equivalent of the egui footer launcher row — click a chip to open.
+    fn min(b: &mut LayoutBuilder, kind: Panel, x: f64, y: f64, w: f64, h: f64) -> PanelWin<Panel> {
+        let mut p = b.at(kind, x, y, w, h);
+        p.state = panel_kit::WinState::Minimized;
+        p
+    }
+    let b = &mut b;
+    let mut v = vec![
+        min(b, Panel::Layout, 740.0, 60.0, 340.0, 480.0),
+        min(b, Panel::Style, 760.0, 80.0, 320.0, 440.0),
+        min(b, Panel::Camera, 780.0, 100.0, 320.0, 360.0),
+        min(b, Panel::Filter, 800.0, 120.0, 340.0, 420.0),
+        min(b, Panel::FilterStrip, 820.0, 140.0, 420.0, 120.0),
+        min(b, Panel::Metrics, 840.0, 160.0, 320.0, 380.0),
+        min(b, Panel::Instances, 860.0, 180.0, 360.0, 420.0),
+        min(b, Panel::Generate, 880.0, 200.0, 360.0, 440.0),
+        min(b, Panel::Timeline, 900.0, 220.0, 380.0, 320.0),
+        min(b, Panel::Debug, 920.0, 240.0, 320.0, 360.0),
+    ];
+    // Floating mode: the graph view starts dominant (~2x everything else);
+    // clamp_to_viewport pulls the right column in on narrower screens.
+    v.extend([
+        b.at(Panel::Graph, 12.0, 44.0, 920.0, 620.0),
+        b.at(Panel::Nodes, 940.0, 44.0, 290.0, 290.0),
+        b.at(Panel::Search, 940.0, 342.0, 290.0, 322.0),
+        b.at(Panel::Inspector, 1238.0, 44.0, 330.0, 300.0),
+        b.at(Panel::Document, 1238.0, 352.0, 330.0, 460.0),
+        b.at(Panel::Progress, 12.0, 672.0, 920.0, 200.0),
+        b.at(Panel::Settings, 940.0, 672.0, 290.0, 200.0),
+        b.at(Panel::Help, 1238.0, 820.0, 330.0, 150.0),
+    ]);
+    v
 }
 
 // --- progress feed --------------------------------------------------------------
 
 /// One server task folded out of the /progress event stream.
 #[derive(Clone, PartialEq)]
-struct TaskRow {
+pub(crate) struct TaskRow {
     id: u64,
     group: String,
     label: String,
@@ -89,7 +167,7 @@ struct TaskRow {
 }
 
 #[derive(Clone, PartialEq)]
-struct LogRow {
+pub(crate) struct LogRow {
     level: api::LogLevel,
     group: String,
     message: String,
@@ -146,22 +224,22 @@ fn fold_progress(tasks: &mut Vec<TaskRow>, logs: &mut Vec<LogRow>, ev: api::Prog
 /// Every app signal, bundled `Copy` so panel renderers and handlers can grab
 /// what they need without prop-drilling through components.
 #[derive(Clone, Copy)]
-struct Ctx {
-    graph: Signal<Option<GraphData>>,
-    load_error: Signal<Option<String>>,
-    selected: Signal<Option<String>>,
-    meta: Signal<Option<proto::NodeMeta>>,
-    meta_busy: Signal<bool>,
-    draft: Signal<String>,
-    save_msg: Signal<String>,
-    query: Signal<String>,
-    results: Signal<Vec<String>>,
-    result_total: Signal<u32>,
-    searching: Signal<bool>,
-    filter: Signal<String>,
-    server: Signal<String>,
-    tasks: Signal<Vec<TaskRow>>,
-    logs: Signal<Vec<LogRow>>,
+pub(crate) struct Ctx {
+    pub(crate) graph: Signal<Option<GraphData>>,
+    pub(crate) load_error: Signal<Option<String>>,
+    pub(crate) selected: Signal<Option<String>>,
+    pub(crate) meta: Signal<Option<proto::NodeMeta>>,
+    pub(crate) meta_busy: Signal<bool>,
+    pub(crate) draft: Signal<String>,
+    pub(crate) save_msg: Signal<String>,
+    pub(crate) query: Signal<String>,
+    pub(crate) results: Signal<Vec<String>>,
+    pub(crate) result_total: Signal<u32>,
+    pub(crate) searching: Signal<bool>,
+    pub(crate) filter: Signal<String>,
+    pub(crate) server: Signal<String>,
+    pub(crate) tasks: Signal<Vec<TaskRow>>,
+    pub(crate) logs: Signal<Vec<LogRow>>,
 }
 
 async fn reload_graph(mut ctx: Ctx) {
@@ -184,7 +262,10 @@ fn render_markdown(md: &str) -> String {
 
 #[component]
 fn App() -> Element {
-    let ws = panel_kit::use_workspace("jc_layout", default_layout);
+    // _v2: bumped when the default layout changed shape (graph view 2x +
+    // tray-parity panels docked) — the merge-missing-kinds reconciliation
+    // can't resize panels a stale saved layout already contains.
+    let ws = panel_kit::use_workspace("jc_layout_v2", default_layout);
 
     let ctx = Ctx {
         graph: use_signal(|| None),
@@ -307,7 +388,9 @@ fn App() -> Element {
     }
 
     let g_now = ctx.graph.read().clone();
-    let busy_tasks = ctx.tasks.read().iter().any(|t| t.state == 0);
+    // Mirrors the egui tray's right-side running indicator: a live count of
+    // in-progress server tasks, grey idle dot otherwise.
+    let n_running = ctx.tasks.read().iter().filter(|t| t.state == 0).count();
     let mode_label = match ws.effective_mode() {
         panel_kit::Mode::Tiling => "tiling",
         panel_kit::Mode::Floating => "floating",
@@ -360,10 +443,12 @@ fn App() -> Element {
                         "{mode_label} · connecting…"
                     }
                 }
-                if busy_tasks {
-                    span { class: "activity", "● server working…" }
+                if n_running > 0 {
+                    span { class: "activity", Spinner {} " running {n_running}" }
                 } else if g_now.is_none() {
                     span { class: "activity", "○ waiting for graph-api" }
+                } else {
+                    span { class: "activity idle", "●" }
                 }
             }
 
@@ -393,6 +478,16 @@ fn panel_body(kind: Panel, _maximized: bool, ctx: Ctx) -> Element {
         Panel::Document => document_panel(ctx),
         Panel::Progress => progress_panel(ctx),
         Panel::Settings => settings_panel(ctx),
+        Panel::Layout => panels::layout::panel(ctx),
+        Panel::Style => panels::style::panel(ctx),
+        Panel::Camera => panels::camera::panel(ctx),
+        Panel::Filter => panels::filter::panel(ctx),
+        Panel::FilterStrip => panels::filter_strip::panel(ctx),
+        Panel::Metrics => panels::metrics::panel(ctx),
+        Panel::Instances => panels::instances::panel(ctx),
+        Panel::Generate => panels::generate::panel(ctx),
+        Panel::Timeline => panels::timeline::panel(ctx),
+        Panel::Debug => panels::debug::panel(ctx),
         Panel::Help => rsx! {
             div { class: "help",
                 p { "canvas: drag rotate · wheel zoom · WASD pan · QE fwd/back · Shift boost · F fit · click select" }

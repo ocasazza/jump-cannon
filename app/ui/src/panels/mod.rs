@@ -1,0 +1,16 @@
+//! Tray-parity panels — one module per panel from the egui app's footer
+//! launcher row (`status_footer.rs::show_tray`). Each module owns its file
+//! completely: panel-local state as module-level `GlobalSignal`s, private
+//! API helpers built on `crate::api::{get_json, get_proto, get_bytes, url}`,
+//! and styles under its own anchor block in assets/app.css.
+
+pub mod layout;
+pub mod style;
+pub mod camera;
+pub mod filter;
+pub mod filter_strip;
+pub mod metrics;
+pub mod instances;
+pub mod generate;
+pub mod timeline;
+pub mod debug;

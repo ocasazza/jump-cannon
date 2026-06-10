@@ -30,6 +30,8 @@
 //! }
 //! ```
 
+pub mod badge;
+
 use dioxus::events::MouseEvent;
 use dioxus::prelude::*;
 use gloo_storage::{LocalStorage, Storage};
@@ -45,6 +47,16 @@ pub trait PanelKind:
     Copy + PartialEq + Eq + std::hash::Hash + Serialize + serde::de::DeserializeOwned + 'static
 {
     fn title(self) -> &'static str;
+}
+
+/// CSS-safe slug of a panel title ("Filter Strip" -> "filter-strip"). Every
+/// panel section gets `panel panel-<slug>` so apps can style individual
+/// panels — e.g. making one panel full-width in tiling mode.
+fn kind_slug(title: &str) -> String {
+    title
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_lowercase() } else { '-' })
+        .collect()
 }
 
 #[derive(Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -180,6 +192,9 @@ pub struct Workspace<K: PanelKind> {
     pub panels: Signal<Vec<PanelWin<K>>>,
     pub mode: Signal<Mode>,
     pub drag: Signal<Option<Drag>>,
+    /// Tiling-mode reorder drag: the kind being dragged. Hovering another
+    /// panel while set live-shuffles the dragged panel into that slot.
+    pub tile_drag: Signal<Option<K>>,
     pub is_mobile: Signal<bool>,
 }
 
@@ -205,6 +220,7 @@ pub fn use_workspace<K: PanelKind>(
     });
     let mode = use_signal(|| saved.as_ref().map(|(_, m)| *m).unwrap_or(Mode::Floating));
     let drag = use_signal(|| Option::<Drag>::None);
+    let tile_drag = use_signal(|| Option::<K>::None);
     let is_mobile = use_signal(viewport_is_mobile);
 
     use_hook(|| {
@@ -228,12 +244,13 @@ pub fn use_workspace<K: PanelKind>(
     use_effect(move || {
         let ps = panels.read().clone();
         let md = *mode.read();
-        if drag.read().is_none() {
+        // Persist once a drag settles — not on every mousemove/hover-shuffle.
+        if drag.read().is_none() && tile_drag.read().is_none() {
             save_layout(storage_key, &ps, md);
         }
     });
 
-    Workspace { panels, mode, drag, is_mobile }
+    Workspace { panels, mode, drag, tile_drag, is_mobile }
 }
 
 impl<K: PanelKind> Workspace<K> {
@@ -298,6 +315,27 @@ impl<K: PanelKind> Workspace<K> {
     pub fn handle_mouse_up(&self) {
         let mut drag = self.drag;
         drag.set(None);
+        let mut tile_drag = self.tile_drag;
+        tile_drag.set(None);
+    }
+
+    /// Tiling-mode reorder: move `dragged` into `target`'s slot. Moving down
+    /// the flow inserts after the target, moving up inserts before — the
+    /// classic sortable-list shuffle, so the dragged panel snaps into
+    /// whichever slot the pointer is over. Vec order is the tiling order and
+    /// persists with the layout.
+    fn reorder_tile(&self, dragged: K, target: K) {
+        let mut panels = self.panels;
+        let mut ps = panels.write();
+        let Some(from) = ps.iter().position(|p| p.kind == dragged) else { return };
+        let Some(to) = ps.iter().position(|p| p.kind == target) else { return };
+        if from == to {
+            return;
+        }
+        let p = ps.remove(from);
+        let after_removal = if from < to { to - 1 } else { to };
+        let insert_at = (if from < to { after_removal + 1 } else { after_removal }).min(ps.len());
+        ps.insert(insert_at, p);
     }
 
     /// Render the workspace area. `body` renders one panel's content given its
@@ -324,12 +362,15 @@ impl<K: PanelKind> Workspace<K> {
             "ws floating"
         };
 
+        let dragging_tile = *self.tile_drag.read();
         rsx! {
             div { class: "{ws_class}",
                 for i in visible.iter().copied() {
                     {
                         let p = ps[i];
                         let floating = maximized.is_none() && mode_now == Mode::Floating;
+                        let tiling = maximized.is_none() && mode_now == Mode::Tiling;
+                        let kind = p.kind;
                         let style = if maximized.is_some() {
                             "position:absolute; inset:0;".to_string()
                         } else if floating {
@@ -338,11 +379,26 @@ impl<K: PanelKind> Workspace<K> {
                         } else {
                             String::new()
                         };
+                        let slug = kind_slug(p.kind.title());
+                        let drag_cls = if dragging_tile == Some(kind) { " tile-dragging" } else { "" };
                         rsx! {
                             section {
-                                key: "{i}",
-                                class: "panel",
+                                // Keyed by kind (stable identity), not index:
+                                // tiling reorders mutate the Vec mid-drag and
+                                // index keys would remount every panel.
+                                key: "{slug}",
+                                class: "panel panel-{slug}{drag_cls}",
                                 style: "{style}",
+                                onmouseenter: move |_| {
+                                    // Snap the dragged panel into this slot.
+                                    if tiling {
+                                        if let Some(d) = *ws.tile_drag.read() {
+                                            if d != kind {
+                                                ws.reorder_tile(d, kind);
+                                            }
+                                        }
+                                    }
+                                },
                                 onmousedown: move |_| {
                                     // z-order only matters when panels can overlap (floating).
                                     // In tiling, mutating panels here re-renders and can swallow
@@ -353,7 +409,7 @@ impl<K: PanelKind> Workspace<K> {
                                         if let Some(pp) = panels.write().get_mut(i) { pp.z = z; };
                                     }
                                 },
-                                {ws.header(i, p.kind.title(), floating)}
+                                {ws.header(i, p.kind, floating, tiling)}
                                 div { class: "panel-body",
                                     {body(p.kind, maximized == Some(i))}
                                 }
@@ -374,16 +430,24 @@ impl<K: PanelKind> Workspace<K> {
     }
 
     /// Panel chrome: traffic lights (red = floating⇄tiling, yellow = minimize,
-    /// green = maximize⇄restore) + the drag-to-move title strip.
-    fn header(&self, idx: usize, title: &str, draggable: bool) -> Element {
+    /// green = maximize⇄restore) + the drag-to-move title strip. In floating
+    /// mode the drag moves the window freely; in tiling mode it starts a
+    /// reorder drag (hover another panel to snap into its slot). Mobile gets
+    /// neither (static stack).
+    fn header(&self, idx: usize, kind: K, draggable: bool, tiling: bool) -> Element {
         let ws = *self;
+        let title = kind.title();
         let is_max = self.panels.read().get(idx).map(|p| p.state) == Some(WinState::Maximized);
         rsx! {
             header {
                 class: "panel-head",
                 onmousedown: move |e: MouseEvent| {
-                    if !draggable { return; }
-                    ws.begin_drag(idx, DragKind::Move, &e);
+                    if draggable {
+                        ws.begin_drag(idx, DragKind::Move, &e);
+                    } else if tiling && !*ws.is_mobile.read() {
+                        let mut tile_drag = ws.tile_drag;
+                        tile_drag.set(Some(kind));
+                    }
                 },
                 div { class: "lights",
                     button { class: "light red", title: "tiling / floating",

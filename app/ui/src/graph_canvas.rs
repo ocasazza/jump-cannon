@@ -142,6 +142,12 @@ pub fn GraphCanvas(graph: Signal<Option<GraphData>>, selected: Signal<Option<Str
                 onmousemove: move |e: MouseEvent| {
                     render::set_pointer_over(true);
                     let c = e.element_coordinates();
+                    // A drag is only live while a button is held — without
+                    // this check a press whose release happened off-canvas
+                    // leaves a stale drag that spins the camera on re-entry.
+                    if drag.read().is_some() && e.held_buttons().is_empty() {
+                        drag.set(None);
+                    }
                     let cur = *drag.read();
                     if let Some(mut d) = cur {
                         let (dx, dy) = (c.x - d.last_mx, c.y - d.last_my);

@@ -83,8 +83,21 @@ thread_local! {
     static RAF_STARTED: Cell<bool> = const { Cell::new(false) };
 }
 
-fn with_host<R>(f: impl FnOnce(&mut RenderHost) -> R) -> Option<R> {
+/// Run `f` against the live render host (None while the canvas is unmounted
+/// or the async init is still in flight). This is the panels' doorway to the
+/// renderer: `render::with_host(|h| h.pipes.set_…(…))` — the full setter
+/// surface ported from graph_pipelines.rs lives on `h.pipes`, the 6DoF
+/// camera on `h.pipes.camera`.
+pub(crate) fn with_host<R>(f: impl FnOnce(&mut RenderHost) -> R) -> Option<R> {
     HOST.with(|h| h.borrow_mut().as_mut().map(f))
+}
+
+/// Monotonic canvas-mount generation — bumps every time the Graph panel
+/// remounts and the host is rebuilt (back to the boot gpu-force layout).
+/// The Layout panel keys its "already applied" detector on this so a
+/// persisted engine re-applies onto a fresh host instead of being skipped.
+pub(crate) fn mount_generation() -> u64 {
+    CTL.with(|c| c.borrow().generation)
 }
 
 fn canvas_el() -> Option<web_sys::HtmlCanvasElement> {
@@ -216,8 +229,74 @@ fn tick() {
         if dt_valid {
             h.pipes.camera.pan(pan[0], pan[1], pan[2]);
         }
+        // Defensive: a NaN that sneaks into the camera basis (bad input
+        // delta, degenerate zoom) would render as a permanently black
+        // canvas with no error anywhere. Reset instead of going dark.
+        let p = h.pipes.camera.position;
+        if !(p.x.is_finite() && p.y.is_finite() && p.z.is_finite())
+            || !h.pipes.camera.yaw.is_finite()
+            || !h.pipes.camera.pitch.is_finite()
+        {
+            tracing::warn!("[render] camera state went non-finite — resetting");
+            let aspect = h.pipes.camera.aspect;
+            h.pipes.camera = crate::render::camera::Camera::new(aspect);
+        }
+        let t0 = js_sys::Date::now();
         h.frame();
+        perf_record(now, js_sys::Date::now() - t0);
     });
+}
+
+// --- frame-time / FPS instrumentation ------------------------------------------
+//
+// Port of the egui PerfCollector's role for the Debug panel's time-series
+// charts: per-frame wall cost (encode+submit ms) and frame spacing (dt →
+// FPS). True per-GPU-stage timing needs timestamp queries (not in the egui
+// app either); its StageId instrumentation measured CPU-side phases, which
+// `frame()` wall cost approximates for this single-pass renderer.
+
+const PERF_CAP: usize = 240;
+
+#[derive(Default)]
+struct Perf {
+    /// ms between rAF ticks (1000/dt = instantaneous FPS).
+    frame_dt: std::collections::VecDeque<f32>,
+    /// ms spent inside RenderHost::frame() (CPU encode + submit + present).
+    frame_cost: std::collections::VecDeque<f32>,
+    last_tick: f64,
+}
+
+thread_local! {
+    static PERF: RefCell<Perf> = RefCell::new(Perf::default());
+}
+
+fn perf_record(tick_start_ms: f64, cost_ms: f64) {
+    PERF.with(|p| {
+        let mut p = p.borrow_mut();
+        if p.last_tick > 0.0 {
+            let dt = (tick_start_ms - p.last_tick) as f32;
+            // Skip tab-suspend gaps; they'd flatten the chart's scale.
+            if dt > 0.0 && dt < 500.0 {
+                p.frame_dt.push_back(dt);
+                if p.frame_dt.len() > PERF_CAP {
+                    p.frame_dt.pop_front();
+                }
+            }
+        }
+        p.last_tick = tick_start_ms;
+        p.frame_cost.push_back(cost_ms as f32);
+        if p.frame_cost.len() > PERF_CAP {
+            p.frame_cost.pop_front();
+        }
+    });
+}
+
+/// (frame_dt_ms, frame_cost_ms) histories, oldest first — Debug panel charts.
+pub(crate) fn perf_series() -> (Vec<f32>, Vec<f32>) {
+    PERF.with(|p| {
+        let p = p.borrow();
+        (p.frame_dt.iter().copied().collect(), p.frame_cost.iter().copied().collect())
+    })
 }
 
 // --- input entry points (called from Dioxus event handlers) -------------------

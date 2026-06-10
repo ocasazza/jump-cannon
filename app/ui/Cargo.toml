@@ -11,7 +11,12 @@ panel-kit = { path = "../panel-kit" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 # WASM-side HTTP to graph-api (the frontend always runs in a webview).
-gloo-net = { version = "0.6", features = ["http"] }
+# "websocket" feeds the Layout panel's remote-engine bridges
+# (/graph/layout/stream consumers) — same feature pair graph-renderer enables.
+gloo-net = { version = "0.6", features = ["http", "websocket"] }
+# StreamExt for the layout-stream WebSocket consumers. Version + feature
+# trim match graph-renderer's Cargo.toml (no executor side on wasm).
+futures = { version = "0.3", default-features = false, features = ["std", "async-await"] }
 gloo-storage = { workspace = true }   # persist the server URL + layout between sessions
 gloo-timers = { version = "0.3", features = ["futures"] }  # pollers + redraw ticker
 wasm-bindgen = { workspace = true }
@@ -34,6 +39,8 @@ graph-layouts = { path = "../../crates/graph-layouts" }
 web-sys = { workspace = true, features = [
     "Window", "Document", "Element", "Event", "EventTarget",
     "HtmlCanvasElement",
+    # panic banner (main.rs panic hook): console.error + DOM injection
+    "console", "HtmlElement", "Node",
 ] }
 tracing = "0.1"
 tracing-wasm = "0.2"

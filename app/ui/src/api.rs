@@ -43,11 +43,11 @@ pub fn set_server_url(url: &str) {
 
 pub type ApiResult<T> = Result<T, String>;
 
-fn err<E: std::fmt::Display>(e: E) -> String {
+pub(crate) fn err<E: std::fmt::Display>(e: E) -> String {
     e.to_string()
 }
 
-fn url(path: &str) -> String {
+pub(crate) fn url(path: &str) -> String {
     format!("{}{}", server_url(), path)
 }
 
@@ -60,11 +60,11 @@ fn encode_id(id: &str) -> String {
         .join("/")
 }
 
-async fn get_json<T: serde::de::DeserializeOwned>(path: &str) -> ApiResult<T> {
+pub(crate) async fn get_json<T: serde::de::DeserializeOwned>(path: &str) -> ApiResult<T> {
     Request::get(&url(path)).send().await.map_err(err)?.json().await.map_err(err)
 }
 
-async fn get_bytes(path: &str) -> ApiResult<Vec<u8>> {
+pub(crate) async fn get_bytes(path: &str) -> ApiResult<Vec<u8>> {
     let resp = Request::get(&url(path)).send().await.map_err(err)?;
     if !resp.ok() {
         return Err(format!("{} -> HTTP {}", path, resp.status()));
@@ -72,7 +72,7 @@ async fn get_bytes(path: &str) -> ApiResult<Vec<u8>> {
     resp.binary().await.map_err(err)
 }
 
-async fn get_proto<T: Message + Default>(path: &str) -> ApiResult<T> {
+pub(crate) async fn get_proto<T: Message + Default>(path: &str) -> ApiResult<T> {
     let bytes = get_bytes(path).await?;
     T::decode(bytes.as_slice()).map_err(err)
 }

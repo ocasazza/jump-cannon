@@ -23,17 +23,19 @@
 //! (`depth_stencil: None`), and this port keeps that choice: identical
 //! output, one less attachment to manage.
 //!
-//! Dropped relative to the egui port: `swap_physics_layout` /
-//! `run_static_solve` (they take the egui-side `LayoutFactory` registry,
-//! which doesn't exist here yet — gpu-force is constructed directly).
+//! `swap_physics_layout` / `run_static_solve` are ported from the egui
+//! app's graph_pipelines.rs with one signature change: they take the
+//! pre-built `Box<dyn DynPhysicsLayout>` / `&dyn DynStaticLayout` instead
+//! of the egui-side `LayoutFactory` registry (which doesn't exist here —
+//! the Layout panel owns engine construction).
 #![allow(dead_code)] // preserved API surface from the egui port; not every entry point is wired into the Dioxus UI yet.
 
 use crate::render::camera::Camera;
 use bytemuck::{Pod, Zeroable};
 use glam::{Mat4, Vec3, Vec4};
 use graph_layouts::{
-    BoxedPhysics, DynPhysicsLayout, Edge as GlEdge, GpuForceLayout, GpuForceOptions,
-    Graph as GlGraph, Node as GlNode,
+    BoxedPhysics, DynPhysicsLayout, DynStaticLayout, Edge as GlEdge, GpuForceLayout,
+    GpuForceOptions, Graph as GlGraph, Node as GlNode,
 };
 use std::sync::{Arc, Mutex};
 use wgpu::util::DeviceExt;
@@ -1513,6 +1515,109 @@ impl GraphPipelines {
         Ok(())
     }
 
+    /// Replace the active physics layout with a pre-built one (port of the
+    /// egui `swap_physics_layout`, minus the factory indirection). Syncs the
+    /// cached topology graph's `position3` from the live CPU positions mirror
+    /// first, so the fresh layout's `init_with_device` resumes from whatever
+    /// the previous layout — including a one-shot static solve — left behind,
+    /// instead of jumping back to the bootstrap positions.
+    pub fn swap_physics_layout(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        mut layout: Box<dyn DynPhysicsLayout>,
+    ) {
+        let Some(b) = self.buffers.as_mut() else {
+            return;
+        };
+        if let Some(graph) = b.layout_graph.as_mut() {
+            // `build_topology_graph` builds ids as zero-padded indices, so
+            // the same scheme indexes back in.
+            let n = b.n_nodes as usize;
+            let width = format!("{}", n.max(1) - 1).len().max(1);
+            for i in 0..n {
+                if i * 3 + 2 >= b.positions_cpu.len() {
+                    break;
+                }
+                let id = format!("{:0width$}", i, width = width);
+                if let Some(node) = graph.nodes.get_mut(&id) {
+                    node.position3 = Some([
+                        b.positions_cpu[i * 3],
+                        b.positions_cpu[i * 3 + 1],
+                        b.positions_cpu[i * 3 + 2],
+                    ]);
+                }
+            }
+        }
+        let Some(graph) = b.layout_graph.as_ref() else {
+            return;
+        };
+        match layout.init_with_device(device, queue, graph, &b.positions) {
+            Ok(()) => {
+                b.layout = Some(layout);
+            }
+            Err(e) => {
+                tracing::warn!("[render] swap_physics_layout init failed: {e}");
+            }
+        }
+    }
+
+    /// One-shot static solve against the cached topology graph (port of the
+    /// egui `run_static_solve`). Writes the solver's positions into the GPU
+    /// buffer + CPU mirror and tears down any active physics layout so
+    /// `compute_step` doesn't immediately stomp the freshly-written positions.
+    pub fn run_static_solve(
+        &mut self,
+        queue: &wgpu::Queue,
+        layout: &dyn DynStaticLayout,
+        settings: &serde_json::Value,
+    ) -> Result<(), String> {
+        let b = self
+            .buffers
+            .as_mut()
+            .ok_or_else(|| "run_static_solve: no buffers loaded".to_string())?;
+        let graph = b
+            .layout_graph
+            .as_ref()
+            .ok_or_else(|| "run_static_solve: no cached topology graph".to_string())?;
+
+        let positions = layout.solve_dyn(settings, graph)?;
+        let n_nodes = b.n_nodes as usize;
+        if positions.len() != n_nodes * 3 {
+            return Err(format!(
+                "run_static_solve: solver returned {} floats, expected {}",
+                positions.len(),
+                n_nodes * 3,
+            ));
+        }
+
+        // Re-pack into the vec4-padded layout the WGSL storage buffer
+        // expects (matches the format `load()` builds at bootstrap).
+        let mut padded: Vec<f32> = Vec::with_capacity(n_nodes * 4);
+        for i in 0..n_nodes {
+            padded.extend_from_slice(&[
+                positions[i * 3],
+                positions[i * 3 + 1],
+                positions[i * 3 + 2],
+                0.0,
+            ]);
+        }
+        if padded.is_empty() {
+            padded.extend_from_slice(&[0.0; 4]);
+        }
+        queue.write_buffer(&b.positions, 0, bytemuck::cast_slice(&padded));
+
+        // Refresh the CPU mirror so raycasts and `bounds()` see the new
+        // positions instead of the pre-solve state.
+        b.positions_cpu = positions;
+
+        // Tear down any active physics layout so `compute_step` doesn't
+        // immediately stomp the freshly-written positions.
+        b.layout = None;
+
+        Ok(())
+    }
+
     /// True once the GPU force layout has settled (max-KE under the
     /// configured `energy_threshold` for `HALT_FRAMES` consecutive
     /// readbacks). False if no layout is initialised or auto-halt is
@@ -1745,6 +1850,13 @@ impl RenderHost {
             .await
             .map_err(|e| format!("request_device: {e}"))?;
 
+        // WebGPU validation errors don't panic — they kill rendering
+        // silently (black canvas, app otherwise alive). Route them through
+        // tracing so they're visible in the console at WARN level.
+        device.on_uncaptured_error(Box::new(|e| {
+            tracing::error!("[render] wgpu uncaptured error: {e}");
+        }));
+
         let caps = surface.get_capabilities(&adapter);
         let format = caps
             .formats
@@ -1797,6 +1909,29 @@ impl RenderHost {
     /// buffers need both halves from one `&mut self`.)
     pub fn pipes_and_queue(&mut self) -> (&mut GraphPipelines, &wgpu::Queue) {
         (&mut self.pipes, &self.queue)
+    }
+
+    /// Layout-panel entry points — `GraphPipelines` needs the device and/or
+    /// queue alongside `&mut self.pipes`, which `with_host` callers can't
+    /// split-borrow themselves (the fields are private to this module).
+    pub fn swap_physics_layout(&mut self, layout: Box<dyn DynPhysicsLayout>) {
+        self.pipes
+            .swap_physics_layout(&self.device, &self.queue, layout);
+    }
+
+    pub fn run_static_solve(
+        &mut self,
+        layout: &dyn DynStaticLayout,
+        settings: &serde_json::Value,
+    ) -> Result<(), String> {
+        self.pipes.run_static_solve(&self.queue, layout, settings)
+    }
+
+    /// Seed/scrub path: write a full position set into the live buffer
+    /// (re-initialising any active physics layout from it).
+    pub fn apply_positions(&mut self, positions: &[f32]) -> Result<(), String> {
+        self.pipes
+            .set_positions(&self.device, &self.queue, positions)
     }
 
     /// Canvas client (logical/CSS px) size.
