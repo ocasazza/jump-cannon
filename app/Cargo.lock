@@ -3446,8 +3446,8 @@ dependencies = [
 
 [[package]]
 name = "panel-kit"
-version = "0.1.0"
-source = "git+https://github.com/ocasazza/panel-kit#f361e9c405895582ffb6f29865747641cdf3a1a0"
+version = "0.2.0"
+source = "git+https://github.com/ocasazza/panel-kit#d31e14829e094e3bdfcdcf5c611fea4796240522"
 dependencies = [
  "dioxus",
  "gloo-storage",

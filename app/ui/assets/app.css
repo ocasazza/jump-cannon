@@ -7,10 +7,10 @@
 
 .topbar .activity.idle { color:var(--dim); animation:none; }
 
-/* Tiling mode: the graph view owns a full row at ~2x panel height; every
-   other panel keeps the default 340px flex basis. (Floating mode instead
-   starts the panel large via default_layout — freely resizable there.) */
-.ws.tiling .panel-graph { flex:1 1 100%; min-width:100%; height:55vh; min-height:380px; }
+/* Tiling: the graph's full-width default moved into default_layout's
+   .with_tile(4, 3) — panel-kit 0.2 renders snapped tile spans inline, so a
+   CSS flex/height override here would be dead (inline wins) and would fight
+   the user's grip-resizes. */
 .graph-hud { position:absolute; top:.5rem; left:.5rem; display:flex; gap:.4rem; opacity:.75; }
 .graph-hud:hover { opacity:1; }
 

@@ -46,6 +46,13 @@ fn main() {
     std::panic::set_hook(Box::new(|info| {
         let msg = info.to_string();
         web_sys::console::error_1(&msg.clone().into());
+        // JS stack at the panic point: dev-build wasm keeps function names,
+        // so this names the actual call chain (panic locations alone can be
+        // misattributed across inlined frames).
+        let err = js_sys::Error::new("panic stack");
+        if let Ok(stack) = js_sys::Reflect::get(&err, &"stack".into()) {
+            web_sys::console::error_1(&stack);
+        }
         if let Some(doc) = web_sys::window().and_then(|w| w.document()) {
             if let Ok(div) = doc.create_element("div") {
                 let _ = div.set_attribute(
@@ -146,8 +153,11 @@ fn default_layout() -> Vec<PanelWin<Panel>> {
     ];
     // Floating mode: the graph view starts dominant (~2x everything else);
     // clamp_to_viewport pulls the right column in on narrower screens.
+    // Tiling mode: the graph starts full-width × 3 rows (with_tile replaces
+    // the old .panel-graph CSS override; the grip resizes it in snapped
+    // steps now).
     v.extend([
-        b.at(Panel::Graph, 12.0, 44.0, 920.0, 620.0),
+        b.at(Panel::Graph, 12.0, 44.0, 920.0, 620.0).with_tile(4, 3),
         b.at(Panel::Nodes, 940.0, 44.0, 290.0, 620.0),
         b.at(Panel::Inspector, 1238.0, 44.0, 330.0, 300.0),
         b.at(Panel::Document, 1238.0, 352.0, 330.0, 460.0),
@@ -268,10 +278,10 @@ fn App() -> Element {
     // handling, style/camera loops) before any panel renders — a saved
     // layout with every panel minimized must still process boot presets.
     appstate::ensure_init();
-    // _v3: Search merged into the unified Nodes browser (the Search variant
-    // is gone, which breaks old saved-layout deserialization) — and v2 had
-    // bumped for the 2x graph view + docked tray panels.
-    let ws = panel_kit::use_workspace("jc_layout_v3", default_layout);
+    // _v4: tiling spans (tile_w/tile_h) — saved v3 layouts would deserialize
+    // with a quarter-width graph tile, so re-seed the defaults. (v3: Search
+    // merged into Nodes; v2: 2x graph view + docked tray panels.)
+    let ws = panel_kit::use_workspace("jc_layout_v4", default_layout);
 
     // Drain palette jump-to-section requests into the workspace, logging
     // the same `("section", "<title>: open")` event the egui app pushed.

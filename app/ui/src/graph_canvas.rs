@@ -54,6 +54,17 @@ pub async fn load() -> Result<GraphData, String> {
     let edges = api::edges().await?;
 
     let n = init.n_nodes as usize;
+    // The three fetches above aren't atomic: a server-side graph swap
+    // (vault reload, /generate) between them hands us an edge list that
+    // doesn't match `n`. Fail the attempt — the caller's retry loop picks
+    // up the new snapshot consistently a moment later.
+    if ids.len() != n || edges.iter().any(|&e| e as usize >= n) {
+        return Err(format!(
+            "inconsistent snapshot (n={n}, ids={}, max edge idx={:?}) — server graph changed mid-load",
+            ids.len(),
+            edges.iter().max()
+        ));
+    }
     let mut metrics: HashMap<String, Vec<f32>> = HashMap::new();
     for name in ["community", "pagerank"] {
         match api::metric(name).await {

@@ -134,9 +134,16 @@ fn contract_one_level(n: usize, edges: &[u32]) -> (usize, Vec<u32>, Vec<u32>) {
     let mut out = Vec::with_capacity(edges.len() / 2);
     let mut j = 0;
     while j + 1 < edges.len() {
-        let s = parent[edges[j] as usize];
-        let t = parent[edges[j + 1] as usize];
+        // Same out-of-range guard as the matching loop above: edge lists
+        // fetched over the wire can disagree with `n` (e.g. a server-side
+        // graph swap mid-load) — skip, don't panic.
+        let (es, et) = (edges[j] as usize, edges[j + 1] as usize);
         j += 2;
+        if es >= n || et >= n {
+            continue;
+        }
+        let s = parent[es];
+        let t = parent[et];
         if s == t {
             continue; // self-loop after contraction
         }
