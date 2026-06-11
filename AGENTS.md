@@ -16,7 +16,7 @@ The test harness in `crates/test-browser/` is the only exception, and only becau
 |---|---|
 | `crates/graph-api` | axum HTTP server. Loads the vault, serves `/graph/*`, `/node/*id`, `/search`, `/vault/page` (editor PUT), `/progress`, etc. Watches `$VAULT_ROOT` via `notify` and atomically swaps the in-memory `GraphSnapshot` through `arc-swap`. Serves the frontend dist from `--assets-dir` / `JUMP_CANNON_ASSETS_DIR`. |
 | `crates/graph-layouts` | wgpu compute force-sim. Native + WASM. Consumed in-process by `app/ui` (path dependency). |
-| `crates/graph-compute` | Optional standalone layout solver, gRPC on `[::1]:50051`. Opt-in via `--compute-url` / `GRAPH_API_COMPUTE_URL` — unset means the broker is never dialed. Deployable as the docker-compose service or via Sky-Pilot (`infra/sky/`). |
+| `crates/graph-compute` | Optional standalone layout solver, gRPC on `[::1]:50051`. Opt-in via `--compute-url` / `JUMP_CANNON_COMPUTE_URL` — unset means the broker is never dialed. Deployable as the docker-compose service or via Sky-Pilot (`infra/sky/`). |
 | `crates/graph-metrics` | PageRank, Louvain, k-core, betweenness, weakly-connected-components. Stateless functions over `vault-data::Graph`. |
 | `crates/vault-data` | Shared domain types: `Node`, `Edge`, `Graph`, `FieldSchema`, the categorical color palette. Every other vault crate depends on it; no I/O. |
 | `crates/vault-links` | Wikilink extractor. Walks an Obsidian vault on disk, parses markdown + frontmatter, and produces a `VaultGraph`. The startup loader inside graph-api lives here. |
@@ -100,7 +100,7 @@ Run `just test browser-rust` before claiming any visual change works. Don't comm
 | `VAULT_ROOT` env / `--vault-root` flag | graph-api | `$PWD` (CWD fallback) |
 | `GRAPH_API_PORT` env / `--port` flag | graph-api | `0` (OS-assigned ephemeral) |
 | `GRAPH_API_HOST` env / `--host` flag | graph-api | `127.0.0.1` (container override: `0.0.0.0`) |
-| `GRAPH_API_COMPUTE_URL` env / `--compute-url` flag | graph-api | unset → broker disabled, `/graph/layout/stream` returns 503 |
+| `JUMP_CANNON_COMPUTE_URL` env / `--compute-url` flag | graph-api | unset → broker disabled, `/graph/layout/stream` returns 503 |
 | `JUMP_CANNON_ASSETS_DIR` env / `--assets-dir` flag | graph-api | unset → assets 404 (no embedded bundle; point it at the app dist) |
 | `GRAPH_API_NO_WATCH=1` | graph-api | unset → file watcher armed |
 
