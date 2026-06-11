@@ -1233,8 +1233,11 @@ pub async fn push_graph_to_worker(state: &AppState) {
         return;
     }
     let csr = build_csr_bin(&snap);
-    let positions = soup_positions_bytes(n, 800.0, 0xC0A7_5E);
-    match state.inner.compute_broker.load_graph(csr, positions).await {
+    // No position seed: the worker ring-seeds as a placeholder and every
+    // engine re-seeds itself on Subscribe per its own seed_mode — which the
+    // Layout panel's dynamic seed config selects through the stream params.
+    // Pushing a hardcoded ball here would shadow that machinery.
+    match state.inner.compute_broker.load_graph(csr, Vec::new()).await {
         Ok(worker_n) => {
             tracing::info!(n, worker_n, "pushed vault graph to compute worker");
         }
