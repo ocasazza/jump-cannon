@@ -1216,15 +1216,11 @@ fn build_csr_bin(snap: &crate::state::GraphSnapshot) -> Vec<u8> {
 /// remote engine streams frames for the wrong node set and attribute-sized
 /// engines (geometric lens `node_class`) fail init outright.
 pub async fn push_graph_to_worker(state: &AppState) {
-    // connect_with returns before its forwarder task finishes dialing, so
-    // poll briefly instead of skipping the push on a not-yet-true flag.
-    for _ in 0..20 {
-        if state.inner.compute_broker.status().await.connected {
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-    }
-    if !state.inner.compute_broker.status().await.connected {
+    // Gate on a configured URL only — LoadGraph dials its own one-shot
+    // client, so it must NOT wait for the subscribe stream: a worker wedged
+    // on an inconsistent graph fails every subscribe, and this push is
+    // exactly what un-wedges it.
+    if state.inner.compute_broker.status().await.url.is_empty() {
         return;
     }
     let snap = state.inner.snapshot.load_full();

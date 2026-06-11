@@ -619,8 +619,23 @@ pub async fn run_sim_loop(state: Arc<SimState>, _tick_hz: f32) {
         })
         .await
         .expect("engine step panicked");
-        *state.active.lock().await = Some(active);
         let new_positions = output.positions;
+        // A LoadGraph can land while this step is in flight: the output then
+        // belongs to the PREVIOUS graph. Committing it would poison
+        // `state.positions` (length != 3*n of the new graph) and wedge every
+        // future engine init. Drop the stale frame AND the stale engine —
+        // load_graph cleared `active` deliberately; the next Subscribe
+        // re-inits on the new graph.
+        let n_now = state.graph.read().await.n_nodes as usize;
+        if new_positions.len() != 3 * n_now {
+            tracing::warn!(
+                got = new_positions.len() / 3,
+                expect = n_now,
+                "dropping stale engine step from before a LoadGraph swap"
+            );
+            continue;
+        }
+        *state.active.lock().await = Some(active);
 
         // Commit + broadcast.
         {

@@ -283,13 +283,20 @@ pub struct ActiveEngine {
 
 /// Deterministic unit-ring seed positions for `n` nodes (same convention as
 /// crates/graph-api/src/vault_loader.rs). The engine seeds from these at init.
+/// Deterministic placeholder seed: a 3D ball with radius ∝ sqrt(n) (the
+/// engines' own scaling convention). The previous unit-radius planar ring
+/// put vault-sized graphs at ~1e-4 neighbor spacing — coincident for f32
+/// force math, so repulsion (1/d²) overflowed and fa2 streamed NaN frames.
 fn ring_seed(n: usize) -> Vec<f32> {
+    let radius = (n.max(1) as f32).sqrt() * 5.0;
+    let mut s: u32 = 0x9E37_79B1;
+    let mut next = || {
+        s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        (s as f32 / u32::MAX as f32) * 2.0 - 1.0
+    };
     let mut positions = vec![0.0f32; 3 * n];
-    for i in 0..n {
-        let t = (i as f32) / (n.max(1) as f32) * std::f32::consts::TAU;
-        positions[3 * i] = t.cos();
-        positions[3 * i + 1] = t.sin();
-        positions[3 * i + 2] = 0.0;
+    for v in positions.iter_mut() {
+        *v = next() * radius;
     }
     positions
 }
@@ -337,7 +344,7 @@ impl SimState {
     /// Hot-swap the active graph (the `LoadGraph` RPC). Replaces the graph +
     /// positions, resets the frame counter, and clears the active engine so the
     /// next Subscribe re-inits it on the new graph. `positions` must be length
-    /// `3 * n_nodes` if provided; `None` ⇒ a deterministic ring seed. Returns the
+    /// `3 * n_nodes` if provided; `None` ⇒ a deterministic ball seed. Returns the
     /// new node count.
     pub async fn load_graph(
         &self,
@@ -377,8 +384,26 @@ impl SimState {
         params: serde_json::Value,
         attributes: Option<GraphAttributes>,
     ) -> Result<&'static str, String> {
-        let positions = self.positions.read().await.clone();
         let graph = self.graph.read().await.clone(); // Arc clone — cheap
+        let positions = {
+            let n = graph.n_nodes as usize;
+            let cur = self.positions.read().await.clone();
+            if cur.len() == 3 * n {
+                cur
+            } else {
+                // Self-heal instead of wedging: a stale buffer (e.g. a tick
+                // that committed across a LoadGraph swap before that race
+                // was guarded) must not fail every future engine init.
+                tracing::warn!(
+                    got = cur.len() / 3,
+                    expect = n,
+                    "positions buffer does not match graph; re-seeding"
+                );
+                let fresh = ring_seed(n);
+                *self.positions.write().await = fresh.clone();
+                fresh
+            }
+        };
         // Construct the engine on the async thread (cheap), then move it +
         // context to the blocking pool for init.
         let mut engine = self
