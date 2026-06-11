@@ -35,6 +35,7 @@ use crate::sim::CsrGraph;
 pub mod cpu_spring;
 pub mod fa2_bh;
 pub mod fa2_brute;
+pub mod fa2_speed;
 pub mod geometric;
 pub mod geometric_bonding_gpu;
 pub mod geometric_gpu;

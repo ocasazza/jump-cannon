@@ -32,6 +32,7 @@ pub mod engines;
 pub mod partition;
 pub mod service;
 pub mod sim;
+pub mod stability;
 pub mod topo_fisheye;
 
 pub use bsp::{run_bsp_mesh, BspWorker, LiveHaloProvider, MeshTransport};

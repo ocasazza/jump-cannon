@@ -151,6 +151,12 @@ pub fn resolve(
     settings.exclusion_strength = lens.exclusion_strength;
     settings.affinity_strength = lens.affinity_strength;
     settings.gravity = lens.gravity;
+    // Integrator knobs: lens serde-defaults equal the engine defaults
+    // (1.0 / 0.9 / 10.0), so an old persisted lens — and the default lens —
+    // resolves byte-identically to the pre-knob settings (golden master safe).
+    settings.time_step = lens.time_step;
+    settings.damping = lens.damping;
+    settings.max_step = lens.max_step;
     if !lens.coordination_angles.is_empty() {
         settings.coordination_angles = lens.coordination_angles.clone();
     }

@@ -898,6 +898,17 @@ impl LensPreset {
     }
 
     fn apply_to(self, c: &mut LensConfig) {
+        // Integrator triple validated on the real vault (9,724 nodes / 48k
+        // edges, graph-layout-stability harness): the engine defaults
+        // (dt=1, damping=0.9) overshoot at vault stiffness (K·dt² ≫ 2) and
+        // saturate the max_step clamp into a ±10 flip-flop. dt=0.1 /
+        // damping=0.6 decays monotonically on BOTH engines (geometric-gpu on
+        // the vault: median step 4.9 → 0.04 over 600 ticks; the stiffer CPU
+        // engine limit-cycles at dt≥0.25 but settles to ~0.01 here).
+        // Preset-only — engine defaults stay golden-pinned.
+        c.time_step = 0.1;
+        c.damping = 0.6;
+        c.max_step = 10.0;
         match self {
             LensPreset::CrystallizeMotifs => {
                 c.class = ClassLens::Uniform;
@@ -2241,6 +2252,20 @@ fn geometric_ui() -> Element {
             on: move |v: f64| edit::<LensConfig>(BRIDGE_GEOMETRIC, |c| c.angle_stiffness = v as f32) }
         Slider { label: "Gravity", min: 0.0, max: 0.1, value: opts.gravity as f64,
             on: move |v: f64| edit::<LensConfig>(BRIDGE_GEOMETRIC, |c| c.gravity = v as f32) }
+
+        div { class: "lay-sub", "Integrator" }
+        Slider { label: "Time step", min: 0.01, max: 1.0, value: opts.time_step as f64, log: true,
+            title: "Integration dt. The strongest stabilizer: if the layout flip-flops at the \
+                    Max step cap (stiff forces, K·dt² > 2), halve this first.",
+            on: move |v: f64| edit::<LensConfig>(BRIDGE_GEOMETRIC, |c| c.time_step = v as f32) }
+        Slider { label: "Damping", min: 0.0, max: 1.0, value: opts.damping as f64,
+            title: "Velocity retention per step (1 = frictionless). Lower dissipates overshoot \
+                    oscillation faster.",
+            on: move |v: f64| edit::<LensConfig>(BRIDGE_GEOMETRIC, |c| c.damping = v as f32) }
+        Slider { label: "Max step", min: 0.0, max: 20.0, value: opts.max_step as f64,
+            title: "Per-step displacement cap per node (0 = uncapped). A spike guard, not a \
+                    stabilizer — if every step saturates it, lower Time step instead.",
+            on: move |v: f64| edit::<LensConfig>(BRIDGE_GEOMETRIC, |c| c.max_step = v as f32) }
 
         hr { class: "lay-sep" }
 

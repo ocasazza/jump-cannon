@@ -170,15 +170,10 @@ fn dist(p: &[f32], i: usize, j: usize) -> f32 {
 
 /// A single edge must stay FINITE (never NaN/Inf) over a long run.
 ///
-/// KNOWN LIMITATION (documented by this canary, not asserted away): fa2-brute
-/// is numerically *unstable* on a 2-node graph — with no swing/speed damping,
-/// the 1/dist repulsion singularity flings the pair apart, attraction yanks them
-/// back, and the separation oscillates wildly (observed band ≈ [0.1, 80]) rather
-/// than settling. Two nodes is a pathological case for FA2; 3+ nodes stabilize
-/// (see the equilateral-triangle canary). So we only guard the floor here: the
-/// step must not produce non-finite coordinates. Tightening this to a bounded
-/// band would require porting FA2's adaptive-speed (swing) control — a separate
-/// algorithm task, flagged as a follow-up.
+/// Historical note: before the adaptive-speed (swing) port — see
+/// `engines::fa2_speed` — this 2-node case oscillated wildly (observed band
+/// ≈ [0.1, 80]); the swing controller now damps it. The canary keeps guarding
+/// only the floor (finiteness) so it stays robust to force-model tweaks.
 #[test]
 fn fa2_single_edge_stays_finite() {
     let _g = gpu_guard();

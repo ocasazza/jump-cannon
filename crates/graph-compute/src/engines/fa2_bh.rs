@@ -1,8 +1,10 @@
 //! Barnes-Hut ForceAtlas2 layout engine (`"fa2-bh"`).
 //!
 //! Same ForceAtlas2 as [`Fa2BruteEngine`](super::Fa2BruteEngine) — identical
-//! attraction (linear edge scan), gravity, and Euler integration — but the
-//! O(n²) all-pairs repulsion is replaced by an O(n log n) Barnes-Hut octree
+//! attraction (linear edge scan), gravity, and adaptive-speed displacement
+//! (the paper's swing/traction mechanism, host-reduced via
+//! [`super::fa2_speed`]) — but the O(n²) all-pairs repulsion is replaced by an
+//! O(n log n) Barnes-Hut octree
 //! walk (θ-criterion). The converged layout is the same; this is a *pure
 //! speedup* (docs/layout-algorithms.md §1: "Visual: identical to FA2"), lifting
 //! the useful graph size from ~10–50k nodes (brute force) toward ~1M.
@@ -65,6 +67,12 @@ struct Fa2BhParamsRaw {
     theta: f32,
     /// Populated octree slots this step (0 => repulsion skipped). Replaces pad1.
     n_octree: u32,
+    /// Global adaptive speed s(G); host-recomputed between force/apply passes.
+    speed: f32,
+    /// Per-step displacement cap (paper k_smax; 0 disables).
+    max_displacement: f32,
+    _pad0: u32,
+    _pad1: u32,
 }
 
 /// FA2 + Barnes-Hut tunables. Serde-roundtrippable so they ride on the wire as
@@ -87,6 +95,10 @@ pub struct Fa2BhSettings {
     /// common sweet spot (Burtscher & Pingali 2011 §4.5). Larger = faster, less
     /// accurate; 0.0 degenerates to brute force (every leaf visited).
     pub theta: f32,
+    /// Per-step displacement cap — the paper's `k_smax` (10 in Gephi/the
+    /// paper). `0` disables. Must match `Fa2Settings::max_displacement` for the
+    /// theta=0 brute-equivalence property to hold.
+    pub max_displacement: f32,
 }
 
 impl Default for Fa2BhSettings {
@@ -101,6 +113,7 @@ impl Default for Fa2BhSettings {
             prevent_overlap: false,
             time_step: 1.0,
             theta: 0.7,
+            max_displacement: 10.0,
         }
     }
 }
@@ -109,18 +122,28 @@ impl Default for Fa2BhSettings {
 struct Gpu {
     device: std::sync::Arc<wgpu::Device>,
     queue: std::sync::Arc<wgpu::Queue>,
-    pipeline: wgpu::ComputePipeline,
+    /// `fa2_force`: forces + swing/traction stats.
+    force_pipeline: wgpu::ComputePipeline,
+    /// `fa2_apply`: adaptive-speed displacement (after the host reduction).
+    apply_pipeline: wgpu::ComputePipeline,
     /// Ping-pong bind groups for deterministic position double-buffering
     /// (timeline P2): `[0]` reads A→writes B, `[1]` reads B→writes A.
     bind_groups: [wgpu::BindGroup; 2],
     read_idx: usize,
     positions_buf: wgpu::Buffer,
     positions_buf_b: wgpu::Buffer,
-    _velocities_buf: wgpu::Buffer,
+    _old_force_buf: wgpu::Buffer,
+    _force_buf: wgpu::Buffer,
     _edges_buf: wgpu::Buffer,
     _edge_weights_buf: wgpu::Buffer,
     _degrees_buf: wgpu::Buffer,
     params_buf: wgpu::Buffer,
+    stats_buf: wgpu::Buffer,
+    stats_readback_buf: wgpu::Buffer,
+    /// `n_nodes * 8` — bytes of the per-node (swing, traction) stats buffer.
+    stats_byte_len: u64,
+    /// Adaptive global-speed controller (Gephi's speed/speedEfficiency).
+    adaptive: super::fa2_speed::AdaptiveSpeed,
     oct_nodes_buf: wgpu::Buffer,
     /// Capacity of `oct_nodes_buf` in OctNode slots.
     oct_capacity: u32,
@@ -233,7 +256,9 @@ impl LayoutEngine for Fa2BhEngine {
             positions_vec4.extend_from_slice(&[0.0, 0.0, 0.0, 0.0]);
         }
 
-        let velocities = vec![0.0f32; n.max(1) * 4];
+        // Previous-step force F_{t-1}, zero at start (Gephi: old forces are 0
+        // on the first pass, so step-1 swing = |F| and traction = |F|/2).
+        let old_force = vec![0.0f32; n.max(1) * 4];
 
         // Synthesize edges + per-node degree from CSR (same as fa2-brute).
         let mut edges_pairs: Vec<[u32; 2]> = Vec::new();
@@ -287,9 +312,14 @@ impl LayoutEngine for Fa2BhEngine {
                 | wgpu::BufferUsages::COPY_SRC
                 | wgpu::BufferUsages::COPY_DST,
         });
-        let velocities_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("fa2bh_velocities"),
-            contents: bytemuck::cast_slice(&velocities),
+        let old_force_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("fa2bh_old_force"),
+            contents: bytemuck::cast_slice(&old_force),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        });
+        let force_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("fa2bh_force"),
+            contents: bytemuck::cast_slice(&old_force),
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
         });
         let edges_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -320,7 +350,7 @@ impl LayoutEngine for Fa2BhEngine {
             mapped_at_creation: false,
         });
 
-        let params_init = build_params_raw(n_nodes, n_edges, &self.settings, 0);
+        let params_init = build_params_raw(n_nodes, n_edges, &self.settings, 0, 1.0);
         let params_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("fa2bh_params"),
             contents: bytemuck::bytes_of(&params_init),
@@ -330,6 +360,23 @@ impl LayoutEngine for Fa2BhEngine {
         let readback_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("fa2bh_positions_readback"),
             size: positions_byte_len,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        // Per-node (mass·swing, mass·traction) pairs for the host's global
+        // adaptive-speed reduction; read back BETWEEN the force and apply
+        // passes each step.
+        let stats_byte_len = (n.max(1) as u64) * 8;
+        let stats_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("fa2bh_stats"),
+            size: stats_byte_len,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let stats_readback_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("fa2bh_stats_readback"),
+            size: stats_byte_len,
             usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -377,13 +424,15 @@ impl LayoutEngine for Fa2BhEngine {
             label: Some("fa2bh_bgl"),
             entries: &[
                 storage_ro(0), // positions_in (read-only this step)
-                storage_rw(1), // velocities
+                storage_rw(1), // old_force (F_{t-1})
                 storage_ro(2), // edges
                 storage_ro(3), // edge_weights
                 uniform(4),    // params
                 storage_ro(5), // degrees
                 storage_ro(6), // oct_nodes
                 storage_rw(7), // positions_out (write-only this step)
+                storage_rw(8), // force (F_t)
+                storage_rw(9), // stats (mass·swing, mass·traction)
             ],
         });
 
@@ -392,11 +441,19 @@ impl LayoutEngine for Fa2BhEngine {
             bind_group_layouts: &[&bgl],
             push_constant_ranges: &[],
         });
-        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("fa2bh_pipeline"),
+        let force_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("fa2bh_force_pipeline"),
             layout: Some(&pl),
             module: &shader,
-            entry_point: Some("fa2_step"),
+            entry_point: Some("fa2_force"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+        let apply_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("fa2bh_apply_pipeline"),
+            layout: Some(&pl),
+            module: &shader,
+            entry_point: Some("fa2_apply"),
             compilation_options: Default::default(),
             cache: None,
         });
@@ -412,7 +469,7 @@ impl LayoutEngine for Fa2BhEngine {
                     },
                     wgpu::BindGroupEntry {
                         binding: 1,
-                        resource: velocities_buf.as_entire_binding(),
+                        resource: old_force_buf.as_entire_binding(),
                     },
                     wgpu::BindGroupEntry {
                         binding: 2,
@@ -438,6 +495,14 @@ impl LayoutEngine for Fa2BhEngine {
                         binding: 7,
                         resource: out_buf.as_entire_binding(),
                     },
+                    wgpu::BindGroupEntry {
+                        binding: 8,
+                        resource: force_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 9,
+                        resource: stats_buf.as_entire_binding(),
+                    },
                 ],
             })
         };
@@ -449,16 +514,22 @@ impl LayoutEngine for Fa2BhEngine {
         self.gpu = Some(Gpu {
             device,
             queue,
-            pipeline,
+            force_pipeline,
+            apply_pipeline,
             bind_groups,
             read_idx: 0,
             positions_buf,
             positions_buf_b,
-            _velocities_buf: velocities_buf,
+            _old_force_buf: old_force_buf,
+            _force_buf: force_buf,
             _edges_buf: edges_buf,
             _edge_weights_buf: edge_weights_buf,
             _degrees_buf: degrees_buf,
             params_buf,
+            stats_buf,
+            stats_readback_buf,
+            stats_byte_len,
+            adaptive: super::fa2_speed::AdaptiveSpeed::default(),
             oct_nodes_buf,
             oct_capacity,
             readback_buf,
@@ -496,26 +567,86 @@ impl LayoutEngine for Fa2BhEngine {
             );
         }
 
+        let workgroups = ((gpu.n_nodes + WORKGROUP_SIZE - 1) / WORKGROUP_SIZE).max(1);
+
+        // ---- Pass 1: forces + swing/traction stats -------------------------
         // Refresh params (settings + this step's tree size). n_edges is fixed.
-        let params = build_params_raw(gpu.n_nodes, gpu.cached_n_edges, &settings, used);
+        let params = build_params_raw(
+            gpu.n_nodes,
+            gpu.cached_n_edges,
+            &settings,
+            used,
+            gpu.adaptive.speed,
+        );
         gpu.queue
             .write_buffer(&gpu.params_buf, 0, bytemuck::bytes_of(&params));
 
         let mut encoder = gpu
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("fa2bh_encoder"),
+                label: Some("fa2bh_force_encoder"),
             });
-
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("fa2bh_pass"),
+                label: Some("fa2bh_force_pass"),
                 timestamp_writes: None,
             });
-            pass.set_pipeline(&gpu.pipeline);
+            pass.set_pipeline(&gpu.force_pipeline);
             pass.set_bind_group(0, &gpu.bind_groups[gpu.read_idx], &[]);
-            let workgroups = (gpu.n_nodes + WORKGROUP_SIZE - 1) / WORKGROUP_SIZE;
-            pass.dispatch_workgroups(workgroups.max(1), 1, 1);
+            pass.dispatch_workgroups(workgroups, 1, 1);
+        }
+        encoder.copy_buffer_to_buffer(
+            &gpu.stats_buf,
+            0,
+            &gpu.stats_readback_buf,
+            0,
+            gpu.stats_byte_len,
+        );
+        gpu.queue.submit(std::iter::once(encoder.finish()));
+
+        // ---- Host reduction: global adaptive speed (Gephi state machine) ---
+        {
+            let slice = gpu.stats_readback_buf.slice(..);
+            let (tx, rx) = std::sync::mpsc::channel();
+            slice.map_async(wgpu::MapMode::Read, move |res| {
+                let _ = tx.send(res);
+            });
+            gpu.device.poll(wgpu::Maintain::Wait);
+            rx.recv()
+                .expect("map_async channel closed")
+                .expect("stats buffer map failed");
+            let data = slice.get_mapped_range();
+            let stats: &[f32] = bytemuck::cast_slice(&data);
+            gpu.adaptive
+                .update(gpu.n_nodes, settings.jitter_tolerance, stats);
+            drop(data);
+            gpu.stats_readback_buf.unmap();
+        }
+
+        // ---- Pass 2: adaptive-speed displacement ---------------------------
+        let params = build_params_raw(
+            gpu.n_nodes,
+            gpu.cached_n_edges,
+            &settings,
+            used,
+            gpu.adaptive.speed,
+        );
+        gpu.queue
+            .write_buffer(&gpu.params_buf, 0, bytemuck::bytes_of(&params));
+
+        let mut encoder = gpu
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("fa2bh_apply_encoder"),
+            });
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("fa2bh_apply_pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&gpu.apply_pipeline);
+            pass.set_bind_group(0, &gpu.bind_groups[gpu.read_idx], &[]);
+            pass.dispatch_workgroups(workgroups, 1, 1);
         }
 
         // OUT buffer for this step: group 0 wrote B, group 1 wrote A.
@@ -561,13 +692,15 @@ impl LayoutEngine for Fa2BhEngine {
     }
 }
 
-/// Build a params uniform payload. `n_edges` is fixed at `init`; settings and
-/// `n_octree` (the per-step tree size) can change between calls.
+/// Build a params uniform payload. `n_edges` is fixed at `init`; settings,
+/// `n_octree` (the per-step tree size), and `speed` (the host-side adaptive
+/// global speed) change between calls.
 fn build_params_raw(
     n_nodes: u32,
     n_edges: u32,
     s: &Fa2BhSettings,
     n_octree: u32,
+    speed: f32,
 ) -> Fa2BhParamsRaw {
     Fa2BhParamsRaw {
         n_nodes,
@@ -582,6 +715,10 @@ fn build_params_raw(
         prevent_overlap: s.prevent_overlap as u32,
         theta: s.theta.max(0.0),
         n_octree,
+        speed,
+        max_displacement: s.max_displacement,
+        _pad0: 0,
+        _pad1: 0,
     }
 }
 

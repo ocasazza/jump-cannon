@@ -30,6 +30,14 @@ path = "src/bin/cc.rs"
 name = "graph-bfs"
 path = "src/bin/bfs.rs"
 
+# Layout-engine stability harness: runs an engine N steps over a real CSR (or a
+# seeded synthetic scale-free graph) from the renderer's random-ball seed and
+# prints divergence/convergence telemetry. The measurement tool behind the fa2
+# adaptive-speed + geometric integrator-knob work.
+[[bin]]
+name = "graph-layout-stability"
+path = "src/bin/layout_stability.rs"
+
 [lib]
 name = "graph_compute"
 path = "src/lib.rs"

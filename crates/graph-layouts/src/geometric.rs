@@ -83,6 +83,33 @@ pub struct LensConfig {
     pub exclusion_strength: f32,
     pub affinity_strength: f32,
     pub gravity: f32,
+
+    // --- integrator knobs ----------------------------------------------------
+    // The engine's damped-Euler integrator (`v ← damping·(v + dt·a)`,
+    // `x ← x + clamp(dt·v, ±max_step)`) is only stable when the effective
+    // stiffness K of the local force field satisfies K·dt² ≲ 2; past that the
+    // update overshoots equilibrium every step and the max_step clamp turns the
+    // divergence into a ±max_step flip-flop (zero net progress — exactly what
+    // the vault graph showed at dt=1 with exclusion_strength=100). These three
+    // expose the stability triangle to the lens so a dense, stiff graph can be
+    // dialed down without touching force magnitudes. Serde defaults return the
+    // engine's CURRENT defaults so old persisted lenses (and the geometric
+    // golden master) stay byte-identical.
+    /// Integration time step `dt`. Halving dt quarters K·dt² — the strongest
+    /// stabilizer. Engine default `1.0`.
+    #[serde(default = "default_time_step")]
+    pub time_step: f32,
+    /// Velocity retention per step in `[0,1]` (1 = frictionless). Lower values
+    /// dissipate the overshoot oscillation faster. Engine default `0.9`.
+    #[serde(default = "default_damping")]
+    pub damping: f32,
+    /// Hard cap on per-step displacement per node (`0` = uncapped). A safety
+    /// guard against transient force spikes, not a stabilizer: if the
+    /// uncapped step would exceed it every tick, the integrator is overshooting
+    /// and dt/damping are what need lowering. Engine default `10.0`.
+    #[serde(default = "default_max_step")]
+    pub max_step: f32,
+
     pub coordination_angles: Vec<f32>,
     pub class_radius: Vec<f32>,
     pub class_affinity: Vec<f32>,
@@ -161,6 +188,19 @@ fn default_well_width() -> f32 {
     1.0
 }
 
+// Integrator defaults — MUST equal the geometric engine's `GeometricSettings`
+// defaults (graph-compute geometric.rs) so a lens that omits them resolves to
+// the byte-identical engine default (golden master).
+fn default_time_step() -> f32 {
+    1.0
+}
+fn default_damping() -> f32 {
+    0.9
+}
+fn default_max_step() -> f32 {
+    10.0
+}
+
 fn default_r_bond() -> f32 {
     1.0
 }
@@ -194,6 +234,9 @@ impl Default for LensConfig {
             exclusion_strength: 100.0,
             affinity_strength: 0.0,
             gravity: 0.005,
+            time_step: 1.0,
+            damping: 0.9,
+            max_step: 10.0,
             coordination_angles: vec![],
             class_radius: vec![],
             class_affinity: vec![],
@@ -267,6 +310,11 @@ mod tests {
         let decoded: LensConfig = serde_json::from_value(old).unwrap();
         assert!(!decoded.use_multilevel);
         assert_eq!(decoded.edge_length, EdgeLengthLens::Uniform);
+        // Integrator knobs absent ⇒ the engine's current defaults, so a
+        // pre-knob lens resolves to the byte-identical golden-master settings.
+        assert_eq!(decoded.time_step, 1.0);
+        assert_eq!(decoded.damping, 0.9);
+        assert_eq!(decoded.max_step, 10.0);
         // The dynamic-bond fields (added later) must default OFF when absent so
         // a pre-bonding config keeps the byte-identical geometric default.
         assert!(!decoded.bonding_enabled);
