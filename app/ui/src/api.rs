@@ -28,17 +28,30 @@ pub fn default_url() -> String {
     option_env!("JC_SERVER_URL").unwrap_or("http://127.0.0.1:8765").to_string()
 }
 
+/// Normalize a user-typed server URL past the two classic webview footguns:
+/// a missing scheme (fetch treats `127.0.0.1:8766` as a relative URL) and
+/// `localhost` (macOS WebKit resolves it to IPv6 `::1`, but graph-api binds
+/// IPv4 `127.0.0.1` — the fetch dies as an opaque "TypeError: Load failed").
+fn normalize_url(url: &str) -> String {
+    let mut v = url.trim().trim_end_matches('/').to_string();
+    if !v.is_empty() && !v.contains("://") {
+        v = format!("http://{v}");
+    }
+    v.replace("://localhost", "://127.0.0.1")
+}
+
 pub fn server_url() -> String {
     let v: String = LocalStorage::get(URL_KEY).unwrap_or_else(|_| default_url());
-    if v.trim().is_empty() {
+    let v = normalize_url(&v);
+    if v.is_empty() {
         default_url()
     } else {
-        v.trim_end_matches('/').to_string()
+        v
     }
 }
 
 pub fn set_server_url(url: &str) {
-    let _ = LocalStorage::set(URL_KEY, url.trim().trim_end_matches('/'));
+    let _ = LocalStorage::set(URL_KEY, normalize_url(url));
 }
 
 pub type ApiResult<T> = Result<T, String>;
