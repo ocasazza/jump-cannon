@@ -1206,6 +1206,42 @@ fn build_csr_bin(snap: &crate::state::GraphSnapshot) -> Vec<u8> {
     out
 }
 
+/// Push the active vault snapshot to the compute worker: binary CSR +
+/// a seeded random-ball position seed (the worker just needs a
+/// non-degenerate start; the engines move on from it immediately).
+///
+/// Called on broker connect (main.rs) and after every watcher reload —
+/// without this the worker keeps simulating whatever graph it booted with
+/// (the 1024-node demo unless `GRAPH_COMPUTE_GRAPH_PATH` was set), so every
+/// remote engine streams frames for the wrong node set and attribute-sized
+/// engines (geometric lens `node_class`) fail init outright.
+pub async fn push_graph_to_worker(state: &AppState) {
+    // connect_with returns before its forwarder task finishes dialing, so
+    // poll briefly instead of skipping the push on a not-yet-true flag.
+    for _ in 0..20 {
+        if state.inner.compute_broker.status().await.connected {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
+    if !state.inner.compute_broker.status().await.connected {
+        return;
+    }
+    let snap = state.inner.snapshot.load_full();
+    let n = snap.graph.nodes.len() as u32;
+    if n == 0 {
+        return;
+    }
+    let csr = build_csr_bin(&snap);
+    let positions = soup_positions_bytes(n, 800.0, 0xC0A7_5E);
+    match state.inner.compute_broker.load_graph(csr, positions).await {
+        Ok(worker_n) => {
+            tracing::info!(n, worker_n, "pushed vault graph to compute worker");
+        }
+        Err(e) => tracing::warn!(n, "vault graph push to compute worker failed: {e}"),
+    }
+}
+
 async fn graph_metric(State(s): State<AppState>, Path(name): Path<String>) -> impl IntoResponse {
     cached_binary_response(&s, &name).into_response()
 }

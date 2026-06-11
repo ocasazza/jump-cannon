@@ -84,17 +84,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let compute_broker = ComputeBroker::new();
+
+    let state = AppState::new(
+        vault_root.clone(),
+        graph,
+        vault_search,
+        args.assets_dir,
+        compute_broker.clone(),
+        progress.clone(),
+    );
+
     if let Some(compute_url) = args.compute_url.clone() {
         let broker = compute_broker.clone();
         // ADR-002: pick + tune the remote layout engine from env. Empty/unset
         // ⇒ the worker's startup default (backward compatible).
         let remote_layout = RemoteLayout::from_env();
+        let push_state = state.clone();
         tokio::spawn(async move {
             match broker
                 .connect_with(compute_url.clone(), remote_layout)
                 .await
             {
-                Ok(()) => tracing::info!(url = %compute_url, "connected to graph-compute worker"),
+                Ok(()) => {
+                    tracing::info!(url = %compute_url, "connected to graph-compute worker");
+                    // Hand the worker the vault graph — its boot graph is a
+                    // demo placeholder; remote engines must simulate ours.
+                    graph_api::server::push_graph_to_worker(&push_state).await;
+                }
                 Err(e) => tracing::warn!(
                     url = %compute_url,
                     "graph-compute unreachable: {e}; /graph/layout/stream will return 503"
@@ -107,15 +123,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
              /graph/layout/stream will return 503"
         );
     }
-
-    let state = AppState::new(
-        vault_root.clone(),
-        graph,
-        vault_search,
-        args.assets_dir,
-        compute_broker,
-        progress.clone(),
-    );
 
     // Live reload: watch $VAULT_ROOT for `.md` changes and atomically
     // swap a new GraphSnapshot into AppState. Skipped if --no-watch.

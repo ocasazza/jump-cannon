@@ -217,6 +217,10 @@ async fn rebuild_snapshot(state: &AppState) {
 
     state.inner.snapshot.store(snapshot);
     progress.finish(reload_id);
+
+    // Keep the compute worker simulating THIS graph (no-op when the broker
+    // is disabled or disconnected).
+    crate::server::push_graph_to_worker(state).await;
 }
 
 /// Full respawn of the vault-search subprocess with `--rebuild`. Used as
