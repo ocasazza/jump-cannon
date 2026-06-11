@@ -43,6 +43,8 @@ web-sys = { workspace = true, features = [
     "HtmlCanvasElement",
     # panic banner (main.rs panic hook): console.error + DOM injection
     "console", "HtmlElement", "Node",
+    # api.rs GET helpers bypass the HTTP cache (live graph buffers)
+    "RequestCache",
 ] }
 tracing = "0.1"
 tracing-wasm = "0.2"

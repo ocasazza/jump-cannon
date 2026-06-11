@@ -73,12 +73,22 @@ fn encode_id(id: &str) -> String {
         .join("/")
 }
 
+/// GET with the browser HTTP cache bypassed. The graph buffers are live
+/// state, not assets: `/generate`, `/compute/soup`, and vault reloads swap
+/// them mid-session, and a cached `/graph/edges` from a previous graph
+/// poisons every consistency check until it expires (the server once
+/// stamped them `immutable, max-age=1y` — WebKit took it at its word).
+/// `NoStore` both skips existing entries and never writes new ones.
+fn get(path: &str) -> gloo_net::http::RequestBuilder {
+    Request::get(&url(path)).cache(web_sys::RequestCache::NoStore)
+}
+
 pub(crate) async fn get_json<T: serde::de::DeserializeOwned>(path: &str) -> ApiResult<T> {
-    Request::get(&url(path)).send().await.map_err(err)?.json().await.map_err(err)
+    get(path).send().await.map_err(err)?.json().await.map_err(err)
 }
 
 pub(crate) async fn get_bytes(path: &str) -> ApiResult<Vec<u8>> {
-    let resp = Request::get(&url(path)).send().await.map_err(err)?;
+    let resp = get(path).send().await.map_err(err)?;
     if !resp.ok() {
         return Err(format!("{} -> HTTP {}", path, resp.status()));
     }

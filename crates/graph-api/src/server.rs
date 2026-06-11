@@ -1487,9 +1487,11 @@ fn cached_binary_response(s: &AppState, key: &str) -> axum::response::Response {
     };
     let mut headers = HeaderMap::new();
     headers.insert(header::CONTENT_TYPE, HeaderValue::from_static(OCTET_CT));
-    headers.insert(
-        header::CACHE_CONTROL,
-        HeaderValue::from_static("public, max-age=31536000, immutable"),
-    );
+    // no-store, NOT immutable: these buffers are live state — /generate,
+    // /compute/soup, and vault reloads all swap them mid-session. A cached
+    // edges buffer from a previous graph poisons the client's consistency
+    // guard until it expires (the old `max-age=1y, immutable` did exactly
+    // that to the webview).
+    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     (StatusCode::OK, headers, buf.to_vec()).into_response()
 }
