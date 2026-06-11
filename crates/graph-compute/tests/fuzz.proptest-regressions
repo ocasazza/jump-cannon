@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc fa9eb863d8ed60f0ab0ba841c9fe1f314192edeb13a2ddf5d91940a9c1f66bd5 # shrinks to shape = Star, n = 237, seed_kind = Ball, params = Object {"time_step": Number(0.187363862991333)}, graph_seed = 18677859776758509, steps = 21

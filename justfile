@@ -174,7 +174,7 @@ build:
 # An optional ARG parameterizes targets that take a knob:
 #   just test                # all (cargo + Rust browser smoke)
 #   just test cargo          # native unit + integration tests (incl. regression.rs + fuzz.rs at default volume)
-#   just test fuzz [N]       # property-based fuzz, N cases per layout (default 10000)
+#   just test fuzz [N]       # property-based fuzz: graph-layouts layouts + graph-compute engines (default 10000)
 #   just test bench          # criterion benches across layouts; HTML in target/criterion/
 #   just test canary [URL]   # live-cluster gRPC smoke (default URL: http://[::1]:50051)
 #   just test geometric      # geometric engine: solved-case canary + regression golden + perf
@@ -187,7 +187,9 @@ test target='all' arg='':
       all)        just test cargo && just test browser-rust ;;
       cargo)      cargo test --workspace ;;
       fuzz)       PROPTEST_CASES="${ARG:-{{arg}}}"; PROPTEST_CASES="${PROPTEST_CASES:-10000}" \
-                  cargo test -p graph-layouts --test fuzz --release ;;
+                  cargo test -p graph-layouts --test fuzz --release && \
+                  PROPTEST_CASES="${PROPTEST_CASES:-10000}" \
+                  cargo test -p graph-compute --test fuzz --release ;;
       bench)      cargo run --release -p graph-layouts --example bench_static_layouts -- --bench ;;
       canary)     URL="${ARG:-{{arg}}}"; URL="${URL:-http://[::1]:50051}" \
                   GRAPH_COMPUTE_CANARY_URL="$URL" \

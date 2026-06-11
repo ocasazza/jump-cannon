@@ -498,9 +498,17 @@ pub fn cpu_step(graph: &CsrGraph, positions: &[f32], dt: f32) -> Vec<f32> {
             fy += f * dy;
             fz += f * dz;
         }
-        new_positions[3 * v] = vx + dt * fx;
-        new_positions[3 * v + 1] = vy + dt * fy;
-        new_positions[3 * v + 2] = vz + dt * fz;
+        // Semi-implicit hub damping: the explicit update diverges when
+        // dt·k_spring·degree > 2 (a degree-236 hub at dt≈0.19 trips it —
+        // found by tests/fuzz.rs). Dividing by (1 + dt·k·deg) is the
+        // standard implicit-Euler stabilization: unconditionally stable in
+        // dt and degree, and within O(dt·k·deg) of the explicit update for
+        // low-degree nodes, so path/grid behavior is effectively unchanged.
+        let deg = (end - start) as f32;
+        let damp = 1.0 + dt * k_spring * deg;
+        new_positions[3 * v] = vx + dt * fx / damp;
+        new_positions[3 * v + 1] = vy + dt * fy / damp;
+        new_positions[3 * v + 2] = vz + dt * fz / damp;
     }
     new_positions
 }
