@@ -21,6 +21,7 @@ mod palette;
 mod panels;
 mod proto;
 mod render;
+mod worker;
 
 use std::collections::HashSet;
 
@@ -278,10 +279,11 @@ fn App() -> Element {
     // handling, style/camera loops) before any panel renders — a saved
     // layout with every panel minimized must still process boot presets.
     appstate::ensure_init();
-    // _v4: tiling spans (tile_w/tile_h) — saved v3 layouts would deserialize
-    // with a quarter-width graph tile, so re-seed the defaults. (v3: Search
-    // merged into Nodes; v2: 2x graph view + docked tray panels.)
-    let ws = panel_kit::use_workspace("jc_layout_v4", default_layout);
+    // _v5: re-seed defaults — saved v4 layouts could persist the Graph panel
+    // minimized (its body, and thus the wgpu canvas, never mounts → blank
+    // graph), plus pre-resize-fix geometry. (v4: tiling spans tile_w/tile_h;
+    // v3: Search merged into Nodes; v2: 2x graph view + docked tray panels.)
+    let ws = panel_kit::use_workspace("jc_layout_v5", default_layout);
 
     // Drain palette jump-to-section requests into the workspace, logging
     // the same `("section", "<title>: open")` event the egui app pushed.
