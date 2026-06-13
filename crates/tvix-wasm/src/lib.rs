@@ -33,10 +33,15 @@ use wasm_bindgen::prelude::*;
 // The caps are env-tunable so the NATIVE server (graph-api) can raise them for
 // the large self-assembly demos — the geometric GPU engine + 2-D dispatch tiling
 // scales to millions of particles, and `soupGen` now builds in O(n). The default
-// (50k) still protects a browser tab on the wasm path, where `std::env::var`
-// always returns `Err` (no env) and the default holds.
-const DEFAULT_MAX_NODES: usize = 50_000;
-const DEFAULT_MAX_EDGES: usize = 200_000;
+// (1M, matching the soup path's `MAX_SOUP_NODES`) still backstops a browser tab
+// on the wasm path, where `std::env::var` always returns `Err` (no env) and the
+// default holds — but it is no longer an artificially low wall. Truly unbounded
+// browser eval needs the retired tvix-worker (Web Worker + timeout) restored so
+// a runaway expression can't lock the UI thread; until then the inline path
+// keeps a finite backstop. The native server (graph-api) can raise both via
+// JC_MAX_NODES / JC_MAX_EDGES with no ceiling.
+const DEFAULT_MAX_NODES: usize = 1_000_000;
+const DEFAULT_MAX_EDGES: usize = 4_000_000;
 
 fn env_cap(var: &str, default: usize) -> usize {
     std::env::var(var)
@@ -48,6 +53,28 @@ fn env_cap(var: &str, default: usize) -> usize {
 /// Output cap on node count. Override with `JC_MAX_NODES` (native server only).
 fn max_nodes() -> usize {
     env_cap("JC_MAX_NODES", DEFAULT_MAX_NODES)
+}
+
+/// Enforce the output caps against explicit limits. Split from
+/// [`parse_graph_json`] so the cap logic is testable without materializing a
+/// cap-sized graph (prohibitive now that the default is 1M nodes).
+fn check_caps_against(
+    n_nodes: usize,
+    n_edges: usize,
+    max_nodes: usize,
+    max_edges: usize,
+) -> Result<(), String> {
+    if n_nodes > max_nodes {
+        return Err(format!(
+            "graph too large: {n_nodes} nodes exceeds the {max_nodes} node cap"
+        ));
+    }
+    if n_edges > max_edges {
+        return Err(format!(
+            "graph too large: {n_edges} edges exceeds the {max_edges} edge cap"
+        ));
+    }
+    Ok(())
 }
 
 /// Output cap on edge count. Override with `JC_MAX_EDGES` (native server only).
@@ -296,20 +323,7 @@ pub fn parse_graph_json(json: &str) -> Result<GeneratedGraph, String> {
         format!("result is not a {{ nodes, links }} graph (toGraphJSON shape): {e}")
     })?;
 
-    let max_nodes = max_nodes();
-    if raw.nodes.len() > max_nodes {
-        return Err(format!(
-            "graph too large: {} nodes exceeds the {max_nodes} node cap",
-            raw.nodes.len()
-        ));
-    }
-    let max_edges = max_edges();
-    if raw.links.len() > max_edges {
-        return Err(format!(
-            "graph too large: {} edges exceeds the {max_edges} edge cap",
-            raw.links.len()
-        ));
-    }
+    check_caps_against(raw.nodes.len(), raw.links.len(), max_nodes(), max_edges())?;
 
     let nodes = raw
         .nodes
@@ -718,14 +732,18 @@ mod tests {
 
     #[test]
     fn node_cap_triggers() {
-        // genList of (default cap + 1) trivial nodes, no links. Uses the default
-        // (env unset) so the test stays cheap and deterministic.
-        let expr = format!(
-            "{{ nodes = builtins.genList (i: {{ id = builtins.toString i; }}) {}; links = []; }}",
-            DEFAULT_MAX_NODES + 1
-        );
-        let err = eval_graph(&expr).unwrap_err();
+        // The cap logic, exercised directly: the old shape of this test
+        // (genList of cap+1 nodes through tvix) became prohibitively slow
+        // once the default rose to 1M. Default wiring (env unset in tests)
+        // is asserted separately via max_nodes()/max_edges() themselves.
+        assert_eq!(max_nodes(), DEFAULT_MAX_NODES);
+        assert_eq!(max_edges(), DEFAULT_MAX_EDGES);
+        let err = check_caps_against(DEFAULT_MAX_NODES + 1, 0, max_nodes(), max_edges())
+            .unwrap_err();
         assert!(err.contains("node cap"), "unexpected error: {err}");
+        let err = check_caps_against(0, DEFAULT_MAX_EDGES + 1, max_nodes(), max_edges())
+            .unwrap_err();
+        assert!(err.contains("edge cap"), "unexpected error: {err}");
     }
 
     #[test]
