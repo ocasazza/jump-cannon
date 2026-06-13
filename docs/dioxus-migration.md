@@ -91,12 +91,15 @@ Executed 2026-06-10 (five parallel ports against the egui reference at
   feeding the Debug event log.
 - Client-side tvix eval (`panels/{layout,generate}.rs`): built-in + custom
   Nix seed expressions via `tvix_wasm::eval_seed`; Generate Inline executor
-  via `eval_graph` with Auto server→inline transport fallback.
+  via `eval_graph`; LocalWorker executor restored 2026-06-12 — the
+  `tvix-worker` bin is back as an app workspace member (`app/tvix-worker`),
+  trunk builds it as a worker bundle, and `ui/src/worker.rs` spawns it (Blob
+  bootstrap + READY handshake). Auto's offline fallback is the worker again
+  (server → worker, matching the egui wasm `resolve_generate_backend`).
 
 Remaining `PARITY GAP` annotations (grep `app/ui/src` for the full list):
-new-graph-tab (single Graph panel by design), LocalWorker executor
-(tvix-worker retired; Inline covers it), client-side degree/wcc buffers for
-generated graphs, per-stage perf overlay, syntect source highlighting,
+new-graph-tab (single Graph panel by design), client-side degree/wcc buffers
+for generated graphs, per-stage perf overlay, syntect source highlighting,
 edge-hover width from Style state, soft-tether card drag offsets.
 
 ## Phase 5 — retirement ✅

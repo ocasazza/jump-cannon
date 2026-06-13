@@ -1,6 +1,9 @@
 # Cargo workspace for the Dioxus + Tauri full-stack app:
-#   ui         — jump-cannon's Dioxus frontend (talks HTTP to graph-api)
-#   src-tauri  — Tauri v2 shell (pure webview container, no IPC commands)
+#   ui          — jump-cannon's Dioxus frontend (talks HTTP to graph-api)
+#   src-tauri   — Tauri v2 shell (pure webview container, no IPC commands)
+#   tvix-worker — Web Worker bin: tvix graph eval off the UI thread (the
+#                 Generate panel's LocalWorker executor; trunk builds it as a
+#                 separate worker bundle via app/ui/index.html)
 #
 # The panel-workspace library lives in its own repo now —
 # https://github.com/ocasazza/panel-kit — consumed as a git dependency and
@@ -12,7 +15,7 @@
 # builds through nix + crane and must not absorb the Tauri/Dioxus dependency
 # tree.
 [workspace]
-members = ["ui", "src-tauri"]
+members = ["ui", "src-tauri", "tvix-worker"]
 resolver = "2"
 
 [workspace.package]

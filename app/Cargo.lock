@@ -3447,7 +3447,7 @@ dependencies = [
 [[package]]
 name = "panel-kit"
 version = "0.2.0"
-source = "git+https://github.com/ocasazza/panel-kit#c0ec98d5216aa90eb4741b728254c5cb46383004"
+source = "git+https://github.com/ocasazza/panel-kit#554180b32d2ca885a432a63f9e8700052f6672c3"
 dependencies = [
  "dioxus",
  "gloo-storage",
@@ -5864,9 +5864,24 @@ name = "tvix-wasm"
 version = "1.0.0"
 dependencies = [
  "bytes",
+ "console_error_panic_hook",
+ "js-sys",
  "serde",
  "serde_json",
  "tvix-eval",
+ "wasm-bindgen",
+]
+
+[[package]]
+name = "tvix-worker"
+version = "0.1.0"
+dependencies = [
+ "console_error_panic_hook",
+ "js-sys",
+ "serde_json",
+ "tvix-wasm",
+ "wasm-bindgen",
+ "web-sys",
 ]
 
 [[package]]

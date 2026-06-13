@@ -22,10 +22,11 @@ app-dev:
 app-build:
     cd app && cargo tauri build
 
-# Type-check the app workspace: WASM frontend + native Tauri shell.
-# (The frontend also builds reproducibly via `nix build .#app-web`.)
+# Type-check the app workspace: WASM frontend + worker bundle + native Tauri
+# shell. (The frontend also builds reproducibly via `nix build .#app-web`.)
 app-check:
     cd app && cargo check --target wasm32-unknown-unknown -p panel-kit -p jump-cannon-ui
+    cd app && cargo check --target wasm32-unknown-unknown -p tvix-worker --features wasm
     cd app && cargo check -p jump-cannon-app
 
 # Regenerate the checked-in prost output (app/ui/src/proto/) after editing

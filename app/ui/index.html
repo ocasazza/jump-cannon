@@ -7,6 +7,12 @@
     <!-- Name the crate explicitly: trunk is driven from the workspace root in
          the nix (crane) build, where the virtual manifest has no root package. -->
     <link data-trunk rel="rust" href="Cargo.toml" data-bin="jump-cannon-ui" />
+    <!-- Offline non-freeze: the tvix-worker bundle hosts a second wasm instance
+         that runs `eval_graph` in a real Web Worker thread. Built into the same
+         dist/ as `tvix-worker.js` + `tvix-worker_bg.wasm`. `Trunk.toml` sets
+         `filehash=false` so the app can spawn the stable URL `/tvix-worker.js`
+         (see ui/src/worker.rs / the Generate panel's LocalWorker executor). -->
+    <link data-trunk rel="rust" href="../tvix-worker/Cargo.toml" data-bin="tvix-worker" data-type="worker" data-cargo-features="wasm" />
   </head>
   <body>
     <div id="main"></div>

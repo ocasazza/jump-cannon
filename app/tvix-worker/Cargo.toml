@@ -1,0 +1,40 @@
+[package]
+name = "tvix-worker"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Web Worker host: runs tvix-wasm graph evaluation off the webview main thread."
+
+# Binary only — trunk builds this with `data-type="worker"` into a standalone
+# worker bundle (`tvix-worker.js` + `tvix-worker_bg.wasm`). It is NOT part of
+# the app's wasm module; app/ui spawns it as a `web_sys::Worker`.
+# (Restored from the retired crates/tvix-worker — same crate, now an app
+# workspace member so it resolves against the app lockfile's wasm-bindgen pin.)
+[[bin]]
+name = "tvix-worker"
+path = "src/main.rs"
+
+[features]
+default = []
+# Mirrors tvix-wasm's `wasm` feature gate so a plain `cargo check` (native)
+# doesn't try to pull the wasm-only entry point. The trunk build passes
+# `--cargo-features wasm` (see app/ui/index.html's worker link).
+wasm = ["tvix-wasm/wasm"]
+
+[dependencies]
+# The only real dependency: the pure tvix-eval graph evaluator. One-way edge
+# (tvix-wasm has no dep on the worker), same as app/ui's use of it.
+tvix-wasm  = { path = "../../crates/tvix-wasm" }
+serde_json = { workspace = true }
+
+# The wasm glue is wasm32-only so a native `cargo check --workspace` doesn't
+# compile web-sys/js-sys/wasm-bindgen for a bin whose only native body is an
+# empty `main`. The `wasm` feature gates the actual worker entry point.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen = { workspace = true }
+js-sys       = "0.3"
+console_error_panic_hook = "0.1"
+web-sys = { workspace = true, features = [
+  "DedicatedWorkerGlobalScope",
+  "MessageEvent",
+] }

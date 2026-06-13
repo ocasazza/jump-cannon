@@ -7,6 +7,10 @@
 [build]
 target = "ui/index.html"
 dist = "ui/dist"
+# Stable asset names: app/ui spawns the tvix-worker bundle at the fixed URL
+# /tvix-worker.js (see ui/src/worker.rs) — a content hash in the filename
+# would break that. Same trade the egui-era root Trunk.toml made.
+filehash = false
 
 # Watch the path dependencies too — trunk's default only covers the bin
 # crate's directory, so graph-layouts edits otherwise never trigger a
@@ -14,7 +18,7 @@ dist = "ui/dist"
 # dependency now; when developing it locally via [patch], add its checkout
 # here too.)
 [watch]
-watch = ["ui", "../crates/graph-layouts"]
+watch = ["ui", "tvix-worker", "../crates/graph-layouts", "../crates/tvix-wasm"]
 
 [serve]
 port = 8081

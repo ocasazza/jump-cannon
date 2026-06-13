@@ -127,14 +127,11 @@ fn generator_expr(ex: &SoupExample) -> String {
 // --- execution backend ---------------------------------------------------------
 
 /// Port of `GenerateBackendChoice` (ui/state.rs). Server evaluates over async
-/// HTTP to graph-api; Inline runs `tvix_wasm::eval_graph` in the browser; Auto
-/// prefers Server and falls back to Inline when graph-api is unreachable
-/// (`app.rs::resolve_generate_backend`, with Inline standing in for the
-/// retired wasm LocalWorker fallback).
-// PARITY GAP: the LocalWorker executor (tvix in a Web Worker via the deleted
-// crates/tvix-worker) stays retired — picking it falls back to the Inline
-// executor, the same fallback the egui native build used. Inline covers
-// client-side eval.
+/// HTTP to graph-api; Inline runs `tvix_wasm::eval_graph` on the UI thread;
+/// LocalWorker runs it in a real Web Worker (the restored `app/tvix-worker`
+/// bundle via `crate::worker`) so big evals never freeze the webview; Auto
+/// prefers Server and falls back to LocalWorker when graph-api is unreachable
+/// (the egui `app.rs::resolve_generate_backend` wasm fallback, restored).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 enum Backend {
     #[default]
@@ -338,7 +335,24 @@ async fn generate(expr: &str) -> Result<GeneratedGraph, String> {
 async fn eval_inline(expr: &str) -> Result<GeneratedGraph, String> {
     gloo_timers::future::TimeoutFuture::new(0).await;
     let g = tvix_wasm::eval_graph(expr)?;
-    Ok(GeneratedGraph {
+    Ok(convert_generated(g))
+}
+
+/// LocalWorker executor — `tvix_wasm::eval_graph` in a real Web Worker (the
+/// restored `app/tvix-worker` bundle, spawned by `crate::worker`). The UI
+/// thread never blocks: the eval runs in a browser-owned thread and the reply
+/// arrives by message — this is what lets the Generate panel chew through
+/// graphs far past the old inline comfort zone without freezing the webview.
+async fn eval_worker(expr: &str) -> Result<GeneratedGraph, String> {
+    let g = crate::worker::eval_in_worker(expr.to_string()).await?;
+    Ok(convert_generated(g))
+}
+
+/// `tvix_wasm::GeneratedGraph` → the panel's `GeneratedGraph` (the `/generate`
+/// response shape). Shared by the Inline and LocalWorker executors so all
+/// three backends feed the same promotion path.
+fn convert_generated(g: tvix_wasm::GeneratedGraph) -> GeneratedGraph {
+    GeneratedGraph {
         nodes: g.nodes.into_iter().map(|n| GenNode { id: n.id }).collect(),
         links: g
             .edges
@@ -348,7 +362,7 @@ async fn eval_inline(expr: &str) -> Result<GeneratedGraph, String> {
                 target: e.target,
             })
             .collect(),
-    })
+    }
 }
 
 /// `POST /compute/soup` — same soft-error contract.
@@ -487,12 +501,13 @@ pub fn panel(ctx: Ctx) -> Element {
                     *STATUS.write() = Some("evaluating on the server…".to_string());
                     generate(&src).await
                 }
-                // PARITY GAP: LocalWorker (tvix in a Web Worker via the
-                // deleted crates/tvix-worker) stays retired — it falls back
-                // to the Inline executor, like the egui native build did.
-                Backend::Inline | Backend::LocalWorker => {
+                Backend::Inline => {
                     *STATUS.write() = Some("evaluating locally…".to_string());
                     eval_inline(&src).await
+                }
+                Backend::LocalWorker => {
+                    *STATUS.write() = Some("evaluating in a Web Worker…".to_string());
+                    eval_worker(&src).await
                 }
                 Backend::Auto => {
                     *STATUS.write() = Some("evaluating on the server…".to_string());
@@ -501,12 +516,13 @@ pub fn panel(ctx: Ctx) -> Element {
                         // A real eval error from a reachable server — surface
                         // it; falling back would just re-pay the eval.
                         ServerEval::EvalErr(e) => Err(e),
-                        // Unreachable → the local fallback (egui
-                        // resolve_generate_backend with Auto).
+                        // Unreachable → the non-freeze local fallback (egui
+                        // resolve_generate_backend's wasm Auto → LocalWorker).
                         ServerEval::Unreachable(_) => {
-                            *STATUS.write() =
-                                Some("server unreachable — evaluating locally…".to_string());
-                            eval_inline(&src).await
+                            *STATUS.write() = Some(
+                                "server unreachable — evaluating in a Web Worker…".to_string(),
+                            );
+                            eval_worker(&src).await
                         }
                     }
                 }
@@ -710,8 +726,8 @@ pub fn panel(ctx: Ctx) -> Element {
                         key: "{b.key()}",
                         value: "{b.key()}",
                         title: if b == Backend::LocalWorker {
-                            "Offline Web Worker eval. Falls back to the Inline executor — \
-                             the tvix-worker crate is retired."
+                            "Offline Web Worker eval: tvix runs in a browser-owned \
+                             thread, so big evaluations never freeze the UI."
                         } else {
                             ""
                         },

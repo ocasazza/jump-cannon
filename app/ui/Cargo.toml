@@ -45,6 +45,8 @@ web-sys = { workspace = true, features = [
     "console", "HtmlElement", "Node",
     # api.rs GET helpers bypass the HTTP cache (live graph buffers)
     "RequestCache",
+    # worker.rs: spawn the tvix-worker bundle from a Blob bootstrap URL
+    "Blob", "BlobPropertyBag", "MessageEvent", "Url", "Worker",
 ] }
 tracing = "0.1"
 tracing-wasm = "0.2"
