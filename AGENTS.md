@@ -80,9 +80,11 @@ The whole repo builds through **nix + crane + trunk**. No `npm install`, no `was
 
 `just dev-up` and the test recipes are convenience wrappers around the nix outputs — never standalone command stacks.
 
+`just` is structured with **modules** for subcommand grammar: `test` and `cluster` live in `just/*.just`, so `just test cargo`, `just test fuzz 5000`, `just cluster up sky` are real, completable recipes (not bash-case dispatch). `just --list` shows the top level grouped by `[group(...)]`; `just --list test` / `just --list cluster` enumerate a module's subcommands. Each module pins `set working-directory := '..'` so recipes run from the repo root.
+
 ## Testing
 
-- `just test all` (or `just test`) — workspace `cargo test` + the Rust browser smoke test.
+- `just test` / `just test all` — workspace `cargo test` + the Rust browser smoke test.
 - `just test browser-rust` — Rust-driven browser suite via `crates/test-browser` (chromiumoxide + Nix-provided Chromium), driving the Dioxus app: boot log (`[jump-cannon-ui] boot`), canvas dimensions, screenshot. (The egui-era Playwright/JS suite was removed with the egui frontend.)
 - `cargo test -p <crate>` for single-crate runs; standard `cargo test -- <filter>` for one test.
 

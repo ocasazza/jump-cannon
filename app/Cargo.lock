@@ -3447,13 +3447,22 @@ dependencies = [
 [[package]]
 name = "panel-kit"
 version = "0.2.0"
-source = "git+https://github.com/ocasazza/panel-kit#554180b32d2ca885a432a63f9e8700052f6672c3"
+source = "git+https://github.com/ocasazza/panel-kit#c8df35647887b53d0bae32e9792248751ad94352"
 dependencies = [
  "dioxus",
  "gloo-storage",
+ "panel-kit-core",
  "serde",
  "wasm-bindgen",
  "web-sys",
+]
+
+[[package]]
+name = "panel-kit-core"
+version = "0.2.0"
+source = "git+https://github.com/ocasazza/panel-kit#c8df35647887b53d0bae32e9792248751ad94352"
+dependencies = [
+ "serde",
 ]
 
 [[package]]

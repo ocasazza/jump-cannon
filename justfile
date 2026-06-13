@@ -1,48 +1,74 @@
-# jump-cannon — task runner. `just <recipe>` to run.
-# `just` lists all recipes.
+# jump-cannon — task runner.
+#
+#   just                 list every recipe, grouped
+#   just test            run the full test suite      (module: `just test --list`)
+#   just test fuzz 5000  run one test target with args
+#   just cluster up sky  manage the compute cluster   (module: `just cluster --list`)
+#
+# `test` and `cluster` are modules (just/*.just): their subcommands are real,
+# completable recipes with their own `--list`, not bash-case dispatch.
 
 set dotenv-load := true
 set positional-arguments
 
-# Default: show recipes
+# Subcommand modules — the "rich grammar". Each lives in just/<name>.just;
+# run `just --list <mod>` for its subcommands.
+# Test suite: `just test`, `just test cargo`, `just test fuzz 5000`, …
+mod test 'just/test.just'
+# graph-compute cluster: `just cluster up`, `just cluster down sky`, …
+mod cluster 'just/cluster.just'
+
+# Shared paths — single source of truth, no hardcoded duplicates across recipes.
+app_dir := "app"
+dist     := app_dir / "ui/dist"
+
+# Default: list every recipe (grouped by [group(...)]).
 default:
     @just --list
 
 #
-# Dioxus + Tauri desktop app (the app/ workspace). The shell is a pure
-# webview container — start the backend separately (`just dev-up`) and the
-# app connects to graph-api over HTTP (default http://127.0.0.1:8765,
-# configurable in its Settings panel).
+# ── app ── Dioxus + Tauri desktop app (the app/ workspace). The shell is a pure
+# webview container — start the backend separately (`just dev-up`) and the app
+# connects to graph-api over HTTP (default http://127.0.0.1:8765, configurable
+# in its Settings panel).
+#
 
 # Run the desktop app with hot-reload (trunk serve behind tauri dev).
+[group('app')]
 app-dev:
-    cd app && cargo tauri dev
+    cd {{app_dir}} && cargo tauri dev
 
 # Build the release bundle (.dmg / .AppImage / .msi per platform).
+[group('app')]
 app-build:
-    cd app && cargo tauri build
+    cd {{app_dir}} && cargo tauri build
 
 # Type-check the app workspace: WASM frontend + worker bundle + native Tauri
 # shell. (The frontend also builds reproducibly via `nix build .#app-web`.)
+[group('app')]
+[doc('Type-check the app workspace (WASM frontend + worker + native Tauri shell)')]
 app-check:
-    cd app && cargo check --target wasm32-unknown-unknown -p panel-kit -p jump-cannon-ui
-    cd app && cargo check --target wasm32-unknown-unknown -p tvix-worker --features wasm
-    cd app && cargo check -p jump-cannon-app
+    cd {{app_dir}} && cargo check --target wasm32-unknown-unknown -p panel-kit -p jump-cannon-ui
+    cd {{app_dir}} && cargo check --target wasm32-unknown-unknown -p tvix-worker --features wasm
+    cd {{app_dir}} && cargo check -p jump-cannon-app
 
 # Regenerate the checked-in prost output (app/ui/src/proto/) after editing
 # crates/graph-api/proto/graph.proto. Checked in (instead of a build.rs) so
 # the app workspace is self-contained — no protoc, pure crane/nix build.
+[group('app')]
+[doc('Regenerate the checked-in prost output after editing graph.proto')]
 app-proto:
     cargo check -p graph-api
-    cp -f "$(ls -t target/debug/build/graph-api-*/out/jumpcannon.graph.rs | head -1)" app/ui/src/proto/jumpcannon.graph.rs
-    @echo "regenerated app/ui/src/proto/jumpcannon.graph.rs"
+    cp -f "$(ls -t target/debug/build/graph-api-*/out/jumpcannon.graph.rs | head -1)" {{app_dir}}/ui/src/proto/jumpcannon.graph.rs
+    @echo "regenerated {{app_dir}}/ui/src/proto/jumpcannon.graph.rs"
 
 #
-# Internals: backgrounds `nix run .#dev-up` (native binary on darwin,
-# podman+compose on linux) for the distributed compute backend, then runs
-# the API server with cargo-watch in the foreground. Ctrl-C tears down both
-# via a trap. `nix run .#dev-up` standalone still works for orchestration
-# (CI, deploy, integration tests) — this recipe is the contributor entry.
+# ── dev ── the contributor entry point. `dev-up` backgrounds `nix run .#dev-up`
+# (native binary on darwin, podman+compose on linux) for the distributed compute
+# backend, then runs the API server with cargo-watch in the foreground. Ctrl-C
+# tears down both via a trap. `nix run .#dev-up` standalone still works for
+# orchestration (CI, deploy, integration tests).
+#
 
 # Notes: `gpu` selects the Barnes-Hut wgpu engine (fa2-bh), `cpu` selects
 # SGD-stress (sgd-stress). The worker hosts every engine regardless — this only
@@ -52,6 +78,8 @@ app-proto:
 # All-in-one dev stack + hot-reload; backend = gpu (default) | cpu.
 # The frontend is the Dioxus app (app/ui) — served by graph-api at :8765
 # in the browser, and what `just app-dev`'s Tauri shell connects to.
+[group('dev')]
+[doc('All-in-one dev stack + hot-reload; backend = gpu (default) | cpu')]
 dev-up backend="gpu":
     #!/usr/bin/env bash
     set -euo pipefail
@@ -67,9 +95,9 @@ dev-up backend="gpu":
     esac
     echo "→ compute backend: {{backend}} (engine: $COMPUTE_ENGINE)"
 
-    TRUNK_DIR="app"
-    ASSETS="app/ui/dist"
-    echo "→ frontend: app (Dioxus, dist: $ASSETS)"
+    TRUNK_DIR="{{app_dir}}"
+    ASSETS="{{dist}}"
+    echo "→ frontend: {{app_dir}} (Dioxus, dist: $ASSETS)"
 
     # ---- Stage 1: WASM bundle, always built ----
     # The trunk dist is what graph-api serves at `/`. The previous
@@ -158,97 +186,65 @@ dev-up backend="gpu":
       -x "run -p graph-api -- --assets-dir $ASSETS"
 
 # Symmetric teardown for `just dev-up`. Idempotent — safe to re-run.
+[group('dev')]
 dev-down:
     nix run .#dev-down
 
 # Run the production binary (no watch). Assets are no longer embedded in
 # the binary — build the app dist first and serve it via --assets-dir.
+[group('dev')]
+[doc('Run the production binary (no watch): build app dist, then serve it')]
 run:
-    cd app && trunk build --release
-    cargo run --release -p graph-api -- --assets-dir app/ui/dist
+    cd {{app_dir}} && trunk build --release
+    cargo run --release -p graph-api -- --assets-dir {{dist}}
+
+#
+# ── build / quality ──
+#
 
 # Build everything in release mode.
+[group('build')]
 build:
     cargo build --release --workspace
 
-# Run tests. `just test` runs everything; pass a target for one layer.
-# An optional ARG parameterizes targets that take a knob:
-#   just test                # all (cargo + Rust browser smoke)
-#   just test cargo          # native unit + integration tests (incl. regression.rs + fuzz.rs at default volume)
-#   just test fuzz [N]       # property-based fuzz: graph-layouts layouts + graph-compute engines (default 10000)
-#   just test bench          # criterion benches across layouts; HTML in target/criterion/
-#   just test canary [URL]   # live-cluster gRPC smoke (default URL: http://[::1]:50051)
-#   just test geometric      # geometric engine: solved-case canary + regression golden + perf
-#   just test geometric-golden # regenerate the geometric regression golden (intentional baseline bump)
-#   just test browser-rust   # Rust-driven browser smoke (crates/test-browser via CDP)
-test target='all' arg='':
-    #!/usr/bin/env bash
-    set -euo pipefail
-    case "{{target}}" in
-      all)        just test cargo && just test browser-rust ;;
-      cargo)      cargo test --workspace ;;
-      fuzz)       PROPTEST_CASES="${ARG:-{{arg}}}"; PROPTEST_CASES="${PROPTEST_CASES:-10000}" \
-                  cargo test -p graph-layouts --test fuzz --release && \
-                  PROPTEST_CASES="${PROPTEST_CASES:-10000}" \
-                  cargo test -p graph-compute --test fuzz --release ;;
-      bench)      cargo run --release -p graph-layouts --example bench_static_layouts -- --bench ;;
-      canary)     URL="${ARG:-{{arg}}}"; URL="${URL:-http://[::1]:50051}" \
-                  GRAPH_COMPUTE_CANARY_URL="$URL" \
-                  cargo test -p graph-compute --test canary -- --nocapture ;;
-      geometric)  cargo test -p graph-compute --test geometric_solver -- --nocapture ;;
-      geometric-golden) UPDATE_GEOMETRIC_GOLDEN=1 \
-                  cargo test -p graph-compute --test geometric_solver regression_golden_master -- --nocapture ;;
-      browser-rust) just _test-browser-rust ;;
-      *) echo "unknown test target: {{target}} (try: cargo, fuzz, bench, canary, geometric, geometric-golden, browser-rust)" >&2; exit 1 ;;
-    esac
-
 # Format the workspace.
+[group('build')]
 fmt:
     cargo fmt --all
 
 # Lint with clippy, deny warnings.
+[group('build')]
 clippy:
     cargo clippy --all-targets -- -D warnings
 
+#
+# ── util ──
+#
+
 # Reindex vault-search manually.
+[group('util')]
 reindex VAULT_ROOT=`echo ${VAULT_ROOT:-.}`:
     cargo run --release -p vault-search -- --vault {{ VAULT_ROOT }} --rebuild --port 0
 
-# Tail graph-api logs (only useful if launched detached).
+# Tail the detached graph-compute log (written by `just dev-up`'s native worker).
+[group('util')]
 logs:
-    tail -f /tmp/graph-api.log
+    tail -f /tmp/graph-compute.log
 
-# Kill any stray graph-api / vault-search processes from previous runs.
+# Kill every stray jump-cannon process from a crashed run — mirrors dev-up's
+# teardown (graph-api, vault-search, graph-compute, trunk watch, cargo-watch).
+[group('util')]
+[doc('Kill every stray jump-cannon process from a crashed run')]
+[confirm("kill all stray graph-api / vault-search / graph-compute / trunk processes?")]
 kill:
     -pkill -f 'graph-api'
     -pkill -f 'vault-search'
+    -pkill -f 'graph-compute'
+    -pkill -f 'trunk watch'
+    -pkill -f 'cargo-watch.*graph-api'
 
 # Nuke the trunk dist to force a full rebuild.
+[group('util')]
+[confirm("rm -rf the WASM dist (forces a full rebuild)?")]
 clean-wasm:
-    rm -rf app/ui/dist
-
-# Rust-driven browser smoke test: a Rust binary (crates/test-browser)
-# drives headless chromium via CDP against the Dioxus app. No local trunk
-# build needed — the flake wrapper serves the nix-built app-web dist by
-# default (override with ASSETS_DIR=...). Output:
-# target/test-browser-rust/{boot.png, report.json}.
-_test-browser-rust:
-    nix run .#test-browser-rust
-
-# Manage the graph-compute cluster. WHERE picks the backend.
-#   just cluster up [local|sky]      # default: local (podman) — also auto-renders configs
-#   just cluster down [local|sky]
-#   just cluster endpoint sky        # prints JUMP_CANNON_COMPUTE_URL=http://<host>:50051
-#   just cluster render              # regenerate docker-compose.yml + infra/sky/*.yaml from flake.nix
-cluster action='up' where='local':
-    #!/usr/bin/env bash
-    set -euo pipefail
-    case "{{action}}/{{where}}" in
-      up/local)       nix run .#render-stack-configs && nix run .#dev-up ;;
-      down/local)     nix run .#dev-down ;;
-      up/sky)         sky launch -c graph-compute infra/sky/graph-compute.yaml --yes ;;
-      down/sky)       sky down graph-compute --yes ;;
-      endpoint/sky)   sky status --endpoint 50051 graph-compute | awk '{print "JUMP_CANNON_COMPUTE_URL=http://" $0}' ;;
-      render/*)       nix run .#render-stack-configs ;;
-      *) echo "usage: just cluster {up|down|endpoint|render} [local|sky]" >&2; exit 1 ;;
-    esac
+    rm -rf {{dist}}

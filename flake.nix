@@ -656,6 +656,10 @@
 
             # Dev workflow
             just
+            # Declarative process manager for `just dev-up`'s hot-reload stack
+            # (graph-compute + trunk watch + cargo-watch graph-api). Replaces
+            # the old hand-rolled PID/trap/pkill orchestration; see just/dev-stack.yaml.
+            process-compose
 
             # Local dev cluster (`just dev-up` / `just dev-down`). podman runs
             # rootless on NixOS without enabling system docker; podman-compose
