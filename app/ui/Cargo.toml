@@ -7,7 +7,7 @@ license.workspace = true
 [dependencies]
 # Dioxus 0.6 — all-Rust UI, compiled to WASM and rendered in Tauri's webview.
 dioxus = { workspace = true }
-# Shared panel-workspace library (also consumed by apple-notes-ocr-flow).
+# Shared panel-workspace library (also consumed by snake-pit).
 # Develop against a local checkout via [patch] in the workspace Cargo.toml.
 panel-kit = { git = "https://github.com/ocasazza/panel-kit" }
 serde = { workspace = true }

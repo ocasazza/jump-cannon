@@ -26,11 +26,11 @@ The test harness in `crates/test-browser/` is the only exception, and only becau
 
 ## Dioxus + Tauri app (`app/`)
 
-**THE frontend**, modeled 1:1 on `apple-notes-ocr-flow`. A **separate Cargo workspace** (`app/Cargo.toml`) so the main nix + crane workspace never absorbs the Tauri/Dioxus dependency tree:
+**THE frontend**, modeled 1:1 on `snake-pit`. A **separate Cargo workspace** (`app/Cargo.toml`) so the main nix + crane workspace never absorbs the Tauri/Dioxus dependency tree:
 
 | Crate | Role |
 |---|---|
-| [`panel-kit`](https://github.com/ocasazza/panel-kit) (external) | **Generic, app-agnostic** panel-workspace library: floating/tiling panels, macOS traffic lights, drag/resize, tiling drag-reorder, minimize-to-dock, localStorage layout persistence, base CSS theme (`panel_kit::CSS`). Lives in its own repo and is consumed as a git dependency by both this app and apple-notes-ocr-flow, so the two share one component/styling library. Apps implement `panel_kit::PanelKind` on an enum and call `use_workspace` + `ws.render(body_fn)`. Local development: `[patch."https://github.com/ocasazza/panel-kit"]` in `app/Cargo.toml`. |
+| [`panel-kit`](https://github.com/ocasazza/panel-kit) (external) | **Generic, app-agnostic** panel-workspace library: floating/tiling panels, macOS traffic lights, drag/resize, tiling drag-reorder, minimize-to-dock, localStorage layout persistence, base CSS theme (`panel_kit::CSS`). Lives in its own repo and is consumed as a git dependency by both this app and snake-pit, so the two share one component/styling library. Apps implement `panel_kit::PanelKind` on an enum and call `use_workspace` + `ws.render(body_fn)`. Local development: `[patch."https://github.com/ocasazza/panel-kit"]` in `app/Cargo.toml`. |
 | `app/ui` | jump-cannon's Dioxus 0.6 frontend (trunk-built WASM, port 8081; `app/Trunk.toml` at the workspace root drives both dev and nix builds). Panels: Graph (wgpu canvas), Nodes, Inspector, Document (editor → `PUT /vault/page`), Progress (polls `/progress`), Settings, Help, plus the tray-parity panels (Layout, Style, Camera, Filter, Metrics, Instances, Generate, Timeline, Debug). Talks to graph-api with three wire formats: JSON, protobuf, and raw LE f32/u32 buffers. The prost types are **checked in** (`app/ui/src/proto/`, regen via `just app-proto`). |
 | `app/src-tauri` | Tauri v2 shell. Pure webview container — **no IPC commands**; the frontend reaches graph-api over HTTP (`tauri-plugin-http` allows LAN/Tailscale hosts). Lib+main split for iOS/Android entrypoints. |
 

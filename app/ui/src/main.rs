@@ -7,7 +7,7 @@
 //!
 //! The frontend is a pure HTTP client of graph-api (`just dev-up` starts the
 //! backend); the Tauri shell is a webview container with no IPC commands —
-//! same architecture as apple-notes-ocr-flow.
+//! same architecture as snake-pit.
 //!
 //! Build: `cargo tauri dev` inside `app/` (nix devshell provides trunk +
 //! protoc + cargo-tauri).

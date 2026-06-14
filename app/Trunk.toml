@@ -3,7 +3,7 @@
 # index.html rust link rather than the (virtual) workspace manifest; both the
 # crane derivation (nix build .#app-web) and `cargo tauri dev` run trunk here.
 #
-# Port 8081 so it can run alongside apple-notes-ocr-flow (8080).
+# Port 8081 so it can run alongside snake-pit (8080).
 [build]
 target = "ui/index.html"
 dist = "ui/dist"
