@@ -1,0 +1,14 @@
+{
+  "main": {
+    "enabled": 1,
+    "hidden": false,
+    "description": "main - graph-compute GPU checks + Metal benches via flake hydraJobs",
+    "type": 1,
+    "flake": "git+ssh://git@github.com/ocasazza/jump-cannon?ref=main",
+    "checkinterval": 300,
+    "schedulingshares": 100,
+    "enableemail": false,
+    "emailoverride": "",
+    "keepnr": 10
+  }
+}
