@@ -573,6 +573,7 @@ pub fn panel(ctx: Ctx) -> Element {
             "morphology": ex.morphology,
         });
         let name = ex.name;
+        let morphology = ex.morphology;
         *SOUP_RUNNING.write() = true;
         *SOUP_ERROR.write() = None;
         *SOUP_STATUS.write() = Some(format!("{name}: spawning the soup…"));
@@ -585,8 +586,13 @@ pub fn panel(ctx: Ctx) -> Element {
                     ));
                     // The server now hosts the soup as its active graph.
                     crate::reload_graph(ctx).await;
+                    // Hand off to the Layout panel's geometric engine so both
+                    // self-assembly surfaces agree and the user can keep tuning
+                    // the running assembly there.
+                    crate::panels::layout::stage_self_assembly(morphology);
                     *SOUP_STATUS.write() = Some(format!(
-                        "{name}: {} particles — Geometric (GPU) assembling on the worker",
+                        "{name}: {} particles — Geometric (GPU) assembling on the worker \
+                         (tune it in the Layout panel)",
                         r.n_nodes
                     ));
                 }

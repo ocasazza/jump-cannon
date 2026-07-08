@@ -121,6 +121,11 @@ static PREV_APPLIED: GlobalSignal<Option<AppliedKey>> = Signal::global(|| None);
 static SOLVE_MSG: GlobalSignal<String> = Signal::global(String::new);
 static SEED_STATUS: GlobalSignal<Option<String>> = Signal::global(|| None);
 static SEED_ERROR: GlobalSignal<Option<String>> = Signal::global(|| None);
+/// The `(engine_id, settings)` that were last actually *solved* by a static
+/// engine. Unlike [`PREV_APPLIED`] (which the poll loop refreshes on every
+/// settings push), this only advances when a real solve runs — so the panel
+/// can tell when a static engine has un-applied slider edits pending.
+static LAST_SOLVED: GlobalSignal<Option<(String, Value)>> = Signal::global(|| None);
 
 // --- /compute wire types (FROZEN CONTRACT — see graph-api/src/server.rs) --------
 
@@ -312,7 +317,8 @@ fn select_remote_engine(engine_id: &str) {
             let mut cfg: LensConfig =
                 serde_json::from_value(json.clone()).unwrap_or_else(|_| default_lens());
             cfg.use_gpu = want_gpu;
-            cfg.use_multilevel = false;
+            // use_multilevel is user-controlled via the geometric UI checkbox
+            // (default false); selecting the engine preserves that choice.
             if let Ok(v) = serde_json::to_value(&cfg) {
                 *json = v;
             }
@@ -334,6 +340,67 @@ fn select_remote_engine(engine_id: &str) {
     persist(&st);
     *STATE.write() = st;
     apply_engine(false);
+}
+
+/// One worker connection (URL + reconnect backoff) shared by every remote
+/// engine. Both bridges keep their own `url`/`reconnect_backoff_ms` on the
+/// wire, so this writes through to both settings blocks at once — the panel
+/// exposes a single "worker" row instead of duplicating the fields per engine.
+fn set_worker_connection(url: Option<String>, reconnect_ms: Option<u32>) {
+    edit::<RemoteFa2Settings>(BRIDGE_REMOTE_FA2, |s| {
+        if let Some(u) = &url {
+            s.url = u.clone();
+        }
+        if let Some(r) = reconnect_ms {
+            s.reconnect_backoff_ms = r;
+        }
+    });
+    edit::<LensConfig>(BRIDGE_GEOMETRIC, |c| {
+        if let Some(u) = &url {
+            c.url = u.clone();
+        }
+        if let Some(r) = reconnect_ms {
+            c.reconnect_backoff_ms = r;
+        }
+    });
+}
+
+/// Current worker URL (both bridges are kept in sync by
+/// [`set_worker_connection`]; read the fa2 block as the canonical copy).
+fn worker_url() -> String {
+    typed_settings::<RemoteFa2Settings>(BRIDGE_REMOTE_FA2).url
+}
+
+fn worker_reconnect_ms() -> u32 {
+    typed_settings::<RemoteFa2Settings>(BRIDGE_REMOTE_FA2).reconnect_backoff_ms
+}
+
+/// Force the active engine to rebuild from scratch: clearing the applied key
+/// makes the next [`apply_engine`] treat it as a first-apply, which for the
+/// remote bridges tears down and reopens the WebSocket stream (a "restart"),
+/// and for local engines re-seeds/re-solves. The single primary-action button
+/// routes remote engines here so "Restart stream" actually reconnects.
+fn restart_active() {
+    *PREV_APPLIED.write() = None;
+    apply_engine(true);
+}
+
+/// Select the geometric-gpu engine and stage the self-assembly regime that
+/// matches a `/compute/soup` morphology, so the Layout panel reflects (and can
+/// keep tuning) what the Generate panel's "Assemble" just started on the
+/// worker. Keeps the two self-assembly surfaces from silently disagreeing.
+pub(crate) fn stage_self_assembly(morphology: &str) {
+    let preset = match morphology {
+        "chains" => Some(SelfAssemblyPreset::LipidChain),
+        "sheet" => Some(SelfAssemblyPreset::HoneycombSheet),
+        "tube" => Some(SelfAssemblyPreset::Tube),
+        "vesicle" => Some(SelfAssemblyPreset::Vesicle),
+        _ => None,
+    };
+    select_remote_engine("geometric-gpu");
+    if let Some(preset) = preset {
+        edit::<LensConfig>(BRIDGE_GEOMETRIC, |c| preset.apply_to(c));
+    }
 }
 
 // --- apply (the App::apply_layout_to_gpu port) ---------------------------------------
@@ -444,7 +511,13 @@ fn apply_engine(solve_requested: bool) {
             // auto-solve — the user hits Solve to commit them.
             if active_changed || solve_requested || boot_mismatch {
                 match build_static(&active) {
-                    Some(l) => h.run_static_solve(l.as_ref(), &json),
+                    Some(l) => {
+                        let r = h.run_static_solve(l.as_ref(), &json);
+                        if r.is_ok() {
+                            *LAST_SOLVED.write() = Some((active.clone(), json.clone()));
+                        }
+                        r
+                    }
                     None => Err(format!("no static solver for {active:?}")),
                 }
             } else {
@@ -1466,16 +1539,30 @@ pub fn panel(_ctx: Ctx) -> Element {
 
     let health = HEALTH.read().clone();
     let (health_class, health_txt) = match &health {
-        Some(h) if h.connected => ("lay-health ok", format!("worker ● connected — {}", h.url)),
-        Some(h) => ("lay-health bad", format!("worker ○ disconnected — {}", h.url)),
-        None => ("lay-health", "worker — (no /compute/health yet)".to_string()),
+        Some(h) if h.connected => {
+            ("lay-health ok", format!("compute worker ● connected — {}", h.url))
+        }
+        Some(h) => ("lay-health bad", format!("compute worker ○ disconnected — {}", h.url)),
+        None => ("lay-health", "compute worker — (no /compute/health yet)".to_string()),
     };
 
     let desc = descriptor_for(&active);
-    let show_solve = desc.as_ref().map(|d| d.kind == LayoutKind::Static).unwrap_or(false);
-    let show_wake = desc.as_ref().map(|d| d.kind == LayoutKind::Physics).unwrap_or(false)
-        && active != BRIDGE_GEOMETRIC
-        && active != BRIDGE_REMOTE_FA2;
+    let is_static = desc.as_ref().map(|d| d.kind == LayoutKind::Static).unwrap_or(false);
+    let is_physics = desc.as_ref().map(|d| d.kind == LayoutKind::Physics).unwrap_or(false);
+    let is_bridge = active == BRIDGE_GEOMETRIC || active == BRIDGE_REMOTE_FA2;
+    // Live sim state for the Pause/Resume toggle (physics + remote engines).
+    let sim_running = render::with_host(|h| h.pipes.sim_running()).unwrap_or(true);
+    // Static engines don't auto-apply slider edits — flag when the current
+    // settings differ from what was last actually solved so the user knows to
+    // press Solve. Physics engines apply live, so this never fires for them.
+    let static_dirty = is_static
+        && LAST_SOLVED
+            .read()
+            .as_ref()
+            .map(|(id, json)| *id == active && *json != settings_or_default(&active))
+            .unwrap_or(false);
+    let worker_url_val = worker_url();
+    let worker_reconnect_val = worker_reconnect_ms();
     let solve_msg = SOLVE_MSG.read().clone();
 
     rsx! {
@@ -1504,7 +1591,7 @@ pub fn panel(_ctx: Ctx) -> Element {
                             }
                         }
                     }
-                    optgroup { label: "Remote",
+                    optgroup { label: "Compute worker",
                         for o in remote_opts {
                             option {
                                 key: "{o.value}{o.label}",
@@ -1536,9 +1623,20 @@ pub fn panel(_ctx: Ctx) -> Element {
                 }
             }
             div { class: "lay-hint",
-                "Remote engines stream from the graph-compute worker via graph-api."
+                "Compute-worker engines stream from graph-compute via graph-api."
             }
             div { class: "{health_class}", "{health_txt}" }
+
+            // One worker connection, shared by every remote engine (was
+            // duplicated per-bridge). Only shown when a worker engine is active.
+            if is_bridge {
+                div { class: "lay-sub", "Worker connection" }
+                TextRow { label: "URL", value: worker_url_val,
+                    on: move |v: String| set_worker_connection(Some(v), None) }
+                IntRow { label: "Reconnect", min: 100, max: 30_000, value: worker_reconnect_val as i64,
+                    note: "ms",
+                    on: move |v: i64| set_worker_connection(None, Some(v as u32)) }
+            }
 
             hr { class: "lay-sep" }
 
@@ -1548,24 +1646,47 @@ pub fn panel(_ctx: Ctx) -> Element {
 
             {engine_params(&active)}
 
-            if show_solve {
+            // One primary-action slot for every engine kind (was two separate
+            // Solve / Wake buttons that both called apply_engine(true)), plus a
+            // Pause/Resume toggle for anything that runs a live sim.
+            if is_static || is_physics {
                 hr { class: "lay-sep" }
                 div { class: "lay-row",
                     span { class: "lay-k" }
-                    button { class: "lay-btn", onclick: move |_| apply_engine(true), "Solve" }
-                }
-            }
-            if show_wake {
-                hr { class: "lay-sep" }
-                div { class: "lay-row",
-                    span { class: "lay-k" }
-                    button {
-                        class: "lay-btn",
-                        title: "Re-energize the sim. Useful when the layout looks frozen \
-                                (KE below energy_threshold → auto-halt fired).",
-                        onclick: move |_| apply_engine(true),
-                        "Wake"
+                    if is_static {
+                        button {
+                            class: if static_dirty { "lay-btn active" } else { "lay-btn" },
+                            title: "Run the static layout solver with the current settings.",
+                            onclick: move |_| apply_engine(true),
+                            "Solve"
+                        }
+                    } else if is_bridge {
+                        button {
+                            class: "lay-btn",
+                            title: "Reconnect to the compute worker and restart the position stream.",
+                            onclick: move |_| restart_active(),
+                            "Restart stream"
+                        }
+                    } else {
+                        button {
+                            class: "lay-btn",
+                            title: "Re-energize the sim. Useful when the layout looks frozen \
+                                    (KE below energy_threshold → auto-halt fired).",
+                            onclick: move |_| apply_engine(true),
+                            "Wake"
+                        }
                     }
+                    if is_physics {
+                        button {
+                            class: "lay-btn",
+                            title: "Pause or resume the running layout (also on the graph HUD).",
+                            onclick: move |_| render::set_sim_running(!sim_running),
+                            { if sim_running { "Pause" } else { "Resume" } }
+                        }
+                    }
+                }
+                if static_dirty {
+                    div { class: "lay-hint", "Unsolved slider changes — press Solve to apply." }
                 }
             }
             if !solve_msg.is_empty() {
@@ -1722,20 +1843,8 @@ fn gpu_force_ui() -> Element {
     let repulsion_mode = opts.repulsion_mode;
 
     rsx! {
-        // Reset row — reset to defaults then re-apply the detected preset.
-        div { class: "lay-row lay-right",
-            button {
-                class: "lay-btn lay-small",
-                title: "Reset this engine's sliders to defaults",
-                onclick: move |_| {
-                    let mut o = GpuForceOptions::default();
-                    active_preset.apply_to(&mut o);
-                    save_settings("gpu-force", &o);
-                },
-                "↺ reset"
-            }
-        }
-
+        // Reset lives in the top-row ↺ (resets the active engine); no
+        // per-engine duplicate here.
         div { class: "lay-sub", "Preset" }
         div { class: "lay-presets",
             for preset in LayoutPreset::ALL {
@@ -2074,12 +2183,13 @@ fn klay_ui() -> Element {
 fn remote_fa2_ui() -> Element {
     let s: RemoteFa2Settings = typed_settings(BRIDGE_REMOTE_FA2);
     rsx! {
-        TextRow { label: "url", value: s.url.clone(),
-            on: move |v: String| edit::<RemoteFa2Settings>(BRIDGE_REMOTE_FA2, |s| s.url = v.clone()) }
-        IntRow { label: "reconnect ms", min: 100, max: 30_000, value: s.reconnect_backoff_ms as i64,
-            on: move |v: i64| edit::<RemoteFa2Settings>(BRIDGE_REMOTE_FA2, |s| {
-                s.reconnect_backoff_ms = v as u32;
-            }) }
+        div { class: "lay-hint",
+            { format!(
+                "Streams the '{}' engine from the compute worker. Set the address \
+                 in Worker connection above.",
+                s.layout_id
+            ) }
+        }
     }
 }
 
@@ -2096,23 +2206,14 @@ fn geometric_ui() -> Element {
     let bonding = opts.bonding_enabled;
 
     rsx! {
-        div { class: "lay-row lay-right",
-            button {
-                class: "lay-btn lay-small",
-                title: "Reset this engine's settings to defaults",
-                onclick: move |_| save_settings(BRIDGE_GEOMETRIC, &default_lens()),
-                "↺ reset"
-            }
-        }
-
-        div { class: "lay-sub", "Connection" }
-        TextRow { label: "URL", value: opts.url.clone(),
-            on: move |v: String| edit::<LensConfig>(BRIDGE_GEOMETRIC, |c| c.url = v.clone()) }
-        IntRow { label: "Reconnect", min: 100, max: 30_000, value: opts.reconnect_backoff_ms as i64,
-            note: "ms",
-            on: move |v: i64| edit::<LensConfig>(BRIDGE_GEOMETRIC, |c| c.reconnect_backoff_ms = v as u32) }
-        // NOTE: GPU / Multilevel are not checkboxes here — they are distinct
-        // entries in the unified Engine picker (geometric vs geometric-gpu).
+        // Connection (URL / reconnect) is the shared "Worker connection" row at
+        // the top of the panel; reset is the top-row ↺. GPU is the geometric vs
+        // geometric-gpu entry in the Engine picker.
+        div { class: "lay-sub", "Options" }
+        CheckRow { label: "Multilevel", value: opts.use_multilevel, text: "coarsen",
+            title: "Solve on a coarsened graph hierarchy first, then refine — faster \
+                    convergence on large graphs. Off by default.",
+            on: move |v: bool| edit::<LensConfig>(BRIDGE_GEOMETRIC, |c| c.use_multilevel = v) }
 
         hr { class: "lay-sep" }
 
@@ -2270,6 +2371,11 @@ fn geometric_ui() -> Element {
         hr { class: "lay-sep" }
 
         div { class: "lay-sub", "Self-assembly" }
+        div { class: "lay-hint",
+            "Tune bonding on the current graph here. The Generate panel's "
+            "\"Assemble\" spawns a fresh particle soup and hands it to this engine "
+            "(it stages the matching regime automatically)."
+        }
         CheckRow { label: "Bonding", value: bonding, text: "enabled",
             title: "Add/remove edges (bonds) each step under a proximity + class + valence + \
                     angle constraint, so chains → sheets → tubes → vesicles emerge on an \

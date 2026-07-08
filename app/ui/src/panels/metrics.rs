@@ -246,7 +246,9 @@ fn MetricsPanel() -> Element {
             }
             hr {}
             if let Some(snap) = snap {
-                div { class: "metrics-counts", { format!("nodes {}   edges {}", snap.n_nodes, snap.n_edges) } }
+                div { class: "metrics-counts",
+                    title: "Counts read back from the renderer's CPU positions/edges — the sample these quality metrics were computed over (not the graph-topology totals in Settings).",
+                    { format!("measured over {} nodes   {} edges", snap.n_nodes, snap.n_edges) } }
                 hr {}
                 // Pinned metrics first (highlighted), then the full list.
                 if !pinned.is_empty() {

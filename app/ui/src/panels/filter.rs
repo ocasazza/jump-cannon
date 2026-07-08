@@ -13,16 +13,20 @@
 //!     `set_filter_mask` (Filter) or `set_focus_set` (Focus) — the same
 //!     dispatch as app.rs::apply_focus_set_to_gpu's no-node-focus arm.
 //!
-//! Shared state lives in module-level `GlobalSignal`s; `filter_strip.rs`
-//! imports them. User-facing settings persist under `jc_filter_v1`.
+//! The active (field, value) chip strip — its per-field / cross-field
+//! combinators and the Filter/Dim behavior toggle — renders at the top of this
+//! panel (it was the separate "Filters" strip panel before the two merged).
+//! User-facing settings persist under `jc_filter_v1`.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use dioxus::prelude::*;
 use gloo_storage::{LocalStorage, Storage};
+use panel_kit::badge::{Badge, BadgeKind};
 use serde::{Deserialize, Serialize};
 
 use crate::api::get_proto;
+use crate::badges::badge_kind_for;
 use crate::{proto, render, Ctx};
 
 // --- query model (port of ui/query.rs) -----------------------------------------
@@ -292,7 +296,10 @@ impl FilterBehavior {
     pub(crate) fn label(self) -> &'static str {
         match self {
             FilterBehavior::Filter => "Filter",
-            FilterBehavior::Focus => "Focus",
+            // Displayed as "Dim" so "Focus" is left to mean only the Camera
+            // panel's focus mode (the variant name stays Focus for the
+            // persisted serde tag).
+            FilterBehavior::Focus => "Dim",
         }
     }
     pub(crate) fn tooltip(self) -> &'static str {
@@ -668,6 +675,10 @@ pub fn panel(_ctx: Ctx) -> Element {
 
     rsx! {
         div { class: "fil",
+            // Active (field, value) chips + combinators + Filter/Dim toggle —
+            // merged in from the former standalone "Filters" strip panel.
+            { active_filters_section(&q) }
+
             // Right-aligned reset row (ui/widgets.rs::reset_row): back to the
             // default model — just the system search card, no active filters.
             div { class: "fil-reset",
@@ -728,6 +739,126 @@ pub fn panel(_ctx: Ctx) -> Element {
                 }
                 {fields_el}
             }
+        }
+    }
+}
+
+/// The active-filter strip: cross-field combinator + Filter/Dim behavior
+/// toggle in the header, one row per active field below. Empty state when no
+/// filters are active. (Merged in from the former `filter_strip.rs` panel; all
+/// mutations route through `edit_filters` so the GPU push stays in one place.)
+fn active_filters_section(q: &QueryModel) -> Element {
+    let behavior = *BEHAVIOR.read();
+    let total: usize = q.active_filters.by_field.values().map(|s| s.len()).sum();
+    if total == 0 {
+        return rsx! { div { class: "fst-empty", "no active filters" } };
+    }
+
+    let cross = q.active_filters.cross_field_combinator;
+    let cross_label = format!("{} fields", cross.label());
+    let behavior_label = behavior.label();
+    let behavior_tip = behavior.tooltip();
+
+    // Fields render in user-insertion order, not BTreeMap name order.
+    let order: Vec<String> = q
+        .active_filters
+        .insertion_order
+        .iter()
+        .filter(|f| q.active_filters.by_field.contains_key(*f))
+        .cloned()
+        .collect();
+
+    rsx! {
+        div { class: "fst",
+            div { class: "fst-head",
+                span { class: "fst-k", "match" }
+                button { class: "fst-toggle",
+                    title: "How field-level results combine: `all` = AND (intersect), `any` = OR (union).",
+                    onclick: move |_| {
+                        let next = cross.toggled();
+                        edit_filters(move |q| q.active_filters.cross_field_combinator = next);
+                    },
+                    "{cross_label}"
+                }
+                span { class: "fst-sep" }
+                // Filter / Dim behavior toggle.
+                span { class: "fst-k", "when matched:" }
+                button { class: "fst-toggle", title: "{behavior_tip}",
+                    onclick: move |_| toggle_behavior(),
+                    "{behavior_label}"
+                }
+                // Clear-all on the right — only worth a button from 2 chips up.
+                if total >= 2 {
+                    button { class: "fst-toggle fst-clear",
+                        onclick: move |_| edit_filters(|q| q.clear_all_filters()),
+                        "clear filters"
+                    }
+                }
+            }
+            div { class: "fst-rows",
+                for field in order {
+                    { active_field_row(q, field) }
+                }
+            }
+        }
+    }
+}
+
+/// One row per active field: `field_name [any|all] [chip] [chip] …`.
+fn active_field_row(q: &QueryModel, field: String) -> Element {
+    let combinator = q.active_filters.combinator_for(&field);
+    let comb_label = combinator.label();
+    let values: Vec<String> = q
+        .active_filters
+        .by_field
+        .get(&field)
+        .map(|s| s.iter().cloned().collect())
+        .unwrap_or_default();
+    // Only meaningful with ≥ 2 values; still rendered (greyed) otherwise so the
+    // affordance stays visible.
+    let multi = values.len() > 1;
+    let f_clear = field.clone();
+    let f_comb = field.clone();
+    rsx! {
+        div { class: "fst-row", key: "{field}",
+            // Field-name lozenge with ✕ — clears the whole field.
+            Badge {
+                field: "{field}",
+                value: "{field}",
+                kind: BadgeKind::Generic,
+                active: true,
+                with_x: true,
+                on_action: move |_| edit_filters(|q| q.clear_field(&f_clear)),
+            }
+            button {
+                class: if multi { "fst-toggle fst-comb" } else { "fst-toggle fst-comb dim" },
+                title: "Toggle how this field's values combine: `any` = OR (match any value), `all` = AND (match all values).",
+                onclick: move |_| {
+                    let next = combinator.toggled();
+                    edit_filters(|q| q.active_filters.set_combinator_for(&f_comb, next));
+                },
+                "{comb_label}"
+            }
+            // Value chips — click removes.
+            for value in values {
+                { active_chip(field.clone(), value) }
+            }
+        }
+    }
+}
+
+fn active_chip(field: String, value: String) -> Element {
+    let kind = badge_kind_for(&field);
+    let (f, v) = (field.clone(), value.clone());
+    rsx! {
+        Badge {
+            key: "{value}",
+            field: "{field}",
+            value: "{value}",
+            kind,
+            active: true,
+            with_x: true,
+            on_action: move |_| edit_filters(|q| q.toggle_field_filter(&f, &v)),
         }
     }
 }

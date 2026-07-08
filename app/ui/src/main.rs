@@ -96,7 +96,6 @@ pub(crate) enum Panel {
     Style,
     Camera,
     Filter,
-    FilterStrip,
     Metrics,
     Instances,
     Generate,
@@ -118,7 +117,6 @@ impl panel_kit::PanelKind for Panel {
             Panel::Style => "Style",
             Panel::Camera => "Camera",
             Panel::Filter => "Filter",
-            Panel::FilterStrip => "Filters",
             Panel::Metrics => "Metrics",
             Panel::Instances => "Instances",
             Panel::Generate => "Generate",
@@ -145,7 +143,6 @@ fn default_layout() -> Vec<PanelWin<Panel>> {
         min(b, Panel::Style, 760.0, 80.0, 320.0, 440.0),
         min(b, Panel::Camera, 780.0, 100.0, 320.0, 360.0),
         min(b, Panel::Filter, 800.0, 120.0, 340.0, 420.0),
-        min(b, Panel::FilterStrip, 820.0, 140.0, 420.0, 120.0),
         min(b, Panel::Metrics, 840.0, 160.0, 320.0, 380.0),
         min(b, Panel::Instances, 860.0, 180.0, 360.0, 420.0),
         min(b, Panel::Generate, 880.0, 200.0, 360.0, 440.0),
@@ -279,11 +276,13 @@ fn App() -> Element {
     // handling, style/camera loops) before any panel renders — a saved
     // layout with every panel minimized must still process boot presets.
     appstate::ensure_init();
-    // _v5: re-seed defaults — saved v4 layouts could persist the Graph panel
-    // minimized (its body, and thus the wgpu canvas, never mounts → blank
-    // graph), plus pre-resize-fix geometry. (v4: tiling spans tile_w/tile_h;
-    // v3: Search merged into Nodes; v2: 2x graph view + docked tray panels.)
-    let ws = panel_kit::use_workspace("jc_layout_v5", default_layout);
+    // _v6: the FilterStrip ("Filters") panel merged into the Filter panel, so
+    // its enum variant is gone — a saved v5 layout referencing it would fail to
+    // deserialize; re-seed instead. (v5: re-seed so a minimized Graph panel
+    // can't leave the wgpu canvas unmounted → blank graph, plus pre-resize-fix
+    // geometry; v4: tiling spans tile_w/tile_h; v3: Search merged into Nodes;
+    // v2: 2x graph view + docked tray panels.)
+    let ws = panel_kit::use_workspace("jc_layout_v6", default_layout);
 
     // Drain palette jump-to-section requests into the workspace, logging
     // the same `("section", "<title>: open")` event the egui app pushed.
@@ -471,10 +470,12 @@ fn App() -> Element {
 
             header { class: "topbar",
                 h1 { "JUMP CANNON" }
+                // Node/edge/community counts live in the Settings panel (the
+                // superset — it also has components); the topbar just shows the
+                // workspace mode + connection state to avoid a third copy.
                 span { class: "hint",
-                    if let Some(g) = g_now.as_ref() {
-                        { format!("{mode_label} · {} nodes · {} edges · {} communities",
-                            g.n_nodes, g.n_edges, g.num_communities) }
+                    if g_now.is_some() {
+                        "{mode_label}"
                     } else {
                         "{mode_label} · connecting…"
                     }
@@ -521,7 +522,6 @@ fn panel_body(kind: Panel, _maximized: bool, ctx: Ctx) -> Element {
         Panel::Style => panels::style::panel(ctx),
         Panel::Camera => panels::camera::panel(ctx),
         Panel::Filter => panels::filter::panel(ctx),
-        Panel::FilterStrip => panels::filter_strip::panel(ctx),
         Panel::Metrics => panels::metrics::panel(ctx),
         Panel::Instances => panels::instances::panel(ctx),
         Panel::Generate => panels::generate::panel(ctx),

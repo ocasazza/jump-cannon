@@ -9,7 +9,6 @@ pub mod nodes;
 pub mod style;
 pub mod camera;
 pub mod filter;
-pub mod filter_strip;
 pub mod metrics;
 pub mod instances;
 pub mod generate;
