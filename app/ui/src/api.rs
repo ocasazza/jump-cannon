@@ -25,7 +25,42 @@ const URL_KEY: &str = "jc_server_url";
 /// `JC_SERVER_URL=http://127.0.0.1:8766 just app-dev`) to point a dev build
 /// elsewhere without touching localStorage.
 pub fn default_url() -> String {
-    option_env!("JC_SERVER_URL").unwrap_or("http://127.0.0.1:8765").to_string()
+    // An explicit build-time override always wins (e.g. a phone/Tauri build
+    // pointed at a remote Mac via `JC_SERVER_URL=…`).
+    if let Some(u) = option_env!("JC_SERVER_URL") {
+        return u.to_string();
+    }
+    // Otherwise, when a browser loaded this page from graph-api itself, fetch
+    // from that same origin: `localhost` vs `127.0.0.1`, custom ports, LAN IPs
+    // and Tailscale names then all "just work" without a per-origin
+    // localStorage entry — and a stale stored URL can no longer strand the app
+    // on a host the page was never served from. Only http(s) origins qualify;
+    // the Tauri shell loads from `tauri://localhost` / `null`, which falls
+    // through to the 127.0.0.1 default below.
+    if let Some(origin) = page_origin() {
+        if origin.starts_with("http://") || origin.starts_with("https://") {
+            return origin;
+        }
+    }
+    "http://127.0.0.1:8765".to_string()
+}
+
+/// The page's own origin (`http://host:port`), or `None` outside a browser.
+/// Reflection-based (like `panels::instances::page_origin`) to avoid pulling in
+/// the web-sys `Location` feature.
+#[cfg(target_arch = "wasm32")]
+fn page_origin() -> Option<String> {
+    use wasm_bindgen::JsValue;
+    let win = web_sys::window()?;
+    let loc = js_sys::Reflect::get(win.as_ref(), &JsValue::from_str("location")).ok()?;
+    js_sys::Reflect::get(&loc, &JsValue::from_str("origin"))
+        .ok()?
+        .as_string()
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn page_origin() -> Option<String> {
+    None
 }
 
 /// Normalize a user-typed server URL past the two classic webview footguns:

@@ -149,6 +149,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         graph_api::browser::open_url(&url);
     }
 
+    // When bound to IPv4 loopback (the dev default), also serve on IPv6
+    // loopback at the same port. Safari/WebKit resolve `localhost` to `::1`
+    // first, so without this a user who opens `http://localhost:<port>` can't
+    // even reach the page. Best-effort: a bind failure here (no IPv6 stack,
+    // port race) is non-fatal — the IPv4 listener still serves.
+    if host == std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)) {
+        let v6 = std::net::SocketAddr::new(
+            std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
+            bound.port(),
+        );
+        match tokio::net::TcpListener::bind(v6).await {
+            Ok(l6) => {
+                tracing::info!(url = %format!("http://{}/", v6), "also listening (IPv6 loopback)");
+                let app6 = app.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = axum::serve(l6, app6).await {
+                        tracing::warn!(error = %e, "IPv6 loopback server exited");
+                    }
+                });
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "could not also bind [::1]; localhost-over-IPv6 won't reach this server")
+            }
+        }
+    }
+
     axum::serve(listener, app).await?;
     Ok(())
 }
