@@ -22,7 +22,8 @@ Integration still owed in jump-cannon proper:
       renderer/broker can request centrality without shelling out to the bin.
 - [ ] **Surface ranks in the renderer.** Node sizing / colouring by PageRank
       (and connected-component id) is the natural consumer — wire ranks into
-      `graph-renderer` node attributes.
+      the Dioxus renderer's node attributes (`app/ui/src/render.rs`; the retired
+      `graph-renderer` egui crate lives in git history).
 - [ ] **Reconcile the two PageRank oracles.** `graph-metrics::compute_pagerank`
       (directed, f64, mutates `VaultGraph`) and `analytics::cpu_pagerank`
       (undirected/symmetric, f32, over `CsrGraph`) now coexist. Decide the
