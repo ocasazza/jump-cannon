@@ -57,6 +57,9 @@ pub enum SourceKind {
     Obsidian,
     /// Evaluate a tvix Nix expression to produce a graph.
     Tvix,
+    /// Generate a random graph directly in Rust (fast, no Nix eval).
+    /// Controlled by --nodes and --edges CLI flags.
+    Generate,
 }
 
 impl SourceKind {
@@ -64,13 +67,14 @@ impl SourceKind {
     pub fn parse(s: &str) -> Option<Self> {
         match s.to_lowercase().as_str() {
             "obsidian" | "vault" => Some(Self::Obsidian),
-            "tvix" | "nix" | "generate" => Some(Self::Tvix),
+            "tvix" | "nix" => Some(Self::Tvix),
+            "generate" | "gen" | "random" => Some(Self::Generate),
             _ => None,
         }
     }
 
     /// All known source kinds (for help text).
     pub fn all() -> &'static [&'static str] {
-        &["obsidian", "tvix"]
+        &["obsidian", "tvix", "generate"]
     }
 }

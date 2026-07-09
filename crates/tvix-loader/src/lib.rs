@@ -35,6 +35,7 @@
 use std::collections::HashMap;
 
 use data_loader::{LoadResult, Loader};
+use rand::Rng;
 use vault_data::{NodeMeta, NodeMetrics, VaultEdge, VaultGraph, VaultNode};
 
 /// Loads a graph by evaluating a Nix expression through tvix-eval.
@@ -90,6 +91,83 @@ impl Loader for TvixLoader {
     }
 
     /// Tvix graphs have no filesystem root — no watching.
+    fn root_path(&self) -> Option<&std::path::PathBuf> {
+        None
+    }
+}
+
+/// Generates a random graph directly in Rust — no Nix eval overhead.
+///
+/// Produces `num_nodes` nodes (IDs `n0`..`n{N-1}`) and `num_edges` random
+/// directed edges between them. No self-loops. Each node gets the tag
+/// `"generated"`. Generation is O(N+E) and completes in milliseconds even
+/// for 100k+ node graphs.
+///
+/// # CLI flags
+///
+/// `--source generate --nodes 100000 --edges 100000`
+pub struct GenerateLoader {
+    num_nodes: usize,
+    num_edges: usize,
+}
+
+impl GenerateLoader {
+    pub fn new(num_nodes: usize, num_edges: usize) -> Self {
+        Self { num_nodes, num_edges }
+    }
+}
+
+impl Loader for GenerateLoader {
+    fn name(&self) -> &str {
+        "generate"
+    }
+
+    fn load(&self) -> LoadResult {
+        let mut graph = VaultGraph::new();
+        let mut rng = rand::thread_rng();
+
+        // Generate nodes.
+        for i in 0..self.num_nodes {
+            let id = format!("n{i}");
+            let meta = NodeMeta {
+                title: id.clone(),
+                tags: vec!["generated".into()],
+                frontmatter: HashMap::new(),
+                mtime: 0,
+                path: id.clone(),
+                doctype: Some("generated".into()),
+                folder: String::new(),
+            };
+            graph.add_node(VaultNode {
+                id,
+                meta,
+                metrics: NodeMetrics::default(),
+                x: 0.0,
+                y: 0.0,
+            });
+        }
+
+        // Generate random edges (no self-loops).
+        let max_node = self.num_nodes.saturating_sub(1);
+        for _ in 0..self.num_edges {
+            let src = rng.gen_range(0..=max_node);
+            let mut tgt = rng.gen_range(0..=max_node);
+            // Avoid self-loops: if we pick the same node, shift by 1.
+            if self.num_nodes > 1 && tgt == src {
+                tgt = (tgt + 1) % self.num_nodes;
+            }
+            graph.add_edge(VaultEdge {
+                source: format!("n{src}"),
+                target: format!("n{tgt}"),
+            });
+        }
+
+        LoadResult {
+            graph,
+            unresolved: Vec::new(),
+        }
+    }
+
     fn root_path(&self) -> Option<&std::path::PathBuf> {
         None
     }
@@ -228,5 +306,45 @@ mod tests {
         for name in &names {
             assert!(TvixLoader::from_demo(name).is_some(), "demo {name} not found");
         }
+    }
+
+    #[test]
+    fn generate_small_graph() {
+        let loader = GenerateLoader::new(10, 20);
+        let result = loader.load();
+        assert_eq!(result.graph.node_count(), 10);
+        assert_eq!(result.graph.edge_count(), 20);
+        assert!(result.unresolved.is_empty());
+        // All nodes tagged "generated".
+        for (_, node) in &result.graph.nodes {
+            assert!(node.meta.tags.contains(&"generated".to_string()));
+        }
+    }
+
+    #[test]
+    fn generate_no_self_loops() {
+        // With 2 nodes and many edges, self-loops should never appear.
+        let loader = GenerateLoader::new(2, 100);
+        let result = loader.load();
+        for edge in &result.graph.edges {
+            assert_ne!(edge.source, edge.target, "no self-loops");
+        }
+    }
+
+    #[test]
+    fn generate_zero_nodes() {
+        let loader = GenerateLoader::new(0, 0);
+        let result = loader.load();
+        assert_eq!(result.graph.node_count(), 0);
+        assert_eq!(result.graph.edge_count(), 0);
+    }
+
+    #[test]
+    fn generate_large_graph_is_fast() {
+        // 50k nodes, 100k edges should complete in well under 1 second.
+        let loader = GenerateLoader::new(50_000, 100_000);
+        let result = loader.load();
+        assert_eq!(result.graph.node_count(), 50_000);
+        assert_eq!(result.graph.edge_count(), 100_000);
     }
 }

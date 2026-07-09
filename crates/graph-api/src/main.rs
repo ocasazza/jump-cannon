@@ -46,6 +46,12 @@ struct Args {
     /// reads from the file at --vault-root (which must be a .nix file).
     #[arg(long, env = "JUMP_CANNON_TVIX_EXPR")]
     tvix_expr: Option<String>,
+    /// When --source=generate, the number of nodes to create.
+    #[arg(long, env = "JUMP_CANNON_GENERATE_NODES", default_value_t = 1000)]
+    generate_nodes: usize,
+    /// When --source=generate, the number of edges to create.
+    #[arg(long, env = "JUMP_CANNON_GENERATE_EDGES", default_value_t = 2000)]
+    generate_edges: usize,
 }
 
 #[tokio::main]
@@ -94,6 +100,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             tracing::info!(expr_len = expr.len(), "using tvix loader");
             Box::new(tvix_loader::TvixLoader::new(expr))
         }
+        data_loader::SourceKind::Generate => {
+            tracing::info!(
+                nodes = args.generate_nodes,
+                edges = args.generate_edges,
+                "using generate loader"
+            );
+            Box::new(tvix_loader::GenerateLoader::new(
+                args.generate_nodes,
+                args.generate_edges,
+            ))
+        }
     };
 
     // Shared progress log. Surfaces "Scanning vault / Computing metrics /
@@ -121,8 +138,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 None
             }
         }
-    } else {
-        tracing::info!("skipping vault-search (tvix source has no filesystem index)");
+} else {
+        tracing::info!(source = loader.name(), "skipping vault-search (no filesystem index)");
         None
     };
 
