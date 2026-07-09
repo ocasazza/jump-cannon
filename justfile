@@ -190,6 +190,61 @@ dev-up backend="gpu":
 dev-down:
     nix run .#dev-down
 
+# ── Quick backend stack ── the fast path for compute / GPU work: native
+# graph-compute (→ Metal on macOS, real hardware) + graph-api, with NO frontend
+# build. Detached, so it returns to your shell with the stack running. All
+# config is declarative in `.env` (VAULT_ROOT, GRAPH_API_PORT,
+# JUMP_CANNON_COMPUTE_URL). Inspect it with `just stack-status`; stop it with
+# `just stack-down`. For the full hot-reload UI stack, use `just dev-up`.
+[group('dev')]
+[doc('Quick backend stack: native graph-compute (Metal) + graph-api, no frontend')]
+stack backend="gpu":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    case "{{backend}}" in
+      gpu) engine=fa2-bh ;;      # GPU: Barnes-Hut ForceAtlas2 (wgpu → Metal)
+      cpu) engine=sgd-stress ;;  # CPU: SGD stress-majorization
+      *) echo "stack: unknown backend '{{backend}}' (expected gpu|cpu)" >&2; exit 2 ;;
+    esac
+    port="${GRAPH_API_PORT:-8765}"
+    echo "→ backend={{backend}} (engine: $engine) · api :${port} · worker ${JUMP_CANNON_COMPUTE_URL:-unset}"
+    echo "→ building graph-compute + graph-api + vault-search…"
+    cargo build -p graph-compute -p graph-api -p vault-search
+    just stack-down >/dev/null 2>&1 || true   # idempotent: clear any prior stack
+    echo "→ starting graph-compute (native worker — Metal on macOS)…"
+    RUST_LOG=info nohup ./target/debug/graph-compute > /tmp/graph-compute.log 2>&1 &
+    echo "→ starting graph-api…"
+    GRAPH_API_NO_BROWSER=true JUMP_CANNON_COMPUTE_LAYOUT_ID="$engine" RUST_LOG=info \
+      nohup ./target/debug/graph-api > /tmp/graph-api.log 2>&1 &
+    echo "→ waiting for graph-api on :${port}…"
+    curl -s --retry 90 --retry-delay 1 --retry-connrefused "http://127.0.0.1:${port}/graph/init" -o /dev/null || true
+    echo
+    just stack-status
+
+# Probe a running `just stack`: worker GPU adapter, broker health, engine list.
+[group('dev')]
+stack-status:
+    #!/usr/bin/env bash
+    port="${GRAPH_API_PORT:-8765}"
+    echo "── graph-compute adapter ──"
+    grep -iE 'adapter initialized|backend=' /tmp/graph-compute.log 2>/dev/null | tail -1 || echo "  (no worker log yet)"
+    echo "── /compute/health (frontend-facing) ──"
+    curl -s "http://127.0.0.1:${port}/compute/health" 2>/dev/null || echo "  (graph-api not responding)"; echo
+    echo "── /compute/engines ──"
+    curl -s "http://127.0.0.1:${port}/compute/engines" 2>/dev/null \
+      | python3 -c 'import sys,json; d=json.load(sys.stdin); print("  active:",d.get("active")); [print("   -",e["id"]) for e in d.get("engines",[])]' \
+      2>/dev/null || echo "  (could not parse engines — is the stack up?)"
+    echo "── urls ──"
+    echo "  graph-api : http://127.0.0.1:${port}"
+    echo "  worker    : ${JUMP_CANNON_COMPUTE_URL:-unset}"
+
+# Stop the `just stack` backend (scoped to its binaries; safe to re-run).
+[group('dev')]
+stack-down:
+    -@pkill -f 'target/debug/graph-compute' 2>/dev/null || true
+    -@pkill -f 'target/debug/graph-api' 2>/dev/null || true
+    @echo "→ stack stopped"
+
 # Run the production binary (no watch). Assets are no longer embedded in
 # the binary — build the app dist first and serve it via --assets-dir.
 [group('dev')]
