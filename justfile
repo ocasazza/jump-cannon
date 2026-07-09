@@ -213,8 +213,11 @@ stack backend="gpu":
     echo "→ backend={{backend}} (engine: $engine) · app :${port} · worker ${JUMP_CANNON_COMPUTE_URL:-unset}"
     echo "→ building graph-compute + graph-api + vault-search…"
     cargo build -p graph-compute -p graph-api -p vault-search
-    echo "→ building frontend WASM bundle (trunk; incremental)…"
-    (cd {{app_dir}} && trunk build)
+    # --release: graph-api (not `trunk serve`) hosts the bundle, so it must be a
+    # production build — a debug build injects Dioxus's `/_dioxus` hot-reload
+    # socket that 404s here, and its unoptimized WASM boots slowly.
+    echo "→ building frontend WASM bundle (trunk --release)…"
+    (cd {{app_dir}} && trunk build --release)
     just stack-down >/dev/null 2>&1 || true   # idempotent: clear any prior stack
     echo "→ starting graph-compute (native worker — Metal on macOS)…"
     RUST_LOG=info nohup ./target/debug/graph-compute > /tmp/graph-compute.log 2>&1 &
