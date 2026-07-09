@@ -11,15 +11,34 @@ use axum::http::{Request, StatusCode};
 use prost::Message;
 use tower::ServiceExt; // for `oneshot`
 
+use data_loader::{LoadResult, Loader};
 use graph_api::proto::NodeMeta;
 use graph_api::AppState;
 use vault_data::VaultGraph;
+
+/// A stub loader that always returns an empty graph. Used in tests that
+/// don't need a real data source.
+struct EmptyLoader;
+
+impl Loader for EmptyLoader {
+    fn name(&self) -> &str {
+        "empty"
+    }
+
+    fn load(&self) -> LoadResult {
+        LoadResult {
+            graph: VaultGraph::new(),
+            unresolved: Vec::new(),
+        }
+    }
+}
 
 /// Build an `AppState` over an empty `VaultGraph`. No vault-search
 /// subprocess, no asset dir — enough to exercise the protobuf endpoints.
 fn empty_state() -> AppState {
     AppState::new(
         std::path::PathBuf::from("/tmp/jump-cannon-test-empty-vault"),
+        Box::new(EmptyLoader),
         VaultGraph::new(),
         None,
         None,
@@ -97,6 +116,7 @@ async fn node_meta_stub_for_missing_id() {
 fn _state_constructor_is_public() -> AppState {
     AppState::new(
         std::path::PathBuf::new(),
+        Box::new(EmptyLoader),
         VaultGraph::new(),
         None,
         None,

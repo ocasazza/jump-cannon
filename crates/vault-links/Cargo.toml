@@ -5,13 +5,14 @@ edition = "2021"
 description = "Wikilink extractor: walks an Obsidian vault and produces a VaultGraph"
 
 [dependencies]
-vault-data = { path = "../vault-data" }
-serde      = { workspace = true }
-serde_json = { workspace = true }
-serde_yaml = "0.9"
-anyhow     = "1"
-ignore     = "0.4"
-walkdir    = "2"
+vault-data  = { path = "../vault-data" }
+data-loader = { path = "../data-loader" }
+serde       = { workspace = true }
+serde_json  = { workspace = true }
+serde_yaml  = "0.9"
+anyhow      = "1"
+ignore      = "0.4"
+walkdir     = "2"
 
 [dev-dependencies]
 tempfile = "3"

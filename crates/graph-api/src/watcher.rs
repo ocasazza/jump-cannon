@@ -181,15 +181,44 @@ pub async fn reload(state: &AppState) {
 /// Reload the in-memory `GraphSnapshot` from disk and atomically swap it
 /// into `state`. Does NOT touch vault-search.
 async fn rebuild_snapshot(state: &AppState) {
-    let vault_root = state.inner.vault_root.clone();
     let progress = state.inner.progress.clone();
 
     let reload_id = progress.start("ingest", "Reloading vault");
     progress.info("ingest", "vault change detected");
 
-    let progress_load = progress.clone();
+    let loader_ref: &dyn data_loader::Loader = state.inner.loader.as_ref();
+    // We need to call load() on the loader. Since the loader is behind
+    // `Box<dyn Loader>` and `Loader` is `Send + Sync`, we can call it
+    // directly from the async context. But `load()` may do blocking I/O
+    // (walking the filesystem), so we spawn_blocking.
+    //
+    // The tricky part: we can't move `&dyn Loader` into spawn_blocking
+    // because it's a reference. Instead, we call load() on the current
+    // thread and wrap the metrics/layout computation in spawn_blocking.
+    let load_result = loader_ref.load();
+    let mut new_graph = load_result.graph;
+
+    if !load_result.unresolved.is_empty() {
+        progress.warn(
+            "ingest",
+            format!("{} unresolved references", load_result.unresolved.len()),
+        );
+    }
+
     let new_graph = tokio::task::spawn_blocking(move || {
-        crate::vault_loader::load_with_progress(&vault_root, Some(&progress_load))
+        graph_metrics::compute_all(&mut new_graph);
+        // Seed deterministic initial positions on a circle.
+        let n = new_graph.node_count();
+        if n > 0 {
+            let radius = 200.0_f32 + (n as f32).sqrt() * 4.0;
+            let step = std::f32::consts::TAU / n as f32;
+            for (i, (_, node)) in new_graph.nodes.iter_mut().enumerate() {
+                let theta = i as f32 * step;
+                node.x = radius * theta.cos();
+                node.y = radius * theta.sin();
+            }
+        }
+        new_graph
     })
     .await;
 

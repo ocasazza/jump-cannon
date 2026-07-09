@@ -2,6 +2,7 @@ use clap::Parser;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use data_loader::Loader;
 use graph_api::{
     compute_broker::{ComputeBroker, RemoteLayout},
     progress::ProgressLog,
@@ -37,6 +38,14 @@ struct Args {
     /// docker container leaves this unset so live reload works.
     #[arg(long, env = "GRAPH_API_NO_WATCH")]
     no_watch: bool,
+    /// Data source: "obsidian" (default) or "tvix". When "tvix", --vault-root
+    /// is interpreted as a path to a .nix file to evaluate.
+    #[arg(long, env = "JUMP_CANNON_SOURCE", default_value = "obsidian")]
+    source: String,
+    /// When --source=tvix, the Nix expression to evaluate. If not provided,
+    /// reads from the file at --vault-root (which must be a .nix file).
+    #[arg(long, env = "JUMP_CANNON_TVIX_EXPR")]
+    tvix_expr: Option<String>,
 }
 
 #[tokio::main]
@@ -55,28 +64,66 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .vault_root
         .unwrap_or_else(|| std::env::current_dir().unwrap());
 
+    // Select the data loader.
+    let source_kind = data_loader::SourceKind::parse(&args.source)
+        .unwrap_or_else(|| {
+            tracing::warn!(
+                source = %args.source,
+                "unknown source; falling back to obsidian"
+            );
+            data_loader::SourceKind::Obsidian
+        });
+
+    let loader: Box<dyn Loader> = match source_kind {
+        data_loader::SourceKind::Obsidian => {
+            tracing::info!(vault_root = %vault_root.display(), "using obsidian loader");
+            Box::new(vault_links::ObsidianLoader::new(vault_root.clone()))
+        }
+        data_loader::SourceKind::Tvix => {
+            let expr = if let Some(ref e) = args.tvix_expr {
+                e.clone()
+            } else if vault_root.extension().map_or(false, |ext| ext == "nix") {
+                std::fs::read_to_string(&vault_root).unwrap_or_else(|e| {
+                    tracing::error!(path = %vault_root.display(), error = %e, "failed to read tvix expression file");
+                    String::new()
+                })
+            } else {
+                tracing::warn!("--source=tvix but no --tvix-expr and --vault-root is not a .nix file; using empty graph");
+                String::new()
+            };
+            tracing::info!(expr_len = expr.len(), "using tvix loader");
+            Box::new(tvix_loader::TvixLoader::new(expr))
+        }
+    };
+
     // Shared progress log. Surfaces "Scanning vault / Computing metrics /
     // Seeding positions / Rebuilding search index" task bars to the
     // frontend footer via GET /progress.
     let progress = Arc::new(ProgressLog::new());
 
-    // Initial vault load — emit progress events so the bootstrap fetch
+    // Initial graph load — emit progress events so the bootstrap fetch
     // sees a populated /progress response on the first poll.
-    let graph = vault_loader::load_with_progress(&vault_root, Some(&progress));
+    let graph = vault_loader::load_with_progress(loader.as_ref(), Some(&progress));
 
     // Spawn vault-search before binding so /search can proxy to it.
-    let vault_search_id = progress.start("ingest", "Spawning vault-search");
-    let vault_search = match graph_api::subprocess::VaultSearch::spawn(&vault_root).await {
-        Ok(vs) => {
-            tracing::info!(port = vs.port, "vault-search subprocess up");
-            progress.finish(vault_search_id);
-            Some(std::sync::Arc::new(vs))
+    // Only for obsidian — tvix graphs have no filesystem to index.
+    let vault_search = if source_kind == data_loader::SourceKind::Obsidian {
+        let vault_search_id = progress.start("ingest", "Spawning vault-search");
+        match graph_api::subprocess::VaultSearch::spawn(&vault_root).await {
+            Ok(vs) => {
+                tracing::info!(port = vs.port, "vault-search subprocess up");
+                progress.finish(vault_search_id);
+                Some(std::sync::Arc::new(vs))
+            }
+            Err(e) => {
+                tracing::warn!("vault-search unavailable: {e}; /search falls back to title-contains");
+                progress.fail(vault_search_id, format!("{e}"));
+                None
+            }
         }
-        Err(e) => {
-            tracing::warn!("vault-search unavailable: {e}; /search falls back to title-contains");
-            progress.fail(vault_search_id, format!("{e}"));
-            None
-        }
+    } else {
+        tracing::info!("skipping vault-search (tvix source has no filesystem index)");
+        None
     };
 
     if let Some(dir) = &args.assets_dir {
@@ -87,6 +134,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let state = AppState::new(
         vault_root.clone(),
+        loader,
         graph,
         vault_search,
         args.assets_dir,

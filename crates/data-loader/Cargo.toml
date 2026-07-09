@@ -1,0 +1,10 @@
+[package]
+name = "data-loader"
+version = "1.0.0"
+edition = "2021"
+description = "Generic data-loading trait + schema: adapters produce VaultGraph from any source"
+
+[dependencies]
+vault-data = { path = "../vault-data" }
+serde      = { workspace = true }
+serde_json = { workspace = true }

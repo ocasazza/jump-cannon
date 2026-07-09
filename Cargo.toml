@@ -9,6 +9,8 @@ members = [
     "crates/vault-links",
     "crates/vault-search",
     "crates/tvix-wasm",
+    "crates/data-loader",
+    "crates/tvix-loader",
     "crates/test-browser",
 ]
 

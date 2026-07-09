@@ -747,6 +747,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a4ae5f15dda3c708c0ade84bfee31ccab44a3da4f88015ed22f63732abe300c8"
 
 [[package]]
+name = "data-loader"
+version = "1.0.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "vault-data",
+]
+
+[[package]]
 name = "delaunator"
 version = "1.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1242,6 +1251,7 @@ dependencies = [
  "bytemuck",
  "bytes",
  "clap",
+ "data-loader",
  "dotenvy",
  "futures",
  "graph-compute",
@@ -1262,6 +1272,7 @@ dependencies = [
  "tower-http 0.5.2",
  "tracing",
  "tracing-subscriber",
+ "tvix-loader",
  "tvix-wasm",
  "urlencoding",
  "vault-data",
@@ -4126,6 +4137,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "tvix-loader"
+version = "1.0.0"
+dependencies = [
+ "data-loader",
+ "rand 0.8.6",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tracing",
+ "tvix-wasm",
+ "vault-data",
+]
+
+[[package]]
 name = "tvix-wasm"
 version = "1.0.0"
 dependencies = [
@@ -4267,6 +4292,7 @@ name = "vault-links"
 version = "1.0.0"
 dependencies = [
  "anyhow",
+ "data-loader",
  "ignore",
  "serde",
  "serde_json",
