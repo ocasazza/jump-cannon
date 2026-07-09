@@ -191,13 +191,16 @@ dev-down:
     nix run .#dev-down
 
 # ── Quick backend stack ── the fast path for compute / GPU work: native
-# graph-compute (→ Metal on macOS, real hardware) + graph-api, with NO frontend
-# build. Detached, so it returns to your shell with the stack running. All
-# config is declarative in `.env` (VAULT_ROOT, GRAPH_API_PORT,
-# JUMP_CANNON_COMPUTE_URL). Inspect it with `just stack-status`; stop it with
-# `just stack-down`. For the full hot-reload UI stack, use `just dev-up`.
+# graph-compute (→ Metal on macOS, real hardware) + graph-api serving the built
+# Dioxus UI. It builds the WASM bundle ONCE and serves it (no trunk-watch /
+# cargo-watch hot-reload — that's the only thing it drops vs `dev-up`, and what
+# keeps it quick). Detached, so it returns to your shell with the stack running
+# and the app open at http://127.0.0.1:$GRAPH_API_PORT. All config is
+# declarative in `.env` (VAULT_ROOT, GRAPH_API_PORT, JUMP_CANNON_COMPUTE_URL).
+# Inspect with `just stack-status`; stop with `just stack-down`. For live
+# frontend hot-reload while editing the UI, use `just dev-up`.
 [group('dev')]
-[doc('Quick backend stack: native graph-compute (Metal) + graph-api, no frontend')]
+[doc('Quick dev stack: native graph-compute (Metal) + graph-api + served Dioxus UI')]
 stack backend="gpu":
     #!/usr/bin/env bash
     set -euo pipefail
@@ -207,15 +210,17 @@ stack backend="gpu":
       *) echo "stack: unknown backend '{{backend}}' (expected gpu|cpu)" >&2; exit 2 ;;
     esac
     port="${GRAPH_API_PORT:-8765}"
-    echo "→ backend={{backend}} (engine: $engine) · api :${port} · worker ${JUMP_CANNON_COMPUTE_URL:-unset}"
+    echo "→ backend={{backend}} (engine: $engine) · app :${port} · worker ${JUMP_CANNON_COMPUTE_URL:-unset}"
     echo "→ building graph-compute + graph-api + vault-search…"
     cargo build -p graph-compute -p graph-api -p vault-search
+    echo "→ building frontend WASM bundle (trunk; incremental)…"
+    (cd {{app_dir}} && trunk build)
     just stack-down >/dev/null 2>&1 || true   # idempotent: clear any prior stack
     echo "→ starting graph-compute (native worker — Metal on macOS)…"
     RUST_LOG=info nohup ./target/debug/graph-compute > /tmp/graph-compute.log 2>&1 &
-    echo "→ starting graph-api…"
-    GRAPH_API_NO_BROWSER=true JUMP_CANNON_COMPUTE_LAYOUT_ID="$engine" RUST_LOG=info \
-      nohup ./target/debug/graph-api > /tmp/graph-api.log 2>&1 &
+    echo "→ starting graph-api (serving the UI from {{dist}})…"
+    JUMP_CANNON_COMPUTE_LAYOUT_ID="$engine" RUST_LOG=info \
+      nohup ./target/debug/graph-api --assets-dir {{dist}} > /tmp/graph-api.log 2>&1 &
     echo "→ waiting for graph-api on :${port}…"
     curl -s --retry 90 --retry-delay 1 --retry-connrefused "http://127.0.0.1:${port}/graph/init" -o /dev/null || true
     echo
@@ -234,9 +239,15 @@ stack-status:
     curl -s "http://127.0.0.1:${port}/compute/engines" 2>/dev/null \
       | python3 -c 'import sys,json; d=json.load(sys.stdin); print("  active:",d.get("active")); [print("   -",e["id"]) for e in d.get("engines",[])]' \
       2>/dev/null || echo "  (could not parse engines — is the stack up?)"
-    echo "── urls ──"
-    echo "  graph-api : http://127.0.0.1:${port}"
-    echo "  worker    : ${JUMP_CANNON_COMPUTE_URL:-unset}"
+    echo "── frontend ──"
+    if curl -s "http://127.0.0.1:${port}/" 2>/dev/null | grep -qiE '<html|jump-cannon|<script'; then
+      echo "  UI served ✓"
+    else
+      echo "  UI not served (no --assets-dir dist?)"
+    fi
+    echo "── open ──"
+    echo "  app    : http://127.0.0.1:${port}   (Dioxus UI + API)"
+    echo "  worker : ${JUMP_CANNON_COMPUTE_URL:-unset}"
 
 # Stop the `just stack` backend (scoped to its binaries; safe to re-run).
 [group('dev')]
