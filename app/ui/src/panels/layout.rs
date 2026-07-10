@@ -168,30 +168,35 @@ async fn fetch_compute() {
 // --- engine registry -------------------------------------------------------------
 
 /// Same order the egui `LayoutRegistry::seed_default` registers, minus the
-/// two bridges (they live under Remote).
-fn local_descriptors() -> Vec<LayoutDescriptor> {
-    vec![
-        <GpuForceLayout as PhysicsLayout>::descriptor(),
-        <RandomLayout as StaticLayout>::descriptor(),
-        <CircleLayout as StaticLayout>::descriptor(),
-        <GridLayout as StaticLayout>::descriptor(),
-        <SphereLayout as StaticLayout>::descriptor(),
-        <ConcentricLayout as StaticLayout>::descriptor(),
-        <HilbertLayout as StaticLayout>::descriptor(),
-        <SpectralLayout as StaticLayout>::descriptor(),
-        <FcoseLayout as StaticLayout>::descriptor(),
-        <CoseBilkentLayout as StaticLayout>::descriptor(),
-        <CiseLayout as StaticLayout>::descriptor(),
-        <DagreLayout as StaticLayout>::descriptor(),
-        <KlayLayout as StaticLayout>::descriptor(),
-    ]
+/// two bridges (they live under Remote). Computed once — the descriptor set
+/// is static for the lifetime of the app.
+fn local_descriptors() -> &'static [LayoutDescriptor] {
+    use std::sync::LazyLock;
+    static DESCRIPTORS: LazyLock<Vec<LayoutDescriptor>> = LazyLock::new(|| {
+        vec![
+            <GpuForceLayout as PhysicsLayout>::descriptor(),
+            <RandomLayout as StaticLayout>::descriptor(),
+            <CircleLayout as StaticLayout>::descriptor(),
+            <GridLayout as StaticLayout>::descriptor(),
+            <SphereLayout as StaticLayout>::descriptor(),
+            <ConcentricLayout as StaticLayout>::descriptor(),
+            <HilbertLayout as StaticLayout>::descriptor(),
+            <SpectralLayout as StaticLayout>::descriptor(),
+            <FcoseLayout as StaticLayout>::descriptor(),
+            <CoseBilkentLayout as StaticLayout>::descriptor(),
+            <CiseLayout as StaticLayout>::descriptor(),
+            <DagreLayout as StaticLayout>::descriptor(),
+            <KlayLayout as StaticLayout>::descriptor(),
+        ]
+    });
+    &DESCRIPTORS
 }
 
 fn descriptor_for(id: &str) -> Option<LayoutDescriptor> {
     match id {
         BRIDGE_REMOTE_FA2 => Some(<RemoteFa2Layout as PhysicsLayout>::descriptor()),
         BRIDGE_GEOMETRIC => Some(<RemoteGeometricLayout as PhysicsLayout>::descriptor()),
-        other => local_descriptors().into_iter().find(|d| d.id == other),
+        other => local_descriptors().iter().find(|d| d.id == other).cloned(),
     }
 }
 
@@ -265,8 +270,31 @@ fn settings_or_default(id: &str) -> Value {
         .unwrap_or_else(|| default_settings(id))
 }
 
-fn typed_settings<T: DeserializeOwned + Default>(id: &str) -> T {
-    serde_json::from_value(settings_or_default(id)).unwrap_or_default()
+fn typed_settings<T: Serialize + DeserializeOwned + Default>(id: &str) -> T {
+    // Cache the last deserialized value per engine id. The cache key is the
+    // JSON pointer (which is stable as long as the settings map entry isn't
+    // replaced), so we only pay the serde cost when settings actually change.
+    thread_local! {
+        static CACHE: std::cell::RefCell<std::collections::HashMap<String, (String, String)>> =
+            std::cell::RefCell::new(std::collections::HashMap::new());
+    }
+    let raw = settings_or_default(id);
+    let raw_str = raw.to_string();
+    CACHE.with(|c| {
+        let mut cache = c.borrow_mut();
+        if let Some((cached_raw, cached_serialized)) = cache.get(id) {
+            if *cached_raw == raw_str {
+                // Same JSON — reuse the cached deserialized value.
+                return serde_json::from_str(cached_serialized).unwrap_or_default();
+            }
+        }
+        // New or changed — deserialize and cache.
+        let val: T = serde_json::from_value(raw).unwrap_or_default();
+        if let Ok(serialized) = serde_json::to_string(&val) {
+            cache.insert(id.to_string(), (raw_str, serialized));
+        }
+        val
+    })
 }
 
 /// Write one engine's settings block, persist, and push to the GPU.
@@ -1551,7 +1579,7 @@ pub fn panel(_ctx: Ctx) -> Element {
     let is_physics = desc.as_ref().map(|d| d.kind == LayoutKind::Physics).unwrap_or(false);
     let is_bridge = active == BRIDGE_GEOMETRIC || active == BRIDGE_REMOTE_FA2;
     // Live sim state for the Pause/Resume toggle (physics + remote engines).
-    let sim_running = render::with_host(|h| h.pipes.sim_running()).unwrap_or(true);
+    let sim_running = *render::SIM_RUNNING.read();
     // Static engines don't auto-apply slider edits — flag when the current
     // settings differ from what was last actually solved so the user knows to
     // press Solve. Physics engines apply live, so this never fires for them.

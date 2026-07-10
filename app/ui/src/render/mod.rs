@@ -26,10 +26,16 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
 use std::rc::Rc;
 
+use dioxus::prelude::*;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 
 pub use pipelines::{GraphData as Scene, RenderHost};
+
+/// Reactive mirror of the sim play/pause state. Updated by
+/// [`set_sim_running`]; panels read this instead of reaching into the
+/// thread-local render host so the UI re-renders on state changes.
+pub static SIM_RUNNING: GlobalSignal<bool> = Signal::global(|| true);
 
 /// DOM id of the graph canvas — shared with `graph_canvas.rs`.
 pub const CANVAS_ID: &str = "graph-canvas";
@@ -527,4 +533,5 @@ pub fn fit_camera() {
 pub fn set_sim_running(running: bool) {
     CTL.with(|c| c.borrow_mut().sim_running = running);
     with_host(|h| h.pipes.set_sim_running(running));
+    *SIM_RUNNING.write() = running;
 }

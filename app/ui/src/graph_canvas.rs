@@ -78,11 +78,19 @@ pub async fn load() -> Result<GraphData, String> {
     // Sphere shell seed, then the coarsening warm-up (which always
     // returns a full position set, so it effectively rules; the sphere
     // remains as the fallback should warmup ever come back short).
+    //
+    // Skip the warmup for large graphs (>10k nodes): the multilevel
+    // coarsening + CPU FR cascade runs in WASM on the main thread and
+    // blocks the UI for seconds at 100k scale. The sphere shell seed is
+    // perfectly adequate when a GPU compute backend (graph-compute) is
+    // handling layout — the GPU converges from any reasonable init.
     let mut positions = render::data::spawn_on_unit_sphere(n, 800.0);
-    let spring_len = GpuForceOptions::default().spring_len.max(1.0);
-    let warmed = graph_layouts::warmup_positions(n, &edges, spring_len, 0xC0A75E);
-    if warmed.len() == positions.len() {
-        positions = warmed;
+    if n <= 10_000 {
+        let spring_len = GpuForceOptions::default().spring_len.max(1.0);
+        let warmed = graph_layouts::warmup_positions(n, &edges, spring_len, 0xC0A75E);
+        if warmed.len() == positions.len() {
+            positions = warmed;
+        }
     }
 
     let colors = render::data::colors_from_metric("community", &metrics, n);

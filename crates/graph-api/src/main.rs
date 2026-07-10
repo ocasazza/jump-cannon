@@ -52,6 +52,15 @@ struct Args {
     /// When --source=generate, the number of edges to create.
     #[arg(long, env = "JUMP_CANNON_GENERATE_EDGES", default_value_t = 2000)]
     generate_edges: usize,
+    /// When --source=generate, partition nodes into this many clusters.
+    /// Nodes within the same cluster connect more often (see --cluster-affinity).
+    /// Default 0 = no clustering (purely random edges).
+    #[arg(long, env = "JUMP_CANNON_GENERATE_CLUSTERS", default_value_t = 0)]
+    generate_clusters: usize,
+    /// When --source=generate with --clusters > 0, the probability (0.0–1.0)
+    /// that an edge connects nodes within the same cluster. Default 0.8.
+    #[arg(long, env = "JUMP_CANNON_GENERATE_CLUSTER_AFFINITY", default_value_t = 0.8)]
+    generate_cluster_affinity: f64,
 }
 
 #[tokio::main]
@@ -104,11 +113,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             tracing::info!(
                 nodes = args.generate_nodes,
                 edges = args.generate_edges,
+                clusters = args.generate_clusters,
+                affinity = args.generate_cluster_affinity,
                 "using generate loader"
             );
             Box::new(tvix_loader::GenerateLoader::new(
                 args.generate_nodes,
                 args.generate_edges,
+                args.generate_clusters,
+                args.generate_cluster_affinity,
             ))
         }
     };

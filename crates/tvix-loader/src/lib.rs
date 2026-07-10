@@ -109,11 +109,13 @@ impl Loader for TvixLoader {
 pub struct GenerateLoader {
     num_nodes: usize,
     num_edges: usize,
+    num_clusters: usize,
+    cluster_affinity: f64,
 }
 
 impl GenerateLoader {
-    pub fn new(num_nodes: usize, num_edges: usize) -> Self {
-        Self { num_nodes, num_edges }
+    pub fn new(num_nodes: usize, num_edges: usize, num_clusters: usize, cluster_affinity: f64) -> Self {
+        Self { num_nodes, num_edges, num_clusters, cluster_affinity }
     }
 }
 
@@ -126,12 +128,27 @@ impl Loader for GenerateLoader {
         let mut graph = VaultGraph::new();
         let mut rng = rand::thread_rng();
 
-        // Generate nodes.
+        // Partition nodes into clusters.
+        let cluster_count = if self.num_clusters > 0 && self.num_nodes > 0 {
+            self.num_clusters.min(self.num_nodes)
+        } else {
+            0
+        };
+        // Assign each node to a cluster (round-robin for even distribution).
+        let node_cluster: Vec<usize> = (0..self.num_nodes)
+            .map(|i| i % cluster_count.max(1))
+            .collect();
+
+        // Generate nodes with cluster tags.
         for i in 0..self.num_nodes {
             let id = format!("n{i}");
+            let mut tags = vec!["generated".into()];
+            if cluster_count > 0 {
+                tags.push(format!("cluster-{}", node_cluster[i]));
+            }
             let meta = NodeMeta {
                 title: id.clone(),
-                tags: vec!["generated".into()],
+                tags,
                 frontmatter: HashMap::new(),
                 mtime: 0,
                 path: id.clone(),
@@ -147,15 +164,38 @@ impl Loader for GenerateLoader {
             });
         }
 
-        // Generate random edges (no self-loops).
+        // Generate edges with community structure.
         let max_node = self.num_nodes.saturating_sub(1);
+        let affinity = self.cluster_affinity.clamp(0.0, 1.0);
+
         for _ in 0..self.num_edges {
             let src = rng.gen_range(0..=max_node);
-            let mut tgt = rng.gen_range(0..=max_node);
-            // Avoid self-loops: if we pick the same node, shift by 1.
-            if self.num_nodes > 1 && tgt == src {
-                tgt = (tgt + 1) % self.num_nodes;
-            }
+
+            let tgt = if cluster_count > 0 && rng.gen::<f64>() < affinity {
+                // Intra-cluster: pick a target from the same cluster.
+                let cluster = node_cluster[src];
+                let candidates: Vec<usize> = (0..self.num_nodes)
+                    .filter(|&i| node_cluster[i] == cluster && i != src)
+                    .collect();
+                if candidates.is_empty() {
+                    // Fallback: random target (cluster of size 1).
+                    let mut t = rng.gen_range(0..=max_node);
+                    if self.num_nodes > 1 && t == src {
+                        t = (t + 1) % self.num_nodes;
+                    }
+                    t
+                } else {
+                    candidates[rng.gen_range(0..candidates.len())]
+                }
+            } else {
+                // Inter-cluster (or no clustering): random target.
+                let mut t = rng.gen_range(0..=max_node);
+                if self.num_nodes > 1 && t == src {
+                    t = (t + 1) % self.num_nodes;
+                }
+                t
+            };
+
             graph.add_edge(VaultEdge {
                 source: format!("n{src}"),
                 target: format!("n{tgt}"),
@@ -310,7 +350,7 @@ mod tests {
 
     #[test]
     fn generate_small_graph() {
-        let loader = GenerateLoader::new(10, 20);
+        let loader = GenerateLoader::new(10, 20, 0, 0.0);
         let result = loader.load();
         assert_eq!(result.graph.node_count(), 10);
         assert_eq!(result.graph.edge_count(), 20);
@@ -324,7 +364,7 @@ mod tests {
     #[test]
     fn generate_no_self_loops() {
         // With 2 nodes and many edges, self-loops should never appear.
-        let loader = GenerateLoader::new(2, 100);
+        let loader = GenerateLoader::new(2, 100, 0, 0.0);
         let result = loader.load();
         for edge in &result.graph.edges {
             assert_ne!(edge.source, edge.target, "no self-loops");
@@ -333,7 +373,7 @@ mod tests {
 
     #[test]
     fn generate_zero_nodes() {
-        let loader = GenerateLoader::new(0, 0);
+        let loader = GenerateLoader::new(0, 0, 0, 0.0);
         let result = loader.load();
         assert_eq!(result.graph.node_count(), 0);
         assert_eq!(result.graph.edge_count(), 0);
@@ -342,9 +382,22 @@ mod tests {
     #[test]
     fn generate_large_graph_is_fast() {
         // 50k nodes, 100k edges should complete in well under 1 second.
-        let loader = GenerateLoader::new(50_000, 100_000);
+        let loader = GenerateLoader::new(50_000, 100_000, 0, 0.0);
         let result = loader.load();
         assert_eq!(result.graph.node_count(), 50_000);
         assert_eq!(result.graph.edge_count(), 100_000);
+    }
+
+    #[test]
+    fn generate_clustered_graph() {
+        let loader = GenerateLoader::new(100, 500, 3, 0.8);
+        let result = loader.load();
+        assert_eq!(result.graph.node_count(), 100);
+        assert_eq!(result.graph.edge_count(), 500);
+        // Every node should have a cluster tag.
+        for (_, node) in &result.graph.nodes {
+            let has_cluster = node.meta.tags.iter().any(|t| t.starts_with("cluster-"));
+            assert!(has_cluster, "node {} missing cluster tag", node.id);
+        }
     }
 }
