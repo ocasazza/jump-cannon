@@ -700,8 +700,8 @@
       };
     };
 
-    # Hydra jobs — what the nixstation Hydra (pdx-nxst-001) builds per merge to
-    # main, as a flake-type jobset. Scoped DELIBERATELY to the GPU-analytics
+    # Hydra jobs — what the nixstation Hydra builds per merge to main, as a
+    # flake-type jobset. Scoped DELIBERATELY to the GPU-analytics
     # deliverable this CI exists to guard (correctness + perf regression):
     #
     #   x86_64-linux.tests-gpu      — the GPU correctness gate. Runs the WGSL
