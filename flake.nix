@@ -121,7 +121,11 @@
           pname = "graph-compute-bench-pagerank";
           version = "0.1.0";
           __noChroot = true;
-          nativeBuildInputs = [ pkgs.protobuf ];
+          nativeBuildInputs = [
+            pkgs.protobuf
+            pkgs.python3
+            pkgs.curl
+          ];
           buildPhaseCargoCommand = ''
             cargo run --release -p graph-compute --example bench_pagerank -- \
               --bench --noplot --save-baseline hydra
@@ -132,9 +136,34 @@
           doCheck = false;
           installPhaseCommand = ''
             mkdir -p $out/nix-support
-            if [ -d target/criterion ]; then cp -r target/criterion $out/criterion; fi
-            # Surface the criterion dir as a Hydra build product for the report.
-            echo "report criterion $out/criterion" > $out/nix-support/hydra-build-products
+
+            # Archive raw criterion output as a Hydra build product.
+            if [ -d target/criterion ]; then
+              cp -r target/criterion $out/criterion
+              echo "report criterion $out/criterion" >> $out/nix-support/hydra-build-products
+            fi
+
+            # Convert criterion JSON → dashboard JSON files.
+            if [ -d target/criterion ]; then
+              mkdir -p $out/benchdata
+              python3 ${./scripts/criterion-to-dashboard-json.py} \
+                --criterion-dir target/criterion \
+                --out-dir $out/benchdata \
+                --timestamp "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+              echo "report benchdata $out/benchdata" >> $out/nix-support/hydra-build-products
+            fi
+
+            # Upload dashboard JSON to SeaweedFS S3 (same endpoint Thanos uses).
+            # Credentials: the builder must have S3_SECRET_KEY in its environment
+            # (provisioned via Hydra's secret management or /etc/bencher/ci-token).
+            if [ -d $out/benchdata ] && [ -n "''${S3_SECRET_KEY:-}" ]; then
+              S3="http://pdx-nxst-001.schrodinger.com:8333/jc-benches"
+              for f in $out/benchdata/*.json; do
+                curl -sf -X PUT -T "$f" \
+                  -H "Authorization: AWS admin:$S3_SECRET_KEY" \
+                  "$S3/$(basename "$f")" || true
+              done
+            fi
           '';
         });
 
