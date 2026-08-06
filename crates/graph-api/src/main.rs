@@ -23,7 +23,7 @@ struct Args {
     /// container bind. `$GRAPH_API_HOST` is the matching env var.
     #[arg(long, env = "GRAPH_API_HOST", default_value = "127.0.0.1")]
     host: String,
-    /// Don't auto-open the browser. Override with $GRAPH_API_NO_BROWSER=1.
+    /// Don't auto-open the browser. Override with $GRAPH_API_NO_BROWSER=true.
     #[arg(long, env = "GRAPH_API_NO_BROWSER")]
     no_browser: bool,
     /// Serve /assets and / from this directory at request time (the

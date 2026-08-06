@@ -4,7 +4,7 @@ services:
     - graph-compute
     environment:
       GRAPH_API_HOST: 0.0.0.0
-      GRAPH_API_NO_BROWSER: '1'
+      GRAPH_API_NO_BROWSER: 'true'
       GRAPH_API_PORT: '8765'
       JUMP_CANNON_ASSETS_DIR: /assets
       JUMP_CANNON_COMPUTE_URL: http://graph-compute:50051

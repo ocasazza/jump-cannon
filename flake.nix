@@ -324,7 +324,7 @@
             Env = [
               "GRAPH_API_HOST=0.0.0.0"
               "GRAPH_API_PORT=${toString graphApiService.port}"
-              "GRAPH_API_NO_BROWSER=1"
+              "GRAPH_API_NO_BROWSER=true"
               "JUMP_CANNON_ASSETS_DIR=/assets"
               "VAULT_ROOT=/vault"
               "RUST_LOG=${graphApiService.rustLog}"
@@ -371,7 +371,7 @@
                 Env = [
                   "GRAPH_API_HOST=0.0.0.0"
                   "GRAPH_API_PORT=${toString graphApiService.port}"
-                  "GRAPH_API_NO_BROWSER=1"
+                  "GRAPH_API_NO_BROWSER=true"
                   "JUMP_CANNON_ASSETS_DIR=/assets"
                   "VAULT_ROOT=/vault"
                   "RUST_LOG=${graphApiService.rustLog}"
@@ -671,7 +671,7 @@
             environment = {
               GRAPH_API_HOST              = "0.0.0.0";
               GRAPH_API_PORT              = toString graphApiService.port;
-              GRAPH_API_NO_BROWSER        = "1";
+              GRAPH_API_NO_BROWSER        = "true";
               JUMP_CANNON_ASSETS_DIR      = "/assets";
               VAULT_ROOT                  = "/vault";
               JUMP_CANNON_COMPUTE_URL     = "http://${graphComputeService.name}:${toString graphComputeService.port}";
