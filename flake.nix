@@ -107,6 +107,13 @@
           nativeBuildInputs = [ pkgs.protobuf ];
         });
 
+        graph-compute-k8s-binary = craneLib.buildPackage (commonArgs // {
+          cargoArtifacts = depsNative;
+          cargoExtraArgs = "--package graph-compute";
+          nativeBuildInputs = [ pkgs.protobuf ];
+          doCheck = false;
+        });
+
         # Perf benches (REPORT-ONLY, never gates a merge). Runs the criterion
         # bench_pagerank example (size sweep) **and** bench_scaling (the
         # degree × structure / sparse↔dense matrix), capturing all criterion
@@ -386,7 +393,7 @@
               name = "${k8sImageRegistry}/jump-cannon-graph-compute";
               tag = "latest";
               contents = [
-                graph-compute
+                graph-compute-k8s-binary
                 pkgs.cacert
                 pkgs.vulkan-loader
               ];
@@ -457,7 +464,7 @@
               mkdir -p "$out/bin"
             '';
 
-        testMetricsShell = ''
+        testMetricsPushShell = ''
           push_metrics() {
             test_name="$1"
             passed="$2"
@@ -476,7 +483,9 @@
               "$PUSHGATEWAY_URL/metrics/job/jump-cannon-$test_name/app/jump-cannon/test/$test_name"
             rm -f "$metrics_file"
           }
+        '';
 
+        testMetricsShell = testMetricsPushShell + ''
           run_and_report() {
             test_name="$1"
             shift
@@ -508,7 +517,7 @@
             : "''${PUSHGATEWAY_URL:=http://pushgateway.monitoring.svc.cluster.local:9091}"
             : "''${PROPTEST_CASES:=10000}"
             export PROPTEST_CASES
-            ${testMetricsShell}
+            ${testMetricsPushShell}
 
             started="$(date +%s)"
             set +e
