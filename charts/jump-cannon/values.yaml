@@ -109,6 +109,8 @@ tests:
     tag: latest
     pullPolicy: Always
   pushgatewayUrl: http://pushgateway.monitoring.svc.cluster.local:9091
+  # Keep the test cadence independent of the controller-manager's local zone.
+  timeZone: America/Los_Angeles
   commonResources:
     requests:
       cpu: 500m
@@ -118,8 +120,8 @@ tests:
       memory: 2Gi
   fuzz:
     enabled: true
-    suspend: true
-    schedule: "15 3 * * *"
+    suspend: false
+    schedule: "0 0 * * 0"
     cases: "10000"
     kueue:
       enabled: false
@@ -129,8 +131,8 @@ tests:
   performance:
     enabled: true
     namespace: ""
-    suspend: true
-    schedule: "45 3 * * *"
+    suspend: false
+    schedule: "30 0 * * 0"
     includeHuge: "0"
     kueue:
       enabled: true
@@ -150,7 +152,7 @@ tests:
         nvidia.com/gpu: "1"
   browser:
     enabled: true
-    suspend: true
-    schedule: "15 4 * * *"
+    suspend: false
+    schedule: "15 0 * * 0"
     baseUrl: http://jump-cannon:80
     timeoutSeconds: "90"

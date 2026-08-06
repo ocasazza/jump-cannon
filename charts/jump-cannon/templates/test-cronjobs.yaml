@@ -8,6 +8,9 @@ metadata:
     app.kubernetes.io/component: fuzz-tests
 spec:
   schedule: {{ .Values.tests.fuzz.schedule | quote }}
+  {{- with .Values.tests.timeZone }}
+  timeZone: {{ . | quote }}
+  {{- end }}
   suspend: {{ .Values.tests.fuzz.suspend }}
   concurrencyPolicy: Forbid
   successfulJobsHistoryLimit: 2
@@ -63,6 +66,9 @@ metadata:
     app.kubernetes.io/component: performance-tests
 spec:
   schedule: {{ .Values.tests.performance.schedule | quote }}
+  {{- with .Values.tests.timeZone }}
+  timeZone: {{ . | quote }}
+  {{- end }}
   suspend: {{ .Values.tests.performance.suspend }}
   concurrencyPolicy: Forbid
   successfulJobsHistoryLimit: 2
@@ -118,6 +124,9 @@ metadata:
     app.kubernetes.io/component: browser-tests
 spec:
   schedule: {{ .Values.tests.browser.schedule | quote }}
+  {{- with .Values.tests.timeZone }}
+  timeZone: {{ . | quote }}
+  {{- end }}
   suspend: {{ .Values.tests.browser.suspend }}
   concurrencyPolicy: Forbid
   successfulJobsHistoryLimit: 2
