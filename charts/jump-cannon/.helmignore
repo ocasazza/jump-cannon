@@ -1,0 +1,4 @@
+.git/
+.gitignore
+ci/
+README.md

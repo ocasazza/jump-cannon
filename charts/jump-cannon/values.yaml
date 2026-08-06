@@ -1,0 +1,156 @@
+nameOverride: ""
+fullnameOverride: ""
+
+imagePullSecrets:
+  - name: gar-pull
+
+serviceAccount:
+  create: true
+  name: ""
+  automountServiceAccountToken: false
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 10001
+  runAsGroup: 10001
+  fsGroup: 10001
+  seccompProfile:
+    type: RuntimeDefault
+
+containerSecurityContext:
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop:
+      - ALL
+
+graphApi:
+  replicas: 1
+  image:
+    repository: us-central1-docker.pkg.dev/it-ops-nixstation/lavender/jump-cannon-graph-api
+    tag: latest
+    pullPolicy: Always
+  port: 8765
+  rustLog: info
+  computeUrl: http://jump-cannon-compute:50051
+  resources:
+    requests:
+      cpu: 250m
+      memory: 512Mi
+    limits:
+      cpu: "2"
+      memory: 2Gi
+
+vault:
+  mountPath: /vault
+  persistence:
+    enabled: true
+    storageClassName: local-path
+    size: 5Gi
+  seed:
+    enabled: true
+    image: docker.io/library/busybox:1.36.1
+    files:
+      Welcome.md: |
+        # jump-cannon
+
+        This vault is managed by the in-cluster jump-cannon deployment.
+
+        See [[Performance]].
+      Performance.md: |
+        # Performance
+
+        Cluster test jobs push their status to Pushgateway for Grafana.
+
+graphCompute:
+  enabled: true
+  namespace: ""
+  serviceAccountName: default
+  podSecurityContext:
+    seccompProfile:
+      type: RuntimeDefault
+  service:
+    port: 50051
+  image:
+    repository: us-central1-docker.pkg.dev/it-ops-nixstation/lavender/jump-cannon-graph-compute
+    tag: latest
+    pullPolicy: Always
+  rustLog: info
+  tickHz: "30"
+  bindAddr: "[::]:50051"
+  ray:
+    image: vllm/vllm-openai@sha256:e4f88a835143cd22aee2397a26ec6bb80b3a4a6fe0c882bcbc63822904766089
+    rayVersion: "2.52.0"
+    queueName: gpu
+    workloadPriorityClassName: batch
+    podPriorityClassName: gpu-batch
+    ttlSeconds: 14400
+    nodeSelector:
+      nixstation.io/gpu-workload: elastic
+    headResources:
+      requests:
+        cpu: "1"
+        memory: 2Gi
+      limits:
+        cpu: "2"
+        memory: 4Gi
+    backendResources:
+      requests:
+        cpu: "2"
+        memory: 4Gi
+        nvidia.com/gpu: "1"
+      limits:
+        cpu: "4"
+        memory: 8Gi
+        nvidia.com/gpu: "1"
+
+tests:
+  image:
+    repository: us-central1-docker.pkg.dev/it-ops-nixstation/lavender/jump-cannon-test-runner
+    tag: latest
+    pullPolicy: Always
+  pushgatewayUrl: http://pushgateway.monitoring.svc.cluster.local:9091
+  commonResources:
+    requests:
+      cpu: 500m
+      memory: 512Mi
+    limits:
+      cpu: "2"
+      memory: 2Gi
+  fuzz:
+    enabled: true
+    suspend: true
+    schedule: "15 3 * * *"
+    cases: "10000"
+    kueue:
+      enabled: false
+      queueName: gpu
+      workloadPriorityClassName: batch
+      podPriorityClassName: gpu-batch
+  performance:
+    enabled: true
+    namespace: ""
+    suspend: true
+    schedule: "45 3 * * *"
+    includeHuge: "0"
+    kueue:
+      enabled: true
+      queueName: gpu
+      workloadPriorityClassName: batch
+      podPriorityClassName: gpu-batch
+    nodeSelector:
+      nixstation.io/gpu-workload: elastic
+    resources:
+      requests:
+        cpu: "2"
+        memory: 4Gi
+        nvidia.com/gpu: "1"
+      limits:
+        cpu: "4"
+        memory: 8Gi
+        nvidia.com/gpu: "1"
+  browser:
+    enabled: true
+    suspend: true
+    schedule: "15 4 * * *"
+    baseUrl: http://jump-cannon:80
+    timeoutSeconds: "90"

@@ -1,0 +1,17 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "jump-cannon.fullname" . }}
+  labels:
+    {{- include "jump-cannon.labels" . | nindent 4 }}
+    app.kubernetes.io/component: graph-api
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "jump-cannon.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: graph-api
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+      protocol: TCP

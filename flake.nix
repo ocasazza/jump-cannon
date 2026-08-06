@@ -60,6 +60,8 @@
 
         craneLib     = (inputs.crane.mkLib pkgs).overrideToolchain rustToolchainNative;
         craneLibWasm = (inputs.crane.mkLib pkgs).overrideToolchain rustToolchainWasm;
+        isLinux = pkgs.stdenv.hostPlatform.system == "x86_64-linux";
+        k8sImageRegistry = "us-central1-docker.pkg.dev/it-ops-nixstation/lavender";
 
         src = pkgs.lib.fileset.toSource {
           root = ./.;
@@ -323,6 +325,307 @@
           };
         };
 
+        unsupportedK8sImage = name:
+          pkgs.runCommand "${name}-unsupported"
+            {
+              meta = {
+                description = "${name} OCI image (only built on x86_64-linux)";
+                platforms = [ "x86_64-linux" ];
+              };
+            }
+            ''
+              mkdir -p "$out"
+              echo "${name} is only available on x86_64-linux" > "$out/README"
+            '';
+
+        graph-api-k8s-image =
+          if isLinux then
+            pkgs.dockerTools.streamLayeredImage {
+              name = "${k8sImageRegistry}/jump-cannon-graph-api";
+              tag = "latest";
+              contents = [
+                graph-api
+                vault-search
+                pkgs.cacert
+              ];
+              extraCommands = ''
+                mkdir -p assets etc/ssl/certs
+                cp -r ${app-web}/. assets/
+                ln -sf ${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt etc/ssl/certs/ca-bundle.crt
+              '';
+              fakeRootCommands = ''
+                printf 'root:x:0:0::/root:/noshell\njump:x:10001:10001:Jump Cannon:/tmp:/noshell\n' > etc/passwd
+                printf 'root:x:0:\njump:x:10001:\n' > etc/group
+                chmod 0644 etc/passwd etc/group
+              '';
+              config = {
+                Entrypoint = [ "/bin/graph-api" ];
+                ExposedPorts."${toString graphApiService.port}/tcp" = {};
+                Env = [
+                  "GRAPH_API_HOST=0.0.0.0"
+                  "GRAPH_API_PORT=${toString graphApiService.port}"
+                  "GRAPH_API_NO_BROWSER=1"
+                  "JUMP_CANNON_ASSETS_DIR=/assets"
+                  "VAULT_ROOT=/vault"
+                  "RUST_LOG=${graphApiService.rustLog}"
+                  "SSL_CERT_FILE=/etc/ssl/certs/ca-bundle.crt"
+                  "NIX_SSL_CERT_FILE=/etc/ssl/certs/ca-bundle.crt"
+                ];
+                Labels = {
+                  "org.opencontainers.image.source" = "https://github.com/ocasazza/jump-cannon";
+                  "org.opencontainers.image.description" = "jump-cannon graph-api with Dioxus frontend assets";
+                };
+              };
+            }
+          else
+            unsupportedK8sImage "graph-api-k8s-image";
+
+        graph-compute-k8s-image =
+          if isLinux then
+            pkgs.dockerTools.streamLayeredImage {
+              name = "${k8sImageRegistry}/jump-cannon-graph-compute";
+              tag = "latest";
+              contents = [
+                graph-compute
+                pkgs.cacert
+                pkgs.vulkan-loader
+              ];
+              extraCommands = ''
+                mkdir -p etc/ssl/certs
+                ln -sf ${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt etc/ssl/certs/ca-bundle.crt
+              '';
+              fakeRootCommands = ''
+                printf 'root:x:0:0::/root:/noshell\njump:x:10001:10001:Jump Cannon:/tmp:/noshell\n' > etc/passwd
+                printf 'root:x:0:\njump:x:10001:\n' > etc/group
+                chmod 0644 etc/passwd etc/group
+              '';
+              config = {
+                Entrypoint = [ "/bin/graph-compute" ];
+                ExposedPorts."${toString graphComputeService.port}/tcp" = {};
+                Env = [
+                  "GRAPH_COMPUTE_TICK_HZ=${toString graphComputeService.tickHz}"
+                  "GRAPH_COMPUTE_ADDR=${graphComputeService.bindAddr}"
+                  "RUST_LOG=${graphComputeService.rustLog}"
+                  "SSL_CERT_FILE=/etc/ssl/certs/ca-bundle.crt"
+                  "NIX_SSL_CERT_FILE=/etc/ssl/certs/ca-bundle.crt"
+                ];
+                Labels = {
+                  "org.opencontainers.image.source" = "https://github.com/ocasazza/jump-cannon";
+                  "org.opencontainers.image.description" = "jump-cannon graph-compute gRPC backend";
+                };
+              };
+            }
+          else
+            unsupportedK8sImage "graph-compute-k8s-image";
+
+        test-workload-bins =
+          if isLinux then
+            craneLib.mkCargoDerivation (commonArgs // {
+              cargoArtifacts = depsNative;
+              pname = "jump-cannon-test-workload-bins";
+              version = "0.1.0";
+              nativeBuildInputs = [ pkgs.protobuf ];
+              buildPhaseCargoCommand = ''
+                CARGO_TARGET_DIR=target/layout-fuzz \
+                  cargo test -p graph-layouts --test fuzz --release --no-run
+                CARGO_TARGET_DIR=target/compute-fuzz \
+                  cargo test -p graph-compute --test fuzz --release --no-run
+                CARGO_TARGET_DIR=target/benches \
+                  cargo build --release -p graph-layouts --example bench_static_layouts
+                CARGO_TARGET_DIR=target/benches \
+                  cargo build --release -p graph-compute \
+                    --example bench_pagerank \
+                    --example bench_scaling
+              '';
+              doInstallCargoArtifacts = false;
+              doCheck = false;
+              installPhaseCommand = ''
+                mkdir -p "$out/bin"
+
+                layout_fuzz=$(find target/layout-fuzz/release/deps -maxdepth 1 -type f -perm -111 -name 'fuzz-*' | sort | head -n1)
+                compute_fuzz=$(find target/compute-fuzz/release/deps -maxdepth 1 -type f -perm -111 -name 'fuzz-*' | sort | head -n1)
+                install -m 0755 "$layout_fuzz" "$out/bin/graph-layouts-fuzz"
+                install -m 0755 "$compute_fuzz" "$out/bin/graph-compute-fuzz"
+
+                install -m 0755 target/benches/release/examples/bench_static_layouts "$out/bin/graph-layouts-bench-static"
+                install -m 0755 target/benches/release/examples/bench_pagerank "$out/bin/graph-compute-bench-pagerank"
+                install -m 0755 target/benches/release/examples/bench_scaling "$out/bin/graph-compute-bench-scaling"
+              '';
+            })
+          else
+            pkgs.runCommand "jump-cannon-test-workload-bins-unsupported" { } ''
+              mkdir -p "$out/bin"
+            '';
+
+        testMetricsShell = ''
+          push_metrics() {
+            test_name="$1"
+            passed="$2"
+            failed="$3"
+            duration="$4"
+            now="$(date +%s)"
+            metrics_file="$(mktemp)"
+            {
+              printf 'jump_cannon_test_last_run_timestamp_seconds{app="jump-cannon",test="%s"} %s\n' "$test_name" "$now"
+              printf 'test_run_total{app="jump-cannon",test="%s"} 1\n' "$test_name"
+              printf 'test_run_passed{app="jump-cannon",test="%s"} %s\n' "$test_name" "$passed"
+              printf 'test_run_failed{app="jump-cannon",test="%s"} %s\n' "$test_name" "$failed"
+              printf 'test_duration_seconds{app="jump-cannon",test="%s"} %s\n' "$test_name" "$duration"
+            } > "$metrics_file"
+            curl -fsS --data-binary @"$metrics_file" \
+              "$PUSHGATEWAY_URL/metrics/job/jump-cannon-$test_name/app/jump-cannon/test/$test_name"
+            rm -f "$metrics_file"
+          }
+
+          run_and_report() {
+            test_name="$1"
+            shift
+            started="$(date +%s)"
+            set +e
+            "$@"
+            status="$?"
+            set -e
+            ended="$(date +%s)"
+            duration="$((ended - started))"
+            if [ "$status" -eq 0 ]; then
+              push_metrics "$test_name" 1 0 "$duration"
+            else
+              push_metrics "$test_name" 0 1 "$duration" || true
+            fi
+            return "$status"
+          }
+        '';
+
+        jump-cannon-fuzz = pkgs.writeShellApplication {
+          name = "jump-cannon-fuzz";
+          runtimeInputs = [
+            test-workload-bins
+            pkgs.coreutils
+            pkgs.curl
+          ];
+          text = ''
+            set -euo pipefail
+            : "''${PUSHGATEWAY_URL:=http://pushgateway.monitoring.svc.cluster.local:9091}"
+            : "''${PROPTEST_CASES:=10000}"
+            export PROPTEST_CASES
+            ${testMetricsShell}
+
+            started="$(date +%s)"
+            set +e
+            graph-layouts-fuzz
+            layout_status="$?"
+            graph-compute-fuzz
+            compute_status="$?"
+            set -e
+            ended="$(date +%s)"
+            duration="$((ended - started))"
+            if [ "$layout_status" -eq 0 ] && [ "$compute_status" -eq 0 ]; then
+              push_metrics fuzz 1 0 "$duration"
+              exit 0
+            fi
+            push_metrics fuzz 0 1 "$duration" || true
+            exit 1
+          '';
+        };
+
+        jump-cannon-perf = pkgs.writeShellApplication {
+          name = "jump-cannon-perf";
+          runtimeInputs = [
+            test-workload-bins
+            pkgs.coreutils
+            pkgs.curl
+          ];
+          text = ''
+            set -euo pipefail
+            : "''${PUSHGATEWAY_URL:=http://pushgateway.monitoring.svc.cluster.local:9091}"
+            ${testMetricsShell}
+
+            if [ "''${BENCH_INCLUDE_1M:-0}" != "1" ]; then
+              unset BENCH_INCLUDE_1M
+            fi
+
+            run_and_report performance sh -c '
+              graph-layouts-bench-static --bench &&
+              graph-compute-bench-pagerank --bench --noplot &&
+              graph-compute-bench-scaling --bench --noplot
+            '
+          '';
+        };
+
+        jump-cannon-browser-smoke = pkgs.writeShellApplication {
+          name = "jump-cannon-browser-smoke";
+          runtimeInputs = [
+            test-browser
+            pkgs.chromium
+            pkgs.coreutils
+            pkgs.curl
+          ];
+          text = ''
+            set -euo pipefail
+            : "''${PUSHGATEWAY_URL:=http://pushgateway.monitoring.svc.cluster.local:9091}"
+            : "''${JUMP_CANNON_BASE_URL:=http://jump-cannon:80}"
+            : "''${JUMP_CANNON_BROWSER_TIMEOUT_SECONDS:=90}"
+            OUT_DIR="''${OUT_DIR:-/tmp/jump-cannon-browser-smoke}"
+            mkdir -p "$OUT_DIR"
+            ${testMetricsShell}
+
+            run_and_report browser test-browser \
+              --base-url "$JUMP_CANNON_BASE_URL" \
+              --chromium ${pkgs.chromium}/bin/chromium \
+              --out-dir "$OUT_DIR" \
+              --timeout-secs "$JUMP_CANNON_BROWSER_TIMEOUT_SECONDS"
+          '';
+        };
+
+        test-runner-image =
+          if isLinux then
+            pkgs.dockerTools.streamLayeredImage {
+              name = "${k8sImageRegistry}/jump-cannon-test-runner";
+              tag = "latest";
+              contents = [
+                jump-cannon-fuzz
+                jump-cannon-perf
+                jump-cannon-browser-smoke
+                test-workload-bins
+                test-browser
+                pkgs.bashInteractive
+                pkgs.chromium
+                pkgs.coreutils
+                pkgs.curl
+                pkgs.cacert
+                pkgs.jq
+                pkgs.mesa
+                pkgs.vulkan-loader
+              ];
+              extraCommands = ''
+                mkdir -p tmp etc/ssl/certs
+                chmod 1777 tmp
+                ln -sf ${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt etc/ssl/certs/ca-bundle.crt
+              '';
+              fakeRootCommands = ''
+                printf 'root:x:0:0::/root:/noshell\njump:x:10001:10001:Jump Cannon:/tmp:/noshell\n' > etc/passwd
+                printf 'root:x:0:\njump:x:10001:\n' > etc/group
+                chmod 0644 etc/passwd etc/group
+              '';
+              config = {
+                Cmd = [ "/bin/jump-cannon-browser-smoke" ];
+                WorkingDir = "/tmp";
+                Env = [
+                  "PATH=/bin"
+                  "HOME=/tmp"
+                  "SSL_CERT_FILE=/etc/ssl/certs/ca-bundle.crt"
+                  "NIX_SSL_CERT_FILE=/etc/ssl/certs/ca-bundle.crt"
+                  "VK_ICD_FILENAMES=/share/vulkan/icd.d/lvp_icd.x86_64.json"
+                ];
+                Labels = {
+                  "org.opencontainers.image.source" = "https://github.com/ocasazza/jump-cannon";
+                  "org.opencontainers.image.description" = "jump-cannon cluster test runner";
+                };
+              };
+            }
+          else
+            unsupportedK8sImage "test-runner-image";
+
         yamlFmt = pkgs.formats.yaml {};
 
         docker-compose-yaml = yamlFmt.generate "docker-compose.yml" {
@@ -582,8 +885,10 @@
           default          = graph-api;
           inherit vault-search graph-api graph-compute graph-layouts-wasm tvix-wasm app-web;
           inherit bench-pagerank;
+          chart-tarball = pkgs.callPackage ./packages/chart-tarball { };
           inherit graph-compute-image graph-api-image docker-compose-yaml sky-task-yaml;
-          inherit test-browser;
+          inherit graph-api-k8s-image graph-compute-k8s-image test-runner-image;
+          inherit test-browser test-workload-bins;
         };
 
         apps = {
@@ -750,6 +1055,10 @@
     # debt that isn't this deliverable's.
     flake.hydraJobs = {
       x86_64-linux.tests-gpu = inputs.self.checks.x86_64-linux.tests-gpu;
+      x86_64-linux.chart-tarball = inputs.self.packages.x86_64-linux.chart-tarball;
+      x86_64-linux.graph-api-k8s-image = inputs.self.packages.x86_64-linux.graph-api-k8s-image;
+      x86_64-linux.graph-compute-k8s-image = inputs.self.packages.x86_64-linux.graph-compute-k8s-image;
+      x86_64-linux.test-runner-image = inputs.self.packages.x86_64-linux.test-runner-image;
       aarch64-darwin.graph-compute = inputs.self.packages.aarch64-darwin.graph-compute;
       aarch64-darwin.bench-pagerank = inputs.self.packages.aarch64-darwin.bench-pagerank;
     };

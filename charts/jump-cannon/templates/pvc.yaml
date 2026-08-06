@@ -1,0 +1,17 @@
+{{- if .Values.vault.persistence.enabled }}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "jump-cannon.fullname" . }}-vault
+  labels:
+    {{- include "jump-cannon.labels" . | nindent 4 }}
+spec:
+  accessModes:
+    - ReadWriteOnce
+  {{- if .Values.vault.persistence.storageClassName }}
+  storageClassName: {{ .Values.vault.persistence.storageClassName | quote }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ .Values.vault.persistence.size | quote }}
+{{- end }}

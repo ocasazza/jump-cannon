@@ -1,0 +1,6 @@
+apiVersion: v2
+name: jump-cannon
+description: jump-cannon graph-api, frontend assets, on-demand GPU compute, and test jobs
+type: application
+version: 0.1.0
+appVersion: "0.1.0"

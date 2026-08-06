@@ -1,0 +1,110 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "jump-cannon.fullname" . }}
+  labels:
+    {{- include "jump-cannon.labels" . | nindent 4 }}
+    app.kubernetes.io/component: graph-api
+spec:
+  replicas: {{ .Values.graphApi.replicas }}
+  selector:
+    matchLabels:
+      {{- include "jump-cannon.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: graph-api
+  template:
+    metadata:
+      labels:
+        {{- include "jump-cannon.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: graph-api
+    spec:
+      serviceAccountName: {{ include "jump-cannon.serviceAccountName" . }}
+      automountServiceAccountToken: {{ .Values.serviceAccount.automountServiceAccountToken }}
+      imagePullSecrets:
+        {{- toYaml .Values.imagePullSecrets | nindent 8 }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      {{- if .Values.vault.seed.enabled }}
+      initContainers:
+        - name: seed-vault
+          image: {{ .Values.vault.seed.image | quote }}
+          imagePullPolicy: IfNotPresent
+          command:
+            - /bin/sh
+            - -c
+          args:
+            - |
+              set -eu
+              mkdir -p {{ .Values.vault.mountPath }}
+              for source in /seed/*; do
+                [ -f "$source" ] || continue
+                target="{{ .Values.vault.mountPath }}/$(basename "$source")"
+                [ -e "$target" ] || cp "$source" "$target"
+              done
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+          volumeMounts:
+            - name: vault
+              mountPath: {{ .Values.vault.mountPath }}
+            - name: vault-seed
+              mountPath: /seed
+              readOnly: true
+      {{- end }}
+      containers:
+        - name: graph-api
+          image: {{ include "jump-cannon.graphApiImage" . | quote }}
+          imagePullPolicy: {{ .Values.graphApi.image.pullPolicy }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.graphApi.port }}
+              protocol: TCP
+          env:
+            - name: GRAPH_API_HOST
+              value: "0.0.0.0"
+            - name: GRAPH_API_PORT
+              value: {{ .Values.graphApi.port | quote }}
+            - name: GRAPH_API_NO_BROWSER
+              value: "1"
+            - name: JUMP_CANNON_ASSETS_DIR
+              value: /assets
+            - name: VAULT_ROOT
+              value: {{ .Values.vault.mountPath | quote }}
+            - name: JUMP_CANNON_COMPUTE_URL
+              value: {{ .Values.graphApi.computeUrl | quote }}
+            - name: RUST_LOG
+              value: {{ .Values.graphApi.rustLog | quote }}
+          readinessProbe:
+            httpGet:
+              path: /
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 2
+          livenessProbe:
+            httpGet:
+              path: /
+              port: http
+            initialDelaySeconds: 30
+            periodSeconds: 20
+            timeoutSeconds: 2
+          resources:
+            {{- toYaml .Values.graphApi.resources | nindent 12 }}
+          securityContext:
+            {{- toYaml .Values.containerSecurityContext | nindent 12 }}
+          volumeMounts:
+            - name: vault
+              mountPath: {{ .Values.vault.mountPath }}
+      volumes:
+        - name: vault
+          {{- if .Values.vault.persistence.enabled }}
+          persistentVolumeClaim:
+            claimName: {{ include "jump-cannon.fullname" . }}-vault
+          {{- else }}
+          emptyDir: {}
+          {{- end }}
+        {{- if .Values.vault.seed.enabled }}
+        - name: vault-seed
+          configMap:
+            name: {{ include "jump-cannon.fullname" . }}-vault-seed
+        {{- end }}

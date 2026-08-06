@@ -1,0 +1,13 @@
+{{- if .Values.vault.seed.enabled }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "jump-cannon.fullname" . }}-vault-seed
+  labels:
+    {{- include "jump-cannon.labels" . | nindent 4 }}
+data:
+  {{- range $name, $body := .Values.vault.seed.files }}
+  {{ $name | quote }}: |-
+{{ $body | nindent 4 }}
+  {{- end }}
+{{- end }}
