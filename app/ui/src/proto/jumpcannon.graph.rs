@@ -14,6 +14,10 @@ pub struct Init {
     /// Future: clients pass color preferences; server returns derived palette.
     #[prost(float, repeated, tag = "5")]
     pub palette: ::prost::alloc::vec::Vec<f32>,
+    /// Process-local graph snapshot identity. All bulk buffers and remote layout
+    /// frames for this bootstrap must carry the same non-zero value.
+    #[prost(uint64, tag = "6")]
+    pub graph_revision: u64,
 }
 /// Per-node metadata. Returned by /node/:id (sparse, on-demand).
 #[derive(Clone, PartialEq, ::prost::Message)]

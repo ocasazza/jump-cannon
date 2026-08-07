@@ -7,6 +7,16 @@ use graph_layouts::geometric::{ClassLens, CoordinationLens, EdgeLengthLens, Lens
 use graph_metrics::{compute_edge_strength, EdgeStrengthKind};
 use std::collections::BTreeMap;
 
+/// Logarithmic degree bands keep hubs distinct without allocating one class
+/// per exact degree: 0, 1, 2-3, 4-7, 8-15, ...
+fn degree_bucket(degree: usize) -> u32 {
+    if degree == 0 {
+        0
+    } else {
+        degree.ilog2() + 1
+    }
+}
+
 pub fn resolve(
     lens: &LensConfig,
     snapshot: &GraphSnapshot,
@@ -28,7 +38,7 @@ pub fn resolve(
         // Class
         let class_val = match &lens.class {
             ClassLens::Uniform => 0,
-            ClassLens::DegreeBuckets => node.metrics.community as u32,
+            ClassLens::DegreeBuckets => degree_bucket(node.metrics.degree),
             ClassLens::Louvain => node.metrics.community as u32,
             ClassLens::Field(f) => {
                 let val = node
@@ -80,10 +90,17 @@ pub fn resolve(
         node_mass.push(mass_val);
     }
 
+    // Table dimensions must cover the actual emitted class ids. Counting only
+    // categorical-encoder entries made structural classes (Louvain, degree,
+    // tag) fall outside the table and therefore resolve to neutral forces.
+    let num_classes = node_class
+        .iter()
+        .copied()
+        .max()
+        .map_or(1, |max_class| max_class as usize + 1);
     attrs.node_class = Some(node_class);
     settings.class_source = ClassSource::Injected;
 
-    let num_classes = class_encoder.map.len().max(1);
     settings.class_radius = vec![lens.exclusion_strength / 10.0; num_classes];
     settings.class_affinity_dim = num_classes as u32;
     settings.class_affinity = vec![lens.affinity_strength; num_classes * num_classes];
@@ -262,6 +279,7 @@ mod tests {
         );
 
         let snap = GraphSnapshot {
+            revision: 1,
             graph,
             id_to_idx: [("node1".to_string(), 0)].into_iter().collect(),
             idx_to_id: vec!["node1".to_string()],
@@ -318,6 +336,7 @@ mod tests {
             .map(|(i, id)| (id.clone(), i as u32))
             .collect();
         let snap = GraphSnapshot {
+            revision: 1,
             graph,
             id_to_idx,
             idx_to_id,
@@ -345,6 +364,82 @@ mod tests {
         assert_eq!(settings.edge_length_source, EdgeLengthSource::Injected);
     }
 
+    fn class_snapshot(values: &[(usize, usize, bool)]) -> GraphSnapshot {
+        let mut graph = VaultGraph::default();
+        let mut idx_to_id = Vec::new();
+        for (i, &(degree, community, tagged)) in values.iter().enumerate() {
+            let id = format!("n{i}");
+            idx_to_id.push(id.clone());
+            graph.nodes.insert(
+                id.clone(),
+                VaultNode {
+                    id,
+                    metrics: NodeMetrics {
+                        degree,
+                        community,
+                        ..Default::default()
+                    },
+                    meta: vault_data::NodeMeta {
+                        tags: tagged.then(|| "selected".to_string()).into_iter().collect(),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            );
+        }
+        let id_to_idx = idx_to_id
+            .iter()
+            .enumerate()
+            .map(|(i, id)| (id.clone(), i as u32))
+            .collect();
+        GraphSnapshot {
+            revision: 1,
+            graph,
+            id_to_idx,
+            idx_to_id,
+            binary_cache: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn degree_buckets_use_degree_and_size_the_class_tables() {
+        let snap = class_snapshot(&[
+            (0, 99, false),
+            (1, 99, false),
+            (2, 99, false),
+            (3, 99, false),
+            (4, 99, false),
+            (8, 99, false),
+        ]);
+        let mut lens = LensConfig::default();
+        lens.class = ClassLens::DegreeBuckets;
+
+        let (settings, attrs) = resolve(&lens, &snap);
+        assert_eq!(attrs.node_class, Some(vec![0, 1, 2, 2, 3, 4]));
+        assert_eq!(settings.class_affinity_dim, 5);
+        assert_eq!(settings.class_radius.len(), 5);
+        assert_eq!(settings.class_affinity.len(), 25);
+    }
+
+    #[test]
+    fn structural_class_tables_cover_louvain_and_tag_ids() {
+        let snap = class_snapshot(&[(1, 0, false), (1, 3, true)]);
+
+        let mut louvain = LensConfig::default();
+        louvain.class = ClassLens::Louvain;
+        let (settings, attrs) = resolve(&louvain, &snap);
+        assert_eq!(attrs.node_class, Some(vec![0, 3]));
+        assert_eq!(settings.class_affinity_dim, 4);
+        assert_eq!(settings.class_affinity.len(), 16);
+
+        let mut tag = LensConfig::default();
+        tag.class = ClassLens::Tag("selected".into());
+        let (settings, attrs) = resolve(&tag, &snap);
+        assert_eq!(attrs.node_class, Some(vec![0, 1]));
+        assert_eq!(settings.class_affinity_dim, 2);
+        assert_eq!(settings.class_affinity.len(), 4);
+    }
+
     fn one_node_snapshot() -> GraphSnapshot {
         let mut graph = VaultGraph::default();
         graph.nodes.insert(
@@ -355,6 +450,7 @@ mod tests {
             },
         );
         GraphSnapshot {
+            revision: 1,
             graph,
             id_to_idx: [("n".to_string(), 0)].into_iter().collect(),
             idx_to_id: vec!["n".to_string()],

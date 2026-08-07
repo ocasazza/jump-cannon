@@ -42,12 +42,18 @@ service Compute {
 message LoadGraphRequest {
   bytes csr       = 1;
   bytes positions = 2;
+  uint64 graph_revision = 3; // 0 = legacy/unknown
+  // Required for a same-revision placement update. Ignored when the graph
+  // revision changes because that starts a fresh selection-generation scope.
+  uint64 expected_selection_generation = 4;
 }
 
 message LoadGraphResponse {
   bool   ok      = 1;
   uint32 n_nodes = 2;
   string error   = 3;
+  uint64 graph_revision = 4;
+  uint64 selection_generation = 5;
 }
 
 message SubscribeRequest {
@@ -61,6 +67,11 @@ message SubscribeRequest {
   // serde settings struct per engine stays the single source of truth.
   google.protobuf.Struct params = 3;
   GraphAttributes attributes = 4;  // NEW; absent ⇒ structural/standalone path
+  // Expected active graph. A non-zero mismatch is rejected before engine init.
+  uint64 graph_revision = 5;
+  // Monotonic singleton control-plane version. Reusing the current value is
+  // idempotent and must not reinitialize the active engine. 0 = legacy.
+  uint64 selection_generation = 6;
 }
 
 // Injected per-node / per-edge geometric attributes (parallel to the backend
@@ -79,6 +90,8 @@ message PositionDelta {
   // raw little-endian f32 [x0,y0,z0,x1,y1,z1,...]
   bytes positions = 2;
   uint32 n_nodes = 3;
+  uint64 graph_revision = 4;
+  uint64 selection_generation = 5;
 }
 
 // Boundary-position exchange payload for the distributed BSP model
@@ -115,6 +128,11 @@ message HealthResponse {
   bool ok = 1;
   uint32 n_nodes = 2;
   uint64 frame = 3;
+  string requested_layout_id = 4;
+  string effective_layout_id = 5;
+  string fallback_reason = 6; // empty when no fallback occurred
+  uint64 graph_revision = 7;
+  uint64 selection_generation = 8;
 }
 
 // Knobs for the §4 coarsening pass. All fields optional; zero/empty means

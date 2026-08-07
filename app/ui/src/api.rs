@@ -119,7 +119,82 @@ fn get(path: &str) -> gloo_net::http::RequestBuilder {
 }
 
 pub(crate) async fn get_json<T: serde::de::DeserializeOwned>(path: &str) -> ApiResult<T> {
-    get(path).send().await.map_err(err)?.json().await.map_err(err)
+    get(path)
+        .send()
+        .await
+        .map_err(err)?
+        .json()
+        .await
+        .map_err(err)
+}
+
+pub(crate) async fn put_json<I: Serialize, O: serde::de::DeserializeOwned>(
+    path: &str,
+    body: &I,
+) -> ApiResult<O> {
+    let resp = Request::put(&url(path))
+        .json(body)
+        .map_err(err)?
+        .send()
+        .await
+        .map_err(err)?;
+    if !resp.ok() {
+        return Err(format!("{} -> HTTP {}", path, resp.status()));
+    }
+    resp.json().await.map_err(err)
+}
+
+pub(crate) async fn put_raw_json<O: serde::de::DeserializeOwned>(
+    path: &str,
+    body: Vec<u8>,
+) -> ApiResult<O> {
+    let resp = Request::put(&url(path))
+        .header("Content-Type", "application/octet-stream")
+        .body(body)
+        .map_err(err)?
+        .send()
+        .await
+        .map_err(err)?;
+    if !resp.ok() {
+        return Err(format!("{} -> HTTP {}", path, resp.status()));
+    }
+    resp.json().await.map_err(err)
+}
+
+/// A graph-derived response paired with the topology revision advertised by
+/// graph-api. Revision `0` means an older server did not provide the header.
+pub(crate) struct Revisioned<T> {
+    pub(crate) revision: u64,
+    pub(crate) value: T,
+}
+
+fn graph_revision(resp: &gloo_net::http::Response) -> u64 {
+    resp.headers()
+        .get("X-Graph-Revision")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0)
+}
+
+async fn get_revisioned_json<T: serde::de::DeserializeOwned>(
+    path: &str,
+) -> ApiResult<Revisioned<T>> {
+    let resp = get(path).send().await.map_err(err)?;
+    if !resp.ok() {
+        return Err(format!("{} -> HTTP {}", path, resp.status()));
+    }
+    let revision = graph_revision(&resp);
+    let value = resp.json().await.map_err(err)?;
+    Ok(Revisioned { revision, value })
+}
+
+async fn get_revisioned_bytes(path: &str) -> ApiResult<Revisioned<Vec<u8>>> {
+    let resp = get(path).send().await.map_err(err)?;
+    if !resp.ok() {
+        return Err(format!("{} -> HTTP {}", path, resp.status()));
+    }
+    let revision = graph_revision(&resp);
+    let value = resp.binary().await.map_err(err)?;
+    Ok(Revisioned { revision, value })
 }
 
 pub(crate) async fn get_bytes(path: &str) -> ApiResult<Vec<u8>> {
@@ -135,12 +210,29 @@ pub(crate) async fn get_proto<T: Message + Default>(path: &str) -> ApiResult<T> 
     T::decode(bytes.as_slice()).map_err(err)
 }
 
+pub(crate) async fn get_revisioned_proto<T: Message + Default>(
+    path: &str,
+) -> ApiResult<Revisioned<T>> {
+    let response = get_revisioned_bytes(path).await?;
+    let value = T::decode(response.value.as_slice()).map_err(err)?;
+    Ok(Revisioned {
+        revision: response.revision,
+        value,
+    })
+}
+
 fn f32s(bytes: &[u8]) -> Vec<f32> {
-    bytes.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()
+    bytes
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect()
 }
 
 fn u32s(bytes: &[u8]) -> Vec<u32> {
-    bytes.chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()
+    bytes
+        .chunks_exact(4)
+        .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect()
 }
 
 // --- graph data ---------------------------------------------------------------
@@ -151,8 +243,13 @@ pub async fn init() -> ApiResult<proto::Init> {
 }
 
 /// `/graph/ids` — node ids in the same order as the binary buffers.
+#[allow(dead_code)] // revision-aware bootstrap uses revisioned_ids
 pub async fn ids() -> ApiResult<Vec<String>> {
     get_json("/graph/ids").await
+}
+
+pub(crate) async fn revisioned_ids() -> ApiResult<Revisioned<Vec<String>>> {
+    get_revisioned_json("/graph/ids").await
 }
 
 /// `/graph/positions` — flat [x0, y0, x1, y1, …] f32 buffer.
@@ -167,8 +264,17 @@ pub async fn positions() -> ApiResult<Vec<f32>> {
 }
 
 /// `/graph/edges` — flat [src, tgt, …] u32 buffer of dense node indices.
+#[allow(dead_code)] // revision-aware bootstrap uses revisioned_edges
 pub async fn edges() -> ApiResult<Vec<u32>> {
     Ok(u32s(&get_bytes("/graph/edges").await?))
+}
+
+pub(crate) async fn revisioned_edges() -> ApiResult<Revisioned<Vec<u32>>> {
+    let r = get_revisioned_bytes("/graph/edges").await?;
+    Ok(Revisioned {
+        revision: r.revision,
+        value: u32s(&r.value),
+    })
 }
 
 /// `/graph/metrics/:name` — per-node f32 buffer (degree, pagerank, community, …).
@@ -176,15 +282,33 @@ pub async fn metric(name: &str) -> ApiResult<Vec<f32>> {
     Ok(f32s(&get_bytes(&format!("/graph/metrics/{name}")).await?))
 }
 
+pub(crate) async fn revisioned_metric(name: &str) -> ApiResult<Revisioned<Vec<f32>>> {
+    let r = get_revisioned_bytes(&format!("/graph/metrics/{name}")).await?;
+    Ok(Revisioned {
+        revision: r.revision,
+        value: f32s(&r.value),
+    })
+}
+
 /// `/node/*id` — full per-node metadata + markdown body.
 pub async fn node_meta(id: &str) -> ApiResult<proto::NodeMeta> {
     get_proto(&format!("/node/{}", encode_id(id))).await
 }
 
+pub(crate) async fn revisioned_node_meta(
+    id: &str,
+) -> ApiResult<Revisioned<proto::NodeMeta>> {
+    get_revisioned_proto(&format!("/node/{}", encode_id(id))).await
+}
+
 /// `/search?q=…` — BM25 full-text search (vault-search) with title fallback.
 #[allow(dead_code)] // the node browser uses search_rich; kept for wire parity with the egui client
 pub async fn search(q: &str, limit: u32) -> ApiResult<proto::SearchResults> {
-    get_proto(&format!("/search?q={}&limit={limit}", urlencoding::encode(q))).await
+    get_proto(&format!(
+        "/search?q={}&limit={limit}",
+        urlencoding::encode(q)
+    ))
+    .await
 }
 
 /// One `/search/rich` hit. `snippet` is server-built HTML: the matched body
@@ -208,8 +332,24 @@ pub struct RichResults {
 }
 
 /// `/search/rich?q=…` — full-text search with highlighted body snippets.
+#[allow(dead_code)] // revision-aware node browser uses revisioned_search_rich
 pub async fn search_rich(q: &str, limit: u32) -> ApiResult<RichResults> {
-    get_json(&format!("/search/rich?q={}&limit={limit}", urlencoding::encode(q))).await
+    get_json(&format!(
+        "/search/rich?q={}&limit={limit}",
+        urlencoding::encode(q)
+    ))
+    .await
+}
+
+pub(crate) async fn revisioned_search_rich(
+    q: &str,
+    limit: u32,
+) -> ApiResult<Revisioned<RichResults>> {
+    get_revisioned_json(&format!(
+        "/search/rich?q={}&limit={limit}",
+        urlencoding::encode(q)
+    ))
+    .await
 }
 
 // --- vault writes ---------------------------------------------------------------
@@ -250,12 +390,31 @@ pub enum LogLevel {
 #[derive(Clone, Debug, Deserialize, PartialEq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ProgressEvent {
-    Start { id: u64, group: String, label: String },
-    SetProgress { id: u64, progress: f32 },
-    UpdateLabel { id: u64, label: String },
-    Finish { id: u64 },
-    Fail { id: u64, reason: String },
-    Log { level: LogLevel, group: String, message: String },
+    Start {
+        id: u64,
+        group: String,
+        label: String,
+    },
+    SetProgress {
+        id: u64,
+        progress: f32,
+    },
+    UpdateLabel {
+        id: u64,
+        label: String,
+    },
+    Finish {
+        id: u64,
+    },
+    Fail {
+        id: u64,
+        reason: String,
+    },
+    Log {
+        level: LogLevel,
+        group: String,
+        message: String,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq)]
@@ -270,11 +429,23 @@ pub struct ProgressResponse {
     pub next_seq: u64,
     pub server_ms: u64,
     pub events: Vec<Stamped>,
+    /// Active graph identity advertised out-of-band by graph-api. A zero
+    /// value means an older server omitted the header.
+    #[serde(default)]
+    pub graph_revision: u64,
 }
 
 /// `GET /progress?since=<seq>` — tail of the server-side progress event log.
 pub async fn progress(since: u64) -> ApiResult<ProgressResponse> {
-    get_json(&format!("/progress?since={since}")).await
+    let path = format!("/progress?since={since}");
+    let resp = get(&path).send().await.map_err(err)?;
+    if !resp.ok() {
+        return Err(format!("{} -> HTTP {}", path, resp.status()));
+    }
+    let revision = graph_revision(&resp);
+    let mut value: ProgressResponse = resp.json().await.map_err(err)?;
+    value.graph_revision = revision;
+    Ok(value)
 }
 
 #[allow(dead_code)] // not surfaced in a panel yet — /configs is dev-only on the server

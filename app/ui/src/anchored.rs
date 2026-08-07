@@ -277,6 +277,7 @@ struct Preview {
 }
 
 static PREVIEW: GlobalSignal<Preview> = Signal::global(Preview::default);
+static META_SESSION: GlobalSignal<u64> = Signal::global(|| 0);
 
 /// Per-card projected placement, written by the driver loop.
 /// `(x, y)` is the EMA-smoothed projection (panel placement);
@@ -330,6 +331,22 @@ struct Timing {
 
 thread_local! {
     static TIMING: RefCell<Timing> = RefCell::new(Timing::default());
+}
+
+/// Clear all node-index and metadata-derived overlay state on graph
+/// replacement. The session counter also makes late `/node/:id` responses
+/// harmless when the replacement happens while a preview request is in flight.
+pub(crate) fn reset_for_graph_session() {
+    let next_session = META_SESSION.peek().wrapping_add(1);
+    *META_SESSION.write() = next_session;
+    *HOVER_IDX.write() = None;
+    *STICKY_IDX.write() = None;
+    *PROMOTED.write() = None;
+    *PROMOTED_META.write() = None;
+    *PREVIEW.write() = Preview::default();
+    *FRAME.write() = OverlayFrame::default();
+    TIMING.with(|timing| *timing.borrow_mut() = Timing::default());
+    render::set_hover_feedback(None, None);
 }
 
 // --- canvas-event entry points (called from graph_canvas.rs handlers) ----------
@@ -479,14 +496,16 @@ fn kick_preview_fetch(id: String) {
         return;
     }
     TIMING.with(|t| t.borrow_mut().preview_fetch_for = Some(id.clone()));
+    let session = *META_SESSION.peek();
     spawn(async move {
         match crate::api::node_meta(&id).await {
-            Ok(m) => {
+            Ok(m) if *META_SESSION.peek() == session => {
                 // Render gates on meta.id matching the hovered node's id,
                 // so a stale arrival for a previous node is harmless — it
                 // just refreshes the cache.
                 PREVIEW.write().meta = Some(m);
             }
+            Ok(_) => {}
             Err(e) => tracing::warn!("[anchored] preview fetch {id}: {e}"),
         }
         TIMING.with(|t| {
@@ -500,9 +519,10 @@ fn kick_preview_fetch(id: String) {
 
 fn kick_promoted_fetch(id: String) {
     TIMING.with(|t| t.borrow_mut().promoted_fetch_for = Some(id.clone()));
+    let session = *META_SESSION.peek();
     spawn(async move {
         match crate::api::node_meta(&id).await {
-            Ok(m) => {
+            Ok(m) if *META_SESSION.peek() == session => {
                 // Accept only if this fetch is still the live one (the
                 // user may have clicked another node mid-flight).
                 let current = TIMING.with(|t| t.borrow().promoted_fetch_for.clone());
@@ -510,6 +530,7 @@ fn kick_promoted_fetch(id: String) {
                     *PROMOTED_META.write() = Some(m);
                 }
             }
+            Ok(_) => {}
             Err(e) => tracing::warn!("[anchored] promoted fetch {id}: {e}"),
         }
     });

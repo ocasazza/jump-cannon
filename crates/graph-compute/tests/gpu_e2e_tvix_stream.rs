@@ -167,6 +167,7 @@ async fn run_engine(engine_id: &str, graph: CsrGraph) -> EngineReport {
     let mut stream = client
         .subscribe(SubscribeRequest {
             graph_id: "gpu-e2e".into(),
+            graph_revision: 0,
             layout_id: engine_id.into(),
             ..Default::default()
         })

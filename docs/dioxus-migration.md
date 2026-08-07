@@ -48,6 +48,12 @@ Source: `ui/layout/registry.rs` + `ui/layout/algorithms/*`, panel:
   `JUMP_CANNON_COMPUTE_LAYOUT_ID`, switchable live.
 - Per-engine parameter UIs, run/pause/reset, engine grouping identical to the
   egui picker.
+- Graph sessions are revisioned end to end: bulk HTTP reads, layout selection,
+  initial placement, worker subscriptions, and browser frames must agree on a
+  graph revision plus selection generation. Local generated graphs are marked
+  client-only, so server metadata/search/compute controls cannot silently act
+  on the previous vault. Panel actions (Pause/Resume and Fit) live in Panel
+  Kit's shared header-action slot instead of overlapping the graph canvas.
 
 ## Phase 3 — settings panels ✅
 
@@ -101,6 +107,12 @@ Remaining `PARITY GAP` annotations (grep `app/ui/src` for the full list):
 new-graph-tab (single Graph panel by design), client-side degree/wcc buffers
 for generated graphs, per-stage perf overlay, syntect source highlighting,
 edge-hover width from Style state, soft-tether card drag offsets.
+
+Architecture follow-up (2026-08-06): proxied search hits are filtered against
+the captured graph snapshot, but same-id snippets can briefly reflect the
+previous Tantivy generation while watcher refresh is in flight. Add an
+explicit search-index revision if strict snippet freshness becomes a product
+requirement.
 
 ## Phase 5 — retirement ✅
 

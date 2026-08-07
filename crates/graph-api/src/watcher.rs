@@ -244,12 +244,15 @@ async fn rebuild_snapshot(state: &AppState) {
     };
     progress.finish(snap_id);
 
+    // Publish the API snapshot and rebind/load the worker as one graph-control
+    // transaction. The lock order is state graph_control -> broker control.
+    let _graph_control = state.inner.graph_control.lock().await;
     state.inner.snapshot.store(snapshot);
     progress.finish(reload_id);
 
     // Keep the compute worker simulating THIS graph (no-op when the broker
     // is disabled or disconnected).
-    crate::server::push_graph_to_worker(state).await;
+    crate::server::push_graph_to_worker_locked(state).await;
 }
 
 /// Full respawn of the vault-search subprocess with `--rebuild`. Used as

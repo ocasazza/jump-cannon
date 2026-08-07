@@ -32,6 +32,94 @@ use serde::{Deserialize, Serialize};
 
 use graph_canvas::GraphData;
 
+/// Provenance of the graph currently mounted in the browser.  This is
+/// deliberately separate from where an expression was evaluated: a graph
+/// returned by `POST /generate` is still browser-owned until graph-api hosts
+/// it as an active snapshot.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum GraphOrigin {
+    Server { endpoint: String },
+    ClientGenerated { evaluator: String },
+}
+
+/// Identity for browser state derived from one graph load.  `epoch` changes
+/// on every replacement (including same-server reloads); `graph_revision` is
+/// the server's topology identity and is absent for browser-only graphs.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct GraphSession {
+    pub(crate) epoch: u64,
+    pub(crate) graph_revision: Option<u64>,
+    pub(crate) origin: GraphOrigin,
+}
+
+impl GraphSession {
+    fn loading_server(endpoint: String) -> Self {
+        Self {
+            epoch: 0,
+            graph_revision: None,
+            origin: GraphOrigin::Server { endpoint },
+        }
+    }
+
+    pub(crate) fn is_server_backed(&self) -> bool {
+        matches!(self.origin, GraphOrigin::Server { .. })
+    }
+
+    pub(crate) fn short_label(&self) -> String {
+        match &self.origin {
+            GraphOrigin::Server { .. } => self
+                .graph_revision
+                .filter(|r| *r != 0)
+                .map(|r| format!("server graph r{r}"))
+                .unwrap_or_else(|| "server graph".to_string()),
+            GraphOrigin::ClientGenerated { evaluator } => {
+                format!("generated locally ({evaluator}; client-only)")
+            }
+        }
+    }
+
+    fn replaced_by_server_revision(&self, advertised_revision: u64) -> bool {
+        self.is_server_backed()
+            && advertised_revision != 0
+            && self
+                .graph_revision
+                .is_some_and(|revision| revision != advertised_revision)
+    }
+}
+
+#[cfg(test)]
+mod graph_session_tests {
+    use super::{GraphOrigin, GraphSession};
+
+    #[test]
+    fn progress_revision_only_invalidates_a_loaded_server_graph() {
+        let server = GraphSession {
+            epoch: 3,
+            graph_revision: Some(17),
+            origin: GraphOrigin::Server {
+                endpoint: "http://graph-api".into(),
+            },
+        };
+        assert!(!server.replaced_by_server_revision(0));
+        assert!(!server.replaced_by_server_revision(17));
+        assert!(server.replaced_by_server_revision(18));
+
+        let loading = GraphSession {
+            graph_revision: None,
+            ..server.clone()
+        };
+        assert!(!loading.replaced_by_server_revision(18));
+
+        let generated = GraphSession {
+            origin: GraphOrigin::ClientGenerated {
+                evaluator: "browser".into(),
+            },
+            ..server
+        };
+        assert!(!generated.replaced_by_server_revision(18));
+    }
+}
+
 fn main() {
     // WARN, not the tracing-wasm default (TRACE): at TRACE every Dioxus VDOM
     // diff and signal write hits console.log — tens of thousands of calls per
@@ -189,7 +277,13 @@ fn fold_progress(tasks: &mut Vec<TaskRow>, logs: &mut Vec<LogRow>, ev: api::Prog
     use api::ProgressEvent as E;
     match ev {
         E::Start { id, group, label } => {
-            tasks.push(TaskRow { id, group, label, progress: None, state: 0 });
+            tasks.push(TaskRow {
+                id,
+                group,
+                label,
+                progress: None,
+                state: 0,
+            });
         }
         E::SetProgress { id, progress } => {
             if let Some(t) = tasks.iter_mut().find(|t| t.id == id) {
@@ -213,8 +307,16 @@ fn fold_progress(tasks: &mut Vec<TaskRow>, logs: &mut Vec<LogRow>, ev: api::Prog
                 t.label = format!("{} — {}", t.label, reason);
             }
         }
-        E::Log { level, group, message } => {
-            logs.push(LogRow { level, group, message });
+        E::Log {
+            level,
+            group,
+            message,
+        } => {
+            logs.push(LogRow {
+                level,
+                group,
+                message,
+            });
         }
     }
     // Keep the panel bounded: drop the oldest settled tasks + oldest logs.
@@ -238,6 +340,7 @@ fn fold_progress(tasks: &mut Vec<TaskRow>, logs: &mut Vec<LogRow>, ev: api::Prog
 #[derive(Clone, Copy)]
 pub(crate) struct Ctx {
     pub(crate) graph: Signal<Option<GraphData>>,
+    pub(crate) graph_session: Signal<GraphSession>,
     pub(crate) load_error: Signal<Option<String>>,
     pub(crate) selected: Signal<Option<String>>,
     pub(crate) meta: Signal<Option<proto::NodeMeta>>,
@@ -253,12 +356,106 @@ pub(crate) struct Ctx {
     pub(crate) logs: Signal<Vec<LogRow>>,
 }
 
-async fn reload_graph(mut ctx: Ctx) {
+/// Clear every value whose node indices or server ownership came from the old
+/// graph. Persisted user preferences remain; caches and live masks do not.
+fn invalidate_graph_derived_state(mut ctx: Ctx) {
+    ctx.selected.set(None);
+    ctx.meta.set(None);
+    ctx.meta_busy.set(false);
+    ctx.draft.set(String::new());
+    ctx.save_msg.set(String::new());
+    ctx.query.set(String::new());
+    ctx.results.set(Vec::new());
+    ctx.result_total.set(0);
+    ctx.searching.set(false);
+    panels::nodes::reset_for_graph_session();
+    panels::filter::reset_for_graph_session();
+    panels::inspector::reset_for_graph_session();
+    panels::style::reset_for_graph_session(None);
+    panels::timeline::reset_for_graph_session();
+    anchored::reset_for_graph_session();
+    palette::reset_for_graph_session();
+    render::set_selected_node(None);
+    render::set_search_highlights(None);
+}
+
+fn begin_server_graph_load(mut ctx: Ctx) -> u64 {
+    let endpoint = api::server_url();
+    let connection_changed = match &ctx.graph_session.peek().origin {
+        GraphOrigin::Server { endpoint: old } => old != &endpoint,
+        // A client-only session no longer retains the endpoint its cached
+        // documents came from. Clear them before reattaching to any server;
+        // preserving a dirty buffer under a same-named node is less safe.
+        GraphOrigin::ClientGenerated { .. } => true,
+    };
+    let epoch = ctx.graph_session.peek().epoch.wrapping_add(1);
+    invalidate_graph_derived_state(ctx);
+    if connection_changed {
+        panels::document::reset_for_server_change();
+        ctx.tasks.set(Vec::new());
+        ctx.logs.set(Vec::new());
+    }
+    panels::layout::set_expected_graph_revision(None);
     ctx.graph.set(None);
     ctx.load_error.set(None);
-    match graph_canvas::load().await {
-        Ok(g) => ctx.graph.set(Some(g)),
-        Err(e) => ctx.load_error.set(Some(e)),
+    ctx.graph_session.set(GraphSession {
+        epoch,
+        graph_revision: None,
+        origin: GraphOrigin::Server { endpoint },
+    });
+    epoch
+}
+
+fn commit_server_graph(mut ctx: Ctx, epoch: u64, graph: GraphData) -> bool {
+    if ctx.graph_session.peek().epoch != epoch {
+        return false;
+    }
+    let revision = graph.graph_revision.filter(|r| *r != 0);
+    ctx.graph_session.write().graph_revision = revision;
+    panels::layout::set_expected_graph_revision(revision);
+    panels::style::reset_for_graph_session(revision);
+    ctx.graph.set(Some(graph));
+    true
+}
+
+/// Replace the canvas with a graph which graph-api does not host. Server-only
+/// panels use the session origin to avoid silently querying the old vault.
+pub(crate) fn replace_with_client_graph(
+    mut ctx: Ctx,
+    graph: GraphData,
+    evaluator: impl Into<String>,
+) {
+    let epoch = ctx.graph_session.peek().epoch.wrapping_add(1);
+    invalidate_graph_derived_state(ctx);
+    panels::layout::set_expected_graph_revision(None);
+    ctx.graph_session.set(GraphSession {
+        epoch,
+        graph_revision: None,
+        origin: GraphOrigin::ClientGenerated {
+            evaluator: evaluator.into(),
+        },
+    });
+    let scene = graph.scene.clone();
+    ctx.graph.set(Some(graph));
+    render::mount_canvas(scene);
+}
+
+async fn reload_graph(mut ctx: Ctx) {
+    let epoch = begin_server_graph_load(ctx);
+    loop {
+        match graph_canvas::load().await {
+            Ok(g) => {
+                if commit_server_graph(ctx, epoch, g) {
+                    ctx.load_error.set(None);
+                }
+                break;
+            }
+            Err(e) if ctx.graph_session.peek().epoch == epoch => {
+                ctx.load_error.set(Some(e));
+                gloo_timers::future::TimeoutFuture::new(1500).await;
+            }
+            Err(_) => break,
+        }
     }
 }
 
@@ -300,6 +497,7 @@ fn App() -> Element {
 
     let ctx = Ctx {
         graph: use_signal(|| None),
+        graph_session: use_signal(|| GraphSession::loading_server(api::server_url())),
         load_error: use_signal(|| None),
         selected: use_signal(|| None),
         meta: use_signal(|| None),
@@ -319,22 +517,8 @@ fn App() -> Element {
     // that's still indexing (or starting up) self-heals instead of leaving
     // the canvas permanently empty.
     {
-        let mut graph = ctx.graph;
-        let mut load_error = ctx.load_error;
         use_future(move || async move {
-            loop {
-                match graph_canvas::load().await {
-                    Ok(g) => {
-                        graph.set(Some(g));
-                        load_error.set(None);
-                        break;
-                    }
-                    Err(e) => {
-                        load_error.set(Some(e));
-                        gloo_timers::future::TimeoutFuture::new(1500).await;
-                    }
-                }
-            }
+            reload_graph(ctx).await;
         });
     }
 
@@ -345,16 +529,48 @@ fn App() -> Element {
         let mut meta_busy = ctx.meta_busy;
         let mut draft = ctx.draft;
         let mut save_msg = ctx.save_msg;
+        let graph_session = ctx.graph_session;
         use_effect(move || {
             let sel = selected.read().clone();
+            let session = graph_session.read().clone();
+            if !session.is_server_backed() {
+                meta.set(None);
+                meta_busy.set(false);
+                draft.set(String::new());
+                save_msg.set(
+                    "Client-only graph: node metadata and document editing are unavailable.".into(),
+                );
+                return;
+            }
             if let Some(id) = sel {
+                let epoch = session.epoch;
                 meta_busy.set(true);
                 save_msg.set(String::new());
                 spawn(async move {
-                    match api::node_meta(&id).await {
-                        Ok(m) => {
+                    let fetched = api::revisioned_node_meta(&id).await;
+                    // A graph replacement or a newer selection invalidates
+                    // this response even when the node id happens to match.
+                    if graph_session.peek().epoch != epoch
+                        || selected.peek().as_deref() != Some(id.as_str())
+                    {
+                        return;
+                    }
+                    match fetched {
+                        Ok(response)
+                            if response.revision == 0
+                                || session.graph_revision == Some(response.revision) =>
+                        {
+                            let m = response.value;
                             draft.set(m.body.clone());
                             meta.set(Some(m));
+                        }
+                        Ok(response) => {
+                            meta.set(None);
+                            save_msg.set(format!(
+                                "graph changed while loading node metadata (r{} → r{})",
+                                session.graph_revision.unwrap_or(0),
+                                response.revision
+                            ));
                         }
                         Err(e) => {
                             meta.set(None);
@@ -363,6 +579,11 @@ fn App() -> Element {
                     }
                     meta_busy.set(false);
                 });
+            } else {
+                meta.set(None);
+                meta_busy.set(false);
+                draft.set(String::new());
+                save_msg.set(String::new());
             }
         });
     }
@@ -376,6 +597,17 @@ fn App() -> Element {
             loop {
                 if let Ok(resp) = api::progress(since).await {
                     since = resp.next_seq;
+                    let session = ctx.graph_session.peek().clone();
+                    let server_replaced_graph =
+                        session.replaced_by_server_revision(resp.graph_revision);
+                    if server_replaced_graph {
+                        // `/progress` is the global, always-mounted poller, so
+                        // it also acts as the graph-session invalidation feed.
+                        // Reload before any panel can continue applying dense
+                        // metrics/field indices from the replacement snapshot
+                        // to the old renderer buffers.
+                        reload_graph(ctx).await;
+                    }
                     if !resp.events.is_empty() {
                         let mut t = tasks.read().clone();
                         let mut l = logs.read().clone();
@@ -410,14 +642,18 @@ fn App() -> Element {
             let g = graph.read();
             let res = results.read();
             if let Some(g) = g.as_ref() {
-                let hl: HashSet<u32> =
-                    res.iter().filter_map(|id| g.id_to_idx.get(id)).copied().collect();
+                let hl: HashSet<u32> = res
+                    .iter()
+                    .filter_map(|id| g.id_to_idx.get(id))
+                    .copied()
+                    .collect();
                 render::set_search_highlights(Some(hl));
             }
         });
     }
 
     let g_now = ctx.graph.read().clone();
+    let session_label = ctx.graph_session.read().short_label();
     // Mirrors the egui tray's right-side running indicator: a live count of
     // in-progress server tasks, grey idle dot otherwise.
     let n_running = ctx.tasks.read().iter().filter(|t| t.state == 0).count();
@@ -475,7 +711,7 @@ fn App() -> Element {
                 // workspace mode + connection state to avoid a third copy.
                 span { class: "hint",
                     if g_now.is_some() {
-                        "{mode_label}"
+                        "{mode_label} · {session_label}"
                     } else {
                         "{mode_label} · connecting…"
                     }
@@ -489,7 +725,10 @@ fn App() -> Element {
                 }
             }
 
-            {ws.render(move |kind, maximized| panel_body(kind, maximized, ctx))}
+            {ws.render_with_header(
+                move |kind, maximized| panel_body(kind, maximized, ctx),
+                move |kind, _maximized| panel_header_actions(kind, ctx),
+            )}
 
             {ws.dock()}
 
@@ -532,11 +771,53 @@ fn panel_body(kind: Panel, _maximized: bool, ctx: Ctx) -> Element {
                 p { "canvas: drag rotate · wheel zoom · WASD pan · QE fwd/back · Shift boost · F fit · click select" }
                 p { "nodes: type → fuzzy files + content matches + filter chips" }
                 hr {}
-                p { "🔴 tiling ⇄ floating" }
+                p { "🔵 tiling ⇄ floating" }
                 p { "🟡 minimize → dock" }
-                p { "🟢 maximize ⇄ restore" }
+                p { "🩷 maximize ⇄ restore" }
             }
         },
+    }
+}
+
+fn panel_header_actions(kind: Panel, ctx: Ctx) -> Element {
+    if kind != Panel::Graph {
+        return rsx! {};
+    }
+    let run_control = panels::layout::header_run_control(
+        ctx.graph_session.peek().is_server_backed(),
+    );
+    let remote = matches!(
+        run_control,
+        Some(panels::layout::HeaderRunControl::RemoteAttached)
+    );
+    let following = *render::SIM_RUNNING.read();
+    let disabled = ctx.graph.read().is_none();
+    rsx! {
+        if run_control.is_some() {
+            panel_kit::PanelHeaderButton {
+                label: if following { "Ⅱ" } else { "▶" },
+                title: if remote {
+                    if following {
+                        "Freeze worker position updates in this view; the remote solver keeps running"
+                    } else {
+                        "Follow live worker position updates again"
+                    }
+                } else if following {
+                    "Pause the local layout solver"
+                } else {
+                    "Resume the local layout solver"
+                },
+                active: !following,
+                disabled,
+                on_press: move |_| render::set_sim_running(!following),
+            }
+        }
+        panel_kit::PanelHeaderButton {
+            label: "Fit",
+            title: "Fit the camera to the graph (F)",
+            disabled,
+            on_press: move |_| render::fit_camera(),
+        }
     }
 }
 
@@ -589,8 +870,14 @@ fn progress_panel(ctx: Ctx) -> Element {
 /// Server connection + graph stats. The URL is persisted in localStorage so
 /// the app can point at a remote graph-api (LAN/Tailscale) like the OCR app.
 fn settings_panel(ctx: Ctx) -> Element {
-    let Ctx { mut server, graph, .. } = ctx;
+    let Ctx {
+        mut server,
+        graph,
+        graph_session,
+        ..
+    } = ctx;
     let g = graph.read().clone();
+    let session = graph_session.read().clone();
     rsx! {
         div { class: "controls",
             div { class: "server",
@@ -614,9 +901,15 @@ fn settings_panel(ctx: Ctx) -> Element {
                     div { class: "kv", span { class: "k", "components" } span { class: "v", "{g.num_wcc}" } }
                 }
             }
+            div { class: "note", "active: {session.short_label()}" }
             div { class: "note",
-                "backend: graph-api (axum) — start with `just dev-up`; "
-                "compute/HPC layers stay behind it and are not part of this app."
+                if session.is_server_backed() {
+                    "Graph metadata/search/documents are served by graph-api. Compute-worker \
+                     layouts are accepted only for this graph revision."
+                } else {
+                    "This generated graph is browser-owned. Metadata/search/documents and \
+                     compute-worker layouts are disabled until it is hosted by graph-api."
+                }
             }
         }
     }

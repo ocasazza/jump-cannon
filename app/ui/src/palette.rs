@@ -1157,11 +1157,20 @@ static PREVIEW_CACHE: GlobalSignal<HashMap<String, proto::NodeMeta>> =
     Signal::global(HashMap::new);
 /// Failed-fetch ids → error message; avoids re-fetching forever.
 static PREVIEW_ERRORS: GlobalSignal<HashMap<String, String>> = Signal::global(HashMap::new);
+static PREVIEW_SESSION: GlobalSignal<u64> = Signal::global(|| 0);
 
 thread_local! {
     /// Ids with a preview fetch in flight — a thread_local (not a signal)
     /// so the render path can arm fetches without writing reactive state.
     static PREVIEW_INFLIGHT: RefCell<HashSet<String>> = RefCell::new(HashSet::new());
+}
+
+pub(crate) fn reset_for_graph_session() {
+    let next_session = PREVIEW_SESSION.peek().wrapping_add(1);
+    *PREVIEW_SESSION.write() = next_session;
+    PREVIEW_CACHE.write().clear();
+    PREVIEW_ERRORS.write().clear();
+    PREVIEW_INFLIGHT.with(|inflight| inflight.borrow_mut().clear());
 }
 
 /// Read-only snapshot of the recorded action instances.
@@ -1593,14 +1602,17 @@ fn request_preview(id: &str) {
         return;
     }
     let id = id.to_string();
+    let session = *PREVIEW_SESSION.peek();
     spawn(async move {
         match api::node_meta(&id).await {
-            Ok(m) => {
+            Ok(m) if *PREVIEW_SESSION.peek() == session => {
                 PREVIEW_CACHE.write().insert(id.clone(), m);
             }
-            Err(e) => {
+            Ok(_) => {}
+            Err(e) if *PREVIEW_SESSION.peek() == session => {
                 PREVIEW_ERRORS.write().insert(id.clone(), e);
             }
+            Err(_) => {}
         }
         PREVIEW_INFLIGHT.with(|s| {
             s.borrow_mut().remove(&id);

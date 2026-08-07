@@ -54,11 +54,18 @@ struct Persisted {
 
 /// Empty-state tag-browser query (egui `AppState::tag_browser_query`).
 static TAG_QUERY: GlobalSignal<String> = Signal::global(|| {
-    LocalStorage::get::<Persisted>(STORE_KEY).map(|p| p.tag_query).unwrap_or_default()
+    LocalStorage::get::<Persisted>(STORE_KEY)
+        .map(|p| p.tag_query)
+        .unwrap_or_default()
 });
 
 fn persist() {
-    let _ = LocalStorage::set(STORE_KEY, &Persisted { tag_query: TAG_QUERY.peek().clone() });
+    let _ = LocalStorage::set(
+        STORE_KEY,
+        &Persisted {
+            tag_query: TAG_QUERY.peek().clone(),
+        },
+    );
 }
 
 // --- community metric --------------------------------------------------------------
@@ -72,17 +79,39 @@ fn persist() {
 static COMMUNITY: GlobalSignal<Option<Vec<f32>>> = Signal::global(|| None);
 static COMMUNITY_STARTED: GlobalSignal<bool> = Signal::global(|| false);
 
-fn ensure_community_metric() {
+fn ensure_community_metric(ctx: Ctx) {
+    if !ctx.graph_session.peek().is_server_backed() {
+        return;
+    }
     if *COMMUNITY_STARTED.peek() {
         return;
     }
     *COMMUNITY_STARTED.write() = true;
+    let expected_revision = ctx.graph_session.peek().graph_revision;
     spawn(async move {
-        match api::metric("community").await {
-            Ok(v) => *COMMUNITY.write() = Some(v),
+        match api::revisioned_metric("community").await {
+            Ok(response)
+                if response.revision == 0
+                    || expected_revision == Some(response.revision) =>
+            {
+                *COMMUNITY.write() = Some(response.value)
+            }
+            Ok(response) => {
+                tracing::warn!(
+                    expected = ?expected_revision,
+                    got = response.revision,
+                    "[inspector] discarded community metric from a replacement graph"
+                );
+                *COMMUNITY_STARTED.write() = false;
+            }
             Err(e) => tracing::warn!("[inspector] community metric fetch failed: {e}"),
         }
     });
+}
+
+pub(crate) fn reset_for_graph_session() {
+    *COMMUNITY_STARTED.write() = false;
+    *COMMUNITY.write() = None;
 }
 
 /// Community swatch for node `idx` — the egui `node_color_for_key` path at
@@ -228,7 +257,12 @@ fn build_pills(items: &[(u32, Option<Dir>)], ids: &[String]) -> (Vec<Pill>, usiz
                 Some(d) => format!("{} — {}", id, d.tip()),
                 None => id.clone(),
             };
-            Pill { id, label, tint: community_tint(i), tip }
+            Pill {
+                id,
+                label,
+                tint: community_tint(i),
+                tip,
+            }
         })
         .collect();
     (pills, truncated)
@@ -365,9 +399,10 @@ fn browse_tags() -> Element {
     let trimmed = query.trim().to_string();
 
     let fi_guard = filter::FIELD_INDEX.read();
-    let tag_buckets = fi_guard.as_ref().and_then(|r| r.as_ref().ok()).and_then(|fi| {
-        fi.by_field.get("tags")
-    });
+    let tag_buckets = fi_guard
+        .as_ref()
+        .and_then(|r| r.as_ref().ok())
+        .and_then(|fi| fi.by_field.get("tags"));
     let Some(tag_buckets) = tag_buckets else {
         let msg = if fi_guard.is_none() {
             "(no node selected — loading tags…)"
@@ -385,8 +420,10 @@ fn browse_tags() -> Element {
     // stable tiebreak. Non-empty query → fuzzy score desc, frequency desc.
     let active_q = filter::QUERY.read();
     let ranked: Vec<(String, usize, bool)> = if trimmed.is_empty() {
-        let mut v: Vec<(&String, usize)> =
-            tag_buckets.iter().map(|(v, idxs)| (v, idxs.len())).collect();
+        let mut v: Vec<(&String, usize)> = tag_buckets
+            .iter()
+            .map(|(v, idxs)| (v, idxs.len()))
+            .collect();
         v.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
         v.truncate(MAX_CHIPS);
         v.into_iter()
@@ -396,9 +433,7 @@ fn browse_tags() -> Element {
         let needle = trimmed.to_lowercase();
         let mut scored: Vec<(i32, &String, usize)> = tag_buckets
             .iter()
-            .filter_map(|(value, idxs)| {
-                fuzzy_score(&needle, value).map(|s| (s, value, idxs.len()))
-            })
+            .filter_map(|(value, idxs)| fuzzy_score(&needle, value).map(|s| (s, value, idxs.len())))
             .collect();
         scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.2.cmp(&a.2)));
         scored.truncate(MAX_CHIPS);
@@ -550,23 +585,40 @@ fn fm_value_cell(value: &Value) -> Element {
         Value::String(s) => rsx! { div { class: "ins-fmtext", "{s}" } },
         Value::Null => rsx! { span { class: "ins-note", "—" } },
         Value::Object(_) | Value::Array(_) => {
-            let pretty =
-                serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string());
+            let pretty = serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string());
             rsx! { pre { class: "ins-fmjson", "{pretty}" } }
         }
         // Scalars are chip-walker territory — unreachable under normal flow.
         Value::Number(n) => rsx! { span { class: "ins-fmtext", "{n}" } },
-        Value::Bool(b) => rsx! { span { class: "ins-fmtext", { if *b { "true" } else { "false" } } } },
+        Value::Bool(b) => {
+            rsx! { span { class: "ins-fmtext", { if *b { "true" } else { "false" } } } }
+        }
     }
 }
 
 // --- panel -----------------------------------------------------------------------------------
 
 pub(crate) fn panel(ctx: Ctx) -> Element {
+    if !ctx.graph_session.read().is_server_backed() {
+        let selected = ctx.selected.read().clone();
+        return rsx! {
+            div { class: "inspector",
+                div { class: "empty",
+                    if let Some(id) = selected {
+                        "{id}\n\nClient-only graph: graph-api does not own this node, so metadata, \
+                         neighbors, tags, and documents are unavailable."
+                    } else {
+                        "Client-only graph: select a node to see its generated id. \
+                         Host the graph in graph-api to inspect metadata."
+                    }
+                }
+            }
+        };
+    }
     // Both fetches are one-shot and shared — opening the inspector alone
     // must arm them (the egui app fetched both at boot).
-    filter::ensure_field_index();
-    ensure_community_metric();
+    filter::ensure_field_index(ctx);
+    ensure_community_metric(ctx);
 
     let sel = ctx.selected.read().clone();
     let body = match sel {
@@ -619,7 +671,10 @@ fn node_view(ctx: Ctx, id: String) -> Element {
                 // Tags / doctype / folder + frontmatter chips — hidden
                 // entirely when the node carries none of them (egui
                 // show_badges early-out).
-                if m.tags.is_empty() && m.folder.is_empty() && m.doctype.is_none() && !has_frontmatter
+                if m.tags.is_empty()
+                    && m.folder.is_empty()
+                    && m.doctype.is_none()
+                    && !has_frontmatter
                 {
                     rsx! {}
                 } else {

@@ -186,6 +186,17 @@
           cargoExtraArgs = "--package test-browser";
         });
 
+        # nixpkgs Chromium is Linux-only. On Darwin the browser wrapper below
+        # accepts CHROME_BIN / CHROMIUM_BIN or discovers an installed app.
+        nixChromiumBin =
+          if pkgs.stdenv.hostPlatform.isLinux
+          then "${pkgs.chromium}/bin/chromium"
+          else "";
+        browserVulkanIcdDir =
+          if pkgs.stdenv.hostPlatform.isLinux
+          then "${pkgs.mesa}/share/vulkan/icd.d"
+          else "";
+
         # `nix run .#test-browser-rust` — bring up graph-api + open the
         # page in chromium with WebGPU enabled + run the Rust smoke test.
         #
@@ -201,10 +212,9 @@
           runtimeInputs = [
             graph-api
             test-browser
-            pkgs.chromium
             pkgs.curl
             pkgs.coreutils
-          ];
+          ] ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux [ pkgs.chromium ];
           text = ''
             set -euo pipefail
 
@@ -213,6 +223,28 @@
             VAULT="''${VAULT_ROOT:-/tmp/test-vault}"
             PORT="''${TEST_PORT:-47896}"
             OUT_DIR="''${OUT_DIR:-$REPO_ROOT/target/test-browser-rust}"
+            BROWSER_BIN="''${CHROME_BIN:-''${CHROMIUM_BIN:-}}"
+
+            if [ -z "$BROWSER_BIN" ] && [ "$(uname -s)" = "Darwin" ]; then
+              for candidate in \
+                "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" \
+                "/Applications/Chromium.app/Contents/MacOS/Chromium" \
+                "/Applications/Google Chrome Canary.app/Contents/MacOS/Google Chrome Canary"
+              do
+                if [ -x "$candidate" ]; then
+                  BROWSER_BIN="$candidate"
+                  break
+                fi
+              done
+            fi
+            if [ -z "$BROWSER_BIN" ]; then
+              BROWSER_BIN="${nixChromiumBin}"
+            fi
+            if [ -z "$BROWSER_BIN" ] || [ ! -x "$BROWSER_BIN" ]; then
+              echo "error: no Chrome or Chromium executable found" >&2
+              echo "hint: install Google Chrome or set CHROME_BIN=/path/to/browser" >&2
+              exit 2
+            fi
 
             if [ ! -f "$ASSETS_DIR/index.html" ]; then
               echo "error: no trunk dist at $ASSETS_DIR" >&2
@@ -230,11 +262,11 @@
 
             # Software vulkan ICD for WebGPU on headless linux — mirrors the
             # devshell's VK_ICD_FILENAMES setting.
-            if [ -z "''${VK_ICD_FILENAMES:-}" ] && [ -d ${pkgs.mesa}/share/vulkan/icd.d ]; then
-              export VK_ICD_FILENAMES=${pkgs.mesa}/share/vulkan/icd.d/lvp_icd.x86_64.json
+            if [ -n "${browserVulkanIcdDir}" ] && [ -z "''${VK_ICD_FILENAMES:-}" ] && [ -d "${browserVulkanIcdDir}" ]; then
+              export VK_ICD_FILENAMES="${browserVulkanIcdDir}/lvp_icd.x86_64.json"
             fi
 
-            echo "→ starting graph-api on port $PORT…"
+            echo "→ starting graph-api on port ''${PORT}…"
             graph-api \
               --vault-root "$VAULT" \
               --port "$PORT" \
@@ -254,7 +286,7 @@
             echo "→ running test-browser…"
             test-browser \
               --base-url "http://127.0.0.1:$PORT" \
-              --chromium ${pkgs.chromium}/bin/chromium \
+              --chromium "$BROWSER_BIN" \
               --out-dir "$OUT_DIR" \
               --timeout-secs 60
           '';

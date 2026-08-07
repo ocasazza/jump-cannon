@@ -595,7 +595,10 @@ fn colors_from_metric(
     if v.len() < n {
         return render::data::default_colors(n);
     }
-    let categorical = matches!(metric_key, "community" | "wcc" | "doctype" | "folder" | "tag");
+    let categorical = matches!(
+        metric_key,
+        "community" | "wcc" | "doctype" | "folder" | "tag"
+    );
     let mut out = Vec::with_capacity(n * 4);
     if categorical {
         for i in 0..n {
@@ -723,6 +726,10 @@ thread_local! {
     static METRICS_GEN: Cell<u32> = const { Cell::new(0) };
     /// Metric fetches in flight (or backing off after a failure).
     static PENDING: RefCell<HashSet<&'static str>> = RefCell::new(HashSet::new());
+    /// Server metrics are only meaningful for a graph-api-owned topology.
+    static METRICS_ALLOWED: Cell<bool> = const { Cell::new(false) };
+    static METRICS_REVISION: Cell<Option<u64>> = const { Cell::new(None) };
+    static METRICS_SESSION: Cell<u64> = const { Cell::new(0) };
     /// Change-detect for the buffer recompute — the egui app's
     /// `prev_style_key`, extended with the metrics generation and the
     /// `sizes_base` allocation address. The address changes when either we
@@ -734,6 +741,16 @@ thread_local! {
     /// recompute (the egui app forces this via `prev_selected_hash = None`).
     static SEL_MIRROR: Cell<Option<u32>> = const { Cell::new(None) };
     static LAST_PANEL_RENDER_MS: Cell<f64> = const { Cell::new(0.0) };
+}
+
+pub(crate) fn reset_for_graph_session(graph_revision: Option<u64>) {
+    METRICS_ALLOWED.with(|c| c.set(graph_revision.is_some()));
+    METRICS_REVISION.with(|c| c.set(graph_revision));
+    METRICS_SESSION.with(|c| c.set(c.get().wrapping_add(1)));
+    METRICS_TL.with(|m| m.borrow_mut().clear());
+    PENDING.with(|p| p.borrow_mut().clear());
+    METRICS_GEN.with(|g| g.set(g.get().wrapping_add(1)));
+    LAST_APPLIED.with(|c| c.set(None));
 }
 
 fn update(mutate: impl FnOnce(&mut StyleState)) {
@@ -774,6 +791,9 @@ pub(crate) fn state_restore(s: &StyleState) {
 /// doctype / folder) are skipped — the builders fall back, exactly like the
 /// egui app does for keys absent from its metrics map.
 fn ensure_metrics(style: &StyleState) {
+    if !METRICS_ALLOWED.with(Cell::get) {
+        return;
+    }
     const SERVED: &[&str] = &[
         "degree",
         "indegree",
@@ -806,11 +826,32 @@ fn ensure_metrics(style: &StyleState) {
         if PENDING.with(|p| !p.borrow_mut().insert(key)) {
             continue;
         }
+        let session = METRICS_SESSION.with(Cell::get);
         wasm_bindgen_futures::spawn_local(async move {
-            match crate::api::metric(key).await {
-                Ok(v) => {
+            match crate::api::revisioned_metric(key).await {
+                Ok(response) => {
+                    if !METRICS_ALLOWED.with(Cell::get)
+                        || METRICS_SESSION.with(Cell::get) != session
+                    {
+                        return;
+                    }
+                    let expected_revision = METRICS_REVISION.with(Cell::get);
+                    if response.revision != 0
+                        && expected_revision != Some(response.revision)
+                    {
+                        tracing::warn!(
+                            metric = key,
+                            expected = ?expected_revision,
+                            got = response.revision,
+                            "[style] discarded metric from a replacement graph"
+                        );
+                        PENDING.with(|p| {
+                            p.borrow_mut().remove(key);
+                        });
+                        return;
+                    }
                     METRICS_TL.with(|m| {
-                        m.borrow_mut().insert(key.to_string(), v);
+                        m.borrow_mut().insert(key.to_string(), response.value);
                     });
                     METRICS_GEN.with(|g| g.set(g.get().wrapping_add(1)));
                     PENDING.with(|p| {
@@ -862,7 +903,8 @@ fn apply_now() {
 
             let n = pipes.n_nodes() as usize;
             let mv = metrics_view(&metrics, &style);
-            let colors = colors_from_metric(style.color_by.metric_key(), mv.as_ref(), n, style.palette);
+            let colors =
+                colors_from_metric(style.color_by.metric_key(), mv.as_ref(), n, style.palette);
             let sizes = render::data::sizes_from_metric(
                 style.size_by.metric_key(),
                 &metrics,
@@ -1016,6 +1058,7 @@ fn hex_rgb(s: &str) -> Option<[f32; 3]> {
 pub fn panel(ctx: Ctx) -> Element {
     ensure_init();
     crate::appstate::ensure_init();
+    let server_backed = ctx.graph_session.read().is_server_backed();
     // Selection mirror for the post-recompute overlay re-push. Kept fresh
     // for as long as the panel renders (the workspace re-renders open
     // panels whenever the selection signal changes).
@@ -1039,6 +1082,12 @@ pub fn panel(ctx: Ctx) -> Element {
 
     rsx! {
         div { class: "sty",
+            if !server_backed {
+                div { class: "sty-note",
+                    "Client-only graph: server-derived metrics are unavailable. Uniform and \
+                     renderer-local styling still apply."
+                }
+            }
             div { class: "sty-reset-row",
                 button { class: "btn sty-small",
                     onclick: move |_| update(|s| *s = StyleState::default()),

@@ -111,6 +111,12 @@ impl DocState {
 /// Keyed by node id — the egui App's `page_viewer_states` map.
 static DOCS: GlobalSignal<HashMap<String, DocState>> = Signal::global(HashMap::new);
 
+/// Node ids are only unique within one graph-api endpoint. Switching servers
+/// must not offer an old endpoint's dirty buffer as the new endpoint's file.
+pub(crate) fn reset_for_server_change() {
+    DOCS.write().clear();
+}
+
 fn with_doc<R>(id: &str, f: impl FnOnce(&mut DocState) -> R) -> R {
     f(DOCS.write().entry(id.to_string()).or_default())
 }
@@ -306,6 +312,11 @@ fn render_markdown(md: &str) -> String {
 // --- panel -----------------------------------------------------------------------------
 
 pub(crate) fn panel(ctx: Ctx) -> Element {
+    if !ctx.graph_session.read().is_server_backed() {
+        return rsx! { div { class: "empty",
+            "Client-only graph: there is no server-owned vault page to view or edit."
+        } };
+    }
     let Ctx { meta, meta_busy, selected, .. } = ctx;
     if *meta_busy.read() {
         return rsx! { div { class: "skeleton", Spinner { label: "loading node…" } } };

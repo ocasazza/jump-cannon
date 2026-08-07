@@ -14,6 +14,7 @@
 //! those checks was removed with the egui frontend — see git history.)
 
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -22,9 +23,8 @@ use chromiumoxide::browser::{Browser, BrowserConfig};
 use chromiumoxide::cdp::browser_protocol::page::CaptureScreenshotParams;
 use clap::Parser;
 use futures::StreamExt;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
-use std::sync::Arc;
 
 /// The single readiness signal we wait for. Logged from
 /// `app/ui/src/main.rs` (fn main) right before the Dioxus app launches.
@@ -60,7 +60,37 @@ struct Report {
     duration_ms: u128,
     #[serde(skip_serializing_if = "Option::is_none")]
     reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    graph_header_actions: Option<HeaderActionCheck>,
+    page_errors: Vec<String>,
     console_logs: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct HeaderActionDetail {
+    label: String,
+    title: String,
+    width: f64,
+    height: f64,
+    within_header: bool,
+    within_panel: bool,
+    drag_started: bool,
+    canvas_after_click: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct HeaderActionCheck {
+    ok: bool,
+    action_count: usize,
+    play_pause_found: bool,
+    fit_found: bool,
+    geometry_ok: bool,
+    clicks_ok: bool,
+    drag_started: bool,
+    canvas_present: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    reason: Option<String>,
+    actions: Vec<HeaderActionDetail>,
 }
 
 #[tokio::main(flavor = "multi_thread")]
@@ -84,10 +114,32 @@ async fn main() -> Result<()> {
     let duration_ms = started.elapsed().as_millis();
 
     let logs = console_logs.lock().await.clone();
-    let (ok, reason, canvas_width, canvas_height, boot_log_found) = match &result {
-        Ok(o) => (true, None, o.canvas_width, o.canvas_height, o.boot_log_found),
-        Err(e) => (false, Some(format!("{e:#}")), 0, 0, false),
-    };
+    let (ok, reason, canvas_width, canvas_height, boot_log_found, header_actions, page_errors) =
+        match &result {
+            Ok(o) => {
+                let ok = o.header_actions.ok && o.page_errors.is_empty();
+                let reason = if !o.header_actions.ok {
+                    o.header_actions.reason.clone()
+                } else if !o.page_errors.is_empty() {
+                    Some(format!(
+                        "browser emitted {} console error(s) or unhandled exception(s)",
+                        o.page_errors.len()
+                    ))
+                } else {
+                    None
+                };
+                (
+                    ok,
+                    reason,
+                    o.canvas_width,
+                    o.canvas_height,
+                    o.boot_log_found,
+                    Some(o.header_actions.clone()),
+                    o.page_errors.clone(),
+                )
+            }
+            Err(e) => (false, Some(format!("{e:#}")), 0, 0, false, None, Vec::new()),
+        };
 
     let report = Report {
         ok,
@@ -97,6 +149,8 @@ async fn main() -> Result<()> {
         boot_log_found,
         duration_ms,
         reason: reason.clone(),
+        graph_header_actions: header_actions,
+        page_errors,
         console_logs: tail(&logs, 50),
     };
 
@@ -118,6 +172,8 @@ struct RunOk {
     canvas_width: u32,
     canvas_height: u32,
     boot_log_found: bool,
+    header_actions: HeaderActionCheck,
+    page_errors: Vec<String>,
 }
 
 async fn run(args: &Args, console_logs: Arc<Mutex<Vec<String>>>) -> Result<RunOk> {
@@ -126,19 +182,22 @@ async fn run(args: &Args, console_logs: Arc<Mutex<Vec<String>>>) -> Result<RunOk
     probe_server(&probe_url, Duration::from_secs(args.timeout_secs.min(30))).await?;
 
     // ---- 2. launch chromium ----------------------------------------------
-    let chromium_args: Vec<String> = vec![
+    let mut chromium_args: Vec<String> = vec![
         "--enable-unsafe-webgpu".into(),
-        "--enable-features=Vulkan".into(),
         "--no-sandbox".into(),
         "--disable-dev-shm-usage".into(),
         "--disable-gpu-sandbox".into(),
-        // Linux-only flags. Harmless on darwin (chromium ignores unknown
-        // GL/ANGLE knobs); we don't bother branching here because the nix
-        // wrapper runs on linux + macos developer boxes only.
-        "--use-angle=vulkan".into(),
-        "--use-gl=angle".into(),
         "--window-size=1280,800".into(),
     ];
+    // Headless Linux uses the Nix-provided lavapipe Vulkan adapter. Installed
+    // Chrome on macOS should retain its native Metal/ANGLE defaults.
+    if cfg!(target_os = "linux") {
+        chromium_args.extend([
+            "--enable-features=Vulkan".into(),
+            "--use-angle=vulkan".into(),
+            "--use-gl=angle".into(),
+        ]);
+    }
 
     let config = BrowserConfig::builder()
         .chrome_executable(&args.chromium)
@@ -188,6 +247,10 @@ async fn drive_page(
         .event_listener::<chromiumoxide::cdp::js_protocol::runtime::EventConsoleApiCalled>()
         .await
         .context("listen console api")?;
+    let mut runtime_exceptions = page
+        .event_listener::<chromiumoxide::cdp::js_protocol::runtime::EventExceptionThrown>()
+        .await
+        .context("listen runtime exceptions")?;
     // Suppress unused warning on lifecycle stream (kept in case future
     // checks want to wait for `load` semantically).
     let _ = page
@@ -222,6 +285,23 @@ async fn drive_page(
             logs_b.lock().await.push(line);
         }
     });
+    let logs_c = console_logs.clone();
+    let exception_pump = tokio::spawn(async move {
+        while let Some(ev) = runtime_exceptions.next().await {
+            let details = &ev.exception_details;
+            let description = details
+                .exception
+                .as_ref()
+                .and_then(|exception| exception.description.clone())
+                .unwrap_or_default();
+            let line = if description.is_empty() {
+                format!("[exception] {}", details.text)
+            } else {
+                format!("[exception] {}: {}", details.text, description)
+            };
+            logs_c.lock().await.push(line);
+        }
+    });
 
     let target = args.base_url.trim_end_matches('/').to_string() + "/";
     tracing::info!("navigating to {target}");
@@ -253,7 +333,148 @@ async fn drive_page(
         );
     }
 
-    // ---- 4. canvas exists with non-zero size -----------------------------
+    // ---- 4. graph header actions are present, visible, and safe ----------
+    // Wait for graph data to finish loading: the boot log is emitted before
+    // the Graph panel's canvas and header actions necessarily exist.
+    let graph_ready_js = r#"(() => {
+        const panel = document.querySelector('section.panel-graph');
+        const header = panel?.querySelector(':scope > header.panel-head');
+        const canvas = panel?.querySelector('canvas.graph-canvas');
+        const actions = header?.querySelectorAll(
+          '.panel-head-actions button.panel-head-action'
+        );
+        return Boolean(panel && header && canvas && actions?.length >= 2);
+    })()"#;
+    let graph_deadline = Instant::now() + Duration::from_secs(args.timeout_secs);
+    while Instant::now() < graph_deadline {
+        let ready: bool = page.evaluate(graph_ready_js).await?.into_value()?;
+        if ready {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+
+    // Exercise the controls through the same pointer/mouse event sequence a
+    // user generates. Holding pointerdown across two animation frames catches
+    // accidental propagation into Panel Kit's panel-drag handlers.
+    let header_actions_js = r#"(async () => {
+        const panel = document.querySelector('section.panel-graph');
+        const header = panel?.querySelector(':scope > header.panel-head');
+        const root = panel?.closest('.ws-root') || document.querySelector('.ws-root');
+        const buttons = header
+          ? [...header.querySelectorAll('.panel-head-actions button.panel-head-action')]
+          : [];
+        const text = (button) => (button?.textContent || '').trim();
+        const title = (button) => button?.getAttribute('title') || '';
+        const isPlayPause = (button) =>
+          text(button) === '▶' || text(button) === 'Ⅱ' ||
+          /Pause|Resume|Freeze|Follow/i.test(title(button));
+        const isFit = (button) => text(button) === 'Fit' || /Fit the camera/i.test(title(button));
+        const playPause = buttons.find(isPlayPause);
+        const fit = buttons.find(isFit);
+        const chosen = [playPause, fit].filter(Boolean);
+        const headerRect = header?.getBoundingClientRect();
+        const panelRect = panel?.getBoundingClientRect();
+        const details = chosen.map((button) => {
+          const rect = button.getBoundingClientRect();
+          return {
+            label: text(button),
+            title: title(button),
+            width: rect.width,
+            height: rect.height,
+            within_header: Boolean(headerRect) &&
+              rect.left >= headerRect.left - 0.5 && rect.right <= headerRect.right + 0.5,
+            within_panel: Boolean(panelRect) &&
+              rect.left >= panelRect.left - 0.5 && rect.right <= panelRect.right + 0.5,
+            drag_started: false,
+            canvas_after_click: false,
+          };
+        });
+        const nextFrames = () => new Promise((resolve) =>
+          requestAnimationFrame(() => requestAnimationFrame(resolve))
+        );
+        const dragActive = () => Boolean(
+          root?.classList.contains('dragging') ||
+          panel?.classList.contains('tile-dragging')
+        );
+
+        for (let i = 0; i < chosen.length; i += 1) {
+          const button = chosen[i];
+          const rect = button.getBoundingClientRect();
+          const point = {
+            bubbles: true,
+            cancelable: true,
+            button: 0,
+            buttons: 1,
+            clientX: rect.left + rect.width / 2,
+            clientY: rect.top + rect.height / 2,
+            pointerId: 1,
+            pointerType: 'mouse',
+            isPrimary: true,
+          };
+          let sawDrag = dragActive();
+          const observer = new MutationObserver(() => { sawDrag ||= dragActive(); });
+          if (root) {
+            observer.observe(root, {
+              attributes: true,
+              subtree: true,
+              attributeFilter: ['class'],
+            });
+          }
+          button.dispatchEvent(new PointerEvent('pointerdown', point));
+          button.dispatchEvent(new MouseEvent('mousedown', point));
+          await nextFrames();
+          sawDrag ||= dragActive();
+          button.dispatchEvent(new PointerEvent('pointerup', { ...point, buttons: 0 }));
+          button.dispatchEvent(new MouseEvent('mouseup', { ...point, buttons: 0 }));
+          button.click();
+          await nextFrames();
+          sawDrag ||= dragActive();
+          observer.disconnect();
+          const canvas = document.querySelector('section.panel-graph canvas.graph-canvas');
+          const canvasRect = canvas?.getBoundingClientRect();
+          details[i].drag_started = sawDrag;
+          details[i].canvas_after_click = Boolean(
+            canvasRect && canvasRect.width > 0 && canvasRect.height > 0
+          );
+        }
+
+        const playPauseFound = Boolean(playPause);
+        const fitFound = Boolean(fit);
+        const geometryOk = details.length === 2 && details.every((action) =>
+          action.width > 0 && action.height > 0 &&
+          action.within_header && action.within_panel
+        );
+        const dragStarted = details.some((action) => action.drag_started);
+        const canvasPresent = details.length === 2 &&
+          details.every((action) => action.canvas_after_click);
+        const clicksOk = !dragStarted && canvasPresent;
+        const failures = [];
+        if (!panel || !header) failures.push('Graph panel header missing');
+        if (!playPauseFound) failures.push('play/pause action missing');
+        if (!fitFound) failures.push('Fit action missing');
+        if (!geometryOk) failures.push('header action clipped or zero-sized');
+        if (dragStarted) failures.push('header action started a panel drag');
+        if (!canvasPresent) failures.push('Graph canvas missing after action click');
+        return {
+          ok: failures.length === 0,
+          action_count: buttons.length,
+          play_pause_found: playPauseFound,
+          fit_found: fitFound,
+          geometry_ok: geometryOk,
+          clicks_ok: clicksOk,
+          drag_started: dragStarted,
+          canvas_present: canvasPresent,
+          reason: failures.length ? failures.join('; ') : null,
+          actions: details,
+        };
+    })()"#;
+    let header_actions_value: serde_json::Value =
+        page.evaluate(header_actions_js).await?.into_value()?;
+    let header_actions: HeaderActionCheck = serde_json::from_value(header_actions_value)
+        .context("decode Graph header action regression result")?;
+
+    // ---- 5. canvas exists with non-zero size -----------------------------
     // The Dioxus app's graph canvas is `<canvas class="graph-canvas">`
     // (app/ui/src/graph_canvas.rs); fall back to any canvas on the page.
     let dims_js = r#"(() => {
@@ -270,7 +491,7 @@ async fn drive_page(
     let canvas_width = dims.get("w").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
     let canvas_height = dims.get("h").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
 
-    // ---- 5. screenshot ---------------------------------------------------
+    // ---- 6. screenshot ---------------------------------------------------
     let shot_params = CaptureScreenshotParams::builder().build();
     let png_b64 = page
         .screenshot(shot_params)
@@ -298,8 +519,18 @@ async fn drive_page(
     // Tear down pumps (browser close in caller will end them anyway).
     console_pump.abort();
     runtime_pump.abort();
+    exception_pump.abort();
     let _ = console_pump.await;
     let _ = runtime_pump.await;
+    let _ = exception_pump.await;
+
+    let page_errors = console_logs
+        .lock()
+        .await
+        .iter()
+        .filter(|line| line.starts_with("[error]") || line.starts_with("[exception]"))
+        .cloned()
+        .collect();
 
     if !boot_log_found {
         bail!(
@@ -320,6 +551,8 @@ async fn drive_page(
         canvas_width,
         canvas_height,
         boot_log_found,
+        header_actions,
+        page_errors,
     })
 }
 

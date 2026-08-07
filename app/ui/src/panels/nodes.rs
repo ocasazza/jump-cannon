@@ -32,6 +32,12 @@ const FILE_CAP: usize = 40;
 const LIST_CAP: usize = 300;
 const SUGGESTION_CAP: usize = 8;
 
+pub(crate) fn reset_for_graph_session() {
+    let next_generation = GEN.peek().wrapping_add(1);
+    *GEN.write() = next_generation;
+    RICH.write().clear();
+}
+
 // --- fuzzy matching -----------------------------------------------------------
 
 /// Subsequence fuzzy match of `needle` (lowercase) against `hay`.
@@ -72,7 +78,9 @@ fn fuzzy_match(needle: &str, hay: &str) -> Option<(i32, Vec<usize>)> {
 }
 
 fn escape_html(s: &str) -> String {
-    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
 }
 
 /// `hay` with the matched byte positions wrapped in `<b>` — same highlight
@@ -95,9 +103,24 @@ fn highlight_positions(hay: &str, positions: &[usize]) -> String {
 // --- search dispatch ------------------------------------------------------------
 
 fn run_search(ctx: Ctx) {
-    let Ctx { mut results, mut result_total, mut searching, query, .. } = ctx;
+    let Ctx {
+        mut results,
+        mut result_total,
+        mut searching,
+        query,
+        graph_session,
+        ..
+    } = ctx;
     let q = query.peek().trim().to_string();
     let gen = *GEN.peek();
+    let session = graph_session.peek().clone();
+    if !session.is_server_backed() {
+        RICH.write().clear();
+        results.set(Vec::new());
+        result_total.set(0);
+        searching.set(false);
+        return;
+    }
     spawn(async move {
         gloo_timers::future::TimeoutFuture::new(DEBOUNCE_MS).await;
         if *GEN.peek() != gen {
@@ -110,11 +133,24 @@ fn run_search(ctx: Ctx) {
             return;
         }
         searching.set(true);
-        match api::search_rich(&q, 60).await {
-            Ok(r) => {
+        let response = api::revisioned_search_rich(&q, 60).await;
+        if *GEN.peek() != gen || graph_session.peek().epoch != session.epoch {
+            return;
+        }
+        match response {
+            Ok(response)
+                if response.revision == 0
+                    || session.graph_revision == Some(response.revision) =>
+            {
+                let r = response.value;
                 result_total.set(r.total as u32);
                 results.set(r.results.iter().map(|h| h.id.clone()).collect());
                 *RICH.write() = r.results;
+            }
+            Ok(_) => {
+                result_total.set(0);
+                results.set(Vec::new());
+                RICH.write().clear();
             }
             Err(_) => {
                 result_total.set(0);
@@ -130,16 +166,25 @@ fn run_search(ctx: Ctx) {
 
 pub fn panel(ctx: Ctx) -> Element {
     crate::appstate::ensure_init();
-    let Ctx { graph, mut selected, mut query, searching, result_total, .. } = ctx;
+    let Ctx {
+        graph,
+        graph_session,
+        mut selected,
+        mut query,
+        searching,
+        result_total,
+        ..
+    } = ctx;
     let g = graph.read();
     let Some(g) = g.as_ref() else {
         return rsx! { div { class: "empty", "—" } };
     };
     let q = query.read().trim().to_string();
     let q_lower = q.to_lowercase();
+    let server_backed = graph_session.read().is_server_backed();
 
     // Filter-suggestion chips: meta_summary values containing the query.
-    let suggestions: Vec<(String, String, usize, bool)> = if q.is_empty() {
+    let suggestions: Vec<(String, String, usize, bool)> = if q.is_empty() || !server_backed {
         Vec::new()
     } else {
         let active_q = filter::QUERY.read();
@@ -151,11 +196,12 @@ pub fn panel(ctx: Ctx) -> Element {
                 fi.by_field
                     .iter()
                     .flat_map(|(field, values)| {
-                        values.iter().filter(|(val, _)| val.to_lowercase().contains(&q_lower)).map(
-                            move |(val, nodes)| {
+                        values
+                            .iter()
+                            .filter(|(val, _)| val.to_lowercase().contains(&q_lower))
+                            .map(move |(val, nodes)| {
                                 (field.clone(), val.clone(), nodes.len(), false)
-                            },
-                        )
+                            })
                     })
                     .collect()
             })
@@ -179,7 +225,9 @@ pub fn panel(ctx: Ctx) -> Element {
             .collect();
         hits.sort_by(|a, b| b.0.cmp(&a.0));
         hits.truncate(FILE_CAP);
-        hits.into_iter().map(|(_, id, p)| (id.clone(), highlight_positions(id, &p))).collect()
+        hits.into_iter()
+            .map(|(_, id, p)| (id.clone(), highlight_positions(id, &p)))
+            .collect()
     };
 
     let rich = RICH.read().clone();
@@ -194,9 +242,16 @@ pub fn panel(ctx: Ctx) -> Element {
                 oninput: move |e| {
                     query.set(e.value());
                     *GEN.write() += 1;
-                    filter::ensure_field_index();
+                    filter::ensure_field_index(ctx);
                     run_search(ctx);
                 },
+            }
+
+            if !server_backed {
+                div { class: "more",
+                    "Client-only graph: file-name matching works locally; content search, \
+                     metadata filters, and document lookup require a server-hosted graph."
+                }
             }
 
             if q.is_empty() {
@@ -273,9 +328,10 @@ pub fn panel(ctx: Ctx) -> Element {
                     }
 
                     // Full-text content hits with highlighted snippets.
-                    div { class: "browse-group",
-                        "content"
-                        if *searching.read() {
+                    if server_backed {
+                        div { class: "browse-group",
+                            "content"
+                            if *searching.read() {
                             Spinner {}
                         } else {
                             span { class: "sugg-count", " {rich.len()} shown · {total} total" }
@@ -307,4 +363,5 @@ pub fn panel(ctx: Ctx) -> Element {
             }
         }
     }
+}
 }

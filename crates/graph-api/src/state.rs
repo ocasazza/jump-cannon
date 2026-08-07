@@ -14,7 +14,9 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use arc_swap::{ArcSwap, ArcSwapOption};
 use data_loader::Loader;
@@ -28,6 +30,11 @@ use crate::subprocess::VaultSearch;
 /// [`GraphSnapshot::build`] and swapped in atomically by the watcher
 /// after each reload.
 pub struct GraphSnapshot {
+    /// Process-local identity for this complete graph materialization. Every
+    /// rebuild receives a fresh non-zero value, even when the node count is
+    /// unchanged, so independently fetched buffers and remote layout frames
+    /// can prove that they belong to the same snapshot.
+    pub revision: u64,
     pub graph: VaultGraph,
     /// id (relative path, vault-links convention) -> dense index used for
     /// the binary buffer routes.
@@ -46,6 +53,8 @@ impl GraphSnapshot {
     /// Build a fresh snapshot from a loaded `VaultGraph`. Recomputes all
     /// derived caches (id_to_idx, idx_to_id, binary buffers).
     pub fn build(graph: VaultGraph) -> Self {
+        let revision = next_graph_revision();
+
         let mut id_to_idx = HashMap::with_capacity(graph.nodes.len());
         let mut idx_to_id = Vec::with_capacity(graph.nodes.len());
         for (i, (id, _)) in graph.nodes.iter().enumerate() {
@@ -82,10 +91,46 @@ impl GraphSnapshot {
         );
 
         Self {
+            revision,
             graph,
             id_to_idx,
             idx_to_id,
             binary_cache,
+        }
+    }
+}
+
+/// Seed the per-process revision sequence with process- and wall-clock entropy
+/// so a restarted graph-api does not reuse the worker's previous graph token.
+/// The counter then guarantees uniqueness within the process.
+fn initial_graph_revision() -> u64 {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let mut value = (nanos as u64)
+        ^ ((nanos >> 64) as u64).rotate_left(29)
+        ^ (u64::from(std::process::id())).rotate_left(17);
+    // SplitMix64 finalizer: spread small clock/PID changes across every bit.
+    value ^= value >> 30;
+    value = value.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    value ^= value >> 27;
+    value = value.wrapping_mul(0x94d0_49bb_1331_11eb);
+    value ^= value >> 31;
+    if value == 0 {
+        1
+    } else {
+        value
+    }
+}
+
+fn next_graph_revision() -> u64 {
+    static NEXT_REVISION: OnceLock<AtomicU64> = OnceLock::new();
+    let counter = NEXT_REVISION.get_or_init(|| AtomicU64::new(initial_graph_revision()));
+    loop {
+        let revision = counter.fetch_add(1, Ordering::Relaxed);
+        if revision != 0 {
+            return revision;
         }
     }
 }
@@ -104,6 +149,9 @@ pub struct AppStateInner {
     /// Atomically swappable graph + derived caches. The watcher task
     /// publishes new snapshots after each vault reload.
     pub snapshot: ArcSwap<GraphSnapshot>,
+    /// Serializes snapshot authority changes with worker control-plane
+    /// mutations. Always acquire this before any broker control lock.
+    pub graph_control: tokio::sync::Mutex<()>,
     /// Optional vault-search subprocess. Swappable so reloads can drop
     /// the old child + respawn against the rebuilt index.
     pub vault_search: ArcSwapOption<VaultSearch>,
@@ -135,6 +183,7 @@ impl AppState {
                 vault_root,
                 loader,
                 snapshot: ArcSwap::new(Arc::new(snapshot)),
+                graph_control: tokio::sync::Mutex::new(()),
                 vault_search: ArcSwapOption::new(vault_search),
                 assets_dir,
                 compute_broker,
@@ -149,5 +198,19 @@ impl AppState {
     #[inline]
     pub fn snapshot(&self) -> Arc<GraphSnapshot> {
         self.inner.snapshot.load_full()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rebuilt_snapshots_receive_distinct_nonzero_revisions() {
+        let first = GraphSnapshot::build(VaultGraph::default());
+        let second = GraphSnapshot::build(VaultGraph::default());
+        assert_ne!(first.revision, 0);
+        assert_ne!(second.revision, 0);
+        assert_ne!(first.revision, second.revision);
     }
 }

@@ -10,6 +10,9 @@ message Init {
   // Color palette as flat r,g,b,r,g,b,... (3 floats per color).
   // Future: clients pass color preferences; server returns derived palette.
   repeated float palette = 5 [packed=true];
+  // Process-local graph snapshot identity. All bulk buffers and remote layout
+  // frames for this bootstrap must carry the same non-zero value.
+  uint64 graph_revision = 6;
 }
 
 // Per-node metadata. Returned by /node/:id (sparse, on-demand).

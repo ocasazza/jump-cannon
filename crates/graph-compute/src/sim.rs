@@ -11,6 +11,7 @@
 //! `cpu_step` itself remains here as the reference integrator the
 //! `CpuSpringEngine` wraps (and that tests call directly).
 
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::{broadcast, Mutex, RwLock};
 
@@ -212,7 +213,8 @@ mod tests {
         // Start on a tiny 4-node path, then hot-swap to a 64-node particle soup
         // (0 edges) — the self-assembly LoadGraph path.
         let state = SimState::new(CsrGraph::path(4));
-        state.init_engine("geometric", serde_json::Value::Null, None)
+        state
+            .init_engine("geometric", serde_json::Value::Null, None)
             .await
             .expect("init on the original graph");
         assert!(state.active.lock().await.is_some());
@@ -228,10 +230,11 @@ mod tests {
             .collect();
 
         let n = state
-            .load_graph(soup, Some(pos.clone()))
+            .load_graph(soup, Some(pos.clone()), 42, 0)
             .await
             .expect("load_graph");
         assert_eq!(n, 64);
+        assert_eq!(state.graph_revision.load(Ordering::Acquire), 42);
         // Swap is observable: graph + positions replaced, frame reset, active cleared.
         assert_eq!(state.graph.read().await.n_nodes, 64);
         assert_eq!(state.positions.read().await.len(), 64 * 3);
@@ -250,8 +253,121 @@ mod tests {
         let mut active = state.active.lock().await;
         let mut active = active.take().unwrap();
         let out = active.engine.step(&mut active.ctx);
-        assert_eq!(out.positions.len(), 64 * 3, "engine ran on the swapped graph");
+        assert_eq!(
+            out.positions.len(),
+            64 * 3,
+            "engine ran on the swapped graph"
+        );
         assert!(out.positions.iter().all(|v| v.is_finite()));
+    }
+
+    #[tokio::test]
+    async fn selection_generation_is_idempotent_and_rejects_stale_mutation() {
+        let state = SimState::new(CsrGraph::path(4));
+        let running = state
+            .init_engine_for_generation("cpu-spring", serde_json::Value::Null, None, 0, 3)
+            .await
+            .expect("initial authoritative selection");
+        assert_eq!(running, "cpu-spring");
+        assert_eq!(state.selection_generation.load(Ordering::Acquire), 3);
+        assert_eq!(
+            *state.engine_status.read().await,
+            EngineStatus {
+                requested_layout_id: "cpu-spring",
+                effective_layout_id: "cpu-spring",
+                fallback_reason: None,
+            }
+        );
+
+        // An equal-generation reconnect returns the already-running engine
+        // before interpreting a new payload, so it cannot reset simulation.
+        let running = state
+            .init_engine_for_generation("not-a-real-engine", serde_json::Value::Null, None, 0, 3)
+            .await
+            .expect("same generation is idempotent");
+        assert_eq!(running, "cpu-spring");
+
+        let stale = state
+            .init_engine_for_generation("cpu-spring", serde_json::Value::Null, None, 0, 2)
+            .await
+            .expect_err("older generation must be rejected");
+        assert!(stale.contains("stale selection generation"));
+    }
+
+    #[tokio::test]
+    async fn graph_change_resets_generation_but_same_revision_placement_is_cas_bound() {
+        let state = SimState::new(CsrGraph::path(4));
+        state
+            .init_engine_for_generation("cpu-spring", serde_json::Value::Null, None, 0, 9)
+            .await
+            .expect("initialize persistent worker selection");
+
+        state
+            .load_graph(CsrGraph::path(4), None, 42, 9)
+            .await
+            .expect("new graph starts a fresh generation scope");
+        assert_eq!(state.graph_revision.load(Ordering::Acquire), 42);
+        assert_eq!(state.selection_generation.load(Ordering::Acquire), 0);
+        assert_eq!(*state.engine_status.read().await, EngineStatus::default());
+
+        state
+            .init_engine_for_generation("cpu-spring", serde_json::Value::Null, None, 42, 1)
+            .await
+            .expect("select engine for new graph");
+        let original_positions = state.positions.read().await.clone();
+        let stale = state
+            .load_graph(CsrGraph::path(4), Some(vec![7.0; 12]), 42, 0)
+            .await
+            .expect_err("stale placement generation must reject");
+        assert!(stale.contains("stale selection generation"));
+        assert_eq!(*state.positions.read().await, original_positions);
+
+        state
+            .load_graph(CsrGraph::path(4), Some(vec![7.0; 12]), 42, 1)
+            .await
+            .expect("current-generation placement succeeds");
+        assert_eq!(state.selection_generation.load(Ordering::Acquire), 1);
+        assert_eq!(*state.positions.read().await, vec![7.0; 12]);
+    }
+
+    #[tokio::test]
+    async fn lost_new_graph_response_can_be_replayed_before_engine_init() {
+        let state = SimState::new(CsrGraph::path(4));
+        state
+            .init_engine_for_generation("cpu-spring", serde_json::Value::Null, None, 0, 9)
+            .await
+            .expect("initialize old graph selection");
+        state
+            .load_graph(CsrGraph::path(4), Some(vec![1.0; 12]), 42, 9)
+            .await
+            .expect("worker commits new graph before response is lost");
+        assert_eq!(state.selection_generation.load(Ordering::Acquire), 0);
+        assert!(state.needs_engine_init.load(Ordering::Acquire));
+
+        state
+            .load_graph(CsrGraph::path(4), Some(vec![2.0; 12]), 42, 9)
+            .await
+            .expect("identical broker retry must converge");
+        assert_eq!(state.graph_revision.load(Ordering::Acquire), 42);
+        assert_eq!(state.selection_generation.load(Ordering::Acquire), 0);
+        assert_eq!(*state.positions.read().await, vec![2.0; 12]);
+    }
+
+    #[tokio::test]
+    async fn rejected_placement_does_not_mutate_worker_graph() {
+        let state = SimState::new(CsrGraph::path(4));
+        let original_positions = state.positions.read().await.clone();
+        let mut invalid_positions = vec![0.0; 5 * 3];
+        invalid_positions[7] = f32::INFINITY;
+
+        let error = state
+            .load_graph(CsrGraph::path(5), Some(invalid_positions), 99, 0)
+            .await
+            .expect_err("non-finite placement must fail");
+        assert!(error.contains("non-finite"));
+        assert_eq!(state.graph.read().await.n_nodes, 4);
+        assert_eq!(state.graph_revision.load(Ordering::Acquire), 0);
+        assert_eq!(*state.positions.read().await, original_positions);
     }
 
     #[test]
@@ -279,6 +395,20 @@ mod tests {
 pub struct ActiveEngine {
     pub engine: Box<dyn LayoutEngine>,
     pub ctx: EngineCtx,
+    /// Graph revision captured when this engine was initialized. This catches
+    /// stale same-sized steps that a node-count check cannot distinguish.
+    pub graph_revision: u64,
+    /// Singleton control-plane generation that initialized this engine.
+    pub selection_generation: u64,
+}
+
+/// Truth reported by the worker health endpoint. Requested and effective ids
+/// differ only when initialization fell back to another engine.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct EngineStatus {
+    pub requested_layout_id: &'static str,
+    pub effective_layout_id: &'static str,
+    pub fallback_reason: Option<String>,
 }
 
 /// Deterministic unit-ring seed positions for `n` nodes (same convention as
@@ -307,6 +437,20 @@ pub struct SimState {
     /// it: `init_engine` clones the `Arc` (cheap) into the engine context, so a
     /// swap is only observed at the next Subscribe re-init — never mid-step.
     pub graph: RwLock<Arc<CsrGraph>>,
+    /// Identity supplied by the graph owner in `LoadGraph`. Revision 0 is
+    /// reserved for the worker's boot/legacy graph.
+    pub graph_revision: AtomicU64,
+    /// Latest successfully initialized remote selection. Generation 0 is the
+    /// worker-local startup/legacy selection.
+    pub selection_generation: AtomicU64,
+    /// True only when no engine has been initialized for the current graph.
+    /// Unlike `active.is_none()`, this does not flap while the tick loop owns
+    /// the engine during a blocking step.
+    pub needs_engine_init: AtomicBool,
+    pub engine_status: RwLock<EngineStatus>,
+    /// Serializes graph replacement with engine initialization so an engine
+    /// cannot capture a new graph with the previous graph's seed positions.
+    graph_swap: Mutex<()>,
     /// Interleaved x,y,z f32 positions, length `3 * n_nodes`. Host copy that
     /// the active engine seeds from at `init` and that each tick overwrites
     /// with the engine's `StepOutput`.
@@ -333,6 +477,11 @@ impl SimState {
         let (tx, _rx) = broadcast::channel(32);
         Arc::new(Self {
             graph: RwLock::new(Arc::new(graph)),
+            graph_revision: AtomicU64::new(0),
+            selection_generation: AtomicU64::new(0),
+            needs_engine_init: AtomicBool::new(true),
+            engine_status: RwLock::new(EngineStatus::default()),
+            graph_swap: Mutex::new(()),
             positions: RwLock::new(positions),
             frame: RwLock::new(0),
             tx,
@@ -350,23 +499,64 @@ impl SimState {
         &self,
         graph: CsrGraph,
         positions: Option<Vec<f32>>,
+        graph_revision: u64,
+        expected_selection_generation: u64,
     ) -> Result<u32, String> {
+        let _swap = self.graph_swap.lock().await;
+        let current_revision = self.graph_revision.load(Ordering::Acquire);
+        let current_generation = self.selection_generation.load(Ordering::Acquire);
+        let new_graph = graph_revision != current_revision;
+        // A new-graph LoadGraph may commit at the worker while its response is
+        // lost. The broker retries the identical target with its pre-reset
+        // generation; recognize that uninitialized gen-0 state as a replay.
+        let unacknowledged_new_graph_replay = !new_graph
+            && current_generation == 0
+            && self.needs_engine_init.load(Ordering::Acquire)
+            && expected_selection_generation > 0;
+        if !new_graph
+            && !unacknowledged_new_graph_replay
+            && expected_selection_generation != current_generation
+        {
+            return Err(format!(
+                "stale selection generation {expected_selection_generation}; worker has {current_generation}"
+            ));
+        }
         let n = graph.n_nodes as usize;
         let pos = match positions {
-            Some(p) if p.len() == 3 * n => p,
-            Some(p) => {
+            Some(p) if p.len() != 3 * n => {
                 return Err(format!(
                     "positions length {} != 3 * n_nodes ({})",
                     p.len(),
                     3 * n
                 ))
             }
+            Some(p) if p.iter().any(|value| !value.is_finite()) => {
+                return Err("positions contain a non-finite component".into())
+            }
+            Some(p) => p,
             None => ring_seed(n),
         };
+        // Publish the revision first to invalidate any same-sized step already
+        // in flight. Engine initialization is held off by `graph_swap` until
+        // the complete graph/position replacement below is visible.
+        self.graph_revision.store(graph_revision, Ordering::Release);
         *self.graph.write().await = Arc::new(graph);
         *self.positions.write().await = pos;
         *self.frame.write().await = 0;
         *self.active.lock().await = None; // next Subscribe re-inits on the new graph
+        self.needs_engine_init.store(true, Ordering::Release);
+        if new_graph {
+            // Generations are scoped to a graph identity. A new graph must not
+            // inherit a persistent worker's previous API process generation.
+            self.selection_generation.store(0, Ordering::Release);
+            *self.engine_status.write().await = EngineStatus::default();
+        } else {
+            // A same-revision placement keeps the user's selection intent and
+            // generation, but the engine must be initialized from the new seed.
+            let mut status = self.engine_status.write().await;
+            status.effective_layout_id = "";
+            status.fallback_reason = None;
+        }
         Ok(n as u32)
     }
 
@@ -384,6 +574,58 @@ impl SimState {
         params: serde_json::Value,
         attributes: Option<GraphAttributes>,
     ) -> Result<&'static str, String> {
+        let selection_generation = self.selection_generation.load(Ordering::Acquire);
+        let graph_revision = self.graph_revision.load(Ordering::Acquire);
+        self.init_engine_for_generation(
+            layout_id,
+            params,
+            attributes,
+            graph_revision,
+            selection_generation,
+        )
+        .await
+    }
+
+    /// Initialize an engine for an authoritative singleton-selection version.
+    /// The generation is published only after initialization succeeds.
+    pub async fn init_engine_for_generation(
+        self: &Arc<Self>,
+        layout_id: &str,
+        params: serde_json::Value,
+        attributes: Option<GraphAttributes>,
+        graph_revision: u64,
+        selection_generation: u64,
+    ) -> Result<&'static str, String> {
+        let _swap = self.graph_swap.lock().await;
+        let current_revision = self.graph_revision.load(Ordering::Acquire);
+        if graph_revision != 0 && graph_revision != current_revision {
+            return Err(format!(
+                "stale graph revision {graph_revision}; worker has {current_revision}"
+            ));
+        }
+        let current_generation = self.selection_generation.load(Ordering::Acquire);
+        if selection_generation != 0 && selection_generation < current_generation {
+            return Err(format!(
+                "stale selection generation {selection_generation}; worker has {current_generation}"
+            ));
+        }
+        if selection_generation != 0
+            && selection_generation == current_generation
+            && !self.needs_engine_init.load(Ordering::Acquire)
+        {
+            if let Some(active) = self.active.lock().await.as_ref() {
+                return Ok(active.engine.descriptor().id);
+            }
+            // The simulation loop temporarily owns the active engine. Returning
+            // here is the critical no-reset reconnect behavior.
+            let effective = self.engine_status.read().await.effective_layout_id;
+            return Ok(if effective.is_empty() {
+                self.registry.default_id()
+            } else {
+                effective
+            });
+        }
+        let graph_revision = current_revision;
         let graph = self.graph.read().await.clone(); // Arc clone — cheap
         let positions = {
             let n = graph.n_nodes as usize;
@@ -412,6 +654,11 @@ impl SimState {
             .ok_or_else(|| format!("unknown layout_id {layout_id:?}"))?;
         engine.set_params(&params)?;
         let chosen_id = engine.descriptor().id;
+        *self.engine_status.write().await = EngineStatus {
+            requested_layout_id: chosen_id,
+            effective_layout_id: "",
+            fallback_reason: None,
+        };
         let fallback_id = crate::engines::CpuSpringEngine::ID;
         let registry_has_fallback = self.registry.contains(fallback_id);
 
@@ -423,7 +670,15 @@ impl SimState {
                 CsrShard::whole(&graph)
             };
             match engine.init(&mut ctx, &shard, &positions) {
-                Ok(()) => Ok((ActiveEngine { engine, ctx }, attributes)),
+                Ok(()) => Ok((
+                    ActiveEngine {
+                        engine,
+                        ctx,
+                        graph_revision,
+                        selection_generation,
+                    },
+                    attributes,
+                )),
                 Err(e) => Err((e, ctx, graph, positions, attributes)),
             }
         })
@@ -432,14 +687,19 @@ impl SimState {
 
         match result {
             Ok((active, _attrs)) => {
+                self.engine_status.write().await.effective_layout_id = chosen_id;
+                self.selection_generation
+                    .store(selection_generation, Ordering::Release);
                 *self.active.lock().await = Some(active);
+                self.needs_engine_init.store(false, Ordering::Release);
                 Ok(chosen_id)
             }
             Err((init_err, mut ctx, graph, positions, attributes)) => {
                 if chosen_id != fallback_id && registry_has_fallback {
+                    let fallback_reason = init_err.to_string();
                     tracing::warn!(
                         engine = chosen_id,
-                        error = %init_err,
+                        error = %fallback_reason,
                         "engine init failed; falling back to {fallback_id}"
                     );
                     let mut fallback = self
@@ -454,10 +714,20 @@ impl SimState {
                     fallback
                         .init(&mut ctx, &shard, &positions)
                         .map_err(|e| format!("fallback engine init failed: {e}"))?;
+                    *self.engine_status.write().await = EngineStatus {
+                        requested_layout_id: chosen_id,
+                        effective_layout_id: fallback_id,
+                        fallback_reason: Some(fallback_reason),
+                    };
+                    self.selection_generation
+                        .store(selection_generation, Ordering::Release);
                     *self.active.lock().await = Some(ActiveEngine {
                         engine: fallback,
                         ctx,
+                        graph_revision,
+                        selection_generation,
                     });
+                    self.needs_engine_init.store(false, Ordering::Release);
                     Ok(fallback_id)
                 } else {
                     Err(format!("engine {chosen_id} init failed: {init_err}"))

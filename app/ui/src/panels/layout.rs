@@ -8,9 +8,9 @@
 //!   * **Remote** — the engines advertised by the graph-compute worker via
 //!     `GET /compute/engines`. Each entry routes through one of the two
 //!     "bridge" layouts and patches that bridge's settings so the
-//!     `/graph/layout/stream?layout_id=` query self-selects the worker
-//!     engine per-connection. The UI never calls `PUT /compute/layout`
-//!     (matching the egui picker's documented contract).
+//!     versioned `PUT /compute/layout` selects the worker once; WebSocket
+//!     open/reconnect carries only graph + selection identity and never
+//!     mutates shared worker state.
 //!
 //! Bridge routing (worker engine id → bridge + settings patch):
 //!   * `geometric`     → active `"geometric"`, LensConfig.use_gpu=false
@@ -42,7 +42,7 @@ use graph_layouts::{
     SpectralLayout, SpectralSettings, SphereLayout, SphereSettings, StaticLayout,
 };
 
-use crate::api::get_json;
+use crate::api::{get_json, put_json, put_raw_json};
 use crate::render;
 use crate::Ctx;
 
@@ -126,6 +126,16 @@ static SEED_ERROR: GlobalSignal<Option<String>> = Signal::global(|| None);
 /// settings push), this only advances when a real solve runs — so the panel
 /// can tell when a static engine has un-applied slider edits pending.
 static LAST_SOLVED: GlobalSignal<Option<(String, Value)>> = Signal::global(|| None);
+static CONTROL_REQUEST_TOKEN: GlobalSignal<u64> = Signal::global(|| 0);
+static CONTROL_BUSY: GlobalSignal<bool> = Signal::global(|| false);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RemoteLease {
+    graph_revision: u64,
+    selection_generation: u64,
+}
+
+static REMOTE_LEASE_VIEW: GlobalSignal<Option<RemoteLease>> = Signal::global(|| None);
 
 // --- /compute wire types (FROZEN CONTRACT — see graph-api/src/server.rs) --------
 
@@ -138,6 +148,8 @@ struct ComputeEngines {
     active: String,
     #[serde(default)]
     engines: Vec<EngineInfo>,
+    #[serde(default)]
+    selection_generation: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Deserialize)]
@@ -154,15 +166,235 @@ struct EngineInfo {
 struct ComputeHealth {
     connected: bool,
     url: String,
+    #[serde(default)]
+    worker_ok: bool,
+    #[serde(default)]
+    requested_layout_id: String,
+    #[serde(default)]
+    effective_layout_id: String,
+    #[serde(default)]
+    fallback_reason: Option<String>,
+    #[serde(default)]
+    worker_status_error: Option<String>,
+    #[serde(default)]
+    selection_generation: u64,
+    #[serde(default)]
+    graph_revision: u64,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct HealthView {
+    class: &'static str,
+    text: String,
+}
+
+fn worker_health_view(health: Option<&ComputeHealth>) -> HealthView {
+    let Some(health) = health else {
+        return HealthView {
+            class: "lay-health",
+            text: "compute worker — (no /compute/health yet)".into(),
+        };
+    };
+    if !health.connected {
+        return HealthView {
+            class: "lay-health bad",
+            text: format!("compute worker ○ disconnected — {}", health.url),
+        };
+    }
+    if let Some(error) = health.worker_status_error.as_deref() {
+        return HealthView {
+            class: "lay-health bad",
+            text: format!("compute worker ◐ connected, status unavailable — {error}"),
+        };
+    }
+    if !health.worker_ok {
+        return HealthView {
+            class: "lay-health bad",
+            text: "compute worker ◐ connected, not ready".into(),
+        };
+    }
+    HealthView {
+        class: "lay-health ok",
+        text: format!("compute worker ● ready — {}", health.url),
+    }
+}
+
+fn remote_solver_status(
+    health: Option<&ComputeHealth>,
+    lease: Option<RemoteLease>,
+    control_busy: bool,
+) -> String {
+    if control_busy {
+        return "selecting engine…".into();
+    }
+    let Some(lease) = lease else {
+        return "not attached".into();
+    };
+    let Some(health) = health else {
+        return format!(
+            "attached at selection g{} · awaiting worker status",
+            lease.selection_generation
+        );
+    };
+    if health.graph_revision != lease.graph_revision
+        || health.selection_generation != lease.selection_generation
+    {
+        return format!(
+            "refreshing status for graph r{} · selection g{}",
+            lease.graph_revision, lease.selection_generation
+        );
+    }
+    if !health.connected {
+        return "disconnected".into();
+    }
+    if let Some(error) = health.worker_status_error.as_deref() {
+        return format!("worker status unavailable: {error}");
+    }
+    if !health.worker_ok {
+        return "worker not ready".into();
+    }
+
+    let requested = health.requested_layout_id.trim();
+    let effective = health.effective_layout_id.trim();
+    if effective.is_empty() {
+        return format!(
+            "requested {} · no effective engine reported · selection g{}",
+            if requested.is_empty() { "unknown" } else { requested },
+            lease.selection_generation
+        );
+    }
+    if !requested.is_empty() && requested != effective {
+        let reason = health
+            .fallback_reason
+            .as_deref()
+            .filter(|reason| !reason.trim().is_empty())
+            .unwrap_or("worker fallback");
+        return format!(
+            "requested {requested} → effective {effective} · fallback: {reason} · selection g{}",
+            lease.selection_generation
+        );
+    }
+    if let Some(reason) = health
+        .fallback_reason
+        .as_deref()
+        .filter(|reason| !reason.trim().is_empty())
+    {
+        return format!(
+            "effective {effective} · {reason} · selection g{}",
+            lease.selection_generation
+        );
+    }
+    format!(
+        "effective {effective} · selection g{}",
+        lease.selection_generation
+    )
 }
 
 async fn fetch_compute() {
     let r = get_json::<ComputeEngines>("/compute/engines").await;
+    let connected = r.as_ref().map(|v| v.connected).unwrap_or(false);
+    if let Ok(view) = &r {
+        KNOWN_SELECTION_GENERATION.with(|g| g.set(view.selection_generation));
+    }
     *COMPUTE.write() = Some(r);
     match get_json::<ComputeHealth>("/compute/health").await {
         Ok(h) => *HEALTH.write() = Some(h),
         Err(_) => *HEALTH.write() = None,
     }
+    let should_sync = connected
+        && should_sync_remote_session(
+            active_is_remote(),
+            EXPECTED_GRAPH_REVISION.with(std::cell::Cell::get),
+            expected_stream_lease(),
+            *CONTROL_BUSY.peek(),
+        );
+    if should_sync {
+        request_remote_selection();
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct ComputeLayoutPutReq {
+    graph_revision: u64,
+    layout_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    params: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    lens: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    expected_generation: Option<u64>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+struct ComputeLayoutPutResp {
+    ok: bool,
+    #[serde(default)]
+    changed: bool,
+    #[serde(default)]
+    graph_revision: u64,
+    #[serde(default)]
+    selection_generation: u64,
+    #[serde(default)]
+    error: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+struct InitialPlacementResp {
+    ok: bool,
+    #[serde(default)]
+    n_nodes: u32,
+    #[serde(default)]
+    graph_revision: u64,
+    #[serde(default)]
+    selection_generation: u64,
+    #[serde(default)]
+    error: Option<String>,
+}
+
+fn validate_placement_response(
+    response: &InitialPlacementResp,
+    expected: RemoteLease,
+    n_nodes: usize,
+) -> Result<(), String> {
+    if !response.ok {
+        return Err(response.error.clone().unwrap_or_else(|| "initial placement rejected".into()));
+    }
+    if response.n_nodes as usize != n_nodes {
+        return Err(format!("worker placed {} nodes; expected {n_nodes}", response.n_nodes));
+    }
+    if response.graph_revision != expected.graph_revision {
+        return Err(format!(
+            "placement graph revision {} != active revision {}",
+            response.graph_revision, expected.graph_revision
+        ));
+    }
+    if response.selection_generation != expected.selection_generation {
+        return Err(format!(
+            "placement changed selection generation {} -> {}",
+            expected.selection_generation, response.selection_generation
+        ));
+    }
+    Ok(())
+}
+
+fn positions_le_bytes(positions: &[f32], n_nodes: usize) -> Result<Vec<u8>, String> {
+    let expected_components = n_nodes
+        .checked_mul(3)
+        .ok_or_else(|| "node count is too large for a placement".to_string())?;
+    if positions.len() != expected_components {
+        return Err(format!(
+            "placement has {} components; expected {expected_components} for {n_nodes} nodes",
+            positions.len()
+        ));
+    }
+    let mut bytes = Vec::with_capacity(positions.len() * 4);
+    for (i, value) in positions.iter().copied().enumerate() {
+        if !value.is_finite() {
+            return Err(format!("position component {i} is not finite"));
+        }
+        bytes.extend_from_slice(&value.to_le_bytes());
+    }
+    Ok(bytes)
 }
 
 // --- engine registry -------------------------------------------------------------
@@ -303,7 +535,11 @@ fn put_settings(id: &str, v: Value) {
     st.settings.insert(id.to_string(), v);
     persist(&st);
     *STATE.write() = st;
-    apply_engine(false);
+    if active_is_remote() && STATE.peek().active == id {
+        request_remote_selection();
+    } else {
+        apply_engine(false);
+    }
 }
 
 fn save_settings<T: Serialize>(id: &str, s: &T) {
@@ -329,9 +565,8 @@ fn set_active(id: &str) {
 }
 
 /// Route a worker engine id to the appropriate bridge and patch that
-/// bridge's persisted settings. The `?layout_id=` query on the stream
-/// (built from these settings) self-selects the worker engine, so no
-/// `PUT /compute/layout` is needed.
+/// bridge's persisted settings. The control-plane PUT below is the sole
+/// selection mutation; WebSocket open/reconnect is read-only.
 fn select_remote_engine(engine_id: &str) {
     let mut st = STATE.read().clone();
     match engine_id {
@@ -367,7 +602,112 @@ fn select_remote_engine(engine_id: &str) {
     }
     persist(&st);
     *STATE.write() = st;
-    apply_engine(false);
+    request_remote_selection();
+}
+
+fn desired_remote_selection() -> Option<ComputeLayoutPutReq> {
+    let st = STATE.peek().clone();
+    match st.active.as_str() {
+        BRIDGE_GEOMETRIC => {
+            let lens: LensConfig = st
+                .settings
+                .get(BRIDGE_GEOMETRIC)
+                .cloned()
+                .and_then(|v| serde_json::from_value(v).ok())
+                .unwrap_or_else(default_lens);
+            Some(ComputeLayoutPutReq {
+                graph_revision: 0,
+                layout_id: if lens.use_gpu { "geometric-gpu" } else { "geometric" }.into(),
+                params: None,
+                lens: serde_json::to_value(lens).ok(),
+                expected_generation: None,
+            })
+        }
+        BRIDGE_REMOTE_FA2 => {
+            let settings: RemoteFa2Settings = st
+                .settings
+                .get(BRIDGE_REMOTE_FA2)
+                .cloned()
+                .and_then(|v| serde_json::from_value(v).ok())
+                .unwrap_or_default();
+            Some(ComputeLayoutPutReq {
+                graph_revision: 0,
+                layout_id: settings.layout_id,
+                params: None,
+                lens: None,
+                expected_generation: None,
+            })
+        }
+        _ => None,
+    }
+}
+
+/// Serialize one desired remote selection through the versioned singleton
+/// control API. A rapid newer edit supersedes this task; if its first request
+/// observes a stale generation it retries the same latest intent against the
+/// generation returned by the server.
+fn request_remote_selection() {
+    let Some(mut request) = desired_remote_selection() else { return };
+    let Some(graph_revision) = EXPECTED_GRAPH_REVISION.with(std::cell::Cell::get) else {
+        *SOLVE_MSG.write() = "remote layout unavailable: graph has no server revision".into();
+        return;
+    };
+    request.graph_revision = graph_revision;
+    let token = CONTROL_REQUEST_TOKEN.peek().wrapping_add(1);
+    *CONTROL_REQUEST_TOKEN.write() = token;
+    *CONTROL_BUSY.write() = true;
+    set_stream_lease(None);
+    wasm_bindgen_futures::spawn_local(async move {
+        let mut expected = KNOWN_SELECTION_GENERATION.with(std::cell::Cell::get);
+        for _ in 0..3 {
+            request.expected_generation = (expected != 0).then_some(expected);
+            let response = put_json::<_, ComputeLayoutPutResp>("/compute/layout", &request).await;
+            if *CONTROL_REQUEST_TOKEN.peek() != token {
+                return;
+            }
+            match response {
+                Ok(resp) => {
+                    if resp.selection_generation != 0 {
+                        KNOWN_SELECTION_GENERATION.with(|g| g.set(resp.selection_generation));
+                    }
+                    if resp.ok {
+                        if resp.graph_revision != graph_revision || resp.selection_generation == 0 {
+                            *SOLVE_MSG.write() = format!(
+                                "remote selection identity mismatch (graph r{}, generation {})",
+                                resp.graph_revision, resp.selection_generation
+                            );
+                            break;
+                        }
+                        set_stream_lease(Some(RemoteLease {
+                            graph_revision: resp.graph_revision,
+                            selection_generation: resp.selection_generation,
+                        }));
+                        *PREV_APPLIED.write() = None;
+                        *SOLVE_MSG.write() = if resp.changed {
+                            format!("worker selection generation {}", resp.selection_generation)
+                        } else {
+                            format!("worker selection unchanged at generation {}", resp.selection_generation)
+                        };
+                        apply_engine(false);
+                        break;
+                    }
+                    if resp.selection_generation != 0 && resp.selection_generation != expected {
+                        expected = resp.selection_generation;
+                        continue;
+                    }
+                    *SOLVE_MSG.write() = resp.error.unwrap_or_else(|| "remote selection rejected".into());
+                    break;
+                }
+                Err(e) => {
+                    *SOLVE_MSG.write() = format!("remote selection failed: {e}");
+                    break;
+                }
+            }
+        }
+        if *CONTROL_REQUEST_TOKEN.peek() == token {
+            *CONTROL_BUSY.write() = false;
+        }
+    });
 }
 
 /// One worker connection (URL + reconnect backoff) shared by every remote
@@ -417,7 +757,11 @@ fn restart_active() {
 /// matches a `/compute/soup` morphology, so the Layout panel reflects (and can
 /// keep tuning) what the Generate panel's "Assemble" just started on the
 /// worker. Keeps the two self-assembly surfaces from silently disagreeing.
-pub(crate) fn stage_self_assembly(morphology: &str) {
+pub(crate) fn stage_self_assembly(
+    morphology: &str,
+    graph_revision: u64,
+    selection_generation: u64,
+) {
     let preset = match morphology {
         "chains" => Some(SelfAssemblyPreset::LipidChain),
         "sheet" => Some(SelfAssemblyPreset::HoneycombSheet),
@@ -425,9 +769,33 @@ pub(crate) fn stage_self_assembly(morphology: &str) {
         "vesicle" => Some(SelfAssemblyPreset::Vesicle),
         _ => None,
     };
-    select_remote_engine("geometric-gpu");
+    let mut st = STATE.peek().clone();
+    st.active = BRIDGE_GEOMETRIC.to_string();
+    let json = st
+        .settings
+        .entry(BRIDGE_GEOMETRIC.to_string())
+        .or_insert_with(|| default_settings(BRIDGE_GEOMETRIC));
+    let mut cfg: LensConfig =
+        serde_json::from_value(json.clone()).unwrap_or_else(|_| default_lens());
+    cfg.use_gpu = true;
     if let Some(preset) = preset {
-        edit::<LensConfig>(BRIDGE_GEOMETRIC, |c| preset.apply_to(c));
+        preset.apply_to(&mut cfg);
+    }
+    if let Ok(value) = serde_json::to_value(cfg) {
+        *json = value;
+    }
+    persist(&st);
+    *STATE.write() = st;
+    KNOWN_SELECTION_GENERATION.with(|g| g.set(selection_generation));
+    if EXPECTED_GRAPH_REVISION.with(std::cell::Cell::get) == Some(graph_revision)
+        && graph_revision != 0
+        && selection_generation != 0
+    {
+        set_stream_lease(Some(RemoteLease { graph_revision, selection_generation }));
+        *PREV_APPLIED.write() = None;
+        apply_engine(false);
+    } else {
+        *SOLVE_MSG.write() = "self-assembly control identity does not match the loaded graph".into();
     }
 }
 
@@ -574,7 +942,11 @@ enum LayoutPreset {
 }
 
 impl LayoutPreset {
-    const ALL: [LayoutPreset; 3] = [LayoutPreset::Fast, LayoutPreset::Balanced, LayoutPreset::Pretty];
+    const ALL: [LayoutPreset; 3] = [
+        LayoutPreset::Fast,
+        LayoutPreset::Balanced,
+        LayoutPreset::Pretty,
+    ];
 
     fn label(self) -> &'static str {
         match self {
@@ -661,6 +1033,15 @@ fn default_stream_url() -> String {
     format!("{ws}/graph/layout/stream")
 }
 
+fn versioned_stream_url(base: &str) -> Option<String> {
+    let lease = expected_stream_lease()?;
+    let sep = if base.contains('?') { '&' } else { '?' };
+    Some(format!(
+        "{base}{sep}graph_revision={}&selection_generation={}",
+        lease.graph_revision, lease.selection_generation
+    ))
+}
+
 fn default_lens() -> LensConfig {
     let mut c = LensConfig::default();
     c.url = default_stream_url();
@@ -671,7 +1052,7 @@ fn default_lens() -> LensConfig {
 struct RemoteFa2Settings {
     url: String,
     reconnect_backoff_ms: u32,
-    /// Worker engine id this generic bridge requests via `?layout_id=`.
+    /// Worker engine id selected through the authoritative control PUT.
     #[serde(default = "default_layout_id")]
     layout_id: String,
 }
@@ -690,19 +1071,75 @@ impl Default for RemoteFa2Settings {
     }
 }
 
-/// Shared latch — the WS consumer task drops the latest decoded positions
-/// vec here; `step_with_encoder` `take()`s it and uploads to the GPU.
-type Latch = Arc<Mutex<Option<Vec<f32>>>>;
+#[derive(Debug)]
+struct RemoteFrame {
+    graph_revision: u64,
+    selection_generation: u64,
+    positions: Vec<f32>,
+}
+
+/// Shared latch — the WS consumer task drops the latest decoded frame here;
+/// `step_with_encoder` validates its topology identity before GPU upload.
+type Latch = Arc<Mutex<Option<RemoteFrame>>>;
+
+thread_local! {
+    static EXPECTED_GRAPH_REVISION: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+    static EXPECTED_SELECTION_GENERATION: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+    static KNOWN_SELECTION_GENERATION: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+fn set_stream_lease(lease: Option<RemoteLease>) {
+    EXPECTED_SELECTION_GENERATION.with(|g| g.set(lease.map(|l| l.selection_generation)));
+    *REMOTE_LEASE_VIEW.write() = lease;
+}
+
+/// Set by the graph-session owner on every replacement. `None` intentionally
+/// disables remote frames for browser-only and legacy/unidentified graphs.
+pub(crate) fn set_expected_graph_revision(revision: Option<u64>) {
+    EXPECTED_GRAPH_REVISION.with(|r| r.set(revision.filter(|v| *v != 0)));
+    set_stream_lease(None);
+}
+
+fn frame_matches_expected(
+    graph_revision: u64,
+    selection_generation: u64,
+    expected: Option<RemoteLease>,
+) -> bool {
+    expected == Some(RemoteLease { graph_revision, selection_generation })
+        && graph_revision != 0
+        && selection_generation != 0
+}
+
+fn expected_stream_lease() -> Option<RemoteLease> {
+    let graph_revision = EXPECTED_GRAPH_REVISION.with(std::cell::Cell::get)?;
+    let selection_generation = EXPECTED_SELECTION_GENERATION.with(std::cell::Cell::get)?;
+    Some(RemoteLease { graph_revision, selection_generation })
+}
+
+fn should_sync_remote_session(
+    active_remote: bool,
+    graph_revision: Option<u64>,
+    lease: Option<RemoteLease>,
+    control_busy: bool,
+) -> bool {
+    active_remote && graph_revision.is_some() && lease.is_none() && !control_busy
+}
+
+fn frame_matches_active_graph(graph_revision: u64, selection_generation: u64) -> bool {
+    frame_matches_expected(graph_revision, selection_generation, expected_stream_lease())
+}
 
 /// Wire format (matches graph-api's ws_handler):
-/// `[u64 LE frame][u32 LE n_nodes][f32 LE positions; n_nodes * 3]`
-fn parse_frame(bytes: &[u8]) -> Option<(u64, u32, Vec<f32>)> {
-    if bytes.len() < 12 {
+/// `[u64 graph_revision][u64 selection_generation][u64 frame][u32 n][xyz]`
+fn parse_frame(bytes: &[u8]) -> Option<(u64, u64, u64, u32, Vec<f32>)> {
+    if bytes.len() < 28 {
         return None;
     }
-    let frame = u64::from_le_bytes(bytes[0..8].try_into().ok()?);
-    let n = u32::from_le_bytes(bytes[8..12].try_into().ok()?);
-    let body = &bytes[12..];
+    let graph_revision = u64::from_le_bytes(bytes[0..8].try_into().ok()?);
+    let selection_generation = u64::from_le_bytes(bytes[8..16].try_into().ok()?);
+    let frame = u64::from_le_bytes(bytes[16..24].try_into().ok()?);
+    let n = u32::from_le_bytes(bytes[24..28].try_into().ok()?);
+    let body = &bytes[28..];
     if body.len() != (n as usize) * 12 {
         return None;
     }
@@ -712,7 +1149,7 @@ fn parse_frame(bytes: &[u8]) -> Option<(u64, u32, Vec<f32>)> {
     for chunk in body.chunks_exact(4) {
         out.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
     }
-    Some((frame, n, out))
+    Some((graph_revision, selection_generation, frame, n, out))
 }
 
 fn spawn_ws_consumer(url: String, backoff_ms: u32, latch: Latch) {
@@ -740,9 +1177,18 @@ async fn ws_consumer_loop(url: String, base_backoff_ms: u32, latch: Latch) {
                 while let Some(msg) = stream.next().await {
                     match msg {
                         Ok(Message::Bytes(bytes)) => {
-                            if let Some((_frame, _n, positions)) = parse_frame(&bytes) {
+                            if let Some((graph_revision, selection_generation, _frame, _n, positions)) =
+                                parse_frame(&bytes)
+                            {
+                                if !frame_matches_active_graph(graph_revision, selection_generation) {
+                                    continue;
+                                }
                                 if let Ok(mut g) = latch.lock() {
-                                    *g = Some(positions);
+                                    *g = Some(RemoteFrame {
+                                        graph_revision,
+                                        selection_generation,
+                                        positions,
+                                    });
                                 }
                             }
                         }
@@ -761,7 +1207,7 @@ async fn ws_consumer_loop(url: String, base_backoff_ms: u32, latch: Latch) {
     }
 }
 
-/// Generic remote bridge: consumes `/graph/layout/stream?layout_id=` and
+/// Generic remote bridge: consumes the versioned `/graph/layout/stream` and
 /// writes the latched frames into the shared positions buffer each tick.
 /// No compute pass — purely a "remote sink".
 struct RemoteFa2Layout {
@@ -781,20 +1227,24 @@ impl RemoteFa2Layout {
         }
     }
 
-    fn stream_url(&self) -> String {
-        let sep = if self.settings.url.contains('?') { '&' } else { '?' };
-        format!("{}{}layout_id={}", self.settings.url, sep, self.settings.layout_id)
+    fn stream_url(&self) -> Option<String> {
+        versioned_stream_url(&self.settings.url)
     }
 
     /// (Re)spawn the WS consumer when the effective URL changed. Called from
-    /// both init and step so a settings-only engine change (same bridge id →
-    /// no layout swap) still reaches a new `?layout_id=` stream. Replacing
-    /// the latch drops the old consumer's only other Arc, ending its loop.
+    /// both init and step so a newly-issued selection generation reaches a
+    /// fresh read-only stream even when the bridge id itself did not change.
+    /// Replacing the latch drops the old consumer's other Arc and ends it.
     fn ensure_stream(&mut self) {
         if self.n_nodes == 0 {
             return;
         }
-        let url = self.stream_url();
+        let Some(url) = self.stream_url() else {
+            if self.spawned_url.take().is_some() {
+                self.latch = Arc::new(Mutex::new(None));
+            }
+            return;
+        };
         if self.spawned_url.as_deref() == Some(url.as_str()) {
             return;
         }
@@ -814,8 +1264,8 @@ impl PhysicsLayout for RemoteFa2Layout {
             kind: LayoutKind::Physics,
             display_name: "Remote (compute)",
             description: "Stream positions from the remote graph-compute worker over WebSocket. \
-                 The worker engine is requested per-connection via the stream's \
-                 `?layout_id=` query.",
+                 Engine selection happens once through graph-api's versioned control API; \
+                 stream reconnects are read-only.",
             requirements: LayoutRequirements {
                 needs_edges: false,
                 needs_cpu_positions: false,
@@ -852,11 +1302,14 @@ impl PhysicsLayout for RemoteFa2Layout {
             Ok(mut g) => g.take(),
             Err(_) => return,
         };
-        let Some(positions) = positions else { return };
+        let Some(frame) = positions else { return };
+        if !frame_matches_active_graph(frame.graph_revision, frame.selection_generation) {
+            return;
+        }
         // Frames whose n mismatches the local topology are dropped — guards
         // against a worker that hasn't picked up the same graph load yet.
-        if positions.len() == 3 * (self.n_nodes as usize) && self.n_nodes > 0 {
-            queue.write_buffer(positions_buf, 0, bytemuck::cast_slice(&positions));
+        if frame.positions.len() == 3 * (self.n_nodes as usize) && self.n_nodes > 0 {
+            queue.write_buffer(positions_buf, 0, bytemuck::cast_slice(&frame.positions));
         }
     }
 
@@ -868,8 +1321,8 @@ impl PhysicsLayout for RemoteFa2Layout {
     }
 }
 
-/// Geometric-engine bridge: same sink, but the resolved lens rides in
-/// `?lens=` and the CPU↔GPU backend choice in `?layout_id=`.
+/// Geometric-engine bridge: same versioned stream sink. The resolved lens and
+/// CPU/GPU choice are applied once through the control-plane PUT.
 struct RemoteGeometricLayout {
     settings: LensConfig,
     latch: Latch,
@@ -887,18 +1340,20 @@ impl RemoteGeometricLayout {
         }
     }
 
-    fn stream_url(&self) -> String {
-        let backend_id = if self.settings.use_gpu { "geometric-gpu" } else { BRIDGE_GEOMETRIC };
-        let lens_json = serde_json::to_string(&self.settings).unwrap_or_default();
-        let encoded_lens = urlencoding::encode(&lens_json);
-        format!("{}?layout_id={}&lens={}", self.settings.url, backend_id, encoded_lens)
+    fn stream_url(&self) -> Option<String> {
+        versioned_stream_url(&self.settings.url)
     }
 
     fn ensure_stream(&mut self) {
         if self.n_nodes == 0 {
             return;
         }
-        let url = self.stream_url();
+        let Some(url) = self.stream_url() else {
+            if self.spawned_url.take().is_some() {
+                self.latch = Arc::new(Mutex::new(None));
+            }
+            return;
+        };
         if self.spawned_url.as_deref() == Some(url.as_str()) {
             return;
         }
@@ -957,9 +1412,12 @@ impl PhysicsLayout for RemoteGeometricLayout {
             Ok(mut g) => g.take(),
             Err(_) => return,
         };
-        let Some(positions) = positions else { return };
-        if positions.len() == 3 * (self.n_nodes as usize) && self.n_nodes > 0 {
-            queue.write_buffer(positions_buf, 0, bytemuck::cast_slice(&positions));
+        let Some(frame) = positions else { return };
+        if !frame_matches_active_graph(frame.graph_revision, frame.selection_generation) {
+            return;
+        }
+        if frame.positions.len() == 3 * (self.n_nodes as usize) && self.n_nodes > 0 {
+            queue.write_buffer(positions_buf, 0, bytemuck::cast_slice(&frame.positions));
         }
     }
 
@@ -1174,9 +1632,13 @@ fn set_gpu_force_seed_mode(keep: bool) {
     let mode = if keep { "none" } else { "random" };
     let n = render::with_host(|h| h.pipes.n_nodes() as usize).unwrap_or(0);
     let mut st = STATE.read().clone();
-    let entry = st.settings.entry("gpu-force".to_string()).or_insert_with(|| {
-        serde_json::to_value(GpuForceOptions::for_n_nodes(n)).unwrap_or_else(|_| serde_json::json!({}))
-    });
+    let entry = st
+        .settings
+        .entry("gpu-force".to_string())
+        .or_insert_with(|| {
+            serde_json::to_value(GpuForceOptions::for_n_nodes(n))
+                .unwrap_or_else(|_| serde_json::json!({}))
+        });
     if let Some(obj) = entry.as_object_mut() {
         obj.insert("seed_mode".to_string(), serde_json::json!(mode));
     }
@@ -1230,18 +1692,81 @@ fn apply_seed_expr(expr: &str) {
                 return;
             }
             let flat: Vec<f32> = positions.into_iter().flatten().collect();
-            match render::with_host(|h| h.apply_positions(&flat)) {
-                Some(Ok(())) => {
-                    *SEED_STATUS.write() = Some(format!("applied {n} positions"));
-                    // Keep the just-applied positions through the sim re-init.
-                    set_gpu_force_seed_mode(true);
-                }
+            if active_is_remote() {
+                apply_remote_initial_placement(flat, n);
+            } else {
+                match render::with_host(|h| h.apply_positions(&flat)) {
+                    Some(Ok(())) => {
+                        *SEED_STATUS.write() = Some(format!("applied {n} positions locally"));
+                        // Keep the just-applied positions through the sim re-init.
+                        set_gpu_force_seed_mode(true);
+                    }
                 Some(Err(e)) => *SEED_ERROR.write() = Some(e),
-                None => *SEED_ERROR.write() = Some("renderer not mounted".to_string()),
+                    None => *SEED_ERROR.write() = Some("renderer not mounted".to_string()),
+                }
             }
         }
         Err(err) => *SEED_ERROR.write() = Some(err),
     }
+}
+
+fn apply_remote_initial_placement(positions: Vec<f32>, n_nodes: usize) {
+    let Some(expected) = expected_stream_lease() else {
+        *SEED_ERROR.write() = Some(
+            "remote placement unavailable: select a worker engine for this graph first".into(),
+        );
+        return;
+    };
+    let bytes = match positions_le_bytes(&positions, n_nodes) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            *SEED_ERROR.write() = Some(error);
+            return;
+        }
+    };
+    *SEED_STATUS.write() = Some("sending starting placement to the remote solver…".into());
+    *SEED_ERROR.write() = None;
+    wasm_bindgen_futures::spawn_local(async move {
+        let path = format!(
+            "/compute/initial-placement?graph_revision={}&selection_generation={}",
+            expected.graph_revision, expected.selection_generation
+        );
+        let response = put_raw_json::<InitialPlacementResp>(&path, bytes).await;
+        if expected_stream_lease() != Some(expected) {
+            *SEED_STATUS.write() = None;
+            *SEED_ERROR.write() = Some("graph or worker selection changed while placing nodes".into());
+            return;
+        }
+        match response.and_then(|r| {
+            validate_placement_response(&r, expected, n_nodes)?;
+            Ok(r)
+        }) {
+            Ok(_) => match render::with_host(|h| h.apply_positions(&positions)) {
+                Some(Ok(())) => {
+                    *SEED_STATUS.write() = Some(format!(
+                        "remote solver accepted {n_nodes} starting positions; view updated"
+                    ));
+                    *SEED_ERROR.write() = None;
+                }
+                Some(Err(error)) => {
+                    *SEED_STATUS.write() = None;
+                    *SEED_ERROR.write() = Some(format!(
+                        "worker accepted placement, but the view could not update: {error}"
+                    ));
+                }
+                None => {
+                    *SEED_STATUS.write() = None;
+                    *SEED_ERROR.write() = Some(
+                        "worker accepted placement, but the Graph panel is not mounted".into(),
+                    );
+                }
+            },
+            Err(error) => {
+                *SEED_STATUS.write() = None;
+                *SEED_ERROR.write() = Some(error);
+            }
+        }
+    });
 }
 
 /// Minimal "No seed" placement for a freshly generated graph: a small
@@ -1277,9 +1802,7 @@ pub(crate) fn seed_positions_for_generated(n: usize) -> Vec<f32> {
     let st = STATE.read().clone();
     let expr: Option<String> = match st.seed_strategy {
         SeedStrategy::None => None,
-        SeedStrategy::BuiltIn(i) => tvix_wasm::seed_demos()
-            .get(i)
-            .map(|d| d.expr.to_string()),
+        SeedStrategy::BuiltIn(i) => tvix_wasm::seed_demos().get(i).map(|d| d.expr.to_string()),
         SeedStrategy::Custom => Some(st.seed_custom),
     };
     match expr {
@@ -1411,7 +1934,12 @@ fn CheckRow(
 }
 
 #[component]
-fn TextRow(label: String, value: String, on: EventHandler<String>, title: Option<String>) -> Element {
+fn TextRow(
+    label: String,
+    value: String,
+    on: EventHandler<String>,
+    title: Option<String>,
+) -> Element {
     rsx! {
         div { class: "lay-row", title: title.unwrap_or_default(),
             span { class: "lay-k", "{label}" }
@@ -1461,7 +1989,46 @@ struct PickerOpt {
     disabled: bool,
 }
 
-pub fn panel(_ctx: Ctx) -> Element {
+pub(crate) fn active_is_remote() -> bool {
+    matches!(
+        STATE.peek().active.as_str(),
+        BRIDGE_GEOMETRIC | BRIDGE_REMOTE_FA2
+    )
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum HeaderRunControl {
+    LocalPhysics,
+    RemoteAttached,
+}
+
+fn header_run_control_for(
+    active: &str,
+    server_backed: bool,
+    remote_attached: bool,
+) -> Option<HeaderRunControl> {
+    if matches!(active, BRIDGE_GEOMETRIC | BRIDGE_REMOTE_FA2) {
+        return (server_backed && remote_attached).then_some(HeaderRunControl::RemoteAttached);
+    }
+    descriptor_for(active)
+        .filter(|descriptor| descriptor.kind == LayoutKind::Physics)
+        .map(|_| HeaderRunControl::LocalPhysics)
+}
+
+/// Header play/pause is only truthful for a live local physics engine or an
+/// attached remote stream. Static layouts and unattached/client-only bridges
+/// deliberately expose only the camera Fit action.
+pub(crate) fn header_run_control(server_backed: bool) -> Option<HeaderRunControl> {
+    let active = STATE.read().active.clone();
+    let remote_attached = REMOTE_LEASE_VIEW.read().is_some();
+    header_run_control_for(
+        active.as_str(),
+        server_backed,
+        remote_attached,
+    )
+}
+
+pub fn panel(ctx: Ctx) -> Element {
     // Re-push the persisted engine onto the live host once per panel mount
     // (the host always boots gpu-force; PREV_APPLIED gates redundant swaps).
     use_future(|| async {
@@ -1486,7 +2053,18 @@ pub fn panel(_ctx: Ctx) -> Element {
                     Some(Err(_)) => true,
                 }
             };
-            if needs {
+            // A graph replacement clears the remote lease even when the
+            // worker remains connected. Re-fetching the control view here
+            // reattaches the persisted remote engine to the new graph token;
+            // otherwise the old WebSocket would reconnect forever with a
+            // deliberately-invalid revision/generation pair.
+            let needs_session_sync = should_sync_remote_session(
+                active_is_remote(),
+                EXPECTED_GRAPH_REVISION.with(std::cell::Cell::get),
+                expected_stream_lease(),
+                *CONTROL_BUSY.peek(),
+            );
+            if needs || needs_session_sync {
                 fetch_compute().await;
             } else {
                 match get_json::<ComputeHealth>("/compute/health").await {
@@ -1499,6 +2077,7 @@ pub fn panel(_ctx: Ctx) -> Element {
     });
 
     let st = STATE.read().clone();
+    let server_backed = ctx.graph_session.read().is_server_backed();
     let active = st.active.clone();
     let lens: LensConfig = typed_settings(BRIDGE_GEOMETRIC);
     let fa2: RemoteFa2Settings = typed_settings(BRIDGE_REMOTE_FA2);
@@ -1506,7 +2085,11 @@ pub fn panel(_ctx: Ctx) -> Element {
     let picker_value = match active.as_str() {
         BRIDGE_GEOMETRIC => format!(
             "remote:{}",
-            if lens.use_gpu { "geometric-gpu" } else { BRIDGE_GEOMETRIC }
+            if lens.use_gpu {
+                "geometric-gpu"
+            } else {
+                BRIDGE_GEOMETRIC
+            }
         ),
         BRIDGE_REMOTE_FA2 => format!("remote:{}", fa2.layout_id),
         other => other.to_string(),
@@ -1545,7 +2128,7 @@ pub fn panel(_ctx: Ctx) -> Element {
                     },
                     value,
                     label: e.display_name.clone(),
-                    disabled: false,
+                    disabled: !server_backed,
                 });
             }
         }
@@ -1561,22 +2144,22 @@ pub fn panel(_ctx: Ctx) -> Element {
             value: picker_value.clone(),
             title: String::new(),
             selected: true,
-            disabled: false,
+            disabled: !server_backed,
         });
     }
 
     let health = HEALTH.read().clone();
-    let (health_class, health_txt) = match &health {
-        Some(h) if h.connected => {
-            ("lay-health ok", format!("compute worker ● connected — {}", h.url))
-        }
-        Some(h) => ("lay-health bad", format!("compute worker ○ disconnected — {}", h.url)),
-        None => ("lay-health", "compute worker — (no /compute/health yet)".to_string()),
-    };
+    let health_view = worker_health_view(health.as_ref());
 
     let desc = descriptor_for(&active);
-    let is_static = desc.as_ref().map(|d| d.kind == LayoutKind::Static).unwrap_or(false);
-    let is_physics = desc.as_ref().map(|d| d.kind == LayoutKind::Physics).unwrap_or(false);
+    let is_static = desc
+        .as_ref()
+        .map(|d| d.kind == LayoutKind::Static)
+        .unwrap_or(false);
+    let is_physics = desc
+        .as_ref()
+        .map(|d| d.kind == LayoutKind::Physics)
+        .unwrap_or(false);
     let is_bridge = active == BRIDGE_GEOMETRIC || active == BRIDGE_REMOTE_FA2;
     // Live sim state for the Pause/Resume toggle (physics + remote engines).
     let sim_running = *render::SIM_RUNNING.read();
@@ -1592,6 +2175,10 @@ pub fn panel(_ctx: Ctx) -> Element {
     let worker_url_val = worker_url();
     let worker_reconnect_val = worker_reconnect_ms();
     let solve_msg = SOLVE_MSG.read().clone();
+    let control_busy = *CONTROL_BUSY.read();
+    let remote_lease = *REMOTE_LEASE_VIEW.read();
+    let remote_solver = remote_solver_status(health.as_ref(), remote_lease, control_busy);
+    let history_mode = crate::panels::timeline::history_mode_label();
 
     rsx! {
         div { class: "lay",
@@ -1603,7 +2190,9 @@ pub fn panel(_ctx: Ctx) -> Element {
                     onchange: move |e| {
                         let v = e.value();
                         if let Some(rid) = v.strip_prefix("remote:") {
-                            select_remote_engine(rid);
+                            if server_backed {
+                                select_remote_engine(rid);
+                            }
                         } else if !v.is_empty() {
                             set_active(&v);
                         }
@@ -1653,7 +2242,23 @@ pub fn panel(_ctx: Ctx) -> Element {
             div { class: "lay-hint",
                 "Compute-worker engines stream from graph-compute via graph-api."
             }
-            div { class: "{health_class}", "{health_txt}" }
+            if !server_backed {
+                div { class: "lay-health bad",
+                    "Remote layouts are disabled: this graph exists only in the browser. \
+                     Choose a local engine or host the graph through graph-api."
+                }
+            }
+            div { class: "{health_view.class}", "{health_view.text}" }
+            if is_bridge {
+                div { class: "lay-hint",
+                    "solver: {remote_solver}"
+                }
+                div { class: "lay-hint",
+                    "display: "
+                    if sim_running { "following worker frames" } else { "frozen locally · worker still running" }
+                }
+                div { class: "lay-hint", "history: {history_mode}" }
+            }
 
             // One worker connection, shared by every remote engine (was
             // duplicated per-bridge). Only shown when a worker engine is active.
@@ -1668,7 +2273,7 @@ pub fn panel(_ctx: Ctx) -> Element {
 
             hr { class: "lay-sep" }
 
-            {seed_section()}
+            {seed_section(is_bridge)}
 
             hr { class: "lay-sep" }
 
@@ -1707,9 +2312,15 @@ pub fn panel(_ctx: Ctx) -> Element {
                     if is_physics {
                         button {
                             class: "lay-btn",
-                            title: "Pause or resume the running layout (also on the graph HUD).",
+                            title: if is_bridge {
+                                "Freeze or resume position updates in this view; the remote worker keeps running."
+                            } else {
+                                "Pause or resume the local running layout (also on the graph HUD)."
+                            },
                             onclick: move |_| render::set_sim_running(!sim_running),
-                            { if sim_running { "Pause" } else { "Resume" } }
+                            { if is_bridge {
+                                if sim_running { "Freeze view" } else { "Follow live" }
+                            } else if sim_running { "Pause" } else { "Resume" } }
                         }
                     }
                 }
@@ -1726,7 +2337,7 @@ pub fn panel(_ctx: Ctx) -> Element {
 
 // --- seed section --------------------------------------------------------------------
 
-fn seed_section() -> Element {
+fn seed_section(remote: bool) -> Element {
     let st = STATE.read().clone();
     let strategy = st.seed_strategy.clone();
 
@@ -1787,10 +2398,15 @@ fn seed_section() -> Element {
     let error = SEED_ERROR.read().clone();
 
     rsx! {
-        div { class: "lay-sub", "Initial seed" }
+        div { class: "lay-sub", if remote { "Remote starting placement" } else { "Starting placement" } }
         div { class: "lay-hint",
-            "Place nodes before the sim runs. Pick a built-in, write a custom Nix seed, \
-             or apply none."
+            if remote {
+                "Apply evaluates the seed, sends those starting positions to the remote worker, \
+                 and updates this view only after the worker accepts them."
+            } else {
+                "Reposition the current graph before waking the local layout. Pick a built-in, \
+                 write a custom Nix seed, or leave positions unchanged."
+            }
         }
         div { class: "lay-row",
             span { class: "lay-k", "seed" }
@@ -1862,6 +2478,158 @@ fn engine_params(active: &str) -> Element {
         _ => rsx! {
             div { class: "lay-hint", "No layout registered for active id — pick one above." }
         },
+    }
+}
+
+#[cfg(test)]
+mod frame_tests {
+    use super::{
+        frame_matches_expected, header_run_control_for, parse_frame, positions_le_bytes,
+        remote_solver_status, should_sync_remote_session, validate_placement_response,
+        ComputeHealth, HeaderRunControl, InitialPlacementResp, RemoteLease,
+        BRIDGE_REMOTE_FA2,
+    };
+
+    fn lease() -> RemoteLease {
+        RemoteLease {
+            graph_revision: 17,
+            selection_generation: 9,
+        }
+    }
+
+    fn health(requested: &str, effective: &str) -> ComputeHealth {
+        ComputeHealth {
+            connected: true,
+            url: "http://worker".into(),
+            worker_ok: true,
+            requested_layout_id: requested.into(),
+            effective_layout_id: effective.into(),
+            fallback_reason: None,
+            worker_status_error: None,
+            selection_generation: 9,
+            graph_revision: 17,
+        }
+    }
+
+    #[test]
+    fn remote_frame_carries_graph_revision() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&17_u64.to_le_bytes());
+        bytes.extend_from_slice(&9_u64.to_le_bytes());
+        bytes.extend_from_slice(&4_u64.to_le_bytes());
+        bytes.extend_from_slice(&1_u32.to_le_bytes());
+        for value in [1.0_f32, -2.0, 3.5] {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        let (revision, generation, frame, n, positions) =
+            parse_frame(&bytes).expect("valid frame");
+        assert_eq!((revision, generation, frame, n), (17, 9, 4, 1));
+        assert_eq!(positions, vec![1.0, -2.0, 3.5]);
+    }
+
+    #[test]
+    fn remote_frame_rejects_legacy_and_truncated_headers() {
+        assert!(parse_frame(&[0; 12]).is_none());
+        let mut bytes = vec![0; 28];
+        bytes[24..28].copy_from_slice(&1_u32.to_le_bytes());
+        assert!(parse_frame(&bytes).is_none());
+    }
+
+    #[test]
+    fn frame_policy_requires_both_revision_and_selection_generation() {
+        let expected = Some(lease());
+        assert!(frame_matches_expected(17, 9, expected));
+        assert!(!frame_matches_expected(18, 9, expected));
+        assert!(!frame_matches_expected(17, 10, expected));
+        assert!(!frame_matches_expected(17, 9, None));
+        assert!(!frame_matches_expected(0, 9, Some(RemoteLease {
+            graph_revision: 0,
+            selection_generation: 9,
+        })));
+    }
+
+    #[test]
+    fn remote_graph_replacement_requires_control_plane_resync() {
+        assert!(should_sync_remote_session(true, Some(17), None, false));
+        assert!(!should_sync_remote_session(false, Some(17), None, false));
+        assert!(!should_sync_remote_session(true, None, None, false));
+        assert!(!should_sync_remote_session(
+            true,
+            Some(17),
+            Some(lease()),
+            false,
+        ));
+        assert!(!should_sync_remote_session(true, Some(17), None, true));
+    }
+
+    #[test]
+    fn header_run_action_only_describes_a_live_execution_mode() {
+        assert_eq!(
+            header_run_control_for("gpu-force", true, false),
+            Some(HeaderRunControl::LocalPhysics)
+        );
+        assert_eq!(header_run_control_for("grid", true, false), None);
+        assert_eq!(header_run_control_for(BRIDGE_REMOTE_FA2, false, true), None);
+        assert_eq!(header_run_control_for(BRIDGE_REMOTE_FA2, true, false), None);
+        assert_eq!(
+            header_run_control_for(BRIDGE_REMOTE_FA2, true, true),
+            Some(HeaderRunControl::RemoteAttached)
+        );
+    }
+
+    #[test]
+    fn solver_status_exposes_requested_to_effective_fallback() {
+        let mut view = health("cise", "fcose");
+        view.fallback_reason = Some("cise unavailable on this worker".into());
+        assert_eq!(
+            remote_solver_status(Some(&view), Some(lease()), false),
+            "requested cise → effective fcose · fallback: cise unavailable on this worker · selection g9"
+        );
+    }
+
+    #[test]
+    fn solver_status_never_applies_health_from_another_lease() {
+        let mut view = health("fcose", "fcose");
+        view.selection_generation = 10;
+        assert_eq!(
+            remote_solver_status(Some(&view), Some(lease()), false),
+            "refreshing status for graph r17 · selection g9"
+        );
+    }
+
+    #[test]
+    fn placement_response_must_preserve_the_exact_lease_and_arity() {
+        let accepted = InitialPlacementResp {
+            ok: true,
+            n_nodes: 2,
+            graph_revision: 17,
+            selection_generation: 9,
+            error: None,
+        };
+        assert!(validate_placement_response(&accepted, lease(), 2).is_ok());
+
+        let mut wrong_nodes = accepted.clone();
+        wrong_nodes.n_nodes = 3;
+        assert!(validate_placement_response(&wrong_nodes, lease(), 2).is_err());
+        let mut wrong_revision = accepted.clone();
+        wrong_revision.graph_revision = 18;
+        assert!(validate_placement_response(&wrong_revision, lease(), 2).is_err());
+        let mut wrong_generation = accepted;
+        wrong_generation.selection_generation = 10;
+        assert!(validate_placement_response(&wrong_generation, lease(), 2).is_err());
+    }
+
+    #[test]
+    fn placement_bytes_are_exact_little_endian_xyz_and_finite() {
+        let positions = [1.0_f32, -2.0, 3.5];
+        let encoded = positions_le_bytes(&positions, 1).expect("valid xyz");
+        let expected: Vec<u8> = positions
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect();
+        assert_eq!(encoded, expected);
+        assert!(positions_le_bytes(&positions, 2).is_err());
+        assert!(positions_le_bytes(&[0.0, f32::NAN, 1.0], 1).is_err());
     }
 }
 

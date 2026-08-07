@@ -253,7 +253,10 @@ pub(crate) struct PersistedKnobs {
 impl Default for PersistedKnobs {
     fn default() -> Self {
         // Same defaults as the egui `TimelineState`.
-        PersistedKnobs { depth: 300, stride: 1 }
+        PersistedKnobs {
+            depth: 300,
+            stride: 1,
+        }
     }
 }
 
@@ -264,13 +267,19 @@ fn load_knobs() -> PersistedKnobs {
 fn save_knobs() {
     let _ = LocalStorage::set(
         STORE_KEY,
-        PersistedKnobs { depth: *DEPTH.peek(), stride: *STRIDE.peek() },
+        PersistedKnobs {
+            depth: *DEPTH.peek(),
+            stride: *STRIDE.peek(),
+        },
     );
 }
 
 /// AppState round-trip seam (`crate::appstate`): the live capture knobs.
 pub(crate) fn state_snapshot() -> PersistedKnobs {
-    PersistedKnobs { depth: *DEPTH.read(), stride: *STRIDE.read() }
+    PersistedKnobs {
+        depth: *DEPTH.read(),
+        stride: *STRIDE.read(),
+    }
 }
 
 /// AppState round-trip seam: write imported knobs straight to localStorage;
@@ -308,6 +317,17 @@ thread_local! {
     static TICKER_STARTED: Cell<bool> = const { Cell::new(false) };
 }
 
+/// A frame index only has meaning within one graph session. Clear eagerly on
+/// replacement even when the new graph has the same number of nodes.
+pub(crate) fn reset_for_graph_session() {
+    RING.with(|r| r.borrow_mut().clear());
+    CAPTURE_IDX.with(|c| c.set(0));
+    SEEK_DIRTY.with(|c| c.set(false));
+    *SCRUB.write() = ScrubState::Live;
+    *BUFFERED_LEN.write() = 0;
+    *BUFFERED_BYTES.write() = 0;
+}
+
 /// Logical index the scrub UI points at: the paused frame when paused, else
 /// the head (newest buffered frame). Untracked — for handlers + the ticker.
 fn current_idx() -> usize {
@@ -328,6 +348,13 @@ fn pause_at(idx: usize) {
 fn resume_live() {
     *SCRUB.write() = ScrubState::Live;
     SEEK_DIRTY.with(|c| c.set(true));
+}
+
+pub(crate) fn history_mode_label() -> &'static str {
+    match *SCRUB.peek() {
+        ScrubState::Live => "capturing displayed positions",
+        ScrubState::Paused { .. } => "scrubbing frozen buffer",
+    }
 }
 
 // --- ticker (port of App::tick_timeline) ------------------------------------------
@@ -495,7 +522,14 @@ pub fn panel(_ctx: Ctx) -> Element {
     .min(max_idx);
 
     let shown = idx;
-    let status = if paused { "paused" } else { "live" };
+    let remote = crate::panels::layout::active_is_remote();
+    let status = if paused && remote {
+        "view frozen · worker still running"
+    } else if paused {
+        "paused"
+    } else {
+        "live"
+    };
     let bytes = *BUFFERED_BYTES.read();
     let depth = *DEPTH.read();
 
@@ -506,7 +540,13 @@ pub fn panel(_ctx: Ctx) -> Element {
                 // Play/Pause toggle. Live → "⏸ Pause"; Paused → "▶ Play".
                 button {
                     class: "btn",
-                    title: if paused { "Resume live simulation" } else { "Pause and scrub the buffered history" },
+                    title: if paused {
+                        if remote { "Follow the live worker stream again" } else { "Resume live simulation" }
+                    } else if remote {
+                        "Freeze the displayed history for scrubbing; the remote worker keeps running"
+                    } else {
+                        "Pause and scrub the buffered history"
+                    },
                     onclick: move |_| {
                         if paused {
                             resume_live();
@@ -516,7 +556,13 @@ pub fn panel(_ctx: Ctx) -> Element {
                             pause_at(max_idx);
                         }
                     },
-                    if paused { "▶ Play" } else { "⏸ Pause" }
+                    if paused {
+                        if remote { "▶ Follow live" } else { "▶ Play" }
+                    } else if remote {
+                        "⏸ Freeze view"
+                    } else {
+                        "⏸ Pause"
+                    }
                 }
                 // Step-back / step-forward only make sense while paused;
                 // pressing one while live first pauses at the head, then
@@ -622,6 +668,82 @@ fn knobs() -> Element {
              live frame. Raise stride (or lower depth) for large graphs — see the \
              memory budget in the timeline module."
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Frame, FrameRing};
+
+    fn frame(seed: f32) -> Vec<f32> {
+        vec![seed, seed + 1.0, seed + 2.0, seed + 3.0, seed + 4.0, seed + 5.0]
+    }
+
+    #[test]
+    fn reconstructs_keyframes_and_deltas_exactly() {
+        let mut ring = FrameRing::new(8, 3);
+        let frames: Vec<_> = (0..7).map(|i| frame(i as f32 * 10.0)).collect();
+        for positions in &frames {
+            ring.push(positions);
+        }
+        for (i, expected) in frames.iter().enumerate() {
+            assert_eq!(ring.get(i).as_deref(), Some(expected.as_slice()));
+        }
+        assert!(matches!(ring.frames[0], Frame::Key(_)));
+        assert!(matches!(ring.frames[3], Frame::Key(_)));
+        assert!(matches!(ring.frames[6], Frame::Key(_)));
+    }
+
+    #[test]
+    fn eviction_promotes_the_new_front_to_a_keyframe() {
+        let mut ring = FrameRing::new(3, 8);
+        let frames: Vec<_> = (0..5).map(|i| frame(i as f32)).collect();
+        for positions in &frames {
+            ring.push(positions);
+        }
+        assert_eq!(ring.len(), 3);
+        assert!(matches!(ring.frames.front(), Some(Frame::Key(_))));
+        assert_eq!(ring.get(0).as_deref(), Some(frames[2].as_slice()));
+        assert_eq!(ring.latest().as_deref(), Some(frames[4].as_slice()));
+    }
+
+    #[test]
+    fn component_count_change_resets_implicitly() {
+        let mut ring = FrameRing::new(8, 4);
+        ring.push(&frame(1.0));
+        ring.push(&frame(2.0));
+        let replacement = vec![9.0, 8.0, 7.0];
+        ring.push(&replacement);
+        assert_eq!(ring.len(), 1);
+        assert_eq!(ring.components(), Some(3));
+        assert_eq!(ring.latest().as_deref(), Some(replacement.as_slice()));
+    }
+
+    #[test]
+    fn same_arity_graph_requires_explicit_session_reset() {
+        let mut ring = FrameRing::new(8, 4);
+        ring.push(&frame(1.0));
+        ring.push(&frame(2.0));
+        // A replacement graph may have the same node count, so component
+        // count cannot identify the session boundary.
+        ring.clear();
+        let replacement = frame(100.0);
+        ring.push(&replacement);
+        assert_eq!(ring.len(), 1);
+        assert_eq!(ring.get(0).as_deref(), Some(replacement.as_slice()));
+    }
+
+    #[test]
+    fn shrinking_depth_preserves_the_newest_frames() {
+        let mut ring = FrameRing::new(6, 4);
+        let frames: Vec<_> = (0..6).map(|i| frame(i as f32)).collect();
+        for positions in &frames {
+            ring.push(positions);
+        }
+        ring.set_depth(2);
+        assert_eq!(ring.len(), 2);
+        assert_eq!(ring.get(0).as_deref(), Some(frames[4].as_slice()));
+        assert_eq!(ring.latest().as_deref(), Some(frames[5].as_slice()));
     }
 }
 

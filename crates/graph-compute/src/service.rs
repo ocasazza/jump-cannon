@@ -14,6 +14,7 @@
 
 use std::collections::HashMap;
 use std::pin::Pin;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -87,6 +88,16 @@ impl ComputeService {
 }
 
 type SubscribeStream = Pin<Box<dyn Stream<Item = Result<PositionDelta, Status>> + Send + 'static>>;
+
+fn validate_graph_revision(expected: u64, actual: u64) -> Result<(), Status> {
+    if expected == 0 || expected == actual {
+        Ok(())
+    } else {
+        Err(Status::failed_precondition(format!(
+            "graph revision mismatch: subscriber expects {expected}, worker has {actual}"
+        )))
+    }
+}
 type TopoFisheyeStream = Pin<Box<dyn Stream<Item = Result<HybridFrame, Status>> + Send + 'static>>;
 type ExchangeHaloStream = Pin<Box<dyn Stream<Item = Result<HaloDelta, Status>> + Send + 'static>>;
 
@@ -164,13 +175,31 @@ impl Compute for ComputeService {
         req: Request<SubscribeRequest>,
     ) -> Result<Response<Self::SubscribeStream>, Status> {
         let req = req.into_inner();
+        let active_revision = self.state.graph_revision.load(Ordering::Acquire);
+        validate_graph_revision(req.graph_revision, active_revision)?;
+
+        let current_generation = self.state.selection_generation.load(Ordering::Acquire);
+        if req.selection_generation == 0 && current_generation != 0 {
+            return Err(Status::failed_precondition(format!(
+                "selection generation required: worker has {current_generation}"
+            )));
+        }
+        if req.selection_generation != 0 && req.selection_generation < current_generation {
+            return Err(Status::failed_precondition(format!(
+                "stale selection generation {}: worker has {current_generation}",
+                req.selection_generation
+            )));
+        }
 
         // ADR-002: a Subscribe may select + tune the layout engine. An empty
         // `layout_id` with no `params` means "leave whatever the worker is
         // already running" (the Phase-1 startup default). Otherwise we (re)init
         // the active engine from the registry. Single-worker model: there is
         // one active engine per process, so a select swaps it for everyone.
-        let want_select = !req.layout_id.is_empty() || req.params.is_some();
+        let want_select = self.state.needs_engine_init.load(Ordering::Acquire)
+            || req.selection_generation > current_generation
+            || (req.selection_generation == 0
+                && (!req.layout_id.is_empty() || req.params.is_some()));
         if want_select {
             if !req.layout_id.is_empty() && !self.state.registry.contains(&req.layout_id) {
                 return Err(Status::invalid_argument(format!(
@@ -191,7 +220,13 @@ impl Compute for ComputeService {
             };
             let running = self
                 .state
-                .init_engine(&req.layout_id, params, attributes)
+                .init_engine_for_generation(
+                    &req.layout_id,
+                    params,
+                    attributes,
+                    req.graph_revision,
+                    req.selection_generation,
+                )
                 .await
                 .map_err(|e| Status::internal(format!("engine init failed: {e}")))?;
             tracing::info!(
@@ -223,10 +258,16 @@ impl Compute for ComputeService {
         _req: Request<HealthRequest>,
     ) -> Result<Response<HealthResponse>, Status> {
         let frame = *self.state.frame.read().await;
+        let engine = self.state.engine_status.read().await.clone();
         Ok(Response::new(HealthResponse {
             ok: true,
             n_nodes: self.state.graph.read().await.n_nodes,
             frame,
+            requested_layout_id: engine.requested_layout_id.to_string(),
+            effective_layout_id: engine.effective_layout_id.to_string(),
+            fallback_reason: engine.fallback_reason.unwrap_or_default(),
+            graph_revision: self.state.graph_revision.load(Ordering::Acquire),
+            selection_generation: self.state.selection_generation.load(Ordering::Acquire),
         }))
     }
 
@@ -243,6 +284,8 @@ impl Compute for ComputeService {
                 ok: false,
                 n_nodes: 0,
                 error: e,
+                graph_revision: self.state.graph_revision.load(Ordering::Acquire),
+                selection_generation: self.state.selection_generation.load(Ordering::Acquire),
             }))
         };
         let graph = match CsrGraph::from_bin_bytes(&req.csr) {
@@ -262,13 +305,28 @@ impl Compute for ComputeService {
                     .collect::<Vec<f32>>(),
             )
         };
-        match self.state.load_graph(graph, positions).await {
+        match self
+            .state
+            .load_graph(
+                graph,
+                positions,
+                req.graph_revision,
+                req.expected_selection_generation,
+            )
+            .await
+        {
             Ok(n) => {
-                tracing::info!(n_nodes = n, "LoadGraph: swapped active graph");
+                tracing::info!(
+                    n_nodes = n,
+                    graph_revision = req.graph_revision,
+                    "LoadGraph: swapped active graph"
+                );
                 Ok(Response::new(LoadGraphResponse {
                     ok: true,
                     n_nodes: n,
                     error: String::new(),
+                    graph_revision: req.graph_revision,
+                    selection_generation: self.state.selection_generation.load(Ordering::Acquire),
                 }))
             }
             Err(e) => err(e),
@@ -606,6 +664,20 @@ pub async fn run_sim_loop(state: Arc<SimState>, _tick_hz: f32) {
             Some(a) => a,
             None => continue,
         };
+        let active_revision = state.graph_revision.load(Ordering::Acquire);
+        let selection_generation = state.selection_generation.load(Ordering::Acquire);
+        if active.graph_revision != active_revision
+            || active.selection_generation != selection_generation
+        {
+            tracing::warn!(
+                engine_revision = active.graph_revision,
+                active_revision,
+                engine_generation = active.selection_generation,
+                selection_generation,
+                "dropping stale engine after control-plane change"
+            );
+            continue;
+        }
         if active.engine.is_halted() {
             // Engine converged: reinstall and idle (still answer Subscribe with
             // the last broadcast frame).
@@ -626,12 +698,21 @@ pub async fn run_sim_loop(state: Arc<SimState>, _tick_hz: f32) {
         // future engine init. Drop the stale frame AND the stale engine —
         // load_graph cleared `active` deliberately; the next Subscribe
         // re-inits on the new graph.
+        let active_revision = state.graph_revision.load(Ordering::Acquire);
+        let selection_generation = state.selection_generation.load(Ordering::Acquire);
         let n_now = state.graph.read().await.n_nodes as usize;
-        if new_positions.len() != 3 * n_now {
+        if active.graph_revision != active_revision
+            || active.selection_generation != selection_generation
+            || new_positions.len() != 3 * n_now
+        {
             tracing::warn!(
                 got = new_positions.len() / 3,
                 expect = n_now,
-                "dropping stale engine step from before a LoadGraph swap"
+                engine_revision = active.graph_revision,
+                active_revision,
+                engine_generation = active.selection_generation,
+                selection_generation,
+                "dropping stale engine step after control-plane change"
             );
             continue;
         }
@@ -654,6 +735,8 @@ pub async fn run_sim_loop(state: Arc<SimState>, _tick_hz: f32) {
             // positions, even right after a LoadGraph swap (no graph lock here).
             n_nodes: (new_positions.len() / 3) as u32,
             positions: bytes,
+            graph_revision: active_revision,
+            selection_generation,
         };
         // ignore send errors; broadcast returns Err if no receivers — that's fine.
         let _ = state.tx.send(delta);
@@ -663,6 +746,16 @@ pub async fn run_sim_loop(state: Arc<SimState>, _tick_hz: f32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn graph_revision_validation_is_strict_for_versioned_clients() {
+        assert!(validate_graph_revision(0, 17).is_ok());
+        assert!(validate_graph_revision(17, 17).is_ok());
+        let err = validate_graph_revision(17, 18).expect_err("mismatch must fail");
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        assert!(err.message().contains("expects 17"));
+        assert!(err.message().contains("has 18"));
+    }
 
     /// REGRESSION (the bug the user hit): geometric engine settings must survive
     /// the full wire round-trip `serde_json::Value → prost Struct → Value` and
