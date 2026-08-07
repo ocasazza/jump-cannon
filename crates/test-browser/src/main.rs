@@ -224,6 +224,15 @@ async fn run(args: &Args, console_logs: Arc<Mutex<Vec<String>>>) -> Result<RunOk
         // Linux software WebGPU is saturating the render thread.
         .viewport(None)
         .window_size(1280, 800);
+    // WebGPU is restricted to secure contexts. Cluster smoke tests use an
+    // internal plain-HTTP Service, so grant only that explicitly requested
+    // test origin secure-context treatment in this disposable browser.
+    if args.base_url.starts_with("http://") {
+        config = config.arg((
+            "unsafely-treat-insecure-origin-as-secure",
+            args.base_url.trim_end_matches('/'),
+        ));
+    }
     // Headless Linux uses the Nix-provided lavapipe Vulkan adapter. Valued
     // arguments must be tuples so chromiumoxide merges `enable-features`
     // with its defaults instead of emitting duplicate switches.

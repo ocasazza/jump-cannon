@@ -26,5 +26,11 @@ can temporarily occupy Chromium's renderer while it creates the device and
 pipelines; one stalled CDP evaluation is diagnostic evidence, not by itself a
 failed application boot.
 
+WebGPU requires a secure browser context. The cluster smoke test reaches the
+app through its plain-HTTP Kubernetes Service, so its disposable Chromium
+process grants secure-context treatment only to the configured `baseUrl`.
+Production browser exposure should terminate TLS rather than copy this test
+exception.
+
 A nonzero canvas rectangle alone does not prove nodes rendered. Review the
 screenshot and browser errors for visual changes to [[Frontend]] or [[Workspace]].
