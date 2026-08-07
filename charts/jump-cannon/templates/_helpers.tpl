@@ -23,6 +23,10 @@
 {{- end -}}
 {{- end -}}
 
+{{- define "jump-cannon.vaultClaimName" -}}
+{{- default (printf "%s-vault" (include "jump-cannon.fullname" .)) .Values.vault.persistence.existingClaim -}}
+{{- end -}}
+
 {{- define "jump-cannon.labels" -}}
 helm.sh/chart: {{ .Chart.Name }}-{{ .Chart.Version | replace "+" "_" }}
 app.kubernetes.io/name: {{ include "jump-cannon.name" . }}

@@ -88,6 +88,79 @@ JUMP_CANNON_IMPORTER_INPUT=crates/pest-importer/examples/line-graph.txt \
 nix develop -c cargo run -p graph-api -- --no-browser
 ```
 
+### Built-in Open Knowledge Format importer
+
+Open Knowledge Format (OKF) is a schema-aware built-in importer, not a runtime
+Pest package. It implements the normative Google Cloud Platform
+[OKF v0.2 specification](https://github.com/GoogleCloudPlatform/knowledge-catalog/blob/3fcbb9f828c2f23d109c855ee403c3a4c81f3a96/okf/SPEC.md)
+(the published version is named `0.2`) with a YAML-frontmatter parser and a
+CommonMark link parser. Pest remains useful for trusted,
+administrator-installed custom text grammars; it is not a better fit for a
+format whose syntax is already YAML plus Markdown.
+
+The OKF graph mapping is deliberately narrow and follows the format rather than
+Obsidian conventions:
+
+- each non-reserved `.md` file is a concept; its ID is the suffixless,
+  bundle-relative path;
+- `index.md` and `log.md` are reserved at every directory level and do not
+  become concept nodes;
+- every concept has a non-empty frontmatter `type`, while optional `tags` are
+  taken only from a YAML list of strings (not inline hashtags, wikilinks,
+  singular fields, or comma-split scalar values);
+- standard CommonMark links to other concepts create directed edges from the
+  referring concept to the target, and an internal `sources[].resource`
+  reference creates the same directed derivation relationship;
+- external, missing, self, and image links do not create graph edges; and
+- unknown string-keyed frontmatter fields are retained as JSON attributes (or
+  canonical YAML text when their nested key shape is not JSON-compatible), so
+  an importer update is not required for every domain-specific extension.
+
+The root `index.md` may declare `okf_version: "0.2"`. Its absence is valid, and
+an unrecognized declared version is imported best-effort rather than rejected,
+which keeps discovery forward-compatible without claiming full support for the
+newer version. Neither concept content nor Attested Computation material is
+executed.
+
+The native in-process parser applies event, node, depth, scalar, anchor, alias,
+merge, and replay budgets before and during expansion. Ordinary YAML reuse
+works, while amplification patterns are rejected before a small frontmatter
+document can grow into unbounded process memory. Input, identifiers,
+frontmatter, references, graph endpoints, diagnostics, and the downstream
+filter-summary expansion all have aggregate output budgets before snapshot
+publication.
+
+A local bundle can be selected through the same administrator-owned server
+configuration as the other built-ins:
+
+```bash
+JUMP_CANNON_SOURCE=okf \
+VAULT_ROOT=/path/to/okf-bundle \
+JUMP_CANNON_OKF_SOURCE_ID=my-bundle \
+nix develop -c cargo run -p graph-api -- --no-browser
+```
+
+The source ID is a stable ASCII slug (`A-Z`, `a-z`, `0-9`, `.`, `_`, `-`) so
+source namespaces cannot produce ambiguous node IDs.
+The built-in filesystem implementation currently requires a Unix host
+(including Linux Kubernetes nodes and macOS development): its component-wise
+`openat`/no-follow/nonblocking reads are the security boundary for
+ingestion-writable bundles. Other platforms fail closed until an equivalent
+confined-open backend is implemented.
+
+The Helm integration supports either a release-owned PVC or a same-namespace
+claim supplied through `vault.persistence.existingClaim`, including a claim
+owned and written by Lavender Ingest. Graph-api mounts an OKF claim read-only.
+`additionalServiceAccounts` can create exact namespace-local identities for
+companion ingestion components without inventing RBAC or transferring PVC
+ownership. OKF combines filesystem notifications with a 60-second periodic
+full-rescan fallback by default because cross-pod writes are not guaranteed to
+produce inotify events on every CSI/NFS/RWX implementation. The interval is
+configurable and restarts after each completed reload, so a large graph does
+not enter an immediate catch-up loop; unsupported notifications degrade to the
+periodic driver. Obsidian retains notification-only behavior unless its generic
+filesystem rescan setting is explicitly enabled.
+
 ### Wasm Component plugins
 
 Code is needed for genuinely new codecs or connector behavior. Those extensions
@@ -148,14 +221,14 @@ Every importer exposes a descriptor with:
 - deterministic limits for input bytes, records, nodes, edges, and diagnostics.
 
 Source-instance IDs must namespace node and edge IDs before multiple importers
-can be composed into one graph. Kubernetes does this now; the current Pest
-adapter is still a single active source and keeps package-local IDs. Built-in
-mappers use fallible node insertion so duplicate IDs are rejected before an
-`IndexMap` can overwrite them. Graph-api additionally rejects dangling edges
-and non-finite positions before publication. The planned operation sink must make
-duplicate and output-limit enforcement unavoidable for third-party mappers;
-post-hoc validation of an already materialized map cannot recover overwritten
-duplicate provenance.
+can be composed into one graph. Kubernetes and OKF do this now; the current
+Pest adapter is still a single active source and keeps package-local IDs.
+Built-in mappers use fallible node insertion so duplicate IDs are rejected
+before an `IndexMap` can overwrite them. Graph-api additionally rejects
+dangling edges and non-finite positions before publication. The planned
+operation sink must make duplicate and output-limit enforcement unavoidable for
+third-party mappers; post-hoc validation of an already materialized map cannot
+recover overwritten duplicate provenance.
 
 ## Capability model
 
@@ -241,6 +314,54 @@ and [watch semantics](https://kubernetes.io/docs/reference/using-api/api-concept
 
 Importer packages and source instances are separate resources.
 
+### Current experience
+
+Today, loading data is an administrator/deployment action. One active source is
+selected when graph-api starts, using CLI flags or environment variables
+locally and equivalent server/volume configuration in Helm. The Dioxus app
+automatically loads the graph published by that active source and the existing
+Progress panel reports reload work. Switching from Obsidian to OKF, Kubernetes,
+or Pest therefore changes server configuration and normally restarts the
+server; it does not require a different frontend.
+
+The initial OKF integration exposes nodes, frontmatter attributes, schema tags,
+and edges, but deliberately does not advertise source-body read or write
+capabilities. Inspector metadata and graph filtering work; the Document body
+and editor remain unavailable until content reads are routed through the
+importer's bounded, no-follow filesystem boundary instead of graph-api's
+Obsidian compatibility reader.
+
+There is no Importers panel, browser package upload, importer marketplace, or
+browser-owned credential flow yet. Adding a custom importer today means an
+administrator supplies a trusted Pest manifest and input through explicit
+paths, normally read-only mounts, or deploys a compiled-in source. The server
+validates the configured source at startup and fails on an unknown source; it
+never silently falls back to Obsidian. The Helm path similarly binds a selected
+importer to server-side mounts or Kubernetes access rather than transferring a
+dataset through the browser.
+
+### Target experience
+
+The planned Dioxus Importers panel will keep package installation separate from
+source configuration:
+
+1. **Importer Library** shows built-ins and installed packages with their
+   version, digest, validation state, requested capabilities, and trust level.
+2. **Add Source** selects an importer and binds its declared effects to a
+   concrete server-side directory, URL, Kubernetes scope, or other supported
+   connector. Secrets remain references resolved by the host.
+3. **Preview** validates the package and source without publishing a graph. It
+   shows requested effects, diagnostics, counts, and sampled nodes, tags, and
+   edges so an administrator can grant an exact reviewed subset.
+4. **Run** reports progress through the existing progress experience and
+   atomically publishes a validated result. A failed run leaves the last good
+   graph snapshot active.
+
+Untrusted user packages require a sandboxed Wasmtime worker with fuel, epoch
+deadlines, memory and batch limits, and process or pod isolation. Until that
+boundary and graph-api authentication/authorization exist, browser upload and
+network-facing install/run operations remain intentionally unavailable.
+
 Planned server API:
 
 - `GET /importers` lists built-ins and installed packages, validation state,
@@ -252,15 +373,10 @@ Planned server API:
 - `POST /importers/:id/runs` starts an asynchronous run and returns a run ID.
 - `GET /import-runs/:id` reports durable status and diagnostics.
 
-The Dioxus app gets a dedicated Importers panel rather than expanding Generate.
-It reuses the existing Rust file-input pattern and progress feed. A successful
-run calls the existing graph reload path. Credentials never enter browser
-localStorage or shareable app-state exports.
-
-Until the control plane is secured, a Pest source is selected with explicit
-administrator-managed manifest and input paths, normally supplied through
-read-only mounts. The server validates the selected package at startup and
-fails on an unknown source; it never silently falls back to Obsidian.
+These endpoints are a design target, not an implemented public API. The Dioxus
+panel will reuse the existing Rust file-input pattern and progress feed rather
+than expanding Generate. Credentials never enter browser localStorage or
+shareable app-state exports.
 
 ## Migration plan
 
@@ -270,11 +386,17 @@ fails on an unknown source; it never silently falls back to Obsidian.
   error contracts to `data-loader` while preserving the current `Loader` API.
 - [x] Add a trusted/admin runtime-Pest importer with a versioned manifest,
   canonical captures, validation, limits, and golden tests.
+- [x] Add a schema-aware OKF v0.2 filesystem importer with specification-based
+  concept IDs, tags, links, provenance edges, and forward-compatible fields.
 - [x] Add an async Kubernetes snapshot connector over allowlisted dynamic
   resources, initially read-only.
 - [x] Select an importer by stable ID/path without an unknown-source fallback.
 - [x] Make watcher startup honor the selected importer instead of always
   watching `$VAULT_ROOT` for Markdown.
+- [x] Add a configurable periodic filesystem rescan fallback for cross-pod PVC
+  writers while keeping Obsidian's default event-driven behavior.
+- [x] Let Helm use either a chart-owned or externally owned PVC and create
+  explicitly named companion ingestion ServiceAccounts without implicit RBAC.
 - [x] Keep Obsidian, tvix, and generated loaders behavior-compatible.
 
 ### Phase 2: generic graph ownership

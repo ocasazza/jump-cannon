@@ -1,0 +1,26 @@
+[package]
+name = "okf-importer"
+version.workspace = true
+edition.workspace = true
+description = "Bounded Open Knowledge Format v0.2 filesystem importer for jump-cannon."
+
+[dependencies]
+data-loader = { path = "../data-loader" }
+vault-data = { path = "../vault-data" }
+percent-encoding = "2"
+pulldown-cmark = "0.12"
+serde_json = { workspace = true }
+serde-saphyr = { version = "0.0.29", default-features = false, features = ["deserialize"] }
+serde_yaml = "0.9"
+thiserror = "1"
+tokio = { workspace = true }
+walkdir = "2"
+
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1", features = ["fs"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[target.'cfg(unix)'.dev-dependencies]
+libc = "0.2"

@@ -40,6 +40,7 @@ notify-debouncer-mini = "0.4"
 vault-data     = { path = "../vault-data" }
 data-loader    = { path = "../data-loader" }
 kubernetes-importer = { path = "../kubernetes-importer" }
+okf-importer = { path = "../okf-importer" }
 pest-importer = { path = "../pest-importer" }
 vault-links    = { path = "../vault-links" }
 tvix-loader    = { path = "../tvix-loader" }

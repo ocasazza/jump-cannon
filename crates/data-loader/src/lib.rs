@@ -73,6 +73,8 @@ pub enum SourceKind {
     Generate,
     /// List allowlisted Kubernetes dynamic resources through kube-rs.
     Kubernetes,
+    /// Import an Open Knowledge Format v0.2 bundle from the filesystem.
+    Okf,
     /// Parse a bounded filesystem input with an administrator-installed,
     /// runtime-validated Pest grammar package.
     Pest,
@@ -86,6 +88,7 @@ impl SourceKind {
             "tvix" | "nix" => Some(Self::Tvix),
             "generate" | "gen" | "random" => Some(Self::Generate),
             "kubernetes" | "k8s" => Some(Self::Kubernetes),
+            "okf" | "open-knowledge-format" => Some(Self::Okf),
             "pest" | "grammar" => Some(Self::Pest),
             _ => None,
         }
@@ -93,7 +96,7 @@ impl SourceKind {
 
     /// All known source kinds (for help text).
     pub fn all() -> &'static [&'static str] {
-        &["obsidian", "tvix", "generate", "kubernetes", "pest"]
+        &["obsidian", "tvix", "generate", "kubernetes", "okf", "pest"]
     }
 }
 
@@ -535,6 +538,16 @@ mod importer_tests {
 
     fn descriptor(capabilities: Vec<Capability>) -> ImporterDescriptor {
         ImporterDescriptor::new("fake", "Fake", "1", capabilities)
+    }
+
+    #[test]
+    fn source_kind_accepts_okf_names() {
+        assert_eq!(SourceKind::parse("okf"), Some(SourceKind::Okf));
+        assert_eq!(
+            SourceKind::parse("OPEN-KNOWLEDGE-FORMAT"),
+            Some(SourceKind::Okf)
+        );
+        assert!(SourceKind::all().contains(&"okf"));
     }
 
     struct FakeConnector {

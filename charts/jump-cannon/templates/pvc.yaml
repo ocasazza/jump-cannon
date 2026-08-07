@@ -1,9 +1,10 @@
 {{- $graphSource := ternary "kubernetes" .Values.graphApi.source .Values.kubernetesImporter.enabled -}}
-{{- if and (eq $graphSource "obsidian") .Values.vault.persistence.enabled }}
+{{- $usesFilesystem := or (eq $graphSource "obsidian") (eq $graphSource "okf") -}}
+{{- if and $usesFilesystem .Values.vault.persistence.enabled (not .Values.vault.persistence.existingClaim) }}
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
-  name: {{ include "jump-cannon.fullname" . }}-vault
+  name: {{ include "jump-cannon.vaultClaimName" . }}
   labels:
     {{- include "jump-cannon.labels" . | nindent 4 }}
 spec:

@@ -9,6 +9,17 @@ serviceAccount:
   name: ""
   automountServiceAccountToken: false
 
+# Additional namespace-local identities for companion ingestion components.
+# This chart creates only the ServiceAccounts; each component must select its
+# account in its own pod spec. No RBAC permissions are implied or created.
+additionalServiceAccounts: {}
+  # lavender-ingest:
+  #   annotations:
+  #     iam.gke.io/gcp-service-account: lavender-ingest@example.iam.gserviceaccount.com
+  #   labels:
+  #     app.kubernetes.io/component: ingestion
+  #   automountServiceAccountToken: false
+
 podSecurityContext:
   runAsNonRoot: true
   runAsUser: 10001
@@ -26,8 +37,12 @@ containerSecurityContext:
 graphApi:
   replicas: 1
   # Source identifier understood by graph-api. Enabling the Kubernetes
-  # importer below selects kubernetes regardless of this value.
+  # importer below selects kubernetes regardless of this value. Set this to
+  # okf to load an Open Knowledge Format bundle from the vault mount.
   source: obsidian
+  # Optional full-rescan fallback for non-OKF filesystem sources. Set this
+  # above 0 when writes arrive through another pod or mount.
+  filesystemRescanIntervalSeconds: 0
   image:
     repository: us-central1-docker.pkg.dev/it-ops-nixstation/lavender/jump-cannon-graph-api
     tag: latest
@@ -42,6 +57,15 @@ graphApi:
     limits:
       cpu: "2"
       memory: 2Gi
+
+# ASCII slug used to namespace graph node IDs when graphApi.source is okf.
+# The OKF bundle itself is read from vault.mountPath.
+okfImporter:
+  sourceId: default
+  # Cross-pod writes on some CSI/NFS/RWX volumes do not reliably produce
+  # inotify events in the graph-api pod. Set to 0 only when notifications are
+  # known to propagate; increase this interval for especially large bundles.
+  filesystemRescanIntervalSeconds: 60
 
 # Import Kubernetes API resources as graph nodes. The importer package is
 # configuration only; credentials and RBAC remain host-owned effects.
@@ -84,6 +108,9 @@ vault:
   mountPath: /vault
   persistence:
     enabled: true
+    # Mount a claim created by another chart (for example lavender-ingest).
+    # When non-empty, jump-cannon does not render its own PVC.
+    existingClaim: ""
     storageClassName: local-path
     size: 5Gi
   seed:

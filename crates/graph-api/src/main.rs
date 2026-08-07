@@ -39,7 +39,16 @@ struct Args {
     /// docker container leaves this unset so live reload works.
     #[arg(long, env = "GRAPH_API_NO_WATCH")]
     no_watch: bool,
-    /// Data source: obsidian (default), tvix, generate, kubernetes, or pest.
+    /// Periodic full-rescan fallback for filesystem importers, in seconds.
+    /// This catches writes whose filesystem notifications do not propagate
+    /// across another pod or mount. Set to 0 to disable the fallback.
+    #[arg(
+        long,
+        env = "JUMP_CANNON_FILESYSTEM_RESCAN_SECONDS",
+        default_value_t = 0
+    )]
+    filesystem_rescan_seconds: u64,
+    /// Data source: obsidian (default), tvix, generate, kubernetes, okf, or pest.
     /// Runtime Pest packages are trusted administrator-installed code; the
     /// unauthenticated HTTP API does not accept grammar uploads.
     #[arg(long, env = "JUMP_CANNON_SOURCE", default_value = "obsidian")]
@@ -53,6 +62,9 @@ struct Args {
     /// explicitly mounted service-account projection, never from this file.
     #[arg(long, env = "JUMP_CANNON_KUBERNETES_CONFIG")]
     kubernetes_config: Option<PathBuf>,
+    /// Stable ASCII slug used to namespace OKF node IDs.
+    #[arg(long, env = "JUMP_CANNON_OKF_SOURCE_ID", default_value = "default")]
+    okf_source_id: String,
     /// Versioned TOML package containing a runtime Pest grammar and capture map.
     /// Required by --source=pest.
     #[arg(long, env = "JUMP_CANNON_IMPORTER_MANIFEST")]
@@ -157,6 +169,17 @@ async fn main() -> anyhow::Result<()> {
             );
             Box::new(kubernetes_importer::build_importer(config)?)
         }
+        data_loader::SourceKind::Okf => {
+            tracing::info!(
+                source_id = %args.okf_source_id,
+                root = %vault_root.display(),
+                "using Open Knowledge Format importer"
+            );
+            Box::new(okf_importer::OkfImporter::new(
+                vault_root.clone(),
+                args.okf_source_id.clone(),
+            )?)
+        }
         data_loader::SourceKind::Pest => {
             let manifest_path = args.importer_manifest.as_ref().with_context(|| {
                 "--source=pest requires --importer-manifest / JUMP_CANNON_IMPORTER_MANIFEST"
@@ -201,8 +224,8 @@ async fn main() -> anyhow::Result<()> {
     };
 
     // This CLI is the trusted host configuration surface: every selectable
-    // source is either compiled into graph-api or an explicitly bound,
-    // administrator-installed native Pest package. Descriptor requests do not
+    // source is either compiled into graph-api (including OKF) or an explicitly
+    // bound, administrator-installed native Pest package. Descriptor requests do not
     // grant themselves; the host records the exact tuples here. A future
     // untrusted upload/control-plane path must select a reviewed subset instead
     // of applying this trusted-source policy.
@@ -293,7 +316,7 @@ async fn main() -> anyhow::Result<()> {
     // Live reload follows the active importer's watch plan (filesystem,
     // polling, push, or static) rather than assuming an Obsidian directory.
     if !args.no_watch {
-        graph_api::watcher::spawn(state.clone());
+        graph_api::watcher::spawn(state.clone(), args.filesystem_rescan_seconds);
     } else {
         tracing::info!("filesystem watcher disabled (--no-watch)");
     }

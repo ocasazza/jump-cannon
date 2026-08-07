@@ -1,5 +1,10 @@
 {{- $graphSource := ternary "kubernetes" .Values.graphApi.source .Values.kubernetesImporter.enabled -}}
-{{- $usesVault := eq $graphSource "obsidian" -}}
+{{- $usesObsidian := eq $graphSource "obsidian" -}}
+{{- $usesFilesystem := or $usesObsidian (eq $graphSource "okf") -}}
+{{- $filesystemRescanSeconds := .Values.graphApi.filesystemRescanIntervalSeconds -}}
+{{- if eq $graphSource "okf" -}}
+{{- $filesystemRescanSeconds = .Values.okfImporter.filesystemRescanIntervalSeconds -}}
+{{- end -}}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -29,7 +34,7 @@ spec:
         {{- toYaml .Values.imagePullSecrets | nindent 8 }}
       securityContext:
         {{- toYaml .Values.podSecurityContext | nindent 8 }}
-      {{- if and $usesVault .Values.vault.seed.enabled }}
+      {{- if and $usesObsidian .Values.vault.seed.enabled }}
       initContainers:
         - name: seed-vault
           image: {{ .Values.vault.seed.image | quote }}
@@ -81,9 +86,15 @@ spec:
             - name: JUMP_CANNON_KUBERNETES_CONFIG
               value: {{ printf "%s/config.json" .Values.kubernetesImporter.mountPath | quote }}
             {{- end }}
-            {{- if $usesVault }}
+            {{- if eq $graphSource "okf" }}
+            - name: JUMP_CANNON_OKF_SOURCE_ID
+              value: {{ .Values.okfImporter.sourceId | quote }}
+            {{- end }}
+            {{- if $usesFilesystem }}
             - name: VAULT_ROOT
               value: {{ .Values.vault.mountPath | quote }}
+            - name: JUMP_CANNON_FILESYSTEM_RESCAN_SECONDS
+              value: {{ $filesystemRescanSeconds | quote }}
             {{- end }}
             - name: JUMP_CANNON_COMPUTE_URL
               value: {{ .Values.graphApi.computeUrl | quote }}
@@ -106,11 +117,14 @@ spec:
             {{- toYaml .Values.graphApi.resources | nindent 12 }}
           securityContext:
             {{- toYaml .Values.containerSecurityContext | nindent 12 }}
-          {{- if or $usesVault .Values.kubernetesImporter.enabled }}
+          {{- if or $usesFilesystem .Values.kubernetesImporter.enabled }}
           volumeMounts:
-            {{- if $usesVault }}
+            {{- if $usesFilesystem }}
             - name: vault
               mountPath: {{ .Values.vault.mountPath }}
+              {{- if eq $graphSource "okf" }}
+              readOnly: true
+              {{- end }}
             {{- end }}
             {{- if .Values.kubernetesImporter.enabled }}
             - name: kubernetes-importer-config
@@ -123,17 +137,17 @@ spec:
               readOnly: true
             {{- end }}
           {{- end }}
-      {{- if or $usesVault .Values.kubernetesImporter.enabled }}
+      {{- if or $usesFilesystem .Values.kubernetesImporter.enabled }}
       volumes:
-        {{- if $usesVault }}
+        {{- if $usesFilesystem }}
         - name: vault
           {{- if .Values.vault.persistence.enabled }}
           persistentVolumeClaim:
-            claimName: {{ include "jump-cannon.fullname" . }}-vault
+            claimName: {{ include "jump-cannon.vaultClaimName" . }}
           {{- else }}
           emptyDir: {}
           {{- end }}
-        {{- if .Values.vault.seed.enabled }}
+        {{- if and $usesObsidian .Values.vault.seed.enabled }}
         - name: vault-seed
           configMap:
             name: {{ include "jump-cannon.fullname" . }}-vault-seed

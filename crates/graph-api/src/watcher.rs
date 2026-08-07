@@ -1,8 +1,9 @@
 //! Change drivers that reload the active importer.
 //!
-//! Filesystem importers use `notify-debouncer-mini`; polling importers use a
-//! Tokio interval; static importers install no change driver. Filesystem bursts
-//! are coalesced into one reload, then:
+//! Filesystem importers use `notify-debouncer-mini` plus an optional periodic
+//! full-rescan fallback; polling importers use a Tokio interval; static
+//! importers install no change driver. Filesystem bursts are coalesced into one
+//! reload, then:
 //!
 //!   1. Re-runs `vault_loader::load_with_progress` (emits "Scanning
 //!      vault", "Computing graph metrics", "Seeding layout positions"
@@ -16,9 +17,9 @@
 //!
 //! ## Filter
 //!
-//! Events for paths whose components contain `.git`, `node_modules`,
-//! `.obsidian`, or a leading-dot dotfile are ignored. Obsidian additionally
-//! accepts only `.md`; other filesystem importers react to their bound input.
+//! Obsidian ignores `.git`, `node_modules`, `.obsidian`, and leading-dot paths.
+//! Obsidian accepts only `.md`; schema-driven importers otherwise retain their
+//! own event and path semantics rather than inheriting Obsidian exclusions.
 //!
 //! ## Container caveats
 //!
@@ -27,7 +28,8 @@
 //! host fs are propagated through the OCI bind mount on most engines
 //! (podman, docker on Linux). On macOS Docker Desktop / Lima, fs
 //! events are heavily debounced by the virtualization layer — a 1-2s
-//! lag is normal.
+//! lag is normal. Writes through another pod or mount may not produce an
+//! event at all, so filesystem importers can also run a periodic full rescan.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -46,7 +48,7 @@ use crate::state::{AppState, GraphSnapshot};
 ///
 /// `state` is the live `AppState`; the watcher swaps new snapshots into
 /// it under `state.inner.snapshot`.
-pub fn spawn(state: AppState) {
+pub fn spawn(state: AppState, filesystem_rescan_seconds: u64) {
     let descriptor = state.inner.importer.descriptor();
     if !watch_is_authorized(&state.inner.importer, &descriptor) {
         let message = format!(
@@ -62,8 +64,15 @@ pub fn spawn(state: AppState) {
             tracing::info!(importer = %descriptor.id, "importer is static; change driver disabled");
         }
         WatchPlan::Filesystem { root } => {
-            let markdown_only = descriptor.id == "obsidian";
-            spawn_filesystem(state, root, markdown_only);
+            let obsidian_conventions = descriptor.id == "obsidian";
+            let markdown_only = obsidian_conventions;
+            spawn_filesystem(
+                state,
+                root,
+                markdown_only,
+                obsidian_conventions,
+                filesystem_rescan_seconds,
+            );
         }
         WatchPlan::Poll { interval_ms } => spawn_poll(state, interval_ms),
         WatchPlan::Push => {
@@ -123,7 +132,39 @@ fn polling_interval(interval_ms: u64) -> tokio::time::Interval {
     interval
 }
 
-fn spawn_filesystem(state: AppState, vault_root: PathBuf, markdown_only: bool) {
+fn filesystem_rescan_interval(seconds: u64) -> Option<tokio::time::Interval> {
+    if seconds == 0 {
+        return None;
+    }
+
+    let period = Duration::from_secs(seconds);
+    let mut interval = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    Some(interval)
+}
+
+async fn next_filesystem_rescan(interval: &mut Option<tokio::time::Interval>) {
+    match interval {
+        Some(interval) => {
+            interval.tick().await;
+        }
+        None => std::future::pending::<()>().await,
+    }
+}
+
+fn reset_filesystem_rescan(interval: &mut Option<tokio::time::Interval>) {
+    if let Some(interval) = interval {
+        interval.reset();
+    }
+}
+
+fn spawn_filesystem(
+    state: AppState,
+    vault_root: PathBuf,
+    markdown_only: bool,
+    obsidian_conventions: bool,
+    filesystem_rescan_seconds: u64,
+) {
     let progress = state.inner.progress.clone();
 
     // Reload signal channel. The notify callback runs on the notify
@@ -154,7 +195,7 @@ fn spawn_filesystem(state: AppState, vault_root: PathBuf, markdown_only: bool) {
             };
             let mut paths: HashSet<String> = HashSet::new();
             for e in &events {
-                if !is_relevant(&watch_root, &e.path, markdown_only) {
+                if !is_relevant(&watch_root, &e.path, markdown_only, obsidian_conventions) {
                     continue;
                 }
                 if let Some(rel) = relative_path(&watch_root, &e.path) {
@@ -168,42 +209,94 @@ fn spawn_filesystem(state: AppState, vault_root: PathBuf, markdown_only: bool) {
     );
 
     let mut debouncer = match debouncer_res {
-        Ok(d) => d,
+        Ok(debouncer) => Some(debouncer),
         Err(e) => {
-            progress.error("watch", format!("failed to start watcher: {e}"));
-            tracing::error!("watcher start failed: {e}");
-            return;
+            progress.warn("watch", format!("failed to start filesystem watcher: {e}"));
+            tracing::warn!("filesystem watcher start failed: {e}");
+            None
         }
     };
 
-    if let Err(e) = debouncer
-        .watcher()
-        .watch(&vault_root, RecursiveMode::Recursive)
-    {
-        progress.error("watch", format!("watch({}): {e}", vault_root.display()));
-        tracing::error!(path = %vault_root.display(), "watch failed: {e}");
-        return;
+    if let Some(active) = &mut debouncer {
+        if let Err(e) = active
+            .watcher()
+            .watch(&vault_root, RecursiveMode::Recursive)
+        {
+            progress.warn("watch", format!("watch({}): {e}", vault_root.display()));
+            tracing::warn!(path = %vault_root.display(), "filesystem watch failed: {e}");
+            debouncer = None;
+        }
     }
 
-    progress.info(
-        "watch",
-        format!("watching importer source: {}", vault_root.display()),
-    );
+    let notifications_enabled = debouncer.is_some();
+    if notifications_enabled {
+        progress.info(
+            "watch",
+            format!("watching importer source: {}", vault_root.display()),
+        );
+    } else if filesystem_rescan_seconds == 0 {
+        progress.error(
+            "watch",
+            "filesystem notifications unavailable and periodic rescan disabled",
+        );
+        return;
+    } else {
+        progress.warn(
+            "watch",
+            "filesystem notifications unavailable; using periodic rescan only",
+        );
+    }
+    if filesystem_rescan_seconds == 0 {
+        progress.info("watch", "periodic filesystem rescan disabled");
+    } else {
+        progress.info(
+            "watch",
+            format!("full filesystem rescan every {filesystem_rescan_seconds} seconds"),
+        );
+    }
 
-    // Move the debouncer into the background task so it lives as long
-    // as the task does (dropping it stops the watch).
+    drop(tx);
+
+    // Move the optional debouncer into the background task so it lives as long
+    // as the task does (dropping it stops the watch). Notification-driven and
+    // timer-driven reloads share this task, so they cannot run concurrently.
     tokio::spawn(async move {
         let _debouncer = debouncer; // keep alive
-        while let Some(mut paths) = rx.recv().await {
-            // Drain any additional pending batches that arrived while
-            // we were blocked. try_recv loop coalesces a burst of
-            // edits into a single reload, unioning their path sets so
-            // nothing is lost.
-            while let Ok(more) = rx.try_recv() {
-                paths.extend(more);
-            }
+        let mut notifications_enabled = notifications_enabled;
+        let mut rescan_interval = filesystem_rescan_interval(filesystem_rescan_seconds);
+        loop {
+            tokio::select! {
+                maybe_paths = rx.recv(), if notifications_enabled => {
+                    let Some(mut paths) = maybe_paths else {
+                        notifications_enabled = false;
+                        if rescan_interval.is_none() {
+                            break;
+                        }
+                        continue;
+                    };
 
-            reload_with_paths(&state, &paths).await;
+                    // Drain any additional pending batches that arrived while
+                    // we were blocked. try_recv loop coalesces a burst of
+                    // edits into a single reload, unioning their path sets so
+                    // nothing is lost.
+                    while let Ok(more) = rx.try_recv() {
+                        paths.extend(more);
+                    }
+
+                    reload_with_paths(&state, &paths).await;
+                    // Always wait one complete quiet period after a reload;
+                    // an already-due timer must not trigger back-to-back work.
+                    reset_filesystem_rescan(&mut rescan_interval);
+                }
+                () = next_filesystem_rescan(&mut rescan_interval) => {
+                    tracing::debug!(
+                        seconds = filesystem_rescan_seconds,
+                        "running periodic filesystem rescan"
+                    );
+                    reload(&state).await;
+                    reset_filesystem_rescan(&mut rescan_interval);
+                }
+            }
         }
     });
 }
@@ -346,9 +439,14 @@ fn relative_path(vault_root: &Path, path: &Path) -> Option<String> {
     }
 }
 
-/// Filter: only `.md` files under `vault_root` whose path doesn't
-/// traverse a hidden / ignored directory.
-fn is_relevant(vault_root: &Path, path: &Path, markdown_only: bool) -> bool {
+/// Filter source events without applying Obsidian conventions to generic
+/// filesystem importers.
+fn is_relevant(
+    vault_root: &Path,
+    path: &Path,
+    markdown_only: bool,
+    obsidian_conventions: bool,
+) -> bool {
     // Strip the vault root prefix for component inspection so we don't
     // false-trigger on something like `/home/.config/...`.
     let rel: PathBuf = path
@@ -358,10 +456,11 @@ fn is_relevant(vault_root: &Path, path: &Path, markdown_only: bool) -> bool {
 
     for comp in rel.components() {
         let s = comp.as_os_str().to_string_lossy();
-        if s == ".git"
-            || s == "node_modules"
-            || s == ".obsidian"
-            || (s.starts_with('.') && s != "." && s != "..")
+        if obsidian_conventions
+            && (s == ".git"
+                || s == "node_modules"
+                || s == ".obsidian"
+                || (s.starts_with('.') && s != "." && s != ".."))
         {
             return false;
         }
@@ -462,6 +561,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn filesystem_rescan_can_be_disabled() {
+        assert!(filesystem_rescan_interval(0).is_none());
+    }
+
+    #[tokio::test]
+    async fn filesystem_rescan_waits_before_first_tick_and_skips_missed_ticks() {
+        let mut interval = filesystem_rescan_interval(1).unwrap();
+        assert_eq!(
+            interval.missed_tick_behavior(),
+            tokio::time::MissedTickBehavior::Skip
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), interval.tick())
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
     async fn failed_reload_keeps_last_good_snapshot() {
         let mut graph = VaultGraph::new();
         graph.add_node(VaultNode {
@@ -488,27 +606,46 @@ mod tests {
     #[test]
     fn filter_accepts_markdown() {
         let root = Path::new("/v");
-        assert!(is_relevant(root, Path::new("/v/notes/foo.md"), true));
-        assert!(is_relevant(root, Path::new("/v/foo.md"), true));
+        assert!(is_relevant(root, Path::new("/v/notes/foo.md"), true, true));
+        assert!(is_relevant(root, Path::new("/v/foo.md"), true, true));
     }
 
     #[test]
     fn filter_rejects_non_markdown() {
         let root = Path::new("/v");
-        assert!(!is_relevant(root, Path::new("/v/foo.txt"), true));
-        assert!(!is_relevant(root, Path::new("/v/notes/img.png"), true));
-        assert!(is_relevant(root, Path::new("/v/foo.txt"), false));
+        assert!(!is_relevant(root, Path::new("/v/foo.txt"), true, true));
+        assert!(!is_relevant(
+            root,
+            Path::new("/v/notes/img.png"),
+            true,
+            true
+        ));
+        assert!(is_relevant(root, Path::new("/v/foo.txt"), false, false));
     }
 
     #[test]
     fn filter_rejects_dotdirs() {
         let root = Path::new("/v");
-        assert!(!is_relevant(root, Path::new("/v/.git/HEAD.md"), true));
+        assert!(!is_relevant(root, Path::new("/v/.git/HEAD.md"), true, true));
         assert!(!is_relevant(
             root,
             Path::new("/v/.obsidian/cache/x.md"),
+            true,
             true
         ));
-        assert!(!is_relevant(root, Path::new("/v/node_modules/x.md"), true));
+        assert!(!is_relevant(
+            root,
+            Path::new("/v/node_modules/x.md"),
+            true,
+            true
+        ));
+        assert!(!is_relevant(root, Path::new("/v/.hidden/x.md"), true, true));
+        assert!(is_relevant(root, Path::new("/v/.hidden/x.md"), true, false));
+        assert!(is_relevant(
+            root,
+            Path::new("/v/.git/concept.md"),
+            true,
+            false
+        ));
     }
 }
