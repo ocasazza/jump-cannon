@@ -231,6 +231,6 @@ tests:
     schedule: "15 0 * * 0"
     baseUrl: http://jump-cannon:80
     timeoutSeconds: "90"
-    # Includes scheduling and a cold pull of the test-runner image in addition
-    # to the 90-second in-process browser deadline.
-    activeDeadlineSeconds: 300
+    # Includes scheduling and the observed cold pull of the test-runner image
+    # in addition to the 90-second in-process browser deadline.
+    activeDeadlineSeconds: 900

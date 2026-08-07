@@ -196,6 +196,12 @@
           if pkgs.stdenv.hostPlatform.isLinux
           then "${pkgs.mesa}/share/vulkan/icd.d"
           else "";
+        # Chromium aborts in Skia when a minimal container has no usable font
+        # manager. Keep the browser smoke image self-contained and deterministic.
+        browserFontsConf =
+          if pkgs.stdenv.hostPlatform.isLinux
+          then pkgs.makeFontsConf { fontDirectories = [ pkgs.dejavu_fonts ]; }
+          else null;
 
         # `nix run .#test-browser-rust` — bring up graph-api + open the
         # page in chromium with WebGPU enabled + run the Rust smoke test.
@@ -658,6 +664,8 @@
                 pkgs.coreutils
                 pkgs.curl
                 pkgs.cacert
+                pkgs.dejavu_fonts
+                pkgs.fontconfig
                 pkgs.jq
                 pkgs.mesa
                 pkgs.vulkan-loader
@@ -681,6 +689,7 @@
                   "HOME=/tmp"
                   "SSL_CERT_FILE=/etc/ssl/certs/ca-bundle.crt"
                   "NIX_SSL_CERT_FILE=/etc/ssl/certs/ca-bundle.crt"
+                  "FONTCONFIG_FILE=${browserFontsConf}"
                   "VK_ICD_FILENAMES=/share/vulkan/icd.d/lvp_icd.x86_64.json"
                 ];
                 Labels = {
