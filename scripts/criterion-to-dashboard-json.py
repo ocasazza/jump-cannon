@@ -30,18 +30,46 @@ def load_estimates(criterion_dir: Path) -> dict[str, dict]:
         rel = estimates_path.relative_to(criterion_dir)
         bench_id = str(rel.parent.parent).replace("/", "_")  # pagerank_gpu_10000
         with open(estimates_path) as f:
-            results[bench_id] = json.load(f)
+            estimates = json.load(f)
+
+        # Criterion stores timing estimates and benchmark metadata separately.
+        # Keep the throughput next to the estimates so the rest of this
+        # converter can operate on one record per benchmark.
+        benchmark_path = estimates_path.with_name("benchmark.json")
+        if benchmark_path.exists():
+            with open(benchmark_path) as f:
+                benchmark = json.load(f)
+            estimates["throughput"] = benchmark.get("throughput")
+
+        results[bench_id] = estimates
     return results
+
+
+def mean_estimate_ns(estimates: dict) -> float:
+    """Read Criterion's current point estimate with legacy-format fallback."""
+    mean = estimates["mean"]
+    if "point_estimate" in mean:
+        return mean["point_estimate"]
+    return mean["estimate"]
 
 
 def throughput_melem_s(estimates: dict) -> float:
     """Compute throughput in millions of elements per second."""
-    mean_ns = estimates["mean"]["estimate"]  # nanoseconds
-    # throughput is a list; take the first element's per_iteration
-    tp = estimates.get("throughput", [])
+    mean_ns = mean_estimate_ns(estimates)
+    tp = estimates.get("throughput")
     if not tp:
         return 0.0
-    elements = tp[0]["per_iteration"]
+
+    # Criterion 0.5 serializes Throughput::Elements as {"Elements": N} in
+    # benchmark.json. Retain support for the converter's original list shape
+    # so existing baseline data remains readable.
+    if isinstance(tp, dict):
+        elements = tp.get("Elements")
+    else:
+        elements = tp[0].get("per_iteration")
+    if elements is None:
+        return 0.0
+
     seconds = mean_ns / 1e9
     if seconds == 0:
         return 0.0
@@ -128,9 +156,9 @@ def main():
     # Store baseline estimates separately.
     baseline_est_path = args.out_dir / f"baseline{args.baseline_run}_estimates.json"
     if not baseline_est_path.exists():
-        # Serialize just the mean.estimate for each benchmark
+        # Serialize just the mean point estimate for each benchmark.
         baseline_est = {
-            bid: {"mean": {"estimate": est["mean"]["estimate"]},
+            bid: {"mean": {"point_estimate": mean_estimate_ns(est)},
                   "throughput": est.get("throughput", [])}
             for bid, est in results.items()
         }
