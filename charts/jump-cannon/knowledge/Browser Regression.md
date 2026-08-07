@@ -18,9 +18,9 @@ service-account token, and the automation browser explicitly disables its own
 sandbox because the pod is already isolated and capability-free. The harness
 uses the fixed Chromium window directly instead of CDP viewport emulation and
 enforces `--timeout-secs` as an overall deadline so software WebGPU cannot leave
-a CronJob running indefinitely. Chromiumoxide's `goto` already waits for the
-initial page load; application readiness then comes from the boot log and graph
-render checks, without registering a second navigation wait.
+a CronJob running indefinitely. Navigation is scheduled from `about:blank`
+without waiting on Chromium's page-load lifecycle; application readiness comes
+from the boot log and graph render checks instead.
 
 A nonzero canvas rectangle alone does not prove nodes rendered. Review the
 screenshot and browser errors for visual changes to [[Frontend]] or [[Workspace]].

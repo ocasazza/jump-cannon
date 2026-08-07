@@ -345,7 +345,17 @@ async fn drive_page(
 
     let target = args.base_url.trim_end_matches('/').to_string() + "/";
     tracing::info!("navigating to {target}");
-    page.goto(&target).await.context("page.goto")?;
+    // chromiumoxide special-cases Page.navigate and waits for the browser's
+    // page-load lifecycle. Headless software WebGPU can keep that lifecycle
+    // pending even after the Dioxus app boots, causing the command's 30s
+    // deadline to fail. Schedule navigation through Runtime.evaluate instead;
+    // the explicit boot/render checks below are the readiness contract.
+    let target_json = serde_json::to_string(&target).context("encode navigation target")?;
+    page.evaluate(format!(
+        "setTimeout(() => window.location.replace({target_json}), 0)"
+    ))
+    .await
+    .context("schedule navigation")?;
 
     // ---- 3. wait for the boot log line -----------------------------------
     let deadline = Instant::now() + Duration::from_secs(args.timeout_secs);
