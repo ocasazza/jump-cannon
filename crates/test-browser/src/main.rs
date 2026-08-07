@@ -112,7 +112,17 @@ async fn main() -> Result<()> {
     let started = Instant::now();
     let console_logs: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
 
-    let result = run(&args, console_logs.clone()).await;
+    let result = tokio::time::timeout(
+        Duration::from_secs(args.timeout_secs),
+        run(&args, console_logs.clone()),
+    )
+    .await
+    .unwrap_or_else(|_| {
+        Err(anyhow!(
+            "browser smoke exceeded the overall {}s timeout",
+            args.timeout_secs
+        ))
+    });
     let duration_ms = started.elapsed().as_millis();
 
     let logs = console_logs.lock().await.clone();
@@ -182,17 +192,11 @@ fn chromium_args() -> Vec<&'static str> {
     // chromiumoxide models arguments as keys and adds the `--` prefix when it
     // builds the command line. Supplying CLI-form strings here would turn
     // `--foo` into `----foo`, which Chromium silently ignores.
-    let mut args = vec![
+    vec![
         "enable-unsafe-webgpu",
         "disable-dev-shm-usage",
         "disable-gpu-sandbox",
-    ];
-    // Headless Linux uses the Nix-provided lavapipe Vulkan adapter. Installed
-    // Chrome on macOS should retain its native Metal/ANGLE defaults.
-    if cfg!(target_os = "linux") {
-        args.extend(["enable-features=Vulkan", "use-angle=vulkan", "use-gl=angle"]);
-    }
-    args
+    ]
 }
 
 async fn run(args: &Args, console_logs: Arc<Mutex<Vec<String>>>) -> Result<RunOk> {
@@ -201,15 +205,28 @@ async fn run(args: &Args, console_logs: Arc<Mutex<Vec<String>>>) -> Result<RunOk
     probe_server(&probe_url, Duration::from_secs(args.timeout_secs.min(30))).await?;
 
     // ---- 2. launch chromium ----------------------------------------------
-    let config = BrowserConfig::builder()
+    let mut config = BrowserConfig::builder()
         .chrome_executable(&args.chromium)
         .args(chromium_args())
         // This is an isolated automation browser. Use chromiumoxide's typed
         // switch so rootful container callers cannot accidentally omit it.
         .no_sandbox()
-        .window_size(1280, 800)
-        .build()
-        .map_err(|e| anyhow!("BrowserConfig: {e}"))?;
+        // The fixed browser window is enough for these geometry assertions.
+        // Disabling viewport emulation avoids a post-navigation
+        // Emulation.setDeviceMetricsOverride command that can time out while
+        // Linux software WebGPU is saturating the render thread.
+        .viewport(None)
+        .window_size(1280, 800);
+    // Headless Linux uses the Nix-provided lavapipe Vulkan adapter. Valued
+    // arguments must be tuples so chromiumoxide merges `enable-features`
+    // with its defaults instead of emitting duplicate switches.
+    if cfg!(target_os = "linux") {
+        config = config
+            .arg(("enable-features", "Vulkan"))
+            .arg(("use-angle", "vulkan"))
+            .arg(("use-gl", "angle"));
+    }
+    let config = config.build().map_err(|e| anyhow!("BrowserConfig: {e}"))?;
 
     let (mut browser, mut handler) = Browser::launch(config)
         .await
@@ -217,14 +234,32 @@ async fn run(args: &Args, console_logs: Arc<Mutex<Vec<String>>>) -> Result<RunOk
 
     // The CDP handler must be driven; spawn a task that polls it.
     let handler_task = tokio::spawn(async move {
-        while handler.next().await.is_some() {}
+        while let Some(event) = handler.next().await {
+            if let Err(error) = event {
+                tracing::error!("CDP handler failed: {error}");
+                break;
+            }
+        }
     });
 
     let outcome = drive_page(&browser, args, console_logs).await;
 
     // Best-effort browser teardown.
-    let _ = browser.close().await;
+    let close_ok = matches!(
+        tokio::time::timeout(Duration::from_secs(5), browser.close()).await,
+        Ok(Ok(_))
+    );
+    if !close_ok {
+        let _ = tokio::time::timeout(Duration::from_secs(5), async {
+            match browser.kill().await {
+                Some(result) => result,
+                None => Ok(()),
+            }
+        })
+        .await;
+    }
     drop(browser);
+    handler_task.abort();
     let _ = handler_task.await;
 
     outcome
@@ -653,5 +688,6 @@ mod tests {
         let args = chromium_args();
         assert!(!args.is_empty());
         assert!(args.iter().all(|arg| !arg.starts_with('-')));
+        assert!(args.iter().all(|arg| !arg.contains('=')));
     }
 }

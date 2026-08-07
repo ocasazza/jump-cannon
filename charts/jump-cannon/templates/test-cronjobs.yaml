@@ -144,6 +144,7 @@ spec:
   jobTemplate:
     spec:
       ttlSecondsAfterFinished: 86400
+      activeDeadlineSeconds: {{ .Values.tests.browser.activeDeadlineSeconds }}
       backoffLimit: 0
       template:
         metadata:

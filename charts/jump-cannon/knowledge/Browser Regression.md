@@ -15,7 +15,10 @@ and `report.json` under `target/test-browser-rust`.
 Chromiumoxide arguments are keys without a leading `--`; its launcher adds the
 CLI prefix. Cluster browser jobs run as the chart's non-root identity without a
 service-account token, and the automation browser explicitly disables its own
-sandbox because the pod is already isolated and capability-free.
+sandbox because the pod is already isolated and capability-free. The harness
+uses the fixed Chromium window directly instead of CDP viewport emulation and
+enforces `--timeout-secs` as an overall deadline so software WebGPU cannot leave
+a CronJob running indefinitely.
 
 A nonzero canvas rectangle alone does not prove nodes rendered. Review the
 screenshot and browser errors for visual changes to [[Frontend]] or [[Workspace]].
