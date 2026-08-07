@@ -22,3 +22,8 @@ ConfigMap before publishing the chart.
 The chart owns portable workload configuration. The consuming environment owns
 cluster policy, credentials, NetBird resources, and Gateway routes. Continue
 through [[GitOps Release]], [[Security Model]], and [[Scheduled Tests]].
+
+This is the production infrastructure boundary for Jump Cannon, including the
+optional GPU-backed RayCluster. Local Docker Compose remains development-only;
+parallel repository-level infrastructure stacks are intentionally not
+maintained.

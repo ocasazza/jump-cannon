@@ -119,5 +119,5 @@ console marker. The egui implementation lives in git history.
 
 ## Non-goals
 
-The compute layer (graph-compute, broker orchestration, Sky-Pilot) stays
+The compute layer (graph-compute, broker orchestration, Kubernetes/Ray) stays
 behind graph-api — the app consumes its HTTP/streaming interfaces only.

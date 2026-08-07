@@ -17,7 +17,7 @@ The test harness in `crates/test-browser/` is the only exception, and only becau
 | `crates/data-loader` | Source-neutral importer contracts. Every descriptor carries discovery schema version 1, and every completed import emits one validated `SearchDocument` per graph node. Defines the six CLI source kinds: Obsidian, tvix, generate, Kubernetes, OKF, and Pest. |
 | `crates/graph-api` | axum HTTP server. Loads the selected importer, serves `/graph/*`, `/graph/schema`, `/node/*id`, `/search`, `/vault/page` (Obsidian editor PUT), `/progress`, etc. Atomically swaps an in-memory `GraphSnapshot` containing the graph, importer schema, generic Tantivy search index, schema-driven facets, metrics, and binary caches. Serves the frontend dist from `--assets-dir` / `JUMP_CANNON_ASSETS_DIR`. |
 | `crates/graph-layouts` | wgpu compute force-sim. Native + WASM. Consumed in-process by `app/ui` (path dependency). |
-| `crates/graph-compute` | Optional standalone layout solver, gRPC on `[::1]:50051`. Opt-in via `--compute-url` / `JUMP_CANNON_COMPUTE_URL` — unset means the broker is never dialed. Deployable as the docker-compose service or via Sky-Pilot (`infra/sky/`). |
+| `crates/graph-compute` | Optional standalone layout solver, gRPC on `[::1]:50051`. Opt-in via `--compute-url` / `JUMP_CANNON_COMPUTE_URL` — unset means the broker is never dialed. Runs through the local docker-compose development stack or the Helm chart's Kueue-admitted RayCluster. |
 | `crates/graph-metrics` | PageRank, Louvain, k-core, betweenness, weakly-connected-components. Stateless functions over `vault-data::Graph`. |
 | `crates/vault-data` | Shared domain types: `Node`, `Edge`, `Graph`, `FieldSchema`, the categorical color palette. Every other vault crate depends on it; no I/O. |
 | `crates/vault-links` | Obsidian importer. Walks a vault on disk, parses Markdown + frontmatter, resolves wikilinks, and emits a graph plus discovery documents. |
@@ -43,7 +43,7 @@ Workflow: `just dev-up` (backend) + `just app-dev` (desktop app, hot-reload). `j
 
 Nix integration: `nix build .#app-web` builds the frontend dist through crane + trunk (it's also a flake check, so `nix flake check` gates it). `wasm-bindgen` is pinned to `=0.2.118` in `app/Cargo.toml` to match the nixpkgs CLI exactly. The Tauri shell itself stays a devshell build — bundling needs platform signing toolchains nix can't usefully sandbox on macOS.
 
-Scope rule: the compute layer (`graph-compute`, gRPC broker, Sky-Pilot orchestration) is **not** part of this app — it stays behind graph-api's interfaces.
+Scope rule: the compute layer (`graph-compute`, gRPC broker, Kubernetes/Ray orchestration) is **not** part of this app — it stays behind graph-api's interfaces.
 
 **Parity contract:** the migration target was *identical features* to the retired egui renderer — same wgpu renderer, same layout engines, same settings. The phase plan, feature inventory, and remaining PARITY-GAP items live in [`docs/dioxus-migration.md`](docs/dioxus-migration.md); the egui reference implementation is in git history.
 
@@ -100,7 +100,7 @@ The whole repo builds through **nix + crane + trunk**. No `npm install`, no `was
 
 `just dev-up` and the test recipes are convenience wrappers around the nix outputs — never standalone command stacks.
 
-`just` is structured with **modules** for subcommand grammar: `test` and `cluster` live in `just/*.just`, so `just test cargo`, `just test fuzz 5000`, `just cluster up sky` are real, completable recipes (not bash-case dispatch). `just --list` shows the top level grouped by `[group(...)]`; `just --list test` / `just --list cluster` enumerate a module's subcommands. Each module pins `set working-directory := '..'` so recipes run from the repo root.
+`just` is structured with **modules** for subcommand grammar: `test` and `cluster` live in `just/*.just`, so `just test cargo`, `just test fuzz 5000`, and `just cluster up` are real, completable recipes (not bash-case dispatch). `just --list` shows the top level grouped by `[group(...)]`; `just --list test` / `just --list cluster` enumerate a module's subcommands. Each module pins `set working-directory := '..'` so recipes run from the repo root.
 
 ## Testing
 

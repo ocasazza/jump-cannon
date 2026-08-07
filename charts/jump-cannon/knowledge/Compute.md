@@ -12,6 +12,11 @@ graph-api is the only frontend-facing compute boundary. Local layouts run in
 the browser. Cluster-hosted GPU sessions use [[Ray GPU Sessions]] admitted by
 [[Kueue Scheduling]].
 
+Production compute is declared by [[Helm Deployment]] and the consuming
+Kubernetes environment. The repository's Docker Compose output is only a local
+development convenience; do not add a parallel repository-level infrastructure
+stack.
+
 Batch expansion and future training belong in [[Large Jobs and Training]], not
 inside the UI. Measure session startup and workload behavior through
 [[Performance Engineering]] and [[Observability]].

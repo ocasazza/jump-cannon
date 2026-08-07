@@ -56,8 +56,8 @@ impl CsrGraph {
     /// [u32 n_nodes][u32 n_edges][u32 × (n_nodes+1) offsets][u32 × n_edges neighbors]
     /// ```
     ///
-    /// Matches the `/graph/csr.bin` exporter in `graph-api`. Same on-disk
-    /// format SkyPilot mounts via `file_mounts` in `infra/sky/graph-compute.yaml`.
+    /// Matches the `/graph/csr.bin` exporter in `graph-api` and the payload
+    /// accepted by the `LoadGraph` gRPC.
     pub fn load_bin(path: impl AsRef<std::path::Path>) -> anyhow::Result<Self> {
         let path = path.as_ref();
         let bytes = std::fs::read(path)

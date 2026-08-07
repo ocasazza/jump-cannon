@@ -1,5 +1,5 @@
-//! Live-cluster canaries. Probe a running graph-compute (local podman or
-//! SkyPilot pod) and assert end-to-end health.
+//! Live-cluster canaries. Probe a running graph-compute (local podman or a
+//! Kubernetes/Ray pod) and assert end-to-end health.
 //!
 //! Tests are gated on `GRAPH_COMPUTE_CANARY_URL` — without it they're
 //! skipped, so they're safe to leave in `cargo test --workspace`. Run

@@ -3,7 +3,7 @@
 #   just                 list every recipe, grouped
 #   just test            run the full test suite      (module: `just test --list`)
 #   just test fuzz 5000  run one test target with args
-#   just cluster up sky  manage the compute cluster   (module: `just cluster --list`)
+#   just cluster up      start local compute services (module: `just cluster --list`)
 #
 # `test` and `cluster` are modules (just/*.just): their subcommands are real,
 # completable recipes with their own `--list`, not bash-case dispatch.
@@ -15,7 +15,7 @@ set positional-arguments
 # run `just --list <mod>` for its subcommands.
 # Test suite: `just test`, `just test cargo`, `just test fuzz 5000`, …
 mod test 'just/test.just'
-# graph-compute cluster: `just cluster up`, `just cluster down sky`, …
+# local graph-compute development stack: `just cluster up`, `just cluster down`, …
 mod cluster 'just/cluster.just'
 
 # Shared paths — single source of truth, no hardcoded duplicates across recipes.

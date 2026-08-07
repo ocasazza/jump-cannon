@@ -1470,8 +1470,8 @@ async fn graph_edges(State(s): State<AppState>) -> impl IntoResponse {
     cached_binary_response(&s, "edges").into_response()
 }
 
-/// Symmetrized CSR adjacency export consumed by `graph-compute` (and SkyPilot
-/// `file_mounts` pre-launch). Format is little-endian:
+/// Symmetrized CSR adjacency export consumed by `graph-compute`. Format is
+/// little-endian:
 ///
 /// ```text
 /// [u32 n_nodes][u32 n_edges][u32 × (n_nodes+1) offsets][u32 × n_edges neighbors]

@@ -8,8 +8,8 @@
 //! Boot semantics: the broadcast channel is created up front so the WS
 //! endpoint never returns 503 for a transient worker outage. A background
 //! reconnect task keeps the gRPC stream alive across worker restarts using
-//! exponential backoff (1s → cap 30s, reset on a successful dial). This is
-//! the SkyPilot-pod-restart story; see infra/sky/README.md.
+//! exponential backoff (1s → cap 30s, reset on a successful dial), covering
+//! local worker restarts and Kubernetes/Ray pod replacement alike.
 
 use std::sync::atomic::Ordering;
 use std::sync::Arc;

@@ -362,11 +362,11 @@
           '';
         };
 
-        # ----- Distributed compute backend: single source of truth -----
-        # The same service spec drives both the local docker-compose stack
-        # (`just dev-up`) and the SkyPilot cloud task (`just sky-up`). Edit
-        # this attrset, then `nix run .#render-stack-configs` to regenerate
-        # both YAMLs.
+        # ----- Local distributed-compute development backend -----
+        # This service spec drives the local docker-compose stack. Production
+        # compute is declared by charts/jump-cannon and scheduled by the
+        # consuming Kubernetes environment. Edit this attrset, then run
+        # `nix run .#render-compose` to regenerate docker-compose.yml.
         graphComputeService = {
           name        = "graph-compute";
           port        = 50051;
@@ -376,8 +376,6 @@
           # (broker, probe) can reach the gRPC port. The native default is
           # `[::1]:50051` which works only for in-host loopback.
           bindAddr    = "[::]:50051";
-          # Cloud-only: SkyPilot accelerator request. Ignored locally.
-          accelerator = "L4:1";
         };
 
         # OCI image built from the Crane derivation — no Dockerfile needed.
@@ -788,42 +786,15 @@
           };
         };
 
-        sky-task-yaml = yamlFmt.generate "graph-compute.sky.yaml" {
-          resources = {
-            accelerators = graphComputeService.accelerator;
-            ports        = [ graphComputeService.port ];
-          };
-          file_mounts."/opt/jump-cannon" = ".";
-          setup = ''
-            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
-            source $HOME/.cargo/env
-            sudo apt-get update -y
-            sudo apt-get install -y libvulkan1 vulkan-tools mesa-vulkan-drivers
-            vulkaninfo --summary || echo "WARN: no vulkan; wgpu falls back to CPU"
-            cd /opt/jump-cannon
-            cargo build --release -p graph-compute
-          '';
-          run = ''
-            source $HOME/.cargo/env
-            cd /opt/jump-cannon
-            GRAPH_COMPUTE_TICK_HZ=${toString graphComputeService.tickHz} \
-            GRAPH_COMPUTE_ADDR=${graphComputeService.bindAddr} \
-            RUST_LOG=${graphComputeService.rustLog} \
-            ./target/release/graph-compute
-          '';
-        };
-
-        # `nix run .#render-stack-configs` — regenerates both YAML files
-        # from the shared graphComputeService spec above.
-        render-stack-configs = pkgs.writeShellApplication {
-          name = "render-stack-configs";
+        # `nix run .#render-compose` — regenerates the local development
+        # compose file from graphComputeService and graphApiService above.
+        render-compose = pkgs.writeShellApplication {
+          name = "render-compose";
           runtimeInputs = [ pkgs.coreutils ];
           text = ''
             set -euo pipefail
             install -m 0644 ${docker-compose-yaml} docker-compose.yml
-            install -d infra/sky
-            install -m 0644 ${sky-task-yaml} infra/sky/graph-compute.yaml
-            echo "rendered: docker-compose.yml + infra/sky/graph-compute.yaml"
+            echo "rendered: docker-compose.yml"
           '';
         };
 
@@ -1001,13 +972,13 @@
           inherit vault-search graph-api graph-compute graph-layouts-wasm tvix-wasm app-web;
           inherit bench-pagerank;
           chart-tarball = pkgs.callPackage ./packages/chart-tarball { };
-          inherit graph-compute-image graph-api-image docker-compose-yaml sky-task-yaml;
+          inherit graph-compute-image graph-api-image docker-compose-yaml;
           inherit graph-api-k8s-image graph-compute-k8s-image test-runner-image;
           inherit test-browser test-workload-bins;
         };
 
         apps = {
-          render-stack-configs = { type = "app"; program = "${render-stack-configs}/bin/render-stack-configs"; };
+          render-compose = { type = "app"; program = "${render-compose}/bin/render-compose"; };
           dev-up   = { type = "app"; program = "${dev-up}/bin/dev-up"; };
           dev-down = { type = "app"; program = "${dev-down}/bin/dev-down"; };
           test-browser-rust = { type = "app"; program = "${test-browser-rust}/bin/test-browser-rust"; };
