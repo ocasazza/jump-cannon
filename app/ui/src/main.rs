@@ -238,6 +238,14 @@ fn legacy_settings_tab(kind: LegacyPanel) -> Option<panels::settings::SettingsTa
 }
 
 fn convert_panel<K>(panel: PanelWin<K>, kind: Panel) -> PanelWin<Panel> {
+    // Panel Kit's historical 1x2 default is too narrow and short for the
+    // editor-style Nodes workbench. Upgrade that exact legacy span while
+    // preserving every explicitly different user size.
+    let (tile_w, tile_h) = if kind == Panel::Nodes && panel.tile_w == 1 && panel.tile_h == 2 {
+        (2, 4)
+    } else {
+        (panel.tile_w, panel.tile_h)
+    };
     PanelWin {
         kind,
         x: panel.x,
@@ -246,8 +254,8 @@ fn convert_panel<K>(panel: PanelWin<K>, kind: Panel) -> PanelWin<Panel> {
         h: panel.h,
         state: panel.state,
         z: panel.z,
-        tile_w: panel.tile_w,
-        tile_h: panel.tile_h,
+        tile_w,
+        tile_h,
     }
 }
 
@@ -276,7 +284,10 @@ fn convert_legacy_layout(
 
     if let Some((_, source, _)) = visible_config {
         let settings = convert_panel(source, Panel::Settings);
-        if let Some(existing) = panels.iter_mut().find(|panel| panel.kind == Panel::Settings) {
+        if let Some(existing) = panels
+            .iter_mut()
+            .find(|panel| panel.kind == Panel::Settings)
+        {
             *existing = settings;
         } else {
             panels.push(settings);
@@ -341,7 +352,8 @@ fn default_layout() -> Vec<PanelWin<Panel>> {
     // steps now).
     v.extend([
         b.at(Panel::Graph, 12.0, 44.0, 640.0, 620.0).with_tile(4, 3),
-        b.at(Panel::Nodes, 660.0, 44.0, 608.0, 620.0),
+        b.at(Panel::Nodes, 660.0, 44.0, 608.0, 620.0)
+            .with_tile(2, 4),
         b.at(Panel::Progress, 12.0, 672.0, 640.0, 200.0),
         b.at(Panel::Settings, 660.0, 672.0, 608.0, 420.0)
             .with_tile(2, 3),
@@ -508,15 +520,10 @@ fn commit_server_graph(mut ctx: Ctx, epoch: u64, graph: GraphData) -> bool {
         return false;
     }
     let revision = graph.graph_revision.filter(|r| *r != 0);
-    let scene = graph.scene.clone();
     ctx.graph_session.write().graph_revision = revision;
     panels::layout::set_expected_graph_revision(revision);
     panels::style::reset_for_graph_session(true);
     ctx.graph.set(Some(graph));
-    // The canvas normally mounts before the asynchronous server load returns.
-    // Feed the completed scene to that existing element; onmounted remains the
-    // fallback when the Graph panel is restored after loading.
-    render::mount_canvas(scene);
     true
 }
 
@@ -537,9 +544,7 @@ pub(crate) fn replace_with_client_graph(
             evaluator: evaluator.into(),
         },
     });
-    let scene = graph.scene.clone();
     ctx.graph.set(Some(graph));
-    render::mount_canvas(scene);
 }
 
 pub(crate) async fn reload_graph(mut ctx: Ctx) {

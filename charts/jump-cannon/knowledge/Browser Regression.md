@@ -16,16 +16,29 @@ and writes `nodes-editor.png`, `boot.png`, and `report.json` under
 Stable fixture notes prove that Nodes renders a horizontal navigator/content
 split, exposes the core importer search keys, loads selected content, preserves
 selection across Flat and Tags, groups exact multi-tags without duplicate rows,
-and exposes a synthetic `(untagged)` group. When the wrapper owns the temporary
-vault, those fixtures are mandatory rather than silently falling back to a
-weaker generic check. The structured result is recorded under
-`nodes_editor` in `report.json`.
+and exposes a synthetic `(untagged)` group. It also hit-tests the search and
+mode controls below the Panel Kit header, switches to tiling, and verifies that
+the Nodes tile remains large enough for a left navigator and wider content
+pane. When the wrapper owns the temporary vault, those fixtures are mandatory
+rather than silently falling back to a weaker generic check. The structured
+result is recorded under `nodes_editor` in `report.json`.
+
+The same run maximizes unified Settings and verifies the Connection, Layout,
+Appearance, and Camera tabs in order. Each tab must have one selected ARIA tab,
+a matching tabpanel with real delegated content, and an unobscured pointer
+target; the retired standalone configuration panels must be absent. Restoring
+Settings must remount a render-ready Graph canvas. These results are recorded
+under `settings_tabs`.
 
 Chromiumoxide arguments are keys without a leading `--`; its launcher adds the
 CLI prefix. Cluster browser jobs run as the chart's non-root identity without a
 service-account token, and the automation browser explicitly disables its own
-sandbox because the pod is already isolated and capability-free. The harness
-uses the fixed Chromium window directly instead of CDP viewport emulation and
+sandbox because the pod is already isolated and capability-free. Linux
+headless runs keep Vulkan compute but disable the display surface, presenting
+through Chromium's headless path so the first WebGPU frame cannot block CDP.
+The harness uses an incognito, per-run browser profile and the fixed Chromium
+window directly instead of CDP viewport emulation. This prevents persisted
+panel choices and concurrent profile locks from affecting results, and
 enforces `--timeout-secs` as an overall deadline so software WebGPU cannot leave
 a CronJob running indefinitely. Navigation is scheduled from `about:blank`
 without waiting on Chromium's page-load lifecycle; application readiness comes
@@ -35,11 +48,17 @@ can temporarily occupy Chromium's renderer while it creates the device and
 pipelines; one stalled CDP evaluation is diagnostic evidence, not by itself a
 failed application boot.
 
+The console collector preserves CDP severity. Resource-load errors, unhandled
+exceptions, `console.error`, and Rust tracing `ERROR` records all fail the run;
+warnings remain diagnostic. A report is not green merely because a failure was
+delivered through CDP's Log domain instead of Runtime.
+
 WebGPU requires a secure browser context. The cluster smoke test reaches the
 app through its plain-HTTP Kubernetes Service, so its disposable Chromium
 process grants secure-context treatment only to the configured `baseUrl`.
 Production browser exposure should terminate TLS rather than copy this test
-exception.
+exception. The happy-path assertion records both `window.isSecureContext` and
+`navigator.gpu` before accepting the renderer-ready marker.
 
 A nonzero canvas rectangle alone does not prove nodes rendered. Review both
 screenshots and browser errors for visual changes to [[Frontend]] or [[Workspace]].

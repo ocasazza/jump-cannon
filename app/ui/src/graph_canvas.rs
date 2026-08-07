@@ -171,17 +171,28 @@ struct Drag {
 #[component]
 pub fn GraphCanvas(graph: Signal<Option<GraphData>>, selected: Signal<Option<String>>) -> Element {
     let mut drag = use_signal(|| Option::<Drag>::None);
+    let render_status = render::RENDER_STATUS.read().clone();
+    let render_state = render_status.as_attr();
+    let node_count = graph.read().as_ref().map(|g| g.n_nodes).unwrap_or(0);
+
+    // One owner for renderer initialization. This effect runs after the DOM
+    // commit, reacts when the graph scene changes, and runs again when a
+    // minimized Graph panel is restored. Keeping it here avoids racing a
+    // graph-commit mount against the canvas onmounted hook.
+    use_effect(move || {
+        if let Some(g) = graph.read().as_ref() {
+            render::mount_canvas(g.scene.clone());
+        }
+    });
 
     rsx! {
-        div { class: "graph-wrap",
+        div {
+            class: "graph-wrap",
+            "data-render-state": "{render_state}",
             canvas {
                 id: render::CANVAS_ID,
                 class: "graph-canvas",
-                onmounted: move |_| {
-                    if let Some(g) = graph.read().as_ref() {
-                        render::mount_canvas(g.scene.clone());
-                    }
-                },
+                "data-node-count": "{node_count}",
                 onmousedown: move |e: MouseEvent| {
                     let c = e.element_coordinates();
                     drag.set(Some(Drag { last_mx: c.x, last_my: c.y, moved: false }));
@@ -254,6 +265,22 @@ pub fn GraphCanvas(graph: Signal<Option<GraphData>>, selected: Signal<Option<Str
                     // Browser wheel-down is +y; egui zoom-in is positive.
                     render::wheel_zoom(-dy as f32);
                 },
+            }
+            if render_status == render::RenderStatus::Initializing {
+                div {
+                    class: "graph-render-status initializing",
+                    "data-testid": "graph-render-status",
+                    "Preparing WebGPU renderer…"
+                }
+            }
+            if let render::RenderStatus::Unavailable { title, detail } = render_status {
+                div {
+                    class: "graph-render-status unavailable",
+                    role: "alert",
+                    "data-testid": "graph-render-status",
+                    h2 { "{title}" }
+                    p { "{detail}" }
+                }
             }
         }
     }

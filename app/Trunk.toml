@@ -11,6 +11,10 @@ dist = "ui/dist"
 # /tvix-worker.js (see ui/src/worker.rs) — a content hash in the filename
 # would break that. Same trade the egui-era root Trunk.toml made.
 filehash = false
+# Trunk otherwise adds SRI to the WASM `as=fetch` preload. Chromium cannot
+# apply SRI to that destination and reports a misleading console warning; the
+# generated bundle is served as a same-origin, host-owned unit.
+no_sri = true
 
 # Watch the path dependencies too — trunk's default only covers the bin
 # crate's directory, so graph-layouts edits otherwise never trigger a
