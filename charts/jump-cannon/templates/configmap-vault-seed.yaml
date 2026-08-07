@@ -6,9 +6,10 @@ metadata:
   name: {{ include "jump-cannon.fullname" . }}-vault-seed
   labels:
     {{- include "jump-cannon.labels" . | nindent 4 }}
+{{/* Preserve byte-zero frontmatter in administrator-supplied seed notes. */}}
 data:
   {{- range $name, $body := .Values.vault.seed.files }}
   {{ $name | quote }}: |-
-{{ $body | nindent 4 }}
+{{ $body | indent 4 }}
   {{- end }}
 {{- end }}
