@@ -163,9 +163,18 @@ impl ConnectorOp {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) enum Card {
     /// System search card; no delete button.
-    Search { value: String, regex: bool },
-    Filter { field: String, op: Op, value: String },
-    Connector { op: ConnectorOp },
+    Search {
+        value: String,
+        regex: bool,
+    },
+    Filter {
+        field: String,
+        op: Op,
+        value: String,
+    },
+    Connector {
+        op: ConnectorOp,
+    },
     ParenOpen,
     ParenClose,
     Not,
@@ -184,7 +193,10 @@ impl Default for QueryModel {
     fn default() -> Self {
         Self {
             // Always start with the system search card.
-            cards: vec![Card::Search { value: String::new(), regex: false }],
+            cards: vec![Card::Search {
+                value: String::new(),
+                regex: false,
+            }],
             active_filters: ActiveFieldFilters::default(),
         }
     }
@@ -193,7 +205,11 @@ impl Default for QueryModel {
 impl QueryModel {
     /// Toggle inclusion of `(field, value)` in the active filter set.
     pub(crate) fn toggle_field_filter(&mut self, field: &str, value: &str) {
-        let entry = self.active_filters.by_field.entry(field.to_string()).or_default();
+        let entry = self
+            .active_filters
+            .by_field
+            .entry(field.to_string())
+            .or_default();
         if entry.contains(value) {
             entry.remove(value);
             if entry.is_empty() {
@@ -203,7 +219,12 @@ impl QueryModel {
             }
         } else {
             entry.insert(value.to_string());
-            if !self.active_filters.insertion_order.iter().any(|f| f == field) {
+            if !self
+                .active_filters
+                .insertion_order
+                .iter()
+                .any(|f| f == field)
+            {
                 self.active_filters.insertion_order.push(field.to_string());
             }
         }
@@ -337,7 +358,10 @@ impl FieldIndex {
             let mut v = b.node_idx.clone();
             v.sort_unstable();
             v.dedup();
-            by_field.entry(field).or_default().insert(b.value.clone(), v);
+            by_field
+                .entry(field)
+                .or_default()
+                .insert(b.value.clone(), v);
         }
         Self { by_field }
     }
@@ -473,9 +497,13 @@ pub(crate) static BEHAVIOR: GlobalSignal<FilterBehavior> = Signal::global(|| loa
 pub(crate) static FIELD_INDEX: GlobalSignal<Option<Result<FieldIndex, String>>> =
     Signal::global(|| None);
 static FIELD_INDEX_STARTED: GlobalSignal<bool> = Signal::global(|| false);
+static FIELD_INDEX_SESSION: GlobalSignal<u64> = Signal::global(|| 0);
 
 fn persist() {
-    let p = Persisted { query: QUERY.peek().clone(), behavior: *BEHAVIOR.peek() };
+    let p = Persisted {
+        query: QUERY.peek().clone(),
+        behavior: *BEHAVIOR.peek(),
+    };
     let _ = LocalStorage::set(STORE_KEY, &p);
 }
 
@@ -488,18 +516,32 @@ pub(crate) fn state_snapshot() -> (QueryModel, FilterBehavior) {
 /// AppState round-trip seam: write the imported filter state straight to
 /// localStorage; the apply path's reload re-seeds the signals.
 pub(crate) fn state_restore(query: &QueryModel, behavior: FilterBehavior) {
-    let _ = LocalStorage::set(STORE_KEY, &Persisted { query: query.clone(), behavior });
+    let _ = LocalStorage::set(
+        STORE_KEY,
+        &Persisted {
+            query: query.clone(),
+            behavior,
+        },
+    );
 }
 
 /// One-shot `/graph/meta_summary` fetch — called from both panels' render
 /// paths so whichever opens first arms it (the egui app fetches at boot).
-pub(crate) fn ensure_field_index() {
+pub(crate) fn ensure_field_index(ctx: Ctx) {
+    if !ctx.graph_session.peek().is_server_backed() {
+        return;
+    }
     if *FIELD_INDEX_STARTED.peek() {
         return;
     }
     *FIELD_INDEX_STARTED.write() = true;
+    let session = *FIELD_INDEX_SESSION.peek();
     spawn(async move {
-        match get_proto::<proto::MetaSummary>("/graph/meta_summary").await {
+        let fetched = get_proto::<proto::MetaSummary>("/graph/meta_summary").await;
+        if *FIELD_INDEX_SESSION.peek() != session {
+            return;
+        }
+        match fetched {
             Ok(m) => {
                 tracing::info!(
                     "[filter] meta_summary: {} fields, {} buckets",
@@ -515,6 +557,21 @@ pub(crate) fn ensure_field_index() {
                 *FIELD_INDEX.write() = Some(Err(e));
             }
         }
+    });
+}
+
+/// Drop index-derived state whenever dense node indices may have changed.
+/// The user's persisted query remains available when a new server graph is
+/// loaded, but no stale mask is allowed to survive the transition.
+pub(crate) fn reset_for_graph_session() {
+    let next = FIELD_INDEX_SESSION.peek().wrapping_add(1);
+    *FIELD_INDEX_SESSION.write() = next;
+    *FIELD_INDEX_STARTED.write() = false;
+    *FIELD_INDEX.write() = None;
+    render::with_host(|h| {
+        let (pipes, queue) = h.pipes_and_queue();
+        pipes.set_filter_mask(queue, None);
+        pipes.set_focus_set(queue, None, &HashSet::new());
     });
 }
 
@@ -609,15 +666,22 @@ fn append_filter(q: &mut QueryModel) {
         Some(Card::Connector { .. }) | Some(Card::ParenOpen) | Some(Card::Not) | None
     );
     if needs_connector {
-        q.cards.push(Card::Connector { op: ConnectorOp::And });
+        q.cards.push(Card::Connector {
+            op: ConnectorOp::And,
+        });
     }
-    q.cards.push(Card::Filter { field: "tag".into(), op: Op::Eq, value: String::new() });
+    q.cards.push(Card::Filter {
+        field: "tag".into(),
+        op: Op::Eq,
+        value: String::new(),
+    });
 }
 
 // --- panel -------------------------------------------------------------------------
 
-pub fn panel(_ctx: Ctx) -> Element {
-    ensure_field_index();
+pub fn panel(ctx: Ctx) -> Element {
+    let server_backed = ctx.graph_session.read().is_server_backed();
+    ensure_field_index(ctx);
     crate::appstate::ensure_init();
     let q = QUERY.read().clone();
     let cards = q.cards.clone();
@@ -675,6 +739,12 @@ pub fn panel(_ctx: Ctx) -> Element {
 
     rsx! {
         div { class: "fil",
+            if !server_backed {
+                div { class: "fil-note",
+                    "Metadata filters are unavailable for this client-only graph. \
+                     Host the graph in graph-api before applying field buckets."
+                }
+            }
             // Active (field, value) chips + combinators + Filter/Dim toggle —
             // merged in from the former standalone "Filters" strip panel.
             { active_filters_section(&q) }
@@ -727,7 +797,8 @@ pub fn panel(_ctx: Ctx) -> Element {
             }
 
             // Field/value bucket browser (FieldIndex from /graph/meta_summary).
-            div { class: "fil-fields",
+            if server_backed {
+              div { class: "fil-fields",
                 div { class: "fil-fhead",
                     span { class: "fil-ftitle", "fields" }
                     if active_total >= 1 {
@@ -738,6 +809,7 @@ pub fn panel(_ctx: Ctx) -> Element {
                     }
                 }
                 {fields_el}
+              }
             }
         }
     }
@@ -982,5 +1054,90 @@ fn card_el(i: usize, card: Card) -> Element {
                 }
             }
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ActiveFieldFilters, Card, Combinator, FieldIndex, Op, QueryModel};
+    use std::collections::{BTreeSet, HashMap, HashSet};
+
+    fn index() -> FieldIndex {
+        FieldIndex {
+            by_field: HashMap::from([
+                ("tags".into(), HashMap::from([
+                    ("rust".into(), vec![0, 1, 3]),
+                    ("gpu".into(), vec![1, 2]),
+                ])),
+                ("folder".into(), HashMap::from([
+                    ("work".into(), vec![1, 3]),
+                    ("home".into(), vec![0, 2]),
+                ])),
+            ]),
+        }
+    }
+
+    fn values(items: &[&str]) -> BTreeSet<String> {
+        items.iter().map(|v| (*v).to_string()).collect()
+    }
+
+    #[test]
+    fn defaults_union_values_and_intersect_fields() {
+        let filters = ActiveFieldFilters {
+            by_field: [
+                ("tags".into(), values(&["rust", "gpu"])),
+                ("folder".into(), values(&["work"])),
+            ].into_iter().collect(),
+            ..Default::default()
+        };
+        assert_eq!(index().matches(&filters), Some(HashSet::from([1, 3])));
+    }
+
+    #[test]
+    fn all_within_a_multivalue_field_intersects_buckets() {
+        let mut filters = ActiveFieldFilters {
+            by_field: [("tags".into(), values(&["rust", "gpu"]))].into_iter().collect(),
+            ..Default::default()
+        };
+        filters.set_combinator_for("tags", Combinator::All);
+        assert_eq!(index().matches(&filters), Some(HashSet::from([1])));
+    }
+
+    #[test]
+    fn cross_field_any_unions_field_results() {
+        let filters = ActiveFieldFilters {
+            by_field: [
+                ("tags".into(), values(&["rust"])),
+                ("folder".into(), values(&["home"])),
+            ].into_iter().collect(),
+            cross_field_combinator: Combinator::Any,
+            ..Default::default()
+        };
+        assert_eq!(index().matches(&filters), Some(HashSet::from([0, 1, 2, 3])));
+    }
+
+    #[test]
+    fn unknown_persisted_values_do_not_destroy_known_matches() {
+        let filters = ActiveFieldFilters {
+            by_field: [("tags".into(), values(&["rust", "removed-tag"]))]
+                .into_iter().collect(),
+            ..Default::default()
+        };
+        assert_eq!(index().matches(&filters), Some(HashSet::from([0, 1, 3])));
+    }
+
+    #[test]
+    fn query_reset_removes_cards_and_active_filters() {
+        let mut query = QueryModel::default();
+        query.cards.push(Card::Filter {
+            field: "tags".into(),
+            op: Op::Eq,
+            value: "rust".into(),
+        });
+        query.toggle_field_filter("tags", "rust");
+        query.clear();
+        assert!(matches!(query.cards.as_slice(), [Card::Search { value, regex: false }] if value.is_empty()));
+        assert!(query.active_filters.by_field.is_empty());
+        assert!(query.active_filters.insertion_order.is_empty());
     }
 }

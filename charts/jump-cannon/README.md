@@ -10,6 +10,20 @@ The chart intentionally does not create network exposure objects. The
 envoy-ai-gateway deployment owns NetBird `NetworkResource` and Gateway API
 routes for the nixstation cluster.
 
+## Default knowledge graph
+
+The chart packages the canonical markdown under `knowledge/` and synchronizes
+it to the reserved `Jump Cannon/` folder in the Obsidian vault. The graph starts
+at `Start Here` and maps product use, development, operations, compute,
+observability, testing, security, troubleshooting, and the agent workflow used
+to maintain Jump Cannon itself.
+
+Packaged knowledge is chart-owned and replaced on each graph-api rollout.
+Additional `vault.seed.files` are copied to the vault root only when absent, so
+the chart never overwrites user-owned seed content. Set
+`vault.seed.includeKnowledgeBase=false` to omit the packaged corpus. Seed files
+are stored in ConfigMaps and must never contain credentials or sensitive data.
+
 GPU compute and performance tests run at batch priority on the `gpu` LocalQueue.
 In nixstation, render them into `gpu-workloads` with `graphCompute.namespace`
 and `tests.performance.namespace` so they use the existing LocalQueue. With the

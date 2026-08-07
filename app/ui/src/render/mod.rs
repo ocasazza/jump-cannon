@@ -140,7 +140,8 @@ pub fn mount_canvas(mut scene: Scene) {
             tracing::warn!("[render] mount: canvas #{CANVAS_ID} not in DOM");
             return;
         };
-        match RenderHost::new(canvas, scene).await {
+        let _ = canvas.remove_attribute("data-render-ready");
+        match RenderHost::new(canvas.clone(), scene).await {
             Ok(host) => {
                 let still_current = CTL.with(|c| c.borrow().generation == generation);
                 if !still_current {
@@ -149,6 +150,7 @@ pub fn mount_canvas(mut scene: Scene) {
                 HOST.with(|h| *h.borrow_mut() = Some(host));
                 reapply_ctl_state();
                 start_raf_loop();
+                let _ = canvas.set_attribute("data-render-ready", "true");
             }
             Err(e) => tracing::error!("[render] wgpu init failed: {e}"),
         }

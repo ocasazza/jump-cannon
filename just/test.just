@@ -60,4 +60,6 @@ geometric-golden:
 [group('test')]
 [doc('Rust-driven browser smoke test (crates/test-browser via CDP)')]
 browser-rust:
-    nix run .#test-browser-rust
+    # The repository .env may point VAULT_ROOT at a developer vault. Keep the
+    # regression fixture isolated so its node and edge assertions stay stable.
+    env -u VAULT_ROOT nix run .#test-browser-rust

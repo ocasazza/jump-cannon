@@ -111,6 +111,12 @@ impl DocState {
 /// Keyed by node id — the egui App's `page_viewer_states` map.
 static DOCS: GlobalSignal<HashMap<String, DocState>> = Signal::global(HashMap::new);
 
+/// Node ids are only unique within one graph-api endpoint. Switching servers
+/// must not offer an old endpoint's dirty buffer as the new endpoint's file.
+pub(crate) fn reset_for_server_change() {
+    DOCS.write().clear();
+}
+
 fn with_doc<R>(id: &str, f: impl FnOnce(&mut DocState) -> R) -> R {
     f(DOCS.write().entry(id.to_string()).or_default())
 }
@@ -167,15 +173,18 @@ mod content_capability_tests {
 /// defensive `split_frontmatter` port. The wire strips frontmatter before
 /// sending, so this normally passes the input through.
 fn split_frontmatter(source: &str) -> &str {
-    let Some(after_open) =
-        source.strip_prefix("---\n").or_else(|| source.strip_prefix("---\r\n"))
+    let Some(after_open) = source
+        .strip_prefix("---\n")
+        .or_else(|| source.strip_prefix("---\r\n"))
     else {
         return source;
     };
     let mut start = 0usize;
     while start < after_open.len() {
-        let line_end =
-            after_open[start..].find('\n').map(|i| start + i).unwrap_or(after_open.len());
+        let line_end = after_open[start..]
+            .find('\n')
+            .map(|i| start + i)
+            .unwrap_or(after_open.len());
         if after_open[start..line_end].trim_end_matches('\r') == "---" {
             let mut body_start = line_end;
             if after_open[body_start..].starts_with('\n') {
@@ -195,12 +204,22 @@ fn cursor_stats(buf: &str, byte_off: usize) -> (usize, usize, usize, usize) {
     let off = byte_off.min(buf.len());
     // Clamp to a char boundary (the UTF-16 → byte conversion already lands
     // on one, but stay defensive).
-    let off = (0..=off).rev().find(|&i| buf.is_char_boundary(i)).unwrap_or(0);
+    let off = (0..=off)
+        .rev()
+        .find(|&i| buf.is_char_boundary(i))
+        .unwrap_or(0);
     let head = &buf[..off];
     let line = head.bytes().filter(|b| *b == b'\n').count() + 1;
-    let col = head.rsplit('\n').next().map(|s| s.chars().count() + 1).unwrap_or(1);
-    let total_lines =
-        if buf.is_empty() { 1 } else { buf.bytes().filter(|b| *b == b'\n').count() + 1 };
+    let col = head
+        .rsplit('\n')
+        .next()
+        .map(|s| s.chars().count() + 1)
+        .unwrap_or(1);
+    let total_lines = if buf.is_empty() {
+        1
+    } else {
+        buf.bytes().filter(|b| *b == b'\n').count() + 1
+    };
     (line, col, total_lines, buf.chars().count())
 }
 
@@ -345,7 +364,17 @@ fn render_markdown(md: &str) -> String {
 // --- panel -----------------------------------------------------------------------------
 
 pub(crate) fn panel(ctx: Ctx) -> Element {
-    let Ctx { meta, meta_busy, selected, .. } = ctx;
+    if !ctx.graph_session.read().is_server_backed() {
+        return rsx! { div { class: "empty",
+            "Client-only graph: there is no server-owned vault page to view or edit."
+        } };
+    }
+    let Ctx {
+        meta,
+        meta_busy,
+        selected,
+        ..
+    } = ctx;
     if *meta_busy.read() {
         return rsx! { div { class: "skeleton", Spinner { label: "loading node…" } } };
     }
@@ -448,7 +477,11 @@ pub(crate) fn panel(ctx: Ctx) -> Element {
     let body_el: Element = match st.mode {
         ViewMode::Rendered => {
             // Preview the dirty buffer when edits exist, else the wire body.
-            let source = if st.dirty { st.buffer.clone() } else { m.body.clone() };
+            let source = if st.dirty {
+                st.buffer.clone()
+            } else {
+                m.body.clone()
+            };
             let body_text = split_frontmatter(&source).to_string();
             if body_text.is_empty() {
                 rsx! { div { class: "ins-note", "(empty body)" } }
@@ -513,7 +546,13 @@ pub(crate) fn panel(ctx: Ctx) -> Element {
 /// egui Source tab ran a syntect layouter through egui_extras); syntect is
 /// not a dependency of this crate and new deps are out of scope, so the
 /// source renders as plain monospace.
-fn source_editor(ctx: Ctx, node_id: &str, path: &str, st: &DocState, total_lines: usize) -> Element {
+fn source_editor(
+    ctx: Ctx,
+    node_id: &str,
+    path: &str,
+    st: &DocState,
+    total_lines: usize,
+) -> Element {
     // Same logical-vs-visual line caveat as the egui gutter: long wrapped
     // lines diverge — accepted, markdown body lines are usually short.
     let gutter: String = (1..=total_lines).map(|n| format!("{n}\n")).collect();

@@ -67,6 +67,19 @@ graph-api notify watcher ──► debounce 400ms ──► rebuild Graph + resp
 
 `tvix-wasm` is the cross-target Nix evaluator (used server-side for `POST /generate`; available for future config surfaces).
 
+## Living knowledge graph
+
+The canonical user, development, and operations map starts at
+[`charts/jump-cannon/knowledge/Start Here.md`](charts/jump-cannon/knowledge/Start%20Here.md).
+Agents must use that map when changing Jump Cannon and update the affected notes
+and wikilinks in the same change as behavior, deployment, or runbook changes.
+The Helm chart packages this exact corpus into the default vault, so these files
+are both agent-facing docs and the graph users explore in Jump Cannon itself.
+
+Files under `charts/jump-cannon/knowledge/` are chart-owned and synchronized to
+the reserved `Jump Cannon/` folder in the deployed vault. User-owned vault notes
+and `vault.seed.files` are not part of that managed folder.
+
 ## Build & development
 
 The whole repo builds through **nix + crane + trunk**. No `npm install`, no `wasm-pack`, no yarn lockfile.

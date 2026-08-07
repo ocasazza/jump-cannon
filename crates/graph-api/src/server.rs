@@ -5,6 +5,7 @@
 // at this server via a --backend-url flag (not yet implemented).
 
 use axum::{
+    body::Bytes,
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
         Path, Query, State,
@@ -25,6 +26,7 @@ use vault_data::color::PALETTE;
 
 const PROTOBUF_CT: &str = "application/x-protobuf";
 const OCTET_CT: &str = "application/octet-stream";
+const GRAPH_REVISION_HEADER: &str = "x-graph-revision";
 
 fn importer_authorizes(
     importer: &HostedImporter,
@@ -34,6 +36,13 @@ fn importer_authorizes(
 ) -> bool {
     let capability = Capability::new(effect, transport, scope);
     importer.is_authorized(&capability)
+}
+
+fn insert_graph_revision(headers: &mut HeaderMap, revision: u64) {
+    headers.insert(
+        GRAPH_REVISION_HEADER,
+        HeaderValue::from_str(&revision.to_string()).expect("u64 is a valid header value"),
+    );
 }
 
 pub fn router(state: AppState) -> Router {
@@ -61,6 +70,10 @@ pub fn router(state: AppState) -> Router {
         .route("/compute/health", get(compute_health))
         .route("/compute/engines", get(compute_engines))
         .route("/compute/layout", put(compute_layout_put))
+        .route(
+            "/compute/initial-placement",
+            put(compute_initial_placement_put),
+        )
         // Self-assembly demo: synthesize a particle soup, host it as the active
         // graph, and push it to the compute worker so the geometric engine
         // assembles it (instead of the vault graph).
@@ -465,43 +478,251 @@ struct ComputeLayoutPutReq {
     layout_id: String,
     #[serde(default)]
     params: Option<serde_json::Value>,
+    #[serde(default)]
+    lens: Option<LensConfig>,
+    #[serde(default)]
+    expected_generation: Option<u64>,
 }
 
 #[derive(Serialize)]
 struct ComputeLayoutPutResp {
     ok: bool,
+    changed: bool,
+    graph_revision: u64,
+    selection_generation: u64,
     error: Option<String>,
+}
+
+fn resolve_remote_selection(
+    layout_id: String,
+    params: Option<serde_json::Value>,
+    lens: Option<LensConfig>,
+    snap: &crate::state::GraphSnapshot,
+) -> Result<crate::compute_broker::RemoteLayout, String> {
+    let mut selection = crate::compute_broker::RemoteLayout {
+        layout_id: layout_id.clone(),
+        params,
+        ..Default::default()
+    };
+    let Some(lens) = lens else {
+        return Ok(selection);
+    };
+    if layout_id != "geometric" && layout_id != "geometric-gpu" {
+        return Err("lens is only valid for geometric layouts".into());
+    }
+
+    let (settings, attrs) = attribute_resolver::resolve(&lens, snap);
+    let settings_json = serde_json::to_value(settings).map_err(|e| e.to_string())?;
+    selection.attributes = Some(attribute_resolver::encode_proto(attrs));
+    if lens.use_multilevel {
+        let multilevel = graph_compute::engines::MultilevelSettings {
+            inner: layout_id,
+            inner_params: settings_json,
+            ..Default::default()
+        };
+        selection.layout_id = "multilevel".to_string();
+        selection.params = Some(serde_json::to_value(multilevel).map_err(|e| e.to_string())?);
+    } else {
+        selection.params = Some(settings_json);
+    }
+    selection.lens = Some(lens);
+    Ok(selection)
 }
 
 async fn compute_layout_put(
     State(s): State<AppState>,
     Json(req): Json<ComputeLayoutPutReq>,
 ) -> impl IntoResponse {
+    let snap = s.snapshot();
+    let graph_revision = snap.revision;
+    let current_generation = s.inner.compute_broker.selection_state().await.generation;
     let layout_id = req.layout_id.trim().to_string();
     if layout_id.is_empty() {
         return axum::Json(ComputeLayoutPutResp {
             ok: false,
+            changed: false,
+            graph_revision,
+            selection_generation: current_generation,
             error: Some("layout_id must be non-empty".into()),
         });
     }
-    let selection = crate::compute_broker::RemoteLayout {
-        layout_id,
-        params: req.params,
-        ..Default::default()
+    let selection = match resolve_remote_selection(layout_id, req.params, req.lens, &snap) {
+        Ok(selection) => selection,
+        Err(error) => {
+            return axum::Json(ComputeLayoutPutResp {
+                ok: false,
+                changed: false,
+                graph_revision,
+                selection_generation: current_generation,
+                error: Some(error),
+            })
+        }
     };
-    match s.inner.compute_broker.reselect(selection).await {
-        Ok(()) => axum::Json(ComputeLayoutPutResp {
+    match s
+        .inner
+        .compute_broker
+        .reselect(selection, req.expected_generation)
+        .await
+    {
+        Ok(update) => axum::Json(ComputeLayoutPutResp {
             ok: true,
+            changed: update.changed,
+            graph_revision,
+            selection_generation: update.generation,
             error: None,
         }),
         Err(e) => {
             tracing::warn!(error = %e, "compute layout reselect failed");
+            let generation = s.inner.compute_broker.selection_state().await.generation;
             axum::Json(ComputeLayoutPutResp {
                 ok: false,
+                changed: false,
+                graph_revision,
+                selection_generation: generation,
                 error: Some(e.to_string()),
             })
         }
     }
+}
+
+#[derive(Deserialize)]
+struct InitialPlacementQuery {
+    graph_revision: u64,
+}
+
+#[derive(Serialize)]
+struct InitialPlacementResp {
+    ok: bool,
+    n_nodes: u32,
+    graph_revision: u64,
+    selection_generation: u64,
+    error: Option<String>,
+}
+
+fn validate_initial_positions(bytes: &[u8], n_nodes: usize) -> Result<(), String> {
+    let expected = n_nodes
+        .checked_mul(12)
+        .ok_or_else(|| "position byte length overflow".to_string())?;
+    if bytes.len() != expected {
+        return Err(format!(
+            "positions byte length {} != 12 * n_nodes ({expected})",
+            bytes.len()
+        ));
+    }
+    for (component, chunk) in bytes.chunks_exact(4).enumerate() {
+        let value = f32::from_le_bytes(chunk.try_into().expect("four-byte chunk"));
+        if !value.is_finite() {
+            return Err(format!("position component {component} is not finite"));
+        }
+    }
+    Ok(())
+}
+
+/// Replace the remote worker's initial positions for the current graph without
+/// mutating the authoritative layout selection generation.
+async fn compute_initial_placement_put(
+    State(s): State<AppState>,
+    Query(query): Query<InitialPlacementQuery>,
+    body: Bytes,
+) -> impl IntoResponse {
+    let snap = s.snapshot();
+    let selection_generation = s.inner.compute_broker.selection_state().await.generation;
+    let response = |ok, n_nodes, graph_revision, selection_generation, error| {
+        axum::Json(InitialPlacementResp {
+            ok,
+            n_nodes,
+            graph_revision,
+            selection_generation,
+            error,
+        })
+    };
+    if query.graph_revision == 0 || query.graph_revision != snap.revision {
+        return response(
+            false,
+            0,
+            snap.revision,
+            selection_generation,
+            Some(format!(
+                "stale graph revision {}; current revision is {}",
+                query.graph_revision, snap.revision
+            )),
+        );
+    }
+    let n_nodes = snap.graph.node_count();
+    if n_nodes == 0 {
+        return response(
+            false,
+            0,
+            snap.revision,
+            selection_generation,
+            Some("graph has no nodes".into()),
+        );
+    }
+    if let Err(error) = validate_initial_positions(&body, n_nodes) {
+        return response(false, 0, snap.revision, selection_generation, Some(error));
+    }
+    // Recheck immediately before mutation; the Arc keeps the captured graph
+    // coherent, while this guard prevents knowingly loading a stale snapshot.
+    if s.snapshot().revision != snap.revision {
+        return response(
+            false,
+            0,
+            s.snapshot().revision,
+            s.inner.compute_broker.selection_state().await.generation,
+            Some("graph changed while validating initial placement".into()),
+        );
+    }
+
+    let csr = build_csr_bin(&snap);
+    let worker_n = match s
+        .inner
+        .compute_broker
+        .load_graph(csr, body.to_vec(), snap.revision)
+        .await
+    {
+        Ok(n) => n,
+        Err(error) => {
+            return response(
+                false,
+                0,
+                snap.revision,
+                s.inner.compute_broker.selection_state().await.generation,
+                Some(format!("worker LoadGraph: {error}")),
+            )
+        }
+    };
+
+    let current_revision = s.snapshot().revision;
+    if current_revision != snap.revision {
+        // A reload won the race while LoadGraph was in flight. Restore the
+        // current snapshot so the worker cannot remain on stale topology.
+        push_graph_to_worker(&s).await;
+        return response(
+            false,
+            0,
+            current_revision,
+            s.inner.compute_broker.selection_state().await.generation,
+            Some("graph changed while applying initial placement; worker restore attempted".into()),
+        );
+    }
+    if worker_n != n_nodes as u32 {
+        return response(
+            false,
+            0,
+            snap.revision,
+            s.inner.compute_broker.selection_state().await.generation,
+            Some(format!(
+                "worker node count {worker_n} != expected {n_nodes}"
+            )),
+        );
+    }
+    response(
+        true,
+        worker_n,
+        snap.revision,
+        s.inner.compute_broker.selection_state().await.generation,
+        None,
+    )
 }
 
 // ─── /compute/soup — server-side particle-soup self-assembly demo ────────────
@@ -537,6 +758,8 @@ struct ComputeSoupReq {
 struct ComputeSoupResp {
     ok: bool,
     n_nodes: u32,
+    graph_revision: u64,
+    selection_generation: u64,
     error: Option<String>,
 }
 
@@ -622,16 +845,24 @@ async fn compute_soup_post(
     State(s): State<AppState>,
     Json(req): Json<ComputeSoupReq>,
 ) -> impl IntoResponse {
-    let err = |msg: String| {
+    let initial_revision = s.snapshot().revision;
+    let initial_generation = s.inner.compute_broker.selection_state().await.generation;
+    let err = |msg: String, graph_revision: u64, selection_generation: u64| {
         axum::Json(ComputeSoupResp {
             ok: false,
             n_nodes: 0,
+            graph_revision,
+            selection_generation,
             error: Some(msg),
         })
     };
     let n = req.n;
     if n == 0 || n > MAX_SOUP_NODES {
-        return err(format!("n must be in 1..={MAX_SOUP_NODES} (got {n})"));
+        return err(
+            format!("n must be in 1..={MAX_SOUP_NODES} (got {n})"),
+            initial_revision,
+            initial_generation,
+        );
     }
     let radius = req.radius.unwrap_or(40.0);
     let seed = req.seed.unwrap_or(1);
@@ -647,17 +878,33 @@ async fn compute_soup_post(
         });
     }
     let snapshot = crate::state::GraphSnapshot::build(vg);
+    let graph_revision = snapshot.revision;
     s.inner.snapshot.store(std::sync::Arc::new(snapshot));
 
     // 2. Push the same soup to the compute worker (binary CSR + positions).
     let csr = soup_csr_bytes(n);
     let positions = soup_positions_bytes(n, radius, seed);
-    let worker_n = match s.inner.compute_broker.load_graph(csr, positions).await {
+    let worker_n = match s
+        .inner
+        .compute_broker
+        .load_graph(csr, positions, graph_revision)
+        .await
+    {
         Ok(wn) => wn,
-        Err(e) => return err(format!("worker LoadGraph: {e}")),
+        Err(e) => {
+            return err(
+                format!("worker LoadGraph: {e}"),
+                graph_revision,
+                s.inner.compute_broker.selection_state().await.generation,
+            )
+        }
     };
     if worker_n != n {
-        return err(format!("worker node count {worker_n} != requested {n}"));
+        return err(
+            format!("worker node count {worker_n} != requested {n}"),
+            graph_revision,
+            s.inner.compute_broker.selection_state().await.generation,
+        );
     }
 
     // 3. Select the geometric (GPU) engine with the membrane regime so the worker
@@ -669,14 +916,23 @@ async fn compute_soup_post(
         params,
         ..Default::default()
     };
-    if let Err(e) = s.inner.compute_broker.reselect(selection).await {
-        return err(format!("select geometric engine: {e}"));
-    }
+    let update = match s.inner.compute_broker.reselect(selection, None).await {
+        Ok(update) => update,
+        Err(e) => {
+            return err(
+                format!("select geometric engine: {e}"),
+                graph_revision,
+                s.inner.compute_broker.selection_state().await.generation,
+            )
+        }
+    };
 
     tracing::info!(n, morphology, "compute/soup: hosting + assembling a soup");
     axum::Json(ComputeSoupResp {
         ok: true,
         n_nodes: n,
+        graph_revision,
+        selection_generation: update.generation,
         error: None,
     })
 }
@@ -834,7 +1090,9 @@ fn mime_for(path: &str) -> &'static str {
 async fn graph_ids(State(s): State<AppState>) -> impl IntoResponse {
     use axum::Json;
     let snap = s.snapshot();
-    Json(snap.idx_to_id.clone())
+    let mut headers = HeaderMap::new();
+    insert_graph_revision(&mut headers, snap.revision);
+    (headers, Json(snap.idx_to_id.clone()))
 }
 
 async fn graph_init(State(s): State<AppState>) -> impl IntoResponse {
@@ -847,6 +1105,7 @@ async fn graph_init(State(s): State<AppState>) -> impl IntoResponse {
         num_communities: g.num_communities as u32,
         num_wcc: g.num_wcc as u32,
         palette,
+        graph_revision: snap.revision,
     };
     proto_response(&msg)
 }
@@ -1086,7 +1345,10 @@ struct SearchParams {
 /// snippets are display-ready HTML fragments for the Dioxus node browser, not
 /// hot-path bulk data. Falls back to the same title-contains scan as `/search`
 /// (empty snippets) when vault-search isn't running.
-async fn search_rich(State(s): State<AppState>, Query(p): Query<SearchParams>) -> impl IntoResponse {
+async fn search_rich(
+    State(s): State<AppState>,
+    Query(p): Query<SearchParams>,
+) -> impl IntoResponse {
     let limit = p.limit.unwrap_or(50);
     let vs_opt = s.inner.vault_search.load_full();
     if let Some(vs) = vs_opt.as_deref() {
@@ -1219,6 +1481,7 @@ async fn graph_csr_bin(State(s): State<AppState>) -> axum::response::Response {
     let bytes = build_csr_bin(&snap);
     let mut headers = HeaderMap::new();
     headers.insert(header::CONTENT_TYPE, HeaderValue::from_static(OCTET_CT));
+    insert_graph_revision(&mut headers, snap.revision);
     (StatusCode::OK, headers, bytes).into_response()
 }
 
@@ -1275,7 +1538,7 @@ pub async fn push_graph_to_worker(state: &AppState) {
     // client, so it must NOT wait for the subscribe stream: a worker wedged
     // on an inconsistent graph fails every subscribe, and this push is
     // exactly what un-wedges it.
-    if state.inner.compute_broker.status().await.url.is_empty() {
+    if !state.inner.compute_broker.is_configured().await {
         return;
     }
     let snap = state.inner.snapshot.load_full();
@@ -1288,7 +1551,12 @@ pub async fn push_graph_to_worker(state: &AppState) {
     // engine re-seeds itself on Subscribe per its own seed_mode — which the
     // Layout panel's dynamic seed config selects through the stream params.
     // Pushing a hardcoded ball here would shadow that machinery.
-    match state.inner.compute_broker.load_graph(csr, Vec::new()).await {
+    match state
+        .inner
+        .compute_broker
+        .load_graph(csr, Vec::new(), snap.revision)
+        .await
+    {
         Ok(worker_n) => {
             tracing::info!(n, worker_n, "pushed vault graph to compute worker");
         }
@@ -1309,11 +1577,13 @@ async fn graph_meta_summary(State(s): State<AppState>) -> impl IntoResponse {
     if let Some(buf) = snap.binary_cache.get("meta_summary").cloned() {
         let mut headers = HeaderMap::new();
         headers.insert(header::CONTENT_TYPE, HeaderValue::from_static(PROTOBUF_CT));
+        insert_graph_revision(&mut headers, snap.revision);
         return (StatusCode::OK, headers, buf.to_vec()).into_response();
     }
     let bytes = build_meta_summary_bytes(&snap.graph);
     let mut headers = HeaderMap::new();
     headers.insert(header::CONTENT_TYPE, HeaderValue::from_static(PROTOBUF_CT));
+    insert_graph_revision(&mut headers, snap.revision);
     (StatusCode::OK, headers, bytes).into_response()
 }
 
@@ -1440,62 +1710,49 @@ fn extract_strings(v: &serde_json::Value) -> Vec<String> {
 // Subscribes to the configured graph-compute worker and forwards every
 // PositionDelta to the WebSocket as a single binary frame:
 //
-//   [u64 LE frame number][u32 LE n_nodes][raw f32 LE positions...]
+//   [u64 graph revision][u64 selection generation][u64 frame number]
+//   [u32 n_nodes][raw f32 LE positions...]
 //
 // The WASM client reuses the same `positions` byte layout that
 // `/graph/positions` already serves, so the renderer's existing buffer-update
 // path can ingest these frames once a stream-consumer lands. WebTransport
 // upgrade is a Phase 4 deliverable; WebSocket is the contained Phase 1 choice.
+#[derive(Deserialize)]
+struct LayoutStreamQuery {
+    graph_revision: u64,
+    selection_generation: u64,
+}
+
+fn validate_layout_stream_session(
+    query: &LayoutStreamQuery,
+    graph_revision: u64,
+    selection_generation: u64,
+) -> Result<(), String> {
+    if query.graph_revision == 0 || query.graph_revision != graph_revision {
+        return Err(format!(
+            "stale graph revision {}; current revision is {graph_revision}",
+            query.graph_revision
+        ));
+    }
+    if query.selection_generation == 0 || query.selection_generation != selection_generation {
+        return Err(format!(
+            "stale selection generation {}; current generation is {selection_generation}",
+            query.selection_generation
+        ));
+    }
+    Ok(())
+}
+
 async fn graph_layout_stream(
     State(s): State<AppState>,
-    Query(params): Query<std::collections::HashMap<String, String>>,
+    Query(query): Query<LayoutStreamQuery>,
     ws: WebSocketUpgrade,
 ) -> axum::response::Response {
-    if let Some(layout_id) = params.get("layout_id") {
-        let mut selection = crate::compute_broker::RemoteLayout {
-            layout_id: layout_id.clone(),
-            ..Default::default()
-        };
-
-        // Resolve the lens for BOTH geometric backends — the renderer sends
-        // "geometric-gpu" when GPU acceleration is on, and that path needs the
-        // injected attributes (class / edge-strength rest lengths) just as much
-        // as the CPU one. Resolving only "geometric" silently dropped the lens on
-        // the GPU backend.
-        if layout_id == "geometric" || layout_id == "geometric-gpu" {
-            if let Some(lens_str) = params.get("lens") {
-                if let Ok(lens) = serde_json::from_str::<LensConfig>(lens_str) {
-                    let snap = s.snapshot();
-                    let (settings, attrs) = attribute_resolver::resolve(&lens, &snap);
-                    let settings_json = serde_json::to_value(settings).unwrap();
-                    selection.attributes = Some(attribute_resolver::encode_proto(attrs));
-
-                    if lens.use_multilevel {
-                        // Wrap the geometric engine in the multilevel cascade: the
-                        // selected geometric backend becomes the inner solver. The
-                        // resolved GeometricSettings ride as `inner_params`.
-                        let ml = graph_compute::engines::MultilevelSettings {
-                            inner: layout_id.clone(),
-                            inner_params: settings_json,
-                            ..Default::default()
-                        };
-                        selection.layout_id = "multilevel".to_string();
-                        selection.params = Some(serde_json::to_value(ml).unwrap());
-                    } else {
-                        selection.params = Some(settings_json);
-                    }
-                    selection.lens = Some(lens);
-                }
-            }
-        }
-
-        // Apply the selection to the global broker. `reselect` restarts the
-        // forwarder so subsequent frames come from the chosen engine (+ resolved
-        // attributes); ignore the error when the broker is disabled (the
-        // `subscribe` below then simply yields no stream).
-        if let Err(e) = s.inner.compute_broker.reselect(selection).await {
-            tracing::warn!(error = %e, "compute reselect from layout stream failed");
-        }
+    let graph_revision = s.snapshot().revision;
+    let selection = s.inner.compute_broker.selection_state().await;
+    if let Err(error) = validate_layout_stream_session(&query, graph_revision, selection.generation)
+    {
+        return (StatusCode::CONFLICT, error).into_response();
     }
 
     let Some(rx) = s.inner.compute_broker.subscribe().await else {
@@ -1505,12 +1762,16 @@ async fn graph_layout_stream(
         )
             .into_response();
     };
-    ws.on_upgrade(move |socket| layout_stream_loop(socket, rx))
+    ws.on_upgrade(move |socket| {
+        layout_stream_loop(socket, rx, graph_revision, selection.generation)
+    })
 }
 
 async fn layout_stream_loop(
     mut socket: WebSocket,
     mut rx: tokio::sync::broadcast::Receiver<graph_compute::proto::PositionDelta>,
+    graph_revision: u64,
+    selection_generation: u64,
 ) {
     loop {
         let frame = match rx.recv().await {
@@ -1521,14 +1782,44 @@ async fn layout_stream_loop(
             }
             Err(RecvError::Closed) => break,
         };
-        let mut buf = Vec::with_capacity(8 + 4 + frame.positions.len());
-        buf.extend_from_slice(&frame.frame.to_le_bytes());
-        buf.extend_from_slice(&frame.n_nodes.to_le_bytes());
-        buf.extend_from_slice(&frame.positions);
+        let Ok(buf) = encode_layout_frame(&frame, graph_revision, selection_generation) else {
+            tracing::warn!(
+                expected_revision = graph_revision,
+                got_revision = frame.graph_revision,
+                expected_generation = selection_generation,
+                got_generation = frame.selection_generation,
+                "closing stale layout stream"
+            );
+            break;
+        };
         if socket.send(Message::Binary(buf)).await.is_err() {
             break;
         }
     }
+}
+
+/// Encode one browser layout frame.
+///
+/// Wire format (little-endian):
+/// `[u64 graph_revision][u64 selection_generation][u64 frame]`
+/// `[u32 n_nodes][raw xyz f32 positions]`.
+fn encode_layout_frame(
+    frame: &graph_compute::proto::PositionDelta,
+    expected_revision: u64,
+    expected_generation: u64,
+) -> Result<Vec<u8>, ()> {
+    if frame.graph_revision != expected_revision
+        || frame.selection_generation != expected_generation
+    {
+        return Err(());
+    }
+    let mut buf = Vec::with_capacity(28 + frame.positions.len());
+    buf.extend_from_slice(&frame.graph_revision.to_le_bytes());
+    buf.extend_from_slice(&frame.selection_generation.to_le_bytes());
+    buf.extend_from_slice(&frame.frame.to_le_bytes());
+    buf.extend_from_slice(&frame.n_nodes.to_le_bytes());
+    buf.extend_from_slice(&frame.positions);
+    Ok(buf)
 }
 
 fn cached_binary_response(s: &AppState, key: &str) -> axum::response::Response {
@@ -1538,6 +1829,7 @@ fn cached_binary_response(s: &AppState, key: &str) -> axum::response::Response {
     };
     let mut headers = HeaderMap::new();
     headers.insert(header::CONTENT_TYPE, HeaderValue::from_static(OCTET_CT));
+    insert_graph_revision(&mut headers, snap.revision);
     // no-store, NOT immutable: these buffers are live state — /generate,
     // /compute/soup, and vault reloads all swap them mid-session. A cached
     // edges buffer from a previous graph poisons the client's consistency
@@ -1545,4 +1837,76 @@ fn cached_binary_response(s: &AppState, key: &str) -> axum::response::Response {
     // that to the webview).
     headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     (StatusCode::OK, headers, buf.to_vec()).into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn layout_frame_encodes_revision_prefixed_header() {
+        let positions = [1.0_f32, -2.0, 3.5]
+            .into_iter()
+            .flat_map(f32::to_le_bytes)
+            .collect();
+        let frame = graph_compute::proto::PositionDelta {
+            frame: 9,
+            positions,
+            n_nodes: 1,
+            graph_revision: 42,
+            selection_generation: 7,
+        };
+
+        let bytes = encode_layout_frame(&frame, 42, 7).expect("matching session");
+        assert_eq!(u64::from_le_bytes(bytes[0..8].try_into().unwrap()), 42);
+        assert_eq!(u64::from_le_bytes(bytes[8..16].try_into().unwrap()), 7);
+        assert_eq!(u64::from_le_bytes(bytes[16..24].try_into().unwrap()), 9);
+        assert_eq!(u32::from_le_bytes(bytes[24..28].try_into().unwrap()), 1);
+        assert_eq!(&bytes[28..], frame.positions);
+        assert!(encode_layout_frame(&frame, 41, 7).is_err());
+        assert!(encode_layout_frame(&frame, 42, 6).is_err());
+    }
+
+    #[test]
+    fn layout_stream_requires_current_graph_and_selection_tokens() {
+        let current = LayoutStreamQuery {
+            graph_revision: 42,
+            selection_generation: 7,
+        };
+        assert!(validate_layout_stream_session(&current, 42, 7).is_ok());
+
+        let stale_graph = LayoutStreamQuery {
+            graph_revision: 41,
+            selection_generation: 7,
+        };
+        assert!(validate_layout_stream_session(&stale_graph, 42, 7)
+            .unwrap_err()
+            .contains("stale graph revision"));
+
+        let stale_selection = LayoutStreamQuery {
+            graph_revision: 42,
+            selection_generation: 6,
+        };
+        assert!(validate_layout_stream_session(&stale_selection, 42, 7)
+            .unwrap_err()
+            .contains("stale selection generation"));
+    }
+
+    #[test]
+    fn initial_placement_requires_exact_finite_xyz_payload() {
+        let valid: Vec<u8> = [0.0_f32, 1.0, -2.0, 3.0, 4.0, 5.0]
+            .into_iter()
+            .flat_map(f32::to_le_bytes)
+            .collect();
+        assert!(validate_initial_positions(&valid, 2).is_ok());
+        assert!(validate_initial_positions(&valid[..20], 2)
+            .unwrap_err()
+            .contains("byte length"));
+
+        let mut nonfinite = valid;
+        nonfinite[8..12].copy_from_slice(&f32::NAN.to_le_bytes());
+        assert!(validate_initial_positions(&nonfinite, 2)
+            .unwrap_err()
+            .contains("not finite"));
+    }
 }

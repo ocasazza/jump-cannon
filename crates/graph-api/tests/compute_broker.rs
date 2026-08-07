@@ -43,17 +43,23 @@ async fn reselect_updates_stored_selection() {
 
     // Initial selection is the default (empty ⇒ worker default engine).
     assert_eq!(broker.selection().await.layout_id, "");
+    assert_eq!(broker.selection_state().await.generation, 1);
 
     // Reselect to a concrete engine + params.
     let params = serde_json::json!({ "gravity": 1.5 });
-    broker
-        .reselect(RemoteLayout {
-            layout_id: "fa2-bh".to_string(),
-            params: Some(params.clone()),
-            ..Default::default()
-        })
+    let update = broker
+        .reselect(
+            RemoteLayout {
+                layout_id: "fa2-bh".to_string(),
+                params: Some(params.clone()),
+                ..Default::default()
+            },
+            Some(1),
+        )
         .await
         .expect("reselect against a connected broker succeeds");
+    assert_eq!(update.generation, 2);
+    assert!(update.changed);
 
     let sel = broker.selection().await;
     assert_eq!(
@@ -62,7 +68,7 @@ async fn reselect_updates_stored_selection() {
     );
     assert_eq!(
         sel.params,
-        Some(params),
+        Some(params.clone()),
         "reselect must store the new params"
     );
 
@@ -72,6 +78,35 @@ async fn reselect_updates_stored_selection() {
     // broker's currently-selected layout_id.
     let view = broker.list_engines().await;
     assert!(!view.connected, "no worker listening ⇒ connected:false");
+    assert_eq!(view.selection_generation, 2);
+
+    // Retrying the identical desired state is idempotent even when the caller
+    // only has the pre-mutation generation (for example, a lost response).
+    let retry = broker
+        .reselect(
+            RemoteLayout {
+                layout_id: "fa2-bh".to_string(),
+                params: Some(params),
+                ..Default::default()
+            },
+            Some(1),
+        )
+        .await
+        .expect("identical stale retry is idempotent");
+    assert_eq!(retry.generation, 2);
+    assert!(!retry.changed);
+
+    let stale = broker
+        .reselect(
+            RemoteLayout {
+                layout_id: "cpu-spring".to_string(),
+                ..Default::default()
+            },
+            Some(1),
+        )
+        .await
+        .expect_err("different selection with stale generation must fail");
+    assert!(stale.to_string().contains("stale selection generation"));
 }
 
 /// `reselect` on a never-connected broker is a caller error (no URL to dial).
@@ -79,11 +114,14 @@ async fn reselect_updates_stored_selection() {
 async fn reselect_errors_without_connect() {
     let broker = ComputeBroker::new();
     let err = broker
-        .reselect(RemoteLayout {
-            layout_id: "fa2-bh".to_string(),
-            params: None,
-            ..Default::default()
-        })
+        .reselect(
+            RemoteLayout {
+                layout_id: "fa2-bh".to_string(),
+                params: None,
+                ..Default::default()
+            },
+            None,
+        )
         .await
         .expect_err("reselect with no configured URL must error");
     assert!(

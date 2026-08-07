@@ -101,6 +101,7 @@ async fn canary_subscribe_streams_frames() {
     let mut s = client
         .subscribe(SubscribeRequest {
             graph_id: String::new(),
+            graph_revision: 0,
             ..Default::default()
         })
         .await
@@ -164,6 +165,7 @@ async fn canary_positions_are_changing() {
     let mut s = client
         .subscribe(SubscribeRequest {
             graph_id: String::new(),
+            graph_revision: 0,
             ..Default::default()
         })
         .await

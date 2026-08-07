@@ -598,8 +598,11 @@ mod tests {
             crate::compute_broker::ComputeBroker::new(),
             Arc::new(crate::progress::ProgressLog::new()),
         );
+        let revision = state.snapshot().revision;
+
         assert!(!rebuild_snapshot(&state).await);
         let snapshot = state.snapshot();
+        assert_eq!(snapshot.revision, revision);
         assert!(snapshot.graph.nodes.contains_key("last-good"));
     }
 

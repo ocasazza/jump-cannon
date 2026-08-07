@@ -14,6 +14,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use arc_swap::{ArcSwap, ArcSwapOption};
@@ -28,6 +29,11 @@ use crate::subprocess::VaultSearch;
 /// [`GraphSnapshot::build`] and swapped in atomically by the watcher
 /// after each reload.
 pub struct GraphSnapshot {
+    /// Process-local identity for this complete graph materialization. Every
+    /// rebuild receives a fresh non-zero value, even when the node count is
+    /// unchanged, so independently fetched buffers and remote layout frames
+    /// can prove that they belong to the same snapshot.
+    pub revision: u64,
     pub graph: VaultGraph,
     /// id (relative path, vault-links convention) -> dense index used for
     /// the binary buffer routes.
@@ -46,6 +52,10 @@ impl GraphSnapshot {
     /// Build a fresh snapshot from a loaded `VaultGraph`. Recomputes all
     /// derived caches (id_to_idx, idx_to_id, binary buffers).
     pub fn build(graph: VaultGraph) -> Self {
+        static NEXT_REVISION: AtomicU64 = AtomicU64::new(1);
+        let revision = NEXT_REVISION.fetch_add(1, Ordering::Relaxed);
+        assert_ne!(revision, 0, "graph revision counter exhausted");
+
         let mut id_to_idx = HashMap::with_capacity(graph.nodes.len());
         let mut idx_to_id = Vec::with_capacity(graph.nodes.len());
         for (i, (id, _)) in graph.nodes.iter().enumerate() {
@@ -82,6 +92,7 @@ impl GraphSnapshot {
         );
 
         Self {
+            revision,
             graph,
             id_to_idx,
             idx_to_id,
@@ -149,5 +160,19 @@ impl AppState {
     #[inline]
     pub fn snapshot(&self) -> Arc<GraphSnapshot> {
         self.inner.snapshot.load_full()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rebuilt_snapshots_receive_distinct_nonzero_revisions() {
+        let first = GraphSnapshot::build(VaultGraph::default());
+        let second = GraphSnapshot::build(VaultGraph::default());
+        assert_ne!(first.revision, 0);
+        assert_ne!(second.revision, 0);
+        assert_ne!(first.revision, second.revision);
     }
 }

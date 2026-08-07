@@ -116,17 +116,25 @@ vault:
   seed:
     enabled: true
     image: docker.io/library/busybox:1.36.1
+    # Sync the chart-owned documentation into /vault/Jump Cannon. These files
+    # are source-controlled under charts/jump-cannon/knowledge and are replaced
+    # on rollout. Put user-owned content elsewhere in the vault.
+    includeKnowledgeBase: true
+    # Additional non-secret files are copied to the vault root only when the
+    # target does not already exist.
     files:
       Welcome.md: |
         # jump-cannon
 
         This vault is managed by the in-cluster jump-cannon deployment.
 
-        See [[Performance]].
+        Begin with [[Start Here]]. Test health is summarized in [[Performance]].
       Performance.md: |
         # Performance
 
         Cluster test jobs push their status to Pushgateway for Grafana.
+
+        See [[Performance Engineering]], [[Scheduled Tests]], and [[Observability]].
 
 graphCompute:
   enabled: true

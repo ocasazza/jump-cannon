@@ -5,6 +5,11 @@ Docs-as-code lives next to the code it describes (module-level `//!` comments,
 **cross-crate, higher-level** material that doesn't belong to any single
 module — research syntheses, architecture diagrams, and design rationale.
 
+The living user, development, and operations map is stored beside its delivery
+surface in [`charts/jump-cannon/knowledge/`](../charts/jump-cannon/knowledge/).
+Helm deploys that same markdown corpus as Jump Cannon's default graph, and
+`AGENTS.md` requires agents to maintain it with the code and runbooks it maps.
+
 | Doc | What it covers |
 |---|---|
 | [`layout-algorithms.md`](layout-algorithms.md) | Survey of GPU/distributed graph-layout algorithm families (force-directed, stress, multilevel, DR-embedding, distributed), with complexity, GPU/shard suitability, visual behavior, and citations. The "why we picked these" reference. |

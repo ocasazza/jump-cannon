@@ -15,9 +15,10 @@ use data_loader::{
     Capability, Effect, HostedImporter, ImportError, ImportFuture, Importer, ImporterDescriptor,
     LoadResult, Loader, Transport,
 };
-use graph_api::proto::NodeMeta;
+use graph_api::proto::{Init, NodeMeta};
+use graph_api::state::GraphSnapshot;
 use graph_api::AppState;
-use vault_data::VaultGraph;
+use vault_data::{VaultEdge, VaultGraph, VaultNode};
 
 /// A stub loader that always returns an empty graph. Used in tests that
 /// don't need a real data source.
@@ -77,15 +78,46 @@ fn trust_test_importer(importer: Box<dyn Importer>) -> HostedImporter {
 /// Build an `AppState` over an empty `VaultGraph`. No vault-search
 /// subprocess, no asset dir — enough to exercise the protobuf endpoints.
 fn empty_state() -> AppState {
+    state_with_graph(VaultGraph::new())
+}
+
+fn state_with_graph(graph: VaultGraph) -> AppState {
     AppState::new(
         std::path::PathBuf::from("/tmp/jump-cannon-test-empty-vault"),
         trust_test_importer(Box::new(EmptyLoader)),
-        VaultGraph::new(),
+        graph,
         None,
         None,
         graph_api::compute_broker::ComputeBroker::new(),
         Arc::new(graph_api::progress::ProgressLog::new()),
     )
+}
+
+fn two_node_graph(prefix: &str) -> VaultGraph {
+    let mut graph = VaultGraph::new();
+    graph.add_node(VaultNode {
+        id: format!("{prefix}-a"),
+        ..Default::default()
+    });
+    graph.add_node(VaultNode {
+        id: format!("{prefix}-b"),
+        ..Default::default()
+    });
+    graph.add_edge(VaultEdge {
+        source: format!("{prefix}-a"),
+        target: format!("{prefix}-b"),
+    });
+    graph
+}
+
+fn response_revision(resp: &axum::response::Response) -> u64 {
+    resp.headers()
+        .get("x-graph-revision")
+        .expect("X-Graph-Revision header")
+        .to_str()
+        .expect("revision header is text")
+        .parse()
+        .expect("revision header is u64")
 }
 
 /// `/node/<missing-id>` regression: previously returned 404 + a noisy
@@ -209,6 +241,82 @@ async fn declared_but_ungranted_content_write_is_forbidden() {
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
 }
 
+/// Every independently fetched graph buffer identifies the exact snapshot it
+/// came from. This is what lets the frontend reject a reload that lands
+/// between `/graph/init` and the bulk requests.
+#[tokio::test]
+async fn graph_endpoints_advertise_one_snapshot_revision() {
+    let state = state_with_graph(two_node_graph("first"));
+    let revision = state.snapshot().revision;
+    let app = graph_api::router(state);
+
+    let init_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/graph/init")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .expect("init served");
+    assert_eq!(init_resp.status(), StatusCode::OK);
+    let init = Init::decode(
+        to_bytes(init_resp.into_body(), 1 << 20)
+            .await
+            .expect("init body")
+            .as_ref(),
+    )
+    .expect("decode Init");
+    assert_eq!(init.graph_revision, revision);
+
+    for path in [
+        "/graph/ids",
+        "/graph/positions",
+        "/graph/edges",
+        "/graph/metrics/community",
+        "/graph/meta_summary",
+        "/graph/csr.bin",
+    ] {
+        let resp = app
+            .clone()
+            .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+            .await
+            .unwrap_or_else(|e| panic!("{path} served: {e}"));
+        assert_eq!(resp.status(), StatusCode::OK, "{path}");
+        assert_eq!(response_revision(&resp), revision, "{path}");
+    }
+}
+
+/// Equal node counts are not graph identity. Swapping to a different graph of
+/// the same size must advance the revision and expose the replacement IDs.
+#[tokio::test]
+async fn same_cardinality_snapshot_swap_changes_revision() {
+    let state = state_with_graph(two_node_graph("before"));
+    let first_revision = state.snapshot().revision;
+    state
+        .inner
+        .snapshot
+        .store(Arc::new(GraphSnapshot::build(two_node_graph("after"))));
+    let second_revision = state.snapshot().revision;
+    assert_ne!(first_revision, second_revision);
+
+    let resp = graph_api::router(state)
+        .oneshot(
+            Request::builder()
+                .uri("/graph/ids")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .expect("ids served");
+    assert_eq!(response_revision(&resp), second_revision);
+    let ids: Vec<String> =
+        serde_json::from_slice(&to_bytes(resp.into_body(), 1 << 20).await.expect("ids body"))
+            .expect("ids json");
+    assert_eq!(ids, ["after-a", "after-b"]);
+}
+
 /// Belt-and-braces: keep `AppState` constructable from outside the crate.
 /// If a future refactor makes `AppState::new` private, this test fails to
 /// compile and reminds us to ship a public test-only constructor instead
@@ -269,6 +377,46 @@ async fn generate_ok_returns_graph_counts() {
     // The optional `type` field round-trips, and absent kinds stay absent.
     assert_eq!(graph["nodes"][0]["type"], serde_json::json!("x"));
     assert!(graph["nodes"][1].get("type").is_none());
+}
+
+/// `/generate` is evaluation-only: returning a browser-owned graph must not
+/// silently replace graph-api's active vault snapshot, even if the generated
+/// graph happens to have the same node count.
+#[tokio::test]
+async fn generate_does_not_replace_active_graph_or_revision() {
+    let state = state_with_graph(two_node_graph("hosted"));
+    let before_revision = state.snapshot().revision;
+    let before_ids = state.snapshot().idx_to_id.clone();
+    let app = graph_api::router(state.clone());
+
+    let expr = r#"{
+        nodes = [ { id = "generated-a"; } { id = "generated-b"; } ];
+        links = [ { source = "generated-a"; target = "generated-b"; } ];
+    }"#;
+    let body = serde_json::to_vec(&serde_json::json!({ "expr": expr })).unwrap();
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/generate")
+                .header("content-type", "application/json")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .expect("generate served");
+    assert_eq!(resp.status(), StatusCode::OK);
+    let generated: serde_json::Value = serde_json::from_slice(
+        &to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .expect("generate body"),
+    )
+    .expect("generate json");
+    assert_eq!(generated["ok"], serde_json::json!(true));
+    assert_eq!(generated["graph"]["nodes"].as_array().unwrap().len(), 2);
+
+    assert_eq!(state.snapshot().revision, before_revision);
+    assert_eq!(state.snapshot().idx_to_id, before_ids);
 }
 
 /// The embedded graph library is reachable server-side too: a `starGen` via the

@@ -16,7 +16,7 @@ use std::time::Duration;
 
 use graph_compute::proto::compute_client::ComputeClient;
 use graph_compute::proto::compute_server::ComputeServer;
-use graph_compute::proto::{HealthRequest, SubscribeRequest};
+use graph_compute::proto::{HealthRequest, LoadGraphRequest, SubscribeRequest};
 use graph_compute::service::{run_sim_loop, ComputeService};
 use graph_compute::sim::{CsrGraph, SimState};
 use hyper_util::rt::TokioIo;
@@ -49,6 +49,21 @@ async fn connect_in_process(svc: ComputeService) -> Channel {
         .expect("connect over in-memory duplex")
 }
 
+fn position_bytes(positions: &[f32]) -> Vec<u8> {
+    positions
+        .iter()
+        .flat_map(|value| value.to_le_bytes())
+        .collect()
+}
+
+fn four_node_cycle() -> CsrGraph {
+    CsrGraph {
+        n_nodes: 4,
+        offsets: vec![0, 2, 4, 6, 8],
+        neighbors: vec![1, 3, 0, 2, 1, 3, 0, 2],
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn delivers_at_least_one_position_delta() {
     let graph = CsrGraph::path(64);
@@ -67,6 +82,7 @@ async fn delivers_at_least_one_position_delta() {
     let mut stream = client
         .subscribe(SubscribeRequest {
             graph_id: "test".into(),
+            graph_revision: 0,
             ..Default::default()
         })
         .await
@@ -105,6 +121,7 @@ async fn positions_advance_over_frames() {
     let mut stream = client
         .subscribe(SubscribeRequest {
             graph_id: "test".into(),
+            graph_revision: 0,
             ..Default::default()
         })
         .await
@@ -148,6 +165,130 @@ async fn positions_advance_over_frames() {
         "positions did not advance over 30 frames (L2 = {})",
         l2
     );
+}
+
+/// A same-cardinality topology replacement must still be distinguishable from
+/// the graph it replaced. The worker rejects stale subscriptions and stamps
+/// every new frame with the replacement revision rather than relying on node
+/// count as an identity proxy.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn same_cardinality_reload_rejects_stale_revision_and_stamps_new_frames() {
+    let state = SimState::new(CsrGraph::path(4));
+    let sim_state = state.clone();
+    tokio::spawn(async move { run_sim_loop(sim_state, 60.0).await });
+
+    let channel = connect_in_process(ComputeService::new(state.clone())).await;
+    let mut client = ComputeClient::new(channel);
+
+    let first = client
+        .load_graph(LoadGraphRequest {
+            csr: CsrGraph::path(4).to_bin(),
+            positions: Vec::new(),
+            graph_revision: 41,
+        })
+        .await
+        .expect("load first graph")
+        .into_inner();
+    assert!(first.ok, "first LoadGraph failed: {}", first.error);
+    assert_eq!(first.graph_revision, 41);
+
+    let replacement_seed = vec![
+        -3.0, 0.0, 0.0, // node 0
+        0.0, 3.0, 0.0, // node 1
+        3.0, 0.0, 0.0, // node 2
+        0.0, -3.0, 0.0, // node 3
+    ];
+    let replacement = client
+        .load_graph(LoadGraphRequest {
+            csr: four_node_cycle().to_bin(),
+            positions: position_bytes(&replacement_seed),
+            graph_revision: 42,
+        })
+        .await
+        .expect("load same-cardinality replacement")
+        .into_inner();
+    assert!(replacement.ok, "replacement failed: {}", replacement.error);
+    assert_eq!(replacement.n_nodes, 4);
+    assert_eq!(replacement.graph_revision, 42);
+
+    let stale = client
+        .subscribe(SubscribeRequest {
+            graph_id: "stale".into(),
+            graph_revision: 41,
+            layout_id: "cpu-spring".into(),
+            ..Default::default()
+        })
+        .await
+        .expect_err("stale graph revision must be rejected");
+    assert_eq!(stale.code(), tonic::Code::FailedPrecondition);
+
+    let mut stream = client
+        .subscribe(SubscribeRequest {
+            graph_id: "replacement".into(),
+            graph_revision: 42,
+            layout_id: "cpu-spring".into(),
+            ..Default::default()
+        })
+        .await
+        .expect("subscribe to replacement")
+        .into_inner();
+    let frame = tokio::time::timeout(Duration::from_secs(2), stream.message())
+        .await
+        .expect("timed out waiting for replacement frame")
+        .expect("replacement stream errored")
+        .expect("replacement stream ended");
+    assert_eq!(frame.graph_revision, 42);
+    assert_eq!(frame.n_nodes, 4);
+}
+
+/// `LoadGraph.positions` is the remote seed contract. Preserve it exactly so
+/// choosing remote execution does not silently replace the caller's initial
+/// placement before an engine is selected.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn load_graph_preserves_supplied_positions_and_rejects_bad_arity_atomically() {
+    let state = SimState::new(CsrGraph::path(3));
+    let channel = connect_in_process(ComputeService::new(state.clone())).await;
+    let mut client = ComputeClient::new(channel);
+
+    let supplied = vec![
+        -1.0, -2.0, -3.0, // node 0
+        4.0, 5.0, 6.0, // node 1
+        7.5, 8.5, 9.5, // node 2
+    ];
+    let loaded = client
+        .load_graph(LoadGraphRequest {
+            csr: CsrGraph::path(3).to_bin(),
+            positions: position_bytes(&supplied),
+            graph_revision: 77,
+        })
+        .await
+        .expect("load graph with positions")
+        .into_inner();
+    assert!(loaded.ok, "LoadGraph failed: {}", loaded.error);
+    assert_eq!(loaded.graph_revision, 77);
+    assert_eq!(*state.positions.read().await, supplied);
+
+    let before_graph = state.graph.read().await.to_bin();
+    let rejected = client
+        .load_graph(LoadGraphRequest {
+            csr: four_node_cycle().to_bin(),
+            positions: position_bytes(&[0.0, 1.0, 2.0]),
+            graph_revision: 78,
+        })
+        .await
+        .expect("invalid LoadGraph returns a soft error")
+        .into_inner();
+    assert!(!rejected.ok, "bad position arity unexpectedly succeeded");
+    assert!(rejected.error.contains("positions length"));
+    assert_eq!(rejected.graph_revision, 77);
+    assert_eq!(
+        state
+            .graph_revision
+            .load(std::sync::atomic::Ordering::Acquire),
+        77
+    );
+    assert_eq!(state.graph.read().await.to_bin(), before_graph);
+    assert_eq!(*state.positions.read().await, supplied);
 }
 
 /// Phase 2: validate that a CSR file written via `write_bin` and re-loaded

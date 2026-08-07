@@ -5,6 +5,9 @@
 {{- if eq $graphSource "okf" -}}
 {{- $filesystemRescanSeconds = .Values.okfImporter.filesystemRescanIntervalSeconds -}}
 {{- end -}}
+{{- $hasKnowledge := and $usesObsidian .Values.vault.seed.enabled .Values.vault.seed.includeKnowledgeBase -}}
+{{- $hasSeedFiles := and $usesObsidian .Values.vault.seed.enabled (gt (len .Values.vault.seed.files) 0) -}}
+{{- $seedsVault := or $hasKnowledge $hasSeedFiles -}}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -23,9 +26,14 @@ spec:
       labels:
         {{- include "jump-cannon.selectorLabels" . | nindent 8 }}
         app.kubernetes.io/component: graph-api
-      {{- if .Values.kubernetesImporter.enabled }}
+      {{- if or .Values.kubernetesImporter.enabled $seedsVault }}
       annotations:
+        {{- if $seedsVault }}
+        checksum/vault-content: {{ printf "%s%s" (include (print $.Template.BasePath "/configmap-vault-knowledge.yaml") .) (include (print $.Template.BasePath "/configmap-vault-seed.yaml") .) | sha256sum }}
+        {{- end }}
+        {{- if .Values.kubernetesImporter.enabled }}
         checksum/kubernetes-importer-config: {{ toJson .Values.kubernetesImporter.config | replace "{{ .Release.Namespace }}" .Release.Namespace | sha256sum }}
+        {{- end }}
       {{- end }}
     spec:
       serviceAccountName: {{ include "jump-cannon.serviceAccountName" . }}
@@ -34,7 +42,7 @@ spec:
         {{- toYaml .Values.imagePullSecrets | nindent 8 }}
       securityContext:
         {{- toYaml .Values.podSecurityContext | nindent 8 }}
-      {{- if and $usesObsidian .Values.vault.seed.enabled }}
+      {{- if $seedsVault }}
       initContainers:
         - name: seed-vault
           image: {{ .Values.vault.seed.image | quote }}
@@ -45,12 +53,25 @@ spec:
           args:
             - |
               set -eu
-              mkdir -p {{ .Values.vault.mountPath }}
+              mkdir -p "$VAULT_ROOT"
+              {{- if $hasKnowledge }}
+              managed_dir="$VAULT_ROOT/Jump Cannon"
+              mkdir -p "$managed_dir"
+              for source in /knowledge/*; do
+                [ -f "$source" ] || continue
+                cp -f "$source" "$managed_dir/$(basename "$source")"
+              done
+              {{- end }}
+              {{- if $hasSeedFiles }}
               for source in /seed/*; do
                 [ -f "$source" ] || continue
-                target="{{ .Values.vault.mountPath }}/$(basename "$source")"
-                [ -e "$target" ] || cp "$source" "$target"
+                target="$VAULT_ROOT/$(basename "$source")"
+                [ -e "$target" ] || cp -f "$source" "$target"
               done
+              {{- end }}
+          env:
+            - name: VAULT_ROOT
+              value: {{ .Values.vault.mountPath | quote }}
           securityContext:
             allowPrivilegeEscalation: false
             capabilities:
@@ -59,9 +80,16 @@ spec:
           volumeMounts:
             - name: vault
               mountPath: {{ .Values.vault.mountPath }}
+            {{- if $hasKnowledge }}
+            - name: vault-knowledge
+              mountPath: /knowledge
+              readOnly: true
+            {{- end }}
+            {{- if $hasSeedFiles }}
             - name: vault-seed
               mountPath: /seed
               readOnly: true
+            {{- end }}
       {{- end }}
       containers:
         - name: graph-api
@@ -147,7 +175,17 @@ spec:
           {{- else }}
           emptyDir: {}
           {{- end }}
-        {{- if and $usesObsidian .Values.vault.seed.enabled }}
+        {{- if $hasKnowledge }}
+        - name: vault-knowledge
+          configMap:
+            name: {{ include "jump-cannon.fullname" . }}-vault-knowledge
+            items:
+              {{- range $path, $_ := .Files.Glob "knowledge/*.md" }}
+              - key: {{ printf "doc-%s" (sha256sum $path | trunc 16) }}
+                path: {{ base $path | quote }}
+              {{- end }}
+        {{- end }}
+        {{- if $hasSeedFiles }}
         - name: vault-seed
           configMap:
             name: {{ include "jump-cannon.fullname" . }}-vault-seed

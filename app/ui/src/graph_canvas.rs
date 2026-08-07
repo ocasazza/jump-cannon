@@ -21,6 +21,9 @@ use crate::render;
 /// Everything the app needs, fetched once from graph-api.
 #[derive(Clone, PartialEq)]
 pub struct GraphData {
+    /// Server topology identity. `None` is reserved for browser-owned graphs
+    /// which graph-api and graph-compute cannot safely address.
+    pub graph_revision: Option<u64>,
     pub n_nodes: u32,
     pub n_edges: u32,
     pub num_communities: u32,
@@ -50,8 +53,26 @@ pub struct GraphData {
 ///     (egui default `SizeBy::PageRank`, `size_mul = 0.5`).
 pub async fn load() -> Result<GraphData, String> {
     let init = api::init().await?;
-    let ids = api::ids().await?;
-    let edges = api::edges().await?;
+    let ids_response = api::revisioned_ids().await?;
+    let edges_response = api::revisioned_edges().await?;
+    let ids = ids_response.value;
+    let edges = edges_response.value;
+    let revision = init.graph_revision;
+
+    // Count checks cannot detect a same-cardinality graph swap. When the
+    // server supports revisions, require every independently fetched buffer
+    // to belong to the same topology before mounting it.
+    for (name, got) in [
+        ("ids", ids_response.revision),
+        ("edges", edges_response.revision),
+    ] {
+        if revision != 0 && got != 0 && got != revision {
+            return Err(format!(
+                "inconsistent snapshot ({name} revision {got}, init revision {revision}) — \
+                 server graph changed mid-load"
+            ));
+        }
+    }
 
     let n = init.n_nodes as usize;
     // The three fetches above aren't atomic: a server-side graph swap
@@ -67,9 +88,16 @@ pub async fn load() -> Result<GraphData, String> {
     }
     let mut metrics: HashMap<String, Vec<f32>> = HashMap::new();
     for name in ["community", "pagerank"] {
-        match api::metric(name).await {
-            Ok(v) => {
-                metrics.insert(name.to_string(), v);
+        match api::revisioned_metric(name).await {
+            Ok(r) if revision == 0 || r.revision == 0 || r.revision == revision => {
+                metrics.insert(name.to_string(), r.value);
+            }
+            Ok(r) => {
+                return Err(format!(
+                    "inconsistent snapshot (metric {name} revision {}, init revision {revision}) — \
+                     server graph changed mid-load",
+                    r.revision
+                ));
             }
             Err(e) => tracing::warn!("[graph] metric {name}: {e}"),
         }
@@ -103,6 +131,7 @@ pub async fn load() -> Result<GraphData, String> {
         .collect();
 
     Ok(GraphData {
+        graph_revision: (revision != 0).then_some(revision),
         n_nodes: init.n_nodes,
         n_edges: init.n_edges,
         num_communities: init.num_communities,
@@ -142,7 +171,6 @@ struct Drag {
 #[component]
 pub fn GraphCanvas(graph: Signal<Option<GraphData>>, selected: Signal<Option<String>>) -> Element {
     let mut drag = use_signal(|| Option::<Drag>::None);
-    let mut sim_on = use_signal(|| true);
 
     rsx! {
         div { class: "graph-wrap",
@@ -226,26 +254,6 @@ pub fn GraphCanvas(graph: Signal<Option<GraphData>>, selected: Signal<Option<Str
                     // Browser wheel-down is +y; egui zoom-in is positive.
                     render::wheel_zoom(-dy as f32);
                 },
-            }
-            // Minimal force-layout transport. The full Layout panel
-            // (sliders, presets, backend picker) comes later.
-            div { class: "graph-hud",
-                button {
-                    class: "btn",
-                    title: "play/pause the GPU force layout",
-                    onclick: move |_| {
-                        let next = !*sim_on.read();
-                        sim_on.set(next);
-                        render::set_sim_running(next);
-                    },
-                    { if *sim_on.read() { "⏸ layout" } else { "▶ layout" } }
-                }
-                button {
-                    class: "btn",
-                    title: "fit camera to graph (F)",
-                    onclick: move |_| render::fit_camera(),
-                    "fit"
-                }
             }
         }
     }

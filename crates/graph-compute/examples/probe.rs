@@ -21,6 +21,8 @@ async fn main() -> anyhow::Result<()> {
     let mut s = client
         .subscribe(SubscribeRequest {
             graph_id: String::new(),
+            graph_revision: 0,
+            selection_generation: 0,
             layout_id: String::new(),
             params: None,
             attributes: None,

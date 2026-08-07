@@ -11,8 +11,6 @@
    .with_tile(4, 3) — panel-kit 0.2 renders snapped tile spans inline, so a
    CSS flex/height override here would be dead (inline wins) and would fight
    the user's grip-resizes. */
-.graph-hud { position:absolute; top:.5rem; left:.5rem; display:flex; gap:.4rem; opacity:.75; }
-.graph-hud:hover { opacity:1; }
 
 /* Node browser / search result lists */
 .browse, .search { display:flex; flex-direction:column; gap:.4rem; height:100%; min-height:0; }

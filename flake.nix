@@ -186,6 +186,17 @@
           cargoExtraArgs = "--package test-browser";
         });
 
+        # nixpkgs Chromium is Linux-only. On Darwin the browser wrapper below
+        # accepts CHROME_BIN / CHROMIUM_BIN or discovers an installed app.
+        nixChromiumBin =
+          if pkgs.stdenv.hostPlatform.isLinux
+          then "${pkgs.chromium}/bin/chromium"
+          else "";
+        browserVulkanIcdDir =
+          if pkgs.stdenv.hostPlatform.isLinux
+          then "${pkgs.mesa}/share/vulkan/icd.d"
+          else "";
+
         # `nix run .#test-browser-rust` — bring up graph-api + open the
         # page in chromium with WebGPU enabled + run the Rust smoke test.
         #
@@ -201,18 +212,44 @@
           runtimeInputs = [
             graph-api
             test-browser
-            pkgs.chromium
             pkgs.curl
             pkgs.coreutils
-          ];
+          ] ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux [ pkgs.chromium ];
           text = ''
             set -euo pipefail
 
             REPO_ROOT="''${REPO_ROOT:-$PWD}"
             ASSETS_DIR="''${ASSETS_DIR:-${app-web}}"
-            VAULT="''${VAULT_ROOT:-/tmp/test-vault}"
             PORT="''${TEST_PORT:-47896}"
             OUT_DIR="''${OUT_DIR:-$REPO_ROOT/target/test-browser-rust}"
+            BROWSER_BIN="''${CHROME_BIN:-''${CHROMIUM_BIN:-}}"
+            if [ -n "''${VAULT_ROOT:-}" ]; then
+              VAULT="$VAULT_ROOT"
+            else
+              VAULT="$OUT_DIR/vault"
+              rm -rf "$VAULT"
+            fi
+
+            if [ -z "$BROWSER_BIN" ] && [ "$(uname -s)" = "Darwin" ]; then
+              for candidate in \
+                "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" \
+                "/Applications/Chromium.app/Contents/MacOS/Chromium" \
+                "/Applications/Google Chrome Canary.app/Contents/MacOS/Google Chrome Canary"
+              do
+                if [ -x "$candidate" ]; then
+                  BROWSER_BIN="$candidate"
+                  break
+                fi
+              done
+            fi
+            if [ -z "$BROWSER_BIN" ]; then
+              BROWSER_BIN="${nixChromiumBin}"
+            fi
+            if [ -z "$BROWSER_BIN" ] || [ ! -x "$BROWSER_BIN" ]; then
+              echo "error: no Chrome or Chromium executable found" >&2
+              echo "hint: install Google Chrome or set CHROME_BIN=/path/to/browser" >&2
+              exit 2
+            fi
 
             if [ ! -f "$ASSETS_DIR/index.html" ]; then
               echo "error: no trunk dist at $ASSETS_DIR" >&2
@@ -221,17 +258,21 @@
               exit 2
             fi
 
-            mkdir -p "$VAULT" "$OUT_DIR"
-            if [ ! -f "$VAULT/Alpha.md" ]; then
-              printf 'See [[Beta]] and [[Gamma]].\n' > "$VAULT/Alpha.md"
-              printf '[[Alpha]]\n'                   > "$VAULT/Beta.md"
-              printf '[[Alpha]] [[Beta]]\n'          > "$VAULT/Gamma.md"
+            mkdir -p "$VAULT" "$VAULT/Jump Cannon" "$OUT_DIR"
+            for source in ${./charts/jump-cannon/knowledge}/*.md; do
+              cp -f "$source" "$VAULT/Jump Cannon/$(basename "$source")"
+            done
+            if [ ! -f "$VAULT/Welcome.md" ]; then
+              printf 'Begin with [[Start Here]]. See [[Performance]].\n' > "$VAULT/Welcome.md"
+            fi
+            if [ ! -f "$VAULT/Performance.md" ]; then
+              printf 'See [[Performance Engineering]], [[Scheduled Tests]], and [[Observability]].\n' > "$VAULT/Performance.md"
             fi
 
             # Software vulkan ICD for WebGPU on headless linux — mirrors the
             # devshell's VK_ICD_FILENAMES setting.
-            if [ -z "''${VK_ICD_FILENAMES:-}" ] && [ -d ${pkgs.mesa}/share/vulkan/icd.d ]; then
-              export VK_ICD_FILENAMES=${pkgs.mesa}/share/vulkan/icd.d/lvp_icd.x86_64.json
+            if [ -n "${browserVulkanIcdDir}" ] && [ -z "''${VK_ICD_FILENAMES:-}" ] && [ -d "${browserVulkanIcdDir}" ]; then
+              export VK_ICD_FILENAMES="${browserVulkanIcdDir}/lvp_icd.x86_64.json"
             fi
 
             echo "→ starting graph-api on port ''${PORT}…"
@@ -254,7 +295,7 @@
             echo "→ running test-browser…"
             test-browser \
               --base-url "http://127.0.0.1:$PORT" \
-              --chromium ${pkgs.chromium}/bin/chromium \
+              --chromium "$BROWSER_BIN" \
               --out-dir "$OUT_DIR" \
               --timeout-secs 60
           '';

@@ -314,9 +314,10 @@ async fn generate_server(expr: &str) -> ServerEval {
             Some(g) => ServerEval::Graph(g),
             None => ServerEval::EvalErr("server returned ok without a graph".to_string()),
         },
-        Ok(resp) => {
-            ServerEval::EvalErr(resp.error.unwrap_or_else(|| "evaluation failed".to_string()))
-        }
+        Ok(resp) => ServerEval::EvalErr(
+            resp.error
+                .unwrap_or_else(|| "evaluation failed".to_string()),
+        ),
     }
 }
 
@@ -371,6 +372,10 @@ struct SoupResp {
     ok: bool,
     #[serde(default)]
     n_nodes: u32,
+    #[serde(default)]
+    graph_revision: u64,
+    #[serde(default)]
+    selection_generation: u64,
     #[serde(default)]
     error: Option<String>,
 }
@@ -456,6 +461,7 @@ fn graph_data_from_generated(g: &GeneratedGraph) -> GraphData {
     let num_wcc = wcc_count(n, &edges);
 
     GraphData {
+        graph_revision: None,
         n_nodes: n as u32,
         n_edges,
         num_communities: 0,
@@ -494,35 +500,34 @@ pub fn panel(ctx: Ctx) -> Element {
         *RUNNING.write() = true;
         *ERROR.write() = None;
         *STATUS.write() = Some("queued…".to_string());
-        let mut graph = ctx.graph;
         spawn(async move {
-            let result = match backend {
+            let (result, evaluator) = match backend {
                 Backend::Server => {
                     *STATUS.write() = Some("evaluating on the server…".to_string());
-                    generate(&src).await
+                    (generate(&src).await, "server")
                 }
                 Backend::Inline => {
                     *STATUS.write() = Some("evaluating locally…".to_string());
-                    eval_inline(&src).await
+                    (eval_inline(&src).await, "inline")
                 }
                 Backend::LocalWorker => {
                     *STATUS.write() = Some("evaluating in a Web Worker…".to_string());
-                    eval_worker(&src).await
+                    (eval_worker(&src).await, "web worker")
                 }
                 Backend::Auto => {
                     *STATUS.write() = Some("evaluating on the server…".to_string());
                     match generate_server(&src).await {
-                        ServerEval::Graph(g) => Ok(g),
+                        ServerEval::Graph(g) => (Ok(g), "server"),
                         // A real eval error from a reachable server — surface
                         // it; falling back would just re-pay the eval.
-                        ServerEval::EvalErr(e) => Err(e),
+                        ServerEval::EvalErr(e) => (Err(e), "server"),
                         // Unreachable → the non-freeze local fallback (egui
                         // resolve_generate_backend's wasm Auto → LocalWorker).
                         ServerEval::Unreachable(_) => {
                             *STATUS.write() = Some(
                                 "server unreachable — evaluating in a Web Worker…".to_string(),
                             );
-                            eval_worker(&src).await
+                            (eval_worker(&src).await, "web worker")
                         }
                     }
                 }
@@ -535,13 +540,11 @@ pub fn panel(ctx: Ctx) -> Element {
                     // mount the converted scene directly instead.
                     let gd = graph_data_from_generated(&g);
                     *STATUS.write() = Some(format!(
-                        "{} nodes, {} edges — replaced the live graph",
+                        "{} nodes, {} edges — client-only graph (server tools disabled)",
                         gd.n_nodes, gd.n_edges
                     ));
                     *ERROR.write() = None;
-                    let scene = gd.scene.clone();
-                    graph.set(Some(gd));
-                    render::mount_canvas(scene);
+                    crate::replace_with_client_graph(ctx, gd, evaluator);
                 }
                 Err(e) => {
                     *ERROR.write() = Some(e);
@@ -589,7 +592,11 @@ pub fn panel(ctx: Ctx) -> Element {
                     // Hand off to the Layout panel's geometric engine so both
                     // self-assembly surfaces agree and the user can keep tuning
                     // the running assembly there.
-                    crate::panels::layout::stage_self_assembly(morphology);
+                    crate::panels::layout::stage_self_assembly(
+                        morphology,
+                        r.graph_revision,
+                        r.selection_generation,
+                    );
                     *SOUP_STATUS.write() = Some(format!(
                         "{name}: {} particles — Geometric (GPU) assembling on the worker \
                          (tune it in the Layout panel)",
@@ -713,8 +720,8 @@ pub fn panel(ctx: Ctx) -> Element {
             }
             hr { class: "gen-sep" }
 
-            // ── Execution backend picker — backend_picker ──────────────────
-            div { class: "gen-label", "Execution backend" }
+            // ── Expression evaluator picker — backend_picker ───────────────
+            div { class: "gen-label", "Expression evaluator" }
             div { class: "gen-hint",
                 "Where the expression is evaluated. Server (async HTTP to graph-api) \
                  keeps the browser responsive for large graphs. Auto uses Server when \
@@ -746,8 +753,8 @@ pub fn panel(ctx: Ctx) -> Element {
             // ── NixExtension chrome: hint / examples / editor / action ─────
             div { class: "gen-hint",
                 "Write a Nix expression that evaluates to toGraphJSON's \
-                 {{ nodes = [...]; links = [...]; }} shape. Evaluating replaces \
-                 the live graph."
+                 {{ nodes = [...]; links = [...]; }} shape. Evaluate mounts a \
+                 browser-owned graph; use Assemble for a server-hosted run."
             }
             hr { class: "gen-sep" }
             div { class: "gen-label", "Examples" }
