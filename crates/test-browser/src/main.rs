@@ -1,4 +1,4 @@
-//! Rust-driven browser regression suite (foundation).
+//! Rust-driven browser regression suite.
 //!
 //! Asserts the bare minimum that future regression checks will build on:
 //!
@@ -6,8 +6,9 @@
 //!   2. Headless Chromium launches with WebGPU flags and navigates.
 //!   3. The boot log line `[jump-cannon-ui] boot` appears on the JS
 //!      console within `--timeout-secs`.
-//!   4. The graph `<canvas>` element exists with non-zero width/height.
-//!   5. A screenshot is saved to `<out-dir>/boot.png` for visual review.
+//!   4. The graph canvas becomes render-ready and its header controls work.
+//!   5. Nodes is a two-pane editor; Flat/Tags selection and content work.
+//!   6. Screenshots are saved for the Nodes editor and complete workspace.
 //!
 //! Anything flaky (pixel brightness, motion deltas, click recovery) is
 //! deliberately deferred. (The legacy egui-era Playwright suite that held
@@ -55,6 +56,10 @@ struct Args {
     /// Overall test timeout (seconds).
     #[arg(long, default_value_t = 60)]
     timeout_secs: u64,
+
+    /// Require the wrapper's stable Nodes editor fixtures and strict checks.
+    #[arg(long)]
+    fixtures_required: bool,
 }
 
 #[derive(Serialize)]
@@ -69,6 +74,8 @@ struct Report {
     reason: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     graph_header_actions: Option<HeaderActionCheck>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    nodes_editor: Option<NodesEditorCheck>,
     page_errors: Vec<String>,
     console_logs: Vec<String>,
 }
@@ -102,6 +109,25 @@ struct HeaderActionCheck {
     actions: Vec<HeaderActionDetail>,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct NodesEditorCheck {
+    ok: bool,
+    fixture_contract: bool,
+    panel_visible: bool,
+    horizontal_split: bool,
+    sidebar_width: f64,
+    main_width: f64,
+    flat_default: bool,
+    selected_content_loaded: bool,
+    selection_persisted: bool,
+    exact_tag_groups: bool,
+    untagged_group: bool,
+    flat_active_count: usize,
+    schema_core_keys: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    reason: Option<String>,
+}
+
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -133,32 +159,52 @@ async fn main() -> Result<()> {
     let duration_ms = started.elapsed().as_millis();
 
     let logs = console_logs.lock().await.clone();
-    let (ok, reason, canvas_width, canvas_height, boot_log_found, header_actions, page_errors) =
-        match &result {
-            Ok(o) => {
-                let ok = o.header_actions.ok && o.page_errors.is_empty();
-                let reason = if !o.header_actions.ok {
-                    o.header_actions.reason.clone()
-                } else if !o.page_errors.is_empty() {
-                    Some(format!(
-                        "browser emitted {} console error(s) or unhandled exception(s)",
-                        o.page_errors.len()
-                    ))
-                } else {
-                    None
-                };
-                (
-                    ok,
-                    reason,
-                    o.canvas_width,
-                    o.canvas_height,
-                    o.boot_log_found,
-                    Some(o.header_actions.clone()),
-                    o.page_errors.clone(),
-                )
-            }
-            Err(e) => (false, Some(format!("{e:#}")), 0, 0, false, None, Vec::new()),
-        };
+    let (
+        ok,
+        reason,
+        canvas_width,
+        canvas_height,
+        boot_log_found,
+        header_actions,
+        nodes_editor,
+        page_errors,
+    ) = match &result {
+        Ok(o) => {
+            let ok = o.header_actions.ok && o.nodes_editor.ok && o.page_errors.is_empty();
+            let reason = if !o.header_actions.ok {
+                o.header_actions.reason.clone()
+            } else if !o.nodes_editor.ok {
+                o.nodes_editor.reason.clone()
+            } else if !o.page_errors.is_empty() {
+                Some(format!(
+                    "browser emitted {} console error(s) or unhandled exception(s)",
+                    o.page_errors.len()
+                ))
+            } else {
+                None
+            };
+            (
+                ok,
+                reason,
+                o.canvas_width,
+                o.canvas_height,
+                o.boot_log_found,
+                Some(o.header_actions.clone()),
+                Some(o.nodes_editor.clone()),
+                o.page_errors.clone(),
+            )
+        }
+        Err(e) => (
+            false,
+            Some(format!("{e:#}")),
+            0,
+            0,
+            false,
+            None,
+            None,
+            Vec::new(),
+        ),
+    };
 
     let report = Report {
         ok,
@@ -169,6 +215,7 @@ async fn main() -> Result<()> {
         duration_ms,
         reason: reason.clone(),
         graph_header_actions: header_actions,
+        nodes_editor,
         page_errors,
         console_logs: tail(&logs, 50),
     };
@@ -192,6 +239,7 @@ struct RunOk {
     canvas_height: u32,
     boot_log_found: bool,
     header_actions: HeaderActionCheck,
+    nodes_editor: NodesEditorCheck,
     page_errors: Vec<String>,
 }
 
@@ -244,9 +292,7 @@ async fn run(args: &Args, console_logs: Arc<Mutex<Vec<String>>>) -> Result<RunOk
     }
     let config = config.build().map_err(|e| anyhow!("BrowserConfig: {e}"))?;
 
-    let (mut browser, mut handler) = Browser::launch(config)
-        .await
-        .context("Browser::launch")?;
+    let (mut browser, mut handler) = Browser::launch(config).await.context("Browser::launch")?;
 
     // The CDP handler must be driven; spawn a task that polls it.
     let handler_task = tokio::spawn(async move {
@@ -288,10 +334,7 @@ async fn drive_page(
 ) -> Result<RunOk> {
     use chromiumoxide::cdp::browser_protocol::page::EventLifecycleEvent;
 
-    let page = browser
-        .new_page("about:blank")
-        .await
-        .context("new_page")?;
+    let page = browser.new_page("about:blank").await.context("new_page")?;
 
     // Console listener. Push every entry; we filter for the boot needle
     // when polling below.
@@ -309,10 +352,7 @@ async fn drive_page(
         .context("listen runtime exceptions")?;
     // Suppress unused warning on lifecycle stream (kept in case future
     // checks want to wait for `load` semantically).
-    let _ = page
-        .event_listener::<EventLifecycleEvent>()
-        .await
-        .ok();
+    let _ = page.event_listener::<EventLifecycleEvent>().await.ok();
 
     let logs_a = console_logs.clone();
     let console_pump = tokio::spawn(async move {
@@ -474,6 +514,182 @@ async fn drive_page(
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
 
+    // ---- 5. Nodes is an editor-style navigator + focused-content surface --
+    // Exercise real buttons and wait on the same DOM state a user sees. The
+    // wrapper seeds stable fixtures so this contract is independent of edits
+    // to the living documentation corpus.
+    let nodes_editor_js = r#"(async () => {
+        const waitFor = async (predicate, timeoutMs = 6000) => {
+          const deadline = performance.now() + timeoutMs;
+          while (performance.now() < deadline) {
+            const value = predicate();
+            if (value) return value;
+            await new Promise((resolve) => setTimeout(resolve, 50));
+          }
+          return null;
+        };
+        const failures = [];
+        const editor = await waitFor(() => document.querySelector('[data-testid="nodes-editor"]'));
+        const panel = editor?.closest('section.panel-nodes');
+        const sidebar = editor?.querySelector('[data-testid="node-sidebar"]');
+        const main = editor?.querySelector('[data-testid="node-main"]');
+        const editorRect = editor?.getBoundingClientRect();
+        const sidebarRect = sidebar?.getBoundingClientRect();
+        const mainRect = main?.getBoundingClientRect();
+        const panelVisible = Boolean(
+          panel && editorRect && editorRect.width > 0 && editorRect.height > 0
+        );
+        const horizontalSplit = Boolean(
+          sidebarRect && mainRect &&
+          sidebarRect.width > 0 && mainRect.width > sidebarRect.width &&
+          mainRect.left >= sidebarRect.right - 1
+        );
+
+        const flat = editor?.querySelector('[data-node-list-mode="flat"]');
+        const tags = editor?.querySelector('[data-node-list-mode="tags"]');
+        const flatDefault = flat?.getAttribute('aria-pressed') === 'true';
+        const schemaCoreKeys = Boolean(await waitFor(() => {
+          const keys = [...(editor?.querySelectorAll('.search-schema-key') || [])]
+            .map((element) => (element.textContent || '').trim());
+          return ['id:', 'title:', 'tags:'].every((key) => keys.includes(key));
+        }));
+
+        const strictFixture = sidebar?.querySelector(
+          '[data-node-id="Node Editor Fixture"]'
+        );
+        const fixtureContract = Boolean(strictFixture);
+        const fixture = strictFixture || sidebar?.querySelector('[data-node-id]');
+        const fixtureId = fixture?.getAttribute('data-node-id') || '';
+        fixture?.click();
+        const selectedContentLoaded = Boolean(await waitFor(() =>
+          main?.querySelector('[data-focused-node]')?.getAttribute('data-focused-node') === fixtureId &&
+          (!fixtureContract ||
+            (main?.textContent || '').includes('BROWSER_NODE_EDITOR_SENTINEL'))
+        ));
+
+        tags?.click();
+        const tagModeReady = Boolean(await waitFor(() =>
+          tags?.getAttribute('aria-pressed') === 'true' &&
+          editor?.querySelector('[data-tag]')
+        ));
+        const groups = [...(editor?.querySelectorAll('[data-tag-kind="exact"]') || [])];
+        const groupNamed = (tag) => groups.find(
+          (group) => group.getAttribute('data-tag') === tag
+        );
+        const untaggedGroup = editor?.querySelector('[data-synthetic-group="untagged"]');
+        const expand = (group) => {
+          const summary = group?.querySelector('.nodes-tag-summary');
+          if (summary?.getAttribute('aria-expanded') !== 'true') summary?.click();
+          return group;
+        };
+        const groupsToExercise = fixtureContract
+          ? [groupNamed('browser-editor'), groupNamed('browser-shared')].filter(Boolean)
+          : groups.slice(0, 2);
+        groupsToExercise.forEach(expand);
+        expand(untaggedGroup);
+        await waitFor(() => groupsToExercise.every(
+          (group) => group.querySelector('[data-node-id]')
+        ));
+        const genericGroupsExact = groupsToExercise.length > 0 && groupsToExercise.every(
+          (group) => {
+            const ids = [...group.querySelectorAll('[data-node-id]')]
+              .map((node) => node.getAttribute('data-node-id'));
+            return ids.length > 0 && new Set(ids).size === ids.length;
+          }
+        );
+        const editorGroup = groupNamed('browser-editor');
+        const sharedGroup = groupNamed('browser-shared');
+        const fixtureGroupsExact = Boolean(
+          editorGroup && sharedGroup &&
+          [...editorGroup.querySelectorAll('[data-node-id]')]
+            .filter((node) => node.getAttribute('data-node-id') === fixtureId).length === 1 &&
+          [...sharedGroup.querySelectorAll('[data-node-id]')]
+            .filter((node) => node.getAttribute('data-node-id') === fixtureId).length === 1 &&
+          [...sharedGroup.querySelectorAll('[data-node-id]')]
+            .some((node) => node.getAttribute('data-node-id') === 'Node Shared Fixture')
+        );
+        const exactTagGroups = tagModeReady && genericGroupsExact &&
+          (!fixtureContract || fixtureGroupsExact);
+        const untaggedGroupPresent = Boolean(
+          untaggedGroup?.querySelector('[data-node-id]')
+        );
+        const fixtureUntagged = Boolean(
+          [...(untaggedGroup?.querySelectorAll('[data-node-id]') || [])]
+            .some((node) => node.getAttribute('data-node-id') === 'Node Untagged Fixture')
+        );
+        const selectionPersisted = Boolean(
+          main?.querySelector('[data-focused-node]')?.getAttribute('data-focused-node') === fixtureId &&
+          (!fixtureContract ||
+            (main?.textContent || '').includes('BROWSER_NODE_EDITOR_SENTINEL'))
+        );
+
+        flat?.click();
+        await waitFor(() => flat?.getAttribute('aria-pressed') === 'true');
+        const flatActiveCount = [...(sidebar?.querySelectorAll(
+          '[data-node-id][aria-current="page"]'
+        ) || [])].filter(
+          (node) => node.getAttribute('data-node-id') === fixtureId
+        ).length;
+
+        // Leave the hierarchy visible for the screenshot while proving the
+        // selection survives the round trip through both navigator modes.
+        tags?.click();
+        await waitFor(() => tags?.getAttribute('aria-pressed') === 'true');
+
+        if (!panelVisible) failures.push('Nodes editor panel missing or hidden');
+        if (!horizontalSplit) failures.push('Nodes navigator is not left of a wider content pane');
+        if (!flatDefault) failures.push('Flat navigator is not the fresh-layout default');
+        if (!schemaCoreKeys) failures.push('core importer search keys missing');
+        if (!selectedContentLoaded) failures.push('selected node content did not load');
+        if (!selectionPersisted) failures.push('selection/content did not survive Tags mode');
+        if (!exactTagGroups) failures.push('exact multi-tag grouping is incorrect');
+        if (fixtureContract && (!untaggedGroupPresent || !fixtureUntagged)) {
+          failures.push('synthetic untagged group or fixture missing');
+        }
+        if (flatActiveCount !== 1) failures.push('Flat mode did not expose exactly one active row');
+        return {
+          ok: failures.length === 0,
+          fixture_contract: fixtureContract,
+          panel_visible: panelVisible,
+          horizontal_split: horizontalSplit,
+          sidebar_width: sidebarRect?.width || 0,
+          main_width: mainRect?.width || 0,
+          flat_default: flatDefault,
+          selected_content_loaded: selectedContentLoaded,
+          selection_persisted: selectionPersisted,
+          exact_tag_groups: Boolean(exactTagGroups),
+          untagged_group: untaggedGroupPresent,
+          flat_active_count: flatActiveCount,
+          schema_core_keys: schemaCoreKeys,
+          reason: failures.length ? failures.join('; ') : null,
+        };
+    })()"#;
+    let nodes_editor_value: serde_json::Value =
+        page.evaluate(nodes_editor_js).await?.into_value()?;
+    let mut nodes_editor: NodesEditorCheck = serde_json::from_value(nodes_editor_value)
+        .context("decode Nodes editor regression result")?;
+    if args.fixtures_required && !nodes_editor.fixture_contract {
+        nodes_editor.ok = false;
+        nodes_editor.reason =
+            Some("required Nodes editor fixtures were not imported into the navigator".to_string());
+    }
+
+    let nodes_png = page
+        .screenshot(CaptureScreenshotParams::builder().build())
+        .await
+        .context("Nodes editor screenshot")?;
+    let nodes_bytes = if nodes_png.first() == Some(&0x89) {
+        nodes_png
+    } else {
+        base64::engine::general_purpose::STANDARD
+            .decode(&nodes_png)
+            .unwrap_or(nodes_png)
+    };
+    let nodes_shot_path = args.out_dir.join("nodes-editor.png");
+    tokio::fs::write(&nodes_shot_path, nodes_bytes).await?;
+    tracing::info!("wrote screenshot {}", nodes_shot_path.display());
+
+    // ---- 6. Graph header actions are present, visible, and safe ----------
     // Exercise the controls through the same pointer/mouse event sequence a
     // user generates. Holding pointerdown across two animation frames catches
     // accidental propagation into Panel Kit's panel-drag handlers.
@@ -603,7 +819,7 @@ async fn drive_page(
     let header_actions: HeaderActionCheck = serde_json::from_value(header_actions_value)
         .context("decode Graph header action regression result")?;
 
-    // ---- 5. canvas exists with non-zero size -----------------------------
+    // ---- 7. canvas exists with non-zero size -----------------------------
     // The Dioxus app's graph canvas is `<canvas class="graph-canvas">`
     // (app/ui/src/graph_canvas.rs); fall back to any canvas on the page.
     let dims_js = r#"(() => {
@@ -620,12 +836,9 @@ async fn drive_page(
     let canvas_width = dims.get("w").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
     let canvas_height = dims.get("h").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
 
-    // ---- 6. screenshot ---------------------------------------------------
+    // ---- 8. screenshot ---------------------------------------------------
     let shot_params = CaptureScreenshotParams::builder().build();
-    let png_b64 = page
-        .screenshot(shot_params)
-        .await
-        .context("screenshot")?;
+    let png_b64 = page.screenshot(shot_params).await.context("screenshot")?;
     let bytes: Vec<u8> = png_b64;
     let shot_path = args.out_dir.join("boot.png");
     // Heuristic: if first byte is the PNG magic 0x89, write as-is; else
@@ -677,6 +890,7 @@ async fn drive_page(
         canvas_height,
         boot_log_found,
         header_actions,
+        nodes_editor,
         page_errors,
     })
 }
@@ -694,17 +908,13 @@ async fn probe_server(url: &str, timeout: Duration) -> Result<()> {
     loop {
         let attempt = async {
             let mut stream = TcpStream::connect((host.as_str(), port)).await?;
-            let req = format!(
-                "GET {path} HTTP/1.1\r\nHost: {host}:{port}\r\nConnection: close\r\n\r\n"
-            );
+            let req =
+                format!("GET {path} HTTP/1.1\r\nHost: {host}:{port}\r\nConnection: close\r\n\r\n");
             stream.write_all(req.as_bytes()).await?;
             let mut buf = Vec::with_capacity(512);
             // Read up to first chunk; we just need the status line.
-            let _ = tokio::time::timeout(
-                Duration::from_secs(5),
-                stream.read_to_end(&mut buf),
-            )
-            .await;
+            let _ =
+                tokio::time::timeout(Duration::from_secs(5), stream.read_to_end(&mut buf)).await;
             let head = String::from_utf8_lossy(&buf);
             if head.starts_with("HTTP/1.1 200") || head.starts_with("HTTP/1.0 200") {
                 anyhow::Ok(())

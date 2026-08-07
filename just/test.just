@@ -56,7 +56,8 @@ geometric-golden:
 
 # Rust-driven browser smoke test (crates/test-browser via CDP). No local trunk
 # build needed — the flake wrapper serves the nix-built app-web dist by default
-# (override with ASSETS_DIR=...). Output: target/test-browser-rust/{boot.png,report.json}.
+# (override with ASSETS_DIR=...). Output includes boot.png, nodes-editor.png,
+# and report.json under target/test-browser-rust/.
 [group('test')]
 [doc('Rust-driven browser smoke test (crates/test-browser via CDP)')]
 browser-rust:

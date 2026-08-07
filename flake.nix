@@ -236,8 +236,12 @@
             BROWSER_BIN="''${CHROME_BIN:-''${CHROMIUM_BIN:-}}"
             if [ -n "''${VAULT_ROOT:-}" ]; then
               VAULT="$VAULT_ROOT"
+              SEED_NODE_EDITOR_FIXTURES=0
+              FIXTURE_REQUIRE_ARGS=()
             else
               VAULT="$RUN_ROOT/vault"
+              SEED_NODE_EDITOR_FIXTURES=1
+              FIXTURE_REQUIRE_ARGS=(--fixtures-required)
             fi
 
             SERVER_PID=""
@@ -287,6 +291,40 @@
             if [ ! -f "$VAULT/Performance.md" ]; then
               printf 'See [[Performance Engineering]], [[Scheduled Tests]], and [[Observability]].\n' > "$VAULT/Performance.md"
             fi
+            # Stable fixtures for the Nodes workbench browser contract. Keep
+            # these outside the managed knowledge folder so their ids and tag
+            # shapes are independent of living-document edits.
+            if [ "$SEED_NODE_EDITOR_FIXTURES" -eq 1 ] && [ ! -f "$VAULT/Node Editor Fixture.md" ]; then
+              printf '%s\n' \
+                '---' \
+                'title: Node Editor Fixture' \
+                'tags: [browser-editor, browser-shared]' \
+                '---' \
+                "" \
+                '# Node Editor Fixture' \
+                "" \
+                'BROWSER_NODE_EDITOR_SENTINEL' \
+                > "$VAULT/Node Editor Fixture.md"
+            fi
+            if [ "$SEED_NODE_EDITOR_FIXTURES" -eq 1 ] && [ ! -f "$VAULT/Node Shared Fixture.md" ]; then
+              printf '%s\n' \
+                '---' \
+                'title: Node Shared Fixture' \
+                'tags: [browser-shared]' \
+                '---' \
+                "" \
+                'Shared tag sibling.' \
+                > "$VAULT/Node Shared Fixture.md"
+            fi
+            if [ "$SEED_NODE_EDITOR_FIXTURES" -eq 1 ] && [ ! -f "$VAULT/Node Untagged Fixture.md" ]; then
+              printf '%s\n' \
+                '---' \
+                'title: Node Untagged Fixture' \
+                '---' \
+                "" \
+                'Synthetic untagged-group fixture.' \
+                > "$VAULT/Node Untagged Fixture.md"
+            fi
 
             # Software vulkan ICD for WebGPU on headless linux — mirrors the
             # devshell's VK_ICD_FILENAMES setting.
@@ -315,9 +353,11 @@
               --base-url "http://127.0.0.1:$PORT" \
               --chromium "$BROWSER_BIN" \
               --out-dir "$RUN_OUT" \
-              --timeout-secs 60
+              --timeout-secs 60 \
+              "''${FIXTURE_REQUIRE_ARGS[@]}"
 
             install -m 0644 "$RUN_OUT/boot.png" "$OUT_DIR/boot.png"
+            install -m 0644 "$RUN_OUT/nodes-editor.png" "$OUT_DIR/nodes-editor.png"
             install -m 0644 "$RUN_OUT/report.json" "$OUT_DIR/report.json"
           '';
         };

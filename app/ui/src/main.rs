@@ -173,8 +173,8 @@ impl panel_kit::PanelKind for Panel {
     }
 }
 
-/// Default layout: the graph canvas dominates the left; browse/search in the
-/// middle column; inspector + document on the right; progress along the bottom.
+/// Default layout: graph and the editor-style Nodes workbench share the main
+/// row; the detachable Inspector and Document views start in the dock.
 fn default_layout() -> Vec<PanelWin<Panel>> {
     let mut b = LayoutBuilder::new();
     // The tray-parity panels start minimized: the dock is this app's
@@ -195,20 +195,21 @@ fn default_layout() -> Vec<PanelWin<Panel>> {
         min(b, Panel::Generate, 880.0, 200.0, 360.0, 440.0),
         min(b, Panel::Timeline, 900.0, 220.0, 380.0, 320.0),
         min(b, Panel::Debug, 920.0, 240.0, 320.0, 360.0),
+        min(b, Panel::Inspector, 940.0, 260.0, 330.0, 300.0),
+        min(b, Panel::Document, 960.0, 280.0, 430.0, 460.0),
+        min(b, Panel::Help, 980.0, 300.0, 330.0, 180.0),
     ];
-    // Floating mode: the graph view starts dominant (~2x everything else);
-    // clamp_to_viewport pulls the right column in on narrower screens.
+    // Floating mode: the 1280px browser-regression viewport can show both
+    // primary surfaces without overlap. The Nodes panel is wide enough for
+    // its navigator + focused-content split.
     // Tiling mode: the graph starts full-width × 3 rows (with_tile replaces
     // the old .panel-graph CSS override; the grip resizes it in snapped
     // steps now).
     v.extend([
-        b.at(Panel::Graph, 12.0, 44.0, 920.0, 620.0).with_tile(4, 3),
-        b.at(Panel::Nodes, 940.0, 44.0, 290.0, 620.0),
-        b.at(Panel::Inspector, 1238.0, 44.0, 330.0, 300.0),
-        b.at(Panel::Document, 1238.0, 352.0, 330.0, 460.0),
-        b.at(Panel::Progress, 12.0, 672.0, 920.0, 200.0),
-        b.at(Panel::Settings, 940.0, 672.0, 290.0, 200.0),
-        b.at(Panel::Help, 1238.0, 820.0, 330.0, 150.0),
+        b.at(Panel::Graph, 12.0, 44.0, 640.0, 620.0).with_tile(4, 3),
+        b.at(Panel::Nodes, 660.0, 44.0, 608.0, 620.0),
+        b.at(Panel::Progress, 12.0, 672.0, 640.0, 200.0),
+        b.at(Panel::Settings, 660.0, 672.0, 608.0, 200.0),
     ]);
     v
 }
@@ -437,7 +438,9 @@ fn App() -> Element {
     // can't leave the wgpu canvas unmounted → blank graph, plus pre-resize-fix
     // geometry; v4: tiling spans tile_w/tile_h; v3: Search merged into Nodes;
     // v2: 2x graph view + docked tray panels.)
-    let ws = panel_kit::use_workspace("jc_layout_v6", default_layout);
+    // v7 intentionally adopts the two-pane Nodes workbench default once;
+    // subsequent panel movement/resizing persists as before.
+    let ws = panel_kit::use_workspace("jc_layout_v7", default_layout);
 
     // Drain palette jump-to-section requests into the workspace, logging
     // the same `("section", "<title>: open")` event the egui app pushed.
@@ -722,7 +725,7 @@ fn panel_body(kind: Panel, _maximized: bool, ctx: Ctx) -> Element {
         Panel::Help => rsx! {
             div { class: "help",
                 p { "canvas: drag rotate · wheel zoom · WASD pan · QE fwd/back · Shift boost · F fit · click select" }
-                p { "nodes: type → fuzzy files + content matches + filter chips" }
+                p { "nodes: Flat/Tags navigator → selected content editor; type for indexed search" }
                 hr {}
                 p { "🔵 tiling ⇄ floating" }
                 p { "🟡 minimize → dock" }

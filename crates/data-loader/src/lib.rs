@@ -255,6 +255,9 @@ impl ImporterSchema {
             }
         }
 
+        // These fields are the source-neutral discovery surface every host
+        // may rely on. Tags are also a mandatory facet so clients can build
+        // bulk navigation and filters without issuing one request per node.
         for (key, expected_type) in [
             ("id", DiscoveryFieldType::Keyword),
             ("title", DiscoveryFieldType::Text),
@@ -265,13 +268,16 @@ impl ImporterSchema {
                     "discovery schema must declare required field {key:?}"
                 )));
             };
+            let missing_required_facet = key == "tags" && !field.facetable;
             if !field.required
                 || !field.searchable
                 || field.field_type != expected_type
                 || field.default_value.is_some()
+                || missing_required_facet
             {
+                let facet_requirement = if key == "tags" { ", facetable" } else { "" };
                 return Err(invalid_descriptor(format!(
-                    "field {key:?} must be required, searchable, typed {expected_type:?}, and have no default"
+                    "field {key:?} must be required, searchable{facet_requirement}, typed {expected_type:?}, and have no default"
                 )));
             }
         }
@@ -1286,7 +1292,15 @@ mod importer_tests {
         schema.field_mut("tags").searchable = false;
         let error = schema.validate().unwrap_err().to_string();
         assert!(
-            error.contains("field \"tags\" must be required, searchable"),
+            error.contains("field \"tags\" must be required, searchable, facetable"),
+            "{error}"
+        );
+
+        let mut schema = test_schema();
+        schema.field_mut("tags").facetable = false;
+        let error = schema.validate().unwrap_err().to_string();
+        assert!(
+            error.contains("field \"tags\" must be required, searchable, facetable"),
             "{error}"
         );
 

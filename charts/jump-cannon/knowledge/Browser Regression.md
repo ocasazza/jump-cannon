@@ -9,8 +9,17 @@ tags: [jump-cannon, browser, webgpu]
 # Browser Regression
 
 `just test browser-rust` starts graph-api with a test vault, opens the built
-Dioxus app in Chromium, exercises Graph header actions, and writes `boot.png`
-and `report.json` under `target/test-browser-rust`.
+Dioxus app in Chromium, exercises Graph header actions and the Nodes workbench,
+and writes `nodes-editor.png`, `boot.png`, and `report.json` under
+`target/test-browser-rust`.
+
+Stable fixture notes prove that Nodes renders a horizontal navigator/content
+split, exposes the core importer search keys, loads selected content, preserves
+selection across Flat and Tags, groups exact multi-tags without duplicate rows,
+and exposes a synthetic `(untagged)` group. When the wrapper owns the temporary
+vault, those fixtures are mandatory rather than silently falling back to a
+weaker generic check. The structured result is recorded under
+`nodes_editor` in `report.json`.
 
 Chromiumoxide arguments are keys without a leading `--`; its launcher adds the
 CLI prefix. Cluster browser jobs run as the chart's non-root identity without a
@@ -32,5 +41,5 @@ process grants secure-context treatment only to the configured `baseUrl`.
 Production browser exposure should terminate TLS rather than copy this test
 exception.
 
-A nonzero canvas rectangle alone does not prove nodes rendered. Review the
-screenshot and browser errors for visual changes to [[Frontend]] or [[Workspace]].
+A nonzero canvas rectangle alone does not prove nodes rendered. Review both
+screenshots and browser errors for visual changes to [[Frontend]] or [[Workspace]].
