@@ -9,48 +9,74 @@ pub struct ParsedNote {
     pub frontmatter: HashMap<String, serde_json::Value>,
     pub doctype: Option<String>,
     pub links: Vec<String>,
+    /// Markdown body without YAML frontmatter. Retained for the generic
+    /// importer-driven full-text index.
+    pub body: String,
 }
 
 /// Parse a markdown file's raw text into a `ParsedNote`.
 pub fn parse_note(path: &Path, text: &str) -> ParsedNote {
+    parse_note_impl(path, text, false).expect("non-strict note parsing is infallible")
+}
+
+/// Parse a markdown file while rejecting malformed YAML frontmatter.
+///
+/// The compatibility [`parse_note`] entrypoint preserves its historical
+/// best-effort behavior. Importers use this fallible variant so a malformed
+/// note cannot be silently published with its metadata stripped.
+pub fn try_parse_note(path: &Path, text: &str) -> Result<ParsedNote, serde_yaml::Error> {
+    parse_note_impl(path, text, true)
+}
+
+fn parse_note_impl(
+    path: &Path,
+    text: &str,
+    reject_invalid_frontmatter: bool,
+) -> Result<ParsedNote, serde_yaml::Error> {
     let (fm_raw, body) = split_frontmatter(text);
     let mut frontmatter: HashMap<String, serde_json::Value> = HashMap::new();
     let mut tags: Vec<String> = Vec::new();
     let mut doctype: Option<String> = None;
 
     if let Some(fm) = fm_raw {
-        if let Ok(v) = serde_yaml::from_str::<serde_yaml::Value>(&fm) {
-            if let serde_yaml::Value::Mapping(m) = &v {
-                for (k, val) in m {
-                    let key = k.as_str().unwrap_or("").to_string();
-                    let json_val = yaml_to_json(val);
-                    // Obsidian's `tags:` field shows up in many shapes in
-                    // the wild. The legacy code only accepted the YAML
-                    // array form (`tags: [a, b]`), silently dropping
-                    // every other form — which meant the API returned
-                    // empty `tags` for most vaults, the renderer's
-                    // `meta.tags.is_empty()` guard hid the badges, and
-                    // the user saw a chip-less sidebar.
-                    //
-                    // Accept (in order of common usage):
-                    //   - YAML array of strings: `tags: [a, b]`
-                    //   - Comma-separated scalar: `tags: a, b`
-                    //   - Single scalar:          `tags: a`
-                    // Also accept the singular `tag:` form some users
-                    // type. Strip leading `#` and surrounding quotes
-                    // (vault-search's `clean_tag` shape).
-                    if key == "tags" || key == "tag" {
-                        for t in extract_tags_from_value(&json_val) {
-                            if !tags.contains(&t) {
-                                tags.push(t);
-                            }
+        let parsed = match serde_yaml::from_str::<serde_yaml::Value>(&fm) {
+            Ok(value) => Some(value),
+            Err(error) if reject_invalid_frontmatter => return Err(error),
+            Err(_) => None,
+        };
+        if let Some(serde_yaml::Value::Mapping(m)) = parsed {
+            for (k, val) in &m {
+                let key = k.as_str().unwrap_or("").to_string();
+                let json_val = yaml_to_json(val);
+                // Obsidian's `tags:` field shows up in many shapes in
+                // the wild. The legacy code only accepted the YAML
+                // array form (`tags: [a, b]`), silently dropping
+                // every other form — which meant the API returned
+                // empty `tags` for most vaults, the renderer's
+                // `meta.tags.is_empty()` guard hid the badges, and
+                // the user saw a chip-less sidebar.
+                //
+                // Accept (in order of common usage):
+                //   - YAML array of strings: `tags: [a, b]`
+                //   - Comma-separated scalar: `tags: a, b`
+                //   - Single scalar:          `tags: a`
+                // Also accept the singular `tag:` form some users
+                // type. Strip leading `#` and surrounding quotes
+                // (vault-search's `clean_tag` shape).
+                if key == "tags" || key == "tag" {
+                    for t in extract_tags_from_value(&json_val) {
+                        if !tags.contains(&t) {
+                            tags.push(t);
                         }
                     }
-                    if key == "doctype" {
-                        doctype = json_val.as_str().map(|s| s.to_string());
-                    }
-                    frontmatter.insert(key, json_val);
                 }
+                if key == "doctype" {
+                    doctype = json_val
+                        .as_str()
+                        .filter(|value| !value.trim().is_empty())
+                        .map(str::to_string);
+                }
+                frontmatter.insert(key, json_val);
             }
         }
     }
@@ -71,13 +97,14 @@ pub fn parse_note(path: &Path, text: &str) -> ParsedNote {
         }
     }
 
-    ParsedNote {
+    Ok(ParsedNote {
         title,
         tags,
         frontmatter,
         doctype,
         links,
-    }
+        body,
+    })
 }
 
 /// Pull tag strings out of an arbitrary frontmatter JSON value.
@@ -150,7 +177,10 @@ fn extract_inline_tags(body: &str) -> Vec<String> {
                 // punctuation. Avoids matching `foo#bar` (anchor link
                 // or path fragment).
                 let preceded_ok = i == 0
-                    || matches!(bytes[i - 1], b' ' | b'\t' | b',' | b';' | b'(' | b'[' | b'{');
+                    || matches!(
+                        bytes[i - 1],
+                        b' ' | b'\t' | b',' | b';' | b'(' | b'[' | b'{'
+                    );
                 let mut j = i + 1;
                 while j < bytes.len() {
                     let c = bytes[j];
@@ -184,7 +214,10 @@ fn extract_inline_tags(body: &str) -> Vec<String> {
 /// Split `---\n…\n---\n` frontmatter from the rest of the file.
 /// Returns `(Some(frontmatter_text), body)` or `(None, full_text)`.
 fn split_frontmatter(text: &str) -> (Option<String>, String) {
-    let rest = match text.strip_prefix("---\n").or_else(|| text.strip_prefix("---\r\n")) {
+    let rest = match text
+        .strip_prefix("---\n")
+        .or_else(|| text.strip_prefix("---\r\n"))
+    {
         Some(r) => r,
         None => return (None, text.to_string()),
     };

@@ -11,9 +11,9 @@
 use std::collections::{BTreeMap, HashMap};
 
 use data_loader::{
-    Capability, DecodedRecord, Decoder, Effect, GraphMapper, ImportError, ImportFuture,
-    ImportPipeline, ImporterDescriptor, LoadResult, SourceConnector, SourceRecord, Transport,
-    WatchPlan,
+    Capability, DecodedRecord, Decoder, DiscoveryField, DiscoveryFieldType, EdgeTypeSchema, Effect,
+    GraphMapper, ImportError, ImportFuture, ImportPipeline, ImporterDescriptor, ImporterSchema,
+    LoadResult, SearchDocument, SourceConnector, SourceRecord, Transport, WatchPlan,
 };
 use kube::{
     api::{Api, DynamicObject, GroupVersionKind, ListParams},
@@ -556,6 +556,7 @@ impl KubernetesGraphMapper {
 impl GraphMapper for KubernetesGraphMapper {
     fn map(&self, records: Vec<DecodedRecord>) -> Result<LoadResult, ImportError> {
         let mut graph = VaultGraph::new();
+        let mut search_documents = Vec::new();
         let mut uid_to_id = HashMap::new();
         let mut owners_by_node = Vec::new();
 
@@ -563,8 +564,13 @@ impl GraphMapper for KubernetesGraphMapper {
             let object = record.value.as_object().ok_or_else(|| ImportError::Map {
                 message: format!("{} is not a JSON object", record.origin),
             })?;
-            let api_version = string_field(object, "apiVersion").unwrap_or("unknown");
-            let kind = string_field(object, "kind").unwrap_or("Resource");
+            let api_version =
+                string_field(object, "apiVersion").ok_or_else(|| ImportError::Map {
+                    message: format!("{} has no string apiVersion", record.origin),
+                })?;
+            let kind = string_field(object, "kind").ok_or_else(|| ImportError::Map {
+                message: format!("{} has no string kind", record.origin),
+            })?;
             let metadata = object
                 .get("metadata")
                 .and_then(Value::as_object)
@@ -589,6 +595,12 @@ impl GraphMapper for KubernetesGraphMapper {
                 .and_then(Value::as_object)
                 .cloned()
                 .unwrap_or_default();
+            let mut label_values = labels
+                .iter()
+                .filter_map(|(key, value)| value.as_str().map(|value| format!("{key}={value}")))
+                .collect::<Vec<_>>();
+            label_values.sort();
+            label_values.dedup();
             let mut tags = vec!["kubernetes".into(), kind.to_string()];
             tags.extend(labels.iter().filter_map(|(key, value)| {
                 value.as_str().map(|value| format!("label:{key}={value}"))
@@ -623,6 +635,26 @@ impl GraphMapper for KubernetesGraphMapper {
                 .flatten()
                 .filter_map(|owner| owner.get("uid").and_then(Value::as_str).map(str::to_string))
                 .collect::<Vec<_>>();
+
+            let mut search_document = SearchDocument::new(&node_id)
+                .with("id", node_id.clone())
+                .with("title", name)
+                .with("tags", serde_json::json!(tags))
+                .with("path", record.origin.clone())
+                .with("type", kind)
+                .with("namespace", namespace)
+                .with("api_version", api_version)
+                .with("labels", serde_json::json!(label_values));
+            if let Some(uid) = uid {
+                search_document.insert("uid", uid);
+            }
+            if let Some(resource_version) = metadata
+                .get("resourceVersion")
+                .and_then(serde_json::Value::as_str)
+            {
+                search_document.insert("resource_version", resource_version);
+            }
+            search_documents.push(search_document);
 
             graph
                 .try_add_node(VaultNode {
@@ -667,12 +699,19 @@ impl GraphMapper for KubernetesGraphMapper {
             message: error.to_string(),
         })?;
 
-        Ok(LoadResult { graph, unresolved })
+        Ok(LoadResult {
+            graph,
+            search_documents,
+            unresolved,
+        })
     }
 }
 
 fn string_field<'a>(object: &'a Map<String, Value>, field: &str) -> Option<&'a str> {
-    object.get(field).and_then(Value::as_str)
+    object
+        .get(field)
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
 }
 
 /// Build a Kubernetes snapshot pipeline with exact per-query capability
@@ -690,6 +729,7 @@ pub fn build_importer(config: KubernetesSourceConfig) -> Result<ImportPipeline, 
         format!("Kubernetes ({})", config.source_id),
         env!("CARGO_PKG_VERSION"),
         capabilities,
+        kubernetes_schema(),
     )
     .with_watch(watch);
     let mapper = KubernetesGraphMapper::new(&config.source_id, config.include_object);
@@ -700,6 +740,40 @@ pub fn build_importer(config: KubernetesSourceConfig) -> Result<ImportPipeline, 
         Box::new(JsonDecoder),
         Box::new(mapper),
     )
+}
+
+fn kubernetes_schema() -> ImporterSchema {
+    ImporterSchema::new(
+        vec![
+            DiscoveryField::new("id", DiscoveryFieldType::Keyword, true).searchable(2),
+            DiscoveryField::new("title", DiscoveryFieldType::Text, true)
+                .searchable(4)
+                .snippet(),
+            DiscoveryField::new("tags", DiscoveryFieldType::KeywordList, true)
+                .searchable(3)
+                .facetable(),
+            DiscoveryField::new("path", DiscoveryFieldType::Keyword, true).searchable(1),
+            DiscoveryField::new("type", DiscoveryFieldType::Keyword, true)
+                .searchable(3)
+                .facetable(),
+            DiscoveryField::new("namespace", DiscoveryFieldType::Keyword, true)
+                .searchable(2)
+                .facetable(),
+            DiscoveryField::new("api_version", DiscoveryFieldType::Keyword, true)
+                .searchable(2)
+                .facetable(),
+            DiscoveryField::new("labels", DiscoveryFieldType::KeywordList, true)
+                .searchable(2)
+                .facetable(),
+            DiscoveryField::new("uid", DiscoveryFieldType::Keyword, false).searchable(1),
+            DiscoveryField::new("resource_version", DiscoveryFieldType::Keyword, false),
+        ],
+        vec![EdgeTypeSchema::directed(
+            "owner_reference",
+            "Kubernetes ownerReference from owner to dependent resource",
+        )],
+    )
+    .with_input_media_types(["application/json"])
 }
 
 #[cfg(test)]
@@ -820,6 +894,92 @@ mod tests {
         let node = &loaded.graph.nodes["k8s:test:uid:deployment-uid"];
         assert!(!node.meta.frontmatter.contains_key("annotations"));
         assert!(!node.meta.frontmatter.contains_key("object"));
+
+        let schema = kubernetes_schema();
+        schema.validate_result(&loaded).unwrap();
+        let document = &loaded.search_documents[0];
+        assert!(!document.fields.contains_key("annotations"));
+        assert!(!document.fields.contains_key("object"));
+        assert!(!document
+            .fields
+            .values()
+            .any(|value| value.to_string().contains("do-not-expose")));
+    }
+
+    #[test]
+    fn kubernetes_schema_exposes_only_allowlisted_search_keys() {
+        let schema = kubernetes_schema();
+        schema.validate().unwrap();
+        assert_eq!(
+            schema
+                .fields
+                .iter()
+                .map(|field| field.key.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "id",
+                "title",
+                "tags",
+                "path",
+                "type",
+                "namespace",
+                "api_version",
+                "labels",
+                "uid",
+                "resource_version",
+            ]
+        );
+        assert!(schema.field("labels").unwrap().facetable);
+        assert!(!schema.fields.iter().any(|field| matches!(
+            field.key.as_str(),
+            "annotations" | "object" | "spec" | "status"
+        )));
+
+        let config = serde_json::from_value(json!({
+            "source_id": "test",
+            "resources": [{
+                "group": "apps",
+                "version": "v1",
+                "kind": "Deployment",
+                "namespaces": ["demo"]
+            }]
+        }))
+        .unwrap();
+        let importer = build_importer(config).unwrap();
+        importer.descriptor().validate().unwrap();
+        assert_eq!(importer.descriptor().schema, schema);
+    }
+
+    #[test]
+    fn full_object_mode_does_not_leak_object_or_annotations_into_search() {
+        let loaded = KubernetesGraphMapper::new("test", true)
+            .map(vec![decoded(
+                "deployment",
+                json!({
+                    "apiVersion": "apps/v1",
+                    "kind": "Deployment",
+                    "metadata": {
+                        "name": "web",
+                        "namespace": "demo",
+                        "uid": "deployment-uid",
+                        "annotations": { "private.example/token": "do-not-index" }
+                    },
+                    "spec": { "privateValue": "do-not-index" }
+                }),
+            )])
+            .unwrap();
+        let node = &loaded.graph.nodes["k8s:test:uid:deployment-uid"];
+        assert!(node.meta.frontmatter.contains_key("annotations"));
+        assert!(node.meta.frontmatter.contains_key("object"));
+
+        let document = &loaded.search_documents[0];
+        assert!(!document.fields.contains_key("annotations"));
+        assert!(!document.fields.contains_key("object"));
+        assert!(!document
+            .fields
+            .values()
+            .any(|value| value.to_string().contains("do-not-index")));
+        kubernetes_schema().validate_result(&loaded).unwrap();
     }
 
     #[test]

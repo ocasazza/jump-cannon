@@ -34,7 +34,10 @@
 
 use std::collections::HashMap;
 
-use data_loader::{LoadResult, Loader};
+use data_loader::{
+    DiscoveryField, DiscoveryFieldType, EdgeTypeSchema, ImporterSchema, LoadResult, Loader,
+    SearchDocument,
+};
 use rand::Rng;
 use vault_data::{NodeMeta, NodeMetrics, VaultEdge, VaultGraph, VaultNode};
 
@@ -77,17 +80,36 @@ impl Loader for TvixLoader {
         "tvix"
     }
 
+    fn schema(&self) -> ImporterSchema {
+        generated_schema(
+            "declared",
+            "Directed edge declared by the evaluated Nix graph",
+        )
+        .with_input_media_types(["application/x-nix"])
+    }
+
     fn load(&self) -> LoadResult {
-        match tvix_wasm::eval_graph(&self.expr) {
-            Ok(gen) => convert_generated_graph(&gen),
+        match self.try_load() {
+            Ok(result) => result,
             Err(e) => {
                 tracing::warn!(error = %e, "tvix eval failed");
                 LoadResult {
                     graph: VaultGraph::new(),
-                    unresolved: vec![e],
+                    search_documents: Vec::new(),
+                    unresolved: vec![e.to_string()],
                 }
             }
         }
+    }
+
+    fn try_load(&self) -> Result<LoadResult, data_loader::ImportError> {
+        let generated = tvix_wasm::eval_graph(&self.expr).map_err(|message| {
+            data_loader::ImportError::Decode {
+                origin: "tvix".into(),
+                message,
+            }
+        })?;
+        Ok(convert_generated_graph(&generated))
     }
 
     /// Tvix graphs have no filesystem root — no watching.
@@ -114,14 +136,28 @@ pub struct GenerateLoader {
 }
 
 impl GenerateLoader {
-    pub fn new(num_nodes: usize, num_edges: usize, num_clusters: usize, cluster_affinity: f64) -> Self {
-        Self { num_nodes, num_edges, num_clusters, cluster_affinity }
+    pub fn new(
+        num_nodes: usize,
+        num_edges: usize,
+        num_clusters: usize,
+        cluster_affinity: f64,
+    ) -> Self {
+        Self {
+            num_nodes,
+            num_edges,
+            num_clusters,
+            cluster_affinity,
+        }
     }
 }
 
 impl Loader for GenerateLoader {
     fn name(&self) -> &str {
         "generate"
+    }
+
+    fn schema(&self) -> ImporterSchema {
+        generated_schema("generated", "Directed edge produced by the graph generator")
     }
 
     fn load(&self) -> LoadResult {
@@ -140,11 +176,11 @@ impl Loader for GenerateLoader {
             .collect();
 
         // Generate nodes with cluster tags.
-        for i in 0..self.num_nodes {
+        for (i, cluster) in node_cluster.iter().enumerate() {
             let id = format!("n{i}");
             let mut tags = vec!["generated".into()];
             if cluster_count > 0 {
-                tags.push(format!("cluster-{}", node_cluster[i]));
+                tags.push(format!("cluster-{cluster}"));
             }
             let meta = NodeMeta {
                 source_id: "generate".into(),
@@ -169,7 +205,15 @@ impl Loader for GenerateLoader {
         }
 
         // Generate edges with community structure.
-        let max_node = self.num_nodes.saturating_sub(1);
+        if self.num_nodes == 0 {
+            return LoadResult {
+                graph,
+                search_documents: Vec::new(),
+                unresolved: Vec::new(),
+            };
+        }
+
+        let max_node = self.num_nodes - 1;
         let affinity = self.cluster_affinity.clamp(0.0, 1.0);
 
         for _ in 0..self.num_edges {
@@ -206,8 +250,22 @@ impl Loader for GenerateLoader {
             });
         }
 
+        let search_documents = graph
+            .nodes
+            .values()
+            .map(|node| {
+                SearchDocument::new(&node.id)
+                    .with("id", node.id.clone())
+                    .with("title", node.meta.title.clone())
+                    .with("tags", serde_json::json!(node.meta.tags))
+                    .with("path", node.meta.path.clone())
+                    .with("type", "generated")
+            })
+            .collect();
+
         LoadResult {
             graph,
+            search_documents,
             unresolved: Vec::new(),
         }
     }
@@ -229,13 +287,16 @@ impl Loader for GenerateLoader {
 /// any extra configuration.
 pub fn convert_generated_graph(gen: &tvix_wasm::GeneratedGraph) -> LoadResult {
     let mut graph = VaultGraph::new();
+    let mut search_documents = Vec::with_capacity(gen.nodes.len());
 
     // Collect kind → tag mapping for consistent tagging.
     let mut kind_tags: HashMap<String, String> = HashMap::new();
 
     for node in &gen.nodes {
         let tag = node.kind.as_deref().unwrap_or("node");
-        kind_tags.entry(tag.to_string()).or_insert_with(|| tag.to_string());
+        kind_tags
+            .entry(tag.to_string())
+            .or_insert_with(|| tag.to_string());
 
         let meta = NodeMeta {
             source_id: "tvix".into(),
@@ -258,6 +319,14 @@ pub fn convert_generated_graph(gen: &tvix_wasm::GeneratedGraph) -> LoadResult {
             x: 0.0,
             y: 0.0,
         });
+        search_documents.push(
+            SearchDocument::new(&node.id)
+                .with("id", node.id.clone())
+                .with("title", node.id.clone())
+                .with("tags", serde_json::json!([tag]))
+                .with("path", node.id.clone())
+                .with("type", tag),
+        );
     }
 
     for edge in &gen.edges {
@@ -272,8 +341,28 @@ pub fn convert_generated_graph(gen: &tvix_wasm::GeneratedGraph) -> LoadResult {
 
     LoadResult {
         graph,
+        search_documents,
         unresolved: Vec::new(),
     }
+}
+
+fn generated_schema(edge_key: &str, edge_description: &str) -> ImporterSchema {
+    ImporterSchema::new(
+        vec![
+            DiscoveryField::new("id", DiscoveryFieldType::Keyword, true).searchable(2),
+            DiscoveryField::new("title", DiscoveryFieldType::Text, true)
+                .searchable(4)
+                .snippet(),
+            DiscoveryField::new("tags", DiscoveryFieldType::KeywordList, true)
+                .searchable(3)
+                .facetable(),
+            DiscoveryField::new("path", DiscoveryFieldType::Keyword, true).searchable(2),
+            DiscoveryField::new("type", DiscoveryFieldType::Keyword, true)
+                .searchable(2)
+                .facetable(),
+        ],
+        vec![EdgeTypeSchema::directed(edge_key, edge_description)],
+    )
 }
 
 #[cfg(test)]
@@ -284,7 +373,10 @@ mod tests {
     fn star_graph_round_trip() {
         let loader = TvixLoader::from_demo("Star (hub)").expect("star demo exists");
         let result = loader.load();
-        assert!(result.unresolved.is_empty(), "tvix graphs have no unresolved refs");
+        assert!(
+            result.unresolved.is_empty(),
+            "tvix graphs have no unresolved refs"
+        );
         let g = &result.graph;
         assert_eq!(g.node_count(), 12, "star: 1 center + 11 spokes");
         assert_eq!(g.edge_count(), 11, "star: 11 hub→spoke edges");
@@ -336,14 +428,56 @@ mod tests {
         assert!(a.meta.tags.contains(&"source".to_string()));
         let b = result.graph.nodes.get("b").unwrap();
         assert!(b.meta.tags.contains(&"sink".to_string()));
+
+        let schema = loader.schema();
+        let descriptor = data_loader::Importer::descriptor(&loader);
+        descriptor.validate().unwrap();
+        assert_eq!(descriptor.schema, schema);
+        schema.validate_result(&result).unwrap();
+        assert_eq!(
+            result.search_documents[0]
+                .fields
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            ["id", "path", "tags", "title", "type"]
+        );
     }
 
     #[test]
-    fn bad_expr_returns_empty_graph() {
+    fn direct_bad_expr_load_preserves_legacy_diagnostic_result() {
         let loader = TvixLoader::new("let x = in");
         let result = loader.load();
         assert_eq!(result.graph.node_count(), 0);
-        assert!(!result.unresolved.is_empty(), "error should be in unresolved");
+        assert!(
+            !result.unresolved.is_empty(),
+            "error should be in unresolved"
+        );
+    }
+
+    #[tokio::test]
+    async fn bad_expr_fails_through_hosted_importer_boundary() {
+        let loader = TvixLoader::new("let x = in");
+        let descriptor = data_loader::Importer::descriptor(&loader);
+        let read = descriptor
+            .capabilities
+            .iter()
+            .find(|capability| capability.effect == data_loader::Effect::Read)
+            .expect("tvix importer declares read capability")
+            .clone();
+        let importer = data_loader::HostedImporter::new(Box::new(loader), [read])
+            .expect("valid hosted tvix importer");
+
+        let error = data_loader::Importer::import(&importer)
+            .await
+            .expect_err("invalid tvix must not become an empty graph");
+        match error {
+            data_loader::ImportError::Decode { origin, message } => {
+                assert_eq!(origin, "tvix");
+                assert!(!message.is_empty());
+            }
+            other => panic!("unexpected import error: {other}"),
+        }
     }
 
     #[test]
@@ -352,7 +486,10 @@ mod tests {
         assert!(!names.is_empty());
         // Every demo name should resolve to a loader.
         for name in &names {
-            assert!(TvixLoader::from_demo(name).is_some(), "demo {name} not found");
+            assert!(
+                TvixLoader::from_demo(name).is_some(),
+                "demo {name} not found"
+            );
         }
     }
 
@@ -367,6 +504,12 @@ mod tests {
         for (_, node) in &result.graph.nodes {
             assert!(node.meta.tags.contains(&"generated".to_string()));
         }
+        let schema = loader.schema();
+        let descriptor = data_loader::Importer::descriptor(&loader);
+        descriptor.validate().unwrap();
+        assert_eq!(descriptor.schema, schema);
+        schema.validate_result(&result).unwrap();
+        assert_eq!(result.search_documents.len(), result.graph.node_count());
     }
 
     #[test]

@@ -7,7 +7,7 @@
 //! the original Obsidian, tvix, and generated graph adapters.
 
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     future::Future,
     path::PathBuf,
     pin::Pin,
@@ -17,11 +17,575 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use vault_data::VaultGraph;
 
+/// Discovery-schema version understood by this release.
+pub const DISCOVERY_SCHEMA_VERSION: u32 = 1;
+/// Descriptor fields are intentionally bounded so a future package-control
+/// plane cannot turn schema validation into an allocation attack.
+pub const MAX_DISCOVERY_FIELDS: usize = 128;
+/// One imported snapshot may retain at most this many bytes of indexed values.
+pub const MAX_SEARCH_DOCUMENT_BYTES: usize = 512 * 1024 * 1024;
+
+/// Logical value type emitted into a discovery document.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DiscoveryFieldType {
+    Text,
+    Keyword,
+    KeywordList,
+    Number,
+    Boolean,
+    Date,
+    Url,
+}
+
+/// One named field in an importer's source-neutral discovery contract.
+///
+/// Unknown source attributes may still be retained in `NodeMeta.frontmatter`,
+/// but they are neither indexed nor faceted until the importer explicitly
+/// declares them here and emits a matching [`SearchDocument`] value.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DiscoveryField {
+    pub key: String,
+    pub field_type: DiscoveryFieldType,
+    pub required: bool,
+    pub searchable: bool,
+    pub facetable: bool,
+    #[serde(default)]
+    pub snippet: bool,
+    #[serde(default = "default_search_boost")]
+    pub boost: u16,
+    #[serde(default)]
+    pub default_value: Option<serde_json::Value>,
+    #[serde(default)]
+    pub sensitive: bool,
+}
+
+const fn default_search_boost() -> u16 {
+    1
+}
+
+impl DiscoveryField {
+    pub fn new(key: impl Into<String>, field_type: DiscoveryFieldType, required: bool) -> Self {
+        Self {
+            key: key.into(),
+            field_type,
+            required,
+            searchable: false,
+            facetable: false,
+            snippet: false,
+            boost: 1,
+            default_value: None,
+            sensitive: false,
+        }
+    }
+
+    pub fn searchable(mut self, boost: u16) -> Self {
+        self.searchable = true;
+        self.boost = boost;
+        self
+    }
+
+    pub fn facetable(mut self) -> Self {
+        self.facetable = true;
+        self
+    }
+
+    pub fn snippet(mut self) -> Self {
+        self.snippet = true;
+        self
+    }
+
+    pub fn with_default(mut self, value: impl Into<serde_json::Value>) -> Self {
+        self.default_value = Some(value.into());
+        self
+    }
+}
+
+/// Semantics of the canonical edges produced by one importer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EdgeTypeSchema {
+    pub key: String,
+    pub directed: bool,
+    #[serde(default)]
+    pub description: Option<String>,
+}
+
+impl EdgeTypeSchema {
+    pub fn directed(key: impl Into<String>, description: impl Into<String>) -> Self {
+        Self {
+            key: key.into(),
+            directed: true,
+            description: Some(description.into()),
+        }
+    }
+}
+
+/// Source-content operations available after graph materialization.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct ContentSchema {
+    pub readable: bool,
+    pub writable: bool,
+    #[serde(default)]
+    pub media_types: Vec<String>,
+}
+
+/// Versioned, mandatory output/discovery schema for an importer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ImporterSchema {
+    pub schema_version: u32,
+    #[serde(default)]
+    pub input_media_types: Vec<String>,
+    pub fields: Vec<DiscoveryField>,
+    pub edge_types: Vec<EdgeTypeSchema>,
+    #[serde(default)]
+    pub content: ContentSchema,
+}
+
+impl ImporterSchema {
+    pub fn new(fields: Vec<DiscoveryField>, edge_types: Vec<EdgeTypeSchema>) -> Self {
+        Self {
+            schema_version: DISCOVERY_SCHEMA_VERSION,
+            input_media_types: Vec::new(),
+            fields,
+            edge_types,
+            content: ContentSchema::default(),
+        }
+    }
+
+    pub fn with_input_media_types(
+        mut self,
+        media_types: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
+        self.input_media_types = media_types.into_iter().map(Into::into).collect();
+        self
+    }
+
+    pub fn with_content(mut self, content: ContentSchema) -> Self {
+        self.content = content;
+        self
+    }
+
+    pub fn field(&self, key: &str) -> Option<&DiscoveryField> {
+        self.fields.iter().find(|field| field.key == key)
+    }
+
+    pub fn searchable_fields(&self) -> impl Iterator<Item = &DiscoveryField> {
+        self.fields.iter().filter(|field| field.searchable)
+    }
+
+    pub fn facetable_fields(&self) -> impl Iterator<Item = &DiscoveryField> {
+        self.fields.iter().filter(|field| field.facetable)
+    }
+
+    pub fn validate(&self) -> Result<(), ImportError> {
+        if self.schema_version != DISCOVERY_SCHEMA_VERSION {
+            return Err(invalid_descriptor(format!(
+                "unsupported discovery schema version {}; supported version is {}",
+                self.schema_version, DISCOVERY_SCHEMA_VERSION
+            )));
+        }
+        if self.fields.is_empty() || self.fields.len() > MAX_DISCOVERY_FIELDS {
+            return Err(invalid_descriptor(format!(
+                "discovery schema must declare between 1 and {MAX_DISCOVERY_FIELDS} fields"
+            )));
+        }
+
+        let mut keys = HashSet::with_capacity(self.fields.len());
+        for field in &self.fields {
+            if !valid_schema_key(&field.key) {
+                return Err(invalid_descriptor(format!(
+                    "invalid discovery field key {:?}",
+                    field.key
+                )));
+            }
+            if !keys.insert(field.key.as_str()) {
+                return Err(invalid_descriptor(format!(
+                    "duplicate discovery field key {:?}",
+                    field.key
+                )));
+            }
+            if field.searchable && field.boost == 0 {
+                return Err(invalid_descriptor(format!(
+                    "searchable field {:?} must have a non-zero boost",
+                    field.key
+                )));
+            }
+            if field.boost > 100 {
+                return Err(invalid_descriptor(format!(
+                    "field {:?} boost {} exceeds 100",
+                    field.key, field.boost
+                )));
+            }
+            if field.snippet && (!field.searchable || field.field_type != DiscoveryFieldType::Text)
+            {
+                return Err(invalid_descriptor(format!(
+                    "snippet field {:?} must be searchable text",
+                    field.key
+                )));
+            }
+            if field.facetable && field.field_type == DiscoveryFieldType::Text {
+                return Err(invalid_descriptor(format!(
+                    "free-text field {:?} cannot be facetable",
+                    field.key
+                )));
+            }
+            if field.sensitive
+                && (field.required
+                    || field.searchable
+                    || field.facetable
+                    || field.snippet
+                    || field.default_value.is_some())
+            {
+                return Err(invalid_descriptor(format!(
+                    "sensitive field {:?} cannot be required, defaulted, indexed, faceted, or snippet-capable",
+                    field.key
+                )));
+            }
+            if let Some(value) = &field.default_value {
+                validate_field_value(field, value).map_err(|message| {
+                    invalid_descriptor(format!(
+                        "default for field {:?} is invalid: {message}",
+                        field.key
+                    ))
+                })?;
+            }
+        }
+
+        for (key, expected_type) in [
+            ("id", DiscoveryFieldType::Keyword),
+            ("title", DiscoveryFieldType::Text),
+            ("tags", DiscoveryFieldType::KeywordList),
+        ] {
+            let Some(field) = self.field(key) else {
+                return Err(invalid_descriptor(format!(
+                    "discovery schema must declare required field {key:?}"
+                )));
+            };
+            if !field.required
+                || !field.searchable
+                || field.field_type != expected_type
+                || field.default_value.is_some()
+            {
+                return Err(invalid_descriptor(format!(
+                    "field {key:?} must be required, searchable, typed {expected_type:?}, and have no default"
+                )));
+            }
+        }
+
+        if self.edge_types.is_empty() {
+            return Err(invalid_descriptor(
+                "discovery schema must declare at least one edge type".into(),
+            ));
+        }
+        let mut edge_keys = HashSet::with_capacity(self.edge_types.len());
+        for edge in &self.edge_types {
+            if !valid_schema_key(&edge.key) || !edge_keys.insert(edge.key.as_str()) {
+                return Err(invalid_descriptor(format!(
+                    "edge type keys must be valid and unique: {:?}",
+                    edge.key
+                )));
+            }
+        }
+        if self.content.writable && !self.content.readable {
+            return Err(invalid_descriptor(
+                "writable content must also be readable".into(),
+            ));
+        }
+        if (self.content.readable || self.content.writable) && self.content.media_types.is_empty() {
+            return Err(invalid_descriptor(
+                "readable or writable content must declare at least one media type".into(),
+            ));
+        }
+        validate_media_types(&self.input_media_types)?;
+        validate_media_types(&self.content.media_types)?;
+        Ok(())
+    }
+
+    /// Validate the searchable projection emitted for one completed import.
+    pub fn validate_result(&self, result: &LoadResult) -> Result<(), ImportError> {
+        self.validate_output(&result.graph, &result.search_documents)
+    }
+
+    /// Validate a graph and its searchable projection without cloning either.
+    pub fn validate_output(
+        &self,
+        graph: &VaultGraph,
+        search_documents: &[SearchDocument],
+    ) -> Result<(), ImportError> {
+        self.validate()?;
+        if search_documents.len() != graph.nodes.len() {
+            return Err(ImportError::Map {
+                message: format!(
+                    "importer emitted {} search documents for {} graph nodes",
+                    search_documents.len(),
+                    graph.nodes.len()
+                ),
+            });
+        }
+
+        let fields: HashMap<&str, &DiscoveryField> = self
+            .fields
+            .iter()
+            .map(|field| (field.key.as_str(), field))
+            .collect();
+        let mut seen = HashSet::with_capacity(search_documents.len());
+        let mut total_bytes = 0usize;
+        for document in search_documents {
+            let Some(node) = graph.nodes.get(&document.node_id) else {
+                return Err(ImportError::Map {
+                    message: format!(
+                        "search document references unknown node {:?}",
+                        document.node_id
+                    ),
+                });
+            };
+            if !seen.insert(document.node_id.as_str()) {
+                return Err(ImportError::Map {
+                    message: format!("duplicate search document for node {:?}", document.node_id),
+                });
+            }
+            for key in document.fields.keys() {
+                let Some(field) = fields.get(key.as_str()) else {
+                    return Err(ImportError::Map {
+                        message: format!(
+                            "search document for {:?} emitted undeclared field {:?}",
+                            document.node_id, key
+                        ),
+                    });
+                };
+                if field.sensitive {
+                    return Err(ImportError::Map {
+                        message: format!(
+                            "search document for {:?} emitted sensitive field {:?}",
+                            document.node_id, key
+                        ),
+                    });
+                }
+            }
+            for field in &self.fields {
+                let value = document
+                    .fields
+                    .get(&field.key)
+                    .or(field.default_value.as_ref());
+                if field.required && value.is_none() {
+                    return Err(ImportError::Map {
+                        message: format!(
+                            "search document for {:?} is missing required field {:?}",
+                            document.node_id, field.key
+                        ),
+                    });
+                }
+                if let Some(value) = value {
+                    validate_field_value(field, value).map_err(|message| ImportError::Map {
+                        message: format!(
+                            "search document for {:?} has invalid field {:?}: {message}",
+                            document.node_id, field.key
+                        ),
+                    })?;
+                    total_bytes = total_bytes.saturating_add(json_value_bytes(value));
+                    if total_bytes > MAX_SEARCH_DOCUMENT_BYTES {
+                        return Err(ImportError::Map {
+                            message: format!(
+                                "search document values exceed {MAX_SEARCH_DOCUMENT_BYTES} bytes"
+                            ),
+                        });
+                    }
+                }
+            }
+            let indexed_id = document
+                .fields
+                .get("id")
+                .and_then(serde_json::Value::as_str)
+                .expect("validated core id field");
+            if indexed_id != document.node_id {
+                return Err(ImportError::Map {
+                    message: format!(
+                        "search document for {:?} indexes mismatched id {:?}",
+                        document.node_id, indexed_id
+                    ),
+                });
+            }
+            let indexed_title = document
+                .fields
+                .get("title")
+                .and_then(serde_json::Value::as_str)
+                .expect("validated core title field");
+            if indexed_title.trim().is_empty() || indexed_title != node.meta.title {
+                return Err(ImportError::Map {
+                    message: format!(
+                        "search document for {:?} must index its canonical non-empty title",
+                        document.node_id
+                    ),
+                });
+            }
+            let indexed_tags = document
+                .fields
+                .get("tags")
+                .and_then(serde_json::Value::as_array)
+                .expect("validated core tags field");
+            if indexed_tags.len() != node.meta.tags.len()
+                || indexed_tags
+                    .iter()
+                    .zip(&node.meta.tags)
+                    .any(|(indexed, canonical)| indexed.as_str() != Some(canonical.as_str()))
+            {
+                return Err(ImportError::Map {
+                    message: format!(
+                        "search document for {:?} must index its canonical tags",
+                        document.node_id
+                    ),
+                });
+            }
+        }
+
+        for node in graph.nodes.values() {
+            if node.meta.source_id.trim().is_empty() {
+                return Err(ImportError::Map {
+                    message: format!("node {:?} has an empty source_id", node.id),
+                });
+            }
+            if node.meta.content_readable && !self.content.readable {
+                return Err(ImportError::Map {
+                    message: format!(
+                        "node {:?} advertises readable content outside its schema",
+                        node.id
+                    ),
+                });
+            }
+            if node.meta.content_writable && !self.content.writable {
+                return Err(ImportError::Map {
+                    message: format!(
+                        "node {:?} advertises writable content outside its schema",
+                        node.id
+                    ),
+                });
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Searchable/facetable values emitted for one graph node.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SearchDocument {
+    pub node_id: String,
+    pub fields: BTreeMap<String, serde_json::Value>,
+}
+
+impl SearchDocument {
+    pub fn new(node_id: impl Into<String>) -> Self {
+        Self {
+            node_id: node_id.into(),
+            fields: BTreeMap::new(),
+        }
+    }
+
+    pub fn insert(&mut self, key: impl Into<String>, value: impl Into<serde_json::Value>) {
+        self.fields.insert(key.into(), value.into());
+    }
+
+    pub fn with(mut self, key: impl Into<String>, value: impl Into<serde_json::Value>) -> Self {
+        self.insert(key, value);
+        self
+    }
+}
+
+fn valid_schema_key(key: &str) -> bool {
+    !key.is_empty()
+        && key.len() <= 64
+        && key
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+        && key.as_bytes().first().is_some_and(u8::is_ascii_alphabetic)
+}
+
+fn validate_media_types(media_types: &[String]) -> Result<(), ImportError> {
+    let mut seen = HashSet::with_capacity(media_types.len());
+    for media_type in media_types {
+        if media_type.trim().is_empty()
+            || media_type.chars().any(char::is_whitespace)
+            || !media_type.contains('/')
+        {
+            return Err(invalid_descriptor(format!(
+                "invalid media type {media_type:?}"
+            )));
+        }
+        if !seen.insert(media_type) {
+            return Err(invalid_descriptor(format!(
+                "duplicate media type {media_type:?}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_field_value(field: &DiscoveryField, value: &serde_json::Value) -> Result<(), String> {
+    let valid = match field.field_type {
+        DiscoveryFieldType::Text => value.is_string(),
+        DiscoveryFieldType::Keyword | DiscoveryFieldType::Date | DiscoveryFieldType::Url => {
+            value.as_str().is_some_and(|value| !value.trim().is_empty())
+        }
+        DiscoveryFieldType::KeywordList => value.as_array().is_some_and(|items| {
+            let mut seen = HashSet::with_capacity(items.len());
+            items.iter().all(|item| {
+                item.as_str()
+                    .filter(|value| !value.trim().is_empty())
+                    .is_some_and(|value| seen.insert(value))
+            })
+        }),
+        DiscoveryFieldType::Number => value.is_number(),
+        DiscoveryFieldType::Boolean => value.is_boolean(),
+    };
+    if valid {
+        Ok(())
+    } else {
+        let expectation = match field.field_type {
+            DiscoveryFieldType::Keyword
+            | DiscoveryFieldType::KeywordList
+            | DiscoveryFieldType::Date
+            | DiscoveryFieldType::Url => match field.field_type {
+                DiscoveryFieldType::KeywordList => {
+                    "expected KeywordList with non-empty unique values".into()
+                }
+                _ => format!("expected {:?} with a non-empty value", field.field_type),
+            },
+            _ => format!("expected {:?}", field.field_type),
+        };
+        Err(expectation)
+    }
+}
+
+fn json_value_bytes(value: &serde_json::Value) -> usize {
+    match value {
+        serde_json::Value::Null => 0,
+        serde_json::Value::Bool(_) => 1,
+        serde_json::Value::Number(number) => number.to_string().len(),
+        serde_json::Value::String(string) => string.len(),
+        serde_json::Value::Array(values) => values.iter().map(json_value_bytes).sum(),
+        serde_json::Value::Object(values) => values
+            .iter()
+            .map(|(key, value)| key.len() + json_value_bytes(value))
+            .sum(),
+    }
+}
+
+fn invalid_descriptor(message: String) -> ImportError {
+    ImportError::InvalidDescriptor { message }
+}
+
 /// The result of a single load pass.
 #[derive(Debug)]
 pub struct LoadResult {
     /// The populated graph (nodes + resolved edges).
     pub graph: VaultGraph,
+    /// Typed, bounded discovery projection. There must be exactly one document
+    /// per graph node, and every field must be declared by the importer schema.
+    pub search_documents: Vec<SearchDocument>,
     /// References that could not be resolved to any known node.
     /// For Obsidian: wikilinks with no matching note.
     /// For tvix: always empty (generated graphs are self-consistent).
@@ -43,8 +607,22 @@ pub trait Loader: Send + Sync {
     /// Human-readable name for progress / UI (e.g. "obsidian", "tvix").
     fn name(&self) -> &str;
 
+    /// Mandatory output/discovery contract for this loader.
+    fn schema(&self) -> ImporterSchema;
+
     /// Produce a fresh graph from the source.
     fn load(&self) -> LoadResult;
+
+    /// Produce a fresh graph through the mandatory importer boundary.
+    ///
+    /// Compatibility loaders default to their infallible [`Loader::load`]
+    /// implementation. Loaders whose source can fail must override this method
+    /// so hosts retain the previous snapshot instead of publishing a synthetic
+    /// empty result. `load` may still preserve legacy diagnostic behavior for
+    /// direct callers.
+    fn try_load(&self) -> Result<LoadResult, ImportError> {
+        Ok(self.load())
+    }
 
     /// The root path this loader reads from, if any. Used by the watcher to
     /// know *what* to watch. Returns `None` for sources that have no
@@ -164,6 +742,7 @@ pub enum WatchPlan {
 
 /// Stable metadata advertised by an importer implementation or manifest.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ImporterDescriptor {
     pub id: String,
     pub name: String,
@@ -172,6 +751,7 @@ pub struct ImporterDescriptor {
     pub capabilities: Vec<Capability>,
     #[serde(default)]
     pub watch: WatchPlan,
+    pub schema: ImporterSchema,
 }
 
 impl ImporterDescriptor {
@@ -180,6 +760,7 @@ impl ImporterDescriptor {
         name: impl Into<String>,
         version: impl Into<String>,
         capabilities: Vec<Capability>,
+        schema: ImporterSchema,
     ) -> Self {
         Self {
             id: id.into(),
@@ -187,12 +768,55 @@ impl ImporterDescriptor {
             version: version.into(),
             capabilities,
             watch: WatchPlan::Static,
+            schema,
         }
     }
 
     pub fn with_watch(mut self, watch: WatchPlan) -> Self {
         self.watch = watch;
         self
+    }
+
+    /// Validate identity, capabilities, and the mandatory discovery schema.
+    pub fn validate(&self) -> Result<(), ImportError> {
+        if self.id.trim().is_empty()
+            || self.name.trim().is_empty()
+            || self.version.trim().is_empty()
+        {
+            return Err(invalid_descriptor(
+                "id, name, and version must be non-empty".into(),
+            ));
+        }
+        if !self
+            .capabilities
+            .iter()
+            .any(|capability| capability.effect == Effect::Read)
+        {
+            return Err(invalid_descriptor(
+                "an importer must request at least one read capability".into(),
+            ));
+        }
+        if self.schema.content.readable
+            != self
+                .capabilities
+                .iter()
+                .any(|capability| capability.effect == Effect::ContentRead)
+        {
+            return Err(invalid_descriptor(
+                "content.readable must agree with ContentRead capability".into(),
+            ));
+        }
+        if self.schema.content.writable
+            != self
+                .capabilities
+                .iter()
+                .any(|capability| capability.effect == Effect::ContentWrite)
+        {
+            return Err(invalid_descriptor(
+                "content.writable must agree with ContentWrite capability".into(),
+            ));
+        }
+        self.schema.validate()
     }
 }
 
@@ -240,12 +864,13 @@ where
             self.name(),
             env!("CARGO_PKG_VERSION"),
             capabilities,
+            self.schema(),
         )
         .with_watch(watch)
     }
 
     fn import<'a>(&'a self) -> ImportFuture<'a, Result<LoadResult, ImportError>> {
-        Box::pin(async move { Ok(self.load()) })
+        Box::pin(async move { self.try_load() })
     }
 }
 
@@ -266,23 +891,7 @@ impl HostedImporter {
         grants: impl IntoIterator<Item = Capability>,
     ) -> Result<Self, ImportError> {
         let descriptor = importer.descriptor();
-        if descriptor.id.trim().is_empty()
-            || descriptor.name.trim().is_empty()
-            || descriptor.version.trim().is_empty()
-        {
-            return Err(ImportError::InvalidDescriptor {
-                message: "id, name, and version must be non-empty".into(),
-            });
-        }
-        if !descriptor
-            .capabilities
-            .iter()
-            .any(|capability| capability.effect == Effect::Read)
-        {
-            return Err(ImportError::InvalidDescriptor {
-                message: "an importer must request at least one read capability".into(),
-            });
-        }
+        descriptor.validate()?;
 
         let mut exact_grants = HashSet::new();
         for grant in grants {
@@ -327,6 +936,7 @@ impl Importer for HostedImporter {
     fn import<'a>(&'a self) -> ImportFuture<'a, Result<LoadResult, ImportError>> {
         Box::pin(async move {
             let descriptor = self.importer.descriptor();
+            descriptor.validate()?;
             for capability in descriptor
                 .capabilities
                 .iter()
@@ -334,7 +944,9 @@ impl Importer for HostedImporter {
             {
                 self.authorize(capability)?;
             }
-            self.importer.import().await
+            let result = self.importer.import().await?;
+            descriptor.schema.validate_result(&result)?;
+            Ok(result)
         })
     }
 }
@@ -389,6 +1001,14 @@ pub enum ImportError {
     SourceWrite { origin: String, message: String },
     #[error("decode failed at {origin}: {message}")]
     Decode { origin: String, message: String },
+    #[error(
+        "unsupported input media type {content_type:?} at {origin}; importer accepts {accepted:?}"
+    )]
+    UnsupportedMediaType {
+        origin: String,
+        content_type: String,
+        accepted: Vec<String>,
+    },
     #[error("graph mapping failed: {message}")]
     Map { message: String },
     #[error("effect {effect:?} is unsupported")]
@@ -445,12 +1065,11 @@ impl ImportPipeline {
         decoder: Box<dyn Decoder>,
         mapper: Box<dyn GraphMapper>,
     ) -> Result<Self, ImportError> {
-        if descriptor.id.trim().is_empty()
-            || descriptor.name.trim().is_empty()
-            || descriptor.version.trim().is_empty()
-        {
+        descriptor.validate()?;
+        if descriptor.schema.input_media_types.is_empty() {
             return Err(ImportError::InvalidDescriptor {
-                message: "id, name, and version must be non-empty".into(),
+                message: "connector-backed importer must declare at least one input media type"
+                    .into(),
             });
         }
 
@@ -503,11 +1122,33 @@ impl ImportPipeline {
     /// Execute connector -> decoder -> mapper in that order.
     pub async fn run(&self) -> Result<LoadResult, ImportError> {
         let source_records = self.connector.read().await?;
+        for record in &source_records {
+            let actual_media_type = record
+                .content_type
+                .split_once(';')
+                .map_or(record.content_type.as_str(), |(media_type, _)| media_type)
+                .trim();
+            if !self
+                .descriptor
+                .schema
+                .input_media_types
+                .iter()
+                .any(|accepted| accepted.eq_ignore_ascii_case(actual_media_type))
+            {
+                return Err(ImportError::UnsupportedMediaType {
+                    origin: record.origin.clone(),
+                    content_type: record.content_type.clone(),
+                    accepted: self.descriptor.schema.input_media_types.clone(),
+                });
+            }
+        }
         let decoded = source_records
             .into_iter()
             .map(|record| self.decoder.decode(record))
             .collect::<Result<Vec<_>, _>>()?;
-        self.mapper.map(decoded)
+        let result = self.mapper.map(decoded)?;
+        self.descriptor.schema.validate_result(&result)?;
+        Ok(result)
     }
 }
 
@@ -536,8 +1177,251 @@ mod importer_tests {
         Capability::new(effect, Transport::InMemory, scope)
     }
 
+    fn test_schema() -> ImporterSchema {
+        ImporterSchema::new(
+            vec![
+                DiscoveryField::new("id", DiscoveryFieldType::Keyword, true).searchable(2),
+                DiscoveryField::new("title", DiscoveryFieldType::Text, true)
+                    .searchable(3)
+                    .snippet(),
+                DiscoveryField::new("tags", DiscoveryFieldType::KeywordList, true)
+                    .searchable(2)
+                    .facetable(),
+            ],
+            vec![EdgeTypeSchema::directed(
+                "relationship",
+                "Test relationship",
+            )],
+        )
+        .with_input_media_types(["text/plain"])
+    }
+
     fn descriptor(capabilities: Vec<Capability>) -> ImporterDescriptor {
-        ImporterDescriptor::new("fake", "Fake", "1", capabilities)
+        ImporterDescriptor::new("fake", "Fake", "1", capabilities, test_schema())
+    }
+
+    fn one_node_result(document: SearchDocument) -> LoadResult {
+        let mut graph = VaultGraph::new();
+        graph.add_node(VaultNode {
+            id: "n1".into(),
+            meta: vault_data::NodeMeta {
+                source_id: "fixture".into(),
+                title: "Node one".into(),
+                tags: vec!["fixture".into()],
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        LoadResult {
+            graph,
+            search_documents: vec![document],
+            unresolved: Vec::new(),
+        }
+    }
+
+    fn valid_document() -> SearchDocument {
+        SearchDocument::new("n1")
+            .with("id", "n1")
+            .with("title", "Node one")
+            .with("tags", json!(["fixture"]))
+    }
+
+    #[test]
+    fn discovery_schema_rejects_missing_and_duplicate_core_fields() {
+        for missing in ["id", "title", "tags"] {
+            let mut schema = test_schema();
+            schema.fields.retain(|field| field.key != missing);
+            let error = schema.validate().unwrap_err().to_string();
+            assert!(
+                error.contains(&format!("required field \"{missing}\"")),
+                "{missing}: {error}"
+            );
+        }
+
+        let mut schema = test_schema();
+        schema.fields.push(schema.fields[0].clone());
+        let error = schema.validate().unwrap_err().to_string();
+        assert!(
+            error.contains("duplicate discovery field key \"id\""),
+            "{error}"
+        );
+
+        let mut schema = test_schema();
+        schema.fields.push(DiscoveryField::new(
+            "invalid key",
+            DiscoveryFieldType::Keyword,
+            false,
+        ));
+        let error = schema.validate().unwrap_err().to_string();
+        assert!(
+            error.contains("invalid discovery field key \"invalid key\""),
+            "{error}"
+        );
+
+        let mut schema = test_schema();
+        schema.fields.push(DiscoveryField::new(
+            "invalid-key",
+            DiscoveryFieldType::Keyword,
+            false,
+        ));
+        let error = schema.validate().unwrap_err().to_string();
+        assert!(
+            error.contains("invalid discovery field key \"invalid-key\""),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn discovery_schema_rejects_invalid_core_field_contracts() {
+        let mut schema = test_schema();
+        schema.field_mut("title").field_type = DiscoveryFieldType::Keyword;
+        schema.field_mut("title").snippet = false;
+        let error = schema.validate().unwrap_err().to_string();
+        assert!(
+            error.contains("field \"title\" must be required, searchable"),
+            "{error}"
+        );
+
+        let mut schema = test_schema();
+        schema.field_mut("tags").searchable = false;
+        let error = schema.validate().unwrap_err().to_string();
+        assert!(
+            error.contains("field \"tags\" must be required, searchable"),
+            "{error}"
+        );
+
+        let mut schema = test_schema();
+        schema.field_mut("id").default_value = Some(json!("default-id"));
+        let error = schema.validate().unwrap_err().to_string();
+        assert!(error.contains("and have no default"), "{error}");
+    }
+
+    #[test]
+    fn discovery_documents_reject_missing_undeclared_and_wrong_typed_fields() {
+        let schema = test_schema();
+
+        let missing = SearchDocument::new("n1")
+            .with("id", "n1")
+            .with("tags", json!([]));
+        let error = schema
+            .validate_result(&one_node_result(missing))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("missing required field \"title\""),
+            "{error}"
+        );
+
+        let undeclared = valid_document().with("secret", "must not be indexed");
+        let error = schema
+            .validate_result(&one_node_result(undeclared))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("emitted undeclared field \"secret\""),
+            "{error}"
+        );
+
+        let wrong_type = SearchDocument::new("n1")
+            .with("id", "n1")
+            .with("title", "Node one")
+            .with("tags", "fixture");
+        let error = schema
+            .validate_result(&one_node_result(wrong_type))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("invalid field \"tags\": expected KeywordList"),
+            "{error}"
+        );
+
+        let mut schema = test_schema();
+        let mut sensitive = DiscoveryField::new("secret", DiscoveryFieldType::Keyword, false);
+        sensitive.sensitive = true;
+        schema.fields.push(sensitive);
+        let error = schema
+            .validate_result(&one_node_result(
+                valid_document().with("secret", "must not enter discovery"),
+            ))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("emitted sensitive field \"secret\""),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn discovery_documents_must_be_one_to_one_with_graph_nodes() {
+        let schema = test_schema();
+        let mut result = one_node_result(valid_document());
+        result.search_documents.push(valid_document());
+        let error = schema.validate_result(&result).unwrap_err().to_string();
+        assert!(
+            error.contains("2 search documents for 1 graph nodes"),
+            "{error}"
+        );
+
+        let unknown = SearchDocument::new("unknown")
+            .with("id", "unknown")
+            .with("title", "Unknown")
+            .with("tags", json!([]));
+        let error = schema
+            .validate_result(&one_node_result(unknown))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("references unknown node \"unknown\""),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn discovery_documents_match_canonical_identity_title_and_tags() {
+        let schema = test_schema();
+
+        let mismatched_id = SearchDocument::new("n1")
+            .with("id", "another-id")
+            .with("title", "Node one")
+            .with("tags", json!(["fixture"]));
+        let error = schema
+            .validate_result(&one_node_result(mismatched_id))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("indexes mismatched id"), "{error}");
+
+        let mismatched_title = SearchDocument::new("n1")
+            .with("id", "n1")
+            .with("title", "Different title")
+            .with("tags", json!(["fixture"]));
+        let error = schema
+            .validate_result(&one_node_result(mismatched_title))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("canonical non-empty title"), "{error}");
+
+        let mismatched_tags = SearchDocument::new("n1")
+            .with("id", "n1")
+            .with("title", "Node one")
+            .with("tags", json!(["different"]));
+        let error = schema
+            .validate_result(&one_node_result(mismatched_tags))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("canonical tags"), "{error}");
+    }
+
+    trait FieldMut {
+        fn field_mut(&mut self, key: &str) -> &mut DiscoveryField;
+    }
+
+    impl FieldMut for ImporterSchema {
+        fn field_mut(&mut self, key: &str) -> &mut DiscoveryField {
+            self.fields
+                .iter_mut()
+                .find(|field| field.key == key)
+                .expect("test field")
+        }
     }
 
     #[test]
@@ -623,14 +1507,29 @@ mod importer_tests {
         fn map(&self, records: Vec<DecodedRecord>) -> Result<LoadResult, ImportError> {
             self.trace.lock().unwrap().push("map".into());
             let mut graph = VaultGraph::new();
+            let mut search_documents = Vec::new();
             for record in records {
+                let id = record.origin;
                 graph.add_node(VaultNode {
-                    id: record.origin,
+                    id: id.clone(),
+                    meta: vault_data::NodeMeta {
+                        source_id: "fake".into(),
+                        title: id.clone(),
+                        tags: Vec::new(),
+                        ..Default::default()
+                    },
                     ..Default::default()
                 });
+                search_documents.push(
+                    SearchDocument::new(&id)
+                        .with("id", id.clone())
+                        .with("title", id)
+                        .with("tags", serde_json::json!([])),
+                );
             }
             Ok(LoadResult {
                 graph,
+                search_documents,
                 unresolved: Vec::new(),
             })
         }
@@ -711,6 +1610,76 @@ mod importer_tests {
     }
 
     #[tokio::test]
+    async fn pipeline_rejects_undeclared_media_type_before_decoding() {
+        let trace = Trace::default();
+        let mut unsupported = record("payload.json", "{}");
+        unsupported.content_type = "application/json".into();
+        let pipeline = pipeline(&trace, vec![unsupported], None).unwrap();
+
+        let error = pipeline.run().await.unwrap_err();
+
+        assert_eq!(
+            error,
+            ImportError::UnsupportedMediaType {
+                origin: "payload.json".into(),
+                content_type: "application/json".into(),
+                accepted: vec!["text/plain".into()],
+            }
+        );
+        assert_eq!(*trace.lock().unwrap(), ["read"]);
+    }
+
+    #[test]
+    fn pipeline_requires_an_input_media_type_declaration() {
+        let trace = Trace::default();
+        let read = capability(Effect::Read, "fixture");
+        let mut descriptor = descriptor(vec![read]);
+        descriptor.schema.input_media_types.clear();
+
+        let result = ImportPipeline::new(
+            descriptor,
+            Box::new(FakeConnector {
+                trace: trace.clone(),
+                scope: "fixture".into(),
+                records: Vec::new(),
+                error: None,
+            }),
+            Box::new(FakeDecoder {
+                trace: trace.clone(),
+                fail_at: None,
+            }),
+            Box::new(FakeMapper { trace }),
+        );
+
+        let Err(error) = result else {
+            panic!("pipeline without an input media type must be rejected")
+        };
+        assert_eq!(
+            error,
+            ImportError::InvalidDescriptor {
+                message: "connector-backed importer must declare at least one input media type"
+                    .into(),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn pipeline_accepts_case_insensitive_media_type_with_parameters() {
+        let trace = Trace::default();
+        let mut parameterized = record("payload.txt", "one");
+        parameterized.content_type = "Text/Plain; charset=utf-8".into();
+        let pipeline = pipeline(&trace, vec![parameterized], None).unwrap();
+
+        let loaded = pipeline.run().await.unwrap();
+
+        assert_eq!(loaded.graph.node_count(), 1);
+        assert_eq!(
+            *trace.lock().unwrap(),
+            ["read", "decode:payload.txt", "map"]
+        );
+    }
+
+    #[tokio::test]
     async fn missing_exact_grant_denies_before_source_effect() {
         let trace = Trace::default();
         let pipeline = pipeline(&trace, vec![record("a", "one")], None).unwrap();
@@ -786,9 +1755,14 @@ mod importer_tests {
             "legacy"
         }
 
+        fn schema(&self) -> ImporterSchema {
+            test_schema()
+        }
+
         fn load(&self) -> LoadResult {
             LoadResult {
                 graph: VaultGraph::new(),
+                search_documents: Vec::new(),
                 unresolved: vec!["legacy diagnostic".into()],
             }
         }

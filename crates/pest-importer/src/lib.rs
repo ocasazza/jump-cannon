@@ -33,8 +33,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use data_loader::{
-    Capability, Effect, ImportError as PipelineError, ImportFuture, Importer, ImporterDescriptor,
-    LoadResult, Loader, Transport, WatchPlan,
+    Capability, DiscoveryField, DiscoveryFieldType, EdgeTypeSchema, Effect,
+    ImportError as PipelineError, ImportFuture, Importer, ImporterDescriptor, ImporterSchema,
+    LoadResult, Loader, SearchDocument, Transport, WatchPlan,
 };
 use pest::iterators::Pair;
 use pest_meta::ast::RuleType;
@@ -46,7 +47,7 @@ use thiserror::Error;
 use vault_data::{NodeMeta, NodeMetrics, VaultEdge, VaultGraph, VaultNode};
 
 /// Importer package format understood by this crate.
-pub const FORMAT_VERSION: u32 = 1;
+pub const FORMAT_VERSION: u32 = 2;
 
 /// Maximum limits accepted from an importer package.
 ///
@@ -72,9 +73,20 @@ pub struct ImporterManifest {
     pub parser: ParserConfig,
     /// Semantic names in the Pest parse tree.
     pub captures: CaptureRules,
+    /// Explicit allowlist of package-specific discovery fields. Canonical
+    /// id/title/tags/path/type fields are supplied by the host automatically.
+    pub schema: PackageSchema,
     /// Per-package limits, bounded by [HARD_LIMITS].
     #[serde(default)]
     pub limits: Limits,
+}
+
+/// Package-specific searchable/facetable string properties.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PackageSchema {
+    #[serde(default)]
+    pub fields: Vec<DiscoveryField>,
 }
 
 /// Identity and release metadata for an importer package.
@@ -380,10 +392,39 @@ impl ValidatedPackage {
             }
         }
 
+        let search_documents = mapped
+            .graph
+            .nodes
+            .values()
+            .map(|node| self.search_document(node))
+            .collect();
+
         Ok(LoadResult {
             graph: mapped.graph,
+            search_documents,
             unresolved,
         })
+    }
+
+    fn search_document(&self, node: &VaultNode) -> SearchDocument {
+        let mut document = SearchDocument::new(&node.id)
+            .with("id", node.id.clone())
+            .with("title", node.meta.title.clone())
+            .with("tags", serde_json::json!(node.meta.tags))
+            .with("path", node.meta.path.clone());
+        if let Some(kind) = &node.meta.doctype {
+            document.insert("type", kind.clone());
+        }
+        for field in &self.manifest.schema.fields {
+            if let Some(value) = node.meta.frontmatter.get(&field.key) {
+                let keep = field.field_type == DiscoveryFieldType::Text
+                    || value.as_str().is_some_and(|value| !value.trim().is_empty());
+                if keep {
+                    document.insert(&field.key, value.clone());
+                }
+            }
+        }
+        document
     }
 
     fn collect_records<'i, 'r>(
@@ -446,6 +487,8 @@ impl ValidatedPackage {
         }
 
         let title = fields.title.unwrap_or_else(|| id.clone());
+        fields.tags.sort();
+        fields.tags.dedup();
         let meta = NodeMeta {
             source_id: self.manifest.metadata.id.clone(),
             title,
@@ -647,9 +690,14 @@ impl Loader for FilesystemLoader {
         &self.package.manifest.metadata.name
     }
 
+    fn schema(&self) -> ImporterSchema {
+        pest_schema(self.package.manifest.schema.fields.clone())
+    }
+
     fn load(&self) -> LoadResult {
         self.load_checked().unwrap_or_else(|error| LoadResult {
             graph: VaultGraph::new(),
+            search_documents: Vec::new(),
             unresolved: vec![format!(
                 "importer '{}' failed: {error}",
                 self.package.manifest.metadata.id
@@ -699,6 +747,7 @@ impl Importer for FilesystemImporter {
             &metadata.name,
             &metadata.version,
             vec![read, watch],
+            pest_schema(self.loader.package.manifest.schema.fields.clone()),
         )
         .with_watch(WatchPlan::Filesystem {
             root: self.loader.input_path.clone(),
@@ -745,6 +794,7 @@ fn validate_manifest(
 
     validate_metadata(&manifest.metadata)?;
     validate_limits(manifest.limits)?;
+    validate_package_schema(&manifest.schema)?;
 
     if manifest_source_bytes > manifest.limits.manifest_bytes {
         return Err(ImportError::ManifestTooLarge {
@@ -825,6 +875,64 @@ fn validate_limits(limits: Limits) -> Result<(), ImportError> {
         }
     }
     Ok(())
+}
+
+fn validate_package_schema(schema: &PackageSchema) -> Result<(), ImportError> {
+    const CORE_KEYS: &[&str] = &["id", "title", "tags", "path", "type"];
+    for field in &schema.fields {
+        if CORE_KEYS.contains(&field.key.as_str()) {
+            return Err(ImportError::InvalidMetadata(format!(
+                "schema field {:?} collides with a canonical field",
+                field.key
+            )));
+        }
+        if !matches!(
+            field.field_type,
+            DiscoveryFieldType::Text
+                | DiscoveryFieldType::Keyword
+                | DiscoveryFieldType::Date
+                | DiscoveryFieldType::Url
+        ) {
+            return Err(ImportError::InvalidMetadata(format!(
+                "Pest property field {:?} must be text, keyword, date, or url",
+                field.key
+            )));
+        }
+        if field.sensitive {
+            return Err(ImportError::InvalidMetadata(format!(
+                "sensitive property {:?} must not enter the discovery schema",
+                field.key
+            )));
+        }
+    }
+    pest_schema(schema.fields.clone())
+        .validate()
+        .map_err(|error| ImportError::InvalidMetadata(error.to_string()))
+}
+
+fn pest_schema(package_fields: Vec<DiscoveryField>) -> ImporterSchema {
+    let mut fields = vec![
+        DiscoveryField::new("id", DiscoveryFieldType::Keyword, true).searchable(2),
+        DiscoveryField::new("title", DiscoveryFieldType::Text, true)
+            .searchable(4)
+            .snippet(),
+        DiscoveryField::new("tags", DiscoveryFieldType::KeywordList, true)
+            .searchable(3)
+            .facetable(),
+        DiscoveryField::new("path", DiscoveryFieldType::Keyword, true).searchable(2),
+        DiscoveryField::new("type", DiscoveryFieldType::Keyword, false)
+            .searchable(2)
+            .facetable(),
+    ];
+    fields.extend(package_fields);
+    ImporterSchema::new(
+        fields,
+        vec![EdgeTypeSchema::directed(
+            "declared",
+            "Directed edge emitted by the package capture map",
+        )],
+    )
+    .with_input_media_types(["text/plain"])
 }
 
 fn validate_rule_bindings(
@@ -948,7 +1056,7 @@ atom = _{ (!("," | ";" | "=" | "|" | NEWLINE) ~ ANY)+ }
 
     fn manifest(extra_limits: &str) -> String {
         format!(
-            r#"format_version = 1
+            r#"format_version = 2
 
 [metadata]
 id = "example.line-graph"
@@ -972,6 +1080,27 @@ value = "value"
 edge = "edge"
 source = "source"
 target = "target"
+
+[[schema.fields]]
+key = "owner"
+field_type = "keyword"
+required = false
+searchable = true
+facetable = true
+
+[[schema.fields]]
+key = "zone"
+field_type = "keyword"
+required = false
+searchable = true
+facetable = true
+
+[[schema.fields]]
+key = "state"
+field_type = "keyword"
+required = false
+searchable = true
+facetable = true
 {extra_limits}
 "#
         )
@@ -992,7 +1121,7 @@ target = "target"
 
     #[test]
     fn rejects_unknown_format_and_bad_grammar() {
-        let unknown = manifest("").replacen("format_version = 1", "format_version = 2", 1);
+        let unknown = manifest("").replacen("format_version = 2", "format_version = 3", 1);
         assert!(matches!(
             ValidatedPackage::from_toml(&unknown),
             Err(ImportError::UnsupportedFormatVersion { .. })
@@ -1002,6 +1131,18 @@ target = "target"
         assert!(matches!(
             ValidatedPackage::from_toml(&bad),
             Err(ImportError::Grammar(_))
+        ));
+    }
+
+    #[test]
+    fn rejects_v1_packages_that_do_not_declare_search_schema() {
+        let v1 = manifest("").replacen("format_version = 2", "format_version = 1", 1);
+        assert!(matches!(
+            ValidatedPackage::from_toml(&v1),
+            Err(ImportError::UnsupportedFormatVersion {
+                found: 1,
+                supported: FORMAT_VERSION
+            })
         ));
     }
 
@@ -1030,7 +1171,7 @@ target = "target"
         let n1 = result.graph.nodes.get("n1").expect("n1");
         assert_eq!(n1.meta.title, "Alpha");
         assert_eq!(n1.meta.doctype.as_deref(), Some("service"));
-        assert_eq!(n1.meta.tags, vec!["red".to_owned(), "prod".to_owned()]);
+        assert_eq!(n1.meta.tags, vec!["prod".to_owned(), "red".to_owned()]);
         assert_eq!(n1.meta.path, "n1");
         assert_eq!(
             n1.meta.frontmatter["owner"],
@@ -1041,6 +1182,30 @@ target = "target"
         let edge = &result.graph.edges[0];
         assert_eq!(edge.source, "n1");
         assert_eq!(edge.target, "n2");
+
+        let schema = pest_schema(package().manifest().schema.fields.clone());
+        schema.validate_result(&result).unwrap();
+    }
+
+    #[test]
+    fn undeclared_properties_remain_metadata_but_never_enter_search_documents() {
+        let package = package();
+        let result = package
+            .parse_input("N|n1|Alpha|service|prod|owner=platform;private=secret")
+            .unwrap();
+        let node = &result.graph.nodes["n1"];
+        let document = &result.search_documents[0];
+
+        assert_eq!(node.meta.frontmatter["private"], "secret");
+        assert_eq!(document.fields["owner"], "platform");
+        assert!(!document.fields.contains_key("private"));
+        assert!(!document
+            .fields
+            .values()
+            .any(|value| value.as_str() == Some("secret")));
+        pest_schema(package.manifest().schema.fields.clone())
+            .validate_result(&result)
+            .unwrap();
     }
 
     #[test]
@@ -1128,7 +1293,17 @@ target = "target"
 
         assert_eq!(loader.name(), "Line graph");
         assert_eq!(loader.root_path(), Some(&path));
-        assert_eq!(loader.load().graph.node_count(), 1);
+        let schema = loader.schema();
+        assert!(schema.field("owner").unwrap().searchable);
+        assert!(schema.field("zone").unwrap().facetable);
+        let result = loader.load();
+        assert_eq!(result.graph.node_count(), 1);
+        schema.validate_result(&result).unwrap();
+
+        let importer = FilesystemImporter::new(package(), &path);
+        let descriptor = importer.descriptor();
+        descriptor.validate().unwrap();
+        assert_eq!(descriptor.schema, schema);
     }
 
     #[test]

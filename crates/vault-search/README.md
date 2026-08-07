@@ -4,10 +4,19 @@ Standalone HTTP full-text search backend for an Obsidian vault, backed by
 [Tantivy](https://github.com/quickwit-oss/tantivy) (Lucene-class FTS in
 Rust).
 
-Designed as a reusable component: any of the `vault-*` visualization or
-analysis tools can spawn a `vault-search` instance (or hit a long-lived
-one) and offload search off the main UI thread instead of each tool
-re-implementing it.
+> **Compatibility component:** graph-api no longer spawns or queries this
+> process. Active Jump Cannon search is a source-neutral, in-memory Tantivy
+> index built inside each `GraphSnapshot` from the selected importer's
+> mandatory discovery schema and validated `SearchDocument` records. That
+> keeps the graph, schema, search results, and filter facets on one atomic
+> revision and exposes the contract through `GET /graph/schema`. This binary
+> remains available only for consumers that specifically need its standalone,
+> Obsidian-filesystem HTTP API and disk cache.
+
+Independent tools can still spawn a `vault-search` instance (or hit a
+long-lived one) when they intentionally want this legacy Obsidian-specific
+contract. Its fixed fields, ID conventions, cache, and reindex lifecycle are
+not the importer discovery contract used by graph-api.
 
 ## Quick start
 

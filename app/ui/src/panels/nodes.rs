@@ -3,17 +3,18 @@
 //! One input, three result surfaces (replaces the old separate Nodes +
 //! Search panels):
 //!   * empty query — the plain node list, titles only
-//!   * typed query — **Files**: client-side fuzzy match over node ids with
-//!     the matched characters highlighted; **Content**: full-text hits from
-//!     `/search/rich` with the matching body region highlighted (Tantivy
-//!     snippet `<b>` tags)
+//!   * typed query — **Identifiers**: client-side fuzzy match over node ids
+//!     with the matched characters highlighted; **Indexed**: importer-defined
+//!     search hits from `/search/rich`, with highlights when the importer
+//!     declares a snippet-capable field
 //!   * **Filters**: field values from the meta_summary index that match the
 //!     query surface as toggle chips — the bridge from free-text search into
 //!     the Filter panel's query model (`panels::filter::QUERY` + `sync_gpu`),
 //!     so a search can be promoted into a live canvas filter.
 //!
-//! Content hits double as canvas highlights via `ctx.results` (same path the
-//! old Search panel used).
+//! Indexed hits double as canvas highlights via `ctx.results` (same path the
+//! old Search panel used). The active importer's searchable keys come from
+//! `/graph/schema`; query failures are shown rather than treated as no hits.
 
 use dioxus::prelude::*;
 use panel_kit::Spinner;
@@ -21,20 +22,32 @@ use panel_kit::Spinner;
 use crate::panels::filter;
 use crate::{api, Ctx};
 
-/// Rich content hits for the current query (display list only — the id set
+/// Rich indexed hits for the current query (display list only — the id set
 /// for canvas highlighting lives on `ctx.results`).
 static RICH: GlobalSignal<Vec<api::RichHit>> = Signal::global(Vec::new);
+/// Active importer's discovery contract, fetched once per hosted graph.
+static SEARCH_SCHEMA: GlobalSignal<Option<Result<api::GraphSchema, String>>> =
+    Signal::global(|| None);
+static SEARCH_SCHEMA_STARTED: GlobalSignal<bool> = Signal::global(|| false);
+static SEARCH_SCHEMA_SESSION: GlobalSignal<u64> = Signal::global(|| 0);
+/// Last server-side query error. Invalid field-qualified queries are user
+/// input errors, not empty result sets, so keep them visible beside results.
+static SEARCH_ERROR: GlobalSignal<Option<String>> = Signal::global(|| None);
 /// Debounce generation — a keystroke invalidates older in-flight searches.
 static GEN: GlobalSignal<u32> = Signal::global(|| 0);
 
 const DEBOUNCE_MS: u32 = 250;
-const FILE_CAP: usize = 40;
+const ID_CAP: usize = 40;
 const LIST_CAP: usize = 300;
 const SUGGESTION_CAP: usize = 8;
 
 pub(crate) fn reset_for_graph_session() {
     *GEN.write() = GEN.peek().wrapping_add(1);
     RICH.write().clear();
+    *SEARCH_ERROR.write() = None;
+    *SEARCH_SCHEMA_SESSION.write() = SEARCH_SCHEMA_SESSION.peek().wrapping_add(1);
+    *SEARCH_SCHEMA_STARTED.write() = false;
+    *SEARCH_SCHEMA.write() = None;
 }
 
 // --- fuzzy matching -----------------------------------------------------------
@@ -101,6 +114,24 @@ fn highlight_positions(hay: &str, positions: &[usize]) -> String {
 
 // --- search dispatch ------------------------------------------------------------
 
+fn ensure_search_schema(ctx: Ctx) {
+    if !ctx.graph_session.peek().is_server_backed() || *SEARCH_SCHEMA_STARTED.peek() {
+        return;
+    }
+    *SEARCH_SCHEMA_STARTED.write() = true;
+    let session = *SEARCH_SCHEMA_SESSION.peek();
+    spawn(async move {
+        let fetched = api::graph_schema().await;
+        if *SEARCH_SCHEMA_SESSION.peek() != session {
+            return;
+        }
+        if let Err(error) = &fetched {
+            tracing::warn!("[nodes] graph schema fetch failed: {error}");
+        }
+        *SEARCH_SCHEMA.write() = Some(fetched);
+    });
+}
+
 fn run_search(ctx: Ctx) {
     let Ctx {
         mut results,
@@ -111,9 +142,17 @@ fn run_search(ctx: Ctx) {
         ..
     } = ctx;
     let q = query.peek().trim().to_string();
+    *SEARCH_ERROR.write() = None;
     let gen = *GEN.peek();
     let session = graph_session.peek().clone();
     if !session.is_server_backed() {
+        RICH.write().clear();
+        results.set(Vec::new());
+        result_total.set(0);
+        searching.set(false);
+        return;
+    }
+    if q.is_empty() {
         RICH.write().clear();
         results.set(Vec::new());
         result_total.set(0);
@@ -124,12 +163,6 @@ fn run_search(ctx: Ctx) {
         gloo_timers::future::TimeoutFuture::new(DEBOUNCE_MS).await;
         if *GEN.peek() != gen {
             return; // superseded by a newer keystroke
-        }
-        if q.is_empty() {
-            RICH.write().clear();
-            results.set(Vec::new());
-            result_total.set(0);
-            return;
         }
         searching.set(true);
         let response = api::search_rich(&q, 60).await;
@@ -142,10 +175,11 @@ fn run_search(ctx: Ctx) {
                 results.set(r.results.iter().map(|h| h.id.clone()).collect());
                 *RICH.write() = r.results;
             }
-            Err(_) => {
+            Err(error) => {
                 result_total.set(0);
                 results.set(Vec::new());
                 RICH.write().clear();
+                *SEARCH_ERROR.write() = Some(format!("search failed: {error}"));
             }
         }
         searching.set(false);
@@ -172,6 +206,12 @@ pub fn panel(ctx: Ctx) -> Element {
     let q = query.read().trim().to_string();
     let q_lower = q.to_lowercase();
     let server_backed = graph_session.read().is_server_backed();
+    if server_backed {
+        ensure_search_schema(ctx);
+    }
+    let schema = SEARCH_SCHEMA.read().clone();
+    let search_error = SEARCH_ERROR.read().clone();
+    let search_failed = search_error.is_some();
 
     // Filter-suggestion chips: meta_summary values containing the query.
     let suggestions: Vec<(String, String, usize, bool)> = if q.is_empty() || !server_backed {
@@ -204,8 +244,8 @@ pub fn panel(ctx: Ctx) -> Element {
         v
     };
 
-    // Files: fuzzy over node ids, best-first.
-    let files: Vec<(String, String)> = if q.is_empty() {
+    // Identifiers: fuzzy over node ids, best-first.
+    let identifiers: Vec<(String, String)> = if q.is_empty() {
         Vec::new()
     } else {
         let mut hits: Vec<(i32, &String, Vec<usize>)> = g
@@ -214,7 +254,7 @@ pub fn panel(ctx: Ctx) -> Element {
             .filter_map(|id| fuzzy_match(&q_lower, id).map(|(s, p)| (s, id, p)))
             .collect();
         hits.sort_by(|a, b| b.0.cmp(&a.0));
-        hits.truncate(FILE_CAP);
+        hits.truncate(ID_CAP);
         hits.into_iter()
             .map(|(_, id, p)| (id.clone(), highlight_positions(id, &p)))
             .collect()
@@ -227,7 +267,7 @@ pub fn panel(ctx: Ctx) -> Element {
         div { class: "browse",
             input {
                 class: "filter",
-                placeholder: "fuzzy files · full-text content · filters…",
+                placeholder: "fuzzy ids · indexed fields · filters…",
                 value: "{query}",
                 oninput: move |e| {
                     query.set(e.value());
@@ -237,11 +277,48 @@ pub fn panel(ctx: Ctx) -> Element {
                 },
             }
 
+            if server_backed {
+                match schema {
+                    Some(Ok(schema)) => rsx! {
+                        div {
+                            class: "search-schema",
+                            title: format!(
+                                "{} v{} · graph revision {}",
+                                schema.source.id,
+                                schema.source.version,
+                                schema.graph_revision,
+                            ),
+                            span { class: "search-schema-label", "{schema.source.name} search keys" }
+                            for field in schema.schema.fields.iter().filter(|field| field.searchable) {
+                                span {
+                                    key: "{field.key}",
+                                    class: "search-schema-key",
+                                    title: if field.facetable {
+                                        "field-qualified search; also available as a filter"
+                                    } else {
+                                        "field-qualified search"
+                                    },
+                                    "{field.key}:"
+                                }
+                            }
+                        }
+                    },
+                    Some(Err(error)) => rsx! {
+                        div { class: "browse-error", "search schema unavailable: {error}" }
+                    },
+                    None => rsx! {},
+                }
+            }
+
             if !server_backed {
                 div { class: "more",
-                    "Client-only graph: file-name matching works locally; content search, \
+                    "Client-only graph: node-id matching works locally; indexed search, \
                      metadata filters, and document lookup require a server-hosted graph."
                 }
+            }
+
+            if let Some(error) = search_error {
+                div { class: "browse-error", "{error}" }
             }
 
             if q.is_empty() {
@@ -296,11 +373,11 @@ pub fn panel(ctx: Ctx) -> Element {
                         }
                     }
 
-                    // Fuzzy file-name hits, matched characters highlighted.
-                    if !files.is_empty() {
-                        div { class: "browse-group", "files" }
+                    // Fuzzy node-id hits, matched characters highlighted.
+                    if !identifiers.is_empty() {
+                        div { class: "browse-group", "identifiers" }
                         nav { class: "queue",
-                            for (id , html) in files {
+                            for (id , html) in identifiers {
                                 {
                                     let active = selected.read().as_deref() == Some(id.as_str());
                                     let id_click = id.clone();
@@ -317,18 +394,18 @@ pub fn panel(ctx: Ctx) -> Element {
                         }
                     }
 
-                    // Full-text content hits with highlighted snippets.
+                    // Importer-indexed hits with optional highlighted snippets.
                     if server_backed {
                         div { class: "browse-group",
-                            "content"
+                            "indexed"
                             if *searching.read() {
                                 Spinner {}
                             } else {
                                 span { class: "sugg-count", " {rich.len()} shown · {total} total" }
                             }
                         }
-                        if rich.is_empty() && !*searching.read() {
-                            div { class: "more", "no content matches" }
+                        if rich.is_empty() && !*searching.read() && !search_failed {
+                            div { class: "more", "no indexed matches" }
                         }
                         nav { class: "queue",
                             for h in rich {

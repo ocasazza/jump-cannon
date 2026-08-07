@@ -12,6 +12,7 @@ pub mod browser;
 pub mod compute_broker;
 pub mod progress;
 pub mod proto;
+pub mod search_index;
 pub mod server;
 pub mod state;
 pub mod subprocess;

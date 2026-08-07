@@ -12,11 +12,12 @@ use prost::Message;
 use tower::ServiceExt; // for `oneshot`
 
 use data_loader::{
-    Capability, Effect, HostedImporter, ImportError, ImportFuture, Importer, ImporterDescriptor,
-    LoadResult, Loader, Transport,
+    Capability, ContentSchema, DiscoveryField, DiscoveryFieldType, EdgeTypeSchema, Effect,
+    HostedImporter, ImportError, ImportFuture, Importer, ImporterDescriptor, ImporterSchema,
+    LoadResult, Loader, SearchDocument, Transport,
 };
-use graph_api::proto::{Init, NodeMeta};
-use graph_api::state::GraphSnapshot;
+use graph_api::proto::{Init, MetaSummary, NodeMeta};
+use graph_api::state::{GraphSnapshot, SnapshotSource};
 use graph_api::AppState;
 use vault_data::{VaultEdge, VaultGraph, VaultNode};
 
@@ -24,16 +25,54 @@ use vault_data::{VaultEdge, VaultGraph, VaultNode};
 /// don't need a real data source.
 struct EmptyLoader;
 
+fn test_schema() -> ImporterSchema {
+    ImporterSchema::new(
+        vec![
+            DiscoveryField::new("id", DiscoveryFieldType::Keyword, true).searchable(2),
+            DiscoveryField::new("title", DiscoveryFieldType::Text, true).searchable(4),
+            DiscoveryField::new("tags", DiscoveryFieldType::KeywordList, true)
+                .searchable(2)
+                .facetable(),
+        ],
+        vec![EdgeTypeSchema::directed("reference", "test edge")],
+    )
+}
+
+fn load_result(mut graph: VaultGraph) -> LoadResult {
+    let search_documents = graph
+        .nodes
+        .values_mut()
+        .map(|node| {
+            if node.meta.source_id.is_empty() {
+                node.meta.source_id = "test".into();
+            }
+            if node.meta.title.is_empty() {
+                node.meta.title = node.id.clone();
+            }
+            SearchDocument::new(&node.id)
+                .with("id", node.id.clone())
+                .with("title", node.meta.title.clone())
+                .with("tags", serde_json::json!(node.meta.tags))
+        })
+        .collect();
+    LoadResult {
+        graph,
+        search_documents,
+        unresolved: Vec::new(),
+    }
+}
+
 impl Loader for EmptyLoader {
     fn name(&self) -> &str {
         "empty"
     }
 
+    fn schema(&self) -> ImporterSchema {
+        test_schema()
+    }
+
     fn load(&self) -> LoadResult {
-        LoadResult {
-            graph: VaultGraph::new(),
-            unresolved: Vec::new(),
-        }
+        load_result(VaultGraph::new())
     }
 }
 
@@ -52,21 +91,26 @@ impl Importer for DeclaredButUngrantedWrite {
                     "/tmp/jump-cannon-test-empty-vault",
                 ),
                 Capability::new(
+                    Effect::ContentRead,
+                    Transport::Filesystem,
+                    "/tmp/jump-cannon-test-empty-vault",
+                ),
+                Capability::new(
                     Effect::ContentWrite,
                     Transport::Filesystem,
                     "/tmp/jump-cannon-test-empty-vault",
                 ),
             ],
+            test_schema().with_content(ContentSchema {
+                readable: true,
+                writable: true,
+                media_types: vec!["text/markdown".into()],
+            }),
         )
     }
 
     fn import<'a>(&'a self) -> ImportFuture<'a, Result<LoadResult, ImportError>> {
-        Box::pin(async {
-            Ok(LoadResult {
-                graph: VaultGraph::new(),
-                unresolved: Vec::new(),
-            })
-        })
+        Box::pin(async { Ok(load_result(VaultGraph::new())) })
     }
 }
 
@@ -85,12 +129,12 @@ fn state_with_graph(graph: VaultGraph) -> AppState {
     AppState::new(
         std::path::PathBuf::from("/tmp/jump-cannon-test-empty-vault"),
         trust_test_importer(Box::new(EmptyLoader)),
-        graph,
-        None,
+        load_result(graph),
         None,
         graph_api::compute_broker::ComputeBroker::new(),
         Arc::new(graph_api::progress::ProgressLog::new()),
     )
+    .unwrap()
 }
 
 fn two_node_graph(prefix: &str) -> VaultGraph {
@@ -218,12 +262,12 @@ async fn declared_but_ungranted_content_write_is_forbidden() {
     let state = AppState::new(
         std::path::PathBuf::from("/tmp/jump-cannon-test-empty-vault"),
         importer,
-        VaultGraph::new(),
-        None,
+        load_result(VaultGraph::new()),
         None,
         graph_api::compute_broker::ComputeBroker::new(),
         Arc::new(graph_api::progress::ProgressLog::new()),
-    );
+    )
+    .unwrap();
     let app = graph_api::router(state);
     let body = serde_json::to_vec(&serde_json::json!({
         "path": "some/note",
@@ -294,10 +338,16 @@ async fn graph_endpoints_advertise_one_snapshot_revision() {
 async fn same_cardinality_snapshot_swap_changes_revision() {
     let state = state_with_graph(two_node_graph("before"));
     let first_revision = state.snapshot().revision;
-    state
-        .inner
-        .snapshot
-        .store(Arc::new(GraphSnapshot::build(two_node_graph("after"))));
+    let loaded = load_result(two_node_graph("after"));
+    state.inner.snapshot.store(Arc::new(
+        GraphSnapshot::build(
+            loaded.graph,
+            SnapshotSource::new("test", "Test", "1"),
+            test_schema(),
+            loaded.search_documents,
+        )
+        .unwrap(),
+    ));
     let second_revision = state.snapshot().revision;
     assert_ne!(first_revision, second_revision);
 
@@ -317,6 +367,107 @@ async fn same_cardinality_snapshot_swap_changes_revision() {
     assert_eq!(ids, ["after-a", "after-b"]);
 }
 
+#[tokio::test]
+async fn schema_search_and_facets_share_the_importer_contract() {
+    let mut graph = VaultGraph::new();
+    graph.add_node(VaultNode {
+        id: "schema-node".into(),
+        meta: vault_data::NodeMeta {
+            source_id: "test".into(),
+            title: "Opaque title".into(),
+            tags: vec!["revenue".into()],
+            ..Default::default()
+        },
+        ..Default::default()
+    });
+    let state = state_with_graph(graph);
+    let revision = state.snapshot().revision;
+    let app = graph_api::router(state);
+
+    let schema_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/graph/schema")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .expect("schema served");
+    assert_eq!(schema_response.status(), StatusCode::OK);
+    let schema: serde_json::Value = serde_json::from_slice(
+        &to_bytes(schema_response.into_body(), 1 << 20)
+            .await
+            .expect("schema body"),
+    )
+    .expect("schema json");
+    assert_eq!(schema["graph_revision"], revision);
+    assert_eq!(schema["source"]["id"], "empty");
+    assert_eq!(schema["schema"]["schema_version"], 1);
+    assert!(schema["schema"]["fields"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|field| field["key"] == "tags"
+            && field["searchable"] == true
+            && field["facetable"] == true));
+
+    let search_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/search/rich?q=tags%3Arevenue")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .expect("search served");
+    assert_eq!(search_response.status(), StatusCode::OK);
+    let search: serde_json::Value = serde_json::from_slice(
+        &to_bytes(search_response.into_body(), 1 << 20)
+            .await
+            .expect("search body"),
+    )
+    .expect("search json");
+    assert_eq!(search["total"], 1);
+    assert_eq!(search["results"][0]["id"], "schema-node");
+
+    let invalid_query = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/search/rich?q=secret%3Avalue")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .expect("invalid search served");
+    assert_eq!(invalid_query.status(), StatusCode::BAD_REQUEST);
+
+    let facets_response = app
+        .oneshot(
+            Request::builder()
+                .uri("/graph/meta_summary")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .expect("facets served");
+    assert_eq!(facets_response.status(), StatusCode::OK);
+    assert_eq!(response_revision(&facets_response), revision);
+    let facets = MetaSummary::decode(
+        to_bytes(facets_response.into_body(), 1 << 20)
+            .await
+            .expect("facets body")
+            .as_ref(),
+    )
+    .expect("decode facets");
+    assert_eq!(facets.fields, ["tags"]);
+    assert_eq!(facets.buckets.len(), 1);
+    assert_eq!(facets.buckets[0].value, "revenue");
+    assert_eq!(facets.buckets[0].node_idx, [0]);
+}
+
 /// Belt-and-braces: keep `AppState` constructable from outside the crate.
 /// If a future refactor makes `AppState::new` private, this test fails to
 /// compile and reminds us to ship a public test-only constructor instead
@@ -326,12 +477,12 @@ fn _state_constructor_is_public() -> AppState {
     AppState::new(
         std::path::PathBuf::new(),
         trust_test_importer(Box::new(EmptyLoader)),
-        VaultGraph::new(),
-        None,
+        load_result(VaultGraph::new()),
         None,
         graph_api::compute_broker::ComputeBroker::new(),
         Arc::new(graph_api::progress::ProgressLog::new()),
     )
+    .unwrap()
 }
 
 // Silence "unused import" if Arc ever becomes unused; keeps the test

@@ -76,6 +76,53 @@ pub fn list_markdown(root: &Path) -> Result<Vec<(String, PathBuf, u64)>> {
     Ok(out)
 }
 
+/// Strictly walk the vault for importer publication.
+///
+/// Unlike [`list_markdown`], this path rejects walk and metadata failures so a
+/// reload cannot publish a partial graph when part of the source is unreadable.
+pub fn try_list_markdown(root: &Path) -> Result<Vec<(String, PathBuf, u64)>> {
+    let root_metadata = root
+        .metadata()
+        .with_context(|| format!("read vault root metadata for {}", root.display()))?;
+    anyhow::ensure!(
+        root_metadata.is_dir(),
+        "vault root {} is not a directory",
+        root.display()
+    );
+    let mut out = Vec::new();
+    for entry in build_walker(root)? {
+        let entry = entry.with_context(|| format!("walk vault {}", root.display()))?;
+        let path = entry.path();
+        if path.extension().and_then(|s| s.to_str()) != Some("md") {
+            continue;
+        }
+        let metadata = path
+            .metadata()
+            .with_context(|| format!("read metadata for {}", path.display()))?;
+        if !metadata.is_file() {
+            continue;
+        }
+        let rel = path.strip_prefix(root).with_context(|| {
+            format!(
+                "markdown path {} is outside vault {}",
+                path.display(),
+                root.display()
+            )
+        })?;
+        let id = rel
+            .with_extension("")
+            .to_string_lossy()
+            .to_string()
+            .replace('\\', "/");
+        let mtime = metadata
+            .modified()
+            .with_context(|| format!("read modified time for {}", path.display()))
+            .map(systime_to_secs)?;
+        out.push((id, path.to_path_buf(), mtime));
+    }
+    Ok(out)
+}
+
 fn systime_to_secs(t: SystemTime) -> u64 {
     t.duration_since(SystemTime::UNIX_EPOCH)
         .map(|d| d.as_secs())

@@ -109,7 +109,7 @@ fn encode_id(id: &str) -> String {
 }
 
 /// GET with the browser HTTP cache bypassed. The graph buffers are live
-/// state, not assets: `/generate`, `/compute/soup`, and vault reloads swap
+/// state, not assets: `/generate`, `/compute/soup`, and importer reloads swap
 /// them mid-session, and a cached `/graph/edges` from a previous graph
 /// poisons every consistency check until it expires (the server once
 /// stamped them `immutable, max-age=1y` — WebKit took it at its word).
@@ -279,12 +279,12 @@ pub(crate) async fn revisioned_metric(name: &str) -> ApiResult<Revisioned<Vec<f3
     })
 }
 
-/// `/node/*id` — full per-node metadata + markdown body.
+/// `/node/*id` — full per-node metadata plus any readable source body.
 pub async fn node_meta(id: &str) -> ApiResult<proto::NodeMeta> {
     get_proto(&format!("/node/{}", encode_id(id))).await
 }
 
-/// `/search?q=…` — BM25 full-text search (vault-search) with title fallback.
+/// `/search?q=…` — importer-schema-driven search over the hosted graph.
 #[allow(dead_code)] // the node browser uses search_rich; kept for wire parity with the egui client
 pub async fn search(q: &str, limit: u32) -> ApiResult<proto::SearchResults> {
     get_proto(&format!(
@@ -314,13 +314,60 @@ pub struct RichResults {
     pub results: Vec<RichHit>,
 }
 
-/// `/search/rich?q=…` — full-text search with highlighted body snippets.
+/// `/search/rich?q=…` — importer-schema-driven search with snippets from
+/// fields the importer explicitly marks as snippet-capable.
 pub async fn search_rich(q: &str, limit: u32) -> ApiResult<RichResults> {
-    get_json(&format!(
-        "/search/rich?q={}&limit={limit}",
-        urlencoding::encode(q)
-    ))
-    .await
+    let path = format!("/search/rich?q={}&limit={limit}", urlencoding::encode(q));
+    let resp = get(&path).send().await.map_err(err)?;
+    if !resp.ok() {
+        let status = resp.status();
+        let detail = resp.text().await.unwrap_or_default();
+        let detail = detail.trim();
+        return Err(if detail.is_empty() {
+            format!("{path} -> HTTP {status}")
+        } else {
+            format!("{path} -> HTTP {status}: {detail}")
+        });
+    }
+    resp.json().await.map_err(err)
+}
+
+/// Minimal `/graph/schema` view used by the Nodes panel. Serde deliberately
+/// ignores the rest of the importer contract: this UI only needs the source
+/// identity and the fields callers may use in a search query.
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+pub struct GraphSchema {
+    #[serde(default)]
+    pub graph_revision: u64,
+    pub source: ImporterSource,
+    pub schema: DiscoverySchema,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+pub struct ImporterSource {
+    pub id: String,
+    pub name: String,
+    pub version: String,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Default)]
+pub struct DiscoverySchema {
+    #[serde(default)]
+    pub fields: Vec<DiscoveryField>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+pub struct DiscoveryField {
+    pub key: String,
+    #[serde(default)]
+    pub searchable: bool,
+    #[serde(default)]
+    pub facetable: bool,
+}
+
+/// `/graph/schema` — the active importer's versioned discovery contract.
+pub async fn graph_schema() -> ApiResult<GraphSchema> {
+    get_json("/graph/schema").await
 }
 
 // --- vault writes ---------------------------------------------------------------

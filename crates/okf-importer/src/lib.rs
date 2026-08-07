@@ -15,7 +15,8 @@ use std::{
 };
 
 use data_loader::{
-    Capability, Effect, ImportError, ImportFuture, Importer, ImporterDescriptor, LoadResult,
+    Capability, DiscoveryField, DiscoveryFieldType, EdgeTypeSchema, Effect, ImportError,
+    ImportFuture, Importer, ImporterDescriptor, ImporterSchema, LoadResult, SearchDocument,
     Transport, WatchPlan,
 };
 use percent_encoding::percent_decode_str;
@@ -351,6 +352,7 @@ impl OkfImporter {
             .collect();
         let mut graph = VaultGraph::new();
         let mut relations = Vec::with_capacity(concepts.len());
+        let mut search_documents = Vec::with_capacity(concepts.len());
 
         for concept in concepts {
             let ParsedConcept {
@@ -361,10 +363,22 @@ impl OkfImporter {
                 frontmatter,
                 source_resources,
                 links,
+                body,
                 mtime,
             } = concept;
             let node_id = self.node_id(&id);
             let folder = concept_folder(&id);
+            search_documents.push(okf_search_document(
+                &node_id,
+                &id,
+                &title,
+                &concept_type,
+                &tags,
+                &folder,
+                &body,
+                &frontmatter,
+                &source_resources,
+            ));
             graph
                 .try_add_node(VaultNode {
                     id: node_id,
@@ -465,7 +479,11 @@ impl OkfImporter {
         graph
             .validate()
             .map_err(|error| OkfError::Graph(error.to_string()))?;
-        Ok(LoadResult { graph, unresolved })
+        Ok(LoadResult {
+            graph,
+            search_documents,
+            unresolved,
+        })
     }
 
     fn push_edge(
@@ -525,6 +543,7 @@ impl Importer for OkfImporter {
                 Capability::new(Effect::Read, Transport::Filesystem, scope.clone()),
                 Capability::new(Effect::Watch, Transport::Filesystem, scope),
             ],
+            okf_schema(),
         )
         .with_watch(WatchPlan::Filesystem {
             root: self.root.clone(),
@@ -557,6 +576,7 @@ struct ParsedConcept {
     frontmatter: HashMap<String, serde_json::Value>,
     source_resources: Vec<String>,
     links: Vec<String>,
+    body: String,
     mtime: i64,
 }
 
@@ -607,21 +627,48 @@ fn parse_concept(id: &str, raw: String, mtime: i64) -> Result<ParsedConcept, Okf
             message: "frontmatter requires a non-empty string `type`".into(),
         })?
         .to_string();
+    if let Some(status) = mapping.get(serde_yaml::Value::String("status".into())) {
+        let Some(status) = status.as_str() else {
+            return Err(OkfError::InvalidConcept {
+                concept: id.into(),
+                message: "frontmatter `status` must be draft, stable, or deprecated".into(),
+            });
+        };
+        if !matches!(status, "draft" | "stable" | "deprecated") {
+            return Err(OkfError::InvalidConcept {
+                concept: id.into(),
+                message: "frontmatter `status` must be draft, stable, or deprecated".into(),
+            });
+        }
+    }
     let title = yaml_string(mapping, "title")
         .filter(|value| !value.trim().is_empty())
         .map(str::to_string)
         .unwrap_or_else(|| id.rsplit('/').next().unwrap_or(id).to_string());
-    let tags = mapping
-        .get(serde_yaml::Value::String("tags".into()))
-        .and_then(serde_yaml::Value::as_sequence)
-        .map(|items| {
-            items
-                .iter()
-                .filter_map(serde_yaml::Value::as_str)
-                .map(str::to_string)
-                .collect()
-        })
-        .unwrap_or_default();
+    let mut tags = match mapping.get(serde_yaml::Value::String("tags".into())) {
+        None => Vec::new(),
+        Some(serde_yaml::Value::Sequence(items)) => items
+            .iter()
+            .map(|item| {
+                item.as_str()
+                    .filter(|value| !value.trim().is_empty())
+                    .map(str::to_string)
+                    .ok_or_else(|| OkfError::InvalidConcept {
+                        concept: id.into(),
+                        message: "frontmatter `tags` must be a YAML list of non-empty strings"
+                            .into(),
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()?,
+        Some(_) => {
+            return Err(OkfError::InvalidConcept {
+                concept: id.into(),
+                message: "frontmatter `tags` must be a YAML list of strings".into(),
+            })
+        }
+    };
+    tags.sort();
+    tags.dedup();
     let mut source_resources = extract_source_resources(mapping);
     source_resources.sort();
     source_resources.dedup();
@@ -653,6 +700,7 @@ fn parse_concept(id: &str, raw: String, mtime: i64) -> Result<ParsedConcept, Okf
         frontmatter,
         source_resources,
         links,
+        body: body.to_string(),
         mtime,
     })
 }
@@ -671,8 +719,217 @@ fn extract_source_resources(mapping: &serde_yaml::Mapping) -> Vec<String> {
         .flatten()
         .filter_map(serde_yaml::Value::as_mapping)
         .filter_map(|source| yaml_string(source, "resource"))
+        .filter(|resource| !resource.trim().is_empty())
         .map(str::to_string)
         .collect()
+}
+
+fn okf_schema() -> ImporterSchema {
+    ImporterSchema::new(
+        vec![
+            DiscoveryField::new("id", DiscoveryFieldType::Keyword, true).searchable(2),
+            DiscoveryField::new("title", DiscoveryFieldType::Text, true)
+                .searchable(4)
+                .snippet(),
+            DiscoveryField::new("tags", DiscoveryFieldType::KeywordList, true)
+                .searchable(3)
+                .facetable(),
+            DiscoveryField::new("path", DiscoveryFieldType::Keyword, true).searchable(2),
+            DiscoveryField::new("type", DiscoveryFieldType::Keyword, true)
+                .searchable(3)
+                .facetable(),
+            DiscoveryField::new("folder", DiscoveryFieldType::Keyword, false)
+                .searchable(1)
+                .facetable(),
+            DiscoveryField::new("body", DiscoveryFieldType::Text, true)
+                .searchable(1)
+                .snippet(),
+            DiscoveryField::new("description", DiscoveryFieldType::Text, false)
+                .searchable(3)
+                .snippet(),
+            DiscoveryField::new("resource", DiscoveryFieldType::Url, false).searchable(2),
+            DiscoveryField::new("status", DiscoveryFieldType::Keyword, true)
+                .searchable(2)
+                .facetable()
+                .with_default("stable"),
+            DiscoveryField::new("stale_after", DiscoveryFieldType::Date, false)
+                .searchable(1)
+                .facetable(),
+            DiscoveryField::new("trust_tier", DiscoveryFieldType::Keyword, true)
+                .searchable(2)
+                .facetable(),
+            DiscoveryField::new("generated_by", DiscoveryFieldType::Keyword, false)
+                .searchable(1)
+                .facetable(),
+            DiscoveryField::new("generated_at", DiscoveryFieldType::Date, false).searchable(1),
+            DiscoveryField::new("verified_by", DiscoveryFieldType::KeywordList, false)
+                .searchable(2)
+                .facetable(),
+            DiscoveryField::new("source_resources", DiscoveryFieldType::KeywordList, false)
+                .searchable(2),
+            DiscoveryField::new("source_titles", DiscoveryFieldType::KeywordList, false)
+                .searchable(2),
+            DiscoveryField::new("source_authors", DiscoveryFieldType::KeywordList, false)
+                .searchable(1)
+                .facetable(),
+            DiscoveryField::new("runtime", DiscoveryFieldType::Keyword, false)
+                .searchable(2)
+                .facetable(),
+        ],
+        vec![EdgeTypeSchema::directed(
+            "relationship",
+            "Standard Markdown concept link or internal provenance reference",
+        )],
+    )
+    .with_input_media_types(["text/markdown"])
+}
+
+#[allow(clippy::too_many_arguments)]
+fn okf_search_document(
+    node_id: &str,
+    path: &str,
+    title: &str,
+    concept_type: &str,
+    tags: &[String],
+    folder: &str,
+    body: &str,
+    frontmatter: &HashMap<String, serde_json::Value>,
+    source_resources: &[String],
+) -> SearchDocument {
+    let mut document = SearchDocument::new(node_id)
+        .with("id", node_id)
+        .with("title", title)
+        .with("tags", serde_json::json!(tags))
+        .with("path", path)
+        .with("type", concept_type)
+        .with("body", body)
+        .with(
+            "status",
+            frontmatter
+                .get("status")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("stable"),
+        )
+        .with("trust_tier", okf_trust_tier(frontmatter));
+    if !folder.is_empty() {
+        document.insert("folder", folder);
+    }
+    for (key, output_key) in [
+        ("description", "description"),
+        ("resource", "resource"),
+        ("stale_after", "stale_after"),
+        ("runtime", "runtime"),
+    ] {
+        if let Some(value) = frontmatter
+            .get(key)
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+        {
+            document.insert(output_key, value);
+        }
+    }
+    if let Some(generated) = frontmatter
+        .get("generated")
+        .and_then(serde_json::Value::as_object)
+    {
+        if let Some(actor) = generated
+            .get("by")
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+        {
+            document.insert("generated_by", actor);
+        }
+        if let Some(at) = generated
+            .get("at")
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+        {
+            document.insert("generated_at", at);
+        }
+    }
+    let verified_by = okf_verified_actors(frontmatter);
+    if !verified_by.is_empty() {
+        document.insert("verified_by", serde_json::json!(verified_by));
+    }
+    if !source_resources.is_empty() {
+        document.insert("source_resources", serde_json::json!(source_resources));
+    }
+    let (source_titles, source_authors) = okf_source_discovery(frontmatter);
+    if !source_titles.is_empty() {
+        document.insert("source_titles", serde_json::json!(source_titles));
+    }
+    if !source_authors.is_empty() {
+        document.insert("source_authors", serde_json::json!(source_authors));
+    }
+    document
+}
+
+fn okf_verified_actors(frontmatter: &HashMap<String, serde_json::Value>) -> Vec<String> {
+    let Some(verified) = frontmatter.get("verified") else {
+        return Vec::new();
+    };
+    let entries: Vec<&serde_json::Map<String, serde_json::Value>> = match verified {
+        serde_json::Value::Object(entry) => vec![entry],
+        serde_json::Value::Array(entries) => entries
+            .iter()
+            .filter_map(serde_json::Value::as_object)
+            .collect(),
+        _ => Vec::new(),
+    };
+    let mut actors = entries
+        .into_iter()
+        .filter_map(|entry| entry.get("by").and_then(serde_json::Value::as_str))
+        .filter(|actor| !actor.trim().is_empty())
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    actors.sort();
+    actors.dedup();
+    actors
+}
+
+fn okf_trust_tier(frontmatter: &HashMap<String, serde_json::Value>) -> &'static str {
+    let actors = okf_verified_actors(frontmatter);
+    if actors.iter().any(|actor| actor.starts_with("human:")) {
+        "human-reviewed"
+    } else if actors.is_empty() {
+        "unverified"
+    } else {
+        "machine-confirmed"
+    }
+}
+
+fn okf_source_discovery(
+    frontmatter: &HashMap<String, serde_json::Value>,
+) -> (Vec<String>, Vec<String>) {
+    let mut titles = Vec::new();
+    let mut authors = Vec::new();
+    for source in frontmatter
+        .get("sources")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(serde_json::Value::as_object)
+    {
+        if let Some(title) = source
+            .get("title")
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+        {
+            titles.push(title.to_string());
+        }
+        if let Some(author) = source
+            .get("author")
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+        {
+            authors.push(author.to_string());
+        }
+    }
+    titles.sort();
+    titles.dedup();
+    authors.sort();
+    authors.dedup();
+    (titles, authors)
 }
 
 fn split_frontmatter(raw: &str) -> Option<(&str, &str)> {
@@ -1150,7 +1407,7 @@ sources:
         write(
             fixture.path(),
             "concepts/beta.md",
-            "---\ntype: table\ntags: finance, revenue\n---\n",
+            "---\ntype: table\ntags: [finance, revenue]\n---\n",
         );
         write(fixture.path(), "concepts/root.md", &concept("policy", ""));
         write(
@@ -1186,10 +1443,117 @@ sources:
         assert!(!alpha.content_readable);
         assert!(!alpha.content_writable);
         assert_eq!(alpha.frontmatter["extension"]["owner"], "platform");
-        assert!(result.graph.nodes["okf:fixture:concepts/beta"]
-            .meta
-            .tags
-            .is_empty());
+        assert_eq!(
+            result.graph.nodes["okf:fixture:concepts/beta"].meta.tags,
+            ["finance", "revenue"]
+        );
+    }
+
+    #[test]
+    fn okf_schema_exposes_search_keys_and_documents_with_stable_default() {
+        let fixture = TempDir::new().unwrap();
+        write(
+            fixture.path(),
+            "metrics/revenue.md",
+            r#"---
+type: metric
+title: Revenue
+tags: [finance, canonical]
+description: Net recognized revenue
+verified:
+  - by: human:reviewer
+sources:
+  - resource: https://example.com/source
+    title: Finance handbook
+    author: Finance team
+---
+Revenue body token.
+"#,
+        );
+        let importer = OkfImporter::new(fixture.path(), "fixture").unwrap();
+        let descriptor = importer.descriptor();
+        let result = importer.load_checked().unwrap();
+
+        descriptor.validate().unwrap();
+        descriptor.schema.validate_result(&result).unwrap();
+        let searchable = descriptor
+            .schema
+            .searchable_fields()
+            .map(|field| field.key.as_str())
+            .collect::<BTreeSet<_>>();
+        for required in [
+            "id",
+            "title",
+            "tags",
+            "type",
+            "body",
+            "description",
+            "status",
+            "trust_tier",
+            "verified_by",
+            "source_resources",
+            "source_titles",
+            "source_authors",
+        ] {
+            assert!(
+                searchable.contains(required),
+                "missing search key {required}"
+            );
+        }
+
+        let document = &result.search_documents[0];
+        assert_eq!(document.node_id, "okf:fixture:metrics/revenue");
+        assert_eq!(document.fields["status"], "stable");
+        assert_eq!(document.fields["trust_tier"], "human-reviewed");
+        assert_eq!(
+            document.fields["tags"],
+            serde_json::json!(["canonical", "finance"])
+        );
+        assert_eq!(
+            document.fields["verified_by"],
+            serde_json::json!(["human:reviewer"])
+        );
+        assert_eq!(
+            document.fields["source_titles"],
+            serde_json::json!(["Finance handbook"])
+        );
+        assert_eq!(
+            document.fields["source_authors"],
+            serde_json::json!(["Finance team"])
+        );
+        assert!(document.fields["body"]
+            .as_str()
+            .unwrap()
+            .contains("Revenue body token"));
+    }
+
+    #[test]
+    fn malformed_okf_tags_are_rejected_instead_of_silently_dropped() {
+        for (name, tags) in [
+            ("scalar", "tags: finance, revenue"),
+            ("non-string", "tags: [finance, 42]"),
+            ("empty", "tags: [finance, '']"),
+        ] {
+            let fixture = TempDir::new().unwrap();
+            write(
+                fixture.path(),
+                "bad.md",
+                &format!("---\ntype: metric\n{tags}\n---\n"),
+            );
+
+            let error = OkfImporter::new(fixture.path(), "fixture")
+                .unwrap()
+                .load_checked()
+                .unwrap_err();
+            assert!(
+                matches!(error, OkfError::InvalidConcept { .. }),
+                "{name}: {error}"
+            );
+            assert!(
+                error.to_string().contains("`tags` must be a YAML list"),
+                "{name}: {error}"
+            );
+        }
     }
 
     #[test]
@@ -1650,6 +2014,8 @@ type: source
         let descriptor = importer.descriptor();
         let canonical_root = fixture.path().canonicalize().unwrap();
         let scope = canonical_root.to_string_lossy().into_owned();
+
+        descriptor.validate().unwrap();
 
         assert_eq!(descriptor.id, "okf");
         assert_eq!(descriptor.version, "0.2");

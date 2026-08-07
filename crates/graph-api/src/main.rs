@@ -126,7 +126,7 @@ async fn main() -> anyhow::Result<()> {
         data_loader::SourceKind::Tvix => {
             let expr = if let Some(ref e) = args.tvix_expr {
                 e.clone()
-            } else if vault_root.extension().map_or(false, |ext| ext == "nix") {
+            } else if vault_root.extension().is_some_and(|ext| ext == "nix") {
                 std::fs::read_to_string(&vault_root).unwrap_or_else(|e| {
                     tracing::error!(path = %vault_root.display(), error = %e, "failed to read tvix expression file");
                     String::new()
@@ -239,33 +239,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Initial graph load — emit progress events so the bootstrap fetch
     // sees a populated /progress response on the first poll.
-    let graph = vault_loader::load_with_progress(&importer, Some(&progress)).await?;
-
-    // Spawn vault-search before binding so /search can proxy to it.
-    // Only for obsidian — tvix graphs have no filesystem to index.
-    let vault_search = if source_kind == data_loader::SourceKind::Obsidian {
-        let vault_search_id = progress.start("ingest", "Spawning vault-search");
-        match graph_api::subprocess::VaultSearch::spawn(&vault_root).await {
-            Ok(vs) => {
-                tracing::info!(port = vs.port, "vault-search subprocess up");
-                progress.finish(vault_search_id);
-                Some(std::sync::Arc::new(vs))
-            }
-            Err(e) => {
-                tracing::warn!(
-                    "vault-search unavailable: {e}; /search falls back to title-contains"
-                );
-                progress.fail(vault_search_id, format!("{e}"));
-                None
-            }
-        }
-    } else {
-        tracing::info!(
-            source = importer.descriptor().id,
-            "skipping vault-search (importer has no vault index)"
-        );
-        None
-    };
+    let loaded = vault_loader::load_with_progress(&importer, Some(&progress)).await?;
 
     if let Some(dir) = &args.assets_dir {
         tracing::info!(assets_dir = %dir.display(), "dev mode: serving assets from disk");
@@ -276,12 +250,11 @@ async fn main() -> anyhow::Result<()> {
     let state = AppState::new(
         vault_root.clone(),
         importer,
-        graph,
-        vault_search,
+        loaded,
         args.assets_dir,
         compute_broker.clone(),
         progress.clone(),
-    );
+    )?;
 
     if let Some(compute_url) = args.compute_url.clone() {
         let broker = compute_broker.clone();

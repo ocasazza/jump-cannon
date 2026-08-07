@@ -10,14 +10,14 @@
 
 use std::sync::Arc;
 
+use data_loader::LoadResult;
 use data_loader::{ImportError, Importer};
-use vault_data::VaultGraph;
 
 use crate::progress::ProgressLog;
 
 /// Load a graph through any [`Importer`], compute metrics, and seed initial
 /// positions. Convenience wrapper for callers that don't want a progress feed.
-pub async fn load(importer: &dyn Importer) -> Result<VaultGraph, ImportError> {
+pub async fn load(importer: &dyn Importer) -> Result<LoadResult, ImportError> {
     load_with_progress(importer, None).await
 }
 
@@ -27,7 +27,7 @@ pub async fn load(importer: &dyn Importer) -> Result<VaultGraph, ImportError> {
 pub async fn load_with_progress(
     importer: &dyn Importer,
     progress: Option<&Arc<ProgressLog>>,
-) -> Result<VaultGraph, ImportError> {
+) -> Result<LoadResult, ImportError> {
     let descriptor = importer.descriptor();
     let source_name = descriptor.id.as_str();
     tracing::info!(source = %source_name, "loading graph");
@@ -48,7 +48,12 @@ pub async fn load_with_progress(
             return Err(error);
         }
     };
-    let mut graph = result.graph;
+    descriptor.schema.validate_result(&result)?;
+    let data_loader::LoadResult {
+        mut graph,
+        search_documents,
+        unresolved,
+    } = result;
 
     if let Err(error) = graph.validate() {
         let error = ImportError::Map {
@@ -72,11 +77,11 @@ pub async fn load_with_progress(
         p.finish(id);
     }
 
-    if !result.unresolved.is_empty() {
+    if !unresolved.is_empty() {
         tracing::warn!(
             n_nodes = graph.node_count(),
             n_edges = graph.edge_count(),
-            unresolved = result.unresolved.len(),
+            unresolved = unresolved.len(),
             "graph loaded with unresolved references"
         );
     } else {
@@ -147,21 +152,46 @@ pub async fn load_with_progress(
         "metrics computed"
     );
 
-    Ok(graph)
+    Ok(LoadResult {
+        graph,
+        search_documents,
+        unresolved,
+    })
 }
 
 #[cfg(test)]
 mod tests {
-    use data_loader::{ImportFuture, ImporterDescriptor, LoadResult};
+    use data_loader::{
+        Capability, DiscoveryField, DiscoveryFieldType, EdgeTypeSchema, Effect, ImportFuture,
+        ImporterDescriptor, ImporterSchema, LoadResult, SearchDocument, Transport,
+    };
+    use vault_data::VaultGraph;
     use vault_data::{VaultEdge, VaultNode};
 
     use super::*;
 
     struct DanglingGraphImporter;
 
+    fn test_schema() -> ImporterSchema {
+        ImporterSchema::new(
+            vec![
+                DiscoveryField::new("id", DiscoveryFieldType::Keyword, true).searchable(2),
+                DiscoveryField::new("title", DiscoveryFieldType::Text, true).searchable(4),
+                DiscoveryField::new("tags", DiscoveryFieldType::KeywordList, true).searchable(2),
+            ],
+            vec![EdgeTypeSchema::directed("reference", "test edge")],
+        )
+    }
+
     impl Importer for DanglingGraphImporter {
         fn descriptor(&self) -> ImporterDescriptor {
-            ImporterDescriptor::new("dangling", "Dangling test graph", "1", Vec::new())
+            ImporterDescriptor::new(
+                "dangling",
+                "Dangling test graph",
+                "1",
+                vec![Capability::new(Effect::Read, Transport::InMemory, "test")],
+                test_schema(),
+            )
         }
 
         fn import<'a>(&'a self) -> ImportFuture<'a, Result<LoadResult, ImportError>> {
@@ -169,6 +199,11 @@ mod tests {
                 let mut graph = VaultGraph::new();
                 graph.add_node(VaultNode {
                     id: "present".into(),
+                    meta: vault_data::NodeMeta {
+                        source_id: "dangling".into(),
+                        title: "Present".into(),
+                        ..Default::default()
+                    },
                     ..Default::default()
                 });
                 graph.add_edge(VaultEdge {
@@ -177,6 +212,10 @@ mod tests {
                 });
                 Ok(LoadResult {
                     graph,
+                    search_documents: vec![SearchDocument::new("present")
+                        .with("id", "present")
+                        .with("title", "Present")
+                        .with("tags", serde_json::json!([]))],
                     unresolved: Vec::new(),
                 })
             })

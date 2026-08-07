@@ -552,7 +552,7 @@ fn App() -> Element {
         });
     }
 
-    // Poll the server progress log (vault reloads, search reindex, …).
+    // Poll the server progress log (import reloads, search reindex, …).
     {
         let mut tasks = ctx.tasks;
         let mut logs = ctx.logs;

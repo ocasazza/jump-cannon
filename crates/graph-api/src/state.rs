@@ -17,13 +17,32 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use arc_swap::{ArcSwap, ArcSwapOption};
-use data_loader::HostedImporter;
+use arc_swap::ArcSwap;
+use data_loader::{HostedImporter, ImportError, ImporterSchema, LoadResult, SearchDocument};
 use vault_data::VaultGraph;
 
 use crate::compute_broker::ComputeBroker;
 use crate::progress::ProgressLog;
-use crate::subprocess::VaultSearch;
+use crate::search_index::SearchIndex;
+
+/// Sanitized importer identity associated with one exact snapshot revision.
+/// Capability scopes stay in the host descriptor and are never exposed here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SnapshotSource {
+    pub id: String,
+    pub name: String,
+    pub version: String,
+}
+
+impl SnapshotSource {
+    pub fn new(id: impl Into<String>, name: impl Into<String>, version: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
+            name: name.into(),
+            version: version.into(),
+        }
+    }
+}
 
 /// Everything derived from the on-disk vault. Built by
 /// [`GraphSnapshot::build`] and swapped in atomically by the watcher
@@ -35,6 +54,13 @@ pub struct GraphSnapshot {
     /// can prove that they belong to the same snapshot.
     pub revision: u64,
     pub graph: VaultGraph,
+    /// Sanitized identity of the source that produced this exact graph.
+    pub source: SnapshotSource,
+    /// Importer-owned discovery schema associated with this exact revision.
+    pub schema: ImporterSchema,
+    /// Full-text index built from validated importer documents before the
+    /// snapshot becomes visible.
+    pub search_index: SearchIndex,
     /// id (relative path, vault-links convention) -> dense index used for
     /// the binary buffer routes.
     pub id_to_idx: HashMap<String, u32>,
@@ -51,8 +77,21 @@ pub struct GraphSnapshot {
 impl GraphSnapshot {
     /// Build a fresh snapshot from a loaded `VaultGraph`. Recomputes all
     /// derived caches (id_to_idx, idx_to_id, binary buffers).
-    pub fn build(graph: VaultGraph) -> Self {
+    pub fn build(
+        graph: VaultGraph,
+        source: SnapshotSource,
+        schema: ImporterSchema,
+        search_documents: Vec<SearchDocument>,
+    ) -> Result<Self, ImportError> {
         static NEXT_REVISION: AtomicU64 = AtomicU64::new(1);
+        schema.validate_output(&graph, &search_documents)?;
+        graph.validate().map_err(|error| ImportError::Map {
+            message: format!("invalid graph snapshot: {error}"),
+        })?;
+        let search_index =
+            SearchIndex::build(&schema, &search_documents).map_err(|error| ImportError::Map {
+                message: format!("build discovery index: {error:#}"),
+            })?;
         let revision = NEXT_REVISION.fetch_add(1, Ordering::Relaxed);
         assert_ne!(revision, 0, "graph revision counter exhausted");
 
@@ -88,16 +127,23 @@ impl GraphSnapshot {
         }
         binary_cache.insert(
             "meta_summary".into(),
-            Arc::from(crate::server::build_meta_summary_bytes(&graph)),
+            Arc::from(crate::server::build_meta_summary_bytes(
+                &graph,
+                &schema,
+                &search_documents,
+            )?),
         );
 
-        Self {
+        Ok(Self {
             revision,
             graph,
+            source,
+            schema,
+            search_index,
             id_to_idx,
             idx_to_id,
             binary_cache,
-        }
+        })
     }
 }
 
@@ -115,9 +161,6 @@ pub struct AppStateInner {
     /// Atomically swappable graph + derived caches. The watcher task
     /// publishes new snapshots after each vault reload.
     pub snapshot: ArcSwap<GraphSnapshot>,
-    /// Optional vault-search subprocess. Swappable so reloads can drop
-    /// the old child + respawn against the rebuilt index.
-    pub vault_search: ArcSwapOption<VaultSearch>,
     /// When `Some`, /assets/* and / are read from this directory at request
     /// time (dev mode: edit JS/CSS/HTML, refresh browser, no rebuild).
     pub assets_dir: Option<PathBuf>,
@@ -134,24 +177,29 @@ impl AppState {
     pub fn new(
         vault_root: PathBuf,
         importer: HostedImporter,
-        graph: VaultGraph,
-        vault_search: Option<Arc<VaultSearch>>,
+        loaded: LoadResult,
         assets_dir: Option<PathBuf>,
         compute_broker: ComputeBroker,
         progress: Arc<ProgressLog>,
-    ) -> Self {
-        let snapshot = GraphSnapshot::build(graph);
-        Self {
+    ) -> Result<Self, ImportError> {
+        let descriptor = importer.descriptor();
+        let source = SnapshotSource::new(&descriptor.id, &descriptor.name, &descriptor.version);
+        let snapshot = GraphSnapshot::build(
+            loaded.graph,
+            source,
+            descriptor.schema,
+            loaded.search_documents,
+        )?;
+        Ok(Self {
             inner: Arc::new(AppStateInner {
                 vault_root,
                 importer,
                 snapshot: ArcSwap::new(Arc::new(snapshot)),
-                vault_search: ArcSwapOption::new(vault_search),
                 assets_dir,
                 compute_broker,
                 progress,
             }),
-        }
+        })
     }
 
     /// Single atomic load of the current snapshot. Hold the returned
@@ -169,10 +217,36 @@ mod tests {
 
     #[test]
     fn rebuilt_snapshots_receive_distinct_nonzero_revisions() {
-        let first = GraphSnapshot::build(VaultGraph::default());
-        let second = GraphSnapshot::build(VaultGraph::default());
+        let schema = test_schema();
+        let first = GraphSnapshot::build(
+            VaultGraph::default(),
+            SnapshotSource::new("test", "Test", "1"),
+            schema.clone(),
+            Vec::new(),
+        )
+        .unwrap();
+        let second = GraphSnapshot::build(
+            VaultGraph::default(),
+            SnapshotSource::new("test", "Test", "1"),
+            schema,
+            Vec::new(),
+        )
+        .unwrap();
         assert_ne!(first.revision, 0);
         assert_ne!(second.revision, 0);
         assert_ne!(first.revision, second.revision);
+    }
+
+    fn test_schema() -> ImporterSchema {
+        use data_loader::{DiscoveryField, DiscoveryFieldType, EdgeTypeSchema};
+
+        ImporterSchema::new(
+            vec![
+                DiscoveryField::new("id", DiscoveryFieldType::Keyword, true).searchable(2),
+                DiscoveryField::new("title", DiscoveryFieldType::Text, true).searchable(3),
+                DiscoveryField::new("tags", DiscoveryFieldType::KeywordList, true).searchable(2),
+            ],
+            vec![EdgeTypeSchema::directed("relationship", "test")],
+        )
     }
 }

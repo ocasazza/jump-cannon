@@ -1748,7 +1748,7 @@ fn render_search(ctx: Ctx, st: &PaletteState) -> Element {
         input {
             class: "cp-input",
             value: "{query}",
-            placeholder: "Type a command or fuzzy-search vault files…",
+            placeholder: "Type a command or fuzzy-search graph nodes…",
             onmounted: move |e: MountedEvent| {
                 spawn(async move {
                     let _ = e.data().set_focus(true).await;

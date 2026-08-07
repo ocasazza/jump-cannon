@@ -10,10 +10,8 @@
 //!      task bars to `ProgressLog`).
 //!   2. Builds a fresh `GraphSnapshot` and `ArcSwap`s it into the
 //!      `AppState`. In-flight readers keep the previous `Arc` valid.
-//!   3. For Obsidian only, refreshes or respawns the `vault-search` subprocess
-//!      `--rebuild` so BM25 search returns up-to-date hits. (See the
-//!      GUESS note in `subprocess.rs::spawn_rebuild` — no in-place
-//!      refresh API exists today.)
+//!   3. The importer-driven Tantivy index and schema-driven facets are built
+//!      into that same snapshot before the single atomic swap.
 //!
 //! ## Filter
 //!
@@ -41,7 +39,7 @@ use notify_debouncer_mini::{new_debouncer, DebouncedEvent};
 
 use data_loader::{Effect, HostedImporter, ImporterDescriptor, Transport, WatchPlan};
 
-use crate::state::{AppState, GraphSnapshot};
+use crate::state::{AppState, GraphSnapshot, SnapshotSource};
 
 /// Spawn the filesystem watcher + reload task. Returns immediately; the
 /// watcher and reload loop run for the lifetime of the process.
@@ -301,69 +299,19 @@ fn spawn_filesystem(
     });
 }
 
-/// Run one reload with a known set of changed `.md` paths (vault-relative).
-/// Rebuilds the graph snapshot, then attempts an incremental refresh of the
-/// vault-search index against just those paths. If refresh fails (no child
-/// running, HTTP error, lock poisoned, etc.) we fall back to a full
-/// `spawn_rebuild`, logging a warning so regressions are visible.
-pub async fn reload_with_paths(state: &AppState, paths: &HashSet<String>) {
-    if !rebuild_snapshot(state).await {
-        return;
-    }
-
-    if state.inner.importer.descriptor().id != "obsidian" {
-        return;
-    }
-
-    let progress = state.inner.progress.clone();
-    let path_vec: Vec<String> = paths.iter().cloned().collect();
-    let n = path_vec.len();
-
-    // Try incremental refresh first. We hold the current `Arc<VaultSearch>`
-    // across the await — the worst case is we POST to a child that's
-    // already been swapped out, the request fails, and we fall back.
-    let current = state.inner.vault_search.load();
-    if let Some(vs) = current.as_ref() {
-        let refresh_id = progress.start("ingest", format!("Refreshing search index ({n})"));
-        match vs.refresh(&path_vec).await {
-            Ok((updated, deleted, skipped)) => {
-                progress.info(
-                    "ingest",
-                    format!(
-                        "search refresh: {updated} upserted, {deleted} deleted, {skipped} skipped"
-                    ),
-                );
-                progress.finish(refresh_id);
-                return;
-            }
-            Err(e) => {
-                progress.warn(
-                    "ingest",
-                    format!("incremental refresh failed, falling back to rebuild: {e}"),
-                );
-                progress.fail(refresh_id, "refresh failed");
-                tracing::warn!(error = %e, "vault-search refresh failed; respawning");
-            }
-        }
-    }
-
-    // Fallback: full respawn with --rebuild.
-    respawn_search(state).await;
+/// Run one reload with a known set of changed paths. The current vertical
+/// slice still rebuilds a complete graph/search/facet snapshot; retaining the
+/// path set makes the future delta boundary explicit without a second index.
+pub async fn reload_with_paths(state: &AppState, _paths: &HashSet<String>) {
+    rebuild_snapshot(state).await;
 }
 
-/// Run one full reload: rebuild snapshot + respawn vault-search. Used at
-/// startup-style code paths where there's no known change set.
+/// Run one full graph/search/facet reload.
 pub async fn reload(state: &AppState) {
-    if !rebuild_snapshot(state).await {
-        return;
-    }
-    if state.inner.importer.descriptor().id == "obsidian" {
-        respawn_search(state).await;
-    }
+    rebuild_snapshot(state).await;
 }
 
-/// Reload the in-memory `GraphSnapshot` from disk and atomically swap it
-/// into `state`. Does NOT touch vault-search.
+/// Reload graph, search index, and facets, then atomically swap them together.
 async fn rebuild_snapshot(state: &AppState) -> bool {
     let progress = state.inner.progress.clone();
 
@@ -371,10 +319,10 @@ async fn rebuild_snapshot(state: &AppState) -> bool {
     let reload_id = progress.start("ingest", format!("Reloading {}", descriptor.name));
     progress.info("ingest", format!("{} change detected", descriptor.id));
 
-    let new_graph =
+    let loaded =
         match crate::vault_loader::load_with_progress(&state.inner.importer, Some(&progress)).await
         {
-            Ok(graph) => graph,
+            Ok(loaded) => loaded,
             Err(error) => {
                 progress.fail(reload_id, error.to_string());
                 return false;
@@ -382,13 +330,18 @@ async fn rebuild_snapshot(state: &AppState) -> bool {
         };
 
     let snap_id = progress.start("ingest", "Building snapshot");
-    let snapshot = tokio::task::spawn_blocking(move || GraphSnapshot::build(new_graph))
-        .await
-        .map(Arc::new);
+    let schema = descriptor.schema;
+    let source = SnapshotSource::new(descriptor.id, descriptor.name, descriptor.version);
+    let snapshot = tokio::task::spawn_blocking(move || {
+        GraphSnapshot::build(loaded.graph, source, schema, loaded.search_documents)
+    })
+    .await
+    .map_err(|error| error.to_string())
+    .and_then(|snapshot| snapshot.map(Arc::new).map_err(|error| error.to_string()));
     let snapshot = match snapshot {
         Ok(s) => s,
         Err(e) => {
-            progress.fail(snap_id, format!("snapshot panic: {e}"));
+            progress.fail(snap_id, format!("snapshot build: {e}"));
             progress.fail(reload_id, "snapshot build failed");
             return false;
         }
@@ -404,26 +357,7 @@ async fn rebuild_snapshot(state: &AppState) -> bool {
     true
 }
 
-/// Full respawn of the vault-search subprocess with `--rebuild`. Used as
-/// the fallback when incremental refresh fails or at startup-style paths.
-async fn respawn_search(state: &AppState) {
-    let progress = state.inner.progress.clone();
-    let search_id = progress.start("ingest", "Rebuilding search index");
-    let vault_root = state.inner.vault_root.clone();
-    match crate::subprocess::VaultSearch::spawn_rebuild(&vault_root).await {
-        Ok(vs) => {
-            state.inner.vault_search.store(Some(Arc::new(vs)));
-            progress.finish(search_id);
-        }
-        Err(e) => {
-            progress.fail(search_id, format!("vault-search respawn: {e}"));
-        }
-    }
-}
-
-/// Convert an absolute event path to the vault-relative form vault-search
-/// expects (forward slashes, with `.md` extension preserved). Returns
-/// `None` if the path can't be made relative.
+/// Convert an absolute event path to a stable vault-relative path.
 fn relative_path(vault_root: &Path, path: &Path) -> Option<String> {
     if vault_root == path {
         return path
@@ -472,8 +406,46 @@ fn is_relevant(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use data_loader::{ImportError, ImportFuture, Importer, ImporterDescriptor, LoadResult};
+    use data_loader::{
+        DiscoveryField, DiscoveryFieldType, EdgeTypeSchema, ImportError, ImportFuture, Importer,
+        ImporterDescriptor, ImporterSchema, LoadResult, SearchDocument,
+    };
     use vault_data::{VaultGraph, VaultNode};
+
+    fn test_schema() -> ImporterSchema {
+        ImporterSchema::new(
+            vec![
+                DiscoveryField::new("id", DiscoveryFieldType::Keyword, true).searchable(2),
+                DiscoveryField::new("title", DiscoveryFieldType::Text, true).searchable(4),
+                DiscoveryField::new("tags", DiscoveryFieldType::KeywordList, true).searchable(2),
+            ],
+            vec![EdgeTypeSchema::directed("reference", "test edge")],
+        )
+    }
+
+    fn test_result(mut graph: VaultGraph) -> LoadResult {
+        let search_documents = graph
+            .nodes
+            .values_mut()
+            .map(|node| {
+                if node.meta.source_id.is_empty() {
+                    node.meta.source_id = "test".into();
+                }
+                if node.meta.title.is_empty() {
+                    node.meta.title = node.id.clone();
+                }
+                SearchDocument::new(&node.id)
+                    .with("id", node.id.clone())
+                    .with("title", node.meta.title.clone())
+                    .with("tags", serde_json::json!(node.meta.tags))
+            })
+            .collect();
+        LoadResult {
+            graph,
+            search_documents,
+            unresolved: Vec::new(),
+        }
+    }
 
     struct FailingImporter;
 
@@ -488,6 +460,7 @@ mod tests {
                     Transport::InMemory,
                     "failing",
                 )],
+                test_schema(),
             )
         }
 
@@ -521,6 +494,7 @@ mod tests {
                         "cluster-a/apps/deployments:default",
                     ),
                 ],
+                test_schema(),
             )
             .with_watch(WatchPlan::Poll { interval_ms: 100 })
         }
@@ -529,6 +503,7 @@ mod tests {
             Box::pin(async {
                 Ok(LoadResult {
                     graph: VaultGraph::new(),
+                    search_documents: Vec::new(),
                     unresolved: Vec::new(),
                 })
             })
@@ -584,6 +559,11 @@ mod tests {
         let mut graph = VaultGraph::new();
         graph.add_node(VaultNode {
             id: "last-good".into(),
+            meta: vault_data::NodeMeta {
+                source_id: "test".into(),
+                title: "Last good".into(),
+                ..Default::default()
+            },
             ..Default::default()
         });
         let raw: Box<dyn Importer> = Box::new(FailingImporter);
@@ -592,12 +572,12 @@ mod tests {
         let state = crate::AppState::new(
             PathBuf::new(),
             importer,
-            graph,
-            None,
+            test_result(graph),
             None,
             crate::compute_broker::ComputeBroker::new(),
             Arc::new(crate::progress::ProgressLog::new()),
-        );
+        )
+        .unwrap();
         let revision = state.snapshot().revision;
 
         assert!(!rebuild_snapshot(&state).await);

@@ -258,8 +258,44 @@ impl CategoricalEncoder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
+    use data_loader::{
+        DiscoveryField, DiscoveryFieldType, EdgeTypeSchema, ImporterSchema, SearchDocument,
+    };
     use vault_data::{NodeMetrics, VaultEdge, VaultGraph, VaultNode};
+
+    fn test_snapshot(mut graph: VaultGraph) -> GraphSnapshot {
+        let search_documents = graph
+            .nodes
+            .values_mut()
+            .map(|node| {
+                if node.meta.source_id.is_empty() {
+                    node.meta.source_id = "test".into();
+                }
+                if node.meta.title.is_empty() {
+                    node.meta.title = node.id.clone();
+                }
+                SearchDocument::new(&node.id)
+                    .with("id", node.id.clone())
+                    .with("title", node.meta.title.clone())
+                    .with("tags", serde_json::json!(node.meta.tags))
+            })
+            .collect();
+        let schema = ImporterSchema::new(
+            vec![
+                DiscoveryField::new("id", DiscoveryFieldType::Keyword, true).searchable(2),
+                DiscoveryField::new("title", DiscoveryFieldType::Text, true).searchable(4),
+                DiscoveryField::new("tags", DiscoveryFieldType::KeywordList, true).searchable(2),
+            ],
+            vec![EdgeTypeSchema::directed("reference", "test edge")],
+        );
+        GraphSnapshot::build(
+            graph,
+            crate::state::SnapshotSource::new("test", "Test", "1"),
+            schema,
+            search_documents,
+        )
+        .unwrap()
+    }
 
     #[test]
     fn test_resolve_uniform() {
@@ -278,13 +314,7 @@ mod tests {
             },
         );
 
-        let snap = GraphSnapshot {
-            revision: 1,
-            graph,
-            id_to_idx: [("node1".to_string(), 0)].into_iter().collect(),
-            idx_to_id: vec!["node1".to_string()],
-            binary_cache: HashMap::new(),
-        };
+        let snap = test_snapshot(graph);
 
         let lens = LensConfig::default();
         let (settings, attrs) = resolve(&lens, &snap);
@@ -326,26 +356,13 @@ mod tests {
             });
         }
 
-        let idx_to_id: Vec<String> = ["a", "b", "c", "d", "e", "f"]
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
-        let id_to_idx: HashMap<String, u32> = idx_to_id
-            .iter()
-            .enumerate()
-            .map(|(i, id)| (id.clone(), i as u32))
-            .collect();
-        let snap = GraphSnapshot {
-            revision: 1,
-            graph,
-            id_to_idx,
-            idx_to_id,
-            binary_cache: HashMap::new(),
-        };
+        let snap = test_snapshot(graph);
 
-        let mut lens = LensConfig::default();
-        lens.edge_length = EdgeLengthLens::JaccardStrength;
-        lens.edge_strength_spread = 3.0;
+        let lens = LensConfig {
+            edge_length: EdgeLengthLens::JaccardStrength,
+            edge_strength_spread: 3.0,
+            ..Default::default()
+        };
         let (settings, attrs) = resolve(&lens, &snap);
 
         let edge_len = attrs.edge_len.expect("edge_len present");
@@ -366,10 +383,8 @@ mod tests {
 
     fn class_snapshot(values: &[(usize, usize, bool)]) -> GraphSnapshot {
         let mut graph = VaultGraph::default();
-        let mut idx_to_id = Vec::new();
         for (i, &(degree, community, tagged)) in values.iter().enumerate() {
             let id = format!("n{i}");
-            idx_to_id.push(id.clone());
             graph.nodes.insert(
                 id.clone(),
                 VaultNode {
@@ -387,18 +402,7 @@ mod tests {
                 },
             );
         }
-        let id_to_idx = idx_to_id
-            .iter()
-            .enumerate()
-            .map(|(i, id)| (id.clone(), i as u32))
-            .collect();
-        GraphSnapshot {
-            revision: 1,
-            graph,
-            id_to_idx,
-            idx_to_id,
-            binary_cache: HashMap::new(),
-        }
+        test_snapshot(graph)
     }
 
     #[test]
@@ -411,8 +415,10 @@ mod tests {
             (4, 99, false),
             (8, 99, false),
         ]);
-        let mut lens = LensConfig::default();
-        lens.class = ClassLens::DegreeBuckets;
+        let lens = LensConfig {
+            class: ClassLens::DegreeBuckets,
+            ..Default::default()
+        };
 
         let (settings, attrs) = resolve(&lens, &snap);
         assert_eq!(attrs.node_class, Some(vec![0, 1, 2, 2, 3, 4]));
@@ -425,15 +431,19 @@ mod tests {
     fn structural_class_tables_cover_louvain_and_tag_ids() {
         let snap = class_snapshot(&[(1, 0, false), (1, 3, true)]);
 
-        let mut louvain = LensConfig::default();
-        louvain.class = ClassLens::Louvain;
+        let louvain = LensConfig {
+            class: ClassLens::Louvain,
+            ..Default::default()
+        };
         let (settings, attrs) = resolve(&louvain, &snap);
         assert_eq!(attrs.node_class, Some(vec![0, 3]));
         assert_eq!(settings.class_affinity_dim, 4);
         assert_eq!(settings.class_affinity.len(), 16);
 
-        let mut tag = LensConfig::default();
-        tag.class = ClassLens::Tag("selected".into());
+        let tag = LensConfig {
+            class: ClassLens::Tag("selected".into()),
+            ..Default::default()
+        };
         let (settings, attrs) = resolve(&tag, &snap);
         assert_eq!(attrs.node_class, Some(vec![0, 1]));
         assert_eq!(settings.class_affinity_dim, 2);
@@ -449,13 +459,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        GraphSnapshot {
-            revision: 1,
-            graph,
-            id_to_idx: [("n".to_string(), 0)].into_iter().collect(),
-            idx_to_id: vec!["n".to_string()],
-            binary_cache: HashMap::new(),
-        }
+        test_snapshot(graph)
     }
 
     /// The default lens (bonding OFF) must leave the resolved engine settings'
@@ -475,16 +479,18 @@ mod tests {
     /// self-assembly stage.
     #[test]
     fn bonding_knobs_pass_through_when_enabled() {
-        let mut lens = LensConfig::default();
-        lens.bonding_enabled = true;
-        lens.r_bond = 1.1;
-        lens.r_break = 1.5;
-        lens.bond_every = 4;
-        lens.bond_stiffness = 0.4;
-        lens.default_max_valence = 3;
-        lens.default_bond_angle = 120.0;
-        lens.line_tension = 4.0;
-        lens.spont_curvature = 0.5;
+        let lens = LensConfig {
+            bonding_enabled: true,
+            r_bond: 1.1,
+            r_break: 1.5,
+            bond_every: 4,
+            bond_stiffness: 0.4,
+            default_max_valence: 3,
+            default_bond_angle: 120.0,
+            line_tension: 4.0,
+            spont_curvature: 0.5,
+            ..Default::default()
+        };
 
         let (settings, _) = resolve(&lens, &one_node_snapshot());
         assert!(settings.bonding_enabled);

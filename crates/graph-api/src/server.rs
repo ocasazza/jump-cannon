@@ -60,6 +60,7 @@ pub fn router(state: AppState) -> Router {
         .route("/graph/csr.bin", get(graph_csr_bin))
         .route("/graph/metrics/:name", get(graph_metric))
         .route("/graph/meta_summary", get(graph_meta_summary))
+        .route("/graph/schema", get(graph_schema))
         .route("/graph/layout/stream", get(graph_layout_stream))
         // `*id` (wildcard) instead of `:id` so multi-segment ids like
         // `vault/shared/knowledge-base/...` match. The captured String
@@ -250,11 +251,7 @@ async fn vault_page_put(
     if !canonical_parent.starts_with(&canonical_root) {
         return put_err(StatusCode::BAD_REQUEST, "resolved path escapes vault root");
     }
-    let final_path = canonical_parent.join(
-        abs.file_name()
-            .ok_or_else(|| "missing filename")
-            .unwrap_or_default(),
-    );
+    let final_path = canonical_parent.join(abs.file_name().unwrap_or_default());
 
     // Read the existing file to preserve its YAML frontmatter block.
     // The wire format is *body only*; the on-disk file keeps whatever
@@ -871,13 +868,78 @@ async fn compute_soup_post(
     // 1. Host the soup as graph-api's active graph so the renderer fetches its
     //    node set (matching the streamed positions). Synthesized directly.
     let mut vg = vault_data::VaultGraph::new();
+    let mut search_documents = Vec::with_capacity(n as usize);
     for i in 0..n {
+        let id = format!("s{i}");
         vg.add_node(vault_data::VaultNode {
-            id: format!("s{i}"),
+            id: id.clone(),
+            meta: vault_data::NodeMeta {
+                source_id: "compute-soup".into(),
+                title: id.clone(),
+                tags: vec!["particle".into()],
+                path: id.clone(),
+                doctype: Some("particle".into()),
+                ..Default::default()
+            },
             ..Default::default()
         });
+        search_documents.push(
+            data_loader::SearchDocument::new(&id)
+                .with("id", id.clone())
+                .with("title", id.clone())
+                .with("tags", serde_json::json!(["particle"]))
+                .with("path", id)
+                .with("type", "particle"),
+        );
     }
-    let snapshot = crate::state::GraphSnapshot::build(vg);
+    let schema = data_loader::ImporterSchema::new(
+        vec![
+            data_loader::DiscoveryField::new("id", data_loader::DiscoveryFieldType::Keyword, true)
+                .searchable(2),
+            data_loader::DiscoveryField::new("title", data_loader::DiscoveryFieldType::Text, true)
+                .searchable(4)
+                .snippet(),
+            data_loader::DiscoveryField::new(
+                "tags",
+                data_loader::DiscoveryFieldType::KeywordList,
+                true,
+            )
+            .searchable(3)
+            .facetable(),
+            data_loader::DiscoveryField::new(
+                "path",
+                data_loader::DiscoveryFieldType::Keyword,
+                true,
+            )
+            .searchable(2),
+            data_loader::DiscoveryField::new(
+                "type",
+                data_loader::DiscoveryFieldType::Keyword,
+                true,
+            )
+            .searchable(2)
+            .facetable(),
+        ],
+        vec![data_loader::EdgeTypeSchema::directed(
+            "bond",
+            "Dynamic particle bond",
+        )],
+    );
+    let snapshot = match crate::state::GraphSnapshot::build(
+        vg,
+        crate::state::SnapshotSource::new("compute-soup", "Compute soup", "1"),
+        schema,
+        search_documents,
+    ) {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            return err(
+                format!("build soup snapshot: {error}"),
+                initial_revision,
+                initial_generation,
+            )
+        }
+    };
     let graph_revision = snapshot.revision;
     s.inner.snapshot.store(std::sync::Arc::new(snapshot));
 
@@ -1125,20 +1187,20 @@ async fn graph_init(State(s): State<AppState>) -> impl IntoResponse {
 ///
 /// TODO(prisma): wire up an optional Prisma lookup *before* falling back to
 /// the stub. Concrete next steps:
-///   - Schema lives at:
-///       `~/Repositories/schrodinger/nixstation/projects/ingest/prisma/schema.prisma`
-///     (model `ObsidianDocument`, keyed on `vaultPath`).
-///   - The dev SQLite file is at:
-///       `~/Repositories/schrodinger/nixstation/projects/ingest/prisma/_dev.db`
-///     Production likely uses the same `DATABASE_URL` env var convention as
-///     the rest of the ingest pipeline.
-///   - Add a `--prisma-url <sqlite-url>` flag (and matching `Prisma` field on
-///     `AppStateInner`, populated at boot only when the flag is set) — keep
-///     this *optional* so the existing in-memory-only path keeps working.
-///   - Probably easiest to use `sqlx` (raw SQL against the small set of
-///     columns we need: `vault_path`, `title`, `lifecycle`, plus the per-doc
-///     join into `obsidian_documents_tags` for tags). `prisma-client-rust`
-///     is the "match the schema" option but adds a build-time codegen step.
+/// - Schema lives at:
+///   `~/Repositories/schrodinger/nixstation/projects/ingest/prisma/schema.prisma`
+///   (model `ObsidianDocument`, keyed on `vaultPath`).
+/// - The dev SQLite file is at:
+///   `~/Repositories/schrodinger/nixstation/projects/ingest/prisma/_dev.db`
+///   Production likely uses the same `DATABASE_URL` env var convention as
+///   the rest of the ingest pipeline.
+/// - Add a `--prisma-url <sqlite-url>` flag (and matching `Prisma` field on
+///   `AppStateInner`, populated at boot only when the flag is set) — keep
+///   this *optional* so the existing in-memory-only path keeps working.
+/// - Probably easiest to use `sqlx` (raw SQL against the small set of
+///   columns we need: `vault_path`, `title`, `lifecycle`, plus the per-doc
+///   join into `obsidian_documents_tags` for tags). `prisma-client-rust`
+///   is the "match the schema" option but adds a build-time codegen step.
 ///   - On hit, populate `NodeMeta` with the real title/folder/tags from the
 ///     row and leave the metric fields at zero (no PageRank for nodes that
 ///     aren't in the layout graph).
@@ -1339,109 +1401,55 @@ struct SearchParams {
 
 /// `GET /search/rich?q=…` — full-text search with highlighted body snippets.
 ///
-/// Passthrough of vault-search's `/search` (BM25 + Tantivy SnippetGenerator;
-/// `{"total": N, "results": [{"id", "score", "snippet"}]}` where `snippet` is
-/// match-highlighted HTML using `<b>` tags around hits). JSON, not protobuf:
-/// snippets are display-ready HTML fragments for the Dioxus node browser, not
-/// hot-path bulk data. Falls back to the same title-contains scan as `/search`
-/// (empty snippets) when vault-search isn't running.
+/// Queries the active importer's validated discovery projection with BM25 and
+/// Tantivy's query syntax. The JSON result includes optional match-highlighted
+/// HTML snippets only from fields that the importer declared snippet-capable.
 async fn search_rich(
     State(s): State<AppState>,
     Query(p): Query<SearchParams>,
 ) -> impl IntoResponse {
-    let limit = p.limit.unwrap_or(50);
-    let vs_opt = s.inner.vault_search.load_full();
-    if let Some(vs) = vs_opt.as_deref() {
-        let url = format!(
-            "{}/search?q={}&limit={}",
-            vs.url(),
-            urlencoding::encode(&p.q),
-            limit
-        );
-        let resp = match reqwest::get(&url).await {
-            Ok(r) => r,
-            Err(e) => {
-                return (StatusCode::BAD_GATEWAY, format!("vault-search proxy: {e}"))
-                    .into_response()
-            }
-        };
-        return match resp.json::<serde_json::Value>().await {
-            Ok(v) => Json(v).into_response(),
-            Err(e) => {
-                (StatusCode::BAD_GATEWAY, format!("vault-search decode: {e}")).into_response()
-            }
-        };
-    }
-
     let snap = s.snapshot();
-    let q = p.q.to_lowercase();
-    let results: Vec<serde_json::Value> = snap
-        .graph
-        .nodes
-        .iter()
-        .filter(|(_, n)| n.meta.title.to_lowercase().contains(&q))
-        .take(limit as usize)
-        .map(|(id, _)| serde_json::json!({ "id": id, "score": 0.0, "snippet": "" }))
-        .collect();
-    Json(serde_json::json!({ "total": results.len(), "results": results })).into_response()
+    let limit = p.limit.unwrap_or(50).min(5_000) as usize;
+    match snap.search_index.search(&p.q, limit, true) {
+        Ok(results) => Json(serde_json::json!({
+            "total": results.total,
+            "results": results.hits.into_iter().map(|hit| serde_json::json!({
+                "id": hit.id,
+                "score": hit.score,
+                "snippet": hit.snippet,
+            })).collect::<Vec<_>>(),
+        }))
+        .into_response(),
+        Err(error) => (StatusCode::BAD_REQUEST, error.to_string()).into_response(),
+    }
 }
 
 async fn search(State(s): State<AppState>, Query(p): Query<SearchParams>) -> impl IntoResponse {
-    let limit = p.limit.unwrap_or(50);
-    // Fast path: proxy to vault-search's /ids endpoint (Tantivy BM25).
-    let vs_opt = s.inner.vault_search.load_full();
-    if let Some(vs) = vs_opt.as_deref() {
-        let url = format!(
-            "{}/ids?q={}&limit={}",
-            vs.url(),
-            urlencoding::encode(&p.q),
-            limit
-        );
-        let resp = match reqwest::get(&url).await {
-            Ok(r) => r,
-            Err(e) => {
-                return (StatusCode::BAD_GATEWAY, format!("vault-search proxy: {e}"))
-                    .into_response()
-            }
-        };
-        let json: serde_json::Value = match resp.json().await {
-            Ok(v) => v,
-            Err(e) => {
-                return (StatusCode::BAD_GATEWAY, format!("vault-search decode: {e}"))
-                    .into_response()
-            }
-        };
-        // vault-search shape: {"ids": [...], "total": N}
-        let ids: Vec<String> = json["ids"]
-            .as_array()
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_str().map(String::from))
-                    .collect()
-            })
-            .unwrap_or_default();
-        let total = json["total"].as_u64().unwrap_or(ids.len() as u64) as u32;
-        let msg = proto::SearchResults { total, ids };
-        return proto_response(&msg).into_response();
-    }
-
-    // Fallback: naive title-contains scan when vault-search isn't running.
     let snap = s.snapshot();
-    let q = p.q.to_lowercase();
-    let mut ids: Vec<String> = snap
-        .graph
-        .nodes
-        .iter()
-        .filter(|(_, n)| n.meta.title.to_lowercase().contains(&q))
-        .map(|(id, _)| id.clone())
-        .take(limit as usize)
-        .collect();
-    ids.sort();
-    let msg = proto::SearchResults {
-        total: ids.len() as u32,
-        ids,
-    };
-    proto_response(&msg).into_response()
+    let limit = p.limit.unwrap_or(50).min(5_000) as usize;
+    match snap.search_index.search(&p.q, limit, false) {
+        Ok(results) => {
+            let msg = proto::SearchResults {
+                total: results.total.min(u32::MAX as usize) as u32,
+                ids: results.hits.into_iter().map(|hit| hit.id).collect(),
+            };
+            proto_response(&msg).into_response()
+        }
+        Err(error) => (StatusCode::BAD_REQUEST, error.to_string()).into_response(),
+    }
+}
+
+async fn graph_schema(State(s): State<AppState>) -> impl IntoResponse {
+    let snap = s.snapshot();
+    Json(serde_json::json!({
+        "graph_revision": snap.revision,
+        "source": {
+            "id": snap.source.id,
+            "name": snap.source.name,
+            "version": snap.source.version,
+        },
+        "schema": snap.schema,
+    }))
 }
 
 fn proto_response<M: ProstMessage>(msg: &M) -> impl IntoResponse {
@@ -1568,97 +1576,136 @@ async fn graph_metric(State(s): State<AppState>, Path(name): Path<String>) -> im
     cached_binary_response(&s, &name).into_response()
 }
 
-/// Returns a per-field inverted index covering the small handful of
-/// fields the renderer-side chip / badge UI cares about. Built once per
-/// process and cached as `Arc<[u8]>` in `binary_cache` under the
-/// reserved key "meta_summary".
+/// Returns a per-field inverted index for exactly the fields the active
+/// importer declares facetable. Built with the rest of the snapshot and cached
+/// as `Arc<[u8]>` under the reserved key `meta_summary`.
 async fn graph_meta_summary(State(s): State<AppState>) -> impl IntoResponse {
     let snap = s.snapshot();
-    if let Some(buf) = snap.binary_cache.get("meta_summary").cloned() {
-        let mut headers = HeaderMap::new();
-        headers.insert(header::CONTENT_TYPE, HeaderValue::from_static(PROTOBUF_CT));
-        insert_graph_revision(&mut headers, snap.revision);
-        return (StatusCode::OK, headers, buf.to_vec()).into_response();
-    }
-    let bytes = build_meta_summary_bytes(&snap.graph);
+    let Some(buf) = snap.binary_cache.get("meta_summary").cloned() else {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "snapshot is missing its schema-derived facet summary",
+        )
+            .into_response();
+    };
     let mut headers = HeaderMap::new();
     headers.insert(header::CONTENT_TYPE, HeaderValue::from_static(PROTOBUF_CT));
     insert_graph_revision(&mut headers, snap.revision);
-    (StatusCode::OK, headers, bytes).into_response()
+    (StatusCode::OK, headers, buf.to_vec()).into_response()
 }
 
 /// Walk the graph once and build a [`proto::MetaSummary`]. The frontend
 /// uses this CSR-style payload (sorted node-idx vecs per (field, value)
 /// bucket) to compute filter intersections without per-click round-trips.
-pub fn build_meta_summary_bytes(graph: &vault_data::VaultGraph) -> Vec<u8> {
-    use serde_json::Value;
+pub fn build_meta_summary_bytes(
+    graph: &vault_data::VaultGraph,
+    schema: &data_loader::ImporterSchema,
+    documents: &[data_loader::SearchDocument],
+) -> Result<Vec<u8>, data_loader::ImportError> {
     use std::collections::BTreeMap;
+
+    const MAX_FACET_BUCKETS: usize = 1_000_000;
+    const MAX_FACET_MEMBERSHIPS: usize = 20_000_000;
 
     // Field name -> value -> sorted Vec<node_idx>.
     let mut idx: BTreeMap<String, BTreeMap<String, Vec<u32>>> = BTreeMap::new();
+    let mut bucket_count = 0usize;
+    let mut membership_count = 0usize;
     fn push(
         idx: &mut BTreeMap<String, BTreeMap<String, Vec<u32>>>,
+        bucket_count: &mut usize,
+        membership_count: &mut usize,
         field: &str,
         value: &str,
         node: u32,
-    ) {
+    ) -> Result<(), data_loader::ImportError> {
         let v = value.trim();
         if v.is_empty() {
-            return;
+            return Ok(());
+        }
+        let new_bucket = idx.get(field).is_none_or(|values| !values.contains_key(v));
+        let next_buckets = bucket_count.saturating_add(usize::from(new_bucket));
+        let next_memberships = membership_count.saturating_add(1);
+        if next_buckets > MAX_FACET_BUCKETS || next_memberships > MAX_FACET_MEMBERSHIPS {
+            return Err(data_loader::ImportError::Map {
+                message: format!(
+                    "facet summary exceeds limits: {next_buckets} buckets / {next_memberships} memberships"
+                ),
+            });
         }
         idx.entry(field.to_string())
             .or_default()
             .entry(v.to_string())
             .or_default()
             .push(node);
+        *bucket_count = next_buckets;
+        *membership_count = next_memberships;
+        Ok(())
     }
 
-    for (i, (_id, node)) in graph.nodes.iter().enumerate() {
-        let ni = i as u32;
-        for t in &node.meta.tags {
-            push(&mut idx, "tags", t, ni);
-        }
-        if let Some(dt) = &node.meta.doctype {
-            push(&mut idx, "doctype", dt, ni);
-        }
-        push(&mut idx, "folder", &node.meta.folder, ni);
-        let fm = &node.meta.frontmatter;
-        // status — usually a scalar string.
-        if let Some(Value::String(v)) = fm.get("status") {
-            push(&mut idx, "status", v, ni);
-        }
-        // authors — comma-split string OR array.
-        if let Some(v) = fm.get("authors") {
-            for s in extract_strings(v) {
-                for part in s.split(',') {
-                    push(&mut idx, "authors", part, ni);
+    let fields: std::collections::HashMap<&str, &data_loader::DiscoveryField> = schema
+        .facetable_fields()
+        .map(|field| (field.key.as_str(), field))
+        .collect();
+    for document in documents {
+        let Some(node_index) = graph.nodes.get_index_of(&document.node_id) else {
+            return Err(data_loader::ImportError::Map {
+                message: format!(
+                    "facet document references unknown node {:?}",
+                    document.node_id
+                ),
+            });
+        };
+        let ni = node_index as u32;
+        for (key, field) in &fields {
+            let value = document.fields.get(*key).or(field.default_value.as_ref());
+            let Some(value) = value else { continue };
+            match field.field_type {
+                data_loader::DiscoveryFieldType::Keyword
+                | data_loader::DiscoveryFieldType::Date
+                | data_loader::DiscoveryFieldType::Url => {
+                    if let Some(value) = value.as_str() {
+                        push(
+                            &mut idx,
+                            &mut bucket_count,
+                            &mut membership_count,
+                            key,
+                            value,
+                            ni,
+                        )?;
+                    }
                 }
-            }
-        }
-        if let Some(v) = fm.get("entities") {
-            for s in extract_strings(v) {
-                push(&mut idx, "entities", &s, ni);
-            }
-        }
-        if let Some(v) = fm.get("key_topics") {
-            for s in extract_strings(v) {
-                push(&mut idx, "key_topics", &s, ni);
-            }
-        }
-        // related — wikilinks; strip the [[ ]] wrapper, split on |.
-        if let Some(v) = fm.get("related") {
-            for s in extract_strings(v) {
-                let t = s.trim();
-                let inner = t
-                    .strip_prefix("[[")
-                    .and_then(|x| x.strip_suffix("]]"))
-                    .unwrap_or(t);
-                let target = inner
-                    .split_once('|')
-                    .map(|(p, _)| p)
-                    .unwrap_or(inner)
-                    .trim();
-                push(&mut idx, "related", target, ni);
+                data_loader::DiscoveryFieldType::KeywordList => {
+                    for value in value
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(serde_json::Value::as_str)
+                    {
+                        push(
+                            &mut idx,
+                            &mut bucket_count,
+                            &mut membership_count,
+                            key,
+                            value,
+                            ni,
+                        )?;
+                    }
+                }
+                data_loader::DiscoveryFieldType::Number
+                | data_loader::DiscoveryFieldType::Boolean => {
+                    push(
+                        &mut idx,
+                        &mut bucket_count,
+                        &mut membership_count,
+                        key,
+                        &value.to_string(),
+                        ni,
+                    )?;
+                }
+                data_loader::DiscoveryFieldType::Text => {
+                    unreachable!("schema validation rejects facetable free-text fields")
+                }
             }
         }
     }
@@ -1686,18 +1733,7 @@ pub fn build_meta_summary_bytes(graph: &vault_data::VaultGraph) -> Vec<u8> {
     let msg = proto::MetaSummary { fields, buckets };
     let mut buf = Vec::with_capacity(msg.encoded_len());
     msg.encode(&mut buf).expect("encode meta_summary");
-    buf
-}
-
-fn extract_strings(v: &serde_json::Value) -> Vec<String> {
-    match v {
-        serde_json::Value::String(s) => vec![s.clone()],
-        serde_json::Value::Array(arr) => arr
-            .iter()
-            .filter_map(|x| x.as_str().map(|s| s.to_string()))
-            .collect(),
-        _ => Vec::new(),
-    }
+    Ok(buf)
 }
 
 /// Look up a precomputed buffer in `AppState::binary_cache` and serve it

@@ -1,5 +1,9 @@
-use super::parser::{extract_wikilinks, parse_note};
-use std::path::Path;
+use super::{
+    loader::ObsidianLoader,
+    parser::{extract_wikilinks, parse_note},
+};
+use data_loader::{ImportError, Loader};
+use std::{fs, path::Path};
 
 #[test]
 fn unit_extract_wikilinks_basic() {
@@ -110,4 +114,84 @@ fn unit_parse_note_tags_dedup_across_sources() {
     let note = parse_note(Path::new("vault/i.md"), text);
     let count = note.tags.iter().filter(|t| *t == "alpha").count();
     assert_eq!(count, 1, "expected dedup, got {:?}", note.tags);
+}
+
+#[test]
+fn obsidian_schema_and_search_documents_satisfy_the_contract() {
+    let fixture = tempfile::tempdir().unwrap();
+    fs::write(
+        fixture.path().join("page.md"),
+        "---\ntags: [runbook]\ndescription: Recovery steps\nstatus: active\n---\nBody token.\n",
+    )
+    .unwrap();
+    let loader = ObsidianLoader::new(fixture.path());
+    let descriptor = data_loader::Importer::descriptor(&loader);
+    let schema = loader.schema();
+    let result = loader.load();
+
+    descriptor.validate().unwrap();
+    assert_eq!(descriptor.schema, schema);
+    schema.validate_result(&result).unwrap();
+    let keys = schema
+        .searchable_fields()
+        .map(|field| field.key.as_str())
+        .collect::<Vec<_>>();
+    assert!(keys.contains(&"body"));
+    assert!(keys.contains(&"description"));
+    assert!(keys.contains(&"tags"));
+
+    let document = result.search_documents.first().unwrap();
+    assert_eq!(document.fields["tags"], serde_json::json!(["runbook"]));
+    assert_eq!(document.fields["body"], "Body token.\n");
+    assert_eq!(document.fields["description"], "Recovery steps");
+}
+
+#[test]
+fn obsidian_try_load_rejects_a_missing_vault() {
+    let fixture = tempfile::tempdir().unwrap();
+    let missing = fixture.path().join("missing");
+    let error = ObsidianLoader::new(&missing).try_load().unwrap_err();
+
+    assert!(matches!(error, ImportError::SourceRead { .. }));
+    assert!(error.to_string().contains("missing"));
+}
+
+#[test]
+fn obsidian_try_load_rejects_a_non_directory_vault() {
+    let fixture = tempfile::tempdir().unwrap();
+    let file = fixture.path().join("vault.txt");
+    fs::write(&file, "not a vault").unwrap();
+
+    let error = ObsidianLoader::new(&file).try_load().unwrap_err();
+
+    assert!(matches!(error, ImportError::SourceRead { .. }));
+    assert!(error.to_string().contains("not a directory"));
+}
+
+#[test]
+fn obsidian_try_load_rejects_an_unreadable_note_instead_of_publishing_partial_data() {
+    let fixture = tempfile::tempdir().unwrap();
+    fs::write(fixture.path().join("valid.md"), "Valid body.\n").unwrap();
+    fs::write(fixture.path().join("invalid.md"), [0xff, 0xfe, 0xfd]).unwrap();
+
+    let error = ObsidianLoader::new(fixture.path()).try_load().unwrap_err();
+
+    assert!(matches!(error, ImportError::SourceRead { .. }));
+    assert!(error.to_string().contains("invalid.md"));
+}
+
+#[test]
+fn obsidian_try_load_rejects_malformed_frontmatter() {
+    let fixture = tempfile::tempdir().unwrap();
+    fs::write(
+        fixture.path().join("invalid.md"),
+        "---\ntags: [unterminated\n---\nBody.\n",
+    )
+    .unwrap();
+
+    let error = ObsidianLoader::new(fixture.path()).try_load().unwrap_err();
+
+    assert!(matches!(error, ImportError::SourceRead { .. }));
+    assert!(error.to_string().contains("parse YAML frontmatter"));
+    assert!(error.to_string().contains("invalid.md"));
 }

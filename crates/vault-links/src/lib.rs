@@ -3,7 +3,7 @@ pub mod parser;
 pub mod extractor;
 pub mod loader;
 
-pub use extractor::{extract_vault, ExtractionResult};
+pub use extractor::{extract_vault, try_extract_vault, ExtractionResult};
 pub use loader::ObsidianLoader;
 
 #[cfg(test)]

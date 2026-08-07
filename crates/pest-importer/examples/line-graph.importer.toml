@@ -1,4 +1,4 @@
-format_version = 1
+format_version = 2
 
 [metadata]
 id = "example.line-graph"
@@ -40,6 +40,27 @@ value = "value"
 edge = "edge"
 source = "source"
 target = "target"
+
+[[schema.fields]]
+key = "owner"
+field_type = "keyword"
+required = false
+searchable = true
+facetable = true
+
+[[schema.fields]]
+key = "zone"
+field_type = "keyword"
+required = false
+searchable = true
+facetable = true
+
+[[schema.fields]]
+key = "state"
+field_type = "keyword"
+required = false
+searchable = true
+facetable = true
 
 [limits]
 manifest_bytes = 131072

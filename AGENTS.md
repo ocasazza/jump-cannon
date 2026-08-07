@@ -14,13 +14,18 @@ The test harness in `crates/test-browser/` is the only exception, and only becau
 
 | Crate | Role |
 |---|---|
-| `crates/graph-api` | axum HTTP server. Loads the vault, serves `/graph/*`, `/node/*id`, `/search`, `/vault/page` (editor PUT), `/progress`, etc. Watches `$VAULT_ROOT` via `notify` and atomically swaps the in-memory `GraphSnapshot` through `arc-swap`. Serves the frontend dist from `--assets-dir` / `JUMP_CANNON_ASSETS_DIR`. |
+| `crates/data-loader` | Source-neutral importer contracts. Every descriptor carries discovery schema version 1, and every completed import emits one validated `SearchDocument` per graph node. Defines the six CLI source kinds: Obsidian, tvix, generate, Kubernetes, OKF, and Pest. |
+| `crates/graph-api` | axum HTTP server. Loads the selected importer, serves `/graph/*`, `/graph/schema`, `/node/*id`, `/search`, `/vault/page` (Obsidian editor PUT), `/progress`, etc. Atomically swaps an in-memory `GraphSnapshot` containing the graph, importer schema, generic Tantivy search index, schema-driven facets, metrics, and binary caches. Serves the frontend dist from `--assets-dir` / `JUMP_CANNON_ASSETS_DIR`. |
 | `crates/graph-layouts` | wgpu compute force-sim. Native + WASM. Consumed in-process by `app/ui` (path dependency). |
 | `crates/graph-compute` | Optional standalone layout solver, gRPC on `[::1]:50051`. Opt-in via `--compute-url` / `JUMP_CANNON_COMPUTE_URL` — unset means the broker is never dialed. Deployable as the docker-compose service or via Sky-Pilot (`infra/sky/`). |
 | `crates/graph-metrics` | PageRank, Louvain, k-core, betweenness, weakly-connected-components. Stateless functions over `vault-data::Graph`. |
 | `crates/vault-data` | Shared domain types: `Node`, `Edge`, `Graph`, `FieldSchema`, the categorical color palette. Every other vault crate depends on it; no I/O. |
-| `crates/vault-links` | Wikilink extractor. Walks an Obsidian vault on disk, parses markdown + frontmatter, and produces a `VaultGraph`. The startup loader inside graph-api lives here. |
-| `crates/vault-search` | Standalone HTTP service. Tantivy-backed full-text + field search over the vault. Spawned by graph-api as a subprocess; respawned with `--rebuild` on every watcher-driven reload. |
+| `crates/vault-links` | Obsidian importer. Walks a vault on disk, parses Markdown + frontmatter, resolves wikilinks, and emits a graph plus discovery documents. |
+| `crates/tvix-loader` | tvix and direct-Rust generated graph importers; both emit the same canonical identity/tag/type discovery fields. |
+| `crates/okf-importer` | Bounded filesystem importer for the official Open Knowledge Format v0.2 schema, including typed status, trust, attestation, provenance, and relationship discovery. |
+| `crates/kubernetes-importer` | Capability-scoped, allowlisted Kubernetes metadata importer with owner-reference edges and namespace/API/label facets. |
+| `crates/pest-importer` | Trusted runtime grammar importer. Manifest format 2 requires package authors to declare the property fields admitted to search and facets. |
+| `crates/vault-search` | Legacy standalone Obsidian-only HTTP search service. It remains independently runnable for compatibility consumers but graph-api does not spawn or query it. |
 | `crates/tvix-wasm` | `tvix-eval` bridge — native + WASM Nix expression evaluator. Enables Nix expressions in the UI/data pipeline without shelling out. |
 | `crates/test-browser` | Rust-only Chromium driver (chromiumoxide) for the foundational browser regression suite. Spawned by `just test browser-rust` / `nix run .#test-browser-rust`. |
 
@@ -45,24 +50,25 @@ Scope rule: the compute layer (`graph-compute`, gRPC broker, Sky-Pilot orchestra
 ## Data flow
 
 ```
-$VAULT_ROOT (.md files)
+configured source (Obsidian / tvix / generate / Kubernetes / OKF / Pest)
        │
-       ├──► vault-links ──► vault-data::Graph ──► graph-api (in-memory ArcSwap<GraphSnapshot>)
-       │                                                  │
-       │                                                  ├──► graph-metrics (computed once + on reload)
-       │                                                  │
-       │                                                  ├──► HTTP /graph/* /node/*id /vault/page /progress
-       │                                                  │           │
-       │                                                  │           ▼
-       │                                                  │     app/ui (Dioxus WASM in browser / Tauri webview)
-       │                                                  │           │
-       │                                                  │           └──► graph-layouts (wgpu compute, in-process)
-       │                                                  │
-       │                                                  └──► graph-compute (optional gRPC, out-of-process layout)
+       ▼
+importer ──► Graph + ImporterSchema + one SearchDocument per node
        │
-       └──► vault-search subprocess ──► tantivy index ──► HTTP /search
+       ▼
+graph-api validates and builds one ArcSwap<GraphSnapshot>
+       │
+       ├──► graph-metrics + binary caches
+       ├──► in-process Tantivy index + schema-driven facet summary
+       ├──► HTTP /graph/* /graph/schema /node/*id /search /progress
+       │           │
+       │           ▼
+       │     app/ui (Dioxus WASM in browser / Tauri webview)
+       │           │
+       │           └──► graph-layouts (wgpu compute, in-process)
+       └──► graph-compute (optional gRPC, out-of-process layout)
 
-graph-api notify watcher ──► debounce 400ms ──► rebuild Graph + respawn vault-search ──► emit /progress events
+selected watch plan ──► complete validated rebuild ──► atomic snapshot swap + /progress events
 ```
 
 `tvix-wasm` is the cross-target Nix evaluator (used server-side for `POST /generate`; available for future config surfaces).
@@ -89,7 +95,8 @@ The whole repo builds through **nix + crane + trunk**. No `npm install`, no `was
 - `just dev-down` — symmetric teardown.
 - `just app-dev` / `just app-build` — Tauri desktop shell (dev / release bundles).
 - `just run` — production binary, no watch: builds the app dist (`cd app && trunk build --release`) then serves it via `--assets-dir app/ui/dist`.
-- `just kill` — purge stray graph-api / vault-search processes from prior runs.
+- `just kill` — purge stray graph-api / legacy standalone vault-search
+  processes from prior runs.
 
 `just dev-up` and the test recipes are convenience wrappers around the nix outputs — never standalone command stacks.
 
@@ -127,7 +134,7 @@ The frontend is the Dioxus app in `app/` — panel workspace from `panel-kit` (e
 
 ## Backend state architecture
 
-`graph-api` holds the in-memory `GraphSnapshot` (graph + id maps + binary cache) inside `arc-swap::ArcSwap`. Handlers grab one snapshot per request and the watcher's reload can't invalidate an in-flight read. The watcher (`crates/graph-api/src/watcher.rs`) debounces `.md` changes at 400 ms; a save burst coalesces into one reload. `vault-search` is currently respawned with `--rebuild` on every reload — incremental refresh is a known follow-up.
+`graph-api` holds the in-memory `GraphSnapshot` (graph, importer schema, Tantivy index, schema-driven facet summary, id maps, metrics, and binary caches) inside `arc-swap::ArcSwap`. Handlers grab one snapshot per request and the active importer's reload cannot invalidate an in-flight read. The Obsidian watcher (`crates/graph-api/src/watcher.rs`) debounces `.md` changes at 400 ms; a save burst coalesces into one reload. Other sources use their declared static, filesystem, or polling watch plans. A complete search index is built before the new graph revision is swapped in; graph-api does not manage a `vault-search` subprocess.
 
 Progress for each reload stage emits to `crates/graph-api/src/progress.rs` and surfaces to the frontend via `GET /progress?since=<seq>`. The app's Progress panel polls and renders the stream automatically.
 

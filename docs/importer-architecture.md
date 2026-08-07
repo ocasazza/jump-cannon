@@ -1,6 +1,6 @@
 # Importer architecture
 
-Status: **accepted; compatibility foundation implemented**.
+Status: **accepted; mandatory discovery/search schema implemented**.
 
 This document defines how jump-cannon stops treating an Obsidian vault as its
 data model and instead treats it as one importer. It supersedes the ingest and
@@ -27,10 +27,10 @@ SourceConnector ──bytes──► Decoder ──records──► GraphMapper 
   CBOR, and a runtime Pest grammar are decoders, not sources.
 - A **graph mapper** is pure. It turns records into validated graph operations.
 - A **graph sink** is the target ownership boundary: it validates operations
-  and atomically publishes a graph snapshot. The compatibility slice still
-  returns a complete `VaultGraph`; graph-api validates the invariants that
-  remain representable there before publication, and failed imports never
-  replace the live graph.
+  and atomically publishes a graph snapshot. The compatibility slice returns a
+  complete `VaultGraph` plus one typed `SearchDocument` per node. graph-api
+  validates both projections, builds search and facet data, and publishes them
+  together; failed imports never replace the live snapshot.
 - Writes are a separate, opt-in path: a pure encoder produces a mutation and a
   capability-bearing sink connector applies it. Read access never implies write
   access.
@@ -211,14 +211,89 @@ The first vertical slice materializes every source into a full graph and reuses
 core step so Kubernetes watches, UDP streams, and incremental filesystem
 updates do not require another ingestion redesign.
 
-Every importer exposes a descriptor with:
+Every importer descriptor now has an enforced stable ID, display name,
+implementation version, requested capabilities, watch plan, and mandatory
+`ImporterSchema`. Discovery schema version 1 describes:
 
-- stable ID, display name, version, and manifest API version;
-- supported snapshot/watch/write modes;
-- requested capabilities;
-- accepted and emitted media types;
-- configuration schema and secret-reference fields;
-- deterministic limits for input bytes, records, nodes, edges, and diagnostics.
+- accepted input media types;
+- fields with a logical type (`text`, `keyword`, `keyword_list`, `number`,
+  `boolean`, `date`, or `url`) and required, searchable, facetable, snippet,
+  boost, default-value, and sensitive flags;
+- the key and direction of every edge type the importer can emit; and
+- readable/writable source-content capabilities and their media types.
+
+The core `id`, `title`, and `tags` fields are required and searchable for every
+importer, with types `keyword`, `text`, and `keyword_list` respectively. A
+schema must contain at least one edge type, may declare at most 128 fields, and
+cannot mark a sensitive field searchable, facetable, or eligible for snippets.
+Writable content implies readable content, and the schema must agree with the
+descriptor's content capabilities.
+
+Each completed import emits exactly one `SearchDocument` for every graph node.
+The document must reference that node, may contain only declared fields, and
+must satisfy the schema's required fields, logical types, defaults, and global
+value-size bound. Its `id`, non-empty `title`, and unique `tags` must match the
+canonical graph node exactly. Sensitive fields may be declared for explicit
+exclusion but cannot enter a discovery document. Unknown source attributes can
+remain in node metadata, but they are neither indexed nor faceted until the
+importer explicitly declares and projects them. `HostedImporter` validates the
+descriptor before execution and the result afterward; `GraphSnapshot::build`
+repeats the graph/schema boundary validation before publication.
+
+Search indexing is a pure host-owned derivative of those validated documents,
+so every importer receives consistent search without needing network, storage,
+or a separate `Search` effect grant.
+
+Connector-backed importers must declare at least one input media type, and
+`ImportPipeline` checks every `SourceRecord` against that declaration before
+invoking the decoder. Matching is case-insensitive and permits parameters such
+as `charset` on the source record; an undeclared media type fails the import
+without running parser code. Native compatibility loaders that read their
+source directly do not cross this record boundary and remain responsible for
+decoding only their declared input format.
+
+### Implemented importer schemas
+
+All six selectable source kinds satisfy the version-1 contract:
+
+| Source | Discovery projection | Edge/content contract |
+| --- | --- | --- |
+| Obsidian | `id`, `title`, `tags`, `path`, `type`, `folder`, `body`, `description`, `status`, `authors`, `entities`, `key_topics`, `related` | Directed `wikilink`; Markdown content is readable and writable. |
+| tvix | `id`, `title`, `tags`, `path`, `type` | Directed `declared` edge; no source-content operations. |
+| generate | `id`, `title`, `tags`, `path`, `type` | Directed `generated` edge; no source-content operations. |
+| Kubernetes | `id`, `title`, `tags`, `path`, `type`, `namespace`, `api_version`, `labels`, `uid`, `resource_version` | Directed `owner_reference`; metadata discovery does not expose resource bodies as content. |
+| OKF | `id`, `title`, `tags`, `path`, `type`, `folder`, `body`, `description`, `resource`, `status`, `stale_after`, `trust_tier`, `generated_by`, `generated_at`, `verified_by`, `source_resources`, `source_titles`, `source_authors`, `runtime` | Directed `relationship`; no source-content operations yet. The normative format version is OKF v0.2. |
+| Pest package | Core `id`, `title`, `tags`, `path`, and `type`, plus only the package's declared property fields | Directed `declared` edge; no source-content operations. Package manifest format 2 makes the property schema mandatory. |
+
+The endpoint returns the searchable and facetable flags rather than asking
+clients to infer them from this table. Kubernetes `resource_version` is retained
+for discovery metadata but intentionally is not searchable; Pest property flags
+come from the validated package manifest.
+
+Pest capture values are strings, so package-defined discovery properties are
+limited to text, keyword, date, and URL fields. A package cannot redeclare the
+core keys or put a sensitive property in the discovery projection.
+
+### Search and facet publication
+
+graph-api builds a source-neutral, in-memory Tantivy index from the active
+importer's schema and documents. Search boosts, field-qualified query keys, and
+snippet eligibility all come from that schema. The metadata summary used for
+filters is likewise built only from fields marked facetable; it no longer
+assumes Obsidian frontmatter keys.
+
+The graph, schema, search index, metadata-facet summary, metrics, and binary
+caches belong to one `GraphSnapshot` revision and become visible through one
+atomic swap. A failed schema, document, index, or facet build leaves the prior
+revision active. graph-api does not spawn `vault-search`, and there is no
+title-only fallback for non-Obsidian sources.
+
+`GET /graph/schema` returns the current graph revision, active source ID/name/
+version, and complete discovery schema. `GET /search` returns matching IDs in
+protobuf; `GET /search/rich` returns JSON results with scores and snippets.
+Malformed queries or references to fields absent from the active schema return
+HTTP 400. Clients should inspect `/graph/schema` before presenting search keys,
+facets, or content actions.
 
 Source-instance IDs must namespace node and edge IDs before multiple importers
 can be composed into one graph. Kubernetes and OKF do this now; the current
@@ -318,14 +393,20 @@ Importer packages and source instances are separate resources.
 
 Today, loading data is an administrator/deployment action. One active source is
 selected when graph-api starts, using CLI flags or environment variables
-locally and equivalent server/volume configuration in Helm. The Dioxus app
-automatically loads the graph published by that active source and the existing
-Progress panel reports reload work. Switching from Obsidian to OKF, Kubernetes,
-or Pest therefore changes server configuration and normally restarts the
-server; it does not require a different frontend.
+locally and equivalent server/volume configuration in Helm. The six supported
+selections are Obsidian, tvix, generate, Kubernetes, OKF, and Pest. The Dioxus
+app automatically loads the graph published by that source and the existing
+Progress panel reports reload work. Switching sources therefore changes server
+configuration and normally restarts the server; it does not require a
+different frontend.
 
-The initial OKF integration exposes nodes, frontmatter attributes, schema tags,
-and edges, but deliberately does not advertise source-body read or write
+Every server importer publishes its current discovery/search contract at
+`/graph/schema`, and the Nodes search endpoint indexes the fields its importer
+declares. The Nodes panel displays the active searchable keys and surfaces
+invalid queries, but the current UI does not yet provide an importer-library or
+full query-builder panel.
+OKF exposes nodes, typed discovery fields, frontmatter attributes, tags, and
+edges, but deliberately does not advertise source-body read or write
 capabilities. Inspector metadata and graph filtering work; the Document body
 and editor remain unavailable until content reads are routed through the
 importer's bounded, no-follow filesystem boundary instead of graph-api's
@@ -346,7 +427,8 @@ The planned Dioxus Importers panel will keep package installation separate from
 source configuration:
 
 1. **Importer Library** shows built-ins and installed packages with their
-   version, digest, validation state, requested capabilities, and trust level.
+   version, digest, validation state, requested capabilities, trust level, and
+   declared search/facet/content contract.
 2. **Add Source** selects an importer and binds its declared effects to a
    concrete server-side directory, URL, Kubernetes scope, or other supported
    connector. Secrets remain references resolved by the host.
@@ -365,7 +447,7 @@ network-facing install/run operations remain intentionally unavailable.
 Planned server API:
 
 - `GET /importers` lists built-ins and installed packages, validation state,
-  digest, version, and requested capabilities.
+  digest, version, requested capabilities, and discovery schema.
 - `PUT /importers/:id` validates a bounded single-file package and its fixtures,
   then atomically installs it. This is gated on authentication/authorization.
 - `POST /importers/:id/preview` returns counts, sampled nodes/edges,
@@ -398,6 +480,10 @@ shareable app-state exports.
 - [x] Let Helm use either a chart-owned or externally owned PVC and create
   explicitly named companion ingestion ServiceAccounts without implicit RBAC.
 - [x] Keep Obsidian, tvix, and generated loaders behavior-compatible.
+- [x] Require a versioned discovery schema and one validated search document
+  per node from Obsidian, tvix, generate, Kubernetes, OKF, and Pest.
+- [x] Build generic Tantivy search and schema-driven facets inside the same
+  atomic graph snapshot, and expose the active contract at `/graph/schema`.
 
 ### Phase 2: generic graph ownership
 
@@ -412,9 +498,9 @@ shareable app-state exports.
   Kubernetes already namespaces its IDs, while Pest remains single-source.
 - [ ] Make third-party mappers emit through a host-owned operation sink so
   duplicate and output-limit enforcement cannot be bypassed or erased.
-- [ ] Route node content and search through source adapters. Content metadata is
-  explicit and `/vault/page` is now guarded as an Obsidian-only compatibility
-  write route.
+- [x] Route search through importer-owned, host-validated discovery documents.
+- [ ] Route node content through source adapters. Content metadata is explicit
+  and `/vault/page` remains an Obsidian-only compatibility write route.
 - [ ] Move JSON/CSV/DOT decoders out of `graph-layouts` into importer codecs.
 
 ### Phase 3: incremental runtime and secured library
