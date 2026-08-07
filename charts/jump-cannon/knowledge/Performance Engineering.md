@@ -15,3 +15,8 @@ them into one score.
 
 Weekly cluster results flow through [[Scheduled Tests]] to [[Observability]].
 GPU-backed runs follow [[Kueue Scheduling]] and [[Ray GPU Sessions]].
+
+Merge-time Metal Criterion runs publish their native reports as immutable Hydra
+build products. Compare retained Hydra results directly; benchmark derivations
+must not manage credentials, upload into a mutable dashboard store, or depend on
+an out-of-band format-conversion script.
