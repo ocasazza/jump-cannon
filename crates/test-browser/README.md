@@ -1,8 +1,7 @@
 # test-browser
 
-Rust-driven browser smoke test for the Dioxus frontend (app/ui) WASM
-bundle. Foundation crate — the assertion set is deliberately minimal
-while the frontend stabilizes.
+Rust-driven browser regression test for the Dioxus frontend (app/ui) WASM
+bundle.
 
 ## What it asserts today
 
@@ -10,13 +9,26 @@ while the frontend stabilizes.
 2. Headless Chromium launches with WebGPU flags and navigates.
 3. The boot log line `[jump-cannon-ui] boot` appears on the JS console
    within `--timeout-secs` (logged from `app/ui/src/main.rs`).
-4. The graph `<canvas>` element exists with non-zero width and height.
-5. A screenshot is written to `<out-dir>/boot.png`. **Pixel content is
-   not asserted** — that's the flaky part.
+4. The graph `<canvas>` exists, reaches render-ready, and has non-zero size.
+5. Graph header actions are visible, clickable, and do not begin a panel drag.
+6. Nodes has a left navigator and wider focused-content pane; selecting a
+   seeded note loads its body.
+7. Flat/Tags round-trips preserve selection, exact multi-tag groups contain
+   one row per node, synthetic `(untagged)` is present, core schema keys remain
+   visible, and the controls stay below the panel header in floating and tiling.
+8. Unified Settings exposes four accessible, content-backed tabs; restoring it
+   remounts a render-ready Graph canvas.
+9. CDP resource errors, console errors, Rust tracing errors, and unhandled
+   exceptions fail the run.
+10. Screenshots are written to `<out-dir>/nodes-editor.png` and `boot.png`.
+   Pixel content is reviewed rather than asserted.
 
-Future additions: motion deltas, click-doesn't-blank, tag round-trips,
-`/compute/health` shape, etc. (The egui-era Playwright suite that held
-those checks was removed with the egui frontend — see git history.)
+On Linux, the harness uses Vulkan for WebGPU compute while disabling the
+display surface; unified headless Chrome presents through its offscreen path
+instead of waiting on a nonexistent swapchain.
+Each invocation also uses incognito mode and a run-scoped Chromium profile, so
+persisted Panel Kit state and concurrent Chrome profile locks cannot leak
+between regressions.
 
 ## Running locally
 
@@ -32,9 +44,10 @@ a local `cd app && trunk build --release` if you want to test local
 edits.
 
 Output lands in `target/test-browser-rust/`:
+- `nodes-editor.png` — Nodes workbench with tag hierarchy and focused content
 - `boot.png` — screenshot at the moment all assertions passed
-- `report.json` — JSON with `{ok, canvas_width, canvas_height,
-  boot_log_found, duration_ms, console_logs[]}`
+- `report.json` — JSON including structured `nodes_editor`, `settings_tabs`,
+  `graph_header_actions`, canvas, boot-log, and browser-error results
 
 ## CLI
 

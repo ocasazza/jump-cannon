@@ -16,9 +16,11 @@ called `0.0.2`.
 
 Every importer descriptor must supply discovery schema version 1. It declares
 input media types, typed search/facet fields, edge semantics, and content
-capabilities. `id`, `title`, and `tags` are required searchable fields. Each
-successful import must emit exactly one typed `SearchDocument` for every graph
-node, using only fields declared by its schema. The host rejects missing,
+capabilities. `id`, `title`, and `tags` are required searchable fields, and
+`tags` must also be facetable so generic clients can build bulk tag navigation
+without one metadata request per node. Each successful import must emit exactly
+one typed `SearchDocument` for every graph node, using only fields declared by
+its schema. The host rejects missing,
 duplicate, unknown, mistyped, oversized, or capability-inconsistent output.
 Core document identity, title, and unique tags must match the canonical node;
 sensitive values cannot enter discovery documents.

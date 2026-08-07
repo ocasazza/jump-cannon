@@ -244,7 +244,9 @@ mod tests {
             vec![
                 DiscoveryField::new("id", DiscoveryFieldType::Keyword, true).searchable(2),
                 DiscoveryField::new("title", DiscoveryFieldType::Text, true).searchable(3),
-                DiscoveryField::new("tags", DiscoveryFieldType::KeywordList, true).searchable(2),
+                DiscoveryField::new("tags", DiscoveryFieldType::KeywordList, true)
+                    .searchable(2)
+                    .facetable(),
             ],
             vec![EdgeTypeSchema::directed("relationship", "test")],
         )

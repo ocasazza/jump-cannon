@@ -43,9 +43,10 @@ use crate::panels::filter;
 use crate::panels::inspector::badge_dispatch;
 use crate::{api, badges, proto, Ctx};
 
-/// DOM id of the source textarea — the cursor/selection helpers reach it
-/// through `document.getElementById` (one Document panel per workspace).
-const EDIT_ID: &str = "jc-doc-src";
+/// DOM id used by the detachable Document panel. The Nodes workbench embeds
+/// the same viewer with a different id so both surfaces can be open without
+/// cursor/find operations targeting the wrong textarea.
+const DOCUMENT_EDIT_ID: &str = "jc-doc-src";
 
 // --- per-node editor state (PageViewerState port) -----------------------------------
 
@@ -245,13 +246,13 @@ fn byte_to_u16(s: &str, byte_idx: usize) -> usize {
 /// The web-sys feature set doesn't include HtmlTextAreaElement, so the
 /// selection API goes through js-sys reflection on the raw element — still
 /// all-Rust, no JS shims.
-fn edit_el() -> Option<web_sys::Element> {
-    web_sys::window()?.document()?.get_element_by_id(EDIT_ID)
+fn edit_el(editor_id: &str) -> Option<web_sys::Element> {
+    web_sys::window()?.document()?.get_element_by_id(editor_id)
 }
 
 /// Read `selectionStart` (UTF-16 units) from the source textarea.
-fn dom_cursor_u16() -> usize {
-    edit_el()
+fn dom_cursor_u16(editor_id: &str) -> usize {
+    edit_el(editor_id)
         .and_then(|el| js_sys::Reflect::get(&el, &"selectionStart".into()).ok())
         .and_then(|v| v.as_f64())
         .map(|f| f as usize)
@@ -259,8 +260,10 @@ fn dom_cursor_u16() -> usize {
 }
 
 /// `setSelectionRange(start, end)` + `focus()` on the source textarea.
-fn dom_set_selection_u16(start: usize, end: usize) {
-    let Some(el) = edit_el() else { return };
+fn dom_set_selection_u16(editor_id: &str, start: usize, end: usize) {
+    let Some(el) = edit_el(editor_id) else {
+        return;
+    };
     if let Ok(f) = js_sys::Reflect::get(&el, &"focus".into()) {
         if let Some(func) = f.dyn_ref::<js_sys::Function>() {
             let _ = func.call0(&el);
@@ -278,8 +281,8 @@ fn dom_set_selection_u16(start: usize, end: usize) {
 /// Insert `s` at the textarea cursor — the Tab → 4-spaces shim. The
 /// controlled-textarea value rewrite resets the DOM cursor, so the new
 /// position is restored on the next tick.
-fn insert_at_cursor(node_id: &str, s: &str) {
-    let cur = dom_cursor_u16();
+fn insert_at_cursor(node_id: &str, editor_id: &str, s: &str) {
+    let cur = dom_cursor_u16(editor_id);
     with_doc(node_id, |d| {
         let cur = cur.min(d.buffer.encode_utf16().count());
         let byte = u16_to_byte(&d.buffer, cur);
@@ -288,16 +291,17 @@ fn insert_at_cursor(node_id: &str, s: &str) {
         d.cursor_u16 = cur + s.encode_utf16().count();
     });
     let target = cur + s.encode_utf16().count();
+    let editor_id = editor_id.to_string();
     spawn(async move {
         gloo_timers::future::TimeoutFuture::new(0).await;
-        dom_set_selection_u16(target, target);
+        dom_set_selection_u16(&editor_id, target, target);
     });
 }
 
 /// Walk the buffer for the next find hit after `find_last_jump`, wrapping
 /// to the start when exhausted; select it in the textarea — port of
 /// `jump_to_next_match`.
-fn jump_to_next_match(node_id: &str) {
+fn jump_to_next_match(node_id: &str, editor_id: &str) {
     let sel = with_doc(node_id, |d| {
         if d.find_query.is_empty() {
             return None;
@@ -314,7 +318,7 @@ fn jump_to_next_match(node_id: &str) {
         Some((start, end))
     });
     if let Some((start, end)) = sel {
-        dom_set_selection_u16(start, end);
+        dom_set_selection_u16(editor_id, start, end);
     }
 }
 
@@ -364,6 +368,12 @@ fn render_markdown(md: &str) -> String {
 // --- panel -----------------------------------------------------------------------------
 
 pub(crate) fn panel(ctx: Ctx) -> Element {
+    viewer(ctx, DOCUMENT_EDIT_ID)
+}
+
+/// Reusable node-content viewer. `editor_id` identifies the concrete surface
+/// so the embedded Nodes editor and detachable Document panel can coexist.
+pub(crate) fn viewer(ctx: Ctx, editor_id: &'static str) -> Element {
     if !ctx.graph_session.read().is_server_backed() {
         return rsx! { div { class: "empty",
             "Client-only graph: there is no server-owned vault page to view or edit."
@@ -489,7 +499,7 @@ pub(crate) fn panel(ctx: Ctx) -> Element {
                 rsx! { div { class: "rendered-md", dangerous_inner_html: render_markdown(&body_text) } }
             }
         }
-        ViewMode::Source => source_editor(ctx, &node_id, &path, &st, total_lines),
+        ViewMode::Source => source_editor(ctx, editor_id, &node_id, &path, &st, total_lines),
     };
 
     let (id_t1, id_t2) = (node_id.clone(), node_id.clone());
@@ -548,6 +558,7 @@ pub(crate) fn panel(ctx: Ctx) -> Element {
 /// source renders as plain monospace.
 fn source_editor(
     ctx: Ctx,
+    editor_id: &'static str,
     node_id: &str,
     path: &str,
     st: &DocState,
@@ -574,6 +585,12 @@ fn source_editor(
     let path_kd = path.to_string();
     let find_query = st.find_query.clone();
     let buffer = st.buffer.clone();
+    let editor_id_find = editor_id;
+    let editor_id_find_button = editor_id;
+    let editor_id_input = editor_id;
+    let editor_id_key = editor_id;
+    let editor_id_cursor = editor_id;
+    let editor_id_cursor_key = editor_id;
 
     rsx! {
         if st.find_open {
@@ -588,13 +605,13 @@ fn source_editor(
                     }),
                     onkeydown: move |e: KeyboardEvent| {
                         if e.key() == Key::Enter {
-                            jump_to_next_match(&id_fkd);
+                            jump_to_next_match(&id_fkd, editor_id_find);
                         }
                     },
                 }
                 span { class: "doc-dim", "{match_count} matches" }
                 button { class: "btn", title: "Enter while focused in the find field",
-                    onclick: move |_| jump_to_next_match(&id_fnext),
+                    onclick: move |_| jump_to_next_match(&id_fnext, editor_id_find_button),
                     "Find next"
                 }
             }
@@ -602,14 +619,14 @@ fn source_editor(
         div { class: "doc-srcwrap",
             pre { class: "doc-gutter", "{gutter}" }
             textarea {
-                id: EDIT_ID,
+                id: editor_id,
                 class: "doc-src",
                 spellcheck: false,
                 rows: "{rows}",
                 value: "{buffer}",
                 oninput: move |e| {
                     let v = e.value();
-                    let cur = dom_cursor_u16();
+                    let cur = dom_cursor_u16(editor_id_input);
                     with_doc(&id_in, |d| {
                         d.buffer = v;
                         d.recompute_dirty();
@@ -623,11 +640,11 @@ fn source_editor(
                 // Cursor readout tracking — click + arrow keys move the
                 // caret without an input event.
                 onclick: move |_| {
-                    let cur = dom_cursor_u16();
+                    let cur = dom_cursor_u16(editor_id_cursor);
                     with_doc(&id_cur, |d| d.cursor_u16 = cur);
                 },
                 onkeyup: move |_| {
-                    let cur = dom_cursor_u16();
+                    let cur = dom_cursor_u16(editor_id_cursor_key);
                     with_doc(&id_cur2, |d| d.cursor_u16 = cur);
                 },
                 onkeydown: move |e: KeyboardEvent| {
@@ -638,7 +655,7 @@ fn source_editor(
                         // raw Tab before the TextEdit saw it).
                         Key::Tab if !cmd => {
                             e.prevent_default();
-                            insert_at_cursor(&id_kd, "    ");
+                            insert_at_cursor(&id_kd, editor_id_key, "    ");
                         }
                         Key::Escape => with_doc(&id_kd, |d| d.find_open = false),
                         Key::Character(c) if cmd && c.eq_ignore_ascii_case("s") => {

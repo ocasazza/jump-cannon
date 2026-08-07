@@ -8,21 +8,36 @@ tags: [jump-cannon, search, editing]
 
 # Nodes, Search, and Documents
 
-The Nodes panel searches the active server importer's validated discovery
-documents. Search is source-neutral and supports the field-qualified keys
-declared by `GET /graph/schema`; snippets, boosts, and metadata-filter facets
-also come from that schema. Obsidian, tvix, generate, Kubernetes, OKF, and Pest
-therefore use the same graph-api search path rather than a title-only fallback.
-The panel shows the active field-qualified keys and reports invalid query or
-schema errors inline.
+Nodes is an editor-style workbench. Its left navigator lists nodes and its main
+area follows the selected node, showing source identity, path, content state,
+frontmatter badges, and any readable body. Select from the navigator or the
+Graph; both routes focus the same node. Inspector and Document remain available
+as detachable views, while Nodes keeps navigation and content together for the
+normal workflow.
 
-Selecting a node fills Inspector and, when the source advertises readable
-content, Document. The current Obsidian importer is the only built-in with
-readable and writable source content. Saving its Document sends
-`PUT /vault/page`; graph-api preserves YAML frontmatter and the vault watcher
-reloads the complete graph/search snapshot. Other server-hosted sources are
-read-only until their importer schema and connector explicitly implement
-content access.
+With an empty query, switch the navigator between Flat and Tags. Tags groups by
+the exact keyword emitted by the importer: a multi-tagged node appears under
+each tag, while nodes without tags appear under the visually distinct synthetic
+`(untagged)` group.
+The generic schema does not assign special meaning to `/` or another character
+inside a tag. Groups expand lazily and visible lists are bounded for large
+graphs; an already selected node remains pinned into view beyond those bounds.
+Tag navigation uses the bulk facet snapshot rather than requesting metadata for
+every node.
+
+Typing switches the navigator to search results. Search is source-neutral and
+supports the field-qualified keys declared by `GET /graph/schema`; snippets,
+boosts, and metadata-filter facets also come from that schema. Obsidian, tvix,
+generate, Kubernetes, OKF, and Pest therefore use the same graph-api search path
+rather than a title-only fallback. The toolbar shows the active keys and reports
+invalid query or schema errors inline.
+
+The current Obsidian importer is the only built-in with readable and writable
+source content. Saving from the focused editor sends `PUT /vault/page`;
+graph-api preserves YAML frontmatter and the vault watcher reloads the complete
+graph/search snapshot. Other server-hosted sources show read-only content or a
+truthful metadata-only state until their importer schema and connector
+explicitly implement content access.
 
 Graphs created inside the browser remain client-only and are separate from the
 server-side `generate` importer. See [[Backend API]], [[Importer Runtime]], and

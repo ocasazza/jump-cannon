@@ -1,4 +1,4 @@
-//! Rust-driven browser regression suite (foundation).
+//! Rust-driven browser regression suite.
 //!
 //! Asserts the bare minimum that future regression checks will build on:
 //!
@@ -6,8 +6,10 @@
 //!   2. Headless Chromium launches with WebGPU flags and navigates.
 //!   3. The boot log line `[jump-cannon-ui] boot` appears on the JS
 //!      console within `--timeout-secs`.
-//!   4. The graph `<canvas>` element exists with non-zero width/height.
-//!   5. A screenshot is saved to `<out-dir>/boot.png` for visual review.
+//!   4. The graph canvas becomes render-ready and its header controls work.
+//!   5. Nodes is a two-pane editor; Flat/Tags selection and content work.
+//!   6. Unified Settings exposes four accessible, content-backed tabs.
+//!   7. Screenshots are saved for the Nodes editor and complete workspace.
 //!
 //! Anything flaky (pixel brightness, motion deltas, click recovery) is
 //! deliberately deferred. (The legacy egui-era Playwright suite that held
@@ -37,6 +39,20 @@ const BOOT_LOG_NEEDLE: &str = "[jump-cannon-ui] boot";
 /// the overall smoke-test deadline.
 const READINESS_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// CDP's Log domain and Runtime console domain report severity differently.
+/// Preserve native error/exception levels, and also catch Rust tracing's
+/// `ERROR ...` records, which tracing-wasm emits through `console.log`.
+fn browser_log_is_error(line: &str) -> bool {
+    if line.starts_with("[error]") || line.starts_with("[exception]") {
+        return true;
+    }
+    line.strip_prefix("[log]")
+        .map(str::trim_start)
+        .map(|message| message.trim_start_matches('"').replace("%c", ""))
+        .map(|message| message.starts_with("ERROR "))
+        .unwrap_or(false)
+}
+
 #[derive(Parser, Debug)]
 #[command(name = "test-browser", about = "Rust-driven browser smoke test")]
 struct Args {
@@ -55,6 +71,10 @@ struct Args {
     /// Overall test timeout (seconds).
     #[arg(long, default_value_t = 60)]
     timeout_secs: u64,
+
+    /// Require the wrapper's stable Nodes editor fixtures and strict checks.
+    #[arg(long)]
+    fixtures_required: bool,
 }
 
 #[derive(Serialize)]
@@ -69,6 +89,10 @@ struct Report {
     reason: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     graph_header_actions: Option<HeaderActionCheck>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    nodes_editor: Option<NodesEditorCheck>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    settings_tabs: Option<SettingsTabsCheck>,
     page_errors: Vec<String>,
     console_logs: Vec<String>,
 }
@@ -96,10 +120,47 @@ struct HeaderActionCheck {
     drag_started: bool,
     canvas_present: bool,
     render_ready: bool,
+    secure_context: bool,
+    webgpu_available: bool,
     node_count: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     reason: Option<String>,
     actions: Vec<HeaderActionDetail>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct NodesEditorCheck {
+    ok: bool,
+    fixture_contract: bool,
+    panel_visible: bool,
+    horizontal_split: bool,
+    controls_below_header: bool,
+    controls_hit_test: bool,
+    tiling_geometry: bool,
+    sidebar_width: f64,
+    main_width: f64,
+    flat_default: bool,
+    selected_content_loaded: bool,
+    selection_persisted: bool,
+    exact_tag_groups: bool,
+    untagged_group: bool,
+    flat_active_count: usize,
+    schema_core_keys: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    reason: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct SettingsTabsCheck {
+    ok: bool,
+    labels: Vec<String>,
+    content_panels: Vec<String>,
+    aria_contract: bool,
+    controls_hit_test: bool,
+    legacy_panels_absent: bool,
+    graph_restored: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    reason: Option<String>,
 }
 
 #[tokio::main(flavor = "multi_thread")]
@@ -133,32 +194,75 @@ async fn main() -> Result<()> {
     let duration_ms = started.elapsed().as_millis();
 
     let logs = console_logs.lock().await.clone();
-    let (ok, reason, canvas_width, canvas_height, boot_log_found, header_actions, page_errors) =
-        match &result {
-            Ok(o) => {
-                let ok = o.header_actions.ok && o.page_errors.is_empty();
-                let reason = if !o.header_actions.ok {
-                    o.header_actions.reason.clone()
-                } else if !o.page_errors.is_empty() {
-                    Some(format!(
-                        "browser emitted {} console error(s) or unhandled exception(s)",
-                        o.page_errors.len()
-                    ))
-                } else {
-                    None
-                };
-                (
-                    ok,
-                    reason,
-                    o.canvas_width,
-                    o.canvas_height,
-                    o.boot_log_found,
-                    Some(o.header_actions.clone()),
-                    o.page_errors.clone(),
-                )
-            }
-            Err(e) => (false, Some(format!("{e:#}")), 0, 0, false, None, Vec::new()),
-        };
+    let captured_page_errors: Vec<String> = logs
+        .iter()
+        .filter(|line| browser_log_is_error(line))
+        .cloned()
+        .collect();
+    let (
+        ok,
+        reason,
+        canvas_width,
+        canvas_height,
+        boot_log_found,
+        header_actions,
+        nodes_editor,
+        settings_tabs,
+        page_errors,
+    ) = match &result {
+        Ok(o) => {
+            let ok = o.boot_log_found
+                && o.canvas_width > 0
+                && o.canvas_height > 0
+                && o.header_actions.ok
+                && o.nodes_editor.ok
+                && o.settings_tabs.ok
+                && captured_page_errors.is_empty();
+            let reason = if !o.boot_log_found {
+                Some(format!("boot log {BOOT_LOG_NEEDLE:?} was not observed"))
+            } else if o.canvas_width == 0 || o.canvas_height == 0 {
+                Some(format!(
+                    "canvas dimensions invalid: {}x{}",
+                    o.canvas_width, o.canvas_height
+                ))
+            } else if !o.header_actions.ok {
+                o.header_actions.reason.clone()
+            } else if !o.nodes_editor.ok {
+                o.nodes_editor.reason.clone()
+            } else if !o.settings_tabs.ok {
+                o.settings_tabs.reason.clone()
+            } else if !captured_page_errors.is_empty() {
+                Some(format!(
+                    "browser emitted {} console error(s) or unhandled exception(s)",
+                    captured_page_errors.len()
+                ))
+            } else {
+                None
+            };
+            (
+                ok,
+                reason,
+                o.canvas_width,
+                o.canvas_height,
+                o.boot_log_found,
+                Some(o.header_actions.clone()),
+                Some(o.nodes_editor.clone()),
+                Some(o.settings_tabs.clone()),
+                captured_page_errors.clone(),
+            )
+        }
+        Err(e) => (
+            false,
+            Some(format!("{e:#}")),
+            0,
+            0,
+            false,
+            None,
+            None,
+            None,
+            captured_page_errors.clone(),
+        ),
+    };
 
     let report = Report {
         ok,
@@ -169,6 +273,8 @@ async fn main() -> Result<()> {
         duration_ms,
         reason: reason.clone(),
         graph_header_actions: header_actions,
+        nodes_editor,
+        settings_tabs,
         page_errors,
         console_logs: tail(&logs, 50),
     };
@@ -192,7 +298,8 @@ struct RunOk {
     canvas_height: u32,
     boot_log_found: bool,
     header_actions: HeaderActionCheck,
-    page_errors: Vec<String>,
+    nodes_editor: NodesEditorCheck,
+    settings_tabs: SettingsTabsCheck,
 }
 
 fn chromium_args() -> Vec<&'static str> {
@@ -215,6 +322,13 @@ async fn run(args: &Args, console_logs: Arc<Mutex<Vec<String>>>) -> Result<RunOk
     let mut config = BrowserConfig::builder()
         .chrome_executable(&args.chromium)
         .args(chromium_args())
+        // Panel Kit intentionally persists workspace and per-panel choices.
+        // Keep regression defaults deterministic and discard state on exit.
+        .incognito()
+        // The flake wrapper gives each invocation a unique temporary out_dir.
+        // Keep Chrome's ProcessSingleton/profile lock scoped to that run too,
+        // so concurrent browser gates cannot attach to or evict one another.
+        .user_data_dir(args.out_dir.join("chromium-profile"))
         // This is an isolated automation browser. Use chromiumoxide's typed
         // switch so rootful container callers cannot accidentally omit it.
         .no_sandbox()
@@ -240,13 +354,15 @@ async fn run(args: &Args, console_logs: Arc<Mutex<Vec<String>>>) -> Result<RunOk
         config = config
             .arg(("enable-features", "Vulkan"))
             .arg(("use-angle", "vulkan"))
-            .arg(("use-gl", "angle"));
+            .arg(("use-gl", "angle"))
+            // Unified headless Chrome has no display swapchain. Keep Dawn's
+            // Vulkan adapter/compute path, but present through its headless
+            // blit path so the first surface frame cannot block Runtime/CDP.
+            .arg("disable-vulkan-surface");
     }
     let config = config.build().map_err(|e| anyhow!("BrowserConfig: {e}"))?;
 
-    let (mut browser, mut handler) = Browser::launch(config)
-        .await
-        .context("Browser::launch")?;
+    let (mut browser, mut handler) = Browser::launch(config).await.context("Browser::launch")?;
 
     // The CDP handler must be driven; spawn a task that polls it.
     let handler_task = tokio::spawn(async move {
@@ -288,10 +404,7 @@ async fn drive_page(
 ) -> Result<RunOk> {
     use chromiumoxide::cdp::browser_protocol::page::EventLifecycleEvent;
 
-    let page = browser
-        .new_page("about:blank")
-        .await
-        .context("new_page")?;
+    let page = browser.new_page("about:blank").await.context("new_page")?;
 
     // Console listener. Push every entry; we filter for the boot needle
     // when polling below.
@@ -309,15 +422,12 @@ async fn drive_page(
         .context("listen runtime exceptions")?;
     // Suppress unused warning on lifecycle stream (kept in case future
     // checks want to wait for `load` semantically).
-    let _ = page
-        .event_listener::<EventLifecycleEvent>()
-        .await
-        .ok();
+    let _ = page.event_listener::<EventLifecycleEvent>().await.ok();
 
     let logs_a = console_logs.clone();
     let console_pump = tokio::spawn(async move {
         while let Some(ev) = console_events.next().await {
-            let line = format!("[log] {}", ev.entry.text);
+            let line = format!("[{}] {}", ev.entry.level.as_ref(), ev.entry.text);
             logs_a.lock().await.push(line);
         }
     });
@@ -408,9 +518,7 @@ async fn drive_page(
         const actions = header?.querySelectorAll(
           '.panel-head-actions button.panel-head-action'
         );
-        const nodeCount = Number(
-          document.querySelector('.stats .kv:first-child .v')?.textContent || 0
-        );
+        const nodeCount = Number(canvas?.dataset.nodeCount || 0);
         return Boolean(
           panel && header && canvas && actions?.length >= 2 &&
           canvas.dataset.renderReady === 'true' && nodeCount > 0
@@ -474,6 +582,354 @@ async fn drive_page(
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
 
+    // ---- 5. Nodes is an editor-style navigator + focused-content surface --
+    // Exercise real buttons and wait on the same DOM state a user sees. The
+    // wrapper seeds stable fixtures so this contract is independent of edits
+    // to the living documentation corpus.
+    let nodes_editor_js = r#"(async () => {
+        const waitFor = async (predicate, timeoutMs = 6000) => {
+          const deadline = performance.now() + timeoutMs;
+          while (performance.now() < deadline) {
+            const value = predicate();
+            if (value) return value;
+            await new Promise((resolve) => setTimeout(resolve, 50));
+          }
+          return null;
+        };
+        const failures = [];
+        const editor = await waitFor(() => document.querySelector('[data-testid="nodes-editor"]'));
+        const panel = editor?.closest('section.panel-nodes');
+        const header = panel?.querySelector(':scope > header.panel-head');
+        const sidebar = editor?.querySelector('[data-testid="node-sidebar"]');
+        const main = editor?.querySelector('[data-testid="node-main"]');
+        const search = editor?.querySelector('input.nodes-search');
+        const flat = editor?.querySelector('[data-node-list-mode="flat"]');
+        const tags = editor?.querySelector('[data-node-list-mode="tags"]');
+        const editorRect = editor?.getBoundingClientRect();
+        const headerRect = header?.getBoundingClientRect();
+        const sidebarRect = sidebar?.getBoundingClientRect();
+        const mainRect = main?.getBoundingClientRect();
+        const panelVisible = Boolean(
+          panel && editorRect && editorRect.width > 0 && editorRect.height > 0
+        );
+        const horizontalSplit = Boolean(
+          sidebarRect && mainRect &&
+          sidebarRect.width > 0 && mainRect.width > sidebarRect.width &&
+          mainRect.left >= sidebarRect.right - 1
+        );
+        const controls = [search, flat, tags].filter(Boolean);
+        const controlsBelowHeader = Boolean(
+          headerRect && editorRect && controls.length === 3 &&
+          editorRect.top >= headerRect.bottom - 1 &&
+          controls.every((control) => control.getBoundingClientRect().top >= headerRect.bottom - 1)
+        );
+        const controlsHitTest = controls.length === 3 && controls.every((control) => {
+          const rect = control.getBoundingClientRect();
+          const hit = document.elementFromPoint(
+            rect.left + rect.width / 2,
+            rect.top + rect.height / 2
+          );
+          return hit === control || control.contains(hit);
+        });
+
+        const flatDefault = flat?.getAttribute('aria-pressed') === 'true';
+        const schemaCoreKeys = Boolean(await waitFor(() => {
+          const keys = [...(editor?.querySelectorAll('.search-schema-key') || [])]
+            .map((element) => (element.textContent || '').trim());
+          return ['id:', 'title:', 'tags:'].every((key) => keys.includes(key));
+        }));
+
+        const strictFixture = sidebar?.querySelector(
+          '[data-node-id="Node Editor Fixture"]'
+        );
+        const fixtureContract = Boolean(strictFixture);
+        const fixture = strictFixture || sidebar?.querySelector('[data-node-id]');
+        const fixtureId = fixture?.getAttribute('data-node-id') || '';
+        fixture?.click();
+        const selectedContentLoaded = Boolean(await waitFor(() =>
+          main?.querySelector('[data-focused-node]')?.getAttribute('data-focused-node') === fixtureId &&
+          (!fixtureContract ||
+            (main?.textContent || '').includes('BROWSER_NODE_EDITOR_SENTINEL'))
+        ));
+
+        tags?.click();
+        const tagModeReady = Boolean(await waitFor(() =>
+          tags?.getAttribute('aria-pressed') === 'true' &&
+          editor?.querySelector('[data-tag]')
+        ));
+        const groups = [...(editor?.querySelectorAll('[data-tag-kind="exact"]') || [])];
+        const groupNamed = (tag) => groups.find(
+          (group) => group.getAttribute('data-tag') === tag
+        );
+        const untaggedGroup = editor?.querySelector('[data-synthetic-group="untagged"]');
+        const expand = (group) => {
+          const summary = group?.querySelector('.nodes-tag-summary');
+          if (summary?.getAttribute('aria-expanded') !== 'true') summary?.click();
+          return group;
+        };
+        const groupsToExercise = fixtureContract
+          ? [groupNamed('browser-editor'), groupNamed('browser-shared')].filter(Boolean)
+          : groups.slice(0, 2);
+        groupsToExercise.forEach(expand);
+        expand(untaggedGroup);
+        await waitFor(() => groupsToExercise.every(
+          (group) => group.querySelector('[data-node-id]')
+        ));
+        const genericGroupsExact = groupsToExercise.length > 0 && groupsToExercise.every(
+          (group) => {
+            const ids = [...group.querySelectorAll('[data-node-id]')]
+              .map((node) => node.getAttribute('data-node-id'));
+            return ids.length > 0 && new Set(ids).size === ids.length;
+          }
+        );
+        const editorGroup = groupNamed('browser-editor');
+        const sharedGroup = groupNamed('browser-shared');
+        const fixtureGroupsExact = Boolean(
+          editorGroup && sharedGroup &&
+          [...editorGroup.querySelectorAll('[data-node-id]')]
+            .filter((node) => node.getAttribute('data-node-id') === fixtureId).length === 1 &&
+          [...sharedGroup.querySelectorAll('[data-node-id]')]
+            .filter((node) => node.getAttribute('data-node-id') === fixtureId).length === 1 &&
+          [...sharedGroup.querySelectorAll('[data-node-id]')]
+            .some((node) => node.getAttribute('data-node-id') === 'Node Shared Fixture')
+        );
+        const exactTagGroups = tagModeReady && genericGroupsExact &&
+          (!fixtureContract || fixtureGroupsExact);
+        const untaggedGroupPresent = Boolean(
+          untaggedGroup?.querySelector('[data-node-id]')
+        );
+        const fixtureUntagged = Boolean(
+          [...(untaggedGroup?.querySelectorAll('[data-node-id]') || [])]
+            .some((node) => node.getAttribute('data-node-id') === 'Node Untagged Fixture')
+        );
+        const selectionPersisted = Boolean(
+          main?.querySelector('[data-focused-node]')?.getAttribute('data-focused-node') === fixtureId &&
+          (!fixtureContract ||
+            (main?.textContent || '').includes('BROWSER_NODE_EDITOR_SENTINEL'))
+        );
+
+        flat?.click();
+        await waitFor(() => flat?.getAttribute('aria-pressed') === 'true');
+        const flatActiveCount = [...(sidebar?.querySelectorAll(
+          '[data-node-id][aria-current="page"]'
+        ) || [])].filter(
+          (node) => node.getAttribute('data-node-id') === fixtureId
+        ).length;
+
+        // Leave the hierarchy visible for the screenshot while proving the
+        // selection survives the round trip through both navigator modes.
+        tags?.click();
+        await waitFor(() => tags?.getAttribute('aria-pressed') === 'true');
+
+        // The editor must remain usable in Panel Kit's other desktop mode.
+        // A too-small default tile was the second half of the reported visual
+        // regression, so check both size and the left-nav/content relationship.
+        const workspace = panel?.closest('.ws');
+        const modeToggle = panel?.querySelector('.light.mode');
+        let tilingGeometry = false;
+        if (workspace && modeToggle && header && search && sidebar && main) {
+          modeToggle.click();
+          const tiled = await waitFor(() => workspace.classList.contains('tiling'));
+          if (tiled) {
+            const tiledPanel = panel.getBoundingClientRect();
+            const tiledHeader = header.getBoundingClientRect();
+            const tiledSearch = search.getBoundingClientRect();
+            const tiledSidebar = sidebar.getBoundingClientRect();
+            const tiledMain = main.getBoundingClientRect();
+            tilingGeometry = Boolean(
+              tiledPanel.width >= 480 && tiledPanel.height >= 450 &&
+              tiledSearch.top >= tiledHeader.bottom - 1 &&
+              tiledSidebar.width > 0 && tiledMain.width > tiledSidebar.width &&
+              tiledMain.left >= tiledSidebar.right - 1
+            );
+          }
+          modeToggle.click();
+          await waitFor(() => workspace.classList.contains('floating'));
+        }
+
+        if (!panelVisible) failures.push('Nodes editor panel missing or hidden');
+        if (!horizontalSplit) failures.push('Nodes navigator is not left of a wider content pane');
+        if (!controlsBelowHeader) failures.push('Nodes controls overlap the panel header');
+        if (!controlsHitTest) failures.push('Nodes controls are obscured from pointer input');
+        if (!tilingGeometry) failures.push('Nodes tile is too small for the editor layout');
+        if (!flatDefault) failures.push('Flat navigator is not the fresh-layout default');
+        if (!schemaCoreKeys) failures.push('core importer search keys missing');
+        if (!selectedContentLoaded) failures.push('selected node content did not load');
+        if (!selectionPersisted) failures.push('selection/content did not survive Tags mode');
+        if (!exactTagGroups) failures.push('exact multi-tag grouping is incorrect');
+        if (fixtureContract && (!untaggedGroupPresent || !fixtureUntagged)) {
+          failures.push('synthetic untagged group or fixture missing');
+        }
+        if (flatActiveCount !== 1) failures.push('Flat mode did not expose exactly one active row');
+        return {
+          ok: failures.length === 0,
+          fixture_contract: fixtureContract,
+          panel_visible: panelVisible,
+          horizontal_split: horizontalSplit,
+          controls_below_header: controlsBelowHeader,
+          controls_hit_test: controlsHitTest,
+          tiling_geometry: tilingGeometry,
+          sidebar_width: sidebarRect?.width || 0,
+          main_width: mainRect?.width || 0,
+          flat_default: flatDefault,
+          selected_content_loaded: selectedContentLoaded,
+          selection_persisted: selectionPersisted,
+          exact_tag_groups: Boolean(exactTagGroups),
+          untagged_group: untaggedGroupPresent,
+          flat_active_count: flatActiveCount,
+          schema_core_keys: schemaCoreKeys,
+          reason: failures.length ? failures.join('; ') : null,
+        };
+    })()"#;
+    let nodes_editor_value: serde_json::Value =
+        page.evaluate(nodes_editor_js).await?.into_value()?;
+    let mut nodes_editor: NodesEditorCheck = serde_json::from_value(nodes_editor_value)
+        .context("decode Nodes editor regression result")?;
+    if args.fixtures_required && !nodes_editor.fixture_contract {
+        nodes_editor.ok = false;
+        nodes_editor.reason =
+            Some("required Nodes editor fixtures were not imported into the navigator".to_string());
+    }
+
+    let nodes_png = page
+        .screenshot(CaptureScreenshotParams::builder().build())
+        .await
+        .context("Nodes editor screenshot")?;
+    let nodes_bytes = if nodes_png.first() == Some(&0x89) {
+        nodes_png
+    } else {
+        base64::engine::general_purpose::STANDARD
+            .decode(&nodes_png)
+            .unwrap_or(nodes_png)
+    };
+    let nodes_shot_path = args.out_dir.join("nodes-editor.png");
+    tokio::fs::write(&nodes_shot_path, nodes_bytes).await?;
+    tracing::info!("wrote screenshot {}", nodes_shot_path.display());
+
+    // ---- 6. Unified Settings exposes four accessible, real tabs ---------
+    // Maximize Settings so every tab is both visible and pointer-hit-testable,
+    // exercise each delegated panel, then restore the workspace. Restoring
+    // also proves that the Graph canvas has one reliable remount owner.
+    let settings_tabs_js = r#"(async () => {
+        const waitFor = async (predicate, timeoutMs = 10000) => {
+          const deadline = performance.now() + timeoutMs;
+          while (performance.now() < deadline) {
+            const value = predicate();
+            if (value) return value;
+            await new Promise((resolve) => setTimeout(resolve, 50));
+          }
+          return null;
+        };
+        const failures = [];
+        const expected = [
+          ['Connection', 'connection', 'input[aria-label="Graph API server URL"]'],
+          ['Layout', 'layout', '.lay'],
+          ['Appearance', 'appearance', '.sty'],
+          ['Camera', 'camera', '.cam'],
+        ];
+        const initialPanel = document.querySelector('section.panel-settings');
+        const maximize = initialPanel?.querySelector(
+          ':scope > header.panel-head .light.max'
+        );
+        maximize?.click();
+        // Panel Kit remounts the sole visible panel when maximizing. Reacquire
+        // it before checking geometry or driving its Dioxus event handlers.
+        const panel = await waitFor(() => {
+          const candidate = document.querySelector('section.panel-settings');
+          const rect = candidate?.getBoundingClientRect();
+          return document.querySelector('.ws.maxed') &&
+            rect?.width > 900 && rect?.height > 400 && candidate;
+        });
+        const maximized = Boolean(panel);
+
+        const tabs = [...(panel?.querySelectorAll('[role="tab"]') || [])];
+        const labels = tabs.map((tab) => (tab.textContent || '').trim());
+        const contentPanels = [];
+        let ariaContract = maximized && labels.length === expected.length &&
+          expected.every(([label], index) => labels[index] === label);
+        let controlsHitTest = maximized && tabs.length === expected.length;
+
+        for (const [label, slug, selector] of expected) {
+          const tab = tabs.find((candidate) => (candidate.textContent || '').trim() === label);
+          tab?.click();
+          const content = await waitFor(() => {
+            const selected = panel?.querySelector(`[role="tab"][aria-selected="true"]`);
+            const tabpanel = panel?.querySelector('[role="tabpanel"]');
+            return selected === tab &&
+              tabpanel?.id === `settings-panel-${slug}` &&
+              tabpanel?.querySelector(selector) && tabpanel;
+          });
+          if (content) contentPanels.push(slug);
+
+          const selectedTabs = tabs.filter(
+            (candidate) => candidate.getAttribute('aria-selected') === 'true'
+          );
+          const controlled = tab?.getAttribute('aria-controls') === `settings-panel-${slug}`;
+          const rovingTabindex = selectedTabs.length === 1 && tabs.every((candidate) =>
+            candidate.getAttribute('tabindex') === (candidate === tab ? '0' : '-1')
+          );
+          ariaContract &&= Boolean(content && controlled && rovingTabindex);
+
+          if (tab) {
+            const rect = tab.getBoundingClientRect();
+            const hit = document.elementFromPoint(
+              rect.left + rect.width / 2,
+              rect.top + rect.height / 2
+            );
+            controlsHitTest &&= hit === tab || tab.contains(hit);
+          } else {
+            controlsHitTest = false;
+          }
+        }
+
+        const legacyPanelsAbsent = !document.querySelector(
+          'section.panel-layout, section.panel-style, section.panel-camera'
+        );
+
+        // Leave the familiar Connection summary selected, restore all panels,
+        // and wait for the fresh Graph canvas rather than retaining a stale
+        // element reference across Panel Kit's maximize/unmaximize remount.
+        const liveSettings = document.querySelector('section.panel-settings');
+        const connection = [...(liveSettings?.querySelectorAll('[role="tab"]') || [])]
+          .find((tab) => (tab.textContent || '').trim() === 'Connection');
+        connection?.click();
+        const restore = liveSettings?.querySelector(
+          ':scope > header.panel-head .light.max'
+        );
+        restore?.click();
+        const workspaceRestored = Boolean(await waitFor(() =>
+          !document.querySelector('.ws.maxed')
+        ));
+        const graphRestored = Boolean(await waitFor(() => {
+          const canvas = document.querySelector('section.panel-graph canvas.graph-canvas');
+          return canvas?.dataset.renderReady === 'true' &&
+            Number(canvas?.dataset.nodeCount || 0) > 0;
+        }));
+
+        if (!initialPanel || !maximize || !maximized) failures.push('Settings panel did not maximize');
+        if (!restore || !workspaceRestored) failures.push('Settings panel did not restore');
+        if (!ariaContract) failures.push('Settings tab labels or ARIA relationships are invalid');
+        if (!controlsHitTest) failures.push('Settings tabs are obscured from pointer input');
+        if (contentPanels.length !== expected.length) failures.push('a Settings tab has no delegated content');
+        if (!legacyPanelsAbsent) failures.push('legacy Layout, Style, or Camera panel still exists');
+        if (!graphRestored) failures.push('Graph renderer did not remount after Settings restore');
+        return {
+          ok: failures.length === 0,
+          labels,
+          content_panels: contentPanels,
+          aria_contract: Boolean(ariaContract),
+          controls_hit_test: Boolean(controlsHitTest),
+          legacy_panels_absent: legacyPanelsAbsent,
+          graph_restored: graphRestored,
+          reason: failures.length ? failures.join('; ') : null,
+        };
+    })()"#;
+    let settings_tabs_value: serde_json::Value =
+        page.evaluate(settings_tabs_js).await?.into_value()?;
+    let settings_tabs: SettingsTabsCheck = serde_json::from_value(settings_tabs_value)
+        .context("decode unified Settings regression result")?;
+
+    // ---- 7. Graph header actions are present, visible, and safe ----------
     // Exercise the controls through the same pointer/mouse event sequence a
     // user generates. Holding pointerdown across two animation frames catches
     // accidental propagation into Panel Kit's panel-drag handlers.
@@ -570,9 +1026,9 @@ async fn drive_page(
           details.every((action) => action.canvas_after_click);
         const canvas = panel?.querySelector('canvas.graph-canvas');
         const renderReady = canvas?.dataset.renderReady === 'true';
-        const nodeCount = Number(
-          document.querySelector('.stats .kv:first-child .v')?.textContent || 0
-        );
+        const secureContext = window.isSecureContext === true;
+        const webgpuAvailable = Boolean(navigator.gpu);
+        const nodeCount = Number(canvas?.dataset.nodeCount || 0);
         const clicksOk = !dragStarted && canvasPresent;
         const failures = [];
         if (!panel || !header) failures.push('Graph panel header missing');
@@ -581,6 +1037,8 @@ async fn drive_page(
         if (!geometryOk) failures.push('header action clipped or zero-sized');
         if (dragStarted) failures.push('header action started a panel drag');
         if (!canvasPresent) failures.push('Graph canvas missing after action click');
+        if (!secureContext) failures.push('browser page is not a secure context');
+        if (!webgpuAvailable) failures.push('navigator.gpu is unavailable');
         if (!renderReady) failures.push('WebGPU render host did not initialize');
         if (nodeCount < 1) failures.push('frontend did not load any graph nodes');
         return {
@@ -593,6 +1051,8 @@ async fn drive_page(
           drag_started: dragStarted,
           canvas_present: canvasPresent,
           render_ready: renderReady,
+          secure_context: secureContext,
+          webgpu_available: webgpuAvailable,
           node_count: nodeCount,
           reason: failures.length ? failures.join('; ') : null,
           actions: details,
@@ -603,7 +1063,7 @@ async fn drive_page(
     let header_actions: HeaderActionCheck = serde_json::from_value(header_actions_value)
         .context("decode Graph header action regression result")?;
 
-    // ---- 5. canvas exists with non-zero size -----------------------------
+    // ---- 8. canvas exists with non-zero size -----------------------------
     // The Dioxus app's graph canvas is `<canvas class="graph-canvas">`
     // (app/ui/src/graph_canvas.rs); fall back to any canvas on the page.
     let dims_js = r#"(() => {
@@ -620,12 +1080,9 @@ async fn drive_page(
     let canvas_width = dims.get("w").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
     let canvas_height = dims.get("h").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
 
-    // ---- 6. screenshot ---------------------------------------------------
+    // ---- 9. screenshot ---------------------------------------------------
     let shot_params = CaptureScreenshotParams::builder().build();
-    let png_b64 = page
-        .screenshot(shot_params)
-        .await
-        .context("screenshot")?;
+    let png_b64 = page.screenshot(shot_params).await.context("screenshot")?;
     let bytes: Vec<u8> = png_b64;
     let shot_path = args.out_dir.join("boot.png");
     // Heuristic: if first byte is the PNG magic 0x89, write as-is; else
@@ -649,35 +1106,13 @@ async fn drive_page(
     let _ = runtime_pump.await;
     let _ = exception_pump.await;
 
-    let page_errors = console_logs
-        .lock()
-        .await
-        .iter()
-        .filter(|line| line.starts_with("[error]") || line.starts_with("[exception]"))
-        .cloned()
-        .collect();
-
-    if !boot_log_found {
-        bail!(
-            "boot log {:?} not observed within {}s",
-            BOOT_LOG_NEEDLE,
-            args.timeout_secs
-        );
-    }
-    if canvas_width == 0 || canvas_height == 0 {
-        bail!(
-            "canvas dimensions invalid: {}x{}",
-            canvas_width,
-            canvas_height
-        );
-    }
-
     Ok(RunOk {
         canvas_width,
         canvas_height,
         boot_log_found,
         header_actions,
-        page_errors,
+        nodes_editor,
+        settings_tabs,
     })
 }
 
@@ -694,17 +1129,13 @@ async fn probe_server(url: &str, timeout: Duration) -> Result<()> {
     loop {
         let attempt = async {
             let mut stream = TcpStream::connect((host.as_str(), port)).await?;
-            let req = format!(
-                "GET {path} HTTP/1.1\r\nHost: {host}:{port}\r\nConnection: close\r\n\r\n"
-            );
+            let req =
+                format!("GET {path} HTTP/1.1\r\nHost: {host}:{port}\r\nConnection: close\r\n\r\n");
             stream.write_all(req.as_bytes()).await?;
             let mut buf = Vec::with_capacity(512);
             // Read up to first chunk; we just need the status line.
-            let _ = tokio::time::timeout(
-                Duration::from_secs(5),
-                stream.read_to_end(&mut buf),
-            )
-            .await;
+            let _ =
+                tokio::time::timeout(Duration::from_secs(5), stream.read_to_end(&mut buf)).await;
             let head = String::from_utf8_lossy(&buf);
             if head.starts_with("HTTP/1.1 200") || head.starts_with("HTTP/1.0 200") {
                 anyhow::Ok(())
@@ -755,7 +1186,7 @@ fn tail(v: &[String], n: usize) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::chromium_args;
+    use super::{browser_log_is_error, chromium_args};
 
     #[test]
     fn chromiumoxide_arguments_are_keys_not_cli_tokens() {
@@ -763,5 +1194,19 @@ mod tests {
         assert!(!args.is_empty());
         assert!(args.iter().all(|arg| !arg.starts_with('-')));
         assert!(args.iter().all(|arg| !arg.contains('=')));
+    }
+
+    #[test]
+    fn browser_errors_cover_cdp_and_rust_tracing_levels() {
+        assert!(browser_log_is_error("[error] Failed to load resource"));
+        assert!(browser_log_is_error("[exception] Uncaught TypeError"));
+        assert!(browser_log_is_error(
+            "[log] \"ERROR ui/src/render/mod.rs: wgpu init failed\""
+        ));
+        assert!(browser_log_is_error(
+            "[log] \"%cERROR%c ui/src/render/mod.rs: wgpu init failed\" \"color: red\" \"\""
+        ));
+        assert!(!browser_log_is_error("[warning] preload warning"));
+        assert!(!browser_log_is_error("[log] \"[jump-cannon-ui] boot\""));
     }
 }
