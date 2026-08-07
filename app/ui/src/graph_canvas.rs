@@ -13,7 +13,6 @@ use std::collections::HashMap;
 use dioxus::events::{MouseEvent, WheelEvent};
 use dioxus::html::geometry::WheelDelta;
 use dioxus::prelude::*;
-use graph_layouts::GpuForceOptions;
 
 use crate::api;
 use crate::render;
@@ -43,10 +42,9 @@ pub struct GraphData {
 /// Mirrors the egui app's bootstrap (`app.rs::spawn_fetch_task` +
 /// `try_promote_bootstrap_to_gpu`):
 ///   - the server's 2D positions are ignored — nodes seed on a hollow
-///     sphere shell (radius 800 wu), then the multilevel coarsening
-///     warm-up (`graph_layouts::warmup_positions`) replaces that with a
-///     coarsened-cascade seed so the GPU sim converges in a handful of
-///     frames instead of hundreds;
+///     sphere shell (radius 800 wu); this deterministic O(n) seed keeps
+///     bootstrap work bounded and leaves convergence to the selected GPU
+///     or remote layout engine instead of running CPU FR on the UI thread;
 ///   - colors come from the community metric through the Tableau20
 ///     palette (egui default `ColorBy::Community`);
 ///   - sizes come from pagerank with the default 0.5 multiplier
@@ -103,23 +101,10 @@ pub async fn load() -> Result<GraphData, String> {
         }
     }
 
-    // Sphere shell seed, then the coarsening warm-up (which always
-    // returns a full position set, so it effectively rules; the sphere
-    // remains as the fallback should warmup ever come back short).
-    //
-    // Skip the warmup for large graphs (>10k nodes): the multilevel
-    // coarsening + CPU FR cascade runs in WASM on the main thread and
-    // blocks the UI for seconds at 100k scale. The sphere shell seed is
-    // perfectly adequate when a GPU compute backend (graph-compute) is
-    // handling layout — the GPU converges from any reasonable init.
-    let mut positions = render::data::spawn_on_unit_sphere(n, 800.0);
-    if n <= 10_000 {
-        let spring_len = GpuForceOptions::default().spring_len.max(1.0);
-        let warmed = graph_layouts::warmup_positions(n, &edges, spring_len, 0xC0A75E);
-        if warmed.len() == positions.len() {
-            positions = warmed;
-        }
-    }
+    // Deterministic O(n) sphere shell seed. CPU FR warm-up used to run here
+    // synchronously after the fetches and could block the browser main thread
+    // before Dioxus had a chance to update the loading workspace.
+    let positions = render::data::spawn_on_unit_sphere(n, 800.0);
 
     let colors = render::data::colors_from_metric("community", &metrics, n);
     let sizes = render::data::sizes_from_metric("pagerank", &metrics, n, 0.5);

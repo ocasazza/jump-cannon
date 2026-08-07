@@ -255,9 +255,8 @@ pub(crate) async fn revisioned_ids() -> ApiResult<Revisioned<Vec<String>>> {
 /// `/graph/positions` — flat [x0, y0, x1, y1, …] f32 buffer.
 ///
 /// Unused since the wgpu renderer landed: it seeds its own 3D positions
-/// (sphere shell + multilevel coarsening warm-up, like the egui app) and
-/// the GPU force sim takes over from there. Kept for parity with the
-/// server's endpoint surface.
+/// on a deterministic sphere shell and the selected layout engine takes over
+/// from there. Kept for parity with the server's endpoint surface.
 #[allow(dead_code)]
 pub async fn positions() -> ApiResult<Vec<f32>> {
     Ok(f32s(&get_bytes("/graph/positions").await?))

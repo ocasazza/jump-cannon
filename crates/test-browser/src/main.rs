@@ -81,6 +81,8 @@ struct HeaderActionDetail {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct HeaderActionCheck {
     ok: bool,
+    boot_handoff_ok: bool,
+    workspace_mode: String,
     action_count: usize,
     play_pause_found: bool,
     fit_found: bool,
@@ -354,6 +356,28 @@ async fn drive_page(
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
 
+    // The reported clipping occurred in tiling mode. Fresh browser profiles
+    // start floating, so switch through Panel Kit's real mode control before
+    // measuring or taking the screenshot.
+    let tiling_mode_js = r#"(async () => {
+        const nextFrames = () => new Promise((resolve) =>
+          requestAnimationFrame(() => requestAnimationFrame(resolve))
+        );
+        let root = document.querySelector('.ws');
+        if (!root?.classList.contains('tiling')) {
+          const graph = document.querySelector('section.panel-graph');
+          const modeButton = graph?.querySelector(':scope > header.panel-head .light.mode');
+          modeButton?.click();
+          await nextFrames();
+          root = document.querySelector('.ws');
+        }
+        return root?.classList.contains('tiling') ?? false;
+    })()"#;
+    let tiling_mode: bool = page.evaluate(tiling_mode_js).await?.into_value()?;
+    if !tiling_mode {
+        bail!("failed to switch Panel Kit workspace into tiling mode");
+    }
+
     // Exercise the controls through the same pointer/mouse event sequence a
     // user generates. Holding pointerdown across two animation frames catches
     // accidental propagation into Panel Kit's panel-drag handlers.
@@ -361,6 +385,10 @@ async fn drive_page(
         const panel = document.querySelector('section.panel-graph');
         const header = panel?.querySelector(':scope > header.panel-head');
         const root = panel?.closest('.ws-root') || document.querySelector('.ws-root');
+        const workspace = panel?.closest('.ws') || document.querySelector('.ws');
+        const staticBoot = document.querySelector('[data-panel-kit-static-boot]');
+        const bootHandoffOk = !staticBoot || getComputedStyle(staticBoot).display === 'none';
+        const workspaceMode = workspace?.classList.contains('tiling') ? 'tiling' : 'floating';
         const buttons = header
           ? [...header.querySelectorAll('.panel-head-actions button.panel-head-action')]
           : [];
@@ -450,6 +478,8 @@ async fn drive_page(
           details.every((action) => action.canvas_after_click);
         const clicksOk = !dragStarted && canvasPresent;
         const failures = [];
+        if (!bootHandoffOk) failures.push('static pre-WASM boot shell still visible');
+        if (workspaceMode !== 'tiling') failures.push('workspace did not remain in tiling mode');
         if (!panel || !header) failures.push('Graph panel header missing');
         if (!playPauseFound) failures.push('play/pause action missing');
         if (!fitFound) failures.push('Fit action missing');
@@ -458,6 +488,8 @@ async fn drive_page(
         if (!canvasPresent) failures.push('Graph canvas missing after action click');
         return {
           ok: failures.length === 0,
+          boot_handoff_ok: bootHandoffOk,
+          workspace_mode: workspaceMode,
           action_count: buttons.length,
           play_pause_found: playPauseFound,
           fit_found: fitFound,
@@ -528,7 +560,11 @@ async fn drive_page(
         .lock()
         .await
         .iter()
-        .filter(|line| line.starts_with("[error]") || line.starts_with("[exception]"))
+        .filter(|line| {
+            line.starts_with("[error]")
+                || line.starts_with("[exception]")
+                || line.contains("Failed to load resource")
+        })
         .cloned()
         .collect();
 
