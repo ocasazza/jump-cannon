@@ -30,6 +30,13 @@ use tokio::sync::Mutex;
 /// `app/ui/src/main.rs` (fn main) right before the Dioxus app launches.
 const BOOT_LOG_NEEDLE: &str = "[jump-cannon-ui] boot";
 
+/// Keep a renderer-busy readiness probe shorter than chromiumoxide's fixed
+/// 30-second command deadline. Linux software WebGPU may synchronously occupy
+/// the renderer while it creates the device and pipelines; dropping a stalled
+/// probe lets a later attempt observe the initialized page without weakening
+/// the overall smoke-test deadline.
+const READINESS_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+
 #[derive(Parser, Debug)]
 #[command(name = "test-browser", about = "Rust-driven browser smoke test")]
 struct Args {
@@ -401,10 +408,59 @@ async fn drive_page(
         );
     })()"#;
     let graph_deadline = Instant::now() + Duration::from_secs(args.timeout_secs);
-    while Instant::now() < graph_deadline {
-        let ready: bool = page.evaluate(graph_ready_js).await?.into_value()?;
-        if ready {
-            break;
+    let graph_wait_started = Instant::now();
+    let mut graph_probe_attempt = 0_u32;
+    let mut last_graph_probe_error = None;
+    loop {
+        let remaining = graph_deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            let detail = last_graph_probe_error
+                .as_deref()
+                .unwrap_or("the page remained responsive but not render-ready");
+            bail!(
+                "graph did not become render-ready within {}s after {} probe(s): {detail}",
+                args.timeout_secs,
+                graph_probe_attempt
+            );
+        }
+
+        graph_probe_attempt += 1;
+        let probe_timeout = READINESS_PROBE_TIMEOUT.min(remaining);
+        let probe = tokio::time::timeout(probe_timeout, page.evaluate(graph_ready_js)).await;
+        match probe {
+            Ok(Ok(value)) => {
+                let ready: bool = value.into_value().context("decode graph readiness probe")?;
+                if ready {
+                    tracing::info!(
+                        attempt = graph_probe_attempt,
+                        elapsed_ms = graph_wait_started.elapsed().as_millis(),
+                        "graph became render-ready"
+                    );
+                    break;
+                }
+                last_graph_probe_error = None;
+            }
+            Ok(Err(error)) => {
+                let detail = format!("Runtime.evaluate failed: {error:#}");
+                tracing::warn!(
+                    attempt = graph_probe_attempt,
+                    elapsed_ms = graph_wait_started.elapsed().as_millis(),
+                    "graph readiness probe failed; retrying: {detail}"
+                );
+                last_graph_probe_error = Some(detail);
+            }
+            Err(_) => {
+                let detail = format!(
+                    "Runtime.evaluate exceeded the {}s per-probe timeout",
+                    probe_timeout.as_secs()
+                );
+                tracing::warn!(
+                    attempt = graph_probe_attempt,
+                    elapsed_ms = graph_wait_started.elapsed().as_millis(),
+                    "graph readiness probe stalled; retrying: {detail}"
+                );
+                last_graph_probe_error = Some(detail);
+            }
         }
         tokio::time::sleep(Duration::from_millis(250)).await;
     }

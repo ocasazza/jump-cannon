@@ -20,7 +20,11 @@ uses the fixed Chromium window directly instead of CDP viewport emulation and
 enforces `--timeout-secs` as an overall deadline so software WebGPU cannot leave
 a CronJob running indefinitely. Navigation is scheduled from `about:blank`
 without waiting on Chromium's page-load lifecycle; application readiness comes
-from the boot log and graph render checks instead.
+from the boot log and graph render checks instead. Readiness evaluation uses
+bounded attempts under that same overall deadline because Linux software WebGPU
+can temporarily occupy Chromium's renderer while it creates the device and
+pipelines; one stalled CDP evaluation is diagnostic evidence, not by itself a
+failed application boot.
 
 A nonzero canvas rectangle alone does not prove nodes rendered. Review the
 screenshot and browser errors for visual changes to [[Frontend]] or [[Workspace]].
