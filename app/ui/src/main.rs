@@ -27,6 +27,7 @@ use std::collections::HashSet;
 
 use dioxus::events::{Key, KeyboardEvent};
 use dioxus::prelude::*;
+use gloo_storage::{LocalStorage, Storage};
 use panel_kit::{LayoutBuilder, PanelWin, Spinner};
 use serde::{Deserialize, Serialize};
 
@@ -139,9 +140,6 @@ pub(crate) enum Panel {
     Settings,
     Help,
     // egui-tray parity panels (see docs/dioxus-migration.md phases 2-3):
-    Layout,
-    Style,
-    Camera,
     Filter,
     Metrics,
     Instances,
@@ -160,9 +158,6 @@ impl panel_kit::PanelKind for Panel {
             Panel::Progress => "Progress",
             Panel::Settings => "Settings",
             Panel::Help => "Help",
-            Panel::Layout => "Layout",
-            Panel::Style => "Style",
-            Panel::Camera => "Camera",
             Panel::Filter => "Filter",
             Panel::Metrics => "Metrics",
             Panel::Instances => "Instances",
@@ -170,6 +165,148 @@ impl panel_kit::PanelKind for Panel {
             Panel::Timeline => "Timeline",
             Panel::Debug => "Debug",
         }
+    }
+}
+
+const WORKSPACE_LAYOUT_KEY: &str = "jc_layout_v9";
+const LEGACY_WORKSPACE_LAYOUT_KEYS: &[&str] = &["jc_layout_v8", "jc_layout_v7", "jc_layout_v6"];
+
+/// Panel identity used by the three workspace layouts immediately preceding
+/// the Settings consolidation. Keeping this separate from [`Panel`] lets us
+/// decode and collapse old Layout/Style/Camera windows without retaining them
+/// as live Panel Kit kinds.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Deserialize)]
+enum LegacyPanel {
+    Graph,
+    Nodes,
+    Inspector,
+    Document,
+    Progress,
+    Settings,
+    Help,
+    Layout,
+    Style,
+    Camera,
+    Filter,
+    Metrics,
+    Instances,
+    Generate,
+    Timeline,
+    Debug,
+}
+
+#[derive(Deserialize)]
+struct LegacyWorkspaceLayout {
+    panels: Vec<PanelWin<LegacyPanel>>,
+    tiling: bool,
+}
+
+#[derive(Serialize, Deserialize)]
+struct WorkspaceLayout {
+    panels: Vec<PanelWin<Panel>>,
+    tiling: bool,
+}
+
+fn current_panel(kind: LegacyPanel) -> Option<Panel> {
+    Some(match kind {
+        LegacyPanel::Graph => Panel::Graph,
+        LegacyPanel::Nodes => Panel::Nodes,
+        LegacyPanel::Inspector => Panel::Inspector,
+        LegacyPanel::Document => Panel::Document,
+        LegacyPanel::Progress => Panel::Progress,
+        LegacyPanel::Settings => Panel::Settings,
+        LegacyPanel::Help => Panel::Help,
+        LegacyPanel::Filter => Panel::Filter,
+        LegacyPanel::Metrics => Panel::Metrics,
+        LegacyPanel::Instances => Panel::Instances,
+        LegacyPanel::Generate => Panel::Generate,
+        LegacyPanel::Timeline => Panel::Timeline,
+        LegacyPanel::Debug => Panel::Debug,
+        LegacyPanel::Layout | LegacyPanel::Style | LegacyPanel::Camera => return None,
+    })
+}
+
+fn legacy_settings_tab(kind: LegacyPanel) -> Option<panels::settings::SettingsTab> {
+    use panels::settings::SettingsTab;
+    match kind {
+        LegacyPanel::Settings => Some(SettingsTab::Connection),
+        LegacyPanel::Layout => Some(SettingsTab::Layout),
+        LegacyPanel::Style => Some(SettingsTab::Appearance),
+        LegacyPanel::Camera => Some(SettingsTab::Camera),
+        _ => None,
+    }
+}
+
+fn convert_panel<K>(panel: PanelWin<K>, kind: Panel) -> PanelWin<Panel> {
+    PanelWin {
+        kind,
+        x: panel.x,
+        y: panel.y,
+        w: panel.w,
+        h: panel.h,
+        state: panel.state,
+        z: panel.z,
+        tile_w: panel.tile_w,
+        tile_h: panel.tile_h,
+    }
+}
+
+/// Collapse an old layout into one Settings window. If a legacy configuration
+/// panel was visible, the frontmost configuration panel's geometry becomes the
+/// Settings geometry and its destination becomes the active tab; minimized
+/// legacy dock chips are simply removed.
+fn convert_legacy_layout(
+    legacy: LegacyWorkspaceLayout,
+) -> (WorkspaceLayout, Option<panels::settings::SettingsTab>) {
+    let visible_config = legacy
+        .panels
+        .iter()
+        .filter_map(|panel| {
+            legacy_settings_tab(panel.kind)
+                .filter(|_| panel.state != panel_kit::WinState::Minimized)
+                .map(|tab| (panel.z, *panel, tab))
+        })
+        .max_by_key(|(z, _, _)| *z);
+
+    let mut panels: Vec<PanelWin<Panel>> = legacy
+        .panels
+        .into_iter()
+        .filter_map(|panel| current_panel(panel.kind).map(|kind| convert_panel(panel, kind)))
+        .collect();
+
+    if let Some((_, source, _)) = visible_config {
+        let settings = convert_panel(source, Panel::Settings);
+        if let Some(existing) = panels.iter_mut().find(|panel| panel.kind == Panel::Settings) {
+            *existing = settings;
+        } else {
+            panels.push(settings);
+        }
+    }
+
+    (
+        WorkspaceLayout {
+            panels,
+            tiling: legacy.tiling,
+        },
+        visible_config.map(|(_, _, tab)| tab),
+    )
+}
+
+fn migrate_workspace_layout() {
+    if LocalStorage::get::<WorkspaceLayout>(WORKSPACE_LAYOUT_KEY).is_ok() {
+        return;
+    }
+    for key in LEGACY_WORKSPACE_LAYOUT_KEYS {
+        let Ok(legacy) = LocalStorage::get::<LegacyWorkspaceLayout>(key) else {
+            continue;
+        };
+        let (layout, tab) = convert_legacy_layout(legacy);
+        if LocalStorage::set(WORKSPACE_LAYOUT_KEY, layout).is_ok() {
+            if let Some(tab) = tab {
+                panels::settings::select_tab(tab);
+            }
+        }
+        break;
     }
 }
 
@@ -186,9 +323,6 @@ fn default_layout() -> Vec<PanelWin<Panel>> {
     }
     let b = &mut b;
     let mut v = vec![
-        min(b, Panel::Layout, 740.0, 60.0, 340.0, 480.0),
-        min(b, Panel::Style, 760.0, 80.0, 320.0, 440.0),
-        min(b, Panel::Camera, 780.0, 100.0, 320.0, 360.0),
         min(b, Panel::Filter, 800.0, 120.0, 340.0, 420.0),
         min(b, Panel::Metrics, 840.0, 160.0, 320.0, 380.0),
         min(b, Panel::Instances, 860.0, 180.0, 360.0, 420.0),
@@ -209,7 +343,8 @@ fn default_layout() -> Vec<PanelWin<Panel>> {
         b.at(Panel::Graph, 12.0, 44.0, 640.0, 620.0).with_tile(4, 3),
         b.at(Panel::Nodes, 660.0, 44.0, 608.0, 620.0),
         b.at(Panel::Progress, 12.0, 672.0, 640.0, 200.0),
-        b.at(Panel::Settings, 660.0, 672.0, 608.0, 200.0),
+        b.at(Panel::Settings, 660.0, 672.0, 608.0, 420.0)
+            .with_tile(2, 3),
     ]);
     v
 }
@@ -407,7 +542,7 @@ pub(crate) fn replace_with_client_graph(
     render::mount_canvas(scene);
 }
 
-async fn reload_graph(mut ctx: Ctx) {
+pub(crate) async fn reload_graph(mut ctx: Ctx) {
     let epoch = begin_server_graph_load(ctx);
     match graph_canvas::load().await {
         Ok(g) => {
@@ -440,7 +575,11 @@ fn App() -> Element {
     // v2: 2x graph view + docked tray panels.)
     // v7 intentionally adopts the two-pane Nodes workbench default once;
     // subsequent panel movement/resizing persists as before.
-    let ws = panel_kit::use_workspace("jc_layout_v7", default_layout);
+    // v9 consolidates Layout, Style, and Camera into one tabbed Settings
+    // surface. Migrate v6-v8 layout geometry and let the
+    // independent jc_* control state continue unchanged.
+    migrate_workspace_layout();
+    let ws = panel_kit::use_workspace(WORKSPACE_LAYOUT_KEY, default_layout);
 
     // Drain palette jump-to-section requests into the workspace, logging
     // the same `("section", "<title>: open")` event the egui app pushed.
@@ -712,10 +851,7 @@ fn panel_body(kind: Panel, _maximized: bool, ctx: Ctx) -> Element {
         Panel::Inspector => panels::inspector::panel(ctx),
         Panel::Document => panels::document::panel(ctx),
         Panel::Progress => progress_panel(ctx),
-        Panel::Settings => settings_panel(ctx),
-        Panel::Layout => panels::layout::panel(ctx),
-        Panel::Style => panels::style::panel(ctx),
-        Panel::Camera => panels::camera::panel(ctx),
+        Panel::Settings => panels::settings::panel(ctx),
         Panel::Filter => panels::filter::panel(ctx),
         Panel::Metrics => panels::metrics::panel(ctx),
         Panel::Instances => panels::instances::panel(ctx),
@@ -809,54 +945,6 @@ fn progress_panel(ctx: Ctx) -> Element {
                         }
                         span { class: "log-msg", "{l.message}" }
                     }
-                }
-            }
-        }
-    }
-}
-
-/// Server connection + graph stats. The URL is persisted in localStorage so
-/// the app can point at a remote graph-api (LAN/Tailscale) like the OCR app.
-fn settings_panel(ctx: Ctx) -> Element {
-    let Ctx {
-        mut server,
-        graph,
-        graph_session,
-        ..
-    } = ctx;
-    let g = graph.read().clone();
-    let session = graph_session.read().clone();
-    rsx! {
-        div { class: "controls",
-            div { class: "server",
-                input {
-                    value: "{server}",
-                    oninput: move |e| server.set(e.value()),
-                }
-                button { class: "btn",
-                    onclick: move |_| {
-                        api::set_server_url(&server.read());
-                        spawn(reload_graph(ctx));
-                    },
-                    "Connect"
-                }
-            }
-            if let Some(g) = g {
-                div { class: "stats",
-                    div { class: "kv", span { class: "k", "nodes" } span { class: "v", "{g.n_nodes}" } }
-                    div { class: "kv", span { class: "k", "edges" } span { class: "v", "{g.n_edges}" } }
-                    div { class: "kv", span { class: "k", "communities" } span { class: "v", "{g.num_communities}" } }
-                    div { class: "kv", span { class: "k", "components" } span { class: "v", "{g.num_wcc}" } }
-                }
-            }
-            div { class: "note", "active: {session.short_label()}" }
-            div { class: "note",
-                if session.is_server_backed() {
-                    "Graph metadata/search/documents are served by graph-api. Compute-worker \
-                     layouts are accepted only for this graph revision."
-                } else {
-                    "This generated graph is browser-owned. Metadata/search/documents and \
-                     compute-worker layouts are disabled until it is hosted by graph-api."
                 }
             }
         }

@@ -71,12 +71,13 @@ Executed 2026-06-10 (five parallel ports against the egui reference at
 - Command palette (`app/ui/src/palette.rs`): ActionRegistry + all builtins,
   Ctrl/Cmd+P, fuzzy matching with title/path highlighting, param forms,
   two-pane node preview, category grouping. Jump-to-section actions open
-  panels through `main.rs::OPEN_PANEL` → `panel_kit::Workspace::restore`.
+  panels through `main.rs::OPEN_PANEL` → `panel_kit::Workspace::restore`;
+  Layout, Style, and Camera deep-link to tabs in the unified Settings panel.
 - Anchored hover/click cards (`app/ui/src/anchored.rs`): 50 ms raycast
   throttle, 700 ms preview arm, sticky-beats-hover, EMA(0.4) placement,
   reserved-size edge clamping, tether line + off-screen arrow, promoted
   click card with fly-to (`render::look_at_node`). Focus sets
-  (`FocusMode` × 5) push GPU dim masks; the Camera panel's picker drives
+  (`FocusMode` × 5) push GPU dim masks; the Camera tab in Settings drives
   them.
 - Inspector parity (`panels/inspector.rs`): active-filter strip, empty-state
   tag browser, badge rows via `badges.rs`, frontmatter leftover grid,

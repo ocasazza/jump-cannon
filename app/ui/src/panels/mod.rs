@@ -14,6 +14,7 @@ pub mod instances;
 pub mod generate;
 pub mod timeline;
 pub mod debug;
+pub mod settings;
 // phase 4: Inspector + Document moved out of main.rs for the parity port.
 pub mod document;
 pub mod inspector;

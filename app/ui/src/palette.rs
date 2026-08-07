@@ -163,14 +163,24 @@ impl Section {
     fn panel(self) -> crate::Panel {
         match self {
             Section::Filter => crate::Panel::Filter,
-            Section::Style => crate::Panel::Style,
-            Section::Layout => crate::Panel::Layout,
-            Section::Camera => crate::Panel::Camera,
+            Section::Style | Section::Layout | Section::Camera => crate::Panel::Settings,
             Section::Instances => crate::Panel::Instances,
             Section::Debug => crate::Panel::Debug,
             Section::Metrics => crate::Panel::Metrics,
             Section::Generate => crate::Panel::Generate,
             Section::Timeline => crate::Panel::Timeline,
+        }
+    }
+
+    /// Consolidated configuration sections deep-link into Settings while
+    /// active exploration tools retain their standalone workspace panels.
+    fn settings_tab(self) -> Option<crate::panels::settings::SettingsTab> {
+        use crate::panels::settings::SettingsTab;
+        match self {
+            Section::Layout => Some(SettingsTab::Layout),
+            Section::Style => Some(SettingsTab::Appearance),
+            Section::Camera => Some(SettingsTab::Camera),
+            _ => None,
         }
     }
 }
@@ -1571,6 +1581,9 @@ fn run_builtin(
         // egui: `state.set_section_open(sec, true)` — here a restore+raise
         // request the App root drains into `Workspace::restore`.
         B::JumpToSection(sec) => {
+            if let Some(tab) = sec.settings_tab() {
+                crate::panels::settings::select_tab(tab);
+            }
             *crate::OPEN_PANEL.write() = Some(sec.panel());
             serde_json::json!({ "open": sec.title() })
         }
