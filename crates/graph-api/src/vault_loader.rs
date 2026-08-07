@@ -1,45 +1,64 @@
 //! Graph load + metric compute. Runs at startup and on every watched-fs
 //! reload.
 //!
-//! Generic over [`data_loader::Loader`] — the concrete loader (Obsidian vault,
-//! tvix expression, etc.) is selected at startup and the rest of the pipeline
-//! (metrics, position seeding, binary caches) is loader-agnostic.
+//! Generic over [`data_loader::Importer`] — the concrete source/decoder/mapper
+//! pipeline is selected at startup and the rest of the graph materialization
+//! path (metrics, position seeding, binary caches) is importer-agnostic.
 //
 // Future: incremental reload — re-extract only changed files via mtime
 // tracking. Today every reload is a full re-walk.
 
 use std::sync::Arc;
 
-use data_loader::Loader;
+use data_loader::{ImportError, Importer};
 use vault_data::VaultGraph;
 
 use crate::progress::ProgressLog;
 
-/// Load a graph through any [`Loader`], compute metrics, and seed initial
+/// Load a graph through any [`Importer`], compute metrics, and seed initial
 /// positions. Convenience wrapper for callers that don't want a progress feed.
-pub fn load(loader: &dyn Loader) -> VaultGraph {
-    load_with_progress(loader, None)
+pub async fn load(importer: &dyn Importer) -> Result<VaultGraph, ImportError> {
+    load_with_progress(importer, None).await
 }
 
 /// Like [`load`] but emits per-stage progress into a [`ProgressLog`].
-/// Stages: "Scanning vault" (or "Evaluating tvix"), "Computing metrics",
-/// "Seeding positions".
-pub fn load_with_progress(
-    loader: &dyn Loader,
+/// Stages identify the selected importer, metric computation, and position
+/// seeding.
+pub async fn load_with_progress(
+    importer: &dyn Importer,
     progress: Option<&Arc<ProgressLog>>,
-) -> VaultGraph {
-    let source_name = loader.name();
+) -> Result<VaultGraph, ImportError> {
+    let descriptor = importer.descriptor();
+    let source_name = descriptor.id.as_str();
     tracing::info!(source = %source_name, "loading graph");
 
     let scan_label = match source_name {
         "obsidian" => "Scanning vault",
         "tvix" => "Evaluating tvix expression",
-        other => other,
+        _ => descriptor.name.as_str(),
     };
     let scan_id = progress.map(|p| p.start("ingest", scan_label));
 
-    let result = loader.load();
+    let result = match importer.import().await {
+        Ok(result) => result,
+        Err(error) => {
+            if let (Some(progress), Some(id)) = (progress, scan_id) {
+                progress.fail(id, error.to_string());
+            }
+            return Err(error);
+        }
+    };
     let mut graph = result.graph;
+
+    if let Err(error) = graph.validate() {
+        let error = ImportError::Map {
+            message: format!("importer {source_name:?} produced an invalid graph: {error}"),
+        };
+        if let (Some(progress), Some(id)) = (progress, scan_id) {
+            progress.fail(id, error.to_string());
+        }
+        return Err(error);
+    }
 
     if let (Some(p), Some(id)) = (progress, scan_id) {
         p.update_label(
@@ -69,23 +88,55 @@ pub fn load_with_progress(
     }
 
     let metrics_id = progress.map(|p| p.start("ingest", "Computing graph metrics"));
-    graph_metrics::compute_all(&mut graph);
+    let metrics_result = tokio::task::spawn_blocking(move || {
+        graph_metrics::compute_all(&mut graph);
+        graph
+    })
+    .await;
+    let mut graph = match metrics_result {
+        Ok(graph) => graph,
+        Err(error) => {
+            let error = ImportError::Map {
+                message: format!("graph metric computation panicked: {error}"),
+            };
+            if let (Some(progress), Some(id)) = (progress, metrics_id) {
+                progress.fail(id, error.to_string());
+            }
+            return Err(error);
+        }
+    };
     if let (Some(p), Some(id)) = (progress, metrics_id) {
         p.finish(id);
     }
 
     // Seed deterministic initial positions on a circle.
     let seed_id = progress.map(|p| p.start("ingest", "Seeding layout positions"));
-    let n = graph.node_count();
-    if n > 0 {
-        let radius = 200.0_f32 + (n as f32).sqrt() * 4.0;
-        let step = std::f32::consts::TAU / n as f32;
-        for (i, (_, node)) in graph.nodes.iter_mut().enumerate() {
-            let theta = i as f32 * step;
-            node.x = radius * theta.cos();
-            node.y = radius * theta.sin();
+    let seed_result = tokio::task::spawn_blocking(move || {
+        let n = graph.node_count();
+        if n > 0 {
+            let radius = 200.0_f32 + (n as f32).sqrt() * 4.0;
+            let step = std::f32::consts::TAU / n as f32;
+            for (i, (_, node)) in graph.nodes.iter_mut().enumerate() {
+                let theta = i as f32 * step;
+                node.x = radius * theta.cos();
+                node.y = radius * theta.sin();
+            }
         }
-    }
+        graph
+    })
+    .await;
+    let graph = match seed_result {
+        Ok(graph) => graph,
+        Err(error) => {
+            let error = ImportError::Map {
+                message: format!("initial position seeding panicked: {error}"),
+            };
+            if let (Some(progress), Some(id)) = (progress, seed_id) {
+                progress.fail(id, error.to_string());
+            }
+            return Err(error);
+        }
+    };
     if let (Some(p), Some(id)) = (progress, seed_id) {
         p.finish(id);
     }
@@ -96,5 +147,52 @@ pub fn load_with_progress(
         "metrics computed"
     );
 
-    graph
+    Ok(graph)
+}
+
+#[cfg(test)]
+mod tests {
+    use data_loader::{ImportFuture, ImporterDescriptor, LoadResult};
+    use vault_data::{VaultEdge, VaultNode};
+
+    use super::*;
+
+    struct DanglingGraphImporter;
+
+    impl Importer for DanglingGraphImporter {
+        fn descriptor(&self) -> ImporterDescriptor {
+            ImporterDescriptor::new("dangling", "Dangling test graph", "1", Vec::new())
+        }
+
+        fn import<'a>(&'a self) -> ImportFuture<'a, Result<LoadResult, ImportError>> {
+            Box::pin(async {
+                let mut graph = VaultGraph::new();
+                graph.add_node(VaultNode {
+                    id: "present".into(),
+                    ..Default::default()
+                });
+                graph.add_edge(VaultEdge {
+                    source: "present".into(),
+                    target: "missing".into(),
+                });
+                Ok(LoadResult {
+                    graph,
+                    unresolved: Vec::new(),
+                })
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn rejects_invalid_importer_graph_before_metrics() {
+        let error = load(&DanglingGraphImporter).await.unwrap_err();
+
+        assert!(matches!(
+            error,
+            ImportError::Map { message }
+                if message.contains("invalid graph")
+                    && message.contains("edge 0")
+                    && message.contains("missing")
+        ));
+    }
 }

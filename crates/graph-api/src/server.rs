@@ -19,11 +19,22 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast::error::RecvError;
 
 use crate::{attribute_resolver, proto, state::AppState};
+use data_loader::{Capability, Effect, HostedImporter, Transport};
 use graph_layouts::geometric::LensConfig;
 use vault_data::color::PALETTE;
 
 const PROTOBUF_CT: &str = "application/x-protobuf";
 const OCTET_CT: &str = "application/octet-stream";
+
+fn importer_authorizes(
+    importer: &HostedImporter,
+    effect: Effect,
+    transport: Transport,
+    scope: &str,
+) -> bool {
+    let capability = Capability::new(effect, transport, scope);
+    importer.is_authorized(&capability)
+}
 
 pub fn router(state: AppState) -> Router {
     Router::new()
@@ -171,6 +182,19 @@ async fn vault_page_put(
     State(s): State<AppState>,
     Json(req): Json<VaultPagePutReq>,
 ) -> axum::response::Response {
+    let content_scope = s.inner.vault_root.to_string_lossy();
+    let can_write = importer_authorizes(
+        &s.inner.importer,
+        Effect::ContentWrite,
+        Transport::Filesystem,
+        &content_scope,
+    );
+    if !can_write {
+        return put_err(
+            StatusCode::FORBIDDEN,
+            "the active importer does not grant the Obsidian content-write effect",
+        );
+    }
     if req.body.len() > MAX_PAGE_BYTES {
         return put_err(
             StatusCode::PAYLOAD_TOO_LARGE,
@@ -861,6 +885,19 @@ async fn graph_init(State(s): State<AppState>) -> impl IntoResponse {
 ///     aren't in the layout graph).
 async fn node_meta(State(s): State<AppState>, Path(id): Path<String>) -> impl IntoResponse {
     let snap = s.snapshot();
+    let content_scope = s.inner.vault_root.to_string_lossy();
+    let can_read_filesystem_content = importer_authorizes(
+        &s.inner.importer,
+        Effect::ContentRead,
+        Transport::Filesystem,
+        &content_scope,
+    );
+    let can_write_filesystem_content = importer_authorizes(
+        &s.inner.importer,
+        Effect::ContentWrite,
+        Transport::Filesystem,
+        &content_scope,
+    );
     if let Some(node) = snap.graph.nodes.get(&id) {
         let frontmatter_json =
             serde_json::to_string(&node.meta.frontmatter).unwrap_or_else(|_| "{}".into());
@@ -869,7 +906,13 @@ async fn node_meta(State(s): State<AppState>, Path(id): Path<String>) -> impl In
         // ~50MB of text), so this is a lazy per-request file read.
         // Strip the YAML frontmatter so the renderer doesn't render it
         // twice — it's already in `frontmatter_json`.
-        let body = read_body(&s.inner.vault_root, &node.meta.path);
+        let content_readable = node.meta.content_readable && can_read_filesystem_content;
+        let content_writable = node.meta.content_writable && can_write_filesystem_content;
+        let body = if content_readable {
+            read_body(&s.inner.vault_root, &node.meta.path)
+        } else {
+            String::new()
+        };
         let msg = proto::NodeMeta {
             id: id.clone(),
             title: node.meta.title.clone(),
@@ -887,6 +930,10 @@ async fn node_meta(State(s): State<AppState>, Path(id): Path<String>) -> impl In
             community: node.metrics.community as u32,
             wcc: node.metrics.wcc as u32,
             body,
+            source_id: node.meta.source_id.clone(),
+            content_type: node.meta.content_type.clone(),
+            content_readable,
+            content_writable,
         };
         return proto_response(&msg).into_response();
     }
@@ -899,7 +946,7 @@ async fn node_meta(State(s): State<AppState>, Path(id): Path<String>) -> impl In
     // editor opens normally.
     let stripped = id.strip_prefix("vault/").unwrap_or(&id);
     let candidate = s.inner.vault_root.join(format!("{stripped}.md"));
-    if candidate.is_file() {
+    if can_read_filesystem_content && candidate.is_file() {
         // Path-safety: canonicalize both sides and ensure the resolved
         // file stays inside the vault root. Defeats `..` escapes.
         let safe = match (candidate.canonicalize(), s.inner.vault_root.canonicalize()) {
@@ -931,6 +978,10 @@ async fn node_meta(State(s): State<AppState>, Path(id): Path<String>) -> impl In
                 community: 0,
                 wcc: 0,
                 body,
+                source_id: "obsidian".into(),
+                content_type: Some("text/markdown".into()),
+                content_readable: true,
+                content_writable: can_write_filesystem_content,
             };
             return proto_response(&msg).into_response();
         }
@@ -962,6 +1013,10 @@ async fn node_meta(State(s): State<AppState>, Path(id): Path<String>) -> impl In
         // vault, so no body is available. The renderer falls back to
         // displaying just metadata.
         body: String::new(),
+        source_id: String::new(),
+        content_type: None,
+        content_readable: false,
+        content_writable: false,
     };
     proto_response(&msg).into_response()
 }

@@ -10,6 +10,8 @@ members = [
     "crates/vault-search",
     "crates/tvix-wasm",
     "crates/data-loader",
+    "crates/kubernetes-importer",
+    "crates/pest-importer",
     "crates/tvix-loader",
     "crates/test-browser",
 ]

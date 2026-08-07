@@ -50,14 +50,20 @@ pub struct NodeMeta {
     pub community: u32,
     #[prost(uint32, tag = "17")]
     pub wcc: u32,
-    /// Full markdown body of the note (frontmatter stripped). Lazily read
-    /// from disk on each `/node/:id` request — we don't pre-load every
-    /// body into memory because a 10k-node vault would balloon the
-    /// server's RSS. Empty for external nodes (no corresponding file) or
-    /// when the read fails. Frontmatter is *not* duplicated here; it
-    /// lives in `frontmatter_json` (field 7).
+    /// Optional source-backed body. Obsidian content is read lazily rather than
+    /// retained in every in-memory node. Other importers remain metadata-only
+    /// until they implement the matching content effect.
     #[prost(string, tag = "18")]
     pub body: ::prost::alloc::string::String,
+    /// Importer/source instance that produced this node.
+    #[prost(string, tag = "19")]
+    pub source_id: ::prost::alloc::string::String,
+    #[prost(string, optional, tag = "20")]
+    pub content_type: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(bool, tag = "21")]
+    pub content_readable: bool,
+    #[prost(bool, tag = "22")]
+    pub content_writable: bool,
 }
 /// Search response. Returned by /search?q=…
 #[derive(Clone, PartialEq, ::prost::Message)]

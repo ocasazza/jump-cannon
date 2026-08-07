@@ -1,0 +1,12 @@
+{{- if .Values.kubernetesImporter.enabled }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "jump-cannon.fullname" . }}-kubernetes-importer
+  labels:
+    {{- include "jump-cannon.labels" . | nindent 4 }}
+    app.kubernetes.io/component: graph-api
+data:
+  config.json: |
+    {{- toPrettyJson .Values.kubernetesImporter.config | replace "{{ .Release.Namespace }}" .Release.Namespace | nindent 4 }}
+{{- end }}

@@ -1,0 +1,13 @@
+[package]
+name = "kubernetes-importer"
+version = "1.0.0"
+edition = "2021"
+description = "Capability-scoped Kubernetes DynamicObject source and graph mapper"
+
+[dependencies]
+data-loader = { path = "../data-loader" }
+vault-data  = { path = "../vault-data" }
+serde       = { workspace = true }
+serde_json  = { workspace = true }
+kube        = { version = "4.2", default-features = true }
+k8s-openapi = { version = "0.28", features = ["latest"] }

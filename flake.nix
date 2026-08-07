@@ -234,7 +234,7 @@
               export VK_ICD_FILENAMES=${pkgs.mesa}/share/vulkan/icd.d/lvp_icd.x86_64.json
             fi
 
-            echo "→ starting graph-api on port $PORT…"
+            echo "→ starting graph-api on port ''${PORT}…"
             graph-api \
               --vault-root "$VAULT" \
               --port "$PORT" \

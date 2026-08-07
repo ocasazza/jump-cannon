@@ -2,7 +2,8 @@ use clap::Parser;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use data_loader::Loader;
+use anyhow::Context;
+use data_loader::{HostedImporter, Importer};
 use graph_api::{
     compute_broker::{ComputeBroker, RemoteLayout},
     progress::ProgressLog,
@@ -38,14 +39,27 @@ struct Args {
     /// docker container leaves this unset so live reload works.
     #[arg(long, env = "GRAPH_API_NO_WATCH")]
     no_watch: bool,
-    /// Data source: "obsidian" (default) or "tvix". When "tvix", --vault-root
-    /// is interpreted as a path to a .nix file to evaluate.
+    /// Data source: obsidian (default), tvix, generate, kubernetes, or pest.
+    /// Runtime Pest packages are trusted administrator-installed code; the
+    /// unauthenticated HTTP API does not accept grammar uploads.
     #[arg(long, env = "JUMP_CANNON_SOURCE", default_value = "obsidian")]
     source: String,
     /// When --source=tvix, the Nix expression to evaluate. If not provided,
     /// reads from the file at --vault-root (which must be a .nix file).
     #[arg(long, env = "JUMP_CANNON_TVIX_EXPR")]
     tvix_expr: Option<String>,
+    /// JSON source-instance configuration used by --source=kubernetes.
+    /// Credentials are resolved by kube-rs from kubeconfig or the pod's
+    /// explicitly mounted service-account projection, never from this file.
+    #[arg(long, env = "JUMP_CANNON_KUBERNETES_CONFIG")]
+    kubernetes_config: Option<PathBuf>,
+    /// Versioned TOML package containing a runtime Pest grammar and capture map.
+    /// Required by --source=pest.
+    #[arg(long, env = "JUMP_CANNON_IMPORTER_MANIFEST")]
+    importer_manifest: Option<PathBuf>,
+    /// Filesystem input bound to --importer-manifest. Required by --source=pest.
+    #[arg(long, env = "JUMP_CANNON_IMPORTER_INPUT")]
+    importer_input: Option<PathBuf>,
     /// When --source=generate, the number of nodes to create.
     #[arg(long, env = "JUMP_CANNON_GENERATE_NODES", default_value_t = 1000)]
     generate_nodes: usize,
@@ -59,12 +73,16 @@ struct Args {
     generate_clusters: usize,
     /// When --source=generate with --clusters > 0, the probability (0.0–1.0)
     /// that an edge connects nodes within the same cluster. Default 0.8.
-    #[arg(long, env = "JUMP_CANNON_GENERATE_CLUSTER_AFFINITY", default_value_t = 0.8)]
+    #[arg(
+        long,
+        env = "JUMP_CANNON_GENERATE_CLUSTER_AFFINITY",
+        default_value_t = 0.8
+    )]
     generate_cluster_affinity: f64,
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> anyhow::Result<()> {
     let _ = dotenvy::dotenv();
 
     tracing_subscriber::fmt()
@@ -80,16 +98,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or_else(|| std::env::current_dir().unwrap());
 
     // Select the data loader.
-    let source_kind = data_loader::SourceKind::parse(&args.source)
-        .unwrap_or_else(|| {
-            tracing::warn!(
-                source = %args.source,
-                "unknown source; falling back to obsidian"
-            );
-            data_loader::SourceKind::Obsidian
-        });
+    let source_kind = data_loader::SourceKind::parse(&args.source).with_context(|| {
+        format!(
+            "unknown source {:?}; expected one of {}",
+            args.source,
+            data_loader::SourceKind::all().join(", ")
+        )
+    })?;
 
-    let loader: Box<dyn Loader> = match source_kind {
+    let importer: Box<dyn Importer> = match source_kind {
         data_loader::SourceKind::Obsidian => {
             tracing::info!(vault_root = %vault_root.display(), "using obsidian loader");
             Box::new(vault_links::ObsidianLoader::new(vault_root.clone()))
@@ -124,7 +141,73 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 args.generate_cluster_affinity,
             ))
         }
+        data_loader::SourceKind::Kubernetes => {
+            let path = args.kubernetes_config.as_ref().with_context(|| {
+                "--source=kubernetes requires --kubernetes-config / JUMP_CANNON_KUBERNETES_CONFIG"
+            })?;
+            let raw = std::fs::read_to_string(path).with_context(|| {
+                format!("failed to read Kubernetes source config {}", path.display())
+            })?;
+            let config: kubernetes_importer::KubernetesSourceConfig = serde_json::from_str(&raw)
+                .with_context(|| format!("invalid Kubernetes source config {}", path.display()))?;
+            tracing::info!(
+                source_id = %config.source_id,
+                resources = config.resources.len(),
+                "using Kubernetes importer"
+            );
+            Box::new(kubernetes_importer::build_importer(config)?)
+        }
+        data_loader::SourceKind::Pest => {
+            let manifest_path = args.importer_manifest.as_ref().with_context(|| {
+                "--source=pest requires --importer-manifest / JUMP_CANNON_IMPORTER_MANIFEST"
+            })?;
+            let input_path = args.importer_input.as_ref().with_context(|| {
+                "--source=pest requires --importer-input / JUMP_CANNON_IMPORTER_INPUT"
+            })?;
+            let manifest_len = std::fs::metadata(manifest_path)
+                .with_context(|| {
+                    format!(
+                        "failed to inspect importer package {}",
+                        manifest_path.display()
+                    )
+                })?
+                .len() as usize;
+            anyhow::ensure!(
+                manifest_len <= pest_importer::HARD_LIMITS.manifest_bytes,
+                "importer package {} is {} bytes; hard limit is {} bytes",
+                manifest_path.display(),
+                manifest_len,
+                pest_importer::HARD_LIMITS.manifest_bytes
+            );
+            let raw = std::fs::read(manifest_path).with_context(|| {
+                format!(
+                    "failed to read importer package {}",
+                    manifest_path.display()
+                )
+            })?;
+            let package = pest_importer::ValidatedPackage::from_toml_bytes(&raw)
+                .with_context(|| format!("invalid importer package {}", manifest_path.display()))?;
+            tracing::info!(
+                importer = %package.manifest().metadata.id,
+                version = %package.manifest().metadata.version,
+                input = %input_path.display(),
+                "using trusted runtime Pest importer"
+            );
+            Box::new(pest_importer::FilesystemImporter::new(
+                package,
+                input_path.clone(),
+            ))
+        }
     };
+
+    // This CLI is the trusted host configuration surface: every selectable
+    // source is either compiled into graph-api or an explicitly bound,
+    // administrator-installed native Pest package. Descriptor requests do not
+    // grant themselves; the host records the exact tuples here. A future
+    // untrusted upload/control-plane path must select a reviewed subset instead
+    // of applying this trusted-source policy.
+    let host_grants = importer.descriptor().capabilities;
+    let importer = HostedImporter::new(importer, host_grants)?;
 
     // Shared progress log. Surfaces "Scanning vault / Computing metrics /
     // Seeding positions / Rebuilding search index" task bars to the
@@ -133,7 +216,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Initial graph load — emit progress events so the bootstrap fetch
     // sees a populated /progress response on the first poll.
-    let graph = vault_loader::load_with_progress(loader.as_ref(), Some(&progress));
+    let graph = vault_loader::load_with_progress(&importer, Some(&progress)).await?;
 
     // Spawn vault-search before binding so /search can proxy to it.
     // Only for obsidian — tvix graphs have no filesystem to index.
@@ -146,13 +229,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Some(std::sync::Arc::new(vs))
             }
             Err(e) => {
-                tracing::warn!("vault-search unavailable: {e}; /search falls back to title-contains");
+                tracing::warn!(
+                    "vault-search unavailable: {e}; /search falls back to title-contains"
+                );
                 progress.fail(vault_search_id, format!("{e}"));
                 None
             }
         }
-} else {
-        tracing::info!(source = loader.name(), "skipping vault-search (no filesystem index)");
+    } else {
+        tracing::info!(
+            source = importer.descriptor().id,
+            "skipping vault-search (importer has no vault index)"
+        );
         None
     };
 
@@ -164,7 +252,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let state = AppState::new(
         vault_root.clone(),
-        loader,
+        importer,
         graph,
         vault_search,
         args.assets_dir,
@@ -202,8 +290,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
-    // Live reload: watch $VAULT_ROOT for `.md` changes and atomically
-    // swap a new GraphSnapshot into AppState. Skipped if --no-watch.
+    // Live reload follows the active importer's watch plan (filesystem,
+    // polling, push, or static) rather than assuming an Obsidian directory.
     if !args.no_watch {
         graph_api::watcher::spawn(state.clone());
     } else {

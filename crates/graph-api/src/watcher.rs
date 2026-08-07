@@ -1,15 +1,15 @@
-//! Filesystem watcher that drives live vault reloads.
+//! Change drivers that reload the active importer.
 //!
-//! Wires `notify-debouncer-mini` to a tokio mpsc channel. When `.md`
-//! files under `$VAULT_ROOT` change, the watcher coalesces a burst of
-//! events into a single reload, then:
+//! Filesystem importers use `notify-debouncer-mini`; polling importers use a
+//! Tokio interval; static importers install no change driver. Filesystem bursts
+//! are coalesced into one reload, then:
 //!
 //!   1. Re-runs `vault_loader::load_with_progress` (emits "Scanning
 //!      vault", "Computing graph metrics", "Seeding layout positions"
 //!      task bars to `ProgressLog`).
 //!   2. Builds a fresh `GraphSnapshot` and `ArcSwap`s it into the
 //!      `AppState`. In-flight readers keep the previous `Arc` valid.
-//!   3. Drops the old `vault-search` subprocess and respawns it with
+//!   3. For Obsidian only, refreshes or respawns the `vault-search` subprocess
 //!      `--rebuild` so BM25 search returns up-to-date hits. (See the
 //!      GUESS note in `subprocess.rs::spawn_rebuild` — no in-place
 //!      refresh API exists today.)
@@ -17,8 +17,8 @@
 //! ## Filter
 //!
 //! Events for paths whose components contain `.git`, `node_modules`,
-//! `.obsidian`, or a leading-dot dotfile are ignored, as are
-//! non-`.md` files. This avoids reloading on every git index update.
+//! `.obsidian`, or a leading-dot dotfile are ignored. Obsidian additionally
+//! accepts only `.md`; other filesystem importers react to their bound input.
 //!
 //! ## Container caveats
 //!
@@ -37,6 +37,8 @@ use std::time::Duration;
 use notify::RecursiveMode;
 use notify_debouncer_mini::{new_debouncer, DebouncedEvent};
 
+use data_loader::{Effect, HostedImporter, ImporterDescriptor, Transport, WatchPlan};
+
 use crate::state::{AppState, GraphSnapshot};
 
 /// Spawn the filesystem watcher + reload task. Returns immediately; the
@@ -45,7 +47,83 @@ use crate::state::{AppState, GraphSnapshot};
 /// `state` is the live `AppState`; the watcher swaps new snapshots into
 /// it under `state.inner.snapshot`.
 pub fn spawn(state: AppState) {
-    let vault_root = state.inner.vault_root.clone();
+    let descriptor = state.inner.importer.descriptor();
+    if !watch_is_authorized(&state.inner.importer, &descriptor) {
+        let message = format!(
+            "{} declares a change driver without an exact watch grant; change driver disabled",
+            descriptor.id
+        );
+        state.inner.progress.warn("watch", &message);
+        tracing::warn!(importer = %descriptor.id, "{message}");
+        return;
+    }
+    match descriptor.watch {
+        WatchPlan::Static => {
+            tracing::info!(importer = %descriptor.id, "importer is static; change driver disabled");
+        }
+        WatchPlan::Filesystem { root } => {
+            let markdown_only = descriptor.id == "obsidian";
+            spawn_filesystem(state, root, markdown_only);
+        }
+        WatchPlan::Poll { interval_ms } => spawn_poll(state, interval_ms),
+        WatchPlan::Push => {
+            state.inner.progress.warn(
+                "watch",
+                format!(
+                    "{} requests push changes, but push streams are not wired yet",
+                    descriptor.id
+                ),
+            );
+        }
+    }
+}
+
+fn watch_is_authorized(importer: &HostedImporter, descriptor: &ImporterDescriptor) -> bool {
+    match &descriptor.watch {
+        WatchPlan::Static => true,
+        WatchPlan::Filesystem { root } => {
+            let capability = data_loader::Capability::new(
+                Effect::Watch,
+                Transport::Filesystem,
+                root.to_string_lossy().into_owned(),
+            );
+            descriptor.capabilities.contains(&capability) && importer.is_authorized(&capability)
+        }
+        WatchPlan::Poll { .. } | WatchPlan::Push => {
+            let watches = descriptor
+                .capabilities
+                .iter()
+                .filter(|capability| capability.effect == Effect::Watch)
+                .collect::<Vec<_>>();
+            !watches.is_empty()
+                && watches
+                    .into_iter()
+                    .all(|capability| importer.is_authorized(capability))
+        }
+    }
+}
+
+fn spawn_poll(state: AppState, interval_ms: u64) {
+    let interval_ms = interval_ms.max(100);
+    let progress = state.inner.progress.clone();
+    progress.info("watch", format!("polling importer every {interval_ms} ms"));
+    tokio::spawn(async move {
+        let mut interval = polling_interval(interval_ms);
+        interval.tick().await;
+        loop {
+            interval.tick().await;
+            reload(&state).await;
+        }
+    });
+}
+
+fn polling_interval(interval_ms: u64) -> tokio::time::Interval {
+    let mut interval = tokio::time::interval(Duration::from_millis(interval_ms));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    interval
+}
+
+fn spawn_filesystem(state: AppState, vault_root: PathBuf, markdown_only: bool) {
     let progress = state.inner.progress.clone();
 
     // Reload signal channel. The notify callback runs on the notify
@@ -76,10 +154,10 @@ pub fn spawn(state: AppState) {
             };
             let mut paths: HashSet<String> = HashSet::new();
             for e in &events {
-                if !is_relevant(&watch_root, &e.path) {
+                if !is_relevant(&watch_root, &e.path, markdown_only) {
                     continue;
                 }
-                if let Some(rel) = relative_md_path(&watch_root, &e.path) {
+                if let Some(rel) = relative_path(&watch_root, &e.path) {
                     paths.insert(rel);
                 }
             }
@@ -107,7 +185,10 @@ pub fn spawn(state: AppState) {
         return;
     }
 
-    progress.info("watch", format!("watching vault: {}", vault_root.display()));
+    progress.info(
+        "watch",
+        format!("watching importer source: {}", vault_root.display()),
+    );
 
     // Move the debouncer into the background task so it lives as long
     // as the task does (dropping it stops the watch).
@@ -133,7 +214,13 @@ pub fn spawn(state: AppState) {
 /// running, HTTP error, lock poisoned, etc.) we fall back to a full
 /// `spawn_rebuild`, logging a warning so regressions are visible.
 pub async fn reload_with_paths(state: &AppState, paths: &HashSet<String>) {
-    rebuild_snapshot(state).await;
+    if !rebuild_snapshot(state).await {
+        return;
+    }
+
+    if state.inner.importer.descriptor().id != "obsidian" {
+        return;
+    }
 
     let progress = state.inner.progress.clone();
     let path_vec: Vec<String> = paths.iter().cloned().collect();
@@ -174,61 +261,32 @@ pub async fn reload_with_paths(state: &AppState, paths: &HashSet<String>) {
 /// Run one full reload: rebuild snapshot + respawn vault-search. Used at
 /// startup-style code paths where there's no known change set.
 pub async fn reload(state: &AppState) {
-    rebuild_snapshot(state).await;
-    respawn_search(state).await;
+    if !rebuild_snapshot(state).await {
+        return;
+    }
+    if state.inner.importer.descriptor().id == "obsidian" {
+        respawn_search(state).await;
+    }
 }
 
 /// Reload the in-memory `GraphSnapshot` from disk and atomically swap it
 /// into `state`. Does NOT touch vault-search.
-async fn rebuild_snapshot(state: &AppState) {
+async fn rebuild_snapshot(state: &AppState) -> bool {
     let progress = state.inner.progress.clone();
 
-    let reload_id = progress.start("ingest", "Reloading vault");
-    progress.info("ingest", "vault change detected");
+    let descriptor = state.inner.importer.descriptor();
+    let reload_id = progress.start("ingest", format!("Reloading {}", descriptor.name));
+    progress.info("ingest", format!("{} change detected", descriptor.id));
 
-    let loader_ref: &dyn data_loader::Loader = state.inner.loader.as_ref();
-    // We need to call load() on the loader. Since the loader is behind
-    // `Box<dyn Loader>` and `Loader` is `Send + Sync`, we can call it
-    // directly from the async context. But `load()` may do blocking I/O
-    // (walking the filesystem), so we spawn_blocking.
-    //
-    // The tricky part: we can't move `&dyn Loader` into spawn_blocking
-    // because it's a reference. Instead, we call load() on the current
-    // thread and wrap the metrics/layout computation in spawn_blocking.
-    let load_result = loader_ref.load();
-    let mut new_graph = load_result.graph;
-
-    if !load_result.unresolved.is_empty() {
-        progress.warn(
-            "ingest",
-            format!("{} unresolved references", load_result.unresolved.len()),
-        );
-    }
-
-    let new_graph = tokio::task::spawn_blocking(move || {
-        graph_metrics::compute_all(&mut new_graph);
-        // Seed deterministic initial positions on a circle.
-        let n = new_graph.node_count();
-        if n > 0 {
-            let radius = 200.0_f32 + (n as f32).sqrt() * 4.0;
-            let step = std::f32::consts::TAU / n as f32;
-            for (i, (_, node)) in new_graph.nodes.iter_mut().enumerate() {
-                let theta = i as f32 * step;
-                node.x = radius * theta.cos();
-                node.y = radius * theta.sin();
+    let new_graph =
+        match crate::vault_loader::load_with_progress(&state.inner.importer, Some(&progress)).await
+        {
+            Ok(graph) => graph,
+            Err(error) => {
+                progress.fail(reload_id, error.to_string());
+                return false;
             }
-        }
-        new_graph
-    })
-    .await;
-
-    let new_graph = match new_graph {
-        Ok(g) => g,
-        Err(e) => {
-            progress.fail(reload_id, format!("reload panic: {e}"));
-            return;
-        }
-    };
+        };
 
     let snap_id = progress.start("ingest", "Building snapshot");
     let snapshot = tokio::task::spawn_blocking(move || GraphSnapshot::build(new_graph))
@@ -239,7 +297,7 @@ async fn rebuild_snapshot(state: &AppState) {
         Err(e) => {
             progress.fail(snap_id, format!("snapshot panic: {e}"));
             progress.fail(reload_id, "snapshot build failed");
-            return;
+            return false;
         }
     };
     progress.finish(snap_id);
@@ -250,6 +308,7 @@ async fn rebuild_snapshot(state: &AppState) {
     // Keep the compute worker simulating THIS graph (no-op when the broker
     // is disabled or disconnected).
     crate::server::push_graph_to_worker(state).await;
+    true
 }
 
 /// Full respawn of the vault-search subprocess with `--rebuild`. Used as
@@ -272,7 +331,12 @@ async fn respawn_search(state: &AppState) {
 /// Convert an absolute event path to the vault-relative form vault-search
 /// expects (forward slashes, with `.md` extension preserved). Returns
 /// `None` if the path can't be made relative.
-fn relative_md_path(vault_root: &Path, path: &Path) -> Option<String> {
+fn relative_path(vault_root: &Path, path: &Path) -> Option<String> {
+    if vault_root == path {
+        return path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned());
+    }
     let rel = path.strip_prefix(vault_root).ok()?;
     let s = rel.to_string_lossy().replace('\\', "/");
     if s.is_empty() {
@@ -284,7 +348,7 @@ fn relative_md_path(vault_root: &Path, path: &Path) -> Option<String> {
 
 /// Filter: only `.md` files under `vault_root` whose path doesn't
 /// traverse a hidden / ignored directory.
-fn is_relevant(vault_root: &Path, path: &Path) -> bool {
+fn is_relevant(vault_root: &Path, path: &Path, markdown_only: bool) -> bool {
     // Strip the vault root prefix for component inspection so we don't
     // false-trigger on something like `/home/.config/...`.
     let rel: PathBuf = path
@@ -303,32 +367,148 @@ fn is_relevant(vault_root: &Path, path: &Path) -> bool {
         }
     }
 
-    matches!(path.extension().and_then(|s| s.to_str()), Some("md"))
+    !markdown_only || matches!(path.extension().and_then(|s| s.to_str()), Some("md"))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use data_loader::{ImportError, ImportFuture, Importer, ImporterDescriptor, LoadResult};
+    use vault_data::{VaultGraph, VaultNode};
+
+    struct FailingImporter;
+
+    impl Importer for FailingImporter {
+        fn descriptor(&self) -> ImporterDescriptor {
+            ImporterDescriptor::new(
+                "failing",
+                "Failing",
+                "1",
+                vec![data_loader::Capability::new(
+                    Effect::Read,
+                    Transport::InMemory,
+                    "failing",
+                )],
+            )
+        }
+
+        fn import<'a>(&'a self) -> ImportFuture<'a, Result<LoadResult, ImportError>> {
+            Box::pin(async {
+                Err(ImportError::SourceRead {
+                    origin: "test".into(),
+                    message: "expected failure".into(),
+                })
+            })
+        }
+    }
+
+    struct DeclaredButUngrantedWatch;
+
+    impl Importer for DeclaredButUngrantedWatch {
+        fn descriptor(&self) -> ImporterDescriptor {
+            ImporterDescriptor::new(
+                "ungranted-watch",
+                "Ungranted watch",
+                "1",
+                vec![
+                    data_loader::Capability::new(
+                        Effect::Read,
+                        Transport::Kubernetes,
+                        "cluster-a/apps/deployments:default",
+                    ),
+                    data_loader::Capability::new(
+                        Effect::Watch,
+                        Transport::Kubernetes,
+                        "cluster-a/apps/deployments:default",
+                    ),
+                ],
+            )
+            .with_watch(WatchPlan::Poll { interval_ms: 100 })
+        }
+
+        fn import<'a>(&'a self) -> ImportFuture<'a, Result<LoadResult, ImportError>> {
+            Box::pin(async {
+                Ok(LoadResult {
+                    graph: VaultGraph::new(),
+                    unresolved: Vec::new(),
+                })
+            })
+        }
+    }
+
+    #[test]
+    fn declared_but_ungranted_watch_cannot_start_change_driver() {
+        let raw = DeclaredButUngrantedWatch;
+        let descriptor = raw.descriptor();
+        let importer = HostedImporter::new(
+            Box::new(raw),
+            descriptor
+                .capabilities
+                .iter()
+                .filter(|capability| capability.effect == Effect::Read)
+                .cloned(),
+        )
+        .unwrap();
+
+        assert!(!watch_is_authorized(&importer, &descriptor));
+    }
+
+    #[tokio::test]
+    async fn polling_skips_missed_ticks_instead_of_bursting_reloads() {
+        assert_eq!(
+            polling_interval(100).missed_tick_behavior(),
+            tokio::time::MissedTickBehavior::Skip
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_reload_keeps_last_good_snapshot() {
+        let mut graph = VaultGraph::new();
+        graph.add_node(VaultNode {
+            id: "last-good".into(),
+            ..Default::default()
+        });
+        let raw: Box<dyn Importer> = Box::new(FailingImporter);
+        let grants = raw.descriptor().capabilities;
+        let importer = HostedImporter::new(raw, grants).unwrap();
+        let state = crate::AppState::new(
+            PathBuf::new(),
+            importer,
+            graph,
+            None,
+            None,
+            crate::compute_broker::ComputeBroker::new(),
+            Arc::new(crate::progress::ProgressLog::new()),
+        );
+        assert!(!rebuild_snapshot(&state).await);
+        let snapshot = state.snapshot();
+        assert!(snapshot.graph.nodes.contains_key("last-good"));
+    }
 
     #[test]
     fn filter_accepts_markdown() {
         let root = Path::new("/v");
-        assert!(is_relevant(root, Path::new("/v/notes/foo.md")));
-        assert!(is_relevant(root, Path::new("/v/foo.md")));
+        assert!(is_relevant(root, Path::new("/v/notes/foo.md"), true));
+        assert!(is_relevant(root, Path::new("/v/foo.md"), true));
     }
 
     #[test]
     fn filter_rejects_non_markdown() {
         let root = Path::new("/v");
-        assert!(!is_relevant(root, Path::new("/v/foo.txt")));
-        assert!(!is_relevant(root, Path::new("/v/notes/img.png")));
+        assert!(!is_relevant(root, Path::new("/v/foo.txt"), true));
+        assert!(!is_relevant(root, Path::new("/v/notes/img.png"), true));
+        assert!(is_relevant(root, Path::new("/v/foo.txt"), false));
     }
 
     #[test]
     fn filter_rejects_dotdirs() {
         let root = Path::new("/v");
-        assert!(!is_relevant(root, Path::new("/v/.git/HEAD.md")));
-        assert!(!is_relevant(root, Path::new("/v/.obsidian/cache/x.md")));
-        assert!(!is_relevant(root, Path::new("/v/node_modules/x.md")));
+        assert!(!is_relevant(root, Path::new("/v/.git/HEAD.md"), true));
+        assert!(!is_relevant(
+            root,
+            Path::new("/v/.obsidian/cache/x.md"),
+            true
+        ));
+        assert!(!is_relevant(root, Path::new("/v/node_modules/x.md"), true));
     }
 }

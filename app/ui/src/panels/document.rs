@@ -117,11 +117,50 @@ fn with_doc<R>(id: &str, f: impl FnOnce(&mut DocState) -> R) -> R {
 
 // --- detection + text helpers (page_viewer.rs ports) ----------------------------------
 
-/// Detect obsidian-page nodes. There is no `"obsidian_page"` sentinel
-/// server-side; the only special doctype is `"external"` (the `/node/:id`
-/// stub fallback). Rule: doctype != "external" AND path non-empty.
-fn is_obsidian_page(meta: &proto::NodeMeta) -> bool {
-    !meta.path.is_empty() && meta.doctype.as_deref() != Some("external")
+/// Content editing follows the source adapter's explicit effect rather than
+/// inferring write safety from path or document type.
+fn is_writable_content(meta: &proto::NodeMeta) -> bool {
+    meta.content_writable
+        // Backward compatibility for a new UI connected to a server that
+        // predates source/content capability fields. Old Obsidian nodes had a
+        // non-empty path; generated and external nodes must remain read-only.
+        || (meta.source_id.is_empty()
+            && !meta.path.is_empty()
+            && !matches!(
+                meta.doctype.as_deref(),
+                Some("external") | Some("generated")
+            ))
+}
+
+#[cfg(test)]
+mod content_capability_tests {
+    use super::*;
+
+    #[test]
+    fn honors_explicit_new_server_capability() {
+        let meta = proto::NodeMeta {
+            source_id: "obsidian".into(),
+            content_writable: true,
+            ..Default::default()
+        };
+        assert!(is_writable_content(&meta));
+    }
+
+    #[test]
+    fn preserves_legacy_obsidian_editing_without_enabling_generated_nodes() {
+        let legacy_page = proto::NodeMeta {
+            path: "notes/page.md".into(),
+            ..Default::default()
+        };
+        let legacy_generated = proto::NodeMeta {
+            path: "n1".into(),
+            doctype: Some("generated".into()),
+            ..Default::default()
+        };
+
+        assert!(is_writable_content(&legacy_page));
+        assert!(!is_writable_content(&legacy_generated));
+    }
 }
 
 /// Returns `(had_frontmatter, body)` from a raw markdown source — the
@@ -316,12 +355,17 @@ pub(crate) fn panel(ctx: Ctx) -> Element {
             if selected.read().is_some() { "node failed to load" } else { "select a node" }
         } };
     };
-    if !is_obsidian_page(m) {
-        // Stub/external nodes have no file on disk — nothing to edit.
-        // Show the body read-only if the server sent one anyway.
+    if !is_writable_content(m) {
+        // Read-only sources may still expose content through a source adapter.
         let body = m.body.clone();
         return rsx! { div { class: "docv",
-            div { class: "empty", "external node — no file on disk" }
+            div { class: "empty",
+                if m.content_readable {
+                    "source content is read-only"
+                } else {
+                    "this source exposes metadata only"
+                }
+            }
             if !body.is_empty() {
                 div { class: "rendered-md", dangerous_inner_html: render_markdown(&body) }
             }

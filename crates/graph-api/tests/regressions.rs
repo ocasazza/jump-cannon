@@ -11,7 +11,10 @@ use axum::http::{Request, StatusCode};
 use prost::Message;
 use tower::ServiceExt; // for `oneshot`
 
-use data_loader::{LoadResult, Loader};
+use data_loader::{
+    Capability, Effect, HostedImporter, ImportError, ImportFuture, Importer, ImporterDescriptor,
+    LoadResult, Loader, Transport,
+};
 use graph_api::proto::NodeMeta;
 use graph_api::AppState;
 use vault_data::VaultGraph;
@@ -33,12 +36,50 @@ impl Loader for EmptyLoader {
     }
 }
 
+struct DeclaredButUngrantedWrite;
+
+impl Importer for DeclaredButUngrantedWrite {
+    fn descriptor(&self) -> ImporterDescriptor {
+        ImporterDescriptor::new(
+            "ungranted-write",
+            "Ungranted write",
+            "1",
+            vec![
+                Capability::new(
+                    Effect::Read,
+                    Transport::Filesystem,
+                    "/tmp/jump-cannon-test-empty-vault",
+                ),
+                Capability::new(
+                    Effect::ContentWrite,
+                    Transport::Filesystem,
+                    "/tmp/jump-cannon-test-empty-vault",
+                ),
+            ],
+        )
+    }
+
+    fn import<'a>(&'a self) -> ImportFuture<'a, Result<LoadResult, ImportError>> {
+        Box::pin(async {
+            Ok(LoadResult {
+                graph: VaultGraph::new(),
+                unresolved: Vec::new(),
+            })
+        })
+    }
+}
+
+fn trust_test_importer(importer: Box<dyn Importer>) -> HostedImporter {
+    let grants = importer.descriptor().capabilities;
+    HostedImporter::new(importer, grants).unwrap()
+}
+
 /// Build an `AppState` over an empty `VaultGraph`. No vault-search
 /// subprocess, no asset dir — enough to exercise the protobuf endpoints.
 fn empty_state() -> AppState {
     AppState::new(
         std::path::PathBuf::from("/tmp/jump-cannon-test-empty-vault"),
-        Box::new(EmptyLoader),
+        trust_test_importer(Box::new(EmptyLoader)),
         VaultGraph::new(),
         None,
         None,
@@ -106,6 +147,66 @@ async fn node_meta_stub_for_missing_id() {
     // a future "smarter" id-splitter doesn't silently drift.
     assert_eq!(meta.title, "Missing.md");
     assert_eq!(meta.folder, "some/deeply/nested/path");
+    assert!(!meta.content_readable);
+    assert!(!meta.content_writable);
+}
+
+/// A non-Obsidian importer cannot reach the legacy vault filesystem writer,
+/// even if a client guesses a valid-looking relative path.
+#[tokio::test]
+async fn vault_write_requires_obsidian_content_effect() {
+    let app = graph_api::router(empty_state());
+    let body = serde_json::to_vec(&serde_json::json!({
+        "path": "some/note",
+        "body": "replacement"
+    }))
+    .unwrap();
+    let req = Request::builder()
+        .method("PUT")
+        .uri("/vault/page")
+        .header("content-type", "application/json")
+        .body(Body::from(body))
+        .unwrap();
+
+    let resp = app.oneshot(req).await.expect("router served");
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn declared_but_ungranted_content_write_is_forbidden() {
+    let importer = HostedImporter::new(
+        Box::new(DeclaredButUngrantedWrite),
+        [Capability::new(
+            Effect::Read,
+            Transport::Filesystem,
+            "/tmp/jump-cannon-test-empty-vault",
+        )],
+    )
+    .unwrap();
+    let state = AppState::new(
+        std::path::PathBuf::from("/tmp/jump-cannon-test-empty-vault"),
+        importer,
+        VaultGraph::new(),
+        None,
+        None,
+        graph_api::compute_broker::ComputeBroker::new(),
+        Arc::new(graph_api::progress::ProgressLog::new()),
+    );
+    let app = graph_api::router(state);
+    let body = serde_json::to_vec(&serde_json::json!({
+        "path": "some/note",
+        "body": "replacement"
+    }))
+    .unwrap();
+    let req = Request::builder()
+        .method("PUT")
+        .uri("/vault/page")
+        .header("content-type", "application/json")
+        .body(Body::from(body))
+        .unwrap();
+
+    let resp = app.oneshot(req).await.expect("router served");
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
 }
 
 /// Belt-and-braces: keep `AppState` constructable from outside the crate.
@@ -116,7 +217,7 @@ async fn node_meta_stub_for_missing_id() {
 fn _state_constructor_is_public() -> AppState {
     AppState::new(
         std::path::PathBuf::new(),
-        Box::new(EmptyLoader),
+        trust_test_importer(Box::new(EmptyLoader)),
         VaultGraph::new(),
         None,
         None,

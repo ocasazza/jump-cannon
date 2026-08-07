@@ -1,4 +1,10 @@
-# tvix graph generation + pipeline plugin architecture — design
+# tvix graph generation + pipeline plugin architecture — historical design
+
+> **Status note (2026-08-06):** the tvix generation work described here has
+> since landed, so several “not implemented” statements below are historical.
+> The current data-import and user-loadable extension design lives in
+> [`importer-architecture.md`](importer-architecture.md). Keep this document as
+> implementation history and for its compute/render stage taxonomy.
 
 Two linked deliverables, presented as **research + design**. No features are
 implemented yet; this is the plan the orchestrator reviews before any code lands.

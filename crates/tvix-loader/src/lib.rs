@@ -147,6 +147,7 @@ impl Loader for GenerateLoader {
                 tags.push(format!("cluster-{}", node_cluster[i]));
             }
             let meta = NodeMeta {
+                source_id: "generate".into(),
                 title: id.clone(),
                 tags,
                 frontmatter: HashMap::new(),
@@ -154,6 +155,9 @@ impl Loader for GenerateLoader {
                 path: id.clone(),
                 doctype: Some("generated".into()),
                 folder: String::new(),
+                content_type: None,
+                content_readable: false,
+                content_writable: false,
             };
             graph.add_node(VaultNode {
                 id,
@@ -234,6 +238,7 @@ pub fn convert_generated_graph(gen: &tvix_wasm::GeneratedGraph) -> LoadResult {
         kind_tags.entry(tag.to_string()).or_insert_with(|| tag.to_string());
 
         let meta = NodeMeta {
+            source_id: "tvix".into(),
             title: node.id.clone(),
             tags: vec![tag.to_string()],
             frontmatter: HashMap::new(),
@@ -241,6 +246,9 @@ pub fn convert_generated_graph(gen: &tvix_wasm::GeneratedGraph) -> LoadResult {
             path: node.id.clone(),
             doctype: Some("generated".into()),
             folder: String::new(),
+            content_type: None,
+            content_readable: false,
+            content_writable: false,
         };
 
         graph.add_node(VaultNode {

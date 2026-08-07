@@ -2,7 +2,7 @@
 name = "vault-data"
 version = "1.0.0"
 edition = "2021"
-description = "Shared domain types for vault graph visualization"
+description = "Canonical graph domain types shared by importers, metrics, APIs, and renderers"
 
 [dependencies]
 serde      = { workspace = true }

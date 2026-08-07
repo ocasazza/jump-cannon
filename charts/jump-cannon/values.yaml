@@ -25,6 +25,9 @@ containerSecurityContext:
 
 graphApi:
   replicas: 1
+  # Source identifier understood by graph-api. Enabling the Kubernetes
+  # importer below selects kubernetes regardless of this value.
+  source: obsidian
   image:
     repository: us-central1-docker.pkg.dev/it-ops-nixstation/lavender/jump-cannon-graph-api
     tag: latest
@@ -39,6 +42,43 @@ graphApi:
     limits:
       cpu: "2"
       memory: 2Gi
+
+# Import Kubernetes API resources as graph nodes. The importer package is
+# configuration only; credentials and RBAC remain host-owned effects.
+kubernetesImporter:
+  enabled: false
+  mountPath: /etc/jump-cannon/kubernetes
+  config:
+    source_id: in-cluster
+    max_objects: 100000
+    max_bytes: 134217728
+    poll_interval_ms: 30000
+    include_object: false
+    allow_secrets: false
+    resources:
+      - group: ""
+        version: v1
+        kind: Pod
+        # ConfigMap rendering expands this to the Helm release namespace.
+        namespaces:
+          - "{{ .Release.Namespace }}"
+        label_selector: null
+        field_selector: null
+  serviceAccountToken:
+    # Explicit projected token; pod-wide automount remains disabled.
+    enabled: false
+    expirationSeconds: 3600
+    audience: ""
+  rbac:
+    # Creates a Role and RoleBinding only in the Helm release namespace.
+    # The only granted verb is list, matching the metadata-only polling client.
+    create: false
+    rules: []
+    # Example:
+    #   - apiGroups: [""]
+    #     resources: ["pods"]
+    #   - apiGroups: ["apps"]
+    #     resources: ["deployments", "replicasets"]
 
 vault:
   mountPath: /vault

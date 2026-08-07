@@ -1,3 +1,5 @@
+{{- $graphSource := ternary "kubernetes" .Values.graphApi.source .Values.kubernetesImporter.enabled -}}
+{{- $usesVault := eq $graphSource "obsidian" -}}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -16,6 +18,10 @@ spec:
       labels:
         {{- include "jump-cannon.selectorLabels" . | nindent 8 }}
         app.kubernetes.io/component: graph-api
+      {{- if .Values.kubernetesImporter.enabled }}
+      annotations:
+        checksum/kubernetes-importer-config: {{ toJson .Values.kubernetesImporter.config | replace "{{ .Release.Namespace }}" .Release.Namespace | sha256sum }}
+      {{- end }}
     spec:
       serviceAccountName: {{ include "jump-cannon.serviceAccountName" . }}
       automountServiceAccountToken: {{ .Values.serviceAccount.automountServiceAccountToken }}
@@ -23,7 +29,7 @@ spec:
         {{- toYaml .Values.imagePullSecrets | nindent 8 }}
       securityContext:
         {{- toYaml .Values.podSecurityContext | nindent 8 }}
-      {{- if .Values.vault.seed.enabled }}
+      {{- if and $usesVault .Values.vault.seed.enabled }}
       initContainers:
         - name: seed-vault
           image: {{ .Values.vault.seed.image | quote }}
@@ -69,8 +75,16 @@ spec:
               value: "true"
             - name: JUMP_CANNON_ASSETS_DIR
               value: /assets
+            - name: JUMP_CANNON_SOURCE
+              value: {{ $graphSource | quote }}
+            {{- if .Values.kubernetesImporter.enabled }}
+            - name: JUMP_CANNON_KUBERNETES_CONFIG
+              value: {{ printf "%s/config.json" .Values.kubernetesImporter.mountPath | quote }}
+            {{- end }}
+            {{- if $usesVault }}
             - name: VAULT_ROOT
               value: {{ .Values.vault.mountPath | quote }}
+            {{- end }}
             - name: JUMP_CANNON_COMPUTE_URL
               value: {{ .Values.graphApi.computeUrl | quote }}
             - name: RUST_LOG
@@ -92,10 +106,26 @@ spec:
             {{- toYaml .Values.graphApi.resources | nindent 12 }}
           securityContext:
             {{- toYaml .Values.containerSecurityContext | nindent 12 }}
+          {{- if or $usesVault .Values.kubernetesImporter.enabled }}
           volumeMounts:
+            {{- if $usesVault }}
             - name: vault
               mountPath: {{ .Values.vault.mountPath }}
+            {{- end }}
+            {{- if .Values.kubernetesImporter.enabled }}
+            - name: kubernetes-importer-config
+              mountPath: {{ .Values.kubernetesImporter.mountPath }}
+              readOnly: true
+            {{- end }}
+            {{- if and .Values.kubernetesImporter.enabled .Values.kubernetesImporter.serviceAccountToken.enabled }}
+            - name: kubernetes-api-access
+              mountPath: /var/run/secrets/kubernetes.io/serviceaccount
+              readOnly: true
+            {{- end }}
+          {{- end }}
+      {{- if or $usesVault .Values.kubernetesImporter.enabled }}
       volumes:
+        {{- if $usesVault }}
         - name: vault
           {{- if .Values.vault.persistence.enabled }}
           persistentVolumeClaim:
@@ -108,3 +138,33 @@ spec:
           configMap:
             name: {{ include "jump-cannon.fullname" . }}-vault-seed
         {{- end }}
+        {{- end }}
+        {{- if .Values.kubernetesImporter.enabled }}
+        - name: kubernetes-importer-config
+          configMap:
+            name: {{ include "jump-cannon.fullname" . }}-kubernetes-importer
+        {{- end }}
+        {{- if and .Values.kubernetesImporter.enabled .Values.kubernetesImporter.serviceAccountToken.enabled }}
+        - name: kubernetes-api-access
+          projected:
+            defaultMode: 0440
+            sources:
+              - serviceAccountToken:
+                  path: token
+                  expirationSeconds: {{ .Values.kubernetesImporter.serviceAccountToken.expirationSeconds }}
+                  {{- with .Values.kubernetesImporter.serviceAccountToken.audience }}
+                  audience: {{ . | quote }}
+                  {{- end }}
+              - configMap:
+                  name: kube-root-ca.crt
+                  items:
+                    - key: ca.crt
+                      path: ca.crt
+              - downwardAPI:
+                  items:
+                    - path: namespace
+                      fieldRef:
+                        apiVersion: v1
+                        fieldPath: metadata.namespace
+        {{- end }}
+      {{- end }}

@@ -17,7 +17,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use arc_swap::{ArcSwap, ArcSwapOption};
-use data_loader::Loader;
+use data_loader::HostedImporter;
 use vault_data::VaultGraph;
 
 use crate::compute_broker::ComputeBroker;
@@ -98,9 +98,9 @@ pub struct AppState {
 
 pub struct AppStateInner {
     pub vault_root: PathBuf,
-    /// The data loader — Obsidian vault walker, tvix evaluator, etc.
-    /// The watcher calls `loader.load()` on each reload.
-    pub loader: Box<dyn Loader>,
+    /// The active importer pipeline. Existing synchronous loaders are adapted
+    /// through `data_loader`'s compatibility implementation.
+    pub importer: HostedImporter,
     /// Atomically swappable graph + derived caches. The watcher task
     /// publishes new snapshots after each vault reload.
     pub snapshot: ArcSwap<GraphSnapshot>,
@@ -122,7 +122,7 @@ pub struct AppStateInner {
 impl AppState {
     pub fn new(
         vault_root: PathBuf,
-        loader: Box<dyn Loader>,
+        importer: HostedImporter,
         graph: VaultGraph,
         vault_search: Option<Arc<VaultSearch>>,
         assets_dir: Option<PathBuf>,
@@ -133,7 +133,7 @@ impl AppState {
         Self {
             inner: Arc::new(AppStateInner {
                 vault_root,
-                loader,
+                importer,
                 snapshot: ArcSwap::new(Arc::new(snapshot)),
                 vault_search: ArcSwapOption::new(vault_search),
                 assets_dir,

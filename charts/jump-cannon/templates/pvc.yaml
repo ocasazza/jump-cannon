@@ -1,4 +1,5 @@
-{{- if .Values.vault.persistence.enabled }}
+{{- $graphSource := ternary "kubernetes" .Values.graphApi.source .Values.kubernetesImporter.enabled -}}
+{{- if and (eq $graphSource "obsidian") .Values.vault.persistence.enabled }}
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:

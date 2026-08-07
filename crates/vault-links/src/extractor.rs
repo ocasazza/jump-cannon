@@ -53,6 +53,7 @@ pub fn extract_vault(root: &Path) -> ExtractionResult {
             .unwrap_or_default();
 
         let meta = NodeMeta {
+            source_id: "obsidian".into(),
             title: note.title.clone(),
             tags: note.tags.clone(),
             frontmatter: note.frontmatter.clone(),
@@ -60,6 +61,9 @@ pub fn extract_vault(root: &Path) -> ExtractionResult {
             path: id.clone(),
             doctype: note.doctype.clone(),
             folder,
+            content_type: Some("text/markdown".into()),
+            content_readable: true,
+            content_writable: true,
         };
 
         graph.add_node(VaultNode {

@@ -1,0 +1,49 @@
+format_version = 1
+
+[metadata]
+id = "example.line-graph"
+name = "Line graph"
+version = "1.0.0"
+description = "Example runtime grammar for line-oriented node and edge records"
+
+[parser]
+root_rule = "document"
+grammar = '''
+document = { SOI ~ (record ~ NEWLINE?)* ~ EOI }
+record = _{ node | edge }
+node = { "N|" ~ node_id ~ "|" ~ title ~ "|" ~ kind ~ "|" ~ tags ~ "|" ~ properties }
+node_id = @{ field }
+title = @{ field }
+kind = @{ field }
+tags = _{ (tag ~ ("," ~ tag)*)? }
+tag = @{ atom }
+properties = _{ (property ~ (";" ~ property)*)? }
+property = { key ~ "=" ~ value }
+key = @{ atom }
+value = @{ atom }
+edge = { "E|" ~ source ~ "|" ~ target }
+source = @{ field }
+target = @{ field }
+field = _{ (!("|" | NEWLINE) ~ ANY)+ }
+atom = _{ (!("," | ";" | "=" | "|" | NEWLINE) ~ ANY)+ }
+'''
+
+[captures]
+node = "node"
+id = "node_id"
+title = "title"
+kind = "kind"
+tag = "tag"
+property = "property"
+key = "key"
+value = "value"
+edge = "edge"
+source = "source"
+target = "target"
+
+[limits]
+manifest_bytes = 131072
+grammar_bytes = 65536
+input_bytes = 33554432
+nodes = 100000
+edges = 500000

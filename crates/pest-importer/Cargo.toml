@@ -1,0 +1,20 @@
+[package]
+name = "pest-importer"
+version = "1.0.0"
+edition = "2021"
+description = "Runtime Pest grammar importer packages for jump-cannon graphs"
+
+[dependencies]
+data-loader = { path = "../data-loader" }
+vault-data = { path = "../vault-data" }
+pest = "=2.8.8"
+pest_meta = "=2.8.8"
+pest_vm = "=2.8.8"
+semver = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+toml = "0.8"
+
+[dev-dependencies]
+tempfile = "3"

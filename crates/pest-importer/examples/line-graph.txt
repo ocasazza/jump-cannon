@@ -1,0 +1,3 @@
+N|api|API|service|prod,edge|owner=platform;zone=west
+N|database|Database|database|prod|owner=data;zone=west
+E|api|database

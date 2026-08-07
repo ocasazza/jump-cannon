@@ -3,7 +3,7 @@
 
 use std::path::{Path, PathBuf};
 
-use data_loader::{LoadResult, Loader};
+use data_loader::{Effect, LoadResult, Loader};
 
 use crate::extractor::extract_vault;
 
@@ -38,6 +38,10 @@ impl Loader for ObsidianLoader {
 
     fn root_path(&self) -> Option<&PathBuf> {
         Some(&self.root)
+    }
+
+    fn additional_effects(&self) -> &'static [Effect] {
+        &[Effect::Search, Effect::ContentRead, Effect::ContentWrite]
     }
 }
 

@@ -8,3 +8,7 @@ description = "Generic data-loading trait + schema: adapters produce VaultGraph 
 vault-data = { path = "../vault-data" }
 serde      = { workspace = true }
 serde_json = { workspace = true }
+thiserror  = "2"
+
+[dev-dependencies]
+tokio = { workspace = true }

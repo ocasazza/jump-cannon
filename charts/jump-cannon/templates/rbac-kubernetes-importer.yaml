@@ -1,0 +1,50 @@
+{{- if and .Values.kubernetesImporter.enabled .Values.kubernetesImporter.rbac.create }}
+{{- if eq (len .Values.kubernetesImporter.rbac.rules) 0 }}
+{{- fail "kubernetesImporter.rbac.create requires at least one explicit RBAC rule" }}
+{{- end }}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "jump-cannon.fullname" . }}-kubernetes-importer
+  labels:
+    {{- include "jump-cannon.labels" . | nindent 4 }}
+    app.kubernetes.io/component: graph-api
+rules:
+  {{- range $index, $rule := .Values.kubernetesImporter.rbac.rules }}
+  {{- if or (eq (len $rule.apiGroups) 0) (eq (len $rule.resources) 0) }}
+  {{- fail (printf "kubernetesImporter.rbac.rules[%d] requires explicit apiGroups and resources" $index) }}
+  {{- end }}
+  {{- range $group := $rule.apiGroups }}
+  {{- if contains "*" $group }}
+  {{- fail (printf "kubernetesImporter.rbac.rules[%d] must not contain wildcard apiGroups" $index) }}
+  {{- end }}
+  {{- end }}
+  {{- range $resource := $rule.resources }}
+  {{- if contains "*" $resource }}
+  {{- fail (printf "kubernetesImporter.rbac.rules[%d] must not contain wildcard resources" $index) }}
+  {{- end }}
+  {{- end }}
+  - apiGroups:
+      {{- toYaml $rule.apiGroups | nindent 6 }}
+    resources:
+      {{- toYaml $rule.resources | nindent 6 }}
+    verbs:
+      - list
+  {{- end }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "jump-cannon.fullname" . }}-kubernetes-importer
+  labels:
+    {{- include "jump-cannon.labels" . | nindent 4 }}
+    app.kubernetes.io/component: graph-api
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "jump-cannon.fullname" . }}-kubernetes-importer
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "jump-cannon.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
+{{- end }}
