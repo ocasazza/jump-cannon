@@ -346,7 +346,6 @@ async fn drive_page(
     let target = args.base_url.trim_end_matches('/').to_string() + "/";
     tracing::info!("navigating to {target}");
     page.goto(&target).await.context("page.goto")?;
-    page.wait_for_navigation().await.context("wait_for_navigation")?;
 
     // ---- 3. wait for the boot log line -----------------------------------
     let deadline = Instant::now() + Duration::from_secs(args.timeout_secs);

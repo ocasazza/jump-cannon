@@ -204,8 +204,8 @@
         #   1. A trunk dist. Defaults to the nix-built app-web (the Dioxus
         #      frontend) store path; override with ASSETS_DIR for fast
         #      iteration against a local `trunk watch` build in app/.
-        #   2. A test vault at /tmp/test-vault (auto-seeded by `just`
-        #      recipes; this wrapper also seeds a minimal one).
+        #   2. An isolated test vault (the wrapper creates and seeds one unless
+        #      VAULT_ROOT is explicitly provided).
         # The wrapper bails with a clear error if (1) is missing.
         test-browser-rust = pkgs.writeShellApplication {
           name = "test-browser-rust";
@@ -220,15 +220,28 @@
 
             REPO_ROOT="''${REPO_ROOT:-$PWD}"
             ASSETS_DIR="''${ASSETS_DIR:-${app-web}}"
-            PORT="''${TEST_PORT:-47896}"
+            # PID-derived defaults keep simultaneous local/agent runs from
+            # racing on the same listener. TEST_PORT remains an explicit
+            # deterministic override for callers that need one.
+            PORT="''${TEST_PORT:-$((40000 + $$ % 20000))}"
             OUT_DIR="''${OUT_DIR:-$REPO_ROOT/target/test-browser-rust}"
+            RUN_ROOT=$(mktemp -d "''${TMPDIR:-/tmp}/jump-cannon-browser.XXXXXX")
+            RUN_OUT="$RUN_ROOT/out"
             BROWSER_BIN="''${CHROME_BIN:-''${CHROMIUM_BIN:-}}"
             if [ -n "''${VAULT_ROOT:-}" ]; then
               VAULT="$VAULT_ROOT"
             else
-              VAULT="$OUT_DIR/vault"
-              rm -rf "$VAULT"
+              VAULT="$RUN_ROOT/vault"
             fi
+
+            SERVER_PID=""
+            cleanup() {
+              if [ -n "$SERVER_PID" ]; then
+                kill "$SERVER_PID" 2>/dev/null || true
+              fi
+              rm -rf "$RUN_ROOT"
+            }
+            trap cleanup EXIT
 
             if [ -z "$BROWSER_BIN" ] && [ "$(uname -s)" = "Darwin" ]; then
               for candidate in \
@@ -258,7 +271,7 @@
               exit 2
             fi
 
-            mkdir -p "$VAULT" "$VAULT/Jump Cannon" "$OUT_DIR"
+            mkdir -p "$VAULT" "$VAULT/Jump Cannon" "$OUT_DIR" "$RUN_OUT"
             for source in ${./charts/jump-cannon/knowledge}/*.md; do
               cp -f "$source" "$VAULT/Jump Cannon/$(basename "$source")"
             done
@@ -282,7 +295,6 @@
               --no-browser \
               --assets-dir "$ASSETS_DIR" &
             SERVER_PID=$!
-            trap 'kill "$SERVER_PID" 2>/dev/null || true' EXIT
 
             # Wait for /
             for _ in $(seq 1 30); do
@@ -296,8 +308,11 @@
             test-browser \
               --base-url "http://127.0.0.1:$PORT" \
               --chromium "$BROWSER_BIN" \
-              --out-dir "$OUT_DIR" \
+              --out-dir "$RUN_OUT" \
               --timeout-secs 60
+
+            install -m 0644 "$RUN_OUT/boot.png" "$OUT_DIR/boot.png"
+            install -m 0644 "$RUN_OUT/report.json" "$OUT_DIR/report.json"
           '';
         };
 
