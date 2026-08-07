@@ -473,10 +473,12 @@ fn App() -> Element {
 
     // Resilient initial load: retry until the backend answers, so a server
     // that's still indexing (or starting up) self-heals instead of leaving
-    // the canvas permanently empty.
+    // the canvas permanently empty. Yield one browser task before starting
+    // any API/graph work so Dioxus can commit and paint the workspace shell.
     {
         let mut load_error = ctx.load_error;
         use_future(move || async move {
+            gloo_timers::future::TimeoutFuture::new(0).await;
             let epoch = begin_server_graph_load(ctx);
             loop {
                 match graph_canvas::load().await {

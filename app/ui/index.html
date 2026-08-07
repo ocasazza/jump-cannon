@@ -4,6 +4,33 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
     <title>Jump Cannon</title>
+    <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'><rect width='64' height='64' rx='12' fill='%2309090a'/><circle cx='18' cy='32' r='8' fill='%23389cf6'/><circle cx='32' cy='32' r='8' fill='%23f6be3c'/><circle cx='46' cy='32' r='8' fill='%23ee60c2'/></svg>" />
+    <!-- Critical copy of panel_kit::BOOT_CSS. This must exist outside Rust:
+         Trunk awaits the main WASM module before Dioxus can render anything. -->
+    <style>
+      .panel-kit-boot { position:fixed; inset:0; z-index:2147483000; display:flex; flex-direction:column;
+        min-width:0; min-height:0; overflow:hidden; background:#09090a; color:#efeff0;
+        font:12px/1.35 "Courier Prime",ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; }
+      .panel-kit-boot-bar { display:flex; align-items:center; gap:12px; height:35px; flex:0 0 35px;
+        padding:0 14px; border-bottom:1px solid #242427; letter-spacing:.08em; text-transform:uppercase; }
+      .panel-kit-boot-title { font-weight:700; }
+      .panel-kit-boot-status { color:#77777d; font-size:10px; }
+      .panel-kit-boot-panels { display:grid; grid-template-columns:minmax(0,3fr) minmax(240px,2fr);
+        grid-template-rows:1fr 1fr; gap:8px; flex:1; min-height:0; padding:44px 8px 8px; }
+      .panel-kit-boot-panel { position:relative; min-width:0; min-height:90px; border:1px solid #35353a;
+        border-radius:4px; background:#0c0c0d; overflow:hidden; }
+      .panel-kit-boot-panel:first-child { grid-row:1 / span 2; }
+      .panel-kit-boot-panel::before { content:""; position:absolute; top:9px; left:12px; width:52px; height:8px;
+        border-radius:3px; background:linear-gradient(90deg,#389cf6 0 14%,transparent 14% 22%,#f6be3c 22% 36%,transparent 36% 44%,#ee60c2 44% 58%,transparent 58%); }
+      .panel-kit-boot-line { height:6px; margin:34px 12px 0; border-radius:3px; background:#1a1a1d;
+        animation:panel-kit-boot-pulse 1.25s ease-in-out infinite alternate; }
+      .panel-kit-boot-line + .panel-kit-boot-line { width:62%; margin-top:9px; animation-delay:.18s; }
+      [data-dioxus-id] > .panel-kit-boot[data-panel-kit-static-boot] { display:none; }
+      @keyframes panel-kit-boot-pulse { from { opacity:.35; } to { opacity:.9; } }
+      @media (max-width:680px) { .panel-kit-boot-panels { grid-template-columns:1fr; grid-template-rows:2fr 1fr; }
+        .panel-kit-boot-panel:first-child { grid-row:auto; } .panel-kit-boot-panel:last-child { display:none; } }
+      @media (prefers-reduced-motion:reduce) { .panel-kit-boot-line { animation:none; opacity:.65; } }
+    </style>
     <!-- Name the crate explicitly: trunk is driven from the workspace root in
          the nix (crane) build, where the virtual manifest has no root package. -->
     <link data-trunk rel="rust" href="Cargo.toml" data-bin="jump-cannon-ui" />
@@ -15,6 +42,18 @@
     <link data-trunk rel="rust" href="../tvix-worker/Cargo.toml" data-bin="tvix-worker" data-type="worker" data-cargo-features="wasm" />
   </head>
   <body>
-    <div id="main"></div>
+    <div id="main">
+      <section class="panel-kit-boot" data-panel-kit-static-boot role="status" aria-live="polite">
+        <header class="panel-kit-boot-bar">
+          <strong class="panel-kit-boot-title">JUMP CANNON</strong>
+          <span class="panel-kit-boot-status">loading application…</span>
+        </header>
+        <main class="panel-kit-boot-panels" aria-hidden="true">
+          <div class="panel-kit-boot-panel"><div class="panel-kit-boot-line"></div><div class="panel-kit-boot-line"></div></div>
+          <div class="panel-kit-boot-panel"><div class="panel-kit-boot-line"></div><div class="panel-kit-boot-line"></div></div>
+          <div class="panel-kit-boot-panel"><div class="panel-kit-boot-line"></div><div class="panel-kit-boot-line"></div></div>
+        </main>
+      </section>
+    </div>
   </body>
 </html>
