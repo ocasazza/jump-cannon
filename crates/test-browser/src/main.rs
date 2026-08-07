@@ -1,17 +1,15 @@
-//! Rust-driven browser regression suite (foundation).
-//!
-//! Asserts the bare minimum that future regression checks will build on:
+//! Rust-driven browser regression suite for the Dioxus/WebGPU frontend.
 //!
 //!   1. The page at `--base-url` responds (HTTP 200).
 //!   2. Headless Chromium launches with WebGPU flags and navigates.
 //!   3. The boot log line `[jump-cannon-ui] boot` appears on the JS
 //!      console within `--timeout-secs`.
-//!   4. The graph `<canvas>` element exists with non-zero width/height.
-//!   5. A screenshot is saved to `<out-dir>/boot.png` for visual review.
-//!
-//! Anything flaky (pixel brightness, motion deltas, click recovery) is
-//! deliberately deferred. (The legacy egui-era Playwright suite that held
-//! those checks was removed with the egui frontend — see git history.)
+//!   4. The static boot shell is outside and adjacent to the Dioxus mount,
+//!      then hidden after mount.
+//!   5. WebGPU, graph data, canvas dimensions, and Graph header actions are
+//!      ready and remain intact after interaction.
+//!   6. No console error, runtime exception, or failed resource load occurs.
+//!   7. A screenshot is saved to `<out-dir>/boot.png` for visual review.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -61,9 +59,23 @@ struct Report {
     #[serde(skip_serializing_if = "Option::is_none")]
     reason: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pre_wasm_mount: Option<PreWasmMountCheck>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     graph_header_actions: Option<HeaderActionCheck>,
     page_errors: Vec<String>,
     console_logs: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct PreWasmMountCheck {
+    ok: bool,
+    main_mount_found: bool,
+    static_boot_found: bool,
+    static_boot_inside_main: bool,
+    static_boot_adjacent_sibling: bool,
+    static_boot_hidden: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    reason: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -128,32 +140,62 @@ async fn main() -> Result<()> {
     let duration_ms = started.elapsed().as_millis();
 
     let logs = console_logs.lock().await.clone();
-    let (ok, reason, canvas_width, canvas_height, boot_log_found, header_actions, page_errors) =
-        match &result {
-            Ok(o) => {
-                let ok = o.header_actions.ok && o.page_errors.is_empty();
-                let reason = if !o.header_actions.ok {
-                    o.header_actions.reason.clone()
-                } else if !o.page_errors.is_empty() {
-                    Some(format!(
-                        "browser emitted {} console error(s) or unhandled exception(s)",
-                        o.page_errors.len()
-                    ))
-                } else {
-                    None
-                };
-                (
-                    ok,
-                    reason,
-                    o.canvas_width,
-                    o.canvas_height,
-                    o.boot_log_found,
-                    Some(o.header_actions.clone()),
-                    o.page_errors.clone(),
-                )
-            }
-            Err(e) => (false, Some(format!("{e:#}")), 0, 0, false, None, Vec::new()),
-        };
+    let (
+        ok,
+        reason,
+        canvas_width,
+        canvas_height,
+        boot_log_found,
+        pre_wasm_mount,
+        header_actions,
+        page_errors,
+    ) = match &result {
+        Ok(o) => {
+            let header_actions_ok = o
+                .header_actions
+                .as_ref()
+                .is_some_and(|header_actions| header_actions.ok);
+            let ok = o.pre_wasm_mount.ok && header_actions_ok && o.page_errors.is_empty();
+            let reason = if !o.pre_wasm_mount.ok {
+                o.pre_wasm_mount.reason.clone()
+            } else if let Some(header_actions) = o
+                .header_actions
+                .as_ref()
+                .filter(|header_actions| !header_actions.ok)
+            {
+                header_actions.reason.clone()
+            } else if o.header_actions.is_none() {
+                Some("Graph header action regression did not run".to_string())
+            } else if !o.page_errors.is_empty() {
+                Some(format!(
+                    "browser emitted {} console error(s) or unhandled exception(s)",
+                    o.page_errors.len()
+                ))
+            } else {
+                None
+            };
+            (
+                ok,
+                reason,
+                o.canvas_width,
+                o.canvas_height,
+                o.boot_log_found,
+                Some(o.pre_wasm_mount.clone()),
+                o.header_actions.clone(),
+                o.page_errors.clone(),
+            )
+        }
+        Err(e) => (
+            false,
+            Some(format!("{e:#}")),
+            0,
+            0,
+            false,
+            None,
+            None,
+            Vec::new(),
+        ),
+    };
 
     let report = Report {
         ok,
@@ -163,6 +205,7 @@ async fn main() -> Result<()> {
         boot_log_found,
         duration_ms,
         reason: reason.clone(),
+        pre_wasm_mount,
         graph_header_actions: header_actions,
         page_errors,
         console_logs: tail(&logs, 50),
@@ -186,7 +229,8 @@ struct RunOk {
     canvas_width: u32,
     canvas_height: u32,
     boot_log_found: bool,
-    header_actions: HeaderActionCheck,
+    pre_wasm_mount: PreWasmMountCheck,
+    header_actions: Option<HeaderActionCheck>,
     page_errors: Vec<String>,
 }
 
@@ -384,7 +428,68 @@ async fn drive_page(
         );
     }
 
-    // ---- 4. graph header actions are present, visible, and safe ----------
+    // ---- 4. static pre-WASM shell hands off without sharing #main --------
+    // The static shell must remain outside Dioxus's mount node. Otherwise the
+    // first virtual-DOM diff can try to reconcile server-authored children and
+    // fail before graph readiness gives the broader regression useful output.
+    let pre_wasm_mount_js = r#"(async () => {
+        await new Promise((resolve) => requestAnimationFrame(() =>
+          requestAnimationFrame(resolve)
+        ));
+        const mainMount = document.querySelector('#main');
+        const staticBoot = document.querySelector('[data-panel-kit-static-boot]');
+        const staticBootInsideMain = Boolean(
+          mainMount && staticBoot && mainMount.contains(staticBoot)
+        );
+        const staticBootAdjacentSibling = Boolean(
+          mainMount && staticBoot && mainMount.nextElementSibling === staticBoot
+        );
+        const staticBootHidden = Boolean(
+          staticBoot && getComputedStyle(staticBoot).display === 'none'
+        );
+        const failures = [];
+        if (!mainMount) failures.push('#main Dioxus mount missing');
+        if (!staticBoot) failures.push('static pre-WASM boot shell missing');
+        if (staticBootInsideMain) {
+          failures.push('static pre-WASM boot shell is inside #main');
+        }
+        if (mainMount && staticBoot && !staticBootAdjacentSibling) {
+          failures.push('static pre-WASM boot shell is not the adjacent sibling after #main');
+        }
+        if (staticBoot && !staticBootHidden) {
+          failures.push('static pre-WASM boot shell still visible after Dioxus mount');
+        }
+        return {
+          ok: failures.length === 0,
+          main_mount_found: Boolean(mainMount),
+          static_boot_found: Boolean(staticBoot),
+          static_boot_inside_main: staticBootInsideMain,
+          static_boot_adjacent_sibling: staticBootAdjacentSibling,
+          static_boot_hidden: staticBootHidden,
+          reason: failures.length ? failures.join('; ') : null,
+        };
+    })()"#;
+    let pre_wasm_mount_value: serde_json::Value =
+        page.evaluate(pre_wasm_mount_js).await?.into_value()?;
+    let pre_wasm_mount: PreWasmMountCheck = serde_json::from_value(pre_wasm_mount_value)
+        .context("decode pre-WASM mount invariant result")?;
+    if !pre_wasm_mount.ok {
+        // Preserve the structured fields in report.json and stop before the
+        // graph-ready timeout obscures this earlier mount failure.
+        console_pump.abort();
+        runtime_pump.abort();
+        exception_pump.abort();
+        return Ok(RunOk {
+            canvas_width: 0,
+            canvas_height: 0,
+            boot_log_found,
+            pre_wasm_mount,
+            header_actions: None,
+            page_errors: Vec::new(),
+        });
+    }
+
+    // ---- 5. graph header actions are present, visible, and safe ----------
     // Wait for graph data to finish loading: the boot log is emitted before
     // the Graph panel's canvas and header actions necessarily exist.
     let graph_ready_js = r#"(() => {
@@ -570,7 +675,7 @@ async fn drive_page(
     let header_actions: HeaderActionCheck = serde_json::from_value(header_actions_value)
         .context("decode Graph header action regression result")?;
 
-    // ---- 5. canvas exists with non-zero size -----------------------------
+    // ---- 6. canvas exists with non-zero size -----------------------------
     // The Dioxus app's graph canvas is `<canvas class="graph-canvas">`
     // (app/ui/src/graph_canvas.rs); fall back to any canvas on the page.
     let dims_js = r#"(() => {
@@ -587,7 +692,7 @@ async fn drive_page(
     let canvas_width = dims.get("w").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
     let canvas_height = dims.get("h").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
 
-    // ---- 6. screenshot ---------------------------------------------------
+    // ---- 7. screenshot ---------------------------------------------------
     let shot_params = CaptureScreenshotParams::builder().build();
     let png_b64 = page
         .screenshot(shot_params)
@@ -647,7 +752,8 @@ async fn drive_page(
         canvas_width,
         canvas_height,
         boot_log_found,
-        header_actions,
+        pre_wasm_mount,
+        header_actions: Some(header_actions),
         page_errors,
     })
 }

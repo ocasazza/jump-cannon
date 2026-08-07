@@ -12,6 +12,11 @@ tags: [jump-cannon, browser, webgpu]
 Dioxus app in Chromium, exercises Graph header actions, and writes `boot.png`
 and `report.json` under `target/test-browser-rust`.
 
+The report also verifies the startup handoff: the marked static boot shell is
+the adjacent sibling of `#main`, never a child of the Dioxus mount, and is
+hidden after the first Dioxus commit. This protects the empty-mount invariant
+documented in [[Frontend]] as well as catching resource-load and WASM errors.
+
 Chromiumoxide arguments are keys without a leading `--`; its launcher adds the
 CLI prefix. Cluster browser jobs run as the chart's non-root identity without a
 service-account token, and the automation browser explicitly disables its own

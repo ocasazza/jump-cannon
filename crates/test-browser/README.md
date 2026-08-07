@@ -1,8 +1,8 @@
 # test-browser
 
-Rust-driven browser smoke test for the Dioxus frontend (app/ui) WASM
-bundle. Foundation crate — the assertion set is deliberately minimal
-while the frontend stabilizes.
+Rust-driven browser smoke test for the Dioxus frontend (`app/ui`) WASM
+bundle. It exercises the built app through Chromium's DevTools Protocol; no
+hand-written JavaScript is shipped with the frontend.
 
 ## What it asserts today
 
@@ -10,13 +10,21 @@ while the frontend stabilizes.
 2. Headless Chromium launches with WebGPU flags and navigates.
 3. The boot log line `[jump-cannon-ui] boot` appears on the JS console
    within `--timeout-secs` (logged from `app/ui/src/main.rs`).
-4. The graph `<canvas>` element exists with non-zero width and height.
-5. A screenshot is written to `<out-dir>/boot.png`. **Pixel content is
-   not asserted** — that's the flaky part.
+4. The Dioxus mount and pre-WASM shell obey the startup invariant: `#main`
+   exists, the marked static shell is its adjacent sibling rather than a
+   child, and the shell is hidden after Dioxus mounts. Keeping foreign DOM out
+   of `#main` prevents Dioxus 0.6's `invalid key` startup panic.
+5. The Graph panel has initialized its WebGPU render host, loaded at least one
+   node, and exposes a non-zero-size canvas.
+6. In tiling mode, Pause/Resume and Fit are visible inside the Graph header,
+   clicking them does not start a panel drag, and the canvas remains mounted.
+7. No console error, unhandled runtime exception, or failed resource load was
+   observed.
+8. A screenshot is written to `<out-dir>/boot.png` for visual review. Pixel
+   content is not automatically asserted.
 
-Future additions: motion deltas, click-doesn't-blank, tag round-trips,
-`/compute/health` shape, etc. (The egui-era Playwright suite that held
-those checks was removed with the egui frontend — see git history.)
+The retired egui-era Playwright suite lives in git history; this Rust harness
+is the browser regression gate for the Dioxus app.
 
 ## Running locally
 
@@ -32,9 +40,11 @@ a local `cd app && trunk build --release` if you want to test local
 edits.
 
 Output lands in `target/test-browser-rust/`:
+
 - `boot.png` — screenshot at the moment all assertions passed
-- `report.json` — JSON with `{ok, canvas_width, canvas_height,
-  boot_log_found, duration_ms, console_logs[]}`
+- `report.json` — machine-readable result including canvas dimensions, boot
+  and mount-handoff state, render/node readiness, header-action checks,
+  browser errors, and recent console logs
 
 ## CLI
 

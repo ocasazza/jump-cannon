@@ -12,5 +12,11 @@ tags: [jump-cannon, frontend, dioxus, wgpu]
 behavior; Jump Cannon owns panels, graph interactions, API calls, and app CSS.
 wgpu draws the graph and `graph-layouts` supplies in-process layout compute.
 
+The pre-WASM loading shell follows panel-kit's static boot contract: `#main`
+stays empty and the marked shell is its immediately following sibling. Dioxus
+0.6 does not clear pre-existing mount children; putting the shell inside
+`#main` reaches the diff engine as foreign unkeyed DOM and panics with
+`invalid key`. App CSS hides the sibling after Dioxus marks the mount root.
+
 Do not add handwritten JavaScript or a JS bundler. Validate visible changes with
 [[Browser Regression]] and keep server contracts in [[Backend API]].

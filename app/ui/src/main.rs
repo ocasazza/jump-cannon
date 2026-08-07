@@ -619,7 +619,6 @@ fn App() -> Element {
 
     rsx! {
         style { {panel_kit::CSS} }
-        style { {include_str!("../assets/app.css")} }
         div {
             class: ws.root_class(),
             tabindex: "0",
