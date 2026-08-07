@@ -13,5 +13,7 @@ configured time zone. Defaults are Sunday at 00:00, 00:15, and 00:30.
 
 Fuzz and browser work are bounded CPU jobs. GPU performance work is admitted by
 [[Kueue Scheduling]] and may remain queued until quota is deliberately granted.
+All test pods use the chart's non-root security contexts, drop capabilities,
+and disable service-account token automount.
 Results feed [[Observability]], [[Fuzz Testing]], [[Browser Regression]], and
 [[Performance Engineering]].

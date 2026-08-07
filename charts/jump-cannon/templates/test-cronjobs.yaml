@@ -33,12 +33,15 @@ spec:
             {{- include "jump-cannon.selectorLabels" . | nindent 12 }}
             app.kubernetes.io/component: fuzz-tests
         spec:
+          automountServiceAccountToken: false
           restartPolicy: Never
           {{- if .Values.tests.fuzz.kueue.enabled }}
           priorityClassName: {{ .Values.tests.fuzz.kueue.podPriorityClassName | quote }}
           {{- end }}
           imagePullSecrets:
             {{- toYaml .Values.imagePullSecrets | nindent 12 }}
+          securityContext:
+            {{- toYaml .Values.podSecurityContext | nindent 12 }}
           containers:
             - name: fuzz
               image: {{ include "jump-cannon.testImage" . | quote }}
@@ -52,6 +55,8 @@ spec:
                   value: {{ .Values.tests.fuzz.cases | quote }}
               resources:
                 {{- toYaml .Values.tests.commonResources | nindent 16 }}
+              securityContext:
+                {{- toYaml .Values.containerSecurityContext | nindent 16 }}
 ---
 {{- end }}
 {{- if .Values.tests.performance.enabled }}
@@ -91,6 +96,7 @@ spec:
             {{- include "jump-cannon.selectorLabels" . | nindent 12 }}
             app.kubernetes.io/component: performance-tests
         spec:
+          automountServiceAccountToken: false
           restartPolicy: Never
           {{- if .Values.tests.performance.kueue.enabled }}
           priorityClassName: {{ .Values.tests.performance.kueue.podPriorityClassName | quote }}
@@ -99,6 +105,8 @@ spec:
             {{- toYaml .Values.imagePullSecrets | nindent 12 }}
           nodeSelector:
             {{- toYaml .Values.tests.performance.nodeSelector | nindent 12 }}
+          securityContext:
+            {{- toYaml .Values.podSecurityContext | nindent 12 }}
           containers:
             - name: performance
               image: {{ include "jump-cannon.testImage" . | quote }}
@@ -112,6 +120,8 @@ spec:
                   value: {{ .Values.tests.performance.includeHuge | quote }}
               resources:
                 {{- toYaml .Values.tests.performance.resources | nindent 16 }}
+              securityContext:
+                {{- toYaml .Values.containerSecurityContext | nindent 16 }}
 ---
 {{- end }}
 {{- if .Values.tests.browser.enabled }}
@@ -141,9 +151,12 @@ spec:
             {{- include "jump-cannon.selectorLabels" . | nindent 12 }}
             app.kubernetes.io/component: browser-tests
         spec:
+          automountServiceAccountToken: false
           restartPolicy: Never
           imagePullSecrets:
             {{- toYaml .Values.imagePullSecrets | nindent 12 }}
+          securityContext:
+            {{- toYaml .Values.podSecurityContext | nindent 12 }}
           containers:
             - name: browser
               image: {{ include "jump-cannon.testImage" . | quote }}
@@ -159,4 +172,6 @@ spec:
                   value: {{ .Values.tests.browser.timeoutSeconds | quote }}
               resources:
                 {{- toYaml .Values.tests.commonResources | nindent 16 }}
+              securityContext:
+                {{- toYaml .Values.containerSecurityContext | nindent 16 }}
 {{- end }}

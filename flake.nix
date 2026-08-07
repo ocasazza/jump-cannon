@@ -660,6 +660,7 @@
               config = {
                 Cmd = [ "/bin/jump-cannon-browser-smoke" ];
                 WorkingDir = "/tmp";
+                User = "10001:10001";
                 Env = [
                   "PATH=/bin"
                   "HOME=/tmp"

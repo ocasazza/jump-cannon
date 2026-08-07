@@ -178,32 +178,35 @@ struct RunOk {
     page_errors: Vec<String>,
 }
 
+fn chromium_args() -> Vec<&'static str> {
+    // chromiumoxide models arguments as keys and adds the `--` prefix when it
+    // builds the command line. Supplying CLI-form strings here would turn
+    // `--foo` into `----foo`, which Chromium silently ignores.
+    let mut args = vec![
+        "enable-unsafe-webgpu",
+        "disable-dev-shm-usage",
+        "disable-gpu-sandbox",
+    ];
+    // Headless Linux uses the Nix-provided lavapipe Vulkan adapter. Installed
+    // Chrome on macOS should retain its native Metal/ANGLE defaults.
+    if cfg!(target_os = "linux") {
+        args.extend(["enable-features=Vulkan", "use-angle=vulkan", "use-gl=angle"]);
+    }
+    args
+}
+
 async fn run(args: &Args, console_logs: Arc<Mutex<Vec<String>>>) -> Result<RunOk> {
     // ---- 1. server reachability ------------------------------------------
     let probe_url = args.base_url.trim_end_matches('/').to_string() + "/";
     probe_server(&probe_url, Duration::from_secs(args.timeout_secs.min(30))).await?;
 
     // ---- 2. launch chromium ----------------------------------------------
-    let mut chromium_args: Vec<String> = vec![
-        "--enable-unsafe-webgpu".into(),
-        "--no-sandbox".into(),
-        "--disable-dev-shm-usage".into(),
-        "--disable-gpu-sandbox".into(),
-        "--window-size=1280,800".into(),
-    ];
-    // Headless Linux uses the Nix-provided lavapipe Vulkan adapter. Installed
-    // Chrome on macOS should retain its native Metal/ANGLE defaults.
-    if cfg!(target_os = "linux") {
-        chromium_args.extend([
-            "--enable-features=Vulkan".into(),
-            "--use-angle=vulkan".into(),
-            "--use-gl=angle".into(),
-        ]);
-    }
-
     let config = BrowserConfig::builder()
         .chrome_executable(&args.chromium)
-        .args(chromium_args)
+        .args(chromium_args())
+        // This is an isolated automation browser. Use chromiumoxide's typed
+        // switch so rootful container callers cannot accidentally omit it.
+        .no_sandbox()
         .window_size(1280, 800)
         .build()
         .map_err(|e| anyhow!("BrowserConfig: {e}"))?;
@@ -214,7 +217,7 @@ async fn run(args: &Args, console_logs: Arc<Mutex<Vec<String>>>) -> Result<RunOk
 
     // The CDP handler must be driven; spawn a task that polls it.
     let handler_task = tokio::spawn(async move {
-        while let Some(_) = handler.next().await {}
+        while handler.next().await.is_some() {}
     });
 
     let outcome = drive_page(&browser, args, console_logs).await;
@@ -514,11 +517,7 @@ async fn drive_page(
         .screenshot(shot_params)
         .await
         .context("screenshot")?;
-    let bytes: Vec<u8> = match png_b64 {
-        // Newer chromiumoxide returns Vec<u8> directly; older returns base64
-        // string. Handle both by trying to decode if it looks like base64.
-        b => b,
-    };
+    let bytes: Vec<u8> = png_b64;
     let shot_path = args.out_dir.join("boot.png");
     // Heuristic: if first byte is the PNG magic 0x89, write as-is; else
     // assume base64-encoded text.
@@ -643,4 +642,16 @@ fn parse_url(url: &str) -> Result<(String, u16, String)> {
 fn tail(v: &[String], n: usize) -> Vec<String> {
     let start = v.len().saturating_sub(n);
     v[start..].to_vec()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::chromium_args;
+
+    #[test]
+    fn chromiumoxide_arguments_are_keys_not_cli_tokens() {
+        let args = chromium_args();
+        assert!(!args.is_empty());
+        assert!(args.iter().all(|arg| !arg.starts_with('-')));
+    }
 }
