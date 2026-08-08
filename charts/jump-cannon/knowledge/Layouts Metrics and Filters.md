@@ -8,9 +8,12 @@ tags: [jump-cannon, layout, metrics]
 
 # Layouts, Metrics, and Filters
 
-Settings groups persistent graph configuration into four tabs:
+Settings groups persistent graph configuration and deployment discovery into
+five tabs:
 
 - **Connection** selects graph-api and summarizes the active graph session.
+- **Importers** reports the active importer and the sanitized, deployment-owned
+  source catalog; switching sources remains a Helm rollout.
 - **Layout** chooses the simulation engine, starting positions, solver
   parameters, and playback behavior.
 - **Appearance** maps graph attributes to size, shape, and color.

@@ -1,0 +1,6 @@
+importers:
+  selected: ""
+  sources:
+    lavender-ingest-okf:
+      producer:
+        existingClaimValue: another-okf-claim

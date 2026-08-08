@@ -391,20 +391,29 @@ Importer packages and source instances are separate resources.
 
 ### Current experience
 
-Today, loading data is an administrator/deployment action. One active source is
+Loading data is an administrator/deployment action. One active source is
 selected when graph-api starts, using CLI flags or environment variables
 locally and equivalent server/volume configuration in Helm. The six supported
-selections are Obsidian, tvix, generate, Kubernetes, OKF, and Pest. The Dioxus
-app automatically loads the graph published by that source and the existing
-Progress panel reports reload work. Switching sources therefore changes server
-configuration and normally restarts the server; it does not require a
-different frontend.
+selections are Obsidian, tvix, generate, Kubernetes, OKF, and Pest. Helm can
+also declare named source instances under `importers.sources` and select one
+with `importers.selected`; an empty selector preserves the legacy source
+settings. The chart currently wires named Obsidian, Kubernetes, and OKF
+profiles; it does not advertise tvix or Pest profiles until their required
+source-specific inputs can be represented and mounted. The Dioxus app
+automatically loads the graph published by that source and the existing
+Progress panel reports reload work. Switching sources changes server
+configuration and normally restarts the server.
 
 Every server importer publishes its current discovery/search contract at
 `/graph/schema`, and the Nodes search endpoint indexes the fields its importer
-declares. The Nodes panel displays the active searchable keys and surfaces
-invalid queries, but the current UI does not yet provide an importer-library or
-full query-builder panel.
+declares. `GET /importers` publishes a sanitized, read-only view of the active
+importer and configured source instances. **Settings > Importers** renders that
+catalog, including the selected instance, filesystem claim/path, read-only
+state, and operator-facing producer handoff metadata. It deliberately contains
+no credentials or Apply, Run, or Activate action: selection remains Helm policy
+and requires a rollout. The Nodes panel displays the active searchable keys and
+surfaces invalid queries, but the current UI does not yet provide a full
+query-builder panel.
 OKF exposes nodes, typed discovery fields, frontmatter attributes, tags, and
 edges, but deliberately does not advertise source-body read or write
 capabilities. Inspector metadata and graph filtering work; the Document body
@@ -412,19 +421,21 @@ and editor remain unavailable until content reads are routed through the
 importer's bounded, no-follow filesystem boundary instead of graph-api's
 Obsidian compatibility reader.
 
-There is no Importers panel, browser package upload, importer marketplace, or
-browser-owned credential flow yet. Adding a custom importer today means an
-administrator supplies a trusted Pest manifest and input through explicit
-paths, normally read-only mounts, or deploys a compiled-in source. The server
-validates the configured source at startup and fails on an unknown source; it
-never silently falls back to Obsidian. The Helm path similarly binds a selected
-importer to server-side mounts or Kubernetes access rather than transferring a
-dataset through the browser.
+There is no browser package upload, importer marketplace, runtime source
+mutation, or browser-owned credential flow. Adding a custom importer today
+means an administrator supplies a trusted Pest manifest and input through
+explicit paths, normally read-only mounts, or deploys a compiled-in source. The
+server validates both the configured catalog and selected source at startup and
+fails on an invalid or mismatched selection; it never silently falls back to
+Obsidian. The Helm path similarly binds a selected importer to server-side
+mounts or Kubernetes access rather than transferring a dataset through the
+browser.
 
 ### Target experience
 
-The planned Dioxus Importers panel will keep package installation separate from
-source configuration:
+The future authenticated control plane will extend the read-only Dioxus
+Importers tab while keeping package installation separate from source
+configuration:
 
 1. **Importer Library** shows built-ins and installed packages with their
    version, digest, validation state, requested capabilities, trust level, and
@@ -444,10 +455,14 @@ deadlines, memory and batch limits, and process or pod isolation. Until that
 boundary and graph-api authentication/authorization exist, browser upload and
 network-facing install/run operations remain intentionally unavailable.
 
-Planned server API:
+Current server API:
 
-- `GET /importers` lists built-ins and installed packages, validation state,
-  digest, version, requested capabilities, and discovery schema.
+- `GET /importers` returns the active importer and sanitized configured source
+  instances. Its activation mode is `helm_rollout`; no mutation endpoint is
+  exposed.
+
+Planned authenticated server API:
+
 - `PUT /importers/:id` validates a bounded single-file package and its fixtures,
   then atomically installs it. This is gated on authentication/authorization.
 - `POST /importers/:id/preview` returns counts, sampled nodes/edges,
@@ -455,10 +470,10 @@ Planned server API:
 - `POST /importers/:id/runs` starts an asynchronous run and returns a run ID.
 - `GET /import-runs/:id` reports durable status and diagnostics.
 
-These endpoints are a design target, not an implemented public API. The Dioxus
-panel will reuse the existing Rust file-input pattern and progress feed rather
-than expanding Generate. Credentials never enter browser localStorage or
-shareable app-state exports.
+The mutation and run endpoints are a design target, not an implemented public
+API. Any future upload surface will reuse the existing Rust file-input pattern
+and progress feed rather than expanding Generate. Credentials never enter
+browser localStorage or shareable app-state exports.
 
 ## Migration plan
 
@@ -484,6 +499,8 @@ shareable app-state exports.
   per node from Obsidian, tvix, generate, Kubernetes, OKF, and Pest.
 - [x] Build generic Tantivy search and schema-driven facets inside the same
   atomic graph snapshot, and expose the active contract at `/graph/schema`.
+- [x] Add a deployment-selected source-instance catalog, sanitized read-only
+  `/importers` discovery, and a non-mutating Dioxus Settings tab.
 
 ### Phase 2: generic graph ownership
 
@@ -508,7 +525,8 @@ shareable app-state exports.
 - [ ] Add source event streams and graph deltas; initially coalesce deltas into
   the existing full snapshot publication path.
 - [ ] Add the authenticated importer/source-instance/run control plane.
-- [ ] Add the Dioxus Importers panel and Rust browser regression.
+- [ ] Add authenticated install, preview, and run actions to the read-only
+  Dioxus Importers tab and extend its Rust browser regression.
 - [ ] Add a read-only multi-package importer-library volume to the Helm chart.
 - [x] Add opt-in, namespace-scoped Kubernetes token/RBAC templates; preserve
   the secure defaults.

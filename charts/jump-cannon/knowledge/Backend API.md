@@ -22,6 +22,12 @@ HTTP 400. graph-api builds this index directly from validated importer
 `SearchDocument` records; it does not spawn `vault-search` and never falls back
 to title-only matching.
 
+`GET /importers` returns the active descriptor plus a bounded, sanitized list
+of configured source instances. Its activation mode is `helm_rollout`; the API
+does not expose a source-selection or run mutation. graph-api rejects an
+unknown selection, a selected kind that differs from the importer actually
+started, and unsafe filesystem profiles during startup.
+
 Bulk arrays use little-endian numeric buffers; structured messages use protobuf
 or JSON where appropriate. See [[Architecture]], [[Observability]], and
 [[Security Model]]. Importer contracts are documented in [[Importer Runtime]].

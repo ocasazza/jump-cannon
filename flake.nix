@@ -308,6 +308,14 @@
               export VK_ICD_FILENAMES="${browserVulkanIcdDir}/lvp_icd.x86_64.json"
             fi
 
+            # Stable deployment catalog for the Settings -> Importers browser
+            # contract. Keep Obsidian selected so it matches the fixture vault
+            # hosted below; Lavender remains an available, unselected OKF
+            # profile whose shared PVC is consumer-mounted read-only.
+            if [ -z "''${JUMP_CANNON_IMPORTER_CATALOG_JSON:-}" ]; then
+              export JUMP_CANNON_IMPORTER_CATALOG_JSON='{"selected":"local-obsidian","sources":{"local-obsidian":{"displayName":"Local browser vault","description":"Deterministic Obsidian source for the Rust browser regression.","kind":"obsidian"},"lavender-ingest-okf":{"displayName":"Lavender ingest OKF","description":"Git-backed Open Knowledge Format v0.2 repository produced by lavender-ingest. The shared claim is deployment-provisioned RWX and must be in the same namespace; the producer defaults to lavender-ingest-okf (or <release>-okf), with files readable by UID/GID 10001.","kind":"okf","sourceId":"lavender-ingest","filesystemRescanIntervalSeconds":60,"source":{"volumeName":"lavender-okf-repository","existingClaim":"lavender-okf-shared","mountPath":"/var/lib/lavender/okf-repository","path":"/var/lib/lavender/okf-repository/okf","readOnly":true},"producer":{"chart":"lavender-ingest","defaultClaim":"lavender-ingest-okf","repositoryRoot":"/data/okf-repository","workflowInput":"/data/okf-repository/okf","existingClaimValuePath":"okf.persistence.existingClaim","existingClaimValue":"lavender-okf-shared"}}}}'
+            fi
+
             echo "→ starting graph-api on port ''${PORT}…"
             graph-api \
               --vault-root "$VAULT" \
@@ -334,6 +342,7 @@
 
             install -m 0644 "$RUN_OUT/boot.png" "$OUT_DIR/boot.png"
             install -m 0644 "$RUN_OUT/nodes-editor.png" "$OUT_DIR/nodes-editor.png"
+            install -m 0644 "$RUN_OUT/settings-importers.png" "$OUT_DIR/settings-importers.png"
             install -m 0644 "$RUN_OUT/report.json" "$OUT_DIR/report.json"
           '';
         };

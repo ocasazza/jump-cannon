@@ -370,6 +370,86 @@ pub async fn graph_schema() -> ApiResult<GraphSchema> {
     get_json("/graph/schema").await
 }
 
+// --- importer deployment catalog ---------------------------------------------
+
+/// Sanitized, deployment-owned importer catalog exposed by graph-api. The
+/// endpoint is deliberately read-only: changing the selected source replaces
+/// the process-lifetime importer and watcher, so Helm remains the activation
+/// authority and a rollout performs the switch.
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ImporterCatalog {
+    pub activation: String,
+    #[serde(default)]
+    pub selected: Option<String>,
+    pub active: ActiveImporter,
+    #[serde(default)]
+    pub sources: Vec<ImporterProfile>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+pub struct ActiveImporter {
+    #[serde(default)]
+    pub kind: Option<String>,
+    pub importer: ImporterSource,
+}
+
+impl ActiveImporter {
+    pub fn kind_label(&self) -> &str {
+        self.kind.as_deref().unwrap_or("unknown/custom")
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ImporterProfile {
+    pub id: String,
+    pub display_name: String,
+    #[serde(default)]
+    pub description: String,
+    pub kind: String,
+    #[serde(default)]
+    pub source_id: Option<String>,
+    #[serde(default)]
+    pub filesystem_rescan_interval_seconds: Option<u64>,
+    #[serde(default)]
+    pub selected: bool,
+    #[serde(default)]
+    pub active: bool,
+    #[serde(default)]
+    pub source: Option<ImporterFilesystemSource>,
+    #[serde(default)]
+    pub producer: Option<ImporterProducer>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ImporterFilesystemSource {
+    pub volume_name: String,
+    pub existing_claim: String,
+    pub mount_path: String,
+    pub path: String,
+    #[serde(default)]
+    pub read_only: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ImporterProducer {
+    pub chart: String,
+    pub default_claim: String,
+    pub repository_root: String,
+    pub workflow_input: String,
+    pub existing_claim_value_path: String,
+    pub existing_claim_value: String,
+}
+
+/// `GET /importers` — deployment-selectable source profiles and the importer
+/// currently hosted by this graph-api process.
+pub async fn importers() -> ApiResult<ImporterCatalog> {
+    get_json("/importers").await
+}
+
 // --- vault writes ---------------------------------------------------------------
 
 #[derive(Clone, Debug, Deserialize)]
@@ -466,4 +546,29 @@ pub struct ConfigEntry {
 #[allow(dead_code)]
 pub async fn configs() -> ApiResult<Vec<ConfigEntry>> {
     get_json("/configs").await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ImporterCatalog;
+
+    #[test]
+    fn importer_catalog_accepts_an_omitted_active_kind() {
+        let catalog: ImporterCatalog = serde_json::from_value(serde_json::json!({
+            "activation": "helm_rollout",
+            "selected": null,
+            "active": {
+                "importer": {
+                    "id": "custom",
+                    "name": "Custom importer",
+                    "version": "1"
+                }
+            },
+            "sources": []
+        }))
+        .expect("catalog without an active kind must remain readable");
+
+        assert_eq!(catalog.active.kind, None);
+        assert_eq!(catalog.active.kind_label(), "unknown/custom");
+    }
 }

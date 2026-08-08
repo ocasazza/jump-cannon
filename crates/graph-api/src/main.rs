@@ -6,6 +6,7 @@ use anyhow::Context;
 use data_loader::{HostedImporter, Importer};
 use graph_api::{
     compute_broker::{ComputeBroker, RemoteLayout},
+    importer_catalog::ImporterCatalog,
     progress::ProgressLog,
     router, vault_loader, AppState,
 };
@@ -53,6 +54,11 @@ struct Args {
     /// unauthenticated HTTP API does not accept grammar uploads.
     #[arg(long, env = "JUMP_CANNON_SOURCE", default_value = "obsidian")]
     source: String,
+    /// Bounded JSON catalog of deployment-owned importer source instances.
+    /// It is exposed read-only at GET /importers; switching still requires a
+    /// Helm rollout.
+    #[arg(long, env = "JUMP_CANNON_IMPORTER_CATALOG_JSON")]
+    importer_catalog_json: Option<String>,
     /// When --source=tvix, the Nix expression to evaluate. If not provided,
     /// reads from the file at --vault-root (which must be a .nix file).
     #[arg(long, env = "JUMP_CANNON_TVIX_EXPR")]
@@ -117,6 +123,11 @@ async fn main() -> anyhow::Result<()> {
             data_loader::SourceKind::all().join(", ")
         )
     })?;
+
+    let importer_catalog =
+        ImporterCatalog::parse(args.importer_catalog_json.as_deref(), source_kind.clone())
+            .map_err(anyhow::Error::msg)
+            .context("invalid deployment importer catalog")?;
 
     let importer: Box<dyn Importer> = match source_kind {
         data_loader::SourceKind::Obsidian => {
@@ -247,13 +258,14 @@ async fn main() -> anyhow::Result<()> {
 
     let compute_broker = ComputeBroker::new();
 
-    let state = AppState::new(
+    let state = AppState::new_with_importer_catalog(
         vault_root.clone(),
         importer,
         loaded,
         args.assets_dir,
         compute_broker.clone(),
         progress.clone(),
+        importer_catalog,
     )?;
 
     if let Some(compute_url) = args.compute_url.clone() {

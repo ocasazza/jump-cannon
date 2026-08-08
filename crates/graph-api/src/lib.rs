@@ -10,6 +10,7 @@
 pub mod binary;
 pub mod browser;
 pub mod compute_broker;
+pub mod importer_catalog;
 pub mod progress;
 pub mod proto;
 pub mod search_index;

@@ -39,6 +39,12 @@ the prior complete revision active. `GET /graph/schema` is the client-visible
 contract for the active source. See [[Nodes Search and Documents]] and
 [[Backend API]].
 
+Helm can declare named source instances under `importers.sources` and select
+one with `importers.selected`. graph-api validates the bounded catalog against
+the source that actually started and exposes only its sanitized form through
+`GET /importers`. The read-only Settings tab reports what deployment selected;
+changing the active source remains a Helm rollout rather than a browser effect.
+
 The default markdown loader resolves wikilinks and is currently the only
 importer that advertises readable and writable source content. Kubernetes
 queries are explicit, bounded, metadata-only, and namespace-scoped by default.

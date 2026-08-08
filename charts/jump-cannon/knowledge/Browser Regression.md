@@ -10,8 +10,8 @@ tags: [jump-cannon, browser, webgpu]
 
 `just test browser-rust` starts graph-api with a test vault, opens the built
 Dioxus app in Chromium, exercises Graph header actions and the Nodes workbench,
-and writes `nodes-editor.png`, `boot.png`, and `report.json` under
-`target/test-browser-rust`.
+and writes `nodes-editor.png`, `settings-importers.png`, `boot.png`, and
+`report.json` under `target/test-browser-rust`.
 
 Stable fixture notes prove that Nodes renders a horizontal navigator/content
 split, exposes the core importer search keys, loads selected content, preserves
@@ -23,12 +23,17 @@ pane. When the wrapper owns the temporary vault, those fixtures are mandatory
 rather than silently falling back to a weaker generic check. The structured
 result is recorded under `nodes_editor` in `report.json`.
 
-The same run maximizes unified Settings and verifies the Connection, Layout,
-Appearance, and Camera tabs in order. Each tab must have one selected ARIA tab,
-a matching tabpanel with real delegated content, and an unobscured pointer
-target; the retired standalone configuration panels must be absent. Restoring
-Settings must remount a render-ready Graph canvas. These results are recorded
-under `settings_tabs`.
+The same run maximizes unified Settings and verifies the Connection, Importers,
+Layout, Appearance, and Camera tabs in order. Each tab must have one selected
+ARIA tab, a matching tabpanel with real delegated content, and an unobscured
+pointer target; the retired standalone configuration panels must be absent.
+The importer fixture proves that the active source is identified, the Lavender
+source shows its exact read-only claim and `/var/lib/lavender/okf-repository/okf`
+input, deployment-provisioned RWX and same-namespace requirements, alternate
+`<release>-okf` naming, UID/GID `10001`, and rollout ownership are explained,
+and no Apply, Run, or Activate action is present. Restoring Settings must
+remount a render-ready Graph canvas. These results are recorded under
+`settings_tabs`.
 
 Chromiumoxide arguments are keys without a leading `--`; its launcher adds the
 CLI prefix. Cluster browser jobs run as the chart's non-root identity without a

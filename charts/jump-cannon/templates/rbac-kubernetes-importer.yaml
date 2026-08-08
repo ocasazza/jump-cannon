@@ -1,4 +1,5 @@
-{{- if and .Values.kubernetesImporter.enabled .Values.kubernetesImporter.rbac.create }}
+{{- $importer := include "jump-cannon.importerSelection" . | fromJson -}}
+{{- if and $importer.usesKubernetes .Values.kubernetesImporter.rbac.create }}
 {{- if eq (len .Values.kubernetesImporter.rbac.rules) 0 }}
 {{- fail "kubernetesImporter.rbac.create requires at least one explicit RBAC rule" }}
 {{- end }}

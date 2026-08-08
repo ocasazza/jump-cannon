@@ -1,5 +1,5 @@
-{{- $graphSource := ternary "kubernetes" .Values.graphApi.source .Values.kubernetesImporter.enabled -}}
-{{- if and (eq $graphSource "obsidian") .Values.vault.seed.enabled .Values.vault.seed.includeKnowledgeBase }}
+{{- $importer := include "jump-cannon.importerSelection" . | fromJson -}}
+{{- if and $importer.allowsSeeds .Values.vault.seed.enabled .Values.vault.seed.includeKnowledgeBase }}
 apiVersion: v1
 kind: ConfigMap
 metadata:

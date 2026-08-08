@@ -1,0 +1,21 @@
+importers:
+  selected: lavender-ingest-okf
+
+# Deliberately conflict with the selected profile. The named profile must win
+# without rendering Kubernetes configuration or a chart-owned vault.
+graphApi:
+  source: obsidian
+
+kubernetesImporter:
+  enabled: true
+
+graphCompute:
+  enabled: false
+
+tests:
+  fuzz:
+    enabled: false
+  performance:
+    enabled: false
+  browser:
+    enabled: false
