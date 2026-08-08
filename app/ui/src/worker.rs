@@ -149,8 +149,8 @@ mod wasm {
     /// (identical promotion path, no shape drift). Error shape:
     /// `{"ok":false,"error":"…"}`.
     fn parse_reply(data: &str) -> Result<GeneratedGraph, String> {
-        let v: serde_json::Value = serde_json::from_str(data)
-            .map_err(|e| format!("worker reply was not JSON: {e}"))?;
+        let v: serde_json::Value =
+            serde_json::from_str(data).map_err(|e| format!("worker reply was not JSON: {e}"))?;
         if v.get("ok").and_then(|b| b.as_bool()).unwrap_or(false) {
             let graph = v
                 .get("graph")

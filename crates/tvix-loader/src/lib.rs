@@ -36,7 +36,7 @@ use std::collections::HashMap;
 
 use data_loader::{
     DiscoveryField, DiscoveryFieldType, EdgeTypeSchema, ImporterSchema, LoadResult, Loader,
-    SearchDocument,
+    SearchDocument, TagHierarchySchema,
 };
 use rand::Rng;
 use vault_data::{NodeMeta, NodeMetrics, VaultEdge, VaultGraph, VaultNode};
@@ -362,6 +362,7 @@ fn generated_schema(edge_key: &str, edge_description: &str) -> ImporterSchema {
                 .facetable(),
         ],
         vec![EdgeTypeSchema::directed(edge_key, edge_description)],
+        TagHierarchySchema::slash(),
     )
 }
 

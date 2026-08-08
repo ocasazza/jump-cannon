@@ -15,7 +15,7 @@
 # builds through nix + crane and must not absorb the Tauri/Dioxus dependency
 # tree.
 [workspace]
-members = ["ui", "src-tauri", "tvix-worker"]
+members = ["filter-model", "ui", "src-tauri", "tvix-worker"]
 resolver = "2"
 
 [workspace.package]

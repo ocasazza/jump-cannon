@@ -131,13 +131,21 @@ static AUTO: GlobalSignal<bool> = Signal::global(|| restore().auto);
 fn persist() {
     let _ = LocalStorage::set(
         STORE_KEY,
-        Persisted { pinned: PINNED.read().clone(), last: *SNAP.read(), auto: *AUTO.read() },
+        Persisted {
+            pinned: PINNED.read().clone(),
+            last: *SNAP.read(),
+            auto: *AUTO.read(),
+        },
     );
 }
 
 /// AppState round-trip seam (`crate::appstate`): the live metrics state.
 pub(crate) fn state_snapshot() -> Persisted {
-    Persisted { pinned: PINNED.read().clone(), last: *SNAP.read(), auto: *AUTO.read() }
+    Persisted {
+        pinned: PINNED.read().clone(),
+        last: *SNAP.read(),
+        auto: *AUTO.read(),
+    }
 }
 
 /// AppState round-trip seam: write imported metrics state straight to
@@ -156,8 +164,12 @@ fn compute(full: bool) {
 
     let Some((positions, edge_pairs)) = render::with_host(|h| {
         let positions = h.pipes.positions_cpu().to_vec();
-        let pairs: Vec<(u32, u32)> =
-            h.pipes.edges_cpu().chunks_exact(2).map(|c| (c[0], c[1])).collect();
+        let pairs: Vec<(u32, u32)> = h
+            .pipes
+            .edges_cpu()
+            .chunks_exact(2)
+            .map(|c| (c[0], c[1]))
+            .collect();
         (positions, pairs)
     }) else {
         return; // renderer not mounted yet — nothing to measure
@@ -177,7 +189,10 @@ fn compute(full: bool) {
         (fs, cr)
     } else {
         let prev = *SNAP.read();
-        (prev.and_then(|s| s.full_stress), prev.and_then(|s| s.crossings))
+        (
+            prev.and_then(|s| s.full_stress),
+            prev.and_then(|s| s.crossings),
+        )
     };
 
     *SNAP.write() = Some(MetricsSnapshot {

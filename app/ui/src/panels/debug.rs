@@ -155,10 +155,17 @@ fn DebugPanel(graph: Signal<Option<GraphData>>) -> Element {
             let window = ((now - prev) / 16.7).ceil().max(1.0) as usize;
             let mean_tail = |v: &[f32]| -> f32 {
                 let tail = &v[v.len().saturating_sub(window)..];
-                if tail.is_empty() { 0.0 } else { tail.iter().sum::<f32>() / tail.len() as f32 }
+                if tail.is_empty() {
+                    0.0
+                } else {
+                    tail.iter().sum::<f32>() / tail.len() as f32
+                }
             };
-            let frame_ms =
-                if dts.is_empty() { (now - prev) as f32 } else { mean_tail(&dts) };
+            let frame_ms = if dts.is_empty() {
+                (now - prev) as f32
+            } else {
+                mean_tail(&dts)
+            };
             let cost_ms = mean_tail(&costs);
             prev = now;
             let (max_ke, halted, sim_running, n_nodes, n_edges, host_live) = with_host(|h| {
@@ -172,7 +179,12 @@ fn DebugPanel(graph: Signal<Option<GraphData>>) -> Element {
                 )
             })
             .unwrap_or((0.0, false, false, 0, 0, false));
-            buf.push(Sample { t: (now - start) / 1000.0, frame_ms, cost_ms, max_ke });
+            buf.push(Sample {
+                t: (now - start) / 1000.0,
+                frame_ms,
+                cost_ms,
+                max_ke,
+            });
             let overflow = buf.len().saturating_sub(SAMPLE_CAP);
             if overflow > 0 {
                 buf.drain(..overflow);
@@ -289,20 +301,55 @@ fn stats_view(graph: Signal<Option<GraphData>>) -> Element {
     // in-process GPU force layout.
     let backend = if perf.host_live { "gpu-force" } else { "—" };
 
-    let n_nodes = if perf.host_live { perf.n_nodes } else { g.as_ref().map_or(0, |g| g.n_nodes) };
-    let n_edges = if perf.host_live { perf.n_edges } else { g.as_ref().map_or(0, |g| g.n_edges) };
+    let n_nodes = if perf.host_live {
+        perf.n_nodes
+    } else {
+        g.as_ref().map_or(0, |g| g.n_nodes)
+    };
+    let n_edges = if perf.host_live {
+        perf.n_edges
+    } else {
+        g.as_ref().map_or(0, |g| g.n_edges)
+    };
     let n_comms = g.as_ref().map_or(0, |g| g.num_communities);
-    let dash = |v: u32| if v == 0 { "—".to_string() } else { v.to_string() };
+    let dash = |v: u32| {
+        if v == 0 {
+            "—".to_string()
+        } else {
+            v.to_string()
+        }
+    };
     let (n, m, c) = (dash(n_nodes), dash(n_edges), dash(n_comms));
 
     let fps_pts: Vec<[f64; 2]> = perf
         .samples
         .iter()
-        .map(|s| [s.t, if s.frame_ms > 0.0 { 1000.0 / s.frame_ms as f64 } else { 0.0 }])
+        .map(|s| {
+            [
+                s.t,
+                if s.frame_ms > 0.0 {
+                    1000.0 / s.frame_ms as f64
+                } else {
+                    0.0
+                },
+            ]
+        })
         .collect();
-    let frame_pts: Vec<[f64; 2]> = perf.samples.iter().map(|s| [s.t, s.frame_ms as f64]).collect();
-    let cost_pts: Vec<[f64; 2]> = perf.samples.iter().map(|s| [s.t, s.cost_ms as f64]).collect();
-    let ke_pts: Vec<[f64; 2]> = perf.samples.iter().map(|s| [s.t, s.max_ke as f64]).collect();
+    let frame_pts: Vec<[f64; 2]> = perf
+        .samples
+        .iter()
+        .map(|s| [s.t, s.frame_ms as f64])
+        .collect();
+    let cost_pts: Vec<[f64; 2]> = perf
+        .samples
+        .iter()
+        .map(|s| [s.t, s.cost_ms as f64])
+        .collect();
+    let ke_pts: Vec<[f64; 2]> = perf
+        .samples
+        .iter()
+        .map(|s| [s.t, s.max_ke as f64])
+        .collect();
     let fps_stats = stats3(fps_pts.iter().map(|p| p[1] as f32));
     let frame_stats = stats3(frame_pts.iter().map(|p| p[1] as f32));
     let cost_stats = stats3(cost_pts.iter().map(|p| p[1] as f32));
@@ -403,7 +450,11 @@ fn multi_chart(series: &[(&str, &'static str, String, &[[f64; 2]])]) -> Element 
         .iter()
         .map(|(_, color, _, pts)| {
             let visible: Vec<&[f64; 2]> = pts.iter().filter(|p| p[0] >= x_min).collect();
-            let y_max = visible.iter().map(|p| p[1]).fold(0.0_f64, f64::max).max(1e-9);
+            let y_max = visible
+                .iter()
+                .map(|p| p[1])
+                .fold(0.0_f64, f64::max)
+                .max(1e-9);
             let line: String = visible
                 .iter()
                 .map(|p| {
@@ -418,7 +469,10 @@ fn multi_chart(series: &[(&str, &'static str, String, &[[f64; 2]])]) -> Element 
     let y_maxes: Vec<f64> = series
         .iter()
         .map(|(_, _, _, pts)| {
-            pts.iter().filter(|p| p[0] >= x_min).map(|p| p[1]).fold(0.0_f64, f64::max)
+            pts.iter()
+                .filter(|p| p[0] >= x_min)
+                .map(|p| p[1])
+                .fold(0.0_f64, f64::max)
         })
         .collect();
 

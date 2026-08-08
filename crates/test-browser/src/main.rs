@@ -9,7 +9,8 @@
 //!   4. The graph canvas becomes render-ready and its header controls work.
 //!   5. Nodes is a two-pane editor; Flat/Tags selection and content work.
 //!   6. Unified Settings exposes four accessible, content-backed tabs.
-//!   7. Screenshots are saved for the Nodes editor and complete workspace.
+//!   7. Filter is a repeatable, nested Boolean builder with live validation.
+//!   8. Screenshots are saved for the Nodes editor, Filter builder, and workspace.
 //!
 //! Anything flaky (pixel brightness, motion deltas, click recovery) is
 //! deliberately deferred. (The legacy egui-era Playwright suite that held
@@ -93,6 +94,8 @@ struct Report {
     nodes_editor: Option<NodesEditorCheck>,
     #[serde(skip_serializing_if = "Option::is_none")]
     settings_tabs: Option<SettingsTabsCheck>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    filter_builder: Option<FilterBuilderCheck>,
     page_errors: Vec<String>,
     console_logs: Vec<String>,
 }
@@ -143,9 +146,11 @@ struct NodesEditorCheck {
     selected_content_loaded: bool,
     selection_persisted: bool,
     exact_tag_groups: bool,
+    hierarchical_tag_paths: bool,
     untagged_group: bool,
     flat_active_count: usize,
     schema_core_keys: bool,
+    search_schema_generic: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     reason: Option<String>,
 }
@@ -162,6 +167,23 @@ struct SettingsTabsCheck {
     importer_read_only: bool,
     importer_no_mutation_controls: bool,
     legacy_panels_absent: bool,
+    graph_restored: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    reason: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct FilterBuilderCheck {
+    ok: bool,
+    panel_visible: bool,
+    independent_search_rules: bool,
+    field_rules: bool,
+    all_count: usize,
+    any_count: usize,
+    mode_counts: bool,
+    inline_diagnostic: bool,
+    last_valid_state: bool,
+    accessible_reorder: bool,
     graph_restored: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     reason: Option<String>,
@@ -212,6 +234,7 @@ async fn main() -> Result<()> {
         header_actions,
         nodes_editor,
         settings_tabs,
+        filter_builder,
         page_errors,
     ) = match &result {
         Ok(o) => {
@@ -221,6 +244,7 @@ async fn main() -> Result<()> {
                 && o.header_actions.ok
                 && o.nodes_editor.ok
                 && o.settings_tabs.ok
+                && o.filter_builder.ok
                 && captured_page_errors.is_empty();
             let reason = if !o.boot_log_found {
                 Some(format!("boot log {BOOT_LOG_NEEDLE:?} was not observed"))
@@ -235,6 +259,8 @@ async fn main() -> Result<()> {
                 o.nodes_editor.reason.clone()
             } else if !o.settings_tabs.ok {
                 o.settings_tabs.reason.clone()
+            } else if !o.filter_builder.ok {
+                o.filter_builder.reason.clone()
             } else if !captured_page_errors.is_empty() {
                 Some(format!(
                     "browser emitted {} console error(s) or unhandled exception(s)",
@@ -252,6 +278,7 @@ async fn main() -> Result<()> {
                 Some(o.header_actions.clone()),
                 Some(o.nodes_editor.clone()),
                 Some(o.settings_tabs.clone()),
+                Some(o.filter_builder.clone()),
                 captured_page_errors.clone(),
             )
         }
@@ -261,6 +288,7 @@ async fn main() -> Result<()> {
             0,
             0,
             false,
+            None,
             None,
             None,
             None,
@@ -279,6 +307,7 @@ async fn main() -> Result<()> {
         graph_header_actions: header_actions,
         nodes_editor,
         settings_tabs,
+        filter_builder,
         page_errors,
         console_logs: tail(&logs, 50),
     };
@@ -304,6 +333,7 @@ struct RunOk {
     header_actions: HeaderActionCheck,
     nodes_editor: NodesEditorCheck,
     settings_tabs: SettingsTabsCheck,
+    filter_builder: FilterBuilderCheck,
 }
 
 fn chromium_args() -> Vec<&'static str> {
@@ -644,6 +674,13 @@ async fn drive_page(
             .map((element) => (element.textContent || '').trim());
           return ['id:', 'title:', 'tags:'].every((key) => keys.includes(key));
         }));
+        const searchSchemaGeneric = Boolean(await waitFor(() => {
+          const schema = editor?.querySelector('.search-schema');
+          const label = schema?.querySelector('[data-search-schema-label]');
+          return (label?.textContent || '').trim() === 'Search fields' &&
+            schema?.getAttribute('aria-label') === 'Search fields from active importer schema' &&
+            Boolean(schema?.getAttribute('data-search-schema-source'));
+        }));
 
         const strictFixture = sidebar?.querySelector(
           '[data-node-id="Node Editor Fixture"]'
@@ -673,6 +710,27 @@ async fn drive_page(
           if (summary?.getAttribute('aria-expanded') !== 'true') summary?.click();
           return group;
         };
+        const groupAtPath = (path) => [...(editor?.querySelectorAll('[data-tag-path]') || [])]
+          .find((group) => group.getAttribute('data-tag-path') === path);
+        const expandPath = async (path) => {
+          const segments = path.split('/');
+          let prefix = '';
+          let group = null;
+          for (const segment of segments) {
+            prefix = prefix ? `${prefix}/${segment}` : segment;
+            group = await waitFor(() => groupAtPath(prefix));
+            if (!group) return null;
+            expand(group);
+          }
+          return group;
+        };
+        const fooLeaf = fixtureContract ? await expandPath('foo/bar/baz') : null;
+        const beeLeaf = fixtureContract ? await expandPath('bee/bop/baz') : null;
+        if (fixtureContract) {
+          await waitFor(() => [fooLeaf, beeLeaf].every(
+            (group) => group?.querySelector('[data-node-id="Node Editor Fixture"]')
+          ));
+        }
         const groupsToExercise = fixtureContract
           ? [groupNamed('browser-editor'), groupNamed('browser-shared')].filter(Boolean)
           : groups.slice(0, 2);
@@ -701,6 +759,13 @@ async fn drive_page(
         );
         const exactTagGroups = tagModeReady && genericGroupsExact &&
           (!fixtureContract || fixtureGroupsExact);
+        const hierarchicalTagPaths = !fixtureContract || Boolean(
+          fooLeaf && beeLeaf &&
+          fooLeaf.getAttribute('data-tag-segment') === 'baz' &&
+          beeLeaf.getAttribute('data-tag-segment') === 'baz' &&
+          [...fooLeaf.querySelectorAll('[data-node-id="Node Editor Fixture"]')].length === 1 &&
+          [...beeLeaf.querySelectorAll('[data-node-id="Node Editor Fixture"]')].length === 1
+        );
         const untaggedGroupPresent = Boolean(
           untaggedGroup?.querySelector('[data-node-id]')
         );
@@ -760,9 +825,11 @@ async fn drive_page(
         if (!tilingGeometry) failures.push('Nodes tile is too small for the editor layout');
         if (!flatDefault) failures.push('Flat navigator is not the fresh-layout default');
         if (!schemaCoreKeys) failures.push('core importer search keys missing');
+        if (!searchSchemaGeneric) failures.push('search field label is importer-specific');
         if (!selectedContentLoaded) failures.push('selected node content did not load');
         if (!selectionPersisted) failures.push('selection/content did not survive Tags mode');
         if (!exactTagGroups) failures.push('exact multi-tag grouping is incorrect');
+        if (!hierarchicalTagPaths) failures.push('required tag paths did not render as nested groups');
         if (fixtureContract && (!untaggedGroupPresent || !fixtureUntagged)) {
           failures.push('synthetic untagged group or fixture missing');
         }
@@ -781,9 +848,11 @@ async fn drive_page(
           selected_content_loaded: selectedContentLoaded,
           selection_persisted: selectionPersisted,
           exact_tag_groups: Boolean(exactTagGroups),
+          hierarchical_tag_paths: hierarchicalTagPaths,
           untagged_group: untaggedGroupPresent,
           flat_active_count: flatActiveCount,
           schema_core_keys: schemaCoreKeys,
+          search_schema_generic: searchSchemaGeneric,
           reason: failures.length ? failures.join('; ') : null,
         };
     })()"#;
@@ -1137,7 +1206,328 @@ async fn drive_page(
         });
     }
 
-    // ---- 7. Graph header actions are present, visible, and safe ----------
+    // ---- 7. Filter is a repeatable, validated Boolean builder -------------
+    // Restore the minimized Filter panel, maximize it for deterministic
+    // geometry, and drive only its stable test/ARIA contract. The fixture tags
+    // make the nested group's ALL/ANY counts deterministic: their intersection
+    // is one node and their union is two nodes.
+    let filter_builder_js = r#"(async () => {
+        const waitFor = async (predicate, timeoutMs = 10000) => {
+          const deadline = performance.now() + timeoutMs;
+          while (performance.now() < deadline) {
+            const value = predicate();
+            if (value) return value;
+            await new Promise((resolve) => setTimeout(resolve, 50));
+          }
+          return null;
+        };
+        const failures = [];
+        const selector = (testId) => `[data-testid="${testId}"]`;
+        const own = (group, testId) => [...(group?.querySelectorAll(selector(testId)) || [])]
+          .find((element) => element.closest(selector('filter-group')) === group);
+        const ownRules = (group, kind) => [...(group?.querySelectorAll(
+          `${selector('filter-rule')}[data-rule-kind="${kind}"]`
+        ) || [])].filter((rule) => rule.closest(selector('filter-group')) === group);
+        const setValue = async (control, value) => {
+          if (!control) return false;
+          if (control instanceof HTMLInputElement || control instanceof HTMLTextAreaElement) {
+            const proto = control instanceof HTMLTextAreaElement
+              ? HTMLTextAreaElement.prototype
+              : HTMLInputElement.prototype;
+            const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
+            setter?.call(control, value);
+          } else {
+            control.value = value;
+          }
+          control.dispatchEvent(new Event('input', { bubbles: true }));
+          control.dispatchEvent(new Event('change', { bubbles: true }));
+          await new Promise((resolve) => setTimeout(resolve, 75));
+          return true;
+        };
+        const countOf = (group) => {
+          const count = own(group, 'filter-match-count');
+          const raw = count?.getAttribute('data-count') || count?.textContent || '';
+          const match = raw.match(/\d+/);
+          return match ? Number(match[0]) : 0;
+        };
+        const groupById = (id) => document.querySelector(
+          `${selector('filter-group')}[data-group-id="${id}"]`
+        );
+        const ruleById = (id) => document.querySelector(
+          `${selector('filter-rule')}[data-rule-id="${id}"]`
+        );
+        const setFieldRule = async (id, field, value) => {
+          let rule = ruleById(id);
+          await setValue(rule?.querySelector(selector('filter-field-name')), field);
+          rule = ruleById(id);
+          await setValue(rule?.querySelector(selector('filter-field-value')), value);
+          return Boolean(ruleById(id));
+        };
+        const setMatchesOperator = async (id) => {
+          for (let attempt = 0; attempt < 6; attempt += 1) {
+            const rule = ruleById(id);
+            const control = rule?.querySelector(selector('filter-field-operator'));
+            // A <select>'s textContent concatenates EVERY option label, so it
+            // always contains "matches regex" and would make this probe report
+            // success before the operator was ever changed. Read textContent
+            // only for a non-select control, where it reflects current state.
+            const state = [
+              control?.getAttribute('data-operator'),
+              control?.value,
+              control instanceof HTMLSelectElement ? null : control?.textContent,
+              rule?.getAttribute('data-expression'),
+            ].filter(Boolean).join(' ');
+            if (/matches/i.test(state)) return true;
+            if (control instanceof HTMLSelectElement) {
+              const option = [...control.options].find((candidate) =>
+                /matches/i.test(`${candidate.value} ${candidate.textContent || ''}`)
+              );
+              if (!option) return false;
+              await setValue(control, option.value);
+            } else {
+              control?.click();
+              await new Promise((resolve) => setTimeout(resolve, 75));
+            }
+          }
+          return false;
+        };
+
+        const dockChip = [...document.querySelectorAll('.dock-chip')]
+          .find((chip) => (chip.textContent || '').trim() === 'Filter');
+        dockChip?.click();
+        const initialPanel = await waitFor(() => document.querySelector('section.panel-filter'));
+        const maximize = initialPanel?.querySelector(
+          ':scope > header.panel-head .light.max'
+        );
+        maximize?.click();
+        const panel = await waitFor(() => {
+          const candidate = document.querySelector('section.panel-filter');
+          const rect = candidate?.getBoundingClientRect();
+          return document.querySelector('.ws.maxed') && rect?.width > 900 &&
+            rect?.height > 400 && candidate;
+        });
+        const builder = await waitFor(() => panel?.querySelector(selector('filter-builder')));
+        const panelVisible = Boolean(panel && builder);
+        builder?.querySelector(selector('filter-reset'))?.click();
+
+        let root = await waitFor(() => {
+          const candidate = builder?.querySelector(selector('filter-group'));
+          return candidate?.getAttribute('data-group-id') && candidate;
+        });
+        const rootId = root?.getAttribute('data-group-id') || '';
+
+        own(root, 'filter-add-search')?.click();
+        await waitFor(() => ownRules(groupById(rootId), 'search').length === 1);
+        root = groupById(rootId);
+        own(root, 'filter-add-search')?.click();
+        const searchesAdded = await waitFor(() => {
+          const rules = ownRules(groupById(rootId), 'search');
+          return rules.length === 2 && rules;
+        });
+        let searchRules = searchesAdded || [];
+        const firstSearchId = searchRules[0]?.getAttribute('data-rule-id') || '';
+        const secondSearchId = searchRules[1]?.getAttribute('data-rule-id') || '';
+        await setValue(
+          ruleById(firstSearchId)?.querySelector(selector('filter-search-query')),
+          'BROWSER_NODE_EDITOR_SENTINEL'
+        );
+        await setValue(
+          ruleById(secondSearchId)?.querySelector(selector('filter-search-query')),
+          'Shared tag sibling'
+        );
+
+        root = groupById(rootId);
+        searchRules = ownRules(root, 'search');
+        const secondBeforeMove = searchRules.find(
+          (rule) => rule.getAttribute('data-rule-id') === secondSearchId
+        );
+        const moveUp = [...(secondBeforeMove?.querySelectorAll('button[aria-label]') || [])]
+          .find((button) => /^Move rule .+ up$/.test(button.getAttribute('aria-label') || ''));
+        moveUp?.click();
+        const reordered = await waitFor(() => {
+          const liveRoot = groupById(rootId);
+          const ids = ownRules(liveRoot, 'search')
+            .map((rule) => rule.getAttribute('data-rule-id'));
+          return ids[0] === secondSearchId && ids[1] === firstSearchId && ids;
+        });
+        const accessibleReorder = Boolean(
+          moveUp && /^Move rule .+ up$/.test(moveUp.getAttribute('aria-label') || '') && reordered
+        );
+        searchRules = ownRules(groupById(rootId), 'search');
+        const searchValues = searchRules.map((rule) =>
+          rule.querySelector(selector('filter-search-query'))?.value || ''
+        );
+        const independentSearchRules = searchRules.length === 2 &&
+          new Set(searchRules.map((rule) => rule.getAttribute('data-rule-id'))).size === 2 &&
+          searchValues.includes('BROWSER_NODE_EDITOR_SENTINEL') &&
+          searchValues.includes('Shared tag sibling') &&
+          searchRules.every((rule) => Boolean(rule.getAttribute('data-expression')));
+
+        root = groupById(rootId);
+        own(root, 'filter-add-group')?.click();
+        const nested = await waitFor(() => [...(builder?.querySelectorAll(
+          selector('filter-group')
+        ) || [])].find((group) => group.getAttribute('data-group-id') !== rootId));
+        const nestedId = nested?.getAttribute('data-group-id') || '';
+        const firstAddField = await waitFor(() => {
+          const button = own(groupById(nestedId), 'filter-add-field');
+          return button && !button.disabled && button;
+        });
+        firstAddField?.click();
+        await waitFor(() => ownRules(groupById(nestedId), 'field').length === 1);
+        own(groupById(nestedId), 'filter-add-field')?.click();
+        const fieldsAdded = await waitFor(() => {
+          const rules = ownRules(groupById(nestedId), 'field');
+          return rules.length === 2 && rules;
+        });
+        let fieldRules = fieldsAdded || [];
+        const editorFieldId = fieldRules[0]?.getAttribute('data-rule-id') || '';
+        const sharedFieldId = fieldRules[1]?.getAttribute('data-rule-id') || '';
+        await setFieldRule(editorFieldId, 'tags', 'browser-editor');
+        await setFieldRule(sharedFieldId, 'tags', 'browser-shared');
+
+        const allReady = await waitFor(() => {
+          const group = groupById(nestedId);
+          return group?.getAttribute('data-mode') === 'all' && countOf(group) === 1 && group;
+        });
+        const allCount = allReady ? countOf(allReady) : 0;
+        own(groupById(nestedId), 'filter-group-mode')?.parentElement
+          ?.querySelector('[data-testid="filter-group-mode"][data-mode-target="any"]')
+          ?.click();
+        const anyReady = await waitFor(() => {
+          const group = groupById(nestedId);
+          return group?.getAttribute('data-mode') === 'any' && countOf(group) === 2 && group;
+        });
+        const anyCount = anyReady ? countOf(anyReady) : 0;
+        const modeCounts = allCount === 1 && anyCount === 2;
+        fieldRules = ownRules(groupById(nestedId), 'field');
+        const fieldValues = fieldRules.map((rule) =>
+          rule.querySelector(selector('filter-field-value'))?.value || ''
+        );
+        const fieldsPresent = fieldRules.length === 2 &&
+          fieldValues.includes('browser-editor') && fieldValues.includes('browser-shared') &&
+          fieldRules.every((rule) =>
+            (rule.querySelector(selector('filter-field-name'))?.value || '') === 'tags' &&
+            Boolean(rule.getAttribute('data-expression'))
+          );
+
+        const matchesOperator = await setMatchesOperator(editorFieldId);
+        await setValue(
+          ruleById(editorFieldId)?.querySelector(selector('filter-field-value')),
+          'browser-editor'
+        );
+        const appliedBeforeInvalid = await waitFor(() => {
+          const evaluation = builder?.querySelector(selector('filter-evaluation'));
+          return evaluation?.getAttribute('data-phase') === 'applied' &&
+            evaluation?.getAttribute('data-applied-count') !== null && evaluation;
+        });
+        const lastAppliedCount = appliedBeforeInvalid?.getAttribute('data-applied-count');
+        await setValue(
+          ruleById(editorFieldId)?.querySelector(selector('filter-field-value')),
+          '['
+        );
+        const diagnostic = await waitFor(() => {
+          const rule = ruleById(editorFieldId);
+          const alert = rule?.querySelector(`${selector('filter-diagnostic')}[role="alert"]`);
+          return /Invalid regular expression/i.test(alert?.textContent || '') && alert;
+        });
+        const invalidEvaluation = builder?.querySelector(selector('filter-evaluation'));
+        const inlineDiagnostic = Boolean(matchesOperator && diagnostic);
+        const lastValidState = Boolean(
+          appliedBeforeInvalid && invalidEvaluation?.getAttribute('data-phase') === 'invalid' &&
+          invalidEvaluation?.getAttribute('data-applied-count') === lastAppliedCount &&
+          countOf(groupById(nestedId)) === anyCount
+        );
+
+        if (!dockChip || !initialPanel || !maximize || !panelVisible) {
+          failures.push('Filter did not restore from the dock and maximize');
+        }
+        if (!independentSearchRules) failures.push('repeatable Search rules are not independent');
+        if (!accessibleReorder) failures.push('Search rules did not expose a working accessible reorder');
+        if (!fieldsPresent) failures.push('fixture tag field rules are incomplete');
+        if (!modeCounts) failures.push('nested ALL/ANY counts were not 1 and 2');
+        if (!inlineDiagnostic) failures.push('invalid regex has no inline diagnostic');
+        if (!lastValidState) failures.push('invalid draft did not preserve the last valid result');
+        return {
+          ok: failures.length === 0,
+          panel_visible: panelVisible,
+          independent_search_rules: independentSearchRules,
+          field_rules: fieldsPresent,
+          all_count: allCount,
+          any_count: anyCount,
+          mode_counts: modeCounts,
+          inline_diagnostic: inlineDiagnostic,
+          last_valid_state: lastValidState,
+          accessible_reorder: accessibleReorder,
+          graph_restored: false,
+          reason: failures.length ? failures.join('; ') : null,
+        };
+    })()"#;
+    let filter_builder_value: serde_json::Value =
+        page.evaluate(filter_builder_js).await?.into_value()?;
+    let mut filter_builder: FilterBuilderCheck = serde_json::from_value(filter_builder_value)
+        .context("decode Filter builder regression result")?;
+
+    let filter_png = page
+        .screenshot(CaptureScreenshotParams::builder().build())
+        .await
+        .context("Filter builder screenshot")?;
+    let filter_bytes = if filter_png.first() == Some(&0x89) {
+        filter_png
+    } else {
+        base64::engine::general_purpose::STANDARD
+            .decode(&filter_png)
+            .unwrap_or(filter_png)
+    };
+    let filter_shot_path = args.out_dir.join("filter-builder.png");
+    tokio::fs::write(&filter_shot_path, filter_bytes).await?;
+    tracing::info!("wrote screenshot {}", filter_shot_path.display());
+
+    // Reset the deliberately invalid draft before restoring the full
+    // workspace. This leaves subsequent Graph checks independent of the
+    // Filter regression while proving the renderer remount path again.
+    let filter_shot_restored: bool = page
+        .evaluate(
+            r#"(async () => {
+                const waitFor = async (predicate, timeoutMs = 10000) => {
+                  const deadline = performance.now() + timeoutMs;
+                  while (performance.now() < deadline) {
+                    const value = predicate();
+                    if (value) return value;
+                    await new Promise((resolve) => setTimeout(resolve, 50));
+                  }
+                  return null;
+                };
+                const panel = document.querySelector('section.panel-filter');
+                panel?.querySelector('[data-testid="filter-reset"]')?.click();
+                await waitFor(() => {
+                  const builder = panel?.querySelector('[data-testid="filter-builder"]');
+                  return !builder?.querySelector('[data-testid="filter-rule"]') && builder;
+                });
+                if (document.querySelector('.ws.maxed')) {
+                  panel?.querySelector(':scope > header.panel-head .light.max')?.click();
+                }
+                const workspace = await waitFor(() => !document.querySelector('.ws.maxed'));
+                const graph = await waitFor(() => {
+                  const canvas = document.querySelector('section.panel-graph canvas.graph-canvas');
+                  return canvas?.dataset.renderReady === 'true' &&
+                    Number(canvas?.dataset.nodeCount || 0) > 0;
+                });
+                return Boolean(workspace && graph);
+            })()"#,
+        )
+        .await?
+        .into_value()?;
+    filter_builder.graph_restored = filter_shot_restored;
+    if !filter_shot_restored {
+        filter_builder.ok = false;
+        filter_builder.reason = Some(match filter_builder.reason.take() {
+            Some(reason) => format!("{reason}; Graph did not restore after Filter screenshot"),
+            None => "Graph did not restore after Filter screenshot".to_string(),
+        });
+    }
+
+    // ---- 8. Graph header actions are present, visible, and safe ----------
     // Exercise the controls through the same pointer/mouse event sequence a
     // user generates. Holding pointerdown across two animation frames catches
     // accidental propagation into Panel Kit's panel-drag handlers.
@@ -1271,7 +1661,7 @@ async fn drive_page(
     let header_actions: HeaderActionCheck = serde_json::from_value(header_actions_value)
         .context("decode Graph header action regression result")?;
 
-    // ---- 8. canvas exists with non-zero size -----------------------------
+    // ---- 9. canvas exists with non-zero size -----------------------------
     // The Dioxus app's graph canvas is `<canvas class="graph-canvas">`
     // (app/ui/src/graph_canvas.rs); fall back to any canvas on the page.
     let dims_js = r#"(() => {
@@ -1288,7 +1678,7 @@ async fn drive_page(
     let canvas_width = dims.get("w").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
     let canvas_height = dims.get("h").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
 
-    // ---- 9. screenshot ---------------------------------------------------
+    // ---- 10. screenshot --------------------------------------------------
     let shot_params = CaptureScreenshotParams::builder().build();
     let png_b64 = page.screenshot(shot_params).await.context("screenshot")?;
     let bytes: Vec<u8> = png_b64;
@@ -1321,6 +1711,7 @@ async fn drive_page(
         header_actions,
         nodes_editor,
         settings_tabs,
+        filter_builder,
     })
 }
 

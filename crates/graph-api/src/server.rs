@@ -68,6 +68,7 @@ pub fn router(state: AppState) -> Router {
         // includes the full path tail without a leading slash.
         .route("/node/*id", get(node_meta))
         .route("/search", get(search))
+        .route("/search/matches", get(search_matches))
         .route("/search/rich", get(search_rich))
         .route("/compute/health", get(compute_health))
         .route("/compute/engines", get(compute_engines))
@@ -933,6 +934,7 @@ async fn compute_soup_post(
             "bond",
             "Dynamic particle bond",
         )],
+        data_loader::TagHierarchySchema::slash(),
     );
     let snapshot = match crate::state::GraphSnapshot::build(
         vg,
@@ -1446,6 +1448,49 @@ async fn search(State(s): State<AppState>, Query(p): Query<SearchParams>) -> imp
         }
         Err(error) => (StatusCode::BAD_REQUEST, error.to_string()).into_response(),
     }
+}
+
+/// `GET /search/matches?q=…` — every matching node as a dense-index buffer.
+///
+/// Unlike the ranked search endpoints, this is a set-valued primitive for the
+/// visual filter evaluator: it never accepts a client limit and is bounded by
+/// the number of nodes in the exact snapshot advertised by the response.
+async fn search_matches(
+    State(s): State<AppState>,
+    Query(p): Query<SearchParams>,
+) -> axum::response::Response {
+    let snap = s.snapshot();
+    let results = match snap
+        .search_index
+        .search(&p.q, snap.graph.nodes.len(), false)
+    {
+        Ok(results) => results,
+        Err(error) => return (StatusCode::BAD_REQUEST, error.to_string()).into_response(),
+    };
+
+    let mut indices = Vec::with_capacity(results.hits.len());
+    for hit in results.hits {
+        let Some(&index) = snap.id_to_idx.get(&hit.id) else {
+            tracing::error!(node_id = %hit.id, "search result is absent from its graph snapshot");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "search index is inconsistent with the graph snapshot",
+            )
+                .into_response();
+        };
+        indices.push(index);
+    }
+    indices.sort_unstable();
+    indices.dedup();
+
+    let mut bytes = Vec::with_capacity(indices.len() * std::mem::size_of::<u32>());
+    for index in indices {
+        bytes.extend_from_slice(&index.to_le_bytes());
+    }
+    let mut headers = HeaderMap::new();
+    headers.insert(header::CONTENT_TYPE, HeaderValue::from_static(OCTET_CT));
+    insert_graph_revision(&mut headers, snap.revision);
+    (StatusCode::OK, headers, bytes).into_response()
 }
 
 async fn graph_schema(State(s): State<AppState>) -> impl IntoResponse {

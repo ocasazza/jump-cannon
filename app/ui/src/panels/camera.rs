@@ -166,7 +166,13 @@ pub(crate) fn state_snapshot() -> (CameraState, FocusState) {
 /// AppState round-trip seam: write imported camera + focus straight to
 /// localStorage; the apply path's reload re-seeds [`STATE`].
 pub(crate) fn state_restore(camera: &CameraState, focus: &FocusState) {
-    let _ = LocalStorage::set(STORE_KEY, &Persisted { camera: *camera, focus: *focus });
+    let _ = LocalStorage::set(
+        STORE_KEY,
+        &Persisted {
+            camera: *camera,
+            focus: *focus,
+        },
+    );
 }
 
 fn sync(s: &Persisted) {
@@ -229,15 +235,16 @@ pub(crate) fn ensure_init() {
                 let size = web_sys::window().map(|w| {
                     (
                         w.inner_width().ok().and_then(|v| v.as_f64()).unwrap_or(0.0),
-                        w.inner_height().ok().and_then(|v| v.as_f64()).unwrap_or(0.0),
+                        w.inner_height()
+                            .ok()
+                            .and_then(|v| v.as_f64())
+                            .unwrap_or(0.0),
                     )
                 });
                 if let Some(size) = size {
                     let changed = match last_fit_screen {
                         None => false, // initial fit handled at graph load; skip first tick
-                        Some(prev) => {
-                            (prev.0 - size.0).abs().max((prev.1 - size.1).abs()) > 1.0
-                        }
+                        Some(prev) => (prev.0 - size.0).abs().max((prev.1 - size.1).abs()) > 1.0,
                     };
                     if changed {
                         render::with_host(|h| h.pipes.fit_camera());

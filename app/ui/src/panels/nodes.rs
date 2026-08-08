@@ -2,12 +2,15 @@
 //!
 //! The left navigator has two browse modes when the query is empty:
 //!   * **Flat** — graph-order node ids, bounded for large graphs;
-//!   * **Tags** — exact importer tag -> node groups from `/graph/meta_summary`.
+//!   * **Tags** — application-wide hierarchical tag paths -> node groups from
+//!     `/graph/meta_summary`.
 //!
-//! Tags are kept exact: the generic discovery contract defines a keyword list,
-//! not a separator convention. A node with multiple tags appears in each group;
-//! nodes with no tags appear under synthetic `(untagged)`. Groups expand lazily so a large
-//! graph does not create a hidden DOM containing every tag assignment.
+//! Discovery schema v1 requires every importer to publish `/` as the tag path
+//! separator. `foo/bar/baz` therefore becomes a nested path for every source;
+//! single-segment tags remain at the root. A node with multiple tags appears
+//! under every declared path, while nodes with no tags appear under synthetic
+//! `(untagged)`. Groups expand lazily so a large graph does not create a hidden
+//! DOM containing every tag assignment.
 //!
 //! A non-empty query keeps the existing source-neutral search surfaces:
 //! identifier fuzzy matches, importer-indexed hits, and filter suggestions.
@@ -15,7 +18,7 @@
 //! the same readable/writable content viewer as the detachable Document panel.
 
 use std::cmp::Reverse;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
 use dioxus::prelude::*;
@@ -79,14 +82,34 @@ struct TagGroup {
     nodes: Arc<[u32]>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TagBranch {
+    label: String,
+    path: String,
+    group_index: Option<usize>,
+    aggregate_count: usize,
+    children: Vec<Arc<TagBranch>>,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct TagHierarchy {
-    groups: Vec<TagGroup>,
+    groups: Arc<[TagGroup]>,
+    roots: Vec<Arc<TagBranch>>,
     untagged: Arc<[u32]>,
 }
 
+#[derive(Default)]
+struct TagBranchBuilder {
+    group_index: Option<usize>,
+    children: BTreeMap<String, TagBranchBuilder>,
+}
+
 impl TagHierarchy {
-    fn from_buckets(tags: Option<&HashMap<String, Vec<u32>>>, node_count: usize) -> Self {
+    fn from_buckets(
+        tags: Option<&HashMap<String, Vec<u32>>>,
+        node_count: usize,
+        hierarchy_separator: char,
+    ) -> Self {
         let mut tagged = vec![false; node_count];
         let mut groups = Vec::new();
 
@@ -121,13 +144,94 @@ impl TagHierarchy {
                 .cmp(&right.tag.to_lowercase())
                 .then_with(|| left.tag.cmp(&right.tag))
         });
+        let groups: Arc<[TagGroup]> = groups.into();
+        let mut builders = BTreeMap::<String, TagBranchBuilder>::new();
+        for (group_index, group) in groups.iter().enumerate() {
+            let segments = tag_segments(&group.tag, hierarchy_separator);
+            let segment_count = segments.len();
+            let mut level = &mut builders;
+            for (segment_index, segment) in segments.into_iter().enumerate() {
+                let branch = level.entry(segment).or_default();
+                if segment_index + 1 == segment_count {
+                    branch.group_index = Some(group_index);
+                }
+                level = &mut branch.children;
+            }
+        }
+        let roots = freeze_tag_branches(builders, "", hierarchy_separator, &groups);
         let untagged: Arc<[u32]> = tagged
             .into_iter()
             .enumerate()
             .filter_map(|(index, tagged)| (!tagged).then_some(index as u32))
             .collect::<Vec<_>>()
             .into();
-        Self { groups, untagged }
+        Self {
+            groups,
+            roots,
+            untagged,
+        }
+    }
+}
+
+fn tag_segments(tag: &str, hierarchy_separator: char) -> Vec<String> {
+    let segments: Vec<&str> = tag.split(hierarchy_separator).collect();
+    if segments.len() > 1 && segments.iter().all(|segment| !segment.is_empty()) {
+        segments.into_iter().map(str::to_string).collect()
+    } else {
+        vec![tag.to_string()]
+    }
+}
+
+fn freeze_tag_branches(
+    builders: BTreeMap<String, TagBranchBuilder>,
+    parent_path: &str,
+    separator: char,
+    groups: &[TagGroup],
+) -> Vec<Arc<TagBranch>> {
+    let mut branches: Vec<Arc<TagBranch>> = builders
+        .into_iter()
+        .map(|(label, builder)| {
+            let path = if parent_path.is_empty() {
+                label.clone()
+            } else {
+                format!("{parent_path}{separator}{label}")
+            };
+            let children = freeze_tag_branches(builder.children, &path, separator, groups);
+            let mut members = BTreeSet::new();
+            if let Some(group_index) = builder.group_index {
+                if let Some(group) = groups.get(group_index) {
+                    members.extend(group.nodes.iter().copied());
+                }
+            }
+            for child in &children {
+                collect_branch_members(child, groups, &mut members);
+            }
+            Arc::new(TagBranch {
+                label,
+                path,
+                group_index: builder.group_index,
+                aggregate_count: members.len(),
+                children,
+            })
+        })
+        .collect();
+    branches.sort_by(|left, right| {
+        left.label
+            .to_lowercase()
+            .cmp(&right.label.to_lowercase())
+            .then_with(|| left.label.cmp(&right.label))
+    });
+    branches
+}
+
+fn collect_branch_members(branch: &TagBranch, groups: &[TagGroup], members: &mut BTreeSet<u32>) {
+    if let Some(group_index) = branch.group_index {
+        if let Some(group) = groups.get(group_index) {
+            members.extend(group.nodes.iter().copied());
+        }
+    }
+    for child in &branch.children {
+        collect_branch_members(child, groups, members);
     }
 }
 
@@ -303,17 +407,27 @@ fn tags_are_facetable(schema: &Option<Result<api::GraphSchema, String>>) -> Opti
     })
 }
 
-fn ensure_tag_hierarchy(node_count: usize) {
+fn tag_hierarchy_separator(schema: &Option<Result<api::GraphSchema, String>>) -> Option<char> {
+    schema
+        .as_ref()
+        .and_then(|schema| schema.as_ref().ok())
+        .map(|schema| schema.schema.tag_hierarchy.separator)
+}
+
+fn ensure_tag_hierarchy(node_count: usize, hierarchy_separator: char) {
     if TAG_HIERARCHY.peek().is_some() {
         return;
     }
     let hierarchy = {
         let index = filter::FIELD_INDEX.read();
         index.as_ref().and_then(|result| {
-            result
-                .as_ref()
-                .ok()
-                .map(|index| TagHierarchy::from_buckets(index.by_field.get("tags"), node_count))
+            result.as_ref().ok().map(|index| {
+                TagHierarchy::from_buckets(
+                    index.by_field.get("tags"),
+                    node_count,
+                    hierarchy_separator,
+                )
+            })
         })
     };
     if let Some(hierarchy) = hierarchy {
@@ -437,6 +551,118 @@ fn tag_group(
     }
 }
 
+fn tag_branch_is_visible(branch: &TagBranch, visible_groups: &BTreeSet<usize>) -> bool {
+    branch
+        .group_index
+        .is_some_and(|group_index| visible_groups.contains(&group_index))
+        || branch
+            .children
+            .iter()
+            .any(|child| tag_branch_is_visible(child, visible_groups))
+}
+
+fn tag_branch(
+    branch: Arc<TagBranch>,
+    depth: usize,
+    groups: Arc<[TagGroup]>,
+    visible_groups: Arc<BTreeSet<usize>>,
+    ids: &[String],
+    selected: Signal<Option<String>>,
+) -> Element {
+    let expanded = EXPANDED_TAGS.read().contains(&branch.path);
+    let toggle_identity = branch.path.clone();
+    let section_key = branch.path.clone();
+    let node_key_prefix = branch.path.clone();
+    let exact_group = branch
+        .group_index
+        .filter(|group_index| visible_groups.contains(group_index))
+        .and_then(|group_index| groups.get(group_index));
+    let exact_tag = exact_group.map(|group| group.tag.clone());
+    let direct_nodes = exact_group.map(|group| Arc::clone(&group.nodes));
+    let visible_children: Vec<Arc<TagBranch>> = branch
+        .children
+        .iter()
+        .filter(|child| tag_branch_is_visible(child, &visible_groups))
+        .cloned()
+        .collect();
+    let mut shown_nodes: Vec<String> = if expanded {
+        direct_nodes
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .take(TAG_NODE_CAP)
+            .filter_map(|index| ids.get(*index as usize))
+            .cloned()
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let selected_id = selected.read().clone();
+    if expanded {
+        if let (Some(selected_id), Some(direct_nodes)) = (selected_id, direct_nodes.as_ref()) {
+            if let Some(selected_index) = ids.iter().position(|id| id == &selected_id) {
+                if direct_nodes.binary_search(&(selected_index as u32)).is_ok()
+                    && !shown_nodes.iter().any(|id| id == &selected_id)
+                {
+                    shown_nodes.push(selected_id);
+                }
+            }
+        }
+    }
+    let direct_count = direct_nodes.as_ref().map_or(0, |nodes| nodes.len());
+    let omitted = direct_count.saturating_sub(shown_nodes.len());
+    let label = branch.label.clone();
+    let path = branch.path.clone();
+    let aggregate_count = branch.aggregate_count;
+    rsx! {
+        section {
+            class: "nodes-tag-group",
+            key: "{section_key}",
+            role: "treeitem",
+            "aria-level": "{depth}",
+            "data-tag": exact_tag.unwrap_or_else(|| path.clone()),
+            "data-tag-path": path.clone(),
+            "data-tag-segment": label.clone(),
+            "data-tag-kind": if direct_nodes.is_some() { "exact" } else { "branch" },
+            "data-tag-depth": "{depth}",
+            button {
+                class: "nodes-tag-summary",
+                title: "{path}",
+                "aria-expanded": if expanded { "true" } else { "false" },
+                onclick: move |_| toggle_tag(&toggle_identity),
+                span { class: "nodes-tag-chevron", if expanded { "▾" } else { "▸" } }
+                span { class: "nodes-tag-label", "{label}" }
+                span { class: "nodes-tag-count", "{aggregate_count}" }
+            }
+            if expanded {
+                div { class: "nodes-tag-children", role: "group",
+                    for id in shown_nodes {
+                        { node_button(
+                            id.clone(),
+                            format!("{node_key_prefix}:{id}"),
+                            selected,
+                            "queue-item nodes-tag-node",
+                        ) }
+                    }
+                    if omitted > 0 {
+                        div { class: "more", "… {omitted} more in this tag (type to search)" }
+                    }
+                    for child in visible_children {
+                        { tag_branch(
+                            child,
+                            depth + 1,
+                            Arc::clone(&groups),
+                            Arc::clone(&visible_groups),
+                            ids,
+                            selected,
+                        ) }
+                    }
+                }
+            }
+        }
+    }
+}
+
 fn tag_navigation(
     hierarchy: Arc<TagHierarchy>,
     ids: &[String],
@@ -451,7 +677,7 @@ fn tag_navigation(
     // Keep the complete importer facet index behind `Arc`; reactive selection
     // and metadata updates clone only labels and shared slices, not millions
     // of tag memberships.
-    let shown_groups: Vec<(String, Arc<[u32]>)> = hierarchy
+    let visible_groups: BTreeSet<usize> = hierarchy
         .groups
         .iter()
         .enumerate()
@@ -460,17 +686,29 @@ fn tag_navigation(
                 || selected_index
                     .is_some_and(|selected| group.nodes.binary_search(&selected).is_ok())
         })
-        .map(|(_, group)| (group.tag.clone(), Arc::clone(&group.nodes)))
+        .map(|(index, _)| index)
         .collect();
-    let omitted_groups = group_count.saturating_sub(shown_groups.len());
+    let omitted_groups = group_count.saturating_sub(visible_groups.len());
+    let visible_groups = Arc::new(visible_groups);
+    let groups = Arc::clone(&hierarchy.groups);
+    let shown_roots: Vec<Arc<TagBranch>> = hierarchy
+        .roots
+        .iter()
+        .filter(|branch| tag_branch_is_visible(branch, &visible_groups))
+        .cloned()
+        .collect();
     let untagged = Arc::clone(&hierarchy.untagged);
     rsx! {
-        nav { class: "nodes-tag-tree", "aria-label": "Nodes grouped by tag",
-            for (tag, nodes) in shown_groups {
-                {
-                    let identity = format!("tag:{tag}");
-                    tag_group(identity, tag, nodes, ids, selected, false)
-                }
+        nav { class: "nodes-tag-tree", role: "tree", "aria-label": "Nodes grouped by tag",
+            for branch in shown_roots {
+                { tag_branch(
+                    branch,
+                    1,
+                    Arc::clone(&groups),
+                    Arc::clone(&visible_groups),
+                    ids,
+                    selected,
+                ) }
             }
             if !untagged.is_empty() {
                 { tag_group(
@@ -599,8 +837,11 @@ pub fn panel(ctx: Ctx) -> Element {
         .as_ref()
         .and_then(|schema| schema.as_ref().err())
         .cloned();
+    let hierarchy_separator = tag_hierarchy_separator(&schema);
     if mode == NavigatorMode::Tags && tag_contract == Some(true) {
-        ensure_tag_hierarchy(graph.ids.len());
+        if let Some(hierarchy_separator) = hierarchy_separator {
+            ensure_tag_hierarchy(graph.ids.len(), hierarchy_separator);
+        }
     }
     let hierarchy = TAG_HIERARCHY.read().clone();
 
@@ -704,13 +945,19 @@ pub fn panel(ctx: Ctx) -> Element {
                         Some(Ok(schema)) => rsx! {
                             div {
                                 class: "search-schema",
+                                "aria-label": "Search fields from active importer schema",
+                                "data-search-schema-source": "{schema.source.id}",
                                 title: format!(
                                     "{} v{} · graph revision {}",
                                     schema.source.id,
                                     schema.source.version,
                                     schema.graph_revision,
                                 ),
-                                span { class: "search-schema-label", "{schema.source.name} search keys" }
+                                span {
+                                    class: "search-schema-label",
+                                    "data-search-schema-label": "true",
+                                    "Search fields"
+                                }
                                 for field in schema.schema.fields.iter().filter(|field| field.searchable) {
                                     span {
                                         key: "{field.key}",
@@ -883,27 +1130,64 @@ pub fn panel(ctx: Ctx) -> Element {
 mod tests {
     use super::*;
 
+    fn find_branch<'a>(branches: &'a [Arc<TagBranch>], path: &str) -> Option<&'a TagBranch> {
+        for branch in branches {
+            if branch.path == path {
+                return Some(branch);
+            }
+            if let Some(found) = find_branch(&branch.children, path) {
+                return Some(found);
+            }
+        }
+        None
+    }
+
+    fn branch_at<'a>(branches: &'a [Arc<TagBranch>], path: &str) -> &'a TagBranch {
+        find_branch(branches, path).unwrap_or_else(|| panic!("missing tag branch {path}"))
+    }
+
+    fn exact_nodes<'a>(hierarchy: &'a TagHierarchy, branch: &TagBranch) -> &'a [u32] {
+        branch
+            .group_index
+            .and_then(|group_index| hierarchy.groups.get(group_index))
+            .map_or(&[], |group| group.nodes.as_ref())
+    }
+
     #[test]
-    fn tag_hierarchy_keeps_exact_tags_and_tracks_untagged_nodes() {
+    fn single_segment_tags_remain_root_groups_and_track_untagged_nodes() {
         let buckets = HashMap::from([
-            ("ops/runbook".to_string(), vec![2, 0, 2, 99]),
+            ("operations".to_string(), vec![2, 0, 2, 99]),
             ("production".to_string(), vec![1, 2]),
         ]);
-        let hierarchy = TagHierarchy::from_buckets(Some(&buckets), 4);
+        let hierarchy = TagHierarchy::from_buckets(Some(&buckets), 4, '/');
 
-        assert_eq!(
-            hierarchy.groups,
-            vec![
-                TagGroup {
-                    tag: "ops/runbook".into(),
-                    nodes: vec![0, 2].into(),
-                },
-                TagGroup {
-                    tag: "production".into(),
-                    nodes: vec![1, 2].into(),
-                },
-            ]
-        );
+        assert_eq!(hierarchy.roots.len(), 2);
+        let ops = branch_at(&hierarchy.roots, "operations");
+        assert_eq!(ops.label, "operations");
+        assert!(ops.children.is_empty());
+        assert_eq!(exact_nodes(&hierarchy, ops), &[0, 2]);
         assert_eq!(hierarchy.untagged.as_ref(), &[3]);
+    }
+
+    #[test]
+    fn application_tag_hierarchy_builds_nested_paths_and_keeps_multi_tag_membership() {
+        let buckets = HashMap::from([
+            ("foo/bar/baz".to_string(), vec![0]),
+            ("bee/bop/baz".to_string(), vec![0]),
+            ("foo/bar/qux".to_string(), vec![1]),
+        ]);
+        let hierarchy = TagHierarchy::from_buckets(Some(&buckets), 3, '/');
+
+        let foo = branch_at(&hierarchy.roots, "foo");
+        let foo_bar = branch_at(&hierarchy.roots, "foo/bar");
+        let foo_baz = branch_at(&hierarchy.roots, "foo/bar/baz");
+        let bee_baz = branch_at(&hierarchy.roots, "bee/bop/baz");
+        assert_eq!(foo.aggregate_count, 2);
+        assert_eq!(foo_bar.aggregate_count, 2);
+        assert_eq!(foo_baz.label, "baz");
+        assert_eq!(bee_baz.label, "baz");
+        assert_eq!(exact_nodes(&hierarchy, foo_baz), &[0]);
+        assert_eq!(exact_nodes(&hierarchy, bee_baz), &[0]);
+        assert_eq!(hierarchy.untagged.as_ref(), &[2]);
     }
 }

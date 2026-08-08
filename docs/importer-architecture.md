@@ -268,7 +268,11 @@ All six selectable source kinds satisfy the version-1 contract:
 The endpoint returns the searchable and facetable flags rather than asking
 clients to infer them from this table. Kubernetes `resource_version` is retained
 for discovery metadata but intentionally is not searchable; Pest property flags
-come from the validated package manifest.
+come from the validated package manifest. Every version-1 importer schema must
+publish the application-wide `tag_hierarchy` contract with `/` as its separator.
+The host rejects a missing or different separator and rejects tag values with
+empty path segments, so all clients can render the required hierarchy without
+source-specific inference or fallback behavior.
 
 Pest capture values are strings, so package-defined discovery properties are
 limited to text, keyword, date, and URL fields. A package cannot redeclare the

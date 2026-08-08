@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 use data_loader::{
     ContentSchema, DiscoveryField, DiscoveryFieldType, EdgeTypeSchema, Effect, ImportError,
-    ImporterSchema, LoadResult, Loader,
+    ImporterSchema, LoadResult, Loader, TagHierarchySchema,
 };
 
 use crate::extractor::{extract_vault, try_extract_vault};
@@ -74,6 +74,7 @@ impl Loader for ObsidianLoader {
                 "wikilink",
                 "Obsidian wikilink from the source note to its target note",
             )],
+            TagHierarchySchema::slash(),
         )
         .with_input_media_types(["text/markdown"])
         .with_content(ContentSchema {

@@ -13,7 +13,8 @@ use std::collections::{BTreeMap, HashMap};
 use data_loader::{
     Capability, DecodedRecord, Decoder, DiscoveryField, DiscoveryFieldType, EdgeTypeSchema, Effect,
     GraphMapper, ImportError, ImportFuture, ImportPipeline, ImporterDescriptor, ImporterSchema,
-    LoadResult, SearchDocument, SourceConnector, SourceRecord, Transport, WatchPlan,
+    LoadResult, SearchDocument, SourceConnector, SourceRecord, TagHierarchySchema, Transport,
+    WatchPlan,
 };
 use kube::{
     api::{Api, DynamicObject, GroupVersionKind, ListParams},
@@ -772,6 +773,7 @@ fn kubernetes_schema() -> ImporterSchema {
             "owner_reference",
             "Kubernetes ownerReference from owner to dependent resource",
         )],
+        TagHierarchySchema::slash(),
     )
     .with_input_media_types(["application/json"])
 }

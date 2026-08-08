@@ -95,7 +95,10 @@ pub fn colors_from_metric(
     if v.len() < n {
         return default_colors(n);
     }
-    let categorical = matches!(metric_key, "community" | "wcc" | "doctype" | "folder" | "tag");
+    let categorical = matches!(
+        metric_key,
+        "community" | "wcc" | "doctype" | "folder" | "tag"
+    );
     let mut out = Vec::with_capacity(n * 4);
     if categorical {
         for i in 0..n {

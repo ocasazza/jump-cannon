@@ -27,9 +27,11 @@ versions migrate to one Settings panel and preserve the frontmost visible
 configuration panel's geometry and state.
 
 Metrics and Filter remain standalone tools: Metrics evaluates the current
-result, while Filter can hide non-matches or keep context dimmed. Generate,
-Instances, Timeline, and Debug also remain separate because they are active
-workflows rather than persistent configuration.
+result, while [[Filter Builder]] composes repeatable search and metadata rules
+inside nested Match all, Match any, and Exclude groups. It can hide non-matches
+or keep context dimmed, and reports live evidence for each subexpression.
+Generate, Instances, Timeline, and Debug also remain separate because they are
+active workflows rather than persistent configuration.
 
 The default renderer runs `graph-layouts` in the browser. Larger or shared work
 can use [[Compute]]. Treat layout speed, readability, and interaction latency as

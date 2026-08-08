@@ -38,6 +38,7 @@ js-sys = "0.3"
 # Reaches outside app/ deliberately — the nix appSrc fileset includes
 # crates/graph-layouts for exactly this dependency.
 graph-layouts = { path = "../../crates/graph-layouts" }
+jump-cannon-filter-model = { path = "../filter-model" }
 web-sys = { workspace = true, features = [
     "Window", "Document", "Element", "Event", "EventTarget",
     "HtmlCanvasElement",

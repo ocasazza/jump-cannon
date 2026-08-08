@@ -14,7 +14,7 @@ use tower::ServiceExt; // for `oneshot`
 use data_loader::{
     Capability, ContentSchema, DiscoveryField, DiscoveryFieldType, EdgeTypeSchema, Effect,
     HostedImporter, ImportError, ImportFuture, Importer, ImporterDescriptor, ImporterSchema,
-    LoadResult, Loader, SearchDocument, Transport,
+    LoadResult, Loader, SearchDocument, TagHierarchySchema, Transport,
 };
 use graph_api::importer_catalog::ImporterCatalog;
 use graph_api::proto::{Init, MetaSummary, NodeMeta};
@@ -36,6 +36,7 @@ fn test_schema() -> ImporterSchema {
                 .facetable(),
         ],
         vec![EdgeTypeSchema::directed("reference", "test edge")],
+        TagHierarchySchema::slash(),
     )
 }
 
@@ -498,6 +499,83 @@ async fn same_cardinality_snapshot_swap_changes_revision() {
 }
 
 #[tokio::test]
+async fn search_matches_returns_every_dense_index_with_its_snapshot_revision() {
+    let mut graph = VaultGraph::new();
+    for i in 0..75 {
+        graph.add_node(VaultNode {
+            id: format!("matching-{i:03}"),
+            meta: vault_data::NodeMeta {
+                title: "Shared match term".into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+    }
+    graph.add_node(VaultNode {
+        id: "not-matching".into(),
+        meta: vault_data::NodeMeta {
+            title: "Unrelated document".into(),
+            ..Default::default()
+        },
+        ..Default::default()
+    });
+
+    let state = state_with_graph(graph);
+    let revision = state.snapshot().revision;
+    let mut expected: Vec<u32> = state
+        .snapshot()
+        .id_to_idx
+        .iter()
+        .filter_map(|(id, &index)| id.starts_with("matching-").then_some(index))
+        .collect();
+    expected.sort_unstable();
+
+    let response = graph_api::router(state)
+        .oneshot(
+            Request::builder()
+                .uri("/search/matches?q=shared")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .expect("search matches served");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response_revision(&response), revision);
+    assert_eq!(
+        response.headers().get("content-type").unwrap(),
+        "application/octet-stream"
+    );
+    let body = to_bytes(response.into_body(), 1 << 20)
+        .await
+        .expect("search matches body");
+    let actual: Vec<u32> = body
+        .chunks_exact(4)
+        .map(|chunk| u32::from_le_bytes(chunk.try_into().unwrap()))
+        .collect();
+    assert_eq!(actual, expected);
+    assert_eq!(
+        actual.len(),
+        75,
+        "the endpoint must not inherit the 50-hit UI limit"
+    );
+}
+
+#[tokio::test]
+async fn search_matches_rejects_invalid_query_syntax() {
+    let response = graph_api::router(state_with_graph(two_node_graph("query")))
+        .oneshot(
+            Request::builder()
+                .uri("/search/matches?q=secret%3Avalue")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .expect("invalid search matches served");
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
 async fn schema_search_and_facets_share_the_importer_contract() {
     let mut graph = VaultGraph::new();
     graph.add_node(VaultNode {
@@ -534,6 +612,7 @@ async fn schema_search_and_facets_share_the_importer_contract() {
     assert_eq!(schema["graph_revision"], revision);
     assert_eq!(schema["source"]["id"], "empty");
     assert_eq!(schema["schema"]["schema_version"], 1);
+    assert_eq!(schema["schema"]["tag_hierarchy"]["separator"], "/");
     assert!(schema["schema"]["fields"]
         .as_array()
         .unwrap()

@@ -408,7 +408,7 @@ mod tests {
     use super::*;
     use data_loader::{
         DiscoveryField, DiscoveryFieldType, EdgeTypeSchema, ImportError, ImportFuture, Importer,
-        ImporterDescriptor, ImporterSchema, LoadResult, SearchDocument,
+        ImporterDescriptor, ImporterSchema, LoadResult, SearchDocument, TagHierarchySchema,
     };
     use vault_data::{VaultGraph, VaultNode};
 
@@ -422,6 +422,7 @@ mod tests {
                     .facetable(),
             ],
             vec![EdgeTypeSchema::directed("reference", "test edge")],
+            TagHierarchySchema::slash(),
         )
     }
 

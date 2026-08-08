@@ -89,17 +89,23 @@ impl ParamValue {
             ParameterType::String => ParamValue::String(String::new()),
             ParameterType::Number => ParamValue::Number(0.0),
             ParameterType::Boolean => ParamValue::Boolean(false),
-            ParameterType::Select | ParameterType::MultiSelect => {
-                ParamValue::Selected(Vec::new())
-            }
+            ParameterType::Select | ParameterType::MultiSelect => ParamValue::Selected(Vec::new()),
         }
     }
 
     pub(crate) fn as_string(&self) -> Option<&str> {
-        if let ParamValue::String(s) = self { Some(s) } else { None }
+        if let ParamValue::String(s) = self {
+            Some(s)
+        } else {
+            None
+        }
     }
     pub(crate) fn as_selected(&self) -> Option<&[String]> {
-        if let ParamValue::Selected(v) = self { Some(v.as_slice()) } else { None }
+        if let ParamValue::Selected(v) = self {
+            Some(v.as_slice())
+        } else {
+            None
+        }
     }
 }
 
@@ -279,7 +285,10 @@ impl ActionRegistry {
     }
 
     pub(crate) fn root_actions(&self) -> Vec<&Action> {
-        self.actions.iter().filter(|a| a.parent_id.is_none()).collect()
+        self.actions
+            .iter()
+            .filter(|a| a.parent_id.is_none())
+            .collect()
     }
 
     pub(crate) fn child_actions(&self, parent_id: &str) -> Vec<&Action> {
@@ -297,7 +306,9 @@ impl ActionRegistry {
         action_id: &str,
         initial_values: &HashMap<String, ParamValue>,
     ) {
-        let Some(action) = self.get(action_id).cloned() else { return };
+        let Some(action) = self.get(action_id).cloned() else {
+            return;
+        };
         let mut form_values: HashMap<String, ParamValue> = HashMap::new();
         for p in &action.parameters {
             let v = initial_values
@@ -338,9 +349,7 @@ impl ActionRegistry {
             .map(|a| a.kind)
             .unwrap_or(ActionType::MultiInstance);
         if kind == ActionType::Singleton {
-            if let Some(existing) =
-                self.instances.iter_mut().find(|i| i.action_id == action_id)
-            {
+            if let Some(existing) = self.instances.iter_mut().find(|i| i.action_id == action_id) {
                 existing.params = params;
                 existing.state = state;
                 return existing.id;
@@ -406,9 +415,18 @@ fn words(ws: &[&str]) -> Vec<String> {
 
 fn font_family_options() -> Vec<ParameterOption> {
     vec![
-        ParameterOption { value: "monospace".into(), label: "Monospace".into() },
-        ParameterOption { value: "sans-serif".into(), label: "Sans Serif".into() },
-        ParameterOption { value: "serif".into(), label: "Serif".into() },
+        ParameterOption {
+            value: "monospace".into(),
+            label: "Monospace".into(),
+        },
+        ParameterOption {
+            value: "sans-serif".into(),
+            label: "Sans Serif".into(),
+        },
+        ParameterOption {
+            value: "serif".into(),
+            label: "Serif".into(),
+        },
     ]
 }
 
@@ -423,7 +441,11 @@ fn seed_default_actions(reg: &mut ActionRegistry) {
         required: true,
         default: Some(ParamValue::Number(14.0)),
         options: vec![],
-        validation: ParameterValidation { pattern: None, min: Some(8.0), max: Some(32.0) },
+        validation: ParameterValidation {
+            pattern: None,
+            min: Some(8.0),
+            max: Some(32.0),
+        },
     };
     let font_family_param = ActionParameter {
         id: "font_family".into(),
@@ -691,9 +713,18 @@ fn seed_default_actions(reg: &mut ActionRegistry) {
                 required: true,
                 default: Some(ParamValue::Selected(vec!["all".into()])),
                 options: vec![
-                    ParameterOption { value: "all".into(), label: "All Nodes".into() },
-                    ParameterOption { value: "selected".into(), label: "Selected Nodes".into() },
-                    ParameterOption { value: "visible".into(), label: "Visible Nodes".into() },
+                    ParameterOption {
+                        value: "all".into(),
+                        label: "All Nodes".into(),
+                    },
+                    ParameterOption {
+                        value: "selected".into(),
+                        label: "Selected Nodes".into(),
+                    },
+                    ParameterOption {
+                        value: "visible".into(),
+                        label: "Visible Nodes".into(),
+                    },
                 ],
                 validation: ParameterValidation::default(),
             },
@@ -740,10 +771,22 @@ fn seed_default_actions(reg: &mut ActionRegistry) {
                 required: true,
                 default: Some(ParamValue::Selected(vec!["default".into()])),
                 options: vec![
-                    ParameterOption { value: "default".into(), label: "Default".into() },
-                    ParameterOption { value: "text".into(), label: "Text".into() },
-                    ParameterOption { value: "image".into(), label: "Image".into() },
-                    ParameterOption { value: "code".into(), label: "Code".into() },
+                    ParameterOption {
+                        value: "default".into(),
+                        label: "Default".into(),
+                    },
+                    ParameterOption {
+                        value: "text".into(),
+                        label: "Text".into(),
+                    },
+                    ParameterOption {
+                        value: "image".into(),
+                        label: "Image".into(),
+                    },
+                    ParameterOption {
+                        value: "code".into(),
+                        label: "Code".into(),
+                    },
                 ],
                 validation: ParameterValidation::default(),
             },
@@ -1151,7 +1194,11 @@ impl PaletteState {
         self.selected_idx = 0;
     }
     fn toggle(&mut self) {
-        if self.open { self.close() } else { self.open() }
+        if self.open {
+            self.close()
+        } else {
+            self.open()
+        }
     }
 }
 
@@ -1163,8 +1210,7 @@ static REGISTRY: GlobalSignal<ActionRegistry> = Signal::global(|| {
 });
 
 /// Successful preview fetches keyed by node id (egui `preview_cache`).
-static PREVIEW_CACHE: GlobalSignal<HashMap<String, proto::NodeMeta>> =
-    Signal::global(HashMap::new);
+static PREVIEW_CACHE: GlobalSignal<HashMap<String, proto::NodeMeta>> = Signal::global(HashMap::new);
 /// Failed-fetch ids → error message; avoids re-fetching forever.
 static PREVIEW_ERRORS: GlobalSignal<HashMap<String, String>> = Signal::global(HashMap::new);
 
@@ -1207,7 +1253,10 @@ fn ranked_actions(
         None => reg.root_actions(),
     };
     if query.trim().is_empty() {
-        scope.into_iter().map(|a| (a.clone(), MatchInfo::default())).collect()
+        scope
+            .into_iter()
+            .map(|a| (a.clone(), MatchInfo::default()))
+            .collect()
     } else {
         let mut scored: Vec<(Action, MatchInfo)> = scope
             .into_iter()
@@ -1322,8 +1371,16 @@ fn move_selection(ctx: Ctx, dir: i32) {
         return;
     }
     let mut p = PALETTE.write();
-    let cur = if p.selected_idx >= total { 0 } else { p.selected_idx };
-    p.selected_idx = if dir > 0 { (cur + 1) % total } else { (cur + total - 1) % total };
+    let cur = if p.selected_idx >= total {
+        0
+    } else {
+        p.selected_idx
+    };
+    p.selected_idx = if dir > 0 {
+        (cur + 1) % total
+    } else {
+        (cur + total - 1) % total
+    };
 }
 
 fn tab_complete(ctx: Ctx) {
@@ -1334,7 +1391,11 @@ fn tab_complete(ctx: Ctx) {
     }
     let sel = {
         let i = PALETTE.peek().selected_idx;
-        if i >= total { 0 } else { i }
+        if i >= total {
+            0
+        } else {
+            i
+        }
     };
     let completion = if sel < ranked.len() {
         ranked[sel].0.title.clone()
@@ -1352,7 +1413,11 @@ fn activate_selected(ctx: Ctx) {
     }
     let sel = {
         let i = PALETTE.peek().selected_idx;
-        if i >= total { 0 } else { i }
+        if i >= total {
+            0
+        } else {
+            i
+        }
     };
     if sel < ranked.len() {
         enter_action(&ranked[sel].0);
@@ -1407,10 +1472,14 @@ fn form_apply_or_next() {
                 .map(|a| (a.clone(), cfg.current_param_index, cfg.form_values.clone()))
         })
     };
-    let Some((action, raw_idx, values)) = snapshot else { return };
+    let Some((action, raw_idx, values)) = snapshot else {
+        return;
+    };
     let n = action.parameters.len();
     let idx = raw_idx.min(n.saturating_sub(1));
-    let Some(param) = action.parameters.get(idx) else { return };
+    let Some(param) = action.parameters.get(idx) else {
+        return;
+    };
     if check_param(param, values.get(&param.id)).is_err() {
         return;
     }
@@ -1426,7 +1495,9 @@ fn form_apply_or_next() {
 // --- execution dispatch (port of app.rs::execute_action / run_builtin) -------------
 
 fn execute_action(action_id: &str, params: HashMap<String, ParamValue>) {
-    let Some(action) = REGISTRY.peek().get(action_id).cloned() else { return };
+    let Some(action) = REGISTRY.peek().get(action_id).cloned() else {
+        return;
+    };
     // Parent-only actions drill into children; they should not produce
     // instances even if accidentally executed.
     if !action.children_ids.is_empty() && action.parameters.is_empty() {
@@ -1437,7 +1508,9 @@ fn execute_action(action_id: &str, params: HashMap<String, ParamValue>) {
     crate::appstate::note_mutation("palette", &action.title);
     let ActionHandler::Builtin(variant) = action.handler;
     let result = run_builtin(variant, &params);
-    REGISTRY.write().record_execution(&action.id, params, result);
+    REGISTRY
+        .write()
+        .record_execution(&action.id, params, result);
 }
 
 /// Append a Filter card to the shared query model, prefixed with an AND
@@ -1453,16 +1526,19 @@ fn append_filter_card(field: String, value: String) {
             None | Some(Card::Connector { .. }) | Some(Card::ParenOpen) | Some(Card::Not)
         );
         if needs_connector {
-            q.cards.push(Card::Connector { op: ConnectorOp::And });
+            q.cards.push(Card::Connector {
+                op: ConnectorOp::And,
+            });
         }
-        q.cards.push(Card::Filter { field, op: Op::Eq, value });
+        q.cards.push(Card::Filter {
+            field,
+            op: Op::Eq,
+            value,
+        });
     });
 }
 
-fn run_builtin(
-    variant: BuiltinAction,
-    params: &HashMap<String, ParamValue>,
-) -> serde_json::Value {
+fn run_builtin(variant: BuiltinAction, params: &HashMap<String, ParamValue>) -> serde_json::Value {
     use BuiltinAction as B;
     match variant {
         B::Settings | B::NodeOperations | B::Filter => serde_json::json!({}),
@@ -1523,7 +1599,11 @@ fn run_builtin(
         }
 
         B::FilterByName | B::FilterByContent => {
-            let field = if matches!(variant, B::FilterByName) { "name" } else { "content" };
+            let field = if matches!(variant, B::FilterByName) {
+                "name"
+            } else {
+                "content"
+            };
             let pattern = params
                 .get("pattern")
                 .and_then(|v| v.as_string())
@@ -1552,7 +1632,10 @@ fn run_builtin(
             if !q.is_empty() {
                 let q2 = q.clone();
                 filter::edit_filters(|m| {
-                    m.cards.push(Card::Search { value: q2, regex: false });
+                    m.cards.push(Card::Search {
+                        value: q2,
+                        regex: false,
+                    });
                 });
             }
             serde_json::json!({ "search": { "query": q } })
@@ -1638,7 +1721,11 @@ pub(crate) fn overlay(ctx: Ctx) -> Element {
         let has_nodes = g.as_ref().map(|x| !x.ids.is_empty()).unwrap_or(false);
         !configuring && !st.query.trim().is_empty() && has_nodes
     };
-    let body = if configuring { render_param_form() } else { render_search(ctx, &st) };
+    let body = if configuring {
+        render_param_form()
+    } else {
+        render_search(ctx, &st)
+    };
     rsx! {
         div { class: "cp-overlay",
             div { class: if wide { "cp-panel wide" } else { "cp-panel" }, {body} }
@@ -1654,7 +1741,11 @@ fn render_search(ctx: Ctx, st: &PaletteState) -> Element {
         let crumbs: Vec<String> = st
             .breadcrumb
             .iter()
-            .map(|pid| reg.get(pid).map(|a| a.title.clone()).unwrap_or_else(|| pid.clone()))
+            .map(|pid| {
+                reg.get(pid)
+                    .map(|a| a.title.clone())
+                    .unwrap_or_else(|| pid.clone())
+            })
             .collect();
         (crumbs, ranked_actions(&reg, &st.breadcrumb, &st.query))
     };
@@ -1667,7 +1758,11 @@ fn render_search(ctx: Ctx, st: &PaletteState) -> Element {
     };
 
     let total = ranked.len() + files.len();
-    let sel = if total == 0 || st.selected_idx >= total { 0 } else { st.selected_idx };
+    let sel = if total == 0 || st.selected_idx >= total {
+        0
+    } else {
+        st.selected_idx
+    };
     // Group root entries by category when the user hasn't typed anything
     // and isn't drilled into a child scope.
     let group_by_category = st.breadcrumb.is_empty() && st.query.trim().is_empty();
@@ -1874,14 +1969,20 @@ fn render_preview(selected: &Option<String>) -> Element {
 fn render_param_form() -> Element {
     let (action, raw_idx, values) = {
         let reg = REGISTRY.read();
-        let Some(cfg) = reg.configuring.as_ref() else { return rsx! {} };
-        let Some(action) = reg.get(&cfg.action_id).cloned() else { return rsx! {} };
+        let Some(cfg) = reg.configuring.as_ref() else {
+            return rsx! {};
+        };
+        let Some(action) = reg.get(&cfg.action_id).cloned() else {
+            return rsx! {};
+        };
         (action, cfg.current_param_index, cfg.form_values.clone())
     };
     let n_params = action.parameters.len();
     let idx = raw_idx.min(n_params.saturating_sub(1));
     let is_last = idx + 1 >= n_params;
-    let Some(param) = action.parameters.get(idx).cloned() else { return rsx! {} };
+    let Some(param) = action.parameters.get(idx).cloned() else {
+        return rsx! {};
+    };
     let value = values
         .get(&param.id)
         .cloned()
@@ -1974,9 +2075,21 @@ fn param_widget(param: &ActionParameter, value: &ParamValue) -> Element {
             }
         }
         ParameterType::Number => {
-            let n = if let ParamValue::Number(n) = value { *n } else { 0.0 };
-            let min = param.validation.min.map(|v| v.to_string()).unwrap_or_default();
-            let max = param.validation.max.map(|v| v.to_string()).unwrap_or_default();
+            let n = if let ParamValue::Number(n) = value {
+                *n
+            } else {
+                0.0
+            };
+            let min = param
+                .validation
+                .min
+                .map(|v| v.to_string())
+                .unwrap_or_default();
+            let max = param
+                .validation
+                .max
+                .map(|v| v.to_string())
+                .unwrap_or_default();
             rsx! {
                 input { class: "cp-form-in num", r#type: "number", step: "0.1",
                     min: "{min}", max: "{max}", value: "{n}",
@@ -2023,8 +2136,10 @@ fn param_widget(param: &ActionParameter, value: &ParamValue) -> Element {
                     div { class: "cp-desc", em { "(no options available)" } }
                 };
             }
-            let selected: Vec<String> =
-                value.as_selected().map(<[String]>::to_vec).unwrap_or_default();
+            let selected: Vec<String> = value
+                .as_selected()
+                .map(<[String]>::to_vec)
+                .unwrap_or_default();
             let opts = param.options.clone();
             rsx! {
                 div { class: "cp-form-multi",

@@ -294,6 +294,17 @@ pub async fn search(q: &str, limit: u32) -> ApiResult<proto::SearchResults> {
     .await
 }
 
+/// `/search/matches?q=…` — every full-text match as a dense node index,
+/// paired with the graph snapshot revision those indices belong to.
+pub(crate) async fn search_matches(q: &str) -> ApiResult<Revisioned<Vec<u32>>> {
+    let path = format!("/search/matches?q={}", urlencoding::encode(q));
+    let r = get_revisioned_bytes(&path).await?;
+    Ok(Revisioned {
+        revision: r.revision,
+        value: u32s(&r.value),
+    })
+}
+
 /// One `/search/rich` hit. `snippet` is server-built HTML: the matched body
 /// region with `<b>` around hits (Tantivy SnippetGenerator output — source
 /// text is escaped server-side, the only markup is the highlight tags).
@@ -334,7 +345,7 @@ pub async fn search_rich(q: &str, limit: u32) -> ApiResult<RichResults> {
 
 /// Minimal `/graph/schema` view used by the Nodes panel. Serde deliberately
 /// ignores the rest of the importer contract: this UI only needs the source
-/// identity and the fields callers may use in a search query.
+/// identity plus searchable/facetable fields and the required tag hierarchy.
 #[derive(Clone, Debug, Deserialize, PartialEq)]
 pub struct GraphSchema {
     #[serde(default)]
@@ -352,8 +363,20 @@ pub struct ImporterSource {
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Default)]
 pub struct DiscoverySchema {
+    pub tag_hierarchy: TagHierarchySchema,
     #[serde(default)]
     pub fields: Vec<DiscoveryField>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+pub struct TagHierarchySchema {
+    pub separator: char,
+}
+
+impl Default for TagHierarchySchema {
+    fn default() -> Self {
+        Self { separator: '/' }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq)]

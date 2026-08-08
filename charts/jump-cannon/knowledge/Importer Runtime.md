@@ -18,9 +18,13 @@ Every importer descriptor must supply discovery schema version 1. It declares
 input media types, typed search/facet fields, edge semantics, and content
 capabilities. `id`, `title`, and `tags` are required searchable fields, and
 `tags` must also be facetable so generic clients can build bulk tag navigation
-without one metadata request per node. Each successful import must emit exactly
-one typed `SearchDocument` for every graph node, using only fields declared by
-its schema. The host rejects missing,
+without one metadata request per node. Every schema must also declare the
+application-wide `tag_hierarchy` contract with `/` as its separator. This is
+mandatory for all importers, not an optional field capability: single-segment
+tags remain roots and slash-delimited tags form nested paths. Empty path
+segments are invalid. Each successful import must emit exactly one typed
+`SearchDocument` for every graph node, using only fields declared by its
+schema. The host rejects missing,
 duplicate, unknown, mistyped, oversized, or capability-inconsistent output.
 Core document identity, title, and unique tags must match the canonical node;
 sensitive values cannot enter discovery documents.
