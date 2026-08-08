@@ -156,7 +156,11 @@ struct SettingsTabsCheck {
     labels: Vec<String>,
     content_panels: Vec<String>,
     aria_contract: bool,
+    keyboard_contract: bool,
     controls_hit_test: bool,
+    importer_catalog: bool,
+    importer_read_only: bool,
+    importer_no_mutation_controls: bool,
     legacy_panels_absent: bool,
     graph_restored: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -806,7 +810,7 @@ async fn drive_page(
     tokio::fs::write(&nodes_shot_path, nodes_bytes).await?;
     tracing::info!("wrote screenshot {}", nodes_shot_path.display());
 
-    // ---- 6. Unified Settings exposes four accessible, real tabs ---------
+    // ---- 6. Unified Settings exposes five accessible, real tabs ---------
     // Maximize Settings so every tab is both visible and pointer-hit-testable,
     // exercise each delegated panel, then restore the workspace. Restoring
     // also proves that the Graph canvas has one reliable remount owner.
@@ -823,6 +827,7 @@ async fn drive_page(
         const failures = [];
         const expected = [
           ['Connection', 'connection', 'input[aria-label="Graph API server URL"]'],
+          ['Importers', 'importers', '.importer-card[data-source-id="lavender-ingest-okf"]'],
           ['Layout', 'layout', '.lay'],
           ['Appearance', 'appearance', '.sty'],
           ['Camera', 'camera', '.cam'],
@@ -848,6 +853,9 @@ async fn drive_page(
         let ariaContract = maximized && labels.length === expected.length &&
           expected.every(([label], index) => labels[index] === label);
         let controlsHitTest = maximized && tabs.length === expected.length;
+        let importerCatalog = false;
+        let importerReadOnly = false;
+        let importerNoMutationControls = false;
 
         for (const [label, slug, selector] of expected) {
           const tab = tabs.find((candidate) => (candidate.textContent || '').trim() === label);
@@ -860,6 +868,74 @@ async fn drive_page(
               tabpanel?.querySelector(selector) && tabpanel;
           });
           if (content) contentPanels.push(slug);
+
+          if (label === 'Importers' && content) {
+            const text = (selector) =>
+              (content.querySelector(selector)?.textContent || '').trim();
+            const lavender = content.querySelector(
+              '.importer-card[data-source-id="lavender-ingest-okf"]'
+            );
+            const lavenderText = (selector) =>
+              (lavender?.querySelector(selector)?.textContent || '').trim();
+            const policy = text('.importer-policy');
+            const selectedProfile = text('[data-field="selected-profile"]');
+            const activeKind = text('[data-field="active-kind"]');
+            const knownKinds = new Set([
+              'obsidian', 'tvix', 'generate', 'kubernetes', 'okf', 'pest'
+            ]);
+            const cards = [...content.querySelectorAll('.importer-card[data-source-id]')];
+            const selectedCards = cards.filter(
+              (card) => card.getAttribute('data-selected') === 'true'
+            );
+            const activeCards = cards.filter(
+              (card) => card.getAttribute('data-active') === 'true'
+            );
+            const selectionMatches = selectedProfile === 'none'
+              ? knownKinds.has(activeKind) && selectedCards.length === 0 && activeCards.length === 0
+              : knownKinds.has(activeKind) &&
+                selectedCards.length === 1 && activeCards.length === 1 &&
+                selectedCards[0] === activeCards[0] &&
+                selectedCards[0].getAttribute('data-source-id') === selectedProfile &&
+                selectedCards[0].getAttribute('data-kind') === activeKind;
+            importerCatalog = Boolean(
+              content.querySelector('.importers-view[data-activation="helm_rollout"]') &&
+              lavender &&
+              selectionMatches &&
+              text('[data-field="active-importer-id"]') &&
+              /Configured by Helm/i.test(policy) &&
+              /rollout is required/i.test(policy)
+            );
+            importerReadOnly = Boolean(
+              lavender?.querySelector('.importer-badge.read-only') &&
+              lavenderText('[data-field="consumer-volume"]') === 'lavender-okf-repository' &&
+              lavenderText('[data-field="consumer-claim"]') === 'lavender-okf-shared' &&
+              lavenderText('[data-field="consumer-mount"]') ===
+                '/var/lib/lavender/okf-repository' &&
+              lavenderText('[data-field="consumer-input"]') ===
+                '/var/lib/lavender/okf-repository/okf' &&
+              lavenderText('[data-field="consumer-access"]') === 'read-only' &&
+              lavenderText('[data-field="producer-default-claim"]') ===
+                'lavender-ingest-okf' &&
+              lavenderText('[data-field="producer-repository-root"]') ===
+                '/data/okf-repository' &&
+              lavenderText('[data-field="producer-workflow-input"]') ===
+                '/data/okf-repository/okf' &&
+              lavenderText('[data-field="producer-existing-claim-value-path"]') ===
+                'okf.persistence.existingClaim' &&
+              lavenderText('[data-field="producer-existing-claim-value"]') ===
+                'lavender-okf-shared'
+            );
+            const lavenderDescription = lavenderText('.importer-description');
+            importerReadOnly &&= /deployment-provisioned RWX/i.test(lavenderDescription) &&
+              /same namespace/i.test(lavenderDescription) &&
+              /<release>-okf/.test(lavenderDescription) &&
+              /UID\/GID 10001/i.test(lavenderDescription);
+            const runtimeControls = [...content.querySelectorAll('button, input, select, textarea')]
+              .filter((control) => /apply|run|activate|switch/i.test(
+                `${control.textContent || ''} ${control.getAttribute('aria-label') || ''}`
+              ));
+            importerNoMutationControls = runtimeControls.length === 0;
+          }
 
           const selectedTabs = tabs.filter(
             (candidate) => candidate.getAttribute('aria-selected') === 'true'
@@ -881,6 +957,31 @@ async fn drive_page(
             controlsHitTest = false;
           }
         }
+
+        const keyboardStep = async (fromLabel, key, toLabel) => {
+          const currentTabs = [...(panel?.querySelectorAll('[role="tab"]') || [])];
+          const from = currentTabs.find(
+            (tab) => (tab.textContent || '').trim() === fromLabel
+          );
+          const to = currentTabs.find(
+            (tab) => (tab.textContent || '').trim() === toLabel
+          );
+          from?.click();
+          const selected = await waitFor(() =>
+            from?.getAttribute('aria-selected') === 'true' && from
+          );
+          selected?.focus();
+          selected?.dispatchEvent(new KeyboardEvent('keydown', { key, bubbles: true }));
+          return Boolean(await waitFor(() =>
+            to?.getAttribute('aria-selected') === 'true' &&
+            document.activeElement === to && to
+          ));
+        };
+        let keyboardContract = maximized;
+        keyboardContract &&= await keyboardStep('Connection', 'ArrowRight', 'Importers');
+        keyboardContract &&= await keyboardStep('Importers', 'End', 'Camera');
+        keyboardContract &&= await keyboardStep('Camera', 'Home', 'Connection');
+        keyboardContract &&= await keyboardStep('Connection', 'ArrowLeft', 'Camera');
 
         const legacyPanelsAbsent = !document.querySelector(
           'section.panel-layout, section.panel-style, section.panel-camera'
@@ -909,8 +1010,12 @@ async fn drive_page(
         if (!initialPanel || !maximize || !maximized) failures.push('Settings panel did not maximize');
         if (!restore || !workspaceRestored) failures.push('Settings panel did not restore');
         if (!ariaContract) failures.push('Settings tab labels or ARIA relationships are invalid');
+        if (!keyboardContract) failures.push('Settings tab keyboard navigation is invalid');
         if (!controlsHitTest) failures.push('Settings tabs are obscured from pointer input');
         if (contentPanels.length !== expected.length) failures.push('a Settings tab has no delegated content');
+        if (!importerCatalog) failures.push('deployment-managed importer catalog is incomplete');
+        if (!importerReadOnly) failures.push('Lavender OKF read-only PVC contract is incomplete');
+        if (!importerNoMutationControls) failures.push('Importer catalog exposes a runtime mutation control');
         if (!legacyPanelsAbsent) failures.push('legacy Layout, Style, or Camera panel still exists');
         if (!graphRestored) failures.push('Graph renderer did not remount after Settings restore');
         return {
@@ -918,7 +1023,11 @@ async fn drive_page(
           labels,
           content_panels: contentPanels,
           aria_contract: Boolean(ariaContract),
+          keyboard_contract: Boolean(keyboardContract),
           controls_hit_test: Boolean(controlsHitTest),
+          importer_catalog: Boolean(importerCatalog),
+          importer_read_only: Boolean(importerReadOnly),
+          importer_no_mutation_controls: Boolean(importerNoMutationControls),
           legacy_panels_absent: legacyPanelsAbsent,
           graph_restored: graphRestored,
           reason: failures.length ? failures.join('; ') : null,
@@ -926,8 +1035,105 @@ async fn drive_page(
     })()"#;
     let settings_tabs_value: serde_json::Value =
         page.evaluate(settings_tabs_js).await?.into_value()?;
-    let settings_tabs: SettingsTabsCheck = serde_json::from_value(settings_tabs_value)
+    let mut settings_tabs: SettingsTabsCheck = serde_json::from_value(settings_tabs_value)
         .context("decode unified Settings regression result")?;
+
+    // Capture visual evidence of the new app-owned importer catalog. The
+    // contract check above restores the workspace first; maximize Settings a
+    // second time, leave Importers selected for the screenshot, then restore
+    // and prove the graph canvas remounts before continuing.
+    let settings_shot_ready: bool = page
+        .evaluate(
+            r#"(async () => {
+                const waitFor = async (predicate, timeoutMs = 10000) => {
+                  const deadline = performance.now() + timeoutMs;
+                  while (performance.now() < deadline) {
+                    const value = predicate();
+                    if (value) return value;
+                    await new Promise((resolve) => setTimeout(resolve, 50));
+                  }
+                  return null;
+                };
+                const initial = document.querySelector('section.panel-settings');
+                initial?.querySelector(':scope > header.panel-head .light.max')?.click();
+                const panel = await waitFor(() => {
+                  const candidate = document.querySelector('section.panel-settings');
+                  const rect = candidate?.getBoundingClientRect();
+                  return document.querySelector('.ws.maxed') &&
+                    rect?.width > 900 && rect?.height > 400 && candidate;
+                });
+                const importer = [...(panel?.querySelectorAll('[role="tab"]') || [])]
+                  .find((tab) => (tab.textContent || '').trim() === 'Importers');
+                importer?.click();
+                return Boolean(await waitFor(() =>
+                  importer?.getAttribute('aria-selected') === 'true' &&
+                  panel?.querySelector(
+                    '.importer-card[data-source-id="lavender-ingest-okf"]'
+                  )
+                ));
+            })()"#,
+        )
+        .await?
+        .into_value()?;
+    if !settings_shot_ready {
+        settings_tabs.ok = false;
+        settings_tabs.reason = Some(match settings_tabs.reason.take() {
+            Some(reason) => format!("{reason}; Importers screenshot did not become ready"),
+            None => "Importers screenshot did not become ready".to_string(),
+        });
+    } else {
+        let settings_png = page
+            .screenshot(CaptureScreenshotParams::builder().build())
+            .await
+            .context("Settings Importers screenshot")?;
+        let settings_bytes = if settings_png.first() == Some(&0x89) {
+            settings_png
+        } else {
+            base64::engine::general_purpose::STANDARD
+                .decode(&settings_png)
+                .unwrap_or(settings_png)
+        };
+        let settings_shot_path = args.out_dir.join("settings-importers.png");
+        tokio::fs::write(&settings_shot_path, settings_bytes).await?;
+        tracing::info!("wrote screenshot {}", settings_shot_path.display());
+    }
+
+    let settings_shot_restored: bool = page
+        .evaluate(
+            r#"(async () => {
+                const waitFor = async (predicate, timeoutMs = 10000) => {
+                  const deadline = performance.now() + timeoutMs;
+                  while (performance.now() < deadline) {
+                    const value = predicate();
+                    if (value) return value;
+                    await new Promise((resolve) => setTimeout(resolve, 50));
+                  }
+                  return null;
+                };
+                const settings = document.querySelector('section.panel-settings');
+                const connection = [...(settings?.querySelectorAll('[role="tab"]') || [])]
+                  .find((tab) => (tab.textContent || '').trim() === 'Connection');
+                connection?.click();
+                settings?.querySelector(':scope > header.panel-head .light.max')?.click();
+                const workspace = await waitFor(() => !document.querySelector('.ws.maxed'));
+                const graph = await waitFor(() => {
+                  const canvas = document.querySelector('section.panel-graph canvas.graph-canvas');
+                  return canvas?.dataset.renderReady === 'true' &&
+                    Number(canvas?.dataset.nodeCount || 0) > 0;
+                });
+                return Boolean(workspace && graph);
+            })()"#,
+        )
+        .await?
+        .into_value()?;
+    if !settings_shot_restored {
+        settings_tabs.ok = false;
+        settings_tabs.graph_restored = false;
+        settings_tabs.reason = Some(match settings_tabs.reason.take() {
+            Some(reason) => format!("{reason}; Graph did not restore after Importers screenshot"),
+            None => "Graph did not restore after Importers screenshot".to_string(),
+        });
+    }
 
     // ---- 7. Graph header actions are present, visible, and safe ----------
     // Exercise the controls through the same pointer/mouse event sequence a

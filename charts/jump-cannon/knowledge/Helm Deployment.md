@@ -19,6 +19,41 @@ an added blank line makes Obsidian treat the metadata and tags as body text.
 Use `indent`, not `nindent`, for these block values and verify the rendered
 ConfigMap before publishing the chart.
 
+The importer catalog is deployment policy. Define named instances under
+`importers.sources` and activate one with `importers.selected`; an empty
+selector preserves `graphApi.source` and `kubernetesImporter.enabled`. The
+application displays a sanitized catalog in **Settings > Importers**, but a
+source change requires a Helm rollout. Named chart profiles are currently
+wired for Obsidian, Kubernetes, and OKF; source kinds with additional required
+inputs are not accepted until the chart owns their complete configuration.
+
+The chart's inactive `lavender-ingest-okf` instance consumes the externally
+provisioned `lavender-okf-shared` RWX claim read-only. It mounts the repository
+at `/var/lib/lavender/okf-repository` and imports
+`/var/lib/lavender/okf-repository/okf`. Activate it with:
+
+```yaml
+importers:
+  selected: lavender-ingest-okf
+```
+
+Lavender's writer normally owns a dedicated claim named
+`lavender-ingest-okf` or `<release>-okf`, with repository root
+`/data/okf-repository` and workflow input `/data/okf-repository/okf`. Shared
+mode instead requires this writer value:
+
+```yaml
+okf:
+  persistence:
+    existingClaim: lavender-okf-shared
+```
+
+Keep both releases in the same namespace. The storage class must support RWX,
+and files must be readable and traversable by UID/GID `10001`. Never substitute
+Lavender lake or state storage for the OKF repository. A live Git working tree
+is not an immutable workflow snapshot; record its HEAD or copy it before a run
+that requires reproducibility.
+
 The chart owns portable workload configuration. The consuming environment owns
 cluster policy, credentials, NetBird resources, and Gateway routes. Continue
 through [[GitOps Release]], [[Security Model]], and [[Scheduled Tests]].

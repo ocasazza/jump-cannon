@@ -1,0 +1,290 @@
+{
+  "$schema": "https://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "required": [
+    "importers"
+  ],
+  "properties": {
+    "importers": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "selected",
+        "sources"
+      ],
+      "properties": {
+        "selected": {
+          "type": "string",
+          "pattern": "^$|^[a-z0-9](?:[a-z0-9._-]*[a-z0-9])?$",
+          "maxLength": 128
+        },
+        "sources": {
+          "type": "object",
+          "maxProperties": 128,
+          "propertyNames": {
+            "pattern": "^[a-z0-9](?:[a-z0-9._-]*[a-z0-9])?$",
+            "maxLength": 128
+          },
+          "additionalProperties": {
+            "$ref": "#/definitions/importerProfile"
+          }
+        }
+      }
+    }
+  },
+  "additionalProperties": true,
+  "definitions": {
+    "importerProfile": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "displayName",
+        "description",
+        "kind"
+      ],
+      "properties": {
+        "displayName": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "description": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 4096
+        },
+        "kind": {
+          "type": "string",
+          "enum": [
+            "obsidian",
+            "kubernetes",
+            "okf"
+          ]
+        },
+        "sourceId": {
+          "type": "string",
+          "pattern": "^[a-z0-9](?:[a-z0-9._-]*[a-z0-9])?$",
+          "maxLength": 128
+        },
+        "filesystemRescanIntervalSeconds": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 86400
+        },
+        "source": {
+          "$ref": "#/definitions/filesystemSource"
+        },
+        "producer": {
+          "$ref": "#/definitions/sourceProducer"
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "required": [
+              "producer"
+            ]
+          },
+          "then": {
+            "required": [
+              "source"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "enum": [
+                  "obsidian",
+                  "okf"
+                ]
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "source",
+              "filesystemRescanIntervalSeconds"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "okf"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "sourceId"
+            ],
+            "properties": {
+              "source": {
+                "properties": {
+                  "readOnly": {
+                    "const": true
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "obsidian"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "source": {
+                "properties": {
+                  "readOnly": {
+                    "const": false
+                  }
+                }
+              }
+            },
+            "not": {
+              "required": [
+                "sourceId"
+              ]
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "kubernetes"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "sourceId"
+            ],
+            "allOf": [
+              {
+                "not": {
+                  "required": [
+                    "source"
+                  ]
+                }
+              },
+              {
+                "not": {
+                  "required": [
+                    "filesystemRescanIntervalSeconds"
+                  ]
+                }
+              }
+            ]
+          }
+        }
+      ]
+    },
+    "filesystemSource": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "volumeName",
+        "existingClaim",
+        "mountPath",
+        "path",
+        "readOnly"
+      ],
+      "properties": {
+        "volumeName": {
+          "type": "string",
+          "pattern": "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$",
+          "maxLength": 63,
+          "not": {
+            "enum": [
+              "vault-knowledge",
+              "vault-seed",
+              "kubernetes-importer-config",
+              "kubernetes-api-access"
+            ]
+          }
+        },
+        "existingClaim": {
+          "type": "string",
+          "pattern": "^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?)*$",
+          "maxLength": 253
+        },
+        "mountPath": {
+          "type": "string",
+          "pattern": "^/",
+          "minLength": 1,
+          "maxLength": 4096,
+          "not": {
+            "pattern": "^/(knowledge|seed)/?$"
+          }
+        },
+        "path": {
+          "type": "string",
+          "pattern": "^/",
+          "minLength": 1,
+          "maxLength": 4096
+        },
+        "readOnly": {
+          "type": "boolean"
+        }
+      }
+    },
+    "sourceProducer": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "chart",
+        "defaultClaim",
+        "repositoryRoot",
+        "workflowInput",
+        "existingClaimValuePath",
+        "existingClaimValue"
+      ],
+      "properties": {
+        "chart": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "defaultClaim": {
+          "type": "string",
+          "pattern": "^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?)*$",
+          "minLength": 1,
+          "maxLength": 253
+        },
+        "repositoryRoot": {
+          "type": "string",
+          "pattern": "^/",
+          "minLength": 1,
+          "maxLength": 4096
+        },
+        "workflowInput": {
+          "type": "string",
+          "pattern": "^/",
+          "minLength": 1,
+          "maxLength": 4096
+        },
+        "existingClaimValuePath": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "existingClaimValue": {
+          "type": "string",
+          "pattern": "^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?)*$",
+          "minLength": 1,
+          "maxLength": 253
+        }
+      }
+    }
+  }
+}

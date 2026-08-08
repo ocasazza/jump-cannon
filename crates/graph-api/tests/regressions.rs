@@ -16,6 +16,7 @@ use data_loader::{
     HostedImporter, ImportError, ImportFuture, Importer, ImporterDescriptor, ImporterSchema,
     LoadResult, Loader, SearchDocument, Transport,
 };
+use graph_api::importer_catalog::ImporterCatalog;
 use graph_api::proto::{Init, MetaSummary, NodeMeta};
 use graph_api::state::{GraphSnapshot, SnapshotSource};
 use graph_api::AppState;
@@ -137,6 +138,19 @@ fn state_with_graph(graph: VaultGraph) -> AppState {
     .unwrap()
 }
 
+fn state_with_catalog(catalog: ImporterCatalog) -> AppState {
+    AppState::new_with_importer_catalog(
+        std::path::PathBuf::from("/tmp/jump-cannon-test-empty-vault"),
+        trust_test_importer(Box::new(EmptyLoader)),
+        load_result(VaultGraph::new()),
+        None,
+        graph_api::compute_broker::ComputeBroker::new(),
+        Arc::new(graph_api::progress::ProgressLog::new()),
+        catalog,
+    )
+    .unwrap()
+}
+
 fn two_node_graph(prefix: &str) -> VaultGraph {
     let mut graph = VaultGraph::new();
     graph.add_node(VaultNode {
@@ -162,6 +176,122 @@ fn response_revision(resp: &axum::response::Response) -> u64 {
         .expect("revision header is text")
         .parse()
         .expect("revision header is u64")
+}
+
+#[tokio::test]
+async fn importer_catalog_is_read_only_sorted_and_sanitized() {
+    let raw = r#"{
+      "selected": "lavender-ingest-okf",
+      "sources": {
+        "other-vault": {
+          "displayName": "Other vault",
+          "kind": "obsidian"
+        },
+        "lavender-ingest-okf": {
+          "displayName": "Lavender ingest OKF",
+          "description": "Deployment-provisioned read-only OKF repository",
+          "kind": "okf",
+          "sourceId": "lavender-ingest",
+          "filesystemRescanIntervalSeconds": 60,
+          "source": {
+            "volumeName": "lavender-okf-repository",
+            "existingClaim": "lavender-okf-shared",
+            "mountPath": "/var/lib/lavender/okf-repository",
+            "path": "/var/lib/lavender/okf-repository/okf",
+            "readOnly": true
+          },
+          "producer": {
+            "chart": "lavender-ingest",
+            "defaultClaim": "lavender-ingest-okf",
+            "repositoryRoot": "/data/okf-repository",
+            "workflowInput": "/data/okf-repository/okf",
+            "existingClaimValuePath": "okf.persistence.existingClaim",
+            "existingClaimValue": "lavender-okf-shared"
+          }
+        }
+      }
+    }"#;
+    let catalog = ImporterCatalog::parse(Some(raw), data_loader::SourceKind::Okf).unwrap();
+    let app = graph_api::router(state_with_catalog(catalog));
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/importers")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = serde_json::from_slice(
+        &to_bytes(response.into_body(), 1 << 20)
+            .await
+            .expect("importer catalog body"),
+    )
+    .expect("importer catalog JSON");
+
+    assert_eq!(body["activation"], "helm_rollout");
+    assert_eq!(body["selected"], "lavender-ingest-okf");
+    assert_eq!(body["active"]["kind"], "okf");
+    assert_eq!(body["active"]["importer"]["id"], "empty");
+    assert_eq!(body["sources"][0]["id"], "lavender-ingest-okf");
+    assert_eq!(body["sources"][1]["id"], "other-vault");
+    assert_eq!(
+        body["sources"][0]["source"]["path"],
+        "/var/lib/lavender/okf-repository/okf"
+    );
+    assert_eq!(body["sources"][0]["source"]["readOnly"], true);
+    assert!(body.get("capabilities").is_none());
+    assert!(!body.to_string().contains("token"));
+
+    let mutation = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/importers")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(mutation.status(), StatusCode::METHOD_NOT_ALLOWED);
+}
+
+#[tokio::test]
+async fn importer_catalog_default_state_keeps_active_identity_without_a_kind() {
+    // AppState::new predates deployment catalogs and remains the compatibility
+    // constructor for embedders. Its endpoint still succeeds and advertises
+    // the active importer identity, while kind is absent until a trusted host
+    // supplies the runtime source kind through new_with_importer_catalog.
+    let response = graph_api::router(empty_state())
+        .oneshot(
+            Request::builder()
+                .uri("/importers")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = serde_json::from_slice(
+        &to_bytes(response.into_body(), 1 << 20)
+            .await
+            .expect("default importer catalog body"),
+    )
+    .expect("default importer catalog JSON");
+    assert_eq!(body["activation"], "helm_rollout");
+    assert!(body.get("selected").is_none());
+    assert!(body["active"].get("kind").is_none());
+    assert_eq!(body["active"]["importer"]["id"], "empty");
+    assert_eq!(body["active"]["importer"]["name"], "empty");
+    assert!(!body["active"]["importer"]["version"]
+        .as_str()
+        .unwrap()
+        .is_empty());
+    assert_eq!(body["sources"], serde_json::json!([]));
 }
 
 /// `/node/<missing-id>` regression: previously returned 404 + a noisy

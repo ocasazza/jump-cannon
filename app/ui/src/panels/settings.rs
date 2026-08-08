@@ -1,9 +1,10 @@
 //! Unified Settings surface.
 //!
-//! Connection remains app-owned while Layout, Appearance, and Camera delegate
-//! to their existing panel modules. Each delegate is mounted through its own
-//! component scope because those renderers use hooks whose ordering must not be
-//! coupled to the selected tab.
+//! Connection and the read-only importer deployment catalog remain app-owned
+//! while Layout, Appearance, and Camera delegate to their existing panel
+//! modules. Each delegate is mounted through its own component scope because
+//! those renderers use hooks whose ordering must not be coupled to the selected
+//! tab.
 
 use dioxus::events::{Key, KeyboardEvent};
 use dioxus::prelude::*;
@@ -20,14 +21,16 @@ const STORE_KEY: &str = "jc_settings_tab_v1";
 pub(crate) enum SettingsTab {
     #[default]
     Connection,
+    Importers,
     Layout,
     Appearance,
     Camera,
 }
 
 impl SettingsTab {
-    const ALL: [Self; 4] = [
+    const ALL: [Self; 5] = [
         Self::Connection,
+        Self::Importers,
         Self::Layout,
         Self::Appearance,
         Self::Camera,
@@ -36,6 +39,7 @@ impl SettingsTab {
     const fn label(self) -> &'static str {
         match self {
             Self::Connection => "Connection",
+            Self::Importers => "Importers",
             Self::Layout => "Layout",
             Self::Appearance => "Appearance",
             Self::Camera => "Camera",
@@ -45,6 +49,7 @@ impl SettingsTab {
     const fn slug(self) -> &'static str {
         match self {
             Self::Connection => "connection",
+            Self::Importers => "importers",
             Self::Layout => "layout",
             Self::Appearance => "appearance",
             Self::Camera => "camera",
@@ -195,6 +200,179 @@ fn connection_panel(ctx: Ctx) -> Element {
     }
 }
 
+#[derive(Clone, Debug, PartialEq)]
+enum ImportersViewState {
+    Loading,
+    Ready(api::ImporterCatalog),
+    Failed(String),
+}
+
+fn importer_fact(label: &'static str, field: &'static str, value: &str) -> Element {
+    rsx! {
+        div { class: "importer-fact",
+            dt { "{label}" }
+            dd { "data-field": field, "{value}" }
+        }
+    }
+}
+
+fn importer_card(profile: &api::ImporterProfile) -> Element {
+    let source_id = profile.source_id.as_deref().unwrap_or("—");
+    rsx! {
+        article {
+            key: "{profile.id}",
+            class: "importer-card",
+            "data-source-id": "{profile.id}",
+            "data-kind": "{profile.kind}",
+            "data-selected": if profile.selected { "true" } else { "false" },
+            "data-active": if profile.active { "true" } else { "false" },
+            header { class: "importer-card-head",
+                div {
+                    h3 { "{profile.display_name}" }
+                    code { class: "importer-profile-id", "{profile.id}" }
+                }
+                div { class: "importer-badges",
+                    if profile.active {
+                        span { class: "importer-badge active", "active" }
+                    }
+                    if profile.selected {
+                        span { class: "importer-badge selected", "selected" }
+                    }
+                    if profile.source.as_ref().is_some_and(|source| source.read_only) {
+                        span { class: "importer-badge read-only", "read-only" }
+                    }
+                }
+            }
+            if !profile.description.is_empty() {
+                p { class: "importer-description", "{profile.description}" }
+            }
+            dl { class: "importer-facts importer-identity",
+                {importer_fact("kind", "kind", &profile.kind)}
+                {importer_fact("source id", "source-id", source_id)}
+                if let Some(interval) = profile.filesystem_rescan_interval_seconds {
+                    {importer_fact(
+                        "filesystem rescan",
+                        "filesystem-rescan",
+                        &format!("{interval}s"),
+                    )}
+                }
+            }
+            if let Some(source) = &profile.source {
+                section { class: "importer-contract importer-consumer",
+                    h4 {
+                        if source.read_only { "Read-only consumer" } else { "Filesystem source" }
+                    }
+                    dl { class: "importer-facts",
+                        {importer_fact("volume", "consumer-volume", &source.volume_name)}
+                        {importer_fact("claim", "consumer-claim", &source.existing_claim)}
+                        {importer_fact("mount", "consumer-mount", &source.mount_path)}
+                        {importer_fact("input", "consumer-input", &source.path)}
+                        {importer_fact(
+                            "access",
+                            "consumer-access",
+                            if source.read_only { "read-only" } else { "read-write" },
+                        )}
+                    }
+                }
+            }
+            if let Some(producer) = &profile.producer {
+                section { class: "importer-contract importer-producer",
+                    h4 { "Producer contract" }
+                    dl { class: "importer-facts",
+                        {importer_fact("chart", "producer-chart", &producer.chart)}
+                        {importer_fact(
+                            "default claim",
+                            "producer-default-claim",
+                            &producer.default_claim,
+                        )}
+                        {importer_fact(
+                            "repository root",
+                            "producer-repository-root",
+                            &producer.repository_root,
+                        )}
+                        {importer_fact(
+                            "workflow input",
+                            "producer-workflow-input",
+                            &producer.workflow_input,
+                        )}
+                        {importer_fact(
+                            "writer value",
+                            "producer-existing-claim-value-path",
+                            &producer.existing_claim_value_path,
+                        )}
+                        {importer_fact(
+                            "writer claim",
+                            "producer-existing-claim-value",
+                            &producer.existing_claim_value,
+                        )}
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn importer_catalog(catalog: &api::ImporterCatalog) -> Element {
+    let selected = catalog.selected.as_deref().unwrap_or("none");
+    let active_kind = catalog.active.kind_label();
+    rsx! {
+        div {
+            class: "importers-view",
+            "data-activation": "{catalog.activation}",
+            section { class: "importer-policy", role: "note",
+                span { class: "importer-policy-label", "Deployment-managed" }
+                p {
+                    "Configured by Helm. A rollout is required to switch the active importer; "
+                    "this view intentionally has no runtime activation controls."
+                }
+            }
+            section { class: "importer-active-summary",
+                div {
+                    span { class: "importer-section-label", "Active importer" }
+                    strong { "{catalog.active.importer.name}" }
+                    code { "data-field": "active-kind", "{active_kind}" }
+                }
+                dl { class: "importer-facts",
+                    {importer_fact("package", "active-importer-id", &catalog.active.importer.id)}
+                    {importer_fact("version", "active-importer-version", &catalog.active.importer.version)}
+                    {importer_fact("selected profile", "selected-profile", selected)}
+                }
+            }
+            div { class: "importer-list", "aria-label": "Configured importer profiles",
+                for profile in &catalog.sources {
+                    {importer_card(profile)}
+                }
+            }
+        }
+    }
+}
+
+#[allow(non_snake_case)]
+fn ImportersSettings() -> Element {
+    let mut state = use_signal(|| ImportersViewState::Loading);
+    use_effect(move || {
+        spawn(async move {
+            state.set(match api::importers().await {
+                Ok(catalog) => ImportersViewState::Ready(catalog),
+                Err(error) => ImportersViewState::Failed(error),
+            });
+        });
+    });
+
+    let view = state.read().clone();
+    match view {
+        ImportersViewState::Loading => rsx! {
+            div { class: "importers-status", role: "status", "Loading importer catalog…" }
+        },
+        ImportersViewState::Ready(catalog) => importer_catalog(&catalog),
+        ImportersViewState::Failed(error) => rsx! {
+            div { class: "importers-status error", role: "alert",
+                "Importer catalog unavailable: {error}"
+            }
+        },
+    }
+}
+
 /// Manual props keep `Ctx`'s signal-bundle type unchanged while still giving
 /// each delegated renderer a real component boundary for its hooks.
 #[derive(Clone, Copy, Props)]
@@ -259,6 +437,7 @@ pub fn panel(ctx: Ctx) -> Element {
                 tabindex: "0",
                 match active {
                     SettingsTab::Connection => connection_panel(ctx),
+                    SettingsTab::Importers => rsx! { ImportersSettings {} },
                     SettingsTab::Layout => rsx! { LayoutSettings { ctx } },
                     SettingsTab::Appearance => rsx! { AppearanceSettings { ctx } },
                     SettingsTab::Camera => rsx! { CameraSettings { ctx } },

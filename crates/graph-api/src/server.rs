@@ -53,6 +53,7 @@ pub fn router(state: AppState) -> Router {
         // `/configs` lists shipped presets; `/configs/:name` returns one as YAML.
         .route("/configs", get(configs_list))
         .route("/configs/:name", get(config_get))
+        .route("/importers", get(importers_catalog))
         .route("/graph/init", get(graph_init))
         .route("/graph/ids", get(graph_ids))
         .route("/graph/positions", get(graph_positions))
@@ -98,6 +99,14 @@ pub fn router(state: AppState) -> Router {
 
 async fn asset_fallback(State(s): State<AppState>, uri: axum::http::Uri) -> impl IntoResponse {
     asset_response(&s, uri.path().trim_start_matches('/'))
+}
+
+/// Return the sanitized deployment source catalog. Activating another source
+/// is a Helm rollout operation; this unauthenticated local API deliberately has
+/// no importer mutation route.
+async fn importers_catalog(State(s): State<AppState>) -> impl IntoResponse {
+    let snapshot = s.snapshot();
+    Json(s.inner.importer_catalog.response(&snapshot.source))
 }
 
 // --- Vault write endpoint ---

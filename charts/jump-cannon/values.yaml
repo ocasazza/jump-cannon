@@ -58,6 +58,34 @@ graphApi:
       cpu: "2"
       memory: 2Gi
 
+# Named importer profiles provide an operator-facing catalog without removing
+# the legacy graphApi.source / kubernetesImporter.enabled configuration. An
+# empty selection preserves that legacy behavior exactly. The chart currently
+# wires named Obsidian, Kubernetes, and OKF profiles; other graph-api source
+# kinds remain available through their source-specific CLI configuration.
+importers:
+  selected: ""
+  sources:
+    lavender-ingest-okf:
+      displayName: Lavender Ingest OKF
+      description: Read the OKF v0.2 repository maintained by lavender-ingest from a same namespace, deployment-provisioned RWX claim. The writer defaults to lavender-ingest-okf (<release>-okf), and files must be readable by UID/GID 10001.
+      kind: okf
+      sourceId: lavender-ingest
+      filesystemRescanIntervalSeconds: 60
+      source:
+        volumeName: lavender-okf-repository
+        existingClaim: lavender-okf-shared
+        mountPath: /var/lib/lavender/okf-repository
+        path: /var/lib/lavender/okf-repository/okf
+        readOnly: true
+      producer:
+        chart: lavender-ingest
+        defaultClaim: lavender-ingest-okf
+        repositoryRoot: /data/okf-repository
+        workflowInput: /data/okf-repository/okf
+        existingClaimValuePath: okf.persistence.existingClaim
+        existingClaimValue: lavender-okf-shared
+
 # ASCII slug used to namespace graph node IDs when graphApi.source is okf.
 # The OKF bundle itself is read from vault.mountPath.
 okfImporter:

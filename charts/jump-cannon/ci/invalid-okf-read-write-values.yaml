@@ -1,0 +1,6 @@
+importers:
+  selected: lavender-ingest-okf
+  sources:
+    lavender-ingest-okf:
+      source:
+        readOnly: false

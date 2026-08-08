@@ -67,27 +67,87 @@ Keep each importer query's `namespaces` within the Helm release namespace when
 using the chart-created Role. Use externally managed credentials and RBAC for
 cluster-wide or cross-namespace queries.
 
-## Open Knowledge Format importer
+## Importer source catalog
 
-Set `graphApi.source=okf` to load an OKF bundle from the same filesystem mount
-used by the Obsidian source. `okfImporter.sourceId` supplies the stable source
-identity used to namespace graph node IDs. For example:
+`importers.sources` is the deployment-time catalog of configured source
+instances. Set `importers.selected` to one catalog key to activate it. Leaving
+the selector empty preserves the existing `graphApi.source` and
+`kubernetesImporter.enabled` behavior, so existing releases can migrate without
+changing their active source. Named profiles are currently wired for Obsidian,
+Kubernetes, and OKF. Kubernetes profiles use the existing
+`kubernetesImporter.config`, token, and RBAC values; tvix, generate, and Pest
+remain source-specific graph-api CLI configurations until the chart has
+complete profile shapes for them.
+
+The chart ships an inactive `lavender-ingest-okf` item for the shared Lavender
+OKF repository. Select it with:
 
 ```yaml
-graphApi:
-  source: okf
+importers:
+  selected: lavender-ingest-okf
+```
 
-okfImporter:
-  sourceId: product-catalog
-  filesystemRescanIntervalSeconds: 60
+That item mounts the deployment-provisioned `lavender-okf-shared` RWX claim
+read-only at `/var/lib/lavender/okf-repository` and imports only
+`/var/lib/lavender/okf-repository/okf`. It sets the stable source ID to
+`lavender-ingest` and performs a full filesystem rescan every 60 seconds. The
+selected item, sanitized source details, and active importer are visible in the
+application's read-only **Settings > Importers** tab. Switching remains a Helm
+configuration and rollout operation; the browser has no Apply, Run, or
+Activate control.
 
-vault:
+The producer and consumer paths are deliberately different:
+
+| Contract | PVC | Repository root | OKF input |
+|---|---|---|---|
+| `lavender-ingest` writer | `lavender-ingest-okf` or `<release>-okf` by default | `/data/okf-repository` | `/data/okf-repository/okf` |
+| jump-cannon reader | deployment-provisioned `lavender-okf-shared` | `/var/lib/lavender/okf-repository` | `/var/lib/lavender/okf-repository/okf` |
+
+For shared mode, configure the writer chart to use the same externally
+provisioned claim:
+
+```yaml
+okf:
   persistence:
-    enabled: true
-    existingClaim: lavender-ingest-data
-  seed:
-    enabled: false
+    existingClaim: lavender-okf-shared
+```
 
+Both releases must be in the same namespace. The claim and storage backend must
+support concurrent RWX mounts, and its directories and files must be readable
+and traversable by jump-cannon's UID/GID `10001`. Do not point this profile at
+Lavender lake or state volumes. The chart never creates, annotates, or takes
+ownership of `lavender-okf-shared`.
+
+The shared Git working tree is a live handoff, not an immutable workflow
+snapshot. A workflow that needs a reproducible input must record the repository
+HEAD or copy the selected tree to immutable storage before processing it.
+
+The graph API combines native filesystem notifications with a periodic full
+rescan. The rescan is important for cross-pod writers because some CSI, NFS,
+and RWX volume implementations do not propagate remote-write notification
+events to every mount. Named sources use their own
+`filesystemRescanIntervalSeconds`; legacy OKF selection uses
+`okfImporter.filesystemRescanIntervalSeconds`, which defaults to `60`. Increase
+it for very large bundles when scan cost matters, or set it to `0` only when
+the storage backend's event propagation is known to be reliable. Reload
+publication is atomic, and an invalid or incomplete bundle leaves the last good
+graph active until a later scan succeeds.
+
+Obsidian retains notification-only behavior by default. Set
+`graphApi.filesystemRescanIntervalSeconds` above `0` if that source is also fed
+through a storage backend that needs polling fallback.
+
+For standalone deployments, continue to select `graphApi.source=okf` and leave
+`vault.persistence.existingClaim` empty. With persistence enabled, jump-cannon
+then creates and owns its normal release-scoped PVC. The named catalog is only
+required when source-instance-specific mounts and paths are needed.
+
+`additionalServiceAccounts` is a map keyed by exact ServiceAccount name. It
+lets the jump-cannon release create namespace-local identities for companion
+ingestion components, with optional annotations and labels. Token automount
+defaults to `false` for every additional account:
+
+```yaml
 additionalServiceAccounts:
   lavender-ingest:
     labels:
@@ -95,38 +155,10 @@ additionalServiceAccounts:
     automountServiceAccountToken: false
 ```
 
-Here `lavender-ingest` owns the `lavender-ingest-data` PVC and jump-cannon
-mounts it read-only for the OKF source. Setting
-`vault.persistence.existingClaim` suppresses this chart's PVC resource. Both
-releases must use the same namespace because PVCs and ServiceAccounts are
-namespace-scoped. The claim's access mode and storage backend must also support
-the ingestion and graph-api pods' intended concurrent mount pattern.
-
-The graph API combines native filesystem notifications with a periodic full
-rescan. The rescan is important for cross-pod writers because some CSI, NFS,
-and RWX volume implementations do not propagate remote-write notification
-events to every mount. `okfImporter.filesystemRescanIntervalSeconds` defaults
-to `60`; increase it for very large bundles when scan cost matters, or set it to
-`0` only when the storage backend's event propagation is known to be reliable.
-Reload publication is atomic, and an invalid or incomplete bundle leaves the
-last good graph active until a later scan succeeds.
-
-Obsidian retains notification-only behavior by default. Set
-`graphApi.filesystemRescanIntervalSeconds` above `0` if that source is also fed
-through a storage backend that needs polling fallback.
-
-For standalone deployments, leave `existingClaim` empty. With persistence
-enabled, jump-cannon then creates and owns its normal release-scoped PVC. Both
-chart-owned and Lavender-owned storage modes support the Obsidian and OKF
-filesystem importers.
-
-`additionalServiceAccounts` is a map keyed by exact ServiceAccount name. It
-lets the jump-cannon release create namespace-local identities for companion
-ingestion components, with optional annotations and labels. Token automount
-defaults to `false` for every additional account. The consuming chart must set
-that name in its own pod spec; for example, configure lavender-ingest with
-`serviceAccount.create=false` and `serviceAccount.name=lavender-ingest` to use
-the account above without rendering a duplicate.
+The consuming chart must set that name in its own pod spec; for example,
+configure lavender-ingest with `serviceAccount.create=false` and
+`serviceAccount.name=lavender-ingest` to use the account without rendering a
+duplicate.
 
 ServiceAccounts do not authorize PVC mounts, so this mechanism deliberately
 does not create Roles or RoleBindings. Pod volume references, the PVC/PV access

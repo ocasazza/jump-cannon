@@ -1,0 +1,19 @@
+importers:
+  selected: in-cluster-kubernetes
+  sources:
+    in-cluster-kubernetes:
+      displayName: In-cluster Kubernetes
+      description: Read the allowlisted metadata source in kubernetesImporter.config.
+      kind: kubernetes
+      sourceId: in-cluster
+
+graphCompute:
+  enabled: false
+
+tests:
+  fuzz:
+    enabled: false
+  performance:
+    enabled: false
+  browser:
+    enabled: false

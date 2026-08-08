@@ -1,0 +1,15 @@
+importers:
+  selected: ""
+  sources:
+    dormant-broken-okf:
+      displayName: Dormant broken OKF
+      description: Proves every catalog item is validated before graph-api starts.
+      kind: okf
+      sourceId: dormant-broken
+      filesystemRescanIntervalSeconds: 60
+      source:
+        volumeName: dormant-broken-okf
+        existingClaim: dormant-broken-okf
+        mountPath: /var/lib/dormant-broken
+        path: /var/lib/dormant-broken/../escape
+        readOnly: true

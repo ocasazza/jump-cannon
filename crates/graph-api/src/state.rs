@@ -22,6 +22,7 @@ use data_loader::{HostedImporter, ImportError, ImporterSchema, LoadResult, Searc
 use vault_data::VaultGraph;
 
 use crate::compute_broker::ComputeBroker;
+use crate::importer_catalog::ImporterCatalog;
 use crate::progress::ProgressLog;
 use crate::search_index::SearchIndex;
 
@@ -171,6 +172,10 @@ pub struct AppStateInner {
     /// surface "Scanning vault / Loading graph / Rebuilding search
     /// index" task bars in the footer.
     pub progress: Arc<ProgressLog>,
+    /// Bounded, non-secret deployment source catalog exposed read-only at
+    /// `GET /importers`. This never grants effects or changes the active
+    /// process-lifetime importer.
+    pub importer_catalog: ImporterCatalog,
 }
 
 impl AppState {
@@ -181,6 +186,29 @@ impl AppState {
         assets_dir: Option<PathBuf>,
         compute_broker: ComputeBroker,
         progress: Arc<ProgressLog>,
+    ) -> Result<Self, ImportError> {
+        Self::new_with_importer_catalog(
+            vault_root,
+            importer,
+            loaded,
+            assets_dir,
+            compute_broker,
+            progress,
+            ImporterCatalog::default(),
+        )
+    }
+
+    /// Construct application state with a validated deployment-owned source
+    /// catalog. The legacy [`Self::new`] constructor intentionally remains so
+    /// embedders and tests that do not need catalog metadata keep working.
+    pub fn new_with_importer_catalog(
+        vault_root: PathBuf,
+        importer: HostedImporter,
+        loaded: LoadResult,
+        assets_dir: Option<PathBuf>,
+        compute_broker: ComputeBroker,
+        progress: Arc<ProgressLog>,
+        importer_catalog: ImporterCatalog,
     ) -> Result<Self, ImportError> {
         let descriptor = importer.descriptor();
         let source = SnapshotSource::new(&descriptor.id, &descriptor.name, &descriptor.version);
@@ -198,6 +226,7 @@ impl AppState {
                 assets_dir,
                 compute_broker,
                 progress,
+                importer_catalog,
             }),
         })
     }

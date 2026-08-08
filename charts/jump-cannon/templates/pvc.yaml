@@ -1,6 +1,5 @@
-{{- $graphSource := ternary "kubernetes" .Values.graphApi.source .Values.kubernetesImporter.enabled -}}
-{{- $usesFilesystem := or (eq $graphSource "obsidian") (eq $graphSource "okf") -}}
-{{- if and $usesFilesystem .Values.vault.persistence.enabled (not .Values.vault.persistence.existingClaim) }}
+{{- $importer := include "jump-cannon.importerSelection" . | fromJson -}}
+{{- if and $importer.usesFilesystem (not $importer.named) .Values.vault.persistence.enabled (not .Values.vault.persistence.existingClaim) }}
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
