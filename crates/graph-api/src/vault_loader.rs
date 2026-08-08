@@ -163,7 +163,8 @@ pub async fn load_with_progress(
 mod tests {
     use data_loader::{
         Capability, DiscoveryField, DiscoveryFieldType, EdgeTypeSchema, Effect, ImportFuture,
-        ImporterDescriptor, ImporterSchema, LoadResult, SearchDocument, Transport,
+        ImporterDescriptor, ImporterSchema, LoadResult, SearchDocument, TagHierarchySchema,
+        Transport,
     };
     use vault_data::VaultGraph;
     use vault_data::{VaultEdge, VaultNode};
@@ -182,6 +183,7 @@ mod tests {
                     .facetable(),
             ],
             vec![EdgeTypeSchema::directed("reference", "test edge")],
+            TagHierarchySchema::slash(),
         )
     }
 

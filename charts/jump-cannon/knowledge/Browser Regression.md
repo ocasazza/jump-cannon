@@ -17,7 +17,8 @@ Stable fixture notes prove that Nodes renders a horizontal navigator/content
 split, uses the importer-neutral `Search fields` label while exposing the core
 schema-provided keys, loads selected content, preserves
 selection across Flat and Tags, groups exact multi-tags without duplicate rows,
-and exposes a synthetic `(untagged)` group. It also hit-tests the search and
+renders the same fixture under both `foo/bar/baz` and `bee/bop/baz`, and exposes
+a synthetic `(untagged)` group. It also hit-tests the search and
 mode controls below the Panel Kit header, switches to tiling, and verifies that
 the Nodes tile remains large enough for a left navigator and wider content
 pane. When the wrapper owns the temporary vault, those fixtures are mandatory

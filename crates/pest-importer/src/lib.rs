@@ -35,7 +35,7 @@ use std::sync::Arc;
 use data_loader::{
     Capability, DiscoveryField, DiscoveryFieldType, EdgeTypeSchema, Effect,
     ImportError as PipelineError, ImportFuture, Importer, ImporterDescriptor, ImporterSchema,
-    LoadResult, Loader, SearchDocument, Transport, WatchPlan,
+    LoadResult, Loader, SearchDocument, TagHierarchySchema, Transport, WatchPlan,
 };
 use pest::iterators::Pair;
 use pest_meta::ast::RuleType;
@@ -931,6 +931,7 @@ fn pest_schema(package_fields: Vec<DiscoveryField>) -> ImporterSchema {
             "declared",
             "Directed edge emitted by the package capture map",
         )],
+        TagHierarchySchema::slash(),
     )
     .with_input_media_types(["text/plain"])
 }

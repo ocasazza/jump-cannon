@@ -274,7 +274,7 @@
               printf '%s\n' \
                 '---' \
                 'title: Node Editor Fixture' \
-                'tags: [browser-editor, browser-shared]' \
+                'tags: [browser-editor, browser-shared, foo/bar/baz, bee/bop/baz]' \
                 '---' \
                 "" \
                 '# Node Editor Fixture' \

@@ -334,7 +334,7 @@ pub async fn search_rich(q: &str, limit: u32) -> ApiResult<RichResults> {
 
 /// Minimal `/graph/schema` view used by the Nodes panel. Serde deliberately
 /// ignores the rest of the importer contract: this UI only needs the source
-/// identity and the fields callers may use in a search query.
+/// identity plus searchable/facetable fields and the required tag hierarchy.
 #[derive(Clone, Debug, Deserialize, PartialEq)]
 pub struct GraphSchema {
     #[serde(default)]
@@ -352,8 +352,20 @@ pub struct ImporterSource {
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Default)]
 pub struct DiscoverySchema {
+    pub tag_hierarchy: TagHierarchySchema,
     #[serde(default)]
     pub fields: Vec<DiscoveryField>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+pub struct TagHierarchySchema {
+    pub separator: char,
+}
+
+impl Default for TagHierarchySchema {
+    fn default() -> Self {
+        Self { separator: '/' }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq)]

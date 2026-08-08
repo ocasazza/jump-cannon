@@ -2,7 +2,7 @@ use super::{
     loader::ObsidianLoader,
     parser::{extract_wikilinks, parse_note},
 };
-use data_loader::{ImportError, Loader};
+use data_loader::{ImportError, Loader, TagHierarchySchema};
 use std::{fs, path::Path};
 
 #[test]
@@ -139,6 +139,7 @@ fn obsidian_schema_and_search_documents_satisfy_the_contract() {
     assert!(keys.contains(&"body"));
     assert!(keys.contains(&"description"));
     assert!(keys.contains(&"tags"));
+    assert_eq!(schema.tag_hierarchy, TagHierarchySchema::slash());
 
     let document = result.search_documents.first().unwrap();
     assert_eq!(document.fields["tags"], serde_json::json!(["runbook"]));

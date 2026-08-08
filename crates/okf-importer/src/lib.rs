@@ -17,7 +17,7 @@ use std::{
 use data_loader::{
     Capability, DiscoveryField, DiscoveryFieldType, EdgeTypeSchema, Effect, ImportError,
     ImportFuture, Importer, ImporterDescriptor, ImporterSchema, LoadResult, SearchDocument,
-    Transport, WatchPlan,
+    TagHierarchySchema, Transport, WatchPlan,
 };
 use percent_encoding::percent_decode_str;
 use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
@@ -780,6 +780,7 @@ fn okf_schema() -> ImporterSchema {
             "relationship",
             "Standard Markdown concept link or internal provenance reference",
         )],
+        TagHierarchySchema::slash(),
     )
     .with_input_media_types(["text/markdown"])
 }

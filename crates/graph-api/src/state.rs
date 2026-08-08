@@ -267,7 +267,7 @@ mod tests {
     }
 
     fn test_schema() -> ImporterSchema {
-        use data_loader::{DiscoveryField, DiscoveryFieldType, EdgeTypeSchema};
+        use data_loader::{DiscoveryField, DiscoveryFieldType, EdgeTypeSchema, TagHierarchySchema};
 
         ImporterSchema::new(
             vec![
@@ -278,6 +278,7 @@ mod tests {
                     .facetable(),
             ],
             vec![EdgeTypeSchema::directed("relationship", "test")],
+            TagHierarchySchema::slash(),
         )
     }
 }

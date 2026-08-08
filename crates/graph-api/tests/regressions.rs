@@ -14,7 +14,7 @@ use tower::ServiceExt; // for `oneshot`
 use data_loader::{
     Capability, ContentSchema, DiscoveryField, DiscoveryFieldType, EdgeTypeSchema, Effect,
     HostedImporter, ImportError, ImportFuture, Importer, ImporterDescriptor, ImporterSchema,
-    LoadResult, Loader, SearchDocument, Transport,
+    LoadResult, Loader, SearchDocument, TagHierarchySchema, Transport,
 };
 use graph_api::importer_catalog::ImporterCatalog;
 use graph_api::proto::{Init, MetaSummary, NodeMeta};
@@ -36,6 +36,7 @@ fn test_schema() -> ImporterSchema {
                 .facetable(),
         ],
         vec![EdgeTypeSchema::directed("reference", "test edge")],
+        TagHierarchySchema::slash(),
     )
 }
 
@@ -534,6 +535,7 @@ async fn schema_search_and_facets_share_the_importer_contract() {
     assert_eq!(schema["graph_revision"], revision);
     assert_eq!(schema["source"]["id"], "empty");
     assert_eq!(schema["schema"]["schema_version"], 1);
+    assert_eq!(schema["schema"]["tag_hierarchy"]["separator"], "/");
     assert!(schema["schema"]["fields"]
         .as_array()
         .unwrap()

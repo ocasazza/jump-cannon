@@ -933,6 +933,7 @@ async fn compute_soup_post(
             "bond",
             "Dynamic particle bond",
         )],
+        data_loader::TagHierarchySchema::slash(),
     );
     let snapshot = match crate::state::GraphSnapshot::build(
         vg,

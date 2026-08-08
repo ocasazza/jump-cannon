@@ -143,6 +143,7 @@ struct NodesEditorCheck {
     selected_content_loaded: bool,
     selection_persisted: bool,
     exact_tag_groups: bool,
+    hierarchical_tag_paths: bool,
     untagged_group: bool,
     flat_active_count: usize,
     schema_core_keys: bool,
@@ -681,6 +682,27 @@ async fn drive_page(
           if (summary?.getAttribute('aria-expanded') !== 'true') summary?.click();
           return group;
         };
+        const groupAtPath = (path) => [...(editor?.querySelectorAll('[data-tag-path]') || [])]
+          .find((group) => group.getAttribute('data-tag-path') === path);
+        const expandPath = async (path) => {
+          const segments = path.split('/');
+          let prefix = '';
+          let group = null;
+          for (const segment of segments) {
+            prefix = prefix ? `${prefix}/${segment}` : segment;
+            group = await waitFor(() => groupAtPath(prefix));
+            if (!group) return null;
+            expand(group);
+          }
+          return group;
+        };
+        const fooLeaf = fixtureContract ? await expandPath('foo/bar/baz') : null;
+        const beeLeaf = fixtureContract ? await expandPath('bee/bop/baz') : null;
+        if (fixtureContract) {
+          await waitFor(() => [fooLeaf, beeLeaf].every(
+            (group) => group?.querySelector('[data-node-id="Node Editor Fixture"]')
+          ));
+        }
         const groupsToExercise = fixtureContract
           ? [groupNamed('browser-editor'), groupNamed('browser-shared')].filter(Boolean)
           : groups.slice(0, 2);
@@ -709,6 +731,13 @@ async fn drive_page(
         );
         const exactTagGroups = tagModeReady && genericGroupsExact &&
           (!fixtureContract || fixtureGroupsExact);
+        const hierarchicalTagPaths = !fixtureContract || Boolean(
+          fooLeaf && beeLeaf &&
+          fooLeaf.getAttribute('data-tag-segment') === 'baz' &&
+          beeLeaf.getAttribute('data-tag-segment') === 'baz' &&
+          [...fooLeaf.querySelectorAll('[data-node-id="Node Editor Fixture"]')].length === 1 &&
+          [...beeLeaf.querySelectorAll('[data-node-id="Node Editor Fixture"]')].length === 1
+        );
         const untaggedGroupPresent = Boolean(
           untaggedGroup?.querySelector('[data-node-id]')
         );
@@ -772,6 +801,7 @@ async fn drive_page(
         if (!selectedContentLoaded) failures.push('selected node content did not load');
         if (!selectionPersisted) failures.push('selection/content did not survive Tags mode');
         if (!exactTagGroups) failures.push('exact multi-tag grouping is incorrect');
+        if (!hierarchicalTagPaths) failures.push('required tag paths did not render as nested groups');
         if (fixtureContract && (!untaggedGroupPresent || !fixtureUntagged)) {
           failures.push('synthetic untagged group or fixture missing');
         }
@@ -790,6 +820,7 @@ async fn drive_page(
           selected_content_loaded: selectedContentLoaded,
           selection_persisted: selectionPersisted,
           exact_tag_groups: Boolean(exactTagGroups),
+          hierarchical_tag_paths: hierarchicalTagPaths,
           untagged_group: untaggedGroupPresent,
           flat_active_count: flatActiveCount,
           schema_core_keys: schemaCoreKeys,

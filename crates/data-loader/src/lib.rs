@@ -132,6 +132,21 @@ pub struct ContentSchema {
     pub media_types: Vec<String>,
 }
 
+/// Application-wide tag path contract. Every importer must publish this
+/// alongside its required `tags` field so clients can build one consistent
+/// hierarchical navigator.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TagHierarchySchema {
+    pub separator: char,
+}
+
+impl TagHierarchySchema {
+    pub const fn slash() -> Self {
+        Self { separator: '/' }
+    }
+}
+
 /// Versioned, mandatory output/discovery schema for an importer.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -139,6 +154,7 @@ pub struct ImporterSchema {
     pub schema_version: u32,
     #[serde(default)]
     pub input_media_types: Vec<String>,
+    pub tag_hierarchy: TagHierarchySchema,
     pub fields: Vec<DiscoveryField>,
     pub edge_types: Vec<EdgeTypeSchema>,
     #[serde(default)]
@@ -146,10 +162,15 @@ pub struct ImporterSchema {
 }
 
 impl ImporterSchema {
-    pub fn new(fields: Vec<DiscoveryField>, edge_types: Vec<EdgeTypeSchema>) -> Self {
+    pub fn new(
+        fields: Vec<DiscoveryField>,
+        edge_types: Vec<EdgeTypeSchema>,
+        tag_hierarchy: TagHierarchySchema,
+    ) -> Self {
         Self {
             schema_version: DISCOVERY_SCHEMA_VERSION,
             input_media_types: Vec::new(),
+            tag_hierarchy,
             fields,
             edge_types,
             content: ContentSchema::default(),
@@ -191,6 +212,12 @@ impl ImporterSchema {
         if self.fields.is_empty() || self.fields.len() > MAX_DISCOVERY_FIELDS {
             return Err(invalid_descriptor(format!(
                 "discovery schema must declare between 1 and {MAX_DISCOVERY_FIELDS} fields"
+            )));
+        }
+        if self.tag_hierarchy.separator != '/' {
+            return Err(invalid_descriptor(format!(
+                "tag hierarchy separator must be the application-wide '/' delimiter, got {:?}",
+                self.tag_hierarchy.separator
             )));
         }
 
@@ -433,6 +460,16 @@ impl ImporterSchema {
                 .get("tags")
                 .and_then(serde_json::Value::as_array)
                 .expect("validated core tags field");
+            for tag in indexed_tags.iter().filter_map(serde_json::Value::as_str) {
+                validate_tag_path(tag, self.tag_hierarchy.separator).map_err(|message| {
+                    ImportError::Map {
+                        message: format!(
+                            "search document for {:?} has invalid tag {tag:?}: {message}",
+                            document.node_id
+                        ),
+                    }
+                })?;
+            }
             if indexed_tags.len() != node.meta.tags.len()
                 || indexed_tags
                     .iter()
@@ -508,6 +545,17 @@ fn valid_schema_key(key: &str) -> bool {
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
         && key.as_bytes().first().is_some_and(u8::is_ascii_alphabetic)
+}
+
+fn validate_tag_path(tag: &str, separator: char) -> Result<(), &'static str> {
+    if tag
+        .split(separator)
+        .any(|segment| segment.trim().is_empty())
+    {
+        Err("hierarchical tags must contain a non-empty segment on both sides of every separator")
+    } else {
+        Ok(())
+    }
 }
 
 fn validate_media_types(media_types: &[String]) -> Result<(), ImportError> {
@@ -1198,6 +1246,7 @@ mod importer_tests {
                 "relationship",
                 "Test relationship",
             )],
+            TagHierarchySchema::slash(),
         )
         .with_input_media_types(["text/plain"])
     }
@@ -1308,6 +1357,21 @@ mod importer_tests {
         schema.field_mut("id").default_value = Some(json!("default-id"));
         let error = schema.validate().unwrap_err().to_string();
         assert!(error.contains("and have no default"), "{error}");
+    }
+
+    #[test]
+    fn discovery_schema_requires_the_application_tag_hierarchy() {
+        test_schema().validate().unwrap();
+
+        let mut invalid_separator = test_schema();
+        invalid_separator.tag_hierarchy.separator = ':';
+        let error = invalid_separator.validate().unwrap_err().to_string();
+        assert!(error.contains("application-wide '/' delimiter"), "{error}");
+
+        let mut serialized = serde_json::to_value(test_schema()).unwrap();
+        serialized.as_object_mut().unwrap().remove("tag_hierarchy");
+        let error = serde_json::from_value::<ImporterSchema>(serialized).unwrap_err();
+        assert!(error.to_string().contains("missing field `tag_hierarchy`"));
     }
 
     #[test]
@@ -1423,6 +1487,25 @@ mod importer_tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("canonical tags"), "{error}");
+
+        let mut malformed_result = one_node_result(
+            SearchDocument::new("n1")
+                .with("id", "n1")
+                .with("title", "Node one")
+                .with("tags", json!(["foo//bar"])),
+        );
+        malformed_result
+            .graph
+            .nodes
+            .get_mut("n1")
+            .unwrap()
+            .meta
+            .tags = vec!["foo//bar".into()];
+        let error = schema
+            .validate_result(&malformed_result)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("invalid tag \"foo//bar\""), "{error}");
     }
 
     trait FieldMut {

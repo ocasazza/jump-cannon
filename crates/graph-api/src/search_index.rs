@@ -220,7 +220,9 @@ fn add_value(
 
 #[cfg(test)]
 mod tests {
-    use data_loader::{DiscoveryField, EdgeTypeSchema, ImporterSchema, SearchDocument};
+    use data_loader::{
+        DiscoveryField, EdgeTypeSchema, ImporterSchema, SearchDocument, TagHierarchySchema,
+    };
     use serde_json::json;
 
     use super::*;
@@ -240,6 +242,7 @@ mod tests {
                     .facetable(),
             ],
             vec![EdgeTypeSchema::directed("relationship", "test edge")],
+            TagHierarchySchema::slash(),
         )
     }
 

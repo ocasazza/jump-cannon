@@ -260,6 +260,7 @@ mod tests {
     use super::*;
     use data_loader::{
         DiscoveryField, DiscoveryFieldType, EdgeTypeSchema, ImporterSchema, SearchDocument,
+        TagHierarchySchema,
     };
     use vault_data::{NodeMetrics, VaultEdge, VaultGraph, VaultNode};
 
@@ -289,6 +290,7 @@ mod tests {
                     .facetable(),
             ],
             vec![EdgeTypeSchema::directed("reference", "test edge")],
+            TagHierarchySchema::slash(),
         );
         GraphSnapshot::build(
             graph,
