@@ -1,308 +1,35 @@
-//! Filter panel — Dioxus port of crates/graph-renderer/src/ui/sections/filter.rs
-//! plus its data model (ui/query.rs) and the inverted index (ui/field_index.rs).
+//! Filter panel — a nested, directly manipulable Boolean outline backed by
+//! `jump-cannon-filter-model`, plus the inverted index used for field facets.
 //!
 //! Three layers, top to bottom:
-//!   - the card-stream query builder (search card, filter cards, AND/OR
-//!     connectors, paren pairs, NOT) — same mutation rules as the egui
-//!     section, persisted across sessions;
-//!   - a field/value bucket browser decoded from `GET /graph/meta_summary`
-//!     (protobuf `MetaSummary`); clicking a bucket toggles it into the
-//!     active (field, value) set the chip strip renders;
-//!   - the GPU push: active filters resolve through [`FieldIndex::matches`]
-//!     (per-field any/all, cross-field any/all) and land on the renderer via
-//!     `set_filter_mask` (Filter) or `set_focus_set` (Focus) — the same
-//!     dispatch as app.rs::apply_focus_set_to_gpu's no-node-focus arm.
+//!   - an accessible logic outline with repeatable search/field leaves,
+//!     nested ALL/ANY groups, keyboard reorder controls, and pointer drag/drop;
+//!   - a contextual field/value palette decoded from
+//!     `GET /graph/meta_summary`, with live bucket counts;
+//!   - a last-valid evaluator that reports node-keyed diagnostics and subtree
+//!     counts before dispatching Filter/Dim masks to the GPU.
 //!
-//! The active (field, value) chip strip — its per-field / cross-field
-//! combinators and the Filter/Dim behavior toggle — renders at the top of this
-//! panel (it was the separate "Filters" strip panel before the two merged).
-//! User-facing settings persist under `jc_filter_v1`.
+//! The public compatibility projection remains available to Inspector and the
+//! command palette. User-facing settings continue to persist under
+//! `jc_filter_v1` so v1 state can be upgraded in place.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 
 use dioxus::prelude::*;
+use futures::future::join_all;
 use gloo_storage::{LocalStorage, Storage};
-use panel_kit::badge::{Badge, BadgeKind};
 use serde::{Deserialize, Serialize};
 
 use crate::api::get_proto;
-use crate::badges::badge_kind_for;
 use crate::{proto, render, Ctx};
 
-// --- query model (port of ui/query.rs) -----------------------------------------
-
-/// How multiple selections combine. `Any` = union (OR), `All` = intersect
-/// (AND). Used both per-field (value buckets within a field) and cross-field
-/// (each field's resulting set). Per-field `All` is meaningful for
-/// multi-valued fields like `tags`; for single-valued fields it degenerates
-/// to `∅` — surfaced anyway rather than lying about the data shape.
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, Hash)]
-pub(crate) enum Combinator {
-    /// Union — match any of the selected values.
-    #[default]
-    Any,
-    /// Intersect — match all selected values.
-    All,
-}
-
-impl Combinator {
-    pub(crate) fn label(self) -> &'static str {
-        match self {
-            Combinator::Any => "any",
-            Combinator::All => "all",
-        }
-    }
-    pub(crate) fn toggled(self) -> Self {
-        match self {
-            Combinator::Any => Combinator::All,
-            Combinator::All => Combinator::Any,
-        }
-    }
-}
-
-/// Active per-field filter selections driven by bucket/chip clicks.
-///
-/// Defaults: per-field `Any` (OR within a field), cross-field `All` (AND
-/// across fields). `insertion_order` keeps the chip strip stable in the
-/// order the user added fields (BTreeMap iteration would shuffle it).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct ActiveFieldFilters {
-    pub by_field: BTreeMap<String, BTreeSet<String>>,
-    #[serde(default)]
-    pub insertion_order: Vec<String>,
-    /// Per-field combinator override. Missing key = `Any` (OR).
-    #[serde(default)]
-    pub field_combinator: BTreeMap<String, Combinator>,
-    /// How field-level results combine. Default `All` (AND) so existing
-    /// persisted state behaves as before.
-    #[serde(default = "default_cross_field_combinator")]
-    pub cross_field_combinator: Combinator,
-}
-
-fn default_cross_field_combinator() -> Combinator {
-    Combinator::All
-}
-
-impl Default for ActiveFieldFilters {
-    // NB: cross-field default is `All` (AND), not the `Combinator` type
-    // default — that's `Any`, which fits the per-field level instead.
-    fn default() -> Self {
-        Self {
-            by_field: BTreeMap::new(),
-            insertion_order: Vec::new(),
-            field_combinator: BTreeMap::new(),
-            cross_field_combinator: default_cross_field_combinator(),
-        }
-    }
-}
-
-impl ActiveFieldFilters {
-    pub(crate) fn combinator_for(&self, field: &str) -> Combinator {
-        self.field_combinator
-            .get(field)
-            .copied()
-            .unwrap_or(Combinator::Any)
-    }
-    pub(crate) fn set_combinator_for(&mut self, field: &str, c: Combinator) {
-        // Keep the map sparse: drop the default to avoid serde bloat.
-        if matches!(c, Combinator::Any) {
-            self.field_combinator.remove(field);
-        } else {
-            self.field_combinator.insert(field.to_string(), c);
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-pub(crate) enum Op {
-    /// `=`
-    Eq,
-    /// `≠`
-    Neq,
-    /// `~`
-    Contains,
-    /// `~/regex/`
-    Matches,
-}
-
-impl Op {
-    pub(crate) fn label(self) -> &'static str {
-        match self {
-            Op::Eq => "=",
-            Op::Neq => "≠",
-            Op::Contains => "~",
-            Op::Matches => "~/r/",
-        }
-    }
-
-    pub(crate) fn cycle(self) -> Op {
-        match self {
-            Op::Eq => Op::Neq,
-            Op::Neq => Op::Contains,
-            Op::Contains => Op::Matches,
-            Op::Matches => Op::Eq,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-pub(crate) enum ConnectorOp {
-    And,
-    Or,
-}
-
-impl ConnectorOp {
-    pub(crate) fn label(self) -> &'static str {
-        match self {
-            ConnectorOp::And => "and",
-            ConnectorOp::Or => "or",
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) enum Card {
-    /// System search card; no delete button.
-    Search {
-        value: String,
-        regex: bool,
-    },
-    Filter {
-        field: String,
-        op: Op,
-        value: String,
-    },
-    Connector {
-        op: ConnectorOp,
-    },
-    ParenOpen,
-    ParenClose,
-    Not,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct QueryModel {
-    pub cards: Vec<Card>,
-    /// Bucket/chip-driven (field, value) toggles. Resolved through
-    /// [`FieldIndex::matches`] and pushed to the GPU by [`sync_gpu`].
-    #[serde(default)]
-    pub active_filters: ActiveFieldFilters,
-}
-
-impl Default for QueryModel {
-    fn default() -> Self {
-        Self {
-            // Always start with the system search card.
-            cards: vec![Card::Search {
-                value: String::new(),
-                regex: false,
-            }],
-            active_filters: ActiveFieldFilters::default(),
-        }
-    }
-}
-
-impl QueryModel {
-    /// Toggle inclusion of `(field, value)` in the active filter set.
-    pub(crate) fn toggle_field_filter(&mut self, field: &str, value: &str) {
-        let entry = self
-            .active_filters
-            .by_field
-            .entry(field.to_string())
-            .or_default();
-        if entry.contains(value) {
-            entry.remove(value);
-            if entry.is_empty() {
-                self.active_filters.by_field.remove(field);
-                self.active_filters.insertion_order.retain(|f| f != field);
-                self.active_filters.field_combinator.remove(field);
-            }
-        } else {
-            entry.insert(value.to_string());
-            if !self
-                .active_filters
-                .insertion_order
-                .iter()
-                .any(|f| f == field)
-            {
-                self.active_filters.insertion_order.push(field.to_string());
-            }
-        }
-    }
-
-    pub(crate) fn clear_field(&mut self, field: &str) {
-        self.active_filters.by_field.remove(field);
-        self.active_filters.insertion_order.retain(|f| f != field);
-        self.active_filters.field_combinator.remove(field);
-    }
-
-    pub(crate) fn clear_all_filters(&mut self) {
-        self.active_filters = ActiveFieldFilters::default();
-    }
-
-    /// Returns true if `(field, value)` is currently selected.
-    pub(crate) fn is_filter_active(&self, field: &str, value: &str) -> bool {
-        self.active_filters
-            .by_field
-            .get(field)
-            .map(|set| set.contains(value))
-            .unwrap_or(false)
-    }
-
-    /// Reset to the default model: just the system search card.
-    pub(crate) fn clear(&mut self) {
-        *self = Self::default();
-    }
-}
-
-/// If `idx` pointed at a removed `ParenOpen`, remove the matching
-/// `ParenClose` (the next unmatched `)` to the right of `idx`).
-fn remove_matching_paren_close(cards: &mut Vec<Card>, idx: usize) {
-    let mut depth: i32 = 0;
-    let mut found: Option<usize> = None;
-    for (i, c) in cards.iter().enumerate().skip(idx) {
-        match c {
-            Card::ParenOpen => depth += 1,
-            Card::ParenClose => {
-                if depth == 0 {
-                    found = Some(i);
-                    break;
-                }
-                depth -= 1;
-            }
-            _ => {}
-        }
-    }
-    if let Some(i) = found {
-        cards.remove(i);
-    }
-}
-
-/// Mirror of `remove_matching_paren_close` for a removed `ParenClose`:
-/// walk LEFT from `idx-1` to find the matching unmatched `(`.
-fn remove_matching_paren_open(cards: &mut Vec<Card>, idx: usize) {
-    if idx == 0 {
-        return;
-    }
-    let mut depth: i32 = 0;
-    let mut found: Option<usize> = None;
-    for i in (0..idx).rev() {
-        match cards[i] {
-            Card::ParenClose => depth += 1,
-            Card::ParenOpen => {
-                if depth == 0 {
-                    found = Some(i);
-                    break;
-                }
-                depth -= 1;
-            }
-            _ => {}
-        }
-    }
-    if let Some(i) = found {
-        cards.remove(i);
-    }
-}
+use jump_cannon_filter_model::{
+    self as filter_model, Clause, Diagnostic, EvalOutput, GroupMode, NodeId, Rule, RuleGroup,
+    RuleKind, SearchMatches,
+};
+pub(crate) use jump_cannon_filter_model::{
+    Card, ConnectorOp, Op, QueryModel,
+};
 
 // --- filter behavior (port of ui/state.rs::FilterBehavior) ----------------------
 
@@ -314,15 +41,9 @@ pub(crate) enum FilterBehavior {
 }
 
 impl FilterBehavior {
-    pub(crate) fn label(self) -> &'static str {
-        match self {
-            FilterBehavior::Filter => "Filter",
-            // Displayed as "Dim" so "Focus" is left to mean only the Camera
-            // panel's focus mode (the variant name stays Focus for the
-            // persisted serde tag).
-            FilterBehavior::Focus => "Dim",
-        }
-    }
+    /// The Focus variant is presented as "Dim" throughout the UI so "Focus" is
+    /// left to mean only the Camera panel's focus mode; the variant name stays
+    /// Focus for the persisted serde tag.
     pub(crate) fn tooltip(self) -> &'static str {
         match self {
             FilterBehavior::Filter => "Hide non-matching nodes and the edges that touch them.",
@@ -364,81 +85,6 @@ impl FieldIndex {
                 .insert(b.value.clone(), v);
         }
         Self { by_field }
-    }
-
-    /// `Some(set)` when at least one filter is set AND at least one
-    /// (field, value) pair resolves to a known bucket; `None` otherwise
-    /// (= no filter active).
-    pub(crate) fn matches(&self, filters: &ActiveFieldFilters) -> Option<HashSet<u32>> {
-        if filters.by_field.is_empty() {
-            return None;
-        }
-        let mut per_field: Vec<HashSet<u32>> = Vec::new();
-        for (field, values) in &filters.by_field {
-            if values.is_empty() {
-                continue;
-            }
-            let Some(buckets) = self.by_field.get(field) else {
-                continue;
-            };
-            let combinator = filters.combinator_for(field);
-            // Resolve each selected value to its bucket. Skip unknown
-            // values rather than treating them as the empty set —
-            // otherwise stale persisted state would tank intersections.
-            let mut buckets_for_field: Vec<&Vec<u32>> = Vec::new();
-            for v in values {
-                if let Some(idxs) = buckets.get(v) {
-                    buckets_for_field.push(idxs);
-                }
-            }
-            if buckets_for_field.is_empty() {
-                continue;
-            }
-            let combined: HashSet<u32> = match combinator {
-                Combinator::Any => {
-                    let mut union: HashSet<u32> = HashSet::new();
-                    for b in &buckets_for_field {
-                        union.extend(b.iter().copied());
-                    }
-                    union
-                }
-                Combinator::All => {
-                    // Intersect smallest first.
-                    let mut sorted = buckets_for_field.clone();
-                    sorted.sort_by_key(|b| b.len());
-                    let mut acc: HashSet<u32> = sorted[0].iter().copied().collect();
-                    for b in sorted.iter().skip(1) {
-                        let bset: HashSet<u32> = b.iter().copied().collect();
-                        acc.retain(|x| bset.contains(x));
-                    }
-                    acc
-                }
-            };
-            per_field.push(combined);
-        }
-        if per_field.is_empty() {
-            return None;
-        }
-        let acc: HashSet<u32> = match filters.cross_field_combinator {
-            Combinator::All => {
-                // Intersect smallest first.
-                per_field.sort_by_key(|s| s.len());
-                let mut iter = per_field.into_iter();
-                let mut acc = iter.next().unwrap();
-                for next in iter {
-                    acc.retain(|x| next.contains(x));
-                }
-                acc
-            }
-            Combinator::Any => {
-                let mut acc: HashSet<u32> = HashSet::new();
-                for s in per_field {
-                    acc.extend(s.into_iter());
-                }
-                acc
-            }
-        };
-        Some(acc)
     }
 
     /// Per-node categorical f32 metric: each node's value is the bucket id
@@ -488,7 +134,9 @@ struct Persisted {
 }
 
 fn load() -> Persisted {
-    LocalStorage::get(STORE_KEY).unwrap_or_default()
+    let mut persisted: Persisted = LocalStorage::get(STORE_KEY).unwrap_or_default();
+    persisted.query.normalize_imported();
+    persisted
 }
 
 pub(crate) static QUERY: GlobalSignal<QueryModel> = Signal::global(|| load().query);
@@ -498,6 +146,27 @@ pub(crate) static FIELD_INDEX: GlobalSignal<Option<Result<FieldIndex, String>>> 
     Signal::global(|| None);
 static FIELD_INDEX_STARTED: GlobalSignal<bool> = Signal::global(|| false);
 static FIELD_INDEX_SESSION: GlobalSignal<u64> = Signal::global(|| 0);
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum EvalPhase {
+    #[default]
+    Idle,
+    Checking,
+    Applied,
+    Invalid,
+}
+
+#[derive(Debug, Clone, Default)]
+struct EvaluationState {
+    generation: u64,
+    applied_version: u64,
+    phase: EvalPhase,
+    matches: Option<HashSet<u32>>,
+    counts: HashMap<NodeId, usize>,
+    diagnostics: Vec<Diagnostic>,
+}
+
+static EVALUATION: GlobalSignal<EvaluationState> = Signal::global(EvaluationState::default);
 
 fn persist() {
     let p = Persisted {
@@ -516,13 +185,9 @@ pub(crate) fn state_snapshot() -> (QueryModel, FilterBehavior) {
 /// AppState round-trip seam: write the imported filter state straight to
 /// localStorage; the apply path's reload re-seeds the signals.
 pub(crate) fn state_restore(query: &QueryModel, behavior: FilterBehavior) {
-    let _ = LocalStorage::set(
-        STORE_KEY,
-        &Persisted {
-            query: query.clone(),
-            behavior,
-        },
-    );
+    let mut query = query.clone();
+    query.normalize_imported();
+    let _ = LocalStorage::set(STORE_KEY, &Persisted { query, behavior });
 }
 
 /// One-shot `/graph/meta_summary` fetch — called from both panels' render
@@ -568,6 +233,11 @@ pub(crate) fn reset_for_graph_session() {
     *FIELD_INDEX_SESSION.write() = next;
     *FIELD_INDEX_STARTED.write() = false;
     *FIELD_INDEX.write() = None;
+    let next_generation = EVALUATION.peek().generation.wrapping_add(1);
+    *EVALUATION.write() = EvaluationState {
+        generation: next_generation,
+        ..EvaluationState::default()
+    };
     render::with_host(|h| {
         let (pipes, queue) = h.pipes_and_queue();
         pipes.set_filter_mask(queue, None);
@@ -575,21 +245,158 @@ pub(crate) fn reset_for_graph_session() {
     });
 }
 
-/// Resolve the active filters through the field index and dispatch on
-/// [`FilterBehavior`] — the no-node-focus arm of the egui app's
-/// `apply_focus_set_to_gpu`. Always clears the *other* GPU path so toggling
-/// between modes doesn't leave stale state behind.
-///
-/// PARITY GAP: the egui app re-pushes this change-detected per frame, so a
-/// renderer rebuild repaints the mask automatically; here it is mutation-
-/// driven, and a canvas remount drops the mask until the next filter edit
-/// (render/mod.rs::reapply_ctl_state is outside this file's ownership).
+/// Evaluate every query edit from the app root, including mutations made by
+/// Inspector badges or command-palette actions while this panel is closed.
+/// Invalid/pending drafts deliberately retain the last applied match set.
+pub(crate) fn use_query_evaluator(ctx: Ctx) {
+    use_effect(move || {
+        let query = QUERY.read().clone();
+        let graph_session = ctx.graph_session.read().clone();
+        let graph = ctx.graph.read();
+        let Some(graph) = graph.as_ref() else {
+            return;
+        };
+        let node_count = graph.ids.len();
+        let graph_revision = graph.graph_revision;
+        let server_backed = graph_session.is_server_backed();
+
+        if server_backed && FIELD_INDEX.read().is_none() {
+            ensure_field_index(ctx);
+            let mut state = EVALUATION.write();
+            state.phase = EvalPhase::Checking;
+            return;
+        }
+
+        let field_index = FIELD_INDEX
+            .read()
+            .as_ref()
+            .and_then(|result| result.as_ref().ok())
+            .cloned()
+            .unwrap_or_default();
+        let diagnostics =
+            filter_model::validate(query.root(), &field_index.by_field, server_backed);
+        let generation = EVALUATION.peek().generation.wrapping_add(1);
+        {
+            let mut state = EVALUATION.write();
+            state.generation = generation;
+            state.diagnostics = diagnostics.clone();
+            if !diagnostics.is_empty() {
+                state.phase = EvalPhase::Invalid;
+            }
+        }
+        if !diagnostics.is_empty() {
+            return;
+        }
+
+        if query.is_empty() {
+            apply_evaluation(generation, EvalOutput::default());
+            return;
+        }
+
+        let searches = filter_model::search_rules(query.root());
+        if searches.is_empty() {
+            let output = filter_model::evaluate(
+                query.root(),
+                &field_index.by_field,
+                &SearchMatches::new(),
+                node_count,
+            );
+            apply_evaluation(generation, output);
+            return;
+        }
+
+        EVALUATION.write().phase = EvalPhase::Checking;
+        let query_root = query.root().clone();
+        let facets = field_index.by_field;
+        let session_epoch = graph_session.epoch;
+        spawn(async move {
+            gloo_timers::future::TimeoutFuture::new(220).await;
+            if EVALUATION.peek().generation != generation {
+                return;
+            }
+            // `/search/matches` is the set-valued primitive: no client limit,
+            // so a rule matching more nodes than the ranked endpoint's cap
+            // still hides exactly the non-matching nodes.
+            let requests = searches.into_iter().map(|(rule_id, query)| async move {
+                let response = crate::api::search_matches(&query).await;
+                (rule_id, response)
+            });
+            let mut matches = SearchMatches::new();
+            let mut errors = Vec::new();
+            // The indices are dense positions inside the snapshot that served
+            // them, so they are only comparable when every rule — and the graph
+            // on screen — came from that same revision.
+            let mut served_revision = None;
+            for (rule_id, response) in join_all(requests).await {
+                match response {
+                    Ok(response) => {
+                        if *served_revision.get_or_insert(response.revision) != response.revision {
+                            return;
+                        }
+                        matches.insert(rule_id, response.value.into_iter().collect());
+                    }
+                    Err(error) => errors.push(Diagnostic {
+                        node_id: rule_id,
+                        message: error,
+                    }),
+                }
+            }
+            if EVALUATION.peek().generation != generation
+                || ctx.graph_session.peek().epoch != session_epoch
+                || ctx
+                    .graph
+                    .peek()
+                    .as_ref()
+                    .and_then(|graph| graph.graph_revision)
+                    != graph_revision
+                || served_revision.is_some_and(|served| graph_revision != Some(served))
+            {
+                return;
+            }
+            if !errors.is_empty() {
+                let mut state = EVALUATION.write();
+                state.phase = EvalPhase::Invalid;
+                state.diagnostics = errors;
+                return;
+            }
+            let output = filter_model::evaluate(&query_root, &facets, &matches, node_count);
+            apply_evaluation(generation, output);
+        });
+    });
+}
+
+fn apply_evaluation(generation: u64, output: EvalOutput) {
+    if EVALUATION.peek().generation != generation {
+        return;
+    }
+    {
+        let mut state = EVALUATION.write();
+        state.phase = if output.matches.is_some() {
+            EvalPhase::Applied
+        } else {
+            EvalPhase::Idle
+        };
+        state.matches = output.matches;
+        state.counts = output.counts;
+        state.diagnostics.clear();
+        state.applied_version = state.applied_version.wrapping_add(1);
+    }
+    sync_gpu();
+}
+
+pub(crate) fn current_matches() -> Option<HashSet<u32>> {
+    EVALUATION.peek().matches.clone()
+}
+
+pub(crate) fn applied_version() -> u64 {
+    EVALUATION.peek().applied_version
+}
+
+/// Push the last valid expression result into the renderer. `Some(empty)` is
+/// intentionally distinct from no filter: a valid zero-result query hides or
+/// dims every node and the panel explains why.
 pub(crate) fn sync_gpu() {
-    let matching: Option<HashSet<u32>> = FIELD_INDEX
-        .peek()
-        .as_ref()
-        .and_then(|r| r.as_ref().ok())
-        .and_then(|fi| fi.matches(&QUERY.peek().active_filters));
+    let matching = current_matches();
     let behavior = *BEHAVIOR.peek();
     render::with_host(|h| {
         let (pipes, queue) = h.pipes_and_queue();
@@ -600,39 +407,23 @@ pub(crate) fn sync_gpu() {
                 pipes.set_filter_mask(queue, matching.as_ref());
             }
             FilterBehavior::Focus => {
-                // Clear the hard filter mask, then dim via focus_set.
-                // Empty matching → no dim (all visible).
                 pipes.set_filter_mask(queue, None);
-                pipes.set_focus_set(queue, None, &matching.unwrap_or_default());
+                pipes.set_filter_focus_set(queue, matching.as_ref());
             }
         }
     });
 }
 
-/// Card-stream mutation: persist only — cards don't drive the GPU mask
-/// (Filter-card leaves are "unsupported" in the egui evaluator too).
-///
-/// PARITY GAP: the egui app resolves Search cards through cached
-/// `/search?q=` fetches and folds AND/OR/NOT into a dim set via
-/// `QueryModel::evaluate` → `set_selected` (app.rs:3776). Here the card
-/// model + UI are fully ported and persisted, but that async evaluator is
-/// not wired — `render::set_search_highlights` (the `set_selected` port)
-/// is owned by main.rs's Search-panel effect and would be clobbered.
-///
-fn edit_cards(f: impl FnOnce(&mut QueryModel)) {
-    // Auto-snapshot attribution — the egui Filter section stamps
-    // `snapshot_source = Some("Filter")` every frame it renders.
-    crate::appstate::note_source("Filter");
-    f(&mut QUERY.write());
-    persist();
-}
-
-/// Active-filter mutation: persist + re-push the GPU mask.
+/// Canonical expression mutation. Compatibility callers may still append a
+/// v1 `Card`; absorb it as an active leaf before persisting.
 pub(crate) fn edit_filters(f: impl FnOnce(&mut QueryModel)) {
     crate::appstate::note_source("Filter");
-    f(&mut QUERY.write());
+    {
+        let mut query = QUERY.write();
+        f(&mut query);
+        query.absorb_appended_cards();
+    }
     persist();
-    sync_gpu();
 }
 
 pub(crate) fn toggle_behavior() {
@@ -643,488 +434,1160 @@ pub(crate) fn toggle_behavior() {
     sync_gpu();
 }
 
-// --- card mutations (port of sections/filter.rs apply-queued-mutations) -----------
-
-fn delete_card(idx: usize) {
-    edit_cards(|q| {
-        if idx < q.cards.len() {
-            let removed = q.cards.remove(idx);
-            match removed {
-                Card::ParenOpen => remove_matching_paren_close(&mut q.cards, idx),
-                Card::ParenClose => remove_matching_paren_open(&mut q.cards, idx),
-                _ => {}
-            }
-        }
-    });
-}
-
-/// Tail "+" button: append a default Filter (preceded by AND). Only prepend
-/// a connector if the last card isn't already a connector / paren-open / NOT.
-fn append_filter(q: &mut QueryModel) {
-    let needs_connector = !matches!(
-        q.cards.last(),
-        Some(Card::Connector { .. }) | Some(Card::ParenOpen) | Some(Card::Not) | None
-    );
-    if needs_connector {
-        q.cards.push(Card::Connector {
-            op: ConnectorOp::And,
-        });
-    }
-    q.cards.push(Card::Filter {
-        field: "tag".into(),
-        op: Op::Eq,
-        value: String::new(),
-    });
-}
-
 // --- panel -------------------------------------------------------------------------
+
+#[derive(Debug, Clone)]
+struct FieldChoice {
+    name: String,
+    node_count: usize,
+    values: Vec<(String, usize)>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DropIntent {
+    Before(NodeId),
+    Inside(NodeId),
+}
+
+#[derive(Clone, Copy)]
+struct EditorSignals {
+    active_palette: Signal<Option<NodeId>>,
+    drag_source: Signal<Option<NodeId>>,
+    drag_target: Signal<Option<DropIntent>>,
+}
+
+fn field_catalog(index: &FieldIndex) -> Vec<FieldChoice> {
+    let mut fields: Vec<FieldChoice> = index
+        .by_field
+        .iter()
+        .map(|(name, buckets)| {
+            let mut nodes = HashSet::new();
+            let mut values: Vec<(String, usize)> = buckets
+                .iter()
+                .map(|(value, indices)| {
+                    nodes.extend(indices.iter().copied());
+                    (value.clone(), indices.len())
+                })
+                .collect();
+            values.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+            FieldChoice {
+                name: name.clone(),
+                node_count: nodes.len(),
+                values,
+            }
+        })
+        .collect();
+    fields.sort_by(|a, b| a.name.cmp(&b.name));
+    fields
+}
+
+fn phase_name(phase: EvalPhase) -> &'static str {
+    match phase {
+        EvalPhase::Idle => "idle",
+        EvalPhase::Checking => "checking",
+        EvalPhase::Applied => "applied",
+        EvalPhase::Invalid => "invalid",
+    }
+}
+
+fn group_mode_name(mode: GroupMode) -> &'static str {
+    match mode {
+        GroupMode::All => "all",
+        GroupMode::Any => "any",
+    }
+}
+
+fn group_connector(mode: GroupMode) -> &'static str {
+    match mode {
+        GroupMode::All => "AND",
+        GroupMode::Any => "OR",
+    }
+}
+
+fn op_name(op: Op) -> &'static str {
+    match op {
+        Op::Eq => "is",
+        Op::Neq => "is not",
+        Op::Contains => "contains",
+        Op::Matches => "matches regex",
+    }
+}
+
+fn op_token(op: Op) -> &'static str {
+    match op {
+        Op::Eq => "eq",
+        Op::Neq => "neq",
+        Op::Contains => "contains",
+        Op::Matches => "matches",
+    }
+}
+
+fn parse_op(value: &str) -> Op {
+    match value {
+        "neq" => Op::Neq,
+        "contains" => Op::Contains,
+        "matches" => Op::Matches,
+        _ => Op::Eq,
+    }
+}
 
 pub fn panel(ctx: Ctx) -> Element {
     let server_backed = ctx.graph_session.read().is_server_backed();
     ensure_field_index(ctx);
     crate::appstate::ensure_init();
-    let q = QUERY.read().clone();
-    let cards = q.cards.clone();
-    let active_total: usize = q.active_filters.by_field.values().map(|s| s.len()).sum();
 
-    // Field browser snapshot: (field, [(value, count, active)]) — values
-    // sorted by bucket size desc then name, fields by name.
-    let fields_el: Element = match FIELD_INDEX.read().as_ref() {
-        None => rsx! { div { class: "fil-note", "loading field index…" } },
-        Some(Err(e)) => rsx! { div { class: "fil-note", "meta_summary failed: {e}" } },
-        Some(Ok(fi)) => {
-            let mut fields: Vec<(String, Vec<(String, usize, bool)>)> = fi
-                .by_field
-                .iter()
-                .map(|(f, vals)| {
-                    let mut vv: Vec<(String, usize, bool)> = vals
-                        .iter()
-                        .map(|(v, idxs)| (v.clone(), idxs.len(), q.is_filter_active(f, v)))
-                        .collect();
-                    vv.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-                    (f.clone(), vv)
-                })
-                .collect();
-            fields.sort_by(|a, b| a.0.cmp(&b.0));
-            rsx! {
-                for (field, values) in fields {
-                    details { key: "{field}", class: "fil-field",
-                        summary {
-                            span { class: "fil-fname", "{field}" }
-                            span { class: "fil-fcount", { format!("{} values", values.len()) } }
-                        }
-                        div { class: "fil-buckets",
-                            for (value, count, active) in values {
-                                {
-                                    let f2 = field.clone();
-                                    let v2 = value.clone();
-                                    rsx! {
-                                        button {
-                                            key: "{value}",
-                                            class: if active { "fil-bucket active" } else { "fil-bucket" },
-                                            title: "Toggle this (field, value) filter",
-                                            onclick: move |_| edit_filters(|q| q.toggle_field_filter(&f2, &v2)),
-                                            span { class: "fil-bv", "{value}" }
-                                            span { class: "fil-bc", "{count}" }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
+    let mut active_palette = use_signal(|| None::<NodeId>);
+    let drag_source = use_signal(|| None::<NodeId>);
+    let drag_target = use_signal(|| None::<DropIntent>);
+    let signals = EditorSignals {
+        active_palette,
+        drag_source,
+        drag_target,
+    };
+    let drag_source_now = *drag_source.read();
+    let drag_target_now = *drag_target.read();
+
+    let q = QUERY.read().clone();
+    let evaluation = EVALUATION.read().clone();
+    let node_count = ctx
+        .graph
+        .read()
+        .as_ref()
+        .map(|graph| graph.ids.len())
+        .unwrap_or_default();
+    let index_snapshot = FIELD_INDEX.read().clone();
+    let catalog = index_snapshot
+        .as_ref()
+        .and_then(|result| result.as_ref().ok())
+        .map(field_catalog)
+        .unwrap_or_default();
+    let index_note = match index_snapshot {
+        None if server_backed => Some("Loading filterable fields…".to_string()),
+        Some(Err(error)) => Some(format!("Field index unavailable: {error}")),
+        _ => None,
+    };
+
+    let mut diagnostics: HashMap<NodeId, Vec<String>> = HashMap::new();
+    for diagnostic in &evaluation.diagnostics {
+        diagnostics
+            .entry(diagnostic.node_id)
+            .or_default()
+            .push(diagnostic.message.clone());
+    }
+
+    let last_valid = evaluation.matches.as_ref().map(HashSet::len);
+    // "1 node" / "2 nodes" — the count is user-facing copy, not a raw number.
+    let nodes_phrase = |count: usize| {
+        format!("{count} {}", if count == 1 { "node" } else { "nodes" })
+    };
+    let (status_title, status_detail) = match evaluation.phase {
+        EvalPhase::Idle => (
+            format!("All {node_count} nodes"),
+            "No active expression".to_string(),
+        ),
+        EvalPhase::Checking => (
+            "Checking changes…".to_string(),
+            last_valid
+                .map(|count| format!("Still showing {}", nodes_phrase(count)))
+                .unwrap_or_else(|| "Nothing applied yet".to_string()),
+        ),
+        EvalPhase::Applied => (
+            format!("{} matching", nodes_phrase(last_valid.unwrap_or_default())),
+            "Live".to_string(),
+        ),
+        EvalPhase::Invalid => {
+            let issue_count = evaluation.diagnostics.len();
+            (
+                format!(
+                    "{issue_count} {}",
+                    if issue_count == 1 { "issue" } else { "issues" }
+                ),
+                last_valid
+                    .map(|count| format!("Still showing {}", nodes_phrase(count)))
+                    .unwrap_or_else(|| "Fix the outline to apply it".to_string()),
+            )
         }
+    };
+    let status_class = format!("fil-status {}", phase_name(evaluation.phase));
+    let status_phase = phase_name(evaluation.phase);
+    let query_state = match evaluation.phase {
+        EvalPhase::Idle => "idle",
+        EvalPhase::Checking => "loading",
+        EvalPhase::Applied => "valid",
+        EvalPhase::Invalid => "invalid",
+    };
+    let last_valid_attr = last_valid
+        .map(|count| count.to_string())
+        .unwrap_or_default();
+    let behavior = *BEHAVIOR.read();
+    let filter_checked = if behavior == FilterBehavior::Filter {
+        "true"
+    } else {
+        "false"
+    };
+    let dim_checked = if behavior == FilterBehavior::Focus {
+        "true"
+    } else {
+        "false"
     };
 
     rsx! {
-        div { class: "fil",
+        div {
+            class: "fil",
+            "data-testid": "filter-builder",
+            "data-filter-phase": "{status_phase}",
+            "data-query-state": "{query_state}",
+            "data-match-count": "{last_valid_attr}",
             if !server_backed {
-                div { class: "fil-note",
-                    "Metadata filters are unavailable for this client-only graph. \
-                     Host the graph in graph-api before applying field buckets."
+                div { class: "fil-note warning", role: "note",
+                    "Search and metadata fields require a server-hosted graph. Existing rules stay editable."
                 }
             }
-            // Active (field, value) chips + combinators + Filter/Dim toggle —
-            // merged in from the former standalone "Filters" strip panel.
-            { active_filters_section(&q) }
+            if let Some(note) = index_note {
+                div { class: "fil-note", role: "status", "{note}" }
+            }
 
-            // Right-aligned reset row (ui/widgets.rs::reset_row): back to the
-            // default model — just the system search card, no active filters.
-            div { class: "fil-reset",
-                button { class: "fil-card-btn",
-                    onclick: move |_| edit_filters(|q| *q = QueryModel::default()),
-                    "↺ Reset"
+            header { class: "fil-toolbar",
+                div {
+                    class: "{status_class}",
+                    role: "status",
+                    "aria-live": "polite",
+                    "data-testid": "filter-evaluation",
+                    "data-phase": "{status_phase}",
+                    "data-applied-count": "{last_valid_attr}",
+                    "data-query-state": "{query_state}",
+                    "data-match-count": "{last_valid_attr}",
+                    span { class: "fil-status-dot", "aria-hidden": "true" }
+                    span { class: "fil-status-copy",
+                        strong { "{status_title}" }
+                        small { "{status_detail}" }
+                    }
+                }
+                div {
+                    class: "fil-behavior",
+                    role: "radiogroup",
+                    "aria-label": "How non-matching nodes are displayed",
+                    "data-testid": "filter-behavior",
+                    button {
+                        class: if behavior == FilterBehavior::Filter { "active" } else { "" },
+                        role: "radio",
+                        "aria-checked": "{filter_checked}",
+                        title: FilterBehavior::Filter.tooltip(),
+                        onclick: move |_| {
+                            if *BEHAVIOR.peek() != FilterBehavior::Filter {
+                                toggle_behavior();
+                            }
+                        },
+                        "Filter"
+                    }
+                    button {
+                        class: if behavior == FilterBehavior::Focus { "active" } else { "" },
+                        role: "radio",
+                        "aria-checked": "{dim_checked}",
+                        title: FilterBehavior::Focus.tooltip(),
+                        onclick: move |_| {
+                            if *BEHAVIOR.peek() != FilterBehavior::Focus {
+                                toggle_behavior();
+                            }
+                        },
+                        "Dim"
+                    }
+                }
+                button {
+                    class: "fil-reset",
+                    "data-testid": "filter-reset",
+                    "aria-label": "Clear the filter expression",
+                    onclick: move |_| {
+                        *active_palette.write() = None;
+                        edit_filters(QueryModel::clear);
+                    },
+                    "Clear all"
                 }
             }
 
-            // Card stream + tail "+".
-            div { class: "fil-cards",
-                for (i, card) in cards.into_iter().enumerate() {
-                    { card_el(i, card) }
-                }
-                button { class: "fil-card-btn fil-plus", title: "Add filter",
-                    onclick: move |_| edit_cards(append_filter),
-                    "+"
-                }
+            div { class: "fil-intro",
+                strong { "Build the logic as a sentence." }
+                span { "ALL means every line must match; ANY means at least one. Nest a group when a phrase needs its own logic." }
             }
 
-            // Secondary add-buttons row.
-            div { class: "fil-addrow",
-                button { class: "fil-card-btn",
-                    onclick: move |_| edit_cards(|q| q.cards.push(Card::Connector { op: ConnectorOp::And })),
-                    "+ and"
-                }
-                button { class: "fil-card-btn",
-                    onclick: move |_| edit_cards(|q| q.cards.push(Card::Connector { op: ConnectorOp::Or })),
-                    "+ or"
-                }
-                button { class: "fil-card-btn",
-                    onclick: move |_| edit_cards(|q| {
-                        q.cards.push(Card::ParenOpen);
-                        q.cards.push(Card::ParenClose);
-                    }),
-                    "+ ( )"
-                }
-                button { class: "fil-card-btn",
-                    onclick: move |_| edit_cards(|q| q.cards.push(Card::Not)),
-                    "+ not"
-                }
-                button { class: "fil-card-btn fil-clear",
-                    onclick: move |_| edit_filters(|q| q.clear()),
-                    "Clear"
-                }
+            section {
+                class: "fil-expression",
+                role: "tree",
+                "aria-label": "Filter expression",
+                "data-testid": "filter-expression",
+                {group_el(
+                    q.root(),
+                    true,
+                    0,
+                    None,
+                    &catalog,
+                    &evaluation,
+                    &diagnostics,
+                    signals,
+                    drag_source_now,
+                    drag_target_now,
+                )}
             }
+        }
+    }
+}
 
-            // Field/value bucket browser (FieldIndex from /graph/meta_summary).
-            if server_backed {
-              div { class: "fil-fields",
-                div { class: "fil-fhead",
-                    span { class: "fil-ftitle", "fields" }
-                    if active_total >= 1 {
-                        button { class: "fil-card-btn fil-clear fil-clearall",
-                            onclick: move |_| edit_filters(|q| q.clear_all_filters()),
-                            "clear all"
+#[allow(clippy::too_many_arguments)]
+fn group_el(
+    group: &RuleGroup,
+    root: bool,
+    depth: usize,
+    parent_id: Option<NodeId>,
+    catalog: &[FieldChoice],
+    evaluation: &EvaluationState,
+    diagnostics: &HashMap<NodeId, Vec<String>>,
+    signals: EditorSignals,
+    drag_source_now: Option<NodeId>,
+    drag_target_now: Option<DropIntent>,
+) -> Element {
+    let id = group.id;
+    let mode = group.mode;
+    let enabled = group.enabled;
+    let negated = group.negated;
+    let parent_attr = parent_id.map(|id| id.to_string()).unwrap_or_default();
+    let level = depth + 1;
+    let enabled_attr = if enabled { "true" } else { "false" };
+    let negated_attr = if negated { "true" } else { "false" };
+    let mode_attr = group_mode_name(mode);
+    let group_copy = match (mode, negated) {
+        (GroupMode::All, false) => "Every line below must match",
+        (GroupMode::Any, false) => "At least one line below must match",
+        (GroupMode::All, true) => "Exclude nodes matching every line below",
+        (GroupMode::Any, true) => "Exclude nodes matching any line below",
+    };
+    let mut class = if root {
+        "fil-group root".to_string()
+    } else {
+        "fil-group nested".to_string()
+    };
+    if !enabled {
+        class.push_str(" disabled");
+    }
+    if negated {
+        class.push_str(" negated");
+    }
+    if drag_target_now == Some(DropIntent::Inside(id)) {
+        class.push_str(" drop-inside");
+    }
+    let node_diagnostics = diagnostics.get(&id).cloned().unwrap_or_default();
+    let has_diagnostics = !node_diagnostics.is_empty();
+    let aria_invalid = if has_diagnostics { "true" } else { "false" };
+
+    let mut drag_start = signals.drag_source;
+    let mut drag_end_source = signals.drag_source;
+    let mut drag_end_target = signals.drag_target;
+    let drag_for_inside = signals.drag_source;
+    let mut target_for_inside = signals.drag_target;
+    let drop_source = signals.drag_source;
+    let mut drop_target = signals.drag_target;
+    let mut add_field_palette = signals.active_palette;
+    let field_add_disabled = catalog.is_empty();
+    let field_add_disabled_attr = if field_add_disabled { "true" } else { "false" };
+
+    rsx! {
+        section {
+            class: "{class}",
+            role: "treeitem",
+            "aria-level": "{level}",
+            "aria-expanded": "true",
+            "aria-disabled": if enabled { "false" } else { "true" },
+            "aria-invalid": "{aria_invalid}",
+            "data-testid": "filter-group",
+            "data-group-id": "{id}",
+            "data-expression": "group",
+            "data-expression-id": "{id}",
+            "data-expression-kind": "group",
+            "data-expression-depth": "{depth}",
+            "data-expression-parent": "{parent_attr}",
+            "data-expression-enabled": "{enabled_attr}",
+            "data-expression-negated": "{negated_attr}",
+            "data-expression-mode": "{mode_attr}",
+            "data-mode": "{mode_attr}",
+            header { class: "fil-group-head",
+                if !root {
+                    button {
+                        class: "fil-grab",
+                        draggable: "true",
+                        title: "Drag this group to reorder or nest it",
+                        "aria-label": "Drag group {id}",
+                        "aria-grabbed": if drag_source_now == Some(id) { "true" } else { "false" },
+                        ondragstart: move |event| {
+                            event.stop_propagation();
+                            *drag_start.write() = Some(id);
+                        },
+                        ondragend: move |_| {
+                            *drag_end_source.write() = None;
+                            *drag_end_target.write() = None;
+                        },
+                        "⠿"
+                    }
+                }
+                div { class: "fil-group-title",
+                    span { class: "fil-eyebrow", if root { "Root logic" } else { "Nested logic" } }
+                    div {
+                        class: "fil-mode",
+                        role: "group",
+                        "aria-label": "Choose whether all or any rules in this group must match",
+                        span { "Match" }
+                        button {
+                            class: if mode == GroupMode::All { "active" } else { "" },
+                            "aria-pressed": if mode == GroupMode::All { "true" } else { "false" },
+                            "data-testid": "filter-group-mode",
+                            "data-mode-target": "all",
+                            onclick: move |_| edit_filters(|query| {
+                                if let Some(group) = query.group_mut(id) {
+                                    group.mode = GroupMode::All;
+                                }
+                            }),
+                            "ALL"
+                        }
+                        button {
+                            class: if mode == GroupMode::Any { "active" } else { "" },
+                            "aria-pressed": if mode == GroupMode::Any { "true" } else { "false" },
+                            "data-testid": "filter-group-mode",
+                            "data-mode-target": "any",
+                            onclick: move |_| edit_filters(|query| {
+                                if let Some(group) = query.group_mut(id) {
+                                    group.mode = GroupMode::Any;
+                                }
+                            }),
+                            "ANY"
+                        }
+                    }
+                    small { "{group_copy}" }
+                }
+                {count_el(id, enabled, evaluation)}
+                div { class: "fil-actions", role: "group", "aria-label": "Group actions",
+                    button {
+                        class: if enabled { "fil-state active" } else { "fil-state" },
+                        title: if enabled { "Turn this group off without deleting it" } else { "Turn this group back on" },
+                        "aria-label": if enabled { "Disable group" } else { "Enable group" },
+                        "aria-pressed": "{enabled_attr}",
+                        onclick: move |_| toggle_enabled(id),
+                        if enabled { "On" } else { "Off" }
+                    }
+                    button {
+                        class: if negated { "fil-not active" } else { "fil-not" },
+                        title: "Invert the result of this whole group",
+                        "aria-label": "Negate group",
+                        "aria-pressed": "{negated_attr}",
+                        onclick: move |_| toggle_negated(id),
+                        "NOT"
+                    }
+                    if !root {
+                        button {
+                            class: "fil-icon",
+                            title: "Move group up",
+                            "aria-label": "Move group {id} up",
+                            onclick: move |_| edit_filters(|query| { query.move_by(id, -1); }),
+                            "↑"
+                        }
+                        button {
+                            class: "fil-icon",
+                            title: "Move group down",
+                            "aria-label": "Move group {id} down",
+                            onclick: move |_| edit_filters(|query| { query.move_by(id, 1); }),
+                            "↓"
+                        }
+                        button {
+                            class: "fil-icon danger",
+                            title: "Delete group and its rules",
+                            "aria-label": "Delete group {id}",
+                            onclick: move |_| edit_filters(|query| { query.remove(id); }),
+                            "×"
                         }
                     }
                 }
-                {fields_el}
-              }
             }
-        }
-    }
-}
-
-/// The active-filter strip: cross-field combinator + Filter/Dim behavior
-/// toggle in the header, one row per active field below. Empty state when no
-/// filters are active. (Merged in from the former `filter_strip.rs` panel; all
-/// mutations route through `edit_filters` so the GPU push stays in one place.)
-fn active_filters_section(q: &QueryModel) -> Element {
-    let behavior = *BEHAVIOR.read();
-    let total: usize = q.active_filters.by_field.values().map(|s| s.len()).sum();
-    if total == 0 {
-        return rsx! { div { class: "fst-empty", "no active filters" } };
-    }
-
-    let cross = q.active_filters.cross_field_combinator;
-    let cross_label = format!("{} fields", cross.label());
-    let behavior_label = behavior.label();
-    let behavior_tip = behavior.tooltip();
-
-    // Fields render in user-insertion order, not BTreeMap name order.
-    let order: Vec<String> = q
-        .active_filters
-        .insertion_order
-        .iter()
-        .filter(|f| q.active_filters.by_field.contains_key(*f))
-        .cloned()
-        .collect();
-
-    rsx! {
-        div { class: "fst",
-            div { class: "fst-head",
-                span { class: "fst-k", "match" }
-                button { class: "fst-toggle",
-                    title: "How field-level results combine: `all` = AND (intersect), `any` = OR (union).",
-                    onclick: move |_| {
-                        let next = cross.toggled();
-                        edit_filters(move |q| q.active_filters.cross_field_combinator = next);
-                    },
-                    "{cross_label}"
+            for message in node_diagnostics {
+                p {
+                    class: "fil-diagnostic",
+                    role: "alert",
+                    "data-testid": "filter-diagnostic",
+                    "data-diagnostic-node-id": "{id}",
+                    "{message}"
                 }
-                span { class: "fst-sep" }
-                // Filter / Dim behavior toggle.
-                span { class: "fst-k", "when matched:" }
-                button { class: "fst-toggle", title: "{behavior_tip}",
-                    onclick: move |_| toggle_behavior(),
-                    "{behavior_label}"
-                }
-                // Clear-all on the right — only worth a button from 2 chips up.
-                if total >= 2 {
-                    button { class: "fst-toggle fst-clear",
-                        onclick: move |_| edit_filters(|q| q.clear_all_filters()),
-                        "clear filters"
+            }
+            div {
+                class: "fil-group-children",
+                role: "group",
+                "data-testid": "filter-group-children",
+                "data-expression-group-id": "{id}",
+                "data-drop-target": "group",
+                ondragover: move |event| {
+                    if drag_for_inside.peek().is_some() {
+                        event.prevent_default();
+                        event.stop_propagation();
+                        if *target_for_inside.peek() != Some(DropIntent::Inside(id)) {
+                            *target_for_inside.write() = Some(DropIntent::Inside(id));
+                        }
                     }
-                }
-            }
-            div { class: "fst-rows",
-                for field in order {
-                    { active_field_row(q, field) }
-                }
-            }
-        }
-    }
-}
-
-/// One row per active field: `field_name [any|all] [chip] [chip] …`.
-fn active_field_row(q: &QueryModel, field: String) -> Element {
-    let combinator = q.active_filters.combinator_for(&field);
-    let comb_label = combinator.label();
-    let values: Vec<String> = q
-        .active_filters
-        .by_field
-        .get(&field)
-        .map(|s| s.iter().cloned().collect())
-        .unwrap_or_default();
-    // Only meaningful with ≥ 2 values; still rendered (greyed) otherwise so the
-    // affordance stays visible.
-    let multi = values.len() > 1;
-    let f_clear = field.clone();
-    let f_comb = field.clone();
-    rsx! {
-        div { class: "fst-row", key: "{field}",
-            // Field-name lozenge with ✕ — clears the whole field.
-            Badge {
-                field: "{field}",
-                value: "{field}",
-                kind: BadgeKind::Generic,
-                active: true,
-                with_x: true,
-                on_action: move |_| edit_filters(|q| q.clear_field(&f_clear)),
-            }
-            button {
-                class: if multi { "fst-toggle fst-comb" } else { "fst-toggle fst-comb dim" },
-                title: "Toggle how this field's values combine: `any` = OR (match any value), `all` = AND (match all values).",
-                onclick: move |_| {
-                    let next = combinator.toggled();
-                    edit_filters(|q| q.active_filters.set_combinator_for(&f_comb, next));
                 },
-                "{comb_label}"
-            }
-            // Value chips — click removes.
-            for value in values {
-                { active_chip(field.clone(), value) }
+                ondrop: move |event| {
+                    event.prevent_default();
+                    event.stop_propagation();
+                    if let Some(source_id) = *drop_source.peek() {
+                        edit_filters(|query| { query.move_to_group(source_id, id); });
+                    }
+                    *drop_target.write() = None;
+                },
+                if group.children.is_empty() {
+                    div { class: "fil-empty-drop",
+                        strong { "No rules yet" }
+                        span { "Add a line below, or drop one here." }
+                    }
+                }
+                for (index, child) in group.children.iter().enumerate() {
+                    {clause_el(
+                        child,
+                        index,
+                        group.children.len(),
+                        mode,
+                        depth + 1,
+                        id,
+                        catalog,
+                        evaluation,
+                        diagnostics,
+                        signals,
+                        drag_source_now,
+                        drag_target_now,
+                    )}
+                }
+                div { class: "fil-add", role: "group", "aria-label": "Add to this group",
+                    button {
+                        "data-testid": "filter-add-search",
+                        "data-expression-target": "{id}",
+                        onclick: move |_| edit_filters(|query| { query.add_search(id); }),
+                        span { "＋" }
+                        "Search"
+                    }
+                    button {
+                        "data-testid": "filter-add-field",
+                        "data-expression-target": "{id}",
+                        disabled: field_add_disabled,
+                        "aria-disabled": "{field_add_disabled_attr}",
+                        title: if field_add_disabled { "Filterable fields are still loading or unavailable" } else { "Add a field rule" },
+                        onclick: move |_| {
+                            let mut added = None;
+                            edit_filters(|query| {
+                                added = query.add_field(id, "");
+                            });
+                            if let Some(rule_id) = added {
+                                *add_field_palette.write() = Some(rule_id);
+                            }
+                        },
+                        span { "＋" }
+                        "Field"
+                    }
+                    button {
+                        "data-testid": "filter-add-group",
+                        "data-expression-target": "{id}",
+                        onclick: move |_| edit_filters(|query| { query.add_group(id); }),
+                        span { "＋" }
+                        "Group"
+                    }
+                    span { class: "fil-drop-hint", "Drop here to move into this group" }
+                }
             }
         }
     }
 }
 
-fn active_chip(field: String, value: String) -> Element {
-    let kind = badge_kind_for(&field);
-    let (f, v) = (field.clone(), value.clone());
+#[allow(clippy::too_many_arguments)]
+fn clause_el(
+    clause: &Clause,
+    index: usize,
+    sibling_count: usize,
+    parent_mode: GroupMode,
+    depth: usize,
+    parent_id: NodeId,
+    catalog: &[FieldChoice],
+    evaluation: &EvaluationState,
+    diagnostics: &HashMap<NodeId, Vec<String>>,
+    signals: EditorSignals,
+    drag_source_now: Option<NodeId>,
+    drag_target_now: Option<DropIntent>,
+) -> Element {
+    let id = clause.id();
+    let connector = group_connector(parent_mode);
+    let mut class = "fil-clause".to_string();
+    if drag_target_now == Some(DropIntent::Before(id)) {
+        class.push_str(" drop-before");
+    }
+    let drag_for_before = signals.drag_source;
+    let mut target_for_before = signals.drag_target;
+    let drop_source = signals.drag_source;
+    let mut drop_target = signals.drag_target;
     rsx! {
-        Badge {
-            key: "{value}",
-            field: "{field}",
-            value: "{value}",
-            kind,
-            active: true,
-            with_x: true,
-            on_action: move |_| edit_filters(|q| q.toggle_field_filter(&f, &v)),
+        div {
+            key: "{id}",
+            class: "{class}",
+            "data-drop-before-id": "{id}",
+            ondragover: move |event| {
+                if drag_for_before.peek().is_some() {
+                    event.prevent_default();
+                    event.stop_propagation();
+                    if *target_for_before.peek() != Some(DropIntent::Before(id)) {
+                        *target_for_before.write() = Some(DropIntent::Before(id));
+                    }
+                }
+            },
+            ondrop: move |event| {
+                event.prevent_default();
+                event.stop_propagation();
+                if let Some(source_id) = *drop_source.peek() {
+                    edit_filters(|query| { query.move_before(source_id, id); });
+                }
+                *drop_target.write() = None;
+            },
+            div { class: if index == 0 { "fil-junction first" } else { "fil-junction" },
+                if index > 0 {
+                    span {
+                        title: if parent_mode == GroupMode::All {
+                            "Both this line and its siblings must match"
+                        } else {
+                            "This line or one of its siblings must match"
+                        },
+                        "{connector}"
+                    }
+                } else if sibling_count > 1 {
+                    span { class: "sr-only", "First of {sibling_count} lines" }
+                }
+            }
+            match clause {
+                Clause::Rule(rule) => rule_el(
+                    rule,
+                    depth,
+                    parent_id,
+                    catalog,
+                    evaluation,
+                    diagnostics,
+                    signals,
+                    drag_source_now,
+                ),
+                Clause::Group(group) => group_el(
+                    group,
+                    false,
+                    depth,
+                    Some(parent_id),
+                    catalog,
+                    evaluation,
+                    diagnostics,
+                    signals,
+                    drag_source_now,
+                    drag_target_now,
+                ),
+            }
         }
     }
 }
 
-/// One card widget — same controls per variant as the egui renderer's
-/// `render_card`, with mutations routed through `edit_cards`/`delete_card`.
-fn card_el(i: usize, card: Card) -> Element {
-    match card {
-        Card::Search { value, regex } => {
-            let regex_label = if regex { ".*" } else { "abc" };
-            rsx! {
-                div { class: "fil-card",
-                    span { class: "fil-k", "search:" }
-                    input { class: "fil-in search", placeholder: "text…", value: "{value}",
-                        oninput: move |e| {
-                            let v = e.value();
-                            edit_cards(|q| {
-                                if let Some(Card::Search { value, .. }) = q.cards.get_mut(i) {
-                                    *value = v;
-                                }
-                            });
-                        },
-                    }
-                    button { class: "fil-card-btn", title: "Toggle regex",
-                        onclick: move |_| edit_cards(|q| {
-                            if let Some(Card::Search { regex, .. }) = q.cards.get_mut(i) {
-                                *regex = !*regex;
-                            }
-                        }),
-                        "{regex_label}"
-                    }
-                    // No delete: system card.
-                }
-            }
-        }
-        Card::Filter { field, op, value } => {
-            let op_label = op.label();
-            rsx! {
-                div { class: "fil-card",
-                    input { class: "fil-in field", placeholder: "field", value: "{field}",
-                        oninput: move |e| {
-                            let v = e.value();
-                            edit_cards(|q| {
-                                if let Some(Card::Filter { field, .. }) = q.cards.get_mut(i) {
-                                    *field = v;
-                                }
-                            });
-                        },
-                    }
-                    button { class: "fil-card-btn", title: "Cycle operator",
-                        onclick: move |_| edit_cards(|q| {
-                            if let Some(Card::Filter { op, .. }) = q.cards.get_mut(i) {
-                                *op = op.cycle();
-                            }
-                        }),
-                        "{op_label}"
-                    }
-                    input { class: "fil-in value", placeholder: "value", value: "{value}",
-                        oninput: move |e| {
-                            let v = e.value();
-                            edit_cards(|q| {
-                                if let Some(Card::Filter { value, .. }) = q.cards.get_mut(i) {
-                                    *value = v;
-                                }
-                            });
-                        },
-                    }
-                    button { class: "fil-card-btn", title: "Delete filter",
-                        onclick: move |_| delete_card(i),
-                        "×"
-                    }
-                }
-            }
-        }
-        Card::Connector { op } => {
-            let op_label = op.label();
-            rsx! {
-                div { class: "fil-card",
-                    button { class: "fil-card-btn fil-strong", title: "Click to toggle AND/OR",
-                        onclick: move |_| edit_cards(|q| {
-                            if let Some(Card::Connector { op }) = q.cards.get_mut(i) {
-                                *op = match *op {
-                                    ConnectorOp::And => ConnectorOp::Or,
-                                    ConnectorOp::Or => ConnectorOp::And,
-                                };
-                            }
-                        }),
-                        "{op_label}"
-                    }
-                    button { class: "fil-card-btn", title: "Delete connector",
-                        onclick: move |_| delete_card(i),
-                        "×"
-                    }
-                }
-            }
-        }
-        Card::ParenOpen => rsx! {
-            div { class: "fil-card",
-                span { class: "fil-glyph", "(" }
-                button { class: "fil-card-btn", title: "Delete paren pair",
-                    onclick: move |_| delete_card(i),
-                    "×"
-                }
-            }
-        },
-        Card::ParenClose => rsx! {
-            div { class: "fil-card",
-                span { class: "fil-glyph", ")" }
-                button { class: "fil-card-btn", title: "Delete paren pair",
-                    onclick: move |_| delete_card(i),
-                    "×"
-                }
-            }
-        },
-        Card::Not => rsx! {
-            div { class: "fil-card",
-                span { class: "fil-glyph", "not" }
-                button { class: "fil-card-btn", title: "Delete NOT",
-                    onclick: move |_| delete_card(i),
-                    "×"
-                }
-            }
-        },
+#[allow(clippy::too_many_arguments)]
+fn rule_el(
+    rule: &Rule,
+    depth: usize,
+    parent_id: NodeId,
+    catalog: &[FieldChoice],
+    evaluation: &EvaluationState,
+    diagnostics: &HashMap<NodeId, Vec<String>>,
+    signals: EditorSignals,
+    drag_source_now: Option<NodeId>,
+) -> Element {
+    let id = rule.id;
+    let enabled = rule.enabled;
+    let negated = rule.negated;
+    let level = depth + 1;
+    let enabled_attr = if enabled { "true" } else { "false" };
+    let negated_attr = if negated { "true" } else { "false" };
+    let kind_attr = match rule.kind {
+        RuleKind::Search { .. } => "search",
+        RuleKind::Field { .. } => "field",
+    };
+    let node_diagnostics = diagnostics.get(&id).cloned().unwrap_or_default();
+    let has_diagnostics = !node_diagnostics.is_empty();
+    let aria_invalid = if has_diagnostics { "true" } else { "false" };
+    let mut class = "fil-rule".to_string();
+    if !enabled {
+        class.push_str(" disabled");
     }
+    if negated {
+        class.push_str(" negated");
+    }
+    if has_diagnostics {
+        class.push_str(" invalid");
+    }
+    let mut drag_start = signals.drag_source;
+    let mut drag_end_source = signals.drag_source;
+    let mut drag_end_target = signals.drag_target;
+    let mut palette_on_delete = signals.active_palette;
+
+    rsx! {
+        article {
+            class: "{class}",
+            role: "treeitem",
+            "aria-level": "{level}",
+            "aria-disabled": if enabled { "false" } else { "true" },
+            "aria-invalid": "{aria_invalid}",
+            "data-testid": "filter-rule",
+            "data-rule-id": "{id}",
+            "data-rule-kind": "{kind_attr}",
+            "data-expression": "{kind_attr}",
+            "data-expression-id": "{id}",
+            "data-expression-kind": "{kind_attr}",
+            "data-expression-depth": "{depth}",
+            "data-expression-parent": "{parent_id}",
+            "data-expression-enabled": "{enabled_attr}",
+            "data-expression-negated": "{negated_attr}",
+            div { class: "fil-rule-main",
+                button {
+                    class: "fil-grab",
+                    draggable: "true",
+                    title: "Drag this rule to reorder or move it into another group",
+                    "aria-label": "Drag {kind_attr} rule {id}",
+                    "aria-grabbed": if drag_source_now == Some(id) { "true" } else { "false" },
+                    ondragstart: move |event| {
+                        event.stop_propagation();
+                        *drag_start.write() = Some(id);
+                    },
+                    ondragend: move |_| {
+                        *drag_end_source.write() = None;
+                        *drag_end_target.write() = None;
+                    },
+                    "⠿"
+                }
+                button {
+                    class: if enabled { "fil-state active" } else { "fil-state" },
+                    title: if enabled { "Turn this rule off without deleting it" } else { "Turn this rule back on" },
+                    "aria-label": if enabled { "Disable rule" } else { "Enable rule" },
+                    "aria-pressed": "{enabled_attr}",
+                    onclick: move |_| toggle_enabled(id),
+                    if enabled { "On" } else { "Off" }
+                }
+                span { class: "fil-rule-kind", "{kind_attr}" }
+                div { class: "fil-rule-editor",
+                    {rule_editor(rule, catalog, has_diagnostics, signals)}
+                }
+                {count_el(id, enabled, evaluation)}
+                div { class: "fil-actions", role: "group", "aria-label": "Rule actions",
+                    button {
+                        class: if negated { "fil-not active" } else { "fil-not" },
+                        title: "Invert this rule",
+                        "aria-label": "Negate rule",
+                        "aria-pressed": "{negated_attr}",
+                        onclick: move |_| toggle_negated(id),
+                        "NOT"
+                    }
+                    button {
+                        class: "fil-icon",
+                        title: "Move rule up",
+                        "aria-label": "Move rule {id} up",
+                        onclick: move |_| edit_filters(|query| { query.move_by(id, -1); }),
+                        "↑"
+                    }
+                    button {
+                        class: "fil-icon",
+                        title: "Move rule down",
+                        "aria-label": "Move rule {id} down",
+                        onclick: move |_| edit_filters(|query| { query.move_by(id, 1); }),
+                        "↓"
+                    }
+                    button {
+                        class: "fil-icon danger",
+                        title: "Delete rule",
+                        "aria-label": "Delete rule {id}",
+                        onclick: move |_| {
+                            if *palette_on_delete.peek() == Some(id) {
+                                *palette_on_delete.write() = None;
+                            }
+                            edit_filters(|query| { query.remove(id); });
+                        },
+                        "×"
+                    }
+                }
+            }
+            for message in node_diagnostics {
+                p {
+                    class: "fil-diagnostic",
+                    role: "alert",
+                    "data-testid": "filter-diagnostic",
+                    "data-diagnostic-node-id": "{id}",
+                    "{message}"
+                }
+            }
+            if let RuleKind::Field { field, op, value } = &rule.kind {
+                if *signals.active_palette.read() == Some(id) {
+                    {field_palette(id, field, *op, value, catalog, signals.active_palette)}
+                }
+            }
+        }
+    }
+}
+
+fn rule_editor(
+    rule: &Rule,
+    catalog: &[FieldChoice],
+    invalid: bool,
+    signals: EditorSignals,
+) -> Element {
+    let id = rule.id;
+    let aria_invalid = if invalid { "true" } else { "false" };
+    match &rule.kind {
+        RuleKind::Search { query } => {
+            let mut active_palette = signals.active_palette;
+            rsx! {
+                label { class: "sr-only", r#for: "fil-search-{id}", "Search query" }
+                input {
+                    id: "fil-search-{id}",
+                    class: "fil-input search",
+                    r#type: "search",
+                    value: "{query}",
+                    placeholder: "words, phrase, or search syntax…",
+                    "aria-invalid": "{aria_invalid}",
+                    "data-testid": "filter-search-query",
+                    "data-expression-input": "query",
+                    onfocus: move |_| *active_palette.write() = None,
+                    oninput: move |event| {
+                        let value = event.value();
+                        edit_filters(|model| {
+                            if let Some(rule) = model.rule_mut(id) {
+                                rule.kind = RuleKind::Search { query: value };
+                            }
+                        });
+                    },
+                }
+            }
+        }
+        RuleKind::Field { field, op, value } => {
+            let selected_known = catalog.iter().any(|choice| choice.name == *field);
+            let datalist_id = format!("fil-values-{id}");
+            let palette_open = *signals.active_palette.peek() == Some(id);
+            let mut field_palette_signal = signals.active_palette;
+            let mut value_palette_signal = signals.active_palette;
+            let mut palette_button_signal = signals.active_palette;
+            rsx! {
+                label { class: "sr-only", r#for: "fil-field-{id}", "Field" }
+                select {
+                    id: "fil-field-{id}",
+                    class: "fil-select field",
+                    "aria-label": "Field",
+                    "aria-invalid": "{aria_invalid}",
+                    "data-testid": "filter-field-name",
+                    "data-expression-input": "field",
+                    onfocus: move |_| *field_palette_signal.write() = Some(id),
+                    onchange: move |event| {
+                        let next = event.value();
+                        edit_filters(|model| {
+                            if let Some(Rule { kind: RuleKind::Field { field, value, .. }, .. }) = model.rule_mut(id) {
+                                if *field != next {
+                                    *field = next;
+                                    value.clear();
+                                }
+                            }
+                        });
+                    },
+                    option { value: "", selected: field.is_empty(), "Choose field…" }
+                    if !field.is_empty() && !selected_known {
+                        option { value: "{field}", selected: true, "{field} · unavailable" }
+                    }
+                    for choice in catalog {
+                        option {
+                            key: "{choice.name}",
+                            value: "{choice.name}",
+                            selected: choice.name == *field,
+                            {format!("{} · {} values", choice.name, choice.values.len())}
+                        }
+                    }
+                }
+                label { class: "sr-only", r#for: "fil-op-{id}", "Operator" }
+                select {
+                    id: "fil-op-{id}",
+                    class: "fil-select op",
+                    "aria-label": "Operator",
+                    "data-testid": "filter-field-operator",
+                    "data-expression-input": "operator",
+                    onchange: move |event| {
+                        let next = parse_op(&event.value());
+                        edit_filters(|model| {
+                            if let Some(Rule { kind: RuleKind::Field { op, .. }, .. }) = model.rule_mut(id) {
+                                *op = next;
+                            }
+                        });
+                    },
+                    for candidate in [Op::Eq, Op::Neq, Op::Contains, Op::Matches] {
+                        option {
+                            value: "{op_token(candidate)}",
+                            selected: candidate == *op,
+                            "{op_name(candidate)}"
+                        }
+                    }
+                }
+                label { class: "sr-only", r#for: "fil-value-{id}", "Value" }
+                input {
+                    id: "fil-value-{id}",
+                    class: "fil-input value",
+                    r#type: "text",
+                    value: "{value}",
+                    list: "{datalist_id}",
+                    placeholder: if *op == Op::Matches { "regular expression…" } else { "value…" },
+                    "aria-label": "Value",
+                    "aria-invalid": "{aria_invalid}",
+                    "aria-autocomplete": "list",
+                    "data-testid": "filter-field-value",
+                    "data-expression-input": "value",
+                    onfocus: move |_| *value_palette_signal.write() = Some(id),
+                    oninput: move |event| {
+                        let next = event.value();
+                        edit_filters(|model| {
+                            if let Some(Rule { kind: RuleKind::Field { value, .. }, .. }) = model.rule_mut(id) {
+                                *value = next;
+                            }
+                        });
+                    },
+                }
+                datalist { id: "{datalist_id}",
+                    if let Some(choice) = catalog.iter().find(|choice| choice.name == *field) {
+                        for (candidate, count) in choice.values.iter().take(200) {
+                            option { value: "{candidate}", label: "{count} nodes" }
+                        }
+                    }
+                }
+                button {
+                    class: if palette_open { "fil-palette-toggle active" } else { "fil-palette-toggle" },
+                    title: "Browse fields and known values with node counts",
+                    "aria-label": "Browse field values",
+                    "aria-expanded": if palette_open { "true" } else { "false" },
+                    "aria-controls": "fil-palette-{id}",
+                    "data-testid": "filter-value-palette-toggle",
+                    onclick: move |_| {
+                        let next = if *palette_button_signal.peek() == Some(id) { None } else { Some(id) };
+                        *palette_button_signal.write() = next;
+                    },
+                    "▾"
+                }
+            }
+        }
+    }
+}
+
+fn field_palette(
+    id: NodeId,
+    field: &str,
+    op: Op,
+    value: &str,
+    catalog: &[FieldChoice],
+    mut active_palette: Signal<Option<NodeId>>,
+) -> Element {
+    let current = catalog.iter().find(|choice| choice.name == field);
+    let needle = value.to_lowercase();
+    let suggestions: Vec<(String, usize)> = current
+        .map(|choice| {
+            choice
+                .values
+                .iter()
+                .filter(|(candidate, _)| {
+                    needle.trim().is_empty()
+                        || op == Op::Matches
+                        || candidate.to_lowercase().contains(&needle)
+                })
+                .take(40)
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default();
+    let palette_title = current
+        .map(|choice| {
+            format!(
+                "{} known values across {} nodes",
+                choice.values.len(),
+                choice.node_count
+            )
+        })
+        .unwrap_or_else(|| "Choose a filterable field".to_string());
+
+    rsx! {
+        div {
+            id: "fil-palette-{id}",
+            class: "fil-context",
+            role: "region",
+            "aria-label": "Field and value palette",
+            "data-testid": "filter-value-palette",
+            "data-expression-id": "{id}",
+            div { class: "fil-context-head",
+                div {
+                    strong { "Data palette" }
+                    small { "{palette_title}" }
+                }
+                button {
+                    class: "fil-icon",
+                    "aria-label": "Close field and value palette",
+                    onclick: move |_| *active_palette.write() = None,
+                    "×"
+                }
+            }
+            div {
+                class: "fil-field-palette",
+                role: "listbox",
+                "aria-label": "Filterable fields",
+                for choice in catalog {
+                    {
+                        let field_name = choice.name.clone();
+                        let selected = choice.name == field;
+                        rsx! {
+                            button {
+                                key: "{choice.name}",
+                                class: if selected { "active" } else { "" },
+                                role: "option",
+                                "aria-selected": if selected { "true" } else { "false" },
+                                "data-field": "{choice.name}",
+                                "data-field-value-count": "{choice.values.len()}",
+                                "data-field-node-count": "{choice.node_count}",
+                                onclick: move |_| edit_filters(|model| {
+                                    if let Some(Rule { kind: RuleKind::Field { field, value, .. }, .. }) = model.rule_mut(id) {
+                                        if *field != field_name {
+                                            field.clone_from(&field_name);
+                                            value.clear();
+                                        }
+                                    }
+                                }),
+                                span { "{choice.name}" }
+                                small { {format!("{}v · {}n", choice.values.len(), choice.node_count)} }
+                            }
+                        }
+                    }
+                }
+            }
+            if let Some(choice) = current {
+                div { class: "fil-value-head",
+                    span { "Known {choice.name} values" }
+                    if !needle.trim().is_empty() && op != Op::Matches {
+                        small { "containing “{value}”" }
+                    }
+                }
+                div {
+                    class: "fil-value-palette",
+                    role: "listbox",
+                    "aria-label": "Known values for {choice.name}",
+                    if suggestions.is_empty() {
+                        span { class: "fil-palette-empty", "No known values match this draft. You can still use the typed value." }
+                    }
+                    for (candidate, count) in suggestions {
+                        {
+                            let next_value = candidate.clone();
+                            let selected = candidate == value;
+                            rsx! {
+                                button {
+                                    key: "{candidate}",
+                                    class: if selected { "active" } else { "" },
+                                    role: "option",
+                                    "aria-selected": if selected { "true" } else { "false" },
+                                    "data-value": "{candidate}",
+                                    "data-value-node-count": "{count}",
+                                    onclick: move |_| edit_filters(|model| {
+                                        if let Some(Rule { kind: RuleKind::Field { value, .. }, .. }) = model.rule_mut(id) {
+                                            value.clone_from(&next_value);
+                                        }
+                                    }),
+                                    span { "{candidate}" }
+                                    small { "{count}" }
+                                }
+                            }
+                        }
+                    }
+                }
+                if choice.values.len() > 40 && needle.trim().is_empty() {
+                    div { class: "fil-palette-more", "Showing the 40 most common values. Type to narrow the palette." }
+                }
+            }
+        }
+    }
+}
+
+fn count_el(id: NodeId, enabled: bool, evaluation: &EvaluationState) -> Element {
+    if !enabled {
+        return rsx! {
+            output {
+                class: "fil-count off",
+                "data-testid": "filter-match-count",
+                "data-expression-count": "",
+                "data-match-count": "",
+                "data-count": "",
+                "off"
+            }
+        };
+    }
+    let Some(count) = evaluation.counts.get(&id).copied() else {
+        return if evaluation.phase == EvalPhase::Checking {
+            rsx! {
+                output {
+                    class: "fil-count pending",
+                    "data-testid": "filter-match-count",
+                    "data-expression-count": "",
+                    "data-match-count": "",
+                    "data-count": "",
+                    "aria-label": "Result count pending",
+                    "…"
+                }
+            }
+        } else {
+            rsx! {}
+        };
+    };
+    let stale = matches!(evaluation.phase, EvalPhase::Checking | EvalPhase::Invalid);
+    let noun = if count == 1 { "node" } else { "nodes" };
+    rsx! {
+        output {
+            class: if stale { "fil-count stale" } else { "fil-count" },
+            title: if stale { "Count from the last valid expression" } else { "Live subtree match count" },
+            "aria-label": if stale {
+                format!("{count} {noun} in the last valid expression")
+            } else {
+                format!("{count} matching {noun}")
+            },
+            "data-testid": "filter-match-count",
+            "data-expression-count": "{count}",
+            "data-match-count": "{count}",
+            "data-count": "{count}",
+            "data-expression-count-stale": if stale { "true" } else { "false" },
+            "data-evaluation-version": "{evaluation.applied_version}",
+            "{count} {noun}"
+        }
+    }
+}
+
+fn toggle_enabled(id: NodeId) {
+    edit_filters(|query| {
+        if id == query.root().id {
+            let enabled = query.root().enabled;
+            query.root_mut().enabled = !enabled;
+        } else {
+            query.toggle_enabled(id);
+        }
+    });
+}
+
+fn toggle_negated(id: NodeId) {
+    edit_filters(|query| {
+        if id == query.root().id {
+            let negated = query.root().negated;
+            query.root_mut().negated = !negated;
+        } else {
+            query.toggle_negated(id);
+        }
+    });
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{ActiveFieldFilters, Card, Combinator, FieldIndex, Op, QueryModel};
-    use std::collections::{BTreeSet, HashMap, HashSet};
-
-    fn index() -> FieldIndex {
-        FieldIndex {
-            by_field: HashMap::from([
-                ("tags".into(), HashMap::from([
-                    ("rust".into(), vec![0, 1, 3]),
-                    ("gpu".into(), vec![1, 2]),
-                ])),
-                ("folder".into(), HashMap::from([
-                    ("work".into(), vec![1, 3]),
-                    ("home".into(), vec![0, 2]),
-                ])),
-            ]),
-        }
-    }
-
-    fn values(items: &[&str]) -> BTreeSet<String> {
-        items.iter().map(|v| (*v).to_string()).collect()
-    }
-
-    #[test]
-    fn defaults_union_values_and_intersect_fields() {
-        let filters = ActiveFieldFilters {
-            by_field: [
-                ("tags".into(), values(&["rust", "gpu"])),
-                ("folder".into(), values(&["work"])),
-            ].into_iter().collect(),
-            ..Default::default()
-        };
-        assert_eq!(index().matches(&filters), Some(HashSet::from([1, 3])));
-    }
-
-    #[test]
-    fn all_within_a_multivalue_field_intersects_buckets() {
-        let mut filters = ActiveFieldFilters {
-            by_field: [("tags".into(), values(&["rust", "gpu"]))].into_iter().collect(),
-            ..Default::default()
-        };
-        filters.set_combinator_for("tags", Combinator::All);
-        assert_eq!(index().matches(&filters), Some(HashSet::from([1])));
-    }
-
-    #[test]
-    fn cross_field_any_unions_field_results() {
-        let filters = ActiveFieldFilters {
-            by_field: [
-                ("tags".into(), values(&["rust"])),
-                ("folder".into(), values(&["home"])),
-            ].into_iter().collect(),
-            cross_field_combinator: Combinator::Any,
-            ..Default::default()
-        };
-        assert_eq!(index().matches(&filters), Some(HashSet::from([0, 1, 2, 3])));
-    }
-
-    #[test]
-    fn unknown_persisted_values_do_not_destroy_known_matches() {
-        let filters = ActiveFieldFilters {
-            by_field: [("tags".into(), values(&["rust", "removed-tag"]))]
-                .into_iter().collect(),
-            ..Default::default()
-        };
-        assert_eq!(index().matches(&filters), Some(HashSet::from([0, 1, 3])));
-    }
+    // The v1 facet-combinator semantics these used to assert against the
+    // panel-local index now run through migration + `evaluate` in
+    // `jump-cannon-filter-model` (the `v1_*` tests there), which is the code
+    // path the panel actually uses.
+    use super::{Card, Op, QueryModel};
 
     #[test]
     fn query_reset_removes_cards_and_active_filters() {
@@ -1136,7 +1599,8 @@ mod tests {
         });
         query.toggle_field_filter("tags", "rust");
         query.clear();
-        assert!(matches!(query.cards.as_slice(), [Card::Search { value, regex: false }] if value.is_empty()));
+        assert!(query.cards.is_empty());
+        assert!(query.root().children.is_empty());
         assert!(query.active_filters.by_field.is_empty());
         assert!(query.active_filters.insertion_order.is_empty());
     }

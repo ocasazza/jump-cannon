@@ -618,6 +618,11 @@ fn App() -> Element {
         logs: use_signal(Vec::new),
     };
 
+    // Query evaluation is app-owned rather than panel-owned: persisted
+    // expressions and mutations from badges/palette actions must keep applying
+    // even when the Filter panel is minimized or never mounted.
+    panels::filter::use_query_evaluator(ctx);
+
     // Resilient initial load: retry until the backend answers, so a server
     // that's still indexing (or starting up) self-heals instead of leaving
     // the canvas permanently empty.

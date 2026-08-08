@@ -343,6 +343,7 @@
             install -m 0644 "$RUN_OUT/boot.png" "$OUT_DIR/boot.png"
             install -m 0644 "$RUN_OUT/nodes-editor.png" "$OUT_DIR/nodes-editor.png"
             install -m 0644 "$RUN_OUT/settings-importers.png" "$OUT_DIR/settings-importers.png"
+            install -m 0644 "$RUN_OUT/filter-builder.png" "$OUT_DIR/filter-builder.png"
             install -m 0644 "$RUN_OUT/report.json" "$OUT_DIR/report.json"
           '';
         };

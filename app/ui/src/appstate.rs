@@ -166,7 +166,9 @@ pub(crate) fn apply(state: &AppState, source: &str) {
     let len = storage.length().unwrap_or(0);
     let mut stale = Vec::new();
     for i in 0..len {
-        let Ok(Some(key)) = storage.key(i) else { continue };
+        let Ok(Some(key)) = storage.key(i) else {
+            continue;
+        };
         if key.starts_with(STATE_PREFIX)
             && !COVERED_KEYS.contains(&key.as_str())
             && !state.extra.contains_key(&key)
@@ -190,7 +192,9 @@ fn capture_extra() -> BTreeMap<String, String> {
     let mut map = BTreeMap::new();
     let len = storage.length().unwrap_or(0);
     for i in 0..len {
-        let Ok(Some(key)) = storage.key(i) else { continue };
+        let Ok(Some(key)) = storage.key(i) else {
+            continue;
+        };
         if !key.starts_with(STATE_PREFIX) || COVERED_KEYS.contains(&key.as_str()) {
             continue;
         }
@@ -345,8 +349,8 @@ pub(crate) fn restore_snapshot(idx: usize) -> Result<(), String> {
         .get(idx)
         .cloned()
         .ok_or_else(|| "no such snapshot".to_string())?;
-    let state: AppState = serde_json::from_str(&entry.state_json)
-        .map_err(|e| format!("restore failed: {e}"))?;
+    let state: AppState =
+        serde_json::from_str(&entry.state_json).map_err(|e| format!("restore failed: {e}"))?;
     apply(
         &state,
         &format!("restore @ {}", format_timestamp_ms(entry.timestamp_ms)),
@@ -509,7 +513,9 @@ fn js_get(obj: &wasm_bindgen::JsValue, key: &str) -> Option<wasm_bindgen::JsValu
 fn location_part(key: &str) -> Option<String> {
     let win = web_sys::window()?;
     let win: &wasm_bindgen::JsValue = win.as_ref();
-    js_get(win, "location").and_then(|l| js_get(&l, key))?.as_string()
+    js_get(win, "location")
+        .and_then(|l| js_get(&l, key))?
+        .as_string()
 }
 
 pub(crate) fn reload_page() {

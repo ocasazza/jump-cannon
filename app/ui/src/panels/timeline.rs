@@ -676,7 +676,14 @@ mod tests {
     use super::{Frame, FrameRing};
 
     fn frame(seed: f32) -> Vec<f32> {
-        vec![seed, seed + 1.0, seed + 2.0, seed + 3.0, seed + 4.0, seed + 5.0]
+        vec![
+            seed,
+            seed + 1.0,
+            seed + 2.0,
+            seed + 3.0,
+            seed + 4.0,
+            seed + 5.0,
+        ]
     }
 
     #[test]

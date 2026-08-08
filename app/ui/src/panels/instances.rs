@@ -96,7 +96,9 @@ fn copy_to_clipboard(text: &str) {
 fn page_origin() -> Option<String> {
     let win = web_sys::window()?;
     let win: &JsValue = win.as_ref();
-    js_get(win, "location").and_then(|l| js_get(&l, "origin"))?.as_string()
+    js_get(win, "location")
+        .and_then(|l| js_get(&l, "origin"))?
+        .as_string()
 }
 
 /// Anchor-triggered data-URL download (the egui port uses a Blob; data URLs
@@ -108,7 +110,10 @@ fn download_text(filename: &str, mime: &str, contents: &str) -> Result<(), Strin
     let anchor = doc
         .create_element("a")
         .map_err(|e| format!("create anchor: {e:?}"))?;
-    let href = format!("data:{mime};charset=utf-8,{}", urlencoding::encode(contents));
+    let href = format!(
+        "data:{mime};charset=utf-8,{}",
+        urlencoding::encode(contents)
+    );
     anchor
         .set_attribute("href", &href)
         .map_err(|e| format!("href: {e:?}"))?;
@@ -147,7 +152,10 @@ fn view_preset(name: String) {
             *PREFS.write() = prefs;
         }
     }
-    *PRESET_VIEW.write() = Some(PresetView { name: name.clone(), content: None });
+    *PRESET_VIEW.write() = Some(PresetView {
+        name: name.clone(),
+        content: None,
+    });
     spawn(async move {
         let res = get_text(&format!("/configs/{name}")).await;
         let mut view = PRESET_VIEW.write();

@@ -261,6 +261,11 @@ fn reapply_ctl_state() {
         pipes.set_selected(queue, highlights.as_ref());
         pipes.set_sim_running(sim_running);
     });
+    // Filter evaluation lives outside renderer mount state. Reapply its last
+    // valid result after a canvas/host rebuild just as we do selection and
+    // simulation state above. Anchored node focus observes mount_generation
+    // and, when active, overwrites this base filter dispatch on its next tick.
+    crate::panels::filter::sync_gpu();
 }
 
 /// The continuous frame loop. Started once; runs for the lifetime of the

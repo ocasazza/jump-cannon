@@ -16,11 +16,16 @@ bundle.
 7. Flat/Tags round-trips preserve selection, exact multi-tag groups contain
    one row per node, synthetic `(untagged)` is present, core schema keys remain
    visible, and the controls stay below the panel header in floating and tiling.
-8. Unified Settings exposes four accessible, content-backed tabs; restoring it
+8. Unified Settings exposes five accessible, content-backed tabs; restoring it
    remounts a render-ready Graph canvas.
-9. CDP resource errors, console errors, Rust tracing errors, and unhandled
+9. Filter restores from the dock into a maximized Boolean builder with
+   repeatable Search and field rules, live All/Any subtree counts, inline
+   syntax diagnostics that preserve the last valid result, and accessible
+   reorder controls; restoring the workspace remounts Graph afterward.
+10. CDP resource errors, console errors, Rust tracing errors, and unhandled
    exceptions fail the run.
-10. Screenshots are written to `<out-dir>/nodes-editor.png` and `boot.png`.
+11. Screenshots are written to `<out-dir>/nodes-editor.png`,
+   `filter-builder.png`, and `boot.png`.
    Pixel content is reviewed rather than asserted.
 
 On Linux, the harness uses Vulkan for WebGPU compute while disabling the
@@ -45,9 +50,12 @@ edits.
 
 Output lands in `target/test-browser-rust/`:
 - `nodes-editor.png` — Nodes workbench with tag hierarchy and focused content
+- `filter-builder.png` — maximized Filter builder with nested Boolean rules
+- `settings-importers.png` — deployment-managed importer catalog
 - `boot.png` — screenshot at the moment all assertions passed
 - `report.json` — JSON including structured `nodes_editor`, `settings_tabs`,
-  `graph_header_actions`, canvas, boot-log, and browser-error results
+  `filter_builder`, `graph_header_actions`, canvas, boot-log, and browser-error
+  results
 
 ## CLI
 

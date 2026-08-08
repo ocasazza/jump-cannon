@@ -1286,17 +1286,42 @@ impl GraphPipelines {
         queue.write_buffer(&b.dim_alpha, 0, bytemuck::cast_slice(&out));
     }
 
+    /// Push the filter evaluator's soft-focus mask. This deliberately keeps
+    /// `None` (no applied expression) distinct from `Some(empty)` (a valid
+    /// expression matching zero nodes): the former clears dimming, while the
+    /// latter dims every node.
+    pub fn set_filter_focus_set(
+        &mut self,
+        queue: &wgpu::Queue,
+        matching: Option<&std::collections::HashSet<u32>>,
+    ) {
+        let Some(b) = self.buffers.as_mut() else {
+            return;
+        };
+        let n = b.n_nodes as usize;
+        if n == 0 {
+            return;
+        }
+        let mut out: Vec<f32> = vec![1.0; n];
+        if let Some(set) = matching {
+            out.fill(0.25);
+            for &m in set {
+                if (m as usize) < n {
+                    out[m as usize] = 1.0;
+                }
+            }
+        }
+        queue.write_buffer(&b.dim_alpha, 0, bytemuck::cast_slice(&out));
+    }
+
     /// Push the per-node filter mask. Unlike [`Self::set_focus_set`], this
     /// writes a *hard* 0.0 for non-matching nodes, which the node/edge
     /// shaders interpret as "discard" — non-matching nodes (and edges
     /// touching them) disappear entirely rather than dimming.
     ///
     /// - `matching == None`: filter cleared → all 1.0.
-    /// - `matching == Some(set)` with non-empty set: 1.0 for indices in
-    ///   the set, 0.0 otherwise.
-    /// - `matching == Some(empty)`: treat as a no-op (all 1.0) so the user
-    ///   doesn't end up with a black screen when a filter accidentally
-    ///   matches zero nodes. A warning is logged.
+    /// - `matching == Some(set)`: 1.0 for indices in the set, 0.0 otherwise;
+    ///   an empty set therefore hides every node.
     pub fn set_filter_mask(
         &mut self,
         queue: &wgpu::Queue,
@@ -1310,22 +1335,11 @@ impl GraphPipelines {
             return;
         }
         let mut out: Vec<f32> = vec![1.0; n];
-        match matching {
-            None => {}
-            Some(set) if set.is_empty() => {
-                tracing::warn!(
-                    "[render] set_filter_mask: empty match set; \
-                     leaving all nodes visible to avoid a black screen"
-                );
-            }
-            Some(set) => {
-                for v in out.iter_mut() {
-                    *v = 0.0;
-                }
-                for &m in set {
-                    if (m as usize) < n {
-                        out[m as usize] = 1.0;
-                    }
+        if let Some(set) = matching {
+            out.fill(0.0);
+            for &m in set {
+                if (m as usize) < n {
+                    out[m as usize] = 1.0;
                 }
             }
         }

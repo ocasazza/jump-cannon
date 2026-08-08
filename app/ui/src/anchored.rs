@@ -169,10 +169,8 @@ pub(crate) fn compute_focus_set(
             }
         }
         FocusMode::Filter => {
-            if let Some(Ok(fi)) = filter::FIELD_INDEX.peek().as_ref() {
-                if let Some(matched) = fi.matches(&filter::QUERY.peek().active_filters) {
-                    set.extend(matched);
-                }
+            if let Some(matched) = filter::current_matches() {
+                set.extend(matched);
             }
         }
     }
@@ -343,11 +341,7 @@ fn pick_allowed(idx: u32) -> bool {
     if !matches!(*filter::BEHAVIOR.peek(), FilterBehavior::Filter) {
         return true;
     }
-    filter::FIELD_INDEX
-        .peek()
-        .as_ref()
-        .and_then(|r| r.as_ref().ok())
-        .and_then(|fi| fi.matches(&filter::QUERY.peek().active_filters))
+    filter::current_matches()
         .map(|set| set.contains(&idx))
         .unwrap_or(true)
 }
@@ -517,27 +511,13 @@ fn kick_promoted_fetch(id: String) {
 
 // --- driver loop ----------------------------------------------------------------
 
-/// Stable signature of the active filter set + behavior, so a chip toggle
-/// re-runs the focus push even when `focused` is unchanged (app.rs
-/// filter_sig — BTreeMap iteration keeps the hash deterministic). It also
-/// repairs the dim mask after `filter::sync_gpu` clobbers a node-focus
-/// write (the egui app re-ran change-detected every frame; here the next
-/// 16 ms tick catches it).
+/// Stable signature of the last successfully applied expression + behavior.
+/// Draft edits do not disturb the active focus set until validation/evaluation
+/// succeeds. It also repairs the dim mask after `filter::sync_gpu` clobbers a
+/// node-focus write (the egui app re-ran change-detected every frame; here the
+/// next 16 ms tick catches it).
 fn filter_sig() -> u64 {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    let q = filter::QUERY.peek();
-    let mut h = DefaultHasher::new();
-    for (k, vs) in q.active_filters.by_field.iter() {
-        k.hash(&mut h);
-        for v in vs.iter() {
-            v.hash(&mut h);
-        }
-        (q.active_filters.combinator_for(k) as u8).hash(&mut h);
-    }
-    (q.active_filters.cross_field_combinator as u8).hash(&mut h);
-    (*filter::BEHAVIOR.peek() as u8).hash(&mut h);
-    h.finish()
+    filter::applied_version().wrapping_mul(2) | (*filter::BEHAVIOR.peek() as u64)
 }
 
 fn id_for(graph: &Signal<Option<GraphData>>, idx: u32) -> Option<String> {

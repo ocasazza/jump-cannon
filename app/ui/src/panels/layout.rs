@@ -259,7 +259,11 @@ fn remote_solver_status(
     if effective.is_empty() {
         return format!(
             "requested {} · no effective engine reported · selection g{}",
-            if requested.is_empty() { "unknown" } else { requested },
+            if requested.is_empty() {
+                "unknown"
+            } else {
+                requested
+            },
             lease.selection_generation
         );
     }
@@ -349,10 +353,16 @@ fn validate_placement_response(
     n_nodes: usize,
 ) -> Result<(), String> {
     if !response.ok {
-        return Err(response.error.clone().unwrap_or_else(|| "initial placement rejected".into()));
+        return Err(response
+            .error
+            .clone()
+            .unwrap_or_else(|| "initial placement rejected".into()));
     }
     if response.n_nodes as usize != n_nodes {
-        return Err(format!("worker placed {} nodes; expected {n_nodes}", response.n_nodes));
+        return Err(format!(
+            "worker placed {} nodes; expected {n_nodes}",
+            response.n_nodes
+        ));
     }
     if response.graph_revision != expected.graph_revision {
         return Err(format!(
@@ -608,7 +618,12 @@ fn desired_remote_selection() -> Option<ComputeLayoutPutReq> {
                 .and_then(|v| serde_json::from_value(v).ok())
                 .unwrap_or_else(default_lens);
             Some(ComputeLayoutPutReq {
-                layout_id: if lens.use_gpu { "geometric-gpu" } else { "geometric" }.into(),
+                layout_id: if lens.use_gpu {
+                    "geometric-gpu"
+                } else {
+                    "geometric"
+                }
+                .into(),
                 params: None,
                 lens: serde_json::to_value(lens).ok(),
                 expected_generation: None,
@@ -637,7 +652,9 @@ fn desired_remote_selection() -> Option<ComputeLayoutPutReq> {
 /// observes a stale generation it retries the same latest intent against the
 /// generation returned by the server.
 fn request_remote_selection() {
-    let Some(mut request) = desired_remote_selection() else { return };
+    let Some(mut request) = desired_remote_selection() else {
+        return;
+    };
     let Some(graph_revision) = EXPECTED_GRAPH_REVISION.with(std::cell::Cell::get) else {
         *SOLVE_MSG.write() = "remote layout unavailable: graph has no server revision".into();
         return;
@@ -675,7 +692,10 @@ fn request_remote_selection() {
                         *SOLVE_MSG.write() = if resp.changed {
                             format!("worker selection generation {}", resp.selection_generation)
                         } else {
-                            format!("worker selection unchanged at generation {}", resp.selection_generation)
+                            format!(
+                                "worker selection unchanged at generation {}",
+                                resp.selection_generation
+                            )
                         };
                         apply_engine(false);
                         break;
@@ -684,7 +704,9 @@ fn request_remote_selection() {
                         expected = resp.selection_generation;
                         continue;
                     }
-                    *SOLVE_MSG.write() = resp.error.unwrap_or_else(|| "remote selection rejected".into());
+                    *SOLVE_MSG.write() = resp
+                        .error
+                        .unwrap_or_else(|| "remote selection rejected".into());
                     break;
                 }
                 Err(e) => {
@@ -780,11 +802,15 @@ pub(crate) fn stage_self_assembly(
         && graph_revision != 0
         && selection_generation != 0
     {
-        set_stream_lease(Some(RemoteLease { graph_revision, selection_generation }));
+        set_stream_lease(Some(RemoteLease {
+            graph_revision,
+            selection_generation,
+        }));
         *PREV_APPLIED.write() = None;
         apply_engine(false);
     } else {
-        *SOLVE_MSG.write() = "self-assembly control identity does not match the loaded graph".into();
+        *SOLVE_MSG.write() =
+            "self-assembly control identity does not match the loaded graph".into();
     }
 }
 
@@ -1094,7 +1120,11 @@ fn frame_matches_expected(
     selection_generation: u64,
     expected: Option<RemoteLease>,
 ) -> bool {
-    expected == Some(RemoteLease { graph_revision, selection_generation })
+    expected
+        == Some(RemoteLease {
+            graph_revision,
+            selection_generation,
+        })
         && graph_revision != 0
         && selection_generation != 0
 }
@@ -1102,11 +1132,18 @@ fn frame_matches_expected(
 fn expected_stream_lease() -> Option<RemoteLease> {
     let graph_revision = EXPECTED_GRAPH_REVISION.with(std::cell::Cell::get)?;
     let selection_generation = EXPECTED_SELECTION_GENERATION.with(std::cell::Cell::get)?;
-    Some(RemoteLease { graph_revision, selection_generation })
+    Some(RemoteLease {
+        graph_revision,
+        selection_generation,
+    })
 }
 
 fn frame_matches_active_graph(graph_revision: u64, selection_generation: u64) -> bool {
-    frame_matches_expected(graph_revision, selection_generation, expected_stream_lease())
+    frame_matches_expected(
+        graph_revision,
+        selection_generation,
+        expected_stream_lease(),
+    )
 }
 
 /// Wire format (matches graph-api's ws_handler):
@@ -1157,10 +1194,16 @@ async fn ws_consumer_loop(url: String, base_backoff_ms: u32, latch: Latch) {
                 while let Some(msg) = stream.next().await {
                     match msg {
                         Ok(Message::Bytes(bytes)) => {
-                            if let Some((graph_revision, selection_generation, _frame, _n, positions)) =
-                                parse_frame(&bytes)
+                            if let Some((
+                                graph_revision,
+                                selection_generation,
+                                _frame,
+                                _n,
+                                positions,
+                            )) = parse_frame(&bytes)
                             {
-                                if !frame_matches_active_graph(graph_revision, selection_generation) {
+                                if !frame_matches_active_graph(graph_revision, selection_generation)
+                                {
                                     continue;
                                 }
                                 if let Ok(mut g) = latch.lock() {
@@ -1714,7 +1757,8 @@ fn apply_remote_initial_placement(positions: Vec<f32>, n_nodes: usize) {
         let response = put_raw_json::<InitialPlacementResp>(&path, bytes).await;
         if expected_stream_lease() != Some(expected) {
             *SEED_STATUS.write() = None;
-            *SEED_ERROR.write() = Some("graph or worker selection changed while placing nodes".into());
+            *SEED_ERROR.write() =
+                Some("graph or worker selection changed while placing nodes".into());
             return;
         }
         match response.and_then(|r| {
@@ -2456,8 +2500,7 @@ mod frame_tests {
         for value in [1.0_f32, -2.0, 3.5] {
             bytes.extend_from_slice(&value.to_le_bytes());
         }
-        let (revision, generation, frame, n, positions) =
-            parse_frame(&bytes).expect("valid frame");
+        let (revision, generation, frame, n, positions) = parse_frame(&bytes).expect("valid frame");
         assert_eq!((revision, generation, frame, n), (17, 9, 4, 1));
         assert_eq!(positions, vec![1.0, -2.0, 3.5]);
     }
@@ -2477,10 +2520,14 @@ mod frame_tests {
         assert!(!frame_matches_expected(18, 9, expected));
         assert!(!frame_matches_expected(17, 10, expected));
         assert!(!frame_matches_expected(17, 9, None));
-        assert!(!frame_matches_expected(0, 9, Some(RemoteLease {
-            graph_revision: 0,
-            selection_generation: 9,
-        })));
+        assert!(!frame_matches_expected(
+            0,
+            9,
+            Some(RemoteLease {
+                graph_revision: 0,
+                selection_generation: 9,
+            })
+        ));
     }
 
     #[test]

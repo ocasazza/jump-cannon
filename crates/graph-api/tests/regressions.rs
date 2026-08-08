@@ -499,6 +499,83 @@ async fn same_cardinality_snapshot_swap_changes_revision() {
 }
 
 #[tokio::test]
+async fn search_matches_returns_every_dense_index_with_its_snapshot_revision() {
+    let mut graph = VaultGraph::new();
+    for i in 0..75 {
+        graph.add_node(VaultNode {
+            id: format!("matching-{i:03}"),
+            meta: vault_data::NodeMeta {
+                title: "Shared match term".into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+    }
+    graph.add_node(VaultNode {
+        id: "not-matching".into(),
+        meta: vault_data::NodeMeta {
+            title: "Unrelated document".into(),
+            ..Default::default()
+        },
+        ..Default::default()
+    });
+
+    let state = state_with_graph(graph);
+    let revision = state.snapshot().revision;
+    let mut expected: Vec<u32> = state
+        .snapshot()
+        .id_to_idx
+        .iter()
+        .filter_map(|(id, &index)| id.starts_with("matching-").then_some(index))
+        .collect();
+    expected.sort_unstable();
+
+    let response = graph_api::router(state)
+        .oneshot(
+            Request::builder()
+                .uri("/search/matches?q=shared")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .expect("search matches served");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response_revision(&response), revision);
+    assert_eq!(
+        response.headers().get("content-type").unwrap(),
+        "application/octet-stream"
+    );
+    let body = to_bytes(response.into_body(), 1 << 20)
+        .await
+        .expect("search matches body");
+    let actual: Vec<u32> = body
+        .chunks_exact(4)
+        .map(|chunk| u32::from_le_bytes(chunk.try_into().unwrap()))
+        .collect();
+    assert_eq!(actual, expected);
+    assert_eq!(
+        actual.len(),
+        75,
+        "the endpoint must not inherit the 50-hit UI limit"
+    );
+}
+
+#[tokio::test]
+async fn search_matches_rejects_invalid_query_syntax() {
+    let response = graph_api::router(state_with_graph(two_node_graph("query")))
+        .oneshot(
+            Request::builder()
+                .uri("/search/matches?q=secret%3Avalue")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .expect("invalid search matches served");
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
 async fn schema_search_and_facets_share_the_importer_contract() {
     let mut graph = VaultGraph::new();
     graph.add_node(VaultNode {

@@ -2668,6 +2668,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "jump-cannon-filter-model"
+version = "1.0.0"
+dependencies = [
+ "regex",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "jump-cannon-ui"
 version = "1.0.0"
 dependencies = [
@@ -2681,6 +2690,7 @@ dependencies = [
  "gloo-timers",
  "graph-layouts",
  "js-sys",
+ "jump-cannon-filter-model",
  "miniz_oxide",
  "panel-kit",
  "prost",

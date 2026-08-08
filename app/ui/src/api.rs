@@ -294,6 +294,17 @@ pub async fn search(q: &str, limit: u32) -> ApiResult<proto::SearchResults> {
     .await
 }
 
+/// `/search/matches?q=…` — every full-text match as a dense node index,
+/// paired with the graph snapshot revision those indices belong to.
+pub(crate) async fn search_matches(q: &str) -> ApiResult<Revisioned<Vec<u32>>> {
+    let path = format!("/search/matches?q={}", urlencoding::encode(q));
+    let r = get_revisioned_bytes(&path).await?;
+    Ok(Revisioned {
+        revision: r.revision,
+        value: u32s(&r.value),
+    })
+}
+
 /// One `/search/rich` hit. `snippet` is server-built HTML: the matched body
 /// region with `<b>` around hits (Tantivy SnippetGenerator output — source
 /// text is escaped server-side, the only markup is the highlight tags).
