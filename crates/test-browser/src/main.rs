@@ -146,6 +146,7 @@ struct NodesEditorCheck {
     untagged_group: bool,
     flat_active_count: usize,
     schema_core_keys: bool,
+    search_schema_generic: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     reason: Option<String>,
 }
@@ -644,6 +645,13 @@ async fn drive_page(
             .map((element) => (element.textContent || '').trim());
           return ['id:', 'title:', 'tags:'].every((key) => keys.includes(key));
         }));
+        const searchSchemaGeneric = Boolean(await waitFor(() => {
+          const schema = editor?.querySelector('.search-schema');
+          const label = schema?.querySelector('[data-search-schema-label]');
+          return (label?.textContent || '').trim() === 'Search fields' &&
+            schema?.getAttribute('aria-label') === 'Search fields from active importer schema' &&
+            Boolean(schema?.getAttribute('data-search-schema-source'));
+        }));
 
         const strictFixture = sidebar?.querySelector(
           '[data-node-id="Node Editor Fixture"]'
@@ -760,6 +768,7 @@ async fn drive_page(
         if (!tilingGeometry) failures.push('Nodes tile is too small for the editor layout');
         if (!flatDefault) failures.push('Flat navigator is not the fresh-layout default');
         if (!schemaCoreKeys) failures.push('core importer search keys missing');
+        if (!searchSchemaGeneric) failures.push('search field label is importer-specific');
         if (!selectedContentLoaded) failures.push('selected node content did not load');
         if (!selectionPersisted) failures.push('selection/content did not survive Tags mode');
         if (!exactTagGroups) failures.push('exact multi-tag grouping is incorrect');
@@ -784,6 +793,7 @@ async fn drive_page(
           untagged_group: untaggedGroupPresent,
           flat_active_count: flatActiveCount,
           schema_core_keys: schemaCoreKeys,
+          search_schema_generic: searchSchemaGeneric,
           reason: failures.length ? failures.join('; ') : null,
         };
     })()"#;

@@ -29,8 +29,10 @@ Typing switches the navigator to search results. Search is source-neutral and
 supports the field-qualified keys declared by `GET /graph/schema`; snippets,
 boosts, and metadata-filter facets also come from that schema. Obsidian, tvix,
 generate, Kubernetes, OKF, and Pest therefore use the same graph-api search path
-rather than a title-only fallback. The toolbar shows the active keys and reports
-invalid query or schema errors inline.
+rather than a title-only fallback. The toolbar labels this source-neutral
+contract as `Search fields` and renders only the active schema's searchable
+keys; the importer identity remains metadata rather than user-facing search
+terminology. Invalid query or schema errors appear inline.
 
 The current Obsidian importer is the only built-in with readable and writable
 source content. Saving from the focused editor sends `PUT /vault/page`;

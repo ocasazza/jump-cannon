@@ -704,13 +704,19 @@ pub fn panel(ctx: Ctx) -> Element {
                         Some(Ok(schema)) => rsx! {
                             div {
                                 class: "search-schema",
+                                "aria-label": "Search fields from active importer schema",
+                                "data-search-schema-source": "{schema.source.id}",
                                 title: format!(
                                     "{} v{} · graph revision {}",
                                     schema.source.id,
                                     schema.source.version,
                                     schema.graph_revision,
                                 ),
-                                span { class: "search-schema-label", "{schema.source.name} search keys" }
+                                span {
+                                    class: "search-schema-label",
+                                    "data-search-schema-label": "true",
+                                    "Search fields"
+                                }
                                 for field in schema.schema.fields.iter().filter(|field| field.searchable) {
                                     span {
                                         key: "{field.key}",

@@ -14,7 +14,8 @@ and writes `nodes-editor.png`, `settings-importers.png`, `boot.png`, and
 `report.json` under `target/test-browser-rust`.
 
 Stable fixture notes prove that Nodes renders a horizontal navigator/content
-split, exposes the core importer search keys, loads selected content, preserves
+split, uses the importer-neutral `Search fields` label while exposing the core
+schema-provided keys, loads selected content, preserves
 selection across Flat and Tags, groups exact multi-tags without duplicate rows,
 and exposes a synthetic `(untagged)` group. It also hit-tests the search and
 mode controls below the Panel Kit header, switches to tiling, and verifies that
