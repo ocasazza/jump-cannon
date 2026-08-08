@@ -58,3 +58,8 @@ test-browser \
   --out-dir target/test-browser-rust \
   --timeout-secs 60
 ```
+
+`--base-url` accepts both HTTP and HTTPS origins. Plain HTTP gets a fast raw
+liveness probe before Chromium starts. HTTPS goes directly through Chromium so
+the run validates the browser's real certificate trust, private-network
+authentication, secure-context state, and WebGPU exposure.

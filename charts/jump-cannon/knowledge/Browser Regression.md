@@ -65,5 +65,11 @@ Production browser exposure should terminate TLS rather than copy this test
 exception. The happy-path assertion records both `window.isSecureContext` and
 `navigator.gpu` before accepting the renderer-ready marker.
 
+The runner accepts both HTTP and HTTPS base URLs. Its raw TCP liveness probe is
+plain-HTTP only; an HTTPS production-origin run deliberately navigates directly
+with Chromium so certificate trust, NetBird authentication, secure-context
+classification, and WebGPU exposure are all exercised by the same browser that
+performs the assertions.
+
 A nonzero canvas rectangle alone does not prove nodes rendered. Review both
 screenshots and browser errors for visual changes to [[Frontend]] or [[Workspace]].
