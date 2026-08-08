@@ -320,7 +320,9 @@ fn chromium_args() -> Vec<&'static str> {
 async fn run(args: &Args, console_logs: Arc<Mutex<Vec<String>>>) -> Result<RunOk> {
     // ---- 1. server reachability ------------------------------------------
     let probe_url = args.base_url.trim_end_matches('/').to_string() + "/";
-    probe_server(&probe_url, Duration::from_secs(args.timeout_secs.min(30))).await?;
+    if raw_http_probe_required(&probe_url)? {
+        probe_server(&probe_url, Duration::from_secs(args.timeout_secs.min(30))).await?;
+    }
 
     // ---- 2. launch chromium ----------------------------------------------
     let mut config = BrowserConfig::builder()
@@ -1322,10 +1324,24 @@ async fn drive_page(
     })
 }
 
-/// Poll the base URL with HTTP GET via a raw TCP+HTTP/1.1 handshake. We
-/// avoid pulling reqwest just for a liveness probe — the wrapper script
-/// already does a curl loop before invoking us, so this is a belt-and-
-/// suspenders check that yields a clear error.
+/// Decide whether the belt-and-suspenders raw TCP probe can handle this URL.
+/// HTTPS deliberately goes straight to Chromium so the browser performs the
+/// real certificate, secure-context, and private-network authentication path.
+fn raw_http_probe_required(url: &str) -> Result<bool> {
+    if url.starts_with("http://") {
+        Ok(true)
+    } else if url.starts_with("https://") {
+        Ok(false)
+    } else {
+        Err(anyhow!(
+            "only http:// or https:// URLs supported, got {url}"
+        ))
+    }
+}
+
+/// Poll a plain-HTTP base URL with a raw TCP+HTTP/1.1 handshake. We avoid
+/// pulling a second HTTP client just for the local liveness probe; HTTPS is
+/// navigated by Chromium instead.
 async fn probe_server(url: &str, timeout: Duration) -> Result<()> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpStream;
@@ -1392,7 +1408,7 @@ fn tail(v: &[String], n: usize) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{browser_log_is_error, chromium_args};
+    use super::{browser_log_is_error, chromium_args, raw_http_probe_required};
 
     #[test]
     fn chromiumoxide_arguments_are_keys_not_cli_tokens() {
@@ -1414,5 +1430,12 @@ mod tests {
         ));
         assert!(!browser_log_is_error("[warning] preload warning"));
         assert!(!browser_log_is_error("[log] \"[jump-cannon-ui] boot\""));
+    }
+
+    #[test]
+    fn production_https_uses_chromiums_network_stack() {
+        assert!(raw_http_probe_required("http://127.0.0.1:8765/").unwrap());
+        assert!(!raw_http_probe_required("https://jump-cannon.example/").unwrap());
+        assert!(raw_http_probe_required("file:///tmp/index.html").is_err());
     }
 }
