@@ -368,7 +368,12 @@
         graph-compute-image = pkgs.dockerTools.buildLayeredImage {
           name     = graphComputeService.name;
           tag      = "latest";
-          contents = [ graph-compute pkgs.cacert ];
+          # vulkan-loader + mesa (lavapipe) so wgpu can create a device on a
+          # headless node. VK_ADD_DRIVER_FILES is additive: when the NVIDIA
+          # device plugin injects the driver's Vulkan ICD, wgpu's
+          # HighPerformance preference selects the discrete adapter and
+          # lavapipe is only the fallback.
+          contents = [ graph-compute pkgs.cacert pkgs.vulkan-loader pkgs.mesa ];
           config   = {
             Cmd = [ "/bin/graph-compute" ];
             ExposedPorts."${toString graphComputeService.port}/tcp" = {};
@@ -376,6 +381,8 @@
               "GRAPH_COMPUTE_TICK_HZ=${toString graphComputeService.tickHz}"
               "GRAPH_COMPUTE_ADDR=${graphComputeService.bindAddr}"
               "RUST_LOG=${graphComputeService.rustLog}"
+              "LD_LIBRARY_PATH=/lib"
+              "VK_ADD_DRIVER_FILES=/share/vulkan/icd.d/lvp_icd.x86_64.json"
             ];
           };
         };
