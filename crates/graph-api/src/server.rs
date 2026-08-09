@@ -74,6 +74,10 @@ pub fn router(state: AppState) -> Router {
         .route("/compute/engines", get(compute_engines))
         .route("/compute/layout", put(compute_layout_put))
         .route(
+            "/compute/session",
+            get(compute_session_get).put(compute_session_put),
+        )
+        .route(
             "/compute/initial-placement",
             put(compute_initial_placement_put),
         )
@@ -571,13 +575,22 @@ async fn compute_layout_put(
         .reselect(selection, req.expected_generation)
         .await
     {
-        Ok(update) => axum::Json(ComputeLayoutPutResp {
-            ok: true,
-            changed: update.changed,
-            graph_revision,
-            selection_generation: update.generation,
-            error: None,
-        }),
+        Ok(update) => {
+            // Auto-dispatch hook (design Q4): a successful reselect means a
+            // remote/cluster engine was selected (local engines never reach
+            // this endpoint — they run in the frontend). Fire-and-forget;
+            // the response contract above is unchanged.
+            if let Some(session) = &s.inner.gpu_session {
+                session.auto_dispatch_if_parked();
+            }
+            axum::Json(ComputeLayoutPutResp {
+                ok: true,
+                changed: update.changed,
+                graph_revision,
+                selection_generation: update.generation,
+                error: None,
+            })
+        }
         Err(e) => {
             tracing::warn!(error = %e, "compute layout reselect failed");
             let generation = s.inner.compute_broker.selection_state().await.generation;
@@ -592,12 +605,81 @@ async fn compute_layout_put(
     }
 }
 
+// --- GPU session endpoints ---
+//
+// `GET /compute/session` — HTTP 200 ALWAYS. Disabled (no controller — local
+// dev, no template mounted, no kube client): exactly `{"enabled": false}` so
+// the frontend hides the session console card. Enabled: the full
+// `SessionStatus` shape (state machine, idle countdown, failure reason, and
+// the broker status embedded as a sub-object).
+//
+// `PUT /compute/session` — body `{"action":"dispatch"|"park"}`; sets the
+// in-memory desired state and returns immediately (the reconcile loop
+// converges asynchronously; idempotent). Soft envelope, HTTP 200:
+// `{ "ok": bool, "state": string|null, "error": string|null }`.
+
+async fn compute_session_get(State(s): State<AppState>) -> impl IntoResponse {
+    match &s.inner.gpu_session {
+        Some(session) => {
+            let value = serde_json::to_value(session.status().await)
+                .unwrap_or_else(|e| {
+                    tracing::warn!(error = %e, "gpu session status serialization failed");
+                    serde_json::json!({ "enabled": false })
+                });
+            axum::Json(value)
+        }
+        None => axum::Json(serde_json::json!({ "enabled": false })),
+    }
+}
+
 #[derive(Deserialize)]
-struct InitialPlacementQuery {
-    graph_revision: u64,
+#[serde(rename_all = "lowercase")]
+enum ComputeSessionAction {
+    Dispatch,
+    Park,
+}
+
+#[derive(Deserialize)]
+struct ComputeSessionPutReq {
+    action: ComputeSessionAction,
 }
 
 #[derive(Serialize)]
+struct ComputeSessionPutResp {
+    ok: bool,
+    state: Option<String>,
+    error: Option<String>,
+}
+
+async fn compute_session_put(
+    State(s): State<AppState>,
+    Json(req): Json<ComputeSessionPutReq>,
+) -> impl IntoResponse {
+    let Some(session) = &s.inner.gpu_session else {
+        return axum::Json(ComputeSessionPutResp {
+            ok: false,
+            state: None,
+            error: Some(
+                "gpu session feature is not enabled (no session template mounted)".into(),
+            ),
+        });
+    };
+    let desired = match req.action {
+        ComputeSessionAction::Dispatch => crate::gpu_session::Desired::Running,
+        ComputeSessionAction::Park => crate::gpu_session::Desired::Parked,
+    };
+    let state = session.set_desired(desired);
+    axum::Json(ComputeSessionPutResp {
+        ok: true,
+        state: Some(state.as_str().to_string()),
+        error: None,
+    })
+}
+
+#[derive(Deserialize)]
+struct InitialPlacementQuery {
+    graph_revision: u64,
+}#[derive(Serialize)]
 struct InitialPlacementResp {
     ok: bool,
     n_nodes: u32,

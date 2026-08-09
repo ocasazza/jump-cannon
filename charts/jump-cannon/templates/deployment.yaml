@@ -6,6 +6,7 @@
 {{- $hasKnowledge := and $importer.allowsSeeds .Values.vault.seed.enabled .Values.vault.seed.includeKnowledgeBase -}}
 {{- $hasSeedFiles := and $importer.allowsSeeds .Values.vault.seed.enabled (gt (len .Values.vault.seed.files) 0) -}}
 {{- $seedsVault := or $hasKnowledge $hasSeedFiles -}}
+{{- $gpuSession := and .Values.graphCompute.enabled .Values.graphCompute.session.enabled -}}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -24,13 +25,16 @@ spec:
       labels:
         {{- include "jump-cannon.selectorLabels" . | nindent 8 }}
         app.kubernetes.io/component: graph-api
-      {{- if or $usesKubernetes $seedsVault }}
+      {{- if or $usesKubernetes $seedsVault $gpuSession }}
       annotations:
         {{- if $seedsVault }}
         checksum/vault-content: {{ printf "%s%s" (include (print $.Template.BasePath "/configmap-vault-knowledge.yaml") .) (include (print $.Template.BasePath "/configmap-vault-seed.yaml") .) | sha256sum }}
         {{- end }}
         {{- if $usesKubernetes }}
         checksum/kubernetes-importer-config: {{ toJson .Values.kubernetesImporter.config | replace "{{ .Release.Namespace }}" .Release.Namespace | sha256sum }}
+        {{- end }}
+        {{- if $gpuSession }}
+        checksum/gpu-session-template: {{ include "jump-cannon.rayclusterManifest" . | sha256sum }}
         {{- end }}
       {{- end }}
     spec:
@@ -126,6 +130,22 @@ spec:
             {{- end }}
             - name: JUMP_CANNON_COMPUTE_URL
               value: {{ .Values.graphApi.computeUrl | quote }}
+            {{- if $gpuSession }}
+            - name: JUMP_CANNON_GPU_SESSION_TEMPLATE
+              value: /etc/jump-cannon/gpu-session/raycluster.yaml
+            - name: JUMP_CANNON_GPU_SESSION_CLUSTER_NAME
+              value: {{ include "jump-cannon.computeName" . | quote }}
+            - name: JUMP_CANNON_GPU_SESSION_NAMESPACE
+              value: {{ include "jump-cannon.computeNamespace" . | quote }}
+            - name: JUMP_CANNON_GPU_SESSION_IDLE_SECONDS
+              value: {{ .Values.graphCompute.session.idleSeconds | quote }}
+            - name: JUMP_CANNON_GPU_SESSION_ADMISSION_TIMEOUT
+              value: {{ .Values.graphCompute.session.admissionTimeoutSeconds | quote }}
+            - name: JUMP_CANNON_GPU_SESSION_MAX_SECONDS
+              value: {{ .Values.graphCompute.session.maxExecTimeSeconds | quote }}
+            - name: JUMP_CANNON_GPU_SESSION_HEAD_START_TIMEOUT
+              value: {{ .Values.graphCompute.session.headStartTimeoutSeconds | quote }}
+            {{- end }}
             - name: RUST_LOG
               value: {{ .Values.graphApi.rustLog | quote }}
           readinessProbe:
@@ -145,7 +165,7 @@ spec:
             {{- toYaml .Values.graphApi.resources | nindent 12 }}
           securityContext:
             {{- toYaml .Values.containerSecurityContext | nindent 12 }}
-          {{- if or $usesFilesystem $usesKubernetes }}
+          {{- if or $usesFilesystem $usesKubernetes $gpuSession }}
           volumeMounts:
             {{- if $usesFilesystem }}
             - name: {{ $importer.volumeName }}
@@ -164,8 +184,14 @@ spec:
               mountPath: /var/run/secrets/kubernetes.io/serviceaccount
               readOnly: true
             {{- end }}
+            {{- if $gpuSession }}
+            - name: gpu-session-template
+              mountPath: /etc/jump-cannon/gpu-session/raycluster.yaml
+              subPath: raycluster.yaml
+              readOnly: true
+            {{- end }}
           {{- end }}
-      {{- if or $usesFilesystem $usesKubernetes }}
+      {{- if or $usesFilesystem $usesKubernetes $gpuSession }}
       volumes:
         {{- if $usesFilesystem }}
         - name: {{ $importer.volumeName }}
@@ -199,6 +225,11 @@ spec:
         - name: kubernetes-importer-config
           configMap:
             name: {{ include "jump-cannon.fullname" . }}-kubernetes-importer
+        {{- end }}
+        {{- if $gpuSession }}
+        - name: gpu-session-template
+          configMap:
+            name: {{ include "jump-cannon.fullname" . }}-gpu-session-template
         {{- end }}
         {{- if and $usesKubernetes .Values.kubernetesImporter.serviceAccountToken.enabled }}
         - name: kubernetes-api-access

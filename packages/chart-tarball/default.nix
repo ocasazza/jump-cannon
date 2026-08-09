@@ -69,6 +69,42 @@ pkgs.runCommand "jump-cannon-chart-tarball"
     grep -Fq 'value: "kubernetes"' named-kubernetes.yaml
     grep -Fq 'in-cluster-kubernetes' named-kubernetes.yaml
 
+    # Static compute mode (default): the RayCluster CR renders with the
+    # Kueue max-exec-time safety label.
+    helm template gpu-static ./jump-cannon \
+      --set tests.fuzz.enabled=false \
+      --set tests.performance.enabled=false \
+      --set tests.browser.enabled=false \
+      > gpu-static.yaml
+    grep -Fq 'kind: RayCluster' gpu-static.yaml
+    grep -Fq 'kueue.x-k8s.io/max-exec-time-seconds' gpu-static.yaml
+
+    # On-demand session mode: no RayCluster CR; the template ConfigMap,
+    # least-privilege session RBAC, Deployment env/mount, and the always-on
+    # compute Service render instead.
+    helm template gpu-session ./jump-cannon \
+      --set graphCompute.session.enabled=true \
+      --set tests.fuzz.enabled=false \
+      --set tests.performance.enabled=false \
+      --set tests.browser.enabled=false \
+      > gpu-session.yaml
+    if grep -Eq '^kind: RayCluster$' gpu-session.yaml; then
+      echo "session mode must not render the RayCluster CR" >&2
+      exit 1
+    fi
+    grep -Fq 'gpu-session-template' gpu-session.yaml
+    grep -Fq 'rayclusters' gpu-session.yaml
+    grep -Fq 'pods/log' gpu-session.yaml
+    grep -Fq 'kueue.x-k8s.io/max-exec-time-seconds' gpu-session.yaml
+    grep -Fq 'name: JUMP_CANNON_GPU_SESSION_TEMPLATE' gpu-session.yaml
+    grep -Fq 'name: JUMP_CANNON_GPU_SESSION_CLUSTER_NAME' gpu-session.yaml
+    grep -Fq 'name: JUMP_CANNON_GPU_SESSION_NAMESPACE' gpu-session.yaml
+    grep -Fq 'jump-cannon-compute' gpu-session.yaml
+    if grep -Fq 'rayclusters/finalizers' gpu-session.yaml; then
+      echo "session RBAC must not touch RayCluster finalizers" >&2
+      exit 1
+    fi
+
     expect_render_failure() {
       name="$1"
       shift
@@ -104,6 +140,9 @@ pkgs.runCommand "jump-cannon-chart-tarball"
       --set-string importers.sources.pest.description=unsupported \
       --set-string importers.sources.pest.kind=pest \
       --set importers.sources.pest.filesystemRescanIntervalSeconds=0
+    expect_render_failure gpu-session-multi-replica \
+      --set graphCompute.session.enabled=true \
+      --set graphApi.replicas=2
 
     helm package ./jump-cannon -d "$out/charts"
   ''

@@ -186,6 +186,61 @@ struct ComputeHealth {
     graph_revision: u64,
 }
 
+// --- /compute/session wire types (GPU session console — see gpu-session design) ------
+//
+// `GET /compute/session` answers HTTP 200 always. The disabled (local dev)
+// payload is exactly `{"enabled": false}` — every other field is defaulted so
+// both shapes deserialize into one struct.
+
+#[derive(Clone, Debug, Default, PartialEq, Deserialize)]
+struct SessionBroker {
+    #[serde(default)]
+    connected: bool,
+    #[serde(default)]
+    worker_ok: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Deserialize)]
+struct ComputeSession {
+    enabled: bool,
+    /// parked | dispatching | queued | admitted | head_starting | ready |
+    /// parking | failed
+    #[serde(default)]
+    state: String,
+    /// running | parked
+    #[serde(default)]
+    desired: String,
+    #[serde(default)]
+    cluster_name: String,
+    #[serde(default)]
+    state_since_ms: u64,
+    #[serde(default)]
+    idle_seconds_remaining: Option<u64>,
+    #[serde(default)]
+    detail: String,
+    #[serde(default)]
+    failure_reason: Option<String>,
+    #[serde(default)]
+    broker: Option<SessionBroker>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct SessionActionReq {
+    action: &'static str,
+}
+
+/// `PUT /compute/session` soft envelope: `{ ok, state, error }` — HTTP 200
+/// even for rejections (feature disabled / template invalid).
+#[derive(Clone, Debug, Default, Deserialize)]
+struct SessionActionResp {
+    ok: bool,
+    #[serde(default)]
+    #[allow(dead_code)] // the immediate re-poll is the source of truth
+    state: String,
+    #[serde(default)]
+    error: Option<String>,
+}
+
 #[derive(Debug, PartialEq, Eq)]
 struct HealthView {
     class: &'static str,
@@ -2079,6 +2134,157 @@ fn store_health(health: Option<ComputeHealth>) {
     *HEALTH.write() = health;
 }
 
+// --- GPU session console state ---------------------------------------------------
+
+/// Latest `/compute/session` status. `None` until the first successful poll;
+/// `enabled:false` (local dev) hides the console card entirely.
+static SESSION: GlobalSignal<Option<ComputeSession>> = Signal::global(|| None);
+/// Whether the session feature is enabled server-side — a tiny signal so the
+/// App-scope header switch re-renders only when the flag flips, not on every
+/// 2 s poll (mirrors [`WORKER_DOT`]).
+static SESSION_ON: GlobalSignal<bool> = Signal::global(|| false);
+/// Session glyph for the header's Compute Cluster segment (○/◐/●/⚠), written
+/// only on transitions. The header falls back to [`WORKER_DOT`] when the
+/// session feature is disabled.
+static SESSION_DOT: GlobalSignal<&'static str> = Signal::global(|| "○");
+/// One-line session summary for the header segment tooltip — tiny signal,
+/// written only when the text actually changes.
+static SESSION_TITLE: GlobalSignal<String> = Signal::global(String::new);
+/// Rejection/transport error from the last `PUT /compute/session`.
+static SESSION_ERR: GlobalSignal<Option<String>> = Signal::global(|| None);
+
+/// Wall clock in milliseconds — the session's `state_since_ms` epochs are
+/// server-side `SystemTime` millis.
+#[cfg(target_arch = "wasm32")]
+fn now_ms() -> u64 {
+    js_sys::Date::now() as u64
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// (glyph, css-state) for a session state — the same glyph language as the
+/// worker dot: ○ parked/off, ◐ transitional (warming or parking), ● ready,
+/// ⚠ failed.
+fn session_status(state: &str) -> (&'static str, &'static str) {
+    match state {
+        "ready" => ("●", "ok"),
+        "failed" => ("⚠", "fail"),
+        "parked" => ("○", "off"),
+        // dispatching | queued | admitted | head_starting | parking
+        _ => ("◐", "warm"),
+    }
+}
+
+/// Compact elapsed/duration text: 8s, 1m 12s, 2h 5m.
+fn fmt_elapsed_ms(ms: u64) -> String {
+    let s = ms / 1000;
+    if s < 60 {
+        format!("{s}s")
+    } else if s < 3600 {
+        format!("{}m {}s", s / 60, s % 60)
+    } else {
+        format!("{}h {}m", s / 3600, (s % 3600) / 60)
+    }
+}
+
+/// Badge text for the console card and the header tooltip.
+fn session_state_label(session: &ComputeSession) -> String {
+    let elapsed = fmt_elapsed_ms(now_ms().saturating_sub(session.state_since_ms));
+    match session.state.as_str() {
+        "parked" => "parked".to_string(),
+        "ready" => "ready".to_string(),
+        "failed" => "failed".to_string(),
+        "head_starting" => format!("starting · {elapsed}"),
+        other => format!("{other} · {elapsed}"),
+    }
+}
+
+/// Store the latest `/compute/session` and keep the tiny header signals in
+/// sync (they only write on change, so the App-scope header doesn't re-render
+/// on every poll).
+fn store_session(session: ComputeSession) {
+    if *SESSION_ON.peek() != session.enabled {
+        *SESSION_ON.write() = session.enabled;
+    }
+    if session.enabled {
+        let (dot, _) = session_status(&session.state);
+        if *SESSION_DOT.peek() != dot {
+            *SESSION_DOT.write() = dot;
+        }
+        let title = {
+            let label = session_state_label(&session);
+            let detail = session.detail.trim();
+            if detail.is_empty() {
+                format!("GPU session {dot} {label} — {}", session.cluster_name)
+            } else {
+                format!("GPU session {dot} {label} — {detail}")
+            }
+        };
+        if *SESSION_TITLE.peek() != title {
+            *SESSION_TITLE.write() = title;
+        }
+    }
+    *SESSION.write() = Some(session);
+}
+
+async fn fetch_session() {
+    if let Ok(session) = get_json::<ComputeSession>("/compute/session").await {
+        store_session(session);
+    }
+    // Transport errors keep the last known status — the health poll's own
+    // error surface already covers a dead graph-api, and a stale console
+    // beats a flickering one.
+}
+
+/// `PUT /compute/session {"action": …}` — dispatch or park. The card shows
+/// the transitional state immediately (optimistic), the PUT's soft envelope
+/// surfaces rejections, and an out-of-band re-poll reconciles with the
+/// server's view instead of waiting for the 2 s cadence.
+fn session_action(action: &'static str) {
+    *SESSION_ERR.write() = None;
+    if let Some(mut s) = SESSION.peek().clone() {
+        if s.enabled {
+            s.state = if action == "dispatch" {
+                "dispatching".to_string()
+            } else {
+                "parking".to_string()
+            };
+            s.desired = if action == "dispatch" {
+                "running".to_string()
+            } else {
+                "parked".to_string()
+            };
+            s.state_since_ms = now_ms();
+            s.detail.clear();
+            s.failure_reason = None;
+            s.idle_seconds_remaining = None;
+            store_session(s);
+        }
+    }
+    spawn(async move {
+        match put_json::<_, SessionActionResp>("/compute/session", &SessionActionReq { action })
+            .await
+        {
+            Ok(resp) => {
+                if !resp.ok {
+                    *SESSION_ERR.write() = Some(
+                        resp.error
+                            .unwrap_or_else(|| format!("session {action} rejected")),
+                    );
+                }
+                fetch_session().await;
+            }
+            Err(e) => *SESSION_ERR.write() = Some(format!("session {action} failed: {e}")),
+        }
+    });
+}
+
 pub(crate) fn active_is_remote() -> bool {
     matches!(
         STATE.peek().active.as_str(),
@@ -2096,20 +2302,37 @@ pub(crate) fn active_is_remote() -> bool {
 /// segment carries the live worker status dot (○/◐/●).
 pub(crate) fn backend_switch_header() -> Element {
     let view = *VIEW_BACKEND.read();
-    let dot = *WORKER_DOT.read();
+    // When the GPU session feature is enabled server-side, the cluster
+    // segment's dot + tooltip track the SESSION (○ parked / ◐ warming /
+    // ● ready / ⚠ failed); otherwise they track broker health as before.
+    let session_on = *SESSION_ON.read();
+    let dot = if session_on {
+        *SESSION_DOT.read()
+    } else {
+        *WORKER_DOT.read()
+    };
     // peek: the App-scope header must not subscribe to the full settings
     // bag (every slider drag would re-render the whole workspace).
     let running = backend_of(&STATE.peek().active);
-    let health_text = worker_health_view(HEALTH.peek().as_ref()).text;
+    let status_text = if session_on {
+        let t = SESSION_TITLE.read().clone();
+        if t.is_empty() {
+            "GPU session".to_string()
+        } else {
+            t
+        }
+    } else {
+        worker_health_view(HEALTH.peek().as_ref()).text
+    };
     let local_title = match running {
         Backend::Local => "Show local engines — the running engine lives here".to_string(),
         Backend::Cluster => "Show the engines that run on this device".to_string(),
     };
     let cluster_title = match running {
         Backend::Cluster => {
-            format!("Show compute-cluster engines — the running engine lives here · {health_text}")
+            format!("Show compute-cluster engines — the running engine lives here · {status_text}")
         }
-        Backend::Local => format!("Show compute-cluster engines — {health_text}"),
+        Backend::Local => format!("Show compute-cluster engines — {status_text}"),
     };
     rsx! {
         panel_kit::PanelHeaderButton {
@@ -2164,6 +2387,17 @@ pub fn panel(ctx: Ctx) -> Element {
         }
     });
 
+    // GPU session status, polled on the same 2 s cadence as worker health.
+    // `enabled:false` (local dev) hides the console card; the header's
+    // cluster dot reads the tiny SESSION_ON/SESSION_DOT signals.
+    use_future(|| async {
+        const POLL_MS: u32 = 2000;
+        loop {
+            fetch_session().await;
+            gloo_timers::future::TimeoutFuture::new(POLL_MS).await;
+        }
+    });
+
     // The viewed gallery re-joins the running engine's backend on every
     // engine change (card click, Generate-panel self-assembly staging, boot
     // restore). Clicking a header segment only re-points VIEW_BACKEND, so
@@ -2195,6 +2429,7 @@ pub fn panel(ctx: Ctx) -> Element {
     let snap = COMPUTE.read().clone();
     let health = HEALTH.read().clone();
     let health_view = worker_health_view(health.as_ref());
+    let session = SESSION.read().clone();
 
     let desc = descriptor_for(&active);
     let is_static = desc
@@ -2276,6 +2511,7 @@ pub fn panel(ctx: Ctx) -> Element {
                 Backend::Cluster => cluster_gallery(
                     &snap,
                     health.as_ref(),
+                    session.as_ref(),
                     server_backed,
                     selected_remote.as_deref(),
                     is_bridge,
@@ -2540,14 +2776,19 @@ fn remote_card(e: &EngineInfo, selected: bool, server_backed: bool) -> Element {
     }
 }
 
-/// The Compute Cluster gallery: a worker status card (health dot, one-line
-/// summary, reconnect + refresh) above the engines advertised by
-/// `GET /compute/engines`. Unavailable states render as designed empty
-/// cards carrying the reason and the recovery action — the same states the
-/// old picker's disabled placeholder options carried.
+/// The Compute Cluster gallery: a status card above the engines advertised
+/// by `GET /compute/engines`. When the GPU session feature is enabled
+/// server-side, the card is the session console (state badge, Dispatch/Park,
+/// idle countdown, failure reason) with the worker health folded in — one
+/// instrument, not two stacked cards. With `enabled:false` (local dev) the
+/// plain worker status card renders exactly as before. Unavailable states
+/// render as designed empty cards carrying the reason and the recovery
+/// action — the same states the old picker's disabled placeholder options
+/// carried.
 fn cluster_gallery(
     snap: &Option<Result<ComputeEngines, String>>,
     health: Option<&ComputeHealth>,
+    session: Option<&ComputeSession>,
     server_backed: bool,
     selected_remote: Option<&str>,
     is_bridge: bool,
@@ -2558,6 +2799,12 @@ fn cluster_gallery(
         Some(Ok(eng)) if eng.connected => &eng.engines,
         _ => &[],
     };
+    // The session console is the source of truth for "why isn't the cluster
+    // up" — while it is enabled and not ready, the "no compute worker" empty
+    // card below would only repeat it.
+    let session_explains_absence = session
+        .map(|s| s.enabled && s.state != "ready")
+        .unwrap_or(false);
     // Active bridge engine missing from the advertised list — keep the
     // gallery honest about what is selected (the old picker's ghost option).
     let ghost = selected_remote
@@ -2565,29 +2812,33 @@ fn cluster_gallery(
         .map(str::to_string);
 
     rsx! {
-        div { class: "lay-worker {state}",
-            span { class: "lay-worker-dot", "{dot}" }
-            div { class: "lay-worker-info",
-                div { class: "lay-worker-title", "Compute worker" }
-                div { class: "lay-worker-sub", title: "{sub}", "{sub}" }
-            }
-            if is_bridge {
+        if let Some(s) = session.filter(|s| s.enabled) {
+            {session_console(s, health, is_bridge, engines.is_empty())}
+        } else {
+            div { class: "lay-worker {state}",
+                span { class: "lay-worker-dot", "{dot}" }
+                div { class: "lay-worker-info",
+                    div { class: "lay-worker-title", "Compute worker" }
+                    div { class: "lay-worker-sub", title: "{sub}", "{sub}" }
+                }
+                if is_bridge {
+                    button {
+                        class: "lay-btn lay-small",
+                        r#type: "button",
+                        title: "Reconnect to the compute worker and restart the position stream",
+                        onclick: move |_| restart_active(),
+                        "reconnect"
+                    }
+                }
                 button {
                     class: "lay-btn lay-small",
                     r#type: "button",
-                    title: "Reconnect to the compute worker and restart the position stream",
-                    onclick: move |_| restart_active(),
-                    "reconnect"
+                    title: "Refresh the remote engine list and worker health",
+                    onclick: move |_| {
+                        spawn(async move { fetch_compute().await; });
+                    },
+                    "↻"
                 }
-            }
-            button {
-                class: "lay-btn lay-small",
-                r#type: "button",
-                title: "Refresh the remote engine list and worker health",
-                onclick: move |_| {
-                    spawn(async move { fetch_compute().await; });
-                },
-                "↻"
             }
         }
 
@@ -2619,7 +2870,7 @@ fn cluster_gallery(
                     }
                 }
             },
-            Some(Ok(eng)) if !eng.connected => rsx! {
+            Some(Ok(eng)) if !eng.connected && !session_explains_absence => rsx! {
                 div { class: "lay-empty",
                     span { class: "lay-empty-title", "○ No compute worker" }
                     span { class: "lay-empty-text",
@@ -2667,6 +2918,182 @@ fn cluster_gallery(
                         on_select: move |_| select_remote_engine(&id),
                     }
                 }
+            }
+        }
+    }
+}
+
+// --- GPU session console ---------------------------------------------------------
+
+/// The merged session + worker instrument at the top of the cluster gallery.
+/// One card: state badge (○ parked / ◐ transitional with elapsed / ● ready /
+/// ⚠ failed), the server's `detail` line, failure reason, idle countdown
+/// while ready, and the Dispatch/Park actions. The broker affordances from
+/// the plain worker card (reconnect, refresh) stay reachable in the ready
+/// state — they hit the broker, not the session.
+fn session_console(
+    session: &ComputeSession,
+    health: Option<&ComputeHealth>,
+    is_bridge: bool,
+    engines_unavailable: bool,
+) -> Element {
+    let (glyph, cls) = session_status(&session.state);
+    let label = session_state_label(session);
+    let ready = session.state == "ready";
+
+    // Dispatch: enabled from parked/failed; disabled-with-reason through the
+    // transitional states (the label says which way the machine is moving).
+    let (dispatch_label, dispatch_disabled, dispatch_title) = match session.state.as_str() {
+        "parked" => (
+            "Dispatch",
+            false,
+            "Start the GPU compute cluster".to_string(),
+        ),
+        "failed" => (
+            "Dispatch",
+            false,
+            "Retry — start the GPU compute cluster".to_string(),
+        ),
+        "ready" => (
+            "Dispatch",
+            true,
+            "the session is already running".to_string(),
+        ),
+        "parking" => (
+            "parking…",
+            true,
+            "waiting for the old cluster to finish releasing its quota".to_string(),
+        ),
+        _ => (
+            "dispatching…",
+            true,
+            "the session is warming — this updates as it converges".to_string(),
+        ),
+    };
+    // Park: enabled while running or warming (a warm-time park cancels the
+    // dispatch); disabled-with-reason otherwise.
+    let (park_label, park_disabled, park_title) = match session.state.as_str() {
+        "ready" => (
+            "Park",
+            false,
+            "Park the cluster — releases the GPU quota".to_string(),
+        ),
+        "dispatching" | "queued" | "admitted" | "head_starting" => (
+            "Park",
+            false,
+            "Cancel the dispatch and park the cluster".to_string(),
+        ),
+        "parking" => ("parking…", true, "park already in progress".to_string()),
+        _ => (
+            "Park",
+            true,
+            "nothing to park — the session is not running".to_string(),
+        ),
+    };
+
+    // Parked/failed with no usable engines: the console is the way out, so
+    // the Dispatch button gets a quiet accent nudge (not a modal).
+    let dispatch_cta = matches!(session.state.as_str(), "parked" | "failed") && engines_unavailable;
+    let dispatch_class = if dispatch_cta {
+        "lay-btn lay-small ses-cta"
+    } else {
+        "lay-btn lay-small"
+    };
+
+    // Detail line: the server's own words when it has any, otherwise a
+    // per-state fallback so the card never reads empty.
+    let detail = {
+        let d = session.detail.trim();
+        if !d.is_empty() {
+            d.to_string()
+        } else {
+            match session.state.as_str() {
+                "parked" => format!("cluster {} is parked — dispatch to start the GPU worker", session.cluster_name),
+                "ready" => format!("cluster {} is up", session.cluster_name),
+                "failed" => "the session failed — see the reason below".to_string(),
+                "parking" => "releasing the GPU quota…".to_string(),
+                _ => format!("warming cluster {}…", session.cluster_name),
+            }
+        }
+    };
+
+    let worker_sub = worker_health_sub(health);
+    let idle = if ready {
+        session.idle_seconds_remaining
+    } else {
+        None
+    };
+    let session_err = SESSION_ERR.read().clone();
+
+    rsx! {
+        div { class: "ses {cls}",
+            div { class: "ses-head",
+                span { class: "ses-dot", "{glyph}" }
+                div { class: "ses-info",
+                    div { class: "ses-title",
+                        span { class: "ses-name", "GPU session" }
+                        span { class: "ses-state", "{label}" }
+                    }
+                    div { class: "ses-detail", title: "{detail}", "{detail}" }
+                }
+                div { class: "ses-actions",
+                    button {
+                        class: "{dispatch_class}",
+                        r#type: "button",
+                        disabled: dispatch_disabled,
+                        title: "{dispatch_title}",
+                        onclick: move |_| session_action("dispatch"),
+                        "{dispatch_label}"
+                    }
+                    button {
+                        class: "lay-btn lay-small",
+                        r#type: "button",
+                        disabled: park_disabled,
+                        title: "{park_title}",
+                        onclick: move |_| session_action("park"),
+                        "{park_label}"
+                    }
+                    if ready && is_bridge {
+                        button {
+                            class: "lay-btn lay-small",
+                            r#type: "button",
+                            title: "Reconnect to the compute worker and restart the position stream",
+                            onclick: move |_| restart_active(),
+                            "reconnect"
+                        }
+                    }
+                    if ready {
+                        button {
+                            class: "lay-btn lay-small",
+                            r#type: "button",
+                            title: "Refresh the session, remote engine list, and worker health",
+                            onclick: move |_| {
+                                spawn(async move {
+                                    fetch_session().await;
+                                    fetch_compute().await;
+                                });
+                            },
+                            "↻"
+                        }
+                    }
+                }
+            }
+            if let Some(reason) = session.failure_reason.as_deref().filter(|r| !r.trim().is_empty()) {
+                div { class: "ses-fail", "⚠ {reason}" }
+            }
+            if ready {
+                div { class: "ses-meta",
+                    span { class: "ses-worker", title: "{worker_sub}", "worker {worker_sub}" }
+                    if let Some(idle_s) = idle {
+                        span { class: "ses-idle",
+                            title: "The session parks itself after this much idle time",
+                            "idle auto-park in {fmt_elapsed_ms(idle_s * 1000)}"
+                        }
+                    }
+                }
+            }
+            if let Some(err) = session_err {
+                div { class: "lay-err", "{err}" }
             }
         }
     }
@@ -2815,6 +3242,68 @@ fn engine_params(active: &str) -> Element {
         _ => rsx! {
             div { class: "lay-hint", "No layout registered for active id — pick one above." }
         },
+    }
+}
+
+#[cfg(test)]
+mod session_tests {
+    use super::{fmt_elapsed_ms, session_status, ComputeSession};
+
+    #[test]
+    fn disabled_payload_is_exactly_enabled_false() {
+        let s: ComputeSession =
+            serde_json::from_str("{\"enabled\": false}").expect("disabled shape deserializes");
+        assert!(!s.enabled);
+        assert!(s.state.is_empty());
+        assert!(s.broker.is_none());
+    }
+
+    #[test]
+    fn enabled_payload_round_trips_the_locked_contract() {
+        let s: ComputeSession = serde_json::from_value(serde_json::json!({
+            "enabled": true,
+            "state": "queued",
+            "desired": "running",
+            "cluster_name": "jump-cannon-compute",
+            "state_since_ms": 1736000000000_u64,
+            "idle_seconds_remaining": 812,
+            "detail": "waiting for admission: 0/1 nvidia.com/gpu available in ClusterQueue gpu",
+            "failure_reason": null,
+            "broker": { "connected": false, "worker_ok": false }
+        }))
+        .expect("enabled shape deserializes");
+        assert!(s.enabled);
+        assert_eq!(s.state, "queued");
+        assert_eq!(s.desired, "running");
+        assert_eq!(s.cluster_name, "jump-cannon-compute");
+        assert_eq!(s.state_since_ms, 1736000000000);
+        assert_eq!(s.idle_seconds_remaining, Some(812));
+        assert_eq!(
+            s.detail,
+            "waiting for admission: 0/1 nvidia.com/gpu available in ClusterQueue gpu"
+        );
+        assert_eq!(s.failure_reason, None);
+        assert_eq!(
+            s.broker.map(|b| (b.connected, b.worker_ok)),
+            Some((false, false))
+        );
+    }
+
+    #[test]
+    fn session_glyph_language_matches_the_worker_dot() {
+        assert_eq!(session_status("parked"), ("○", "off"));
+        assert_eq!(session_status("ready"), ("●", "ok"));
+        assert_eq!(session_status("failed"), ("⚠", "fail"));
+        for warm in ["dispatching", "queued", "admitted", "head_starting", "parking"] {
+            assert_eq!(session_status(warm), ("◐", "warm"), "state {warm}");
+        }
+    }
+
+    #[test]
+    fn elapsed_format_is_compact() {
+        assert_eq!(fmt_elapsed_ms(8_000), "8s");
+        assert_eq!(fmt_elapsed_ms(72_000), "1m 12s");
+        assert_eq!(fmt_elapsed_ms(7_500_000), "2h 5m");
     }
 }
 

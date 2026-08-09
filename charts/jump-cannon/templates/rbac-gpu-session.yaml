@@ -1,0 +1,59 @@
+{{- if and .Values.graphCompute.enabled .Values.graphCompute.session.enabled }}
+{{- if ne (int .Values.graphApi.replicas) 1 }}
+{{- fail "graphCompute.session.enabled requires graphApi.replicas == 1: two in-memory GPU session controllers would fight over the single RayCluster" }}
+{{- end }}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "jump-cannon.fullname" . }}-gpu-session
+  namespace: {{ include "jump-cannon.computeNamespace" . }}
+  labels:
+    {{- include "jump-cannon.labels" . | nindent 4 }}
+    app.kubernetes.io/component: graph-api
+rules:
+  - apiGroups:
+      - ray.io
+    resources:
+      - rayclusters
+    verbs:
+      - get
+      - create
+      - delete
+  - apiGroups:
+      - kueue.x-k8s.io
+    resources:
+      - workloads
+    verbs:
+      - get
+      - list
+  - apiGroups:
+      - ""
+    resources:
+      - pods
+    verbs:
+      - get
+      - list
+  - apiGroups:
+      - ""
+    resources:
+      - pods/log
+    verbs:
+      - get
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "jump-cannon.fullname" . }}-gpu-session
+  namespace: {{ include "jump-cannon.computeNamespace" . }}
+  labels:
+    {{- include "jump-cannon.labels" . | nindent 4 }}
+    app.kubernetes.io/component: graph-api
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "jump-cannon.fullname" . }}-gpu-session
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "jump-cannon.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
+{{- end }}
