@@ -2,15 +2,19 @@
 //! (+ ui/layout/registry.rs, ui/layout/algorithms/*, ui/sections/seed.rs — the
 //! seed UI is embedded at the bottom of the Layout section, same as egui).
 //!
-//! One unified "Engine" picker, grouped into two sub-lists:
-//!   * **Local** — every non-bridge layout (the static solvers + the local
-//!     GPU physics sim). Selecting one sets the active id directly.
-//!   * **Remote** — the engines advertised by the graph-compute worker via
-//!     `GET /compute/engines`. Each entry routes through one of the two
-//!     "bridge" layouts and patches that bridge's settings so the
-//!     versioned `PUT /compute/layout` selects the worker once; WebSocket
-//!     open/reconnect carries only graph + selection identity and never
-//!     mutates shared worker state.
+//! One engine gallery split by backend, switched from the Settings panel
+//! header (This Device / Compute Cluster — the Layout surface is a Settings
+//! tab, so the segmented switch rides the panel's header-actions slot):
+//!   * **This Device** — every non-bridge layout (the static solvers + the
+//!     local GPU physics sim) as rich cards. Selecting a card sets the
+//!     active id directly.
+//!   * **Compute Cluster** — a live worker status card (○/◐/● health dot,
+//!     reconnect, refresh) above the engines advertised by the
+//!     graph-compute worker via `GET /compute/engines`. Each engine card
+//!     routes through one of the two "bridge" layouts and patches that
+//!     bridge's settings so the versioned `PUT /compute/layout` selects the
+//!     worker once; WebSocket open/reconnect carries only graph + selection
+//!     identity and never mutates shared worker state.
 //!
 //! Bridge routing (worker engine id → bridge + settings patch):
 //!   * `geometric`     → active `"geometric"`, LensConfig.use_gpu=false
@@ -298,8 +302,8 @@ async fn fetch_compute() {
     }
     *COMPUTE.write() = Some(r);
     match get_json::<ComputeHealth>("/compute/health").await {
-        Ok(h) => *HEALTH.write() = Some(h),
-        Err(_) => *HEALTH.write() = None,
+        Ok(h) => store_health(Some(h)),
+        Err(_) => store_health(None),
     }
     if should_sync && expected_stream_lease().is_none() {
         request_remote_selection();
@@ -1961,12 +1965,74 @@ fn SeedRow(label: String, value: u64, on: EventHandler<u64>) -> Element {
 
 // --- panel ------------------------------------------------------------------------------
 
-struct PickerOpt {
-    value: String,
-    label: String,
-    title: String,
-    selected: bool,
-    disabled: bool,
+/// Which engine gallery the panel (and the header switch) is showing.
+/// `Local` = the engines that run in this process (gpu-force physics + the
+/// static solvers); `Cluster` = the engines advertised by the graph-compute
+/// worker. Session-only, never persisted: the view re-joins the running
+/// engine's backend whenever the engine changes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Backend {
+    Local,
+    Cluster,
+}
+
+fn backend_of(engine_id: &str) -> Backend {
+    match engine_id {
+        BRIDGE_GEOMETRIC | BRIDGE_REMOTE_FA2 => Backend::Cluster,
+        _ => Backend::Local,
+    }
+}
+
+fn backend_label(backend: Backend) -> &'static str {
+    match backend {
+        Backend::Local => "this device",
+        Backend::Cluster => "the compute cluster",
+    }
+}
+
+static VIEW_BACKEND: GlobalSignal<Backend> = Signal::global(|| backend_of(&load_state().active));
+
+/// Live worker status glyph for the header's Compute Cluster segment
+/// (○/◐/●). Kept separate from [`HEALTH`] so the header — rendered in the
+/// App scope, not the panel's — re-renders only when the glyph flips, not
+/// on every 2 s health poll.
+static WORKER_DOT: GlobalSignal<&'static str> = Signal::global(|| "○");
+
+/// (glyph, css-state) for the worker health: ● ready / ◐ connected but
+/// degraded / ○ disconnected or unknown.
+fn worker_status(health: Option<&ComputeHealth>) -> (&'static str, &'static str) {
+    match health {
+        Some(h) if h.connected && h.worker_ok && h.worker_status_error.is_none() => ("●", "ok"),
+        Some(h) if h.connected => ("◐", "warn"),
+        _ => ("○", "off"),
+    }
+}
+
+/// One-line health summary without the "compute worker" prefix — the worker
+/// status card supplies its own title.
+fn worker_health_sub(health: Option<&ComputeHealth>) -> String {
+    let Some(h) = health else {
+        return "no /compute/health yet".into();
+    };
+    if !h.connected {
+        return format!("disconnected — {}", h.url);
+    }
+    if let Some(error) = h.worker_status_error.as_deref() {
+        return format!("connected, status unavailable — {error}");
+    }
+    if !h.worker_ok {
+        return "connected, not ready".into();
+    }
+    format!("ready — {}", h.url)
+}
+
+/// Store the latest `/compute/health` and keep [`WORKER_DOT`] in sync.
+fn store_health(health: Option<ComputeHealth>) {
+    let dot = worker_status(health.as_ref()).0;
+    if *WORKER_DOT.peek() != dot {
+        *WORKER_DOT.write() = dot;
+    }
+    *HEALTH.write() = health;
 }
 
 pub(crate) fn active_is_remote() -> bool {
@@ -1974,6 +2040,47 @@ pub(crate) fn active_is_remote() -> bool {
         STATE.peek().active.as_str(),
         BRIDGE_GEOMETRIC | BRIDGE_REMOTE_FA2
     )
+}
+
+/// Segmented This Device / Compute Cluster backend switch, rendered into
+/// the Settings panel's header-actions slot while the Layout tab is active
+/// (the Layout surface is a Settings tab, so it has no panel chrome of its
+/// own — main.rs mounts this there). The highlighted segment is the
+/// *viewed* gallery: clicking browses the other backend without touching
+/// the running engine, and the view re-joins the running engine's backend
+/// on the next engine change (see the effect in [`panel`]). The cluster
+/// segment carries the live worker status dot (○/◐/●).
+pub(crate) fn backend_switch_header() -> Element {
+    let view = *VIEW_BACKEND.read();
+    let dot = *WORKER_DOT.read();
+    // peek: the App-scope header must not subscribe to the full settings
+    // bag (every slider drag would re-render the whole workspace).
+    let running = backend_of(&STATE.peek().active);
+    let health_text = worker_health_view(HEALTH.peek().as_ref()).text;
+    let local_title = match running {
+        Backend::Local => "Show local engines — the running engine lives here".to_string(),
+        Backend::Cluster => "Show the engines that run on this device".to_string(),
+    };
+    let cluster_title = match running {
+        Backend::Cluster => {
+            format!("Show compute-cluster engines — the running engine lives here · {health_text}")
+        }
+        Backend::Local => format!("Show compute-cluster engines — {health_text}"),
+    };
+    rsx! {
+        panel_kit::PanelHeaderButton {
+            label: "This Device",
+            title: local_title,
+            active: view == Backend::Local,
+            on_press: move |_| *VIEW_BACKEND.write() = Backend::Local,
+        }
+        panel_kit::PanelHeaderButton {
+            label: format!("Compute Cluster {dot}"),
+            title: cluster_title,
+            active: view == Backend::Cluster,
+            on_press: move |_| *VIEW_BACKEND.write() = Backend::Cluster,
+        }
+    }
 }
 
 pub fn panel(ctx: Ctx) -> Element {
@@ -2005,11 +2112,22 @@ pub fn panel(ctx: Ctx) -> Element {
                 fetch_compute().await;
             } else {
                 match get_json::<ComputeHealth>("/compute/health").await {
-                    Ok(h) => *HEALTH.write() = Some(h),
-                    Err(_) => *HEALTH.write() = None,
+                    Ok(h) => store_health(Some(h)),
+                    Err(_) => store_health(None),
                 }
             }
             gloo_timers::future::TimeoutFuture::new(RETRY_MS).await;
+        }
+    });
+
+    // The viewed gallery re-joins the running engine's backend on every
+    // engine change (card click, Generate-panel self-assembly staging, boot
+    // restore). Clicking a header segment only re-points VIEW_BACKEND, so
+    // browsing the other backend never disturbs the running engine.
+    use_effect(move || {
+        let backend = backend_of(&STATE.read().active);
+        if *VIEW_BACKEND.peek() != backend {
+            *VIEW_BACKEND.write() = backend;
         }
     });
 
@@ -2019,72 +2137,18 @@ pub fn panel(ctx: Ctx) -> Element {
     let lens: LensConfig = typed_settings(BRIDGE_GEOMETRIC);
     let fa2: RemoteFa2Settings = typed_settings(BRIDGE_REMOTE_FA2);
 
-    let picker_value = match active.as_str() {
-        BRIDGE_GEOMETRIC => format!(
-            "remote:{}",
-            if lens.use_gpu {
-                "geometric-gpu"
-            } else {
-                BRIDGE_GEOMETRIC
-            }
+    // The worker engine id the active bridge selection maps to — the card
+    // that reads as selected in the cluster gallery (replaces the old
+    // `remote:<id>` <select> encoding).
+    let selected_remote: Option<String> = match active.as_str() {
+        BRIDGE_GEOMETRIC => Some(
+            if lens.use_gpu { "geometric-gpu" } else { BRIDGE_GEOMETRIC }.to_string(),
         ),
-        BRIDGE_REMOTE_FA2 => format!("remote:{}", fa2.layout_id),
-        other => other.to_string(),
+        BRIDGE_REMOTE_FA2 => Some(fa2.layout_id.clone()),
+        _ => None,
     };
-
-    let local_opts: Vec<PickerOpt> = local_descriptors()
-        .into_iter()
-        .map(|d| PickerOpt {
-            value: d.id.to_string(),
-            label: d.display_name.to_string(),
-            title: d.description.to_string(),
-            selected: d.id == active,
-            disabled: false,
-        })
-        .collect();
 
     let snap = COMPUTE.read().clone();
-    let mut remote_opts: Vec<PickerOpt> = Vec::new();
-    let status_opt = |label: &str| PickerOpt {
-        value: String::new(),
-        label: label.to_string(),
-        title: String::new(),
-        selected: false,
-        disabled: true,
-    };
-    match &snap {
-        Some(Ok(eng)) if eng.connected => {
-            for e in &eng.engines {
-                let value = format!("remote:{}", e.id);
-                remote_opts.push(PickerOpt {
-                    selected: value == picker_value,
-                    title: if e.description.is_empty() {
-                        e.kind.clone()
-                    } else {
-                        format!("{} — {}", e.kind, e.description)
-                    },
-                    value,
-                    label: e.display_name.clone(),
-                    disabled: !server_backed,
-                });
-            }
-        }
-        Some(Ok(_)) => remote_opts.push(status_opt("no compute worker")),
-        Some(Err(_)) => remote_opts.push(status_opt("engines unavailable")),
-        None => remote_opts.push(status_opt("loading…")),
-    }
-    // Active bridge engine missing from the advertised list — keep the
-    // collapsed picker honest about what's selected.
-    if picker_value.starts_with("remote:") && !remote_opts.iter().any(|o| o.value == picker_value) {
-        remote_opts.push(PickerOpt {
-            label: picker_value.trim_start_matches("remote:").to_string(),
-            value: picker_value.clone(),
-            title: String::new(),
-            selected: true,
-            disabled: !server_backed,
-        });
-    }
-
     let health = HEALTH.read().clone();
     let health_view = worker_health_view(health.as_ref());
 
@@ -2117,75 +2181,76 @@ pub fn panel(ctx: Ctx) -> Element {
     let remote_solver = remote_solver_status(health.as_ref(), remote_lease, control_busy);
     let history_mode = crate::panels::timeline::history_mode_label();
 
+    let active_backend = backend_of(&active);
+    let view = *VIEW_BACKEND.read();
+    // Display name of the running engine for the cross-backend banner: the
+    // worker's own display name for bridge selections, the registry
+    // descriptor otherwise.
+    let running_name: String = match &selected_remote {
+        Some(sel) => match &snap {
+            Some(Ok(eng)) => eng
+                .engines
+                .iter()
+                .find(|e| &e.id == sel)
+                .map(|e| e.display_name.clone())
+                .unwrap_or_else(|| sel.clone()),
+            _ => sel.clone(),
+        },
+        None => desc
+            .as_ref()
+            .map(|d| d.display_name.to_string())
+            .unwrap_or_else(|| active.clone()),
+    };
+    let params_name = desc
+        .as_ref()
+        .map(|d| d.display_name.to_string())
+        .unwrap_or_else(|| active.clone());
+
     rsx! {
         div { class: "lay",
-            div { class: "lay-row",
-                span { class: "lay-k", "Engine" }
-                select {
-                    class: "lay-select",
-                    value: "{picker_value}",
-                    onchange: move |e| {
-                        let v = e.value();
-                        if let Some(rid) = v.strip_prefix("remote:") {
-                            if server_backed {
-                                select_remote_engine(rid);
-                            }
-                        } else if !v.is_empty() {
-                            set_active(&v);
-                        }
-                    },
-                    optgroup { label: "Local",
-                        for o in local_opts {
-                            option {
-                                key: "{o.value}",
-                                value: o.value.clone(),
-                                title: o.title.clone(),
-                                selected: o.selected,
-                                {o.label.clone()}
-                            }
-                        }
+            // Cross-backend banner: browsing one gallery while the running
+            // engine belongs to the other. Keeps "view ≠ running" honest —
+            // one click jumps back to the running engine's gallery.
+            if view != active_backend {
+                div { class: "lay-running",
+                    span { class: "lay-running-dot", "●" }
+                    span { class: "lay-running-text",
+                        "Running on {backend_label(active_backend)}: {running_name}"
                     }
-                    optgroup { label: "Compute worker",
-                        for o in remote_opts {
-                            option {
-                                key: "{o.value}{o.label}",
-                                value: o.value.clone(),
-                                title: o.title.clone(),
-                                selected: o.selected,
-                                disabled: o.disabled,
-                                {o.label.clone()}
-                            }
-                        }
+                    button {
+                        class: "lay-btn lay-small",
+                        r#type: "button",
+                        title: "Show the gallery that contains the running engine",
+                        onclick: move |_| *VIEW_BACKEND.write() = active_backend,
+                        "show"
                     }
                 }
-                button {
-                    class: "lay-btn lay-small",
-                    title: "Refresh remote engine list",
-                    onclick: move |_| {
-                        spawn(async move { fetch_compute().await; });
-                    },
-                    "↻"
-                }
-                button {
-                    class: "lay-btn lay-small",
-                    title: "Reset to defaults",
-                    onclick: move |_| {
-                        let id = STATE.read().active.clone();
-                        put_settings(&id, default_settings(&id));
-                    },
-                    "↺"
-                }
             }
-            div { class: "lay-hint",
-                "Compute-worker engines stream from graph-compute via graph-api."
+
+            match view {
+                Backend::Local => local_gallery(&active),
+                Backend::Cluster => cluster_gallery(
+                    &snap,
+                    health.as_ref(),
+                    server_backed,
+                    selected_remote.as_deref(),
+                    is_bridge,
+                ),
             }
-            if !server_backed {
-                div { class: "lay-health bad",
-                    "Remote layouts are disabled: this graph exists only in the browser. \
-                     Choose a local engine or host the graph through graph-api."
+
+            // While a remote engine runs and the user browses the local
+            // gallery, keep the worker health + browser-owned warnings
+            // visible (the cluster view carries them on its status card).
+            if is_bridge && view == Backend::Local {
+                div { class: "{health_view.class}", "{health_view.text}" }
+                if !server_backed {
+                    div { class: "lay-health bad",
+                        "Remote layouts are disabled: this graph exists only in the browser. \
+                         Choose a local engine or host the graph through graph-api."
+                    }
                 }
             }
-            div { class: "{health_view.class}", "{health_view.text}" }
+
             if is_bridge {
                 div { class: "lay-hint",
                     "solver: {remote_solver}"
@@ -2195,11 +2260,9 @@ pub fn panel(ctx: Ctx) -> Element {
                     if sim_running { "following worker frames" } else { "frozen locally · worker still running" }
                 }
                 div { class: "lay-hint", "history: {history_mode}" }
-            }
 
-            // One worker connection, shared by every remote engine (was
-            // duplicated per-bridge). Only shown when a worker engine is active.
-            if is_bridge {
+                // One worker connection, shared by every remote engine (was
+                // duplicated per-bridge). Only shown when a worker engine is active.
                 div { class: "lay-sub", "Worker connection" }
                 TextRow { label: "URL", value: worker_url_val,
                     on: move |v: String| set_worker_connection(Some(v), None) }
@@ -2214,6 +2277,23 @@ pub fn panel(ctx: Ctx) -> Element {
 
             hr { class: "lay-sep" }
 
+            // Parameters belong to the *running* engine regardless of which
+            // gallery is being browsed — the header names it and carries the
+            // reset-to-defaults action.
+            div { class: "lay-params-head",
+                span { class: "lay-sub", "Parameters" }
+                span { class: "lay-params-engine", title: "{params_name}", "{params_name}" }
+                button {
+                    class: "lay-btn lay-small",
+                    r#type: "button",
+                    title: "Reset {params_name} to its default settings",
+                    onclick: move |_| {
+                        let id = STATE.read().active.clone();
+                        put_settings(&id, default_settings(&id));
+                    },
+                    "↺"
+                }
+            }
             {engine_params(&active)}
 
             // One primary-action slot for every engine kind (was two separate
@@ -2267,6 +2347,282 @@ pub fn panel(ctx: Ctx) -> Element {
             }
             if !solve_msg.is_empty() {
                 div { class: "lay-err", "{solve_msg}" }
+            }
+        }
+    }
+}
+
+// --- engine gallery ----------------------------------------------------------------------
+
+/// One rich engine card: name + live "running" pill, kind/processor chips,
+/// a clamped description, and a disabled-with-reason state. A real
+/// `<button>` so selection is keyboard-reachable (Enter/Space) — one click
+/// switches the engine.
+#[component]
+fn EngineCard(
+    name: String,
+    description: String,
+    kind_label: String,
+    kind_class: &'static str,
+    proc_label: String,
+    proc_class: &'static str,
+    active: bool,
+    disabled: bool,
+    disabled_reason: Option<String>,
+    /// Dashed-border "ghost" treatment for the kept-but-unadvertised remote
+    /// selection.
+    #[props(default)]
+    ghost: bool,
+    title: String,
+    on_select: EventHandler<()>,
+) -> Element {
+    let mut class = String::from("lay-card");
+    if active {
+        class.push_str(" active");
+    }
+    if ghost {
+        class.push_str(" ghost");
+    }
+    rsx! {
+        button {
+            class: "{class}",
+            r#type: "button",
+            disabled,
+            title: "{title}",
+            aria_pressed: if active { "true" } else { "false" },
+            onclick: move |_| on_select.call(()),
+            div { class: "lay-card-head",
+                span { class: "lay-card-name", "{name}" }
+                if active {
+                    span { class: "lay-live", "● running" }
+                }
+            }
+            div { class: "lay-card-chips",
+                span { class: "lay-chip {kind_class}", "{kind_label}" }
+                span { class: "lay-chip {proc_class}", "{proc_label}" }
+            }
+            if !description.is_empty() {
+                p { class: "lay-card-desc", "{description}" }
+            }
+            if let Some(reason) = disabled_reason {
+                span { class: "lay-card-why", "{reason}" }
+            }
+        }
+    }
+}
+
+fn local_card(d: &LayoutDescriptor, active: bool) -> Element {
+    let id = d.id;
+    let (kind_label, kind_class) = match d.kind {
+        LayoutKind::Static => ("static", "kind-static"),
+        LayoutKind::Physics => ("physics", "kind-physics"),
+    };
+    let (proc_label, proc_class) = if id == "gpu-force" {
+        ("gpu", "proc-gpu")
+    } else {
+        ("cpu", "proc-cpu")
+    };
+    rsx! {
+        EngineCard {
+            key: "{id}",
+            name: d.display_name.to_string(),
+            description: d.description.to_string(),
+            kind_label: kind_label.to_string(),
+            kind_class,
+            proc_label: proc_label.to_string(),
+            proc_class,
+            active,
+            disabled: false,
+            disabled_reason: None,
+            title: d.description.to_string(),
+            on_select: move |_| set_active(id),
+        }
+    }
+}
+
+/// The This Device gallery: one rich card per local engine (gpu-force
+/// physics + the static solvers).
+fn local_gallery(active: &str) -> Element {
+    rsx! {
+        div {
+            class: "lay-gallery",
+            role: "group",
+            aria_label: "Layout engines that run on this device",
+            for d in local_descriptors() {
+                {local_card(d, d.id == active)}
+            }
+        }
+        div { class: "lay-hint",
+            "These engines solve in this app — no worker needed. Static engines run \
+             once per Solve; physics engines run live."
+        }
+    }
+}
+
+fn remote_card(e: &EngineInfo, selected: bool, server_backed: bool) -> Element {
+    let id = e.id.clone();
+    let lower = e.kind.to_lowercase();
+    let (kind_label, kind_class) = if lower.contains("phys") {
+        ("physics".to_string(), "kind-physics")
+    } else if lower.contains("static") {
+        ("static".to_string(), "kind-static")
+    } else if e.kind.is_empty() {
+        ("engine".to_string(), "kind-remote")
+    } else {
+        (e.kind.clone(), "kind-remote")
+    };
+    let title = if e.description.is_empty() {
+        e.kind.clone()
+    } else {
+        format!("{} — {}", e.kind, e.description)
+    };
+    let key = id.clone();
+    rsx! {
+        EngineCard {
+            key: "{key}",
+            name: e.display_name.clone(),
+            description: e.description.clone(),
+            kind_label,
+            kind_class,
+            proc_label: "cluster".to_string(),
+            proc_class: "proc-cluster",
+            active: selected,
+            disabled: !server_backed,
+            disabled_reason: (!server_backed)
+                .then(|| "browser-owned graph — host it through graph-api".to_string()),
+            title,
+            on_select: move |_| select_remote_engine(&id),
+        }
+    }
+}
+
+/// The Compute Cluster gallery: a worker status card (health dot, one-line
+/// summary, reconnect + refresh) above the engines advertised by
+/// `GET /compute/engines`. Unavailable states render as designed empty
+/// cards carrying the reason and the recovery action — the same states the
+/// old picker's disabled placeholder options carried.
+fn cluster_gallery(
+    snap: &Option<Result<ComputeEngines, String>>,
+    health: Option<&ComputeHealth>,
+    server_backed: bool,
+    selected_remote: Option<&str>,
+    is_bridge: bool,
+) -> Element {
+    let (dot, state) = worker_status(health);
+    let sub = worker_health_sub(health);
+    let engines: &[EngineInfo] = match snap {
+        Some(Ok(eng)) if eng.connected => &eng.engines,
+        _ => &[],
+    };
+    // Active bridge engine missing from the advertised list — keep the
+    // gallery honest about what is selected (the old picker's ghost option).
+    let ghost = selected_remote
+        .filter(|sel| !engines.iter().any(|e| e.id == *sel))
+        .map(str::to_string);
+
+    rsx! {
+        div { class: "lay-worker {state}",
+            span { class: "lay-worker-dot", "{dot}" }
+            div { class: "lay-worker-info",
+                div { class: "lay-worker-title", "Compute worker" }
+                div { class: "lay-worker-sub", title: "{sub}", "{sub}" }
+            }
+            if is_bridge {
+                button {
+                    class: "lay-btn lay-small",
+                    r#type: "button",
+                    title: "Reconnect to the compute worker and restart the position stream",
+                    onclick: move |_| restart_active(),
+                    "reconnect"
+                }
+            }
+            button {
+                class: "lay-btn lay-small",
+                r#type: "button",
+                title: "Refresh the remote engine list and worker health",
+                onclick: move |_| {
+                    spawn(async move { fetch_compute().await; });
+                },
+                "↻"
+            }
+        }
+
+        if !server_backed {
+            div { class: "lay-health bad",
+                "Remote layouts are disabled: this graph exists only in the browser. \
+                 Choose a local engine or host the graph through graph-api."
+            }
+        }
+
+        match snap {
+            None => rsx! {
+                div { class: "lay-empty",
+                    panel_kit::Spinner { label: "contacting graph-api for the engine list…" }
+                }
+            },
+            Some(Err(error)) => rsx! {
+                div { class: "lay-empty",
+                    span { class: "lay-empty-title", "✕ Engines unavailable" }
+                    span { class: "lay-empty-text", "{error}" }
+                    button {
+                        class: "lay-btn lay-small",
+                        r#type: "button",
+                        title: "Retry fetching the engine list",
+                        onclick: move |_| {
+                            spawn(async move { fetch_compute().await; });
+                        },
+                        "retry"
+                    }
+                }
+            },
+            Some(Ok(eng)) if !eng.connected => rsx! {
+                div { class: "lay-empty",
+                    span { class: "lay-empty-title", "○ No compute worker" }
+                    span { class: "lay-empty-text",
+                        "graph-api has no compute broker configured (--compute-url). \
+                         Worker engines appear here as soon as one connects."
+                    }
+                }
+            },
+            Some(Ok(_)) => rsx! {},
+        }
+
+        if !engines.is_empty() {
+            div {
+                class: "lay-gallery",
+                role: "group",
+                aria_label: "Layout engines on the compute cluster",
+                for e in engines {
+                    {remote_card(e, selected_remote == Some(e.id.as_str()), server_backed)}
+                }
+            }
+            div { class: "lay-hint",
+                "Compute-cluster engines stream from graph-compute via graph-api."
+            }
+        }
+
+        if let Some(ghost_id) = ghost {
+            {
+                let id = ghost_id.clone();
+                rsx! {
+                    EngineCard {
+                        name: ghost_id,
+                        description: "Not advertised by the connected worker — the selection is kept."
+                            .to_string(),
+                        kind_label: "engine".to_string(),
+                        kind_class: "kind-remote",
+                        proc_label: "cluster".to_string(),
+                        proc_class: "proc-cluster",
+                        active: true,
+                        disabled: !server_backed,
+                        disabled_reason: (!server_backed)
+                            .then(|| "browser-owned graph — host it through graph-api".to_string()),
+                        ghost: true,
+                        title: "The connected worker does not advertise this engine; the selection is kept."
+                            .to_string(),
+                        on_select: move |_| select_remote_engine(&id),
+                    }
+                }
             }
         }
     }
