@@ -200,7 +200,7 @@ graphCompute:
     # Seconds to wait for the Ray head pod to become ready after admission.
     headStartTimeoutSeconds: 900
   ray:
-    image: vllm/vllm-openai@sha256:e4f88a835143cd22aee2397a26ec6bb80b3a4a6fe0c882bcbc63822904766089
+    image: rayproject/ray:2.52.0-py311@sha256:a601a539f3d881d644848690622cfa4d31e22d6cb3f5158e8b4bb96418d28da8
     rayVersion: "2.52.0"
     queueName: gpu
     workloadPriorityClassName: batch
