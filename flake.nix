@@ -488,7 +488,14 @@
               contents = [
                 graph-compute-k8s-binary
                 pkgs.cacert
+                # vulkan-loader + mesa (lavapipe) so wgpu can create a
+                # device on a headless node. VK_ADD_DRIVER_FILES is
+                # additive: when the NVIDIA device plugin injects the
+                # driver's Vulkan ICD via CDI, wgpu's HighPerformance
+                # preference selects the discrete adapter and lavapipe is
+                # only the fallback.
                 pkgs.vulkan-loader
+                pkgs.mesa
               ];
               extraCommands = ''
                 mkdir -p etc/ssl/certs
@@ -508,6 +515,8 @@
                   "RUST_LOG=${graphComputeService.rustLog}"
                   "SSL_CERT_FILE=/etc/ssl/certs/ca-bundle.crt"
                   "NIX_SSL_CERT_FILE=/etc/ssl/certs/ca-bundle.crt"
+                  "LD_LIBRARY_PATH=/lib"
+                  "VK_ADD_DRIVER_FILES=/share/vulkan/icd.d/lvp_icd.x86_64.json"
                 ];
                 Labels = {
                   "org.opencontainers.image.source" = "https://github.com/ocasazza/jump-cannon";
