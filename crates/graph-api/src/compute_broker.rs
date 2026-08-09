@@ -537,6 +537,17 @@ impl ComputeBroker {
         self.inner.tx.read().await.as_ref().map(|tx| tx.subscribe())
     }
 
+    /// Number of live broadcast receivers (open `/graph/layout/stream`
+    /// WebSocket clients). Used by the GPU-session controller's idle
+    /// auto-park rule: zero subscribers means no renderer is consuming
+    /// remote frames.
+    pub async fn subscriber_count(&self) -> usize {
+        match self.inner.tx.read().await.as_ref() {
+            Some(tx) => tx.receiver_count(),
+            None => 0,
+        }
+    }
+
     /// The currently-selected remote layout (ADR-002). Mainly a test seam for
     /// asserting that `reselect` updated the stored selection.
     pub async fn selection(&self) -> RemoteLayout {

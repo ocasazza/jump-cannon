@@ -180,6 +180,25 @@ graphCompute:
   rustLog: info
   tickHz: "30"
   bindAddr: "[::]:50051"
+  # On-demand GPU session lifecycle. When enabled, the chart does NOT create
+  # the RayCluster CR; instead it renders the identical manifest into the
+  # <fullname>-gpu-session-template ConfigMap mounted into graph-api, which
+  # creates/deletes the RayCluster on demand (explicit dispatch/park,
+  # idle auto-park, hard time cap) within the standing Kueue quota envelope.
+  # The compute Service always renders (zero endpoints while parked).
+  # Requires graphApi.replicas == 1 (enforced by a chart fail).
+  session:
+    enabled: false
+    # Seconds of no cluster-engine activity before the session auto-parks.
+    idleSeconds: 900
+    # Seconds to wait for Kueue admission before failing the session.
+    admissionTimeoutSeconds: 600
+    # Hard cap on session lifetime in seconds. Also stamped onto the
+    # RayCluster as the kueue.x-k8s.io/max-exec-time-seconds label in BOTH
+    # modes (Kueue-enforced safety rail).
+    maxExecTimeSeconds: 14400
+    # Seconds to wait for the Ray head pod to become ready after admission.
+    headStartTimeoutSeconds: 900
   ray:
     image: vllm/vllm-openai@sha256:e4f88a835143cd22aee2397a26ec6bb80b3a4a6fe0c882bcbc63822904766089
     rayVersion: "2.52.0"

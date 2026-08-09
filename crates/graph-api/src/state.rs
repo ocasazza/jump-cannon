@@ -22,6 +22,7 @@ use data_loader::{HostedImporter, ImportError, ImporterSchema, LoadResult, Searc
 use vault_data::VaultGraph;
 
 use crate::compute_broker::ComputeBroker;
+use crate::gpu_session::GpuSessionHandle;
 use crate::importer_catalog::ImporterCatalog;
 use crate::progress::ProgressLog;
 use crate::search_index::SearchIndex;
@@ -167,6 +168,10 @@ pub struct AppStateInner {
     pub assets_dir: Option<PathBuf>,
     /// gRPC client to a `graph-compute` worker.
     pub compute_broker: ComputeBroker,
+    /// On-demand GPU session controller (Kueue/KubeRay RayCluster
+    /// lifecycle). `None` when the feature is disabled — no template mounted
+    /// or no kube client — so local dev is completely unaffected (R11).
+    pub gpu_session: Option<GpuSessionHandle>,
     /// Append-only event log mirrored by the frontend's `Progress` UI
     /// (poll via `GET /progress?since=<seq>`). Used by the watcher to
     /// surface "Scanning vault / Loading graph / Rebuilding search
@@ -225,10 +230,23 @@ impl AppState {
                 snapshot: ArcSwap::new(Arc::new(snapshot)),
                 assets_dir,
                 compute_broker,
+                gpu_session: None,
                 progress,
                 importer_catalog,
             }),
         })
+    }
+
+    /// Attach the GPU session controller handle. Consumes + returns self so
+    /// `main` can chain it onto the constructor before the state is shared;
+    /// if the `Arc` is already shared the handle is dropped with a warning
+    /// (a startup ordering bug, not a runtime hazard).
+    pub fn with_gpu_session(mut self, handle: Option<GpuSessionHandle>) -> Self {
+        match Arc::get_mut(&mut self.inner) {
+            Some(inner) => inner.gpu_session = handle,
+            None => tracing::warn!("gpu session handle dropped: AppState already shared"),
+        }
+        self
     }
 
     /// Single atomic load of the current snapshot. Hold the returned

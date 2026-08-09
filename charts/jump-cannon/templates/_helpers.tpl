@@ -256,6 +256,128 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- printf "%s:%s" .Values.graphCompute.image.repository .Values.graphCompute.image.tag -}}
 {{- end -}}
 
+{{- define "jump-cannon.computeName" -}}
+{{- printf "%s-compute" (include "jump-cannon.fullname" .) -}}
+{{- end -}}
+
+{{- define "jump-cannon.computeNamespace" -}}
+{{- default .Release.Namespace .Values.graphCompute.namespace -}}
+{{- end -}}
+
+{{/*
+Single source of truth for the graph-compute RayCluster manifest. Rendered
+directly as a CR by raycluster-compute.yaml when
+graphCompute.session.enabled=false, and embedded into the gpu-session-template
+ConfigMap when session mode is on, so the two paths can never drift.
+The kueue.x-k8s.io/max-exec-time-seconds label is the Kueue-enforced hard cap
+and must be present in BOTH modes.
+*/}}
+{{- define "jump-cannon.rayclusterManifest" -}}
+apiVersion: ray.io/v1
+kind: RayCluster
+metadata:
+  name: {{ include "jump-cannon.computeName" . }}
+  namespace: {{ include "jump-cannon.computeNamespace" . }}
+  labels:
+    {{- include "jump-cannon.labels" . | nindent 4 }}
+    app.kubernetes.io/component: graph-compute
+    kueue.x-k8s.io/queue-name: {{ .Values.graphCompute.ray.queueName | quote }}
+    kueue.x-k8s.io/priority-class: {{ .Values.graphCompute.ray.workloadPriorityClassName | quote }}
+    kueue.x-k8s.io/max-exec-time-seconds: {{ default 14400 .Values.graphCompute.session.maxExecTimeSeconds | quote }}
+  annotations:
+    ai-gateway.schrodinger.com/ttl-seconds: {{ .Values.graphCompute.ray.ttlSeconds | quote }}
+spec:
+  rayVersion: {{ .Values.graphCompute.ray.rayVersion | quote }}
+  headGroupSpec:
+    rayStartParams:
+      dashboard-host: "0.0.0.0"
+      num-cpus: "0"
+      num-gpus: "0"
+    template:
+      metadata:
+        labels:
+          {{- include "jump-cannon.selectorLabels" . | nindent 10 }}
+          app.kubernetes.io/component: graph-compute
+      spec:
+        serviceAccountName: {{ .Values.graphCompute.serviceAccountName | quote }}
+        automountServiceAccountToken: false
+        priorityClassName: {{ .Values.graphCompute.ray.podPriorityClassName | quote }}
+        imagePullSecrets:
+          {{- toYaml .Values.imagePullSecrets | nindent 10 }}
+        nodeSelector:
+          {{- toYaml .Values.graphCompute.ray.nodeSelector | nindent 10 }}
+        securityContext:
+          {{- toYaml .Values.graphCompute.podSecurityContext | nindent 10 }}
+        initContainers:
+          - name: install-ray-runtime
+            image: {{ .Values.graphCompute.ray.image | quote }}
+            imagePullPolicy: IfNotPresent
+            command:
+              - /bin/sh
+              - -c
+            args:
+              - |
+                set -eu
+                marker=/opt/ray-runtime/.complete-ray{{ .Values.graphCompute.ray.rayVersion }}
+                [ -f "$marker" ] && exit 0
+                python3 -m pip install --disable-pip-version-check --no-cache-dir --no-deps \
+                  --target /opt/ray-runtime \
+                  ray=={{ .Values.graphCompute.ray.rayVersion }} msgpack==1.2.1 colorful==0.5.8 aiohttp-cors==0.8.1 \
+                  opencensus==0.11.4 opencensus-context==0.1.3 py-spy==0.4.2 \
+                  virtualenv==21.6.1 smart-open==8.0.0
+                PYTHONPATH=/opt/ray-runtime python3 -c 'import ray; assert ray.__version__ == "{{ .Values.graphCompute.ray.rayVersion }}"'
+                touch "$marker"
+            volumeMounts:
+              - name: ray-runtime
+                mountPath: /opt/ray-runtime
+        containers:
+          - name: ray-head
+            image: {{ .Values.graphCompute.ray.image | quote }}
+            imagePullPolicy: IfNotPresent
+            env:
+              - name: PYTHONPATH
+                value: /opt/ray-runtime
+              - name: PATH
+                value: /opt/ray-runtime/bin:/usr/local/bin:/usr/bin:/bin
+              - name: RAY_USAGE_STATS_ENABLED
+                value: "0"
+            ports:
+              - name: gcs
+                containerPort: 6379
+              - name: dashboard
+                containerPort: 8265
+              - name: client
+                containerPort: 10001
+              - name: metrics
+                containerPort: 8080
+            resources:
+              {{- toYaml .Values.graphCompute.ray.headResources | nindent 14 }}
+            volumeMounts:
+              - name: ray-runtime
+                mountPath: /opt/ray-runtime
+          - name: graph-compute
+            image: {{ include "jump-cannon.graphComputeImage" . | quote }}
+            imagePullPolicy: {{ .Values.graphCompute.image.pullPolicy }}
+            ports:
+              - name: grpc
+                containerPort: {{ .Values.graphCompute.service.port }}
+                protocol: TCP
+            env:
+              - name: GRAPH_COMPUTE_TICK_HZ
+                value: {{ .Values.graphCompute.tickHz | quote }}
+              - name: GRAPH_COMPUTE_ADDR
+                value: {{ .Values.graphCompute.bindAddr | quote }}
+              - name: RUST_LOG
+                value: {{ .Values.graphCompute.rustLog | quote }}
+            resources:
+              {{- toYaml .Values.graphCompute.ray.backendResources | nindent 14 }}
+            securityContext:
+              {{- toYaml .Values.containerSecurityContext | nindent 14 }}
+        volumes:
+          - name: ray-runtime
+            emptyDir: {}
+{{- end -}}
+
 {{- define "jump-cannon.testImage" -}}
 {{- printf "%s:%s" .Values.tests.image.repository .Values.tests.image.tag -}}
 {{- end -}}

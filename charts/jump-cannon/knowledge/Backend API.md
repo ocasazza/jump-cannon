@@ -34,3 +34,13 @@ started, and unsafe filesystem profiles during startup.
 Bulk arrays use little-endian numeric buffers; structured messages use protobuf
 or JSON where appropriate. See [[Architecture]], [[Observability]], and
 [[Security Model]]. Importer contracts are documented in [[Importer Runtime]].
+
+The `/compute/*` family fronts the optional remote layout worker
+([[Ray GPU Sessions]]). `/compute/health` and `/compute/engines` degrade
+gracefully when the worker is absent; their wire shapes are frozen contracts
+with the frontend. `GET /compute/session` reports the on-demand GPU session
+lifecycle as derived state with the broker status embedded, and
+`PUT /compute/session` requests dispatch or park; both return soft JSON
+envelopes, and the pair reports `{"enabled": false}` where no cluster is
+available (local development). Session progress and bounded worker logs emit
+to the `gpu-session` group on `/progress`.

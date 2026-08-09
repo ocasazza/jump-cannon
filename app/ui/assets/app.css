@@ -370,6 +370,42 @@ textarea.md:focus { outline:none; border-color:var(--fg); }
 .lay-worker-sub { color:var(--dim); font-size:.64rem; overflow:hidden; text-overflow:ellipsis;
   white-space:nowrap; }
 
+/* layout: GPU session console (cluster gallery header when session mode is on).
+   One instrument merging the session state + worker health; same glyph
+   language as the worker dot (○ off / ◐ warm / ● ok / ⚠ fail). */
+.ses { display:flex; flex-direction:column; gap:.3rem; background:var(--bg);
+  border:1px solid var(--line); border-radius:6px; padding:.45rem .55rem;
+  animation:lay-rise .18s ease-out; }
+.ses.ok { border-color:#1d4426; }
+.ses.warm { border-color:#4a3a12; }
+.ses.fail { border-color:#5a1d1d; }
+.ses-head { display:flex; align-items:center; gap:.55rem; }
+.ses-dot { font-size:.8rem; }
+.ses.ok .ses-dot { color:#3fb950; }
+.ses.warm .ses-dot { color:#d29922; animation:lay-pulse 1.6s infinite; }
+.ses.fail .ses-dot { color:#f85149; }
+.ses.off .ses-dot { color:var(--dim); }
+.ses-info { flex:1; min-width:0; }
+.ses-title { display:flex; align-items:baseline; gap:.45rem; }
+.ses-name { font-weight:700; font-size:.72rem; }
+.ses-state { font-size:.64rem; color:var(--dim); }
+.ses.ok .ses-state { color:#3fb950; }
+.ses.warm .ses-state { color:#d29922; }
+.ses.fail .ses-state { color:#f85149; }
+.ses-detail { color:var(--dim); font-size:.64rem; overflow:hidden; text-overflow:ellipsis;
+  white-space:nowrap; }
+.ses-actions { display:flex; align-items:center; gap:.35rem; flex:0 0 auto; }
+.ses-actions .lay-btn:disabled { opacity:.5; cursor:not-allowed; }
+.ses-cta:not(:disabled) { color:var(--accent); border-color:var(--accent); }
+.ses-fail { color:#f85149; font-size:.64rem; line-height:1.4; }
+.ses-meta { display:flex; align-items:baseline; gap:.8rem; border-top:1px solid var(--line);
+  padding-top:.3rem; }
+.ses-worker { color:var(--dim); font-size:.62rem; overflow:hidden; text-overflow:ellipsis;
+  white-space:nowrap; }
+.ses.ok .ses-worker { color:#3fb950; }
+.ses-idle { margin-left:auto; flex:0 0 auto; color:var(--dim); font-size:.62rem;
+  font-variant-numeric:tabular-nums; }
+
 /* layout: designed empty states (loading / unavailable / no worker) */
 .lay-empty { border:1px dashed var(--line2); border-radius:6px; padding:.6rem .7rem;
   display:flex; flex-direction:column; gap:.3rem; align-items:flex-start; color:var(--dim); }

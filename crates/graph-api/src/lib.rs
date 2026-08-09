@@ -10,6 +10,7 @@
 pub mod binary;
 pub mod browser;
 pub mod compute_broker;
+pub mod gpu_session;
 pub mod importer_catalog;
 pub mod progress;
 pub mod proto;
