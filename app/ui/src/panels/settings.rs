@@ -85,6 +85,13 @@ pub(crate) fn select_tab(tab: SettingsTab) {
     let _ = LocalStorage::set(STORE_KEY, tab);
 }
 
+/// The currently selected tab — lets app-level chrome (the panel header's
+/// action slot) mirror tab-specific affordances, like the Layout tab's
+/// backend switch.
+pub(crate) fn active_tab() -> SettingsTab {
+    *ACTIVE_TAB.read()
+}
+
 fn focus_tab(tab: SettingsTab) {
     let Some(element) = web_sys::window()
         .and_then(|window| window.document())

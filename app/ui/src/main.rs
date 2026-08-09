@@ -882,6 +882,14 @@ fn panel_body(kind: Panel, _maximized: bool, ctx: Ctx) -> Element {
 }
 
 fn panel_header_actions(kind: Panel, ctx: Ctx) -> Element {
+    // The Layout surface is a Settings tab, so its segmented backend switch
+    // (This Device / Compute Cluster + worker status dot) rides the
+    // Settings panel's header-actions slot while that tab is active.
+    if kind == Panel::Settings
+        && panels::settings::active_tab() == panels::settings::SettingsTab::Layout
+    {
+        return panels::layout::backend_switch_header();
+    }
     if kind != Panel::Graph {
         return rsx! {};
     }

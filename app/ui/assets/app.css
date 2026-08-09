@@ -317,6 +317,71 @@ textarea.md:focus { outline:none; border-color:var(--fg); }
   padding:.35rem; box-sizing:border-box; resize:vertical; }
 .lay-right { justify-content:flex-end; }
 
+/* layout: backend galleries + engine cards (This Device / Compute Cluster) */
+.lay-running { display:flex; align-items:center; gap:.5rem; border:1px solid var(--line2);
+  border-left:3px solid #3fb950; border-radius:4px; padding:.3rem .5rem; background:var(--bg); }
+.lay-running-dot { color:#3fb950; font-size:.7rem; animation:lay-pulse 1.6s infinite; }
+.lay-running-text { flex:1; min-width:0; color:var(--fg); font-size:.68rem; overflow:hidden;
+  text-overflow:ellipsis; white-space:nowrap; }
+
+.lay-gallery { display:grid; grid-template-columns:repeat(auto-fill, minmax(10.5rem, 1fr));
+  gap:.4rem; animation:lay-rise .18s ease-out; }
+@keyframes lay-rise { from { opacity:0; transform:translateY(4px); } }
+@keyframes lay-pulse { 50% { opacity:.35; } }
+
+.lay-card { display:flex; flex-direction:column; gap:.3rem; text-align:left;
+  background:var(--bg); color:var(--fg); border:1px solid var(--line); border-radius:6px;
+  padding:.45rem .55rem; cursor:pointer; font-family:var(--mono); font-size:11px; }
+.lay-card:hover:not(:disabled) { border-color:var(--fg); }
+.lay-card:focus-visible { outline:1px solid var(--fg); outline-offset:2px; }
+.lay-card.active { border-color:#3fb950;
+  box-shadow:0 0 0 1px #3fb950, 0 0 14px -6px #3fb950; }
+.lay-card.ghost { border-style:dashed; }
+.lay-card:disabled { opacity:.5; cursor:not-allowed; }
+.lay-card-head { display:flex; align-items:center; justify-content:space-between; gap:.4rem; }
+.lay-card-name { font-weight:700; font-size:.74rem; overflow:hidden; text-overflow:ellipsis; }
+.lay-live { flex:0 0 auto; color:#3fb950; font-size:.58rem; text-transform:uppercase;
+  letter-spacing:.08em; animation:lay-pulse 1.6s infinite; }
+.lay-card-chips { display:flex; flex-wrap:wrap; gap:.3rem; }
+.lay-chip { border:1px solid var(--line2); border-radius:999px; padding:0 .45rem;
+  font-size:.58rem; line-height:1.6; color:var(--dim); text-transform:uppercase;
+  letter-spacing:.06em; }
+.lay-chip.kind-physics { color:var(--blue); border-color:var(--blue); }
+.lay-chip.kind-static { color:var(--pink); border-color:var(--pink); }
+.lay-chip.kind-remote { color:var(--dim); }
+.lay-chip.proc-gpu { color:#3fb950; border-color:#3fb950; }
+.lay-chip.proc-cpu { color:var(--dim); }
+.lay-chip.proc-cluster { color:var(--accent); border-color:var(--accent); }
+.lay-card-desc { margin:0; color:var(--dim); font-size:.64rem; line-height:1.4;
+  display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical; overflow:hidden; }
+.lay-card-why { color:#d29922; font-size:.62rem; }
+
+/* layout: compute worker status card (cluster gallery header) */
+.lay-worker { display:flex; align-items:center; gap:.55rem; background:var(--bg);
+  border:1px solid var(--line); border-radius:6px; padding:.4rem .55rem; }
+.lay-worker.ok { border-color:#1d4426; }
+.lay-worker.warn { border-color:#4a3a12; }
+.lay-worker-dot { font-size:.8rem; }
+.lay-worker.ok .lay-worker-dot { color:#3fb950; }
+.lay-worker.warn .lay-worker-dot { color:#d29922; }
+.lay-worker.off .lay-worker-dot { color:var(--dim); }
+.lay-worker-info { flex:1; min-width:0; }
+.lay-worker-title { font-weight:700; font-size:.72rem; }
+.lay-worker-sub { color:var(--dim); font-size:.64rem; overflow:hidden; text-overflow:ellipsis;
+  white-space:nowrap; }
+
+/* layout: designed empty states (loading / unavailable / no worker) */
+.lay-empty { border:1px dashed var(--line2); border-radius:6px; padding:.6rem .7rem;
+  display:flex; flex-direction:column; gap:.3rem; align-items:flex-start; color:var(--dim); }
+.lay-empty-title { color:var(--fg); font-weight:700; font-size:.72rem; }
+.lay-empty-text { font-size:.66rem; line-height:1.45; }
+
+/* layout: parameters section header (names the running engine + reset) */
+.lay-params-head { display:flex; align-items:baseline; gap:.5rem; margin-top:.3rem; }
+.lay-params-head .lay-sub { margin-top:0; }
+.lay-params-engine { flex:1; min-width:0; color:var(--dim); font-size:.66rem; overflow:hidden;
+  text-overflow:ellipsis; white-space:nowrap; }
+
 /* === panel: style (owned by panels/style.rs) === */
 .sty { display:flex; flex-direction:column; gap:.3rem; font-size:11.5px; }
 .sty-reset-row { display:flex; justify-content:flex-end; }
