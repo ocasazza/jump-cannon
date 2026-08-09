@@ -308,37 +308,11 @@ spec:
           {{- toYaml .Values.graphCompute.ray.nodeSelector | nindent 10 }}
         securityContext:
           {{- toYaml .Values.graphCompute.podSecurityContext | nindent 10 }}
-        initContainers:
-          - name: install-ray-runtime
-            image: {{ .Values.graphCompute.ray.image | quote }}
-            imagePullPolicy: IfNotPresent
-            command:
-              - /bin/sh
-              - -c
-            args:
-              - |
-                set -eu
-                marker=/opt/ray-runtime/.complete-ray{{ .Values.graphCompute.ray.rayVersion }}
-                [ -f "$marker" ] && exit 0
-                python3 -m pip install --disable-pip-version-check --no-cache-dir --no-deps \
-                  --target /opt/ray-runtime \
-                  ray=={{ .Values.graphCompute.ray.rayVersion }} msgpack==1.2.1 colorful==0.5.8 aiohttp-cors==0.8.1 \
-                  opencensus==0.11.4 opencensus-context==0.1.3 py-spy==0.4.2 \
-                  virtualenv==21.6.1 smart-open==8.0.0
-                PYTHONPATH=/opt/ray-runtime python3 -c 'import ray; assert ray.__version__ == "{{ .Values.graphCompute.ray.rayVersion }}"'
-                touch "$marker"
-            volumeMounts:
-              - name: ray-runtime
-                mountPath: /opt/ray-runtime
         containers:
           - name: ray-head
             image: {{ .Values.graphCompute.ray.image | quote }}
             imagePullPolicy: IfNotPresent
             env:
-              - name: PYTHONPATH
-                value: /opt/ray-runtime
-              - name: PATH
-                value: /opt/ray-runtime/bin:/usr/local/bin:/usr/bin:/bin
               - name: RAY_USAGE_STATS_ENABLED
                 value: "0"
             ports:
@@ -352,9 +326,6 @@ spec:
                 containerPort: 8080
             resources:
               {{- toYaml .Values.graphCompute.ray.headResources | nindent 14 }}
-            volumeMounts:
-              - name: ray-runtime
-                mountPath: /opt/ray-runtime
           - name: graph-compute
             image: {{ include "jump-cannon.graphComputeImage" . | quote }}
             imagePullPolicy: {{ .Values.graphCompute.image.pullPolicy }}
@@ -373,9 +344,6 @@ spec:
               {{- toYaml .Values.graphCompute.ray.backendResources | nindent 14 }}
             securityContext:
               {{- toYaml .Values.containerSecurityContext | nindent 14 }}
-        volumes:
-          - name: ray-runtime
-            emptyDir: {}
 {{- end -}}
 
 {{- define "jump-cannon.testImage" -}}

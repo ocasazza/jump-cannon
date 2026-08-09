@@ -31,6 +31,11 @@ external deletions (eviction, janitor) self-heal to parked. Progress and
 bounded Ray head / graph-compute logs stream to the `gpu-session` group on
 [[Backend API]]'s `/progress`; the cluster gallery renders the console.
 
+The RayCluster base image is the official `rayproject/ray` build with Ray
+preinstalled — never bootstrap Ray with a runtime `pip install` init
+container: cluster egress MITMs PyPI TLS, and the pull-then-install path made
+session starts slow and fragile.
+
 Safety rails: an admission timeout parks a session that never gets quota; a
 `kueue.x-k8s.io/max-exec-time-seconds` label caps admitted runtime; a
 watchdog deletes the CR and fails the session if no Kueue Workload appears
