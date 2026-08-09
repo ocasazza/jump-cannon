@@ -75,7 +75,11 @@ spec:
   timeZone: {{ . | quote }}
   {{- end }}
   suspend: {{ .Values.tests.performance.suspend }}
-  concurrencyPolicy: Forbid
+  # Kueue holds this Job suspended while GPU quota is 0, and a suspended Job
+  # stays "active" forever. Under Forbid that starves every later run, so the
+  # nightly schedule would only ever admit the first queued Job. Replace lets
+  # each night supersede the stale queued Workload.
+  concurrencyPolicy: {{ .Values.tests.performance.concurrencyPolicy }}
   successfulJobsHistoryLimit: 2
   failedJobsHistoryLimit: 3
   jobTemplate:
@@ -89,6 +93,9 @@ spec:
         {{- end }}
     spec:
       ttlSecondsAfterFinished: 86400
+      # Only counts unsuspended time, so this bounds a run that has been
+      # admitted and then hangs; it does not expire a Kueue-held Job.
+      activeDeadlineSeconds: {{ .Values.tests.performance.activeDeadlineSeconds }}
       backoffLimit: 0
       template:
         metadata:

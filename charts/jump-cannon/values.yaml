@@ -243,7 +243,7 @@ tests:
   fuzz:
     enabled: true
     suspend: false
-    schedule: "0 0 * * 0"
+    schedule: "0 0 * * *"
     cases: "10000"
     kueue:
       enabled: false
@@ -254,7 +254,13 @@ tests:
     enabled: true
     namespace: ""
     suspend: false
-    schedule: "30 0 * * 0"
+    schedule: "30 0 * * *"
+    # Replace, not Forbid: a Kueue-held Job never stops being active, so Forbid
+    # would let one queued run starve every following night.
+    concurrencyPolicy: Replace
+    # Bounds an admitted-then-hung benchmark. Suspended (queued) time does not
+    # count toward it, so this never cancels a Job that is merely awaiting GPU.
+    activeDeadlineSeconds: 3600
     includeHuge: "0"
     kueue:
       enabled: true
@@ -275,7 +281,7 @@ tests:
   browser:
     enabled: true
     suspend: false
-    schedule: "15 0 * * 0"
+    schedule: "15 0 * * *"
     baseUrl: http://jump-cannon:80
     timeoutSeconds: "90"
     # Includes scheduling and the observed cold pull of the test-runner image

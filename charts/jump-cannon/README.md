@@ -1,8 +1,8 @@
 # jump-cannon chart
 
 This chart packages the jump-cannon frontend/API, an optional Kueue-admitted
-RayCluster GPU compute session, and weekly CronJobs for fuzz, performance, and
-browser smoke tests. By default, the jobs run on Sunday in
+RayCluster GPU compute session, and nightly CronJobs for fuzz, performance, and
+browser smoke tests. By default, the jobs run every day in
 `America/Los_Angeles`: fuzz at 00:00, browser smoke at 00:15, and performance
 at 00:30.
 
