@@ -10,6 +10,9 @@ tags: [jump-cannon, security]
 
 The chart runs non-root, drops Linux capabilities, disables service-account
 token automount by default, and keeps packaged documentation in ConfigMaps.
+On-demand GPU session mode (see [[Ray GPU Sessions]]) is the one exception:
+the controller manages the session RayCluster through the in-cluster API, so
+session mode forces token automount on with the bound gpu-session Role.
 Never put credentials or sensitive source data in Helm values or this graph.
 
 Importer access is explicit and least-privilege. Network exposure is

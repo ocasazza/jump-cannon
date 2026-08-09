@@ -39,7 +39,9 @@ spec:
       {{- end }}
     spec:
       serviceAccountName: {{ include "jump-cannon.serviceAccountName" . }}
-      automountServiceAccountToken: {{ .Values.serviceAccount.automountServiceAccountToken }}
+      {{- /* The GPU session controller needs in-cluster API access to manage the
+             session RayCluster, so session mode forces token automount on. */}}
+      automountServiceAccountToken: {{ or .Values.serviceAccount.automountServiceAccountToken $gpuSession }}
       imagePullSecrets:
         {{- toYaml .Values.imagePullSecrets | nindent 8 }}
       securityContext:

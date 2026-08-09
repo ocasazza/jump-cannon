@@ -100,6 +100,9 @@ pkgs.runCommand "jump-cannon-chart-tarball"
     grep -Fq 'name: JUMP_CANNON_GPU_SESSION_CLUSTER_NAME' gpu-session.yaml
     grep -Fq 'name: JUMP_CANNON_GPU_SESSION_NAMESPACE' gpu-session.yaml
     grep -Fq 'jump-cannon-compute' gpu-session.yaml
+    # The session controller needs the in-cluster API; session mode must
+    # force service-account token automount on.
+    grep -Fq 'automountServiceAccountToken: true' gpu-session.yaml
     if grep -Fq 'rayclusters/finalizers' gpu-session.yaml; then
       echo "session RBAC must not touch RayCluster finalizers" >&2
       exit 1
