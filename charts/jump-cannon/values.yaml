@@ -287,3 +287,10 @@ tests:
     # Includes scheduling and the observed cold pull of the test-runner image
     # in addition to the 90-second in-process browser deadline.
     activeDeadlineSeconds: 900
+
+# Grafana dashboards ship as labeled ConfigMaps (one per dashboards/*.json).
+# The monitoring stack's Grafana sidecar watches the label and loads them.
+grafanaDashboards:
+  enabled: true
+  label: grafana_dashboard
+  labelValue: "1"

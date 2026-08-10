@@ -1,0 +1,19 @@
+# Grafana dashboards ship with the chart so the app owns what it is measured
+# by. Each JSON under dashboards/ becomes one labeled ConfigMap; the
+# monitoring stack's Grafana sidecar (k8s-sidecar watching
+# grafana_dashboard=1) loads them into its provisioned charts folder.
+{{- if .Values.grafanaDashboards.enabled }}
+{{- range $path, $_ := .Files.Glob "dashboards/*.json" }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "jump-cannon.fullname" $ }}-grafana-{{ base $path | trimSuffix ".json" }}
+  labels:
+    {{- include "jump-cannon.labels" $ | nindent 4 }}
+    {{ $.Values.grafanaDashboards.label }}: {{ $.Values.grafanaDashboards.labelValue | quote }}
+data:
+  {{ base $path }}: |-
+{{ $.Files.Get $path | indent 4 }}
+{{- end }}
+{{- end }}

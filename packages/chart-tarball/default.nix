@@ -31,8 +31,11 @@ pkgs.runCommand "jump-cannon-chart-tarball"
     grep -Fq 'name: JUMP_CANNON_SOURCE' legacy.yaml
     grep -Fq 'value: "obsidian"' legacy.yaml
 
+    # Dashboards are release-scoped, not importer-scoped: disable them here so
+    # the no-ConfigMap guard below keeps covering only importer resources.
     helm template lavender ./jump-cannon \
       -f ./jump-cannon/ci/lavender-ingest-okf-values.yaml \
+      --set grafanaDashboards.enabled=false \
       > lavender.yaml
     grep -Fq 'name: JUMP_CANNON_IMPORTER_CATALOG_JSON' lavender.yaml
     grep -Fq 'name: JUMP_CANNON_OKF_SOURCE_ID' lavender.yaml
@@ -61,6 +64,24 @@ pkgs.runCommand "jump-cannon-chart-tarball"
       > legacy-kubernetes.yaml
     grep -Fq 'name: JUMP_CANNON_KUBERNETES_CONFIG' legacy-kubernetes.yaml
     grep -Fq 'value: "kubernetes"' legacy-kubernetes.yaml
+
+    # Grafana dashboards: every dashboards/*.json ships as a labeled ConfigMap
+    # for the monitoring stack's sidecar; disabling drops them all. (Match the
+    # rendered ConfigMap name/label, not the bare label string — the packaged
+    # knowledge notes mention grafana_dashboard in prose.)
+    grep -Fq 'grafana_dashboard: "1"' legacy.yaml
+    grep -Fq 'jump-cannon-grafana-test-results' legacy.yaml
+    helm template no-dashboards ./jump-cannon \
+      --set grafanaDashboards.enabled=false \
+      --set graphCompute.enabled=false \
+      --set tests.fuzz.enabled=false \
+      --set tests.performance.enabled=false \
+      --set tests.browser.enabled=false \
+      > no-dashboards.yaml
+    if grep -Fq 'jump-cannon-grafana-test-results' no-dashboards.yaml; then
+      echo "grafanaDashboards.enabled=false must not render dashboard ConfigMaps" >&2
+      exit 1
+    fi
 
     helm template named-kubernetes ./jump-cannon \
       -f ./jump-cannon/ci/named-kubernetes-values.yaml \
