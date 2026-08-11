@@ -14,7 +14,7 @@ The test harness in `crates/test-browser/` is the only exception, and only becau
 
 | Crate | Role |
 |---|---|
-| `crates/data-loader` | Source-neutral importer contracts. Every descriptor carries discovery schema version 1, and every completed import emits one validated `SearchDocument` per graph node. Defines the six CLI source kinds: Obsidian, tvix, generate, Kubernetes, OKF, and Pest. |
+| `crates/data-loader` | Source-neutral importer contracts. Every descriptor carries discovery schema version 1, and every completed import emits one validated `SearchDocument` per graph node. Defines the seven CLI source kinds: Obsidian, tvix, generate, Kubernetes, OKF, Pest, and GitHub. |
 | `crates/graph-api` | axum HTTP server. Loads the selected importer, serves `/graph/*`, `/graph/schema`, `/node/*id`, `/search`, `/vault/page` (Obsidian editor PUT), `/progress`, etc. Atomically swaps an in-memory `GraphSnapshot` containing the graph, importer schema, generic Tantivy search index, schema-driven facets, metrics, and binary caches. Serves the frontend dist from `--assets-dir` / `JUMP_CANNON_ASSETS_DIR`. |
 | `crates/graph-layouts` | wgpu compute force-sim. Native + WASM. Consumed in-process by `app/ui` (path dependency). |
 | `crates/graph-compute` | Optional standalone layout solver, gRPC on `[::1]:50051`. Opt-in via `--compute-url` / `JUMP_CANNON_COMPUTE_URL` — unset means the broker is never dialed. Runs through the local docker-compose development stack or the Helm chart's Kueue-admitted RayCluster. |
@@ -25,7 +25,7 @@ The test harness in `crates/test-browser/` is the only exception, and only becau
 | `crates/okf-importer` | Bounded filesystem importer for the official Open Knowledge Format v0.2 schema, including typed status, trust, attestation, provenance, and relationship discovery. |
 | `crates/kubernetes-importer` | Capability-scoped, allowlisted Kubernetes metadata importer with owner-reference edges and namespace/API/label facets. |
 | `crates/pest-importer` | Trusted runtime grammar importer. Manifest format 2 requires package authors to declare the property fields admitted to search and facets. |
-| `crates/vault-search` | Legacy standalone Obsidian-only HTTP search service. It remains independently runnable for compatibility consumers but graph-api does not spawn or query it. |
+| `crates/github-importer` | GitHub tarball importer. Polls codeload with ETag revalidation, extracts into a local cache, and reuses vault-links Obsidian parsing so the knowledge corpus updates push-to-main without a chart republish. |
 | `crates/tvix-wasm` | `tvix-eval` bridge — native + WASM Nix expression evaluator. Enables Nix expressions in the UI/data pipeline without shelling out. |
 | `crates/test-browser` | Rust-only Chromium driver (chromiumoxide) for the foundational browser regression suite. Spawned by `just test browser-rust` / `nix run .#test-browser-rust`. |
 
@@ -50,7 +50,7 @@ Scope rule: the compute layer (`graph-compute`, gRPC broker, Kubernetes/Ray orch
 ## Data flow
 
 ```
-configured source (Obsidian / tvix / generate / Kubernetes / OKF / Pest)
+configured source (Obsidian / tvix / generate / Kubernetes / OKF / Pest / GitHub)
        │
        ▼
 importer ──► Graph + ImporterSchema + one SearchDocument per node
@@ -95,7 +95,7 @@ The whole repo builds through **nix + crane + trunk**. No `npm install`, no `was
 - `just dev-down` — symmetric teardown.
 - `just app-dev` / `just app-build` — Tauri desktop shell (dev / release bundles).
 - `just run` — production binary, no watch: builds the app dist (`cd app && trunk build --release`) then serves it via `--assets-dir app/ui/dist`.
-- `just kill` — purge stray graph-api / legacy standalone vault-search
+- `just kill` — purge stray graph-api
   processes from prior runs.
 
 `just dev-up` and the test recipes are convenience wrappers around the nix outputs — never standalone command stacks.
@@ -134,7 +134,7 @@ The frontend is the Dioxus app in `app/` — panel workspace from `panel-kit` (e
 
 ## Backend state architecture
 
-`graph-api` holds the in-memory `GraphSnapshot` (graph, importer schema, Tantivy index, schema-driven facet summary, id maps, metrics, and binary caches) inside `arc-swap::ArcSwap`. Handlers grab one snapshot per request and the active importer's reload cannot invalidate an in-flight read. The Obsidian watcher (`crates/graph-api/src/watcher.rs`) debounces `.md` changes at 400 ms; a save burst coalesces into one reload. Other sources use their declared static, filesystem, or polling watch plans. A complete search index is built before the new graph revision is swapped in; graph-api does not manage a `vault-search` subprocess.
+`graph-api` holds the in-memory `GraphSnapshot` (graph, importer schema, Tantivy index, schema-driven facet summary, id maps, metrics, and binary caches) inside `arc-swap::ArcSwap`. Handlers grab one snapshot per request and the active importer's reload cannot invalidate an in-flight read. The Obsidian watcher (`crates/graph-api/src/watcher.rs`) debounces `.md` changes at 400 ms; a save burst coalesces into one reload. Other sources use their declared static, filesystem, or polling watch plans. A complete search index is built before the new graph revision is swapped in.
 
 Progress for each reload stage emits to `crates/graph-api/src/progress.rs` and surfaces to the frontend via `GET /progress?since=<seq>`. The app's Progress panel polls and renders the stream automatically.
 

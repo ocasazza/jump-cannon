@@ -17,8 +17,16 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use vault_data::VaultGraph;
 
+pub mod identity;
+pub mod testing;
+
 /// Discovery-schema version understood by this release.
-pub const DISCOVERY_SCHEMA_VERSION: u32 = 1;
+///
+/// Version 2 introduces the unified identity contract: every importer
+/// declares [`ImporterSchema::source_kind`] and every node ID is exactly
+/// `{source_kind}:{source_id}:{local}` (see [`identity`]). Version 1 schemas
+/// are rejected.
+pub const DISCOVERY_SCHEMA_VERSION: u32 = 2;
 /// Descriptor fields are intentionally bounded so a future package-control
 /// plane cannot turn schema validation into an allocation attack.
 pub const MAX_DISCOVERY_FIELDS: usize = 128;
@@ -103,6 +111,17 @@ impl DiscoveryField {
 }
 
 /// Semantics of the canonical edges produced by one importer.
+///
+/// The `key` is declaration-only metadata — nothing consumes it at runtime.
+/// Importers converge on this conventional vocabulary:
+///
+/// | key | meaning |
+/// |---|---|
+/// | `wikilink` | Obsidian `[[wikilink]]` from source note to target note |
+/// | `declared` | edge declared by the source artifact itself (tvix Nix graph, Pest capture map) |
+/// | `generated` | edge produced algorithmically by the graph generator |
+/// | `relationship` | typed relationship between concepts (OKF links, provenance references) |
+/// | `owner_reference` | Kubernetes `ownerReference` from owner to dependent |
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EdgeTypeSchema {
@@ -152,6 +171,10 @@ impl TagHierarchySchema {
 #[serde(deny_unknown_fields)]
 pub struct ImporterSchema {
     pub schema_version: u32,
+    /// The lowercase [`SourceKind`] identifier of the importer that owns this
+    /// schema. Every node ID in the import must be exactly
+    /// `{source_kind}:{source_id}:{local}` (see [`identity`]).
+    pub source_kind: String,
     #[serde(default)]
     pub input_media_types: Vec<String>,
     pub tag_hierarchy: TagHierarchySchema,
@@ -163,12 +186,14 @@ pub struct ImporterSchema {
 
 impl ImporterSchema {
     pub fn new(
+        source_kind: impl Into<String>,
         fields: Vec<DiscoveryField>,
         edge_types: Vec<EdgeTypeSchema>,
         tag_hierarchy: TagHierarchySchema,
     ) -> Self {
         Self {
             schema_version: DISCOVERY_SCHEMA_VERSION,
+            source_kind: source_kind.into(),
             input_media_types: Vec::new(),
             tag_hierarchy,
             fields,
@@ -207,6 +232,16 @@ impl ImporterSchema {
             return Err(invalid_descriptor(format!(
                 "unsupported discovery schema version {}; supported version is {}",
                 self.schema_version, DISCOVERY_SCHEMA_VERSION
+            )));
+        }
+        if let Err(message) = identity::validate_source_kind(&self.source_kind) {
+            return Err(invalid_descriptor(message));
+        }
+        if !SourceKind::all().contains(&self.source_kind.as_str()) {
+            return Err(invalid_descriptor(format!(
+                "source_kind {:?} must be a SourceKind lowercase identifier (one of {})",
+                self.source_kind,
+                SourceKind::all().join(", ")
             )));
         }
         if self.fields.is_empty() || self.fields.len() > MAX_DISCOVERY_FIELDS {
@@ -486,9 +521,27 @@ impl ImporterSchema {
         }
 
         for node in graph.nodes.values() {
-            if node.meta.source_id.trim().is_empty() {
+            // The shared namespace-ambiguity rule: every source_id must be a
+            // safe single namespace segment (`[a-z0-9._-]{1,128}`, no `:`).
+            if let Err(message) = identity::validate_source_id(&node.meta.source_id) {
                 return Err(ImportError::Map {
-                    message: format!("node {:?} has an empty source_id", node.id),
+                    message: format!("node {:?} has an invalid source_id: {message}", node.id),
+                });
+            }
+            // Namespace conformance: every node ID is exactly
+            // `{source_kind}:{source_id}:{local}` with a valid local part.
+            let prefix = format!("{}:{}:", self.source_kind, node.meta.source_id);
+            let Some(local) = node.id.strip_prefix(&prefix) else {
+                return Err(ImportError::Map {
+                    message: format!(
+                        "node {:?} does not start with its namespace prefix {prefix:?}",
+                        node.id
+                    ),
+                });
+            };
+            if let Err(message) = identity::validate_local_id(local) {
+                return Err(ImportError::Map {
+                    message: format!("node {:?} has an invalid local id: {message}", node.id),
                 });
             }
             if node.meta.content_readable && !self.content.readable {
@@ -504,6 +557,20 @@ impl ImporterSchema {
                     message: format!(
                         "node {:?} advertises writable content outside its schema",
                         node.id
+                    ),
+                });
+            }
+        }
+
+        // Every edge endpoint must resolve to a node in this import: dangling
+        // wikilink/reference resolution can never reach publication.
+        for (index, edge) in graph.edges.iter().enumerate() {
+            if !graph.nodes.contains_key(&edge.source) || !graph.nodes.contains_key(&edge.target)
+            {
+                return Err(ImportError::Map {
+                    message: format!(
+                        "edge {index} has a missing endpoint: {:?} -> {:?}",
+                        edge.source, edge.target
                     ),
                 });
             }
@@ -710,6 +777,9 @@ pub enum SourceKind {
     /// Parse a bounded filesystem input with an administrator-installed,
     /// runtime-validated Pest grammar package.
     Pest,
+    /// Import a vault corpus from a GitHub repository tarball (codeload,
+    /// ETag-revalidated polling).
+    GitHub,
 }
 
 impl SourceKind {
@@ -722,13 +792,14 @@ impl SourceKind {
             "kubernetes" | "k8s" => Some(Self::Kubernetes),
             "okf" | "open-knowledge-format" => Some(Self::Okf),
             "pest" | "grammar" => Some(Self::Pest),
+            "github" => Some(Self::GitHub),
             _ => None,
         }
     }
 
     /// All known source kinds (for help text).
     pub fn all() -> &'static [&'static str] {
-        &["obsidian", "tvix", "generate", "kubernetes", "okf", "pest"]
+        &["obsidian", "tvix", "generate", "kubernetes", "okf", "pest", "github"]
     }
 }
 
@@ -1233,6 +1304,7 @@ mod importer_tests {
 
     fn test_schema() -> ImporterSchema {
         ImporterSchema::new(
+            "generate",
             vec![
                 DiscoveryField::new("id", DiscoveryFieldType::Keyword, true).searchable(2),
                 DiscoveryField::new("title", DiscoveryFieldType::Text, true)
@@ -1255,10 +1327,14 @@ mod importer_tests {
         ImporterDescriptor::new("fake", "Fake", "1", capabilities, test_schema())
     }
 
+    /// Namespaced test node ID: `{source_kind}:{source_id}:{local}` for the
+    /// `generate`/`fixture` test namespace.
+    const N1: &str = "generate:fixture:n1";
+
     fn one_node_result(document: SearchDocument) -> LoadResult {
         let mut graph = VaultGraph::new();
         graph.add_node(VaultNode {
-            id: "n1".into(),
+            id: N1.into(),
             meta: vault_data::NodeMeta {
                 source_id: "fixture".into(),
                 title: "Node one".into(),
@@ -1275,8 +1351,8 @@ mod importer_tests {
     }
 
     fn valid_document() -> SearchDocument {
-        SearchDocument::new("n1")
-            .with("id", "n1")
+        SearchDocument::new(N1)
+            .with("id", N1)
             .with("title", "Node one")
             .with("tags", json!(["fixture"]))
     }
@@ -1378,8 +1454,8 @@ mod importer_tests {
     fn discovery_documents_reject_missing_undeclared_and_wrong_typed_fields() {
         let schema = test_schema();
 
-        let missing = SearchDocument::new("n1")
-            .with("id", "n1")
+        let missing = SearchDocument::new(N1)
+            .with("id", N1)
             .with("tags", json!([]));
         let error = schema
             .validate_result(&one_node_result(missing))
@@ -1400,8 +1476,8 @@ mod importer_tests {
             "{error}"
         );
 
-        let wrong_type = SearchDocument::new("n1")
-            .with("id", "n1")
+        let wrong_type = SearchDocument::new(N1)
+            .with("id", N1)
             .with("title", "Node one")
             .with("tags", "fixture");
         let error = schema
@@ -1458,7 +1534,7 @@ mod importer_tests {
     fn discovery_documents_match_canonical_identity_title_and_tags() {
         let schema = test_schema();
 
-        let mismatched_id = SearchDocument::new("n1")
+        let mismatched_id = SearchDocument::new(N1)
             .with("id", "another-id")
             .with("title", "Node one")
             .with("tags", json!(["fixture"]));
@@ -1468,8 +1544,8 @@ mod importer_tests {
             .to_string();
         assert!(error.contains("indexes mismatched id"), "{error}");
 
-        let mismatched_title = SearchDocument::new("n1")
-            .with("id", "n1")
+        let mismatched_title = SearchDocument::new(N1)
+            .with("id", N1)
             .with("title", "Different title")
             .with("tags", json!(["fixture"]));
         let error = schema
@@ -1478,8 +1554,8 @@ mod importer_tests {
             .to_string();
         assert!(error.contains("canonical non-empty title"), "{error}");
 
-        let mismatched_tags = SearchDocument::new("n1")
-            .with("id", "n1")
+        let mismatched_tags = SearchDocument::new(N1)
+            .with("id", N1)
             .with("title", "Node one")
             .with("tags", json!(["different"]));
         let error = schema
@@ -1489,15 +1565,15 @@ mod importer_tests {
         assert!(error.contains("canonical tags"), "{error}");
 
         let mut malformed_result = one_node_result(
-            SearchDocument::new("n1")
-                .with("id", "n1")
+            SearchDocument::new(N1)
+                .with("id", N1)
                 .with("title", "Node one")
                 .with("tags", json!(["foo//bar"])),
         );
         malformed_result
             .graph
             .nodes
-            .get_mut("n1")
+            .get_mut(N1)
             .unwrap()
             .meta
             .tags = vec!["foo//bar".into()];
@@ -1606,7 +1682,7 @@ mod importer_tests {
             let mut graph = VaultGraph::new();
             let mut search_documents = Vec::new();
             for record in records {
-                let id = record.origin;
+                let id = format!("generate:fake:{}", record.origin);
                 graph.add_node(VaultNode {
                     id: id.clone(),
                     meta: vault_data::NodeMeta {
@@ -1845,9 +1921,7 @@ mod importer_tests {
         assert!(trace.lock().unwrap().is_empty());
     }
 
-    struct LegacyLoader;
-
-    impl Loader for LegacyLoader {
+    struct LegacyLoader;    impl Loader for LegacyLoader {
         fn name(&self) -> &str {
             "legacy"
         }
@@ -1884,5 +1958,101 @@ mod importer_tests {
             Transport::InMemory,
             "legacy"
         )));
+    }
+
+    #[tokio::test]
+    async fn shared_import_contract_harness_accepts_a_conformant_importer() {
+        crate::testing::assert_import_contract(&LegacyLoader).await;
+    }
+
+    #[test]
+    fn discovery_schema_v1_is_rejected() {
+        let mut schema = test_schema();
+        schema.schema_version = 1;
+        let error = schema.validate().unwrap_err().to_string();
+        assert!(
+            error.contains("unsupported discovery schema version 1"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn discovery_schema_rejects_unknown_source_kinds() {
+        for kind in ["", "Unknown", "github-enterprise"] {
+            let mut schema = test_schema();
+            schema.source_kind = kind.into();
+            let error = schema.validate().unwrap_err().to_string();
+            assert!(
+                error.contains("source_kind"),
+                "{kind}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn node_ids_must_match_the_declared_namespace() {
+        let schema = test_schema();
+
+        let namespaced_result = |node_id: &str, source_id: &str| {
+            let mut graph = VaultGraph::new();
+            graph.add_node(VaultNode {
+                id: node_id.into(),
+                meta: vault_data::NodeMeta {
+                    source_id: source_id.into(),
+                    title: "Node one".into(),
+                    tags: vec!["fixture".into()],
+                    ..Default::default()
+                },
+                ..Default::default()
+            });
+            LoadResult {
+                graph,
+                search_documents: vec![SearchDocument::new(node_id)
+                    .with("id", node_id)
+                    .with("title", "Node one")
+                    .with("tags", json!(["fixture"]))],
+                unresolved: Vec::new(),
+            }
+        };
+
+        // Wrong kind prefix.
+        let error = schema
+            .validate_result(&namespaced_result("tvix:fixture:n1", "fixture"))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("does not start with its namespace prefix"),
+            "{error}"
+        );
+
+        // Empty local part.
+        let error = schema
+            .validate_result(&namespaced_result("generate:fixture:", "fixture"))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("invalid local id"), "{error}");
+
+        // ':' in source_id can never produce an unambiguous namespace.
+        let error = schema
+            .validate_result(&namespaced_result("generate:a:b:n1", "a:b"))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("invalid source_id"), "{error}");
+    }
+
+    #[test]
+    fn edge_endpoints_must_resolve_within_the_graph() {
+        let schema = test_schema();
+        let mut result = one_node_result(valid_document());
+        result.graph.add_edge(vault_data::VaultEdge {
+            source: N1.into(),
+            target: "generate:fixture:missing".into(),
+        });
+        let error = schema.validate_result(&result).unwrap_err().to_string();
+        assert!(
+            error.contains("missing endpoint")
+                && error.contains("generate:fixture:missing"),
+            "{error}"
+        );
     }
 }

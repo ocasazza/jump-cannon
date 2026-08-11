@@ -9,8 +9,10 @@ tags: [jump-cannon, importer]
 # Importer Runtime
 
 Importers acquire records, map them into a graph and discovery documents, and
-publish one complete revision. The six server source kinds are Obsidian, tvix,
-generate, Kubernetes, OKF, and a trusted administrator-installed Pest package.
+publish one complete revision. The seven server source kinds are Obsidian,
+tvix, generate, Kubernetes, OKF, a trusted administrator-installed Pest
+package, and GitHub. GitHub delivers a repository tarball over HTTP with ETag
+polling and reuses the Obsidian markdown pipeline; see [[GitHub Importer]].
 OKF implements the official format version 0.2; its `0.2` version must not be
 called `0.0.2`.
 
@@ -54,7 +56,8 @@ importer that advertises readable and writable source content. Kubernetes
 queries are explicit, bounded, metadata-only, and namespace-scoped by default.
 OKF loads a filesystem bundle under a stable source identity. Pest manifest
 format 2 requires package authors to declare every property that can enter
-search or facets.
+search or facets. GitHub reads a polled repository tarball and produces the
+same node IDs as Obsidian mode for the same corpus.
 
 Do not hide network access, credentials, or authorization inside a pure mapper.
 Deployment owns those effects through [[Helm Deployment]] and [[Security Model]].

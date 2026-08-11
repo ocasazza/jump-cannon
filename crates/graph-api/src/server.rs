@@ -356,8 +356,14 @@ const MAX_GENERATE_EXPR_BYTES: usize = 1024 * 1024;
 #[derive(Deserialize)]
 struct GeneratePostReq {
     /// The Nix expression to evaluate (must produce toGraphJSON's
-    /// `{ nodes = [...]; links = [...]; }` shape).
+    /// `{ nodes = [...]; links = [...] }` shape).
     expr: String,
+    /// Optional deterministic seed accompanying the request. Nix evaluation
+    /// is already deterministic, so today this is accepted for wire
+    /// compatibility with the generate CLI's `--seed` and simply logged;
+    /// absent defaults to the same behavior as seed 0.
+    #[serde(default)]
+    seed: Option<u64>,
 }
 
 #[derive(Serialize)]
@@ -394,6 +400,9 @@ async fn generate_post(Json(req): Json<GeneratePostReq>) -> axum::response::Resp
     // `tvix_wasm::eval_graph` is synchronous and CPU-bound (and uses non-Send
     // `Rc` internals), so run it on a blocking thread. Only the `expr` String
     // and the returned JSON cross the boundary — both are `Send`.
+    if let Some(seed) = req.seed {
+        tracing::debug!(seed, "generate request seed (tvix eval is deterministic)");
+    }
     let expr = req.expr;
     let result = tokio::task::spawn_blocking(move || {
         tvix_wasm::eval_graph(&expr).map(|g| tvix_wasm::to_graph_json(&g))
@@ -959,18 +968,24 @@ async fn compute_soup_post(
 
     // 1. Synthesize the soup snapshot (it becomes graph-api's active graph in
     //    step 3, after the worker accepts it, so the renderer fetches its node
-    //    set matching the streamed positions).
+    //    set matching the streamed positions). Synthesized directly.
+    let soup_namespace =
+        data_loader::identity::Namespace::new("generate", "compute-soup")
+            .expect("the compute-soup namespace is valid");
     let mut vg = vault_data::VaultGraph::new();
     let mut search_documents = Vec::with_capacity(n as usize);
     for i in 0..n {
-        let id = format!("s{i}");
+        let local = format!("s{i}");
+        let id = soup_namespace
+            .node_id(&local)
+            .expect("ordinal soup local ids are valid");
         vg.add_node(vault_data::VaultNode {
             id: id.clone(),
             meta: vault_data::NodeMeta {
                 source_id: "compute-soup".into(),
-                title: id.clone(),
+                title: local.clone(),
                 tags: vec!["particle".into()],
-                path: id.clone(),
+                path: local,
                 doctype: Some("particle".into()),
                 ..Default::default()
             },
@@ -978,14 +993,15 @@ async fn compute_soup_post(
         });
         search_documents.push(
             data_loader::SearchDocument::new(&id)
-                .with("id", id.clone())
-                .with("title", id.clone())
+                .with("id", id)
+                .with("title", format!("s{i}"))
                 .with("tags", serde_json::json!(["particle"]))
-                .with("path", id)
+                .with("path", format!("s{i}"))
                 .with("type", "particle"),
         );
     }
     let schema = data_loader::ImporterSchema::new(
+        "generate",
         vec![
             data_loader::DiscoveryField::new("id", data_loader::DiscoveryFieldType::Keyword, true)
                 .searchable(2),

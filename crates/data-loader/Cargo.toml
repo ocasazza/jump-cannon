@@ -9,6 +9,7 @@ vault-data = { path = "../vault-data" }
 serde      = { workspace = true }
 serde_json = { workspace = true }
 thiserror  = "2"
+sha2       = "0.10"
 
 [dev-dependencies]
 tokio = { workspace = true }

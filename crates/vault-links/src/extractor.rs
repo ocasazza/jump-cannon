@@ -1,6 +1,7 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
+use data_loader::identity::Namespace;
 use data_loader::SearchDocument;
 use vault_data::{NodeMeta, NodeMetrics, VaultEdge, VaultGraph, VaultNode};
 
@@ -37,8 +38,9 @@ pub fn extract_vault(root: &Path) -> ExtractionResult {
     };
 
     extract_paths(root, paths, |path| {
-        let text = std::fs::read_to_string(path).unwrap_or_default();
-        Ok(parse_note(path, &text))
+        let bytes = std::fs::read(path).unwrap_or_default();
+        let text = String::from_utf8(bytes.clone()).unwrap_or_default();
+        Ok((parse_note(path, &text), bytes))
     })
     .expect("best-effort vault extraction is infallible")
 }
@@ -47,10 +49,13 @@ pub fn extract_vault(root: &Path) -> ExtractionResult {
 pub fn try_extract_vault(root: &Path) -> Result<ExtractionResult> {
     let paths = try_list_markdown(root)?;
     extract_paths(root, paths, |path| {
-        let text = std::fs::read_to_string(path)
+        let bytes = std::fs::read(path)
             .with_context(|| format!("read markdown note {}", path.display()))?;
-        try_parse_note(path, &text)
-            .with_context(|| format!("parse YAML frontmatter in {}", path.display()))
+        let text = String::from_utf8(bytes.clone())
+            .with_context(|| format!("read markdown note {} as UTF-8", path.display()))?;
+        let note = try_parse_note(path, &text)
+            .with_context(|| format!("parse YAML frontmatter in {}", path.display()))?;
+        Ok((note, bytes))
     })
 }
 
@@ -60,25 +65,38 @@ fn extract_paths<F>(
     mut parse_file: F,
 ) -> Result<ExtractionResult>
 where
-    F: FnMut(&Path) -> Result<ParsedNote>,
+    F: FnMut(&Path) -> Result<(ParsedNote, Vec<u8>)>,
 {
-    // First pass: parse all notes and build a title → id lookup.
+    // Unified identity contract: `obsidian:obsidian:{vault-relative path}`.
+    let namespace = Namespace::new("obsidian", "obsidian")
+        .expect("the obsidian namespace is valid by construction");
+
+    // First pass: parse all notes and build a title → local-id lookup.
     let mut title_to_id: HashMap<String, String> = HashMap::new();
-    let mut parsed: Vec<(String, crate::parser::ParsedNote, u64)> = Vec::new();
+    let mut parsed: Vec<(String, ParsedNote, Vec<u8>, u64)> = Vec::new();
 
     for (id, path, mtime) in &paths {
-        let note = parse_file(path)?;
+        let (note, bytes) = parse_file(path)?;
         title_to_id
             .entry(note.title.clone())
             .or_insert_with(|| id.clone() as String);
-        parsed.push((id.clone(), note, *mtime));
+        parsed.push((id.clone(), note, bytes, *mtime));
     }
 
-    // Second pass: build graph nodes.
+    // Second pass: build graph nodes under the unified namespace.
     let mut graph = VaultGraph::new();
     let mut search_documents = Vec::with_capacity(parsed.len());
+    let mut unresolved = Vec::new();
+    let mut local_ids: HashSet<&str> = HashSet::with_capacity(parsed.len());
 
-    for (idx, (id, note, mtime)) in parsed.iter().enumerate() {
+    for (idx, (id, note, bytes, mtime)) in parsed.iter().enumerate() {
+        let node_id = match namespace.node_id(id) {
+            Ok(node_id) => node_id,
+            Err(error) => {
+                unresolved.push(format!("{id}: {error}"));
+                continue;
+            }
+        };
         let (_rel_id, abs_path, _mtime) = &paths[idx];
 
         let folder: String = abs_path
@@ -95,6 +113,8 @@ where
             tags: note.tags.clone(),
             frontmatter: note.frontmatter.clone(),
             mtime: *mtime as i64,
+            // The vault-relative local path — /vault/page and the node-content
+            // reader resolve it against the vault root.
             path: id.clone(),
             doctype: note.doctype.clone(),
             folder: folder.clone(),
@@ -104,19 +124,21 @@ where
         };
 
         graph.add_node(VaultNode {
-            id: id.clone(),
+            id: node_id.clone(),
             meta,
             metrics: NodeMetrics::default(),
             x: 0.0,
             y: 0.0,
         });
+        local_ids.insert(id.as_str());
 
-        let mut document = SearchDocument::new(id)
-            .with("id", id.clone())
+        let mut document = SearchDocument::new(&node_id)
+            .with("id", node_id)
             .with("title", note.title.clone())
             .with("tags", serde_json::json!(note.tags))
             .with("path", id.clone())
-            .with("body", note.body.clone());
+            .with("body", note.body.clone())
+            .with("content_hash", namespace.content_id(bytes));
         if let Some(doctype) = &note.doctype {
             document.insert("type", doctype.clone());
         }
@@ -155,23 +177,34 @@ where
         search_documents.push(document);
     }
 
-    // Third pass: resolve wikilinks and add edges.
-    let mut unresolved = Vec::new();
-
-    for (id, note, _mtime) in &parsed {
+    // Third pass: resolve wikilinks against local ids and titles, then emit
+    // namespaced edge endpoints.
+    for (id, note, _bytes, _mtime) in &parsed {
+        if !local_ids.contains(id.as_str()) {
+            continue;
+        }
+        let source = namespace
+            .node_id(id)
+            .expect("accepted local ids already passed namespace validation");
         for link in &note.links {
-            // Try to resolve: exact id match first, then title lookup.
-            let target = if graph.nodes.contains_key(link.as_str()) {
+            // Try to resolve: exact local id match first, then title lookup.
+            let target_local = if local_ids.contains(link.as_str()) {
                 Some(link.clone())
             } else {
-                title_to_id.get(link.as_str()).cloned()
+                title_to_id
+                    .get(link.as_str())
+                    .filter(|target| local_ids.contains(target.as_str()))
+                    .cloned()
             };
 
-            match target {
-                Some(target_id) => {
+            match target_local {
+                Some(local) => {
+                    let target = namespace
+                        .node_id(&local)
+                        .expect("accepted local ids already passed namespace validation");
                     graph.add_edge(VaultEdge {
-                        source: id.clone(),
-                        target: target_id,
+                        source: source.clone(),
+                        target,
                     });
                 }
                 None => {

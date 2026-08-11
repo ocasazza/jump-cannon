@@ -33,7 +33,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use data_loader::{
-    Capability, DiscoveryField, DiscoveryFieldType, EdgeTypeSchema, Effect,
+    identity::Namespace, Capability, DiscoveryField, DiscoveryFieldType, EdgeTypeSchema, Effect,
     ImportError as PipelineError, ImportFuture, Importer, ImporterDescriptor, ImporterSchema,
     LoadResult, Loader, SearchDocument, TagHierarchySchema, Transport, WatchPlan,
 };
@@ -297,6 +297,7 @@ pub enum ImportError {
 pub struct ValidatedPackage {
     manifest: ImporterManifest,
     vm: Arc<Vm>,
+    namespace: Namespace,
 }
 
 impl ValidatedPackage {
@@ -447,7 +448,8 @@ impl ValidatedPackage {
 
             let node = self.map_node(pair)?;
             if mapped.graph.nodes.contains_key(&node.id) {
-                return Err(ImportError::DuplicateNodeId(node.id));
+                // Report the local capture id, not the namespaced node ID.
+                return Err(ImportError::DuplicateNodeId(node.meta.path.clone()));
             }
             mapped.graph.add_node(node);
             return Ok(());
@@ -485,6 +487,10 @@ impl ValidatedPackage {
         if id.is_empty() {
             return Err(invalid_record("node", "id capture is empty"));
         }
+        let node_id = self
+            .namespace
+            .node_id(&id)
+            .map_err(|error| invalid_record("node", error.to_string()))?;
 
         let title = fields.title.unwrap_or_else(|| id.clone());
         fields.tags.sort();
@@ -504,7 +510,7 @@ impl ValidatedPackage {
         };
 
         Ok(VaultNode {
-            id,
+            id: node_id,
             meta,
             metrics: NodeMetrics::default(),
             x: 0.0,
@@ -615,7 +621,16 @@ impl ValidatedPackage {
                 "source and target captures must be non-empty",
             ));
         }
-        Ok(VaultEdge { source, target })
+        Ok(VaultEdge {
+            source: self
+                .namespace
+                .node_id(&source)
+                .map_err(|error| invalid_record("edge", error.to_string()))?,
+            target: self
+                .namespace
+                .node_id(&target)
+                .map_err(|error| invalid_record("edge", error.to_string()))?,
+        })
     }
 
     fn collect_edge_fields<'i, 'r>(
@@ -795,6 +810,8 @@ fn validate_manifest(
     validate_metadata(&manifest.metadata)?;
     validate_limits(manifest.limits)?;
     validate_package_schema(&manifest.schema)?;
+    let namespace = Namespace::new("pest", &manifest.metadata.id)
+        .map_err(|error| ImportError::InvalidMetadata(error.to_string()))?;
 
     if manifest_source_bytes > manifest.limits.manifest_bytes {
         return Err(ImportError::ManifestTooLarge {
@@ -821,21 +838,20 @@ fn validate_manifest(
     Ok(ValidatedPackage {
         manifest,
         vm: Arc::new(Vm::new(optimized)),
+        namespace,
     })
 }
 
 fn validate_metadata(metadata: &PackageMetadata) -> Result<(), ImportError> {
-    if metadata.id.is_empty()
-        || !metadata
-            .id
-            .chars()
-            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_'))
-    {
-        return Err(ImportError::InvalidMetadata(
-            "metadata.id must be a non-empty ASCII identifier using letters, digits, '.', '-', or '_'"
-                .to_owned(),
-        ));
-    }
+    // The package id is the source_id segment of every emitted node ID, so it
+    // follows the shared namespace-ambiguity rule (`[a-z0-9._-]{1,128}`).
+    data_loader::identity::validate_source_id(&metadata.id)
+        .map_err(|_| {
+            ImportError::InvalidMetadata(
+                "metadata.id must be a non-empty lowercase ASCII identifier of at most 128 bytes using letters, digits, '.', '-', or '_'"
+                    .to_owned(),
+            )
+        })?;
     if metadata.name.trim().is_empty() {
         return Err(ImportError::InvalidMetadata(
             "metadata.name must not be empty".to_owned(),
@@ -926,6 +942,7 @@ fn pest_schema(package_fields: Vec<DiscoveryField>) -> ImporterSchema {
     ];
     fields.extend(package_fields);
     ImporterSchema::new(
+        "pest",
         fields,
         vec![EdgeTypeSchema::directed(
             "declared",
@@ -1166,10 +1183,10 @@ facetable = true
                 .keys()
                 .map(String::as_str)
                 .collect::<Vec<_>>(),
-            vec!["n1", "n2"]
+            vec!["pest:example.line-graph:n1", "pest:example.line-graph:n2"]
         );
 
-        let n1 = result.graph.nodes.get("n1").expect("n1");
+        let n1 = result.graph.nodes.get("pest:example.line-graph:n1").expect("n1");
         assert_eq!(n1.meta.title, "Alpha");
         assert_eq!(n1.meta.doctype.as_deref(), Some("service"));
         assert_eq!(n1.meta.tags, vec!["prod".to_owned(), "red".to_owned()]);
@@ -1181,8 +1198,8 @@ facetable = true
         assert_eq!(n1.meta.frontmatter["zone"], Value::String("west".into()));
 
         let edge = &result.graph.edges[0];
-        assert_eq!(edge.source, "n1");
-        assert_eq!(edge.target, "n2");
+        assert_eq!(edge.source, "pest:example.line-graph:n1");
+        assert_eq!(edge.target, "pest:example.line-graph:n2");
 
         let schema = pest_schema(package().manifest().schema.fields.clone());
         schema.validate_result(&result).unwrap();
@@ -1194,7 +1211,7 @@ facetable = true
         let result = package
             .parse_input("N|n1|Alpha|service|prod|owner=platform;private=secret")
             .unwrap();
-        let node = &result.graph.nodes["n1"];
+        let node = &result.graph.nodes["pest:example.line-graph:n1"];
         let document = &result.search_documents[0];
 
         assert_eq!(node.meta.frontmatter["private"], "secret");
@@ -1226,7 +1243,7 @@ facetable = true
         assert_eq!(result.graph.edge_count(), 0);
         assert_eq!(
             result.unresolved,
-            ["edge 'n1' -> 'missing' has missing target"]
+            ["edge 'pest:example.line-graph:n1' -> 'pest:example.line-graph:missing' has missing target"]
         );
     }
 
@@ -1317,5 +1334,34 @@ facetable = true
         assert_eq!(result.graph.node_count(), 0);
         assert_eq!(result.unresolved.len(), 1);
         assert!(result.unresolved[0].contains("example.line-graph"));
+    }
+
+    #[tokio::test]
+    async fn pest_importer_satisfies_the_shared_import_contract() {
+        let mut file = tempfile::NamedTempFile::new().expect("temp input");
+        write!(
+            file,
+            "N|n1|Alpha|service|red,prod|owner=platform\nN|n2|Beta|database||\nE|n1|n2"
+        )
+        .expect("write input");
+        let importer = FilesystemImporter::new(package(), file.path());
+        data_loader::testing::assert_import_contract(&importer).await;
+    }
+
+    #[test]
+    fn pest_ids_are_golden() {
+        let result = package()
+            .parse_input("N|n1|Alpha|service|prod|owner=platform\nE|n1|n1")
+            .expect("input parses");
+
+        // Node IDs are exactly `pest:{package id}:{capture id}`.
+        let node = result
+            .graph
+            .nodes
+            .get("pest:example.line-graph:n1")
+            .expect("namespaced node");
+        assert_eq!(node.meta.source_id, "example.line-graph");
+        assert_eq!(node.meta.path, "n1");
+        assert_eq!(result.graph.edges[0].source, "pest:example.line-graph:n1");
     }
 }

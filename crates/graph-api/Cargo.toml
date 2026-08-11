@@ -32,7 +32,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 open               = "5"
 clap               = { version = "4", features = ["derive", "env"] }
 dotenvy            = "0.15"
-reqwest            = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 urlencoding        = "2"
 tantivy            = "0.22"
 arc-swap           = "1"
@@ -48,6 +47,7 @@ data-loader    = { path = "../data-loader" }
 kubernetes-importer = { path = "../kubernetes-importer" }
 okf-importer = { path = "../okf-importer" }
 pest-importer = { path = "../pest-importer" }
+github-importer = { path = "../github-importer" }
 vault-links    = { path = "../vault-links" }
 tvix-loader    = { path = "../tvix-loader" }
 graph-layouts  = { path = "../graph-layouts" }

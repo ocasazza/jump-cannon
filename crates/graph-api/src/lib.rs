@@ -17,7 +17,6 @@ pub mod proto;
 pub mod search_index;
 pub mod server;
 pub mod state;
-pub mod subprocess;
 pub mod vault_loader;
 pub mod watcher;
 

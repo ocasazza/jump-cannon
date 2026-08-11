@@ -288,6 +288,7 @@ mod tests {
         use data_loader::{DiscoveryField, DiscoveryFieldType, EdgeTypeSchema, TagHierarchySchema};
 
         ImporterSchema::new(
+            "generate",
             vec![
                 DiscoveryField::new("id", DiscoveryFieldType::Keyword, true).searchable(2),
                 DiscoveryField::new("title", DiscoveryFieldType::Text, true).searchable(3),

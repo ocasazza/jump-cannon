@@ -28,6 +28,7 @@ struct EmptyLoader;
 
 fn test_schema() -> ImporterSchema {
     ImporterSchema::new(
+        "generate",
         vec![
             DiscoveryField::new("id", DiscoveryFieldType::Keyword, true).searchable(2),
             DiscoveryField::new("title", DiscoveryFieldType::Text, true).searchable(4),
@@ -41,6 +42,24 @@ fn test_schema() -> ImporterSchema {
 }
 
 fn load_result(mut graph: VaultGraph) -> LoadResult {
+    // The shared identity contract requires namespaced node IDs; rewrite the
+    // fixtures' bare IDs into the `generate:test:` namespace.
+    let bare_ids: Vec<String> = graph.nodes.keys().cloned().collect();
+    for bare in &bare_ids {
+        let node = graph.nodes.shift_remove(bare).expect("fixture node");
+        let namespaced = format!("generate:test:{bare}");
+        graph.nodes.insert(
+            namespaced.clone(),
+            VaultNode {
+                id: namespaced,
+                ..node
+            },
+        );
+    }
+    for edge in &mut graph.edges {
+        edge.source = format!("generate:test:{}", edge.source);
+        edge.target = format!("generate:test:{}", edge.target);
+    }
     let search_documents = graph
         .nodes
         .values_mut()
@@ -121,8 +140,8 @@ fn trust_test_importer(importer: Box<dyn Importer>) -> HostedImporter {
     HostedImporter::new(importer, grants).unwrap()
 }
 
-/// Build an `AppState` over an empty `VaultGraph`. No vault-search
-/// subprocess, no asset dir — enough to exercise the protobuf endpoints.
+/// Build an `AppState` over an empty `VaultGraph`. No asset dir — enough
+/// to exercise the protobuf endpoints.
 fn empty_state() -> AppState {
     state_with_graph(VaultGraph::new())
 }
@@ -495,7 +514,7 @@ async fn same_cardinality_snapshot_swap_changes_revision() {
     let ids: Vec<String> =
         serde_json::from_slice(&to_bytes(resp.into_body(), 1 << 20).await.expect("ids body"))
             .expect("ids json");
-    assert_eq!(ids, ["after-a", "after-b"]);
+    assert_eq!(ids, ["generate:test:after-a", "generate:test:after-b"]);
 }
 
 #[tokio::test]
@@ -526,7 +545,7 @@ async fn search_matches_returns_every_dense_index_with_its_snapshot_revision() {
         .snapshot()
         .id_to_idx
         .iter()
-        .filter_map(|(id, &index)| id.starts_with("matching-").then_some(index))
+        .filter_map(|(id, &index)| id.starts_with("generate:test:matching-").then_some(index))
         .collect();
     expected.sort_unstable();
 
@@ -611,7 +630,7 @@ async fn schema_search_and_facets_share_the_importer_contract() {
     .expect("schema json");
     assert_eq!(schema["graph_revision"], revision);
     assert_eq!(schema["source"]["id"], "empty");
-    assert_eq!(schema["schema"]["schema_version"], 1);
+    assert_eq!(schema["schema"]["schema_version"], 2);
     assert_eq!(schema["schema"]["tag_hierarchy"]["separator"], "/");
     assert!(schema["schema"]["fields"]
         .as_array()
@@ -639,7 +658,7 @@ async fn schema_search_and_facets_share_the_importer_contract() {
     )
     .expect("search json");
     assert_eq!(search["total"], 1);
-    assert_eq!(search["results"][0]["id"], "schema-node");
+    assert_eq!(search["results"][0]["id"], "generate:test:schema-node");
 
     let invalid_query = app
         .clone()

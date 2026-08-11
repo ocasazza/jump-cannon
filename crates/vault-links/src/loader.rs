@@ -33,6 +33,7 @@ impl Loader for ObsidianLoader {
 
     fn schema(&self) -> ImporterSchema {
         ImporterSchema::new(
+            "obsidian",
             vec![
                 DiscoveryField::new("id", DiscoveryFieldType::Keyword, true).searchable(2),
                 DiscoveryField::new("title", DiscoveryFieldType::Text, true)
@@ -69,6 +70,8 @@ impl Loader for ObsidianLoader {
                 DiscoveryField::new("related", DiscoveryFieldType::KeywordList, false)
                     .searchable(1)
                     .facetable(),
+                // Content address of the raw file bytes (`h256:{32hex}`).
+                DiscoveryField::new("content_hash", DiscoveryFieldType::Keyword, false).facetable(),
             ],
             vec![EdgeTypeSchema::directed(
                 "wikilink",

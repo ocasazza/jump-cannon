@@ -116,17 +116,13 @@ dev-up backend="gpu":
     TRUNK_PID=$!
 
     # ---- Stage 2 (parallel): everything else ----
-    # Three independent builds/processes run concurrently so the user
-    # doesn't wait for vault-search → backend → api serially:
-    #   1. vault-search compile         (~30s cold, fast incremental)
-    #   2. graph-compute backend boot   (~5s after binary build)
-    #   3. graph-api pre-build          (~10-30s cold; warms the cargo
+    # Independent builds/processes run concurrently:
+    #   1. graph-compute backend boot   (~5s after binary build)
+    #   2. graph-api pre-build          (~10-30s cold; warms the cargo
     #      cache so `cargo watch`'s startup build is a no-op and the
     #      server starts serving the frontend within ms)
 
     echo "→ kicking off parallel builds + backend…"
-    cargo build --release -p vault-search &
-    VAULT_PID=$!
 
     # Build graph-compute (release for GPU backends to work properly)
     cargo build --release -p graph-compute &
@@ -144,10 +140,9 @@ dev-up backend="gpu":
 
     cleanup() {
         echo
-        echo "→ tearing down (backend pid $BACKEND_PID, vault pid $VAULT_PID, trunk pid $TRUNK_PID)…"
+        echo "→ tearing down (backend pid $BACKEND_PID, trunk pid $TRUNK_PID)…"
         # Kill tracked PIDs first with SIGKILL (-9) for immediate termination
         kill -9 "$BACKEND_PID" 2>/dev/null || true
-        kill -9 "$VAULT_PID" 2>/dev/null || true
         kill -9 "$API_BUILD_PID" 2>/dev/null || true
         kill -9 "$TRUNK_PID" 2>/dev/null || true
         # Kill cargo-watch (starts after trap, so not in a tracked PID var)
@@ -163,8 +158,8 @@ dev-up backend="gpu":
     trap cleanup EXIT INT TERM
 
     # Wait for the api pre-build before handing off to cargo-watch. The
-    # other three (vault-search, backend, trunk watch) continue in the
-    # background — the frontend doesn't block on any of them.
+    # backend and trunk watch continue in the background — the frontend
+    # doesn't block on either of them.
     wait "$API_BUILD_PID" || { echo "graph-api build failed"; exit 1; }
 
     echo "→ graph-api built; starting hot-reload server (frontend live now, WASM rebuilds on edit)…"
@@ -211,8 +206,8 @@ stack backend="gpu":
     esac
     port="${GRAPH_API_PORT:-8765}"
     echo "→ backend={{backend}} (engine: $engine) · app :${port} · worker ${JUMP_CANNON_COMPUTE_URL:-unset}"
-    echo "→ building graph-compute + graph-api + vault-search…"
-    cargo build -p graph-compute -p graph-api -p vault-search
+    echo "→ building graph-compute + graph-api…"
+    cargo build -p graph-compute -p graph-api
     # --release: graph-api (not `trunk serve`) hosts the bundle, so it must be a
     # production build — a debug build injects Dioxus's `/_dioxus` hot-reload
     # socket that 404s here, and its unoptimized WASM boots slowly.
@@ -290,24 +285,18 @@ clippy:
 # ── util ──
 #
 
-# Reindex vault-search manually.
-[group('util')]
-reindex VAULT_ROOT=`echo ${VAULT_ROOT:-.}`:
-    cargo run --release -p vault-search -- --vault {{ VAULT_ROOT }} --rebuild --port 0
-
 # Tail the detached graph-compute log (written by `just dev-up`'s native worker).
 [group('util')]
 logs:
     tail -f /tmp/graph-compute.log
 
 # Kill every stray jump-cannon process from a crashed run — mirrors dev-up's
-# teardown (graph-api, vault-search, graph-compute, trunk watch, cargo-watch).
+# teardown (graph-api, graph-compute, trunk watch, cargo-watch).
 [group('util')]
 [doc('Kill every stray jump-cannon process from a crashed run')]
-[confirm("kill all stray graph-api / vault-search / graph-compute / trunk processes?")]
+[confirm("kill all stray graph-api / graph-compute / trunk processes?")]
 kill:
     -pkill -f 'graph-api'
-    -pkill -f 'vault-search'
     -pkill -f 'graph-compute'
     -pkill -f 'trunk watch'
     -pkill -f 'cargo-watch.*graph-api'

@@ -35,10 +35,10 @@
 use std::collections::HashMap;
 
 use data_loader::{
-    DiscoveryField, DiscoveryFieldType, EdgeTypeSchema, ImporterSchema, LoadResult, Loader,
-    SearchDocument, TagHierarchySchema,
+    identity::Namespace, DiscoveryField, DiscoveryFieldType, EdgeTypeSchema, ImporterSchema,
+    LoadResult, Loader, SearchDocument, TagHierarchySchema,
 };
-use rand::Rng;
+use rand::{Rng, SeedableRng};
 use vault_data::{NodeMeta, NodeMetrics, VaultEdge, VaultGraph, VaultNode};
 
 /// Loads a graph by evaluating a Nix expression through tvix-eval.
@@ -82,6 +82,7 @@ impl Loader for TvixLoader {
 
     fn schema(&self) -> ImporterSchema {
         generated_schema(
+            "tvix",
             "declared",
             "Directed edge declared by the evaluated Nix graph",
         )
@@ -109,7 +110,7 @@ impl Loader for TvixLoader {
                 message,
             }
         })?;
-        Ok(convert_generated_graph(&generated))
+        convert_generated_graph(&generated)
     }
 
     /// Tvix graphs have no filesystem root — no watching.
@@ -120,19 +121,24 @@ impl Loader for TvixLoader {
 
 /// Generates a random graph directly in Rust — no Nix eval overhead.
 ///
-/// Produces `num_nodes` nodes (IDs `n0`..`n{N-1}`) and `num_edges` random
-/// directed edges between them. No self-loops. Each node gets the tag
-/// `"generated"`. Generation is O(N+E) and completes in milliseconds even
-/// for 100k+ node graphs.
+/// Produces `num_nodes` nodes (local IDs `n0`..`n{N-1}`, namespaced to
+/// `generate:generate:n{i}`) and `num_edges` random directed edges between
+/// them. No self-loops. Each node gets the tag `"generated"`. Generation is
+/// O(N+E) and completes in milliseconds even for 100k+ node graphs.
+///
+/// Edge topology is deterministic: `load` seeds a `StdRng` with `seed`, so
+/// the same `(nodes, edges, clusters, affinity, seed)` always produces the
+/// identical graph.
 ///
 /// # CLI flags
 ///
-/// `--source generate --nodes 100000 --edges 100000`
+/// `--source generate --generate-nodes 100000 --generate-edges 100000 --seed 0`
 pub struct GenerateLoader {
     num_nodes: usize,
     num_edges: usize,
     num_clusters: usize,
     cluster_affinity: f64,
+    seed: u64,
 }
 
 impl GenerateLoader {
@@ -141,12 +147,14 @@ impl GenerateLoader {
         num_edges: usize,
         num_clusters: usize,
         cluster_affinity: f64,
+        seed: u64,
     ) -> Self {
         Self {
             num_nodes,
             num_edges,
             num_clusters,
             cluster_affinity,
+            seed,
         }
     }
 }
@@ -157,12 +165,18 @@ impl Loader for GenerateLoader {
     }
 
     fn schema(&self) -> ImporterSchema {
-        generated_schema("generated", "Directed edge produced by the graph generator")
+        generated_schema(
+            "generate",
+            "generated",
+            "Directed edge produced by the graph generator",
+        )
     }
 
     fn load(&self) -> LoadResult {
         let mut graph = VaultGraph::new();
-        let mut rng = rand::thread_rng();
+        let namespace =
+            Namespace::new("generate", "generate").expect("the generate namespace is valid");
+        let mut rng = rand::rngs::StdRng::seed_from_u64(self.seed);
 
         // Partition nodes into clusters.
         let cluster_count = if self.num_clusters > 0 && self.num_nodes > 0 {
@@ -177,18 +191,21 @@ impl Loader for GenerateLoader {
 
         // Generate nodes with cluster tags.
         for (i, cluster) in node_cluster.iter().enumerate() {
-            let id = format!("n{i}");
+            let local = format!("n{i}");
+            let id = namespace
+                .node_id(&local)
+                .expect("ordinal local ids are valid");
             let mut tags = vec!["generated".into()];
             if cluster_count > 0 {
                 tags.push(format!("cluster-{cluster}"));
             }
             let meta = NodeMeta {
                 source_id: "generate".into(),
-                title: id.clone(),
+                title: local.clone(),
                 tags,
                 frontmatter: HashMap::new(),
                 mtime: 0,
-                path: id.clone(),
+                path: local,
                 doctype: Some("generated".into()),
                 folder: String::new(),
                 content_type: None,
@@ -245,8 +262,12 @@ impl Loader for GenerateLoader {
             };
 
             graph.add_edge(VaultEdge {
-                source: format!("n{src}"),
-                target: format!("n{tgt}"),
+                source: namespace
+                    .node_id(&format!("n{src}"))
+                    .expect("ordinal local ids are valid"),
+                target: namespace
+                    .node_id(&format!("n{tgt}"))
+                    .expect("ordinal local ids are valid"),
             });
         }
 
@@ -278,14 +299,17 @@ impl Loader for GenerateLoader {
 /// Convert a [`tvix_wasm::GeneratedGraph`] into a [`VaultGraph`].
 ///
 /// Mapping:
-/// - `GenNode { id, kind }` → `VaultNode { id, meta: { title: id, tags: [kind], ... } }`
-/// - `GenEdge { source, target }` → `VaultEdge { source, target }`
+/// - `GenNode { id, kind }` → `VaultNode { id: "tvix:tvix:{id}", meta: { title: id, tags: [kind], ... } }`
+/// - `GenEdge { source, target }` → `VaultEdge` over the namespaced IDs
 ///
 /// Tags are derived from the node `kind`: each distinct kind becomes a tag
 /// applied to every node of that kind. This gives the frontend's tag chip
 /// strip immediate utility for generated graphs — filter by `kind` without
 /// any extra configuration.
-pub fn convert_generated_graph(gen: &tvix_wasm::GeneratedGraph) -> LoadResult {
+pub fn convert_generated_graph(
+    gen: &tvix_wasm::GeneratedGraph,
+) -> Result<LoadResult, data_loader::ImportError> {
+    let namespace = Namespace::new("tvix", "tvix").expect("the tvix namespace is valid");
     let mut graph = VaultGraph::new();
     let mut search_documents = Vec::with_capacity(gen.nodes.len());
 
@@ -298,6 +322,7 @@ pub fn convert_generated_graph(gen: &tvix_wasm::GeneratedGraph) -> LoadResult {
             .entry(tag.to_string())
             .or_insert_with(|| tag.to_string());
 
+        let node_id = namespace.node_id(&node.id)?;
         let meta = NodeMeta {
             source_id: "tvix".into(),
             title: node.id.clone(),
@@ -313,15 +338,15 @@ pub fn convert_generated_graph(gen: &tvix_wasm::GeneratedGraph) -> LoadResult {
         };
 
         graph.add_node(VaultNode {
-            id: node.id.clone(),
+            id: node_id.clone(),
             meta,
             metrics: NodeMetrics::default(),
             x: 0.0,
             y: 0.0,
         });
         search_documents.push(
-            SearchDocument::new(&node.id)
-                .with("id", node.id.clone())
+            SearchDocument::new(&node_id)
+                .with("id", node_id)
                 .with("title", node.id.clone())
                 .with("tags", serde_json::json!([tag]))
                 .with("path", node.id.clone())
@@ -331,23 +356,23 @@ pub fn convert_generated_graph(gen: &tvix_wasm::GeneratedGraph) -> LoadResult {
 
     for edge in &gen.edges {
         // Only add edges where both endpoints exist in the node set.
-        if graph.nodes.contains_key(&edge.source) && graph.nodes.contains_key(&edge.target) {
-            graph.add_edge(VaultEdge {
-                source: edge.source.clone(),
-                target: edge.target.clone(),
-            });
+        let source = namespace.node_id(&edge.source)?;
+        let target = namespace.node_id(&edge.target)?;
+        if graph.nodes.contains_key(&source) && graph.nodes.contains_key(&target) {
+            graph.add_edge(VaultEdge { source, target });
         }
     }
 
-    LoadResult {
+    Ok(LoadResult {
         graph,
         search_documents,
         unresolved: Vec::new(),
-    }
+    })
 }
 
-fn generated_schema(edge_key: &str, edge_description: &str) -> ImporterSchema {
+fn generated_schema(source_kind: &str, edge_key: &str, edge_description: &str) -> ImporterSchema {
     ImporterSchema::new(
+        source_kind,
         vec![
             DiscoveryField::new("id", DiscoveryFieldType::Keyword, true).searchable(2),
             DiscoveryField::new("title", DiscoveryFieldType::Text, true)
@@ -383,11 +408,11 @@ mod tests {
         assert_eq!(g.edge_count(), 11, "star: 11 hub→spoke edges");
 
         // Center node should have tag "center".
-        let center = g.nodes.get("n0").expect("center node exists");
+        let center = g.nodes.get("tvix:tvix:n0").expect("center node exists");
         assert!(center.meta.tags.contains(&"center".to_string()));
 
         // Spoke nodes should have tag "spoke".
-        let spoke = g.nodes.get("n1").expect("spoke node exists");
+        let spoke = g.nodes.get("tvix:tvix:n1").expect("spoke node exists");
         assert!(spoke.meta.tags.contains(&"spoke".to_string()));
     }
 
@@ -425,9 +450,9 @@ mod tests {
         assert_eq!(result.graph.node_count(), 2);
         assert_eq!(result.graph.edge_count(), 1);
 
-        let a = result.graph.nodes.get("a").unwrap();
+        let a = result.graph.nodes.get("tvix:tvix:a").unwrap();
         assert!(a.meta.tags.contains(&"source".to_string()));
-        let b = result.graph.nodes.get("b").unwrap();
+        let b = result.graph.nodes.get("tvix:tvix:b").unwrap();
         assert!(b.meta.tags.contains(&"sink".to_string()));
 
         let schema = loader.schema();
@@ -496,7 +521,7 @@ mod tests {
 
     #[test]
     fn generate_small_graph() {
-        let loader = GenerateLoader::new(10, 20, 0, 0.0);
+        let loader = GenerateLoader::new(10, 20, 0, 0.0, 0);
         let result = loader.load();
         assert_eq!(result.graph.node_count(), 10);
         assert_eq!(result.graph.edge_count(), 20);
@@ -516,7 +541,7 @@ mod tests {
     #[test]
     fn generate_no_self_loops() {
         // With 2 nodes and many edges, self-loops should never appear.
-        let loader = GenerateLoader::new(2, 100, 0, 0.0);
+        let loader = GenerateLoader::new(2, 100, 0, 0.0, 0);
         let result = loader.load();
         for edge in &result.graph.edges {
             assert_ne!(edge.source, edge.target, "no self-loops");
@@ -525,7 +550,7 @@ mod tests {
 
     #[test]
     fn generate_zero_nodes() {
-        let loader = GenerateLoader::new(0, 0, 0, 0.0);
+        let loader = GenerateLoader::new(0, 0, 0, 0.0, 0);
         let result = loader.load();
         assert_eq!(result.graph.node_count(), 0);
         assert_eq!(result.graph.edge_count(), 0);
@@ -534,7 +559,7 @@ mod tests {
     #[test]
     fn generate_large_graph_is_fast() {
         // 50k nodes, 100k edges should complete in well under 1 second.
-        let loader = GenerateLoader::new(50_000, 100_000, 0, 0.0);
+        let loader = GenerateLoader::new(50_000, 100_000, 0, 0.0, 0);
         let result = loader.load();
         assert_eq!(result.graph.node_count(), 50_000);
         assert_eq!(result.graph.edge_count(), 100_000);
@@ -542,7 +567,7 @@ mod tests {
 
     #[test]
     fn generate_clustered_graph() {
-        let loader = GenerateLoader::new(100, 500, 3, 0.8);
+        let loader = GenerateLoader::new(100, 500, 3, 0.8, 0);
         let result = loader.load();
         assert_eq!(result.graph.node_count(), 100);
         assert_eq!(result.graph.edge_count(), 500);
@@ -551,5 +576,66 @@ mod tests {
             let has_cluster = node.meta.tags.iter().any(|t| t.starts_with("cluster-"));
             assert!(has_cluster, "node {} missing cluster tag", node.id);
         }
+    }
+
+    fn edge_pairs(result: &LoadResult) -> Vec<(String, String)> {
+        result
+            .graph
+            .edges
+            .iter()
+            .map(|edge| (edge.source.clone(), edge.target.clone()))
+            .collect()
+    }
+
+    #[test]
+    fn generate_same_seed_produces_identical_edges() {
+        let first = GenerateLoader::new(20, 40, 3, 0.8, 7).load();
+        let second = GenerateLoader::new(20, 40, 3, 0.8, 7).load();
+        assert_eq!(edge_pairs(&first), edge_pairs(&second));
+        assert_eq!(first.search_documents, second.search_documents);
+    }
+
+    #[test]
+    fn generate_different_seeds_produce_different_edges() {
+        let first = GenerateLoader::new(20, 40, 0, 0.0, 1).load();
+        let second = GenerateLoader::new(20, 40, 0, 0.0, 2).load();
+        assert_ne!(edge_pairs(&first), edge_pairs(&second));
+    }
+
+    #[test]
+    fn generate_seed_zero_is_the_golden_default() {
+        let result = GenerateLoader::new(5, 4, 0, 0.0, 0).load();
+        let ids: Vec<&str> = result.graph.nodes.keys().map(String::as_str).collect();
+        assert_eq!(
+            ids,
+            [
+                "generate:generate:n0",
+                "generate:generate:n1",
+                "generate:generate:n2",
+                "generate:generate:n3",
+                "generate:generate:n4",
+            ]
+        );
+        assert_eq!(
+            edge_pairs(&result),
+            [
+                ("generate:generate:n0".to_string(), "generate:generate:n1".to_string()),
+                ("generate:generate:n1".to_string(), "generate:generate:n0".to_string()),
+                ("generate:generate:n0".to_string(), "generate:generate:n2".to_string()),
+                ("generate:generate:n2".to_string(), "generate:generate:n4".to_string()),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn tvix_importer_satisfies_the_shared_import_contract() {
+        let loader = TvixLoader::from_demo("Star (hub)").expect("star demo exists");
+        data_loader::testing::assert_import_contract(&loader).await;
+    }
+
+    #[tokio::test]
+    async fn generate_importer_satisfies_the_shared_import_contract() {
+        let loader = GenerateLoader::new(32, 64, 4, 0.8, 99);
+        data_loader::testing::assert_import_contract(&loader).await;
     }
 }
