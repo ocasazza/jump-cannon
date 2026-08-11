@@ -957,8 +957,9 @@ async fn compute_soup_post(
     let seed = req.seed.unwrap_or(1);
     let morphology = req.morphology.as_deref().unwrap_or("sheet").to_string();
 
-    // 1. Host the soup as graph-api's active graph so the renderer fetches its
-    //    node set (matching the streamed positions). Synthesized directly.
+    // 1. Synthesize the soup snapshot (it becomes graph-api's active graph in
+    //    step 3, after the worker accepts it, so the renderer fetches its node
+    //    set matching the streamed positions).
     let mut vg = vault_data::VaultGraph::new();
     let mut search_documents = Vec::with_capacity(n as usize);
     for i in 0..n {
@@ -1034,9 +1035,12 @@ async fn compute_soup_post(
         }
     };
     let graph_revision = snapshot.revision;
-    s.inner.snapshot.store(std::sync::Arc::new(snapshot));
 
-    // 2. Push the same soup to the compute worker (binary CSR + positions).
+    // 2. Push the soup to the compute worker (binary CSR + positions) BEFORE
+    //    hosting it as the active graph: when no worker is reachable (e.g. a
+    //    parked on-demand GPU session leaves the compute Service with zero
+    //    endpoints) the request must fail without clobbering the current
+    //    snapshot.
     let csr = soup_csr_bytes(n);
     let positions = soup_positions_bytes(n, radius, seed);
     let worker_n = match s
@@ -1048,21 +1052,28 @@ async fn compute_soup_post(
         Ok(wn) => wn,
         Err(e) => {
             return err(
-                format!("worker LoadGraph: {e}"),
-                graph_revision,
-                s.inner.compute_broker.selection_state().await.generation,
+                format!(
+                    "worker LoadGraph: {e} \
+                     (no reachable compute worker — dispatch a GPU session first)"
+                ),
+                initial_revision,
+                initial_generation,
             )
         }
     };
     if worker_n != n {
         return err(
             format!("worker node count {worker_n} != requested {n}"),
-            graph_revision,
-            s.inner.compute_broker.selection_state().await.generation,
+            initial_revision,
+            initial_generation,
         );
     }
 
-    // 3. Select the geometric (GPU) engine with the membrane regime so the worker
+    // 3. The worker accepted the soup: host it as the active graph so the
+    //    renderer fetches its node set (matching the streamed positions).
+    s.inner.snapshot.store(std::sync::Arc::new(snapshot));
+
+    // 4. Select the geometric (GPU) engine with the membrane regime so the worker
     //    assembles the soup. The renderer's WS lens would also drive this, but
     //    setting it here makes the demo assemble the moment the soup loads.
     let params = serde_json::to_value(membrane_lens(&morphology)).ok();
