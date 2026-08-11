@@ -236,10 +236,15 @@ fn collect_branch_members(branch: &TagBranch, groups: &[TagGroup], members: &mut
 }
 
 pub(crate) fn reset_for_graph_session() {
-    *GEN.write() = GEN.peek().wrapping_add(1);
+    // Bind the peek() result first: in `*X.write() = X.peek()...` the RHS
+    // peek guard is still alive when write() runs, which panics with
+    // AlreadyBorrowed (GlobalSignal::write unwraps try_write_unchecked).
+    let gen = GEN.peek().wrapping_add(1);
+    *GEN.write() = gen;
     RICH.write().clear();
     *SEARCH_ERROR.write() = None;
-    *SEARCH_SCHEMA_SESSION.write() = SEARCH_SCHEMA_SESSION.peek().wrapping_add(1);
+    let schema_session = SEARCH_SCHEMA_SESSION.peek().wrapping_add(1);
+    *SEARCH_SCHEMA_SESSION.write() = schema_session;
     *SEARCH_SCHEMA_STARTED.write() = false;
     *SEARCH_SCHEMA.write() = None;
     EXPANDED_TAGS.write().clear();
