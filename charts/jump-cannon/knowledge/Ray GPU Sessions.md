@@ -42,6 +42,12 @@ watchdog deletes the CR and fails the session if no Kueue Workload appears
 after create; session mode refuses to run with more than one graph-api
 replica.
 
+Selecting a remote engine does not by itself give the worker a graph: the
+broker only reselects, and `/compute/health` legitimately reports
+`graph_revision: 0` until the UI sends a seed/solve
+(`PUT /compute/initial-placement`, which loads the graph server-side). A
+ready session with graph revision 0 is waiting for a seed, not broken.
+
 Escape hatch: if a parked CR sticks terminating on the Kueue finalizer,
 confirm the Workload is finished, then remove the finalizer by hand
 (`kubectl -n gpu-workloads patch workload <name> --type=json
