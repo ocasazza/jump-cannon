@@ -22,8 +22,8 @@ primitive for [[Filter Builder]]: it returns every match as raw little-endian
 `u32` dense indices plus `X-Graph-Revision`, bounded by the exact snapshot's
 node count rather than a ranked UI limit. Invalid or unavailable
 field-qualified queries return HTTP 400. graph-api builds this index directly
-from validated importer `SearchDocument` records; it does not spawn
-`vault-search` and never falls back to title-only matching.
+from validated importer `SearchDocument` records and never falls back to
+title-only matching.
 
 `GET /importers` returns the active descriptor plus a bounded, sanitized list
 of configured source instances. Its activation mode is `helm_rollout`; the API

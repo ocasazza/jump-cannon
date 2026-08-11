@@ -2,6 +2,7 @@
 {{- $graphSource := $importer.kind -}}
 {{- $usesFilesystem := $importer.usesFilesystem -}}
 {{- $usesKubernetes := $importer.usesKubernetes -}}
+{{- $usesGitHub := eq $importer.kind "github" -}}
 {{- $filesystemRescanSeconds := $importer.filesystemRescanIntervalSeconds -}}
 {{- $hasKnowledge := and $importer.allowsSeeds .Values.vault.seed.enabled .Values.vault.seed.includeKnowledgeBase -}}
 {{- $hasSeedFiles := and $importer.allowsSeeds .Values.vault.seed.enabled (gt (len .Values.vault.seed.files) 0) -}}
@@ -124,6 +125,25 @@ spec:
             - name: JUMP_CANNON_OKF_SOURCE_ID
               value: {{ $importer.sourceId | quote }}
             {{- end }}
+            {{- if $usesGitHub }}
+            - name: JUMP_CANNON_GITHUB_REPO
+              value: {{ .Values.githubImporter.repo | quote }}
+            - name: JUMP_CANNON_GITHUB_REF
+              value: {{ .Values.githubImporter.ref | quote }}
+            - name: JUMP_CANNON_GITHUB_PATH
+              value: {{ .Values.githubImporter.path | quote }}
+            - name: JUMP_CANNON_GITHUB_POLL_INTERVAL_MS
+              value: {{ mul (int .Values.githubImporter.pollIntervalSeconds) 1000 | quote }}
+            - name: JUMP_CANNON_GITHUB_CACHE_DIR
+              value: {{ .Values.githubImporter.cacheDir | quote }}
+            {{- if .Values.githubImporter.tokenSecret.name }}
+            - name: JUMP_CANNON_GITHUB_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.githubImporter.tokenSecret.name | quote }}
+                  key: {{ .Values.githubImporter.tokenSecret.key | quote }}
+            {{- end }}
+            {{- end }}
             {{- if $usesFilesystem }}
             - name: VAULT_ROOT
               value: {{ $importer.path | quote }}
@@ -167,7 +187,7 @@ spec:
             {{- toYaml .Values.graphApi.resources | nindent 12 }}
           securityContext:
             {{- toYaml .Values.containerSecurityContext | nindent 12 }}
-          {{- if or $usesFilesystem $usesKubernetes $gpuSession }}
+          {{- if or $usesFilesystem $usesKubernetes $usesGitHub $gpuSession }}
           volumeMounts:
             {{- if $usesFilesystem }}
             - name: {{ $importer.volumeName }}
@@ -175,6 +195,10 @@ spec:
               {{- if $importer.readOnly }}
               readOnly: true
               {{- end }}
+            {{- end }}
+            {{- if $usesGitHub }}
+            - name: github-importer-cache
+              mountPath: {{ .Values.githubImporter.cacheDir | quote }}
             {{- end }}
             {{- if $usesKubernetes }}
             - name: kubernetes-importer-config
@@ -193,8 +217,12 @@ spec:
               readOnly: true
             {{- end }}
           {{- end }}
-      {{- if or $usesFilesystem $usesKubernetes $gpuSession }}
+      {{- if or $usesFilesystem $usesKubernetes $usesGitHub $gpuSession }}
       volumes:
+        {{- if $usesGitHub }}
+        - name: github-importer-cache
+          emptyDir: {}
+        {{- end }}
         {{- if $usesFilesystem }}
         - name: {{ $importer.volumeName }}
           {{- if $importer.named }}

@@ -1,0 +1,21 @@
+[package]
+name = "github-importer"
+version = "1.0.0"
+edition = "2021"
+description = "GitHub tarball importer: polls codeload.github.com with ETag revalidation and reuses the Obsidian vault parser"
+
+[dependencies]
+vault-data  = { path = "../vault-data" }
+data-loader = { path = "../data-loader" }
+vault-links = { path = "../vault-links" }
+reqwest     = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+tar         = "0.4"
+flate2      = "1"
+serde       = { workspace = true }
+serde_json  = { workspace = true }
+anyhow      = "1"
+tracing     = "0.1"
+
+[dev-dependencies]
+tempfile = "3"
+tokio    = { workspace = true }

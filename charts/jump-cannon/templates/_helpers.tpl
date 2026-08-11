@@ -42,6 +42,10 @@ graphApi.source, and the legacy vault/OKF values remain authoritative.
   {{- if eq $kind "okf" -}}
     {{- $rescan = .Values.okfImporter.filesystemRescanIntervalSeconds -}}
   {{- end -}}
+  {{- /* github, like kubernetes, is a non-filesystem kind: it reads its
+         corpus from a remote tarball into an ephemeral pod cache, so
+         usesFilesystem/usesObsidian/allowsSeeds must all stay false and the
+         vault PVC plus seed init container are skipped. */ -}}
   {{- dict
       "named" false
       "selected" ""

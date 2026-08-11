@@ -50,7 +50,8 @@ struct Args {
         default_value_t = 0
     )]
     filesystem_rescan_seconds: u64,
-    /// Data source: obsidian (default), tvix, generate, kubernetes, okf, or pest.
+    /// Data source: obsidian (default), tvix, generate, kubernetes, okf, pest,
+    /// or github.
     /// Runtime Pest packages are trusted administrator-installed code; the
     /// unauthenticated HTTP API does not accept grammar uploads.
     #[arg(long, env = "JUMP_CANNON_SOURCE", default_value = "obsidian")]
@@ -72,6 +73,38 @@ struct Args {
     /// Stable ASCII slug used to namespace OKF node IDs.
     #[arg(long, env = "JUMP_CANNON_OKF_SOURCE_ID", default_value = "default")]
     okf_source_id: String,
+    /// GitHub repository slug (`owner/repo`) backing --source=github.
+    #[arg(long, env = "JUMP_CANNON_GITHUB_REPO")]
+    github_repo: Option<String>,
+    /// GitHub branch, tag, or commit SHA to poll.
+    #[arg(long, env = "JUMP_CANNON_GITHUB_REF", default_value = "main")]
+    github_ref: String,
+    /// Subdirectory within the repository holding the vault corpus.
+    #[arg(
+        long,
+        env = "JUMP_CANNON_GITHUB_PATH",
+        default_value = "charts/jump-cannon/knowledge"
+    )]
+    github_path: String,
+    /// Bearer token for private repositories. Prefer the env var so the token
+    /// stays out of process argument lists; it is never logged.
+    #[arg(long, env = "JUMP_CANNON_GITHUB_TOKEN")]
+    github_token: Option<String>,
+    /// Codeload poll cadence in milliseconds (ETag-revalidated). 0 disables
+    /// polling and advertises a static one-shot snapshot.
+    #[arg(
+        long,
+        env = "JUMP_CANNON_GITHUB_POLL_INTERVAL_MS",
+        default_value_t = 60000
+    )]
+    github_poll_interval_ms: u64,
+    /// Root of the tarball extraction cache. Defaults to a per-host tempdir.
+    #[arg(long, env = "JUMP_CANNON_GITHUB_CACHE_DIR")]
+    github_cache_dir: Option<PathBuf>,
+    /// Stable ASCII slug used to namespace GitHub node IDs. Defaults to the
+    /// sanitized repository slug (e.g. "ocasazza-jump-cannon").
+    #[arg(long, env = "JUMP_CANNON_GITHUB_SOURCE_ID")]
+    github_source_id: Option<String>,
     /// Versioned TOML package containing a runtime Pest grammar and capture map.
     /// Required by --source=pest.
     #[arg(long, env = "JUMP_CANNON_IMPORTER_MANIFEST")]
@@ -98,6 +131,10 @@ struct Args {
         default_value_t = 0.8
     )]
     generate_cluster_affinity: f64,
+    /// When --source=generate, the deterministic RNG seed for edge topology.
+    /// The same flags with the same seed always produce the identical graph.
+    #[arg(long = "seed", env = "JUMP_CANNON_GENERATE_SEED", default_value_t = 0)]
+    generate_seed: u64,
     /// Path to the chart-rendered RayCluster session template (JSON, mounted
     /// from a ConfigMap). When set (and a kube client is available), the
     /// on-demand GPU session controller runs; unset = the feature is fully
@@ -204,6 +241,7 @@ async fn main() -> anyhow::Result<()> {    let _ = dotenvy::dotenv();
                 edges = args.generate_edges,
                 clusters = args.generate_clusters,
                 affinity = args.generate_cluster_affinity,
+                seed = args.generate_seed,
                 "using generate loader"
             );
             Box::new(tvix_loader::GenerateLoader::new(
@@ -211,6 +249,7 @@ async fn main() -> anyhow::Result<()> {    let _ = dotenvy::dotenv();
                 args.generate_edges,
                 args.generate_clusters,
                 args.generate_cluster_affinity,
+                args.generate_seed,
             ))
         }
         data_loader::SourceKind::Kubernetes => {
@@ -280,6 +319,39 @@ async fn main() -> anyhow::Result<()> {    let _ = dotenvy::dotenv();
                 package,
                 input_path.clone(),
             ))
+        }
+        data_loader::SourceKind::GitHub => {
+            let repo = args.github_repo.clone().with_context(|| {
+                "--source=github requires --github-repo / JUMP_CANNON_GITHUB_REPO"
+            })?;
+            let source_id = args
+                .github_source_id
+                .clone()
+                .unwrap_or_else(|| github_importer::sanitize_source_id(&repo));
+            let cache_dir = args
+                .github_cache_dir
+                .clone()
+                .unwrap_or_else(|| std::env::temp_dir().join("jump-cannon-github"));
+            let config = github_importer::GitHubSourceConfig {
+                source_id,
+                repo,
+                git_ref: args.github_ref.clone(),
+                path: args.github_path.clone(),
+                token: args.github_token.clone(),
+                poll_interval_ms: args.github_poll_interval_ms,
+                cache_dir,
+                max_bytes: github_importer::DEFAULT_MAX_TARBALL_BYTES,
+            };
+            // The token is deliberately absent from this log line.
+            tracing::info!(
+                source_id = %config.source_id,
+                repo = %config.repo,
+                git_ref = %config.git_ref,
+                path = %config.path,
+                poll_interval_ms = config.poll_interval_ms,
+                "using GitHub importer"
+            );
+            Box::new(github_importer::GitHubImporter::new(config)?)
         }
     };
 

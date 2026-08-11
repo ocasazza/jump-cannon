@@ -175,6 +175,7 @@ mod tests {
 
     fn test_schema() -> ImporterSchema {
         ImporterSchema::new(
+            "generate",
             vec![
                 DiscoveryField::new("id", DiscoveryFieldType::Keyword, true).searchable(2),
                 DiscoveryField::new("title", DiscoveryFieldType::Text, true).searchable(4),
@@ -202,7 +203,7 @@ mod tests {
             Box::pin(async {
                 let mut graph = VaultGraph::new();
                 graph.add_node(VaultNode {
-                    id: "present".into(),
+                    id: "generate:dangling:present".into(),
                     meta: vault_data::NodeMeta {
                         source_id: "dangling".into(),
                         title: "Present".into(),
@@ -211,13 +212,13 @@ mod tests {
                     ..Default::default()
                 });
                 graph.add_edge(VaultEdge {
-                    source: "present".into(),
-                    target: "missing".into(),
+                    source: "generate:dangling:present".into(),
+                    target: "generate:dangling:missing".into(),
                 });
                 Ok(LoadResult {
                     graph,
-                    search_documents: vec![SearchDocument::new("present")
-                        .with("id", "present")
+                    search_documents: vec![SearchDocument::new("generate:dangling:present")
+                        .with("id", "generate:dangling:present")
                         .with("title", "Present")
                         .with("tags", serde_json::json!([]))],
                     unresolved: Vec::new(),
@@ -230,12 +231,13 @@ mod tests {
     async fn rejects_invalid_importer_graph_before_metrics() {
         let error = load(&DanglingGraphImporter).await.unwrap_err();
 
+        // The shared validate_output contract rejects the dangling edge before
+        // graph.validate() or metric computation ever see it.
         assert!(matches!(
             error,
             ImportError::Map { message }
-                if message.contains("invalid graph")
-                    && message.contains("edge 0")
-                    && message.contains("missing")
+                if message.contains("missing endpoint")
+                    && message.contains("generate:dangling:missing")
         ));
     }
 }

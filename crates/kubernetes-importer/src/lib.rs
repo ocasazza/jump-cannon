@@ -11,10 +11,10 @@
 use std::collections::{BTreeMap, HashMap};
 
 use data_loader::{
-    Capability, DecodedRecord, Decoder, DiscoveryField, DiscoveryFieldType, EdgeTypeSchema, Effect,
-    GraphMapper, ImportError, ImportFuture, ImportPipeline, ImporterDescriptor, ImporterSchema,
-    LoadResult, SearchDocument, SourceConnector, SourceRecord, TagHierarchySchema, Transport,
-    WatchPlan,
+    identity::Namespace, Capability, DecodedRecord, Decoder, DiscoveryField, DiscoveryFieldType,
+    EdgeTypeSchema, Effect, GraphMapper, ImportError, ImportFuture, ImportPipeline, Importer,
+    ImporterDescriptor, ImporterSchema, LoadResult, SearchDocument, SourceConnector, SourceRecord,
+    TagHierarchySchema, Transport, WatchPlan,
 };
 use kube::{
     api::{Api, DynamicObject, GroupVersionKind, ListParams},
@@ -556,6 +556,9 @@ impl KubernetesGraphMapper {
 
 impl GraphMapper for KubernetesGraphMapper {
     fn map(&self, records: Vec<DecodedRecord>) -> Result<LoadResult, ImportError> {
+        // Unified identity contract: `kubernetes:{source_id}:uid:{uid}` (the
+        // UID is the external stable identity and stays unhashed).
+        let ns = Namespace::new("kubernetes", &self.source_id)?;
         let mut graph = VaultGraph::new();
         let mut search_documents = Vec::new();
         let mut uid_to_id = HashMap::new();
@@ -584,11 +587,8 @@ impl GraphMapper for KubernetesGraphMapper {
             let namespace = string_field(metadata, "namespace").unwrap_or("_cluster");
             let uid = string_field(metadata, "uid");
             let node_id = match uid {
-                Some(uid) => format!("k8s:{}:uid:{uid}", self.source_id),
-                None => format!(
-                    "k8s:{}:{api_version}:{kind}:{namespace}:{name}",
-                    self.source_id
-                ),
+                Some(uid) => ns.node_id(&format!("uid:{uid}"))?,
+                None => ns.node_id(&format!("{api_version}:{kind}:{namespace}:{name}"))?,
             };
 
             let labels = metadata
@@ -745,6 +745,7 @@ pub fn build_importer(config: KubernetesSourceConfig) -> Result<ImportPipeline, 
 
 fn kubernetes_schema() -> ImporterSchema {
     ImporterSchema::new(
+        "kubernetes",
         vec![
             DiscoveryField::new("id", DiscoveryFieldType::Keyword, true).searchable(2),
             DiscoveryField::new("title", DiscoveryFieldType::Text, true)
@@ -893,7 +894,7 @@ mod tests {
             )])
             .unwrap();
 
-        let node = &loaded.graph.nodes["k8s:test:uid:deployment-uid"];
+        let node = &loaded.graph.nodes["kubernetes:test:uid:deployment-uid"];
         assert!(!node.meta.frontmatter.contains_key("annotations"));
         assert!(!node.meta.frontmatter.contains_key("object"));
 
@@ -970,7 +971,7 @@ mod tests {
                 }),
             )])
             .unwrap();
-        let node = &loaded.graph.nodes["k8s:test:uid:deployment-uid"];
+        let node = &loaded.graph.nodes["kubernetes:test:uid:deployment-uid"];
         assert!(node.meta.frontmatter.contains_key("annotations"));
         assert!(node.meta.frontmatter.contains_key("object"));
 
@@ -1033,12 +1034,12 @@ mod tests {
         assert_eq!(
             loaded.graph.edges[0],
             VaultEdge {
-                source: "k8s:test:uid:owner-uid".into(),
-                target: "k8s:test:uid:child-uid".into(),
+                source: "kubernetes:test:uid:owner-uid".into(),
+                target: "kubernetes:test:uid:child-uid".into(),
             }
         );
         assert!(loaded.unresolved.is_empty());
-        let owner = &loaded.graph.nodes["k8s:test:uid:owner-uid"];
+        let owner = &loaded.graph.nodes["kubernetes:test:uid:owner-uid"];
         assert!(owner.meta.tags.contains(&"label:app=web".into()));
     }
 
@@ -1170,6 +1171,92 @@ mod tests {
         assert!(loaded
             .graph
             .nodes
-            .contains_key("k8s:test:v1:Service:demo:api"));
+            .contains_key("kubernetes:test:v1:Service:demo:api"));
+    }
+
+    /// The live connector needs a cluster, so the shared harness runs against
+    /// the pure mapper path with fixed records — the same code that shapes
+    /// every node ID and edge the connector feed produces.
+    struct MapperImporter {
+        records: Vec<DecodedRecord>,
+    }
+
+    impl Importer for MapperImporter {
+        fn descriptor(&self) -> ImporterDescriptor {
+            ImporterDescriptor::new(
+                "kubernetes.test",
+                "Kubernetes test mapper",
+                "1",
+                vec![Capability::new(
+                    Effect::Read,
+                    Transport::Kubernetes,
+                    "kubernetes:test",
+                )],
+                kubernetes_schema(),
+            )
+        }
+
+        fn import<'a>(&'a self) -> ImportFuture<'a, Result<LoadResult, ImportError>> {
+            Box::pin(async move {
+                KubernetesGraphMapper::new("test", false).map(self.records.clone())
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn kubernetes_mapper_satisfies_the_shared_import_contract() {
+        let importer = MapperImporter {
+            records: vec![
+                decoded(
+                    "deployment",
+                    json!({
+                        "apiVersion": "apps/v1",
+                        "kind": "Deployment",
+                        "metadata": {
+                            "name": "web",
+                            "namespace": "demo",
+                            "uid": "owner-uid",
+                            "labels": { "app": "web" }
+                        }
+                    }),
+                ),
+                decoded(
+                    "replicaset",
+                    json!({
+                        "apiVersion": "apps/v1",
+                        "kind": "ReplicaSet",
+                        "metadata": {
+                            "name": "web-abc",
+                            "namespace": "demo",
+                            "uid": "child-uid",
+                            "ownerReferences": [{ "uid": "owner-uid" }]
+                        }
+                    }),
+                ),
+            ],
+        };
+        data_loader::testing::assert_import_contract(&importer).await;
+    }
+
+    #[test]
+    fn kubernetes_ids_are_golden() {
+        let loaded = KubernetesGraphMapper::new("test", false)
+            .map(vec![decoded(
+                "deployment",
+                json!({
+                    "apiVersion": "apps/v1",
+                    "kind": "Deployment",
+                    "metadata": {
+                        "name": "web",
+                        "namespace": "demo",
+                        "uid": "9f8e7d6c-1234-4abc-9def-0123456789ab"
+                    }
+                }),
+            )])
+            .unwrap();
+
+        assert!(loaded.graph.nodes.contains_key(
+            "kubernetes:test:uid:9f8e7d6c-1234-4abc-9def-0123456789ab"
+        ));
     }
 }

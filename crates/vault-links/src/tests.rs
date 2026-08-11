@@ -196,3 +196,60 @@ fn obsidian_try_load_rejects_malformed_frontmatter() {
     assert!(error.to_string().contains("parse YAML frontmatter"));
     assert!(error.to_string().contains("invalid.md"));
 }
+
+#[tokio::test]
+async fn obsidian_importer_satisfies_the_shared_import_contract() {
+    let fixture = tempfile::tempdir().unwrap();
+    fs::write(
+        fixture.path().join("alpha.md"),
+        "---\ntags: [runbook]\n---\nSee [[beta]].\n",
+    )
+    .unwrap();
+    fs::write(fixture.path().join("beta.md"), "Target body.\n").unwrap();
+
+    let loader = ObsidianLoader::new(fixture.path());
+    data_loader::testing::assert_import_contract(&loader).await;
+}
+
+#[test]
+fn obsidian_ids_and_content_hashes_are_golden() {
+    let fixture = tempfile::tempdir().unwrap();
+    fs::write(
+        fixture.path().join("page.md"),
+        "---\ntags: [runbook]\n---\nGolden body.\n",
+    )
+    .unwrap();
+    fs::write(fixture.path().join("linked.md"), "Target.\n").unwrap();
+    fs::write(fixture.path().join("index.md"), "See [[linked]].\n").unwrap();
+
+    let result = ObsidianLoader::new(fixture.path()).load();
+
+    // Node IDs are exactly `{source_kind}:{source_id}:{vault-relative path}`.
+    let page = result
+        .graph
+        .nodes
+        .get("obsidian:obsidian:page")
+        .expect("namespaced page node");
+    assert_eq!(page.meta.source_id, "obsidian");
+    assert_eq!(page.meta.path, "page");
+
+    // The content hash covers the raw file bytes, truncated SHA-256.
+    let document = result
+        .search_documents
+        .iter()
+        .find(|document| document.node_id == "obsidian:obsidian:page")
+        .expect("page document");
+    assert_eq!(
+        document.fields["content_hash"],
+        "h256:80e57bef7e76518579e1f8d9c21a824e"
+    );
+
+    // Wikilink resolution emits namespaced endpoints.
+    let edge = result
+        .graph
+        .edges
+        .iter()
+        .find(|edge| edge.source == "obsidian:obsidian:index")
+        .expect("index edge");
+    assert_eq!(edge.target, "obsidian:obsidian:linked");
+}

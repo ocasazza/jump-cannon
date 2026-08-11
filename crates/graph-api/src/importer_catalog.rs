@@ -37,6 +37,7 @@ pub enum CatalogSourceKind {
     Kubernetes,
     Okf,
     Pest,
+    GitHub,
 }
 
 impl From<SourceKind> for CatalogSourceKind {
@@ -48,6 +49,7 @@ impl From<SourceKind> for CatalogSourceKind {
             SourceKind::Kubernetes => Self::Kubernetes,
             SourceKind::Okf => Self::Okf,
             SourceKind::Pest => Self::Pest,
+            SourceKind::GitHub => Self::GitHub,
         }
     }
 }
@@ -285,7 +287,7 @@ fn validate_source(id: &str, source: &ImporterSourceDefinition) -> Result<(), St
         validate_stable_id("sourceId", source_id)?;
         if !matches!(
             source.kind,
-            CatalogSourceKind::Okf | CatalogSourceKind::Kubernetes
+            CatalogSourceKind::Okf | CatalogSourceKind::Kubernetes | CatalogSourceKind::GitHub
         ) {
             return Err(format!(
                 "source {id:?} kind {:?} must not declare sourceId",

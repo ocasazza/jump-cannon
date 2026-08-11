@@ -27,6 +27,14 @@ source change requires a Helm rollout. Named chart profiles are currently
 wired for Obsidian, Kubernetes, and OKF; source kinds with additional required
 inputs are not accepted until the chart owns their complete configuration.
 
+`graphApi.source: github` selects the docs-importer mode: graph-api polls the
+GitHub repository tarball named by `githubImporter.repo`/`ref`/`path` and
+rebuilds on change, so knowledge updates ship with a push to main instead of a
+chart republish. The vault PVC, seed init container, and knowledge ConfigMap
+sync are skipped in this mode; they remain the fallback under the default
+`obsidian` source. Private mirrors take a token only through
+`githubImporter.tokenSecret`, never through values. See [[GitHub Importer]].
+
 The chart's inactive `lavender-ingest-okf` instance consumes the externally
 provisioned `lavender-okf-shared` RWX claim read-only. It mounts the repository
 at `/var/lib/lavender/okf-repository` and imports

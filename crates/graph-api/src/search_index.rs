@@ -229,6 +229,7 @@ mod tests {
 
     fn schema() -> ImporterSchema {
         ImporterSchema::new(
+            "okf",
             vec![
                 DiscoveryField::new("id", DiscoveryFieldType::Keyword, true).searchable(2),
                 DiscoveryField::new("title", DiscoveryFieldType::Text, true)

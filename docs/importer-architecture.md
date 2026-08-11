@@ -289,7 +289,7 @@ assumes Obsidian frontmatter keys.
 The graph, schema, search index, metadata-facet summary, metrics, and binary
 caches belong to one `GraphSnapshot` revision and become visible through one
 atomic swap. A failed schema, document, index, or facet build leaves the prior
-revision active. graph-api does not spawn `vault-search`, and there is no
+revision active, and there is no
 title-only fallback for non-Obsidian sources.
 
 `GET /graph/schema` returns the current graph revision, active source ID/name/
