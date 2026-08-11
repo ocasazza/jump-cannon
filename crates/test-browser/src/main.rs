@@ -683,7 +683,7 @@ async fn drive_page(
         }));
 
         const strictFixture = sidebar?.querySelector(
-          '[data-node-id="Node Editor Fixture"]'
+          '[data-node-id="Node Editor Fixture"], [data-node-id$=":Node Editor Fixture"]'
         );
         const fixtureContract = Boolean(strictFixture);
         const fixture = strictFixture || sidebar?.querySelector('[data-node-id]');
@@ -728,7 +728,7 @@ async fn drive_page(
         const beeLeaf = fixtureContract ? await expandPath('bee/bop/baz') : null;
         if (fixtureContract) {
           await waitFor(() => [fooLeaf, beeLeaf].every(
-            (group) => group?.querySelector('[data-node-id="Node Editor Fixture"]')
+            (group) => group?.querySelector('[data-node-id="Node Editor Fixture"], [data-node-id$=":Node Editor Fixture"]')
           ));
         }
         const groupsToExercise = fixtureContract
@@ -763,8 +763,8 @@ async fn drive_page(
           fooLeaf && beeLeaf &&
           fooLeaf.getAttribute('data-tag-segment') === 'baz' &&
           beeLeaf.getAttribute('data-tag-segment') === 'baz' &&
-          [...fooLeaf.querySelectorAll('[data-node-id="Node Editor Fixture"]')].length === 1 &&
-          [...beeLeaf.querySelectorAll('[data-node-id="Node Editor Fixture"]')].length === 1
+          [...fooLeaf.querySelectorAll('[data-node-id="Node Editor Fixture"], [data-node-id$=":Node Editor Fixture"]')].length === 1 &&
+          [...beeLeaf.querySelectorAll('[data-node-id="Node Editor Fixture"], [data-node-id$=":Node Editor Fixture"]')].length === 1
         );
         const untaggedGroupPresent = Boolean(
           untaggedGroup?.querySelector('[data-node-id]')
