@@ -4,6 +4,7 @@
 
 use dioxus::prelude::*;
 use graph_vcs::{Conflict, ConflictResolution, NodeId, ResolvedNode};
+use panel_kit::Spinner;
 
 use super::worlds::active_world_id;
 use crate::{api, Ctx};
@@ -12,6 +13,9 @@ pub fn panel(ctx: Ctx) -> Element {
     let mut conflicts = use_signal(Vec::<Conflict>::new);
     let mut note = use_signal(|| None::<String>);
     let tick = use_signal(|| 0u64);
+    // Gate the empty state behind the first completed fetch (Spinner while
+    // loading, matching the other panels).
+    let mut loaded = use_signal(|| false);
 
     use_future(move || async move {
         let mut seen = (u64::MAX, Option::<String>::None);
@@ -32,6 +36,7 @@ pub fn panel(ctx: Ctx) -> Element {
                 } else {
                     conflicts.set(Vec::new());
                 }
+                loaded.set(true);
             }
             gloo_timers::future::TimeoutFuture::new(2000).await;
         }
@@ -77,7 +82,11 @@ pub fn panel(ctx: Ctx) -> Element {
                     div { class: "note", "{m}" }
                 }
                 if list.is_empty() {
-                    div { class: "empty", "no recorded conflicts on main" }
+                    if *loaded.read() {
+                        div { class: "empty", "no recorded conflicts on main" }
+                    } else {
+                        Spinner { label: "loading conflicts…" }
+                    }
                 }
                 for c in &list {
                     {
@@ -102,6 +111,7 @@ pub fn panel(ctx: Ctx) -> Element {
                                     button {
                                         class: "btn",
                                         r#type: "button",
+                                        title: "Resolve with the main (ours) side of the conflict",
                                         disabled: c.ours.is_none(),
                                         onclick: {
                                             let n = node.clone();
@@ -112,6 +122,7 @@ pub fn panel(ctx: Ctx) -> Element {
                                     button {
                                         class: "btn",
                                         r#type: "button",
+                                        title: "Resolve with the incoming (theirs) side of the conflict",
                                         disabled: c.theirs.is_none(),
                                         onclick: {
                                             let n = node.clone();
@@ -122,6 +133,7 @@ pub fn panel(ctx: Ctx) -> Element {
                                     button {
                                         class: "btn",
                                         r#type: "button",
+                                        title: "Resolve by deleting the node from main (committed like any other resolution)",
                                         onclick: {
                                             let n = node.clone();
                                             move |_| resolve(n.clone(), ResolvedNode::Deleted)

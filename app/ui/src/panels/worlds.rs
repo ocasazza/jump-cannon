@@ -9,6 +9,7 @@
 
 use dioxus::prelude::*;
 use graph_vcs::{GraphOp, NodeId, VaultEdge, VaultNode};
+use panel_kit::Spinner;
 use session_manager::{UserIdentity, WorldId, WorldSpec};
 
 use super::instances::download_text;
@@ -51,6 +52,9 @@ pub fn panel(mut ctx: Ctx) -> Element {
     let mut name = use_signal(String::new);
     let mut desc = use_signal(String::new);
     let mut tick = use_signal(|| 0u64);
+    // Gate the empty state behind the first completed fetch so it doesn't
+    // flash before the list resolves (app convention: Spinner while loading).
+    let mut loaded = use_signal(|| false);
     // Commit-editor form state lives here, not in `commit_editor`: the
     // editor section renders conditionally (embedded host + open world), and
     // hooks must stay unconditional within one scope.
@@ -78,6 +82,7 @@ pub fn panel(mut ctx: Ctx) -> Element {
                     }
                     Err(e) => error.set(Some(e)),
                 }
+                loaded.set(true);
             }
             gloo_timers::future::TimeoutFuture::new(1500).await;
         }
@@ -135,7 +140,11 @@ pub fn panel(mut ctx: Ctx) -> Element {
                 div { class: "note", "error: {e}" }
             }
             if list.is_empty() && err.is_none() {
-                div { class: "empty", "no worlds yet — create one above" }
+                if *loaded.read() {
+                    div { class: "empty", "no worlds yet — create one above" }
+                } else {
+                    Spinner { label: "loading worlds…" }
+                }
             }
             for row in list {
                 {

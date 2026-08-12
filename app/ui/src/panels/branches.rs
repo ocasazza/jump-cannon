@@ -5,6 +5,7 @@
 
 use dioxus::prelude::*;
 use graph_vcs::BranchInfo;
+use panel_kit::Spinner;
 
 use super::worlds::active_world_id;
 use crate::{api, Ctx};
@@ -13,6 +14,9 @@ pub fn panel(ctx: Ctx) -> Element {
     let mut branches = use_signal(Vec::<BranchInfo>::new);
     let mut note = use_signal(|| None::<String>);
     let mut tick = use_signal(|| 0u64);
+    // Gate the empty state behind the first completed fetch (Spinner while
+    // loading, matching the other panels).
+    let mut loaded = use_signal(|| false);
 
     use_future(move || async move {
         let mut seen = (u64::MAX, Option::<String>::None);
@@ -36,6 +40,7 @@ pub fn panel(ctx: Ctx) -> Element {
                 } else {
                     branches.set(Vec::new());
                 }
+                loaded.set(true);
             }
             gloo_timers::future::TimeoutFuture::new(2000).await;
         }
@@ -54,7 +59,11 @@ pub fn panel(ctx: Ctx) -> Element {
                     div { class: "note", "{m}" }
                 }
                 if list.is_empty() {
-                    div { class: "empty", "no branches" }
+                    if *loaded.read() {
+                        div { class: "empty", "no branches" }
+                    } else {
+                        Spinner { label: "loading branches…" }
+                    }
                 }
                 for b in &list {
                     {

@@ -4,6 +4,7 @@
 
 use dioxus::prelude::*;
 use graph_vcs::Commit;
+use panel_kit::Spinner;
 
 use super::worlds::active_world_id;
 use crate::Ctx;
@@ -15,6 +16,9 @@ pub fn panel(ctx: Ctx) -> Element {
     let mut error = use_signal(|| None::<String>);
     let mut new_branch = use_signal(String::new);
     let mut tick = use_signal(|| 0u64);
+    // Gate the empty state behind the first completed fetch (Spinner while
+    // loading, matching the other panels).
+    let mut loaded = use_signal(|| false);
 
     use_future(move || async move {
         let mut seen = (u64::MAX, String::new(), Option::<String>::None);
@@ -27,6 +31,7 @@ pub fn panel(ctx: Ctx) -> Element {
                 let Some(wid) = active_world_id(ctx) else {
                     commits.set(Vec::new());
                     branches.set(Vec::new());
+                    loaded.set(true);
                     gloo_timers::future::TimeoutFuture::new(1500).await;
                     continue;
                 };
@@ -52,6 +57,7 @@ pub fn panel(ctx: Ctx) -> Element {
                     }
                     Err(e) => error.set(Some(e.to_string())),
                 }
+                loaded.set(true);
             }
             gloo_timers::future::TimeoutFuture::new(1500).await;
         }
@@ -78,6 +84,7 @@ pub fn panel(ctx: Ctx) -> Element {
                                     key: "{name}",
                                     class: if active { "btn branch active" } else { "btn branch" },
                                     r#type: "button",
+                                    aria_pressed: if active { "true" } else { "false" },
                                     onclick: move |_| branch.set(pick.clone()),
                                     "{name}"
                                 }
@@ -89,7 +96,11 @@ pub fn panel(ctx: Ctx) -> Element {
                     div { class: "note", "error: {e}" }
                 }
                 if log.is_empty() && err.is_none() {
-                    div { class: "empty", "no commits on {current_branch}" }
+                    if *loaded.read() {
+                        div { class: "empty", "no commits on {current_branch}" }
+                    } else {
+                        Spinner { label: "loading history…" }
+                    }
                 }
                 for c in log {
                     {

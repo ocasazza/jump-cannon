@@ -411,6 +411,10 @@ fn sessions_default_layout() -> Vec<PanelWin<Panel>> {
         min(b, Panel::GpuSessions, 880.0, 200.0, 380.0, 340.0),
         min(b, Panel::Nodes, 900.0, 240.0, 608.0, 620.0),
         min(b, Panel::Progress, 920.0, 280.0, 640.0, 200.0),
+        // Settings carries the session-manager URL + x-user identity the
+        // Worlds/GPU panels depend on — reachable from the dock here, not
+        // only back in the User view.
+        min(b, Panel::Settings, 930.0, 300.0, 608.0, 420.0),
         min(b, Panel::Help, 940.0, 320.0, 330.0, 180.0),
     ];
     v.extend([
@@ -670,7 +674,7 @@ fn view_slug(view: AppView) -> &'static str {
 }
 
 /// The view boot restores: the last one chosen via the topbar switcher.
-fn persisted_view() -> AppView {
+pub(crate) fn persisted_view() -> AppView {
     match LocalStorage::get::<String>(VIEW_KEY)
         .unwrap_or_default()
         .as_str()
@@ -678,6 +682,18 @@ fn persisted_view() -> AppView {
         "sessions" => AppView::Sessions,
         _ => AppView::User,
     }
+}
+
+/// Whether `view`'s workspace layout holds `kind`. The palette filters its
+/// jump-to-section commands through this so it never offers a restore that
+/// would silently no-op (`Workspace::restore` on a panel the active view's
+/// layout doesn't contain).
+pub(crate) fn panel_in_view(kind: Panel, view: AppView) -> bool {
+    let layout = match view {
+        AppView::User => default_layout(),
+        AppView::Sessions => sessions_default_layout(),
+    };
+    layout.iter().any(|p| p.kind == kind)
 }
 
 /// Clear every value whose node indices or server ownership came from the old
@@ -1112,12 +1128,16 @@ fn App() -> Element {
                     button {
                         class: if view_now == AppView::User { "view-btn active" } else { "view-btn" },
                         r#type: "button",
+                        title: "User workspace: explore the served graph",
+                        aria_pressed: if view_now == AppView::User { "true" } else { "false" },
                         onclick: move |_| switch_view(ctx, AppView::User),
                         "User"
                     }
                     button {
                         class: if view_now == AppView::Sessions { "view-btn active" } else { "view-btn" },
                         r#type: "button",
+                        title: "Sessions workspace: versioned shared worlds",
+                        aria_pressed: if view_now == AppView::Sessions { "true" } else { "false" },
                         onclick: move |_| switch_view(ctx, AppView::Sessions),
                         "Sessions"
                     }

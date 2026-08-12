@@ -4,6 +4,7 @@
 //! or no-world states (the panel itself stays restore-able from the dock).
 
 use dioxus::prelude::*;
+use panel_kit::Spinner;
 
 use crate::{api, Ctx};
 
@@ -11,6 +12,9 @@ pub fn panel(ctx: Ctx) -> Element {
     let mut status = use_signal(|| None::<serde_json::Value>);
     let mut note = use_signal(|| None::<String>);
     let mut tick = use_signal(|| 0u64);
+    // Gate the empty state behind the first completed fetch (Spinner while
+    // loading, matching the other panels).
+    let mut loaded = use_signal(|| false);
 
     use_future(move || async move {
         let mut seen = (u64::MAX, Option::<String>::None);
@@ -25,6 +29,7 @@ pub fn panel(ctx: Ctx) -> Element {
                         Ok(v) => status.set(Some(v)),
                         Err(e) => note.set(Some(e)),
                     }
+                    loaded.set(true);
                 }
             }
             gloo_timers::future::TimeoutFuture::new(3000).await;
@@ -87,8 +92,10 @@ pub fn panel(ctx: Ctx) -> Element {
                     pre { class: "session-status",
                         {serde_json::to_string_pretty(v).unwrap_or_default()}
                     }
-                } else {
+                } else if *loaded.read() {
                     div { class: "empty", "no session state yet" }
+                } else {
+                    Spinner { label: "loading session state…" }
                 }
                 div { class: "note",
                     "worlds share the standing Kueue GPU envelope; idle worlds auto-park"
