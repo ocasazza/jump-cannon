@@ -29,8 +29,12 @@ node IDs whether it arrives over the filesystem or the tarball. The reserved
 
 The chart wires this mode with `graphApi.source: github` and the
 `githubImporter` values (`repo`, `ref`, `path`, `pollIntervalSeconds`,
-`cacheDir`). The knowledge ConfigMap and vault seed sync are untouched and
-remain the fallback under `graphApi.source: obsidian`. Tokens for private
+`cacheDir`). This is the **live source in the nixstation cluster** since
+envoy-ai-gateway `5e3ed2a` (2026-08-11): the platform component sets
+`graphApi.source = "github"` with the default repo/ref/path values, so the
+deployed corpus tracks `ocasazza/jump-cannon@main` with a 60 s ETag poll. The
+knowledge ConfigMap and vault seed sync are untouched and remain the fallback
+under `graphApi.source: obsidian`. Tokens for private
 mirrors never enter values; point `githubImporter.tokenSecret.name`/`key` at
 an existing Secret and the chart injects `JUMP_CANNON_GITHUB_TOKEN` through a
 `secretKeyRef`.
