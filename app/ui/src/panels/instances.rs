@@ -103,7 +103,7 @@ fn page_origin() -> Option<String> {
 
 /// Anchor-triggered data-URL download (the egui port uses a Blob; data URLs
 /// avoid the Blob/Url web-sys features).
-fn download_text(filename: &str, mime: &str, contents: &str) -> Result<(), String> {
+pub(crate) fn download_text(filename: &str, mime: &str, contents: &str) -> Result<(), String> {
     let doc = web_sys::window()
         .and_then(|w| w.document())
         .ok_or("no document")?;

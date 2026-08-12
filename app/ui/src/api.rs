@@ -10,6 +10,7 @@
 //! The base URL is configurable at runtime and persisted in local storage —
 //! localhost in dev, a LAN/Tailscale address from another device.
 
+use dioxus::prelude::*;
 use gloo_net::http::Request;
 use gloo_storage::{LocalStorage, Storage};
 use prost::Message;
@@ -18,6 +19,15 @@ use serde::{Deserialize, Serialize};
 use crate::proto;
 
 const URL_KEY: &str = "jc_server_url";
+const SM_URL_KEY: &str = "jc_session_manager_url";
+const USER_KEY: &str = "jc_user_name";
+
+/// World-scoped graph base (`{session-manager}/worlds/{id}`), set by the
+/// Sessions view when a world is opened and cleared on every view switch.
+/// When `Some`, all graph fetches target the session-manager server instead
+/// of the standalone graph-api — one mounted view at a time keeps this
+/// unambiguous.
+pub(crate) static WORLD_BASE: GlobalSignal<Option<String>> = Signal::global(|| None);
 
 /// Default API base. 127.0.0.1, not "localhost": on macOS `localhost`
 /// resolves to ::1 (IPv6) first, but the dev server binds IPv4. 8765 is the
@@ -89,6 +99,39 @@ pub fn set_server_url(url: &str) {
     let _ = LocalStorage::set(URL_KEY, normalize_url(url));
 }
 
+/// Configured session-manager base URL, or `None` for standalone mode
+/// (the Sessions view then runs on the embedded single-user host).
+pub fn session_manager_url() -> Option<String> {
+    let v: String = LocalStorage::get(SM_URL_KEY).unwrap_or_default();
+    let v = normalize_url(&v);
+    if v.is_empty() {
+        None
+    } else {
+        Some(v)
+    }
+}
+
+pub fn set_session_manager_url(url: &str) {
+    let _ = LocalStorage::set(SM_URL_KEY, normalize_url(url));
+}
+
+/// Identity sent to the session manager (`x-user` header). The OIDC gateway
+/// injects this server-side in cluster deployments; the app mirrors it so
+/// direct connections carry the same identity.
+pub fn user_name() -> String {
+    let v: String = LocalStorage::get(USER_KEY).unwrap_or_default();
+    let v = v.trim().to_string();
+    if v.is_empty() {
+        "local".to_string()
+    } else {
+        v
+    }
+}
+
+pub fn set_user_name(name: &str) {
+    let _ = LocalStorage::set(USER_KEY, name.trim());
+}
+
 pub type ApiResult<T> = Result<T, String>;
 
 pub(crate) fn err<E: std::fmt::Display>(e: E) -> String {
@@ -96,6 +139,9 @@ pub(crate) fn err<E: std::fmt::Display>(e: E) -> String {
 }
 
 pub(crate) fn url(path: &str) -> String {
+    if let Some(base) = WORLD_BASE.read().clone() {
+        return format!("{base}{path}");
+    }
     format!("{}{}", server_url(), path)
 }
 
@@ -115,7 +161,14 @@ fn encode_id(id: &str) -> String {
 /// stamped them `immutable, max-age=1y` — WebKit took it at its word).
 /// `NoStore` both skips existing entries and never writes new ones.
 fn get(path: &str) -> gloo_net::http::RequestBuilder {
-    Request::get(&url(path)).cache(web_sys::RequestCache::NoStore)
+    let req = Request::get(&url(path)).cache(web_sys::RequestCache::NoStore);
+    // World-scoped fetches hit the session manager, which requires identity
+    // on every authenticated route (only /healthz is exempt).
+    if WORLD_BASE.read().is_some() {
+        req.header("x-user", &user_name())
+    } else {
+        req
+    }
 }
 
 pub(crate) async fn get_json<T: serde::de::DeserializeOwned>(path: &str) -> ApiResult<T> {
@@ -569,6 +622,47 @@ pub struct ConfigEntry {
 #[allow(dead_code)]
 pub async fn configs() -> ApiResult<Vec<ConfigEntry>> {
     get_json("/configs").await
+}
+
+// --- session manager control API ------------------------------------------------
+
+/// `{session-manager}/api/...` — control-plane calls (compute sessions,
+/// world metadata) go to the manager root, not the per-world graph base.
+fn sm_api(path: &str) -> Option<String> {
+    session_manager_url().map(|base| format!("{base}/api{path}"))
+}
+
+/// `GET /api/worlds/:id/compute/session` — live GPU session state, derived
+/// from cluster objects server-side. Shape is `{"enabled": false}` when the
+/// broker is disabled, else graph-api's SessionStatus — consumed loosely.
+pub async fn sm_compute_session(world: &str) -> ApiResult<serde_json::Value> {
+    let url = sm_api(&format!("/worlds/{world}/compute/session"))
+        .ok_or("no session manager configured")?;
+    let resp = Request::get(&url)
+        .header("x-user", &user_name())
+        .send()
+        .await
+        .map_err(err)?;
+    if !resp.ok() {
+        return Err(format!("compute session -> HTTP {}", resp.status()));
+    }
+    resp.json().await.map_err(err)
+}
+
+/// `POST /api/worlds/:id/compute/{dispatch|park}` — writer-only GPU session
+/// actions; the server answers with a soft `{ok, state, error}` envelope.
+pub async fn sm_compute_action(world: &str, action: &str) -> ApiResult<serde_json::Value> {
+    let url = sm_api(&format!("/worlds/{world}/compute/{action}"))
+        .ok_or("no session manager configured")?;
+    let resp = Request::post(&url)
+        .header("x-user", &user_name())
+        .send()
+        .await
+        .map_err(err)?;
+    if !resp.ok() {
+        return Err(format!("compute {action} -> HTTP {}", resp.status()));
+    }
+    resp.json().await.map_err(err)
 }
 
 #[cfg(test)]

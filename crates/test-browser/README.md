@@ -22,10 +22,13 @@ bundle.
    repeatable Search and field rules, live All/Any subtree counts, inline
    syntax diagnostics that preserve the last valid result, and accessible
    reorder controls; restoring the workspace remounts Graph afterward.
-10. CDP resource errors, console errors, Rust tracing errors, and unhandled
-   exceptions fail the run.
-11. Screenshots are written to `<out-dir>/nodes-editor.png`,
-   `filter-builder.png`, and `boot.png`.
+10. The topbar view switcher mounts the Sessions workspace — Worlds panel with
+    its embedded-host empty state plus the dock — and switching back to User
+    remounts a render-ready Graph canvas.
+11. CDP resource errors, console errors, Rust tracing errors, and unhandled
+    exceptions fail the run.
+12. Screenshots are written to `<out-dir>/nodes-editor.png`,
+   `filter-builder.png`, `sessions-view.png`, and `boot.png`.
    Pixel content is reviewed rather than asserted.
 
 On Linux, the harness uses Vulkan for WebGPU compute while disabling the
@@ -52,10 +55,11 @@ Output lands in `target/test-browser-rust/`:
 - `nodes-editor.png` — Nodes workbench with tag hierarchy and focused content
 - `filter-builder.png` — maximized Filter builder with nested Boolean rules
 - `settings-importers.png` — deployment-managed importer catalog
+- `sessions-view.png` — Sessions workspace (Worlds panel, dock)
 - `boot.png` — screenshot at the moment all assertions passed
 - `report.json` — JSON including structured `nodes_editor`, `settings_tabs`,
-  `filter_builder`, `graph_header_actions`, canvas, boot-log, and browser-error
-  results
+  `filter_builder`, `sessions_view`, `graph_header_actions`, canvas, boot-log,
+  and browser-error results
 
 ## CLI
 

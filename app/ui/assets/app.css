@@ -936,3 +936,16 @@ textarea.doc-src:focus { outline:none; }
 /* phase-4 anchor: client-side tvix eval (layout seeds, generate inline)  */
 /* — the tvix agent owns this block —                                     */
 /* ====================================================================== */
+
+/* ====================================================================== */
+/* Sessions view: topbar switcher + world/VCS/GPU panels                  */
+/* ====================================================================== */
+.view-switch { display:inline-flex; gap:2px; margin-left:1rem; }
+.view-btn { background:transparent; color:var(--dim); border:1px solid var(--line2);
+  font:inherit; padding:0 .6rem; cursor:pointer; }
+.view-btn:hover { color:var(--fg); }
+.view-btn.active { color:var(--fg); border-color:var(--fg); }
+.btn.branch.active { border-color:var(--fg); color:var(--fg); }
+.conflict-row { border:1px solid var(--line2); padding:.35rem .5rem; margin-bottom:.35rem; }
+.session-status { background:var(--bg); border:1px solid var(--line2); padding:.5rem;
+  max-height:16rem; overflow:auto; white-space:pre-wrap; }

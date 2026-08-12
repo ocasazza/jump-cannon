@@ -147,6 +147,83 @@ pub async fn load() -> Result<GraphData, String> {
     })
 }
 
+/// Convert an embedded world's materialized snapshot into `GraphData`,
+/// mirroring the Generate panel's client-graph path (`graph_revision: None`,
+/// default colors/sizes, union-find `num_wcc`, no Louvain). Node iteration
+/// order is the snapshot's `BTreeMap` order, so the same snapshot always
+/// mounts the same buffer layout. Positions come from the stored `x`/`y`
+/// when any node carries them; otherwise the same deterministic sphere +
+/// coarsening warm-up as `load()` seeds the sim.
+pub(crate) fn graph_data_from_snapshot(snapshot: &graph_vcs::Snapshot) -> GraphData {
+    let mut id_to_idx: HashMap<String, u32> = HashMap::with_capacity(snapshot.nodes.len());
+    let mut ids: Vec<String> = Vec::with_capacity(snapshot.nodes.len());
+    for id in snapshot.nodes.keys() {
+        id_to_idx.insert(id.0.clone(), ids.len() as u32);
+        ids.push(id.0.clone());
+    }
+    let n = ids.len();
+
+    let mut edges: Vec<u32> = Vec::with_capacity(snapshot.edges.len() * 2);
+    for edge in &snapshot.edges {
+        // Mirror the Generate panel: edges whose endpoints are gone are
+        // silently dropped (`DeleteNode` does not cascade).
+        let (Some(&s), Some(&t)) = (
+            id_to_idx.get(&edge.source),
+            id_to_idx.get(&edge.target),
+        ) else {
+            continue;
+        };
+        edges.push(s);
+        edges.push(t);
+    }
+    let n_edges = (edges.len() / 2) as u32;
+
+    let has_stored_positions = snapshot
+        .nodes
+        .values()
+        .any(|node| node.x != 0.0 || node.y != 0.0);
+    let positions = if has_stored_positions {
+        let mut positions = Vec::with_capacity(n * 3);
+        for node in snapshot.nodes.values() {
+            positions.push(node.x);
+            positions.push(node.y);
+            positions.push(0.0);
+        }
+        positions
+    } else {
+        let mut positions = render::data::spawn_on_unit_sphere(n, 800.0);
+        if n <= 10_000 {
+            let spring_len = GpuForceOptions::default().spring_len.max(1.0);
+            let warmed = graph_layouts::warmup_positions(n, &edges, spring_len, 0xC0A75E);
+            if warmed.len() == positions.len() {
+                positions = warmed;
+            }
+        }
+        positions
+    };
+
+    let metrics: HashMap<String, Vec<f32>> = HashMap::new();
+    let colors = render::data::colors_from_metric("community", &metrics, n);
+    let sizes = render::data::sizes_from_metric("pagerank", &metrics, n, 0.5);
+    let num_wcc = crate::panels::generate::wcc_count(n, &edges);
+
+    GraphData {
+        graph_revision: None,
+        n_nodes: n as u32,
+        n_edges,
+        num_communities: 0,
+        num_wcc,
+        ids,
+        id_to_idx,
+        scene: render::Scene {
+            positions,
+            edges,
+            colors,
+            sizes,
+        },
+    }
+}
+
 /// In-flight pointer drag (camera rotate). A press that never travels
 /// more than the slop is a click — and clicks pick nodes.
 #[derive(Clone, Copy, PartialEq)]

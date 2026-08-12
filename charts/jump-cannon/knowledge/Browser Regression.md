@@ -10,8 +10,8 @@ tags: [jump-cannon, browser, webgpu]
 
 `just test browser-rust` starts graph-api with a test vault, opens the built
 Dioxus app in Chromium, exercises Graph header actions and the Nodes workbench,
-and writes `nodes-editor.png`, `settings-importers.png`, `boot.png`, and
-`report.json` under `target/test-browser-rust`.
+and writes `nodes-editor.png`, `settings-importers.png`, `sessions-view.png`,
+`boot.png`, and `report.json` under `target/test-browser-rust`.
 
 Stable fixture notes prove that Nodes renders a horizontal navigator/content
 split, uses the importer-neutral `Search fields` label while exposing the core
@@ -36,6 +36,16 @@ input, deployment-provisioned RWX and same-namespace requirements, alternate
 and no Apply, Run, or Activate action is present. Restoring Settings must
 remount a render-ready Graph canvas. These results are recorded under
 `settings_tabs`.
+
+The run then clicks the topbar **Sessions** view switcher. View switches
+reload the page (persisted `jc_view` + `location.reload()`), so the suite
+detects the fresh runtime by the `window.__jc_boot` stamp changing and
+asserts in fresh evaluates: against the embedded single-user host the
+contract is deterministic — the Sessions workspace mounts the Worlds panel
+with its "no worlds yet" empty state and the dock, and switching back to
+**User** remounts a render-ready Graph canvas. These results are recorded
+under `sessions_view`, with visual evidence in `sessions-view.png`. The
+view contract itself lives in [[Session Manager]].
 
 Chromiumoxide arguments are keys without a leading `--`; its launcher adds the
 CLI prefix. Cluster browser jobs run as the chart's non-root identity without a

@@ -1,0 +1,19 @@
+{{- if .Values.sessionManager.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "jump-cannon.sessionManagerName" . }}
+  labels:
+    {{- include "jump-cannon.labels" . | nindent 4 }}
+    app.kubernetes.io/component: session-manager
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "jump-cannon.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: session-manager
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+      protocol: TCP
+{{- end }}

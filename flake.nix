@@ -344,6 +344,7 @@
             install -m 0644 "$RUN_OUT/nodes-editor.png" "$OUT_DIR/nodes-editor.png"
             install -m 0644 "$RUN_OUT/settings-importers.png" "$OUT_DIR/settings-importers.png"
             install -m 0644 "$RUN_OUT/filter-builder.png" "$OUT_DIR/filter-builder.png"
+            install -m 0644 "$RUN_OUT/sessions-view.png" "$OUT_DIR/sessions-view.png"
             install -m 0644 "$RUN_OUT/report.json" "$OUT_DIR/report.json"
           '';
         };
@@ -902,11 +903,13 @@
         # checked in (app/ui/src/proto/), so no protoc — but the workspace is
         # no longer fully self-contained: jump-cannon-ui's wgpu renderer
         # drives the GPU force layout via a path dependency on
-        # crates/graph-layouts (which has no path deps of its own), so the
-        # source root is the repo root with a fileset union of app/ + that
-        # crate. `sourceRoot` drops the build into app/ where Trunk.toml and
-        # the workspace manifest live; the relative ../../crates/graph-layouts
-        # path then resolves inside the union. wasm-bindgen is pinned to
+        # crates/graph-layouts, and the Sessions view drives worlds via path
+        # dependencies on crates/session-manager + crates/graph-vcs (which in
+        # turn path-depend on crates/vault-data), so the
+        # source root is the repo root with a fileset union of app/ + those
+        # crates. `sourceRoot` drops the build into app/ where Trunk.toml and
+        # the workspace manifest live; the relative ../../crates/*
+        # paths then resolve inside the union. wasm-bindgen is pinned to
         # =0.2.118 in app/Cargo.toml to match the nixpkgs CLI exactly (no
         # CLI/crate version-skew caveats).
         #
@@ -921,17 +924,17 @@
             (pkgs.lib.fileset.fileFilter
               (file: builtins.any file.hasExt [ "rs" "toml" "lock" "html" "css" "wgsl" ])
               ./app)
-            # graph-layouts embeds its compute WGSL via include_str!.
+            # The Sessions view path-depends on session-manager/graph-vcs,
+            # whose *optional* server deps (graph-api, data-loader, …) still
+            # need their manifests parsed, and those use `workspace = true`
+            # inheritance — so the whole crates/ tree and the root workspace
+            # manifest must be present even though only a few crates compile.
+            # Extensions beyond rs/toml: wgsl (graph-layouts/graph-compute
+            # shaders), nix (tvix-wasm demo catalog), proto (graph-api).
+            ./Cargo.toml
             (pkgs.lib.fileset.fileFilter
-              (file: builtins.any file.hasExt [ "rs" "toml" "lock" "wgsl" ])
-              ./crates/graph-layouts)
-            # tvix-wasm: client-side Nix eval for Layout seeds + Generate
-            # Inline executor (phase 4) — second path dep outside app/.
-            # "nix": the crate embeds its demo catalog via include_str!
-            # (src/nix/*.nix).
-            (pkgs.lib.fileset.fileFilter
-              (file: builtins.any file.hasExt [ "rs" "toml" "lock" "nix" ])
-              ./crates/tvix-wasm)
+              (file: builtins.any file.hasExt [ "rs" "toml" "lock" "wgsl" "nix" "proto" ])
+              ./crates)
           ];
         };
 

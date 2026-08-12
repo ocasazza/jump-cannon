@@ -6,6 +6,8 @@ members = [
     "crates/graph-api",
     "crates/graph-compute",
     "crates/vault-data",
+    "crates/graph-vcs",
+    "crates/session-manager",
     "crates/vault-links",
     "crates/vault-search",
     "crates/tvix-wasm",

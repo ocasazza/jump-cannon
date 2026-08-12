@@ -225,6 +225,75 @@ graphCompute:
         memory: 8Gi
         nvidia.com/gpu: "1"
 
+# Multi-user session-manager: world/session/VCS REST API plus per-world
+# graph serving, backed by the world-store PVC. Disabled by default; the
+# single-tenant graphApi deployment above remains the default surface.
+sessionManager:
+  enabled: false
+  image:
+    repository: us-central1-docker.pkg.dev/it-ops-nixstation/lavender/jump-cannon-session-manager
+    tag: latest
+    pullPolicy: Always
+  port: 8080
+  rustLog: info
+  # In-memory controllers (world serving states, GPU session loops) live in
+  # the pod, so exactly one replica is supported.
+  replicas: 1
+  # Trusted identity header set by the authenticating ingress; requests
+  # without it get 401.
+  userHeader: x-user
+  # World store backend: minigraf (one <world-slug>.graph file per world on
+  # the PVC) or terminusdb (one TerminusDB database per world; requires
+  # terminusdb.enabled=true, enforced by a chart fail).
+  store: minigraf
+  persistence:
+    enabled: true
+    # Mount a claim created elsewhere; when non-empty the chart does not
+    # render its own world-store PVC.
+    existingClaim: ""
+    storageClassName: local-path
+    size: 5Gi
+  resources:
+    requests:
+      cpu: 250m
+      memory: 512Mi
+    limits:
+      cpu: "2"
+      memory: 2Gi
+  # Per-world GPU compute broker: one Kueue-admitted RayCluster per world,
+  # lifecycle-managed by the session-manager (dispatch/park, idle auto-park,
+  # hard caps) within the same standing LocalQueue envelope as
+  # graphCompute.session. Mutually exclusive with graphCompute.session
+  # (enforced by a chart fail); requires sessionManager.replicas == 1.
+  gpu:
+    enabled: false
+    # Defaults to graphCompute.namespace (the release namespace when unset).
+    namespace: ""
+    idleSeconds: 900
+    admissionTimeoutSeconds: 600
+    maxExecTimeSeconds: 14400
+    headStartTimeoutSeconds: 900
+
+# TerminusDB backend for sessionManager.store=terminusdb: one database per
+# world, served by a single-replica StatefulSet with its own PVC. Disabled by
+# default. The admin password NEVER comes from values: create a Secret holding
+# it and reference that Secret via adminPasswordSecret.
+terminusdb:
+  enabled: false
+  image: terminusdb/terminusdb:v12.0.7
+  service:
+    port: 6363
+  persistence:
+    size: 10Gi
+    # null = the cluster default storage class.
+    storageClass: null
+  adminPasswordSecret:
+    # Name of a user-created Secret holding the TerminusDB admin password.
+    # The chart fails to render when terminusdb is enabled without one.
+    name: ""
+    # Key within that Secret carrying the password.
+    key: password
+
 tests:
   image:
     repository: us-central1-docker.pkg.dev/it-ops-nixstation/lavender/jump-cannon-test-runner

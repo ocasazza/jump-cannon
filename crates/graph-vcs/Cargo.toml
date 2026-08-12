@@ -1,0 +1,27 @@
+[package]
+name = "graph-vcs"
+version = "1.0.0"
+edition = "2021"
+description = "Jujutsu-inspired version-control core for VaultGraph snapshots, backed by minigraf"
+
+[features]
+# TerminusDB-backed store (native only). Off by default so wasm32 and the
+# embedded app never pull an HTTP client; enabled by session-manager's
+# `server` feature.
+terminus = ["dep:reqwest"]
+
+[dependencies]
+vault-data = { path = "../vault-data" }
+serde      = { workspace = true }
+serde_json = { workspace = true }
+thiserror  = "2"
+minigraf   = "1.2"
+sha2       = "0.10"
+
+# `terminus` feature only (native). Plain HTTP, no TLS backend: in-cluster
+# traffic terminates TLS at the ingress, same stance as session-manager.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+reqwest = { version = "0.12", default-features = false, features = ["json", "blocking"], optional = true }
+
+[dev-dependencies]
+tempfile = "3"

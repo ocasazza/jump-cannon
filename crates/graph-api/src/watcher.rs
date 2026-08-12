@@ -73,16 +73,36 @@ pub fn spawn(state: AppState, filesystem_rescan_seconds: u64) {
             );
         }
         WatchPlan::Poll { interval_ms } => spawn_poll(state, interval_ms),
-        WatchPlan::Push => {
-            state.inner.progress.warn(
-                "watch",
-                format!(
-                    "{} requests push changes, but push streams are not wired yet",
-                    descriptor.id
-                ),
-            );
-        }
+        WatchPlan::Push => spawn_push(state),
     }
+}
+
+/// Push-driven reload: each tick on the trigger receiver wired via
+/// [`AppState::with_push_trigger`] runs one full snapshot rebuild. Without a
+/// wired trigger the driver stays disabled, matching the historical
+/// warn-and-continue behavior for push sources.
+fn spawn_push(state: AppState) {
+    let Some(mut trigger) = state.inner.push_trigger.clone() else {
+        let message = format!(
+            "{} requests push changes, but no push trigger is wired; change driver disabled",
+            state.inner.importer.descriptor().id
+        );
+        state.inner.progress.warn("watch", &message);
+        tracing::warn!(importer = %state.inner.importer.descriptor().id, "{message}");
+        return;
+    };
+    state.inner.progress.info(
+        "watch",
+        format!(
+            "{} reloads on push trigger",
+            state.inner.importer.descriptor().id
+        ),
+    );
+    tokio::spawn(async move {
+        while trigger.changed().await.is_ok() {
+            reload(&state).await;
+        }
+    });
 }
 
 fn watch_is_authorized(importer: &HostedImporter, descriptor: &ImporterDescriptor) -> bool {

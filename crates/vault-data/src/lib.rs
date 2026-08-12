@@ -8,7 +8,7 @@ pub mod node;
 mod tests;
 
 pub use color::PALETTE;
-pub use edge::VaultEdge;
+pub use edge::{EdgeId, VaultEdge};
 pub use field_schema::{DoctypeSchema, FieldSchema, FieldType};
 pub use graph::{GraphValidationError, VaultGraph};
 pub use node::{NodeMeta, NodeMetrics, VaultNode};

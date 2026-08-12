@@ -385,7 +385,7 @@ struct SoupResp {
 /// Weakly-connected component count via union-find over the undirected edge
 /// set — ported from `generate.rs::wcc_labels` (the labels themselves have no
 /// home here, see the PARITY GAP in `graph_data_from_generated`).
-fn wcc_count(n_nodes: usize, edges: &[u32]) -> u32 {
+pub(crate) fn wcc_count(n_nodes: usize, edges: &[u32]) -> u32 {
     let mut parent: Vec<u32> = (0..n_nodes as u32).collect();
     fn find(parent: &mut [u32], x: u32) -> u32 {
         let mut root = x;

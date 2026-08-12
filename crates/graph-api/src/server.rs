@@ -45,10 +45,11 @@ fn insert_graph_revision(headers: &mut HeaderMap, revision: u64) {
     );
 }
 
-pub fn router(state: AppState) -> Router {
+/// Every API route EXCEPT the frontend asset routes (`/`, `/assets/*path`,
+/// and the static fallback), without state or layers applied. Shared by
+/// [`api_router`] and [`router`].
+fn api_routes() -> Router<AppState> {
     Router::new()
-        .route("/", get(index))
-        .route("/assets/*path", get(asset))
         // App-state config presets (the instances-page import/export feature):
         // `/configs` lists shipped presets; `/configs/:name` returns one as YAML.
         .route("/configs", get(configs_list))
@@ -88,6 +89,28 @@ pub fn router(state: AppState) -> Router {
         .route("/vault/page", put(vault_page_put))
         .route("/generate", axum::routing::post(generate_post))
         .route("/progress", get(progress_poll))
+}
+
+/// The full API surface with state applied, WITHOUT the frontend asset
+/// routes. This is the mountable form: the session-manager server nests one
+/// of these per world under `/worlds/:name/` (worlds are constructed with
+/// `assets_dir: None`, and the only asset-dependent handlers — `/`,
+/// `/assets/*path`, the fallback, and the `/configs*` presets — either are
+/// absent here or already gate on `assets_dir.is_some()`).
+pub fn api_router(state: AppState) -> Router {
+    api_routes()
+        // Permissive CORS: same stance as `router` — see below.
+        .layer(tower_http::cors::CorsLayer::permissive())
+        .with_state(state)
+}
+
+/// The standalone server router: the full API plus the frontend asset
+/// routes (`/`, `/assets/*path`) and the static fallback. Behavior is
+/// unchanged from before the `api_router` split.
+pub fn router(state: AppState) -> Router {
+    api_routes()
+        .route("/", get(index))
+        .route("/assets/*path", get(asset))
         // Permissive CORS: the Dioxus/Tauri app (app/) loads from its own
         // origin (tauri dev server / tauri:// in release) and fetches this API
         // cross-origin. Consistent with the local-dev no-auth stance documented

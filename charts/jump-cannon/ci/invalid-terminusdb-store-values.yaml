@@ -1,0 +1,13 @@
+# Must FAIL to render: the terminusdb world store is selected but the
+# in-cluster TerminusDB server is not enabled.
+sessionManager:
+  enabled: true
+  store: terminusdb
+
+tests:
+  fuzz:
+    enabled: false
+  performance:
+    enabled: false
+  browser:
+    enabled: false

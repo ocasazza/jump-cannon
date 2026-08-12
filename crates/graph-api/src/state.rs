@@ -181,6 +181,12 @@ pub struct AppStateInner {
     /// `GET /importers`. This never grants effects or changes the active
     /// process-lifetime importer.
     pub importer_catalog: ImporterCatalog,
+    /// Push reload trigger for `WatchPlan::Push` importers. `Some` only when
+    /// the host wired one via [`AppState::with_push_trigger`]; each received
+    /// tick runs a full snapshot rebuild (see `watcher.rs`). Standalone
+    /// graph-api never sets this — push sources without a trigger keep the
+    /// old warn-and-disable behavior.
+    pub push_trigger: Option<tokio::sync::watch::Receiver<u64>>,
 }
 
 impl AppState {
@@ -233,8 +239,22 @@ impl AppState {
                 gpu_session: None,
                 progress,
                 importer_catalog,
+                push_trigger: None,
             }),
         })
+    }
+
+    /// Attach a push-trigger receiver for a `WatchPlan::Push` importer.
+    /// Consumes + returns self so the host can chain it onto the constructor
+    /// before the state is shared; if the `Arc` is already shared the
+    /// receiver is dropped with a warning (a startup ordering bug, not a
+    /// runtime hazard).
+    pub fn with_push_trigger(mut self, rx: tokio::sync::watch::Receiver<u64>) -> Self {
+        match Arc::get_mut(&mut self.inner) {
+            Some(inner) => inner.push_trigger = Some(rx),
+            None => tracing::warn!("push trigger dropped: AppState already shared"),
+        }
+        self
     }
 
     /// Attach the GPU session controller handle. Consumes + returns self so

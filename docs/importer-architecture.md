@@ -535,6 +535,12 @@ browser localStorage or shareable app-state exports.
 - [x] Add opt-in, namespace-scoped Kubernetes token/RBAC templates; preserve
   the secure defaults.
 
+Landed since this list was written: `WatchPlan::Push` is now a real change
+driver — wired in `crates/graph-api/src/watcher.rs` and used by the session
+manager's `WorldImporter` to publish VCS commits through the same atomic full
+snapshot path as any other reload. Source event streams, deltas, and the
+host-owned op-sink remain open below.
+
 ### Phase 4: sandboxed extensibility and writes
 
 - [ ] Define versioned WIT mapper, connector, encoder, and sink worlds.

@@ -1,0 +1,69 @@
+{{- include "jump-cannon.validateSessionManagerGpu" . -}}
+{{- if and .Values.sessionManager.enabled .Values.sessionManager.gpu.enabled }}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "jump-cannon.sessionManagerName" . }}-gpu-broker
+  namespace: {{ include "jump-cannon.smComputeNamespace" . }}
+  labels:
+    {{- include "jump-cannon.labels" . | nindent 4 }}
+    app.kubernetes.io/component: session-manager
+rules:
+  - apiGroups:
+      - ray.io
+    resources:
+      - rayclusters
+    verbs:
+      - get
+      - list
+      - create
+      - delete
+  - apiGroups:
+      - kueue.x-k8s.io
+    resources:
+      - workloads
+    verbs:
+      - get
+      - list
+  - apiGroups:
+      - ""
+    resources:
+      - pods
+    verbs:
+      - get
+      - list
+  - apiGroups:
+      - ""
+    resources:
+      - pods/log
+    verbs:
+      - get
+  {{- /* The broker maintains one ClusterIP Service per world (KubeRay's
+         auto head service never exposes the graph-compute sidecar's gRPC
+         port). */}}
+  - apiGroups:
+      - ""
+    resources:
+      - services
+    verbs:
+      - get
+      - create
+      - delete
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "jump-cannon.sessionManagerName" . }}-gpu-broker
+  namespace: {{ include "jump-cannon.smComputeNamespace" . }}
+  labels:
+    {{- include "jump-cannon.labels" . | nindent 4 }}
+    app.kubernetes.io/component: session-manager
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "jump-cannon.sessionManagerName" . }}-gpu-broker
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "jump-cannon.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
+{{- end }}

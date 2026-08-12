@@ -265,6 +265,64 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- end -}}
 
 {{/*
+Session-manager helpers. The per-world GPU broker defaults its compute
+namespace to the graphCompute compute namespace so per-world RayClusters land
+in the same standing LocalQueue envelope as the single-tenant session.
+*/}}
+{{- define "jump-cannon.sessionManagerName" -}}
+{{- printf "%s-session-manager" (include "jump-cannon.fullname" .) -}}
+{{- end -}}
+
+{{- define "jump-cannon.sessionManagerImage" -}}
+{{- printf "%s:%s" .Values.sessionManager.image.repository .Values.sessionManager.image.tag -}}
+{{- end -}}
+
+{{- define "jump-cannon.smComputeNamespace" -}}
+{{- default (include "jump-cannon.computeNamespace" .) .Values.sessionManager.gpu.namespace -}}
+{{- end -}}
+
+{{- define "jump-cannon.worldsClaimName" -}}
+{{- default (printf "%s-worlds" (include "jump-cannon.fullname" .)) .Values.sessionManager.persistence.existingClaim -}}
+{{- end -}}
+
+{{/*
+Guardrails for the session-manager GPU broker: one in-memory controller set
+per release, and never two GPU controllers (legacy single-tenant session and
+per-world broker) managing the same compute namespace.
+*/}}
+{{- define "jump-cannon.validateSessionManagerGpu" -}}
+{{- if and .Values.sessionManager.enabled .Values.sessionManager.gpu.enabled -}}
+{{- if ne (int .Values.sessionManager.replicas) 1 -}}
+{{- fail "sessionManager.gpu.enabled requires sessionManager.replicas == 1: in-memory per-world GPU controllers in two replicas would fight over the same RayClusters" -}}
+{{- end -}}
+{{- if and .Values.graphCompute.enabled .Values.graphCompute.session.enabled -}}
+{{- fail "graphCompute.session.enabled and sessionManager.gpu.enabled are mutually exclusive: two GPU controllers would manage the same compute namespace" -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
+TerminusDB world-store backend helpers.
+*/}}
+{{- define "jump-cannon.terminusdbName" -}}
+{{- printf "%s-terminusdb" (include "jump-cannon.fullname" .) -}}
+{{- end -}}
+
+{{/*
+Guardrails for the terminusdb store: the admin password must come from a
+user-created Secret (never values), and selecting the terminusdb world store
+requires the in-cluster server.
+*/}}
+{{- define "jump-cannon.validateTerminusdb" -}}
+{{- if and .Values.terminusdb.enabled (not .Values.terminusdb.adminPasswordSecret.name) -}}
+{{- fail "terminusdb.enabled requires terminusdb.adminPasswordSecret.name: the admin password must come from a user-created Secret, never from values" -}}
+{{- end -}}
+{{- if and .Values.sessionManager.enabled (eq .Values.sessionManager.store "terminusdb") (not .Values.terminusdb.enabled) -}}
+{{- fail "sessionManager.store=terminusdb requires terminusdb.enabled=true: the session-manager needs an in-cluster TerminusDB server" -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
 Single source of truth for the graph-compute RayCluster manifest. Rendered
 directly as a CR by raycluster-compute.yaml when
 graphCompute.session.enabled=false, and embedded into the gpu-session-template
@@ -273,21 +331,34 @@ The kueue.x-k8s.io/max-exec-time-seconds label is the Kueue-enforced hard cap
 and must be present in BOTH modes.
 */}}
 {{- define "jump-cannon.rayclusterManifest" -}}
+{{- include "jump-cannon.rayclusterManifestNamed" (dict "root" . "clusterName" (include "jump-cannon.computeName" .)) -}}
+{{- end -}}
+
+{{/*
+Parameterized form of jump-cannon.rayclusterManifest: takes a dict with
+"root" (the template context), "clusterName" (metadata.name — a placeholder
+like __world__ for the session-manager per-world template, which the GPU
+broker stamps per world at dispatch time), an optional "namespace" override
+(sessionManager.gpu.namespace for per-world clusters), and an optional
+"maxExecSeconds" override (sessionManager.gpu.maxExecTimeSeconds).
+*/}}
+{{- define "jump-cannon.rayclusterManifestNamed" -}}
+{{- $root := .root -}}
 apiVersion: ray.io/v1
 kind: RayCluster
 metadata:
-  name: {{ include "jump-cannon.computeName" . }}
-  namespace: {{ include "jump-cannon.computeNamespace" . }}
+  name: {{ .clusterName }}
+  namespace: {{ .namespace | default (include "jump-cannon.computeNamespace" $root) }}
   labels:
-    {{- include "jump-cannon.labels" . | nindent 4 }}
+    {{- include "jump-cannon.labels" $root | nindent 4 }}
     app.kubernetes.io/component: graph-compute
-    kueue.x-k8s.io/queue-name: {{ .Values.graphCompute.ray.queueName | quote }}
-    kueue.x-k8s.io/priority-class: {{ .Values.graphCompute.ray.workloadPriorityClassName | quote }}
-    kueue.x-k8s.io/max-exec-time-seconds: {{ default 14400 .Values.graphCompute.session.maxExecTimeSeconds | quote }}
+    kueue.x-k8s.io/queue-name: {{ $root.Values.graphCompute.ray.queueName | quote }}
+    kueue.x-k8s.io/priority-class: {{ $root.Values.graphCompute.ray.workloadPriorityClassName | quote }}
+    kueue.x-k8s.io/max-exec-time-seconds: {{ (.maxExecSeconds | default (default 14400 $root.Values.graphCompute.session.maxExecTimeSeconds)) | quote }}
   annotations:
-    ai-gateway.schrodinger.com/ttl-seconds: {{ .Values.graphCompute.ray.ttlSeconds | quote }}
+    ai-gateway.schrodinger.com/ttl-seconds: {{ $root.Values.graphCompute.ray.ttlSeconds | quote }}
 spec:
-  rayVersion: {{ .Values.graphCompute.ray.rayVersion | quote }}
+  rayVersion: {{ $root.Values.graphCompute.ray.rayVersion | quote }}
   headGroupSpec:
     rayStartParams:
       dashboard-host: "0.0.0.0"
@@ -296,21 +367,21 @@ spec:
     template:
       metadata:
         labels:
-          {{- include "jump-cannon.selectorLabels" . | nindent 10 }}
+          {{- include "jump-cannon.selectorLabels" $root | nindent 10 }}
           app.kubernetes.io/component: graph-compute
       spec:
-        serviceAccountName: {{ .Values.graphCompute.serviceAccountName | quote }}
+        serviceAccountName: {{ $root.Values.graphCompute.serviceAccountName | quote }}
         automountServiceAccountToken: false
-        priorityClassName: {{ .Values.graphCompute.ray.podPriorityClassName | quote }}
+        priorityClassName: {{ $root.Values.graphCompute.ray.podPriorityClassName | quote }}
         imagePullSecrets:
-          {{- toYaml .Values.imagePullSecrets | nindent 10 }}
+          {{- toYaml $root.Values.imagePullSecrets | nindent 10 }}
         nodeSelector:
-          {{- toYaml .Values.graphCompute.ray.nodeSelector | nindent 10 }}
+          {{- toYaml $root.Values.graphCompute.ray.nodeSelector | nindent 10 }}
         securityContext:
-          {{- toYaml .Values.graphCompute.podSecurityContext | nindent 10 }}
+          {{- toYaml $root.Values.graphCompute.podSecurityContext | nindent 10 }}
         containers:
           - name: ray-head
-            image: {{ .Values.graphCompute.ray.image | quote }}
+            image: {{ $root.Values.graphCompute.ray.image | quote }}
             imagePullPolicy: IfNotPresent
             env:
               - name: RAY_USAGE_STATS_ENABLED
@@ -325,25 +396,25 @@ spec:
               - name: metrics
                 containerPort: 8080
             resources:
-              {{- toYaml .Values.graphCompute.ray.headResources | nindent 14 }}
+              {{- toYaml $root.Values.graphCompute.ray.headResources | nindent 14 }}
           - name: graph-compute
-            image: {{ include "jump-cannon.graphComputeImage" . | quote }}
-            imagePullPolicy: {{ .Values.graphCompute.image.pullPolicy }}
+            image: {{ include "jump-cannon.graphComputeImage" $root | quote }}
+            imagePullPolicy: {{ $root.Values.graphCompute.image.pullPolicy }}
             ports:
               - name: grpc
-                containerPort: {{ .Values.graphCompute.service.port }}
+                containerPort: {{ $root.Values.graphCompute.service.port }}
                 protocol: TCP
             env:
               - name: GRAPH_COMPUTE_TICK_HZ
-                value: {{ .Values.graphCompute.tickHz | quote }}
+                value: {{ $root.Values.graphCompute.tickHz | quote }}
               - name: GRAPH_COMPUTE_ADDR
-                value: {{ .Values.graphCompute.bindAddr | quote }}
+                value: {{ $root.Values.graphCompute.bindAddr | quote }}
               - name: RUST_LOG
-                value: {{ .Values.graphCompute.rustLog | quote }}
+                value: {{ $root.Values.graphCompute.rustLog | quote }}
             resources:
-              {{- toYaml .Values.graphCompute.ray.backendResources | nindent 14 }}
+              {{- toYaml $root.Values.graphCompute.ray.backendResources | nindent 14 }}
             securityContext:
-              {{- toYaml .Values.containerSecurityContext | nindent 14 }}
+              {{- toYaml $root.Values.containerSecurityContext | nindent 14 }}
 {{- end -}}
 
 {{- define "jump-cannon.testImage" -}}

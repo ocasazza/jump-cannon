@@ -24,6 +24,14 @@ Two lifecycle modes, selected by `graphCompute.session.enabled`:
   the hard cap) deletes it. Deleting the CR is the only supported park —
   Kueue owns `spec.suspend` while admitted and reverts user changes.
 
+A third mode ships with the [[Session Manager]]: when `sessionManager.gpu` is
+enabled, its broker owns **one Kueue-admitted RayCluster per world** from the
+chart's `__world__`-placeholder template ConfigMap, with the same
+dispatch/park lifecycle, idle auto-park, and hard caps. All per-world clusters
+draw from the same standing LocalQueue envelope — the envelope, not the
+broker, bounds consumption. This mode is mutually exclusive with
+`graphCompute.session.enabled`; the chart fails the render if both are set.
+
 Session state (`GET /compute/session`) is derived from cluster objects, never
 stored: parked, dispatching, queued, admitted, head_starting, ready, parking,
 failed. The controller adopts a pre-existing CR on startup, so restarts and

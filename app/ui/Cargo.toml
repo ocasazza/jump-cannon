@@ -38,6 +38,15 @@ js-sys = "0.3"
 # Reaches outside app/ deliberately — the nix appSrc fileset includes
 # crates/graph-layouts for exactly this dependency.
 graph-layouts = { path = "../../crates/graph-layouts" }
+# Abstract world/session interface (crates/session-manager): the Sessions
+# view's Worlds/History/Branches/Merge panels are written once against the
+# WorldHost trait — EmbeddedSessionManager (in-memory minigraf) standalone,
+# HttpSessionManager when a session-manager URL is configured. Default
+# features keep the lib wasm32-clean (the server feature is native-only).
+session-manager = { path = "../../crates/session-manager", default-features = false }
+# VCS model types (Commit/BranchInfo/Conflict/…) rendered by the Sessions
+# view's History/Branches/Merge panels; values come from WorldHost::vcs.
+graph-vcs = { path = "../../crates/graph-vcs" }
 jump-cannon-filter-model = { path = "../filter-model" }
 web-sys = { workspace = true, features = [
     "Window", "Document", "Element", "Event", "EventTarget",
