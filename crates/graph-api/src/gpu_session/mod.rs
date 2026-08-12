@@ -299,6 +299,20 @@ impl GpuSessionHandle {
         desired_projection(&self.inner.shared.lock().expect("gpu session lock"))
     }
 
+    /// Reset the idle auto-park clock. Hosts that observe user activity
+    /// outside the broker's subscriber count (the session-manager's
+    /// per-world mux touches on every `/worlds/:name/*` request and VCS
+    /// mutation) call this so idle auto-park measures real use. No-op cheap;
+    /// also wakes the reconcile loop so the projection stays fresh.
+    pub fn touch_activity(&self) {
+        self.inner
+            .shared
+            .lock()
+            .expect("gpu session lock")
+            .last_activity = Instant::now();
+        self.inner.wake.notify_one();
+    }
+
     /// Auto-dispatch hook (Q4): called from `compute_layout_put` after a
     /// successful remote reselect. Non-blocking; only fires when the
     /// observed state is parked/failed.

@@ -1,0 +1,125 @@
+{{- include "jump-cannon.validateTerminusdb" . -}}
+{{- if .Values.sessionManager.enabled }}
+{{- $gpu := .Values.sessionManager.gpu.enabled -}}
+{{- $terminusdb := eq .Values.sessionManager.store "terminusdb" -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "jump-cannon.sessionManagerName" . }}
+  labels:
+    {{- include "jump-cannon.labels" . | nindent 4 }}
+    app.kubernetes.io/component: session-manager
+spec:
+  replicas: {{ .Values.sessionManager.replicas }}
+  selector:
+    matchLabels:
+      {{- include "jump-cannon.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: session-manager
+  template:
+    metadata:
+      labels:
+        {{- include "jump-cannon.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: session-manager
+      {{- if $gpu }}
+      annotations:
+        checksum/gpu-world-template: {{ include "jump-cannon.rayclusterManifestNamed" (dict "root" . "clusterName" "__world__" "namespace" (include "jump-cannon.smComputeNamespace" .) "maxExecSeconds" .Values.sessionManager.gpu.maxExecTimeSeconds) | sha256sum }}
+      {{- end }}
+    spec:
+      serviceAccountName: {{ include "jump-cannon.serviceAccountName" . }}
+      {{- /* The per-world GPU broker needs in-cluster API access to manage
+             world RayClusters/Services, so GPU mode forces token automount on. */}}
+      automountServiceAccountToken: {{ or .Values.serviceAccount.automountServiceAccountToken $gpu }}
+      imagePullSecrets:
+        {{- toYaml .Values.imagePullSecrets | nindent 8 }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: session-manager
+          image: {{ include "jump-cannon.sessionManagerImage" . | quote }}
+          imagePullPolicy: {{ .Values.sessionManager.image.pullPolicy }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.sessionManager.port }}
+              protocol: TCP
+          env:
+            - name: SESSION_MANAGER_HOST
+              value: "0.0.0.0"
+            - name: SESSION_MANAGER_PORT
+              value: {{ .Values.sessionManager.port | quote }}
+            - name: JUMP_CANNON_WORLDS_DIR
+              value: /worlds
+            - name: JUMP_CANNON_USER_HEADER
+              value: {{ .Values.sessionManager.userHeader | quote }}
+            - name: JUMP_CANNON_SM_STORE
+              value: {{ .Values.sessionManager.store | quote }}
+            {{- if $terminusdb }}
+            - name: TERMINUSDB_URL
+              value: http://{{ include "jump-cannon.terminusdbName" . }}:{{ .Values.terminusdb.service.port }}
+            - name: TERMINUSDB_USER
+              value: admin
+            - name: TERMINUSDB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.terminusdb.adminPasswordSecret.name | quote }}
+                  key: {{ .Values.terminusdb.adminPasswordSecret.key | quote }}
+            {{- end }}
+            {{- if $gpu }}
+            - name: JUMP_CANNON_SM_GPU_TEMPLATE
+              value: /etc/jump-cannon/gpu-world/raycluster.yaml
+            - name: JUMP_CANNON_SM_COMPUTE_NAMESPACE
+              value: {{ include "jump-cannon.smComputeNamespace" . | quote }}
+            - name: JUMP_CANNON_SM_RELEASE
+              value: {{ include "jump-cannon.fullname" . | quote }}
+            - name: JUMP_CANNON_SM_COMPUTE_PORT
+              value: {{ .Values.graphCompute.service.port | quote }}
+            - name: JUMP_CANNON_SM_IDLE_SECONDS
+              value: {{ .Values.sessionManager.gpu.idleSeconds | quote }}
+            - name: JUMP_CANNON_SM_ADMISSION_TIMEOUT
+              value: {{ .Values.sessionManager.gpu.admissionTimeoutSeconds | quote }}
+            - name: JUMP_CANNON_SM_MAX_SECONDS
+              value: {{ .Values.sessionManager.gpu.maxExecTimeSeconds | quote }}
+            - name: JUMP_CANNON_SM_HEAD_START_TIMEOUT
+              value: {{ .Values.sessionManager.gpu.headStartTimeoutSeconds | quote }}
+            {{- end }}
+            - name: RUST_LOG
+              value: {{ .Values.sessionManager.rustLog | quote }}
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 2
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 30
+            periodSeconds: 20
+            timeoutSeconds: 2
+          resources:
+            {{- toYaml .Values.sessionManager.resources | nindent 12 }}
+          securityContext:
+            {{- toYaml .Values.containerSecurityContext | nindent 12 }}
+          volumeMounts:
+            - name: worlds
+              mountPath: /worlds
+            {{- if $gpu }}
+            - name: gpu-world-template
+              mountPath: /etc/jump-cannon/gpu-world/raycluster.yaml
+              subPath: raycluster.yaml
+              readOnly: true
+            {{- end }}
+      volumes:
+        - name: worlds
+          {{- if .Values.sessionManager.persistence.enabled }}
+          persistentVolumeClaim:
+            claimName: {{ include "jump-cannon.worldsClaimName" . }}
+          {{- else }}
+          emptyDir: {}
+          {{- end }}
+        {{- if $gpu }}
+        - name: gpu-world-template
+          configMap:
+            name: {{ include "jump-cannon.sessionManagerName" . }}-gpu-world-template
+        {{- end }}
+{{- end }}

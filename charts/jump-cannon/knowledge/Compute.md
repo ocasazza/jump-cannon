@@ -10,7 +10,9 @@ tags: [jump-cannon, compute]
 
 graph-api is the only frontend-facing compute boundary. Local layouts run in
 the browser. Cluster-hosted GPU sessions use [[Ray GPU Sessions]] admitted by
-[[Kueue Scheduling]].
+[[Kueue Scheduling]]. When the [[Session Manager]] is enabled it brokers the
+same kind of Kueue-admitted RayCluster per world, sharing the standing GPU
+envelope and mutually exclusive with the legacy single session mode.
 
 Production compute is declared by [[Helm Deployment]] and the consuming
 Kubernetes environment. The repository's Docker Compose output is only a local

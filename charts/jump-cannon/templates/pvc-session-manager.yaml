@@ -1,0 +1,18 @@
+{{- if and .Values.sessionManager.enabled .Values.sessionManager.persistence.enabled (not .Values.sessionManager.persistence.existingClaim) }}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "jump-cannon.worldsClaimName" . }}
+  labels:
+    {{- include "jump-cannon.labels" . | nindent 4 }}
+    app.kubernetes.io/component: session-manager
+spec:
+  accessModes:
+    - ReadWriteOnce
+  {{- if .Values.sessionManager.persistence.storageClassName }}
+  storageClassName: {{ .Values.sessionManager.persistence.storageClassName | quote }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ .Values.sessionManager.persistence.size | quote }}
+{{- end }}

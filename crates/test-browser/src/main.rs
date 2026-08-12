@@ -10,7 +10,10 @@
 //!   5. Nodes is a two-pane editor; Flat/Tags selection and content work.
 //!   6. Unified Settings exposes four accessible, content-backed tabs.
 //!   7. Filter is a repeatable, nested Boolean builder with live validation.
-//!   8. Screenshots are saved for the Nodes editor, Filter builder, and workspace.
+//!   8. The Sessions view switcher mounts the world workspace (Worlds panel,
+//!      dock) against the embedded host and returns to the User view.
+//!   9. Screenshots are saved for the Nodes editor, Filter builder, Sessions
+//!      view, and workspace.
 //!
 //! Anything flaky (pixel brightness, motion deltas, click recovery) is
 //! deliberately deferred. (The legacy egui-era Playwright suite that held
@@ -96,6 +99,8 @@ struct Report {
     settings_tabs: Option<SettingsTabsCheck>,
     #[serde(skip_serializing_if = "Option::is_none")]
     filter_builder: Option<FilterBuilderCheck>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sessions_view: Option<SessionsViewCheck>,
     page_errors: Vec<String>,
     console_logs: Vec<String>,
 }
@@ -189,6 +194,19 @@ struct FilterBuilderCheck {
     reason: Option<String>,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct SessionsViewCheck {
+    ok: bool,
+    switch_found: bool,
+    sessions_active: bool,
+    worlds_panel: bool,
+    worlds_empty_state: bool,
+    dock_present: bool,
+    user_restored: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    reason: Option<String>,
+}
+
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -235,6 +253,7 @@ async fn main() -> Result<()> {
         nodes_editor,
         settings_tabs,
         filter_builder,
+        sessions_view,
         page_errors,
     ) = match &result {
         Ok(o) => {
@@ -245,6 +264,7 @@ async fn main() -> Result<()> {
                 && o.nodes_editor.ok
                 && o.settings_tabs.ok
                 && o.filter_builder.ok
+                && o.sessions_view.ok
                 && captured_page_errors.is_empty();
             let reason = if !o.boot_log_found {
                 Some(format!("boot log {BOOT_LOG_NEEDLE:?} was not observed"))
@@ -261,6 +281,8 @@ async fn main() -> Result<()> {
                 o.settings_tabs.reason.clone()
             } else if !o.filter_builder.ok {
                 o.filter_builder.reason.clone()
+            } else if !o.sessions_view.ok {
+                o.sessions_view.reason.clone()
             } else if !captured_page_errors.is_empty() {
                 Some(format!(
                     "browser emitted {} console error(s) or unhandled exception(s)",
@@ -279,6 +301,7 @@ async fn main() -> Result<()> {
                 Some(o.nodes_editor.clone()),
                 Some(o.settings_tabs.clone()),
                 Some(o.filter_builder.clone()),
+                Some(o.sessions_view.clone()),
                 captured_page_errors.clone(),
             )
         }
@@ -288,6 +311,7 @@ async fn main() -> Result<()> {
             0,
             0,
             false,
+            None,
             None,
             None,
             None,
@@ -308,6 +332,7 @@ async fn main() -> Result<()> {
         nodes_editor,
         settings_tabs,
         filter_builder,
+        sessions_view,
         page_errors,
         console_logs: tail(&logs, 50),
     };
@@ -334,6 +359,7 @@ struct RunOk {
     nodes_editor: NodesEditorCheck,
     settings_tabs: SettingsTabsCheck,
     filter_builder: FilterBuilderCheck,
+    sessions_view: SessionsViewCheck,
 }
 
 fn chromium_args() -> Vec<&'static str> {
@@ -1696,6 +1722,216 @@ async fn drive_page(
     }
     tracing::info!("wrote screenshot {}", shot_path.display());
 
+    // ---- 11. Sessions view mounts the world workspace -------------------
+    // View switches RELOAD the page (persisted `jc_view` + location.reload),
+    // so each click destroys the JS execution context: assertions must run in
+    // fresh evaluates against the reloaded page, detecting the new runtime by
+    // the `window.__jc_boot` stamp changing. With no session-manager URL
+    // configured the app boots the embedded single-user host, so the contract
+    // is deterministic: Worlds panel with its empty state, dock present, and
+    // switching back to User remounts the graph canvas.
+    let click_sessions_js = r#"(() => {
+        const buttons = [...(document.querySelector('nav.view-switch')
+          ?.querySelectorAll('button.view-btn') || [])];
+        const userButton = buttons.find(
+          (button) => (button.textContent || '').trim() === 'User'
+        );
+        const sessionsButton = buttons.find(
+          (button) => (button.textContent || '').trim() === 'Sessions'
+        );
+        const switchFound = Boolean(userButton && sessionsButton);
+        sessionsButton?.click();
+        return { switch_found: switchFound, boot_before: window.__jc_boot || 0 };
+    })()"#;
+    let click_value: serde_json::Value = page.evaluate(click_sessions_js).await?.into_value()?;
+    let switch_found = click_value
+        .get("switch_found")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let boot_before = click_value
+        .get("boot_before")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.0);
+
+    // Poll (in fresh evaluates) until the reloaded page reports a new boot
+    // stamp with the Sessions button active.
+    let sessions_state_js = r#"(() => {
+        const buttons = [...(document.querySelector('nav.view-switch')
+          ?.querySelectorAll('button.view-btn') || [])];
+        const sessions = buttons.find(
+          (button) => (button.textContent || '').trim() === 'Sessions'
+        );
+        return {
+          boot: window.__jc_boot || 0,
+          active: Boolean(sessions?.classList.contains('active')),
+        };
+    })()"#;
+    let mut sessions_active = false;
+    for _ in 0..50 {
+        // The page reloads on switch: evaluates can race the navigation and
+        // lose their execution context — retry rather than fail.
+        let Ok(eval) = page.evaluate(sessions_state_js).await else {
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            continue;
+        };
+        let v: serde_json::Value = eval.into_value()?;
+        let boot = v.get("boot").and_then(|b| b.as_f64()).unwrap_or(0.0);
+        let active = v.get("active").and_then(|a| a.as_bool()).unwrap_or(false);
+        if boot != boot_before && active {
+            sessions_active = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+
+    let sessions_panels_js = r#"(async () => {
+        const waitFor = async (predicate, timeoutMs = 10000) => {
+          const deadline = performance.now() + timeoutMs;
+          while (performance.now() < deadline) {
+            const value = predicate();
+            if (value) return value;
+            await new Promise((resolve) => setTimeout(resolve, 50));
+          }
+          return null;
+        };
+        const worldsPanel = await waitFor(() => {
+          const panel = document.querySelector('section.panel-worlds');
+          const title = panel?.querySelector(':scope > header.panel-head .panel-title');
+          return (title?.textContent || '').trim() === 'Worlds' && panel;
+        });
+        const worldsEmptyState = Boolean(await waitFor(() => {
+          const empty = worldsPanel?.querySelector('.empty');
+          return /no worlds yet/i.test(empty?.textContent || '') && empty;
+        }));
+        const dockPresent = Boolean(await waitFor(() =>
+          document.querySelector('footer.dock')
+        ));
+        return {
+          worlds_panel: Boolean(worldsPanel),
+          worlds_empty_state: worldsEmptyState,
+          dock_present: dockPresent,
+        };
+    })()"#;
+    let panels_value: serde_json::Value =
+        page.evaluate(sessions_panels_js).await?.into_value()?;
+    let worlds_visible = panels_value
+        .get("worlds_panel")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let worlds_empty_state = panels_value
+        .get("worlds_empty_state")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let dock_present = panels_value
+        .get("dock_present")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    let mut failures: Vec<String> = Vec::new();
+    if !switch_found {
+        failures.push("topbar view switcher missing User/Sessions buttons".to_string());
+    }
+    if !sessions_active {
+        failures.push("Sessions button did not become active".to_string());
+    }
+    if !worlds_visible {
+        failures.push("Worlds panel missing in the Sessions workspace".to_string());
+    }
+    if !worlds_empty_state {
+        failures.push("embedded-host Worlds empty state missing".to_string());
+    }
+    if !dock_present {
+        failures.push("Sessions workspace dock missing".to_string());
+    }
+    let mut sessions_view = SessionsViewCheck {
+        ok: failures.is_empty(),
+        switch_found,
+        sessions_active,
+        worlds_panel: worlds_visible,
+        worlds_empty_state,
+        dock_present,
+        user_restored: false,
+        reason: if failures.is_empty() {
+            None
+        } else {
+            Some(failures.join("; "))
+        },
+    };
+
+    let sessions_png = page
+        .screenshot(CaptureScreenshotParams::builder().build())
+        .await
+        .context("Sessions view screenshot")?;
+    let sessions_bytes = if sessions_png.first() == Some(&0x89) {
+        sessions_png
+    } else {
+        base64::engine::general_purpose::STANDARD
+            .decode(&sessions_png)
+            .unwrap_or(sessions_png)
+    };
+    let sessions_shot_path = args.out_dir.join("sessions-view.png");
+    tokio::fs::write(&sessions_shot_path, sessions_bytes).await?;
+    tracing::info!("wrote screenshot {}", sessions_shot_path.display());
+
+    // Leave the app back on the User view: proves the switch is reversible
+    // (a second reload) and keeps any later assertions on the default surface.
+    let click_user_js = r#"(() => {
+        const buttons = [...(document.querySelector('nav.view-switch')
+          ?.querySelectorAll('button.view-btn') || [])];
+        const user = buttons.find(
+          (button) => (button.textContent || '').trim() === 'User'
+        );
+        user?.click();
+        return { boot_before: window.__jc_boot || 0 };
+    })()"#;
+    let click_user_value: serde_json::Value =
+        page.evaluate(click_user_js).await?.into_value()?;
+    let user_boot_before = click_user_value
+        .get("boot_before")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.0);
+    let user_state_js = r#"(() => {
+        const buttons = [...(document.querySelector('nav.view-switch')
+          ?.querySelectorAll('button.view-btn') || [])];
+        const user = buttons.find(
+          (button) => (button.textContent || '').trim() === 'User'
+        );
+        const canvas = document.querySelector('section.panel-graph canvas.graph-canvas');
+        return {
+          boot: window.__jc_boot || 0,
+          active: Boolean(user?.classList.contains('active')),
+          graph_ready: canvas?.dataset.renderReady === 'true' &&
+            Number(canvas?.dataset.nodeCount || 0) > 0,
+        };
+    })()"#;
+    let mut user_restored = false;
+    for _ in 0..50 {
+        let Ok(eval) = page.evaluate(user_state_js).await else {
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            continue;
+        };
+        let v: serde_json::Value = eval.into_value()?;
+        let boot = v.get("boot").and_then(|b| b.as_f64()).unwrap_or(0.0);
+        let active = v.get("active").and_then(|a| a.as_bool()).unwrap_or(false);
+        let graph_ready = v
+            .get("graph_ready")
+            .and_then(|g| g.as_bool())
+            .unwrap_or(false);
+        if boot != user_boot_before && active && graph_ready {
+            user_restored = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+    sessions_view.user_restored = user_restored;
+    if !user_restored {
+        sessions_view.ok = false;
+        sessions_view.reason = Some(match sessions_view.reason.take() {
+            Some(reason) => format!("{reason}; User view did not restore a render-ready graph"),
+            None => "User view did not restore a render-ready graph".to_string(),
+        });
+    }
+
     // Tear down pumps (browser close in caller will end them anyway).
     console_pump.abort();
     runtime_pump.abort();
@@ -1712,6 +1948,7 @@ async fn drive_page(
         nodes_editor,
         settings_tabs,
         filter_builder,
+        sessions_view,
     })
 }
 

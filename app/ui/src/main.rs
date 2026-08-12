@@ -24,14 +24,26 @@ mod render;
 mod worker;
 
 use std::collections::HashSet;
+use std::sync::Arc;
 
 use dioxus::events::{Key, KeyboardEvent};
 use dioxus::prelude::*;
 use gloo_storage::{LocalStorage, Storage};
 use panel_kit::{LayoutBuilder, PanelWin, Spinner};
 use serde::{Deserialize, Serialize};
+use session_manager::{EmbeddedSessionManager, HttpSessionManager, UserIdentity, WorldHost};
 
 use graph_canvas::GraphData;
+
+/// Top-level app surface. `User` is the classic single-graph workspace;
+/// `Sessions` is the world/session workspace (versioned worlds, branches,
+/// GPU sessions) backed by a `WorldHost`. One view is mounted at a time —
+/// the single wgpu RenderHost and the global graph-derived state stay valid.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum AppView {
+    User,
+    Sessions,
+}
 
 /// Provenance of the graph currently mounted in the browser.  This is
 /// deliberately separate from where an expression was evaluated: a graph
@@ -122,6 +134,15 @@ fn main() {
     // exact line to know the wasm app booted. console.log directly (NOT
     // tracing) — tracing is filtered to WARN above.
     web_sys::console::log_1(&"[jump-cannon-ui] boot".into());
+    // Boot marker for the browser regression: view switches reload the page,
+    // so the suite detects the new runtime by this value changing.
+    if let Some(w) = web_sys::window() {
+        let _ = js_sys::Reflect::set(
+            w.as_ref(),
+            &"__jc_boot".into(),
+            &wasm_bindgen::JsValue::from_f64(js_sys::Date::now()),
+        );
+    }
     launch(App);
 }
 
@@ -146,6 +167,12 @@ pub(crate) enum Panel {
     Generate,
     Timeline,
     Debug,
+    // Sessions view (versioned shared worlds — crates/session-manager):
+    Worlds,
+    History,
+    Branches,
+    Merge,
+    GpuSessions,
 }
 
 impl panel_kit::PanelKind for Panel {
@@ -164,11 +191,17 @@ impl panel_kit::PanelKind for Panel {
             Panel::Generate => "Generate",
             Panel::Timeline => "Timeline",
             Panel::Debug => "Debug",
+            Panel::Worlds => "Worlds",
+            Panel::History => "History",
+            Panel::Branches => "Branches",
+            Panel::Merge => "Merge",
+            Panel::GpuSessions => "GPU Sessions",
         }
     }
 }
 
 const WORKSPACE_LAYOUT_KEY: &str = "jc_layout_v9";
+const SESSIONS_LAYOUT_KEY: &str = "jc_sessions_layout_v1";
 const LEGACY_WORKSPACE_LAYOUT_KEYS: &[&str] = &["jc_layout_v8", "jc_layout_v7", "jc_layout_v6"];
 
 /// Panel identity used by the three workspace layouts immediately preceding
@@ -361,6 +394,39 @@ fn default_layout() -> Vec<PanelWin<Panel>> {
     v
 }
 
+/// Sessions view default layout: world management and history share the main
+/// row; the graph surface of the open world sits below, with branch/merge/GPU
+/// consoles in the dock until needed.
+fn sessions_default_layout() -> Vec<PanelWin<Panel>> {
+    let mut b = LayoutBuilder::new();
+    fn min(b: &mut LayoutBuilder, kind: Panel, x: f64, y: f64, w: f64, h: f64) -> PanelWin<Panel> {
+        let mut p = b.at(kind, x, y, w, h);
+        p.state = panel_kit::WinState::Minimized;
+        p
+    }
+    let b = &mut b;
+    let mut v = vec![
+        min(b, Panel::Branches, 840.0, 120.0, 400.0, 360.0),
+        min(b, Panel::Merge, 860.0, 160.0, 420.0, 400.0),
+        min(b, Panel::GpuSessions, 880.0, 200.0, 380.0, 340.0),
+        min(b, Panel::Nodes, 900.0, 240.0, 608.0, 620.0),
+        min(b, Panel::Progress, 920.0, 280.0, 640.0, 200.0),
+        // Settings carries the session-manager URL + x-user identity the
+        // Worlds/GPU panels depend on — reachable from the dock here, not
+        // only back in the User view.
+        min(b, Panel::Settings, 930.0, 300.0, 608.0, 420.0),
+        min(b, Panel::Help, 940.0, 320.0, 330.0, 180.0),
+    ];
+    v.extend([
+        b.at(Panel::Worlds, 12.0, 44.0, 420.0, 420.0).with_tile(2, 2),
+        b.at(Panel::History, 444.0, 44.0, 824.0, 420.0)
+            .with_tile(4, 2),
+        b.at(Panel::Graph, 12.0, 476.0, 1256.0, 460.0)
+            .with_tile(6, 2),
+    ]);
+    v
+}
+
 // --- progress feed --------------------------------------------------------------
 
 /// One server task folded out of the /progress event stream.
@@ -442,9 +508,29 @@ fn fold_progress(tasks: &mut Vec<TaskRow>, logs: &mut Vec<LogRow>, ev: api::Prog
 
 // --- shared app context ----------------------------------------------------------
 
+/// Build the standalone (no session-manager URL) host. wasm32 uses the
+/// localStorage-persistent backend so browser-only worlds survive reloads,
+/// falling back to pure in-memory when persistence is unavailable; native
+/// (tests, tooling) stays in-memory.
+fn new_embedded_host() -> Result<EmbeddedSessionManager, session_manager::SessionError> {
+    #[cfg(target_arch = "wasm32")]
+    {
+        EmbeddedSessionManager::open_persistent().or_else(|e| {
+            tracing::warn!(
+                "persistent embedded host unavailable ({e}); falling back to in-memory"
+            );
+            EmbeddedSessionManager::in_memory()
+        })
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        EmbeddedSessionManager::in_memory()
+    }
+}
+
 /// Every app signal, bundled `Copy` so panel renderers and handlers can grab
 /// what they need without prop-drilling through components.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq)]
 pub(crate) struct Ctx {
     pub(crate) graph: Signal<Option<GraphData>>,
     pub(crate) graph_session: Signal<GraphSession>,
@@ -461,6 +547,153 @@ pub(crate) struct Ctx {
     pub(crate) server: Signal<String>,
     pub(crate) tasks: Signal<Vec<TaskRow>>,
     pub(crate) logs: Signal<Vec<LogRow>>,
+    // Sessions view: active surface, world host, and the world whose graph is
+    // mounted. `sm_url`/`user` are the Settings edit buffers that rebuild the
+    // host on change.
+    pub(crate) view: Signal<AppView>,
+    pub(crate) host: Signal<Arc<dyn WorldHost>>,
+    /// The concrete embedded host whenever `host` is one (no session-manager
+    /// URL configured). World export/import are inherent methods on
+    /// `EmbeddedSessionManager` — the `WorldHost` trait stays stable — so
+    /// the Sessions panels reach them through this handle.
+    pub(crate) embedded: Signal<Option<Arc<EmbeddedSessionManager>>>,
+    pub(crate) active_world: Signal<Option<String>>,
+    pub(crate) sm_url: Signal<String>,
+    pub(crate) user: Signal<String>,
+}
+
+/// Point the graph surface at a world's serving routes and reload. The
+/// session manager serves each open world's full graph-api surface at
+/// `/worlds/:name/...`; with no manager configured (embedded host) the
+/// world's `main` head is materialized in-browser instead (see
+/// [`rematerialize_embedded`]).
+pub(crate) fn open_world_in_view(mut ctx: Ctx, world: String) {
+    ctx.active_world.set(Some(world.clone()));
+    match api::session_manager_url() {
+        Some(sm) => {
+            *api::WORLD_BASE.write() = Some(format!("{sm}/worlds/{world}"));
+            spawn(reload_graph(ctx));
+        }
+        None => {
+            *api::WORLD_BASE.write() = None;
+            spawn_rematerialize_embedded(ctx);
+        }
+    }
+}
+
+/// Detach the graph surface from any world (world closed, view switched).
+pub(crate) fn clear_world_base(mut ctx: Ctx) {
+    ctx.active_world.set(None);
+    *api::WORLD_BASE.write() = None;
+    *EMBEDDED_HEAD.write() = None;
+}
+
+/// The (world, head) pair currently mounted from the embedded host, so
+/// repeat rematerializations that would produce the identical graph skip
+/// the full canvas reload.
+pub(crate) static EMBEDDED_HEAD: GlobalSignal<Option<(String, String)>> = Signal::global(|| None);
+
+/// Materialize the open embedded world's `main` head into the canvas as a
+/// browser-owned graph. No-op when a session manager is configured, no
+/// world is open, or the mounted head is already current.
+pub(crate) async fn rematerialize_embedded(mut ctx: Ctx) {
+    if api::session_manager_url().is_some() {
+        return;
+    }
+    let Some(world) = ctx.active_world.read().clone() else {
+        return;
+    };
+    let Ok(wid) = session_manager::WorldId::parse(&world) else {
+        return;
+    };
+    let host = ctx.host.read().clone();
+    let result = async {
+        let vcs = host.vcs(&wid).await.map_err(|e| e.to_string())?;
+        let head = vcs
+            .head("main")
+            .await
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "world has no main branch".to_string())?;
+        let snapshot = vcs.materialize(&head).await.map_err(|e| e.to_string())?;
+        Ok((head, snapshot))
+    }
+    .await;
+    match result {
+        Ok((head, snapshot)) => {
+            if EMBEDDED_HEAD.peek().as_ref() == Some(&(world.clone(), head.0.clone())) {
+                return;
+            }
+            let graph = graph_canvas::graph_data_from_snapshot(&snapshot);
+            ctx.load_error.set(None);
+            replace_with_client_graph(ctx, graph, "embedded world");
+            // Set AFTER the replace, which clears the record for any other
+            // client graph (the Generate panel's local path).
+            *EMBEDDED_HEAD.write() = Some((world, head.0));
+        }
+        Err(e) => {
+            tracing::warn!("embedded world materialize failed: {e}");
+            ctx.load_error.set(Some(e));
+        }
+    }
+}
+
+/// Fire-and-forget [`rematerialize_embedded`] for VCS-mutation handlers:
+/// only spawns when the embedded host is active and a world is open.
+pub(crate) fn spawn_rematerialize_embedded(ctx: Ctx) {
+    if api::session_manager_url().is_some() || ctx.active_world.peek().is_none() {
+        return;
+    }
+    spawn(rematerialize_embedded(ctx));
+}
+
+/// Switch the top-level view. Exactly one workspace is mounted at a time;
+/// the switch re-bases graph fetches (world base in Sessions, standalone
+/// graph-api in User) and runs the standard graph invalidation + reload.
+/// Switch the top-level view by persisting the choice and reloading the
+/// page. The two views own separate workspaces, servers, and world hosts —
+/// a full reload gives each a clean Dioxus runtime instead of migrating
+/// live signal/hook state across workspaces. Boot restores the persisted
+/// view (see [`persisted_view`]).
+pub(crate) fn switch_view(ctx: Ctx, view: AppView) {
+    if *ctx.view.peek() == view {
+        return;
+    }
+    let _ = LocalStorage::set(VIEW_KEY, view_slug(view));
+    if let Some(w) = web_sys::window() {
+        let _ = w.location().reload();
+    }
+}
+
+const VIEW_KEY: &str = "jc_view";
+
+fn view_slug(view: AppView) -> &'static str {
+    match view {
+        AppView::User => "user",
+        AppView::Sessions => "sessions",
+    }
+}
+
+/// The view boot restores: the last one chosen via the topbar switcher.
+pub(crate) fn persisted_view() -> AppView {
+    match LocalStorage::get::<String>(VIEW_KEY)
+        .unwrap_or_default()
+        .as_str()
+    {
+        "sessions" => AppView::Sessions,
+        _ => AppView::User,
+    }
+}
+
+/// Whether `view`'s workspace layout holds `kind`. The palette filters its
+/// jump-to-section commands through this so it never offers a restore that
+/// would silently no-op (`Workspace::restore` on a panel the active view's
+/// layout doesn't contain).
+pub(crate) fn panel_in_view(kind: Panel, view: AppView) -> bool {
+    let layout = match view {
+        AppView::User => default_layout(),
+        AppView::Sessions => sessions_default_layout(),
+    };
+    layout.iter().any(|p| p.kind == kind)
 }
 
 /// Clear every value whose node indices or server ownership came from the old
@@ -486,6 +719,8 @@ fn invalidate_graph_derived_state(mut ctx: Ctx) {
 
 fn begin_server_graph_load(mut ctx: Ctx) -> u64 {
     let endpoint = api::server_url();
+    // A server load supersedes any embedded-world mount record.
+    *EMBEDDED_HEAD.write() = None;
     let initial_load = ctx.graph_session.peek().epoch == 0 && ctx.graph.peek().is_none();
     let connection_changed = match &ctx.graph_session.peek().origin {
         GraphOrigin::Server { endpoint: old } => old != &endpoint,
@@ -534,6 +769,9 @@ pub(crate) fn replace_with_client_graph(
     graph: GraphData,
     evaluator: impl Into<String>,
 ) {
+    // Any client-graph replacement supersedes the embedded-world mount
+    // record; `rematerialize_embedded` re-sets it after calling this.
+    *EMBEDDED_HEAD.write() = None;
     let epoch = ctx.graph_session.peek().epoch.wrapping_add(1);
     invalidate_graph_derived_state(ctx);
     panels::layout::set_expected_graph_revision(None);
@@ -584,13 +822,25 @@ fn App() -> Element {
     // surface. Migrate v6-v8 layout geometry and let the
     // independent jc_* control state continue unchanged.
     migrate_workspace_layout();
-    let ws = panel_kit::use_workspace(WORKSPACE_LAYOUT_KEY, default_layout);
+    // Both views' workspaces are created unconditionally (hook rules); only
+    // the active view's workspace is rendered, so the single wgpu render host
+    // and localStorage layout persistence (`jc_layout_v9` vs
+    // `jc_sessions_layout_v1`) stay consistent per view.
+    let ws_user = panel_kit::use_workspace(WORKSPACE_LAYOUT_KEY, default_layout);
+    let ws_sessions = panel_kit::use_workspace(SESSIONS_LAYOUT_KEY, sessions_default_layout);
+    // Hoisted above the palette-drain effect so both it and Ctx share one
+    // view signal. Boot restores the view last chosen via the switcher.
+    let view = use_signal(persisted_view);
 
     // Drain palette jump-to-section requests into the workspace, logging
     // the same `("section", "<title>: open")` event the egui app pushed.
     use_effect(move || {
         let req = *OPEN_PANEL.read();
         if let Some(kind) = req {
+            let ws = match *view.read() {
+                AppView::User => ws_user,
+                AppView::Sessions => ws_sessions,
+            };
             ws.restore(kind);
             appstate::note_mutation(
                 "section",
@@ -600,6 +850,8 @@ fn App() -> Element {
         }
     });
 
+    let initial_embedded = Arc::new(new_embedded_host().expect("embedded host cannot fail"));
+    let initial_host = initial_embedded.clone();
     let ctx = Ctx {
         graph: use_signal(|| None),
         graph_session: use_signal(|| GraphSession::loading_server(api::server_url())),
@@ -616,7 +868,60 @@ fn App() -> Element {
         server: use_signal(api::server_url),
         tasks: use_signal(Vec::new),
         logs: use_signal(Vec::new),
+        view,
+        host: use_signal(move || initial_host.clone() as Arc<dyn WorldHost>),
+        embedded: use_signal(move || Some(initial_embedded.clone())),
+        active_world: use_signal(|| None),
+        sm_url: use_signal(|| api::session_manager_url().unwrap_or_default()),
+        user: use_signal(api::user_name),
     };
+
+    // Rebuild the world host when the session-manager URL or user identity
+    // changes: remote (`HttpSessionManager`) when a manager is configured,
+    // embedded single-user otherwise. Any world selection is dropped — the
+    // new host does not know it.
+    {
+        let mut host = ctx.host;
+        let mut embedded = ctx.embedded;
+        let mut active_world = ctx.active_world;
+        use_effect(move || {
+            let sm = api::session_manager_url();
+            let name = ctx.user.read().clone();
+            spawn(async move {
+                let identity = UserIdentity {
+                    name,
+                    groups: Vec::new(),
+                };
+                let next: Arc<dyn WorldHost> = match sm {
+                    Some(url) => match HttpSessionManager::connect(url, identity).await {
+                        Ok(h) => {
+                            embedded.set(None);
+                            Arc::new(h)
+                        }
+                        Err(e) => {
+                            tracing::warn!("session manager connect failed: {e}");
+                            return;
+                        }
+                    },
+                    None => match new_embedded_host() {
+                        Ok(h) => {
+                            let h = Arc::new(h);
+                            embedded.set(Some(h.clone()));
+                            h
+                        }
+                        Err(e) => {
+                            tracing::warn!("embedded host init failed: {e}");
+                            return;
+                        }
+                    },
+                };
+                host.set(next);
+                active_world.set(None);
+                *api::WORLD_BASE.write() = None;
+                *EMBEDDED_HEAD.write() = None;
+            });
+        });
+    }
 
     // Query evaluation is app-owned rather than panel-owned: persisted
     // expressions and mutations from badges/palette actions must keep applying
@@ -762,10 +1067,16 @@ fn App() -> Element {
     // Mirrors the egui tray's right-side running indicator: a live count of
     // in-progress server tasks, grey idle dot otherwise.
     let n_running = ctx.tasks.read().iter().filter(|t| t.state == 0).count();
+    let view_now = *ctx.view.read();
+    let ws = match view_now {
+        AppView::User => ws_user,
+        AppView::Sessions => ws_sessions,
+    };
     let mode_label = match ws.effective_mode() {
         panel_kit::Mode::Tiling => "tiling",
         panel_kit::Mode::Floating => "floating",
     };
+    let world_label = ctx.active_world.read().clone();
 
     rsx! {
         style { {panel_kit::CSS} }
@@ -811,11 +1122,37 @@ fn App() -> Element {
 
             header { class: "topbar",
                 h1 { "JUMP CANNON" }
+                // View switcher: each view owns its workspace + dock (its own
+                // localStorage layout); the graph surface re-bases on switch.
+                nav { class: "view-switch",
+                    button {
+                        class: if view_now == AppView::User { "view-btn active" } else { "view-btn" },
+                        r#type: "button",
+                        title: "User workspace: explore the served graph",
+                        aria_pressed: if view_now == AppView::User { "true" } else { "false" },
+                        onclick: move |_| switch_view(ctx, AppView::User),
+                        "User"
+                    }
+                    button {
+                        class: if view_now == AppView::Sessions { "view-btn active" } else { "view-btn" },
+                        r#type: "button",
+                        title: "Sessions workspace: versioned shared worlds",
+                        aria_pressed: if view_now == AppView::Sessions { "true" } else { "false" },
+                        onclick: move |_| switch_view(ctx, AppView::Sessions),
+                        "Sessions"
+                    }
+                }
                 // Node/edge/community counts live in the Settings panel (the
                 // superset — it also has components); the topbar just shows the
                 // workspace mode + connection state to avoid a third copy.
                 span { class: "hint",
-                    if g_now.is_some() {
+                    if view_now == AppView::Sessions {
+                        if let Some(w) = &world_label {
+                            "sessions · world {w}"
+                        } else {
+                            "sessions · no world open"
+                        }
+                    } else if g_now.is_some() {
                         "{mode_label} · {session_label}"
                     } else {
                         "{mode_label} · connecting…"
@@ -830,12 +1167,10 @@ fn App() -> Element {
                 }
             }
 
-            {ws.render_with_header(
-                move |kind, maximized| panel_body(kind, maximized, ctx),
-                move |kind, _maximized| panel_header_actions(kind, ctx),
-            )}
-
-            {ws.dock()}
+            {match view_now {
+                AppView::User => rsx! { UserWorkspaceView { ws: ViewWs(ws_user), ctx } },
+                AppView::Sessions => rsx! { SessionsWorkspaceView { ws: ViewWs(ws_sessions), ctx } },
+            }}
 
             // Phase-4 overlays: both render empty until active.
             {palette::overlay(ctx)}
@@ -844,11 +1179,81 @@ fn App() -> Element {
     }
 }
 
+// --- per-view workspace wrappers ------------------------------------------------
+
+// `Workspace::render_with_header` calls each visible panel's body fn INLINE,
+// so panel hooks land in the caller's scope. Both views must therefore mount
+// under DISTINCT component types: switching views unmounts one scope and
+// initializes the other cleanly, instead of scrambling hook indices inside a
+// single shared scope (the rules-of-hooks panic this fixes).
+
+/// Prop wrapper: Dioxus 0.6 requires `PartialEq` props and `Workspace` has
+/// none. Signal equality is identity-based, which is exactly what a prop
+/// comparison needs.
+#[derive(Clone, Copy)]
+struct ViewWs(panel_kit::Workspace<Panel>);
+
+impl PartialEq for ViewWs {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.panels == other.0.panels
+            && self.0.mode == other.0.mode
+            && self.0.drag == other.0.drag
+            && self.0.tile_drag == other.0.tile_drag
+            && self.0.is_mobile == other.0.is_mobile
+            && self.0.viewport == other.0.viewport
+            && self.0.ws_scroll == other.0.ws_scroll
+    }
+}
+
+#[component]
+fn UserWorkspaceView(ws: ViewWs, ctx: Ctx) -> Element {
+    let ws = ws.0;
+    rsx! {
+        {ws.render_with_header(
+            move |kind, maximized| panel_body(kind, maximized, ctx),
+            move |kind, _maximized| panel_header_actions(kind, ctx),
+        )}
+        {ws.dock()}
+    }
+}
+
+#[component]
+fn SessionsWorkspaceView(ws: ViewWs, ctx: Ctx) -> Element {
+    let ws = ws.0;
+    rsx! {
+        {ws.render_with_header(
+            move |kind, maximized| panel_body(kind, maximized, ctx),
+            move |kind, _maximized| panel_header_actions(kind, ctx),
+        )}
+        {ws.dock()}
+    }
+}
+
 // --- panel bodies ----------------------------------------------------------------
 
 fn panel_body(kind: Panel, _maximized: bool, ctx: Ctx) -> Element {
     match kind {
         Panel::Graph => {
+            // In the Sessions view with no world mounted there is nothing to
+            // draw. With a world open on the embedded host the canvas mounts
+            // the materialized `main` head as a client graph (see
+            // `rematerialize_embedded`), so the hint is only for the
+            // no-world-open case.
+            if *ctx.view.read() == AppView::Sessions
+                && api::WORLD_BASE.read().is_none()
+                && ctx.active_world.read().is_none()
+            {
+                let embedded = api::session_manager_url().is_none();
+                return rsx! {
+                    div { class: "skeleton",
+                        if embedded {
+                            "embedded single-user mode: open a world in the Worlds panel to edit its graph locally"
+                        } else {
+                            "open a world in the Worlds panel to load its graph"
+                        }
+                    }
+                };
+            }
             if ctx.graph.read().is_some() {
                 rsx! { graph_canvas::GraphCanvas { graph: ctx.graph, selected: ctx.selected } }
             } else if let Some(e) = ctx.load_error.read().clone() {
@@ -868,6 +1273,11 @@ fn panel_body(kind: Panel, _maximized: bool, ctx: Ctx) -> Element {
         Panel::Generate => panels::generate::panel(ctx),
         Panel::Timeline => panels::timeline::panel(ctx),
         Panel::Debug => panels::debug::panel(ctx),
+        Panel::Worlds => panels::worlds::panel(ctx),
+        Panel::History => panels::history::panel(ctx),
+        Panel::Branches => panels::branches::panel(ctx),
+        Panel::Merge => panels::merge::panel(ctx),
+        Panel::GpuSessions => panels::gpu_sessions::panel(ctx),
         Panel::Help => rsx! {
             div { class: "help",
                 p { "canvas: drag rotate · wheel zoom · WASD pan · QE fwd/back · Shift boost · F fit · click select" }

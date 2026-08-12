@@ -30,6 +30,140 @@
           }
         }
       }
+    },
+    "sessionManager": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "replicas": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1
+        },
+        "port": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 65535
+        },
+        "userHeader": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "store": {
+          "type": "string",
+          "enum": [
+            "minigraf",
+            "terminusdb"
+          ]
+        },
+        "persistence": {
+          "type": "object",
+          "additionalProperties": true,
+          "properties": {
+            "enabled": {
+              "type": "boolean"
+            },
+            "existingClaim": {
+              "type": "string",
+              "maxLength": 253
+            },
+            "size": {
+              "type": "string",
+              "minLength": 1
+            }
+          }
+        },
+        "gpu": {
+          "type": "object",
+          "additionalProperties": true,
+          "properties": {
+            "enabled": {
+              "type": "boolean"
+            },
+            "namespace": {
+              "type": "string",
+              "maxLength": 63
+            },
+            "idleSeconds": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "admissionTimeoutSeconds": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "maxExecTimeSeconds": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "headStartTimeoutSeconds": {
+              "type": "integer",
+              "minimum": 1
+            }
+          }
+        }
+      }
+    },
+    "terminusdb": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "image": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512
+        },
+        "service": {
+          "type": "object",
+          "additionalProperties": true,
+          "properties": {
+            "port": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 65535
+            }
+          }
+        },
+        "persistence": {
+          "type": "object",
+          "additionalProperties": true,
+          "properties": {
+            "size": {
+              "type": "string",
+              "minLength": 1
+            },
+            "storageClass": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "minLength": 1
+            }
+          }
+        },
+        "adminPasswordSecret": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "name": {
+              "type": "string",
+              "maxLength": 253
+            },
+            "key": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 253
+            }
+          }
+        }
+      }
     }
   },
   "additionalProperties": true,

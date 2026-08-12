@@ -1,0 +1,24 @@
+# helm-template coverage for the terminusdb world store: the session-manager
+# deployment gets the TERMINUSDB_* env wiring and the StatefulSet/Service
+# render. The admin password Secret is user-created; the chart only
+# references it by name.
+sessionManager:
+  enabled: true
+  store: terminusdb
+
+terminusdb:
+  enabled: true
+  adminPasswordSecret:
+    name: terminusdb-admin
+
+graphCompute:
+  session:
+    enabled: false
+
+tests:
+  fuzz:
+    enabled: false
+  performance:
+    enabled: false
+  browser:
+    enabled: false

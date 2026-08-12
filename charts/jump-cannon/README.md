@@ -40,6 +40,80 @@ and `tests.performance.namespace` so they use the existing LocalQueue. With the
 ClusterQueue GPU quota at `0`, the scheduled performance Job stays queued until
 an operator deliberately grants quota and frees silicon from a serving workload.
 
+## Session manager
+
+Set `sessionManager.enabled=true` to deploy the multi-user session-manager
+alongside the single-tenant graph-api: a world/session/VCS REST API plus
+per-world graph serving under `/worlds/:name/*`. World VCS persistence uses
+one of two backends selected by `sessionManager.store`: `minigraf` (default)
+keeps one `<world-slug>.graph` file per world on the world-store PVC
+(`<fullname>-worlds`, or `sessionManager.persistence.existingClaim` when
+externally provisioned); `terminusdb` keeps one TerminusDB database per world
+on the in-cluster server below (the worlds PVC then carries only the
+`worlds.json` metadata/ACL manifest). The Service is
+`<fullname>-session-manager` (ClusterIP, port 80 → `sessionManager.port`).
+Requests must carry the trusted identity header
+(`sessionManager.userHeader`, default `x-user`) set by an authenticating
+ingress; requests without it get 401. Exactly one replica is supported —
+world serving states live in pod memory — and the schema caps
+`sessionManager.replicas` at 1.
+
+| Value | Default | Purpose |
+|---|---|---|
+| `sessionManager.enabled` | `false` | Deploy the session-manager |
+| `sessionManager.image.repository` / `.tag` | `…/jump-cannon-session-manager:latest` | Server image |
+| `sessionManager.port` | `8080` | Container listen port |
+| `sessionManager.replicas` | `1` | Must stay 1 (schema-enforced) |
+| `sessionManager.userHeader` | `x-user` | Trusted identity header |
+| `sessionManager.store` | `minigraf` | World store backend: `minigraf` or `terminusdb` (requires `terminusdb.enabled`, chart-fail enforced) |
+| `sessionManager.persistence.enabled` / `.size` / `.storageClassName` / `.existingClaim` | `true` / `5Gi` / `local-path` / `""` | World-store PVC |
+
+### TerminusDB world store
+
+Set `terminusdb.enabled=true` to deploy a single-replica TerminusDB
+StatefulSet (`<fullname>-terminusdb`, ClusterIP Service on
+`terminusdb.service.port`) with a PVC volumeClaimTemplate. Selecting
+`sessionManager.store=terminusdb` then points the session-manager at it
+(`TERMINUSDB_URL` plus the admin credentials) — the chart fails to render if
+the store is selected without the server. The admin password always comes
+from a user-created Secret referenced by
+`terminusdb.adminPasswordSecret.name` / `.key` (the chart fails without one);
+it never appears in values. Create it before installing, e.g.
+`kubectl create secret generic terminusdb-admin --from-literal=password=…`.
+The dashboard is disabled; TerminusDB is single-writer, so the StatefulSet
+stays at one replica.
+
+| Value | Default | Purpose |
+|---|---|---|
+| `terminusdb.enabled` | `false` | Deploy the TerminusDB StatefulSet |
+| `terminusdb.image` | `terminusdb/terminusdb:v12.0.7` | Server image (pinned tag) |
+| `terminusdb.service.port` | `6363` | Service port |
+| `terminusdb.persistence.size` / `.storageClass` | `10Gi` / `null` (cluster default) | Data volumeClaimTemplate |
+| `terminusdb.adminPasswordSecret.name` / `.key` | `""` / `password` | User-created Secret holding the admin password |
+
+### Per-world GPU broker
+
+With `sessionManager.gpu.enabled=true` the session-manager also runs the
+per-world GPU compute broker: one Kueue-admitted RayCluster per world in the
+compute namespace, lifecycle-managed exactly like the single-tenant
+`graphCompute.session` loop (dispatch → admission → head ready; park deletes
+the CR; idle auto-park; the `kueue.x-k8s.io/max-exec-time-seconds` hard cap).
+All world clusters land in the same standing LocalQueue envelope
+(`graphCompute.ray.queueName`). The chart renders the same
+`jump-cannon.rayclusterManifest` into a per-world template ConfigMap with a
+`__world__` name placeholder; the broker stamps
+`<release-fullname>-<world-slug>` (DNS-1123, ≤63 chars) per world and
+maintains a per-world ClusterIP Service (same name,
+`ray.io/cluster`/`ray.io/node-type=head` selector) because KubeRay's head
+service never exposes the graph-compute sidecar's gRPC port. A world's
+compute URL is `http://<cluster-name>.<compute-namespace>.svc:50051`.
+`sessionManager.gpu` is mutually exclusive with `graphCompute.session` (a
+chart `fail` enforces this) and defaults its namespace to
+`graphCompute.namespace`; RBAC mirrors `rbac-gpu-session.yaml` plus
+`rayclusters list` and `services get/create/delete`. Timeouts
+(`idleSeconds`, `admissionTimeoutSeconds`, `maxExecTimeSeconds`,
+`headStartTimeoutSeconds`) mirror the `graphCompute.session` defaults.
+
 ## Kubernetes importer
 
 Set `kubernetesImporter.enabled=true` to select the Kubernetes graph source and

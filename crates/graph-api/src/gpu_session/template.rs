@@ -32,19 +32,34 @@ impl SessionTemplate {
     /// (never panics) on any IO/parse/validation failure; the caller disables
     /// the session feature on Err.
     pub fn load(path: &Path, cluster_name: &str, namespace: &str) -> anyhow::Result<Self> {
+        let manifest = Self::read(path)?;
+        Self::validate(&manifest, cluster_name, namespace)
+            .with_context(|| format!("invalid gpu session template {}", path.display()))?;
+        Ok(Self { manifest })
+    }
+
+    /// Multi-world variant of [`Self::load`]: `metadata.name` is a
+    /// placeholder the caller stamps per world at render time (the
+    /// session-manager GPU broker), so only its presence — not a fixed
+    /// value — is validated.
+    pub fn load_templated(path: &Path, namespace: &str) -> anyhow::Result<Self> {
+        let manifest = Self::read(path)?;
+        Self::validate_inner(&manifest, None, namespace)
+            .with_context(|| format!("invalid gpu world template {}", path.display()))?;
+        Ok(Self { manifest })
+    }
+
+    fn read(path: &Path) -> anyhow::Result<Value> {
         let raw = std::fs::read_to_string(path)
             .with_context(|| format!("read gpu session template {}", path.display()))?;
         // The chart mounts the manifest as YAML (raycluster.yaml); YAML is a
         // superset of JSON, so this accepts either rendering.
-        let manifest: Value = serde_yaml::from_str(&raw).with_context(|| {
+        serde_yaml::from_str(&raw).with_context(|| {
             format!(
                 "parse gpu session template {} as YAML",
                 path.display()
             )
-        })?;
-        Self::validate(&manifest, cluster_name, namespace)
-            .with_context(|| format!("invalid gpu session template {}", path.display()))?;
-        Ok(Self { manifest })
+        })
     }
 
     /// Boot-time validation per the locked spec: parses as an object,
@@ -52,6 +67,16 @@ impl SessionTemplate {
     /// name/namespace match the configured values, and the Kueue queue label
     /// is present.
     pub fn validate(manifest: &Value, cluster_name: &str, namespace: &str) -> anyhow::Result<()> {
+        Self::validate_inner(manifest, Some(cluster_name), namespace)
+    }
+
+    /// `expected_name == None` accepts any non-empty placeholder name (the
+    /// multi-world template; `render` stamps the real per-world name).
+    fn validate_inner(
+        manifest: &Value,
+        expected_name: Option<&str>,
+        namespace: &str,
+    ) -> anyhow::Result<()> {
         let kind = manifest
             .get("kind")
             .and_then(Value::as_str)
@@ -70,8 +95,19 @@ impl SessionTemplate {
             .pointer("/metadata/name")
             .and_then(Value::as_str)
             .ok_or_else(|| anyhow!("missing metadata.name"))?;
-        if name != cluster_name {
-            bail!("metadata.name {name:?} does not match configured cluster name {cluster_name:?}");
+        match expected_name {
+            Some(expected) => {
+                if name != expected {
+                    bail!(
+                        "metadata.name {name:?} does not match configured cluster name {expected:?}"
+                    );
+                }
+            }
+            None => {
+                if name.is_empty() {
+                    bail!("metadata.name (per-world placeholder) must be non-empty");
+                }
+            }
         }
         let ns = manifest
             .pointer("/metadata/namespace")
@@ -243,6 +279,40 @@ mod tests {
         std::fs::write(&invalid, "kind: RayCluster\n").expect("write");
         assert!(SessionTemplate::load(&invalid, "a", "b").is_err());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_templated_accepts_placeholder_name_and_stamps_per_world() {
+        let dir = std::env::temp_dir().join(format!("gpu-world-template-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let path = dir.join("raycluster.yaml");
+        std::fs::write(
+            &path,
+            "apiVersion: ray.io/v1\nkind: RayCluster\nmetadata:\n  name: __world__\n  namespace: gpu-workloads\n  labels:\n    kueue.x-k8s.io/queue-name: gpu\nspec: {}\n",
+        )
+        .expect("write");
+        let template =
+            SessionTemplate::load_templated(&path, "gpu-workloads").expect("placeholder template loads");
+        let stamped = template.render("jump-cannon-my-world", "gpu-workloads", 14400);
+        assert_eq!(
+            stamped.pointer("/metadata/name").and_then(Value::as_str),
+            Some("jump-cannon-my-world")
+        );
+        // Namespace mismatch is still rejected for placeholder templates.
+        assert!(SessionTemplate::load_templated(&path, "other-ns").is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_templated_rejects_missing_name() {
+        let mut m = good_manifest();
+        m.pointer_mut("/metadata")
+            .and_then(Value::as_object_mut)
+            .expect("metadata")
+            .remove("name");
+        let err = SessionTemplate::validate_inner(&m, None, "gpu-workloads")
+            .expect_err("missing name must fail");
+        assert!(err.to_string().contains("metadata.name"), "{err}");
     }
 
     #[test]

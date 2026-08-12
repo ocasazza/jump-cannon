@@ -1,0 +1,19 @@
+# helm-template coverage for the session-manager deployment with the
+# per-world GPU broker enabled (and the legacy single-tenant session off).
+sessionManager:
+  enabled: true
+  gpu:
+    enabled: true
+    namespace: gpu-workloads
+
+graphCompute:
+  session:
+    enabled: false
+
+tests:
+  fuzz:
+    enabled: false
+  performance:
+    enabled: false
+  browser:
+    enabled: false

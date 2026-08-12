@@ -847,7 +847,15 @@ fn seed_default_actions(reg: &mut ActionRegistry) {
 
     // PARITY GAP: panel open/restore state lives in main.rs's
     // `use_workspace` hook — not reachable from a module-level dispatch.
+    // Only offer sections the active view's workspace actually holds: the
+    // registry is built once per page load and the view switcher reloads
+    // the page, so a boot-time filter is exact (a restore of a panel the
+    // layout doesn't contain would silently no-op).
+    let view = crate::persisted_view();
     for &section in Section::ALL {
+        if !crate::panel_in_view(section.panel(), view) {
+            continue;
+        }
         let id = format!("jump-{}", section.title().to_lowercase());
         let title = format!("Go to {}", section.title());
         reg.register(Action {

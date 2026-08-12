@@ -15,6 +15,8 @@ people, development agents, graph-api, and the deployed frontend.
 - Change it through [[Development]].
 - Run it through [[Operations]].
 - Establish backend sessions through [[Compute]].
+- Share and version graphs through [[Session Manager]] and
+  [[Worlds and Versioning]].
 - Keep the system and this graph aligned through [[Agent Workflow]] and
   [[Maintaining This Map]].
 

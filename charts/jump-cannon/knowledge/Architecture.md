@@ -15,5 +15,11 @@ in-process search index, schema-driven facets, editing, progress, and the
 optional compute broker. The Dioxus WASM client fetches topology and renders it
 with wgpu.
 
+Alongside the single-source graph-api, the optional session manager hosts
+multi-user shared versioned worlds: the same Dioxus app switches to its
+Sessions view, and each world's served branch is rebuilt through the same
+atomic snapshot path. Keep it in [[Session Manager]] and its versioning model
+in [[Worlds and Versioning]].
+
 Keep source loading in [[Importer Runtime]], HTTP contracts in [[Backend API]],
 presentation in [[Frontend]], and scheduled or remote work in [[Compute]].

@@ -18,3 +18,9 @@ pub mod timeline;
 // phase 4: Inspector + Document moved out of main.rs for the parity port.
 pub mod document;
 pub mod inspector;
+// Sessions view (versioned shared worlds — crates/session-manager).
+pub mod branches;
+pub mod gpu_sessions;
+pub mod history;
+pub mod merge;
+pub mod worlds;

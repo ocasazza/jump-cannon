@@ -145,7 +145,7 @@ fn tab_button(tab: SettingsTab, active: SettingsTab) -> Element {
     }
 }
 
-fn connection_panel(ctx: Ctx) -> Element {
+fn connection_panel(mut ctx: Ctx) -> Element {
     let Ctx {
         mut server,
         graph,
@@ -171,6 +171,48 @@ fn connection_panel(ctx: Ctx) -> Element {
                         spawn(reload_graph(ctx));
                     },
                     "Connect"
+                }
+            }
+            // Sessions view backend: empty = embedded single-user host (worlds
+            // live in this browser); set = multi-user session-manager server.
+            // The identity mirrors the `x-user` header the OIDC gateway
+            // injects in cluster deployments.
+            div { class: "server",
+                input {
+                    aria_label: "Session manager URL (empty = embedded)",
+                    placeholder: "session manager URL (empty = embedded)",
+                    value: "{ctx.sm_url}",
+                    oninput: move |event| ctx.sm_url.set(event.value()),
+                }
+                button {
+                    class: "btn",
+                    r#type: "button",
+                    onclick: move |_| {
+                        api::set_session_manager_url(&ctx.sm_url.read());
+                        // Host rebuild is driven by the identity below; poke it
+                        // so a URL-only change also reconnects.
+                        let u = ctx.user.read().clone();
+                        ctx.user.set(u);
+                    },
+                    "Set"
+                }
+            }
+            div { class: "server",
+                input {
+                    aria_label: "User name (x-user identity)",
+                    placeholder: "user name (x-user identity)",
+                    value: "{ctx.user}",
+                    oninput: move |event| ctx.user.set(event.value()),
+                }
+                button {
+                    class: "btn",
+                    r#type: "button",
+                    onclick: move |_| {
+                        api::set_user_name(&ctx.user.read());
+                        let u = ctx.user.read().clone();
+                        ctx.user.set(u);
+                    },
+                    "Set"
                 }
             }
             if let Some(graph) = graph {
