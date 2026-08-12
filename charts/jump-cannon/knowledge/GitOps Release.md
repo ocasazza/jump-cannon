@@ -9,9 +9,19 @@ tags: [jump-cannon, gitops, flux]
 # GitOps Release
 
 The release sequence is source commit, Hydra image and chart builds, secured
-artifact publication, consumer chart lock update, rendered manifest review,
-Flux reconciliation, and live workload verification. Each step needs its own
-evidence; a source build does not prove the cluster updated.
+artifact publication, Flux reconciliation, and live workload verification.
+Each step needs its own evidence; a source build does not prove the cluster
+updated.
+
+There is no consumer chart-lock step. The packaged chart keeps version 0.1.0
+but `appVersion` carries the source revision, so every source build changes
+the tarball bytes at the stable object key
+`gs://it-ops-nixstation-k8s-artifacts/charts/jump-cannon-0.1.0.tgz`. The
+consumer environment follows it with a Flux Bucket source + HelmRelease: the
+Bucket source sees a new artifact revision and the HelmRelease upgrades on
+its own, and the Deployment's `chart.appVersion` pod annotation rolls the
+pods onto the new `latest` image even when the chart templates did not
+change.
 
 Environment-owned resources include [[NetBird Access]] and GPU admission under
 [[Kueue Scheduling]]. Confirm the deployed result in [[Observability]].

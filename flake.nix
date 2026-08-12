@@ -963,7 +963,9 @@
           default          = graph-api;
           inherit graph-api graph-compute graph-layouts-wasm tvix-wasm app-web;
           inherit bench-pagerank;
-          chart-tarball = pkgs.callPackage ./packages/chart-tarball { };
+          chart-tarball = pkgs.callPackage ./packages/chart-tarball {
+            sourceRev = inputs.self.rev or inputs.self.dirtyRev or "unknown";
+          };
           inherit graph-compute-image graph-api-image docker-compose-yaml;
           inherit graph-api-k8s-image graph-compute-k8s-image test-runner-image;
           inherit test-browser test-workload-bins;

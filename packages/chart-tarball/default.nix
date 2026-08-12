@@ -5,7 +5,14 @@
 # Hydra-host chart cache at /var/lib/hydra-cache/charts/ and to the locked-down
 # GCS fallback bucket. Consumers fetch from the CIDR-gated /hydra-cache/charts
 # path, not from anonymous GCS.
-{ pkgs }:
+#
+# The chart version stays 0.1.0 (stable object key), but appVersion is stamped
+# with the source revision so every source build produces distinct tarball
+# bytes: the Flux Bucket source watching gs://it-ops-nixstation-k8s-artifacts
+# sees a new artifact revision and the consumer HelmRelease upgrades — and the
+# Deployment's chart.appVersion pod annotation rolls the pods onto the new
+# `latest` image even when the chart templates themselves did not change.
+{ pkgs, sourceRev ? "unknown" }:
 pkgs.runCommand "jump-cannon-chart-tarball"
   {
     nativeBuildInputs = [
@@ -216,5 +223,5 @@ pkgs.runCommand "jump-cannon-chart-tarball"
       --set graphCompute.session.enabled=true \
       --set graphApi.replicas=2
 
-    helm package ./jump-cannon -d "$out/charts"
+    helm package --app-version "${sourceRev}" ./jump-cannon -d "$out/charts"
   ''
