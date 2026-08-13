@@ -127,6 +127,8 @@ Run `just test browser-rust` before claiming any visual change works. Don't comm
 | `JUMP_CANNON_COMPUTE_URL` env / `--compute-url` flag | graph-api | unset → broker disabled, `/graph/layout/stream` returns 503 |
 | `JUMP_CANNON_ASSETS_DIR` env / `--assets-dir` flag | graph-api | unset → assets 404 (no embedded bundle; point it at the app dist) |
 | `GRAPH_API_NO_WATCH=1` | graph-api | unset → file watcher armed |
+| `JUMP_CANNON_IMPORTER_SWITCH_GROUP` env / `--importer-switch-group` flag | graph-api | unset → runtime importer switching disabled (rollout-only) |
+| `JUMP_CANNON_USER_GROUPS_HEADER` env / `--user-groups-header` flag | graph-api | `x-netbird-groups` (proxy-injected, comma-separated) |
 
 `.env` at the repo root is auto-loaded by the justfile (`set dotenv-load := true`).
 
