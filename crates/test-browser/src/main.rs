@@ -16,11 +16,11 @@
 //!      dock) against the embedded host and returns to the User view.
 //!   10. Screenshots are saved for the Nodes editor, Filter builder, Sessions
 //!       view, and workspace.
-//!  11. Runtime importer switching: a second fixture graph-api (two-source
-//!      Obsidian catalog + switch group) is mirrored/spawned in parallel;
-//!      the scenario asserts the wire gate (403/200/404), the authorized
-//!      selector + graph swap + sessionStorage persistence, the fresh-tab
-//!      default, and the unauthorized note + stale-selection reset.
+//!   11. Runtime importer switching: a second fixture graph-api (two-source
+//!       Obsidian catalog + switch group) is mirrored/spawned in parallel;
+//!       the scenario asserts the wire gate (403/200/404), the authorized
+//!       selector + graph swap + sessionStorage persistence, the fresh-tab
+//!       default, and the unauthorized note + stale-selection reset.
 //!
 //! Anything flaky (pixel brightness, motion deltas, click recovery) is
 //! deliberately deferred. (The legacy egui-era Playwright suite that held
@@ -2526,7 +2526,6 @@ async fn setup_switch_fixture(origin: &str) -> Result<Option<SwitchFixture>> {
     .to_string();
 
     let port = pick_free_port().await?;
-    let setup_started = Instant::now();
     let server = tokio::process::Command::new(bin)
         .arg("--vault-root")
         .arg(&default_vault)
@@ -2545,11 +2544,6 @@ async fn setup_switch_fixture(origin: &str) -> Result<Option<SwitchFixture>> {
         .context("spawn second fixture graph-api")?;
     let base_url = format!("http://127.0.0.1:{port}");
     probe_server(&format!("{base_url}/"), Duration::from_secs(30)).await?;
-    tracing::info!(
-        elapsed_ms = setup_started.elapsed().as_millis(),
-        mirrored,
-        "importer-switch fixture server serving at {base_url}"
-    );
     Ok(Some(SwitchFixture {
         base_url,
         server,
@@ -2631,9 +2625,8 @@ const SWITCH_TO_ALT_JS: &str = r#"(async () => {
     });
     if (!button) return { clicked: false, stored: false, swapped: false, badge: false };
     button.click();
-    // gloo Storage JSON-encodes values, so the raw item is `"alt-obsidian"`.
     const stored = await waitFor(() =>
-      JSON.parse(sessionStorage.getItem('jc_source_id') || 'null') === '__ALT_ID__' ? true : null
+      sessionStorage.getItem('jc_source_id') === '__ALT_ID__' ? true : null
     );
     const swapped = await waitFor(() => {
       const ids = [...document.querySelectorAll('[data-testid="node-sidebar"] [data-node-id]')]
@@ -2667,7 +2660,7 @@ const PERSISTED_ALT_JS: &str = r#"(async () => {
     };
     const persisted = await waitFor(() => {
       if (!window.__jc_boot) return null;
-      if (JSON.parse(sessionStorage.getItem('jc_source_id') || 'null') !== '__ALT_ID__') return null;
+      if (sessionStorage.getItem('jc_source_id') !== '__ALT_ID__') return null;
       const ids = [...document.querySelectorAll('[data-testid="node-sidebar"] [data-node-id]')]
         .map((row) => row.getAttribute('data-node-id'));
       return ids.some((id) => id === '__ALT_NODE__' || id.endsWith(':__ALT_NODE__'))
@@ -2860,7 +2853,6 @@ async fn run_switch_scenario_inner(
     check: &mut ImporterSwitchCheck,
     console_logs: Arc<Mutex<Vec<String>>>,
 ) -> Result<()> {
-    let scenario_started = Instant::now();
     let base = &fixture.base_url;
 
     // ---- wire contract (no browser): the group gate and id validation ----
@@ -2881,16 +2873,9 @@ async fn run_switch_scenario_inner(
     )
     .await?
         == 404;
-    tracing::info!(
-        forbidden = check.wire_forbidden,
-        authorized = check.wire_authorized,
-        unknown = check.wire_unknown,
-        "importer-switch wire contract checked"
-    );
 
     // ---- authorized page: selector, switch, persistence, switch-back ------
     let page = open_switch_page(browser, base, true).await?;
-    tracing::info!("importer-switch authorized page opened");
     // Feed the authorized page's console into the shared error gate: the
     // happy path must stay clean.
     let mut page_logs = page
@@ -2927,7 +2912,6 @@ async fn run_switch_scenario_inner(
     });
 
     let view: serde_json::Value = evaluate_retry(&page, IMPORTERS_VIEW_JS, 5).await?;
-    tracing::info!(view = %view, "importer-switch authorized catalog state");
     let buttons = view
         .get("buttons")
         .and_then(|b| b.as_array())
@@ -2965,7 +2949,6 @@ async fn run_switch_scenario_inner(
         5,
     )
     .await?;
-    tracing::info!(switched = %switched, "importer-switch alternate selection driven");
     check.switch_swaps_nodes = initial_default
         && switched.get("clicked").and_then(|v| v.as_bool()) == Some(true)
         && switched.get("stored").and_then(|v| v.as_bool()) == Some(true)
@@ -2990,7 +2973,6 @@ async fn run_switch_scenario_inner(
     .await?;
     check.session_persists_reload =
         persisted.get("persisted").and_then(|v| v.as_bool()) == Some(true);
-    tracing::info!(persisted = %persisted, "importer-switch in-tab reload checked");
 
     let switched_back: serde_json::Value = evaluate_retry(
         &page,
@@ -3008,7 +2990,6 @@ async fn run_switch_scenario_inner(
         switched_back.get("clicked").and_then(|v| v.as_bool()) == Some(true)
             && switched_back.get("cleared").and_then(|v| v.as_bool()) == Some(true)
             && switched_back.get("restored").and_then(|v| v.as_bool()) == Some(true);
-    tracing::info!(switched_back = %switched_back, "importer-switch return to default checked");
 
     page_log_pump.abort();
     page_exception_pump.abort();
@@ -3016,14 +2997,10 @@ async fn run_switch_scenario_inner(
     let _ = page_exception_pump.await;
     let _ = page.close().await;
 
-    // ---- fresh tab, no group header: session storage is per-tab, so this
-    // page boots the deployment default even though another tab selected the
-    // alternate; without the group it also gets the read-only catalog plus
-    // the group-required note. (The page deliberately fetches a 403 in the
-    // stale flow below, so its console is not fed to the error gate.)
-    let denied = open_switch_page(browser, base, false).await?;
-    let fresh_state: serde_json::Value = evaluate_retry(&denied, NODE_IDS_JS, 5).await?;
-    tracing::info!(fresh = %fresh_state, "importer-switch fresh-tab default checked");
+    // ---- fresh tab, authorized: session storage is per-tab, so the default
+    // view returns even though another tab selected the alternate.
+    let fresh = open_switch_page(browser, base, true).await?;
+    let fresh_state: serde_json::Value = evaluate_retry(&fresh, NODE_IDS_JS, 5).await?;
     let fresh_ids = fresh_state
         .get("ids")
         .and_then(|v| v.as_array())
@@ -3033,9 +3010,13 @@ async fn run_switch_scenario_inner(
         && fresh_ids
             .iter()
             .any(|id| id.as_str().is_some_and(|id| node_id_matches(id, SWITCH_DEFAULT_NODE)));
+    let _ = fresh.close().await;
 
+    // ---- unauthorized page: the group-required note, no selector, and
+    // stale-selection recovery (no group header → no extra console gating;
+    // the page deliberately fetches a 403).
+    let denied = open_switch_page(browser, base, false).await?;
     let denied_view: serde_json::Value = evaluate_retry(&denied, IMPORTERS_VIEW_JS, 5).await?;
-    tracing::info!(denied = %denied_view, "importer-switch denied catalog state");
     let denied_policy = denied_view
         .get("policy")
         .and_then(|v| v.as_str())
@@ -3052,10 +3033,9 @@ async fn run_switch_scenario_inner(
         && denied_policy.contains(SWITCH_GROUP);
 
     // Plant a stale selection as if the viewer had switched before losing
-    // the group, reload, and recover through the reset affordance. gloo
-    // Storage JSON-encodes values, so plant the quoted form.
+    // the group, reload, and recover through the reset affordance.
     denied
-        .evaluate("sessionStorage.setItem('jc_source_id', JSON.stringify('alt-obsidian')); location.reload()")
+        .evaluate("sessionStorage.setItem('jc_source_id', 'alt-obsidian'); location.reload()")
         .await
         .ok();
     tokio::time::sleep(Duration::from_millis(500)).await;
@@ -3076,10 +3056,6 @@ async fn run_switch_scenario_inner(
         && reset.get("restored").and_then(|v| v.as_bool()) == Some(true);
     let _ = denied.close().await;
 
-    tracing::info!(
-        elapsed_ms = scenario_started.elapsed().as_millis(),
-        "importer-switch scenario finished"
-    );
     Ok(())
 }
 

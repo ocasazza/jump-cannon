@@ -51,7 +51,11 @@ the source that actually started and exposes only its sanitized form through
 `GET /importers`. The rollout-based selection remains the deployment default;
 when `importers.runtimeSwitchGroup` is set, viewers in that NetBird group can
 also switch the viewed source per browser session from the Settings tab, with
-writes and compute pinned to the deployment-selected source.
+writes and compute pinned to the deployment-selected source. The viewer's
+selection lives in sessionStorage as the **bare string** `jc_source_id` (no
+JSON encoding — the harness and proxy tooling plant and read it through the
+DOM storage API), rides as the `x-jump-cannon-source` request header, and as
+`?source=` on the layout WebSocket, whose browser API cannot set headers.
 
 The default markdown loader resolves wikilinks and is currently the only
 importer that advertises readable and writable source content. Kubernetes

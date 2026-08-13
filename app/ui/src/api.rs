@@ -12,7 +12,7 @@
 
 use dioxus::prelude::*;
 use gloo_net::http::Request;
-use gloo_storage::{LocalStorage, SessionStorage, Storage};
+use gloo_storage::{LocalStorage, Storage};
 use prost::Message;
 use serde::{Deserialize, Serialize};
 
@@ -138,11 +138,28 @@ pub fn set_user_name(name: &str) {
     let _ = LocalStorage::set(USER_KEY, name.trim());
 }
 
+/// Raw `window.sessionStorage` handle. The source selection is stored as a
+/// bare string — NOT gloo_storage's JSON encoding — because the selection is
+/// part of the browser-facing contract: the test harness (and any proxy
+/// tooling) plants and inspects `jc_source_id` through the DOM storage API
+/// directly, and a JSON-quoted value would read back as a different id.
+#[cfg(target_arch = "wasm32")]
+fn session_storage() -> Option<web_sys::Storage> {
+    web_sys::window()?.session_storage().ok()?
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn session_storage() -> Option<web_sys::Storage> {
+    None
+}
+
 /// The viewer's selected importer source id, or `None` for the deployment
 /// default. Session-scoped by design: the selection is a per-viewer graph
 /// view, never persisted across browser sessions or shared with other users.
 pub fn source_id() -> Option<String> {
-    let v: String = SessionStorage::get(SOURCE_KEY).unwrap_or_default();
+    let v = session_storage()
+        .and_then(|s| s.get_item(SOURCE_KEY).ok().flatten())
+        .unwrap_or_default();
     let v = v.trim().to_string();
     if v.is_empty() {
         None
@@ -152,11 +169,15 @@ pub fn source_id() -> Option<String> {
 }
 
 pub fn set_source_id(id: &str) {
-    let _ = SessionStorage::set(SOURCE_KEY, id.trim());
+    if let Some(s) = session_storage() {
+        let _ = s.set_item(SOURCE_KEY, id.trim());
+    }
 }
 
 pub fn clear_source_id() {
-    SessionStorage::delete(SOURCE_KEY);
+    if let Some(s) = session_storage() {
+        let _ = s.remove_item(SOURCE_KEY);
+    }
 }
 
 /// Inject the source-selection header when the viewer has switched sources.

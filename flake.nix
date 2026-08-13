@@ -332,7 +332,7 @@
               --base-url "http://127.0.0.1:$PORT" \
               --chromium "$BROWSER_BIN" \
               --out-dir "$RUN_OUT" \
-              --timeout-secs 60 \
+              --timeout-secs "''${JUMP_CANNON_BROWSER_TIMEOUT_SECONDS:-120}" \
               "''${FIXTURE_REQUIRE_ARGS[@]}"
 
             install -m 0644 "$RUN_OUT/boot.png" "$OUT_DIR/boot.png"

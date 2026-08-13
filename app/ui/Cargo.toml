@@ -55,6 +55,8 @@ web-sys = { workspace = true, features = [
     "console", "HtmlElement", "Node",
     # api.rs GET helpers bypass the HTTP cache (live graph buffers)
     "RequestCache",
+    # api.rs source selection: raw sessionStorage (no JSON encoding)
+    "Storage",
     # worker.rs: spawn the tvix-worker bundle from a Blob bootstrap URL
     "Blob", "BlobPropertyBag", "MessageEvent", "Url", "Worker",
 ] }
