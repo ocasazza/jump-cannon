@@ -713,6 +713,7 @@ fn invalidate_graph_derived_state(mut ctx: Ctx) {
     panels::inspector::reset_for_graph_session();
     panels::style::reset_for_graph_session(false);
     panels::timeline::reset_for_graph_session();
+    palette::reset_for_graph_session();
     render::set_selected_node(None);
     render::set_search_highlights(None);
 }
