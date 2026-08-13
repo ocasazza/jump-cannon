@@ -172,6 +172,20 @@ struct NodesEditorCheck {
     flat_active_count: usize,
     schema_core_keys: bool,
     search_schema_generic: bool,
+    #[serde(default)]
+    tag_mode_ready: bool,
+    #[serde(default)]
+    generic_groups_exact: bool,
+    #[serde(default)]
+    fixture_groups_exact: bool,
+    #[serde(default)]
+    fixture_id: String,
+    #[serde(default)]
+    untagged_ids: Vec<String>,
+    #[serde(default)]
+    editor_group_ids: Vec<String>,
+    #[serde(default)]
+    shared_group_ids: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     reason: Option<String>,
 }
@@ -861,7 +875,10 @@ async fn drive_page(
           [...sharedGroup.querySelectorAll('[data-node-id]')]
             .filter((node) => node.getAttribute('data-node-id') === fixtureId).length === 1 &&
           [...sharedGroup.querySelectorAll('[data-node-id]')]
-            .some((node) => node.getAttribute('data-node-id') === 'Node Shared Fixture')
+            .some((node) => {
+              const id = node.getAttribute('data-node-id');
+              return id === 'Node Shared Fixture' || id?.endsWith(':Node Shared Fixture');
+            })
         );
         const exactTagGroups = tagModeReady && genericGroupsExact &&
           (!fixtureContract || fixtureGroupsExact);
@@ -877,7 +894,10 @@ async fn drive_page(
         );
         const fixtureUntagged = Boolean(
           [...(untaggedGroup?.querySelectorAll('[data-node-id]') || [])]
-            .some((node) => node.getAttribute('data-node-id') === 'Node Untagged Fixture')
+            .some((node) => {
+              const id = node.getAttribute('data-node-id');
+              return id === 'Node Untagged Fixture' || id?.endsWith(':Node Untagged Fixture');
+            })
         );
         const selectionPersisted = Boolean(
           main?.querySelector('[data-focused-node]')?.getAttribute('data-focused-node') === fixtureId &&
@@ -959,6 +979,16 @@ async fn drive_page(
           flat_active_count: flatActiveCount,
           schema_core_keys: schemaCoreKeys,
           search_schema_generic: searchSchemaGeneric,
+          tag_mode_ready: Boolean(tagModeReady),
+          generic_groups_exact: Boolean(genericGroupsExact),
+          fixture_groups_exact: Boolean(fixtureGroupsExact),
+          fixture_id: fixtureId,
+          untagged_ids: [...(untaggedGroup?.querySelectorAll('[data-node-id]') || [])]
+            .map((node) => node.getAttribute('data-node-id')).slice(0, 8),
+          editor_group_ids: [...(editorGroup?.querySelectorAll('[data-node-id]') || [])]
+            .map((node) => node.getAttribute('data-node-id')),
+          shared_group_ids: [...(sharedGroup?.querySelectorAll('[data-node-id]') || [])]
+            .map((node) => node.getAttribute('data-node-id')),
           reason: failures.length ? failures.join('; ') : null,
         };
     })()"#;
