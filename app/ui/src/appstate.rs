@@ -567,10 +567,12 @@ fn strip_config_param() {
 /// `GET /configs/:name` — one preset's YAML as plain text.
 async fn fetch_config(name: &str) -> Result<String, String> {
     let path = format!("/configs/{name}");
-    let resp = gloo_net::http::Request::get(&crate::api::url(&path))
-        .send()
-        .await
-        .map_err(crate::api::err)?;
+    let resp = crate::api::with_source_header(gloo_net::http::Request::get(&crate::api::url(
+        &path,
+    )))
+    .send()
+    .await
+    .map_err(crate::api::err)?;
     if !resp.ok() {
         return Err(format!("{} -> HTTP {}", path, resp.status()));
     }

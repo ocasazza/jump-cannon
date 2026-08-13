@@ -12,7 +12,7 @@
 
 use dioxus::prelude::*;
 use gloo_net::http::Request;
-use gloo_storage::{LocalStorage, Storage};
+use gloo_storage::{LocalStorage, SessionStorage, Storage};
 use prost::Message;
 use serde::{Deserialize, Serialize};
 
@@ -21,6 +21,12 @@ use crate::proto;
 const URL_KEY: &str = "jc_server_url";
 const SM_URL_KEY: &str = "jc_session_manager_url";
 const USER_KEY: &str = "jc_user_name";
+const SOURCE_KEY: &str = "jc_source_id";
+
+/// Request header carrying the viewer's selected importer source id. Mirrors
+/// `graph_api::source_host::SOURCE_HEADER`; the layout WebSocket (whose
+/// browser API cannot set headers) takes the same id as `?source=` instead.
+pub const SOURCE_HEADER: &str = "x-jump-cannon-source";
 
 /// World-scoped graph base (`{session-manager}/worlds/{id}`), set by the
 /// Sessions view when a world is opened and cleared on every view switch.
@@ -132,6 +138,39 @@ pub fn set_user_name(name: &str) {
     let _ = LocalStorage::set(USER_KEY, name.trim());
 }
 
+/// The viewer's selected importer source id, or `None` for the deployment
+/// default. Session-scoped by design: the selection is a per-viewer graph
+/// view, never persisted across browser sessions or shared with other users.
+pub fn source_id() -> Option<String> {
+    let v: String = SessionStorage::get(SOURCE_KEY).unwrap_or_default();
+    let v = v.trim().to_string();
+    if v.is_empty() {
+        None
+    } else {
+        Some(v)
+    }
+}
+
+pub fn set_source_id(id: &str) {
+    let _ = SessionStorage::set(SOURCE_KEY, id.trim());
+}
+
+pub fn clear_source_id() {
+    SessionStorage::delete(SOURCE_KEY);
+}
+
+/// Inject the source-selection header when the viewer has switched sources.
+/// Sent unconditionally once set — write/compute endpoints answer 400 on a
+/// non-default selection, and that error is meant to surface to the user.
+pub(crate) fn with_source_header(
+    req: gloo_net::http::RequestBuilder,
+) -> gloo_net::http::RequestBuilder {
+    match source_id() {
+        Some(id) => req.header(SOURCE_HEADER, &id),
+        None => req,
+    }
+}
+
 pub type ApiResult<T> = Result<T, String>;
 
 pub(crate) fn err<E: std::fmt::Display>(e: E) -> String {
@@ -161,7 +200,7 @@ fn encode_id(id: &str) -> String {
 /// stamped them `immutable, max-age=1y` — WebKit took it at its word).
 /// `NoStore` both skips existing entries and never writes new ones.
 fn get(path: &str) -> gloo_net::http::RequestBuilder {
-    let req = Request::get(&url(path)).cache(web_sys::RequestCache::NoStore);
+    let req = with_source_header(Request::get(&url(path)).cache(web_sys::RequestCache::NoStore));
     // World-scoped fetches hit the session manager, which requires identity
     // on every authenticated route (only /healthz is exempt).
     if WORLD_BASE.read().is_some() {
@@ -449,9 +488,10 @@ pub async fn graph_schema() -> ApiResult<GraphSchema> {
 // --- importer deployment catalog ---------------------------------------------
 
 /// Sanitized, deployment-owned importer catalog exposed by graph-api. The
-/// endpoint is deliberately read-only: changing the selected source replaces
-/// the process-lifetime importer and watcher, so Helm remains the activation
-/// authority and a rollout performs the switch.
+/// endpoint never mutates deployment state: Helm remains the activation
+/// authority for the default source. When the deployment enables runtime
+/// switching, authorized viewers may additionally *view* any `runnable`
+/// source per browser session — see `runtime_switch`.
 #[derive(Clone, Debug, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct ImporterCatalog {
@@ -460,7 +500,22 @@ pub struct ImporterCatalog {
     pub selected: Option<String>,
     pub active: ActiveImporter,
     #[serde(default)]
+    pub runtime_switch: RuntimeSwitchStatus,
+    #[serde(default)]
     pub sources: Vec<ImporterProfile>,
+}
+
+/// Per-request runtime switching posture from `GET /importers`. `allowed` is
+/// computed server-side from the caller's proxy-injected groups header.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct RuntimeSwitchStatus {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub allowed: bool,
+    #[serde(default)]
+    pub required_group: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq)]
@@ -492,6 +547,11 @@ pub struct ImporterProfile {
     pub selected: bool,
     #[serde(default)]
     pub active: bool,
+    /// True when graph-api can construct this source at runtime for per-viewer
+    /// switching. The deployment default is always selectable regardless —
+    /// selecting it short-circuits server-side before the runnable check.
+    #[serde(default)]
+    pub runnable: bool,
     #[serde(default)]
     pub source: Option<ImporterFilesystemSource>,
     #[serde(default)]
@@ -539,7 +599,7 @@ pub struct VaultPagePutResp {
 /// preserved verbatim). `path` follows the vault-links convention: relative,
 /// no `.md` extension, matching `NodeMeta.path`.
 pub async fn put_page(path: &str, body: &str) -> ApiResult<VaultPagePutResp> {
-    Request::put(&url("/vault/page"))
+    with_source_header(Request::put(&url("/vault/page")))
         .json(&serde_json::json!({ "path": path, "body": body }))
         .map_err(err)?
         .send()
@@ -687,5 +747,44 @@ mod tests {
 
         assert_eq!(catalog.active.kind, None);
         assert_eq!(catalog.active.kind_label(), "unknown/custom");
+        // Older servers predate runtime switching: the block defaults to
+        // disabled and sources default to non-runnable.
+        assert!(!catalog.runtime_switch.enabled);
+        assert!(!catalog.runtime_switch.allowed);
+        assert_eq!(catalog.runtime_switch.required_group, None);
+    }
+
+    #[test]
+    fn importer_catalog_reads_runtime_switch_posture() {
+        let catalog: ImporterCatalog = serde_json::from_value(serde_json::json!({
+            "activation": "helm_rollout",
+            "selected": "local-obsidian",
+            "active": {
+                "kind": "obsidian",
+                "importer": { "id": "obsidian", "name": "Obsidian", "version": "1" }
+            },
+            "runtimeSwitch": {
+                "enabled": true,
+                "allowed": true,
+                "requiredGroup": "test-admins"
+            },
+            "sources": [{
+                "id": "local-obsidian",
+                "displayName": "Local vault",
+                "kind": "obsidian",
+                "selected": true,
+                "active": true,
+                "runnable": true
+            }]
+        }))
+        .expect("runtime switch block must deserialize");
+
+        assert!(catalog.runtime_switch.enabled);
+        assert!(catalog.runtime_switch.allowed);
+        assert_eq!(
+            catalog.runtime_switch.required_group.as_deref(),
+            Some("test-admins")
+        );
+        assert!(catalog.sources[0].runnable);
     }
 }

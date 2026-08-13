@@ -284,7 +284,16 @@ textarea.md:focus { outline:none; border-color:var(--fg); }
   color:var(--dim); font-size:.58rem; letter-spacing:.04em; text-transform:uppercase; }
 .importer-badge.active { color:var(--green); border-color:#2f6f4a; }
 .importer-badge.selected { color:var(--accent); border-color:#28557e; }
+.importer-badge.viewing { color:var(--yellow); border-color:#655123; }
 .importer-badge.read-only { color:var(--yellow); border-color:#655123; }
+.importer-card[data-viewing="true"] { border-color:#655123; }
+.importer-switch-btn { background:var(--bg); color:var(--fg); border:1px solid var(--line2);
+  border-radius:99px; padding:.08rem .5rem; font-family:inherit; font-size:.58rem;
+  letter-spacing:.04em; text-transform:uppercase; cursor:pointer; }
+.importer-switch-btn:hover:not(:disabled) { border-color:var(--fg); }
+.importer-switch-btn:disabled { opacity:.55; cursor:default; }
+.importer-switch-btn[data-viewing="true"] { color:var(--yellow); border-color:#655123; opacity:1; }
+.importer-switch-reset { align-self:flex-start; font-size:.62rem; }
 .importer-description { margin:0; padding:.45rem .65rem; color:var(--dim); font-size:.68rem;
   line-height:1.45; border-bottom:1px solid var(--line); }
 .importer-contract { padding:.45rem .65rem; border-top:1px solid var(--line); }

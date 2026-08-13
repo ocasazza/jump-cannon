@@ -16,12 +16,17 @@
 //!      dock) against the embedded host and returns to the User view.
 //!   10. Screenshots are saved for the Nodes editor, Filter builder, Sessions
 //!       view, and workspace.
+//!  11. Runtime importer switching: a second fixture graph-api (two-source
+//!      Obsidian catalog + switch group) is mirrored/spawned in parallel;
+//!      the scenario asserts the wire gate (403/200/404), the authorized
+//!      selector + graph swap + sessionStorage persistence, the fresh-tab
+//!      default, and the unauthorized note + stale-selection reset.
 //!
 //! Anything flaky (pixel brightness, motion deltas, click recovery) is
 //! deliberately deferred. (The legacy egui-era Playwright suite that held
 //! those checks was removed with the egui frontend — see git history.)
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -105,6 +110,8 @@ struct Report {
     filter_builder: Option<FilterBuilderCheck>,
     #[serde(skip_serializing_if = "Option::is_none")]
     sessions_view: Option<SessionsViewCheck>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    importer_switch: Option<ImporterSwitchCheck>,
     page_errors: Vec<String>,
     console_logs: Vec<String>,
 }
@@ -200,7 +207,7 @@ struct SettingsTabsCheck {
     controls_hit_test: bool,
     importer_catalog: bool,
     importer_read_only: bool,
-    importer_no_mutation_controls: bool,
+    importer_switch_controls_absent: bool,
     legacy_panels_absent: bool,
     graph_restored: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -235,6 +242,64 @@ struct SessionsViewCheck {
     user_restored: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     reason: Option<String>,
+}
+
+/// Runtime per-viewer importer switching, exercised against a second,
+/// self-hosted fixture graph-api (the main fixture has no switch group, so
+/// the selector-absent contract lives in `settings_tabs`). The scenario
+/// spawns `graph-api` from PATH with `JUMP_CANNON_IMPORTER_SWITCH_GROUP` and
+/// a two-source Obsidian catalog, mirrors the app dist from `--base-url`, and
+/// simulates the authenticating proxy with `Network.setExtraHTTPHeaders`.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct ImporterSwitchCheck {
+    ok: bool,
+    /// True when no `graph-api` binary was available to host the second
+    /// fixture (e.g. a direct run against a remote base URL). Skipped runs
+    /// never fail the suite; the `just test browser-rust` wrapper always has
+    /// the binary on PATH, so the gate exercises the full contract.
+    #[serde(default)]
+    skipped: bool,
+    wire_forbidden: bool,
+    wire_authorized: bool,
+    wire_unknown: bool,
+    selector_visible: bool,
+    switch_swaps_nodes: bool,
+    session_persists_reload: bool,
+    switch_back_restores_default: bool,
+    fresh_tab_default: bool,
+    denied_note: bool,
+    stale_reset_recovers: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    reason: Option<String>,
+}
+
+impl ImporterSwitchCheck {
+    fn skipped() -> Self {
+        Self {
+            ok: true,
+            skipped: true,
+            wire_forbidden: false,
+            wire_authorized: false,
+            wire_unknown: false,
+            selector_visible: false,
+            switch_swaps_nodes: false,
+            session_persists_reload: false,
+            switch_back_restores_default: false,
+            fresh_tab_default: false,
+            denied_note: false,
+            stale_reset_recovers: false,
+            reason: Some("graph-api binary not on PATH; scenario skipped".to_string()),
+        }
+    }
+
+    fn failed(reason: String) -> Self {
+        Self {
+            ok: false,
+            skipped: false,
+            reason: Some(reason),
+            ..Self::skipped()
+        }
+    }
 }
 
 #[tokio::main(flavor = "multi_thread")]
@@ -285,6 +350,7 @@ async fn main() -> Result<()> {
         settings_tabs,
         filter_builder,
         sessions_view,
+        importer_switch,
         page_errors,
     ) = match &result {
         Ok(o) => {
@@ -297,6 +363,7 @@ async fn main() -> Result<()> {
                 && o.settings_tabs.ok
                 && o.filter_builder.ok
                 && o.sessions_view.ok
+                && o.importer_switch.ok
                 && captured_page_errors.is_empty();
             let reason = if !o.boot_log_found {
                 Some(format!("boot log {BOOT_LOG_NEEDLE:?} was not observed"))
@@ -317,6 +384,8 @@ async fn main() -> Result<()> {
                 o.filter_builder.reason.clone()
             } else if !o.sessions_view.ok {
                 o.sessions_view.reason.clone()
+            } else if !o.importer_switch.ok {
+                o.importer_switch.reason.clone()
             } else if !captured_page_errors.is_empty() {
                 Some(format!(
                     "browser emitted {} console error(s) or unhandled exception(s)",
@@ -337,6 +406,7 @@ async fn main() -> Result<()> {
                 Some(o.settings_tabs.clone()),
                 Some(o.filter_builder.clone()),
                 Some(o.sessions_view.clone()),
+                Some(o.importer_switch.clone()),
                 captured_page_errors.clone(),
             )
         }
@@ -370,6 +440,7 @@ async fn main() -> Result<()> {
         settings_tabs,
         filter_builder,
         sessions_view,
+        importer_switch,
         page_errors,
         console_logs: tail(&logs, 50),
     };
@@ -398,6 +469,7 @@ struct RunOk {
     settings_tabs: SettingsTabsCheck,
     filter_builder: FilterBuilderCheck,
     sessions_view: SessionsViewCheck,
+    importer_switch: ImporterSwitchCheck,
 }
 
 fn chromium_args() -> Vec<&'static str> {
@@ -607,6 +679,13 @@ async fn drive_page(
             recent
         );
     }
+
+    // ---- 3b. importer-switch fixture setup runs in parallel ---------------
+    // Mirroring the app dist (raw HTTP) and booting the second fixture
+    // graph-api overlaps the main-page checks; the browser scenario itself
+    // runs sequentially at the end.
+    let switch_origin = args.base_url.trim_end_matches('/').to_string();
+    let switch_setup = tokio::spawn(async move { setup_switch_fixture(&switch_origin).await });
 
     // ---- 4. graph header actions are present, visible, and safe ----------
     // Wait for graph data to finish loading: the boot log is emitted before
@@ -1062,7 +1141,7 @@ async fn drive_page(
         let controlsHitTest = maximized && tabs.length === expected.length;
         let importerCatalog = false;
         let importerReadOnly = false;
-        let importerNoMutationControls = false;
+        let importerSwitchControlsAbsent = false;
 
         for (const [label, slug, selector] of expected) {
           const tab = tabs.find((candidate) => (candidate.textContent || '').trim() === label);
@@ -1137,11 +1216,16 @@ async fn drive_page(
               /same namespace/i.test(lavenderDescription) &&
               /<release>-okf/.test(lavenderDescription) &&
               /UID\/GID 10001/i.test(lavenderDescription);
-            const runtimeControls = [...content.querySelectorAll('button, input, select, textarea')]
-              .filter((control) => /apply|run|activate|switch/i.test(
-                `${control.textContent || ''} ${control.getAttribute('aria-label') || ''}`
-              ));
-            importerNoMutationControls = runtimeControls.length === 0;
+            // The main fixture server runs without a switch group, so the
+            // runtime selector must be absent and today's read-only rendering
+            // preserved exactly. The enabled/authorized selector contract is
+            // exercised by the importer_switch scenario against a second
+            // fixture server.
+            const switchState = content.querySelector('.importers-view')
+              ?.getAttribute('data-runtime-switch');
+            const switchControls = content.querySelectorAll('.importer-switch-btn');
+            importerSwitchControlsAbsent = switchState === 'disabled' &&
+              switchControls.length === 0;
           }
 
           const selectedTabs = tabs.filter(
@@ -1222,7 +1306,7 @@ async fn drive_page(
         if (contentPanels.length !== expected.length) failures.push('a Settings tab has no delegated content');
         if (!importerCatalog) failures.push('deployment-managed importer catalog is incomplete');
         if (!importerReadOnly) failures.push('Lavender OKF read-only PVC contract is incomplete');
-        if (!importerNoMutationControls) failures.push('Importer catalog exposes a runtime mutation control');
+        if (!importerSwitchControlsAbsent) failures.push('Importer catalog exposes runtime switch controls while switching is disabled');
         if (!legacyPanelsAbsent) failures.push('legacy Layout, Style, or Camera panel still exists');
         if (!graphRestored) failures.push('Graph renderer did not remount after Settings restore');
         return {
@@ -1234,7 +1318,7 @@ async fn drive_page(
           controls_hit_test: Boolean(controlsHitTest),
           importer_catalog: Boolean(importerCatalog),
           importer_read_only: Boolean(importerReadOnly),
-          importer_no_mutation_controls: Boolean(importerNoMutationControls),
+          importer_switch_controls_absent: Boolean(importerSwitchControlsAbsent),
           legacy_panels_absent: legacyPanelsAbsent,
           graph_restored: graphRestored,
           reason: failures.length ? failures.join('; ') : null,
@@ -2042,6 +2126,20 @@ async fn drive_page(
         });
     }
 
+    // ---- 12. runtime per-viewer importer switching -------------------------
+    // The second fixture server was set up in parallel (3b). The authorized
+    // page's console/exception streams feed the shared error gate; the
+    // unauthorized page deliberately triggers a 403 flow, so its console is
+    // not gated (the wire-level 403 is asserted directly over raw HTTP).
+    let importer_switch = match switch_setup.await {
+        Ok(Ok(Some(fixture))) => {
+            run_switch_scenario(browser, fixture, console_logs.clone()).await
+        }
+        Ok(Ok(None)) => ImporterSwitchCheck::skipped(),
+        Ok(Err(error)) => ImporterSwitchCheck::failed(format!("switch fixture setup: {error:#}")),
+        Err(error) => ImporterSwitchCheck::failed(format!("switch fixture task: {error}")),
+    };
+
     // Tear down pumps (browser close in caller will end them anyway).
     console_pump.abort();
     runtime_pump.abort();
@@ -2060,6 +2158,7 @@ async fn drive_page(
         settings_tabs,
         filter_builder,
         sessions_view,
+        importer_switch,
     })
 }
 
@@ -2138,6 +2237,825 @@ fn parse_url(url: &str) -> Result<(String, u16, String)> {
         None => (hostport.to_string(), 80),
     };
     Ok((host, port, path.to_string()))
+}
+
+// --- runtime importer switching fixture ---------------------------------------
+
+/// Group the second fixture server requires for runtime switching. The
+/// authorized page carries it via `Network.setExtraHTTPHeaders`, simulating
+/// the authenticating proxy's group injection.
+const SWITCH_GROUP: &str = "test-admins";
+const SWITCH_DEFAULT_ID: &str = "default-obsidian";
+const SWITCH_ALT_ID: &str = "alt-obsidian";
+const SWITCH_DEFAULT_NODE: &str = "Switch Default Fixture";
+const SWITCH_ALT_NODE: &str = "Switch Alt Fixture";
+
+/// The second fixture server: a two-source Obsidian catalog (default vault +
+/// tiny alternate vault) with `JUMP_CANNON_IMPORTER_SWITCH_GROUP` set, serving
+/// the same app dist as `--base-url` from a local mirror.
+struct SwitchFixture {
+    base_url: String,
+    server: tokio::process::Child,
+    work_dir: PathBuf,
+}
+
+/// Locate the `graph-api` binary: explicit `GRAPH_API_BIN` first, then PATH
+/// (the `test-browser-rust` wrapper puts it there via `runtimeInputs`).
+fn find_graph_api_bin() -> Option<PathBuf> {
+    if let Some(explicit) = std::env::var_os("GRAPH_API_BIN") {
+        let path = PathBuf::from(explicit);
+        if path.is_file() {
+            return Some(path);
+        }
+    }
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path)
+        .map(|dir| dir.join("graph-api"))
+        .find(|candidate| candidate.is_file())
+}
+
+async fn pick_free_port() -> Result<u16> {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    Ok(listener.local_addr()?.port())
+}
+
+/// Raw HTTP GET returning only the status code — the wire-contract half of
+/// the switch scenario (403/200/404) needs no browser.
+async fn raw_get_status(url: &str, headers: &[(&str, &str)]) -> Result<u16> {
+    let (status, _) = raw_get(url, headers).await?;
+    Ok(status)
+}
+
+/// Minimal HTTP/1.1 GET over a closing connection: enough to mirror the app
+/// dist and to assert the switch gate's status codes without pulling an
+/// HTTP client dependency into the harness.
+async fn raw_get(url: &str, headers: &[(&str, &str)]) -> Result<(u16, Vec<u8>)> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let (host, port, path) = parse_url(url)?;
+    let mut stream = tokio::net::TcpStream::connect((host.as_str(), port)).await?;
+    let mut request =
+        format!("GET {path} HTTP/1.1\r\nHost: {host}:{port}\r\nConnection: close\r\n");
+    for (name, value) in headers {
+        request.push_str(&format!("{name}: {value}\r\n"));
+    }
+    request.push_str("\r\n");
+    stream.write_all(request.as_bytes()).await?;
+    let mut buf = Vec::with_capacity(512);
+    tokio::time::timeout(Duration::from_secs(120), stream.read_to_end(&mut buf))
+        .await
+        .map_err(|_| anyhow!("raw GET {url} timed out"))??;
+    let split = buf
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .ok_or_else(|| anyhow!("raw GET {url}: no header terminator"))?;
+    let head = String::from_utf8_lossy(&buf[..split]);
+    let status = head
+        .split_whitespace()
+        .nth(1)
+        .and_then(|token| token.parse::<u16>().ok())
+        .ok_or_else(|| {
+            anyhow!(
+                "no HTTP status in response: {}",
+                head.lines().next().unwrap_or("<empty>")
+            )
+        })?;
+    let body = &buf[split + 4..];
+    let chunked = head
+        .lines()
+        .any(|line| line.eq_ignore_ascii_case("transfer-encoding: chunked"));
+    let body = if chunked {
+        decode_chunked(body).with_context(|| format!("raw GET {url}: chunked body"))?
+    } else {
+        body.to_vec()
+    };
+    Ok((status, body))
+}
+
+fn decode_chunked(mut body: &[u8]) -> Result<Vec<u8>> {
+    let mut out = Vec::new();
+    loop {
+        let pos = body
+            .windows(2)
+            .position(|w| w == b"\r\n")
+            .ok_or_else(|| anyhow!("missing chunk-size terminator"))?;
+        let size_text = std::str::from_utf8(&body[..pos])?;
+        let size = usize::from_str_radix(
+            size_text.split(';').next().unwrap_or("").trim(),
+            16,
+        )
+        .map_err(|e| anyhow!("bad chunk size {size_text:?}: {e}"))?;
+        body = &body[pos + 2..];
+        if size == 0 {
+            break;
+        }
+        if body.len() < size + 2 {
+            bail!("truncated chunk");
+        }
+        out.extend_from_slice(&body[..size]);
+        body = &body[size + 2..];
+    }
+    Ok(out)
+}
+
+/// Replace `__TOKEN__`-style placeholders in a JS block.
+fn js_with(tokens: &[(&str, &str)], js: &str) -> String {
+    let mut out = js.to_string();
+    for (token, value) in tokens {
+        out = out.replace(token, value);
+    }
+    out
+}
+
+/// Collect asset paths (`*.js` / `*.wasm` / `*.css`) from an HTML or JS text.
+/// Anchored on the extension and walked backward over path characters rather
+/// than paired quotes: a lone apostrophe inside a double-quoted script must
+/// not shift quote pairing and swallow a modulepreload href.
+fn discover_assets(text: &str, urls: &mut std::collections::BTreeSet<String>) {
+    let is_path_char = |b: u8| {
+        b.is_ascii_alphanumeric() || matches!(b, b'/' | b'.' | b'-' | b'_')
+    };
+    let bytes = text.as_bytes();
+    for extension in [".js", ".wasm", ".css"] {
+        let mut start = 0;
+        while let Some(found) = text[start..].find(extension) {
+            let end = start + found + extension.len();
+            start = end;
+            // The extension must terminate the path (next char is a quote or
+            // other non-path character).
+            if bytes.get(end).is_some_and(|b| is_path_char(*b)) {
+                continue;
+            }
+            let mut begin = end - extension.len();
+            while begin > 0 && is_path_char(bytes[begin - 1]) {
+                begin -= 1;
+            }
+            let candidate = &text[begin..end];
+            if candidate.starts_with("//")
+                || candidate.starts_with("data:")
+                || !candidate.bytes().any(|b| b.is_ascii_alphanumeric())
+            {
+                continue;
+            }
+            let candidate = candidate.strip_prefix("./").unwrap_or(candidate);
+            let normalized = if let Some(stripped) = candidate.strip_prefix('/') {
+                format!("/{stripped}")
+            } else {
+                format!("/{candidate}")
+            };
+            // Keep only plausible single-file asset paths; a walk that
+            // crossed a scheme separator or traversal component is noise.
+            if normalized.contains("::") || normalized.split('/').any(|part| part == "..") {
+                continue;
+            }
+            urls.insert(normalized);
+        }
+    }
+}
+
+/// Mirror the app dist from the running server into `dest` over raw HTTP so
+/// the second fixture graph-api can serve the identical build via
+/// `--assets-dir`. The dist uses stable file names (`filehash = false` in
+/// app/Trunk.toml); snippet files are discovered from index.html and the JS
+/// glue rather than hardcoded. Raw HTTP keeps 404s off any console listener.
+async fn mirror_dist(origin: &str, dest: &Path) -> Result<usize> {
+    let mut urls = std::collections::BTreeSet::from([
+        "/app.css".to_string(),
+        "/jump-cannon-ui.js".to_string(),
+        "/jump-cannon-ui_bg.wasm".to_string(),
+        "/tvix-worker.js".to_string(),
+        "/tvix-worker_bg.wasm".to_string(),
+    ]);
+    let (status, html) = raw_get(&format!("{origin}/"), &[]).await?;
+    if status != 200 {
+        bail!("mirror discovery: GET {origin}/ -> HTTP {status}");
+    }
+    discover_assets(&String::from_utf8_lossy(&html), &mut urls);
+    for glue in ["/jump-cannon-ui.js", "/tvix-worker.js"] {
+        let (status, js) = raw_get(&format!("{origin}{glue}"), &[]).await?;
+        if status == 200 {
+            discover_assets(&String::from_utf8_lossy(&js), &mut urls);
+        }
+    }
+    urls.insert("/".to_string()); // index.html itself
+
+    let mut mirrored = 0_usize;
+    for path in urls {
+        let relative = path.trim_start_matches('/');
+        let relative = if relative.is_empty() {
+            "index.html"
+        } else {
+            relative
+        };
+        let target = dest.join(relative);
+        if let Some(parent) = target.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+        let (status, bytes) = raw_get(&format!("{origin}{path}"), &[]).await?;
+        // Discovery over minified glue yields occasional false positives
+        // (string-concatenated fragments); skip anything not served rather
+        // than failing the mirror. graph-api's static fallback answers
+        // unknown paths with index.html, which mirrors as a harmless copy.
+        if status != 200 {
+            continue;
+        }
+        tokio::fs::write(&target, bytes).await?;
+        mirrored += 1;
+    }
+    Ok(mirrored)
+}
+
+/// Build the second fixture server: tempdir vaults, mirrored dist, and a
+/// spawned graph-api with the switch group configured. Returns `None` when
+/// no graph-api binary is available (scenario skipped).
+async fn setup_switch_fixture(origin: &str) -> Result<Option<SwitchFixture>> {
+    let Some(bin) = find_graph_api_bin() else {
+        return Ok(None);
+    };
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let work_dir = std::env::temp_dir().join(format!("jump-cannon-switch-{}-{unique}", std::process::id()));
+    let assets = work_dir.join("assets");
+    let default_vault = work_dir.join("default-vault");
+    let alt_vault = work_dir.join("alt-vault");
+    tokio::fs::create_dir_all(&assets).await?;
+    tokio::fs::create_dir_all(&default_vault).await?;
+    tokio::fs::create_dir_all(&alt_vault).await?;
+    tokio::fs::write(
+        default_vault.join(format!("{SWITCH_DEFAULT_NODE}.md")),
+        "---\ntitle: Switch Default Fixture\ntags: [browser-switch]\n---\n\nSWITCH_DEFAULT_SENTINEL\n",
+    )
+    .await?;
+    tokio::fs::write(
+        alt_vault.join(format!("{SWITCH_ALT_NODE}.md")),
+        "---\ntitle: Switch Alt Fixture\ntags: [browser-switch-alt]\n---\n\nSWITCH_ALT_SENTINEL\n",
+    )
+    .await?;
+
+    let mirrored = mirror_dist(origin, &assets).await.context("mirror app dist")?;
+    if mirrored == 0 {
+        bail!("mirrored no assets from {origin}");
+    }
+
+    let alt_path = alt_vault.to_string_lossy().to_string();
+    let catalog = serde_json::json!({
+        "selected": SWITCH_DEFAULT_ID,
+        "sources": {
+            SWITCH_DEFAULT_ID: {
+                "displayName": "Switch default vault",
+                "description": "Deployment default for the runtime-switch browser contract.",
+                "kind": "obsidian"
+            },
+            SWITCH_ALT_ID: {
+                "displayName": "Switch alternate vault",
+                "description": "Runnable alternate for the runtime-switch browser contract.",
+                "kind": "obsidian",
+                "source": {
+                    "volumeName": "switch-alt-vault",
+                    "existingClaim": "switch-alt-vault",
+                    "mountPath": alt_path,
+                    "path": alt_path,
+                    "readOnly": false
+                }
+            }
+        }
+    })
+    .to_string();
+
+    let port = pick_free_port().await?;
+    let server = tokio::process::Command::new(bin)
+        .arg("--vault-root")
+        .arg(&default_vault)
+        .arg("--port")
+        .arg(port.to_string())
+        .arg("--no-browser")
+        .arg("--assets-dir")
+        .arg(&assets)
+        .env("JUMP_CANNON_IMPORTER_CATALOG_JSON", catalog)
+        .env("JUMP_CANNON_IMPORTER_SWITCH_GROUP", SWITCH_GROUP)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .context("spawn second fixture graph-api")?;
+    let base_url = format!("http://127.0.0.1:{port}");
+    probe_server(&format!("{base_url}/"), Duration::from_secs(30)).await?;
+    Ok(Some(SwitchFixture {
+        base_url,
+        server,
+        work_dir,
+    }))
+}
+
+/// Settings > Importers summary: switch posture, policy note, and per-card
+/// radio state. Token-free; shared by the authorized and unauthorized pages.
+const IMPORTERS_VIEW_JS: &str = r#"(async () => {
+    const waitFor = async (predicate, timeoutMs = 30000) => {
+      const deadline = performance.now() + timeoutMs;
+      while (performance.now() < deadline) {
+        const value = predicate();
+        if (value) return value;
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
+      return null;
+    };
+    const panel = await waitFor(() => document.querySelector('section.panel-settings'));
+    if (!panel) return { error: 'settings panel missing' };
+    const tab = [...panel.querySelectorAll('[role="tab"]')]
+      .find((candidate) => (candidate.textContent || '').trim() === 'Importers');
+    if (!tab) return { error: 'Importers tab missing' };
+    tab.click();
+    const view = await waitFor(() => panel.querySelector('.importers-view[data-runtime-switch]'));
+    if (!view) return { error: 'importers view missing' };
+    return {
+      switch_state: view.getAttribute('data-runtime-switch'),
+      policy: (view.querySelector('.importer-policy')?.textContent || '')
+        .replace(/\s+/g, ' ').trim(),
+      buttons: [...view.querySelectorAll('.importer-switch-btn')].map((button) => ({
+        id: button.getAttribute('data-source-id'),
+        viewing: button.getAttribute('data-viewing') === 'true',
+        disabled: button.disabled,
+      })),
+      reset_button: Boolean(view.querySelector('.importer-switch-reset')),
+    };
+})()"#;
+
+/// Sidebar node ids plus the session-scoped selection. Waits for boot and a
+/// populated Nodes navigator.
+const NODE_IDS_JS: &str = r#"(async () => {
+    const waitFor = async (predicate, timeoutMs = 45000) => {
+      const deadline = performance.now() + timeoutMs;
+      while (performance.now() < deadline) {
+        const value = predicate();
+        if (value) return value;
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
+      return null;
+    };
+    const ids = await waitFor(() => {
+      if (!window.__jc_boot) return null;
+      const rows = [...document.querySelectorAll('[data-testid="node-sidebar"] [data-node-id]')];
+      return rows.length ? rows.map((row) => row.getAttribute('data-node-id')) : null;
+    });
+    return { ids: ids || [], stored: sessionStorage.getItem('jc_source_id') };
+})()"#;
+
+/// Click the alternate source's radio and wait for the graph swap: stored
+/// selection, alternate-only node list, and the `viewing` badge after the
+/// catalog refetch.
+const SWITCH_TO_ALT_JS: &str = r#"(async () => {
+    const waitFor = async (predicate, timeoutMs = 45000) => {
+      const deadline = performance.now() + timeoutMs;
+      while (performance.now() < deadline) {
+        const value = predicate();
+        if (value) return value;
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
+      return null;
+    };
+    const button = await waitFor(() => {
+      const candidate = document.querySelector(
+        '.importer-switch-btn[data-source-id="__ALT_ID__"]'
+      );
+      return candidate && !candidate.disabled ? candidate : null;
+    });
+    if (!button) return { clicked: false, stored: false, swapped: false, badge: false };
+    button.click();
+    const stored = await waitFor(() =>
+      sessionStorage.getItem('jc_source_id') === '__ALT_ID__' ? true : null
+    );
+    const swapped = await waitFor(() => {
+      const ids = [...document.querySelectorAll('[data-testid="node-sidebar"] [data-node-id]')]
+        .map((row) => row.getAttribute('data-node-id'));
+      // Node ids are source-prefixed (`obsidian:obsidian:<path>`).
+      const has = (name) => ids.some((id) => id === name || id.endsWith(':' + name));
+      return has('__ALT_NODE__') && !has('__DEFAULT_NODE__') ? true : null;
+    });
+    const badge = await waitFor(() => document.querySelector(
+      '.importer-card[data-source-id="__ALT_ID__"] .importer-badge.viewing'
+    ));
+    return {
+      clicked: true,
+      stored: Boolean(stored),
+      swapped: Boolean(swapped),
+      badge: Boolean(badge),
+    };
+})()"#;
+
+/// After an in-tab reload the session-scoped selection must persist and the
+/// alternate graph must load again.
+const PERSISTED_ALT_JS: &str = r#"(async () => {
+    const waitFor = async (predicate, timeoutMs = 45000) => {
+      const deadline = performance.now() + timeoutMs;
+      while (performance.now() < deadline) {
+        const value = predicate();
+        if (value) return value;
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
+      return null;
+    };
+    const persisted = await waitFor(() => {
+      if (!window.__jc_boot) return null;
+      if (sessionStorage.getItem('jc_source_id') !== '__ALT_ID__') return null;
+      const ids = [...document.querySelectorAll('[data-testid="node-sidebar"] [data-node-id]')]
+        .map((row) => row.getAttribute('data-node-id'));
+      return ids.some((id) => id === '__ALT_NODE__' || id.endsWith(':__ALT_NODE__'))
+        ? true
+        : null;
+    });
+    return { persisted: Boolean(persisted) };
+})()"#;
+
+/// Switch back to the deployment default: selection cleared, default nodes.
+const SWITCH_BACK_JS: &str = r#"(async () => {
+    const waitFor = async (predicate, timeoutMs = 45000) => {
+      const deadline = performance.now() + timeoutMs;
+      while (performance.now() < deadline) {
+        const value = predicate();
+        if (value) return value;
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
+      return null;
+    };
+    const panel = await waitFor(() => document.querySelector('section.panel-settings'));
+    const tab = panel && [...panel.querySelectorAll('[role="tab"]')]
+      .find((candidate) => (candidate.textContent || '').trim() === 'Importers');
+    tab?.click();
+    const button = await waitFor(() => {
+      const candidate = document.querySelector(
+        '.importer-switch-btn[data-source-id="__DEFAULT_ID__"]'
+      );
+      return candidate && !candidate.disabled ? candidate : null;
+    });
+    if (!button) return { clicked: false, cleared: false, restored: false };
+    button.click();
+    const cleared = await waitFor(() =>
+      sessionStorage.getItem('jc_source_id') === null ? true : null
+    );
+    const restored = await waitFor(() => {
+      const ids = [...document.querySelectorAll('[data-testid="node-sidebar"] [data-node-id]')]
+        .map((row) => row.getAttribute('data-node-id'));
+      return ids.some((id) => id === '__DEFAULT_NODE__' || id.endsWith(':__DEFAULT_NODE__'))
+        ? true
+        : null;
+    });
+    return {
+      clicked: true,
+      cleared: Boolean(cleared),
+      restored: Boolean(restored),
+    };
+})()"#;
+
+/// Stale-selection recovery on an unauthorized page: the catalog stays
+/// reachable (it never requires the group), the reset affordance clears the
+/// session selection, and the default graph loads.
+const RESET_STALE_JS: &str = r#"(async () => {
+    const waitFor = async (predicate, timeoutMs = 45000) => {
+      const deadline = performance.now() + timeoutMs;
+      while (performance.now() < deadline) {
+        const value = predicate();
+        if (value) return value;
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
+      return null;
+    };
+    const button = await waitFor(() => document.querySelector('.importer-switch-reset'));
+    if (!button) return { found: false, cleared: false, restored: false };
+    button.click();
+    const cleared = await waitFor(() =>
+      sessionStorage.getItem('jc_source_id') === null ? true : null
+    );
+    const restored = await waitFor(() => {
+      const ids = [...document.querySelectorAll('[data-testid="node-sidebar"] [data-node-id]')]
+        .map((row) => row.getAttribute('data-node-id'));
+      return ids.some((id) => id === '__DEFAULT_NODE__' || id.endsWith(':__DEFAULT_NODE__'))
+        ? true
+        : null;
+    });
+    return {
+      found: true,
+      cleared: Boolean(cleared),
+      restored: Boolean(restored),
+    };
+})()"#;
+
+/// Navigate a fresh page to `url`, optionally injecting the group header the
+/// authenticating proxy would set. Navigation is scheduled (not awaited) for
+/// the same reason as the main page: software WebGPU can hold the page-load
+/// lifecycle pending past the CDP command deadline.
+async fn open_switch_page(
+    browser: &Browser,
+    url: &str,
+    with_group: bool,
+) -> Result<chromiumoxide::Page> {
+    use chromiumoxide::cdp::browser_protocol::network::{
+        Headers, SetExtraHttpHeadersParams,
+    };
+
+    let page = browser.new_page("about:blank").await.context("switch page")?;
+    if with_group {
+        page.execute(SetExtraHttpHeadersParams::new(Headers::new(
+            serde_json::json!({ "x-netbird-groups": SWITCH_GROUP }),
+        )))
+        .await
+        .context("set extra HTTP headers")?;
+    }
+    let target = serde_json::to_string(url)?;
+    page.evaluate(format!(
+        "setTimeout(() => window.location.replace({target}), 0)"
+    ))
+    .await
+    .context("schedule switch page navigation")?;
+    Ok(page)
+}
+
+/// Evaluate with retries: in-tab reloads destroy the JS execution context,
+/// and a racing evaluate fails rather than returning stale state.
+async fn evaluate_retry<T: serde::de::DeserializeOwned>(
+    page: &chromiumoxide::Page,
+    js: &str,
+    attempts: usize,
+) -> Result<T> {
+    let mut last_error = None;
+    for _ in 0..attempts {
+        match page.evaluate(js).await {
+            Ok(value) => return Ok(value.into_value().context("decode evaluation result")?),
+            Err(error) => {
+                last_error = Some(error);
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+        }
+    }
+    Err(anyhow!("evaluate failed after {attempts} attempts: {:?}", last_error))
+}
+
+/// Node ids are source-prefixed (`obsidian:obsidian:<path>`); match a
+/// fixture by exact id or `:<name>` suffix.
+fn node_id_matches(id: &str, name: &str) -> bool {
+    id == name || id.ends_with(&format!(":{name}"))
+}
+
+/// Drive the runtime-switch contract against the second fixture server.
+async fn run_switch_scenario(
+    browser: &Browser,
+    fixture: SwitchFixture,
+    console_logs: Arc<Mutex<Vec<String>>>,
+) -> ImporterSwitchCheck {
+    let mut check = ImporterSwitchCheck {
+        ok: false,
+        skipped: false,
+        wire_forbidden: false,
+        wire_authorized: false,
+        wire_unknown: false,
+        selector_visible: false,
+        switch_swaps_nodes: false,
+        session_persists_reload: false,
+        switch_back_restores_default: false,
+        fresh_tab_default: false,
+        denied_note: false,
+        stale_reset_recovers: false,
+        reason: None,
+    };
+    if let Err(error) = run_switch_scenario_inner(browser, &fixture, &mut check, console_logs).await
+    {
+        check.reason = Some(match check.reason.take() {
+            Some(reason) => format!("{reason}; {error:#}"),
+            None => format!("{error:#}"),
+        });
+    }
+    check.ok = check.reason.is_none()
+        && check.wire_forbidden
+        && check.wire_authorized
+        && check.wire_unknown
+        && check.selector_visible
+        && check.switch_swaps_nodes
+        && check.session_persists_reload
+        && check.switch_back_restores_default
+        && check.fresh_tab_default
+        && check.denied_note
+        && check.stale_reset_recovers;
+    if !check.ok && check.reason.is_none() {
+        check.reason = Some("one or more importer-switch assertions failed".to_string());
+    }
+    // kill_on_drop reaps the fixture server; remove the vault/asset tempdir.
+    drop(fixture.server);
+    let _ = std::fs::remove_dir_all(&fixture.work_dir);
+    check
+}
+
+async fn run_switch_scenario_inner(
+    browser: &Browser,
+    fixture: &SwitchFixture,
+    check: &mut ImporterSwitchCheck,
+    console_logs: Arc<Mutex<Vec<String>>>,
+) -> Result<()> {
+    let base = &fixture.base_url;
+
+    // ---- wire contract (no browser): the group gate and id validation ----
+    let source = ("x-jump-cannon-source", SWITCH_ALT_ID);
+    check.wire_forbidden = raw_get_status(&format!("{base}/graph/ids"), &[source]).await? == 403;
+    check.wire_authorized = raw_get_status(
+        &format!("{base}/graph/ids"),
+        &[source, ("x-netbird-groups", SWITCH_GROUP)],
+    )
+    .await?
+        == 200;
+    check.wire_unknown = raw_get_status(
+        &format!("{base}/graph/ids"),
+        &[
+            ("x-jump-cannon-source", "no-such-source"),
+            ("x-netbird-groups", SWITCH_GROUP),
+        ],
+    )
+    .await?
+        == 404;
+
+    // ---- authorized page: selector, switch, persistence, switch-back ------
+    let page = open_switch_page(browser, base, true).await?;
+    // Feed the authorized page's console into the shared error gate: the
+    // happy path must stay clean.
+    let mut page_logs = page
+        .event_listener::<chromiumoxide::cdp::browser_protocol::log::EventEntryAdded>()
+        .await
+        .context("listen switch page log entries")?;
+    let logs_a = console_logs.clone();
+    let page_log_pump = tokio::spawn(async move {
+        while let Some(ev) = page_logs.next().await {
+            let line = format!("[{}] {}", ev.entry.level.as_ref(), ev.entry.text);
+            logs_a.lock().await.push(line);
+        }
+    });
+    let mut page_exceptions = page
+        .event_listener::<chromiumoxide::cdp::js_protocol::runtime::EventExceptionThrown>()
+        .await
+        .context("listen switch page exceptions")?;
+    let logs_b = console_logs;
+    let page_exception_pump = tokio::spawn(async move {
+        while let Some(ev) = page_exceptions.next().await {
+            let details = &ev.exception_details;
+            let description = details
+                .exception
+                .as_ref()
+                .and_then(|exception| exception.description.clone())
+                .unwrap_or_default();
+            let line = if description.is_empty() {
+                format!("[exception] {}", details.text)
+            } else {
+                format!("[exception] {}: {}", details.text, description)
+            };
+            logs_b.lock().await.push(line);
+        }
+    });
+
+    let view: serde_json::Value = evaluate_retry(&page, IMPORTERS_VIEW_JS, 5).await?;
+    let buttons = view
+        .get("buttons")
+        .and_then(|b| b.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let button_for = |id: &str| {
+        buttons.iter().find(|b| b.get("id").and_then(|v| v.as_str()) == Some(id))
+    };
+    check.selector_visible = view.get("switch_state").and_then(|v| v.as_str()) == Some("enabled")
+        && button_for(SWITCH_ALT_ID)
+            .is_some_and(|b| b.get("disabled").and_then(|v| v.as_bool()) == Some(false))
+        && button_for(SWITCH_DEFAULT_ID)
+            .is_some_and(|b| b.get("viewing").and_then(|v| v.as_bool()) == Some(true));
+
+    let initial: serde_json::Value = evaluate_retry(&page, NODE_IDS_JS, 5).await?;
+    let initial_ids = initial
+        .get("ids")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let initial_default = initial_ids
+        .iter()
+        .any(|id| id.as_str().is_some_and(|id| node_id_matches(id, SWITCH_DEFAULT_NODE)));
+
+    let switched: serde_json::Value = evaluate_retry(
+        &page,
+        &js_with(
+            &[
+                ("__ALT_ID__", SWITCH_ALT_ID),
+                ("__ALT_NODE__", SWITCH_ALT_NODE),
+                ("__DEFAULT_NODE__", SWITCH_DEFAULT_NODE),
+            ],
+            SWITCH_TO_ALT_JS,
+        ),
+        5,
+    )
+    .await?;
+    check.switch_swaps_nodes = initial_default
+        && switched.get("clicked").and_then(|v| v.as_bool()) == Some(true)
+        && switched.get("stored").and_then(|v| v.as_bool()) == Some(true)
+        && switched.get("swapped").and_then(|v| v.as_bool()) == Some(true)
+        && switched.get("badge").and_then(|v| v.as_bool()) == Some(true);
+
+    // In-tab reload: the session selection survives and re-loads the
+    // alternate graph.
+    let _ = page.evaluate("location.reload()").await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let persisted: serde_json::Value = evaluate_retry(
+        &page,
+        &js_with(
+            &[
+                ("__ALT_ID__", SWITCH_ALT_ID),
+                ("__ALT_NODE__", SWITCH_ALT_NODE),
+            ],
+            PERSISTED_ALT_JS,
+        ),
+        10,
+    )
+    .await?;
+    check.session_persists_reload =
+        persisted.get("persisted").and_then(|v| v.as_bool()) == Some(true);
+
+    let switched_back: serde_json::Value = evaluate_retry(
+        &page,
+        &js_with(
+            &[
+                ("__DEFAULT_ID__", SWITCH_DEFAULT_ID),
+                ("__DEFAULT_NODE__", SWITCH_DEFAULT_NODE),
+            ],
+            SWITCH_BACK_JS,
+        ),
+        5,
+    )
+    .await?;
+    check.switch_back_restores_default =
+        switched_back.get("clicked").and_then(|v| v.as_bool()) == Some(true)
+            && switched_back.get("cleared").and_then(|v| v.as_bool()) == Some(true)
+            && switched_back.get("restored").and_then(|v| v.as_bool()) == Some(true);
+
+    page_log_pump.abort();
+    page_exception_pump.abort();
+    let _ = page_log_pump.await;
+    let _ = page_exception_pump.await;
+    let _ = page.close().await;
+
+    // ---- fresh tab, authorized: session storage is per-tab, so the default
+    // view returns even though another tab selected the alternate.
+    let fresh = open_switch_page(browser, base, true).await?;
+    let fresh_state: serde_json::Value = evaluate_retry(&fresh, NODE_IDS_JS, 5).await?;
+    let fresh_ids = fresh_state
+        .get("ids")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    check.fresh_tab_default = fresh_state.get("stored").and_then(|v| v.as_null()).is_some()
+        && fresh_ids
+            .iter()
+            .any(|id| id.as_str().is_some_and(|id| node_id_matches(id, SWITCH_DEFAULT_NODE)));
+    let _ = fresh.close().await;
+
+    // ---- unauthorized page: the group-required note, no selector, and
+    // stale-selection recovery (no group header → no extra console gating;
+    // the page deliberately fetches a 403).
+    let denied = open_switch_page(browser, base, false).await?;
+    let denied_view: serde_json::Value = evaluate_retry(&denied, IMPORTERS_VIEW_JS, 5).await?;
+    let denied_policy = denied_view
+        .get("policy")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let denied_buttons = denied_view
+        .get("buttons")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    check.denied_note = denied_view.get("switch_state").and_then(|v| v.as_str()) == Some("denied")
+        && denied_buttons.is_empty()
+        && denied_policy.contains("Switching requires NetBird group")
+        && denied_policy.contains(SWITCH_GROUP);
+
+    // Plant a stale selection as if the viewer had switched before losing
+    // the group, reload, and recover through the reset affordance.
+    denied
+        .evaluate("sessionStorage.setItem('jc_source_id', 'alt-obsidian'); location.reload()")
+        .await
+        .ok();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let stale_view: serde_json::Value = evaluate_retry(&denied, IMPORTERS_VIEW_JS, 10).await?;
+    let reset_visible = stale_view
+        .get("reset_button")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let reset: serde_json::Value = evaluate_retry(
+        &denied,
+        &js_with(&[("__DEFAULT_NODE__", SWITCH_DEFAULT_NODE)], RESET_STALE_JS),
+        5,
+    )
+    .await?;
+    check.stale_reset_recovers = reset_visible
+        && reset.get("found").and_then(|v| v.as_bool()) == Some(true)
+        && reset.get("cleared").and_then(|v| v.as_bool()) == Some(true)
+        && reset.get("restored").and_then(|v| v.as_bool()) == Some(true);
+    let _ = denied.close().await;
+
+    Ok(())
 }
 
 fn tail(v: &[String], n: usize) -> Vec<String> {

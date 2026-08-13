@@ -265,8 +265,33 @@ fn importer_fact(label: &'static str, field: &'static str, value: &str) -> Eleme
     }
 }
 
-fn importer_card(profile: &api::ImporterProfile) -> Element {
+/// One catalog card. When runtime switching is enabled and the viewer is
+/// authorized, each card carries a radio-style `view` button: runnable
+/// sources (and always the deployment default) are selectable; the currently
+/// viewed source shows a disabled `viewing` button and a badge.
+#[allow(clippy::too_many_arguments)]
+fn importer_card(
+    profile: &api::ImporterProfile,
+    switch_allowed: bool,
+    viewing: Option<&str>,
+    mut on_switch: impl FnMut(Option<String>) + 'static,
+) -> Element {
     let source_id = profile.source_id.as_deref().unwrap_or("—");
+    let is_default = profile.selected;
+    let is_viewing = match viewing {
+        Some(id) => id == profile.id,
+        None => is_default,
+    };
+    let selectable = is_default || profile.runnable;
+    let switch_title = if is_viewing {
+        "currently viewed source".to_string()
+    } else if selectable {
+        format!("view the {} graph in this browser session", profile.id)
+    } else {
+        "graph-api cannot construct this source at runtime (kind needs more than catalog metadata)"
+            .to_string()
+    };
+    let switch_id = profile.id.clone();
     rsx! {
         article {
             key: "{profile.id}",
@@ -275,6 +300,8 @@ fn importer_card(profile: &api::ImporterProfile) -> Element {
             "data-kind": "{profile.kind}",
             "data-selected": if profile.selected { "true" } else { "false" },
             "data-active": if profile.active { "true" } else { "false" },
+            "data-runnable": if profile.runnable { "true" } else { "false" },
+            "data-viewing": if is_viewing { "true" } else { "false" },
             header { class: "importer-card-head",
                 div {
                     h3 { "{profile.display_name}" }
@@ -287,8 +314,27 @@ fn importer_card(profile: &api::ImporterProfile) -> Element {
                     if profile.selected {
                         span { class: "importer-badge selected", "selected" }
                     }
+                    if switch_allowed && is_viewing && !is_default {
+                        span { class: "importer-badge viewing", "viewing" }
+                    }
                     if profile.source.as_ref().is_some_and(|source| source.read_only) {
                         span { class: "importer-badge read-only", "read-only" }
+                    }
+                    if switch_allowed {
+                        button {
+                            class: "importer-switch-btn",
+                            r#type: "button",
+                            role: "radio",
+                            aria_checked: if is_viewing { "true" } else { "false" },
+                            "data-source-id": "{profile.id}",
+                            "data-viewing": if is_viewing { "true" } else { "false" },
+                            disabled: is_viewing || !selectable,
+                            title: "{switch_title}",
+                            onclick: move |_| {
+                                on_switch((!is_default).then(|| switch_id.clone()));
+                            },
+                            if is_viewing { "viewing" } else { "view" }
+                        }
                     }
                 }
             }
@@ -361,18 +407,59 @@ fn importer_card(profile: &api::ImporterProfile) -> Element {
     }
 }
 
-fn importer_catalog(catalog: &api::ImporterCatalog) -> Element {
+fn importer_catalog(
+    catalog: &api::ImporterCatalog,
+    viewing: Option<String>,
+    mut on_switch: impl FnMut(Option<String>) + 'static + Copy,
+) -> Element {
     let selected = catalog.selected.as_deref().unwrap_or("none");
     let active_kind = catalog.active.kind_label();
+    let switch = &catalog.runtime_switch;
+    let switch_state = if !switch.enabled {
+        "disabled"
+    } else if switch.allowed {
+        "enabled"
+    } else {
+        "denied"
+    };
+    let switch_allowed = switch.enabled && switch.allowed;
+    let required_group = switch.required_group.as_deref().unwrap_or("?");
+    // A stale session selection (the viewer lost the required group, or the
+    // source was undeployed) must never strand them: the reset affordance
+    // returns to the deployment default, which never requires authorization.
+    let stale_viewing = switch.enabled && !switch.allowed && viewing.is_some();
     rsx! {
         div {
             class: "importers-view",
             "data-activation": "{catalog.activation}",
+            "data-runtime-switch": "{switch_state}",
             section { class: "importer-policy", role: "note",
                 span { class: "importer-policy-label", "Deployment-managed" }
-                p {
-                    "Configured by Helm. A rollout is required to switch the active importer; "
-                    "this view intentionally has no runtime activation controls."
+                if !switch.enabled {
+                    p {
+                        "Configured by Helm. A rollout is required to switch the active importer; "
+                        "this view intentionally has no runtime activation controls."
+                    }
+                } else if switch.allowed {
+                    p {
+                        "Configured by Helm. Runtime viewing is enabled for your group: selecting a "
+                        "source re-loads this browser session's graph as a read-only view; writes, "
+                        "generation, and compute stay on the deployment default."
+                    }
+                } else {
+                    p {
+                        "Configured by Helm. Switching requires NetBird group "
+                        code { "{required_group}" }
+                        "."
+                    }
+                }
+                if stale_viewing {
+                    button {
+                        class: "btn importer-switch-reset",
+                        r#type: "button",
+                        onclick: move |_| on_switch(None),
+                        "return to deployment default"
+                    }
                 }
             }
             section { class: "importer-active-summary",
@@ -388,8 +475,9 @@ fn importer_catalog(catalog: &api::ImporterCatalog) -> Element {
                 }
             }
             div { class: "importer-list", "aria-label": "Configured importer profiles",
+                role: "radiogroup",
                 for profile in &catalog.sources {
-                    {importer_card(profile)}
+                    {importer_card(profile, switch_allowed, viewing.as_deref(), on_switch)}
                 }
             }
         }
@@ -397,9 +485,17 @@ fn importer_catalog(catalog: &api::ImporterCatalog) -> Element {
 }
 
 #[allow(non_snake_case)]
-fn ImportersSettings() -> Element {
+fn ImportersSettings(props: DelegateProps) -> Element {
+    let ctx = props.ctx;
     let mut state = use_signal(|| ImportersViewState::Loading);
+    // The viewed source is session state (sessionStorage), not server state:
+    // the catalog's `selected`/`active` always describe the deployment default.
+    let mut viewing = use_signal(|| api::source_id());
+    let mut generation = use_signal(|| 0_u64);
     use_effect(move || {
+        // Re-run after every switch so the catalog's per-request posture
+        // (`allowed`) and the cards' radio state refresh together.
+        let _ = *generation.read();
         spawn(async move {
             state.set(match api::importers().await {
                 Ok(catalog) => ImportersViewState::Ready(catalog),
@@ -408,12 +504,24 @@ fn ImportersSettings() -> Element {
         });
     });
 
+    let on_switch = move |id: Option<String>| {
+        match &id {
+            Some(id) => api::set_source_id(id),
+            None => api::clear_source_id(),
+        }
+        viewing.set(id);
+        generation += 1;
+        spawn(reload_graph(ctx));
+    };
+
     let view = state.read().clone();
     match view {
         ImportersViewState::Loading => rsx! {
             div { class: "importers-status", role: "status", "Loading importer catalog…" }
         },
-        ImportersViewState::Ready(catalog) => importer_catalog(&catalog),
+        ImportersViewState::Ready(catalog) => {
+            importer_catalog(&catalog, viewing.read().clone(), on_switch)
+        }
         ImportersViewState::Failed(error) => rsx! {
             div { class: "importers-status error", role: "alert",
                 "Importer catalog unavailable: {error}"
@@ -486,7 +594,7 @@ pub fn panel(ctx: Ctx) -> Element {
                 tabindex: "0",
                 match active {
                     SettingsTab::Connection => connection_panel(ctx),
-                    SettingsTab::Importers => rsx! { ImportersSettings {} },
+                    SettingsTab::Importers => rsx! { ImportersSettings { ctx } },
                     SettingsTab::Layout => rsx! { LayoutSettings { ctx } },
                     SettingsTab::Appearance => rsx! { AppearanceSettings { ctx } },
                     SettingsTab::Camera => rsx! { CameraSettings { ctx } },
