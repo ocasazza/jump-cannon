@@ -16,11 +16,12 @@ pub mod progress;
 pub mod proto;
 pub mod search_index;
 pub mod server;
+pub mod source_host;
 pub mod state;
 pub mod vault_loader;
 pub mod watcher;
 
-pub use server::{api_router, router};
+pub use server::{api_router, api_router_with_host, router, router_with_host};
 pub use state::AppState;
 pub mod attribute_resolver;
 
