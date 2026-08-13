@@ -28,14 +28,17 @@ choosing the active source; named chart profiles are currently wired for
 Obsidian, Kubernetes, and OKF, and source kinds with additional required
 inputs are not accepted until the chart owns their complete configuration.
 
-Every configured filesystem source is mounted read-only in the graph-api pod,
-not only the selected one, so dormant claims are available without a rollout.
-When `importers.runtimeSwitchGroup` names a NetBird group, graph-api lets
-viewers whose proxy-injected `x-netbird-groups` header contains that group
-switch the viewed source at runtime from **Settings > Importers** (per browser
-session, read-only graph views; writes, generation, and compute stay on the
-deployment-selected source). An empty `runtimeSwitchGroup` disables runtime
-switching and preserves the rollout-only behavior. See [[Security Model]] for
+When `importers.runtimeSwitchGroup` names a NetBird group, every configured
+filesystem source is also mounted read-only in the graph-api pod (not only the
+selected one) and graph-api lets viewers whose proxy-injected
+`x-netbird-groups` header contains that group switch the viewed source at
+runtime from **Settings > Importers** (per browser session, read-only graph
+views; writes, generation, and compute stay on the deployment-selected
+source). Only set the group once every dormant profile's producer claim
+exists in the release namespace — a mounted claim is a hard pod dependency,
+so a missing claim blocks pod startup and fails the rollout. An empty
+`runtimeSwitchGroup` disables runtime switching, skips the dormant mounts,
+and preserves the rollout-only behavior. See [[Security Model]] for
 the trust boundary.
 
 `graphApi.source: github` selects the docs-importer mode: graph-api polls the

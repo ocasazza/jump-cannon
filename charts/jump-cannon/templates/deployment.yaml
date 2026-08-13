@@ -8,15 +8,21 @@
 {{- $hasSeedFiles := and $importer.allowsSeeds .Values.vault.seed.enabled (gt (len .Values.vault.seed.files) 0) -}}
 {{- $seedsVault := or $hasKnowledge $hasSeedFiles -}}
 {{- $gpuSession := and .Values.graphCompute.enabled .Values.graphCompute.session.enabled -}}
-{{- /* Dormant filesystem sources: every catalog entry with a source block whose
-     volume differs from the selected importer's is also mounted read-only, so
-     runtime per-user source switching can serve it without a rollout. The
-     seed-vault init container stays selected-only. */ -}}
+{{- /* Dormant filesystem sources: when runtime switching is enabled
+     (importers.runtimeSwitchGroup non-empty), every catalog entry with a
+     source block whose volume differs from the selected importer's is also
+     mounted read-only, so runtime per-user source switching can serve it
+     without a rollout. Keep this gated on the switch group: mounting a
+     dormant profile's claim makes it a hard pod dependency, so a profile
+     whose producer claim is not provisioned yet would block every rollout.
+     The seed-vault init container stays selected-only. */ -}}
 {{- $dormantSources := list -}}
+{{- if .Values.importers.runtimeSwitchGroup -}}
 {{- range $id, $profile := .Values.importers.sources -}}
   {{- if and (kindIs "map" $profile) (hasKey $profile "source") (ne $profile.source.volumeName $importer.volumeName) -}}
     {{- $dormantSources = append $dormantSources $profile.source -}}
   {{- end -}}
+{{- end -}}
 {{- end -}}
 apiVersion: apps/v1
 kind: Deployment
