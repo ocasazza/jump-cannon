@@ -22,10 +22,21 @@ ConfigMap before publishing the chart.
 The importer catalog is deployment policy. Define named instances under
 `importers.sources` and activate one with `importers.selected`; an empty
 selector preserves `graphApi.source` and `kubernetesImporter.enabled`. The
-application displays a sanitized catalog in **Settings > Importers**, but a
-source change requires a Helm rollout. Named chart profiles are currently
-wired for Obsidian, Kubernetes, and OKF; source kinds with additional required
+application displays a sanitized catalog in **Settings > Importers**. The
+rollout-based `importers.selected` flow remains the deployment default for
+choosing the active source; named chart profiles are currently wired for
+Obsidian, Kubernetes, and OKF, and source kinds with additional required
 inputs are not accepted until the chart owns their complete configuration.
+
+Every configured filesystem source is mounted read-only in the graph-api pod,
+not only the selected one, so dormant claims are available without a rollout.
+When `importers.runtimeSwitchGroup` names a NetBird group, graph-api lets
+viewers whose proxy-injected `x-netbird-groups` header contains that group
+switch the viewed source at runtime from **Settings > Importers** (per browser
+session, read-only graph views; writes, generation, and compute stay on the
+deployment-selected source). An empty `runtimeSwitchGroup` disables runtime
+switching and preserves the rollout-only behavior. See [[Security Model]] for
+the trust boundary.
 
 `graphApi.source: github` selects the docs-importer mode: graph-api polls the
 GitHub repository tarball named by `githubImporter.repo`/`ref`/`path` and

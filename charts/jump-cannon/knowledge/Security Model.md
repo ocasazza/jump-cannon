@@ -20,10 +20,20 @@ environment-owned through [[Service Access]]. GPU work is admitted through
 [[Kueue Scheduling]]. Review these boundaries in [[Helm Deployment]].
 
 `GET /importers` and **Settings > Importers** expose only sanitized deployment
-metadata. They never expose credentials or add an unauthenticated Apply, Run,
-or Activate path. Filesystem source instances declare the exact claim, mount,
-input path, and read-only state. The Lavender OKF profile may read only the
-shared OKF repository claim; it must never mount Lavender lake or state data.
+metadata. They never expose credentials. Filesystem source instances declare
+the exact claim, mount, input path, and read-only state. The Lavender OKF
+profile may read only the shared OKF repository claim; it must never mount
+Lavender lake or state data.
+
+When `importers.runtimeSwitchGroup` is set, a viewer may select any runnable
+catalog source at runtime from **Settings > Importers** instead of waiting for
+a Helm rollout. graph-api gates the switch on the proxy-injected
+`x-netbird-groups` header containing the configured group, and every
+configured filesystem source is already mounted read-only in the pod. Writes,
+generation, and GPU compute remain bound to the deployment-selected source.
+Known limitation: the direct L3 NetworkResource route bypasses the proxy, so
+the group header is forgeable by any NetBird client on that route — the gate
+deters casual access, not a determined insider.
 
 The [[Session Manager]] adds an identity boundary: an authenticating gateway
 injects the `x-user` header (name configurable) and the server trusts it —

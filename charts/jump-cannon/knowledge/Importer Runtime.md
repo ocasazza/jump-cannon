@@ -48,8 +48,10 @@ contract for the active source. See [[Nodes Search and Documents]] and
 Helm can declare named source instances under `importers.sources` and select
 one with `importers.selected`. graph-api validates the bounded catalog against
 the source that actually started and exposes only its sanitized form through
-`GET /importers`. The read-only Settings tab reports what deployment selected;
-changing the active source remains a Helm rollout rather than a browser effect.
+`GET /importers`. The rollout-based selection remains the deployment default;
+when `importers.runtimeSwitchGroup` is set, viewers in that NetBird group can
+also switch the viewed source per browser session from the Settings tab, with
+writes and compute pinned to the deployment-selected source.
 
 The default markdown loader resolves wikilinks and is currently the only
 importer that advertises readable and writable source content. Kubernetes
