@@ -9,7 +9,9 @@ use graph_api::{
     gpu_session::{GpuSessionConfig, GpuSessionHandle},
     importer_catalog::ImporterCatalog,
     progress::ProgressLog,
-    router, vault_loader, AppState,
+    router_with_host,
+    source_host::{SourceHost, SwitchConfig},
+    vault_loader, AppState,
 };
 
 /// Resolution order: CLI flag > env var (VAULT_ROOT) > .env file > current directory.
@@ -57,10 +59,24 @@ struct Args {
     #[arg(long, env = "JUMP_CANNON_SOURCE", default_value = "obsidian")]
     source: String,
     /// Bounded JSON catalog of deployment-owned importer source instances.
-    /// It is exposed read-only at GET /importers; switching still requires a
-    /// Helm rollout.
+    /// It is exposed read-only at GET /importers. Without
+    /// --importer-switch-group, switching to another source still requires a
+    /// Helm rollout; with it, runnable sources become per-viewer selectable.
     #[arg(long, env = "JUMP_CANNON_IMPORTER_CATALOG_JSON")]
     importer_catalog_json: Option<String>,
+    /// NetBird group allowed to view non-default importer sources at runtime.
+    /// Unset disables runtime switching entirely: the x-jump-cannon-source
+    /// header is ignored and every request serves the deployment default.
+    #[arg(long, env = "JUMP_CANNON_IMPORTER_SWITCH_GROUP")]
+    importer_switch_group: Option<String>,
+    /// Header carrying the caller's comma-separated group memberships,
+    /// injected by the authenticating proxy.
+    #[arg(
+        long,
+        env = "JUMP_CANNON_USER_GROUPS_HEADER",
+        default_value = "x-netbird-groups"
+    )]
+    user_groups_header: String,
     /// When --source=tvix, the Nix expression to evaluate. If not provided,
     /// reads from the file at --vault-root (which must be a .nix file).
     #[arg(long, env = "JUMP_CANNON_TVIX_EXPR")]
@@ -210,10 +226,24 @@ async fn main() -> anyhow::Result<()> {    let _ = dotenvy::dotenv();
         )
     })?;
 
-    let importer_catalog =
-        ImporterCatalog::parse(args.importer_catalog_json.as_deref(), source_kind.clone())
-            .map_err(anyhow::Error::msg)
-            .context("invalid deployment importer catalog")?;
+    // Runtime per-viewer source switching. Fail-closed: an unset (or blank)
+    // group disables the feature and the selection header is ignored.
+    let switch = SwitchConfig::new(args.importer_switch_group.clone(), &args.user_groups_header);
+    if switch.enabled() {
+        tracing::info!(
+            group = args.importer_switch_group.as_deref().unwrap_or_default(),
+            groups_header = %args.user_groups_header,
+            "runtime importer switching enabled"
+        );
+    }
+
+    let importer_catalog = ImporterCatalog::parse_with_runtime_switch(
+        args.importer_catalog_json.as_deref(),
+        source_kind.clone(),
+        switch.enabled(),
+    )
+    .map_err(anyhow::Error::msg)
+    .context("invalid deployment importer catalog")?;
 
     let importer: Box<dyn Importer> = match source_kind {
         data_loader::SourceKind::Obsidian => {
@@ -434,7 +464,7 @@ async fn main() -> anyhow::Result<()> {    let _ = dotenvy::dotenv();
         tracing::info!("filesystem watcher disabled (--no-watch)");
     }
 
-    let app = router(state);
+    let app = router_with_host(SourceHost::new(state, switch));
 
     let host: std::net::IpAddr = args.host.parse().unwrap_or_else(|_| {
         tracing::warn!(host = %args.host, "invalid --host, defaulting to 127.0.0.1");

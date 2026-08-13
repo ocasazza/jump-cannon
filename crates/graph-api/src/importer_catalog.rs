@@ -1,9 +1,13 @@
 //! Deployment-owned importer source-instance catalog.
 //!
-//! The catalog is descriptive, not a runtime control plane. Helm selects one
-//! source before `graph-api` starts, and the unauthenticated API exposes only
-//! the bounded, non-secret fields needed to explain that deployment. Switching
-//! sources requires a rollout; there are intentionally no mutation methods.
+//! Helm still selects the deployment-default source before `graph-api` starts,
+//! and the unauthenticated API exposes only the bounded, non-secret fields
+//! needed to explain that deployment; there are intentionally no mutation
+//! methods. When runtime switching is enabled (`JUMP_CANNON_IMPORTER_SWITCH_GROUP`),
+//! the catalog additionally drives per-viewer source selection: entries marked
+//! `runnable` (filesystem kinds constructible from catalog metadata alone) may
+//! be served to authorized callers as read-only graph views built lazily by the
+//! [`crate::source_host::SourceHost`]. Writes and compute stay default-only.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -95,6 +99,20 @@ pub struct ImporterSourceDefinition {
     pub producer: Option<ImporterProducerContract>,
 }
 
+impl ImporterSourceDefinition {
+    /// Whether graph-api can construct this source at runtime from catalog
+    /// metadata alone. v1: the filesystem kinds (Obsidian, OKF) with a
+    /// filesystem source contract — everything else needs configuration the
+    /// catalog deliberately does not carry (GitHub repo/token, Kubernetes
+    /// allowlists, Pest packages, Nix expressions).
+    pub fn runnable(&self) -> bool {
+        matches!(
+            self.kind,
+            CatalogSourceKind::Obsidian | CatalogSourceKind::Okf
+        ) && self.source.is_some()
+    }
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct RawImporterCatalog {
@@ -127,6 +145,18 @@ impl ImporterCatalog {
     /// process actually activated. Missing or whitespace-only JSON means an
     /// empty catalog while still recording the active kind.
     pub fn parse(raw: Option<&str>, active_kind: SourceKind) -> Result<Self, String> {
+        Self::parse_with_runtime_switch(raw, active_kind, false)
+    }
+
+    /// [`Self::parse`] with the runtime-switching posture made explicit. When
+    /// `runtime_switch` is enabled the selected source's kind no longer has to
+    /// match the process's active kind: per-viewer selection can serve any
+    /// runnable catalog entry, so the deployment default is just one of them.
+    pub fn parse_with_runtime_switch(
+        raw: Option<&str>,
+        active_kind: SourceKind,
+        runtime_switch: bool,
+    ) -> Result<Self, String> {
         let active_kind = CatalogSourceKind::from(active_kind);
         let Some(raw) = raw else {
             return Ok(Self {
@@ -174,7 +204,7 @@ impl ImporterCatalog {
             let definition = sources.get(selected).ok_or_else(|| {
                 format!("selected importer source {selected:?} does not exist in sources")
             })?;
-            if definition.kind != active_kind {
+            if !runtime_switch && definition.kind != active_kind {
                 return Err(format!(
                     "selected importer source {selected:?} has kind {:?}, but graph-api activated {:?}",
                     definition.kind, active_kind
@@ -190,9 +220,30 @@ impl ImporterCatalog {
         })
     }
 
+    /// The deployment-default source id, when the catalog declares one.
+    pub fn selected(&self) -> Option<&str> {
+        self.selected.as_deref()
+    }
+
+    /// Look up one named source definition. Used by the runtime source host
+    /// to lazily construct alternate sources.
+    pub fn source(&self, id: &str) -> Option<&ImporterSourceDefinition> {
+        self.sources
+            .iter()
+            .find(|(source_id, _)| source_id == id)
+            .map(|(_, definition)| definition)
+    }
+
     /// Build the sanitized API representation for the currently published
     /// graph snapshot. Importer capabilities and their scopes are omitted.
-    pub fn response(&self, importer: &SnapshotSource) -> ImporterCatalogResponse {
+    /// `runtime_switch` is computed per request by the caller: `enabled` and
+    /// `required_group` are process config, `allowed` reflects the calling
+    /// viewer's group membership.
+    pub fn response(
+        &self,
+        importer: &SnapshotSource,
+        runtime_switch: &RuntimeSwitchStatus,
+    ) -> ImporterCatalogResponse {
         let sources = self
             .sources
             .iter()
@@ -208,6 +259,7 @@ impl ImporterCatalog {
                         .filesystem_rescan_interval_seconds,
                     selected,
                     active: selected && self.active_kind == Some(definition.kind),
+                    runnable: definition.runnable(),
                     source: definition.source.clone(),
                     producer: definition.producer.clone(),
                 }
@@ -225,6 +277,7 @@ impl ImporterCatalog {
                     version: importer.version.clone(),
                 },
             },
+            runtime_switch: runtime_switch.clone(),
             sources,
         }
     }
@@ -237,7 +290,30 @@ pub struct ImporterCatalogResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub selected: Option<String>,
     pub active: ActiveImporter,
+    pub runtime_switch: RuntimeSwitchStatus,
     pub sources: Vec<ImporterCatalogItem>,
+}
+
+/// Per-request runtime switching posture surfaced at `GET /importers`.
+/// `required_group` serializes as `null` when switching is disabled; the UI
+/// shows it in the "requires group X" affordance when `allowed` is false.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RuntimeSwitchStatus {
+    pub enabled: bool,
+    pub allowed: bool,
+    pub required_group: Option<String>,
+}
+
+impl RuntimeSwitchStatus {
+    /// Switching disabled: every request is served the deployment default.
+    pub fn disabled() -> Self {
+        Self {
+            enabled: false,
+            allowed: false,
+            required_group: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -269,6 +345,10 @@ pub struct ImporterCatalogItem {
     pub filesystem_rescan_interval_seconds: Option<u64>,
     pub selected: bool,
     pub active: bool,
+    /// True when graph-api can construct this source at runtime (see
+    /// [`ImporterSourceDefinition::runnable`]). The UI disables selection
+    /// for non-runnable sources.
+    pub runnable: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source: Option<ImporterFilesystemSource>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -489,19 +569,59 @@ mod tests {
     #[test]
     fn accepts_read_only_lavender_okf_contract_and_sorts_sources() {
         let catalog = ImporterCatalog::parse(Some(LAVENDER), SourceKind::Okf).unwrap();
-        let response = catalog.response(&SnapshotSource::new("okf", "OKF", "0.2"));
+        let response = catalog.response(
+            &SnapshotSource::new("okf", "OKF", "0.2"),
+            &RuntimeSwitchStatus::disabled(),
+        );
 
         assert_eq!(response.activation, "helm_rollout");
         assert_eq!(response.selected.as_deref(), Some("lavender-ingest-okf"));
         assert_eq!(response.active.kind, Some(CatalogSourceKind::Okf));
+        assert_eq!(response.runtime_switch, RuntimeSwitchStatus::disabled());
         assert_eq!(response.sources[0].id, "lavender-ingest-okf");
         assert!(response.sources[0].selected);
         assert!(response.sources[0].active);
+        assert!(response.sources[0].runnable);
         assert_eq!(response.sources[1].id, "z-last");
+        // No filesystem contract: not constructible at runtime.
+        assert!(!response.sources[1].runnable);
         assert_eq!(
             response.sources[0].source.as_ref().unwrap().path,
             "/var/lib/lavender/okf-repository/okf"
         );
+    }
+
+    #[test]
+    fn runtime_switch_relaxes_selected_kind_match() {
+        // Strict parse (switching disabled) keeps the historical rejection.
+        assert!(ImporterCatalog::parse(Some(LAVENDER), SourceKind::Obsidian)
+            .unwrap_err()
+            .contains("activated Obsidian"));
+
+        // With runtime switching enabled the deployment default is just one
+        // runnable entry among several, so a kind mismatch is tolerated.
+        let catalog =
+            ImporterCatalog::parse_with_runtime_switch(Some(LAVENDER), SourceKind::Obsidian, true)
+                .unwrap();
+        assert_eq!(catalog.selected(), Some("lavender-ingest-okf"));
+        assert!(catalog
+            .source("lavender-ingest-okf")
+            .expect("selected source lookup")
+            .runnable());
+        assert!(catalog.source("missing").is_none());
+
+        // The selected source must still exist, even when switching.
+        let missing = LAVENDER.replace(
+            "\"selected\": \"lavender-ingest-okf\"",
+            "\"selected\": \"missing\"",
+        );
+        assert!(ImporterCatalog::parse_with_runtime_switch(
+            Some(&missing),
+            SourceKind::Obsidian,
+            true
+        )
+        .unwrap_err()
+        .contains("does not exist"));
     }
 
     #[test]

@@ -19,6 +19,7 @@ use prost::Message as ProstMessage;
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast::error::RecvError;
 
+use crate::source_host::{DefaultSource, SourceHost, SourceSelection};
 use crate::{attribute_resolver, proto, state::AppState};
 use data_loader::{Capability, Effect, HostedImporter, Transport};
 use graph_layouts::geometric::LensConfig;
@@ -47,8 +48,10 @@ fn insert_graph_revision(headers: &mut HeaderMap, revision: u64) {
 
 /// Every API route EXCEPT the frontend asset routes (`/`, `/assets/*path`,
 /// and the static fallback), without state or layers applied. Shared by
-/// [`api_router`] and [`router`].
-fn api_routes() -> Router<AppState> {
+/// [`api_router`] and [`router`]. Read handlers take [`SourceSelection`] and
+/// serve the caller's selected source; write/compute handlers take
+/// [`DefaultSource`] and reject non-default selections with 400.
+fn api_routes() -> Router<SourceHost> {
     Router::new()
         // App-state config presets (the instances-page import/export feature):
         // `/configs` lists shipped presets; `/configs/:name` returns one as YAML.
@@ -98,16 +101,28 @@ fn api_routes() -> Router<AppState> {
 /// `/assets/*path`, the fallback, and the `/configs*` presets — either are
 /// absent here or already gate on `assets_dir.is_some()`).
 pub fn api_router(state: AppState) -> Router {
+    api_router_with_host(SourceHost::default_only(state))
+}
+
+/// [`api_router`] with an explicit [`SourceHost`]: per-viewer source selection
+/// is honored according to the host's switch config.
+pub fn api_router_with_host(host: SourceHost) -> Router {
     api_routes()
         // Permissive CORS: same stance as `router` — see below.
         .layer(tower_http::cors::CorsLayer::permissive())
-        .with_state(state)
+        .with_state(host)
 }
 
 /// The standalone server router: the full API plus the frontend asset
 /// routes (`/`, `/assets/*path`) and the static fallback. Behavior is
 /// unchanged from before the `api_router` split.
 pub fn router(state: AppState) -> Router {
+    router_with_host(SourceHost::default_only(state))
+}
+
+/// [`router`] with an explicit [`SourceHost`]: per-viewer source selection
+/// is honored according to the host's switch config.
+pub fn router_with_host(host: SourceHost) -> Router {
     api_routes()
         .route("/", get(index))
         .route("/assets/*path", get(asset))
@@ -122,19 +137,26 @@ pub fn router(state: AppState) -> Router {
         // links its hashed wasm/js at the root. Serving unmatched paths from
         // the assets dir lets graph-api host either frontend unchanged.
         .fallback(get(asset_fallback))
-        .with_state(state)
+        .with_state(host)
 }
 
-async fn asset_fallback(State(s): State<AppState>, uri: axum::http::Uri) -> impl IntoResponse {
-    asset_response(&s, uri.path().trim_start_matches('/'))
+async fn asset_fallback(State(host): State<SourceHost>, uri: axum::http::Uri) -> impl IntoResponse {
+    asset_response(host.default_state(), uri.path().trim_start_matches('/'))
 }
 
-/// Return the sanitized deployment source catalog. Activating another source
-/// is a Helm rollout operation; this unauthenticated local API deliberately has
-/// no importer mutation route.
-async fn importers_catalog(State(s): State<AppState>) -> impl IntoResponse {
-    let snapshot = s.snapshot();
-    Json(s.inner.importer_catalog.response(&snapshot.source))
+/// Return the sanitized deployment source catalog. The response always
+/// describes the deployment default (`selected`/`active`); per-viewer
+/// selection never mutates those. The `runtimeSwitch` block is computed per
+/// request from the caller's groups header.
+async fn importers_catalog(
+    State(host): State<SourceHost>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    let snapshot = host.default_state().snapshot();
+    Json(
+        host.catalog()
+            .response(&snapshot.source, &host.switch().status(&headers)),
+    )
 }
 
 // --- Vault write endpoint ---
@@ -230,9 +252,10 @@ fn resolve_vault_path(
 }
 
 async fn vault_page_put(
-    State(s): State<AppState>,
+    selection: DefaultSource,
     Json(req): Json<VaultPagePutReq>,
 ) -> axum::response::Response {
+    let s = selection.0;
     let content_scope = s.inner.vault_root.to_string_lossy();
     let can_write = importer_authorizes(
         &s.inner.importer,
@@ -412,7 +435,10 @@ fn generate_err(msg: impl Into<String>) -> axum::response::Response {
     .into_response()
 }
 
-async fn generate_post(Json(req): Json<GeneratePostReq>) -> axum::response::Response {
+async fn generate_post(
+    _selection: DefaultSource,
+    Json(req): Json<GeneratePostReq>,
+) -> axum::response::Response {
     if req.expr.len() > MAX_GENERATE_EXPR_BYTES {
         return generate_err(format!(
             "expression too large: {} bytes exceeds the {MAX_GENERATE_EXPR_BYTES} byte cap",
@@ -491,7 +517,8 @@ fn extract_frontmatter_block(text: &str) -> String {
 /// (the renderer's WS to *this* server stays connected even when the
 /// downstream gRPC stream is dead, so without this signal a stalled
 /// canvas reads as a frontend bug).
-async fn compute_health(State(s): State<AppState>) -> impl IntoResponse {
+async fn compute_health(selection: DefaultSource) -> impl IntoResponse {
+    let s = selection.0;
     let status = s.inner.compute_broker.status().await;
     axum::Json(status)
 }
@@ -503,7 +530,8 @@ async fn compute_health(State(s): State<AppState>) -> impl IntoResponse {
 /// engines:[] }` (HTTP 200) when the broker is disabled or the worker is
 /// unreachable — same graceful posture as `/compute/health`. So the
 /// renderer's layout picker is engine-location agnostic.
-async fn compute_engines(State(s): State<AppState>) -> impl IntoResponse {
+async fn compute_engines(selection: DefaultSource) -> impl IntoResponse {
+    let s = selection.0;
     let view = s.inner.compute_broker.list_engines().await;
     axum::Json(view)
 }
@@ -573,9 +601,10 @@ fn resolve_remote_selection(
 }
 
 async fn compute_layout_put(
-    State(s): State<AppState>,
+    selection: DefaultSource,
     Json(req): Json<ComputeLayoutPutReq>,
 ) -> impl IntoResponse {
+    let s = selection.0;
     let snap = s.snapshot();
     let graph_revision = snap.revision;
     let current_generation = s.inner.compute_broker.selection_state().await.generation;
@@ -650,7 +679,8 @@ async fn compute_layout_put(
 // converges asynchronously; idempotent). Soft envelope, HTTP 200:
 // `{ "ok": bool, "state": string|null, "error": string|null }`.
 
-async fn compute_session_get(State(s): State<AppState>) -> impl IntoResponse {
+async fn compute_session_get(selection: DefaultSource) -> impl IntoResponse {
+    let s = selection.0;
     match &s.inner.gpu_session {
         Some(session) => {
             let value = serde_json::to_value(session.status().await)
@@ -684,9 +714,10 @@ struct ComputeSessionPutResp {
 }
 
 async fn compute_session_put(
-    State(s): State<AppState>,
+    selection: DefaultSource,
     Json(req): Json<ComputeSessionPutReq>,
 ) -> impl IntoResponse {
+    let s = selection.0;
     let Some(session) = &s.inner.gpu_session else {
         return axum::Json(ComputeSessionPutResp {
             ok: false,
@@ -742,10 +773,11 @@ fn validate_initial_positions(bytes: &[u8], n_nodes: usize) -> Result<(), String
 /// Replace the remote worker's initial positions for the current graph without
 /// mutating the authoritative layout selection generation.
 async fn compute_initial_placement_put(
-    State(s): State<AppState>,
+    selection: DefaultSource,
     Query(query): Query<InitialPlacementQuery>,
     body: Bytes,
 ) -> impl IntoResponse {
+    let s = selection.0;
     let snap = s.snapshot();
     let selection_generation = s.inner.compute_broker.selection_state().await.generation;
     let response = |ok, n_nodes, graph_revision, selection_generation, error| {
@@ -963,9 +995,10 @@ fn membrane_lens(morphology: &str) -> LensConfig {
 }
 
 async fn compute_soup_post(
-    State(s): State<AppState>,
+    selection: DefaultSource,
     Json(req): Json<ComputeSoupReq>,
 ) -> impl IntoResponse {
+    let s = selection.0;
     let initial_revision = s.snapshot().revision;
     let initial_generation = s.inner.compute_broker.selection_state().await.generation;
     let err = |msg: String, graph_revision: u64, selection_generation: u64| {
@@ -1153,19 +1186,20 @@ struct ProgressQuery {
 }
 
 async fn progress_poll(
-    State(s): State<AppState>,
+    selection: SourceSelection,
     Query(p): Query<ProgressQuery>,
 ) -> impl IntoResponse {
+    let s = selection.0;
     let resp = s.inner.progress.since(p.since.unwrap_or(0));
     axum::Json(resp)
 }
 
-async fn index(State(s): State<AppState>) -> impl IntoResponse {
-    asset_response(&s, "index.html")
+async fn index(State(host): State<SourceHost>) -> impl IntoResponse {
+    asset_response(host.default_state(), "index.html")
 }
 
-async fn asset(State(s): State<AppState>, Path(path): Path<String>) -> impl IntoResponse {
-    asset_response(&s, &path)
+async fn asset(State(host): State<SourceHost>, Path(path): Path<String>) -> impl IntoResponse {
+    asset_response(host.default_state(), &path)
 }
 
 // --- App-state config presets -------------------------------------------------
@@ -1184,7 +1218,8 @@ fn configs_dir(s: &AppState) -> Option<std::path::PathBuf> {
 
 /// `GET /configs` → `[{ "name": "...", "description": "..." }, …]` (sorted).
 /// Description is the file's first `# …` comment line, if any.
-async fn configs_list(State(s): State<AppState>) -> impl IntoResponse {
+async fn configs_list(selection: SourceSelection) -> impl IntoResponse {
+    let s = selection.0;
     let Some(dir) = configs_dir(&s) else {
         return (
             StatusCode::NOT_FOUND,
@@ -1215,7 +1250,8 @@ async fn configs_list(State(s): State<AppState>) -> impl IntoResponse {
 }
 
 /// `GET /configs/:name` → the preset's YAML (`name` without the `.yaml`).
-async fn config_get(State(s): State<AppState>, Path(name): Path<String>) -> impl IntoResponse {
+async fn config_get(selection: SourceSelection, Path(name): Path<String>) -> impl IntoResponse {
+    let s = selection.0;
     // Reject path traversal / nested paths.
     if name.is_empty() || name.contains('/') || name.contains('\\') || name.contains("..") {
         return (StatusCode::BAD_REQUEST, "invalid config name").into_response();
@@ -1292,15 +1328,17 @@ fn mime_for(path: &str) -> &'static str {
 /// `/graph/edges`, and `/graph/metrics/*` binary buffers. Lets the renderer
 /// hand server-side string ids (vault paths) directly to Cosmograph and back
 /// to `/node/:id` without a translation step.
-async fn graph_ids(State(s): State<AppState>) -> impl IntoResponse {
+async fn graph_ids(selection: SourceSelection) -> impl IntoResponse {
     use axum::Json;
+    let s = selection.0;
     let snap = s.snapshot();
     let mut headers = HeaderMap::new();
     insert_graph_revision(&mut headers, snap.revision);
     (headers, Json(snap.idx_to_id.clone()))
 }
 
-async fn graph_init(State(s): State<AppState>) -> impl IntoResponse {
+async fn graph_init(selection: SourceSelection) -> impl IntoResponse {
+    let s = selection.0;
     let snap = s.snapshot();
     let g = &snap.graph;
     let palette: Vec<f32> = PALETTE.iter().flat_map(|rgb| rgb.iter().copied()).collect();
@@ -1347,7 +1385,8 @@ async fn graph_init(State(s): State<AppState>) -> impl IntoResponse {
 ///   - On hit, populate `NodeMeta` with the real title/folder/tags from the
 ///     row and leave the metric fields at zero (no PageRank for nodes that
 ///     aren't in the layout graph).
-async fn node_meta(State(s): State<AppState>, Path(id): Path<String>) -> impl IntoResponse {
+async fn node_meta(selection: SourceSelection, Path(id): Path<String>) -> impl IntoResponse {
+    let s = selection.0;
     let snap = s.snapshot();
     let content_scope = s.inner.vault_root.to_string_lossy();
     let can_read_filesystem_content = importer_authorizes(
@@ -1548,9 +1587,10 @@ struct SearchParams {
 /// Tantivy's query syntax. The JSON result includes optional match-highlighted
 /// HTML snippets only from fields that the importer declared snippet-capable.
 async fn search_rich(
-    State(s): State<AppState>,
+    selection: SourceSelection,
     Query(p): Query<SearchParams>,
 ) -> impl IntoResponse {
+    let s = selection.0;
     let snap = s.snapshot();
     let limit = p.limit.unwrap_or(50).min(5_000) as usize;
     match snap.search_index.search(&p.q, limit, true) {
@@ -1567,7 +1607,8 @@ async fn search_rich(
     }
 }
 
-async fn search(State(s): State<AppState>, Query(p): Query<SearchParams>) -> impl IntoResponse {
+async fn search(selection: SourceSelection, Query(p): Query<SearchParams>) -> impl IntoResponse {
+    let s = selection.0;
     let snap = s.snapshot();
     let limit = p.limit.unwrap_or(50).min(5_000) as usize;
     match snap.search_index.search(&p.q, limit, false) {
@@ -1588,9 +1629,10 @@ async fn search(State(s): State<AppState>, Query(p): Query<SearchParams>) -> imp
 /// visual filter evaluator: it never accepts a client limit and is bounded by
 /// the number of nodes in the exact snapshot advertised by the response.
 async fn search_matches(
-    State(s): State<AppState>,
+    selection: SourceSelection,
     Query(p): Query<SearchParams>,
 ) -> axum::response::Response {
+    let s = selection.0;
     let snap = s.snapshot();
     let results = match snap
         .search_index
@@ -1625,7 +1667,8 @@ async fn search_matches(
     (StatusCode::OK, headers, bytes).into_response()
 }
 
-async fn graph_schema(State(s): State<AppState>) -> impl IntoResponse {
+async fn graph_schema(selection: SourceSelection) -> impl IntoResponse {
+    let s = selection.0;
     let snap = s.snapshot();
     Json(serde_json::json!({
         "graph_revision": snap.revision,
@@ -1648,11 +1691,13 @@ fn proto_response<M: ProstMessage>(msg: &M) -> impl IntoResponse {
 
 // --- Binary endpoints (raw little-endian buffers for hot-path bulk data) ---
 
-async fn graph_positions(State(s): State<AppState>) -> impl IntoResponse {
+async fn graph_positions(selection: SourceSelection) -> impl IntoResponse {
+    let s = selection.0;
     cached_binary_response(&s, "positions").into_response()
 }
 
-async fn graph_edges(State(s): State<AppState>) -> impl IntoResponse {
+async fn graph_edges(selection: SourceSelection) -> impl IntoResponse {
+    let s = selection.0;
     cached_binary_response(&s, "edges").into_response()
 }
 
@@ -1667,7 +1712,8 @@ async fn graph_edges(State(s): State<AppState>) -> impl IntoResponse {
 /// Built fresh per request for now; if hot, fold into `binary_cache` like
 /// `/graph/edges`. Returns 503 if the in-memory graph hasn't loaded yet
 /// (mirrors `/graph/layout/stream`'s 503 pattern).
-async fn graph_csr_bin(State(s): State<AppState>) -> axum::response::Response {
+async fn graph_csr_bin(selection: SourceSelection) -> axum::response::Response {
+    let s = selection.0;
     let snap = s.snapshot();
     if snap.graph.nodes.is_empty() {
         return (StatusCode::SERVICE_UNAVAILABLE, "graph not loaded").into_response();
@@ -1758,14 +1804,16 @@ pub async fn push_graph_to_worker(state: &AppState) {
     }
 }
 
-async fn graph_metric(State(s): State<AppState>, Path(name): Path<String>) -> impl IntoResponse {
+async fn graph_metric(selection: SourceSelection, Path(name): Path<String>) -> impl IntoResponse {
+    let s = selection.0;
     cached_binary_response(&s, &name).into_response()
 }
 
 /// Returns a per-field inverted index for exactly the fields the active
 /// importer declares facetable. Built with the rest of the snapshot and cached
 /// as `Arc<[u8]>` under the reserved key `meta_summary`.
-async fn graph_meta_summary(State(s): State<AppState>) -> impl IntoResponse {
+async fn graph_meta_summary(selection: SourceSelection) -> impl IntoResponse {
+    let s = selection.0;
     let snap = s.snapshot();
     let Some(buf) = snap.binary_cache.get("meta_summary").cloned() else {
         return (
@@ -1966,10 +2014,11 @@ fn validate_layout_stream_session(
 }
 
 async fn graph_layout_stream(
-    State(s): State<AppState>,
+    selection: SourceSelection,
     Query(query): Query<LayoutStreamQuery>,
     ws: WebSocketUpgrade,
 ) -> axum::response::Response {
+    let s = selection.0;
     let graph_revision = s.snapshot().revision;
     let selection = s.inner.compute_broker.selection_state().await;
     if let Err(error) = validate_layout_stream_session(&query, graph_revision, selection.generation)
