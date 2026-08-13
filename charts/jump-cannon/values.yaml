@@ -67,6 +67,12 @@ graphApi:
 # kinds remain available through their source-specific CLI configuration.
 importers:
   selected: ""
+  # NetBird group allowed to switch the viewed source at runtime from
+  # Settings > Importers (per browser session, read-only graph views; writes
+  # and compute stay on the deployment-selected source). Empty disables
+  # runtime switching entirely and preserves the rollout-only behavior where
+  # importers.selected is the only way to change the active source.
+  runtimeSwitchGroup: ""
   sources:
     lavender-ingest-okf:
       displayName: Lavender Ingest OKF

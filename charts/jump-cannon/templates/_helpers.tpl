@@ -155,6 +155,7 @@ must never turn into a pod startup failure.
 {{- if gt (len $catalogJson) 65536 -}}
   {{- fail "importers catalog JSON exceeds graph-api's 65536-byte limit" -}}
 {{- end -}}
+{{- $seenVolumeNames := dict -}}
 {{- range $id, $profile := .Values.importers.sources -}}
   {{- $kind := required (printf "importers.sources[%q].kind is required" $id) $profile.kind -}}
   {{- if or (eq (trim $profile.displayName) "") (gt (len $profile.displayName) 256) -}}
@@ -184,6 +185,18 @@ must never turn into a pod startup failure.
       {{- fail (printf "importers.sources[%q].source is required for filesystem kind %s" $id $kind) -}}
     {{- end -}}
     {{- $source := $profile.source -}}
+    {{- /* Every filesystem source is mounted read-only in the pod (dormant
+           ones back runtime source switching), so each must declare its own
+           unique volumeName and existingClaim, not only the selected one. */ -}}
+    {{- $volumeName := required (printf "importers.sources[%q].source.volumeName is required" $id) $source.volumeName -}}
+    {{- if has $volumeName (list "vault-knowledge" "vault-seed" "kubernetes-importer-config" "kubernetes-api-access") -}}
+      {{- fail (printf "importers.sources[%q].source.volumeName %q is reserved by the chart" $id $volumeName) -}}
+    {{- end -}}
+    {{- if hasKey $seenVolumeNames $volumeName -}}
+      {{- fail (printf "importers.sources[%q].source.volumeName %q duplicates importers.sources[%q]: volume names must be unique across the catalog" $id $volumeName (index $seenVolumeNames $volumeName)) -}}
+    {{- end -}}
+    {{- $_ := set $seenVolumeNames $volumeName $id -}}
+    {{- $_ = required (printf "importers.sources[%q].source.existingClaim is required" $id) $source.existingClaim -}}
     {{- $mountPath := required (printf "importers.sources[%q].source.mountPath is required" $id) $source.mountPath -}}
     {{- $path := required (printf "importers.sources[%q].source.path is required" $id) $source.path -}}
     {{- if or (gt (len $mountPath) 4096) (gt (len $path) 4096) -}}

@@ -18,6 +18,10 @@
           "pattern": "^$|^[a-z0-9](?:[a-z0-9._-]*[a-z0-9])?$",
           "maxLength": 128
         },
+        "runtimeSwitchGroup": {
+          "type": "string",
+          "maxLength": 256
+        },
         "sources": {
           "type": "object",
           "maxProperties": 128,

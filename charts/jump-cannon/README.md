@@ -176,9 +176,12 @@ read-only at `/var/lib/lavender/okf-repository` and imports only
 `/var/lib/lavender/okf-repository/okf`. It sets the stable source ID to
 `lavender-ingest` and performs a full filesystem rescan every 60 seconds. The
 selected item, sanitized source details, and active importer are visible in the
-application's read-only **Settings > Importers** tab. Switching remains a Helm
-configuration and rollout operation; the browser has no Apply, Run, or
-Activate control.
+application's **Settings > Importers** tab. Every configured filesystem source
+is mounted read-only in the graph-api pod, not only the selected one. By
+default switching remains a Helm configuration and rollout operation; setting
+`importers.runtimeSwitchGroup` to a NetBird group additionally lets viewers in
+that group switch the viewed source per browser session from the Settings tab,
+while writes, generation, and compute stay on the deployment-selected source.
 
 The producer and consumer paths are deliberately different:
 
