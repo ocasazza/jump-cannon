@@ -37,10 +37,27 @@ pointer target; the retired standalone configuration panels must be absent.
 The importer fixture proves that the active source is identified, the Lavender
 source shows its exact read-only claim and `/var/lib/lavender/okf-repository/okf`
 input, deployment-provisioned RWX and same-namespace requirements, alternate
-`<release>-okf` naming, UID/GID `10001`, and rollout ownership are explained,
-and no Apply, Run, or Activate action is present. Restoring Settings must
-remount a render-ready Graph canvas. These results are recorded under
-`settings_tabs`.
+`<release>-okf` naming, UID/GID `10001`, and rollout ownership are explained.
+Because the main fixture server sets no `JUMP_CANNON_IMPORTER_SWITCH_GROUP`,
+the runtime switch selector must be absent (`data-runtime-switch="disabled"`,
+no `.importer-switch-btn`). Restoring Settings must remount a render-ready
+Graph canvas. These results are recorded under `settings_tabs`.
+
+A second fixture graph-api exercises the runtime switching contract itself.
+The harness mirrors the served app dist over raw HTTP into a tempdir, spawns
+`graph-api` from PATH with a two-source Obsidian catalog (default vault plus a
+tiny alternate vault) and `JUMP_CANNON_IMPORTER_SWITCH_GROUP=test-admins`, and
+simulates the authenticating proxy with `Network.setExtraHTTPHeaders`. It
+asserts the wire gate directly (no group → 403, group → 200, unknown id →
+404), then in the browser: the selector appears for an authorized viewer,
+clicking the alternate swaps the Nodes list to the alternate vault and marks
+the card `viewing`, the sessionStorage selection persists across an in-tab
+reload, a fresh tab returns to the deployment default, and an unauthorized
+viewer sees the "Switching requires NetBird group" note with no controls —
+plus a stale planted selection recovers through the "return to deployment
+default" affordance. The authorized page's console feeds the shared error
+gate; the unauthorized page deliberately fetches a 403, so only its wire
+status is asserted. These results are recorded under `importer_switch`.
 
 The run then clicks the topbar **Sessions** view switcher. View switches
 reload the page (persisted `jc_view` + `location.reload()`), so the suite

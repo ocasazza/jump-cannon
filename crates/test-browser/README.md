@@ -31,7 +31,16 @@ bundle.
     remounts a render-ready Graph canvas.
 12. CDP resource errors, console errors, Rust tracing errors, and unhandled
     exceptions fail the run.
-13. Screenshots are written to `<out-dir>/nodes-editor.png`,
+13. Runtime importer switching: the harness mirrors the served app dist over
+    raw HTTP, spawns a second `graph-api` from PATH with a two-source Obsidian
+    catalog and `JUMP_CANNON_IMPORTER_SWITCH_GROUP=test-admins`, and simulates
+    the proxy's group header via `Network.setExtraHTTPHeaders`. It asserts the
+    wire gate (403/200/404), the authorized selector and graph swap with
+    sessionStorage persistence across an in-tab reload, the fresh-tab default,
+    and the unauthorized group-required note plus stale-selection reset
+    (recorded under `importer_switch`; skipped when no `graph-api` binary is
+    on PATH, e.g. direct runs against a remote base URL).
+14. Screenshots are written to `<out-dir>/nodes-editor.png`,
     `filter-builder.png`, `sessions-view.png`, and `boot.png`.
     Pixel content is reviewed rather than asserted.
 
@@ -63,6 +72,7 @@ Output lands in `target/test-browser-rust/`:
 - `boot.png` — screenshot at the moment all assertions passed
 - `report.json` — JSON including structured `pre_wasm_mount`, `nodes_editor`,
   `settings_tabs`, `filter_builder`, `sessions_view`, `graph_header_actions`,
+  `importer_switch`,
   canvas, boot-log, and browser-error results
 
 ## CLI
