@@ -48,3 +48,26 @@ Manual bypass when Hydra genuinely cannot push: build the image via the
 remote builder (`ssh://root@pdx-nxst-001.schrodinger.com` is in
 `/etc/nix/machines` and reachable off-NetBird), stream the closure down,
 and `crane push` the tarball to GAR `latest`.
+
+## Consumer rollout requires the Revision strategy
+
+The chart version is pinned `0.1.0` and republished in place, so the
+consumer HelmRelease (envoy-ai-gateway
+`lib/cluster-manifests/components/platforms/jump-cannon.nix`) must set
+`reconcileStrategy: Revision`. Under the default `ChartVersion` strategy a
+republished tarball has the same version and helm-controller never upgrades:
+Hydra, GAR, and the chart cache all look green while the workload stays on
+the old build. Verify with
+`kubectl -n flux-system get helmrelease jump-cannon -o jsonpath='{.status.history[0].appVersion}'`
+against the expected source sha.
+
+## Hydra access without the sysmgr ssh key
+
+`sudo -u hydra psql` on pdx-nxnx-lv01 needs the sysmgr key, which is not on
+every machine. The HTTP API is the portable fallback: log in at
+`http://pdx-nxnx-lv01.schrodinger.com:8080/hydra/login` as `hydra-ro`
+(password in Secret `holmes/hydra-robot`, readable with the admin
+kubeconfig), keep the session cookie, then query
+`/jobset/<project>/<jobset>/evals` and `/build/<id>` with
+`Accept: application/json`. Build status 0 is success, 1 failed, 2
+dependency-failed.
