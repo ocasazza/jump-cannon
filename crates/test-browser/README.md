@@ -9,27 +9,31 @@ bundle.
 2. Headless Chromium launches with WebGPU flags and navigates.
 3. The boot log line `[jump-cannon-ui] boot` appears on the JS console
    within `--timeout-secs` (logged from `app/ui/src/main.rs`).
-4. The graph `<canvas>` exists, reaches render-ready, and has non-zero size.
-5. Graph header actions are visible, clickable, and do not begin a panel drag.
-6. Nodes has a left navigator and wider focused-content pane; selecting a
+4. The Dioxus mount and pre-WASM shell obey the startup invariant: `#main`
+   exists, the marked static shell is its adjacent sibling rather than a
+   child, and the shell is hidden after Dioxus mounts. Keeping foreign DOM out
+   of `#main` prevents Dioxus 0.6's `invalid key` startup panic.
+5. The graph `<canvas>` exists, reaches render-ready, and has non-zero size.
+6. Graph header actions are visible, clickable, and do not begin a panel drag.
+7. Nodes has a left navigator and wider focused-content pane; selecting a
    seeded note loads its body.
-7. Flat/Tags round-trips preserve selection, exact multi-tag groups contain
+8. Flat/Tags round-trips preserve selection, exact multi-tag groups contain
    one row per node, synthetic `(untagged)` is present, core schema keys remain
    visible, and the controls stay below the panel header in floating and tiling.
-8. Unified Settings exposes five accessible, content-backed tabs; restoring it
+9. Unified Settings exposes five accessible, content-backed tabs; restoring it
    remounts a render-ready Graph canvas.
-9. Filter restores from the dock into a maximized Boolean builder with
-   repeatable Search and field rules, live All/Any subtree counts, inline
-   syntax diagnostics that preserve the last valid result, and accessible
-   reorder controls; restoring the workspace remounts Graph afterward.
-10. The topbar view switcher mounts the Sessions workspace — Worlds panel with
+10. Filter restores from the dock into a maximized Boolean builder with
+    repeatable Search and field rules, live All/Any subtree counts, inline
+    syntax diagnostics that preserve the last valid result, and accessible
+    reorder controls; restoring the workspace remounts Graph afterward.
+11. The topbar view switcher mounts the Sessions workspace — Worlds panel with
     its embedded-host empty state plus the dock — and switching back to User
     remounts a render-ready Graph canvas.
-11. CDP resource errors, console errors, Rust tracing errors, and unhandled
+12. CDP resource errors, console errors, Rust tracing errors, and unhandled
     exceptions fail the run.
-12. Screenshots are written to `<out-dir>/nodes-editor.png`,
-   `filter-builder.png`, `sessions-view.png`, and `boot.png`.
-   Pixel content is reviewed rather than asserted.
+13. Screenshots are written to `<out-dir>/nodes-editor.png`,
+    `filter-builder.png`, `sessions-view.png`, and `boot.png`.
+    Pixel content is reviewed rather than asserted.
 
 On Linux, the harness uses Vulkan for WebGPU compute while disabling the
 display surface; unified headless Chrome presents through its offscreen path
@@ -57,9 +61,9 @@ Output lands in `target/test-browser-rust/`:
 - `settings-importers.png` — deployment-managed importer catalog
 - `sessions-view.png` — Sessions workspace (Worlds panel, dock)
 - `boot.png` — screenshot at the moment all assertions passed
-- `report.json` — JSON including structured `nodes_editor`, `settings_tabs`,
-  `filter_builder`, `sessions_view`, `graph_header_actions`, canvas, boot-log,
-  and browser-error results
+- `report.json` — JSON including structured `pre_wasm_mount`, `nodes_editor`,
+  `settings_tabs`, `filter_builder`, `sessions_view`, `graph_header_actions`,
+  canvas, boot-log, and browser-error results
 
 ## CLI
 

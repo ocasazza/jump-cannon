@@ -13,6 +13,11 @@ Dioxus app in Chromium, exercises Graph header actions and the Nodes workbench,
 and writes `nodes-editor.png`, `settings-importers.png`, `sessions-view.png`,
 `boot.png`, and `report.json` under `target/test-browser-rust`.
 
+The report also verifies the startup handoff: the marked static boot shell is
+the adjacent sibling of `#main`, never a child of the Dioxus mount, and is
+hidden after the first Dioxus commit. This protects the empty-mount invariant
+documented in [[Frontend]] as well as catching resource-load and WASM errors.
+
 Stable fixture notes prove that Nodes renders a horizontal navigator/content
 split, uses the importer-neutral `Search fields` label while exposing the core
 schema-provided keys, loads selected content, preserves

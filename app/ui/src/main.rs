@@ -1079,8 +1079,9 @@ fn App() -> Element {
     let world_label = ctx.active_world.read().clone();
 
     rsx! {
+        // app.css is not inlined here: index.html loads it via a Trunk
+        // <link rel="css"> so the static boot shell can paint pre-WASM.
         style { {panel_kit::CSS} }
-        style { {include_str!("../assets/app.css")} }
         div {
             class: ws.root_class(),
             tabindex: "0",

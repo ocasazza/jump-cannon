@@ -6,14 +6,16 @@
 //!   2. Headless Chromium launches with WebGPU flags and navigates.
 //!   3. The boot log line `[jump-cannon-ui] boot` appears on the JS
 //!      console within `--timeout-secs`.
-//!   4. The graph canvas becomes render-ready and its header controls work.
-//!   5. Nodes is a two-pane editor; Flat/Tags selection and content work.
-//!   6. Unified Settings exposes four accessible, content-backed tabs.
-//!   7. Filter is a repeatable, nested Boolean builder with live validation.
-//!   8. The Sessions view switcher mounts the world workspace (Worlds panel,
+//!   4. The static boot shell is outside and adjacent to the Dioxus mount,
+//!      then hidden after mount.
+//!   5. The graph canvas becomes render-ready and its header controls work.
+//!   6. Nodes is a two-pane editor; Flat/Tags selection and content work.
+//!   7. Unified Settings exposes four accessible, content-backed tabs.
+//!   8. Filter is a repeatable, nested Boolean builder with live validation.
+//!   9. The Sessions view switcher mounts the world workspace (Worlds panel,
 //!      dock) against the embedded host and returns to the User view.
-//!   9. Screenshots are saved for the Nodes editor, Filter builder, Sessions
-//!      view, and workspace.
+//!   10. Screenshots are saved for the Nodes editor, Filter builder, Sessions
+//!       view, and workspace.
 //!
 //! Anything flaky (pixel brightness, motion deltas, click recovery) is
 //! deliberately deferred. (The legacy egui-era Playwright suite that held
@@ -92,6 +94,8 @@ struct Report {
     #[serde(skip_serializing_if = "Option::is_none")]
     reason: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pre_wasm_mount: Option<PreWasmMountCheck>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     graph_header_actions: Option<HeaderActionCheck>,
     #[serde(skip_serializing_if = "Option::is_none")]
     nodes_editor: Option<NodesEditorCheck>,
@@ -103,6 +107,18 @@ struct Report {
     sessions_view: Option<SessionsViewCheck>,
     page_errors: Vec<String>,
     console_logs: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct PreWasmMountCheck {
+    ok: bool,
+    main_mount_found: bool,
+    static_boot_found: bool,
+    static_boot_inside_main: bool,
+    static_boot_adjacent_sibling: bool,
+    static_boot_hidden: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    reason: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -249,6 +265,7 @@ async fn main() -> Result<()> {
         canvas_width,
         canvas_height,
         boot_log_found,
+        pre_wasm_mount,
         header_actions,
         nodes_editor,
         settings_tabs,
@@ -260,6 +277,7 @@ async fn main() -> Result<()> {
             let ok = o.boot_log_found
                 && o.canvas_width > 0
                 && o.canvas_height > 0
+                && o.pre_wasm_mount.ok
                 && o.header_actions.ok
                 && o.nodes_editor.ok
                 && o.settings_tabs.ok
@@ -273,6 +291,8 @@ async fn main() -> Result<()> {
                     "canvas dimensions invalid: {}x{}",
                     o.canvas_width, o.canvas_height
                 ))
+            } else if !o.pre_wasm_mount.ok {
+                o.pre_wasm_mount.reason.clone()
             } else if !o.header_actions.ok {
                 o.header_actions.reason.clone()
             } else if !o.nodes_editor.ok {
@@ -297,6 +317,7 @@ async fn main() -> Result<()> {
                 o.canvas_width,
                 o.canvas_height,
                 o.boot_log_found,
+                Some(o.pre_wasm_mount.clone()),
                 Some(o.header_actions.clone()),
                 Some(o.nodes_editor.clone()),
                 Some(o.settings_tabs.clone()),
@@ -316,6 +337,7 @@ async fn main() -> Result<()> {
             None,
             None,
             None,
+            None,
             captured_page_errors.clone(),
         ),
     };
@@ -328,6 +350,7 @@ async fn main() -> Result<()> {
         boot_log_found,
         duration_ms,
         reason: reason.clone(),
+        pre_wasm_mount,
         graph_header_actions: header_actions,
         nodes_editor,
         settings_tabs,
@@ -355,6 +378,7 @@ struct RunOk {
     canvas_width: u32,
     canvas_height: u32,
     boot_log_found: bool,
+    pre_wasm_mount: PreWasmMountCheck,
     header_actions: HeaderActionCheck,
     nodes_editor: NodesEditorCheck,
     settings_tabs: SettingsTabsCheck,
@@ -642,6 +666,62 @@ async fn drive_page(
             }
         }
         tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+
+    // ---- 4b. static pre-WASM shell hands off without sharing #main -------
+    // The static shell must remain outside Dioxus's mount node. Otherwise the
+    // first virtual-DOM diff can try to reconcile server-authored children and
+    // panic with `invalid key`. This runs after the render-ready wait so the
+    // Dioxus commit (and the shell-hiding selector) have already settled.
+    let pre_wasm_mount_js = r#"(async () => {
+        await new Promise((resolve) => requestAnimationFrame(() =>
+          requestAnimationFrame(resolve)
+        ));
+        const mainMount = document.querySelector('#main');
+        const staticBoot = document.querySelector('[data-panel-kit-static-boot]');
+        const staticBootInsideMain = Boolean(
+          mainMount && staticBoot && mainMount.contains(staticBoot)
+        );
+        const staticBootAdjacentSibling = Boolean(
+          mainMount && staticBoot && mainMount.nextElementSibling === staticBoot
+        );
+        const staticBootHidden = Boolean(
+          staticBoot && getComputedStyle(staticBoot).display === 'none'
+        );
+        const failures = [];
+        if (!mainMount) failures.push('#main Dioxus mount missing');
+        if (!staticBoot) failures.push('static pre-WASM boot shell missing');
+        if (staticBootInsideMain) {
+          failures.push('static pre-WASM boot shell is inside #main');
+        }
+        if (mainMount && staticBoot && !staticBootAdjacentSibling) {
+          failures.push('static pre-WASM boot shell is not the adjacent sibling after #main');
+        }
+        if (staticBoot && !staticBootHidden) {
+          failures.push('static pre-WASM boot shell still visible after Dioxus mount');
+        }
+        return {
+          ok: failures.length === 0,
+          main_mount_found: Boolean(mainMount),
+          static_boot_found: Boolean(staticBoot),
+          static_boot_inside_main: staticBootInsideMain,
+          static_boot_adjacent_sibling: staticBootAdjacentSibling,
+          static_boot_hidden: staticBootHidden,
+          reason: failures.length ? failures.join('; ') : null,
+        };
+    })()"#;
+    let pre_wasm_mount_value: serde_json::Value =
+        page.evaluate(pre_wasm_mount_js).await?.into_value()?;
+    let pre_wasm_mount: PreWasmMountCheck = serde_json::from_value(pre_wasm_mount_value)
+        .context("decode pre-WASM mount invariant result")?;
+    if !pre_wasm_mount.ok {
+        // Stop here: a broken mount handoff would only obscure every later
+        // check, and the bail reason carries the structured failures.
+        let detail = pre_wasm_mount
+            .reason
+            .clone()
+            .unwrap_or_else(|| "unknown mount invariant failure".to_string());
+        bail!("pre-WASM mount invariant failed: {detail}");
     }
 
     // ---- 5. Nodes is an editor-style navigator + focused-content surface --
@@ -1944,6 +2024,7 @@ async fn drive_page(
         canvas_width,
         canvas_height,
         boot_log_found,
+        pre_wasm_mount,
         header_actions,
         nodes_editor,
         settings_tabs,

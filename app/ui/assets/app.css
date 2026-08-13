@@ -1,5 +1,32 @@
 /* jump-cannon panel styles — layered after panel-kit.css. */
 
+/* Static pre-WASM Panel Kit shell. This block deliberately uses standalone
+   colors because it paints before panel_kit::CSS exists. The marked shell is
+   an adjacent sibling of an empty #main; it must never be mounted inside the
+   Dioxus root because Dioxus 0.6 does not clear pre-existing children. */
+.panel-kit-boot { position:fixed; inset:0; z-index:2147483000; display:flex; flex-direction:column;
+  min-width:0; min-height:0; overflow:hidden; background:#09090a; color:#efeff0;
+  font:12px/1.35 "Courier Prime",ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; }
+.panel-kit-boot-bar { display:flex; align-items:center; gap:12px; height:35px; flex:0 0 35px;
+  padding:0 14px; border-bottom:1px solid #242427; letter-spacing:.08em; text-transform:uppercase; }
+.panel-kit-boot-title { font-weight:700; }
+.panel-kit-boot-status { color:#77777d; font-size:10px; }
+.panel-kit-boot-panels { display:grid; grid-template-columns:minmax(0,3fr) minmax(240px,2fr);
+  grid-template-rows:1fr 1fr; gap:8px; flex:1; min-height:0; padding:44px 8px 8px; }
+.panel-kit-boot-panel { position:relative; min-width:0; min-height:90px; border:1px solid #35353a;
+  border-radius:4px; background:#0c0c0d; overflow:hidden; }
+.panel-kit-boot-panel:first-child { grid-row:1 / span 2; }
+.panel-kit-boot-panel::before { content:""; position:absolute; top:9px; left:12px; width:52px; height:8px;
+  border-radius:3px; background:linear-gradient(90deg,#389cf6 0 14%,transparent 14% 22%,#f6be3c 22% 36%,transparent 36% 44%,#ee60c2 44% 58%,transparent 58%); }
+.panel-kit-boot-line { height:6px; margin:34px 12px 0; border-radius:3px; background:#1a1a1d;
+  animation:panel-kit-boot-pulse 1.25s ease-in-out infinite alternate; }
+.panel-kit-boot-line + .panel-kit-boot-line { width:62%; margin-top:9px; animation-delay:.18s; }
+#main[data-dioxus-id] + .panel-kit-boot[data-panel-kit-static-boot] { display:none; }
+@keyframes panel-kit-boot-pulse { from { opacity:.35; } to { opacity:.9; } }
+@media (max-width:680px) { .panel-kit-boot-panels { grid-template-columns:1fr; grid-template-rows:2fr 1fr; }
+  .panel-kit-boot-panel:first-child { grid-row:auto; } .panel-kit-boot-panel:last-child { display:none; } }
+@media (prefers-reduced-motion:reduce) { .panel-kit-boot-line { animation:none; opacity:.65; } }
+
 /* Shared utility: label text exposed to assistive tech but not painted.
    Panels pair a visible control with an sr-only <label for=…>, so without
    this rule those labels render as stray full-size text. */
