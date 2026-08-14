@@ -434,6 +434,56 @@ spec:
               {{- toYaml $root.Values.containerSecurityContext | nindent 14 }}
 {{- end -}}
 
+{{/*
+okf-sync: derive the writable OKF repository claim and mount from the importer
+catalog so the CronJob can never drift from the profile it feeds. Uses the
+selected profile when it is a named OKF filesystem source; otherwise requires
+exactly one OKF profile in the catalog. Fails when no runnable OKF filesystem
+profile exists, and fails when the derived claim is the vault claim — the
+active vault must never be mounted read-write by a batch job. Catalog
+validation (jump-cannon.importerSelection) runs first, so source.existingClaim
+and source.mountPath are guaranteed present for OKF profiles.
+*/}}
+{{- define "jump-cannon.okfSyncSource" -}}
+{{- $selection := include "jump-cannon.importerSelection" . | fromJson -}}
+{{- $profileId := "" -}}
+{{- if and $selection.named (eq $selection.kind "okf") -}}
+  {{- $profileId = $selection.selected -}}
+{{- else -}}
+  {{- $found := list -}}
+  {{- range $id, $profile := .Values.importers.sources -}}
+    {{- if and (kindIs "map" $profile) (eq (default "" $profile.kind) "okf") -}}
+      {{- $found = append $found $id -}}
+    {{- end -}}
+  {{- end -}}
+  {{- if ne (len $found) 1 -}}
+    {{- fail (printf "okfSync.enabled requires the selected importer to be a named OKF profile or exactly one OKF profile in importers.sources (found %d)" (len $found)) -}}
+  {{- end -}}
+  {{- $profileId = index $found 0 -}}
+{{- end -}}
+{{- $profile := index .Values.importers.sources $profileId -}}
+{{- $claimName := $profile.source.existingClaim -}}
+{{- if eq $claimName (include "jump-cannon.vaultClaimName" .) -}}
+  {{- fail (printf "okfSync derives claim %q from importers.sources[%q], which is the vault claim: never mount the active vault read-write" $claimName $profileId) -}}
+{{- end -}}
+{{- if eq (trim .Values.okfSync.repoUrl) "" -}}
+  {{- fail "okfSync.enabled requires okfSync.repoUrl" -}}
+{{- end -}}
+{{- if eq (trim .Values.okfSync.deployKeySecret) "" -}}
+  {{- fail "okfSync.enabled requires okfSync.deployKeySecret: the read-only deploy key must come from a user-created Secret, never from values" -}}
+{{- end -}}
+{{- dict
+    "profileId" $profileId
+    "volumeName" $profile.source.volumeName
+    "claimName" $claimName
+    "mountPath" $profile.source.mountPath
+  | toJson -}}
+{{- end -}}
+
+{{- define "jump-cannon.okfSyncImage" -}}
+{{- printf "%s:%s" .Values.okfSync.image.repository .Values.okfSync.image.tag -}}
+{{- end -}}
+
 {{- define "jump-cannon.testImage" -}}
 {{- printf "%s:%s" .Values.tests.image.repository .Values.tests.image.tag -}}
 {{- end -}}

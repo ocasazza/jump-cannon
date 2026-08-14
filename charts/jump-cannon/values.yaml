@@ -97,6 +97,26 @@ importers:
         existingClaimValuePath: okf.persistence.existingClaim
         existingClaimValue: lavender-okf-shared
 
+# okf-sync CronJob: fast-forward git-pulls the lavender OKF repository
+# (pushed nightly by lavender-ingest) into the shared claim an OKF importer
+# profile serves from. The claim and mount path are derived from the catalog
+# profile itself (the selected OKF profile, or the catalog's single OKF
+# profile) so this job can never drift from the reader. The claim is RWO
+# local-path and graph-api already mounts it read-only, so the sync pod
+# carries a hard podAffinity to the graph-api pod's node. Sync divergence is
+# never resolved: the job fails loudly for an operator.
+okfSync:
+  enabled: false
+  schedule: "17 * * * *"
+  image:
+    repository: us-central1-docker.pkg.dev/it-ops-nixstation/lavender/jump-cannon-okf-sync
+    tag: latest
+    pullPolicy: Always
+  repoUrl: "git@github.com:schrodinger/lavender-okf.git"
+  # Name of a user-created Secret holding the read-only GitHub deploy key at
+  # key id_ed25519; mounted read-only at /secrets/okf-reader with mode 0400.
+  deployKeySecret: "lavender-okf-reader"
+
 # ASCII slug used to namespace graph node IDs when graphApi.source is okf.
 # The OKF bundle itself is read from vault.mountPath.
 okfImporter:

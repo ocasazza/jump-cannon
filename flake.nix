@@ -730,6 +730,113 @@
           '';
         };
 
+        # okf-sync: chart-managed CronJob payload that git-pulls the lavender
+        # OKF repository (schrodinger/lavender-okf) into the shared claim the
+        # OKF importer profile serves from. The claim is a read replica: only
+        # fast-forward updates are applied and divergence fails loudly.
+        okf-sync = pkgs.writeShellApplication {
+          name = "okf-sync";
+          runtimeInputs = [
+            pkgs.git
+            pkgs.openssh
+            pkgs.cacert
+            pkgs.bashInteractive
+            pkgs.coreutils
+          ];
+          text = ''
+            set -euo pipefail
+
+            : "''${OKF_REPO_URL:?okf-sync: OKF_REPO_URL must be set (ssh URL of the OKF repository)}"
+            : "''${OKF_TARGET_DIR:?okf-sync: OKF_TARGET_DIR must be set (claim mount to sync into)}"
+
+            # Read-only deploy key registered on the repository. HOME is /tmp
+            # in the image, so ssh state (known_hosts) stays writable there.
+            export GIT_SSH_COMMAND="ssh -i /secrets/okf-reader/id_ed25519 -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=/tmp/known_hosts"
+
+            if [ -d "$OKF_TARGET_DIR/.git" ]; then
+              # Existing checkout. Normalize the origin remote first: the claim
+              # may have been seeded by the producer's own git working tree
+              # whose remote does not necessarily point at the mirror.
+              if git -C "$OKF_TARGET_DIR" remote get-url origin >/dev/null 2>&1; then
+                git -C "$OKF_TARGET_DIR" remote set-url origin "$OKF_REPO_URL"
+              else
+                git -C "$OKF_TARGET_DIR" remote add origin "$OKF_REPO_URL"
+              fi
+              git -C "$OKF_TARGET_DIR" fetch origin
+              # The claim is a read replica: fast-forward only. A diverged,
+              # locally-committed-ahead, or non-main checkout is an operator
+              # incident, never something to merge or force — fail loudly and
+              # let the Job go red. (A bare `merge --ff-only` treats a
+              # locally-ahead HEAD as "Already up to date", so the ancestry
+              # check comes first.)
+              if [ "$(git -C "$OKF_TARGET_DIR" branch --show-current)" != "main" ]; then
+                echo "okf-sync: $OKF_TARGET_DIR is not on branch main; refusing to reconcile a read replica" >&2
+                exit 1
+              fi
+              if ! git -C "$OKF_TARGET_DIR" merge-base --is-ancestor HEAD origin/main; then
+                echo "okf-sync: $OKF_TARGET_DIR has commits not on origin/main; refusing to reconcile a read replica" >&2
+                exit 1
+              fi
+              git -C "$OKF_TARGET_DIR" merge --ff-only origin/main
+              echo "okf-sync: $OKF_TARGET_DIR now at $(git -C "$OKF_TARGET_DIR" rev-parse HEAD)"
+            else
+              # Fresh claim. `git clone` refuses a non-empty target and a
+              # provisioned PVC mount may already contain entries (for example
+              # a lost+found directory), so initialize in place instead:
+              # init + fetch + reset materializes the exact origin/main tree
+              # while unrelated entries remain as untracked files.
+              mkdir -p "$OKF_TARGET_DIR"
+              git -C "$OKF_TARGET_DIR" init -b main
+              git -C "$OKF_TARGET_DIR" remote add origin "$OKF_REPO_URL"
+              git -C "$OKF_TARGET_DIR" fetch origin
+              git -C "$OKF_TARGET_DIR" reset --hard origin/main
+              echo "okf-sync: cloned $OKF_REPO_URL into $OKF_TARGET_DIR at $(git -C "$OKF_TARGET_DIR" rev-parse HEAD)"
+            fi
+          '';
+        };
+
+        okf-sync-k8s-image =
+          if isLinux then
+            pkgs.dockerTools.streamLayeredImage {
+              name = "${k8sImageRegistry}/jump-cannon-okf-sync";
+              tag = "latest";
+              contents = [
+                okf-sync
+                pkgs.git
+                pkgs.openssh
+                pkgs.cacert
+                pkgs.bashInteractive
+                pkgs.coreutils
+              ];
+              extraCommands = ''
+                mkdir -p tmp etc/ssl/certs
+                chmod 1777 tmp
+                ln -sf ${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt etc/ssl/certs/ca-bundle.crt
+              '';
+              fakeRootCommands = ''
+                printf 'root:x:0:0::/root:/noshell\njump:x:10001:10001:Jump Cannon:/tmp:/noshell\n' > etc/passwd
+                printf 'root:x:0:\njump:x:10001:\n' > etc/group
+                chmod 0644 etc/passwd etc/group
+              '';
+              config = {
+                Entrypoint = [ "/bin/okf-sync" ];
+                WorkingDir = "/tmp";
+                User = "10001:10001";
+                Env = [
+                  "PATH=/bin"
+                  "HOME=/tmp"
+                  "SSL_CERT_FILE=/etc/ssl/certs/ca-bundle.crt"
+                  "NIX_SSL_CERT_FILE=/etc/ssl/certs/ca-bundle.crt"
+                ];
+                Labels = {
+                  "org.opencontainers.image.source" = "https://github.com/ocasazza/jump-cannon";
+                  "org.opencontainers.image.description" = "jump-cannon okf-sync: fast-forward pull of the lavender OKF repository into the shared claim";
+                };
+              };
+            }
+          else
+            unsupportedK8sImage "okf-sync-k8s-image";
+
         test-runner-image =
           if isLinux then
             pkgs.dockerTools.streamLayeredImage {
@@ -1021,7 +1128,7 @@
             sourceRev = inputs.self.rev or inputs.self.dirtyRev or "unknown";
           };
           inherit graph-compute-image graph-api-image docker-compose-yaml;
-          inherit graph-api-k8s-image graph-compute-k8s-image session-manager-k8s-image test-runner-image;
+          inherit graph-api-k8s-image graph-compute-k8s-image session-manager-k8s-image test-runner-image okf-sync-k8s-image;
           inherit session-manager;
           inherit test-browser test-workload-bins;
         };
@@ -1194,6 +1301,7 @@
       x86_64-linux.graph-compute-k8s-image = inputs.self.packages.x86_64-linux.graph-compute-k8s-image;
       x86_64-linux.session-manager-k8s-image = inputs.self.packages.x86_64-linux.session-manager-k8s-image;
       x86_64-linux.test-runner-image = inputs.self.packages.x86_64-linux.test-runner-image;
+      x86_64-linux.okf-sync-k8s-image = inputs.self.packages.x86_64-linux.okf-sync-k8s-image;
       aarch64-darwin.graph-compute = inputs.self.packages.aarch64-darwin.graph-compute;
       aarch64-darwin.bench-pagerank = inputs.self.packages.aarch64-darwin.bench-pagerank;
     };

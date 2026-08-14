@@ -35,6 +35,66 @@
         }
       }
     },
+    "okfSync": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "enabled",
+        "schedule",
+        "image",
+        "repoUrl",
+        "deployKeySecret"
+      ],
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "schedule": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64
+        },
+        "image": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "repository",
+            "tag",
+            "pullPolicy"
+          ],
+          "properties": {
+            "repository": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 512
+            },
+            "tag": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128
+            },
+            "pullPolicy": {
+              "type": "string",
+              "enum": [
+                "Always",
+                "IfNotPresent",
+                "Never"
+              ]
+            }
+          }
+        },
+        "repoUrl": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512
+        },
+        "deployKeySecret": {
+          "type": "string",
+          "pattern": "^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?)*$",
+          "maxLength": 253
+        }
+      }
+    },
     "sessionManager": {
       "type": "object",
       "additionalProperties": true,

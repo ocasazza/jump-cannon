@@ -205,6 +205,28 @@ and traversable by jump-cannon's UID/GID `10001`. Do not point this profile at
 Lavender lake or state volumes. The chart never creates, annotates, or takes
 ownership of `lavender-okf-shared`.
 
+### okf-sync CronJob
+
+lavender-ingest pushes its OKF repository to the private
+`schrodinger/lavender-okf` GitHub repo nightly. With `okfSync.enabled=true`
+the chart renders a CronJob that git fast-forward pulls that repo into the
+profile's claim, replacing the shared-writer deployment model. The claim and
+mount path are derived from the importer catalog profile (the selected OKF
+profile, or the catalog's single OKF entry); rendering fails when no runnable
+OKF filesystem profile exists or when the derived claim is the vault claim.
+Because the claim is RWO `local-path` and graph-api mounts it read-only, the
+sync pod carries a hard `podAffinity` to the graph-api pod's node
+(`kubernetes.io/hostname`). Syncs are fast-forward-only: divergence fails the
+Job loudly and is never auto-resolved.
+
+| Value | Default | Purpose |
+|---|---|---|
+| `okfSync.enabled` | `false` | Render the okf-sync CronJob |
+| `okfSync.schedule` | `17 * * * *` | Sync cadence |
+| `okfSync.image.repository` / `.tag` / `.pullPolicy` | `…/jump-cannon-okf-sync:latest` / `Always` | Sync image |
+| `okfSync.repoUrl` | `git@github.com:schrodinger/lavender-okf.git` | SSH URL of the OKF mirror |
+| `okfSync.deployKeySecret` | `lavender-okf-reader` | User-created Secret with the read-only deploy key at key `id_ed25519` (mounted `0400` at `/secrets/okf-reader`) |
+
 The shared Git working tree is a live handoff, not an immutable workflow
 snapshot. A workflow that needs a reproducible input must record the repository
 HEAD or copy the selected tree to immutable storage before processing it.

@@ -67,3 +67,11 @@ same node IDs as Obsidian mode for the same corpus.
 
 Do not hide network access, credentials, or authorization inside a pure mapper.
 Deployment owns those effects through [[Helm Deployment]] and [[Security Model]].
+
+The Lavender OKF profile's data path is pull-based: lavender-ingest git-pushes
+its OKF repository to the private `schrodinger/lavender-okf` repo nightly, the
+chart-managed okf-sync CronJob (`okfSync.enabled`) fast-forward pulls that repo
+into the shared claim, and graph-api's periodic filesystem rescan
+(`filesystemRescanIntervalSeconds`, 60 seconds for the shipped profile)
+rebuilds the snapshot from the updated bundle. Reload publication stays atomic:
+a failed pull or an invalid bundle leaves the last good graph active.

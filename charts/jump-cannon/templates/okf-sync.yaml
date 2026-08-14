@@ -1,0 +1,80 @@
+{{- if .Values.okfSync.enabled }}
+{{- $sync := include "jump-cannon.okfSyncSource" . | fromJson }}
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ include "jump-cannon.fullname" . }}-okf-sync
+  labels:
+    {{- include "jump-cannon.labels" . | nindent 4 }}
+    app.kubernetes.io/component: okf-sync
+spec:
+  schedule: {{ .Values.okfSync.schedule | quote }}
+  # A hung sync must never overlap the next run: two writers on the same
+  # claim would race the git fast-forward.
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 2
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    metadata:
+      labels:
+        {{- include "jump-cannon.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: okf-sync
+    spec:
+      ttlSecondsAfterFinished: 86400
+      # Divergence is an operator incident, not a retryable error: keep
+      # retries minimal so a red Job surfaces fast.
+      backoffLimit: 1
+      template:
+        metadata:
+          labels:
+            {{- include "jump-cannon.selectorLabels" . | nindent 12 }}
+            app.kubernetes.io/component: okf-sync
+        spec:
+          automountServiceAccountToken: false
+          restartPolicy: Never
+          imagePullSecrets:
+            {{- toYaml .Values.imagePullSecrets | nindent 12 }}
+          securityContext:
+            {{- toYaml .Values.podSecurityContext | nindent 12 }}
+          affinity:
+            podAffinity:
+              # The derived claim is RWO local-path (node-local) and graph-api
+              # already mounts it read-only, so the sync pod must land on the
+              # same node as the graph-api pod. Selector labels come from the
+              # chart's own helpers so this can never drift.
+              requiredDuringSchedulingIgnoredDuringExecution:
+                - labelSelector:
+                    matchLabels:
+                      {{- include "jump-cannon.selectorLabels" . | nindent 22 }}
+                      app.kubernetes.io/component: graph-api
+                  topologyKey: kubernetes.io/hostname
+          containers:
+            - name: okf-sync
+              image: {{ include "jump-cannon.okfSyncImage" . | quote }}
+              imagePullPolicy: {{ .Values.okfSync.image.pullPolicy }}
+              env:
+                - name: OKF_REPO_URL
+                  value: {{ .Values.okfSync.repoUrl | quote }}
+                - name: OKF_TARGET_DIR
+                  value: {{ $sync.mountPath | quote }}
+                - name: HOME
+                  value: /tmp
+              securityContext:
+                {{- toYaml .Values.containerSecurityContext | nindent 16 }}
+              volumeMounts:
+                # Read-write by design: this job is the claim's writer; the
+                # graph-api pod mounts the same claim read-only.
+                - name: {{ $sync.volumeName }}
+                  mountPath: {{ $sync.mountPath }}
+                - name: okf-reader-key
+                  mountPath: /secrets/okf-reader
+                  readOnly: true
+          volumes:
+            - name: {{ $sync.volumeName }}
+              persistentVolumeClaim:
+                claimName: {{ $sync.claimName }}
+            - name: okf-reader-key
+              secret:
+                secretName: {{ .Values.okfSync.deployKeySecret | quote }}
+                defaultMode: 0400
+{{- end }}
