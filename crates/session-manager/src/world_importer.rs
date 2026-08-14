@@ -2,12 +2,15 @@
 //! [`graph_vcs`] store (feature `server`, native only).
 //!
 //! Every `import()` materializes the head of one branch and converts the
-//! snapshot into a [`LoadResult`]: nodes become graph nodes (with the
-//! normalizations the discovery contract requires — non-empty `source_id`
-//! and `title`), edges become `link` edges (dangling endpoints are dropped
-//! into `unresolved`, since commits like "add an edge before its target
-//! node" are legal in the VCS but not in a published graph), and every node
-//! gets one [`SearchDocument`] projecting the fixed world schema.
+//! snapshot into a [`LoadResult`]. The VCS layer stores user-authored local
+//! IDs; publishing namespaces them to the unified identity contract —
+//! `world:<world-slug>:<local>` — and rewrites edge endpoints to match.
+//! Nodes get the normalizations the discovery contract requires (source_id
+//! pinned to the world slug, non-empty `title`), edges become `link` edges
+//! (dangling endpoints are dropped into `unresolved`, since commits like
+//! "add an edge before its target node" are legal in the VCS but not in a
+//! published graph), and every node gets one [`SearchDocument`] projecting
+//! the fixed world schema.
 //!
 //! The descriptor declares `WatchPlan::Push`: the serving side rebuilds when
 //! the session-manager server fires the world's push trigger after a
@@ -20,9 +23,9 @@
 //! projection is deferred.
 
 use data_loader::{
-    Capability, DiscoveryField, DiscoveryFieldType, EdgeTypeSchema, Effect, ImportError,
-    ImportFuture, Importer, ImporterDescriptor, ImporterSchema, LoadResult, SearchDocument,
-    TagHierarchySchema, Transport, WatchPlan,
+    identity::Namespace, Capability, DiscoveryField, DiscoveryFieldType, EdgeTypeSchema, Effect,
+    ImportError, ImportFuture, Importer, ImporterDescriptor, ImporterSchema, LoadResult,
+    SearchDocument, TagHierarchySchema, Transport, WatchPlan,
 };
 use graph_vcs::{Snapshot, VcsStore};
 use std::sync::Arc;
@@ -30,7 +33,9 @@ use vault_data::{VaultEdge, VaultGraph};
 
 use crate::WorldId;
 
-/// The importer id / snapshot source id every world serves under.
+/// The importer id / source kind every world serves under. The source
+/// instance id is the world slug, so published node IDs are
+/// `world:<world-slug>:<local>`.
 pub const WORLD_SOURCE_ID: &str = "world";
 
 /// A graph importer reading a world's versioned snapshot.
@@ -38,16 +43,19 @@ pub struct WorldImporter {
     store: Arc<dyn VcsStore>,
     branch: String,
     scope: String,
+    slug: String,
 }
 
 impl WorldImporter {
     /// An importer over `store`'s `branch` head. `world` namespaces the
-    /// declared capability scopes (`world:<slug>`).
+    /// declared capability scopes (`world:<slug>`) and the published node
+    /// identity (`world:<slug>:<local>`).
     pub fn new(store: Arc<dyn VcsStore>, branch: impl Into<String>, world: &WorldId) -> Self {
         Self {
             store,
             branch: branch.into(),
             scope: format!("world:{}", world.0),
+            slug: world.0.clone(),
         }
     }
 
@@ -57,6 +65,7 @@ impl WorldImporter {
     /// optional facetable `folder`, with one directed `link` edge type.
     pub fn schema() -> ImporterSchema {
         ImporterSchema::new(
+            WORLD_SOURCE_ID,
             vec![
                 DiscoveryField::new("id", DiscoveryFieldType::Keyword, true).searchable(2),
                 DiscoveryField::new("title", DiscoveryFieldType::Text, true)
@@ -122,34 +131,45 @@ impl Importer for WorldImporter {
                     })
                 }
             };
-            Ok(snapshot_to_load_result(snapshot))
+            // World slugs are `[A-Za-z0-9._-]`; an uppercase slug is a legal
+            // world id but not a legal source_id segment, and identity
+            // misconfiguration must fail the import, never publish.
+            let namespace = Namespace::new(WORLD_SOURCE_ID, &self.slug)?;
+            snapshot_to_load_result(snapshot, &namespace, &self.slug)
         })
     }
 }
 
-/// Convert a VCS snapshot into a validated [`LoadResult`].
-fn snapshot_to_load_result(snapshot: Snapshot) -> LoadResult {
+/// Convert a VCS snapshot into a validated [`LoadResult`], namespacing
+/// user-authored local node IDs to `world:<slug>:<local>`.
+fn snapshot_to_load_result(
+    snapshot: Snapshot,
+    namespace: &Namespace,
+    slug: &str,
+) -> Result<LoadResult, ImportError> {
     let mut graph = VaultGraph::new();
     let mut search_documents = Vec::with_capacity(snapshot.nodes.len());
     for (_id, mut node) in snapshot.nodes {
+        let local = node.id.clone();
+        let published = namespace.node_id(&local)?;
         // Normalizations the discovery contract requires of every published
-        // node. Committed nodes may leave these empty.
-        if node.meta.source_id.trim().is_empty() {
-            node.meta.source_id = WORLD_SOURCE_ID.to_string();
-        }
+        // node. Committed nodes may leave these empty; the source instance
+        // is always the world itself.
+        node.id = published.clone();
+        node.meta.source_id = slug.to_string();
         if node.meta.title.trim().is_empty() {
-            node.meta.title = node.id.clone();
+            node.meta.title = local.clone();
         }
         if node.meta.path.trim().is_empty() {
-            node.meta.path = node.id.clone();
+            node.meta.path = local.clone();
         }
         // World content is not filesystem-backed; never advertise source
         // content effects the serving side cannot honor.
         node.meta.content_readable = false;
         node.meta.content_writable = false;
 
-        let mut document = SearchDocument::new(&node.id)
-            .with("id", node.id.clone())
+        let mut document = SearchDocument::new(&published)
+            .with("id", published.clone())
             .with("title", node.meta.title.clone())
             .with("tags", serde_json::json!(node.meta.tags))
             .with("path", node.meta.path.clone())
@@ -170,21 +190,25 @@ fn snapshot_to_load_result(snapshot: Snapshot) -> LoadResult {
 
     // Edges whose endpoints are not both present cannot be published
     // (`VaultGraph::validate` rejects them); report them as unresolved.
+    // Endpoints are rewritten into the same namespace as the nodes.
     let mut unresolved = Vec::new();
     for edge in snapshot.edges {
-        if graph.nodes.contains_key(&edge.source) && graph.nodes.contains_key(&edge.target) {
-            graph.add_edge(VaultEdge {
-                source: edge.source,
-                target: edge.target,
-            });
-        } else {
-            unresolved.push(format!("edge {} -> {}", edge.source, edge.target));
+        let endpoints = namespace
+            .node_id(&edge.source)
+            .and_then(|source| namespace.node_id(&edge.target).map(|target| (source, target)));
+        match endpoints {
+            Ok((source, target))
+                if graph.nodes.contains_key(&source) && graph.nodes.contains_key(&target) =>
+            {
+                graph.add_edge(VaultEdge { source, target });
+            }
+            _ => unresolved.push(format!("edge {} -> {}", edge.source, edge.target)),
         }
     }
 
-    LoadResult {
+    Ok(LoadResult {
         graph,
         search_documents,
         unresolved,
-    }
+    })
 }

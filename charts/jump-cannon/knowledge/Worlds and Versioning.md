@@ -39,6 +39,10 @@ rebuild the graph served under `/worlds/:name/*` through the same atomic
 snapshot path as any importer reload. Other branches are working state until
 merged or rebased onto `main`.
 
+The VCS layer stores user-authored local IDs; publishing namespaces them to
+the unified identity contract, so served node IDs are
+`world:<world-slug>:<local>` (commits and ops keep the local form).
+
 In **browser-alone mode** (no session-manager URL configured) the embedded
 host keeps worlds in-memory and re-exports each one to localStorage after
 every mutation, replaying on boot. The Worlds panel adds a commit editor

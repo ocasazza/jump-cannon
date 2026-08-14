@@ -92,6 +92,7 @@ fn api_routes() -> Router<SourceHost> {
         .route("/vault/page", put(vault_page_put))
         .route("/generate", axum::routing::post(generate_post))
         .route("/progress", get(progress_poll))
+        .route("/log/client", axum::routing::post(client_log_post))
 }
 
 /// The full API surface with state applied, WITHOUT the frontend asset
@@ -521,6 +522,54 @@ async fn compute_health(selection: DefaultSource) -> impl IntoResponse {
     let s = selection.0;
     let status = s.inner.compute_broker.status().await;
     axum::Json(status)
+}
+
+// --- client error telemetry ------------------------------------------------
+//
+// The Dioxus/Tauri app ships client-side failures (panel fetch errors, Rust
+// panics via a panic hook) here so a deployed graph-api / session manager
+// captures what its browsers actually hit — the alternative is asking users
+// to paste webview console text. The client sends fire-and-forget, so the
+// handler stays cheap: validate, truncate, log, 204. Lives in `api_routes`
+// so the session-manager's per-world mounts inherit it.
+
+/// Message cap: generous for panic strings, small enough that a looping
+/// client can't fill the log volume.
+const CLIENT_LOG_MAX_MESSAGE: usize = 4096;
+
+#[derive(Debug, Deserialize)]
+struct ClientLogEntry {
+    /// "error" | "panic" | free-form; unknown levels are accepted and logged
+    /// as-is so old servers don't reject newer clients.
+    level: Option<String>,
+    message: String,
+    /// Structured extras (href, world, panel); logged verbatim.
+    #[serde(default)]
+    context: Option<serde_json::Value>,
+}
+
+fn validate_client_log(mut entry: ClientLogEntry) -> ClientLogEntry {
+    if entry.message.chars().count() > CLIENT_LOG_MAX_MESSAGE {
+        entry.message = entry.message.chars().take(CLIENT_LOG_MAX_MESSAGE).collect();
+        entry.message.push_str("…[truncated]");
+    }
+    entry
+}
+
+async fn client_log_post(Json(entry): Json<ClientLogEntry>) -> StatusCode {
+    let entry = validate_client_log(entry);
+    let level = entry.level.as_deref().unwrap_or("error");
+    match entry.context {
+        Some(context) => tracing::warn!(
+            target: "jump_cannon::client",
+            level,
+            context = %context,
+            "{}",
+            entry.message
+        ),
+        None => tracing::warn!(target: "jump_cannon::client", level, "{}", entry.message),
+    }
+    StatusCode::NO_CONTENT
 }
 
 /// `GET /compute/engines` (FROZEN CONTRACT). Enumerates the worker's
@@ -2161,6 +2210,35 @@ mod tests {
         assert!(validate_layout_stream_session(&stale_selection, 42, 7)
             .unwrap_err()
             .contains("stale selection generation"));
+    }
+
+    #[test]
+    fn client_log_truncates_oversize_messages_on_char_boundaries() {
+        let entry = ClientLogEntry {
+            level: None,
+            message: "x".repeat(10_000),
+            context: None,
+        };
+        let v = validate_client_log(entry);
+        assert!(v.message.len() <= CLIENT_LOG_MAX_MESSAGE + 16);
+        assert!(v.message.ends_with("…[truncated]"));
+
+        // Multi-byte content must not split a char (String::truncate would
+        // panic here).
+        let entry = ClientLogEntry {
+            level: Some("panic".into()),
+            message: "é".repeat(10_000),
+            context: Some(serde_json::json!({"panel": "gpu"})),
+        };
+        let v = validate_client_log(entry);
+        assert!(v.message.ends_with("…[truncated]"));
+
+        let short = ClientLogEntry {
+            level: None,
+            message: "fine".into(),
+            context: None,
+        };
+        assert_eq!(validate_client_log(short).message, "fine");
     }
 
     #[test]
