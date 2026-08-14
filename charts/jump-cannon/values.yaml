@@ -331,7 +331,7 @@ sessionManager:
 # it and reference that Secret via adminPasswordSecret.
 terminusdb:
   enabled: false
-  image: terminusdb/terminusdb:v12.0.7
+  image: terminusdb/terminusdb-server:v12.0.7
   service:
     port: 6363
   persistence:

@@ -86,7 +86,7 @@ stays at one replica.
 | Value | Default | Purpose |
 |---|---|---|
 | `terminusdb.enabled` | `false` | Deploy the TerminusDB StatefulSet |
-| `terminusdb.image` | `terminusdb/terminusdb:v12.0.7` | Server image (pinned tag) |
+| `terminusdb.image` | `terminusdb/terminusdb-server:v12.0.7` | Server image (pinned tag) |
 | `terminusdb.service.port` | `6363` | Service port |
 | `terminusdb.persistence.size` / `.storageClass` | `10Gi` / `null` (cluster default) | Data volumeClaimTemplate |
 | `terminusdb.adminPasswordSecret.name` / `.key` | `""` / `password` | User-created Secret holding the admin password |

@@ -9,6 +9,10 @@ description = "Jujutsu-inspired version-control core for VaultGraph snapshots, b
 # embedded app never pull an HTTP client; enabled by session-manager's
 # `server` feature.
 terminus = ["dep:reqwest"]
+# Exposes the reusable `contract` module (the VcsStore parity suite) for
+# external backend test harnesses. Always compiled for this crate's own
+# tests; mirrors session-manager's `conformance` feature.
+contract = []
 
 [dependencies]
 vault-data = { path = "../vault-data" }

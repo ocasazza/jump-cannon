@@ -1,0 +1,26 @@
+feat(graph-vcs): verify M6 TerminusStore against a live server + shared parity contract
+
+The TerminusDB backend shipped in the session-manager commit had never run
+against a real server. Booting terminusdb/terminusdb-server:v12.0.7 surfaced
+three bugs, fixed here:
+
+- TerminusStore::new auto-provisions its organization (POST
+  /api/organization) before database/schema — a fresh server only has the
+  admin org, so every open previously failed.
+- Document writes switch from POST overwrite=true (which *appends* field
+  values, corrupting single-valued fields like branch heads into sets) to
+  PUT create=true (true replace/upsert).
+- Chart image corrected: terminusdb/terminusdb does not exist on Docker
+  Hub; pinned terminusdb/terminusdb-server:v12.0.7.
+
+Parity tests: the ten store-level scenarios move into graph_vcs::contract
+(feature contract, mirroring the session-manager conformance suite) and run
+identically against MinigrafStore (always) and TerminusStore via
+tests/terminus_contract.rs — env-gated on TERMINUSDB_TEST_URL, or
+TERMINUSDB_BOOT_CONTAINER=docker|podman to boot the pinned image and run
+the whole contract plus a reopen-persistence check; auto-skip otherwise, so
+cargo test -p graph-vcs --all-features stays green with no container
+runtime. Verified green against podman-booted TerminusDB.
+
+Docs: M6 marked done in docs/session-manager-plan.md with the verification
+findings; AGENTS.md crate map updated.
