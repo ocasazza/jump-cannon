@@ -47,17 +47,69 @@ use minigraf::{Minigraf, QueryResult, Value};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 #[cfg(not(target_arch = "wasm32"))]
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+#[cfg(not(target_arch = "wasm32"))]
+use std::sync::{Arc, OnceLock, Weak};
 
 /// Maximum byte length of one chunk payload. File-backed minigraf caps a
 /// serialized fact at 4080 bytes; 3000 leaves ample header room.
 const CHUNK_BYTES: usize = 3000;
 
+/// Process-local registry of file-backed stores this process opened through
+/// [`MinigrafStore::open`], held as weak tokens: alive while the store handle
+/// lives, dead once it drops.
+///
+/// minigraf's own same-process lock check (`holder PID == our PID` → refuse)
+/// misfires under PID namespaces: in Kubernetes every container's main
+/// process is PID 1, so a stale `<world>.graph.lock` left by a previous pod
+/// reads as "this process holds it" and the world file is bricked after
+/// every pod restart. The registry is the source of truth for "do WE hold
+/// it": a lock file whose holder PID equals ours while the registry has no
+/// live token for the path can only be a dead container's leftover, and is
+/// reclaimed before open. A live token (genuine same-process double-open —
+/// minigraf issue #304) or a lock held by a different live PID are left
+/// untouched and minigraf's original error stands.
+#[cfg(not(target_arch = "wasm32"))]
+static OPEN_FILES: OnceLock<Mutex<HashMap<PathBuf, Weak<()>>>> = OnceLock::new();
+
+/// The sidecar lock path minigraf derives for a database file
+/// (`db.with_extension("graph.lock")` — see minigraf's `FileLock`).
+#[cfg(not(target_arch = "wasm32"))]
+fn lock_path_for(db_path: &Path) -> PathBuf {
+    db_path.with_extension("graph.lock")
+}
+
+/// Remove `db_path`'s lock file when its holder cannot be a live foreign
+/// process: the holder PID is ours (PID-namespace aliasing — safe only
+/// because the [`OPEN_FILES`] registry proves we hold no handle), or the
+/// holder is dead (`/proc/<pid>` absent). Anything else is left for
+/// minigraf's own checks to reject.
+#[cfg(not(target_arch = "wasm32"))]
+fn reclaim_stale_lock(db_path: &Path) {
+    let lock_path = lock_path_for(db_path);
+    let Ok(holder) = std::fs::read_to_string(&lock_path) else {
+        return; // no lock file (or unreadable): nothing to reclaim
+    };
+    let Ok(pid) = holder.trim().parse::<u32>() else {
+        return; // unparseable holder: conservative, leave it
+    };
+    let ours = pid == std::process::id();
+    let alive = std::path::Path::new(&format!("/proc/{pid}")).exists();
+    // No /proc (macOS dev): only the aliased-self case is safe to reclaim.
+    if ours || !alive {
+        let _ = std::fs::remove_file(&lock_path);
+    }
+}
+
 /// Embedded, minigraf-backed [`VcsStore`].
 pub struct MinigrafStore {
     db: Minigraf,
     mu: Mutex<()>,
+    /// Keeps the [`OPEN_FILES`] registry entry alive while this store is
+    /// open; never read directly.
+    #[cfg(not(target_arch = "wasm32"))]
+    _lock_token: Option<Arc<()>>,
 }
 
 // The store is shared through the object-safe trait, so it must be Send+Sync.
@@ -70,15 +122,47 @@ impl MinigrafStore {
     /// Open (or create) a file-backed store. Native only: minigraf owns the
     /// filesystem path handling, and file-backed minigraf is not available
     /// on wasm32.
+    ///
+    /// Reclaims stale container locks before opening (see [`OPEN_FILES`]):
+    /// a leftover lock whose holder PID aliases ours (PID namespaces) or
+    /// names a dead process is removed when this process holds no live
+    /// handle for the path.
     #[cfg(not(target_arch = "wasm32"))]
     pub fn open(path: impl AsRef<Path>) -> Result<Self, VcsError> {
+        let path = path.as_ref();
+        // Absolutize without canonicalizing (the file may not exist yet) so
+        // the registry key is CWD-independent.
+        let key = std::env::current_dir()
+            .map(|dir| dir.join(path))
+            .unwrap_or_else(|_| path.to_path_buf());
+        let registry = OPEN_FILES.get_or_init(|| Mutex::new(HashMap::new()));
+        {
+            let registry = registry
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let we_hold_it = registry
+                .get(&key)
+                .and_then(Weak::upgrade)
+                .is_some();
+            if !we_hold_it {
+                reclaim_stale_lock(&key);
+            }
+            // A live token: a genuine same-process double-open — fall through
+            // and let minigraf's check reject it.
+        }
         let db = minigraf::OpenOptions::new()
             .path(path)
             .open()
             .map_err(|e| store_err(e))?;
+        let token = Arc::new(());
+        registry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(key, Arc::downgrade(&token));
         Ok(Self {
             db,
             mu: Mutex::new(()),
+            _lock_token: Some(token),
         })
     }
 
@@ -88,6 +172,8 @@ impl MinigrafStore {
         Ok(Self {
             db,
             mu: Mutex::new(()),
+            #[cfg(not(target_arch = "wasm32"))]
+            _lock_token: None,
         })
     }
 
