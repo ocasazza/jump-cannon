@@ -1,6 +1,13 @@
 # Session manager plan and handoff
 
-Status: milestones 1–5 implemented (pending final app type-check); 6–8 remain.
+Status: all milestones implemented and **deployed** (2026-08-14). The cluster
+runs the session manager (`jump-cannon-session-manager` image, minigraf
+store, per-world GPU broker; single-tenant `graphCompute.session` retired)
+behind the NetBird proxy at
+`https://jump-cannon-sessions.proxy.cluster.nixstation.internal`. Worlds
+publish namespaced node IDs (`world:<world-slug>:<local>`) under discovery
+schema v2. Client errors ship to `POST /log/client` (pod logs, target
+`jump_cannon::client`).
 
 This is the living handoff for the k8s-native session manager arc: shared
 versioned worlds, Jujutsu-inspired graph versioning over minigraf (embedded)

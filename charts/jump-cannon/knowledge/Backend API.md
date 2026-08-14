@@ -44,3 +44,11 @@ lifecycle as derived state with the broker status embedded, and
 envelopes, and the pair reports `{"enabled": false}` where no cluster is
 available (local development). Session progress and bounded worker logs emit
 to the `gpu-session` group on `/progress`.
+
+`POST /log/client` is the client-error intake: the Dioxus/Tauri app ships
+panel fetch errors and wasm panics here (fire-and-forget, deduped), and the
+server logs them under the `jump_cannon::client` tracing target (204; 422 on
+malformed payloads; messages truncate at 4096 chars). The session manager's
+per-world mounts inherit the route, so world-scoped failures land in the
+session-manager pod's logs. When a user reports a UI failure, grep the pod
+logs for `jump_cannon::client` before asking for console text.
