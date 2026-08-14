@@ -753,6 +753,11 @@
             # in the image, so ssh state (known_hosts) stays writable there.
             export GIT_SSH_COMMAND="ssh -i /secrets/okf-reader/id_ed25519 -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=/tmp/known_hosts"
 
+            # The provisioned claim root is owned by root while the pod runs
+            # as 10001 (fsGroup only fixes the group); git's dubious-ownership
+            # check rejects it otherwise. HOME=/tmp keeps --global writable.
+            git config --global --add safe.directory "$OKF_TARGET_DIR"
+
             if [ -d "$OKF_TARGET_DIR/.git" ]; then
               # Existing checkout. Normalize the origin remote first: the claim
               # may have been seeded by the producer's own git working tree
@@ -763,6 +768,17 @@
                 git -C "$OKF_TARGET_DIR" remote add origin "$OKF_REPO_URL"
               fi
               git -C "$OKF_TARGET_DIR" fetch origin
+              if ! git -C "$OKF_TARGET_DIR" ls-remote --heads origin main | grep -q .; then
+                echo "okf-sync: origin has no main branch yet (producer has not pushed); nothing to do"
+                exit 0
+              fi
+              if ! git -C "$OKF_TARGET_DIR" rev-parse --verify HEAD >/dev/null 2>&1; then
+                # An earlier pre-first-push run initialized the repo but had
+                # nothing to fetch, so HEAD is unborn; materialize now.
+                git -C "$OKF_TARGET_DIR" reset --hard origin/main
+                echo "okf-sync: materialized $OKF_TARGET_DIR at $(git -C "$OKF_TARGET_DIR" rev-parse HEAD)"
+                exit 0
+              fi
               # The claim is a read replica: fast-forward only. A diverged,
               # locally-committed-ahead, or non-main checkout is an operator
               # incident, never something to merge or force — fail loudly and
@@ -789,6 +805,10 @@
               git -C "$OKF_TARGET_DIR" init -b main
               git -C "$OKF_TARGET_DIR" remote add origin "$OKF_REPO_URL"
               git -C "$OKF_TARGET_DIR" fetch origin
+              if ! git -C "$OKF_TARGET_DIR" ls-remote --heads origin main | grep -q .; then
+                echo "okf-sync: origin has no main branch yet (producer has not pushed); nothing to do"
+                exit 0
+              fi
               git -C "$OKF_TARGET_DIR" reset --hard origin/main
               echo "okf-sync: cloned $OKF_REPO_URL into $OKF_TARGET_DIR at $(git -C "$OKF_TARGET_DIR" rev-parse HEAD)"
             fi
