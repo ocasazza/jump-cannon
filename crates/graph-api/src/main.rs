@@ -246,6 +246,11 @@ async fn main() -> anyhow::Result<()> {    let _ = dotenvy::dotenv();
     .context("invalid deployment importer catalog")?;
 
     let importer: Box<dyn Importer> = match source_kind {
+        data_loader::SourceKind::World => {
+            anyhow::bail!(
+                "`--source world` is not a standalone source: shared worlds are hosted by the session manager (crates/session-manager)"
+            )
+        }
         data_loader::SourceKind::Obsidian => {
             tracing::info!(vault_root = %vault_root.display(), "using obsidian loader");
             Box::new(vault_links::ObsidianLoader::new(vault_root.clone()))

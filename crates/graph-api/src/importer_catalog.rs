@@ -42,6 +42,9 @@ pub enum CatalogSourceKind {
     Okf,
     Pest,
     GitHub,
+    /// Session-manager shared world; never constructible from chart catalog
+    /// metadata (no filesystem source), like the other non-filesystem kinds.
+    World,
 }
 
 impl From<SourceKind> for CatalogSourceKind {
@@ -54,6 +57,7 @@ impl From<SourceKind> for CatalogSourceKind {
             SourceKind::Okf => Self::Okf,
             SourceKind::Pest => Self::Pest,
             SourceKind::GitHub => Self::GitHub,
+            SourceKind::World => Self::World,
         }
     }
 }

@@ -142,6 +142,7 @@ async fn world_create_commit_serves_graph() {
 
     // Commit on main, then the push-trigger rebuild must land in the served
     // graph (this exercises mux → WorldImporter → push trigger end to end).
+    // Served ids carry the unified namespace: world:<slug>:<local>.
     let resp = commit(
         &http,
         &base,
@@ -167,7 +168,7 @@ async fn world_create_commit_serves_graph() {
         .unwrap();
         assert_eq!(resp.status(), 200);
         let ids: Vec<String> = resp.json().await.unwrap();
-        if ids == ["node-1"] {
+        if ids == ["world:alpha-world:node-1"] {
             break;
         }
         assert!(

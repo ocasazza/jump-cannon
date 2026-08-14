@@ -14,7 +14,7 @@ The test harness in `crates/test-browser/` is the only exception, and only becau
 
 | Crate | Role |
 |---|---|
-| `crates/data-loader` | Source-neutral importer contracts. Every descriptor carries discovery schema version 1, and every completed import emits one validated `SearchDocument` per graph node. Defines the seven CLI source kinds: Obsidian, tvix, generate, Kubernetes, OKF, Pest, and GitHub. |
+| `crates/data-loader` | Source-neutral importer contracts. Every descriptor carries discovery schema version 2, and every completed import emits one validated `SearchDocument` per graph node. Defines the seven CLI source kinds (Obsidian, tvix, generate, Kubernetes, OKF, Pest, GitHub) plus `world`, which is served by the session manager rather than the standalone CLI. |
 | `crates/graph-api` | axum HTTP server. Loads the selected importer, serves `/graph/*`, `/graph/schema`, `/node/*id`, `/search`, `/vault/page` (Obsidian editor PUT), `/progress`, etc. Atomically swaps an in-memory `GraphSnapshot` containing the graph, importer schema, generic Tantivy search index, schema-driven facets, metrics, and binary caches. Serves the frontend dist from `--assets-dir` / `JUMP_CANNON_ASSETS_DIR`. |
 | `crates/graph-layouts` | wgpu compute force-sim. Native + WASM. Consumed in-process by `app/ui` (path dependency). |
 | `crates/graph-compute` | Optional standalone layout solver, gRPC on `[::1]:50051`. Opt-in via `--compute-url` / `JUMP_CANNON_COMPUTE_URL` — unset means the broker is never dialed. Runs through the local docker-compose development stack or the Helm chart's Kueue-admitted RayCluster. |

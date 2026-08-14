@@ -780,6 +780,10 @@ pub enum SourceKind {
     /// Import a vault corpus from a GitHub repository tarball (codeload,
     /// ETag-revalidated polling).
     GitHub,
+    /// A versioned shared world served by the session manager
+    /// (`crates/session-manager`). Not a CLI-selectable source: worlds are
+    /// hosted per-world by the session-manager server.
+    World,
 }
 
 impl SourceKind {
@@ -793,13 +797,16 @@ impl SourceKind {
             "okf" | "open-knowledge-format" => Some(Self::Okf),
             "pest" | "grammar" => Some(Self::Pest),
             "github" => Some(Self::GitHub),
+            "world" => Some(Self::World),
             _ => None,
         }
     }
 
     /// All known source kinds (for help text).
     pub fn all() -> &'static [&'static str] {
-        &["obsidian", "tvix", "generate", "kubernetes", "okf", "pest", "github"]
+        &[
+            "obsidian", "tvix", "generate", "kubernetes", "okf", "pest", "github", "world",
+        ]
     }
 }
 
