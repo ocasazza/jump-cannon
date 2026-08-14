@@ -62,3 +62,15 @@ world-store PVC, RBAC, per-world RayCluster template). Exactly one replica is
 supported, and `sessionManager.gpu` is mutually exclusive with the legacy
 `graphCompute.session` mode — the chart fails the render otherwise. Review the
 values in [[Helm Deployment]] and the component picture in [[Architecture]].
+
+**Deployed** (2026-08-14): the consumer component
+(`envoy-ai-gateway/.../platforms/jump-cannon.nix`) enables the manager with
+the minigraf store and the per-world GPU broker, and exposes it through the
+NetBird TLS proxy at
+`https://jump-cannon-sessions.proxy.cluster.nixstation.internal` (the shared
+proxy injects `x-user`; browsers put this URL in Settings → session manager).
+The single-tenant `graphCompute.session` is retired there; per-world
+dispatch creates a Kueue-held RayCluster in `gpu-workloads` until quota is
+granted ("waiting for a seed, not broken" — [[Ray GPU Sessions]]). The
+`jump-cannon-session-manager` image publishes like the other runtime images
+([[GitOps Release]]).
