@@ -385,6 +385,43 @@ fn file_backed_reopen_preserves_state() {
     assert_eq!(block_on(store.op_log(10)).unwrap().len(), 1);
 }
 
+/// A leftover lock file whose holder PID aliases ours (every container's
+/// main process is PID 1 in its own PID namespace, so a dead pod's lock
+/// reads as "this process") must be reclaimed once no live handle exists.
+#[test]
+fn stale_container_lock_is_reclaimed() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("world.graph");
+    {
+        let store = MinigrafStore::open(&path).unwrap();
+        block_on(store.commit("main", vec![upsert(node("kept"))], "alice", "seed")).unwrap();
+        // drop: the clean FileLock drop removes the lock file.
+    }
+    // Simulate the dead pod's leftover: a lock file bearing OUR pid.
+    std::fs::write(
+        path.with_extension("graph.lock"),
+        std::process::id().to_string(),
+    )
+    .unwrap();
+    let store = MinigrafStore::open(&path)
+        .expect("stale same-PID lock with no live handle must be reclaimed");
+    assert!(block_on(store.head("main")).unwrap().is_some());
+}
+
+/// The registry must not weaken minigraf's real protection: a second open
+/// while we hold a live handle on the same file still fails.
+#[test]
+fn live_same_process_double_open_still_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("world.graph");
+    let _store = MinigrafStore::open(&path).unwrap();
+    let err = match MinigrafStore::open(&path) {
+        Ok(_) => panic!("double open of a live handle must fail"),
+        Err(e) => e.to_string(),
+    };
+    assert!(err.contains("already open"), "unexpected error: {err}");
+}
+
 // ── Pure merge/diff unit coverage ───────────────────────────────────────────
 
 #[test]
