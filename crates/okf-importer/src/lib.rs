@@ -15,9 +15,9 @@ use std::{
 };
 
 use data_loader::{
-    Capability, DiscoveryField, DiscoveryFieldType, EdgeTypeSchema, Effect, ImportError,
-    ImportFuture, Importer, ImporterDescriptor, ImporterSchema, LoadResult, SearchDocument,
-    TagHierarchySchema, Transport, WatchPlan,
+    identity::Namespace, Capability, DiscoveryField, DiscoveryFieldType, EdgeTypeSchema, Effect,
+    ImportError, ImportFuture, Importer, ImporterDescriptor, ImporterSchema, LoadResult,
+    SearchDocument, TagHierarchySchema, Transport, WatchPlan,
 };
 use percent_encoding::percent_decode_str;
 use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
@@ -143,6 +143,7 @@ impl Limits {
 pub struct OkfImporter {
     root: PathBuf,
     source_id: String,
+    namespace: Namespace,
     limits: Limits,
 }
 
@@ -158,17 +159,10 @@ impl OkfImporter {
     ) -> Result<Self, OkfError> {
         let configured_root = root.into();
         let source_id = source_id.into();
-        if source_id.is_empty()
-            || source_id.len() > 128
-            || !source_id
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
-        {
-            return Err(OkfError::InvalidConfiguration(
-                "OKF source_id must be at most 128 bytes and contain only ASCII letters, digits, '-', '_', or '.'"
-                    .into(),
-            ));
-        }
+        // The shared namespace-ambiguity rule (`[a-z0-9._-]{1,128}`, no `:`),
+        // enforced for every importer by data-loader's identity contract.
+        let namespace = Namespace::new("okf", &source_id)
+            .map_err(|error| OkfError::InvalidConfiguration(error.to_string()))?;
         let root = configured_root
             .canonicalize()
             .map_err(|source| OkfError::Io {
@@ -188,6 +182,7 @@ impl OkfImporter {
         Ok(Self {
             root,
             source_id,
+            namespace,
             limits: limits.validate()?,
         })
     }
@@ -366,7 +361,7 @@ impl OkfImporter {
                 body,
                 mtime,
             } = concept;
-            let node_id = self.node_id(&id);
+            let node_id = self.node_id(&id)?;
             let folder = concept_folder(&id);
             search_documents.push(okf_search_document(
                 &node_id,
@@ -517,18 +512,20 @@ impl OkfImporter {
             });
         }
         *edge_endpoint_bytes = next_endpoint_bytes;
-        let source = self.node_id(source);
-        let target = self.node_id(target);
+        let source = self.node_id(source)?;
+        let target = self.node_id(target)?;
         graph.add_edge(VaultEdge { source, target });
         Ok(())
     }
 
-    fn node_id(&self, concept_id: &str) -> String {
-        format!("okf:{}:{concept_id}", self.source_id)
+    fn node_id(&self, concept_id: &str) -> Result<String, OkfError> {
+        self.namespace
+            .node_id(concept_id)
+            .map_err(|error| OkfError::Graph(error.to_string()))
     }
 
     fn node_id_len(&self, concept_id: &str) -> usize {
-        "okf:".len() + self.source_id.len() + ':'.len_utf8() + concept_id.len()
+        self.namespace.prefix().len() + concept_id.len()
     }
 }
 
@@ -726,6 +723,7 @@ fn extract_source_resources(mapping: &serde_yaml::Mapping) -> Vec<String> {
 
 fn okf_schema() -> ImporterSchema {
     ImporterSchema::new(
+        "okf",
         vec![
             DiscoveryField::new("id", DiscoveryFieldType::Keyword, true).searchable(2),
             DiscoveryField::new("title", DiscoveryFieldType::Text, true)
@@ -2048,12 +2046,26 @@ type: source
 
     #[test]
     fn source_ids_cannot_make_ambiguous_node_namespaces() {
-        for invalid in ["", "has space", "a:b", "path/segment", "unicode-λ"] {
+        for invalid in ["", "has space", "a:b", "path/segment", "unicode-λ", "UPPER"] {
             let error = OkfImporter::new(".", invalid).unwrap_err();
             assert!(matches!(error, OkfError::InvalidConfiguration(_)));
         }
         assert!(OkfImporter::new(".", "a".repeat(129)).is_err());
         assert!(OkfImporter::new(".", "team-blue_2.prod").is_ok());
+    }
+
+    #[tokio::test]
+    async fn okf_importer_satisfies_the_shared_import_contract() {
+        let fixture = TempDir::new().unwrap();
+        write(
+            fixture.path(),
+            "concepts/alpha.md",
+            &concept("metric", "[Beta](./beta.md)"),
+        );
+        write(fixture.path(), "concepts/beta.md", &concept("table", ""));
+
+        let importer = OkfImporter::new(fixture.path(), "fixture").unwrap();
+        data_loader::testing::assert_import_contract(&importer).await;
     }
 
     #[cfg(unix)]

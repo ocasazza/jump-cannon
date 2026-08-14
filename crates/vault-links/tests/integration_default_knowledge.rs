@@ -50,9 +50,10 @@ fn default_knowledge_base_is_connected_and_resolved() {
         "Jump Cannon/Compute",
         "Jump Cannon/Agent Workflow",
     ] {
+        let node_id = format!("obsidian:obsidian:{required}");
         assert!(
-            result.graph.nodes.contains_key(required),
-            "missing default branch {required}"
+            result.graph.nodes.contains_key(&node_id),
+            "missing default branch {node_id}"
         );
     }
 
@@ -64,7 +65,7 @@ fn default_knowledge_base_is_connected_and_resolved() {
             .push(edge.target.as_str());
     }
     let mut visited = HashSet::new();
-    let mut queue = VecDeque::from(["Jump Cannon/Start Here"]);
+    let mut queue = VecDeque::from(["obsidian:obsidian:Jump Cannon/Start Here"]);
     while let Some(id) = queue.pop_front() {
         if !visited.insert(id) {
             continue;

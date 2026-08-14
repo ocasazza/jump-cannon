@@ -2,11 +2,28 @@
 {{- $graphSource := $importer.kind -}}
 {{- $usesFilesystem := $importer.usesFilesystem -}}
 {{- $usesKubernetes := $importer.usesKubernetes -}}
+{{- $usesGitHub := eq $importer.kind "github" -}}
 {{- $filesystemRescanSeconds := $importer.filesystemRescanIntervalSeconds -}}
 {{- $hasKnowledge := and $importer.allowsSeeds .Values.vault.seed.enabled .Values.vault.seed.includeKnowledgeBase -}}
 {{- $hasSeedFiles := and $importer.allowsSeeds .Values.vault.seed.enabled (gt (len .Values.vault.seed.files) 0) -}}
 {{- $seedsVault := or $hasKnowledge $hasSeedFiles -}}
 {{- $gpuSession := and .Values.graphCompute.enabled .Values.graphCompute.session.enabled -}}
+{{- /* Dormant filesystem sources: when runtime switching is enabled
+     (importers.runtimeSwitchGroup non-empty), every catalog entry with a
+     source block whose volume differs from the selected importer's is also
+     mounted read-only, so runtime per-user source switching can serve it
+     without a rollout. Keep this gated on the switch group: mounting a
+     dormant profile's claim makes it a hard pod dependency, so a profile
+     whose producer claim is not provisioned yet would block every rollout.
+     The seed-vault init container stays selected-only. */ -}}
+{{- $dormantSources := list -}}
+{{- if .Values.importers.runtimeSwitchGroup -}}
+{{- range $id, $profile := .Values.importers.sources -}}
+  {{- if and (kindIs "map" $profile) (hasKey $profile "source") (ne $profile.source.volumeName $importer.volumeName) -}}
+    {{- $dormantSources = append $dormantSources $profile.source -}}
+  {{- end -}}
+{{- end -}}
+{{- end -}}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -25,8 +42,11 @@ spec:
       labels:
         {{- include "jump-cannon.selectorLabels" . | nindent 8 }}
         app.kubernetes.io/component: graph-api
-      {{- if or $usesKubernetes $seedsVault $gpuSession }}
+      {{- /* chart.appVersion carries the source revision (chart-tarball stamps
+             it at package time), so a new build rolls the pods onto the new
+             `latest` image even when no template or value changed. */}}
       annotations:
+        chart.appVersion: {{ .Chart.AppVersion | quote }}
         {{- if $seedsVault }}
         checksum/vault-content: {{ printf "%s%s" (include (print $.Template.BasePath "/configmap-vault-knowledge.yaml") .) (include (print $.Template.BasePath "/configmap-vault-seed.yaml") .) | sha256sum }}
         {{- end }}
@@ -36,7 +56,6 @@ spec:
         {{- if $gpuSession }}
         checksum/gpu-session-template: {{ include "jump-cannon.rayclusterManifest" . | sha256sum }}
         {{- end }}
-      {{- end }}
     spec:
       serviceAccountName: {{ include "jump-cannon.serviceAccountName" . }}
       {{- /* The GPU session controller needs in-cluster API access to manage the
@@ -116,6 +135,10 @@ spec:
               value: {{ $graphSource | quote }}
             - name: JUMP_CANNON_IMPORTER_CATALOG_JSON
               value: {{ dict "selected" .Values.importers.selected "sources" .Values.importers.sources | toJson | quote }}
+            {{- if .Values.importers.runtimeSwitchGroup }}
+            - name: JUMP_CANNON_IMPORTER_SWITCH_GROUP
+              value: {{ .Values.importers.runtimeSwitchGroup | quote }}
+            {{- end }}
             {{- if $usesKubernetes }}
             - name: JUMP_CANNON_KUBERNETES_CONFIG
               value: {{ printf "%s/config.json" .Values.kubernetesImporter.mountPath | quote }}
@@ -123,6 +146,25 @@ spec:
             {{- if eq $graphSource "okf" }}
             - name: JUMP_CANNON_OKF_SOURCE_ID
               value: {{ $importer.sourceId | quote }}
+            {{- end }}
+            {{- if $usesGitHub }}
+            - name: JUMP_CANNON_GITHUB_REPO
+              value: {{ .Values.githubImporter.repo | quote }}
+            - name: JUMP_CANNON_GITHUB_REF
+              value: {{ .Values.githubImporter.ref | quote }}
+            - name: JUMP_CANNON_GITHUB_PATH
+              value: {{ .Values.githubImporter.path | quote }}
+            - name: JUMP_CANNON_GITHUB_POLL_INTERVAL_MS
+              value: {{ mul (int .Values.githubImporter.pollIntervalSeconds) 1000 | quote }}
+            - name: JUMP_CANNON_GITHUB_CACHE_DIR
+              value: {{ .Values.githubImporter.cacheDir | quote }}
+            {{- if .Values.githubImporter.tokenSecret.name }}
+            - name: JUMP_CANNON_GITHUB_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.githubImporter.tokenSecret.name | quote }}
+                  key: {{ .Values.githubImporter.tokenSecret.key | quote }}
+            {{- end }}
             {{- end }}
             {{- if $usesFilesystem }}
             - name: VAULT_ROOT
@@ -167,7 +209,7 @@ spec:
             {{- toYaml .Values.graphApi.resources | nindent 12 }}
           securityContext:
             {{- toYaml .Values.containerSecurityContext | nindent 12 }}
-          {{- if or $usesFilesystem $usesKubernetes $gpuSession }}
+          {{- if or $usesFilesystem $usesKubernetes $usesGitHub $gpuSession $dormantSources }}
           volumeMounts:
             {{- if $usesFilesystem }}
             - name: {{ $importer.volumeName }}
@@ -175,6 +217,15 @@ spec:
               {{- if $importer.readOnly }}
               readOnly: true
               {{- end }}
+            {{- end }}
+            {{- range $dormant := $dormantSources }}
+            - name: {{ $dormant.volumeName }}
+              mountPath: {{ $dormant.mountPath }}
+              readOnly: true
+            {{- end }}
+            {{- if $usesGitHub }}
+            - name: github-importer-cache
+              mountPath: {{ .Values.githubImporter.cacheDir | quote }}
             {{- end }}
             {{- if $usesKubernetes }}
             - name: kubernetes-importer-config
@@ -193,8 +244,18 @@ spec:
               readOnly: true
             {{- end }}
           {{- end }}
-      {{- if or $usesFilesystem $usesKubernetes $gpuSession }}
+      {{- if or $usesFilesystem $usesKubernetes $usesGitHub $gpuSession $dormantSources }}
       volumes:
+        {{- if $usesGitHub }}
+        - name: github-importer-cache
+          emptyDir: {}
+        {{- end }}
+        {{- range $dormant := $dormantSources }}
+        - name: {{ $dormant.volumeName }}
+          persistentVolumeClaim:
+            claimName: {{ $dormant.existingClaim }}
+            readOnly: true
+        {{- end }}
         {{- if $usesFilesystem }}
         - name: {{ $importer.volumeName }}
           {{- if $importer.named }}

@@ -38,7 +38,9 @@ graphApi:
   replicas: 1
   # Source identifier understood by graph-api. Enabling the Kubernetes
   # importer below selects kubernetes regardless of this value. Set this to
-  # okf to load an Open Knowledge Format bundle from the vault mount.
+  # okf to load an Open Knowledge Format bundle from the vault mount. Set
+  # this to github to pull the knowledge corpus from a GitHub repository
+  # (see githubImporter below) instead of the vault filesystem.
   source: obsidian
   # Optional full-rescan fallback for non-OKF filesystem sources. Set this
   # above 0 when writes arrive through another pod or mount.
@@ -65,6 +67,15 @@ graphApi:
 # kinds remain available through their source-specific CLI configuration.
 importers:
   selected: ""
+  # NetBird group allowed to switch the viewed source at runtime from
+  # Settings > Importers (per browser session, read-only graph views; writes
+  # and compute stay on the deployment-selected source). Empty disables
+  # runtime switching entirely and preserves the rollout-only behavior where
+  # importers.selected is the only way to change the active source.
+  # Non-empty also mounts every configured filesystem source's claim
+  # read-only, so only set it once every dormant profile's producer claim
+  # exists in this namespace — a missing claim blocks pod startup.
+  runtimeSwitchGroup: ""
   sources:
     lavender-ingest-okf:
       displayName: Lavender Ingest OKF
@@ -94,6 +105,26 @@ okfImporter:
   # inotify events in the graph-api pod. Set to 0 only when notifications are
   # known to propagate; increase this interval for especially large bundles.
   filesystemRescanIntervalSeconds: 60
+
+# GitHub docs-importer mode, selected with graphApi.source: github. graph-api
+# downloads the repository tarball (codeload) for the configured ref, extracts
+# it into an ephemeral pod cache, and parses the configured subdirectory with
+# the same Obsidian markdown pipeline the vault filesystem source uses. This
+# is the docs-importer mode: knowledge updates flow push-to-main -> poll ->
+# rebuild without a chart republish. The vault ConfigMap sync remains the
+# fallback under graphApi.source: obsidian and is untouched by this mode.
+githubImporter:
+  repo: "ocasazza/jump-cannon"
+  ref: "main"
+  path: "charts/jump-cannon/knowledge"
+  pollIntervalSeconds: 60
+  # Ephemeral extraction cache mounted as an emptyDir in the graph-api pod.
+  cacheDir: "/var/cache/jump-cannon/github"
+  # Token for private mirrors comes from an existing Secret, never values:
+  #   tokenSecret: { name: "jump-cannon-github", key: "token" }
+  tokenSecret:
+    name: ""
+    key: "token"
 
 # Import Kubernetes API resources as graph nodes. The importer package is
 # configuration only; credentials and RBAC remain host-owned effects.

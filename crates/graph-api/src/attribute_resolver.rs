@@ -265,6 +265,24 @@ mod tests {
     use vault_data::{NodeMetrics, VaultEdge, VaultGraph, VaultNode};
 
     fn test_snapshot(mut graph: VaultGraph) -> GraphSnapshot {
+        // The shared identity contract requires namespaced node IDs; rewrite
+        // the fixture's bare IDs into the `generate:test:` namespace.
+        let bare_ids: Vec<String> = graph.nodes.keys().cloned().collect();
+        for bare in &bare_ids {
+            let node = graph.nodes.shift_remove(bare).expect("fixture node");
+            let namespaced = format!("generate:test:{bare}");
+            graph.nodes.insert(
+                namespaced.clone(),
+                VaultNode {
+                    id: namespaced,
+                    ..node
+                },
+            );
+        }
+        for edge in &mut graph.edges {
+            edge.source = format!("generate:test:{}", edge.source);
+            edge.target = format!("generate:test:{}", edge.target);
+        }
         let search_documents = graph
             .nodes
             .values_mut()
@@ -282,6 +300,7 @@ mod tests {
             })
             .collect();
         let schema = ImporterSchema::new(
+            "generate",
             vec![
                 DiscoveryField::new("id", DiscoveryFieldType::Keyword, true).searchable(2),
                 DiscoveryField::new("title", DiscoveryFieldType::Text, true).searchable(4),

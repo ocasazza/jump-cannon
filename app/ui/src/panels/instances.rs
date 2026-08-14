@@ -133,7 +133,7 @@ pub(crate) fn download_text(filename: &str, mime: &str, contents: &str) -> Resul
 /// `GET /configs/:name` — one preset's YAML as plain text (api.rs has no
 /// text fetch, so this stays private to the panel).
 async fn get_text(path: &str) -> Result<String, String> {
-    let resp = gloo_net::http::Request::get(&url(path))
+    let resp = crate::api::with_source_header(gloo_net::http::Request::get(&url(path)))
         .send()
         .await
         .map_err(err)?;

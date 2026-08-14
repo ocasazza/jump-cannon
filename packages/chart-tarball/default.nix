@@ -5,7 +5,14 @@
 # Hydra-host chart cache at /var/lib/hydra-cache/charts/ and to the locked-down
 # GCS fallback bucket. Consumers fetch from the CIDR-gated /hydra-cache/charts
 # path, not from anonymous GCS.
-{ pkgs }:
+#
+# The chart version stays 0.1.0 (stable object key), but appVersion is stamped
+# with the source revision so every source build produces distinct tarball
+# bytes: the Flux Bucket source watching gs://it-ops-nixstation-k8s-artifacts
+# sees a new artifact revision and the consumer HelmRelease upgrades — and the
+# Deployment's chart.appVersion pod annotation rolls the pods onto the new
+# `latest` image even when the chart templates themselves did not change.
+{ pkgs, sourceRev ? "unknown" }:
 pkgs.runCommand "jump-cannon-chart-tarball"
   {
     nativeBuildInputs = [
@@ -64,6 +71,54 @@ pkgs.runCommand "jump-cannon-chart-tarball"
       > legacy-kubernetes.yaml
     grep -Fq 'name: JUMP_CANNON_KUBERNETES_CONFIG' legacy-kubernetes.yaml
     grep -Fq 'value: "kubernetes"' legacy-kubernetes.yaml
+
+    # GitHub docs-importer mode: env from githubImporter values (seconds -> ms
+    # for the poll interval), an ephemeral emptyDir extraction cache, and no
+    # vault filesystem (github is a non-filesystem source like kubernetes).
+    helm template github ./jump-cannon \
+      --set graphApi.source=github \
+      --set graphCompute.enabled=false \
+      --set tests.fuzz.enabled=false \
+      --set tests.performance.enabled=false \
+      --set tests.browser.enabled=false \
+      > github.yaml
+    grep -Fq 'value: "github"' github.yaml
+    grep -Fq 'name: JUMP_CANNON_GITHUB_REPO' github.yaml
+    grep -Fq 'value: "ocasazza/jump-cannon"' github.yaml
+    grep -Fq 'name: JUMP_CANNON_GITHUB_REF' github.yaml
+    grep -Fq 'value: "main"' github.yaml
+    grep -Fq 'name: JUMP_CANNON_GITHUB_PATH' github.yaml
+    grep -Fq 'value: "charts/jump-cannon/knowledge"' github.yaml
+    grep -Fq 'name: JUMP_CANNON_GITHUB_POLL_INTERVAL_MS' github.yaml
+    grep -Fq 'value: "60000"' github.yaml
+    grep -Fq 'name: JUMP_CANNON_GITHUB_CACHE_DIR' github.yaml
+    grep -Fq 'name: github-importer-cache' github.yaml
+    grep -Fq 'mountPath: "/var/cache/jump-cannon/github"' github.yaml
+    grep -Fq 'emptyDir: {}' github.yaml
+    if grep -Fq 'name: VAULT_ROOT' github.yaml; then
+      echo "github mode must not mount the vault filesystem" >&2
+      exit 1
+    fi
+    if grep -Eq '^kind: PersistentVolumeClaim$' github.yaml; then
+      echo "github mode must not render the vault PVC" >&2
+      exit 1
+    fi
+    # The token never comes from values: it renders only via secretKeyRef.
+    helm template github-token ./jump-cannon \
+      --set graphApi.source=github \
+      --set githubImporter.tokenSecret.name=jump-cannon-github \
+      --set graphCompute.enabled=false \
+      --set tests.fuzz.enabled=false \
+      --set tests.performance.enabled=false \
+      --set tests.browser.enabled=false \
+      > github-token.yaml
+    grep -Fq 'name: JUMP_CANNON_GITHUB_TOKEN' github-token.yaml
+    grep -Fq 'secretKeyRef:' github-token.yaml
+    grep -Fq 'name: "jump-cannon-github"' github-token.yaml
+    if grep -Fq 'name: JUMP_CANNON_GITHUB_TOKEN' github.yaml; then
+      echo "github token env must not render without tokenSecret.name" >&2
+      exit 1
+    fi
 
     # Grafana dashboards: every dashboards/*.json ships as a labeled ConfigMap
     # for the monitoring stack's sidecar; disabling drops them all. (Match the
@@ -168,5 +223,5 @@ pkgs.runCommand "jump-cannon-chart-tarball"
       --set graphCompute.session.enabled=true \
       --set graphApi.replicas=2
 
-    helm package ./jump-cannon -d "$out/charts"
+    helm package --app-version "${sourceRev}" ./jump-cannon -d "$out/charts"
   ''

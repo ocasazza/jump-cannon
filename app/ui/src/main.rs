@@ -717,6 +717,7 @@ fn invalidate_graph_derived_state(mut ctx: Ctx) {
     panels::inspector::reset_for_graph_session();
     panels::style::reset_for_graph_session(false);
     panels::timeline::reset_for_graph_session();
+    palette::reset_for_graph_session();
     render::set_selected_node(None);
     render::set_search_highlights(None);
 }
@@ -1083,8 +1084,9 @@ fn App() -> Element {
     let world_label = ctx.active_world.read().clone();
 
     rsx! {
+        // app.css is not inlined here: index.html loads it via a Trunk
+        // <link rel="css"> so the static boot shell can paint pre-WASM.
         style { {panel_kit::CSS} }
-        style { {include_str!("../assets/app.css")} }
         div {
             class: ws.root_class(),
             tabindex: "0",

@@ -3,9 +3,9 @@ use ignore::{overrides::OverrideBuilder, WalkBuilder};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-/// Directories and patterns excluded per the canonical contract shared with
-/// vault-search. Uses `ignore` override globs with `**/` prefixes so exclusions
-/// apply at any depth, not just the vault root.
+/// Directories and patterns excluded from vault walks. Uses `ignore` override
+/// globs with `**/` prefixes so exclusions apply at any depth, not just the
+/// vault root.
 const EXCLUDES: &[&str] = &[
     "!**/.obsidian/**",
     "!**/.git/**",

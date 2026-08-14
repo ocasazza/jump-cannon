@@ -9,7 +9,7 @@ license.workspace = true
 dioxus = { workspace = true }
 # Shared panel-workspace library (also consumed by snake-pit).
 # Develop against a local checkout via [patch] in the workspace Cargo.toml.
-panel-kit = { git = "https://github.com/ocasazza/panel-kit", rev = "a38596a" }
+panel-kit = { git = "https://github.com/ocasazza/panel-kit", rev = "b4974e6" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 # WASM-side HTTP to graph-api (the frontend always runs in a webview).
@@ -55,6 +55,8 @@ web-sys = { workspace = true, features = [
     "console", "HtmlElement", "Node",
     # api.rs GET helpers bypass the HTTP cache (live graph buffers)
     "RequestCache",
+    # api.rs source selection: raw sessionStorage (no JSON encoding)
+    "Storage",
     # worker.rs: spawn the tvix-worker bundle from a Blob bootstrap URL
     "Blob", "BlobPropertyBag", "MessageEvent", "Url", "Worker",
 ] }

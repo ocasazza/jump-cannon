@@ -191,6 +191,10 @@ struct Persisted {
     soup_n: u32,
     soup_radius: f32,
     soup_seed: u64,
+    /// Deterministic seed sent with the `/generate` request payload
+    /// (mirrors the graph-api `--seed` generate flag; absent = seed 0).
+    #[serde(default)]
+    gen_seed: u64,
 }
 
 impl Default for Persisted {
@@ -203,6 +207,7 @@ impl Default for Persisted {
             // Server defaults for /compute/soup (`radius` 40, `seed` 1).
             soup_radius: 40.0,
             soup_seed: 1,
+            gen_seed: 0,
         }
     }
 }
@@ -222,6 +227,7 @@ fn persist() {
         soup_n: *SOUP_N.read(),
         soup_radius: *SOUP_RADIUS.read(),
         soup_seed: *SOUP_SEED.read(),
+        gen_seed: *GEN_SEED.read(),
     };
     let _ = LocalStorage::set(STORE_KEY, &p);
 }
@@ -234,6 +240,7 @@ static SOUP_EXAMPLE: GlobalSignal<usize> = Signal::global(|| restore().soup_exam
 static SOUP_N: GlobalSignal<u32> = Signal::global(|| restore().soup_n);
 static SOUP_RADIUS: GlobalSignal<f32> = Signal::global(|| restore().soup_radius);
 static SOUP_SEED: GlobalSignal<u64> = Signal::global(|| restore().soup_seed);
+static GEN_SEED: GlobalSignal<u64> = Signal::global(|| restore().gen_seed);
 
 /// Transient eval chrome (NixEditorState's `error`/`status`). `RUNNING` is the
 /// egui `state.generate.request.is_some()` latch — at most one in-flight eval.
@@ -252,7 +259,7 @@ async fn post_json<B: Serialize, T: serde::de::DeserializeOwned>(
     path: &str,
     body: &B,
 ) -> Result<T, String> {
-    Request::post(&url(path))
+    crate::api::with_source_header(Request::post(&url(path)))
         .json(body)
         .map_err(err)?
         .send()
@@ -307,8 +314,13 @@ enum ServerEval {
     Unreachable(String),
 }
 
-async fn generate_server(expr: &str) -> ServerEval {
-    match post_json::<_, GenerateResp>("/generate", &serde_json::json!({ "expr": expr })).await {
+async fn generate_server(expr: &str, seed: u64) -> ServerEval {
+    match post_json::<_, GenerateResp>(
+        "/generate",
+        &serde_json::json!({ "expr": expr, "seed": seed }),
+    )
+    .await
+    {
         Err(e) => ServerEval::Unreachable(e),
         Ok(resp) if resp.ok => match resp.graph {
             Some(g) => ServerEval::Graph(g),
@@ -322,7 +334,7 @@ async fn generate_server(expr: &str) -> ServerEval {
 }
 
 async fn generate(expr: &str) -> Result<GeneratedGraph, String> {
-    match generate_server(expr).await {
+    match generate_server(expr, *GEN_SEED.read()).await {
         ServerEval::Graph(g) => Ok(g),
         ServerEval::EvalErr(e) | ServerEval::Unreachable(e) => Err(e),
     }
@@ -516,7 +528,7 @@ pub fn panel(ctx: Ctx) -> Element {
                 }
                 Backend::Auto => {
                     *STATUS.write() = Some("evaluating on the server…".to_string());
-                    match generate_server(&src).await {
+                    match generate_server(&src, *GEN_SEED.read()).await {
                         ServerEval::Graph(g) => (Ok(g), "server"),
                         // A real eval error from a reachable server — surface
                         // it; falling back would just re-pay the eval.
@@ -745,6 +757,26 @@ pub fn panel(ctx: Ctx) -> Element {
                             ""
                         },
                         "{b.label()}"
+                    }
+                }
+            }
+            hr { class: "gen-sep" }
+            div { class: "gen-params",
+                label {
+                    title: "deterministic seed sent with the /generate request payload \
+                            (mirrors the graph-api --seed generate flag; Nix evaluation \
+                            itself is already deterministic)",
+                    "seed"
+                    input {
+                        r#type: "number",
+                        min: "0",
+                        value: "{GEN_SEED}",
+                        oninput: move |e| {
+                            if let Ok(v) = e.value().parse::<u64>() {
+                                *GEN_SEED.write() = v;
+                                persist();
+                            }
+                        },
                     }
                 }
             }

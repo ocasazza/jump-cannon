@@ -22,10 +22,32 @@ ConfigMap before publishing the chart.
 The importer catalog is deployment policy. Define named instances under
 `importers.sources` and activate one with `importers.selected`; an empty
 selector preserves `graphApi.source` and `kubernetesImporter.enabled`. The
-application displays a sanitized catalog in **Settings > Importers**, but a
-source change requires a Helm rollout. Named chart profiles are currently
-wired for Obsidian, Kubernetes, and OKF; source kinds with additional required
+application displays a sanitized catalog in **Settings > Importers**. The
+rollout-based `importers.selected` flow remains the deployment default for
+choosing the active source; named chart profiles are currently wired for
+Obsidian, Kubernetes, and OKF, and source kinds with additional required
 inputs are not accepted until the chart owns their complete configuration.
+
+When `importers.runtimeSwitchGroup` names a NetBird group, every configured
+filesystem source is also mounted read-only in the graph-api pod (not only the
+selected one) and graph-api lets viewers whose proxy-injected
+`x-netbird-groups` header contains that group switch the viewed source at
+runtime from **Settings > Importers** (per browser session, read-only graph
+views; writes, generation, and compute stay on the deployment-selected
+source). Only set the group once every dormant profile's producer claim
+exists in the release namespace — a mounted claim is a hard pod dependency,
+so a missing claim blocks pod startup and fails the rollout. An empty
+`runtimeSwitchGroup` disables runtime switching, skips the dormant mounts,
+and preserves the rollout-only behavior. See [[Security Model]] for
+the trust boundary.
+
+`graphApi.source: github` selects the docs-importer mode: graph-api polls the
+GitHub repository tarball named by `githubImporter.repo`/`ref`/`path` and
+rebuilds on change, so knowledge updates ship with a push to main instead of a
+chart republish. The vault PVC, seed init container, and knowledge ConfigMap
+sync are skipped in this mode; they remain the fallback under the default
+`obsidian` source. Private mirrors take a token only through
+`githubImporter.tokenSecret`, never through values. See [[GitHub Importer]].
 
 The chart's inactive `lavender-ingest-okf` instance consumes the externally
 provisioned `lavender-okf-shared` RWX claim read-only. It mounts the repository

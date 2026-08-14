@@ -5,6 +5,9 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
     <title>Jump Cannon</title>
     <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'><rect width='64' height='64' rx='12' fill='%2309090a'/><circle cx='18' cy='32' r='8' fill='%23389cf6'/><circle cx='32' cy='32' r='8' fill='%23f6be3c'/><circle cx='46' cy='32' r='8' fill='%23ee60c2'/></svg>" />
+    <!-- This CSS must load before the Rust module so the static Panel Kit boot
+         shell can paint while Trunk downloads and instantiates the app WASM. -->
+    <link data-trunk rel="css" href="assets/app.css" />
     <!-- Name the crate explicitly: trunk is driven from the workspace root in
          the nix (crane) build, where the virtual manifest has no root package. -->
     <link data-trunk rel="rust" href="Cargo.toml" data-bin="jump-cannon-ui" />
@@ -16,6 +19,20 @@
     <link data-trunk rel="rust" href="../tvix-worker/Cargo.toml" data-bin="tvix-worker" data-type="worker" data-cargo-features="wasm" />
   </head>
   <body>
+    <!-- Dioxus requires an empty mount element. The static boot shell must be
+         its adjacent sibling; placing pre-existing DOM inside #main makes the
+         Dioxus 0.6 diff engine panic with `invalid key`. -->
     <div id="main"></div>
+    <section class="panel-kit-boot" data-panel-kit-static-boot role="status" aria-live="polite">
+      <header class="panel-kit-boot-bar">
+        <strong class="panel-kit-boot-title">JUMP CANNON</strong>
+        <span class="panel-kit-boot-status">loading application…</span>
+      </header>
+      <main class="panel-kit-boot-panels" aria-hidden="true">
+        <div class="panel-kit-boot-panel"><div class="panel-kit-boot-line"></div><div class="panel-kit-boot-line"></div></div>
+        <div class="panel-kit-boot-panel"><div class="panel-kit-boot-line"></div><div class="panel-kit-boot-line"></div></div>
+        <div class="panel-kit-boot-panel"><div class="panel-kit-boot-line"></div><div class="panel-kit-boot-line"></div></div>
+      </main>
+    </section>
   </body>
 </html>

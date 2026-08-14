@@ -89,11 +89,6 @@
 
         # ----- Native packages -----
 
-        vault-search = craneLib.buildPackage (commonArgs // {
-          cargoArtifacts = depsNative;
-          cargoExtraArgs = "--package vault-search";
-        });
-
         graph-api = craneLib.buildPackage (commonArgs // {
           cargoArtifacts = depsNative;
           cargoExtraArgs = "--package graph-api";
@@ -337,7 +332,7 @@
               --base-url "http://127.0.0.1:$PORT" \
               --chromium "$BROWSER_BIN" \
               --out-dir "$RUN_OUT" \
-              --timeout-secs 60 \
+              --timeout-secs "''${JUMP_CANNON_BROWSER_TIMEOUT_SECONDS:-120}" \
               "''${FIXTURE_REQUIRE_ARGS[@]}"
 
             install -m 0644 "$RUN_OUT/boot.png" "$OUT_DIR/boot.png"
@@ -407,11 +402,7 @@
         graph-api-image = pkgs.dockerTools.buildLayeredImage {
           name     = graphApiService.name;
           tag      = "latest";
-          # vault-search is a sibling binary that graph-api spawns as a
-          # subprocess at startup. Bake it into the image's PATH alongside
-          # graph-api itself so the in-container spawn works without
-          # needing a separate sidecar.
-          contents = [ graph-api vault-search pkgs.cacert ];
+          contents = [ graph-api pkgs.cacert ];
           config   = {
             Cmd = [ "/bin/graph-api" ];
             ExposedPorts."${toString graphApiService.port}/tcp" = {};
@@ -446,7 +437,6 @@
               tag = "latest";
               contents = [
                 graph-api
-                vault-search
                 pkgs.cacert
               ];
               extraCommands = ''
@@ -974,9 +964,11 @@
       in {
         packages = {
           default          = graph-api;
-          inherit vault-search graph-api graph-compute graph-layouts-wasm tvix-wasm app-web;
+          inherit graph-api graph-compute graph-layouts-wasm tvix-wasm app-web;
           inherit bench-pagerank;
-          chart-tarball = pkgs.callPackage ./packages/chart-tarball { };
+          chart-tarball = pkgs.callPackage ./packages/chart-tarball {
+            sourceRev = inputs.self.rev or inputs.self.dirtyRev or "unknown";
+          };
           inherit graph-compute-image graph-api-image docker-compose-yaml;
           inherit graph-api-k8s-image graph-compute-k8s-image test-runner-image;
           inherit test-browser test-workload-bins;
@@ -1107,8 +1099,7 @@
               . ./.env
               set +a
             fi
-            # Make cargo-built binaries findable for cross-process spawning
-            # (graph-api spawns vault-search as a subprocess).
+            # Make cargo-built binaries findable on PATH.
             export PATH="$PWD/target/release:$PWD/target/debug:$PATH"
           '';
         };

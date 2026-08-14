@@ -18,6 +18,7 @@ use data_loader::{
 };
 use graph_api::importer_catalog::ImporterCatalog;
 use graph_api::proto::{Init, MetaSummary, NodeMeta};
+use graph_api::source_host::{SourceHost, SwitchConfig};
 use graph_api::state::{GraphSnapshot, SnapshotSource};
 use graph_api::AppState;
 use vault_data::{VaultEdge, VaultGraph, VaultNode};
@@ -28,6 +29,7 @@ struct EmptyLoader;
 
 fn test_schema() -> ImporterSchema {
     ImporterSchema::new(
+        "generate",
         vec![
             DiscoveryField::new("id", DiscoveryFieldType::Keyword, true).searchable(2),
             DiscoveryField::new("title", DiscoveryFieldType::Text, true).searchable(4),
@@ -41,6 +43,24 @@ fn test_schema() -> ImporterSchema {
 }
 
 fn load_result(mut graph: VaultGraph) -> LoadResult {
+    // The shared identity contract requires namespaced node IDs; rewrite the
+    // fixtures' bare IDs into the `generate:test:` namespace.
+    let bare_ids: Vec<String> = graph.nodes.keys().cloned().collect();
+    for bare in &bare_ids {
+        let node = graph.nodes.shift_remove(bare).expect("fixture node");
+        let namespaced = format!("generate:test:{bare}");
+        graph.nodes.insert(
+            namespaced.clone(),
+            VaultNode {
+                id: namespaced,
+                ..node
+            },
+        );
+    }
+    for edge in &mut graph.edges {
+        edge.source = format!("generate:test:{}", edge.source);
+        edge.target = format!("generate:test:{}", edge.target);
+    }
     let search_documents = graph
         .nodes
         .values_mut()
@@ -121,8 +141,8 @@ fn trust_test_importer(importer: Box<dyn Importer>) -> HostedImporter {
     HostedImporter::new(importer, grants).unwrap()
 }
 
-/// Build an `AppState` over an empty `VaultGraph`. No vault-search
-/// subprocess, no asset dir — enough to exercise the protobuf endpoints.
+/// Build an `AppState` over an empty `VaultGraph`. No asset dir — enough
+/// to exercise the protobuf endpoints.
 fn empty_state() -> AppState {
     state_with_graph(VaultGraph::new())
 }
@@ -495,7 +515,7 @@ async fn same_cardinality_snapshot_swap_changes_revision() {
     let ids: Vec<String> =
         serde_json::from_slice(&to_bytes(resp.into_body(), 1 << 20).await.expect("ids body"))
             .expect("ids json");
-    assert_eq!(ids, ["after-a", "after-b"]);
+    assert_eq!(ids, ["generate:test:after-a", "generate:test:after-b"]);
 }
 
 #[tokio::test]
@@ -526,7 +546,7 @@ async fn search_matches_returns_every_dense_index_with_its_snapshot_revision() {
         .snapshot()
         .id_to_idx
         .iter()
-        .filter_map(|(id, &index)| id.starts_with("matching-").then_some(index))
+        .filter_map(|(id, &index)| id.starts_with("generate:test:matching-").then_some(index))
         .collect();
     expected.sort_unstable();
 
@@ -611,7 +631,7 @@ async fn schema_search_and_facets_share_the_importer_contract() {
     .expect("schema json");
     assert_eq!(schema["graph_revision"], revision);
     assert_eq!(schema["source"]["id"], "empty");
-    assert_eq!(schema["schema"]["schema_version"], 1);
+    assert_eq!(schema["schema"]["schema_version"], 2);
     assert_eq!(schema["schema"]["tag_hierarchy"]["separator"], "/");
     assert!(schema["schema"]["fields"]
         .as_array()
@@ -639,7 +659,7 @@ async fn schema_search_and_facets_share_the_importer_contract() {
     )
     .expect("search json");
     assert_eq!(search["total"], 1);
-    assert_eq!(search["results"][0]["id"], "schema-node");
+    assert_eq!(search["results"][0]["id"], "generate:test:schema-node");
 
     let invalid_query = app
         .clone()
@@ -859,4 +879,411 @@ async fn generate_non_graph_result_is_soft_error() {
         v["error"].as_str().unwrap_or("").contains("nodes, links"),
         "expected a shape-mismatch error; got {v}",
     );
+}
+
+// ── Runtime per-viewer importer source switching ────────────────────────────
+//
+// The `x-jump-cannon-source` header selects a catalog source per request.
+// Selecting a non-default source requires runtime switching to be enabled
+// (`SwitchConfig` with a required group) AND the caller's groups header to
+// contain that group. Writes/compute stay on the deployment default.
+
+const SWITCH_GROUP: &str = "kubernetes-clients";
+const GROUPS_HEADER: &str = "x-netbird-groups";
+const SOURCE_HEADER: &str = "x-jump-cannon-source";
+
+/// A tiny on-disk Obsidian vault fixture: one note.
+fn fixture_vault(tag: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("jump-cannon-switch-{}-{tag}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("fixture vault dir");
+    std::fs::write(
+        dir.join("alt-note.md"),
+        "# Alt Note\n\nalternate vault body\n",
+    )
+    .expect("fixture note");
+    dir
+}
+
+/// Catalog with the fixture vault as a runnable alternate, a non-runnable
+/// GitHub entry, and an OKF entry whose root does not exist (build failure).
+fn switch_catalog_json(vault: &std::path::Path) -> String {
+    serde_json::json!({
+        "selected": "default-gen",
+        "sources": {
+            "default-gen": { "displayName": "Default generated", "kind": "generate" },
+            "alt-vault": {
+                "displayName": "Alt vault",
+                "kind": "obsidian",
+                "source": {
+                    "volumeName": "alt-vault",
+                    "existingClaim": "alt-vault",
+                    "mountPath": vault.to_str().unwrap(),
+                    "path": vault.to_str().unwrap(),
+                    "readOnly": false
+                }
+            },
+            "gh": { "displayName": "GH", "kind": "github", "sourceId": "gh" },
+            "broken-okf": {
+                "displayName": "Broken OKF",
+                "kind": "okf",
+                "sourceId": "broken",
+                "source": {
+                    "volumeName": "broken-okf",
+                    "existingClaim": "broken-okf",
+                    "mountPath": "/nonexistent-jump-cannon-test",
+                    "path": "/nonexistent-jump-cannon-test/okf",
+                    "readOnly": true
+                }
+            }
+        }
+    })
+    .to_string()
+}
+
+fn switch_host(catalog_raw: &str, group: Option<&str>) -> SourceHost {
+    let catalog = ImporterCatalog::parse_with_runtime_switch(
+        Some(catalog_raw),
+        data_loader::SourceKind::Generate,
+        group.is_some(),
+    )
+    .expect("switch catalog parses");
+    SourceHost::new(
+        state_with_catalog(catalog),
+        SwitchConfig::new(group.map(str::to_owned), GROUPS_HEADER),
+    )
+}
+
+fn source_request(path: &str, source: &str, groups: Option<&str>) -> Request<Body> {
+    let mut builder = Request::builder().uri(path).header(SOURCE_HEADER, source);
+    if let Some(groups) = groups {
+        builder = builder.header(GROUPS_HEADER, groups);
+    }
+    builder.body(Body::empty()).unwrap()
+}
+
+async fn json_body(response: axum::response::Response) -> serde_json::Value {
+    serde_json::from_slice(
+        &to_bytes(response.into_body(), 1 << 20)
+            .await
+            .expect("response body"),
+    )
+    .expect("response JSON")
+}
+
+/// Gate closed (no required group configured): the selection header is ignored
+/// and every request serves the deployment default — today's exact behavior.
+#[tokio::test]
+async fn runtime_switch_disabled_ignores_selection_header() {
+    let vault = fixture_vault("disabled");
+    let catalog = ImporterCatalog::parse(
+        Some(&switch_catalog_json(&vault)),
+        data_loader::SourceKind::Generate,
+    )
+    .expect("strict catalog parse");
+    let app = graph_api::router_with_host(SourceHost::default_only(state_with_catalog(catalog)));
+
+    let response = app
+        .clone()
+        .oneshot(source_request("/graph/ids", "alt-vault", None))
+        .await
+        .expect("ids served");
+    assert_eq!(response.status(), StatusCode::OK);
+    let ids: Vec<String> = serde_json::from_slice(
+        &to_bytes(response.into_body(), 1 << 20)
+            .await
+            .expect("ids body"),
+    )
+    .expect("ids JSON");
+    assert!(
+        ids.is_empty(),
+        "header ignored: the default graph is served"
+    );
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/importers")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .expect("catalog served");
+    let body = json_body(response).await;
+    assert_eq!(body["runtimeSwitch"]["enabled"], false);
+    assert_eq!(body["runtimeSwitch"]["allowed"], false);
+    assert!(body["runtimeSwitch"]["requiredGroup"].is_null());
+    let alt = body["sources"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["id"] == "alt-vault")
+        .expect("alt-vault entry");
+    assert_eq!(alt["runnable"], true);
+    let gh = body["sources"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["id"] == "gh")
+        .expect("gh entry");
+    assert_eq!(gh["runnable"], false);
+}
+
+/// Gate open: selecting a non-default source without the required group (or
+/// with the wrong one) is 403. The deployment default itself never requires
+/// authorization, even when named explicitly.
+#[tokio::test]
+async fn runtime_switch_forbids_alternate_without_group_membership() {
+    let vault = fixture_vault("forbidden");
+    let host = switch_host(&switch_catalog_json(&vault), Some(SWITCH_GROUP));
+    let app = graph_api::router_with_host(host);
+
+    for groups in [None, Some("someone-else")] {
+        let response = app
+            .clone()
+            .oneshot(source_request("/graph/ids", "alt-vault", groups))
+            .await
+            .expect("ids served");
+        assert_eq!(
+            response.status(),
+            StatusCode::FORBIDDEN,
+            "groups header {groups:?} must be rejected"
+        );
+    }
+
+    // Explicitly selecting the deployment default needs no group.
+    let response = app
+        .oneshot(source_request("/graph/ids", "default-gen", None))
+        .await
+        .expect("ids served");
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+/// First authorized request builds the alternate lazily; its graph, revision,
+/// and progress log are independent of the default's.
+#[tokio::test]
+async fn runtime_switch_builds_alternate_lazily_and_isolates_state() {
+    let vault = fixture_vault("lazy");
+    let host = switch_host(&switch_catalog_json(&vault), Some(SWITCH_GROUP));
+    let app = graph_api::router_with_host(host);
+
+    let default_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/graph/ids")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .expect("default ids served");
+    assert_eq!(default_response.status(), StatusCode::OK);
+    let default_revision = response_revision(&default_response);
+    let default_ids: Vec<String> = serde_json::from_slice(
+        &to_bytes(default_response.into_body(), 1 << 20)
+            .await
+            .expect("default ids body"),
+    )
+    .expect("default ids JSON");
+    assert!(default_ids.is_empty());
+
+    let alt_response = app
+        .clone()
+        .oneshot(source_request(
+            "/graph/ids",
+            "alt-vault",
+            Some(SWITCH_GROUP),
+        ))
+        .await
+        .expect("alternate ids served");
+    assert_eq!(alt_response.status(), StatusCode::OK);
+    let alt_revision = response_revision(&alt_response);
+    assert_ne!(alt_revision, default_revision);
+    let alt_ids: Vec<String> = serde_json::from_slice(
+        &to_bytes(alt_response.into_body(), 1 << 20)
+            .await
+            .expect("alternate ids body"),
+    )
+    .expect("alternate ids JSON");
+    assert_eq!(alt_ids.len(), 1, "fixture vault has exactly one note");
+    assert!(
+        alt_ids[0].contains("alt-note"),
+        "alternate id names the fixture note: {alt_ids:?}"
+    );
+
+    // A second request hits the cached serving state (same revision).
+    let second = app
+        .clone()
+        .oneshot(source_request(
+            "/graph/ids",
+            "alt-vault",
+            Some(SWITCH_GROUP),
+        ))
+        .await
+        .expect("cached alternate served");
+    assert_eq!(response_revision(&second), alt_revision);
+
+    // Progress logs are per-source: the alternate's build emitted events,
+    // the default's (constructed without a load) is empty.
+    let default_progress = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/progress")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .expect("default progress served");
+    let default_progress = json_body(default_progress).await;
+    assert_eq!(default_progress["events"].as_array().unwrap().len(), 0);
+
+    let alt_progress = app
+        .clone()
+        .oneshot(source_request("/progress", "alt-vault", Some(SWITCH_GROUP)))
+        .await
+        .expect("alternate progress served");
+    let alt_progress = json_body(alt_progress).await;
+    assert!(
+        !alt_progress["events"].as_array().unwrap().is_empty(),
+        "alternate build flows through its own progress log"
+    );
+
+    // /importers computes runtimeSwitch.allowed per request from the
+    // caller's groups header.
+    let allowed = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/importers")
+                .header(GROUPS_HEADER, SWITCH_GROUP)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .expect("catalog served");
+    let allowed = json_body(allowed).await;
+    assert_eq!(allowed["runtimeSwitch"]["enabled"], true);
+    assert_eq!(allowed["runtimeSwitch"]["allowed"], true);
+    assert_eq!(allowed["runtimeSwitch"]["requiredGroup"], SWITCH_GROUP);
+    // The response still describes the deployment default.
+    assert_eq!(allowed["selected"], "default-gen");
+
+    let denied = app
+        .oneshot(
+            Request::builder()
+                .uri("/importers")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .expect("catalog served");
+    let denied = json_body(denied).await;
+    assert_eq!(denied["runtimeSwitch"]["enabled"], true);
+    assert_eq!(denied["runtimeSwitch"]["allowed"], false);
+
+    let _ = std::fs::remove_dir_all(&vault);
+}
+
+/// Writes, generation, and compute endpoints stay on the deployment default:
+/// selecting an alternate is rejected with 400 even for authorized callers.
+#[tokio::test]
+async fn runtime_switch_rejects_writes_and_compute_on_alternates() {
+    let vault = fixture_vault("writes");
+    let host = switch_host(&switch_catalog_json(&vault), Some(SWITCH_GROUP));
+    let app = graph_api::router_with_host(host);
+
+    let put = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/vault/page")
+                .header("content-type", "application/json")
+                .header(SOURCE_HEADER, "alt-vault")
+                .header(GROUPS_HEADER, SWITCH_GROUP)
+                .body(Body::from(
+                    serde_json::to_vec(&serde_json::json!({"path": "x", "body": "y"})).unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .expect("put served");
+    assert_eq!(put.status(), StatusCode::BAD_REQUEST);
+
+    let generate = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/generate")
+                .header("content-type", "application/json")
+                .header(SOURCE_HEADER, "alt-vault")
+                .header(GROUPS_HEADER, SWITCH_GROUP)
+                .body(Body::from(
+                    serde_json::to_vec(&serde_json::json!({"expr": "{ nodes = []; links = []; }"}))
+                        .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .expect("generate served");
+    assert_eq!(generate.status(), StatusCode::BAD_REQUEST);
+
+    let compute = app
+        .oneshot(source_request(
+            "/compute/health",
+            "alt-vault",
+            Some(SWITCH_GROUP),
+        ))
+        .await
+        .expect("compute health served");
+    assert_eq!(compute.status(), StatusCode::BAD_REQUEST);
+
+    let _ = std::fs::remove_dir_all(&vault);
+}
+
+/// Error contract: unknown source id → 404; known but not runnable → 400;
+/// a cached build failure → 503 (replayed, not rebuilt per request).
+#[tokio::test]
+async fn runtime_switch_error_contract() {
+    let vault = fixture_vault("errors");
+    let host = switch_host(&switch_catalog_json(&vault), Some(SWITCH_GROUP));
+    let app = graph_api::router_with_host(host);
+
+    let unknown = app
+        .clone()
+        .oneshot(source_request(
+            "/graph/ids",
+            "no-such-source",
+            Some(SWITCH_GROUP),
+        ))
+        .await
+        .expect("unknown served");
+    assert_eq!(unknown.status(), StatusCode::NOT_FOUND);
+
+    let not_runnable = app
+        .clone()
+        .oneshot(source_request("/graph/ids", "gh", Some(SWITCH_GROUP)))
+        .await
+        .expect("not-runnable served");
+    assert_eq!(not_runnable.status(), StatusCode::BAD_REQUEST);
+
+    for attempt in 0..2 {
+        let broken = app
+            .clone()
+            .oneshot(source_request(
+                "/graph/ids",
+                "broken-okf",
+                Some(SWITCH_GROUP),
+            ))
+            .await
+            .expect("broken served");
+        assert_eq!(
+            broken.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "attempt {attempt}: cached build failure must surface as 503"
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&vault);
 }

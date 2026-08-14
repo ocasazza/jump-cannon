@@ -1109,11 +1109,40 @@ fn default_stream_url() -> String {
 
 fn versioned_stream_url(base: &str) -> Option<String> {
     let lease = expected_stream_lease()?;
-    let sep = if base.contains('?') { '&' } else { '?' };
+    // The browser WebSocket API cannot set headers, so the per-viewer source
+    // selection rides as a query parameter. Strip any stale `source=` baked
+    // into a persisted settings URL first so re-switching never duplicates it.
+    let mut url = strip_query_param(base, "source");
+    if let Some(source) = crate::api::source_id() {
+        let sep = if url.contains('?') { '&' } else { '?' };
+        url = format!("{url}{sep}source={source}");
+    }
+    let sep = if url.contains('?') { '&' } else { '?' };
     Some(format!(
-        "{base}{sep}graph_revision={}&selection_generation={}",
+        "{url}{sep}graph_revision={}&selection_generation={}",
         lease.graph_revision, lease.selection_generation
     ))
+}
+
+/// Remove one query parameter from a URL string. Catalog source ids are
+/// validated URL-safe ASCII server-side, so no percent-decoding is needed.
+fn strip_query_param(url: &str, name: &str) -> String {
+    let Some(qmark) = url.find('?') else {
+        return url.to_string();
+    };
+    let (base, query) = (&url[..qmark], &url[qmark + 1..]);
+    let kept: Vec<&str> = query
+        .split('&')
+        .filter(|pair| pair.split('=').next() != Some(name))
+        .collect();
+    if kept.len() == query.split('&').count() {
+        return url.to_string();
+    }
+    if kept.is_empty() {
+        base.to_string()
+    } else {
+        format!("{base}?{}", kept.join("&"))
+    }
 }
 
 fn default_lens() -> LensConfig {

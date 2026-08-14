@@ -9,12 +9,12 @@ members = [
     "crates/graph-vcs",
     "crates/session-manager",
     "crates/vault-links",
-    "crates/vault-search",
     "crates/tvix-wasm",
     "crates/data-loader",
     "crates/kubernetes-importer",
     "crates/okf-importer",
     "crates/pest-importer",
+    "crates/github-importer",
     "crates/tvix-loader",
     "crates/test-browser",
 ]

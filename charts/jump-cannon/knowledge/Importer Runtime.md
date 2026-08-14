@@ -9,8 +9,10 @@ tags: [jump-cannon, importer]
 # Importer Runtime
 
 Importers acquire records, map them into a graph and discovery documents, and
-publish one complete revision. The six server source kinds are Obsidian, tvix,
-generate, Kubernetes, OKF, and a trusted administrator-installed Pest package.
+publish one complete revision. The seven server source kinds are Obsidian,
+tvix, generate, Kubernetes, OKF, a trusted administrator-installed Pest
+package, and GitHub. GitHub delivers a repository tarball over HTTP with ETag
+polling and reuses the Obsidian markdown pipeline; see [[GitHub Importer]].
 OKF implements the official format version 0.2; its `0.2` version must not be
 called `0.0.2`.
 
@@ -46,15 +48,22 @@ contract for the active source. See [[Nodes Search and Documents]] and
 Helm can declare named source instances under `importers.sources` and select
 one with `importers.selected`. graph-api validates the bounded catalog against
 the source that actually started and exposes only its sanitized form through
-`GET /importers`. The read-only Settings tab reports what deployment selected;
-changing the active source remains a Helm rollout rather than a browser effect.
+`GET /importers`. The rollout-based selection remains the deployment default;
+when `importers.runtimeSwitchGroup` is set, viewers in that NetBird group can
+also switch the viewed source per browser session from the Settings tab, with
+writes and compute pinned to the deployment-selected source. The viewer's
+selection lives in sessionStorage as the **bare string** `jc_source_id` (no
+JSON encoding — the harness and proxy tooling plant and read it through the
+DOM storage API), rides as the `x-jump-cannon-source` request header, and as
+`?source=` on the layout WebSocket, whose browser API cannot set headers.
 
 The default markdown loader resolves wikilinks and is currently the only
 importer that advertises readable and writable source content. Kubernetes
 queries are explicit, bounded, metadata-only, and namespace-scoped by default.
 OKF loads a filesystem bundle under a stable source identity. Pest manifest
 format 2 requires package authors to declare every property that can enter
-search or facets.
+search or facets. GitHub reads a polled repository tarball and produces the
+same node IDs as Obsidian mode for the same corpus.
 
 Do not hide network access, credentials, or authorization inside a pure mapper.
 Deployment owns those effects through [[Helm Deployment]] and [[Security Model]].

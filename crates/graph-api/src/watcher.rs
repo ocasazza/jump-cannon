@@ -434,6 +434,7 @@ mod tests {
 
     fn test_schema() -> ImporterSchema {
         ImporterSchema::new(
+            "generate",
             vec![
                 DiscoveryField::new("id", DiscoveryFieldType::Keyword, true).searchable(2),
                 DiscoveryField::new("title", DiscoveryFieldType::Text, true).searchable(4),
@@ -581,7 +582,7 @@ mod tests {
     async fn failed_reload_keeps_last_good_snapshot() {
         let mut graph = VaultGraph::new();
         graph.add_node(VaultNode {
-            id: "last-good".into(),
+            id: "generate:test:last-good".into(),
             meta: vault_data::NodeMeta {
                 source_id: "test".into(),
                 title: "Last good".into(),
@@ -606,7 +607,7 @@ mod tests {
         assert!(!rebuild_snapshot(&state).await);
         let snapshot = state.snapshot();
         assert_eq!(snapshot.revision, revision);
-        assert!(snapshot.graph.nodes.contains_key("last-good"));
+        assert!(snapshot.graph.nodes.contains_key("generate:test:last-good"));
     }
 
     #[test]

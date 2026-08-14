@@ -62,7 +62,7 @@ fn parse_note_impl(
                 //   - Single scalar:          `tags: a`
                 // Also accept the singular `tag:` form some users
                 // type. Strip leading `#` and surrounding quotes
-                // (vault-search's `clean_tag` shape).
+                // (the `clean_tag` shape).
                 if key == "tags" || key == "tag" {
                     for t in extract_tags_from_value(&json_val) {
                         if !tags.contains(&t) {
