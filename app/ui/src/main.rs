@@ -16,6 +16,7 @@ mod anchored;
 mod api;
 mod appstate;
 mod badges;
+mod client_log;
 mod graph_canvas;
 mod palette;
 mod panels;
@@ -130,6 +131,9 @@ fn main() {
             }
         }
     }));
+    // Ship panics to `POST /log/client` too — chains onto the hook above, so
+    // the console output and red banner are unchanged.
+    client_log::install_panic_hook();
     // Boot marker for crates/test-browser: it greps the console for this
     // exact line to know the wasm app booted. console.log directly (NOT
     // tracing) — tracing is filtered to WARN above.

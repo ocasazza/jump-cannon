@@ -8,7 +8,7 @@ use graph_vcs::BranchInfo;
 use panel_kit::Spinner;
 
 use super::worlds::active_world_id;
-use crate::{api, Ctx};
+use crate::{api, client_log, Ctx};
 
 pub fn panel(ctx: Ctx) -> Element {
     let mut branches = use_signal(Vec::<BranchInfo>::new);
@@ -33,9 +33,9 @@ pub fn panel(ctx: Ctx) -> Element {
                                 bs.sort_by(|a, b| a.name.0.cmp(&b.name.0));
                                 branches.set(bs);
                             }
-                            Err(e) => note.set(Some(e.to_string())),
+                            Err(e) => note.set(Some(client_log::tagged("branches", e))),
                         },
-                        Err(e) => note.set(Some(e.to_string())),
+                        Err(e) => note.set(Some(client_log::tagged("branches", e))),
                     }
                 } else {
                     branches.set(Vec::new());
@@ -106,10 +106,10 @@ pub fn panel(ctx: Ctx) -> Element {
                                                                     tick += 1;
                                                                     crate::spawn_rematerialize_embedded(ctx);
                                                                 }
-                                                                Err(e) => note.set(Some(e.to_string())),
+                                                                Err(e) => note.set(Some(client_log::tagged("branches", e))),
                                                             }
                                                         }
-                                                        Err(e) => note.set(Some(e.to_string())),
+                                                        Err(e) => note.set(Some(client_log::tagged("branches", e))),
                                                     }
                                                 });
                                             },
@@ -141,10 +141,10 @@ pub fn panel(ctx: Ctx) -> Element {
                                                                     tick += 1;
                                                                     crate::spawn_rematerialize_embedded(ctx);
                                                                 }
-                                                                Err(e) => note.set(Some(e.to_string())),
+                                                                Err(e) => note.set(Some(client_log::tagged("branches", e))),
                                                             }
                                                         }
-                                                        Err(e) => note.set(Some(e.to_string())),
+                                                        Err(e) => note.set(Some(client_log::tagged("branches", e))),
                                                     }
                                                 });
                                             },

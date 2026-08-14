@@ -7,7 +7,7 @@ use graph_vcs::{Conflict, ConflictResolution, NodeId, ResolvedNode};
 use panel_kit::Spinner;
 
 use super::worlds::active_world_id;
-use crate::{api, Ctx};
+use crate::{api, client_log, Ctx};
 
 pub fn panel(ctx: Ctx) -> Element {
     let mut conflicts = use_signal(Vec::<Conflict>::new);
@@ -29,9 +29,9 @@ pub fn panel(ctx: Ctx) -> Element {
                     match host.vcs(&wid).await {
                         Ok(vcs) => match vcs.conflicts("main").await {
                             Ok(cs) => conflicts.set(cs),
-                            Err(e) => note.set(Some(e.to_string())),
+                            Err(e) => note.set(Some(client_log::tagged("merge", e))),
                         },
-                        Err(e) => note.set(Some(e.to_string())),
+                        Err(e) => note.set(Some(client_log::tagged("merge", e))),
                     }
                 } else {
                     conflicts.set(Vec::new());
@@ -65,10 +65,10 @@ pub fn panel(ctx: Ctx) -> Element {
                             tick += 1;
                             crate::spawn_rematerialize_embedded(ctx);
                         }
-                        Err(e) => note.set(Some(e.to_string())),
+                        Err(e) => note.set(Some(client_log::tagged("merge", e))),
                     }
                 }
-                Err(e) => note.set(Some(e.to_string())),
+                Err(e) => note.set(Some(client_log::tagged("merge", e))),
             }
         });
     };

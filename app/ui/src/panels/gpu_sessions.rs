@@ -6,7 +6,7 @@
 use dioxus::prelude::*;
 use panel_kit::Spinner;
 
-use crate::{api, Ctx};
+use crate::{api, client_log, Ctx};
 
 pub fn panel(ctx: Ctx) -> Element {
     let mut status = use_signal(|| None::<serde_json::Value>);
@@ -27,7 +27,7 @@ pub fn panel(ctx: Ctx) -> Element {
                 if let Some(w) = &world {
                     match api::sm_compute_session(w).await {
                         Ok(v) => status.set(Some(v)),
-                        Err(e) => note.set(Some(e)),
+                        Err(e) => note.set(Some(client_log::tagged("gpu-sessions", e))),
                     }
                     loaded.set(true);
                 }
@@ -63,7 +63,7 @@ pub fn panel(ctx: Ctx) -> Element {
                                 if let Some(w) = w {
                                     match api::sm_compute_action(&w, "dispatch").await {
                                         Ok(_) => tick += 1,
-                                        Err(e) => note.set(Some(e)),
+                                        Err(e) => note.set(Some(client_log::tagged("gpu-sessions", e))),
                                     }
                                 }
                             });
@@ -80,7 +80,7 @@ pub fn panel(ctx: Ctx) -> Element {
                                 if let Some(w) = w {
                                     match api::sm_compute_action(&w, "park").await {
                                         Ok(_) => tick += 1,
-                                        Err(e) => note.set(Some(e)),
+                                        Err(e) => note.set(Some(client_log::tagged("gpu-sessions", e))),
                                     }
                                 }
                             });

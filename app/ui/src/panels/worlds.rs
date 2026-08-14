@@ -13,7 +13,7 @@ use panel_kit::Spinner;
 use session_manager::{UserIdentity, WorldId, WorldSpec};
 
 use super::instances::download_text;
-use crate::{api, clear_world_base, open_world_in_view, spawn_rematerialize_embedded, Ctx};
+use crate::{api, clear_world_base, client_log, open_world_in_view, spawn_rematerialize_embedded, Ctx};
 
 #[derive(Clone, PartialEq)]
 struct Row {
@@ -80,7 +80,7 @@ pub fn panel(mut ctx: Ctx) -> Element {
                         rows.set(rs);
                         error.set(None);
                     }
-                    Err(e) => error.set(Some(e)),
+                    Err(e) => error.set(Some(client_log::tagged("worlds", e))),
                 }
                 loaded.set(true);
             }
@@ -123,7 +123,7 @@ pub fn panel(mut ctx: Ctx) -> Element {
                                     desc.set(String::new());
                                     tick += 1;
                                 }
-                                Err(e) => error.set(Some(e.to_string())),
+                                Err(e) => error.set(Some(client_log::tagged("worlds", e))),
                             }
                         });
                     },
@@ -203,7 +203,7 @@ pub fn panel(mut ctx: Ctx) -> Element {
                                                         }
                                                         tick += 1;
                                                     }
-                                                    Err(e) => error.set(Some(e.to_string())),
+                                                    Err(e) => error.set(Some(client_log::tagged("worlds", e))),
                                                 }
                                             }
                                         });
@@ -237,7 +237,7 @@ pub fn panel(mut ctx: Ctx) -> Element {
                                                             error.set(Some(format!("download: {e}")));
                                                         }
                                                     }
-                                                    Err(e) => error.set(Some(e)),
+                                                    Err(e) => error.set(Some(client_log::tagged("worlds", e))),
                                                 }
                                             });
                                         },
@@ -279,7 +279,7 @@ pub fn panel(mut ctx: Ctx) -> Element {
                                                     });
                                                     match result {
                                                         Ok(_) => tick += 1,
-                                                        Err(e) => error.set(Some(e)),
+                                                        Err(e) => error.set(Some(client_log::tagged("worlds", e))),
                                                     }
                                                 }
                                                 None => {
@@ -351,9 +351,9 @@ fn commit_editor(ctx: Ctx, editor: EditorState) -> Element {
                         note.set(Some(format!("committed: {message}")));
                         spawn_rematerialize_embedded(ctx);
                     }
-                    Err(e) => note.set(Some(e.to_string())),
+                    Err(e) => note.set(Some(client_log::tagged("worlds", e))),
                 },
-                Err(e) => note.set(Some(e.to_string())),
+                Err(e) => note.set(Some(client_log::tagged("worlds", e))),
             }
         });
     };

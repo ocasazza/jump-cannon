@@ -7,7 +7,7 @@ use graph_vcs::Commit;
 use panel_kit::Spinner;
 
 use super::worlds::active_world_id;
-use crate::Ctx;
+use crate::{client_log, Ctx};
 
 pub fn panel(ctx: Ctx) -> Element {
     let mut branch = use_signal(|| "main".to_string());
@@ -45,17 +45,17 @@ pub fn panel(ctx: Ctx) -> Element {
                                 names.sort();
                                 branches.set(names);
                             }
-                            Err(e) => error.set(Some(e.to_string())),
+                            Err(e) => error.set(Some(client_log::tagged("history", e))),
                         }
                         match vcs.log(&b, 200).await {
                             Ok(cs) => {
                                 commits.set(cs);
                                 error.set(None);
                             }
-                            Err(e) => error.set(Some(e.to_string())),
+                            Err(e) => error.set(Some(client_log::tagged("history", e))),
                         }
                     }
-                    Err(e) => error.set(Some(e.to_string())),
+                    Err(e) => error.set(Some(client_log::tagged("history", e))),
                 }
                 loaded.set(true);
             }
@@ -139,10 +139,10 @@ pub fn panel(ctx: Ctx) -> Element {
                                                                 tick += 1;
                                                                 crate::spawn_rematerialize_embedded(ctx);
                                                             }
-                                                            Err(e) => error.set(Some(e.to_string())),
+                                                            Err(e) => error.set(Some(client_log::tagged("history", e))),
                                                         }
                                                     }
-                                                    Err(e) => error.set(Some(e.to_string())),
+                                                    Err(e) => error.set(Some(client_log::tagged("history", e))),
                                                 }
                                             });
                                         },
