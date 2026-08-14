@@ -49,6 +49,18 @@ remote builder (`ssh://root@pdx-nxst-001.schrodinger.com` is in
 `/etc/nix/machines` and reachable off-NetBird), stream the closure down,
 and `crane push` the tarball to GAR `latest`.
 
+## Chart/image publish race
+
+The chart tarball and the runtime images are separate Hydra jobs of one
+eval, and the chart publishes first (~2-3 min before the image jobs'
+skopeo push completes). Flux then rolls the Deployment on the new chart
+revision while `:latest` still points at the previous image, so the fresh
+pod comes up on the OLD build. After every source deploy, compare the
+running pod's `imageID` digest against the registry's `latest` digest and
+`kubectl rollout restart deploy/jump-cannon -n jump-cannon` when they
+differ. (Hit on the 8083dee deploy, 2026-08-14: pod pulled build-2598
+while latest was already build-2684.)
+
 ## Consumer rollout requires the Revision strategy
 
 The chart version is pinned `0.1.0` and republished in place, so the
