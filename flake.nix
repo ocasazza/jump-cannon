@@ -768,7 +768,8 @@
                 git -C "$OKF_TARGET_DIR" remote add origin "$OKF_REPO_URL"
               fi
               git -C "$OKF_TARGET_DIR" fetch origin
-              if ! git -C "$OKF_TARGET_DIR" ls-remote --heads origin main | grep -q .; then
+              # No grep in the image: test the ls-remote output in pure shell.
+              if [ -z "$(git -C "$OKF_TARGET_DIR" ls-remote --heads origin main)" ]; then
                 echo "okf-sync: origin has no main branch yet (producer has not pushed); nothing to do"
                 exit 0
               fi
@@ -805,7 +806,8 @@
               git -C "$OKF_TARGET_DIR" init -b main
               git -C "$OKF_TARGET_DIR" remote add origin "$OKF_REPO_URL"
               git -C "$OKF_TARGET_DIR" fetch origin
-              if ! git -C "$OKF_TARGET_DIR" ls-remote --heads origin main | grep -q .; then
+              # No grep in the image: test the ls-remote output in pure shell.
+              if [ -z "$(git -C "$OKF_TARGET_DIR" ls-remote --heads origin main)" ]; then
                 echo "okf-sync: origin has no main branch yet (producer has not pushed); nothing to do"
                 exit 0
               fi
