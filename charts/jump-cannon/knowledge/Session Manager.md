@@ -71,6 +71,15 @@ NetBird TLS proxy at
 proxy injects `x-user`; browsers put this URL in Settings → session manager).
 The single-tenant `graphCompute.session` is retired there; per-world
 dispatch creates a Kueue-held RayCluster in `gpu-workloads` until quota is
-granted ("waiting for a seed, not broken" — [[Ray GPU Sessions]]). The
-`jump-cannon-session-manager` image publishes like the other runtime images
+granted ("waiting for a seed, not broken" — [[Ray GPU Sessions]]). The `jump-cannon-session-manager` image publishes like the other runtime images
 ([[GitOps Release]]).
+
+**Container restart hazard (fixed in graph-vcs):** minigraf's file lock
+rejects a holder PID equal to the current process — but every container's
+main process is PID 1 in its own PID namespace, so a stale
+`<world>.graph.lock` from a previous pod used to brick the world after any
+pod restart. `MinigrafStore::open` now keeps a weak-token registry of paths
+it actually holds and reclaims stale same-PID/dead-PID locks; genuine
+same-process double-opens and foreign live holders still fail. If a world
+ever reports "locked by another process" with a LIVE different PID, that is
+a real second mount — do not delete the lock blindly.
