@@ -207,7 +207,7 @@ struct SettingsTabsCheck {
     controls_hit_test: bool,
     importer_catalog: bool,
     importer_read_only: bool,
-    importer_switch_controls_absent: bool,
+    importer_switch_posture: bool,
     legacy_panels_absent: bool,
     graph_restored: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1142,7 +1142,7 @@ async fn drive_page(
         let controlsHitTest = maximized && tabs.length === expected.length;
         let importerCatalog = false;
         let importerReadOnly = false;
-        let importerSwitchControlsAbsent = false;
+        let importerSwitchPosture = false;
 
         for (const [label, slug, selector] of expected) {
           const tab = tabs.find((candidate) => (candidate.textContent || '').trim() === label);
@@ -1165,10 +1165,14 @@ async fn drive_page(
             const lavenderText = (selector) =>
               (lavender?.querySelector(selector)?.textContent || '').trim();
             const policy = text('.importer-policy');
+            const switchState = content.querySelector('.importers-view')
+              ?.getAttribute('data-runtime-switch');
+            const switchControls = content.querySelectorAll('.importer-switch-btn');
             const selectedProfile = text('[data-field="selected-profile"]');
             const activeKind = text('[data-field="active-kind"]');
             const knownKinds = new Set([
-              'obsidian', 'tvix', 'generate', 'kubernetes', 'okf', 'pest'
+              'obsidian', 'tvix', 'generate', 'kubernetes', 'okf', 'pest',
+              'github', 'world'
             ]);
             const cards = [...content.querySelectorAll('.importer-card[data-source-id]')];
             const selectedCards = cards.filter(
@@ -1184,13 +1188,22 @@ async fn drive_page(
                 selectedCards[0] === activeCards[0] &&
                 selectedCards[0].getAttribute('data-source-id') === selectedProfile &&
                 selectedCards[0].getAttribute('data-kind') === activeKind;
+            // The policy note follows the per-viewer runtime-switch posture:
+            // a disabled deployment requires a rollout, an authorized viewer
+            // gets runtime viewing, and a denied viewer gets the
+            // group-required note. All three remain deployment-managed.
+            const policyByState = {
+              disabled: /rollout is required/i,
+              enabled: /Runtime viewing is enabled/i,
+              denied: /Switching requires NetBird group/i,
+            };
             importerCatalog = Boolean(
               content.querySelector('.importers-view[data-activation="helm_rollout"]') &&
               lavender &&
               selectionMatches &&
               text('[data-field="active-importer-id"]') &&
               /Configured by Helm/i.test(policy) &&
-              /rollout is required/i.test(policy)
+              Boolean(policyByState[switchState]?.test(policy))
             );
             importerReadOnly = Boolean(
               lavender?.querySelector('.importer-badge.read-only') &&
@@ -1217,16 +1230,17 @@ async fn drive_page(
               /same namespace/i.test(lavenderDescription) &&
               /<release>-okf/.test(lavenderDescription) &&
               /UID\/GID 10001/i.test(lavenderDescription);
-            // The main fixture server runs without a switch group, so the
-            // runtime selector must be absent and today's read-only rendering
-            // preserved exactly. The enabled/authorized selector contract is
-            // exercised by the importer_switch scenario against a second
-            // fixture server.
-            const switchState = content.querySelector('.importers-view')
-              ?.getAttribute('data-runtime-switch');
-            const switchControls = content.querySelectorAll('.importer-switch-btn');
-            importerSwitchControlsAbsent = switchState === 'disabled' &&
-              switchControls.length === 0;
+            // Switch controls must exist exactly when this viewer is
+            // authorized: absent for disabled deployments (the local fixture)
+            // and for denied viewers (the deployment's unprivileged browser
+            // identity), present for enabled viewers. The full authorized
+            // selector contract is exercised by the importer_switch scenario
+            // against a second fixture server.
+            importerSwitchPosture = Boolean(
+              ((switchState === 'disabled' || switchState === 'denied') &&
+                switchControls.length === 0) ||
+              (switchState === 'enabled' && switchControls.length > 0)
+            );
           }
 
           const selectedTabs = tabs.filter(
@@ -1307,7 +1321,7 @@ async fn drive_page(
         if (contentPanels.length !== expected.length) failures.push('a Settings tab has no delegated content');
         if (!importerCatalog) failures.push('deployment-managed importer catalog is incomplete');
         if (!importerReadOnly) failures.push('Lavender OKF read-only PVC contract is incomplete');
-        if (!importerSwitchControlsAbsent) failures.push('Importer catalog exposes runtime switch controls while switching is disabled');
+        if (!importerSwitchPosture) failures.push('Importer catalog switch controls do not match the viewer posture');
         if (!legacyPanelsAbsent) failures.push('legacy Layout, Style, or Camera panel still exists');
         if (!graphRestored) failures.push('Graph renderer did not remount after Settings restore');
         return {
@@ -1319,7 +1333,7 @@ async fn drive_page(
           controls_hit_test: Boolean(controlsHitTest),
           importer_catalog: Boolean(importerCatalog),
           importer_read_only: Boolean(importerReadOnly),
-          importer_switch_controls_absent: Boolean(importerSwitchControlsAbsent),
+          importer_switch_posture: Boolean(importerSwitchPosture),
           legacy_panels_absent: legacyPanelsAbsent,
           graph_restored: graphRestored,
           reason: failures.length ? failures.join('; ') : null,
@@ -1429,9 +1443,15 @@ async fn drive_page(
 
     // ---- 7. Filter is a repeatable, validated Boolean builder -------------
     // Restore the minimized Filter panel, maximize it for deterministic
-    // geometry, and drive only its stable test/ARIA contract. The fixture tags
-    // make the nested group's ALL/ANY counts deterministic: their intersection
-    // is one node and their union is two nodes.
+    // geometry, and drive only its stable test/ARIA contract. The nested
+    // group's tag pair and expected ALL/ANY counts derive from the served
+    // corpus itself: the JS decodes /graph/meta_summary (the same facet
+    // payload the panel evaluates field rules against) and picks two tag
+    // values whose node sets have a strict intersection-is-smaller-than-union
+    // relationship. The contract therefore holds against the seeded fixture
+    // vault and the live github-imported corpus alike — the fixture notes
+    // cannot be seeded into a deployment whose importer grants no
+    // content-write effect.
     let filter_builder_js = r#"(async () => {
         const waitFor = async (predicate, timeoutMs = 10000) => {
           const deadline = performance.now() + timeoutMs;
@@ -1512,6 +1532,117 @@ async fn drive_page(
           }
           return false;
         };
+
+        // Decode /graph/meta_summary — the same facet payload the panel
+        // evaluates field rules against — and pick two tag values whose node
+        // sets have a strict intersection < union relationship, so the
+        // nested group's ALL/ANY counts are derived from the served corpus
+        // rather than from fixture notes a read-only deployment cannot hold.
+        // Wire shape (prost): MetaSummary { repeated string fields = 1;
+        // repeated FieldBucket buckets = 2 }; FieldBucket { uint32 field_idx
+        // = 1; string value = 2; packed repeated uint32 node_idx = 3 }.
+        const corpusTags = await (async () => {
+          try {
+            const response = await fetch('/graph/meta_summary');
+            if (!response.ok) return null;
+            const bytes = new Uint8Array(await response.arrayBuffer());
+            const reader = (buffer) => {
+              let offset = 0;
+              return {
+                varint() {
+                  let result = 0;
+                  let shift = 0;
+                  for (;;) {
+                    if (offset >= buffer.length) throw new Error('truncated varint');
+                    const byte = buffer[offset];
+                    offset += 1;
+                    result += (byte & 0x7f) * 2 ** shift;
+                    if (!(byte & 0x80)) return result;
+                    shift += 7;
+                  }
+                },
+                take(length) {
+                  if (offset + length > buffer.length) throw new Error('truncated field');
+                  const slice = buffer.slice(offset, offset + length);
+                  offset += length;
+                  return slice;
+                },
+                get done() { return offset >= buffer.length; },
+              };
+            };
+            const top = reader(bytes);
+            const fields = [];
+            const buckets = [];
+            while (!top.done) {
+              const key = top.varint();
+              if (key % 8 !== 2) throw new Error('unexpected wire type');
+              const field = Math.floor(key / 8);
+              const payload = top.take(top.varint());
+              if (field === 1) fields.push(new TextDecoder().decode(payload));
+              if (field === 2) buckets.push(payload);
+            }
+            const tags = new Map();
+            for (const bucket of buckets) {
+              const inner = reader(bucket);
+              let fieldIdx = null;
+              let value = null;
+              let nodes = [];
+              while (!inner.done) {
+                const key = inner.varint();
+                const field = Math.floor(key / 8);
+                if (key % 8 === 0) {
+                  const scalar = inner.varint();
+                  if (field === 1) fieldIdx = scalar;
+                } else if (key % 8 === 2) {
+                  const payload = inner.take(inner.varint());
+                  if (field === 2) value = new TextDecoder().decode(payload);
+                  if (field === 3) {
+                    const packed = reader(payload);
+                    nodes = [];
+                    while (!packed.done) nodes.push(packed.varint());
+                  }
+                } else {
+                  throw new Error('unexpected wire type');
+                }
+              }
+              if (fieldIdx !== null && fields[fieldIdx] === 'tags' && value) {
+                tags.set(value, nodes);
+              }
+            }
+            return tags;
+          } catch {
+            return null;
+          }
+        })();
+        // Regex-safe values only: the pair later feeds the Matches operator.
+        const tagCandidates = [...(corpusTags?.entries() || [])]
+          .filter(([value]) => /^[A-Za-z0-9/_-]+$/.test(value))
+          .sort((a, b) => a[1].length - b[1].length ||
+            (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0))
+          .slice(0, 200);
+        let tagPair = null;
+        let disjointPair = null;
+        for (let i = 0; i < tagCandidates.length && !tagPair; i += 1) {
+          for (let j = i + 1; j < tagCandidates.length; j += 1) {
+            const first = new Set(tagCandidates[i][1]);
+            const second = new Set(tagCandidates[j][1]);
+            const intersection = [...first].filter((node) => second.has(node)).length;
+            const union = new Set([...first, ...second]).size;
+            if (union <= intersection) continue;
+            const pair = {
+              a: tagCandidates[i][0],
+              b: tagCandidates[j][0],
+              all: intersection,
+              any: union,
+            };
+            if (intersection >= 1) {
+              tagPair = pair;
+              break;
+            }
+            disjointPair = disjointPair || pair;
+          }
+        }
+        tagPair = tagPair || disjointPair;
 
         const dockChip = [...document.querySelectorAll('.dock-chip')]
           .find((chip) => (chip.textContent || '').trim() === 'Filter');
@@ -1604,69 +1735,85 @@ async fn drive_page(
         let fieldRules = fieldsAdded || [];
         const editorFieldId = fieldRules[0]?.getAttribute('data-rule-id') || '';
         const sharedFieldId = fieldRules[1]?.getAttribute('data-rule-id') || '';
-        await setFieldRule(editorFieldId, 'tags', 'browser-editor');
-        await setFieldRule(sharedFieldId, 'tags', 'browser-shared');
+        let allCount = 0;
+        let anyCount = 0;
+        let modeCounts = false;
+        let fieldsPresent = false;
+        let inlineDiagnostic = false;
+        let lastValidState = false;
+        if (tagPair) {
+          await setFieldRule(editorFieldId, 'tags', tagPair.a);
+          await setFieldRule(sharedFieldId, 'tags', tagPair.b);
 
-        const allReady = await waitFor(() => {
-          const group = groupById(nestedId);
-          return group?.getAttribute('data-mode') === 'all' && countOf(group) === 1 && group;
-        });
-        const allCount = allReady ? countOf(allReady) : 0;
-        own(groupById(nestedId), 'filter-group-mode')?.parentElement
-          ?.querySelector('[data-testid="filter-group-mode"][data-mode-target="any"]')
-          ?.click();
-        const anyReady = await waitFor(() => {
-          const group = groupById(nestedId);
-          return group?.getAttribute('data-mode') === 'any' && countOf(group) === 2 && group;
-        });
-        const anyCount = anyReady ? countOf(anyReady) : 0;
-        const modeCounts = allCount === 1 && anyCount === 2;
-        fieldRules = ownRules(groupById(nestedId), 'field');
-        const fieldValues = fieldRules.map((rule) =>
-          rule.querySelector(selector('filter-field-value'))?.value || ''
-        );
-        const fieldsPresent = fieldRules.length === 2 &&
-          fieldValues.includes('browser-editor') && fieldValues.includes('browser-shared') &&
-          fieldRules.every((rule) =>
-            (rule.querySelector(selector('filter-field-name'))?.value || '') === 'tags' &&
-            Boolean(rule.getAttribute('data-expression'))
+          const allReady = await waitFor(() => {
+            const group = groupById(nestedId);
+            return group?.getAttribute('data-mode') === 'all' &&
+              countOf(group) === tagPair.all && group;
+          });
+          allCount = allReady ? countOf(allReady) : 0;
+          own(groupById(nestedId), 'filter-group-mode')?.parentElement
+            ?.querySelector('[data-testid="filter-group-mode"][data-mode-target="any"]')
+            ?.click();
+          const anyReady = await waitFor(() => {
+            const group = groupById(nestedId);
+            return group?.getAttribute('data-mode') === 'any' &&
+              countOf(group) === tagPair.any && group;
+          });
+          anyCount = anyReady ? countOf(anyReady) : 0;
+          modeCounts = tagPair.any > tagPair.all &&
+            allCount === tagPair.all && anyCount === tagPair.any;
+          fieldRules = ownRules(groupById(nestedId), 'field');
+          const fieldValues = fieldRules.map((rule) =>
+            rule.querySelector(selector('filter-field-value'))?.value || ''
           );
+          fieldsPresent = fieldRules.length === 2 &&
+            fieldValues.includes(tagPair.a) && fieldValues.includes(tagPair.b) &&
+            fieldRules.every((rule) =>
+              (rule.querySelector(selector('filter-field-name'))?.value || '') === 'tags' &&
+              Boolean(rule.getAttribute('data-expression'))
+            );
 
-        const matchesOperator = await setMatchesOperator(editorFieldId);
-        await setValue(
-          ruleById(editorFieldId)?.querySelector(selector('filter-field-value')),
-          'browser-editor'
-        );
-        const appliedBeforeInvalid = await waitFor(() => {
-          const evaluation = builder?.querySelector(selector('filter-evaluation'));
-          return evaluation?.getAttribute('data-phase') === 'applied' &&
-            evaluation?.getAttribute('data-applied-count') !== null && evaluation;
-        });
-        const lastAppliedCount = appliedBeforeInvalid?.getAttribute('data-applied-count');
-        await setValue(
-          ruleById(editorFieldId)?.querySelector(selector('filter-field-value')),
-          '['
-        );
-        const diagnostic = await waitFor(() => {
-          const rule = ruleById(editorFieldId);
-          const alert = rule?.querySelector(`${selector('filter-diagnostic')}[role="alert"]`);
-          return /Invalid regular expression/i.test(alert?.textContent || '') && alert;
-        });
-        const invalidEvaluation = builder?.querySelector(selector('filter-evaluation'));
-        const inlineDiagnostic = Boolean(matchesOperator && diagnostic);
-        const lastValidState = Boolean(
-          appliedBeforeInvalid && invalidEvaluation?.getAttribute('data-phase') === 'invalid' &&
-          invalidEvaluation?.getAttribute('data-applied-count') === lastAppliedCount &&
-          countOf(groupById(nestedId)) === anyCount
-        );
+          const matchesOperator = await setMatchesOperator(editorFieldId);
+          // Matches is unanchored; anchor the pattern so it selects exactly
+          // the same bucket the exact-match operator did.
+          await setValue(
+            ruleById(editorFieldId)?.querySelector(selector('filter-field-value')),
+            `^${tagPair.a}$`
+          );
+          const appliedBeforeInvalid = await waitFor(() => {
+            const evaluation = builder?.querySelector(selector('filter-evaluation'));
+            return evaluation?.getAttribute('data-phase') === 'applied' &&
+              evaluation?.getAttribute('data-applied-count') !== null && evaluation;
+          });
+          const lastAppliedCount = appliedBeforeInvalid?.getAttribute('data-applied-count');
+          await setValue(
+            ruleById(editorFieldId)?.querySelector(selector('filter-field-value')),
+            '['
+          );
+          const diagnostic = await waitFor(() => {
+            const rule = ruleById(editorFieldId);
+            const alert = rule?.querySelector(`${selector('filter-diagnostic')}[role="alert"]`);
+            return /Invalid regular expression/i.test(alert?.textContent || '') && alert;
+          });
+          const invalidEvaluation = builder?.querySelector(selector('filter-evaluation'));
+          inlineDiagnostic = Boolean(matchesOperator && diagnostic);
+          lastValidState = Boolean(
+            appliedBeforeInvalid && invalidEvaluation?.getAttribute('data-phase') === 'invalid' &&
+            invalidEvaluation?.getAttribute('data-applied-count') === lastAppliedCount &&
+            countOf(groupById(nestedId)) === anyCount
+          );
+        }
 
         if (!dockChip || !initialPanel || !maximize || !panelVisible) {
           failures.push('Filter did not restore from the dock and maximize');
         }
         if (!independentSearchRules) failures.push('repeatable Search rules are not independent');
         if (!accessibleReorder) failures.push('Search rules did not expose a working accessible reorder');
-        if (!fieldsPresent) failures.push('fixture tag field rules are incomplete');
-        if (!modeCounts) failures.push('nested ALL/ANY counts were not 1 and 2');
+        if (!tagPair) failures.push('served corpus has no tag pair with a strict ALL/ANY relationship');
+        if (!fieldsPresent) failures.push('tag field rules are incomplete');
+        if (!modeCounts) failures.push(
+          `nested ALL/ANY counts were not ${tagPair?.all ?? '?'} and ${tagPair?.any ?? '?'}`
+        );
         if (!inlineDiagnostic) failures.push('invalid regex has no inline diagnostic');
         if (!lastValidState) failures.push('invalid draft did not preserve the last valid result');
         return {

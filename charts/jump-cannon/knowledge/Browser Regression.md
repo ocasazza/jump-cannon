@@ -38,10 +38,22 @@ The importer fixture proves that the active source is identified, the Lavender
 source shows its exact read-only claim and `/var/lib/lavender/okf-repository/okf`
 input, deployment-provisioned RWX and same-namespace requirements, alternate
 `<release>-okf` naming, UID/GID `10001`, and rollout ownership are explained.
-Because the main fixture server sets no `JUMP_CANNON_IMPORTER_SWITCH_GROUP`,
-the runtime switch selector must be absent (`data-runtime-switch="disabled"`,
-no `.importer-switch-btn`). Restoring Settings must remount a render-ready
+The switch-posture assertion is per-viewer: against the main fixture server
+(no `JUMP_CANNON_IMPORTER_SWITCH_GROUP`) the runtime switch selector must be
+absent (`data-runtime-switch="disabled"`, no `.importer-switch-btn`); against
+a switching-enabled deployment the harness asserts the posture it is served —
+the group-required note and no controls for a denied viewer, controls for an
+authorized one. Restoring Settings must remount a render-ready
 Graph canvas. These results are recorded under `settings_tabs`.
+
+The Filter builder contract derives its nested-group expectations from the
+served corpus rather than from fixture notes (a deployment whose importer
+grants no content-write effect cannot be seeded). The harness decodes
+`/graph/meta_summary` — the same facet payload the panel evaluates field
+rules against — picks two tag values whose node sets have a strict
+intersection-smaller-than-union relationship, and asserts the nested group's
+ALL count equals the computed intersection and the ANY count the computed
+union. These results are recorded under `filter_builder`.
 
 A second fixture graph-api exercises the runtime switching contract itself.
 The harness mirrors the served app dist over raw HTTP into a tempdir, spawns
