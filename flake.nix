@@ -102,6 +102,15 @@
           nativeBuildInputs = [ pkgs.protobuf ];
         });
 
+        # Multi-user session-manager server (world/session/VCS REST API +
+        # per-world graph serving + GPU broker). `server` feature pulls in
+        # the axum binary; prost builds need protoc like graph-api.
+        session-manager = craneLib.buildPackage (commonArgs // {
+          cargoArtifacts = depsNative;
+          cargoExtraArgs = "--package session-manager --features server";
+          nativeBuildInputs = [ pkgs.protobuf ];
+        });
+
         graph-compute-k8s-binary = craneLib.buildPackage (commonArgs // {
           cargoArtifacts = depsNative;
           cargoExtraArgs = "--package graph-compute";
@@ -517,6 +526,48 @@
             }
           else
             unsupportedK8sImage "graph-compute-k8s-image";
+
+        # Session-manager k8s image: the chart's sessionManager section
+        # (deployment-session-manager.yaml) points at this repo/name. All
+        # runtime config arrives via env from the chart; the image only
+        # needs the server binary and TLS roots (kube client + TerminusDB).
+        session-manager-k8s-image =
+          if isLinux then
+            pkgs.dockerTools.streamLayeredImage {
+              name = "${k8sImageRegistry}/jump-cannon-session-manager";
+              tag = "latest";
+              contents = [
+                session-manager
+                pkgs.cacert
+              ];
+              extraCommands = ''
+                mkdir -p etc/ssl/certs worlds
+                ln -sf ${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt etc/ssl/certs/ca-bundle.crt
+              '';
+              fakeRootCommands = ''
+                printf 'root:x:0:0::/root:/noshell\njump:x:10001:10001:Jump Cannon:/tmp:/noshell\n' > etc/passwd
+                printf 'root:x:0:\njump:x:10001:\n' > etc/group
+                chmod 0644 etc/passwd etc/group
+              '';
+              config = {
+                Entrypoint = [ "/bin/session-manager" ];
+                ExposedPorts."8080/tcp" = {};
+                Env = [
+                  "SESSION_MANAGER_HOST=0.0.0.0"
+                  "SESSION_MANAGER_PORT=8080"
+                  "JUMP_CANNON_WORLDS_DIR=/worlds"
+                  "RUST_LOG=info"
+                  "SSL_CERT_FILE=/etc/ssl/certs/ca-bundle.crt"
+                  "NIX_SSL_CERT_FILE=/etc/ssl/certs/ca-bundle.crt"
+                ];
+                Labels = {
+                  "org.opencontainers.image.source" = "https://github.com/ocasazza/jump-cannon";
+                  "org.opencontainers.image.description" = "jump-cannon session-manager (multi-user worlds/VCS/GPU broker)";
+                };
+              };
+            }
+          else
+            unsupportedK8sImage "session-manager-k8s-image";
 
         test-workload-bins =
           if isLinux then
@@ -970,7 +1021,8 @@
             sourceRev = inputs.self.rev or inputs.self.dirtyRev or "unknown";
           };
           inherit graph-compute-image graph-api-image docker-compose-yaml;
-          inherit graph-api-k8s-image graph-compute-k8s-image test-runner-image;
+          inherit graph-api-k8s-image graph-compute-k8s-image session-manager-k8s-image test-runner-image;
+          inherit session-manager;
           inherit test-browser test-workload-bins;
         };
 
@@ -1140,6 +1192,7 @@
       x86_64-linux.chart-tarball = inputs.self.packages.x86_64-linux.chart-tarball;
       x86_64-linux.graph-api-k8s-image = inputs.self.packages.x86_64-linux.graph-api-k8s-image;
       x86_64-linux.graph-compute-k8s-image = inputs.self.packages.x86_64-linux.graph-compute-k8s-image;
+      x86_64-linux.session-manager-k8s-image = inputs.self.packages.x86_64-linux.session-manager-k8s-image;
       x86_64-linux.test-runner-image = inputs.self.packages.x86_64-linux.test-runner-image;
       aarch64-darwin.graph-compute = inputs.self.packages.aarch64-darwin.graph-compute;
       aarch64-darwin.bench-pagerank = inputs.self.packages.aarch64-darwin.bench-pagerank;
