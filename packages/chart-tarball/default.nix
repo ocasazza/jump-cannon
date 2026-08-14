@@ -61,6 +61,56 @@ pkgs.runCommand "jump-cannon-chart-tarball"
       echo "selected lavender-ingest-okf must not seed its read-only source" >&2
       exit 1
     fi
+    # okfSync defaults to disabled: no sync CronJob may render.
+    if grep -Eq '^kind: CronJob$' lavender.yaml; then
+      echo "okfSync.enabled=false must not render any CronJob" >&2
+      exit 1
+    fi
+
+    # okf-sync CronJob: claim and mount are derived from the selected OKF
+    # profile, the deploy key comes from the named Secret, and a hard
+    # podAffinity pins the sync pod to the graph-api node (RWO local-path).
+    # Assertions run against the extracted CronJob document because the claim
+    # name and mount path also appear (read-only) in the graph-api Deployment.
+    helm template okf-sync ./jump-cannon \
+      -f ./jump-cannon/ci/lavender-ingest-okf-values.yaml \
+      --set grafanaDashboards.enabled=false \
+      --set okfSync.enabled=true \
+      > okf-sync.yaml
+    awk '/^# Source: jump-cannon\/templates\/okf-sync.yaml$/{f=1} f&&/^---$/{exit} f' \
+      okf-sync.yaml > okf-sync-cronjob.yaml
+    grep -Fq 'kind: CronJob' okf-sync-cronjob.yaml
+    grep -Eq '^  name: okf-sync-jump-cannon-okf-sync$' okf-sync-cronjob.yaml
+    grep -Fq 'schedule: "17 * * * *"' okf-sync-cronjob.yaml
+    grep -Fq 'concurrencyPolicy: Forbid' okf-sync-cronjob.yaml
+    grep -Fq 'image: "us-central1-docker.pkg.dev/it-ops-nixstation/lavender/jump-cannon-okf-sync:latest"' okf-sync-cronjob.yaml
+    grep -Fq 'name: OKF_REPO_URL' okf-sync-cronjob.yaml
+    grep -Fq 'value: "git@github.com:schrodinger/lavender-okf.git"' okf-sync-cronjob.yaml
+    grep -Fq 'name: OKF_TARGET_DIR' okf-sync-cronjob.yaml
+    grep -Fq 'value: "/var/lib/lavender/okf-repository"' okf-sync-cronjob.yaml
+    grep -Fq 'mountPath: /var/lib/lavender/okf-repository' okf-sync-cronjob.yaml
+    grep -Fq 'claimName: lavender-okf-shared' okf-sync-cronjob.yaml
+    grep -Fq 'secretName: "lavender-okf-reader"' okf-sync-cronjob.yaml
+    grep -Fq 'defaultMode: 0400' okf-sync-cronjob.yaml
+    grep -Fq 'requiredDuringSchedulingIgnoredDuringExecution' okf-sync-cronjob.yaml
+    grep -Fq 'topologyKey: kubernetes.io/hostname' okf-sync-cronjob.yaml
+    grep -Fq 'app.kubernetes.io/component: graph-api' okf-sync-cronjob.yaml
+    # The sync pod is the claim's writer: only the deploy-key mount may be
+    # read-only inside the CronJob pod.
+    test "$(grep -Fc 'readOnly: true' okf-sync-cronjob.yaml)" -eq 1
+
+    # okfSync with a dormant (unselected) OKF profile still derives claim and
+    # mount from the catalog's single OKF entry.
+    helm template okf-sync-dormant ./jump-cannon \
+      --set graphCompute.enabled=false \
+      --set tests.fuzz.enabled=false \
+      --set tests.performance.enabled=false \
+      --set tests.browser.enabled=false \
+      --set okfSync.enabled=true \
+      > okf-sync-dormant.yaml
+    grep -Fq 'kind: CronJob' okf-sync-dormant.yaml
+    grep -Fq 'claimName: lavender-okf-shared' okf-sync-dormant.yaml
+    grep -Fq 'value: "/var/lib/lavender/okf-repository"' okf-sync-dormant.yaml
 
     helm template legacy-kubernetes ./jump-cannon \
       --set kubernetesImporter.enabled=true \
@@ -222,6 +272,22 @@ pkgs.runCommand "jump-cannon-chart-tarball"
     expect_render_failure gpu-session-multi-replica \
       --set graphCompute.session.enabled=true \
       --set graphApi.replicas=2
+    # okf-sync must refuse to mount the active vault claim read-write.
+    expect_render_failure okf-sync-vault-claim \
+      --set okfSync.enabled=true \
+      --set-string vault.persistence.existingClaim=lavender-okf-shared
+    # okf-sync needs a runnable OKF filesystem profile to derive claim/mount
+    # from; with the catalog's only OKF entry turned into Obsidian it fails.
+    expect_render_failure okf-sync-no-okf-profile \
+      --set okfSync.enabled=true \
+      --set importers.sources.lavender-ingest-okf.sourceId=null \
+      --set importers.sources.lavender-ingest-okf.producer=null \
+      --set-string importers.sources.lavender-ingest-okf.kind=obsidian \
+      --set importers.sources.lavender-ingest-okf.source.readOnly=false
+    # The deploy key always comes from a user-created Secret, never values.
+    expect_render_failure okf-sync-blank-deploy-key-secret \
+      --set okfSync.enabled=true \
+      --set-string okfSync.deployKeySecret=" "
 
     helm package --app-version "${sourceRev}" ./jump-cannon -d "$out/charts"
   ''

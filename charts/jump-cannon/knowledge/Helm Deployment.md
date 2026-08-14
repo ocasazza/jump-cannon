@@ -76,6 +76,30 @@ Lavender lake or state storage for the OKF repository. A live Git working tree
 is not an immutable workflow snapshot; record its HEAD or copy it before a run
 that requires reproducibility.
 
+## okf-sync CronJob
+
+lavender-ingest git-pushes the OKF repository to the private
+`schrodinger/lavender-okf` GitHub repo nightly. Set `okfSync.enabled=true` to
+render a CronJob (default schedule `17 * * * *`) that fast-forward pulls that
+repo into the profile's claim, so the OKF source serves real data without a
+writer deployment sharing the volume. Claim name and mount path are derived
+from the importer catalog profile itself — the selected OKF profile, or the
+catalog's single OKF entry — never duplicated in values; the chart fails to
+render when no runnable OKF filesystem profile exists or when the derived
+claim is the vault claim.
+
+The deploy key always comes from a user-created Secret named by
+`okfSync.deployKeySecret` (default `lavender-okf-reader`) holding the
+read-only GitHub deploy key at key `id_ed25519`, mounted at
+`/secrets/okf-reader` with mode `0400`. The key never appears in values.
+
+The derived claim is RWO `local-path` and graph-api already mounts it
+read-only, so the sync pod carries a hard `podAffinity` on the graph-api pod
+labels with `kubernetes.io/hostname` topology: it only schedules on the
+graph-api node. Syncs are fast-forward-only; divergence or a non-`main`
+checkout fails the Job loudly for an operator — the claim is a read replica
+and the job never merges or force-resets.
+
 The chart owns portable workload configuration. The consuming environment owns
 cluster policy, credentials, NetBird resources, and Gateway routes. Continue
 through [[GitOps Release]], [[Security Model]], and [[Scheduled Tests]].

@@ -23,7 +23,10 @@ environment-owned through [[Service Access]]. GPU work is admitted through
 metadata. They never expose credentials. Filesystem source instances declare
 the exact claim, mount, input path, and read-only state. The Lavender OKF
 profile may read only the shared OKF repository claim; it must never mount
-Lavender lake or state data.
+Lavender lake or state data. The okf-sync CronJob authenticates to GitHub with
+a read-only deploy key scoped to the `schrodinger/lavender-okf` repository;
+the private key lives only in a user-created Secret (mounted mode `0400`,
+never in values), so the sync job can pull but never push.
 
 When `importers.runtimeSwitchGroup` is set, a viewer may select any runnable
 catalog source at runtime from **Settings > Importers** instead of waiting for
