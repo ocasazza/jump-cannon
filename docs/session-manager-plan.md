@@ -127,4 +127,7 @@ history fidelity.
   cluster (`my.world` vs `my-world`).
 - The open world is not persisted across view-switch reloads (in-memory
   `active_world` only); re-open it from the Worlds panel. Embedded worlds
-  themselves persist via localStorage re-export.
+  themselves persist via localStorage re-export. The server-side open set is
+  in-memory too: a session-manager restart closes every world, and the
+  Worlds panel's Open button re-opens it (`POST /api/worlds` is an idempotent
+  reopen; `WorldExists` is treated as already-open success).
