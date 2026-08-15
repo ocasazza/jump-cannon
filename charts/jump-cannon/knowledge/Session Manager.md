@@ -74,6 +74,15 @@ dispatch creates a Kueue-held RayCluster in `gpu-workloads` until quota is
 granted ("waiting for a seed, not broken" — [[Ray GPU Sessions]]). The `jump-cannon-session-manager` image publishes like the other runtime images
 ([[GitOps Release]]).
 
+**World open state is in-memory:** a pod restart closes every world — the
+`worlds.json` manifest still lists them, but `/worlds/:name/*`,
+`/api/worlds/:id/compute/session`, and the VCS routes 404
+(`world_not_found`) until the world is re-opened. Re-opening is idempotent:
+`POST /api/worlds` with an existing name re-opens a closed world (and fails
+with `world_exists` only when it is already open). The Worlds panel's **Open**
+button does exactly this before attaching a session, so a restart is
+recoverable from the UI alone.
+
 **Container restart hazard (fixed in graph-vcs):** minigraf's file lock
 rejects a holder PID equal to the current process — but every container's
 main process is PID 1 in its own PID namespace, so a stale

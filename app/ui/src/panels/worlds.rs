@@ -10,7 +10,7 @@
 use dioxus::prelude::*;
 use graph_vcs::{GraphOp, NodeId, VaultEdge, VaultNode};
 use panel_kit::Spinner;
-use session_manager::{UserIdentity, WorldId, WorldSpec};
+use session_manager::{SessionError, UserIdentity, WorldId, WorldSpec};
 
 use super::instances::download_text;
 use crate::{api, clear_world_base, client_log, open_world_in_view, spawn_rematerialize_embedded, Ctx};
@@ -152,6 +152,7 @@ pub fn panel(mut ctx: Ctx) -> Element {
                     let id = row.id.clone();
                     let id_for_close = row.id.clone();
                     let id_for_export = row.id.clone();
+                    let name_for_open = row.name.clone();
                     let em_for_export = embedded.clone();
                     rsx! {
                         div { key: "{row.id}", class: "kv",
@@ -166,14 +167,34 @@ pub fn panel(mut ctx: Ctx) -> Element {
                                     disabled: is_active,
                                     onclick: move |_| {
                                         let world = id.clone();
-                                        // Attach a session up front on
-                                        // multi-user hosts; single-user hosts
-                                        // keep their one implicit session.
-                                        let joined = world.clone();
+                                        let spec = WorldSpec {
+                                            name: name_for_open.clone(),
+                                            description: None,
+                                        };
                                         spawn(async move {
                                             let host = ctx.host.read().clone();
+                                            // Re-open the world on the host
+                                            // first: a session-manager restart
+                                            // drops every world's in-memory
+                                            // open state, and the per-world
+                                            // serving routes 404 until the
+                                            // world is re-opened. WorldExists
+                                            // means it is already open — that
+                                            // is success here.
+                                            match host.open_world(spec).await {
+                                                Ok(_)
+                                                | Err(SessionError::WorldExists { .. }) => {}
+                                                Err(e) => {
+                                                    error.set(Some(client_log::tagged("worlds", e)));
+                                                    return;
+                                                }
+                                            }
+                                            // Attach a session up front on
+                                            // multi-user hosts; single-user
+                                            // hosts keep their one implicit
+                                            // session.
                                             if let Some(dir) = host.sessions() {
-                                                if let Ok(wid) = WorldId::parse(&joined) {
+                                                if let Ok(wid) = WorldId::parse(&world) {
                                                     let user = UserIdentity {
                                                         name: api::user_name(),
                                                         groups: Vec::new(),
@@ -181,8 +202,8 @@ pub fn panel(mut ctx: Ctx) -> Element {
                                                     let _ = dir.join(&wid, &user).await;
                                                 }
                                             }
+                                            open_world_in_view(ctx, world);
                                         });
-                                        open_world_in_view(ctx, world);
                                     },
                                     "Open"
                                 }
