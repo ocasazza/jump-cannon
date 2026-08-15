@@ -72,12 +72,16 @@ gate; the unauthorized page deliberately fetches a 403, so only its wire
 status is asserted. These results are recorded under `importer_switch`.
 
 The run then clicks the topbar **Sessions** view switcher. View switches
-reload the page (persisted `jc_view` + `location.reload()`), so the suite
-detects the fresh runtime by the `window.__jc_boot` stamp changing and
-asserts in fresh evaluates: against the embedded single-user host the
-contract is deterministic — the Sessions workspace mounts the Worlds panel
-with its "no worlds yet" empty state and the dock, and switching back to
-**User** remounts a render-ready Graph canvas. These results are recorded
+mount in place (persisted `jc_view` + distinct
+`UserWorkspaceView`/`SessionsWorkspaceView` component types — no page
+reload), so the suite asserts in fresh evaluates against the live page:
+against the embedded single-user host the contract is deterministic — the
+Sessions workspace mounts the Worlds panel with its "no worlds yet" empty
+state and the dock, switching back to **User** remounts a render-ready
+Graph canvas, a world created and opened on the embedded host survives a
+full-page reload (`jc_world` + boot restore: topbar label AND remounted
+canvas), and a maximized-panel round-trip (maximize Worlds, switch
+away and back) keeps the app alive. These results are recorded
 under `sessions_view`, with visual evidence in `sessions-view.png`. The
 view contract itself lives in [[Session Manager]].
 

@@ -18,6 +18,14 @@ thiserror  = "2"
 minigraf   = "1.2"
 sha2       = "0.10"
 
+# wasm32: minigraf's `browser` feature switches its transaction IDs from
+# `SystemTime::now()` (which panics on wasm32-unknown-unknown) to
+# `js_sys::Date::now()`. Without it every commit in the embedded browser
+# host aborts the app. The feature's IndexedDB `BrowserDb` façade stays
+# unused — `MinigrafStore` is in-memory on wasm32 regardless.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+minigraf = { version = "1.2", features = ["browser"] }
+
 # `terminus` feature only (native). Plain HTTP, no TLS backend: in-cluster
 # traffic terminates TLS at the ingress, same stance as session-manager.
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]

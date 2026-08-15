@@ -2065,13 +2065,14 @@ async fn drive_page(
     tracing::info!("wrote screenshot {}", shot_path.display());
 
     // ---- 11. Sessions view mounts the world workspace -------------------
-    // View switches RELOAD the page (persisted `jc_view` + location.reload),
-    // so each click destroys the JS execution context: assertions must run in
-    // fresh evaluates against the reloaded page, detecting the new runtime by
-    // the `window.__jc_boot` stamp changing. With no session-manager URL
-    // configured the app boots the embedded single-user host, so the contract
-    // is deterministic: Worlds panel with its empty state, dock present, and
-    // switching back to User remounts the graph canvas.
+    // View switches mount IN PLACE (persisted `jc_view` + distinct
+    // UserWorkspaceView/SessionsWorkspaceView component types): the flush
+    // unmounts one hook scope and initializes the other without a page
+    // reload, so assertions run in fresh evaluates against the live page.
+    // With no session-manager URL configured the app boots the embedded
+    // single-user host, so the contract is deterministic: Worlds panel with
+    // its empty state, dock present, and switching back to User remounts the
+    // graph canvas.
     let click_sessions_js = r#"(() => {
         const buttons = [...(document.querySelector('nav.view-switch')
           ?.querySelectorAll('button.view-btn') || [])];
@@ -2083,20 +2084,15 @@ async fn drive_page(
         );
         const switchFound = Boolean(userButton && sessionsButton);
         sessionsButton?.click();
-        return { switch_found: switchFound, boot_before: window.__jc_boot || 0 };
+        return { switch_found: switchFound };
     })()"#;
     let click_value: serde_json::Value = page.evaluate(click_sessions_js).await?.into_value()?;
     let switch_found = click_value
         .get("switch_found")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
-    let boot_before = click_value
-        .get("boot_before")
-        .and_then(|v| v.as_f64())
-        .unwrap_or(0.0);
 
-    // Poll (in fresh evaluates) until the reloaded page reports a new boot
-    // stamp with the Sessions button active.
+    // Poll (in fresh evaluates) until the Sessions button reports active.
     let sessions_state_js = r#"(() => {
         const buttons = [...(document.querySelector('nav.view-switch')
           ?.querySelectorAll('button.view-btn') || [])];
@@ -2104,26 +2100,18 @@ async fn drive_page(
           (button) => (button.textContent || '').trim() === 'Sessions'
         );
         return {
-          boot: window.__jc_boot || 0,
           active: Boolean(sessions?.classList.contains('active')),
         };
     })()"#;
     let mut sessions_active = false;
     for _ in 0..50 {
-        // The page reloads on switch: evaluates can race the navigation and
-        // lose their execution context — retry rather than fail.
-        let Ok(eval) = page.evaluate(sessions_state_js).await else {
-            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-            continue;
-        };
+        let eval = page.evaluate(sessions_state_js).await?;
         let v: serde_json::Value = eval.into_value()?;
-        let boot = v.get("boot").and_then(|b| b.as_f64()).unwrap_or(0.0);
-        let active = v.get("active").and_then(|a| a.as_bool()).unwrap_or(false);
-        if boot != boot_before && active {
+        if v.get("active").and_then(|a| a.as_bool()).unwrap_or(false) {
             sessions_active = true;
             break;
         }
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
 
     let sessions_panels_js = r#"(async () => {
@@ -2216,7 +2204,7 @@ async fn drive_page(
     tracing::info!("wrote screenshot {}", sessions_shot_path.display());
 
     // Leave the app back on the User view: proves the switch is reversible
-    // (a second reload) and keeps any later assertions on the default surface.
+    // and keeps any later assertions on the default surface.
     let click_user_js = r#"(() => {
         const buttons = [...(document.querySelector('nav.view-switch')
           ?.querySelectorAll('button.view-btn') || [])];
@@ -2224,14 +2212,9 @@ async fn drive_page(
           (button) => (button.textContent || '').trim() === 'User'
         );
         user?.click();
-        return { boot_before: window.__jc_boot || 0 };
+        return true;
     })()"#;
-    let click_user_value: serde_json::Value =
-        page.evaluate(click_user_js).await?.into_value()?;
-    let user_boot_before = click_user_value
-        .get("boot_before")
-        .and_then(|v| v.as_f64())
-        .unwrap_or(0.0);
+    page.evaluate(click_user_js).await?;
     let user_state_js = r#"(() => {
         const buttons = [...(document.querySelector('nav.view-switch')
           ?.querySelectorAll('button.view-btn') || [])];
@@ -2240,7 +2223,6 @@ async fn drive_page(
         );
         const canvas = document.querySelector('section.panel-graph canvas.graph-canvas');
         return {
-          boot: window.__jc_boot || 0,
           active: Boolean(user?.classList.contains('active')),
           graph_ready: canvas?.dataset.renderReady === 'true' &&
             Number(canvas?.dataset.nodeCount || 0) > 0,
@@ -2248,22 +2230,18 @@ async fn drive_page(
     })()"#;
     let mut user_restored = false;
     for _ in 0..50 {
-        let Ok(eval) = page.evaluate(user_state_js).await else {
-            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-            continue;
-        };
+        let eval = page.evaluate(user_state_js).await?;
         let v: serde_json::Value = eval.into_value()?;
-        let boot = v.get("boot").and_then(|b| b.as_f64()).unwrap_or(0.0);
         let active = v.get("active").and_then(|a| a.as_bool()).unwrap_or(false);
         let graph_ready = v
             .get("graph_ready")
             .and_then(|g| g.as_bool())
             .unwrap_or(false);
-        if boot != user_boot_before && active && graph_ready {
+        if active && graph_ready {
             user_restored = true;
             break;
         }
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
     sessions_view.user_restored = user_restored;
     if !user_restored {
@@ -2272,6 +2250,283 @@ async fn drive_page(
             Some(reason) => format!("{reason}; User view did not restore a render-ready graph"),
             None => "User view did not restore a render-ready graph".to_string(),
         });
+    }
+
+    // Open-world persistence: the world open in the Sessions view survives a
+    // full-page reload via the `jc_world` localStorage key (boot restore in
+    // the host-rebuild effect). Create + open a world on the embedded host,
+    // reload, and require the topbar to show the world again; then close it
+    // so the selection (and key) clear. Driven step by step so each stage
+    // can time out on its own.
+    let world_flow = async |page: &chromiumoxide::Page| -> Result<Vec<&'static str>> {
+        let mut failures: Vec<&'static str> = Vec::new();
+        // Sessions view (may already be active — the click then no-ops).
+        page.evaluate(
+            r#"(() => {
+                const buttons = [...(document.querySelector('nav.view-switch')
+                  ?.querySelectorAll('button.view-btn') || [])];
+                buttons.find((b) => (b.textContent || '').trim() === 'Sessions')?.click();
+                return true;
+            })()"#,
+        )
+        .await?;
+        // Fill the world-name input (native setter + input event so Dioxus
+        // sees it), then wait for the Create button to enable before
+        // clicking — Dioxus applies the input event a tick after dispatch.
+        let fill_js = r#"(() => {
+            const input = document.querySelector(
+              'section.panel-worlds input[aria-label="World name"]');
+            if (!input) return false;
+            const setter = Object.getOwnPropertyDescriptor(
+              window.HTMLInputElement.prototype, 'value').set;
+            setter.call(input, 'browser-e2e');
+            input.dispatchEvent(new Event('input', { bubbles: true }));
+            return true;
+        })()"#;
+        let create_js = r#"(() => {
+            const create = [...document.querySelectorAll(
+              'section.panel-worlds .controls button')]
+              .find((b) => (b.textContent || '').trim() === 'Create');
+            if (!create) return 'no-create';
+            if (create.disabled) return 'disabled';
+            create.click();
+            return 'ok';
+        })()"#;
+        let mut created = false;
+        for _ in 0..50 {
+            let filled: serde_json::Value = page.evaluate(fill_js).await?.into_value()?;
+            if !filled.as_bool().unwrap_or(false) {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                continue;
+            }
+            let v: serde_json::Value = page.evaluate(create_js).await?.into_value()?;
+            match v.as_str().unwrap_or("") {
+                "ok" => {
+                    created = true;
+                    break;
+                }
+                "no-create" => break, // input present but button missing: dead end
+                _ => {}
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        if !created {
+            failures.push("world create form never became operable");
+            return Ok(failures);
+        }
+        // Wait for the world row, then click its Open button.
+        let open_js = r#"(() => {
+            const row = [...document.querySelectorAll('section.panel-worlds .kv')]
+              .find((r) => (r.textContent || '').includes('browser-e2e'));
+            if (!row) return 'no-row';
+            const open = [...row.querySelectorAll('button')]
+              .find((b) => (b.textContent || '').trim() === 'Open');
+            if (!open) return 'no-open: ' + (row.innerHTML || '').slice(0, 300);
+            open.click();
+            return 'ok';
+        })()"#;
+        let mut opened = false;
+        let mut last_no_open = String::new();
+        for _ in 0..50 {
+            let v: serde_json::Value = page.evaluate(open_js).await?.into_value()?;
+            let s = v.as_str().unwrap_or("");
+            if s == "ok" {
+                opened = true;
+                break;
+            }
+            if let Some(detail) = s.strip_prefix("no-open: ") {
+                last_no_open = detail.to_string();
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        if !opened {
+            // `last_no_open` carries the row markup when the row existed but
+            // the Open button was never found.
+            eprintln!("world row never offered Open; last row markup: {last_no_open}");
+            failures.push("world row never offered Open");
+            return Ok(failures);
+        }
+        // Wait until the topbar reports the open world.
+        let label_js = r#"(() => {
+            const hint = document.querySelector('header.topbar .hint');
+            return {
+              open: (hint?.textContent || '').includes('world browser-e2e'),
+              canvas: Boolean(document.querySelector(
+                'section.panel-graph canvas.graph-canvas')),
+              boot: window.__jc_boot || 0,
+            };
+        })()"#;
+        let mut label_before = false;
+        let mut boot_before = 0.0_f64;
+        for _ in 0..50 {
+            let v: serde_json::Value = page.evaluate(label_js).await?.into_value()?;
+            boot_before = v.get("boot").and_then(|b| b.as_f64()).unwrap_or(0.0);
+            if v.get("open").and_then(|o| o.as_bool()).unwrap_or(false) {
+                label_before = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        if !label_before {
+            failures.push("opened world never showed in the topbar");
+            return Ok(failures);
+        }
+        // Reload the page; the boot restore must re-open the world and
+        // remount its canvas (the embedded host replays the world closed, so
+        // this also proves the reopen-and-rematerialize path).
+        page.evaluate("(() => { location.reload(); return true; })()")
+            .await?;
+        let mut restored = false;
+        for _ in 0..100 {
+            // Evaluates can race the navigation and lose their execution
+            // context — retry rather than fail.
+            let Ok(eval) = page.evaluate(label_js).await else {
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                continue;
+            };
+            let v: serde_json::Value = eval.into_value()?;
+            let boot = v.get("boot").and_then(|b| b.as_f64()).unwrap_or(0.0);
+            let open = v.get("open").and_then(|o| o.as_bool()).unwrap_or(false);
+            let canvas = v.get("canvas").and_then(|c| c.as_bool()).unwrap_or(false);
+            if boot != boot_before && open && canvas {
+                restored = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        }
+        if !restored {
+            failures.push("open world did not restore across a page reload (label + canvas)");
+            return Ok(failures);
+        }
+        // Close the world: selection + persisted key must clear.
+        let close_js = r#"(() => {
+            const row = [...document.querySelectorAll('section.panel-worlds .kv')]
+              .find((r) => (r.textContent || '').includes('browser-e2e'));
+            const close = row && [...row.querySelectorAll('button')]
+              .find((b) => (b.textContent || '').trim() === 'Close');
+            close?.click();
+            return Boolean(close);
+        })()"#;
+        let mut cleared = false;
+        for _ in 0..50 {
+            let closed: serde_json::Value = page.evaluate(close_js).await?.into_value()?;
+            let v: serde_json::Value = page.evaluate(label_js).await?.into_value()?;
+            let still_open = v.get("open").and_then(|o| o.as_bool()).unwrap_or(false);
+            if closed.as_bool().unwrap_or(false) && !still_open {
+                cleared = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        if !cleared {
+            failures.push("closing the world did not clear the topbar selection");
+        }
+        Ok(failures)
+    };
+    match world_flow(&page).await {
+        Ok(failures) if failures.is_empty() => {}
+        Ok(failures) => {
+            sessions_view.ok = false;
+            sessions_view.reason = Some(match sessions_view.reason.take() {
+                Some(reason) => format!("{reason}; {}", failures.join("; ")),
+                None => failures.join("; "),
+            });
+        }
+        Err(e) => {
+            sessions_view.ok = false;
+            sessions_view.reason = Some(match sessions_view.reason.take() {
+                Some(reason) => format!("{reason}; world persistence pass errored: {e:#}"),
+                None => format!("world persistence pass errored: {e:#}"),
+            });
+        }
+    }
+
+    // Maximized-panel regression: mount the Sessions workspace while its
+    // persisted layout holds a maximized panel — the flush path a prior
+    // `GlobalSignal::write() → AlreadyBorrowed` investigation flagged. The
+    // in-place switch must keep the app alive (evaluates keep answering)
+    // with the maximized Worlds panel rendered; then restore the layout and
+    // leave the app on the User view.
+    let maximize_roundtrip_js = |extra: &str| {
+        format!(
+            r#"(() => {{
+                const buttons = [...(document.querySelector('nav.view-switch')
+                  ?.querySelectorAll('button.view-btn') || [])];
+                const byLabel = (label) => buttons.find(
+                  (button) => (button.textContent || '').trim() === label
+                );
+                {extra}
+                return true;
+            }})()"#
+        )
+    };
+    page.evaluate(maximize_roundtrip_js("byLabel('Sessions')?.click();"))
+        .await?;
+    let max_light_js = r#"(() => {
+        const light = document.querySelector('section.panel-worlds .light.max');
+        light?.click();
+        return Boolean(light);
+    })()"#;
+    // Wait for the Worlds panel, maximize it, switch away and back.
+    let mut maximized_ok = false;
+    for _ in 0..50 {
+        let hit: serde_json::Value = page.evaluate(max_light_js).await?.into_value()?;
+        if hit.as_bool().unwrap_or(false) {
+            maximized_ok = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    page.evaluate(maximize_roundtrip_js("byLabel('User')?.click();"))
+        .await?;
+    page.evaluate(maximize_roundtrip_js("byLabel('Sessions')?.click();"))
+        .await?;
+    let maxed_state_js = r#"(() => {
+        const panel = document.querySelector('section.panel-worlds');
+        const maxed = Boolean(panel?.querySelector('.max-hint'));
+        const others = [...document.querySelectorAll('section.panel')]
+          .filter((p) => p !== panel).length;
+        return { maxed, others };
+    })()"#;
+    let mut maximized_mounted = false;
+    for _ in 0..50 {
+        let v: serde_json::Value = page.evaluate(maxed_state_js).await?.into_value()?;
+        let maxed = v.get("maxed").and_then(|m| m.as_bool()).unwrap_or(false);
+        let others = v.get("others").and_then(|o| o.as_u64()).unwrap_or(0);
+        if maxed && others == 0 {
+            maximized_mounted = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    if !(maximized_ok && maximized_mounted) {
+        sessions_view.ok = false;
+        sessions_view.reason = Some(match sessions_view.reason.take() {
+            Some(reason) => format!(
+                "{reason}; maximized-panel round-trip failed (maximized_ok={maximized_ok}, mounted={maximized_mounted})"
+            ),
+            None => format!(
+                "maximized-panel round-trip failed (maximized_ok={maximized_ok}, mounted={maximized_mounted})"
+            ),
+        });
+    }
+    // Restore: un-maximize Worlds and leave the app on the User view with a
+    // render-ready graph for any later assertions.
+    page.evaluate(max_light_js).await?;
+    page.evaluate(maximize_roundtrip_js("byLabel('User')?.click();"))
+        .await?;
+    for _ in 0..50 {
+        let eval = page.evaluate(user_state_js).await?;
+        let v: serde_json::Value = eval.into_value()?;
+        let active = v.get("active").and_then(|a| a.as_bool()).unwrap_or(false);
+        let graph_ready = v
+            .get("graph_ready")
+            .and_then(|g| g.as_bool())
+            .unwrap_or(false);
+        if active && graph_ready {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
 
     // ---- 12. runtime per-viewer importer switching -------------------------

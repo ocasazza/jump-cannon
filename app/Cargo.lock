@@ -3140,10 +3140,15 @@ dependencies = [
  "anyhow",
  "chrono",
  "crc32fast",
+ "js-sys",
  "postcard",
  "regex-lite",
  "serde",
+ "serde_json",
  "uuid",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
 ]
 
 [[package]]

@@ -43,7 +43,7 @@ and TerminusDB (cluster), Kueue-shared per-world GPU, and a multi-view UI.
 | `HttpSessionManager` client (wasm-clean, reqwest) | `crates/session-manager/src/http.rs` | done |
 | `GpuBroker`: per-world RayClusters via wrapped `gpu_session::GpuSessionHandle`s, per-world compute Services, activity touch | `crates/session-manager/src/gpu_broker.rs` | done, disabled without template env |
 | Helm: `sessionManager.*` values, Deployment/Service/PVC/RBAC/templates, `ci/session-manager.yaml`, mutual-exclusion `fail` vs `graphCompute.session` | `charts/jump-cannon` | done, helm template/lint green |
-| App views: `AppView::{User,Sessions}` topbar switcher, per-view workspaces (`jc_layout_v9` / `jc_sessions_layout_v1`), `Ctx.host: Arc<dyn WorldHost>`, world-aware `api::url` via `WORLD_BASE`. **View switching reloads the page** (persisted `jc_view` + `location.reload()`): the views own separate workspaces, servers, and world hosts, and a clean Dioxus runtime per view sidesteps live hook/signal migration across workspaces. `window.__jc_boot` lets the browser suite detect the new runtime. | `app/ui/src/main.rs`, `api.rs` | done |
+| App views: `AppView::{User,Sessions}` topbar switcher, per-view workspaces (`jc_layout_v9` / `jc_sessions_layout_v1`), `Ctx.host: Arc<dyn WorldHost>`, world-aware `api::url` via `WORLD_BASE`. **View switching mounts in place** (persisted `jc_view` + `ctx.view.set`): the views own separate workspaces, servers, and world hosts; the distinct `UserWorkspaceView`/`SessionsWorkspaceView` component types keep the switch a clean unmount/mount of hook scopes. The open world persists as `jc_world` and re-mounts on return to Sessions. `window.__jc_boot` still stamps boot for the browser suite. | `app/ui/src/main.rs`, `api.rs` | done |
 | Sessions panels: Worlds, History, Branches, Merge, GPU Sessions. Settings also rides the Sessions dock (it carries the session-manager URL + x-user identity); palette jump-to-section commands are filtered at boot to panels the active view's workspace holds, and the new panels gate their empty states behind a first-fetch Spinner like the older panels. | `app/ui/src/panels/{worlds,history,branches,merge,gpu_sessions}.rs`, `palette.rs` | done |
 | M7: world export/import (`WorldExport` v1, `MinigrafStore::restore_commit/restore_branch`) | `crates/session-manager/src/export.rs`, `crates/graph-vcs/src/minigraf_store.rs` | done, 5 tests |
 | M7: wasm embedded persistence — localStorage export-snapshot per commit (`open_persistent`), NOT minigraf IndexedDB (see M7 note below) | `crates/session-manager/src/embedded.rs` | done |
@@ -64,6 +64,25 @@ one `WorldExport` JSON per world to localStorage after every successful
 mutation (`PersistingStore` hook), replayed on boot — the same format as
 user-facing export/import. Best-effort (quota errors swallowed), full
 history fidelity.
+
+Follow-up fixes (2026-08-14), both caught by the browser suite's
+world-persistence pass — the first time embedded world creation was
+exercised in a real browser:
+
+- Bare `minigraf` panics on wasm32: its transaction IDs call
+  `SystemTime::now()` unless the `browser` feature switches them to
+  `js_sys::Date::now()`. graph-vcs now enables `minigraf/browser` on
+  wasm32 targets only (the IndexedDB façade remains unused; the clock is
+  what we need). Without it, creating a world in the browser aborted the
+  app on the first commit.
+- Replayed worlds boot CLOSED (`open_persistent`), so the boot-restore's
+  rematerialize hit `require_open`; `rematerialize_embedded` now
+  re-opens a world the host still knows (and refuses to silently
+  re-create a genuinely unknown one).
+- The gpu_force pipelines created zero-sized storage buffers for an
+  empty graph, flooding wgpu bind-group validation errors; vec-backed
+  buffers now pad to one dummy element (`nonempty_f32`/`nonempty_u32`
+  in gpu_force.rs).
 
 ## Key seams for the next session
 
@@ -103,19 +122,27 @@ history fidelity.
 
 ## Known limitations (documented in code)
 
-- **In-place view switching panics.** Mounting the Sessions workspace
-  in-place hit two independent Dioxus issues: (1) a rules-of-hooks violation
-  — `Workspace::render_with_header` calls panel bodies inline, so a second
-  workspace must mount under a distinct component type (fixed:
-  `UserWorkspaceView`/`SessionsWorkspaceView` + `ViewWs` prop wrapper,
-  kept in the code); (2) an unresolved
-  `GlobalSignal::write() → AlreadyBorrowed` panic (empty `borrowed_at`,
-  consistent with an untracked `peek()` guard) firing in the post-click
-  flush even with all Sessions panels stubbed and the Graph panel hidden —
-  root cause not found after extensive bisection (see git history for the
-  bisect trail). The shipped reload-based switch sidesteps (2); revisit if
-  in-place switching is ever wanted (likely candidates: a periodic
-  global-writing loop interacting with the maximized-panel flush).
+- ~~**In-place view switching panics.**~~ **Resolved (2026-08-14).** The
+  two Dioxus issues behind the reload-based switch: (1) a rules-of-hooks
+  violation — `Workspace::render_with_header` calls panel bodies inline, so
+  a second workspace must mount under a distinct component type (fix kept:
+  `UserWorkspaceView`/`SessionsWorkspaceView` + `ViewWs` prop wrapper);
+  (2) the `GlobalSignal::write() → AlreadyBorrowed` panic (empty
+  `borrowed_at`, untracked `peek()` guard) did **not** reproduce when the
+  switch was reduced to a bare `ctx.view.set(view)` and driven by the
+  Rust browser suite (Chromium, embedded host, default layouts): the
+  Sessions workspace mounted cleanly, including a maximized-panel
+  round-trip. The panic therefore lived in the *extra synchronous work*
+  the old in-place attempt did inside the click handler (world-base
+  detach + full graph invalidation + reload writing dozens of
+  GlobalSignals on the same stack as the pending flush), not in mounting
+  the second workspace itself. The shipped `switch_view` keeps the
+  handler minimal: set the view signal, detach/re-attach `WORLD_BASE`,
+  and let the ordinary spawned `reload_graph`/`rematerialize_embedded`
+  paths re-base the graph. The browser suite's step 11 now covers
+  in-place switching (Sessions mount, User return, maximized-panel
+  round-trip) against the shared console-error gate, which would catch a
+  panic-hook firing.
 - Frontmatter is not projected into world search documents (fixed world
   schema); values remain visible via `/node/*id` `frontmatter_json`.
 - Read ACLs are coarse: any authenticated user reads any world; writers are
@@ -125,9 +152,11 @@ history fidelity.
   parked-state task per retired world until process exit).
 - Distinct world slugs sanitizing to the same DNS-1123 cluster name share a
   cluster (`my.world` vs `my-world`).
-- The open world is not persisted across view-switch reloads (in-memory
-  `active_world` only); re-open it from the Worlds panel. Embedded worlds
-  themselves persist via localStorage re-export. The server-side open set is
-  in-memory too: a session-manager restart closes every world, and the
+- The open world is persisted: `jc_world` localStorage (written by
+  `open_world_in_view`, cleared by `clear_world_base`) is restored by the
+  first run of the host-rebuild effect in `App` when booting into the
+  Sessions view, and re-mounted by `switch_view` on returning to Sessions —
+  for both embedded and HTTP session-manager hosts. The server-side open set
+  is in-memory: a session-manager restart closes every world, and the
   Worlds panel's Open button re-opens it (`POST /api/worlds` is an idempotent
   reopen; `WorldExists` is treated as already-open success).
