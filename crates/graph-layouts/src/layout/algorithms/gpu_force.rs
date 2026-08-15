@@ -990,6 +990,19 @@ struct SimParamsRaw {
 // of 16 in WGSL). We use a 4-component layout on the CPU side to match.
 const VEC3_STRIDE: u64 = 16;
 
+/// wgpu rejects zero-sized storage buffers at bind-group validation, and an
+/// empty graph (0 nodes / 0 edges) still mounts the pipelines (e.g. a
+/// freshly created world in the app), so vec-backed buffers pad to one
+/// dummy element. Shaders never read the dummy: dispatch counts derive from
+/// n_nodes / n_edges.
+fn nonempty_f32(v: &[f32]) -> &[f32] {
+    if v.is_empty() { &[0.0; 4] } else { v }
+}
+
+fn nonempty_u32(v: &[u32]) -> &[u32] {
+    if v.is_empty() { &[0] } else { v }
+}
+
 /// Position buffer ownership.
 ///
 /// In the legacy `run()` path the GPU state owns both ping-pong buffers.
@@ -1662,12 +1675,12 @@ impl GpuState {
 
         let pos_a = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("positions_a"),
-            contents: bytemuck::cast_slice(&pc.initial_positions),
+            contents: bytemuck::cast_slice(nonempty_f32(&pc.initial_positions)),
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
         });
         let pos_b = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("positions_b"),
-            contents: bytemuck::cast_slice(&pc.initial_positions),
+            contents: bytemuck::cast_slice(nonempty_f32(&pc.initial_positions)),
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
         });
         let aux = build_aux_buffers(device, &pc);
@@ -1751,7 +1764,7 @@ impl GpuState {
         // shared buffer; COPY_DST so we can seed it.
         let pos_b = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("positions_internal_b"),
-            contents: bytemuck::cast_slice(&pc.initial_positions),
+            contents: bytemuck::cast_slice(nonempty_f32(&pc.initial_positions)),
             usage: wgpu::BufferUsages::STORAGE
                 | wgpu::BufferUsages::COPY_SRC
                 | wgpu::BufferUsages::COPY_DST,
@@ -2389,17 +2402,17 @@ struct AuxBuffers {
 fn build_aux_buffers(device: &wgpu::Device, pc: &PreCompute) -> AuxBuffers {
     let vel = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("velocities"),
-        contents: bytemuck::cast_slice(&pc.velocities),
+        contents: bytemuck::cast_slice(nonempty_f32(&pc.velocities)),
         usage: wgpu::BufferUsages::STORAGE,
     });
     let off = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("edge_offsets"),
-        contents: bytemuck::cast_slice(&pc.edge_offsets),
+        contents: bytemuck::cast_slice(nonempty_u32(&pc.edge_offsets)),
         usage: wgpu::BufferUsages::STORAGE,
     });
     let neigh = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("edge_neighbors"),
-        contents: bytemuck::cast_slice(&pc.edge_neighbors),
+        contents: bytemuck::cast_slice(nonempty_u32(&pc.edge_neighbors)),
         usage: wgpu::BufferUsages::STORAGE,
     });
     // Hub-aware (Tigr) virtual-vertex CSR + per-virtual spring partials.
@@ -2418,12 +2431,12 @@ fn build_aux_buffers(device: &wgpu::Device, pc: &PreCompute) -> AuxBuffers {
     virt_csr_packed.extend_from_slice(&pc.virt_real_idx);
     let virt_csr = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("virt_csr"),
-        contents: bytemuck::cast_slice(&virt_csr_packed),
+        contents: bytemuck::cast_slice(nonempty_u32(&virt_csr_packed)),
         usage: wgpu::BufferUsages::STORAGE,
     });
     let virt_edge_offsets = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("virt_edge_offsets"),
-        contents: bytemuck::cast_slice(&pc.virt_edge_offsets),
+        contents: bytemuck::cast_slice(nonempty_u32(&pc.virt_edge_offsets)),
         usage: wgpu::BufferUsages::STORAGE,
     });
     // Per-virtual partial spring forces — vec3<f32> stride = 16 bytes.
@@ -2442,7 +2455,7 @@ fn build_aux_buffers(device: &wgpu::Device, pc: &PreCompute) -> AuxBuffers {
     });
     let mass = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("mass"),
-        contents: bytemuck::cast_slice(&pc.mass),
+        contents: bytemuck::cast_slice(nonempty_f32(&pc.mass)),
         usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
     });
     // Initial capacity: enough for a 1-cell grid + the n nodes. Will grow.

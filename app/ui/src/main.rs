@@ -138,8 +138,9 @@ fn main() {
     // exact line to know the wasm app booted. console.log directly (NOT
     // tracing) — tracing is filtered to WARN above.
     web_sys::console::log_1(&"[jump-cannon-ui] boot".into());
-    // Boot marker for the browser regression: view switches reload the page,
-    // so the suite detects the new runtime by this value changing.
+    // Boot marker for the browser regression: the suite detects the app
+    // runtime by this value (and detects full-page reloads — e.g. the
+    // AppState apply path — by it changing).
     if let Some(w) = web_sys::window() {
         let _ = js_sys::Reflect::set(
             w.as_ref(),
@@ -573,6 +574,9 @@ pub(crate) struct Ctx {
 /// [`rematerialize_embedded`]).
 pub(crate) fn open_world_in_view(mut ctx: Ctx, world: String) {
     ctx.active_world.set(Some(world.clone()));
+    // Persist the selection so page reloads and Sessions-view returns
+    // re-open the same world (see [`restore_persisted_world`]).
+    let _ = LocalStorage::set(WORLD_KEY, &world);
     match api::session_manager_url() {
         Some(sm) => {
             *api::WORLD_BASE.write() = Some(format!("{sm}/worlds/{world}"));
@@ -585,9 +589,10 @@ pub(crate) fn open_world_in_view(mut ctx: Ctx, world: String) {
     }
 }
 
-/// Detach the graph surface from any world (world closed, view switched).
+/// Detach the graph surface from any world (world closed, host changed).
 pub(crate) fn clear_world_base(mut ctx: Ctx) {
     ctx.active_world.set(None);
+    let _ = LocalStorage::delete(WORLD_KEY);
     *api::WORLD_BASE.write() = None;
     *EMBEDDED_HEAD.write() = None;
 }
@@ -612,7 +617,33 @@ pub(crate) async fn rematerialize_embedded(mut ctx: Ctx) {
     };
     let host = ctx.host.read().clone();
     let result = async {
-        let vcs = host.vcs(&wid).await.map_err(|e| e.to_string())?;
+        let vcs = match host.vcs(&wid).await {
+            Ok(vcs) => vcs,
+            // A world replayed from localStorage at boot comes back CLOSED
+            // (`open_persistent`), so the first materialize after a reload
+            // hits require_open. Re-open a world the host still knows; a
+            // genuinely unknown world keeps the original error rather than
+            // being silently re-created empty.
+            Err(session_manager::SessionError::WorldNotFound { .. }) => {
+                let known = host
+                    .worlds()
+                    .await
+                    .map_err(|e| e.to_string())?
+                    .iter()
+                    .any(|w| w.id == wid);
+                if !known {
+                    return Err(format!("world not found: {}", wid.0));
+                }
+                host.open_world(session_manager::WorldSpec {
+                    name: wid.0.clone(),
+                    description: None,
+                })
+                .await
+                .map_err(|e| e.to_string())?;
+                host.vcs(&wid).await.map_err(|e| e.to_string())?
+            }
+            Err(e) => return Err(e.to_string()),
+        };
         let head = vcs
             .head("main")
             .await
@@ -650,25 +681,46 @@ pub(crate) fn spawn_rematerialize_embedded(ctx: Ctx) {
     spawn(rematerialize_embedded(ctx));
 }
 
-/// Switch the top-level view. Exactly one workspace is mounted at a time;
-/// the switch re-bases graph fetches (world base in Sessions, standalone
-/// graph-api in User) and runs the standard graph invalidation + reload.
-/// Switch the top-level view by persisting the choice and reloading the
-/// page. The two views own separate workspaces, servers, and world hosts —
-/// a full reload gives each a clean Dioxus runtime instead of migrating
-/// live signal/hook state across workspaces. Boot restores the persisted
-/// view (see [`persisted_view`]).
-pub(crate) fn switch_view(ctx: Ctx, view: AppView) {
+/// Switch the top-level view in place. The two views own separate workspaces,
+/// servers, and world hosts; exactly one workspace is mounted at a time, and
+/// `UserWorkspaceView`/`SessionsWorkspaceView` are distinct component types so
+/// the switch unmounts one hook scope and initializes the other cleanly (the
+/// rules-of-hooks fix — see the wrapper comment below). The graph surface
+/// re-bases on switch: standalone graph-api in User, the open world's routes
+/// (or embedded rematerialization) in Sessions. The choice persists
+/// (`jc_view`) so a later full-page reload boots into the same view, and the
+/// open world persists separately (`jc_world`) so leaving Sessions for User
+/// and returning re-mounts it.
+pub(crate) fn switch_view(mut ctx: Ctx, view: AppView) {
     if *ctx.view.peek() == view {
         return;
     }
     let _ = LocalStorage::set(VIEW_KEY, view_slug(view));
-    if let Some(w) = web_sys::window() {
-        let _ = w.location().reload();
+    match view {
+        AppView::User => {
+            // Detach the world routes without dropping the selection: the
+            // world stays open (and persisted) and re-mounts on return.
+            *api::WORLD_BASE.write() = None;
+            *EMBEDDED_HEAD.write() = None;
+            ctx.view.set(view);
+            spawn(reload_graph(ctx));
+        }
+        AppView::Sessions => {
+            ctx.view.set(view);
+            if let Some(world) = ctx.active_world.peek().clone() {
+                open_world_in_view(ctx, world);
+            }
+        }
     }
 }
 
 const VIEW_KEY: &str = "jc_view";
+/// localStorage key for the world open in the Sessions view. Written by
+/// [`open_world_in_view`], cleared by [`clear_world_base`]; read at boot by
+/// [`restore_persisted_world`] and on returning to the Sessions view, so
+/// neither a page reload nor a view switch strands the selection. Applies
+/// to both embedded and HTTP session-manager hosts.
+const WORLD_KEY: &str = "jc_world";
 
 fn view_slug(view: AppView) -> &'static str {
     match view {
@@ -686,6 +738,24 @@ pub(crate) fn persisted_view() -> AppView {
         "sessions" => AppView::Sessions,
         _ => AppView::User,
     }
+}
+
+/// Re-open the world that was open when the page last unloaded (before
+/// in-place view switching landed, every view switch reloaded the page and
+/// stranded the selection; full reloads still happen via the AppState apply
+/// path). Only the Sessions view mounts world graphs, and only after the
+/// boot host build has run — the caller is the first run of the
+/// host-rebuild effect in [`App`], so `ctx.host` already points at the host
+/// the world was opened on.
+fn restore_persisted_world(ctx: Ctx) {
+    if *ctx.view.peek() != AppView::Sessions {
+        return;
+    }
+    let world = LocalStorage::get::<String>(WORLD_KEY).unwrap_or_default();
+    if world.is_empty() {
+        return;
+    }
+    open_world_in_view(ctx, world);
 }
 
 /// Whether `view`'s workspace layout holds `kind`. The palette filters its
@@ -883,15 +953,19 @@ fn App() -> Element {
 
     // Rebuild the world host when the session-manager URL or user identity
     // changes: remote (`HttpSessionManager`) when a manager is configured,
-    // embedded single-user otherwise. Any world selection is dropped — the
-    // new host does not know it.
+    // embedded single-user otherwise. The first run is the boot build — it
+    // restores the world persisted across a view-switch reload instead of
+    // dropping the selection; on later (real) host changes any world
+    // selection is dropped, since the new host does not know it.
     {
         let mut host = ctx.host;
         let mut embedded = ctx.embedded;
-        let mut active_world = ctx.active_world;
+        let mut booted = use_signal(|| false);
         use_effect(move || {
             let sm = api::session_manager_url();
             let name = ctx.user.read().clone();
+            let first_run = !*booted.peek();
+            booted.set(true);
             spawn(async move {
                 let identity = UserIdentity {
                     name,
@@ -921,9 +995,11 @@ fn App() -> Element {
                     },
                 };
                 host.set(next);
-                active_world.set(None);
-                *api::WORLD_BASE.write() = None;
-                *EMBEDDED_HEAD.write() = None;
+                if first_run {
+                    restore_persisted_world(ctx);
+                } else {
+                    clear_world_base(ctx);
+                }
             });
         });
     }
