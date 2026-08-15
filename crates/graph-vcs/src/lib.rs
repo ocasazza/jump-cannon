@@ -7,7 +7,10 @@
 //! - Conflicts are first-class recorded state: a merge or rebase can land with
 //!   conflicts attached, and resolution is a separate later operation.
 //! - [`VcsStore`] is the object-safe storage trait; [`MinigrafStore`] is the
-//!   embedded implementation backed by a single-file minigraf database.
+//!   embedded implementation backed by a single-file minigraf database, and
+//!   `TerminusStore` (feature `terminus`, native only) is the server
+//!   implementation backed by a TerminusDB cluster. Both satisfy the shared
+//!   parity suite in `contract` (feature `contract`).
 //!
 //! The core is pure Rust with no async runtime dependency: the trait's boxed
 //! futures wrap synchronous work, and the crate compiles for wasm32 targets
@@ -20,6 +23,8 @@ pub mod model;
 pub mod store;
 #[cfg(all(feature = "terminus", not(target_arch = "wasm32")))]
 pub mod terminus_store;
+#[cfg(any(test, feature = "contract"))]
+pub mod contract;
 
 #[cfg(test)]
 mod tests;

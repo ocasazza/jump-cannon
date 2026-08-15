@@ -1,30 +1,20 @@
-//! End-to-end tests for [`MinigrafStore`] against the ten milestone scenarios.
-//! Follows the vault-data convention of a `src/tests.rs` module.
+//! End-to-end tests for [`MinigrafStore`]. The store-level parity scenarios
+//! live in [`crate::contract`] (shared with the TerminusDB backend's gated
+//! harness in `tests/terminus_contract.rs`); this module adds the
+//! minigraf-specific coverage (fact-limit chunking, file-backed reopen, lock
+//! handling) and the pure merge/diff unit tests.
 
+use crate::contract;
 use crate::merge::{diff_snapshots, merge_snapshots, Snapshot};
-use crate::model::{ConflictResolution, GraphOp, MergeStatus, NodeId, OpKind, ResolvedNode};
+use crate::model::{GraphOp, NodeId};
 use crate::{MinigrafStore, VcsStore};
 use std::future::Future;
-use std::sync::Arc;
 use vault_data::{EdgeId, VaultEdge, VaultNode};
 
 /// Minimal executor: the store's futures wrap synchronous work, so a single
 /// poll always completes; no async runtime dependency.
 fn block_on<F: Future>(future: F) -> F::Output {
-    use std::task::{Context, Poll, Wake, Waker};
-    struct Nop;
-    impl Wake for Nop {
-        fn wake(self: Arc<Self>) {}
-    }
-    let waker = Waker::from(Arc::new(Nop));
-    let mut context = Context::from_waker(&waker);
-    let mut future = Box::pin(future);
-    loop {
-        match future.as_mut().poll(&mut context) {
-            Poll::Ready(value) => return value,
-            Poll::Pending => std::thread::yield_now(),
-        }
-    }
+    contract::block_on(future)
 }
 
 fn node(id: &str) -> VaultNode {
@@ -60,41 +50,61 @@ fn store() -> MinigrafStore {
     MinigrafStore::in_memory().unwrap()
 }
 
-/// 1. commit → materialize round-trip: nodes, edges, and frontmatter survive.
+// ── Shared contract scenarios (parity with TerminusStore) ───────────────────
+
 #[test]
 fn commit_materialize_roundtrip() {
-    let store = store();
-    let mut a = node_with_fm("alpha", "status", "draft");
-    a.meta.tags = vec!["x".into(), "y/z".into()];
-    a.x = 1.5;
-    a.y = -2.25;
-    let b = node("beta");
-    let commit = block_on(store.commit(
-        "main",
-        vec![upsert(a.clone()), upsert(b.clone()), edge("alpha", "beta")],
-        "alice",
-        "initial",
-    ))
-    .unwrap();
-
-    let snapshot = block_on(store.materialize(&commit.id)).unwrap();
-    assert_eq!(snapshot.nodes.len(), 2);
-    assert_eq!(
-        serde_json::to_value(snapshot.nodes.get(&NodeId("alpha".into())).unwrap()).unwrap(),
-        serde_json::to_value(&a).unwrap()
-    );
-    assert_eq!(
-        serde_json::to_value(snapshot.nodes.get(&NodeId("beta".into())).unwrap()).unwrap(),
-        serde_json::to_value(&b).unwrap()
-    );
-    assert!(snapshot.edges.contains(&EdgeId {
-        source: "alpha".into(),
-        target: "beta".into()
-    }));
-    assert_eq!(block_on(store.head("main")).unwrap(), Some(commit.id));
+    contract::commit_materialize_roundtrip(&store());
 }
 
-/// 2. A node whose serialized JSON exceeds the 4080-byte fact limit is
+#[test]
+fn large_node_roundtrip() {
+    contract::large_node_roundtrip(&store());
+}
+
+#[test]
+fn branch_and_diff() {
+    contract::branch_and_diff(&store());
+}
+
+#[test]
+fn merge_disjoint_nodes_auto_merges() {
+    contract::merge_disjoint_nodes_auto_merges(&store());
+}
+
+#[test]
+fn merge_different_frontmatter_keys_auto_merges() {
+    contract::merge_different_frontmatter_keys_auto_merges(&store());
+}
+
+#[test]
+fn merge_same_attribute_conflicts_then_resolve() {
+    contract::merge_same_attribute_conflicts_then_resolve(&store());
+}
+
+#[test]
+fn merge_delete_vs_edit_conflicts() {
+    contract::merge_delete_vs_edit_conflicts(&store());
+}
+
+#[test]
+fn edge_merge_semantics() {
+    contract::edge_merge_semantics(&store());
+}
+
+#[test]
+fn rebase_replays_commits() {
+    contract::rebase_replays_commits(&store());
+}
+
+#[test]
+fn op_log_records_operations_in_order() {
+    contract::op_log_records_operations_in_order(&store());
+}
+
+// ── Minigraf-specific coverage ──────────────────────────────────────────────
+
+/// A node whose serialized JSON exceeds the 4080-byte fact limit is
 /// chunked and round-trips.
 #[test]
 fn chunked_large_node_roundtrip() {
@@ -115,247 +125,7 @@ fn chunked_large_node_roundtrip() {
     );
 }
 
-/// 3. Divergent commits on disjoint nodes merge cleanly.
-#[test]
-fn merge_disjoint_nodes_auto_merges() {
-    let store = store();
-    let base = block_on(store.commit("main", vec![upsert(node("shared"))], "alice", "base")).unwrap();
-    block_on(store.create_branch("dev", &base.id)).unwrap();
-    block_on(store.commit("main", vec![upsert(node("from-main"))], "alice", "main work")).unwrap();
-    block_on(store.commit("dev", vec![upsert(node("from-dev"))], "bob", "dev work")).unwrap();
-
-    let report = block_on(store.merge("main", "dev", "alice", "merge dev")).unwrap();
-    assert_eq!(report.status, MergeStatus::Merged);
-    assert!(report.conflicts.is_empty());
-    assert_eq!(report.commit.parents.len(), 2);
-
-    let snapshot = block_on(store.materialize(&report.commit.id)).unwrap();
-    for id in ["shared", "from-main", "from-dev"] {
-        assert!(snapshot.nodes.contains_key(&NodeId(id.into())), "missing {id}");
-    }
-}
-
-/// 4. Same node, different frontmatter keys edited per side → attribute-level
-/// auto-merge.
-#[test]
-fn merge_different_frontmatter_keys_auto_merges() {
-    let store = store();
-    let base = block_on(store.commit("main", vec![upsert(node("n"))], "alice", "base")).unwrap();
-    block_on(store.create_branch("dev", &base.id)).unwrap();
-    block_on(store.commit("main", vec![upsert(node_with_fm("n", "a", "1"))], "alice", "add a")).unwrap();
-    block_on(store.commit("dev", vec![upsert(node_with_fm("n", "b", "2"))], "bob", "add b")).unwrap();
-
-    let report = block_on(store.merge("main", "dev", "alice", "merge")).unwrap();
-    assert_eq!(report.status, MergeStatus::Merged);
-    assert!(report.conflicts.is_empty());
-    let snapshot = block_on(store.materialize(&report.commit.id)).unwrap();
-    let fm = &snapshot.nodes.get(&NodeId("n".into())).unwrap().meta.frontmatter;
-    assert_eq!(fm.get("a").unwrap(), "1");
-    assert_eq!(fm.get("b").unwrap(), "2");
-}
-
-/// 5. Same node, same attribute changed differently → recorded conflict; the
-/// merge still lands; `resolve` with an explicit choice clears it.
-#[test]
-fn merge_same_attribute_conflicts_then_resolve() {
-    let store = store();
-    let base = block_on(store.commit("main", vec![upsert(node_with_fm("n", "k", "base"))], "alice", "base")).unwrap();
-    block_on(store.create_branch("dev", &base.id)).unwrap();
-    block_on(store.commit("main", vec![upsert(node_with_fm("n", "k", "ours"))], "alice", "ours")).unwrap();
-    block_on(store.commit("dev", vec![upsert(node_with_fm("n", "k", "theirs"))], "bob", "theirs")).unwrap();
-
-    let report = block_on(store.merge("main", "dev", "alice", "merge")).unwrap();
-    assert_eq!(report.status, MergeStatus::Merged);
-    assert_eq!(report.conflicts.len(), 1);
-    let conflict = &report.conflicts[0];
-    assert_eq!(conflict.node_id, NodeId("n".into()));
-    assert!(conflict.base.is_some() && conflict.ours.is_some() && conflict.theirs.is_some());
-
-    // The merge lands with `ours` kept, and the conflict is queryable.
-    let snapshot = block_on(store.materialize(&report.commit.id)).unwrap();
-    let fm = &snapshot.nodes.get(&NodeId("n".into())).unwrap().meta.frontmatter;
-    assert_eq!(fm.get("k").unwrap(), "ours");
-    assert_eq!(block_on(store.conflicts("main")).unwrap().len(), 1);
-
-    // Resolve with an explicit value: conflict clears, new commit lands.
-    let resolved = node_with_fm("n", "k", "agreed");
-    let resolution = block_on(store.resolve(
-        "main",
-        vec![ConflictResolution {
-            node_id: NodeId("n".into()),
-            choice: ResolvedNode::Explicit(resolved),
-        }],
-        "alice",
-    ))
-    .unwrap();
-    assert!(resolution.conflicts.is_empty());
-    assert!(block_on(store.conflicts("main")).unwrap().is_empty());
-    let snapshot = block_on(store.materialize(&resolution.id)).unwrap();
-    let fm = &snapshot.nodes.get(&NodeId("n".into())).unwrap().meta.frontmatter;
-    assert_eq!(fm.get("k").unwrap(), "agreed");
-}
-
-/// 6. Delete on one side vs edit on the other → conflict; merged snapshot
-/// keeps ours.
-#[test]
-fn merge_delete_vs_edit_conflicts() {
-    let store = store();
-    let base = block_on(store.commit("main", vec![upsert(node_with_fm("n", "k", "v"))], "alice", "base")).unwrap();
-    block_on(store.create_branch("dev", &base.id)).unwrap();
-    // main (ours) deletes; dev (theirs) edits.
-    block_on(store.commit("main", vec![GraphOp::DeleteNode(NodeId("n".into()))], "alice", "delete")).unwrap();
-    block_on(store.commit("dev", vec![upsert(node_with_fm("n", "k", "edited"))], "bob", "edit")).unwrap();
-
-    let report = block_on(store.merge("main", "dev", "alice", "merge")).unwrap();
-    assert_eq!(report.conflicts.len(), 1);
-    let conflict = &report.conflicts[0];
-    assert!(conflict.base.is_some());
-    assert!(conflict.ours.is_none(), "ours deleted the node");
-    assert!(conflict.theirs.is_some(), "theirs edited the node");
-    // Ours (delete) is kept in the merged snapshot.
-    let snapshot = block_on(store.materialize(&report.commit.id)).unwrap();
-    assert!(!snapshot.nodes.contains_key(&NodeId("n".into())));
-
-    // Resolving with Theirs restores the edited node.
-    let resolution = block_on(store.resolve(
-        "main",
-        vec![ConflictResolution {
-            node_id: NodeId("n".into()),
-            choice: ResolvedNode::Theirs,
-        }],
-        "alice",
-    ))
-    .unwrap();
-    let snapshot = block_on(store.materialize(&resolution.id)).unwrap();
-    assert_eq!(
-        snapshot
-            .nodes
-            .get(&NodeId("n".into()))
-            .unwrap()
-            .meta
-            .frontmatter
-            .get("k")
-            .unwrap(),
-        "edited"
-    );
-}
-
-/// 7. Edge add/add dedupes by identity; delete on one side wins when the edge
-/// is unchanged on the other.
-#[test]
-fn edge_merge_semantics() {
-    let store = store();
-    let base = block_on(store.commit(
-        "main",
-        vec![
-            upsert(node("a")),
-            upsert(node("b")),
-            upsert(node("c")),
-            edge("a", "b"),
-            edge("b", "c"),
-        ],
-        "alice",
-        "base",
-    ))
-    .unwrap();
-    block_on(store.create_branch("dev", &base.id)).unwrap();
-    // main adds a->c (also added by dev) and deletes b->c.
-    block_on(store.commit(
-        "main",
-        vec![edge("a", "c"), GraphOp::DeleteEdge(EdgeId { source: "b".into(), target: "c".into() })],
-        "alice",
-        "main edges",
-    ))
-    .unwrap();
-    // dev adds the same a->c edge, leaves b->c untouched.
-    block_on(store.commit("dev", vec![edge("a", "c")], "bob", "dev edges")).unwrap();
-
-    let report = block_on(store.merge("main", "dev", "alice", "merge")).unwrap();
-    assert!(report.conflicts.is_empty());
-    let snapshot = block_on(store.materialize(&report.commit.id)).unwrap();
-    assert!(snapshot.edges.contains(&EdgeId { source: "a".into(), target: "b".into() }));
-    assert!(snapshot.edges.contains(&EdgeId { source: "a".into(), target: "c".into() }));
-    assert!(
-        !snapshot.edges.contains(&EdgeId { source: "b".into(), target: "c".into() }),
-        "deleted on main, unchanged on dev → absent"
-    );
-    assert_eq!(snapshot.edges.len(), 2);
-}
-
-/// 8. Rebase a two-commit branch onto a moved main: new CommitIds, same
-/// ChangeIds, correct final snapshot and log topology.
-#[test]
-fn rebase_replays_commits() {
-    let store = store();
-    let base = block_on(store.commit("main", vec![upsert(node("root"))], "alice", "base")).unwrap();
-    block_on(store.create_branch("dev", &base.id)).unwrap();
-    let d1 = block_on(store.commit("dev", vec![upsert(node("d1"))], "bob", "d1")).unwrap();
-    let d2 = block_on(store.commit("dev", vec![upsert(node_with_fm("d2", "k", "v"))], "bob", "d2")).unwrap();
-    // main moves ahead.
-    block_on(store.commit("main", vec![upsert(node("main-work"))], "alice", "main work")).unwrap();
-
-    let report = block_on(store.rebase("dev", "main", "alice")).unwrap();
-    assert_eq!(report.rebased.len(), 2);
-    assert_eq!(report.rebased[0].change_id, d1.change_id);
-    assert_eq!(report.rebased[1].change_id, d2.change_id);
-    assert_ne!(report.rebased[0].id, d1.id);
-    assert_ne!(report.rebased[1].id, d2.id);
-    // Rebased chain: d2' -> d1' -> main head.
-    assert_eq!(report.rebased[1].parents, vec![report.rebased[0].id.clone()]);
-    assert_eq!(report.new_head, report.rebased[1].id);
-
-    let snapshot = block_on(store.materialize(&report.new_head)).unwrap();
-    for id in ["root", "main-work", "d1", "d2"] {
-        assert!(snapshot.nodes.contains_key(&NodeId(id.into())), "missing {id}");
-    }
-
-    // Log walks first parents: d2', d1', main-work commit, base.
-    let log = block_on(store.log("dev", 10)).unwrap();
-    assert_eq!(log.len(), 4);
-    assert_eq!(log[0].id, report.rebased[1].id);
-    assert_eq!(log[1].id, report.rebased[0].id);
-    assert_eq!(log[3].id, base.id);
-    assert_eq!(block_on(store.head("dev")).unwrap(), Some(report.new_head));
-}
-
-/// 9. The op log records commit / branch / merge / resolve / rebase in order.
-#[test]
-fn op_log_records_operations_in_order() {
-    let store = store();
-    let base = block_on(store.commit("main", vec![upsert(node_with_fm("n", "k", "v"))], "alice", "base")).unwrap();
-    block_on(store.create_branch("dev", &base.id)).unwrap();
-    block_on(store.commit("main", vec![upsert(node_with_fm("n", "k", "ours"))], "alice", "ours")).unwrap();
-    block_on(store.commit("dev", vec![upsert(node_with_fm("n", "k", "theirs"))], "bob", "theirs")).unwrap();
-    block_on(store.merge("main", "dev", "alice", "merge")).unwrap();
-    block_on(store.resolve(
-        "main",
-        vec![ConflictResolution { node_id: NodeId("n".into()), choice: ResolvedNode::Ours }],
-        "alice",
-    ))
-    .unwrap();
-    block_on(store.rebase("dev", "main", "alice")).unwrap();
-
-    let log = block_on(store.op_log(100)).unwrap();
-    let kinds: Vec<OpKind> = log.iter().map(|e| e.kind).collect();
-    assert_eq!(
-        kinds,
-        vec![
-            OpKind::Rebase,
-            OpKind::Resolve,
-            OpKind::Merge,
-            OpKind::Commit,
-            OpKind::Commit,
-            OpKind::Branch,
-            OpKind::Commit,
-        ]
-    );
-    let seqs: Vec<u64> = log.iter().map(|e| e.seq).collect();
-    let mut sorted = seqs.clone();
-    sorted.sort_unstable_by(|a, b| b.cmp(a));
-    assert_eq!(seqs, sorted, "newest first");
-}
-
-/// 10. File-backed store: commit, drop, reopen, and the head/log survive.
+/// File-backed store: commit, drop, reopen, and the head/log survive.
 #[test]
 fn file_backed_reopen_preserves_state() {
     let dir = tempfile::tempdir().unwrap();

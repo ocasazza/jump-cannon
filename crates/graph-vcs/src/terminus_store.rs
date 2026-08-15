@@ -50,8 +50,8 @@
 //! (one transaction when the branch *is* `main`). If (2) fails the commit
 //! document is an unreachable orphan — the branch head never moved, so the
 //! operation observably failed and an idempotent retry (same content-addressed
-//! id, `overwrite=true`) converges. The reverse order is never used, so a
-//! pointer can never reference a missing commit.
+//! id; writes are `PUT` document-replaces) converges. The reverse order is
+//! never used, so a pointer can never reference a missing commit.
 //!
 //! # Calling convention
 //!
@@ -149,6 +149,7 @@ impl TerminusStore {
             db: world.to_string(),
             mu: Mutex::new(()),
         };
+        store.ensure_organization()?;
         store.ensure_database()?;
         store.ensure_schema()?;
         Ok(store)
@@ -211,8 +212,12 @@ impl TerminusStore {
         Ok(self.get_docs(branch, &[("id", id)])?.into_iter().next())
     }
 
-    /// Insert/overwrite documents on a branch in one native commit, carrying
-    /// the given author and message.
+    /// Replace documents on a branch in one native commit, carrying the
+    /// given author and message. `PUT` with `create=true` is the document
+    /// API's upsert: a listed `@id` is fully replaced (POST would *append*
+    /// field values to the existing document, corrupting single-valued
+    /// fields like a branch head pointer into a multi-value set), and absent
+    /// ids are created.
     fn post_docs(
         &self,
         branch: Option<&str>,
@@ -222,19 +227,42 @@ impl TerminusStore {
     ) -> Result<(), VcsError> {
         let response = self
             .http
-            .post(self.document_url(branch))
+            .put(self.document_url(branch))
             .basic_auth(&self.config.user, Some(&self.config.password))
             .query(&[
                 ("graph_type", "instance"),
                 ("author", author),
                 ("message", message),
-                ("overwrite", "true"),
+                ("create", "true"),
             ])
             .json(&docs)
             .send()
             .map_err(store_err)?;
         check(response)?;
         Ok(())
+    }
+
+    /// Create the organization when missing. A fresh server only has the
+    /// `admin` organization; creation needs the user's `user_name` in the
+    /// body. A create race (already-exists rejection) is tolerated.
+    fn ensure_organization(&self) -> Result<(), VcsError> {
+        let base = self.config.base_url.trim_end_matches('/');
+        let response = self
+            .http
+            .post(format!("{}/api/organization", base))
+            .basic_auth(&self.config.user, Some(&self.config.password))
+            .json(&json!({
+                "organization_name": self.config.org,
+                "user_name": self.config.user,
+            }))
+            .send()
+            .map_err(store_err)?;
+        match check(response) {
+            Ok(_) => Ok(()),
+            // Another store instance created it first (or it always existed).
+            Err(e) if already_exists(&e) => Ok(()),
+            Err(e) => Err(e),
+        }
     }
 
     /// Create the database when missing. Existence is probed with

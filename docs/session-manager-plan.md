@@ -36,7 +36,7 @@ and TerminusDB (cluster), Kueue-shared per-world GPU, and a multi-view UI.
 
 | Piece | Where | State |
 |---|---|---|
-| `VcsStore` + jj model + `MinigrafStore` | `crates/graph-vcs` | done, 15 tests |
+| `VcsStore` + jj model + `MinigrafStore` | `crates/graph-vcs` | done, 25 tests |
 | `WorldHost`/`SessionDirectory` + `EmbeddedSessionManager` + conformance suite | `crates/session-manager` | done, 5 tests |
 | graph-api split (`api_router`/`router`), `build_world_state`, `WatchPlan::Push` wired | `crates/graph-api` | done, behavior unchanged |
 | `KubernetesSessionManager` server (`server` feature): auth middleware, VCS/session REST `/api/*`, per-world nested graph serving `/worlds/:name/*` (RwLock + tower oneshot mux), `WorldImporter` | `crates/session-manager` | done, 12 tests incl. HTTP conformance |
@@ -48,6 +48,9 @@ and TerminusDB (cluster), Kueue-shared per-world GPU, and a multi-view UI.
 | M7: world export/import (`WorldExport` v1, `MinigrafStore::restore_commit/restore_branch`) | `crates/session-manager/src/export.rs`, `crates/graph-vcs/src/minigraf_store.rs` | done, 5 tests |
 | M7: wasm embedded persistence — localStorage export-snapshot per commit (`open_persistent`), NOT minigraf IndexedDB (see M7 note below) | `crates/session-manager/src/embedded.rs` | done |
 | M7: embedded-world canvas (`rematerialize_embedded` → client `GraphData`), Worlds-panel commit editor (add node/edge, delete selected), export download / import upload | `app/ui/src/{main,graph_canvas}.rs`, `panels/worlds.rs` | done |
+| M6: `TerminusStore` (feature `terminus`, native): one TerminusDB org + database per world, native branches per our branch, Rust-side snapshot merge/rebase, `PUT create=true` document upserts, org/database/schema auto-provisioned at open | `crates/graph-vcs/src/terminus_store.rs` | done, verified against `terminusdb/terminusdb-server:v12.0.7` |
+| M6: shared `VcsStore` parity suite (feature `contract`, mirrors session-manager's `conformance`) run by minigraf unit tests and by the env/boot-gated TerminusDB harness (`TERMINUSDB_TEST_URL` / `TERMINUSDB_BOOT_CONTAINER=docker\|podman`; auto-skip otherwise) | `crates/graph-vcs/src/contract.rs`, `tests/terminus_contract.rs` | done |
+| M6: session-manager `--store terminusdb` + `TERMINUSDB_*` env; chart `terminusdb` StatefulSet/Service (image `terminusdb/terminusdb-server:v12.0.7`), admin Secret guardrails, `ci/terminusdb.yaml` | `crates/session-manager/src/{kubernetes.rs,bin/}`, `charts/jump-cannon` | done, helm template green |
 
 ## M7 persistence finding (why localStorage, not IndexedDB)
 
@@ -99,14 +102,33 @@ exercised in a real browser:
   the panel-kit repo — the app currently uses two static workspaces, which is
   functionally equivalent for two views.
 
+## M6 TerminusDB verification findings (2026-08-14)
+
+M6 shipped in the original session-manager commit but had never been run
+against a real server; booting `terminusdb/terminusdb-server:v12.0.7`
+(`TERMINUSDB_BOOT_CONTAINER=podman`) surfaced three bugs, all fixed:
+
+- The store never created its organization — a fresh server only has
+  `admin`, so every open failed with `Unknown organization name`.
+  `TerminusStore::new` now auto-provisions org (`POST /api/organization`)
+  → database → schema, tolerating already-exists races.
+- Document writes used `POST ...&overwrite=true`, which does not replace:
+  TerminusDB *appends* field values, so a moved branch head became a
+  multi-value set and reads failed. Writes are now `PUT` with `create=true`
+  (true upsert/replace semantics).
+- The chart pinned `terminusdb/terminusdb:v12.0.7`, an image that does not
+  exist on Docker Hub (would ImagePullBackOff); corrected to
+  `terminusdb/terminusdb-server:v12.0.7`.
+
+The ten store-level parity scenarios now live in `graph_vcs::contract`
+(feature `contract`) and run identically against `MinigrafStore` (always)
+and `TerminusStore` (gated: `TERMINUSDB_TEST_URL` for a running server, or
+`TERMINUSDB_BOOT_CONTAINER=docker|podman` to boot one; auto-skip otherwise),
+plus a TerminusDB-specific reopen-persistence test. `cargo test -p
+graph-vcs --all-features` stays green with no container runtime.
+
 ## Remaining milestones
 
-- **M6 TerminusStore**: `graph-vcs` backend mapping our commit/branch ops
-  onto TerminusDB's native branch/merge/rebase (thin reqwest client or the
-  community Rust client); optional `terminusdb` StatefulSet in the chart
-  (`terminusdb.enabled=false` default, admin Secret); docker-gated parity
-  tests against the `VcsStore` contract. `sessionManager.store` values key
-  already validates `minigraf|terminusdb` (only minigraf wired).
 - ~~**M7 browser-alone polish**~~ **done** (see the M7 table rows + the
   persistence finding above): world export/import (JSON `WorldExport`
   download/upload rather than raw `.graph` files — the export carries full
