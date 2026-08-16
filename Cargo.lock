@@ -1464,6 +1464,7 @@ dependencies = [
  "graph-compute",
  "graph-layouts",
  "graph-metrics",
+ "http-json-importer",
  "k8s-openapi",
  "kube",
  "kubernetes-importer",
@@ -1712,6 +1713,21 @@ dependencies = [
  "http",
  "http-body",
  "pin-project-lite",
+]
+
+[[package]]
+name = "http-json-importer"
+version = "1.0.0"
+dependencies = [
+ "data-loader",
+ "parking_lot",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "tokio",
+ "toml 0.8.23",
+ "tracing",
+ "vault-data",
 ]
 
 [[package]]

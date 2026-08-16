@@ -1,0 +1,23 @@
+{{- $importer := include "jump-cannon.importerSelection" . | fromJson -}}
+{{- if eq $importer.kind "httpjson" }}
+{{/* Chart-owned package(s) for the HTTP/JSON importer engine. Each TOML
+     under charts/jump-cannon/packages/ becomes one data key keyed by its
+     filename, so the runtime can read them by name
+     (e.g. `hindsight-memory-bank.toml`) with no path translation. The
+     deployment mounts this ConfigMap under `.Values.httpJsonImporter.mountPath`
+     only when `importers.selected` / `graphApi.source` selects `httpjson`,
+     so deployments that never run the engine do not depend on its
+     packages. */}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "jump-cannon.fullname" . }}-importer-packages
+  labels:
+    {{- include "jump-cannon.labels" . | nindent 4 }}
+    app.kubernetes.io/component: graph-api
+data:
+  {{- range $path, $_ := .Files.Glob "packages/*.toml" }}
+  {{ base $path }}: |-
+{{ $.Files.Get $path | indent 4 }}
+  {{- end }}
+{{- end }}

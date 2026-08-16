@@ -357,6 +357,7 @@ impl OkfImporter {
                 tags,
                 frontmatter,
                 source_resources,
+                path_references,
                 links,
                 body,
                 mtime,
@@ -400,14 +401,14 @@ impl OkfImporter {
                     y: 0.0,
                 })
                 .map_err(|error| OkfError::Graph(error.to_string()))?;
-            relations.push((id, links, source_resources));
+            relations.push((id, links, path_references));
         }
 
         let mut edge_ids = HashSet::new();
         let mut edge_endpoint_bytes = 0_u64;
         let mut unresolved_ids = HashSet::new();
         let mut unresolved_bytes = 0_u64;
-        for (source_index, (concept_id, links, source_resources)) in relations.iter().enumerate() {
+        for (source_index, (concept_id, links, path_references)) in relations.iter().enumerate() {
             for destination in links {
                 let Some(target) = resolve_body_link(concept_id, destination) else {
                     continue;
@@ -444,12 +445,14 @@ impl OkfImporter {
                 )?;
             }
 
-            for resource in source_resources {
+            for resource in path_references {
                 let Some(target) = resolve_source_resource(concept_id, resource) else {
                     continue;
                 };
                 // `resource` may be an external data object or a free-form
-                // scope descriptor. It is provenance metadata unless it
+                // scope descriptor, or an OKF §6.2 path-valued field
+                // (`resource`, `computation`, `executor.resource`,
+                // `attester.resource`). It is provenance metadata unless it
                 // resolves to another concept in this bundle.
                 if let Some(&target_index) = concept_indices.get(&target) {
                     self.push_edge(
@@ -571,7 +574,18 @@ struct ParsedConcept {
     concept_type: String,
     tags: Vec<String>,
     frontmatter: HashMap<String, serde_json::Value>,
+    /// Every `sources[].resource` string (OKF §5.1) — drives the
+    /// `source_resources` discovery projection.
     source_resources: Vec<String>,
+    /// Every OKF §6.2 path-valued field string (`sources[].resource`,
+    /// `resource`, `computation`, `executor.resource`,
+    /// `attester.resource`). Used for graph-edge creation: any value that
+    /// resolves to another concept in the bundle becomes a directed
+    /// `relationship` edge from the source concept to the target concept.
+    /// External URLs and scope descriptors resolve to `None` and are
+    /// silently dropped, matching the spec's permissive conformance.
+    path_references: Vec<String>,
+    /// Standard CommonMark body link destinations (OKF §6.1).
     links: Vec<String>,
     body: String,
     mtime: i64,
@@ -669,6 +683,9 @@ fn parse_concept(id: &str, raw: String, mtime: i64) -> Result<ParsedConcept, Okf
     let mut source_resources = extract_source_resources(mapping);
     source_resources.sort();
     source_resources.dedup();
+    let mut path_references = extract_path_references(mapping);
+    path_references.sort();
+    path_references.dedup();
     let mut links = markdown_links(body);
     links.sort();
     links.dedup();
@@ -696,12 +713,12 @@ fn parse_concept(id: &str, raw: String, mtime: i64) -> Result<ParsedConcept, Okf
         tags,
         frontmatter,
         source_resources,
+        path_references,
         links,
         body: body.to_string(),
         mtime,
     })
 }
-
 fn yaml_string<'a>(mapping: &'a serde_yaml::Mapping, key: &str) -> Option<&'a str> {
     mapping
         .get(serde_yaml::Value::String(key.into()))
@@ -719,6 +736,41 @@ fn extract_source_resources(mapping: &serde_yaml::Mapping) -> Vec<String> {
         .filter(|resource| !resource.trim().is_empty())
         .map(str::to_string)
         .collect()
+}
+
+/// Collect every OKF §6.2 path-valued field string the concept declares.
+///
+/// The set is the union of every path a concept names — `sources[].resource`
+/// (provenance), the top-level `resource` (underlying asset URI),
+/// `computation` (Attested Computation's computation file), and the
+/// nested `executor.resource` / `attester.resource` (Attested Computation's
+/// execution and attestation references). The spec permits any of these to
+/// resolve to another concept in the bundle; consumers that build a graph
+/// view treat each resolution as a directed `relationship` edge.
+fn extract_path_references(mapping: &serde_yaml::Mapping) -> Vec<String> {
+    let mut paths: Vec<String> = extract_source_resources(mapping);
+    for key in ["resource", "computation"] {
+        if let Some(value) = yaml_string(mapping, key) {
+            let trimmed = value.trim();
+            if !trimmed.is_empty() {
+                paths.push(trimmed.to_string());
+            }
+        }
+    }
+    for outer in ["executor", "attester"] {
+        if let Some(nested) = mapping
+            .get(serde_yaml::Value::String(outer.into()))
+            .and_then(serde_yaml::Value::as_mapping)
+        {
+            if let Some(value) = yaml_string(nested, "resource") {
+                let trimmed = value.trim();
+                if !trimmed.is_empty() {
+                    paths.push(trimmed.to_string());
+                }
+            }
+        }
+    }
+    paths
 }
 
 fn okf_schema() -> ImporterSchema {
@@ -1614,6 +1666,61 @@ sources:
                 ),
             ])
         );
+        assert!(result.unresolved.is_empty());
+    }
+
+    #[test]
+    fn okf_section_6_2_path_valued_fields_create_relationship_edges() {
+        let fixture = TempDir::new().unwrap();
+        write(
+            fixture.path(),
+            "metrics/revenue.md",
+            "---\n\
+type: metric\n\
+title: Revenue\n\
+executor:\n\
+  resource: computations/revenue.md\n\
+---\n",
+        );
+        write(fixture.path(), "computations/revenue.md", &concept("computation", ""));
+
+        let result = load(fixture.path());
+
+        assert_eq!(result.graph.node_count(), 2);
+        assert_eq!(
+            edges(&result),
+            BTreeSet::from([(
+                "okf:fixture:metrics/revenue".into(),
+                "okf:fixture:computations/revenue".into(),
+            )])
+        );
+    }
+
+    #[test]
+    fn okf_section_6_2_path_valued_fields_skip_dangling_targets() {
+        let fixture = TempDir::new().unwrap();
+        write(
+            fixture.path(),
+            "metrics/revenue.md",
+            "---\n\
+type: metric\n\
+executor:\n\
+  resource: ./missing-via-executor.md\n\
+sources:\n\
+  - resource: ./missing-via-source.md\n\
+---\n",
+        );
+        write(fixture.path(), "sibling.md", &concept("other", ""));
+
+        let result = load(fixture.path());
+
+        assert_eq!(result.graph.node_count(), 2);
+        // None of the §6.2 path-valued fields resolve: no edges.
+        assert_eq!(result.graph.edge_count(), 0);
+        // Path-valued fields with internal misses are silently dropped
+        // (matching the existing `sources[].resource` behavior); only body
+        // links land in `unresolved`. There are no body links here, so the
+        // unresolved list is empty.
         assert!(result.unresolved.is_empty());
     }
 

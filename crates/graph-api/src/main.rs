@@ -53,7 +53,9 @@ struct Args {
     )]
     filesystem_rescan_seconds: u64,
     /// Data source: obsidian (default), tvix, generate, kubernetes, okf, pest,
-    /// or github.
+    /// github, or httpjson. Package-driven kinds (pest, httpjson) take their
+    /// behaviour from --importer-manifest, so a new API is a package, not a
+    /// new source kind.
     /// Runtime Pest packages are trusted administrator-installed code; the
     /// unauthenticated HTTP API does not accept grammar uploads.
     #[arg(long, env = "JUMP_CANNON_SOURCE", default_value = "obsidian")]
@@ -121,8 +123,34 @@ struct Args {
     /// sanitized repository slug (e.g. "ocasazza-jump-cannon").
     #[arg(long, env = "JUMP_CANNON_GITHUB_SOURCE_ID")]
     github_source_id: Option<String>,
-    /// Versioned TOML package containing a runtime Pest grammar and capture map.
-    /// Required by --source=pest.
+    /// Root of the JSON API bound to an `httpjson` package, e.g.
+    /// http://hindsight-api-proxy.hindsight.svc.cluster.local. Required by
+    /// --source=httpjson.
+    #[arg(long, env = "JUMP_CANNON_IMPORTER_ENDPOINT")]
+    importer_endpoint: Option<String>,
+    /// Value for one variable the package declares, as `name=value`
+    /// (repeatable). The package names its variables; the deployment supplies
+    /// them, e.g. `--importer-var bank=omp`.
+    #[arg(long = "importer-var", env = "JUMP_CANNON_IMPORTER_VARS", value_delimiter = ',')]
+    importer_vars: Vec<String>,
+    /// Bearer token for an authenticated API. Prefer the env var so the token
+    /// stays out of process argument lists; it is never logged.
+    #[arg(long, env = "JUMP_CANNON_IMPORTER_TOKEN")]
+    importer_token: Option<String>,
+    /// Stable ASCII slug namespacing this instance's node IDs. Defaults to the
+    /// package's sanitized metadata id.
+    #[arg(long, env = "JUMP_CANNON_IMPORTER_SOURCE_ID")]
+    importer_source_id: Option<String>,
+    /// Poll cadence in milliseconds for package-driven remote sources. 0
+    /// advertises a static one-shot snapshot.
+    #[arg(
+        long,
+        env = "JUMP_CANNON_IMPORTER_POLL_INTERVAL_MS",
+        default_value_t = 60000
+    )]
+    importer_poll_interval_ms: u64,
+    /// Versioned TOML importer package. Required by --source=pest (a Pest
+    /// grammar + capture map) and --source=httpjson (endpoints + mapping).
     #[arg(long, env = "JUMP_CANNON_IMPORTER_MANIFEST")]
     importer_manifest: Option<PathBuf>,
     /// Filesystem input bound to --importer-manifest. Required by --source=pest.
@@ -388,6 +416,60 @@ async fn main() -> anyhow::Result<()> {    let _ = dotenvy::dotenv();
             );
             Box::new(github_importer::GitHubImporter::new(config)?)
         }
+        data_loader::SourceKind::HttpJson => {
+            let manifest_path = args.importer_manifest.as_ref().with_context(|| {
+                "--source=httpjson requires --importer-manifest / JUMP_CANNON_IMPORTER_MANIFEST"
+            })?;
+            let endpoint = args.importer_endpoint.clone().with_context(|| {
+                "--source=httpjson requires --importer-endpoint / JUMP_CANNON_IMPORTER_ENDPOINT"
+            })?;
+            let manifest_len = std::fs::metadata(manifest_path)
+                .with_context(|| {
+                    format!(
+                        "failed to inspect importer package {}",
+                        manifest_path.display()
+                    )
+                })?
+                .len() as usize;
+            anyhow::ensure!(
+                manifest_len <= http_json_importer::manifest::HARD_LIMITS.manifest_bytes,
+                "importer package {} is {} bytes; hard limit is {} bytes",
+                manifest_path.display(),
+                manifest_len,
+                http_json_importer::manifest::HARD_LIMITS.manifest_bytes
+            );
+            let raw = std::fs::read(manifest_path).with_context(|| {
+                format!(
+                    "failed to read importer package {}",
+                    manifest_path.display()
+                )
+            })?;
+            let package = http_json_importer::ValidatedPackage::from_toml_bytes(&raw)
+                .with_context(|| format!("invalid importer package {}", manifest_path.display()))?;
+            let variables = parse_importer_vars(&args.importer_vars)?;
+            let source_id = args
+                .importer_source_id
+                .clone()
+                .unwrap_or_else(|| sanitize_source_id(&package.manifest().metadata.id));
+            let instance = http_json_importer::InstanceConfig {
+                source_id,
+                base_url: endpoint,
+                variables,
+                token: args.importer_token.clone(),
+                poll_interval_ms: args.importer_poll_interval_ms,
+            };
+            // The token is deliberately absent from this log line.
+            tracing::info!(
+                package = %package.manifest().metadata.id,
+                version = %package.manifest().metadata.version,
+                source_id = %instance.source_id,
+                endpoint = %instance.base_url,
+                variables = ?instance.variables,
+                poll_interval_ms = instance.poll_interval_ms,
+                "using HTTP/JSON package importer"
+            );
+            Box::new(http_json_importer::build_importer(package, instance)?)
+        }
     };
 
     // This CLI is the trusted host configuration surface: every selectable
@@ -464,7 +546,7 @@ async fn main() -> anyhow::Result<()> {    let _ = dotenvy::dotenv();
     // Live reload follows the active importer's watch plan (filesystem,
     // polling, push, or static) rather than assuming an Obsidian directory.
     if !args.no_watch {
-        graph_api::watcher::spawn(state.clone(), args.filesystem_rescan_seconds);
+        let _ = graph_api::watcher::spawn(state.clone(), args.filesystem_rescan_seconds);
     } else {
         tracing::info!("filesystem watcher disabled (--no-watch)");
     }
@@ -514,6 +596,54 @@ async fn main() -> anyhow::Result<()> {    let _ = dotenvy::dotenv();
 
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+/// Parse repeated `--importer-var name=value` bindings. A malformed pair is a
+/// configuration error naming the offending argument, never a silent skip.
+fn parse_importer_vars(
+    pairs: &[String],
+) -> anyhow::Result<std::collections::BTreeMap<String, String>> {
+    let mut variables = std::collections::BTreeMap::new();
+    for pair in pairs {
+        let pair = pair.trim();
+        if pair.is_empty() {
+            continue;
+        }
+        let (name, value) = pair.split_once('=').with_context(|| {
+            format!("--importer-var expects name=value, got {pair:?}")
+        })?;
+        let (name, value) = (name.trim(), value.trim());
+        anyhow::ensure!(
+            !name.is_empty() && !value.is_empty(),
+            "--importer-var expects a non-empty name and value, got {pair:?}"
+        );
+        anyhow::ensure!(
+            variables.insert(name.to_string(), value.to_string()).is_none(),
+            "--importer-var {name:?} was supplied twice"
+        );
+    }
+    Ok(variables)
+}
+
+/// Fold an arbitrary package id into the `[a-z0-9._-]` source-id charset.
+fn sanitize_source_id(package_id: &str) -> String {
+    let sanitized: String = package_id
+        .to_lowercase()
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_lowercase() || ch.is_ascii_digit() || matches!(ch, '.' | '_' | '-') {
+                ch
+            } else {
+                '-'
+            }
+        })
+        .take(data_loader::identity::MAX_SOURCE_ID_BYTES)
+        .collect();
+    if sanitized.is_empty() {
+        "httpjson".to_string()
+    } else {
+        sanitized
+    }
 }
 
 /// Build the GPU session controller from CLI/env config. Returns `None`

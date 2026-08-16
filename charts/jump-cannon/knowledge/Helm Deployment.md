@@ -49,6 +49,19 @@ sync are skipped in this mode; they remain the fallback under the default
 `obsidian` source. Private mirrors take a token only through
 `githubImporter.tokenSecret`, never through values. See [[GitHub Importer]].
 
+`httpJsonImporter` selects the `httpjson` engine. The chart ships every
+TOML under `charts/jump-cannon/packages/` (e.g. `hindsight-memory-bank.toml`)
+as a ConfigMap, and the bound pod points `JUMP_CANNON_IMPORTER_*`
+(`--importer-manifest` / `--importer-endpoint` / `--importer-var name=value`
+/ `--importer-token` / `--importer-source-id` / `--importer-poll-interval-ms`)
+at the chosen bank. No vault claim is mounted and the seed init container is
+skipped, since the corpus is remote. `httpJsonImporter.limits.maxRecords`
+bounds each collection's import loudly instead of truncating (the package
+also declares `request_timeout_seconds`, `max_records`, and page-size caps;
+see [[Hindsight Importer]] for the Hindsight example and AGENTS.md for the
+generic binding). An authenticated API takes a token only through
+`httpJsonImporter.tokenSecret`. See [[Importer Runtime]] for the engine.
+
 The chart's inactive `lavender-ingest-okf` instance consumes the externally
 provisioned `lavender-okf-shared` RWX claim read-only. It mounts the repository
 at `/var/lib/lavender/okf-repository` and imports

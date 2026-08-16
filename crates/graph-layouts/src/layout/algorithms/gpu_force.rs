@@ -1044,6 +1044,14 @@ struct GpuState {
     gb_scan_pipeline: wgpu::ComputePipeline,
     gb_scatter_pipeline: wgpu::ComputePipeline,
     gb_bind_group_layout: wgpu::BindGroupLayout,
+    /// Group 0 placeholder bind group for the four grid-build pipelines
+    /// (they only reference group 1). wgpu requires an explicit
+    /// `set_bind_group` for every group index the pipeline layout
+    /// declares, even one whose layout has zero entries — `Binder`
+    /// treats validity as a contiguous prefix from index 0, so an unset
+    /// "empty" group poisons every higher-indexed group too. Must be
+    /// bound at every grid-build dispatch.
+    empty_gb_bind_group: wgpu::BindGroup,
 
     positions: PositionsStorage,
     /// True while pos_a is the "in" and pos_b is the "out" buffer.
@@ -1097,6 +1105,11 @@ struct GpuState {
     /// declared, so it must be present in the bind group) — we just
     /// fill it with a 1-slot sentinel buffer.
     oct_bind_group_layout: wgpu::BindGroupLayout,
+    /// Group 1 placeholder bind group for `force_step`/`spring_step`,
+    /// which don't use the grid-build bindings the real group 1 layout
+    /// declares. Same requirement as `empty_gb_bind_group` above: must be
+    /// explicitly bound at every dispatch, not just groups 0/2/3.
+    force_empty_gb_bind_group: wgpu::BindGroup,
     /// Number of valid octree slots populated last build. 0 = no tree.
     n_octree_used: u32,
     /// Reusable CPU build scratch — kept across frames to avoid
@@ -1469,6 +1482,8 @@ struct ForcePipelines {
     spring_bgl: wgpu::BindGroupLayout,
     /// Standalone hub-aware spring kernel (one thread per virtual vertex).
     spring_step: wgpu::ComputePipeline,
+    empty_gb_bg: wgpu::BindGroup,
+    force_empty_gb_bg: wgpu::BindGroup,
 }
 
 fn build_pipeline(device: &wgpu::Device) -> ForcePipelines {
@@ -1541,6 +1556,14 @@ fn build_pipeline(device: &wgpu::Device) -> ForcePipelines {
         label: Some("gpu_force_grid_build_empty_bgl"),
         entries: &[],
     });
+    // wgpu still requires this to be explicitly bound at dispatch time
+    // even though it has zero entries — see the doc comment on
+    // `GpuState::empty_gb_bind_group`.
+    let empty_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("gpu_force_grid_build_empty_bg"),
+        layout: &empty_bgl,
+        entries: &[],
+    });
 
     // Group 2: octree storage. Single read-only storage buffer at @binding(1)
     // matching `oct_nodes` in force.wgsl. We omit the params/bbox bindings
@@ -1558,6 +1581,12 @@ fn build_pipeline(device: &wgpu::Device) -> ForcePipelines {
     // bindings the grid-build pipelines own).
     let force_empty_gb_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
         label: Some("gpu_force_force_empty_gb_bgl"),
+        entries: &[],
+    });
+    // Same "must still be explicitly bound" requirement as `empty_bg`.
+    let force_empty_gb_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("gpu_force_force_empty_gb_bg"),
+        layout: &force_empty_gb_bgl,
         entries: &[],
     });
 
@@ -1660,6 +1689,8 @@ fn build_pipeline(device: &wgpu::Device) -> ForcePipelines {
         oct_bgl,
         spring_bgl,
         spring_step,
+        empty_gb_bg: empty_bg,
+        force_empty_gb_bg,
     }
 }
 
@@ -1702,6 +1733,7 @@ impl GpuState {
             gb_scan_pipeline: pipelines.gb_scan,
             gb_scatter_pipeline: pipelines.gb_scatter,
             gb_bind_group_layout: pipelines.gb_bgl,
+            empty_gb_bind_group: pipelines.empty_gb_bg,
             positions: PositionsStorage::Owned { pos_a, pos_b },
             a_is_in: true,
             velocities: aux.vel,
@@ -1728,6 +1760,7 @@ impl GpuState {
             oct_nodes_buf: aux.oct_nodes,
             oct_nodes_capacity: aux.oct_nodes_capacity,
             oct_bind_group_layout: pipelines.oct_bgl,
+            force_empty_gb_bind_group: pipelines.force_empty_gb_bg,
             n_octree_used: 0,
             oct_build: OctreeBuild::default(),
             staging: Some(staging),
@@ -1784,6 +1817,7 @@ impl GpuState {
             gb_scan_pipeline: pipelines.gb_scan,
             gb_scatter_pipeline: pipelines.gb_scatter,
             gb_bind_group_layout: pipelines.gb_bgl,
+            empty_gb_bind_group: pipelines.empty_gb_bg,
             positions: PositionsStorage::Borrowed { pos_b },
             a_is_in: true,
             velocities: aux.vel,
@@ -1810,6 +1844,7 @@ impl GpuState {
             oct_nodes_buf: aux.oct_nodes,
             oct_nodes_capacity: aux.oct_nodes_capacity,
             oct_bind_group_layout: pipelines.oct_bgl,
+            force_empty_gb_bind_group: pipelines.force_empty_gb_bg,
             n_octree_used: 0,
             oct_build: OctreeBuild::default(),
             staging: None,
@@ -1974,6 +2009,7 @@ impl GpuState {
                 timestamp_writes: None,
             });
             cpass.set_pipeline(&self.gb_clear_pipeline);
+            cpass.set_bind_group(0, &self.empty_gb_bind_group, &[]);
             cpass.set_bind_group(1, bg, &[]);
             cpass.dispatch_workgroups(cells_groups.max(1), 1, 1);
         }
@@ -1984,6 +2020,7 @@ impl GpuState {
                 timestamp_writes: None,
             });
             cpass.set_pipeline(&self.gb_count_pipeline);
+            cpass.set_bind_group(0, &self.empty_gb_bind_group, &[]);
             cpass.set_bind_group(1, bg, &[]);
             cpass.dispatch_workgroups(nodes_groups.max(1), 1, 1);
         }
@@ -1994,6 +2031,7 @@ impl GpuState {
                 timestamp_writes: None,
             });
             cpass.set_pipeline(&self.gb_scan_pipeline);
+            cpass.set_bind_group(0, &self.empty_gb_bind_group, &[]);
             cpass.set_bind_group(1, bg, &[]);
             cpass.dispatch_workgroups(1, 1, 1);
         }
@@ -2004,6 +2042,7 @@ impl GpuState {
                 timestamp_writes: None,
             });
             cpass.set_pipeline(&self.gb_scatter_pipeline);
+            cpass.set_bind_group(0, &self.empty_gb_bind_group, &[]);
             cpass.set_bind_group(1, bg, &[]);
             cpass.dispatch_workgroups(nodes_groups.max(1), 1, 1);
         }
@@ -2131,7 +2170,7 @@ impl GpuState {
         });
         cpass.set_pipeline(&self.pipeline);
         cpass.set_bind_group(0, bind_group, &[]);
-        // group(1) unused by force_step.
+        cpass.set_bind_group(1, &self.force_empty_gb_bind_group, &[]);
         cpass.set_bind_group(2, oct_bg, &[]);
         cpass.set_bind_group(3, spring_bg, &[]);
         let groups = (self.n_nodes + 63) / 64;
@@ -2174,6 +2213,7 @@ impl GpuState {
         });
         cpass.set_pipeline(&self.spring_pipeline);
         cpass.set_bind_group(0, bind_group, &[]);
+        cpass.set_bind_group(1, &self.force_empty_gb_bind_group, &[]);
         cpass.set_bind_group(2, oct_bg, &[]);
         cpass.set_bind_group(3, spring_bg, &[]);
         let groups = (self.n_virtual + 63) / 64;

@@ -287,7 +287,7 @@ async fn ensure_serving(s: &ServerState, id: &WorldId) -> Result<(), Response> {
     .with_push_trigger(rx);
     // Arm the push change driver; the initial snapshot was already built by
     // `build_world_state`, and every later tick runs a full rebuild.
-    graph_api::watcher::spawn(app_state.clone(), 0);
+    let _ = graph_api::watcher::spawn(app_state.clone(), 0);
     let compute_broker = app_state.inner.compute_broker.clone();
     let router = graph_api::api_router(app_state);
     write_worlds(s).insert(

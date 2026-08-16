@@ -42,6 +42,11 @@ pub enum CatalogSourceKind {
     Okf,
     Pest,
     GitHub,
+    /// A paged JSON API read through the declarative package engine. Like the
+    /// other remote kinds it is never constructible from chart catalog
+    /// metadata alone (the package, endpoint, and variables live in CLI
+    /// config).
+    HttpJson,
     /// Session-manager shared world; never constructible from chart catalog
     /// metadata (no filesystem source), like the other non-filesystem kinds.
     World,
@@ -57,6 +62,7 @@ impl From<SourceKind> for CatalogSourceKind {
             SourceKind::Okf => Self::Okf,
             SourceKind::Pest => Self::Pest,
             SourceKind::GitHub => Self::GitHub,
+            SourceKind::HttpJson => Self::HttpJson,
             SourceKind::World => Self::World,
         }
     }
@@ -371,7 +377,10 @@ fn validate_source(id: &str, source: &ImporterSourceDefinition) -> Result<(), St
         validate_stable_id("sourceId", source_id)?;
         if !matches!(
             source.kind,
-            CatalogSourceKind::Okf | CatalogSourceKind::Kubernetes | CatalogSourceKind::GitHub
+            CatalogSourceKind::Okf
+                | CatalogSourceKind::Kubernetes
+                | CatalogSourceKind::GitHub
+                | CatalogSourceKind::HttpJson
         ) {
             return Err(format!(
                 "source {id:?} kind {:?} must not declare sourceId",

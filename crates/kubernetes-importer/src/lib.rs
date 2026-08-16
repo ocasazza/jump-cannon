@@ -12,7 +12,7 @@ use std::collections::{BTreeMap, HashMap};
 
 use data_loader::{
     identity::Namespace, Capability, DecodedRecord, Decoder, DiscoveryField, DiscoveryFieldType,
-    EdgeTypeSchema, Effect, GraphMapper, ImportError, ImportFuture, ImportPipeline, Importer,
+    EdgeTypeSchema, Effect, GraphMapper, ImportError, ImportFuture, ImportPipeline,
     ImporterDescriptor, ImporterSchema, LoadResult, SearchDocument, SourceConnector, SourceRecord,
     TagHierarchySchema, Transport, WatchPlan,
 };
@@ -535,6 +535,7 @@ impl Decoder for JsonDecoder {
         Ok(DecodedRecord {
             origin: record.origin,
             value,
+            metadata: record.metadata,
         })
     }
 }
@@ -782,12 +783,13 @@ fn kubernetes_schema() -> ImporterSchema {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use data_loader::Importer;
     use serde_json::json;
-
     fn decoded(origin: &str, value: Value) -> DecodedRecord {
         DecodedRecord {
             origin: origin.into(),
             value,
+            metadata: Default::default(),
         }
     }
 

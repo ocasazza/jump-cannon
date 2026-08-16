@@ -40,7 +40,9 @@ graphApi:
   # importer below selects kubernetes regardless of this value. Set this to
   # okf to load an Open Knowledge Format bundle from the vault mount. Set
   # this to github to pull the knowledge corpus from a GitHub repository
-  # (see githubImporter below) instead of the vault filesystem.
+  # (see githubImporter below) instead of the vault filesystem. Set this to
+  # httpjson to read a JSON API through an importer package (see
+  # httpJsonImporter below), such as the shipped Hindsight memory bank.
   source: obsidian
   # Optional full-rescan fallback for non-OKF filesystem sources. Set this
   # above 0 when writes arrive through another pod or mount.
@@ -142,6 +144,34 @@ githubImporter:
   cacheDir: "/var/cache/jump-cannon/github"
   # Token for private mirrors comes from an existing Secret, never values:
   #   tokenSecret: { name: "jump-cannon-github", key: "token" }
+  tokenSecret:
+    name: ""
+    key: "token"
+
+# Package-driven HTTP/JSON mode, selected with graphApi.source: httpjson.
+# graph-api reads a paged JSON API according to a versioned TOML importer
+# package and publishes its documents as a graph. The package describes the API
+# shape (endpoints, pagination, and the projection into nodes and edges); this
+# block binds it to one instance. Another JSON API means another package, not
+# another source kind, flag set, or crate. The shipped example is the Hindsight
+# memory bank, whose tenant and bank are instance variables below.
+httpJsonImporter:
+  # Filename of a chart-owned package under charts/jump-cannon/packages/.
+  package: "hindsight-memory-bank.toml"
+  mountPath: /etc/jump-cannon/importer-packages
+  # Root of the API this package is bound to.
+  endpoint: "http://hindsight-api-proxy.hindsight.svc.cluster.local"
+  # Values for the variables the package declares. A required variable with no
+  # value fails the import loudly at startup rather than importing nothing.
+  variables:
+    tenant: default
+    bank: omp
+  pollIntervalSeconds: 60
+  # Optional slug namespacing node IDs; empty = the package's sanitized id.
+  sourceId: ""
+  # Bearer token for an authenticated API comes from an existing Secret, never
+  # values:
+  #   tokenSecret: { name: "jump-cannon-importer", key: "token" }
   tokenSecret:
     name: ""
     key: "token"

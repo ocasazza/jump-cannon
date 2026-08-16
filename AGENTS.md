@@ -14,7 +14,7 @@ The test harness in `crates/test-browser/` is the only exception, and only becau
 
 | Crate | Role |
 |---|---|
-| `crates/data-loader` | Source-neutral importer contracts. Every descriptor carries discovery schema version 2, and every completed import emits one validated `SearchDocument` per graph node. Defines the seven CLI source kinds (Obsidian, tvix, generate, Kubernetes, OKF, Pest, GitHub) plus `world`, which is served by the session manager rather than the standalone CLI. |
+| `crates/data-loader` | Source-neutral importer contracts. Every descriptor carries discovery schema version 2, and every completed import emits one validated `SearchDocument` per graph node. Defines the eight CLI source kinds (Obsidian, tvix, generate, Kubernetes, OKF, Pest, GitHub, httpjson) plus `world`, which is served by the session manager rather than the standalone CLI. `httpjson` ships with no built-in source: every JSON API is a declarative package under `charts/jump-cannon/packages/` (e.g. `hindsight-memory-bank.toml`), bound to an instance at runtime via `JUMP_CANNON_IMPORTER_*`. |
 | `crates/graph-api` | axum HTTP server. Loads the selected importer, serves `/graph/*`, `/graph/schema`, `/node/*id`, `/search`, `/vault/page` (Obsidian editor PUT), `/progress`, etc. Atomically swaps an in-memory `GraphSnapshot` containing the graph, importer schema, generic Tantivy search index, schema-driven facets, metrics, and binary caches. Serves the frontend dist from `--assets-dir` / `JUMP_CANNON_ASSETS_DIR`. |
 | `crates/graph-layouts` | wgpu compute force-sim. Native + WASM. Consumed in-process by `app/ui` (path dependency). |
 | `crates/graph-compute` | Optional standalone layout solver, gRPC on `[::1]:50051`. Opt-in via `--compute-url` / `JUMP_CANNON_COMPUTE_URL` — unset means the broker is never dialed. Runs through the local docker-compose development stack or the Helm chart's Kueue-admitted RayCluster. |
@@ -28,8 +28,56 @@ The test harness in `crates/test-browser/` is the only exception, and only becau
 | `crates/kubernetes-importer` | Capability-scoped, allowlisted Kubernetes metadata importer with owner-reference edges and namespace/API/label facets. |
 | `crates/pest-importer` | Trusted runtime grammar importer. Manifest format 2 requires package authors to declare the property fields admitted to search and facets. |
 | `crates/github-importer` | GitHub tarball importer. Polls codeload with ETag revalidation, extracts into a local cache, and reuses vault-links Obsidian parsing so the knowledge corpus updates push-to-main without a chart republish. |
+| `crates/http-json-importer` | Declarative HTTP/JSON importer engine. Reads paged JSON APIs and projects their documents into the canonical graph via a versioned TOML package (`ValidatedPackage`); the package is mechanism, the bank/tenant/URL is instance configuration bound at runtime. One engine serves every JSON API: there are N packages (`hindsight-memory-bank.toml`, …) and one `SourceKind::HttpJson`. Importer package format and `serde(deny_unknown_fields)` validation live in `crates/http-json-importer/src/manifest.rs`; `connect`/`paginate`/`validate_template`/`validate_pointer` enforce that every `{placeholder}` names a declared variable and every JSON pointer starts with `/`. |
 | `crates/tvix-wasm` | `tvix-eval` bridge — native + WASM Nix expression evaluator. Enables Nix expressions in the UI/data pipeline without shelling out. |
 | `crates/test-browser` | Rust-only Chromium driver (chromiumoxide) for the foundational browser regression suite. Spawned by `just test browser-rust` / `nix run .#test-browser-rust`. |
+
+## Importers: packages, not crates
+
+There can be **hundreds** of importers. There must not be hundreds of crates.
+
+Read the crate map above correctly: every importer crate in it is a
+**mechanism**, not a data source.
+
+| Crate | The mechanism it adds |
+|---|---|
+| `vault-links` | markdown + wikilink parsing |
+| `okf-importer` | one published interchange format (OKF v0.2) |
+| `kubernetes-importer` | the Kubernetes dynamic-API transport |
+| `github-importer` | the polled-tarball-over-HTTP transport |
+| `pest-importer` | the runtime grammar-package engine |
+| `http-json-importer` | paged JSON over HTTP, declared as a versioned TOML package |
+
+A *source* — this repository, that cluster, this API tenant, that memory bank —
+is configuration bound to those mechanisms at runtime. It is not new compiled
+code, and it does not get a crate.
+
+`crates/data-loader` owns the seams that make this work: `SourceConnector` (the
+only component permitted to perform I/O), `Decoder` (pure wire format),
+`GraphMapper` (pure projection into the graph IR), composed by
+`ImportPipeline`, with `Transport` already naming filesystem, http, kubernetes,
+grpc, udp, in-memory, and wasm_component. `crates/pest-importer` is the
+reference for the package model: one versioned TOML manifest carries metadata,
+parse rules, declared discovery fields, and limits, and **deliberately carries
+no data-source binding** — an administrator binds a validated package to an
+input at runtime, and its module docs call out HTTP/Kubernetes/protobuf/
+streaming adapters feeding the same package format.
+
+Before adding an importer, name what is actually new:
+
+| Genuinely new | Where it belongs |
+|---|---|
+| Another instance of a source you can already reach | catalog / package configuration — no Rust at all |
+| A wire format or mapping vocabulary | a `Decoder` / `GraphMapper` behind the existing contracts |
+| A way to *reach* bytes | one `SourceConnector`, reused by every later source on that transport |
+
+The anti-pattern is adding, per data source: a `SourceKind` variant, a
+`CatalogSourceKind` variant, a `graph-api` match arm, bespoke `--flags`, a
+chart values block, and a crate. That is O(sources) of compiled code and
+deployment surface for what is data, and it does not survive the tenth source,
+let alone the hundredth.
+
+**Worked example:** adding a new JSON API is one new TOML package, not one new crate. `charts/jump-cannon/packages/hindsight-memory-bank.toml` declares the Hindsight 0.9.1 memory-bank API as a package bound to an instance by tenant + bank, served by the shared engine — no Rust touched.
 
 ## Dioxus + Tauri app (`app/`)
 
@@ -52,10 +100,7 @@ Scope rule: the compute layer (`graph-compute`, gRPC broker, Kubernetes/Ray orch
 ## Data flow
 
 ```
-configured source (Obsidian / tvix / generate / Kubernetes / OKF / Pest / GitHub)
-       │
-       ▼
-importer ──► Graph + ImporterSchema + one SearchDocument per node
+configured source (Obsidian / tvix / generate / Kubernetes / OKF / Pest / GitHub, or an httpjson package instance)
        │
        ▼
 graph-api validates and builds one ArcSwap<GraphSnapshot>
@@ -129,6 +174,12 @@ Run `just test browser-rust` before claiming any visual change works. Don't comm
 | `GRAPH_API_NO_WATCH=1` | graph-api | unset → file watcher armed |
 | `JUMP_CANNON_IMPORTER_SWITCH_GROUP` env / `--importer-switch-group` flag | graph-api | unset → runtime importer switching disabled (rollout-only) |
 | `JUMP_CANNON_USER_GROUPS_HEADER` env / `--user-groups-header` flag | graph-api | `x-netbird-groups` (proxy-injected, comma-separated) |
+| `JUMP_CANNON_IMPORTER_MANIFEST` env / `--importer-manifest` flag | graph-api | unset → no httpjson instance bound; the named TOML package must be on disk (the chart mounts `hindsight-memory-bank.toml` under `JUMP_CANNON_IMPORTER_PACKAGES_DIR`) |
+| `JUMP_CANNON_IMPORTER_ENDPOINT` env / `--importer-endpoint` flag | graph-api | unset → no httpjson instance bound; the absolute http(s) URL of the JSON API root (e.g. `http://hindsight-api-proxy.hindsight.svc.cluster.local`) |
+| `JUMP_CANNON_IMPORTER_VAR` env / `--importer-var name=value` flag (repeatable) | graph-api | unset → package defaults apply (`tenant = default`; any required variable without a default fails the import loudly) |
+| `JUMP_CANNON_IMPORTER_TOKEN` env / `--importer-token` flag | graph-api | unset → no Authorization header sent (redacted from every log line, capability scope, and error message) |
+| `JUMP_CANNON_IMPORTER_SOURCE_ID` env / `--importer-source-id` flag | graph-api | unset → sourced from the bound instance (engine falls back to the package id); namespaced as `httpjson:{source_id}:…` |
+| `JUMP_CANNON_IMPORTER_POLL_INTERVAL_MS` env / `--importer-poll-interval-ms` flag | graph-api | `60000` (0 → static one-shot) |
 
 `.env` at the repo root is auto-loaded by the justfile (`set dotenv-load := true`).
 
