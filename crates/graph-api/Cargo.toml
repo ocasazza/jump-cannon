@@ -48,6 +48,7 @@ kubernetes-importer = { path = "../kubernetes-importer" }
 okf-importer = { path = "../okf-importer" }
 pest-importer = { path = "../pest-importer" }
 github-importer = { path = "../github-importer" }
+hindsight-importer = { path = "../hindsight-importer" }
 vault-links    = { path = "../vault-links" }
 tvix-loader    = { path = "../tvix-loader" }
 graph-layouts  = { path = "../graph-layouts" }

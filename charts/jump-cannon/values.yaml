@@ -40,7 +40,8 @@ graphApi:
   # importer below selects kubernetes regardless of this value. Set this to
   # okf to load an Open Knowledge Format bundle from the vault mount. Set
   # this to github to pull the knowledge corpus from a GitHub repository
-  # (see githubImporter below) instead of the vault filesystem.
+  # (see githubImporter below) instead of the vault filesystem. Set this to
+  # hindsight to publish one Hindsight memory bank (see hindsightImporter).
   source: obsidian
   # Optional full-rescan fallback for non-OKF filesystem sources. Set this
   # above 0 when writes arrive through another pod or mount.
@@ -142,6 +143,34 @@ githubImporter:
   cacheDir: "/var/cache/jump-cannon/github"
   # Token for private mirrors comes from an existing Secret, never values:
   #   tokenSecret: { name: "jump-cannon-github", key: "token" }
+  tokenSecret:
+    name: ""
+    key: "token"
+
+# Hindsight memory-bank mode, selected with graphApi.source: hindsight.
+# graph-api reads one bank of a Hindsight memory service over its HTTP API and
+# publishes its memory units, canonical entities, and source documents as one
+# graph: unit->unit temporal/semantic/caused_by links come from Hindsight's own
+# memory graph, plus unit->entity `mentions` and unit->document `documented_in`
+# edges. Nothing is written back — the importer is read-only.
+hindsightImporter:
+  # Root of the Hindsight HTTP API (no trailing path). In-cluster this is the
+  # api service; over NetBird it is the proxy hostname.
+  url: "http://hindsight-api-proxy.hindsight.svc.cluster.local"
+  # Tenant path segment: /v1/{tenant}/banks/...
+  tenant: "default"
+  # The bank to import. Must exist in the tenant's bank list; a mistyped bank
+  # fails the import loudly with the banks that do exist.
+  bank: "omp"
+  pollIntervalSeconds: 60
+  # Hard bound on imported memory units. A larger bank is an error, never a
+  # silent truncation.
+  maxUnits: 50000
+  # Optional slug namespacing node IDs; empty = the sanitized bank id.
+  sourceId: ""
+  # Bearer token for an authenticated Hindsight API comes from an existing
+  # Secret, never values:
+  #   tokenSecret: { name: "jump-cannon-hindsight", key: "token" }
   tokenSecret:
     name: ""
     key: "token"

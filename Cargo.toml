@@ -14,7 +14,7 @@ members = [
     "crates/kubernetes-importer",
     "crates/okf-importer",
     "crates/pest-importer",
-    "crates/github-importer",
+    "crates/hindsight-importer",
     "crates/tvix-loader",
     "crates/test-browser",
 ]

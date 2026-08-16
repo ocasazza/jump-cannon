@@ -53,7 +53,7 @@ struct Args {
     )]
     filesystem_rescan_seconds: u64,
     /// Data source: obsidian (default), tvix, generate, kubernetes, okf, pest,
-    /// or github.
+    /// github, or hindsight.
     /// Runtime Pest packages are trusted administrator-installed code; the
     /// unauthenticated HTTP API does not accept grammar uploads.
     #[arg(long, env = "JUMP_CANNON_SOURCE", default_value = "obsidian")]
@@ -121,6 +121,41 @@ struct Args {
     /// sanitized repository slug (e.g. "ocasazza-jump-cannon").
     #[arg(long, env = "JUMP_CANNON_GITHUB_SOURCE_ID")]
     github_source_id: Option<String>,
+    /// Root of the Hindsight HTTP API backing --source=hindsight, e.g.
+    /// http://hindsight-api-proxy.hindsight.svc.cluster.local.
+    #[arg(long, env = "JUMP_CANNON_HINDSIGHT_URL")]
+    hindsight_url: Option<String>,
+    /// Hindsight memory bank to import. Must exist in the tenant's bank list;
+    /// a mistyped bank fails the import with the banks that do exist.
+    #[arg(long, env = "JUMP_CANNON_HINDSIGHT_BANK", default_value = "omp")]
+    hindsight_bank: String,
+    /// Hindsight tenant path segment (`/v1/{tenant}/banks/...`).
+    #[arg(long, env = "JUMP_CANNON_HINDSIGHT_TENANT", default_value = "default")]
+    hindsight_tenant: String,
+    /// Bearer token for an authenticated Hindsight API. Prefer the env var so
+    /// the token stays out of process argument lists; it is never logged.
+    #[arg(long, env = "JUMP_CANNON_HINDSIGHT_TOKEN")]
+    hindsight_token: Option<String>,
+    /// Hindsight poll cadence in milliseconds. 0 disables polling and
+    /// advertises a static one-shot snapshot.
+    #[arg(
+        long,
+        env = "JUMP_CANNON_HINDSIGHT_POLL_INTERVAL_MS",
+        default_value_t = 60000
+    )]
+    hindsight_poll_interval_ms: u64,
+    /// Hard bound on imported memory units. A larger bank is an error, not a
+    /// silent truncation.
+    #[arg(
+        long,
+        env = "JUMP_CANNON_HINDSIGHT_MAX_UNITS",
+        default_value_t = hindsight_importer::DEFAULT_MAX_UNITS
+    )]
+    hindsight_max_units: usize,
+    /// Stable ASCII slug used to namespace Hindsight node IDs. Defaults to
+    /// the sanitized bank id (e.g. "omp").
+    #[arg(long, env = "JUMP_CANNON_HINDSIGHT_SOURCE_ID")]
+    hindsight_source_id: Option<String>,
     /// Versioned TOML package containing a runtime Pest grammar and capture map.
     /// Required by --source=pest.
     #[arg(long, env = "JUMP_CANNON_IMPORTER_MANIFEST")]
@@ -387,6 +422,30 @@ async fn main() -> anyhow::Result<()> {    let _ = dotenvy::dotenv();
                 "using GitHub importer"
             );
             Box::new(github_importer::GitHubImporter::new(config)?)
+        }
+        data_loader::SourceKind::Hindsight => {
+            let base_url = args.hindsight_url.clone().with_context(|| {
+                "--source=hindsight requires --hindsight-url / JUMP_CANNON_HINDSIGHT_URL"
+            })?;
+            let config = hindsight_importer::HindsightSourceConfig {
+                base_url,
+                tenant: args.hindsight_tenant.clone(),
+                bank: args.hindsight_bank.clone(),
+                token: args.hindsight_token.clone(),
+                poll_interval_ms: args.hindsight_poll_interval_ms,
+                source_id: args.hindsight_source_id.clone(),
+                max_units: args.hindsight_max_units,
+            };
+            // The token is deliberately absent from this log line.
+            tracing::info!(
+                source_id = %config.resolved_source_id(),
+                url = %config.base_url,
+                tenant = %config.tenant,
+                bank = %config.bank,
+                poll_interval_ms = config.poll_interval_ms,
+                "using Hindsight importer"
+            );
+            Box::new(hindsight_importer::HindsightImporter::new(config)?)
         }
     };
 

@@ -3,6 +3,7 @@
 {{- $usesFilesystem := $importer.usesFilesystem -}}
 {{- $usesKubernetes := $importer.usesKubernetes -}}
 {{- $usesGitHub := eq $importer.kind "github" -}}
+{{- $usesHindsight := eq $importer.kind "hindsight" -}}
 {{- $filesystemRescanSeconds := $importer.filesystemRescanIntervalSeconds -}}
 {{- $hasKnowledge := and $importer.allowsSeeds .Values.vault.seed.enabled .Values.vault.seed.includeKnowledgeBase -}}
 {{- $hasSeedFiles := and $importer.allowsSeeds .Values.vault.seed.enabled (gt (len .Values.vault.seed.files) 0) -}}
@@ -164,6 +165,29 @@ spec:
                 secretKeyRef:
                   name: {{ .Values.githubImporter.tokenSecret.name | quote }}
                   key: {{ .Values.githubImporter.tokenSecret.key | quote }}
+            {{- end }}
+            {{- end }}
+            {{- if $usesHindsight }}
+            - name: JUMP_CANNON_HINDSIGHT_URL
+              value: {{ .Values.hindsightImporter.url | quote }}
+            - name: JUMP_CANNON_HINDSIGHT_TENANT
+              value: {{ .Values.hindsightImporter.tenant | quote }}
+            - name: JUMP_CANNON_HINDSIGHT_BANK
+              value: {{ .Values.hindsightImporter.bank | quote }}
+            - name: JUMP_CANNON_HINDSIGHT_POLL_INTERVAL_MS
+              value: {{ mul (int .Values.hindsightImporter.pollIntervalSeconds) 1000 | quote }}
+            - name: JUMP_CANNON_HINDSIGHT_MAX_UNITS
+              value: {{ .Values.hindsightImporter.maxUnits | quote }}
+            {{- if .Values.hindsightImporter.sourceId }}
+            - name: JUMP_CANNON_HINDSIGHT_SOURCE_ID
+              value: {{ .Values.hindsightImporter.sourceId | quote }}
+            {{- end }}
+            {{- if .Values.hindsightImporter.tokenSecret.name }}
+            - name: JUMP_CANNON_HINDSIGHT_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.hindsightImporter.tokenSecret.name | quote }}
+                  key: {{ .Values.hindsightImporter.tokenSecret.key | quote }}
             {{- end }}
             {{- end }}
             {{- if $usesFilesystem }}

@@ -49,6 +49,14 @@ sync are skipped in this mode; they remain the fallback under the default
 `obsidian` source. Private mirrors take a token only through
 `githubImporter.tokenSecret`, never through values. See [[GitHub Importer]].
 
+`graphApi.source: hindsight` selects one Hindsight memory bank: graph-api polls
+`hindsightImporter.url` for the bank named by `hindsightImporter.bank` and
+publishes its memory units, entities, and documents. Like the github mode it
+mounts no vault claim and skips the seed init container, and it is read-only —
+`maxUnits` bounds the import loudly instead of truncating. An authenticated API
+takes a token only through `hindsightImporter.tokenSecret`. See
+[[Hindsight Importer]].
+
 The chart's inactive `lavender-ingest-okf` instance consumes the externally
 provisioned `lavender-okf-shared` RWX claim read-only. It mounts the repository
 at `/var/lib/lavender/okf-repository` and imports

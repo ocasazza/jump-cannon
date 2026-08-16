@@ -14,7 +14,7 @@ The test harness in `crates/test-browser/` is the only exception, and only becau
 
 | Crate | Role |
 |---|---|
-| `crates/data-loader` | Source-neutral importer contracts. Every descriptor carries discovery schema version 2, and every completed import emits one validated `SearchDocument` per graph node. Defines the seven CLI source kinds (Obsidian, tvix, generate, Kubernetes, OKF, Pest, GitHub) plus `world`, which is served by the session manager rather than the standalone CLI. |
+| `crates/data-loader` | Source-neutral importer contracts. Every descriptor carries discovery schema version 2, and every completed import emits one validated `SearchDocument` per graph node. Defines the eight CLI source kinds (Obsidian, tvix, generate, Kubernetes, OKF, Pest, GitHub, Hindsight) plus `world`, which is served by the session manager rather than the standalone CLI. |
 | `crates/graph-api` | axum HTTP server. Loads the selected importer, serves `/graph/*`, `/graph/schema`, `/node/*id`, `/search`, `/vault/page` (Obsidian editor PUT), `/progress`, etc. Atomically swaps an in-memory `GraphSnapshot` containing the graph, importer schema, generic Tantivy search index, schema-driven facets, metrics, and binary caches. Serves the frontend dist from `--assets-dir` / `JUMP_CANNON_ASSETS_DIR`. |
 | `crates/graph-layouts` | wgpu compute force-sim. Native + WASM. Consumed in-process by `app/ui` (path dependency). |
 | `crates/graph-compute` | Optional standalone layout solver, gRPC on `[::1]:50051`. Opt-in via `--compute-url` / `JUMP_CANNON_COMPUTE_URL` — unset means the broker is never dialed. Runs through the local docker-compose development stack or the Helm chart's Kueue-admitted RayCluster. |
@@ -28,6 +28,7 @@ The test harness in `crates/test-browser/` is the only exception, and only becau
 | `crates/kubernetes-importer` | Capability-scoped, allowlisted Kubernetes metadata importer with owner-reference edges and namespace/API/label facets. |
 | `crates/pest-importer` | Trusted runtime grammar importer. Manifest format 2 requires package authors to declare the property fields admitted to search and facets. |
 | `crates/github-importer` | GitHub tarball importer. Polls codeload with ETag revalidation, extracts into a local cache, and reuses vault-links Obsidian parsing so the knowledge corpus updates push-to-main without a chart republish. |
+| `crates/hindsight-importer` | Hindsight memory-bank importer. Polls one selected bank of a Hindsight HTTP API and publishes its memory units, canonical entities, and retained documents as one read-only graph (`temporal`/`semantic`/`caused_by` links verbatim, plus `mentions` and `documented_in` edges). |
 | `crates/tvix-wasm` | `tvix-eval` bridge — native + WASM Nix expression evaluator. Enables Nix expressions in the UI/data pipeline without shelling out. |
 | `crates/test-browser` | Rust-only Chromium driver (chromiumoxide) for the foundational browser regression suite. Spawned by `just test browser-rust` / `nix run .#test-browser-rust`. |
 
@@ -52,7 +53,7 @@ Scope rule: the compute layer (`graph-compute`, gRPC broker, Kubernetes/Ray orch
 ## Data flow
 
 ```
-configured source (Obsidian / tvix / generate / Kubernetes / OKF / Pest / GitHub)
+configured source (Obsidian / tvix / generate / Kubernetes / OKF / Pest / GitHub / Hindsight)
        │
        ▼
 importer ──► Graph + ImporterSchema + one SearchDocument per node
@@ -129,6 +130,11 @@ Run `just test browser-rust` before claiming any visual change works. Don't comm
 | `GRAPH_API_NO_WATCH=1` | graph-api | unset → file watcher armed |
 | `JUMP_CANNON_IMPORTER_SWITCH_GROUP` env / `--importer-switch-group` flag | graph-api | unset → runtime importer switching disabled (rollout-only) |
 | `JUMP_CANNON_USER_GROUPS_HEADER` env / `--user-groups-header` flag | graph-api | `x-netbird-groups` (proxy-injected, comma-separated) |
+| `JUMP_CANNON_HINDSIGHT_URL` env / `--hindsight-url` flag | graph-api | unset → required by `--source=hindsight` |
+| `JUMP_CANNON_HINDSIGHT_BANK` env / `--hindsight-bank` flag | graph-api | `omp` (must exist in the tenant's bank list) |
+| `JUMP_CANNON_HINDSIGHT_TENANT` env / `--hindsight-tenant` flag | graph-api | `default` |
+| `JUMP_CANNON_HINDSIGHT_POLL_INTERVAL_MS` env / `--hindsight-poll-interval-ms` flag | graph-api | `60000` (0 → static one-shot) |
+| `JUMP_CANNON_HINDSIGHT_MAX_UNITS` env / `--hindsight-max-units` flag | graph-api | `50000` (hard bound; over-bound banks fail loudly) |
 
 `.env` at the repo root is auto-loaded by the justfile (`set dotenv-load := true`).
 

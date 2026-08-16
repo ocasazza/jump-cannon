@@ -780,6 +780,9 @@ pub enum SourceKind {
     /// Import a vault corpus from a GitHub repository tarball (codeload,
     /// ETag-revalidated polling).
     GitHub,
+    /// Import one bank of a Hindsight memory service over its HTTP API
+    /// (memory units, entities, documents, and their graph).
+    Hindsight,
     /// A versioned shared world served by the session manager
     /// (`crates/session-manager`). Not a CLI-selectable source: worlds are
     /// hosted per-world by the session-manager server.
@@ -797,6 +800,7 @@ impl SourceKind {
             "okf" | "open-knowledge-format" => Some(Self::Okf),
             "pest" | "grammar" => Some(Self::Pest),
             "github" => Some(Self::GitHub),
+            "hindsight" | "memory-bank" => Some(Self::Hindsight),
             "world" => Some(Self::World),
             _ => None,
         }
@@ -805,7 +809,15 @@ impl SourceKind {
     /// All known source kinds (for help text).
     pub fn all() -> &'static [&'static str] {
         &[
-            "obsidian", "tvix", "generate", "kubernetes", "okf", "pest", "github", "world",
+            "obsidian",
+            "tvix",
+            "generate",
+            "kubernetes",
+            "okf",
+            "pest",
+            "github",
+            "hindsight",
+            "world",
         ]
     }
 }
