@@ -42,10 +42,11 @@ pub enum CatalogSourceKind {
     Okf,
     Pest,
     GitHub,
-    /// One bank of a Hindsight memory service, reached over its HTTP API;
-    /// like the other remote kinds it is never constructible from chart
-    /// catalog metadata alone (the API URL and bank live in CLI config).
-    Hindsight,
+    /// A paged JSON API read through the declarative package engine. Like the
+    /// other remote kinds it is never constructible from chart catalog
+    /// metadata alone (the package, endpoint, and variables live in CLI
+    /// config).
+    HttpJson,
     /// Session-manager shared world; never constructible from chart catalog
     /// metadata (no filesystem source), like the other non-filesystem kinds.
     World,
@@ -61,7 +62,7 @@ impl From<SourceKind> for CatalogSourceKind {
             SourceKind::Okf => Self::Okf,
             SourceKind::Pest => Self::Pest,
             SourceKind::GitHub => Self::GitHub,
-            SourceKind::Hindsight => Self::Hindsight,
+            SourceKind::HttpJson => Self::HttpJson,
             SourceKind::World => Self::World,
         }
     }
@@ -379,7 +380,7 @@ fn validate_source(id: &str, source: &ImporterSourceDefinition) -> Result<(), St
             CatalogSourceKind::Okf
                 | CatalogSourceKind::Kubernetes
                 | CatalogSourceKind::GitHub
-                | CatalogSourceKind::Hindsight
+                | CatalogSourceKind::HttpJson
         ) {
             return Err(format!(
                 "source {id:?} kind {:?} must not declare sourceId",

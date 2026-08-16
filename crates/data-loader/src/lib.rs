@@ -780,9 +780,11 @@ pub enum SourceKind {
     /// Import a vault corpus from a GitHub repository tarball (codeload,
     /// ETag-revalidated polling).
     GitHub,
-    /// Import one bank of a Hindsight memory service over its HTTP API
-    /// (memory units, entities, documents, and their graph).
-    Hindsight,
+    /// Read a paged JSON API through the declarative package engine
+    /// (`crates/http-json-importer`). One kind serves every JSON API: the
+    /// package supplies the endpoints and mapping, and instances vary by
+    /// `source_id`, exactly as Pest packages do.
+    HttpJson,
     /// A versioned shared world served by the session manager
     /// (`crates/session-manager`). Not a CLI-selectable source: worlds are
     /// hosted per-world by the session-manager server.
@@ -800,7 +802,7 @@ impl SourceKind {
             "okf" | "open-knowledge-format" => Some(Self::Okf),
             "pest" | "grammar" => Some(Self::Pest),
             "github" => Some(Self::GitHub),
-            "hindsight" | "memory-bank" => Some(Self::Hindsight),
+            "httpjson" | "http-json" => Some(Self::HttpJson),
             "world" => Some(Self::World),
             _ => None,
         }
@@ -816,7 +818,7 @@ impl SourceKind {
             "okf",
             "pest",
             "github",
-            "hindsight",
+            "httpjson",
             "world",
         ]
     }
@@ -1106,10 +1108,17 @@ pub struct SourceRecord {
 }
 
 /// Source payload after a pure decoder has interpreted its wire format.
+///
+/// The connector's acquisition [`metadata`](Self::metadata) rides through
+/// decoding unchanged: a decoder interprets bytes, it does not get to decide
+/// which query produced them. Multi-endpoint connectors depend on this to tell
+/// a mapper which collection a document came from.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DecodedRecord {
     pub origin: String,
     pub value: serde_json::Value,
+    #[serde(default)]
+    pub metadata: BTreeMap<String, serde_json::Value>,
 }
 
 /// A write requested against a source connector.
@@ -1687,6 +1696,7 @@ mod importer_tests {
             Ok(DecodedRecord {
                 origin: record.origin,
                 value: json!({ "text": text }),
+                metadata: record.metadata,
             })
         }
     }

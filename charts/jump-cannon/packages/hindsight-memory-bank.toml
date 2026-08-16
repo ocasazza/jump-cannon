@@ -1,0 +1,340 @@
+# Hindsight memory-bank package.
+#
+# Bound to one Hindsight tenant + bank by `instances.selected` (or the legacy
+# `hindsightImporter` values). The HTTP/JSON engine does the I/O, decoding, and
+# ID namespacing; this file declares what one Hindsight memory bank looks like
+# and how its records become nodes, edges, and discovery fields. No new
+# `SourceKind` variant, no new crate: AGENTS.md, "Importers: packages, not
+# crates".
+#
+# Verified against the Hindsight 0.9.1 API deployed behind
+# `http://hindsight-api-proxy.hindsight.svc.cluster.local`:
+#   GET /v1/{tenant}/banks                                -> {"banks":[{"bank_id":...}]}
+#   GET /v1/{tenant}/banks/{bank}/memories/list?state=…   -> {"items":[…],"total":N}
+#   GET /v1/{tenant}/banks/{bank}/graph?limit=           -> {"edges":[{"data":{...}}],"total_units":N}
+#   GET /v1/{tenant}/banks/{bank}/entities?limit=&offset=-> {"items":[…],"total":N}
+#   GET /v1/{tenant}/banks/{bank}/documents?limit=&offset=->{"items":[…],"total":N}
+
+format_version = 1
+
+# -----------------------------------------------------------------------------
+# Metadata
+# -----------------------------------------------------------------------------
+
+[metadata]
+id = "hindsight.memory-bank"
+name = "Hindsight memory bank"
+version = "1.0.0"
+description = "Reads one bank of a Hindsight memory service as a read-only graph: valid memory units, canonical entities, retained documents, plus the unit->unit temporal/semantic/caused_by links Hindsight's own graph serves and the unit->entity/unit->document edges derived from the unit record."
+
+# -----------------------------------------------------------------------------
+# Variables (bound by an administrator at instance time, never baked in)
+# -----------------------------------------------------------------------------
+
+[[variables]]
+name = "tenant"
+default = "default"
+description = "Tenant path segment: /v1/{tenant}/banks/..."
+
+[[variables]]
+name = "bank"
+description = "The memory bank to import. Must exist in /v1/{tenant}/banks; a mistyped bank fails the import loudly with the banks that do."
+
+# -----------------------------------------------------------------------------
+# Preflight (existence check on the bound bank)
+# -----------------------------------------------------------------------------
+
+[preflight]
+path = "/v1/{tenant}/banks"
+items_pointer = "/banks"
+id_pointer = "/bank_id"
+variable = "bank"
+subject = "bank"
+
+# =============================================================================
+# Collections
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# memories: valid memory units (state=valid). State filter is the API-side
+# `query`, repeated client-side in `skip_unless` so an older API ignoring
+# `state=` still drops invalidated units.
+# -----------------------------------------------------------------------------
+
+[[collections]]
+name = "memories"
+path = "/v1/{tenant}/banks/{bank}/memories/list"
+query = { state = "valid" }
+paginate = { style = "limit_offset" }
+
+[collections.nodes]
+id_pointer = "/id"
+node_type = "memory"
+tags_pointer = "/tags"
+skip_unless = { pointer = "/state", equals = "valid" }
+
+[collections.nodes.title]
+pointer = "/text"
+fallback_prefix = "memory"
+
+[[collections.nodes.fields]]
+key = "body"
+pointer = "/text"
+
+[[collections.nodes.fields]]
+key = "context"
+pointer = "/context"
+
+[[collections.nodes.fields]]
+key = "entities"
+pointer = "/entities"
+transform = "split_csv"
+
+[[collections.nodes.fields]]
+key = "fact_type"
+pointer = "/fact_type"
+
+[[collections.nodes.fields]]
+key = "state"
+pointer = "/state"
+
+[[collections.nodes.fields]]
+key = "document_id"
+pointer = "/document_id"
+
+[[collections.nodes.fields]]
+key = "session_id"
+pointer = "/metadata/session_id"
+
+[[collections.nodes.fields]]
+key = "mentioned_at"
+pointer = "/mentioned_at"
+
+[[collections.nodes.fields]]
+key = "proof_count"
+pointer = "/proof_count"
+
+# mentions: each unit -> each canonical entity named in /entities (CSV split).
+# The bipartite mentions edges carry the same adjacency as Hindsight's own
+# `entity` links, which we deliberately drop in the `links` collection below.
+[[collections.nodes.edges]]
+kind = "mentions"
+value_pointer = "/entities"
+transform = "split_csv"
+target_collection = "entities"
+match_on = "title"
+
+# documented_in: each unit -> the source document retained against.
+[[collections.nodes.edges]]
+kind = "documented_in"
+value_pointer = "/document_id"
+target_collection = "documents"
+match_on = "id"
+
+# -----------------------------------------------------------------------------
+# entities: canonical entities Hindsight has surfaced across the bank.
+# -----------------------------------------------------------------------------
+
+[[collections]]
+name = "entities"
+path = "/v1/{tenant}/banks/{bank}/entities"
+paginate = { style = "limit_offset" }
+
+[collections.nodes]
+id_pointer = "/id"
+local_prefix = "entity:"
+node_type = "entity"
+
+[collections.nodes.title]
+pointer = "/canonical_name"
+fallback_prefix = "entity"
+
+[[collections.nodes.fields]]
+key = "mention_count"
+pointer = "/mention_count"
+
+# -----------------------------------------------------------------------------
+# documents: retained documents the units were consolidated from. Title is the
+# session id when present (so sessions form a facet) else the document id.
+# -----------------------------------------------------------------------------
+
+[[collections]]
+name = "documents"
+path = "/v1/{tenant}/banks/{bank}/documents"
+paginate = { style = "limit_offset" }
+
+[collections.nodes]
+id_pointer = "/id"
+local_prefix = "document:"
+node_type = "document"
+tags_pointer = "/tags"
+
+[collections.nodes.title]
+pointer = "/retain_params/metadata/session_id"
+fallback_prefix = "document"
+
+[[collections.nodes.fields]]
+key = "memory_count"
+pointer = "/memory_unit_count"
+
+[[collections.nodes.fields]]
+key = "session_id"
+pointer = "/retain_params/metadata/session_id"
+
+[[collections.nodes.fields]]
+key = "body"
+pointer = "/retain_params/context"
+
+# -----------------------------------------------------------------------------
+# links: unit->unit edges from Hindsight's own memory graph. We import
+# temporal/semantic/caused_by verbatim and drop the `entity` link kind
+# (matches-by-shared-entity); the bipartite `mentions` edges above express it.
+# -----------------------------------------------------------------------------
+
+[[collections]]
+name = "links"
+path = "/v1/{tenant}/banks/{bank}/graph"
+items_pointer = "/edges"
+total_pointer = "/total_units"
+
+[collections.edges]
+source_pointer = "/data/source"
+target_pointer = "/data/target"
+kind_pointer = "/data/linkType"
+include_kinds = ["temporal", "semantic", "caused_by"]
+endpoints_collection = "memories"
+drop_self_loops = true
+dedupe = "unordered"
+
+# =============================================================================
+# Discovery schema (package-declared fields and edge types)
+# =============================================================================
+# `id`, `title`, `tags`, `path`, `type`, `folder` are supplied by the engine.
+# The package declares only what is added; each `FieldRule.key` below names
+# one of these.
+
+[[schema.fields]]
+key = "body"
+field_type = "text"
+required = false
+searchable = true
+facetable = false
+snippet = true
+boost = 4
+
+[[schema.fields]]
+key = "context"
+field_type = "text"
+required = false
+searchable = true
+facetable = false
+boost = 2
+
+# Entities come from Hindsight as a single CSV string ("tofu, Hydra"); the
+# split_csv transform produces the list values actually indexed.
+[[schema.fields]]
+key = "entities"
+field_type = "keyword_list"
+required = false
+searchable = true
+facetable = true
+boost = 2
+
+[[schema.fields]]
+key = "fact_type"
+field_type = "keyword"
+required = false
+searchable = true
+facetable = true
+
+[[schema.fields]]
+key = "state"
+field_type = "keyword"
+required = false
+searchable = true
+facetable = true
+
+[[schema.fields]]
+key = "document_id"
+field_type = "keyword"
+required = false
+searchable = true
+facetable = false
+boost = 2
+
+[[schema.fields]]
+key = "session_id"
+field_type = "keyword"
+required = false
+searchable = true
+facetable = true
+boost = 2
+
+[[schema.fields]]
+key = "mentioned_at"
+field_type = "date"
+required = false
+searchable = true
+facetable = true
+
+[[schema.fields]]
+key = "proof_count"
+field_type = "number"
+required = false
+searchable = true
+facetable = true
+
+[[schema.fields]]
+key = "mention_count"
+field_type = "number"
+required = false
+searchable = true
+facetable = true
+
+[[schema.fields]]
+key = "memory_count"
+field_type = "number"
+required = false
+searchable = true
+facetable = true
+
+# Edge types. `mentions`/`documented_in` are derived from each memory unit;
+# `temporal`/`semantic`/`caused_by` come from Hindsight's own graph. The
+# bipartite `mentions` edges mean `semantic` relations between units (the
+# `entity` Hindsight link kind, which we drop in the `links` collection) flow
+# through the entity node undirected.
+[[schema.edge_types]]
+key = "temporal"
+directed = true
+description = "Hindsight unit->unit temporal ordering."
+
+[[schema.edge_types]]
+key = "semantic"
+directed = false
+description = "Hindsight unit<->unit semantic similarity (undirected)."
+
+[[schema.edge_types]]
+key = "caused_by"
+directed = true
+description = "Hindsight unit->unit causal relation."
+
+[[schema.edge_types]]
+key = "mentions"
+directed = true
+description = "Memory unit -> canonical entity named in its /entities (CSV split)."
+
+[[schema.edge_types]]
+key = "documented_in"
+directed = true
+description = "Memory unit -> retained document it was consolidated from."
+
+# =============================================================================
+# Limits
+# =============================================================================
+# `request_timeout_seconds = 120` covers the ~24s observed for the largest graph
+# query (381 units) with room for retries. `max_records = 50000` is the loud
+# hard bound; an over-bound bank fails the import rather than truncating.
+
+[limits]
+request_timeout_seconds = 120
+max_records = 50000

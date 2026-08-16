@@ -3,7 +3,7 @@
 {{- $usesFilesystem := $importer.usesFilesystem -}}
 {{- $usesKubernetes := $importer.usesKubernetes -}}
 {{- $usesGitHub := eq $importer.kind "github" -}}
-{{- $usesHindsight := eq $importer.kind "hindsight" -}}
+{{- $usesHttpJson := eq $importer.kind "httpjson" -}}
 {{- $filesystemRescanSeconds := $importer.filesystemRescanIntervalSeconds -}}
 {{- $hasKnowledge := and $importer.allowsSeeds .Values.vault.seed.enabled .Values.vault.seed.includeKnowledgeBase -}}
 {{- $hasSeedFiles := and $importer.allowsSeeds .Values.vault.seed.enabled (gt (len .Values.vault.seed.files) 0) -}}
@@ -167,27 +167,27 @@ spec:
                   key: {{ .Values.githubImporter.tokenSecret.key | quote }}
             {{- end }}
             {{- end }}
-            {{- if $usesHindsight }}
-            - name: JUMP_CANNON_HINDSIGHT_URL
-              value: {{ .Values.hindsightImporter.url | quote }}
-            - name: JUMP_CANNON_HINDSIGHT_TENANT
-              value: {{ .Values.hindsightImporter.tenant | quote }}
-            - name: JUMP_CANNON_HINDSIGHT_BANK
-              value: {{ .Values.hindsightImporter.bank | quote }}
-            - name: JUMP_CANNON_HINDSIGHT_POLL_INTERVAL_MS
-              value: {{ mul (int .Values.hindsightImporter.pollIntervalSeconds) 1000 | quote }}
-            - name: JUMP_CANNON_HINDSIGHT_MAX_UNITS
-              value: {{ .Values.hindsightImporter.maxUnits | quote }}
-            {{- if .Values.hindsightImporter.sourceId }}
-            - name: JUMP_CANNON_HINDSIGHT_SOURCE_ID
-              value: {{ .Values.hindsightImporter.sourceId | quote }}
+            {{- if $usesHttpJson }}
+            - name: JUMP_CANNON_IMPORTER_MANIFEST
+              value: {{ printf "%s/%s" .Values.httpJsonImporter.mountPath .Values.httpJsonImporter.package | quote }}
+            - name: JUMP_CANNON_IMPORTER_ENDPOINT
+              value: {{ .Values.httpJsonImporter.endpoint | quote }}
+            {{- if .Values.httpJsonImporter.variables }}
+            - name: JUMP_CANNON_IMPORTER_VARS
+              value: {{ include "jump-cannon.importerVars" . | quote }}
             {{- end }}
-            {{- if .Values.hindsightImporter.tokenSecret.name }}
-            - name: JUMP_CANNON_HINDSIGHT_TOKEN
+            - name: JUMP_CANNON_IMPORTER_POLL_INTERVAL_MS
+              value: {{ mul (int .Values.httpJsonImporter.pollIntervalSeconds) 1000 | quote }}
+            {{- if .Values.httpJsonImporter.sourceId }}
+            - name: JUMP_CANNON_IMPORTER_SOURCE_ID
+              value: {{ .Values.httpJsonImporter.sourceId | quote }}
+            {{- end }}
+            {{- if .Values.httpJsonImporter.tokenSecret.name }}
+            - name: JUMP_CANNON_IMPORTER_TOKEN
               valueFrom:
                 secretKeyRef:
-                  name: {{ .Values.hindsightImporter.tokenSecret.name | quote }}
-                  key: {{ .Values.hindsightImporter.tokenSecret.key | quote }}
+                  name: {{ .Values.httpJsonImporter.tokenSecret.name | quote }}
+                  key: {{ .Values.httpJsonImporter.tokenSecret.key | quote }}
             {{- end }}
             {{- end }}
             {{- if $usesFilesystem }}
@@ -233,7 +233,7 @@ spec:
             {{- toYaml .Values.graphApi.resources | nindent 12 }}
           securityContext:
             {{- toYaml .Values.containerSecurityContext | nindent 12 }}
-          {{- if or $usesFilesystem $usesKubernetes $usesGitHub $gpuSession $dormantSources }}
+          {{- if or $usesFilesystem $usesKubernetes $usesGitHub $usesHttpJson $gpuSession $dormantSources }}
           volumeMounts:
             {{- if $usesFilesystem }}
             - name: {{ $importer.volumeName }}
@@ -250,6 +250,11 @@ spec:
             {{- if $usesGitHub }}
             - name: github-importer-cache
               mountPath: {{ .Values.githubImporter.cacheDir | quote }}
+            {{- end }}
+            {{- if $usesHttpJson }}
+            - name: importer-packages
+              mountPath: {{ .Values.httpJsonImporter.mountPath | quote }}
+              readOnly: true
             {{- end }}
             {{- if $usesKubernetes }}
             - name: kubernetes-importer-config
@@ -268,11 +273,16 @@ spec:
               readOnly: true
             {{- end }}
           {{- end }}
-      {{- if or $usesFilesystem $usesKubernetes $usesGitHub $gpuSession $dormantSources }}
+      {{- if or $usesFilesystem $usesKubernetes $usesGitHub $usesHttpJson $gpuSession $dormantSources }}
       volumes:
         {{- if $usesGitHub }}
         - name: github-importer-cache
           emptyDir: {}
+        {{- end }}
+        {{- if $usesHttpJson }}
+        - name: importer-packages
+          configMap:
+            name: {{ include "jump-cannon.fullname" . }}-importer-packages
         {{- end }}
         {{- range $dormant := $dormantSources }}
         - name: {{ $dormant.volumeName }}

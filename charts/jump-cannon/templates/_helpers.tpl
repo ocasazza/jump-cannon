@@ -487,3 +487,16 @@ and source.mountPath are guaranteed present for OKF profiles.
 {{- define "jump-cannon.testImage" -}}
 {{- printf "%s:%s" .Values.tests.image.repository .Values.tests.image.tag -}}
 {{- end -}}
+
+{{/*
+Render httpJsonImporter.variables as the comma-separated name=value list
+graph-api's --importer-var / JUMP_CANNON_IMPORTER_VARS accepts. Keys are sorted
+so the rendered Deployment is stable across upgrades.
+*/}}
+{{- define "jump-cannon.importerVars" -}}
+{{- $pairs := list -}}
+{{- range $name, $value := .Values.httpJsonImporter.variables -}}
+{{- $pairs = append $pairs (printf "%s=%v" $name $value) -}}
+{{- end -}}
+{{- join "," $pairs -}}
+{{- end -}}

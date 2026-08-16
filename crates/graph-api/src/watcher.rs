@@ -42,11 +42,12 @@ use data_loader::{Effect, HostedImporter, ImporterDescriptor, Transport, WatchPl
 use crate::state::{AppState, GraphSnapshot, SnapshotSource};
 
 /// Spawn the filesystem watcher + reload task. Returns immediately; the
-/// watcher and reload loop run for the lifetime of the process.
+/// watcher and reload loop run for the lifetime of the process, unless the
+/// caller aborts the returned handle (used to evict idle alternate sources).
 ///
 /// `state` is the live `AppState`; the watcher swaps new snapshots into
 /// it under `state.inner.snapshot`.
-pub fn spawn(state: AppState, filesystem_rescan_seconds: u64) {
+pub fn spawn(state: AppState, filesystem_rescan_seconds: u64) -> Option<tokio::task::JoinHandle<()>> {
     let descriptor = state.inner.importer.descriptor();
     if !watch_is_authorized(&state.inner.importer, &descriptor) {
         let message = format!(
@@ -55,11 +56,12 @@ pub fn spawn(state: AppState, filesystem_rescan_seconds: u64) {
         );
         state.inner.progress.warn("watch", &message);
         tracing::warn!(importer = %descriptor.id, "{message}");
-        return;
+        return None;
     }
     match descriptor.watch {
         WatchPlan::Static => {
             tracing::info!(importer = %descriptor.id, "importer is static; change driver disabled");
+            None
         }
         WatchPlan::Filesystem { root } => {
             let obsidian_conventions = descriptor.id == "obsidian";
@@ -70,9 +72,9 @@ pub fn spawn(state: AppState, filesystem_rescan_seconds: u64) {
                 markdown_only,
                 obsidian_conventions,
                 filesystem_rescan_seconds,
-            );
+            )
         }
-        WatchPlan::Poll { interval_ms } => spawn_poll(state, interval_ms),
+        WatchPlan::Poll { interval_ms } => Some(spawn_poll(state, interval_ms)),
         WatchPlan::Push => spawn_push(state),
     }
 }
@@ -81,7 +83,7 @@ pub fn spawn(state: AppState, filesystem_rescan_seconds: u64) {
 /// [`AppState::with_push_trigger`] runs one full snapshot rebuild. Without a
 /// wired trigger the driver stays disabled, matching the historical
 /// warn-and-continue behavior for push sources.
-fn spawn_push(state: AppState) {
+fn spawn_push(state: AppState) -> Option<tokio::task::JoinHandle<()>> {
     let Some(mut trigger) = state.inner.push_trigger.clone() else {
         let message = format!(
             "{} requests push changes, but no push trigger is wired; change driver disabled",
@@ -89,7 +91,7 @@ fn spawn_push(state: AppState) {
         );
         state.inner.progress.warn("watch", &message);
         tracing::warn!(importer = %state.inner.importer.descriptor().id, "{message}");
-        return;
+        return None;
     };
     state.inner.progress.info(
         "watch",
@@ -98,11 +100,11 @@ fn spawn_push(state: AppState) {
             state.inner.importer.descriptor().id
         ),
     );
-    tokio::spawn(async move {
+    Some(tokio::spawn(async move {
         while trigger.changed().await.is_ok() {
             reload(&state).await;
         }
-    });
+    }))
 }
 
 fn watch_is_authorized(importer: &HostedImporter, descriptor: &ImporterDescriptor) -> bool {
@@ -130,7 +132,7 @@ fn watch_is_authorized(importer: &HostedImporter, descriptor: &ImporterDescripto
     }
 }
 
-fn spawn_poll(state: AppState, interval_ms: u64) {
+fn spawn_poll(state: AppState, interval_ms: u64) -> tokio::task::JoinHandle<()> {
     let interval_ms = interval_ms.max(100);
     let progress = state.inner.progress.clone();
     progress.info("watch", format!("polling importer every {interval_ms} ms"));
@@ -141,7 +143,7 @@ fn spawn_poll(state: AppState, interval_ms: u64) {
             interval.tick().await;
             reload(&state).await;
         }
-    });
+    })
 }
 
 fn polling_interval(interval_ms: u64) -> tokio::time::Interval {
@@ -182,7 +184,7 @@ fn spawn_filesystem(
     markdown_only: bool,
     obsidian_conventions: bool,
     filesystem_rescan_seconds: u64,
-) {
+) -> Option<tokio::task::JoinHandle<()>> {
     let progress = state.inner.progress.clone();
 
     // Reload signal channel. The notify callback runs on the notify
@@ -257,7 +259,7 @@ fn spawn_filesystem(
             "watch",
             "filesystem notifications unavailable and periodic rescan disabled",
         );
-        return;
+        return None;
     } else {
         progress.warn(
             "watch",
@@ -278,7 +280,7 @@ fn spawn_filesystem(
     // Move the optional debouncer into the background task so it lives as long
     // as the task does (dropping it stops the watch). Notification-driven and
     // timer-driven reloads share this task, so they cannot run concurrently.
-    tokio::spawn(async move {
+    Some(tokio::spawn(async move {
         let _debouncer = debouncer; // keep alive
         let mut notifications_enabled = notifications_enabled;
         let mut rescan_interval = filesystem_rescan_interval(filesystem_rescan_seconds);
@@ -316,7 +318,7 @@ fn spawn_filesystem(
                 }
             }
         }
-    });
+    }))
 }
 
 /// Run one reload with a known set of changed paths. The current vertical

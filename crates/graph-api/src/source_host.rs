@@ -18,7 +18,8 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::sync::{Arc, RwLock, RwLockWriteGuard};
+use std::time::{Duration, Instant};
 
 use axum::extract::FromRequestParts;
 use axum::http::request::Parts;
@@ -155,19 +156,56 @@ pub struct ResolvedSource {
 }
 
 enum AlternateSource {
-    Serving(AppState),
+    Serving {
+        state: AppState,
+        /// Background rescan task for this alternate; aborted on eviction.
+        watcher: Option<tokio::task::JoinHandle<()>>,
+    },
     /// Cached build failure: surfaced as 503 without re-attempting the build
-    /// on every request. A cached entry lives until process restart.
+    /// on every request. Evicted on the same idle TTL as a serving entry.
     Failed(String),
 }
+
+/// One entry in the alternates map: its state plus the last time a request
+/// resolved to it, driving idle eviction.
+struct AlternateEntry {
+    source: AlternateSource,
+    last_used: Instant,
+}
+
+/// How long a lazily-built alternate stays resident — and its background
+/// rescan watcher keeps running — without being requested again. Without
+/// this, one past request to an expensive alternate (e.g. a large corpus on
+/// a short `filesystemRescanIntervalSeconds`) pins a second full graph/search
+/// rebuild loop in memory for the life of the process.
+const ALTERNATE_IDLE_TTL: Duration = Duration::from_secs(15 * 60);
+/// How often the idle sweep runs.
+const ALTERNATE_EVICTION_INTERVAL: Duration = Duration::from_secs(60);
 
 struct SourceHostInner {
     default: AppState,
     catalog: ImporterCatalog,
     switch: SwitchConfig,
-    alternates: RwLock<HashMap<String, AlternateSource>>,
+    alternates: RwLock<HashMap<String, AlternateEntry>>,
     /// Serializes lazy builds so a concurrent burst builds one alternate once.
     build_lock: tokio::sync::Mutex<()>,
+    idle_ttl: Duration,
+    eviction_interval: Duration,
+}
+
+/// Idle detection: ids whose entry hasn't been used since `now - idle_ttl`.
+/// Pure and side-effect-free so the exact selection logic is unit-testable
+/// without a real `AppState` or waiting on real timers.
+fn expired_alternate_ids(
+    alternates: &HashMap<String, AlternateEntry>,
+    now: Instant,
+    idle_ttl: Duration,
+) -> Vec<String> {
+    alternates
+        .iter()
+        .filter(|(_, entry)| now.duration_since(entry.last_used) >= idle_ttl)
+        .map(|(id, _)| id.clone())
+        .collect()
 }
 
 /// Cloneable handle owning the default serving state plus lazily-built
@@ -179,15 +217,73 @@ pub struct SourceHost {
 
 impl SourceHost {
     pub fn new(default: AppState, switch: SwitchConfig) -> Self {
-        Self {
+        Self::with_ttl(default, switch, ALTERNATE_IDLE_TTL, ALTERNATE_EVICTION_INTERVAL)
+    }
+
+    /// Like [`Self::new`] with an overridable idle TTL and sweep interval —
+    /// exercised by tests so eviction doesn't require a real 15-minute wait.
+    pub fn with_ttl(
+        default: AppState,
+        switch: SwitchConfig,
+        idle_ttl: Duration,
+        eviction_interval: Duration,
+    ) -> Self {
+        let host = Self {
             inner: Arc::new(SourceHostInner {
                 catalog: default.inner.importer_catalog.clone(),
                 default,
                 switch,
                 alternates: RwLock::new(HashMap::new()),
                 build_lock: tokio::sync::Mutex::new(()),
+                idle_ttl,
+                eviction_interval,
             }),
+        };
+        if host.inner.switch.enabled() {
+            host.spawn_eviction_sweep();
         }
+        host
+    }
+
+    /// Periodically evicts alternates idle longer than `ALTERNATE_IDLE_TTL`,
+    /// aborting each evicted entry's background rescan watcher. Without this
+    /// an alternate built by a single past request would rescan and rebuild
+    /// its full graph/search index forever, alongside the default source.
+    fn spawn_eviction_sweep(&self) {
+        let inner = Arc::clone(&self.inner);
+        let idle_ttl = inner.idle_ttl;
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(inner.eviction_interval);
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                interval.tick().await;
+                let expired: Vec<(String, Option<tokio::task::JoinHandle<()>>)> = {
+                    let mut alternates = inner
+                        .alternates
+                        .write()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    let expired_ids = expired_alternate_ids(&alternates, Instant::now(), idle_ttl);
+                    expired_ids
+                        .into_iter()
+                        .filter_map(|id| {
+                            alternates.remove(&id).map(|entry| {
+                                let watcher = match entry.source {
+                                    AlternateSource::Serving { watcher, .. } => watcher,
+                                    AlternateSource::Failed(_) => None,
+                                };
+                                (id, watcher)
+                            })
+                        })
+                        .collect()
+                };
+                for (source_id, watcher) in expired {
+                    if let Some(handle) = watcher {
+                        handle.abort();
+                    }
+                    tracing::info!(source = %source_id, "evicted idle alternate importer source");
+                }
+            }
+        });
     }
 
     /// A host with switching disabled: every request serves the default.
@@ -255,20 +351,15 @@ impl SourceHost {
 
     /// Build (or fetch) the serving state for one runnable alternate source,
     /// mirroring session-manager's `ensure_serving`. The first authorized
-    /// request pays the import cost; failures are cached and replayed as 503.
+    /// request pays the import cost; failures are cached and replayed as 503
+    /// until the entry's idle TTL evicts it (see `spawn_eviction_sweep`).
     async fn ensure_serving(&self, source_id: &str) -> Result<AppState, String> {
-        if let Some(entry) = self.read_alternates().get(source_id) {
-            return match entry {
-                AlternateSource::Serving(state) => Ok(state.clone()),
-                AlternateSource::Failed(message) => Err(message.clone()),
-            };
+        if let Some(result) = self.touch_alternate(source_id) {
+            return result;
         }
         let _guard = self.inner.build_lock.lock().await;
-        if let Some(entry) = self.read_alternates().get(source_id) {
-            return match entry {
-                AlternateSource::Serving(state) => Ok(state.clone()),
-                AlternateSource::Failed(message) => Err(message.clone()),
-            };
+        if let Some(result) = self.touch_alternate(source_id) {
+            return result;
         }
         let definition = self
             .inner
@@ -277,11 +368,17 @@ impl SourceHost {
             .expect("ensure_serving is only called for known sources")
             .clone();
         match build_alternate(source_id, &definition).await {
-            Ok(state) => {
+            Ok((state, watcher)) => {
                 tracing::info!(source = source_id, "alternate importer source serving");
                 self.write_alternates().insert(
                     source_id.to_owned(),
-                    AlternateSource::Serving(state.clone()),
+                    AlternateEntry {
+                        source: AlternateSource::Serving {
+                            state: state.clone(),
+                            watcher,
+                        },
+                        last_used: Instant::now(),
+                    },
                 );
                 Ok(state)
             }
@@ -289,21 +386,29 @@ impl SourceHost {
                 tracing::warn!(source = source_id, error = %message, "alternate source build failed");
                 self.write_alternates().insert(
                     source_id.to_owned(),
-                    AlternateSource::Failed(message.clone()),
+                    AlternateEntry {
+                        source: AlternateSource::Failed(message.clone()),
+                        last_used: Instant::now(),
+                    },
                 );
                 Err(message)
             }
         }
     }
 
-    fn read_alternates(&self) -> RwLockReadGuard<'_, HashMap<String, AlternateSource>> {
-        self.inner
-            .alternates
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    /// Bumps an existing entry's last-used time and returns its cached
+    /// result, or `None` if no entry exists yet.
+    fn touch_alternate(&self, source_id: &str) -> Option<Result<AppState, String>> {
+        let mut alternates = self.write_alternates();
+        let entry = alternates.get_mut(source_id)?;
+        entry.last_used = Instant::now();
+        Some(match &entry.source {
+            AlternateSource::Serving { state, .. } => Ok(state.clone()),
+            AlternateSource::Failed(message) => Err(message.clone()),
+        })
     }
 
-    fn write_alternates(&self) -> RwLockWriteGuard<'_, HashMap<String, AlternateSource>> {
+    fn write_alternates(&self) -> RwLockWriteGuard<'_, HashMap<String, AlternateEntry>> {
         self.inner
             .alternates
             .write()
@@ -311,14 +416,16 @@ impl SourceHost {
     }
 }
 
-/// Construct one alternate serving state from its catalog entry. Runnable
-/// kinds are exactly the filesystem kinds constructible from catalog metadata:
-/// OKF needs only root + sourceId, Obsidian only a root. The entry's declared
-/// rescan interval drives its periodic full rescan (0 = notifications only).
+/// Construct one alternate serving state from its catalog entry, plus its
+/// background rescan watcher handle (if any), so the caller can abort it on
+/// eviction. Runnable kinds are exactly the filesystem kinds constructible
+/// from catalog metadata: OKF needs only root + sourceId, Obsidian only a
+/// root. The entry's declared rescan interval drives its periodic full
+/// rescan (0 = notifications only).
 async fn build_alternate(
     source_id: &str,
     definition: &crate::importer_catalog::ImporterSourceDefinition,
-) -> Result<AppState, String> {
+) -> Result<(AppState, Option<tokio::task::JoinHandle<()>>), String> {
     let filesystem = definition
         .source
         .as_ref()
@@ -350,11 +457,11 @@ async fn build_alternate(
     let state = crate::build_world_state(importer, grants, root, progress)
         .await
         .map_err(|error| format!("import alternate source {source_id:?}: {error}"))?;
-    crate::watcher::spawn(
+    let watcher = crate::watcher::spawn(
         state.clone(),
         definition.filesystem_rescan_interval_seconds.unwrap_or(0),
     );
-    Ok(state)
+    Ok((state, watcher))
 }
 
 /// Extract the requested source id: the header first, then the `source` query
@@ -420,5 +527,64 @@ impl FromRequestParts<SourceHost> for DefaultSource {
                 .into_response());
         }
         Ok(Self(resolved.state))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `Failed` entries need no `AppState`, so the idle-detection predicate
+    /// can be exercised directly without spinning up a real importer —
+    /// this is the exact selection logic that was missing before the fix,
+    /// which pinned every lazily-built alternate in memory forever.
+    fn entry(idle_for: Duration) -> AlternateEntry {
+        AlternateEntry {
+            source: AlternateSource::Failed("unused".to_owned()),
+            last_used: Instant::now() - idle_for,
+        }
+    }
+
+    #[test]
+    fn expired_alternate_ids_selects_only_entries_past_the_ttl() {
+        let ttl = Duration::from_secs(60);
+        let mut alternates = HashMap::new();
+        alternates.insert("idle".to_owned(), entry(Duration::from_secs(120)));
+        alternates.insert("fresh".to_owned(), entry(Duration::from_secs(1)));
+        alternates.insert("at-boundary".to_owned(), entry(ttl));
+
+        let mut expired = expired_alternate_ids(&alternates, Instant::now(), ttl);
+        expired.sort();
+
+        assert_eq!(
+            expired,
+            vec!["at-boundary".to_owned(), "idle".to_owned()],
+            "only entries idle for at least the TTL are selected for eviction"
+        );
+    }
+
+    #[test]
+    fn expired_alternate_ids_is_empty_when_nothing_is_idle() {
+        let ttl = Duration::from_secs(60);
+        let mut alternates = HashMap::new();
+        alternates.insert("fresh-a".to_owned(), entry(Duration::ZERO));
+        alternates.insert("fresh-b".to_owned(), entry(Duration::from_secs(59)));
+
+        assert!(expired_alternate_ids(&alternates, Instant::now(), ttl).is_empty());
+    }
+
+    /// A request between build and the next sweep must observe its own
+    /// build immediately, not the pre-insert idle state — this is what
+    /// `ensure_serving` relies on via `touch_alternate`.
+    #[test]
+    fn touching_an_entry_resets_its_idle_clock() {
+        let mut alternates = HashMap::new();
+        alternates.insert("alt".to_owned(), entry(Duration::from_secs(120)));
+
+        if let Some(entry) = alternates.get_mut("alt") {
+            entry.last_used = Instant::now();
+        }
+
+        assert!(expired_alternate_ids(&alternates, Instant::now(), Duration::from_secs(60)).is_empty());
     }
 }

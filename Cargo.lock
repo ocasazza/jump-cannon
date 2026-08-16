@@ -1464,7 +1464,7 @@ dependencies = [
  "graph-compute",
  "graph-layouts",
  "graph-metrics",
- "hindsight-importer",
+ "http-json-importer",
  "k8s-openapi",
  "kube",
  "kubernetes-importer",
@@ -1677,20 +1677,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dfa686283ad6dd069f105e5ab091b04c62850d3e4cf5d67debad1933f55023df"
 
 [[package]]
-name = "hindsight-importer"
-version = "1.0.0"
-dependencies = [
- "data-loader",
- "parking_lot",
- "reqwest 0.12.28",
- "serde",
- "serde_json",
- "tokio",
- "tracing",
- "vault-data",
-]
-
-[[package]]
 name = "htmlescape"
 version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1727,6 +1713,21 @@ dependencies = [
  "http",
  "http-body",
  "pin-project-lite",
+]
+
+[[package]]
+name = "http-json-importer"
+version = "1.0.0"
+dependencies = [
+ "data-loader",
+ "parking_lot",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "tokio",
+ "toml 0.8.23",
+ "tracing",
+ "vault-data",
 ]
 
 [[package]]

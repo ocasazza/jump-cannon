@@ -1,8 +1,8 @@
 [package]
-name = "hindsight-importer"
+name = "http-json-importer"
 version = "1.0.0"
 edition = "2021"
-description = "Hindsight memory-bank importer: polls one bank of a Hindsight HTTP API (memory units, entities, documents, and their graph)"
+description = "Declarative HTTP/JSON importer engine: reads paged JSON APIs into the canonical graph from a versioned TOML package"
 
 [dependencies]
 vault-data  = { path = "../vault-data" }
@@ -10,8 +10,9 @@ data-loader = { path = "../data-loader" }
 reqwest     = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 serde       = { workspace = true }
 serde_json  = { workspace = true }
+toml        = "0.8"
 tracing     = "0.1"
-parking_lot = "0.12"
 
 [dev-dependencies]
-tokio = { workspace = true }
+tokio       = { workspace = true }
+parking_lot = "0.12"

@@ -11,12 +11,14 @@ tags: [jump-cannon, importer]
 Importers acquire records, map them into a graph and discovery documents, and
 publish one complete revision. The eight server source kinds are Obsidian,
 tvix, generate, Kubernetes, OKF, a trusted administrator-installed Pest
-package, GitHub, and Hindsight. GitHub delivers a repository tarball over HTTP
-with ETag polling and reuses the Obsidian markdown pipeline; see
-[[GitHub Importer]]. Hindsight polls one memory bank over its HTTP API and
-publishes memory units, entities, and documents as one graph; see
-[[Hindsight Importer]]. OKF implements the official format version 0.2; its
-`0.2` version must not be called `0.0.2`.
+package, GitHub, and httpjson (the engine name). Every JSON API — including
+Hindsight — is a declarative package under `charts/jump-cannon/packages/`
+bound to an instance at runtime via the `JUMP_CANNON_IMPORTER_*` env vars;
+Hindsight is the package `hindsight-memory-bank.toml`, not a source kind.
+See [[Hindsight Importer]] and AGENTS.md "Importers: packages, not crates".
+GitHub delivers a repository tarball over HTTP with ETag polling and reuses
+the Obsidian markdown pipeline; see [[GitHub Importer]]. OKF implements the
+official format version 0.2; its `0.2` version must not be called `0.0.2`.
 
 Every importer descriptor must supply discovery schema version 2. It declares
 input media types, typed search/facet fields, edge semantics, and content
@@ -65,8 +67,10 @@ queries are explicit, bounded, metadata-only, and namespace-scoped by default.
 OKF loads a filesystem bundle under a stable source identity. Pest manifest
 format 2 requires package authors to declare every property that can enter
 search or facets. GitHub reads a polled repository tarball and produces the
-same node IDs as Obsidian mode for the same corpus. Hindsight reads one
-selected memory bank read-only and bounds every collection it pages.
+same node IDs as Obsidian mode for the same corpus. The httpjson engine
+binds an instance to one HTTP/JSON API per `JUMP_CANNON_IMPORTER_*` env
+var and reads one selected Hindsight memory bank read-only; bounds and
+record caps are loud per collection (see [[Hindsight Importer]]).
 
 Do not hide network access, credentials, or authorization inside a pure mapper.
 Deployment owns those effects through [[Helm Deployment]] and [[Security Model]].
