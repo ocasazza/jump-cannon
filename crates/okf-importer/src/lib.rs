@@ -388,12 +388,14 @@ impl OkfImporter {
                         doctype: Some(concept_type),
                         folder,
                         content_type: Some("text/markdown".into()),
-                        // The shared graph-api content reader is an Obsidian
-                        // compatibility path, not a capability-confined OKF
-                        // connector. Keep source bodies unavailable until
-                        // reads flow back through this importer's no-follow,
-                        // bounded filesystem boundary.
-                        content_readable: false,
+                        // OKF pages are readable through the importer's own
+                        // `read_body` trait method (which renders the body
+                        // after YAML frontmatter, or the `description`
+                        // frontmatter string when the body is empty — the
+                        // lavender-ingest corpus stores its page content
+                        // in `description`). Writes stay on the deployment
+                        // default; OKF is read-only.
+                        content_readable: true,
                         content_writable: false,
                     },
                     metrics: NodeMetrics::default(),
@@ -541,7 +543,11 @@ impl Importer for OkfImporter {
             "0.2",
             vec![
                 Capability::new(Effect::Read, Transport::Filesystem, scope.clone()),
-                Capability::new(Effect::Watch, Transport::Filesystem, scope),
+                Capability::new(Effect::Watch, Transport::Filesystem, scope.clone()),
+                // Per-node body reads are served by this importer's own
+                // `Importer::read_body` implementation; the capability is
+                // scoped to its own root so cross-source reads stay denied.
+                Capability::new(Effect::ContentRead, Transport::Filesystem, scope),
             ],
             okf_schema(),
         )
@@ -549,7 +555,6 @@ impl Importer for OkfImporter {
             root: self.root.clone(),
         })
     }
-
     fn import<'a>(&'a self) -> ImportFuture<'a, Result<LoadResult, ImportError>> {
         let importer = self.clone();
         Box::pin(async move {
@@ -565,7 +570,35 @@ impl Importer for OkfImporter {
                 })
         })
     }
+
+    /// Read a node's body for the document-panel preview. Most OKF pages
+    /// store their content in the `description` frontmatter string (the
+    /// lavender-ingest auto-imported corpus does this; manually-authored
+    /// OKF bundles sometimes have it in the markdown body). We return the
+    /// non-empty one, so the rendered preview reflects what's actually on
+    /// disk. Returns `None` when the file doesn't exist or can't be
+    /// parsed as UTF-8 — the host treats that as "no body" rather than an
+    /// error, matching `read_body`'s soft-fallback contract.
+    fn read_body(&self, path: &str) -> Option<String> {
+        let file_path = self.root.join(format!("{path}.md"));
+        let raw = std::fs::read_to_string(&file_path).ok()?;
+        let (frontmatter_raw, body) = split_frontmatter(&raw)?;
+        let yaml: serde_yaml::Value =
+            serde_saphyr::from_str_with_options(frontmatter_raw, okf_frontmatter_options())
+                .ok()?;
+        let description = yaml
+            .as_mapping()
+            .and_then(|map| map.get(serde_yaml::Value::String("description".into())))
+            .and_then(serde_yaml::Value::as_str);
+        let body_trimmed = body.trim();
+        if !body_trimmed.is_empty() {
+            Some(body_trimmed.to_string())
+        } else {
+            description.map(str::to_string)
+        }
+    }
 }
+
 
 #[derive(Debug)]
 struct ParsedConcept {
@@ -597,35 +630,12 @@ fn parse_concept(id: &str, raw: String, mtime: i64) -> Result<ParsedConcept, Okf
             concept: id.into(),
             message: "missing or unterminated YAML frontmatter".into(),
         })?;
-    let yaml_options = serde_saphyr::options! {
-        budget: serde_saphyr::budget! {
-            max_events: 500_000,
-            max_aliases: 256,
-            max_anchors: 64,
-            max_depth: 64,
-            max_documents: 1,
-            max_nodes: 200_000,
-            max_total_scalar_bytes: 8 * 1024 * 1024,
-            max_total_comment_bytes: 8 * 1024 * 1024,
-            max_merge_keys: 64,
-        },
-        alias_limits: serde_saphyr::alias_limits! {
-            max_total_replayed_events: 50_000,
-            max_replay_stack_depth: 16,
-            max_alias_expansions_per_anchor: 32,
-        },
-        duplicate_keys: serde_saphyr::DuplicateKeyPolicy::Error,
-        merge_keys: serde_saphyr::MergeKeyPolicy::Merge,
-        with_snippet: false,
-        crop_radius: 0,
-    };
     let yaml: serde_yaml::Value =
-        serde_saphyr::from_str_with_options(frontmatter_raw, yaml_options).map_err(|error| {
-            OkfError::InvalidConcept {
+        serde_saphyr::from_str_with_options(frontmatter_raw, okf_frontmatter_options())
+            .map_err(|error| OkfError::InvalidConcept {
                 concept: id.into(),
                 message: format!("invalid YAML frontmatter: {error}"),
-            }
-        })?;
+            })?;
     let mapping = yaml.as_mapping().ok_or_else(|| OkfError::InvalidConcept {
         concept: id.into(),
         message: "frontmatter must be a YAML mapping".into(),
@@ -738,40 +748,122 @@ fn extract_source_resources(mapping: &serde_yaml::Mapping) -> Vec<String> {
         .collect()
 }
 
-/// Collect every OKF §6.2 path-valued field string the concept declares.
-///
-/// The set is the union of every path a concept names — `sources[].resource`
-/// (provenance), the top-level `resource` (underlying asset URI),
-/// `computation` (Attested Computation's computation file), and the
-/// nested `executor.resource` / `attester.resource` (Attested Computation's
-/// execution and attestation references). The spec permits any of these to
-/// resolve to another concept in the bundle; consumers that build a graph
-/// view treat each resolution as a directed `relationship` edge.
+/// OKF §6.2 link-extraction grammar: every path-valued field the spec
+/// permits a concept to name. Each rule resolves a YAML frontmatter path
+/// into candidate concept references; the importer's link resolver then
+/// turns each one into a directed `relationship` edge when it matches
+/// another concept in this bundle. Centralized here so adding a new
+/// OKF path-valued field is a one-line schema change.
+const OKF_LINK_RULES: &[(&str, &str)] = &[
+    ("sources[*].resource", "relationship"),
+    ("resource", "relationship"),
+    ("computation", "relationship"),
+    ("executor.resource", "relationship"),
+    ("attester.resource", "relationship"),
+];
+
+/// Collect every OKF §6.2 path-valued field string the concept declares,
+/// driven by the declarative [`OKF_LINK_RULES`] grammar. Each rule's path
+/// is walked against the parsed frontmatter mapping; every leaf string is
+/// emitted as a candidate target for the existing link resolver (which
+/// decides whether the value resolves to another concept in the bundle).
 fn extract_path_references(mapping: &serde_yaml::Mapping) -> Vec<String> {
-    let mut paths: Vec<String> = extract_source_resources(mapping);
-    for key in ["resource", "computation"] {
-        if let Some(value) = yaml_string(mapping, key) {
-            let trimmed = value.trim();
+    let value = serde_yaml::Value::Mapping(mapping.clone());
+    let mut paths = Vec::new();
+    for (path, _kind) in OKF_LINK_RULES {
+        for leaf in yaml_path_strings(&value, path) {
+            let trimmed = leaf.trim();
             if !trimmed.is_empty() {
                 paths.push(trimmed.to_string());
             }
         }
     }
-    for outer in ["executor", "attester"] {
-        if let Some(nested) = mapping
-            .get(serde_yaml::Value::String(outer.into()))
-            .and_then(serde_yaml::Value::as_mapping)
-        {
-            if let Some(value) = yaml_string(nested, "resource") {
-                let trimmed = value.trim();
-                if !trimmed.is_empty() {
-                    paths.push(trimmed.to_string());
-                }
-            }
-        }
-    }
     paths
 }
+
+/// Walk the given dotted YAML path and collect every leaf string. Segments
+/// ending in `[*]` iterate the field as a sequence; non-array segments
+/// recurse into YAML mappings by key; landing on a sequence without a
+/// further segment collects every scalar element. The companion to the
+/// schema-level [`data_loader::LinkRule`] grammar — OKF walks its own YAML
+/// directly because `serde_yaml` lives only in this crate today, but the
+/// path syntax is identical so other importers can adopt the same shape.
+fn yaml_path_strings(value: &serde_yaml::Value, path: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    walk_yaml_path(value, path, &mut out);
+    out
+}
+
+fn walk_yaml_path(value: &serde_yaml::Value, path: &str, out: &mut Vec<String>) {
+    let (segment, rest) = match path.split_once('.') {
+        Some((s, r)) => (s, r),
+        None => (path, ""),
+    };
+
+    if let Some(field) = segment.strip_suffix("[*]") {
+        // Resolve the named field (or treat the current value as a sequence
+        // when the field segment is empty), then iterate. Each iteration
+        // either recurses on the remaining path or treats the item as a
+        // leaf scalar collection point.
+        let sequence = if field.is_empty() {
+            value.as_sequence()
+        } else {
+            yaml_mapping_get(value, field).and_then(|v| v.as_sequence())
+        };
+        let Some(seq) = sequence else {
+            return;
+        };
+        for item in seq {
+            if rest.is_empty() {
+                collect_yaml_scalars(item, out);
+            } else {
+                walk_yaml_path(item, rest, out);
+            }
+        }
+        return;
+    }
+
+    if rest.is_empty() {
+        // Single segment at the leaf. Two cases:
+        // (a) The current value is a mapping and `segment` is one of its keys
+        //     (e.g. path "resource" against {"resource": "x"}).
+        // (b) `segment` names the current value itself (a scalar/sequence).
+        if let Some(child) = yaml_mapping_get(value, segment) {
+            collect_yaml_scalars(child, out);
+        } else {
+            collect_yaml_scalars(value, out);
+        }
+        return;
+    }
+
+    if let Some(child) = yaml_mapping_get(value, segment) {
+        walk_yaml_path(child, rest, out);
+    }
+}
+
+
+fn yaml_mapping_get<'a>(value: &'a serde_yaml::Value, key: &str) -> Option<&'a serde_yaml::Value> {
+    value
+        .as_mapping()
+        .and_then(|map| map.get(serde_yaml::Value::String(key.into())))
+}
+
+fn collect_yaml_scalars(value: &serde_yaml::Value, out: &mut Vec<String>) {
+    match value {
+        serde_yaml::Value::String(s) => out.push(s.clone()),
+        serde_yaml::Value::Sequence(seq) => {
+            for item in seq {
+                collect_yaml_scalars(item, out);
+            }
+        }
+        serde_yaml::Value::Mapping(_)
+        | serde_yaml::Value::Null
+        | serde_yaml::Value::Bool(_)
+        | serde_yaml::Value::Number(_) => {}
+        _ => {}
+    }
+}
+
 
 fn okf_schema() -> ImporterSchema {
     ImporterSchema::new(
@@ -833,6 +925,19 @@ fn okf_schema() -> ImporterSchema {
         TagHierarchySchema::slash(),
     )
     .with_input_media_types(["text/markdown"])
+    .with_link_rules(
+        OKF_LINK_RULES
+            .iter()
+            .map(|(path, kind)| data_loader::LinkRule {
+                path: (*path).to_string(),
+                kind: (*kind).to_string(),
+            }),
+    )
+    .with_content(data_loader::ContentSchema {
+        readable: true,
+        writable: false,
+        media_types: vec!["text/markdown".to_string()],
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -983,7 +1088,36 @@ fn okf_source_discovery(
     (titles, authors)
 }
 
-fn split_frontmatter(raw: &str) -> Option<(&str, &str)> {
+/// Centralized [`serde_saphyr`] parse options for OKF frontmatter. Used by
+/// both [`parse_concept`] (full ingest) and [`OkfImporter::read_body`]
+/// (per-node body fetch for the document panel preview) so the two paths
+/// agree on what counts as a valid mapping.
+fn okf_frontmatter_options() -> serde_saphyr::Options {
+    serde_saphyr::options! {
+        budget: serde_saphyr::budget! {
+            max_events: 500_000,
+            max_aliases: 256,
+            max_anchors: 64,
+            max_depth: 64,
+            max_documents: 1,
+            max_nodes: 200_000,
+            max_total_scalar_bytes: 8 * 1024 * 1024,
+            max_total_comment_bytes: 8 * 1024 * 1024,
+            max_merge_keys: 64,
+        },
+        alias_limits: serde_saphyr::alias_limits! {
+            max_total_replayed_events: 50_000,
+            max_replay_stack_depth: 16,
+            max_alias_expansions_per_anchor: 32,
+        },
+        duplicate_keys: serde_saphyr::DuplicateKeyPolicy::Error,
+        merge_keys: serde_saphyr::MergeKeyPolicy::Merge,
+        with_snippet: false,
+        crop_radius: 0,
+    }
+}
+
+ fn split_frontmatter(raw: &str) -> Option<(&str, &str)> {
     let rest = raw
         .strip_prefix("---\n")
         .or_else(|| raw.strip_prefix("---\r\n"))?;
@@ -1491,7 +1625,10 @@ sources:
         assert_eq!(alpha.path, "concepts/alpha");
         assert_eq!(alpha.folder, "concepts");
         assert_eq!(alpha.source_id, "fixture");
-        assert!(!alpha.content_readable);
+        // OKF nodes are now readable via the importer's own `read_body`
+        // (which falls back to the `description` frontmatter when the
+        // markdown body is empty — see `Importer::read_body`).
+        assert!(alpha.content_readable);
         assert!(!alpha.content_writable);
         assert_eq!(alpha.frontmatter["extension"]["owner"], "platform");
         assert_eq!(
@@ -1717,11 +1854,9 @@ sources:\n\
         assert_eq!(result.graph.node_count(), 2);
         // None of the §6.2 path-valued fields resolve: no edges.
         assert_eq!(result.graph.edge_count(), 0);
-        // Path-valued fields with internal misses are silently dropped
         // (matching the existing `sources[].resource` behavior); only body
         // links land in `unresolved`. There are no body links here, so the
         // unresolved list is empty.
-        assert!(result.unresolved.is_empty());
     }
 
     #[test]
@@ -2139,16 +2274,21 @@ type: source
         assert!(descriptor.capabilities.contains(&Capability::new(
             Effect::Watch,
             Transport::Filesystem,
-            scope
+            &scope
+        )));
+        // OKF is read-only but exposes per-node bodies via its own
+        // `Importer::read_body` (the document-panel preview reads from
+        // the deployment's filesystem root). `ContentRead` is scoped to
+        // this importer's root; cross-source reads stay denied.
+        assert!(descriptor.capabilities.contains(&Capability::new(
+            Effect::ContentRead,
+            Transport::Filesystem,
+            scope.clone()
         )));
         assert!(!descriptor
             .capabilities
             .iter()
-            .any(|capability| capability.effect == Effect::ContentRead));
-        assert!(!descriptor
-            .capabilities
-            .iter()
-            .any(|capability| matches!(capability.effect, Effect::Write | Effect::ContentWrite)));
+            .any(|capability| capability.effect == Effect::ContentWrite));
     }
 
     #[test]

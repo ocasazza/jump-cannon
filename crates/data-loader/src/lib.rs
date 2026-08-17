@@ -166,6 +166,27 @@ impl TagHierarchySchema {
     }
 }
 
+/// One rule in the declarative link-extraction grammar: a YAML frontmatter
+/// path whose string values are candidate references to other concepts in
+/// the bundle (or relative paths that resolve against the source concept's
+/// id). The path is dot-delimited; segments ending in `[*]` iterate over
+/// the field as a YAML sequence; non-array segments recurse into YAML
+/// mappings by key. Every leaf string is collected and routed through the
+/// importer's link resolver (which decides whether the value resolves to
+/// another concept in the bundle and, if so, emits an edge of `kind`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LinkRule {
+    /// Dotted YAML path. Sequence iteration uses `[*]`; nested maps
+    /// recurse by key. Examples:
+    /// - `sources[*].resource` — every entry's `resource` field under `sources:`
+    /// - `executor.resource` — single value at `executor.resource`
+    /// - `resource` — single scalar at the top level
+    pub path: String,
+    /// Declared edge kind; must match a key in [`ImporterSchema::edge_types`].
+    pub kind: String,
+}
+
 /// Versioned, mandatory output/discovery schema for an importer.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -180,9 +201,17 @@ pub struct ImporterSchema {
     pub tag_hierarchy: TagHierarchySchema,
     pub fields: Vec<DiscoveryField>,
     pub edge_types: Vec<EdgeTypeSchema>,
-    #[serde(default)]
     pub content: ContentSchema,
-}
+    /// Declarative link-extraction grammar. Each rule names a YAML
+    /// frontmatter path whose string values are candidate references to
+    /// other concepts in this bundle (or relative paths that resolve to
+    /// them). The grammar is consumed by importers that expose frontmatter
+    /// (e.g. OKF's §6.2 path-valued fields); importers that don't use
+    /// frontmatter leave this empty and emit edges through their own
+    /// dedicated paths.
+    #[serde(default)]
+    pub link_rules: Vec<LinkRule>,
+ }
 
 impl ImporterSchema {
     pub fn new(
@@ -199,6 +228,7 @@ impl ImporterSchema {
             fields,
             edge_types,
             content: ContentSchema::default(),
+            link_rules: Vec::new(),
         }
     }
 
@@ -212,6 +242,14 @@ impl ImporterSchema {
 
     pub fn with_content(mut self, content: ContentSchema) -> Self {
         self.content = content;
+        self
+    }
+
+    pub fn with_link_rules(
+        mut self,
+        rules: impl IntoIterator<Item = LinkRule>,
+    ) -> Self {
+        self.link_rules = rules.into_iter().collect();
         self
     }
 
@@ -356,6 +394,21 @@ impl ImporterSchema {
                     "edge type keys must be valid and unique: {:?}",
                     edge.key
                 )));
+            }
+        }
+        if !self.link_rules.is_empty() {
+            for rule in &self.link_rules {
+                if rule.path.trim().is_empty() {
+                    return Err(invalid_descriptor(format!(
+                        "link rule path must be a non-empty dotted YAML path"
+                    )));
+                }
+                if !edge_keys.contains(rule.kind.as_str()) {
+                    return Err(invalid_descriptor(format!(
+                        "link rule {:?} references undeclared edge type {:?}; declare it in edge_types",
+                        rule.path, rule.kind
+                    )));
+                }
             }
         }
         if self.content.writable && !self.content.readable {
@@ -699,6 +752,7 @@ fn invalid_descriptor(message: String) -> ImportError {
     ImportError::InvalidDescriptor { message }
 }
 
+
 /// The result of a single load pass.
 #[derive(Debug)]
 pub struct LoadResult {
@@ -973,6 +1027,18 @@ impl ImporterDescriptor {
 pub trait Importer: Send + Sync {
     fn descriptor(&self) -> ImporterDescriptor;
     fn import<'a>(&'a self) -> ImportFuture<'a, Result<LoadResult, ImportError>>;
+
+    /// Optional body reader: return the markdown body for a node whose
+    /// `meta.path` is `path` (relative to the importer's own filesystem root),
+    /// or `None` when this importer doesn't surface bodies. Default is `None`.
+    /// Hosts that serve per-source bodies (see [`Effect::ContentRead`]) prefer
+    /// this over a shared filesystem read so each importer can project its
+    /// own body semantics (e.g. OKF falls back to the `description`
+    /// frontmatter when the markdown body is empty). The host already holds
+    /// the matching capability; importers don't re-authorize.
+    fn read_body(&self, _path: &str) -> Option<String> {
+        None
+    }
 }
 
 /// Compatibility bridge: every existing synchronous [`Loader`] is also an
@@ -1077,6 +1143,10 @@ impl HostedImporter {
 impl Importer for HostedImporter {
     fn descriptor(&self) -> ImporterDescriptor {
         self.importer.descriptor()
+    }
+
+    fn read_body(&self, path: &str) -> Option<String> {
+        self.importer.read_body(path)
     }
 
     fn import<'a>(&'a self) -> ImportFuture<'a, Result<LoadResult, ImportError>> {

@@ -21,7 +21,7 @@ use tokio::sync::broadcast::error::RecvError;
 
 use crate::source_host::{DefaultSource, SourceHost, SourceSelection};
 use crate::{attribute_resolver, proto, state::AppState};
-use data_loader::{Capability, Effect, HostedImporter, Transport};
+use data_loader::{Capability, Effect, HostedImporter, Importer, Transport};
 use graph_layouts::geometric::LensConfig;
 use vault_data::color::PALETTE;
 
@@ -1460,8 +1460,16 @@ async fn node_meta(selection: SourceSelection, Path(id): Path<String>) -> impl I
         // twice — it's already in `frontmatter_json`.
         let content_readable = node.meta.content_readable && can_read_filesystem_content;
         let content_writable = node.meta.content_writable && can_write_filesystem_content;
+        // Prefer the importer's own body reader (e.g. OKF's per-source
+        // `Importer::read_body`, which can fall back to the `description`
+        // frontmatter when the markdown body is empty). Fall back to the
+        // shared filesystem reader so importers that don't override
+        // `read_body` keep their existing Obsidian-style contract.
         let body = if content_readable {
-            read_body(&s.inner.vault_root, &node.meta.path)
+            s.inner
+                .importer
+                .read_body(&node.meta.path)
+                .unwrap_or_else(|| read_body(&s.inner.vault_root, &node.meta.path))
         } else {
             String::new()
         };

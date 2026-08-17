@@ -3380,7 +3380,10 @@ async fn run_switch_scenario_inner(
         && reset.get("found").and_then(|v| v.as_bool()) == Some(true)
         && reset.get("cleared").and_then(|v| v.as_bool()) == Some(true)
         && reset.get("restored").and_then(|v| v.as_bool()) == Some(true);
-    let _: () = evaluate_retry(
+    // Re-switch so the reload + view-button assertions still exercise
+    // the alternate path. The JS returns a map; we discard the value
+    // because the next assertions are what matter.
+    let _: serde_json::Value = evaluate_retry(
         &page,
         &js_with(
             &[("__ALT_ID__", SWITCH_ALT_ID), ("__ALT_NODE__", SWITCH_ALT_NODE)],
@@ -3389,11 +3392,7 @@ async fn run_switch_scenario_inner(
         5,
     )
     .await?;
-
-    // In-tab reload: the session selection survives and re-loads the
-    // alternate graph.
     let _ = page.evaluate("location.reload()").await;
-    tokio::time::sleep(Duration::from_millis(500)).await;
     let persisted: serde_json::Value = evaluate_retry(
         &page,
         &js_with(
