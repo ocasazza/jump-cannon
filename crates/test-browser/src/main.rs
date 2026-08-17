@@ -269,6 +269,11 @@ struct ImporterSwitchCheck {
     fresh_tab_default: bool,
     denied_note: bool,
     stale_reset_recovers: bool,
+    /// Authorized viewer currently viewing the alternate: the policy reset
+    /// affordance must be visible and clicking it must clear the session
+    /// selection and restore the deployment default. Covers the case where
+    /// `stale_reset_recovers` does not (viewer still has the group).
+    viewing_non_default_reset: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     reason: Option<String>,
 }
@@ -288,6 +293,7 @@ impl ImporterSwitchCheck {
             fresh_tab_default: false,
             denied_note: false,
             stale_reset_recovers: false,
+            viewing_non_default_reset: false,
             reason: Some("graph-api binary not on PATH; scenario skipped".to_string()),
         }
     }
@@ -3220,8 +3226,10 @@ async fn run_switch_scenario(
         fresh_tab_default: false,
         denied_note: false,
         stale_reset_recovers: false,
+        viewing_non_default_reset: false,
         reason: None,
     };
+
     if let Err(error) = run_switch_scenario_inner(browser, &fixture, &mut check, console_logs).await
     {
         check.reason = Some(match check.reason.take() {
@@ -3238,8 +3246,8 @@ async fn run_switch_scenario(
         && check.session_persists_reload
         && check.switch_back_restores_default
         && check.fresh_tab_default
-        && check.denied_note
-        && check.stale_reset_recovers;
+        && check.stale_reset_recovers
+        && check.viewing_non_default_reset;
     if !check.ok && check.reason.is_none() {
         check.reason = Some("one or more importer-switch assertions failed".to_string());
     }
@@ -3356,6 +3364,31 @@ async fn run_switch_scenario_inner(
         && switched.get("stored").and_then(|v| v.as_bool()) == Some(true)
         && switched.get("swapped").and_then(|v| v.as_bool()) == Some(true)
         && switched.get("badge").and_then(|v| v.as_bool()) == Some(true);
+    // While viewing the alternate (still authorized), the policy reset
+    // affordance must be visible and clicking it must clear the session
+    // selection and restore the deployment default. Re-runs SWITCH_TO_ALT
+    // below so the reload test still exercises the alternate path.
+    let alt_view: serde_json::Value = evaluate_retry(&page, IMPORTERS_VIEW_JS, 5).await?;
+    let reset_visible = alt_view.get("reset_button").and_then(|v| v.as_bool()) == Some(true);
+    let reset: serde_json::Value = evaluate_retry(
+        &page,
+        &js_with(&[("__DEFAULT_NODE__", SWITCH_DEFAULT_NODE)], RESET_STALE_JS),
+        5,
+    )
+    .await?;
+    check.viewing_non_default_reset = reset_visible
+        && reset.get("found").and_then(|v| v.as_bool()) == Some(true)
+        && reset.get("cleared").and_then(|v| v.as_bool()) == Some(true)
+        && reset.get("restored").and_then(|v| v.as_bool()) == Some(true);
+    let _: () = evaluate_retry(
+        &page,
+        &js_with(
+            &[("__ALT_ID__", SWITCH_ALT_ID), ("__ALT_NODE__", SWITCH_ALT_NODE)],
+            SWITCH_TO_ALT_JS,
+        ),
+        5,
+    )
+    .await?;
 
     // In-tab reload: the session selection survives and re-loads the
     // alternate graph.

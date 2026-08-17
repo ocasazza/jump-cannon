@@ -424,10 +424,14 @@ fn importer_catalog(
     };
     let switch_allowed = switch.enabled && switch.allowed;
     let required_group = switch.required_group.as_deref().unwrap_or("?");
-    // A stale session selection (the viewer lost the required group, or the
-    // source was undeployed) must never strand them: the reset affordance
-    // returns to the deployment default, which never requires authorization.
-    let stale_viewing = switch.enabled && !switch.allowed && viewing.is_some();
+    // A session override that's not the deployment default — whether stale
+    // (denied because the viewer lost the required group, or the source was
+    // undeployed) or simply an active non-default view — must always be
+    // recoverable: the reset affordance returns to the deployment default,
+    // which never requires authorization.
+    let viewing_non_default = switch.enabled
+        && viewing.is_some()
+        && viewing.as_deref() != catalog.selected.as_deref();
     rsx! {
         div {
             class: "importers-view",
@@ -453,7 +457,7 @@ fn importer_catalog(
                         "."
                     }
                 }
-                if stale_viewing {
+                if viewing_non_default {
                     button {
                         class: "btn importer-switch-reset",
                         r#type: "button",
