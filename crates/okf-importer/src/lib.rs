@@ -345,6 +345,8 @@ impl OkfImporter {
             .enumerate()
             .map(|(index, concept)| (concept.id.clone(), index))
             .collect();
+        let url_to_concept = build_url_index(&concepts);
+        let concept_ids: Vec<String> = concepts.iter().map(|c| c.id.clone()).collect();
         let mut graph = VaultGraph::new();
         let mut relations = Vec::with_capacity(concepts.len());
         let mut search_documents = Vec::with_capacity(concepts.len());
@@ -388,13 +390,6 @@ impl OkfImporter {
                         doctype: Some(concept_type),
                         folder,
                         content_type: Some("text/markdown".into()),
-                        // OKF pages are readable through the importer's own
-                        // `read_body` trait method (which renders the body
-                        // after YAML frontmatter, or the `description`
-                        // frontmatter string when the body is empty — the
-                        // lavender-ingest corpus stores its page content
-                        // in `description`). Writes stay on the deployment
-                        // default; OKF is read-only.
                         content_readable: true,
                         content_writable: false,
                     },
@@ -412,9 +407,26 @@ impl OkfImporter {
         let mut unresolved_bytes = 0_u64;
         for (source_index, (concept_id, links, path_references)) in relations.iter().enumerate() {
             for destination in links {
-                let Some(target) = resolve_body_link(concept_id, destination) else {
-                    continue;
+                // Try a relative path first (the OKF §6.2 / markdown
+                // `[text](path)` convention), then fall back to a URL
+                // resolver so Confluence `display/{space}/{title}` /
+                // `viewpage.action?pageId=N` and Jira `browse/{KEY}`
+                // URLs — which the auto-imported corpus actually emits —
+                // resolve against other concepts in the bundle.
+                // Links that resolve to neither a relative path nor a
+                // known URL (e.g. external `file://` schemes, escapes,
+                // percent-encoded external URLs) are skipped silently —
+                // they're provenance pointers, not corpus edges.
+                let target = if let Some(target) =
+                    resolve_body_link(concept_id, destination)
+                {
+                    Some(target)
+                } else if has_uri_scheme(destination) {
+                    resolve_url_target(destination, &url_to_concept, &concept_ids)
+                } else {
+                    None
                 };
+                let Some(target) = target else { continue };
                 let Some(&target_index) = concept_indices.get(&target) else {
                     if !unresolved_ids.insert((source_index, destination.clone())) {
                         continue;
@@ -446,26 +458,31 @@ impl OkfImporter {
                     (concept_id, &target),
                 )?;
             }
-
             for resource in path_references {
-                let Some(target) = resolve_source_resource(concept_id, resource) else {
+                // Same fallback order as body links: OKF §6.2 path
+                // first (relative within the bundle), then URL form for
+                // the auto-imported corpus' Confluence/Jira sources.
+                let target = if let Some(target) =
+                    resolve_source_resource(concept_id, resource)
+                {
+                    Some(target)
+                } else if has_uri_scheme(resource) {
+                    resolve_url_target(resource, &url_to_concept, &concept_ids)
+                } else {
+                    None
+                };
+                let Some(target) = target else { continue };
+                let Some(&target_index) = concept_indices.get(&target) else {
                     continue;
                 };
-                // `resource` may be an external data object or a free-form
-                // scope descriptor, or an OKF §6.2 path-valued field
-                // (`resource`, `computation`, `executor.resource`,
-                // `attester.resource`). It is provenance metadata unless it
-                // resolves to another concept in this bundle.
-                if let Some(&target_index) = concept_indices.get(&target) {
-                    self.push_edge(
-                        &mut graph,
-                        &mut edge_ids,
-                        &mut edge_endpoint_bytes,
-                        source_index,
-                        target_index,
-                        (concept_id, &target),
-                    )?;
-                }
+                self.push_edge(
+                    &mut graph,
+                    &mut edge_ids,
+                    &mut edge_endpoint_bytes,
+                    source_index,
+                    target_index,
+                    (concept_id, &target),
+                )?;
             }
         }
 
@@ -1234,6 +1251,99 @@ fn resolve_reference(source_id: &str, raw: &str, base: ReferenceBase) -> Option<
     path.strip_suffix(".md").map(str::to_string)
 }
 
+/// Build a URL → concept index from each concept's `source_url` frontmatter
+/// field, indexed under every URL shape the corpus emits (canonical
+/// `source_url`, query-string variants with `pageId=` or
+/// `spaceKey=&title=`, and the display-form `/display/{space}/{title}`
+/// path). Also indexes by `external_id`'s tail segment so Jira-style
+/// `https://.../browse/{KEY}` URLs and their `jira:{KEY}` /
+/// `confluence:{SPACE}:{PAGE_ID}` external_id forms resolve.
+fn build_url_index(concepts: &[ParsedConcept]) -> HashMap<String, usize> {
+    let mut index = HashMap::new();
+    for (idx, concept) in concepts.iter().enumerate() {
+        let Some(url) = concept
+            .frontmatter
+            .get("source_url")
+            .and_then(serde_json::Value::as_str)
+        else {
+            continue;
+        };
+        for key in url_keys_for(url) {
+            index.entry(key).or_insert(idx);
+        }
+        // Mirror by `external_id` tail so Jira `browse/{KEY}` URLs match
+        // concepts whose `external_id` is `jira:{KEY}` or
+        // `confluence:{SPACE}:{PAGE_ID}`.
+        if let Some(external_id) = concept
+            .frontmatter
+            .get("external_id")
+            .and_then(serde_json::Value::as_str)
+        {
+            if let Some(tail) = external_id.rsplit(':').next() {
+                if !tail.is_empty() && !index.contains_key(tail) {
+                    index.insert(tail.to_string(), idx);
+                }
+            }
+        }
+    }
+    index
+}
+
+/// Every URL shape we recognise for cross-bundle edge resolution.
+/// Confluence emits a single page under multiple forms (`/display/...`,
+/// `/pages/viewpage.action?pageId=...`, `/pages/viewpage.action?spaceKey=...&title=...`)
+/// and the corpus body freely mixes them. Indexing all variants keeps the
+/// runtime resolver a single map lookup regardless of which shape the
+/// body author chose.
+fn url_keys_for(url: &str) -> Vec<String> {
+    let mut keys = Vec::with_capacity(4);
+    let trimmed = url.split('#').next().unwrap_or(url).trim();
+    if !trimmed.is_empty() {
+        keys.push(trimmed.to_string());
+    }
+    // `?pageId=49479694` → pageId value
+    if let Some(query_start) = trimmed.find('?') {
+        let query = &trimmed[query_start + 1..];
+        for pair in query.split('&') {
+            if let Some(value) = pair.strip_prefix("pageId=") {
+                if !value.is_empty() {
+                    keys.push(value.to_string());
+                }
+            }
+        }
+    }
+    // `/display/{space}/{title}` → last two path segments joined
+    if let Some(path_start) = trimmed.find("://").map(|i| i + 3) {
+        if let Some(path) = trimmed[path_start..].split('?').next() {
+            let segments: Vec<&str> = path
+                .split('/')
+                .filter(|segment| !segment.is_empty())
+                .collect();
+            if segments.len() >= 2 {
+                let display_form = format!("{}/{}", segments[segments.len() - 2], segments[segments.len() - 1]);
+                keys.push(display_form);
+            }
+        }
+    }
+    keys
+}
+
+/// Resolve an absolute URL to a concept in this bundle. Mirrors the
+/// lookup table built by [`build_url_index`]: tries the URL verbatim,
+/// then the `pageId` query parameter, then the `space/title` display
+/// form. Returns the matched concept's id when the URL points at a page
+/// in this bundle; `None` otherwise (including for URLs whose
+/// authoritative form is on a system we don't mirror).
+fn resolve_url_target(url: &str, url_to_concept: &HashMap<String, usize>, ids: &[String]) -> Option<String> {
+    let trimmed = url.split('#').next().unwrap_or(url).trim();
+    for key in url_keys_for(trimmed) {
+        if let Some(&idx) = url_to_concept.get(&key) {
+            return ids.get(idx).cloned();
+        }
+    }
+    None
+}
+
 fn has_uri_scheme(value: &str) -> bool {
     let before_slash = value.split('/').next().unwrap_or(value);
     before_slash.find(':').is_some_and(|index| {
@@ -1250,7 +1360,9 @@ fn is_scheme_byte(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'-' | b'.')
 }
 
+
 fn json_value_nodes(value: &serde_json::Value) -> usize {
+
     match value {
         serde_json::Value::Array(values) => 1_usize.saturating_add(
             values
@@ -1857,6 +1969,67 @@ sources:\n\
         // (matching the existing `sources[].resource` behavior); only body
         // links land in `unresolved`. There are no body links here, so the
         // unresolved list is empty.
+    }
+
+    #[test]
+    fn body_url_references_resolve_against_other_concepts() {
+        // Auto-imported OKF corpora (Confluence / Jira) carry cross-
+        // page references as absolute URLs in the body, not as relative
+        // markdown paths or as OKF §6.2 path-valued fields. The URL
+        // resolver must recognise every shape a single page is emitted
+        // under (display, viewpage, browse) and route it back to the
+        // concept whose `source_url` / `external_id` tail segment
+        // matches. Unrelated external URLs drop cleanly with no edge.
+        let fixture = TempDir::new().unwrap();
+        write(
+            fixture.path(),
+            "knowledge/alpha.md",
+            "---\ntype: concept\nsource_url: https://confluence.example.com/display/LD/Alpha\n---\n\
+[beta display](https://confluence.example.com/display/LD/Beta)\n\
+[beta pageId](https://confluence.example.com/pages/viewpage.action?pageId=99999)\n\
+[beta space+title](https://confluence.example.com/pages/viewpage.action?spaceKey=LD&title=Beta)\n",
+        );
+        write(
+            fixture.path(),
+            "knowledge/beta.md",
+            "---\ntype: concept\nsource_url: https://confluence.example.com/pages/viewpage.action?pageId=99999\n---\n",
+        );
+        write(
+            fixture.path(),
+            "jira/issue-1.md",
+            "---\ntype: concept\nsource_url: https://atlassian.example.com/browse/PROJ-1\nexternal_id: jira:PROJ-1\n---\n\
+see [issue 2](https://atlassian.example.com/browse/PROJ-2)\n",
+        );
+        write(
+            fixture.path(),
+            "jira/issue-2.md",
+            "---\ntype: concept\nsource_url: https://atlassian.example.com/browse/PROJ-2\nexternal_id: jira:PROJ-2\n---\n",
+        );
+        write(
+            fixture.path(),
+            "external.md",
+            "---\ntype: concept\n---\n\
+[unrelated](https://freshservice.example.com/helpdesk/tickets/11075)\n",
+        );
+
+        let result = load(fixture.path());
+
+        // Three URL shapes all collapse to the same `beta` concept.
+        assert_eq!(
+            edges(&result),
+            BTreeSet::from([
+                (
+                    "okf:fixture:knowledge/alpha".into(),
+                    "okf:fixture:knowledge/beta".into(),
+                ),
+                (
+                    "okf:fixture:jira/issue-1".into(),
+                    "okf:fixture:jira/issue-2".into(),
+                ),
+            ])
+        );
+        assert!(result.unresolved.is_empty());
+        assert_eq!(result.graph.node_count(), 5);
     }
 
     #[test]
