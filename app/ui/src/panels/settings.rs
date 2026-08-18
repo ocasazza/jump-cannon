@@ -265,10 +265,13 @@ fn importer_fact(label: &'static str, field: &'static str, value: &str) -> Eleme
     }
 }
 
-/// One catalog card. When runtime switching is enabled and the viewer is
-/// authorized, each card carries a radio-style `view` button: runnable
-/// sources (and always the deployment default) are selectable; the currently
-/// viewed source shows a disabled `viewing` button and a badge.
+/// One catalog card. The default collapsed view shows only what a viewer
+/// needs to identify the source and switch to it: name, source kind,
+/// identity (source id + filesystem rescan interval), description, and
+/// one primary action button. Deployment-side configuration (volume,
+/// claim, mount, producer contract) hides behind a `<details>` disclosure
+/// so the default card stays compact while keeping the field selectors
+/// the browser regression suite exercises intact.
 #[allow(clippy::too_many_arguments)]
 fn importer_card(
     profile: &api::ImporterProfile,
@@ -283,58 +286,51 @@ fn importer_card(
         None => is_default,
     };
     let selectable = is_default || profile.runnable;
-    let switch_title = if is_viewing {
-        "currently viewed source".to_string()
-    } else if selectable {
-        format!("view the {} graph in this browser session", profile.id)
+    let has_details = profile.source.is_some() || profile.producer.is_some();
+    let card_class: String = if is_viewing {
+        "importer-card importer-card-viewing".into()
+    } else if is_default {
+        "importer-card importer-card-default".into()
     } else {
-        "graph-api cannot construct this source at runtime (kind needs more than catalog metadata)"
-            .to_string()
+        "importer-card".into()
+    };
+    let button_class: String = if is_viewing {
+        "btn importer-switch-btn importer-switch-current".into()
+    } else if is_default {
+        "btn importer-switch-btn importer-switch-default".into()
+    } else {
+        "btn importer-switch-btn importer-switch-primary".into()
+    };
+    let button_label: &'static str = if is_viewing {
+        if is_default { "Default · viewing" } else { "Viewing this source" }
+    } else if is_default {
+        "Return to default"
+    } else {
+        "View this source"
     };
     let switch_id = profile.id.clone();
     rsx! {
         article {
-            key: "{profile.id}",
-            class: "importer-card",
+            class: "{card_class}",
             "data-source-id": "{profile.id}",
             "data-kind": "{profile.kind}",
-            "data-selected": if profile.selected { "true" } else { "false" },
+            "data-selected": if is_default { "true" } else { "false" },
             "data-active": if profile.active { "true" } else { "false" },
             "data-runnable": if profile.runnable { "true" } else { "false" },
-            "data-viewing": if is_viewing { "true" } else { "false" },
             header { class: "importer-card-head",
-                div {
+                div { class: "importer-card-title",
                     h3 { "{profile.display_name}" }
                     code { class: "importer-profile-id", "{profile.id}" }
                 }
                 div { class: "importer-badges",
-                    if profile.active {
-                        span { class: "importer-badge active", "active" }
-                    }
-                    if profile.selected {
-                        span { class: "importer-badge selected", "selected" }
-                    }
-                    if switch_allowed && is_viewing && !is_default {
+                    span { class: "importer-badge importer-kind-tag", "{profile.kind}" }
+                    if is_viewing && !is_default {
+                        span { class: "importer-badge viewing", "viewing" }
+                    } else if is_viewing && is_default {
                         span { class: "importer-badge viewing", "viewing" }
                     }
                     if profile.source.as_ref().is_some_and(|source| source.read_only) {
                         span { class: "importer-badge read-only", "read-only" }
-                    }
-                    if switch_allowed {
-                        button {
-                            class: "importer-switch-btn",
-                            r#type: "button",
-                            role: "radio",
-                            aria_checked: if is_viewing { "true" } else { "false" },
-                            "data-source-id": "{profile.id}",
-                            "data-viewing": if is_viewing { "true" } else { "false" },
-                            disabled: is_viewing || !selectable,
-                            title: "{switch_title}",
-                            onclick: move |_| {
-                                on_switch((!is_default).then(|| switch_id.clone()));
-                            },
-                            if is_viewing { "viewing" } else { "view" }
-                        }
                     }
                 }
             }
@@ -342,70 +338,103 @@ fn importer_card(
                 p { class: "importer-description", "{profile.description}" }
             }
             dl { class: "importer-facts importer-identity",
-                {importer_fact("kind", "kind", &profile.kind)}
                 {importer_fact("source id", "source-id", source_id)}
                 if let Some(interval) = profile.filesystem_rescan_interval_seconds {
                     {importer_fact(
-                        "filesystem rescan",
+                        "scan",
                         "filesystem-rescan",
                         &format!("{interval}s"),
                     )}
                 }
             }
-            if let Some(source) = &profile.source {
-                section { class: "importer-contract importer-consumer",
-                    h4 {
-                        if source.read_only { "Read-only consumer" } else { "Filesystem source" }
-                    }
-                    dl { class: "importer-facts",
-                        {importer_fact("volume", "consumer-volume", &source.volume_name)}
-                        {importer_fact("claim", "consumer-claim", &source.existing_claim)}
-                        {importer_fact("mount", "consumer-mount", &source.mount_path)}
-                        {importer_fact("input", "consumer-input", &source.path)}
-                        {importer_fact(
-                            "access",
-                            "consumer-access",
-                            if source.read_only { "read-only" } else { "read-write" },
-                        )}
+            // Primary action: switch to this source. Disabled when already
+            // viewing it, hidden for sources graph-api cannot construct at
+            // runtime. The default source's action is `None` (clears the
+            if switch_allowed {
+                div { class: "importer-switch-row",
+                    button {
+                        class: "{button_class}",
+                        r#type: "button",
+                        role: "radio",
+                        aria_checked: if is_viewing { "true" } else { "false" },
+                        "data-source-id": "{profile.id}",
+                        "data-viewing": if is_viewing { "true" } else { "false" },
+                        disabled: is_viewing || !selectable,
+                        onclick: move |_| {
+                            on_switch((!is_default).then(|| switch_id.clone()));
+                        },
+                        "{button_label}"
                     }
                 }
             }
-            if let Some(producer) = &profile.producer {
-                section { class: "importer-contract importer-producer",
-                    h4 { "Producer contract" }
-                    dl { class: "importer-facts",
-                        {importer_fact("chart", "producer-chart", &producer.chart)}
-                        {importer_fact(
-                            "default claim",
-                            "producer-default-claim",
-                            &producer.default_claim,
-                        )}
-                        {importer_fact(
-                            "repository root",
-                            "producer-repository-root",
-                            &producer.repository_root,
-                        )}
-                        {importer_fact(
-                            "workflow input",
-                            "producer-workflow-input",
-                            &producer.workflow_input,
-                        )}
-                        {importer_fact(
-                            "writer value",
-                            "producer-existing-claim-value-path",
-                            &producer.existing_claim_value_path,
-                        )}
-                        {importer_fact(
-                            "writer claim",
-                            "producer-existing-claim-value",
-                            &producer.existing_claim_value,
-                        )}
+            // Deployment-side details collapse behind a native `<details>`
+            // element so the default card stays compact while the
+            // browser regression's `data-field="consumer-*" /
+            // producer-*` selectors still resolve (the nodes are in the
+            // DOM regardless of disclosure state).
+            if has_details {
+                details { class: "importer-details",
+                    summary { class: "importer-details-summary",
+                        span { "Deployment details" }
+                        span { class: "importer-details-hint", "filesystem + producer contract" }
+                    }
+                    if let Some(source) = &profile.source {
+                        section { class: "importer-contract importer-consumer",
+                            h4 {
+                                if source.read_only { "Read-only consumer" } else { "Filesystem source" }
+                            }
+                            dl { class: "importer-facts",
+                                {importer_fact("volume", "consumer-volume", &source.volume_name)}
+                                {importer_fact("claim", "consumer-claim", &source.existing_claim)}
+                                {importer_fact("mount", "consumer-mount", &source.mount_path)}
+                                {importer_fact("input", "consumer-input", &source.path)}
+                                {importer_fact(
+                                    "access",
+                                    "consumer-access",
+                                    if source.read_only { "read-only" } else { "read-write" },
+                                )}
+                            }
+                        }
+                    }
+                    if let Some(producer) = &profile.producer {
+                        section { class: "importer-contract importer-producer",
+                            h4 { "Producer contract" }
+                            dl { class: "importer-facts",
+                                {importer_fact("chart", "producer-chart", &producer.chart)}
+                                {importer_fact(
+                                    "default claim",
+                                    "producer-default-claim",
+                                    &producer.default_claim,
+                                )}
+                                {importer_fact(
+                                    "repository root",
+                                    "producer-repository-root",
+                                    &producer.repository_root,
+                                )}
+                                {importer_fact(
+                                    "workflow input",
+                                    "producer-workflow-input",
+                                    &producer.workflow_input,
+                                )}
+                                {importer_fact(
+                                    "writer value",
+                                    "producer-existing-claim-value-path",
+                                    &producer.existing_claim_value_path,
+                                )}
+                                {importer_fact(
+                                    "writer claim",
+                                    "producer-existing-claim-value",
+                                    &producer.existing_claim_value,
+                                )}
+                            }
+                        }
                     }
                 }
             }
         }
     }
 }
+
 
 fn importer_catalog(
     catalog: &api::ImporterCatalog,
@@ -432,6 +461,26 @@ fn importer_catalog(
     let viewing_non_default = switch.enabled
         && viewing.is_some()
         && viewing.as_deref() != catalog.selected.as_deref();
+    // Split profiles into the one the viewer is currently looking at
+    // (prominent) and the alternatives they could switch to (compact list).
+    // When the viewer has no session override, the deployment default is
+    // the active view; otherwise the override is.
+    let (viewing_profile, other_profiles): (Option<&api::ImporterProfile>, Vec<&api::ImporterProfile>) = {
+        let viewing_id = viewing.as_deref();
+        let active = catalog.sources.iter().find(|p| match viewing_id {
+            Some(id) => p.id == id,
+            None => p.selected,
+        });
+        let others: Vec<&api::ImporterProfile> = catalog
+            .sources
+            .iter()
+            .filter(|p| match viewing_id {
+                Some(id) => p.id != id,
+                None => !p.selected,
+            })
+            .collect();
+        (active, others)
+    };
     rsx! {
         div {
             class: "importers-view",
@@ -478,15 +527,39 @@ fn importer_catalog(
                     {importer_fact("selected profile", "selected-profile", selected)}
                 }
             }
-            div { class: "importer-list", "aria-label": "Configured importer profiles",
-                role: "radiogroup",
-                for profile in &catalog.sources {
-                    {importer_card(profile, switch_allowed, viewing.as_deref(), on_switch)}
+            // Currently-viewing: single prominent card so the viewer's eye
+            // lands on it without scanning a list.
+            if let Some(viewing_profile) = viewing_profile {
+                section {
+                    class: "importer-section importer-section-viewing",
+                    div { class: "importer-section-label", "Currently viewing" }
+                    div { class: "importer-list", "aria-label": "Active source",
+                        {importer_card(viewing_profile, switch_allowed, viewing.as_deref(), on_switch)}
+                    }
+                }
+            }
+            // Alternatives: compact list of every other runnable source. The
+            // default sits here when the viewer is currently looking at an
+            // override (return-target); alternates sit here otherwise.
+            if !other_profiles.is_empty() {
+                section {
+                    class: "importer-section importer-section-alternates",
+                    div {
+                        class: "importer-section-label",
+                        if viewing_non_default { "Return to default" } else { "Other sources" }
+                    }
+                    div { class: "importer-list", "aria-label": "Other configured sources",
+                        role: "radiogroup",
+                        for profile in &other_profiles {
+                            {importer_card(profile, switch_allowed, viewing.as_deref(), on_switch)}
+                        }
+                    }
                 }
             }
         }
     }
 }
+
 
 #[allow(non_snake_case)]
 fn ImportersSettings(props: DelegateProps) -> Element {
