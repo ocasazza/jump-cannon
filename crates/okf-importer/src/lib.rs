@@ -201,8 +201,40 @@ impl OkfImporter {
 
     /// Load and validate one complete snapshot.
     pub fn load_checked(&self) -> Result<LoadResult, OkfError> {
-        let concepts = self.read_concepts()?;
+        let mut concepts = self.read_concepts()?;
+        Self::annotate_tag_degrees(&mut concepts);
         self.map_concepts(concepts)
+    }
+
+    /// Add a `tag_degrees: {tag: count}` frontmatter entry to every
+    /// concept, where `count` is the number of concepts in this bundle
+    /// that share the tag. The graph itself stays free of tag
+    /// co-occurrence edges (clique explosion), but the renderer /
+    /// search can filter by `tag_degrees.<tag>` to surface rare-tag
+    /// clusters or suppress popular-tag noise — degree is the only
+    /// signal needed to make that decision.
+    fn annotate_tag_degrees(concepts: &mut [ParsedConcept]) {
+        use std::collections::HashMap;
+        let mut counts: HashMap<String, usize> = HashMap::new();
+        for c in concepts.iter() {
+            for t in &c.tags {
+                *counts.entry(t.clone()).or_insert(0) += 1;
+            }
+        }
+        for c in concepts.iter_mut() {
+            let mut entry = serde_json::Map::with_capacity(c.tags.len());
+            for t in &c.tags {
+                if let Some(&n) = counts.get(t) {
+                    entry.insert(t.clone(), serde_json::Value::from(n as u64));
+                }
+            }
+            if !entry.is_empty() {
+                c.frontmatter.insert(
+                    "tag_degrees".to_string(),
+                           serde_json::Value::Object(entry),
+                );
+            }
+        }
     }
 
     fn read_concepts(&self) -> Result<Vec<ParsedConcept>, OkfError> {
@@ -1400,6 +1432,15 @@ fn url_keys_for(url: &str) -> Vec<String> {
             {
                 keys.push(format!("{}/{}", segments[2], segments[5..].join("/")));
             }
+            // `/browse/{KEY}` (Jira) — emit the bare `KEY` so the
+            // resolver can match body / description links against
+            // `external_id: jira:{KEY}` in the source side.
+            if segments.len() >= 2 && segments[segments.len() - 2] == "browse" {
+                let key = segments[segments.len() - 1];
+                if !key.is_empty() {
+                    keys.push(key.to_string());
+                }
+            }
         }
     }
     keys
@@ -2202,6 +2243,80 @@ description: empty\n\
             )])
         );
         assert!(result.unresolved.is_empty());
+    }
+
+
+
+    #[test]
+    fn jira_browse_url_resolves_via_external_id_tail() {
+        // Body / description cross-references in the lavender-ingest
+        // corpus use Jira `browse/{KEY}` URLs. The OKF schema stores
+        // the matching `external_id: jira:{KEY}` on the concept. The
+        // url_keys_for normaliser must extract just `{KEY}` from
+        // `/browse/{KEY}` so the resolver can match it against the
+        // external_id tail index. Without this, every Jira cross-ref
+        // would land in the `browse/KEY` bin and never resolve.
+        let fixture = TempDir::new().unwrap();
+        write(
+            fixture.path(),
+            "jira/issue-1.md",
+            "---\ntype: concept\ntitle: Issue 1\nsource_url: https://schrodinger.atlassian.net/browse/PROJ-1\nexternal_id: jira:PROJ-1\n---\n",
+        );
+        write(
+            fixture.path(),
+            "jira/issue-2.md",
+            "---\ntype: concept\ntitle: Issue 2\nsource_url: https://schrodinger.atlassian.net/browse/PROJ-2\nexternal_id: jira:PROJ-2\n---\n[see](https://schrodinger.atlassian.net/browse/PROJ-1)\n",
+        );
+
+        let result = load(fixture.path());
+
+        assert_eq!(result.graph.node_count(), 2);
+        assert_eq!(
+            edges(&result),
+            BTreeSet::from([(
+                "okf:fixture:jira/issue-2".into(),
+                "okf:fixture:jira/issue-1".into(),
+            )])
+        );
+        assert!(result.unresolved.is_empty());
+    }
+
+    #[test]
+    fn tag_degrees_are_emitted_per_concept() {
+        // The tag-degree field stores the per-bundle count for each of
+        // the concept's tags. The graph itself stays free of tag
+        // co-occurrence edges (those would cliquify on the source /
+        // space / project tags), but the renderer can filter by
+        // degree to surface rare-tag clusters or suppress popular-tag
+        // noise.
+        let fixture = TempDir::new().unwrap();
+        write(
+            fixture.path(),
+            "common.md",
+            "---\ntype: concept\ntags: [popular, shared]\n---\n",
+        );
+        write(
+            fixture.path(),
+            "rare.md",
+            "---\ntype: concept\ntags: [shared, niche]\n---\n",
+        );
+        write(
+            fixture.path(),
+            "lone.md",
+            "---\ntype: concept\ntags: [lone]\n---\n",
+        );
+
+        let result = load(fixture.path());
+        assert_eq!(result.graph.node_count(), 3);
+
+        let common = &result.graph.nodes["okf:fixture:common"].meta.frontmatter;
+        let rare = &result.graph.nodes["okf:fixture:rare"].meta.frontmatter;
+        let lone = &result.graph.nodes["okf:fixture:lone"].meta.frontmatter;
+        assert_eq!(common["tag_degrees"]["popular"], serde_json::json!(1));
+        assert_eq!(common["tag_degrees"]["shared"], serde_json::json!(2));
+        assert_eq!(rare["tag_degrees"]["shared"], serde_json::json!(2));
+        assert_eq!(rare["tag_degrees"]["niche"], serde_json::json!(1));
+        assert_eq!(lone["tag_degrees"]["lone"], serde_json::json!(1));
     }
 
     #[test]
