@@ -264,7 +264,7 @@ spec:
             - name: github-importer-cache
               mountPath: {{ .Values.githubImporter.cacheDir | quote }}
             {{- end }}
-            {{- if $usesHttpJson }}
+            {{- if $needsHttpJsonPackages }}
             - name: importer-packages
               mountPath: {{ .Values.httpJsonImporter.mountPath | quote }}
               readOnly: true
@@ -286,7 +286,7 @@ spec:
               readOnly: true
             {{- end }}
           {{- end }}
-      {{- if or $usesFilesystem $usesKubernetes $usesGitHub $usesHttpJson $gpuSession $dormantSources }}
+      {{- if or $usesFilesystem $usesKubernetes $usesGitHub $needsHttpJsonPackages $gpuSession $dormantSources }}
       volumes:
         {{- if $usesGitHub }}
         - name: github-importer-cache
