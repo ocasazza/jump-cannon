@@ -16,8 +16,8 @@ use serde_json::Value;
 use vault_data::{NodeMeta, VaultEdge, VaultGraph, VaultNode};
 
 use crate::manifest::{
-    Collection, Dedupe, EdgeListRules, EdgeRule, FieldRule, MatchOn, NodeRules, Predicate,
-    Produces, TitleRule, Transform, ValidatedPackage,
+    Collection, Dedupe, EdgeListRules, EdgeRule, FieldRule, MatchOn, NodeRules, Pagination,
+    Predicate, Produces, TitleRule, Transform, ValidatedPackage,
 };
 use crate::RECORD_COLLECTION_KEY;
 
@@ -109,6 +109,23 @@ impl GraphMapper for ManifestMapper {
                     }
                 })?;
                 let local = format!("{}{raw_id}", rules.local_prefix);
+                if locals.contains_key(&local) && collection.paginate == Pagination::LimitOffset {
+                    // Offset pagination against a live-mutating remote list
+                    // (e.g. Hindsight's async LLM extraction continuing to
+                    // write while a page walk is in flight) can re-observe
+                    // the same record at a different offset when items
+                    // shift position between page fetches. That is the same
+                    // record by id, not a real collision -- the graph's
+                    // strict `try_add_node` hard-fail below stays in force
+                    // for `Pagination::None` collections, where a duplicate
+                    // id can only mean a genuine package/data bug.
+                    tracing::debug!(
+                        collection = %collection.name,
+                        id = %raw_id,
+                        "duplicate node id from paginated re-fetch; keeping first occurrence"
+                    );
+                    continue;
+                }
                 let node_id = self.namespace.node_id(&local)?;
                 let title = title_for(&rules.title, document, &raw_id);
                 let tags = tags_for(rules, document);

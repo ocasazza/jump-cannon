@@ -388,3 +388,55 @@ fn records_are_grouped_by_their_collection_tag_not_by_order() {
     assert!(has_edge(&result, "u1", "document:doc-1"));
     assert_eq!(result.graph.node_count(), 5);
 }
+
+#[test]
+fn duplicate_node_id_from_paginated_recollection_is_tolerated() {
+    // Simulates offset pagination re-observing "u1" on a second "memories"
+    // page after it shifted position under concurrent writes (the Hindsight
+    // omp-bank failure mode this guards against). The paginated collection
+    // must keep the first occurrence and must not error.
+    let mut records = hindsight_records();
+    records.push(record(
+        "memories",
+        json!({"items": [
+            {"id": "u1", "text": "A different later snapshot of the same unit",
+             "entities": "tofu, Hydra", "tags": [], "state": "valid", "document_id": "doc-1"}
+        ]}),
+    ));
+    let result = mapper().map(records).expect("duplicate from pagination is tolerated, not an error");
+    assert_eq!(
+        result.graph.node_count(),
+        5,
+        "the re-observed u1 must not add a second node"
+    );
+    let kept = result
+        .graph
+        .nodes
+        .get(&node_id("u1"))
+        .expect("u1 present");
+    assert_eq!(
+        kept.meta.frontmatter["body"],
+        json!("First fact about tofu state migration handling"),
+        "the first occurrence must win, not the later duplicate page"
+    );
+}
+
+#[test]
+fn duplicate_node_id_in_non_paginated_collection_still_fails() {
+    // "documents" declares no `paginate`, so it defaults to `Pagination::None`
+    // (a single request) -- a duplicate id there can only be a genuine
+    // package/data bug and must still hard-fail.
+    let mut records = hindsight_records();
+    records.push(record(
+        "documents",
+        json!({"items": [{"id": "doc-1", "name": "a conflicting second document"}]}),
+    ));
+    let error = mapper()
+        .map(records)
+        .expect_err("a genuine duplicate id in a non-paginated collection must fail");
+    let message = error.to_string();
+    assert!(
+        message.contains("duplicate node id"),
+        "unexpected error: {message}"
+    );
+}

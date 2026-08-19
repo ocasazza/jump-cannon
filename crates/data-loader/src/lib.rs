@@ -399,9 +399,9 @@ impl ImporterSchema {
         if !self.link_rules.is_empty() {
             for rule in &self.link_rules {
                 if rule.path.trim().is_empty() {
-                    return Err(invalid_descriptor(format!(
-                        "link rule path must be a non-empty dotted YAML path"
-                    )));
+                    return Err(invalid_descriptor(
+                        "link rule path must be a non-empty dotted YAML path".to_string(),
+                    ));
                 }
                 if !edge_keys.contains(rule.kind.as_str()) {
                     return Err(invalid_descriptor(format!(
