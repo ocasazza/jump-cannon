@@ -68,7 +68,7 @@ graphApi:
 # wires named Obsidian, Kubernetes, and OKF profiles; other graph-api source
 # kinds remain available through their source-specific CLI configuration.
 importers:
-  selected: "hindsight-memory-bank"
+  selected: ""
   # NetBird group allowed to switch the viewed source at runtime from
   # Settings > Importers (per browser session, read-only graph views; writes
   # and compute stay on the deployment-selected source). Empty disables
@@ -104,16 +104,69 @@ importers:
     # sets it to `kubernetes-clients`). Stays in sync by hand — the chart
     # does not auto-derive catalog entries from `httpJsonImporter` so
     # dormant alternates can be removed or overridden per-deployment.
+    # Each bank is a separate runtime profile because the httpjson package
+    # binds one tenant + bank per importer instance. The default `omp` bank
+    # remains `hindsight-memory-bank`; the named alternates are selectable
+    # from Settings > Importers when the runtime switch group is allowed.
     hindsight-memory-bank:
-      displayName: Hindsight Memory Bank
-      description: Read the Hindsight agent-memory server's omp bank through the httpjson package engine (charts/jump-cannon/packages/hindsight-memory-bank.toml). Same connection details as the rollout httpJsonImporter binding below, offered here as a runtime-switchable alternate.
+      displayName: Hindsight Memory Bank · omp
+      description: Hindsight agent-memory bank `omp`, imported read-only through the shared httpjson package engine.
       kind: httpjson
+      sourceId: hindsight-omp
       httpJson:
         package: hindsight-memory-bank.toml
         endpoint: http://hindsight-api-proxy.hindsight.svc.cluster.local
         variables:
           tenant: default
           bank: omp
+        pollIntervalMs: 60000
+    hindsight-memory-bank-jira-ithelp-canary:
+      displayName: Hindsight Memory Bank · jira-ithelp-canary
+      description: Hindsight agent-memory bank `jira-ithelp-canary`, imported read-only through the shared httpjson package engine.
+      kind: httpjson
+      sourceId: hindsight-jira-ithelp-canary
+      httpJson:
+        package: hindsight-memory-bank.toml
+        endpoint: http://hindsight-api-proxy.hindsight.svc.cluster.local
+        variables:
+          tenant: default
+          bank: jira-ithelp-canary
+        pollIntervalMs: 60000
+    hindsight-memory-bank-confluence-itkb:
+      displayName: Hindsight Memory Bank · confluence-itkb
+      description: Hindsight agent-memory bank `confluence-itkb`, imported read-only through the shared httpjson package engine.
+      kind: httpjson
+      sourceId: hindsight-confluence-itkb
+      httpJson:
+        package: hindsight-memory-bank.toml
+        endpoint: http://hindsight-api-proxy.hindsight.svc.cluster.local
+        variables:
+          tenant: default
+          bank: confluence-itkb
+        pollIntervalMs: 60000
+    hindsight-memory-bank-confluence-itkb-canary:
+      displayName: Hindsight Memory Bank · confluence-itkb-canary
+      description: Hindsight agent-memory bank `confluence-itkb-canary`, imported read-only through the shared httpjson package engine.
+      kind: httpjson
+      sourceId: hindsight-confluence-itkb-canary
+      httpJson:
+        package: hindsight-memory-bank.toml
+        endpoint: http://hindsight-api-proxy.hindsight.svc.cluster.local
+        variables:
+          tenant: default
+          bank: confluence-itkb-canary
+        pollIntervalMs: 60000
+    hindsight-memory-bank-jira-ithelp:
+      displayName: Hindsight Memory Bank · jira-ithelp
+      description: Hindsight agent-memory bank `jira-ithelp`, imported read-only through the shared httpjson package engine.
+      kind: httpjson
+      sourceId: hindsight-jira-ithelp
+      httpJson:
+        package: hindsight-memory-bank.toml
+        endpoint: http://hindsight-api-proxy.hindsight.svc.cluster.local
+        variables:
+          tenant: default
+          bank: jira-ithelp
         pollIntervalMs: 60000
 
 # okf-sync CronJob: fast-forward git-pulls the lavender OKF repository
