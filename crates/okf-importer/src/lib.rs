@@ -716,7 +716,23 @@ fn parse_concept(id: &str, raw: String, mtime: i64) -> Result<ParsedConcept, Okf
     let mut links = markdown_links(body);
     links.sort();
     links.dedup();
-
+    // Auto-imported OKF corpora (lavender-ingest) store their page content
+    // in the `description` frontmatter string rather than the markdown
+    // body — the YAML block ends right after the metadata, leaving the body
+    // section empty. Re-run the markdown link extractor over the
+    // `description` field so URL-based cross-references inside that field
+    // also land in the link stream the URL resolver sees.
+    if let Some(description) = yaml_string(mapping, "description") {
+        if !description.trim().is_empty() {
+            for url in markdown_links(description) {
+                if !links.contains(&url) {
+                    links.push(url);
+                }
+            }
+        }
+    }
+    links.sort();
+    links.dedup();
     let mut frontmatter = HashMap::new();
     for (key, value) in mapping {
         let Some(key) = key.as_str() else {
@@ -2030,6 +2046,45 @@ see [issue 2](https://atlassian.example.com/browse/PROJ-2)\n",
         );
         assert!(result.unresolved.is_empty());
         assert_eq!(result.graph.node_count(), 5);
+    }
+
+    #[test]
+    fn description_frontmatter_body_links_resolve_against_concepts() {
+        let fixture = TempDir::new().unwrap();
+        // Auto-imported OKF corpora (lavender-ingest) leave the markdown
+        // body empty and put the page content in the `description`
+        write(
+            fixture.path(),
+            "knowledge/alpha.md",
+            "---\n\
+type: concept\n\
+title: Alpha\n\
+source_url: https://confluence.example.com/display/LD/Alpha\n\
+description: \"# Alpha Page\\nSee the [Beta page](https://confluence.example.com/display/LD/Beta) for context.\"\n\
+---\n",
+        );
+        write(
+            fixture.path(),
+            "knowledge/beta.md",
+            "---\n\
+type: concept\n\
+title: Beta\n\
+source_url: https://confluence.example.com/display/LD/Beta\n\
+description: empty\n\
+---\n",
+        );
+
+        let result = load(fixture.path());
+
+        assert_eq!(result.graph.node_count(), 2);
+        assert_eq!(
+            edges(&result),
+            BTreeSet::from([(
+                "okf:fixture:knowledge/alpha".into(),
+                "okf:fixture:knowledge/beta".into(),
+            )])
+        );
+        assert!(result.unresolved.is_empty());
     }
 
     #[test]
