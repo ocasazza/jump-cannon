@@ -1377,7 +1377,6 @@ fn url_keys_for(url: &str) -> Vec<String> {
             }
         }
     }
-    // `/display/{space}/{title}` → last two path segments joined
     if let Some(path_start) = trimmed.find("://").map(|i| i + 3) {
         if let Some(path) = trimmed[path_start..].split('?').next() {
             let segments: Vec<&str> = path
@@ -1387,6 +1386,19 @@ fn url_keys_for(url: &str) -> Vec<String> {
             if segments.len() >= 2 {
                 let display_form = format!("{}/{}", segments[segments.len() - 2], segments[segments.len() - 1]);
                 keys.push(display_form);
+            }
+            // `/wiki/spaces/{space}/pages/{page_id}/{title}` — emit the
+            // canonical `/display/{space}/{title}` form so body /
+            // description URLs in the display form can resolve. The
+            // lavender-ingest corpus stores source_urls in the page-view
+            // form but cross-references in the display form; same page,
+            // different URL.
+            if segments.len() >= 6
+                && segments[0] == "wiki"
+                && segments[1] == "spaces"
+                && segments[3] == "pages"
+            {
+                keys.push(format!("{}/{}", segments[2], segments[5..].join("/")));
             }
         }
     }
