@@ -68,7 +68,7 @@ graphApi:
 # wires named Obsidian, Kubernetes, and OKF profiles; other graph-api source
 # kinds remain available through their source-specific CLI configuration.
 importers:
-  selected: ""
+  selected: "hindsight-memory-bank"
   # NetBird group allowed to switch the viewed source at runtime from
   # Settings > Importers (per browser session, read-only graph views; writes
   # and compute stay on the deployment-selected source). Empty disables
