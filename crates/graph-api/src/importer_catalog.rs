@@ -30,6 +30,9 @@ const MAX_LABEL_BYTES: usize = 256;
 const MAX_DESCRIPTION_BYTES: usize = 4 * 1024;
 const MAX_PATH_BYTES: usize = 4 * 1024;
 const MAX_RESCAN_SECONDS: u64 = 24 * 60 * 60;
+const MAX_PACKAGE_FILENAME_BYTES: usize = 256;
+const MAX_ENDPOINT_BYTES: usize = 2048;
+const MAX_POLL_INTERVAL_MS: u64 = 24 * 60 * 60 * 1000;
 
 /// Canonical source kind serialized by the read-only catalog endpoint.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -42,10 +45,13 @@ pub enum CatalogSourceKind {
     Okf,
     Pest,
     GitHub,
-    /// A paged JSON API read through the declarative package engine. Like the
-    /// other remote kinds it is never constructible from chart catalog
-    /// metadata alone (the package, endpoint, and variables live in CLI
-    /// config).
+    /// A paged JSON API read through the declarative package engine. The
+    /// rollout path (`--source=httpjson`) binds one package via CLI/env
+    /// configuration and is unaffected by this enum. The catalog path
+    /// (`Importers > catalog` with `kind: httpjson`) is constructible at
+    /// runtime from chart catalog metadata: the package filename, the API
+    /// endpoint, and the per-instance variables are declared on the
+    /// profile and resolved server-side.
     HttpJson,
     /// Session-manager shared world; never constructible from chart catalog
     /// metadata (no filesystem source), like the other non-filesystem kinds.
@@ -78,6 +84,28 @@ pub struct ImporterFilesystemSource {
     pub path: String,
     pub read_only: bool,
 }
+/// Read-only HTTP/JSON package-importer contract for one source instance.
+/// `token_env` names an environment variable ALREADY present in this
+/// process's environment (populated by the deployment's Secret wiring,
+/// if any) — resolved server-side at alternate-construction time. The
+/// catalog and this struct never carry the token's actual value.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ImporterHttpJsonSource {
+    pub package: String,
+    pub endpoint: String,
+    #[serde(default)]
+    pub variables: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_env: Option<String>,
+    #[serde(default = "default_http_json_poll_interval_ms")]
+    pub poll_interval_ms: u64,
+}
+
+fn default_http_json_poll_interval_ms() -> u64 {
+    60_000
+}
+
 
 /// Producer-side handoff metadata shown to operators.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -106,20 +134,26 @@ pub struct ImporterSourceDefinition {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<ImporterFilesystemSource>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub http_json: Option<ImporterHttpJsonSource>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub producer: Option<ImporterProducerContract>,
 }
 
 impl ImporterSourceDefinition {
     /// Whether graph-api can construct this source at runtime from catalog
-    /// metadata alone. v1: the filesystem kinds (Obsidian, OKF) with a
-    /// filesystem source contract — everything else needs configuration the
-    /// catalog deliberately does not carry (GitHub repo/token, Kubernetes
-    /// allowlists, Pest packages, Nix expressions).
+    /// metadata alone. Filesystem kinds (Obsidian, OKF) need a filesystem
+    /// source contract; HTTP/JSON needs an endpoint + package binding.
+    /// Everything else still needs configuration the catalog deliberately
+    /// does not carry (GitHub repo/token, Kubernetes allowlists, Pest
+    /// packages, Nix expressions).
     pub fn runnable(&self) -> bool {
-        matches!(
+        let filesystem_kind = matches!(
             self.kind,
             CatalogSourceKind::Obsidian | CatalogSourceKind::Okf
-        ) && self.source.is_some()
+        );
+        let http_json_kind = self.kind == CatalogSourceKind::HttpJson;
+        (filesystem_kind && self.source.is_some())
+            || (http_json_kind && self.http_json.is_some())
     }
 }
 
@@ -271,6 +305,7 @@ impl ImporterCatalog {
                     active: selected && self.active_kind == Some(definition.kind),
                     runnable: definition.runnable(),
                     source: definition.source.clone(),
+                    http_json: definition.http_json.clone(),
                     producer: definition.producer.clone(),
                 }
             })
@@ -362,6 +397,8 @@ pub struct ImporterCatalogItem {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source: Option<ImporterFilesystemSource>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub http_json: Option<ImporterHttpJsonSource>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub producer: Option<ImporterProducerContract>,
 }
 
@@ -417,6 +454,54 @@ fn validate_source(id: &str, source: &ImporterSourceDefinition) -> Result<(), St
         return Err(format!(
             "OKF source {id:?} must declare a read-only filesystem source"
         ));
+    }
+
+    let http_json_kind = source.kind == CatalogSourceKind::HttpJson;
+    if !http_json_kind && source.http_json.is_some() {
+        return Err(format!(
+            "source {id:?} kind {:?} must not declare an httpJson contract",
+            source.kind
+        ));
+    }
+    if http_json_kind && source.http_json.is_none() {
+        return Err(format!(
+            "httpJson source {id:?} must declare an httpJson contract"
+        ));
+    }
+
+    if let Some(http_json) = &source.http_json {
+        validate_nonempty("httpJson.package", &http_json.package, MAX_PACKAGE_FILENAME_BYTES)?;
+        if http_json.package.contains('/') {
+            return Err(format!(
+                "source {id:?} httpJson.package must not contain '/'"
+            ));
+        }
+        if http_json.package == "." || http_json.package == ".." {
+            return Err(format!(
+                "source {id:?} httpJson.package must not be '.' or '..'"
+            ));
+        }
+        validate_nonempty("httpJson.endpoint", &http_json.endpoint, MAX_ENDPOINT_BYTES)?;
+        if !(http_json.endpoint.starts_with("http://")
+            || http_json.endpoint.starts_with("https://"))
+        {
+            return Err(format!(
+                "source {id:?} httpJson.endpoint must start with http:// or https://"
+            ));
+        }
+        if let Some(token_env) = &http_json.token_env {
+            validate_env_var_name("httpJson.tokenEnv", token_env)?;
+        }
+        if http_json.poll_interval_ms == 0 {
+            return Err(format!(
+                "source {id:?} httpJson.pollIntervalMs must be non-zero"
+            ));
+        }
+        if http_json.poll_interval_ms > MAX_POLL_INTERVAL_MS {
+            return Err(format!(
+                "source {id:?} httpJson.pollIntervalMs exceeds {MAX_POLL_INTERVAL_MS}"
+            ));
+        }
     }
 
     if let Some(filesystem) = &source.source {
@@ -539,6 +624,22 @@ fn validate_nonempty(field: &str, value: &str, max: usize) -> Result<(), String>
 fn validate_bounded(field: &str, value: &str, max: usize) -> Result<(), String> {
     if value.len() > max {
         return Err(format!("{field} exceeds {max} bytes"));
+    }
+    Ok(())
+}
+
+fn validate_env_var_name(field: &str, value: &str) -> Result<(), String> {
+    validate_nonempty(field, value, MAX_ID_BYTES)?;
+    let bytes = value.as_bytes();
+    let first = bytes[0];
+    let first_valid = first.is_ascii_uppercase() || first == b'_';
+    let rest_valid = bytes[1..]
+        .iter()
+        .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || *byte == b'_');
+    if !first_valid || !rest_valid {
+        return Err(format!(
+            "{field} must be a POSIX environment variable name ([A-Z_][A-Z0-9_]*)"
+        ));
     }
     Ok(())
 }
@@ -887,5 +988,154 @@ mod tests {
         assert!(ImporterCatalog::parse(Some(&whitespace), SourceKind::Okf)
             .unwrap_err()
             .contains("maximum"));
+    }
+
+    const HINDSIGHT: &str = r#"{
+      "sources": {
+        "hindsight-memory-bank": {
+          "displayName": "Hindsight Memory Bank",
+          "description": "Read the omp bank of the Hindsight memory service.",
+          "kind": "httpjson",
+          "httpJson": {
+            "package": "hindsight-memory-bank.toml",
+            "endpoint": "http://hindsight-api-proxy.hindsight.svc.cluster.local",
+            "variables": { "tenant": "default", "bank": "omp" },
+            "pollIntervalMs": 60000
+          }
+        }
+      }
+    }"#;
+
+    #[test]
+    fn accepts_httpjson_source_and_marks_it_runnable() {
+        let catalog = ImporterCatalog::parse(Some(HINDSIGHT), SourceKind::HttpJson).unwrap();
+        let response = catalog.response(
+            &SnapshotSource::new("httpjson", "HTTP/JSON", "1.0"),
+            &RuntimeSwitchStatus::disabled(),
+        );
+        assert_eq!(response.sources.len(), 1);
+        let item = &response.sources[0];
+        assert_eq!(item.id, "hindsight-memory-bank");
+        assert_eq!(item.kind, CatalogSourceKind::HttpJson);
+        assert!(item.runnable, "httpjson with httpJson contract is runnable");
+        let http_json = item
+            .http_json
+            .as_ref()
+            .expect("httpJson present in API response");
+        assert_eq!(http_json.package, "hindsight-memory-bank.toml");
+        assert_eq!(http_json.endpoint,
+            "http://hindsight-api-proxy.hindsight.svc.cluster.local");
+        assert_eq!(http_json.variables.get("bank").map(String::as_str), Some("omp"));
+        assert_eq!(http_json.poll_interval_ms, 60_000);
+
+        let definition = catalog
+            .source("hindsight-memory-bank")
+            .expect("httpjson source lookup");
+        assert!(definition.runnable());
+    }
+
+    #[test]
+    fn rejects_httpjson_kind_without_http_json_contract() {
+        let raw = r#"{
+          "sources": {
+            "broken": {
+              "displayName": "Broken",
+              "description": "httpjson kind with no httpJson contract",
+              "kind": "httpjson"
+            }
+          }
+        }"#;
+        let err = ImporterCatalog::parse(Some(raw), SourceKind::HttpJson)
+            .unwrap_err();
+        assert!(err.contains("httpJson source"), "got: {err}");
+    }
+
+    #[test]
+    fn rejects_http_json_contract_on_non_httpjson_kind() {
+        let raw = r#"{
+          "sources": {
+            "wrong-kind": {
+              "displayName": "Wrong kind",
+              "description": "okf kind declaring httpJson",
+              "kind": "okf",
+              "sourceId": "okf-id",
+              "source": {
+                "volumeName": "vault",
+                "existingClaim": "vault",
+                "mountPath": "/vault",
+                "path": "/vault",
+                "readOnly": true
+              },
+              "httpJson": {
+                "package": "hindsight-memory-bank.toml",
+                "endpoint": "http://example.invalid"
+              }
+            }
+          }
+        }"#;
+        let err = ImporterCatalog::parse(Some(raw), SourceKind::Okf).unwrap_err();
+        assert!(err.contains("must not declare an httpJson contract"), "got: {err}");
+    }
+
+    #[test]
+    fn rejects_httpjson_endpoint_with_bad_scheme() {
+        let raw = r#"{
+          "sources": {
+            "bad-scheme": {
+              "displayName": "Bad scheme",
+              "description": "ws endpoint, not http(s)",
+              "kind": "httpjson",
+              "httpJson": {
+                "package": "hindsight-memory-bank.toml",
+                "endpoint": "ws://hindsight-api-proxy.invalid"
+              }
+            }
+          }
+        }"#;
+        let err = ImporterCatalog::parse(Some(raw), SourceKind::HttpJson)
+            .unwrap_err();
+        assert!(err.contains("http:// or https://"), "got: {err}");
+    }
+
+    #[test]
+    fn rejects_httpjson_token_env_with_lowercase_or_empty() {
+        let raw = r#"{
+          "sources": {
+            "bad-env": {
+              "displayName": "Bad env",
+              "description": "lowercase tokenEnv",
+              "kind": "httpjson",
+              "httpJson": {
+                "package": "hindsight-memory-bank.toml",
+                "endpoint": "http://example.invalid",
+                "tokenEnv": "hindsight_token"
+              }
+            }
+          }
+        }"#;
+        let err = ImporterCatalog::parse(Some(raw), SourceKind::HttpJson)
+            .unwrap_err();
+        assert!(err.contains("POSIX environment variable name"), "got: {err}");
+    }
+
+    #[test]
+    fn rejects_httpjson_zero_poll_interval() {
+        let raw = r#"{
+          "sources": {
+            "zero-poll": {
+              "displayName": "Zero poll",
+              "description": "zero pollIntervalMs",
+              "kind": "httpjson",
+              "httpJson": {
+                "package": "hindsight-memory-bank.toml",
+                "endpoint": "http://example.invalid",
+                "pollIntervalMs": 0
+              }
+            }
+          }
+        }"#;
+        let err = ImporterCatalog::parse(Some(raw), SourceKind::HttpJson)
+            .unwrap_err();
+        assert!(err.contains("pollIntervalMs must be non-zero"), "got: {err}");
     }
 }

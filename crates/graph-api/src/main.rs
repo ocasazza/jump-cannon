@@ -10,7 +10,7 @@ use graph_api::{
     importer_catalog::ImporterCatalog,
     progress::ProgressLog,
     router_with_host,
-    source_host::{SourceHost, SwitchConfig},
+    source_host::SwitchConfig,
     vault_loader, AppState,
 };
 
@@ -149,6 +149,12 @@ struct Args {
         default_value_t = 60000
     )]
     importer_poll_interval_ms: u64,
+    /// Directory the chart mounts every httpjson catalog package into
+    /// (shared by the rollout `--importer-manifest` binding and every
+    /// catalog-declared httpjson alternate). Required for the latter; the
+    /// rollout path still resolves its own full path via `--importer-manifest`.
+    #[arg(long, env = "JUMP_CANNON_IMPORTER_PACKAGES_DIR")]
+    importer_packages_dir: Option<PathBuf>,
     /// Versioned TOML importer package. Required by --source=pest (a Pest
     /// grammar + capture map) and --source=httpjson (endpoints + mapping).
     #[arg(long, env = "JUMP_CANNON_IMPORTER_MANIFEST")]
@@ -551,7 +557,11 @@ async fn main() -> anyhow::Result<()> {    let _ = dotenvy::dotenv();
         tracing::info!("filesystem watcher disabled (--no-watch)");
     }
 
-    let app = router_with_host(SourceHost::new(state, switch));
+    let app = router_with_host(graph_api::source_host::SourceHost::with_packages_dir(
+        state,
+        switch,
+        args.importer_packages_dir.clone(),
+    ));
 
     let host: std::net::IpAddr = args.host.parse().unwrap_or_else(|_| {
         tracing::warn!(host = %args.host, "invalid --host, defaulting to 127.0.0.1");

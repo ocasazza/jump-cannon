@@ -256,7 +256,8 @@
           "enum": [
             "obsidian",
             "kubernetes",
-            "okf"
+            "okf",
+            "httpjson"
           ]
         },
         "sourceId": {
@@ -271,6 +272,9 @@
         },
         "source": {
           "$ref": "#/definitions/filesystemSource"
+        },
+        "httpJson": {
+          "$ref": "#/definitions/httpJsonSource"
         },
         "producer": {
           "$ref": "#/definitions/sourceProducer"
@@ -366,6 +370,36 @@
           "then": {
             "required": [
               "sourceId"
+            ],
+            "allOf": [
+              {
+                "not": {
+                  "required": [
+                    "source"
+                  ]
+                }
+              },
+              {
+                "not": {
+                  "required": [
+                    "filesystemRescanIntervalSeconds"
+                  ]
+                }
+              }
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "httpjson"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "httpJson"
             ],
             "allOf": [
               {
@@ -481,6 +515,44 @@
           "pattern": "^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?)*$",
           "minLength": 1,
           "maxLength": 253
+        }
+      }
+    },
+    "httpJsonSource": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "package",
+        "endpoint"
+      ],
+      "properties": {
+        "package": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "endpoint": {
+          "type": "string",
+          "pattern": "^https?://",
+          "minLength": 1,
+          "maxLength": 2048
+        },
+        "variables": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
+        "tokenEnv": {
+          "type": "string",
+          "pattern": "^[A-Z_][A-Z0-9_]*$",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "pollIntervalMs": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 86400000
         }
       }
     }

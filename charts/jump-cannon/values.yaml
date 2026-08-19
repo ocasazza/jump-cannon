@@ -98,6 +98,23 @@ importers:
         workflowInput: /data/okf-repository/okf
         existingClaimValuePath: okf.persistence.existingClaim
         existingClaimValue: lavender-okf-shared
+    # Same connection details as the rollout `httpJsonImporter:` binding
+    # below (offered here as a runtime-switchable alternate once
+    # `importers.runtimeSwitchGroup` is non-empty, e.g. envoy-ai-gateway
+    # sets it to `kubernetes-clients`). Stays in sync by hand — the chart
+    # does not auto-derive catalog entries from `httpJsonImporter` so
+    # dormant alternates can be removed or overridden per-deployment.
+    hindsight-memory-bank:
+      displayName: Hindsight Memory Bank
+      description: Read the Hindsight agent-memory server's omp bank through the httpjson package engine (charts/jump-cannon/packages/hindsight-memory-bank.toml). Same connection details as the rollout httpJsonImporter binding below, offered here as a runtime-switchable alternate.
+      kind: httpjson
+      httpJson:
+        package: hindsight-memory-bank.toml
+        endpoint: http://hindsight-api-proxy.hindsight.svc.cluster.local
+        variables:
+          tenant: default
+          bank: omp
+        pollIntervalMs: 60000
 
 # okf-sync CronJob: fast-forward git-pulls the lavender OKF repository
 # (pushed nightly by lavender-ingest) into the shared claim an OKF importer

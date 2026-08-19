@@ -17,7 +17,7 @@
 //! exactly today's behavior. Writes and compute endpoints stay default-only.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock, RwLockWriteGuard};
 use std::time::{Duration, Instant};
 
@@ -191,6 +191,12 @@ struct SourceHostInner {
     build_lock: tokio::sync::Mutex<()>,
     idle_ttl: Duration,
     eviction_interval: Duration,
+    /// Directory the chart mounts every httpjson catalog package into (shared
+    /// by the rollout `--importer-manifest` binding and every catalog-declared
+    /// httpjson alternate). Required to construct a runtime-switchable
+    /// `httpjson` alternate; the rollout path still resolves its own full
+    /// path via `--importer-manifest`.
+    packages_dir: Option<PathBuf>,
 }
 
 /// Idle detection: ids whose entry hasn't been used since `now - idle_ttl`.
@@ -207,7 +213,6 @@ fn expired_alternate_ids(
         .map(|(id, _)| id.clone())
         .collect()
 }
-
 /// Cloneable handle owning the default serving state plus lazily-built
 /// alternates. This is the axum router state for the standalone server.
 #[derive(Clone)]
@@ -216,15 +221,39 @@ pub struct SourceHost {
 }
 
 impl SourceHost {
+    /// Build a host that does not need to construct runtime-switchable
+    /// `httpjson` alternates. Catalog-declared filesystem/OKF/Obsidian
+    /// alternates still work; constructing an `httpjson` alternate will
+    /// fail with a clear deployment error. Use [`Self::with_packages_dir`]
+    /// (or one of the rollover entry points) when chart-side secret
+    /// injection of a real `httpjson` alternate is needed.
     pub fn new(default: AppState, switch: SwitchConfig) -> Self {
-        Self::with_ttl(default, switch, ALTERNATE_IDLE_TTL, ALTERNATE_EVICTION_INTERVAL)
+        Self::with_packages_dir(default, switch, None)
     }
 
-    /// Like [`Self::new`] with an overridable idle TTL and sweep interval —
-    /// exercised by tests so eviction doesn't require a real 15-minute wait.
+    /// Like [`Self::new`] but with an explicit `packages_dir` for resolving
+    /// catalog-declared `httpjson` alternate package filenames.
+    pub fn with_packages_dir(
+        default: AppState,
+        switch: SwitchConfig,
+        packages_dir: Option<PathBuf>,
+    ) -> Self {
+        Self::with_ttl(
+            default,
+            switch,
+            packages_dir,
+            ALTERNATE_IDLE_TTL,
+            ALTERNATE_EVICTION_INTERVAL,
+        )
+    }
+
+    /// Like [`Self::with_packages_dir`] with an overridable idle TTL and sweep
+    /// interval — exercised by tests so eviction doesn't require a real
+    /// 15-minute wait.
     pub fn with_ttl(
         default: AppState,
         switch: SwitchConfig,
+        packages_dir: Option<PathBuf>,
         idle_ttl: Duration,
         eviction_interval: Duration,
     ) -> Self {
@@ -237,6 +266,7 @@ impl SourceHost {
                 build_lock: tokio::sync::Mutex::new(()),
                 idle_ttl,
                 eviction_interval,
+                packages_dir,
             }),
         };
         if host.inner.switch.enabled() {
@@ -367,7 +397,7 @@ impl SourceHost {
             .source(source_id)
             .expect("ensure_serving is only called for known sources")
             .clone();
-        match build_alternate(source_id, &definition).await {
+        match build_alternate(source_id, &definition, self.inner.packages_dir.as_deref()).await {
             Ok((state, watcher)) => {
                 tracing::info!(source = source_id, "alternate importer source serving");
                 self.write_alternates().insert(
@@ -419,49 +449,159 @@ impl SourceHost {
 /// Construct one alternate serving state from its catalog entry, plus its
 /// background rescan watcher handle (if any), so the caller can abort it on
 /// eviction. Runnable kinds are exactly the filesystem kinds constructible
-/// from catalog metadata: OKF needs only root + sourceId, Obsidian only a
-/// root. The entry's declared rescan interval drives its periodic full
-/// rescan (0 = notifications only).
+/// from catalog metadata (OKF needs only root + sourceId, Obsidian only a
+/// root) plus the `httpjson` kind whose package filename, endpoint, and
+/// variables are all carried by the catalog profile. The entry's declared
+/// rescan interval drives the filesystem alt's periodic full rescan
+/// (0 = notifications only); poll-kind sources (httpjson) drive their own
+/// cadence via the importer's `WatchPlan::Poll` and ignore the second arg.
 async fn build_alternate(
     source_id: &str,
     definition: &crate::importer_catalog::ImporterSourceDefinition,
+    packages_dir: Option<&Path>,
 ) -> Result<(AppState, Option<tokio::task::JoinHandle<()>>), String> {
-    let filesystem = definition
-        .source
-        .as_ref()
-        .ok_or_else(|| format!("importer source {source_id:?} has no filesystem source"))?;
-    let root = PathBuf::from(&filesystem.path);
-    let importer: Box<dyn data_loader::Importer> = match definition.kind {
-        CatalogSourceKind::Okf => {
-            let okf_source_id = definition
+    match definition.kind {
+        CatalogSourceKind::HttpJson => {
+            let http_json = definition.http_json.as_ref().ok_or_else(|| {
+                format!("httpjson source {source_id:?} has no httpJson contract")
+            })?;
+            let packages_dir = packages_dir.ok_or_else(|| {
+                format!(
+                    "httpjson source {source_id:?} cannot be served: \
+                     JUMP_CANNON_IMPORTER_PACKAGES_DIR is not configured"
+                )
+            })?;
+            let manifest_path = packages_dir.join(&http_json.package);
+            let manifest_len = std::fs::metadata(&manifest_path)
+                .map_err(|error| {
+                    format!(
+                        "httpjson source {source_id:?}: failed to inspect package {}: {error}",
+                        manifest_path.display()
+                    )
+                })?
+                .len() as usize;
+            if manifest_len > http_json_importer::manifest::HARD_LIMITS.manifest_bytes {
+                return Err(format!(
+                    "httpjson source {source_id:?} package {} is {} bytes; hard limit is {} bytes",
+                    manifest_path.display(),
+                    manifest_len,
+                    http_json_importer::manifest::HARD_LIMITS.manifest_bytes
+                ));
+            }
+            let raw = std::fs::read(&manifest_path).map_err(|error| {
+                format!(
+                    "httpjson source {source_id:?}: failed to read package {}: {error}",
+                    manifest_path.display()
+                )
+            })?;
+            let package = http_json_importer::ValidatedPackage::from_toml_bytes(&raw)
+                .map_err(|error| {
+                    format!(
+                        "httpjson source {source_id:?}: invalid package {}: {error}",
+                        manifest_path.display()
+                    )
+                })?;
+            let source_id_value = definition
                 .source_id
                 .clone()
-                .ok_or_else(|| format!("OKF source {source_id:?} must declare sourceId"))?;
-            Box::new(
-                okf_importer::OkfImporter::new(root.clone(), okf_source_id)
+                .unwrap_or_else(|| sanitize_source_id(&package.manifest().metadata.id));
+            let token = http_json
+                .token_env
+                .as_deref()
+                .and_then(|name| std::env::var(name).ok());
+            let instance = http_json_importer::InstanceConfig {
+                source_id: source_id_value,
+                base_url: http_json.endpoint.clone(),
+                variables: http_json.variables.clone(),
+                token,
+                poll_interval_ms: http_json.poll_interval_ms,
+            };
+            // Per `importer_catalog` validation the package filename is bounded
+            // ASCII and contains no path separators, so the joined path is
+            // always below `packages_dir`. The filesystem root is irrelevant
+            // for a remote source; no capability here joins onto it.
+            let root = PathBuf::new();
+            let importer: Box<dyn data_loader::Importer> = Box::new(
+                http_json_importer::build_importer(package, instance)
                     .map_err(|error| error.to_string())?,
-            )
+            );
+            let grants: std::collections::HashSet<data_loader::Capability> =
+                importer.descriptor().capabilities.into_iter().collect();
+            let progress = Arc::new(ProgressLog::new());
+            let state = crate::build_world_state(importer, grants, root, progress)
+                .await
+                .map_err(|error| {
+                    format!("import alternate source {source_id:?}: {error}")
+                })?;
+            // The watcher dispatches on the importer's own `WatchPlan`
+            // (Poll for httpjson, Filesystem for the OKF/Obsidian arms
+            // below), so the second arg is ignored for this kind.
+            let watcher = crate::watcher::spawn(
+                state.clone(),
+                definition.filesystem_rescan_interval_seconds.unwrap_or(0),
+            );
+            Ok((state, watcher))
         }
-        CatalogSourceKind::Obsidian => Box::new(vault_links::ObsidianLoader::new(root.clone())),
-        other => {
-            return Err(format!(
-                "importer source kind {other:?} is not constructible at runtime"
-            ))
+        CatalogSourceKind::Okf | CatalogSourceKind::Obsidian => {
+            let filesystem = definition.source.as_ref().ok_or_else(|| {
+                format!("importer source {source_id:?} has no filesystem source")
+            })?;
+            let root = PathBuf::from(&filesystem.path);
+            let importer: Box<dyn data_loader::Importer> = match definition.kind {
+                CatalogSourceKind::Okf => {
+                    let okf_source_id = definition.source_id.clone().ok_or_else(|| {
+                        format!("OKF source {source_id:?} must declare sourceId")
+                    })?;
+                    Box::new(
+                        okf_importer::OkfImporter::new(root.clone(), okf_source_id)
+                            .map_err(|error| error.to_string())?,
+                    )
+                }
+                CatalogSourceKind::Obsidian => {
+                    Box::new(vault_links::ObsidianLoader::new(root.clone()))
+                }
+                _ => unreachable!("filesystem match arm excludes HttpJson"),
+            };
+            let grants: std::collections::HashSet<data_loader::Capability> =
+                importer.descriptor().capabilities.into_iter().collect();
+            let progress = Arc::new(ProgressLog::new());
+            let state = crate::build_world_state(importer, grants, root, progress)
+                .await
+                .map_err(|error| format!("import alternate source {source_id:?}: {error}"))?;
+            let watcher = crate::watcher::spawn(
+                state.clone(),
+                definition.filesystem_rescan_interval_seconds.unwrap_or(0),
+            );
+            Ok((state, watcher))
         }
-    };
-    // The deployment catalog is administrator-supplied trusted configuration,
-    // so — exactly like main.rs — the host grants the declared capabilities.
-    let grants: std::collections::HashSet<data_loader::Capability> =
-        importer.descriptor().capabilities.into_iter().collect();
-    let progress = Arc::new(ProgressLog::new());
-    let state = crate::build_world_state(importer, grants, root, progress)
-        .await
-        .map_err(|error| format!("import alternate source {source_id:?}: {error}"))?;
-    let watcher = crate::watcher::spawn(
-        state.clone(),
-        definition.filesystem_rescan_interval_seconds.unwrap_or(0),
-    );
-    Ok((state, watcher))
+        other => Err(format!(
+            "importer source kind {other:?} is not constructible at runtime"
+        )),
+    }
+}
+
+/// Fold an arbitrary package id into the `[a-z0-9._-]` source-id charset.
+/// Duplicates the (tiny) helper in `main.rs` because that file is a binary
+/// and `source_host` is a library; the chart's bound catalog never reaches
+/// for this branch because the package id is already validated upstream.
+fn sanitize_source_id(package_id: &str) -> String {
+    let sanitized: String = package_id
+        .to_lowercase()
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_lowercase() || ch.is_ascii_digit() || matches!(ch, '.' | '_' | '-') {
+                ch
+            } else {
+                '-'
+            }
+        })
+        .take(data_loader::identity::MAX_SOURCE_ID_BYTES)
+        .collect();
+    if sanitized.is_empty() {
+        "httpjson".to_string()
+    } else {
+        sanitized
+    }
 }
 
 /// Extract the requested source id: the header first, then the `source` query

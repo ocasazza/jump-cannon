@@ -1,5 +1,13 @@
 {{- $importer := include "jump-cannon.importerSelection" . | fromJson -}}
-{{- if eq $importer.kind "httpjson" }}
+{{- $anyHttpJsonCatalogSource := false -}}
+{{- if .Values.importers.runtimeSwitchGroup -}}
+{{- range $id, $profile := .Values.importers.sources -}}
+  {{- if and (kindIs "map" $profile) (eq $profile.kind "httpjson") -}}
+    {{- $anyHttpJsonCatalogSource = true -}}
+  {{- end -}}
+{{- end -}}
+{{- end -}}
+{{- if or (eq $importer.kind "httpjson") $anyHttpJsonCatalogSource }}
 {{/* Chart-owned package(s) for the HTTP/JSON importer engine. Each TOML
      under charts/jump-cannon/packages/ becomes one data key keyed by its
      filename, so the runtime can read them by name

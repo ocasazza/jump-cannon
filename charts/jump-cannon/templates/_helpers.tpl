@@ -72,6 +72,10 @@ graphApi.source, and the legacy vault/OKF values remain authoritative.
     {{- fail (printf "importers.sources[%q] must be an object" $selected) -}}
   {{- end -}}
   {{- $kind := required (printf "importers.sources[%q].kind is required" $selected) $profile.kind -}}
+  {{- /* httpjson is intentionally NOT in the importerSelection whitelist:
+        a named httpjson source is only a runtime-switchable catalog entry,
+        not a Helm-rollout-selected active source. The single rollout
+        `httpjson` source remains `graphApi.source: httpjson` (legacy path). */ -}}
   {{- if not (has $kind (list "obsidian" "kubernetes" "okf")) -}}
     {{- fail (printf "importers.sources[%q].kind %q is not wired by this chart" $selected $kind) -}}
   {{- end -}}
@@ -164,7 +168,7 @@ must never turn into a pod startup failure.
   {{- if gt (len $profile.description) 4096 -}}
     {{- fail (printf "importers.sources[%q].description exceeds 4096 UTF-8 bytes" $id) -}}
   {{- end -}}
-  {{- if not (has $kind (list "obsidian" "kubernetes" "okf")) -}}
+  {{- if not (has $kind (list "obsidian" "kubernetes" "okf" "httpjson")) -}}
     {{- fail (printf "importers.sources[%q].kind %q is not wired by this chart" $id $kind) -}}
   {{- end -}}
   {{- $usesFilesystem := or (eq $kind "obsidian") (eq $kind "okf") -}}
@@ -218,6 +222,28 @@ must never turn into a pod startup failure.
     {{- if and (eq $kind "obsidian") $source.readOnly -}}
       {{- fail (printf "importers.sources[%q].source.readOnly must be false until Obsidian write grants are source-scoped" $id) -}}
     {{- end -}}
+  {{- end -}}
+  {{- if eq $kind "httpjson" -}}
+    {{- if not (hasKey $profile "httpJson") -}}
+      {{- fail (printf "importers.sources[%q].httpJson is required for kind httpjson" $id) -}}
+    {{- end -}}
+    {{- $httpJson := $profile.httpJson -}}
+    {{- if not (kindIs "map" $httpJson) -}}
+      {{- fail (printf "importers.sources[%q].httpJson must be an object" $id) -}}
+    {{- end -}}
+    {{- $package := required (printf "importers.sources[%q].httpJson.package is required" $id) $httpJson.package -}}
+    {{- /* Package filename existence is enforced at runtime by the
+           httpjson importer (a missing TOML fails the alternate's build
+           with a clear error). Helm cannot reliably check it here
+           because .Files is unavailable inside sub-templates, and we
+           want the validation helper to stay callable from
+           importerSelection. */ -}}
+    {{- $endpoint := required (printf "importers.sources[%q].httpJson.endpoint is required" $id) $httpJson.endpoint -}}
+    {{- if not (or (hasPrefix "http://" $endpoint) (hasPrefix "https://" $endpoint)) -}}
+      {{- fail (printf "importers.sources[%q].httpJson.endpoint must start with http:// or https://" $id) -}}
+    {{- end -}}
+  {{- else if hasKey $profile "httpJson" -}}
+    {{- fail (printf "importers.sources[%q].httpJson is only valid for kind httpjson" $id) -}}
   {{- end -}}
   {{- with $profile.producer -}}
     {{- if not (hasKey $profile "source") -}}
