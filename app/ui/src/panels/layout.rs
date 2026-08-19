@@ -2685,40 +2685,46 @@ fn EngineCard(
     title: String,
     on_select: EventHandler<()>,
 ) -> Element {
-    let mut class = String::from("lay-card");
+    // Keep the existing `lay-card*` class names so the browser regression
+    // suite's `[data-source-id]` / `[aria-pressed]` / `lay-card-name` /
+    // `lay-chip` selectors keep matching. The shared `SelectableCard`
+    // component supplies the head / chip / desc / why skeleton; the
+    // "● running" badge is a layout-specific slot via `children`.
+    let mut class = String::from("select-card lay-card");
     if active {
         class.push_str(" active");
     }
     if ghost {
         class.push_str(" ghost");
     }
+    let chips = vec![
+        (kind_class.to_string(), kind_label.clone()),
+        (proc_class.to_string(), proc_label.clone()),
+    ];
     rsx! {
-        button {
-            class: "{class}",
-            r#type: "button",
+        crate::selection_card::SelectableCard {
+            source_id: title.clone(),
+            kind: "engine".to_string(),
+            card_class: class,
+            name: name.clone(),
+            subtitle: String::new(),
+            chips,
+            description: description.clone(),
+            disabled_reason: disabled_reason.clone().unwrap_or_default(),
+            is_viewing: active,
+            is_ghost: ghost,
             disabled,
-            title: "{title}",
-            aria_pressed: if active { "true" } else { "false" },
-            onclick: move |_| on_select.call(()),
-            div { class: "lay-card-head",
-                span { class: "lay-card-name", "{name}" }
-                if active {
+            title: title.clone(),
+            on_select: Some(on_select),
+            if active {
+                div { class: "lay-card-status",
                     span { class: "lay-live", "● running" }
                 }
-            }
-            div { class: "lay-card-chips",
-                span { class: "lay-chip {kind_class}", "{kind_label}" }
-                span { class: "lay-chip {proc_class}", "{proc_label}" }
-            }
-            if !description.is_empty() {
-                p { class: "lay-card-desc", "{description}" }
-            }
-            if let Some(reason) = disabled_reason {
-                span { class: "lay-card-why", "{reason}" }
             }
         }
     }
 }
+
 
 fn local_card(d: &LayoutDescriptor, active: bool) -> Element {
     let id = d.id;

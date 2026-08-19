@@ -16,6 +16,7 @@ mod anchored;
 mod api;
 mod appstate;
 mod badges;
+mod selection_card;
 mod client_log;
 mod graph_canvas;
 mod palette;

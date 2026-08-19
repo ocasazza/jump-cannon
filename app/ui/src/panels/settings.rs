@@ -287,13 +287,32 @@ fn importer_card(
     };
     let selectable = is_default || profile.runnable;
     let has_details = profile.source.is_some() || profile.producer.is_some();
+    // The browser regression's data-source-id / data-active /
+    // data-runnable / data-selected selectors all key on these
+    // attributes; the shared `select-card` parent class only adds
+    // the neutral wrapper so importers and engines can share styles.
+    // The `importer-card*` class chain remains for the regression's
+    // `[data-source-id="lavender-ingest-okf"]` selectors and the
+    // existing per-state colour rules.
     let card_class: String = if is_viewing {
-        "importer-card importer-card-viewing".into()
+        "select-card importer-card importer-card-viewing".into()
     } else if is_default {
-        "importer-card importer-card-default".into()
+        "select-card importer-card importer-card-default".into()
     } else {
-        "importer-card".into()
+        "select-card importer-card".into()
     };
+    let mut chips: Vec<(String, String)> = Vec::new();
+    chips.push(("importer-kind-tag".to_string(), profile.kind.clone()));
+    if is_viewing {
+        chips.push(("viewing".to_string(), "viewing".to_string()));
+    }
+    if profile
+        .source
+        .as_ref()
+        .is_some_and(|source| source.read_only)
+    {
+        chips.push(("read-only".to_string(), "read-only".to_string()));
+    }
     let button_class: String = if is_viewing {
         "btn importer-switch-btn importer-switch-current".into()
     } else if is_default {
@@ -310,32 +329,31 @@ fn importer_card(
     };
     let switch_id = profile.id.clone();
     rsx! {
-        article {
-            class: "{card_class}",
-            "data-source-id": "{profile.id}",
-            "data-kind": "{profile.kind}",
-            "data-selected": if is_default { "true" } else { "false" },
-            "data-active": if profile.active { "true" } else { "false" },
-            "data-runnable": if profile.runnable { "true" } else { "false" },
-            header { class: "importer-card-head",
-                div { class: "importer-card-title",
-                    h3 { "{profile.display_name}" }
-                    code { class: "importer-profile-id", "{profile.id}" }
+        crate::selection_card::SelectableCard {
+            source_id: profile.id.clone(),
+            kind: profile.kind.clone(),
+            card_class,
+            name: profile.display_name.clone(),
+            subtitle: profile.id.clone(),
+            chips,
+            description: profile.description.clone(),
+            disabled_reason: String::new(),
+            is_default,
+            is_viewing,
+            is_ghost: false,
+            disabled: false,
+            title: profile.id.clone(),
+            on_select: None,
+            div { class: "importer-badges",
+                span { class: "importer-badge importer-kind-tag", "{profile.kind}" }
+                if is_viewing && !is_default {
+                    span { class: "importer-badge viewing", "viewing" }
+                } else if is_viewing && is_default {
+                    span { class: "importer-badge viewing", "viewing" }
                 }
-                div { class: "importer-badges",
-                    span { class: "importer-badge importer-kind-tag", "{profile.kind}" }
-                    if is_viewing && !is_default {
-                        span { class: "importer-badge viewing", "viewing" }
-                    } else if is_viewing && is_default {
-                        span { class: "importer-badge viewing", "viewing" }
-                    }
-                    if profile.source.as_ref().is_some_and(|source| source.read_only) {
-                        span { class: "importer-badge read-only", "read-only" }
-                    }
+                if profile.source.as_ref().is_some_and(|source| source.read_only) {
+                    span { class: "importer-badge read-only", "read-only" }
                 }
-            }
-            if !profile.description.is_empty() {
-                p { class: "importer-description", "{profile.description}" }
             }
             dl { class: "importer-facts importer-identity",
                 {importer_fact("source id", "source-id", source_id)}
@@ -347,9 +365,6 @@ fn importer_card(
                     )}
                 }
             }
-            // Primary action: switch to this source. Disabled when already
-            // viewing it, hidden for sources graph-api cannot construct at
-            // runtime. The default source's action is `None` (clears the
             if switch_allowed {
                 div { class: "importer-switch-row",
                     button {
@@ -367,11 +382,6 @@ fn importer_card(
                     }
                 }
             }
-            // Deployment-side details collapse behind a native `<details>`
-            // element so the default card stays compact while the
-            // browser regression's `data-field="consumer-*" /
-            // producer-*` selectors still resolve (the nodes are in the
-            // DOM regardless of disclosure state).
             if has_details {
                 details { class: "importer-details",
                     summary { class: "importer-details-summary",
@@ -434,6 +444,8 @@ fn importer_card(
         }
     }
 }
+
+
 
 
 fn importer_catalog(

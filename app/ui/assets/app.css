@@ -1013,3 +1013,52 @@ textarea.doc-src:focus { outline:none; }
   margin-bottom:.35rem; }
 .session-status { background:var(--bg); border:1px solid var(--line2); border-radius:3px;
   padding:.5rem; max-height:16rem; overflow:auto; white-space:pre-wrap; }
+
+/* selection card / chip / why — shared primitives for one-of-N
+   pickers. The existing .lay-card-* / .importer-card-* / .lay-chip /
+   .importer-chip rules below remain as compatibility shims for the
+   migration; new code uses the .select-card-* names so both layout
+   and importer selection can share markup. */
+.select-card {
+  display:flex; flex-direction:column; gap:.3rem; text-align:left;
+  background:var(--bg); color:var(--fg); border:1px solid var(--line);
+  border-radius:6px; padding:.55rem .65rem; cursor:pointer;
+}
+.select-card:hover:not(:disabled) { border-color:var(--fg); }
+.select-card:focus-visible { outline:1px solid var(--fg); outline-offset:2px; }
+.select-card[aria-pressed="true"] { border-color:var(--accent); }
+.select-card[data-viewing="true"] {
+  border-color:#655123; box-shadow:inset 0 0 0 1px #655123;
+}
+.select-card[data-default="true"][data-viewing="false"] {
+  border-color:#28557e;
+}
+.select-card[data-ghost="true"] { border-style:dashed; }
+.select-card:disabled { opacity:.5; cursor:not-allowed; }
+.select-card-head {
+  display:flex; align-items:flex-start; justify-content:space-between;
+  gap:.5rem;
+}
+.select-card-title { display:flex; min-width:0; flex-direction:column; gap:.1rem; }
+.select-card-title h3 {
+  margin:0; color:var(--fg); font-size:.78rem; font-weight:600;
+  overflow:hidden; text-overflow:ellipsis;
+}
+.select-card-subtitle {
+  color:var(--dim); font-family:var(--mono); font-size:.66rem;
+  overflow-wrap:anywhere;
+}
+.select-card-chips {
+  display:flex; flex-wrap:wrap; justify-content:flex-end; gap:.25rem;
+  align-items:center;
+}
+.select-card-chip {
+  border:1px solid var(--line2); border-radius:999px; padding:.08rem .32rem;
+  color:var(--dim); font-size:.58rem; letter-spacing:.04em;
+  text-transform:uppercase;
+}
+.select-card-desc {
+  margin:0; color:var(--dim); font-size:.68rem; line-height:1.45;
+}
+.select-card-why { color:var(--yellow); font-size:.62rem; }
+
