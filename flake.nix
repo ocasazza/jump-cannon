@@ -663,20 +663,36 @@
             export PROPTEST_CASES
             ${testMetricsPushShell}
 
-            started="$(date +%s)"
+            # Each fuzzer pushes its own row (test="fuzz-graph-layouts" /
+            # "fuzz-graph-compute") with its own wall-clock duration, so a
+            # failure in one is visible without hiding the other's result.
+            layout_started="$(date +%s)"
             set +e
             graph-layouts-fuzz
             layout_status="$?"
+            set -e
+            layout_duration="$(( $(date +%s) - layout_started ))"
+            if [ "$layout_status" -eq 0 ]; then
+              push_metrics fuzz-graph-layouts 1 0 "$layout_duration"
+            else
+              push_metrics fuzz-graph-layouts 0 1 "$layout_duration" || true
+            fi
+
+            compute_started="$(date +%s)"
+            set +e
             graph-compute-fuzz
             compute_status="$?"
             set -e
-            ended="$(date +%s)"
-            duration="$((ended - started))"
+            compute_duration="$(( $(date +%s) - compute_started ))"
+            if [ "$compute_status" -eq 0 ]; then
+              push_metrics fuzz-graph-compute 1 0 "$compute_duration"
+            else
+              push_metrics fuzz-graph-compute 0 1 "$compute_duration" || true
+            fi
+
             if [ "$layout_status" -eq 0 ] && [ "$compute_status" -eq 0 ]; then
-              push_metrics fuzz 1 0 "$duration"
               exit 0
             fi
-            push_metrics fuzz 0 1 "$duration" || true
             exit 1
           '';
         };
@@ -697,11 +713,22 @@
               unset BENCH_INCLUDE_1M
             fi
 
-            run_and_report performance sh -c '
-              graph-layouts-bench-static --bench &&
-              graph-compute-bench-pagerank --bench --noplot &&
-              graph-compute-bench-scaling --bench --noplot
-            '
+            # Each benchmark runs and reports independently -- previously a
+            # single `&&`-chained `run_and_report performance ...` meant a
+            # static-layouts failure silently skipped pagerank/scaling for
+            # the whole night. Run all three regardless of one another, and
+            # fail the job at the end if any of them failed.
+            overall_status=0
+            if ! run_and_report performance-bench-static-layouts graph-layouts-bench-static --bench; then
+              overall_status=1
+            fi
+            if ! run_and_report performance-bench-pagerank graph-compute-bench-pagerank --bench --noplot; then
+              overall_status=1
+            fi
+            if ! run_and_report performance-bench-scaling graph-compute-bench-scaling --bench --noplot; then
+              overall_status=1
+            fi
+            exit "$overall_status"
           '';
         };
 
@@ -712,6 +739,7 @@
             pkgs.chromium
             pkgs.coreutils
             pkgs.curl
+            pkgs.jq
           ];
           text = ''
             set -euo pipefail
@@ -720,13 +748,40 @@
             : "''${JUMP_CANNON_BROWSER_TIMEOUT_SECONDS:=90}"
             OUT_DIR="''${OUT_DIR:-/tmp/jump-cannon-browser-smoke}"
             mkdir -p "$OUT_DIR"
-            ${testMetricsShell}
+            ${testMetricsPushShell}
 
-            run_and_report browser test-browser \
+            # test-browser scores 7 independent named checks and writes them
+            # to $OUT_DIR/report.json; push one Pushgateway row per check
+            # that actually ran (a check is omitted from the JSON, not
+            # `null`, when its scenario was skipped -- e.g. importer_switch
+            # with no second graph-api binary on PATH -- and must not be
+            # fabricated as a pass or fail here).
+            started="$(date +%s)"
+            set +e
+            test-browser \
               --base-url "$JUMP_CANNON_BASE_URL" \
               --chromium ${pkgs.chromium}/bin/chromium \
               --out-dir "$OUT_DIR" \
               --timeout-secs "$JUMP_CANNON_BROWSER_TIMEOUT_SECONDS"
+            status="$?"
+            set -e
+            duration="$(( $(date +%s) - started ))"
+
+            report="$OUT_DIR/report.json"
+            if [ -f "$report" ]; then
+              for field in pre_wasm_mount graph_header_actions nodes_editor settings_tabs filter_builder sessions_view importer_switch; do
+                ok="$(jq -r --arg f "$field" '.[$f].ok // empty' "$report")"
+                [ -n "$ok" ] || continue
+                row_name="browser-$(printf '%s' "$field" | tr '_' '-')"
+                if [ "$ok" = "true" ]; then
+                  push_metrics "$row_name" 1 0 "$duration"
+                else
+                  push_metrics "$row_name" 0 1 "$duration" || true
+                fi
+              done
+            fi
+
+            exit "$status"
           '';
         };
 
