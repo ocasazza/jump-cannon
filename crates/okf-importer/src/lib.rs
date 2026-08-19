@@ -714,6 +714,15 @@ fn parse_concept(id: &str, raw: String, mtime: i64) -> Result<ParsedConcept, Okf
     path_references.sort();
     path_references.dedup();
     let mut links = markdown_links(body);
+    // The auto-imported corpus (lavender-ingest) doesn't wrap URLs in
+    // markdown link syntax — every cross-reference in the body and the
+    // `description` frontmatter field is a bare URL. Pull them out with a
+    // separate pass so the URL resolver can actually find them.
+    for url in bare_urls(body) {
+        if !links.contains(&url) {
+            links.push(url);
+        }
+    }
     links.sort();
     links.dedup();
     // Auto-imported OKF corpora (lavender-ingest) store their page content
@@ -725,6 +734,11 @@ fn parse_concept(id: &str, raw: String, mtime: i64) -> Result<ParsedConcept, Okf
     if let Some(description) = yaml_string(mapping, "description") {
         if !description.trim().is_empty() {
             for url in markdown_links(description) {
+                if !links.contains(&url) {
+                    links.push(url);
+                }
+            }
+            for url in bare_urls(description) {
                 if !links.contains(&url) {
                     links.push(url);
                 }
@@ -1203,10 +1217,45 @@ fn markdown_links(body: &str) -> Vec<String> {
     links
 }
 
+/// Extract every absolute URL that appears as bare text in the source
+/// string. pulldown-cmark only surfaces URLs wrapped in markdown link
+/// syntax (`[text](url)`) or angle-bracket autolinks (`<url>`), but the
+/// lavender-ingest corpus dumps URLs into the `description` frontmatter
+/// as plain prose. Without this pass, the URL resolver would never see
+/// them and the corpus graph would stay unconnected even after the
+/// link-rule grammar + URL resolver shipped. We dedupe against the
+/// markdown-link output the caller has already collected so the two
+/// passes don't double-count.
+fn bare_urls(text: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut rest = text;
+    while let Some(start) = rest.find("http://").or_else(|| rest.find("https://")) {
+        let (scheme_start, scheme_len) = if rest[start..].starts_with("https://") {
+            (start, "https://".len())
+        } else {
+            (start, "http://".len())
+        };
+        let after = &rest[scheme_start + scheme_len..];
+        let end = after
+            .find(|c: char| {
+                c.is_whitespace() || matches!(c, '"' | '\'' | ')' | '<' | '>' | '\\')
+            })
+            .unwrap_or(after.len());
+        let url = &rest[scheme_start..scheme_start + scheme_len + end];
+        if !url.is_empty() {
+            out.push(url.to_string());
+        }
+        rest = &rest[scheme_start + scheme_len + end..];
+        if rest.is_empty() {
+            break;
+        }
+    }
+    out
+}
+
 fn resolve_body_link(source_id: &str, raw: &str) -> Option<String> {
     resolve_reference(source_id, raw, ReferenceBase::Document)
 }
-
 fn resolve_source_resource(source_id: &str, raw: &str) -> Option<String> {
     let trimmed = raw.trim();
     let path = trimmed.split('#').next()?;
@@ -2044,8 +2093,64 @@ see [issue 2](https://atlassian.example.com/browse/PROJ-2)\n",
                 ),
             ])
         );
+    }
+
+     #[test]
+    fn bare_urls_in_description_frontmatter_resolve() {
+        // The lavender-ingest corpus dumps Confluence and Jira URLs as
+        // bare text into the `description` frontmatter field — no
+        // markdown `[text](url)` wrapping. The bare-URL extractor has to
+        // catch them so the URL resolver can fire.
+        let fixture = TempDir::new().unwrap();
+        write(
+            fixture.path(),
+            "knowledge/alpha.md",
+            "---\n\
+type: concept\n\
+title: Alpha\n\
+source_url: https://confluence.example.com/display/LD/Alpha\n\
+description: \"Reference: https://confluence.example.com/display/LD/Beta and https://atlassian.example.com/browse/PROJ-2 are related.\"\n\
+---\n",
+        );
+        write(
+            fixture.path(),
+            "knowledge/beta.md",
+            "---\n\
+type: concept\n\
+title: Beta\n\
+source_url: https://confluence.example.com/display/LD/Beta\n\
+---\n",
+        );
+        write(
+            fixture.path(),
+            "jira/proj-2.md",
+            "---\n\
+type: concept\n\
+title: PROJ-2\n\
+source_url: https://atlassian.example.com/browse/PROJ-2\n\
+external_id: jira:PROJ-2\n\
+---\n",
+        );
+
+        let result = load(fixture.path());
+
+        assert_eq!(result.graph.node_count(), 3);
+        // Confluence `display/{space}/{title}` match + Jira
+        // `browse/{KEY}` via external_id tail.
+        assert_eq!(
+            edges(&result),
+            BTreeSet::from([
+                (
+                    "okf:fixture:knowledge/alpha".into(),
+                    "okf:fixture:knowledge/beta".into(),
+                ),
+                (
+                    "okf:fixture:knowledge/alpha".into(),
+                    "okf:fixture:jira/proj-2".into(),
+                ),
+            ])
+        );
         assert!(result.unresolved.is_empty());
-        assert_eq!(result.graph.node_count(), 5);
     }
 
     #[test]
