@@ -59,6 +59,63 @@ pub fn try_extract_vault(root: &Path) -> Result<ExtractionResult> {
     })
 }
 
+/// Parse an in-memory vault corpus — `(vault-relative path, markdown text)`
+/// pairs — through the exact on-disk pipeline and return the same
+/// [`ExtractionResult`].
+///
+/// This is the no-filesystem entry point: browser/WASM hosts fetch note
+/// bytes over HTTP (GitHub trees + raw endpoints) and hand them in here.
+/// Paths are vault-relative with `/` separators; non-`.md` entries and
+/// paths matching the canonical exclusion contract
+/// ([`crate::walker::EXCLUDES`], via [`crate::walker::is_excluded`]) are
+/// dropped exactly as the filesystem walk drops them. Note IDs are derived
+/// byte-identically to [`list_markdown`] (relative path sans extension);
+/// mtimes are 0 — an HTTP corpus carries no meaningful mtime.
+///
+/// Best-effort like [`extract_vault`]: malformed frontmatter parses with its
+/// metadata stripped rather than failing the whole corpus.
+pub fn extract_notes(files: &[(String, String)]) -> ExtractionResult {
+    extract_memory(files, false).expect("best-effort note extraction is infallible")
+}
+
+/// Strict variant of [`extract_notes`] that rejects malformed frontmatter,
+/// mirroring [`try_extract_vault`]'s importer-publication contract.
+pub fn try_extract_notes(files: &[(String, String)]) -> Result<ExtractionResult> {
+    extract_memory(files, true)
+}
+
+fn extract_memory(files: &[(String, String)], strict: bool) -> Result<ExtractionResult> {
+    let root = Path::new("");
+    let mut texts: HashMap<std::path::PathBuf, &str> = HashMap::with_capacity(files.len());
+    let mut paths = Vec::with_capacity(files.len());
+    for (rel, text) in files {
+        let rel_path = std::path::PathBuf::from(rel);
+        if rel_path.extension().and_then(|ext| ext.to_str()) != Some("md") {
+            continue;
+        }
+        if crate::walker::is_excluded(&rel_path) {
+            continue;
+        }
+        let id = rel_path
+            .with_extension("")
+            .to_string_lossy()
+            .to_string()
+            .replace('\\', "/");
+        texts.insert(rel_path.clone(), text.as_str());
+        paths.push((id, rel_path, 0));
+    }
+    extract_paths(root, paths, |path| {
+        let text = texts.get(path).copied().unwrap_or_default();
+        let note = if strict {
+            try_parse_note(path, text)
+                .with_context(|| format!("parse YAML frontmatter in {}", path.display()))?
+        } else {
+            parse_note(path, text)
+        };
+        Ok((note, text.as_bytes().to_vec()))
+    })
+}
+
 fn extract_paths<F>(
     root: &Path,
     paths: Vec<(String, std::path::PathBuf, u64)>,

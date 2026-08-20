@@ -40,3 +40,23 @@ an existing Secret and the chart injects `JUMP_CANNON_GITHUB_TOKEN` through a
 `secretKeyRef`.
 
 See [[Importer Runtime]], [[Import and Generate]], and [[Helm Deployment]].
+
+## In-browser import (GitHub Pages)
+
+The same corpus also loads with no backend at all. The GitHub Pages
+deployment at `https://ocasazza.github.io/jump-cannon/` serves the Dioxus app
+as a static site (built by the `pages` GitHub Actions workflow from the
+`.#app-web-pages` flake output, trunk `--public-url /jump-cannon/`) and the
+app imports in WASM: it lists the repository's markdown through the
+CORS-enabled git trees API, fetches each note from `raw.githubusercontent.com`,
+and runs the exact `vault-links` extraction plus `github:{source_id}:`
+re-namespacing in the browser, so node IDs match a server-side import of the
+same corpus. codeload tarballs are not used there — codeload sends no CORS
+headers for arbitrary origins.
+
+The GitHub panel drives it: repo / ref / subdir, persisted in the browser.
+`?gh=owner/repo&ref=…&path=…` deep-links an import; a bare `*.github.io`
+visit imports the default `ocasazza/jump-cannon` knowledge corpus. Public
+repositories only (no token field), bounded at 512 notes / 8 MiB, and the
+import is a browser-only graph: the canvas, layout, and style panels work,
+while server-backed search and node metadata stay unavailable.

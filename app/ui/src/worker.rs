@@ -20,7 +20,8 @@
 //! we build that bootstrap as a Rust string and spawn the worker from a Blob
 //! URL — the only "logic" in it is "load the wasm", same category as the
 //! trunk-generated loader. `Trunk.toml` sets `filehash=false`, so the bundle
-//! lives at the stable URL [`WORKER_JS_URL`].
+//! lives at stable filenames, resolved against `document.baseURI` at spawn
+//! (the dist may be hosted under a subpath, e.g. GitHub Pages).
 //!
 //! ## Lifecycle
 //!
@@ -61,15 +62,26 @@ mod wasm {
 
     use tvix_wasm::GeneratedGraph;
 
-    /// Stable URL of the trunk-emitted worker glue (`filehash=false` in
-    /// `app/Trunk.toml`; the Dioxus dist links assets at the root).
-    const WORKER_JS_URL: &str = "/tvix-worker.js";
-    /// Stable URL of the worker's wasm module.
-    const WORKER_WASM_URL: &str = "/tvix-worker_bg.wasm";
-
     /// Readiness marker the worker posts once its handler is installed. Must
     /// match `tvix_worker`'s `READY` constant.
     const READY: &str = "__tvix_worker_ready__";
+
+    /// Worker bundle filenames (stable because `filehash=false` in
+    /// `app/Trunk.toml`). Resolved against `document.baseURI` at spawn time —
+    /// never hardcoded root-absolute — because the same dist is hosted both
+    /// at `/` (graph-api, Tauri) and under a subpath (GitHub Pages serves it
+    /// at `/jump-cannon/`, with trunk's `--public-url` rewriting the asset
+    /// links). The blob-URL worker cannot resolve relative URLs itself, so
+    /// the bootstrap embeds absolute ones.
+    fn worker_url(name: &str) -> String {
+        let base = web_sys::window()
+            .and_then(|window| window.document())
+            .and_then(|document| document.base_uri().ok().flatten())
+            .unwrap_or_else(|| "/".to_string());
+        web_sys::Url::new_with_base(name, &base)
+            .map(|url| url.href())
+            .unwrap_or_else(|_| format!("/{name}"))
+    }
 
     /// The classic-worker bootstrap: load the no-modules glue, then init the
     /// wasm (which runs the worker's `#[wasm_bindgen(start)]`, installing the
@@ -79,8 +91,8 @@ mod wasm {
     fn bootstrap_src() -> String {
         format!(
             "self.importScripts('{js}');\nwasm_bindgen('{wasm}');\n",
-            js = WORKER_JS_URL,
-            wasm = WORKER_WASM_URL,
+            js = worker_url("tvix-worker.js"),
+            wasm = worker_url("tvix-worker_bg.wasm"),
         )
     }
 

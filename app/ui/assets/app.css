@@ -722,6 +722,20 @@ input.inst-line:focus { outline:none; border-color:var(--fg); }
 .gen-error { color:var(--red); font-family:var(--mono); font-size:11px;
   white-space:pre-wrap; overflow-wrap:anywhere; }
 
+/* === panel: github (owned by panels/github.rs) === */
+.gh-panel { display:flex; flex-direction:column; gap:.4rem; font-size:11.5px; height:100%;
+  min-height:0; overflow:auto; }
+.gh-label { color:var(--dim); font-size:.66rem; text-transform:uppercase; letter-spacing:.06em; }
+.gh-hint { color:var(--dim); font-size:.72rem; line-height:1.5; }
+.gh-sep { border:none; border-top:1px solid var(--line); margin:.25rem 0; width:100%; }
+.gh-input { width:100%; background:var(--bg); color:var(--fg); border:1px solid var(--line);
+  border-radius:3px; padding:.3rem .4rem; font-family:var(--mono); font-size:12px; }
+.gh-input:focus { outline:none; border-color:var(--fg); }
+.gh-actions { display:flex; align-items:center; gap:.5rem; }
+.gh-status { color:var(--dim); font-size:.72rem; }
+.gh-error { color:var(--red); font-family:var(--mono); font-size:11px;
+  white-space:pre-wrap; overflow-wrap:anywhere; }
+
 /* === panel: timeline (owned by panels/timeline.rs) === */
 .timeline-panel { display:flex; flex-direction:column; gap:.45rem; font-size:11.5px; }
 .timeline-panel hr { border:none; border-top:1px solid var(--line); margin:.25rem 0; width:100%; }

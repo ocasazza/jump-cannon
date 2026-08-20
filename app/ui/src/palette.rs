@@ -134,6 +134,7 @@ pub(crate) enum Section {
     Metrics,
     Generate,
     Timeline,
+    GitHub,
 }
 
 impl Section {
@@ -147,6 +148,7 @@ impl Section {
         Section::Metrics,
         Section::Generate,
         Section::Timeline,
+        Section::GitHub,
     ];
 
     pub(crate) fn title(self) -> &'static str {
@@ -160,6 +162,7 @@ impl Section {
             Section::Metrics => "Metrics",
             Section::Generate => "Generate (tvix)",
             Section::Timeline => "Timeline",
+            Section::GitHub => "GitHub",
         }
     }
 
@@ -175,6 +178,7 @@ impl Section {
             Section::Metrics => crate::Panel::Metrics,
             Section::Generate => crate::Panel::Generate,
             Section::Timeline => crate::Panel::Timeline,
+            Section::GitHub => crate::Panel::GitHub,
         }
     }
 

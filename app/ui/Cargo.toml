@@ -73,4 +73,11 @@ miniz_oxide = "0.8"
 # expressions and the Generate panel's Inline executor. One-way edge —
 # tvix-wasm never depends on app code. Same path dep the egui app carried;
 # the nix appSrc fileset must include crates/tvix-wasm for this.
+# Vault extraction and re-namespacing: in-memory markdown → VaultGraph,
+# then remap from obsidian:obsidian: to github:{source_id}: namespace.
+# wasm32-clean; the github-importer crate (native reqwest-based) is not
+# reusable here, so sanitize_source_id is re-implemented locally.
+vault-links = { path = "../../crates/vault-links" }
+data-loader = { path = "../../crates/data-loader" }
+vault-data = { path = "../../crates/vault-data" }
 tvix-wasm = { path = "../../crates/tvix-wasm" }

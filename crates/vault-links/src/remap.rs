@@ -1,16 +1,19 @@
-//! Re-namespacing of vault-links extraction results.
+//! Re-namespacing of extraction results.
 //!
-//! [`vault_links::try_extract_vault`] publishes under the fixed
-//! `obsidian:obsidian:` namespace with content flags for a mounted,
-//! user-editable vault. The GitHub transport keeps every local part
-//! byte-identical (same parser, same vault-relative paths) but moves the
-//! graph into the configured `github:{source_id}:` namespace and drops the
-//! content flags: the corpus lives in a remote repository cache, so graph-api
-//! cannot resolve or persist note content for it.
+//! The extractors ([`crate::try_extract_vault`], [`crate::extract_notes`])
+//! publish under the fixed `obsidian:obsidian:` namespace with content flags
+//! for a mounted, user-editable vault. Transports that deliver the same
+//! corpus without a mounted vault — the server-side GitHub tarball importer,
+//! the in-browser GitHub import — keep every local part byte-identical (same
+//! parser, same vault-relative paths) but move the graph into their own
+//! namespace (`github:{source_id}:`) and drop the content flags: the corpus
+//! lives in a remote repository, so graph-api cannot resolve or persist note
+//! content for it.
 
-use data_loader::{identity::Namespace, ImportError, LoadResult, SearchDocument};
+use data_loader::{LoadResult, SearchDocument, identity::Namespace, ImportError};
 use vault_data::VaultGraph;
-use vault_links::ExtractionResult;
+
+use crate::ExtractionResult;
 
 /// The fixed namespace vault-links publishes under (see its extractor).
 const OBSIDIAN_PREFIX: &str = "obsidian:obsidian:";

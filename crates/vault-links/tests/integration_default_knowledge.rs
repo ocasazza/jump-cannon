@@ -33,7 +33,7 @@ fn default_knowledge_base_is_connected_and_resolved() {
     let result = extract_vault(temp.path());
     assert_eq!(
         result.graph.node_count(),
-        37,
+        39,
         "unexpected default node count"
     );
     assert!(

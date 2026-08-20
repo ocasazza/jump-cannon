@@ -25,6 +25,7 @@ mod proto;
 mod render;
 mod worker;
 
+mod github;
 use std::collections::HashSet;
 use std::sync::Arc;
 
@@ -178,6 +179,7 @@ pub(crate) enum Panel {
     History,
     Branches,
     Merge,
+    GitHub,
     GpuSessions,
 }
 
@@ -199,6 +201,7 @@ impl panel_kit::PanelKind for Panel {
             Panel::Debug => "Debug",
             Panel::Worlds => "Worlds",
             Panel::History => "History",
+            Panel::GitHub => "GitHub",
             Panel::Branches => "Branches",
             Panel::Merge => "Merge",
             Panel::GpuSessions => "GPU Sessions",
@@ -378,6 +381,7 @@ fn default_layout() -> Vec<PanelWin<Panel>> {
         min(b, Panel::Instances, 860.0, 180.0, 360.0, 420.0),
         min(b, Panel::Generate, 880.0, 200.0, 360.0, 440.0),
         min(b, Panel::Timeline, 900.0, 220.0, 380.0, 320.0),
+        min(b, Panel::GitHub, 890.0, 210.0, 360.0, 440.0),
         min(b, Panel::Debug, 920.0, 240.0, 320.0, 360.0),
         min(b, Panel::Inspector, 940.0, 260.0, 330.0, 300.0),
         min(b, Panel::Document, 960.0, 280.0, 430.0, 460.0),
@@ -1010,12 +1014,25 @@ fn App() -> Element {
     // even when the Filter panel is minimized or never mounted.
     panels::filter::use_query_evaluator(ctx);
 
+    // GitHub import mode: when the URL carries a `?gh=` spec or the page is
+    // served from a github.io host (no graph-api server exists there), the
+    // boot path is an in-browser GitHub import — the resilient server-load
+    // retry below is skipped instead of 404ing against the Pages host
+    // forever. `use_hook` computes the decision ONCE per mount: reading it in
+    // the component body would re-run the import on every App re-render
+    // (each graph promotion re-renders App — an import loop).
+    let github_boot = use_hook(crate::github::boot_spec);
+    let skip_server_load = github_boot.is_some();
+
     // Resilient initial load: retry until the backend answers, so a server
     // that's still indexing (or starting up) self-heals instead of leaving
     // the canvas permanently empty.
     {
         let mut load_error = ctx.load_error;
         use_future(move || async move {
+            if skip_server_load {
+                return;
+            }
             let epoch = begin_server_graph_load(ctx);
             loop {
                 match graph_canvas::load().await {
@@ -1037,6 +1054,18 @@ fn App() -> Element {
         });
     }
 
+    // Boot import in GitHub mode: drive the panel's shared import routine so
+    // progress and errors surface in the GitHub panel, and open that panel.
+    // The future body reads no signals, so it runs exactly once.
+    use_future(move || {
+        let boot = github_boot.clone();
+        async move {
+            if let Some(spec) = boot {
+                *OPEN_PANEL.write() = Some(Panel::GitHub);
+                panels::github::spawn_import(spec, ctx);
+            }
+        }
+    });
     // Selection -> fetch full node meta + seed the document editor.
     {
         let selected = ctx.selected;
@@ -1361,6 +1390,7 @@ fn panel_body(kind: Panel, _maximized: bool, ctx: Ctx) -> Element {
         Panel::Branches => panels::branches::panel(ctx),
         Panel::Merge => panels::merge::panel(ctx),
         Panel::GpuSessions => panels::gpu_sessions::panel(ctx),
+        Panel::GitHub => panels::github::panel(ctx),
         Panel::Help => rsx! {
             div { class: "help",
                 p { "canvas: drag rotate · wheel zoom · WASD pan · QE fwd/back · Shift boost · F fit · click select" }

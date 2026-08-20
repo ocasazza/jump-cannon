@@ -1182,8 +1182,11 @@
           doCheck = false;
         };
 
-        app-web = craneLib.buildTrunkPackage {
-          pname = "app-web";
+        # `publicUrl` (when set) is threaded into `trunk build --public-url`
+        # so the same frontend ships rooted at `/` (graph-api, Tauri) and
+        # under the GitHub Pages project path `/jump-cannon/`.
+        mkAppWeb = { pname, publicUrl ? null }: craneLib.buildTrunkPackage ({
+          inherit pname;
           version = "0.1.0";
           src = appSrc;
           sourceRoot = "source/app";
@@ -1194,12 +1197,23 @@
           trunkIndexPath = "ui/index.html";
           cargoExtraArgs = "--package jump-cannon-ui";
           wasm-bindgen-cli = pkgs.wasm-bindgen-cli_0_2_118;
+        } // pkgs.lib.optionalAttrs (publicUrl != null) {
+          trunkExtraBuildArgs = "--public-url ${publicUrl}";
+        });
+
+        app-web = mkAppWeb { pname = "app-web"; };
+
+        # GitHub Pages deployment of the fully in-browser app, hosted under
+        # the project path (`https://ocasazza.github.io/jump-cannon/`).
+        app-web-pages = mkAppWeb {
+          pname = "app-web-pages";
+          publicUrl = "/jump-cannon/";
         };
 
       in {
         packages = {
           default          = graph-api;
-          inherit graph-api graph-compute graph-layouts-wasm tvix-wasm app-web;
+          inherit graph-api graph-compute graph-layouts-wasm tvix-wasm app-web app-web-pages;
           inherit bench-pagerank;
           chart-tarball = pkgs.callPackage ./packages/chart-tarball {
             sourceRev = inputs.self.rev or inputs.self.dirtyRev or "unknown";

@@ -253,3 +253,101 @@ fn obsidian_ids_and_content_hashes_are_golden() {
         .expect("index edge");
     assert_eq!(edge.target, "obsidian:obsidian:linked");
 }
+
+#[test]
+fn extract_notes_matches_the_on_disk_vault_byte_for_byte() {
+    let fixture = tempfile::tempdir().unwrap();
+    fs::create_dir_all(fixture.path().join("Knowledge")).unwrap();
+    fs::write(
+        fixture.path().join("Knowledge/Start Here.md"),
+        "---\ntags: [runbook]\ndoctype: guide\n---\nSee [[Deep Note]].\n",
+    )
+    .unwrap();
+    fs::write(
+        fixture.path().join("Knowledge/Deep Note.md"),
+        "Back to [[Start Here]].\n",
+    )
+    .unwrap();
+    fs::write(fixture.path().join("root.md"), "Root body.\n").unwrap();
+
+    let on_disk = crate::try_extract_vault(fixture.path()).unwrap();
+    let files: Vec<(String, String)> = [
+        "Knowledge/Start Here.md",
+        "Knowledge/Deep Note.md",
+        "root.md",
+    ]
+    .iter()
+    .map(|rel| {
+        (
+            rel.to_string(),
+            fs::read_to_string(fixture.path().join(rel)).unwrap(),
+        )
+    })
+    .collect();
+    let in_memory = crate::try_extract_notes(&files).unwrap();
+
+    let disk_ids: std::collections::BTreeSet<_> = on_disk.graph.nodes.keys().collect();
+    let memory_ids: std::collections::BTreeSet<_> = in_memory.graph.nodes.keys().collect();
+    assert_eq!(disk_ids, memory_ids);
+
+    let disk_edges: std::collections::BTreeSet<_> = on_disk
+        .graph
+        .edges
+        .iter()
+        .map(|edge| (&edge.source, &edge.target))
+        .collect();
+    let memory_edges: std::collections::BTreeSet<_> = in_memory
+        .graph
+        .edges
+        .iter()
+        .map(|edge| (&edge.source, &edge.target))
+        .collect();
+    assert_eq!(disk_edges, memory_edges);
+
+    // Folder + title + search-document fields survive the transport change.
+    let note = in_memory
+        .graph
+        .nodes
+        .get("obsidian:obsidian:Knowledge/Start Here")
+        .expect("namespaced in-memory node");
+    assert_eq!(note.meta.folder, "Knowledge");
+    assert_eq!(note.meta.mtime, 0);
+    let document = in_memory
+        .search_documents
+        .iter()
+        .find(|document| document.node_id == "obsidian:obsidian:Knowledge/Start Here")
+        .expect("in-memory search document");
+    assert_eq!(document.fields["folder"], "Knowledge");
+    assert_eq!(document.fields["type"], "guide");
+}
+
+#[test]
+fn extract_notes_applies_the_canonical_exclusions() {
+    let files: Vec<(String, String)> = vec![
+        ("page.md".to_string(), "Body.\n".to_string()),
+        (".obsidian/config-note.md".to_string(), "Hidden.\n".to_string()),
+        ("Ink/sketch.md".to_string(), "Hidden.\n".to_string()),
+        ("canvas.canvas".to_string(), "{}".to_string()),
+    ];
+    let result = crate::extract_notes(&files);
+    let ids: std::collections::BTreeSet<&str> = result
+        .graph
+        .nodes
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(ids.len(), 1);
+    assert!(ids.contains("obsidian:obsidian:page"));
+}
+
+#[test]
+fn try_extract_notes_rejects_malformed_frontmatter() {
+    let files: Vec<(String, String)> = vec![(
+        "invalid.md".to_string(),
+        "---\ntags: [unterminated\n---\nBody.\n".to_string(),
+    )];
+    assert!(crate::try_extract_notes(&files).is_err());
+    // The best-effort variant strips the metadata instead of failing.
+    let result = crate::extract_notes(&files);
+    assert_eq!(result.graph.nodes.len(), 1);
+}

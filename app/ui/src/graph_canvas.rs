@@ -223,6 +223,64 @@ pub(crate) fn graph_data_from_snapshot(snapshot: &graph_vcs::Snapshot) -> GraphD
         },
     }
 }
+/// Convert a [`vault_data::VaultGraph`] into [`GraphData`], mirroring
+/// [`graph_data_from_snapshot`] for the github-import panel's browser-only
+/// path. Node iteration order follows the `IndexMap`'s insertion order for
+/// determinism; nodes carry no stored positions (x/y are 0.0), so we always
+/// seed from the sphere + coarsening warm-up.
+pub(crate) fn graph_data_from_vault(graph: &vault_data::VaultGraph) -> GraphData {
+    let mut id_to_idx: HashMap<String, u32> = HashMap::with_capacity(graph.nodes.len());
+    let mut ids: Vec<String> = Vec::with_capacity(graph.nodes.len());
+    for id in graph.nodes.keys() {
+        id_to_idx.insert(id.clone(), ids.len() as u32);
+        ids.push(id.clone());
+    }
+    let n = ids.len();
+
+    let mut edges: Vec<u32> = Vec::with_capacity(graph.edges.len() * 2);
+    for edge in &graph.edges {
+        // Drop edges whose endpoints are gone (shouldn't happen for a
+        // freshly-extracted graph, but mirrors the snapshot path).
+        let (Some(&s), Some(&t)) = (id_to_idx.get(&edge.source), id_to_idx.get(&edge.target))
+        else {
+            continue;
+        };
+        edges.push(s);
+        edges.push(t);
+    }
+    let n_edges = (edges.len() / 2) as u32;
+
+    // No stored positions — seed from sphere + warmup, same as the snapshot path.
+    let mut positions = render::data::spawn_on_unit_sphere(n, 800.0);
+    if n <= 10_000 {
+        let spring_len = GpuForceOptions::default().spring_len.max(1.0);
+        let warmed = graph_layouts::warmup_positions(n, &edges, spring_len, 0xC0A75E);
+        if warmed.len() == positions.len() {
+            positions = warmed;
+        }
+    }
+
+    let metrics: HashMap<String, Vec<f32>> = HashMap::new();
+    let colors = render::data::colors_from_metric("community", &metrics, n);
+    let sizes = render::data::sizes_from_metric("pagerank", &metrics, n, 0.5);
+    let num_wcc = crate::panels::generate::wcc_count(n, &edges);
+
+    GraphData {
+        graph_revision: None,
+        n_nodes: n as u32,
+        n_edges,
+        num_communities: 0,
+        num_wcc,
+        ids,
+        id_to_idx,
+        scene: render::Scene {
+            positions,
+            edges,
+            colors,
+            sizes,
+        },
+    }
+}
 
 /// In-flight pointer drag (camera rotate). A press that never travels
 /// more than the slop is a click — and clicks pick nodes.

@@ -17,13 +17,32 @@ const EXCLUDES: &[&str] = &[
     "!**/*.canvas",
 ];
 
-/// Build an `ignore::Walk` honoring the canonical exclusion contract.
-pub fn build_walker(root: &Path) -> Result<ignore::Walk> {
+/// Build the override matcher encoding the canonical exclusion contract,
+/// rooted at `root`. Shared by the filesystem walker and the no-filesystem
+/// path filter ([`is_excluded`]) so both enforce one glob list.
+fn overrides_for(root: &Path) -> Result<ignore::overrides::Override> {
     let mut overrides = OverrideBuilder::new(root);
     for pat in EXCLUDES {
         overrides.add(pat).with_context(|| format!("override pat: {pat}"))?;
     }
-    let overrides = overrides.build().context("build overrides")?;
+    overrides.build().context("build overrides")
+}
+
+/// Test one vault-relative path against the canonical exclusion contract
+/// without touching the filesystem. The in-memory extraction entry points
+/// (`extract_notes` / `try_extract_notes`) filter HTTP-fetched corpora with
+/// it so a committed `.obsidian/` directory behaves exactly as it does in a
+/// mounted vault.
+pub fn is_excluded(rel: &Path) -> bool {
+    let Ok(overrides) = overrides_for(Path::new("")) else {
+        return false;
+    };
+    overrides.matched(rel, false).is_ignore()
+}
+
+/// Build an `ignore::Walk` honoring the canonical exclusion contract.
+pub fn build_walker(root: &Path) -> Result<ignore::Walk> {
+    let overrides = overrides_for(root)?;
 
     let walker = WalkBuilder::new(root)
         .hidden(false)

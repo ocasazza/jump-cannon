@@ -32,7 +32,6 @@
 
 mod extract;
 mod fetch;
-mod remap;
 
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -449,7 +448,7 @@ impl GitHubImporter {
             origin: root.display().to_string(),
             message: format!("{error:#}"),
         })?;
-        remap::renamespace(result, &self.namespace)
+        vault_links::renamespace(result, &self.namespace)
     }
 }
 
