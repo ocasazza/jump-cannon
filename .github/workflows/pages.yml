@@ -1,0 +1,55 @@
+# GitHub Pages deployment of the fully in-browser jump-cannon app.
+#
+# Builds the Dioxus WASM frontend through the same nix + crane + trunk
+# pipeline as every other artifact (`.#app-web-pages`, which passes
+# `--public-url /jump-cannon/` to trunk) and publishes the dist with the
+# official Pages actions. No backend: the app fetches a GitHub repository's
+# markdown corpus over the CORS-enabled trees/raw endpoints and parses it
+# in WASM (vault-links `extract_notes`).
+name: pages
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "app/**"
+      - "crates/**"
+      - "flake.nix"
+      - "flake.lock"
+      - ".github/workflows/pages.yml"
+  workflow_dispatch:
+
+permissions:
+  pages: write
+  id-token: write
+
+# One deployment at a time; a newer push supersedes an in-flight build.
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build-deploy:
+    runs-on: ubuntu-latest
+    environment: github-pages
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: DeterminateSystems/nix-installer-action@main
+
+      # Free binary cache for public repos; keeps repeat builds at ~minutes
+      # instead of a cold wasm dependency tree.
+      - uses: DeterminateSystems/flakehub-cache-action@main
+
+      - name: Build the Pages frontend dist
+        run: nix build .#app-web-pages --out-link dist
+
+      # SPA fallback: unknown paths under /jump-cannon/ serve the app shell.
+      - name: Stage the artifact
+        run: cp dist/index.html dist/404.html
+
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: dist
+      - uses: actions/deploy-pages@v4
