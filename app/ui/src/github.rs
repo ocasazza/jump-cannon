@@ -5,8 +5,10 @@
 //! raw endpoints, extracts wikilink edges with vault-links, and produces a
 //! [`data_loader::LoadResult`] that the panel promotes onto the canvas.
 //!
-//! This module is gated behind `cfg(target_arch = "wasm32")` so the native
-//! build (Tauri) still compiles — a no-op stub covers every public symbol.
+//! Only the network/import path is wasm-gated (a no-op stub covers `import`
+//! on native); the spec type, persistence, and [`LAST_IMPORT`] signal are
+//! shared so the GitHub panel and the Settings → Importers browser catalog
+//! read one source of truth.
 
 #[cfg(target_arch = "wasm32")]
 use futures::stream::{self, StreamExt};
@@ -15,10 +17,62 @@ use gloo_net::http::Request;
 #[cfg(target_arch = "wasm32")]
 use web_sys::window;
 
+use data_loader::identity::MAX_SOURCE_ID_BYTES;
 #[cfg(target_arch = "wasm32")]
-use data_loader::identity::{MAX_SOURCE_ID_BYTES, Namespace, validate_source_id};
+use data_loader::identity::{Namespace, validate_source_id};
+use dioxus::prelude::*;
+use gloo_storage::{LocalStorage, Storage};
 #[cfg(target_arch = "wasm32")]
 use vault_links::{extract_notes, renamespace};
+
+/// localStorage key holding the last-used import spec (shared by the GitHub
+/// panel's form defaults and the Settings → Importers browser catalog).
+const SPEC_STORAGE_KEY: &str = "jc_github_spec";
+
+/// The spec behind the currently displayed browser-imported graph, set on
+/// every successful import. The Settings → Importers browser catalog reads
+/// it so the tab reflects the live source, not just the persisted default.
+pub static LAST_IMPORT: GlobalSignal<Option<GitHubImportSpec>> = Signal::global(|| None);
+
+/// Persisted form of [`GitHubImportSpec`] (flat strings, serde-defaulted so
+/// older entries keep decoding).
+#[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
+struct StoredSpec {
+    repo: String,
+    git_ref: String,
+    path: String,
+}
+
+/// The last-used spec from localStorage, when one was saved.
+pub fn persisted_spec() -> Option<GitHubImportSpec> {
+    let stored: StoredSpec = LocalStorage::get(SPEC_STORAGE_KEY).ok()?;
+    if stored.repo.trim().is_empty() {
+        return None;
+    }
+    Some(GitHubImportSpec {
+        repo: stored.repo,
+        git_ref: stored.git_ref,
+        path: stored.path,
+    })
+}
+
+/// Persist a spec as the GitHub panel's next-session default.
+pub fn persist_spec(spec: &GitHubImportSpec) {
+    let _ = LocalStorage::set(
+        SPEC_STORAGE_KEY,
+        StoredSpec {
+            repo: spec.repo.clone(),
+            git_ref: spec.git_ref.clone(),
+            path: spec.path.clone(),
+        },
+    );
+}
+
+/// Contract-valid source id for a repository slug — the public wrapper the
+/// Settings catalog displays (`github:{source_id}` namespace).
+pub fn source_id_for(repo: &str) -> String {
+    sanitize_source_id(repo)
+}
 
 /// Repository slug for the GitHub Pages default import (`ocasazza/jump-cannon`).
 const PAGES_DEFAULT_REPO: &str = "ocasazza/jump-cannon";
@@ -32,7 +86,7 @@ const MAX_TOTAL_BYTES: usize = 8 * 1024 * 1024; // 8 MiB
 const FETCH_CONCURRENCY: usize = 8;
 
 /// Configuration for one GitHub repository import.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct GitHubImportSpec {
     /// `owner/repo` slug (e.g. `"ocasazza/jump-cannon"`).
     pub repo: String,
@@ -101,7 +155,6 @@ impl GitHubImportSpec {
 // The github-importer crate uses reqwest (native-only) so we cannot share it
 // across the wasm/native boundary. The logic is ~15 lines and mirrors the
 // upstream implementation exactly; see crates/github-importer/src/lib.rs.
-#[cfg(target_arch = "wasm32")]
 fn sanitize_source_id(repo: &str) -> String {
     let sanitized: String = repo
         .to_lowercase()

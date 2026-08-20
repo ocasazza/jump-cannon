@@ -256,6 +256,76 @@ enum ImportersViewState {
     Failed(String),
 }
 
+/// The importer catalog for pure-frontend deployments (GitHub Pages): no
+/// graph-api exists to answer `GET /importers`, so the tab describes the
+/// importer running inside this browser — the CORS-only GitHub import —
+/// instead of erroring on the static host's 404 page. Rendered when the
+/// boot decision picked GitHub mode and the live graph is not server-backed
+/// (a user who typed a reachable server URL into Connection gets the server
+/// catalog back).
+fn browser_importer_catalog() -> Element {
+    // Live source first, then the persisted panel default, then the boot
+    // spec (deep link or Pages default). Reading LAST_IMPORT subscribes the
+    // tab so a completed import refreshes the card in place.
+    let spec = crate::github::LAST_IMPORT
+        .read()
+        .clone()
+        .or_else(crate::github::persisted_spec)
+        .or_else(crate::github::boot_spec);
+    rsx! {
+        div {
+            class: "importers-view",
+            "data-activation": "browser",
+            "data-runtime-switch": "browser",
+            section { class: "importer-policy", role: "note",
+                span { class: "importer-policy-label", "Browser-hosted" }
+                p {
+                    "No graph-api server: this browser lists, fetches, and parses the source \
+                     itself (GitHub trees + raw endpoints, CORS-only). Public repositories \
+                     only; indexed search and node metadata stay server features."
+                }
+            }
+            if let Some(spec) = spec {
+                section { class: "importer-active-summary",
+                    div {
+                        span { class: "importer-section-label", "Active importer" }
+                        strong { "GitHub (in-browser)" }
+                        code { "data-field": "active-kind", "github" }
+                    }
+                    dl { class: "importer-facts",
+                        {importer_fact("package", "active-importer-id", &format!("github.{}", crate::github::source_id_for(&spec.repo)))}
+                        {importer_fact("version", "active-importer-version", env!("CARGO_PKG_VERSION"))}
+                        {importer_fact("repository", "selected-profile", &spec.repo)}
+                        {importer_fact("ref", "active-ref", if spec.git_ref.is_empty() { "default branch" } else { &spec.git_ref })}
+                        {importer_fact("path", "active-path", if spec.path.is_empty() { "(repository root)" } else { &spec.path })}
+                        {importer_fact("namespace", "active-namespace", &format!("github:{}", crate::github::source_id_for(&spec.repo)))}
+                    }
+                    button {
+                        class: "btn",
+                        r#type: "button",
+                        onclick: move |_| {
+                            *crate::OPEN_PANEL.write() = Some(crate::Panel::GitHub);
+                        },
+                        "Configure in the GitHub panel"
+                    }
+                }
+            } else {
+                section { class: "importer-active-summary",
+                    p { class: "importers-status", "Nothing imported yet." }
+                    button {
+                        class: "btn",
+                        r#type: "button",
+                        onclick: move |_| {
+                            *crate::OPEN_PANEL.write() = Some(crate::Panel::GitHub);
+                        },
+                        "Open the GitHub panel"
+                    }
+                }
+            }
+        }
+    }
+}
+
 fn importer_fact(label: &'static str, field: &'static str, value: &str) -> Element {
     rsx! {
         div { class: "importer-fact",
@@ -575,6 +645,12 @@ fn importer_catalog(
 fn ImportersSettings(props: DelegateProps) -> Element {
     let ctx = props.ctx;
     let mut state = use_signal(|| ImportersViewState::Loading);
+    // Browser-hosted deployment (GitHub Pages or a ?gh= deep link): while no
+    // server-backed graph is live there is no /importers endpoint — the
+    // static host's 404 page is not JSON. Render the browser importer
+    // catalog instead; connecting to a reachable server (Connection tab)
+    // flips back to the server catalog automatically.
+    let browser_hosted = crate::github::boot_spec().is_some();
     // The viewed source is session state (sessionStorage), not server state:
     // the catalog's `selected`/`active` always describe the deployment default.
     let mut viewing = use_signal(|| api::source_id());
@@ -583,6 +659,9 @@ fn ImportersSettings(props: DelegateProps) -> Element {
         // Re-run after every switch so the catalog's per-request posture
         // (`allowed`) and the cards' radio state refresh together.
         let _ = *generation.read();
+        if browser_hosted && !ctx.graph_session.read().is_server_backed() {
+            return;
+        }
         spawn(async move {
             state.set(match api::importers().await {
                 Ok(catalog) => ImportersViewState::Ready(catalog),
@@ -600,6 +679,10 @@ fn ImportersSettings(props: DelegateProps) -> Element {
         generation += 1;
         spawn(reload_graph(ctx));
     };
+
+    if browser_hosted && !ctx.graph_session.read().is_server_backed() {
+        return browser_importer_catalog();
+    }
 
     let view = state.read().clone();
     match view {
