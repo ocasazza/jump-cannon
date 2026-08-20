@@ -45,11 +45,16 @@ jobs:
         run: nix build .#app-web-pages --out-link dist
 
       # SPA fallback: unknown paths under /jump-cannon/ serve the app shell.
+      # `dist` is a symlink into the read-only nix store — dereference it
+      # into a writable staging dir before adding 404.html.
       - name: Stage the artifact
-        run: cp dist/index.html dist/404.html
+        run: |
+          cp -rL dist pages-dist
+          chmod -R u+w pages-dist
+          cp pages-dist/index.html pages-dist/404.html
 
       - uses: actions/configure-pages@v5
       - uses: actions/upload-pages-artifact@v3
         with:
-          path: dist
+          path: pages-dist
       - uses: actions/deploy-pages@v4
