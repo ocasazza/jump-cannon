@@ -6,7 +6,7 @@
 //! different CSS class prefixes. This module unifies both behind
 //! `SelectableCard` and `card_chip` helpers while keeping the
 //! existing class names so the browser regression selectors
-//! (`[data-source-id]`, `[data-active]`, `[data-viewing]`, …) keep
+//! (`[data-source-id]`, `[data-default]`, `[data-viewing]`, …) keep
 //! working on the live cluster.
 
 use dioxus::prelude::*;

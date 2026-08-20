@@ -2686,10 +2686,10 @@ fn EngineCard(
     on_select: EventHandler<()>,
 ) -> Element {
     // Keep the existing `lay-card*` class names so the browser regression
-    // suite's `[data-source-id]` / `[aria-pressed]` / `lay-card-name` /
-    // `lay-chip` selectors keep matching. The shared `SelectableCard`
-    // component supplies the head / chip / desc / why skeleton; the
-    // "● running" badge is a layout-specific slot via `children`.
+    // suite's `[data-source-id]` / `[aria-pressed]` selectors keep matching.
+    // The shared `SelectableCard` component supplies the head / chip / desc /
+    // why skeleton; the "● running" badge is a layout-specific slot via
+    // `children`.
     let mut class = String::from("select-card lay-card");
     if active {
         class.push_str(" active");

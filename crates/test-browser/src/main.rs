@@ -1181,17 +1181,17 @@ async fn drive_page(
               'github', 'world'
             ]);
             const cards = [...content.querySelectorAll('.importer-card[data-source-id]')];
+            // The shared SelectableCard emits data-default for the
+            // deployment-selected profile; the old per-card
+            // data-selected/data-active pair collapsed into it when the
+            // catalog made runtime viewing session-scoped.
             const selectedCards = cards.filter(
-              (card) => card.getAttribute('data-selected') === 'true'
-            );
-            const activeCards = cards.filter(
-              (card) => card.getAttribute('data-active') === 'true'
+              (card) => card.getAttribute('data-default') === 'true'
             );
             const selectionMatches = selectedProfile === 'none'
-              ? knownKinds.has(activeKind) && selectedCards.length === 0 && activeCards.length === 0
+              ? knownKinds.has(activeKind) && selectedCards.length === 0
               : knownKinds.has(activeKind) &&
-                selectedCards.length === 1 && activeCards.length === 1 &&
-                selectedCards[0] === activeCards[0] &&
+                selectedCards.length === 1 &&
                 selectedCards[0].getAttribute('data-source-id') === selectedProfile &&
                 selectedCards[0].getAttribute('data-kind') === activeKind;
             // The policy note follows the per-viewer runtime-switch posture:
@@ -1231,7 +1231,7 @@ async fn drive_page(
               lavenderText('[data-field="producer-existing-claim-value"]') ===
                 'lavender-okf-shared'
             );
-            const lavenderDescription = lavenderText('.importer-description');
+            const lavenderDescription = lavenderText('.select-card-desc');
             importerReadOnly &&= /deployment-provisioned RWX/i.test(lavenderDescription) &&
               /same namespace/i.test(lavenderDescription) &&
               /<release>-okf/.test(lavenderDescription) &&

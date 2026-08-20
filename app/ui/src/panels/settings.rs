@@ -287,13 +287,12 @@ fn importer_card(
     };
     let selectable = is_default || profile.runnable;
     let has_details = profile.source.is_some() || profile.producer.is_some();
-    // The browser regression's data-source-id / data-active /
-    // data-runnable / data-selected selectors all key on these
-    // attributes; the shared `select-card` parent class only adds
-    // the neutral wrapper so importers and engines can share styles.
-    // The `importer-card*` class chain remains for the regression's
-    // `[data-source-id="lavender-ingest-okf"]` selectors and the
-    // existing per-state colour rules.
+    // The browser regression's data-source-id / data-kind / data-default /
+    // data-viewing selectors all key on attributes SelectableCard emits;
+    // the shared `select-card` parent class only adds the neutral wrapper
+    // so importers and engines share chrome. The `importer-card*` class
+    // chain remains for the regression's
+    // `[data-source-id="lavender-ingest-okf"]` selectors.
     let card_class: String = if is_viewing {
         "select-card importer-card importer-card-viewing".into()
     } else if is_default {
@@ -301,17 +300,27 @@ fn importer_card(
     } else {
         "select-card importer-card".into()
     };
+    // Chips render once, in the shared SelectableCard head strip — there
+    // is no second badge row. The suffixes still carry the `importer-badge`
+    // class so the browser regression's `.importer-badge.viewing` /
+    // `.importer-badge.read-only` selectors keep matching.
     let mut chips: Vec<(String, String)> = Vec::new();
-    chips.push(("importer-kind-tag".to_string(), profile.kind.clone()));
+    chips.push((
+        "importer-badge importer-kind-tag".to_string(),
+        profile.kind.clone(),
+    ));
     if is_viewing {
-        chips.push(("viewing".to_string(), "viewing".to_string()));
+        chips.push(("importer-badge viewing".to_string(), "viewing".to_string()));
     }
     if profile
         .source
         .as_ref()
         .is_some_and(|source| source.read_only)
     {
-        chips.push(("read-only".to_string(), "read-only".to_string()));
+        chips.push((
+            "importer-badge read-only".to_string(),
+            "read-only".to_string(),
+        ));
     }
     let button_class: String = if is_viewing {
         "btn importer-switch-btn importer-switch-current".into()
@@ -344,17 +353,6 @@ fn importer_card(
             disabled: false,
             title: profile.id.clone(),
             on_select: None,
-            div { class: "importer-badges",
-                span { class: "importer-badge importer-kind-tag", "{profile.kind}" }
-                if is_viewing && !is_default {
-                    span { class: "importer-badge viewing", "viewing" }
-                } else if is_viewing && is_default {
-                    span { class: "importer-badge viewing", "viewing" }
-                }
-                if profile.source.as_ref().is_some_and(|source| source.read_only) {
-                    span { class: "importer-badge read-only", "read-only" }
-                }
-            }
             dl { class: "importer-facts importer-identity",
                 {importer_fact("source id", "source-id", source_id)}
                 if let Some(interval) = profile.filesystem_rescan_interval_seconds {
