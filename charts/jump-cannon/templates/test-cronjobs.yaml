@@ -123,6 +123,10 @@ spec:
               env:
                 - name: PUSHGATEWAY_URL
                   value: {{ .Values.tests.pushgatewayUrl | quote }}
+                {{- if .Values.tests.performance.profiling.enabled }}
+                - name: PYROSCOPE_URL
+                  value: {{ required "tests.performance.profiling.pyroscopeUrl is required when tests.performance.profiling.enabled=true" .Values.tests.performance.profiling.pyroscopeUrl | quote }}
+                {{- end }}
                 - name: BENCH_INCLUDE_1M
                   value: {{ .Values.tests.performance.includeHuge | quote }}
               resources:

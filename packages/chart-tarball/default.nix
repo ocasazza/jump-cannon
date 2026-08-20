@@ -122,6 +122,36 @@ pkgs.runCommand "jump-cannon-chart-tarball"
     grep -Fq 'name: JUMP_CANNON_KUBERNETES_CONFIG' legacy-kubernetes.yaml
     grep -Fq 'value: "kubernetes"' legacy-kubernetes.yaml
 
+    # tests.performance.profiling: PYROSCOPE_URL renders only when enabled,
+    # requires a URL when it is, and stays out of the default render.
+    helm template profiling ./jump-cannon \
+      --set graphCompute.enabled=false \
+      --set tests.fuzz.enabled=false \
+      --set tests.browser.enabled=false \
+      --set tests.performance.profiling.enabled=true \
+      --set tests.performance.profiling.pyroscopeUrl=http://pyroscope.monitoring.svc:4040 \
+      > profiling.yaml
+    grep -Fq 'name: PYROSCOPE_URL' profiling.yaml
+    grep -Fq 'value: "http://pyroscope.monitoring.svc:4040"' profiling.yaml
+    helm template profiling-off ./jump-cannon \
+      --set graphCompute.enabled=false \
+      --set tests.fuzz.enabled=false \
+      --set tests.browser.enabled=false \
+      > profiling-off.yaml
+    if grep -Fq 'name: PYROSCOPE_URL' profiling-off.yaml; then
+      echo "PYROSCOPE_URL must not render with tests.performance.profiling.enabled=false" >&2
+      exit 1
+    fi
+    if helm template profiling-missing-url ./jump-cannon \
+      --set graphCompute.enabled=false \
+      --set tests.fuzz.enabled=false \
+      --set tests.browser.enabled=false \
+      --set tests.performance.profiling.enabled=true \
+      > /dev/null 2>&1; then
+      echo "tests.performance.profiling.enabled without pyroscopeUrl must fail template" >&2
+      exit 1
+    fi
+
     # GitHub docs-importer mode: env from githubImporter values (seconds -> ms
     # for the poll interval), an ephemeral emptyDir extraction cache, and no
     # vault filesystem (github is a non-filesystem source like kubernetes).

@@ -40,6 +40,13 @@ and `tests.performance.namespace` so they use the existing LocalQueue. With the
 ClusterQueue GPU quota at `0`, the scheduled performance Job stays queued until
 an operator deliberately grants quota and frees silicon from a serving workload.
 
+Set `tests.performance.profiling.enabled=true` with
+`tests.performance.profiling.pyroscopeUrl` pointing at an in-cluster Pyroscope
+to have each benchmark sampled at 100 Hz by pprof-rs and pushed as its own
+Pyroscope series (`jump-cannon-perf.<group>.<benchmark-id>`). The profiler
+perturbs wall-clock timings, so keep it off when the Pushgateway duration
+gauges are the signal you care about.
+
 ## Session manager
 
 Set `sessionManager.enabled=true` to deploy the multi-user session-manager
