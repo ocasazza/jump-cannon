@@ -576,6 +576,11 @@
               pname = "jump-cannon-test-workload-bins";
               version = "0.1.0";
               nativeBuildInputs = [ pkgs.protobuf ];
+              # pprof's frame-pointer unwinder needs frame pointers in the
+              # benchmark hot paths; the workspace crates are compiled by this
+              # derivation (prebuilt depsNative are not), which is where the
+              # pagerank/layout/scaling work happens.
+              RUSTFLAGS = "-Cforce-frame-pointers=yes";
               buildPhaseCargoCommand = ''
                 CARGO_TARGET_DIR=target/layout-fuzz \
                   cargo test -p graph-layouts --test fuzz --release --no-run
@@ -707,7 +712,41 @@
           text = ''
             set -euo pipefail
             : "''${PUSHGATEWAY_URL:=http://pushgateway.monitoring.svc.cluster.local:9091}"
+            : "''${PYROSCOPE_URL:=}"
             ${testMetricsShell}
+
+            # Continuous profiling, opt-in via the chart's
+            # tests.performance.profiling: with PYROSCOPE_URL set, the bench
+            # examples switch to criterion's pprof profiler (BENCH_PPROF,
+            # 100 Hz, one profile.pb per benchmark under CRITERION_HOME) and
+            # push_profiles uploads each to Pyroscope after the run. The
+            # profiler perturbs wall-clock timings, so the Pushgateway
+            # duration metrics stay profiler-free unless this is on.
+            prof_started="$(date +%s)"
+            if [ -n "$PYROSCOPE_URL" ]; then
+              export BENCH_PPROF=1
+              export CRITERION_HOME="''${CRITERION_HOME:-/tmp/criterion}"
+              mkdir -p "$CRITERION_HOME"
+            fi
+
+            push_profiles() {
+              [ -n "''${PYROSCOPE_URL:-}" ] || return 0
+              root="''${CRITERION_HOME:-target/criterion}"
+              ended="$(date +%s)"
+              find "$root" -type f -name profile.pb 2>/dev/null | while read -r pb; do
+                # <group>/<benchmark-id>/profile/profile.pb -> one Pyroscope
+                # series per benchmark, e.g.
+                # jump-cannon-perf.scaling_structure_pagerank.gpu_dense_blocks
+                bench="''${pb#"$root"/}"
+                bench="''${bench%/profile/profile.pb}"
+                name="jump-cannon-perf.''${bench//\//.}"
+                if ! curl -fsS -X POST \
+                  "$PYROSCOPE_URL/ingest?name=$name&from=$prof_started&until=$ended&format=pprof" \
+                  --data-binary @"$pb"; then
+                  echo "warning: pyroscope push failed for $bench" >&2
+                fi
+              done
+            }
 
             if [ "''${BENCH_INCLUDE_1M:-0}" != "1" ]; then
               unset BENCH_INCLUDE_1M
@@ -728,6 +767,7 @@
             if ! run_and_report performance-bench-scaling graph-compute-bench-scaling --bench --noplot; then
               overall_status=1
             fi
+            push_profiles
             exit "$overall_status"
           '';
         };
