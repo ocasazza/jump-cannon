@@ -721,13 +721,19 @@
             # tests.performance.profiling: with PYROSCOPE_URL set, the bench
             # examples switch to criterion's pprof profiler (BENCH_PPROF,
             # 100 Hz, one profile.pb per benchmark under CRITERION_HOME) and
-            # push_profiles uploads each to Pyroscope after the run. The
-            # profiler perturbs wall-clock timings, so the Pushgateway
-            # duration metrics stay profiler-free unless this is on.
+            # push_profiles uploads each to Pyroscope after the run. Criterion
+            # invokes custom profilers only for --profile-time, so profiling
+            # mode is added to each benchmark command below. It replaces the
+            # normal statistical run for these opt-in jobs; the Pushgateway
+            # duration is therefore intentionally not comparable to an
+            # unprofiled run.
             prof_started="$(date +%s)"
+            profile_args=()
             if [ -n "$PYROSCOPE_URL" ]; then
               export BENCH_PPROF=1
               export CRITERION_HOME="''${CRITERION_HOME:-/tmp/criterion}"
+              export BENCH_PROFILE_SECONDS="''${BENCH_PROFILE_SECONDS:-10}"
+              profile_args=(--profile-time "$BENCH_PROFILE_SECONDS")
               mkdir -p "$CRITERION_HOME"
             fi
 
@@ -760,13 +766,18 @@
             # the whole night. Run all three regardless of one another, and
             # fail the job at the end if any of them failed.
             overall_status=0
-            if ! run_and_report performance-bench-static-layouts graph-layouts-bench-static --bench; then
+            if ! run_and_report performance-bench-static-layouts \
+              graph-layouts-bench-static --bench "''${profile_args[@]}"; then
               overall_status=1
             fi
-            if ! run_and_report performance-bench-pagerank graph-compute-bench-pagerank --bench --noplot; then
+            if ! run_and_report performance-bench-pagerank \
+              graph-compute-bench-pagerank --bench --noplot \
+              "''${profile_args[@]}"; then
               overall_status=1
             fi
-            if ! run_and_report performance-bench-scaling graph-compute-bench-scaling --bench --noplot; then
+            if ! run_and_report performance-bench-scaling \
+              graph-compute-bench-scaling --bench --noplot \
+              "''${profile_args[@]}"; then
               overall_status=1
             fi
             # Profile upload is observability, not test verdict: never let a
