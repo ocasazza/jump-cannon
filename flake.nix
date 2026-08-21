@@ -708,6 +708,8 @@
             test-workload-bins
             pkgs.coreutils
             pkgs.curl
+            # find(1) for push_profiles' profile.pb discovery — not in coreutils.
+            pkgs.findutils
           ];
           text = ''
             set -euo pipefail
@@ -767,7 +769,9 @@
             if ! run_and_report performance-bench-scaling graph-compute-bench-scaling --bench --noplot; then
               overall_status=1
             fi
-            push_profiles
+            # Profile upload is observability, not test verdict: never let a
+            # push failure mask or fail the benchmark result.
+            push_profiles || echo "warning: push_profiles failed" >&2
             exit "$overall_status"
           '';
         };
