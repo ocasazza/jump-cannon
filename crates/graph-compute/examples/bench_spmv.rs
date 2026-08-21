@@ -101,11 +101,9 @@ fn bench_spmv(c: &mut Criterion) {
 }
 
 /// Profiling is opt-in via BENCH_PPROF=1 (set by the jump-cannon-perf wrapper
-/// when the chart's tests.profiling.enabled wires PYROSCOPE_URL): pprof-rs
-/// samples at 100 Hz and criterion writes one gzipped `profile.pb` per
-/// benchmark under $CRITERION_HOME (default target/criterion) for the wrapper
-/// to push to Pyroscope. Profiling perturbs wall-clock numbers, so the nightly
-/// Pushgateway timings stay profiler-free unless profiling is on.
+/// when profiling is enabled): pprof-rs samples at 100 Hz and criterion writes
+/// one gzipped `profile.pb` per benchmark under $CRITERION_HOME for the
+/// wrapper to push to Pyroscope — same opt-in as the other bench examples.
 fn criterion_config() -> Criterion {
     if std::env::var_os("BENCH_PPROF").is_some() {
         Criterion::default().with_profiler(pprof::criterion::PProfProfiler::new(

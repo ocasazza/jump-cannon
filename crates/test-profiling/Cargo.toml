@@ -1,0 +1,14 @@
+[package]
+name = "test-profiling"
+version = "1.0.0"
+edition = "2021"
+description = "Env-gated Pyroscope CPU profiling for CI test workloads"
+license = "MIT"
+
+# The pprof backend is native-only (SIGPROF + framehop unwinding); wasm
+# targets get the no-op stub so `clippy --all-targets` for wasm32 never
+# pulls the pyroscope/ring dep tree.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+pyroscope = { version = "2.1.1", features = ["backend-pprof-rs"] }
+# Runs the profiler before libtest's main in test binaries (fuzz harnesses).
+ctor = "0.2"

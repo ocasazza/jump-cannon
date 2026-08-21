@@ -38,6 +38,18 @@ use graph_compute::engines::{
 use graph_compute::sim::CsrGraph;
 use std::time::{Duration, Instant};
 
+// Env-gated Pyroscope CPU profiling: start before libtest's main and keep
+// the agent alive for the whole binary (PYROSCOPE_URL set by the
+// nightly test wrapper; no-op locally). Native-only — wasm never builds the
+// test target this lives in.
+#[cfg(not(target_arch = "wasm32"))]
+#[test_profiling::ctor]
+fn _start_profiling() {
+    if let Some(agent) = test_profiling::start_from_env() {
+        std::mem::forget(agent);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Harness
 // ---------------------------------------------------------------------------

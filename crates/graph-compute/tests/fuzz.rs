@@ -31,6 +31,18 @@ use proptest::prelude::*;
 
 mod common;
 
+// Env-gated Pyroscope CPU profiling: start before libtest's main and keep
+// the agent alive for the whole binary (PYROSCOPE_URL set by the
+// nightly test wrapper; no-op locally). Native-only — wasm never builds the
+// test target this lives in.
+#[cfg(not(target_arch = "wasm32"))]
+#[test_profiling::ctor]
+fn _start_profiling() {
+    if let Some(agent) = test_profiling::start_from_env() {
+        std::mem::forget(agent);
+    }
+}
+
 /// Serialize GPU cases (concurrent wgpu device creation trips Metal
 /// validation under load — same guard as tests/layout_stability.rs).
 static GPU_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());

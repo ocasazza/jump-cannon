@@ -1,26 +1,88 @@
 {
-  "title": "jump-cannon — Test Results",
+  "title": "jump-cannon \u2014 Test Results",
   "uid": "jump-cannon-test-results",
-  "tags": ["jump-cannon", "ci", "tests"],
+  "tags": [
+    "jump-cannon",
+    "ci",
+    "tests"
+  ],
   "timezone": "browser",
   "schemaVersion": 41,
-  "version": 1,
+  "version": 2,
   "refresh": "30s",
-  "time": { "from": "now-7d", "to": "now" },
+  "time": {
+    "from": "now-7d",
+    "to": "now"
+  },
   "editable": true,
   "graphTooltip": 0,
-  "annotations": { "list": [] },
-  "templating": { "list": [] },
+  "annotations": {
+    "list": []
+  },
+  "templating": {
+    "list": [
+      {
+        "name": "test",
+        "label": "Test",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "prometheus"
+        },
+        "definition": "label_values(test_run_passed{app=\"jump-cannon\"}, test)",
+        "query": {
+          "query": "label_values(test_run_passed{app=\"jump-cannon\"}, test)",
+          "refId": "StandardVariableQuery"
+        },
+        "refresh": 1,
+        "includeAll": true,
+        "allValue": ".*",
+        "multi": false,
+        "sort": 1,
+        "current": {}
+      },
+      {
+        "name": "run",
+        "label": "Trace (run)",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "prometheus"
+        },
+        "definition": "label_values(jump_cannon_test_run_info{app=\"jump-cannon\", test=\"$test\"}, run)",
+        "query": {
+          "query": "label_values(jump_cannon_test_run_info{app=\"jump-cannon\", test=\"$test\"}, run)",
+          "refId": "StandardVariableQuery"
+        },
+        "refresh": 1,
+        "includeAll": false,
+        "multi": false,
+        "sort": 3,
+        "current": {}
+      }
+    ]
+  },
   "panels": [
     {
       "id": 1,
       "type": "stat",
       "title": "Pass rate (last runs)",
-      "datasource": { "type": "prometheus", "uid": "prometheus" },
-      "gridPos": { "x": 0, "y": 0, "w": 6, "h": 4 },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 0,
+        "w": 6,
+        "h": 4
+      },
       "targets": [
         {
-          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
           "refId": "A",
           "expr": "sum(test_run_passed{app=\"jump-cannon\"}) / (sum(test_run_passed{app=\"jump-cannon\"}) + sum(test_run_failed{app=\"jump-cannon\"}))"
         }
@@ -31,16 +93,29 @@
           "thresholds": {
             "mode": "absolute",
             "steps": [
-              { "color": "red", "value": null },
-              { "color": "yellow", "value": 0.8 },
-              { "color": "green", "value": 1 }
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 0.8
+              },
+              {
+                "color": "green",
+                "value": 1
+              }
             ]
           }
         },
         "overrides": []
       },
       "options": {
-        "reduceOptions": { "calcs": ["lastNotNull"] },
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
         "colorMode": "background",
         "graphMode": "none",
         "justifyMode": "auto",
@@ -52,11 +127,22 @@
       "id": 2,
       "type": "stat",
       "title": "Passed",
-      "datasource": { "type": "prometheus", "uid": "prometheus" },
-      "gridPos": { "x": 6, "y": 0, "w": 6, "h": 4 },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 6,
+        "y": 0,
+        "w": 6,
+        "h": 4
+      },
       "targets": [
         {
-          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
           "refId": "A",
           "expr": "sum(test_run_passed{app=\"jump-cannon\"})"
         }
@@ -65,13 +151,22 @@
         "defaults": {
           "thresholds": {
             "mode": "absolute",
-            "steps": [{ "color": "green", "value": null }]
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
           }
         },
         "overrides": []
       },
       "options": {
-        "reduceOptions": { "calcs": ["lastNotNull"] },
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
         "colorMode": "background",
         "graphMode": "none",
         "justifyMode": "auto",
@@ -83,11 +178,22 @@
       "id": 3,
       "type": "stat",
       "title": "Failed",
-      "datasource": { "type": "prometheus", "uid": "prometheus" },
-      "gridPos": { "x": 12, "y": 0, "w": 6, "h": 4 },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 0,
+        "w": 6,
+        "h": 4
+      },
       "targets": [
         {
-          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
           "refId": "A",
           "expr": "sum(test_run_failed{app=\"jump-cannon\"})"
         }
@@ -97,15 +203,25 @@
           "thresholds": {
             "mode": "absolute",
             "steps": [
-              { "color": "green", "value": null },
-              { "color": "red", "value": 1 }
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
             ]
           }
         },
         "overrides": []
       },
       "options": {
-        "reduceOptions": { "calcs": ["lastNotNull"] },
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
         "colorMode": "background",
         "graphMode": "none",
         "justifyMode": "auto",
@@ -117,11 +233,22 @@
       "id": 4,
       "type": "stat",
       "title": "Last run age",
-      "datasource": { "type": "prometheus", "uid": "prometheus" },
-      "gridPos": { "x": 18, "y": 0, "w": 6, "h": 4 },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 18,
+        "y": 0,
+        "w": 6,
+        "h": 4
+      },
       "targets": [
         {
-          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
           "refId": "A",
           "expr": "time() - max(jump_cannon_test_last_run_timestamp_seconds{app=\"jump-cannon\"})"
         }
@@ -132,16 +259,29 @@
           "thresholds": {
             "mode": "absolute",
             "steps": [
-              { "color": "green", "value": null },
-              { "color": "yellow", "value": 93600 },
-              { "color": "red", "value": 180000 }
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 93600
+              },
+              {
+                "color": "red",
+                "value": 180000
+              }
             ]
           }
         },
         "overrides": []
       },
       "options": {
-        "reduceOptions": { "calcs": ["lastNotNull"] },
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
         "colorMode": "background",
         "graphMode": "none",
         "justifyMode": "auto",
@@ -152,13 +292,24 @@
     {
       "id": 5,
       "type": "state-timeline",
-      "title": "Pass/fail heatmap — result per test over time",
-      "description": "One row per individual test/check within each nightly CronJob family: fuzz-graph-layouts, fuzz-graph-compute (fuzz); performance-bench-static-layouts, performance-bench-pagerank, performance-bench-scaling (performance); browser-pre-wasm-mount, browser-header-actions, browser-nodes-editor, browser-settings-tabs, browser-filter-builder, browser-sessions-view, browser-importer-switch (browser). Each nightly run pushes its result to Pushgateway; the value persists until the next run, so a red span covers every day that check kept failing.",
-      "datasource": { "type": "prometheus", "uid": "prometheus" },
-      "gridPos": { "x": 0, "y": 4, "w": 24, "h": 8 },
+      "title": "Pass/fail heatmap \u2014 result per test over time",
+      "description": "One row per individual test/check within each nightly CronJob family: fuzz-graph-layouts, fuzz-graph-compute (fuzz); performance-bench-static-layouts, performance-bench-pagerank, performance-bench-scaling, performance-bench-spmv (criterion benches); performance-geometric-solver (canary + golden + perf budgets in one libtest binary); browser-pre-wasm-mount, browser-header-actions, browser-nodes-editor, browser-settings-tabs, browser-filter-builder, browser-sessions-view, browser-importer-switch (browser). Each nightly run pushes its result to Pushgateway; the value persists until the next run, so a red span covers every day that check kept failing.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 4,
+        "w": 24,
+        "h": 8
+      },
       "targets": [
         {
-          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
           "refId": "A",
           "expr": "test_run_passed{app=\"jump-cannon\"}",
           "legendFormat": "{{test}}"
@@ -175,14 +326,25 @@
             {
               "type": "value",
               "options": {
-                "1": { "text": "pass", "color": "green" },
-                "0": { "text": "fail", "color": "red" }
+                "1": {
+                  "text": "pass",
+                  "color": "green"
+                },
+                "0": {
+                  "text": "fail",
+                  "color": "red"
+                }
               }
             }
           ],
           "thresholds": {
             "mode": "absolute",
-            "steps": [{ "color": "green", "value": null }]
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
           }
         },
         "overrides": []
@@ -192,19 +354,37 @@
         "showValue": "auto",
         "alignValue": "left",
         "rowHeight": 0.9,
-        "legend": { "showLegend": true, "displayMode": "list", "placement": "bottom" },
-        "tooltip": { "mode": "multi", "sort": "none" }
+        "legend": {
+          "showLegend": true,
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
       }
     },
     {
       "id": 6,
       "type": "timeseries",
       "title": "Test duration (s)",
-      "datasource": { "type": "prometheus", "uid": "prometheus" },
-      "gridPos": { "x": 0, "y": 12, "w": 12, "h": 8 },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 12,
+        "w": 12,
+        "h": 8
+      },
       "targets": [
         {
-          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
           "refId": "A",
           "expr": "test_duration_seconds{app=\"jump-cannon\"}",
           "legendFormat": "{{test}}"
@@ -224,27 +404,409 @@
         "overrides": []
       },
       "options": {
-        "legend": { "showLegend": true, "displayMode": "list", "placement": "bottom" },
-        "tooltip": { "mode": "multi", "sort": "none" }
+        "legend": {
+          "showLegend": true,
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
       }
     },
     {
       "id": 7,
       "type": "table",
       "title": "Currently failing",
-      "datasource": { "type": "prometheus", "uid": "prometheus" },
-      "gridPos": { "x": 12, "y": 12, "w": 12, "h": 8 },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 12,
+        "w": 12,
+        "h": 8
+      },
       "targets": [
         {
-          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
           "refId": "A",
           "expr": "test_run_failed{app=\"jump-cannon\"} == 1",
           "instant": true,
           "format": "table"
         }
       ],
-      "fieldConfig": { "defaults": {}, "overrides": [] },
-      "options": { "showHeader": true }
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      },
+      "options": {
+        "showHeader": true
+      }
+    },
+    {
+      "id": 8,
+      "type": "ekacnet-cubismgrafana-panel",
+      "title": "All traces over time \u2014 test duration (s)",
+      "description": "Horizon chart of every test run's duration over time: one row per test, darker = slower. Click a cell to drill into that test's flame graph (zoom behavior = data link). The CPU flame graph below is fed by the Pyroscope profiles the fuzz/perf workloads stream during each run.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 20,
+        "w": 24,
+        "h": 6
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "refId": "A",
+          "expr": "test_duration_seconds{app=\"jump-cannon\"}",
+          "legendFormat": "{{test}}"
+        }
+      ],
+      "options": {
+        "text": "test duration (s) \u2014 darker is slower; click a cell to open its flame graph",
+        "extentMin": -10,
+        "extentMax": 10,
+        "automaticExtents": true,
+        "color": "green",
+        "links": [
+          {
+            "title": "Flame graph",
+            "url": "/d/jump-cannon-test-results?var-test=${__field.labels.test}",
+            "targetBlank": false
+          }
+        ],
+        "zoomBehavior": "datalink"
+      },
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      }
+    },
+    {
+      "id": 9,
+      "type": "flamegraph",
+      "title": "CPU flame graph \u2014 $test / $run",
+      "description": "100 Hz CPU samples streamed by the selected test run to Pyroscope (fuzz + performance workloads; browser/k6 have no Rust CPU profile). Select a test and a trace (run) above; hover blocks for self/total time, click to focus, sandwich, or search. Profiles aggregate over the dashboard time range, so zoom the range to narrow to part of a run.",
+      "datasource": {
+        "type": "grafana-pyroscope-datasource",
+        "uid": "pyroscope"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 26,
+        "w": 14,
+        "h": 16
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "grafana-pyroscope-datasource",
+            "uid": "pyroscope"
+          },
+          "refId": "A",
+          "queryType": "profile",
+          "labelSelector": "{test=\"$test\", run=\"$run\"}",
+          "profileTypeId": "process_cpu:cpu:nanoseconds:cpu:nanoseconds",
+          "groupBy": [],
+          "limit": 0
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      }
+    },
+    {
+      "id": 10,
+      "type": "timeseries",
+      "title": "CPU samples over time ($test)",
+      "description": "Aggregated CPU sample count per run from Pyroscope \u2014 the volume of profiling data each trace contributed, so you can see when runs happened and how much CPU they burned.",
+      "datasource": {
+        "type": "grafana-pyroscope-datasource",
+        "uid": "pyroscope"
+      },
+      "gridPos": {
+        "x": 14,
+        "y": 26,
+        "w": 10,
+        "h": 8
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "grafana-pyroscope-datasource",
+            "uid": "pyroscope"
+          },
+          "refId": "A",
+          "queryType": "metrics",
+          "labelSelector": "{test=\"$test\"}",
+          "profileTypeId": "process_cpu:cpu:nanoseconds:cpu:nanoseconds",
+          "groupBy": [
+            "run"
+          ],
+          "limit": 50
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 20,
+            "showPoints": "always",
+            "spanNulls": false
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "showLegend": true,
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      }
+    },
+    {
+      "id": 11,
+      "type": "stat",
+      "title": "k6 checks pass rate",
+      "description": "Share of k6 HTTP regression checks that passed across the latest nightly k6-api-smoke runs (Prometheus remote-write from the k6 CronJob).",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 14,
+        "y": 34,
+        "w": 5,
+        "h": 4
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "refId": "A",
+          "expr": "sum(rate(k6_checks_total{app=\"jump-cannon\", result=\"pass\"}[$__range])) / (sum(rate(k6_checks_total{app=\"jump-cannon\"}[$__range])) or vector(1))"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "green",
+                "value": 1
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "colorMode": "background",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "textMode": "auto"
+      }
+    },
+    {
+      "id": 12,
+      "type": "stat",
+      "title": "k6 error rate (latest)",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 19,
+        "y": 34,
+        "w": 5,
+        "h": 4
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "refId": "A",
+          "expr": "max(k6_http_req_failed_rate{app=\"jump-cannon\"})"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 0.01
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "colorMode": "background",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "textMode": "auto"
+      }
+    },
+    {
+      "id": 13,
+      "type": "timeseries",
+      "title": "k6 request latency p95/p99 (s)",
+      "description": "HTTP request latency percentiles from the nightly k6-api-smoke runs, one series per run (testid).",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 14,
+        "y": 38,
+        "w": 10,
+        "h": 6
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "refId": "A",
+          "expr": "k6_http_req_duration_p95{app=\"jump-cannon\"} / 1000",
+          "legendFormat": "p95 {{testid}}"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "refId": "B",
+          "expr": "k6_http_req_duration_p99{app=\"jump-cannon\"} / 1000",
+          "legendFormat": "p99 {{testid}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "always",
+            "spanNulls": false
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "showLegend": true,
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      }
+    },
+    {
+      "id": 14,
+      "type": "timeseries",
+      "title": "k6 per-endpoint request duration p95 (s)",
+      "description": "p95 latency per named endpoint from the k6-api-smoke sweep (k6_http_req_duration_p95 grouped by the name tag). One series per route: schema, search, positions, edges, csr, pagerank, node_meta, progress, \u2026 Failing per-endpoint thresholds abort the k6 run and flip the error-rate stat.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 44,
+        "w": 24,
+        "h": 8
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "refId": "A",
+          "expr": "k6_http_req_duration_p95{app=\"jump-cannon\"} / 1000",
+          "legendFormat": "{{name}} [{{scenario}}]"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "always",
+            "spanNulls": false
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "showLegend": true,
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
     }
   ]
 }

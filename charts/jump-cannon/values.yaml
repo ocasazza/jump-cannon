@@ -465,6 +465,14 @@ tests:
     suspend: false
     schedule: "0 0 * * *"
     cases: "10000"
+    # Streaming-agent profiling of the fuzz binaries: sets PYROSCOPE_URL on
+    # the fuzz CronJob; the ctor hook in each harness streams 100 Hz CPU
+    # samples for the whole run (labeled test/run). Fuzz asserts invariants,
+    # not timings, so unlike the perf benches this can stay always-on.
+    profiling:
+      enabled: false
+      # Required when enabled, e.g. http://pyroscope.monitoring.svc.cluster.local:4040
+      pyroscopeUrl: ""
     kueue:
       enabled: false
       queueName: gpu
@@ -517,6 +525,46 @@ tests:
     # Includes scheduling and the observed cold pull of the test-runner image
     # in addition to the 90-second in-process browser deadline.
     activeDeadlineSeconds: 900
+  # Grafana-native k6 HTTP regression smoke against the deployed graph-api.
+  # Results stream via Prometheus remote write (k6_* series), so the Grafana
+  # dashboards own the test surface — no separate results store.
+  k6:
+    enabled: true
+    suspend: false
+    schedule: "45 0 * * *"
+    image:
+      repository: grafana/k6
+      tag: 2.2.0
+      pullPolicy: IfNotPresent
+    baseUrl: http://jump-cannon:80
+    # Trend stats exported per request-metric (k6_http_req_duration_p95 etc.).
+    trendStats: "p(95),p(99),min,max,avg"
+    # Prometheus remote-write receiver is enabled on the monitoring stack's
+    # Prometheus (--web.enable-remote-write-receiver).
+    prometheusWriteUrl: http://prometheus.monitoring.svc.cluster.local:9090/api/v1/write
+    # Load scenario shape: sustained read traffic on the hot endpoints after
+    # the smoke sweep (K6_LOAD_DURATION / K6_LOAD_VUS in the pod env).
+    loadDuration: "30s"
+    loadVus: "5"
+    # Kueue is strictly opt-in for k6: it is a light online HTTP check, and
+    # Kueue admission adds queueing latency — GPU quota starvation in the
+    # shared cluster queue would otherwise block soak-style high-frequency
+    # schedules. When enabled, point at a non-GPU queue.
+    kueue:
+      enabled: false
+      queueName: batch
+      workloadPriorityClassName: batch
+      podPriorityClassName: batch
+    # Bounded independently of tests.commonResources so the k6 job never
+    # competes with (or gets the shape of) the fuzz/perf workloads.
+    resources:
+      requests:
+        cpu: 100m
+        memory: 128Mi
+      limits:
+        cpu: 500m
+        memory: 256Mi
+    activeDeadlineSeconds: 600
 
 # Grafana dashboards ship as labeled ConfigMaps (one per dashboards/*.json).
 # The monitoring stack's Grafana sidecar watches the label and loads them.
