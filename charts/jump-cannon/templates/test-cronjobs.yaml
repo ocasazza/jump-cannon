@@ -53,6 +53,14 @@ spec:
                   value: {{ .Values.tests.pushgatewayUrl | quote }}
                 - name: PROPTEST_CASES
                   value: {{ .Values.tests.fuzz.cases | quote }}
+                {{- if .Values.tests.fuzz.profiling.enabled }}
+                - name: PYROSCOPE_URL
+                  value: {{ required "tests.fuzz.profiling.pyroscopeUrl is required when tests.fuzz.profiling.enabled=true" .Values.tests.fuzz.profiling.pyroscopeUrl | quote }}
+                - name: JUMP_CANNON_RUN_ID
+                  valueFrom:
+                    fieldRef:
+                      fieldPath: metadata.name
+                {{- end }}
               resources:
                 {{- toYaml .Values.tests.commonResources | nindent 16 }}
               securityContext:
@@ -186,4 +194,93 @@ spec:
                 {{- toYaml .Values.tests.commonResources | nindent 16 }}
               securityContext:
                 {{- toYaml .Values.containerSecurityContext | nindent 16 }}
+{{- end }}
+
+{{- if .Values.tests.k6.enabled }}
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ include "jump-cannon.fullname" . }}-k6
+  labels:
+    {{- include "jump-cannon.labels" . | nindent 4 }}
+    app.kubernetes.io/component: k6-tests
+spec:
+  schedule: {{ .Values.tests.k6.schedule | quote }}
+  {{- with .Values.tests.timeZone }}
+  timeZone: {{ . | quote }}
+  {{- end }}
+  suspend: {{ .Values.tests.k6.suspend }}
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 2
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    metadata:
+      labels:
+        {{- include "jump-cannon.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: k6-tests
+        {{- if .Values.tests.k6.kueue.enabled }}
+        kueue.x-k8s.io/queue-name: {{ .Values.tests.k6.kueue.queueName | quote }}
+        kueue.x-k8s.io/priority-class: {{ .Values.tests.k6.kueue.workloadPriorityClassName | quote }}
+        {{- end }}
+    spec:
+      ttlSecondsAfterFinished: 86400
+      activeDeadlineSeconds: {{ .Values.tests.k6.activeDeadlineSeconds }}
+      backoffLimit: 0
+      template:
+        metadata:
+          labels:
+            {{- include "jump-cannon.selectorLabels" . | nindent 12 }}
+            app.kubernetes.io/component: k6-tests
+        spec:
+          automountServiceAccountToken: false
+          restartPolicy: Never
+          {{- if .Values.tests.k6.kueue.enabled }}
+          priorityClassName: {{ .Values.tests.k6.kueue.podPriorityClassName | quote }}
+          {{- end }}
+          imagePullSecrets:
+            {{- toYaml .Values.imagePullSecrets | nindent 12 }}
+          securityContext:
+            {{- toYaml .Values.podSecurityContext | nindent 12 }}
+          containers:
+            - name: k6
+              image: "{{ .Values.tests.k6.image.repository }}:{{ .Values.tests.k6.image.tag }}"
+              imagePullPolicy: {{ .Values.tests.k6.image.pullPolicy }}
+              command:
+                - k6
+                - run
+                - --out
+                - experimental-prometheus-rw
+                - /scripts/api-smoke.js
+              env:
+                - name: JUMP_CANNON_BASE_URL
+                  value: {{ .Values.tests.k6.baseUrl | quote }}
+                - name: K6_LOAD_DURATION
+                  value: {{ .Values.tests.k6.loadDuration | quote }}
+                - name: K6_LOAD_VUS
+                  value: {{ .Values.tests.k6.loadVus | quote }}
+                - name: JUMP_CANNON_RUN_ID
+                  valueFrom:
+                    fieldRef:
+                      fieldPath: metadata.name
+                - name: K6_PROMETHEUS_RW_SERVER_URL
+                  value: {{ .Values.tests.k6.prometheusWriteUrl | quote }}
+                - name: K6_PROMETHEUS_RW_TREND_STATS
+                  value: {{ .Values.tests.k6.trendStats | quote }}
+                - name: K6_PROMETHEUS_RW_PUSH_INTERVAL
+                  value: "5s"
+              # Bounded independently of the fuzz/perf shapes: k6 is a light
+              # online check and must never compete for the bigger requests.
+              resources:
+                {{- toYaml .Values.tests.k6.resources | nindent 16 }}
+              securityContext:
+                {{- toYaml .Values.containerSecurityContext | nindent 16 }}
+              volumeMounts:
+                - name: k6-script
+                  mountPath: /scripts
+                  readOnly: true
+          volumes:
+            - name: k6-script
+              configMap:
+                name: {{ include "jump-cannon.fullname" . }}-k6-script
 {{- end }}

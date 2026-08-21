@@ -1,0 +1,15 @@
+{{- if .Values.tests.k6.enabled }}
+# k6 script for the nightly Grafana-native HTTP regression smoke. Mounted
+# into the k6 CronJob pod; the script is chart-owned so the test surface
+# ships and versions with the release.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "jump-cannon.fullname" . }}-k6-script
+  labels:
+    {{- include "jump-cannon.labels" . | nindent 4 }}
+    app.kubernetes.io/component: k6-tests
+data:
+  api-smoke.js: |-
+{{ .Files.Get "k6/api-smoke.js" | indent 4 }}
+{{- end }}

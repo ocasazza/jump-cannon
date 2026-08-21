@@ -19,3 +19,5 @@ tests:
     enabled: false
   browser:
     enabled: false
+  k6:
+    enabled: false

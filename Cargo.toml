@@ -17,6 +17,7 @@ members = [
     "crates/http-json-importer",
     "crates/tvix-loader",
     "crates/test-browser",
+    "crates/test-profiling",
 ]
 
 [workspace.package]

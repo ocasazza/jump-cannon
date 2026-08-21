@@ -32,6 +32,7 @@ pkgs.runCommand "jump-cannon-chart-tarball"
       --set tests.fuzz.enabled=false \
       --set tests.performance.enabled=false \
       --set tests.browser.enabled=false \
+      --set tests.k6.enabled=false \
       > legacy.yaml
     grep -Fq 'kind: PersistentVolumeClaim' legacy.yaml
     grep -Fq 'name: JUMP_CANNON_IMPORTER_CATALOG_JSON' legacy.yaml
@@ -106,6 +107,7 @@ pkgs.runCommand "jump-cannon-chart-tarball"
       --set tests.fuzz.enabled=false \
       --set tests.performance.enabled=false \
       --set tests.browser.enabled=false \
+      --set tests.k6.enabled=false \
       --set okfSync.enabled=true \
       > okf-sync-dormant.yaml
     grep -Fq 'kind: CronJob' okf-sync-dormant.yaml
@@ -118,6 +120,7 @@ pkgs.runCommand "jump-cannon-chart-tarball"
       --set tests.fuzz.enabled=false \
       --set tests.performance.enabled=false \
       --set tests.browser.enabled=false \
+      --set tests.k6.enabled=false \
       > legacy-kubernetes.yaml
     grep -Fq 'name: JUMP_CANNON_KUBERNETES_CONFIG' legacy-kubernetes.yaml
     grep -Fq 'value: "kubernetes"' legacy-kubernetes.yaml
@@ -128,6 +131,7 @@ pkgs.runCommand "jump-cannon-chart-tarball"
       --set graphCompute.enabled=false \
       --set tests.fuzz.enabled=false \
       --set tests.browser.enabled=false \
+      --set tests.k6.enabled=false \
       --set tests.performance.profiling.enabled=true \
       --set tests.performance.profiling.pyroscopeUrl=http://pyroscope.monitoring.svc:4040 \
       > profiling.yaml
@@ -137,6 +141,7 @@ pkgs.runCommand "jump-cannon-chart-tarball"
       --set graphCompute.enabled=false \
       --set tests.fuzz.enabled=false \
       --set tests.browser.enabled=false \
+      --set tests.k6.enabled=false \
       > profiling-off.yaml
     if grep -Fq 'name: PYROSCOPE_URL' profiling-off.yaml; then
       echo "PYROSCOPE_URL must not render with tests.performance.profiling.enabled=false" >&2
@@ -146,6 +151,7 @@ pkgs.runCommand "jump-cannon-chart-tarball"
       --set graphCompute.enabled=false \
       --set tests.fuzz.enabled=false \
       --set tests.browser.enabled=false \
+      --set tests.k6.enabled=false \
       --set tests.performance.profiling.enabled=true \
       > /dev/null 2>&1; then
       echo "tests.performance.profiling.enabled without pyroscopeUrl must fail template" >&2
@@ -161,6 +167,7 @@ pkgs.runCommand "jump-cannon-chart-tarball"
       --set tests.fuzz.enabled=false \
       --set tests.performance.enabled=false \
       --set tests.browser.enabled=false \
+      --set tests.k6.enabled=false \
       > github.yaml
     grep -Fq 'value: "github"' github.yaml
     grep -Fq 'name: JUMP_CANNON_GITHUB_REPO' github.yaml
@@ -191,6 +198,7 @@ pkgs.runCommand "jump-cannon-chart-tarball"
       --set tests.fuzz.enabled=false \
       --set tests.performance.enabled=false \
       --set tests.browser.enabled=false \
+      --set tests.k6.enabled=false \
       > github-token.yaml
     grep -Fq 'name: JUMP_CANNON_GITHUB_TOKEN' github-token.yaml
     grep -Fq 'secretKeyRef:' github-token.yaml
@@ -212,6 +220,7 @@ pkgs.runCommand "jump-cannon-chart-tarball"
       --set tests.fuzz.enabled=false \
       --set tests.performance.enabled=false \
       --set tests.browser.enabled=false \
+      --set tests.k6.enabled=false \
       > no-dashboards.yaml
     if grep -Fq 'jump-cannon-grafana-test-results' no-dashboards.yaml; then
       echo "grafanaDashboards.enabled=false must not render dashboard ConfigMaps" >&2
@@ -231,6 +240,7 @@ pkgs.runCommand "jump-cannon-chart-tarball"
       --set tests.fuzz.enabled=false \
       --set tests.performance.enabled=false \
       --set tests.browser.enabled=false \
+      --set tests.k6.enabled=false \
       > gpu-static.yaml
     grep -Fq 'kind: RayCluster' gpu-static.yaml
     grep -Fq 'kueue.x-k8s.io/max-exec-time-seconds' gpu-static.yaml
@@ -243,6 +253,7 @@ pkgs.runCommand "jump-cannon-chart-tarball"
       --set tests.fuzz.enabled=false \
       --set tests.performance.enabled=false \
       --set tests.browser.enabled=false \
+      --set tests.k6.enabled=false \
       > gpu-session.yaml
     if grep -Eq '^kind: RayCluster$' gpu-session.yaml; then
       echo "session mode must not render the RayCluster CR" >&2
@@ -263,6 +274,60 @@ pkgs.runCommand "jump-cannon-chart-tarball"
       echo "session RBAC must not touch RayCluster finalizers" >&2
       exit 1
     fi
+
+    # k6 CronJob (Grafana-native HTTP regression): renders only when
+    # tests.k6.enabled, mounts the chart-owned script ConfigMap, remote-writes
+    # k6_* metrics to the monitoring Prometheus, and is bounded independently
+    # of the fuzz/perf shapes. Kueue stays opt-in (a light online check must
+    # not queue behind GPU quota).
+    helm template k6 ./jump-cannon \
+      --set graphCompute.enabled=false \
+      --set tests.fuzz.enabled=false \
+      --set tests.performance.enabled=false \
+      --set tests.browser.enabled=false \
+      > k6.yaml
+    grep -Fq 'kind: CronJob' k6.yaml
+    grep -Fq 'app.kubernetes.io/component: k6-tests' k6.yaml
+    grep -Fq 'image: "grafana/k6:2.2.0"' k6.yaml
+    grep -Fq 'experimental-prometheus-rw' k6.yaml
+    grep -Fq 'value: "http://prometheus.monitoring.svc.cluster.local:9090/api/v1/write"' k6.yaml
+    grep -Fq 'name: k6-script' k6.yaml
+    grep -Fq 'jump-cannon-k6-script' k6.yaml
+    grep -Fq 'memory: 128Mi' k6.yaml
+    grep -Fq 'memory: 256Mi' k6.yaml
+    if grep -Fq 'kueue.x-k8s.io/queue-name' k6.yaml; then
+      echo "k6 kueue must stay opt-in (no labels at defaults)" >&2
+      exit 1
+    fi
+    helm template k6-kueue ./jump-cannon \
+      --set graphCompute.enabled=false \
+      --set tests.fuzz.enabled=false \
+      --set tests.performance.enabled=false \
+      --set tests.browser.enabled=false \
+      --set tests.k6.kueue.enabled=true \
+      > k6-kueue.yaml
+    grep -Fq 'kueue.x-k8s.io/queue-name: "batch"' k6-kueue.yaml
+    grep -Fq 'kueue.x-k8s.io/priority-class: "batch"' k6-kueue.yaml
+    grep -Fq 'priorityClassName: "batch"' k6-kueue.yaml
+
+    # Profiling wiring: the fuzz CronJob passes PYROSCOPE_URL + per-run pod
+    # id only when tests.fuzz.profiling is enabled; the dashboard ships the
+    # cubism + flame-graph panels (Pyroscope datasource).
+    helm template profiled ./jump-cannon \
+      --set graphCompute.enabled=false \
+      --set tests.k6.enabled=false \
+      --set-string tests.fuzz.profiling.enabled=true \
+      --set-string tests.fuzz.profiling.pyroscopeUrl=http://pyroscope.monitoring.svc.cluster.local:4040 \
+      --set-string tests.performance.profiling.enabled=true \
+      --set-string tests.performance.profiling.pyroscopeUrl=http://pyroscope.monitoring.svc.cluster.local:4040 \
+      > profiled.yaml
+    test "$(grep -Fc 'name: PYROSCOPE_URL' profiled.yaml)" -eq 2
+    # fuzz profiling carries the explicit per-run id; perf relies on the
+    # wrapper's $(hostname) fallback (also the pod name).
+    test "$(grep -Fc 'fieldPath: metadata.name' profiled.yaml)" -eq 1
+    grep -Fq 'ekacnet-cubismgrafana-panel' legacy.yaml
+    grep -Fq '"type": "flamegraph"' legacy.yaml
+    grep -Fq 'grafana-pyroscope-datasource' legacy.yaml
 
     expect_render_failure() {
       name="$1"
@@ -315,6 +380,10 @@ pkgs.runCommand "jump-cannon-chart-tarball"
       --set-string importers.sources.lavender-ingest-okf.kind=obsidian \
       --set importers.sources.lavender-ingest-okf.source.readOnly=false
     # The deploy key always comes from a user-created Secret, never values.
+    expect_render_failure fuzz-profiling-no-url \
+      --set graphCompute.enabled=false \
+      --set tests.k6.enabled=false \
+      --set-string tests.fuzz.profiling.enabled=true
     expect_render_failure okf-sync-blank-deploy-key-secret \
       --set okfSync.enabled=true \
       --set-string okfSync.deployKeySecret=" "

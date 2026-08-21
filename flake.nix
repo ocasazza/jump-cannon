@@ -575,23 +575,27 @@
               cargoArtifacts = depsNative;
               pname = "jump-cannon-test-workload-bins";
               version = "0.1.0";
-              nativeBuildInputs = [ pkgs.protobuf ];
+              nativeBuildInputs = [ pkgs.protobuf pkgs.cc ];
               # pprof's frame-pointer unwinder needs frame pointers in the
               # benchmark hot paths; the workspace crates are compiled by this
               # derivation (prebuilt depsNative are not), which is where the
-              # pagerank/layout/scaling work happens.
+              # pagerank/layout/scaling work happens. cc: the fuzz/geometric
+              # bins link the pyroscope agent's ring dependency.
               RUSTFLAGS = "-Cforce-frame-pointers=yes";
               buildPhaseCargoCommand = ''
                 CARGO_TARGET_DIR=target/layout-fuzz \
                   cargo test -p graph-layouts --test fuzz --release --no-run
                 CARGO_TARGET_DIR=target/compute-fuzz \
                   cargo test -p graph-compute --test fuzz --release --no-run
+                CARGO_TARGET_DIR=target/geometric \
+                  cargo test -p graph-compute --test geometric_solver --release --no-run
                 CARGO_TARGET_DIR=target/benches \
                   cargo build --release -p graph-layouts --example bench_static_layouts
                 CARGO_TARGET_DIR=target/benches \
                   cargo build --release -p graph-compute \
                     --example bench_pagerank \
-                    --example bench_scaling
+                    --example bench_scaling \
+                    --example bench_spmv
               '';
               doInstallCargoArtifacts = false;
               doCheck = false;
@@ -600,12 +604,15 @@
 
                 layout_fuzz=$(find target/layout-fuzz/release/deps -maxdepth 1 -type f -perm -111 -name 'fuzz-*' | sort | head -n1)
                 compute_fuzz=$(find target/compute-fuzz/release/deps -maxdepth 1 -type f -perm -111 -name 'fuzz-*' | sort | head -n1)
+                geometric=$(find target/geometric/release/deps -maxdepth 1 -type f -perm -111 -name 'geometric_solver-*' | sort | head -n1)
                 install -m 0755 "$layout_fuzz" "$out/bin/graph-layouts-fuzz"
                 install -m 0755 "$compute_fuzz" "$out/bin/graph-compute-fuzz"
+                install -m 0755 "$geometric" "$out/bin/graph-compute-geometric"
 
                 install -m 0755 target/benches/release/examples/bench_static_layouts "$out/bin/graph-layouts-bench-static"
                 install -m 0755 target/benches/release/examples/bench_pagerank "$out/bin/graph-compute-bench-pagerank"
                 install -m 0755 target/benches/release/examples/bench_scaling "$out/bin/graph-compute-bench-scaling"
+                install -m 0755 target/benches/release/examples/bench_spmv "$out/bin/graph-compute-bench-spmv"
               '';
             })
           else
@@ -627,6 +634,9 @@
               printf 'test_run_passed{app="jump-cannon",test="%s"} %s\n' "$test_name" "$passed"
               printf 'test_run_failed{app="jump-cannon",test="%s"} %s\n' "$test_name" "$failed"
               printf 'test_duration_seconds{app="jump-cannon",test="%s"} %s\n' "$test_name" "$duration"
+              # One row per run (run = pod name), so Grafana can list runs per
+              # test for the flame-graph trace dropdown.
+              printf 'jump_cannon_test_run_info{app="jump-cannon",test="%s",run="%s"} 1\n' "$test_name" "''${JUMP_CANNON_RUN_ID:-$(hostname)}"
             } > "$metrics_file"
             curl -fsS --data-binary @"$metrics_file" \
               "$PUSHGATEWAY_URL/metrics/job/jump-cannon-$test_name/app/jump-cannon/test/$test_name"
@@ -638,6 +648,9 @@
           run_and_report() {
             test_name="$1"
             shift
+            # Labels this process's agent-pushed Pyroscope profile (if
+            # PYROSCOPE_URL is set) with the dashboard row name.
+            export JUMP_CANNON_TEST_NAME="$test_name"
             started="$(date +%s)"
             set +e
             "$@"
@@ -665,7 +678,16 @@
             set -euo pipefail
             : "''${PUSHGATEWAY_URL:=http://pushgateway.monitoring.svc.cluster.local:9091}"
             : "''${PROPTEST_CASES:=10000}"
+            : "''${PROPTEST_CASES:=10000}"
             export PROPTEST_CASES
+            # Streaming-agent profiling (chart tests.fuzz.profiling →
+            # PYROSCOPE_URL): the ctor hook in each fuzz binary streams 100 Hz
+            # CPU samples labeled test/run for the whole run. Unlike criterion
+            # pprof this does not replace the statistical run — fuzz asserts
+            # invariants, not timings, so the agent's tiny overhead is fine.
+            : "''${PYROSCOPE_URL:=}"
+            : "''${JUMP_CANNON_RUN_ID:-$(hostname)}"
+            export PROPTEST_CASES PYROSCOPE_URL JUMP_CANNON_RUN_ID
             ${testMetricsPushShell}
 
             # Each fuzzer pushes its own row (test="fuzz-graph-layouts" /
@@ -673,7 +695,7 @@
             # failure in one is visible without hiding the other's result.
             layout_started="$(date +%s)"
             set +e
-            graph-layouts-fuzz
+            JUMP_CANNON_TEST_NAME=fuzz-graph-layouts graph-layouts-fuzz
             layout_status="$?"
             set -e
             layout_duration="$(( $(date +%s) - layout_started ))"
@@ -685,7 +707,7 @@
 
             compute_started="$(date +%s)"
             set +e
-            graph-compute-fuzz
+            JUMP_CANNON_TEST_NAME=fuzz-graph-compute graph-compute-fuzz
             compute_status="$?"
             set -e
             compute_duration="$(( $(date +%s) - compute_started ))"
@@ -778,6 +800,19 @@
             if ! run_and_report performance-bench-scaling \
               graph-compute-bench-scaling --bench --noplot \
               "''${profile_args[@]}"; then
+              overall_status=1
+            fi
+            if ! run_and_report performance-bench-spmv \
+              graph-compute-bench-spmv --bench --noplot \
+              "''${profile_args[@]}"; then
+              overall_status=1
+            fi
+            # Geometric solver: canary + regression golden + perf budgets in
+            # one libtest binary. Profiling here is the streaming agent
+            # (ctor hook reads PYROSCOPE_URL), not criterion's --profile-time,
+            # so no profile_args — the run keeps its full statistical shape.
+            if ! run_and_report performance-geometric-solver \
+              graph-compute-geometric -- --nocapture; then
               overall_status=1
             fi
             # Profile upload is observability, not test verdict: never let a
