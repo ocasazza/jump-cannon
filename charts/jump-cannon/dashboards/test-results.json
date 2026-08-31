@@ -525,8 +525,8 @@
     {
       "id": 15,
       "type": "table",
-      "title": "Profiled test runs \u2014 click a run to drill down",
-      "description": "Recent runs for $test. Click any row to focus the CPU flame graph and sample timeseries on that specific run trace.",
+      "title": "Test runs & duration \u2014 click a test to drill down",
+      "description": "Recent test runs and their duration. Click any test to focus the CPU flame graph and sample timeseries.",
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"
@@ -544,34 +544,23 @@
             "uid": "prometheus"
           },
           "refId": "A",
-          "expr": "jump_cannon_test_run_info{app=\"jump-cannon\", test=~\"$test\"}",
+          "expr": "test_duration_seconds{app=\"jump-cannon\", test=~\"$test\"}",
           "instant": true,
           "format": "table"
         }
       ],
       "fieldConfig": {
         "defaults": {
+          "unit": "s",
           "links": [
             {
-              "title": "Drill into ${__data.fields.test} (${__data.fields.run})",
-              "url": "/d/jump-cannon-test-results?var-test=${__data.fields.test}&var-run=${__data.fields.run}",
+              "title": "Focus flame graph on ${__data.fields.test}",
+              "url": "/d/jump-cannon-test-results?var-test=${__data.fields.test}",
               "targetBlank": false
             }
           ]
         },
         "overrides": [
-          {
-            "matcher": {
-              "id": "byName",
-              "options": "Value"
-            },
-            "properties": [
-              {
-                "id": "custom.hidden",
-                "value": true
-              }
-            ]
-          },
           {
             "matcher": {
               "id": "byName",
@@ -616,7 +605,7 @@
             "properties": [
               {
                 "id": "custom.width",
-                "value": 180
+                "value": 200
               }
             ]
           },
@@ -628,23 +617,27 @@
             "properties": [
               {
                 "id": "displayName",
-                "value": "Test"
+                "value": "Test Workload"
               },
               {
                 "id": "custom.width",
-                "value": 260
+                "value": 300
               }
             ]
           },
           {
             "matcher": {
               "id": "byName",
-              "options": "run"
+              "options": "Value"
             },
             "properties": [
               {
                 "id": "displayName",
-                "value": "Trace (Run Pod ID)"
+                "value": "Duration"
+              },
+              {
+                "id": "unit",
+                "value": "s"
               }
             ]
           }
@@ -718,7 +711,7 @@
     {
       "id": 9,
       "type": "flamegraph",
-      "title": "CPU flame graph \u2014 $test / $run",
+      "title": "CPU flame graph \u2014 $test",
       "description": "100 Hz CPU samples streamed by the selected test run to Pyroscope (fuzz + performance workloads; browser/k6 have no Rust CPU profile). Select a test and a trace (run) above; hover blocks for self/total time, click to focus, sandwich, or search. Profiles aggregate over the dashboard time range, so zoom the range to narrow to part of a run.",
       "datasource": {
         "type": "grafana-pyroscope-datasource",
@@ -738,7 +731,7 @@
           },
           "refId": "A",
           "queryType": "profile",
-          "labelSelector": "{test=~\"$test\", run=~\"$run\"}",
+          "labelSelector": "{test=~\"$test\"}",
           "profileTypeId": "process_cpu:cpu:nanoseconds:cpu:nanoseconds",
           "groupBy": [],
           "limit": 0
