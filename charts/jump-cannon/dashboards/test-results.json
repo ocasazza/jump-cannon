@@ -49,13 +49,14 @@
           "type": "prometheus",
           "uid": "prometheus"
         },
-        "definition": "label_values(jump_cannon_test_run_info{app=\"jump-cannon\", test=\"$test\"}, run)",
+        "definition": "label_values(jump_cannon_test_run_info{app=\"jump-cannon\", test=~\"$test\"}, run)",
         "query": {
-          "query": "label_values(jump_cannon_test_run_info{app=\"jump-cannon\", test=\"$test\"}, run)",
+          "query": "label_values(jump_cannon_test_run_info{app=\"jump-cannon\", test=~\"$test\"}, run)",
           "refId": "StandardVariableQuery"
         },
         "refresh": 1,
-        "includeAll": false,
+        "includeAll": true,
+        "allValue": ".*",
         "multi": false,
         "sort": 3,
         "current": {}
@@ -63,6 +64,19 @@
     ]
   },
   "panels": [
+    {
+      "id": 100,
+      "type": "row",
+      "title": "Test Suite Overview & History",
+      "collapsed": false,
+      "gridPos": {
+        "x": 0,
+        "y": 0,
+        "w": 24,
+        "h": 1
+      },
+      "panels": []
+    },
     {
       "id": 1,
       "type": "stat",
@@ -73,7 +87,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 0,
+        "y": 1,
         "w": 6,
         "h": 4
       },
@@ -133,7 +147,7 @@
       },
       "gridPos": {
         "x": 6,
-        "y": 0,
+        "y": 1,
         "w": 6,
         "h": 4
       },
@@ -184,7 +198,7 @@
       },
       "gridPos": {
         "x": 12,
-        "y": 0,
+        "y": 1,
         "w": 6,
         "h": 4
       },
@@ -239,7 +253,7 @@
       },
       "gridPos": {
         "x": 18,
-        "y": 0,
+        "y": 1,
         "w": 6,
         "h": 4
       },
@@ -300,7 +314,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 4,
+        "y": 5,
         "w": 24,
         "h": 8
       },
@@ -375,7 +389,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 12,
+        "y": 13,
         "w": 12,
         "h": 8
       },
@@ -425,7 +439,7 @@
       },
       "gridPos": {
         "x": 12,
-        "y": 12,
+        "y": 13,
         "w": 12,
         "h": 8
       },
@@ -460,7 +474,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 20,
+        "y": 21,
         "w": 24,
         "h": 6
       },
@@ -483,8 +497,8 @@
         "color": "green",
         "links": [
           {
-            "title": "Flame graph",
-            "url": "/d/jump-cannon-test-results?var-test=${__field.labels.test}",
+            "title": "Flame graph & profile drilldown",
+            "url": "/d/jump-cannon-test-results?var-test=${__field.labels.test}&var-run=.*",
             "targetBlank": false
           }
         ],
@@ -496,37 +510,154 @@
       }
     },
     {
-      "id": 9,
-      "type": "flamegraph",
-      "title": "CPU flame graph \u2014 $test / $run",
-      "description": "100 Hz CPU samples streamed by the selected test run to Pyroscope (fuzz + performance workloads; browser/k6 have no Rust CPU profile). Select a test and a trace (run) above; hover blocks for self/total time, click to focus, sandwich, or search. Profiles aggregate over the dashboard time range, so zoom the range to narrow to part of a run.",
+      "id": 101,
+      "type": "row",
+      "title": "Continuous Profiling (Pyroscope)",
+      "collapsed": false,
+      "gridPos": {
+        "x": 0,
+        "y": 27,
+        "w": 24,
+        "h": 1
+      },
+      "panels": []
+    },
+    {
+      "id": 15,
+      "type": "table",
+      "title": "Profiled test runs \u2014 click a run to drill down",
+      "description": "Recent runs for $test. Click any row to focus the CPU flame graph and sample timeseries on that specific run trace.",
       "datasource": {
-        "type": "grafana-pyroscope-datasource",
-        "uid": "pyroscope"
+        "type": "prometheus",
+        "uid": "prometheus"
       },
       "gridPos": {
         "x": 0,
-        "y": 26,
+        "y": 28,
         "w": 14,
-        "h": 16
+        "h": 8
       },
       "targets": [
         {
           "datasource": {
-            "type": "grafana-pyroscope-datasource",
-            "uid": "pyroscope"
+            "type": "prometheus",
+            "uid": "prometheus"
           },
           "refId": "A",
-          "queryType": "profile",
-          "labelSelector": "{test=\"$test\", run=\"$run\"}",
-          "profileTypeId": "process_cpu:cpu:nanoseconds:cpu:nanoseconds",
-          "groupBy": [],
-          "limit": 0
+          "expr": "jump_cannon_test_run_info{app=\"jump-cannon\", test=~\"$test\"}",
+          "instant": true,
+          "format": "table"
         }
       ],
       "fieldConfig": {
-        "defaults": {},
-        "overrides": []
+        "defaults": {
+          "links": [
+            {
+              "title": "Drill into ${__data.fields.test} (${__data.fields.run})",
+              "url": "/d/jump-cannon-test-results?var-test=${__data.fields.test}&var-run=${__data.fields.run}",
+              "targetBlank": false
+            }
+          ]
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Value"
+            },
+            "properties": [
+              {
+                "id": "custom.hidden",
+                "value": true
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "app"
+            },
+            "properties": [
+              {
+                "id": "custom.hidden",
+                "value": true
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "job"
+            },
+            "properties": [
+              {
+                "id": "custom.hidden",
+                "value": true
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "instance"
+            },
+            "properties": [
+              {
+                "id": "custom.hidden",
+                "value": true
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Time"
+            },
+            "properties": [
+              {
+                "id": "custom.width",
+                "value": 180
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "test"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "Test"
+              },
+              {
+                "id": "custom.width",
+                "value": 260
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "run"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "Trace (Run Pod ID)"
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "showHeader": true,
+        "sortBy": [
+          {
+            "displayName": "Time",
+            "desc": true
+          }
+        ]
       }
     },
     {
@@ -540,7 +671,7 @@
       },
       "gridPos": {
         "x": 14,
-        "y": 26,
+        "y": 28,
         "w": 10,
         "h": 8
       },
@@ -552,7 +683,7 @@
           },
           "refId": "A",
           "queryType": "metrics",
-          "labelSelector": "{test=\"$test\"}",
+          "labelSelector": "{test=~\"$test\"}",
           "profileTypeId": "process_cpu:cpu:nanoseconds:cpu:nanoseconds",
           "groupBy": [
             "run"
@@ -585,6 +716,53 @@
       }
     },
     {
+      "id": 9,
+      "type": "flamegraph",
+      "title": "CPU flame graph \u2014 $test / $run",
+      "description": "100 Hz CPU samples streamed by the selected test run to Pyroscope (fuzz + performance workloads; browser/k6 have no Rust CPU profile). Select a test and a trace (run) above; hover blocks for self/total time, click to focus, sandwich, or search. Profiles aggregate over the dashboard time range, so zoom the range to narrow to part of a run.",
+      "datasource": {
+        "type": "grafana-pyroscope-datasource",
+        "uid": "pyroscope"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 36,
+        "w": 24,
+        "h": 16
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "grafana-pyroscope-datasource",
+            "uid": "pyroscope"
+          },
+          "refId": "A",
+          "queryType": "profile",
+          "labelSelector": "{test=~\"$test\", run=~\"$run\"}",
+          "profileTypeId": "process_cpu:cpu:nanoseconds:cpu:nanoseconds",
+          "groupBy": [],
+          "limit": 0
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      }
+    },
+    {
+      "id": 102,
+      "type": "row",
+      "title": "Synthetic HTTP Regression (k6)",
+      "collapsed": false,
+      "gridPos": {
+        "x": 0,
+        "y": 52,
+        "w": 24,
+        "h": 1
+      },
+      "panels": []
+    },
+    {
       "id": 11,
       "type": "stat",
       "title": "k6 checks pass rate",
@@ -594,9 +772,9 @@
         "uid": "prometheus"
       },
       "gridPos": {
-        "x": 14,
-        "y": 34,
-        "w": 5,
+        "x": 0,
+        "y": 53,
+        "w": 6,
         "h": 4
       },
       "targets": [
@@ -650,9 +828,9 @@
         "uid": "prometheus"
       },
       "gridPos": {
-        "x": 19,
-        "y": 34,
-        "w": 5,
+        "x": 6,
+        "y": 53,
+        "w": 6,
         "h": 4
       },
       "targets": [
@@ -707,10 +885,10 @@
         "uid": "prometheus"
       },
       "gridPos": {
-        "x": 14,
-        "y": 38,
-        "w": 10,
-        "h": 6
+        "x": 12,
+        "y": 53,
+        "w": 12,
+        "h": 4
       },
       "targets": [
         {
@@ -768,7 +946,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 44,
+        "y": 57,
         "w": 24,
         "h": 8
       },
