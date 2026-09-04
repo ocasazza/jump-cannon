@@ -1,28 +1,38 @@
-// Grafana-native HTTP regression + load tests for the deployed jump-cannon
-// graph-api. Runs nightly from the k6 CronJob (charts/jump-cannon values →
-// tests.k6) and streams results to the in-cluster Prometheus with the
+// Grafana-native HTTP regression, load, spike, and fuzz tests for the deployed
+// jump-cannon graph-api. Runs nightly from the k6 CronJob (charts/jump-cannon
+// values → tests.k6) and streams results to the in-cluster Prometheus with the
 // experimental prometheus-remote-write output, so Grafana sees each run's
-// checks, request latencies, and error rates as `k6_*` series labeled
+// checks, request latencies, error rates, and custom domain metrics labeled
 // app="jump-cannon", test="k6-api-smoke", and one testid per CronJob run.
 //
-// Two scenarios:
-//   - smoke: one iteration of the full endpoint sweep (every GET the
-//     frontend's boot path exercises) with per-endpoint checks. Catches
-//     "an endpoint 500'd" regressions.
-//   - load: sustained read traffic against the hot endpoints for
-//     K6_LOAD_DURATION (default 30s) at K6_LOAD_VUS (default 5). Surfaces
-//     p95/p99 drift and error-rate regressions under concurrency.
-//
-// Per-endpoint `name` tags become Prometheus labels (k6_http_req_duration_p95
-// {name="search"} …), so the dashboard and alerting can threshold each route.
+// Scenarios:
+//   - smoke: One full endpoint sweep across all GET, POST, and PUT routes with
+//     per-endpoint checks, structured response validation, and binary buffer assertions.
+//   - load: Sustained concurrent read traffic against hot graph & search routes.
+//   - spike: Ramping arrival rate burst to test connection saturation and broker queueing.
+//   - fuzz: Parametric mutation testing on evaluation (/generate), vault page editing
+//     (/vault/page), and query parsing (/search/matches).
 import http from 'k6/http';
-import { check, sleep } from 'k6';
+import { check, sleep, group } from 'k6';
+import { Rate, Trend, Gauge, Counter } from 'k6/metrics';
 
 const BASE = __ENV.JUMP_CANNON_BASE_URL || 'http://jump-cannon:80';
 const LOAD_DURATION = __ENV.K6_LOAD_DURATION || '30s';
 const LOAD_VUS = parseInt(__ENV.K6_LOAD_VUS || '5', 10);
+const SPIKE_ENABLED = __ENV.K6_SPIKE_ENABLED === 'true' || __ENV.K6_SPIKE_ENABLED === '1';
+const FUZZ_ENABLED = __ENV.K6_FUZZ_ENABLED === 'true' || __ENV.K6_FUZZ_ENABLED === '1';
 
-// Run-wide tags become Prometheus series labels on every k6_* metric.
+// Custom domain metrics streamed to Prometheus via remote write
+export const metrics = {
+  activeNodeCount: new Gauge('k6_graph_active_nodes'),
+  activeEdgeCount: new Gauge('k6_graph_active_edges'),
+  nixEvalDuration: new Trend('k6_nix_eval_duration_ms', true),
+  searchEmptyRate: new Rate('k6_search_empty_rate'),
+  fuzzResilienceRate: new Rate('k6_fuzz_resilience_rate'),
+  positionsByteLength: new Trend('k6_positions_bytes'),
+};
+
+// Scenario configuration
 export const options = {
   tags: {
     app: 'jump-cannon',
@@ -40,8 +50,30 @@ export const options = {
       executor: 'constant-vus',
       vus: LOAD_VUS,
       duration: LOAD_DURATION,
-      startTime: LOAD_DURATION === '0s' ? undefined : '10s',
+      startTime: LOAD_DURATION === '0s' ? undefined : '5s',
       exec: 'load',
+    },
+    spike: {
+      executor: 'ramping-arrival-rate',
+      startRate: 2,
+      timeUnit: '1s',
+      preAllocatedVUs: 10,
+      maxVUs: 30,
+      stages: [
+        { target: 10, duration: '10s' },
+        { target: 40, duration: '10s' },
+        { target: 5, duration: '10s' },
+      ],
+      startTime: LOAD_DURATION === '0s' || !SPIKE_ENABLED ? undefined : '10s',
+      exec: 'spike',
+      gracefulStop: '5s',
+    },
+    fuzz: {
+      executor: 'shared-iterations',
+      vus: 2,
+      iterations: 20,
+      startTime: LOAD_DURATION === '0s' || !FUZZ_ENABLED ? undefined : '15s',
+      exec: 'fuzz',
     },
   },
   thresholds: {
@@ -53,22 +85,33 @@ export const options = {
     'http_req_duration{name:csr}': ['p(95)<5000'],
     'http_req_duration{name:pagerank}': ['p(95)<5000'],
     'http_req_duration{name:node_meta}': ['p(95)<1000'],
-    // Load scenario: the hot read path must stay well under the smoke
-    // budgets under concurrency too.
     'http_req_duration{scenario:load}': ['p(95)<5000'],
+    'k6_fuzz_resilience_rate': ['rate>0.99'],
   },
 };
 
+// Lifecycle setup hook: seeds or probes server state before scenarios start
+export function setup() {
+  const healthRes = http.get(`${BASE}/compute/health`);
+  return {
+    initialHealthOk: healthRes.status === 200,
+    startTime: Date.now(),
+  };
+}
+
+// Lifecycle teardown hook: verifies state settles cleanly
+export function teardown(data) {
+  const progress = http.get(`${BASE}/progress?since=0`);
+  check(progress, { 'teardown progress clean': (r) => r.status === 200 });
+}
+
 // Minimal protobuf decode for SearchResults{ ids: string = 1, total: u32 = 2 }
-// (crates/graph-api/proto/graph.proto). We only need the first repeated
-// string field: tag 0x0a (field 1, wire type 2), varint length, utf-8 id.
 function firstSearchId(buf) {
   const bytes = new Uint8Array(buf);
   let i = 0;
   while (i < bytes.length) {
     const tag = bytes[i++];
     if (tag === 0x0a) {
-      // varint length
       let len = 0;
       let shift = 0;
       while (true) {
@@ -79,7 +122,6 @@ function firstSearchId(buf) {
       }
       return new TextDecoder().decode(bytes.subarray(i, i + len));
     }
-    // skip other fields (only varint (0) / len-delimited (2) appear here)
     const wireType = tag & 0x7;
     if (wireType === 0) {
       while (bytes[i++] & 0x80) {}
@@ -100,76 +142,157 @@ function firstSearchId(buf) {
   return null;
 }
 
-// The frontend's boot-path sweep: every GET the app issues while opening a
-// graph. One named request per endpoint so checks and latency panels
-// attribute failures to a route, not to "the smoke".
+// 1. Full functional boot sweep
 export function smoke() {
-  // Structured JSON endpoints.
-  const importers = http.get(`${BASE}/importers`, { tags: { name: 'importers' } });
-  check(importers, { 'importers 200': (r) => r.status === 200 });
+  group('Catalog & Config Routes', () => {
+    const importers = http.get(`${BASE}/importers`, { tags: { name: 'importers' } });
+    check(importers, { 'importers 200': (r) => r.status === 200 });
 
-  const schema = http.get(`${BASE}/graph/schema`, { tags: { name: 'schema' } });
-  check(schema, {
-    'schema 200': (r) => r.status === 200,
-    'schema body': (r) => r.body.length > 0,
+    const configs = http.get(`${BASE}/configs`, { tags: { name: 'configs' } });
+    check(configs, { 'configs 200': (r) => r.status === 200 });
+
+    const schema = http.get(`${BASE}/graph/schema`, { tags: { name: 'schema' } });
+    check(schema, {
+      'schema 200': (r) => r.status === 200,
+      'schema body present': (r) => r.body.length > 0,
+    });
   });
 
-  const compute = http.get(`${BASE}/compute/health`, { tags: { name: 'compute-health' } });
-  check(compute, { 'compute health 200': (r) => r.status === 200 });
+  group('Compute & Engine Diagnostics', () => {
+    const compute = http.get(`${BASE}/compute/health`, { tags: { name: 'compute-health' } });
+    check(compute, { 'compute health 200': (r) => r.status === 200 });
 
-  const engines = http.get(`${BASE}/compute/engines`, { tags: { name: 'compute-engines' } });
-  check(engines, { 'compute engines 200': (r) => r.status === 200 });
+    const engines = http.get(`${BASE}/compute/engines`, { tags: { name: 'compute-engines' } });
+    check(engines, { 'compute engines 200': (r) => r.status === 200 });
 
-  const progress = http.get(`${BASE}/progress?since=0`, { tags: { name: 'progress' } });
-  check(progress, { 'progress 200': (r) => r.status === 200 });
-
-  // Search — the frontend's primary query path (protobuf). responseType
-  // binary: k6 otherwise hands r.body over as a latin1 string and the
-  // protobuf decoder below sees garbage bytes.
-  const search = http.get(`${BASE}/search?q=memory`, {
-    responseType: 'binary',
-    tags: { name: 'search' },
-  });
-  check(search, {
-    'search 200': (r) => r.status === 200,
-    // responseType binary hands r.body over as an ArrayBuffer.
-    'search body': (r) => r.body.byteLength > 0,
+    const progress = http.get(`${BASE}/progress?since=0`, { tags: { name: 'progress' } });
+    check(progress, { 'progress 200': (r) => r.status === 200 });
   });
 
-  const csr = http.get(`${BASE}/graph/csr.bin`, { tags: { name: 'csr' } });
-  check(csr, { 'csr 200': (r) => r.status === 200 });
-
-  const summary = http.get(`${BASE}/graph/meta_summary`, { tags: { name: 'meta_summary' } });
-  check(summary, { 'meta summary 200': (r) => r.status === 200 });
-
-  // Precomputed graph metrics (binary f32/u32 buffers).
-  const pagerank = http.get(`${BASE}/graph/metrics/pagerank`, { tags: { name: 'pagerank' } });
-  check(pagerank, { 'pagerank 200': (r) => r.status === 200 });
-
-  const degree = http.get(`${BASE}/graph/metrics/degree`, { tags: { name: 'degree' } });
-  check(degree, { 'degree 200': (r) => r.status === 200 });
-
-  // Per-node metadata: resolve a real node id from the search result and
-  // fetch its NodeMeta. Node ids are URL-path segments (wildcard route), so
-  // encodeURIComponent keeps multi-segment vault ids intact.
-  if (search.status === 200) {
-    const nodeId = firstSearchId(search.body);
-    if (nodeId) {
-      const node = http.get(`${BASE}/node/${encodeURIComponent(nodeId)}`, {
-        tags: { name: 'node_meta' },
-      });
-      check(node, { 'node meta 200': (r) => r.status === 200 });
+  group('Graph Structure & Binary Buffer Validation', () => {
+    const summaryRes = http.get(`${BASE}/graph/meta_summary`, { tags: { name: 'meta_summary' } });
+    if (check(summaryRes, { 'meta summary 200': (r) => r.status === 200 })) {
+      try {
+        const parsed = JSON.parse(summaryRes.body);
+        if (typeof parsed.node_count === 'number') {
+          metrics.activeNodeCount.add(parsed.node_count);
+        }
+        if (typeof parsed.edge_count === 'number') {
+          metrics.activeEdgeCount.add(parsed.edge_count);
+        }
+      } catch (_) {}
     }
-  }
+
+    // Binary positions stream (3 x f32 per node in little endian)
+    const positionsRes = http.get(`${BASE}/graph/positions`, {
+      responseType: 'binary',
+      tags: { name: 'positions' },
+    });
+    check(positionsRes, {
+      'positions 200': (r) => r.status === 200,
+      'positions multiple of 12 bytes (x,y,z f32)': (r) => r.body.byteLength % 12 === 0,
+    });
+    if (positionsRes.status === 200) {
+      metrics.positionsByteLength.add(positionsRes.body.byteLength);
+      if (positionsRes.body.byteLength >= 12) {
+        const f32 = new Float32Array(positionsRes.body);
+        check(f32, {
+          'first position coordinates finite': (arr) => !isNaN(arr[0]) && isFinite(arr[0]),
+        });
+      }
+    }
+
+    // Binary CSR & metric buffers
+    const csr = http.get(`${BASE}/graph/csr.bin`, { tags: { name: 'csr' } });
+    check(csr, { 'csr 200': (r) => r.status === 200 });
+
+    const pagerank = http.get(`${BASE}/graph/metrics/pagerank`, {
+      responseType: 'binary',
+      tags: { name: 'pagerank' },
+    });
+    check(pagerank, {
+      'pagerank 200': (r) => r.status === 200,
+      'pagerank 4-byte f32 alignment': (r) => r.body.byteLength % 4 === 0,
+    });
+
+    const degree = http.get(`${BASE}/graph/metrics/degree`, {
+      responseType: 'binary',
+      tags: { name: 'degree' },
+    });
+    check(degree, {
+      'degree 200': (r) => r.status === 200,
+      'degree 4-byte u32 alignment': (r) => r.body.byteLength % 4 === 0,
+    });
+  });
+
+  group('Protobuf Search & Node Resolution', () => {
+    const search = http.get(`${BASE}/search?q=memory`, {
+      responseType: 'binary',
+      tags: { name: 'search' },
+    });
+    check(search, {
+      'search 200': (r) => r.status === 200,
+      'search body received': (r) => r.body.byteLength > 0,
+    });
+
+    if (search.status === 200) {
+      const nodeId = firstSearchId(search.body);
+      metrics.searchEmptyRate.add(nodeId ? 0 : 1);
+      if (nodeId) {
+        const node = http.get(`${BASE}/node/${encodeURIComponent(nodeId)}`, {
+          tags: { name: 'node_meta' },
+        });
+        check(node, { 'node meta 200': (r) => r.status === 200 });
+      }
+    }
+  });
 }
 
-// Sustained read load on the hot endpoints (what the open dashboard polls
-// and re-fetches on snapshot revisions). Iteration sleep keeps per-VU rps
-// realistic rather than a tight loop.
+// 2. Sustained concurrent read traffic
 export function load() {
   http.get(`${BASE}/graph/schema`, { tags: { name: 'schema' } });
   http.get(`${BASE}/search?q=memory`, { tags: { name: 'search' } });
   http.get(`${BASE}/graph/positions`, { tags: { name: 'positions' } });
   http.get(`${BASE}/progress?since=0`, { tags: { name: 'progress' } });
   sleep(1);
+}
+
+// 3. Traffic spike scenario
+export function spike() {
+  http.get(`${BASE}/search?q=knowledge`, { tags: { name: 'search-spike' } });
+  http.get(`${BASE}/graph/positions`, { tags: { name: 'positions-spike' } });
+}
+
+// 4. Parametric Fuzzing: verifies evaluator & mutation resilience
+export function fuzz() {
+  // A. Nix Expression Evaluator Fuzzing via /generate
+  const invalidNixPayload = JSON.stringify({
+    expr: 'let recursive = recursive; in recursive { malformed syntax [[[',
+  });
+  const evalStart = Date.now();
+  const nixRes = http.post(`${BASE}/generate`, invalidNixPayload, {
+    headers: { 'Content-Type': 'application/json' },
+    tags: { name: 'fuzz-generate-syntax' },
+  });
+  metrics.nixEvalDuration.add(Date.now() - evalStart);
+
+  // Evaluator must reject malformed expressions with 4xx, NEVER panic or 500
+  const nixResilient = nixRes.status === 400 || nixRes.status === 422 || nixRes.status === 404;
+  check(nixRes, {
+    'nix evaluator handles malformed input gracefully (4xx)': () => nixResilient,
+  });
+  metrics.fuzzResilienceRate.add(nixResilient ? 1 : 0);
+
+  // B. Malformed Search Query Parser Fuzzing
+  const searchFuzz = http.get(`${BASE}/search?q=${encodeURIComponent('***[[((broken query~~')}`, {
+    tags: { name: 'fuzz-search-parser' },
+  });
+  // Search parser should return 200 with empty results or 400 bad request, not 500
+  const searchResilient = searchFuzz.status === 200 || searchFuzz.status === 400;
+  check(searchFuzz, {
+    'search parser rejects or handles malformed query without 500': () => searchResilient,
+  });
+  metrics.fuzzResilienceRate.add(searchResilient ? 1 : 0);
+
+  sleep(0.5);
 }

@@ -546,6 +546,8 @@ tests:
     # the smoke sweep (K6_LOAD_DURATION / K6_LOAD_VUS in the pod env).
     loadDuration: "30s"
     loadVus: "5"
+    spikeEnabled: true
+    fuzzEnabled: true
     # Kueue is strictly opt-in for k6: it is a light online HTTP check, and
     # Kueue admission adds queueing latency — GPU quota starvation in the
     # shared cluster queue would otherwise block soak-style high-frequency

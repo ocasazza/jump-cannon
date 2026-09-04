@@ -259,6 +259,10 @@ spec:
                   value: {{ .Values.tests.k6.loadDuration | quote }}
                 - name: K6_LOAD_VUS
                   value: {{ .Values.tests.k6.loadVus | quote }}
+                - name: K6_SPIKE_ENABLED
+                  value: {{ .Values.tests.k6.spikeEnabled | quote }}
+                - name: K6_FUZZ_ENABLED
+                  value: {{ .Values.tests.k6.fuzzEnabled | quote }}
                 - name: JUMP_CANNON_RUN_ID
                   valueFrom:
                     fieldRef:
