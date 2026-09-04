@@ -59,8 +59,13 @@ subject = "bank"
 # memories: valid memory units (state=valid). State filter is the API-side
 # `query`, repeated client-side in `skip_unless` so an older API ignoring
 # `state=` still drops invalidated units.
+#
+# Hindsight's three biomimetic memory types are the `fact_type` discriminator
+# (a DB CHECK constraint: world | experience | observation — observations are
+# synthesized by the consolidation engine, never extracted). They become the
+# node type, so color-by / shape-by / filter-by type separate them on the
+# canvas; `fact_type` also stays indexed raw for exact-value search.
 # -----------------------------------------------------------------------------
-
 [[collections]]
 name = "memories"
 path = "/v1/{tenant}/banks/{bank}/memories/list"
@@ -72,6 +77,10 @@ id_pointer = "/id"
 node_type = "memory"
 tags_pointer = "/tags"
 skip_unless = { pointer = "/state", equals = "valid" }
+
+[collections.nodes.doctype]
+pointer = "/fact_type"
+map = { world = "World Fact", experience = "Experience", observation = "Observation" }
 
 [collections.nodes.title]
 pointer = "/text"

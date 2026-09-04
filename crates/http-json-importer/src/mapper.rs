@@ -129,6 +129,7 @@ impl GraphMapper for ManifestMapper {
                 let node_id = self.namespace.node_id(&local)?;
                 let title = title_for(&rules.title, document, &raw_id);
                 let tags = tags_for(rules, document);
+                let node_type = doctype_for(rules, document);
                 let path = format!("{}/{raw_id}", collection.name);
 
                 let mut frontmatter = BTreeMap::new();
@@ -148,7 +149,7 @@ impl GraphMapper for ManifestMapper {
                             frontmatter: frontmatter.clone().into_iter().collect(),
                             mtime: 0,
                             path: path.clone(),
-                            doctype: None,
+                            doctype: Some(node_type.clone()),
                             folder: folder.clone(),
                             content_type: None,
                             content_readable: false,
@@ -165,7 +166,7 @@ impl GraphMapper for ManifestMapper {
                     .with("title", title.clone())
                     .with("tags", serde_json::json!(tags))
                     .with("path", path)
-                    .with("type", rules.node_type.clone())
+                    .with("type", node_type)
                     .with("folder", folder.clone());
                 for (key, value) in frontmatter {
                     search.insert(key, value);
@@ -410,6 +411,26 @@ fn title_for(rule: &TitleRule, document: &Value, raw_id: &str) -> String {
         Some(space) if space > rule.max_chars / 2 => format!("{}…", &truncated[..space]),
         _ => format!("{truncated}…"),
     }
+}
+
+/// The record's type: the `doctype` rule's (optionally mapped) value, else
+/// the collection-wide `node_type`. Non-string values and, when a map is
+/// declared, undeclared values fall back — the `type` facet stays within the
+/// package's vocabulary.
+fn doctype_for(rules: &NodeRules, document: &Value) -> String {
+    let Some(rule) = &rules.doctype else {
+        return rules.node_type.clone();
+    };
+    let Some(raw) = pointer_str(document, &rule.pointer) else {
+        return rules.node_type.clone();
+    };
+    if rule.map.is_empty() {
+        return raw;
+    }
+    rule.map
+        .get(&raw)
+        .cloned()
+        .unwrap_or_else(|| rules.node_type.clone())
 }
 
 /// Canonical tags: trimmed, blanks dropped, deduplicated, order preserved.
