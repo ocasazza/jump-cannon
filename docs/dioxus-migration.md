@@ -73,12 +73,15 @@ Executed 2026-06-10 (five parallel ports against the egui reference at
   two-pane node preview, category grouping. Jump-to-section actions open
   panels through `main.rs::OPEN_PANEL` → `panel_kit::Workspace::restore`;
   Layout, Style, and Camera deep-link to tabs in the unified Settings panel.
-- Anchored hover/click cards (`app/ui/src/anchored.rs`): 50 ms raycast
-  throttle, 700 ms preview arm, sticky-beats-hover, EMA(0.4) placement,
-  reserved-size edge clamping, tether line + off-screen arrow, promoted
-  click card with fly-to (`render::look_at_node`). Focus sets
-  (`FocusMode` × 5) push GPU dim masks; the Camera tab in Settings drives
-  them.
+- Node hover/selection hints (`app/ui/src/hints.rs` + `anchored.rs`): the
+  egui anchored preview/promoted cards are retired in favour of a global
+  header hint bar any component can publish into (`hints::publish`, one slot
+  per source, last published shows). Hover (50 ms raycast throttle,
+  sticky-beats-hover) publishes the node id immediately and enriches it with
+  `/node/:id` meta after a 150 ms dwell on server-backed graphs; selection
+  publishes persistently; `Super+V` opens the Inspector for the hovered or
+  selected node. Focus sets (`FocusMode` × 5) still push GPU dim masks; the
+  Camera tab in Settings drives them.
 - Inspector parity (`panels/inspector.rs`): active-filter strip, empty-state
   tag browser, badge rows via `badges.rs`, frontmatter leftover grid,
   neighbour pills (+ in/out direction), community fold rules.
