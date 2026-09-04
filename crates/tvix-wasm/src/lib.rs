@@ -260,12 +260,14 @@ struct RawGraph {
 
 // ── Evaluation ──────────────────────────────────────────────────────────────
 
-/// Evaluate `expr` to a JSON string via tvix-eval against the embedded library.
+/// Generic Nix → JSON entry point: evaluate `expr` against the embedded
+/// library and return `builtins.toJSON` of the result.
 ///
 /// The user expression is wrapped so lazy thunks are forced (`deepSeq`, which
 /// surfaces errors) and the result is rendered as JSON (`toJSON`, a pure builtin
-/// at the pinned rev).
-fn eval_to_json(expr: &str) -> Result<String, String> {
+/// at the pinned rev). Every consumer — graph generation, seeds, importer
+/// packages authored in Nix — goes through this single sandboxed evaluator.
+pub fn eval_to_json(expr: &str) -> Result<String, String> {
     let wrapped = format!(
         "let __r = ( {expr}\n ); in builtins.deepSeq __r (builtins.toJSON __r)"
     );

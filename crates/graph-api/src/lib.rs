@@ -12,6 +12,8 @@ pub mod browser;
 pub mod compute_broker;
 pub mod gpu_session;
 pub mod importer_catalog;
+pub mod importer_editor;
+pub mod importer_package;
 pub mod progress;
 pub mod proto;
 pub mod search_index;

@@ -14,11 +14,21 @@ tvix, generate, Kubernetes, OKF, a trusted administrator-installed Pest
 package, GitHub, and httpjson (the engine name). Every JSON API — including
 Hindsight — is a declarative package under `charts/jump-cannon/packages/`
 bound to an instance at runtime via the `JUMP_CANNON_IMPORTER_*` env vars;
-Hindsight is the package `hindsight-memory-bank.toml`, not a source kind.
+Hindsight is the package `hindsight-memory-bank.toml` (or its Nix twin
+`hindsight-memory-bank.nix`), not a source kind.
 See [[Hindsight Importer]] and AGENTS.md "Importers: packages, not crates".
 GitHub delivers a repository tarball over HTTP with ETag polling and reuses
 the Obsidian markdown pipeline; see [[GitHub Importer]]. OKF implements the
 official format version 0.2; its `0.2` version must not be called `0.0.2`.
+
+An httpjson package file is either `.toml` or `.nix`: both serialize the same
+`HttpJsonManifest` and pass the identical validation. A `.nix` file is an
+attrset expression evaluated by the in-tree tvix evaluator
+(`tvix_wasm::eval_to_json`, the same sandboxed entry point as `POST
+/generate`); `builtins.toJSON` of the result is the manifest. The format is
+chosen by extension at every load site (`--importer-manifest` at boot and each
+catalog `httpJson.package` alternate). Nix's `let` bindings collapse repeated
+field and schema declarations; see the shipped `.nix` package.
 
 Every importer descriptor must supply discovery schema version 2. It declares
 input media types, typed search/facet fields, edge semantics, and content
@@ -60,6 +70,23 @@ selection lives in sessionStorage as the **bare string** `jc_source_id` (no
 JSON encoding — the harness and proxy tooling plant and read it through the
 DOM storage API), rides as the `x-jump-cannon-source` request header, and as
 `?source=` on the layout WebSocket, whose browser API cannot set headers.
+
+Package definitions are editable through the same gate. `GET
+/importers/{id}/definition` returns an httpjson source's authored text
+(`format`, `package`, `source`, `writable`) with the catalog's read posture;
+`PUT /importers/{id}/definition` and `POST /importers` require the caller's
+groups header to contain `importers.runtimeSwitchGroup` (403 otherwise, and
+always 403 when switching is disabled). Writes validate first (400 with the
+validator's or evaluator's message), then land atomically in
+`JUMP_CANNON_IMPORTER_PACKAGES_DIR` (409 when that directory is read-only),
+and drop the cached alternate so the next switch rebuilds from the new file;
+the deployment default's own importer keeps the package it loaded at boot.
+`POST /importers` also appends the new source to
+`<packages_dir>/catalog.local.json`, a runtime overlay graph-api merges into
+the chart catalog at boot (entries carry `origin: runtime`; an overlay that
+fails validation or shadows a chart id is logged and ignored). The Settings
+tab's Importers cards expose this as an "Edit source" disclosure per httpjson
+card and an "Add importer" card at the end of the alternates list.
 
 The default markdown loader resolves wikilinks and is currently the only
 importer that advertises readable and writable source content. Kubernetes

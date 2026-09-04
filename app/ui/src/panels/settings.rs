@@ -347,6 +347,7 @@ fn importer_card(
     profile: &api::ImporterProfile,
     switch_allowed: bool,
     viewing: Option<&str>,
+    generation: Signal<u64>,
     mut on_switch: impl FnMut(Option<String>) + 'static,
 ) -> Element {
     let source_id = profile.source_id.as_deref().unwrap_or("—");
@@ -407,7 +408,12 @@ fn importer_card(
         "View this source"
     };
     let switch_id = profile.id.clone();
+    // The card is a <button>; the source editor sits beside it in the same
+    // grid slot so its textarea/inputs are never nested inside a button.
+    let has_definition = profile.kind == "httpjson";
+    let definition_id = profile.id.clone();
     rsx! {
+        div { class: "importer-slot",
         crate::selection_card::SelectableCard {
             source_id: profile.id.clone(),
             kind: profile.kind.clone(),
@@ -510,15 +516,378 @@ fn importer_card(
                 }
             }
         }
+        if has_definition {
+            ImporterDefinitionEditor {
+                source_id: definition_id,
+                can_write: switch_allowed,
+                generation,
+            }
+        }
+        }
     }
 }
 
 
+/// Minimal Nix starter for a new package: one node collection with a
+/// doctype rule, one declared field, the required schema block.
+const NIX_PACKAGE_STARTER: &str = r#"# New HTTP/JSON importer package (Nix serialization).
+# Evaluated server-side; the attrset must validate as an httpjson package.
+let
+  field = key: pointer: { inherit key pointer; };
+in
+{
+  format_version = 1;
+  metadata = {
+    id = "example.items";
+    name = "Example items";
+    version = "0.1.0";
+  };
+  variables = [ { name = "project"; description = "Project path segment"; } ];
+  collections = [
+    {
+      name = "items";
+      path = "/v1/{project}/items";
+      paginate = { style = "limit_offset"; };
+      nodes = {
+        id_pointer = "/id";
+        node_type = "item";
+        doctype = {
+          pointer = "/kind";
+          map = { task = "Task"; note = "Note"; };
+        };
+        title = { pointer = "/title"; fallback_prefix = "item"; };
+        fields = [ (field "body" "/body") ];
+        edges = [
+          { kind = "references"; value_pointer = "/parent_id"; target_collection = "items"; match_on = "id"; }
+        ];
+      };
+    }
+  ];
+  schema = {
+    fields = [
+      { key = "body"; field_type = "text"; required = false; searchable = true; facetable = false; snippet = true; }
+    ];
+    edge_types = [
+      { key = "references"; directed = true; description = "Item -> the item it points at."; }
+    ];
+  };
+}
+"#;
 
+#[derive(Clone, PartialEq)]
+enum DefinitionState {
+    Closed,
+    Loading,
+    Ready(api::ImporterDefinition),
+    Failed(String),
+}
 
+/// Inline package-source editor for one httpjson card. The card keeps its
+/// structured view; this reveals (and, when the server's packages dir is
+/// writable and the viewer holds the switch group, edits) the authored
+/// TOML/Nix underneath it.
+#[component]
+fn ImporterDefinitionEditor(
+    source_id: String,
+    can_write: bool,
+    generation: Signal<u64>,
+) -> Element {
+    let mut state = use_signal(|| DefinitionState::Closed);
+    let mut draft = use_signal(String::new);
+    let mut status = use_signal(|| None::<String>);
+    let mut error = use_signal(|| None::<String>);
+    let mut busy = use_signal(|| false);
+    let open = !matches!(*state.read(), DefinitionState::Closed);
+
+    let load_id = source_id.clone();
+    let mut load = move || {
+        let id = load_id.clone();
+        state.set(DefinitionState::Loading);
+        status.set(None);
+        error.set(None);
+        spawn(async move {
+            match api::importer_definition(&id).await {
+                Ok(definition) => {
+                    draft.set(definition.source.clone());
+                    state.set(DefinitionState::Ready(definition));
+                }
+                Err(message) => state.set(DefinitionState::Failed(message)),
+            }
+        });
+    };
+
+    let save_id = source_id.clone();
+    let save = move |_| {
+        let id = save_id.clone();
+        let source = draft.read().clone();
+        busy.set(true);
+        status.set(Some("Validating and saving…".into()));
+        error.set(None);
+        spawn(async move {
+            match api::put_importer_definition(&id, &source).await {
+                Ok(definition) => {
+                    draft.set(definition.source.clone());
+                    state.set(DefinitionState::Ready(definition));
+                    status.set(Some("Saved. The next switch to this source rebuilds it from the new package.".into()));
+                    generation += 1;
+                }
+                Err(message) => {
+                    status.set(None);
+                    error.set(Some(message));
+                }
+            }
+            busy.set(false);
+        });
+    };
+
+    let view = state.read().clone();
+    rsx! {
+        div { class: "importer-definition", "data-source-id": "{source_id}",
+            button {
+                class: "btn importer-definition-toggle",
+                r#type: "button",
+                "aria-expanded": if open { "true" } else { "false" },
+                onclick: move |_| {
+                    if open { state.set(DefinitionState::Closed); } else { load(); }
+                },
+                if open { "Hide source" } else { "Edit source" }
+            }
+            match view {
+                DefinitionState::Closed => rsx! {},
+                DefinitionState::Loading => rsx! {
+                    div { class: "gen-status", "Loading package definition…" }
+                },
+                DefinitionState::Failed(message) => rsx! {
+                    div { class: "gen-error", "{message}" }
+                },
+                DefinitionState::Ready(definition) => {
+                    let editable = can_write && definition.writable;
+                    let dirty = *draft.read() != definition.source;
+                    let original = definition.source.clone();
+                    rsx! {
+                        div { class: "importer-definition-head",
+                            span { class: "importer-badge importer-format-badge", "data-format": "{definition.format}", "{definition.format}" }
+                            code { class: "importer-definition-file", "{definition.package}" }
+                        }
+                        textarea {
+                            class: "gen-editor importer-definition-editor",
+                            rows: "18",
+                            spellcheck: false,
+                            readonly: !editable,
+                            value: "{draft}",
+                            oninput: move |e| draft.set(e.value()),
+                        }
+                        if !editable {
+                            p { class: "importer-definition-note",
+                                if !can_write {
+                                    "Read-only: editing requires runtime switching to be enabled for your group."
+                                } else {
+                                    "Read-only: the server's packages directory is not writable."
+                                }
+                            }
+                        }
+                        div { class: "gen-actions",
+                            button {
+                                class: "btn importer-definition-save",
+                                r#type: "button",
+                                disabled: !editable || !dirty || *busy.read(),
+                                onclick: save,
+                                "Save"
+                            }
+                            button {
+                                class: "btn importer-definition-cancel",
+                                r#type: "button",
+                                disabled: !dirty || *busy.read(),
+                                onclick: move |_| {
+                                    draft.set(original.clone());
+                                    status.set(None);
+                                    error.set(None);
+                                },
+                                "Cancel"
+                            }
+                        }
+                        if let Some(message) = status.read().as_ref() {
+                            div { class: "gen-status", role: "status", "{message}" }
+                        }
+                        if let Some(message) = error.read().as_ref() {
+                            div { class: "gen-error", role: "alert", "{message}" }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Trailing card of the alternates list: a form that `POST`s a new runtime
+/// httpjson source (catalog entry + package file) and refreshes the catalog.
+#[component]
+fn AddImporterCard(allowed: bool, generation: Signal<u64>) -> Element {
+    let mut open = use_signal(|| false);
+    let mut id = use_signal(String::new);
+    let mut name = use_signal(String::new);
+    let mut endpoint = use_signal(String::new);
+    let mut package = use_signal(|| "my-importer.nix".to_string());
+    let mut variables = use_signal(|| vec![(String::new(), String::new())]);
+    let mut source = use_signal(|| NIX_PACKAGE_STARTER.to_string());
+    let mut status = use_signal(|| None::<String>);
+    let mut error = use_signal(|| None::<String>);
+    let mut busy = use_signal(|| false);
+
+    let submit = move |_| {
+        let importer = api::NewImporter {
+            id: id.read().trim().to_string(),
+            name: name.read().trim().to_string(),
+            description: String::new(),
+            package: package.read().trim().to_string(),
+            source: source.read().clone(),
+            endpoint: endpoint.read().trim().to_string(),
+            variables: variables
+                .read()
+                .iter()
+                .filter(|(key, _)| !key.trim().is_empty())
+                .map(|(key, value)| (key.trim().to_string(), value.trim().to_string()))
+                .collect(),
+        };
+        busy.set(true);
+        status.set(Some("Validating and creating…".into()));
+        error.set(None);
+        spawn(async move {
+            match api::post_importer(&importer).await {
+                Ok(_) => {
+                    status.set(None);
+                    open.set(false);
+                    id.set(String::new());
+                    name.set(String::new());
+                    endpoint.set(String::new());
+                    variables.set(vec![(String::new(), String::new())]);
+                    source.set(NIX_PACKAGE_STARTER.to_string());
+                    generation += 1;
+                }
+                Err(message) => {
+                    status.set(None);
+                    error.set(Some(message));
+                }
+            }
+            busy.set(false);
+        });
+    };
+
+    let ready = !id.read().trim().is_empty()
+        && !name.read().trim().is_empty()
+        && !endpoint.read().trim().is_empty()
+        && !package.read().trim().is_empty();
+    let row_count = variables.read().len();
+    rsx! {
+        div { class: "select-card importer-card importer-add-card", "data-source-id": "__add__",
+            div { class: "select-card-head",
+                strong { "Add importer" }
+            }
+            if !allowed {
+                p { class: "importer-definition-note",
+                    "Adding a source requires runtime switching to be enabled for your group."
+                }
+            } else if !*open.read() {
+                p { class: "select-card-desc",
+                    "Declare a new HTTP/JSON source: a catalog entry plus its package, authored in Nix or TOML."
+                }
+                button {
+                    class: "btn importer-add-open",
+                    r#type: "button",
+                    onclick: move |_| open.set(true),
+                    "New importer…"
+                }
+            } else {
+                div { class: "importer-add-form",
+                    label { class: "importer-add-field",
+                        span { "id" }
+                        input { r#type: "text", placeholder: "my-bank", value: "{id}", oninput: move |e| id.set(e.value()) }
+                    }
+                    label { class: "importer-add-field",
+                        span { "name" }
+                        input { r#type: "text", placeholder: "My bank", value: "{name}", oninput: move |e| name.set(e.value()) }
+                    }
+                    label { class: "importer-add-field",
+                        span { "endpoint" }
+                        input { r#type: "text", placeholder: "http://api.example.svc:8080", value: "{endpoint}", oninput: move |e| endpoint.set(e.value()) }
+                    }
+                    label { class: "importer-add-field",
+                        span { "package file" }
+                        input { r#type: "text", placeholder: "my-importer.nix", value: "{package}", oninput: move |e| package.set(e.value()) }
+                    }
+                    div { class: "importer-add-variables",
+                        span { class: "importer-add-label", "variables" }
+                        for row in 0..row_count {
+                            div { key: "{row}", class: "importer-add-variable",
+                                input {
+                                    r#type: "text",
+                                    placeholder: "key",
+                                    value: "{variables.read()[row].0}",
+                                    oninput: move |e| variables.write()[row].0 = e.value(),
+                                }
+                                span { "=" }
+                                input {
+                                    r#type: "text",
+                                    placeholder: "value",
+                                    value: "{variables.read()[row].1}",
+                                    oninput: move |e| variables.write()[row].1 = e.value(),
+                                }
+                                button {
+                                    class: "btn importer-add-variable-remove",
+                                    r#type: "button",
+                                    title: "Remove variable",
+                                    disabled: row_count == 1,
+                                    onclick: move |_| { variables.write().remove(row); },
+                                    "×"
+                                }
+                            }
+                        }
+                        button {
+                            class: "btn importer-add-variable-add",
+                            r#type: "button",
+                            onclick: move |_| variables.write().push((String::new(), String::new())),
+                            "+ variable"
+                        }
+                    }
+                    span { class: "importer-add-label", "package source" }
+                    textarea {
+                        class: "gen-editor importer-definition-editor",
+                        rows: "18",
+                        spellcheck: false,
+                        value: "{source}",
+                        oninput: move |e| source.set(e.value()),
+                    }
+                    div { class: "gen-actions",
+                        button {
+                            class: "btn importer-add-submit",
+                            r#type: "button",
+                            disabled: !ready || *busy.read(),
+                            onclick: submit,
+                            "Create"
+                        }
+                        button {
+                            class: "btn importer-add-cancel",
+                            r#type: "button",
+                            disabled: *busy.read(),
+                            onclick: move |_| { open.set(false); error.set(None); status.set(None); },
+                            "Cancel"
+                        }
+                    }
+                    if let Some(message) = status.read().as_ref() {
+                        div { class: "gen-status", role: "status", "{message}" }
+                    }
+                    if let Some(message) = error.read().as_ref() {
+                        div { class: "gen-error", role: "alert", "{message}" }
+                    }
+                }
+            }
+        }
+    }
+}
 fn importer_catalog(
     catalog: &api::ImporterCatalog,
     viewing: Option<String>,
+    generation: Signal<u64>,
     mut on_switch: impl FnMut(Option<String>) + 'static + Copy,
 ) -> Element {
     let selected = catalog.selected.as_deref().unwrap_or("none");
@@ -614,26 +983,26 @@ fn importer_catalog(
                     class: "importer-section importer-section-viewing",
                     div { class: "importer-section-label", "Currently viewing" }
                     div { class: "importer-list", "aria-label": "Active source",
-                        {importer_card(viewing_profile, switch_allowed, viewing.as_deref(), on_switch)}
+                        {importer_card(viewing_profile, switch_allowed, viewing.as_deref(), generation, on_switch)}
                     }
                 }
             }
             // Alternatives: compact list of every other runnable source. The
             // default sits here when the viewer is currently looking at an
-            // override (return-target); alternates sit here otherwise.
-            if !other_profiles.is_empty() {
-                section {
-                    class: "importer-section importer-section-alternates",
-                    div {
-                        class: "importer-section-label",
-                        if viewing_non_default { "Return to default" } else { "Other sources" }
+            // override (return-target); alternates sit here otherwise. The
+            // trailing card adds a new runtime httpjson source.
+            section {
+                class: "importer-section importer-section-alternates",
+                div {
+                    class: "importer-section-label",
+                    if viewing_non_default { "Return to default" } else { "Other sources" }
+                }
+                div { class: "importer-list", "aria-label": "Other configured sources",
+                    role: "radiogroup",
+                    for profile in &other_profiles {
+                        {importer_card(profile, switch_allowed, viewing.as_deref(), generation, on_switch)}
                     }
-                    div { class: "importer-list", "aria-label": "Other configured sources",
-                        role: "radiogroup",
-                        for profile in &other_profiles {
-                            {importer_card(profile, switch_allowed, viewing.as_deref(), on_switch)}
-                        }
-                    }
+                    AddImporterCard { allowed: switch_allowed, generation }
                 }
             }
         }
@@ -690,7 +1059,7 @@ fn ImportersSettings(props: DelegateProps) -> Element {
             div { class: "importers-status", role: "status", "Loading importer catalog…" }
         },
         ImportersViewState::Ready(catalog) => {
-            importer_catalog(&catalog, viewing.read().clone(), on_switch)
+            importer_catalog(&catalog, viewing.read().clone(), generation, on_switch)
         }
         ImportersViewState::Failed(error) => rsx! {
             div { class: "importers-status error", role: "alert",

@@ -166,12 +166,41 @@ struct RawImporterCatalog {
     sources: BTreeMap<String, ImporterSourceDefinition>,
 }
 
+/// File name of the runtime overlay catalog inside the packages directory.
+/// `POST /importers` appends to it; boot merges it into the chart catalog.
+pub const OVERLAY_CATALOG_FILENAME: &str = "catalog.local.json";
+
+/// The runtime overlay catalog: sources added through `POST /importers`.
+/// Same per-source shape as the chart catalog, never a `selected` key —
+/// the deployment default stays chart-owned.
+#[derive(Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ImporterCatalogOverlay {
+    #[serde(default)]
+    pub sources: BTreeMap<String, ImporterSourceDefinition>,
+}
+
+/// Where a catalog entry came from; serialized on every profile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ImporterOrigin {
+    Deployment,
+    Runtime,
+}
+
+#[derive(Debug, Clone)]
+struct CatalogEntry {
+    id: String,
+    definition: ImporterSourceDefinition,
+    origin: ImporterOrigin,
+}
+
 /// Validated catalog retained in application state.
 #[derive(Debug, Clone)]
 pub struct ImporterCatalog {
     selected: Option<String>,
     active_kind: Option<CatalogSourceKind>,
-    sources: Vec<(String, ImporterSourceDefinition)>,
+    sources: Vec<CatalogEntry>,
 }
 
 impl Default for ImporterCatalog {
@@ -260,8 +289,94 @@ impl ImporterCatalog {
             selected,
             active_kind: Some(active_kind),
             // BTreeMap iteration is lexicographic, making the API stable.
-            sources: sources.into_iter().collect(),
+            sources: sources
+                .into_iter()
+                .map(|(id, definition)| CatalogEntry {
+                    id,
+                    definition,
+                    origin: ImporterOrigin::Deployment,
+                })
+                .collect(),
         })
+    }
+
+    /// Merge the runtime overlay file from `packages_dir` (if present) into
+    /// this catalog. Returns the number of sources merged; an absent file is
+    /// zero. Overlay entries are validated exactly like chart entries and may
+    /// not shadow an existing id.
+    pub fn load_overlay(&mut self, packages_dir: &Path) -> Result<usize, String> {
+        let path = packages_dir.join(OVERLAY_CATALOG_FILENAME);
+        let raw = match std::fs::read_to_string(&path) {
+            Ok(raw) => raw,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+            Err(error) => return Err(format!("failed to read {}: {error}", path.display())),
+        };
+        self.merge_overlay(&raw)
+            .map_err(|error| format!("{}: {error}", path.display()))
+    }
+
+    /// Merge overlay JSON (`{ "sources": { id: definition } }`) as runtime
+    /// entries. All-or-nothing: one invalid or colliding entry rejects the
+    /// whole overlay and leaves the catalog untouched.
+    pub fn merge_overlay(&mut self, raw: &str) -> Result<usize, String> {
+        if raw.len() > MAX_IMPORTER_CATALOG_BYTES {
+            return Err(format!(
+                "importer overlay catalog is {} bytes; maximum is {MAX_IMPORTER_CATALOG_BYTES}",
+                raw.len()
+            ));
+        }
+        let overlay: ImporterCatalogOverlay = serde_json::from_str(raw)
+            .map_err(|error| format!("invalid importer overlay catalog JSON: {error}"))?;
+        if self.sources.len() + overlay.sources.len() > MAX_IMPORTER_CATALOG_SOURCES {
+            return Err(format!(
+                "importer catalog would have {} sources; maximum is {MAX_IMPORTER_CATALOG_SOURCES}",
+                self.sources.len() + overlay.sources.len()
+            ));
+        }
+        for (id, definition) in &overlay.sources {
+            validate_source(id, definition)?;
+            if self.source(id).is_some() {
+                return Err(format!("overlay source {id:?} shadows an existing catalog source"));
+            }
+        }
+        let merged = overlay.sources.len();
+        self.sources.extend(
+            overlay
+                .sources
+                .into_iter()
+                .map(|(id, definition)| CatalogEntry {
+                    id,
+                    definition,
+                    origin: ImporterOrigin::Runtime,
+                }),
+        );
+        self.sources.sort_by(|a, b| a.id.cmp(&b.id));
+        Ok(merged)
+    }
+
+    /// Add one runtime-authored source (`POST /importers`). Validated like a
+    /// chart entry; the id must be new.
+    pub fn insert_runtime_source(
+        &mut self,
+        id: String,
+        definition: ImporterSourceDefinition,
+    ) -> Result<(), String> {
+        validate_source(&id, &definition)?;
+        if self.source(&id).is_some() {
+            return Err(format!("importer source {id:?} already exists"));
+        }
+        if self.sources.len() + 1 > MAX_IMPORTER_CATALOG_SOURCES {
+            return Err(format!(
+                "importer catalog already has {MAX_IMPORTER_CATALOG_SOURCES} sources"
+            ));
+        }
+        self.sources.push(CatalogEntry {
+            id,
+            definition,
+            origin: ImporterOrigin::Runtime,
+        });
+        self.sources.sort_by(|a, b| a.id.cmp(&b.id));
+        Ok(())
     }
 
     /// The deployment-default source id, when the catalog declares one.
@@ -274,8 +389,44 @@ impl ImporterCatalog {
     pub fn source(&self, id: &str) -> Option<&ImporterSourceDefinition> {
         self.sources
             .iter()
-            .find(|(source_id, _)| source_id == id)
-            .map(|(_, definition)| definition)
+            .find(|entry| entry.id == id)
+            .map(|entry| &entry.definition)
+    }
+
+    /// Where a named source came from, or `None` for an unknown id.
+    pub fn origin(&self, id: &str) -> Option<ImporterOrigin> {
+        self.sources
+            .iter()
+            .find(|entry| entry.id == id)
+            .map(|entry| entry.origin)
+    }
+
+    /// The sanitized item for one source, or `None` for an unknown id.
+    pub fn item(&self, id: &str) -> Option<ImporterCatalogItem> {
+        self.sources
+            .iter()
+            .find(|entry| entry.id == id)
+            .map(|entry| self.item_for(entry))
+    }
+
+    fn item_for(&self, entry: &CatalogEntry) -> ImporterCatalogItem {
+        let definition = &entry.definition;
+        let selected = self.selected.as_deref() == Some(entry.id.as_str());
+        ImporterCatalogItem {
+            id: entry.id.clone(),
+            display_name: definition.display_name.clone(),
+            description: definition.description.clone(),
+            kind: definition.kind,
+            origin: entry.origin,
+            source_id: definition.source_id.clone(),
+            filesystem_rescan_interval_seconds: definition.filesystem_rescan_interval_seconds,
+            selected,
+            active: selected && self.active_kind == Some(definition.kind),
+            runnable: definition.runnable(),
+            source: definition.source.clone(),
+            http_json: definition.http_json.clone(),
+            producer: definition.producer.clone(),
+        }
     }
 
     /// Build the sanitized API representation for the currently published
@@ -288,28 +439,7 @@ impl ImporterCatalog {
         importer: &SnapshotSource,
         runtime_switch: &RuntimeSwitchStatus,
     ) -> ImporterCatalogResponse {
-        let sources = self
-            .sources
-            .iter()
-            .map(|(id, definition)| {
-                let selected = self.selected.as_deref() == Some(id.as_str());
-                ImporterCatalogItem {
-                    id: id.clone(),
-                    display_name: definition.display_name.clone(),
-                    description: definition.description.clone(),
-                    kind: definition.kind,
-                    source_id: definition.source_id.clone(),
-                    filesystem_rescan_interval_seconds: definition
-                        .filesystem_rescan_interval_seconds,
-                    selected,
-                    active: selected && self.active_kind == Some(definition.kind),
-                    runnable: definition.runnable(),
-                    source: definition.source.clone(),
-                    http_json: definition.http_json.clone(),
-                    producer: definition.producer.clone(),
-                }
-            })
-            .collect();
+        let sources = self.sources.iter().map(|entry| self.item_for(entry)).collect();
 
         ImporterCatalogResponse {
             activation: "helm_rollout",
@@ -384,6 +514,9 @@ pub struct ImporterCatalogItem {
     pub display_name: String,
     pub description: String,
     pub kind: CatalogSourceKind,
+    /// `deployment` for chart-declared sources, `runtime` for sources added
+    /// through `POST /importers` (persisted in the overlay catalog).
+    pub origin: ImporterOrigin,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -400,6 +533,12 @@ pub struct ImporterCatalogItem {
     pub http_json: Option<ImporterHttpJsonSource>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub producer: Option<ImporterProducerContract>,
+}
+
+/// Validate one source definition exactly as catalog parsing does. Used by
+/// `POST /importers` before any file is written.
+pub fn validate_definition(id: &str, source: &ImporterSourceDefinition) -> Result<(), String> {
+    validate_source(id, source)
 }
 
 fn validate_source(id: &str, source: &ImporterSourceDefinition) -> Result<(), String> {
@@ -1032,6 +1171,59 @@ mod tests {
             .source("hindsight-memory-bank")
             .expect("httpjson source lookup");
         assert!(definition.runnable());
+    }
+
+    #[test]
+    fn overlay_merges_runtime_sources_sorted_and_marked() {
+        let mut catalog = ImporterCatalog::parse(Some(HINDSIGHT), SourceKind::HttpJson).unwrap();
+        let merged = catalog
+            .merge_overlay(
+                r#"{ "sources": { "a-local": {
+                    "displayName": "Local", "kind": "httpjson",
+                    "httpJson": { "package": "local.nix", "endpoint": "http://example.invalid" }
+                } } }"#,
+            )
+            .unwrap();
+        assert_eq!(merged, 1);
+        let response = catalog.response(
+            &SnapshotSource::new("httpjson", "HTTP/JSON", "1.0"),
+            &RuntimeSwitchStatus::disabled(),
+        );
+        assert_eq!(response.sources[0].id, "a-local");
+        assert_eq!(response.sources[0].origin, ImporterOrigin::Runtime);
+        assert_eq!(response.sources[1].origin, ImporterOrigin::Deployment);
+        assert_eq!(catalog.origin("a-local"), Some(ImporterOrigin::Runtime));
+        assert_eq!(
+            serde_json::to_value(&response.sources[0]).unwrap()["origin"],
+            "runtime"
+        );
+
+        let shadow = catalog
+            .merge_overlay(
+                r#"{ "sources": { "hindsight-memory-bank": {
+                    "displayName": "Shadow", "kind": "httpjson",
+                    "httpJson": { "package": "x.toml", "endpoint": "http://example.invalid" }
+                } } }"#,
+            )
+            .unwrap_err();
+        assert!(shadow.contains("shadows"), "{shadow}");
+        assert!(catalog.merge_overlay(r#"{ "selected": "a-local" }"#).is_err());
+        assert!(catalog
+            .insert_runtime_source(
+                "a-local".into(),
+                catalog.source("a-local").unwrap().clone()
+            )
+            .unwrap_err()
+            .contains("already exists"));
+    }
+
+    #[test]
+    fn load_overlay_without_file_is_empty() {
+        let mut catalog = ImporterCatalog::parse(Some(HINDSIGHT), SourceKind::HttpJson).unwrap();
+        let dir = std::env::temp_dir().join(format!("jc-overlay-none-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        assert_eq!(catalog.load_overlay(&dir).unwrap(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

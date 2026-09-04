@@ -57,7 +57,15 @@ fn api_routes() -> Router<SourceHost> {
         // `/configs` lists shipped presets; `/configs/:name` returns one as YAML.
         .route("/configs", get(configs_list))
         .route("/configs/:name", get(config_get))
-        .route("/importers", get(importers_catalog))
+        .route(
+            "/importers",
+            get(importers_catalog).post(crate::importer_editor::importers_post),
+        )
+        .route(
+            "/importers/:source_id/definition",
+            get(crate::importer_editor::definition_get)
+                .put(crate::importer_editor::definition_put),
+        )
         .route("/graph/init", get(graph_init))
         .route("/graph/ids", get(graph_ids))
         .route("/graph/positions", get(graph_positions))

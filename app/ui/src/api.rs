@@ -560,6 +560,10 @@ pub struct ImporterProfile {
     #[serde(default)]
     pub description: String,
     pub kind: String,
+    /// `deployment` for chart-declared sources, `runtime` for sources added
+    /// through `POST /importers` (persisted in the packages-dir overlay).
+    #[serde(default = "default_origin")]
+    pub origin: String,
     #[serde(default)]
     pub source_id: Option<String>,
     #[serde(default)]
@@ -577,6 +581,10 @@ pub struct ImporterProfile {
     pub source: Option<ImporterFilesystemSource>,
     #[serde(default)]
     pub producer: Option<ImporterProducer>,
+}
+
+fn default_origin() -> String {
+    "deployment".to_string()
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq)]
@@ -605,6 +613,80 @@ pub struct ImporterProducer {
 /// currently hosted by this graph-api process.
 pub async fn importers() -> ApiResult<ImporterCatalog> {
     get_json("/importers").await
+}
+
+// --- importer package definitions ------------------------------------------
+
+/// `GET`/`PUT /importers/{id}/definition` — an httpjson source's authored
+/// package text. `writable` is the server's probe of its packages directory.
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+pub struct ImporterDefinition {
+    pub format: String,
+    pub package: String,
+    pub source: String,
+    #[serde(default)]
+    pub writable: bool,
+}
+
+/// `POST /importers` body: a new runtime httpjson source plus its package.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NewImporter {
+    pub id: String,
+    pub name: String,
+    pub description: String,
+    pub package: String,
+    pub source: String,
+    pub endpoint: String,
+    pub variables: std::collections::BTreeMap<String, String>,
+}
+
+/// Definition routes answer failures with a plain-text body (validation
+/// text, authorization, read-only dir); surface it verbatim.
+async fn definition_response<T: serde::de::DeserializeOwned>(
+    resp: gloo_net::http::Response,
+) -> ApiResult<T> {
+    if !resp.ok() {
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        return Err(if text.is_empty() {
+            format!("HTTP {status}")
+        } else {
+            format!("HTTP {status}: {text}")
+        });
+    }
+    resp.json().await.map_err(err)
+}
+
+pub async fn importer_definition(source_id: &str) -> ApiResult<ImporterDefinition> {
+    let resp = get(&format!("/importers/{source_id}/definition"))
+        .send()
+        .await
+        .map_err(err)?;
+    definition_response(resp).await
+}
+
+pub async fn put_importer_definition(
+    source_id: &str,
+    source: &str,
+) -> ApiResult<ImporterDefinition> {
+    let resp = Request::put(&url(&format!("/importers/{source_id}/definition")))
+        .json(&serde_json::json!({ "source": source }))
+        .map_err(err)?
+        .send()
+        .await
+        .map_err(err)?;
+    definition_response(resp).await
+}
+
+pub async fn post_importer(importer: &NewImporter) -> ApiResult<ImporterProfile> {
+    let resp = Request::post(&url("/importers"))
+        .json(importer)
+        .map_err(err)?
+        .send()
+        .await
+        .map_err(err)?;
+    definition_response(resp).await
 }
 
 // --- vault writes ---------------------------------------------------------------

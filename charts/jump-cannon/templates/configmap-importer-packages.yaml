@@ -8,9 +8,9 @@
 {{- end -}}
 {{- end -}}
 {{- if or (eq $importer.kind "httpjson") $anyHttpJsonCatalogSource }}
-{{/* Chart-owned package(s) for the HTTP/JSON importer engine. Each TOML
-     under charts/jump-cannon/packages/ becomes one data key keyed by its
-     filename, so the runtime can read them by name
+{{/* Chart-owned package(s) for the HTTP/JSON importer engine. Each TOML or
+     Nix package under charts/jump-cannon/packages/ becomes one data key
+     keyed by its filename, so the runtime can read them by name
      (e.g. `hindsight-memory-bank.toml`) with no path translation. The
      deployment mounts this ConfigMap under `.Values.httpJsonImporter.mountPath`
      only when `importers.selected` / `graphApi.source` selects `httpjson`,
@@ -24,7 +24,7 @@ metadata:
     {{- include "jump-cannon.labels" . | nindent 4 }}
     app.kubernetes.io/component: graph-api
 data:
-  {{- range $path, $_ := .Files.Glob "packages/*.toml" }}
+  {{- range $path, $_ := .Files.Glob "packages/*.{toml,nix}" }}
   {{ base $path }}: |-
 {{ $.Files.Get $path | indent 4 }}
   {{- end }}

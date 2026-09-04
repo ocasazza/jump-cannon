@@ -17,6 +17,15 @@ crate, not a Hindsight-specific one. There is no `Hindsight` source kind:
 the kind is `httpjson` and Hindsight is the package that maps its endpoints
 (see [[Importer Runtime]] and AGENTS.md "Importers: packages, not crates").
 
+The same package also ships as
+[`hindsight-memory-bank.nix`](../../packages/hindsight-memory-bank.nix): a
+Nix attrset that graph-api evaluates with the in-tree tvix evaluator into the
+identical manifest (`crates/graph-api/src/importer_package.rs` pins the two
+equal). The chart default still binds the `.toml`; the `.nix` form uses `let`
+bindings for the repeated field/schema declarations and is the starting
+point for authoring or editing a package from the Settings tab (see
+[[Importer Runtime]], "Package definitions").
+
 ## How a bank becomes an instance
 
 A bank is the unit of selection. Two instance-level variables feed into the
@@ -101,13 +110,18 @@ and writing facts back through a graph view would bypass it.
 
 ## Adding another bank
 
-Same package, new instance — no Rust touched. Drop a copy of the TOML
-verbatim (it's a single source-of-truth mapping) and bind it through the
-chart's `httpJsonImporter` values:
+Same package, new instance — no Rust touched. Either bind a copy of the
+package (TOML or Nix, verbatim) through the chart's `httpJsonImporter`
+values:
 
-- `httpJsonImporter.package` → `hindsight-memory-bank.toml`
+- `httpJsonImporter.package` → `hindsight-memory-bank.toml` (or `.nix`)
 - `httpJsonImporter.endpoint` → API root for that bank
 - `httpJsonImporter.variables` → `{ tenant: <t>, bank: <b> }`
+
+or, with `importers.runtimeSwitchGroup` set and a writable
+`JUMP_CANNON_IMPORTER_PACKAGES_DIR`, use the Settings tab's "Add importer"
+card (`POST /importers`): it writes the package file next to the shipped
+ones and records the source in `catalog.local.json`, which survives restarts.
 
 Two graph-api pods running the same package against two different
 endpoints publish two distinct graphs (`httpjson:omp:…`,

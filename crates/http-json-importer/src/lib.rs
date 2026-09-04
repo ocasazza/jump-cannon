@@ -231,4 +231,43 @@ mod tests {
             .validate()
             .expect("published discovery schema is internally consistent");
     }
+
+    /// The JSON constructor is the arrival path for Nix-authored packages:
+    /// the same document as the shipped TOML, re-serialized as JSON, must
+    /// validate to the same package.
+    #[test]
+    fn json_document_validates_identically_to_toml() {
+        let toml_text = include_str!(
+            "../../../charts/jump-cannon/packages/hindsight-memory-bank.toml"
+        );
+        let from_toml = ValidatedPackage::from_toml_bytes(toml_text.as_bytes())
+            .expect("TOML fixture validates");
+        let value: toml::Value = toml::from_str(toml_text).expect("fixture is TOML");
+        let json = serde_json::to_string(&value).expect("TOML value serializes as JSON");
+        let from_json = ValidatedPackage::from_json_str(&json).expect("JSON document validates");
+
+        assert_eq!(
+            from_json.manifest().metadata.id,
+            from_toml.manifest().metadata.id
+        );
+        assert_eq!(from_json.collections().len(), from_toml.collections().len());
+        let names = |package: &ValidatedPackage| -> Vec<String> {
+            package.collections().iter().map(|c| c.name.clone()).collect()
+        };
+        assert_eq!(names(&from_json), names(&from_toml));
+        let field_keys = |package: &ValidatedPackage| -> Vec<String> {
+            package
+                .manifest()
+                .schema
+                .fields
+                .iter()
+                .map(|f| f.key.clone())
+                .collect()
+        };
+        assert_eq!(field_keys(&from_json), field_keys(&from_toml));
+        assert!(
+            ValidatedPackage::from_json_str("{\"format_version\": 1}").is_err(),
+            "an incomplete JSON document fails validation"
+        );
+    }
 }
