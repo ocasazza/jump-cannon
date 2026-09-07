@@ -21,6 +21,7 @@ mod client_log;
 mod graph_canvas;
 mod palette;
 mod panels;
+mod pest_worker;
 mod proto;
 mod render;
 mod worker;
@@ -181,6 +182,8 @@ pub(crate) enum Panel {
     Merge,
     GitHub,
     GpuSessions,
+    // Runtime importer package workbench (replaces the Settings → Importers tab):
+    Importers,
 }
 
 impl panel_kit::PanelKind for Panel {
@@ -205,6 +208,7 @@ impl panel_kit::PanelKind for Panel {
             Panel::Branches => "Branches",
             Panel::Merge => "Merge",
             Panel::GpuSessions => "GPU Sessions",
+            Panel::Importers => "Importers",
         }
     }
 }
@@ -380,6 +384,7 @@ fn default_layout() -> Vec<PanelWin<Panel>> {
         min(b, Panel::Metrics, 840.0, 160.0, 320.0, 380.0),
         min(b, Panel::Instances, 860.0, 180.0, 360.0, 420.0),
         min(b, Panel::Generate, 880.0, 200.0, 360.0, 440.0),
+        min(b, Panel::Importers, 870.0, 190.0, 760.0, 560.0),
         min(b, Panel::Timeline, 900.0, 220.0, 380.0, 320.0),
         min(b, Panel::GitHub, 890.0, 210.0, 360.0, 440.0),
         min(b, Panel::Debug, 920.0, 240.0, 320.0, 360.0),
@@ -1391,6 +1396,7 @@ fn panel_body(kind: Panel, _maximized: bool, ctx: Ctx) -> Element {
         Panel::Merge => panels::merge::panel(ctx),
         Panel::GpuSessions => panels::gpu_sessions::panel(ctx),
         Panel::GitHub => panels::github::panel(ctx),
+        Panel::Importers => panels::importers::panel(ctx),
         Panel::Help => rsx! {
             div { class: "help",
                 p { "canvas: drag rotate · wheel zoom · WASD pan · QE fwd/back · Shift boost · F fit · click select" }

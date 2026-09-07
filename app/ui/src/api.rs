@@ -546,12 +546,6 @@ pub struct ActiveImporter {
     pub importer: ImporterSource,
 }
 
-impl ActiveImporter {
-    pub fn kind_label(&self) -> &str {
-        self.kind.as_deref().unwrap_or("unknown/custom")
-    }
-}
-
 #[derive(Clone, Debug, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct ImporterProfile {
@@ -767,7 +761,6 @@ mod tests {
         .expect("catalog without an active kind must remain readable");
 
         assert_eq!(catalog.active.kind, None);
-        assert_eq!(catalog.active.kind_label(), "unknown/custom");
         // Older servers predate runtime switching: the block defaults to
         // disabled and sources default to non-runnable.
         assert!(!catalog.runtime_switch.enabled);

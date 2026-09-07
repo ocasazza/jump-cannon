@@ -6,16 +6,14 @@
 //! tests read to assert URL shape, count, and ordering.
 
 use std::collections::BTreeMap;
+use std::future::Future;
 use std::sync::Arc;
 
 use data_loader::{Capability, Effect, ImportError, ImportFuture, SourceConnector, Transport};
 use parking_lot::Mutex;
 
-use crate::connector::{
-    HttpJsonConnector, JsonTransport, ReqwestTransport, CONTENT_TYPE, USER_AGENT,
-};
-use crate::manifest::{Limits, ValidatedPackage};
-use crate::InstanceConfig;
+use super::{HttpJsonConnector, JsonTransport, CONTENT_TYPE};
+use crate::{InstanceConfig, ValidatedPackage};
 
 const BASE_URL: &str = "http://api.example.test";
 const ROOT: &str = "http://api.example.test";
@@ -24,25 +22,36 @@ const ROOT: &str = "http://api.example.test";
 /// surface to exercise every connector capability without dragging in an
 /// edge-rule schema. `page_size = 2` so tests can use small fixture pages.
 const PACKAGE: &str = r#"
-format_version = 1
+format_version = 3
 
 [metadata]
 id = "test.shape"
 name = "Test shape"
 version = "1.0.0"
 
-[[variables]]
+[limits]
+nodes = 50
+
+[[schema.edge_types]]
+key = "mentions"
+directed = true
+
+[parser]
+engine = "json"
+page_size = 2
+
+[[parser.variables]]
 name = "bank"
 default = "omp"
 
-[preflight]
+[parser.preflight]
 path = "/v1/banks"
 items_pointer = "/items"
 id_pointer = "/bank_id"
 variable = "bank"
 subject = "bank"
 
-[[collections]]
+[[parser.collections]]
 name = "memories"
 path = "/v1/banks/{bank}/memories"
 query = { state = "valid" }
@@ -50,143 +59,140 @@ paginate = { style = "limit_offset" }
 items_pointer = "/items"
 total_pointer = "/total"
 
-[collections.nodes]
+[parser.collections.nodes]
 id_pointer = "/id"
 node_type = "memory"
 
-[collections.nodes.title]
+[parser.collections.nodes.title]
 pointer = "/text"
 fallback_prefix = "memory"
 
-[[collections]]
+[[parser.collections]]
 name = "entities"
 path = "/v1/banks/{bank}/entities"
 paginate = { style = "limit_offset" }
 
-[collections.nodes]
+[parser.collections.nodes]
 id_pointer = "/id"
 node_type = "entity"
 
-[collections.nodes.title]
+[parser.collections.nodes.title]
 pointer = "/name"
 fallback_prefix = "entity"
-
-[limits]
-page_size = 2
-max_records = 50
-
-[schema]
-[[schema.edge_types]]
-key = "mentions"
-directed = true
 "#;
 
 /// A package with no preflight and a single paginated collection. `page_size
 /// = 2` to keep fixture pages small.
 const PACKAGE_NO_PREFLIGHT: &str = r#"
-format_version = 1
+format_version = 3
 
 [metadata]
 id = "test.shape"
 name = "Test shape"
 version = "1.0.0"
 
-[[variables]]
+[limits]
+nodes = 50
+
+[[schema.edge_types]]
+key = "mentions"
+directed = true
+
+[parser]
+engine = "json"
+page_size = 2
+
+[[parser.variables]]
 name = "bank"
 default = "omp"
 
-[[collections]]
+[[parser.collections]]
 name = "memories"
 path = "/v1/banks/{bank}/memories"
 paginate = { style = "limit_offset" }
 
-[collections.nodes]
+[parser.collections.nodes]
 id_pointer = "/id"
 node_type = "memory"
 
-[collections.nodes.title]
+[parser.collections.nodes.title]
 pointer = "/text"
 fallback_prefix = "memory"
-
-[limits]
-page_size = 2
-max_records = 50
-
-[schema]
-[[schema.edge_types]]
-key = "mentions"
-directed = true
 "#;
 
 /// A package with pagination set to `none` and a static query — used by
 /// tests that want to assert single-request + well-formed-query behavior.
 const PACKAGE_NONE_PAGINATION: &str = r#"
-format_version = 1
+format_version = 3
 
 [metadata]
 id = "test.shape"
 name = "Test shape"
 version = "1.0.0"
 
-[[variables]]
+[[schema.edge_types]]
+key = "mentions"
+directed = true
+
+[parser]
+engine = "json"
+
+[[parser.variables]]
 name = "bank"
 default = "omp"
 
-[[collections]]
+[[parser.collections]]
 name = "memories"
 path = "/v1/banks/{bank}/memories"
 query = { state = "valid" }
 
-[collections.nodes]
+[parser.collections.nodes]
 id_pointer = "/id"
 node_type = "memory"
 
-[collections.nodes.title]
+[parser.collections.nodes.title]
 pointer = "/text"
 fallback_prefix = "memory"
-
-[schema]
-[[schema.edge_types]]
-key = "mentions"
-directed = true
 "#;
 
 /// A package tuned for the record-bound failure test: page_size = 1,
-/// max_records = 2. The connector must therefore fail when the server keeps
+/// nodes = 2. The connector must therefore fail when the server keeps
 /// returning full pages.
 const PACKAGE_TIGHT_BOUND: &str = r#"
-format_version = 1
+format_version = 3
 
 [metadata]
 id = "test.shape"
 name = "Test shape"
 version = "1.0.0"
 
-[[variables]]
+[limits]
+nodes = 2
+
+[[schema.edge_types]]
+key = "mentions"
+directed = true
+
+[parser]
+engine = "json"
+page_size = 1
+
+[[parser.variables]]
 name = "bank"
 default = "omp"
 
-[[collections]]
+[[parser.collections]]
 name = "memories"
 path = "/v1/banks/{bank}/memories"
 paginate = { style = "limit_offset" }
 
-[collections.nodes]
+[parser.collections.nodes]
 id_pointer = "/id"
 node_type = "memory"
 
-[collections.nodes.title]
+[parser.collections.nodes.title]
 pointer = "/text"
 fallback_prefix = "memory"
-
-[limits]
-page_size = 1
-max_records = 2
-
-[schema]
-[[schema.edge_types]]
-key = "mentions"
-directed = true
 "#;
 
 fn package(bytes: &str) -> ValidatedPackage {
@@ -273,7 +279,7 @@ fn pages(iter: impl IntoIterator<Item = serde_json::Value>) -> Vec<u8> {
     body(serde_json::json!({ "items": pages, "total": pages.len() }))
 }
 
-fn run<F: std::future::Future>(future: F) -> F::Output {
+fn run<F: Future>(future: F) -> F::Output {
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -281,10 +287,14 @@ fn run<F: std::future::Future>(future: F) -> F::Output {
         .block_on(future)
 }
 
+#[cfg(feature = "native")]
 #[test]
 fn debug_redacts_the_token() {
+    use super::ReqwestTransport;
+
     let instance = instance(Some("ghp_supersecret_token"));
-    let transport = ReqwestTransport::new(&instance, Limits::default()).expect("transport builds");
+    let transport = ReqwestTransport::new(&instance, crate::Limits::default(), 120)
+        .expect("transport builds");
     let debug = format!("{transport:?}");
     assert!(
         !debug.contains("ghp_supersecret_token"),
@@ -611,7 +621,7 @@ fn none_pagination_emits_one_request() {
 
 #[test]
 fn record_bound_failure_names_the_collection_and_bound() {
-    // page_size = 1, max_records = 2. The server returns 5 full pages of 1.
+    // page_size = 1, nodes = 2. The server returns 5 full pages of 1.
     let transport = FixtureTransport::new(BTreeMap::from([
         (
             format!("{ROOT}/v1/banks/omp/memories?limit=1&offset=0"),
@@ -657,7 +667,7 @@ fn record_bound_failure_names_the_collection_and_bound() {
 
 #[test]
 fn total_pointer_over_bound_fails_loudly_with_both_numbers() {
-    // Use a package with a total_pointer and max_records = 50. Server
+    // Use a package with a total_pointer and nodes = 50. Server
     // reports total = 1000. The preflight in PACKAGE doesn't apply here.
     let transport = FixtureTransport::new(BTreeMap::from([
         (
@@ -741,5 +751,5 @@ fn unresolved_placeholder_is_a_programming_error() {
 
 #[test]
 fn user_agent_constant_is_what_we_send() {
-    assert_eq!(USER_AGENT, "jump-cannon-http-json-importer");
+    assert_eq!(super::USER_AGENT, "jump-cannon-http-json-importer");
 }

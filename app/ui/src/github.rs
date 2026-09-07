@@ -6,9 +6,7 @@
 //! [`data_loader::LoadResult`] that the panel promotes onto the canvas.
 //!
 //! Only the network/import path is wasm-gated (a no-op stub covers `import`
-//! on native); the spec type, persistence, and [`LAST_IMPORT`] signal are
-//! shared so the GitHub panel and the Settings → Importers browser catalog
-//! read one source of truth.
+//! on native); the spec type and persistence serve the GitHub panel.
 
 #[cfg(target_arch = "wasm32")]
 use futures::stream::{self, StreamExt};
@@ -20,7 +18,6 @@ use web_sys::window;
 use data_loader::identity::MAX_SOURCE_ID_BYTES;
 #[cfg(target_arch = "wasm32")]
 use data_loader::identity::{Namespace, validate_source_id};
-use dioxus::prelude::*;
 use gloo_storage::{LocalStorage, Storage};
 #[cfg(target_arch = "wasm32")]
 use vault_links::{extract_notes, renamespace};
@@ -28,11 +25,6 @@ use vault_links::{extract_notes, renamespace};
 /// localStorage key holding the last-used import spec (shared by the GitHub
 /// panel's form defaults and the Settings → Importers browser catalog).
 const SPEC_STORAGE_KEY: &str = "jc_github_spec";
-
-/// The spec behind the currently displayed browser-imported graph, set on
-/// every successful import. The Settings → Importers browser catalog reads
-/// it so the tab reflects the live source, not just the persisted default.
-pub static LAST_IMPORT: GlobalSignal<Option<GitHubImportSpec>> = Signal::global(|| None);
 
 /// Persisted form of [`GitHubImportSpec`] (flat strings, serde-defaulted so
 /// older entries keep decoding).
@@ -66,12 +58,6 @@ pub fn persist_spec(spec: &GitHubImportSpec) {
             path: spec.path.clone(),
         },
     );
-}
-
-/// Contract-valid source id for a repository slug — the public wrapper the
-/// Settings catalog displays (`github:{source_id}` namespace).
-pub fn source_id_for(repo: &str) -> String {
-    sanitize_source_id(repo)
 }
 
 /// Repository slug for the GitHub Pages default import (`ocasazza/jump-cannon`).

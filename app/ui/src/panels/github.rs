@@ -128,11 +128,8 @@ pub(crate) fn spawn_import(spec: GitHubImportSpec, ctx: Ctx) {
                 *STATUS.write() = Some(format!("Imported {n} notes, {m} edges"));
 
                 // Persist the spec as the panel default and record it as
-                // the live source (the Settings → Importers browser catalog
-                // reads `LAST_IMPORT`).
+                // the live source.
                 github::persist_spec(&spec);
-                *github::LAST_IMPORT.write() = Some(spec.clone());
-
                 // Convert to GraphData and promote onto the canvas.
                 let graph_data = graph_canvas::graph_data_from_vault(&load_result.graph);
                 crate::replace_with_client_graph(

@@ -22,7 +22,7 @@ ConfigMap before publishing the chart.
 The importer catalog is deployment policy. Define named instances under
 `importers.sources` and activate one with `importers.selected`; an empty
 selector preserves `graphApi.source` and `kubernetesImporter.enabled`. The
-application displays a sanitized catalog in **Settings > Importers**. The
+application displays a sanitized catalog in the **Importers** panel. The
 rollout-based `importers.selected` flow remains the deployment default for
 choosing the active source; named chart profiles are currently wired for
 Obsidian, Kubernetes, and OKF, and source kinds with additional required
@@ -32,7 +32,7 @@ When `importers.runtimeSwitchGroup` names a NetBird group, every configured
 filesystem source is also mounted read-only in the graph-api pod (not only the
 selected one) and graph-api lets viewers whose proxy-injected
 `x-netbird-groups` header contains that group switch the viewed source at
-runtime from **Settings > Importers** (per browser session, read-only graph
+runtime from the **Importers** panel (per browser session, read-only graph
 views; writes, generation, and compute stay on the deployment-selected
 source). Only set the group once every dormant profile's producer claim
 exists in the release namespace — a mounted claim is a hard pod dependency,
@@ -55,9 +55,10 @@ as a ConfigMap, and the bound pod points `JUMP_CANNON_IMPORTER_*`
 (`--importer-manifest` / `--importer-endpoint` / `--importer-var name=value`
 / `--importer-token` / `--importer-source-id` / `--importer-poll-interval-ms`)
 at the chosen bank. No vault claim is mounted and the seed init container is
-skipped, since the corpus is remote. `httpJsonImporter.limits.maxRecords`
-bounds each collection's import loudly instead of truncating (the package
-also declares `request_timeout_seconds`, `max_records`, and page-size caps;
+skipped, since the corpus is remote. The package's `limits.nodes` bound
+fails each collection's import loudly instead of truncating (the package
+also declares `limits.input_bytes`, `parser.request_timeout_seconds`, and
+`parser.page_size` caps;
 see [[Hindsight Importer]] for the Hindsight example and AGENTS.md for the
 generic binding). An authenticated API takes a token only through
 `httpJsonImporter.tokenSecret`. See [[Importer Runtime]] for the engine.

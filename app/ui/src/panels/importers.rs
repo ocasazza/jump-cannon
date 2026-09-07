@@ -1,0 +1,962 @@
+//! Importers panel — browse, edit, copy, and live-preview runtime importer
+//! packages (crates/importer `format_version = 3` TOML manifests).
+//!
+//! Three regions: a package list (server catalog from `GET /importers` plus
+//! browser-local custom packages persisted in localStorage), a Monaco editor
+//! column (full TOML manifest + a pest-grammar-only view), and a preview pane
+//! that parses a sample input through `crate::pest_worker` — the Web Worker
+//! is the CPU sandbox, since pest_vm has no fuel counter and an untrusted
+//! grammar must never run on the UI thread.
+//!
+//! Grammar-view edits splice back into the TOML signal, but only for the
+//! `grammar = '''` literal-string form the package template uses; any other
+//! shape renders the grammar view read-only and the TOML view stays the edit
+//! surface. Panel-local state lives in `GlobalSignal`s (same pattern as
+//! generate.rs) so the file is self-contained.
+
+use std::collections::BTreeMap;
+
+use dioxus::prelude::*;
+use gloo_storage::{LocalStorage, Storage};
+use panel_kit::editor::{MonacoEditor, PANEL_KIT_DARK_THEME};
+use wasm_bindgen::{JsCast, JsValue};
+
+use crate::pest_worker::{parse_in_worker, ParsePreview};
+use crate::{api, reload_graph, Ctx};
+
+// --- persistence ---------------------------------------------------------------
+
+/// localStorage map of browser-local package id → manifest TOML.
+const PACKAGES_KEY: &str = "jump-cannon.importer.packages";
+/// Per-package sample input, prefixed with the package id.
+const SAMPLE_PREFIX: &str = "jump-cannon.importer.sample.";
+
+fn load_packages() -> BTreeMap<String, String> {
+    LocalStorage::get(PACKAGES_KEY).unwrap_or_default()
+}
+
+fn persist_packages() {
+    let _ = LocalStorage::set(PACKAGES_KEY, &*PACKAGES.read());
+}
+
+fn sample_key(id: &str) -> String {
+    format!("{SAMPLE_PREFIX}{id}")
+}
+
+// --- panel-local state -----------------------------------------------------------
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Selection {
+    /// Server catalog profile id (manifest body is deployment-side).
+    Catalog(String),
+    /// Browser-local package id (key into PACKAGES).
+    Local(String),
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum EditorView {
+    #[default]
+    Manifest,
+    Grammar,
+}
+
+#[derive(Clone, PartialEq)]
+enum CatalogState {
+    Idle,
+    Loading,
+    Ready(api::ImporterCatalog),
+    Unavailable(String),
+}
+
+#[derive(Clone)]
+enum PreviewState {
+    Idle,
+    Done(ParsePreview),
+    Failed { message: String, timeout: bool },
+}
+
+static PACKAGES: GlobalSignal<BTreeMap<String, String>> = Signal::global(load_packages);
+static SELECTION: GlobalSignal<Option<Selection>> = Signal::global(|| None);
+static MANIFEST: GlobalSignal<String> = Signal::global(String::new);
+static GRAMMAR: GlobalSignal<String> = Signal::global(String::new);
+/// True when the manifest's grammar is in the spliceable `grammar = '''` form.
+static GRAMMAR_SPLICEABLE: GlobalSignal<bool> = Signal::global(|| false);
+static EDITOR_VIEW: GlobalSignal<EditorView> = Signal::global(EditorView::default);
+static SAMPLE: GlobalSignal<String> = Signal::global(String::new);
+static PREVIEW: GlobalSignal<PreviewState> = Signal::global(|| PreviewState::Idle);
+static PREVIEW_RUNNING: GlobalSignal<bool> = Signal::global(|| false);
+static STATUS: GlobalSignal<Option<String>> = Signal::global(|| None);
+static CATALOG: GlobalSignal<CatalogState> = Signal::global(|| CatalogState::Idle);
+/// Session-scoped source override (mirrors sessionStorage via api::source_id).
+static VIEWING: GlobalSignal<Option<String>> = Signal::global(api::source_id);
+
+// --- manifest text surgery (pure functions; unit-tested below) --------------------
+
+/// Extract the `[parser]` inline pest grammar when it is written in the
+/// template's `grammar = '''` … `'''` literal-multiline form. Any other
+/// shape (basic string, json engine) returns `None` and the grammar view
+/// degrades to read-only.
+fn extract_grammar(manifest: &str) -> Option<String> {
+    let mut in_parser = false;
+    let mut lines = manifest.lines();
+    while let Some(line) = lines.next() {
+        let t = line.trim();
+        if t.starts_with('[') {
+            in_parser = t == "[parser]";
+            continue;
+        }
+        if in_parser && t == "grammar = '''" {
+            let mut body = Vec::new();
+            for inner in lines.by_ref() {
+                if inner.trim() == "'''" {
+                    return Some(body.join("\n"));
+                }
+                body.push(inner);
+            }
+            return None; // unterminated literal string — invalid TOML
+        }
+    }
+    None
+}
+
+/// Replace the `[parser]` grammar with `grammar`, preserving the rest of the
+/// manifest byte-for-byte. Fails when the manifest is not in the spliceable
+/// form or the grammar itself contains a line that would terminate the
+/// literal string early.
+fn splice_grammar(manifest: &str, grammar: &str) -> Result<String, String> {
+    if grammar.contains("'''") {
+        return Err("grammar contains '''; edit the manifest TOML directly".into());
+    }
+    let had_trailing_newline = manifest.ends_with('\n');
+    let mut out: Vec<&str> = Vec::new();
+    let mut in_parser = false;
+    let mut lines = manifest.lines();
+    let mut replaced = false;
+    while let Some(line) = lines.next() {
+        let t = line.trim();
+        if t.starts_with('[') {
+            in_parser = t == "[parser]";
+            out.push(line);
+            continue;
+        }
+        if in_parser && !replaced && t == "grammar = '''" {
+            out.push(line);
+            out.extend(grammar.lines());
+            for inner in lines.by_ref() {
+                if inner.trim() == "'''" {
+                    out.push(inner);
+                    replaced = true;
+                    break;
+                }
+            }
+            if !replaced {
+                return Err("manifest grammar literal is unterminated".into());
+            }
+            continue;
+        }
+        out.push(line);
+    }
+    if !replaced {
+        return Err(
+            "no grammar = ''' literal found under [parser]; edit the manifest TOML directly"
+                .into(),
+        );
+    }
+    let mut joined = out.join("\n");
+    if had_trailing_newline {
+        joined.push('\n');
+    }
+    Ok(joined)
+}
+
+/// Rewrite `[metadata] id = "…"` for duplicated packages; no-op when the
+/// line is absent (validation will surface the mismatch on parse).
+fn rewrite_metadata_id(manifest: &str, new_id: &str) -> String {
+    let mut out = Vec::new();
+    let mut in_metadata = false;
+    for line in manifest.lines() {
+        let t = line.trim();
+        if t.starts_with('[') {
+            in_metadata = t == "[metadata]";
+            out.push(line.to_string());
+            continue;
+        }
+        if in_metadata && t.starts_with("id") && t.contains('=') {
+            out.push(format!("id = \"{new_id}\""));
+            continue;
+        }
+        out.push(line.to_string());
+    }
+    let mut joined = out.join("\n");
+    if manifest.ends_with('\n') {
+        joined.push('\n');
+    }
+    joined
+}
+
+/// Package-id charset per data_loader::identity::validate_source_id:
+/// lowercase ASCII letters, digits, '.', '-', '_'.
+fn sanitize_id(raw: &str) -> String {
+    let mapped: String = raw
+        .chars()
+        .map(|c| {
+            if c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '.' | '-' | '_') {
+                c
+            } else if c.is_ascii_uppercase() {
+                c.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    let trimmed = mapped.trim_matches('-');
+    if trimmed.is_empty() {
+        "package".to_string()
+    } else {
+        trimmed.chars().take(128).collect()
+    }
+}
+
+/// Seed manifest for a new local package — the pest engine's line-graph
+/// example from crates/importer's pest tests.
+fn template_manifest(id: &str, name: &str) -> String {
+    format!(
+        r#"format_version = 3
+
+[metadata]
+id = "{id}"
+name = "{name}"
+version = "0.1.0"
+description = "Browser-edited importer package"
+
+[parser]
+engine = "pest"
+root_rule = "document"
+grammar = '''
+document = {{ SOI ~ (record ~ NEWLINE?)* ~ EOI }}
+record = _{{ node | edge }}
+node = {{ "N|" ~ node_id ~ "|" ~ title ~ "|" ~ kind ~ "|" ~ tags ~ "|" ~ properties }}
+node_id = @{{ field }}
+title = @{{ field }}
+kind = @{{ field }}
+tags = _{{ (tag ~ ("," ~ tag)*)? }}
+tag = @{{ atom }}
+properties = _{{ (property ~ (";" ~ property)*)? }}
+property = {{ key ~ "=" ~ value }}
+key = @{{ atom }}
+value = @{{ atom }}
+edge = {{ "E|" ~ source ~ "|" ~ target }}
+source = @{{ field }}
+target = @{{ field }}
+field = _{{ (!("|" | NEWLINE) ~ ANY)+ }}
+atom = _{{ (!("," | ";" | "=" | "|" | NEWLINE) ~ ANY)+ }}
+'''
+
+[parser.captures]
+node = "node"
+id = "node_id"
+title = "title"
+kind = "kind"
+tag = "tag"
+property = "property"
+key = "key"
+value = "value"
+edge = "edge"
+source = "source"
+target = "target"
+"#
+    )
+}
+
+/// The default sample input matching the template grammar.
+const TEMPLATE_SAMPLE: &str = "N|alpha|Alpha|note|docs|owner=ops\nN|beta|Beta|note||\nE|alpha|beta\n";
+
+/// ssh/grpc connectors execute inside graph-api (native); the browser can
+/// only preview pest grammars.
+fn is_native_kind(kind: &str) -> bool {
+    matches!(kind, "ssh" | "grpc")
+}
+
+// --- actions ---------------------------------------------------------------------
+
+fn set_manifest(text: String) {
+    let grammar = extract_grammar(&text);
+    *GRAMMAR_SPLICEABLE.write() = grammar.is_some();
+    *GRAMMAR.write() = grammar.unwrap_or_default();
+    if let Some(Selection::Local(id)) = SELECTION.peek().clone() {
+        PACKAGES.write().insert(id, text.clone());
+        persist_packages();
+    }
+    *MANIFEST.write() = text;
+}
+/// Manifest write from the grammar editor: the editor already displays the
+/// typed grammar, so GRAMMAR must not be re-extracted and written back —
+/// echoing keystrokes into the bound signal mid-edit corrupts the edit.
+fn set_manifest_from_grammar(text: String) {
+    if let Some(Selection::Local(id)) = SELECTION.peek().clone() {
+        PACKAGES.write().insert(id, text.clone());
+        persist_packages();
+    }
+    *MANIFEST.write() = text;
+}
+
+fn select(sel: Selection) {
+    match &sel {
+        Selection::Local(id) => {
+            let manifest = PACKAGES.peek().get(id).cloned().unwrap_or_default();
+            *SAMPLE.write() = LocalStorage::get(sample_key(id)).unwrap_or_default();
+            *SELECTION.write() = Some(sel);
+            set_manifest(manifest);
+        }
+        Selection::Catalog(_) => {
+            *SELECTION.write() = Some(sel);
+            *MANIFEST.write() = String::new();
+        }
+    }
+    *PREVIEW.write() = PreviewState::Idle;
+    *STATUS.write() = None;
+}
+
+fn unique_local_id(base: &str) -> String {
+    if !PACKAGES.peek().contains_key(base) {
+        return base.to_string();
+    }
+    let mut n = 2;
+    loop {
+        let candidate = format!("{base}-{n}");
+        if !PACKAGES.peek().contains_key(&candidate) {
+            return candidate;
+        }
+        n += 1;
+    }
+}
+
+fn new_package() {
+    let id = unique_local_id("custom.new-package");
+    let manifest = template_manifest(&id, "New package");
+    PACKAGES.write().insert(id.clone(), manifest);
+    persist_packages();
+    let _ = LocalStorage::set(sample_key(&id), TEMPLATE_SAMPLE);
+    select(Selection::Local(id));
+}
+
+fn duplicate_local(id: &str) {
+    let Some(source) = PACKAGES.peek().get(id).cloned() else {
+        return;
+    };
+    let new_id = unique_local_id(&format!("{id}-copy"));
+    PACKAGES
+        .write()
+        .insert(new_id.clone(), rewrite_metadata_id(&source, &new_id));
+    persist_packages();
+    select(Selection::Local(new_id));
+}
+
+fn duplicate_catalog(profile: &api::ImporterProfile) {
+    let id = unique_local_id(&format!("custom.{}", sanitize_id(&profile.id)));
+    let name = format!("{} (copy)", profile.display_name);
+    PACKAGES
+        .write()
+        .insert(id.clone(), template_manifest(&id, &name));
+    persist_packages();
+    let _ = LocalStorage::set(sample_key(&id), TEMPLATE_SAMPLE);
+    select(Selection::Local(id));
+}
+
+fn delete_local(id: &str) {
+    let confirmed = web_sys::window()
+        .and_then(|w| w.confirm_with_message(&format!("Delete local package '{id}'?")).ok())
+        .unwrap_or(false);
+    if !confirmed {
+        return;
+    }
+    PACKAGES.write().remove(id);
+    persist_packages();
+    let _ = LocalStorage::delete(sample_key(id));
+    if *SELECTION.peek() == Some(Selection::Local(id.to_string())) {
+        *SELECTION.write() = None;
+        *MANIFEST.write() = String::new();
+        *GRAMMAR.write() = String::new();
+        *PREVIEW.write() = PreviewState::Idle;
+    }
+}
+
+fn js_get(obj: &JsValue, key: &str) -> Option<JsValue> {
+    js_sys::Reflect::get(obj, &JsValue::from_str(key))
+        .ok()
+        .filter(|v| !v.is_undefined() && !v.is_null())
+}
+
+/// `navigator.clipboard.writeText(text)` via Reflect — fire-and-forget, same
+/// approach as the Instances panel's share-link copy.
+fn copy_to_clipboard(text: &str) {
+    let Some(win) = web_sys::window() else { return };
+    let win: &JsValue = win.as_ref();
+    let Some(clip) = js_get(win, "navigator").and_then(|n| js_get(&n, "clipboard")) else {
+        return;
+    };
+    if let Some(f) = js_get(&clip, "writeText").and_then(|f| f.dyn_into::<js_sys::Function>().ok())
+    {
+        let _ = f.call1(&clip, &JsValue::from_str(text));
+    }
+}
+
+// --- panel ------------------------------------------------------------------------
+
+pub fn panel(ctx: Ctx) -> Element {
+    // Kick the catalog fetch once. Pure-browser deployments (GitHub Pages,
+    // ?gh= deep links) have no /importers endpoint; skip the 404 and say so.
+    let browser_hosted =
+        crate::github::boot_spec().is_some() && !ctx.graph_session.read().is_server_backed();
+    if matches!(&*CATALOG.read(), CatalogState::Idle) {
+        spawn(async move {
+            if browser_hosted {
+                *CATALOG.write() =
+                    CatalogState::Unavailable("browser-hosted deployment (no graph-api)".into());
+                return;
+            }
+            *CATALOG.write() = CatalogState::Loading;
+            *CATALOG.write() = match api::importers().await {
+                Ok(catalog) => CatalogState::Ready(catalog),
+                Err(error) => CatalogState::Unavailable(error),
+            };
+        });
+    }
+
+    let selection = SELECTION.read().clone();
+    let packages = PACKAGES.read().clone();
+    let catalog = CATALOG.read().clone();
+    let viewing = VIEWING.read().clone();
+    let editor_view = *EDITOR_VIEW.read();
+    let preview = PREVIEW.read().clone();
+    let preview_running = *PREVIEW_RUNNING.read();
+    let status = STATUS.read().clone();
+    let spliceable = *GRAMMAR_SPLICEABLE.read();
+
+    let run_preview = move |_| {
+        if *PREVIEW_RUNNING.read() {
+            return;
+        }
+        let manifest = MANIFEST.peek().clone();
+        let input = SAMPLE.peek().clone();
+        *PREVIEW_RUNNING.write() = true;
+        *PREVIEW.write() = PreviewState::Idle;
+        *STATUS.write() = Some("parsing in the sandbox worker…".into());
+        spawn(async move {
+            match parse_in_worker(manifest, input).await {
+                Ok(p) => {
+                    *STATUS.write() = None;
+                    *PREVIEW.write() = PreviewState::Done(p);
+                }
+                Err(e) => {
+                    let timeout = e.contains("timed out");
+                    *STATUS.write() = None;
+                    *PREVIEW.write() = PreviewState::Failed {
+                        message: e,
+                        timeout,
+                    };
+                }
+            }
+            *PREVIEW_RUNNING.write() = false;
+        });
+    };
+
+    rsx! {
+        div { class: "importers-panel", "data-panel": "importers",
+            // ── left: package list ──────────────────────────────────────
+            div { class: "imp-list",
+                div { class: "imp-list-head",
+                    span { "Server catalog" }
+                    if matches!(catalog, CatalogState::Ready(_)) {
+                        button {
+                            class: "btn imp-mini",
+                            r#type: "button",
+                            "data-action": "refresh-catalog",
+                            onclick: move |_| {
+                                spawn(async move {
+                                    *CATALOG.write() = CatalogState::Loading;
+                                    *CATALOG.write() = match api::importers().await {
+                                        Ok(c) => CatalogState::Ready(c),
+                                        Err(e) => CatalogState::Unavailable(e),
+                                    };
+                                });
+                            },
+                            "↻"
+                        }
+                    }
+                }
+                div { class: "imp-rows", role: "listbox", aria_label: "Server catalog",
+                    match &catalog {
+                        CatalogState::Idle | CatalogState::Loading => rsx! {
+                            div { class: "imp-note", role: "status", "loading catalog…" }
+                        },
+                        CatalogState::Unavailable(reason) => rsx! {
+                            div { class: "imp-note", "data-field": "catalog-unavailable",
+                                "server catalog unavailable — {reason}"
+                            }
+                        },
+                        CatalogState::Ready(catalog) => rsx! {
+                            if catalog.sources.is_empty() {
+                                div { class: "imp-note", "catalog is empty" }
+                            }
+                            if !catalog.runtime_switch.enabled {
+                                div { class: "imp-note", "data-field": "switch-posture",
+                                    "runtime switching is disabled by this deployment; apply requires a rollout"
+                                }
+                            } else if !catalog.runtime_switch.allowed {
+                                div { class: "imp-note", "data-field": "switch-posture",
+                                    "viewing other sources requires authorization"
+                                }
+                            }
+                            for profile in &catalog.sources {
+                                {
+                                    let id = profile.id.clone();
+                                    let click_id = id.clone();
+                                    let selected = selection == Some(Selection::Catalog(id.clone()));
+                                    let native = is_native_kind(&profile.kind);
+                                    let is_viewing = viewing.as_deref() == Some(profile.id.as_str())
+                                        || (viewing.is_none() && profile.selected);
+                                    rsx! {
+                                        button {
+                                            key: "{id}",
+                                            class: if selected { "imp-row selected" } else { "imp-row" },
+                                            r#type: "button",
+                                            role: "option",
+                                            aria_selected: if selected { "true" } else { "false" },
+                                            "data-package-id": "{profile.id}",
+                                            "data-source": "server",
+                                            "data-kind": "{profile.kind}",
+                                            "data-native": if native { "true" } else { "false" },
+                                            "data-viewing": if is_viewing { "true" } else { "false" },
+                                            onclick: move |_| select(Selection::Catalog(click_id.clone())),
+                                            span { class: "imp-row-name", "{profile.display_name}" }
+                                            span { class: "imp-row-chips",
+                                                span { class: "imp-chip", "{profile.kind}" }
+                                                if native {
+                                                    span { class: "imp-chip native",
+                                                        title: "native-only connector: runs inside graph-api, not in the browser",
+                                                        "native"
+                                                    }
+                                                }
+                                                if is_viewing {
+                                                    span { class: "imp-chip viewing", "viewing" }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        },
+                    }
+                }
+                div { class: "imp-list-head",
+                    span { "Local packages" }
+                    button {
+                        class: "btn imp-mini",
+                        r#type: "button",
+                        "data-action": "new-package",
+                        onclick: move |_| new_package(),
+                        "+ New package"
+                    }
+                }
+                div { class: "imp-rows", role: "listbox", aria_label: "Local packages",
+                    if packages.is_empty() {
+                        div { class: "imp-note", "no local packages yet" }
+                    }
+                    for id in packages.keys() {
+                        {
+                            let id = id.clone();
+                            let click_id = id.clone();
+                            let selected = selection == Some(Selection::Local(id.clone()));
+                            rsx! {
+                                button {
+                                    key: "{id}",
+                                    class: if selected { "imp-row selected" } else { "imp-row" },
+                                    r#type: "button",
+                                    role: "option",
+                                    aria_selected: if selected { "true" } else { "false" },
+                                    "data-package-id": "{id}",
+                                    "data-source": "local",
+                                    onclick: move |_| select(Selection::Local(click_id.clone())),
+                                    span { class: "imp-row-name", "{id}" }
+                                    span { class: "imp-row-chips",
+                                        span { class: "imp-chip local", "local" }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // ── center: manifest / grammar editors ─────────────────────
+            div { class: "imp-editor",
+                {match &selection {
+                    None => rsx! {
+                        div { class: "imp-note imp-center-hint",
+                            "select a package to view or edit it"
+                        }
+                    },
+                    Some(Selection::Catalog(pid)) => {
+                        let profile = match &catalog {
+                            CatalogState::Ready(c) => {
+                                c.sources.iter().find(|p| &p.id == pid).cloned()
+                            }
+                            _ => None,
+                        };
+                        match profile {
+                            Some(profile) => {
+                                let switch = catalog_runtime_switch(&catalog);
+                                let is_default = profile.selected;
+                                let is_viewing = viewing.as_deref() == Some(profile.id.as_str())
+                                    || (viewing.is_none() && is_default);
+                                let native = is_native_kind(&profile.kind);
+                                let apply_allowed = switch
+                                    && (is_default || profile.runnable)
+                                    && !is_viewing;
+                                // Clearing the session's own selection is session-local
+                                // and needs no deployment authorization — always offer it
+                                // on the default profile while viewing elsewhere.
+                                let reset_offered = is_default && viewing.is_some() && !is_viewing;
+                                let apply_label = if is_default {
+                                    "Return to default"
+                                } else {
+                                    "Apply (view this source)"
+                                };
+                                let apply_id = profile.id.clone();
+                                rsx! {
+                                    div { class: "imp-summary",
+                                        div { class: "imp-summary-title", "{profile.display_name}" }
+                                        dl { class: "imp-facts",
+                                            div { class: "imp-fact",
+                                                dt { "package" }
+                                                dd { "data-field": "package-id", "{profile.id}" }
+                                            }
+                                            div { class: "imp-fact",
+                                                dt { "kind" }
+                                                dd { "data-field": "package-kind", "{profile.kind}" }
+                                            }
+                                            if !profile.description.is_empty() {
+                                                div { class: "imp-fact",
+                                                    dt { "description" }
+                                                    dd { "{profile.description}" }
+                                                }
+                                            }
+                                        }
+                                        if native {
+                                            div { class: "imp-note",
+                                                title: "native-only connector",
+                                                "native-only connector: ssh/grpc acquisition runs inside graph-api; the browser cannot preview it"
+                                            }
+                                        }
+                                        div { class: "imp-note",
+                                            "the manifest TOML lives deployment-side; duplicate this entry to edit a local copy"
+                                        }
+                                        div { class: "imp-actions",
+                                            button {
+                                                class: "btn",
+                                                r#type: "button",
+                                                "data-action": "duplicate",
+                                                onclick: move |_| duplicate_catalog(&profile),
+                                                "Duplicate to local"
+                                            }
+                                            if apply_allowed || reset_offered {
+                                                button {
+                                                    class: "btn",
+                                                    r#type: "button",
+                                                    "data-action": "apply",
+                                                    disabled: native && !ctx.graph_session.read().is_server_backed(),
+                                                    title: if native {
+                                                        "native-only connector: apply switches the server-hosted source; it cannot run in the browser"
+                                                    } else {
+                                                        "switch this browser session's graph view"
+                                                    },
+                                                    onclick: move |_| {
+                                                        if is_default {
+                                                            api::clear_source_id();
+                                                            VIEWING.write().take();
+                                                        } else {
+                                                            api::set_source_id(&apply_id);
+                                                            *VIEWING.write() = Some(apply_id.clone());
+                                                        }
+                                                        spawn(reload_graph(ctx));
+                                                    },
+                                                    "{apply_label}"
+                                                }
+                                            }
+                                            button {
+                                                class: "btn",
+                                                r#type: "button",
+                                                disabled: true,
+                                                title: "manifest lives deployment-side — duplicate to local first",
+                                                "Copy TOML"
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            None => rsx! {
+                                div { class: "imp-note", "catalog entry not loaded — refresh the catalog" }
+                            },
+                        }
+                    }
+                    Some(Selection::Local(pid)) => {
+                        let pid = pid.clone();
+                        let pid_dup = pid.clone();
+                        let pid_export = pid.clone();
+                        let pid_delete = pid.clone();
+                        let editor_key = pid.clone();
+                        rsx! {
+                            div { class: "imp-editor-tabs", role: "tablist",
+                                button {
+                                    class: if editor_view == EditorView::Manifest { "imp-tab active" } else { "imp-tab" },
+                                    r#type: "button",
+                                    role: "tab",
+                                    "data-view": "manifest",
+                                    aria_selected: if editor_view == EditorView::Manifest { "true" } else { "false" },
+                                    onclick: move |_| *EDITOR_VIEW.write() = EditorView::Manifest,
+                                    "Manifest (TOML)"
+                                }
+                                button {
+                                    class: if editor_view == EditorView::Grammar { "imp-tab active" } else { "imp-tab" },
+                                    r#type: "button",
+                                    role: "tab",
+                                    "data-view": "grammar",
+                                    aria_selected: if editor_view == EditorView::Grammar { "true" } else { "false" },
+                                    onclick: move |_| *EDITOR_VIEW.write() = EditorView::Grammar,
+                                    "Grammar (pest)"
+                                }
+                            }
+                            div { class: "imp-editor-host",
+                                match editor_view {
+                                    EditorView::Manifest => rsx! {
+                                        // One-way binding: the editor is the only writer while
+                                        // mounted; cross-view sync happens via remount (key) so
+                                        // no signal write can reenter the editor's on_change.
+                                        MonacoEditor {
+                                            key: "{editor_key}",
+                                            initial: MANIFEST.peek().clone(),
+                                            language: "toml".to_string(),
+                                            theme: Some(PANEL_KIT_DARK_THEME.to_string()),
+                                            on_change: move |text: String| set_manifest(text),
+                                        }
+                                    },
+                                    EditorView::Grammar => rsx! {
+                                        if spliceable {
+                                            MonacoEditor {
+                                                key: "{editor_key}",
+                                                initial: GRAMMAR.peek().clone(),
+                                                language: "pest".to_string(),
+                                                theme: Some(PANEL_KIT_DARK_THEME.to_string()),
+                                                on_change: move |text: String| {
+                                                    // The peek guard must drop before the arms
+                                                    // write MANIFEST — a scrutinee temporary
+                                                    // lives for the whole match.
+                                                    let current = MANIFEST.peek().clone();
+                                                    match splice_grammar(&current, &text) {
+                                                        Ok(manifest) => set_manifest_from_grammar(manifest),
+                                                        Err(e) => *STATUS.write() = Some(e),
+                                                    }
+                                                },
+                                            }
+                                        } else {
+                                            div { class: "imp-note", "data-field": "grammar-readonly",
+                                                "no spliceable grammar = ''' literal under [parser] — edit the manifest TOML directly (json-engine packages have no pest grammar)"
+                                            }
+                                        }
+                                    },
+                                }
+                            }
+                            div { class: "imp-actions",
+                                button {
+                                    class: "btn",
+                                    r#type: "button",
+                                    "data-action": "duplicate",
+                                    onclick: move |_| duplicate_local(&pid_dup),
+                                    "Duplicate"
+                                }
+                                button {
+                                    class: "btn",
+                                    r#type: "button",
+                                    "data-action": "copy-toml",
+                                    onclick: move |_| {
+                                        copy_to_clipboard(&MANIFEST.peek());
+                                        *STATUS.write() = Some("manifest copied to clipboard".into());
+                                    },
+                                    "Copy TOML"
+                                }
+                                button {
+                                    class: "btn",
+                                    r#type: "button",
+                                    "data-action": "export",
+                                    onclick: move |_| {
+                                        if let Err(e) = super::instances::download_text(
+                                            &format!("{pid_export}.toml"),
+                                            "application/toml",
+                                            &MANIFEST.peek(),
+                                        ) {
+                                            *STATUS.write() = Some(format!("export: {e}"));
+                                        }
+                                    },
+                                    "Export"
+                                }
+                                button {
+                                    class: "btn imp-danger",
+                                    r#type: "button",
+                                    "data-action": "delete",
+                                    onclick: move |_| delete_local(&pid_delete),
+                                    "Delete"
+                                }
+                                button {
+                                    class: "btn",
+                                    r#type: "button",
+                                    "data-action": "apply",
+                                    title: "preview only in browser mode",
+                                    onclick: run_preview,
+                                    "Apply"
+                                }
+                            }
+                        }
+                    }
+                }}
+            }
+
+            // ── bottom: parse preview ──────────────────────────────────
+            div { class: "imp-preview",
+                {match &selection {
+                    Some(Selection::Local(_)) => rsx! {
+                        div { class: "imp-preview-input",
+                            textarea {
+                                class: "imp-sample",
+                                "data-field": "sample-input",
+                                placeholder: "sample input for the selected package…",
+                                value: "{SAMPLE}",
+                                oninput: move |e| {
+                                    let v = e.value();
+                                    if let Some(Selection::Local(id)) = SELECTION.peek().clone() {
+                                        let _ = LocalStorage::set(sample_key(&id), &v);
+                                    }
+                                    *SAMPLE.write() = v;
+                                },
+                            }
+                        }
+                        div { class: "imp-preview-run",
+                            button {
+                                class: "btn",
+                                r#type: "button",
+                                "data-action": "parse-preview",
+                                disabled: preview_running || MANIFEST.read().trim().is_empty(),
+                                onclick: run_preview,
+                                if preview_running { "Parsing…" } else { "Parse preview" }
+                            }
+                            if let Some(status) = &status {
+                                div { class: "imp-status", "data-field": "preview-status", "{status}" }
+                            }
+                            match &preview {
+                                PreviewState::Idle => rsx! {},
+                                PreviewState::Done(p) => rsx! {
+                                    div { class: "imp-preview-result", "data-outcome": "ok",
+                                        span { class: "imp-counts",
+                                            strong { "data-field": "preview-nodes", "{p.nodes}" }
+                                            " nodes · "
+                                            strong { "data-field": "preview-edges", "{p.edges}" }
+                                            " edges"
+                                        }
+                                        if !p.unresolved.is_empty() {
+                                            div { class: "imp-unresolved",
+                                                span { class: "imp-counts", "unresolved:" }
+                                                for id in &p.unresolved {
+                                                    code { key: "{id}", class: "imp-unresolved-id", "{id}" }
+                                                }
+                                            }
+                                        }
+                                        if !p.sample_ids.is_empty() {
+                                            div { class: "imp-samples",
+                                                span { class: "imp-counts", "sample ids:" }
+                                                for id in &p.sample_ids {
+                                                    code { key: "{id}", class: "imp-sample-id", "{id}" }
+                                                }
+                                            }
+                                        }
+                                    }
+                                },
+                                PreviewState::Failed { message, timeout } => rsx! {
+                                    div {
+                                        class: if *timeout { "imp-preview-error timeout" } else { "imp-preview-error" },
+                                        role: "alert",
+                                        "data-outcome": if *timeout { "timeout" } else { "error" },
+                                        "data-field": "preview-error",
+                                        "{message}"
+                                        if *timeout {
+                                            div { class: "imp-note",
+                                                "the grammar hit the worker CPU limit and the worker was killed — the UI thread never blocked"
+                                            }
+                                        }
+                                    }
+                                },
+                            }
+                        }
+                    },
+                    Some(Selection::Catalog(_)) => rsx! {
+                        div { class: "imp-note",
+                            "duplicate this catalog entry to a local package to run parse previews"
+                        }
+                    },
+                    None => rsx! {
+                        div { class: "imp-note", "preview runs against the selected local package" }
+                    },
+                }}
+            }
+        }
+    }
+}
+
+/// Whether the catalog's runtime switch posture allows session-scoped source
+/// selection (mirrors the retired Settings → Importers gating).
+fn catalog_runtime_switch(catalog: &CatalogState) -> bool {
+    match catalog {
+        CatalogState::Ready(c) => c.runtime_switch.enabled && c.runtime_switch.allowed,
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn template_extract_splice_roundtrip() {
+        let manifest = template_manifest("custom.demo", "Demo");
+        let grammar = extract_grammar(&manifest).expect("template grammar is spliceable");
+        assert!(grammar.contains("document = { SOI"));
+        let edited = grammar.replacen("document", "top", 1);
+        let spliced = splice_grammar(&manifest, &edited).expect("splice succeeds");
+        assert_eq!(extract_grammar(&spliced).as_deref(), Some(edited.as_str()));
+        assert!(spliced.contains("root_rule = \"document\""));
+        assert!(spliced.contains("[parser.captures]"));
+        assert_eq!(spliced.ends_with('\n'), manifest.ends_with('\n'));
+    }
+
+    #[test]
+    fn splice_rejects_terminator_line_and_missing_grammar() {
+        let manifest = template_manifest("custom.demo", "Demo");
+        assert!(splice_grammar(&manifest, "a = { '''\n").is_err());
+        assert!(splice_grammar("[parser]\nengine = \"json\"\n", "x").is_err());
+        assert!(extract_grammar("[parser]\nengine = \"json\"\n").is_none());
+    }
+
+    #[test]
+    fn rewrite_metadata_id_scoped_to_metadata_table() {
+        let manifest = template_manifest("custom.demo", "Demo");
+        let rewritten = rewrite_metadata_id(&manifest, "custom.copy");
+        assert!(rewritten.contains("[metadata]\nid = \"custom.copy\""));
+        // [parser.captures] id binding stays untouched.
+        assert!(rewritten.contains("id = \"node_id\""));
+    }
+
+    #[test]
+    fn sanitize_id_matches_source_id_charset() {
+        assert_eq!(sanitize_id("Lavender Ingest/OKF"), "lavender-ingest-okf");
+        assert_eq!(sanitize_id("---"), "package");
+    }
+}

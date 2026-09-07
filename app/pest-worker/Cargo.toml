@@ -1,0 +1,42 @@
+[package]
+name = "pest-worker"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Web Worker host: runs importer pest-engine preview parses off the webview main thread."
+
+# Binary only — trunk builds this with `data-type="worker"` into a standalone
+# worker bundle (`pest-worker.js` + `pest-worker_bg.wasm`). It is NOT part of
+# the app's wasm module; app/ui spawns it as a `web_sys::Worker`.
+[[bin]]
+name = "pest-worker"
+path = "src/main.rs"
+
+[features]
+default = []
+# Mirrors tvix-worker's gate so a plain `cargo check` (native) doesn't try to
+# pull the wasm-only entry point. The trunk build passes `--cargo-features
+# wasm` (see app/ui/index.html's worker link). Nothing to forward: importer's
+# core is already wasm-clean with default-features = false.
+wasm = []
+
+[dependencies]
+# The only real dependency: the unified importer engine. default-features =
+# false drops the `native` feature (filesystem loading, reqwest) — what
+# remains is the wasm-clean core: manifest validation and pest-engine
+# parse_input on caller-supplied bytes.
+importer   = { path = "../../crates/importer", default-features = false }
+serde      = { workspace = true }
+serde_json = { workspace = true }
+
+# The wasm glue is wasm32-only so a native `cargo check --workspace` doesn't
+# compile web-sys/js-sys/wasm-bindgen for a bin whose only native body is an
+# empty `main`. The `wasm` feature gates the actual worker entry point.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen = { workspace = true }
+js-sys       = "0.3"
+console_error_panic_hook = "0.1"
+web-sys = { workspace = true, features = [
+  "DedicatedWorkerGlobalScope",
+  "MessageEvent",
+] }

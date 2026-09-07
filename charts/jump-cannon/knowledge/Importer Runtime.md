@@ -42,6 +42,15 @@ parameters such as a charset. Compatibility loaders that read inputs directly
 remain responsible for honoring their own declared format until they move onto
 the connector record boundary.
 
+Generic byte acquisition lives in `crates/importer-connectors`: `https`
+(reqwest natively, gloo-net in the browser), `ssh` and `grpc` (native only;
+the gRPC connector invokes unary and server-streaming methods dynamically
+from a descriptor set or server reflection), plus pure-Rust `envelope`
+expansion of tar/tar.gz/zip/gzip payloads into one record per entry. Each
+connector declares its exact capability scope and enforces byte, entry, and
+message bounds at acquisition. Tokens and key paths are runtime
+configuration — never package fields — and are redacted from `Debug`.
+
 graph-api builds the in-memory search index and filter facets from those
 validated documents. The graph, schema, search index, facets, metrics, and
 binary caches share one atomic snapshot revision, so a failed rebuild leaves
@@ -64,9 +73,12 @@ DOM storage API), rides as the `x-jump-cannon-source` request header, and as
 The default markdown loader resolves wikilinks and is currently the only
 importer that advertises readable and writable source content. Kubernetes
 queries are explicit, bounded, metadata-only, and namespace-scoped by default.
-OKF loads a filesystem bundle under a stable source identity. Pest manifest
-format 2 requires package authors to declare every property that can enter
-search or facets. GitHub reads a polled repository tarball and produces the
+OKF loads a filesystem bundle under a stable source identity. Importer package
+format 3 wraps both runtime engines (`crates/importer`): a shared
+`[metadata]`/`[limits]`/`[schema.fields]` envelope plus `[parser] engine =
+"pest"` (inline grammar + capture map) or `"json"` (endpoints + projection).
+Package authors must declare every property that can enter search or facets.
+GitHub reads a polled repository tarball and produces the
 same node IDs as Obsidian mode for the same corpus. The httpjson engine
 binds an instance to one HTTP/JSON API per `JUMP_CANNON_IMPORTER_*` env
 var and reads one selected Hindsight memory bank read-only; bounds and

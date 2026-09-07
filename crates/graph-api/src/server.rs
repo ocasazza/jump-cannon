@@ -1248,7 +1248,17 @@ async fn index(State(host): State<SourceHost>) -> impl IntoResponse {
 }
 
 async fn asset(State(host): State<SourceHost>, Path(path): Path<String>) -> impl IntoResponse {
-    asset_response(host.default_state(), &path)
+    // Nested asset directories (e.g. the vendored Monaco bundle at
+    // assets/vendor/) serve literally; bare names keep the legacy
+    // egui-prefix convention of resolving at the dist root.
+    let s = host.default_state();
+    if let Some(dir) = &s.inner.assets_dir {
+        let nested = dir.join("assets").join(&path);
+        if nested.is_file() {
+            return asset_response(s, &format!("assets/{path}"));
+        }
+    }
+    asset_response(s, &path)
 }
 
 // --- App-state config presets -------------------------------------------------

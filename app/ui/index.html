@@ -17,6 +17,15 @@
          `filehash=false` so the app can spawn the stable URL `/tvix-worker.js`
          (see ui/src/worker.rs / the Generate panel's LocalWorker executor). -->
     <link data-trunk rel="rust" href="../tvix-worker/Cargo.toml" data-bin="tvix-worker" data-type="worker" data-cargo-features="wasm" />
+    <!-- Importers panel live preview: the pest-worker bundle validates a
+         package manifest and preview-parses a sample input in a killable
+         worker thread (pest_vm has no fuel counter). Built into the same
+         dist/ as `pest-worker.js` + `pest-worker_bg.wasm`; `filehash=false`
+         keeps the spawn URL stable (see ui/src/pest_worker.rs). -->
+    <link data-trunk rel="rust" href="../pest-worker/Cargo.toml" data-bin="pest-worker" data-type="worker" data-cargo-features="wasm" />
+    <!-- panel-kit's vendored Monaco editor assets, copied verbatim into dist
+         so the Importers panel's MonacoEditor can load its workers. -->
+    <link data-trunk rel="copy-dir" href="assets/vendor" data-target-path="assets/vendor" />
   </head>
   <body>
     <!-- Dioxus requires an empty mount element. The static boot shell must be

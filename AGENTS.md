@@ -26,10 +26,10 @@ The test harness in `crates/test-browser/` is the only exception, and only becau
 | `crates/tvix-loader` | tvix and direct-Rust generated graph importers; both emit the same canonical identity/tag/type discovery fields. |
 | `crates/okf-importer` | Bounded filesystem importer for the official Open Knowledge Format v0.2 schema, including typed status, trust, attestation, provenance, and relationship discovery. |
 | `crates/kubernetes-importer` | Capability-scoped, allowlisted Kubernetes metadata importer with owner-reference edges and namespace/API/label facets. |
-| `crates/pest-importer` | Trusted runtime grammar importer. Manifest format 2 requires package authors to declare the property fields admitted to search and facets. |
 | `crates/github-importer` | GitHub tarball importer. Polls codeload with ETag revalidation, extracts into a local cache, and reuses vault-links Obsidian parsing so the knowledge corpus updates push-to-main without a chart republish. |
-| `crates/http-json-importer` | Declarative HTTP/JSON importer engine. Reads paged JSON APIs and projects their documents into the canonical graph via a versioned TOML package (`ValidatedPackage`); the package is mechanism, the bank/tenant/URL is instance configuration bound at runtime. One engine serves every JSON API: there are N packages (`hindsight-memory-bank.toml`, …) and one `SourceKind::HttpJson`. Importer package format and `serde(deny_unknown_fields)` validation live in `crates/http-json-importer/src/manifest.rs`; `connect`/`paginate`/`validate_template`/`validate_pointer` enforce that every `{placeholder}` names a declared variable and every JSON pointer starts with `/`. |
+| `crates/importer` | Unified runtime importer engine. One versioned TOML package format (`format_version = 3`): a shared `[metadata]`/`[limits]`/`[schema.fields]` envelope plus `[parser] engine = "pest"` (inline grammar + capture map, trusted administrator-installed packages) or `[parser] engine = "json"` (paged JSON endpoints + projection). The package is mechanism; the path/bank/tenant/URL is instance configuration bound at runtime. One engine serves every JSON API: there are N packages (`hindsight-memory-bank.toml`, …) and one `SourceKind::HttpJson`. `serde(deny_unknown_fields)` validation rejects unknown envelope and engine keys; `validate_template`/`validate_pointer` enforce that every `{placeholder}` names a declared variable and every JSON pointer starts with `/`. The core (validation, `parse_input`, JSON decode/map) builds on wasm32 with `--no-default-features`; the `native` feature gates filesystem loading and the reqwest transport. |
 | `crates/tvix-wasm` | `tvix-eval` bridge — native + WASM Nix expression evaluator. Enables Nix expressions in the UI/data pipeline without shelling out. |
+| `crates/importer-connectors` | Generic byte-source connectors feeding `crates/importer` grammar packages: `https` (reqwest native / gloo-net wasm, runtime bearer token), `envelope` (pure-Rust tar/tar.gz/zip/gzip expansion, wasm-clean), `ssh` (native; agent or key-file auth, optional known_hosts pinning), `grpc` (native; tonic + prost-reflect dynamic unary/server-streaming invocation from a descriptor set or server reflection). Each is a `SourceConnector` declaring exact capabilities; credentials are runtime config, never package fields. |
 | `crates/test-browser` | Rust-only Chromium driver (chromiumoxide) for the foundational browser regression suite. Spawned by `just test browser-rust` / `nix run .#test-browser-rust`. |
 
 ## Importers: packages, not crates
@@ -45,8 +45,8 @@ Read the crate map above correctly: every importer crate in it is a
 | `okf-importer` | one published interchange format (OKF v0.2) |
 | `kubernetes-importer` | the Kubernetes dynamic-API transport |
 | `github-importer` | the polled-tarball-over-HTTP transport |
-| `pest-importer` | the runtime grammar-package engine |
-| `http-json-importer` | paged JSON over HTTP, declared as a versioned TOML package |
+| `importer` | the runtime package engines: pest grammars and paged JSON over HTTP, both declared as versioned TOML packages |
+| `importer-connectors` | byte acquisition transports — HTTPS, SSH, gRPC — plus tar/tar.gz/zip/gzip envelope expansion, all behind `SourceConnector` |
 
 A *source* — this repository, that cluster, this API tenant, that memory bank —
 is configuration bound to those mechanisms at runtime. It is not new compiled
@@ -56,12 +56,11 @@ code, and it does not get a crate.
 only component permitted to perform I/O), `Decoder` (pure wire format),
 `GraphMapper` (pure projection into the graph IR), composed by
 `ImportPipeline`, with `Transport` already naming filesystem, http, kubernetes,
-grpc, udp, in-memory, and wasm_component. `crates/pest-importer` is the
+grpc, udp, in-memory, wasm_component, and ssh. `crates/importer` is the
 reference for the package model: one versioned TOML manifest carries metadata,
 parse rules, declared discovery fields, and limits, and **deliberately carries
 no data-source binding** — an administrator binds a validated package to an
-input at runtime, and its module docs call out HTTP/Kubernetes/protobuf/
-streaming adapters feeding the same package format.
+input at runtime.
 
 Before adding an importer, name what is actually new:
 
@@ -86,7 +85,7 @@ let alone the hundredth.
 | Crate | Role |
 |---|---|
 | [`panel-kit`](https://github.com/ocasazza/panel-kit) (external) | **Generic, app-agnostic** panel-workspace library: floating/tiling panels, macOS traffic lights, drag/resize, tiling drag-reorder, minimize-to-dock, localStorage layout persistence, base CSS theme (`panel_kit::CSS`). Lives in its own repo and is consumed as a git dependency by both this app and snake-pit, so the two share one component/styling library. Apps implement `panel_kit::PanelKind` on an enum and call `use_workspace` + `ws.render(body_fn)`. Local development: `[patch."https://github.com/ocasazza/panel-kit"]` in `app/Cargo.toml`. |
-| `app/ui` | jump-cannon's Dioxus 0.6 frontend (trunk-built WASM, port 8081; `app/Trunk.toml` at the workspace root drives both dev and nix builds). Panels: Graph (wgpu canvas), Nodes, Inspector, Document (editor → `PUT /vault/page`), Progress (polls `/progress`), Settings, Help, plus the tray-parity panels (Layout, Style, Camera, Filter, Metrics, Instances, Generate, Timeline, Debug). Talks to graph-api with three wire formats: JSON, protobuf, and raw LE f32/u32 buffers. The prost types are **checked in** (`app/ui/src/proto/`, regen via `just app-proto`). |
+| `app/ui` | jump-cannon's Dioxus 0.6 frontend (trunk-built WASM, port 8081; `app/Trunk.toml` at the workspace root drives both dev and nix builds). Panels: Graph (wgpu canvas), Nodes, Inspector, Document (editor → `PUT /vault/page`), Progress (polls `/progress`), Settings, Help, Importers (runtime importer package workbench: catalog browse + browser-local packages, Monaco TOML/pest editing, sandboxed pest-worker parse preview), plus the tray-parity panels (Layout, Style, Camera, Filter, Metrics, Instances, Generate, Timeline, Debug). Talks to graph-api with three wire formats: JSON, protobuf, and raw LE f32/u32 buffers. The prost types are **checked in** (`app/ui/src/proto/`, regen via `just app-proto`). |
 | `app/src-tauri` | Tauri v2 shell. Pure webview container — **no IPC commands**; the frontend reaches graph-api over HTTP (`tauri-plugin-http` allows LAN/Tailscale hosts). Lib+main split for iOS/Android entrypoints. |
 
 Workflow: `just dev-up` (backend) + `just app-dev` (desktop app, hot-reload). `just app-check` type-checks both targets; `just app-build` makes release bundles. Default server URL is `http://127.0.0.1:8765` (the compose port), changeable in the Settings panel and persisted to localStorage.

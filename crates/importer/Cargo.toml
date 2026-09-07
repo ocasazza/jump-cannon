@@ -1,0 +1,32 @@
+[package]
+name = "importer"
+version = "1.0.0"
+edition = "2021"
+description = "Unified runtime importer engine: format_version 3 packages select a pest or json engine under one shared envelope"
+
+[features]
+default = ["native"]
+# Native-only effects: filesystem package binding and the reqwest HTTP
+# transport. The package core (manifest validation, pest_vm parsing, JSON
+# decode/mapping over caller-supplied bytes) builds on wasm32-unknown-unknown
+# with --no-default-features.
+native = ["dep:reqwest"]
+
+[dependencies]
+data-loader = { path = "../data-loader" }
+vault-data  = { path = "../vault-data" }
+pest        = "=2.8.8"
+pest_meta   = "=2.8.8"
+pest_vm     = "=2.8.8"
+semver      = "1"
+serde       = { workspace = true }
+serde_json  = { workspace = true }
+thiserror   = "2"
+toml        = "0.8"
+tracing     = "0.1"
+reqwest     = { version = "0.12", default-features = false, features = ["rustls-tls"], optional = true }
+
+[dev-dependencies]
+tempfile    = "3"
+tokio       = { workspace = true }
+parking_lot = "0.12"

@@ -19,7 +19,18 @@ Importer access is explicit and least-privilege. Network exposure is
 environment-owned through [[Service Access]]. GPU work is admitted through
 [[Kueue Scheduling]]. Review these boundaries in [[Helm Deployment]].
 
-`GET /importers` and **Settings > Importers** expose only sanitized deployment
+Importer packages (`charts/jump-cannon/packages/`, format 3) never carry
+credentials. Tokens are injected at bind time — a user-created Secret rendered
+into `JUMP_CANNON_IMPORTER_TOKEN` / `JUMP_CANNON_GITHUB_TOKEN` via
+`secretKeyRef`, or the catalog profile's `tokenEnv` — and are redacted from
+log lines, error messages, and capability scopes. The forward direction is
+secret-store indirection without a format change: today the chart resolves a
+cluster Secret into an environment variable; tomorrow a package may declare a
+`secret_ref` name and the host resolves that reference against its secret
+store at bind time, so connector packages gain managed-secret support without
+another package-format migration.
+
+`GET /importers` and the **Importers** panel expose only sanitized deployment
 metadata. They never expose credentials. Filesystem source instances declare
 the exact claim, mount, input path, and read-only state. The Lavender OKF
 profile may read only the shared OKF repository claim; it must never mount
@@ -29,7 +40,7 @@ the private key lives only in a user-created Secret (mounted mode `0400`,
 never in values), so the sync job can pull but never push.
 
 When `importers.runtimeSwitchGroup` is set, a viewer may select any runnable
-catalog source at runtime from **Settings > Importers** instead of waiting for
+catalog source at runtime from the **Importers** panel instead of waiting for
 a Helm rollout. graph-api gates the switch on the proxy-injected
 `x-netbird-groups` header containing the configured group, and every
 configured filesystem source is already mounted read-only in the pod. Writes,

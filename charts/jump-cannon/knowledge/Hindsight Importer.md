@@ -11,8 +11,8 @@ tags: [jump-cannon, importer, http-json, hindsight, memory]
 Hindsight consolidates agent and fleet observations into durable facts. The
 [`hindsight-memory-bank.toml`](../../packages/hindsight-memory-bank.toml)
 **package** bound to an instance turns one Hindsight memory bank into a
-graph; the engine is the shared
-[`http-json-importer`](https://github.com/ocasazza/jump-cannon/tree/main/crates/http-json-importer)
+graph; the engine is the json engine of the shared
+[`importer`](https://github.com/ocasazza/jump-cannon/tree/main/crates/importer)
 crate, not a Hindsight-specific one. There is no `Hindsight` source kind:
 the kind is `httpjson` and Hindsight is the package that maps its endpoints
 (see [[Importer Runtime]] and AGENTS.md "Importers: packages, not crates").
@@ -93,7 +93,7 @@ no document, are reported as unresolved rather than dropped silently.
 | bearer token | unset (no Authorization header) | `--importer-token` (redacted from every log line, capability scope, and error message) |
 | source id | the package id (`hindsight.memory-bank`) | `--importer-source-id` |
 
-`limits.max_records = 50000` (with `request_timeout_seconds = 120`) is a
+`limits.nodes = 50000` (with `parser.request_timeout_seconds = 120`) is a
 hard bound, not a truncation: a bank that exceeds it fails the import
 loudly so nobody explores a silently partial memory. Content stays
 read-only (no `/vault/page` editor path): Hindsight owns consolidation,

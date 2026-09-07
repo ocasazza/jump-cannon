@@ -25,3 +25,4 @@ pub mod history;
 pub mod merge;
 pub mod worlds;
 pub mod github;
+pub mod importers;

@@ -5,101 +5,21 @@ use std::collections::BTreeMap;
 use data_loader::{identity::Namespace, DecodedRecord, GraphMapper, LoadResult};
 use serde_json::{json, Value};
 
-use crate::manifest::{ValidatedPackage, SOURCE_KIND};
-use crate::mapper::ManifestMapper;
-use crate::RECORD_COLLECTION_KEY;
+use super::ManifestMapper;
+use crate::json::config::SOURCE_KIND;
+use crate::json::RECORD_COLLECTION_KEY;
+use crate::ValidatedPackage;
 
 /// A package covering every rule the engine supports: two node collections
 /// joined by title, one joined by id, and an API-provided link list.
 const PACKAGE: &str = r#"
-format_version = 1
+format_version = 3
 
 [metadata]
 id = "test.shape"
 name = "Test shape"
 version = "1.0.0"
 
-[[variables]]
-name = "bank"
-default = "omp"
-
-[[collections]]
-name = "memories"
-path = "/v1/banks/{bank}/memories"
-paginate = { style = "limit_offset" }
-
-[collections.nodes]
-id_pointer = "/id"
-node_type = "memory"
-tags_pointer = "/tags"
-skip_unless = { pointer = "/state", equals = "valid", missing_matches = true }
-
-[collections.nodes.title]
-pointer = "/text"
-max_chars = 20
-fallback_prefix = "memory"
-
-[[collections.nodes.fields]]
-key = "body"
-pointer = "/text"
-
-[[collections.nodes.fields]]
-key = "entities"
-pointer = "/entities"
-transform = "split_csv"
-
-[[collections.nodes.edges]]
-kind = "mentions"
-value_pointer = "/entities"
-transform = "split_csv"
-target_collection = "entities"
-match_on = "title"
-
-[[collections.nodes.edges]]
-kind = "documented_in"
-value_pointer = "/document_id"
-target_collection = "documents"
-match_on = "id"
-
-[[collections]]
-name = "entities"
-path = "/v1/banks/{bank}/entities"
-
-[collections.nodes]
-id_pointer = "/id"
-local_prefix = "entity:"
-node_type = "entity"
-
-[collections.nodes.title]
-pointer = "/canonical_name"
-fallback_prefix = "entity"
-
-[[collections]]
-name = "documents"
-path = "/v1/banks/{bank}/documents"
-
-[collections.nodes]
-id_pointer = "/id"
-local_prefix = "document:"
-node_type = "document"
-
-[collections.nodes.title]
-pointer = "/name"
-fallback_prefix = "document"
-
-[[collections]]
-name = "links"
-path = "/v1/banks/{bank}/graph"
-items_pointer = "/edges"
-
-[collections.edges]
-source_pointer = "/data/source"
-target_pointer = "/data/target"
-kind_pointer = "/data/linkType"
-include_kinds = ["temporal", "semantic", "caused_by"]
-endpoints_collection = "memories"
-
-[schema]
 [[schema.fields]]
 key = "body"
 field_type = "text"
@@ -136,6 +56,89 @@ directed = true
 [[schema.edge_types]]
 key = "documented_in"
 directed = true
+
+[parser]
+engine = "json"
+
+[[parser.variables]]
+name = "bank"
+default = "omp"
+
+[[parser.collections]]
+name = "memories"
+path = "/v1/banks/{bank}/memories"
+paginate = { style = "limit_offset" }
+
+[parser.collections.nodes]
+id_pointer = "/id"
+node_type = "memory"
+tags_pointer = "/tags"
+skip_unless = { pointer = "/state", equals = "valid", missing_matches = true }
+
+[parser.collections.nodes.title]
+pointer = "/text"
+max_chars = 20
+fallback_prefix = "memory"
+
+[[parser.collections.nodes.fields]]
+key = "body"
+pointer = "/text"
+
+[[parser.collections.nodes.fields]]
+key = "entities"
+pointer = "/entities"
+transform = "split_csv"
+
+[[parser.collections.nodes.edges]]
+kind = "mentions"
+value_pointer = "/entities"
+transform = "split_csv"
+target_collection = "entities"
+match_on = "title"
+
+[[parser.collections.nodes.edges]]
+kind = "documented_in"
+value_pointer = "/document_id"
+target_collection = "documents"
+match_on = "id"
+
+[[parser.collections]]
+name = "entities"
+path = "/v1/banks/{bank}/entities"
+
+[parser.collections.nodes]
+id_pointer = "/id"
+local_prefix = "entity:"
+node_type = "entity"
+
+[parser.collections.nodes.title]
+pointer = "/canonical_name"
+fallback_prefix = "entity"
+
+[[parser.collections]]
+name = "documents"
+path = "/v1/banks/{bank}/documents"
+
+[parser.collections.nodes]
+id_pointer = "/id"
+local_prefix = "document:"
+node_type = "document"
+
+[parser.collections.nodes.title]
+pointer = "/name"
+fallback_prefix = "document"
+
+[[parser.collections]]
+name = "links"
+path = "/v1/banks/{bank}/graph"
+items_pointer = "/edges"
+
+[parser.collections.edges]
+source_pointer = "/data/source"
+target_pointer = "/data/target"
+kind_pointer = "/data/linkType"
+include_kinds = ["temporal", "semantic", "caused_by"]
+endpoints_collection = "memories"
 "#;
 
 fn package() -> ValidatedPackage {

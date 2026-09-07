@@ -480,12 +480,12 @@ async fn build_alternate(
                     )
                 })?
                 .len() as usize;
-            if manifest_len > http_json_importer::manifest::HARD_LIMITS.manifest_bytes {
+            if manifest_len > importer::HARD_LIMITS.manifest_bytes {
                 return Err(format!(
                     "httpjson source {source_id:?} package {} is {} bytes; hard limit is {} bytes",
                     manifest_path.display(),
                     manifest_len,
-                    http_json_importer::manifest::HARD_LIMITS.manifest_bytes
+                    importer::HARD_LIMITS.manifest_bytes
                 ));
             }
             let raw = std::fs::read(&manifest_path).map_err(|error| {
@@ -494,7 +494,7 @@ async fn build_alternate(
                     manifest_path.display()
                 )
             })?;
-            let package = http_json_importer::ValidatedPackage::from_toml_bytes(&raw)
+            let package = importer::ValidatedPackage::from_toml_bytes(&raw)
                 .map_err(|error| {
                     format!(
                         "httpjson source {source_id:?}: invalid package {}: {error}",
@@ -509,7 +509,7 @@ async fn build_alternate(
                 .token_env
                 .as_deref()
                 .and_then(|name| std::env::var(name).ok());
-            let instance = http_json_importer::InstanceConfig {
+            let instance = importer::InstanceConfig {
                 source_id: source_id_value,
                 base_url: http_json.endpoint.clone(),
                 variables: http_json.variables.clone(),
@@ -522,7 +522,7 @@ async fn build_alternate(
             // for a remote source; no capability here joins onto it.
             let root = PathBuf::new();
             let importer: Box<dyn data_loader::Importer> = Box::new(
-                http_json_importer::build_importer(package, instance)
+                importer::build_importer(package, instance)
                     .map_err(|error| error.to_string())?,
             );
             let grants: std::collections::HashSet<data_loader::Capability> =

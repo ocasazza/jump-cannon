@@ -30,8 +30,9 @@ pane. When the wrapper owns the temporary vault, those fixtures are mandatory
 rather than silently falling back to a weaker generic check. The structured
 result is recorded under `nodes_editor` in `report.json`.
 
-The same run maximizes unified Settings and verifies the Connection, Importers,
-Layout, Appearance, and Camera tabs in order. Each tab must have one selected
+The same run maximizes unified Settings and verifies the Connection,
+Layout, Appearance, and Camera tabs in order (Importers moved to its own
+panel). Each tab must have one selected
 ARIA tab, a matching tabpanel with real delegated content, and an unobscured
 pointer target; the retired standalone configuration panels must be absent.
 The importer fixture proves that the active source is identified, the Lavender

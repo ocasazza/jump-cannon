@@ -15,11 +15,12 @@ use data_loader::{
 use serde_json::Value;
 use vault_data::{NodeMeta, VaultEdge, VaultGraph, VaultNode};
 
-use crate::manifest::{
-    Collection, Dedupe, EdgeListRules, EdgeRule, FieldRule, MatchOn, NodeRules, Pagination,
-    Predicate, Produces, TitleRule, Transform, ValidatedPackage,
+use super::config::{
+    Collection, Dedupe, EdgeListRules, EdgeRule, FieldRule, JsonEngineConfig, MatchOn, NodeRules,
+    Pagination, Predicate, Produces, TitleRule, Transform,
 };
-use crate::RECORD_COLLECTION_KEY;
+use super::RECORD_COLLECTION_KEY;
+use crate::ValidatedPackage;
 
 /// Projects decoded documents according to one validated package.
 pub struct ManifestMapper {
@@ -34,8 +35,16 @@ struct MappedNode {
 }
 
 impl ManifestMapper {
+    /// `build_importer_with_transport` rejects non-json packages before
+    /// constructing the mapper, so the engine configuration always exists.
     pub fn new(package: ValidatedPackage, namespace: Namespace) -> Self {
         Self { package, namespace }
+    }
+
+    fn config(&self) -> &JsonEngineConfig {
+        self.package
+            .json_config()
+            .expect("mapper is only built for json packages")
     }
 
     /// Documents belonging to `collection`, in fetch order.
@@ -87,7 +96,7 @@ impl GraphMapper for ManifestMapper {
         let mut by_title_ci: HashMap<&str, HashMap<String, String>> = HashMap::new();
 
         // --- pass 1: nodes ----------------------------------------------------
-        for collection in self.package.collections() {
+        for collection in &self.config().collections {
             let Produces::Nodes(rules) = &collection.produces else {
                 continue;
             };
@@ -208,7 +217,7 @@ impl GraphMapper for ManifestMapper {
                 graph.add_edge(VaultEdge { source, target });
             };
 
-        for collection in self.package.collections() {
+        for collection in &self.config().collections {
             match &collection.produces {
                 Produces::Nodes(rules) => {
                     if rules.edges.is_empty() {
@@ -271,8 +280,8 @@ impl ManifestMapper {
     /// The `local_prefix` a node collection stamps onto its local ids.
     /// Validation guarantees an edge rule's target is a node collection.
     fn local_prefix_of(&self, collection: &str) -> String {
-        self.package
-            .collections()
+        self.config()
+            .collections
             .iter()
             .find(|candidate| candidate.name == collection)
             .and_then(|candidate| match &candidate.produces {

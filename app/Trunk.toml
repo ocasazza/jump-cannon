@@ -22,7 +22,7 @@ no_sri = true
 # dependency now; when developing it locally via [patch], add its checkout
 # here too.)
 [watch]
-watch = ["ui", "tvix-worker", "../crates/graph-layouts", "../crates/tvix-wasm"]
+watch = ["ui", "tvix-worker", "pest-worker", "../crates/graph-layouts", "../crates/tvix-wasm", "../crates/importer"]
 
 [serve]
 port = 8081

@@ -1,16 +1,16 @@
-//! HTTP/JSON connector — the single component in this crate that touches a
+//! HTTP/JSON connector — the single json-engine component that touches a
 //! network or filesystem.
 //!
 //! Everything downstream (the [`crate::JsonDecoder`] and the
-//! [`crate::mapper::ManifestMapper`]) operates on bytes and decoded values, so
-//! tests drive the whole importer through a fixture [`JsonTransport`]
-//! implementation without ever reaching a real server.
+//! [`crate::json::mapper::ManifestMapper`]) operates on bytes and decoded
+//! values, so tests drive the whole importer through a fixture
+//! [`JsonTransport`] implementation without ever reaching a real server.
 //!
 //! The seam is intentionally narrow: [`JsonTransport::get`] is the only
 //! effectful method on the connector's surface. [`ReqwestTransport`] is the
-//! production implementation; tests substitute their own. Errors are
-//! [`data_loader::ImportError`] so the connector fits the same pipeline as
-//! every other [`data_loader::SourceConnector`] in the repo.
+//! production implementation (`native` feature); tests substitute their own.
+//! Errors are [`data_loader::ImportError`] so the connector fits the same
+//! pipeline as every other [`data_loader::SourceConnector`] in the repo.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -19,8 +19,11 @@ use data_loader::{
     Capability, Effect, ImportError, ImportFuture, SourceConnector, SourceRecord, Transport,
 };
 
-use crate::manifest::{Collection, Preflight, ValidatedPackage, HARD_LIMITS, SOURCE_KIND};
-use crate::{InstanceConfig, RECORD_COLLECTION_KEY, RECORD_PAGE_KEY};
+use super::config::{Collection, JsonEngineConfig, Preflight, SOURCE_KIND};
+use super::{InstanceConfig, RECORD_COLLECTION_KEY, RECORD_PAGE_KEY};
+use crate::ValidatedPackage;
+#[cfg(feature = "native")]
+use crate::HARD_LIMITS;
 
 /// `User-Agent` header attached to every production request. Distinct from
 /// `Cargo.toml`'s package name so the server logs and the package identity do
@@ -34,6 +37,7 @@ pub const CONTENT_TYPE: &str = "application/json";
 
 /// Maximum bytes of a non-2xx body included in the error message. Bodies
 /// beyond this are truncated with an ellipsis so the diagnostic stays bounded.
+#[cfg(feature = "native")]
 const ERROR_BODY_EXCERPT_BYTES: usize = 256;
 
 /// Effectful HTTP boundary. One method: a GET that returns raw bytes. The
@@ -48,6 +52,7 @@ pub trait JsonTransport: Send + Sync {
 /// collection, with a per-instance bearer token and a per-package response
 /// bound. The token is held as a header (never a URL parameter, never
 /// reflected in error messages) and is redacted from [`Debug`].
+#[cfg(feature = "native")]
 pub struct ReqwestTransport {
     client: reqwest::Client,
     base_url: String,
@@ -56,6 +61,7 @@ pub struct ReqwestTransport {
     timeout_seconds: u64,
 }
 
+#[cfg(feature = "native")]
 impl fmt::Debug for ReqwestTransport {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ReqwestTransport")
@@ -67,23 +73,29 @@ impl fmt::Debug for ReqwestTransport {
     }
 }
 
+#[cfg(feature = "native")]
 impl ReqwestTransport {
-    pub fn new(instance: &InstanceConfig, limits: crate::manifest::Limits) -> Result<Self, ImportError> {
-        let max_response_bytes = limits.max_response_bytes;
-        if max_response_bytes == 0 || max_response_bytes > HARD_LIMITS.max_response_bytes {
+    pub fn new(
+        instance: &InstanceConfig,
+        limits: crate::Limits,
+        timeout_seconds: u64,
+    ) -> Result<Self, ImportError> {
+        let max_response_bytes = limits.input_bytes;
+        if max_response_bytes == 0 || max_response_bytes > HARD_LIMITS.input_bytes {
             return Err(ImportError::InvalidDescriptor {
                 message: format!(
-                    "http-json: max_response_bytes must be between 1 and {}, got {max_response_bytes}",
-                    HARD_LIMITS.max_response_bytes
+                    "json engine: max_response_bytes must be between 1 and {}, got {max_response_bytes}",
+                    HARD_LIMITS.input_bytes
                 ),
             });
         }
-        let timeout_seconds = limits.request_timeout_seconds;
-        if timeout_seconds == 0 || timeout_seconds > HARD_LIMITS.request_timeout_seconds {
+        if timeout_seconds == 0
+            || timeout_seconds > super::config::MAX_REQUEST_TIMEOUT_SECONDS
+        {
             return Err(ImportError::InvalidDescriptor {
                 message: format!(
-                    "http-json: request_timeout_seconds must be between 1 and {}, got {timeout_seconds}",
-                    HARD_LIMITS.request_timeout_seconds
+                    "json engine: request_timeout_seconds must be between 1 and {}, got {timeout_seconds}",
+                    super::config::MAX_REQUEST_TIMEOUT_SECONDS
                 ),
             });
         }
@@ -92,7 +104,7 @@ impl ReqwestTransport {
             .timeout(std::time::Duration::from_secs(timeout_seconds))
             .build()
             .map_err(|error| ImportError::InvalidDescriptor {
-                message: format!("http-json: failed to build HTTP client: {error}"),
+                message: format!("json engine: failed to build HTTP client: {error}"),
             })?;
         Ok(Self {
             client,
@@ -104,6 +116,7 @@ impl ReqwestTransport {
     }
 }
 
+#[cfg(feature = "native")]
 impl JsonTransport for ReqwestTransport {
     fn get<'a>(&'a self, url: &'a str) -> ImportFuture<'a, Result<Vec<u8>, ImportError>> {
         Box::pin(async move {
@@ -162,6 +175,7 @@ impl JsonTransport for ReqwestTransport {
     }
 }
 
+#[cfg(feature = "native")]
 fn truncate_excerpt(bytes: &[u8], limit: usize) -> String {
     if bytes.is_empty() {
         return String::new();
@@ -205,12 +219,26 @@ impl HttpJsonConnector {
         transport: Box<dyn JsonTransport>,
     ) -> Result<Self, ImportError> {
         instance.validate()?;
+        // Reject non-json packages: every collection access below assumes the
+        // json engine configuration exists.
+        package
+            .json_config()
+            .map_err(|error| ImportError::InvalidDescriptor {
+                message: error.to_string(),
+            })?;
         Ok(Self {
             package,
             instance,
             variables,
             transport,
         })
+    }
+
+    /// The engine configuration; [`Self::new`] rejects non-json packages.
+    fn config(&self) -> &JsonEngineConfig {
+        self.package
+            .json_config()
+            .expect("connector construction rejects non-json packages")
     }
 
     /// The package's preflight endpoint, if any. The URL is the resolved
@@ -246,13 +274,13 @@ impl HttpJsonConnector {
             let after = &rest[start + 1..];
             let Some(end) = after.find('}') else {
                 return Err(ImportError::InvalidDescriptor {
-                    message: format!("http-json: {field} has an unterminated {{ placeholder"),
+                    message: format!("json engine: {field} has an unterminated {{ placeholder"),
                 });
             };
             let name = &after[..end];
             let value = self.variables.get(name).ok_or_else(|| ImportError::InvalidDescriptor {
                 message: format!(
-                    "http-json: {field} references unresolved variable {name:?}; bound variables are [{}]",
+                    "json engine: {field} references unresolved variable {name:?}; bound variables are [{}]",
                     self.variables.keys().cloned().collect::<Vec<_>>().join(", ")
                 ),
             })?;
@@ -312,7 +340,7 @@ impl HttpJsonConnector {
         })?;
         let requested = self.variables.get(&preflight.variable).ok_or_else(|| ImportError::InvalidDescriptor {
             message: format!(
-                "http-json: preflight variable {:?} is not bound; resolved variables are [{}]",
+                "json engine: preflight variable {:?} is not bound; resolved variables are [{}]",
                 preflight.variable,
                 self.variables.keys().cloned().collect::<Vec<_>>().join(", ")
             ),
@@ -354,9 +382,9 @@ impl HttpJsonConnector {
         collection: &Collection,
         records: &mut Vec<SourceRecord>,
     ) -> Result<(), ImportError> {
-        let limits = self.package.limits();
-        let page_size = limits.page_size;
-        let max_records = limits.max_records;
+        let config = self.config();
+        let page_size = config.page_size;
+        let max_records = self.package.limits().nodes;
         let static_query = self.static_query(collection)?;
         let mut offset: usize = 0;
         let mut accumulated: usize = 0;
@@ -374,8 +402,8 @@ impl HttpJsonConnector {
                 });
             }
             let query = match collection.paginate {
-                crate::manifest::Pagination::None => static_query.clone(),
-                crate::manifest::Pagination::LimitOffset => {
+                super::config::Pagination::None => static_query.clone(),
+                super::config::Pagination::LimitOffset => {
                     Self::pagination_query(&static_query, page_size, offset)
                 }
             };
@@ -437,8 +465,8 @@ impl HttpJsonConnector {
             accumulated += page_len;
             page_index += 1;
             match collection.paginate {
-                crate::manifest::Pagination::None => break,
-                crate::manifest::Pagination::LimitOffset => {
+                super::config::Pagination::None => break,
+                super::config::Pagination::LimitOffset => {
                     if page_len < page_size {
                         break;
                     }
@@ -454,20 +482,21 @@ impl SourceConnector for HttpJsonConnector {
     fn capabilities(&self, effect: Effect) -> Vec<Capability> {
         match effect {
             Effect::Read | Effect::Watch => {
+                let config = self.config();
                 let mut out = Vec::with_capacity(
-                    self.package.collections().len() + self.package.preflight().is_some() as usize,
+                    config.collections.len() + config.preflight.is_some() as usize,
                 );
-                if let Some(preflight) = self.package.preflight() {
+                if let Some(preflight) = &config.preflight {
                     match self.preflight_url(preflight) {
                         Ok(url) => out.push(Capability::new(effect, Transport::Http, url)),
                         Err(error) => {
-                            tracing::error!(?error, "http-json: dropping preflight capability");
+                            tracing::error!(?error, "json engine: dropping preflight capability");
                             // Continue with collections; `read()` will fail
                             // loudly when the preflight URL is built.
                         }
                     }
                 }
-                for collection in self.package.collections() {
+                for collection in &config.collections {
                     let path_field = format!("{}.path", collection.name);
                     match self.resolve_template(&path_field, &collection.path) {
                         Ok(path) => out.push(Capability::new(
@@ -479,7 +508,7 @@ impl SourceConnector for HttpJsonConnector {
                             tracing::error!(
                                 ?error,
                                 collection = collection.name,
-                                "http-json: dropping collection capability"
+                                "json engine: dropping collection capability"
                             );
                         }
                     }
@@ -493,10 +522,10 @@ impl SourceConnector for HttpJsonConnector {
     fn read<'a>(&'a self) -> ImportFuture<'a, Result<Vec<SourceRecord>, ImportError>> {
         Box::pin(async move {
             let mut records = Vec::new();
-            if let Some(preflight) = self.package.preflight() {
+            if let Some(preflight) = &self.config().preflight {
                 self.run_preflight(preflight).await?;
             }
-            for collection in self.package.collections() {
+            for collection in &self.config().collections {
                 self.run_collection(collection, &mut records).await?;
             }
             Ok(records)

@@ -364,11 +364,11 @@ async fn main() -> anyhow::Result<()> {    let _ = dotenvy::dotenv();
                 })?
                 .len() as usize;
             anyhow::ensure!(
-                manifest_len <= pest_importer::HARD_LIMITS.manifest_bytes,
+                manifest_len <= importer::HARD_LIMITS.manifest_bytes,
                 "importer package {} is {} bytes; hard limit is {} bytes",
                 manifest_path.display(),
                 manifest_len,
-                pest_importer::HARD_LIMITS.manifest_bytes
+                importer::HARD_LIMITS.manifest_bytes
             );
             let raw = std::fs::read(manifest_path).with_context(|| {
                 format!(
@@ -376,7 +376,7 @@ async fn main() -> anyhow::Result<()> {    let _ = dotenvy::dotenv();
                     manifest_path.display()
                 )
             })?;
-            let package = pest_importer::ValidatedPackage::from_toml_bytes(&raw)
+            let package = importer::ValidatedPackage::from_toml_bytes(&raw)
                 .with_context(|| format!("invalid importer package {}", manifest_path.display()))?;
             tracing::info!(
                 importer = %package.manifest().metadata.id,
@@ -384,10 +384,14 @@ async fn main() -> anyhow::Result<()> {    let _ = dotenvy::dotenv();
                 input = %input_path.display(),
                 "using trusted runtime Pest importer"
             );
-            Box::new(pest_importer::FilesystemImporter::new(
-                package,
-                input_path.clone(),
-            ))
+            Box::new(
+                importer::FilesystemImporter::new(package, input_path.clone()).with_context(|| {
+                    format!(
+                        "importer package {} does not select the pest engine",
+                        manifest_path.display()
+                    )
+                })?,
+            )
         }
         data_loader::SourceKind::GitHub => {
             let repo = args.github_repo.clone().with_context(|| {
@@ -438,11 +442,11 @@ async fn main() -> anyhow::Result<()> {    let _ = dotenvy::dotenv();
                 })?
                 .len() as usize;
             anyhow::ensure!(
-                manifest_len <= http_json_importer::manifest::HARD_LIMITS.manifest_bytes,
+                manifest_len <= importer::HARD_LIMITS.manifest_bytes,
                 "importer package {} is {} bytes; hard limit is {} bytes",
                 manifest_path.display(),
                 manifest_len,
-                http_json_importer::manifest::HARD_LIMITS.manifest_bytes
+                importer::HARD_LIMITS.manifest_bytes
             );
             let raw = std::fs::read(manifest_path).with_context(|| {
                 format!(
@@ -450,14 +454,14 @@ async fn main() -> anyhow::Result<()> {    let _ = dotenvy::dotenv();
                     manifest_path.display()
                 )
             })?;
-            let package = http_json_importer::ValidatedPackage::from_toml_bytes(&raw)
+            let package = importer::ValidatedPackage::from_toml_bytes(&raw)
                 .with_context(|| format!("invalid importer package {}", manifest_path.display()))?;
             let variables = parse_importer_vars(&args.importer_vars)?;
             let source_id = args
                 .importer_source_id
                 .clone()
                 .unwrap_or_else(|| sanitize_source_id(&package.manifest().metadata.id));
-            let instance = http_json_importer::InstanceConfig {
+            let instance = importer::InstanceConfig {
                 source_id,
                 base_url: endpoint,
                 variables,
@@ -474,7 +478,7 @@ async fn main() -> anyhow::Result<()> {    let _ = dotenvy::dotenv();
                 poll_interval_ms = instance.poll_interval_ms,
                 "using HTTP/JSON package importer"
             );
-            Box::new(http_json_importer::build_importer(package, instance)?)
+            Box::new(importer::build_importer(package, instance)?)
         }
     };
 

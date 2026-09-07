@@ -1,12 +1,11 @@
-//! Declarative HTTP/JSON importer engine.
+//! The `json` engine: declarative paged-JSON-API importer packages.
 //!
-//! This crate is a **mechanism**, not a data source. It reads paged JSON APIs
-//! and projects their documents into the canonical graph according to a
-//! [`manifest::ValidatedPackage`] — a versioned TOML package that carries no
-//! data-source binding of its own. Adding another JSON API means writing a
-//! package and binding it to an instance; it does not mean writing Rust, a
-//! `SourceKind` variant, or a crate. See "Importers: packages, not crates" in
-//! `AGENTS.md`.
+//! This engine is a **mechanism**, not a data source. It reads paged JSON
+//! APIs and projects their documents into the canonical graph according to
+//! the package's `[parser]` configuration — which carries no data-source
+//! binding of its own. Adding another JSON API means writing a package and
+//! binding it to an instance; it does not mean writing Rust, a `SourceKind`
+//! variant, or a crate. See "Importers: packages, not crates" in `AGENTS.md`.
 //!
 //! The three responsibilities stay separated exactly as
 //! [`data_loader::ImportPipeline`] requires:
@@ -22,8 +21,8 @@
 //! the bound instance and `local` is the package's identifier for the document
 //! (prefixed per collection, e.g. `entity:`).
 
+pub mod config;
 pub mod connector;
-pub mod manifest;
 pub mod mapper;
 
 use std::collections::BTreeMap;
@@ -33,9 +32,17 @@ use data_loader::{
     identity::Namespace, Capability, Decoder, DecodedRecord, Effect, ImportError, ImportPipeline,
     ImporterDescriptor, SourceConnector, SourceRecord, Transport, WatchPlan,
 };
-pub use connector::{HttpJsonConnector, JsonTransport, ReqwestTransport};
-pub use manifest::{ValidatedPackage, SOURCE_KIND};
+pub use config::{
+    Collection, Dedupe, EdgeListRules, EdgeRule, FieldRule, JsonEngineConfig, MatchOn, NodeRules,
+    Pagination, Predicate, Preflight, Produces, TitleRule, Transform, VariableSpec, ENGINE,
+    MAX_PAGE_SIZE, MAX_REQUEST_TIMEOUT_SECONDS, SOURCE_KIND,
+};
+pub use connector::{HttpJsonConnector, JsonTransport};
+#[cfg(feature = "native")]
+pub use connector::ReqwestTransport;
 pub use mapper::ManifestMapper;
+
+use crate::{EngineRuntime, ImporterManifest, ParserConfig, ValidatedPackage};
 
 /// Metadata key naming the collection a [`SourceRecord`] was fetched for.
 /// The mapper dispatches on it, so the connector must always set it.
@@ -78,7 +85,7 @@ impl InstanceConfig {
     pub fn validate(&self) -> Result<(), ImportError> {
         data_loader::identity::validate_source_id(&self.source_id).map_err(|message| {
             ImportError::InvalidDescriptor {
-                message: format!("http-json instance source_id {message}"),
+                message: format!("json engine instance source_id {message}"),
             }
         })?;
         let url = self.base_url.trim_end_matches('/');
@@ -86,7 +93,7 @@ impl InstanceConfig {
         if !absolute || url.chars().any(char::is_whitespace) || url.len() <= "http://".len() {
             return Err(ImportError::InvalidDescriptor {
                 message: format!(
-                    "http-json instance base_url must be an absolute http(s) URL without whitespace, got {:?}",
+                    "json engine instance base_url must be an absolute http(s) URL without whitespace, got {:?}",
                     self.base_url
                 ),
             });
@@ -127,12 +134,81 @@ impl Decoder for JsonDecoder {
     }
 }
 
+/// Parse the full document, validate the shared envelope and the json engine
+/// configuration, and prebuild the discovery schema.
+pub(crate) fn validate(source: &str) -> Result<ValidatedPackage, crate::ImportError> {
+    let wire: config::JsonManifestToml = toml::from_str(source)?;
+    debug_assert_eq!(wire.format_version, crate::FORMAT_VERSION);
+    debug_assert_eq!(wire.parser.engine, config::ENGINE);
+
+    ValidatedPackage::validate_metadata(&wire.metadata)?;
+    ValidatedPackage::validate_limits(wire.limits)?;
+    if source.len() > wire.limits.manifest_bytes {
+        return Err(crate::ImportError::ManifestTooLarge {
+            actual: source.len(),
+            max: wire.limits.manifest_bytes,
+        });
+    }
+
+    let config = JsonEngineConfig {
+        variables: wire.parser.variables,
+        preflight: wire.parser.preflight,
+        collections: wire.parser.collections,
+        page_size: wire.parser.page_size,
+        request_timeout_seconds: wire.parser.request_timeout_seconds,
+    };
+    config::validate_config(&config, &wire.schema)
+        .map_err(|error| crate::ImportError::JsonEngine(error.to_string()))?;
+    let schema = config::build_schema(&wire.schema);
+    schema
+        .validate()
+        .map_err(|error| crate::ImportError::JsonEngine(error.to_string()))?;
+
+    let manifest = ImporterManifest {
+        format_version: wire.format_version,
+        metadata: wire.metadata,
+        limits: wire.limits,
+        schema: wire.schema,
+        parser: ParserConfig::Json(config),
+    };
+    Ok(ValidatedPackage {
+        manifest,
+        schema,
+        runtime: EngineRuntime::Json,
+    })
+}
+
+/// Resolve administrator-supplied values against the package's declared
+/// variables. Pest packages have no variables: they fail with a typed
+/// wrong-engine error.
+pub(crate) fn resolve_variables(
+    package: &ValidatedPackage,
+    supplied: &BTreeMap<String, String>,
+) -> Result<BTreeMap<String, String>, ImportError> {
+    let config = package
+        .json_config()
+        .map_err(|error| ImportError::InvalidDescriptor {
+            message: error.to_string(),
+        })?;
+    config::resolve_variables(&package.manifest().metadata.id, config, supplied)
+}
+
 /// Bind a validated package to an instance over the production HTTP transport.
+#[cfg(feature = "native")]
 pub fn build_importer(
     package: ValidatedPackage,
     instance: InstanceConfig,
 ) -> Result<ImportPipeline, ImportError> {
-    let transport = ReqwestTransport::new(&instance, package.limits())?;
+    let config = package
+        .json_config()
+        .map_err(|error| ImportError::InvalidDescriptor {
+            message: error.to_string(),
+        })?;
+    let transport = ReqwestTransport::new(
+        &instance,
+        package.limits(),
+        config.request_timeout_seconds,
+    )?;
     build_importer_with_transport(package, instance, Box::new(transport))
 }
 
@@ -145,6 +221,12 @@ pub fn build_importer_with_transport(
     transport: Box<dyn JsonTransport>,
 ) -> Result<ImportPipeline, ImportError> {
     instance.validate()?;
+    // Reject non-json packages before anything is constructed on their behalf.
+    package
+        .json_config()
+        .map_err(|error| ImportError::InvalidDescriptor {
+            message: error.to_string(),
+        })?;
     let variables = package.resolve_variables(&instance.variables)?;
     let namespace = Namespace::new(SOURCE_KIND, &instance.source_id)?;
 
@@ -203,6 +285,44 @@ pub fn root_capability(effect: Effect, root: &str) -> Capability {
     Capability::new(effect, Transport::Http, root.to_string())
 }
 
+/// Shared minimal json package for cross-engine tests (e.g. the pest engine's
+/// wrong-engine rejection tests).
+#[cfg(test)]
+pub(crate) mod tests_support {
+    use crate::ValidatedPackage;
+
+    pub(crate) fn minimal_json_package() -> ValidatedPackage {
+        ValidatedPackage::from_toml(
+            r#"format_version = 3
+
+[metadata]
+id = "test.minimal-json"
+name = "Minimal json"
+version = "1.0.0"
+
+[[schema.edge_types]]
+key = "related"
+directed = true
+
+[parser]
+engine = "json"
+
+[[parser.collections]]
+name = "records"
+path = "/v1/records"
+
+[parser.collections.nodes]
+id_pointer = "/id"
+node_type = "record"
+
+[parser.collections.nodes.title]
+pointer = "/name"
+"#,
+        )
+        .expect("minimal json package validates")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -214,21 +334,95 @@ mod tests {
     #[test]
     fn hindsight_memory_bank_package_validates() {
         let bytes = include_bytes!(
-            "../../../charts/jump-cannon/packages/hindsight-memory-bank.toml"
+            "../../../../charts/jump-cannon/packages/hindsight-memory-bank.toml"
         );
         let package = ValidatedPackage::from_toml_bytes(bytes)
             .expect("charts/jump-cannon/packages/hindsight-memory-bank.toml validates");
+        assert_eq!(package.engine(), crate::EngineKind::Json);
         assert!(
             !package.manifest().metadata.id.trim().is_empty(),
             "package must declare a stable metadata.id"
         );
         assert!(
-            !package.collections().is_empty(),
+            !package.json_config().unwrap().collections.is_empty(),
             "package must declare at least one collection"
         );
         package
             .schema()
             .validate()
             .expect("published discovery schema is internally consistent");
+    }
+
+    #[test]
+    fn build_importer_rejects_pest_engine_packages() {
+        let pest_package = ValidatedPackage::from_toml(
+            r#"format_version = 3
+
+[metadata]
+id = "test.minimal-pest"
+name = "Minimal pest"
+version = "1.0.0"
+
+[parser]
+engine = "pest"
+root_rule = "document"
+grammar = '''
+document = { SOI ~ EOI }
+node = { "n" }
+node_id = { "i" }
+title = { "t" }
+kind = { "k" }
+tag = { "g" }
+property = { "p" }
+key = { "y" }
+value = { "v" }
+edge = { "e" }
+source = { "s" }
+target = { "r" }
+'''
+
+[parser.captures]
+node = "node"
+id = "node_id"
+title = "title"
+kind = "kind"
+tag = "tag"
+property = "property"
+key = "key"
+value = "value"
+edge = "edge"
+source = "source"
+target = "target"
+"#,
+        )
+        .expect("minimal pest package validates");
+
+        struct NoopTransport;
+        impl JsonTransport for NoopTransport {
+            fn get<'a>(
+                &'a self,
+                url: &'a str,
+            ) -> data_loader::ImportFuture<'a, Result<Vec<u8>, ImportError>> {
+                let _ = url;
+                Box::pin(async { unreachable!("no request may be issued") })
+            }
+        }
+
+        let instance = InstanceConfig {
+            source_id: "test".into(),
+            base_url: "http://api.example.test".into(),
+            variables: BTreeMap::new(),
+            token: None,
+            poll_interval_ms: 0,
+        };
+        let error = build_importer_with_transport(pest_package, instance, Box::new(NoopTransport))
+            
+            .err()
+            .expect("a pest package must not bind to an HTTP instance");
+        assert!(
+            matches!(error, ImportError::InvalidDescriptor { .. }),
+            "{error:?}"
+        );
+        assert!(error.to_string().contains("json"), "{error}");
     }
 }

@@ -4,18 +4,22 @@
 #   tvix-worker — Web Worker bin: tvix graph eval off the UI thread (the
 #                 Generate panel's LocalWorker executor; trunk builds it as a
 #                 separate worker bundle via app/ui/index.html)
+#   pest-worker — Web Worker bin: importer pest-grammar preview parses off
+#                 the UI thread (the Importers panel's live preview; pest_vm
+#                 has no fuel counter, so the killable worker thread is the
+#                 CPU sandbox)
 #
 # The panel-workspace library lives in its own repo now —
 # https://github.com/ocasazza/panel-kit — consumed as a git dependency and
 # shared with snake-pit. Develop against a local checkout with:
 #   [patch."https://github.com/ocasazza/panel-kit"]
-#   panel-kit = { path = "../../panel-kit" }
+#   panel-kit = { path = "../../../panel-kit" }
 #
 # Deliberately a *separate* workspace from the repo root: the main workspace
 # builds through nix + crane and must not absorb the Tauri/Dioxus dependency
 # tree.
 [workspace]
-members = ["filter-model", "ui", "src-tauri", "tvix-worker"]
+members = ["filter-model", "ui", "src-tauri", "tvix-worker", "pest-worker"]
 resolver = "2"
 
 [workspace.package]
@@ -42,3 +46,4 @@ wasm-bindgen = "=0.2.118"
 wgpu = { version = "23", default-features = false, features = ["webgpu", "wgsl", "fragile-send-sync-non-atomic-wasm"] }
 glam = "0.29"
 bytemuck = { version = "1", features = ["derive"] }
+

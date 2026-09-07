@@ -83,8 +83,8 @@ The checked-in example can be run directly:
 
 ```bash
 JUMP_CANNON_SOURCE=pest \
-JUMP_CANNON_IMPORTER_MANIFEST=crates/pest-importer/examples/line-graph.importer.toml \
-JUMP_CANNON_IMPORTER_INPUT=crates/pest-importer/examples/line-graph.txt \
+JUMP_CANNON_IMPORTER_MANIFEST=crates/importer/examples/line-graph.importer.toml \
+JUMP_CANNON_IMPORTER_INPUT=crates/importer/examples/line-graph.txt \
 nix develop -c cargo run -p graph-api -- --no-browser
 ```
 
@@ -263,7 +263,7 @@ All six selectable source kinds satisfy the version-1 contract:
 | generate | `id`, `title`, `tags`, `path`, `type` | Directed `generated` edge; no source-content operations. |
 | Kubernetes | `id`, `title`, `tags`, `path`, `type`, `namespace`, `api_version`, `labels`, `uid`, `resource_version` | Directed `owner_reference`; metadata discovery does not expose resource bodies as content. |
 | OKF | `id`, `title`, `tags`, `path`, `type`, `folder`, `body`, `description`, `resource`, `status`, `stale_after`, `trust_tier`, `generated_by`, `generated_at`, `verified_by`, `source_resources`, `source_titles`, `source_authors`, `runtime` | Directed `relationship`; no source-content operations yet. The normative format version is OKF v0.2. |
-| Pest package | Core `id`, `title`, `tags`, `path`, and `type`, plus only the package's declared property fields | Directed `declared` edge; no source-content operations. Package manifest format 2 makes the property schema mandatory. |
+| Pest package | Core `id`, `title`, `tags`, `path`, and `type`, plus only the package's declared property fields | Directed `declared` edge; no source-content operations. Importer package format 3 makes the property schema mandatory. |
 
 The endpoint returns the searchable and facetable flags rather than asking
 clients to infer them from this table. Kubernetes `resource_version` is retained

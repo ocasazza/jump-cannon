@@ -11,16 +11,19 @@
 //!   5. The graph canvas becomes render-ready and its header controls work.
 //!   6. Nodes is a two-pane editor; Flat/Tags selection and content work.
 //!   7. Unified Settings exposes four accessible, content-backed tabs.
-//!   8. Filter is a repeatable, nested Boolean builder with live validation.
-//!   9. The Sessions view switcher mounts the world workspace (Worlds panel,
-//!      dock) against the embedded host and returns to the User view.
-//!   10. Screenshots are saved for the Nodes editor, Filter builder, Sessions
-//!       view, and workspace.
-//!   11. Runtime importer switching: a second fixture graph-api (two-source
+//!   8. The Importers panel lists the server catalog, shows the selected
+//!      profile's metadata summary, and gates session-scoped Apply on the
+//!      deployment's runtime-switch posture.
+//!   9. Filter is a repeatable, nested Boolean builder with live validation.
+//!   10. The Sessions view switcher mounts the world workspace (Worlds panel,
+//!       dock) against the embedded host and returns to the User view.
+//!   11. Screenshots are saved for the Nodes editor, Importers panel, Filter
+//!       builder, Sessions view, and workspace.
+//!   12. Runtime importer switching: a second fixture graph-api (two-source
 //!       Obsidian catalog + switch group) is mirrored/spawned in parallel;
 //!       the scenario asserts the wire gate (403/200/404), the authorized
-//!       selector + graph swap + sessionStorage persistence, the fresh-tab
-//!       default, and the unauthorized note + stale-selection reset.
+//!       apply affordance + graph swap + sessionStorage persistence, the
+//!       fresh-tab default, and the denied viewer's absent apply affordance.
 //!
 //! Anything flaky (pixel brightness, motion deltas, click recovery) is
 //! deliberately deferred. (The legacy egui-era Playwright suite that held
@@ -106,6 +109,8 @@ struct Report {
     nodes_editor: Option<NodesEditorCheck>,
     #[serde(skip_serializing_if = "Option::is_none")]
     settings_tabs: Option<SettingsTabsCheck>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    importers_panel: Option<ImportersPanelCheck>,
     #[serde(skip_serializing_if = "Option::is_none")]
     filter_builder: Option<FilterBuilderCheck>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -205,11 +210,28 @@ struct SettingsTabsCheck {
     aria_contract: bool,
     keyboard_contract: bool,
     controls_hit_test: bool,
-    importer_catalog: bool,
-    importer_read_only: bool,
-    importer_switch_posture: bool,
     legacy_panels_absent: bool,
     graph_restored: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    reason: Option<String>,
+}
+
+/// Top-level Importers panel (replaces the retired Settings → Importers
+/// tab): the server catalog list, the selected profile's metadata summary,
+/// and the runtime-switch gate on the summary's Apply affordance.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct ImportersPanelCheck {
+    ok: bool,
+    panel_opened: bool,
+    catalog_ready: bool,
+    lavender_row: bool,
+    kind_chip: bool,
+    default_viewing: bool,
+    summary_card: bool,
+    apply_gated: bool,
+    actions_present: bool,
+    #[serde(default)]
+    panel_closed: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     reason: Option<String>,
 }
@@ -246,7 +268,7 @@ struct SessionsViewCheck {
 
 /// Runtime per-viewer importer switching, exercised against a second,
 /// self-hosted fixture graph-api (the main fixture has no switch group, so
-/// the selector-absent contract lives in `settings_tabs`). The scenario
+/// the apply gate lives in `importers_panel`). The scenario
 /// spawns `graph-api` from PATH with `JUMP_CANNON_IMPORTER_SWITCH_GROUP` and
 /// a two-source Obsidian catalog, mirrors the app dist from `--base-url`, and
 /// simulates the authenticating proxy with `Network.setExtraHTTPHeaders`.
@@ -267,12 +289,17 @@ struct ImporterSwitchCheck {
     session_persists_reload: bool,
     switch_back_restores_default: bool,
     fresh_tab_default: bool,
-    denied_note: bool,
-    stale_reset_recovers: bool,
-    /// Authorized viewer currently viewing the alternate: the policy reset
-    /// affordance must be visible and clicking it must clear the session
-    /// selection and restore the deployment default. Covers the case where
-    /// `stale_reset_recovers` does not (viewer still has the group).
+    /// Denied viewer (no proxy group): the catalog still renders, but no
+    /// row's summary offers the session-scoped Apply affordance.
+    denied_apply_absent: bool,
+    /// Denied viewer with a planted stale selection: the catalog must still
+    /// render and mark the stale row as viewing. The panel has no
+    /// denied-state reset control; recovery requires re-authorization.
+    stale_selection_surfaces: bool,
+    /// Authorized viewer currently viewing the alternate: the default
+    /// profile's 'Return to default' apply must clear the session selection
+    /// and restore the deployment default. Covers the case where
+    /// `stale_selection_surfaces` does not (viewer still has the group).
     viewing_non_default_reset: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     reason: Option<String>,
@@ -291,8 +318,8 @@ impl ImporterSwitchCheck {
             session_persists_reload: false,
             switch_back_restores_default: false,
             fresh_tab_default: false,
-            denied_note: false,
-            stale_reset_recovers: false,
+            denied_apply_absent: false,
+            stale_selection_surfaces: false,
             viewing_non_default_reset: false,
             reason: Some("graph-api binary not on PATH; scenario skipped".to_string()),
         }
@@ -354,6 +381,7 @@ async fn main() -> Result<()> {
         header_actions,
         nodes_editor,
         settings_tabs,
+        importers_panel,
         filter_builder,
         sessions_view,
         importer_switch,
@@ -367,6 +395,7 @@ async fn main() -> Result<()> {
                 && o.header_actions.ok
                 && o.nodes_editor.ok
                 && o.settings_tabs.ok
+                && o.importers_panel.ok
                 && o.filter_builder.ok
                 && o.sessions_view.ok
                 && o.importer_switch.ok
@@ -386,6 +415,8 @@ async fn main() -> Result<()> {
                 o.nodes_editor.reason.clone()
             } else if !o.settings_tabs.ok {
                 o.settings_tabs.reason.clone()
+            } else if !o.importers_panel.ok {
+                o.importers_panel.reason.clone()
             } else if !o.filter_builder.ok {
                 o.filter_builder.reason.clone()
             } else if !o.sessions_view.ok {
@@ -410,6 +441,7 @@ async fn main() -> Result<()> {
                 Some(o.header_actions.clone()),
                 Some(o.nodes_editor.clone()),
                 Some(o.settings_tabs.clone()),
+                Some(o.importers_panel.clone()),
                 Some(o.filter_builder.clone()),
                 Some(o.sessions_view.clone()),
                 Some(o.importer_switch.clone()),
@@ -422,6 +454,7 @@ async fn main() -> Result<()> {
             0,
             0,
             false,
+            None,
             None,
             None,
             None,
@@ -445,6 +478,7 @@ async fn main() -> Result<()> {
         graph_header_actions: header_actions,
         nodes_editor,
         settings_tabs,
+        importers_panel,
         filter_builder,
         sessions_view,
         importer_switch,
@@ -474,6 +508,7 @@ struct RunOk {
     header_actions: HeaderActionCheck,
     nodes_editor: NodesEditorCheck,
     settings_tabs: SettingsTabsCheck,
+    importers_panel: ImportersPanelCheck,
     filter_builder: FilterBuilderCheck,
     sessions_view: SessionsViewCheck,
     importer_switch: ImporterSwitchCheck,
@@ -1103,7 +1138,7 @@ async fn drive_page(
     tokio::fs::write(&nodes_shot_path, nodes_bytes).await?;
     tracing::info!("wrote screenshot {}", nodes_shot_path.display());
 
-    // ---- 6. Unified Settings exposes five accessible, real tabs ---------
+    // ---- 6. Unified Settings exposes four accessible, real tabs ---------
     // Maximize Settings so every tab is both visible and pointer-hit-testable,
     // exercise each delegated panel, then restore the workspace. Restoring
     // also proves that the Graph canvas has one reliable remount owner.
@@ -1120,7 +1155,6 @@ async fn drive_page(
         const failures = [];
         const expected = [
           ['Connection', 'connection', 'input[aria-label="Graph API server URL"]'],
-          ['Importers', 'importers', '.importer-card[data-source-id="lavender-ingest-okf"]'],
           ['Layout', 'layout', '.lay'],
           ['Appearance', 'appearance', '.sty'],
           ['Camera', 'camera', '.cam'],
@@ -1146,10 +1180,6 @@ async fn drive_page(
         let ariaContract = maximized && labels.length === expected.length &&
           expected.every(([label], index) => labels[index] === label);
         let controlsHitTest = maximized && tabs.length === expected.length;
-        let importerCatalog = false;
-        let importerReadOnly = false;
-        let importerSwitchPosture = false;
-
         for (const [label, slug, selector] of expected) {
           const tab = tabs.find((candidate) => (candidate.textContent || '').trim() === label);
           tab?.click();
@@ -1161,93 +1191,6 @@ async fn drive_page(
               tabpanel?.querySelector(selector) && tabpanel;
           });
           if (content) contentPanels.push(slug);
-
-          if (label === 'Importers' && content) {
-            const text = (selector) =>
-              (content.querySelector(selector)?.textContent || '').trim();
-            const lavender = content.querySelector(
-              '.importer-card[data-source-id="lavender-ingest-okf"]'
-            );
-            const lavenderText = (selector) =>
-              (lavender?.querySelector(selector)?.textContent || '').trim();
-            const policy = text('.importer-policy');
-            const switchState = content.querySelector('.importers-view')
-              ?.getAttribute('data-runtime-switch');
-            const switchControls = content.querySelectorAll('.importer-switch-btn');
-            const selectedProfile = text('[data-field="selected-profile"]');
-            const activeKind = text('[data-field="active-kind"]');
-            const knownKinds = new Set([
-              'obsidian', 'tvix', 'generate', 'kubernetes', 'okf', 'pest',
-              'github', 'world'
-            ]);
-            const cards = [...content.querySelectorAll('.importer-card[data-source-id]')];
-            // The shared SelectableCard emits data-default for the
-            // deployment-selected profile; the old per-card
-            // data-selected/data-active pair collapsed into it when the
-            // catalog made runtime viewing session-scoped.
-            const selectedCards = cards.filter(
-              (card) => card.getAttribute('data-default') === 'true'
-            );
-            const selectionMatches = selectedProfile === 'none'
-              ? knownKinds.has(activeKind) && selectedCards.length === 0
-              : knownKinds.has(activeKind) &&
-                selectedCards.length === 1 &&
-                selectedCards[0].getAttribute('data-source-id') === selectedProfile &&
-                selectedCards[0].getAttribute('data-kind') === activeKind;
-            // The policy note follows the per-viewer runtime-switch posture:
-            // a disabled deployment requires a rollout, an authorized viewer
-            // gets runtime viewing, and a denied viewer gets the
-            // group-required note. All three remain deployment-managed.
-            const policyByState = {
-              disabled: /rollout is required/i,
-              enabled: /Runtime viewing is enabled/i,
-              denied: /Switching requires NetBird group/i,
-            };
-            importerCatalog = Boolean(
-              content.querySelector('.importers-view[data-activation="helm_rollout"]') &&
-              lavender &&
-              selectionMatches &&
-              text('[data-field="active-importer-id"]') &&
-              /Configured by Helm/i.test(policy) &&
-              Boolean(policyByState[switchState]?.test(policy))
-            );
-            importerReadOnly = Boolean(
-              lavender?.querySelector('.importer-badge.read-only') &&
-              lavenderText('[data-field="consumer-volume"]') === 'lavender-okf-repository' &&
-              lavenderText('[data-field="consumer-claim"]') === 'lavender-okf-shared' &&
-              lavenderText('[data-field="consumer-mount"]') ===
-                '/var/lib/lavender/okf-repository' &&
-              lavenderText('[data-field="consumer-input"]') ===
-                '/var/lib/lavender/okf-repository/okf' &&
-              lavenderText('[data-field="consumer-access"]') === 'read-only' &&
-              lavenderText('[data-field="producer-default-claim"]') ===
-                'lavender-ingest-okf' &&
-              lavenderText('[data-field="producer-repository-root"]') ===
-                '/data/okf-repository' &&
-              lavenderText('[data-field="producer-workflow-input"]') ===
-                '/data/okf-repository/okf' &&
-              lavenderText('[data-field="producer-existing-claim-value-path"]') ===
-                'okf.persistence.existingClaim' &&
-              lavenderText('[data-field="producer-existing-claim-value"]') ===
-                'lavender-okf-shared'
-            );
-            const lavenderDescription = lavenderText('.select-card-desc');
-            importerReadOnly &&= /deployment-provisioned RWX/i.test(lavenderDescription) &&
-              /same namespace/i.test(lavenderDescription) &&
-              /<release>-okf/.test(lavenderDescription) &&
-              /UID\/GID 10001/i.test(lavenderDescription);
-            // Switch controls must exist exactly when this viewer is
-            // authorized: absent for disabled deployments (the local fixture)
-            // and for denied viewers (the deployment's unprivileged browser
-            // identity), present for enabled viewers. The full authorized
-            // selector contract is exercised by the importer_switch scenario
-            // against a second fixture server.
-            importerSwitchPosture = Boolean(
-              ((switchState === 'disabled' || switchState === 'denied') &&
-                switchControls.length === 0) ||
-              (switchState === 'enabled' && switchControls.length > 0)
-            );
-          }
 
           const selectedTabs = tabs.filter(
             (candidate) => candidate.getAttribute('aria-selected') === 'true'
@@ -1290,8 +1233,8 @@ async fn drive_page(
           ));
         };
         let keyboardContract = maximized;
-        keyboardContract &&= await keyboardStep('Connection', 'ArrowRight', 'Importers');
-        keyboardContract &&= await keyboardStep('Importers', 'End', 'Camera');
+        keyboardContract &&= await keyboardStep('Connection', 'ArrowRight', 'Layout');
+        keyboardContract &&= await keyboardStep('Layout', 'End', 'Camera');
         keyboardContract &&= await keyboardStep('Camera', 'Home', 'Connection');
         keyboardContract &&= await keyboardStep('Connection', 'ArrowLeft', 'Camera');
 
@@ -1325,9 +1268,6 @@ async fn drive_page(
         if (!keyboardContract) failures.push('Settings tab keyboard navigation is invalid');
         if (!controlsHitTest) failures.push('Settings tabs are obscured from pointer input');
         if (contentPanels.length !== expected.length) failures.push('a Settings tab has no delegated content');
-        if (!importerCatalog) failures.push('deployment-managed importer catalog is incomplete');
-        if (!importerReadOnly) failures.push('Lavender OKF read-only PVC contract is incomplete');
-        if (!importerSwitchPosture) failures.push('Importer catalog switch controls do not match the viewer posture');
         if (!legacyPanelsAbsent) failures.push('legacy Layout, Style, or Camera panel still exists');
         if (!graphRestored) failures.push('Graph renderer did not remount after Settings restore');
         return {
@@ -1337,9 +1277,6 @@ async fn drive_page(
           aria_contract: Boolean(ariaContract),
           keyboard_contract: Boolean(keyboardContract),
           controls_hit_test: Boolean(controlsHitTest),
-          importer_catalog: Boolean(importerCatalog),
-          importer_read_only: Boolean(importerReadOnly),
-          importer_switch_posture: Boolean(importerSwitchPosture),
           legacy_panels_absent: legacyPanelsAbsent,
           graph_restored: graphRestored,
           reason: failures.length ? failures.join('; ') : null,
@@ -1347,14 +1284,135 @@ async fn drive_page(
     })()"#;
     let settings_tabs_value: serde_json::Value =
         page.evaluate(settings_tabs_js).await?.into_value()?;
-    let mut settings_tabs: SettingsTabsCheck = serde_json::from_value(settings_tabs_value)
+    let settings_tabs: SettingsTabsCheck = serde_json::from_value(settings_tabs_value)
         .context("decode unified Settings regression result")?;
 
-    // Capture visual evidence of the new app-owned importer catalog. The
-    // contract check above restores the workspace first; maximize Settings a
-    // second time, leave Importers selected for the screenshot, then restore
-    // and prove the graph canvas remounts before continuing.
-    let settings_shot_ready: bool = page
+    // ---- 6b. Importers panel: server catalog, summary, apply gate --------
+    // The retired Settings → Importers tab is now a top-level workspace
+    // panel, restored from the dock like the other tray panels. The main
+    // fixture has no runtime-switch group, so the summary's session-scoped
+    // Apply affordance must stay gated here; the authorized contract runs in
+    // the importer_switch scenario.
+    let importers_panel_js = r#"(async () => {
+        const waitFor = async (predicate, timeoutMs = 30000) => {
+          const deadline = performance.now() + timeoutMs;
+          while (performance.now() < deadline) {
+            const value = predicate();
+            if (value) return value;
+            await new Promise((resolve) => setTimeout(resolve, 50));
+          }
+          return null;
+        };
+        const failures = [];
+        // The default layout docks Importers minimized; open it the way a
+        // user does.
+        const root = await waitFor(() => {
+          const existing = document.querySelector(
+            'section.panel-importers .importers-panel[data-panel="importers"]'
+          );
+          if (existing) return existing;
+          const chip = [...document.querySelectorAll('.dock-chip')]
+            .find((candidate) => (candidate.textContent || '').trim() === 'Importers');
+          chip?.click();
+          return null;
+        });
+        const panelOpened = Boolean(root);
+
+        const catalogRows = await waitFor(() => {
+          const rows = [...document.querySelectorAll(
+            '.importers-panel .imp-rows[aria-label="Server catalog"] ' +
+            'button.imp-row[data-source="server"]'
+          )];
+          return rows.length ? rows : null;
+        });
+        const catalogReady = Boolean(catalogRows) && !document.querySelector(
+          '.importers-panel [data-field="catalog-unavailable"]'
+        );
+
+        const lavender = document.querySelector(
+          '.importers-panel button.imp-row[data-package-id="lavender-ingest-okf"]'
+        );
+        const lavenderRow = Boolean(lavender) &&
+          lavender.getAttribute('data-source') === 'server' &&
+          lavender.getAttribute('data-kind') === 'okf' &&
+          lavender.getAttribute('data-native') === 'false' &&
+          lavender.getAttribute('data-viewing') === 'false';
+        const chips = [...(lavender?.querySelectorAll('.imp-row-chips .imp-chip') || [])]
+          .map((chip) => (chip.textContent || '').trim());
+        const kindChip = chips.includes('okf');
+        const defaultViewing = Boolean(catalogRows) && catalogRows.some((row) =>
+          row.getAttribute('data-package-id') === 'local-obsidian' &&
+          row.getAttribute('data-viewing') === 'true'
+        );
+
+        lavender?.click();
+        const summary = await waitFor(() => {
+          const card = document.querySelector('.importers-panel .imp-summary');
+          const id = card?.querySelector('[data-field="package-id"]')
+            ?.textContent.trim();
+          return id === 'lavender-ingest-okf' ? card : null;
+        });
+        const summaryCard = Boolean(summary) &&
+          Boolean(summary.querySelector('.imp-summary-title')?.textContent.trim()) &&
+          summary.querySelector('[data-field="package-kind"]')?.textContent.trim() === 'okf';
+        // Runtime switching is disabled on this fixture: the summary must
+        // not offer Apply, only the duplicate-to-local escape.
+        const applyGated = Boolean(summary) &&
+          !summary.querySelector('[data-action="apply"]') &&
+          Boolean(summary.querySelector('[data-action="duplicate"]'));
+        const actionsPresent = Boolean(
+          document.querySelector('.importers-panel [data-action="refresh-catalog"]')
+        ) && Boolean(
+          document.querySelector('.importers-panel [data-action="new-package"]')
+        );
+
+        if (!panelOpened) failures.push('Importers panel did not restore from the dock');
+        if (!catalogReady) failures.push('server catalog did not load');
+        if (!lavenderRow) failures.push('lavender-ingest-okf catalog row is missing or misattributed');
+        if (!kindChip) failures.push('lavender-ingest-okf row has no okf kind chip');
+        if (!defaultViewing) failures.push('local-obsidian row is not marked viewing');
+        if (!summaryCard) failures.push('lavender-ingest-okf summary card is incomplete');
+        if (!applyGated) failures.push('Apply is not gated on the disabled runtime switch');
+        if (!actionsPresent) failures.push('catalog refresh or new-package action missing');
+        return {
+          ok: failures.length === 0,
+          panel_opened: panelOpened,
+          catalog_ready: catalogReady,
+          lavender_row: lavenderRow,
+          kind_chip: kindChip,
+          default_viewing: defaultViewing,
+          summary_card: summaryCard,
+          apply_gated: applyGated,
+          actions_present: actionsPresent,
+          reason: failures.length ? failures.join('; ') : null,
+        };
+    })()"#;
+    let importers_panel_value: serde_json::Value =
+        page.evaluate(importers_panel_js).await?.into_value()?;
+    let mut importers_panel: ImportersPanelCheck =
+        serde_json::from_value(importers_panel_value)
+            .context("decode Importers panel regression result")?;
+
+    if importers_panel.summary_card {
+        let importers_png = page
+            .screenshot(CaptureScreenshotParams::builder().build())
+            .await
+            .context("Importers panel screenshot")?;
+        let importers_bytes = if importers_png.first() == Some(&0x89) {
+            importers_png
+        } else {
+            base64::engine::general_purpose::STANDARD
+                .decode(&importers_png)
+                .unwrap_or(importers_png)
+        };
+        let importers_shot_path = args.out_dir.join("importers-panel.png");
+        tokio::fs::write(&importers_shot_path, importers_bytes).await?;
+        tracing::info!("wrote screenshot {}", importers_shot_path.display());
+    }
+
+    // Leave the workspace as found: re-minimize the panel so later steps see
+    // the default dock.
+    let importers_panel_closed: bool = page
         .evaluate(
             r#"(async () => {
                 const waitFor = async (predicate, timeoutMs = 10000) => {
@@ -1366,84 +1424,22 @@ async fn drive_page(
                   }
                   return null;
                 };
-                const initial = document.querySelector('section.panel-settings');
-                initial?.querySelector(':scope > header.panel-head .light.max')?.click();
-                const panel = await waitFor(() => {
-                  const candidate = document.querySelector('section.panel-settings');
-                  const rect = candidate?.getBoundingClientRect();
-                  return document.querySelector('.ws.maxed') &&
-                    rect?.width > 900 && rect?.height > 400 && candidate;
-                });
-                const importer = [...(panel?.querySelectorAll('[role="tab"]') || [])]
-                  .find((tab) => (tab.textContent || '').trim() === 'Importers');
-                importer?.click();
+                document.querySelector(
+                  'section.panel-importers > header.panel-head .light.yellow'
+                )?.click();
                 return Boolean(await waitFor(() =>
-                  importer?.getAttribute('aria-selected') === 'true' &&
-                  panel?.querySelector(
-                    '.importer-card[data-source-id="lavender-ingest-okf"]'
-                  )
+                  !document.querySelector('section.panel-importers') ? true : null
                 ));
             })()"#,
         )
         .await?
         .into_value()?;
-    if !settings_shot_ready {
-        settings_tabs.ok = false;
-        settings_tabs.reason = Some(match settings_tabs.reason.take() {
-            Some(reason) => format!("{reason}; Importers screenshot did not become ready"),
-            None => "Importers screenshot did not become ready".to_string(),
-        });
-    } else {
-        let settings_png = page
-            .screenshot(CaptureScreenshotParams::builder().build())
-            .await
-            .context("Settings Importers screenshot")?;
-        let settings_bytes = if settings_png.first() == Some(&0x89) {
-            settings_png
-        } else {
-            base64::engine::general_purpose::STANDARD
-                .decode(&settings_png)
-                .unwrap_or(settings_png)
-        };
-        let settings_shot_path = args.out_dir.join("settings-importers.png");
-        tokio::fs::write(&settings_shot_path, settings_bytes).await?;
-        tracing::info!("wrote screenshot {}", settings_shot_path.display());
-    }
-
-    let settings_shot_restored: bool = page
-        .evaluate(
-            r#"(async () => {
-                const waitFor = async (predicate, timeoutMs = 10000) => {
-                  const deadline = performance.now() + timeoutMs;
-                  while (performance.now() < deadline) {
-                    const value = predicate();
-                    if (value) return value;
-                    await new Promise((resolve) => setTimeout(resolve, 50));
-                  }
-                  return null;
-                };
-                const settings = document.querySelector('section.panel-settings');
-                const connection = [...(settings?.querySelectorAll('[role="tab"]') || [])]
-                  .find((tab) => (tab.textContent || '').trim() === 'Connection');
-                connection?.click();
-                settings?.querySelector(':scope > header.panel-head .light.max')?.click();
-                const workspace = await waitFor(() => !document.querySelector('.ws.maxed'));
-                const graph = await waitFor(() => {
-                  const canvas = document.querySelector('section.panel-graph canvas.graph-canvas');
-                  return canvas?.dataset.renderReady === 'true' &&
-                    Number(canvas?.dataset.nodeCount || 0) > 0;
-                });
-                return Boolean(workspace && graph);
-            })()"#,
-        )
-        .await?
-        .into_value()?;
-    if !settings_shot_restored {
-        settings_tabs.ok = false;
-        settings_tabs.graph_restored = false;
-        settings_tabs.reason = Some(match settings_tabs.reason.take() {
-            Some(reason) => format!("{reason}; Graph did not restore after Importers screenshot"),
-            None => "Graph did not restore after Importers screenshot".to_string(),
+    importers_panel.panel_closed = importers_panel_closed;
+    if !importers_panel_closed {
+        importers_panel.ok = false;
+        importers_panel.reason = Some(match importers_panel.reason.take() {
+            Some(reason) => format!("{reason}; Importers panel did not re-minimize"),
+            None => "Importers panel did not re-minimize".to_string(),
         });
     }
 
@@ -2565,6 +2561,7 @@ async fn drive_page(
         header_actions,
         nodes_editor,
         settings_tabs,
+        importers_panel,
         filter_builder,
         sessions_view,
         importer_switch,
@@ -2959,9 +2956,10 @@ async fn setup_switch_fixture(origin: &str) -> Result<Option<SwitchFixture>> {
     }))
 }
 
-/// Settings > Importers summary: switch posture, policy note, and per-card
-/// radio state. Token-free; shared by the authorized and unauthorized pages.
-const IMPORTERS_VIEW_JS: &str = r#"(async () => {
+/// Importers panel snapshot: open the panel from the dock, list the server
+/// catalog rows, select `__SELECT_ID__`, and report its summary card's Apply
+/// affordance. Shared by the authorized and unauthorized pages.
+const IMPORTERS_PANEL_VIEW_JS: &str = r#"(async () => {
     const waitFor = async (predicate, timeoutMs = 30000) => {
       const deadline = performance.now() + timeoutMs;
       while (performance.now() < deadline) {
@@ -2971,24 +2969,50 @@ const IMPORTERS_VIEW_JS: &str = r#"(async () => {
       }
       return null;
     };
-    const panel = await waitFor(() => document.querySelector('section.panel-settings'));
-    if (!panel) return { error: 'settings panel missing' };
-    const tab = [...panel.querySelectorAll('[role="tab"]')]
-      .find((candidate) => (candidate.textContent || '').trim() === 'Importers');
-    if (!tab) return { error: 'Importers tab missing' };
-    tab.click();
-    const view = await waitFor(() => panel.querySelector('.importers-view[data-runtime-switch]'));
-    if (!view) return { error: 'importers view missing' };
+    const root = await waitFor(() => {
+      const existing = document.querySelector(
+        'section.panel-importers .importers-panel[data-panel="importers"]'
+      );
+      if (existing) return existing;
+      const chip = [...document.querySelectorAll('.dock-chip')]
+        .find((candidate) => (candidate.textContent || '').trim() === 'Importers');
+      chip?.click();
+      return null;
+    });
+    if (!root) return { error: 'importers panel missing' };
+    const rows = await waitFor(() => {
+      const list = [...document.querySelectorAll(
+        '.importers-panel .imp-rows[aria-label="Server catalog"] ' +
+        'button.imp-row[data-source="server"]'
+      )];
+      return list.length ? list : null;
+    });
+    if (!rows) return { error: 'server catalog missing' };
+    const selectRow = rows.find(
+      (row) => row.getAttribute('data-package-id') === '__SELECT_ID__'
+    );
+    if (!selectRow) return { error: 'row missing: __SELECT_ID__' };
+    selectRow.click();
+    const summary = await waitFor(() => {
+      const card = document.querySelector('.importers-panel .imp-summary');
+      const id = card?.querySelector('[data-field="package-id"]')
+        ?.textContent.trim();
+      return id === '__SELECT_ID__' ? card : null;
+    });
+    if (!summary) return { error: 'summary card missing' };
+    const apply = summary.querySelector('[data-action="apply"]');
     return {
-      switch_state: view.getAttribute('data-runtime-switch'),
-      policy: (view.querySelector('.importer-policy')?.textContent || '')
-        .replace(/\s+/g, ' ').trim(),
-      buttons: [...view.querySelectorAll('.importer-switch-btn')].map((button) => ({
-        id: button.getAttribute('data-source-id'),
-        viewing: button.getAttribute('data-viewing') === 'true',
-        disabled: button.disabled,
+      rows: [...document.querySelectorAll(
+        '.importers-panel .imp-rows[aria-label="Server catalog"] ' +
+        'button.imp-row[data-source="server"]'
+      )].map((row) => ({
+        id: row.getAttribute('data-package-id'),
+        kind: row.getAttribute('data-kind'),
+        viewing: row.getAttribute('data-viewing') === 'true',
       })),
-      reset_button: Boolean(view.querySelector('.importer-switch-reset')),
+      apply_present: Boolean(apply),
+      apply_disabled: apply ? apply.disabled : null,
+      apply_label: (apply?.textContent || '').trim(),
     };
 })()"#;
 
@@ -3012,9 +3036,9 @@ const NODE_IDS_JS: &str = r#"(async () => {
     return { ids: ids || [], stored: sessionStorage.getItem('jc_source_id') };
 })()"#;
 
-/// Click the alternate source's radio and wait for the graph swap: stored
-/// selection, alternate-only node list, and the `viewing` badge after the
-/// catalog refetch.
+/// Select the alternate profile's catalog row and click its summary's Apply
+/// ('Apply (view this source)'), then wait for the graph swap: stored
+/// selection, alternate-only node list, and the row's data-viewing flip.
 const SWITCH_TO_ALT_JS: &str = r#"(async () => {
     const waitFor = async (predicate, timeoutMs = 45000) => {
       const deadline = performance.now() + timeoutMs;
@@ -3025,14 +3049,30 @@ const SWITCH_TO_ALT_JS: &str = r#"(async () => {
       }
       return null;
     };
-    const button = await waitFor(() => {
-      const candidate = document.querySelector(
-        '.importer-switch-btn[data-source-id="__ALT_ID__"]'
+    const root = await waitFor(() => {
+      const existing = document.querySelector(
+        'section.panel-importers .importers-panel[data-panel="importers"]'
       );
-      return candidate && !candidate.disabled ? candidate : null;
+      if (existing) return existing;
+      const chip = [...document.querySelectorAll('.dock-chip')]
+        .find((candidate) => (candidate.textContent || '').trim() === 'Importers');
+      chip?.click();
+      return null;
     });
-    if (!button) return { clicked: false, stored: false, swapped: false, badge: false };
-    button.click();
+    const row = root && await waitFor(() => document.querySelector(
+      '.importers-panel button.imp-row[data-package-id="__ALT_ID__"]'
+    ));
+    if (!row) return { clicked: false, stored: false, swapped: false, badge: false };
+    row.click();
+    const apply = await waitFor(() => {
+      const summary = document.querySelector('.importers-panel .imp-summary');
+      const id = summary?.querySelector('[data-field="package-id"]')
+        ?.textContent.trim();
+      const button = summary?.querySelector('[data-action="apply"]');
+      return id === '__ALT_ID__' && button && !button.disabled ? button : null;
+    });
+    if (!apply) return { clicked: false, stored: false, swapped: false, badge: false };
+    apply.click();
     const stored = await waitFor(() =>
       sessionStorage.getItem('jc_source_id') === '__ALT_ID__' ? true : null
     );
@@ -3044,7 +3084,7 @@ const SWITCH_TO_ALT_JS: &str = r#"(async () => {
       return has('__ALT_NODE__') && !has('__DEFAULT_NODE__') ? true : null;
     });
     const badge = await waitFor(() => document.querySelector(
-      '.importer-card[data-source-id="__ALT_ID__"] .importer-badge.viewing'
+      '.importers-panel button.imp-row[data-package-id="__ALT_ID__"][data-viewing="true"]'
     ));
     return {
       clicked: true,
@@ -3078,8 +3118,10 @@ const PERSISTED_ALT_JS: &str = r#"(async () => {
     return { persisted: Boolean(persisted) };
 })()"#;
 
-/// Switch back to the deployment default: selection cleared, default nodes.
-const SWITCH_BACK_JS: &str = r#"(async () => {
+/// Return to the deployment default: select the default profile's row and
+/// click its summary's 'Return to default' Apply; the session selection
+/// clears and the default graph loads.
+const APPLY_DEFAULT_JS: &str = r#"(async () => {
     const waitFor = async (predicate, timeoutMs = 45000) => {
       const deadline = performance.now() + timeoutMs;
       while (performance.now() < deadline) {
@@ -3089,18 +3131,30 @@ const SWITCH_BACK_JS: &str = r#"(async () => {
       }
       return null;
     };
-    const panel = await waitFor(() => document.querySelector('section.panel-settings'));
-    const tab = panel && [...panel.querySelectorAll('[role="tab"]')]
-      .find((candidate) => (candidate.textContent || '').trim() === 'Importers');
-    tab?.click();
-    const button = await waitFor(() => {
-      const candidate = document.querySelector(
-        '.importer-switch-btn[data-source-id="__DEFAULT_ID__"]'
+    const root = await waitFor(() => {
+      const existing = document.querySelector(
+        'section.panel-importers .importers-panel[data-panel="importers"]'
       );
-      return candidate && !candidate.disabled ? candidate : null;
+      if (existing) return existing;
+      const chip = [...document.querySelectorAll('.dock-chip')]
+        .find((candidate) => (candidate.textContent || '').trim() === 'Importers');
+      chip?.click();
+      return null;
     });
-    if (!button) return { clicked: false, cleared: false, restored: false };
-    button.click();
+    const row = root && await waitFor(() => document.querySelector(
+      '.importers-panel button.imp-row[data-package-id="__DEFAULT_ID__"]'
+    ));
+    if (!row) return { clicked: false, cleared: false, restored: false };
+    row.click();
+    const apply = await waitFor(() => {
+      const summary = document.querySelector('.importers-panel .imp-summary');
+      const id = summary?.querySelector('[data-field="package-id"]')
+        ?.textContent.trim();
+      const button = summary?.querySelector('[data-action="apply"]');
+      return id === '__DEFAULT_ID__' && button && !button.disabled ? button : null;
+    });
+    if (!apply) return { clicked: false, cleared: false, restored: false };
+    apply.click();
     const cleared = await waitFor(() =>
       sessionStorage.getItem('jc_source_id') === null ? true : null
     );
@@ -3113,39 +3167,6 @@ const SWITCH_BACK_JS: &str = r#"(async () => {
     });
     return {
       clicked: true,
-      cleared: Boolean(cleared),
-      restored: Boolean(restored),
-    };
-})()"#;
-
-/// Stale-selection recovery on an unauthorized page: the catalog stays
-/// reachable (it never requires the group), the reset affordance clears the
-/// session selection, and the default graph loads.
-const RESET_STALE_JS: &str = r#"(async () => {
-    const waitFor = async (predicate, timeoutMs = 45000) => {
-      const deadline = performance.now() + timeoutMs;
-      while (performance.now() < deadline) {
-        const value = predicate();
-        if (value) return value;
-        await new Promise((resolve) => setTimeout(resolve, 50));
-      }
-      return null;
-    };
-    const button = await waitFor(() => document.querySelector('.importer-switch-reset'));
-    if (!button) return { found: false, cleared: false, restored: false };
-    button.click();
-    const cleared = await waitFor(() =>
-      sessionStorage.getItem('jc_source_id') === null ? true : null
-    );
-    const restored = await waitFor(() => {
-      const ids = [...document.querySelectorAll('[data-testid="node-sidebar"] [data-node-id]')]
-        .map((row) => row.getAttribute('data-node-id'));
-      return ids.some((id) => id === '__DEFAULT_NODE__' || id.endsWith(':__DEFAULT_NODE__'))
-        ? true
-        : null;
-    });
-    return {
-      found: true,
       cleared: Boolean(cleared),
       restored: Boolean(restored),
     };
@@ -3224,8 +3245,8 @@ async fn run_switch_scenario(
         session_persists_reload: false,
         switch_back_restores_default: false,
         fresh_tab_default: false,
-        denied_note: false,
-        stale_reset_recovers: false,
+        denied_apply_absent: false,
+        stale_selection_surfaces: false,
         viewing_non_default_reset: false,
         reason: None,
     };
@@ -3246,7 +3267,8 @@ async fn run_switch_scenario(
         && check.session_persists_reload
         && check.switch_back_restores_default
         && check.fresh_tab_default
-        && check.stale_reset_recovers
+        && check.denied_apply_absent
+        && check.stale_selection_surfaces
         && check.viewing_non_default_reset;
     if !check.ok && check.reason.is_none() {
         check.reason = Some("one or more importer-switch assertions failed".to_string());
@@ -3321,20 +3343,27 @@ async fn run_switch_scenario_inner(
         }
     });
 
-    let view: serde_json::Value = evaluate_retry(&page, IMPORTERS_VIEW_JS, 5).await?;
-    let buttons = view
-        .get("buttons")
-        .and_then(|b| b.as_array())
+    let view: serde_json::Value = evaluate_retry(
+        &page,
+        &js_with(&[("__SELECT_ID__", SWITCH_ALT_ID)], IMPORTERS_PANEL_VIEW_JS),
+        5,
+    )
+    .await?;
+    let rows = view
+        .get("rows")
+        .and_then(|r| r.as_array())
         .cloned()
         .unwrap_or_default();
-    let button_for = |id: &str| {
-        buttons.iter().find(|b| b.get("id").and_then(|v| v.as_str()) == Some(id))
+    let row_for = |id: &str| {
+        rows.iter().find(|r| r.get("id").and_then(|v| v.as_str()) == Some(id))
     };
-    check.selector_visible = view.get("switch_state").and_then(|v| v.as_str()) == Some("enabled")
-        && button_for(SWITCH_ALT_ID)
-            .is_some_and(|b| b.get("disabled").and_then(|v| v.as_bool()) == Some(false))
-        && button_for(SWITCH_DEFAULT_ID)
-            .is_some_and(|b| b.get("viewing").and_then(|v| v.as_bool()) == Some(true));
+    check.selector_visible = view.get("error").is_none()
+        && view.get("apply_present").and_then(|v| v.as_bool()) == Some(true)
+        && view.get("apply_disabled").and_then(|v| v.as_bool()) == Some(false)
+        && row_for(SWITCH_ALT_ID)
+            .is_some_and(|r| r.get("viewing").and_then(|v| v.as_bool()) == Some(false))
+        && row_for(SWITCH_DEFAULT_ID)
+            .is_some_and(|r| r.get("viewing").and_then(|v| v.as_bool()) == Some(true));
 
     let initial: serde_json::Value = evaluate_retry(&page, NODE_IDS_JS, 5).await?;
     let initial_ids = initial
@@ -3364,29 +3393,49 @@ async fn run_switch_scenario_inner(
         && switched.get("stored").and_then(|v| v.as_bool()) == Some(true)
         && switched.get("swapped").and_then(|v| v.as_bool()) == Some(true)
         && switched.get("badge").and_then(|v| v.as_bool()) == Some(true);
-    // While viewing the alternate (still authorized), the policy reset
-    // affordance must be visible and clicking it must clear the session
-    // selection and restore the deployment default. Re-runs SWITCH_TO_ALT
-    // below so the reload test still exercises the alternate path.
-    let alt_view: serde_json::Value = evaluate_retry(&page, IMPORTERS_VIEW_JS, 5).await?;
-    let reset_visible = alt_view.get("reset_button").and_then(|v| v.as_bool()) == Some(true);
+    // While viewing the alternate (still authorized), the default profile's
+    // summary must offer 'Return to default' and clicking it must clear the
+    // session selection and restore the deployment default. Re-runs
+    // SWITCH_TO_ALT below so the reload test still exercises the alternate
+    // path.
+    let alt_view: serde_json::Value = evaluate_retry(
+        &page,
+        &js_with(&[("__SELECT_ID__", SWITCH_DEFAULT_ID)], IMPORTERS_PANEL_VIEW_JS),
+        5,
+    )
+    .await?;
+    let reset_visible = alt_view.get("apply_present").and_then(|v| v.as_bool()) == Some(true)
+        && alt_view
+            .get("apply_label")
+            .and_then(|v| v.as_str())
+            .is_some_and(|label| label.contains("Return to default"));
     let reset: serde_json::Value = evaluate_retry(
         &page,
-        &js_with(&[("__DEFAULT_NODE__", SWITCH_DEFAULT_NODE)], RESET_STALE_JS),
+        &js_with(
+            &[
+                ("__DEFAULT_ID__", SWITCH_DEFAULT_ID),
+                ("__DEFAULT_NODE__", SWITCH_DEFAULT_NODE),
+            ],
+            APPLY_DEFAULT_JS,
+        ),
         5,
     )
     .await?;
     check.viewing_non_default_reset = reset_visible
-        && reset.get("found").and_then(|v| v.as_bool()) == Some(true)
+        && reset.get("clicked").and_then(|v| v.as_bool()) == Some(true)
         && reset.get("cleared").and_then(|v| v.as_bool()) == Some(true)
         && reset.get("restored").and_then(|v| v.as_bool()) == Some(true);
-    // Re-switch so the reload + view-button assertions still exercise
+    // Re-switch so the reload + switch-back assertions still exercise
     // the alternate path. The JS returns a map; we discard the value
     // because the next assertions are what matter.
     let _: serde_json::Value = evaluate_retry(
         &page,
         &js_with(
-            &[("__ALT_ID__", SWITCH_ALT_ID), ("__ALT_NODE__", SWITCH_ALT_NODE)],
+            &[
+                ("__ALT_ID__", SWITCH_ALT_ID),
+                ("__ALT_NODE__", SWITCH_ALT_NODE),
+                ("__DEFAULT_NODE__", SWITCH_DEFAULT_NODE),
+            ],
             SWITCH_TO_ALT_JS,
         ),
         5,
@@ -3415,7 +3464,7 @@ async fn run_switch_scenario_inner(
                 ("__DEFAULT_ID__", SWITCH_DEFAULT_ID),
                 ("__DEFAULT_NODE__", SWITCH_DEFAULT_NODE),
             ],
-            SWITCH_BACK_JS,
+            APPLY_DEFAULT_JS,
         ),
         5,
     )
@@ -3446,48 +3495,56 @@ async fn run_switch_scenario_inner(
             .any(|id| id.as_str().is_some_and(|id| node_id_matches(id, SWITCH_DEFAULT_NODE)));
     let _ = fresh.close().await;
 
-    // ---- unauthorized page: the group-required note, no selector, and
-    // stale-selection recovery (no group header → no extra console gating;
-    // the page deliberately fetches a 403).
+    // ---- unauthorized page: the catalog stays reachable (it never
+    // requires the group), but no row's summary may offer the
+    // session-scoped Apply affordance.
     let denied = open_switch_page(browser, base, false).await?;
-    let denied_view: serde_json::Value = evaluate_retry(&denied, IMPORTERS_VIEW_JS, 5).await?;
-    let denied_policy = denied_view
-        .get("policy")
-        .and_then(|v| v.as_str())
-        .unwrap_or_default()
-        .to_string();
-    let denied_buttons = denied_view
-        .get("buttons")
-        .and_then(|v| v.as_array())
-        .cloned()
-        .unwrap_or_default();
-    check.denied_note = denied_view.get("switch_state").and_then(|v| v.as_str()) == Some("denied")
-        && denied_buttons.is_empty()
-        && denied_policy.contains("Switching requires NetBird group")
-        && denied_policy.contains(SWITCH_GROUP);
-
-    // Plant a stale selection as if the viewer had switched before losing
-    // the group, reload, and recover through the reset affordance.
-    denied
-        .evaluate("sessionStorage.setItem('jc_source_id', 'alt-obsidian'); location.reload()")
-        .await
-        .ok();
-    tokio::time::sleep(Duration::from_millis(500)).await;
-    let stale_view: serde_json::Value = evaluate_retry(&denied, IMPORTERS_VIEW_JS, 10).await?;
-    let reset_visible = stale_view
-        .get("reset_button")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-    let reset: serde_json::Value = evaluate_retry(
+    let denied_view: serde_json::Value = evaluate_retry(
         &denied,
-        &js_with(&[("__DEFAULT_NODE__", SWITCH_DEFAULT_NODE)], RESET_STALE_JS),
+        &js_with(&[("__SELECT_ID__", SWITCH_ALT_ID)], IMPORTERS_PANEL_VIEW_JS),
         5,
     )
     .await?;
-    check.stale_reset_recovers = reset_visible
-        && reset.get("found").and_then(|v| v.as_bool()) == Some(true)
-        && reset.get("cleared").and_then(|v| v.as_bool()) == Some(true)
-        && reset.get("restored").and_then(|v| v.as_bool()) == Some(true);
+    let denied_rows = denied_view
+        .get("rows")
+        .and_then(|r| r.as_array())
+        .cloned()
+        .unwrap_or_default();
+    check.denied_apply_absent = denied_view.get("error").is_none()
+        && denied_rows.iter().any(|r| {
+            r.get("id").and_then(|v| v.as_str()) == Some(SWITCH_ALT_ID)
+        })
+        && denied_view.get("apply_present").and_then(|v| v.as_bool()) == Some(false);
+
+    // Plant a stale selection as if the viewer had switched before losing
+    // the group and reload. The catalog must still render with the stale
+    // row marked viewing; the panel has no denied-state reset affordance,
+    // so recovery is re-authorization. (No extra console gating here: the
+    // page deliberately fetches a 403.)
+    denied
+        .evaluate(format!(
+            "sessionStorage.setItem('jc_source_id', '{SWITCH_ALT_ID}'); location.reload()"
+        ))
+        .await
+        .ok();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let stale_view: serde_json::Value = evaluate_retry(
+        &denied,
+        &js_with(&[("__SELECT_ID__", SWITCH_ALT_ID)], IMPORTERS_PANEL_VIEW_JS),
+        10,
+    )
+    .await?;
+    let stale_rows = stale_view
+        .get("rows")
+        .and_then(|r| r.as_array())
+        .cloned()
+        .unwrap_or_default();
+    check.stale_selection_surfaces = stale_view.get("error").is_none()
+        && stale_rows.iter().any(|r| {
+            r.get("id").and_then(|v| v.as_str()) == Some(SWITCH_ALT_ID)
+                && r.get("viewing").and_then(|v| v.as_bool()) == Some(true)
+        })
+        && stale_view.get("apply_present").and_then(|v| v.as_bool()) == Some(false);
     let _ = denied.close().await;
 
     Ok(())

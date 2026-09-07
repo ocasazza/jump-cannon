@@ -346,7 +346,7 @@
 
             install -m 0644 "$RUN_OUT/boot.png" "$OUT_DIR/boot.png"
             install -m 0644 "$RUN_OUT/nodes-editor.png" "$OUT_DIR/nodes-editor.png"
-            install -m 0644 "$RUN_OUT/settings-importers.png" "$OUT_DIR/settings-importers.png"
+            install -m 0644 "$RUN_OUT/importers-panel.png" "$OUT_DIR/importers-panel.png"
             install -m 0644 "$RUN_OUT/filter-builder.png" "$OUT_DIR/filter-builder.png"
             install -m 0644 "$RUN_OUT/sessions-view.png" "$OUT_DIR/sessions-view.png"
             install -m 0644 "$RUN_OUT/report.json" "$OUT_DIR/report.json"
@@ -1239,6 +1239,10 @@
             (pkgs.lib.fileset.fileFilter
               (file: builtins.any file.hasExt [ "rs" "toml" "lock" "html" "css" "wgsl" ])
               ./app)
+            # Vendored third-party assets (Monaco editor bundle, fonts, notices)
+            # ride along unfiltered — the extension allowlist above would drop
+            # .js/.ttf payloads the panel-kit editor loads at runtime.
+            ./app/ui/assets/vendor
             # The Sessions view path-depends on session-manager/graph-vcs,
             # whose *optional* server deps (graph-api, data-loader, …) still
             # need their manifests parsed, and those use `workspace = true`

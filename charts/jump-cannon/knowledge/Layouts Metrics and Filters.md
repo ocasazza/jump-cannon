@@ -9,15 +9,19 @@ tags: [jump-cannon, layout, metrics]
 # Layouts, Metrics, and Filters
 
 Settings groups persistent graph configuration and deployment discovery into
-five tabs:
+four tabs:
 
 - **Connection** selects graph-api and summarizes the active graph session.
-- **Importers** reports the active importer and the sanitized, deployment-owned
-  source catalog; switching sources remains a Helm rollout.
 - **Layout** chooses the simulation engine, starting positions, solver
   parameters, and playback behavior.
 - **Appearance** maps graph attributes to size, shape, and color.
 - **Camera** controls navigation, fitting, focus, and depth effects.
+
+Importer packages moved to the standalone **Importers** panel: it lists the
+sanitized deployment catalog alongside browser-local TOML packages, edits
+manifests and pest grammars in Monaco, and previews parses in a sandboxed Web
+Worker. Switching the server source remains a Helm rollout (or the gated
+runtime view described in [[Helm Deployment]]).
 
 The Layout tab's header carries a **This Device / Compute Cluster** switch that
 selects which engine gallery the tab shows; engines are rich cards (kind,

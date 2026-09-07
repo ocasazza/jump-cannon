@@ -835,7 +835,7 @@ pub enum SourceKind {
     /// ETag-revalidated polling).
     GitHub,
     /// Read a paged JSON API through the declarative package engine
-    /// (`crates/http-json-importer`). One kind serves every JSON API: the
+    /// (the json engine in `crates/importer`). One kind serves every JSON API: the
     /// package supplies the endpoints and mapping, and instances vary by
     /// `source_id`, exactly as Pest packages do.
     HttpJson,
@@ -904,6 +904,7 @@ pub enum Transport {
     Udp,
     InMemory,
     WasmComponent,
+    Ssh,
 }
 
 /// One exact effect grant. Scope is deliberately opaque to the core: callers

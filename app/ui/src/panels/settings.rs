@@ -1,10 +1,11 @@
 //! Unified Settings surface.
 //!
-//! Connection and the read-only importer deployment catalog remain app-owned
-//! while Layout, Appearance, and Camera delegate to their existing panel
-//! modules. Each delegate is mounted through its own component scope because
-//! those renderers use hooks whose ordering must not be coupled to the selected
-//! tab.
+//! Connection remains app-owned while Layout, Appearance, and Camera delegate
+//! to their existing panel modules. Each delegate is mounted through its own
+//! component scope because those renderers use hooks whose ordering must not be
+//! coupled to the selected tab. Importers moved to the standalone Importers
+//! panel; a persisted `importers` tab selection now fails to decode and falls
+//! back to the Connection default.
 
 use dioxus::events::{Key, KeyboardEvent};
 use dioxus::prelude::*;
@@ -21,16 +22,14 @@ const STORE_KEY: &str = "jc_settings_tab_v1";
 pub(crate) enum SettingsTab {
     #[default]
     Connection,
-    Importers,
     Layout,
     Appearance,
     Camera,
 }
 
 impl SettingsTab {
-    const ALL: [Self; 5] = [
+    const ALL: [Self; 4] = [
         Self::Connection,
-        Self::Importers,
         Self::Layout,
         Self::Appearance,
         Self::Camera,
@@ -39,7 +38,6 @@ impl SettingsTab {
     const fn label(self) -> &'static str {
         match self {
             Self::Connection => "Connection",
-            Self::Importers => "Importers",
             Self::Layout => "Layout",
             Self::Appearance => "Appearance",
             Self::Camera => "Camera",
@@ -49,7 +47,6 @@ impl SettingsTab {
     const fn slug(self) -> &'static str {
         match self {
             Self::Connection => "connection",
-            Self::Importers => "importers",
             Self::Layout => "layout",
             Self::Appearance => "appearance",
             Self::Camera => "camera",
@@ -249,457 +246,6 @@ fn connection_panel(mut ctx: Ctx) -> Element {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
-enum ImportersViewState {
-    Loading,
-    Ready(api::ImporterCatalog),
-    Failed(String),
-}
-
-/// The importer catalog for pure-frontend deployments (GitHub Pages): no
-/// graph-api exists to answer `GET /importers`, so the tab describes the
-/// importer running inside this browser — the CORS-only GitHub import —
-/// instead of erroring on the static host's 404 page. Rendered when the
-/// boot decision picked GitHub mode and the live graph is not server-backed
-/// (a user who typed a reachable server URL into Connection gets the server
-/// catalog back).
-fn browser_importer_catalog() -> Element {
-    // Live source first, then the persisted panel default, then the boot
-    // spec (deep link or Pages default). Reading LAST_IMPORT subscribes the
-    // tab so a completed import refreshes the card in place.
-    let spec = crate::github::LAST_IMPORT
-        .read()
-        .clone()
-        .or_else(crate::github::persisted_spec)
-        .or_else(crate::github::boot_spec);
-    rsx! {
-        div {
-            class: "importers-view",
-            "data-activation": "browser",
-            "data-runtime-switch": "browser",
-            section { class: "importer-policy", role: "note",
-                span { class: "importer-policy-label", "Browser-hosted" }
-                p {
-                    "No graph-api server: this browser lists, fetches, and parses the source \
-                     itself (GitHub trees + raw endpoints, CORS-only). Public repositories \
-                     only; indexed search and node metadata stay server features."
-                }
-            }
-            if let Some(spec) = spec {
-                section { class: "importer-active-summary",
-                    div {
-                        span { class: "importer-section-label", "Active importer" }
-                        strong { "GitHub (in-browser)" }
-                        code { "data-field": "active-kind", "github" }
-                    }
-                    dl { class: "importer-facts",
-                        {importer_fact("package", "active-importer-id", &format!("github.{}", crate::github::source_id_for(&spec.repo)))}
-                        {importer_fact("version", "active-importer-version", env!("CARGO_PKG_VERSION"))}
-                        {importer_fact("repository", "selected-profile", &spec.repo)}
-                        {importer_fact("ref", "active-ref", if spec.git_ref.is_empty() { "default branch" } else { &spec.git_ref })}
-                        {importer_fact("path", "active-path", if spec.path.is_empty() { "(repository root)" } else { &spec.path })}
-                        {importer_fact("namespace", "active-namespace", &format!("github:{}", crate::github::source_id_for(&spec.repo)))}
-                    }
-                    button {
-                        class: "btn",
-                        r#type: "button",
-                        onclick: move |_| {
-                            *crate::OPEN_PANEL.write() = Some(crate::Panel::GitHub);
-                        },
-                        "Configure in the GitHub panel"
-                    }
-                }
-            } else {
-                section { class: "importer-active-summary",
-                    p { class: "importers-status", "Nothing imported yet." }
-                    button {
-                        class: "btn",
-                        r#type: "button",
-                        onclick: move |_| {
-                            *crate::OPEN_PANEL.write() = Some(crate::Panel::GitHub);
-                        },
-                        "Open the GitHub panel"
-                    }
-                }
-            }
-        }
-    }
-}
-
-fn importer_fact(label: &'static str, field: &'static str, value: &str) -> Element {
-    rsx! {
-        div { class: "importer-fact",
-            dt { "{label}" }
-            dd { "data-field": field, "{value}" }
-        }
-    }
-}
-
-/// One catalog card. The default collapsed view shows only what a viewer
-/// needs to identify the source and switch to it: name, source kind,
-/// identity (source id + filesystem rescan interval), description, and
-/// one primary action button. Deployment-side configuration (volume,
-/// claim, mount, producer contract) hides behind a `<details>` disclosure
-/// so the default card stays compact while keeping the field selectors
-/// the browser regression suite exercises intact.
-#[allow(clippy::too_many_arguments)]
-fn importer_card(
-    profile: &api::ImporterProfile,
-    switch_allowed: bool,
-    viewing: Option<&str>,
-    mut on_switch: impl FnMut(Option<String>) + 'static,
-) -> Element {
-    let source_id = profile.source_id.as_deref().unwrap_or("—");
-    let is_default = profile.selected;
-    let is_viewing = match viewing {
-        Some(id) => id == profile.id,
-        None => is_default,
-    };
-    let selectable = is_default || profile.runnable;
-    let has_details = profile.source.is_some() || profile.producer.is_some();
-    // The browser regression's data-source-id / data-kind / data-default /
-    // data-viewing selectors all key on attributes SelectableCard emits;
-    // the shared `select-card` parent class only adds the neutral wrapper
-    // so importers and engines share chrome. The `importer-card*` class
-    // chain remains for the regression's
-    // `[data-source-id="lavender-ingest-okf"]` selectors.
-    let card_class: String = if is_viewing {
-        "select-card importer-card importer-card-viewing".into()
-    } else if is_default {
-        "select-card importer-card importer-card-default".into()
-    } else {
-        "select-card importer-card".into()
-    };
-    // Chips render once, in the shared SelectableCard head strip — there
-    // is no second badge row. The suffixes still carry the `importer-badge`
-    // class so the browser regression's `.importer-badge.viewing` /
-    // `.importer-badge.read-only` selectors keep matching.
-    let mut chips: Vec<(String, String)> = Vec::new();
-    chips.push((
-        "importer-badge importer-kind-tag".to_string(),
-        profile.kind.clone(),
-    ));
-    if is_viewing {
-        chips.push(("importer-badge viewing".to_string(), "viewing".to_string()));
-    }
-    if profile
-        .source
-        .as_ref()
-        .is_some_and(|source| source.read_only)
-    {
-        chips.push((
-            "importer-badge read-only".to_string(),
-            "read-only".to_string(),
-        ));
-    }
-    let button_class: String = if is_viewing {
-        "btn importer-switch-btn importer-switch-current".into()
-    } else if is_default {
-        "btn importer-switch-btn importer-switch-default".into()
-    } else {
-        "btn importer-switch-btn importer-switch-primary".into()
-    };
-    let button_label: &'static str = if is_viewing {
-        if is_default { "Default · viewing" } else { "Viewing this source" }
-    } else if is_default {
-        "Return to default"
-    } else {
-        "View this source"
-    };
-    let switch_id = profile.id.clone();
-    rsx! {
-        crate::selection_card::SelectableCard {
-            source_id: profile.id.clone(),
-            kind: profile.kind.clone(),
-            card_class,
-            name: profile.display_name.clone(),
-            subtitle: profile.id.clone(),
-            chips,
-            description: profile.description.clone(),
-            disabled_reason: String::new(),
-            is_default,
-            is_viewing,
-            is_ghost: false,
-            disabled: false,
-            title: profile.id.clone(),
-            on_select: None,
-            dl { class: "importer-facts importer-identity",
-                {importer_fact("source id", "source-id", source_id)}
-                if let Some(interval) = profile.filesystem_rescan_interval_seconds {
-                    {importer_fact(
-                        "scan",
-                        "filesystem-rescan",
-                        &format!("{interval}s"),
-                    )}
-                }
-            }
-            if switch_allowed {
-                div { class: "importer-switch-row",
-                    button {
-                        class: "{button_class}",
-                        r#type: "button",
-                        role: "radio",
-                        aria_checked: if is_viewing { "true" } else { "false" },
-                        "data-source-id": "{profile.id}",
-                        "data-viewing": if is_viewing { "true" } else { "false" },
-                        disabled: is_viewing || !selectable,
-                        onclick: move |_| {
-                            on_switch((!is_default).then(|| switch_id.clone()));
-                        },
-                        "{button_label}"
-                    }
-                }
-            }
-            if has_details {
-                details { class: "importer-details",
-                    summary { class: "importer-details-summary",
-                        span { "Deployment details" }
-                        span { class: "importer-details-hint", "filesystem + producer contract" }
-                    }
-                    if let Some(source) = &profile.source {
-                        section { class: "importer-contract importer-consumer",
-                            h4 {
-                                if source.read_only { "Read-only consumer" } else { "Filesystem source" }
-                            }
-                            dl { class: "importer-facts",
-                                {importer_fact("volume", "consumer-volume", &source.volume_name)}
-                                {importer_fact("claim", "consumer-claim", &source.existing_claim)}
-                                {importer_fact("mount", "consumer-mount", &source.mount_path)}
-                                {importer_fact("input", "consumer-input", &source.path)}
-                                {importer_fact(
-                                    "access",
-                                    "consumer-access",
-                                    if source.read_only { "read-only" } else { "read-write" },
-                                )}
-                            }
-                        }
-                    }
-                    if let Some(producer) = &profile.producer {
-                        section { class: "importer-contract importer-producer",
-                            h4 { "Producer contract" }
-                            dl { class: "importer-facts",
-                                {importer_fact("chart", "producer-chart", &producer.chart)}
-                                {importer_fact(
-                                    "default claim",
-                                    "producer-default-claim",
-                                    &producer.default_claim,
-                                )}
-                                {importer_fact(
-                                    "repository root",
-                                    "producer-repository-root",
-                                    &producer.repository_root,
-                                )}
-                                {importer_fact(
-                                    "workflow input",
-                                    "producer-workflow-input",
-                                    &producer.workflow_input,
-                                )}
-                                {importer_fact(
-                                    "writer value",
-                                    "producer-existing-claim-value-path",
-                                    &producer.existing_claim_value_path,
-                                )}
-                                {importer_fact(
-                                    "writer claim",
-                                    "producer-existing-claim-value",
-                                    &producer.existing_claim_value,
-                                )}
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-}
-
-
-
-
-fn importer_catalog(
-    catalog: &api::ImporterCatalog,
-    viewing: Option<String>,
-    mut on_switch: impl FnMut(Option<String>) + 'static + Copy,
-) -> Element {
-    let selected = catalog.selected.as_deref().unwrap_or("none");
-    let active_kind = catalog.active.kind_label();
-    let switch = &catalog.runtime_switch;
-    let switch_state = if !switch.enabled {
-        "disabled"
-    } else if switch.allowed {
-        "enabled"
-    } else {
-        "denied"
-    };
-    let switch_allowed = switch.enabled && switch.allowed;
-    let required_group = switch.required_group.as_deref().unwrap_or("?");
-    // A session override that's not the deployment default — whether stale
-    // (denied because the viewer lost the required group, or the source was
-    // undeployed) or simply an active non-default view — must always be
-    // recoverable: the reset affordance returns to the deployment default,
-    // which never requires authorization.
-    let viewing_non_default = switch.enabled
-        && viewing.is_some()
-        && viewing.as_deref() != catalog.selected.as_deref();
-    // Split profiles into the one the viewer is currently looking at
-    // (prominent) and the alternatives they could switch to (compact list).
-    // When the viewer has no session override, the deployment default is
-    // the active view; otherwise the override is.
-    let (viewing_profile, other_profiles): (Option<&api::ImporterProfile>, Vec<&api::ImporterProfile>) = {
-        let viewing_id = viewing.as_deref();
-        let active = catalog.sources.iter().find(|p| match viewing_id {
-            Some(id) => p.id == id,
-            None => p.selected,
-        });
-        let others: Vec<&api::ImporterProfile> = catalog
-            .sources
-            .iter()
-            .filter(|p| match viewing_id {
-                Some(id) => p.id != id,
-                None => !p.selected,
-            })
-            .collect();
-        (active, others)
-    };
-    rsx! {
-        div {
-            class: "importers-view",
-            "data-activation": "{catalog.activation}",
-            "data-runtime-switch": "{switch_state}",
-            section { class: "importer-policy", role: "note",
-                span { class: "importer-policy-label", "Deployment-managed" }
-                if !switch.enabled {
-                    p {
-                        "Configured by Helm. A rollout is required to switch the active importer; "
-                        "this view intentionally has no runtime activation controls."
-                    }
-                } else if switch.allowed {
-                    p {
-                        "Configured by Helm. Runtime viewing is enabled for your group: selecting a "
-                        "source re-loads this browser session's graph as a read-only view; writes, "
-                        "generation, and compute stay on the deployment default."
-                    }
-                } else {
-                    p {
-                        "Configured by Helm. Switching requires NetBird group "
-                        code { "{required_group}" }
-                        "."
-                    }
-                }
-                if viewing_non_default {
-                    button {
-                        class: "btn importer-switch-reset",
-                        r#type: "button",
-                        onclick: move |_| on_switch(None),
-                        "return to deployment default"
-                    }
-                }
-            }
-            section { class: "importer-active-summary",
-                div {
-                    span { class: "importer-section-label", "Active importer" }
-                    strong { "{catalog.active.importer.name}" }
-                    code { "data-field": "active-kind", "{active_kind}" }
-                }
-                dl { class: "importer-facts",
-                    {importer_fact("package", "active-importer-id", &catalog.active.importer.id)}
-                    {importer_fact("version", "active-importer-version", &catalog.active.importer.version)}
-                    {importer_fact("selected profile", "selected-profile", selected)}
-                }
-            }
-            // Currently-viewing: single prominent card so the viewer's eye
-            // lands on it without scanning a list.
-            if let Some(viewing_profile) = viewing_profile {
-                section {
-                    class: "importer-section importer-section-viewing",
-                    div { class: "importer-section-label", "Currently viewing" }
-                    div { class: "importer-list", "aria-label": "Active source",
-                        {importer_card(viewing_profile, switch_allowed, viewing.as_deref(), on_switch)}
-                    }
-                }
-            }
-            // Alternatives: compact list of every other runnable source. The
-            // default sits here when the viewer is currently looking at an
-            // override (return-target); alternates sit here otherwise.
-            if !other_profiles.is_empty() {
-                section {
-                    class: "importer-section importer-section-alternates",
-                    div {
-                        class: "importer-section-label",
-                        if viewing_non_default { "Return to default" } else { "Other sources" }
-                    }
-                    div { class: "importer-list", "aria-label": "Other configured sources",
-                        role: "radiogroup",
-                        for profile in &other_profiles {
-                            {importer_card(profile, switch_allowed, viewing.as_deref(), on_switch)}
-                        }
-                    }
-                }
-            }
-        }
-    }
-}
-
-
-#[allow(non_snake_case)]
-fn ImportersSettings(props: DelegateProps) -> Element {
-    let ctx = props.ctx;
-    let mut state = use_signal(|| ImportersViewState::Loading);
-    // Browser-hosted deployment (GitHub Pages or a ?gh= deep link): while no
-    // server-backed graph is live there is no /importers endpoint — the
-    // static host's 404 page is not JSON. Render the browser importer
-    // catalog instead; connecting to a reachable server (Connection tab)
-    // flips back to the server catalog automatically.
-    let browser_hosted = crate::github::boot_spec().is_some();
-    // The viewed source is session state (sessionStorage), not server state:
-    // the catalog's `selected`/`active` always describe the deployment default.
-    let mut viewing = use_signal(|| api::source_id());
-    let mut generation = use_signal(|| 0_u64);
-    use_effect(move || {
-        // Re-run after every switch so the catalog's per-request posture
-        // (`allowed`) and the cards' radio state refresh together.
-        let _ = *generation.read();
-        if browser_hosted && !ctx.graph_session.read().is_server_backed() {
-            return;
-        }
-        spawn(async move {
-            state.set(match api::importers().await {
-                Ok(catalog) => ImportersViewState::Ready(catalog),
-                Err(error) => ImportersViewState::Failed(error),
-            });
-        });
-    });
-
-    let on_switch = move |id: Option<String>| {
-        match &id {
-            Some(id) => api::set_source_id(id),
-            None => api::clear_source_id(),
-        }
-        viewing.set(id);
-        generation += 1;
-        spawn(reload_graph(ctx));
-    };
-
-    if browser_hosted && !ctx.graph_session.read().is_server_backed() {
-        return browser_importer_catalog();
-    }
-
-    let view = state.read().clone();
-    match view {
-        ImportersViewState::Loading => rsx! {
-            div { class: "importers-status", role: "status", "Loading importer catalog…" }
-        },
-        ImportersViewState::Ready(catalog) => {
-            importer_catalog(&catalog, viewing.read().clone(), on_switch)
-        }
-        ImportersViewState::Failed(error) => rsx! {
-            div { class: "importers-status error", role: "alert",
-                "Importer catalog unavailable: {error}"
-            }
-        },
-    }
-}
-
 /// Manual props keep `Ctx`'s signal-bundle type unchanged while still giving
 /// each delegated renderer a real component boundary for its hooks.
 #[derive(Clone, Copy, Props)]
@@ -764,7 +310,6 @@ pub fn panel(ctx: Ctx) -> Element {
                 tabindex: "0",
                 match active {
                     SettingsTab::Connection => connection_panel(ctx),
-                    SettingsTab::Importers => rsx! { ImportersSettings { ctx } },
                     SettingsTab::Layout => rsx! { LayoutSettings { ctx } },
                     SettingsTab::Appearance => rsx! { AppearanceSettings { ctx } },
                     SettingsTab::Camera => rsx! { CameraSettings { ctx } },

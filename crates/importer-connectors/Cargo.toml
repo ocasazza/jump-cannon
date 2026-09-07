@@ -1,0 +1,56 @@
+[package]
+name = "importer-connectors"
+version = "1.0.0"
+edition = "2021"
+description = "Generic byte-source connectors (HTTPS, SSH, gRPC) and archive envelope expansion feeding runtime grammar packages"
+
+[features]
+default = ["https", "envelope"]
+https = ["dep:reqwest", "dep:gloo-net", "dep:futures-channel", "dep:wasm-bindgen-futures"]
+envelope = ["dep:tar", "dep:zip", "dep:flate2"]
+ssh = ["dep:ssh2"]
+grpc = [
+    "dep:tonic",
+    "dep:prost",
+    "dep:prost-types",
+    "dep:prost-reflect",
+    "dep:tonic-reflection",
+    "dep:tokio",
+    "dep:tokio-stream",
+]
+
+[dependencies]
+data-loader = { path = "../data-loader" }
+serde       = { workspace = true }
+serde_json  = { workspace = true }
+tar         = { version = "0.4", optional = true }
+zip         = { version = "8", default-features = false, features = ["deflate"], optional = true }
+flate2      = { version = "1", optional = true }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"], optional = true }
+ssh2 = { version = "0.9", features = ["vendored-openssl"], optional = true }
+tonic = { version = "0.14", default-features = false, features = ["channel", "codegen", "tls-webpki-roots"], optional = true }
+prost = { version = "0.14", optional = true }
+prost-types = { version = "0.14", optional = true }
+prost-reflect = { version = "0.16", features = ["serde"], optional = true }
+tonic-reflection = { version = "0.14", default-features = false, optional = true }
+tokio = { version = "1", features = ["macros", "rt", "net", "sync", "time"], optional = true }
+tokio-stream = { version = "0.1", optional = true }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+gloo-net = { version = "0.7", default-features = false, features = ["http"], optional = true }
+futures-channel = { version = "0.3", optional = true }
+wasm-bindgen-futures = { version = "0.4", optional = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+parking_lot = "0.12"
+bytes = "1"
+http-body = "1"
+http-body-util = "0.1"
+tempfile = "3"
+tonic = { version = "0.14", features = ["transport"] }
+tonic-reflection = { version = "0.14", features = ["server"] }
+tokio-stream = { version = "0.1", features = ["net"] }
+prost = { version = "0.14", features = ["derive"] }
