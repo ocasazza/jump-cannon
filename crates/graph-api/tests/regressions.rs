@@ -267,6 +267,8 @@ async fn importer_catalog_is_read_only_sorted_and_sanitized() {
     assert!(body.get("capabilities").is_none());
     assert!(!body.to_string().contains("token"));
 
+    // Without the runtime-switch gate the catalog stays read-only: the
+    // mutation route refuses before it even looks at the body.
     let mutation = app
         .oneshot(
             Request::builder()
@@ -277,7 +279,7 @@ async fn importer_catalog_is_read_only_sorted_and_sanitized() {
         )
         .await
         .unwrap();
-    assert_eq!(mutation.status(), StatusCode::METHOD_NOT_ALLOWED);
+    assert_eq!(mutation.status(), StatusCode::FORBIDDEN);
 }
 
 #[tokio::test]
@@ -1286,4 +1288,273 @@ async fn runtime_switch_error_contract() {
     }
 
     let _ = std::fs::remove_dir_all(&vault);
+}
+
+// ── Importer package definitions (GET/PUT /importers/:id/definition, POST /importers) ──
+
+const TOML_PACKAGE: &str =
+    include_str!("../../../charts/jump-cannon/packages/hindsight-memory-bank.toml");
+
+/// A packages dir holding the shipped package under a catalog-declared
+/// filename, plus a catalog binding it as a runnable httpjson source.
+fn packages_fixture(tag: &str) -> (std::path::PathBuf, String) {
+    let dir = std::env::temp_dir().join(format!("jump-cannon-pkgs-{}-{tag}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("packages dir");
+    std::fs::write(dir.join("hindsight.toml"), TOML_PACKAGE).expect("package file");
+    let catalog = serde_json::json!({
+        "selected": "default-gen",
+        "sources": {
+            "default-gen": { "displayName": "Default generated", "kind": "generate" },
+            "hindsight": {
+                "displayName": "Hindsight",
+                "kind": "httpjson",
+                "httpJson": {
+                    "package": "hindsight.toml",
+                    "endpoint": "http://hindsight.invalid",
+                    "variables": { "bank": "omp" }
+                }
+            }
+        }
+    })
+    .to_string();
+    (dir, catalog)
+}
+
+fn packages_host(dir: &std::path::Path, catalog_raw: &str, group: Option<&str>) -> SourceHost {
+    let mut catalog = ImporterCatalog::parse_with_runtime_switch(
+        Some(catalog_raw),
+        data_loader::SourceKind::Generate,
+        group.is_some(),
+    )
+    .expect("catalog parses");
+    catalog.load_overlay(dir).expect("overlay merges");
+    SourceHost::with_packages_dir(
+        state_with_catalog(catalog),
+        SwitchConfig::new(group.map(str::to_owned), GROUPS_HEADER),
+        Some(dir.to_path_buf()),
+    )
+}
+
+fn json_request(method: &str, path: &str, body: serde_json::Value, groups: Option<&str>) -> Request<Body> {
+    let mut builder = Request::builder()
+        .method(method)
+        .uri(path)
+        .header("content-type", "application/json");
+    if let Some(groups) = groups {
+        builder = builder.header(GROUPS_HEADER, groups);
+    }
+    builder.body(Body::from(body.to_string())).unwrap()
+}
+
+async fn text_body(response: axum::response::Response) -> String {
+    String::from_utf8(
+        to_bytes(response.into_body(), 1 << 20)
+            .await
+            .expect("body")
+            .to_vec(),
+    )
+    .expect("utf-8 body")
+}
+
+/// GET exposes the authored package source with the read posture of the
+/// catalog (no group needed); PUT carries the switch authorization, validates
+/// before writing, and replaces the file atomically.
+#[tokio::test]
+async fn importer_definition_get_and_put_contract() {
+    let (dir, catalog) = packages_fixture("definition");
+    let app = graph_api::router_with_host(packages_host(&dir, &catalog, Some(SWITCH_GROUP)));
+
+    let response = app
+        .clone()
+        .oneshot(Request::builder().uri("/importers/hindsight/definition").body(Body::empty()).unwrap())
+        .await
+        .expect("definition served");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = json_body(response).await;
+    assert_eq!(body["package"], "hindsight.toml");
+    assert_eq!(body["writable"], true);
+    assert_eq!(body["source"].as_str().unwrap(), TOML_PACKAGE);
+
+    let unknown = app
+        .clone()
+        .oneshot(Request::builder().uri("/importers/nope/definition").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(unknown.status(), StatusCode::NOT_FOUND);
+    let not_package = app
+        .clone()
+        .oneshot(Request::builder().uri("/importers/default-gen/definition").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(not_package.status(), StatusCode::BAD_REQUEST);
+
+    let forbidden = app
+        .clone()
+        .oneshot(json_request(
+            "PUT",
+            "/importers/hindsight/definition",
+            serde_json::json!({ "source": TOML_PACKAGE }),
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(forbidden.status(), StatusCode::FORBIDDEN);
+
+    let invalid = app
+        .clone()
+        .oneshot(json_request(
+            "PUT",
+            "/importers/hindsight/definition",
+            serde_json::json!({ "source": "format_version = 1\n" }),
+            Some(SWITCH_GROUP),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
+    assert!(text_body(invalid).await.contains("format_version 3"));
+    assert_eq!(
+        std::fs::read_to_string(dir.join("hindsight.toml")).unwrap(),
+        TOML_PACKAGE,
+        "a rejected PUT never touches the file"
+    );
+
+    let edited = TOML_PACKAGE.replace(
+        "name = \"Hindsight memory bank\"",
+        "name = \"Edited bank\"",
+    );
+    let saved = app
+        .clone()
+        .oneshot(json_request(
+            "PUT",
+            "/importers/hindsight/definition",
+            serde_json::json!({ "source": edited }),
+            Some(SWITCH_GROUP),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(saved.status(), StatusCode::OK);
+    let body = json_body(saved).await;
+    assert_eq!(body["writable"], true);
+    assert_eq!(std::fs::read_to_string(dir.join("hindsight.toml")).unwrap(), edited);
+    assert!(
+        std::fs::read_dir(&dir).unwrap().all(|entry| {
+            !entry.unwrap().file_name().to_string_lossy().contains(".tmp-")
+        }),
+        "atomic write leaves no temp file behind"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// POST validates, writes the package file, appends the overlay catalog, and
+/// publishes the source (origin `runtime`) — which a fresh boot re-merges.
+#[tokio::test]
+async fn importers_post_adds_runtime_source_and_persists_overlay() {
+    let (dir, catalog) = packages_fixture("post");
+    let app = graph_api::router_with_host(packages_host(&dir, &catalog, Some(SWITCH_GROUP)));
+    let body = serde_json::json!({
+        "id": "local-bank",
+        "name": "Local bank",
+        "description": "added at runtime",
+        "package": "local-bank.toml",
+        "source": TOML_PACKAGE,
+        "endpoint": "http://hindsight.invalid",
+        "variables": { "bank": "local" },
+        "pollIntervalMs": 30000
+    });
+
+    let forbidden = app
+        .clone()
+        .oneshot(json_request("POST", "/importers", body.clone(), None))
+        .await
+        .unwrap();
+    assert_eq!(forbidden.status(), StatusCode::FORBIDDEN);
+
+    let mut bad_id = body.clone();
+    bad_id["id"] = serde_json::json!("Bad Id");
+    let rejected = app
+        .clone()
+        .oneshot(json_request("POST", "/importers", bad_id, Some(SWITCH_GROUP)))
+        .await
+        .unwrap();
+    assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
+    let mut escaping = body.clone();
+    escaping["package"] = serde_json::json!("../escape.toml");
+    let rejected = app
+        .clone()
+        .oneshot(json_request("POST", "/importers", escaping, Some(SWITCH_GROUP)))
+        .await
+        .unwrap();
+    assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
+    let mut bad_source = body.clone();
+    bad_source["source"] = serde_json::json!("format_version = 3\nnot-a-package = true\n");
+    let rejected = app
+        .clone()
+        .oneshot(json_request("POST", "/importers", bad_source, Some(SWITCH_GROUP)))
+        .await
+        .unwrap();
+    assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
+    assert!(!dir.join("local-bank.toml").exists(), "rejected POST writes nothing");
+
+    let created = app
+        .clone()
+        .oneshot(json_request("POST", "/importers", body.clone(), Some(SWITCH_GROUP)))
+        .await
+        .unwrap();
+    assert_eq!(created.status(), StatusCode::CREATED);
+    let item = json_body(created).await;
+    assert_eq!(item["id"], "local-bank");
+    assert_eq!(item["origin"], "runtime");
+    assert_eq!(item["runnable"], true);
+    assert_eq!(item["httpJson"]["package"], "local-bank.toml");
+    assert_eq!(item["httpJson"]["pollIntervalMs"], 30000);
+    assert_eq!(std::fs::read_to_string(dir.join("local-bank.toml")).unwrap(), TOML_PACKAGE);
+    let overlay: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(dir.join("catalog.local.json")).unwrap())
+            .unwrap();
+    assert_eq!(overlay["sources"]["local-bank"]["httpJson"]["variables"]["bank"], "local");
+
+    let duplicate = app
+        .clone()
+        .oneshot(json_request("POST", "/importers", body.clone(), Some(SWITCH_GROUP)))
+        .await
+        .unwrap();
+    assert_eq!(duplicate.status(), StatusCode::CONFLICT);
+
+    let catalog_now = app
+        .clone()
+        .oneshot(Request::builder().uri("/importers").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let listed = json_body(catalog_now).await;
+    let sources = listed["sources"].as_array().unwrap();
+    let local = sources.iter().find(|s| s["id"] == "local-bank").expect("runtime source listed");
+    assert_eq!(local["origin"], "runtime");
+    assert!(sources.iter().filter(|s| s["id"] != "local-bank").all(|s| s["origin"] == "deployment"));
+
+    // The new source's definition is served and editable like a chart one.
+    let definition = app
+        .clone()
+        .oneshot(Request::builder().uri("/importers/local-bank/definition").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(definition.status(), StatusCode::OK);
+
+    // A fresh host over the same dir re-merges the overlay at boot.
+    let rebooted = graph_api::router_with_host(packages_host(&dir, &catalog, Some(SWITCH_GROUP)));
+    let listed = json_body(
+        rebooted
+            .oneshot(Request::builder().uri("/importers").body(Body::empty()).unwrap())
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert!(listed["sources"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|s| s["id"] == "local-bank" && s["origin"] == "runtime"));
+
+    let _ = std::fs::remove_dir_all(&dir);
 }

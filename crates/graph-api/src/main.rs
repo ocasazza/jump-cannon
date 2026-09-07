@@ -271,13 +271,22 @@ async fn main() -> anyhow::Result<()> {    let _ = dotenvy::dotenv();
         );
     }
 
-    let importer_catalog = ImporterCatalog::parse_with_runtime_switch(
+    let mut importer_catalog = ImporterCatalog::parse_with_runtime_switch(
         args.importer_catalog_json.as_deref(),
         source_kind.clone(),
         switch.enabled(),
     )
     .map_err(anyhow::Error::msg)
     .context("invalid deployment importer catalog")?;
+    // Runtime-authored sources (`POST /importers`) persist in the packages
+    // dir; a broken overlay must not take the deployment down with it.
+    if let Some(packages_dir) = &args.importer_packages_dir {
+        match importer_catalog.load_overlay(packages_dir) {
+            Ok(0) => {}
+            Ok(merged) => tracing::info!(merged, "merged runtime importer catalog overlay"),
+            Err(error) => tracing::warn!(%error, "ignoring runtime importer catalog overlay"),
+        }
+    }
 
     let importer: Box<dyn Importer> = match source_kind {
         data_loader::SourceKind::World => {
@@ -433,29 +442,13 @@ async fn main() -> anyhow::Result<()> {    let _ = dotenvy::dotenv();
             let endpoint = args.importer_endpoint.clone().with_context(|| {
                 "--source=httpjson requires --importer-endpoint / JUMP_CANNON_IMPORTER_ENDPOINT"
             })?;
-            let manifest_len = std::fs::metadata(manifest_path)
-                .with_context(|| {
-                    format!(
-                        "failed to inspect importer package {}",
-                        manifest_path.display()
-                    )
-                })?
-                .len() as usize;
-            anyhow::ensure!(
-                manifest_len <= importer::HARD_LIMITS.manifest_bytes,
-                "importer package {} is {} bytes; hard limit is {} bytes",
-                manifest_path.display(),
-                manifest_len,
-                importer::HARD_LIMITS.manifest_bytes
+            let (package, definition) =
+                graph_api::importer_package::load_importer_package(manifest_path)
+                    .map_err(anyhow::Error::msg)?;
+            tracing::info!(
+                package = %definition.path.display(),
+                "loaded importer package"
             );
-            let raw = std::fs::read(manifest_path).with_context(|| {
-                format!(
-                    "failed to read importer package {}",
-                    manifest_path.display()
-                )
-            })?;
-            let package = importer::ValidatedPackage::from_toml_bytes(&raw)
-                .with_context(|| format!("invalid importer package {}", manifest_path.display()))?;
             let variables = parse_importer_vars(&args.importer_vars)?;
             let source_id = args
                 .importer_source_id

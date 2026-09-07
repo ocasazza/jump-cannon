@@ -17,6 +17,13 @@ crate, not a Hindsight-specific one. There is no `Hindsight` source kind:
 the kind is `httpjson` and Hindsight is the package that maps its endpoints
 (see [[Importer Runtime]] and AGENTS.md "Importers: packages, not crates").
 
+Each memory unit's `fact_type` (`world` | `experience` | `observation`, a DB
+CHECK constraint) becomes the node's type through the package's
+`[parser.collections.nodes.doctype]` rule, so color-by / shape-by /
+filter-by type separate Hindsight's three biomimetic memory types on the
+canvas; `fact_type` also stays indexed raw. A value outside the declared map
+falls back to the collection's `node_type`.
+
 ## How a bank becomes an instance
 
 A bank is the unit of selection. Two instance-level variables feed into the
@@ -101,13 +108,18 @@ and writing facts back through a graph view would bypass it.
 
 ## Adding another bank
 
-Same package, new instance — no Rust touched. Drop a copy of the TOML
-verbatim (it's a single source-of-truth mapping) and bind it through the
-chart's `httpJsonImporter` values:
+Same package, new instance — no Rust touched. Either bind a copy of the
+package TOML, verbatim, through the chart's `httpJsonImporter` values:
 
 - `httpJsonImporter.package` → `hindsight-memory-bank.toml`
 - `httpJsonImporter.endpoint` → API root for that bank
 - `httpJsonImporter.variables` → `{ tenant: <t>, bank: <b> }`
+
+or, with `importers.runtimeSwitchGroup` set and a writable
+`JUMP_CANNON_IMPORTER_PACKAGES_DIR`, use the Importers panel's "+ New
+source" action (`POST /importers`): it writes the package file next to the
+shipped ones and records the source in `catalog.local.json`, which survives
+restarts.
 
 Two graph-api pods running the same package against two different
 endpoints publish two distinct graphs (`httpjson:omp:…`,

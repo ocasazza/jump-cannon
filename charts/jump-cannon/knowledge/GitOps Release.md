@@ -49,6 +49,28 @@ remote builder (`ssh://root@pdx-nxst-001.schrodinger.com` is in
 `/etc/nix/machines` and reachable off-NetBird), stream the closure down,
 and `crane push` the tarball to GAR `latest`.
 
+Before rebuilding, check whether the image already exists and only the push
+failed: the per-job hook logs live under
+`/var/lib/hydra/runcommand-logs/<xx>/<uuid>` on pdx-nxnx-lv01 and a
+transient registry error looks like `skopeo … writing blob: uploading layer
+chunked: StatusCode: 400, "<!DOCTYPE html>…"`. The hook is idempotent and
+driven only by `$HYDRA_JSON`, so replay it for the finished build instead of
+rebuilding (seen on build 9042, 2026-09-04; `latest` stayed on 9035 and the
+pod rolled onto the old image until this was done):
+
+```bash
+# on pdx-nxnx-lv01, as root
+J=$(mktemp); chown hydra-queue-runner "$J"
+echo '{"buildStatus":0,"build":<id>,"outputs":[{"name":"out","path":"<store path of the build's out>"}]}' > "$J"
+sudo -u hydra-queue-runner env HYDRA_JSON="$J" \
+  /nix/store/…-k8s-image-publish-jump-cannon-graph-api/bin/k8s-image-publish-jump-cannon-graph-api
+```
+
+The script path is the `command` of the matching `<runcommand>` block in
+`/var/lib/hydra/hydra.conf`; the store path is `outputs[].path` from
+`GET /build/<id>` on the Hydra API. Then `kubectl rollout restart` as above
+and confirm the new pod's `imageID` digest changed.
+
 ## Chart/image publish race
 
 The chart tarball and the runtime images are separate Hydra jobs of one

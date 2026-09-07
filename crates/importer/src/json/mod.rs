@@ -33,9 +33,9 @@ use data_loader::{
     ImporterDescriptor, SourceConnector, SourceRecord, Transport, WatchPlan,
 };
 pub use config::{
-    Collection, Dedupe, EdgeListRules, EdgeRule, FieldRule, JsonEngineConfig, MatchOn, NodeRules,
-    Pagination, Predicate, Preflight, Produces, TitleRule, Transform, VariableSpec, ENGINE,
-    MAX_PAGE_SIZE, MAX_REQUEST_TIMEOUT_SECONDS, SOURCE_KIND,
+    Collection, Dedupe, DoctypeRule, EdgeListRules, EdgeRule, FieldRule, JsonEngineConfig, MatchOn,
+    NodeRules, Pagination, Predicate, Preflight, Produces, TitleRule, Transform, VariableSpec,
+    ENGINE, MAX_PAGE_SIZE, MAX_REQUEST_TIMEOUT_SECONDS, SOURCE_KIND,
 };
 pub use connector::{HttpJsonConnector, JsonTransport};
 #[cfg(feature = "native")]

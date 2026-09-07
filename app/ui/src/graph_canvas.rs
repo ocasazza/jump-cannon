@@ -352,8 +352,8 @@ pub fn GraphCanvas(graph: Signal<Option<GraphData>>, selected: Signal<Option<Str
                         d.last_my = c.y;
                         drag.set(Some(d));
                     } else {
-                        // Hover pipeline (anchored cards + shader rim +
-                        // focus dim) — throttle/hold policy lives there.
+                        // Hover pipeline (header hint + shader rim + focus
+                        // dim) — throttle/hold policy lives there.
                         crate::anchored::hover_at(c.x as f32, c.y as f32);
                     }
                 },
@@ -362,17 +362,17 @@ pub fn GraphCanvas(graph: Signal<Option<GraphData>>, selected: Signal<Option<Str
                     drag.set(None);
                     // A press that never travelled is a click. The anchored
                     // module owns the egui click semantics: node hit →
-                    // sticky focus + promoted card (and we mirror the hit
-                    // into `selected` for the Inspector/Document panels,
-                    // like the egui `selected_node_idx`); empty canvas →
-                    // clear sticky focus, `selected` untouched.
+                    // sticky focus (and we mirror the hit into `selected`
+                    // for the Inspector/Document panels, like the egui
+                    // `selected_node_idx`); empty canvas → clear sticky
+                    // focus, `selected` untouched.
                     if let Some(d) = was {
                         if !d.moved {
                             let c = e.element_coordinates();
-                            let hit_id = graph.read().as_ref().and_then(|g| {
-                                crate::anchored::canvas_click(c.x as f32, c.y as f32, g)
-                                    .and_then(|i| g.ids.get(i as usize).cloned())
-                            });
+                            let hit_id = crate::anchored::canvas_click(c.x as f32, c.y as f32)
+                                .and_then(|i| {
+                                    graph.read().as_ref().and_then(|g| g.ids.get(i as usize).cloned())
+                                });
                             if hit_id.is_some() {
                                 selected.set(hit_id);
                             }

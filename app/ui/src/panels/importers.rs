@@ -47,10 +47,13 @@ fn sample_key(id: &str) -> String {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Selection {
-    /// Server catalog profile id (manifest body is deployment-side).
+    /// Server catalog profile id; an httpjson entry's package file is served
+    /// and written through `/importers/:id/definition`.
     Catalog(String),
     /// Browser-local package id (key into PACKAGES).
     Local(String),
+    /// Draft of a new server catalog source (`POST /importers`).
+    NewCatalog,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -66,6 +69,41 @@ enum CatalogState {
     Loading,
     Ready(api::ImporterCatalog),
     Unavailable(String),
+}
+
+/// The authored package file behind the selected catalog source
+/// (`GET`/`PUT /importers/:id/definition`).
+#[derive(Clone, PartialEq)]
+enum ServerPackage {
+    /// Not requested for the current selection.
+    Idle,
+    Loading,
+    /// Text as the server last served or accepted.
+    Ready(api::ImporterDefinition),
+    Failed(String),
+}
+
+/// `POST /importers` draft. The package body is the editor's MANIFEST
+/// buffer, so it gets Monaco and the sandbox preview like any other package.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct NewSourceDraft {
+    id: String,
+    name: String,
+    endpoint: String,
+    package: String,
+    variables: Vec<(String, String)>,
+}
+
+impl Default for NewSourceDraft {
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            name: String::new(),
+            endpoint: String::new(),
+            package: "my-importer.toml".to_string(),
+            variables: vec![(String::new(), String::new())],
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -89,6 +127,12 @@ static STATUS: GlobalSignal<Option<String>> = Signal::global(|| None);
 static CATALOG: GlobalSignal<CatalogState> = Signal::global(|| CatalogState::Idle);
 /// Session-scoped source override (mirrors sessionStorage via api::source_id).
 static VIEWING: GlobalSignal<Option<String>> = Signal::global(api::source_id);
+static SERVER_PACKAGE: GlobalSignal<ServerPackage> = Signal::global(|| ServerPackage::Idle);
+static NEW_SOURCE: GlobalSignal<NewSourceDraft> = Signal::global(NewSourceDraft::default);
+/// A `PUT`/`POST` is in flight; the editor's write actions stay disabled.
+static BUSY: GlobalSignal<bool> = Signal::global(|| false);
+/// Last server rejection (validation text, authorization, read-only dir).
+static ERROR: GlobalSignal<Option<String>> = Signal::global(|| None);
 
 // --- manifest text surgery (pure functions; unit-tested below) --------------------
 
@@ -301,6 +345,8 @@ fn set_manifest_from_grammar(text: String) {
 }
 
 fn select(sel: Selection) {
+    *SERVER_PACKAGE.write() = ServerPackage::Idle;
+    *ERROR.write() = None;
     match &sel {
         Selection::Local(id) => {
             let manifest = PACKAGES.peek().get(id).cloned().unwrap_or_default();
@@ -310,11 +356,106 @@ fn select(sel: Selection) {
         }
         Selection::Catalog(_) => {
             *SELECTION.write() = Some(sel);
-            *MANIFEST.write() = String::new();
+            set_manifest(String::new());
+        }
+        Selection::NewCatalog => {
+            *SELECTION.write() = Some(sel);
+            set_manifest(template_manifest("custom.new-source", "New source"));
         }
     }
     *PREVIEW.write() = PreviewState::Idle;
     *STATUS.write() = None;
+}
+
+/// Start a `POST /importers` draft: a fresh catalog entry plus the package
+/// template as its body.
+fn new_catalog_source() {
+    *NEW_SOURCE.write() = NewSourceDraft::default();
+    select(Selection::NewCatalog);
+}
+
+/// Fetch the selected catalog source's authored package into the editor.
+fn load_server_package(id: String) {
+    *SERVER_PACKAGE.write() = ServerPackage::Loading;
+    *ERROR.write() = None;
+    spawn(async move {
+        match api::importer_definition(&id).await {
+            Ok(definition) => {
+                set_manifest(definition.source.clone());
+                *SERVER_PACKAGE.write() = ServerPackage::Ready(definition);
+            }
+            Err(message) => *SERVER_PACKAGE.write() = ServerPackage::Failed(message),
+        }
+    });
+}
+
+/// Write the editor buffer back. The server validates before it writes, so a
+/// rejection leaves the deployed package untouched and is shown verbatim.
+fn save_server_package(id: String) {
+    if *BUSY.peek() {
+        return;
+    }
+    let source = MANIFEST.peek().clone();
+    *BUSY.write() = true;
+    *ERROR.write() = None;
+    *STATUS.write() = Some("validating and saving…".into());
+    spawn(async move {
+        match api::put_importer_definition(&id, &source).await {
+            Ok(definition) => {
+                *STATUS.write() =
+                    Some("saved — applying this source rebuilds it from the new package".into());
+                *SERVER_PACKAGE.write() = ServerPackage::Ready(definition);
+            }
+            Err(message) => {
+                *STATUS.write() = None;
+                *ERROR.write() = Some(message);
+            }
+        }
+        *BUSY.write() = false;
+    });
+}
+
+/// `POST /importers`: the draft's catalog entry plus the editor buffer as its
+/// package file. On success the catalog is refetched and the new source
+/// selected, so the same editor now edits it.
+fn create_catalog_source() {
+    if *BUSY.peek() {
+        return;
+    }
+    let draft = NEW_SOURCE.peek().clone();
+    let importer = api::NewImporter {
+        id: draft.id.trim().to_string(),
+        name: draft.name.trim().to_string(),
+        description: String::new(),
+        package: draft.package.trim().to_string(),
+        source: MANIFEST.peek().clone(),
+        endpoint: draft.endpoint.trim().to_string(),
+        variables: draft
+            .variables
+            .iter()
+            .filter(|(key, _)| !key.trim().is_empty())
+            .map(|(key, value)| (key.trim().to_string(), value.trim().to_string()))
+            .collect(),
+    };
+    *BUSY.write() = true;
+    *ERROR.write() = None;
+    *STATUS.write() = Some("validating and creating…".into());
+    spawn(async move {
+        match api::post_importer(&importer).await {
+            Ok(profile) => {
+                *CATALOG.write() = match api::importers().await {
+                    Ok(catalog) => CatalogState::Ready(catalog),
+                    Err(error) => CatalogState::Unavailable(error),
+                };
+                select(Selection::Catalog(profile.id));
+            }
+            Err(message) => {
+                *STATUS.write() = None;
+                *ERROR.write() = Some(message);
+            }
+        }
+        *BUSY.write() = false;
+    });
 }
 
 fn unique_local_id(base: &str) -> String {
@@ -432,6 +573,11 @@ pub fn panel(ctx: Ctx) -> Element {
     let preview_running = *PREVIEW_RUNNING.read();
     let status = STATUS.read().clone();
     let spliceable = *GRAMMAR_SPLICEABLE.read();
+    let server_package = SERVER_PACKAGE.read().clone();
+    let busy = *BUSY.read();
+    let error = ERROR.read().clone();
+    let manifest_empty = MANIFEST.read().trim().is_empty();
+    let switch_allowed = catalog_runtime_switch(&catalog);
 
     let run_preview = move |_| {
         if *PREVIEW_RUNNING.read() {
@@ -468,6 +614,13 @@ pub fn panel(ctx: Ctx) -> Element {
                 div { class: "imp-list-head",
                     span { "Server catalog" }
                     if matches!(catalog, CatalogState::Ready(_)) {
+                        button {
+                            class: "btn imp-mini",
+                            r#type: "button",
+                            "data-action": "new-source",
+                            onclick: move |_| new_catalog_source(),
+                            "+ New source"
+                        }
                         button {
                             class: "btn imp-mini",
                             r#type: "button",
@@ -606,12 +759,11 @@ pub fn panel(ctx: Ctx) -> Element {
                         };
                         match profile {
                             Some(profile) => {
-                                let switch = catalog_runtime_switch(&catalog);
                                 let is_default = profile.selected;
                                 let is_viewing = viewing.as_deref() == Some(profile.id.as_str())
                                     || (viewing.is_none() && is_default);
                                 let native = is_native_kind(&profile.kind);
-                                let apply_allowed = switch
+                                let apply_allowed = switch_allowed
                                     && (is_default || profile.runnable)
                                     && !is_viewing;
                                 // Clearing the session's own selection is session-local
@@ -624,22 +776,38 @@ pub fn panel(ctx: Ctx) -> Element {
                                     "Apply (view this source)"
                                 };
                                 let apply_id = profile.id.clone();
+                                // Only httpjson entries name one package file the server
+                                // can serve and rewrite through /importers/:id/definition.
+                                let has_package_file = profile.kind == "httpjson";
+                                let load_id = profile.id.clone();
+                                let save_id = profile.id.clone();
+                                let editor_key = profile.id.clone();
+                                let display_name = profile.display_name.clone();
+                                let package_id = profile.id.clone();
+                                let kind = profile.kind.clone();
+                                let description = profile.description.clone();
                                 rsx! {
                                     div { class: "imp-summary",
-                                        div { class: "imp-summary-title", "{profile.display_name}" }
+                                        div { class: "imp-summary-title", "{display_name}" }
                                         dl { class: "imp-facts",
                                             div { class: "imp-fact",
                                                 dt { "package" }
-                                                dd { "data-field": "package-id", "{profile.id}" }
+                                                dd { "data-field": "package-id", "{package_id}" }
                                             }
                                             div { class: "imp-fact",
                                                 dt { "kind" }
-                                                dd { "data-field": "package-kind", "{profile.kind}" }
+                                                dd { "data-field": "package-kind", "{kind}" }
                                             }
-                                            if !profile.description.is_empty() {
+                                            if !description.is_empty() {
                                                 div { class: "imp-fact",
                                                     dt { "description" }
-                                                    dd { "{profile.description}" }
+                                                    dd { "{description}" }
+                                                }
+                                            }
+                                            if let ServerPackage::Ready(definition) = &server_package {
+                                                div { class: "imp-fact",
+                                                    dt { "file" }
+                                                    dd { "data-field": "package-file", "{definition.package}" }
                                                 }
                                             }
                                         }
@@ -649,8 +817,10 @@ pub fn panel(ctx: Ctx) -> Element {
                                                 "native-only connector: ssh/grpc acquisition runs inside graph-api; the browser cannot preview it"
                                             }
                                         }
-                                        div { class: "imp-note",
-                                            "the manifest TOML lives deployment-side; duplicate this entry to edit a local copy"
+                                        if !has_package_file {
+                                            div { class: "imp-note",
+                                                "this source kind names no single package file; duplicate the entry to edit a local copy"
+                                            }
                                         }
                                         div { class: "imp-actions",
                                             button {
@@ -684,12 +854,79 @@ pub fn panel(ctx: Ctx) -> Element {
                                                     "{apply_label}"
                                                 }
                                             }
-                                            button {
-                                                class: "btn",
-                                                r#type: "button",
-                                                disabled: true,
-                                                title: "manifest lives deployment-side — duplicate to local first",
-                                                "Copy TOML"
+                                            if has_package_file
+                                                && matches!(server_package, ServerPackage::Idle | ServerPackage::Failed(_))
+                                            {
+                                                button {
+                                                    class: "btn",
+                                                    r#type: "button",
+                                                    "data-action": "load-definition",
+                                                    onclick: move |_| load_server_package(load_id.clone()),
+                                                    "Edit server package"
+                                                }
+                                            }
+                                        }
+                                    }
+                                    match &server_package {
+                                        ServerPackage::Idle => rsx! {},
+                                        ServerPackage::Loading => rsx! {
+                                            div { class: "imp-note", role: "status", "loading package definition…" }
+                                        },
+                                        ServerPackage::Failed(message) => rsx! {
+                                            div { class: "imp-error", role: "alert",
+                                                "data-field": "definition-error", "{message}"
+                                            }
+                                        },
+                                        ServerPackage::Ready(definition) => {
+                                            // The server probes its own packages directory:
+                                            // a ConfigMap projection is immutable however
+                                            // authorized the viewer is.
+                                            let editable = switch_allowed && definition.writable;
+                                            let original = definition.source.clone();
+                                            let dirty = *MANIFEST.read() != definition.source;
+                                            rsx! {
+                                                {manifest_editor(editor_key.clone(), editor_view, spliceable, !editable)}
+                                                if !editable {
+                                                    p { class: "imp-readonly", "data-field": "definition-readonly",
+                                                        if !switch_allowed {
+                                                            "read-only: writing a deployment package requires runtime switching to be enabled for your group"
+                                                        } else {
+                                                            "read-only: the server's packages directory is not writable"
+                                                        }
+                                                    }
+                                                }
+                                                div { class: "imp-actions",
+                                                    button {
+                                                        class: "btn",
+                                                        r#type: "button",
+                                                        "data-action": "save-definition",
+                                                        disabled: !editable || !dirty || busy,
+                                                        onclick: move |_| save_server_package(save_id.clone()),
+                                                        "Save to server"
+                                                    }
+                                                    button {
+                                                        class: "btn",
+                                                        r#type: "button",
+                                                        "data-action": "revert-definition",
+                                                        disabled: !dirty || busy,
+                                                        onclick: move |_| {
+                                                            set_manifest(original.clone());
+                                                            *ERROR.write() = None;
+                                                            *STATUS.write() = None;
+                                                        },
+                                                        "Revert"
+                                                    }
+                                                    button {
+                                                        class: "btn",
+                                                        r#type: "button",
+                                                        "data-action": "copy-toml",
+                                                        onclick: move |_| {
+                                                            copy_to_clipboard(&MANIFEST.peek());
+                                                            *STATUS.write() = Some("package copied to clipboard".into());
+                                                        },
+                                                        "Copy TOML"
+                                                    }
+                                                }
                                             }
                                         }
                                     }
@@ -707,66 +944,7 @@ pub fn panel(ctx: Ctx) -> Element {
                         let pid_delete = pid.clone();
                         let editor_key = pid.clone();
                         rsx! {
-                            div { class: "imp-editor-tabs", role: "tablist",
-                                button {
-                                    class: if editor_view == EditorView::Manifest { "imp-tab active" } else { "imp-tab" },
-                                    r#type: "button",
-                                    role: "tab",
-                                    "data-view": "manifest",
-                                    aria_selected: if editor_view == EditorView::Manifest { "true" } else { "false" },
-                                    onclick: move |_| *EDITOR_VIEW.write() = EditorView::Manifest,
-                                    "Manifest (TOML)"
-                                }
-                                button {
-                                    class: if editor_view == EditorView::Grammar { "imp-tab active" } else { "imp-tab" },
-                                    r#type: "button",
-                                    role: "tab",
-                                    "data-view": "grammar",
-                                    aria_selected: if editor_view == EditorView::Grammar { "true" } else { "false" },
-                                    onclick: move |_| *EDITOR_VIEW.write() = EditorView::Grammar,
-                                    "Grammar (pest)"
-                                }
-                            }
-                            div { class: "imp-editor-host",
-                                match editor_view {
-                                    EditorView::Manifest => rsx! {
-                                        // One-way binding: the editor is the only writer while
-                                        // mounted; cross-view sync happens via remount (key) so
-                                        // no signal write can reenter the editor's on_change.
-                                        MonacoEditor {
-                                            key: "{editor_key}",
-                                            initial: MANIFEST.peek().clone(),
-                                            language: "toml".to_string(),
-                                            theme: Some(PANEL_KIT_DARK_THEME.to_string()),
-                                            on_change: move |text: String| set_manifest(text),
-                                        }
-                                    },
-                                    EditorView::Grammar => rsx! {
-                                        if spliceable {
-                                            MonacoEditor {
-                                                key: "{editor_key}",
-                                                initial: GRAMMAR.peek().clone(),
-                                                language: "pest".to_string(),
-                                                theme: Some(PANEL_KIT_DARK_THEME.to_string()),
-                                                on_change: move |text: String| {
-                                                    // The peek guard must drop before the arms
-                                                    // write MANIFEST — a scrutinee temporary
-                                                    // lives for the whole match.
-                                                    let current = MANIFEST.peek().clone();
-                                                    match splice_grammar(&current, &text) {
-                                                        Ok(manifest) => set_manifest_from_grammar(manifest),
-                                                        Err(e) => *STATUS.write() = Some(e),
-                                                    }
-                                                },
-                                            }
-                                        } else {
-                                            div { class: "imp-note", "data-field": "grammar-readonly",
-                                                "no spliceable grammar = ''' literal under [parser] — edit the manifest TOML directly (json-engine packages have no pest grammar)"
-                                            }
-                                        }
-                                    },
-                                }
-                            }
+                            {manifest_editor(editor_key, editor_view, spliceable, false)}
                             div { class: "imp-actions",
                                 button {
                                     class: "btn",
@@ -818,13 +996,143 @@ pub fn panel(ctx: Ctx) -> Element {
                             }
                         }
                     }
+                    Some(Selection::NewCatalog) => {
+                        let draft = NEW_SOURCE.read().clone();
+                        let rows = draft.variables.len();
+                        let ready = !draft.id.trim().is_empty()
+                            && !draft.name.trim().is_empty()
+                            && !draft.endpoint.trim().is_empty()
+                            && !draft.package.trim().is_empty();
+                        rsx! {
+                            div { class: "imp-form", "data-form": "new-source",
+                                div { class: "imp-summary-title", "New server source" }
+                                div { class: "imp-note",
+                                    "declares a catalog entry plus its package file; both land in the server's packages directory and are re-merged at boot"
+                                }
+                                if !switch_allowed {
+                                    p { class: "imp-readonly", "data-field": "create-readonly",
+                                        "read-only: adding a source requires runtime switching to be enabled for your group"
+                                    }
+                                }
+                                label { class: "imp-field",
+                                    span { "id" }
+                                    input {
+                                        r#type: "text",
+                                        placeholder: "my-bank",
+                                        value: "{draft.id}",
+                                        oninput: move |e| NEW_SOURCE.write().id = e.value(),
+                                    }
+                                }
+                                label { class: "imp-field",
+                                    span { "name" }
+                                    input {
+                                        r#type: "text",
+                                        placeholder: "My bank",
+                                        value: "{draft.name}",
+                                        oninput: move |e| NEW_SOURCE.write().name = e.value(),
+                                    }
+                                }
+                                label { class: "imp-field",
+                                    span { "endpoint" }
+                                    input {
+                                        r#type: "text",
+                                        placeholder: "http://api.example.svc:8080",
+                                        value: "{draft.endpoint}",
+                                        oninput: move |e| NEW_SOURCE.write().endpoint = e.value(),
+                                    }
+                                }
+                                label { class: "imp-field",
+                                    span { "package file" }
+                                    input {
+                                        r#type: "text",
+                                        placeholder: "my-importer.toml",
+                                        value: "{draft.package}",
+                                        oninput: move |e| NEW_SOURCE.write().package = e.value(),
+                                    }
+                                }
+                                div { class: "imp-vars",
+                                    span { class: "imp-note", "variables" }
+                                    for row in 0..rows {
+                                        div { key: "{row}", class: "imp-var",
+                                            input {
+                                                r#type: "text",
+                                                placeholder: "key",
+                                                value: "{draft.variables[row].0}",
+                                                oninput: move |e| NEW_SOURCE.write().variables[row].0 = e.value(),
+                                            }
+                                            span { "=" }
+                                            input {
+                                                r#type: "text",
+                                                placeholder: "value",
+                                                value: "{draft.variables[row].1}",
+                                                oninput: move |e| NEW_SOURCE.write().variables[row].1 = e.value(),
+                                            }
+                                            button {
+                                                class: "btn imp-mini",
+                                                r#type: "button",
+                                                title: "Remove variable",
+                                                disabled: rows == 1,
+                                                onclick: move |_| { NEW_SOURCE.write().variables.remove(row); },
+                                                "×"
+                                            }
+                                        }
+                                    }
+                                    button {
+                                        class: "btn imp-mini",
+                                        r#type: "button",
+                                        onclick: move |_| {
+                                            NEW_SOURCE.write().variables.push((String::new(), String::new()));
+                                        },
+                                        "+ variable"
+                                    }
+                                }
+                            }
+                            {manifest_editor("new-source".to_string(), editor_view, spliceable, false)}
+                            div { class: "imp-actions",
+                                button {
+                                    class: "btn",
+                                    r#type: "button",
+                                    "data-action": "create-source",
+                                    disabled: !switch_allowed || !ready || busy || manifest_empty,
+                                    onclick: move |_| create_catalog_source(),
+                                    "Create"
+                                }
+                                button {
+                                    class: "btn",
+                                    r#type: "button",
+                                    "data-action": "cancel-source",
+                                    disabled: busy,
+                                    onclick: move |_| {
+                                        *SELECTION.write() = None;
+                                        set_manifest(String::new());
+                                        *ERROR.write() = None;
+                                        *STATUS.write() = None;
+                                    },
+                                    "Cancel"
+                                }
+                            }
+                        }
+                    }
                 }}
+                if let Some(message) = &error {
+                    div { class: "imp-error", role: "alert", "data-field": "write-error", "{message}" }
+                }
             }
 
             // ── bottom: parse preview ──────────────────────────────────
             div { class: "imp-preview",
-                {match &selection {
-                    Some(Selection::Local(_)) => rsx! {
+                {if selection.is_none() {
+                    rsx! {
+                        div { class: "imp-note", "preview runs against the selected package" }
+                    }
+                } else if manifest_empty {
+                    rsx! {
+                        div { class: "imp-note",
+                            "load the server package, or duplicate the entry to a local package, to run parse previews"
+                        }
+                    }
+                } else {
+                    rsx! {
                         div { class: "imp-preview-input",
                             textarea {
                                 class: "imp-sample",
@@ -845,7 +1153,7 @@ pub fn panel(ctx: Ctx) -> Element {
                                 class: "btn",
                                 r#type: "button",
                                 "data-action": "parse-preview",
-                                disabled: preview_running || MANIFEST.read().trim().is_empty(),
+                                disabled: preview_running || manifest_empty,
                                 onclick: run_preview,
                                 if preview_running { "Parsing…" } else { "Parse preview" }
                             }
@@ -896,16 +1204,84 @@ pub fn panel(ctx: Ctx) -> Element {
                                 },
                             }
                         }
-                    },
-                    Some(Selection::Catalog(_)) => rsx! {
-                        div { class: "imp-note",
-                            "duplicate this catalog entry to a local package to run parse previews"
-                        }
-                    },
-                    None => rsx! {
-                        div { class: "imp-note", "preview runs against the selected local package" }
-                    },
+                    }
                 }}
+            }
+        }
+    }
+}
+
+/// The manifest/grammar editor pair, shared by local packages, deployment
+/// packages fetched from the server, and a `POST /importers` draft.
+/// `read_only` is the server's posture: a package the viewer may read but not
+/// write (unauthorized, or an immutable packages directory).
+fn manifest_editor(
+    editor_key: String,
+    view: EditorView,
+    spliceable: bool,
+    read_only: bool,
+) -> Element {
+    rsx! {
+        div { class: "imp-editor-tabs", role: "tablist",
+            button {
+                class: if view == EditorView::Manifest { "imp-tab active" } else { "imp-tab" },
+                r#type: "button",
+                role: "tab",
+                "data-view": "manifest",
+                aria_selected: if view == EditorView::Manifest { "true" } else { "false" },
+                onclick: move |_| *EDITOR_VIEW.write() = EditorView::Manifest,
+                "Manifest (TOML)"
+            }
+            button {
+                class: if view == EditorView::Grammar { "imp-tab active" } else { "imp-tab" },
+                r#type: "button",
+                role: "tab",
+                "data-view": "grammar",
+                aria_selected: if view == EditorView::Grammar { "true" } else { "false" },
+                onclick: move |_| *EDITOR_VIEW.write() = EditorView::Grammar,
+                "Grammar (pest)"
+            }
+        }
+        div { class: "imp-editor-host",
+            match view {
+                EditorView::Manifest => rsx! {
+                    // One-way binding: the editor is the only writer while
+                    // mounted; cross-view sync happens via remount (key) so
+                    // no signal write can reenter the editor's on_change.
+                    MonacoEditor {
+                        key: "{editor_key}",
+                        initial: MANIFEST.peek().clone(),
+                        language: "toml".to_string(),
+                        theme: Some(PANEL_KIT_DARK_THEME.to_string()),
+                        read_only: read_only,
+                        on_change: move |text: String| set_manifest(text),
+                    }
+                },
+                EditorView::Grammar => rsx! {
+                    if spliceable {
+                        MonacoEditor {
+                            key: "{editor_key}",
+                            initial: GRAMMAR.peek().clone(),
+                            language: "pest".to_string(),
+                            theme: Some(PANEL_KIT_DARK_THEME.to_string()),
+                            read_only: read_only,
+                            on_change: move |text: String| {
+                                // The peek guard must drop before the arms
+                                // write MANIFEST — a scrutinee temporary
+                                // lives for the whole match.
+                                let current = MANIFEST.peek().clone();
+                                match splice_grammar(&current, &text) {
+                                    Ok(manifest) => set_manifest_from_grammar(manifest),
+                                    Err(e) => *STATUS.write() = Some(e),
+                                }
+                            },
+                        }
+                    } else {
+                        div { class: "imp-note", "data-field": "grammar-readonly",
+                            "no spliceable grammar = ''' literal under [parser] — edit the manifest TOML directly (json-engine packages have no pest grammar)"
+                        }
+                    }
+                },
             }
         }
     }

@@ -75,6 +75,10 @@ node_type = "memory"
 tags_pointer = "/tags"
 skip_unless = { pointer = "/state", equals = "valid", missing_matches = true }
 
+[parser.collections.nodes.doctype]
+pointer = "/fact_type"
+map = { world = "World Fact", experience = "Experience", observation = "Observation" }
+
 [parser.collections.nodes.title]
 pointer = "/text"
 max_chars = 20
@@ -174,9 +178,10 @@ fn hindsight_records() -> Vec<DecodedRecord> {
             json!({"items": [
                 {"id": "u1", "text": "First fact about tofu state migration handling",
                  "entities": "tofu, Hydra", "tags": ["project:x", "project:x", " "],
-                 "state": "valid", "document_id": "doc-1"},
+                 "state": "valid", "document_id": "doc-1", "fact_type": "world"},
                 {"id": "u2", "text": "Second fact", "entities": "Hydra",
-                 "tags": [], "state": "valid", "document_id": "doc-1"},
+                 "tags": [], "state": "valid", "document_id": "doc-1",
+                 "fact_type": "opinion"},
                 {"id": "u3", "text": "Retired fact", "entities": "tofu",
                  "tags": [], "state": "invalidated", "document_id": "doc-1"}
             ]}),
@@ -234,6 +239,30 @@ fn output_satisfies_the_declared_schema() {
 }
 
 #[test]
+fn doctype_rule_resolves_per_record_with_collection_fallback() {
+    let result = mapped();
+    let doctype = |local: &str| result.graph.nodes[&node_id(local)].meta.doctype.clone();
+    let indexed_type = |local: &str| {
+        result
+            .search_documents
+            .iter()
+            .find(|document| document.node_id == node_id(local))
+            .expect("indexed document")
+            .fields["type"]
+            .clone()
+    };
+    // Mapped value → the display label, on both the node and the facet.
+    assert_eq!(doctype("u1").as_deref(), Some("World Fact"));
+    assert_eq!(indexed_type("u1"), json!("World Fact"));
+    // A value outside the declared vocabulary falls back to node_type.
+    assert_eq!(doctype("u2").as_deref(), Some("memory"));
+    assert_eq!(indexed_type("u2"), json!("memory"));
+    // Collections without a doctype rule still type every node.
+    assert_eq!(doctype("entity:e1").as_deref(), Some("entity"));
+    assert_eq!(indexed_type("entity:e1"), json!("entity"));
+}
+
+#[test]
 fn skip_unless_drops_retired_documents() {
     let result = mapped();
     assert!(result.graph.nodes.contains_key(&node_id("u1")));
@@ -283,7 +312,7 @@ fn tags_are_trimmed_deduplicated_and_mirrored_into_search() {
         .find(|document| document.node_id == node_id("u1"))
         .expect("search document");
     assert_eq!(document.fields["tags"], json!(["project:x"]));
-    assert_eq!(document.fields["type"], json!("memory"));
+    assert_eq!(document.fields["type"], json!("World Fact"));
     assert_eq!(document.fields["folder"], json!("memories"));
 }
 

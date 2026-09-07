@@ -20,6 +20,14 @@ GitHub delivers a repository tarball over HTTP with ETag polling and reuses
 the Obsidian markdown pipeline; see [[GitHub Importer]]. OKF implements the
 official format version 0.2; its `0.2` version must not be called `0.0.2`.
 
+A package is exactly one `format_version = 3` TOML file. A Nix serialization
+of the same manifest, evaluated server-side by the tvix evaluator, was tried
+and superseded: one authored format keeps the editor, the ConfigMap glob
+(`packages/*.toml`), and validation single-pathed, and the shared envelope
+already carries what the `let`-bound Nix form was collapsing. `.nix` package
+files are not loaded; `tvix_wasm::eval_to_json` stays private to graph
+generation.
+
 Every importer descriptor must supply discovery schema version 2. It declares
 input media types, typed search/facet fields, edge semantics, and content
 capabilities. `id`, `title`, and `tags` are required searchable fields, and
@@ -63,12 +71,32 @@ one with `importers.selected`. graph-api validates the bounded catalog against
 the source that actually started and exposes only its sanitized form through
 `GET /importers`. The rollout-based selection remains the deployment default;
 when `importers.runtimeSwitchGroup` is set, viewers in that NetBird group can
-also switch the viewed source per browser session from the Settings tab, with
+also switch the viewed source per browser session from the Importers panel,
 writes and compute pinned to the deployment-selected source. The viewer's
 selection lives in sessionStorage as the **bare string** `jc_source_id` (no
 JSON encoding — the harness and proxy tooling plant and read it through the
 DOM storage API), rides as the `x-jump-cannon-source` request header, and as
 `?source=` on the layout WebSocket, whose browser API cannot set headers.
+
+Package definitions are editable through the same gate. `GET
+/importers/{id}/definition` returns an httpjson source's authored TOML
+(`package`, `source`, `writable`) with the catalog's read posture;
+`PUT /importers/{id}/definition` and `POST /importers` require the caller's
+groups header to contain `importers.runtimeSwitchGroup` (403 otherwise, and
+always 403 when switching is disabled). Writes validate first (400 with the
+validator's message verbatim), then land atomically in
+`JUMP_CANNON_IMPORTER_PACKAGES_DIR` (409 when that directory is read-only),
+and drop the cached alternate so the next switch rebuilds from the new file;
+the deployment default's own importer keeps the package it loaded at boot.
+`POST /importers` also appends the new source to
+`<packages_dir>/catalog.local.json`, a runtime overlay graph-api merges into
+the chart catalog at boot (entries carry `origin: runtime`; an overlay that
+fails validation or shadows a chart id is logged and ignored). The Importers
+panel is the surface: selecting a catalog entry offers "Edit server package"
+(the Monaco TOML/grammar editor over the served text, then "Save to server"),
+and "+ New source" drives `POST /importers`. Browser-local packages in the
+same panel never leave localStorage, and the grammar preview always runs in
+the sandbox Web Worker — the server never parses a sample input.
 
 The default markdown loader resolves wikilinks and is currently the only
 importer that advertises readable and writable source content. Kubernetes

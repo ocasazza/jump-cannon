@@ -21,12 +21,15 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock, RwLockWriteGuard};
 use std::time::{Duration, Instant};
 
+use arc_swap::ArcSwap;
 use axum::extract::FromRequestParts;
 use axum::http::request::Parts;
 use axum::http::{HeaderMap, HeaderName, StatusCode};
 use axum::response::{IntoResponse, Response};
 
-use crate::importer_catalog::{CatalogSourceKind, ImporterCatalog, RuntimeSwitchStatus};
+use crate::importer_catalog::{
+    CatalogSourceKind, ImporterCatalog, ImporterSourceDefinition, RuntimeSwitchStatus,
+};
 use crate::progress::ProgressLog;
 use crate::state::AppState;
 
@@ -184,7 +187,9 @@ const ALTERNATE_EVICTION_INTERVAL: Duration = Duration::from_secs(60);
 
 struct SourceHostInner {
     default: AppState,
-    catalog: ImporterCatalog,
+    /// Chart catalog plus runtime overlay entries. Swapped wholesale when
+    /// `POST /importers` adds a source; readers never block.
+    catalog: ArcSwap<ImporterCatalog>,
     switch: SwitchConfig,
     alternates: RwLock<HashMap<String, AlternateEntry>>,
     /// Serializes lazy builds so a concurrent burst builds one alternate once.
@@ -259,7 +264,7 @@ impl SourceHost {
     ) -> Self {
         let host = Self {
             inner: Arc::new(SourceHostInner {
-                catalog: default.inner.importer_catalog.clone(),
+                catalog: ArcSwap::from_pointee(default.inner.importer_catalog.clone()),
                 default,
                 switch,
                 alternates: RwLock::new(HashMap::new()),
@@ -329,8 +334,49 @@ impl SourceHost {
         &self.inner.switch
     }
 
-    pub fn catalog(&self) -> &ImporterCatalog {
-        &self.inner.catalog
+    /// The catalog as of this call. Runtime additions swap in a new
+    /// snapshot; a held `Arc` keeps serving the old view consistently.
+    pub fn catalog(&self) -> Arc<ImporterCatalog> {
+        self.inner.catalog.load_full()
+    }
+
+    /// The directory catalog `httpJson.package` filenames resolve against.
+    pub fn packages_dir(&self) -> Option<&Path> {
+        self.inner.packages_dir.as_deref()
+    }
+
+    /// Drop a cached alternate (serving or failed) so the next selection
+    /// rebuilds it from the current package file. No-op for unknown ids.
+    pub fn invalidate_alternate(&self, source_id: &str) {
+        let removed = self.write_alternates().remove(source_id);
+        if let Some(AlternateEntry {
+            source: AlternateSource::Serving {
+                watcher: Some(handle),
+                ..
+            },
+            ..
+        }) = removed
+        {
+            handle.abort();
+        }
+    }
+
+    /// Add a runtime-authored source to the live catalog (see
+    /// [`ImporterCatalog::insert_runtime_source`]). Compare-and-swap: two
+    /// concurrent adds of the same id resolve to one success and one clean
+    /// "already exists".
+    pub fn add_runtime_source(
+        &self,
+        id: String,
+        definition: ImporterSourceDefinition,
+    ) -> Result<(), String> {
+        let mut outcome = Ok(());
+        self.inner.catalog.rcu(|current| {
+            let mut next = ImporterCatalog::clone(current);
+            outcome = next.insert_runtime_source(id.clone(), definition.clone());
+            next
+        });
+        outcome
     }
 
     /// Resolve a request's selection to the serving state. `requested` is the
@@ -350,13 +396,14 @@ impl SourceHost {
         }
         // The deployment default never requires authorization; the UI may send
         // the header unconditionally once a viewer has switched back.
-        if self.inner.catalog.selected() == Some(id) {
+        let catalog = self.inner.catalog.load();
+        if catalog.selected() == Some(id) {
             return Ok(self.default_resolution());
         }
         if !self.inner.switch.authorize(headers) {
             return Err(SourceError::Forbidden);
         }
-        let Some(definition) = self.inner.catalog.source(id) else {
+        let Some(definition) = catalog.source(id) else {
             return Err(SourceError::Unknown(id.to_owned()));
         };
         if !definition.runnable() {
@@ -394,6 +441,7 @@ impl SourceHost {
         let definition = self
             .inner
             .catalog
+            .load()
             .source(source_id)
             .expect("ensure_serving is only called for known sources")
             .clone();
@@ -472,35 +520,14 @@ async fn build_alternate(
                 )
             })?;
             let manifest_path = packages_dir.join(&http_json.package);
-            let manifest_len = std::fs::metadata(&manifest_path)
-                .map_err(|error| {
-                    format!(
-                        "httpjson source {source_id:?}: failed to inspect package {}: {error}",
-                        manifest_path.display()
-                    )
-                })?
-                .len() as usize;
-            if manifest_len > importer::HARD_LIMITS.manifest_bytes {
-                return Err(format!(
-                    "httpjson source {source_id:?} package {} is {} bytes; hard limit is {} bytes",
-                    manifest_path.display(),
-                    manifest_len,
-                    importer::HARD_LIMITS.manifest_bytes
-                ));
-            }
-            let raw = std::fs::read(&manifest_path).map_err(|error| {
-                format!(
-                    "httpjson source {source_id:?}: failed to read package {}: {error}",
-                    manifest_path.display()
-                )
-            })?;
-            let package = importer::ValidatedPackage::from_toml_bytes(&raw)
-                .map_err(|error| {
-                    format!(
-                        "httpjson source {source_id:?}: invalid package {}: {error}",
-                        manifest_path.display()
-                    )
-                })?;
+            // Package validation compiles the declared grammar and is
+            // synchronous CPU work; keep it off the async runtime.
+            let (package, _definition) = tokio::task::spawn_blocking(move || {
+                crate::importer_package::load_importer_package(&manifest_path)
+            })
+            .await
+            .map_err(|error| format!("httpjson source {source_id:?}: package load task failed: {error}"))?
+            .map_err(|error| format!("httpjson source {source_id:?}: {error}"))?;
             let source_id_value = definition
                 .source_id
                 .clone()

@@ -176,8 +176,16 @@ pub struct NodeRules {
     /// Prefix keeping local IDs distinct across collections (`entity:`).
     #[serde(default)]
     pub local_prefix: String,
-    /// Value of the canonical faceted `type` field, e.g. `memory`.
+    /// Collection-wide node type: the canonical faceted `type` field and the
+    /// node's `doctype` for every record the `doctype` rule below does not
+    /// resolve, e.g. `memory`.
     pub node_type: String,
+    /// Per-record type derived from the document itself, e.g. Hindsight's
+    /// `fact_type` (`world` / `experience` / `observation`). Resolved values
+    /// drive color-by/shape-by/filter downstream exactly like a vault
+    /// frontmatter `doctype`.
+    #[serde(default)]
+    pub doctype: Option<DoctypeRule>,
     /// Folder facet; defaults to the collection name.
     #[serde(default)]
     pub folder: Option<String>,
@@ -208,6 +216,20 @@ pub struct TitleRule {
     /// Prefix for the `{prefix} {short-id}` fallback when the pointer is empty.
     #[serde(default = "default_subject")]
     pub fallback_prefix: String,
+}
+
+/// Per-record node type. The value at `pointer` (a JSON string) is looked up
+/// in `map` when the map is non-empty — a bounded, package-declared
+/// vocabulary so the `type` facet cannot balloon on hostile or drifting
+/// data — and used verbatim otherwise. A missing value, or an unmapped one
+/// when `map` is declared, falls back to the collection's `node_type`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DoctypeRule {
+    pub pointer: String,
+    /// Raw document value → display type (`world` → `World Fact`).
+    #[serde(default)]
+    pub map: BTreeMap<String, String>,
 }
 
 /// Equality predicate over one pointer, case-insensitive.
@@ -413,6 +435,16 @@ pub(crate) fn validate_config(
                 validate_pointer(&format!("{name}.title.pointer"), &rules.title.pointer)?;
                 if rules.node_type.trim().is_empty() {
                     return Err(invalid(format!("{name}.node_type must be non-empty")));
+                }
+                if let Some(rule) = &rules.doctype {
+                    validate_pointer(&format!("{name}.doctype.pointer"), &rule.pointer)?;
+                    for (raw, label) in &rule.map {
+                        if raw.trim().is_empty() || label.trim().is_empty() {
+                            return Err(invalid(format!(
+                                "{name}.doctype.map entries must be non-empty, got {raw:?} = {label:?}"
+                            )));
+                        }
+                    }
                 }
                 if rules.title.max_chars == 0 {
                     return Err(invalid(format!("{name}.title.max_chars must be non-zero")));

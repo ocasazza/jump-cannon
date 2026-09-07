@@ -19,6 +19,7 @@ mod badges;
 mod selection_card;
 mod client_log;
 mod graph_canvas;
+mod hints;
 mod palette;
 mod panels;
 mod pest_worker;
@@ -30,7 +31,7 @@ mod github;
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use dioxus::events::{Key, KeyboardEvent};
+use dioxus::events::{Key, KeyboardEvent, Modifiers};
 use dioxus::prelude::*;
 use gloo_storage::{LocalStorage, Storage};
 use panel_kit::{LayoutBuilder, PanelWin, Spinner};
@@ -1217,6 +1218,17 @@ fn App() -> Element {
                     render::clear_keys();
                     return;
                 }
+                // Super+V (⌘V / Meta+V): open the hinted node (hovered,
+                // else selected) in the Inspector. Never reaches the camera
+                // keys, so a held Meta can't leave a WASDQE key stuck.
+                if e.modifiers().contains(Modifiers::META) {
+                    if let Key::Character(c) = e.key() {
+                        if c.eq_ignore_ascii_case("v") && anchored::view_node(ctx) {
+                            e.prevent_default();
+                        }
+                    }
+                    return;
+                }
                 match e.key() {
                     Key::Shift => render::key_event("Shift", true),
                     Key::Character(c) => {
@@ -1275,6 +1287,7 @@ fn App() -> Element {
                         "{mode_label} · connecting…"
                     }
                 }
+                {hints::header_bar()}
                 if n_running > 0 {
                     span { class: "activity", Spinner {} " running {n_running}" }
                 } else if g_now.is_none() {
@@ -1289,9 +1302,10 @@ fn App() -> Element {
                 AppView::Sessions => rsx! { SessionsWorkspaceView { ws: ViewWs(ws_sessions), ctx } },
             }}
 
-            // Phase-4 overlays: both render empty until active.
+            // Root-mounted, render-empty drivers: the palette overlay (empty
+            // until opened) and the hover/click focus engine.
             {palette::overlay(ctx)}
-            {anchored::overlay(ctx)}
+            {anchored::driver(ctx)}
         }
     }
 }

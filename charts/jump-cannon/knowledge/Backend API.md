@@ -27,9 +27,13 @@ title-only matching.
 
 `GET /importers` returns the active descriptor plus a bounded, sanitized list
 of configured source instances. Its activation mode is `helm_rollout`; the API
-does not expose a source-selection or run mutation. graph-api rejects an
+exposes no source-selection or run mutation. graph-api rejects an
 unknown selection, a selected kind that differs from the importer actually
-started, and unsafe filesystem profiles during startup.
+started, and unsafe filesystem profiles during startup. Package text is the
+one mutable surface: `GET /importers/:id/definition` reads an httpjson
+source's authored TOML, and `PUT /importers/:id/definition` plus
+`POST /importers` write it behind the runtime-switch group (see
+[[Importer Runtime]], "Package definitions").
 
 Bulk arrays use little-endian numeric buffers; structured messages use protobuf
 or JSON where appropriate. See [[Architecture]], [[Observability]], and
