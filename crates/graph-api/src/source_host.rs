@@ -32,6 +32,7 @@ use crate::importer_catalog::{
 };
 use crate::progress::ProgressLog;
 use crate::state::AppState;
+use crate::watcher::RescanGate;
 
 /// Header carrying the viewer's selected source id on plain HTTP calls.
 pub const SOURCE_HEADER: &str = "x-jump-cannon-source";
@@ -169,11 +170,22 @@ enum AlternateSource {
     Failed(String),
 }
 
-/// One entry in the alternates map: its state plus the last time a request
-/// resolved to it, driving idle eviction.
+/// One entry in the alternates map: its state plus how recently a request
+/// resolved to it — `last_used` drives idle eviction, `gate` drives the
+/// watcher's periodic rescan. Inert on a `Failed` entry, which has no
+/// watcher.
 struct AlternateEntry {
     source: AlternateSource,
     last_used: Instant,
+    gate: Arc<RescanGate>,
+}
+
+/// Record a request resolving to this entry. Both signals move together: an
+/// entry kept resident by traffic must also keep rescanning, and one that
+/// stops being requested must stop rebuilding before the sweep evicts it.
+fn mark_entry_used(entry: &mut AlternateEntry, now: Instant) {
+    entry.last_used = now;
+    entry.gate.mark_used();
 }
 
 /// How long a lazily-built alternate stays resident — and its background
@@ -445,7 +457,15 @@ impl SourceHost {
             .source(source_id)
             .expect("ensure_serving is only called for known sources")
             .clone();
-        match build_alternate(source_id, &definition, self.inner.packages_dir.as_deref()).await {
+        let gate = Arc::new(RescanGate::default());
+        match build_alternate(
+            source_id,
+            &definition,
+            self.inner.packages_dir.as_deref(),
+            Arc::clone(&gate),
+        )
+        .await
+        {
             Ok((state, watcher)) => {
                 tracing::info!(source = source_id, "alternate importer source serving");
                 self.write_alternates().insert(
@@ -456,6 +476,7 @@ impl SourceHost {
                             watcher,
                         },
                         last_used: Instant::now(),
+                        gate,
                     },
                 );
                 Ok(state)
@@ -467,6 +488,7 @@ impl SourceHost {
                     AlternateEntry {
                         source: AlternateSource::Failed(message.clone()),
                         last_used: Instant::now(),
+                        gate,
                     },
                 );
                 Err(message)
@@ -474,12 +496,14 @@ impl SourceHost {
         }
     }
 
-    /// Bumps an existing entry's last-used time and returns its cached
-    /// result, or `None` if no entry exists yet.
+    /// Bumps an existing entry's last-used time, marks its rescan gate, and
+    /// returns its cached result, or `None` if no entry exists yet. The gate
+    /// is the alternate watcher's only "recently requested" signal: a
+    /// periodic tick with no touch since the previous one rebuilds nothing.
     fn touch_alternate(&self, source_id: &str) -> Option<Result<AppState, String>> {
         let mut alternates = self.write_alternates();
         let entry = alternates.get_mut(source_id)?;
-        entry.last_used = Instant::now();
+        mark_entry_used(entry, Instant::now());
         Some(match &entry.source {
             AlternateSource::Serving { state, .. } => Ok(state.clone()),
             AlternateSource::Failed(message) => Err(message.clone()),
@@ -502,11 +526,14 @@ impl SourceHost {
 /// variables are all carried by the catalog profile. The entry's declared
 /// rescan interval drives the filesystem alt's periodic full rescan
 /// (0 = notifications only); poll-kind sources (httpjson) drive their own
-/// cadence via the importer's `WatchPlan::Poll` and ignore the second arg.
+/// cadence via the importer's `WatchPlan::Poll` and ignore that argument.
+/// Every alternate's driver is gated on `gate`, so its periodic rebuilds
+/// stop while no request resolves to this source.
 async fn build_alternate(
     source_id: &str,
     definition: &crate::importer_catalog::ImporterSourceDefinition,
     packages_dir: Option<&Path>,
+    gate: Arc<RescanGate>,
 ) -> Result<(AppState, Option<tokio::task::JoinHandle<()>>), String> {
     match definition.kind {
         CatalogSourceKind::HttpJson => {
@@ -562,10 +589,11 @@ async fn build_alternate(
                 })?;
             // The watcher dispatches on the importer's own `WatchPlan`
             // (Poll for httpjson, Filesystem for the OKF/Obsidian arms
-            // below), so the second arg is ignored for this kind.
-            let watcher = crate::watcher::spawn(
+            // below), so the rescan interval is ignored for this kind.
+            let watcher = crate::watcher::spawn_gated(
                 state.clone(),
                 definition.filesystem_rescan_interval_seconds.unwrap_or(0),
+                gate,
             );
             Ok((state, watcher))
         }
@@ -595,9 +623,10 @@ async fn build_alternate(
             let state = crate::build_world_state(importer, grants, root, progress)
                 .await
                 .map_err(|error| format!("import alternate source {source_id:?}: {error}"))?;
-            let watcher = crate::watcher::spawn(
+            let watcher = crate::watcher::spawn_gated(
                 state.clone(),
                 definition.filesystem_rescan_interval_seconds.unwrap_or(0),
+                gate,
             );
             Ok((state, watcher))
         }
@@ -709,6 +738,7 @@ mod tests {
         AlternateEntry {
             source: AlternateSource::Failed("unused".to_owned()),
             last_used: Instant::now() - idle_for,
+            gate: Arc::new(RescanGate::default()),
         }
     }
 
@@ -744,14 +774,29 @@ mod tests {
     /// build immediately, not the pre-insert idle state — this is what
     /// `ensure_serving` relies on via `touch_alternate`.
     #[test]
-    fn touching_an_entry_resets_its_idle_clock() {
+    fn marking_an_entry_used_resets_its_idle_clock() {
         let mut alternates = HashMap::new();
         alternates.insert("alt".to_owned(), entry(Duration::from_secs(120)));
 
         if let Some(entry) = alternates.get_mut("alt") {
-            entry.last_used = Instant::now();
+            mark_entry_used(entry, Instant::now());
         }
 
-        assert!(expired_alternate_ids(&alternates, Instant::now(), Duration::from_secs(60)).is_empty());
+        assert!(
+            expired_alternate_ids(&alternates, Instant::now(), Duration::from_secs(60)).is_empty()
+        );
+    }
+
+    /// The same touch that keeps an entry resident must arm its rescan gate;
+    /// otherwise a source under active traffic is never refreshed.
+    #[test]
+    fn marking_an_entry_used_arms_its_rescan_gate() {
+        let mut entry = entry(Duration::from_secs(120));
+        let gate = Arc::clone(&entry.gate);
+        assert_eq!(gate.begin_periodic(), crate::watcher::RescanDecision::SkipIdle);
+
+        mark_entry_used(&mut entry, Instant::now());
+
+        assert_eq!(gate.begin_periodic(), crate::watcher::RescanDecision::Run);
     }
 }

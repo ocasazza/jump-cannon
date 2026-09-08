@@ -766,6 +766,25 @@ pub async fn progress(since: u64) -> ApiResult<ProgressResponse> {
     get_json(&format!("/progress?since={since}")).await
 }
 
+/// `GET /progress?since=<seq>` against the deployment default source,
+/// bypassing the session's source selection.
+///
+/// `/progress` resolves the selected source through the same extractor as
+/// every graph fetch, and each alternate owns its own progress log, so a poll
+/// carrying `x-jump-cannon-source` blocks behind the very build it would
+/// report on. The default source's log is the only one reachable while an
+/// alternate builds.
+pub async fn progress_default(since: u64) -> ApiResult<ProgressResponse> {
+    let req = Request::get(&url(&format!("/progress?since={since}")))
+        .cache(web_sys::RequestCache::NoStore);
+    let req = if WORLD_BASE.read().is_some() {
+        req.header("x-user", &user_name())
+    } else {
+        req
+    };
+    req.send().await.map_err(err)?.json().await.map_err(err)
+}
+
 #[allow(dead_code)] // not surfaced in a panel yet — /configs is dev-only on the server
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct ConfigEntry {

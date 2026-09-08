@@ -113,6 +113,37 @@ enum PreviewState {
     Failed { message: String, timeout: bool },
 }
 
+/// Live outcome of the last source Apply. Applying an alternate source makes
+/// graph-api build that source's whole graph before it answers a single graph
+/// fetch, so the wait is unbounded from the panel's side and must be visible.
+#[derive(Clone, PartialEq)]
+enum ApplyState {
+    Building {
+        elapsed_secs: u64,
+        /// Latest default-log progress label naming the applied source, when
+        /// the server produces one.
+        stage: Option<String>,
+    },
+    Ok {
+        nodes: u32,
+        edges: u32,
+    },
+    Timeout,
+    Error(String),
+}
+
+#[derive(Clone, PartialEq)]
+struct ApplyStatus {
+    /// Catalog id whose summary and row carry the status — the selection at
+    /// Apply time, which is not the applied source for a reset.
+    anchor: String,
+    /// What is being applied, for display.
+    target: String,
+    /// The apply clears the session selection; no inline reset is offered.
+    reset: bool,
+    state: ApplyState,
+}
+
 static PACKAGES: GlobalSignal<BTreeMap<String, String>> = Signal::global(load_packages);
 static SELECTION: GlobalSignal<Option<Selection>> = Signal::global(|| None);
 static MANIFEST: GlobalSignal<String> = Signal::global(String::new);
@@ -133,6 +164,19 @@ static NEW_SOURCE: GlobalSignal<NewSourceDraft> = Signal::global(NewSourceDraft:
 static BUSY: GlobalSignal<bool> = Signal::global(|| false);
 /// Last server rejection (validation text, authorization, read-only dir).
 static ERROR: GlobalSignal<Option<String>> = Signal::global(|| None);
+/// Live state of the last source Apply, anchored to a catalog row.
+static APPLY: GlobalSignal<Option<ApplyStatus>> = Signal::global(|| None);
+/// Bumped by every Apply; the tracker tasks of superseded applies exit
+/// instead of overwriting the current status.
+static APPLY_GEN: GlobalSignal<u64> = Signal::global(|| 0);
+
+/// Ceiling on the first graph payload after an Apply, past which the panel
+/// declares the switch unusable rather than waiting silently.
+///
+/// The cluster ingress in front of graph-api drops the connection at ~75s, so
+/// a source whose build outlives that can never answer through the proxy at
+/// all; 90s leaves headroom for a direct connection on a slower box.
+const APPLY_CEILING_SECS: u64 = 90;
 
 // --- manifest text surgery (pure functions; unit-tested below) --------------------
 
@@ -542,6 +586,226 @@ fn copy_to_clipboard(text: &str) {
     }
 }
 
+// --- source apply tracking -------------------------------------------------------
+
+/// Switch the session's graph view and track the resulting load. `target` is
+/// the catalog id to view, or `None` to clear the session selection and return
+/// to the deployment default. `anchor` is the catalog row the status renders
+/// under (the currently selected summary), which differs from `target` when a
+/// reset is triggered from a failed alternate's summary.
+fn apply_source(ctx: Ctx, anchor: String, target: Option<String>) {
+    match &target {
+        Some(id) => {
+            api::set_source_id(id);
+            *VIEWING.write() = Some(id.clone());
+        }
+        None => {
+            api::clear_source_id();
+            VIEWING.write().take();
+        }
+    }
+    let generation = APPLY_GEN.peek().wrapping_add(1);
+    *APPLY_GEN.write() = generation;
+    *APPLY.write() = Some(ApplyStatus {
+        anchor,
+        target: target
+            .clone()
+            .unwrap_or_else(|| "the deployment default".to_string()),
+        reset: target.is_none(),
+        state: ApplyState::Building {
+            elapsed_secs: 0,
+            stage: None,
+        },
+    });
+    spawn(track_apply(ctx, target, generation));
+}
+
+/// Bound the wait at [`APPLY_CEILING_SECS`] and record the outcome.
+///
+/// The load runs as its own task rather than racing the ceiling: dropping it
+/// would abandon a build that may still land, so a late success replaces the
+/// timeout status instead of being thrown away.
+async fn track_apply(ctx: Ctx, target: Option<String>, generation: u64) {
+    spawn(track_stages(target, generation));
+    spawn(async move {
+        reload_graph(ctx).await;
+        if *APPLY_GEN.peek() != generation {
+            return;
+        }
+        let state = if let Some(error) = ctx.load_error.peek().clone() {
+            ApplyState::Error(error)
+        } else {
+            match ctx.graph.peek().as_ref() {
+                Some(graph) => ApplyState::Ok {
+                    nodes: graph.n_nodes,
+                    edges: graph.n_edges,
+                },
+                None => ApplyState::Error("another graph load superseded this one".into()),
+            }
+        };
+        if let Some(status) = APPLY.write().as_mut() {
+            status.state = state;
+        }
+    });
+    gloo_timers::future::TimeoutFuture::new((APPLY_CEILING_SECS * 1000) as u32).await;
+    if *APPLY_GEN.peek() != generation {
+        return;
+    }
+    if let Some(status) = APPLY.write().as_mut() {
+        if matches!(status.state, ApplyState::Building { .. }) {
+            status.state = ApplyState::Timeout;
+        }
+    }
+}
+
+/// Tick the elapsed-seconds readout once a second and pick up any progress
+/// label naming the applied source.
+///
+/// The elapsed counter is the load-bearing signal: an alternate's build stages
+/// go to that alternate's own progress log, and `/progress` for a selected
+/// source resolves through the same extractor as the graph fetch, so it blocks
+/// behind the build it would describe. Only the default source's log is
+/// readable meanwhile (`api::progress_default`), which carries stages whenever
+/// the applied source is the one graph-api already hosts.
+async fn track_stages(target: Option<String>, generation: u64) {
+    let started = js_sys::Date::now();
+    let mut since = api::progress_default(0)
+        .await
+        .map(|resp| resp.next_seq)
+        .unwrap_or(0);
+    let mut stage = None;
+    loop {
+        gloo_timers::future::TimeoutFuture::new(1000).await;
+        if *APPLY_GEN.peek() != generation
+            || !matches!(
+                APPLY.peek().as_ref().map(|s| &s.state),
+                Some(ApplyState::Building { .. })
+            )
+        {
+            return;
+        }
+        if let Some(id) = &target {
+            if let Ok(resp) = api::progress_default(since).await {
+                since = resp.next_seq;
+                for stamped in &resp.events {
+                    if let Some(label) = source_stage(id, &stamped.event) {
+                        stage = Some(label);
+                    }
+                }
+            }
+            if *APPLY_GEN.peek() != generation {
+                return;
+            }
+        }
+        let elapsed_secs = ((js_sys::Date::now() - started) / 1000.0) as u64;
+        if let Some(status) = APPLY.write().as_mut() {
+            if matches!(status.state, ApplyState::Building { .. }) {
+                status.state = ApplyState::Building {
+                    elapsed_secs,
+                    stage: stage.clone(),
+                };
+            }
+        }
+    }
+}
+
+/// A progress event's display text when it names `id`; events about other
+/// sources (or task bookkeeping) carry nothing the panel can attribute.
+fn source_stage(id: &str, event: &api::ProgressEvent) -> Option<String> {
+    let text = match event {
+        api::ProgressEvent::Start { label, .. } | api::ProgressEvent::UpdateLabel { label, .. } => {
+            label
+        }
+        api::ProgressEvent::Log { message, .. } => message,
+        _ => return None,
+    };
+    text.contains(id).then(|| text.trim().to_string())
+}
+
+/// Inline escape from a failed alternate: clearing the session's own selection
+/// is session-local and allowed whatever the deployment's runtime-switch
+/// posture, so this is offered even where Apply is not.
+fn return_to_default(ctx: Ctx, anchor: String) -> Element {
+    rsx! {
+        button {
+            class: "btn imp-mini",
+            r#type: "button",
+            "data-action": "return-to-default",
+            onclick: move |_| apply_source(ctx, anchor.clone(), None),
+            "Return to default"
+        }
+    }
+}
+
+/// The `[data-field=apply-status]` block under the anchored catalog summary.
+fn apply_status_view(ctx: Ctx, status: &ApplyStatus) -> Element {
+    let target = status.target.clone();
+    let anchor = status.anchor.clone();
+    let offer_reset = !status.reset;
+    match &status.state {
+        ApplyState::Building {
+            elapsed_secs,
+            stage,
+        } => rsx! {
+            div {
+                class: "imp-apply building",
+                role: "status",
+                "data-field": "apply-status",
+                "data-outcome": "building",
+                "data-elapsed": "{elapsed_secs}",
+                span { class: "imp-apply-line", "building {target}… {elapsed_secs}s" }
+                if let Some(stage) = stage {
+                    span { class: "imp-apply-stage", "data-field": "apply-stage", "{stage}" }
+                }
+                span { class: "imp-note",
+                    "an unserved source is parsed, measured, and indexed before its first response; giving up at {APPLY_CEILING_SECS}s"
+                }
+            }
+        },
+        ApplyState::Ok { nodes, edges } => rsx! {
+            div {
+                class: "imp-apply ok",
+                role: "status",
+                "data-field": "apply-status",
+                "data-outcome": "ok",
+                span { class: "imp-apply-line",
+                    "now viewing {target} — "
+                    strong { "data-field": "apply-nodes", "{nodes}" }
+                    " nodes · "
+                    strong { "data-field": "apply-edges", "{edges}" }
+                    " edges"
+                }
+            }
+        },
+        ApplyState::Timeout => rsx! {
+            div {
+                class: "imp-apply timeout",
+                role: "alert",
+                "data-field": "apply-status",
+                "data-outcome": "timeout",
+                span { class: "imp-apply-line",
+                    "{target} did not finish serving within {APPLY_CEILING_SECS}s; it is a large corpus — the deployment default is still available"
+                }
+                if offer_reset {
+                    {return_to_default(ctx, anchor.clone())}
+                }
+            }
+        },
+        ApplyState::Error(message) => rsx! {
+            div {
+                class: "imp-apply error",
+                role: "alert",
+                "data-field": "apply-status",
+                "data-outcome": "error",
+                span { class: "imp-apply-line", "{target} failed to load — {message}" }
+                if offer_reset {
+                    {return_to_default(ctx, anchor.clone())}
+                }
+            }
+        },
+    }
+}
+
 // --- panel ------------------------------------------------------------------------
 
 pub fn panel(ctx: Ctx) -> Element {
@@ -568,6 +832,7 @@ pub fn panel(ctx: Ctx) -> Element {
     let packages = PACKAGES.read().clone();
     let catalog = CATALOG.read().clone();
     let viewing = VIEWING.read().clone();
+    let apply = APPLY.read().clone();
     let editor_view = *EDITOR_VIEW.read();
     let preview = PREVIEW.read().clone();
     let preview_running = *PREVIEW_RUNNING.read();
@@ -669,6 +934,15 @@ pub fn panel(ctx: Ctx) -> Element {
                                     let native = is_native_kind(&profile.kind);
                                     let is_viewing = viewing.as_deref() == Some(profile.id.as_str())
                                         || (viewing.is_none() && profile.selected);
+                                    let apply_chip = apply
+                                        .as_ref()
+                                        .filter(|status| status.anchor == id)
+                                        .map(|status| match &status.state {
+                                            ApplyState::Building { .. } => ("building", "building"),
+                                            ApplyState::Ok { .. } => ("ok", "ready"),
+                                            ApplyState::Timeout => ("timeout", "timeout"),
+                                            ApplyState::Error(_) => ("error", "failed"),
+                                        });
                                     rsx! {
                                         button {
                                             key: "{id}",
@@ -693,6 +967,14 @@ pub fn panel(ctx: Ctx) -> Element {
                                                 }
                                                 if is_viewing {
                                                     span { class: "imp-chip viewing", "viewing" }
+                                                }
+                                                if let Some((outcome, label)) = apply_chip {
+                                                    span {
+                                                        class: "imp-chip apply",
+                                                        "data-field": "apply-chip",
+                                                        "data-outcome": "{outcome}",
+                                                        "{label}"
+                                                    }
                                                 }
                                             }
                                         }
@@ -786,6 +1068,11 @@ pub fn panel(ctx: Ctx) -> Element {
                                 let package_id = profile.id.clone();
                                 let kind = profile.kind.clone();
                                 let description = profile.description.clone();
+                                let apply_anchor = profile.id.clone();
+                                let apply_here = apply
+                                    .as_ref()
+                                    .filter(|status| status.anchor == profile.id)
+                                    .cloned();
                                 rsx! {
                                     div { class: "imp-summary",
                                         div { class: "imp-summary-title", "{display_name}" }
@@ -842,14 +1129,13 @@ pub fn panel(ctx: Ctx) -> Element {
                                                         "switch this browser session's graph view"
                                                     },
                                                     onclick: move |_| {
-                                                        if is_default {
-                                                            api::clear_source_id();
-                                                            VIEWING.write().take();
-                                                        } else {
-                                                            api::set_source_id(&apply_id);
-                                                            *VIEWING.write() = Some(apply_id.clone());
-                                                        }
-                                                        spawn(reload_graph(ctx));
+                                                        let target = (!is_default)
+                                                            .then(|| apply_id.clone());
+                                                        apply_source(
+                                                            ctx,
+                                                            apply_anchor.clone(),
+                                                            target,
+                                                        );
                                                     },
                                                     "{apply_label}"
                                                 }
@@ -865,6 +1151,9 @@ pub fn panel(ctx: Ctx) -> Element {
                                                     "Edit server package"
                                                 }
                                             }
+                                        }
+                                        if let Some(status) = &apply_here {
+                                            {apply_status_view(ctx, status)}
                                         }
                                     }
                                     match &server_package {
@@ -1334,5 +1623,30 @@ mod tests {
     fn sanitize_id_matches_source_id_charset() {
         assert_eq!(sanitize_id("Lavender Ingest/OKF"), "lavender-ingest-okf");
         assert_eq!(sanitize_id("---"), "package");
+    }
+
+    #[test]
+    fn source_stage_only_reports_labels_naming_the_source() {
+        let start = api::ProgressEvent::Start {
+            id: 1,
+            group: "ingest".into(),
+            label: "Reloading lavender-ingest-okf".into(),
+        };
+        assert_eq!(
+            source_stage("lavender-ingest-okf", &start).as_deref(),
+            Some("Reloading lavender-ingest-okf")
+        );
+        // Another source's reload is not this apply's progress.
+        assert!(source_stage("obsidian-vault", &start).is_none());
+        // Task bookkeeping carries no label to attribute.
+        assert!(source_stage(
+            "lavender-ingest-okf",
+            &api::ProgressEvent::SetProgress {
+                id: 1,
+                progress: 0.5
+            }
+        )
+        .is_none());
+        assert!(source_stage("lavender-ingest-okf", &api::ProgressEvent::Finish { id: 1 }).is_none());
     }
 }

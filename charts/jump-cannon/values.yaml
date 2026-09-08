@@ -84,7 +84,12 @@ importers:
       description: Read the OKF v0.2 repository maintained by lavender-ingest from a same namespace, deployment-provisioned RWX claim. The writer defaults to lavender-ingest-okf (<release>-okf), and files must be readable by UID/GID 10001.
       kind: okf
       sourceId: lavender-ingest
-      filesystemRescanIntervalSeconds: 60
+      # okf-sync git-pulls this claim hourly and lavender-ingest pushes it
+      # nightly, so a minute-scale rescan rebuilt a ~37k-node graph (parse +
+      # metrics + search index) every 60s and starved reads of the same
+      # source: /graph/schema took ~18s and the position/edge buffers never
+      # finished. Match the writer's cadence instead.
+      filesystemRescanIntervalSeconds: 3600
       source:
         volumeName: lavender-okf-repository
         existingClaim: lavender-okf-shared

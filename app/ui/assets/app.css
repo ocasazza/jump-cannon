@@ -1051,3 +1051,22 @@ textarea.doc-src:focus { outline:none; }
 .imp-vars { display:flex; flex-direction:column; gap:.3rem; align-items:flex-start; }
 .imp-var { width:100%; display:grid; grid-template-columns:1fr auto 1fr auto;
   align-items:center; gap:.3rem; color:var(--dim); font-family:var(--mono); }
+
+/* Live source-apply feedback in the catalog summary (data-field=apply-status)
+   and its glanceable row chip (data-field=apply-chip). */
+.imp-apply { display:flex; flex-direction:column; align-items:flex-start; gap:.25rem;
+  border:1px solid var(--line2); border-left-width:2px; border-radius:4px;
+  padding:.35rem .5rem; font-size:.66rem; line-height:1.5; overflow-wrap:anywhere; }
+.imp-apply-line { color:var(--fg); }
+.imp-apply-line strong { color:var(--green); }
+.imp-apply-stage { color:var(--dim); font-family:var(--mono); font-size:.62rem; }
+.imp-apply .imp-note { padding:0; }
+.imp-apply.building { border-left-color:var(--accent); }
+.imp-apply.ok { border-left-color:var(--green); }
+.imp-apply.timeout { border-left-color:var(--yellow); }
+.imp-apply.error { border-left-color:var(--red); }
+.imp-apply.error .imp-apply-line { color:var(--red); }
+.imp-chip.apply[data-outcome="building"] { color:var(--accent); border-color:#28557e; }
+.imp-chip.apply[data-outcome="ok"] { color:var(--green); border-color:#2a5334; }
+.imp-chip.apply[data-outcome="timeout"] { color:var(--yellow); border-color:#655123; }
+.imp-chip.apply[data-outcome="error"] { color:var(--red); border-color:#5f2828; }

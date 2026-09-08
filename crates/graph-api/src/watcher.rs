@@ -19,6 +19,13 @@
 //! Obsidian accepts only `.md`; schema-driven importers otherwise retain their
 //! own event and path semantics rather than inheriting Obsidian exclusions.
 //!
+//! ## Alternate sources
+//!
+//! A lazily built alternate ([`crate::source_host`]) gets its driver from
+//! [`spawn_gated`]: its periodic rebuilds run only when a request resolved to
+//! that source since the previous tick, and never overlap each other. The
+//! deployment default is ungated.
+//!
 //! ## Container caveats
 //!
 //! On Linux, inotify events for a bind-mounted directory only fire when
@@ -31,6 +38,7 @@
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -41,13 +49,132 @@ use data_loader::{Effect, HostedImporter, ImporterDescriptor, Transport, WatchPl
 
 use crate::state::{AppState, GraphSnapshot, SnapshotSource};
 
-/// Spawn the filesystem watcher + reload task. Returns immediately; the
-/// watcher and reload loop run for the lifetime of the process, unless the
-/// caller aborts the returned handle (used to evict idle alternate sources).
+/// Gate on a lazily built alternate source's periodic rescan. `SourceHost`
+/// marks the gate used whenever a request resolves to that alternate; the
+/// alternate's watcher consults it on every tick and skips the rebuild when
+/// nothing asked for the source since the previous tick. Rebuilding a large
+/// corpus (graph + metrics + search index) on a timer for a source nobody is
+/// reading starves the requests that source exists to serve.
 ///
-/// `state` is the live `AppState`; the watcher swaps new snapshots into
-/// it under `state.inner.snapshot`.
-pub fn spawn(state: AppState, filesystem_rescan_seconds: u64) -> Option<tokio::task::JoinHandle<()>> {
+/// The deployment default has no gate: its change driver is unchanged.
+#[derive(Debug, Default)]
+pub struct RescanGate {
+    requested: AtomicBool,
+    rebuilding: AtomicBool,
+}
+
+/// Outcome of consulting a [`RescanGate`] on one periodic tick.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RescanDecision {
+    /// Rebuild now; the caller holds this source's rebuild slot until
+    /// [`RescanGate::finish`].
+    Run,
+    /// Nothing requested this source since the previous tick.
+    SkipIdle,
+    /// A rebuild for this source is still running. Ticks are dropped, never
+    /// queued, so a rebuild slower than the interval cannot pile up.
+    SkipInFlight,
+}
+
+impl RescanGate {
+    /// Record a request resolving to this source.
+    pub fn mark_used(&self) {
+        self.requested.store(true, Ordering::Release);
+    }
+
+    /// Decide one periodic tick, claiming the rebuild slot on
+    /// [`RescanDecision::Run`]. The requested flag survives `SkipInFlight`,
+    /// so the tick after the in-flight rebuild still runs.
+    pub(crate) fn begin_periodic(&self) -> RescanDecision {
+        if self
+            .rebuilding
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return RescanDecision::SkipInFlight;
+        }
+        if !self.requested.swap(false, Ordering::AcqRel) {
+            self.rebuilding.store(false, Ordering::Release);
+            return RescanDecision::SkipIdle;
+        }
+        RescanDecision::Run
+    }
+
+    /// Claim the rebuild slot for a change-driven reload. A real source
+    /// change must always land, so this takes the slot unconditionally; its
+    /// only effect is suppressing a periodic tick that races it.
+    fn begin_change(&self) {
+        self.rebuilding.store(true, Ordering::Release);
+    }
+
+    /// Release the rebuild slot.
+    fn finish(&self) {
+        self.rebuilding.store(false, Ordering::Release);
+    }
+}
+
+/// Ungated (default source) watchers always run their tick.
+fn periodic_decision(gate: Option<&RescanGate>) -> RescanDecision {
+    gate.map_or(RescanDecision::Run, RescanGate::begin_periodic)
+}
+
+/// One periodic rebuild, subject to the source's gate.
+async fn periodic_reload(state: &AppState, gate: Option<&RescanGate>, driver: &'static str) {
+    match periodic_decision(gate) {
+        RescanDecision::Run => {
+            reload(state).await;
+            if let Some(gate) = gate {
+                gate.finish();
+            }
+        }
+        decision => {
+            tracing::debug!(driver, ?decision, "skipped periodic rebuild");
+        }
+    }
+}
+
+/// One change-driven rebuild, holding the source's rebuild slot so a racing
+/// periodic tick is skipped instead of doubling the work.
+async fn change_reload(state: &AppState, gate: Option<&RescanGate>, paths: &HashSet<String>) {
+    if let Some(gate) = gate {
+        gate.begin_change();
+    }
+    reload_with_paths(state, paths).await;
+    if let Some(gate) = gate {
+        gate.finish();
+    }
+}
+
+/// Spawn the change driver (filesystem watcher, poll loop, or push trigger)
+/// for the deployment default source. Returns immediately; the driver runs
+/// for the lifetime of the process, unless the caller aborts the returned
+/// handle.
+///
+/// `state` is the live `AppState`; the driver swaps new snapshots into it
+/// under `state.inner.snapshot`.
+pub fn spawn(
+    state: AppState,
+    filesystem_rescan_seconds: u64,
+) -> Option<tokio::task::JoinHandle<()>> {
+    spawn_with_gate(state, filesystem_rescan_seconds, None)
+}
+
+/// [`spawn`] for a lazily built alternate source: periodic rescans are gated
+/// on `gate` (see [`RescanGate`]), change-driven reloads are not. The caller
+/// aborts the returned handle when the alternate is evicted.
+pub fn spawn_gated(
+    state: AppState,
+    filesystem_rescan_seconds: u64,
+    gate: Arc<RescanGate>,
+) -> Option<tokio::task::JoinHandle<()>> {
+    spawn_with_gate(state, filesystem_rescan_seconds, Some(gate))
+}
+
+fn spawn_with_gate(
+    state: AppState,
+    filesystem_rescan_seconds: u64,
+    gate: Option<Arc<RescanGate>>,
+) -> Option<tokio::task::JoinHandle<()>> {
     let descriptor = state.inner.importer.descriptor();
     if !watch_is_authorized(&state.inner.importer, &descriptor) {
         let message = format!(
@@ -72,9 +199,10 @@ pub fn spawn(state: AppState, filesystem_rescan_seconds: u64) -> Option<tokio::t
                 markdown_only,
                 obsidian_conventions,
                 filesystem_rescan_seconds,
+                gate,
             )
         }
-        WatchPlan::Poll { interval_ms } => Some(spawn_poll(state, interval_ms)),
+        WatchPlan::Poll { interval_ms } => Some(spawn_poll(state, interval_ms, gate)),
         WatchPlan::Push => spawn_push(state),
     }
 }
@@ -132,7 +260,11 @@ fn watch_is_authorized(importer: &HostedImporter, descriptor: &ImporterDescripto
     }
 }
 
-fn spawn_poll(state: AppState, interval_ms: u64) -> tokio::task::JoinHandle<()> {
+fn spawn_poll(
+    state: AppState,
+    interval_ms: u64,
+    gate: Option<Arc<RescanGate>>,
+) -> tokio::task::JoinHandle<()> {
     let interval_ms = interval_ms.max(100);
     let progress = state.inner.progress.clone();
     progress.info("watch", format!("polling importer every {interval_ms} ms"));
@@ -141,7 +273,7 @@ fn spawn_poll(state: AppState, interval_ms: u64) -> tokio::task::JoinHandle<()> 
         interval.tick().await;
         loop {
             interval.tick().await;
-            reload(&state).await;
+            periodic_reload(&state, gate.as_deref(), "poll").await;
         }
     })
 }
@@ -184,6 +316,7 @@ fn spawn_filesystem(
     markdown_only: bool,
     obsidian_conventions: bool,
     filesystem_rescan_seconds: u64,
+    gate: Option<Arc<RescanGate>>,
 ) -> Option<tokio::task::JoinHandle<()>> {
     let progress = state.inner.progress.clone();
 
@@ -268,6 +401,14 @@ fn spawn_filesystem(
     }
     if filesystem_rescan_seconds == 0 {
         progress.info("watch", "periodic filesystem rescan disabled");
+    } else if gate.is_some() {
+        progress.info(
+            "watch",
+            format!(
+                "full filesystem rescan every {filesystem_rescan_seconds} seconds \
+                 while this source is being requested"
+            ),
+        );
     } else {
         progress.info(
             "watch",
@@ -303,17 +444,13 @@ fn spawn_filesystem(
                         paths.extend(more);
                     }
 
-                    reload_with_paths(&state, &paths).await;
+                    change_reload(&state, gate.as_deref(), &paths).await;
                     // Always wait one complete quiet period after a reload;
                     // an already-due timer must not trigger back-to-back work.
                     reset_filesystem_rescan(&mut rescan_interval);
                 }
                 () = next_filesystem_rescan(&mut rescan_interval) => {
-                    tracing::debug!(
-                        seconds = filesystem_rescan_seconds,
-                        "running periodic filesystem rescan"
-                    );
-                    reload(&state).await;
+                    periodic_reload(&state, gate.as_deref(), "filesystem-rescan").await;
                     reset_filesystem_rescan(&mut rescan_interval);
                 }
             }
@@ -578,6 +715,74 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    /// The deployment default has no gate; every tick must still rescan.
+    #[test]
+    fn ungated_source_rescans_on_every_tick() {
+        assert_eq!(periodic_decision(None), RescanDecision::Run);
+        assert_eq!(periodic_decision(None), RescanDecision::Run);
+    }
+
+    #[test]
+    fn idle_alternate_tick_skips_the_rebuild() {
+        let gate = RescanGate::default();
+
+        assert_eq!(periodic_decision(Some(&gate)), RescanDecision::SkipIdle);
+        assert_eq!(
+            periodic_decision(Some(&gate)),
+            RescanDecision::SkipIdle,
+            "a skipped tick leaves the rebuild slot free"
+        );
+    }
+
+    #[test]
+    fn requested_alternate_rescans_once_per_request() {
+        let gate = RescanGate::default();
+        gate.mark_used();
+
+        assert_eq!(periodic_decision(Some(&gate)), RescanDecision::Run);
+        gate.finish();
+        assert_eq!(
+            periodic_decision(Some(&gate)),
+            RescanDecision::SkipIdle,
+            "the served rescan consumes the request signal"
+        );
+
+        gate.mark_used();
+        assert_eq!(periodic_decision(Some(&gate)), RescanDecision::Run);
+    }
+
+    /// A rebuild slower than the rescan interval must drop ticks, not queue
+    /// them, or a large corpus rebuilds back to back forever.
+    #[test]
+    fn tick_during_a_rebuild_is_dropped_not_queued() {
+        let gate = RescanGate::default();
+        gate.mark_used();
+        assert_eq!(periodic_decision(Some(&gate)), RescanDecision::Run);
+
+        gate.mark_used();
+        assert_eq!(periodic_decision(Some(&gate)), RescanDecision::SkipInFlight);
+        assert_eq!(periodic_decision(Some(&gate)), RescanDecision::SkipInFlight);
+
+        gate.finish();
+        assert_eq!(
+            periodic_decision(Some(&gate)),
+            RescanDecision::Run,
+            "requests during the suppressed ticks are honored by the next one"
+        );
+    }
+
+    #[test]
+    fn tick_during_a_change_driven_rebuild_is_skipped() {
+        let gate = RescanGate::default();
+        gate.mark_used();
+        gate.begin_change();
+
+        assert_eq!(periodic_decision(Some(&gate)), RescanDecision::SkipInFlight);
+
+        gate.finish();
+        assert_eq!(periodic_decision(Some(&gate)), RescanDecision::Run);
     }
 
     #[tokio::test]
