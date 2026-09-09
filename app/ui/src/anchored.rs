@@ -198,13 +198,14 @@ fn ensure_metrics(n_nodes: u32) {
             // vault metrics for) degrades SameCommunityId to {focused} —
             // the same graceful fallback focus_set.rs::compute uses for a
             // missing metric.
-            Ok(v) if v.len() == n_nodes as usize => {
+            Ok(Some(v)) if v.len() == n_nodes as usize => {
                 c.metrics.insert("community".to_string(), v);
             }
-            Ok(v) => tracing::warn!(
+            Ok(Some(v)) => tracing::warn!(
                 "[anchored] community metric len {} != n_nodes {n_nodes}; focus degrades",
                 v.len()
             ),
+            Ok(None) => tracing::warn!("[anchored] server has no community metric; focus degrades"),
             Err(e) => tracing::warn!("[anchored] community metric fetch: {e}"),
         }
     });

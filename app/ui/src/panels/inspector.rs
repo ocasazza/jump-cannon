@@ -89,7 +89,8 @@ fn ensure_community_metric(ctx: Ctx) {
     *COMMUNITY_STARTED.write() = true;
     spawn(async move {
         match api::metric("community").await {
-            Ok(v) => *COMMUNITY.write() = Some(v),
+            Ok(Some(v)) => *COMMUNITY.write() = Some(v),
+            Ok(None) => tracing::warn!("[inspector] server has no community metric"),
             Err(e) => tracing::warn!("[inspector] community metric fetch failed: {e}"),
         }
     });

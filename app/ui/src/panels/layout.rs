@@ -46,7 +46,7 @@ use graph_layouts::{
     SpectralLayout, SpectralSettings, SphereLayout, SphereSettings, StaticLayout,
 };
 
-use crate::api::{get_json, put_json, put_raw_json};
+use crate::api::{self, get_json, put_json, put_raw_json};
 use crate::render;
 use crate::Ctx;
 
@@ -109,6 +109,11 @@ static STATE: GlobalSignal<PanelState> = Signal::global(load_state);
 /// `Result` distinguishes a server error from a successful "no worker" view.
 static COMPUTE: GlobalSignal<Option<Result<ComputeEngines, String>>> = Signal::global(|| None);
 static HEALTH: GlobalSignal<Option<ComputeHealth>> = Signal::global(|| None);
+/// Catalog id of the alternate source the viewer selected, or `None` on the
+/// deployment default. `/compute/*` takes graph-api's `DefaultSource`
+/// extractor, which answers 400 for any other selection, so the pollers stand
+/// down and the cluster gallery renders the reason instead.
+static COMPUTE_SOURCE: GlobalSignal<Option<String>> = Signal::global(api::source_id);
 /// What the last apply pushed — the swap/short-circuit detector (mirrors
 /// `prev_layout_key` / `prev_active_layout_id` / `prev_seed_mode` on the
 /// egui App). `generation` ties it to one render-host build: a canvas
@@ -353,7 +358,42 @@ fn remote_solver_status(
     )
 }
 
+/// Re-read the session's source selection into [`COMPUTE_SOURCE`] and report
+/// whether `/compute/*` may be called. Broker and session state are dropped
+/// on the way out of the default source: they describe the default graph and
+/// would misreport the alternate.
+fn compute_reachable() -> bool {
+    let selected = api::source_id();
+    if *COMPUTE_SOURCE.peek() != selected {
+        *COMPUTE_SOURCE.write() = selected.clone();
+        if selected.is_some() {
+            clear_compute_state();
+        }
+    }
+    selected.is_none()
+}
+
+/// Drop every `/compute/*`-derived signal, including the tiny header mirrors.
+fn clear_compute_state() {
+    *COMPUTE.write() = None;
+    store_health(None);
+    *SESSION.write() = None;
+    if *SESSION_ON.peek() {
+        *SESSION_ON.write() = false;
+    }
+    if *SESSION_DOT.peek() != "○" {
+        *SESSION_DOT.write() = "○";
+    }
+    if !SESSION_TITLE.peek().is_empty() {
+        SESSION_TITLE.write().clear();
+    }
+    *SESSION_ERR.write() = None;
+}
+
 async fn fetch_compute() {
+    if !compute_reachable() {
+        return;
+    }
     let r = get_json::<ComputeEngines>("/compute/engines").await;
     let should_sync = r.as_ref().map(|v| v.connected).unwrap_or(false) && active_is_remote();
     if let Ok(view) = &r {
@@ -711,6 +751,11 @@ fn desired_remote_selection() -> Option<ComputeLayoutPutReq> {
 /// observes a stale generation it retries the same latest intent against the
 /// generation returned by the server.
 fn request_remote_selection() {
+    if let Some(id) = api::source_id() {
+        *SOLVE_MSG.write() =
+            format!("remote layouts run on the deployment default source; {id} is a read-only view");
+        return;
+    }
     let Some(mut request) = desired_remote_selection() else {
         return;
     };
@@ -1822,6 +1867,12 @@ fn apply_seed_expr(expr: &str) {
 }
 
 fn apply_remote_initial_placement(positions: Vec<f32>, n_nodes: usize) {
+    if let Some(id) = api::source_id() {
+        *SEED_ERROR.write() = Some(format!(
+            "remote placement runs on the deployment default source; {id} is a read-only view"
+        ));
+        return;
+    }
     let Some(expected) = expected_stream_lease() else {
         *SEED_ERROR.write() = Some(
             "remote placement unavailable: select a worker engine for this graph first".into(),
@@ -2263,6 +2314,9 @@ fn store_session(session: ComputeSession) {
 }
 
 async fn fetch_session() {
+    if !api::on_default_source() {
+        return;
+    }
     if let Ok(session) = get_json::<ComputeSession>("/compute/session").await {
         store_session(session);
     }
@@ -2276,6 +2330,12 @@ async fn fetch_session() {
 /// surfaces rejections, and an out-of-band re-poll reconciles with the
 /// server's view instead of waiting for the 2 s cadence.
 fn session_action(action: &'static str) {
+    if let Some(id) = api::source_id() {
+        *SESSION_ERR.write() = Some(format!(
+            "the GPU session runs on the deployment default source; {id} is a read-only view"
+        ));
+        return;
+    }
     *SESSION_ERR.write() = None;
     if let Some(mut s) = SESSION.peek().clone() {
         if s.enabled {
@@ -2343,15 +2403,17 @@ pub(crate) fn backend_switch_header() -> Element {
     // peek: the App-scope header must not subscribe to the full settings
     // bag (every slider drag would re-render the whole workspace).
     let running = backend_of(&STATE.peek().active);
-    let status_text = if session_on {
-        let t = SESSION_TITLE.read().clone();
-        if t.is_empty() {
-            "GPU session".to_string()
-        } else {
-            t
+    let status_text = match COMPUTE_SOURCE.read().as_deref() {
+        Some(id) => format!("unavailable while viewing {id} — default source only"),
+        None if session_on => {
+            let t = SESSION_TITLE.read().clone();
+            if t.is_empty() {
+                "GPU session".to_string()
+            } else {
+                t
+            }
         }
-    } else {
-        worker_health_view(HEALTH.peek().as_ref()).text
+        None => worker_health_view(HEALTH.peek().as_ref()).text,
     };
     let local_title = match running {
         Backend::Local => "Show local engines — the running engine lives here".to_string(),
@@ -2389,27 +2451,30 @@ pub fn panel(ctx: Ctx) -> Element {
     // Fetch the remote engine list, and KEEP RETRYING (every RETRY_SECS)
     // while it is unavailable — self-heals across graph-api cold starts /
     // broker dial races, then idles once connected. Health is polled on the
-    // same cadence for the status line.
+    // same cadence for the status line. Nothing is requested while the viewer
+    // is on an alternate source: `/compute/*` would answer 400 every tick.
     use_future(|| async {
         const RETRY_MS: u32 = 2000;
         loop {
             // Re-apply onto a rebuilt host (canvas remount) — a no-op while
             // the applied key (generation + engine + settings) is current.
             apply_engine(false);
-            let needs = {
-                let snap = COMPUTE.peek();
-                match &*snap {
-                    None => true,
-                    Some(Ok(e)) => !e.connected,
-                    Some(Err(_)) => true,
-                }
-            };
-            if needs {
-                fetch_compute().await;
-            } else {
-                match get_json::<ComputeHealth>("/compute/health").await {
-                    Ok(h) => store_health(Some(h)),
-                    Err(_) => store_health(None),
+            if compute_reachable() {
+                let needs = {
+                    let snap = COMPUTE.peek();
+                    match &*snap {
+                        None => true,
+                        Some(Ok(e)) => !e.connected,
+                        Some(Err(_)) => true,
+                    }
+                };
+                if needs {
+                    fetch_compute().await;
+                } else {
+                    match get_json::<ComputeHealth>("/compute/health").await {
+                        Ok(h) => store_health(Some(h)),
+                        Err(_) => store_health(None),
+                    }
                 }
             }
             gloo_timers::future::TimeoutFuture::new(RETRY_MS).await;
@@ -2459,6 +2524,7 @@ pub fn panel(ctx: Ctx) -> Element {
     let health = HEALTH.read().clone();
     let health_view = worker_health_view(health.as_ref());
     let session = SESSION.read().clone();
+    let alternate_source = COMPUTE_SOURCE.read().clone();
 
     let desc = descriptor_for(&active);
     let is_static = desc
@@ -2544,6 +2610,7 @@ pub fn panel(ctx: Ctx) -> Element {
                     server_backed,
                     selected_remote.as_deref(),
                     is_bridge,
+                    alternate_source.as_deref(),
                 ),
             }
 
@@ -2551,7 +2618,11 @@ pub fn panel(ctx: Ctx) -> Element {
             // gallery, keep the worker health + browser-owned warnings
             // visible (the cluster view carries them on its status card).
             if is_bridge && view == Backend::Local {
-                div { class: "{health_view.class}", "{health_view.text}" }
+                if let Some(id) = alternate_source.as_deref() {
+                    {compute_source_notice(id)}
+                } else {
+                    div { class: "{health_view.class}", "{health_view.text}" }
+                }
                 if !server_backed {
                     div { class: "lay-health bad",
                         "Remote layouts are disabled: this graph exists only in the browser. \
@@ -2811,6 +2882,21 @@ fn remote_card(e: &EngineInfo, selected: bool, server_backed: bool) -> Element {
     }
 }
 
+/// Why the compute surface is unreachable while an alternate source is
+/// selected. `data-lay-state` is the browser suite's hook for the state.
+fn compute_source_notice(source_id: &str) -> Element {
+    rsx! {
+        div { class: "lay-empty", "data-lay-state": "compute-source-alternate",
+            span { class: "lay-empty-title", "○ Compute unavailable on this source" }
+            span { class: "lay-empty-text",
+                "The compute broker and GPU session run on the deployment default source; \
+                 \"{source_id}\" is a read-only view. Choose a This Device engine, or return \
+                 to the default source in the Importers panel."
+            }
+        }
+    }
+}
+
 /// The Compute Cluster gallery: a status card above the engines advertised
 /// by `GET /compute/engines`. When the GPU session feature is enabled
 /// server-side, the card is the session console (state badge, Dispatch/Park,
@@ -2827,7 +2913,11 @@ fn cluster_gallery(
     server_backed: bool,
     selected_remote: Option<&str>,
     is_bridge: bool,
+    alternate_source: Option<&str>,
 ) -> Element {
+    if let Some(id) = alternate_source {
+        return compute_source_notice(id);
+    }
     let (dot, state) = worker_status(health);
     let sub = worker_health_sub(health);
     let engines: &[EngineInfo] = match snap {

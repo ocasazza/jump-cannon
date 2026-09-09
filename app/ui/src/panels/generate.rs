@@ -581,6 +581,13 @@ pub fn panel(ctx: Ctx) -> Element {
             *SOUP_STATUS.write() = None;
             return;
         }
+        if let Some(source) = crate::api::source_id() {
+            *SOUP_ERROR.write() = Some(format!(
+                "self-assembly runs on the deployment default source; {source} is a read-only view"
+            ));
+            *SOUP_STATUS.write() = None;
+            return;
+        }
         let req = serde_json::json!({
             "n": n,
             "radius": *SOUP_RADIUS.read(),

@@ -301,6 +301,12 @@ struct ImporterSwitchCheck {
     /// and restore the deployment default. Covers the case where
     /// `stale_selection_surfaces` does not (viewer still has the group).
     viewing_non_default_reset: bool,
+    /// Authorized viewer on the alternate source with the Settings → Layout
+    /// surface mounted: `/compute/*` is `DefaultSource`-only, so the panel
+    /// must issue no compute request at all and must name the reason
+    /// (`[data-lay-state="compute-source-alternate"]`) instead of polling
+    /// graph-api into a permanent 400 loop.
+    compute_quiet: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     reason: Option<String>,
 }
@@ -321,6 +327,7 @@ impl ImporterSwitchCheck {
             denied_apply_absent: false,
             stale_selection_surfaces: false,
             viewing_non_default_reset: false,
+            compute_quiet: false,
             reason: Some("graph-api binary not on PATH; scenario skipped".to_string()),
         }
     }
@@ -3094,6 +3101,59 @@ const SWITCH_TO_ALT_JS: &str = r#"(async () => {
     };
 })()"#;
 
+/// While the alternate source is selected, mount the Settings → Layout
+/// surface (where the compute pollers live) and record every `/compute/*`
+/// fetch for longer than two 2 s poll cycles. `/compute/*` takes graph-api's
+/// `DefaultSource` extractor and answers 400 for any non-default selection,
+/// so the correct client behaviour is zero requests plus a named
+/// disabled state.
+const COMPUTE_QUIET_JS: &str = r#"(async () => {
+    const waitFor = async (predicate, timeoutMs = 20000) => {
+      const deadline = performance.now() + timeoutMs;
+      while (performance.now() < deadline) {
+        const value = predicate();
+        if (value) return value;
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
+      return null;
+    };
+    if (!window.__jc_compute_probe) {
+      window.__jc_compute_probe = [];
+      const original = window.fetch.bind(window);
+      window.fetch = (input, init) => {
+        const url = typeof input === 'string' ? input : (input && input.url) || '';
+        if (url.includes('/compute/')) window.__jc_compute_probe.push(url);
+        return original(input, init);
+      };
+    }
+    window.__jc_compute_probe.length = 0;
+    const panel = await waitFor(() => document.querySelector('section.panel-settings'));
+    if (!panel) return { error: 'settings panel missing' };
+    const tab = await waitFor(() => [...panel.querySelectorAll('[role="tab"]')]
+      .find((candidate) => (candidate.textContent || '').trim() === 'Layout'));
+    if (!tab) return { error: 'Layout tab missing' };
+    tab.click();
+    const surface = await waitFor(() =>
+      document.querySelector('section.panel-settings [role="tabpanel"] .lay')
+    );
+    if (!surface) return { error: 'Layout surface did not render' };
+    const cluster = await waitFor(() =>
+      [...document.querySelectorAll('section.panel-settings header button')]
+        .find((button) => (button.textContent || '').trim().startsWith('Compute Cluster'))
+    );
+    if (!cluster) return { error: 'Compute Cluster segment missing' };
+    cluster.click();
+    const notice = await waitFor(() => document.querySelector(
+      'section.panel-settings [data-lay-state="compute-source-alternate"]'
+    ));
+    await new Promise((resolve) => setTimeout(resolve, 5000));
+    return {
+      stored: sessionStorage.getItem('jc_source_id'),
+      notice: Boolean(notice),
+      compute_requests: [...window.__jc_compute_probe],
+    };
+})()"#;
+
 /// After an in-tab reload the session-scoped selection must persist and the
 /// alternate graph must load again.
 const PERSISTED_ALT_JS: &str = r#"(async () => {
@@ -3248,6 +3308,7 @@ async fn run_switch_scenario(
         denied_apply_absent: false,
         stale_selection_surfaces: false,
         viewing_non_default_reset: false,
+        compute_quiet: false,
         reason: None,
     };
 
@@ -3269,7 +3330,8 @@ async fn run_switch_scenario(
         && check.fresh_tab_default
         && check.denied_apply_absent
         && check.stale_selection_surfaces
-        && check.viewing_non_default_reset;
+        && check.viewing_non_default_reset
+        && check.compute_quiet;
     if !check.ok && check.reason.is_none() {
         check.reason = Some("one or more importer-switch assertions failed".to_string());
     }
@@ -3393,6 +3455,34 @@ async fn run_switch_scenario_inner(
         && switched.get("stored").and_then(|v| v.as_bool()) == Some(true)
         && switched.get("swapped").and_then(|v| v.as_bool()) == Some(true)
         && switched.get("badge").and_then(|v| v.as_bool()) == Some(true);
+
+    // Still on the alternate: the Layout surface must stand its compute
+    // pollers down rather than 400 every 2 s.
+    let quiet: serde_json::Value = evaluate_retry(&page, COMPUTE_QUIET_JS, 5).await?;
+    let compute_requests = quiet
+        .get("compute_requests")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    check.compute_quiet = quiet.get("error").is_none()
+        && quiet.get("stored").and_then(|v| v.as_str()) == Some(SWITCH_ALT_ID)
+        && quiet.get("notice").and_then(|v| v.as_bool()) == Some(true)
+        && compute_requests.is_empty();
+    if !check.compute_quiet {
+        let detail = match quiet.get("error").and_then(|v| v.as_str()) {
+            Some(error) => error.to_string(),
+            None if !compute_requests.is_empty() => format!(
+                "{} /compute/* request(s) issued on an alternate source: {}",
+                compute_requests.len(),
+                serde_json::to_string(&compute_requests).unwrap_or_default()
+            ),
+            None => "Layout panel did not name the alternate-source compute block".to_string(),
+        };
+        check.reason = Some(match check.reason.take() {
+            Some(reason) => format!("{reason}; {detail}"),
+            None => detail,
+        });
+    }
     // While viewing the alternate (still authorized), the default profile's
     // summary must offer 'Return to default' and clicking it must clear the
     // session selection and restore the deployment default. Re-runs

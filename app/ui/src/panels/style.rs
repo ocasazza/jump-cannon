@@ -18,7 +18,9 @@
 //! the cache cannot be a `GlobalSignal`). Keys with no server buffer
 //! (doctype / folder / recency / the "uniform" sentinel) fall back inside
 //! the buffer builders — the same fallback the egui app hits for keys it
-//! never fetches into `self.metrics`.
+//! never fetches into `self.metrics`. The `tag` buckets are derived here
+//! from the importer facet index (`/graph/meta_summary`); graph-api serves
+//! no `tag` metric buffer.
 
 use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
@@ -28,8 +30,9 @@ use dioxus::prelude::*;
 use gloo_storage::{LocalStorage, Storage};
 use serde::{Deserialize, Serialize};
 
+use crate::panels::filter::FieldIndex;
 use crate::render;
-use crate::Ctx;
+use crate::{proto, Ctx};
 
 const STORE_KEY: &str = "jc_style_v1";
 
@@ -79,8 +82,9 @@ enum ColorBy {
     Folder,
     Recency,
     Doctype,
-    /// Categorical tint by primary tag (first-sorted-tag hash). Served by
-    /// `/graph/metrics/tag` — same tiebreaker the egui FieldIndex uses.
+    /// Categorical tint by primary tag (first-sorted-tag hash), derived
+    /// from the importer facet index — same tiebreaker the egui FieldIndex
+    /// uses.
     Tag,
 }
 
@@ -195,9 +199,7 @@ impl EdgeColorBy {
 /// Whether the `community` categorical metric (consumed by
 /// `ColorBy::Community`, `EdgeColorBy::Community`, `ShapeBy::Community`)
 /// is the server-side Louvain result or overridden with the primary-tag
-/// buckets. The egui app derives the tag metric client-side from its
-/// FieldIndex; here the server's `/graph/metrics/tag` buffer (same
-/// first-sorted-tag tiebreaker) plays that role.
+/// buckets derived from the importer facet index.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Default, Hash)]
 enum CommunitySource {
     #[default]
@@ -692,9 +694,9 @@ fn shapes_from_metric(metric_key: &str, metrics: &HashMap<String, Vec<f32>>, n: 
 }
 
 /// Port of `app.rs::metrics_view`: when `community_source == Tag`, the
-/// `community` key is overridden with the primary-tag buckets. Unlike the
-/// egui app the `tag` key needs no injection — `/graph/metrics/tag` is
-/// fetched straight into the cache.
+/// `community` key is overridden with the primary-tag buckets. The `tag`
+/// key needs no injection — [`ensure_tag_metric`] has already materialized
+/// it into the cache.
 fn metrics_view<'a>(
     metrics: &'a HashMap<String, Vec<f32>>,
     style: &StyleState,
@@ -726,6 +728,13 @@ thread_local! {
     static METRICS_GEN: Cell<u32> = const { Cell::new(0) };
     /// Metric fetches in flight (or backing off after a failure).
     static PENDING: RefCell<HashSet<&'static str>> = RefCell::new(HashSet::new());
+    /// Keys the server answered 404 for. Its buffer set is fixed per graph,
+    /// so one 404 is final: re-asking would be a permanent warning loop.
+    static UNSERVED: RefCell<HashSet<&'static str>> = RefCell::new(HashSet::new());
+    /// Importer facet index behind the primary-tag buckets. graph-api has no
+    /// `tag` metric buffer; `/graph/meta_summary` is the same facet source
+    /// the Nodes and Filter panels read.
+    static TAG_FACETS: RefCell<Option<FieldIndex>> = const { RefCell::new(None) };
     /// Server metrics are only meaningful for a graph-api-owned topology.
     static METRICS_ALLOWED: Cell<bool> = const { Cell::new(false) };
     static METRICS_SESSION: Cell<u64> = const { Cell::new(0) };
@@ -747,6 +756,8 @@ pub(crate) fn reset_for_graph_session(server_backed: bool) {
     METRICS_SESSION.with(|c| c.set(c.get().wrapping_add(1)));
     METRICS_TL.with(|m| m.borrow_mut().clear());
     PENDING.with(|p| p.borrow_mut().clear());
+    UNSERVED.with(|u| u.borrow_mut().clear());
+    TAG_FACETS.with(|c| c.borrow_mut().take());
     METRICS_GEN.with(|g| g.set(g.get().wrapping_add(1)));
     LAST_APPLIED.with(|c| c.set(None));
 }
@@ -784,6 +795,9 @@ pub(crate) fn state_restore(s: &StyleState) {
     let _ = LocalStorage::set(STORE_KEY, s);
 }
 
+/// The `tag` key is derived, not fetched: [`ensure_tag_metric`] owns it.
+const TAG_KEY: &str = "tag";
+
 /// Kick off fetches for every server-served metric the current style needs
 /// and doesn't have cached. Keys with no server buffer (uniform / recency /
 /// doctype / folder) are skipped — the builders fall back, exactly like the
@@ -792,6 +806,8 @@ fn ensure_metrics(style: &StyleState) {
     if !METRICS_ALLOWED.with(Cell::get) {
         return;
     }
+    /// graph-api's per-node binary cache keys (graph-api `state.rs`). Asking
+    /// for anything else is a guaranteed 404.
     const SERVED: &[&str] = &[
         "degree",
         "indegree",
@@ -801,7 +817,6 @@ fn ensure_metrics(style: &StyleState) {
         "kcore",
         "community",
         "wcc",
-        "tag",
     ];
     let mut want = vec![
         style.size_by.metric_key(),
@@ -812,7 +827,10 @@ fn ensure_metrics(style: &StyleState) {
         want.push(style.edge_color_by.metric_key());
     }
     if style.community_source == CommunitySource::Tag {
-        want.push("tag");
+        want.push(TAG_KEY);
+    }
+    if want.contains(&TAG_KEY) {
+        ensure_tag_metric();
     }
     for key in want {
         if !SERVED.contains(&key) {
@@ -821,26 +839,33 @@ fn ensure_metrics(style: &StyleState) {
         if METRICS_TL.with(|m| m.borrow().contains_key(key)) {
             continue;
         }
+        if UNSERVED.with(|u| u.borrow().contains(key)) {
+            continue;
+        }
         if PENDING.with(|p| !p.borrow_mut().insert(key)) {
             continue;
         }
         let session = METRICS_SESSION.with(Cell::get);
         wasm_bindgen_futures::spawn_local(async move {
             match crate::api::metric(key).await {
-                Ok(v) => {
-                    if !METRICS_ALLOWED.with(Cell::get)
-                        || METRICS_SESSION.with(Cell::get) != session
-                    {
+                Ok(Some(v)) => {
+                    if !current_session(session) {
                         return;
                     }
-                    METRICS_TL.with(|m| {
-                        m.borrow_mut().insert(key.to_string(), v);
-                    });
-                    METRICS_GEN.with(|g| g.set(g.get().wrapping_add(1)));
+                    insert_metric(key, v);
                     PENDING.with(|p| {
                         p.borrow_mut().remove(key);
                     });
                     apply_now();
+                }
+                Ok(None) => {
+                    tracing::warn!("[style] metric {key}: not served by this graph");
+                    UNSERVED.with(|u| {
+                        u.borrow_mut().insert(key);
+                    });
+                    PENDING.with(|p| {
+                        p.borrow_mut().remove(key);
+                    });
                 }
                 Err(e) => {
                     tracing::warn!("[style] metric {key}: {e}");
@@ -853,6 +878,79 @@ fn ensure_metrics(style: &StyleState) {
                 }
             }
         });
+    }
+}
+
+fn current_session(session: u64) -> bool {
+    METRICS_ALLOWED.with(Cell::get) && METRICS_SESSION.with(Cell::get) == session
+}
+
+fn insert_metric(key: &str, v: Vec<f32>) {
+    METRICS_TL.with(|m| {
+        m.borrow_mut().insert(key.to_string(), v);
+    });
+    METRICS_GEN.with(|g| g.set(g.get().wrapping_add(1)));
+}
+
+/// Live node count of the loaded render host — the length the categorical
+/// buffers must reach before the builders will use them.
+fn host_node_count() -> Option<usize> {
+    render::with_host(|h| {
+        let (pipes, _) = h.pipes_and_queue();
+        pipes.is_loaded().then(|| pipes.n_nodes() as usize)
+    })
+    .flatten()
+}
+
+/// Materialize the primary-tag buckets into the metric cache. graph-api
+/// serves no `tag` buffer, so the buckets come from the importer facet index
+/// (`/graph/meta_summary`), fetched once per graph session. Re-derives when
+/// the host's node count outgrows the cached buffer.
+fn ensure_tag_metric() {
+    let facets_ready = TAG_FACETS.with(|c| c.borrow().is_some());
+    if !facets_ready {
+        if PENDING.with(|p| !p.borrow_mut().insert(TAG_KEY)) {
+            return;
+        }
+        let session = METRICS_SESSION.with(Cell::get);
+        wasm_bindgen_futures::spawn_local(async move {
+            let fetched = crate::api::get_proto::<proto::MetaSummary>("/graph/meta_summary").await;
+            if !current_session(session) {
+                return;
+            }
+            match fetched {
+                Ok(m) => {
+                    TAG_FACETS.with(|c| *c.borrow_mut() = Some(FieldIndex::from_proto(&m)));
+                    PENDING.with(|p| {
+                        p.borrow_mut().remove(TAG_KEY);
+                    });
+                    ensure_tag_metric();
+                    apply_now();
+                }
+                Err(e) => {
+                    tracing::warn!("[style] tag facets: {e}");
+                    gloo_timers::future::TimeoutFuture::new(15_000).await;
+                    PENDING.with(|p| {
+                        p.borrow_mut().remove(TAG_KEY);
+                    });
+                }
+            }
+        });
+        return;
+    }
+    let Some(n) = host_node_count() else {
+        return;
+    };
+    if METRICS_TL.with(|m| m.borrow().get(TAG_KEY).is_some_and(|v| v.len() >= n)) {
+        return;
+    }
+    let derived = TAG_FACETS.with(|c| {
+        c.borrow()
+            .as_ref()
+            .and_then(|index| index.tag_primary_metric(n))
+    });
+    if let Some(v) = derived {
+        insert_metric(TAG_KEY, v);
     }
 }
 

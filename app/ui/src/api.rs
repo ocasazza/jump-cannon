@@ -180,9 +180,17 @@ pub fn clear_source_id() {
     }
 }
 
+/// Writes, generation, and the compute broker are pinned to the deployment
+/// default source: graph-api's `DefaultSource` extractor answers 400 for any
+/// other selection. Callers gate those routes on this instead of polling
+/// into a permanent 400 loop.
+pub fn on_default_source() -> bool {
+    source_id().is_none()
+}
+
 /// Inject the source-selection header when the viewer has switched sources.
-/// Sent unconditionally once set — write/compute endpoints answer 400 on a
-/// non-default selection, and that error is meant to surface to the user.
+/// Sent unconditionally once set; default-source-only routes must be gated
+/// by the caller ([`on_default_source`]), not by reading their 400.
 pub(crate) fn with_source_header(
     req: gloo_net::http::RequestBuilder,
 ) -> gloo_net::http::RequestBuilder {
@@ -379,9 +387,20 @@ pub(crate) async fn revisioned_edges() -> ApiResult<Revisioned<Vec<u32>>> {
     })
 }
 
-/// `/graph/metrics/:name` — per-node f32 buffer (degree, pagerank, community, …).
-pub async fn metric(name: &str) -> ApiResult<Vec<f32>> {
-    Ok(f32s(&get_bytes(&format!("/graph/metrics/{name}")).await?))
+/// `/graph/metrics/:name` — per-node f32 buffer. The served keys are
+/// graph-api's binary cache set (degree, indegree, outdegree, pagerank,
+/// betweenness, kcore, community, wcc); anything else answers 404, which
+/// returns `Ok(None)` so a caller stops asking instead of retrying forever.
+pub async fn metric(name: &str) -> ApiResult<Option<Vec<f32>>> {
+    let path = format!("/graph/metrics/{name}");
+    let resp = get(&path).send().await.map_err(err)?;
+    if resp.status() == 404 {
+        return Ok(None);
+    }
+    if !resp.ok() {
+        return Err(format!("{} -> HTTP {}", path, resp.status()));
+    }
+    Ok(Some(f32s(&resp.binary().await.map_err(err)?)))
 }
 
 pub(crate) async fn revisioned_metric(name: &str) -> ApiResult<Revisioned<Vec<f32>>> {
@@ -693,17 +712,24 @@ pub struct VaultPagePutResp {
 
 /// `PUT /vault/page` — write a note's body markdown (frontmatter on disk is
 /// preserved verbatim). `path` follows the vault-links convention: relative,
-/// no `.md` extension, matching `NodeMeta.path`.
+/// no `.md` extension, matching `NodeMeta.path`. A non-2xx body is plain
+/// text (a write against a non-default source is rejected 400), so it is
+/// surfaced verbatim rather than parsed as the JSON envelope.
 pub async fn put_page(path: &str, body: &str) -> ApiResult<VaultPagePutResp> {
-    with_source_header(Request::put(&url("/vault/page")))
+    let resp = with_source_header(Request::put(&url("/vault/page")))
         .json(&serde_json::json!({ "path": path, "body": body }))
         .map_err(err)?
         .send()
         .await
-        .map_err(err)?
-        .json()
-        .await
-        .map_err(err)
+        .map_err(err)?;
+    if !resp.ok() {
+        let status = resp.status();
+        return Err(match resp.text().await {
+            Ok(text) if !text.trim().is_empty() => text,
+            _ => format!("/vault/page -> HTTP {status}"),
+        });
+    }
+    resp.json().await.map_err(err)
 }
 
 // --- progress -------------------------------------------------------------------

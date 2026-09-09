@@ -91,8 +91,7 @@ impl FieldIndex {
     /// of its primary tag (first tag in case-sensitive sorted order — the
     /// deterministic tiebreaker for multi-tagged nodes). Bucket ids are
     /// `hash(tag) as u32`; untagged nodes get `0`. `None` when no node
-    /// carries any tag. Ported for the Style panel's tag-color path.
-    #[allow(dead_code)] // consumer lands with the Style panel port
+    /// carries any tag. Backs the Style panel's tag-colour path.
     pub(crate) fn tag_primary_metric(&self, n_nodes: usize) -> Option<Vec<f32>> {
         let tags = self.by_field.get("tags")?;
         // Walk the (value -> [node_idx]) buckets in sorted value order so
