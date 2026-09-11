@@ -337,6 +337,105 @@ fn shipped_pest_packages_parse_their_examples() {
     );
 }
 
+const LABEL_GRAMMAR: &str = r#"
+document = { SOI ~ (item ~ NEWLINE?)* ~ EOI }
+item = { word ~ (" " ~ (hot | cold))* }
+word = @{ (!(" " | "\t" | NEWLINE) ~ ANY)+ }
+hot = @{ "H" }
+cold = @{ "C" }
+title = { "@@title@@" }
+kind = { "@@kind@@" }
+tag = { "@@tag@@" }
+property = { key ~ "=" ~ value }
+key = { "@@key@@" }
+value = { "@@value@@" }
+edge = { source ~ "@@->@@" ~ target }
+source = { "@@source@@" }
+target = { "@@target@@" }
+"#;
+
+fn label_manifest(tag_labels: &str) -> String {
+    format!(
+        r#"format_version = 3
+
+[metadata]
+id = "example.labels"
+name = "Labeled tags"
+version = "1.0.0"
+description = "Test labeled feature tags"
+
+[parser]
+engine = "pest"
+root_rule = "document"
+grammar = '''{LABEL_GRAMMAR}'''
+
+[parser.captures]
+node = "item"
+id = "word"
+title = "title"
+kind = "kind"
+tag = "tag"
+property = "property"
+key = "key"
+value = "value"
+edge = "edge"
+source = "source"
+target = "target"
+{tag_labels}
+"#
+    )
+}
+
+#[test]
+fn tag_labels_push_static_labels_for_matching_rules() {
+    let package = ValidatedPackage::from_toml(&label_manifest(
+        "\n[parser.captures.tag_labels]\nhot = \"hot\"\ncold = \"cold\"\n",
+    ))
+    .expect("valid labeled package");
+    let result = package
+        .parse_input("n1 H C H\nn2\nn3 C")
+        .expect("input parses");
+
+    let tags = |id: &str| {
+        result
+            .graph
+            .nodes
+            .get(&format!("pest:example.labels:{id}"))
+            .unwrap_or_else(|| panic!("{id} present"))
+            .meta
+            .tags
+            .clone()
+    };
+    assert_eq!(tags("n1"), vec!["cold".to_owned(), "hot".to_owned()], "sorted, deduplicated");
+    assert!(tags("n2").is_empty(), "no feature match, no label");
+    assert_eq!(tags("n3"), vec!["cold".to_owned()]);
+    package
+        .schema()
+        .validate_result(&result)
+        .expect("output satisfies the discovery contract");
+}
+
+#[test]
+fn tag_labels_validate_their_rule_bindings() {
+    let missing = label_manifest("\n[parser.captures.tag_labels]\nghost = \"ghost\"\n");
+    assert!(matches!(
+        ValidatedPackage::from_toml(&missing),
+        Err(ImportError::MissingRule { role: "tag_labels", .. })
+    ));
+
+    let empty = label_manifest("\n[parser.captures.tag_labels]\nhot = \"  \"\n");
+    assert!(matches!(
+        ValidatedPackage::from_toml(&empty),
+        Err(ImportError::Grammar(_))
+    ));
+
+    let collides = label_manifest("\n[parser.captures.tag_labels]\nword = \"word-label\"\n");
+    assert!(matches!(
+        ValidatedPackage::from_toml(&collides),
+        Err(ImportError::AmbiguousCaptureRule { second_role: "tag_labels", .. })
+    ));
+}
+
 #[cfg(feature = "native")]
 mod native {
     use std::io::Write;

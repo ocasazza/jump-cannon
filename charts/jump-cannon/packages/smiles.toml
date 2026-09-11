@@ -1,0 +1,121 @@
+# SMILES compound list package (pest grammar).
+#
+# SMILES (Simplified Molecular Input Line Entry System) is the line notation
+# every cheminformatics toolkit (RDKit, Open Babel, PubChem, ChEBI) reads:
+# one compound per line, optionally a tab and a common name.
+#
+# Each line becomes one compound node: the SMILES string is the node id
+# (identity semantics — a duplicate line fails loudly with
+# `DuplicateNodeId`), the optional name is the title, and the grammar tags
+# structural features as it tokenizes, so the tags facet groups compounds by
+# chemistry: `aromatic`, `chiral`, `cyclic`, `halogenated`, `charged`.
+#
+# Grammar notes (edit live in the Importers panel; no recompile):
+# - This is a *tokenizer*, not a validator: `other` catches anything
+#   exotic, so a parse never fails on unusual but legal SMILES. Feature
+#   rules are ordinary tokens, so adding a tag is adding one alternation.
+# - Feature tags ride the engine's `tag_labels` contract: the rule match
+#   pushes the static label, not the matched text.
+# - Atoms-as-nodes and bonds-as-edges (one molecule rendered as its own
+#   graph) are deliberately NOT here: the pest capture contract is one
+#   node per record with no nested graph records, and atom connectivity
+#   needs sibling pairing a PEG cannot express. That is a decoder-level
+#   feature (explode SMILES/SDF to atom/bond records upstream), tracked
+#   via the reserved `bonds_to` edge type below.
+
+format_version = 3
+
+[metadata]
+id = "chemistry.smiles"
+name = "SMILES compound list"
+version = "1.0.0"
+description = "Reads a SMILES compound list (RDKit / Open Babel / PubChem / ChEBI export) as a graph of compounds: one node per SMILES, feature tags (aromatic, chiral, cyclic, halogenated, charged) from the notation itself so the tags facet groups compounds by chemistry."
+
+[limits]
+manifest_bytes = 131072
+grammar_bytes = 65536
+input_bytes = 33554432
+nodes = 100000
+edges = 1000
+
+[[schema.edge_types]]
+key = "bonds_to"
+directed = false
+description = "Reserved for atom -> atom bond edges. Rendering one molecule as its own graph needs a decoder that explodes SMILES/SDF into atom/bond records; the pest capture contract is one node per record with no nested graph records."
+
+[parser]
+engine = "pest"
+root_rule = "document"
+grammar = '''
+document = { SOI ~ compound* ~ NEWLINE* ~ EOI }
+
+// One line = one compound. The SMILES is the id; an optional tab-separated
+// name is the title.
+compound = { smiles ~ ("\t" ~ name)? ~ NEWLINE? }
+name = @{ (!("\r" | "\n") ~ ANY)+ }
+
+// Lenient tokenizer: feature-bearing tokens first, a catch-all last, so no
+// legal SMILES ever fails the parse.
+smiles = { token+ }
+token = _{ bracket_atom | halogen | aromatic | organic_subset | chiral
+         | bond | ring | branch | dot | other }
+
+// [Na+], [C@H], [nH], [NH4+]: parse the inside so feature rules still fire.
+bracket_atom = { "[" ~ bracket_body ~ "]" }
+bracket_body = { (isotope | halogen | aromatic | organic_subset | chiral
+               | hcount | charge | dot | map_class | bracket_other)* }
+bracket_other = @{ !("]" | "\r" | "\n") ~ ANY }
+
+// Feature-labeled tokens (see [parser.captures.tag_labels]).
+halogen = @{ "Cl" | "Br" | "F" | "I" }
+aromatic = @{ "se" | "as" | "b" | "c" | "n" | "o" | "p" | "s" }
+chiral = @{ "@@" | "@" }
+ring = @{ "%" ~ '0'..'9' ~ '0'..'9' | '0'..'9' }
+charge = @{ ("+" | "-")+ }
+
+// Structural tokens.
+organic_subset = @{ "B" | "C" | "N" | "O" | "P" | "S" }
+bond = @{ "-" | "=" | "#" | ":" | "/" | "\\" }
+branch = @{ "(" | ")" }
+dot = @{ "." }
+hcount = @{ "H" ~ '0'..'9'? }
+isotope = @{ '0'..'9'+ }
+map_class = @{ ":" ~ '0'..'9'+ }
+// The catch-all must not cross a token boundary: without the guards it
+// would swallow the tab and the compound name into the SMILES id (and the
+// name's letters would fire feature labels).
+other = @{ !("\t" | "\r" | "\n") ~ ANY }
+
+// Roles a SMILES list does not use. The capture contract requires one
+// distinct, non-silent rule per role; these match nothing in SMILES input.
+kind = { "@@kind@@" }
+tag = { "@@tag@@" }
+property = { key ~ "=" ~ value }
+key = { "@@key@@" }
+value = { "@@value@@" }
+edge = { source ~ "@@->@@" ~ target }
+source = { "@@source@@" }
+target = { "@@target@@" }
+'''
+
+[parser.captures]
+node = "compound"
+id = "smiles"
+title = "name"
+kind = "kind"
+tag = "tag"
+property = "property"
+key = "key"
+value = "value"
+edge = "edge"
+source = "source"
+target = "target"
+
+# Static feature labels: a match of the rule anywhere in the compound's
+# subtree pushes the label onto the node's tags (deduplicated per node).
+[parser.captures.tag_labels]
+aromatic = "aromatic"
+chiral = "chiral"
+ring = "cyclic"
+halogen = "halogenated"
+charge = "charged"

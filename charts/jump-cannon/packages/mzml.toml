@@ -1,0 +1,111 @@
+# mzML spectrum-index package (pest grammar).
+#
+# mzML is the PSI standard XML format for raw mass spectrometry runs
+# (PRIDE, MetaboLights, Metabolomics Workbench all publish it). Production
+# mzML files are megabytes-to-gigabytes of base64 spectra; this package
+# indexes the *run*: one node per spectrum, the spectrum id attribute as
+# the node id, and tags read straight from the controlled vocabulary —
+# `MS1` / `MS2` from the `ms level` cvParam, `positive` / `negative` from
+# the scan polarity — so the tags facet separates survey scans from
+# fragmentation scans.
+#
+# Grammar notes (edit live in the Importers panel; no recompile):
+# - This is a lenient subset parser, not an XML validator: anything that is
+#   not a `<spectrum>` element is skipped, and inside a spectrum only the
+#   id attribute and the tagged cvParams are captured. Binary arrays are
+#   consumed, never decoded.
+# - Feature tags ride the engine's `tag_labels` contract: a rule match
+#   pushes the static label (the matched text would be the raw attribute
+#   fragment, not a useful tag).
+# - Size reality: pest holds the whole input in memory and `junk` scanning
+#   is linear, so bound inputs to index-sized files (`limits.input_bytes`).
+#   For a multi-GB raw run, export the spectrum list first
+#   (`msconvert --filter "metadata"` style) and import that.
+# - Precursor -> precursor-scan edges (MS2 fragment_of its MS1 scan) are
+#   NOT produced: the pest capture contract is one node per record with no
+#   cross-record references. Reserved edge type below.
+
+format_version = 3
+
+[metadata]
+id = "proteomics.mzml"
+name = "mzML spectrum index"
+version = "1.0.0"
+description = "Reads an mzML run (PSI XML, e.g. PRIDE raw files) as a graph of spectra: one node per spectrum id, tagged MS1/MS2 by ms level and positive/negative by scan polarity, so the tags facet separates survey from fragmentation scans."
+
+[limits]
+manifest_bytes = 131072
+grammar_bytes = 65536
+# Index-sized inputs only; see the size note in the header comment.
+input_bytes = 67108864
+nodes = 1000000
+edges = 1000
+
+[[schema.edge_types]]
+key = "fragment_of"
+directed = true
+description = "Reserved for MS2 spectrum -> precursor MS1 spectrum edges. Precursor scan references need cross-record linking the pest capture contract does not offer."
+
+[parser]
+engine = "pest"
+root_rule = "document"
+grammar = '''
+document = { SOI ~ prolog? ~ (spectrum | junk)* ~ EOI }
+prolog = { "<?xml" ~ (!"?>" ~ ANY)* ~ "?>" }
+
+// Anything that is not the start of a spectrum element is skipped one
+// character at a time.
+junk = { !"<spectrum " ~ ANY }
+
+// One <spectrum> element = one spectrum node. The id attribute is the
+// node id; it may appear after other attributes, so scan to it.
+spectrum = { "<spectrum " ~ attrs ~ ">" ~ spectrum_body ~ "</spectrum>" }
+attrs = { (!">" ~ !"id=\"" ~ ANY)* ~ "id=\"" ~ spectrum_id ~ "\"" ~ (!">" ~ ANY)* }
+spectrum_id = @{ (!"\"" ~ ANY)+ }
+
+// Inside a spectrum: tagged cvParams and skipped content (base64 binary
+// arrays are consumed, never decoded).
+spectrum_body = { (ms1 | ms2 | positive | negative | spectrum_junk)* }
+spectrum_junk = { !"</spectrum>" ~ !"name=\"ms level\"" ~ !"name=\"positive scan\"" ~ !"name=\"negative scan\"" ~ ANY }
+
+// Controlled-vocabulary tokens (see [parser.captures.tag_labels]). mzML
+// writers emit name before value; a writer that reorders attributes simply
+// yields no tag, never a parse failure.
+ms1 = @{ "name=\"ms level\" value=\"1\"" }
+ms2 = @{ "name=\"ms level\" value=\"2\"" }
+positive = @{ "name=\"positive scan\"" }
+negative = @{ "name=\"negative scan\"" }
+
+// Roles the spectrum index does not use. The capture contract requires one
+// distinct, non-silent rule per role; these match nothing in mzML input.
+title = { "@@title@@" }
+kind = { "@@kind@@" }
+tag = { "@@tag@@" }
+property = { key ~ "=" ~ value }
+key = { "@@key@@" }
+value = { "@@value@@" }
+edge = { source ~ "@@->@@" ~ target }
+source = { "@@source@@" }
+target = { "@@target@@" }
+'''
+
+[parser.captures]
+node = "spectrum"
+id = "spectrum_id"
+title = "title"
+kind = "kind"
+tag = "tag"
+property = "property"
+key = "key"
+value = "value"
+edge = "edge"
+source = "source"
+target = "target"
+
+# Static feature labels: a match anywhere in the spectrum subtree pushes
+# the label onto the node's tags (deduplicated per node).
+[parser.captures.tag_labels]
+ms1 = "MS1"
+ms2 = "MS2"
+positive = "positive"
+negative = "negative"

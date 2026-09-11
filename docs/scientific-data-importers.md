@@ -31,6 +31,8 @@ Seven distinct formats across eight packages under
 | `mztab.toml` | mzTab 1.0 (TSV) | pest | proteins + peptides; PSM evidence edges |
 | `fasta.toml` | FASTA (text) | pest | one node per sequence; sp/tr type |
 | `gff3.toml` | GFF3 (TSV) | pest | one node per feature; type column as canvas type |
+| `smiles.toml` | SMILES compound list (text) | pest | one node per compound; feature tags (aromatic/chiral/cyclic/halogenated/charged) from the notation itself |
+| `mzml.toml` | mzML 1.1 (PSI XML) | pest | spectrum index: one node per spectrum; MS1/MS2 + polarity tags |
 
 Each pest package ships a sibling example input
 (`packages/examples/<stem>.txt`) that a cargo test parses and validates
@@ -50,6 +52,8 @@ Seven sources bind to those formats today, with zero new code:
 | **ENA / Ensembl / RefSeq** | `fasta`, `gff3` | sequence and annotation downloads |
 | **UniProt** | `fasta` | proteome FASTA (`sp`/`tr` headers become the node type) |
 | **Zenodo + any DataCite member** (Dryad, Figshare, PANGAEA, …) | `datacite-dois` | endpoint `https://api.datacite.org`; the repository is a query choice, not code |
+| **PRIDE / MetaboLights / Metabolomics Workbench** raw runs | `mzml` | mzML downloads; bind index-sized files (see the size note in the package header) |
+| **PubChem / ChEBI / RDKit / Open Babel** | `smiles` | SMILES list exports, one compound per line, optional tab + name |
 
 Mix-and-match examples:
 
@@ -114,6 +118,19 @@ All shared-engine, no per-source code, per "packages, not crates":
    live-mutating remotes (DataCite ranking drift) re-observe records;
    first occurrence wins, consistent with the existing `limit_offset`
    rule. `Pagination::None` collections still hard-fail on duplicates.
+6. **`pluck` edge transform** — `transform = "pluck"` + `element_pointer`
+   reduces each object in an array to one value (DataCite
+   `relatedIdentifiers[].relatedIdentifier` → 338 `related` DOI→DOI citation
+   edges inside the Zenodo silkworm set; those edges are what Louvain
+   communities compute over).
+7. **Pest `tag_labels`** — `[parser.captures.tag_labels]` maps a grammar
+   rule to a static tag pushed onto every node whose subtree matches it
+   (SMILES `aromatic`/`chiral`/`cyclic`/`halogenated`/`charged`; mzML
+   `MS1`/`MS2`/`positive`/`negative`). Scalar captures still recurse, so
+   labels fire inside a composite id rule (the SMILES id tokenizes itself).
+8. **`tags_element_pointer`** — the same pluck for node tags: DataCite
+   `subjects[].subject` → 682 tagged works, so the Tags view groups the
+   registry by subject instead of showing `(untagged)`.
 
 ## Honest limits (documented in each package header)
 
@@ -123,19 +140,25 @@ All shared-engine, no per-source code, per "packages, not crates":
   sample→file edges; GFF3 `Parent=` hierarchy cannot become edges yet.
   Reserved edge types mark where a future engine release can attach these.
 - **No dedupe in pest**: duplicate node ids fail loudly (`DuplicateNodeId`)
-  — correct for FASTA/GFF3 identity semantics, and the reason SDRF/ISA-Tab
-  key nodes on the unique-per-row data file.
+  — correct for FASTA/GFF3/SMILES identity semantics, and the reason
+  SDRF/ISA-Tab key nodes on the unique-per-row data file.
+- **mzML is an index subset, not a full parse**: the `mzml` package reads
+  spectrum ids + cvParam tags and consumes (never decodes) base64 binary
+  arrays; bind index-sized inputs (`limits.input_bytes`). mzIdentML/pepXML
+  grammars are not written yet.
+- **Molecules are not yet graphs of atoms**: the `smiles` package is one
+  node per compound with feature tags. Rendering one molecule as its own
+  atom/bond graph needs a decoder that explodes SMILES/SDF into atom/bond
+  records — the pest capture contract is one node per record with no
+  nested graph records or sibling pairing (ring closures, branches).
 - **Binary formats stay out of pest's reach** (project decision: pest is
-  text-only): mzML binary index blocks, NetCDF/HDF5 (mz5, Andi-MS),
-  proprietary vendor formats. These need the connector/decoder unwrap path
+  text-only): NetCDF/HDF5 (mz5, Andi-MS), proprietary vendor formats.
+  These need the connector/decoder unwrap path
   (`crates/importer-connectors`), not grammars.
 - **Pest runtime binding is filesystem** today (`--source pest <file>`);
   fetching SDRF/mzTab/FASTA over HTTP through `importer-connectors`' https
   `SourceConnector` into the pest engine is the designed composition, not
   yet wired into graph-api's runtime.
-- **mzML/mzIdentML/pepXML** (PSI XML) are text and *pest-reachable*, but
-  metadata-subset grammars for them are not written yet; the line-oriented
-  TSV family was the higher-value first cut.
 - **DataCite deep walks**: page-number pagination caps at 10k records
   server-side; `/meta/total` is checked against `limits.nodes` so an
   over-broad query fails loudly. Cursor pagination is the follow-up
@@ -143,16 +166,22 @@ All shared-engine, no per-source code, per "packages, not crates":
 
 ## Verification
 
-- `cargo test -p importer` — 61 tests, including:
+- `cargo test -p importer` — 67 tests, including:
   - `shipped_packages_validate`: every TOML under `packages/` validates;
   - `shipped_pest_packages_parse_their_examples`: every pest package parses
     its example input and satisfies `schema.validate_result`;
   - page-number walk/exhaustion/custom param names/first-page/record-bound;
     root-array mapping; array edge pointers; variable percent-encoding;
-    page-number duplicate tolerance.
-- Live smoke (throwaway test, since removed, against the real APIs):
+    page-number duplicate tolerance; pluck edges; plucked tags;
+    `tag_labels` (labels, binding validation, composite-id recursion).
+- Live smoke (against the real APIs; throwaway test, since removed):
   - `pride-archive` + PXD084037 → 28 nodes (1 project + 27 files), 27
     `contains` edges, 0 unresolved;
   - `pride-search` + `keyword=silkworm` → 35 project nodes;
   - `datacite-dois` + `query=publisher:Zenodo AND silkworm` → 683 work
     nodes across 7 page-number pages.
+- Live graph-api + browser (2026-09, `nix build .#app-web` dist):
+  - `datacite-dois` instance → 683 nodes, **338 `related` citation edges**
+    (pluck), 682 tagged works grouped by subject in the Tags view;
+  - `smiles` instance → 24 compounds grouped by feature tag: aromatic 11,
+    cyclic 17, chiral 5, charged 2, halogenated 2.

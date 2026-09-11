@@ -1,0 +1,149 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<indexedmzML xmlns="http://psi.hupo.org/ms/mzml">
+  <mzML xmlns="http://psi.hupo.org/ms/mzml" id="PXD084037-S1" version="1.1.0">
+    <cvList count="1">
+      <cv id="MS" fullName="Proteomics Standards Initiative Mass Spectrometry Ontology" URI="https://raw.githubusercontent.com/HUPO-PSI/psi-ms-CV/master/psi-ms.obo" version="4.1.0"/>
+    </cvList>
+    <fileDescription>
+      <fileContent>
+        <cvParam cvRef="MS" accession="MS:1000580" name="MSn spectrum" value=""/>
+      </fileContent>
+      <sourceFileList count="1">
+        <sourceFile id="sf1" name="S1.raw" location="file:///data/PXD084037">
+          <cvParam cvRef="MS" accession="MS:1000563" name="Thermo RAW format" value=""/>
+        </sourceFile>
+      </sourceFileList>
+    </fileDescription>
+    <softwareList count="1">
+      <software id="msconvert" version="3.0">
+        <cvParam cvRef="MS" accession="MS:1002204" name="ProteoWizard msconvert" value=""/>
+      </software>
+    </softwareList>
+    <instrumentConfigurationList count="1">
+      <instrumentConfiguration id="ic1">
+        <cvParam cvRef="MS" accession="MS:1002731" name="Orbitrap Astral" value=""/>
+      </instrumentConfiguration>
+    </instrumentConfigurationList>
+    <dataProcessingList count="1">
+      <dataProcessing id="dp1">
+        <processingMethod order="1" softwareRef="msconvert">
+          <cvParam cvRef="MS" accession="MS:1000544" name="Conversion to mzML" value=""/>
+        </processingMethod>
+      </dataProcessing>
+    </dataProcessingList>
+    <run id="run1" defaultInstrumentConfigurationRef="ic1" startTimeStamp="2026-08-30T09:15:00Z">
+      <spectrumList count="4" defaultDataProcessingRef="dp1">
+        <spectrum id="controllerType=0 controllerNumber=1 scan=1001" index="0" defaultArrayLength="3">
+          <cvParam cvRef="MS" accession="MS:1000511" name="ms level" value="1"/>
+          <cvParam cvRef="MS" accession="MS:1000130" name="positive scan" value=""/>
+          <scanList count="1">
+            <scan>
+              <cvParam cvRef="MS" accession="MS:1000016" name="scan start time" value="12.51" unitCvRef="UO" unitAccession="UO:0000031" unitName="minute"/>
+            </scan>
+          </scanList>
+          <binaryDataArrayList count="2">
+            <binaryDataArray encodedLength="24">
+              <cvParam cvRef="MS" accession="MS:1000514" name="m/z array" value=""/>
+              <cvParam cvRef="MS" accession="MS:1000523" name="64-bit float" value=""/>
+              <cvParam cvRef="MS" accession="MS:1000576" name="no compression" value=""/>
+              <binary>AAAAAARkvEMAAACAZeRxQwAAAABx7HFD</binary>
+            </binaryDataArray>
+            <binaryDataArray encodedLength="24">
+              <cvParam cvRef="MS" accession="MS:1000515" name="intensity array" value=""/>
+              <cvParam cvRef="MS" accession="MS:1000523" name="64-bit float" value=""/>
+              <binary>AAAAAAZZhEIAAACAwvGqQgAAAICl8g9D</binary>
+            </binaryDataArray>
+          </binaryDataArrayList>
+        </spectrum>
+        <spectrum id="controllerType=0 controllerNumber=1 scan=1002" index="1" defaultArrayLength="2">
+          <cvParam cvRef="MS" accession="MS:1000511" name="ms level" value="2"/>
+          <cvParam cvRef="MS" accession="MS:1000130" name="positive scan" value=""/>
+          <precursorList count="1">
+            <precursor spectrumRef="controllerType=0 controllerNumber=1 scan=1001">
+              <selectedIonList count="1">
+                <selectedIon>
+                  <cvParam cvRef="MS" accession="MS:1000744" name="selected ion m/z" value="524.30"/>
+                  <cvParam cvRef="MS" accession="MS:1000041" name="charge state" value="2"/>
+                </selectedIon>
+              </selectedIonList>
+              <activation>
+                <cvParam cvRef="MS" accession="MS:1000422" name="beam-type collision-induced dissociation" value=""/>
+              </activation>
+            </precursor>
+          </precursorList>
+          <binaryDataArrayList count="2">
+            <binaryDataArray encodedLength="16">
+              <cvParam cvRef="MS" accession="MS:1000514" name="m/z array" value=""/>
+              <binary>AAAAAEgjckMAAACApwoCRQ==</binary>
+            </binaryDataArray>
+            <binaryDataArray encodedLength="16">
+              <cvParam cvRef="MS" accession="MS:1000515" name="intensity array" value=""/>
+              <binary>AAAAAOmgUEIAAAAAYk8hQw==</binary>
+            </binaryDataArray>
+          </binaryDataArrayList>
+        </spectrum>
+        <spectrum id="controllerType=0 controllerNumber=1 scan=1003" index="2" defaultArrayLength="3">
+          <cvParam cvRef="MS" accession="MS:1000511" name="ms level" value="1"/>
+          <cvParam cvRef="MS" accession="MS:1000129" name="negative scan" value=""/>
+          <scanList count="1">
+            <scan>
+              <cvParam cvRef="MS" accession="MS:1000016" name="scan start time" value="12.58" unitCvRef="UO" unitAccession="UO:0000031" unitName="minute"/>
+            </scan>
+          </scanList>
+          <binaryDataArrayList count="2">
+            <binaryDataArray encodedLength="24">
+              <cvParam cvRef="MS" accession="MS:1000514" name="m/z array" value=""/>
+              <binary>AAAAAOpjbEMAAABgNVJvQwAAAAB1y2FD</binary>
+            </binaryDataArray>
+            <binaryDataArray encodedLength="24">
+              <cvParam cvRef="MS" accession="MS:1000515" name="intensity array" value=""/>
+              <binary>AAAAAHMi6EEAAABAtMAqQgAAAIBlk9FC</binary>
+            </binaryDataArray>
+          </binaryDataArrayList>
+        </spectrum>
+        <spectrum id="controllerType=0 controllerNumber=1 scan=1004" index="3" defaultArrayLength="2">
+          <cvParam cvRef="MS" accession="MS:1000511" name="ms level" value="2"/>
+          <cvParam cvRef="MS" accession="MS:1000129" name="negative scan" value=""/>
+          <precursorList count="1">
+            <precursor spectrumRef="controllerType=0 controllerNumber=1 scan=1003">
+              <selectedIonList count="1">
+                <selectedIon>
+                  <cvParam cvRef="MS" accession="MS:1000744" name="selected ion m/z" value="609.28"/>
+                  <cvParam cvRef="MS" accession="MS:1000041" name="charge state" value="1"/>
+                </selectedIon>
+              </selectedIonList>
+              <activation>
+                <cvParam cvRef="MS" accession="MS:1000422" name="beam-type collision-induced dissociation" value=""/>
+              </activation>
+            </precursor>
+          </precursorList>
+          <binaryDataArrayList count="2">
+            <binaryDataArray encodedLength="16">
+              <cvParam cvRef="MS" accession="MS:1000514" name="m/z array" value=""/>
+              <binary>AAAAAKgbpEMAAACAxRkqRQ==</binary>
+            </binaryDataArray>
+            <binaryDataArray encodedLength="16">
+              <cvParam cvRef="MS" accession="MS:1000515" name="intensity array" value=""/>
+              <binary>AAAAAH4j0kEAAAAAEv0gQw==</binary>
+            </binaryDataArray>
+          </binaryDataArrayList>
+        </spectrum>
+      </spectrumList>
+      <chromatogramList count="1" defaultDataProcessingRef="dp1">
+        <chromatogram id="TIC" index="0" defaultArrayLength="4">
+          <cvParam cvRef="MS" accession="MS:1000235" name="total ion current chromatogram" value=""/>
+          <binaryDataArrayList count="2">
+            <binaryDataArray encodedLength="32">
+              <cvParam cvRef="MS" accession="MS:1000595" name="time array" value=""/>
+              <binary>AAAAAAAkKUAAAAAAHwkpQAAAAAA+KUAAAAAAHjkpQA==</binary>
+            </binaryDataArray>
+            <binaryDataArray encodedLength="32">
+              <cvParam cvRef="MS" accession="MS:1000515" name="intensity array" value=""/>
+              <binary>AAAAAELlWkIAAABAZslaQgAAAEBryVqCAAAAQGrJWoI=</binary>
+            </binaryDataArray>
+          </binaryDataArrayList>
+        </chromatogram>
+      </chromatogramList>
+    </run>
+  </mzML>
+</indexedmzML>

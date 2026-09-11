@@ -213,6 +213,11 @@ pub struct NodeRules {
     /// Pointer to an array of tag strings.
     #[serde(default)]
     pub tags_pointer: Option<String>,
+    /// When the tags array holds objects instead of strings: pointer applied
+    /// inside each element (DataCite's `subjects[].subject` is the reference
+    /// case). Only meaningful with `tags_pointer`.
+    #[serde(default)]
+    pub tags_element_pointer: Option<String>,
     /// Import the document only when this predicate holds.
     #[serde(default)]
     pub skip_unless: Option<Predicate>,
@@ -282,6 +287,10 @@ pub enum Transform {
     None,
     /// `"tofu, Hydra"` becomes `["tofu", "Hydra"]`.
     SplitCsv,
+    /// The pointer names an array of objects; each object is reduced with the
+    /// rule's `element_pointer` (edge rules only). DataCite's
+    /// `relatedIdentifiers` is the reference case.
+    Pluck,
 }
 
 /// An edge derived from a value inside a node document.
@@ -294,6 +303,11 @@ pub struct EdgeRule {
     pub value_pointer: String,
     #[serde(default)]
     pub transform: Transform,
+    /// With `transform = "pluck"`: pointer applied inside each object element
+    /// of the array `value_pointer` names. Required for pluck, forbidden
+    /// otherwise.
+    #[serde(default)]
+    pub element_pointer: Option<String>,
     /// Collection whose nodes the value resolves against.
     pub target_collection: String,
     #[serde(default)]
@@ -493,11 +507,28 @@ pub(crate) fn validate_config(
                 if let Some(pointer) = &rules.tags_pointer {
                     validate_pointer(&format!("{name}.tags_pointer"), pointer)?;
                 }
+                match (&rules.tags_pointer, &rules.tags_element_pointer) {
+                    (Some(_), Some(element)) => {
+                        validate_pointer(&format!("{name}.tags_element_pointer"), element)?
+                    }
+                    (None, Some(_)) => {
+                        return Err(invalid(format!(
+                            "{name} sets tags_element_pointer without a tags_pointer"
+                        )));
+                    }
+                    _ => {}
+                }
                 if let Some(predicate) = &rules.skip_unless {
                     validate_pointer(&format!("{name}.skip_unless.pointer"), &predicate.pointer)?;
                 }
                 for rule in &rules.fields {
                     validate_pointer(&format!("{name}.fields.{}", rule.key), &rule.pointer)?;
+                    if rule.transform == Transform::Pluck {
+                        return Err(invalid(format!(
+                            "{name} field {:?} uses pluck, which is defined for edge rules only",
+                            rule.key
+                        )));
+                    }
                     if !declared_fields.contains(rule.key.as_str()) {
                         return Err(invalid(format!(
                             "{name} populates field {:?}, which schema.fields does not declare",
@@ -510,6 +541,25 @@ pub(crate) fn validate_config(
                         &format!("{name}.edges.{}", rule.kind),
                         &rule.value_pointer,
                     )?;
+                    match (rule.transform, &rule.element_pointer) {
+                        (Transform::Pluck, Some(element_pointer)) => validate_pointer(
+                            &format!("{name}.edges.{}.element_pointer", rule.kind),
+                            element_pointer,
+                        )?,
+                        (Transform::Pluck, None) => {
+                            return Err(invalid(format!(
+                                "{name} edge {:?} uses pluck without an element_pointer",
+                                rule.kind
+                            )));
+                        }
+                        (_, Some(_)) => {
+                            return Err(invalid(format!(
+                                "{name} edge {:?} sets element_pointer without transform = \"pluck\"",
+                                rule.kind
+                            )));
+                        }
+                        _ => {}
+                    }
                     if !declared_edges.contains(rule.kind.as_str()) {
                         return Err(invalid(format!(
                             "{name} emits edge kind {:?}, which schema.edge_types does not declare",

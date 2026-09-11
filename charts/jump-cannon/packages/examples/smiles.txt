@@ -1,0 +1,24 @@
+CCO	ethanol
+CC(=O)O	acetic acid
+C(=O)(N)N	urea
+O	water
+[Na+].[Cl-]	sodium chloride
+[NH4+]	ammonium
+c1ccccc1	benzene
+Cc1ccccc1	toluene
+Oc1ccccc1	phenol
+C(C(C(=O)O)N)	glycine
+CC(=O)Oc1ccccc1C(=O)O	aspirin
+CC(C)Cc1ccc(cc1)C(C)C(=O)O	ibuprofen
+CC(=O)Nc1ccc(O)cc1	paracetamol
+COc1cc(C=O)ccc1O	vanillin
+C1=CC(=C(C=C1CCN)O)O	dopamine
+C1=CC2=C(C=C1O)C(=CN2)CCN	serotonin
+CN1C=NC2=C1C(=O)N(C(=O)N2C)C	caffeine
+CN1CCC[C@H]1c2cccnc2	nicotine
+C1=CC=C2C(=C1)C(=CN2)C[C@@H](C(=O)O)N	tryptophan
+OC[C@H]1OC(O)[C@H](O)[C@@H](O)[C@H]1O	glucose
+CC1=CCC(CC1)C(=C)C	limonene
+Clc1ccc(cc1)C(c2ccc(Cl)cc2)C(Cl)(Cl)Cl	DDT
+CC1(C)S[C@@H]2C(NC(=O)Cc3ccccc3)C(=O)N2C1C(=O)O	penicillin G
+CN1CC[C@]23c4c5ccc(O)c4O[C@H]2[C@@H](O)C=C[C@H]3[C@H]1C5	morphine

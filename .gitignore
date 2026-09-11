@@ -29,3 +29,4 @@ app/src-tauri/gen/
 .claude/
 .gc/
 result
+app-web-dist

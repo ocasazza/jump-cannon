@@ -621,3 +621,155 @@ fn duplicate_node_id_from_page_number_recollection_is_tolerated() {
         .expect("f1 present");
     assert_eq!(kept.meta.title, "a.raw", "the first occurrence must win");
 }
+
+const PACKAGE_PLUCK_EDGES: &str = r#"
+format_version = 3
+
+[metadata]
+id = "test.pluck"
+name = "Pluck edges"
+version = "1.0.0"
+
+[[schema.edge_types]]
+key = "related"
+directed = true
+
+[parser]
+engine = "json"
+
+[[parser.collections]]
+name = "dois"
+path = "/dois"
+items_pointer = ""
+
+[parser.collections.nodes]
+id_pointer = "/id"
+node_type = "work"
+
+[parser.collections.nodes.title]
+pointer = "/title"
+
+[[parser.collections.nodes.edges]]
+kind = "related"
+value_pointer = "/related"
+transform = "pluck"
+element_pointer = "/doi"
+target_collection = "dois"
+"#;
+
+#[test]
+fn pluck_edge_pointer_yields_one_edge_per_object_element() {
+    // DataCite relatedIdentifiers shape: an array of objects, each reduced
+    // to its DOI; in-set targets resolve, out-of-set are reported
+    // unresolved, and elements lacking the plucked key are skipped.
+    let package =
+        ValidatedPackage::from_toml_bytes(PACKAGE_PLUCK_EDGES.as_bytes()).expect("validates");
+    let mapper = ManifestMapper::new(
+        package,
+        Namespace::new(SOURCE_KIND, "omp").expect("namespace"),
+    );
+    let result = mapper
+        .map(vec![record(
+            "dois",
+            json!([
+                {"id": "10.1/a", "title": "A",
+                 "related": [{"relationType": "Cites", "doi": "10.1/b"},
+                             {"relationType": "Cites", "doi": "10.1/absent"},
+                             {"relationType": "IsSupplementTo"}]},
+                {"id": "10.1/b", "title": "B", "related": []},
+            ]),
+        )])
+        .expect("mapping succeeds");
+    assert!(has_edge(&result, "10.1/a", "10.1/b"));
+    assert_eq!(result.graph.edge_count(), 1);
+    assert_eq!(
+        result.unresolved,
+        ["dois \"10.1/absent\" referenced by 10.1/a"],
+        "the out-of-set DOI must be reported unresolved"
+    );
+}
+
+#[test]
+fn pluck_requires_an_element_pointer_and_is_edge_only() {
+    let no_element = PACKAGE_PLUCK_EDGES.replacen(
+        "element_pointer = \"/doi\"\n",
+        "",
+        1,
+    );
+    assert!(matches!(
+        ValidatedPackage::from_toml_bytes(no_element.as_bytes()),
+        Err(crate::ImportError::JsonEngine(_))
+    ));
+
+    let element_without_pluck = PACKAGE_PLUCK_EDGES.replacen(
+        "transform = \"pluck\"\n",
+        "",
+        1,
+    );
+    assert!(matches!(
+        ValidatedPackage::from_toml_bytes(element_without_pluck.as_bytes()),
+        Err(crate::ImportError::JsonEngine(_))
+    ));
+
+    let pluck_on_field = PACKAGE_PLUCK_EDGES.replace(
+        "[[parser.collections.nodes.edges]]",
+        "[[parser.collections.nodes.fields]]\nkey = \"doi\"\npointer = \"/related\"\ntransform = \"pluck\"\n\n[[parser.collections.nodes.edges]]",
+    );
+    // The field addition must declare its schema field; the pluck rejection
+    // fires first regardless.
+    assert!(matches!(
+        ValidatedPackage::from_toml_bytes(pluck_on_field.as_bytes()),
+        Err(crate::ImportError::JsonEngine(_))
+    ));
+}
+
+#[test]
+fn tags_element_pointer_plucks_object_subjects() {
+    // DataCite subjects shape: an array of `{ "subject": "…" }` objects. The
+    // element pointer reduces each to its string; scalars in the same array
+    // are skipped rather than misread.
+    let package_src = PACKAGE_PLUCK_EDGES.replacen(
+        "node_type = \"work\"",
+        "node_type = \"work\"\ntags_pointer = \"/subjects\"\ntags_element_pointer = \"/subject\"",
+        1,
+    );
+    let package =
+        ValidatedPackage::from_toml_bytes(package_src.as_bytes()).expect("validates");
+    let mapper = ManifestMapper::new(
+        package,
+        Namespace::new(SOURCE_KIND, "omp").expect("namespace"),
+    );
+    let result = mapper
+        .map(vec![record(
+            "dois",
+            json!([{"id": "10.1/a", "title": "A", "related": [],
+                    "subjects": [{"subject": "Paleoproteomics"},
+                                 {"subject": "Paleoproteomics"},
+                                 {"subject": "  "},
+                                 {"subject": "Silk Road"}]}]),
+        )])
+        .expect("mapping succeeds");
+    let node = result
+        .graph
+        .nodes
+        .get(&node_id("10.1/a"))
+        .expect("node present");
+    assert_eq!(
+        node.meta.tags,
+        vec!["Paleoproteomics".to_owned(), "Silk Road".to_owned()],
+        "plucked, trimmed, deduplicated, blanks dropped"
+    );
+}
+
+#[test]
+fn tags_element_pointer_requires_a_tags_pointer() {
+    let package_src = PACKAGE_PLUCK_EDGES.replacen(
+        "node_type = \"work\"",
+        "node_type = \"work\"\ntags_element_pointer = \"/subject\"",
+        1,
+    );
+    assert!(matches!(
+        ValidatedPackage::from_toml_bytes(package_src.as_bytes()),
+        Err(crate::ImportError::JsonEngine(_))
+    ));
+}

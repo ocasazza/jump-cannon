@@ -72,14 +72,15 @@ required = false
 searchable = false
 facetable = false
 
-# Reserved: DataCite relatedIdentifiers carry citation/derived-from links,
-# but they are arrays of objects — producing these edges needs a pluck
-# transform the json engine does not have yet. The discovery schema requires
-# at least one declared edge type.
+# DOI -> DOI edges from DataCite relatedIdentifiers (Cites, IsSupplementTo,
+# References, IsDerivedFrom, …). The pluck transform reduces each object in
+# the array to its relatedIdentifier DOI; targets outside the query result
+# are reported unresolved, not fatal. The per-edge relation type is not
+# imported (one kind per rule).
 [[schema.edge_types]]
-key = "cites"
+key = "related"
 directed = true
-description = "Reserved for DOI -> DOI citation edges from relatedIdentifiers (needs a pluck transform; not yet produced)."
+description = "DOI -> DOI edges from DataCite relatedIdentifiers (Cites, IsSupplementTo, References, IsDerivedFrom, …; the relation type itself is not imported)."
 
 [parser]
 engine = "json"
@@ -101,6 +102,10 @@ total_pointer = "/meta/total"
 [parser.collections.nodes]
 id_pointer = "/id"
 node_type = "work"
+# Tags: DataCite subjects are an array of objects; the element pointer plucks
+# each subject string so the tags facet groups works by subject.
+tags_pointer = "/attributes/subjects"
+tags_element_pointer = "/subject"
 
 [parser.collections.nodes.doctype]
 pointer = "/attributes/types/resourceTypeGeneral"
@@ -129,3 +134,11 @@ pointer = "/attributes/types/resourceTypeGeneral"
 [[parser.collections.nodes.fields]]
 key = "url"
 pointer = "/attributes/url"
+
+[[parser.collections.nodes.edges]]
+kind = "related"
+value_pointer = "/attributes/relatedIdentifiers"
+transform = "pluck"
+element_pointer = "/relatedIdentifier"
+target_collection = "dois"
+match_on = "id"

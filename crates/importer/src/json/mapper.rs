@@ -311,7 +311,12 @@ impl ManifestMapper {
         unresolved: &mut Vec<String>,
     ) {
         let target_collection = rule.target_collection.as_str();
-        for value in rule_values(rule.transform, document, &rule.value_pointer) {
+        for value in rule_values(
+            rule.transform,
+            document,
+            &rule.value_pointer,
+            rule.element_pointer.as_deref(),
+        ) {
             let resolved = match rule.match_on {
                 MatchOn::Id => {
                     // Stored keys are prefixed local ids; the referencing
@@ -462,11 +467,13 @@ fn tags_for(rules: &NodeRules, document: &Value) -> Vec<String> {
     let mut seen = HashSet::with_capacity(items.len());
     items
         .iter()
-        .filter_map(Value::as_str)
-        .map(str::trim)
+        .filter_map(|item| match &rules.tags_element_pointer {
+            Some(element_pointer) => pointer_str(item, element_pointer),
+            None => item.as_str().map(str::to_owned),
+        })
+        .map(|tag| tag.trim().to_owned())
         .filter(|tag| !tag.is_empty())
-        .filter(|tag| seen.insert(tag.to_string()))
-        .map(str::to_string)
+        .filter(|tag| seen.insert(tag.clone()))
         .collect()
 }
 
@@ -475,6 +482,11 @@ fn tags_for(rules: &NodeRules, document: &Value) -> Vec<String> {
 /// and date values.
 fn field_value(rule: &FieldRule, document: &Value) -> Option<Value> {
     match rule.transform {
+        Transform::Pluck => {
+            // Validation rejects pluck on fields (element_pointer exists only
+            // on edge rules); treat as absent rather than guessing.
+            None
+        }
         Transform::SplitCsv => {
             let items = split_csv(document.pointer(&rule.pointer));
             (!items.is_empty()).then(|| serde_json::json!(items))
@@ -503,9 +515,24 @@ fn field_value(rule: &FieldRule, document: &Value) -> Option<Value> {
 /// Values an edge rule references, after its transform. With no transform a
 /// pointer naming an array of scalars (e.g. PRIDE's `projectFileNames`)
 /// yields one value per element; a scalar pointer yields one value.
-fn rule_values(transform: Transform, document: &Value, pointer: &str) -> Vec<String> {
+fn rule_values(
+    transform: Transform,
+    document: &Value,
+    pointer: &str,
+    element_pointer: Option<&str>,
+) -> Vec<String> {
     match transform {
         Transform::SplitCsv => split_csv(document.pointer(pointer)),
+        Transform::Pluck => {
+            let element_pointer = element_pointer.unwrap_or("/");
+            match document.pointer(pointer) {
+                Some(Value::Array(items)) => items
+                    .iter()
+                    .filter_map(|item| pointer_str(item, element_pointer))
+                    .collect(),
+                _ => Vec::new(),
+            }
+        }
         Transform::None => match document.pointer(pointer) {
             Some(Value::Array(items)) => items.iter().filter_map(value_str).collect(),
             _ => pointer_str(document, pointer).into_iter().collect(),

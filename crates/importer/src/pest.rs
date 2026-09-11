@@ -16,7 +16,7 @@
 //! `native`-gated [`FilesystemLoader`]/[`FilesystemImporter`] bind a package
 //! to an explicit administrator-configured path.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 #[cfg(feature = "native")]
@@ -83,6 +83,13 @@ pub struct CaptureRules {
     pub edge: String,
     pub source: String,
     pub target: String,
+    /// Labeled feature tags: grammar rule name -> the tag pushed onto every
+    /// node whose subtree contains a match of that rule. Unlike `tag` (which
+    /// pushes the matched text), these carry a static label, so a grammar can
+    /// mark chemical or structural features (SMILES `aromatic`, `chiral`, …)
+    /// without the label appearing in the input.
+    #[serde(default)]
+    pub tag_labels: BTreeMap<String, String>,
 }
 
 impl CaptureRules {
@@ -278,6 +285,21 @@ fn validate_rule_bindings(
                 rule: name.to_owned(),
                 first_role,
                 second_role: role,
+            });
+        }
+    }
+    for (name, label) in &config.captures.tag_labels {
+        if label.trim().is_empty() {
+            return Err(ImportError::Grammar(format!(
+                "tag_labels rule {name:?} has an empty label"
+            )));
+        }
+        validate_bound_rule("tag_labels", name, &rules)?;
+        if let Some(first_role) = assigned.insert(name.as_str(), "tag_labels") {
+            return Err(ImportError::AmbiguousCaptureRule {
+                rule: name.clone(),
+                first_role,
+                second_role: "tag_labels",
             });
         }
     }
@@ -533,23 +555,30 @@ impl PestEngine<'_> {
         let rule = pair.as_rule();
         let captures = &self.config.captures;
 
+        // Labeled feature tags fire anywhere inside the node subtree; the
+        // label is pushed but recursion continues, since a labeled rule
+        // (e.g. a SMILES bracket atom) can nest further labeled rules.
+        if let Some(label) = captures.tag_labels.get(rule) {
+            fields.tags.push(label.clone());
+        }
+
+        // Scalar captures set their field AND still recurse: the id rule can
+        // be a composite whose subtree carries labeled feature rules (the
+        // SMILES tokenizer captures the whole `smiles` rule as the id, with
+        // `aromatic`/`chiral` tokens inside it). A nested second capture of
+        // the same scalar still errors via `set_scalar`.
         if rule == captures.id {
-            return set_scalar(&mut fields.id, pair.as_str(), "node", "id");
-        }
-        if rule == captures.title {
-            return set_scalar(&mut fields.title, pair.as_str(), "node", "title");
-        }
-        if rule == captures.kind {
-            return set_scalar(&mut fields.kind, pair.as_str(), "node", "kind");
-        }
-        if rule == captures.tag {
+            set_scalar(&mut fields.id, pair.as_str(), "node", "id")?;
+        } else if rule == captures.title {
+            set_scalar(&mut fields.title, pair.as_str(), "node", "title")?;
+        } else if rule == captures.kind {
+            set_scalar(&mut fields.kind, pair.as_str(), "node", "kind")?;
+        } else if rule == captures.tag {
             if pair.as_str().is_empty() {
                 return Err(invalid_record("node", "tag capture is empty"));
             }
             fields.tags.push(pair.as_str().to_owned());
-            return Ok(());
-        }
-        if rule == captures.property {
+        } else if rule == captures.property {
             let (key, value) = self.map_property(pair)?;
             if fields
                 .properties
