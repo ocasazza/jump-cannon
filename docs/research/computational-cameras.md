@@ -57,9 +57,11 @@ The linked set is coherent once read together: it is about *recovering
 signal from enormous numbers of noisy, partial observations* — which is
 exactly the perceptual problem of rendering a large, dense graph.
 
-- **sciadv.adv8257** — *"Functional and epitope specific monoclonal
-  antibody discovery directly from immune sera using cryo-EM"*
-  (Science Advances; <https://www.science.org/doi/10.1126/sciadv.adv8257>,
+- **sciadv.adv8257** — Ferguson, Raghavan, Alzua, Bhavsar, Huang,
+  Rodriguez, Torres, Bottermann, Han, Krammer, Batista, Ward,
+  *"Functional and epitope specific monoclonal antibody discovery directly
+  from immune sera using cryo-EM"*, Science Advances 11(33), eadv8257,
+  2025-08-15 (<https://www.science.org/doi/10.1126/sciadv.adv8257>,
   paywalled; catalog record:
   <https://researchprofiles.ku.dk/en/publications/functional-and-epitope-specific-monoclonal-antibody-discovery-dir/>).
   Cryo-EM used not just for structure but for *selection*: finding a rare
@@ -112,13 +114,20 @@ exactly the perceptual problem of rendering a large, dense graph.
 
 ### Real-time point-set rendering
 
-- **3D Gaussian Splatting** (Kerbl et al., SIGGRAPH 2023): scenes rendered
-  as anisotropic 3D gaussians with alpha blending and splat rasterization
-  — real-time at millions of primitives. Relevant as the *level-of-detail*
-  answer for massive node sets: far nodes become splats whose
-  size/opacity encode local density instead of individually drawn glyphs.
-  (Not yet link-grounded from this session; add the paper citation when
-  first used.)
+- **3D Gaussian Splatting** — Kerbl, Kopanas, Leimkühler, Drettakis,
+  *"3D Gaussian Splatting for Real-Time Radiance Field Rendering"*, ACM
+  Transactions on Graphics (SIGGRAPH 2023),
+  <https://arxiv.org/abs/2308.04079>; reference implementation:
+  <https://github.com/graphdeco-inria/gaussian-splatting>. Scenes are
+  rendered as anisotropic 3D gaussians (position, covariance, opacity,
+  spherical-harmonic color) with adaptive density control
+  (clone/split/prune) and a tile-based, depth-sorted alpha-blending
+  rasterizer — real-time (≥30 fps at 1080p) at millions of primitives.
+  Relevant twice over: (a) the *level-of-detail* answer for massive node
+  sets — far nodes become splats whose size/opacity encode local density
+  instead of individually drawn glyphs; (b) its per-tile depth-sorted
+  alpha blending is a proven solution to exactly the halo-occlusion
+  problem flagged in the bokeh baseline above.
 
 ## Synthesis — feature set
 
