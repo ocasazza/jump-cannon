@@ -32,8 +32,10 @@ Grounding for everything below — what the renderer actually does today.
 1. **World-z vs view-space depth mismatch.** `push_focus`
    (`panels/camera.rs`) sets `focus_plane_z = camera.position.z − distance`
    — an absolute *world* Z coordinate — but the shader compares it against
-   radial view-space distance. The focal band is only correct while the
-   camera looks straight down −Z; any yaw/pitch silently detunes focus.
+   radial view-space distance. The two quantities only coincide by
+   accident: an origin-centered graph viewed down −Z from +Z makes
+   `cam.z − distance` ≈ the view-depth of the graph core. Any yaw, pitch,
+   pan, or off-origin graph silently detunes the focal band.
 2. **Non-perspective CoC mapping.** `coc = blur_z · blur_strength` grows
    linearly in *world* depth-error with a dimensionless slider, ignoring
    perspective (real CoC scales with aperture and inversely with subject
@@ -121,44 +123,33 @@ exactly the perceptual problem of rendering a large, dense graph.
   <https://github.com/graphdeco-inria/gaussian-splatting>. Scenes are
   rendered as anisotropic 3D gaussians (position, covariance, opacity,
   spherical-harmonic color) with adaptive density control
-  (clone/split/prune) and a tile-based, depth-sorted alpha-blending
-  rasterizer — real-time (≥30 fps at 1080p) at millions of primitives.
-  Relevant twice over: (a) the *level-of-detail* answer for massive node
-  sets — far nodes become splats whose size/opacity encode local density
-  instead of individually drawn glyphs; (b) its per-tile depth-sorted
-  alpha blending is a proven solution to exactly the halo-occlusion
-  problem flagged in the bokeh baseline above.
+Ordered cheap-and-correct → researchy. Items 1–6 **landed 2026-09-11**
+(camera effects v2: `Projection` enum + orthographic mode, view-space
+focal band, perspective CoC, fog, clipping slab, attribute focus,
+saved views; the v1 sentinel DoF path is deleted).
 
-## Synthesis — feature set
-
-Ordered cheap-and-correct → researchy. Item 1 is a bug fix, not research.
-
-1. **Fix the DoF model** (bug; small). Compute the focal plane in view
-   space at slider-change time (or push camera-space depth per frame from
-   the 30 Hz loop); replace the linear `blur_z · strength` CoC with a
-   perspective-correct mapping parameterized as aperture + focal distance;
-   address halo clipping (draw inflated quads at the focal plane's depth,
-   or sort/additive-blend the bokeh pass).
-2. **Typed camera models** (small; started). `DofParams` is now a grouped
-   struct (`panels/camera.rs`, serde-flattened, wire-compatible). Next:
-   `enum CameraModel { Perspective { .. }, Orthographic { .. } }` where
-   each variant carries its own parameter struct; the panel swaps
-   parameter sets as a unit. PyMOL's orthoscopic flag proves the UX.
-3. **Depth cueing / fog** (small, high value). Distance-based contrast
-   attenuation in `node.wgsl`/`edge.wgsl` — the cheap 80% of DoF's
-   depth-legibility benefit, no bokeh artifacts.
-4. **View state serialization** (small). A `get_view`/`set_view` analog:
-   position + yaw/pitch + fov + focal plane as one serializable struct;
-   named saved views in the Camera panel; stable restore across graph
-   reloads. This is the "camera as data" foundation for everything below.
-5. **Clipping slabs / section views** (medium). Front/rear clip controls
-   (PyMOL slab model) to slice dense graphs; shader-side discard against
-   view-space depth bounds.
-6. **Defocus as a data channel** (medium; CTF-inspired). Cryo-EM treats
-   defocus as information. Analog: deliberately drive the DoF band from a
-   *data attribute* (staleness, distance-from-selection, confidence) so
-   focus itself encodes signal — contrast transfer as a legibility tool,
-   not damage.
+1. ~~**Fix the DoF model**~~ ✅ LANDED. The focal band is view-space
+   (`focus_depth` + `focus_thickness`, no world-z read); CoC is
+   perspective-correct via `CameraUniform.proj_scale` (ortho-aware);
+   the sentinel-thickness path is replaced by `FLAG_DOF`. Halo clipping
+   remains open: inflated quads still rasterize at node depth (no depth
+   attachment exists in the paint pass).
+2. ~~**Typed camera models**~~ ✅ LANDED. `render::camera::Projection`
+   (`Perspective { fov_y }` / `Orthographic { half_height }`), panel
+   select + fov slider, ortho-aware zoom/fit/picking, `FLAG_ORTHO`.
+3. ~~**Depth cueing / fog**~~ ✅ LANDED. `FogParams` → `FLAG_FOG`;
+   smoothstep contrast+alpha attenuation in both shaders.
+4. ~~**View state serialization**~~ ✅ LANDED. Named saved views
+   (position, yaw/pitch, projection) in `jc_camera_views_v1`, with
+   apply/delete in the Camera panel. Not yet wired into AppState
+   export — that is the remaining "camera as data" step.
+5. ~~**Clipping slabs / section views**~~ ✅ LANDED. `ClipParams` →
+   `FLAG_CLIP`; vertex cull for point sprites, per-fragment discard
+   cuts edges exactly at the slab.
+6. ~~**Defocus as a data channel**~~ ✅ LANDED (first source set).
+   `FLAG_ATTR` + binding-7 `focus_attr` buffer; panel sources: node
+   degree and node size (CPU mirrors, min-max normalized). Server-side
+   metrics (pagerank, k-core) are the obvious next sources.
 7. **Density-aware LOD via splat-style rendering** (large). Beyond a node
    budget, render far regions as density splats (size/opacity from local
    node count and attribute aggregates) instead of glyphs; gaussian-

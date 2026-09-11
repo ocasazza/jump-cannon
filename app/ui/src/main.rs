@@ -1232,7 +1232,14 @@ fn App() -> Element {
                 match e.key() {
                     Key::Shift => render::key_event("Shift", true),
                     Key::Character(c) => {
-                        if c.eq_ignore_ascii_case("f") {
+                        // Ctrl/Alt chords are not single-key camera
+                        // bindings (Ctrl+C must not toggle follow).
+                        let chord = e
+                            .modifiers()
+                            .intersects(Modifiers::CONTROL | Modifiers::ALT);
+                        if chord {
+                            render::key_event(&c, true);
+                        } else if c.eq_ignore_ascii_case("f") {
                             render::fit_camera();
                         } else if c.eq_ignore_ascii_case("c") {
                             // Auto-repeat guard: held-C must not strobe the

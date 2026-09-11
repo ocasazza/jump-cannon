@@ -92,22 +92,34 @@ struct CameraUniform {
     view_proj: [[f32; 4]; 4],
     view: [[f32; 4]; 4],
     cam_pos: [f32; 3],
-    _pad0: f32,
+    /// Vertical NDC-per-world-unit scale of the active projection
+    /// (`Camera::proj_scale`): perspective `1/tan(fov/2)`, ortho
+    /// `1/half_height`. Shaders convert world lengths → pixels with it.
+    proj_scale: f32,
     screen: [f32; 2],
     _pad1: [f32; 2],
 }
 
 // Mirrors `EffectsUniform` in shaders/{node,edge}.wgsl byte-for-byte.
-// Layout: 16 f32 (64 B) base + 4 u32 (16 B) hover tail = 80 bytes total.
-// `edge_color` (vec4) sits at offset 32 → 16-byte aligned. The hover
-// tail starts at offset 64, also 16-byte aligned.
+// Layout: 64 B base (offsets unchanged from v1) + 32 B camera-effects
+// block + 16 B flags/hover tail = 112 bytes total. `edge_color` (vec4)
+// sits at offset 32 → 16-byte aligned; every later block is 16-byte
+// aligned too.
 #[repr(C)]
 #[derive(Copy, Clone, Pod, Zeroable)]
 struct EffectsUniform {
-    focus_plane_z: f32,
+    /// Focal plane as VIEW-SPACE radial distance from the camera (v2 —
+    /// v1 carried an absolute world Z here, which only coincided with
+    /// view depth for origin-centered graphs viewed down −Z).
+    focus_depth: f32,
+    /// Full width of the sharp band in view-space units. Gated by
+    /// FLAG_DOF (v1 used a 1e9 sentinel here — gone).
     focus_thickness: f32,
     cursor_radius_visual: f32,
-    blur_strength: f32,
+    /// CoC scale: pixels of blur per unit of relative depth error
+    /// (v1: `blur_strength`, a world-linear mapping that ignored
+    /// perspective).
+    aperture: f32,
     max_coc: f32,
     edge_alpha_mul: f32,
     edge_dist_min: f32,
@@ -126,6 +138,26 @@ struct EffectsUniform {
     /// alpha in node + edge shaders). 1.0 = neutral; 0 = invisible;
     /// >1 = brighter (alpha clamps to 1 in the blend stage).
     shader_intensity: f32,
+    // --- camera effects block (offset 64) -------------------------------
+    /// Depth cueing: contrast attenuates from fog_start → fog_end
+    /// (view-space distances), scaled by fog_strength. Gated by FLAG_FOG.
+    fog_start: f32,
+    fog_end: f32,
+    fog_strength: f32,
+    /// Clipping slab near plane (view-space). Gated by FLAG_CLIP.
+    clip_near: f32,
+    /// Clipping slab far plane (view-space).
+    clip_far: f32,
+    /// Attribute-focus center in [0,1] — the focal band reads the
+    /// per-node attribute buffer instead of view depth when FLAG_ATTR is
+    /// set. Distance is scaled by `focus_depth` so band semantics match
+    /// the depth-driven path.
+    focus_attr_center: f32,
+    _pad_v2: [f32; 2],
+    // --- flags + hover tail (offset 96) ---------------------------------
+    /// bit0 DoF · bit1 fog · bit2 clip slab · bit3 attribute focus ·
+    /// bit4 orthographic projection (set per-frame from the camera).
+    flags: u32,
     /// Instance index of the node currently under the cursor, or
     /// `u32::MAX` if nothing is hovered. The node fragment shader uses
     /// this to brighten the fill and paint a white inner rim.
@@ -134,18 +166,24 @@ struct EffectsUniform {
     /// hovered, or `u32::MAX` if no edge is hovered. The edge fragment
     /// shader brightens this edge and forces alpha to 1.0.
     hovered_edge: u32,
-    _pad_hover: [u32; 2],
+    _pad_hover: u32,
 }
+
+/// `EffectsUniform.flags` bits. Keep in sync with the `FLAG_*` consts in
+/// shaders/{node,edge}.wgsl.
+pub(crate) const FLAG_DOF: u32 = 1;
+pub(crate) const FLAG_FOG: u32 = 1 << 1;
+pub(crate) const FLAG_CLIP: u32 = 1 << 2;
+pub(crate) const FLAG_ATTR: u32 = 1 << 3;
+pub(crate) const FLAG_ORTHO: u32 = 1 << 4;
 
 impl Default for EffectsUniform {
     fn default() -> Self {
         Self {
-            focus_plane_z: 800.0,
-            // 1e9 = "DoF off" sentinel — node.wgsl skips the bokeh path
-            // entirely while focus_thickness >= 1e6.
-            focus_thickness: 1.0e9,
+            focus_depth: 800.0,
+            focus_thickness: 50.0,
             cursor_radius_visual: 0.0,
-            blur_strength: 0.05,
+            aperture: 0.05,
             max_coc: 60.0,
             // Cosmograph-style edge defaults: thin alpha lines that stack
             // on a near-black background. linkColor #3a4880 → linear-ish
@@ -162,9 +200,17 @@ impl Default for EffectsUniform {
             edge_width: 1.5,
             edge_fade_floor: 0.02,
             shader_intensity: 1.0,
+            fog_start: 1500.0,
+            fog_end: 6000.0,
+            fog_strength: 0.7,
+            clip_near: 1.0,
+            clip_far: 50_000.0,
+            focus_attr_center: 0.5,
+            _pad_v2: [0.0; 2],
+            flags: 0,
             hovered_node: u32::MAX,
             hovered_edge: u32::MAX,
-            _pad_hover: [0; 2],
+            _pad_hover: 0,
         }
     }
 }
@@ -224,9 +270,11 @@ struct Buffers {
     /// separate storage buffer.
     #[allow(dead_code)]
     dim_alpha: wgpu::Buffer,
+    /// Per-node attribute-focus values in [0,1] (binding 7, node shader).
+    #[allow(dead_code)]
+    focus_attr: wgpu::Buffer,
     node_bind_group: wgpu::BindGroup,
     edge_bind_group: wgpu::BindGroup,
-
     layout: Option<Box<dyn DynPhysicsLayout>>,
     /// Cached graph the layout was initialised against. Needed so a
     /// layout swap can re-init a freshly-built layout against the same
@@ -274,6 +322,9 @@ impl GraphPipelines {
                 // it and forwards as `@interpolate(flat) shape_id` to the
                 // fragment SDF switch.
                 ro_storage_entry(6, wgpu::ShaderStages::VERTEX),
+                // Per-node attribute-focus value [0,1] — read by the node
+                // vertex stage when FLAG_ATTR is set (defocus-as-data).
+                ro_storage_entry(7, wgpu::ShaderStages::VERTEX),
             ],
         });
         let edge_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -481,7 +532,7 @@ impl GraphPipelines {
             view_proj: self.camera.view_proj(),
             view: self.camera.view(),
             cam_pos: self.camera.position.to_array(),
-            _pad0: 0.0,
+            proj_scale: self.camera.proj_scale(),
             screen: self.screen_px,
             _pad1: [0.0, 0.0],
         };
@@ -513,6 +564,16 @@ impl GraphPipelines {
             contents: bytemuck::cast_slice(&shape_ids_init),
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
         });
+        // Per-node attribute-focus value in [0,1] — binding 7, node
+        // shader only. All-zero = "at the band edge" when FLAG_ATTR is
+        // off the buffer is never read.
+        let attr_init: Vec<f32> = vec![0.0_f32; n_nodes.max(1) as usize];
+        let focus_attr_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("focus_attr_storage"),
+            contents: bytemuck::cast_slice(&attr_init),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        });
+
 
         let node_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("node bg"),
@@ -525,6 +586,7 @@ impl GraphPipelines {
                 bg_entry(4, &sizes_buf),
                 bg_entry(5, &dim_alpha_buf),
                 bg_entry(6, &shape_ids_buf),
+                bg_entry(7, &focus_attr_buf),
             ],
         });
         let edge_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -581,6 +643,7 @@ impl GraphPipelines {
             camera_uniform,
             effects_uniform,
             dim_alpha: dim_alpha_buf,
+            focus_attr: focus_attr_buf,
             node_bind_group,
             edge_bind_group,
             layout,
@@ -811,12 +874,20 @@ impl GraphPipelines {
             view_proj: self.camera.view_proj(),
             view: self.camera.view(),
             cam_pos: self.camera.position.to_array(),
-            _pad0: 0.0,
+            proj_scale: self.camera.proj_scale(),
             screen: screen_px,
             _pad1: [0.0, 0.0],
         };
         queue.write_buffer(&b.camera_uniform, 0, bytemuck::bytes_of(&cam));
-        queue.write_buffer(&b.effects_uniform, 0, bytemuck::bytes_of(&self.effects));
+        // The ortho flag derives from the camera, not the panel — fold it
+        // into the per-frame copy so panel setters never touch bit4.
+        let mut effects = self.effects;
+        if self.camera.is_ortho() {
+            effects.flags |= FLAG_ORTHO;
+        } else {
+            effects.flags &= !FLAG_ORTHO;
+        }
+        queue.write_buffer(&b.effects_uniform, 0, bytemuck::bytes_of(&effects));
     }
 
     /// Apply the supplied screen size + aspect to the camera. Called every
@@ -895,12 +966,7 @@ impl GraphPipelines {
         let height_px = screen_px[1].max(1.0);
         let aspect = (width_px / height_px).max(0.0001);
         let view = Mat4::look_to_rh(self.camera.position, self.camera.forward(), Vec3::Y);
-        let proj = Mat4::perspective_rh(
-            self.camera.fov_y,
-            aspect,
-            self.camera.znear,
-            self.camera.zfar,
-        );
+        let proj = self.camera.proj_matrix(aspect);
         let view_proj = proj * view;
         // Half-extents convert NDC delta -> pixel delta (NDC spans 2 units).
         let half_w = 0.5 * width_px;
@@ -991,12 +1057,7 @@ impl GraphPipelines {
         let height_px = screen_px[1].max(1.0);
         let aspect = (width_px / height_px).max(0.0001);
         let view = Mat4::look_to_rh(self.camera.position, self.camera.forward(), Vec3::Y);
-        let proj = Mat4::perspective_rh(
-            self.camera.fov_y,
-            aspect,
-            self.camera.znear,
-            self.camera.zfar,
-        );
+        let proj = self.camera.proj_matrix(aspect);
         let view_proj = proj * view;
 
         // Cursor in pixel space (origin top-left).
@@ -1344,16 +1405,52 @@ impl GraphPipelines {
         self.effects.hovered_edge = idx.unwrap_or(u32::MAX);
     }
 
-    /// Update the focal plane center + thickness (effects uniform).
-    pub fn set_focus_plane(&mut self, z: f32, thickness: f32) {
-        self.effects.focus_plane_z = z;
+    /// Update the focal band: view-space focal depth + full band width.
+    pub fn set_focus_band(&mut self, depth: f32, thickness: f32) {
+        self.effects.focus_depth = depth.max(0.0);
         self.effects.focus_thickness = thickness.max(1.0);
     }
 
-    /// Update DoF blur strength + max circle-of-confusion.
-    pub fn set_dof_params(&mut self, blur: f32, max_coc: f32) {
-        self.effects.blur_strength = blur.max(0.0);
+    /// Update DoF aperture + max circle-of-confusion (px).
+    pub fn set_dof(&mut self, aperture: f32, max_coc: f32) {
+        self.effects.aperture = aperture.max(0.0);
         self.effects.max_coc = max_coc.max(0.0);
+    }
+
+    /// Depth cueing (fog): contrast attenuates start → end, scaled by
+    /// strength. `enabled` drives FLAG_FOG.
+    pub fn set_fog(&mut self, start: f32, end: f32, strength: f32, enabled: bool) {
+        self.effects.fog_start = start.max(0.0);
+        self.effects.fog_end = end.max(self.effects.fog_start + 1.0);
+        self.effects.fog_strength = strength.clamp(0.0, 1.0);
+        self.set_flag(FLAG_FOG, enabled);
+    }
+
+    /// Clipping slab (view-space near/far). `enabled` drives FLAG_CLIP.
+    pub fn set_clip(&mut self, near: f32, far: f32, enabled: bool) {
+        self.effects.clip_near = near.max(0.0);
+        self.effects.clip_far = far.max(self.effects.clip_near + 1.0);
+        self.set_flag(FLAG_CLIP, enabled);
+    }
+
+    /// DoF master toggle (FLAG_DOF).
+    pub fn set_dof_enabled(&mut self, enabled: bool) {
+        self.set_flag(FLAG_DOF, enabled);
+    }
+
+    /// Attribute-focus center in [0,1] + toggle (FLAG_ATTR). The per-node
+    /// values themselves stream through [`Self::set_focus_attr`].
+    pub fn set_attr_focus(&mut self, center: f32, enabled: bool) {
+        self.effects.focus_attr_center = center.clamp(0.0, 1.0);
+        self.set_flag(FLAG_ATTR, enabled);
+    }
+
+    fn set_flag(&mut self, bit: u32, on: bool) {
+        if on {
+            self.effects.flags |= bit;
+        } else {
+            self.effects.flags &= !bit;
+        }
     }
 
     /// Update cosmograph-style edge appearance. `color` is RGBA in 0..1.
@@ -1361,7 +1458,7 @@ impl GraphPipelines {
     /// the reference (`linkVisibilityDistanceRange`). `min_transparency`
     /// is the floor at long distances (`linkVisibilityMinTransparency`).
     pub fn set_edge_style(
-        &mut self,
+    &mut self,
         color: [f32; 4],
         alpha_mul: f32,
         dist_range: (f32, f32),
@@ -1381,6 +1478,36 @@ impl GraphPipelines {
         // the smoothstep would invert. Clamp into a safe range.
         self.effects.edge_fade_floor = fade_floor.clamp(0.0, 0.5);
     }
+
+
+    /// Per-node degree (endpoint counts) from the CPU edge mirror —
+    /// attribute source for the defocus-as-data channel.
+    pub fn degrees(&self) -> Option<Vec<f32>> {
+        let b = self.buffers.as_ref()?;
+        let mut d = vec![0.0f32; b.n_nodes as usize];
+        for e in b.edges_cpu.chunks_exact(2) {
+            d[e[0] as usize] += 1.0;
+            d[e[1] as usize] += 1.0;
+        }
+        Some(d)
+    }
+
+    /// Current per-node sizes (px) from the CPU mirror — attribute
+    /// source for the defocus-as-data channel.
+    pub fn node_sizes(&self) -> Option<Vec<f32>> {
+        self.buffers.as_ref().map(|b| b.sizes_cpu.clone())
+    }
+    /// Stream per-node attribute-focus values ([0,1], normalized by the
+    /// caller) into the binding-7 storage buffer. Length must equal
+    /// `n_nodes`.
+    pub fn set_focus_attr(&mut self, queue: &wgpu::Queue, values: Vec<f32>) {
+        let Some(b) = &self.buffers else { return };
+        if values.len() != b.n_nodes as usize {
+            return;
+        }
+        queue.write_buffer(&b.focus_attr, 0, bytemuck::cast_slice(&values));
+    }
+
 
     /// Post-process visual-intensity multiplier (alpha scalar in node +
     /// edge fragment shaders). Clamps to [0, 8] to avoid runaway values.

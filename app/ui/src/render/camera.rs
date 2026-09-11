@@ -1,15 +1,28 @@
-//! 6DoF perspective camera. Position + forward + up basis. WASD pans,
-//! mouse-drag rotates pitch+yaw, scroll zooms (move along forward),
-//! QE ascends/descends.
+//! 6DoF camera with selectable projection. Position + forward + up basis.
+//! WASD pans, mouse-drag rotates pitch+yaw, scroll zooms (perspective:
+//! dolly along forward; orthographic: shrink the view volume), QE
+//! ascends/descends.
 
 use glam::{Mat4, Vec3};
+
+/// Camera projection model. `Orthographic::half_height` is the world-space
+/// half-extent of the view volume's vertical axis — the ortho analog of
+/// dolly distance (smaller = more zoomed in).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Projection {
+    Perspective { fov_y: f32 },
+    Orthographic { half_height: f32 },
+}
+impl Projection {
+    pub const DEFAULT_FOV_Y: f32 = std::f32::consts::FRAC_PI_3; // 60°
+}
 
 #[derive(Clone)]
 pub struct Camera {
     pub position: Vec3,
     pub yaw: f32,   // radians, around world up (Y)
     pub pitch: f32, // radians, around right axis
-    pub fov_y: f32,
+    pub projection: Projection,
     pub aspect: f32,
     pub znear: f32,
     pub zfar: f32,
@@ -26,7 +39,9 @@ impl Camera {
             position,
             yaw: -std::f32::consts::FRAC_PI_2, // looking down -Z
             pitch: 0.0,
-            fov_y: 60f32.to_radians(),
+            projection: Projection::Perspective {
+                fov_y: Projection::DEFAULT_FOV_Y,
+            },
             aspect,
             znear: 0.1,
             zfar: 200_000.0,
@@ -53,10 +68,58 @@ impl Camera {
         self.right().cross(self.forward()).normalize()
     }
 
+    /// Projection matrix for the given aspect ratio. Split out of
+    /// `view_proj` so CPU-side picking (pipelines raycast / edge pick)
+    /// builds the *same* projection the GPU used, for the active model.
+    pub fn proj_matrix(&self, aspect: f32) -> Mat4 {
+        let aspect = aspect.max(0.0001);
+        match self.projection {
+            Projection::Perspective { fov_y } => {
+                Mat4::perspective_rh(fov_y, aspect, self.znear, self.zfar)
+            }
+            Projection::Orthographic { half_height } => {
+                let hh = half_height.max(1.0);
+                let hw = hh * aspect;
+                Mat4::orthographic_rh(-hw, hw, -hh, hh, self.znear, self.zfar)
+            }
+        }
+    }
+
+    /// NDC-per-world-unit vertical scale of the active projection
+    /// (perspective: `1/tan(fov/2)`; ortho: `1/half_height`). Staged into
+    /// `CameraUniform.proj_scale`; shaders multiply world-space lengths by
+    /// `proj_scale * screen.y * 0.5` (perspective also divides by view
+    /// depth) to get pixels.
+    pub fn proj_scale(&self) -> f32 {
+        match self.projection {
+            Projection::Perspective { fov_y } => 1.0 / (fov_y * 0.5).tan(),
+            Projection::Orthographic { half_height } => 1.0 / half_height.max(1.0),
+        }
+    }
+
+    /// True when the orthographic model is active — shaders branch on
+    /// this (perspective divides world lengths by view depth, ortho does
+    /// not).
+    pub fn is_ortho(&self) -> bool {
+        matches!(self.projection, Projection::Orthographic { .. })
+    }
+
+    /// Current vertical field of view in radians, or the ortho-equivalent
+    /// value derived from `half_height` at the camera's distance to the
+    /// origin. Panel slider support.
+    pub fn fov_y(&self) -> f32 {
+        match self.projection {
+            Projection::Perspective { fov_y } => fov_y,
+            Projection::Orthographic { half_height } => {
+                let d = self.position.length().max(1.0);
+                2.0 * (half_height.max(1.0) / d).atan()
+            }
+        }
+    }
+
     pub fn view_proj(&self) -> [[f32; 4]; 4] {
         let view = Mat4::look_to_rh(self.position, self.forward(), Vec3::Y);
-        let proj = Mat4::perspective_rh(self.fov_y, self.aspect.max(0.0001), self.znear, self.zfar);
-        (proj * view).to_cols_array_2d()
+        (self.proj_matrix(self.aspect) * view).to_cols_array_2d()
     }
 
     /// Camera view matrix only (no projection). Used by shaders that need
@@ -84,10 +147,19 @@ impl Camera {
         );
     }
 
-    /// Move along forward by a multiplicative factor (>1 zoom in, <1 out).
+    /// Zoom by a signed world-unit delta (positive = in). Perspective
+    /// dollies along forward; orthographic shrinks the view volume (a
+    /// dolly would change nothing but clipping).
     pub fn zoom(&mut self, factor: f32) {
-        let f = self.forward();
-        self.position += f * factor;
+        match &mut self.projection {
+            Projection::Perspective { .. } => {
+                let f = self.forward();
+                self.position += f * factor;
+            }
+            Projection::Orthographic { half_height } => {
+                *half_height = (*half_height - factor).clamp(1.0, 100_000.0);
+            }
+        }
     }
 
     /// Re-aim the camera at `point` (no orientation change) while pulling
@@ -119,9 +191,19 @@ impl Camera {
         // 1.7× padding (was 1.4× — felt too cramped). With fov_y=60°
         // this lands at ≈ 3.4 × radius, giving the cluster ~25%
         // breathing room on every edge of the viewport.
-        let dist = radius * 1.7 / (self.fov_y * 0.5).sin();
-        // back off along world +Z, look toward center.
-        self.position = center + Vec3::Z * dist;
+        match &mut self.projection {
+            Projection::Perspective { fov_y } => {
+                let dist = radius * 1.7 / (*fov_y * 0.5).sin();
+                // back off along world +Z, look toward center.
+                self.position = center + Vec3::Z * dist;
+            }
+            Projection::Orthographic { half_height } => {
+                *half_height = radius * 1.7;
+                // Position only needs to satisfy near/far; scale comes
+                // from half_height.
+                self.position = center + Vec3::Z * (radius * 4.0).max(self.znear * 10.0);
+            }
+        }
         // recompute yaw/pitch to look at center
         let dir = (center - self.position).normalize();
         self.pitch = dir.y.asin();
@@ -135,12 +217,25 @@ impl Camera {
     }
 
     /// Build a ray from NDC (x in [-1,1], y in [-1,1]) into the scene.
+    /// Ortho rays originate on the view plane and all run along forward.
     pub fn raycast(&self, ndc_x: f32, ndc_y: f32) -> (Vec3, Vec3) {
         let f = self.forward();
-        let r = self.right();
-        let u = self.up();
-        let tan_half = (self.fov_y * 0.5).tan();
-        let dir = (f + r * ndc_x * tan_half * self.aspect + u * ndc_y * tan_half).normalize();
-        (self.position, dir)
+        match self.projection {
+            Projection::Perspective { fov_y } => {
+                let r = self.right();
+                let u = self.up();
+                let tan_half = (fov_y * 0.5).tan();
+                let dir =
+                    (f + r * ndc_x * tan_half * self.aspect + u * ndc_y * tan_half).normalize();
+                (self.position, dir)
+            }
+            Projection::Orthographic { half_height } => {
+                let hh = half_height.max(1.0);
+                let origin = self.position
+                    + self.right() * ndc_x * hh * self.aspect
+                    + self.up() * ndc_y * hh;
+                (origin, f)
+            }
+        }
     }
 }
