@@ -10,6 +10,10 @@
 //! is spawned here on first render. The same loop re-stages the DoF effects
 //! uniforms after a host rebuild (graph panel minimize → restore), which
 //! `render::reapply_ctl_state` does not cover.
+//!
+//! Camera keybindings live at the workspace root (`main.rs::onkeydown`):
+//! `F` fits to graph bounds, `C` toggles follow-centroid, `⇧C` snaps to the
+//! centroid once at the current distance.
 
 use std::cell::Cell;
 
@@ -50,18 +54,44 @@ impl Default for CameraState {
     }
 }
 
+/// Depth-of-field parameterization as one grouped struct — the first half
+/// of the panel's camera-model plan (a future enum of camera types can then
+/// carry a `DofParams` variant payload and swap parameter sets as a unit).
+/// `#[serde(flatten)]` inside [`FocusState`] keeps the persisted wire shape
+/// identical to the pre-grouping flat fields.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
-pub(crate) struct FocusState {
+pub(crate) struct DofParams {
     /// Master DoF toggle. When false, the shader runs the sharp path
     /// for every node (no bokeh halo, no fragment-area inflation) —
     /// this is the cosmograph baseline. When true, the configured
     /// distance / thickness / blur / max_coc band engages.
-    #[serde(default)]
-    dof_enabled: bool,
+    ///
+    /// `rename` preserves the flat `dof_enabled` key written by every
+    /// prior build's localStorage payload and AppState snapshot.
+    #[serde(rename = "dof_enabled", default)]
+    enabled: bool,
     distance: f32,
     thickness: f32,
     blur: f32,
     max_coc: f32,
+}
+
+impl Default for DofParams {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            distance: 100.0,
+            thickness: 50.0,
+            blur: 0.5,
+            max_coc: 8.0,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub(crate) struct FocusState {
+    #[serde(flatten)]
+    dof: DofParams,
     /// Membership criterion for hover/click focus dimming. See
     /// the egui app's `ui/focus_set.rs::FocusMode`.
     #[serde(default)]
@@ -71,11 +101,7 @@ pub(crate) struct FocusState {
 impl Default for FocusState {
     fn default() -> Self {
         Self {
-            dof_enabled: false,
-            distance: 100.0,
-            thickness: 50.0,
-            blur: 0.5,
-            max_coc: 8.0,
+            dof: DofParams::default(),
             focus_mode: FocusMode::default(),
         }
     }
@@ -179,22 +205,50 @@ fn sync(s: &Persisted) {
     let _ = LocalStorage::set(STORE_KEY, s);
     FOLLOW_FIT.with(|c| c.set((s.camera.follow_centroid, s.camera.fit_to_window)));
     FOCUS_MIRROR.with(|c| c.set(s.focus));
-    push_focus(&s.focus);
+    push_focus(&s.focus.dof);
 }
 
 /// Mirror of the egui app's `apply_focus_to_gpu`: plane_z is derived from
 /// the camera's z at change time; DoF off pushes a sentinel thickness so
 /// node.wgsl's `focus_thickness < 1e6` gate stays false for every node
 /// (sharp fragment path, no bokeh quad inflation).
-fn push_focus(f: &FocusState) {
+fn push_focus(f: &DofParams) {
     let f = *f;
     render::with_host(|h| {
         let plane_z = h.pipes.camera.position.z - f.distance;
-        let thickness = if f.dof_enabled { f.thickness } else { 1.0e9 };
+        let thickness = if f.enabled { f.thickness } else { 1.0e9 };
         h.pipes.set_focus_plane(plane_z, thickness);
         h.pipes.set_dof_params(f.blur, f.max_coc);
         FOCUS_GPU.with(|c| c.set(Some([plane_z, thickness, f.blur, f.max_coc])));
     });
+}
+
+/// Look-toward the centroid: keep the camera's current distance along
+/// forward, retarget (`app.rs::apply_camera_to_gpu`). `look_at_point`
+/// floors at `znear * 2` instead of the egui port's original 50-unit
+/// clamp — that clamp blocked zooming in past 50 units of the centroid
+/// for as long as follow-centroid stayed on.
+fn retarget_to_centroid() {
+    render::with_host(|h| {
+        if let Some(c) = h.pipes.centroid() {
+            let dist = (c - h.pipes.camera.position).length();
+            h.pipes.camera.look_at_point(c, dist);
+        }
+    });
+}
+
+/// `C` — toggle follow-centroid, the persistent keep-centered mode.
+/// Routed from the workspace root key handler (main.rs).
+pub(crate) fn toggle_follow_centroid() {
+    let next = !STATE.read().camera.follow_centroid;
+    update(|s| s.camera.follow_centroid = next);
+}
+
+/// `⇧C` — one-shot recenter on the graph centroid at the camera's
+/// current distance; does NOT engage follow mode. Routed from the
+/// workspace root key handler (main.rs).
+pub(crate) fn snap_to_center() {
+    retarget_to_centroid();
 }
 
 /// `pub(crate)`: `appstate::ensure_init` arms this loop from the FIRST
@@ -217,15 +271,7 @@ pub(crate) fn ensure_init() {
         loop {
             let (follow, fit) = FOLLOW_FIT.with(Cell::get);
             if follow {
-                render::with_host(|h| {
-                    if let Some(c) = h.pipes.centroid() {
-                        // Look-toward c: keep current distance along
-                        // forward, retarget (app.rs::apply_camera_to_gpu).
-                        let fwd = h.pipes.camera.forward();
-                        let dist = (c - h.pipes.camera.position).length().max(50.0);
-                        h.pipes.camera.position = c - fwd * dist;
-                    }
-                });
+                retarget_to_centroid();
             }
             if fit {
                 // Auto-refit ONLY on actual window resize — the egui app
@@ -264,7 +310,7 @@ pub(crate) fn ensure_init() {
                 }
                 // Settings restored before the host existed — compute the
                 // plane as soon as a host shows up.
-                None => push_focus(&FOCUS_MIRROR.with(Cell::get)),
+                None => push_focus(&FOCUS_MIRROR.with(Cell::get).dof),
             }
             gloo_timers::future::TimeoutFuture::new(33).await;
         }
@@ -377,11 +423,13 @@ pub fn panel(_ctx: Ctx) -> Element {
                 move |v| update(|s| s.camera.follow_centroid = v))}
             {check_row("Fit to window", false, c.fit_to_window,
                 move |v| update(|s| s.camera.fit_to_window = v))}
+            div { class: "cam-hint",
+                "Keys: F fit to bounds · C toggle follow centroid · ⇧C snap to center."
+            }
 
             // ---- Focus subgroup (merged from former Section::Focus) ---------
             hr { class: "cam-sep" }
             div { class: "cam-sub", "Focus" }
-
             div { class: "cam-row",
                 span { class: "cam-label", "Focus mode" }
                 select { class: "cam-select",
@@ -417,20 +465,25 @@ pub fn panel(_ctx: Ctx) -> Element {
             hr { class: "cam-sep" }
 
             // ---- DoF subgroup -----------------------------------------------
+            // Parameterized as the grouped `DofParams` struct; the longer-
+            // term camera-modes plan (typed camera models, computational
+            // cameras beyond simple DoF, known bokeh-quality defects) lives
+            // in docs/research/computational-cameras.md.
             div { class: "cam-sub", "Depth of field" }
-            {check_row("Enabled", false, f.dof_enabled,
-                move |v| update(|s| s.focus.dof_enabled = v))}
-            {slider_row("distance", 0.0, 1000.0, 1.0, 0, f.distance, !f.dof_enabled,
-                move |v| update(|s| s.focus.distance = v))}
-            {slider_row("thickness", 1.0, 500.0, 1.0, 0, f.thickness, !f.dof_enabled,
-                move |v| update(|s| s.focus.thickness = v))}
-            {slider_row("blur", 0.0, 4.0, 0.01, 2, f.blur, !f.dof_enabled,
-                move |v| update(|s| s.focus.blur = v))}
-            {slider_row("max CoC", 0.0, 32.0, 0.1, 1, f.max_coc, !f.dof_enabled,
-                move |v| update(|s| s.focus.max_coc = v))}
-
+            {check_row("Enabled", false, f.dof.enabled,
+                move |v| update(|s| s.focus.dof.enabled = v))}
+            {slider_row("distance", 0.0, 1000.0, 1.0, 0, f.dof.distance, !f.dof.enabled,
+                move |v| update(|s| s.focus.dof.distance = v))}
+            {slider_row("thickness", 1.0, 500.0, 1.0, 0, f.dof.thickness, !f.dof.enabled,
+                move |v| update(|s| s.focus.dof.thickness = v))}
+            {slider_row("blur", 0.0, 4.0, 0.01, 2, f.dof.blur, !f.dof.enabled,
+                move |v| update(|s| s.focus.dof.blur = v))}
+            {slider_row("max CoC", 0.0, 32.0, 0.1, 1, f.dof.max_coc, !f.dof.enabled,
+                move |v| update(|s| s.focus.dof.max_coc = v))}
             div { class: "cam-hint",
-                "DoF off → cosmograph-style sharp dots; on → microscope bokeh"
+                "The sharp band sits `distance` ahead of the camera with \
+                 `thickness` depth; `blur` and `max CoC` shape the \
+                 out-of-focus halo on nodes outside the band."
             }
         }
     }

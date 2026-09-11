@@ -124,3 +124,15 @@ console marker. The egui implementation lives in git history.
 
 The compute layer (graph-compute, broker orchestration, Kubernetes/Ray) stays
 behind graph-api — the app consumes its HTTP/streaming interfaces only.
+
+## Future work — camera models
+
+Beyond the parity contract: typed DoF parameterization (`DofParams`,
+serde-flattened inside `FocusState`, wire-compatible with the flat keys
+every prior build persisted — landed 2026-09-11), a typed `CameraModel`
+enum, known bokeh-quality defects, and computational-camera modes beyond
+simple DoF. The full research set — current-pipeline baseline, concretely
+broken bokeh behavior, and the linked sources (cryo-EM computational
+imaging, snijderlab/stitch, PyMOL, gaussian splatting) with the synthesized
+feature set — lives in
+[docs/research/computational-cameras.md](research/computational-cameras.md).

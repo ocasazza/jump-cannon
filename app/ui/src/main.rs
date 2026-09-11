@@ -1205,8 +1205,8 @@ fn App() -> Element {
             autofocus: true,
             onmousemove: move |e| ws.handle_mouse_move(&e),
             onmouseup: move |_| ws.handle_mouse_up(),
-            // WASDQE camera pan + Shift boost + F fit, fed to the wgpu
-            // renderer's held-key state. Single-key shortcuts must not
+            // WASDQE camera pan + Shift boost, F fit, C toggle follow
+            // centroid, ⇧C snap to center. Single-key shortcuts must not
             // fire while the user is typing in an input/textarea.
             onkeydown: move |e: KeyboardEvent| {
                 // Palette chord first: it must open even while an input has
@@ -1234,6 +1234,17 @@ fn App() -> Element {
                     Key::Character(c) => {
                         if c.eq_ignore_ascii_case("f") {
                             render::fit_camera();
+                        } else if c.eq_ignore_ascii_case("c") {
+                            // Auto-repeat guard: held-C must not strobe the
+                            // follow-centroid toggle.
+                            if e.is_auto_repeating() {
+                                return;
+                            }
+                            if e.modifiers().contains(Modifiers::SHIFT) {
+                                panels::camera::snap_to_center();
+                            } else {
+                                panels::camera::toggle_follow_centroid();
+                            }
                         } else {
                             render::key_event(&c, true);
                         }
