@@ -185,6 +185,7 @@ fn two_node_graph(prefix: &str) -> VaultGraph {
     graph.add_edge(VaultEdge {
         source: format!("{prefix}-a"),
         target: format!("{prefix}-b"),
+        kind: None,
     });
     graph
 }
@@ -483,6 +484,106 @@ async fn graph_endpoints_advertise_one_snapshot_revision() {
         assert_eq!(resp.status(), StatusCode::OK, "{path}");
         assert_eq!(response_revision(&resp), revision, "{path}");
     }
+}
+
+/// The typed-edge discovery endpoints expose the snapshot's distinct node
+/// types (from `meta.doctype`) and edge kinds with the shared revision.
+#[tokio::test]
+async fn typed_edge_discovery_endpoints_reflect_the_snapshot() {
+    let mut graph = two_node_graph("typed");
+    graph
+        .nodes
+        .get_mut("typed-a")
+        .expect("node a")
+        .meta
+        .doctype = Some("element".to_string());
+    graph.edges.push(vault_data::VaultEdge {
+        source: "typed-a".to_string(),
+        target: "typed-b".to_string(),
+        kind: Some("double".to_string()),
+    });
+    graph.edges.push(vault_data::VaultEdge {
+        source: "typed-a".to_string(),
+        target: "typed-b".to_string(),
+        kind: Some("single".to_string()),
+    });
+    let state = state_with_graph(graph);
+    let revision = state.snapshot().revision;
+    let app = graph_api::router(state);
+
+    let types_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/graph/nodes/types")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .expect("types served");
+    assert_eq!(types_resp.status(), StatusCode::OK);
+    let types = json_body(types_resp).await;
+    assert_eq!(types["graph_revision"], revision);
+    assert_eq!(types["types"], serde_json::json!(["element"]));
+
+    // Per-node view: "typed-a" is the typed node (index 0 into ["element"]),
+    // "typed-b" is untyped.
+    let types_bin_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/graph/nodes/types.bin")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .expect("types.bin served");
+    assert_eq!(types_bin_resp.status(), StatusCode::OK);
+    let bytes = to_bytes(types_bin_resp.into_body(), 1 << 20)
+        .await
+        .expect("types.bin body");
+    let node_indices: Vec<u32> = bytes
+        .chunks_exact(4)
+        .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+    assert_eq!(node_indices, vec![0, u32::MAX]);
+
+    let kinds_resp = app.clone()
+        .oneshot(
+            Request::builder()
+                .uri("/graph/edges/kinds")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .expect("kinds served");
+    assert_eq!(kinds_resp.status(), StatusCode::OK);
+    let kinds = json_body(kinds_resp).await;
+    assert_eq!(kinds["graph_revision"], revision);
+    assert_eq!(kinds["kinds"], serde_json::json!(["double", "single"]));
+
+    // The binary view is per-edge, aligned with `/graph/edges`: both pushed
+    // edges resolve — "double" → table index 0, "single" → index 1.
+    let bin_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/graph/edges/kinds.bin")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .expect("kinds.bin served");
+    assert_eq!(bin_resp.status(), StatusCode::OK);
+    let bytes = to_bytes(bin_resp.into_body(), 1 << 20)
+        .await
+        .expect("kinds.bin body");
+    assert_eq!(bytes.len(), 12, "three u32 indices (one untyped edge)");
+    let indices: Vec<u32> = bytes
+        .chunks_exact(4)
+        .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+    assert_eq!(indices, vec![u32::MAX, 0, 1]);
 }
 
 /// Equal node counts are not graph identity. Swapping to a different graph of

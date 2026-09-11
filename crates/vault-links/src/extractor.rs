@@ -262,6 +262,7 @@ where
                     graph.add_edge(VaultEdge {
                         source: source.clone(),
                         target,
+                        kind: None,
                     });
                 }
                 None => {

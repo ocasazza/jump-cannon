@@ -1059,6 +1059,8 @@ struct GpuState {
     velocities: wgpu::Buffer,
     edge_offsets: wgpu::Buffer,
     edge_neighbors: wgpu::Buffer,
+    /// Per-half-edge spring rest lengths (aligned with `edge_neighbors`).
+    edge_rests: wgpu::Buffer,
     /// Hub-aware (Tigr) virtual-vertex CSR + per-virtual spring partials.
     /// Built once at GpuState init from `edge_offsets`/`edge_neighbors`. See
     /// `HUB_THRESHOLD` and `spring_step` in shaders/force.wgsl.
@@ -1071,8 +1073,10 @@ struct GpuState {
     spring_force_partial_buf: wgpu::Buffer,
     n_virtual: u32,
     spring_bind_group_layout: wgpu::BindGroupLayout,
+    spring_main_bind_group_layout: wgpu::BindGroupLayout,
     spring_pipeline: wgpu::ComputePipeline,
     params_buf: wgpu::Buffer,
+    force_spring_bind_group_layout: wgpu::BindGroupLayout,
     /// Per-node mass (1 + log2(degree)). Static once built.
     /// Legacy mass storage buffer. Kept allocated for backwards-compat
     /// with downstream code that still mutates `cpu_mass`; the shader
@@ -1171,6 +1175,11 @@ struct PreCompute {
     edge_neighbors: Vec<u32>,
     /// Per-node mass = 1 + log2(degree). Hubs end up heavier.
     mass: Vec<f32>,
+    /// Spring rest length per CSR half-edge entry (aligned with
+    /// `edge_neighbors`). Untyped edges inherit the global `spring_len`;
+    /// molecular graphs carry per-edge UFF lengths via the `rest` edge
+    /// metadata key.
+    edge_rests: Vec<f32>,
     /// Virtual-vertex CSR (Tigr) for the hub-aware spring kernel.
     n_virtual: u32,
     virt_real_idx: Vec<u32>,
@@ -1256,6 +1265,8 @@ fn precompute(graph: &Graph, seed_mode: &SeedMode, spring_len: f32) -> PreComput
     let velocities: Vec<f32> = vec![0.0; n_nodes as usize * 4];
 
     let mut adj: Vec<Vec<u32>> = vec![Vec::new(); n_nodes as usize];
+    // Per-half-edge rest lengths, built in lockstep with `adj`.
+    let mut adj_rest: Vec<Vec<f32>> = vec![Vec::new(); n_nodes as usize];
     for e in graph.edges.values() {
         let (Some(&s), Some(&t)) = (
             id_to_idx.get(e.source.as_str()),
@@ -1266,20 +1277,31 @@ fn precompute(graph: &Graph, seed_mode: &SeedMode, spring_len: f32) -> PreComput
         if s == t {
             continue;
         }
+        // Non-finite or non-positive rests would poison the spring force;
+        // anything outside (0, ∞) degrades to the global spring length.
+        let rest = match e.metadata.get("rest") {
+            Some(crate::types::MetadataValue::Number(r)) if r.is_finite() && *r > 0.0 => *r as f32,
+            _ => spring_len,
+        };
         adj[s as usize].push(t);
         adj[t as usize].push(s);
+        adj_rest[s as usize].push(rest);
+        adj_rest[t as usize].push(rest);
     }
     let mut edge_offsets: Vec<u32> = Vec::with_capacity(n_nodes as usize + 1);
     let mut edge_neighbors: Vec<u32> = Vec::new();
+    let mut edge_rests: Vec<f32> = Vec::new();
     let mut acc: u32 = 0;
     edge_offsets.push(0);
-    for ns in &adj {
+    for (ns, rests) in adj.iter().zip(&adj_rest) {
         acc += ns.len() as u32;
         edge_neighbors.extend_from_slice(ns);
+        edge_rests.extend_from_slice(rests);
         edge_offsets.push(acc);
     }
     if edge_neighbors.is_empty() {
         edge_neighbors.push(0);
+        edge_rests.push(spring_len);
     }
     let mass: Vec<f32> = adj
         .iter()
@@ -1352,6 +1374,7 @@ fn precompute(graph: &Graph, seed_mode: &SeedMode, spring_len: f32) -> PreComput
     PreCompute {
         n_nodes,
         n_edges,
+        edge_rests,
         node_order,
         initial_positions: positions,
         velocities,
@@ -1480,6 +1503,12 @@ struct ForcePipelines {
     /// Group(3): hub-aware (Tigr) virtual-vertex CSR + per-virtual spring
     /// partials. Bound by both `spring_step` and `force_step`.
     spring_bgl: wgpu::BindGroupLayout,
+    /// Trimmed group(0) for `spring_step` — see its construction note in
+    /// `build_pipeline` (Chrome WebGPU's 10-storage-buffer per-stage cap).
+    spring_main_bgl: wgpu::BindGroupLayout,
+    /// Trimmed group(3) for `force_step` (read-only `spring_force_partial`
+    /// — keeps force_step under the same cap).
+    force_spring_bgl: wgpu::BindGroupLayout,
     /// Standalone hub-aware spring kernel (one thread per virtual vertex).
     spring_step: wgpu::ComputePipeline,
     empty_gb_bg: wgpu::BindGroup,
@@ -1600,22 +1629,63 @@ fn build_pipeline(device: &wgpu::Device) -> ForcePipelines {
         storage_entry(0, true),  // virt_csr (read)
         storage_entry(1, true),  // virt_edge_offsets (read)
         storage_entry(2, false), // spring_force_partial (rw)
+        // Per-half-edge rest lengths; aligned with group-0 `edge_neighbors`.
+        storage_entry(3, true),  // edge_rests (read)
     ];
     let spring_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
         label: Some("gpu_force_spring_bgl"),
         entries: &spring_bgl_entries,
     });
 
+    // Trimmed group(0) for `spring_step`: the kernel statically reads only
+    // positions_in / edge_neighbors / params. Chrome's WebGPU runtime caps
+    // per-stage DECLARED storage buffers at 10 — with the full main BGL
+    // (6 storage) + octree (1) + spring group (4) the spring pipeline
+    // declares 11 and is rejected. Trimmed: 2 + 0 + 4 = 6.
+    let spring_main_bgl_entries = [
+        storage_entry(0, true), // positions_in
+        storage_entry(4, true), // edge_neighbors
+        wgpu::BindGroupLayoutEntry {
+            binding: 5,
+            visibility: wgpu::ShaderStages::COMPUTE,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Uniform,
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        },
+    ];
+    let spring_main_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("gpu_force_spring_main_bgl"),
+        entries: &spring_main_bgl_entries,
+    });
+    // Trimmed group(3) for `force_step`: it only READS
+    // `spring_force_partial` (gathering the virtual-vertex partials), so
+    // its layout declares just that binding. Sharing the full spring BGL
+    // would push force_step's declared storage count to 11 — over Chrome
+    // WebGPU's per-stage cap of 10 (see `spring_main_bgl`).
+    let force_spring_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("gpu_force_force_spring_bgl"),
+        // read_write to match the WGSL `var<storage, read_write>`
+        // declaration — Dawn validates the declared access, not the
+        // per-entry-point usage, so a read-only layout is rejected.
+        entries: &[
+            storage_entry(0, true),  // virt_csr (read — node_to_virt_offsets)
+            storage_entry(2, false), // spring_force_partial (read_write per WGSL decl)
+        ],
+    });
     let pipeline_layout = device.create_pipeline_layout(
         &wgpu::PipelineLayoutDescriptor {
             label: Some("gpu_force_pl"),
             // group 0 = main, group 1 = placeholder, group 2 = octree,
-            // group 3 = hub-aware spring partials.
+            // group 3 = trimmed spring partials (read-only — force_step
+            // only gathers them).
             bind_group_layouts: &[
                 &bind_group_layout,
                 &force_empty_gb_bgl,
                 &oct_bgl,
-                &spring_bgl,
+                &force_spring_bgl,
             ],
             push_constant_ranges: &[],
         },
@@ -1653,17 +1723,17 @@ fn build_pipeline(device: &wgpu::Device) -> ForcePipelines {
     let gb_scan = mk("scan_cell_offsets");
     let gb_scatter = mk("scatter_cells");
 
-    // Spring kernel pipeline. Reuses the main BGL at group(0) (uses
-    // positions_in/edge_neighbors/params; other entries unused). Octree
-    // BGL at group(2) is unused but must match the layout — we still bind
-    // the octree buffer at dispatch time.
+    // Spring kernel pipeline. Group(0) is the TRIMMED `spring_main_bgl`
+    // (positions_in / edge_neighbors / params — see its note above);
+    // groups 1-2 are empty placeholders (`spring_step` uses neither the
+    // grid-build nor the octree bindings).
     let spring_pipeline_layout = device.create_pipeline_layout(
         &wgpu::PipelineLayoutDescriptor {
             label: Some("gpu_force_spring_pl"),
             bind_group_layouts: &[
-                &bind_group_layout,
+                &spring_main_bgl,
                 &force_empty_gb_bgl,
-                &oct_bgl,
+                &empty_bgl,
                 &spring_bgl,
             ],
             push_constant_ranges: &[],
@@ -1688,6 +1758,8 @@ fn build_pipeline(device: &wgpu::Device) -> ForcePipelines {
         gb_bgl,
         oct_bgl,
         spring_bgl,
+        spring_main_bgl,
+        force_spring_bgl,
         spring_step,
         empty_gb_bg: empty_bg,
         force_empty_gb_bg,
@@ -1739,11 +1811,14 @@ impl GpuState {
             velocities: aux.vel,
             edge_offsets: aux.off,
             edge_neighbors: aux.neigh,
+            edge_rests: aux.rests,
             virt_csr_buf: aux.virt_csr,
             virt_edge_offsets_buf: aux.virt_edge_offsets,
             spring_force_partial_buf: aux.spring_force_partial,
             n_virtual: aux.n_virtual,
             spring_bind_group_layout: pipelines.spring_bgl,
+            spring_main_bind_group_layout: pipelines.spring_main_bgl,
+            force_spring_bind_group_layout: pipelines.force_spring_bgl,
             spring_pipeline: pipelines.spring_step,
             params_buf: aux.params,
             mass_buf: aux.mass,
@@ -1823,11 +1898,14 @@ impl GpuState {
             velocities: aux.vel,
             edge_offsets: aux.off,
             edge_neighbors: aux.neigh,
+            edge_rests: aux.rests,
             virt_csr_buf: aux.virt_csr,
             virt_edge_offsets_buf: aux.virt_edge_offsets,
             spring_force_partial_buf: aux.spring_force_partial,
             n_virtual: aux.n_virtual,
             spring_bind_group_layout: pipelines.spring_bgl,
+            spring_main_bind_group_layout: pipelines.spring_main_bgl,
+            force_spring_bind_group_layout: pipelines.force_spring_bgl,
             spring_pipeline: pipelines.spring_step,
             params_buf: aux.params,
             mass_buf: aux.mass,
@@ -2121,8 +2199,10 @@ impl GpuState {
         }
         let oct_bg = self.make_oct_bind_group(device);
         let spring_bg = self.make_spring_bind_group(device);
-        self.encode_spring_step(&mut encoder, &bind_group, &oct_bg, &spring_bg);
-        self.encode_compute(&mut encoder, &bind_group, &oct_bg, &spring_bg);
+        let spring_main_bg = self.make_spring_main_bind_group(device, pos_in);
+        let force_spring_bg = self.make_force_spring_bind_group(device);
+        self.encode_spring_step(&mut encoder, &spring_main_bg, &spring_bg);
+        self.encode_compute(&mut encoder, &bind_group, &oct_bg, &force_spring_bg);
         queue.submit(Some(encoder.finish()));
     }
 
@@ -2139,9 +2219,11 @@ impl GpuState {
         let (pos_in, pos_out) = self.borrowed_in_out(shared);
         let bind_group = self.make_bind_group(device, pos_in, pos_out);
         let oct_bg = self.make_oct_bind_group(device);
+        let force_spring_bg = self.make_force_spring_bind_group(device);
         let spring_bg = self.make_spring_bind_group(device);
-        self.encode_spring_step(encoder, &bind_group, &oct_bg, &spring_bg);
-        self.encode_compute(encoder, &bind_group, &oct_bg, &spring_bg);
+        let spring_main_bg = self.make_spring_main_bind_group(device, pos_in);
+        self.encode_spring_step(encoder, &spring_main_bg, &spring_bg);
+        self.encode_compute(encoder, &bind_group, &oct_bg, &force_spring_bg);
     }
 
     /// Borrowed-mode wrapper around `encode_grid_build` — builds the bind
@@ -2162,7 +2244,7 @@ impl GpuState {
         encoder: &mut wgpu::CommandEncoder,
         bind_group: &wgpu::BindGroup,
         oct_bg: &wgpu::BindGroup,
-        spring_bg: &wgpu::BindGroup,
+        force_spring_bg: &wgpu::BindGroup,
     ) {
         let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: Some("force_step_pass"),
@@ -2172,7 +2254,7 @@ impl GpuState {
         cpass.set_bind_group(0, bind_group, &[]);
         cpass.set_bind_group(1, &self.force_empty_gb_bind_group, &[]);
         cpass.set_bind_group(2, oct_bg, &[]);
-        cpass.set_bind_group(3, spring_bg, &[]);
+        cpass.set_bind_group(3, force_spring_bg, &[]);
         let groups = (self.n_nodes + 63) / 64;
         cpass.dispatch_workgroups(groups.max(1), 1, 1);
     }
@@ -2193,7 +2275,39 @@ impl GpuState {
                 buf_entry(0, &self.virt_csr_buf),
                 buf_entry(1, &self.virt_edge_offsets_buf),
                 buf_entry(2, &self.spring_force_partial_buf),
+                buf_entry(3, &self.edge_rests),
             ],
+        })
+    }
+
+    /// Group(0) for `spring_step`: the trimmed positions/neighbors/params
+    /// view matching `spring_main_bgl`.
+    fn make_spring_main_bind_group(
+        &self,
+        device: &wgpu::Device,
+        pos_in: &wgpu::Buffer,
+    ) -> wgpu::BindGroup {
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("gpu_force_spring_main_bg"),
+            layout: &self.spring_main_bind_group_layout,
+            entries: &[
+                buf_entry(0, pos_in),
+                buf_entry(4, &self.edge_neighbors),
+                buf_entry(5, &self.params_buf),
+            ],
+        })
+    }
+
+    /// Group(3) for `force_step`: read-only view of the spring partials,
+    /// matching `force_spring_bgl`.
+    fn make_force_spring_bind_group(&self, device: &wgpu::Device) -> wgpu::BindGroup {
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
+            entries: &[
+                buf_entry(0, &self.virt_csr_buf),
+                buf_entry(2, &self.spring_force_partial_buf),
+            ],
+            label: Some("gpu_force_force_spring_bg"),
+            layout: &self.force_spring_bind_group_layout,
         })
     }
 
@@ -2203,8 +2317,7 @@ impl GpuState {
     fn encode_spring_step(
         &self,
         encoder: &mut wgpu::CommandEncoder,
-        bind_group: &wgpu::BindGroup,
-        oct_bg: &wgpu::BindGroup,
+        main_bg: &wgpu::BindGroup,
         spring_bg: &wgpu::BindGroup,
     ) {
         let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -2212,9 +2325,9 @@ impl GpuState {
             timestamp_writes: None,
         });
         cpass.set_pipeline(&self.spring_pipeline);
-        cpass.set_bind_group(0, bind_group, &[]);
+        cpass.set_bind_group(0, main_bg, &[]);
         cpass.set_bind_group(1, &self.force_empty_gb_bind_group, &[]);
-        cpass.set_bind_group(2, oct_bg, &[]);
+        cpass.set_bind_group(2, &self.empty_gb_bind_group, &[]);
         cpass.set_bind_group(3, spring_bg, &[]);
         let groups = (self.n_virtual + 63) / 64;
         cpass.dispatch_workgroups(groups.max(1), 1, 1);
@@ -2415,6 +2528,8 @@ struct AuxBuffers {
     vel: wgpu::Buffer,
     off: wgpu::Buffer,
     neigh: wgpu::Buffer,
+    /// Per-half-edge spring rest lengths (aligned with `neigh`).
+    rests: wgpu::Buffer,
     /// Packs `node_to_virt_offsets` (length n+1) + `virt_real_idx`
     /// (length n_virtual) into one u32 buffer. See `build_aux_buffers`.
     virt_csr: wgpu::Buffer,
@@ -2453,6 +2568,11 @@ fn build_aux_buffers(device: &wgpu::Device, pc: &PreCompute) -> AuxBuffers {
     let neigh = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("edge_neighbors"),
         contents: bytemuck::cast_slice(nonempty_u32(&pc.edge_neighbors)),
+        usage: wgpu::BufferUsages::STORAGE,
+    });
+    let rests = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("edge_rests"),
+        contents: bytemuck::cast_slice(nonempty_f32(&pc.edge_rests)),
         usage: wgpu::BufferUsages::STORAGE,
     });
     // Hub-aware (Tigr) virtual-vertex CSR + per-virtual spring partials.
@@ -2561,6 +2681,7 @@ fn build_aux_buffers(device: &wgpu::Device, pc: &PreCompute) -> AuxBuffers {
         vel,
         off,
         neigh,
+        rests,
         virt_csr,
         virt_edge_offsets,
         spring_force_partial,
@@ -3120,6 +3241,50 @@ mod tests {
 
     fn gpu_test_guard() -> std::sync::MutexGuard<'static, ()> {
         GPU_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// `edge_rests` must stay aligned with `edge_neighbors` (same CSR
+    /// flattening), carry each edge's `rest` metadata on both halves, and
+    /// fall back to the global spring length for untyped or invalid rests.
+    #[test]
+    fn precompute_edge_rests_align_with_neighbors() {
+        use crate::types::MetadataValue;
+
+        let mut graph = Graph::new();
+        for id in ["a", "b", "c"] {
+            graph.add_node(Node::new(id));
+        }
+        let mut typed = Edge::new("e1", "a", "b");
+        typed.metadata.insert("rest".into(), MetadataValue::Number(1.5));
+        graph.add_edge(typed);
+        graph.add_edge(Edge::new("e2", "b", "c")); // untyped → spring_len
+        let mut invalid = Edge::new("e3", "a", "c");
+        invalid
+            .metadata
+            .insert("rest".into(), MetadataValue::Number(f64::NAN));
+        graph.add_edge(invalid);
+
+        let pc = precompute(&graph, &SeedMode::Random, 8.0);
+        assert_eq!(pc.edge_rests.len(), pc.edge_neighbors.len());
+        // Node order is id-sorted: a=0, b=1, c=2. Walk the CSR per node so
+        // the (nondeterministic) HashMap edge order cannot flake the test.
+        let idx = |name: &str| pc.node_order.iter().position(|id| id == name).unwrap() as u32;
+        let (a, b, c) = (idx("a"), idx("b"), idx("c"));
+        for node in [a, b, c] {
+            let start = pc.edge_offsets[node as usize] as usize;
+            let end = pc.edge_offsets[node as usize + 1] as usize;
+            for k in start..end {
+                let expected = match (node, pc.edge_neighbors[k]) {
+                    (x, y) if (x == a && y == b) || (x == b && y == a) => 1.5,
+                    _ => 8.0, // e2 untyped and e3 non-finite both fall back
+                };
+                assert_eq!(
+                    pc.edge_rests[k], expected,
+                    "rest for half-edge {node}->{} at k={k}",
+                    pc.node_order[pc.edge_neighbors[k] as usize]
+                );
+            }
+        }
     }
 
     fn triangle() -> Graph {

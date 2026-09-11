@@ -376,6 +376,7 @@ mod tests {
             graph.add_edge(VaultEdge {
                 source: s.to_string(),
                 target: t.to_string(),
+ kind: None,
             });
         }
 

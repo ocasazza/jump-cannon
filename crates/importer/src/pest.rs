@@ -97,6 +97,13 @@ pub struct CaptureRules {
     /// without the label appearing in the input.
     #[serde(default)]
     pub tag_labels: BTreeMap<String, String>,
+    /// Labeled edge kinds: grammar rule name -> the `VaultEdge.kind` pushed
+    /// onto every edge whose subtree contains a match of that rule. Mirrors
+    /// `tag_labels` for edges, so a grammar can mark bond orders (SDF
+    /// `single`/`double`/`triple`/`aromatic`) without the label appearing
+    /// in the input. At most one label may match per edge.
+    #[serde(default)]
+    pub edge_kind_labels: BTreeMap<String, String>,
 }
 
 impl CaptureRules {
@@ -318,6 +325,21 @@ fn validate_rule_bindings(
                 rule: name.clone(),
                 first_role,
                 second_role: "tag_labels",
+            });
+        }
+    }
+    for (name, label) in &config.captures.edge_kind_labels {
+        if label.trim().is_empty() {
+            return Err(ImportError::Grammar(format!(
+                "edge_kind_labels rule {name:?} has an empty label"
+            )));
+        }
+        validate_bound_rule("edge_kind_labels", name, &rules)?;
+        if let Some(first_role) = assigned.insert(name.as_str(), "edge_kind_labels") {
+            return Err(ImportError::AmbiguousCaptureRule {
+                rule: name.clone(),
+                first_role,
+                second_role: "edge_kind_labels",
             });
         }
     }
@@ -667,8 +689,9 @@ impl PestEngine<'_> {
     fn map_edge<'i, 'r>(&self, pair: Pair<'i, &'r str>) -> Result<VaultEdge, ImportError> {
         let mut source = None;
         let mut target = None;
+        let mut kind = None;
         for child in pair.into_inner() {
-            self.collect_edge_fields(child, &mut source, &mut target)?;
+            self.collect_edge_fields(child, &mut source, &mut target, &mut kind)?;
         }
 
         let source = source.ok_or_else(|| invalid_record("edge", "missing source capture"))?;
@@ -690,6 +713,7 @@ impl PestEngine<'_> {
                 .namespace
                 .node_id(&target)
                 .map_err(|error| invalid_record("edge", error.to_string()))?,
+            kind,
         })
     }
 
@@ -698,9 +722,19 @@ impl PestEngine<'_> {
         pair: Pair<'i, &'r str>,
         source: &mut Option<String>,
         target: &mut Option<String>,
+        kind: &mut Option<String>,
     ) -> Result<(), ImportError> {
         let rule = pair.as_rule();
         let captures = &self.config.captures;
+
+        // Labeled edge kinds fire anywhere inside the edge subtree; at most
+        // one may match (a bond has one order).
+        if let Some(label) = captures.edge_kind_labels.get(rule) {
+            if kind.replace(label.clone()).is_some() {
+                return Err(invalid_record("edge", "multiple edge kind labels matched"));
+            }
+        }
+
         if rule == captures.source {
             return set_scalar(source, pair.as_str(), "edge", "source");
         }
@@ -715,7 +749,7 @@ impl PestEngine<'_> {
         }
 
         for child in pair.into_inner() {
-            self.collect_edge_fields(child, source, target)?;
+            self.collect_edge_fields(child, source, target, kind)?;
         }
         Ok(())
     }

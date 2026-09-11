@@ -18,12 +18,11 @@
 #   connection table, and pest node ids are global — a multi-molecule
 #   $$$$ file fails loudly with `DuplicateNodeId`. Split with
 #   `csplit`/Open Babel first, or import per molecule.
-# - Bond ORDER (single/double/triple/aromatic) is parsed but not yet
-#   carried: `VaultEdge` has no kind field, and the pest edge contract is
-#   source/target only. Per-edge order (and the UFF rest lengths derived
-#   from it) is the molecular-layout follow-up in
-#   `docs/molecular-force-layout.md`; the reserved `bond_order` edge type
-#   below marks where it attaches.
+# - Bond ORDER becomes `VaultEdge.kind`: the type code splits into one
+#   grammar rule per V3000 code, and `edge_kind_labels` names them
+#   single/double/triple/aromatic. The molecular force layout
+#   (`docs/molecular-force-layout.md`) turns kinds into UFF per-edge rest
+#   lengths.
 
 format_version = 3
 
@@ -43,7 +42,7 @@ edges = 500000
 [[schema.edge_types]]
 key = "bond_order"
 directed = false
-description = "Reserved for bond-order-aware edges (single/double/triple/aromatic). VaultEdge carries no kind yet; the order is parsed by the grammar and dropped, tracked in docs/molecular-force-layout.md."
+description = "Bond order edge kinds (single/double/triple/aromatic), attached via edge_kind_labels onto VaultEdge.kind and consumed by the molecular force layout (docs/molecular-force-layout.md)."
 
 [parser]
 engine = "pest"
@@ -87,11 +86,17 @@ key = @{ (UPPERCASE | "_")+ }
 value = @{ (!(" " | "\r" | "\n") ~ ANY)+ }
 
 // M  V30 <idx> <type> <a1> <a2> [CFG=… ENDPTS=…]
-// One bond = one edge; endpoints resolve by atom index.
+// One bond = one edge; endpoints resolve by atom index. The type splits
+// into one rule per V3000 code so edge_kind_labels can name the order.
 bond_line = { "M  V30 " ~ bond_idx ~ " " ~ bond_type ~ " " ~ src ~ " " ~ tgt
             ~ bond_rest ~ NEWLINE }
 bond_idx = @{ '0'..'9'+ }
-bond_type = @{ '0'..'9'+ }
+bond_type = _{ bond_single | bond_double | bond_triple | bond_aromatic }
+bond_single = @{ "1" }
+bond_double = @{ "2" }
+bond_triple = @{ "3" }
+bond_aromatic = @{ "4" }
+
 src = @{ '0'..'9'+ }
 tgt = @{ '0'..'9'+ }
 bond_rest = { (!NEWLINE ~ ANY)* }
@@ -121,3 +126,11 @@ target = "tgt"
 [parser.captures.tag_labels]
 chg_pos = "cation"
 chg_neg = "anion"
+
+# Bond order labels: the V3000 type code becomes the edge kind, consumed by
+# the molecular force layout (UFF per-edge rest lengths).
+[parser.captures.edge_kind_labels]
+bond_single = "single"
+bond_double = "double"
+bond_triple = "triple"
+bond_aromatic = "aromatic"

@@ -74,14 +74,8 @@ fn vault_from_edges(n: u32, edges: &BTreeSet<(u32, u32)>) -> VaultGraph {
         });
     }
     for &(u, v) in edges {
-        vg.add_edge(VaultEdge {
-            source: u.to_string(),
-            target: v.to_string(),
-        });
-        vg.add_edge(VaultEdge {
-            source: v.to_string(),
-            target: u.to_string(),
-        });
+        vg.add_edge(VaultEdge { source: u.to_string(), target: v.to_string(), kind: None });
+        vg.add_edge(VaultEdge { source: v.to_string(), target: u.to_string(), kind: None });
     }
     vg
 }

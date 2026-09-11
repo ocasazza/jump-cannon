@@ -74,7 +74,11 @@ fn api_routes() -> Router<SourceHost> {
         .route("/graph/metrics/:name", get(graph_metric))
         .route("/graph/meta_summary", get(graph_meta_summary))
         .route("/graph/schema", get(graph_schema))
+        .route("/graph/nodes/types", get(graph_node_types))
+        .route("/graph/edges/kinds", get(graph_edge_kinds))
+        .route("/graph/nodes/types.bin", get(graph_node_types_bin))
         .route("/graph/layout/stream", get(graph_layout_stream))
+        .route("/graph/edges/kinds.bin", get(graph_edge_kinds_bin))
         // `*id` (wildcard) instead of `:id` so multi-segment ids like
         // `vault/shared/knowledge-base/...` match. The captured String
         // includes the full path tail without a leading slash.
@@ -1755,6 +1759,43 @@ async fn graph_schema(selection: SourceSelection) -> impl IntoResponse {
         },
         "schema": snap.schema,
     }))
+}
+
+/// Distinct node `element` values in the live snapshot (sorted), for the
+/// client's typed-edge features (molecular layout element lookup).
+async fn graph_node_types(selection: SourceSelection) -> impl IntoResponse {
+    let s = selection.0;
+    let snap = s.snapshot();
+    Json(serde_json::json!({
+        "graph_revision": snap.revision,
+        "types": snap.node_types,
+    }))
+}
+
+/// Per-node type-table indices (`u32::MAX` = untyped) in `/graph/ids`
+/// order. The table itself is `/graph/nodes/types`.
+async fn graph_node_types_bin(selection: SourceSelection) -> impl IntoResponse {
+    let s = selection.0;
+    cached_binary_response(&s, "node_types").into_response()
+}
+
+/// Distinct edge `kind` values in the live snapshot (sorted), for the
+/// client's typed-edge features (bond-order rest lengths). The same table
+/// backs the per-edge indices in `/graph/edges/kinds.bin`.
+async fn graph_edge_kinds(selection: SourceSelection) -> impl IntoResponse {
+    let s = selection.0;
+    let snap = s.snapshot();
+    Json(serde_json::json!({
+        "graph_revision": snap.revision,
+        "kinds": snap.edge_kinds,
+    }))
+}
+
+/// Per-edge kind-table indices (`u32::MAX` = untyped), aligned edge-for-edge
+/// with `/graph/edges`. The table itself is `/graph/edges/kinds`.
+async fn graph_edge_kinds_bin(selection: SourceSelection) -> impl IntoResponse {
+    let s = selection.0;
+    cached_binary_response(&s, "edge_kinds").into_response()
 }
 
 fn proto_response<M: ProstMessage>(msg: &M) -> impl IntoResponse {

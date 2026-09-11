@@ -5,9 +5,9 @@ fn make_triangle() -> VaultGraph {
     for id in ["a", "b", "c"] {
         g.add_node(VaultNode { id: id.to_string(), ..Default::default() });
     }
-    g.add_edge(VaultEdge { source: "a".into(), target: "b".into() });
-    g.add_edge(VaultEdge { source: "b".into(), target: "c".into() });
-    g.add_edge(VaultEdge { source: "c".into(), target: "a".into() });
+    g.add_edge(VaultEdge { source: "a".into(), target: "b".into() , kind: None});
+    g.add_edge(VaultEdge { source: "b".into(), target: "c".into() , kind: None});
+    g.add_edge(VaultEdge { source: "c".into(), target: "a".into() , kind: None});
     g
 }
 
@@ -46,15 +46,15 @@ fn unit_louvain_two_cliques() {
         g.add_node(VaultNode { id: id.to_string(), ..Default::default() });
     }
     // Clique 1
-    g.add_edge(VaultEdge { source: "a".into(), target: "b".into() });
-    g.add_edge(VaultEdge { source: "b".into(), target: "c".into() });
-    g.add_edge(VaultEdge { source: "c".into(), target: "a".into() });
+    g.add_edge(VaultEdge { source: "a".into(), target: "b".into() , kind: None});
+    g.add_edge(VaultEdge { source: "b".into(), target: "c".into() , kind: None});
+    g.add_edge(VaultEdge { source: "c".into(), target: "a".into() , kind: None});
     // Clique 2
-    g.add_edge(VaultEdge { source: "d".into(), target: "e".into() });
-    g.add_edge(VaultEdge { source: "e".into(), target: "f".into() });
-    g.add_edge(VaultEdge { source: "f".into(), target: "d".into() });
+    g.add_edge(VaultEdge { source: "d".into(), target: "e".into() , kind: None});
+    g.add_edge(VaultEdge { source: "e".into(), target: "f".into() , kind: None});
+    g.add_edge(VaultEdge { source: "f".into(), target: "d".into() , kind: None});
     // Bridge
-    g.add_edge(VaultEdge { source: "c".into(), target: "d".into() });
+    g.add_edge(VaultEdge { source: "c".into(), target: "d".into() , kind: None});
     crate::compute_louvain(&mut g, 20);
     // Should find 2 communities
     assert_eq!(g.num_communities, 2, "expected 2 communities, got {}", g.num_communities);
@@ -74,7 +74,7 @@ fn unit_louvain_five_clusters() {
             for j in (i+1)..20 {
                 g.add_edge(VaultEdge {
                     source: format!("c{}_n{}", c, i),
-                    target: format!("c{}_n{}", c, j),
+                    target: format!("c{}_n{}", c, j), kind: None,
                 });
             }
         }
@@ -84,7 +84,7 @@ fn unit_louvain_five_clusters() {
         for c2 in (c1+1)..5 {
             g.add_edge(VaultEdge {
                 source: format!("c{}_n0", c1),
-                target: format!("c{}_n0", c2),
+                target: format!("c{}_n0", c2), kind: None,
             });
         }
     }

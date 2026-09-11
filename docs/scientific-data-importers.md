@@ -130,7 +130,16 @@ All shared-engine, no per-source code, per "packages, not crates":
    (SMILES `aromatic`/`chiral`/`cyclic`/`halogenated`/`charged`; mzML
    `MS1`/`MS2`/`positive`/`negative`). Scalar captures still recurse, so
    labels fire inside a composite id rule (the SMILES id tokenizes itself).
-8. **`tags_element_pointer`** — the same pluck for node tags: DataCite
+8. **Pest `edge_kind_labels`** — `[parser.captures.edge_kind_labels]` maps
+   a grammar rule to a `VaultEdge.kind` pushed onto every edge whose
+   subtree matches it (SDF V3000 bond orders: one rule per type code →
+   `single`/`double`/`triple`/`aromatic`). Mirrors `tag_labels`
+   validation; a second distinct label on the same edge is a record
+   error. Kinds surface through `/graph/edges/kinds(.bin)` and drive the
+   molecular force layout's per-edge UFF rest lengths
+   (`docs/molecular-force-layout.md`); the json engine fills the same
+   field from `EdgeRule.kind` / `EdgeListRules.kind_pointer`.
+9. **`tags_element_pointer`** — the same pluck for node tags: DataCite
    `subjects[].subject` → 682 tagged works, so the Tags view groups the
    registry by subject instead of showing `(untagged)`.
 

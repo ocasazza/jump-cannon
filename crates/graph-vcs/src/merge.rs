@@ -222,6 +222,7 @@ pub fn diff_snapshots(a: &Snapshot, b: &Snapshot) -> Vec<GraphOp> {
             ops.push(GraphOp::UpsertEdge(vault_data::VaultEdge {
                 source: edge.source.clone(),
                 target: edge.target.clone(),
+                kind: None, // Snapshot edges are endpoint-only EdgeIds; kind loss on export is a known worlds gap (docs/molecular-force-layout.md)
             }));
         }
     }

@@ -40,6 +40,7 @@ fn unit_vault_graph_add_and_count() {
     g.add_edge(VaultEdge {
         source: "a".into(),
         target: "b".into(),
+    kind: None,
     });
     assert_eq!(g.node_count(), 2);
     assert_eq!(g.edge_count(), 1);
@@ -89,6 +90,7 @@ fn unit_validate_rejects_dangling_edges() {
     graph.add_edge(VaultEdge {
         source: "present".into(),
         target: "missing".into(),
+    kind: None,
     });
 
     assert!(matches!(

@@ -3,8 +3,10 @@
 Status: active (2026-09). Phase 0 shipped — the SDF V3000 importer
 (`charts/jump-cannon/packages/sdf.toml`) puts atoms, bonds, elements,
 charges, and authored 2D coordinates into the graph, and the app seeds
-the sim from those coordinates (rings render as rings). Everything below
-"The gaps" is the follow-up that makes the layout physics molecular.
+the sim from those coordinates (rings render as rings). Phase 1 shipped:
+bond order is a first-class edge kind end-to-end and the GPU spring
+takes per-edge UFF rest lengths. Remaining: Coulomb (ions), per-node
+vdW parameters, and angle terms — "The gaps" below.
 
 ## Research references (sdgr internal)
 
@@ -69,15 +71,48 @@ computing.
 
 ## The gaps (honest)
 
-1. **`VaultEdge` is `{source, target}` — no kind.** Bond order is parsed
-   by the SDF grammar and dropped. The json engine likewise declares edge
-   kinds in the discovery schema and drops them at mapping.
-2. **The GPU spring has one global `spring_len`.** No per-edge buffer.
+1. ~~**`VaultEdge` is `{source, target}` — no kind.**~~ **Shipped.**
+   `VaultEdge.kind: Option<String>` (serde default); the pest engine maps
+   grammar-rule labels (`edge_kind_labels`, mirroring `tag_labels`) onto
+   it, and the json engine fills it from `EdgeRule.kind` /
+   `EdgeListRules.kind_pointer`. `sdf.toml` splits the V3000 bond-type
+   code into one rule per order → `single|double|triple|aromatic`.
+2. ~~**The GPU spring has one global `spring_len`.**~~ **Shipped.**
+   `force.wgsl` `spring_step` reads a per-half-edge `edge_rests` buffer
+   (binding 3, group 3) aligned with `edge_neighbors`; `precompute` fills
+   it from edge `rest` metadata and falls back to the global spring
+   length for untyped/invalid entries.
 3. **No Coulomb term.** Repulsion is charge-blind.
-4. **Element-aware parameters don't exist anywhere** — no periodic table,
-   radii, or masses in the workspace.
+4. **Per-node element parameters are bond-length-only.** `uff.rs` carries
+   radii/electronegativities for UFF eq. 3 rest lengths; vdW well
+   depths (`D_i`) and masses are not yet wired into the sim.
 
-## Design: UFF-derived molecular attributes
+## Shipped wire contract (phase 1)
+
+Instead of the `MolecularLens`/attribute-proto route sketched below, the
+shipped path is two typed-attribute endpoint pairs, symmetric for nodes
+and edges:
+
+| Endpoint | Content |
+|---|---|
+| `GET /graph/nodes/types` | JSON: sorted distinct node types (`meta.doctype`) + revision |
+| `GET /graph/nodes/types.bin` | u32 per node (id order) indexing the table; `u32::MAX` = untyped |
+| `GET /graph/edges/kinds` | JSON: sorted distinct edge kinds + revision |
+| `GET /graph/edges/kinds.bin` | u32 per edge (`/graph/edges` order) indexing the table; `u32::MAX` = untyped |
+
+The app (`graph_canvas::typed_edge_rests`) computes per-edge rests as
+`uff::bond_rest_length(element(src), element(tgt), bond_order(kind))`,
+revision-checks both tables against `Init`, and hands them to
+`build_topology_graph` as edge `rest` metadata. Any failure disables the
+feature; a graph without bond kinds is byte-identical in behavior to
+before. The vault/snapshot conversions (`graph_data_from_vault`) compute
+the same rests in-process for browser-local packages.
+
+## Design: UFF-derived molecular attributes (original sketch, phase 2+)
+
+The sketch below predates the shipped wire contract; the `MolecularLens`
+route was not taken for rest lengths (wire buffers won on simplicity),
+but it remains the natural path for per-node mass/vdW/charge attributes.
 
 New module `graph-layouts/src/uff.rs` (plain data + pure functions, no I/O,
 wasm-clean):
@@ -136,11 +171,12 @@ the dynamic-bond fields already do.
 
 ### Milestones
 
-1. `VaultEdge.kind` + json/pest fill + SDF bond kinds (core change,
-   moderate blast radius: proto regen via `just app-proto`).
-2. `uff.rs` table + `MolecularLens` + per-edge rest-length buffer in
-   `force.wgsl` → caffeine renders with real bond lengths (ring geometry
-   visibly correct: 6-ring wider than 5-ring, methyl C–H short).
+1. ~~`VaultEdge.kind` + json/pest fill + SDF bond kinds~~ **Done** — via
+   pest `edge_kind_labels` + json `EdgeRule.kind`/`kind_pointer`; no
+   proto regen was needed (kinds ride the new wire buffers, not proto).
+2. ~~`uff.rs` table + per-edge rest-length buffer in `force.wgsl`~~
+   **Done** (without `MolecularLens`; wire buffers instead) → the sim
+   relaxes typed graphs to real bond lengths.
 3. Charge term (ions) — zwitterion carboxylate/ammonium visibly attract.
 4. Angle terms (v2) — hybridization-correct ring shapes.
 
@@ -149,12 +185,19 @@ the dynamic-bond fields already do.
 - `cargo test -p importer` (70) — shipped `sdf.toml` parses the
   glycine-zwitterion example (`cation` + `anion` tags); pest `x`/`y`
   capture tests pin authored positions, the f32-overflow edge, and the
-  zero default for packages without the roles.
-- `cargo test -p graph-api` (91 lib + 22 regressions) — `positions_authored`
-  flag tests: authored coordinates survive `build`, unpositioned graphs get
-  the circle fallback.
+  zero default for packages without the roles;
+  `edge_kind_labels_land_on_vault_edges` pins labeled bond orders onto
+  `VaultEdge.kind` (plus duplicate-label validation).
+- `cargo test -p graph-layouts` (69 lib + suites) — `uff.rs` UFF eq. 3
+  anchors (C–C 1.514 / C=C 1.374 / C≡C 1.293 / aromatic 1.432 / C–H
+  1.091, symmetry, case normalization, unknown-element fallback) and
+  `precompute_edge_rests_align_with_neighbors` (CSR-aligned per-half-edge
+  rests, metadata fallback, non-finite rejection). GPU sim tests green.
+- `cargo test -p graph-api --test regressions` (23) —
+  `typed_edge_discovery_endpoints_reflect_the_snapshot` pins all four
+  typed endpoints: JSON tables with revision, per-node/per-edge index
+  buffers (`u32::MAX` untyped sentinel), table alignment.
 - Live: caffeine via `--source pest … sdf.toml` → 24 atoms / 25 bonds,
-  element tags (C 8, H 10, N 4, O 2), and the fused 6/5-ring core with
-  three methyl arms rendered from the authored depiction (not the random
-  sphere blob). The sim then relaxes toward uniform `spring_len` — the
-  residual distortion is exactly gap #2 below.
+  element tags (C 8, H 10, N 4, O 2), fused 6/5-ring core from the
+  authored depiction; bonds carry kinds and the sim now relaxes toward
+  per-edge UFF lengths instead of one uniform `spring_len`.

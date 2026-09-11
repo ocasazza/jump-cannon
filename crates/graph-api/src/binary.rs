@@ -31,6 +31,73 @@ pub fn edges_buffer(graph: &VaultGraph, id_to_idx: &HashMap<String, u32>) -> Vec
     out
 }
 
+/// Sorted, deduplicated table of distinct edge kinds in the graph. Shared
+/// by the JSON discovery endpoint and the binary per-edge index buffer so
+/// the two always agree on indices.
+pub fn edge_kinds_table(graph: &VaultGraph) -> Vec<String> {
+    let mut kinds: Vec<&str> = graph
+        .edges
+        .iter()
+        .filter_map(|edge| edge.kind.as_deref())
+        .collect();
+    kinds.sort_unstable();
+    kinds.dedup();
+    kinds.into_iter().map(str::to_string).collect()
+}
+
+/// Per-edge kind-table index buffer, aligned edge-for-edge with
+/// [`edges_buffer`] (same iteration and the same endpoint filter). An edge
+/// without a kind encodes `u32::MAX`.
+pub fn edge_kinds_buffer(
+    graph: &VaultGraph,
+    id_to_idx: &HashMap<String, u32>,
+    kinds_table: &[String],
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(graph.edges.len() * 4);
+    for edge in &graph.edges {
+        if !id_to_idx.contains_key(&edge.source) || !id_to_idx.contains_key(&edge.target) {
+            continue;
+        }
+        let idx = edge
+            .kind
+            .as_deref()
+            .and_then(|kind| kinds_table.iter().position(|k| k == kind).map(|i| i as u32))
+            .unwrap_or(u32::MAX);
+        out.extend_from_slice(&idx.to_le_bytes());
+    }
+    out
+}
+
+/// Sorted, deduplicated table of distinct node types (`meta.doctype`).
+/// Shared by the JSON discovery endpoint and the binary per-node index
+/// buffer so the two always agree on indices.
+pub fn node_types_table(graph: &VaultGraph) -> Vec<String> {
+    let mut types: Vec<&str> = graph
+        .nodes
+        .values()
+        .filter_map(|node| node.meta.doctype.as_deref())
+        .collect();
+    types.sort_unstable();
+    types.dedup();
+    types.into_iter().map(str::to_string).collect()
+}
+
+/// Per-node type-table index buffer in node (id_to_idx) order. A node
+/// without a type encodes `u32::MAX`.
+pub fn node_types_buffer(graph: &VaultGraph, types_table: &[String]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(graph.nodes.len() * 4);
+    for node in graph.nodes.values() {
+        let idx = node
+            .meta
+            .doctype
+            .as_deref()
+            .and_then(|t| types_table.iter().position(|k| k == t).map(|i| i as u32))
+            .unwrap_or(u32::MAX);
+        out.extend_from_slice(&idx.to_le_bytes());
+    }
+    out
+}
+
 /// Per-metric flat f32 buffer. Returns None if the metric name is unknown.
 ///
 /// The `tag` metric is a per-node categorical bucket id derived from the

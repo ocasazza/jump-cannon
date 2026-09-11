@@ -187,6 +187,7 @@ mod tests {
                 graph.add_edge(VaultEdge {
                     source: "generate:dangling:present".into(),
                     target: "generate:dangling:missing".into(),
+ kind: None,
                 });
                 Ok(LoadResult {
                     graph,

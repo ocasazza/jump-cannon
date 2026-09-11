@@ -4,6 +4,11 @@ use serde::{Deserialize, Serialize};
 pub struct VaultEdge {
     pub source: String,
     pub target: String,
+    /// Optional edge semantics from the importer (SDF bond order: `single` /
+    /// `double` / `triple` / `aromatic`; json engine's declared `kind`).
+    /// Identity stays the endpoint pair — `EdgeId` ignores this field.
+    #[serde(default)]
+    pub kind: Option<String>,
 }
 
 /// Canonical identity of an edge: its endpoints.

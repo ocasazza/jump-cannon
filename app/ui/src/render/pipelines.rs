@@ -84,6 +84,13 @@ pub struct GraphData {
     pub edges: Vec<u32>,     // [src,tgt, ...] length = 2*m
     pub colors: Vec<f32>,    // [r,g,b,a, ...] length = 4*n
     pub sizes: Vec<f32>,     // length = n
+    /// Per-edge spring rest lengths (length = m). `None` when the graph has
+    /// no typed edges (no SDF bond kinds); inside `Some`, a `0.0` entry
+    /// means "untyped / unknown geometry" and the sim falls back to the
+    /// global spring length. Sourced from UFF bond geometry via
+    /// `graph_layouts::uff` over the `/graph/edges/kinds` + `/graph/nodes/types`
+    /// wire.
+    pub edge_rest: Option<Vec<f32>>,
 }
 
 #[repr(C)]
@@ -603,7 +610,7 @@ impl GraphPipelines {
         });
 
         // Initialise the GPU force layout against the same positions buffer.
-        let layout_graph = build_topology_graph(&graph.positions, &graph.edges);
+        let layout_graph = build_topology_graph(&graph.positions, &graph.edges, graph.edge_rest.as_deref());
         let layout: Option<Box<dyn DynPhysicsLayout>> = {
             let mut boxed: Box<dyn DynPhysicsLayout> = Box::new(BoxedPhysics::new(
                 GpuForceLayout::new(GpuForceOptions::default()),
@@ -1829,7 +1836,7 @@ impl GraphPipelines {
 /// flat position/edge buffers. The id padding scheme matches the egui
 /// app's `build_topology_graph` so the seed-position carryover semantics
 /// (precompute's per-node `position3` override) behave identically.
-fn build_topology_graph(positions: &[f32], edges: &[u32]) -> GlGraph {
+fn build_topology_graph(positions: &[f32], edges: &[u32], edge_rest: Option<&[f32]>) -> GlGraph {
     let n = positions.len() / 3;
     let width = format!("{}", n.max(1) - 1).len().max(1);
 
@@ -1850,7 +1857,20 @@ fn build_topology_graph(positions: &[f32], edges: &[u32]) -> GlGraph {
         }
         let sid = format!("{:0width$}", s, width = width);
         let tid = format!("{:0width$}", t, width = width);
-        g.add_edge(GlEdge::new(format!("e{}", e_i), sid, tid));
+        let mut edge = GlEdge::new(format!("e{}", e_i), sid, tid);
+        // `0.0` means "no typed geometry": leave the metadata unset so the
+        // sim's per-edge fallback handles it identically to an untyped
+        // graph (and the CSR rest for that half-edge is the global
+        // spring length).
+        if let Some(rest) = edge_rest.and_then(|r| r.get(e_i)).copied() {
+            if rest > 0.0 && rest.is_finite() {
+                edge.metadata.insert(
+                    "rest".to_string(),
+                    graph_layouts::MetadataValue::Number(rest as f64),
+                );
+            }
+        }
+        g.add_edge(edge);
     }
     g
 }

@@ -141,6 +141,10 @@ const OCT_BODY_INTERNAL: u32 = 0xFFFFFFFFu;
 @group(3) @binding(0) var<storage, read>       virt_csr:             array<u32>;
 @group(3) @binding(1) var<storage, read>       virt_edge_offsets:    array<u32>;
 @group(3) @binding(2) var<storage, read_write> spring_force_partial: array<vec3<f32>>;
+// Per-half-edge spring rest lengths, aligned with group-0 `edge_neighbors`.
+// Untyped edges carry the global `params.spring_len`; molecular graphs carry
+// per-edge UFF lengths from edge metadata.
+@group(3) @binding(3) var<storage, read> edge_rests: array<f32>;
 
 fn gb_cell_for(pos: vec3<f32>) -> u32 {
     let inv = 1.0 / gb_params.grid_cell_size;
@@ -291,7 +295,7 @@ fn spring_step(@builtin(global_invocation_id) gid: vec3<u32>) {
         let other = edge_neighbors[k];
         let d = positions_in[other].xyz - pos;
         let dist = max(length(d), 0.01);
-        let stretch = dist - params.spring_len;
+        let stretch = dist - edge_rests[k];
         f = f + (d / dist) * (params.spring_k * stretch);
     }
     spring_force_partial[v] = f;

@@ -189,7 +189,7 @@ mod tests {
         for (s, t) in edges {
             g.add_edge(VaultEdge {
                 source: s.to_string(),
-                target: t.to_string(),
+                target: t.to_string(), kind: None,
             });
         }
         // indices of the triangle edge a-b (0) and the shortcut c-d (6)
@@ -246,15 +246,15 @@ mod tests {
         g.add_node(node("b"));
         g.add_edge(VaultEdge {
             source: "a".into(),
-            target: "ghost".into(),
+            target: "ghost".into(), kind: None,
         }); // unknown endpoint
         g.add_edge(VaultEdge {
             source: "a".into(),
-            target: "a".into(),
+            target: "a".into(), kind: None,
         }); // self-loop
         g.add_edge(VaultEdge {
             source: "a".into(),
-            target: "b".into(),
+            target: "b".into(), kind: None,
         });
         let es = compute_edge_strength(&g, EdgeStrengthKind::Jaccard);
         assert_eq!(es.strength.len(), 3);

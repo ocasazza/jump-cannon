@@ -61,10 +61,7 @@ fn upsert(node: VaultNode) -> GraphOp {
 }
 
 fn edge(source: &str, target: &str) -> GraphOp {
-    GraphOp::UpsertEdge(VaultEdge {
-        source: source.into(),
-        target: target.into(),
-    })
+    GraphOp::UpsertEdge(VaultEdge { source: source.into(), target: target.into(), kind: None })
 }
 
 /// commit → materialize round-trip: nodes, edges, and frontmatter survive.

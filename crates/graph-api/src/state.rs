@@ -72,6 +72,12 @@ pub struct GraphSnapshot {
     pub id_to_idx: HashMap<String, u32>,
     /// Dense-index ordered list of node ids (parallel to id_to_idx).
     pub idx_to_id: Vec<String>,
+    /// Sorted, deduplicated edge-kind table; indices into it are the
+    /// per-edge u32 values in the "edge_kinds" binary cache entry.
+    pub edge_kinds: Vec<String>,
+    /// Sorted, deduplicated node-type (`meta.doctype`) table; indices into
+    /// it are the per-node u32 values in the "node_types" binary cache.
+    pub node_types: Vec<String>,
     /// Precomputed bulk-numeric binary buffers. Built once per snapshot;
     /// per-request handlers do an `Arc` clone instead of re-walking
     /// `graph.nodes` and re-allocating. Keys: "positions", "edges",
@@ -138,6 +144,18 @@ impl GraphSnapshot {
             "edges".into(),
             Arc::from(crate::binary::edges_buffer(&graph, &id_to_idx)),
         );
+        let edge_kinds = crate::binary::edge_kinds_table(&graph);
+        binary_cache.insert(
+            "edge_kinds".into(),
+            Arc::from(crate::binary::edge_kinds_buffer(
+                &graph, &id_to_idx, &edge_kinds,
+            )),
+        );
+        let node_types = crate::binary::node_types_table(&graph);
+        binary_cache.insert(
+            "node_types".into(),
+            Arc::from(crate::binary::node_types_buffer(&graph, &node_types)),
+        );
         for name in [
             "degree",
             "indegree",
@@ -171,6 +189,8 @@ impl GraphSnapshot {
             id_to_idx,
             idx_to_id,
             binary_cache,
+            edge_kinds,
+            node_types,
         })
     }
 }

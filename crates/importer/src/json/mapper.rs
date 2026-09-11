@@ -204,7 +204,7 @@ impl GraphMapper for ManifestMapper {
         // duplicate an API-provided link (or vice versa).
         let mut seen: HashSet<(String, String)> = HashSet::new();
         let mut push_edge =
-            |graph: &mut VaultGraph, source: String, target: String, dedupe: Dedupe| {
+            |graph: &mut VaultGraph, source: String, target: String, kind: Option<String>, dedupe: Dedupe| {
                 let key = match dedupe {
                     Dedupe::None => None,
                     Dedupe::Ordered => Some((source.clone(), target.clone())),
@@ -219,7 +219,7 @@ impl GraphMapper for ManifestMapper {
                         return;
                     }
                 }
-                graph.add_edge(VaultEdge { source, target });
+                graph.add_edge(VaultEdge { source, target, kind });
             };
 
         for collection in &self.config().collections {
@@ -307,7 +307,7 @@ impl ManifestMapper {
         by_title: &HashMap<&str, HashMap<String, String>>,
         by_title_ci: &HashMap<&str, HashMap<String, String>>,
         graph: &mut VaultGraph,
-        push_edge: &mut impl FnMut(&mut VaultGraph, String, String, Dedupe),
+        push_edge: &mut impl FnMut(&mut VaultGraph, String, String, Option<String>, Dedupe),
         unresolved: &mut Vec<String>,
     ) {
         let target_collection = rule.target_collection.as_str();
@@ -340,7 +340,7 @@ impl ManifestMapper {
             };
             match resolved {
                 Some(target) => {
-                    push_edge(graph, source_id.to_string(), target, Dedupe::Unordered);
+                    push_edge(graph, source_id.to_string(), target, Some(rule.kind.clone()), Dedupe::Unordered);
                 }
                 None => unresolved.push(format!(
                     "{} {value:?} referenced by {owner}",
@@ -356,7 +356,7 @@ impl ManifestMapper {
         document: &Value,
         by_local: &HashMap<&str, HashMap<String, MappedNode>>,
         graph: &mut VaultGraph,
-        push_edge: &mut impl FnMut(&mut VaultGraph, String, String, Dedupe),
+        push_edge: &mut impl FnMut(&mut VaultGraph, String, String, Option<String>, Dedupe),
     ) {
         if let Some(pointer) = &rules.kind_pointer {
             if !rules.include_kinds.is_empty() {
@@ -384,7 +384,11 @@ impl ManifestMapper {
             // the link has nothing to attach to.
             return;
         };
-        push_edge(graph, source, target, rules.dedupe);
+        let kind = rules
+            .kind_pointer
+            .as_ref()
+            .and_then(|p| pointer_str(document, p));
+        push_edge(graph, source, target, kind, rules.dedupe);
     }
 }
 

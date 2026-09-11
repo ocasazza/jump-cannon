@@ -485,6 +485,7 @@ fn graph_data_from_generated(g: &GeneratedGraph) -> GraphData {
             edges,
             colors,
             sizes,
+            edge_rest: None,
         },
     }
 }

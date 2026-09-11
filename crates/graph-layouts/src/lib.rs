@@ -10,6 +10,10 @@ mod utils;
 /// edge-length CV). Usable from the native solver tests and the WASM renderer.
 pub mod metrics;
 
+/// UFF bond geometry: per-element radii/electronegativities and rest-length
+/// computation for molecular (typed-edge) force layouts.
+pub mod uff;
+
 pub use types::{Graph, Node, Edge, Id, MetadataValue, LayoutOptions};
 pub use layout::algorithms::fcose::{FcoseLayout, FcoseQuality, FcoseSettings};
 pub use layout::algorithms::cose_bilkent::{CoseBilkentLayout, CoseBilkentSettings};

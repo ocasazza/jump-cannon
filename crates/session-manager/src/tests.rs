@@ -137,10 +137,7 @@ fn build_history_world() -> (EmbeddedSessionManager, WorldId) {
         vec![
             GraphOp::UpsertNode(test_node("a", "Alpha")),
             GraphOp::UpsertNode(test_node("b", "Beta")),
-            GraphOp::UpsertEdge(VaultEdge {
-                source: "a".to_string(),
-                target: "b".to_string(),
-            }),
+            GraphOp::UpsertEdge(VaultEdge { source: "a".to_string(), target: "b".to_string(), kind: None }),
         ],
         "local",
         "add a and b",

@@ -250,7 +250,82 @@ fn packages_without_xy_captures_default_to_zero_positions() {
     assert_eq!((node.x, node.y), (0.0, 0.0));
 }
 
+
+/// `edge_kind_labels` push the matched rule's label onto `VaultEdge.kind`;
+/// more than one label matching the same edge is a record error.
+const KINDED_EDGES_PACKAGE: &str = r#"format_version = 3
+
+[metadata]
+id = "example.kinded-edges"
+name = "Kinded edges"
+version = "1.0.0"
+description = "Test edge kind labels"
+
+[parser]
+engine = "pest"
+root_rule = "document"
+grammar = '''
+document = { SOI ~ (record ~ NEWLINE?)* ~ EOI }
+record = _{ node | edge }
+node = { "N|" ~ node_id }
+node_id = @{ field }
+edge = { "E|" ~ bond ~ "|" ~ source ~ "|" ~ target }
+bond = _{ bond_strong | bond_weak }
+bond_strong = @{ "S" }
+bond_weak = @{ "W" }
+source = @{ field }
+target = @{ field }
+title = { "@@title@@" }
+kind = { "@@kind@@" }
+tag = { "@@tag@@" }
+property = { "@@property@@" }
+key = { "@@key@@" }
+value = { "@@value@@" }
+field = _{ (!("|" | NEWLINE) ~ ANY)+ }
+'''
+
+[parser.captures]
+node = "node"
+id = "node_id"
+title = "title"
+kind = "kind"
+tag = "tag"
+property = "property"
+key = "key"
+value = "value"
+edge = "edge"
+source = "source"
+target = "target"
+
+[parser.captures.edge_kind_labels]
+bond_strong = "strong"
+bond_weak = "weak"
+"#;
+
 #[test]
+fn edge_kind_labels_land_on_vault_edges() {
+    let package =
+        ValidatedPackage::from_toml(KINDED_EDGES_PACKAGE).expect("valid kinded package");
+    let result = package
+        .parse_input("N|a\nN|b\nN|c\nE|S|a|b\nE|W|b|c")
+        .expect("input parses");
+
+    assert_eq!(result.graph.edges.len(), 2);
+    let strong = result
+        .graph
+        .edges
+        .iter()
+        .find(|e| e.target.ends_with(":b"))
+        .expect("strong edge");
+    assert_eq!(strong.kind.as_deref(), Some("strong"));
+    let weak = result
+        .graph
+        .edges
+        .iter()
+        .find(|e| e.target.ends_with(":c"))
+        .expect("weak edge");
+    assert_eq!(weak.kind.as_deref(), Some("weak"));
+}
 fn undeclared_properties_remain_metadata_but_never_enter_search_documents() {
     let package = package();
     let result = package

@@ -390,6 +390,50 @@ pub(crate) async fn revisioned_edges() -> ApiResult<Revisioned<Vec<u32>>> {
     })
 }
 
+/// A typed-attribute wire pair: the JSON distinct-value table plus the
+/// per-item u32 index buffer (`u32::MAX` = untyped). Indices into `table`
+/// are the values in `per_item`; alignment follows the companion bulk
+/// endpoint (`/graph/ids` for node types, `/graph/edges` for edge kinds).
+pub(crate) struct TypeTable {
+    pub revision: u64,
+    pub table: Vec<String>,
+    pub per_item: Vec<u32>,
+}
+
+#[derive(serde::Deserialize)]
+struct TypesJson {
+    graph_revision: u64,
+    types: Vec<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct KindsJson {
+    graph_revision: u64,
+    kinds: Vec<String>,
+}
+
+/// `/graph/nodes/types` + `/graph/nodes/types.bin`.
+pub(crate) async fn revisioned_node_types() -> ApiResult<TypeTable> {
+    let t: TypesJson = get_json("/graph/nodes/types").await?;
+    let bin = get_revisioned_bytes("/graph/nodes/types.bin").await?;
+    Ok(TypeTable {
+        revision: t.graph_revision,
+        table: t.types,
+        per_item: u32s(&bin.value),
+    })
+}
+
+/// `/graph/edges/kinds` + `/graph/edges/kinds.bin`.
+pub(crate) async fn revisioned_edge_kinds() -> ApiResult<TypeTable> {
+    let k: KindsJson = get_json("/graph/edges/kinds").await?;
+    let bin = get_revisioned_bytes("/graph/edges/kinds.bin").await?;
+    Ok(TypeTable {
+        revision: k.graph_revision,
+        table: k.kinds,
+        per_item: u32s(&bin.value),
+    })
+}
+
 /// `/graph/metrics/:name` — per-node f32 buffer. The served keys are
 /// graph-api's binary cache set (degree, indegree, outdegree, pagerank,
 /// betweenness, kcore, community, wcc); anything else answers 404, which

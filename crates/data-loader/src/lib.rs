@@ -2147,6 +2147,7 @@ mod importer_tests {
         result.graph.add_edge(vault_data::VaultEdge {
             source: N1.into(),
             target: "generate:fixture:missing".into(),
+    kind: None,
         });
         let error = schema.validate_result(&result).unwrap_err().to_string();
         assert!(

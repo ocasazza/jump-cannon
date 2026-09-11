@@ -106,6 +106,29 @@ pub async fn load() -> Result<GraphData, String> {
         }
     }
 
+    // Typed-edge contract (molecular graphs): UFF per-edge rest lengths.
+    // Any failure or inconsistency disables the feature — the sim then
+    // behaves exactly as before on the global spring length.
+    let edge_rest = match (
+        api::revisioned_node_types().await,
+        api::revisioned_edge_kinds().await,
+    ) {
+        (Ok(types), Ok(kinds))
+            if (revision == 0 || types.revision == 0 || types.revision == revision)
+                && (revision == 0 || kinds.revision == 0 || kinds.revision == revision) =>
+        {
+            typed_edge_rests(&types, &kinds, &edges, n)
+        }
+        (Ok(types), Ok(kinds)) => {
+            return Err(format!(
+                "inconsistent snapshot (types revision {}, kinds revision {}, init revision {revision}) — \
+                 server graph changed mid-load",
+                types.revision, kinds.revision,
+            ));
+        }
+        _ => None,
+    };
+
     let spring_len = GpuForceOptions::default().spring_len.max(1.0);
     let positions = if init.positions_authored {
         // Importer-authored coordinates (e.g. an SDF 2D depiction): the
@@ -164,8 +187,61 @@ pub async fn load() -> Result<GraphData, String> {
             edges,
             colors,
             sizes,
+            edge_rest,
         },
     })
+}
+
+/// Per-edge spring rest lengths from the typed-edge wire (UFF bond
+/// geometry). `None` unless at least one edge resolves — untyped graphs
+/// skip the feature entirely and keep the global spring length. A `0.0`
+/// entry means "no typed geometry for this edge" (unknown kind, unknown
+/// element, missing table entry).
+fn typed_edge_rests(
+    types: &api::TypeTable,
+    kinds: &api::TypeTable,
+    edges: &[u32],
+    n: usize,
+) -> Option<Vec<f32>> {
+    if types.table.is_empty() || kinds.table.is_empty() {
+        return None;
+    }
+    let n_edges = edges.len() / 2;
+    if kinds.per_item.len() != n_edges || types.per_item.len() != n {
+        // Mid-load swap the revision check did not catch (or an older
+        // server): never mount a misaligned rest table.
+        return None;
+    }
+    let mut any = false;
+    let mut rests = vec![0.0f32; n_edges];
+    for (e, slot) in rests.iter_mut().enumerate() {
+        let kind_idx = kinds.per_item[e];
+        if kind_idx == u32::MAX {
+            continue;
+        }
+        let Some(order) = kinds
+            .table
+            .get(kind_idx as usize)
+            .and_then(|kind| graph_layouts::uff::bond_order(kind))
+        else {
+            continue;
+        };
+        let element = |node: u32| -> Option<&str> {
+            let idx = *types.per_item.get(node as usize)?;
+            if idx == u32::MAX {
+                return None;
+            }
+            types.table.get(idx as usize).map(String::as_str)
+        };
+        let (Some(a), Some(b)) = (element(edges[2 * e]), element(edges[2 * e + 1])) else {
+            continue;
+        };
+        if let Some(rest) = graph_layouts::uff::bond_rest_length(a, b, order) {
+            *slot = rest;
+            any = true;
+        }
+    }
+    any.then_some(rests)
 }
 
 /// Importer-authored 2D coordinates → sim seed: z = 0, recentered on the
@@ -291,6 +367,7 @@ pub(crate) fn graph_data_from_snapshot(snapshot: &graph_vcs::Snapshot) -> GraphD
             edges,
             colors,
             sizes,
+            edge_rest: None,
         },
     }
 }
@@ -308,6 +385,12 @@ pub(crate) fn graph_data_from_vault(graph: &vault_data::VaultGraph) -> GraphData
     }
     let n = ids.len();
 
+    // Per-edge UFF rest lengths ride alongside the index buffer so both
+    // apply the same dropped-endpoint filter. A 0.0 entry means "untyped
+    // or unknown geometry" — the sim falls back to the global spring
+    // length for that edge.
+    let mut edge_rest: Vec<f32> = Vec::with_capacity(graph.edges.len());
+    let mut any_rest = false;
     let mut edges: Vec<u32> = Vec::with_capacity(graph.edges.len() * 2);
     for edge in &graph.edges {
         // Drop edges whose endpoints are gone (shouldn't happen for a
@@ -318,7 +401,22 @@ pub(crate) fn graph_data_from_vault(graph: &vault_data::VaultGraph) -> GraphData
         };
         edges.push(s);
         edges.push(t);
+        let rest = edge
+            .kind
+            .as_deref()
+            .and_then(graph_layouts::uff::bond_order)
+            .and_then(|order| {
+                let a = graph.nodes.get(&edge.source)?.meta.doctype.as_deref()?;
+                let b = graph.nodes.get(&edge.target)?.meta.doctype.as_deref()?;
+                graph_layouts::uff::bond_rest_length(a, b, order)
+            })
+            .unwrap_or(0.0);
+        if rest > 0.0 {
+            any_rest = true;
+        }
+        edge_rest.push(rest);
     }
+    let edge_rest = any_rest.then_some(edge_rest);
     let n_edges = (edges.len() / 2) as u32;
 
     // No stored positions — seed from sphere + warmup, same as the snapshot path.
@@ -349,6 +447,7 @@ pub(crate) fn graph_data_from_vault(graph: &vault_data::VaultGraph) -> GraphData
             edges,
             colors,
             sizes,
+            edge_rest,
         },
     }
 }

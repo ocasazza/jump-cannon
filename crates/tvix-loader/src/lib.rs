@@ -268,6 +268,7 @@ impl Loader for GenerateLoader {
                 target: namespace
                     .node_id(&format!("n{tgt}"))
                     .expect("ordinal local ids are valid"),
+                kind: None,
             });
         }
 
@@ -359,7 +360,7 @@ pub fn convert_generated_graph(
         let source = namespace.node_id(&edge.source)?;
         let target = namespace.node_id(&edge.target)?;
         if graph.nodes.contains_key(&source) && graph.nodes.contains_key(&target) {
-            graph.add_edge(VaultEdge { source, target });
+            graph.add_edge(VaultEdge { source, target, kind: None });
         }
     }
 
