@@ -13,7 +13,7 @@ framework: a **format is a package** (mechanism), a **source is an instance
 binding** (configuration). See `AGENTS.md` "Importers: packages, not
 crates" and [[Importer Runtime]].
 
-Ten packages ship under `charts/jump-cannon/packages/`:
+Eleven packages ship under `charts/jump-cannon/packages/`:
 
 - **JSON APIs**: `pride-archive` (PRIDE project + file graph with
   `contains` edges), `pride-search` (PRIDE free-text discovery),
@@ -25,9 +25,11 @@ Ten packages ship under `charts/jump-cannon/packages/`:
   (proteins + peptides with PSM evidence edges), `fasta` (sequence
   databases), `gff3` (genomic annotations), `smiles` (compound lists with
   chemistry feature tags: aromatic, chiral, cyclic, halogenated, charged),
-  `mzml` (PSI XML spectrum index: MS1/MS2 + polarity tags). Each ships an
-  example input under `packages/examples/` that a cargo test parses and
-  validates.
+  `mzml` (PSI XML spectrum index: MS1/MS2 + polarity tags), `sdf` (V3000
+  molecular graphs: atoms as nodes with element types, bonds as edges,
+  ions as cation/anion tags — molecular force layout designed in
+  `docs/molecular-force-layout.md`). Each ships an example input under
+  `packages/examples/` that a cargo test parses and validates.
 
 User options are the package's declared variables at bind time —
 `accession` (PRIDE), `keyword` (PRIDE search), `query` (DataCite) — via

@@ -77,7 +77,7 @@ deployment surface for what is data, and it does not survive the tenth source,
 let alone the hundredth.
 
 **Worked example:** adding a new JSON API is one new TOML package, not one new crate. `charts/jump-cannon/packages/hindsight-memory-bank.toml` declares the Hindsight 0.9.1 memory-bank API as a package bound to an instance by tenant + bank, served by the shared engine — no Rust touched.
-The same rule covers scientific data: PRIDE Archive, the DataCite DOI registry, SDRF-Proteomics, ISA-Tab, mzTab, FASTA, and GFF3 all ship as packages under `charts/jump-cannon/packages/` bound to sources (EBI, MetaboLights, UniProt, Zenodo, …) at runtime — the format matrix and engine mechanics live in `docs/scientific-data-importers.md`.
+The same rule covers scientific data: PRIDE Archive, the DataCite DOI registry, SDRF-Proteomics, ISA-Tab, mzTab, FASTA, GFF3, SMILES, mzML, and SDF V3000 molecular structures all ship as packages under `charts/jump-cannon/packages/` bound to sources (EBI, MetaboLights, UniProt, Zenodo, …) at runtime — the format matrix and engine mechanics live in `docs/scientific-data-importers.md`, molecular force layout in `docs/molecular-force-layout.md`.
 
 ## Dioxus + Tauri app (`app/`)
 

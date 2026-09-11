@@ -33,6 +33,7 @@ Seven distinct formats across eight packages under
 | `gff3.toml` | GFF3 (TSV) | pest | one node per feature; type column as canvas type |
 | `smiles.toml` | SMILES compound list (text) | pest | one node per compound; feature tags (aromatic/chiral/cyclic/halogenated/charged) from the notation itself |
 | `mzml.toml` | mzML 1.1 (PSI XML) | pest | spectrum index: one node per spectrum; MS1/MS2 + polarity tags |
+| `sdf.toml` | SDF/MOL V3000 (text) | pest | molecular graph: one node per atom (element as type), one edge per bond, ions as cation/anion tags |
 
 Each pest package ships a sibling example input
 (`packages/examples/<stem>.txt`) that a cargo test parses and validates
@@ -54,6 +55,7 @@ Seven sources bind to those formats today, with zero new code:
 | **Zenodo + any DataCite member** (Dryad, Figshare, PANGAEA, …) | `datacite-dois` | endpoint `https://api.datacite.org`; the repository is a query choice, not code |
 | **PRIDE / MetaboLights / Metabolomics Workbench** raw runs | `mzml` | mzML downloads; bind index-sized files (see the size note in the package header) |
 | **PubChem / ChEBI / RDKit / Open Babel** | `smiles` | SMILES list exports, one compound per line, optional tab + name |
+| **Maestro / RDKit / Open Babel / PubChem** structures | `sdf` | V3000 exports, one molecule per file; molecular force layout is designed in `docs/molecular-force-layout.md` |
 
 Mix-and-match examples:
 

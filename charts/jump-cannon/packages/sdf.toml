@@ -1,0 +1,114 @@
+# SDF/MOL V3000 connection-table package (pest grammar).
+#
+# SDF is the interchange format every cheminformatics toolkit writes
+# (Maestro .mae export via `structconvert`, RDKit, Open Babel, PubChem).
+# This package reads the V3000 dialect: one atom per node (index as id,
+# element symbol as canvas type), one bond per edge (atom-index endpoints),
+# formal charges as `cation`/`anion` tags plus the remaining `KEY=value`
+# atom properties (MASS, VAL, …) as frontmatter.
+#
+# Grammar notes (edit live in the Importers panel; no recompile):
+# - V3000 (not V2000) because V3000 atom and bond lines carry EXPLICIT
+#   atom indices; V2000 numbers atoms positionally, and a PEG capture can
+#   never synthesize a running counter. Bond endpoints resolve by id, so
+#   the indices must appear as text.
+# - ONE MOLECULE PER INPUT FILE: V3000 atom indices restart at 1 per
+#   connection table, and pest node ids are global — a multi-molecule
+#   $$$$ file fails loudly with `DuplicateNodeId`. Split with
+#   `csplit`/Open Babel first, or import per molecule.
+# - Bond ORDER (single/double/triple/aromatic) is parsed but not yet
+#   carried: `VaultEdge` has no kind field, and the pest edge contract is
+#   source/target only. Per-edge order (and the UFF rest lengths derived
+#   from it) is the molecular-layout follow-up in
+#   `docs/molecular-force-layout.md`; the reserved `bond_order` edge type
+#   below marks where it attaches.
+
+format_version = 3
+
+[metadata]
+id = "chemistry.sdf"
+name = "SDF V3000 molecule"
+version = "1.0.0"
+description = "Reads one SDF/MOL V3000 connection table (Maestro/RDKit/Open Babel/PubChem export) as a molecular graph: one node per atom (element as type), one edge per bond, formal charges as cation/anion tags, atom properties as frontmatter. One molecule per input file."
+
+[limits]
+manifest_bytes = 131072
+grammar_bytes = 65536
+input_bytes = 134217728
+nodes = 200000
+edges = 500000
+
+[[schema.edge_types]]
+key = "bond_order"
+directed = false
+description = "Reserved for bond-order-aware edges (single/double/triple/aromatic). VaultEdge carries no kind yet; the order is parsed by the grammar and dropped, tracked in docs/molecular-force-layout.md."
+
+[parser]
+engine = "pest"
+root_rule = "document"
+grammar = '''
+document = { SOI ~ header_line{3} ~ counts_marker ~ ctab ~ "M  END" ~ NEWLINE* ~ EOI }
+
+// Three free-text header lines (title / program / comment), then the V3000
+// marker counts line.
+header_line = { (!NEWLINE ~ ANY)* ~ NEWLINE }
+counts_marker = { (!NEWLINE ~ ANY)* ~ NEWLINE }
+
+ctab = { "M  V30 BEGIN CTAB" ~ NEWLINE ~ counts ~ atom_block ~ bond_block
+       ~ "M  V30 END CTAB" ~ NEWLINE }
+counts = { "M  V30 COUNTS" ~ (!NEWLINE ~ ANY)* ~ NEWLINE }
+
+atom_block = { "M  V30 BEGIN ATOM" ~ NEWLINE ~ atom_line* ~ "M  V30 END ATOM" ~ NEWLINE }
+bond_block = { "M  V30 BEGIN BOND" ~ NEWLINE ~ bond_line* ~ "M  V30 END BOND" ~ NEWLINE }
+
+// M  V30 <idx> <el> <x> <y> <z> <aamap> [KEY=value]*
+// One atom = one node: index is the id, element the canvas type.
+atom_line = { "M  V30 " ~ atom_idx ~ " " ~ element ~ " " ~ coord ~ " " ~ coord
+            ~ " " ~ coord ~ " " ~ aamap ~ props? ~ NEWLINE }
+atom_idx = @{ '0'..'9'+ }
+element = @{ UPPERCASE ~ LOWERCASE? }
+coord = @{ "-"? ~ '0'..'9'+ ~ "." ~ '0'..'9'+ }
+aamap = @{ '0'..'9'+ }
+props = { (" " ~ prop)+ }
+prop = _{ chg_pos | chg_neg | property }
+
+// Formal charges become tags; every other KEY=value is frontmatter.
+chg_pos = @{ "CHG=1" | "CHG=2" | "CHG=3" }
+chg_neg = @{ "CHG=-1" | "CHG=-2" | "CHG=-3" }
+property = { key ~ "=" ~ value }
+key = @{ (UPPERCASE | "_")+ }
+value = @{ (!(" " | "\r" | "\n") ~ ANY)+ }
+
+// M  V30 <idx> <type> <a1> <a2> [CFG=… ENDPTS=…]
+// One bond = one edge; endpoints resolve by atom index.
+bond_line = { "M  V30 " ~ bond_idx ~ " " ~ bond_type ~ " " ~ src ~ " " ~ tgt
+            ~ bond_rest ~ NEWLINE }
+bond_idx = @{ '0'..'9'+ }
+bond_type = @{ '0'..'9'+ }
+src = @{ '0'..'9'+ }
+tgt = @{ '0'..'9'+ }
+bond_rest = { (!NEWLINE ~ ANY)* }
+
+// Roles an SDF connection table does not use. The capture contract requires
+// one distinct, non-silent rule per role; these match nothing in SDF input.
+title = { "@@title@@" }
+tag = { "@@tag@@" }
+'''
+
+[parser.captures]
+node = "atom_line"
+id = "atom_idx"
+title = "title"
+kind = "element"
+tag = "tag"
+property = "property"
+key = "key"
+value = "value"
+edge = "bond_line"
+source = "src"
+target = "tgt"
+
+# Static feature labels: CHG=<n> atom properties tag the atom as an ion.
+[parser.captures.tag_labels]
+chg_pos = "cation"
+chg_neg = "anion"
