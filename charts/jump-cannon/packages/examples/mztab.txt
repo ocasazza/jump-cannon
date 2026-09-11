@@ -1,0 +1,12 @@
+MTD	mzTab-version	1.0.0
+MTD	mzTab-mode	Summary
+COM	Silkworm cocoon proteomics, example slice
+PRH	accession	description	taxid	species	database	database_version	search_engine	best_search_engine_score[1]	num_psms
+PRT	P0DTC2	Spike glycoprotein	2697049	Severe acute respiratory syndrome coronavirus 2	SilkDB	sdb-2026	[MS, MS:1002492, DIA-NN, ]	0.99	42
+PRT	Q9U6Y8	Fibroin heavy chain	7091	Bombyx mori	SilkDB	sdb-2026	[MS, MS:1002492, DIA-NN, ]	0.97	37
+PEH	sequence	accession	unique	database	database_version	search_engine	best_search_engine_score[1]
+PEP	NVHYVSDGEAVAASSDAR	Q9U6Y8	1	SilkDB	sdb-2026	[MS, MS:1002492, DIA-NN, ]	0.98
+PEP	SAGSSTSGGSSTYGYSSR	Q9U6Y8	1	SilkDB	sdb-2026	[MS, MS:1002492, DIA-NN, ]	0.95
+PSH	sequence	PSM_ID	accession	unique	database	database_version	search_engine
+PSM	NVHYVSDGEAVAASSDAR	1	Q9U6Y8	1	SilkDB	sdb-2026	[MS, MS:1002492, DIA-NN, ]
+PSM	SAGSSTSGGSSTYGYSSR	2	Q9U6Y8	1	SilkDB	sdb-2026	[MS, MS:1002492, DIA-NN, ]

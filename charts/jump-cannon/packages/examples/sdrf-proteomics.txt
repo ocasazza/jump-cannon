@@ -1,0 +1,6 @@
+source name	characteristics[organism]	characteristics[organism part]	assay name	comment[instrument]	comment[data file]	comment[fraction identifier]
+Sapalli-C-1	Bombyx mori	cocoon	S1	Q Exactive	S1.raw	1
+Sapalli-C-2	Bombyx mori	cocoon	S2	Q Exactive	S2.raw	1
+Sapalli-C-3	Bombyx mori	cocoon	S3	Q Exactive	S3.raw	1
+Bombyx mori	Bombyx mori	cocoon	S4	Q Exactive	S4.raw	1
+Bombyx mandarina	Bombyx mandarina	cocoon	S5	Q Exactive	S5.raw	1

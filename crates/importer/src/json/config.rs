@@ -84,7 +84,8 @@ pub(crate) struct JsonParserToml {
 }
 
 /// One administrator-supplied value substituted into paths and queries as
-/// `{name}`. Values are validated as single URL path segments by the engine.
+/// `{name}`. The engine percent-encodes values on interpolation, so values
+/// may carry spaces, slashes, and query syntax (`publisher:Zenodo`).
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct VariableSpec {
@@ -148,7 +149,7 @@ pub struct Collection {
 }
 
 /// How a collection is paged.
-#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq, Default)]
 #[serde(tag = "style", rename_all = "snake_case")]
 pub enum Pagination {
     /// Single request; the endpoint returns everything it will return.
@@ -156,6 +157,25 @@ pub enum Pagination {
     None,
     /// `?limit=&offset=` walked until a short page.
     LimitOffset,
+    /// `?page=0&size=` walked until a short page, with configurable
+    /// parameter names: PRIDE uses `page`/`pageSize`, DataCite uses
+    /// `page[number]`/`page[size]`.
+    PageNumber(PageNumberParams),
+}
+
+/// Parameter names and origin for page-number pagination.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct PageNumberParams {
+    /// Query parameter carrying the page index (`page`, `page[number]`).
+    #[serde(default = "default_page_param")]
+    pub page_param: String,
+    /// Query parameter carrying the page size (`size`, `pageSize`).
+    #[serde(default = "default_size_param")]
+    pub size_param: String,
+    /// Index of the first page: 0 for PRIDE, 1 for DataCite.
+    #[serde(default)]
+    pub first_page: usize,
 }
 
 /// What a collection's documents become: graph nodes, or edges between nodes
@@ -325,6 +345,12 @@ pub enum Dedupe {
 fn default_items_pointer() -> String {
     "/items".to_string()
 }
+fn default_page_param() -> String {
+    "page".to_string()
+}
+fn default_size_param() -> String {
+    "size".to_string()
+}
 fn default_subject() -> String {
     "record".to_string()
 }
@@ -409,7 +435,7 @@ pub(crate) fn validate_config(
 
     if let Some(preflight) = &config.preflight {
         validate_template("preflight.path", &preflight.path, &variables)?;
-        validate_pointer("preflight.items_pointer", &preflight.items_pointer)?;
+        validate_items_pointer("preflight.items_pointer", &preflight.items_pointer)?;
         validate_pointer("preflight.id_pointer", &preflight.id_pointer)?;
         if !variables.contains(preflight.variable.as_str()) {
             return Err(invalid(format!(
@@ -425,7 +451,22 @@ pub(crate) fn validate_config(
         for (key, value) in &collection.query {
             validate_template(&format!("{name}.query.{key}"), value, &variables)?;
         }
-        validate_pointer(&format!("{name}.items_pointer"), &collection.items_pointer)?;
+        validate_items_pointer(&format!("{name}.items_pointer"), &collection.items_pointer)?;
+        if let Pagination::PageNumber(params) = &collection.paginate {
+            for (what, param) in [
+                ("page_param", params.page_param.as_str()),
+                ("size_param", params.size_param.as_str()),
+            ] {
+                let invalid_char = |c: char| {
+                    c.is_whitespace() || matches!(c, '=' | '&' | '?' | '#')
+                };
+                if param.is_empty() || param.chars().any(invalid_char) {
+                    return Err(invalid(format!(
+                        "{name}.paginate.{what} must be a query parameter name without whitespace or '=' '&' '?' '#', got {param:?}"
+                    )));
+                }
+            }
+        }
         if let Some(pointer) = &collection.total_pointer {
             validate_pointer(&format!("{name}.total_pointer"), pointer)?;
         }
@@ -546,13 +587,11 @@ pub(crate) fn resolve_variables(
                 ))
             })?;
         if value.is_empty()
-            || value.len() > 128
-            || value
-                .chars()
-                .any(|ch| ch.is_whitespace() || matches!(ch, '/' | '?' | '#' | '%' | '{' | '}'))
+            || value.len() > 512
+            || value.chars().any(|ch| ch.is_control() || matches!(ch, '{' | '}'))
         {
             return Err(invalid(format!(
-                "variable {:?} must be a URL path segment without whitespace, /, ?, #, %, or braces, got {value:?}",
+                "variable {:?} must be non-empty, at most 512 characters, and free of braces and control characters (values are percent-encoded when interpolated into URLs), got {value:?}",
                 variable.name
             )));
         }
@@ -625,6 +664,17 @@ fn validate_pointer(field: &str, pointer: &str) -> Result<(), ImportError> {
         )));
     }
     Ok(())
+}
+
+/// `items_pointer` variant: the empty string selects the whole response
+/// document, for APIs (PRIDE Archive WS, …) that return a bare JSON array
+/// at the root. `serde_json::Value::pointer("")` already resolves to the
+/// root, so this is a validation relaxation, not new traversal code.
+fn validate_items_pointer(field: &str, pointer: &str) -> Result<(), ImportError> {
+    if pointer.is_empty() {
+        return Ok(());
+    }
+    validate_pointer(field, pointer)
 }
 
 fn is_identifier(value: &str) -> bool {

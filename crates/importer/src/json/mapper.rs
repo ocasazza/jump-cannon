@@ -118,16 +118,20 @@ impl GraphMapper for ManifestMapper {
                     }
                 })?;
                 let local = format!("{}{raw_id}", rules.local_prefix);
-                if locals.contains_key(&local) && collection.paginate == Pagination::LimitOffset {
-                    // Offset pagination against a live-mutating remote list
-                    // (e.g. Hindsight's async LLM extraction continuing to
-                    // write while a page walk is in flight) can re-observe
-                    // the same record at a different offset when items
-                    // shift position between page fetches. That is the same
-                    // record by id, not a real collision -- the graph's
-                    // strict `try_add_node` hard-fail below stays in force
-                    // for `Pagination::None` collections, where a duplicate
-                    // id can only mean a genuine package/data bug.
+                let paginated = matches!(
+                    collection.paginate,
+                    Pagination::LimitOffset | Pagination::PageNumber(_)
+                );
+                if locals.contains_key(&local) && paginated {
+                    // Pagination against a live-mutating remote list
+                    // (Hindsight's async LLM extraction continuing to write
+                    // while a page walk is in flight; DataCite's search
+                    // ranking drifting between page fetches) can re-observe
+                    // the same record at a different page position. That is
+                    // the same record by id, not a real collision -- the
+                    // graph's strict `try_add_node` hard-fail below stays in
+                    // force for `Pagination::None` collections, where a
+                    // duplicate id can only mean a genuine package/data bug.
                     tracing::debug!(
                         collection = %collection.name,
                         id = %raw_id,
@@ -379,10 +383,9 @@ impl ManifestMapper {
     }
 }
 
-/// Read a pointer as a trimmed, non-empty string. Numbers and booleans render
-/// through their JSON form so an id may be numeric.
-fn pointer_str(document: &Value, pointer: &str) -> Option<String> {
-    let value = document.pointer(pointer)?;
+/// Render a scalar as a trimmed, non-empty string. Numbers and booleans
+/// render through their JSON form so an id may be numeric.
+fn value_str(value: &Value) -> Option<String> {
     let text = match value {
         Value::String(text) => text.trim().to_string(),
         Value::Number(number) => number.to_string(),
@@ -390,6 +393,11 @@ fn pointer_str(document: &Value, pointer: &str) -> Option<String> {
         _ => return None,
     };
     (!text.is_empty()).then_some(text)
+}
+
+/// Read a pointer as a scalar string (see [`value_str`]).
+fn pointer_str(document: &Value, pointer: &str) -> Option<String> {
+    value_str(document.pointer(pointer)?)
 }
 
 fn predicate_holds(predicate: Option<&Predicate>, document: &Value) -> bool {
@@ -492,11 +500,16 @@ fn field_value(rule: &FieldRule, document: &Value) -> Option<Value> {
     }
 }
 
-/// Values an edge rule references, after its transform.
+/// Values an edge rule references, after its transform. With no transform a
+/// pointer naming an array of scalars (e.g. PRIDE's `projectFileNames`)
+/// yields one value per element; a scalar pointer yields one value.
 fn rule_values(transform: Transform, document: &Value, pointer: &str) -> Vec<String> {
     match transform {
         Transform::SplitCsv => split_csv(document.pointer(pointer)),
-        Transform::None => pointer_str(document, pointer).into_iter().collect(),
+        Transform::None => match document.pointer(pointer) {
+            Some(Value::Array(items)) => items.iter().filter_map(value_str).collect(),
+            _ => pointer_str(document, pointer).into_iter().collect(),
+        },
     }
 }
 

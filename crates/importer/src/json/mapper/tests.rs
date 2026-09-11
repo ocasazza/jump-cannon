@@ -472,3 +472,152 @@ fn duplicate_node_id_in_non_paginated_collection_still_fails() {
         "unexpected error: {message}"
     );
 }
+
+/// PRIDE shape: an edge rule whose value_pointer names a JSON array of
+/// scalars (projectFileNames) with no transform must yield one edge per
+/// element, matched against the target collection's titles.
+const PACKAGE_ARRAY_EDGES: &str = r#"
+format_version = 3
+
+[metadata]
+id = "test.array-edges"
+name = "Array edges"
+version = "1.0.0"
+
+[[schema.edge_types]]
+key = "contains"
+directed = true
+
+[parser]
+engine = "json"
+
+[[parser.variables]]
+name = "accession"
+default = "PXD1"
+
+[[parser.collections]]
+name = "projects"
+path = "/search/projects"
+items_pointer = ""
+
+[parser.collections.nodes]
+id_pointer = "/accession"
+node_type = "project"
+
+[parser.collections.nodes.title]
+pointer = "/title"
+fallback_prefix = "project"
+
+[[parser.collections.nodes.edges]]
+kind = "contains"
+value_pointer = "/projectFileNames"
+target_collection = "files"
+match_on = "title"
+
+[[parser.collections]]
+name = "files"
+path = "/projects/{accession}/files"
+items_pointer = ""
+
+[parser.collections.nodes]
+id_pointer = "/accession"
+local_prefix = "file:"
+node_type = "file"
+
+[parser.collections.nodes.title]
+pointer = "/fileName"
+fallback_prefix = "file"
+"#;
+
+#[test]
+fn array_valued_edge_pointer_yields_one_edge_per_element() {
+    let package =
+        ValidatedPackage::from_toml_bytes(PACKAGE_ARRAY_EDGES.as_bytes()).expect("validates");
+    let mapper = ManifestMapper::new(
+        package,
+        Namespace::new(SOURCE_KIND, "omp").expect("namespace"),
+    );
+    let result = mapper
+        .map(vec![
+            record(
+                "projects",
+                json!([{"accession": "PXD1", "title": "A project",
+                        "projectFileNames": ["a.raw", "b.raw", "missing.raw"]}]),
+            ),
+            record(
+                "files",
+                json!([{"accession": "f1", "fileName": "a.raw"},
+                       {"accession": "f2", "fileName": "b.raw"}]),
+            ),
+        ])
+        .expect("mapping succeeds");
+    assert!(has_edge(&result, "PXD1", "file:f1"));
+    assert!(has_edge(&result, "PXD1", "file:f2"));
+    assert_eq!(result.graph.edge_count(), 2);
+    assert_eq!(
+        result.unresolved,
+        ["files \"missing.raw\" referenced by PXD1"],
+        "the one unmatched name must be reported unresolved"
+    );
+}
+
+#[test]
+fn root_array_items_pointer_maps_nodes() {
+    // Same package: both collections read bare arrays at the document root
+    // (`items_pointer = ""`).
+    let package =
+        ValidatedPackage::from_toml_bytes(PACKAGE_ARRAY_EDGES.as_bytes()).expect("validates");
+    let mapper = ManifestMapper::new(
+        package,
+        Namespace::new(SOURCE_KIND, "omp").expect("namespace"),
+    );
+    let result = mapper
+        .map(vec![
+            record("projects", json!([{"accession": "PXD1", "title": "A project",
+                                       "projectFileNames": []}])),
+            record("files", json!([{"accession": "f1", "fileName": "a.raw"}])),
+        ])
+        .expect("mapping succeeds");
+    assert_eq!(result.graph.node_count(), 2);
+    assert!(result.graph.nodes.contains_key(&node_id("PXD1")));
+    assert!(result.graph.nodes.contains_key(&node_id("file:f1")));
+}
+
+#[test]
+fn duplicate_node_id_from_page_number_recollection_is_tolerated() {
+    // DataCite's search ranking drifts between page fetches, so a
+    // page-number walk can re-observe the same DOI on a later page. The
+    // first occurrence must win without an error, exactly like the
+    // limit_offset re-observation case.
+    let package_src = PACKAGE_ARRAY_EDGES.replace(
+        "path = \"/projects/{accession}/files\"\nitems_pointer = \"\"",
+        "path = \"/projects/{accession}/files\"\npaginate = { style = \"page_number\" }\nitems_pointer = \"\"",
+    );
+    let package =
+        ValidatedPackage::from_toml_bytes(package_src.as_bytes()).expect("validates");
+    let mapper = ManifestMapper::new(
+        package,
+        Namespace::new(SOURCE_KIND, "omp").expect("namespace"),
+    );
+    let result = mapper
+        .map(vec![
+            record(
+                "projects",
+                json!([{"accession": "PXD1", "title": "A project",
+                        "projectFileNames": ["a.raw"]}]),
+            ),
+            record("files", json!([{"accession": "f1", "fileName": "a.raw"}])),
+            record(
+                "files",
+                json!([{"accession": "f1", "fileName": "a.raw, re-observed on a later page"}]),
+            ),
+        ])
+        .expect("duplicate from page-number walk is tolerated, not an error");
+    assert_eq!(result.graph.node_count(), 2);
+    let kept = result
+        .graph
+        .nodes
+        .get(&node_id("file:f1"))
+        .expect("f1 present");
+    assert_eq!(kept.meta.title, "a.raw", "the first occurrence must win");
+}

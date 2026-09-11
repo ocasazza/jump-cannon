@@ -1,0 +1,4 @@
+Sample Name	Protocol REF	Extract Name	Labeled Extract Name	Label	Term Source REF	MS Assay Name	Raw Spectral Data File	Derived Spectral Data File
+MTBLS1-S1	extraction	MTBLS1-S1-extract	MTBLS1-S1-le	C11	CHMO	pos-1	MTBLS1_POS_01.raw	MTBLS1_POS_01.mzML
+MTBLS1-S2	extraction	MTBLS1-S2-extract	MTBLS1-S2-le	C11	CHMO	pos-2	MTBLS1_POS_02.raw	MTBLS1_POS_02.mzML
+MTBLS1-S3	extraction	MTBLS1-S3-extract	MTBLS1-S3-le	C11	CHMO	pos-3	MTBLS1_POS_03.raw	MTBLS1_POS_03.mzML

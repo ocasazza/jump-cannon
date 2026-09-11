@@ -1,0 +1,92 @@
+# ISA-Tab assay table package (pest grammar).
+#
+# ISA-Tab (Investigation / Study / Assay) is the metadata trio MetaboLights,
+# ArrayExpress, and BioStudies assays publish. This package reads one assay
+# table (`a_*.txt`): each row becomes one raw-data node whose id is the
+# vendor raw file cell (found by content, not column position), whose type
+# is the file extension, and whose tags carry the row's `Sample Name` — the
+# tags facet groups raw files by sample. It is the metabolomics/NMR
+# counterpart of `proteomics.sdrf`, with the ISA-spec `Sample Name` first
+# column instead of SDRF's `source name`.
+#
+# Grammar notes (edit live in the Importers panel; no recompile):
+# - Vendor-raw extensions only. Open-format derived files (.mzML, .nmrML,
+#   .cdf, …) live in their own "Derived … Data File" column of the same row;
+#   the engine requires exactly one id per node, so they are parsed as plain
+#   cells here. A derived-file variant is one edited extension list away.
+# - A row with no recognized raw file fails loudly (`missing id capture`) —
+#   e.g. a reporting-assay table with no data files is not this package's
+#   input.
+# - The study table (`s_*.txt`, Source Name -> Sample Name chains) is a
+#   separate, simpler grammar variant; the assay table is the one carrying
+#   data files.
+
+format_version = 3
+
+[metadata]
+id = "isa.assay-table"
+name = "ISA-Tab assay table"
+version = "1.0.0"
+description = "Reads an ISA-Tab assay table (MetaboLights / ArrayExpress / BioStudies) as a graph of raw data files: one node per vendor raw file, extension as type, sample name as tag so the tags facet groups files by sample."
+
+[limits]
+manifest_bytes = 131072
+grammar_bytes = 65536
+input_bytes = 134217728
+nodes = 500000
+edges = 1000
+
+[[schema.edge_types]]
+key = "derived_from"
+directed = true
+description = "Reserved for raw-file -> sample edges. Row-level sample links would need duplicate-tolerant node capture the pest engine does not offer; samples are carried as tags instead."
+
+[parser]
+engine = "pest"
+root_rule = "document"
+grammar = '''
+document = { SOI ~ header ~ row* ~ NEWLINE* ~ EOI }
+
+// Header line: ISA-Tab assay tables start with "Sample Name" by spec.
+header = { "Sample Name" ~ (!("\r" | "\n") ~ ANY)* ~ NEWLINE }
+
+// One assay row = one raw-data node. `sample` (first cell) is a tag;
+// exactly one cell must be a recognized vendor raw file (the id).
+row = { sample ~ ("\t" ~ cell)* ~ NEWLINE? }
+sample = @{ (!("\t" | "\r" | "\n") ~ ANY)+ }
+cell = _{ data_file | plain_cell }
+plain_cell = @{ (!("\t" | "\r" | "\n") ~ ANY)+ }
+
+// A data-file cell: dot-separated segments whose final segment is a known
+// vendor-raw extension (MS: raw/wiff/d; NMR: fid/jdf/dx/Bruker dirs). The
+// guard keeps a middle segment that merely starts like an extension from
+// ending the match early.
+data_file = { head ~ "." ~ ext_kind }
+head = { name_seg ~ ("." ~ !(ext_kind ~ &cell_end) ~ name_seg)* }
+name_seg = @{ (!("." | "\t" | "\r" | "\n") ~ ANY)+ }
+ext_kind = @{ ("raw" | "RAW" | "wiff" | "WIFF" | "d" | "fid" | "FID" | "jdf" | "JDF" | "dx" | "DX" | "sld" | "SLD" | "bif" | "BIF" | "lcd" | "LCD" | "qgd" | "QGD") ~ (".gz")? }
+cell_end = { "\t" | "\r" | "\n" | EOI }
+
+// Roles ISA-Tab rows do not use. The capture contract requires one distinct,
+// non-silent rule per role; these match nothing in assay input.
+title = { "@@title@@" }
+property = { key ~ "=" ~ value }
+key = { "@@key@@" }
+value = { "@@value@@" }
+edge = { source ~ "@@->@@" ~ target }
+source = { "@@source@@" }
+target = { "@@target@@" }
+'''
+
+[parser.captures]
+node = "row"
+id = "data_file"
+title = "title"
+kind = "ext_kind"
+tag = "sample"
+property = "property"
+key = "key"
+value = "value"
+edge = "edge"
+source = "source"
+target = "target"

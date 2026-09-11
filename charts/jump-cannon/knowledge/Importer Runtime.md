@@ -16,6 +16,8 @@ Hindsight — is a declarative package under `charts/jump-cannon/packages/`
 bound to an instance at runtime via the `JUMP_CANNON_IMPORTER_*` env vars;
 Hindsight is the package `hindsight-memory-bank.toml`, not a source kind.
 See [[Hindsight Importer]] and AGENTS.md "Importers: packages, not crates".
+Scientific data formats (PRIDE, DataCite, SDRF, ISA-Tab, mzTab, FASTA,
+GFF3) are the same pattern; see [[Scientific Data Importers]].
 GitHub delivers a repository tarball over HTTP with ETag polling and reuses
 the Obsidian markdown pipeline; see [[GitHub Importer]]. OKF implements the
 official format version 0.2; its `0.2` version must not be called `0.0.2`.

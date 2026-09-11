@@ -1,0 +1,9 @@
+##gff-version 3
+#!gff-spec-version 1.21
+chr1	Ensembl	gene	1000	5000	.	+	.	ID=gene:ENSG000001;Name=BMS1;gene_name=BMS1;biotype=protein_coding
+chr1	Ensembl	mRNA	1000	5000	.	+	.	ID=transcript:ENST000001;Parent=gene:ENSG000001;Name=BMS1-201;gene_biotype=protein_coding
+chr1	Ensembl	exon	1000	1200	.	+	.	Parent=transcript:ENST000001
+chr1	Ensembl	CDS	1050	1180	.	+	0	ID=cds:ENSP000001;Parent=transcript:ENST000001;product=BMS1 ribosome biogenesis protein
+##FASTA
+>chr1
+ACGTACGT

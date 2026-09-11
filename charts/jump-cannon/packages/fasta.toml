@@ -1,0 +1,82 @@
+# FASTA sequence package (pest grammar).
+#
+# One FASTA record becomes one node: the record id is the accession (the
+# UniProt accession for `sp|`/`tr|` headers, otherwise the first header
+# token), the title is the free-text description, and the UniProt database
+# prefix (`sp` / `tr`) becomes the canvas type when present. Serves every
+# FASTA source — UniProt proteomes, NCBI RefSeq, ENA coding sequences, the
+# search databases attached to PRIDE submissions — because FASTA is the
+# format; the source is where the file lives.
+#
+# Grammar notes (edit live in the Importers panel; no recompile):
+# - `db_kind` recognizes the UniProt `sp`/`tr` prefix and makes it the node
+#   type; headers without it parse with no type.
+# - Duplicate record ids fail the import loudly (`DuplicateNodeId`) — that is
+#   a malformed database, not data to silently merge.
+# - The engine's capture contract requires one rule per role; roles FASTA
+#   does not use (edges, properties, tags) are declared but match nothing.
+
+format_version = 3
+
+[metadata]
+id = "seq.fasta"
+name = "FASTA sequences"
+version = "1.0.0"
+description = "Reads a FASTA file as a graph of sequence records: accession ids, description titles, UniProt sp/tr database type. Source-neutral: UniProt, RefSeq, ENA, or a PRIDE search database."
+
+[limits]
+manifest_bytes = 131072
+grammar_bytes = 65536
+input_bytes = 268435456
+nodes = 500000
+edges = 1000
+
+[[schema.edge_types]]
+key = "aligns_to"
+directed = true
+description = "Reserved for sequence-similarity edges (no FASTA construct produces them; the schema requires one declared edge type)."
+
+[parser]
+engine = "pest"
+root_rule = "document"
+grammar = '''
+document = { SOI ~ record* ~ EOI }
+
+// A record: header line plus wrapped sequence lines. A sequence line is any
+// non-">" line; both plain and empty (newline-only) forms keep the
+// repetition away from a zero-width match.
+record = { header ~ sequence_line* }
+sequence_line = { !">" ~ ((!("\r" | "\n") ~ ANY)+ ~ NEWLINE? | NEWLINE) }
+
+// Header: optional UniProt db prefix (becomes the node type), the accession
+// (the node id), any further pipe-separated entry names, and the free-text
+// description (the title).
+header = { ">" ~ (db_kind ~ "|")? ~ fasta_id ~ ("|" ~ entry_name)* ~ (" " ~ description)? ~ NEWLINE }
+db_kind = @{ "sp" | "tr" }
+fasta_id = @{ (!(" " | "|" | "\r" | "\n") ~ ANY)+ }
+entry_name = @{ (!(" " | "\r" | "\n") ~ ANY)+ }
+description = @{ (!("\r" | "\n") ~ ANY)+ }
+
+// Roles FASTA does not use. The capture contract requires one distinct,
+// non-silent rule per role; these match nothing in FASTA input.
+tag = { "@@tag@@" }
+property = { key ~ "=" ~ value }
+key = { "@@key@@" }
+value = { "@@value@@" }
+edge = { source ~ "@@->@@" ~ target }
+source = { "@@source@@" }
+target = { "@@target@@" }
+'''
+
+[parser.captures]
+node = "record"
+id = "fasta_id"
+title = "description"
+kind = "db_kind"
+tag = "tag"
+property = "property"
+key = "key"
+value = "value"
+edge = "edge"
+source = "source"
+target = "target"

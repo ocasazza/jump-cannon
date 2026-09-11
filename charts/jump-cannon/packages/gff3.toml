@@ -1,0 +1,132 @@
+# GFF3 genome annotation package (pest grammar).
+#
+# GFF3 is the nine-column, spec-fixed tabular genome annotation format
+# served by Ensembl, RefSeq/NCBI, GENCODE, and ENA-adjacent pipelines. Each
+# feature row carrying an `ID=` attribute becomes one node: the id is the
+# feature ID, the type is the third column (`gene`, `mRNA`, `exon`, `CDS`,
+# … — the canvas color-by-type facet), the title is the `Name=` attribute
+# when present, and `gene_name` / `biotype` / `gene_biotype` / `product`
+# attributes become searchable frontmatter properties.
+#
+# Grammar notes (edit live in the Importers panel; no recompile):
+# - Column order is fixed by the GFF3 specification (seqid, source, type,
+#   start, end, score, strand, phase, attributes) — not a layout assumption.
+# - `ID=` may appear anywhere in the attribute list; rows without one
+#   (comments, directives, `##FASTA` sequence blocks, ID-less features) are
+#   skipped silently — they carry no graph identity.
+# - `Parent=` attributes are parsed but not projected: the pest capture
+#   contract emits edges only from records that are not nodes, so
+#   parent/child hierarchy cannot become edges from the same row. The
+#   declared `part_of` edge type marks where a future engine release can
+#   attach it.
+# - Duplicate `ID=` values fail loudly (`DuplicateNodeId`) — GFF3 requires
+#   IDs unique within a file.
+
+format_version = 3
+
+[metadata]
+id = "genomics.gff3"
+name = "GFF3 genome annotation"
+version = "1.0.0"
+description = "Reads a GFF3 annotation file (Ensembl / RefSeq / GENCODE) as a graph of features: ID as node id, type column as canvas type, Name as title, gene_name/biotype/product as searchable properties."
+
+[limits]
+manifest_bytes = 131072
+grammar_bytes = 65536
+input_bytes = 268435456
+nodes = 1000000
+edges = 1000
+
+[[schema.fields]]
+key = "gene_name"
+field_type = "keyword"
+required = false
+searchable = true
+facetable = true
+boost = 2
+
+[[schema.fields]]
+key = "biotype"
+field_type = "keyword"
+required = false
+searchable = true
+facetable = true
+
+[[schema.fields]]
+key = "gene_biotype"
+field_type = "keyword"
+required = false
+searchable = true
+facetable = true
+
+[[schema.fields]]
+key = "product"
+field_type = "text"
+required = false
+searchable = true
+facetable = false
+
+[[schema.edge_types]]
+key = "part_of"
+directed = true
+description = "Reserved for feature -> parent-feature edges from Parent= attributes (needs node+edge dual projection the pest engine does not offer yet)."
+
+[parser]
+engine = "pest"
+root_rule = "document"
+grammar = '''
+document = { SOI ~ (feature | skipped)* ~ EOI }
+
+// A feature row: eight spec-fixed columns, then the attribute list, which
+// must contain ID= somewhere. pre/post attribute alternatives are
+// order-independent; Parent= and unknown attributes are consumed without
+// captures.
+feature = { seqid ~ "\t" ~ src ~ "\t" ~ feature_kind ~ "\t" ~ start ~ "\t" ~ stop ~ "\t" ~ score ~ "\t" ~ strand ~ "\t" ~ phase ~ "\t" ~ pre_attrs ~ id_attr ~ post_attrs ~ NEWLINE? }
+pre_attrs = { (any_attr ~ ";")* }
+post_attrs = { (";" ~ any_attr)* }
+any_attr = _{ name_attr | prop | parent_attr | other_attr }
+
+id_attr = { "ID=" ~ feature_id }
+name_attr = { "Name=" ~ feature_name }
+prop = { prop_key ~ "=" ~ prop_value }
+parent_attr = { "Parent=" ~ attr_body }
+other_attr = { !("ID=" | "Parent=" | "Name=" | "gene_name=" | "biotype=" | "gene_biotype=" | "product=") ~ attr_body }
+
+feature_id = @{ (!(";" | "\t" | "\r" | "\n") ~ ANY)+ }
+feature_name = @{ (!(";" | "\t" | "\r" | "\n") ~ ANY)+ }
+prop_key = @{ "gene_name" | "gene_biotype" | "biotype" | "product" }
+prop_value = @{ (!(";" | "\t" | "\r" | "\n") ~ ANY)+ }
+attr_body = _{ (!(";" | "\t" | "\r" | "\n") ~ ANY)+ }
+
+seqid = _{ (!("\t" | "\r" | "\n") ~ ANY)+ }
+src = _{ (!("\t" | "\r" | "\n") ~ ANY)+ }
+feature_kind = @{ (!("\t" | "\r" | "\n") ~ ANY)+ }
+start = _{ (!("\t" | "\r" | "\n") ~ ANY)+ }
+stop = _{ (!("\t" | "\r" | "\n") ~ ANY)+ }
+score = _{ (!("\t" | "\r" | "\n") ~ ANY)+ }
+strand = _{ (!("\t" | "\r" | "\n") ~ ANY)+ }
+phase = _{ (!("\t" | "\r" | "\n") ~ ANY)+ }
+
+// Comments, directives (##gff-version, ##FASTA blocks), and ID-less rows.
+skipped = { (!("\r" | "\n") ~ ANY)+ ~ NEWLINE? | NEWLINE }
+
+// Roles GFF3 rows do not use. The capture contract requires one distinct,
+// non-silent rule per role; these match nothing in GFF3 input.
+tag = { "@@tag@@" }
+edge = { source ~ "@@->@@" ~ target }
+source = { "@@source@@" }
+target = { "@@target@@" }
+'''
+
+[parser.captures]
+node = "feature"
+id = "feature_id"
+title = "feature_name"
+kind = "feature_kind"
+tag = "tag"
+property = "prop"
+key = "prop_key"
+value = "prop_value"
+edge = "edge"
+source = "source"
+target = "target"

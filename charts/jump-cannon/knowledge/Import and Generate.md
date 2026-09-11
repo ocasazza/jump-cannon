@@ -14,7 +14,9 @@ Kubernetes metadata, import an Open Knowledge Format v0.2 bundle, parse a
 trusted Pest package (importer package format 3), pull a GitHub repository tarball
 (see [[GitHub Importer]]), or bind an `httpjson` engine to one declarative
 TOML package under `charts/jump-cannon/packages/` (Hindsight ships as
-`hindsight-memory-bank.toml`; see [[Hindsight Importer]]). Every server
+`hindsight-memory-bank.toml`; see [[Hindsight Importer]]). Scientific
+formats (PRIDE, DataCite, SDRF, ISA-Tab, mzTab, FASTA, GFF3) ship the same
+way; see [[Scientific Data Importers]]. Every server
 importer publishes its search and facet keys through `GET /graph/schema`.
 
 Open the **Importers** panel to see the active importer and the sanitized

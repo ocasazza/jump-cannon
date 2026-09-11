@@ -211,8 +211,12 @@ fn instance(token: Option<&str>) -> InstanceConfig {
 
 fn build_connector(pkg: &str, transport: Box<dyn JsonTransport>) -> HttpJsonConnector {
     let package = package(pkg);
+    // No overrides: every fixture package declares its variables with
+    // defaults (`bank = "omp"`, `accession = "PXD000001"`, …), so an empty
+    // binding resolves to the same values and stays valid for packages
+    // that declare no `bank` at all.
     let variables = package
-        .resolve_variables(&BTreeMap::from([("bank".to_string(), "omp".to_string())]))
+        .resolve_variables(&BTreeMap::new())
         .expect("variables resolve");
     HttpJsonConnector::new(package, instance(None), variables, transport).expect("connector builds")
 }
@@ -749,7 +753,247 @@ fn unresolved_placeholder_is_a_programming_error() {
     );
 }
 
+
+/// Free-text variables (DataCite queries, organism names) are
+/// percent-encoded when interpolated, so spaces, slashes, and colons reach
+/// the wire encoded while the package's own URL structure stays literal.
+const PACKAGE_FREETEXT_QUERY: &str = r#"
+format_version = 3
+
+[metadata]
+id = "test.freetext-query"
+name = "Free text query"
+version = "1.0.0"
+
+[limits]
+nodes = 50
+
+[[schema.edge_types]]
+key = "contains"
+directed = true
+
+[parser]
+engine = "json"
+
+[[parser.variables]]
+name = "query"
+default = "10.1126/sciadv.aec8738"
+
+[[parser.collections]]
+name = "dois"
+path = "/dois"
+query = { query = "{query}", publisher = "Zenodo" }
+
+[parser.collections.nodes]
+id_pointer = "/id"
+node_type = "work"
+
+[parser.collections.nodes.title]
+pointer = "/id"
+fallback_prefix = "doi"
+"#;
+
+#[test]
+fn variable_values_are_percent_encoded_on_interpolation() {
+    let transport = FixtureTransport::new(BTreeMap::from([(
+        format!("{ROOT}/dois?publisher=Zenodo&query=10.1126%2Fsciadv.aec8738"),
+        ok_response(&body(serde_json::json!({ "items": [] }))),
+    )]));
+    let connector = build_connector(PACKAGE_FREETEXT_QUERY, Box::new(transport.clone()));
+
+    run(connector.read()).expect("read succeeds");
+    assert_eq!(
+        transport.requests(),
+        vec![format!("{ROOT}/dois?publisher=Zenodo&query=10.1126%2Fsciadv.aec8738")],
+        "slash in the variable value must be encoded; the static query must not"
+    );
+}
 #[test]
 fn user_agent_constant_is_what_we_send() {
     assert_eq!(super::USER_AGENT, "jump-cannon-http-json-importer");
+}
+
+/// PRIDE-style package: page-number pagination with `page`/`pageSize`
+/// against a response that is a bare JSON array at the root
+/// (`items_pointer = ""`).
+const PACKAGE_PAGE_NUMBER: &str = r#"
+format_version = 3
+
+[metadata]
+id = "test.page-number"
+name = "Page number"
+version = "1.0.0"
+
+[limits]
+nodes = 50
+
+[[schema.edge_types]]
+key = "contains"
+directed = true
+
+[parser]
+engine = "json"
+page_size = 2
+
+[[parser.variables]]
+name = "accession"
+default = "PXD000001"
+
+[[parser.collections]]
+name = "files"
+path = "/projects/{accession}/files"
+query = { state = "public" }
+paginate = { style = "page_number", page_param = "page", size_param = "pageSize" }
+items_pointer = ""
+
+[parser.collections.nodes]
+id_pointer = "/accession"
+node_type = "file"
+
+[parser.collections.nodes.title]
+pointer = "/fileName"
+fallback_prefix = "file"
+"#;
+
+#[test]
+fn page_number_walks_to_exhaustion_with_custom_param_names() {
+    let transport = FixtureTransport::new(BTreeMap::from([
+        (
+            format!("{ROOT}/projects/PXD000001/files?state=public&page=0&pageSize=2"),
+            ok_response(&body(serde_json::json!([
+                { "accession": "f1", "fileName": "a.raw" },
+                { "accession": "f2", "fileName": "b.raw" },
+            ]))),
+        ),
+        (
+            format!("{ROOT}/projects/PXD000001/files?state=public&page=1&pageSize=2"),
+            ok_response(&body(serde_json::json!([
+                { "accession": "f3", "fileName": "c.raw" },
+                { "accession": "f4", "fileName": "d.raw" },
+            ]))),
+        ),
+        (
+            format!("{ROOT}/projects/PXD000001/files?state=public&page=2&pageSize=2"),
+            ok_response(&body(serde_json::json!([
+                { "accession": "f5", "fileName": "e.raw" },
+            ]))),
+        ),
+    ]));
+    let connector = build_connector(PACKAGE_PAGE_NUMBER, Box::new(transport.clone()));
+
+    let records = run(connector.read()).expect("read succeeds");
+    assert_eq!(records.len(), 3, "expected 3 pages");
+    assert_eq!(
+        transport.requests(),
+        vec![
+            format!("{ROOT}/projects/PXD000001/files?state=public&page=0&pageSize=2"),
+            format!("{ROOT}/projects/PXD000001/files?state=public&page=1&pageSize=2"),
+            format!("{ROOT}/projects/PXD000001/files?state=public&page=2&pageSize=2"),
+        ],
+        "static query must join with `&`, page index starts at 0"
+    );
+    for record in &records {
+        assert_eq!(record.metadata["collection"].as_str(), Some("files"));
+    }
+}
+
+/// DataCite-style variant: `page[number]`/`page[size]` with a 1-based
+/// `first_page`.
+const PACKAGE_PAGE_NUMBER_FIRST_PAGE: &str = r#"
+format_version = 3
+
+[metadata]
+id = "test.page-number-first"
+name = "Page number first page"
+version = "1.0.0"
+
+[limits]
+nodes = 50
+
+[[schema.edge_types]]
+key = "cites"
+directed = true
+
+[parser]
+engine = "json"
+page_size = 2
+
+[[parser.collections]]
+name = "dois"
+path = "/dois"
+paginate = { style = "page_number", page_param = "page[number]", size_param = "page[size]", first_page = 1 }
+items_pointer = "/data"
+
+[parser.collections.nodes]
+id_pointer = "/id"
+node_type = "doi"
+
+[parser.collections.nodes.title]
+pointer = "/id"
+fallback_prefix = "doi"
+"#;
+
+#[test]
+fn page_number_honors_first_page_and_bracketed_param_names() {
+    let transport = FixtureTransport::new(BTreeMap::from([
+        (
+            format!("{ROOT}/dois?page[number]=1&page[size]=2"),
+            ok_response(&body(serde_json::json!({ "data": [{ "id": "a" }, { "id": "b" }] }))),
+        ),
+        (
+            format!("{ROOT}/dois?page[number]=2&page[size]=2"),
+            ok_response(&body(serde_json::json!({ "data": [{ "id": "c" }] }))),
+        ),
+    ]));
+    let connector = build_connector(PACKAGE_PAGE_NUMBER_FIRST_PAGE, Box::new(transport.clone()));
+
+    let records = run(connector.read()).expect("read succeeds");
+    assert_eq!(records.len(), 2);
+    assert_eq!(
+        transport.requests(),
+        vec![
+            format!("{ROOT}/dois?page[number]=1&page[size]=2"),
+            format!("{ROOT}/dois?page[number]=2&page[size]=2"),
+        ],
+    );
+}
+
+#[test]
+fn page_number_record_bound_failure_names_collection_and_bound() {
+    let package_src = PACKAGE_PAGE_NUMBER
+        .replace("nodes = 50", "nodes = 2")
+        .replace("page_size = 2", "page_size = 1");
+    let transport = FixtureTransport::new(BTreeMap::from([
+        (
+            format!("{ROOT}/projects/PXD000001/files?state=public&page=0&pageSize=1"),
+            ok_response(&body(serde_json::json!([{ "accession": "f1" }]))),
+        ),
+        (
+            format!("{ROOT}/projects/PXD000001/files?state=public&page=1&pageSize=1"),
+            ok_response(&body(serde_json::json!([{ "accession": "f2" }]))),
+        ),
+        (
+            format!("{ROOT}/projects/PXD000001/files?state=public&page=2&pageSize=1"),
+            ok_response(&body(serde_json::json!([{ "accession": "f3" }]))),
+        ),
+    ]));
+    let connector = build_connector(&package_src, Box::new(transport));
+
+    let error = run(connector.read()).expect_err("bound must fail");
+    let message = match error {
+        ImportError::SourceRead { message, .. } => message,
+        other => panic!("expected SourceRead, got {other:?}"),
+    };
+    assert!(message.contains("collection files"), "{message}");
+    assert!(message.contains("2 record bound"), "{message}");
+    assert!(message.contains("still returned full pages"), "{message}");
+}
+
+#[test]
+fn page_number_rejects_unsafe_param_names() {
+    let bad = PACKAGE_PAGE_NUMBER
+        .replace("size_param = \"pageSize\"", "size_param = \"pageSize&admin\"");
+    let error = crate::ValidatedPackage::from_toml(&bad).expect_err("must reject");
+    let message = error.to_string();
+    assert!(message.contains("size_param"), "{message}");
 }

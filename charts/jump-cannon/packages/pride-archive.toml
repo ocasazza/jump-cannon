@@ -1,0 +1,382 @@
+# PRIDE Archive project package (ProteomeXchange consortium).
+#
+# Bound to the PRIDE Archive REST API v2 by `instances.selected` (or the
+# `httpJsonImporter` values): one accession becomes a graph of the project
+# plus every file it publishes, with project -> file `contains` edges. The
+# json engine of `crates/importer` does the I/O, decoding, and ID
+# namespacing; this file declares what one PRIDE project looks like. No new
+# `SourceKind` variant, no new crate: AGENTS.md, "Importers: packages, not
+# crates".
+#
+# Verified against the live API (2026-09, accession PXD084037):
+#   GET /search/projects?keyword=…&page=0&pageSize=100  -> [ {project}, … ]
+#   GET /projects/{accession}/files?page=0&pageSize=100 -> [ {file}, … ]
+# Both collections are bare JSON arrays at the document root
+# (`items_pointer = ""`); files paginate by `page`/`pageSize`
+# (`paginate.style = "page_number"`). The search response shape carries
+# instruments/organisms/softwares as plain string lists, which is why the
+# project node comes from /search/projects and not /projects/{accession}
+# (whose CvParam object lists would need a pluck transform).
+#
+# User-supplied options (bound at instance time, e.g.
+# `--importer-var accession=PXD084037` / `JUMP_CANNON_IMPORTER_VAR`):
+#   accession   PRIDE/ProteomeXchange accession. Required. Also the
+#               preflight subject: a mistyped accession fails the import
+#               loudly with the projects the keyword search did find.
+
+format_version = 3
+
+[metadata]
+id = "pride.archive-project"
+name = "PRIDE Archive project"
+version = "1.0.0"
+description = "Reads one PRIDE Archive (ProteomeXchange) accession as a graph: the project record with organism/instrument/software/experiment-type facets, every published file with category and size, and project->file contains edges. Serves PRIDE and, through the same API, ProteomeXchange-member accessions."
+
+# -----------------------------------------------------------------------------
+# Limits
+# -----------------------------------------------------------------------------
+# 25000 nodes covers the largest PRIDE submissions (a project with more files
+# fails the import loudly rather than truncating). `input_bytes` bounds one
+# response body (64 MiB).
+
+[limits]
+nodes = 25000
+input_bytes = 67108864
+
+# =============================================================================
+# Discovery schema (package-declared fields and edge types)
+# =============================================================================
+
+[[schema.fields]]
+key = "description"
+field_type = "text"
+required = false
+searchable = true
+facetable = false
+snippet = true
+boost = 4
+
+[[schema.fields]]
+key = "sample_processing_protocol"
+field_type = "text"
+required = false
+searchable = true
+facetable = false
+
+[[schema.fields]]
+key = "data_processing_protocol"
+field_type = "text"
+required = false
+searchable = true
+facetable = false
+
+[[schema.fields]]
+key = "organisms"
+field_type = "keyword_list"
+required = false
+searchable = true
+facetable = true
+boost = 2
+
+[[schema.fields]]
+key = "instruments"
+field_type = "keyword_list"
+required = false
+searchable = true
+facetable = true
+boost = 2
+
+[[schema.fields]]
+key = "softwares"
+field_type = "keyword_list"
+required = false
+searchable = true
+facetable = true
+
+[[schema.fields]]
+key = "experiment_types"
+field_type = "keyword_list"
+required = false
+searchable = true
+facetable = true
+
+[[schema.fields]]
+key = "quantification_methods"
+field_type = "keyword_list"
+required = false
+searchable = true
+facetable = true
+
+[[schema.fields]]
+key = "diseases"
+field_type = "keyword_list"
+required = false
+searchable = true
+facetable = true
+
+[[schema.fields]]
+key = "keywords"
+field_type = "keyword_list"
+required = false
+searchable = true
+facetable = true
+
+[[schema.fields]]
+key = "submitters"
+field_type = "keyword_list"
+required = false
+searchable = true
+facetable = true
+
+[[schema.fields]]
+key = "lab_pis"
+field_type = "keyword_list"
+required = false
+searchable = true
+facetable = true
+
+[[schema.fields]]
+key = "affiliations"
+field_type = "keyword_list"
+required = false
+searchable = true
+facetable = true
+
+[[schema.fields]]
+key = "references"
+field_type = "keyword_list"
+required = false
+searchable = true
+facetable = false
+
+[[schema.fields]]
+key = "submission_type"
+field_type = "keyword"
+required = false
+searchable = true
+facetable = true
+
+[[schema.fields]]
+key = "publication_date"
+field_type = "date"
+required = false
+searchable = true
+facetable = true
+
+[[schema.fields]]
+key = "file_category"
+field_type = "keyword"
+required = false
+searchable = true
+facetable = true
+boost = 2
+
+[[schema.fields]]
+key = "file_size_bytes"
+field_type = "number"
+required = false
+searchable = true
+facetable = true
+
+[[schema.fields]]
+key = "total_downloads"
+field_type = "number"
+required = false
+searchable = true
+facetable = true
+
+[[schema.fields]]
+key = "ftp_location"
+field_type = "url"
+required = false
+searchable = false
+facetable = false
+
+[[schema.edge_types]]
+key = "contains"
+directed = true
+description = "Project -> published file (matched on the file's name)."
+
+# =============================================================================
+# Engine: paged JSON over HTTP
+# =============================================================================
+# `page_size = 100` matches PRIDE's server-side page-size cap: asking for more
+# would make every page look short and stop the walk early (silent
+# truncation). Page-number pagination walks `page`/`pageSize` until a short
+# page; the `nodes` bound turns an over-bound project into a loud failure.
+
+[parser]
+engine = "json"
+page_size = 100
+request_timeout_seconds = 60
+
+# -----------------------------------------------------------------------------
+# Variables (bound by an administrator at instance time, never baked in)
+# -----------------------------------------------------------------------------
+
+[[parser.variables]]
+name = "accession"
+description = "PRIDE / ProteomeXchange accession to import, e.g. PXD084037. Must appear in the keyword-search preflight; a mistyped accession fails the import loudly with the projects that do match."
+
+# -----------------------------------------------------------------------------
+# Preflight (existence check on the bound accession)
+# -----------------------------------------------------------------------------
+
+[parser.preflight]
+path = "/search/projects?keyword={accession}&page=0&pageSize=100"
+items_pointer = ""
+id_pointer = "/accession"
+variable = "accession"
+subject = "project"
+
+# =============================================================================
+# Collections
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# projects: the search-shaped project record. The search endpoint with the
+# accession as keyword returns the exact accession match; its shape carries
+# instruments/organisms/softwares as plain string lists (facetable keyword
+# lists) where the detail endpoint nests CvParam objects.
+# -----------------------------------------------------------------------------
+
+[[parser.collections]]
+name = "projects"
+path = "/search/projects"
+query = { keyword = "{accession}", page = "0", pageSize = "100" }
+items_pointer = ""
+
+[parser.collections.nodes]
+id_pointer = "/accession"
+node_type = "project"
+tags_pointer = "/keywords"
+
+[parser.collections.nodes.doctype]
+pointer = "/submissionType"
+map = { COMPLETE = "Complete submission", PARTIAL = "Partial submission", SUPPORTED = "Supported submission" }
+
+[parser.collections.nodes.title]
+pointer = "/title"
+fallback_prefix = "project"
+
+[[parser.collections.nodes.fields]]
+key = "description"
+pointer = "/projectDescription"
+
+[[parser.collections.nodes.fields]]
+key = "sample_processing_protocol"
+pointer = "/sampleProcessingProtocol"
+
+[[parser.collections.nodes.fields]]
+key = "data_processing_protocol"
+pointer = "/dataProcessingProtocol"
+
+[[parser.collections.nodes.fields]]
+key = "organisms"
+pointer = "/organisms"
+
+[[parser.collections.nodes.fields]]
+key = "instruments"
+pointer = "/instruments"
+
+[[parser.collections.nodes.fields]]
+key = "softwares"
+pointer = "/softwares"
+
+[[parser.collections.nodes.fields]]
+key = "experiment_types"
+pointer = "/experimentTypes"
+
+[[parser.collections.nodes.fields]]
+key = "quantification_methods"
+pointer = "/quantificationMethods"
+
+[[parser.collections.nodes.fields]]
+key = "diseases"
+pointer = "/diseases"
+
+[[parser.collections.nodes.fields]]
+key = "keywords"
+pointer = "/keywords"
+
+[[parser.collections.nodes.fields]]
+key = "submitters"
+pointer = "/submitters"
+
+[[parser.collections.nodes.fields]]
+key = "lab_pis"
+pointer = "/labPIs"
+
+[[parser.collections.nodes.fields]]
+key = "affiliations"
+pointer = "/affiliations"
+
+[[parser.collections.nodes.fields]]
+key = "references"
+pointer = "/references"
+
+[[parser.collections.nodes.fields]]
+key = "submission_type"
+pointer = "/submissionType"
+
+[[parser.collections.nodes.fields]]
+key = "publication_date"
+pointer = "/publicationDate"
+
+# contains: project -> each file named in /projectFileNames, matched against
+# the file node's title (its fileName). Files the API lists but the project
+# record does not name simply produce no edge; names with no file record are
+# dropped by the engine's dangling-edge rule.
+[[parser.collections.nodes.edges]]
+kind = "contains"
+value_pointer = "/projectFileNames"
+target_collection = "files"
+match_on = "title"
+
+# -----------------------------------------------------------------------------
+# files: every file the project publishes. Bare-array root, page-number
+# pagination. `fileCategory.value` is the PRIDE file-class vocabulary
+# (RAW / PEAK / RESULT / SEARCH / OTHER); it drives both the facet and the
+# canvas type so color-by-type separates raw data from results.
+# -----------------------------------------------------------------------------
+
+[[parser.collections]]
+name = "files"
+path = "/projects/{accession}/files"
+paginate = { style = "page_number", page_param = "page", size_param = "pageSize" }
+items_pointer = ""
+
+[parser.collections.nodes]
+id_pointer = "/accession"
+local_prefix = "file:"
+node_type = "file"
+
+[parser.collections.nodes.doctype]
+pointer = "/fileCategory/value"
+map = { RAW = "Raw data", PEAK = "Peak list", RESULT = "Result", SEARCH = "Search engine output", OTHER = "Other" }
+
+[parser.collections.nodes.title]
+pointer = "/fileName"
+fallback_prefix = "file"
+
+[[parser.collections.nodes.fields]]
+key = "file_category"
+pointer = "/fileCategory/value"
+
+[[parser.collections.nodes.fields]]
+key = "file_size_bytes"
+pointer = "/fileSizeBytes"
+
+[[parser.collections.nodes.fields]]
+key = "publication_date"
+pointer = "/publicationDate"
+
+[[parser.collections.nodes.fields]]
+key = "total_downloads"
+pointer = "/totalDownloads"
+
+# The first public location is the FTP mirror; Aspera follows it. Index 0 is
+# what the API serves today (verified 2026-09 on PXD084037).
+[[parser.collections.nodes.fields]]
+key = "ftp_location"
+pointer = "/publicFileLocations/0/value"

@@ -284,11 +284,29 @@ impl HttpJsonConnector {
                     self.variables.keys().cloned().collect::<Vec<_>>().join(", ")
                 ),
             })?;
-            out.push_str(value);
+            out.push_str(&Self::encode_value(value));
             rest = &after[end + 1..];
         }
         out.push_str(rest);
         Ok(out)
+    }
+
+    /// Percent-encode one resolved variable value for URL interpolation
+    /// (RFC 3986 unreserved characters pass through; everything else —
+    /// spaces, slashes, query syntax — is encoded). Static template text is
+    /// never encoded: paths and query separators (`/ ? & =`) there are the
+    /// package author's own URL structure.
+    fn encode_value(value: &str) -> String {
+        let mut out = String::with_capacity(value.len());
+        for byte in value.bytes() {
+            match byte {
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                    out.push(byte as char)
+                }
+                _ => out.push_str(&format!("%{byte:02X}")),
+            }
+        }
+        out
     }
 
     /// Render the static query portion of a collection (its declared
@@ -312,6 +330,26 @@ impl HttpJsonConnector {
             format!("limit={page_size}&offset={offset}")
         } else {
             format!("{query}&limit={page_size}&offset={offset}")
+        }
+    }
+
+    /// Page-number variant of [`Self::pagination_query`], for APIs paged by
+    /// `{page_param}={index}&{size_param}={page_size}` (PRIDE's
+    /// `page`/`pageSize`, DataCite's `page[number]`/`page[size]`).
+    fn page_number_query(
+        query: &str,
+        params: &super::config::PageNumberParams,
+        page_size: usize,
+        page: usize,
+    ) -> String {
+        let paging = format!(
+            "{}={}&{}={}",
+            params.page_param, page, params.size_param, page_size
+        );
+        if query.is_empty() {
+            paging
+        } else {
+            format!("{query}&{paging}")
         }
     }
 
@@ -401,11 +439,17 @@ impl HttpJsonConnector {
                     ),
                 });
             }
-            let query = match collection.paginate {
+            let query = match &collection.paginate {
                 super::config::Pagination::None => static_query.clone(),
                 super::config::Pagination::LimitOffset => {
                     Self::pagination_query(&static_query, page_size, offset)
                 }
+                super::config::Pagination::PageNumber(params) => Self::page_number_query(
+                    &static_query,
+                    params,
+                    page_size,
+                    params.first_page + page_index,
+                ),
             };
             let url = self.collection_url(collection, &query)?;
             let bytes = self.transport.get(&url).await?;
@@ -464,9 +508,10 @@ impl HttpJsonConnector {
             });
             accumulated += page_len;
             page_index += 1;
-            match collection.paginate {
+            match &collection.paginate {
                 super::config::Pagination::None => break,
-                super::config::Pagination::LimitOffset => {
+                super::config::Pagination::LimitOffset
+                | super::config::Pagination::PageNumber(_) => {
                     if page_len < page_size {
                         break;
                     }

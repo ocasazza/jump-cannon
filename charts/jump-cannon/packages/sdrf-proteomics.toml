@@ -1,0 +1,90 @@
+# SDRF-Proteomics package (pest grammar).
+#
+# SDRF (Sample and Data Relationship Format) is the TSV ProteomeXchange
+# members (PRIDE, MassIVE) publish to describe which sample produced which
+# raw MS file. Each data row becomes one MS-run node: the vendor raw data
+# file cell is the node id (unique per row by design; the title falls back
+# to it), the file extension is the canvas type (raw / wiff / d / …), and
+# the row's `source name` cell is a tag — so the built-in tags facet groups
+# runs by sample.
+#
+# Grammar notes (edit live in the Importers panel; no recompile):
+# - Column-order independent: the data-file cell is found by *content*
+#   (a cell ending in a known vendor-raw extension), not by column position,
+#   so characteristic/comment columns may appear in any order.
+# - The extension vocabulary covers vendor raw formats. Open-format cells
+#   (.mzML, .mzXML, …) are deliberately NOT ids here: in SDRF and ISA-Tab
+#   exports a row can carry both a raw and a derived file column, and the
+#   engine requires exactly one id per node.
+# - A row with no recognized data-file cell fails the import loudly
+#   (`missing id capture`); a row naming the same file twice fails with
+#   `DuplicateNodeId`. Both mean the file is not SDRF-Proteomics-shaped.
+
+format_version = 3
+
+[metadata]
+id = "proteomics.sdrf"
+name = "SDRF-Proteomics sample-to-file"
+version = "1.0.0"
+description = "Reads an SDRF-Proteomics TSV (PRIDE / ProteomeXchange / quantms) as a graph of MS runs: one node per raw data file, extension as type, sample name as tag so the tags facet groups runs by sample."
+
+[limits]
+manifest_bytes = 131072
+grammar_bytes = 65536
+input_bytes = 134217728
+nodes = 500000
+edges = 1000
+
+[[schema.edge_types]]
+key = "derived_from"
+directed = true
+description = "Reserved for file -> sample edges. Row-level sample-to-file links would need duplicate-tolerant node capture the pest engine does not offer; samples are carried as tags instead."
+
+[parser]
+engine = "pest"
+root_rule = "document"
+grammar = '''
+document = { SOI ~ header ~ row* ~ NEWLINE* ~ EOI }
+
+// Header line: starts with the canonical first column name, rest ignored.
+header = { ("source name" | "Source Name") ~ (!("\r" | "\n") ~ ANY)* ~ NEWLINE }
+
+// One data row = one MS-run node. `source_name` (first cell, the sample) is
+// a tag; exactly one cell must be a recognized raw data file (the id).
+row = { source_name ~ ("\t" ~ cell)* ~ NEWLINE? }
+source_name = @{ (!("\t" | "\r" | "\n") ~ ANY)+ }
+cell = _{ data_file | plain_cell }
+plain_cell = @{ (!("\t" | "\r" | "\n") ~ ANY)+ }
+
+// A data-file cell: dot-separated segments whose final segment is a known
+// vendor-raw extension. The guard keeps a middle segment that merely starts
+// like an extension ("file.rawscreen") from ending the match early.
+data_file = { head ~ "." ~ ext_kind }
+head = { name_seg ~ ("." ~ !(ext_kind ~ &cell_end) ~ name_seg)* }
+name_seg = @{ (!("." | "\t" | "\r" | "\n") ~ ANY)+ }
+ext_kind = @{ ("raw" | "RAW" | "wiff" | "WIFF" | "d" | "fid" | "FID" | "jdf" | "JDF" | "sld" | "SLD" | "bif" | "BIF" | "lcd" | "LCD") ~ (".gz")? }
+cell_end = { "\t" | "\r" | "\n" | EOI }
+
+// Roles SDRF rows do not use. The capture contract requires one distinct,
+// non-silent rule per role; these match nothing in SDRF input.
+title = { "@@title@@" }
+property = { key ~ "=" ~ value }
+key = { "@@key@@" }
+value = { "@@value@@" }
+edge = { source ~ "@@->@@" ~ target }
+source = { "@@source@@" }
+target = { "@@target@@" }
+'''
+
+[parser.captures]
+node = "row"
+id = "data_file"
+title = "title"
+kind = "ext_kind"
+tag = "source_name"
+property = "property"
+key = "key"
+value = "value"
+edge = "edge"
+source = "source"
+target = "target"

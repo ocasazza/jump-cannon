@@ -1,0 +1,131 @@
+# DataCite DOI metadata package.
+#
+# Reads the DataCite REST API as a graph of DOI-registered works — datasets,
+# texts, software — with publisher, resource-type, and year facets. One
+# package serves every DataCite member repository (Zenodo, Dryad, Figshare,
+# PANGAEA, EBI's own BioStudies DOIs, …) because they all register through
+# the same metadata store: the repository is chosen by the query, not by
+# code. Bind with e.g.
+#   --importer-endpoint https://api.datacite.org
+#   --importer-var 'query=publisher:Zenodo AND silkworm'   (verified live,
+#   683 works, 2026-09; spaces and colons are percent-encoded on the wire)
+#   --importer-var 'query=Bombyx mori'
+# Note DataCite indexes dataset/DOI-registration metadata, not journal
+# articles — those live in Crossref, so an article DOI (10.1126/…) finds
+# nothing here. PRIDE dataset DOIs, once minted, register as 10.6019/PXD….
+#
+# Verified API shape (2026-09):
+#   GET /dois?query=…&page[number]=1&page[size]=100
+#     -> { "data": [ { "id", "attributes": { … } } ], "meta": { "total": N } }
+# Page-number pagination is 1-based (`first_page = 1`) with bracketed
+# parameter names; `/meta/total` bounds the walk loudly.
+
+format_version = 3
+
+[metadata]
+id = "datacite.dois"
+name = "DataCite DOI registry"
+version = "1.0.0"
+description = "Reads one DataCite REST query as a graph of DOI-registered works with publisher, resource-type, and publication-year facets. Serves every DataCite member repository (Zenodo, Dryad, Figshare, PANGAEA, …) through one package; the repository is a query choice, not code."
+
+[limits]
+# DataCite caps deep page-number walks; /meta/total is checked against this
+# bound before the first page is read, so an over-broad query fails loudly.
+nodes = 5000
+input_bytes = 67108864
+
+[[schema.fields]]
+key = "doi"
+field_type = "keyword"
+required = false
+searchable = true
+facetable = false
+boost = 2
+
+[[schema.fields]]
+key = "publisher"
+field_type = "keyword"
+required = false
+searchable = true
+facetable = true
+boost = 2
+
+[[schema.fields]]
+key = "publication_year"
+field_type = "number"
+required = false
+searchable = true
+facetable = true
+
+[[schema.fields]]
+key = "resource_type"
+field_type = "keyword"
+required = false
+searchable = true
+facetable = true
+boost = 2
+
+[[schema.fields]]
+key = "url"
+field_type = "url"
+required = false
+searchable = false
+facetable = false
+
+# Reserved: DataCite relatedIdentifiers carry citation/derived-from links,
+# but they are arrays of objects — producing these edges needs a pluck
+# transform the json engine does not have yet. The discovery schema requires
+# at least one declared edge type.
+[[schema.edge_types]]
+key = "cites"
+directed = true
+description = "Reserved for DOI -> DOI citation edges from relatedIdentifiers (needs a pluck transform; not yet produced)."
+
+[parser]
+engine = "json"
+page_size = 100
+request_timeout_seconds = 60
+
+[[parser.variables]]
+name = "query"
+description = "DataCite query string: a dataset DOI (10.5281/zenodo.22295531), free text (Bombyx mori), or a fielded query (publisher:Zenodo AND types.resourceTypeGeneral:Dataset). Spaces and colons are percent-encoded on the wire. Journal-article DOIs live in Crossref, not DataCite."
+
+[[parser.collections]]
+name = "dois"
+path = "/dois"
+query = { query = "{query}" }
+paginate = { style = "page_number", page_param = "page[number]", size_param = "page[size]", first_page = 1 }
+items_pointer = "/data"
+total_pointer = "/meta/total"
+
+[parser.collections.nodes]
+id_pointer = "/id"
+node_type = "work"
+
+[parser.collections.nodes.doctype]
+pointer = "/attributes/types/resourceTypeGeneral"
+map = { Dataset = "Dataset", Text = "Text", Software = "Software", Image = "Image", Collection = "Collection" }
+
+[parser.collections.nodes.title]
+pointer = "/attributes/titles/0/title"
+fallback_prefix = "doi"
+
+[[parser.collections.nodes.fields]]
+key = "doi"
+pointer = "/attributes/doi"
+
+[[parser.collections.nodes.fields]]
+key = "publisher"
+pointer = "/attributes/publisher"
+
+[[parser.collections.nodes.fields]]
+key = "publication_year"
+pointer = "/attributes/publicationYear"
+
+[[parser.collections.nodes.fields]]
+key = "resource_type"
+pointer = "/attributes/types/resourceTypeGeneral"
+
+[[parser.collections.nodes.fields]]
+key = "url"
+pointer = "/attributes/url"

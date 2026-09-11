@@ -1,0 +1,93 @@
+# mzTab package (pest grammar).
+#
+# mzTab is the PSI standard TSV for proteomics identification and
+# quantification results (PRIDE result files, MaxQuant/OpenMS/mzid-library
+# exports). The section-prefixed line format maps onto the pest capture
+# contract without any column-position guessing:
+#   PRT rows -> protein nodes (id = accession, title = description,
+#               tag = search database, type = "PRT")
+#   PEP rows -> peptide nodes (id = sequence, type = "PEP")
+#   PSM rows -> peptide-spectrum-match evidence edges
+#               (source = peptide sequence, target = protein accession)
+# MTD/COM/PRH/PEH/PSH lines are section metadata and column headers, skipped.
+#
+# Grammar notes (edit live in the Importers panel; no recompile):
+# - Column order follows the mzTab 1.0 core specification (PRT: accession,
+#   description, taxid, species, database, …; PSM: sequence, PSM_ID,
+#   accession, …), which is fixed by the spec — not a layout assumption.
+# - A peptide shared by several proteins appears once per protein in the PEP
+#   section; the duplicate sequence id then fails the import loudly
+#   (`DuplicateNodeId`). For such files drop the PEP/PSM rules and keep the
+#   protein catalog, or extend the grammar to group accessions.
+# - Duplicate evidence edges (many PSMs for one peptide-protein pair) are
+#   deduplicated by the graph layer, not the grammar.
+
+format_version = 3
+
+[metadata]
+id = "proteomics.mztab"
+name = "mzTab identification results"
+version = "1.0.0"
+description = "Reads an mzTab file as a graph of protein and peptide nodes with PSM evidence edges between them: PRT rows are proteins, PEP rows are peptides, PSM rows are peptide->protein evidence."
+
+[limits]
+manifest_bytes = 131072
+grammar_bytes = 65536
+input_bytes = 268435456
+nodes = 500000
+edges = 500000
+
+[[schema.edge_types]]
+key = "evidence"
+directed = true
+description = "Peptide -> protein identification evidence from a PSM row (spectrum match)."
+
+[parser]
+engine = "pest"
+root_rule = "document"
+grammar = '''
+document = { SOI ~ (line ~ NEWLINE?)* ~ EOI }
+line = _{ node | evidence | skip }
+
+// PRT: accession, description, taxid, species, database, then optional
+// search-engine scores and per-study-variable columns. The leading section
+// code doubles as the node type.
+node = { kind ~ "\t" ~ record_id ~ "\t" ~ node_rest }
+node_rest = _{ protein_rest | peptide_rest }
+protein_rest = _{ title ~ "\t" ~ col ~ "\t" ~ col ~ "\t" ~ tag ~ ("\t" ~ col)* }
+peptide_rest = _{ col ~ ("\t" ~ col)* }
+
+// PSM: sequence, PSM_ID, accession — an evidence edge peptide -> protein.
+evidence = { "PSM" ~ "\t" ~ source ~ "\t" ~ col ~ "\t" ~ target ~ ("\t" ~ col)* }
+
+// Section metadata (MTD), comments (COM), and column headers
+// (PRH/PEH/PSH/…) carry no per-record graph content.
+skip = { (!("\r" | "\n") ~ ANY)+ }
+
+kind = { "PRT" | "PEP" }
+record_id = @{ (!("\t" | "\r" | "\n") ~ ANY)+ }
+title = @{ (!("\t" | "\r" | "\n") ~ ANY)+ }
+tag = @{ (!("\t" | "\r" | "\n") ~ ANY)+ }
+source = @{ (!("\t" | "\r" | "\n") ~ ANY)+ }
+target = @{ (!("\t" | "\r" | "\n") ~ ANY)+ }
+col = _{ (!("\t" | "\r" | "\n") ~ ANY)+ }
+
+// Roles mzTab rows do not use. The capture contract requires one distinct,
+// non-silent rule per role; these match nothing in mzTab input.
+property = { key ~ "=" ~ value }
+key = { "@@key@@" }
+value = { "@@value@@" }
+'''
+
+[parser.captures]
+node = "node"
+id = "record_id"
+title = "title"
+kind = "kind"
+tag = "tag"
+property = "property"
+key = "key"
+value = "value"
+edge = "evidence"
+source = "source"
+target = "target"

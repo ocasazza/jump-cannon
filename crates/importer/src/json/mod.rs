@@ -34,8 +34,8 @@ use data_loader::{
 };
 pub use config::{
     Collection, Dedupe, DoctypeRule, EdgeListRules, EdgeRule, FieldRule, JsonEngineConfig, MatchOn,
-    NodeRules, Pagination, Predicate, Preflight, Produces, TitleRule, Transform, VariableSpec,
-    ENGINE, MAX_PAGE_SIZE, MAX_REQUEST_TIMEOUT_SECONDS, SOURCE_KIND,
+    NodeRules, PageNumberParams, Pagination, Predicate, Preflight, Produces, TitleRule, Transform,
+    VariableSpec, ENGINE, MAX_PAGE_SIZE, MAX_REQUEST_TIMEOUT_SECONDS, SOURCE_KIND,
 };
 pub use connector::{HttpJsonConnector, JsonTransport};
 #[cfg(feature = "native")]
@@ -351,6 +351,31 @@ mod tests {
             .schema()
             .validate()
             .expect("published discovery schema is internally consistent");
+    }
+
+    /// Every package the chart ships under `charts/jump-cannon/packages/`
+    /// (globbed into the importer-packages ConfigMap) must validate against
+    /// the current engine; an invalid one becomes a 409/at-startup failure
+    /// for any deployment that selects it.
+    #[test]
+    fn shipped_packages_validate() {
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../charts/jump-cannon/packages");
+        let mut entries: Vec<_> = std::fs::read_dir(dir)
+            .expect("packages dir exists")
+            .map(|entry| entry.expect("dir entry").path())
+            .filter(|path| path.extension().is_some_and(|ext| ext == "toml"))
+            .collect();
+        entries.sort();
+        assert!(!entries.is_empty(), "packages dir must not be empty");
+        for path in entries {
+            let bytes = std::fs::read(&path).expect("package readable");
+            let package = ValidatedPackage::from_toml_bytes(&bytes)
+                .unwrap_or_else(|error| panic!("{} validates: {error}", path.display()));
+            package
+                .schema()
+                .validate()
+                .unwrap_or_else(|error| panic!("{} schema: {error}", path.display()));
+        }
     }
 
     #[test]

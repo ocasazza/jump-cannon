@@ -1,0 +1,189 @@
+# PRIDE Archive discovery-search package.
+#
+# The mix-and-match counterpart to `pride-archive.toml`: instead of one
+# accession deep-imported with its files, a keyword/facet query becomes a
+# graph of matching *projects* — organisms, instruments, experiment types,
+# and diseases as shared facets so the canvas clusters projects by what they
+# measure. Bind with e.g.
+# `--importer-var keyword=silkworm` (or `keyword=cardiovascular`,
+# `keyword=PXD084037` for a single-project graph).
+#
+# Verified against the live API (2026-09):
+#   GET /search/projects?keyword=silkworm&page=0&pageSize=100 -> [ {project}, … ]
+# Bare JSON array at the root, page-number pagination.
+
+format_version = 3
+
+[metadata]
+id = "pride.archive-search"
+name = "PRIDE Archive discovery search"
+version = "1.0.0"
+description = "Reads one PRIDE Archive keyword search as a graph of matching projects, faceted by organism, instrument, software, experiment type, quantification method, and disease, so projects cluster by what they measure. The discovery-mode counterpart to pride.archive-project."
+
+[limits]
+# 5000 projects bounds one search graph; a broader query fails loudly with
+# the server total instead of silently truncating at the bound.
+nodes = 5000
+input_bytes = 67108864
+
+[[schema.fields]]
+key = "description"
+field_type = "text"
+required = false
+searchable = true
+facetable = false
+snippet = true
+boost = 4
+
+[[schema.fields]]
+key = "organisms"
+field_type = "keyword_list"
+required = false
+searchable = true
+facetable = true
+boost = 2
+
+[[schema.fields]]
+key = "instruments"
+field_type = "keyword_list"
+required = false
+searchable = true
+facetable = true
+boost = 2
+
+[[schema.fields]]
+key = "softwares"
+field_type = "keyword_list"
+required = false
+searchable = true
+facetable = true
+
+[[schema.fields]]
+key = "experiment_types"
+field_type = "keyword_list"
+required = false
+searchable = true
+facetable = true
+
+[[schema.fields]]
+key = "quantification_methods"
+field_type = "keyword_list"
+required = false
+searchable = true
+facetable = true
+
+[[schema.fields]]
+key = "diseases"
+field_type = "keyword_list"
+required = false
+searchable = true
+facetable = true
+
+[[schema.fields]]
+key = "keywords"
+field_type = "keyword_list"
+required = false
+searchable = true
+facetable = true
+
+[[schema.fields]]
+key = "submission_type"
+field_type = "keyword"
+required = false
+searchable = true
+facetable = true
+
+[[schema.fields]]
+key = "publication_date"
+field_type = "date"
+required = false
+searchable = true
+facetable = true
+
+[[schema.fields]]
+key = "download_count"
+field_type = "number"
+required = false
+searchable = true
+facetable = true
+
+# Declared for symmetry with pride.archive-project; the discovery graph is
+# nodes-only (project nodes + shared facets), so no collection produces this
+# edge kind here. The discovery schema requires at least one edge type.
+[[schema.edge_types]]
+key = "contains"
+directed = true
+description = "Reserved for project -> file edges (produced by the pride.archive-project package, not by discovery searches)."
+
+[parser]
+engine = "json"
+page_size = 100
+request_timeout_seconds = 60
+
+[[parser.variables]]
+name = "keyword"
+description = "PRIDE Archive search keyword: free text, an organism, an instrument, a disease, or an accession (e.g. silkworm, cardiovascular, PXD084037). Server-side matched; results are faceted by the fields above for in-app narrowing."
+
+[[parser.collections]]
+name = "projects"
+path = "/search/projects"
+query = { keyword = "{keyword}" }
+paginate = { style = "page_number", page_param = "page", size_param = "pageSize" }
+items_pointer = ""
+
+[parser.collections.nodes]
+id_pointer = "/accession"
+node_type = "project"
+tags_pointer = "/keywords"
+
+[parser.collections.nodes.doctype]
+pointer = "/submissionType"
+map = { COMPLETE = "Complete submission", PARTIAL = "Partial submission", SUPPORTED = "Supported submission" }
+
+[parser.collections.nodes.title]
+pointer = "/title"
+fallback_prefix = "project"
+
+[[parser.collections.nodes.fields]]
+key = "description"
+pointer = "/projectDescription"
+
+[[parser.collections.nodes.fields]]
+key = "organisms"
+pointer = "/organisms"
+
+[[parser.collections.nodes.fields]]
+key = "instruments"
+pointer = "/instruments"
+
+[[parser.collections.nodes.fields]]
+key = "softwares"
+pointer = "/softwares"
+
+[[parser.collections.nodes.fields]]
+key = "experiment_types"
+pointer = "/experimentTypes"
+
+[[parser.collections.nodes.fields]]
+key = "quantification_methods"
+pointer = "/quantificationMethods"
+
+[[parser.collections.nodes.fields]]
+key = "diseases"
+pointer = "/diseases"
+
+[[parser.collections.nodes.fields]]
+key = "keywords"
+pointer = "/keywords"
+
+[[parser.collections.nodes.fields]]
+key = "submission_type"
+pointer = "/submissionType"
+
+[[parser.collections.nodes.fields]]
+key = "publication_date"
+pointer = "/publicationDate"
+
+[[parser.collections.nodes.fields]]
+key = "download_count"
+pointer = "/downloadCount"

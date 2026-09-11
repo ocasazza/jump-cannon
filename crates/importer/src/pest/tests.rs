@@ -277,6 +277,66 @@ fn pest_ids_are_golden() {
     assert_eq!(result.graph.edges[0].source, "pest:example.line-graph:n1");
 }
 
+/// Every pest package the chart ships under `charts/jump-cannon/packages/`
+/// must parse its sibling example input (`examples/<package-stem>.txt`) and
+/// satisfy the full discovery contract (`validate_result`: one search
+/// document per node, indexed id/title/tags equal to the canonical node's).
+/// The examples are the user-facing documentation of each grammar, so a
+/// grammar edit that breaks its example fails here.
+#[test]
+fn shipped_pest_packages_parse_their_examples() {
+    let packages_dir =
+        concat!(env!("CARGO_MANIFEST_DIR"), "/../../charts/jump-cannon/packages");
+    let mut entries: Vec<_> = std::fs::read_dir(packages_dir)
+        .expect("packages dir exists")
+        .map(|entry| entry.expect("dir entry").path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "toml"))
+        .collect();
+    entries.sort();
+
+    let mut parsed_examples = 0;
+    for path in entries {
+        let bytes = std::fs::read(&path).expect("package readable");
+        let package = ValidatedPackage::from_toml_bytes(&bytes)
+            .unwrap_or_else(|error| panic!("{} validates: {error}", path.display()));
+        if package.engine() != crate::EngineKind::Pest {
+            continue;
+        }
+        let example = path
+            .parent()
+            .expect("packages dir has a parent")
+            .join("examples")
+            .join(format!(
+                "{}.txt",
+                path.file_stem().expect("package file name").to_string_lossy()
+            ));
+        let input = std::fs::read_to_string(&example).unwrap_or_else(|error| {
+            panic!(
+                "pest package {} ships an example at {}: {error}",
+                path.display(),
+                example.display()
+            )
+        });
+        let result = package
+            .parse_input(&input)
+            .unwrap_or_else(|error| panic!("{} parses its example: {error}", path.display()));
+        assert!(
+            result.graph.node_count() > 0,
+            "{} example must produce nodes",
+            path.display()
+        );
+        package
+            .schema()
+            .validate_result(&result)
+            .unwrap_or_else(|error| panic!("{} discovery contract: {error}", path.display()));
+        parsed_examples += 1;
+    }
+    assert!(
+        parsed_examples > 0,
+        "at least one shipped pest package must be exercised"
+    );
+}
+
 #[cfg(feature = "native")]
 mod native {
     use std::io::Write;
