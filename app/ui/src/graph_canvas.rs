@@ -42,11 +42,14 @@ pub struct GraphData {
 ///
 /// Mirrors the egui app's bootstrap (`app.rs::spawn_fetch_task` +
 /// `try_promote_bootstrap_to_gpu`):
-///   - the server's 2D positions are ignored — nodes seed on a hollow
-///     sphere shell (radius 800 wu), then the multilevel coarsening
-///     warm-up (`graph_layouts::warmup_positions`) replaces that with a
-///     coarsened-cascade seed so the GPU sim converges in a handful of
-///     frames instead of hundreds;
+///   - when the importer authored positions (`Init.positions_authored`,
+///     e.g. an SDF 2D depiction), the sim seeds from them — recentered and
+///     rescaled so the mean edge length matches the spring length — and the
+///     structure survives to first paint;
+///   - otherwise nodes seed on a hollow sphere shell (radius 800 wu), then
+///     the multilevel coarsening warm-up (`graph_layouts::warmup_positions`)
+///     replaces that with a coarsened-cascade seed so the GPU sim converges
+///     in a handful of frames instead of hundreds;
 ///   - colors come from the community metric through the Tableau20
 ///     palette (egui default `ColorBy::Community`);
 ///   - sizes come from pagerank with the default 0.5 multiplier
@@ -103,23 +106,41 @@ pub async fn load() -> Result<GraphData, String> {
         }
     }
 
-    // Sphere shell seed, then the coarsening warm-up (which always
-    // returns a full position set, so it effectively rules; the sphere
-    // remains as the fallback should warmup ever come back short).
-    //
-    // Skip the warmup for large graphs (>10k nodes): the multilevel
-    // coarsening + CPU FR cascade runs in WASM on the main thread and
-    // blocks the UI for seconds at 100k scale. The sphere shell seed is
-    // perfectly adequate when a GPU compute backend (graph-compute) is
-    // handling layout — the GPU converges from any reasonable init.
-    let mut positions = render::data::spawn_on_unit_sphere(n, 800.0);
-    if n <= 10_000 {
-        let spring_len = GpuForceOptions::default().spring_len.max(1.0);
-        let warmed = graph_layouts::warmup_positions(n, &edges, spring_len, 0xC0A75E);
-        if warmed.len() == positions.len() {
-            positions = warmed;
+    let spring_len = GpuForceOptions::default().spring_len.max(1.0);
+    let positions = if init.positions_authored {
+        // Importer-authored coordinates (e.g. an SDF 2D depiction): the
+        // structure is the layout. Seed from them — centered and rescaled so
+        // the mean bond length matches the sim's spring length — and skip
+        // the sphere/warm-up, which would scramble the authored structure.
+        let r = api::revisioned_positions().await?;
+        if revision != 0 && r.revision != 0 && r.revision != revision {
+            return Err(format!(
+                "inconsistent snapshot (positions revision {}, init revision {revision}) — \
+                 server graph changed mid-load",
+                r.revision
+            ));
         }
-    }
+        authored_positions(&r.value, &edges, n, spring_len)
+            .ok_or_else(|| "positions buffer does not match node count".to_string())?
+    } else {
+        // Sphere shell seed, then the coarsening warm-up (which always
+        // returns a full position set, so it effectively rules; the sphere
+        // remains as the fallback should warmup ever come back short).
+        //
+        // Skip the warmup for large graphs (>10k nodes): the multilevel
+        // coarsening + CPU FR cascade runs in WASM on the main thread and
+        // blocks the UI for seconds at 100k scale. The sphere shell seed is
+        // perfectly adequate when a GPU compute backend (graph-compute) is
+        // handling layout — the GPU converges from any reasonable init.
+        let mut positions = render::data::spawn_on_unit_sphere(n, 800.0);
+        if n <= 10_000 {
+            let warmed = graph_layouts::warmup_positions(n, &edges, spring_len, 0xC0A75E);
+            if warmed.len() == positions.len() {
+                positions = warmed;
+            }
+        }
+        positions
+    };
 
     let colors = render::data::colors_from_metric("community", &metrics, n);
     let sizes = render::data::sizes_from_metric("pagerank", &metrics, n, 0.5);
@@ -145,6 +166,55 @@ pub async fn load() -> Result<GraphData, String> {
             sizes,
         },
     })
+}
+
+/// Importer-authored 2D coordinates → sim seed: z = 0, recentered on the
+/// centroid, and uniformly rescaled so the mean EDGE length matches the
+/// force sim's spring length. The scale step is what keeps an SDF depiction
+/// (ångström units, ±5) and a vault circle (radius ~200) equally usable:
+/// shape and bond-length ratios are authored data, absolute units are not.
+/// `flat` is `[x0, y0, x1, y1, …]`; returns `None` when it doesn't hold `n`
+/// points or every bond is degenerate.
+fn authored_positions(flat: &[f32], edges: &[u32], n: usize, spring_len: f32) -> Option<Vec<f32>> {
+    if flat.len() != n * 2 || n == 0 {
+        return None;
+    }
+    let (mut cx, mut cy) = (0.0_f32, 0.0_f32);
+    for i in 0..n {
+        cx += flat[2 * i];
+        cy += flat[2 * i + 1];
+    }
+    cx /= n as f32;
+    cy /= n as f32;
+
+    let mut mean_len = 0.0_f32;
+    let mut counted = 0u32;
+    for pair in edges.chunks_exact(2) {
+        let (a, b) = (pair[0] as usize, pair[1] as usize);
+        if a >= n || b >= n {
+            continue;
+        }
+        let dx = flat[2 * a] - flat[2 * b];
+        let dy = flat[2 * a + 1] - flat[2 * b + 1];
+        let len = (dx * dx + dy * dy).sqrt();
+        if len > 1e-6 {
+            mean_len += len;
+            counted += 1;
+        }
+    }
+    let scale = if counted > 0 {
+        spring_len / (mean_len / counted as f32)
+    } else {
+        1.0
+    };
+
+    let mut positions = Vec::with_capacity(n * 3);
+    for i in 0..n {
+        positions.push((flat[2 * i] - cx) * scale);
+        positions.push((flat[2 * i + 1] - cy) * scale);
+        positions.push(0.0);
+    }
+    Some(positions)
 }
 
 /// Convert an embedded world's materialized snapshot into `GraphData`,
@@ -183,13 +253,14 @@ pub(crate) fn graph_data_from_snapshot(snapshot: &graph_vcs::Snapshot) -> GraphD
         .values()
         .any(|node| node.x != 0.0 || node.y != 0.0);
     let positions = if has_stored_positions {
-        let mut positions = Vec::with_capacity(n * 3);
+        let mut flat: Vec<f32> = Vec::with_capacity(n * 2);
         for node in snapshot.nodes.values() {
-            positions.push(node.x);
-            positions.push(node.y);
-            positions.push(0.0);
+            flat.push(node.x);
+            flat.push(node.y);
         }
-        positions
+        let spring_len = GpuForceOptions::default().spring_len.max(1.0);
+        authored_positions(&flat, &edges, n, spring_len)
+            .unwrap_or_else(|| render::data::spawn_on_unit_sphere(n, 800.0))
     } else {
         let mut positions = render::data::spawn_on_unit_sphere(n, 800.0);
         if n <= 10_000 {

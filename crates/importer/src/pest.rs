@@ -83,6 +83,13 @@ pub struct CaptureRules {
     pub edge: String,
     pub source: String,
     pub target: String,
+    /// Optional initial-position captures (authored coordinates, e.g. an SDF
+    /// connection table's 2D depiction). Parsed as f32; a node without them
+    /// gets 0.0 and the server falls back to its circle seed.
+    #[serde(default)]
+    pub x: Option<String>,
+    #[serde(default)]
+    pub y: Option<String>,
     /// Labeled feature tags: grammar rule name -> the tag pushed onto every
     /// node whose subtree contains a match of that rule. Unlike `tag` (which
     /// pushes the matched text), these carry a static label, so a grammar can
@@ -283,6 +290,17 @@ fn validate_rule_bindings(
         if let Some(first_role) = assigned.insert(name, role) {
             return Err(ImportError::AmbiguousCaptureRule {
                 rule: name.to_owned(),
+                first_role,
+                second_role: role,
+            });
+        }
+    }
+    for (role, name) in [("x", &config.captures.x), ("y", &config.captures.y)] {
+        let Some(name) = name else { continue };
+        validate_bound_rule(role, name, &rules)?;
+        if let Some(first_role) = assigned.insert(name.as_str(), role) {
+            return Err(ImportError::AmbiguousCaptureRule {
+                rule: name.clone(),
                 first_role,
                 second_role: role,
             });
@@ -542,8 +560,8 @@ impl PestEngine<'_> {
             id: node_id,
             meta,
             metrics: NodeMetrics::default(),
-            x: 0.0,
-            y: 0.0,
+            x: parse_position(fields.x, "x")?,
+            y: parse_position(fields.y, "y")?,
         })
     }
 
@@ -573,6 +591,10 @@ impl PestEngine<'_> {
             set_scalar(&mut fields.title, pair.as_str(), "node", "title")?;
         } else if rule == captures.kind {
             set_scalar(&mut fields.kind, pair.as_str(), "node", "kind")?;
+        } else if captures.x.as_deref() == Some(rule) {
+            set_scalar(&mut fields.x, pair.as_str(), "node", "x")?;
+        } else if captures.y.as_deref() == Some(rule) {
+            set_scalar(&mut fields.y, pair.as_str(), "node", "y")?;
         } else if rule == captures.tag {
             if pair.as_str().is_empty() {
                 return Err(invalid_record("node", "tag capture is empty"));
@@ -710,6 +732,8 @@ struct NodeFields {
     id: Option<String>,
     title: Option<String>,
     kind: Option<String>,
+    x: Option<String>,
+    y: Option<String>,
     tags: Vec<String>,
     properties: HashMap<String, Value>,
 }
@@ -726,6 +750,16 @@ fn set_scalar(
     Ok(())
 }
 
+/// Optional position capture → f32; absent or unparsable falls back to 0.0,
+/// which the server treats as "no authored position" (circle seed).
+fn parse_position(raw: Option<String>, role: &'static str) -> Result<f32, ImportError> {
+    match raw {
+        None => Ok(0.0),
+        Some(text) => text.parse::<f32>().map_err(|_| {
+            invalid_record("node", format!("{role} capture is not a float: {text:?}"))
+        }),
+    }
+}
 fn invalid_record(record: &'static str, detail: impl Into<String>) -> ImportError {
     ImportError::InvalidRecord {
         record,

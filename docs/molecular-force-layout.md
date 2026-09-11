@@ -1,9 +1,18 @@
 # Molecular force layout: edge forces from atoms, bonds, and ions
 
-Status: design (2026-09). Phase 0 shipped — the SDF V3000 importer
-(`charts/jump-cannon/packages/sdf.toml`) puts atoms, bonds, elements, and
-formal charges into the graph; everything below is the follow-up that makes
-the layout physics molecular.
+Status: active (2026-09). Phase 0 shipped — the SDF V3000 importer
+(`charts/jump-cannon/packages/sdf.toml`) puts atoms, bonds, elements,
+charges, and authored 2D coordinates into the graph, and the app seeds
+the sim from those coordinates (rings render as rings). Everything below
+"The gaps" is the follow-up that makes the layout physics molecular.
+
+## Research references (sdgr internal)
+
+| Source | What it contributes |
+|---|---|
+| `mmshare/test/schrodinger/canvasphase/mmffld/test_mmffld_bonded_terms.cpp` | **Parity test methodology, borrowed for TDD**: analytic energy vs kernel (`E = fc·(d−r₀)²` stretch, `fc·(θ−θ₀)² + fc_cubic·(θ−θ₀)³` bend), centered finite-difference force `F = −dE/dx` (h = 1e-3, abs tol 1e-4), index-reversal symmetry, displacement/angle fixtures (`{0.75,1.1,0.8}`, `{1.75,0.1,2.8}`, 30°/45°). |
+| `crystal_entropy/bunsen_skills/crystal-entropy-cep/references/force_field.md` | The OPLS value chain: FFBuilder OPLSDIRs, `-OPLSDIR`/`OPLS_DIR`, SMARTS coverage check — why OPLS itself is not importable. |
+| `bunsen/plugins/matsci/skills/coarse-grained-force-field-builder/SKILL.md` | Prior art for Coulomb handling (dielectric 78 DPD / 15 Martini) and nonbonded cutoffs (6 Å DPD / 12 Å Martini); parameter-treatment modes (fixed / initialize-only / seeded) as a lens vocabulary precedent. |
 
 ## Goal
 
@@ -37,10 +46,16 @@ computing.
 
 ## What exists today (the seams)
 
-- **Import**: `sdf.toml` (pest) — atoms as nodes (element = canvas type),
-  bonds as edges, `CHG=±n` as `cation`/`anion` tags, other atom
-  `KEY=value` properties as frontmatter. Verified live: caffeine, 24
-  atoms / 25 bonds; glycine zwitterion example parses in CI.
+- **Import**: `sdf.toml` (pest) — atoms as nodes (element = canvas type AND
+  tag), bonds as edges, `CHG=±n` as `cation`/`anion` tags, other atom
+  `KEY=value` properties as frontmatter, and the authored 2D depiction as
+  initial positions via the pest engine's optional `x`/`y` capture roles.
+- **Authored positions end-to-end**: `GraphSnapshot.positions_authored` (the
+  circle fallback moved into `GraphSnapshot::build` and only fires when no
+  importer authored coordinates), served as `Init.positions_authored`; the
+  app seeds the sim from `/graph/positions` — recentered, rescaled so the
+  mean edge length matches `spring_len` (`graph_canvas::authored_positions`)
+  — instead of sphere + warm-up.
 - **Attribute channel**: `graph-api::attribute_resolver::resolve` already
   builds per-node `GraphAttributes` (class/coordination/mass) from lenses —
   `MassLens::Field`, `ClassLens::NodeType`, etc. — and encodes them to the
@@ -81,6 +96,12 @@ pub fn element(symbol: &str) -> Option<&'static ElementParams>;
 pub fn bond_rest_length(a: &str, b: &str, order: BondOrder) -> f32;
 pub fn bond_stiffness(order: BondOrder) -> f32; // k/2 by order, clamped
 ```
+
+TDD: the `uff.rs` tests are written first, ported from mmshare's
+`test_mmffld_bonded_terms.cpp` methodology (see Research references):
+analytic energy vs implementation at abs tol 1e-4, centered
+finite-difference force consistency (h = 1e-3), index-reversal symmetry,
+same displacement/angle fixtures.
 
 ### Force terms (what changes in the sim)
 
@@ -125,8 +146,15 @@ the dynamic-bond fields already do.
 
 ## Verified so far
 
-- `cargo test -p importer` — 67 tests incl. shipped `sdf.toml` parsing the
-  glycine-zwitterion example (`cation` + `anion` tags from `CHG=1`/`CHG=-1`).
-- Live: `graph-api --source pest --importer-manifest sdf.toml
-  --importer-input caffeine.sdf` → 24 atom nodes, 25 bond edges, elements
-  as canvas types, rendered in the Dioxus canvas.
+- `cargo test -p importer` (70) — shipped `sdf.toml` parses the
+  glycine-zwitterion example (`cation` + `anion` tags); pest `x`/`y`
+  capture tests pin authored positions, the f32-overflow edge, and the
+  zero default for packages without the roles.
+- `cargo test -p graph-api` (91 lib + 22 regressions) — `positions_authored`
+  flag tests: authored coordinates survive `build`, unpositioned graphs get
+  the circle fallback.
+- Live: caffeine via `--source pest … sdf.toml` → 24 atoms / 25 bonds,
+  element tags (C 8, H 10, N 4, O 2), and the fused 6/5-ring core with
+  three methyl arms rendered from the authored depiction (not the random
+  sphere blob). The sim then relaxes toward uniform `spring_len` — the
+  residual distortion is exactly gap #2 below.

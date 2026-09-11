@@ -18,6 +18,11 @@ pub struct Init {
     /// frames for this bootstrap must carry the same non-zero value.
     #[prost(uint64, tag = "6")]
     pub graph_revision: u64,
+    /// True when the importer authored node positions (e.g. an SDF 2D
+    /// depiction); false means /graph/positions carries the server's circle
+    /// fallback and clients should seed their own layout instead.
+    #[prost(bool, tag = "7")]
+    pub positions_authored: bool,
 }
 /// Per-node metadata. Returned by /node/:id (sparse, on-demand).
 #[derive(Clone, PartialEq, ::prost::Message)]

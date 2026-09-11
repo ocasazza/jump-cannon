@@ -165,6 +165,91 @@ fn maps_good_graph_and_metadata_deterministically() {
         .expect("output satisfies the package schema");
 }
 
+/// Optional x/y capture roles: authored coordinates land on the node's
+/// initial position; nodes without them stay at 0.0 (the server's
+/// circle-fallback signal).
+const POSITIONS_PACKAGE: &str = r#"format_version = 3
+
+[metadata]
+id = "example.positions"
+name = "Positioned graph"
+version = "1.0.0"
+description = "Test x/y captures"
+
+[parser]
+engine = "pest"
+root_rule = "document"
+grammar = '''
+document = { SOI ~ (node ~ NEWLINE?)* ~ EOI }
+node = { "N|" ~ node_id ~ "|" ~ x_pos ~ "|" ~ y_pos }
+node_id = @{ field }
+x_pos = @{ number }
+y_pos = @{ number }
+title = { "@@title@@" }
+kind = { "@@kind@@" }
+tag = { "@@tag@@" }
+property = { "@@property@@" }
+key = { "@@key@@" }
+value = { "@@value@@" }
+edge = { "@@edge@@" }
+source = { "@@source@@" }
+target = { "@@target@@" }
+field = _{ (!("|" | NEWLINE) ~ ANY)+ }
+number = _{ "-"? ~ '0'..'9'+ ~ ("." ~ '0'..'9'+)? }
+'''
+
+[parser.captures]
+node = "node"
+id = "node_id"
+title = "title"
+kind = "kind"
+tag = "tag"
+property = "property"
+key = "key"
+value = "value"
+edge = "edge"
+source = "source"
+target = "target"
+x = "x_pos"
+y = "y_pos"
+"#;
+
+#[test]
+fn xy_captures_seed_authored_positions() {
+    let package =
+        ValidatedPackage::from_toml(POSITIONS_PACKAGE).expect("valid positions package");
+    let result = package
+        .parse_input("N|a|-1.5|2.25\nN|b|3|4")
+        .expect("input parses");
+
+    let a = &result.graph.nodes["pest:example.positions:a"];
+    assert_eq!((a.x, a.y), (-1.5, 2.25));
+    let b = &result.graph.nodes["pest:example.positions:b"];
+    assert_eq!((b.x, b.y), (3.0, 4.0));
+}
+
+#[test]
+fn overflowing_x_literal_pins_f32_infinity_behavior() {
+    let package =
+        ValidatedPackage::from_toml(POSITIONS_PACKAGE).expect("valid positions package");
+    // Rust f32 parsing accepts overflowing literals as ±inf; the grammar's
+    // `number` rule keeps non-numeric text out, so this is the only parse
+    // edge reachable through a validated grammar. Pin the behavior.
+    let result = package
+        .parse_input("N|a|999999999999999999999999999999999999999999|1")
+        .expect("huge literal parses");
+    assert!(result.graph.nodes["pest:example.positions:a"].x.is_infinite());
+}
+
+#[test]
+fn packages_without_xy_captures_default_to_zero_positions() {
+    let result = package()
+        .parse_input("N|n1|Alpha|service||\n")
+        .expect("input parses");
+    let node = &result.graph.nodes["pest:example.line-graph:n1"];
+    assert_eq!((node.x, node.y), (0.0, 0.0));
+}
+
 #[test]
 fn undeclared_properties_remain_metadata_but_never_enter_search_documents() {
     let package = package();

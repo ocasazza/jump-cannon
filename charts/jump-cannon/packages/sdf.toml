@@ -3,7 +3,9 @@
 # SDF is the interchange format every cheminformatics toolkit writes
 # (Maestro .mae export via `structconvert`, RDKit, Open Babel, PubChem).
 # This package reads the V3000 dialect: one atom per node (index as id,
-# element symbol as canvas type), one bond per edge (atom-index endpoints),
+# element symbol as canvas type AND tag — atoms group by C/N/O/H in the
+# Nodes panel), one bond per edge (atom-index endpoints), the authored 2D
+# depiction coordinates as initial positions (the rings render as rings),
 # formal charges as `cation`/`anion` tags plus the remaining `KEY=value`
 # atom properties (MASS, VAL, …) as frontmatter.
 #
@@ -62,12 +64,17 @@ atom_block = { "M  V30 BEGIN ATOM" ~ NEWLINE ~ atom_line* ~ "M  V30 END ATOM" ~ 
 bond_block = { "M  V30 BEGIN BOND" ~ NEWLINE ~ bond_line* ~ "M  V30 END BOND" ~ NEWLINE }
 
 // M  V30 <idx> <el> <x> <y> <z> <aamap> [KEY=value]*
-// One atom = one node: index is the id, element the canvas type.
-atom_line = { "M  V30 " ~ atom_idx ~ " " ~ element ~ " " ~ coord ~ " " ~ coord
-            ~ " " ~ coord ~ " " ~ aamap ~ props? ~ NEWLINE }
+// One atom = one node: index is the id, element the canvas type AND the tag
+// (atom_elem wraps element so the same text fills the kind and tag roles —
+atom_line = { "M  V30 " ~ atom_idx ~ " " ~ atom_elem ~ " " ~ coord_x ~ " " ~ coord_y
+            ~ " " ~ coord_z ~ " " ~ aamap ~ props? ~ NEWLINE }
 atom_idx = @{ '0'..'9'+ }
+atom_elem = { element }
 element = @{ UPPERCASE ~ LOWERCASE? }
-coord = @{ "-"? ~ '0'..'9'+ ~ "." ~ '0'..'9'+ }
+// Distinct rules per axis so the x/y capture roles each bind exactly one.
+coord_x = @{ "-"? ~ '0'..'9'+ ~ "." ~ '0'..'9'+ }
+coord_y = @{ "-"? ~ '0'..'9'+ ~ "." ~ '0'..'9'+ }
+coord_z = @{ "-"? ~ '0'..'9'+ ~ "." ~ '0'..'9'+ }
 aamap = @{ '0'..'9'+ }
 props = { (" " ~ prop)+ }
 prop = _{ chg_pos | chg_neg | property }
@@ -89,10 +96,10 @@ src = @{ '0'..'9'+ }
 tgt = @{ '0'..'9'+ }
 bond_rest = { (!NEWLINE ~ ANY)* }
 
-// Roles an SDF connection table does not use. The capture contract requires
-// one distinct, non-silent rule per role; these match nothing in SDF input.
+// The title role has no V3000 meaning (the file-level title line is not a
+// node property). The capture contract requires one distinct, non-silent
+// rule per role; this matches nothing in SDF input.
 title = { "@@title@@" }
-tag = { "@@tag@@" }
 '''
 
 [parser.captures]
@@ -100,7 +107,9 @@ node = "atom_line"
 id = "atom_idx"
 title = "title"
 kind = "element"
-tag = "tag"
+tag = "atom_elem"
+x = "coord_x"
+y = "coord_y"
 property = "property"
 key = "key"
 value = "value"

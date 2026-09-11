@@ -56,6 +56,10 @@ pub struct GraphSnapshot {
     /// can prove that they belong to the same snapshot.
     pub revision: u64,
     pub graph: VaultGraph,
+    /// True when the importer authored initial positions (e.g. an SDF 2D
+    /// depiction). False means `build` assigned the deterministic circle
+    /// fallback — clients should run their own layout seed instead.
+    pub positions_authored: bool,
     /// Sanitized identity of the source that produced this exact graph.
     pub source: SnapshotSource,
     /// Importer-owned discovery schema associated with this exact revision.
@@ -86,6 +90,27 @@ impl GraphSnapshot {
         search_documents: Vec<SearchDocument>,
     ) -> Result<Self, ImportError> {
         static NEXT_REVISION: AtomicU64 = AtomicU64::new(1);
+        // Importer-authored positions (e.g. an SDF 2D depiction) win; only a
+        // graph with no authored coordinates gets the deterministic circle
+        // fallback. Detected here — centrally — so every build caller
+        // (loader, soup, tests) agrees on the flag.
+        let mut graph = graph;
+        let positions_authored = graph
+            .nodes
+            .values()
+            .any(|node| node.x != 0.0 || node.y != 0.0);
+        if !positions_authored {
+            let n = graph.node_count();
+            if n > 0 {
+                let radius = 200.0_f32 + (n as f32).sqrt() * 4.0;
+                let step = std::f32::consts::TAU / n as f32;
+                for (i, (_, node)) in graph.nodes.iter_mut().enumerate() {
+                    let theta = i as f32 * step;
+                    node.x = radius * theta.cos();
+                    node.y = radius * theta.sin();
+                }
+            }
+        }
         schema.validate_output(&graph, &search_documents)?;
         graph.validate().map_err(|error| ImportError::Map {
             message: format!("invalid graph snapshot: {error}"),
@@ -139,6 +164,7 @@ impl GraphSnapshot {
         Ok(Self {
             revision,
             graph,
+            positions_authored,
             source,
             schema,
             search_index,
@@ -302,6 +328,85 @@ mod tests {
         assert_ne!(first.revision, 0);
         assert_ne!(second.revision, 0);
         assert_ne!(first.revision, second.revision);
+    }
+
+    /// Minimal valid fixture: one search document per node, as the discovery
+    /// contract requires.
+    fn docs_for(graph: &VaultGraph) -> Vec<data_loader::SearchDocument> {
+        graph
+            .nodes
+            .values()
+            .map(|node| {
+                data_loader::SearchDocument::new(&node.id)
+                    .with("id", node.id.clone())
+                    .with("title", node.meta.title.clone())
+                    .with("tags", serde_json::json!(node.meta.tags))
+            })
+            .collect()
+    }
+
+    fn fixture_node(id: &str, x: f32, y: f32) -> vault_data::Node {
+        vault_data::Node {
+            id: id.to_string(),
+            meta: vault_data::NodeMeta {
+                source_id: "test".to_string(),
+                title: id.to_string(),
+                ..Default::default()
+            },
+            metrics: vault_data::NodeMetrics::default(),
+            x,
+            y,
+        }
+    }
+
+    #[test]
+    fn authored_positions_survive_build_and_set_the_flag() {
+        let mut graph = VaultGraph::default();
+        graph.nodes.insert(
+            "generate:test:a".to_string(),
+            fixture_node("generate:test:a", -1.5, 2.25),
+        );
+        let docs = docs_for(&graph);
+        let snapshot = GraphSnapshot::build(
+            graph,
+            SnapshotSource::new("test", "Test", "1"),
+            test_schema(),
+            docs,
+        )
+        .unwrap();
+        assert!(snapshot.positions_authored);
+        let node = &snapshot.graph.nodes["generate:test:a"];
+        assert_eq!(
+            (node.x, node.y),
+            (-1.5, 2.25),
+            "circle fallback must not overwrite authored coordinates"
+        );
+    }
+
+    #[test]
+    fn unpositioned_graphs_get_the_circle_fallback() {
+        let mut graph = VaultGraph::default();
+        for id in ["a", "b", "c"] {
+            let id = format!("generate:test:{id}");
+            graph.nodes.insert(id.clone(), fixture_node(&id, 0.0, 0.0));
+        }
+        let docs = docs_for(&graph);
+        let snapshot = GraphSnapshot::build(
+            graph,
+            SnapshotSource::new("test", "Test", "1"),
+            test_schema(),
+            docs,
+        )
+        .unwrap();
+        assert!(!snapshot.positions_authored);
+        assert!(
+            snapshot
+                .graph
+                .nodes
+                .values()
+                .all(|node| node.x != 0.0 || node.y != 0.0),
+            "circle fallback positions every node off the origin"
+        );
     }
 
     fn test_schema() -> ImporterSchema {

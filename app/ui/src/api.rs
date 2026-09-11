@@ -362,15 +362,18 @@ pub(crate) async fn revisioned_ids() -> ApiResult<Revisioned<Vec<String>>> {
     get_revisioned_json("/graph/ids").await
 }
 
-/// `/graph/positions` — flat [x0, y0, x1, y1, …] f32 buffer.
+/// `/graph/positions` — flat [x0, y0, x1, y1, …] f32 buffer, revision-tagged.
 ///
-/// Unused since the wgpu renderer landed: it seeds its own 3D positions
-/// (sphere shell + multilevel coarsening warm-up, like the egui app) and
-/// the GPU force sim takes over from there. Kept for parity with the
-/// server's endpoint surface.
-#[allow(dead_code)]
-pub async fn positions() -> ApiResult<Vec<f32>> {
-    Ok(f32s(&get_bytes("/graph/positions").await?))
+/// Used when `Init.positions_authored` is true: the importer authored node
+/// coordinates (e.g. an SDF 2D depiction) and the bootstrap seeds the sim
+/// from them instead of the sphere + warm-up. When the flag is false this
+/// buffer is the server's circle fallback and stays unused.
+pub(crate) async fn revisioned_positions() -> ApiResult<Revisioned<Vec<f32>>> {
+    let r = get_revisioned_bytes("/graph/positions").await?;
+    Ok(Revisioned {
+        revision: r.revision,
+        value: f32s(&r.value),
+    })
 }
 
 /// `/graph/edges` — flat [src, tgt, …] u32 buffer of dense node indices.

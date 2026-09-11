@@ -114,37 +114,10 @@ pub async fn load_with_progress(
         p.finish(id);
     }
 
-    // Seed deterministic initial positions on a circle.
-    let seed_id = progress.map(|p| p.start("ingest", "Seeding layout positions"));
-    let seed_result = tokio::task::spawn_blocking(move || {
-        let n = graph.node_count();
-        if n > 0 {
-            let radius = 200.0_f32 + (n as f32).sqrt() * 4.0;
-            let step = std::f32::consts::TAU / n as f32;
-            for (i, (_, node)) in graph.nodes.iter_mut().enumerate() {
-                let theta = i as f32 * step;
-                node.x = radius * theta.cos();
-                node.y = radius * theta.sin();
-            }
-        }
-        graph
-    })
-    .await;
-    let graph = match seed_result {
-        Ok(graph) => graph,
-        Err(error) => {
-            let error = ImportError::Map {
-                message: format!("initial position seeding panicked: {error}"),
-            };
-            if let (Some(progress), Some(id)) = (progress, seed_id) {
-                progress.fail(id, error.to_string());
-            }
-            return Err(error);
-        }
-    };
-    if let (Some(p), Some(id)) = (progress, seed_id) {
-        p.finish(id);
-    }
+    // Initial positions: importer-authored coordinates (e.g. an SDF 2D
+    // depiction) are kept; graphs without them get the deterministic circle
+    // fallback inside `GraphSnapshot::build`, which also sets the snapshot's
+    // `positions_authored` flag clients read from /graph/init.
 
     tracing::info!(
         num_communities = graph.num_communities,

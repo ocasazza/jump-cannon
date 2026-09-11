@@ -13,6 +13,10 @@ message Init {
   // Process-local graph snapshot identity. All bulk buffers and remote layout
   // frames for this bootstrap must carry the same non-zero value.
   uint64 graph_revision = 6;
+  // True when the importer authored node positions (e.g. an SDF 2D
+  // depiction); false means /graph/positions carries the server's circle
+  // fallback and clients should seed their own layout instead.
+  bool positions_authored = 7;
 }
 
 // Per-node metadata. Returned by /node/:id (sparse, on-demand).

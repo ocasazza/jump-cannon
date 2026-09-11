@@ -1416,6 +1416,7 @@ async fn graph_init(selection: SourceSelection) -> impl IntoResponse {
         num_wcc: g.num_wcc as u32,
         palette,
         graph_revision: snap.revision,
+        positions_authored: snap.positions_authored,
     };
     proto_response(&msg)
 }
