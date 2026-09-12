@@ -32,8 +32,10 @@ chrono = { version = "0.4", optional = true }
 console_error_panic_hook = { version = "0.1.7", optional = false }
 
 # WebGPU compute backend for the 3D force-directed layout.
-# wgpu's WebGPU backend targets browsers; webgl is the fallback. Native picks
-# vulkan/metal/dx12 from the default backend set.
+# wgpu's WebGPU backend targets browsers; webgl is the fallback.
+# default-features = false keeps the wasm bundle lean, so the native
+# backends must be re-enabled per target below (the target-specific
+# tables merge features onto this dependency).
 wgpu     = { version = "23", default-features = false, features = ["webgpu", "webgl", "wgsl"] }
 bytemuck = { version = "1", features = ["derive"] }
 pollster = "0.4"
@@ -44,6 +46,18 @@ log = "0.4"
 # coarsener used as a `SeedMode` for the force-directed sim. Pure Rust, no
 # transitive deps, works on WASM.
 delaunator = "1.0"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+wgpu = { version = "23", features = ["metal"] }
+
+[target.'cfg(target_os = "ios")'.dependencies]
+wgpu = { version = "23", features = ["metal"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+wgpu = { version = "23", features = ["vulkan-portability"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+wgpu = { version = "23", features = ["dx12"] }
 
 [dev-dependencies]
 wasm-bindgen-test = "0.3.34"

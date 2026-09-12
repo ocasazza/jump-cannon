@@ -1,0 +1,16 @@
+[package]
+name = "test-scenarios"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+data-loader  = { path = "../data-loader" }
+graph-layouts = { path = "../graph-layouts" }
+importer     = { path = "../importer", features = ["native"] }
+serde        = { workspace = true, features = ["derive"] }
+serde_json   = { workspace = true }
+serde_yaml   = "0.9"
+tokio        = { workspace = true }
+vault-data   = { path = "../vault-data" }
+env_logger   = "0.11"
+log          = "0.4"

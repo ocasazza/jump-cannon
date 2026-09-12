@@ -1,0 +1,24 @@
+# Caffeine UFF molecular layout — molecular-scale gpu-force settings
+# matching crates/test-scenarios/scenarios/caffeine-uff.yaml (boot with
+# `?config=caffeine-uff` against an SDF source).
+layout:
+  active: gpu-force
+  settings:
+    gpu-force:
+      # spring_len anchors at the caffeine mean UFF rest (~1.33 Å) so the
+      # authored depiction is not rescaled away from UFF targets.
+      spring_len: 1.4
+      spring_k: 1.0
+      repulsion: 0.02
+      repulsion_radius: 3.0
+      repulsion_mode: grid
+      grid_enabled: false      # 24 atoms: exact O(n²) pairs
+      gravity: 0.0
+      damping: 0.90
+      dt: 0.10
+      steps_per_call: 8
+      cooling_alpha: 1.0       # no cooling: the config is the physics
+      energy_threshold: 0.0    # never short-circuit
+      seed_mode: none          # authored positions are deliberate
+  seed_strategy: none
+  seed_custom: ""

@@ -18,6 +18,7 @@ members = [
     "crates/tvix-loader",
     "crates/test-browser",
     "crates/test-profiling",
+    "crates/test-scenarios",
 ]
 
 [workspace.package]

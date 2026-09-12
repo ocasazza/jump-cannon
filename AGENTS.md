@@ -31,6 +31,7 @@ The test harness in `crates/test-browser/` is the only exception, and only becau
 | `crates/tvix-wasm` | `tvix-eval` bridge — native + WASM Nix expression evaluator. Enables Nix expressions in the UI/data pipeline without shelling out. |
 | `crates/importer-connectors` | Generic byte-source connectors feeding `crates/importer` grammar packages: `https` (reqwest native / gloo-net wasm, runtime bearer token), `envelope` (pure-Rust tar/tar.gz/zip/gzip expansion, wasm-clean), `ssh` (native; agent or key-file auth, optional known_hosts pinning), `grpc` (native; tonic + prost-reflect dynamic unary/server-streaming invocation from a descriptor set or server reflection). Each is a `SourceConnector` declaring exact capabilities; credentials are runtime config, never package fields. |
 | `crates/test-browser` | Rust-only Chromium driver (chromiumoxide) for the foundational browser regression suite. Spawned by `just test browser-rust` / `nix run .#test-browser-rust`. |
+| `crates/test-scenarios` | YAML configuration-as-code scenario runner for the molecular force layout (`just test scenarios`). One scenario pins importer package + input fixture + exact `GpuForceOptions` + acceptance gates: precision (bit-identical reruns), accuracy (UFF bonds, ring angle sums, planarity), stochastic (seeded-jitter distribution gates), robustness (full-noise boundedness). Requires a native GPU backend — `graph-layouts` enables wgpu `metal`/`vulkan-portability`/`dx12` per target OS for this. |
 
 ## Importers: packages, not crates
 
@@ -171,6 +172,7 @@ Run `just test browser-rust` before claiming any visual change works. Don't comm
 | `GRAPH_API_HOST` env / `--host` flag | graph-api | `127.0.0.1` (container override: `0.0.0.0`) |
 | `JUMP_CANNON_COMPUTE_URL` env / `--compute-url` flag | graph-api | unset → broker disabled, `/graph/layout/stream` returns 503 |
 | `JUMP_CANNON_ASSETS_DIR` env / `--assets-dir` flag | graph-api | unset → assets 404 (no embedded bundle; point it at the app dist) |
+| `JUMP_CANNON_CONFIGS_DIR` env / `--configs-dir` flag | graph-api | unset → `<assets-dir>/../../configs` if it exists; dir of AppState YAML boot presets served at `GET /configs`, booted via `?config=<name>` |
 | `GRAPH_API_NO_WATCH=1` | graph-api | unset → file watcher armed |
 | `JUMP_CANNON_IMPORTER_SWITCH_GROUP` env / `--importer-switch-group` flag | graph-api | unset → runtime importer switching disabled (rollout-only) |
 | `JUMP_CANNON_USER_GROUPS_HEADER` env / `--user-groups-header` flag | graph-api | `x-netbird-groups` (proxy-injected, comma-separated) |

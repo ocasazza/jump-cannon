@@ -1277,12 +1277,15 @@ async fn asset(State(host): State<SourceHost>, Path(path): Path<String>) -> impl
 //
 // These endpoints let the dev-server ship named preset configs so a user can
 // load a known configuration (and share `?config=<name>` links). Presets are
-// optional: the endpoints 404 unless a `configs/` dir exists adjacent to the
-// assets dir's parent (resolved as `<assets-dir>/../../configs`). The egui-era
-// preset YAMLs were deleted with the old renderer crate; drop new YAMLs in
-// such a dir to re-enable. Only available when assets are served from disk.
+// optional: the endpoints 404 unless a configs dir resolves — explicit
+// `--configs-dir` / `JUMP_CANNON_CONFIGS_DIR` first, otherwise
+// `<assets-dir>/../../configs`. AppState YAML boot presets live there
+// (e.g. app/configs/caffeine-uff.yaml).
 
 fn configs_dir(s: &AppState) -> Option<std::path::PathBuf> {
+    if let Some(dir) = &s.inner.configs_dir {
+        return Some(dir.clone());
+    }
     let dist = s.inner.assets_dir.as_ref()?; // e.g. …/app/ui/dist
     Some(dist.parent()?.parent()?.join("configs"))
 }

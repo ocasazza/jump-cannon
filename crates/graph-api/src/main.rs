@@ -35,6 +35,10 @@ struct Args {
     /// frontend dist, e.g. app/ui/dist). Without it, assets 404.
     #[arg(long, env = "JUMP_CANNON_ASSETS_DIR")]
     assets_dir: Option<PathBuf>,
+    /// Serve GET /configs presets from this directory (AppState YAML boot
+    /// presets). Defaults to `<assets-dir>/../../configs` when unset.
+    #[arg(long, env = "JUMP_CANNON_CONFIGS_DIR")]
+    configs_dir: Option<PathBuf>,
     /// URL of the graph-compute gRPC worker. When unset, the compute broker
     /// is disabled.
     #[arg(long, env = "JUMP_CANNON_COMPUTE_URL")]
@@ -514,7 +518,8 @@ async fn main() -> anyhow::Result<()> {    let _ = dotenvy::dotenv();
         progress.clone(),
         importer_catalog,
     )?
-    .with_gpu_session(gpu_session);
+    .with_gpu_session(gpu_session)
+    .with_configs_dir(args.configs_dir);
 
     if let Some(compute_url) = args.compute_url.clone() {
         let broker = compute_broker.clone();

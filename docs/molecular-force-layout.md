@@ -220,3 +220,17 @@ the dynamic-bond fields already do.
   NaN rejection, untyped 1.0 fallback). GPU sim tests green; the Rust
   browser suite (`just test browser-rust`) passes with force_step at
   the 10-storage cap.
+- `just test scenarios` (`crates/test-scenarios`) — YAML CaC test bed
+  `scenarios/caffeine-uff.yaml` against the committed fixture
+  `charts/jump-cannon/packages/examples/sdf-caffeine.txt`: precision
+  (identical reruns bit-identical on-device), accuracy (25/25 bonds
+  within 30% of UFF targets at 5.4% mean; ring interior-angle sums exact
+  at 720°/540°; authored planarity exact), stochastic (12 seeded
+  σ=0.3 jitter runs recover the gates; p95 max bond err 61.5%), and
+  robustness (4 random-ball starts stay finite and bounded — the
+  angle-free field cannot fold full noise, so that gate is a
+  boundedness tripwire, not an accuracy claim). Molecular-scale config:
+  `spring_len 1.4 / repulsion 0.02 / radius 3.0 / gravity 0 / dt 0.1 /
+  damping 0.9`; the same options ship as the boot preset
+  `app/configs/caffeine-uff.yaml` (`?config=caffeine-uff`, served via
+  `GET /configs` with `--configs-dir`/`JUMP_CANNON_CONFIGS_DIR`).

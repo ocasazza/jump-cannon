@@ -212,6 +212,9 @@ pub struct AppStateInner {
     /// When `Some`, /assets/* and / are read from this directory at request
     /// time (dev mode: edit JS/CSS/HTML, refresh browser, no rebuild).
     pub assets_dir: Option<PathBuf>,
+    /// Explicit `GET /configs` preset directory (AppState YAML boot
+    /// presets). `None` → fall back to `<assets-dir>/../../configs`.
+    pub configs_dir: Option<PathBuf>,
     /// gRPC client to a `graph-compute` worker.
     pub compute_broker: ComputeBroker,
     /// On-demand GPU session controller (Kueue/KubeRay RayCluster
@@ -281,6 +284,7 @@ impl AppState {
                 importer,
                 snapshot: ArcSwap::new(Arc::new(snapshot)),
                 assets_dir,
+                configs_dir: None,
                 compute_broker,
                 gpu_session: None,
                 progress,
@@ -311,6 +315,17 @@ impl AppState {
         match Arc::get_mut(&mut self.inner) {
             Some(inner) => inner.gpu_session = handle,
             None => tracing::warn!("gpu session handle dropped: AppState already shared"),
+        }
+        self
+    }
+
+    /// Attach an explicit `GET /configs` preset directory. Chained onto the
+    /// constructor like [`Self::with_gpu_session`]; when never called (or
+    /// `None`), the server falls back to `<assets-dir>/../../configs`.
+    pub fn with_configs_dir(mut self, dir: Option<PathBuf>) -> Self {
+        match Arc::get_mut(&mut self.inner) {
+            Some(inner) => inner.configs_dir = dir,
+            None => tracing::warn!("configs dir dropped: AppState already shared"),
         }
         self
     }

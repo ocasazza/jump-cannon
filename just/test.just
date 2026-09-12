@@ -8,6 +8,7 @@
 #   just test geometric        geometric engine: solved-case canary + regression golden + perf
 #   just test geometric-golden regenerate the geometric regression golden (intentional baseline bump)
 #   just test browser-rust     Rust-driven browser smoke (crates/test-browser via CDP)
+#   just test scenarios        YAML CaC scenario gates (molecular force layout, crates/test-scenarios)
 #
 # `just test --list` shows these as real recipes (completion, per-recipe docs).
 
@@ -25,6 +26,13 @@ all: cargo browser-rust
 [group('test')]
 cargo:
     cargo test --workspace
+
+# YAML scenario runner: deterministic molecular layout test beds
+# (crates/test-scenarios). Pass scenario paths to run a subset.
+[group('test')]
+[doc('YAML CaC scenario gates: molecular force layout precision/accuracy/stochastic')]
+scenarios *paths:
+    cargo run -p test-scenarios -- {{paths}}
 
 # Property-based fuzz over graph-layouts layouts + graph-compute engines.
 # CASES sets PROPTEST_CASES (default 10000).
