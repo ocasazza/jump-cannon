@@ -15,8 +15,7 @@
 //   @group(0) @binding(4) edge_neighbors     (read)   length 2*m
 //   @group(0) @binding(5) params             (uniform)
 //   @group(0) @binding(6) cell_offsets       (read)   length n_cells+1
-//   @group(0) @binding(7) cell_nodes         (read)   length n
-//   @group(0) @binding(8) mass               (read)   length n
+//   @group(0) @binding(8) node_repulsion     (read)   length n
 //   @group(0) @binding(9) energy_out         (read_write) length n  (max disp proxy)
 //
 // Bindings (grid build pipelines: clear_cell_counts / count_cells /
@@ -86,7 +85,12 @@ struct SimParams {
 // selects RepulsionMode::Grid, but `force_step` no longer consumes them —
 // the path falls through to the naive O(n²) repulsion branch instead.
 // Binding 8 used to be `mass: array<f32>` — now packed into positions_in[i].w
-// (see the comment on bindings 0/1). Removing it dropped one storage slot.
+// (see the comment on bindings 0/1). The freed slot carries the per-node
+// repulsion weight: 1.0 = the global Coulomb strength (untyped graphs are
+// all-1.0, so their behavior is unchanged); molecular graphs carry UFF
+// well-depth weights relative to carbon. force_step mixes a pair with
+// UFF's geometric-mean rule, params.repulsion × √(wᵢ × wⱼ).
+@group(0) @binding(8) var<storage, read>       node_repulsion:  array<f32>;
 @group(0) @binding(9) var<storage, read_write> energy_out:      array<f32>;
 
 // ---- Grid-build bindings (group 1) -----------------------------------------
@@ -311,6 +315,8 @@ fn force_step(@builtin(global_invocation_id) gid: vec3<u32>) {
     let pos_full = positions_in[i];
     let pos = pos_full.xyz;
     let self_mass = pos_full.w;
+    // Per-node UFF repulsion weight (1.0 = global Coulomb strength).
+    let rep_i = node_repulsion[i];
     var vel = velocities[i];
     var force = vec3<f32>(0.0, 0.0, 0.0);
 
@@ -367,7 +373,8 @@ fn force_step(@builtin(global_invocation_id) gid: vec3<u32>) {
                 if (body != i) {
                     if (dist2 <= r_clip2 && mass_n > 0.0) {
                         let dist2c = max(dist2, dist2_floor);
-                        force = force + d * (params.repulsion * mass_n / dist2c);
+                        // Leaf pair: UFF geometric-mean mixing.
+                        force = force + d * (params.repulsion * sqrt(rep_i * node_repulsion[body]) * mass_n / dist2c);
                     }
                 }
                 idx = n.links.z; // skip = next-sibling-or-uncle
@@ -378,7 +385,9 @@ fn force_step(@builtin(global_invocation_id) gid: vec3<u32>) {
             if (mass_n > 0.0 && dist2 > 0.0 && (s * s) < (theta2 * dist2)) {
                 if (dist2 <= r_clip2) {
                     let dist2c = max(dist2, dist2_floor);
-                    force = force + d * (params.repulsion * mass_n / dist2c);
+                    // Internal cell: only the node's own weight applies —
+                    // a cell has no element identity to mix against.
+                    force = force + d * (params.repulsion * rep_i * mass_n / dist2c);
                 }
                 idx = n.links.z; // accepted → skip subtree
             } else {
@@ -411,7 +420,7 @@ fn force_step(@builtin(global_invocation_id) gid: vec3<u32>) {
             // Same mass-weighted Coulomb form as the grid path so layout
             // quality is comparable; only the *set* of j's changes.
             // Mass lives in positions_in[j].w (packed alongside xyz).
-            force = force + d * (params.repulsion * p_j.w / dist2c);
+            force = force + d * (params.repulsion * sqrt(rep_i * node_repulsion[j]) * p_j.w / dist2c);
         }
     } else {
         // Naive O(n²) fallback — also catches the legacy
@@ -428,7 +437,7 @@ fn force_step(@builtin(global_invocation_id) gid: vec3<u32>) {
             if (dist2 > r_clip2) { continue; }
             let dist2c = max(dist2, dist2_floor);
             // Mass packed into .w of positions buffer.
-            force = force + d * (params.repulsion * p_j.w / dist2c);
+            force = force + d * (params.repulsion * sqrt(rep_i * node_repulsion[j]) * p_j.w / dist2c);
         }
     }
 

@@ -17,34 +17,41 @@
 /// UFF λ for the bond-order correction (dimensionless).
 const LAMBDA: f32 = 0.1332;
 
-/// Per-element UFF parameters: single-bond radius `x` (Å) and
-/// electronegativity `χ` (eV, GMP scale).
+/// Per-element UFF parameters: single-bond radius `x` (Å),
+/// electronegativity `χ` (eV, GMP scale), and nonbond (vdW) well
+/// depth `d` (kcal/mol).
 struct UffAtom {
     x: f32,
     chi: f32,
+    d: f32,
 }
 
-const fn atom(x: f32, chi: f32) -> UffAtom {
-    UffAtom { x, chi }
+const fn atom(x: f32, chi: f32, d: f32) -> UffAtom {
+    UffAtom { x, chi, d }
 }
 
-/// UFF Table I values for the organic/molecular subset.
+/// UFF Table I values for the organic/molecular subset. The well
+/// depths `d` are the published nonbond (D) parameters; the geometric
+/// mean is UFF's mixing rule for heteronuclear pairs.
 fn uff_atom(symbol: &str) -> Option<UffAtom> {
     let table: &[(&str, UffAtom)] = &[
-        ("H", atom(0.354, 2.886)),
-        ("B", atom(0.838, 4.607)),
-        ("C", atom(0.757, 5.343)),
-        ("N", atom(0.700, 6.899)),
-        ("O", atom(0.658, 8.741)),
-        ("F", atom(0.668, 9.240)),
-        ("Si", atom(1.117, 4.168)),
-        ("P", atom(1.000, 5.464)),
-        ("S", atom(1.046, 6.944)),
-        ("Cl", atom(1.044, 8.564)),
-        ("Br", atom(1.166, 7.946)),
-        ("I", atom(1.382, 7.180)),
+        ("H", atom(0.354, 2.886, 0.044)),
+        ("B", atom(0.838, 4.607, 0.180)),
+        ("C", atom(0.757, 5.343, 0.105)),
+        ("N", atom(0.700, 6.899, 0.069)),
+        ("O", atom(0.658, 8.741, 0.060)),
+        ("F", atom(0.668, 9.240, 0.050)),
+        ("Si", atom(1.117, 4.168, 0.402)),
+        ("P", atom(1.000, 5.464, 0.305)),
+        ("S", atom(1.046, 6.944, 0.274)),
+        ("Cl", atom(1.044, 8.564, 0.227)),
+        ("Br", atom(1.166, 7.946, 0.216)),
+        ("I", atom(1.382, 7.180, 0.170)),
     ];
-    table.iter().find(|(name, _)| *name == symbol).map(|(_, a)| UffAtom { x: a.x, chi: a.chi })
+    table
+        .iter()
+        .find(|(name, _)| *name == symbol)
+        .map(|(_, a)| UffAtom { x: a.x, chi: a.chi, d: a.d })
 }
 
 /// Normalize an element symbol to UFF spelling: first letter uppercase,
@@ -88,6 +95,19 @@ pub fn bond_rest_length(a: &str, b: &str, n: f32) -> Option<f32> {
     Some(a.x + b.x + r_bo - r_en)
 }
 
+/// UFF well depth of carbon — the reference for repulsion weights.
+const REFERENCE_WELL_DEPTH: f32 = 0.105;
+
+/// Per-atom repulsion weight for the force kernel: the element's UFF
+/// nonbond well depth relative to carbon's (dimensionless). The kernel
+/// mixes a pair with UFF's geometric-mean rule,
+/// `repulsion × √(wᵢ × wⱼ)`, so carbon–carbon pairs keep weight 1 and
+/// the global repulsion slider stays the overall scale. `None` when
+/// the element is untabulated — the caller falls back to weight 1.
+pub fn repulsion_weight(symbol: &str) -> Option<f32> {
+    let a = uff_atom(&normalize_symbol(symbol))?;
+    Some(a.d / REFERENCE_WELL_DEPTH)
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -150,4 +170,18 @@ mod tests {
         assert_eq!(bond_order("aromatic"), Some(1.5));
         assert_eq!(bond_order("owner"), None);
     }
+
+    #[test]
+    fn repulsion_weights_follow_uff_well_depths() {
+        // Carbon is the reference: weight exactly 1.
+        assert_close(repulsion_weight("C").unwrap(), 1.0, 1e-6, "C");
+        // Oxygen's shallower well (0.060 vs 0.105) weighs ~0.57.
+        assert_close(repulsion_weight("O").unwrap(), 0.060 / 0.105, 1e-4, "O");
+        // Silicon's deep well (0.402) outweighs carbon ~3.8×.
+        assert_close(repulsion_weight("Si").unwrap(), 0.402 / 0.105, 1e-4, "Si");
+        // Symbols normalize; unknown elements stay untyped.
+        assert_eq!(repulsion_weight("si"), repulsion_weight("Si"));
+        assert_eq!(repulsion_weight("Xx"), None);
+    }
 }
+

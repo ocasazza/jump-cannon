@@ -5,8 +5,10 @@ Status: active (2026-09). Phase 0 shipped — the SDF V3000 importer
 charges, and authored 2D coordinates into the graph, and the app seeds
 the sim from those coordinates (rings render as rings). Phase 1 shipped:
 bond order is a first-class edge kind end-to-end and the GPU spring
-takes per-edge UFF rest lengths. Remaining: Coulomb (ions), per-node
-vdW parameters, and angle terms — "The gaps" below.
+takes per-edge UFF rest lengths. Phase 2a shipped: per-node UFF
+well-depth weights drive repulsion (`repulsion × √(wᵢ × wⱼ)`) on the
+GPU, and Settings ▸ Layout shows when the molecular parameters are
+active. Remaining: Coulomb (ions) and angle terms — "The gaps" below.
 
 ## Research references (sdgr internal)
 
@@ -81,11 +83,14 @@ computing.
    `force.wgsl` `spring_step` reads a per-half-edge `edge_rests` buffer
    (binding 3, group 3) aligned with `edge_neighbors`; `precompute` fills
    it from edge `rest` metadata and falls back to the global spring
-   length for untyped/invalid entries.
 3. **No Coulomb term.** Repulsion is charge-blind.
-4. **Per-node element parameters are bond-length-only.** `uff.rs` carries
-   radii/electronegativities for UFF eq. 3 rest lengths; vdW well
-   depths (`D_i`) and masses are not yet wired into the sim.
+4. ~~**Per-node element parameters are bond-length-only.**~~ **Shipped
+   (well depths).** `uff.rs` now also carries UFF nonbond well depths
+   (`D_i`); the app attaches a per-node `repulsion` weight
+   (`D_i / D_carbon`) and `force.wgsl` `force_step` mixes each pair
+   with UFF's geometric-mean rule on the freed group(0) binding 8.
+   Untyped nodes/graphs are weight 1.0 — byte-identical behavior.
+   Per-node masses and vdW *radii* (contact distances) remain open.
 
 ## Shipped wire contract (phase 1)
 
@@ -100,13 +105,14 @@ and edges:
 | `GET /graph/edges/kinds` | JSON: sorted distinct edge kinds + revision |
 | `GET /graph/edges/kinds.bin` | u32 per edge (`/graph/edges` order) indexing the table; `u32::MAX` = untyped |
 
-The app (`graph_canvas::typed_edge_rests`) computes per-edge rests as
-`uff::bond_rest_length(element(src), element(tgt), bond_order(kind))`,
-revision-checks both tables against `Init`, and hands them to
-`build_topology_graph` as edge `rest` metadata. Any failure disables the
+The app (`graph_canvas::typed_force_params`) computes per-edge rests as
+`uff::bond_rest_length(element(src), element(tgt), bond_order(kind))`
+and per-node weights as `uff::repulsion_weight(element)`, revision-checks
+both tables against `Init`, and hands them to `build_topology_graph` as
+edge `rest` / node `repulsion` metadata. Any failure disables the
 feature; a graph without bond kinds is byte-identical in behavior to
 before. The vault/snapshot conversions (`graph_data_from_vault`) compute
-the same rests in-process for browser-local packages.
+the same values in-process for browser-local packages.
 
 ## Design: UFF-derived molecular attributes (original sketch, phase 2+)
 
@@ -177,8 +183,14 @@ the dynamic-bond fields already do.
 2. ~~`uff.rs` table + per-edge rest-length buffer in `force.wgsl`~~
    **Done** (without `MolecularLens`; wire buffers instead) → the sim
    relaxes typed graphs to real bond lengths.
-3. Charge term (ions) — zwitterion carboxylate/ammonium visibly attract.
-4. Angle terms (v2) — hybridization-correct ring shapes.
+3. ~~Per-node well-depth repulsion~~ **Done** — `force.wgsl`
+   `force_step` mixes `repulsion × √(wᵢ × wⱼ)` from the
+   `node_repulsion` buffer (group 0 binding 8, the freed `mass` slot;
+   force_step is now AT Chrome's 10-storage cap — see the BGL comment).
+   Settings ▸ Layout shows a "molecular parameters active" hint via
+   `graph_canvas::TYPED_FORCE_SUMMARY`.
+4. Charge term (ions) — zwitterion carboxylate/ammonium visibly attract.
+5. Angle terms (v2) — hybridization-correct ring shapes.
 
 ## Verified so far
 
@@ -201,3 +213,10 @@ the dynamic-bond fields already do.
   element tags (C 8, H 10, N 4, O 2), fused 6/5-ring core from the
   authored depiction; bonds carry kinds and the sim now relaxes toward
   per-edge UFF lengths instead of one uniform `spring_len`.
+- `cargo test -p graph-layouts` (71 lib) — `uff::repulsion_weight`
+  anchors (C = 1.0 reference, O ≈ 0.57, Si ≈ 3.8, normalization,
+  unknown fallback) and
+  `precompute_node_repulsion_aligns_with_node_order` (metadata weight,
+  NaN rejection, untyped 1.0 fallback). GPU sim tests green; the Rust
+  browser suite (`just test browser-rust`) passes with force_step at
+  the 10-storage cap.

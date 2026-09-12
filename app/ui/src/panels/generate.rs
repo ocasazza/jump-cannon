@@ -442,6 +442,8 @@ pub(crate) fn wcc_count(n_nodes: usize, edges: &[u32]) -> u32 {
 // back to defaults, which is also what the egui defaults — community /
 // pagerank — resolve to on a generated graph.
 fn graph_data_from_generated(g: &GeneratedGraph) -> GraphData {
+    // Generated graphs are untyped — molecular force parameters inactive.
+    *crate::graph_canvas::TYPED_FORCE_SUMMARY.write() = None;
     let mut id_to_idx: HashMap<String, u32> = HashMap::with_capacity(g.nodes.len());
     let mut ids: Vec<String> = Vec::with_capacity(g.nodes.len());
     for node in &g.nodes {
@@ -486,6 +488,7 @@ fn graph_data_from_generated(g: &GeneratedGraph) -> GraphData {
             colors,
             sizes,
             edge_rest: None,
+            node_repulsion: None,
         },
     }
 }

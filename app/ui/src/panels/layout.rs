@@ -3576,6 +3576,17 @@ fn gpu_force_ui() -> Element {
             }
         }
 
+        // Molecular mode: when the loaded graph carries element/bond
+        // typing, per-atom UFF repulsion weights and per-bond UFF rest
+        // lengths are baked into the GPU buffers and the sliders act as
+        // overall scale on top of them (not per-edge/per-node values).
+        if let Some((typed_nodes, typed_edges)) = *crate::graph_canvas::TYPED_FORCE_SUMMARY.read() {
+            div { class: "lay-hint",
+                "Molecular parameters active: {typed_nodes} per-atom UFF repulsion weights, \
+                 {typed_edges} per-bond UFF lengths — the sliders below scale on top of them."
+            }
+        }
+
         hr { class: "lay-sep" }
 
         div { class: "lay-sub", "Physics" }

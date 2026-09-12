@@ -106,10 +106,11 @@ pub async fn load() -> Result<GraphData, String> {
         }
     }
 
-    // Typed-edge contract (molecular graphs): UFF per-edge rest lengths.
-    // Any failure or inconsistency disables the feature — the sim then
-    // behaves exactly as before on the global spring length.
-    let edge_rest = match (
+    // Typed-attribute contract (molecular graphs): UFF per-edge rest
+    // lengths and per-node repulsion weights. Any failure or inconsistency
+    // disables the feature — the sim then behaves exactly as before on
+    // the global spring length / Coulomb strength.
+    let typed = match (
         api::revisioned_node_types().await,
         api::revisioned_edge_kinds().await,
     ) {
@@ -117,7 +118,7 @@ pub async fn load() -> Result<GraphData, String> {
             if (revision == 0 || types.revision == 0 || types.revision == revision)
                 && (revision == 0 || kinds.revision == 0 || kinds.revision == revision) =>
         {
-            typed_edge_rests(&types, &kinds, &edges, n)
+            typed_force_params(&types, &kinds, &edges, n)
         }
         (Ok(types), Ok(kinds)) => {
             return Err(format!(
@@ -126,7 +127,13 @@ pub async fn load() -> Result<GraphData, String> {
                 types.revision, kinds.revision,
             ));
         }
-        _ => None,
+        _ => {
+            *TYPED_FORCE_SUMMARY.write() = None;
+            TypedForceParams {
+                edge_rest: None,
+                node_repulsion: None,
+            }
+        }
     };
 
     let spring_len = GpuForceOptions::default().spring_len.max(1.0);
@@ -187,61 +194,99 @@ pub async fn load() -> Result<GraphData, String> {
             edges,
             colors,
             sizes,
-            edge_rest,
+            edge_rest: typed.edge_rest,
+            node_repulsion: typed.node_repulsion,
         },
     })
 }
 
-/// Per-edge spring rest lengths from the typed-edge wire (UFF bond
-/// geometry). `None` unless at least one edge resolves — untyped graphs
-/// skip the feature entirely and keep the global spring length. A `0.0`
-/// entry means "no typed geometry for this edge" (unknown kind, unknown
-/// element, missing table entry).
-fn typed_edge_rests(
+/// Summary of the typed (molecular) force parameters the last graph load
+/// resolved — `(typed nodes, typed edges)`. Surfaced by the Settings ▸
+/// Layout tab so the global sliders read as what they are: overall scale
+/// on top of per-atom/per-bond UFF values. `None` = feature inactive.
+pub(crate) static TYPED_FORCE_SUMMARY: GlobalSignal<Option<(usize, usize)>> =
+    Signal::global(|| None);
+
+/// Typed force parameters from the typed-attribute wire: per-edge UFF
+/// rest lengths plus per-node UFF repulsion weights. `None` unless at
+/// least one item resolves — untyped graphs skip the feature entirely
+/// and keep the global spring length / Coulomb strength. A `0.0` entry
+/// means "no typed value for this item" (unknown kind, unknown element,
+/// missing table entry).
+struct TypedForceParams {
+    edge_rest: Option<Vec<f32>>,
+    node_repulsion: Option<Vec<f32>>,
+}
+
+fn typed_force_params(
     types: &api::TypeTable,
     kinds: &api::TypeTable,
     edges: &[u32],
     n: usize,
-) -> Option<Vec<f32>> {
-    if types.table.is_empty() || kinds.table.is_empty() {
-        return None;
-    }
+) -> TypedForceParams {
     let n_edges = edges.len() / 2;
     if kinds.per_item.len() != n_edges || types.per_item.len() != n {
         // Mid-load swap the revision check did not catch (or an older
-        // server): never mount a misaligned rest table.
-        return None;
+        // server): never mount a misaligned table.
+        return TypedForceParams {
+            edge_rest: None,
+            node_repulsion: None,
+        };
     }
-    let mut any = false;
+    let element = |node: u32| -> Option<&str> {
+        let idx = *types.per_item.get(node as usize)?;
+        if idx == u32::MAX {
+            return None;
+        }
+        types.table.get(idx as usize).map(String::as_str)
+    };
+
+    // Per-node repulsion weights (UFF well depth relative to carbon).
+    let mut any_weight = false;
+    let mut weights = vec![0.0f32; n];
+    for (node, slot) in weights.iter_mut().enumerate() {
+        if let Some(w) = element(node as u32).and_then(graph_layouts::uff::repulsion_weight) {
+            *slot = w;
+            any_weight = true;
+        }
+    }
+
+    // Per-edge spring rest lengths (UFF bond geometry).
+    let mut any_rest = false;
     let mut rests = vec![0.0f32; n_edges];
-    for (e, slot) in rests.iter_mut().enumerate() {
-        let kind_idx = kinds.per_item[e];
-        if kind_idx == u32::MAX {
-            continue;
-        }
-        let Some(order) = kinds
-            .table
-            .get(kind_idx as usize)
-            .and_then(|kind| graph_layouts::uff::bond_order(kind))
-        else {
-            continue;
-        };
-        let element = |node: u32| -> Option<&str> {
-            let idx = *types.per_item.get(node as usize)?;
-            if idx == u32::MAX {
-                return None;
+    if !kinds.table.is_empty() {
+        for (e, slot) in rests.iter_mut().enumerate() {
+            let kind_idx = kinds.per_item[e];
+            if kind_idx == u32::MAX {
+                continue;
             }
-            types.table.get(idx as usize).map(String::as_str)
-        };
-        let (Some(a), Some(b)) = (element(edges[2 * e]), element(edges[2 * e + 1])) else {
-            continue;
-        };
-        if let Some(rest) = graph_layouts::uff::bond_rest_length(a, b, order) {
-            *slot = rest;
-            any = true;
+            let Some(order) = kinds
+                .table
+                .get(kind_idx as usize)
+                .and_then(|kind| graph_layouts::uff::bond_order(kind))
+            else {
+                continue;
+            };
+            let (Some(a), Some(b)) = (element(edges[2 * e]), element(edges[2 * e + 1])) else {
+                continue;
+            };
+            if let Some(rest) = graph_layouts::uff::bond_rest_length(a, b, order) {
+                *slot = rest;
+                any_rest = true;
+            }
         }
     }
-    any.then_some(rests)
+
+    *TYPED_FORCE_SUMMARY.write() = (any_weight || any_rest).then(|| {
+        (
+            weights.iter().filter(|w| **w > 0.0).count(),
+            rests.iter().filter(|r| **r > 0.0).count(),
+        )
+    });
+    TypedForceParams {
+        edge_rest: any_rest.then_some(rests),
+        node_repulsion: any_weight.then_some(weights),
+    }
 }
 
 /// Importer-authored 2D coordinates → sim seed: z = 0, recentered on the
@@ -301,6 +346,9 @@ fn authored_positions(flat: &[f32], edges: &[u32], n: usize, spring_len: f32) ->
 /// when any node carries them; otherwise the same deterministic sphere +
 /// coarsening warm-up as `load()` seeds the sim.
 pub(crate) fn graph_data_from_snapshot(snapshot: &graph_vcs::Snapshot) -> GraphData {
+    // World snapshots carry no typed attributes — the molecular force
+    // parameters (and their Layout-tab summary) are inactive here.
+    *TYPED_FORCE_SUMMARY.write() = None;
     let mut id_to_idx: HashMap<String, u32> = HashMap::with_capacity(snapshot.nodes.len());
     let mut ids: Vec<String> = Vec::with_capacity(snapshot.nodes.len());
     for id in snapshot.nodes.keys() {
@@ -368,6 +416,7 @@ pub(crate) fn graph_data_from_snapshot(snapshot: &graph_vcs::Snapshot) -> GraphD
             colors,
             sizes,
             edge_rest: None,
+            node_repulsion: None,
         },
     }
 }
@@ -416,6 +465,27 @@ pub(crate) fn graph_data_from_vault(graph: &vault_data::VaultGraph) -> GraphData
         }
         edge_rest.push(rest);
     }
+    // Per-node UFF repulsion weights, aligned with `ids` (the IndexMap's
+    // insertion order — same iteration as `id_to_idx` above). A 0.0
+    // entry means "untyped element" — weight-1.0 fallback in the sim.
+    let mut any_weight = false;
+    let mut node_repulsion: Vec<f32> = Vec::with_capacity(n);
+    for node in graph.nodes.values() {
+        let w = node
+            .meta
+            .doctype
+            .as_deref()
+            .and_then(graph_layouts::uff::repulsion_weight)
+            .unwrap_or(0.0);
+        if w > 0.0 {
+            any_weight = true;
+        }
+        node_repulsion.push(w);
+    }
+    let typed_nodes = node_repulsion.iter().filter(|w| **w > 0.0).count();
+    let typed_edges = edge_rest.iter().filter(|r| **r > 0.0).count();
+    *TYPED_FORCE_SUMMARY.write() = (any_weight || any_rest).then_some((typed_nodes, typed_edges));
+    let node_repulsion = any_weight.then_some(node_repulsion);
     let edge_rest = any_rest.then_some(edge_rest);
     let n_edges = (edges.len() / 2) as u32;
 
@@ -448,6 +518,7 @@ pub(crate) fn graph_data_from_vault(graph: &vault_data::VaultGraph) -> GraphData
             colors,
             sizes,
             edge_rest,
+            node_repulsion,
         },
     }
 }

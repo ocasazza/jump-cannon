@@ -91,6 +91,13 @@ pub struct GraphData {
     /// `graph_layouts::uff` over the `/graph/edges/kinds` + `/graph/nodes/types`
     /// wire.
     pub edge_rest: Option<Vec<f32>>,
+    /// Per-node repulsion weights (length = n), dimensionless UFF
+    /// well-depth ratios relative to carbon (1.0 = global Coulomb
+    /// strength). `None` when the graph has no typed nodes; inside `Some`,
+    /// a `0.0` entry means "untyped element" and the sim falls back to
+    /// weight 1.0. Sourced from `graph_layouts::uff::repulsion_weight`
+    /// over the `/graph/nodes/types` wire.
+    pub node_repulsion: Option<Vec<f32>>,
 }
 
 #[repr(C)]
@@ -610,7 +617,12 @@ impl GraphPipelines {
         });
 
         // Initialise the GPU force layout against the same positions buffer.
-        let layout_graph = build_topology_graph(&graph.positions, &graph.edges, graph.edge_rest.as_deref());
+        let layout_graph = build_topology_graph(
+            &graph.positions,
+            &graph.edges,
+            graph.edge_rest.as_deref(),
+            graph.node_repulsion.as_deref(),
+        );
         let layout: Option<Box<dyn DynPhysicsLayout>> = {
             let mut boxed: Box<dyn DynPhysicsLayout> = Box::new(BoxedPhysics::new(
                 GpuForceLayout::new(GpuForceOptions::default()),
@@ -1836,7 +1848,12 @@ impl GraphPipelines {
 /// flat position/edge buffers. The id padding scheme matches the egui
 /// app's `build_topology_graph` so the seed-position carryover semantics
 /// (precompute's per-node `position3` override) behave identically.
-fn build_topology_graph(positions: &[f32], edges: &[u32], edge_rest: Option<&[f32]>) -> GlGraph {
+fn build_topology_graph(
+    positions: &[f32],
+    edges: &[u32],
+    edge_rest: Option<&[f32]>,
+    node_repulsion: Option<&[f32]>,
+) -> GlGraph {
     let n = positions.len() / 3;
     let width = format!("{}", n.max(1) - 1).len().max(1);
 
@@ -1846,6 +1863,17 @@ fn build_topology_graph(positions: &[f32], edges: &[u32], edge_rest: Option<&[f3
         let mut node = GlNode::new(id.clone());
         if i * 3 + 2 < positions.len() {
             node.position3 = Some([positions[i * 3], positions[i * 3 + 1], positions[i * 3 + 2]]);
+        }
+        // `0.0` means "untyped element": leave the metadata unset so the
+        // sim's weight-1.0 fallback handles it identically to an untyped
+        // graph (same convention as the edge `rest` key).
+        if let Some(w) = node_repulsion.and_then(|r| r.get(i)).copied() {
+            if w > 0.0 && w.is_finite() {
+                node.metadata.insert(
+                    "repulsion".to_string(),
+                    graph_layouts::MetadataValue::Number(w as f64),
+                );
+            }
         }
         g.add_node(node);
     }

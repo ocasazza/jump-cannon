@@ -1061,6 +1061,9 @@ struct GpuState {
     edge_neighbors: wgpu::Buffer,
     /// Per-half-edge spring rest lengths (aligned with `edge_neighbors`).
     edge_rests: wgpu::Buffer,
+    /// Per-node repulsion weight (1.0 = global Coulomb strength); group(0)
+    /// binding(8). Untyped graphs are all-1.0, so behavior is unchanged.
+    node_repulsion: wgpu::Buffer,
     /// Hub-aware (Tigr) virtual-vertex CSR + per-virtual spring partials.
     /// Built once at GpuState init from `edge_offsets`/`edge_neighbors`. See
     /// `HUB_THRESHOLD` and `spring_step` in shaders/force.wgsl.
@@ -1180,6 +1183,12 @@ struct PreCompute {
     /// molecular graphs carry per-edge UFF lengths via the `rest` edge
     /// metadata key.
     edge_rests: Vec<f32>,
+    /// Per-node repulsion weight (dimensionless, relative to carbon's UFF
+    /// well depth). Untyped or invalid entries are 1.0 so the kernel's
+    /// `repulsion × √(wᵢ × wⱼ)` mixing degrades to the global Coulomb
+    /// strength for untyped graphs. Set from the `repulsion` node
+    /// metadata key.
+    node_repulsion: Vec<f32>,
     /// Virtual-vertex CSR (Tigr) for the hub-aware spring kernel.
     n_virtual: u32,
     virt_real_idx: Vec<u32>,
@@ -1244,6 +1253,19 @@ fn precompute(graph: &Graph, seed_mode: &SeedMode, spring_len: f32) -> PreComput
         // `init_with_device` skips the GPU upload entirely.
         SeedMode::None => vec![0.0f32; 3 * n_nodes as usize],
     };
+    // Per-node repulsion weights: non-positive or non-finite metadata
+    // would poison the √ mixing in the kernel — degrade to 1.0 (the
+    // global Coulomb strength) exactly like an untyped node.
+    let node_repulsion: Vec<f32> = node_order
+        .iter()
+        .map(|id| match graph.nodes[id].metadata.get("repulsion") {
+            Some(crate::types::MetadataValue::Number(w)) if w.is_finite() && *w > 0.0 => {
+                *w as f32
+            }
+            _ => 1.0,
+        })
+        .collect();
+
     // Defensive: if the seeder returned the wrong length (e.g. empty graph
     // edge case), fall back to a zero ball so downstream sizing stays sane.
     if seeded.len() != 3 * n_nodes as usize {
@@ -1375,6 +1397,7 @@ fn precompute(graph: &Graph, seed_mode: &SeedMode, spring_len: f32) -> PreComput
         n_nodes,
         n_edges,
         edge_rests,
+        node_repulsion,
         node_order,
         initial_positions: positions,
         velocities,
@@ -1545,8 +1568,12 @@ fn build_pipeline(device: &wgpu::Device) -> ForcePipelines {
         // just no longer consumes them and falls through to the naive
         // O(n²) branch in that case.
         //
-        // Binding 8 (mass) was also dropped — mass is now packed into
-        // positions[i].w (see force.wgsl preamble + precompute below).
+        // Binding 8 used to be `mass` (now packed into positions[i].w —
+        // see force.wgsl preamble); it now carries the per-node repulsion
+        // weight. force_step is AT the 10-storage cap: group 0 has 7
+        // storage buffers + octree (1) + trimmed spring (2). Adding any
+        // further force_step storage binding breaks Chrome WebGPU.
+        storage_entry(8, true),  // node_repulsion (read)
         storage_entry(9, false), // energy_out
     ];
     let bind_group_layout = device.create_bind_group_layout(
@@ -1812,6 +1839,7 @@ impl GpuState {
             edge_offsets: aux.off,
             edge_neighbors: aux.neigh,
             edge_rests: aux.rests,
+            node_repulsion: aux.repulsion,
             virt_csr_buf: aux.virt_csr,
             virt_edge_offsets_buf: aux.virt_edge_offsets,
             spring_force_partial_buf: aux.spring_force_partial,
@@ -1899,6 +1927,7 @@ impl GpuState {
             edge_offsets: aux.off,
             edge_neighbors: aux.neigh,
             edge_rests: aux.rests,
+            node_repulsion: aux.repulsion,
             virt_csr_buf: aux.virt_csr,
             virt_edge_offsets_buf: aux.virt_edge_offsets,
             spring_force_partial_buf: aux.spring_force_partial,
@@ -2169,8 +2198,8 @@ impl GpuState {
                 buf_entry(4, &self.edge_neighbors),
                 buf_entry(5, &self.params_buf),
                 // Bindings 6 + 7 omitted (cell_offsets / cell_nodes —
-                // see force.wgsl preamble). Binding 8 omitted (mass packed
-                // into positions[i].w).
+                // see force.wgsl preamble).
+                buf_entry(8, &self.node_repulsion),
                 buf_entry(9, &self.energy_buf),
             ],
         })
@@ -2530,6 +2559,8 @@ struct AuxBuffers {
     neigh: wgpu::Buffer,
     /// Per-half-edge spring rest lengths (aligned with `neigh`).
     rests: wgpu::Buffer,
+    /// Per-node repulsion weight (1.0 = global strength).
+    repulsion: wgpu::Buffer,
     /// Packs `node_to_virt_offsets` (length n+1) + `virt_real_idx`
     /// (length n_virtual) into one u32 buffer. See `build_aux_buffers`.
     virt_csr: wgpu::Buffer,
@@ -2573,6 +2604,11 @@ fn build_aux_buffers(device: &wgpu::Device, pc: &PreCompute) -> AuxBuffers {
     let rests = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("edge_rests"),
         contents: bytemuck::cast_slice(nonempty_f32(&pc.edge_rests)),
+        usage: wgpu::BufferUsages::STORAGE,
+    });
+    let repulsion = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("node_repulsion"),
+        contents: bytemuck::cast_slice(nonempty_f32(&pc.node_repulsion)),
         usage: wgpu::BufferUsages::STORAGE,
     });
     // Hub-aware (Tigr) virtual-vertex CSR + per-virtual spring partials.
@@ -2682,6 +2718,7 @@ fn build_aux_buffers(device: &wgpu::Device, pc: &PreCompute) -> AuxBuffers {
         off,
         neigh,
         rests,
+        repulsion,
         virt_csr,
         virt_edge_offsets,
         spring_force_partial,
@@ -3296,6 +3333,36 @@ mod tests {
         g.add_edge(Edge::new("bc", "b", "c"));
         g.add_edge(Edge::new("ca", "c", "a"));
         g
+    }
+
+    /// `node_repulsion` must stay aligned with `node_order` and fall back
+    /// to 1.0 (global Coulomb strength) for untyped or invalid weights —
+    /// otherwise the kernel's √(wᵢ×wⱼ) mixing poisons every pair.
+    #[test]
+    fn precompute_node_repulsion_aligns_with_node_order() {
+        use crate::types::MetadataValue;
+
+        let mut graph = triangle();
+        graph
+            .nodes
+            .get_mut("a")
+            .unwrap()
+            .metadata
+            .insert("repulsion".to_string(), MetadataValue::Number(0.57));
+        graph
+            .nodes
+            .get_mut("b")
+            .unwrap()
+            .metadata
+            .insert("repulsion".to_string(), MetadataValue::Number(f64::NAN));
+        // c stays untyped.
+
+        let pc = precompute(&graph, &SeedMode::Random, 8.0);
+        assert_eq!(pc.node_repulsion.len(), pc.node_order.len());
+        let idx = |name: &str| pc.node_order.iter().position(|id| id == name).unwrap();
+        assert_eq!(pc.node_repulsion[idx("a")], 0.57);
+        assert_eq!(pc.node_repulsion[idx("b")], 1.0, "NaN weight must fall back");
+        assert_eq!(pc.node_repulsion[idx("c")], 1.0, "untyped must fall back");
     }
 
     #[tokio::test(flavor = "current_thread")]
