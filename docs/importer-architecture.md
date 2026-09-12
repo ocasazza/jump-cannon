@@ -307,6 +307,42 @@ against the declared domain instead of the observed one, and `scale = "log"`
 Ranges are host-side presentation parameters only: they never change stored
 values, search behavior, or import validity.
 
+### Simulation and layout parameter ownership
+
+Every simulation and layout parameter — engine selection, force-sim
+constants, lens bindings, integrator triples, bonding knobs, static-layout
+settings — resolves through one overlay stack. From lowest to highest
+precedence:
+
+| Layer | Role |
+| --- | --- |
+| 1. Engine built-in defaults | The base settings, shipped in code. Must be stability-validated (e.g. the integrator triple verified against the real vault), never arbitrary. |
+| 2. Client defaults | Sensible defaults the client applies when nothing above overlays the base. This is the layer that makes a fresh session usable with zero configuration. |
+| 3. Importer package hints | A package MAY suggest an engine and sparse parameter set suited to its data shape (`[layout]` table). Hints are declarative data, never executable behavior, and lose to every layer above. |
+| 4. Host overrides | The host (graph-api deployment, via env/flag config) MAY overwrite **any** parameter. Host values always win; no package hint, client default, or client user edit outranks them. |
+
+Two rules make the stack work:
+
+**Overlays are sparse.** A layer only ever names the parameters it has an
+opinion about; every unset parameter falls through to the layer below. The
+client in particular must send only parameters the user (or its own tuned
+defaults) explicitly chose — today it serializes a fully-populated
+`LensConfig` on every selection, which stomps host values with client
+defaults and makes layer 4 unimplementable. Selection payloads become sparse
+overlays; the server merges base → client overlay → host overlay and versions
+the merged result through the existing selection generation.
+
+**The host is the final authority, and its authority is visible.** When the
+host overrides a parameter, the client renders the effective (host) value,
+not its own. A host override comes in two flavors: a *default* the client
+shows as the current value, and a *pin* the client must render as a
+disabled-with-reason control — pins exist for deployment facts the user
+cannot change from the browser (e.g. `use_gpu = false` on a GPU-less worker).
+Pins are the exception; most deployments set no overrides at all and the
+client default layer governs, which is exactly why that layer must be
+sensible.
+
+
 ### Implemented importer schemas
 
 All six selectable source kinds satisfy the version-1 contract:
