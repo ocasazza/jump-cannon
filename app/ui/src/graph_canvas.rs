@@ -13,7 +13,6 @@ use std::collections::HashMap;
 use dioxus::events::{MouseEvent, WheelEvent};
 use dioxus::html::geometry::WheelDelta;
 use dioxus::prelude::*;
-use graph_layouts::GpuForceOptions;
 
 use crate::api;
 use crate::render;
@@ -136,7 +135,7 @@ pub async fn load() -> Result<GraphData, String> {
         }
     };
 
-    let spring_len = GpuForceOptions::default().spring_len.max(1.0);
+    let spring_len = crate::panels::layout::active_spring_len(n);
     let positions = if init.positions_authored {
         // Importer-authored coordinates (e.g. an SDF 2D depiction): the
         // structure is the layout. Seed from them — centered and rescaled so
@@ -382,13 +381,13 @@ pub(crate) fn graph_data_from_snapshot(snapshot: &graph_vcs::Snapshot) -> GraphD
             flat.push(node.x);
             flat.push(node.y);
         }
-        let spring_len = GpuForceOptions::default().spring_len.max(1.0);
+        let spring_len = crate::panels::layout::active_spring_len(n);
         authored_positions(&flat, &edges, n, spring_len)
             .unwrap_or_else(|| render::data::spawn_on_unit_sphere(n, 800.0))
     } else {
         let mut positions = render::data::spawn_on_unit_sphere(n, 800.0);
         if n <= 10_000 {
-            let spring_len = GpuForceOptions::default().spring_len.max(1.0);
+            let spring_len = crate::panels::layout::active_spring_len(n);
             let warmed = graph_layouts::warmup_positions(n, &edges, spring_len, 0xC0A75E);
             if warmed.len() == positions.len() {
                 positions = warmed;
@@ -492,7 +491,7 @@ pub(crate) fn graph_data_from_vault(graph: &vault_data::VaultGraph) -> GraphData
     // No stored positions — seed from sphere + warmup, same as the snapshot path.
     let mut positions = render::data::spawn_on_unit_sphere(n, 800.0);
     if n <= 10_000 {
-        let spring_len = GpuForceOptions::default().spring_len.max(1.0);
+        let spring_len = crate::panels::layout::active_spring_len(n);
         let warmed = graph_layouts::warmup_positions(n, &edges, spring_len, 0xC0A75E);
         if warmed.len() == positions.len() {
             positions = warmed;

@@ -105,6 +105,29 @@ fn persist(s: &PanelState) {
 }
 
 static STATE: GlobalSignal<PanelState> = Signal::global(load_state);
+
+/// The gpu-force spring length the sim will actually run for a graph of
+/// `n_nodes`, read from the persisted panel state (NOT the live signal —
+/// callers run before the panel mounts). Boot presets (`?config=`) write
+/// this key before the post-apply reload, so a molecular preset's
+/// `spring_len: 1.4` is what the graph load must anchor its
+/// authored-coordinate rescale at; seeding at
+/// `GpuForceOptions::default().spring_len` (400) against per-edge UFF
+/// rests in ångström collapses the molecule to a point. Mirrors
+/// `apply_engine`'s first-apply fill (`for_n_nodes`) when no settings
+/// exist yet.
+pub(crate) fn active_spring_len(n_nodes: usize) -> f32 {
+    let st = load_state();
+    let configured = st
+        .settings
+        .get("gpu-force")
+        .and_then(|v| serde_json::from_value::<GpuForceOptions>(v.clone()).ok());
+    match configured {
+        Some(o) => o.spring_len,
+        None => GpuForceOptions::for_n_nodes(n_nodes).spring_len,
+    }
+    .max(1.0)
+}
 /// Latest `/compute/engines` result. `None` until the first fetch; the inner
 /// `Result` distinguishes a server error from a successful "no worker" view.
 static COMPUTE: GlobalSignal<Option<Result<ComputeEngines, String>>> = Signal::global(|| None);

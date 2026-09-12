@@ -234,3 +234,11 @@ the dynamic-bond fields already do.
   damping 0.9`; the same options ship as the boot preset
   `app/configs/caffeine-uff.yaml` (`?config=caffeine-uff`, served via
   `GET /configs` with `--configs-dir`/`JUMP_CANNON_CONFIGS_DIR`).
+  Live boot verified: `--source pest --importer-manifest packages/sdf.toml
+  --importer-input packages/examples/sdf-caffeine.txt` + `?config=caffeine-uff`
+  renders the full molecule (fused 6/5-ring core, methyl tails, two
+  oxygens). The graph load seeds authored coordinates rescaled to the
+  *active* `spring_len` (`panels::layout::active_spring_len`, which reads
+  the persisted panel state the boot preset wrote) — seeding at the
+  `GpuForceOptions::default()` 400 against ångström UFF rests collapsed
+  the molecule to a single point.
