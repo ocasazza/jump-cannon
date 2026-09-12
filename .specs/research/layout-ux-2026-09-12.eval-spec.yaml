@@ -1,0 +1,527 @@
+rrd_cycle_applied: true
+self_verification_completed: true
+
+evaluation_specification:
+  metadata:
+    user_prompt: >-
+      Design a UI/UX pattern for Jump Cannon's Layout panel that fits ALL use cases
+      (vault-scale force graphs, molecular UFF-typed graphs with authored coordinates,
+      generated graphs, untyped importer graphs, remote compute engines with own
+      settings schemas, static one-shot solvers), replacing the flat-physics-constants
+      panel whose knobs lie about applicability when importer data owns simulation
+      dimensions. Constraints: Rust+Dioxus only (no JS), styling in app.css +
+      panel_kit::CSS, ~340-480px dockable panel, impeccable.style Operate-mode
+      doctrine, packages-not-crates, no engine changes for the core pattern.
+    artifact_type: >-
+      full design documents (panel information architecture, ASCII wireframes, data
+      flow, six use-case walkthroughs, persistence semantics, migration from
+      PanelState, kaizen phasing, judge-condition responses)
+    artifacts_under_evaluation:
+      solution.a.md: "C2 — Engine capability manifests"
+      solution.b.md: "C3 — Per-graph-class forms"
+      solution.c.md: "C1 — Regime-as-data registry"
+    selection_goal: >-
+      Comparative evaluation of the three expanded solutions: rank them, select a
+      primary pattern, and identify which elements of the non-primary solutions
+      merge into it (judges noted C1+C2 are likely one pattern; B1 intent sliders
+      are a likely synthesis ingredient).
+    ground_truth: >-
+      .specs/research/layout-ux-context.md (integration points, doctrine) and
+      .specs/research/layout-ux-2026-09-12.selection.md (judge conditions,
+      consensus observations). Claims contradicting these documents are defects,
+      not creative license.
+
+  judge_output_contract:
+    per_dimension_fields: [criterion_name, score, reason]
+    per_checklist_fields: [id, answer, evidence]
+    summary_fields: [overall_label, weighted_score, rank_justification, merge_map]
+    instructions: >-
+      Score each rubric dimension 1-5 by placing the solution document against its
+      two anchors; interpolate for intermediate cases and extrapolate to 1 (worse
+      than the score_2 anchor) or 5 (clearly beyond the score_4 anchor). Answer
+      every checklist item YES or NO with a one-line evidence citation (section
+      heading or quoted line) from the document. For CK-206, apply only the branch
+      matching the file under evaluation. Compute weighted_score as the weighted
+      sum of dimension scores, then apply the essential gate and pitfall penalties
+      defined in scoring. Rank the three documents by adjusted score; overall_label
+      is one of select / hold / reject per the ranking rules. merge_map names the
+      specific elements of each non-primary document that should merge into the
+      primary (e.g. C1's why-capsule, B1's intent sliders, a bounded form set).
+
+  checklist:
+    - id: CK-201
+      question: >-
+        Does the document explicitly walk through all six use cases by name:
+        (1) vault graphs 1k-100k+ nodes, (2) molecular graphs with UFF-typed
+        bonds/atoms and authored coordinates, (3) generated graphs, (4) untyped
+        importer graphs, (5) remote compute engines with their own settings
+        schemas, (6) static one-shot solvers alongside live sims — each with a
+        concrete panel-state walkthrough, not a one-line mention?
+      category: hard_rule
+      importance: essential
+      rationale: >-
+        The CK-001 gate dominated pruning (15-16 of 18 proposals never named
+        remote engines/static solvers); the expansion contract makes all six
+        walkthroughs mandatory. Deferring any case to "existing forms" repeats
+        the exact failure that gated C1.
+
+    - id: CK-202
+      question: >-
+        When importer data owns a simulation dimension (e.g. 25/25 UFF-typed
+        bonds), is the corresponding control absent, disabled, repurposed, or
+        relabeled on EVERY surface the document specifies — including advanced
+        drawers, escape hatches, and raw-settings editors — never rendered as a
+        live knob?
+      category: hard_rule
+      importance: essential
+      rationale: >-
+        The measured root defect is the dead spring_len slider lying to the user.
+        An escape surface full of raw GpuForceOptions knobs re-arms the lie one
+        click deeper and is the most likely expansion-stage failure mode.
+
+    - id: CK-203
+      question: >-
+        Is every specified UI mechanism implementable in Rust + Dioxus 0.6 with
+        no JavaScript/TypeScript anywhere, and with styling confined to
+        app/ui/assets/app.css and panel_kit::CSS?
+      category: hard_rule
+      importance: essential
+      rationale: >-
+        Hard platform constraint; any mechanism requiring JS widgets, external
+        UI libraries, or a new styling pipeline is undeployable.
+
+    - id: CK-204
+      question: >-
+        Does the core pattern require no engine changes (engine changes, if any,
+        are quarantined in a later, explicitly justified phase)?
+      category: hard_rule
+      importance: essential
+      rationale: >-
+        Explicit constraint restated in the expansion contract; an expansion
+        that smuggles engine work into the core pattern violates the brief.
+
+    - id: CK-205
+      question: >-
+        Does the document contain every contract section: panel information
+        architecture (exact sections, controls, states), data flow (named
+        signals/state driving rendering), six use-case walkthroughs, persistence
+        semantics, migration from today's PanelState, kaizen phasing, explicit
+        judge-condition responses, and at least one ASCII wireframe?
+      category: hard_rule
+      importance: essential
+      rationale: >-
+        Contract-mandated structure; a missing section makes the document
+        ungradeable on that axis and unshippable as docs/layout-ux.md material.
+
+    - id: CK-206
+      question: >-
+        Does the document explicitly respond to its proposal's judge conditions
+        from the selection doc — solution.a (C2): CK-006 absence-vs-provenance
+        (merge C1's why-capsule) AND CK-005 manifests derived from existing
+        serde schemas rather than new compiled tables; solution.b (C3): bounded
+        form count with defined seventh-case behavior AND hybrid-class merge
+        behavior for partially typed graphs; solution.c (C1): explicit coverage
+        of remote engines and static solvers (its pruning gate failure)?
+      category: hard_rule
+      importance: essential
+      rationale: >-
+        These conditions were the price of selection; an expansion that ignores
+        them relitigates the pruning verdict instead of honoring it.
+
+    - id: CK-207
+      question: >-
+        Are the codebase integration points the design relies on consistent with
+        the documented ground truth — TYPED_FORCE_SUMMARY (typed_nodes,
+        typed_edges), GpuForceOptions fields and for_n_nodes, PanelState
+        persisted at jc_layout_v1, remote engines' /compute/engines settings
+        JSON, ?config= boot presets, authored-position seeding via seed_mode?
+      category: hard_rule
+      importance: essential
+      rationale: >-
+        Pruning judges grep-verified codebase claims; a full design built on
+        fabricated signals, renamed APIs, or invented persistence keys cannot
+        be implemented as written.
+
+    - id: CK-208
+      question: >-
+        Do the wireframes and information architecture fit a ~340-480px-wide
+        dockable panel-kit panel without requiring a full-screen surface, modal
+        takeover, or separate window?
+      category: hard_rule
+      importance: important
+      rationale: >-
+        The Layout panel is one of many dockable panels; designs that only work
+        as a page violate the container constraint.
+
+    - id: CK-209
+      question: >-
+        Is migration from jc_layout_v1 specified concretely — a versioned schema,
+        exact handling of old payloads (field-by-field or by explicit rule), and
+        a defined fallback for missing/unparseable state — rather than "bump
+        the version and discard"?
+      category: hard_rule
+      importance: important
+      rationale: >-
+        Silent breakage of persisted state or ?config= boot presets regresses
+        every existing user and the caffeine-uff.yaml workflow.
+
+    - id: CK-210
+      question: >-
+        Are persistence semantics specified — what persists, where, and the
+        precedence among data-owned (L0), regime/preset defaults (L1), and
+        user-set (L2) values when they collide?
+      category: principle
+      importance: important
+      rationale: >-
+        The root cause of the lying panel is three parameter layers rendered as
+        one; a solution that never states layer precedence leaves the collision
+        unresolved in the persistence layer.
+
+    - id: CK-211
+      question: >-
+        Does the design respect "packages, not crates" — behavior driven by
+        configuration/data (YAML registries, existing settings JSON, derived
+        applicability) rather than new compiled per-engine or per-class tables?
+      category: principle
+      importance: important
+      rationale: >-
+        Explicit repo philosophy and the CK-005 concern flagged on C2 at
+        selection time.
+
+    - id: CK-212
+      question: >-
+        Is the first phase the smallest independently shippable increment that
+        removes at least one measured lie (e.g. the dead spring_len slider or
+        the false banner), with later phases each justified?
+      category: principle
+      importance: important
+      rationale: >-
+        Kaizen phasing is a contract requirement; a big-bang phase 1 that lands
+        schema + renderer + migration + presets at once is the anti-pattern.
+
+    - id: CK-213
+      question: >-
+        Is the document faithful to its proposal's core approach (C2 capability
+        manifests / C3 per-graph-class forms / C1 regime-as-data registry)
+        rather than quietly substituting a different pattern?
+      category: principle
+      importance: important
+      rationale: >-
+        The comparison is only meaningful if each artifact develops the approach
+        the judges selected; a bait-and-switch corrupts the synthesis decision.
+
+    - id: CK-214
+      question: >-
+        Does the document address B1 intent sliders (dimensionless multipliers
+        writing through into GpuForceOptions) — either adopting them as a
+        synthesis ingredient or explicitly rejecting them with a rationale?
+      category: principle
+      importance: important
+      rationale: >-
+        Judge consensus named B1 the strongest interaction-model element;
+        silence on it leaves the synthesis question unanswered.
+
+    - id: CK-215
+      question: >-
+        Does the design leave its specialization unbounded — no cap on the
+        number of forms/manifests/regimes and no defined behavior when a
+        seventh graph class or engine appears?
+      category: principle
+      importance: pitfall
+      rationale: >-
+        Bespoke-per-class proliferation was the CK-010 pitfall flagged on C3
+        and generalizes to all three; YES means the anti-pattern is present.
+
+    - id: CK-216
+      question: >-
+        Does any part of the design rely on opaque auto-magic ("the panel just
+        figures out the right layout") that hides control and provenance from
+        the user?
+      category: principle
+      importance: pitfall
+      rationale: >-
+        Violates Operate-mode doctrine (state legible at a glance, provenance
+        visible) and repeats the lying-knob problem in a new costume.
+
+    - id: CK-217
+      question: >-
+        Are vault-regime presets (Fast/Balanced/Pretty with spring_len 40/60/80)
+        still offered unchanged to fully typed molecular graphs?
+      category: principle
+      importance: pitfall
+      rationale: >-
+        Every current preset is wrong for a molecule; leaving them selectable
+        for typed graphs keeps a known trap armed.
+
+    - id: CK-218
+      question: >-
+        Does an advanced/escape surface reintroduce raw flat physics knobs that
+        lie about applicability (unfiltered GpuForceOptions sliders, unscoped
+        raw JSON of local options)?
+      category: principle
+      importance: pitfall
+      rationale: >-
+        The most probable expansion-stage regression: honesty in the default
+        view, dishonesty one disclosure deeper. YES should reduce the score.
+
+    - id: CK-219
+      question: >-
+        Does the document substitute hand-waving ("the panel adapts
+        appropriately", "sensible defaults are chosen") for specified behavior
+        in any of the six walkthroughs or the data-flow section?
+      category: principle
+      importance: pitfall
+      rationale: >-
+        Vagueness was ungradeable at proposal stage and is disqualifying in a
+        full solution meant to drive implementation.
+
+  rubric_dimensions:
+    - name: Six-Use-Case Coverage Depth
+      description: >-
+        Does every one of the six use cases get a concrete walkthrough — the
+        panel's rendered state, which controls are present and which absent,
+        what the provenance display says — through the document's own
+        mechanism? Does the mechanism absorb a seventh case (new importer, new
+        remote engine) without redesign, or does coverage stop where the
+        author's enumeration stopped?
+      scale: 1-5
+      weight: 0.16
+      instruction: >-
+        Walk all six cases through the document's mechanism, checking each
+        against the walkthrough section for panel state, control set, and
+        provenance. Then ask what happens when a seventh engine or graph class
+        appears. Place the document against the anchors: cases deferred to
+        "existing forms" or covered by assertion pull toward score_2; six
+        concrete walkthroughs plus defined seventh-case behavior push toward
+        score_4 and beyond.
+      anchors:
+        contrast: >-
+          Every case gets a concrete panel-state walkthrough, not a deferral to
+          existing forms.
+        score_2: |
+          Generated and importer graphs are untyped, so they behave like vault.
+          Remote engines and static solvers keep their existing forms for now.
+        score_4: |
+          ## Walkthrough: remote engine (case 5)
+          Regime capsule reads "Remote: fdeno — settings served by engine";
+          controls render from the engine's existing /compute/engines settings
+          JSON; no local physics rows are constructed. A remote engine without
+          a settings schema falls back to the same generic renderer over {}.
+
+    - name: Control Honesty and Applicability
+      description: >-
+        Is every control the document specifies — on the default view AND on
+        every escape surface (advanced drawer, raw editor, expert mode) — live
+        only when the dimension it governs is actually adjustable for the
+        current graph? Is the regime/unit collision (vault-unit spring_len vs
+        ångström UFF rests) resolved structurally, or are dead or mis-scaled
+        knobs still reachable anywhere?
+      scale: 1-5
+      weight: 0.18
+      instruction: >-
+        Audit every control surface the document specifies, for a fully typed
+        molecular graph and for a vault graph. Hunt specifically the advanced
+        drawer and any raw/JSON escape hatch. Any surface where a data-owned
+        or wrong-regime knob is still reachable pulls the score toward
+        score_2; applicability truth enforced identically on all surfaces
+        pushes toward score_4 and beyond.
+      anchors:
+        contrast: >-
+          Escape surfaces obey the same applicability truth, not reintroduce
+          raw knobs.
+        score_2: |
+          An "Advanced" disclosure reveals the raw GpuForceOptions sliders for
+          power users.
+        score_4: |
+          The advanced drawer emits only rows whose applicability predicate is
+          live for the current graph; for 25/25 UFF-typed bonds the spring_len
+          row is absent here too.
+
+    - name: Provenance Legibility
+      description: >-
+        Can the user see, per parameter, which layer owns it — data-owned
+        (importer), regime default, or user-set — and why a control is absent
+        or a value applied? Does the document fix the false banner
+        ("sliders scale on top") with truthful per-parameter provenance rather
+        than silent absence or another summary claim?
+      scale: 1-5
+      weight: 0.12
+      instruction: >-
+        For each walkthrough, check what the user is told about ownership:
+        absence alone (control silently missing), a single aggregate banner,
+        or per-parameter why-text. Verify the document explicitly corrects the
+        false "sliders scale on top" claim. Place against the anchors.
+      anchors:
+        contrast: >-
+          Absence is explained with per-parameter provenance, not left silent
+          or re-aggregated.
+        score_2: |
+          Inapplicable controls are simply not rendered; the banner reads
+          "Molecular parameters active".
+        score_4: |
+          Where the spring_len row would be, a why-capsule reads "25 bond
+          lengths from UFF import — spring length is data-owned"; the old
+          "sliders scale on top" banner is deleted, not reworded.
+
+    - name: Operate-Mode UX Quality
+      description: >-
+        Is the default view calm and glanceable — few meaningful controls,
+        state readable at a glance, one primary action per screen, labels over
+        placeholders — with advanced surface tucked away? Do the wireframes
+        avoid slop (nested cards, icon-tile stacks, eyebrow chips, gradient
+        accents, decorative motion) and fit the 340-480px panel?
+      scale: 1-5
+      weight: 0.12
+      instruction: >-
+        Read the wireframes and IA for the default (non-expanded) state of a
+        vault graph and a molecular graph: count the elements a user must
+        parse before acting, check the primary action is singular and obvious,
+        check anti-slop rules. Place against the anchors: the dense form plus
+        another toggle sits near score_2; a small provenance-plus-intent
+        default with a collapsed advanced drawer sits near score_4.
+      anchors:
+        contrast: >-
+          Glanceable state with few live controls, not the same dense form
+          plus another toggle.
+        score_2: |
+          A "Molecular mode" checkbox is added above the existing ten sliders
+          and three preset buttons.
+        score_4: |
+          Default view: regime capsule ("vault-large — 12,400 nodes") plus an
+          intent row (spread out / settle faster); raw rows live in a
+          collapsed drawer.
+
+    - name: Constraint Feasibility and Data-Flow Specificity
+      description: >-
+        Is the rendering pipeline specified against named, existing data
+        sources — TYPED_FORCE_SUMMARY, GpuForceOptions/for_n_nodes, PanelState,
+        /compute/engines settings JSON, ?config= presets — and buildable with
+        Dioxus 0.6 signals/rsx and existing panel-kit components, no JS, no
+        new crates, no engine changes in the core pattern? Or does "state
+        drives the UI" hand-wave the data flow?
+      scale: 1-5
+      weight: 0.12
+      instruction: >-
+        Map each claimed UI behavior in the data-flow section to the concrete
+        signal or state that drives it. Flag anything requiring JS, a new
+        crate, an engine change in the core pattern, or a data source not in
+        the ground-truth list. Place against the anchors: unnamed "state"
+        pulls toward score_2; named signals with derivations push toward
+        score_4.
+      anchors:
+        contrast: >-
+          Named existing signals drive rendering, not unspecified "state".
+        score_2: |
+          The panel reads the current graph state and renders the appropriate
+          controls.
+        score_4: |
+          Row emission keys off TYPED_FORCE_SUMMARY (typed_nodes, typed_edges)
+          plus node count; remote controls render from the engine's existing
+          /compute/engines settings JSON.
+
+    - name: Migration and Persistence Soundness
+      description: >-
+        Is the path from today's jc_layout_v1 PanelState to the new model
+        concrete and lossless-tolerant — versioned schema, explicit handling
+        of old payloads, defined fallback, boot-preset (?config=) compatibility,
+        and stated layer precedence — or is migration a version bump that
+        discards existing users' state?
+      scale: 1-5
+      weight: 0.12
+      instruction: >-
+        Read the persistence/migration section and test it against the actual
+        v1 shape: { active, settings per engine, seed_strategy, seed_custom }
+        at jc_layout_v1, plus ?config= boot presets like caffeine-uff.yaml.
+        Credit concrete read/write rules and fallbacks; discount discards and
+        unexamined preset interactions. Place against the anchors.
+      anchors:
+        contrast: >-
+          Old payloads migrate with a defined fallback, not discarded on a
+          version bump.
+        score_2: |
+          We bump the localStorage key to jc_layout_v2; old settings are
+          discarded.
+        score_4: |
+          Reader accepts v1 payloads: missing regime field → resolve from
+          TYPED_FORCE_SUMMARY + node count; settings re-keyed per engine;
+          unparseable → for_n_nodes fallback. Writer emits v2 with schema: 2.
+
+    - name: Kaizen Phasing
+      description: >-
+        Is the first phase the smallest increment that ships alone and removes
+        at least one measured lie (the dead spring_len slider, the false
+        banner), with each later phase adding one justified layer — versus a
+        big-bang phase 1 bundling schema, renderer, migration, and presets?
+      scale: 1-5
+      weight: 0.08
+      instruction: >-
+        Read the phasing section. Check phase 1 is small, independently
+        shippable, and deletes a named lie; check later phases are ordered by
+        value and each justified (engine changes, if any, last and argued).
+        Place against the anchors.
+      anchors:
+        contrast: >-
+          Phase 1 ships alone and deletes a named lie, not bundles the whole
+          design.
+        score_2: |
+          Phase 1: implement the manifest schema, the renderer, the migration,
+          and the new presets.
+        score_4: |
+          Phase 1 (ships alone): truthful banner + applicability-filtered rows
+          for the local engine — the lying spring_len slider is deleted.
+          Phase 2 adds the registry; phase 3 adopts intent sliders.
+
+    - name: Mergeability and Synthesis
+      description: >-
+        Is the document designed so the artifacts can merge — shared
+        vocabulary and data shapes with the other two approaches (regime
+        capsule ≈ capability record ≈ form schema), explicit treatment of the
+        C1+C2 one-pattern observation, and a concrete adopt/reject position on
+        B1 intent sliders? Or is it a silo that forces a winner-take-all
+        choice?
+      scale: 1-5
+      weight: 0.10
+      instruction: >-
+        Look for a merge/synthesis section and shared concepts named in common
+        with the other proposals (why-capsule, applicability predicate,
+        regime, manifest, intent multiplier). Check the B1 position is
+        concrete (adopted where, or rejected why). Place against the anchors.
+      anchors:
+        contrast: >-
+          Shared vocabulary enabling the C1+C2+B1 merge, not a siloed design.
+        score_2: |
+          (The document never mentions the other proposals, the one-pattern
+          observation, or intent sliders.)
+        score_4: |
+          The regime capsule and the capability manifest are one applicability
+          record; C1's registry is the same data with a resolver. B1 intent
+          sliders are adopted in phase 3 as dimensionless multipliers writing
+          through into GpuForceOptions.
+
+  scoring:
+    aggregation: weighted_sum
+    total_weight: 1.0
+    dimension_scale: 1-5
+    essential_gate: >-
+      If any essential checklist item (CK-201, CK-202, CK-203, CK-204, CK-205,
+      CK-206, CK-207) is NO, the document's final score is capped at 2.0
+      regardless of rubric scores, and its overall_label cannot exceed hold.
+    pitfall_penalty: >-
+      For each pitfall item (CK-215, CK-216, CK-217, CK-218, CK-219) answered
+      YES, subtract 0.25 from the weighted score (floor 1.0).
+    ranking: >-
+      Rank the three documents by final adjusted score descending. Break ties
+      by, in order: (1) Control Honesty and Applicability score, (2)
+      Six-Use-Case Coverage Depth score, (3) fewer YES pitfall answers.
+    labels: >-
+      Rank 1: select (primary pattern). Ranks 2-3: hold (merge contributor)
+      unless adjusted score < 2.5 or gate-capped, in which case reject. The
+      verdict MUST include a merge_map naming which specific elements of each
+      non-primary document merge into the primary (per judge consensus, expect
+      candidates such as C1's why-capsule, C3's bounded form set, B1's intent
+      sliders).
+    verification_duty: >-
+      Judges MUST verify codebase-dependent claims against
+      .specs/research/layout-ux-context.md ground truth (as pruning judges
+      grep-verified proposals). Report any document whose high score rests on
+      claims that contradict the ground truth, and answer CK-207 accordingly.

@@ -38,6 +38,17 @@ segment's dot reports [[Compute]] worker health, and browsing one backend while
 an engine from the other is running surfaces a banner that jumps back to the
 running engine's gallery.
 
+The Layout tab's parameter surface is being redesigned around capability-honest
+regimes: named YAML regimes resolve from the loaded graph, engine capability
+manifests decide which controls exist, and data-owned simulation dimensions
+(UFF-typed bonds/atoms) render as provenance capsules instead of live knobs.
+The measured defects it fixes (dead `spring_len` slider on typed graphs, the
+false "sliders scale on top" banner, vault presets offered to molecular
+geometry), the registry schema, and the kaizen phasing live in
+`docs/layout-ux.md`; the engine truth it binds to (typed rests win outright,
+repulsion mixes via √(wᵢ×wⱼ), `seed_mode: none` keeps authored coordinates) is
+in `docs/molecular-force-layout.md`.
+
 The command palette's existing Go to Layout, Go to Style, and Go to Camera
 actions open Settings on the corresponding tab. Existing Layout, Style, and
 Camera values keep their independent localStorage keys, so consolidating the

@@ -1,0 +1,340 @@
+rrd_cycle_applied: true
+self_verification_completed: true
+
+evaluation_specification:
+  metadata:
+    user_prompt: >-
+      Design a UI/UX pattern for Jump Cannon's Layout panel that fits ALL use cases
+      (vault-scale force graphs, molecular graphs with importer-typed per-bond/per-atom
+      UFF parameters and authored coordinates, generated graphs, untyped importer graphs,
+      remote compute engines, static solvers), replacing the current flat-physics-constants
+      panel whose knobs lie about applicability when importer data owns simulation
+      dimensions. Constraints: Rust+Dioxus only (no JS), styling in app.css + panel_kit::CSS,
+      ~340-480px dockable panel, impeccable.style Operate-mode doctrine.
+    artifact_type: >-
+      proposals (high-level UI/UX approaches with probability estimates, not full
+      implementations)
+    selection_goal: >-
+      Comparative pruning: rank all candidate proposals and select the top 3 for full
+      development into docs/layout-ux.md.
+    evaluation_unit: >-
+      One proposal (an approach with name, summary, description, design decisions,
+      trade-offs, probability, complexity, and risks).
+
+  judge_output_contract:
+    per_dimension_fields: [criterion_name, score, reason]
+    per_checklist_fields: [id, answer, evidence]
+    summary_fields: [overall_label, weighted_score, rank_justification]
+    instructions: >-
+      Score each rubric dimension 1-5 by placing the proposal against its two anchors;
+      interpolate for intermediate cases and extrapolate to 1 (worse than score_2 anchor)
+      or 5 (clearly beyond score_4 anchor). Answer every checklist item YES or NO with a
+      one-line evidence citation from the proposal text. Compute weighted_score as the
+      weighted sum of dimension scores, then apply the essential gate and pitfall penalties
+      defined in scoring. Rank proposals by adjusted score; overall_label is one of
+      select / hold / reject.
+
+  checklist:
+    - id: CK-001
+      question: >-
+        Does the proposal explicitly address all six use cases: (1) vault graphs
+        1k-100k+ nodes, (2) molecular graphs with UFF-typed bonds/atoms and authored
+        coordinates, (3) generated graphs, (4) untyped importer graphs, (5) remote
+        compute engines with their own settings schemas, (6) static one-shot solvers
+        alongside live sims?
+      category: hard_rule
+      importance: essential
+      rationale: >-
+        The assignment's core demand is one pattern fitting ALL use cases; a proposal
+        that silently drops a case (commonly remote engines or static solvers) fails
+        the brief outright.
+
+    - id: CK-002
+      question: >-
+        Does the proposal ensure that when importer data owns a simulation dimension
+        (e.g. 25/25 UFF-typed bonds), the corresponding knob is disabled, hidden,
+        repurposed, or relabeled — never rendered as a live control?
+      category: hard_rule
+      importance: essential
+      rationale: >-
+        The measured root defect is the dead spring_len slider lying to the user;
+        any proposal that leaves data-owned dimensions rendered as live knobs
+        perpetuates the exact bug being fixed.
+
+    - id: CK-003
+      question: >-
+        Is the proposal implementable in Rust + Dioxus 0.6 with no JavaScript/TypeScript
+        anywhere, and with styling confined to app/ui/assets/app.css and panel_kit::CSS?
+      category: hard_rule
+      importance: essential
+      rationale: >-
+        Hard platform constraint; a pattern requiring JS widgets, external UI
+        libraries, or a different styling pipeline is undeployable.
+
+    - id: CK-004
+      question: >-
+        Does the proposal fit a ~340-480px-wide dockable panel-kit panel without
+        requiring a full-screen surface or a separate window?
+      category: hard_rule
+      importance: important
+      rationale: >-
+        The Layout panel is one of many dockable panels; patterns that only work as
+        a page/modal takeover violate the container constraint.
+
+    - id: CK-005
+      question: >-
+        Does the core pattern avoid new crates, engine changes, and new compiled
+        per-engine tables (respecting the repo's "packages, not crates"
+        configuration-over-code philosophy)?
+      category: hard_rule
+      importance: important
+      rationale: >-
+        Explicit constraint: no new compiled surface for the core pattern; engine
+        changes only if a later phase justifies them.
+
+    - id: CK-006
+      question: >-
+        Does the proposal make parameter provenance visible to the user — which values
+        are data-owned (importer), which are regime defaults, which are user-set?
+      category: principle
+      importance: important
+      rationale: >-
+        "Provenance visible" is an explicit doctrine requirement and the fix for the
+        false "sliders scale on top of them" banner.
+
+    - id: CK-007
+      question: >-
+        Does the proposal resolve the regime/unit collision structurally (e.g. typed
+        rest lengths in ångström vs vault-unit spring_len/repulsion) rather than by
+        rescaling slider ranges or adding unit-converted copies of the same knobs?
+      category: principle
+      importance: important
+      rationale: >-
+        Rescaling a vault-regime slider to ångström-looking numbers leaves the
+        multiplicative collision with typed weights intact; only a layered model
+        fixes it.
+
+    - id: CK-008
+      question: >-
+        Does the proposal contain every required contract field: name plus one-sentence
+        summary, a 2-3 paragraph detailed description, key design decisions with
+        rationale, trade-offs, a probability estimate, a complexity rating
+        (low/medium/high), and risks with failure modes?
+      category: hard_rule
+      importance: important
+      rationale: >-
+        Contract-mandated structure; missing fields make the proposal ungradeable on
+        the missing axes.
+
+    - id: CK-009
+      question: >-
+        Does the proposal preserve (or specify an explicit migration for) the existing
+        integration points: PanelState localStorage key jc_layout_v1, ?config= boot
+        presets, the TYPED_FORCE_SUMMARY signal, and remote engines' settings JSON?
+      category: principle
+      importance: important
+      rationale: >-
+        Silent breakage of persisted state or boot presets would regress every
+        existing user and the caffeine-uff.yaml workflow.
+
+    - id: CK-010
+      question: >-
+        Does the proposal special-case individual use cases with bespoke per-importer
+        or per-engine panels instead of one generalizing pattern?
+      category: principle
+      importance: pitfall
+      rationale: >-
+        Six bespoke forms is the over-engineering failure mode; YES means the
+        anti-pattern is present and should lower the score.
+
+    - id: CK-011
+      question: >-
+        Does the proposal rely on opaque auto-magic (e.g. "the panel just figures out
+        the right layout") that hides control and provenance from the user?
+      category: principle
+      importance: pitfall
+      rationale: >-
+        Violates Operate-mode doctrine (state legible at a glance, provenance
+        visible) and repeats the lying-knob problem in a new costume.
+
+    - id: CK-012
+      question: >-
+        Does the proposal leave vault-regime presets (Fast/Balanced/Pretty with
+        spring_len 40/60/80) offered unchanged to typed molecular graphs?
+      category: principle
+      importance: pitfall
+      rationale: >-
+        Every current preset is wrong for a molecule; leaving them selectable for
+        typed graphs keeps a known trap armed.
+
+  rubric_dimensions:
+    - name: Parameter-Provenance Honesty
+      description: >-
+        Does the proposal model the three parameter layers (L0 data-owned, L1 regime
+        defaults, L2 user intent) explicitly and correctly? Does it state who wins
+        when layers collide? Does every rendered control correspond to a dimension
+        that is actually adjustable for the current graph, with data-owned dimensions
+        shown as provenance rather than knobs?
+      scale: 1-5
+      weight: 0.25
+      instruction: >-
+        Identify how the proposal treats each parameter layer and each knob in the
+        current flat form (spring_len, repulsion, gravity, cooling, energy halt) for a
+        fully typed molecular graph versus a vault graph. Place the proposal against
+        the anchors: any knob that stays live while data owns its dimension pulls the
+        score toward score_2; an explicit layered model with collision precedence and
+        provenance rendering pushes toward score_4 and beyond.
+      anchors:
+        contrast: >-
+          Data-owned dimensions stop being knobs entirely, not merely become rescaled
+          knobs.
+        score_2: |
+          If typed data is present, multiply the spring_len and repulsion slider
+          min/max by 0.02 so the values look like ångströms.
+        score_4: |
+          Each parameter is tagged data-owned / regime-default / user-adjustable;
+          data-owned dimensions render as provenance text ("25 bond lengths from
+          UFF import"), never as sliders.
+
+    - name: Use-Case Coverage and Generality
+      description: >-
+        Does the proposal cover all six use cases through one generalizing mechanism
+        rather than case-by-case bolt-ons? Does the mechanism degrade gracefully for
+        cases the designer did not enumerate (a new importer, a new remote engine)?
+      scale: 1-5
+      weight: 0.20
+      instruction: >-
+        Walk all six use cases through the proposal's mechanism and note where the
+        pattern bends or breaks. Then ask what happens when a seventh engine appears.
+        Place against the anchors: coverage limited to the local engine with
+        per-case patches sits near score_2; one mechanism that subsumes all six and
+        absorbs new engines sits near score_4.
+      anchors:
+        contrast: >-
+          Covers all six use cases through one mechanism, not bolt-ons for the local
+          engine only.
+        score_2: |
+          Remote engines and static solvers continue to use their existing flat
+          forms; we add per-engine hardcoded range tables as needed.
+        score_4: |
+          Vault graphs get the full physics drawer; molecules a near-empty drawer;
+          remote engines contribute their own settings through the same capability
+          pass; static solvers show a one-shot "Solve" action.
+
+    - name: Constraint Feasibility and Data-Drivenness
+      description: >-
+        Can this be built with Dioxus 0.6 signals/rsx and the existing Slider and
+        panel-kit components, inside 340-480px, with no JS, no new crates, and no
+        engine changes for the core pattern? Is behavior derived from existing data
+        sources (TYPED_FORCE_SUMMARY, for_n_nodes, /compute/engines settings JSON,
+        PanelState) rather than new compiled tables?
+      scale: 1-5
+      weight: 0.15
+      instruction: >-
+        Map each claimed UI behavior to the concrete data sources and components that
+        exist today. Flag anything requiring JS, a new crate, an engine change, or
+        hardcoded per-engine content compiled into the panel. Place against the
+        anchors: hardcoded per-engine tables pull toward score_2; derivation from
+        existing signals and schemas pushes toward score_4.
+      anchors:
+        contrast: >-
+          Derives behavior from existing signals and engine settings schemas, not
+          new compiled per-engine tables.
+        score_2: |
+          We add per-engine hardcoded range tables compiled into the panel.
+        score_4: |
+          The capability table is derived from TYPED_FORCE_SUMMARY + engine kind +
+          node count; remote engines' existing settings JSON drives their controls.
+
+    - name: Operate-Mode Legibility
+      description: >-
+        Is the default view calm and glanceable — few meaningful controls, state
+        readable at a glance, one primary action per screen, labels over placeholders —
+        with advanced surface tucked away? Does it avoid slop (nested cards, icon-tile
+        stacks, eyebrow chips, gradient accents, decorative motion)?
+      scale: 1-5
+      weight: 0.15
+      instruction: >-
+        Sketch what the panel's default (non-expanded) view looks like for a vault
+        graph and for a molecular graph, counting the controls a user must parse
+        before acting. Place against the anchors: the same dense form plus more
+        toggles sits near score_2; a small provenance-plus-intent default with a
+        collapsed advanced drawer sits near score_4.
+      anchors:
+        contrast: >-
+          Glanceable state with few live controls, not the same dense form plus
+          another toggle.
+        score_2: |
+          A "Molecular mode" checkbox is added above the existing ten sliders and
+          three preset buttons.
+        score_4: |
+          A provenance header plus an intent row ("spread out / settle faster") is
+          the default view; raw knobs live in a collapsed drawer.
+
+    - name: Risk and Migration Realism
+      description: >-
+        Does the proposal honestly name its failure modes — persisted-state migration
+        (jc_layout_v1), boot-preset compatibility (?config=), preset-detection
+        fingerprints, remote settings-schema drift, capability derivation falling out
+        of sync with importers — with plausible mitigations, rather than claiming low
+        risk because the change is small?
+      scale: 1-5
+      weight: 0.13
+      instruction: >-
+        Read the risks/failure-modes section and test each named risk against the
+        actual integration points in layout.rs. Credit risks that are specific to
+        this codebase and carry mitigations; discount generic or absent risk
+        sections. Place against the anchors.
+      anchors:
+        contrast: >-
+          Names concrete migration and failure modes of persisted state and presets,
+          not just "minimal churn".
+        score_2: |
+          Risks: minimal code churn, low risk overall.
+        score_4: |
+          Risks: jc_layout_v1 payloads lacking capability tags fall back to
+          for_n_nodes; renaming presets breaks LayoutPreset::detect fingerprinting,
+          so detection moves to explicit regime fields.
+
+    - name: Kaizen Minimality
+      description: >-
+        Is this the smallest pattern that fits all six cases — one model replacing
+        the flat form, deleting or quarantining wrong-regime artifacts — rather than
+        new modes, parallel preset sets, or abstraction layers piled beside the
+        existing structure?
+      scale: 1-5
+      weight: 0.12
+      instruction: >-
+        Count the new concepts, modes, and parallel structures the proposal adds
+        versus what it removes. A proposal that keeps the flat form and adds a
+        second convention beside it scores low even if each addition is small. Place
+        against the anchors.
+      anchors:
+        contrast: >-
+          Replaces the wrong model with one smaller pattern, not adds a parallel
+          mode beside it.
+        score_2: |
+          Keep the flat form and presets, and add molecule-tuned preset copies
+          alongside them.
+        score_4: |
+          Presets become regime-named; vault presets are not offered to typed
+          graphs; the flat form is replaced, not extended.
+
+  scoring:
+    aggregation: weighted_sum
+    total_weight: 1.0
+    dimension_scale: 1-5
+    essential_gate: >-
+      If any essential checklist item (CK-001, CK-002, CK-003) is NO, the proposal's
+      final score is capped at 2.0 regardless of rubric scores, and overall_label
+      cannot exceed hold.
+    pitfall_penalty: >-
+      For each pitfall item (CK-010, CK-011, CK-012) answered YES, subtract 0.25
+      from the weighted score (floor 1.0).
+    ranking: >-
+      Rank proposals by final adjusted score descending. Break ties by, in order:
+      (1) Parameter-Provenance Honesty score, (2) Use-Case Coverage and Generality
+      score, (3) fewer YES pitfall answers. Select the top 3 for full development;
+      label ranks 1-3 select, next two hold, the rest reject. Report any proposal
+      whose high score rests on claims the judge could not verify against the stated
+      constraints.
