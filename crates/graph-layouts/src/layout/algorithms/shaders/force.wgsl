@@ -339,7 +339,7 @@ fn force_step(@builtin(global_invocation_id) gid: vec3<u32>) {
     // single-pair force ~ repulsion/1600 ≈ 2.5 for the defaults). Stable
     // for both chaotic random-ball seeds and compact converged seeds (the
     // latter being the failure mode the topo-fisheye seed mode hit).
-    let dist2_floor = max(params.spring_len * params.spring_len * 1e-4, 1e-4);
+    let dist2_floor = max(params.spring_len * params.spring_len * 1e-2, 1e-4);
 
     // ---- Repulsion ---------------------------------------------------------
     // Backend selection: BarnesHut overrides the legacy grid path. Both

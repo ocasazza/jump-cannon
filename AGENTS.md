@@ -158,6 +158,8 @@ The whole repo builds through **nix + crane + trunk**. No `npm install`, no `was
 
 Run `just test browser-rust` before claiming any visual change works. Don't commit visual changes without `ok: true`.
 
+**Test-mechanics invariant:** AI-driven semantic regressions of test mechanics are forbidden. NEVER weaken, re-baseline, or re-anchor a failing test's semantic contract (assertion target, thresholds, reference frame) to make it pass. A failing test signals a defect in the code or the environment — root-cause and fix the source; the contract stays intact.
+
 ## Wire format
 
 - **Bulk numeric** (positions, edges, metrics): raw little-endian `f32` / `u32` buffers.

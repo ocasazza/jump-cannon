@@ -14,8 +14,9 @@ use std::borrow::Cow;
 use std::sync::{Arc, Mutex};
 use wgpu::util::DeviceExt;
 
-/// State of the asynchronous energy_buf -> energy_staging readback. Shared
-/// between the main thread and the wgpu map_async callback via Arc<Mutex<>>.
+/// State of an asynchronous GPU-buffer -> staging readback (energy values;
+/// positions for the borrowed-mode octree sync). Shared between the main
+/// thread and the wgpu map_async callback via Arc<Mutex<>>.
 ///
 /// **Critical invariant**: the `map_async` callback must NEVER call any wgpu
 /// method (no `get_mapped_range`, no `unmap`, no buffer access). On WASM the
@@ -27,7 +28,7 @@ use wgpu::util::DeviceExt;
 /// the top of the next `step_with_encoder` (`drain_energy_readback`), where
 /// no other wgpu code is in flight.
 #[derive(Debug)]
-enum EnergyReadback {
+enum AsyncReadback {
     /// No copy in flight; staging buffer is unmapped and idle.
     Idle,
     /// `copy_buffer_to_buffer` was recorded into the current frame's
@@ -48,9 +49,9 @@ enum EnergyReadback {
     Done(Result<(), wgpu::BufferAsyncError>),
 }
 
-impl Default for EnergyReadback {
+impl Default for AsyncReadback {
     fn default() -> Self {
-        EnergyReadback::Idle
+        AsyncReadback::Idle
     }
 }
 
@@ -350,7 +351,7 @@ impl GpuForceOptions {
         // a frozen layout that "isn't moving."
         //
         // 1e-4 × spring_len matches the floor scale used in
-        // `force.wgsl::dist2_floor` (`spring_len² × 1e-4`) so a node
+        // `force.wgsl::dist2_floor` (`spring_len² × 1e-2`) so a node
         // that hasn't moved more than a small fraction of one spring
         // length per step is what counts as "settled."
         o.energy_threshold = (len * 1.0e-4).max(1.0e-6);
@@ -800,11 +801,26 @@ impl GpuForceLayout {
         // mutate state, so even synchronous WASM dispatch is safe.
         let was_copy_scheduled = matches!(
             state.energy_readback.lock().ok().as_deref(),
-            Some(EnergyReadback::CopyScheduled)
+            Some(AsyncReadback::CopyScheduled)
         );
         if was_copy_scheduled {
             state.issue_energy_map();
         }
+
+        // Same deferred-map step for the octree positions ring: the prior
+        // frame's positions copy has been submitted, so issue its map now.
+        let was_oct_copy_scheduled = matches!(
+            state.oct_positions_readback.lock().ok().as_deref(),
+            Some(AsyncReadback::CopyScheduled)
+        );
+        if was_oct_copy_scheduled {
+            state.issue_oct_positions_map();
+        }
+        // Refresh cpu_positions from any completed readback BEFORE the
+        // Barnes-Hut rebuild below — without this the borrowed path builds
+        // every octree from the initial positions forever (a planar start
+        // freezes the tree flat and BH repulsion never acts in 3D).
+        state.drain_oct_positions_readback();
 
         // Drain a previously-scheduled readback (if any) and update halt
         // bookkeeping. We do this BEFORE the early-return so that even after
@@ -859,9 +875,11 @@ impl GpuForceLayout {
             state.rebuild_and_upload_grid(device, queue, &self.options);
         }
         // Build the BH octree CPU-side once per call (matches the grid's
-        // "build once per call" cadence). The shader sees a freshly-uploaded
-        // tree in `oct_nodes_buf` and `params.n_octree`. v2 will move this
-        // to GPU via the build kernels in shaders/octree.wgsl.
+        // "build once per call" cadence) from `cpu_positions`, which the
+        // deferred readback ring at the top of this call keeps tracking
+        // the live sim with one frame of lag. The shader sees a
+        // freshly-uploaded tree in `oct_nodes_buf` and `params.n_octree`.
+        // v2 will move this to GPU via the build kernels in octree.wgsl.
         if matches!(self.options.repulsion_mode, RepulsionMode::BarnesHut) {
             state.rebuild_and_upload_octree(queue);
         } else {
@@ -918,7 +936,7 @@ impl GpuForceLayout {
             let readback_idle = state
                 .energy_readback
                 .lock()
-                .map(|g| matches!(*g, EnergyReadback::Idle))
+                .map(|g| matches!(*g, AsyncReadback::Idle))
                 .unwrap_or(false);
             if readback_idle {
                 // Record the copy + park in CopyScheduled. The next
@@ -929,6 +947,21 @@ impl GpuForceLayout {
                 // wgpu's "Buffer used in submit while mapped" warning
                 // every frame.
                 state.schedule_energy_copy(encoder);
+            }
+        }
+
+        // Barnes-Hut: schedule the positions readback that keeps
+        // `cpu_positions` (and therefore the per-frame octree rebuild)
+        // tracking the live sim with one frame of lag. Only in BH mode —
+        // grid/NS have no CPU-side spatial structure to feed.
+        if matches!(self.options.repulsion_mode, RepulsionMode::BarnesHut) {
+            let oct_ring_idle = state
+                .oct_positions_readback
+                .lock()
+                .map(|g| matches!(*g, AsyncReadback::Idle))
+                .unwrap_or(false);
+            if oct_ring_idle {
+                state.schedule_oct_positions_copy(encoder, shared_buffer);
             }
         }
     }
@@ -1157,7 +1190,19 @@ struct GpuState {
     /// Async energy-readback state. Shared with the wgpu map_async callback.
     /// On native, drained inside `step_with_encoder` after `device.poll(Poll)`;
     /// on WASM, the browser drives the callback between rAF ticks.
-    energy_readback: Arc<Mutex<EnergyReadback>>,
+    energy_readback: Arc<Mutex<AsyncReadback>>,
+
+    /// Borrowed-mode octree positions sync: staging buffer for the
+    /// one-frame-lagged positions readback (`shared_buffer -> staging ->
+    /// cpu_positions`). `None` in the owned path, which re-reads positions
+    /// every `run()` anyway. Without this ring the Barnes-Hut octree is
+    /// rebuilt every frame from the *initial* positions forever — a planar
+    /// authored start (z=0) freezes the tree flat and BH repulsion never
+    /// acts in 3D.
+    oct_positions_staging: Option<wgpu::Buffer>,
+    /// Async state for the octree positions ring (same deferred-readback
+    /// discipline as `energy_readback`).
+    oct_positions_readback: Arc<Mutex<AsyncReadback>>,
 }
 
 /// CPU-side pre-compute: stable id ordering, initial positions
@@ -1879,7 +1924,9 @@ impl GpuState {
             n_cells: 1,
             node_order: pc.node_order,
             effective_damping: 1.0,
-            energy_readback: Arc::new(Mutex::new(EnergyReadback::Idle)),
+            energy_readback: Arc::new(Mutex::new(AsyncReadback::Idle)),
+            oct_positions_staging: None,
+            oct_positions_readback: Arc::new(Mutex::new(AsyncReadback::Idle)),
         })
     }
 
@@ -1967,7 +2014,14 @@ impl GpuState {
             n_cells: 1,
             node_order: pc.node_order,
             effective_damping: 1.0,
-            energy_readback: Arc::new(Mutex::new(EnergyReadback::Idle)),
+            energy_readback: Arc::new(Mutex::new(AsyncReadback::Idle)),
+            oct_positions_staging: Some(device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("oct_positions_staging"),
+                size: pos_buf_size,
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            })),
+            oct_positions_readback: Arc::new(Mutex::new(AsyncReadback::Idle)),
         })
     }
 
@@ -2386,12 +2440,12 @@ impl GpuState {
         let map_succeeded = {
             let mut guard = self.energy_readback.lock().ok()?;
             match &*guard {
-                EnergyReadback::Done(Ok(())) => true,
-                EnergyReadback::Done(Err(_e)) => {
+                AsyncReadback::Done(Ok(())) => true,
+                AsyncReadback::Done(Err(_e)) => {
                     // Map failures are rare and self-recovering — silently
                     // reset to Idle and try again next frame. No unmap
                     // needed (the buffer was never mapped).
-                    *guard = EnergyReadback::Idle;
+                    *guard = AsyncReadback::Idle;
                     return None;
                 }
                 _ => return None, // Idle or Mapping: nothing to drain.
@@ -2423,7 +2477,7 @@ impl GpuState {
         // Now that wgpu state is clean, flip back to Idle so the next
         // step_with_encoder can schedule a fresh readback.
         if let Ok(mut g) = self.energy_readback.lock() {
-            *g = EnergyReadback::Idle;
+            *g = AsyncReadback::Idle;
         }
         Some(max)
     }
@@ -2454,7 +2508,7 @@ impl GpuState {
         // step_with_encoder entry sees CopyScheduled, knows the copy has
         // since been submitted by eframe, and issues the map_async then.
         if let Ok(mut g) = self.energy_readback.lock() {
-            *g = EnergyReadback::CopyScheduled;
+            *g = AsyncReadback::CopyScheduled;
         }
     }
 
@@ -2474,7 +2528,7 @@ impl GpuState {
         // must already be in Mapping when the callback's Done write lands
         // — otherwise the order Done -> Mapping would clobber the result.
         if let Ok(mut g) = self.energy_readback.lock() {
-            *g = EnergyReadback::Mapping;
+            *g = AsyncReadback::Mapping;
         }
         let shared = self.energy_readback.clone();
         let slice = self.energy_staging.slice(..);
@@ -2483,7 +2537,87 @@ impl GpuState {
             // re-entering wgpu from inside the callback panics with
             // "Buffer is already mapped" / "recursive use of an object".
             if let Ok(mut g) = shared.lock() {
-                *g = EnergyReadback::Done(res);
+                *g = AsyncReadback::Done(res);
+            }
+        });
+    }
+
+    /// If the previous frame's positions map completed, copy the staging
+    /// contents into `cpu_positions`, unmap, and reset to Idle. Returns
+    /// true when the mirror was refreshed. Same deferred-readback
+    /// discipline as `drain_energy_readback` — never blocks.
+    fn drain_oct_positions_readback(&mut self) -> bool {
+        let Some(staging) = &self.oct_positions_staging else {
+            return false;
+        };
+        let map_succeeded = {
+            let mut guard = match self.oct_positions_readback.lock() {
+                Ok(g) => g,
+                Err(_) => return false,
+            };
+            match &*guard {
+                AsyncReadback::Done(Ok(())) => true,
+                AsyncReadback::Done(Err(_e)) => {
+                    *guard = AsyncReadback::Idle;
+                    return false;
+                }
+                _ => return false,
+            }
+        };
+        if !map_succeeded {
+            return false;
+        }
+        {
+            let slice = staging.slice(..);
+            let view = slice.get_mapped_range();
+            let floats: &[f32] = bytemuck::cast_slice(&view);
+            let n = self.cpu_positions.len().min(floats.len());
+            if floats[..n].iter().all(|v| v.is_finite()) {
+                self.cpu_positions[..n].copy_from_slice(&floats[..n]);
+            }
+            drop(view);
+        }
+        staging.unmap();
+        if let Ok(mut g) = self.oct_positions_readback.lock() {
+            *g = AsyncReadback::Idle;
+        }
+        true
+    }
+
+    /// Record `shared_buffer -> oct_positions_staging` copy and park in
+    /// CopyScheduled (map_async is issued at the next `step_with_encoder`
+    /// entry — see `schedule_energy_copy` for why it can't happen here).
+    /// Caller guarantees the ring is Idle and the shared buffer holds the
+    /// latest positions (after the `a_is_in` copy-back).
+    fn schedule_oct_positions_copy(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        shared_buffer: &wgpu::Buffer,
+    ) {
+        let Some(staging) = &self.oct_positions_staging else {
+            return;
+        };
+        encoder.copy_buffer_to_buffer(shared_buffer, 0, staging, 0, self.pos_buf_size);
+        if let Ok(mut g) = self.oct_positions_readback.lock() {
+            *g = AsyncReadback::CopyScheduled;
+        }
+    }
+
+    /// Issue `map_async` on the octree positions staging buffer. Same
+    /// re-entrancy contract as `issue_energy_map`: the callback only flips
+    /// shared state, never touches wgpu.
+    fn issue_oct_positions_map(&self) {
+        let Some(staging) = &self.oct_positions_staging else {
+            return;
+        };
+        if let Ok(mut g) = self.oct_positions_readback.lock() {
+            *g = AsyncReadback::Mapping;
+        }
+        let shared = self.oct_positions_readback.clone();
+        let slice = staging.slice(..);
+        slice.map_async(wgpu::MapMode::Read, move |res| {
+            if let Ok(mut g) = shared.lock() {
+                *g = AsyncReadback::Done(res);
             }
         });
     }
@@ -3143,7 +3277,12 @@ impl OctreeBuild {
         // To assign ropes correctly we DFS-visit in order and remember the
         // most recently visited node, then patch its next_idx to the
         // current node when we descend.
-        let mut prev_visited: Option<u32> = None;
+        // Seed with the root so the first child emission patches
+        // `next[0]` — the root frame was pushed directly above and never
+        // passes through the emit path, so starting at `None` leaves
+        // `next[0] = OCT_END` and the WGSL walk terminates at the root
+        // with zero repulsion applied (BH silently broken).
+        let mut prev_visited: Option<u32> = Some(0);
 
         while let Some(_) = stack.last() {
             // First: emit the top-of-stack node if not yet emitted. We use
@@ -3221,15 +3360,12 @@ impl GpuState {
     /// reflects the new tree size. Caller should only invoke this when
     /// `repulsion_mode == BarnesHut` to avoid the per-step build cost.
     ///
-    /// TODO(perf/correctness): `cpu_positions` is only refreshed by the
-    /// legacy `run()` path's blocking readback; the renderer hot path
-    /// (`step_with_encoder`) leaves it at the initial seed. This means
-    /// the BH octree is rebuilt from stale data and forces are computed
-    /// against the seed layout, which causes the sim to settle into a
-    /// degenerate configuration almost immediately. Either (a) move the
-    /// build to GPU (see `shaders/octree.wgsl`) or (b) schedule a periodic
-    /// async readback. Until then BH is not a viable default — see
-    /// `RepulsionMode::default()`.
+    /// `cpu_positions` freshness: the legacy `run()` path re-reads
+    /// positions every call; the renderer hot path (`step_with_encoder`)
+    /// keeps the mirror tracking the live sim with one frame of lag via
+    /// the `oct_positions_*` deferred-readback ring (same discipline as
+    /// the energy ring). Remaining perf work: move the build to GPU (see
+    /// `shaders/octree.wgsl`).
     fn rebuild_and_upload_octree(
         &mut self,
         queue: &wgpu::Queue,
@@ -3265,6 +3401,127 @@ impl GpuState {
 mod tests {
     use super::*;
     use crate::types::{Edge, Node};
+
+    /// Regression: `assign_ropes` must wire the root's `next` link —
+    /// seeding `prev_visited` at `None` left `next[0] = OCT_END`, the WGSL
+    /// walk terminated at the root, and BH applied zero repulsion (nodes
+    /// collapsed under springs/gravity; the GPU smoke tests still passed
+    /// because they only assert finite + moved). This CPU re-walk of the
+    /// built tree pins the acceptance invariant: BH force must track the
+    /// exact O(n²) sum within the theta approximation (no GPU required).
+    #[test]
+    fn bh_octree_walk_tracks_exact_repulsion() {
+        // Star init positions identical to unit_gpu_force_star_hub_stable.
+        const N_LEAVES: usize = 1000;
+        let n = N_LEAVES + 1;
+        let mut positions = vec![0.0f32; n * 4];
+        positions[3] = 1.0; // hub at origin
+        for i in 0..N_LEAVES {
+            let theta = (i as f32) * 0.137;
+            let phi = (i as f32) * 0.071;
+            let r = 50.0f32;
+            positions[(i + 1) * 4] = r * phi.cos() * theta.sin();
+            positions[(i + 1) * 4 + 1] = r * phi.sin() * theta.sin();
+            positions[(i + 1) * 4 + 2] = r * theta.cos();
+            positions[(i + 1) * 4 + 3] = 1.0;
+        }
+        let mass = vec![1.0f32; n];
+        let max_nodes = 2 * n as u32 + 8;
+        let mut build = OctreeBuild::default();
+        let used = build.rebuild(&positions, &mass, n as u32, max_nodes);
+        assert!(used > 0, "octree build must not overflow");
+
+        let repulsion = 50.0f32;
+        let theta2 = 0.7f32 * 0.7;
+        let floor = (30.0f32 * 30.0 * 1e-2).max(1e-4);
+        let r_clip2 = 1600.0f32 * 1600.0;
+        // Same stackless walk as force.wgsl's Barnes-Hut branch.
+        let walk_force = |i: usize| -> [f32; 3] {
+            let pos = [
+                positions[i * 4],
+                positions[i * 4 + 1],
+                positions[i * 4 + 2],
+            ];
+            let mut f = [0.0f32; 3];
+            let mut idx = 0u32;
+            let mut steps = 0u32;
+            let cap = (used * 4).max(16);
+            while idx != OCT_END && steps < cap {
+                steps += 1;
+                let node = &build.nodes[idx as usize];
+                let body = node.meta[0];
+                let com = &node.com_mass;
+                let s = node.pos_size[3] * 2.0;
+                let d = [pos[0] - com[0], pos[1] - com[1], pos[2] - com[2]];
+                let dist2 = d[0] * d[0] + d[1] * d[1] + d[2] * d[2];
+                if body != OCT_BODY_INTERNAL {
+                    if body as usize != i && dist2 <= r_clip2 && com[3] > 0.0 {
+                        let c = repulsion * com[3] / dist2.max(floor);
+                        for k in 0..3 {
+                            f[k] += d[k] * c;
+                        }
+                    }
+                    idx = node.meta[2];
+                    continue;
+                }
+                if com[3] > 0.0 && dist2 > 0.0 && s * s < theta2 * dist2 {
+                    if dist2 <= r_clip2 {
+                        let c = repulsion * com[3] / dist2.max(floor);
+                        for k in 0..3 {
+                            f[k] += d[k] * c;
+                        }
+                    }
+                    idx = node.meta[2];
+                } else {
+                    idx = node.meta[1];
+                }
+            }
+            assert!(steps < cap, "walk hit the paranoia cap — malformed rope");
+            f
+        };
+        let exact_force = |i: usize| -> [f32; 3] {
+            let pos = [
+                positions[i * 4],
+                positions[i * 4 + 1],
+                positions[i * 4 + 2],
+            ];
+            let mut f = [0.0f32; 3];
+            for j in 0..n {
+                if j == i {
+                    continue;
+                }
+                let d = [
+                    pos[0] - positions[j * 4],
+                    pos[1] - positions[j * 4 + 1],
+                    pos[2] - positions[j * 4 + 2],
+                ];
+                let dist2 = d[0] * d[0] + d[1] * d[1] + d[2] * d[2];
+                if dist2 > r_clip2 {
+                    continue;
+                }
+                let c = repulsion / dist2.max(floor);
+                for k in 0..3 {
+                    f[k] += d[k] * c;
+                }
+            }
+            f
+        };
+        for i in [0usize, 1, 500, 999] {
+            let w = walk_force(i);
+            let e = exact_force(i);
+            let wm = (w[0] * w[0] + w[1] * w[1] + w[2] * w[2]).sqrt();
+            let em = (e[0] * e[0] + e[1] * e[1] + e[2] * e[2]).sqrt();
+            let cos = (w[0] * e[0] + w[1] * e[1] + w[2] * e[2]) / (wm * em).max(1e-9);
+            assert!(
+                em > 0.0 && (wm / em - 1.0).abs() < 0.25,
+                "body {i}: BH magnitude {wm:.2} vs exact {em:.2} outside theta tolerance"
+            );
+            assert!(
+                cos > 0.99,
+                "body {i}: BH direction diverges from exact (cos={cos:.4})"
+            );
+        }
+    }
 
     /// Serializes the GPU tests in THIS binary: running all six concurrently
     /// creates six wgpu devices at once, which trips Metal validation errors
@@ -3363,6 +3620,117 @@ mod tests {
         assert_eq!(pc.node_repulsion[idx("a")], 0.57);
         assert_eq!(pc.node_repulsion[idx("b")], 1.0, "NaN weight must fall back");
         assert_eq!(pc.node_repulsion[idx("c")], 1.0, "untyped must fall back");
+    }
+
+    /// Regression: in the borrowed (`step_with_encoder`) path the
+    /// Barnes-Hut octree was rebuilt every frame from `cpu_positions`,
+    /// which was filled once at init and never re-synced — the tree was
+    /// frozen at the initial positions forever (a planar start made BH
+    /// repulsion permanently 2D). The deferred readback ring must keep
+    /// `cpu_positions` tracking the live sim.
+    #[tokio::test(flavor = "current_thread")]
+    async fn borrowed_bh_octree_tracks_live_positions() {
+        let _gpu = gpu_test_guard();
+        let ids = ["a", "b", "c", "d", "e", "f"];
+        let mut graph = Graph::new();
+        for (i, id) in ids.iter().enumerate() {
+            let mut n = Node::new(*id);
+            n.position3 = Some([
+                (i % 3) as f32 * 12.0,
+                if i % 2 == 0 { 8.0 } else { -6.0 },
+                (i as f32 - 2.5) * 5.0,
+            ]);
+            graph.add_node(n);
+        }
+        for (s, t) in [
+            ("a", "b"),
+            ("b", "c"),
+            ("c", "d"),
+            ("d", "e"),
+            ("e", "f"),
+            ("f", "a"),
+        ] {
+            graph.add_edge(Edge::new(format!("{s}{t}"), s, t));
+        }
+
+        let instance = wgpu::Instance::default();
+        let Some(adapter) = instance
+            .request_adapter(&wgpu::RequestAdapterOptions::default())
+            .await
+        else {
+            eprintln!("skipping: no GPU adapter");
+            return;
+        };
+        let Ok((device, queue)) = adapter
+            .request_device(
+                &wgpu::DeviceDescriptor {
+                    label: Some("test/bh-octree-sync"),
+                    required_features: wgpu::Features::empty(),
+                    required_limits: wgpu::Limits {
+                        max_storage_buffers_per_shader_stage: 8,
+                        ..wgpu::Limits::downlevel_defaults().using_resolution(adapter.limits())
+                    },
+                    memory_hints: wgpu::MemoryHints::Performance,
+                },
+                None,
+            )
+            .await
+        else {
+            eprintln!("skipping: no GPU device");
+            return;
+        };
+
+        let shared = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("test/positions"),
+            size: (ids.len() as u64) * 16,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_SRC
+                | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let mut layout = GpuForceLayout::new(GpuForceOptions {
+            repulsion_mode: RepulsionMode::BarnesHut,
+            steps_per_call: 4,
+            // Mild forces: the mirror must track *stable* motion. A hot
+            // sim (repulsion 200 at dist2_floor 0.01) blows positions to
+            // NaN, which the drain's finite-check correctly refuses to
+            // mirror — the test would read that as "frozen".
+            repulsion: 5.0,
+            spring_len: 10.0,
+            gravity: 0.0,
+            energy_threshold: 0.0,
+            ..Default::default()
+        });
+        if let Err(e) = layout.init_with_device(&device, &queue, &graph, &shared) {
+            eprintln!("skipping: {e}");
+            return;
+        }
+        let initial_mirror = layout.state.as_ref().unwrap().cpu_positions.clone();
+
+        // Six frames: enough for copy -> map -> drain to land at least
+        // once. `Maintain::Wait` after each submit: on native, map_async
+        // callbacks are only delivered once the device observes the
+        // queue's completion — a bare `Poll` on an idle queue does not
+        // advance it (wasm drives callbacks via the browser event loop,
+        // so production never hits this).
+        for _ in 0..6 {
+            let mut encoder = device.create_command_encoder(&Default::default());
+            layout.step_with_encoder(&device, &queue, &mut encoder, &shared);
+            queue.submit(Some(encoder.finish()));
+            let _ = device.poll(wgpu::Maintain::Wait);
+        }
+
+        let state = layout.state.as_ref().unwrap();
+        let moved = state
+            .cpu_positions
+            .iter()
+            .zip(initial_mirror.iter())
+            .any(|(a, b)| a.to_bits() != b.to_bits());
+        assert!(
+            moved,
+            "cpu_positions frozen at init — octree would rebuild from stale positions forever"
+        );
+        assert!(state.cpu_positions.iter().all(|v| v.is_finite()));
     }
 
     #[tokio::test(flavor = "current_thread")]
