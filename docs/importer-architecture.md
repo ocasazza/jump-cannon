@@ -252,6 +252,61 @@ without running parser code. Native compatibility loaders that read their
 source directly do not cross this record boundary and remain responsible for
 decoding only their declared input format.
 
+### Pest capture requirement contract
+
+The `[parser.captures]` table is the boundary between what a grammar *can* see
+and what jump-cannon *must* see. It has three tiers.
+
+**Required for every package** — the host cannot build a graph without these:
+
+| Binding | Contract |
+| --- | --- |
+| `node` | Record boundary. Each match becomes exactly one graph node. |
+| `id` | Exactly one non-empty capture per node match; namespaced into the canonical node ID. |
+
+**Optional; bind only when the format has them** — the host degrades
+predictably when a binding is absent (today all eleven bindings are mandatory,
+which forces grammar authors to invent dummy rules for formats without edges
+or properties):
+
+| Binding | When unbound |
+| --- | --- |
+| `title` | Node title falls back to the id text — the current behavior for an empty title capture. |
+| `kind` | Node `doctype` is absent; type-driven lenses treat it as the empty class. |
+| `tag` | Node carries no package tags. |
+| `property` (+ `key`/`value`) | Node carries no package properties. `key` and `value` are valid only together with `property`. |
+| `edge` (+ `source`/`target`) | The graph is node-only. `source` and `target` are valid only together with `edge`; the package schema still declares its edge type and simply never emits it. |
+
+**Node-level typed properties — the "size" contract.** Capture text is always
+a string at the grammar boundary, but a package that declares a property field
+with `field_type = "number"` opts into coercion: the engine parses the value
+capture as f64, fails the import loudly when the text is not numeric, and
+stores a JSON number in `NodeMeta.frontmatter` and in the discovery document.
+Numbers are exactly what the numeric consumers already expect:
+`MassLens::Field` reads `as_f64`, `CoordinationLens::Field` reads `as_u64`,
+and the metric-buffer path below reads f32. Grammars never emit pixel sizes
+and the manifest never binds visual semantics: a package supplies *values*,
+the host owns *ranges*.
+
+**Global computed properties.** The host, not the importer, computes topology
+metrics (degree, PageRank, betweenness, k-core, community, connected
+components, recency) for every source, so no grammar may or must re-implement
+them. Importer-supplied numeric properties join the same pipeline: for every
+declared `number` property the snapshot build synthesizes a per-node f32
+buffer (normalized over the whole graph) and publishes it next to the computed
+metric buffers. Visual channels — SizeBy, ColorBy, layout mass and
+coordination — then bind *any* buffer, computed or imported, through one
+global normalization (min/max with a sqrt curve for size; categorical or
+continuous ramps for color) with no source-specific code in the renderer.
+
+**Arbitrary global parameter ranges.** Observed min/max shifts as data churns,
+which would rescale every node on every reload. A `number` field declaration
+may pin the normalization domain: `range = [lo, hi]` clamps and normalizes
+against the declared domain instead of the observed one, and `scale = "log"`
+(default `"linear"`) log-scales heavy-tailed values before normalization.
+Ranges are host-side presentation parameters only: they never change stored
+values, search behavior, or import validity.
+
 ### Implemented importer schemas
 
 All six selectable source kinds satisfy the version-1 contract:
@@ -274,9 +329,13 @@ The host rejects a missing or different separator and rejects tag values with
 empty path segments, so all clients can render the required hierarchy without
 source-specific inference or fallback behavior.
 
-Pest capture values are strings, so package-defined discovery properties are
-limited to text, keyword, date, and URL fields. A package cannot redeclare the
-core keys or put a sensitive property in the discovery projection.
+Pest capture text is strings at the grammar boundary; the engine coerces on
+the way into the graph per the capture requirement contract above. Pest
+packages may declare text, keyword, date, and URL fields directly, and
+`number` fields through the coercion contract (non-numeric capture text fails
+the import). `boolean` and `keyword_list` coercion is not yet implemented and
+remains unavailable to pest packages until it is. A package cannot redeclare
+the core keys or put a sensitive property in the discovery projection.
 
 ### Search and facet publication
 
