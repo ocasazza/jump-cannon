@@ -45,7 +45,7 @@ manifests decide which controls exist, and data-owned simulation dimensions
 The measured defects it fixes (dead `spring_len` slider on typed graphs, the
 false "sliders scale on top" banner, vault presets offered to molecular
 geometry), the registry schema, and the kaizen phasing live in
-`docs/layout-ux.md`; the engine truth it binds to (typed rests win outright,
+`docs/layout-ux.md` (normative engineering spec: `docs/layout-ux-spec.md`); the
 repulsion mixes via √(wᵢ×wⱼ), `seed_mode: none` keeps authored coordinates) is
 in `docs/molecular-force-layout.md`.
 
