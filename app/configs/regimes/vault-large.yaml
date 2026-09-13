@@ -1,0 +1,17 @@
+# Vault (large) — untyped graphs from 1k nodes up. The base stays n-tuned:
+# `GpuForceOptions::for_n_nodes` scales spring_len, repulsion, the repulsion
+# clip, and the auto-halt threshold with the cube root of the node count, and
+# no YAML value can express that. What this regime declares as data is the
+# one large-graph choice that is NOT a function of n: the repulsion backend.
+# Barnes-Hut wins once a uniform voxel starts collecting hundreds of bodies
+# (real vaults: a few hubs plus long sparse tails).
+id: vault-large
+schema_version: 1
+label: "Vault · large"
+description: "Untyped graphs from 1k nodes; n-tuned base with the Barnes-Hut backend."
+engine: gpu-force
+execution: live
+applicability:
+  min_nodes: 1000
+options:
+  repulsion_mode: barnes_hut

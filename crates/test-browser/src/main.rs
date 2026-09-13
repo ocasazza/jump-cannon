@@ -213,11 +213,11 @@ struct SettingsTabsCheck {
     keyboard_contract: bool,
     controls_hit_test: bool,
     /// Vault graph (main fixture): the Layout tab keeps the live
-    /// `spring_len` slider and the presets row, and names the resolved
-    /// catch-all regime — the phase-1 "vault unchanged" contract.
+    /// `spring_len` slider, names the resolved catch-all regime, and offers
+    /// the migrated fast/balanced/pretty regimes in its picker.
     layout_vault_regime: bool,
     layout_spring_len_live: bool,
-    layout_presets_present: bool,
+    layout_presets_offered: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     reason: Option<String>,
 }
@@ -1335,7 +1335,11 @@ async fn drive_page(
         const layoutSpringLenLive = Boolean(
           layRoot?.querySelector('[data-slider="spring_len"]')
         );
-        const layoutPresetsPresent = Boolean(layRoot?.querySelector('.lay-presets'));
+        const layoutPicker = layRoot?.querySelector('[data-regime-picker]') || null;
+        const layoutPickerIds = [...(layoutPicker?.querySelectorAll('option') || [])]
+          .map((option) => option.value);
+        const layoutPresetsOffered = ['fast', 'balanced', 'pretty']
+          .every((id) => layoutPickerIds.includes(id));
 
         keyboardContract &&= await keyboardStep('Layout', 'End', 'Camera');
         keyboardContract &&= await keyboardStep('Camera', 'Home', 'Connection');
@@ -1373,7 +1377,8 @@ async fn drive_page(
         if (contentPanels.length !== expected.length) failures.push('a Settings tab has no delegated content');
         if (!layoutVaultRegime) failures.push('Layout tab missing the resolved regime line');
         if (!layoutSpringLenLive) failures.push('vault graph lost the live spring_len slider');
-        if (!layoutPresetsPresent) failures.push('vault graph lost the presets row');
+        if (!layoutPicker) failures.push('Layout tab missing the regime picker');
+        if (!layoutPresetsOffered) failures.push('vault graph is not offered the migrated presets');
         if (!legacyPanelsAbsent) failures.push('legacy Layout, Style, or Camera panel still exists');
         if (!graphRestored) failures.push('Graph renderer did not remount after Settings restore');
         return {
@@ -1385,7 +1390,7 @@ async fn drive_page(
           controls_hit_test: Boolean(controlsHitTest),
           layout_vault_regime: layoutVaultRegime,
           layout_spring_len_live: layoutSpringLenLive,
-          layout_presets_present: layoutPresetsPresent,
+          layout_presets_offered: layoutPresetsOffered,
           legacy_panels_absent: legacyPanelsAbsent,
           graph_restored: graphRestored,
           reason: failures.length ? failures.join('; ') : null,
@@ -3238,6 +3243,9 @@ const MOLECULE_LAYOUT_JS: &str = r#"(async () => {
     const root = lay.querySelector('.lay');
     const regime = root?.querySelector('[data-regime-id]') || null;
     const capsule = root?.querySelector('[data-lay-state="typed-rests"]') || null;
+    const picker = root?.querySelector('[data-regime-picker]') || null;
+    const pickerIds = [...(picker?.querySelectorAll('option') || [])]
+      .map((option) => option.value);
     const banner = [...(root?.querySelectorAll('.lay-hint') || [])].some(
       (hint) => (hint.textContent || '').includes('scale on top of')
     );
@@ -3249,9 +3257,11 @@ const MOLECULE_LAYOUT_JS: &str = r#"(async () => {
     return {
       regime_id: regime?.getAttribute('data-regime-id') || null,
       regime_text: (regime?.textContent || '').trim(),
+      reason_text: (root?.querySelector('.lay-regime-reason')?.textContent || '').trim(),
       capsule_text: (capsule?.textContent || '').trim(),
       spring_len_present: Boolean(root?.querySelector('[data-slider="spring_len"]')),
-      presets_present: Boolean(root?.querySelector('.lay-presets')),
+      presets_present: ['fast', 'balanced', 'pretty'].some((id) => pickerIds.includes(id)),
+      picker_present: Boolean(picker),
       banner_present: banner,
       seed_mode: settings?.seed_mode ?? null,
       spring_len_value: typeof settings?.spring_len === 'number' ? settings.spring_len : null,
@@ -3345,14 +3355,18 @@ async fn run_layout_regimes_scenario(
             let regime_id = text("regime_id");
             let regime_text = text("regime_text");
             let capsule_text = text("capsule_text");
+            // The picker row carries the id and the active regime's label;
+            // the resolution reason renders on the sibling line.
+            let reason_text = text("reason_text");
             check.regime_booted = regime_id == "molecular-uff"
                 && regime_text.contains("Molecular · UFF")
-                && regime_text.contains("25 bonds UFF-typed");
+                && reason_text.contains("25 bonds UFF-typed");
             check.capsule_present = capsule_text.contains("25/25 rests from UFF");
             check.spring_len_absent =
                 !view.get("spring_len_present").and_then(|v| v.as_bool()).unwrap_or(true);
-            check.presets_hidden =
-                !view.get("presets_present").and_then(|v| v.as_bool()).unwrap_or(true);
+            check.presets_hidden = view.get("picker_present").and_then(|v| v.as_bool())
+                == Some(true)
+                && !view.get("presets_present").and_then(|v| v.as_bool()).unwrap_or(true);
             check.banner_absent =
                 !view.get("banner_present").and_then(|v| v.as_bool()).unwrap_or(true);
             let seed_mode = text("seed_mode");
@@ -3367,7 +3381,7 @@ async fn run_layout_regimes_scenario(
                 && check.settings_applied;
             if !check.ok {
                 check.reason = Some(format!(
-                    "regime={regime_id:?} capsule={capsule_text:?} \
+                    "regime={regime_id:?} reason={reason_text:?} capsule={capsule_text:?} \
                      spring_len_absent={} presets_hidden={} banner_absent={} \
                      settings_applied={} (seed_mode={seed_mode:?}, spring_len={spring_len:?})",
                     check.spring_len_absent,

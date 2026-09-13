@@ -17,9 +17,11 @@ Dioxus and WebGPU path.
 input fixture, exact `GpuForceOptions`, and acceptance gates (precision:
 bit-identical reruns; accuracy: UFF bond lengths, ring angle sums,
 planarity; stochastic: seeded-jitter distribution gates; robustness:
-full-noise boundedness). The caffeine molecular bed doubles as the
-`?config=caffeine-uff` boot preset in `app/configs/`. See
-`docs/molecular-force-layout.md` for the measured values.
+full-noise boundedness). The same caffeine bed drives the browser suite's
+molecular-regime scenario, and its layout parameters ship as the
+`molecular-uff` registry regime (`app/configs/regimes/`) that any UFF-typed
+graph resolves to automatically — `?config=molecular-uff` pins it explicitly.
+See `docs/molecular-force-layout.md` for the measured values.
 
 Continuous regression layers are [[Fuzz Testing]], [[Performance Engineering]],
 and [[Browser Regression]]. Cluster cadence and admission live in

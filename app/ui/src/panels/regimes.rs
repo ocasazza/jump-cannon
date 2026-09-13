@@ -1,16 +1,23 @@
 //! Layout regimes — named parameter bases as data, capability manifests as
 //! truth (`docs/layout-ux-spec.md`, implementing `docs/layout-ux.md`).
 //!
-//! Phase 1 scope (spec §8): the registry loader (serde, `deny_unknown_fields`,
+//! Phases 1–2 (spec §8): the registry loader (serde, `deny_unknown_fields`,
 //! options validated against `GpuForceOptions`), the `typed_bond_coverage`
-//! predicate, a hand-checked gpu-force capability manifest verified against
-//! the options struct by unit test, and the auto-apply/restore seam that
-//! makes a UFF-typed graph boot into `molecular-uff` with no `?config=`.
+//! resolver, a hand-checked gpu-force capability manifest verified against
+//! the options struct by unit test, and `jc_layout_v2` persistence — a
+//! pinned regime id plus dimensionless overrides against the resolved base,
+//! migrated once from the legacy `jc_layout_v1` absolutes.
+//!
+//! The effective gpu-force settings block is *derived*: regime base
+//! (n-tuned defaults ⊕ regime options, data-owned nulls filled from typed
+//! data) ⊕ overrides. Nothing else writes that block, so a registry YAML
+//! edit propagates to every user who did not override that control.
 //!
 //! Engine-truth anchors that bind this module (spec §7):
 //! - E1: typed rests win outright; `spring_len` is the untyped/invalid
 //!   fallback (`gpu_force.rs:1350-1351`). No control here may claim to scale
-//!   typed rests — a data-owned dimension renders as a capsule, never a knob.
+//!   typed rests — a data-owned dimension renders as a capsule, never a knob,
+//!   and an override on one is parked rather than applied.
 //! - E2: repulsion mixes with per-atom UFF weights via sqrt(wi*wj), so a
 //!   repulsion control stays honest on typed atoms (phase-3 intent).
 //! - M4: coverage = `typed_edges / edge_count` from `TYPED_FORCE_SUMMARY`
@@ -26,8 +33,13 @@ use serde_json::Value;
 use crate::graph_canvas::GraphData;
 
 // The registry ships in the WASM bundle: regimes are deployable data, not
-const REGIME_FILES: [(&str, &str); 2] = [
+// runtime-fetched configuration, and the nix appSrc includes app/configs.
+const REGIME_FILES: [(&str, &str); 6] = [
+    ("balanced.yaml", include_str!("../../../configs/regimes/balanced.yaml")),
+    ("fast.yaml", include_str!("../../../configs/regimes/fast.yaml")),
     ("molecular-uff.yaml", include_str!("../../../configs/regimes/molecular-uff.yaml")),
+    ("pretty.yaml", include_str!("../../../configs/regimes/pretty.yaml")),
+    ("vault-large.yaml", include_str!("../../../configs/regimes/vault-large.yaml")),
     ("vault-small.yaml", include_str!("../../../configs/regimes/vault-small.yaml")),
 ];
 
@@ -41,24 +53,18 @@ pub(crate) enum Execution {
 }
 
 /// Closed predicate vocabulary (spec §2 `applicability`), ANDed at
-/// evaluation. Phase 1 evaluates `typed_bond_coverage`, `min_nodes`, and
-/// `max_nodes`; the remaining fields parse (so a regime declaring them is a
-/// schema-valid authoring) but fail closed at resolution with a warning —
-/// wiring them is phase-2+ work and a silent match would lie.
+/// evaluation. Phases 1–2 evaluate `typed_bond_coverage`, `min_nodes`,
+/// `max_nodes`, and `engine_kind`; the remaining fields parse (so a regime
+/// declaring them is schema-valid authoring) but fail closed at resolution
+/// with a warning — a silent match on an unevaluated predicate would lie.
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub(crate) struct Applicability {
-    #[serde(default)]
     pub typed_bond_coverage: Option<CoverageGte>,
-    #[serde(default)]
     pub min_nodes: Option<u64>,
-    #[serde(default)]
     pub max_nodes: Option<u64>,
-    #[serde(default)]
     pub has_authored_positions: Option<bool>,
-    #[serde(default)]
     pub source_kind: Option<Vec<String>>,
-    #[serde(default)]
     pub engine_kind: Option<Vec<String>>,
 }
 
@@ -68,6 +74,10 @@ pub(crate) struct CoverageGte {
     pub gte: f64,
 }
 
+fn default_true() -> bool {
+    true
+}
+
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Regime {
@@ -75,9 +85,18 @@ pub(crate) struct Regime {
     pub schema_version: u32,
     pub label: String,
     #[serde(default)]
+    #[allow(dead_code)] // picker tooltip copy (phase 3)
     pub description: Option<String>,
     pub engine: String,
     pub execution: Execution,
+    /// Automatic-resolution eligibility. `false` = picker-only: the regime
+    /// is a deliberate user choice (the migrated vault presets), never
+    /// inferred from a graph property. NOT a predicate — it takes no part in
+    /// the R3 specificity sort. (Spec §9 changelog 2026-09-13: without it,
+    /// `fast`/`balanced`/`pretty` — one predicate each — would outrank the
+    /// zero-predicate vault catch-all and hijack auto-resolution.)
+    #[serde(default = "default_true")]
+    pub auto: bool,
     #[serde(default)]
     pub applicability: Applicability,
     /// Partial `GpuForceOptions` projection: keys MUST be option field names
@@ -90,14 +109,20 @@ pub(crate) struct Regime {
     /// Remote-engine regime shape (phase 4); XOR with `options`.
     #[serde(default)]
     pub settings_schema: Option<String>,
+    /// Declared intent controls (phase 3 renders these; the schema accepts
+    /// them now so a regime authored today validates unchanged).
     #[serde(default)]
+    #[allow(dead_code)]
     pub controls: Vec<ControlDecl>,
+    /// Regime ids quarantined from this regime's picker — vault-tuned
+    /// presets must not be offered on ångström geometry.
     #[serde(default)]
     pub presets_hidden: Vec<String>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[allow(dead_code)] // consumed by the phase-3 intent renderer
 pub(crate) struct ControlDecl {
     pub id: String,
     pub kind: ControlKind,
@@ -141,7 +166,6 @@ impl Applicability {
     }
 
     /// First matching predicate, humanized (spec §4's capsule reason line).
-    /// Only predicates that actually decided the match are named.
     fn humanized_reason(&self, state: &SnapshotState) -> String {
         if let Some(cov) = &self.typed_bond_coverage {
             return format!(
@@ -150,24 +174,25 @@ impl Applicability {
             );
         }
         if let Some(min) = self.min_nodes {
-            return format!("{} ≥ {} nodes", state.n_nodes, min);
+            return format!("{} ≥ {min} nodes", state.n_nodes);
         }
         if let Some(max) = self.max_nodes {
-            return format!("{} ≤ {} nodes", state.n_nodes, max);
+            return format!("{} ≤ {max} nodes", state.n_nodes);
+        }
+        if self.engine_kind.is_some() {
+            return format!("{} engine", state.engine_kind);
         }
         "catch-all".to_string()
     }
 
-    /// Fail closed on predicates phase 1 cannot evaluate yet: a regime that
-    /// declares them never matches (and says why in the log) instead of
+    /// Fail closed on predicates the resolver cannot evaluate yet: a regime
+    /// that declares them never matches (and says why in the log) instead of
     /// matching on a guess.
     fn unevaluated(&self) -> Option<&'static str> {
         if self.has_authored_positions.is_some() {
             Some("has_authored_positions")
         } else if self.source_kind.is_some() {
             Some("source_kind")
-        } else if self.engine_kind.is_some() {
-            Some("engine_kind")
         } else {
             None
         }
@@ -176,7 +201,7 @@ impl Applicability {
     fn matches(&self, state: &SnapshotState) -> bool {
         if let Some(field) = self.unevaluated() {
             tracing::warn!(
-                "[regimes] predicate {field} declared but not evaluated in phase 1 — \
+                "[regimes] predicate {field} declared but not evaluated yet — \
                  regime fails closed (spec §2 R3)"
             );
             return false;
@@ -193,6 +218,11 @@ impl Applicability {
         }
         if let Some(max) = self.max_nodes {
             if state.n_nodes > max {
+                return false;
+            }
+        }
+        if let Some(kinds) = &self.engine_kind {
+            if !kinds.iter().any(|k| k == state.engine_kind) {
                 return false;
             }
         }
@@ -223,7 +253,7 @@ pub(crate) fn load_registry(files: &[(&str, &str)]) -> Vec<Regime> {
         .map(|(name, yaml)| {
             let regime: Regime = serde_yml::from_str(yaml)
                 .unwrap_or_else(|e| panic!("[regimes] {name}: invalid regime YAML: {e}"));
-            validate_regime(name, &regime).unwrap_or_else(|e| panic!("[regimes] {name}: {e}"));
+            validate_regime(&regime).unwrap_or_else(|e| panic!("[regimes] {name}: {e}"));
             (name.to_string(), regime)
         })
         .collect();
@@ -233,10 +263,25 @@ pub(crate) fn load_registry(files: &[(&str, &str)]) -> Vec<Regime> {
             .cmp(&a.applicability.predicate_count())
             .then_with(|| an.cmp(bn))
     });
+    // R4: resolution must never fail, so an auto-eligible catch-all has to
+    // exist. Checked at load so a registry edit cannot remove the floor.
+    assert!(
+        regimes
+            .iter()
+            .any(|(_, r)| r.auto && r.applicability.is_empty()),
+        "[regimes] registry needs an auto-eligible catch-all regime (R4)"
+    );
+    // R5 governance: the registry is bounded — a new graph class resolves to
+    // the nearest existing regime until three catalog sources justify one.
+    assert!(
+        regimes.len() <= 8,
+        "[regimes] registry is capped at ~8 entries (R5); got {}",
+        regimes.len()
+    );
     regimes.into_iter().map(|(_, r)| r).collect()
 }
 
-fn validate_regime(_name: &str, r: &Regime) -> Result<(), String> {
+fn validate_regime(r: &Regime) -> Result<(), String> {
     let id_ok = !r.id.is_empty()
         && r.id
             .chars()
@@ -295,35 +340,53 @@ fn validate_regime(_name: &str, r: &Regime) -> Result<(), String> {
     Ok(())
 }
 
+pub(crate) fn regime_by_id(id: &str) -> Option<&'static Regime> {
+    registry().iter().find(|r| r.id == id)
+}
 
 // --- snapshot state + resolver (spec §4) ------------------------------------------
 
-/// The five-field resolution state (spec §1). Phase 1 populates the fields
-/// the coverage predicate and node bounds need; the rest ride along for
-/// phase 2.
+/// The five-field resolution state (spec §1). Phases 1–2 populate the
+/// fields the coverage, node-bound, and engine-kind predicates need; the
+/// rest ride along for later phases.
 #[derive(Clone, Debug)]
 pub(crate) struct SnapshotState {
     pub typed_bond_coverage: f64,
+    #[allow(dead_code)]
     pub typed_nodes: usize,
     pub typed_edges: usize,
     pub n_nodes: u64,
+    #[allow(dead_code)]
     pub n_edges: usize,
     #[allow(dead_code)]
     pub has_authored: bool,
     #[allow(dead_code)]
     pub source_kind: String,
-    #[allow(dead_code)]
     pub engine_kind: &'static str,
 }
 
-/// First regime in registry order whose applicability matches (R3: no
-/// expression language, first match wins). The registry's catch-all
+/// First auto-eligible regime in registry order whose applicability matches
+/// (R3: no expression language, first match wins). The registry's catch-all
 /// guarantees a result.
 pub(crate) fn resolve(state: &SnapshotState) -> &'static Regime {
     registry()
         .iter()
-        .find(|r| r.engine == "gpu-force" && r.applicability.matches(state))
+        .find(|r| r.auto && r.engine == "gpu-force" && r.applicability.matches(state))
         .expect("registry contains a catch-all regime (R4)")
+}
+
+/// Regimes the picker may offer for this state: applicable (auto-eligible or
+/// not) minus the ones the active regime quarantines (`presets_hidden`).
+pub(crate) fn selectable_regimes(
+    state: &SnapshotState,
+    active: &Regime,
+) -> Vec<&'static Regime> {
+    registry()
+        .iter()
+        .filter(|r| r.engine == "gpu-force")
+        .filter(|r| r.id == active.id || r.applicability.matches(state))
+        .filter(|r| !active.presets_hidden.iter().any(|hidden| *hidden == r.id))
+        .collect()
 }
 
 /// What the panel renders: the resolved regime plus the measurements that
@@ -333,14 +396,21 @@ pub(crate) struct RegimeResolution {
     pub regime_id: String,
     pub label: String,
     pub reason: String,
+    /// The user pinned this regime in the picker (no auto-resolution).
+    pub pinned: bool,
     pub typed_nodes: usize,
     pub typed_edges: usize,
     pub n_nodes: usize,
     pub n_edges: usize,
+    #[allow(dead_code)] // typed_edges/n_edges carry this to the panel copy
     pub coverage: f64,
-    /// The regime quarantines the preset row (fast/balanced/pretty) —
-    /// vault-tuned values would clobber UFF geometry.
-    pub presets_hidden: bool,
+    /// Regime ids the picker offers, with display labels.
+    pub choices: Vec<(String, String)>,
+    /// Overrides retained but not applied because their dimension is
+    /// data-owned under the current graph state (spec §1 "parked").
+    pub parked: usize,
+    /// Overrides currently in effect.
+    pub applied_overrides: usize,
 }
 
 pub(crate) static RESOLUTION: GlobalSignal<Option<RegimeResolution>> = Signal::global(|| None);
@@ -357,16 +427,27 @@ pub(crate) fn mean_typed_rest(rests: &[f32]) -> Option<f32> {
     }
 }
 
-fn snapshot_state(graph: &GraphData) -> SnapshotState {
-    let summary = *crate::graph_canvas::TYPED_FORCE_SUMMARY.peek();
-    let (typed_nodes, typed_edges) = summary.unwrap_or((0, 0));
-    let n_edges = graph.n_edges as usize;
+/// Everything the base/override math needs from the loaded graph. Kept as a
+/// small copyable record so an override edit can recompute the effective
+/// settings without re-reading the scene buffers.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub(crate) struct GraphInput {
+    pub n_nodes: usize,
+    pub n_edges: usize,
+    pub typed_nodes: usize,
+    pub typed_edges: usize,
+    pub mean_typed_rest: Option<f32>,
+}
+
+static INPUT: GlobalSignal<GraphInput> = Signal::global(GraphInput::default);
+
+fn snapshot_state(input: &GraphInput) -> SnapshotState {
     SnapshotState {
-        typed_bond_coverage: typed_edges as f64 / n_edges.max(1) as f64,
-        typed_nodes,
-        typed_edges,
-        n_nodes: graph.n_nodes as u64,
-        n_edges,
+        typed_bond_coverage: input.typed_edges as f64 / input.n_edges.max(1) as f64,
+        typed_nodes: input.typed_nodes,
+        typed_edges: input.typed_edges,
+        n_nodes: input.n_nodes as u64,
+        n_edges: input.n_edges,
         has_authored: false,
         source_kind: String::new(),
         engine_kind: "local",
@@ -400,109 +481,313 @@ fn yml_to_json(v: &serde_yml::Value) -> Result<Value, String> {
     })
 }
 
-/// Project a regime's options onto a settings JSON object, filling null
-/// (data-owned) fields from typed graph data. R2: a null with no data
-/// source is an error naming the regime.
-fn effective_options(regime: &Regime, graph: &GraphData) -> Result<Value, String> {
-    let mut fills = BTreeMap::new();
-    if let Some(mean) = graph.scene.edge_rest.as_deref().and_then(mean_typed_rest) {
-        fills.insert("spring_len".to_string(), serde_json::json!(mean));
+// --- base + overrides (spec §5) ---------------------------------------------------
+
+/// The regime's parameter base: the engine's n-tuned defaults, overlaid with
+/// the regime's declared options, with data-owned (`null`) fields filled
+/// from typed graph data. R2: a null with no data source is an error naming
+/// the regime and field.
+pub(crate) fn base_options(
+    regime: &Regime,
+    input: &GraphInput,
+) -> Result<serde_json::Map<String, Value>, String> {
+    let tuned = serde_json::to_value(graph_layouts::GpuForceOptions::for_n_nodes(input.n_nodes))
+        .map_err(|e| format!("regime {}: n-tuned defaults: {e}", regime.id))?;
+    let mut base = tuned
+        .as_object()
+        .cloned()
+        .ok_or_else(|| format!("regime {}: n-tuned defaults are not an object", regime.id))?;
+    let Some(map) = &regime.options else {
+        return Ok(base);
+    };
+    for (key, value) in map {
+        let key = key
+            .as_str()
+            .ok_or_else(|| format!("regime {}: non-string options key", regime.id))?;
+        let json = match yml_to_json(value)? {
+            Value::Null => data_fill(key, input).ok_or_else(|| {
+                format!(
+                    "regime {id}: options field {key:?} is null (data-owned) but the \
+                     loaded graph carries no typed value for it (R2)",
+                    id = regime.id
+                )
+            })?,
+            filled => filled,
+        };
+        base.insert(key.to_string(), json);
     }
-    let mut out = serde_json::Map::new();
-    if let Some(map) = &regime.options {
-        for (key, value) in map {
-            let key = key
-                .as_str()
-                .ok_or_else(|| format!("regime {}: non-string options key", regime.id))?;
-            let json = yml_to_json(value)?;
-            let json = match json {
-                Value::Null => fills.get(key).cloned().ok_or_else(|| {
-                    format!(
-                        "regime {id}: options field {key:?} is null (data-owned) but the \
-                         loaded graph carries no typed value for it (R2)",
-                        id = regime.id
-                    )
-                })?,
-                filled => filled,
-            };
-            out.insert(key.to_string(), json);
+    Ok(base)
+}
+
+/// Values the loaded graph's typed data can supply for a data-owned field.
+fn data_fill(field: &str, input: &GraphInput) -> Option<Value> {
+    match field {
+        "spring_len" => input.mean_typed_rest.map(|mean| serde_json::json!(mean)),
+        _ => None,
+    }
+}
+
+/// A user-set control value, stored against the regime base (spec P1).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub(crate) enum Override {
+    /// Dimensionless factor on the resolved base: a registry YAML edit
+    /// propagates to everyone who did not override that control, and no
+    /// absolute value crosses a regime boundary.
+    Multiplier { value: f64 },
+    /// Values a base cannot scale: enums, toggles, and numeric bases of
+    /// exactly zero (scaling zero is not an override).
+    Absolute { value: Value },
+}
+
+/// How a user-entered absolute value is stored against `base`: as a
+/// multiplier when the base is a nonzero number, absolute otherwise.
+pub(crate) fn override_for(base: Option<&Value>, entered: &Value) -> Override {
+    match (base.and_then(Value::as_f64), entered.as_f64()) {
+        (Some(b), Some(v)) if b.abs() > f64::EPSILON => Override::Multiplier { value: v / b },
+        _ => Override::Absolute {
+            value: entered.clone(),
+        },
+    }
+}
+
+/// Persisted layout state (spec P1). `regime_id` is a *pin*: the user's
+/// picker choice, honored while that regime still matches the loaded graph.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub(crate) struct LayoutStateV2 {
+    pub regime_id: Option<String>,
+    /// Control id (a gpu-force option field through phase 2) → override.
+    pub overrides: BTreeMap<String, Override>,
+}
+
+const STATE_KEY_V2: &str = "jc_layout_v2";
+/// Legacy absolute settings bag (`PanelState`). Left in place for one
+/// release after migration, per spec P2.
+const STATE_KEY_V1: &str = "jc_layout_v1";
+
+fn load_v2() -> Option<LayoutStateV2> {
+    LocalStorage::get(STATE_KEY_V2).ok()
+}
+
+fn save_v2(state: &LayoutStateV2) {
+    let _ = LocalStorage::set(STATE_KEY_V2, state);
+}
+
+/// Legacy `jc_layout_v1` absolutes → overrides against a base (spec P2).
+/// A legacy value equal to the base is not an override; unknown legacy
+/// fields are dropped silently.
+pub(crate) fn migrate_overrides(
+    legacy_gpu_force: &Value,
+    base: &serde_json::Map<String, Value>,
+) -> BTreeMap<String, Override> {
+    let mut overrides = BTreeMap::new();
+    let Some(legacy) = legacy_gpu_force.as_object() else {
+        return overrides;
+    };
+    for (field, value) in legacy {
+        if !gpu_force_manifest().iter().any(|d| d.id == field) {
+            continue; // unknown legacy field: dropped
+        }
+        if manifest_dim(field).is_some_and(|d| d.control == "internal") {
+            continue; // cursor pose is render-host state, never an override
+        }
+        let base_value = base.get(field);
+        if base_value == Some(value) {
+            continue; // identical to the base: nothing to carry
+        }
+        overrides.insert(field.clone(), override_for(base_value, value));
+    }
+    overrides
+}
+
+/// Effective settings for the active regime: base ⊕ overrides. Overrides on
+/// a dimension the data owns under the current state are *parked* — retained
+/// in storage, surfaced in the panel, never applied (M2/E1).
+pub(crate) fn effective_options(
+    regime: &Regime,
+    overrides: &BTreeMap<String, Override>,
+    input: &GraphInput,
+) -> Result<(Value, usize, usize), String> {
+    let mut base = base_options(regime, input)?;
+    let mut parked = 0usize;
+    let mut applied = 0usize;
+    for (field, value) in overrides {
+        let Some(dim) = manifest_dim(field) else {
+            continue; // unknown control: dropped
+        };
+        if dim_owned_by_data(dim, input.typed_edges, input.n_edges) {
+            parked += 1;
+            continue;
+        }
+        match value {
+            Override::Multiplier { value } => {
+                if let Some(b) = base.get(field).and_then(Value::as_f64) {
+                    let scaled = b * value;
+                    let is_int = base
+                        .get(field)
+                        .is_some_and(|v| v.is_i64() || v.is_u64());
+                    base.insert(
+                        field.clone(),
+                        if is_int {
+                            serde_json::json!(scaled.round().max(0.0) as i64)
+                        } else {
+                            serde_json::json!(scaled)
+                        },
+                    );
+                    applied += 1;
+                }
+            }
+            Override::Absolute { value } => {
+                base.insert(field.clone(), value.clone());
+                applied += 1;
+            }
         }
     }
-    Ok(Value::Object(out))
+    Ok((Value::Object(base), parked, applied))
 }
 
-// --- auto-apply seam ----------------------------------------------------------------
-//
-// The resolver applies a non-catch-all regime's options on transition into
-// it and restores the pre-regime settings on the way out, stashing the
-// displaced block in localStorage so a reload round-trips. A user's edits
-// while the regime is active are never clobbered: same-regime re-resolution
-// keeps the current settings (spec §4 "manual override … keep").
+// --- resolution + install ----------------------------------------------------------
 
-const REGIME_STORE_KEY: &str = "jc_layout_regime_v1";
-
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
-struct RegimeRecord {
-    /// Regime whose options were auto-applied; empty = none.
-    #[serde(default)]
-    regime_id: String,
-    /// The gpu-force settings block displaced by the auto-apply.
-    #[serde(default)]
-    stash: Option<Value>,
-}
-
-fn load_regime_record() -> RegimeRecord {
-    LocalStorage::get(REGIME_STORE_KEY).unwrap_or_default()
-}
-
-fn save_regime_record(r: &RegimeRecord) {
-    let _ = LocalStorage::set(REGIME_STORE_KEY, r);
-}
-
-/// Resolve the regime for a freshly loaded graph, publish the resolution
-/// the panel renders, and run the auto-apply/restore seam. Called by every
-/// `GraphData` producer (server load, github vault, embedded world) —
-/// `TYPED_FORCE_SUMMARY` is already written when this runs.
+/// Resolve the regime for a freshly loaded graph, migrate legacy settings on
+/// first run, publish the resolution the panel renders, and install the
+/// effective settings. Called by every `GraphData` producer (server load,
+/// github vault, embedded world) — `TYPED_FORCE_SUMMARY` is already written
+/// when this runs.
 pub(crate) fn on_graph_loaded(graph: &GraphData) {
-    let state = snapshot_state(graph);
-    let regime = resolve(&state);
-    *RESOLUTION.write() = Some(RegimeResolution {
-        regime_id: regime.id.clone(),
-        label: regime.label.clone(),
-        reason: regime.applicability.humanized_reason(&state),
-        typed_nodes: state.typed_nodes,
-        typed_edges: state.typed_edges,
-        n_nodes: state.n_nodes as usize,
-        n_edges: state.n_edges,
-        coverage: state.typed_bond_coverage,
-        presets_hidden: !regime.presets_hidden.is_empty(),
-    });
+    let summary = *crate::graph_canvas::TYPED_FORCE_SUMMARY.peek();
+    let (typed_nodes, typed_edges) = summary.unwrap_or((0, 0));
+    let input = GraphInput {
+        n_nodes: graph.n_nodes as usize,
+        n_edges: graph.n_edges as usize,
+        typed_nodes,
+        typed_edges,
+        mean_typed_rest: graph.scene.edge_rest.as_deref().and_then(mean_typed_rest),
+    };
+    *INPUT.write() = input;
+    migrate_if_needed(&input);
+    reapply();
+}
 
-    let mut record = load_regime_record();
-    if regime.applicability.is_empty() {
-        // Catch-all resolved: leaving an auto-applied regime restores the
-        // displaced settings (or drops the block so for_n_nodes re-tunes).
-        if !record.regime_id.is_empty() {
-            crate::panels::layout::restore_gpu_force_settings(record.stash.take());
-            record.regime_id.clear();
-            save_regime_record(&record);
-        }
+/// One-shot `jc_layout_v1` → `jc_layout_v2` migration (spec P2). Legacy
+/// absolutes divide by the `vault-large` base for the same field, so their
+/// historic vault meaning is preserved as dimensionless overrides, and the
+/// pin records the regime they were authored against. The v1 key is left in
+/// place for one release.
+fn migrate_if_needed(input: &GraphInput) {
+    if load_v2().is_some() {
         return;
     }
-    if record.regime_id == regime.id {
-        return; // same regime: keep current (possibly user-tuned) settings
-    }
-    match effective_options(regime, graph) {
-        Ok(options) => {
-            let stash = crate::panels::layout::gpu_force_settings_snapshot();
-            crate::panels::layout::install_gpu_force_regime_options(options);
-            record.regime_id = regime.id.clone();
-            record.stash = stash;
-            save_regime_record(&record);
+    let legacy: Option<Value> = LocalStorage::get::<Value>(STATE_KEY_V1)
+        .ok()
+        .and_then(|v| v.get("settings")?.get("gpu-force").cloned());
+    let Some(legacy) = legacy else {
+        save_v2(&LayoutStateV2::default());
+        return;
+    };
+    let Some(vault_large) = regime_by_id("vault-large") else {
+        save_v2(&LayoutStateV2::default());
+        return;
+    };
+    let Ok(base) = base_options(vault_large, input) else {
+        save_v2(&LayoutStateV2::default());
+        return;
+    };
+    let overrides = migrate_overrides(&legacy, &base);
+    let migrated = LayoutStateV2 {
+        regime_id: (!overrides.is_empty()).then(|| vault_large.id.clone()),
+        overrides,
+    };
+    tracing::info!(
+        "[regimes] migrated {} legacy gpu-force value(s) to jc_layout_v2",
+        migrated.overrides.len()
+    );
+    save_v2(&migrated);
+}
+
+/// Pin (or unpin, with `None`) the regime the picker selected, then
+/// recompute. An unpinned panel follows automatic resolution.
+pub(crate) fn pin(regime_id: Option<String>) {
+    let mut state = load_v2().unwrap_or_default();
+    state.regime_id = regime_id;
+    save_v2(&state);
+    reapply();
+}
+
+/// Record one control's user-entered absolute value as an override against
+/// the active regime base, then recompute.
+pub(crate) fn set_option_override(field: &str, entered: Value) {
+    let input = *INPUT.peek();
+    let mut state = load_v2().unwrap_or_default();
+    let active = active_regime(&state, &snapshot_state(&input));
+    let base = base_options(active, &input).unwrap_or_default();
+    state
+        .overrides
+        .insert(field.to_string(), override_for(base.get(field), &entered));
+    save_v2(&state);
+    reapply();
+}
+
+/// Drop every override and follow automatic resolution again (the panel's
+/// reset-to-defaults action for gpu-force).
+pub(crate) fn reset() {
+    save_v2(&LayoutStateV2::default());
+    reapply();
+}
+
+/// The regime in effect: the pin when it exists and still matches the loaded
+/// graph (spec §4 "if manual_override active and regime still loads: keep"),
+/// otherwise automatic resolution.
+fn active_regime<'a>(state: &LayoutStateV2, snapshot: &SnapshotState) -> &'static Regime {
+    state
+        .regime_id
+        .as_deref()
+        .and_then(regime_by_id)
+        .filter(|r| r.engine == "gpu-force" && r.applicability.matches(snapshot))
+        .unwrap_or_else(|| resolve(snapshot))
+}
+
+/// Recompute the resolution + effective settings from persisted state and
+/// the current graph, and install them. The single writer of the gpu-force
+/// settings block.
+fn reapply() {
+    let input = *INPUT.peek();
+    let state = load_v2().unwrap_or_default();
+    let snapshot = snapshot_state(&input);
+    let regime = active_regime(&state, &snapshot);
+    let pinned = state
+        .regime_id
+        .as_deref()
+        .is_some_and(|id| id == regime.id.as_str());
+
+    match effective_options(regime, &state.overrides, &input) {
+        Ok((options, parked, applied)) => {
+            *RESOLUTION.write() = Some(RegimeResolution {
+                regime_id: regime.id.clone(),
+                label: regime.label.clone(),
+                reason: if pinned {
+                    "pinned".to_string()
+                } else {
+                    regime.applicability.humanized_reason(&snapshot)
+                },
+                pinned,
+                typed_nodes: input.typed_nodes,
+                typed_edges: input.typed_edges,
+                n_nodes: input.n_nodes,
+                n_edges: input.n_edges,
+                coverage: snapshot.typed_bond_coverage,
+                choices: selectable_regimes(&snapshot, regime)
+                    .into_iter()
+                    .map(|r| (r.id.clone(), r.label.clone()))
+                    .collect(),
+                parked,
+                applied_overrides: applied,
+            });
+            crate::panels::layout::install_gpu_force_settings(options);
         }
         Err(error) => {
-            // R2 loud boot error: keep the previous settings rather than
-            // apply a regime the data cannot fill.
+            // R2 loud error: keep the previous settings rather than install
+            // a base the data cannot fill.
             tracing::error!("[regimes] not applying {id}: {error}", id = regime.id);
         }
     }
@@ -516,9 +801,8 @@ pub(crate) fn on_graph_loaded(graph: &GraphData) {
 // predicate vocabulary as regime YAML (M1); a fired `not_when` renders the
 // dimension as a collapsed-data capsule on every surface (M2, CK-202).
 
-#[allow(dead_code)] // label/control/owned_by/note surface in phase 3's
-                    // manifest-filtered Advanced disclosure; ids gate today.
-
+#[allow(dead_code)] // label/owned_by/note surface in phase 3's
+                    // manifest-filtered Advanced disclosure.
 pub(crate) struct ManifestDim {
     pub id: &'static str,
     pub label: &'static str,
@@ -527,7 +811,7 @@ pub(crate) struct ManifestDim {
     pub control: &'static str,
     /// Fires when the data owns this dimension outright → capsule (M2).
     pub not_when: Option<&'static str>,
-    /// Inverse applicability gate (phase 1: the backend enum's n≥500).
+    /// Inverse applicability gate (the backend enum's n≥500).
     pub min_nodes: Option<u64>,
     pub owned_by: Option<&'static str>,
     pub note: &'static str,
@@ -564,6 +848,10 @@ pub(crate) fn gpu_force_manifest() -> &'static [ManifestDim] {
     ]
 }
 
+pub(crate) fn manifest_dim(id: &str) -> Option<&'static ManifestDim> {
+    gpu_force_manifest().iter().find(|d| d.id == id)
+}
+
 /// Evaluate a manifest dimension's `not_when` against live coverage (M1/M2).
 pub(crate) fn dim_owned_by_data(dim: &ManifestDim, typed_edges: usize, n_edges: usize) -> bool {
     match dim.not_when {
@@ -575,10 +863,6 @@ pub(crate) fn dim_owned_by_data(dim: &ManifestDim, typed_edges: usize, n_edges: 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn manifest_ids() -> Vec<String> {
-        gpu_force_manifest().iter().map(|d| d.id.to_string()).collect()
-    }
 
     /// Spec §3 parity: the hand-checked manifest's dimension set is exactly
     /// `GpuForceOptions`'s serialized field set — drift in either direction
@@ -593,25 +877,31 @@ mod tests {
         .and_then(|v| v.as_object().map(|o| o.keys().cloned().collect()))
         .unwrap_or_default();
         options_fields.sort();
-        let mut ids = manifest_ids();
+        let mut ids: Vec<String> = gpu_force_manifest().iter().map(|d| d.id.to_string()).collect();
         ids.sort();
         assert_eq!(
-            ids,
-            options_fields,
+            ids, options_fields,
             "manifest dimensions must mirror GpuForceOptions fields"
         );
     }
 
     #[test]
     fn registry_loads_ordered_specific_first() {
-        let reg = registry();
-        let ids: Vec<&str> = reg.iter().map(|r| r.id.as_str()).collect();
+        let ids: Vec<&str> = registry().iter().map(|r| r.id.as_str()).collect();
         assert_eq!(
             ids,
-            ["molecular-uff", "vault-small"],
+            [
+                "balanced",
+                "fast",
+                "molecular-uff",
+                "pretty",
+                "vault-large",
+                "vault-small"
+            ],
             "R3: predicate count desc, filename asc"
         );
-        assert!(reg[1].applicability.is_empty(), "R4: catch-all present");
+        let catch_all = registry().iter().find(|r| r.applicability.is_empty());
+        assert_eq!(catch_all.map(|r| r.id.as_str()), Some("vault-small"), "R4");
     }
 
     #[test]
@@ -648,11 +938,46 @@ mod tests {
     }
 
     #[test]
-    fn resolver_coverage_threshold() {
+    fn resolver_coverage_threshold_and_node_bounds() {
         assert_eq!(resolve(&state(1.0, 24)).id, "molecular-uff");
         assert_eq!(resolve(&state(0.5, 24)).id, "molecular-uff");
         assert_eq!(resolve(&state(0.49, 24)).id, "vault-small");
-        assert_eq!(resolve(&state(0.0, 5000)).id, "vault-small");
+        assert_eq!(resolve(&state(0.0, 999)).id, "vault-small");
+        assert_eq!(resolve(&state(0.0, 1000)).id, "vault-large");
+    }
+
+    /// Presets are picker-only: a one-predicate `engine_kind` regime must
+    /// not outrank the zero-predicate vault catch-all in auto-resolution.
+    #[test]
+    fn presets_never_win_auto_resolution_but_are_selectable() {
+        let untyped = state(0.0, 200);
+        assert_eq!(resolve(&untyped).id, "vault-small");
+        let active = resolve(&untyped);
+        let offered: Vec<&str> = selectable_regimes(&untyped, active)
+            .iter()
+            .map(|r| r.id.as_str())
+            .collect();
+        for preset in ["fast", "balanced", "pretty"] {
+            assert!(offered.contains(&preset), "picker offers {preset}: {offered:?}");
+        }
+        assert!(
+            !offered.contains(&"molecular-uff"),
+            "molecular regime is not applicable to an untyped graph: {offered:?}"
+        );
+    }
+
+    /// `presets_hidden` quarantines the vault-tuned presets from ångström
+    /// geometry — on every surface, including the picker.
+    #[test]
+    fn molecular_regime_hides_vault_presets() {
+        let molecule = state(1.0, 24);
+        let active = resolve(&molecule);
+        assert_eq!(active.id, "molecular-uff");
+        let offered: Vec<&str> = selectable_regimes(&molecule, active)
+            .iter()
+            .map(|r| r.id.as_str())
+            .collect();
+        assert_eq!(offered, ["molecular-uff", "vault-small"], "presets quarantined");
     }
 
     #[test]
@@ -660,54 +985,163 @@ mod tests {
         let yaml = "id: guarded\nschema_version: 1\nlabel: Guarded\nengine: gpu-force\nexecution: live\napplicability:\n  source_kind: [obsidian]\noptions: {}\n";
         let reg = load_registry(&[
             ("guarded.yaml", yaml),
-            ("vault-small.yaml", REGIME_FILES[1].1),
+            ("vault-small.yaml", REGIME_FILES[5].1),
         ]);
-        let hit = reg.iter().find(|r| r.applicability.matches(&state(0.0, 100)));
+        let hit = reg
+            .iter()
+            .find(|r| r.auto && r.applicability.matches(&state(0.0, 100)));
         assert_eq!(hit.unwrap().id, "vault-small");
     }
 
-    fn molecule_graph(edge_rest: Option<Vec<f32>>) -> GraphData {
-        GraphData {
-            graph_revision: Some(1),
+    fn molecule_input(mean_rest: Option<f32>) -> GraphInput {
+        GraphInput {
             n_nodes: 24,
             n_edges: 25,
-            num_communities: 1,
-            num_wcc: 1,
-            ids: Vec::new(),
-            id_to_idx: Default::default(),
-            scene: crate::render::Scene {
-                positions: Vec::new(),
-                edges: Vec::new(),
-                colors: Vec::new(),
-                sizes: Vec::new(),
-                edge_rest,
-                node_repulsion: None,
-            },
+            typed_nodes: 24,
+            typed_edges: 25,
+            mean_typed_rest: mean_rest,
         }
     }
 
     #[test]
-    fn molecular_options_fill_spring_len_from_data() {
-        let regime = registry().iter().find(|r| r.id == "molecular-uff").unwrap();
-        let graph = molecule_graph(Some(vec![1.4; 25]));
-        let options = effective_options(regime, &graph).expect("fill succeeds with typed data");
-        let spring_len = options.get("spring_len").and_then(|v| v.as_f64()).unwrap();
+    fn molecular_base_fills_spring_len_from_data() {
+        let regime = regime_by_id("molecular-uff").unwrap();
+        let base = base_options(regime, &molecule_input(Some(1.4))).expect("typed fill");
         assert!(
-            (spring_len - 1.4).abs() < 1e-6,
-            "null spring_len fills from mean typed rest"
+            (base["spring_len"].as_f64().unwrap() - 1.4).abs() < 1e-6,
+            "null spring_len fills from the mean typed rest"
         );
-        assert_eq!(options.get("seed_mode").and_then(|v| v.as_str()), Some("none"));
-        assert_eq!(options.get("gravity").and_then(|v| v.as_f64()), Some(0.0));
-        // Whole block deserializes against the engine struct.
+        assert_eq!(base["seed_mode"], serde_json::json!("none"));
+        assert_eq!(base["gravity"], serde_json::json!(0.0));
         let parsed: graph_layouts::GpuForceOptions =
-            serde_json::from_value(options).expect("fits GpuForceOptions");
+            serde_json::from_value(Value::Object(base)).expect("fits GpuForceOptions");
         assert_eq!(parsed.seed_mode, graph_layouts::SeedMode::None);
 
-        // R2: null with no typed data fails loud, naming the regime.
-        let untyped = molecule_graph(None);
-        let err = effective_options(regime, &untyped).expect_err("R2 fail-loud");
-        assert!(err.contains("molecular-uff"), "error names the regime: {err}");
-        assert!(err.contains("spring_len"), "error names the field: {err}");
+        let err = base_options(regime, &molecule_input(None)).expect_err("R2 fail-loud");
+        assert!(err.contains("molecular-uff") && err.contains("spring_len"), "{err}");
+    }
+
+    /// The vault base stays n-tuned: no YAML value can express
+    /// `for_n_nodes`, so the regime overlays only what is not a function of
+    /// the node count.
+    #[test]
+    fn vault_base_is_n_tuned() {
+        let regime = regime_by_id("vault-large").unwrap();
+        let small = base_options(regime, &GraphInput { n_nodes: 1_000, n_edges: 2_000, ..Default::default() }).unwrap();
+        let large = base_options(regime, &GraphInput { n_nodes: 100_000, n_edges: 200_000, ..Default::default() }).unwrap();
+        assert!(
+            large["spring_len"].as_f64().unwrap() > small["spring_len"].as_f64().unwrap(),
+            "spring_len scales with n"
+        );
+        assert_eq!(large["repulsion_mode"], serde_json::json!("barnes_hut"));
+    }
+
+    #[test]
+    fn override_storage_prefers_multipliers() {
+        // Nonzero numeric base → dimensionless multiplier.
+        assert_eq!(
+            override_for(Some(&serde_json::json!(50.0)), &serde_json::json!(75.0)),
+            Override::Multiplier { value: 1.5 }
+        );
+        // Zero base cannot be scaled.
+        assert_eq!(
+            override_for(Some(&serde_json::json!(0.0)), &serde_json::json!(0.3)),
+            Override::Absolute { value: serde_json::json!(0.3) }
+        );
+        // Enums and toggles are absolute by nature.
+        assert_eq!(
+            override_for(Some(&serde_json::json!("grid")), &serde_json::json!("bh")),
+            Override::Absolute { value: serde_json::json!("bh") }
+        );
+    }
+
+    #[test]
+    fn effective_applies_multipliers_against_the_regime_base() {
+        let regime = regime_by_id("vault-small").unwrap();
+        let input = GraphInput { n_nodes: 500, n_edges: 900, ..Default::default() };
+        let base = base_options(regime, &input).unwrap();
+        let mut overrides = BTreeMap::new();
+        overrides.insert("spring_len".to_string(), Override::Multiplier { value: 2.0 });
+        overrides.insert(
+            "repulsion_mode".to_string(),
+            Override::Absolute { value: serde_json::json!("ns") },
+        );
+        overrides.insert("bogus_field".to_string(), Override::Multiplier { value: 9.0 });
+        let (effective, parked, applied) = effective_options(regime, &overrides, &input).unwrap();
+        assert_eq!(
+            effective["spring_len"].as_f64().unwrap(),
+            base["spring_len"].as_f64().unwrap() * 2.0
+        );
+        assert_eq!(effective["repulsion_mode"], serde_json::json!("ns"));
+        assert_eq!((parked, applied), (0, 2), "unknown control dropped, not applied");
+    }
+
+    /// E1/M2: an override on a data-owned dimension is retained but never
+    /// applied — the engine ignores `spring_len` for typed edges, so
+    /// applying it would move a number that changes nothing.
+    #[test]
+    fn overrides_on_data_owned_dimensions_are_parked() {
+        let regime = regime_by_id("molecular-uff").unwrap();
+        let input = molecule_input(Some(1.33));
+        let mut overrides = BTreeMap::new();
+        overrides.insert("spring_len".to_string(), Override::Multiplier { value: 40.0 });
+        let (effective, parked, applied) = effective_options(regime, &overrides, &input).unwrap();
+        assert_eq!((parked, applied), (1, 0));
+        assert!(
+            (effective["spring_len"].as_f64().unwrap() - 1.33).abs() < 1e-6,
+            "parked override must not scale the data-owned rest"
+        );
+    }
+
+    /// Spec P2: legacy absolutes become multipliers against the vault base,
+    /// values equal to the base are not overrides, and unknown legacy fields
+    /// are dropped silently.
+    #[test]
+    fn v1_migration_divides_legacy_absolutes_by_the_vault_base() {
+        let regime = regime_by_id("vault-large").unwrap();
+        let input = GraphInput { n_nodes: 10_000, n_edges: 40_000, ..Default::default() };
+        let base = base_options(regime, &input).unwrap();
+        let base_spring = base["spring_len"].as_f64().unwrap();
+        let legacy = serde_json::json!({
+            "spring_len": base_spring * 1.25,
+            "damping": base["damping"].as_f64().unwrap(),
+            "seed_mode": "none",
+            "cursor_radius": 12.0,
+            "long_forgotten_knob": 3.0,
+        });
+        let overrides = migrate_overrides(&legacy, &base);
+        match overrides.get("spring_len") {
+            Some(Override::Multiplier { value }) => {
+                assert!((value - 1.25).abs() < 1e-6, "legacy absolute ÷ base: {value}")
+            }
+            other => panic!("expected a multiplier, got {other:?}"),
+        }
+        assert_eq!(
+            overrides.get("seed_mode"),
+            Some(&Override::Absolute { value: serde_json::json!("none") })
+        );
+        assert!(!overrides.contains_key("damping"), "base-equal value is not an override");
+        assert!(!overrides.contains_key("cursor_radius"), "cursor pose is host state");
+        assert!(!overrides.contains_key("long_forgotten_knob"), "unknown field dropped");
+    }
+
+    /// A pin survives only while its regime still matches the loaded graph
+    /// (spec §4) — otherwise a vault pin would put 53-ångström springs on a
+    /// molecule.
+    #[test]
+    fn pin_is_dropped_when_its_regime_stops_matching() {
+        let pinned = LayoutStateV2 {
+            regime_id: Some("vault-large".to_string()),
+            overrides: BTreeMap::new(),
+        };
+        let big_vault = state(0.0, 5_000);
+        assert_eq!(active_regime(&pinned, &big_vault).id, "vault-large");
+        let molecule = state(1.0, 24);
+        assert_eq!(
+            active_regime(&pinned, &molecule).id,
+            "molecular-uff",
+            "a pin that no longer applies falls back to resolution"
+        );
     }
 
     #[test]
@@ -718,18 +1152,9 @@ mod tests {
 
     #[test]
     fn dim_ownership_fires_only_at_full_coverage() {
-        let spring_len = gpu_force_manifest()
-            .iter()
-            .find(|d| d.id == "spring_len")
-            .unwrap();
-        assert!(
-            dim_owned_by_data(spring_len, 25, 25),
-            "full coverage → data-owned capsule"
-        );
-        assert!(
-            !dim_owned_by_data(spring_len, 13, 25),
-            "partial coverage → live (governs untyped)"
-        );
+        let spring_len = manifest_dim("spring_len").unwrap();
+        assert!(dim_owned_by_data(spring_len, 25, 25), "full coverage → capsule");
+        assert!(!dim_owned_by_data(spring_len, 13, 25), "partial → governs untyped");
         assert!(!dim_owned_by_data(spring_len, 0, 25), "untyped → live");
     }
 }

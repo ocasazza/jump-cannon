@@ -209,3 +209,28 @@ for untyped regimes; Advanced manifest-filtered; parked overrides surfaced in `w
 
 - 2026-09-12: initial spec from docs/layout-ux.md + judge merge maps
   (.specs/reports/layout-ux-2026-09-12.{1,2,3}.md).
+- 2026-09-13 (phase 1 landed): registry loader, `typed_bond_coverage`
+  resolver, hand-checked gpu-force manifest + parity test, panel capsule /
+  banner deletion / preset quarantine. Drift from §2: predicates the
+  resolver cannot evaluate yet (`has_authored_positions`, `source_kind`)
+  **fail closed** — a regime declaring one never matches — rather than
+  matching on an unevaluated guess. Authored-position rescale and the
+  coarsening warm-up now anchor at the mean typed rest, and the render host
+  boots from the resolved settings so `seed_mode: none` survives first init
+  (E3); previously the host booted `GpuForceOptions::default()` and
+  re-seeded randomly before the panel could push settings.
+- 2026-09-13 (phase 2 landed): presets are regimes
+  (`fast`/`balanced`/`pretty`), `vault-large` added, `LayoutPreset` +
+  `detect` deleted, `jc_layout_v2` (`{regime_id, overrides}`) with the
+  one-shot v1 migration, and `?config=<regime-id>` pinning through the
+  registry loader. Drift from §2: the regime schema gains **`auto: bool`**
+  (default `true`). Without it the one-predicate preset regimes
+  (`engine_kind: [local]`, per P4) outrank the zero-predicate vault
+  catch-all in the R3 specificity sort and hijack automatic resolution;
+  `auto: false` makes them picker-only. It is not a predicate and takes no
+  part in the sort. Drift from §5 P2: the migration runs at the first graph
+  load rather than at boot, because the `vault-large` base is n-tuned
+  (`for_n_nodes`) and the node count is unknown until a graph exists.
+  Overrides are stored as multipliers when the base is a nonzero number and
+  absolutes otherwise (enums, toggles, zero bases); an override whose
+  dimension the data owns is parked, never applied (M2/E1).

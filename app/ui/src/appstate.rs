@@ -441,17 +441,28 @@ pub(crate) fn ensure_init() {
             Err(e) => tracing::warn!("[appstate] #s= share fragment decode failed: {e}"),
         }
     } else if let Some(name) = config_param_from_location() {
-        // Preset bootstrap — async fetch, then the same strip → apply →
-        // reload dance. `spawn_forever`: the arming panel may unmount.
-        spawn_forever(async move {
-            match fetch_config(&name).await.and_then(|yaml| import_str(&yaml)) {
-                Ok(state) => {
-                    strip_config_param();
-                    apply(&state, "import yaml");
+        // Layout boot presets are registry regimes (spec P3): `?config=` of
+        // a regime id pins that regime through the same loader and schema
+        // the resolver uses — no second format, no fetch, no reload. The
+        // legacy `app/configs/caffeine-uff.yaml` moved to
+        // `app/configs/regimes/molecular-uff.yaml`; every other name is
+        // still a dev-server AppState preset.
+        if crate::panels::regimes::regime_by_id(&name).is_some() {
+            strip_config_param();
+            crate::panels::regimes::pin(Some(name));
+        } else {
+            // Preset bootstrap — async fetch, then the same strip → apply →
+            // reload dance. `spawn_forever`: the arming panel may unmount.
+            spawn_forever(async move {
+                match fetch_config(&name).await.and_then(|yaml| import_str(&yaml)) {
+                    Ok(state) => {
+                        strip_config_param();
+                        apply(&state, "import yaml");
+                    }
+                    Err(e) => tracing::warn!("[appstate] ?config={name} preset failed: {e}"),
                 }
-                Err(e) => tracing::warn!("[appstate] ?config={name} preset failed: {e}"),
-            }
-        });
+            });
+        }
     }
 
     // Auto-snapshot ticker — port of `App::tick_snapshots`: diff the

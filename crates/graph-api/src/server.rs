@@ -1279,8 +1279,9 @@ async fn asset(State(host): State<SourceHost>, Path(path): Path<String>) -> impl
 // load a known configuration (and share `?config=<name>` links). Presets are
 // optional: the endpoints 404 unless a configs dir resolves — explicit
 // `--configs-dir` / `JUMP_CANNON_CONFIGS_DIR` first, otherwise
-// `<assets-dir>/../../configs`. AppState YAML boot presets live there
-// (e.g. app/configs/caffeine-uff.yaml).
+// `<assets-dir>/../../configs`. AppState YAML boot presets live there;
+// layout boot presets are registry regimes served from the app bundle
+// instead (app/configs/regimes/, pinned with `?config=<regime-id>`).
 
 fn configs_dir(s: &AppState) -> Option<std::path::PathBuf> {
     if let Some(dir) = &s.inner.configs_dir {

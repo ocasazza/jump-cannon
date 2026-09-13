@@ -682,34 +682,15 @@ fn edit<T: Serialize + DeserializeOwned + Default>(id: &str, f: impl FnOnce(&mut
 
 // --- regime seam (panels/regimes.rs) --------------------------------------------
 //
-// The resolver owns *when* regime settings apply; this module owns *how*
-// they land (persist + GPU push through the same path as manual edits).
+// The resolver owns *what* the gpu-force settings are (regime base ⊕
+// overrides, recomputed on every graph swap, picker choice, and control
+// edit); this module owns *how* they land (persist + GPU push through the
+// same path as every other engine's settings).
 
-/// Current persisted gpu-force settings block, or `None` when the engine
-/// has no settings yet (first boot — `for_n_nodes` fill applies).
-pub(crate) fn gpu_force_settings_snapshot() -> Option<Value> {
-    STATE.peek().settings.get("gpu-force").cloned()
-}
-
-/// Install a resolved regime's options as the gpu-force settings block.
-pub(crate) fn install_gpu_force_regime_options(options: Value) {
+/// Install the resolver's effective gpu-force settings block. The only
+/// writer of that block — panel controls record overrides instead.
+pub(crate) fn install_gpu_force_settings(options: Value) {
     put_settings("gpu-force", options);
-}
-
-/// Restore the settings block displaced by a regime auto-apply. `None`
-/// drops the block so the next apply re-tunes from `for_n_nodes`.
-pub(crate) fn restore_gpu_force_settings(stash: Option<Value>) {
-    match stash {
-        Some(v) => put_settings("gpu-force", v),
-        None => {
-            let mut st = STATE.read().clone();
-            if st.settings.remove("gpu-force").is_some() {
-                persist(&st);
-                *STATE.write() = st;
-                apply_engine(false);
-            }
-        }
-    }
 }
 
 /// gpu-force options the render host should boot with (canvas mount): the
@@ -1117,91 +1098,6 @@ fn apply_engine(solve_requested: bool) {
         active,
         json,
     });
-}
-
-// --- gpu-force presets (port of ui/layout/algorithms/gpu_force.rs) -------------------
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
-enum LayoutPreset {
-    Fast,
-    #[default]
-    Balanced,
-    Pretty,
-}
-
-impl LayoutPreset {
-    const ALL: [LayoutPreset; 3] = [
-        LayoutPreset::Fast,
-        LayoutPreset::Balanced,
-        LayoutPreset::Pretty,
-    ];
-
-    fn label(self) -> &'static str {
-        match self {
-            LayoutPreset::Fast => "Fast",
-            LayoutPreset::Balanced => "Balanced",
-            LayoutPreset::Pretty => "Pretty",
-        }
-    }
-
-    fn apply_to(self, o: &mut GpuForceOptions) {
-        match self {
-            LayoutPreset::Fast => {
-                o.repulsion = 150.0;
-                o.spring_k = 0.10;
-                o.spring_len = 40.0;
-                o.gravity = 0.005;
-                o.damping = 0.85;
-                o.dt = 0.045;
-                o.steps_per_call = 1;
-                o.cooling_alpha = 0.99;
-                o.cooling_floor = 0.65;
-                o.energy_threshold = 0.5;
-            }
-            LayoutPreset::Balanced => {
-                o.repulsion = 250.0;
-                o.spring_k = 0.06;
-                o.spring_len = 60.0;
-                o.gravity = 0.003;
-                o.damping = 0.92;
-                o.dt = 0.04;
-                o.steps_per_call = 2;
-                o.cooling_alpha = 0.999;
-                o.cooling_floor = 0.85;
-                o.energy_threshold = 0.005;
-            }
-            LayoutPreset::Pretty => {
-                o.repulsion = 400.0;
-                o.spring_k = 0.05;
-                o.spring_len = 80.0;
-                o.gravity = 0.002;
-                o.damping = 0.92;
-                o.dt = 0.025;
-                o.steps_per_call = 4;
-                o.cooling_alpha = 0.999;
-                o.cooling_floor = 0.55;
-                o.energy_threshold = 0.02;
-            }
-        }
-    }
-
-    /// Best-effort guess of which preset produced this options block —
-    /// purely for highlighting the active preset button.
-    fn detect(o: &GpuForceOptions) -> Option<Self> {
-        for p in Self::ALL {
-            let mut probe = GpuForceOptions::default();
-            p.apply_to(&mut probe);
-            if (probe.repulsion - o.repulsion).abs() < 0.001
-                && (probe.spring_k - o.spring_k).abs() < 0.0001
-                && (probe.spring_len - o.spring_len).abs() < 0.001
-                && (probe.dt - o.dt).abs() < 0.0001
-                && probe.steps_per_call == o.steps_per_call
-            {
-                return Some(p);
-            }
-        }
-        None
-    }
 }
 
 // --- remote bridges (ports of remote_fa2.rs / geometric.rs renderer layers) ----------
@@ -1855,21 +1751,10 @@ fn builtin_demo_indices() -> Vec<usize> {
 /// provokes skips the buffer upload; `keep == false` restores `"random"`.
 fn set_gpu_force_seed_mode(keep: bool) {
     let mode = if keep { "none" } else { "random" };
-    let n = render::with_host(|h| h.pipes.n_nodes() as usize).unwrap_or(0);
-    let mut st = STATE.read().clone();
-    let entry = st
-        .settings
-        .entry("gpu-force".to_string())
-        .or_insert_with(|| {
-            serde_json::to_value(GpuForceOptions::for_n_nodes(n))
-                .unwrap_or_else(|_| serde_json::json!({}))
-        });
-    if let Some(obj) = entry.as_object_mut() {
-        obj.insert("seed_mode".to_string(), serde_json::json!(mode));
-    }
-    persist(&st);
-    *STATE.write() = st;
-    apply_engine(false);
+    // Seed mode is a gpu-force option like any other: it rides the regime
+    // override layer, which recomputes and installs the effective settings
+    // block (the single writer) and pushes it to the host.
+    crate::panels::regimes::set_option_override("seed_mode", serde_json::json!(mode));
 }
 
 fn set_seed_strategy(s: SeedStrategy) {
@@ -2735,7 +2620,13 @@ pub fn panel(ctx: Ctx) -> Element {
                     title: "Reset {params_name} to its default settings",
                     onclick: move |_| {
                         let id = STATE.read().active.clone();
-                        put_settings(&id, default_settings(&id));
+                        if id == "gpu-force" {
+                            // gpu-force settings are derived: dropping the
+                            // overrides and the pin *is* the reset.
+                            crate::panels::regimes::reset();
+                        } else {
+                            put_settings(&id, default_settings(&id));
+                        }
                     },
                     "↺"
                 }
@@ -3622,9 +3513,16 @@ mod frame_tests {
     }
 }
 
+/// Record a gpu-force control edit as an override against the active
+/// regime's base (spec P1). The resolver recomputes the effective settings
+/// block and pushes it — controls never write settings directly, so a
+/// registry YAML edit reaches every user who left that control alone.
+fn set_gpu_force(field: &'static str, value: Value) {
+    crate::panels::regimes::set_option_override(field, value);
+}
+
 fn gpu_force_ui() -> Element {
     let opts: GpuForceOptions = typed_settings("gpu-force");
-    let active_preset = LayoutPreset::detect(&opts).unwrap_or_default();
     let repulsion_mode = opts.repulsion_mode;
 
     // Regime resolution (panels/regimes.rs): None only before the first
@@ -3651,7 +3549,10 @@ fn gpu_force_ui() -> Element {
                 0,
             ),
         };
-    let presets_hidden = res.as_ref().is_some_and(|r| r.presets_hidden);
+    let pinned = res.as_ref().is_some_and(|r| r.pinned);
+    let parked = res.as_ref().map(|r| r.parked).unwrap_or(0);
+    let applied_overrides = res.as_ref().map(|r| r.applied_overrides).unwrap_or(0);
+    let choices = res.as_ref().map(|r| r.choices.clone()).unwrap_or_default();
     let manifest = crate::panels::regimes::gpu_force_manifest();
     // M1/M3: controls exist only when manifest ∧ live graph state agree —
     // the dead-knob rule is structural, not a hand-tuned if per slider.
@@ -3670,14 +3571,36 @@ fn gpu_force_ui() -> Element {
         .is_some_and(|min| n_nodes >= min as usize);
 
     rsx! {
-        // Regime line (UI2): the resolved regime and the predicate that
-        // decided the match — the panel's answer to "which source of
-        // truth is in effect".
-        div { class: "lay-regime", "data-regime-id": "{regime_id}",
-            span { class: "lay-regime-label", "{regime_label}" }
-            if !reason.is_empty() {
-                span { class: "lay-regime-reason", "auto: {reason}" }
+        // Regime picker + resolution reason (UI2). Selecting a regime pins
+        // it; `auto` hands the choice back to the resolver. The options are
+        // the regimes applicable to this graph, minus the ones the active
+        // regime quarantines (vault presets on ångström geometry).
+        div { class: "lay-row lay-regime", "data-regime-id": "{regime_id}",
+            span { class: "lay-k", "regime" }
+            select {
+                class: "lay-select",
+                "data-regime-picker": "true",
+                value: if pinned { regime_id.clone() } else { "auto".to_string() },
+                onchange: move |e| {
+                    let value = e.value();
+                    crate::panels::regimes::pin(
+                        (value != "auto").then_some(value),
+                    );
+                },
+                option { value: "auto", selected: !pinned, "auto ({regime_label})" }
+                for (id, label) in choices.iter() {
+                    option {
+                        key: "{id}",
+                        value: "{id}",
+                        selected: pinned && *id == regime_id,
+                        "{label}"
+                    }
+                }
             }
+        }
+        div { class: "lay-regime-reason",
+            if pinned { "pinned · {regime_label}" } else { "auto: {reason}" }
+            if applied_overrides > 0 { " · {applied_overrides} override(s)" }
         }
 
         if spring_len_owned {
@@ -3707,20 +3630,10 @@ fn gpu_force_ui() -> Element {
                  {typed_edges} from UFF"
             }
         }
-
-        if !presets_hidden {
-            // Reset lives in the top-row ↺ (resets the active engine); no
-            // per-engine duplicate here.
-            div { class: "lay-sub", "Preset" }
-            div { class: "lay-presets",
-                for preset in LayoutPreset::ALL {
-                    button {
-                        key: "{preset.label()}",
-                        class: if preset == active_preset { "lay-btn active" } else { "lay-btn" },
-                        onclick: move |_| edit::<GpuForceOptions>("gpu-force", |o| preset.apply_to(o)),
-                        {preset.label()}
-                    }
-                }
+        if parked > 0 {
+            div { class: "lay-hint", "data-lay-state": "parked-overrides",
+                "{parked} override(s) parked — the loaded graph's data owns those \
+                 dimensions; they return if a graph that does not comes back."
             }
         }
 
@@ -3729,9 +3642,9 @@ fn gpu_force_ui() -> Element {
         div { class: "lay-sub", "Physics" }
         Slider { label: "repulsion", min: 0.1, max: 100_000.0, value: opts.repulsion as f64, log: true,
             title: "Mixes with per-atom UFF weights via sqrt(wi*wj) on typed atoms",
-            on: move |v: f64| edit::<GpuForceOptions>("gpu-force", |o| o.repulsion = v as f32) }
+            on: move |v: f64| set_gpu_force("repulsion", serde_json::json!(v)) }
         Slider { label: "spring_k", min: 0.0001, max: 10.0, value: opts.spring_k as f64, log: true,
-            on: move |v: f64| edit::<GpuForceOptions>("gpu-force", |o| o.spring_k = v as f32) }
+            on: move |v: f64| set_gpu_force("spring_k", serde_json::json!(v)) }
         if !spring_len_owned {
             Slider { label: "spring_len", min: 1.0, max: 10_000.0, value: opts.spring_len as f64, log: true,
                 title: if typed_edges > 0 {
@@ -3740,34 +3653,35 @@ fn gpu_force_ui() -> Element {
                 } else {
                     "Global spring rest length — governs every edge".to_string()
                 },
-                on: move |v: f64| edit::<GpuForceOptions>("gpu-force", |o| o.spring_len = v as f32) }
+                on: move |v: f64| set_gpu_force("spring_len", serde_json::json!(v)) }
         }
         Slider { label: "gravity", min: 0.00001, max: 1.0, value: opts.gravity as f64, log: true,
-            on: move |v: f64| edit::<GpuForceOptions>("gpu-force", |o| o.gravity = v as f32) }
+            on: move |v: f64| set_gpu_force("gravity", serde_json::json!(v)) }
         Slider { label: "damping", min: 0.0, max: 1.0, value: opts.damping as f64,
-            on: move |v: f64| edit::<GpuForceOptions>("gpu-force", |o| o.damping = v as f32) }
+            on: move |v: f64| set_gpu_force("damping", serde_json::json!(v)) }
         Slider { label: "dt", min: 0.0001, max: 1.0, value: opts.dt as f64, log: true,
-            on: move |v: f64| edit::<GpuForceOptions>("gpu-force", |o| o.dt = v as f32) }
+            on: move |v: f64| set_gpu_force("dt", serde_json::json!(v)) }
         Slider { label: "steps/call", min: 1.0, max: 64.0, value: opts.steps_per_call as f64,
-            on: move |v: f64| edit::<GpuForceOptions>("gpu-force", |o| {
-                o.steps_per_call = v.round().max(1.0) as u32;
-            }) }
+            on: move |v: f64| set_gpu_force(
+                "steps_per_call",
+                serde_json::json!(v.round().max(1.0) as u32),
+            ) }
 
         hr { class: "lay-sep" }
 
         div { class: "lay-sub", "Cooling" }
         div { class: "lay-hint", "Drives sim toward steady state" }
         Slider { label: "cooling α", min: 0.9, max: 1.0, value: opts.cooling_alpha as f64,
-            on: move |v: f64| edit::<GpuForceOptions>("gpu-force", |o| o.cooling_alpha = v as f32) }
+            on: move |v: f64| set_gpu_force("cooling_alpha", serde_json::json!(v)) }
         Slider { label: "cooling floor", min: 0.0, max: 1.0, value: opts.cooling_floor as f64,
-            on: move |v: f64| edit::<GpuForceOptions>("gpu-force", |o| o.cooling_floor = v as f32) }
+            on: move |v: f64| set_gpu_force("cooling_floor", serde_json::json!(v)) }
 
         hr { class: "lay-sep" }
 
         div { class: "lay-sub", "Auto-halt" }
         div { class: "lay-hint", "Stop dispatching when truly settled" }
         Slider { label: "energy halt", min: 0.0, max: 1.0, value: opts.energy_threshold as f64,
-            on: move |v: f64| edit::<GpuForceOptions>("gpu-force", |o| o.energy_threshold = v as f32) }
+            on: move |v: f64| set_gpu_force("energy_threshold", serde_json::json!(v)) }
 
         if backend_available {
             hr { class: "lay-sep" }
@@ -3783,13 +3697,14 @@ fn gpu_force_ui() -> Element {
                         RepulsionMode::BarnesHut => "bh",
                         RepulsionMode::NegativeSampling => "ns",
                     },
-                    onchange: move |e| edit::<GpuForceOptions>("gpu-force", |o| {
-                        o.repulsion_mode = match e.value().as_str() {
-                            "bh" => RepulsionMode::BarnesHut,
-                            "ns" => RepulsionMode::NegativeSampling,
-                            _ => RepulsionMode::Grid,
-                        };
-                    }),
+                    onchange: move |e| set_gpu_force(
+                        "repulsion_mode",
+                        serde_json::json!(match e.value().as_str() {
+                            "bh" => "barnes_hut",
+                            "ns" => "negative_sampling",
+                            _ => "grid",
+                        }),
+                    ),
                     option { value: "grid", selected: repulsion_mode == RepulsionMode::Grid, "Grid (27-cell)" }
                     option { value: "bh", selected: repulsion_mode == RepulsionMode::BarnesHut, "Barnes-Hut" }
                     option { value: "ns", selected: repulsion_mode == RepulsionMode::NegativeSampling, "Negative sampling" }
@@ -3797,9 +3712,10 @@ fn gpu_force_ui() -> Element {
             }
             if repulsion_mode == RepulsionMode::NegativeSampling {
                 Slider { label: "K samples", min: 1.0, max: 32.0, value: opts.repulsion_samples as f64,
-                    on: move |v: f64| edit::<GpuForceOptions>("gpu-force", |o| {
-                        o.repulsion_samples = v.round().max(1.0) as u32;
-                    }) }
+                    on: move |v: f64| set_gpu_force(
+                        "repulsion_samples",
+                        serde_json::json!(v.round().max(1.0) as u32),
+                    ) }
             }
         }
     }

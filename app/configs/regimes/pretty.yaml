@@ -1,0 +1,23 @@
+# Pretty — the vault-tuned "spend frames on a cleaner layout" base, migrated
+# verbatim from the deleted `LayoutPreset::Pretty`. Picker-only
+# (`auto: false`), like the other two presets.
+id: pretty
+schema_version: 1
+label: "Pretty"
+description: "Slower, cleaner vault-scale layout; more steps per frame."
+engine: gpu-force
+execution: live
+auto: false
+applicability:
+  engine_kind: [local]
+options:
+  repulsion: 400.0
+  spring_k: 0.05
+  spring_len: 80.0
+  gravity: 0.002
+  damping: 0.92
+  dt: 0.025
+  steps_per_call: 4
+  cooling_alpha: 0.999
+  cooling_floor: 0.55
+  energy_threshold: 0.02

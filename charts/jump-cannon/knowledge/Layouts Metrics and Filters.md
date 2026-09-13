@@ -42,18 +42,34 @@ The Layout tab's parameter surface is being redesigned around capability-honest
 regimes: named YAML regimes resolve from the loaded graph, engine capability
 manifests decide which controls exist, and data-owned simulation dimensions
 (UFF-typed bonds/atoms) render as provenance capsules instead of live knobs.
-**Phase 1 has landed** — the registry (`app/configs/regimes/molecular-uff.yaml`
-+ `vault-small.yaml`) resolves on every graph load via the
-`typed_bond_coverage` predicate, a UFF-typed molecule boots into `Molecular ·
-UFF` with no `?config=`, the dead `spring_len` slider is gone at full coverage
+**Phases 1–2 have landed.** The registry is six YAML regimes under
+`app/configs/regimes/`: `molecular-uff`, `vault-large`, `vault-small`
+(catch-all), and the migrated `fast` / `balanced` / `pretty` presets
+(`auto: false` — picker-only, so they never hijack automatic resolution).
+Resolution runs on every graph load from the `typed_bond_coverage`, node-bound,
+and `engine_kind` predicates; a UFF-typed molecule boots into `Molecular · UFF`
+with no `?config=`. The dead `spring_len` slider is gone at full typed coverage
 (`25/25 rests from UFF · override ▸` capsule instead), the false "sliders scale
 on top" banner is deleted, vault presets are quarantined from typed graphs, and
-the repulsion backend enum only appears at n ≥ 500. The three measured defects
-it fixes, the registry schema, and the kaizen phasing live in
-`docs/layout-ux.md` (normative engineering spec: `docs/layout-ux-spec.md`);
-the repulsion mixes via √(wᵢ×wⱼ), `seed_mode: none` keeps authored coordinates) is
-in `docs/molecular-force-layout.md`. Remaining phases: presets as data +
-`jc_layout_v2` migration, intent controls, remote/static regimes.
+the repulsion backend enum only appears at n ≥ 500.
+
+The Layout tab now carries a **regime picker** (`auto` plus every applicable
+regime) instead of a preset row. Control edits are stored as *overrides against
+the resolved base* in `jc_layout_v2` — multipliers where the base is a nonzero
+number, absolutes for enums and toggles — so a registry YAML edit reaches every
+user who left that control alone, and no absolute value crosses a regime
+boundary. Legacy `jc_layout_v1` absolutes migrate once (divided by the
+`vault-large` base). An override on a dimension the loaded graph's data owns is
+*parked*: retained, surfaced, never applied. `?config=<regime-id>` pins a
+regime through the same loader.
+
+The three measured defects, the registry schema, and the kaizen phasing live in
+`docs/layout-ux.md` (normative engineering spec plus implementation-drift
+changelog: `docs/layout-ux-spec.md`); the molecular force details (repulsion
+mixes via √(wᵢ×wⱼ), `seed_mode: none` keeps authored coordinates) are in
+`docs/molecular-force-layout.md`. Remaining phases: intent controls
+(dimensionless Repulsion / Spread / Stiffness / Settle, manifest-filtered
+Advanced) and remote/static regimes (broker-served manifests).
 
 The command palette's existing Go to Layout, Go to Style, and Go to Camera
 actions open Settings on the corresponding tab. Existing Layout, Style, and

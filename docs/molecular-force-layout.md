@@ -230,15 +230,19 @@ the dynamic-bond fields already do.
   robustness (4 random-ball starts stay finite and bounded — the
   angle-free field cannot fold full noise, so that gate is a
   boundedness tripwire, not an accuracy claim). Molecular-scale config:
-  `spring_len 1.4 / repulsion 0.02 / radius 3.0 / gravity 0 / dt 0.1 /
-  damping 0.9`; the same options ship as the boot preset
-  `app/configs/caffeine-uff.yaml` (`?config=caffeine-uff`, served via
-  `GET /configs` with `--configs-dir`/`JUMP_CANNON_CONFIGS_DIR`).
-  Live boot verified: `--source pest --importer-manifest packages/sdf.toml
-  --importer-input packages/examples/sdf-caffeine.txt` + `?config=caffeine-uff`
-  renders the full molecule (fused 6/5-ring core, methyl tails, two
-  oxygens). The graph load seeds authored coordinates rescaled to the
-  *active* `spring_len` (`panels::layout::active_spring_len`, which reads
-  the persisted panel state the boot preset wrote) — seeding at the
+  `spring_len ≈ mean UFF rest / repulsion 0.02 / gravity 0 / dt 0.1 /
+  damping 0.9`; those options ship as the `molecular-uff` **registry
+  regime** (`app/configs/regimes/molecular-uff.yaml`, embedded in the app
+  bundle), which any graph with ≥50% UFF-typed bonds resolves to
+  automatically — `?config=molecular-uff` pins it explicitly, and the
+  retired `app/configs/caffeine-uff.yaml` boot preset is gone.
+  Live boot verified (browser suite's molecular-regime scenario):
+  `--source pest --importer-manifest packages/sdf.toml
+  --importer-input packages/examples/sdf-caffeine.txt` with **no**
+  `?config=` renders the full molecule (fused 6/5-ring core, methyl tails,
+  two oxygens). The graph load seeds authored coordinates rescaled to the
+  *mean typed UFF rest* when the graph carries one (otherwise
+  `panels::layout::active_spring_len`) — seeding at the
   `GpuForceOptions::default()` 400 against ångström UFF rests collapsed
-  the molecule to a single point.
+  the molecule to a single point, and the regime's `spring_len: null`
+  declares the dimension data-owned so no slider claims to scale it.

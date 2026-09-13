@@ -1,0 +1,23 @@
+# Balanced — the vault default preset, migrated verbatim from the deleted
+# `LayoutPreset::Balanced`. Picker-only (`auto: false`): the vault regimes
+# own automatic resolution, and their base stays n-tuned.
+id: balanced
+schema_version: 1
+label: "Balanced"
+description: "Vault-scale middle ground between convergence speed and quality."
+engine: gpu-force
+execution: live
+auto: false
+applicability:
+  engine_kind: [local]
+options:
+  repulsion: 250.0
+  spring_k: 0.06
+  spring_len: 60.0
+  gravity: 0.003
+  damping: 0.92
+  dt: 0.04
+  steps_per_call: 2
+  cooling_alpha: 0.999
+  cooling_floor: 0.85
+  energy_threshold: 0.005
