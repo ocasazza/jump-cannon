@@ -575,7 +575,7 @@
               cargoArtifacts = depsNative;
               pname = "jump-cannon-test-workload-bins";
               version = "0.1.0";
-              nativeBuildInputs = [ pkgs.protobuf pkgs.cc ];
+              nativeBuildInputs = [ pkgs.protobuf pkgs.stdenv.cc ];
               # pprof's frame-pointer unwinder needs frame pointers in the
               # benchmark hot paths; the workspace crates are compiled by this
               # derivation (prebuilt depsNative are not), which is where the
