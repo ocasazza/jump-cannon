@@ -361,6 +361,12 @@ textarea.md:focus { outline:none; border-color:var(--fg); }
 .lay-capsule-override { color:#3fb950; font-size:.68rem; }
 .lay-capsule-note { color:var(--dim); font-size:.65rem; line-height:1.5; margin-top:.25rem;
   border-top:1px dashed var(--line); padding-top:.25rem; }
+.lay-why, .lay-advanced { border:none; }
+.lay-why summary, .lay-advanced summary { cursor:pointer; color:var(--dim); font-size:.68rem;
+  font-family:var(--mono); list-style:none; padding:.1rem 0; }
+.lay-why summary:hover, .lay-advanced summary:hover { color:var(--fg); }
+.lay-why summary::-webkit-details-marker,
+.lay-advanced summary::-webkit-details-marker { display:none; }
 .lay-check { display:flex; align-items:center; gap:.35rem; color:var(--fg); }
 .lay-seed-src { width:100%; min-height:10em; background:var(--bg); color:var(--fg);
   border:1px solid var(--line2); border-radius:3px; font-family:var(--mono); font-size:11px;

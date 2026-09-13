@@ -30,4 +30,11 @@ options:
   cooling_alpha: 1.0       # no cooling: the regime is the physics
   energy_threshold: 0.0    # never short-circuit
   seed_mode: none          # authored positions are deliberate
+controls:
+  # E2: global repulsion mixes with per-atom UFF weights via sqrt(wi*wj), so
+  # this multiplier scales steric spacing on typed atoms truthfully. There is
+  # deliberately NO geometry-scale control: typed rests win outright (E1) and
+  # a knob claiming to scale them would lie.
+  - { id: repulsion, kind: multiplier, label: "Repulsion (atoms)", range: [0.5, 2.0] }
+  - { id: keep_authored, kind: toggle, label: "Keep authored 3D", maps_to: { seed_mode: ["random", "none"] } }
 presets_hidden: [fast, balanced, pretty]

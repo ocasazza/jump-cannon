@@ -2031,7 +2031,7 @@ fn CheckRow(
     title: Option<String>,
 ) -> Element {
     rsx! {
-        div { class: "lay-row", title: title.unwrap_or_default(),
+        div { class: "lay-row", "data-check": "{label}", title: title.unwrap_or_default(),
             span { class: "lay-k", "{label}" }
             label { class: "lay-check",
                 input {
@@ -3552,6 +3552,12 @@ fn gpu_force_ui() -> Element {
     let pinned = res.as_ref().is_some_and(|r| r.pinned);
     let parked = res.as_ref().map(|r| r.parked).unwrap_or(0);
     let applied_overrides = res.as_ref().map(|r| r.applied_overrides).unwrap_or(0);
+    let parked_ids = res.as_ref().map(|r| r.parked_ids.join(", ")).unwrap_or_default();
+    let intents = res.as_ref().map(|r| r.intents.clone()).unwrap_or_default();
+    let hidden_presets = res
+        .as_ref()
+        .map(|r| r.presets_hidden.join(", "))
+        .unwrap_or_default();
     let choices = res.as_ref().map(|r| r.choices.clone()).unwrap_or_default();
     let manifest = crate::panels::regimes::gpu_force_manifest();
     // M1/M3: controls exist only when manifest ∧ live graph state agree —
@@ -3630,14 +3636,69 @@ fn gpu_force_ui() -> Element {
                  {typed_edges} from UFF"
             }
         }
-        if parked > 0 {
-            div { class: "lay-hint", "data-lay-state": "parked-overrides",
-                "{parked} override(s) parked — the loaded graph's data owns those \
-                 dimensions; they return if a graph that does not comes back."
+
+        // Intents (UI2): the primary controls are dimensionless multipliers
+        // over the resolved base, declared by the regime. A control whose
+        // every target dimension the data owns is not constructed at all.
+        if !intents.is_empty() {
+            div { class: "lay-sub", "Intents" }
+            for intent in intents.iter() {
+                if intent.toggle {
+                    CheckRow {
+                        key: "{intent.id}",
+                        label: intent.label.clone(),
+                        value: intent.on,
+                        title: "sets {intent.affects}",
+                        on: {
+                            let id = intent.id.clone();
+                            move |v: bool| crate::panels::regimes::set_intent_toggle(&id, v)
+                        },
+                    }
+                } else {
+                    Slider {
+                        key: "{intent.id}",
+                        label: intent.label.clone(),
+                        min: intent.range.0,
+                        max: intent.range.1,
+                        value: intent.multiplier,
+                        title: "×{intent.multiplier:.2} on {intent.affects} (1.0 = regime base)",
+                        on: {
+                            let id = intent.id.clone();
+                            move |v: f64| crate::panels::regimes::set_intent_multiplier(&id, v)
+                        },
+                    }
+                }
+            }
+        }
+
+        // why ▸ — the provenance disclosure (design §5): what decided the
+        // regime, what the data owns, what is quarantined, and which stored
+        // overrides are parked rather than applied.
+        details { class: "lay-why", "data-lay-state": "why",
+            summary { "why ▸" }
+            div { class: "lay-capsule-note",
+                if pinned {
+                    "regime pinned in the picker; auto would resolve from the graph state."
+                } else {
+                    "resolved automatically: {reason}."
+                }
+                " {typed_nodes} atoms / {typed_edges} of {n_edges} edges carry UFF types."
+                if !hidden_presets.is_empty() {
+                    " Vault presets hidden (would clobber UFF rests): {hidden_presets}."
+                }
+                if parked > 0 {
+                    " {parked} parked override(s): {parked_ids} — retained, not applied, \
+                     because this graph's data owns those dimensions."
+                }
             }
         }
 
         hr { class: "lay-sep" }
+
+        // Advanced ▸ — the raw engine constants, manifest-filtered: a
+        // data-owned dimension never appears here either (CK-202).
+        details { class: "lay-advanced", "data-lay-state": "advanced",
+            summary { "Advanced ▸" }
 
         div { class: "lay-sub", "Physics" }
         Slider { label: "repulsion", min: 0.1, max: 100_000.0, value: opts.repulsion as f64, log: true,
@@ -3717,6 +3778,7 @@ fn gpu_force_ui() -> Element {
                         serde_json::json!(v.round().max(1.0) as u32),
                     ) }
             }
+        }
         }
     }
 }

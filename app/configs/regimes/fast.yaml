@@ -23,3 +23,12 @@ options:
   cooling_alpha: 0.99
   cooling_floor: 0.65
   energy_threshold: 0.5
+controls:
+  # Dimensionless intents over the resolved base (spec §2 `controls`):
+  # `maps_to` gives the exponent applied to the multiplier, so Settle scales
+  # the halt threshold up while easing cooling down (both clamped to the
+  # ranges the engine can use).
+  - { id: repulsion, kind: multiplier, label: "Repulsion", range: [0.5, 2.0] }
+  - { id: spread, kind: multiplier, label: "Spread", range: [0.5, 2.0], maps_to: { spring_len: 1.0 } }
+  - { id: stiffness, kind: multiplier, label: "Stiffness", range: [0.5, 2.0], maps_to: { spring_k: 1.0 } }
+  - { id: settle, kind: multiplier, label: "Settle", range: [0.5, 2.0], maps_to: { energy_threshold: 1.0, cooling_alpha: -1.0 } }

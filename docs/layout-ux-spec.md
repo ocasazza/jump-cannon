@@ -234,3 +234,18 @@ for untyped regimes; Advanced manifest-filtered; parked overrides surfaced in `w
   Overrides are stored as multipliers when the base is a nonzero number and
   absolutes otherwise (enums, toggles, zero bases); an override whose
   dimension the data owns is parked, never applied (M2/E1).
+- 2026-09-13 (phase 3 landed): intents are the primary controls. Each regime
+  declares them in `controls`; a control whose id is an option field maps 1:1
+  (Repulsion), otherwise `maps_to` carries **per-field exponents** on the
+  multiplier (`spread → {spring_len: 1.0}`, `settle → {energy_threshold: 1.0,
+  cooling_alpha: -1.0}`) — an extension of §2's `maps_to`, which only
+  specified enum→option mapping. Toggle intents declare `maps_to: { field:
+  [off, on] }` (`keep_authored → seed_mode`). A control whose every target
+  dimension the data owns is not constructed (M3); a stored override for a
+  control the active regime does not declare is parked, not dropped, when
+  some other regime declares it. Intent results are clamped to the ranges the
+  engine can use (`damping ≤ 0.999`, `cooling_alpha ∈ [0.5, 1.0]`,
+  `cooling_floor ∈ [0, 1]`, `dt ≥ 1e-4`). Raw engine constants moved behind
+  `Advanced ▸`, manifest-filtered so a data-owned dimension appears on no
+  surface; `why ▸` carries the resolution reason, typed coverage, quarantined
+  presets, and the parked-override list.

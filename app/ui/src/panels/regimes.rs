@@ -409,8 +409,33 @@ pub(crate) struct RegimeResolution {
     /// Overrides retained but not applied because their dimension is
     /// data-owned under the current graph state (spec §1 "parked").
     pub parked: usize,
+    /// Names of the parked controls, for the `why ▸` disclosure.
+    pub parked_ids: Vec<String>,
     /// Overrides currently in effect.
     pub applied_overrides: usize,
+    /// The active regime's declared intent controls, ready to render.
+    pub intents: Vec<IntentView>,
+    /// Regime ids this regime quarantines (`why ▸` copy).
+    pub presets_hidden: Vec<String>,
+}
+
+/// One declared intent control, resolved against the live state: a
+/// dimensionless multiplier (or toggle) over the regime base, never an
+/// absolute engine constant.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct IntentView {
+    pub id: String,
+    pub label: String,
+    pub toggle: bool,
+    /// Multiplier range (`kind: multiplier`); neutral is 1.0.
+    pub range: (f64, f64),
+    /// Current multiplier, or 1.0 with no override.
+    pub multiplier: f64,
+    /// Current toggle position (`kind: toggle`).
+    pub on: bool,
+    /// Humanized list of the option fields this intent scales — the
+    /// control's tooltip, so no knob hides what it moves.
+    pub affects: String,
 }
 
 pub(crate) static RESOLUTION: GlobalSignal<Option<RegimeResolution>> = Signal::global(|| None);
@@ -608,43 +633,246 @@ pub(crate) fn effective_options(
     regime: &Regime,
     overrides: &BTreeMap<String, Override>,
     input: &GraphInput,
-) -> Result<(Value, usize, usize), String> {
+) -> Result<Effective, String> {
     let mut base = base_options(regime, input)?;
-    let mut parked = 0usize;
+    let mut parked: Vec<String> = Vec::new();
     let mut applied = 0usize;
-    for (field, value) in overrides {
-        let Some(dim) = manifest_dim(field) else {
-            continue; // unknown control: dropped
+    for (key, value) in overrides {
+        // An override key is either an engine option field (raw control in
+        // the Advanced disclosure) or one of the active regime's declared
+        // intents, which expands onto option fields through `maps_to`.
+        let targets: Vec<(String, f64)> = match manifest_dim(key) {
+            Some(_) => vec![(key.clone(), 1.0)],
+            None => match regime.controls.iter().find(|c| c.id == *key) {
+                Some(control) => intent_targets(control),
+                None => {
+                    // An intent another regime declares (the user set it
+                    // there) is *parked* under this one: retained, surfaced,
+                    // not applied. A control no regime declares is stale —
+                    // dropped silently.
+                    if registry()
+                        .iter()
+                        .any(|r| r.controls.iter().any(|c| c.id == *key))
+                    {
+                        parked.push(key.clone());
+                    }
+                    continue;
+                }
+            },
         };
-        if dim_owned_by_data(dim, input.typed_edges, input.n_edges) {
-            parked += 1;
+        if targets.is_empty() {
             continue;
         }
-        match value {
-            Override::Multiplier { value } => {
-                if let Some(b) = base.get(field).and_then(Value::as_f64) {
-                    let scaled = b * value;
-                    let is_int = base
-                        .get(field)
-                        .is_some_and(|v| v.is_i64() || v.is_u64());
-                    base.insert(
-                        field.clone(),
-                        if is_int {
-                            serde_json::json!(scaled.round().max(0.0) as i64)
-                        } else {
-                            serde_json::json!(scaled)
-                        },
-                    );
-                    applied += 1;
+        // M2/E1: an intent whose every target is data-owned has nothing
+        // honest to do — park it whole rather than move a subset silently.
+        let live: Vec<(String, f64)> = targets
+            .into_iter()
+            .filter(|(field, _)| {
+                !manifest_dim(field).is_some_and(|dim| {
+                    dim_owned_by_data(dim, input.typed_edges, input.n_edges)
+                })
+            })
+            .collect();
+        if live.is_empty() {
+            parked.push(key.clone());
+            continue;
+        }
+        let mut touched = false;
+        for (field, exponent) in live {
+            match value {
+                Override::Multiplier { value } => {
+                    let factor = if (exponent - 1.0).abs() < f64::EPSILON {
+                        *value
+                    } else {
+                        value.powf(exponent)
+                    };
+                    if let Some(b) = base.get(&field).and_then(Value::as_f64) {
+                        let scaled = b * factor;
+                        let is_int = base
+                            .get(&field)
+                            .is_some_and(|v| v.is_i64() || v.is_u64());
+                        base.insert(
+                            field.clone(),
+                            if is_int {
+                                serde_json::json!(scaled.round().max(0.0) as i64)
+                            } else {
+                                serde_json::json!(scaled)
+                            },
+                        );
+                        touched = true;
+                    }
+                }
+                Override::Absolute { value } => {
+                    base.insert(field.clone(), toggle_value(key, regime, &field, value));
+                    touched = true;
                 }
             }
-            Override::Absolute { value } => {
-                base.insert(field.clone(), value.clone());
-                applied += 1;
+        }
+        if touched {
+            applied += 1;
+        }
+    }
+    clamp_engine_ranges(&mut base);
+    Ok(Effective {
+        options: Value::Object(base),
+        parked,
+        applied,
+    })
+}
+
+/// The derived gpu-force settings plus what the override layer did with the
+/// user's stored intent: which controls were applied, and which are parked
+/// because the loaded graph's data owns their dimension.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct Effective {
+    pub options: Value,
+    pub parked: Vec<String>,
+    pub applied: usize,
+}
+
+/// The active regime's declared controls, resolved against stored
+/// overrides: each is a dimensionless multiplier (or a toggle) over the
+/// regime base. Controls whose every target dimension the data owns are
+/// omitted — a knob that cannot move anything must not exist (M2/M3).
+pub(crate) fn intent_views(
+    regime: &Regime,
+    overrides: &BTreeMap<String, Override>,
+    input: &GraphInput,
+    base: &serde_json::Map<String, Value>,
+) -> Vec<IntentView> {
+    regime
+        .controls
+        .iter()
+        .filter_map(|control| {
+            let targets = intent_targets(control);
+            if targets.is_empty() {
+                return None;
+            }
+            let live: Vec<&(String, f64)> = targets
+                .iter()
+                .filter(|(field, _)| {
+                    !manifest_dim(field).is_some_and(|dim| {
+                        dim_owned_by_data(dim, input.typed_edges, input.n_edges)
+                    })
+                })
+                .collect();
+            if live.is_empty() {
+                return None;
+            }
+            let stored = overrides.get(&control.id);
+            let toggle = control.kind == ControlKind::Toggle;
+            let on = if toggle {
+                match stored {
+                    Some(Override::Absolute { value }) => value.as_bool().unwrap_or(false),
+                    // No override: read the toggle's current position off the
+                    // base, so the checkbox reflects what the sim is running.
+                    _ => toggle_is_on(control, base),
+                }
+            } else {
+                false
+            };
+            let multiplier = match stored {
+                Some(Override::Multiplier { value }) => *value,
+                _ => 1.0,
+            };
+            Some(IntentView {
+                id: control.id.clone(),
+                label: control.label.clone(),
+                toggle,
+                range: control.range.unwrap_or((0.5, 2.0)),
+                multiplier,
+                on,
+                affects: live
+                    .iter()
+                    .map(|(field, exponent)| {
+                        if (*exponent - 1.0).abs() < f64::EPSILON {
+                            field.clone()
+                        } else {
+                            format!("{field}^{exponent}")
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            })
+        })
+        .collect()
+}
+
+/// Is a toggle intent currently in its "on" position, judged by the base
+/// value of the first field it maps?
+fn toggle_is_on(control: &ControlDecl, base: &serde_json::Map<String, Value>) -> bool {
+    let Some(maps_to) = &control.maps_to else {
+        return false;
+    };
+    maps_to.iter().any(|(field, choices)| {
+        let Some(choices) = choices.as_array() else {
+            return false;
+        };
+        base.get(field) == choices.get(1)
+    })
+}
+
+/// `(option field, exponent)` pairs an intent scales. A control whose id is
+/// itself an option field maps 1:1 (the Repulsion intent is exactly the
+/// engine's repulsion strength — E2 makes that honest on typed atoms);
+/// otherwise the regime declares the mapping in `maps_to`, where a numeric
+/// value is the exponent applied to the multiplier (1.0 scales with it,
+/// -1.0 inversely, 0.5 as its square root).
+fn intent_targets(control: &ControlDecl) -> Vec<(String, f64)> {
+    if manifest_dim(&control.id).is_some() {
+        return vec![(control.id.clone(), 1.0)];
+    }
+    let Some(maps_to) = &control.maps_to else {
+        return Vec::new();
+    };
+    maps_to
+        .iter()
+        .filter(|(field, _)| manifest_dim(field).is_some())
+        .filter_map(|(field, weight)| match weight {
+            // Multiplier intent: the number is the exponent applied to the
+            // multiplier for this field.
+            Value::Number(_) => weight.as_f64().map(|w| (field.clone(), w)),
+            // Toggle intent: `[off, on]` option values, selected by
+            // `toggle_value` — no exponent takes part.
+            Value::Array(_) => Some((field.clone(), 1.0)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// A toggle intent declares its two option values as `maps_to: { field:
+/// [off, on] }`; everything else stores the entered value verbatim.
+fn toggle_value(control_id: &str, regime: &Regime, field: &str, entered: &Value) -> Value {
+    let Some(on) = entered.as_bool() else {
+        return entered.clone();
+    };
+    regime
+        .controls
+        .iter()
+        .find(|c| c.id == control_id && c.kind == ControlKind::Toggle)
+        .and_then(|c| c.maps_to.as_ref()?.get(field)?.as_array().cloned())
+        .and_then(|choices| choices.get(usize::from(on)).cloned())
+        .unwrap_or_else(|| entered.clone())
+}
+
+/// Keep an intent from driving an option outside the range the engine can
+/// use. The shader clamps `cooling_alpha` at its use site; `damping` above
+/// 1.0 would inject energy every step instead of removing it.
+fn clamp_engine_ranges(base: &mut serde_json::Map<String, Value>) {
+    const CLAMPS: [(&str, f64, f64); 4] = [
+        ("damping", 0.0, 0.999),
+        ("cooling_alpha", 0.5, 1.0),
+        ("cooling_floor", 0.0, 1.0),
+        ("dt", 1.0e-4, 1.0),
+    ];
+    for (field, lo, hi) in CLAMPS {
+        if let Some(value) = base.get(field).and_then(Value::as_f64) {
+            let clamped = value.clamp(lo, hi);
+            if (clamped - value).abs() > f64::EPSILON {
+                base.insert(field.to_string(), serde_json::json!(clamped));
             }
         }
     }
-    Ok((Value::Object(base), parked, applied))
 }
 
 // --- resolution + install ----------------------------------------------------------
@@ -728,6 +956,35 @@ pub(crate) fn set_option_override(field: &str, entered: Value) {
     reapply();
 }
 
+/// Record an intent control's multiplier (1.0 = neutral, i.e. no override).
+pub(crate) fn set_intent_multiplier(control_id: &str, multiplier: f64) {
+    let mut state = load_v2().unwrap_or_default();
+    if (multiplier - 1.0).abs() < 1.0e-6 {
+        state.overrides.remove(control_id);
+    } else {
+        state.overrides.insert(
+            control_id.to_string(),
+            Override::Multiplier { value: multiplier },
+        );
+    }
+    save_v2(&state);
+    reapply();
+}
+
+/// Record a toggle intent's position. Stored as an absolute: the regime's
+/// `maps_to` names the two option values it selects between.
+pub(crate) fn set_intent_toggle(control_id: &str, on: bool) {
+    let mut state = load_v2().unwrap_or_default();
+    state.overrides.insert(
+        control_id.to_string(),
+        Override::Absolute {
+            value: serde_json::json!(on),
+        },
+    );
+    save_v2(&state);
+    reapply();
+}
+
 /// Drop every override and follow automatic resolution again (the panel's
 /// reset-to-defaults action for gpu-force).
 pub(crate) fn reset() {
@@ -761,7 +1018,8 @@ fn reapply() {
         .is_some_and(|id| id == regime.id.as_str());
 
     match effective_options(regime, &state.overrides, &input) {
-        Ok((options, parked, applied)) => {
+        Ok(effective) => {
+            let base = base_options(regime, &input).unwrap_or_default();
             *RESOLUTION.write() = Some(RegimeResolution {
                 regime_id: regime.id.clone(),
                 label: regime.label.clone(),
@@ -780,10 +1038,13 @@ fn reapply() {
                     .into_iter()
                     .map(|r| (r.id.clone(), r.label.clone()))
                     .collect(),
-                parked,
-                applied_overrides: applied,
+                parked: effective.parked.len(),
+                parked_ids: effective.parked.clone(),
+                applied_overrides: effective.applied,
+                intents: intent_views(regime, &state.overrides, &input, &base),
+                presets_hidden: regime.presets_hidden.clone(),
             });
-            crate::panels::layout::install_gpu_force_settings(options);
+            crate::panels::layout::install_gpu_force_settings(effective.options);
         }
         Err(error) => {
             // R2 loud error: keep the previous settings rather than install
@@ -1067,13 +1328,14 @@ mod tests {
             Override::Absolute { value: serde_json::json!("ns") },
         );
         overrides.insert("bogus_field".to_string(), Override::Multiplier { value: 9.0 });
-        let (effective, parked, applied) = effective_options(regime, &overrides, &input).unwrap();
+        let effective = effective_options(regime, &overrides, &input).unwrap();
         assert_eq!(
-            effective["spring_len"].as_f64().unwrap(),
+            effective.options["spring_len"].as_f64().unwrap(),
             base["spring_len"].as_f64().unwrap() * 2.0
         );
-        assert_eq!(effective["repulsion_mode"], serde_json::json!("ns"));
-        assert_eq!((parked, applied), (0, 2), "unknown control dropped, not applied");
+        assert_eq!(effective.options["repulsion_mode"], serde_json::json!("ns"));
+        assert!(effective.parked.is_empty());
+        assert_eq!(effective.applied, 2, "unknown control dropped, not applied");
     }
 
     /// E1/M2: an override on a data-owned dimension is retained but never
@@ -1085,10 +1347,11 @@ mod tests {
         let input = molecule_input(Some(1.33));
         let mut overrides = BTreeMap::new();
         overrides.insert("spring_len".to_string(), Override::Multiplier { value: 40.0 });
-        let (effective, parked, applied) = effective_options(regime, &overrides, &input).unwrap();
-        assert_eq!((parked, applied), (1, 0));
+        let effective = effective_options(regime, &overrides, &input).unwrap();
+        assert_eq!(effective.parked, vec!["spring_len".to_string()]);
+        assert_eq!(effective.applied, 0);
         assert!(
-            (effective["spring_len"].as_f64().unwrap() - 1.33).abs() < 1e-6,
+            (effective.options["spring_len"].as_f64().unwrap() - 1.33).abs() < 1e-6,
             "parked override must not scale the data-owned rest"
         );
     }
@@ -1142,6 +1405,102 @@ mod tests {
             "molecular-uff",
             "a pin that no longer applies falls back to resolution"
         );
+    }
+
+    /// Intents are dimensionless multipliers over the base, expanded
+    /// through the regime's declared `maps_to` exponents. Settle raises the
+    /// halt threshold while easing cooling — one knob, two honest targets.
+    #[test]
+    fn intent_multiplier_expands_through_maps_to() {
+        let regime = regime_by_id("vault-small").unwrap();
+        let input = GraphInput { n_nodes: 400, n_edges: 900, ..Default::default() };
+        let base = base_options(regime, &input).unwrap();
+        let mut overrides = BTreeMap::new();
+        overrides.insert("settle".to_string(), Override::Multiplier { value: 2.0 });
+        overrides.insert("spread".to_string(), Override::Multiplier { value: 0.5 });
+        let effective = effective_options(regime, &overrides, &input).unwrap();
+        assert_eq!(
+            effective.options["energy_threshold"].as_f64().unwrap(),
+            base["energy_threshold"].as_f64().unwrap() * 2.0,
+            "exponent 1.0 scales with the multiplier"
+        );
+        assert_eq!(
+            effective.options["spring_len"].as_f64().unwrap(),
+            base["spring_len"].as_f64().unwrap() * 0.5,
+            "spread maps onto spring_len"
+        );
+        let cooling = effective.options["cooling_alpha"].as_f64().unwrap();
+        assert!(
+            cooling < base["cooling_alpha"].as_f64().unwrap(),
+            "exponent -1.0 moves cooling the other way: {cooling}"
+        );
+        assert_eq!(effective.applied, 2);
+    }
+
+    /// An intent may not drive an option outside the range the engine can
+    /// use: damping above 1.0 would add energy every step.
+    #[test]
+    fn intents_are_clamped_to_engine_ranges() {
+        let yaml = "id: extreme\nschema_version: 1\nlabel: Extreme\nengine: gpu-force\nexecution: live\napplicability: {}\noptions: {}\ncontrols:\n  - { id: wild, kind: multiplier, label: Wild, range: [0.5, 8.0], maps_to: { damping: 1.0, cooling_alpha: 1.0 } }\n";
+        let regime = &load_registry(&[("extreme.yaml", yaml)])[0];
+        let input = GraphInput { n_nodes: 100, n_edges: 100, ..Default::default() };
+        let mut overrides = BTreeMap::new();
+        overrides.insert("wild".to_string(), Override::Multiplier { value: 8.0 });
+        let effective = effective_options(regime, &overrides, &input).unwrap();
+        assert_eq!(effective.options["damping"].as_f64().unwrap(), 0.999);
+        assert_eq!(effective.options["cooling_alpha"].as_f64().unwrap(), 1.0);
+    }
+
+    /// Toggle intents select between the two option values the regime
+    /// declares; with no override the view reflects what the sim is running.
+    #[test]
+    fn toggle_intent_selects_declared_option_values() {
+        let regime = regime_by_id("molecular-uff").unwrap();
+        let input = molecule_input(Some(1.33));
+        let base = base_options(regime, &input).unwrap();
+        let views = intent_views(regime, &BTreeMap::new(), &input, &base);
+        let keep = views.iter().find(|v| v.id == "keep_authored").expect("toggle declared");
+        assert!(keep.on, "molecular base runs seed_mode: none");
+
+        let mut overrides = BTreeMap::new();
+        overrides.insert(
+            "keep_authored".to_string(),
+            Override::Absolute { value: serde_json::json!(false) },
+        );
+        let effective = effective_options(regime, &overrides, &input).unwrap();
+        assert_eq!(effective.options["seed_mode"], serde_json::json!("random"));
+    }
+
+    /// M2/M3: a control that could only move a data-owned dimension is not
+    /// constructed — on typed geometry the Spread intent does not exist,
+    /// and a stored Spread override is parked rather than applied.
+    #[test]
+    fn data_owned_intents_are_not_constructed() {
+        let molecular = regime_by_id("molecular-uff").unwrap();
+        let input = molecule_input(Some(1.33));
+        let base = base_options(molecular, &input).unwrap();
+        let molecular_views = intent_views(molecular, &BTreeMap::new(), &input, &base);
+        let ids: Vec<&str> = molecular_views.iter().map(|v| v.id.as_str()).collect();
+        assert_eq!(ids, ["repulsion", "keep_authored"], "no geometry-scale knob (E1)");
+
+        let vault = regime_by_id("vault-small").unwrap();
+        let vault_input = GraphInput { n_nodes: 300, n_edges: 800, ..Default::default() };
+        let vault_base = base_options(vault, &vault_input).unwrap();
+        let vault_views = intent_views(vault, &BTreeMap::new(), &vault_input, &vault_base);
+        let vault_ids: Vec<&str> = vault_views.iter().map(|v| v.id.as_str()).collect();
+        assert_eq!(vault_ids, ["repulsion", "spread", "stiffness", "settle"]);
+
+        // The same stored Spread override: live on the vault graph, parked
+        // on the molecule.
+        let mut overrides = BTreeMap::new();
+        overrides.insert("spread".to_string(), Override::Multiplier { value: 1.5 });
+        assert_eq!(
+            effective_options(vault, &overrides, &vault_input).unwrap().applied,
+            1
+        );
+        let molecular_effective = effective_options(molecular, &overrides, &input).unwrap();
+        assert_eq!(molecular_effective.parked, vec!["spread".to_string()]);
+        assert_eq!(molecular_effective.applied, 0);
     }
 
     #[test]

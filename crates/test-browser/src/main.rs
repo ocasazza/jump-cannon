@@ -218,6 +218,10 @@ struct SettingsTabsCheck {
     layout_vault_regime: bool,
     layout_spring_len_live: bool,
     layout_presets_offered: bool,
+    /// Phase 3: the vault regime's four dimensionless intents render, with
+    /// the raw engine constants behind the Advanced disclosure.
+    layout_intents_present: bool,
+    layout_advanced_present: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     reason: Option<String>,
 }
@@ -341,6 +345,11 @@ struct LayoutRegimesCheck {
     /// Persisted gpu-force settings came from the regime: `seed_mode`
     /// none (authored positions kept), ångström-scale spring_len fill.
     settings_applied: bool,
+    /// The regime's declared intents render (Repulsion (atoms), Keep
+    /// authored 3D), no geometry-scale intent exists, and the `why ▸` /
+    /// `Advanced ▸` disclosures are present.
+    #[serde(default)]
+    intents_honest: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     reason: Option<String>,
 }
@@ -356,6 +365,7 @@ impl LayoutRegimesCheck {
             presets_hidden: false,
             banner_absent: false,
             settings_applied: false,
+            intents_honest: false,
             reason: Some(reason),
         }
     }
@@ -370,6 +380,7 @@ impl LayoutRegimesCheck {
             presets_hidden: false,
             banner_absent: false,
             settings_applied: false,
+            intents_honest: false,
             reason: Some(reason),
         }
     }
@@ -1340,6 +1351,13 @@ async fn drive_page(
           .map((option) => option.value);
         const layoutPresetsOffered = ['fast', 'balanced', 'pretty']
           .every((id) => layoutPickerIds.includes(id));
+        const layoutIntentRows = [...(layRoot?.querySelectorAll('[data-slider]') || [])]
+          .map((row) => row.getAttribute('data-slider'));
+        const layoutIntentsPresent = ['Repulsion', 'Spread', 'Stiffness', 'Settle']
+          .every((label) => layoutIntentRows.includes(label));
+        const layoutAdvancedPresent = Boolean(
+          layRoot?.querySelector('[data-lay-state="advanced"]')
+        );
 
         keyboardContract &&= await keyboardStep('Layout', 'End', 'Camera');
         keyboardContract &&= await keyboardStep('Camera', 'Home', 'Connection');
@@ -1379,6 +1397,8 @@ async fn drive_page(
         if (!layoutSpringLenLive) failures.push('vault graph lost the live spring_len slider');
         if (!layoutPicker) failures.push('Layout tab missing the regime picker');
         if (!layoutPresetsOffered) failures.push('vault graph is not offered the migrated presets');
+        if (!layoutIntentsPresent) failures.push('vault regime intents are missing');
+        if (!layoutAdvancedPresent) failures.push('Advanced disclosure is missing');
         if (!legacyPanelsAbsent) failures.push('legacy Layout, Style, or Camera panel still exists');
         if (!graphRestored) failures.push('Graph renderer did not remount after Settings restore');
         return {
@@ -1391,6 +1411,8 @@ async fn drive_page(
           layout_vault_regime: layoutVaultRegime,
           layout_spring_len_live: layoutSpringLenLive,
           layout_presets_offered: layoutPresetsOffered,
+          layout_intents_present: layoutIntentsPresent,
+          layout_advanced_present: layoutAdvancedPresent,
           legacy_panels_absent: legacyPanelsAbsent,
           graph_restored: graphRestored,
           reason: failures.length ? failures.join('; ') : null,
@@ -3262,6 +3284,11 @@ const MOLECULE_LAYOUT_JS: &str = r#"(async () => {
       spring_len_present: Boolean(root?.querySelector('[data-slider="spring_len"]')),
       presets_present: ['fast', 'balanced', 'pretty'].some((id) => pickerIds.includes(id)),
       picker_present: Boolean(picker),
+      intent_labels: [...(root?.querySelectorAll('[data-slider], [data-check]') || [])]
+        .map((row) => (row.getAttribute('data-slider')
+          || row.getAttribute('data-check') || '').trim()),
+      why_present: Boolean(root?.querySelector('[data-lay-state="why"]')),
+      advanced_present: Boolean(root?.querySelector('[data-lay-state="advanced"]')),
       banner_present: banner,
       seed_mode: settings?.seed_mode ?? null,
       spring_len_value: typeof settings?.spring_len === 'number' ? settings.spring_len : null,
@@ -3373,7 +3400,27 @@ async fn run_layout_regimes_scenario(
             let spring_len = view.get("spring_len_value").and_then(|v| v.as_f64());
             check.settings_applied = seed_mode == "none"
                 && spring_len.is_some_and(|v| (1.0..=2.0).contains(&v));
+            let intent_labels: Vec<String> = view
+                .get("intent_labels")
+                .and_then(|v| v.as_array())
+                .map(|rows| {
+                    rows.iter()
+                        .filter_map(|r| r.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default();
+            // Phase 3: the molecular regime declares a Repulsion (atoms)
+            // intent and a Keep authored 3D toggle, and — by construction —
+            // no geometry-scale intent (E1). Both disclosures are present.
+            check.intents_honest = intent_labels
+                .iter()
+                .any(|l| l.contains("Repulsion (atoms)"))
+                && intent_labels.iter().any(|l| l.contains("Keep authored 3D"))
+                && !intent_labels.iter().any(|l| l.contains("Spread"))
+                && view.get("why_present").and_then(|v| v.as_bool()) == Some(true)
+                && view.get("advanced_present").and_then(|v| v.as_bool()) == Some(true);
             check.ok = check.regime_booted
+                && check.intents_honest
                 && check.capsule_present
                 && check.spring_len_absent
                 && check.presets_hidden
@@ -3382,8 +3429,9 @@ async fn run_layout_regimes_scenario(
             if !check.ok {
                 check.reason = Some(format!(
                     "regime={regime_id:?} reason={reason_text:?} capsule={capsule_text:?} \
-                     spring_len_absent={} presets_hidden={} banner_absent={} \
-                     settings_applied={} (seed_mode={seed_mode:?}, spring_len={spring_len:?})",
+                     intents={intent_labels:?} spring_len_absent={} presets_hidden={} \
+                     banner_absent={} settings_applied={} \
+                     (seed_mode={seed_mode:?}, spring_len={spring_len:?})",
                     check.spring_len_absent,
                     check.presets_hidden,
                     check.banner_absent,

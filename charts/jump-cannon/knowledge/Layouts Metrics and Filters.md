@@ -42,7 +42,7 @@ The Layout tab's parameter surface is being redesigned around capability-honest
 regimes: named YAML regimes resolve from the loaded graph, engine capability
 manifests decide which controls exist, and data-owned simulation dimensions
 (UFF-typed bonds/atoms) render as provenance capsules instead of live knobs.
-**Phases 1–2 have landed.** The registry is six YAML regimes under
+**Phases 1–3 have landed.** The registry is six YAML regimes under
 `app/configs/regimes/`: `molecular-uff`, `vault-large`, `vault-small`
 (catch-all), and the migrated `fast` / `balanced` / `pretty` presets
 (`auto: false` — picker-only, so they never hijack automatic resolution).
@@ -63,13 +63,23 @@ boundary. Legacy `jc_layout_v1` absolutes migrate once (divided by the
 *parked*: retained, surfaced, never applied. `?config=<regime-id>` pins a
 regime through the same loader.
 
+Primary controls are **dimensionless intents** declared by the regime, not
+absolute physics constants: vault regimes offer Repulsion / Spread / Stiffness
+/ Settle (multipliers on the resolved base, with per-field exponents — Settle
+raises the halt threshold while easing cooling), and the molecular regime
+offers Repulsion (atoms) plus a Keep authored 3D toggle and — by construction
+— no geometry-scale knob, because typed rests win outright in the engine. Raw
+engine constants live behind `Advanced ▸`, manifest-filtered so a data-owned
+dimension appears on no surface, and `why ▸` carries the resolution reason,
+typed coverage, quarantined presets, and any parked overrides.
+
 The three measured defects, the registry schema, and the kaizen phasing live in
 `docs/layout-ux.md` (normative engineering spec plus implementation-drift
 changelog: `docs/layout-ux-spec.md`); the molecular force details (repulsion
 mixes via √(wᵢ×wⱼ), `seed_mode: none` keeps authored coordinates) are in
-`docs/molecular-force-layout.md`. Remaining phases: intent controls
-(dimensionless Repulsion / Spread / Stiffness / Settle, manifest-filtered
-Advanced) and remote/static regimes (broker-served manifests).
+`docs/molecular-force-layout.md`. Remaining: phase 4 (remote/static regimes — broker-served capability
+manifests, `execution: one_shot` rendering, and a generic fallback form for
+engines that serve no manifest).
 
 The command palette's existing Go to Layout, Go to Style, and Go to Camera
 actions open Settings on the corresponding tab. Existing Layout, Style, and
