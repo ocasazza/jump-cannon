@@ -113,35 +113,34 @@ enum PreviewState {
     Failed { message: String, timeout: bool },
 }
 
-/// Live outcome of the last source Apply. Applying an alternate source makes
-/// graph-api build that source's whole graph before it answers a single graph
-/// fetch, so the wait is unbounded from the panel's side and must be visible.
 #[derive(Clone, PartialEq)]
-enum ApplyState {
+pub(crate) enum ApplyState {
     Building {
         elapsed_secs: u64,
-        /// Latest default-log progress label naming the applied source, when
-        /// the server produces one.
+        /// Latest progress label naming the applied source, when the server
+        /// produces one.
         stage: Option<String>,
+        /// Latest `set_progress` fraction from the build's event log, when
+        /// the running stage reports one (0.0–1.0).
+        fraction: Option<f32>,
     },
     Ok {
         nodes: u32,
         edges: u32,
     },
-    Timeout,
     Error(String),
 }
 
 #[derive(Clone, PartialEq)]
-struct ApplyStatus {
+pub(crate) struct ApplyStatus {
     /// Catalog id whose summary and row carry the status — the selection at
     /// Apply time, which is not the applied source for a reset.
     anchor: String,
     /// What is being applied, for display.
-    target: String,
+    pub(crate) target: String,
     /// The apply clears the session selection; no inline reset is offered.
     reset: bool,
-    state: ApplyState,
+    pub(crate) state: ApplyState,
 }
 
 static PACKAGES: GlobalSignal<BTreeMap<String, String>> = Signal::global(load_packages);
@@ -164,19 +163,12 @@ static NEW_SOURCE: GlobalSignal<NewSourceDraft> = Signal::global(NewSourceDraft:
 static BUSY: GlobalSignal<bool> = Signal::global(|| false);
 /// Last server rejection (validation text, authorization, read-only dir).
 static ERROR: GlobalSignal<Option<String>> = Signal::global(|| None);
-/// Live state of the last source Apply, anchored to a catalog row.
-static APPLY: GlobalSignal<Option<ApplyStatus>> = Signal::global(|| None);
+/// Live state of the last source Apply, anchored to a catalog row. Read by
+/// the graph-area loading overlay while a build is in flight.
+pub(crate) static APPLY: GlobalSignal<Option<ApplyStatus>> = Signal::global(|| None);
 /// Bumped by every Apply; the tracker tasks of superseded applies exit
 /// instead of overwriting the current status.
 static APPLY_GEN: GlobalSignal<u64> = Signal::global(|| 0);
-
-/// Ceiling on the first graph payload after an Apply, past which the panel
-/// declares the switch unusable rather than waiting silently.
-///
-/// The cluster ingress in front of graph-api drops the connection at ~75s, so
-/// a source whose build outlives that can never answer through the proxy at
-/// all; 90s leaves headroom for a direct connection on a slower box.
-const APPLY_CEILING_SECS: u64 = 90;
 
 // --- manifest text surgery (pure functions; unit-tested below) --------------------
 
@@ -615,65 +607,148 @@ fn apply_source(ctx: Ctx, anchor: String, target: Option<String>) {
         state: ApplyState::Building {
             elapsed_secs: 0,
             stage: None,
+            fraction: None,
         },
     });
-    spawn(track_apply(ctx, target, generation));
+    spawn(track_apply(ctx, generation));
 }
 
-/// Bound the wait at [`APPLY_CEILING_SECS`] and record the outcome.
+
+
+/// Build a client-side [`GraphData`] from a pest parse preview — the same
+/// shape as the Generate panel's `graph_data_from_generated`, with positions
+/// from the Layout panel's seed strategy and neutral metric defaults.
+fn graph_data_from_preview(p: &crate::pest_worker::ParsePreview) -> crate::GraphData {
+    use std::collections::HashMap;
+
+    let n = p.node_ids.len();
+    let ids: Vec<String> = p.node_ids.clone();
+    let id_to_idx: HashMap<String, u32> = ids
+        .iter()
+        .enumerate()
+        .map(|(idx, id)| (id.clone(), idx as u32))
+        .collect();
+    let mut edges: Vec<u32> = Vec::with_capacity(p.edge_pairs.len() * 2);
+    for (source, target) in &p.edge_pairs {
+        let (Some(&s), Some(&t)) = (id_to_idx.get(source), id_to_idx.get(target)) else {
+            continue;
+        };
+        edges.push(s);
+        edges.push(t);
+    }
+    let n_edges = (edges.len() / 2) as u32;
+    let positions = super::layout::seed_positions_for_generated(n);
+    let metrics: HashMap<String, Vec<f32>> = HashMap::new();
+    let colors = crate::render::data::colors_from_metric("community", &metrics, n);
+    let sizes = crate::render::data::sizes_from_metric("pagerank", &metrics, n, 0.5);
+    // Weakly-connected-component count over the mounted (capped) subgraph —
+    // cheap BFS, mirrors the generated-graph path.
+    let mut seen = vec![false; n];
+    let mut num_wcc = 0u32;
+    for start in 0..n {
+        if seen[start] {
+            continue;
+        }
+        num_wcc += 1;
+        seen[start] = true;
+        let mut stack = vec![start];
+        while let Some(node) = stack.pop() {
+            for pair in edges.chunks(2) {
+                if pair.len() == 2 {
+                    let (a, b) = (pair[0] as usize, pair[1] as usize);
+                    if a == node && !seen[b] {
+                        seen[b] = true;
+                        stack.push(b);
+                    } else if b == node && !seen[a] {
+                        seen[a] = true;
+                        stack.push(a);
+                    }
+                }
+            }
+        }
+    }
+    crate::GraphData {
+        graph_revision: None,
+        n_nodes: n as u32,
+        n_edges,
+        num_communities: 0,
+        num_wcc,
+        ids,
+        id_to_idx,
+        scene: crate::render::Scene {
+            positions,
+            edges,
+            colors,
+            sizes,
+        },
+    }
+}
+
+/// Retry the graph load until it settles, and record the outcome.
 ///
-/// The load runs as its own task rather than racing the ceiling: dropping it
-/// would abandon a build that may still land, so a late success replaces the
-/// timeout status instead of being thrown away.
-async fn track_apply(ctx: Ctx, target: Option<String>, generation: u64) {
-    spawn(track_stages(target, generation));
-    spawn(async move {
+/// Selecting a source graph-api has not built yet makes the first fetch
+/// answer 503 + `Retry-After` (`building importer source …`) while a
+/// background task imports the corpus — the fetch is fast, the build is not.
+/// Loop: reload, and while the failure names an in-flight build, wait a beat
+/// and retry. All requests stay short (nothing blocks on the build), the UI
+/// keeps rendering, and `track_stages` keeps the apply status fed from the
+/// build's live progress log.
+async fn track_apply(ctx: Ctx, generation: u64) {
+    spawn(track_stages(generation));
+    loop {
         reload_graph(ctx).await;
         if *APPLY_GEN.peek() != generation {
             return;
         }
-        let state = if let Some(error) = ctx.load_error.peek().clone() {
-            ApplyState::Error(error)
-        } else {
-            match ctx.graph.peek().as_ref() {
-                Some(graph) => ApplyState::Ok {
-                    nodes: graph.n_nodes,
-                    edges: graph.n_edges,
-                },
-                None => ApplyState::Error("another graph load superseded this one".into()),
+        let error = ctx.load_error.peek().clone();
+        let state = match (&error, ctx.graph.peek().as_ref()) {
+            (Some(error), _) if api::is_building_error(error) => {
+                // Still building: retry shortly. The apply status stays in
+                // its Building state, refreshed by `track_stages`.
+                gloo_timers::future::TimeoutFuture::new(1000).await;
+                if *APPLY_GEN.peek() != generation {
+                    return;
+                }
+                continue;
+            }
+            (Some(error), _) => ApplyState::Error(error.clone()),
+            (None, Some(graph)) => ApplyState::Ok {
+                nodes: graph.n_nodes,
+                edges: graph.n_edges,
+            },
+            (None, None) => {
+                ApplyState::Error("another graph load superseded this one".into())
             }
         };
         if let Some(status) = APPLY.write().as_mut() {
             status.state = state;
         }
-    });
-    gloo_timers::future::TimeoutFuture::new((APPLY_CEILING_SECS * 1000) as u32).await;
-    if *APPLY_GEN.peek() != generation {
         return;
-    }
-    if let Some(status) = APPLY.write().as_mut() {
-        if matches!(status.state, ApplyState::Building { .. }) {
-            status.state = ApplyState::Timeout;
-        }
     }
 }
 
-/// Tick the elapsed-seconds readout once a second and pick up any progress
-/// label naming the applied source.
+/// Refresh the apply status once a second from the applied source's live
+/// progress log.
 ///
-/// The elapsed counter is the load-bearing signal: an alternate's build stages
-/// go to that alternate's own progress log, and `/progress` for a selected
-/// source resolves through the same extractor as the graph fetch, so it blocks
-/// behind the build it would describe. Only the default source's log is
-/// readable meanwhile (`api::progress_default`), which carries stages whenever
-/// the applied source is the one graph-api already hosts.
-async fn track_stages(target: Option<String>, generation: u64) {
+/// `/progress` carries the source-selection header (see `api::get`), so
+/// after this session applied an alternate it returns that source's own
+/// event log — including while the import build runs, because the progress
+/// route never blocks behind a build. Stage labels and `set_progress`
+/// fractions fold into the `Building` status shown on the anchored row, the
+/// graph-area overlay, and (via the app's shared progress sink) the
+/// Progress panel.
+async fn track_stages(generation: u64) {
     let started = js_sys::Date::now();
-    let mut since = api::progress_default(0)
+    let mut since = api::progress(0)
         .await
         .map(|resp| resp.next_seq)
         .unwrap_or(0);
+    // Task-id → current label, so a bare `SetProgress`/`Finish` on a known
+    // task can be attributed to its stage.
+    let mut labels: std::collections::HashMap<u64, String> =
+        std::collections::HashMap::new();
     let mut stage = None;
+    let mut fraction = None;
     loop {
         gloo_timers::future::TimeoutFuture::new(1000).await;
         if *APPLY_GEN.peek() != generation
@@ -684,18 +759,39 @@ async fn track_stages(target: Option<String>, generation: u64) {
         {
             return;
         }
-        if let Some(id) = &target {
-            if let Ok(resp) = api::progress_default(since).await {
-                since = resp.next_seq;
-                for stamped in &resp.events {
-                    if let Some(label) = source_stage(id, &stamped.event) {
-                        stage = Some(label);
+        if let Ok(resp) = api::progress(since).await {
+            since = resp.next_seq;
+            for stamped in &resp.events {
+                match &stamped.event {
+                    api::ProgressEvent::Start { id, label, .. } => {
+                        labels.insert(*id, label.clone());
+                        stage = Some(label.clone());
+                        fraction = None;
+                    }
+                    api::ProgressEvent::UpdateLabel { id, label } => {
+                        labels.insert(*id, label.clone());
+                        stage = Some(label.clone());
+                    }
+                    api::ProgressEvent::SetProgress { id, progress } => {
+                        fraction = Some(*progress);
+                        if let Some(label) = labels.get(id) {
+                            stage = Some(label.clone());
+                        }
+                    }
+                    api::ProgressEvent::Finish { id } | api::ProgressEvent::Fail { id, .. } => {
+                        labels.remove(id);
+                        if labels.is_empty() {
+                            fraction = None;
+                        }
+                    }
+                    api::ProgressEvent::Log { message, .. } => {
+                        stage = Some(message.clone());
                     }
                 }
             }
-            if *APPLY_GEN.peek() != generation {
-                return;
-            }
+        }
+        if *APPLY_GEN.peek() != generation {
+            return;
         }
         let elapsed_secs = ((js_sys::Date::now() - started) / 1000.0) as u64;
         if let Some(status) = APPLY.write().as_mut() {
@@ -703,24 +799,13 @@ async fn track_stages(target: Option<String>, generation: u64) {
                 status.state = ApplyState::Building {
                     elapsed_secs,
                     stage: stage.clone(),
+                    fraction,
                 };
             }
         }
     }
 }
 
-/// A progress event's display text when it names `id`; events about other
-/// sources (or task bookkeeping) carry nothing the panel can attribute.
-fn source_stage(id: &str, event: &api::ProgressEvent) -> Option<String> {
-    let text = match event {
-        api::ProgressEvent::Start { label, .. } | api::ProgressEvent::UpdateLabel { label, .. } => {
-            label
-        }
-        api::ProgressEvent::Log { message, .. } => message,
-        _ => return None,
-    };
-    text.contains(id).then(|| text.trim().to_string())
-}
 
 /// Inline escape from a failed alternate: clearing the session's own selection
 /// is session-local and allowed whatever the deployment's runtime-switch
@@ -746,6 +831,7 @@ fn apply_status_view(ctx: Ctx, status: &ApplyStatus) -> Element {
         ApplyState::Building {
             elapsed_secs,
             stage,
+            fraction,
         } => rsx! {
             div {
                 class: "imp-apply building",
@@ -757,8 +843,19 @@ fn apply_status_view(ctx: Ctx, status: &ApplyStatus) -> Element {
                 if let Some(stage) = stage {
                     span { class: "imp-apply-stage", "data-field": "apply-stage", "{stage}" }
                 }
+                div { class: "imp-progress",
+                    role: "progressbar",
+                    if let Some(fraction) = fraction {
+                        div {
+                            class: "imp-progress-fill",
+                            style: format!("width: {:.0}%", fraction.clamp(0.0, 1.0) * 100.0),
+                        }
+                    } else {
+                        div { class: "imp-progress-fill indeterminate" }
+                    }
+                }
                 span { class: "imp-note",
-                    "an unserved source is parsed, measured, and indexed before its first response; giving up at {APPLY_CEILING_SECS}s"
+                    "the server imports, measures, and indexes this source in the background; stages stream below and in the Progress panel"
                 }
             }
         },
@@ -774,20 +871,6 @@ fn apply_status_view(ctx: Ctx, status: &ApplyStatus) -> Element {
                     " nodes · "
                     strong { "data-field": "apply-edges", "{edges}" }
                     " edges"
-                }
-            }
-        },
-        ApplyState::Timeout => rsx! {
-            div {
-                class: "imp-apply timeout",
-                role: "alert",
-                "data-field": "apply-status",
-                "data-outcome": "timeout",
-                span { class: "imp-apply-line",
-                    "{target} did not finish serving within {APPLY_CEILING_SECS}s; it is a large corpus — the deployment default is still available"
-                }
-                if offer_reset {
-                    {return_to_default(ctx, anchor.clone())}
                 }
             }
         },
@@ -940,41 +1023,86 @@ pub fn panel(ctx: Ctx) -> Element {
                                         .map(|status| match &status.state {
                                             ApplyState::Building { .. } => ("building", "building"),
                                             ApplyState::Ok { .. } => ("ok", "ready"),
-                                            ApplyState::Timeout => ("timeout", "timeout"),
                                             ApplyState::Error(_) => ("error", "failed"),
                                         });
+                                    // Every runnable row carries its own Load
+                                    // action, so loading a source's graph is one
+                                    // click from the list — while clicking the
+                                    // row itself only selects it, keeping
+                                    // catalog browsing free of server-side
+                                    // imports. The default row's Load returns
+                                    // the session to the deployment default.
+                                    let load_target = if switch_allowed
+                                        && (profile.selected || profile.runnable)
+                                        && !is_viewing
+                                    {
+                                        if profile.selected {
+                                            Some(None)
+                                        } else {
+                                            Some(Some(id.clone()))
+                                        }
+                                    } else {
+                                        None
+                                    };
+                                    let loadable = load_target.is_some();
+                                    let load_id = id.clone();
                                     rsx! {
-                                        button {
-                                            key: "{id}",
-                                            class: if selected { "imp-row selected" } else { "imp-row" },
-                                            r#type: "button",
-                                            role: "option",
-                                            aria_selected: if selected { "true" } else { "false" },
-                                            "data-package-id": "{profile.id}",
-                                            "data-source": "server",
-                                            "data-kind": "{profile.kind}",
-                                            "data-native": if native { "true" } else { "false" },
-                                            "data-viewing": if is_viewing { "true" } else { "false" },
-                                            onclick: move |_| select(Selection::Catalog(click_id.clone())),
-                                            span { class: "imp-row-name", "{profile.display_name}" }
-                                            span { class: "imp-row-chips",
-                                                span { class: "imp-chip", "{profile.kind}" }
-                                                if native {
-                                                    span { class: "imp-chip native",
-                                                        title: "native-only connector: runs inside graph-api, not in the browser",
-                                                        "native"
+                                        div { key: "{id}", class: "imp-row-wrap", role: "presentation",
+                                            button {
+                                                class: if selected { "imp-row selected" } else { "imp-row" },
+                                                r#type: "button",
+                                                role: "option",
+                                                aria_selected: if selected { "true" } else { "false" },
+                                                "data-package-id": "{profile.id}",
+                                                "data-source": "server",
+                                                "data-kind": "{profile.kind}",
+                                                "data-native": if native { "true" } else { "false" },
+                                                "data-viewing": if is_viewing { "true" } else { "false" },
+                                                "data-loadable": if loadable { "true" } else { "false" },
+                                                onclick: move |_| select(Selection::Catalog(click_id.clone())),
+                                                span { class: "imp-row-name", "{profile.display_name}" }
+                                                span { class: "imp-row-chips",
+                                                    span { class: "imp-chip", "{profile.kind}" }
+                                                    if native {
+                                                        span { class: "imp-chip native",
+                                                            title: "native-only connector: runs inside graph-api, not in the browser",
+                                                            "native"
+                                                        }
+                                                    }
+                                                    if is_viewing {
+                                                        span { class: "imp-chip viewing", "viewing" }
+                                                    }
+                                                    if let Some((outcome, label)) = apply_chip {
+                                                        span {
+                                                            class: "imp-chip apply",
+                                                            "data-field": "apply-chip",
+                                                            "data-outcome": "{outcome}",
+                                                            "{label}"
+                                                        }
                                                     }
                                                 }
-                                                if is_viewing {
-                                                    span { class: "imp-chip viewing", "viewing" }
-                                                }
-                                                if let Some((outcome, label)) = apply_chip {
-                                                    span {
-                                                        class: "imp-chip apply",
-                                                        "data-field": "apply-chip",
-                                                        "data-outcome": "{outcome}",
-                                                        "{label}"
-                                                    }
+                                            }
+                                            if let Some(target) = load_target {
+                                                button {
+                                                    class: "btn imp-row-load",
+                                                    r#type: "button",
+                                                    "data-action": "load-row",
+                                                    "data-package-id": "{profile.id}",
+                                                    aria_label: if target.is_none() {
+                                                        "Return to the deployment default"
+                                                    } else {
+                                                        "Load this source's graph"
+                                                    },
+                                                    title: if target.is_none() {
+                                                        "return this session to the deployment default"
+                                                    } else {
+                                                        "load this source's graph (imports it if the server has not built it yet)"
+                                                    },
+                                                    onclick: move |_| {
+                                                        select(Selection::Catalog(load_id.clone()));
+                                                        apply_source(ctx, load_id.clone(), target.clone());
+                                                    },
+                                                    if target.is_none() { "⟲" } else { "▶" }
                                                 }
                                             }
                                         }
@@ -1451,7 +1579,9 @@ pub fn panel(ctx: Ctx) -> Element {
                             }
                             match &preview {
                                 PreviewState::Idle => rsx! {},
-                                PreviewState::Done(p) => rsx! {
+                                PreviewState::Done(p) => {
+                                    let preview_graph = p.clone();
+                                    rsx! {
                                     div { class: "imp-preview-result", "data-outcome": "ok",
                                         span { class: "imp-counts",
                                             strong { "data-field": "preview-nodes", "{p.nodes}" }
@@ -1475,8 +1605,29 @@ pub fn panel(ctx: Ctx) -> Element {
                                                 }
                                             }
                                         }
+                                        if !p.node_ids.is_empty() {
+                                            button {
+                                                class: "btn imp-mini",
+                                                r#type: "button",
+                                                "data-action": "view-preview-graph",
+                                                title: "mount the parsed sample as a client-side graph",
+                                                onclick: move |_| {
+                                                    let gd = graph_data_from_preview(&preview_graph);
+                                                    *STATUS.write() = Some(format!(
+                                                        "preview graph: {} nodes, {} edges — client-only (server tools disabled)",
+                                                        gd.n_nodes, gd.n_edges
+                                                    ));
+                                                    crate::replace_with_client_graph(
+                                                        ctx,
+                                                        gd,
+                                                        "pest preview",
+                                                    );
+                                                },
+                                                "View as graph"
+                                            }
+                                        }
                                     }
-                                },
+                                }},
                                 PreviewState::Failed { message, timeout } => rsx! {
                                     div {
                                         class: if *timeout { "imp-preview-error timeout" } else { "imp-preview-error" },
@@ -1620,33 +1771,14 @@ mod tests {
     }
 
     #[test]
-    fn sanitize_id_matches_source_id_charset() {
-        assert_eq!(sanitize_id("Lavender Ingest/OKF"), "lavender-ingest-okf");
-        assert_eq!(sanitize_id("---"), "package");
-    }
-
-    #[test]
-    fn source_stage_only_reports_labels_naming_the_source() {
-        let start = api::ProgressEvent::Start {
-            id: 1,
-            group: "ingest".into(),
-            label: "Reloading lavender-ingest-okf".into(),
-        };
-        assert_eq!(
-            source_stage("lavender-ingest-okf", &start).as_deref(),
-            Some("Reloading lavender-ingest-okf")
-        );
-        // Another source's reload is not this apply's progress.
-        assert!(source_stage("obsidian-vault", &start).is_none());
-        // Task bookkeeping carries no label to attribute.
-        assert!(source_stage(
-            "lavender-ingest-okf",
-            &api::ProgressEvent::SetProgress {
-                id: 1,
-                progress: 0.5
-            }
-        )
-        .is_none());
-        assert!(source_stage("lavender-ingest-okf", &api::ProgressEvent::Finish { id: 1 }).is_none());
+    fn building_errors_are_detected_from_the_error_string() {
+        assert!(api::is_building_error(
+            "/graph/init -> HTTP 503: building importer source \"hindsight-memory-bank\": the import is running"
+        ));
+        // retryable-by-polling, must surface as an error.
+        assert!(!api::is_building_error(
+            "/graph/init -> HTTP 503: import alternate source \"x\": connector unreachable"
+        ));
+        assert!(!api::is_building_error("/graph/init -> HTTP 404"));
     }
 }

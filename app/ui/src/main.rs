@@ -1406,7 +1406,52 @@ fn panel_body(kind: Panel, _maximized: bool, ctx: Ctx) -> Element {
             if ctx.graph.read().is_some() {
                 rsx! { graph_canvas::GraphCanvas { graph: ctx.graph, selected: ctx.selected } }
             } else if let Some(e) = ctx.load_error.read().clone() {
-                rsx! { div { class: "skeleton", Spinner { label: "retrying: {e}" } } }
+                if api::is_building_error(&e) {
+                    // A selected importer source is being built server-side:
+                    // rich non-blocking overlay fed from the live apply
+                    // status instead of the raw 503 text.
+                    let apply = crate::panels::importers::APPLY.read().clone();
+                    let (target, stage, fraction, elapsed) = match apply.as_ref() {
+                        Some(
+                            crate::panels::importers::ApplyStatus {
+                                target,
+                                state: crate::panels::importers::ApplyState::Building {
+                                    elapsed_secs,
+                                    stage,
+                                    fraction,
+                                },
+                                ..
+                            },
+                        ) => (target.clone(), stage.clone(), *fraction, *elapsed_secs),
+                        _ => ("the selected source".to_string(), None, None, 0),
+                    };
+                    rsx! {
+                        div { class: "graph-building", role: "status", "data-field": "graph-building",
+                            div { class: "graph-building-title",
+                                "importing {target}… {elapsed}s"
+                            }
+                            if let Some(stage) = stage {
+                                div { class: "graph-building-stage", "data-field": "building-stage", "{stage}" }
+                            }
+                            div { class: "imp-progress",
+                                role: "progressbar",
+                                if let Some(fraction) = fraction {
+                                    div {
+                                        class: "imp-progress-fill",
+                                        style: format!(
+                                            "width: {:.0}%",
+                                            fraction.clamp(0.0, 1.0) * 100.0
+                                        ),
+                                    }
+                                } else {
+                                    div { class: "imp-progress-fill indeterminate" }
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    rsx! { div { class: "skeleton", Spinner { label: "retrying: {e}" } } }
+                }
             } else {
                 rsx! { div { class: "skeleton", Spinner { label: "loading graph…" } } }
             }

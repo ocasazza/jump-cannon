@@ -1088,7 +1088,9 @@ async fn runtime_switch_builds_alternate_lazily_and_isolates_state() {
     .expect("default ids JSON");
     assert!(default_ids.is_empty());
 
-    let alt_response = app
+    // First selection of an unbuilt alternate starts a background build and
+    // answers 503 + Retry-After with the `building importer source` marker.
+    let started = app
         .clone()
         .oneshot(source_request(
             "/graph/ids",
@@ -1096,8 +1098,49 @@ async fn runtime_switch_builds_alternate_lazily_and_isolates_state() {
             Some(SWITCH_GROUP),
         ))
         .await
-        .expect("alternate ids served");
-    assert_eq!(alt_response.status(), StatusCode::OK);
+        .expect("alternate ids request served");
+    assert_eq!(started.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        started
+            .headers()
+            .get("retry-after")
+            .and_then(|v| v.to_str().ok()),
+        Some("2")
+    );
+    let body = String::from_utf8(
+        to_bytes(started.into_body(), 1 << 20)
+            .await
+            .expect("building body")
+            .to_vec(),
+    )
+    .expect("building body text");
+    assert!(
+        body.starts_with("building importer source"),
+        "building marker: {body}"
+    );
+
+    // The build completes in the background; the retry loop the client runs
+    // converges on the alternate's serving state.
+    let alt_response = loop {
+        let response = app
+            .clone()
+            .oneshot(source_request(
+                "/graph/ids",
+                "alt-vault",
+                Some(SWITCH_GROUP),
+            ))
+            .await
+            .expect("alternate ids served");
+        if response.status() == StatusCode::OK {
+            break response;
+        }
+        assert_eq!(
+            response.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "retry sees building or success, nothing else"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    };
     let alt_revision = response_revision(&alt_response);
     assert_ne!(alt_revision, default_revision);
     let alt_ids: Vec<String> = serde_json::from_slice(

@@ -97,9 +97,12 @@ impl SwitchConfig {
             .unwrap_or_default()
     }
 
-    /// Whether the caller may select a non-default source.
+    /// Whether the caller may select a non-default source. A required group
+    /// of `"*"` authorizes any caller — the deployment explicitly opened
+    /// runtime switching — while an unset group stays fail-closed.
     pub fn authorize(&self, headers: &HeaderMap) -> bool {
         match &self.required_group {
+            Some(required) if required == "*" => true,
             Some(required) => self.caller_groups(headers).iter().any(|g| g == required),
             None => false,
         }
@@ -117,12 +120,16 @@ impl SwitchConfig {
 
 /// Why a source selection could not be served. Maps onto the wire error
 /// contract: unknown id → 404, not runnable → 400, unauthorized → 403,
-/// build failure → 503 with the cached message.
+/// build in progress → 503 + `Retry-After` with a `building importer source`
+/// body, build failure → 503 with the cached message.
 #[derive(Debug)]
 pub enum SourceError {
     Forbidden,
     Unknown(String),
     NotRunnable(String),
+    /// The alternate's import build is running in the background; the caller
+    /// should poll `/progress` with the same selection header and retry.
+    Building(String),
     BuildFailed(String),
 }
 
@@ -141,6 +148,13 @@ impl SourceError {
                 StatusCode::BAD_REQUEST,
                 format!("importer source {id:?} is not runnable at runtime"),
             ),
+            Self::Building(id) => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!(
+                    "building importer source {id:?}: the import is running in the background; \
+                     poll /progress with the same source header for stages, then retry"
+                ),
+            ),
             Self::BuildFailed(message) => (StatusCode::SERVICE_UNAVAILABLE, message.clone()),
         }
     }
@@ -148,8 +162,25 @@ impl SourceError {
 
 impl IntoResponse for SourceError {
     fn into_response(self) -> Response {
-        self.status_and_message().into_response()
+        let (status, message) = self.status_and_message();
+        if matches!(self, Self::Building(_)) {
+            return (
+                status,
+                [("retry-after", "2"), ("content-type", "text/plain; charset=utf-8")],
+                message,
+            )
+                .into_response();
+        }
+        (status, message).into_response()
     }
+}
+
+/// Internal tri-state of `ensure_serving`: the cached serving state, an
+/// in-flight build (caller surfaces [`SourceError::Building`]), or a cached
+/// failure (caller surfaces [`SourceError::BuildFailed`]).
+enum EnsureError {
+    Building,
+    Failed(String),
 }
 
 /// The outcome of resolving one request's source selection.
@@ -160,6 +191,10 @@ pub struct ResolvedSource {
 }
 
 enum AlternateSource {
+    /// Import build running in the background. Never idle-evicted — a build
+    /// that outlived the TTL would race its own eviction; the completion
+    /// handler resets `last_used` and the TTL applies from there.
+    Building,
     Serving {
         state: AppState,
         /// Background rescan task for this alternate; aborted on eviction.
@@ -167,22 +202,28 @@ enum AlternateSource {
     },
     /// Cached build failure: surfaced as 503 without re-attempting the build
     /// on every request. Evicted on the same idle TTL as a serving entry.
+    /// The build's progress log is kept on the entry for post-mortem reads.
     Failed(String),
 }
 
 /// One entry in the alternates map: its state plus how recently a request
 /// resolved to it — `last_used` drives idle eviction, `gate` drives the
-/// watcher's periodic rescan. Inert on a `Failed` entry, which has no
-/// watcher.
+/// watcher's periodic rescan. `progress` is created when the build starts
+/// and survives into `Serving` and `Failed` so `/progress` can always serve
+/// the source's live or final event log. `build` holds the in-flight build
+/// task (abortable on invalidation); inert once the build completes.
 struct AlternateEntry {
     source: AlternateSource,
     last_used: Instant,
     gate: Arc<RescanGate>,
+    progress: Arc<ProgressLog>,
+    build: Option<tokio::task::JoinHandle<()>>,
 }
 
 /// Record a request resolving to this entry. Both signals move together: an
 /// entry kept resident by traffic must also keep rescanning, and one that
 /// stops being requested must stop rebuilding before the sweep evicts it.
+/// Inert on `Building`/`Failed` entries, which have no rescan watcher.
 fn mark_entry_used(entry: &mut AlternateEntry, now: Instant) {
     entry.last_used = now;
     entry.gate.mark_used();
@@ -217,8 +258,10 @@ struct SourceHostInner {
 }
 
 /// Idle detection: ids whose entry hasn't been used since `now - idle_ttl`.
-/// Pure and side-effect-free so the exact selection logic is unit-testable
-/// without a real `AppState` or waiting on real timers.
+/// `Building` entries are exempt — a build in flight must not race its own
+/// eviction; the completion handler resets `last_used` and the TTL applies
+/// from there. Pure and side-effect-free so the exact selection logic is
+/// unit-testable without a real `AppState` or waiting on real timers.
 fn expired_alternate_ids(
     alternates: &HashMap<String, AlternateEntry>,
     now: Instant,
@@ -226,7 +269,10 @@ fn expired_alternate_ids(
 ) -> Vec<String> {
     alternates
         .iter()
-        .filter(|(_, entry)| now.duration_since(entry.last_used) >= idle_ttl)
+        .filter(|(_, entry)| {
+            !matches!(entry.source, AlternateSource::Building { .. })
+                && now.duration_since(entry.last_used) >= idle_ttl
+        })
         .map(|(id, _)| id.clone())
         .collect()
 }
@@ -304,7 +350,7 @@ impl SourceHost {
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 interval.tick().await;
-                let expired: Vec<(String, Option<tokio::task::JoinHandle<()>>)> = {
+                let expired: Vec<(String, Vec<tokio::task::JoinHandle<()>>)> = {
                     let mut alternates = inner
                         .alternates
                         .write()
@@ -313,18 +359,26 @@ impl SourceHost {
                     expired_ids
                         .into_iter()
                         .filter_map(|id| {
+                            // Building entries are never selected for
+                            // eviction; treat an unexpected one as abortable
+                            // rather than leaking its build.
                             alternates.remove(&id).map(|entry| {
-                                let watcher = match entry.source {
-                                    AlternateSource::Serving { watcher, .. } => watcher,
-                                    AlternateSource::Failed(_) => None,
-                                };
-                                (id, watcher)
+                                let mut tasks: Vec<tokio::task::JoinHandle<()>> =
+                                    entry.build.into_iter().collect();
+                                if let AlternateSource::Serving {
+                                    watcher: Some(watcher),
+                                    ..
+                                } = entry.source
+                                {
+                                    tasks.push(watcher);
+                                }
+                                (id, tasks)
                             })
                         })
                         .collect()
                 };
-                for (source_id, watcher) in expired {
-                    if let Some(handle) = watcher {
+                for (source_id, tasks) in expired {
+                    for handle in tasks {
                         handle.abort();
                     }
                     tracing::info!(source = %source_id, "evicted idle alternate importer source");
@@ -357,24 +411,25 @@ impl SourceHost {
         self.inner.packages_dir.as_deref()
     }
 
-    /// Drop a cached alternate (serving or failed) so the next selection
-    /// rebuilds it from the current package file. No-op for unknown ids.
     pub fn invalidate_alternate(&self, source_id: &str) {
         let removed = self.write_alternates().remove(source_id);
-        if let Some(AlternateEntry {
-            source: AlternateSource::Serving {
+        if let Some(entry) = removed {
+            // A build in flight is aborted — the caller changed the
+            // definition out from under it — and a serving entry's rescan
+            // watcher stops with it.
+            if let Some(handle) = entry.build {
+                handle.abort();
+            }
+            if let AlternateSource::Serving {
                 watcher: Some(handle),
                 ..
-            },
-            ..
-        }) = removed
-        {
-            handle.abort();
+            } = entry.source
+            {
+                handle.abort();
+            }
         }
     }
 
-    /// Add a runtime-authored source to the live catalog (see
-    /// [`ImporterCatalog::insert_runtime_source`]). Compare-and-swap: two
     /// concurrent adds of the same id resolve to one success and one clean
     /// "already exists".
     pub fn add_runtime_source(
@@ -398,19 +453,43 @@ impl SourceHost {
         requested: Option<&str>,
         headers: &HeaderMap,
     ) -> Result<ResolvedSource, SourceError> {
+        // Starts the build if none is cached/running and reports in-flight
+        // builds as a retryable 503 rather than awaiting them.
+        match self.authorize_selection(requested, headers)? {
+            None => Ok(self.default_resolution()),
+            Some(id) => match self.ensure_serving(&id).await {
+                Ok(state) => Ok(ResolvedSource {
+                    state,
+                    alternate: Some(id),
+                }),
+                Err(EnsureError::Building) => Err(SourceError::Building(id)),
+                Err(EnsureError::Failed(message)) => Err(SourceError::BuildFailed(message)),
+            },
+        }
+    }
+
+    /// Gate + catalog validation shared by every selection consumer: `None`
+    /// means serve the deployment default; `Some(id)` names an alternate the
+    /// caller is authorized to select. Never builds — write/compute rejection
+    /// uses this to 400 an alternate selection regardless of build state.
+    fn authorize_selection(
+        &self,
+        requested: Option<&str>,
+        headers: &HeaderMap,
+    ) -> Result<Option<String>, SourceError> {
         let requested = requested.map(str::trim).filter(|id| !id.is_empty());
         let Some(id) = requested else {
-            return Ok(self.default_resolution());
+            return Ok(None);
         };
-        // Gate closed: the header is ignored entirely — today's behavior.
+        // Gate closed: the header is ignored entirely.
         if !self.inner.switch.enabled() {
-            return Ok(self.default_resolution());
+            return Ok(None);
         }
-        // The deployment default never requires authorization; the UI may send
-        // the header unconditionally once a viewer has switched back.
+        // The deployment default never requires authorization; the UI may
+        // send the header unconditionally once a viewer has switched back.
         let catalog = self.inner.catalog.load();
         if catalog.selected() == Some(id) {
-            return Ok(self.default_resolution());
+            return Ok(None);
         }
         if !self.inner.switch.authorize(headers) {
             return Err(SourceError::Forbidden);
@@ -421,16 +500,35 @@ impl SourceHost {
         if !definition.runnable() {
             return Err(SourceError::NotRunnable(id.to_owned()));
         }
-        let state = self
-            .ensure_serving(id)
-            .await
-            .map_err(SourceError::BuildFailed)?;
-        Ok(ResolvedSource {
-            state,
-            alternate: Some(id.to_owned()),
-        })
+        Ok(Some(id.to_owned()))
     }
 
+    /// Serve a source's progress event log without ever waiting on a build:
+    /// the default log for no selection, otherwise the selected source's
+    /// entry log — live while building, retained on failure. A selected
+    /// source with no entry yet starts its build (same lazy trigger as any
+    /// other selected request) and immediately serves the fresh log.
+    pub async fn progress_state(
+        &self,
+        requested: Option<&str>,
+        headers: &HeaderMap,
+    ) -> Result<Arc<ProgressLog>, SourceError> {
+        let requested = requested.map(str::trim).filter(|id| !id.is_empty());
+        match self.authorize_selection(requested, headers)? {
+            None => Ok(Arc::clone(&self.inner.default.inner.progress)),
+            Some(id) => {
+                let _ = self.ensure_serving(&id).await;
+                Ok(self
+                    .write_alternates()
+                    .get_mut(&id)
+                    .map(|entry| {
+                        mark_entry_used(entry, Instant::now());
+                        Arc::clone(&entry.progress)
+                    })
+                    .expect("ensure_serving leaves an entry for every runnable source"))
+            }
+        }
+    }
     fn default_resolution(&self) -> ResolvedSource {
         ResolvedSource {
             state: self.inner.default.clone(),
@@ -438,75 +536,131 @@ impl SourceHost {
         }
     }
 
-    /// Build (or fetch) the serving state for one runnable alternate source,
-    /// mirroring session-manager's `ensure_serving`. The first authorized
-    /// request pays the import cost; failures are cached and replayed as 503
-    /// until the entry's idle TTL evicts it (see `spawn_eviction_sweep`).
-    async fn ensure_serving(&self, source_id: &str) -> Result<AppState, String> {
+    /// Fetch the serving state for one runnable alternate source, or start
+    /// its build in the background. The first authorized request pays the
+    /// import cost — but asynchronously: a `Building` entry is inserted
+    /// before the task spawns (so the task can always find its entry), the
+    /// task re-checks the entry under `build_lock` (so concurrent starters
+    /// build once), and the caller gets [`EnsureError::Building`] to surface
+    /// as a retryable 503. Failures are cached on the entry and replayed
+    /// until the idle TTL evicts it (see `spawn_eviction_sweep`).
+    async fn ensure_serving(&self, source_id: &str) -> Result<AppState, EnsureError> {
         if let Some(result) = self.touch_alternate(source_id) {
             return result;
         }
-        let _guard = self.inner.build_lock.lock().await;
-        if let Some(result) = self.touch_alternate(source_id) {
-            return result;
-        }
-        let definition = self
-            .inner
-            .catalog
-            .load()
-            .source(source_id)
-            .expect("ensure_serving is only called for known sources")
-            .clone();
-        let gate = Arc::new(RescanGate::default());
-        match build_alternate(
-            source_id,
-            &definition,
-            self.inner.packages_dir.as_deref(),
-            Arc::clone(&gate),
-        )
-        .await
+        // Reserve the entry under the write lock so exactly one concurrent
+        // starter inserts; latecomers observe the reservation as Building.
         {
-            Ok((state, watcher)) => {
-                tracing::info!(source = source_id, "alternate importer source serving");
-                self.write_alternates().insert(
-                    source_id.to_owned(),
-                    AlternateEntry {
-                        source: AlternateSource::Serving {
-                            state: state.clone(),
-                            watcher,
-                        },
-                        last_used: Instant::now(),
-                        gate,
-                    },
-                );
-                Ok(state)
+            let mut alternates = self.write_alternates();
+            if let Some(entry) = alternates.get_mut(source_id) {
+                mark_entry_used(entry, Instant::now());
+                return match &entry.source {
+                    AlternateSource::Building => Err(EnsureError::Building),
+                    AlternateSource::Serving { state, .. } => Ok(state.clone()),
+                    AlternateSource::Failed(message) => {
+                        Err(EnsureError::Failed(message.clone()))
+                    }
+                };
             }
-            Err(message) => {
-                tracing::warn!(source = source_id, error = %message, "alternate source build failed");
-                self.write_alternates().insert(
-                    source_id.to_owned(),
-                    AlternateEntry {
-                        source: AlternateSource::Failed(message.clone()),
-                        last_used: Instant::now(),
-                        gate,
-                    },
-                );
-                Err(message)
+            alternates.insert(
+                source_id.to_owned(),
+                AlternateEntry {
+                    source: AlternateSource::Building,
+                    last_used: Instant::now(),
+                    gate: Arc::new(RescanGate::default()),
+                    progress: Arc::new(ProgressLog::new()),
+                    build: None,
+                },
+            );
+        }
+        let entry_progress = {
+            let alternates = self.inner
+                .alternates
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let entry = alternates
+                .get(source_id)
+                .expect("entry inserted above in this call");
+            (Arc::clone(&entry.progress), Arc::clone(&entry.gate))
+        };
+        let (progress, gate) = entry_progress;
+        let inner = Arc::clone(&self.inner);
+        let id = source_id.to_owned();
+        let handle = tokio::spawn(async move {
+            let _guard = inner.build_lock.lock().await;
+            // Another starter's task may have finished this build while we
+            // waited on the lock — never build the same source twice. An
+            // absent entry means invalidation removed us; stand down.
+            {
+                let alternates = inner
+                    .alternates
+                    .read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                match alternates.get(&id).map(|entry| &entry.source) {
+                    Some(AlternateSource::Building) => {}
+                    _ => return,
+                }
+            }
+            let definition = inner
+                .catalog
+                .load()
+                .source(&id)
+                .cloned()
+                .expect("build task runs for a catalog source");
+            let outcome = build_alternate(
+                &id,
+                &definition,
+                inner.packages_dir.as_deref(),
+                gate,
+                progress,
+            )
+            .await;
+            let mut alternates = inner
+                .alternates
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(entry) = alternates.get_mut(&id) {
+                // The entry may have been invalidated and replaced by a newer
+                // Building entry while we built; only a still-Building entry
+                // is ours to complete.
+                if matches!(entry.source, AlternateSource::Building) {
+                    match outcome {
+                        Ok((state, watcher)) => {
+                            tracing::info!(source = %id, "alternate importer source serving");
+                            entry.source = AlternateSource::Serving { state, watcher };
+                            entry.last_used = Instant::now();
+                        }
+                        Err(message) => {
+                            tracing::warn!(source = %id, error = %message, "alternate source build failed");
+                            entry.source = AlternateSource::Failed(message);
+                            entry.last_used = Instant::now();
+                        }
+                    }
+                }
+            }
+        });
+        // Record the task for abort-on-invalidate. If it already completed,
+        // the entry is no longer Building and the finished handle is inert.
+        if let Some(entry) = self.write_alternates().get_mut(source_id) {
+            if matches!(entry.source, AlternateSource::Building) {
+                entry.build = Some(handle);
             }
         }
+        Err(EnsureError::Building)
     }
 
     /// Bumps an existing entry's last-used time, marks its rescan gate, and
-    /// returns its cached result, or `None` if no entry exists yet. The gate
-    /// is the alternate watcher's only "recently requested" signal: a
-    /// periodic tick with no touch since the previous one rebuilds nothing.
-    fn touch_alternate(&self, source_id: &str) -> Option<Result<AppState, String>> {
+    /// returns its cached state. The gate is the alternate watcher's only
+    /// "recently requested" signal: a periodic tick with no touch since the
+    /// previous one rebuilds nothing.
+    fn touch_alternate(&self, source_id: &str) -> Option<Result<AppState, EnsureError>> {
         let mut alternates = self.write_alternates();
         let entry = alternates.get_mut(source_id)?;
         mark_entry_used(entry, Instant::now());
         Some(match &entry.source {
+            AlternateSource::Building { .. } => Err(EnsureError::Building),
             AlternateSource::Serving { state, .. } => Ok(state.clone()),
-            AlternateSource::Failed(message) => Err(message.clone()),
+            AlternateSource::Failed(message) => Err(EnsureError::Failed(message.clone())),
         })
     }
 
@@ -534,6 +688,7 @@ async fn build_alternate(
     definition: &crate::importer_catalog::ImporterSourceDefinition,
     packages_dir: Option<&Path>,
     gate: Arc<RescanGate>,
+    progress: Arc<ProgressLog>,
 ) -> Result<(AppState, Option<tokio::task::JoinHandle<()>>), String> {
     match definition.kind {
         CatalogSourceKind::HttpJson => {
@@ -581,8 +736,8 @@ async fn build_alternate(
             );
             let grants: std::collections::HashSet<data_loader::Capability> =
                 importer.descriptor().capabilities.into_iter().collect();
-            let progress = Arc::new(ProgressLog::new());
-            let state = crate::build_world_state(importer, grants, root, progress)
+            let state =
+                crate::build_world_state(importer, grants, root, Arc::clone(&progress))
                 .await
                 .map_err(|error| {
                     format!("import alternate source {source_id:?}: {error}")
@@ -619,8 +774,8 @@ async fn build_alternate(
             };
             let grants: std::collections::HashSet<data_loader::Capability> =
                 importer.descriptor().capabilities.into_iter().collect();
-            let progress = Arc::new(ProgressLog::new());
-            let state = crate::build_world_state(importer, grants, root, progress)
+            let state =
+                crate::build_world_state(importer, grants, root, Arc::clone(&progress))
                 .await
                 .map_err(|error| format!("import alternate source {source_id:?}: {error}"))?;
             let watcher = crate::watcher::spawn_gated(
@@ -711,18 +866,19 @@ impl FromRequestParts<SourceHost> for DefaultSource {
         parts: &mut Parts,
         host: &SourceHost,
     ) -> Result<Self, Self::Rejection> {
-        let resolved = host
-            .select(requested_source(parts).as_deref(), &parts.headers)
-            .await
-            .map_err(IntoResponse::into_response)?;
-        if let Some(id) = resolved.alternate {
-            return Err((
+        // Reject an alternate selection without building it: the write
+        // refusal holds whatever the alternate's build state is.
+        match host
+            .authorize_selection(requested_source(parts).as_deref(), &parts.headers)
+        {
+            Err(error) => Err(error.into_response()),
+            Ok(Some(id)) => Err((
                 StatusCode::BAD_REQUEST,
                 format!("writes and compute stay on the deployment default source; {id:?} is a read-only view"),
             )
-                .into_response());
+                .into_response()),
+            Ok(None) => Ok(Self(host.default_state().clone())),
         }
-        Ok(Self(resolved.state))
     }
 }
 
@@ -731,14 +887,13 @@ mod tests {
     use super::*;
 
     /// `Failed` entries need no `AppState`, so the idle-detection predicate
-    /// can be exercised directly without spinning up a real importer —
-    /// this is the exact selection logic that was missing before the fix,
-    /// which pinned every lazily-built alternate in memory forever.
     fn entry(idle_for: Duration) -> AlternateEntry {
         AlternateEntry {
             source: AlternateSource::Failed("unused".to_owned()),
             last_used: Instant::now() - idle_for,
             gate: Arc::new(RescanGate::default()),
+            progress: Arc::new(ProgressLog::new()),
+            build: None,
         }
     }
 
@@ -798,5 +953,53 @@ mod tests {
         mark_entry_used(&mut entry, Instant::now());
 
         assert_eq!(gate.begin_periodic(), crate::watcher::RescanDecision::Run);
+    }
+
+    /// A build in flight must never race its own eviction, however long it
+    /// has been running.
+    #[test]
+    fn building_entries_are_exempt_from_idle_eviction() {
+        let ttl = Duration::from_secs(60);
+        let mut alternates = HashMap::new();
+        let mut building = entry(Duration::from_secs(3600));
+        building.source = AlternateSource::Building;
+        alternates.insert("building".to_owned(), building);
+        alternates.insert("idle".to_owned(), entry(Duration::from_secs(120)));
+
+        let expired = expired_alternate_ids(&alternates, Instant::now(), ttl);
+
+        assert_eq!(expired, vec!["idle".to_owned()]);
+    }
+
+    /// `"*"` opens runtime switching to every caller; an unset group stays
+    /// fail-closed.
+    #[test]
+    fn switch_config_wildcard_authorizes_any_caller() {
+        use axum::http::HeaderMap;
+
+        let headers = HeaderMap::new(); // no group header at all
+        assert!(SwitchConfig::new(Some("*".to_owned()), "x-groups").authorize(&headers));
+        assert!(!SwitchConfig::new(None, "x-groups").authorize(&headers));
+        assert!(!SwitchConfig::new(Some("ops".to_owned()), "x-groups").authorize(&headers));
+    }
+
+    /// The retryable wire shape: 503, `Retry-After: 2`, and a body the
+    /// client can pattern-match as an in-flight build.
+    #[test]
+    fn building_error_maps_to_retryable_503() {
+        let (status, message) =
+            SourceError::Building("hindsight-memory-bank".to_owned()).status_and_message();
+        assert_eq!(status, axum::http::StatusCode::SERVICE_UNAVAILABLE);
+        assert!(message.starts_with("building importer source"));
+
+        let response = SourceError::Building("hindsight-memory-bank".to_owned()).into_response();
+        assert_eq!(response.status(), axum::http::StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            response
+                .headers()
+                .get("retry-after")
+                .and_then(|v| v.to_str().ok()),
+            Some("2")
+        );
     }
 }

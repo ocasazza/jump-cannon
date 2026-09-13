@@ -1070,3 +1070,32 @@ textarea.doc-src:focus { outline:none; }
 .imp-chip.apply[data-outcome="ok"] { color:var(--green); border-color:#2a5334; }
 .imp-chip.apply[data-outcome="timeout"] { color:var(--yellow); border-color:#655123; }
 .imp-chip.apply[data-outcome="error"] { color:var(--red); border-color:#5f2828; }
+
+/* Importer build progress: determinate bar when the running stage reports a
+   fraction, indeterminate shimmer otherwise. Shared by the Importers panel
+   apply status and the graph-area building overlay. */
+.imp-progress { width:100%; max-width:26rem; height:.55rem; margin:.15rem 0;
+  background:rgba(255,255,255,.06); border:1px solid #2a2a35; border-radius:3px;
+  overflow:hidden; }
+.imp-progress-fill { height:100%; background:var(--accent, #3f7fbf);
+  color:transparent; font-size:0; transition:width .4s ease; }
+.imp-progress-fill.indeterminate { width:40%; animation:imp-indet 1.2s infinite linear; }
+@keyframes imp-indet { 0% { transform:translateX(-100%); } 100% { transform:translateX(350%); } }
+
+/* Graph-area overlay while a selected importer source builds server-side. */
+.graph-building { position:absolute; inset:0; display:flex; flex-direction:column;
+  align-items:center; justify-content:center; gap:.5rem; padding:2rem;
+  background:color-mix(in srgb, var(--bg, #101014) 88%, transparent);
+  z-index:5; }
+.graph-building-title { font-family:var(--mono); color:var(--fg); }
+.graph-building-stage { font-family:var(--mono); font-size:.7rem; color:var(--dim);
+  max-width:32rem; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.graph-building-note { font-size:.65rem; color:var(--dim); }
+
+/* Catalog row + its inline Load action. The row selects (inspect); the Load
+   button applies the source, so one click from the list loads a graph without
+   making catalog browsing trigger server-side imports. */
+.imp-row-wrap { display:flex; align-items:stretch; gap:.2rem; }
+.imp-row-wrap > .imp-row { flex:1 1 auto; }
+.imp-row-load { flex:0 0 auto; padding:0 .45rem; font-size:.7rem; line-height:1;
+  color:var(--accent); }

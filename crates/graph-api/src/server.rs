@@ -1243,12 +1243,22 @@ struct ProgressQuery {
 }
 
 async fn progress_poll(
-    selection: SourceSelection,
+    State(host): State<SourceHost>,
+    headers: HeaderMap,
     Query(p): Query<ProgressQuery>,
-) -> impl IntoResponse {
-    let s = selection.0;
-    let resp = s.inner.progress.since(p.since.unwrap_or(0));
-    axum::Json(resp)
+) -> Result<axum::Json<crate::progress::ProgressResponse>, axum::response::Response> {
+    // Never resolves through a build: a selected source under construction
+    // serves its live build log so the client can watch stages while the
+    // graph fetch itself reports 503 + Retry-After.
+    let requested = headers
+        .get(crate::source_host::SOURCE_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+    let log = host
+        .progress_state(requested.as_deref(), &headers)
+        .await
+        .map_err(|error| error.into_response())?;
+    Ok(axum::Json(log.since(p.since.unwrap_or(0))))
 }
 
 async fn index(State(host): State<SourceHost>) -> impl IntoResponse {

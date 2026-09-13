@@ -3352,12 +3352,32 @@ async fn run_switch_scenario_inner(
     // ---- wire contract (no browser): the group gate and id validation ----
     let source = ("x-jump-cannon-source", SWITCH_ALT_ID);
     check.wire_forbidden = raw_get_status(&format!("{base}/graph/ids"), &[source]).await? == 403;
-    check.wire_authorized = raw_get_status(
+    // Selecting an unbuilt alternate now starts a background import and
+    // answers 503 + Retry-After; the serving 200 arrives once that build
+    // lands, so poll the way the client does.
+    let first = raw_get_status(
         &format!("{base}/graph/ids"),
         &[source, ("x-netbird-groups", SWITCH_GROUP)],
     )
-    .await?
-        == 200;
+    .await?;
+    let mut authorized = first == 200;
+    if first == 503 {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            if raw_get_status(
+                &format!("{base}/graph/ids"),
+                &[source, ("x-netbird-groups", SWITCH_GROUP)],
+            )
+            .await?
+                == 200
+            {
+                authorized = true;
+                break;
+            }
+        }
+    }
+    check.wire_authorized = authorized;
     check.wire_unknown = raw_get_status(
         &format!("{base}/graph/ids"),
         &[

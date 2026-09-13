@@ -238,15 +238,42 @@ fn get(path: &str) -> gloo_net::http::RequestBuilder {
         req
     }
 }
+/// Format a non-2xx response as an error string, appending a short body
+/// excerpt when the server sent one (graph-api's alternate-source 503s are
+/// plain text, e.g. `building importer source "…" — poll /progress`).
+pub(crate) async fn status_error(
+    path: &str,
+    resp: gloo_net::http::Response,
+) -> String {
+    let status = resp.status();
+    let excerpt = resp
+        .text()
+        .await
+        .unwrap_or_default()
+        .trim()
+        .chars()
+        .take(200)
+        .collect::<String>();
+    if excerpt.is_empty() {
+        format!("{path} -> HTTP {status}")
+    } else {
+        format!("{path} -> HTTP {status}: {excerpt}")
+    }
+}
+
+/// True when an API error string reports a 503 whose body names an
+/// in-flight alternate-source build — the retryable, progress-pollable
+/// condition produced by selecting a source graph-api is still importing.
+pub fn is_building_error(error: &str) -> bool {
+    error.contains("HTTP 503") && error.contains("building importer source")
+}
 
 pub(crate) async fn get_json<T: serde::de::DeserializeOwned>(path: &str) -> ApiResult<T> {
-    get(path)
-        .send()
-        .await
-        .map_err(err)?
-        .json()
-        .await
-        .map_err(err)
+    let resp = get(path).send().await.map_err(err)?;
+    if !resp.ok() {
+        return Err(status_error(path, resp).await);
+    }
+    resp.json().await.map_err(err)
 }
 
 pub(crate) async fn put_json<I: Serialize, O: serde::de::DeserializeOwned>(
@@ -260,7 +287,7 @@ pub(crate) async fn put_json<I: Serialize, O: serde::de::DeserializeOwned>(
         .await
         .map_err(err)?;
     if !resp.ok() {
-        return Err(format!("{} -> HTTP {}", path, resp.status()));
+        return Err(status_error(path, resp).await);
     }
     resp.json().await.map_err(err)
 }
@@ -277,7 +304,7 @@ pub(crate) async fn put_raw_json<O: serde::de::DeserializeOwned>(
         .await
         .map_err(err)?;
     if !resp.ok() {
-        return Err(format!("{} -> HTTP {}", path, resp.status()));
+        return Err(status_error(path, resp).await);
     }
     resp.json().await.map_err(err)
 }
@@ -301,7 +328,7 @@ async fn get_revisioned_json<T: serde::de::DeserializeOwned>(
 ) -> ApiResult<Revisioned<T>> {
     let resp = get(path).send().await.map_err(err)?;
     if !resp.ok() {
-        return Err(format!("{} -> HTTP {}", path, resp.status()));
+        return Err(status_error(path, resp).await);
     }
     let revision = graph_revision(&resp);
     let value = resp.json().await.map_err(err)?;
@@ -311,7 +338,7 @@ async fn get_revisioned_json<T: serde::de::DeserializeOwned>(
 async fn get_revisioned_bytes(path: &str) -> ApiResult<Revisioned<Vec<u8>>> {
     let resp = get(path).send().await.map_err(err)?;
     if !resp.ok() {
-        return Err(format!("{} -> HTTP {}", path, resp.status()));
+        return Err(status_error(path, resp).await);
     }
     let revision = graph_revision(&resp);
     let value = resp.binary().await.map_err(err)?;
@@ -321,7 +348,7 @@ async fn get_revisioned_bytes(path: &str) -> ApiResult<Revisioned<Vec<u8>>> {
 pub(crate) async fn get_bytes(path: &str) -> ApiResult<Vec<u8>> {
     let resp = get(path).send().await.map_err(err)?;
     if !resp.ok() {
-        return Err(format!("{} -> HTTP {}", path, resp.status()));
+        return Err(status_error(path, resp).await);
     }
     resp.binary().await.map_err(err)
 }
@@ -398,7 +425,7 @@ pub async fn metric(name: &str) -> ApiResult<Option<Vec<f32>>> {
         return Ok(None);
     }
     if !resp.ok() {
-        return Err(format!("{} -> HTTP {}", path, resp.status()));
+        return Err(status_error(&path, resp).await);
     }
     Ok(Some(f32s(&resp.binary().await.map_err(err)?)))
 }
@@ -787,28 +814,13 @@ pub struct ProgressResponse {
     pub events: Vec<Stamped>,
 }
 
-/// `GET /progress?since=<seq>` — tail of the server-side progress event log.
+/// `GET /progress?since=<seq>` — tail of the server-side progress event log
+/// for the caller's selected source (the deployment default when no source
+/// is selected). The route never blocks behind a build: a selected source
+/// under construction serves its live build log, so polling during an
+/// importer apply streams the build's stages.
 pub async fn progress(since: u64) -> ApiResult<ProgressResponse> {
     get_json(&format!("/progress?since={since}")).await
-}
-
-/// `GET /progress?since=<seq>` against the deployment default source,
-/// bypassing the session's source selection.
-///
-/// `/progress` resolves the selected source through the same extractor as
-/// every graph fetch, and each alternate owns its own progress log, so a poll
-/// carrying `x-jump-cannon-source` blocks behind the very build it would
-/// report on. The default source's log is the only one reachable while an
-/// alternate builds.
-pub async fn progress_default(since: u64) -> ApiResult<ProgressResponse> {
-    let req = Request::get(&url(&format!("/progress?since={since}")))
-        .cache(web_sys::RequestCache::NoStore);
-    let req = if WORLD_BASE.read().is_some() {
-        req.header("x-user", &user_name())
-    } else {
-        req
-    };
-    req.send().await.map_err(err)?.json().await.map_err(err)
 }
 
 #[allow(dead_code)] // not surfaced in a panel yet — /configs is dev-only on the server

@@ -71,12 +71,24 @@ one with `importers.selected`. graph-api validates the bounded catalog against
 the source that actually started and exposes only its sanitized form through
 `GET /importers`. The rollout-based selection remains the deployment default;
 when `importers.runtimeSwitchGroup` is set, viewers in that NetBird group can
-also switch the viewed source per browser session from the Importers panel,
-writes and compute pinned to the deployment-selected source. The viewer's
+also switch the viewed source per browser session from
+the Importers panel, writes and compute pinned to the deployment-selected
+source. A group of `"*"` opens switching to every caller. Switching is
+non-blocking: the first request selecting an unbuilt runnable source starts
+its import as a background task and answers 503 + `Retry-After: 2` with a
+`building importer source` body; `GET /progress` with the same selection
+header serves that build's live event log (never blocking behind the build),
+and the panel/graph overlay poll it until the retry succeeds. The viewer's
 selection lives in sessionStorage as the **bare string** `jc_source_id` (no
 JSON encoding — the harness and proxy tooling plant and read it through the
 DOM storage API), rides as the `x-jump-cannon-source` request header, and as
 `?source=` on the layout WebSocket, whose browser API cannot set headers.
+Clicking a catalog row selects it for the manifest editor; every runnable row
+carries its own inline Load action (`[data-action="load-row"]`, `⟲` on the
+default row) that applies the source, so loading a graph is one click from the
+list while browsing the catalog triggers no server-side imports. The anchored
+row, the graph-area overlay, and the Progress panel all show the build's
+stages and fractions while it runs.
 
 Package definitions are editable through the same gate. `GET
 /importers/{id}/definition` returns an httpjson source's authored TOML
@@ -96,7 +108,10 @@ panel is the surface: selecting a catalog entry offers "Edit server package"
 (the Monaco TOML/grammar editor over the served text, then "Save to server"),
 and "+ New source" drives `POST /importers`. Browser-local packages in the
 same panel never leave localStorage, and the grammar preview always runs in
-the sandbox Web Worker — the server never parses a sample input.
+the sandbox Web Worker — the server never parses a sample input. The preview's
+"View as graph" mounts the parsed sample as a client-only graph in the
+renderer (bounded at 5k nodes / 20k edges), the same mount the Generate panel
+uses, so authoring a package shows its graph without any server round-trip.
 
 The default markdown loader resolves wikilinks and is currently the only
 importer that advertises readable and writable source content. Kubernetes
