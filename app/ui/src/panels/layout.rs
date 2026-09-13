@@ -1075,6 +1075,12 @@ impl LayoutPreset {
         }
     }
 
+    /// Every preset sets the physics *and* the sampling budget so switching
+    /// presets is meaningful under both force laws: `repulsion` drives the
+    /// spring-electrical law, `tfdp_k` / `repulsion_samples` drive t-FDP
+    /// under negative sampling (SNAP-tFDP: k=1 over-contracts clusters,
+    /// gains saturate above k=3). α/β/γ stay at the paper defaults — they
+    /// shape the force curve, not the speed/quality trade.
     fn apply_to(self, o: &mut GpuForceOptions) {
         match self {
             LayoutPreset::Fast => {
@@ -1088,6 +1094,8 @@ impl LayoutPreset {
                 o.cooling_alpha = 0.99;
                 o.cooling_floor = 0.65;
                 o.energy_threshold = 0.5;
+                o.repulsion_samples = 4;
+                o.tfdp_k = 1.0;
             }
             LayoutPreset::Balanced => {
                 o.repulsion = 250.0;
@@ -1100,6 +1108,8 @@ impl LayoutPreset {
                 o.cooling_alpha = 0.999;
                 o.cooling_floor = 0.85;
                 o.energy_threshold = 0.005;
+                o.repulsion_samples = 8;
+                o.tfdp_k = 3.0;
             }
             LayoutPreset::Pretty => {
                 o.repulsion = 400.0;
@@ -1112,6 +1122,8 @@ impl LayoutPreset {
                 o.cooling_alpha = 0.999;
                 o.cooling_floor = 0.55;
                 o.energy_threshold = 0.02;
+                o.repulsion_samples = 16;
+                o.tfdp_k = 3.0;
             }
         }
     }

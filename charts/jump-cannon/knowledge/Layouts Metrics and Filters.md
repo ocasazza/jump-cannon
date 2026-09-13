@@ -66,7 +66,23 @@ Layout tab:
   the SNAP-tFDP estimator, which reproduces the degree-weighted t-FDP
   objective in expectation.
 
+**Barnes-Hut tree construction is now fully GPU-accelerated.** The tree builds entirely on the device in each layout step: 30-bit Morton-key indexing and an 8-pass 4-bit LSD radix sort with multi-workgroup exclusive scan produce canonical tree order; prefix sums of mass and mass-weighted position cache every node's center of mass as a difference of two prefix entries (no atomics, no CPU tree traversal). The pipeline emits DFS-order nodes with next/skip ropes for fast traversal. Zero host readback is needed per step except for position export to the renderer.
+
 A persisted backend or force-model value the current build does not recognise
 falls back to the default rather than to the exact O(n²) path. The scale
 limits of this engine and the planned steps beyond them are tracked in
 `docs/layout-algorithms.md` §"Scale ladder".
+
+## Region map
+
+The **Regions** section in the Style panel controls an aggregate visualization mode for graphs too large to render node-by-node. Each region is a color-filled Voronoi cell, and cells are indexed by the active `community` metric (often a clustering or partition algorithm output like Louvain modularity).
+
+**Mode**: Select *Off* (disabled), *Underlay* (render regions under edges and nodes), or *Only* (regions replace the graph; all edges and node labels disappear and only cell outlines remain).
+
+**Radius**: Cell size in pixels (4–128). Larger radii merge nearby cells; smaller radii fine-grain the view.
+
+**Fill opacity**: The transparency of the cell color fill (0–1). Set to 0 for outline-only regions; increase toward 1 for opaque colored areas.
+
+**Show outlines**: When enabled, the boundary of each Voronoi cell is darkened where the 4-neighbor cluster ID differs, making region edges stand out.
+
+Per frame, the seed pass projects the graph's current positions through the camera and writes the nearest cluster ID into a 512×512 screen-space grid. Ten jump-flood passes (distance steps 256, 128, …, 2, 1) compute the nearest-neighbor Voronoi. Cells farther than the *Radius* setting from any seed become transparent. A fullscreen draw then fills each cell with a color from the current palette (rotated by `id % palette.length()`) at the *Fill opacity*, and stroking outlines where neighbors differ. The entire view recomputes each frame and costs nothing beyond a single O(n) camera-space projection pass, regardless of how many nodes the graph has — making it the only view viable for 10⁷+ node layouts.

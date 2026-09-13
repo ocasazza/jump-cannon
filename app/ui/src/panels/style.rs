@@ -266,8 +266,24 @@ pub(crate) struct StyleState {
     palette: PaletteId,
     #[serde(default)]
     community_source: CommunitySource,
+    #[serde(default)]
+    region_mode: crate::render::RegionMode,
+    #[serde(default = "default_region_radius")]
+    region_radius: f32,
+    #[serde(default = "default_region_alpha")]
+    region_alpha: f32,
+    #[serde(default = "default_region_outline")]
+    region_outline: bool,
 }
-
+fn default_region_radius() -> f32 {
+    24.0
+}
+fn default_region_alpha() -> f32 {
+    0.35
+}
+fn default_region_outline() -> bool {
+    true
+}
 fn default_edge_color() -> [f32; 4] {
     [0.227, 0.282, 0.502, 1.0]
 }
@@ -319,6 +335,10 @@ impl Default for StyleState {
             edge_width: default_edge_width(),
             palette: PaletteId::default(),
             community_source: CommunitySource::default(),
+            region_mode: crate::render::RegionMode::default(),
+            region_radius: default_region_radius(),
+            region_alpha: default_region_alpha(),
+            region_outline: default_region_outline(),
         }
     }
 }
@@ -963,7 +983,7 @@ fn apply_now() {
         let metrics = cache.borrow();
         let gen = METRICS_GEN.with(Cell::get);
         render::with_host(|h| {
-            let (pipes, queue) = h.pipes_and_queue();
+            let (pipes, queue, device) = h.pipes_queue_device();
             if !pipes.is_loaded() {
                 return false;
             }
@@ -976,6 +996,19 @@ fn apply_now() {
                 style.edge_fade_floor,
             );
             pipes.set_shader_intensity(style.shader_intensity);
+
+            // Apply region map settings unconditionally so mode/radius/alpha changes apply
+            let palette: Vec<[f32; 4]> = palette_table(style.palette)
+                .iter()
+                .map(|&[r, g, b]| [r, g, b, 1.0])
+                .collect();
+            pipes.set_region_map(device, queue, crate::render::RegionMapConfig {
+                mode: style.region_mode,
+                radius_cells: style.region_radius,
+                fill_alpha: style.region_alpha,
+                outline: style.region_outline,
+                palette,
+            });
 
             let buf_ptr = pipes.sizes_base().as_ptr() as usize;
             if LAST_APPLIED.with(Cell::get) == Some((style, gen, buf_ptr)) {
@@ -996,6 +1029,14 @@ fn apply_now() {
             pipes.update_colors(queue, colors);
             pipes.update_sizes(queue, sizes);
             pipes.update_shape_ids(queue, shapes);
+
+            // Build cluster IDs from the community metric
+            let ids: Vec<u32> = mv.get("community")
+                .map(|v| v.iter().map(|&x| x as u32).collect())
+                .unwrap_or_else(|| vec![0u32; n]);
+            if ids.len() == n {
+                pipes.update_cluster_ids(queue, ids);
+            }
             // Edge colors: when EdgeColorBy::None, push the uniform
             // edge_color for every edge so per-edge tinting is inert.
             let n_edges = pipes.n_edges() as usize;
@@ -1203,6 +1244,41 @@ pub fn panel(ctx: Ctx) -> Element {
                 PaletteId::ALL.iter().map(|p| p.label()).collect(),
                 PaletteId::ALL.iter().position(|p| *p == s.palette).unwrap_or(0),
                 move |i| { if let Some(&p) = PaletteId::ALL.get(i) { update(|s| s.palette = p); } })}
+
+            {select_row("Regions",
+                vec!["Off", "Underlay", "Only"],
+                match s.region_mode {
+                    crate::render::RegionMode::Off => 0,
+                    crate::render::RegionMode::Underlay => 1,
+                    crate::render::RegionMode::Only => 2,
+                },
+                move |i| {
+                    let mode = match i {
+                        1 => crate::render::RegionMode::Underlay,
+                        2 => crate::render::RegionMode::Only,
+                        _ => crate::render::RegionMode::Off,
+                    };
+                    update(|s| s.region_mode = mode);
+                })}
+
+            {slider_row("Region radius", "cells", 4.0, 128.0, 1.0, 1, s.region_radius,
+                move |v| update(|s| s.region_radius = v))}
+
+            {slider_row("Region fill", "α", 0.0, 1.0, 0.01, 2, s.region_alpha,
+                move |v| update(|s| s.region_alpha = v))}
+
+            div { class: "sty-row",
+                span { class: "sty-label", "Region outline" }
+                input {
+                    r#type: "checkbox",
+                    checked: s.region_outline,
+                    onchange: move |e| update(|s| s.region_outline = e.checked()),
+                }
+            }
+
+            div { class: "sty-row",
+                span { class: "sty-hint", "Cluster regions from the community metric (GMap-style)" }
+            }
 
             {slider_row("Node size multiplier", "×", 0.25, 4.0, 0.01, 2, s.size_mul,
                 move |v| update(|s| s.size_mul = v))}

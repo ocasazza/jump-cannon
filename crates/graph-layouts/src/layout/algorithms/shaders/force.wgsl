@@ -277,49 +277,80 @@ fn force_step(
     // Backend selection. All paths read positions_in[*]; the BH path
     // additionally reads the host-built octree from group(1).
     if (params.repulsion_mode == 1u) {
-        // Stackless rope walk over the octree. Self-pruning happens via
-        // the leaf body_idx check; the acceptance criterion s/d < θ is
-        // applied per visited internal node.
+        // Stackless rope walk over the GPU-built octree (shaders/octree.wgsl).
+        // Self-pruning happens via the leaf body-index check (single-body
+        // leaves) or cell containment (multi-body leaves); the acceptance
+        // criterion s/d < θ is applied per visited internal node.
         let theta2 = params.bh_theta * params.bh_theta;
         var idx: u32 = 0u;
-        // Hard upper bound (paranoia): the octree has ≤ 2N nodes; cap at
-        // 4*n_octree to make any malformed rope a hang-resistant bug
-        // rather than an infinite loop on the GPU.
+        // Hard upper bound (paranoia). The rope always terminates at OCT_END
+        // within the emitted-node count; `params.n_octree` carries the octree
+        // node *capacity* (a static build-time bound), so 4× it is a safe
+        // anti-hang cap independent of the exact GPU-computed node count.
         let walk_cap = max(params.n_octree * 4u, 16u);
         var step: u32 = 0u;
         loop {
             if (idx == OCT_END) { break; }
             if (step >= walk_cap) { break; }
             step = step + 1u;
-            let n = oct_nodes[idx];
-            let body = n.links.x;
-            let com = n.com_mass.xyz;
-            let mass_n = n.com_mass.w;
-            let half = n.pos_size.w;
+            let node = oct_nodes[idx];
+            let body = node.links.x;
+            let cnt = node.links.w;
+            let center = node.pos_size.xyz;
+            let half = node.pos_size.w;
+            let com = node.com_mass.xyz;
+            let mass_n = node.com_mass.w;
+            if (body != OCT_BODY_INTERNAL) {
+                // Leaf. links.w disambiguates single-body (== 1) from a
+                // multi-body max-depth leaf (> 1, bodies coincident to the
+                // Morton grid). The GPU build stores the real body index in
+                // links.x for single-body leaves and the sorted-range start
+                // for multi-body leaves.
+                if (cnt <= 1u) {
+                    if (body != i) {
+                        let d = pos - com;
+                        let dist2 = dot(d, d);
+                        if (dist2 <= r_clip2 && mass_n > 0.0) {
+                            force = force + repulsion_force(d, max(dist2, dist2_floor), mass_n);
+                        }
+                    }
+                } else {
+                    // Multi-body leaf: remove this body's own contribution
+                    // when it falls inside the leaf cell (exact membership,
+                    // since the cell is body i's own Morton cell). Guard the
+                    // adjusted mass against going non-positive.
+                    var m = mass_n;
+                    var c = com;
+                    let inside = all(abs(pos - center) <= vec3<f32>(half * 1.001 + 1e-4));
+                    if (inside) {
+                        m = mass_n - self_mass;
+                        if (m > 1e-6) {
+                            c = (com * mass_n - pos * self_mass) / m;
+                        }
+                    }
+                    if (m > 1e-6) {
+                        let d = pos - c;
+                        let dist2 = dot(d, d);
+                        if (dist2 <= r_clip2) {
+                            force = force + repulsion_force(d, max(dist2, dist2_floor), m);
+                        }
+                    }
+                }
+                idx = node.links.z; // skip = next-sibling-or-uncle
+                continue;
+            }
+            // Internal — Barnes-Hut acceptance: treat as a point mass when
+            // (s/d)² < θ². Squares both sides to avoid the sqrt.
             let s = half * 2.0;
             let d = pos - com;
             let dist2 = dot(d, d);
-            // Leaf — apply directly (skip self).
-            if (body != OCT_BODY_INTERNAL) {
-                if (body != i) {
-                    if (dist2 <= r_clip2 && mass_n > 0.0) {
-                        let dist2c = max(dist2, dist2_floor);
-                        force = force + repulsion_force(d, dist2c, mass_n);
-                    }
-                }
-                idx = n.links.z; // skip = next-sibling-or-uncle
-                continue;
-            }
-            // Internal — apply Barnes-Hut acceptance: treat as point mass
-            // when (s/d)² < θ². Avoids the sqrt by squaring both sides.
             if (mass_n > 0.0 && dist2 > 0.0 && (s * s) < (theta2 * dist2)) {
                 if (dist2 <= r_clip2) {
-                    let dist2c = max(dist2, dist2_floor);
-                    force = force + repulsion_force(d, dist2c, mass_n);
+                    force = force + repulsion_force(d, max(dist2, dist2_floor), mass_n);
                 }
-                idx = n.links.z; // accepted → skip subtree
+                idx = node.links.z; // accepted → skip subtree
             } else {
-                idx = n.links.y; // descend into first child
+                idx = node.links.y; // descend into first child
             }
         }
     } else if (params.repulsion_mode == 2u) {

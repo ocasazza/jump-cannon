@@ -18,7 +18,7 @@ goal is a menu of algorithms that differ along two axes the user cares about:
 
 | # | Algorithm | Family | Complexity | Visual behavior vs FA2 | GPU | Shards | Effort |
 |---|---|---|---|---|---|---|---|
-| 1 | **Barnes-Hut FA2** | force-directed | O(n log n) | *Identical* to FA2, just 100×+ faster | ★★★ | ★★ | Low — tree already host-built in `graph-layouts/octree.wgsl` |
+| 1 | **Barnes-Hut FA2** | force-directed | O(n log n) | *Identical* to FA2, just 100×+ faster | ★★★ | ★★ | **Landed** — tree built on the GPU in `graph-layouts/octree.wgsl` |
 | 2 | **SGD stress** (`s_gd2`) | stress | O(n²) full / **O(kn) pivot** | **Very different** — honors shortest-path distances, untangles structure | ★★★ | ★★★ | Medium |
 | 3 | **Multilevel wrapper** (sfdp / FM³ / Walshaw) | multiscale | O(n log n) | Sharpens *any* inner solver; better global structure | ★★ | ★★ | Medium — coarsening exists in `coarsen.rs` |
 | 4 | **maxent-stress** | stress + entropy | O(n log n) w/ BH | Even node spread, fewer clumps than stress | ★★ | ★★ | Medium |
@@ -64,8 +64,8 @@ cell whose `size / distance < θ` as a single aggregate body. Cuts repulsion to
   cells (center-of-mass) instead of individual nodes.
 - **GPU:** the canonical GPU construction is Burtscher & Pingali's 6-kernel
   CUDA pipeline (build, COM, sort, force, integrate). [[Burtscher-Pingali]][bp11]
-  Our `graph-layouts/octree.wgsl` already follows it (host-built tree today;
-  GPU build is "one Rust change away" per its own header comment).
+  Our `graph-layouts/octree.wgsl` builds the tree on the GPU (Morton sort +
+  level-linear emission; see "Scale ladder" below).
 - **Shards:** ★★ — tree is global; in a distributed setting each worker needs a
   coarse copy of remote COMs (see distributed §5).
 - **Visual:** *identical* to FA2. This is a pure speedup, not a new look.
@@ -299,27 +299,27 @@ aggregates; this is arithmetic, not tuning.
   edge-centric sampler. Their "bundle by source node" scheme *is* one thread
   per CSR row — the shape this engine already had — so no racing writes to
   other nodes' positions are introduced (WGSL has no f32 atomics).
+- **GPU octree build.** The Barnes-Hut tree is now constructed entirely on the GPU via a 30-bit Morton-key 8-pass 4-bit LSD radix sort with multi-workgroup reduce/scan/fixup exclusive scan, order-preserving u32 float atomics for bounding-box reduction, and prefix-sum caching of mass and mass-weighted position. The kernel pipeline emits nodes in DFS order with next/skip ropes; zero host readback per layout step. Build scratch is ~45 bytes per node plus a 48-byte OctNode array at 2N+16 capacity. Multi-body max-depth leaves with identical Morton keys subtract the body's own contribution via exact cell containment.
+- **Region map (GMap-style Voronoi aggregate view).** A GPU seed pass projects nodes through the live camera and writes (packed cell, cluster id) into a 512×512 grid with atomicMin. Ten jump-flood passes (distances 256 down to 1) compute nearest-seed Voronoi; a prune pass makes cells beyond `radius_cells` from any seed transparent; a fullscreen draw fills each cell with a palette color at user-set fill opacity and darkens outlines where 4-neighbor cluster IDs differ. Cluster IDs flow from the Style panel's `community` metric; cost per frame is independent of node count except the seed pass, making this the view for graphs too large for node-by-node rendering.
+
+### Measured on this engine
+
+Benchmarks on an Apple M5 Max (Metal backend), preferential-attachment graphs, mean degree 8, per-step wall time including one position readback per run:
+
+| Nodes / Edges | BH Spring | BH t-FDP | NS Spring | NS t-FDP |
+|---|---|---|---|---|
+| 100k / 400k | 1.05 ms | 0.97 ms | 0.45 ms | 0.61 ms |
+| 1M / 4M | 17.3 ms | 14.0 ms | 8.1 ms | 6.9 ms |
+
+BH = Barnes-Hut; NS = Negative Sampling (K=8); t-FDP defaults k=3.
 
 ### Remaining, in dependency order
 
-1. **GPU octree build, or stochastic Barnes-Hut.** The BH tree is still built
-   on the host every call (`octree.wgsl` kernels are stubs). [2506.02219]
-   reports up to 9.4× less time than GPU deterministic BH at equal median
-   error on Coulomb-style sums (graphics kernels, not graph layout — verify
-   on our workloads).
-2. **Multilevel on the device.** `coarsen.rs` is CPU-only and only seeds
+1. **Multilevel on the device.** `coarsen.rs` is CPU-only and only seeds
    frame 0. GOSH's single-GPU 65 M/1.8 B result is coarsening doing the work.
-3. **Aggregate view above ~10⁷ nodes.** Two published shapes: GraphMaps-style
-   LOD tiles with a per-tile node budget, or GMap-style cluster regions.
-   GMap's inputs already exist here — Louvain in `graph-metrics`, positions
-   from this engine — and its Delaunay/Voronoi/merge step has a wgpu-native
-   substitute: rasterise the cluster-id Voronoi with a jump-flood pass in a
-   fragment shader (O(pixels · log pixels) per frame, no host geometry), then
-   draw region outlines from the id texture. Open questions before building:
-   2-D projection of the 3-D sim for region maps; which metric drives
-   cluster membership per zoom level; label placement.
-4. **Out-of-core positions/CSR** (PBG/GOSH partition staging) — only after 3,
-   since the aggregate view decides what has to be resident.
+2. **Out-of-core positions/CSR** (PBG/GOSH partition staging) — only after
+   region-map levels converge, since the aggregate view decides what has to be
+   resident.
 
 Not planned: pairwise SGD stress inside a compute shader (single-pair
 updates conflict; the GPU-viable form is the sampled SGD of [2409.00876]),

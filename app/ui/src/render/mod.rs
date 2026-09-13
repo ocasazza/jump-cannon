@@ -22,6 +22,7 @@
 pub mod camera;
 pub mod data;
 pub mod pipelines;
+pub mod region_map;
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
@@ -32,6 +33,7 @@ use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 
 pub use pipelines::{GraphData as Scene, RenderHost};
+pub use region_map::{RegionMapConfig, RegionMode};
 
 /// Reactive mirror of the sim play/pause state. Updated by
 /// [`set_sim_running`]; panels read this instead of reaching into the

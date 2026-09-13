@@ -31,6 +31,7 @@
 #![allow(dead_code)] // preserved API surface from the egui port; not every entry point is wired into the Dioxus UI yet.
 
 use crate::render::camera::Camera;
+use crate::render::region_map::{RegionMap, RegionMapConfig, RegionMode};
 use bytemuck::{Pod, Zeroable};
 use glam::{Mat4, Vec3, Vec4};
 use graph_layouts::{
@@ -197,6 +198,10 @@ pub struct GraphPipelines {
     /// only the `step_with_encoder` dispatch is skipped. (Addition over
     /// the egui port, which paused via dt/settings instead.)
     sim_running: bool,
+
+    /// GMap-style cluster region underlay. Built in `new`; its compute
+    /// bind group is wired to the shared buffers in `load`.
+    region: Option<RegionMap>,
 }
 
 struct Buffers {
@@ -214,6 +219,9 @@ struct Buffers {
     /// 1 = square, 2 = triangle, 3 = diamond, 4 = hexagon. Indexes
     /// the switch in `node.wgsl::fs_main`.
     shape_ids: wgpu::Buffer,
+    /// Per-node cluster id (u32 each) for the region-map underlay.
+    /// All-zero by default so a freshly-loaded graph reads as one region.
+    cluster_ids: wgpu::Buffer,
     n_nodes: u32,
     n_edges: u32,
     camera_uniform: wgpu::Buffer,
@@ -383,6 +391,7 @@ impl GraphPipelines {
             screen_px: [1.0, 1.0],
             effects: EffectsUniform::default(),
             sim_running: true,
+            region: Some(RegionMap::new(device, color_format)),
         }
     }
 
@@ -514,6 +523,16 @@ impl GraphPipelines {
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
         });
 
+        // Per-node cluster id. Default: all-zero (one region) so the
+        // region-map underlay reads as a single region until a clustering
+        // pass pushes real ids through `update_cluster_ids`.
+        let cluster_ids_init: Vec<u32> = vec![0_u32; n_nodes.max(1) as usize];
+        let cluster_ids_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("cluster_ids_storage"),
+            contents: bytemuck::cast_slice(&cluster_ids_init),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        });
+
         let node_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("node bg"),
             layout: &self.node_bgl,
@@ -576,6 +595,7 @@ impl GraphPipelines {
             edges: edges_buf,
             edge_colors: edge_colors_buf,
             shape_ids: shape_ids_buf,
+            cluster_ids: cluster_ids_buf,
             n_nodes,
             n_edges,
             camera_uniform,
@@ -595,6 +615,21 @@ impl GraphPipelines {
             positions_frame_idx: 0,
             last_positions_copy_frame: 0,
         });
+
+        // Wire the region-map compute bind group to the freshly-created
+        // shared buffers now that they live in `self.buffers`.
+        if let Some(region) = self.region.as_mut() {
+            if let Some(b) = self.buffers.as_ref() {
+                region.bind(
+                    device,
+                    queue,
+                    &b.positions,
+                    &b.camera_uniform,
+                    &b.cluster_ids,
+                    n_nodes,
+                );
+            }
+        }
 
         // Auto-fit the camera to the loaded graph so the bootstrap frame
         // shows something visible.
@@ -679,6 +714,14 @@ impl GraphPipelines {
             if let Some(l) = b.layout.as_mut() {
                 l.step_with_encoder(device, queue, encoder, &b.positions);
             }
+        }
+
+        // Record the region-map compute passes (clear -> seed -> jump-
+        // flood -> prune) into the same encoder. The seed pass reads the
+        // positions the sim just wrote. No-op when the region mode is Off
+        // or before the graph is loaded.
+        if let Some(region) = self.region.as_ref() {
+            region.encode(encoder);
         }
 
         // Throttle: only schedule a fresh readback once every
@@ -830,6 +873,22 @@ impl GraphPipelines {
     /// Records the edge + node draws into the host's render pass.
     pub fn draw(&self, rpass: &mut wgpu::RenderPass<'_>) {
         let Some(b) = &self.buffers else { return };
+
+        // Region underlay (GMap-style cluster map). Drawn BEFORE edges and
+        // nodes in Underlay mode; in Only mode it replaces them; in Off
+        // mode it draws nothing (and `region.draw` is itself a no-op).
+        let region_mode = self
+            .region
+            .as_ref()
+            .map(|r| r.config().mode)
+            .unwrap_or(RegionMode::Off);
+        if let Some(region) = self.region.as_ref() {
+            region.draw(rpass);
+        }
+        if region_mode == RegionMode::Only {
+            return;
+        }
+
         if b.n_edges > 0 {
             rpass.set_pipeline(&self.edge_pipeline);
             rpass.set_bind_group(0, &b.edge_bind_group, &[]);
@@ -1198,6 +1257,45 @@ impl GraphPipelines {
             return;
         }
         queue.write_buffer(&b.shape_ids, 0, bytemuck::cast_slice(&shapes));
+    }
+
+    /// Replace the per-node cluster id buffer that drives the region-map
+    /// underlay. Length must equal `n_nodes`; a mismatch warns and no-ops.
+    /// No-op before `load` (no buffers yet).
+    pub fn update_cluster_ids(&mut self, queue: &wgpu::Queue, ids: Vec<u32>) {
+        let Some(b) = self.buffers.as_ref() else {
+            return;
+        };
+        if ids.len() != b.n_nodes as usize {
+            tracing::warn!(
+                "[render] update_cluster_ids: len {} != n {}",
+                ids.len(),
+                b.n_nodes
+            );
+            return;
+        }
+        queue.write_buffer(&b.cluster_ids, 0, bytemuck::cast_slice(&ids));
+    }
+
+    /// Apply a new region-map configuration (mode, palette, radius,
+    /// alpha, outline). Re-uploads the palette and params on the GPU.
+    pub fn set_region_map(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        cfg: RegionMapConfig,
+    ) {
+        if let Some(region) = self.region.as_mut() {
+            region.set_config(device, queue, cfg);
+        }
+    }
+
+    /// The current region-map configuration.
+    pub fn region_map_config(&self) -> &RegionMapConfig {
+        self.region
+            .as_ref()
+            .expect("region map is built in GraphPipelines::new")
+            .config()
     }
 
     /// Apply a per-node alpha multiplier from the query selection. When
@@ -1905,6 +2003,14 @@ impl RenderHost {
     /// buffers need both halves from one `&mut self`.)
     pub fn pipes_and_queue(&mut self) -> (&mut GraphPipelines, &wgpu::Queue) {
         (&mut self.pipes, &self.queue)
+    }
+
+    /// Split borrow for callers that also need the device (e.g. the Style
+    /// panel's `set_region_map`, which may recreate the palette buffer).
+    pub fn pipes_queue_device(
+        &mut self,
+    ) -> (&mut GraphPipelines, &wgpu::Queue, &wgpu::Device) {
+        (&mut self.pipes, &self.queue, &self.device)
     }
 
     /// Layout-panel entry points — `GraphPipelines` needs the device and/or
