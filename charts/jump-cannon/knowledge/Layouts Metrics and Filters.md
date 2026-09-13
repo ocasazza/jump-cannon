@@ -42,12 +42,18 @@ The Layout tab's parameter surface is being redesigned around capability-honest
 regimes: named YAML regimes resolve from the loaded graph, engine capability
 manifests decide which controls exist, and data-owned simulation dimensions
 (UFF-typed bonds/atoms) render as provenance capsules instead of live knobs.
-The measured defects it fixes (dead `spring_len` slider on typed graphs, the
-false "sliders scale on top" banner, vault presets offered to molecular
-geometry), the registry schema, and the kaizen phasing live in
-`docs/layout-ux.md` (normative engineering spec: `docs/layout-ux-spec.md`); the
-repulsion mixes via √(wᵢ×wⱼ), `seed_mode: none` keeps authored coordinates) is
-in `docs/molecular-force-layout.md`.
+**Phase 1 has landed** — the registry (`app/configs/regimes/molecular-uff.yaml`
++ `vault-small.yaml`) resolves on every graph load via the
+`typed_bond_coverage` predicate, a UFF-typed molecule boots into `Molecular ·
+UFF` with no `?config=`, the dead `spring_len` slider is gone at full coverage
+(`25/25 rests from UFF · override ▸` capsule instead), the false "sliders scale
+on top" banner is deleted, vault presets are quarantined from typed graphs, and
+the repulsion backend enum only appears at n ≥ 500. The three measured defects
+it fixes, the registry schema, and the kaizen phasing live in
+`docs/layout-ux.md` (normative engineering spec: `docs/layout-ux-spec.md`);
+the repulsion mixes via √(wᵢ×wⱼ), `seed_mode: none` keeps authored coordinates) is
+in `docs/molecular-force-layout.md`. Remaining phases: presets as data +
+`jc_layout_v2` migration, intent controls, remote/static regimes.
 
 The command palette's existing Go to Layout, Go to Style, and Go to Camera
 actions open Settings on the corresponding tab. Existing Layout, Style, and

@@ -1,0 +1,33 @@
+# Molecular UFF regime — graphs with UFF-typed bonds/atoms (SDF imports).
+# Schema: docs/layout-ux-spec.md §2 (serde, deny_unknown_fields).
+#
+# Tuned values preserved byte-for-byte in meaning from the caffeine-uff boot
+# preset (docs/molecular-force-layout.md). `spring_len: null` declares the
+# dimension data-owned: at match time the resolver fills it from the mean
+# typed UFF rest so derived values (repulsion_radius = 4× spring_len in
+# apply_engine) stay on the ångström scale. The engine ignores spring_len
+# for typed edges outright (gpu_force.rs:1350-1351) — it is the untyped
+# fallback only, so this regime renders it as a collapsed-data capsule at
+# full coverage, never as a live knob.
+id: molecular-uff
+schema_version: 1
+label: "Molecular · UFF"
+description: "Typed UFF bonds own the geometry; vault-tuned knobs are quarantined."
+engine: gpu-force
+execution: live
+applicability:
+  typed_bond_coverage: { gte: 0.5 }
+options:
+  spring_len: null
+  spring_k: 1.0
+  repulsion: 0.02
+  repulsion_mode: grid
+  grid_enabled: false      # 24-atom scale: exact O(n²) pairs
+  gravity: 0.0
+  damping: 0.90
+  dt: 0.10
+  steps_per_call: 8
+  cooling_alpha: 1.0       # no cooling: the regime is the physics
+  energy_threshold: 0.0    # never short-circuit
+  seed_mode: none          # authored positions are deliberate
+presets_hidden: [fast, balanced, pretty]

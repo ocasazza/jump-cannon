@@ -10,6 +10,7 @@ pub mod filter;
 pub mod generate;
 pub mod instances;
 pub mod layout;
+pub mod regimes;
 pub mod metrics;
 pub mod nodes;
 pub mod settings;

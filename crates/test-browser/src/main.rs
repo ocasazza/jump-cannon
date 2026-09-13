@@ -117,6 +117,8 @@ struct Report {
     sessions_view: Option<SessionsViewCheck>,
     #[serde(skip_serializing_if = "Option::is_none")]
     importer_switch: Option<ImporterSwitchCheck>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    layout_regimes: Option<LayoutRegimesCheck>,
     page_errors: Vec<String>,
     console_logs: Vec<String>,
 }
@@ -210,8 +212,12 @@ struct SettingsTabsCheck {
     aria_contract: bool,
     keyboard_contract: bool,
     controls_hit_test: bool,
-    legacy_panels_absent: bool,
-    graph_restored: bool,
+    /// Vault graph (main fixture): the Layout tab keeps the live
+    /// `spring_len` slider and the presets row, and names the resolved
+    /// catch-all regime — the phase-1 "vault unchanged" contract.
+    layout_vault_regime: bool,
+    layout_spring_len_live: bool,
+    layout_presets_present: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     reason: Option<String>,
 }
@@ -311,6 +317,64 @@ struct ImporterSwitchCheck {
     reason: Option<String>,
 }
 
+/// Capability-honest layout regimes (docs/layout-ux-spec.md §8 phase 1),
+/// exercised against a caffeine molecule served from the SDF pest package
+/// — a graph with 25/25 UFF-typed bonds and authored coordinates. Skipped
+/// when the fixture files or graph-api binary are unavailable.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+struct LayoutRegimesCheck {
+    ok: bool,
+    #[serde(default)]
+    skipped: bool,
+    /// `[data-regime-id="molecular-uff"]` line renders with the coverage
+    /// reason, and the molecule booted into the regime with no `?config=`.
+    regime_booted: bool,
+    /// The collapsed-data capsule `25/25 rests from UFF` is present.
+    capsule_present: bool,
+    /// No `spring_len` slider exists anywhere in the Layout tab.
+    spring_len_absent: bool,
+    /// Fast/Balanced/Pretty are not offered (`presets_hidden`).
+    presets_hidden: bool,
+    /// The "sliders scale on top of importer-provided parameters" banner
+    /// is gone (it lied — multipliers do not scale typed rests).
+    banner_absent: bool,
+    /// Persisted gpu-force settings came from the regime: `seed_mode`
+    /// none (authored positions kept), ångström-scale spring_len fill.
+    settings_applied: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    reason: Option<String>,
+}
+
+impl LayoutRegimesCheck {
+    fn skipped(reason: String) -> Self {
+        Self {
+            ok: true,
+            skipped: true,
+            regime_booted: false,
+            capsule_present: false,
+            spring_len_absent: false,
+            presets_hidden: false,
+            banner_absent: false,
+            settings_applied: false,
+            reason: Some(reason),
+        }
+    }
+
+    fn failed(reason: String) -> Self {
+        Self {
+            ok: false,
+            skipped: false,
+            regime_booted: false,
+            capsule_present: false,
+            spring_len_absent: false,
+            presets_hidden: false,
+            banner_absent: false,
+            settings_applied: false,
+            reason: Some(reason),
+        }
+    }
+}
+
 impl ImporterSwitchCheck {
     fn skipped() -> Self {
         Self {
@@ -392,6 +456,7 @@ async fn main() -> Result<()> {
         filter_builder,
         sessions_view,
         importer_switch,
+        layout_regimes,
         page_errors,
     ) = match &result {
         Ok(o) => {
@@ -406,6 +471,7 @@ async fn main() -> Result<()> {
                 && o.filter_builder.ok
                 && o.sessions_view.ok
                 && o.importer_switch.ok
+                && o.layout_regimes.as_ref().map(|c| c.ok).unwrap_or(true)
                 && captured_page_errors.is_empty();
             let reason = if !o.boot_log_found {
                 Some(format!("boot log {BOOT_LOG_NEEDLE:?} was not observed"))
@@ -430,6 +496,8 @@ async fn main() -> Result<()> {
                 o.sessions_view.reason.clone()
             } else if !o.importer_switch.ok {
                 o.importer_switch.reason.clone()
+            } else if let Some(c) = o.layout_regimes.as_ref().filter(|c| !c.ok) {
+                c.reason.clone()
             } else if !captured_page_errors.is_empty() {
                 Some(format!(
                     "browser emitted {} console error(s) or unhandled exception(s)",
@@ -452,6 +520,7 @@ async fn main() -> Result<()> {
                 Some(o.filter_builder.clone()),
                 Some(o.sessions_view.clone()),
                 Some(o.importer_switch.clone()),
+                o.layout_regimes.clone(),
                 captured_page_errors.clone(),
             )
         }
@@ -461,6 +530,7 @@ async fn main() -> Result<()> {
             0,
             0,
             false,
+            None,
             None,
             None,
             None,
@@ -489,6 +559,7 @@ async fn main() -> Result<()> {
         filter_builder,
         sessions_view,
         importer_switch,
+        layout_regimes,
         page_errors,
         console_logs: tail(&logs, 50),
     };
@@ -519,6 +590,7 @@ struct RunOk {
     filter_builder: FilterBuilderCheck,
     sessions_view: SessionsViewCheck,
     importer_switch: ImporterSwitchCheck,
+    layout_regimes: Option<LayoutRegimesCheck>,
 }
 
 fn chromium_args() -> Vec<&'static str> {
@@ -735,6 +807,10 @@ async fn drive_page(
     // runs sequentially at the end.
     let switch_origin = args.base_url.trim_end_matches('/').to_string();
     let switch_setup = tokio::spawn(async move { setup_switch_fixture(&switch_origin).await });
+    let molecule_setup = {
+        let origin = args.base_url.trim_end_matches('/').to_string();
+        tokio::spawn(async move { setup_molecule_fixture(&origin).await })
+    };
 
     // ---- 4. graph header actions are present, visible, and safe ----------
     // Wait for graph data to finish loading: the boot log is emitted before
@@ -1241,6 +1317,26 @@ async fn drive_page(
         };
         let keyboardContract = maximized;
         keyboardContract &&= await keyboardStep('Connection', 'ArrowRight', 'Layout');
+        // Vault-side regime contract (main fixture is an untyped vault):
+        // the Layout tab must keep the live spring_len slider + presets
+        // row and carry the resolved regime line.
+        const layoutTab = tabs.find(
+          (candidate) => (candidate.textContent || '').trim() === 'Layout'
+        );
+        layoutTab?.click();
+        const layoutPanel = await waitFor(() => {
+          const tabpanel = panel?.querySelector('[role="tabpanel"]');
+          return layoutTab?.getAttribute('aria-selected') === 'true' &&
+            tabpanel?.querySelector('.lay') && tabpanel;
+        });
+        const layRoot = layoutPanel?.querySelector('.lay') || null;
+        const layoutRegimeLine = layRoot?.querySelector('[data-regime-id]') || null;
+        const layoutVaultRegime = Boolean(layoutRegimeLine);
+        const layoutSpringLenLive = Boolean(
+          layRoot?.querySelector('[data-slider="spring_len"]')
+        );
+        const layoutPresetsPresent = Boolean(layRoot?.querySelector('.lay-presets'));
+
         keyboardContract &&= await keyboardStep('Layout', 'End', 'Camera');
         keyboardContract &&= await keyboardStep('Camera', 'Home', 'Connection');
         keyboardContract &&= await keyboardStep('Connection', 'ArrowLeft', 'Camera');
@@ -1275,6 +1371,9 @@ async fn drive_page(
         if (!keyboardContract) failures.push('Settings tab keyboard navigation is invalid');
         if (!controlsHitTest) failures.push('Settings tabs are obscured from pointer input');
         if (contentPanels.length !== expected.length) failures.push('a Settings tab has no delegated content');
+        if (!layoutVaultRegime) failures.push('Layout tab missing the resolved regime line');
+        if (!layoutSpringLenLive) failures.push('vault graph lost the live spring_len slider');
+        if (!layoutPresetsPresent) failures.push('vault graph lost the presets row');
         if (!legacyPanelsAbsent) failures.push('legacy Layout, Style, or Camera panel still exists');
         if (!graphRestored) failures.push('Graph renderer did not remount after Settings restore');
         return {
@@ -1284,6 +1383,9 @@ async fn drive_page(
           aria_contract: Boolean(ariaContract),
           keyboard_contract: Boolean(keyboardContract),
           controls_hit_test: Boolean(controlsHitTest),
+          layout_vault_regime: layoutVaultRegime,
+          layout_spring_len_live: layoutSpringLenLive,
+          layout_presets_present: layoutPresetsPresent,
           legacy_panels_absent: legacyPanelsAbsent,
           graph_restored: graphRestored,
           reason: failures.length ? failures.join('; ') : null,
@@ -2552,6 +2654,25 @@ async fn drive_page(
         Err(error) => ImporterSwitchCheck::failed(format!("switch fixture task: {error}")),
     };
 
+    // ---- 13. capability-honest layout regimes (caffeine molecule) --------
+    // Spec §8 phase 1: no `?config=` — the resolver alone must boot the
+    // molecule into `molecular-uff` and the three measured lies must be
+    // gone (dead spring_len slider, false banner, poisoned presets).
+    let layout_regimes = match molecule_setup.await {
+        Ok(Ok(Some(fixture))) => {
+            Some(run_layout_regimes_scenario(browser, &fixture, console_logs.clone()).await)
+        }
+        Ok(Ok(None)) => Some(LayoutRegimesCheck::skipped(
+            "graph-api binary or SDF fixture unavailable; scenario skipped".to_string(),
+        )),
+        Ok(Err(error)) => Some(LayoutRegimesCheck::failed(format!(
+            "molecule fixture setup: {error:#}"
+        ))),
+        Err(error) => Some(LayoutRegimesCheck::failed(format!(
+            "molecule fixture task: {error}"
+        ))),
+    };
+
     // Tear down pumps (browser close in caller will end them anyway).
     console_pump.abort();
     runtime_pump.abort();
@@ -2572,6 +2693,7 @@ async fn drive_page(
         filter_builder,
         sessions_view,
         importer_switch,
+        layout_regimes,
     })
 }
 
@@ -2961,6 +3083,302 @@ async fn setup_switch_fixture(origin: &str) -> Result<Option<SwitchFixture>> {
         server,
         work_dir,
     }))
+}
+
+// --- layout-regime (molecular) fixture -----------------------------------------
+
+/// The caffeine molecule's importer package + input, served from the repo's
+/// chart payload directory. Located via env override, then the compile-time
+/// manifest dir (the nix build unions `charts/jump-cannon/packages` into the
+/// crate source root).
+fn packages_dir() -> Option<PathBuf> {
+    if let Some(explicit) = std::env::var_os("JUMP_CANNON_PACKAGES_DIR") {
+        let path = PathBuf::from(explicit);
+        if path.is_dir() {
+            return Some(path);
+        }
+    }
+    let candidate = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../charts/jump-cannon/packages");
+    candidate.is_dir().then_some(candidate)
+}
+
+struct MoleculeFixture {
+    base_url: String,
+    #[allow(dead_code)] // kill_on_drop reaps the server when dropped
+    server: tokio::process::Child,
+    #[allow(dead_code)]
+    work_dir: PathBuf,
+}
+
+/// Serve the caffeine molecule (24 atoms / 25 UFF-typed bonds, authored 2D
+/// depiction) through the SDF pest package, with the mirrored app dist.
+async fn setup_molecule_fixture(origin: &str) -> Result<Option<MoleculeFixture>> {
+    let Some(bin) = find_graph_api_bin() else {
+        return Ok(None);
+    };
+    let Some(packages) = packages_dir() else {
+        tracing::warn!(
+            "[layout-regimes] charts/jump-cannon/packages not found — \
+             molecular scenario skipped"
+        );
+        return Ok(None);
+    };
+    let manifest = packages.join("sdf.toml");
+    let input = packages.join("examples/sdf-caffeine.txt");
+    if !manifest.is_file() || !input.is_file() {
+        tracing::warn!(
+            "[layout-regimes] SDF fixture files missing ({}, {}) — scenario skipped",
+            manifest.display(),
+            input.display()
+        );
+        return Ok(None);
+    }
+
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let work_dir = std::env::temp_dir()
+        .join(format!("jump-cannon-molecule-{}-{unique}", std::process::id()));
+    let assets = work_dir.join("assets");
+    let vault = work_dir.join("vault");
+    tokio::fs::create_dir_all(&assets).await?;
+    tokio::fs::create_dir_all(&vault).await?;
+    let mirrored = mirror_dist(origin, &assets).await.context("mirror app dist")?;
+    if mirrored == 0 {
+        bail!("mirrored no assets from {origin}");
+    }
+
+    let port = pick_free_port().await?;
+    let server = tokio::process::Command::new(bin)
+        .arg("--vault-root")
+        .arg(&vault)
+        .arg("--port")
+        .arg(port.to_string())
+        .arg("--no-browser")
+        .arg("--assets-dir")
+        .arg(&assets)
+        .arg("--source")
+        .arg("pest")
+        .arg("--importer-manifest")
+        .arg(&manifest)
+        .arg("--importer-input")
+        .arg(&input)
+        .env("GRAPH_API_NO_WATCH", "true")
+        // The wrapper exports an Obsidian-selected deployment catalog for
+        // the main fixture; graph-api rejects it against an activated Pest
+        // source ("selected importer source … has kind Obsidian, but
+        // graph-api activated Pest"), so this child starts without it.
+        .env_remove("JUMP_CANNON_IMPORTER_CATALOG_JSON")
+        .env_remove("JUMP_CANNON_SOURCE")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        // Keep the child's diagnostics: a deployment-config rejection exits
+        // before the listener binds, and "connection refused" alone hides
+        // the reason.
+        .stderr(std::process::Stdio::from(
+            std::fs::File::create(work_dir.join("server.log")).context("server log")?,
+        ))
+        .kill_on_drop(true)
+        .spawn()
+        .context("spawn molecule fixture graph-api")?;
+    let base_url = format!("http://127.0.0.1:{port}");
+    if let Err(error) = probe_server(&format!("{base_url}/"), Duration::from_secs(30)).await {
+        let log = tokio::fs::read_to_string(work_dir.join("server.log"))
+            .await
+            .unwrap_or_default();
+        let said = tail(&log.lines().map(str::to_string).collect::<Vec<_>>(), 8).join(" | ");
+        tracing::warn!("[layout-regimes] molecule fixture failed: {error:#}; graph-api said: {said}");
+        bail!("{error:#}; graph-api said: {said}");
+    }
+    tracing::info!("[layout-regimes] molecule fixture ready at {base_url}");
+    Ok(Some(MoleculeFixture {
+        base_url,
+        server,
+        work_dir,
+    }))
+}
+
+/// The Settings ▸ Layout surface on the molecule page: open the panel from
+/// the dock, select the Layout tab, and snapshot every phase-1 acceptance
+/// hook (spec §8: capsule, no spring_len input, presets hidden, banner
+/// gone, regime booted without `?config=`).
+const MOLECULE_LAYOUT_JS: &str = r#"(async () => {
+    const waitFor = async (predicate, timeoutMs = 30000) => {
+      const deadline = performance.now() + timeoutMs;
+      while (performance.now() < deadline) {
+        const value = predicate();
+        if (value) return value;
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
+      return null;
+    };
+    const canvas = await waitFor(() => {
+      const c = document.querySelector('section.panel-graph canvas.graph-canvas');
+      return c?.dataset.renderReady === 'true' &&
+        Number(c?.dataset.nodeCount || 0) === 24 && c;
+    });
+    const panel = await waitFor(() => {
+      const existing = document.querySelector('section.panel-settings');
+      if (existing) return existing;
+      const chip = [...document.querySelectorAll('.dock-chip')]
+        .find((candidate) => (candidate.textContent || '').trim() === 'Settings');
+      chip?.click();
+      return null;
+    });
+    const lay = await waitFor(() => {
+      const tabs = [...(panel?.querySelectorAll('[role="tab"]') || [])];
+      const tab = tabs.find((t) => (t.textContent || '').trim() === 'Layout');
+      tab?.click();
+      const tabpanel = panel?.querySelector('[role="tabpanel"]');
+      return tab?.getAttribute('aria-selected') === 'true' &&
+        tabpanel?.querySelector('.lay') && tabpanel;
+    });
+    if (!canvas || !panel || !lay) return { error: 'layout surface missing' };
+    const root = lay.querySelector('.lay');
+    const regime = root?.querySelector('[data-regime-id]') || null;
+    const capsule = root?.querySelector('[data-lay-state="typed-rests"]') || null;
+    const banner = [...(root?.querySelectorAll('.lay-hint') || [])].some(
+      (hint) => (hint.textContent || '').includes('scale on top of')
+    );
+    let settings = null;
+    try {
+      const raw = localStorage.getItem('jc_layout_v1');
+      settings = raw ? JSON.parse(raw).settings?.['gpu-force'] : null;
+    } catch { settings = null; }
+    return {
+      regime_id: regime?.getAttribute('data-regime-id') || null,
+      regime_text: (regime?.textContent || '').trim(),
+      capsule_text: (capsule?.textContent || '').trim(),
+      spring_len_present: Boolean(root?.querySelector('[data-slider="spring_len"]')),
+      presets_present: Boolean(root?.querySelector('.lay-presets')),
+      banner_present: banner,
+      seed_mode: settings?.seed_mode ?? null,
+      spring_len_value: typeof settings?.spring_len === 'number' ? settings.spring_len : null,
+      repulsion_value: typeof settings?.repulsion === 'number' ? settings.repulsion : null,
+    };
+})()"#;
+
+/// Drive the molecular-regime contract against the caffeine fixture.
+async fn run_layout_regimes_scenario(
+    browser: &Browser,
+    fixture: &MoleculeFixture,
+    console_logs: Arc<Mutex<Vec<String>>>,
+) -> LayoutRegimesCheck {
+    let mut check = LayoutRegimesCheck::default();
+    let result: Result<serde_json::Value> = (|| async {
+        let page = open_switch_page(browser, &fixture.base_url, false)
+            .await
+            .context("molecule page")?;
+        // Feed the page's console into the shared error gate — the happy
+        // path must stay clean.
+        let mut page_logs = page
+            .event_listener::<chromiumoxide::cdp::browser_protocol::log::EventEntryAdded>()
+            .await
+            .context("listen molecule page log entries")?;
+        let logs_a = console_logs.clone();
+        let log_pump = tokio::spawn(async move {
+            while let Some(ev) = page_logs.next().await {
+                logs_a.lock().await.push(format!("[{}] {}", ev.entry.level.as_ref(), ev.entry.text));
+            }
+        });
+        let mut page_exceptions = page
+            .event_listener::<chromiumoxide::cdp::js_protocol::runtime::EventExceptionThrown>()
+            .await
+            .context("listen molecule page exceptions")?;
+        let logs_b = console_logs.clone();
+        let exception_pump = tokio::spawn(async move {
+            while let Some(ev) = page_exceptions.next().await {
+                let details = &ev.exception_details;
+                let line = format!("[exception] {}", details.text);
+                logs_b.lock().await.push(line);
+            }
+        });
+
+        // Boot log gate: same readiness needle as the main page.
+        let boot = {
+            let deadline = Instant::now() + Duration::from_secs(30);
+            loop {
+                if console_logs.lock().await.iter().any(|l| l.contains(BOOT_LOG_NEEDLE)) {
+                    break true;
+                }
+                if Instant::now() > deadline {
+                    break false;
+                }
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+        };
+        if !boot {
+            bail!("molecule page boot log not observed");
+        }
+
+        let view: serde_json::Value = evaluate_retry(&page, MOLECULE_LAYOUT_JS, 5).await?;
+        let png = page
+            .screenshot(CaptureScreenshotParams::builder().build())
+            .await
+            .context("molecule screenshot")?;
+        let bytes = if png.first() == Some(&0x89) {
+            png
+        } else {
+            base64::engine::general_purpose::STANDARD.decode(&png).unwrap_or(png)
+        };
+        let _ = tokio::fs::write("target/test-browser-rust/layout-molecular.png", bytes).await;
+        page.close().await.ok();
+        log_pump.abort();
+        exception_pump.abort();
+        Ok(view)
+    })()
+    .await;
+
+    match result {
+        Err(error) => {
+            check.ok = false;
+            check.reason = Some(format!("molecule scenario errored: {error:#}"));
+        }
+        Ok(view) => {
+            if view.get("error").is_some() {
+                check.ok = false;
+                check.reason = Some("layout surface did not mount on the molecule page".into());
+                return check;
+            }
+            let text = |key: &str| view.get(key).and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let regime_id = text("regime_id");
+            let regime_text = text("regime_text");
+            let capsule_text = text("capsule_text");
+            check.regime_booted = regime_id == "molecular-uff"
+                && regime_text.contains("Molecular · UFF")
+                && regime_text.contains("25 bonds UFF-typed");
+            check.capsule_present = capsule_text.contains("25/25 rests from UFF");
+            check.spring_len_absent =
+                !view.get("spring_len_present").and_then(|v| v.as_bool()).unwrap_or(true);
+            check.presets_hidden =
+                !view.get("presets_present").and_then(|v| v.as_bool()).unwrap_or(true);
+            check.banner_absent =
+                !view.get("banner_present").and_then(|v| v.as_bool()).unwrap_or(true);
+            let seed_mode = text("seed_mode");
+            let spring_len = view.get("spring_len_value").and_then(|v| v.as_f64());
+            check.settings_applied = seed_mode == "none"
+                && spring_len.is_some_and(|v| (1.0..=2.0).contains(&v));
+            check.ok = check.regime_booted
+                && check.capsule_present
+                && check.spring_len_absent
+                && check.presets_hidden
+                && check.banner_absent
+                && check.settings_applied;
+            if !check.ok {
+                check.reason = Some(format!(
+                    "regime={regime_id:?} capsule={capsule_text:?} \
+                     spring_len_absent={} presets_hidden={} banner_absent={} \
+                     settings_applied={} (seed_mode={seed_mode:?}, spring_len={spring_len:?})",
+                    check.spring_len_absent,
+                    check.presets_hidden,
+                    check.banner_absent,
+                    check.settings_applied
+                ));
+            }
+        }
+    }
+    check
 }
 
 /// Importers panel snapshot: open the panel from the dock, list the server

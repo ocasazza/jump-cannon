@@ -348,6 +348,19 @@ textarea.md:focus { outline:none; border-color:var(--fg); }
 .lay-health.ok { color:#3fb950; }
 .lay-health.bad { color:#d29922; }
 .lay-presets { display:flex; flex-wrap:wrap; gap:.35rem; }
+/* regime line + data-owned capsule (panels/regimes.rs) */
+.lay-regime { display:flex; align-items:baseline; gap:.5rem; flex-wrap:wrap; }
+.lay-regime-label { color:var(--fg); font-weight:600; font-size:11.5px; letter-spacing:.02em; }
+.lay-regime-reason { color:var(--dim); font-size:.68rem; font-family:var(--mono); }
+.lay-capsule { border:1px solid var(--line2); border-left:3px solid #3fb950; border-radius:4px;
+  padding:.25rem .5rem; background:var(--bg); }
+.lay-capsule summary { cursor:pointer; color:var(--fg); font-size:.72rem; font-family:var(--mono);
+  display:flex; align-items:baseline; justify-content:space-between; gap:.5rem;
+  list-style:none; }
+.lay-capsule summary::-webkit-details-marker { display:none; }
+.lay-capsule-override { color:#3fb950; font-size:.68rem; }
+.lay-capsule-note { color:var(--dim); font-size:.65rem; line-height:1.5; margin-top:.25rem;
+  border-top:1px dashed var(--line); padding-top:.25rem; }
 .lay-check { display:flex; align-items:center; gap:.35rem; color:var(--fg); }
 .lay-seed-src { width:100%; min-height:10em; background:var(--bg); color:var(--fg);
   border:1px solid var(--line2); border-radius:3px; font-family:var(--mono); font-size:11px;

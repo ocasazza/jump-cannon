@@ -625,7 +625,9 @@ impl GraphPipelines {
         );
         let layout: Option<Box<dyn DynPhysicsLayout>> = {
             let mut boxed: Box<dyn DynPhysicsLayout> = Box::new(BoxedPhysics::new(
-                GpuForceLayout::new(GpuForceOptions::default()),
+                GpuForceLayout::new(crate::panels::layout::boot_gpu_force_options(
+                    graph.positions.len() / 3,
+                )),
             ));
             match boxed.init_with_device(device, queue, &layout_graph, &positions) {
                 Ok(()) => Some(boxed),
@@ -1976,6 +1978,16 @@ impl RenderHost {
         canvas: web_sys::HtmlCanvasElement,
         graph: GraphData,
     ) -> Result<Self, String> {
+        // The browser WebGPU surface target (`SurfaceTarget::Canvas`) only
+        // exists on wasm32 builds. A host compile of this crate exists to
+        // run its unit tests, which never mount a renderer.
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let _ = (&canvas, &graph);
+            return Err("RenderHost requires a browser WebGPU context".to_string());
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
             backends: wgpu::Backends::BROWSER_WEBGPU,
             ..Default::default()
@@ -2061,6 +2073,7 @@ impl RenderHost {
             config,
             pipes,
         })
+        }
     }
 
     /// True while the canvas this host was built against is still in the

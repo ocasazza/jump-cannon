@@ -135,7 +135,15 @@ pub async fn load() -> Result<GraphData, String> {
         }
     };
 
-    let spring_len = crate::panels::layout::active_spring_len(n);
+    // Data-owned anchor (spec E1): when the graph carries UFF rests, the
+    // authored-coordinate rescale anchors at their mean — the same value
+    // the regime resolver fills a data-owned `spring_len` with — instead
+    // of a vault-tuned global slider value.
+    let spring_len = typed
+        .edge_rest
+        .as_deref()
+        .and_then(crate::panels::regimes::mean_typed_rest)
+        .unwrap_or_else(|| crate::panels::layout::active_spring_len(n));
     let positions = if init.positions_authored {
         // Importer-authored coordinates (e.g. an SDF 2D depiction): the
         // structure is the layout. Seed from them — centered and rescaled so
@@ -180,7 +188,7 @@ pub async fn load() -> Result<GraphData, String> {
         .map(|(i, id)| (id.clone(), i as u32))
         .collect();
 
-    Ok(GraphData {
+    let data = GraphData {
         graph_revision: (revision != 0).then_some(revision),
         n_nodes: init.n_nodes,
         n_edges: init.n_edges,
@@ -196,13 +204,19 @@ pub async fn load() -> Result<GraphData, String> {
             edge_rest: typed.edge_rest,
             node_repulsion: typed.node_repulsion,
         },
-    })
+    };
+    // Resolve the layout regime (and auto-apply molecular options) before
+    // the graph commits — the canvas mount then boots the host from the
+    // regime's persisted settings (see render::mount_canvas).
+    crate::panels::regimes::on_graph_loaded(&data);
+    Ok(data)
 }
 
 /// Summary of the typed (molecular) force parameters the last graph load
-/// resolved — `(typed nodes, typed edges)`. Surfaced by the Settings ▸
-/// Layout tab so the global sliders read as what they are: overall scale
-/// on top of per-atom/per-bond UFF values. `None` = feature inactive.
+/// resolved — `(typed nodes, typed edges)`. Feeds the layout regime
+/// resolver's `typed_bond_coverage` predicate (panels/regimes.rs, spec M4:
+/// coverage = typed_edges / edge_count) and the Layout panel's provenance
+/// rows. `None` = feature inactive.
 pub(crate) static TYPED_FORCE_SUMMARY: GlobalSignal<Option<(usize, usize)>> =
     Signal::global(|| None);
 
@@ -211,7 +225,6 @@ pub(crate) static TYPED_FORCE_SUMMARY: GlobalSignal<Option<(usize, usize)>> =
 /// least one item resolves — untyped graphs skip the feature entirely
 /// and keep the global spring length / Coulomb strength. A `0.0` entry
 /// means "no typed value for this item" (unknown kind, unknown element,
-/// missing table entry).
 struct TypedForceParams {
     edge_rest: Option<Vec<f32>>,
     node_repulsion: Option<Vec<f32>>,
@@ -401,7 +414,7 @@ pub(crate) fn graph_data_from_snapshot(snapshot: &graph_vcs::Snapshot) -> GraphD
     let sizes = render::data::sizes_from_metric("pagerank", &metrics, n, 0.5);
     let num_wcc = crate::panels::generate::wcc_count(n, &edges);
 
-    GraphData {
+    let data = GraphData {
         graph_revision: None,
         n_nodes: n as u32,
         n_edges,
@@ -417,7 +430,10 @@ pub(crate) fn graph_data_from_snapshot(snapshot: &graph_vcs::Snapshot) -> GraphD
             edge_rest: None,
             node_repulsion: None,
         },
-    }
+    };
+    // Untyped graph → catch-all regime (restores any displaced settings).
+    crate::panels::regimes::on_graph_loaded(&data);
+    data
 }
 /// Convert a [`vault_data::VaultGraph`] into [`GraphData`], mirroring
 /// [`graph_data_from_snapshot`] for the github-import panel's browser-only
@@ -487,11 +503,14 @@ pub(crate) fn graph_data_from_vault(graph: &vault_data::VaultGraph) -> GraphData
     let node_repulsion = any_weight.then_some(node_repulsion);
     let edge_rest = any_rest.then_some(edge_rest);
     let n_edges = (edges.len() / 2) as u32;
-
-    // No stored positions — seed from sphere + warmup, same as the snapshot path.
+    // No stored positions — seed from sphere + warmup, same as the snapshot
+    // path. Typed graphs anchor the warmup at the mean UFF rest (spec E1).
     let mut positions = render::data::spawn_on_unit_sphere(n, 800.0);
     if n <= 10_000 {
-        let spring_len = crate::panels::layout::active_spring_len(n);
+        let spring_len = edge_rest
+            .as_deref()
+            .and_then(crate::panels::regimes::mean_typed_rest)
+            .unwrap_or_else(|| crate::panels::layout::active_spring_len(n));
         let warmed = graph_layouts::warmup_positions(n, &edges, spring_len, 0xC0A75E);
         if warmed.len() == positions.len() {
             positions = warmed;
@@ -503,7 +522,7 @@ pub(crate) fn graph_data_from_vault(graph: &vault_data::VaultGraph) -> GraphData
     let sizes = render::data::sizes_from_metric("pagerank", &metrics, n, 0.5);
     let num_wcc = crate::panels::generate::wcc_count(n, &edges);
 
-    GraphData {
+    let data = GraphData {
         graph_revision: None,
         n_nodes: n as u32,
         n_edges,
@@ -519,7 +538,9 @@ pub(crate) fn graph_data_from_vault(graph: &vault_data::VaultGraph) -> GraphData
             edge_rest,
             node_repulsion,
         },
-    }
+    };
+    crate::panels::regimes::on_graph_loaded(&data);
+    data
 }
 
 /// In-flight pointer drag (camera rotate). A press that never travels

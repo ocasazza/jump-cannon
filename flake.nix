@@ -71,6 +71,10 @@
             # build that compiles tvix-wasm natively (e.g. the graph-compute
             # gpu tests' Nix-fixture corpus) fails to compile.
             (pkgs.lib.fileset.fileFilter (file: builtins.any file.hasExt [ "rs" "toml" "lock" "md" "html" "scss" "js" "ts" "json" "png" "ico" "sh" "csv" "proto" "wgsl" "nix" ]) ./.)
+            # charts/jump-cannon/packages ships the importer-package fixtures
+            # (sdf.toml + examples/sdf-caffeine.txt) the browser suite's
+            # molecular-regime scenario spawns graph-api against at runtime.
+            ./charts/jump-cannon/packages
           ];
         };
 
@@ -210,6 +214,10 @@
             # racing on the same listener. TEST_PORT remains an explicit
             # deterministic override for callers that need one.
             PORT="''${TEST_PORT:-$((40000 + $$ % 20000))}"
+            # Importer-package fixtures (SDF caffeine molecule) for the
+            # browser suite's molecular-regime scenario — same store-path
+            # pattern as the knowledge-corpus seed below.
+            export JUMP_CANNON_PACKAGES_DIR="${./charts/jump-cannon/packages}"
             OUT_DIR="''${OUT_DIR:-$REPO_ROOT/target/test-browser-rust}"
             RUN_ROOT=$(mktemp -d "''${TMPDIR:-/tmp}/jump-cannon-browser.XXXXXX")
             RUN_OUT="$RUN_ROOT/out"
@@ -1237,7 +1245,7 @@
             # wgsl: the ported renderer embeds its node/edge shaders via
             # include_str! (app/ui/src/shaders/).
             (pkgs.lib.fileset.fileFilter
-              (file: builtins.any file.hasExt [ "rs" "toml" "lock" "html" "css" "wgsl" ])
+              (file: builtins.any file.hasExt [ "rs" "toml" "lock" "html" "css" "wgsl" "yaml" ])
               ./app)
             # Vendored third-party assets (Monaco editor bundle, fonts, notices)
             # ride along unfiltered — the extension allowlist above would drop

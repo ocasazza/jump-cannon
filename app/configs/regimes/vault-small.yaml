@@ -1,0 +1,13 @@
+# Vault catch-all regime — every graph that is not UFF-typed resolves here
+# (R4: resolution never fails). The base is the engine's n-tuned defaults
+# (`GpuForceOptions::for_n_nodes`), so `options` declares no overrides; the
+# Fast/Balanced/Pretty presets (phase 2: YAML regimes) and the user's
+# persisted tuning apply on top exactly as before this registry existed.
+id: vault-small
+schema_version: 1
+label: "Vault · untyped"
+description: "Catch-all: global spring length governs every edge."
+engine: gpu-force
+execution: live
+applicability: {}
+options: {}

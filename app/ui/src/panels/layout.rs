@@ -680,6 +680,52 @@ fn edit<T: Serialize + DeserializeOwned + Default>(id: &str, f: impl FnOnce(&mut
     save_settings(id, &s);
 }
 
+// --- regime seam (panels/regimes.rs) --------------------------------------------
+//
+// The resolver owns *when* regime settings apply; this module owns *how*
+// they land (persist + GPU push through the same path as manual edits).
+
+/// Current persisted gpu-force settings block, or `None` when the engine
+/// has no settings yet (first boot — `for_n_nodes` fill applies).
+pub(crate) fn gpu_force_settings_snapshot() -> Option<Value> {
+    STATE.peek().settings.get("gpu-force").cloned()
+}
+
+/// Install a resolved regime's options as the gpu-force settings block.
+pub(crate) fn install_gpu_force_regime_options(options: Value) {
+    put_settings("gpu-force", options);
+}
+
+/// Restore the settings block displaced by a regime auto-apply. `None`
+/// drops the block so the next apply re-tunes from `for_n_nodes`.
+pub(crate) fn restore_gpu_force_settings(stash: Option<Value>) {
+    match stash {
+        Some(v) => put_settings("gpu-force", v),
+        None => {
+            let mut st = STATE.read().clone();
+            if st.settings.remove("gpu-force").is_some() {
+                persist(&st);
+                *STATE.write() = st;
+                apply_engine(false);
+            }
+        }
+    }
+}
+
+/// gpu-force options the render host should boot with (canvas mount): the
+/// persisted settings when present (a resolved regime writes them during
+/// graph load, before any canvas exists), else the engine's n-tuned
+/// defaults. Booting from persisted settings keeps `seed_mode: none`
+/// regimes from having their authored positions re-seeded by the struct
+/// default's `Random` seed on the host's first init (spec E3).
+pub(crate) fn boot_gpu_force_options(n_nodes: usize) -> GpuForceOptions {
+    load_state()
+        .settings
+        .get("gpu-force")
+        .and_then(|v| serde_json::from_value(v.clone()).ok())
+        .unwrap_or_else(|| GpuForceOptions::for_n_nodes(n_nodes))
+}
+
 fn set_active(id: &str) {
     let mut st = STATE.read().clone();
     st.active = id.to_string();
@@ -2005,9 +2051,6 @@ pub(crate) fn seed_positions_for_generated(n: usize) -> Vec<f32> {
 fn fmt_f(v: f64) -> String {
     format!("{}", v as f32)
 }
-
-/// Slider row: range input (optionally log-mapped, like egui's
-/// `.logarithmic(true)`) + a number box for direct entry.
 #[component]
 fn Slider(
     label: String,
@@ -2030,7 +2073,7 @@ fn Slider(
         (min, max, ((max - min) / 1000.0).max(1e-6))
     };
     rsx! {
-        div { class: "lay-row", title: title.unwrap_or_default(),
+        div { class: "lay-row", "data-slider": "{label}", title: title.unwrap_or_default(),
             span { class: "lay-k", "{label}" }
             input {
                 r#type: "range",
@@ -3584,29 +3627,100 @@ fn gpu_force_ui() -> Element {
     let active_preset = LayoutPreset::detect(&opts).unwrap_or_default();
     let repulsion_mode = opts.repulsion_mode;
 
+    // Regime resolution (panels/regimes.rs): None only before the first
+    // graph load — render the status-quo (vault) shape until then.
+    let res = crate::panels::regimes::RESOLUTION.read().clone();
+    let (regime_id, regime_label, reason, typed_nodes, typed_edges, n_nodes, n_edges) =
+        match &res {
+            Some(r) => (
+                r.regime_id.clone(),
+                r.label.clone(),
+                r.reason.clone(),
+                r.typed_nodes,
+                r.typed_edges,
+                r.n_nodes,
+                r.n_edges,
+            ),
+            None => (
+                "unresolved".to_string(),
+                "Resolving…".to_string(),
+                String::new(),
+                0,
+                0,
+                0,
+                0,
+            ),
+        };
+    let presets_hidden = res.as_ref().is_some_and(|r| r.presets_hidden);
+    let manifest = crate::panels::regimes::gpu_force_manifest();
+    // M1/M3: controls exist only when manifest ∧ live graph state agree —
+    // the dead-knob rule is structural, not a hand-tuned if per slider.
+    // E1/M2: at full typed coverage the UFF bond table owns every rest —
+    // spring_len is inert, so no slider may exist for it (on any surface).
+    let spring_len_owned = manifest
+        .iter()
+        .find(|d| d.id == "spring_len")
+        .is_some_and(|d| crate::panels::regimes::dim_owned_by_data(d, typed_edges, n_edges));
+    let untyped_edges = n_edges.saturating_sub(typed_edges);
+    // Manifest gate: the repulsion backend is a large-graph concern.
+    let backend_available = manifest
+        .iter()
+        .find(|d| d.id == "repulsion_mode")
+        .and_then(|d| d.min_nodes)
+        .is_some_and(|min| n_nodes >= min as usize);
+
     rsx! {
-        // Reset lives in the top-row ↺ (resets the active engine); no
-        // per-engine duplicate here.
-        div { class: "lay-sub", "Preset" }
-        div { class: "lay-presets",
-            for preset in LayoutPreset::ALL {
-                button {
-                    key: "{preset.label()}",
-                    class: if preset == active_preset { "lay-btn active" } else { "lay-btn" },
-                    onclick: move |_| edit::<GpuForceOptions>("gpu-force", |o| preset.apply_to(o)),
-                    {preset.label()}
-                }
+        // Regime line (UI2): the resolved regime and the predicate that
+        // decided the match — the panel's answer to "which source of
+        // truth is in effect".
+        div { class: "lay-regime", "data-regime-id": "{regime_id}",
+            span { class: "lay-regime-label", "{regime_label}" }
+            if !reason.is_empty() {
+                span { class: "lay-regime-reason", "auto: {reason}" }
             }
         }
 
-        // Molecular mode: when the loaded graph carries element/bond
-        // typing, per-atom UFF repulsion weights and per-bond UFF rest
-        // lengths are baked into the GPU buffers and the sliders act as
-        // overall scale on top of them (not per-edge/per-node values).
-        if let Some((typed_nodes, typed_edges)) = *crate::graph_canvas::TYPED_FORCE_SUMMARY.read() {
-            div { class: "lay-hint",
-                "Molecular parameters active: {typed_nodes} per-atom UFF repulsion weights, \
-                 {typed_edges} per-bond UFF lengths — the sliders below scale on top of them."
+        if spring_len_owned {
+            // M2 collapsed-data capsule: the data owns this dimension —
+            // never a disabled control, never a live knob. The override
+            // affordance expands the honest provenance instead of opening
+            // a slider: the engine has no global scale for typed rests
+            // (E1), and per-bond overrides are backlog engine work.
+            details { class: "lay-capsule", "data-lay-state": "typed-rests",
+                summary {
+                    "{typed_edges}/{n_edges} rests from UFF"
+                    span { class: "lay-capsule-override", "override ▸" }
+                }
+                div { class: "lay-capsule-note",
+                    "All {n_edges} bonds resolve from the UFF table. The engine applies \
+                     typed rests outright — the global spring length governs 0 edges here \
+                     and no control may scale typed rests. Per-bond overrides need an \
+                     engine change (backlog). {typed_nodes} atoms carry UFF repulsion \
+                     weights; the repulsion slider stays honest on them."
+                }
+            }
+        } else if typed_edges > 0 {
+            // Hybrid (UI5): partial coverage — name exactly what the
+            // global spring length still governs.
+            div { class: "lay-hint", "data-lay-state": "uff-partial",
+                "uff partial — spring len governs {untyped_edges} untyped edges; \
+                 {typed_edges} from UFF"
+            }
+        }
+
+        if !presets_hidden {
+            // Reset lives in the top-row ↺ (resets the active engine); no
+            // per-engine duplicate here.
+            div { class: "lay-sub", "Preset" }
+            div { class: "lay-presets",
+                for preset in LayoutPreset::ALL {
+                    button {
+                        key: "{preset.label()}",
+                        class: if preset == active_preset { "lay-btn active" } else { "lay-btn" },
+                        onclick: move |_| edit::<GpuForceOptions>("gpu-force", |o| preset.apply_to(o)),
+                        {preset.label()}
+                    }
+                }
             }
         }
 
@@ -3614,11 +3728,20 @@ fn gpu_force_ui() -> Element {
 
         div { class: "lay-sub", "Physics" }
         Slider { label: "repulsion", min: 0.1, max: 100_000.0, value: opts.repulsion as f64, log: true,
+            title: "Mixes with per-atom UFF weights via sqrt(wi*wj) on typed atoms",
             on: move |v: f64| edit::<GpuForceOptions>("gpu-force", |o| o.repulsion = v as f32) }
         Slider { label: "spring_k", min: 0.0001, max: 10.0, value: opts.spring_k as f64, log: true,
             on: move |v: f64| edit::<GpuForceOptions>("gpu-force", |o| o.spring_k = v as f32) }
-        Slider { label: "spring_len", min: 1.0, max: 10_000.0, value: opts.spring_len as f64, log: true,
-            on: move |v: f64| edit::<GpuForceOptions>("gpu-force", |o| o.spring_len = v as f32) }
+        if !spring_len_owned {
+            Slider { label: "spring_len", min: 1.0, max: 10_000.0, value: opts.spring_len as f64, log: true,
+                title: if typed_edges > 0 {
+                    format!("Global rest length — governs {untyped_edges} untyped edges \
+                             ({typed_edges} bonds take UFF rests)")
+                } else {
+                    "Global spring rest length — governs every edge".to_string()
+                },
+                on: move |v: f64| edit::<GpuForceOptions>("gpu-force", |o| o.spring_len = v as f32) }
+        }
         Slider { label: "gravity", min: 0.00001, max: 1.0, value: opts.gravity as f64, log: true,
             on: move |v: f64| edit::<GpuForceOptions>("gpu-force", |o| o.gravity = v as f32) }
         Slider { label: "damping", min: 0.0, max: 1.0, value: opts.damping as f64,
@@ -3646,36 +3769,38 @@ fn gpu_force_ui() -> Element {
         Slider { label: "energy halt", min: 0.0, max: 1.0, value: opts.energy_threshold as f64,
             on: move |v: f64| edit::<GpuForceOptions>("gpu-force", |o| o.energy_threshold = v as f32) }
 
-        hr { class: "lay-sep" }
+        if backend_available {
+            hr { class: "lay-sep" }
 
-        div { class: "lay-sub", "Repulsion backend" }
-        div { class: "lay-hint", "Grid: dense small; BH: clustered; NS: huge" }
-        div { class: "lay-row",
-            span { class: "lay-k", "mode" }
-            select {
-                class: "lay-select",
-                value: match repulsion_mode {
-                    RepulsionMode::Grid => "grid",
-                    RepulsionMode::BarnesHut => "bh",
-                    RepulsionMode::NegativeSampling => "ns",
-                },
-                onchange: move |e| edit::<GpuForceOptions>("gpu-force", |o| {
-                    o.repulsion_mode = match e.value().as_str() {
-                        "bh" => RepulsionMode::BarnesHut,
-                        "ns" => RepulsionMode::NegativeSampling,
-                        _ => RepulsionMode::Grid,
-                    };
-                }),
-                option { value: "grid", selected: repulsion_mode == RepulsionMode::Grid, "Grid (27-cell)" }
-                option { value: "bh", selected: repulsion_mode == RepulsionMode::BarnesHut, "Barnes-Hut" }
-                option { value: "ns", selected: repulsion_mode == RepulsionMode::NegativeSampling, "Negative sampling" }
+            div { class: "lay-sub", "Repulsion backend" }
+            div { class: "lay-hint", "Grid: dense small; BH: clustered; NS: huge" }
+            div { class: "lay-row",
+                span { class: "lay-k", "mode" }
+                select {
+                    class: "lay-select",
+                    value: match repulsion_mode {
+                        RepulsionMode::Grid => "grid",
+                        RepulsionMode::BarnesHut => "bh",
+                        RepulsionMode::NegativeSampling => "ns",
+                    },
+                    onchange: move |e| edit::<GpuForceOptions>("gpu-force", |o| {
+                        o.repulsion_mode = match e.value().as_str() {
+                            "bh" => RepulsionMode::BarnesHut,
+                            "ns" => RepulsionMode::NegativeSampling,
+                            _ => RepulsionMode::Grid,
+                        };
+                    }),
+                    option { value: "grid", selected: repulsion_mode == RepulsionMode::Grid, "Grid (27-cell)" }
+                    option { value: "bh", selected: repulsion_mode == RepulsionMode::BarnesHut, "Barnes-Hut" }
+                    option { value: "ns", selected: repulsion_mode == RepulsionMode::NegativeSampling, "Negative sampling" }
+                }
             }
-        }
-        if repulsion_mode == RepulsionMode::NegativeSampling {
-            Slider { label: "K samples", min: 1.0, max: 32.0, value: opts.repulsion_samples as f64,
-                on: move |v: f64| edit::<GpuForceOptions>("gpu-force", |o| {
-                    o.repulsion_samples = v.round().max(1.0) as u32;
-                }) }
+            if repulsion_mode == RepulsionMode::NegativeSampling {
+                Slider { label: "K samples", min: 1.0, max: 32.0, value: opts.repulsion_samples as f64,
+                    on: move |v: f64| edit::<GpuForceOptions>("gpu-force", |o| {
+                        o.repulsion_samples = v.round().max(1.0) as u32;
+                    }) }
+            }
         }
     }
 }
