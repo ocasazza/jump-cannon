@@ -157,8 +157,16 @@ pub fn router_with_host(host: SourceHost) -> Router {
         .with_state(host)
 }
 
-async fn asset_fallback(State(host): State<SourceHost>, uri: axum::http::Uri) -> impl IntoResponse {
-    asset_response(host.default_state(), uri.path().trim_start_matches('/'))
+async fn asset_fallback(
+    State(host): State<SourceHost>,
+    headers: HeaderMap,
+    uri: axum::http::Uri,
+) -> impl IntoResponse {
+    asset_response(
+        host.default_state(),
+        uri.path().trim_start_matches('/'),
+        &AssetRequest::from(&headers),
+    )
 }
 
 /// Return the sanitized deployment source catalog. The response always
@@ -1290,11 +1298,20 @@ async fn progress_poll(
     axum::Json(resp)
 }
 
-async fn index(State(host): State<SourceHost>) -> impl IntoResponse {
-    asset_response(host.default_state(), "index.html")
+async fn index(State(host): State<SourceHost>, headers: HeaderMap) -> impl IntoResponse {
+    asset_response(
+        host.default_state(),
+        "index.html",
+        &AssetRequest::from(&headers),
+    )
 }
 
-async fn asset(State(host): State<SourceHost>, Path(path): Path<String>) -> impl IntoResponse {
+async fn asset(
+    State(host): State<SourceHost>,
+    Path(path): Path<String>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    let request = AssetRequest::from(&headers);
     // Nested asset directories (e.g. the vendored Monaco bundle at
     // assets/vendor/) serve literally; bare names keep the legacy
     // egui-prefix convention of resolving at the dist root.
@@ -1302,10 +1319,10 @@ async fn asset(State(host): State<SourceHost>, Path(path): Path<String>) -> impl
     if let Some(dir) = &s.inner.assets_dir {
         let nested = dir.join("assets").join(&path);
         if nested.is_file() {
-            return asset_response(s, &format!("assets/{path}"));
+            return asset_response(s, &format!("assets/{path}"), &request);
         }
     }
-    asset_response(s, &path)
+    asset_response(s, &path, &request)
 }
 
 // --- App-state config presets -------------------------------------------------
@@ -1387,35 +1404,168 @@ async fn config_get(selection: SourceSelection, Path(name): Path<String>) -> imp
     }
 }
 
-/// Serve the frontend dist from disk (assets_dir): read every request —
-/// refresh browser to see JS/CSS/HTML edits without rebuild.
+/// One asset, compressed once and kept for reuse: the gzip bytes we put on
+/// the wire plus the validator a conditional request checks against.
 ///
-/// There is no embedded fallback anymore (the egui renderer's include_dir!()
-/// bundle was retired with that crate): the frontend dist is always served
-/// from `--assets-dir` / `JUMP_CANNON_ASSETS_DIR`; without it, assets 404.
-fn asset_response(s: &AppState, path: &str) -> axum::response::Response {
-    let mime = mime_for(path);
-    if let Some(dir) = &s.inner.assets_dir {
-        let full = dir.join(path);
-        match std::fs::read(&full) {
-            Ok(bytes) => {
-                let mut headers = HeaderMap::new();
-                headers.insert(header::CONTENT_TYPE, HeaderValue::from_str(mime).unwrap());
-                (StatusCode::OK, headers, bytes).into_response()
-            }
-            Err(_) => (
-                StatusCode::NOT_FOUND,
-                format!("not found: {}", full.display()),
-            )
-                .into_response(),
-        }
-    } else {
-        (
+/// The identity bytes are deliberately NOT retained — a client that refuses
+/// gzip is rare (every browser sends `Accept-Encoding`), and holding both
+/// copies of a 12 MB wasm bundle would triple the server's steady-state
+/// memory for no practical gain.
+struct CachedAsset {
+    /// Invalidation key: a rebuilt dist changes length, mtime, or (under
+    /// nix, where every store file is stamped at the epoch) the whole path.
+    len: u64,
+    mtime: Option<std::time::SystemTime>,
+    gzip: bytes::Bytes,
+    etag: String,
+}
+
+/// Compressed-asset cache keyed by absolute path. Process-global rather than
+/// per-`AppState`: the dist is one immutable directory per deployment, and a
+/// runtime source alternate serving a different `--assets-dir` keys on its
+/// own paths.
+static ASSET_CACHE: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, std::sync::Arc<CachedAsset>>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+/// Serve the frontend dist from disk (`assets_dir`).
+///
+/// The bundle is big — a release `jump-cannon-ui_bg.wasm` is ~12 MB — and it
+/// crosses a cluster proxy on every cold load. Shipping it raw made that one
+/// long HTTP/2 stream, which a proxy enforcing keepalive pings resets
+/// mid-body (`ERR_HTTP2_PING_FAILED`, then `WebAssembly compilation aborted:
+/// Response body loading was aborted`). Two things fix that here:
+///
+///   * **gzip** (~12 MB → ~4 MB on the real bundle), compressed once per
+///     file and cached, so the transfer is ~3× shorter,
+///   * **a validator** (`ETag` over the content + `If-None-Match` → 304), so
+///     a reload re-streams nothing at all.
+///
+/// `Cache-Control: no-cache` is deliberate: Trunk builds with
+/// `filehash = false`, so `jump-cannon-ui_bg.wasm` is a STABLE name across
+/// deployments. Caching it as immutable would pin a stale bundle in every
+/// browser; revalidating costs one 304.
+///
+/// There is no embedded fallback (the egui renderer's `include_dir!()`
+/// bundle was retired with that crate): without `--assets-dir` /
+/// `JUMP_CANNON_ASSETS_DIR`, assets 404.
+fn asset_response(s: &AppState, path: &str, request: &AssetRequest) -> axum::response::Response {
+    let Some(dir) = &s.inner.assets_dir else {
+        return (
             StatusCode::NOT_FOUND,
             "no assets dir configured (start with --assets-dir or JUMP_CANNON_ASSETS_DIR)",
         )
-            .into_response()
+            .into_response();
+    };
+    let full = dir.join(path);
+    match load_asset(&full, request) {
+        Ok(asset) => asset,
+        Err(_) => (
+            StatusCode::NOT_FOUND,
+            format!("not found: {}", full.display()),
+        )
+            .into_response(),
     }
+}
+
+/// Cache-aware asset load. Returns the gzip payload + validator; the caller
+/// decides what to send based on the request headers.
+fn cached_asset(full: &std::path::Path) -> std::io::Result<std::sync::Arc<CachedAsset>> {
+    let meta = std::fs::metadata(full)?;
+    let len = meta.len();
+    let mtime = meta.modified().ok();
+    if let Some(hit) = ASSET_CACHE
+        .lock()
+        .ok()
+        .and_then(|cache| cache.get(full).cloned())
+        .filter(|hit| hit.len == len && hit.mtime == mtime)
+    {
+        return Ok(hit);
+    }
+
+    let bytes = std::fs::read(full)?;
+    // Level 6: gzip -9 buys ~1% on wasm for several times the CPU, and this
+    // runs on the first request for a freshly built dist.
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::new(6));
+    std::io::Write::write_all(&mut encoder, &bytes)?;
+    let gzip = encoder.finish()?;
+    let etag = format!("\"{:016x}\"", content_tag(&bytes));
+    let asset = std::sync::Arc::new(CachedAsset {
+        len,
+        mtime,
+        gzip: bytes::Bytes::from(gzip),
+        etag,
+    });
+    if let Ok(mut cache) = ASSET_CACHE.lock() {
+        cache.insert(full.to_path_buf(), std::sync::Arc::clone(&asset));
+    }
+    Ok(asset)
+}
+
+/// Content hash for the `ETag`. Derived from the bytes, not the mtime: every
+/// file in a nix store path is stamped at the epoch, so an mtime-based
+/// validator would collide across rebuilds.
+fn content_tag(bytes: &[u8]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    bytes.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// What the request tells us about how the asset may be sent: whether the
+/// client accepts gzip, and which validator it already holds. Passed
+/// explicitly — a request-scoped fact smuggled through a thread-local is
+/// exactly how a future call site silently loses compression.
+#[derive(Clone, Debug, Default)]
+pub struct AssetRequest {
+    accepts_gzip: bool,
+    if_none_match: Option<String>,
+}
+
+impl From<&HeaderMap> for AssetRequest {
+    fn from(headers: &HeaderMap) -> Self {
+        Self {
+            accepts_gzip: headers
+                .get(header::ACCEPT_ENCODING)
+                .and_then(|v| v.to_str().ok())
+                .is_some_and(|v| v.split(',').any(|e| e.trim().starts_with("gzip"))),
+            if_none_match: headers
+                .get(header::IF_NONE_MATCH)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string),
+        }
+    }
+}
+
+fn load_asset(
+    full: &std::path::Path,
+    request: &AssetRequest,
+) -> std::io::Result<axum::response::Response> {
+    let asset = cached_asset(full)?;
+    let mime = mime_for(&full.to_string_lossy());
+
+    let mut headers = HeaderMap::new();
+    headers.insert(header::CONTENT_TYPE, HeaderValue::from_static(mime));
+    headers.insert(header::ETAG, HeaderValue::from_str(&asset.etag).unwrap());
+    headers.insert(header::VARY, HeaderValue::from_static("accept-encoding"));
+    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
+
+    // A browser that already holds this exact bundle re-streams nothing.
+    if request
+        .if_none_match
+        .as_deref()
+        .is_some_and(|candidates| candidates.split(',').any(|tag| tag.trim() == asset.etag))
+    {
+        return Ok((StatusCode::NOT_MODIFIED, headers).into_response());
+    }
+
+    if request.accepts_gzip {
+        headers.insert(header::CONTENT_ENCODING, HeaderValue::from_static("gzip"));
+        return Ok((StatusCode::OK, headers, asset.gzip.clone()).into_response());
+    }
+    // Identity fallback: re-read rather than hold a second copy in memory.
+    let bytes = std::fs::read(full)?;
+    Ok((StatusCode::OK, headers, bytes).into_response())
 }
 
 fn mime_for(path: &str) -> &'static str {

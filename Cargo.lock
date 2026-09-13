@@ -1738,6 +1738,7 @@ dependencies = [
  "clap",
  "data-loader",
  "dotenvy",
+ "flate2",
  "futures",
  "github-importer",
  "graph-compute",

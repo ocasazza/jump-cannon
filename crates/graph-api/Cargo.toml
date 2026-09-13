@@ -18,6 +18,10 @@ tokio              = { workspace = true }
 tokio-stream       = "0.1"
 tower              = "0.4"
 tower-http         = { version = "0.5", features = ["fs", "trace", "cors"] }
+# Static-asset gzip: the release wasm bundle is ~12 MB and crosses a cluster
+# proxy on every cold load; compressing it once (~3x) keeps that transfer
+# short enough that a keepalive-ping-enforcing proxy cannot reset it mid-body.
+flate2             = "1"
 serde              = { workspace = true }
 serde_json         = { workspace = true }
 serde_yaml         = "0.9"

@@ -1659,3 +1659,234 @@ async fn importers_post_adds_runtime_source_and_persists_overlay() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// --- static assets: compression + revalidation --------------------------------
+//
+// The release wasm bundle is ~12 MB and crosses a cluster proxy on every cold
+// load. Shipping it raw made one long HTTP/2 stream that a keepalive-ping
+// proxy reset mid-body, which the browser reports as
+// `ERR_HTTP2_PING_FAILED` + `WebAssembly compilation aborted: Response body
+// loading was aborted`. These tests pin the two properties that fix it.
+
+fn state_with_assets(dir: std::path::PathBuf) -> AppState {
+    AppState::new(
+        std::path::PathBuf::from("/tmp/jump-cannon-test-empty-vault"),
+        trust_test_importer(Box::new(EmptyLoader)),
+        load_result(VaultGraph::new()),
+        Some(dir),
+        graph_api::compute_broker::ComputeBroker::new(),
+        Arc::new(graph_api::progress::ProgressLog::new()),
+    )
+    .unwrap()
+}
+
+/// A dist directory holding one compressible "wasm" payload.
+fn asset_fixture(name: &str, bytes: &[u8]) -> std::path::PathBuf {
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let dir = std::env::temp_dir().join(format!("jump-cannon-assets-{unique}-{name}"));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join(name), bytes).unwrap();
+    dir
+}
+
+/// A browser (which always sends `Accept-Encoding: gzip`) gets the bundle
+/// compressed, and it decompresses back to the exact bytes on disk.
+#[tokio::test]
+async fn wasm_asset_is_gzipped_for_clients_that_accept_it() {
+    // Repetitive but non-trivial payload: compresses well, like real wasm.
+    let payload: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
+    let dir = asset_fixture("jump-cannon-ui_bg.wasm", &payload);
+    let app = graph_api::router(state_with_assets(dir));
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/jump-cannon-ui_bg.wasm")
+                .header("accept-encoding", "gzip, deflate, br")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .expect("router served");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let headers = response.headers().clone();
+    assert_eq!(
+        headers.get("content-encoding").map(|v| v.to_str().unwrap()),
+        Some("gzip"),
+        "a 12 MB bundle must not cross the proxy uncompressed"
+    );
+    assert_eq!(
+        headers.get("content-type").map(|v| v.to_str().unwrap()),
+        Some("application/wasm"),
+        "streaming compilation needs the wasm MIME"
+    );
+    assert!(headers.get("etag").is_some(), "a reload needs a validator");
+    assert_eq!(
+        headers.get("vary").map(|v| v.to_str().unwrap()),
+        Some("accept-encoding"),
+        "a shared cache must not serve gzip to an identity client"
+    );
+    assert_eq!(
+        headers.get("cache-control").map(|v| v.to_str().unwrap()),
+        Some("no-cache"),
+        "Trunk uses stable filenames: immutable caching would pin a stale bundle"
+    );
+
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    assert!(
+        body.len() < payload.len() / 2,
+        "gzip must actually shorten the transfer: {} vs {}",
+        body.len(),
+        payload.len()
+    );
+    let mut decoded = Vec::new();
+    std::io::Read::read_to_end(
+        &mut flate2::read::GzDecoder::new(std::io::Cursor::new(body.as_ref())),
+        &mut decoded,
+    )
+    .expect("body is valid gzip");
+    assert_eq!(decoded, payload, "decompressed bytes must be the bundle");
+}
+
+/// A client without `Accept-Encoding` still gets the raw bytes — correctness
+/// before optimisation.
+#[tokio::test]
+async fn asset_falls_back_to_identity_without_accept_encoding() {
+    let payload: Vec<u8> = (0..50_000u32).map(|i| (i % 251) as u8).collect();
+    let dir = asset_fixture("jump-cannon-ui_bg.wasm", &payload);
+    let app = graph_api::router(state_with_assets(dir));
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/jump-cannon-ui_bg.wasm")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .expect("router served");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(
+        response.headers().get("content-encoding").is_none(),
+        "identity client must not receive gzip"
+    );
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    assert_eq!(body.as_ref(), payload.as_slice());
+}
+
+/// The reload path: a browser holding the current bundle re-streams nothing,
+/// and a browser holding a stale one gets the new bytes.
+#[tokio::test]
+async fn holding_the_current_etag_revalidates_to_304() {
+    let payload: Vec<u8> = (0..80_000u32).map(|i| (i % 251) as u8).collect();
+    let dir = asset_fixture("jump-cannon-ui_bg.wasm", &payload);
+    let state = state_with_assets(dir);
+
+    let first = graph_api::router(state.clone())
+        .oneshot(
+            Request::builder()
+                .uri("/jump-cannon-ui_bg.wasm")
+                .header("accept-encoding", "gzip")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .expect("router served");
+    let etag = first
+        .headers()
+        .get("etag")
+        .expect("first response carries a validator")
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    let reload = graph_api::router(state.clone())
+        .oneshot(
+            Request::builder()
+                .uri("/jump-cannon-ui_bg.wasm")
+                .header("accept-encoding", "gzip")
+                .header("if-none-match", etag.clone())
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .expect("router served");
+    assert_eq!(reload.status(), StatusCode::NOT_MODIFIED);
+    let reload_body = to_bytes(reload.into_body(), usize::MAX).await.unwrap();
+    assert!(reload_body.is_empty(), "304 must carry no body");
+
+    let stale = graph_api::router(state)
+        .oneshot(
+            Request::builder()
+                .uri("/jump-cannon-ui_bg.wasm")
+                .header("accept-encoding", "gzip")
+                .header("if-none-match", "\"0000000000000000\"")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .expect("router served");
+    assert_eq!(
+        stale.status(),
+        StatusCode::OK,
+        "a stale validator must re-stream the bundle"
+    );
+}
+
+/// Dev-mode freshness: `trunk watch` rewrites the dist in place, so the
+/// compressed copy must follow the file, not outlive it.
+#[tokio::test]
+async fn rebuilt_asset_invalidates_the_compressed_copy() {
+    let dir = asset_fixture("jump-cannon-ui_bg.wasm", b"first build payload, repeated. ");
+    let state = state_with_assets(dir.clone());
+
+    let get = |state: AppState| async move {
+        let response = graph_api::router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/jump-cannon-ui_bg.wasm")
+                    .header("accept-encoding", "gzip")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("router served");
+        let etag = response
+            .headers()
+            .get("etag")
+            .map(|v| v.to_str().unwrap().to_string());
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let mut decoded = Vec::new();
+        std::io::Read::read_to_end(
+            &mut flate2::read::GzDecoder::new(std::io::Cursor::new(body.as_ref())),
+            &mut decoded,
+        )
+        .expect("gzip body");
+        (etag, decoded)
+    };
+
+    let (first_etag, first_body) = get(state.clone()).await;
+    assert_eq!(first_body, b"first build payload, repeated. ");
+
+    // Rewrite with a different length (what a rebuild does).
+    std::fs::write(
+        dir.join("jump-cannon-ui_bg.wasm"),
+        b"second build payload, longer than the first one. ",
+    )
+    .unwrap();
+
+    let (second_etag, second_body) = get(state).await;
+    assert_eq!(
+        second_body, b"second build payload, longer than the first one. ",
+        "a rebuilt dist must be served, not the cached copy"
+    );
+    assert_ne!(
+        first_etag, second_etag,
+        "a new bundle needs a new validator or browsers keep the old one"
+    );
+}
