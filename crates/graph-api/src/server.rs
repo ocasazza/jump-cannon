@@ -72,6 +72,10 @@ fn api_routes() -> Router<SourceHost> {
             "/importers/sources/:id/retry",
             axum::routing::post(source_retry),
         )
+        .route(
+            "/importers/sources/:id/parameters",
+            get(source_parameters),
+        )
         .route("/graph/init", get(graph_init))
         .route("/graph/ids", get(graph_ids))
         .route("/graph/positions", get(graph_positions))
@@ -1301,6 +1305,21 @@ async fn source_retry(
     headers: HeaderMap,
 ) -> impl IntoResponse {
     match host.retry(&id, &headers) {
+        Ok(report) => Json(report).into_response(),
+        Err(error) => error.into_response(),
+    }
+}
+
+/// `GET /importers/sources/:id/parameters` — the source's per-request parameter
+/// pickers, running any live discovery (bounded) and falling back to the static
+/// `values` on error. Cached per source for 60s. 404 for an unknown id, 403
+/// when the caller may not select alternates.
+async fn source_parameters(
+    State(host): State<SourceHost>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    match host.parameters(&id, &headers).await {
         Ok(report) => Json(report).into_response(),
         Err(error) => error.into_response(),
     }

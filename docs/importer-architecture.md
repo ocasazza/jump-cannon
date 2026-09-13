@@ -254,13 +254,12 @@ decoding only their declared input format.
 
 ### Implemented importer schemas
 
-All six selectable source kinds satisfy the version-1 contract:
+Every source's discovery projection:
 
 | Source | Discovery projection | Edge/content contract |
 | --- | --- | --- |
 | Obsidian | `id`, `title`, `tags`, `path`, `type`, `folder`, `body`, `description`, `status`, `authors`, `entities`, `key_topics`, `related` | Directed `wikilink`; Markdown content is readable and writable. |
-| tvix | `id`, `title`, `tags`, `path`, `type` | Directed `declared` edge; no source-content operations. |
-| generate | `id`, `title`, `tags`, `path`, `type` | Directed `generated` edge; no source-content operations. |
+| tvix (generator packages) | `id`, `title`, `tags`, `path`, `type` | Directed `declared` edge; no source-content operations. `engine = "tvix"` packages evaluate a parameterised Nix expression (`generate-random.toml`, `generate-clusters.toml`) — the retired `tvix`/`generate` CLI sources. |
 | Kubernetes | `id`, `title`, `tags`, `path`, `type`, `namespace`, `api_version`, `labels`, `uid`, `resource_version` | Directed `owner_reference`; metadata discovery does not expose resource bodies as content. |
 | OKF | `id`, `title`, `tags`, `path`, `type`, `folder`, `body`, `description`, `resource`, `status`, `stale_after`, `trust_tier`, `generated_by`, `generated_at`, `verified_by`, `source_resources`, `source_titles`, `source_authors`, `runtime` | Directed `relationship`; no source-content operations yet. The normative format version is OKF v0.2. |
 | Pest package | Core `id`, `title`, `tags`, `path`, and `type`, plus only the package's declared property fields | Directed `declared` edge; no source-content operations. Importer package format 3 makes the property schema mandatory. |
@@ -397,13 +396,16 @@ Importer packages and source instances are separate resources.
 
 Loading data is an administrator/deployment action. One active source is
 selected when graph-api starts, using CLI flags or environment variables
-locally and equivalent server/volume configuration in Helm. The six supported
-selections are Obsidian, tvix, generate, Kubernetes, OKF, and Pest. Helm can
-also declare named source instances under `importers.sources` and select one
-with `importers.selected`; an empty selector preserves the legacy source
-settings. The chart currently wires named Obsidian, Kubernetes, and OKF
-profiles; it does not advertise tvix or Pest profiles until their required
-source-specific inputs can be represented and mounted. The Dioxus app
+locally and equivalent server/volume configuration in Helm. The supported
+`--source` selections are Obsidian, Kubernetes, OKF, Pest, GitHub, and
+httpjson; graph generators are `engine = "tvix"` packages selected through the
+importer catalog, not a `--source` kind (`--source=generate`/`tvix` are retired
+and error with the package path). Helm can also declare named source instances
+under `importers.sources` and select one with `importers.selected`; an empty
+selector preserves the legacy source settings. The chart currently wires named
+Obsidian, Kubernetes, and OKF profiles; it does not advertise Pest profiles
+until their required source-specific inputs can be represented and mounted. The
+Dioxus app
 automatically loads the graph published by that source and the existing
 Progress panel reports reload work. Switching sources changes server
 configuration and normally restarts the server.
@@ -498,9 +500,10 @@ browser localStorage or shareable app-state exports.
   writers while keeping Obsidian's default event-driven behavior.
 - [x] Let Helm use either a chart-owned or externally owned PVC and create
   explicitly named companion ingestion ServiceAccounts without implicit RBAC.
-- [x] Keep Obsidian, tvix, and generated loaders behavior-compatible.
+- [x] Keep Obsidian and the tvix generator projection behavior-compatible
+  (graph generators are now `engine = "tvix"` packages, not compiled loaders).
 - [x] Require a versioned discovery schema and one validated search document
-  per node from Obsidian, tvix, generate, Kubernetes, OKF, and Pest.
+  per node from Obsidian, the tvix generator engine, Kubernetes, OKF, and Pest.
 - [x] Build generic Tantivy search and schema-driven facets inside the same
   atomic graph snapshot, and expose the active contract at `/graph/schema`.
 - [x] Add a deployment-selected source-instance catalog, sanitized read-only

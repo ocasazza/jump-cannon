@@ -266,7 +266,9 @@ pub async fn importers_post(
             token_env: None,
             poll_interval_ms: req.poll_interval_ms.unwrap_or(60_000),
         }),
+        tvix: None,
         producer: None,
+        parameters: std::collections::BTreeMap::new(),
     };
     if let Err(error) = importer_catalog::validate_definition(&req.id, &definition) {
         return reject(StatusCode::BAD_REQUEST, error);

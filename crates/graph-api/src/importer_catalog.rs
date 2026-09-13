@@ -62,8 +62,6 @@ impl From<SourceKind> for CatalogSourceKind {
     fn from(value: SourceKind) -> Self {
         match value {
             SourceKind::Obsidian => Self::Obsidian,
-            SourceKind::Tvix => Self::Tvix,
-            SourceKind::Generate => Self::Generate,
             SourceKind::Kubernetes => Self::Kubernetes,
             SourceKind::Okf => Self::Okf,
             SourceKind::Pest => Self::Pest,
@@ -106,6 +104,56 @@ fn default_http_json_poll_interval_ms() -> u64 {
     60_000
 }
 
+/// Read-only tvix (Nix-expression generator) package binding for one source
+/// instance. Mirrors [`ImporterHttpJsonSource`] for the tvix engine: a package
+/// filename resolved under the packages dir plus the per-instance variables an
+/// administrator binds. Carries no endpoint or token — a tvix generator
+/// evaluates a Nix expression, it does not call a remote API.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ImporterTvixSource {
+    pub package: String,
+    #[serde(default)]
+    pub variables: BTreeMap<String, String>,
+}
+
+/// One package variable exposed as a per-request pick. Kind-neutral: it lives
+/// at the source-definition level (not nested under a binding) so httpjson,
+/// tvix, and any future package engine share one picker contract. `discover`
+/// (httpjson only) lists valid values live from the bound API at request time;
+/// `values` is a static fallback; `default` pre-selects one. `discover` wins
+/// over `values` when both are present (values are appended, deduped by id).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ImporterParameter {
+    pub label: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub discover: Option<ImporterParameterDiscover>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub values: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default: Option<String>,
+}
+
+/// Live listing of a parameter's valid values from the bound API. Mirrors the
+/// json engine's preflight shape: a path template (resolved with the bound
+/// variables), a JSON pointer to the array, and pointers to each item's id and
+/// (optional) human label.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ImporterParameterDiscover {
+    pub path: String,
+    #[serde(default = "default_items_pointer")]
+    pub items_pointer: String,
+    pub id_pointer: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label_pointer: Option<String>,
+}
+
+fn default_items_pointer() -> String {
+    "/items".to_string()
+}
+
 
 /// Producer-side handoff metadata shown to operators.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -136,24 +184,30 @@ pub struct ImporterSourceDefinition {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub http_json: Option<ImporterHttpJsonSource>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tvix: Option<ImporterTvixSource>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub producer: Option<ImporterProducerContract>,
+    /// Kind-neutral per-request variable pickers, keyed by package variable
+    /// name. Empty for sources that bind every variable statically.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub parameters: BTreeMap<String, ImporterParameter>,
 }
 
 impl ImporterSourceDefinition {
     /// Whether graph-api can construct this source at runtime from catalog
     /// metadata alone. Filesystem kinds (Obsidian, OKF) need a filesystem
-    /// source contract; HTTP/JSON needs an endpoint + package binding.
-    /// Everything else still needs configuration the catalog deliberately
-    /// does not carry (GitHub repo/token, Kubernetes allowlists, Pest
-    /// packages, Nix expressions).
+    /// source contract; HTTP/JSON needs an endpoint + package binding; tvix
+    /// needs a package binding. Everything else still needs configuration the
+    /// catalog deliberately does not carry (GitHub repo/token, Kubernetes
+    /// allowlists, Pest packages).
     pub fn runnable(&self) -> bool {
         let filesystem_kind = matches!(
             self.kind,
             CatalogSourceKind::Obsidian | CatalogSourceKind::Okf
         );
-        let http_json_kind = self.kind == CatalogSourceKind::HttpJson;
         (filesystem_kind && self.source.is_some())
-            || (http_json_kind && self.http_json.is_some())
+            || (self.kind == CatalogSourceKind::HttpJson && self.http_json.is_some())
+            || (self.kind == CatalogSourceKind::Tvix && self.tvix.is_some())
     }
 }
 
@@ -425,7 +479,9 @@ impl ImporterCatalog {
             runnable: definition.runnable(),
             source: definition.source.clone(),
             http_json: definition.http_json.clone(),
+            tvix: definition.tvix.clone(),
             producer: definition.producer.clone(),
+            parameters: definition.parameters.keys().cloned().collect(),
         }
     }
 
@@ -532,7 +588,13 @@ pub struct ImporterCatalogItem {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub http_json: Option<ImporterHttpJsonSource>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub tvix: Option<ImporterTvixSource>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub producer: Option<ImporterProducerContract>,
+    /// Names of the per-request parameters this source declares, so the UI
+    /// knows a row needs a picker before Apply. Always present (empty when
+    /// none).
+    pub parameters: Vec<String>,
 }
 
 /// Validate one source definition exactly as catalog parsing does. Used by
@@ -557,6 +619,7 @@ fn validate_source(id: &str, source: &ImporterSourceDefinition) -> Result<(), St
                 | CatalogSourceKind::Kubernetes
                 | CatalogSourceKind::GitHub
                 | CatalogSourceKind::HttpJson
+                | CatalogSourceKind::Tvix
         ) {
             return Err(format!(
                 "source {id:?} kind {:?} must not declare sourceId",
@@ -640,6 +703,56 @@ fn validate_source(id: &str, source: &ImporterSourceDefinition) -> Result<(), St
             return Err(format!(
                 "source {id:?} httpJson.pollIntervalMs exceeds {MAX_POLL_INTERVAL_MS}"
             ));
+        }
+    }
+
+    let tvix_kind = source.kind == CatalogSourceKind::Tvix;
+    if !tvix_kind && source.tvix.is_some() {
+        return Err(format!(
+            "source {id:?} kind {:?} must not declare a tvix contract",
+            source.kind
+        ));
+    }
+    if let Some(tvix) = &source.tvix {
+        validate_nonempty("tvix.package", &tvix.package, MAX_PACKAGE_FILENAME_BYTES)?;
+        if tvix.package.contains('/') {
+            return Err(format!("source {id:?} tvix.package must not contain '/'"));
+        }
+        if tvix.package == "." || tvix.package == ".." {
+            return Err(format!("source {id:?} tvix.package must not be '.' or '..'"));
+        }
+    }
+
+    // Kind-neutral parameters. Structural checks only: whether every declared
+    // parameter names a real package variable (and required-variable coverage)
+    // needs the package on disk, so those are enforced lazily at selection time
+    // (see `SourceHost::select`). A parameter is only meaningful on a
+    // package-backed source; `discover` performs an HTTP GET, so it is
+    // httpJson-only.
+    if !source.parameters.is_empty() && source.http_json.is_none() && source.tvix.is_none() {
+        return Err(format!(
+            "source {id:?} declares parameters but has no package binding (httpJson or tvix)"
+        ));
+    }
+    for (name, parameter) in &source.parameters {
+        validate_nonempty("parameter name", name, MAX_ID_BYTES)?;
+        validate_nonempty("parameter label", &parameter.label, MAX_LABEL_BYTES)?;
+        for value in &parameter.values {
+            validate_nonempty("parameter value", value, MAX_ID_BYTES)?;
+        }
+        if let Some(discover) = &parameter.discover {
+            if !http_json_kind {
+                return Err(format!(
+                    "source {id:?} parameter {name:?} declares discover, which is httpJson-only"
+                ));
+            }
+            validate_nonempty("parameter discover.path", &discover.path, MAX_PATH_BYTES)?;
+            validate_nonempty("parameter discover.idPointer", &discover.id_pointer, MAX_PATH_BYTES)?;
+            validate_nonempty(
+                "parameter discover.itemsPointer",
+                &discover.items_pointer,
+                MAX_PATH_BYTES,
+            )?;
         }
     }
 
@@ -1047,7 +1160,7 @@ mod tests {
           }
         }"#;
         assert!(
-            ImporterCatalog::parse(Some(ignored_rescan), SourceKind::Generate)
+            ImporterCatalog::parse(Some(ignored_rescan), SourceKind::Pest)
                 .unwrap_err()
                 .contains("must not declare filesystemRescanIntervalSeconds")
         );
@@ -1085,7 +1198,7 @@ mod tests {
           }
         }"#;
         assert!(
-            ImporterCatalog::parse(Some(unused_source_id), SourceKind::Generate)
+            ImporterCatalog::parse(Some(unused_source_id), SourceKind::Pest)
                 .unwrap_err()
                 .contains("must not declare sourceId")
         );

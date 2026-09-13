@@ -106,25 +106,36 @@ loudly so nobody explores a silently partial memory. Content stays
 read-only (no `/vault/page` editor path): Hindsight owns consolidation,
 and writing facts back through a graph view would bypass it.
 
-## Adding another bank
+## Bank selection via parameters
 
-Same package, new instance — no Rust touched. Either bind a copy of the
-package TOML, verbatim, through the chart's `httpJsonImporter` values:
+The single `hindsight-memory-bank` catalog source is parameterised by `bank`,
+discovered at apply time from the API. When the Importers panel renders the
+source, it calls `GET /importers/sources/hindsight/parameters` to discover
+available banks:
 
-- `httpJsonImporter.package` → `hindsight-memory-bank.toml`
-- `httpJsonImporter.endpoint` → API root for that bank
-- `httpJsonImporter.variables` → `{ tenant: <t>, bank: <b> }`
+```json
+{"source": "hindsight", "parameters": {"bank": {
+  "label": "Memory bank",
+  "default": "omp",
+  "values": [{"id":"omp","label":"omp"}, {"id":"jira-ithelp","label":"jira-ithelp"}, ...],
+  "discovered": true
+}}}
+```
 
-or, with `importers.runtimeSwitchGroup` set and a writable
-`JUMP_CANNON_IMPORTER_PACKAGES_DIR`, use the Importers panel's "+ New
-source" action (`POST /importers`): it writes the package file next to the
-shipped ones and records the source in `catalog.local.json`, which survives
-restarts.
+The user picks a bank, and the frontend encodes the selection as
+`hindsight-memory-bank?bank=<id>`, stored in sessionStorage as `jc_source_id`,
+sent as the `x-jump-cannon-source` header on apply. graph-api builds a
+dedicated importer instance with that bank parameter bound, identified by the
+selection string in the alternates registry.
 
-Two graph-api pods running the same package against two different
-endpoints publish two distinct graphs (`httpjson:omp:…`,
-`httpjson:jira-ithelp:…`, …). See [[Helm Deployment]] for the chart
-wiring and [[Importer Runtime]] for the engine's instance model.
+To add a new bank to the Hindsight tenant, register it in the Hindsight API
+and it appears in the discovered list automatically on next discovery; no chart
+change required. Graph-api pods with older `importers.selected` continue to run
+their hardcoded bank unchanged (the legacy per-instance model); switching from
+the deployment default to a parameterised bank is a one-way runtime action.
+
+See [[Importer Runtime]] for the selection string encoding and [[Backend API]]
+for the discovery and build routes.
 
 See also [[Import and Generate]] (settings panel), [[Importer Runtime]],
 [[Backend API]], and [[Helm Deployment]].

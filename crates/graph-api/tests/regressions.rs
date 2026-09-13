@@ -917,7 +917,7 @@ fn switch_catalog_json(vault: &std::path::Path) -> String {
     serde_json::json!({
         "selected": "default-gen",
         "sources": {
-            "default-gen": { "displayName": "Default generated", "kind": "generate" },
+            "default-gen": { "displayName": "Default generated", "kind": "pest" },
             "alt-vault": {
                 "displayName": "Alt vault",
                 "kind": "obsidian",
@@ -950,7 +950,7 @@ fn switch_catalog_json(vault: &std::path::Path) -> String {
 fn switch_host(catalog_raw: &str, group: Option<&str>) -> SourceHost {
     let catalog = ImporterCatalog::parse_with_runtime_switch(
         Some(catalog_raw),
-        data_loader::SourceKind::Generate,
+        data_loader::SourceKind::Pest,
         group.is_some(),
     )
     .expect("switch catalog parses");
@@ -992,7 +992,7 @@ async fn runtime_switch_disabled_ignores_selection_header() {
     let vault = fixture_vault("disabled");
     let catalog = ImporterCatalog::parse(
         Some(&switch_catalog_json(&vault)),
-        data_loader::SourceKind::Generate,
+        data_loader::SourceKind::Pest,
     )
     .expect("strict catalog parse");
     let app = graph_api::router_with_host(SourceHost::default_only(state_with_catalog(catalog)));
@@ -1436,7 +1436,7 @@ fn packages_fixture(tag: &str) -> (std::path::PathBuf, String) {
     let catalog = serde_json::json!({
         "selected": "default-gen",
         "sources": {
-            "default-gen": { "displayName": "Default generated", "kind": "generate" },
+            "default-gen": { "displayName": "Default generated", "kind": "pest" },
             "hindsight": {
                 "displayName": "Hindsight",
                 "kind": "httpjson",
@@ -1455,7 +1455,7 @@ fn packages_fixture(tag: &str) -> (std::path::PathBuf, String) {
 fn packages_host(dir: &std::path::Path, catalog_raw: &str, group: Option<&str>) -> SourceHost {
     let mut catalog = ImporterCatalog::parse_with_runtime_switch(
         Some(catalog_raw),
-        data_loader::SourceKind::Generate,
+        data_loader::SourceKind::Pest,
         group.is_some(),
     )
     .expect("catalog parses");
@@ -1687,5 +1687,209 @@ async fn importers_post_adds_runtime_source_and_persists_overlay() {
         .iter()
         .any(|s| s["id"] == "local-bank" && s["origin"] == "runtime"));
 
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ── Parameterised sources: coverage validation + live discovery ──────────────
+
+/// A packages dir holding the shipped hindsight package plus a catalog binding
+/// it as `hindsight` with the given `httpJson`/`parameters` JSON fragments.
+fn param_packages_fixture(tag: &str, hindsight: serde_json::Value) -> (std::path::PathBuf, String) {
+    let dir = std::env::temp_dir().join(format!("jump-cannon-pkgs-{}-{tag}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("packages dir");
+    std::fs::write(dir.join("hindsight.toml"), TOML_PACKAGE).expect("package file");
+    let mut source = serde_json::json!({
+        "displayName": "Hindsight",
+        "kind": "httpjson",
+    });
+    let object = source.as_object_mut().unwrap();
+    for (key, value) in hindsight.as_object().unwrap() {
+        object.insert(key.clone(), value.clone());
+    }
+    let catalog = serde_json::json!({
+        "selected": "default-gen",
+        "sources": {
+            "default-gen": { "displayName": "Default", "kind": "pest" },
+            "hindsight": source,
+        }
+    })
+    .to_string();
+    (dir, catalog)
+}
+
+/// (c) Selecting an httpjson source whose package requires `bank` (no default)
+/// but neither binds it in `variables` nor declares it as a parameter is a 400
+/// naming the uncovered variable — a misconfigured catalog fails loudly rather
+/// than as an opaque build failure.
+#[tokio::test]
+async fn selecting_source_missing_required_package_variable_is_bad_request() {
+    let (dir, catalog) = param_packages_fixture(
+        "coverage",
+        serde_json::json!({
+            "httpJson": {
+                "package": "hindsight.toml",
+                "endpoint": "http://hindsight.invalid",
+                "variables": { "tenant": "default" }
+            }
+        }),
+    );
+    let host = packages_host(&dir, &catalog, Some(SWITCH_GROUP));
+    let app = graph_api::router_with_host(host);
+
+    let response = app
+        .oneshot(source_request("/graph/ids", "hindsight", Some(SWITCH_GROUP)))
+        .await
+        .expect("served");
+    assert_eq!(
+        response.status(),
+        StatusCode::BAD_REQUEST,
+        "a required package variable that is neither bound nor parameterised is a 400"
+    );
+    let body = text_body(response).await;
+    assert!(
+        body.contains("bank"),
+        "the error names the uncovered variable: {body}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Spawn an in-process HTTP server that answers `GET /v1/default/banks` with the
+/// given status and body, returning its base URL and the serving task.
+async fn spawn_banks_server(
+    status: StatusCode,
+    body: &'static str,
+) -> (String, tokio::task::JoinHandle<()>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind mock banks server");
+    let addr = listener.local_addr().expect("mock addr");
+    let app = axum::Router::new().route(
+        "/v1/default/banks",
+        axum::routing::get(move || async move { (status, body) }),
+    );
+    let handle = tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    (format!("http://{addr}"), handle)
+}
+
+fn parameters_request(id: &str, groups: Option<&str>) -> Request<Body> {
+    let mut builder = Request::builder().uri(format!("/importers/sources/{id}/parameters"));
+    if let Some(groups) = groups {
+        builder = builder.header(GROUPS_HEADER, groups);
+    }
+    builder.body(Body::empty()).unwrap()
+}
+
+/// (d) `/parameters` runs live discovery against the bound API: a healthy
+/// endpoint yields the discovered ids and labels; a 500 falls back to the
+/// static `values` with the error surfaced.
+#[tokio::test]
+async fn parameters_route_discovers_values_and_falls_back_on_error() {
+    // Healthy discovery endpoint.
+    let (url, server) = spawn_banks_server(
+        StatusCode::OK,
+        r#"{"banks":[{"bank_id":"omp","name":"OMP"},{"bank_id":"jira-ithelp","name":"Jira ITHELP"}]}"#,
+    )
+    .await;
+    let (dir, catalog) = param_packages_fixture(
+        "discover-ok",
+        serde_json::json!({
+            "httpJson": {
+                "package": "hindsight.toml",
+                "endpoint": url,
+                "variables": {}
+            },
+            "parameters": {
+                "bank": {
+                    "label": "Memory bank",
+                    "discover": {
+                        "path": "/v1/{tenant}/banks",
+                        "itemsPointer": "/banks",
+                        "idPointer": "/bank_id",
+                        "labelPointer": "/name"
+                    },
+                    "values": ["omp"]
+                }
+            }
+        }),
+    );
+    let host = packages_host(&dir, &catalog, Some(SWITCH_GROUP));
+    let app = graph_api::router_with_host(host);
+
+    let response = app
+        .oneshot(parameters_request("hindsight", Some(SWITCH_GROUP)))
+        .await
+        .expect("parameters served");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = json_body(response).await;
+    assert_eq!(body["source"], "hindsight");
+    let bank = &body["parameters"]["bank"];
+    assert_eq!(bank["label"], "Memory bank");
+    assert_eq!(bank["discovered"], true);
+    assert!(bank["error"].is_null(), "no error on a healthy discovery");
+    let values = bank["values"].as_array().expect("values array");
+    assert!(
+        values
+            .iter()
+            .any(|value| value["id"] == "omp" && value["label"] == "OMP"),
+        "discovered omp with its label: {values:?}"
+    );
+    assert!(
+        values
+            .iter()
+            .any(|value| value["id"] == "jira-ithelp" && value["label"] == "Jira ITHELP"),
+        "discovered jira-ithelp with its label: {values:?}"
+    );
+    server.abort();
+    let _ = std::fs::remove_dir_all(&dir);
+
+    // Discovery endpoint returning 500: fall back to the static values, with the
+    // error surfaced.
+    let (url, server) = spawn_banks_server(StatusCode::INTERNAL_SERVER_ERROR, "boom").await;
+    let (dir, catalog) = param_packages_fixture(
+        "discover-500",
+        serde_json::json!({
+            "httpJson": {
+                "package": "hindsight.toml",
+                "endpoint": url,
+                "variables": {}
+            },
+            "parameters": {
+                "bank": {
+                    "label": "Memory bank",
+                    "discover": {
+                        "path": "/v1/{tenant}/banks",
+                        "itemsPointer": "/banks",
+                        "idPointer": "/bank_id",
+                        "labelPointer": "/name"
+                    },
+                    "values": ["fallback-a", "fallback-b"]
+                }
+            }
+        }),
+    );
+    let host = packages_host(&dir, &catalog, Some(SWITCH_GROUP));
+    let app = graph_api::router_with_host(host);
+
+    let response = app
+        .oneshot(parameters_request("hindsight", Some(SWITCH_GROUP)))
+        .await
+        .expect("parameters served");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = json_body(response).await;
+    let bank = &body["parameters"]["bank"];
+    assert_eq!(bank["discovered"], false, "discovery failed");
+    assert!(bank["error"].is_string(), "the discovery error is surfaced");
+    let values = bank["values"].as_array().expect("values array");
+    let ids: Vec<&str> = values.iter().map(|value| value["id"].as_str().unwrap()).collect();
+    assert_eq!(
+        ids,
+        vec!["fallback-a", "fallback-b"],
+        "falls back to the static values"
+    );
+    server.abort();
     let _ = std::fs::remove_dir_all(&dir);
 }

@@ -275,11 +275,19 @@ impl ImporterSchema {
         if let Err(message) = identity::validate_source_kind(&self.source_kind) {
             return Err(invalid_descriptor(message));
         }
-        if !SourceKind::all().contains(&self.source_kind.as_str()) {
+        // A discovery schema's `source_kind` is a node-ID identity prefix, not a
+        // CLI-constructible source. Package engines (tvix) publish an identity
+        // prefix without a `SourceKind` variant, so accept those in addition to
+        // the CLI kinds. ("httpjson" is still a `SourceKind`, so it is covered
+        // by `all()`.)
+        if !SourceKind::all().contains(&self.source_kind.as_str())
+            && !ENGINE_SOURCE_KINDS.contains(&self.source_kind.as_str())
+        {
             return Err(invalid_descriptor(format!(
-                "source_kind {:?} must be a SourceKind lowercase identifier (one of {})",
+                "source_kind {:?} must be a SourceKind or package-engine identifier (one of {}, {})",
                 self.source_kind,
-                SourceKind::all().join(", ")
+                SourceKind::all().join(", "),
+                ENGINE_SOURCE_KINDS.join(", ")
             )));
         }
         if self.fields.is_empty() || self.fields.len() > MAX_DISCOVERY_FIELDS {
@@ -814,16 +822,21 @@ pub trait Loader: Send + Sync {
     }
 }
 
+/// Node-ID identity prefixes that are valid namespaces without a
+/// CLI-constructible [`SourceKind`] variant. A package engine (tvix: Nix
+/// generators as packages) emits `tvix:{source_id}:{local}` node IDs and a
+/// discovery schema whose `source_kind` is that prefix even though
+/// `--source=tvix` is retired; the `graph-api` self-assembly soup demo emits
+/// `generate:{source_id}:{local}` nodes without any generate loader. Kept
+/// separate from [`SourceKind::all`] so the CLI surface and the identity
+/// allowlist stay decoupled.
+pub const ENGINE_SOURCE_KINDS: &[&str] = &["tvix", "generate"];
+
 /// Enum of known loader types. Used for CLI dispatch (`--source <name>`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SourceKind {
     /// Walk an Obsidian vault on disk (the default).
     Obsidian,
-    /// Evaluate a tvix Nix expression to produce a graph.
-    Tvix,
-    /// Generate a random graph directly in Rust (fast, no Nix eval).
-    /// Controlled by --nodes and --edges CLI flags.
-    Generate,
     /// List allowlisted Kubernetes dynamic resources through kube-rs.
     Kubernetes,
     /// Import an Open Knowledge Format v0.2 bundle from the filesystem.
@@ -850,8 +863,6 @@ impl SourceKind {
     pub fn parse(s: &str) -> Option<Self> {
         match s.to_lowercase().as_str() {
             "obsidian" | "vault" => Some(Self::Obsidian),
-            "tvix" | "nix" => Some(Self::Tvix),
-            "generate" | "gen" | "random" => Some(Self::Generate),
             "kubernetes" | "k8s" => Some(Self::Kubernetes),
             "okf" | "open-knowledge-format" => Some(Self::Okf),
             "pest" | "grammar" => Some(Self::Pest),
@@ -866,8 +877,6 @@ impl SourceKind {
     pub fn all() -> &'static [&'static str] {
         &[
             "obsidian",
-            "tvix",
-            "generate",
             "kubernetes",
             "okf",
             "pest",

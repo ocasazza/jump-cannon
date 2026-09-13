@@ -49,7 +49,6 @@ okf-importer = { path = "../okf-importer" }
 github-importer = { path = "../github-importer" }
 importer = { path = "../importer" }
 vault-links    = { path = "../vault-links" }
-tvix-loader    = { path = "../tvix-loader" }
 graph-layouts  = { path = "../graph-layouts" }
 graph-metrics  = { path = "../graph-metrics" }
 # tvix-wasm is native+wasm; default-features=false builds the native (pure)

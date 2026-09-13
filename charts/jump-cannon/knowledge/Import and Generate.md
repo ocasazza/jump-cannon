@@ -9,13 +9,16 @@ tags: [jump-cannon, importer, generation]
 # Import and Generate
 
 The default source is an Obsidian-style markdown vault. The importer runtime can
-also evaluate a tvix graph, create a server-side generated graph, load bounded
-Kubernetes metadata, import an Open Knowledge Format v0.2 bundle, parse a
-trusted Pest package (importer package format 3), pull a GitHub repository tarball
-(see [[GitHub Importer]]), or bind an `httpjson` engine to one declarative
-TOML package under `charts/jump-cannon/packages/` (Hindsight ships as
-`hindsight-memory-bank.toml`; see [[Hindsight Importer]]). Every server
-importer publishes its search and facet keys through `GET /graph/schema`.
+also load bounded Kubernetes metadata, import an Open Knowledge Format v0.2
+bundle, parse a trusted Pest package (importer package format 3), pull a GitHub
+repository tarball (see [[GitHub Importer]]), bind an `httpjson` engine to one
+declarative TOML package under `charts/jump-cannon/packages/` (Hindsight ships
+as `hindsight-memory-bank.toml`; see [[Hindsight Importer]]), or run an
+`engine = "tvix"` generator package that evaluates a parameterised Nix
+expression into a graph (`generate-random.toml`, `generate-clusters.toml`) with
+its node count, edge count, seed, cluster count, and affinity bound at apply
+time. Every server importer publishes its search and facet keys through
+`GET /graph/schema`.
 
 Open the **Importers** panel to see the active importer and the sanitized
 deployment catalog. Named source instances show their kind, source identity,
@@ -24,6 +27,8 @@ filesystem claim/path, and read-only state. When switching to a source that requ
 The built-in `lavender-ingest-okf` profile reads the shared OKF handoff described
 in [[Helm Deployment]].
 
-Generate evaluates supported Nix expressions through tvix and creates a
-browser-owned graph. Source selection and credentials remain deployment policy.
+Server-side graph generators are `engine = "tvix"` packages (above), selected
+through the importer catalog rather than a `--source` flag. The browser Generate
+panel evaluates supported Nix expressions through tvix on the client and creates
+a browser-owned graph. Source selection and credentials remain deployment policy.
 See [[Importer Runtime]], [[Backend API]], and [[Security Model]].

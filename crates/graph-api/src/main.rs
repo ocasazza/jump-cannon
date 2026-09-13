@@ -52,10 +52,11 @@ struct Args {
         default_value_t = 0
     )]
     filesystem_rescan_seconds: u64,
-    /// Data source: obsidian (default), tvix, generate, kubernetes, okf, pest,
-    /// github, or httpjson. Package-driven kinds (pest, httpjson) take their
-    /// behaviour from --importer-manifest, so a new API is a package, not a
-    /// new source kind.
+    /// Data source: obsidian (default), kubernetes, okf, pest, github, or
+    /// httpjson. Package-driven kinds (pest, httpjson, tvix) take their
+    /// behaviour from a package, so a new API — or a new graph generator — is a
+    /// package, not a new source kind. Graph generators are `engine = "tvix"`
+    /// packages selected through the importer catalog, not `--source`.
     /// Runtime Pest packages are trusted administrator-installed code; the
     /// unauthenticated HTTP API does not accept grammar uploads.
     #[arg(long, env = "JUMP_CANNON_SOURCE", default_value = "obsidian")]
@@ -79,10 +80,6 @@ struct Args {
         default_value = "x-netbird-groups"
     )]
     user_groups_header: String,
-    /// When --source=tvix, the Nix expression to evaluate. If not provided,
-    /// reads from the file at --vault-root (which must be a .nix file).
-    #[arg(long, env = "JUMP_CANNON_TVIX_EXPR")]
-    tvix_expr: Option<String>,
     /// JSON source-instance configuration used by --source=kubernetes.
     /// Credentials are resolved by kube-rs from kubeconfig or the pod's
     /// explicitly mounted service-account projection, never from this file.
@@ -162,29 +159,6 @@ struct Args {
     /// Filesystem input bound to --importer-manifest. Required by --source=pest.
     #[arg(long, env = "JUMP_CANNON_IMPORTER_INPUT")]
     importer_input: Option<PathBuf>,
-    /// When --source=generate, the number of nodes to create.
-    #[arg(long, env = "JUMP_CANNON_GENERATE_NODES", default_value_t = 1000)]
-    generate_nodes: usize,
-    /// When --source=generate, the number of edges to create.
-    #[arg(long, env = "JUMP_CANNON_GENERATE_EDGES", default_value_t = 2000)]
-    generate_edges: usize,
-    /// When --source=generate, partition nodes into this many clusters.
-    /// Nodes within the same cluster connect more often (see --cluster-affinity).
-    /// Default 0 = no clustering (purely random edges).
-    #[arg(long, env = "JUMP_CANNON_GENERATE_CLUSTERS", default_value_t = 0)]
-    generate_clusters: usize,
-    /// When --source=generate with --clusters > 0, the probability (0.0–1.0)
-    /// that an edge connects nodes within the same cluster. Default 0.8.
-    #[arg(
-        long,
-        env = "JUMP_CANNON_GENERATE_CLUSTER_AFFINITY",
-        default_value_t = 0.8
-    )]
-    generate_cluster_affinity: f64,
-    /// When --source=generate, the deterministic RNG seed for edge topology.
-    /// The same flags with the same seed always produce the identical graph.
-    #[arg(long = "seed", env = "JUMP_CANNON_GENERATE_SEED", default_value_t = 0)]
-    generate_seed: u64,
     /// Path to the chart-rendered RayCluster session template (JSON, mounted
     /// from a ConfigMap). When set (and a kube client is available), the
     /// on-demand GPU session controller runs; unset = the feature is fully
@@ -251,6 +225,25 @@ async fn main() -> anyhow::Result<()> {    let _ = dotenvy::dotenv();
         .clone()
         .unwrap_or_else(|| std::env::current_dir().unwrap());
 
+    // Retired source kinds. `generate` and `tvix` are no longer compiled source
+    // kinds carrying data: graph generators are `engine = "tvix"` importer
+    // packages that bind their Nix expression's runtime parameters (node count,
+    // seed, cluster count, …) at apply time, exactly as httpjson binds its
+    // variables. Point the operator at the packages and the catalog binding
+    // rather than falling through to the generic unknown-source error.
+    if matches!(
+        args.source.to_lowercase().as_str(),
+        "generate" | "gen" | "random" | "tvix" | "nix"
+    ) {
+        anyhow::bail!(
+            "--source={} is retired: graph generators are now `engine = \"tvix\"` packages. \
+             Bind charts/jump-cannon/packages/generate-random.toml or generate-clusters.toml \
+             as a catalog source of kind `tvix` (with `tvix.package` and per-parameter values) \
+             and select it through the importer catalog.",
+            args.source
+        );
+    }
+
     // Select the data loader.
     let source_kind = data_loader::SourceKind::parse(&args.source).with_context(|| {
         format!(
@@ -297,38 +290,6 @@ async fn main() -> anyhow::Result<()> {    let _ = dotenvy::dotenv();
         data_loader::SourceKind::Obsidian => {
             tracing::info!(vault_root = %vault_root.display(), "using obsidian loader");
             Box::new(vault_links::ObsidianLoader::new(vault_root.clone()))
-        }
-        data_loader::SourceKind::Tvix => {
-            let expr = if let Some(ref e) = args.tvix_expr {
-                e.clone()
-            } else if vault_root.extension().is_some_and(|ext| ext == "nix") {
-                std::fs::read_to_string(&vault_root).unwrap_or_else(|e| {
-                    tracing::error!(path = %vault_root.display(), error = %e, "failed to read tvix expression file");
-                    String::new()
-                })
-            } else {
-                tracing::warn!("--source=tvix but no --tvix-expr and --vault-root is not a .nix file; using empty graph");
-                String::new()
-            };
-            tracing::info!(expr_len = expr.len(), "using tvix loader");
-            Box::new(tvix_loader::TvixLoader::new(expr))
-        }
-        data_loader::SourceKind::Generate => {
-            tracing::info!(
-                nodes = args.generate_nodes,
-                edges = args.generate_edges,
-                clusters = args.generate_clusters,
-                affinity = args.generate_cluster_affinity,
-                seed = args.generate_seed,
-                "using generate loader"
-            );
-            Box::new(tvix_loader::GenerateLoader::new(
-                args.generate_nodes,
-                args.generate_edges,
-                args.generate_clusters,
-                args.generate_cluster_affinity,
-                args.generate_seed,
-            ))
         }
         data_loader::SourceKind::Kubernetes => {
             let path = args.kubernetes_config.as_ref().with_context(|| {

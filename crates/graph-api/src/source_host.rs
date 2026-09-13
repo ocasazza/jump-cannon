@@ -16,7 +16,7 @@
 //! header is ignored entirely and every request is served the default —
 //! exactly today's behavior. Writes and compute endpoints stay default-only.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::future::Future;
 use std::pin::Pin;
@@ -31,7 +31,8 @@ use axum::http::{HeaderMap, HeaderName, StatusCode};
 use axum::response::{IntoResponse, Response};
 
 use crate::importer_catalog::{
-    CatalogSourceKind, ImporterCatalog, ImporterSourceDefinition, RuntimeSwitchStatus,
+    CatalogSourceKind, ImporterCatalog, ImporterParameterDiscover, ImporterSourceDefinition,
+    RuntimeSwitchStatus,
 };
 use crate::progress::{ProgressLog, ProgressResponse};
 use crate::state::AppState;
@@ -136,6 +137,9 @@ pub enum SourceError {
     BuildFailed { source: String, error: String },
     /// A retry requested against a source that is already building or serving.
     Conflict(String),
+    /// The selection string is malformed or carries a parameter the source
+    /// does not accept — a client error mapped to 400.
+    BadSelection(String),
 }
 
 impl IntoResponse for SourceError {
@@ -174,6 +178,7 @@ impl IntoResponse for SourceError {
             )
                 .into_response(),
             Self::Conflict(message) => (StatusCode::CONFLICT, message).into_response(),
+            Self::BadSelection(message) => (StatusCode::BAD_REQUEST, message).into_response(),
         }
     }
 }
@@ -255,18 +260,103 @@ impl BuildStatusReport {
     }
 }
 
+/// A parsed source selection: a catalog source id plus optional per-request
+/// parameter values. The canonical string form — `id`, or
+/// `id?k1=v1&k2=v2` with keys sorted and both key and value percent-encoded —
+/// is the single wire token shared by the `x-jump-cannon-source` header, the
+/// layout WS `?source=`, `sessionStorage['jc_source_id']`, and the key of the
+/// alternates map. The frontend mirrors this exact grammar.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceSelector {
+    pub id: String,
+    pub params: BTreeMap<String, String>,
+}
+
+impl SourceSelector {
+    /// Parse a canonical selection string. Rejects an empty id, a `?` with no
+    /// parameters, a parameter that is not `key=value`, an empty parameter
+    /// name, a repeated parameter, and invalid percent-encoding. It does NOT
+    /// check parameter names against a catalog definition — that is
+    /// [`validate_selection_params`], which needs the source's declared
+    /// parameters.
+    pub fn parse(raw: &str) -> Result<Self, String> {
+        let raw = raw.trim();
+        if raw.is_empty() {
+            return Err("empty source selection".to_owned());
+        }
+        let (id_part, query) = match raw.split_once('?') {
+            Some((id, query)) => (id, Some(query)),
+            None => (raw, None),
+        };
+        let id = decode_component(id_part)?;
+        if id.is_empty() {
+            return Err("source selection has an empty id".to_owned());
+        }
+        let mut params = BTreeMap::new();
+        if let Some(query) = query {
+            if query.is_empty() {
+                return Err("source selection has a '?' with no parameters".to_owned());
+            }
+            for pair in query.split('&') {
+                let (key, value) = pair
+                    .split_once('=')
+                    .ok_or_else(|| format!("source selection parameter {pair:?} is not key=value"))?;
+                let key = decode_component(key)?;
+                let value = decode_component(value)?;
+                if key.is_empty() {
+                    return Err("source selection has a parameter with an empty name".to_owned());
+                }
+                if params.insert(key.clone(), value).is_some() {
+                    return Err(format!("source selection repeats parameter {key:?}"));
+                }
+            }
+        }
+        Ok(Self { id, params })
+    }
+
+    /// The canonical parameter string (`k1=v1&k2=v2`, sorted by key, both
+    /// sides percent-encoded); empty when there are no parameters.
+    fn params_canonical(&self) -> String {
+        self.params
+            .iter()
+            .map(|(key, value)| format!("{}={}", encode_component(key), encode_component(value)))
+            .collect::<Vec<_>>()
+            .join("&")
+    }
+}
+
+impl std::fmt::Display for SourceSelector {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", encode_component(&self.id))?;
+        if !self.params.is_empty() {
+            write!(f, "?{}", self.params_canonical())?;
+        }
+        Ok(())
+    }
+}
+
+fn decode_component(raw: &str) -> Result<String, String> {
+    urlencoding::decode(raw)
+        .map(std::borrow::Cow::into_owned)
+        .map_err(|error| format!("invalid percent-encoding {raw:?} in source selection: {error}"))
+}
+
+fn encode_component(raw: &str) -> String {
+    urlencoding::encode(raw).into_owned()
+}
+
 /// Outcome of gating a `/status`, `/progress`, or `/retry` request: the
 /// request either targets the always-serving deployment default or an
-/// authorized, runnable alternate.
+/// authorized, runnable alternate (carrying the parsed selection).
 enum GateOutcome {
     Default,
-    Alternate,
+    Alternate(SourceSelector),
 }
 
 /// Which source a request resolves to, before any build is attempted.
 enum Selection {
     Default,
-    Alternate(String),
+    Alternate(SourceSelector),
 }
 
 /// The outcome of resolving one request's source selection.
@@ -338,6 +428,44 @@ const ALTERNATE_IDLE_TTL: Duration = Duration::from_secs(15 * 60);
 /// How often the idle sweep runs.
 const ALTERNATE_EVICTION_INTERVAL: Duration = Duration::from_secs(60);
 
+/// How long a computed parameter report (including any live discovery) is
+/// reused before recomputation. Discovery hits the bound API, so a short cache
+/// keeps the picker responsive without hammering the upstream on every open.
+const PARAMETERS_CACHE_TTL: Duration = Duration::from_secs(60);
+/// Wall-clock ceiling on one parameter's live discovery request.
+const DISCOVERY_TIMEOUT_SECONDS: u64 = 10;
+/// Largest number of discovered values retained from one listing.
+const DISCOVERY_MAX_ITEMS: usize = 1000;
+
+/// One selectable value for a parameter: its wire id and a human label.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ParameterValue {
+    pub id: String,
+    pub label: String,
+}
+
+/// One parameter's resolved picker: its label, pre-selected default, the
+/// available values (discovered first, then static, deduped by id), whether
+/// discovery ran successfully, and any discovery error (values then fall back
+/// to the static list).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ParameterReport {
+    pub label: String,
+    pub default: Option<String>,
+    pub values: Vec<ParameterValue>,
+    pub discovered: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// `GET /importers/sources/:id/parameters` body: the source id and its
+/// per-parameter pickers.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ParametersReport {
+    pub source: String,
+    pub parameters: BTreeMap<String, ParameterReport>,
+}
+
 struct SourceHostInner {
     default: AppState,
     /// Chart catalog plus runtime overlay entries. Swapped wholesale when
@@ -360,6 +488,9 @@ struct SourceHostInner {
     /// `httpjson` alternate; the rollout path still resolves its own full
     /// path via `--importer-manifest`.
     packages_dir: Option<PathBuf>,
+    /// Per-source-id cache of computed parameter reports, keyed by catalog id.
+    /// Each entry is reused for [`PARAMETERS_CACHE_TTL`] before recomputation.
+    parameters_cache: RwLock<HashMap<String, (Instant, ParametersReport)>>,
 }
 
 /// Idle detection: ids whose entry hasn't been used since `now - idle_ttl`.
@@ -454,6 +585,7 @@ impl SourceHost {
                 packages_dir,
                 builder,
                 build_generation: AtomicU64::new(0),
+                parameters_cache: RwLock::new(HashMap::new()),
             }),
         };
         if host.inner.switch.enabled() {
@@ -577,11 +709,19 @@ impl SourceHost {
     ) -> Result<ResolvedSource, SourceError> {
         match self.resolve_selection(requested, headers)? {
             Selection::Default => Ok(self.default_resolution()),
-            Selection::Alternate(id) => {
-                let state = self.ensure_serving(&id)?;
+            Selection::Alternate(selector) => {
+                let key = selector.to_string();
+                // First touch of an unbuilt alternate validates parameter
+                // coverage against the package (400 on a misconfigured source)
+                // before the build spawns; an already-resident entry skips the
+                // reload and resolves straight through `ensure_serving`.
+                if !self.read_alternates().contains_key(&key) {
+                    self.validate_parameter_coverage(&selector).await?;
+                }
+                let state = self.ensure_serving(&selector)?;
                 Ok(ResolvedSource {
                     state,
-                    alternate: Some(id),
+                    alternate: Some(key),
                 })
             }
         }
@@ -597,47 +737,50 @@ impl SourceHost {
     ) -> Result<ResolvedSource, SourceError> {
         match self.resolve_selection(requested, headers)? {
             Selection::Default => Ok(self.default_resolution()),
-            Selection::Alternate(id) => Ok(ResolvedSource {
+            Selection::Alternate(selector) => Ok(ResolvedSource {
                 state: self.inner.default.clone(),
-                alternate: Some(id),
+                alternate: Some(selector.to_string()),
             }),
         }
     }
 
     /// The shared selection front matter for [`Self::select`] and
-    /// [`Self::resolve_default`]: gate the raw header/query value to either the
-    /// deployment default or a specific authorized, runnable alternate id,
-    /// without building anything. A closed gate or the default id ignores the
-    /// selection entirely (today's behavior).
+    /// [`Self::resolve_default`]: parse the raw header/query value and gate it
+    /// to either the deployment default or a specific authorized, runnable
+    /// alternate, without building anything. A closed gate ignores the
+    /// selection entirely; the default id with no parameters is the default.
     fn resolve_selection(
         &self,
         requested: Option<&str>,
         headers: &HeaderMap,
     ) -> Result<Selection, SourceError> {
         let requested = requested.map(str::trim).filter(|id| !id.is_empty());
-        let Some(id) = requested else {
+        let Some(raw) = requested else {
             return Ok(Selection::Default);
         };
         // Gate closed: the header is ignored entirely — today's behavior.
         if !self.inner.switch.enabled() {
             return Ok(Selection::Default);
         }
-        // The deployment default never requires authorization; the UI may send
-        // the header unconditionally once a viewer has switched back.
+        let selector = SourceSelector::parse(raw).map_err(SourceError::BadSelection)?;
+        // The deployment default (with no parameters) never requires
+        // authorization; the UI may send the header unconditionally once a
+        // viewer has switched back.
         let catalog = self.inner.catalog.load();
-        if catalog.selected() == Some(id) {
+        if catalog.selected() == Some(selector.id.as_str()) && selector.params.is_empty() {
             return Ok(Selection::Default);
         }
         if !self.inner.switch.authorize(headers) {
             return Err(SourceError::Forbidden);
         }
-        let Some(definition) = catalog.source(id) else {
-            return Err(SourceError::Unknown(id.to_owned()));
+        let Some(definition) = catalog.source(&selector.id) else {
+            return Err(SourceError::Unknown(selector.id.clone()));
         };
         if !definition.runnable() {
-            return Err(SourceError::NotRunnable(id.to_owned()));
+            return Err(SourceError::NotRunnable(selector.id.clone()));
         }
-        Ok(Selection::Alternate(id.to_owned()))
+        validate_selection_params(&selector, definition).map_err(SourceError::BadSelection)?;
+        Ok(Selection::Alternate(selector))
     }
 
     fn default_resolution(&self) -> ResolvedSource {
@@ -654,19 +797,18 @@ impl SourceHost {
     /// [`SourceError::BuildFailed`], and a missing entry spawns the build task
     /// and returns `Building` immediately. The background task swaps the entry
     /// to `Serving`/`Failed` when it completes (see [`Self::spawn_build`]).
-    fn ensure_serving(&self, source_id: &str) -> Result<AppState, SourceError> {
+    fn ensure_serving(&self, selector: &SourceSelector) -> Result<AppState, SourceError> {
+        let key = selector.to_string();
         let mut alternates = self.write_alternates();
-        if let Some(entry) = alternates.get_mut(source_id) {
+        if let Some(entry) = alternates.get_mut(&key) {
             mark_entry_used(entry, Instant::now());
             return match &entry.source {
                 AlternateSource::Serving { state, .. } => Ok(state.clone()),
                 AlternateSource::Building {
                     progress, started, ..
-                } => Err(SourceError::Building(build_status(
-                    source_id, progress, *started,
-                ))),
+                } => Err(SourceError::Building(build_status(&key, progress, *started))),
                 AlternateSource::Failed { message, .. } => Err(SourceError::BuildFailed {
-                    source: source_id.to_owned(),
+                    source: key.clone(),
                     error: message.clone(),
                 }),
             };
@@ -677,14 +819,14 @@ impl SourceHost {
         let started = Instant::now();
         let generation = self.next_generation();
         let task = self.spawn_build(
-            source_id.to_owned(),
+            selector.clone(),
             generation,
             Arc::clone(&progress),
             Arc::clone(&gate),
         );
-        let status = build_status(source_id, &progress, started);
+        let status = build_status(&key, &progress, started);
         alternates.insert(
-            source_id.to_owned(),
+            key,
             AlternateEntry {
                 source: AlternateSource::Building {
                     progress,
@@ -701,40 +843,44 @@ impl SourceHost {
 
     /// Spawn the background build for one alternate. On completion the task
     /// swaps the `Building` entry to `Serving` or `Failed` — but only if it is
-    /// still the exact build it started (see [`finalize_build`]).
+    /// still the exact build it started (see [`finalize_build`]). The entry is
+    /// keyed by the canonical selection string; the definition is looked up by
+    /// the selection's catalog id.
     fn spawn_build(
         &self,
-        source_id: String,
+        selector: SourceSelector,
         generation: u64,
         progress: Arc<ProgressLog>,
         gate: Arc<RescanGate>,
     ) -> tokio::task::JoinHandle<()> {
         let inner = Arc::clone(&self.inner);
         let builder = Arc::clone(&self.inner.builder);
+        let key = selector.to_string();
         tokio::spawn(async move {
-            let Some(definition) = inner.catalog.load().source(&source_id).cloned() else {
+            let Some(definition) = inner.catalog.load().source(&selector.id).cloned() else {
                 // The source vanished from the catalog between selection and
                 // build (invalidated or removed). Record it as a retryable
                 // failure rather than silently dropping the entry.
                 finalize_build(
                     &inner,
-                    &source_id,
+                    &key,
                     generation,
-                    Err(format!("unknown importer source {source_id:?}")),
+                    Err(format!("unknown importer source {:?}", selector.id)),
                     progress,
                     gate,
                 );
                 return;
             };
             let request = BuildRequest {
-                source_id: source_id.clone(),
+                key: key.clone(),
+                selector: selector.clone(),
                 definition,
                 packages_dir: inner.packages_dir.clone(),
                 gate: Arc::clone(&gate),
                 progress: Arc::clone(&progress),
             };
             let result = (*builder)(request).await;
-            finalize_build(&inner, &source_id, generation, result, progress, gate);
+            finalize_build(&inner, &key, generation, result, progress, gate);
         })
     }
 
@@ -752,17 +898,18 @@ impl SourceHost {
         let id = source_id.trim();
         match self.gate_alternate(source_id, headers)? {
             GateOutcome::Default => Ok(BuildStatusReport::serving(id)),
-            GateOutcome::Alternate => {
+            GateOutcome::Alternate(selector) => {
+                let key = selector.to_string();
                 let alternates = self.read_alternates();
-                Ok(match alternates.get(id) {
-                    None => BuildStatusReport::idle(id),
+                Ok(match alternates.get(&key) {
+                    None => BuildStatusReport::idle(&key),
                     Some(entry) => match &entry.source {
                         AlternateSource::Building {
                             progress, started, ..
-                        } => BuildStatusReport::building(id, progress, *started),
-                        AlternateSource::Serving { .. } => BuildStatusReport::serving(id),
+                        } => BuildStatusReport::building(&key, progress, *started),
+                        AlternateSource::Serving { .. } => BuildStatusReport::serving(&key),
                         AlternateSource::Failed { message, .. } => {
-                            BuildStatusReport::failed(id, message)
+                            BuildStatusReport::failed(&key, message)
                         }
                     },
                 })
@@ -779,12 +926,12 @@ impl SourceHost {
         since: u64,
         headers: &HeaderMap,
     ) -> Result<ProgressResponse, SourceError> {
-        let id = source_id.trim();
         match self.gate_alternate(source_id, headers)? {
             GateOutcome::Default => Ok(self.inner.default.inner.progress.since(since)),
-            GateOutcome::Alternate => {
+            GateOutcome::Alternate(selector) => {
+                let key = selector.to_string();
                 let alternates = self.read_alternates();
-                Ok(match alternates.get(id) {
+                Ok(match alternates.get(&key) {
                     None => ProgressLog::new().since(since),
                     Some(entry) => match &entry.source {
                         AlternateSource::Building { progress, .. } => progress.since(since),
@@ -810,23 +957,24 @@ impl SourceHost {
             GateOutcome::Default => Err(SourceError::Conflict(format!(
                 "importer source {id:?} is the deployment default and is always serving"
             ))),
-            GateOutcome::Alternate => {
+            GateOutcome::Alternate(selector) => {
+                let key = selector.to_string();
                 let mut alternates = self.write_alternates();
-                if let Some(entry) = alternates.get(id) {
+                if let Some(entry) = alternates.get(&key) {
                     match &entry.source {
                         AlternateSource::Building { .. } => {
                             return Err(SourceError::Conflict(format!(
-                                "importer source {id:?} is already building"
+                                "importer source {key:?} is already building"
                             )));
                         }
                         AlternateSource::Serving { .. } => {
                             return Err(SourceError::Conflict(format!(
-                                "importer source {id:?} is already serving"
+                                "importer source {key:?} is already serving"
                             )));
                         }
                         AlternateSource::Failed { finished, .. } => {
                             tracing::info!(
-                                source = %id,
+                                source = %key,
                                 failed_for_ms = elapsed_ms(*finished),
                                 "retrying failed alternate importer source"
                             );
@@ -838,14 +986,14 @@ impl SourceHost {
                 let started = Instant::now();
                 let generation = self.next_generation();
                 let task = self.spawn_build(
-                    id.to_owned(),
+                    selector.clone(),
                     generation,
                     Arc::clone(&progress),
                     Arc::clone(&gate),
                 );
-                let report = BuildStatusReport::building(id, &progress, started);
+                let report = BuildStatusReport::building(&key, &progress, started);
                 alternates.insert(
-                    id.to_owned(),
+                    key,
                     AlternateEntry {
                         source: AlternateSource::Building {
                             progress,
@@ -864,8 +1012,9 @@ impl SourceHost {
 
     /// Gate a `/status`, `/progress`, or `/retry` request with the same
     /// authorization and validity checks as [`Self::select`]: the deployment
-    /// default is always allowed; any other id requires the configured group
-    /// and must name a known, runnable catalog source.
+    /// default (with no parameters) is always allowed; any other selection
+    /// requires the configured group and must name a known, runnable catalog
+    /// source with only that source's declared parameters.
     fn gate_alternate(
         &self,
         source_id: &str,
@@ -875,20 +1024,22 @@ impl SourceHost {
         if id.is_empty() {
             return Ok(GateOutcome::Default);
         }
+        let selector = SourceSelector::parse(id).map_err(SourceError::BadSelection)?;
         let catalog = self.inner.catalog.load();
-        if catalog.selected() == Some(id) {
+        if catalog.selected() == Some(selector.id.as_str()) && selector.params.is_empty() {
             return Ok(GateOutcome::Default);
         }
         if !self.inner.switch.authorize(headers) {
             return Err(SourceError::Forbidden);
         }
-        let Some(definition) = catalog.source(id) else {
-            return Err(SourceError::Unknown(id.to_owned()));
+        let Some(definition) = catalog.source(&selector.id) else {
+            return Err(SourceError::Unknown(selector.id.clone()));
         };
         if !definition.runnable() {
-            return Err(SourceError::NotRunnable(id.to_owned()));
+            return Err(SourceError::NotRunnable(selector.id.clone()));
         }
-        Ok(GateOutcome::Alternate)
+        validate_selection_params(&selector, definition).map_err(SourceError::BadSelection)?;
+        Ok(GateOutcome::Alternate(selector))
     }
 
     fn read_alternates(&self) -> RwLockReadGuard<'_, HashMap<String, AlternateEntry>> {
@@ -904,12 +1055,406 @@ impl SourceHost {
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
+
+    fn read_parameters_cache(
+        &self,
+    ) -> RwLockReadGuard<'_, HashMap<String, (Instant, ParametersReport)>> {
+        self.inner
+            .parameters_cache
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn write_parameters_cache(
+        &self,
+    ) -> RwLockWriteGuard<'_, HashMap<String, (Instant, ParametersReport)>> {
+        self.inner
+            .parameters_cache
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Resolve one source's parameter pickers, running any live discovery
+    /// (bounded: [`DISCOVERY_TIMEOUT_SECONDS`], [`DISCOVERY_MAX_ITEMS`]) and
+    /// caching the result per catalog id for [`PARAMETERS_CACHE_TTL`]. Gated
+    /// like `/status`: the deployment default is always allowed; any other id
+    /// requires the configured group and must name a known source (404/403).
+    pub async fn parameters(
+        &self,
+        source_id: &str,
+        headers: &HeaderMap,
+    ) -> Result<ParametersReport, SourceError> {
+        let selector = SourceSelector::parse(source_id.trim()).map_err(SourceError::BadSelection)?;
+        let catalog = self.inner.catalog.load();
+        let is_default = catalog.selected() == Some(selector.id.as_str());
+        if !is_default && !self.inner.switch.authorize(headers) {
+            return Err(SourceError::Forbidden);
+        }
+        let Some(definition) = catalog.source(&selector.id) else {
+            return Err(SourceError::Unknown(selector.id.clone()));
+        };
+        let definition = definition.clone();
+        drop(catalog);
+        {
+            let cache = self.read_parameters_cache();
+            if let Some((at, report)) = cache.get(&selector.id) {
+                if at.elapsed() < PARAMETERS_CACHE_TTL {
+                    return Ok(report.clone());
+                }
+            }
+        }
+        let report = self.compute_parameters(&selector.id, &definition).await;
+        self.write_parameters_cache()
+            .insert(selector.id.clone(), (Instant::now(), report.clone()));
+        Ok(report)
+    }
+
+    /// Build the per-parameter report for one source. Each parameter with a
+    /// `discover` block is listed live; the static `values` are appended
+    /// (deduped by id). Discovery failures fall back to the static values with
+    /// the error surfaced.
+    async fn compute_parameters(
+        &self,
+        source_id: &str,
+        definition: &ImporterSourceDefinition,
+    ) -> ParametersReport {
+        let mut parameters = BTreeMap::new();
+        for (name, parameter) in &definition.parameters {
+            let mut values: Vec<ParameterValue> = Vec::new();
+            let mut discovered = false;
+            let mut error = None;
+            if let Some(discover) = &parameter.discover {
+                match self.discover_values(source_id, definition, discover).await {
+                    Ok(found) => {
+                        discovered = true;
+                        values = found;
+                    }
+                    Err(message) => error = Some(message),
+                }
+            }
+            let mut seen: std::collections::HashSet<String> =
+                values.iter().map(|value| value.id.clone()).collect();
+            for value in &parameter.values {
+                if seen.insert(value.clone()) {
+                    values.push(ParameterValue {
+                        id: value.clone(),
+                        label: value.clone(),
+                    });
+                }
+            }
+            parameters.insert(
+                name.clone(),
+                ParameterReport {
+                    label: parameter.label.clone(),
+                    default: parameter.default.clone(),
+                    values,
+                    discovered,
+                    error,
+                },
+            );
+        }
+        ParametersReport {
+            source: source_id.to_owned(),
+            parameters,
+        }
+    }
+
+    /// Run one parameter's live discovery against the bound httpjson API,
+    /// exactly as `build_alternate` would build the instance (endpoint +
+    /// variables + token), through the json engine's own reqwest transport.
+    /// Bounded by [`DISCOVERY_TIMEOUT_SECONDS`] and [`DISCOVERY_MAX_ITEMS`].
+    async fn discover_values(
+        &self,
+        source_id: &str,
+        definition: &ImporterSourceDefinition,
+        discover: &ImporterParameterDiscover,
+    ) -> Result<Vec<ParameterValue>, String> {
+        let http_json = definition
+            .http_json
+            .as_ref()
+            .ok_or_else(|| "discovery requires an httpJson binding".to_owned())?;
+        let packages_dir = self
+            .inner
+            .packages_dir
+            .clone()
+            .ok_or_else(|| "importer packages directory is not configured".to_owned())?;
+        let manifest_path = packages_dir.join(&http_json.package);
+        let package = tokio::task::spawn_blocking(move || {
+            crate::importer_package::load_importer_package(&manifest_path)
+        })
+        .await
+        .map_err(|error| format!("package load task failed: {error}"))??
+        .0;
+        let json_config = package.json_config().map_err(|error| error.to_string())?;
+        // Template variables: package defaults, overridden by the binding's
+        // static variables, overridden by parameter defaults. The variable being
+        // discovered is deliberately absent from the discovery path.
+        let mut variables = BTreeMap::new();
+        for spec in &json_config.variables {
+            if let Some(default) = &spec.default {
+                variables.insert(spec.name.clone(), default.clone());
+            }
+        }
+        for (key, value) in &http_json.variables {
+            variables.insert(key.clone(), value.clone());
+        }
+        for (name, parameter) in &definition.parameters {
+            if let Some(default) = &parameter.default {
+                variables.insert(name.clone(), default.clone());
+            }
+        }
+        let path = expand_template(&discover.path, &variables)?;
+        let url = format!("{}{}", http_json.endpoint.trim_end_matches('/'), path);
+        let token = http_json
+            .token_env
+            .as_deref()
+            .and_then(|name| std::env::var(name).ok());
+        let instance = importer::InstanceConfig {
+            source_id: sanitize_source_id(source_id),
+            base_url: http_json.endpoint.clone(),
+            variables,
+            token,
+            poll_interval_ms: 0,
+        };
+        let transport =
+            importer::json::ReqwestTransport::new(&instance, package.limits(), DISCOVERY_TIMEOUT_SECONDS)
+                .map_err(|error| error.to_string())?;
+        let bytes = tokio::time::timeout(
+            Duration::from_secs(DISCOVERY_TIMEOUT_SECONDS),
+            importer::json::JsonTransport::get(&transport, &url),
+        )
+        .await
+        .map_err(|_| format!("discovery timed out after {DISCOVERY_TIMEOUT_SECONDS}s"))?
+        .map_err(|error| error.to_string())?;
+        let value: serde_json::Value = serde_json::from_slice(&bytes)
+            .map_err(|error| format!("discovery response is not JSON: {error}"))?;
+        let items = value
+            .pointer(&discover.items_pointer)
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| format!("discovery response has no array at {}", discover.items_pointer))?;
+        let mut out = Vec::new();
+        for item in items.iter().take(DISCOVERY_MAX_ITEMS) {
+            let id = match item.pointer(&discover.id_pointer) {
+                Some(serde_json::Value::String(text)) => text.clone(),
+                Some(other) => other.to_string(),
+                None => continue,
+            };
+            let label = discover
+                .label_pointer
+                .as_ref()
+                .and_then(|pointer| item.pointer(pointer))
+                .and_then(|value| match value {
+                    serde_json::Value::String(text) => Some(text.clone()),
+                    _ => None,
+                })
+                .unwrap_or_else(|| id.clone());
+            out.push(ParameterValue { id, label });
+        }
+        Ok(out)
+    }
+
+    /// Validate that every package variable the bound package requires (no
+    /// package default) is covered by the binding's static variables or a
+    /// declared parameter, and that every declared parameter names a real
+    /// package variable. Loads the package on first touch; surfaced as a 400
+    /// so a misconfigured catalog entry fails loudly rather than as an opaque
+    /// 503 build failure. Sources with no package binding are trivially valid.
+    async fn validate_parameter_coverage(
+        &self,
+        selector: &SourceSelector,
+    ) -> Result<(), SourceError> {
+        let catalog = self.inner.catalog.load();
+        let Some(definition) = catalog.source(&selector.id) else {
+            return Err(SourceError::Unknown(selector.id.clone()));
+        };
+        let (package_file, bound_variables) = match definition.kind {
+            CatalogSourceKind::HttpJson => match &definition.http_json {
+                Some(binding) => (binding.package.clone(), binding.variables.clone()),
+                None => return Ok(()),
+            },
+            CatalogSourceKind::Tvix => match &definition.tvix {
+                Some(binding) => (binding.package.clone(), binding.variables.clone()),
+                None => return Ok(()),
+            },
+            _ => return Ok(()),
+        };
+        let parameters: BTreeMap<String, ()> =
+            definition.parameters.keys().map(|k| (k.clone(), ())).collect();
+        let id = selector.id.clone();
+        drop(catalog);
+        let Some(packages_dir) = self.inner.packages_dir.clone() else {
+            // No packages dir: the build path itself reports the clear
+            // deployment error; nothing to validate here.
+            return Ok(());
+        };
+        let manifest_path = packages_dir.join(&package_file);
+        let package = tokio::task::spawn_blocking(move || {
+            crate::importer_package::load_importer_package(&manifest_path)
+        })
+        .await
+        .map_err(|error| SourceError::BadSelection(format!("package load task failed: {error}")))?
+        .map_err(SourceError::BadSelection)?
+        .0;
+        let declared = declared_variables(&package);
+        for (name, has_default) in &declared {
+            if *has_default || bound_variables.contains_key(name) || parameters.contains_key(name) {
+                continue;
+            }
+            return Err(SourceError::BadSelection(format!(
+                "source {id:?} is misconfigured: package variable {name:?} is required (no package \
+                 default) but is neither bound in variables nor declared as a parameter"
+            )));
+        }
+        let declared_names: std::collections::HashSet<&str> =
+            declared.iter().map(|(name, _)| name.as_str()).collect();
+        for name in parameters.keys() {
+            if !declared_names.contains(name.as_str()) {
+                return Err(SourceError::BadSelection(format!(
+                    "source {id:?} declares parameter {name:?}, which is not a variable of its \
+                     package"
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Validate a selection's parameters against a source definition without the
+/// package: parameters are only accepted on a package-backed source, and every
+/// supplied key must be a declared parameter of that source. (Declared-vs-
+/// package-variable and required-coverage checks need the package; see
+/// [`SourceHost::validate_parameter_coverage`].)
+fn validate_selection_params(
+    selector: &SourceSelector,
+    definition: &ImporterSourceDefinition,
+) -> Result<(), String> {
+    if selector.params.is_empty() {
+        return Ok(());
+    }
+    if definition.http_json.is_none() && definition.tvix.is_none() {
+        return Err(format!("source {:?} does not accept parameters", selector.id));
+    }
+    for key in selector.params.keys() {
+        if !definition.parameters.contains_key(key) {
+            return Err(format!(
+                "source {:?} has no parameter {key:?}; declared parameters: [{}]",
+                selector.id,
+                definition
+                    .parameters
+                    .keys()
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The package's declared variables as `(name, has_default)`, engine-aware so
+/// coverage validation works for both httpjson and tvix packages.
+fn declared_variables(package: &importer::ValidatedPackage) -> Vec<(String, bool)> {
+    if let Ok(config) = package.json_config() {
+        return config
+            .variables
+            .iter()
+            .map(|variable| (variable.name.clone(), variable.default.is_some()))
+            .collect();
+    }
+    if let Ok(config) = package.tvix_config() {
+        return config
+            .variables
+            .iter()
+            .map(|variable| (variable.name.clone(), variable.default.is_some()))
+            .collect();
+    }
+    Vec::new()
+}
+
+/// The instance variables for one build: the binding's static variables,
+/// overridden by parameter defaults, overridden by the selection's parameter
+/// values (later wins). Package defaults for anything still unset are applied
+/// downstream by the package's own `resolve_variables`.
+fn merge_binding_variables(
+    base: &BTreeMap<String, String>,
+    definition: &ImporterSourceDefinition,
+    selector: &SourceSelector,
+) -> BTreeMap<String, String> {
+    let mut variables = base.clone();
+    for (name, parameter) in &definition.parameters {
+        if let Some(default) = &parameter.default {
+            variables.insert(name.clone(), default.clone());
+        }
+    }
+    for (key, value) in &selector.params {
+        variables.insert(key.clone(), value.clone());
+    }
+    variables
+}
+
+/// The node-namespacing `source_id` for one build. With no parameters it is
+/// the declared `sourceId` (or the sanitized package id). With parameters it is
+/// the declared `sourceId` (or the catalog id) suffixed by a slug of the
+/// selection's parameters, so two selections of one source never collide in the
+/// node namespace. `source_id` must be `[a-z0-9._-]`, so the suffix (which
+/// carries `=`/`&`) is folded through [`sanitize_source_id`].
+fn namespaced_source_id(
+    definition: &ImporterSourceDefinition,
+    selector: &SourceSelector,
+    package_id: &str,
+) -> String {
+    if selector.params.is_empty() {
+        return definition
+            .source_id
+            .clone()
+            .unwrap_or_else(|| sanitize_source_id(package_id));
+    }
+    let base = definition
+        .source_id
+        .clone()
+        .unwrap_or_else(|| selector.id.clone());
+    sanitize_source_id(&format!("{base}.{}", params_slug(&selector.params)))
+}
+
+/// A deterministic `k-v.k-v` slug of the selection parameters (sorted by key),
+/// used to distinguish node namespaces per parameter set.
+fn params_slug(params: &BTreeMap<String, String>) -> String {
+    params
+        .iter()
+        .map(|(key, value)| format!("{key}-{value}"))
+        .collect::<Vec<_>>()
+        .join(".")
+}
+
+/// Expand every `{name}` placeholder in a path template with the resolved
+/// variables. An unterminated placeholder or an unbound variable is an error.
+fn expand_template(template: &str, variables: &BTreeMap<String, String>) -> Result<String, String> {
+    let mut out = String::with_capacity(template.len());
+    let mut rest = template;
+    while let Some(start) = rest.find('{') {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + 1..];
+        let end = after
+            .find('}')
+            .ok_or_else(|| format!("unterminated {{ in template {template:?}"))?;
+        let name = &after[..end];
+        let value = variables
+            .get(name)
+            .ok_or_else(|| format!("template {template:?} references unbound variable {name:?}"))?;
+        out.push_str(value);
+        rest = &after[end + 1..];
+    }
+    out.push_str(rest);
+    Ok(out)
 }
 
 /// Inputs to one alternate build, bundled so the build step is a simple
 /// `Fn(BuildRequest) -> Future` seam that tests replace with a fake.
 struct BuildRequest {
-    source_id: String,
+    /// Canonical selection string; the alternates-map key and progress source.
+    key: String,
+    /// Parsed selection (catalog id + parameter values) driving the build.
+    selector: SourceSelector,
     definition: crate::importer_catalog::ImporterSourceDefinition,
     packages_dir: Option<PathBuf>,
     gate: Arc<RescanGate>,
@@ -935,7 +1480,8 @@ fn default_builder() -> AlternateBuilder {
     Arc::new(|request: BuildRequest| -> BuildFuture {
         Box::pin(async move {
             build_alternate(
-                &request.source_id,
+                &request.key,
+                &request.selector,
                 &request.definition,
                 request.packages_dir.as_deref(),
                 request.gate,
@@ -1033,6 +1579,7 @@ fn elapsed_ms(started: Instant) -> u64 {
 /// stop while no request resolves to this source.
 async fn build_alternate(
     source_id: &str,
+    selector: &SourceSelector,
     definition: &crate::importer_catalog::ImporterSourceDefinition,
     packages_dir: Option<&Path>,
     gate: Arc<RescanGate>,
@@ -1058,10 +1605,9 @@ async fn build_alternate(
             .await
             .map_err(|error| format!("httpjson source {source_id:?}: package load task failed: {error}"))?
             .map_err(|error| format!("httpjson source {source_id:?}: {error}"))?;
-            let source_id_value = definition
-                .source_id
-                .clone()
-                .unwrap_or_else(|| sanitize_source_id(&package.manifest().metadata.id));
+            let source_id_value =
+                namespaced_source_id(definition, selector, &package.manifest().metadata.id);
+            let variables = merge_binding_variables(&http_json.variables, definition, selector);
             let token = http_json
                 .token_env
                 .as_deref()
@@ -1069,7 +1615,7 @@ async fn build_alternate(
             let instance = importer::InstanceConfig {
                 source_id: source_id_value,
                 base_url: http_json.endpoint.clone(),
-                variables: http_json.variables.clone(),
+                variables,
                 token,
                 poll_interval_ms: http_json.poll_interval_ms,
             };
@@ -1099,6 +1645,46 @@ async fn build_alternate(
             );
             Ok((state, watcher))
         }
+        CatalogSourceKind::Tvix => {
+            let tvix = definition
+                .tvix
+                .as_ref()
+                .ok_or_else(|| format!("tvix source {source_id:?} has no tvix contract"))?;
+            let packages_dir = packages_dir.ok_or_else(|| {
+                format!(
+                    "tvix source {source_id:?} cannot be served: \
+                     JUMP_CANNON_IMPORTER_PACKAGES_DIR is not configured"
+                )
+            })?;
+            let manifest_path = packages_dir.join(&tvix.package);
+            let (package, _definition) = tokio::task::spawn_blocking(move || {
+                crate::importer_package::load_importer_package(&manifest_path)
+            })
+            .await
+            .map_err(|error| format!("tvix source {source_id:?}: package load task failed: {error}"))?
+            .map_err(|error| format!("tvix source {source_id:?}: {error}"))?;
+            let source_id_value =
+                namespaced_source_id(definition, selector, &package.manifest().metadata.id);
+            let variables = merge_binding_variables(&tvix.variables, definition, selector);
+            // A tvix generator evaluates a Nix expression; there is no remote
+            // root, so the filesystem root is empty like the httpjson arm.
+            let root = PathBuf::new();
+            let importer: Box<dyn data_loader::Importer> = Box::new(
+                importer::build_tvix_importer(package, variables, source_id_value)
+                    .map_err(|error| error.to_string())?,
+            );
+            let grants: std::collections::HashSet<data_loader::Capability> =
+                importer.descriptor().capabilities.into_iter().collect();
+            let state = crate::build_world_state(importer, grants, root, progress)
+                .await
+                .map_err(|error| format!("import alternate source {source_id:?}: {error}"))?;
+            let watcher = crate::watcher::spawn_gated(
+                state.clone(),
+                definition.filesystem_rescan_interval_seconds.unwrap_or(0),
+                gate,
+            );
+            Ok((state, watcher))
+        }
         CatalogSourceKind::Okf | CatalogSourceKind::Obsidian => {
             let filesystem = definition.source.as_ref().ok_or_else(|| {
                 format!("importer source {source_id:?} has no filesystem source")
@@ -1117,7 +1703,7 @@ async fn build_alternate(
                 CatalogSourceKind::Obsidian => {
                     Box::new(vault_links::ObsidianLoader::new(root.clone()))
                 }
-                _ => unreachable!("filesystem match arm excludes HttpJson"),
+                _ => unreachable!("filesystem match arm excludes HttpJson and Tvix"),
             };
             let grants: std::collections::HashSet<data_loader::Capability> =
                 importer.descriptor().capabilities.into_iter().collect();
@@ -1161,9 +1747,11 @@ fn sanitize_source_id(package_id: &str) -> String {
     }
 }
 
-/// Extract the requested source id: the header first, then the `source` query
-/// parameter (the layout WebSocket cannot set headers). Catalog ids are
-/// validated URL-safe ASCII, so no percent-decoding is needed.
+/// Extract the requested selection string: the header first (carrying the
+/// canonical selection verbatim), then the `source` query parameter on the
+/// layout WebSocket (which cannot set headers). The query value is a single
+/// percent-encoded token — it may itself contain `?`/`&`/`=` — so it is decoded
+/// once here into the canonical form that [`SourceSelector::parse`] expects.
 fn requested_source(parts: &Parts) -> Option<String> {
     if let Some(value) = parts.headers.get(SOURCE_HEADER) {
         return value.to_str().ok().map(str::to_owned);
@@ -1174,7 +1762,11 @@ fn requested_source(parts: &Parts) -> Option<String> {
             .strip_prefix(SOURCE_QUERY_PARAM)
             .and_then(|rest| rest.strip_prefix('='))
         {
-            return Some(value.to_owned());
+            return Some(
+                urlencoding::decode(value)
+                    .map(std::borrow::Cow::into_owned)
+                    .unwrap_or_else(|_| value.to_owned()),
+            );
         }
     }
     None
@@ -1400,10 +1992,16 @@ mod tests {
         .to_string();
         let catalog = ImporterCatalog::parse_with_runtime_switch(
             Some(&catalog_json),
-            data_loader::SourceKind::Generate,
+            data_loader::SourceKind::Pest,
             true,
         )
         .expect("switch catalog parses");
+        state_from_catalog(catalog).await
+    }
+
+    /// Build a default [`AppState`] over a `TinyImporter` for an already-parsed
+    /// catalog — shared by [`default_state`] and [`param_state`].
+    async fn state_from_catalog(catalog: ImporterCatalog) -> AppState {
         let grants: std::collections::HashSet<data_loader::Capability> =
             std::iter::once(data_loader::Capability::new(
                 data_loader::Effect::Read,
@@ -1427,6 +2025,38 @@ mod tests {
             catalog,
         )
         .expect("default app state")
+    }
+
+    /// A default [`AppState`] whose catalog declares a runnable httpjson source
+    /// `banked` with a `bank` parameter, so parameterised selections gate and
+    /// namespace exactly like production (the fake builder bypasses the real
+    /// package load, and `packages_dir` is `None` so coverage validation is a
+    /// no-op).
+    async fn param_state() -> AppState {
+        let catalog_json = serde_json::json!({
+            "selected": "default",
+            "sources": {
+                "default": { "displayName": "Default", "kind": "pest" },
+                "banked": {
+                    "displayName": "Banked",
+                    "kind": "httpjson",
+                    "httpJson": {
+                        "package": "banked.toml",
+                        "endpoint": "http://banked.invalid",
+                        "variables": {}
+                    },
+                    "parameters": { "bank": { "label": "Memory bank" } }
+                }
+            }
+        })
+        .to_string();
+        let catalog = ImporterCatalog::parse_with_runtime_switch(
+            Some(&catalog_json),
+            data_loader::SourceKind::Pest,
+            true,
+        )
+        .expect("param catalog parses");
+        state_from_catalog(catalog).await
     }
 
     fn test_switch() -> SwitchConfig {
@@ -1595,5 +2225,153 @@ mod tests {
             )),
             "the alternate's own build stages flow through its progress log"
         );
+    }
+
+    /// SourceSelector round-trips its canonical form (id + sorted, encoded
+    /// params) and `validate_selection_params` rejects a parameter the source
+    /// does not declare.
+    #[test]
+    fn source_selector_round_trips_and_rejects_undeclared_params() {
+        // Bare id.
+        let bare = SourceSelector::parse("hindsight").expect("bare id parses");
+        assert_eq!(bare.id, "hindsight");
+        assert!(bare.params.is_empty());
+        assert_eq!(bare.to_string(), "hindsight");
+
+        // Params are sorted by key and survive a Display -> parse round trip.
+        let selection = "hindsight?bank=omp&tenant=default";
+        let parsed = SourceSelector::parse(selection).expect("parses");
+        assert_eq!(parsed.id, "hindsight");
+        assert_eq!(parsed.params.get("bank").map(String::as_str), Some("omp"));
+        assert_eq!(parsed.params.get("tenant").map(String::as_str), Some("default"));
+        assert_eq!(parsed.to_string(), selection, "canonical form is stable");
+        // Unsorted input canonicalizes to sorted output.
+        assert_eq!(
+            SourceSelector::parse("hindsight?tenant=default&bank=omp")
+                .unwrap()
+                .to_string(),
+            selection
+        );
+        // A value needing encoding round-trips through percent-encoding.
+        let encoded = SourceSelector::parse("hindsight?bank=a%2Fb").expect("encoded value parses");
+        assert_eq!(encoded.params.get("bank").map(String::as_str), Some("a/b"));
+        assert_eq!(encoded.to_string(), "hindsight?bank=a%2Fb");
+
+        // Malformed selections are rejected.
+        assert!(SourceSelector::parse("").is_err());
+        assert!(SourceSelector::parse("hindsight?").is_err());
+        assert!(SourceSelector::parse("hindsight?bank").is_err());
+        assert!(SourceSelector::parse("hindsight?bank=a&bank=b").is_err());
+
+        // validate_selection_params: a declared parameter is accepted; an
+        // undeclared one and any parameter on a non-package source are rejected.
+        let mut parameters = BTreeMap::new();
+        parameters.insert(
+            "bank".to_owned(),
+            crate::importer_catalog::ImporterParameter {
+                label: "Memory bank".to_owned(),
+                discover: None,
+                values: Vec::new(),
+                default: None,
+            },
+        );
+        let http_json = ImporterSourceDefinition {
+            display_name: "Banked".to_owned(),
+            description: String::new(),
+            kind: CatalogSourceKind::HttpJson,
+            source_id: None,
+            filesystem_rescan_interval_seconds: None,
+            source: None,
+            http_json: Some(crate::importer_catalog::ImporterHttpJsonSource {
+                package: "p.toml".to_owned(),
+                endpoint: "http://x.invalid".to_owned(),
+                variables: BTreeMap::new(),
+                token_env: None,
+                poll_interval_ms: 60_000,
+            }),
+            tvix: None,
+            producer: None,
+            parameters,
+        };
+        validate_selection_params(&SourceSelector::parse("s?bank=omp").unwrap(), &http_json)
+            .expect("declared parameter accepted");
+        assert!(
+            validate_selection_params(&SourceSelector::parse("s?region=us").unwrap(), &http_json)
+                .is_err(),
+            "an undeclared parameter is rejected"
+        );
+
+        let obsidian = ImporterSourceDefinition {
+            http_json: None,
+            kind: CatalogSourceKind::Obsidian,
+            parameters: BTreeMap::new(),
+            ..http_json.clone()
+        };
+        assert!(
+            validate_selection_params(&SourceSelector::parse("s?bank=omp").unwrap(), &obsidian)
+                .is_err(),
+            "a non-package source accepts no parameters"
+        );
+    }
+
+    /// (b) Two selections of one parameterised source with different `bank`
+    /// values build two independent alternates keyed by their canonical
+    /// selection strings, each with a distinct node namespace.
+    #[tokio::test]
+    async fn two_bank_selections_build_independent_namespaced_alternates() {
+        let default = param_state().await;
+        let served = default.clone();
+        let namespaces: Arc<std::sync::Mutex<Vec<String>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured = Arc::clone(&namespaces);
+        let builder: AlternateBuilder = Arc::new(move |request: BuildRequest| -> BuildFuture {
+            let served = served.clone();
+            let captured = Arc::clone(&captured);
+            Box::pin(async move {
+                captured
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(namespaced_source_id(
+                    &request.definition,
+                    &request.selector,
+                    "pkg",
+                ));
+                Ok((served, None))
+            })
+        });
+        let host = host_with_builder(default, builder);
+        let headers = authed_headers();
+
+        host.select(Some("banked?bank=omp"), &headers)
+            .await
+            .expect_err("first omp selection reports Building");
+        host.select(Some("banked?bank=jira-ithelp"), &headers)
+            .await
+            .expect_err("first jira selection reports Building");
+        wait_for_status(&host, "banked?bank=omp", &headers, "serving").await;
+        wait_for_status(&host, "banked?bank=jira-ithelp", &headers, "serving").await;
+
+        let omp = host
+            .select(Some("banked?bank=omp"), &headers)
+            .await
+            .expect("omp serves");
+        let jira = host
+            .select(Some("banked?bank=jira-ithelp"), &headers)
+            .await
+            .expect("jira serves");
+        assert_eq!(omp.alternate.as_deref(), Some("banked?bank=omp"));
+        assert_eq!(jira.alternate.as_deref(), Some("banked?bank=jira-ithelp"));
+
+        let recorded = namespaces
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        assert_eq!(recorded.len(), 2, "each selection builds exactly once");
+        assert_ne!(
+            recorded[0], recorded[1],
+            "two banks get distinct node namespaces"
+        );
+        assert!(recorded.iter().any(|n| n.contains("bank-omp")));
+        assert!(recorded.iter().any(|n| n.contains("bank-jira-ithelp")));
     }
 }

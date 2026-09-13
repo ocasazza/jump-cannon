@@ -1741,7 +1741,6 @@ dependencies = [
  "tower-http 0.5.2",
  "tracing",
  "tracing-subscriber",
- "tvix-loader",
  "tvix-wasm",
  "urlencoding",
  "vault-data",
@@ -2240,6 +2239,7 @@ dependencies = [
  "tokio",
  "toml 0.8.23",
  "tracing",
+ "tvix-wasm",
  "vault-data",
 ]
 
@@ -5772,21 +5772,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 1.0.109",
-]
-
-[[package]]
-name = "tvix-loader"
-version = "1.0.0"
-dependencies = [
- "data-loader",
- "rand 0.8.7",
- "serde",
- "serde_json",
- "tempfile",
- "tokio",
- "tracing",
- "tvix-wasm",
- "vault-data",
 ]
 
 [[package]]
