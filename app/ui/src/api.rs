@@ -746,6 +746,61 @@ pub async fn post_importer(importer: &NewImporter) -> ApiResult<ImporterProfile>
     definition_response(resp).await
 }
 
+// --- importer runtime variables ---------------------------------------------
+
+/// One `[[parser.variables]]` declaration from an httpjson package: the
+/// placeholder name, its description, and the package default applied when
+/// the instance sets no value.
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+pub struct DeclaredVariable {
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    /// Package default; `None` when the declaration carries none.
+    pub default: Option<String>,
+}
+
+/// `GET`/`PUT /importers/{id}/variables` — an httpjson source's declared
+/// package variables plus the instance's effective current values. Unset
+/// variables are simply absent from `current`; the UI shows the declared
+/// default as the field's placeholder.
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+pub struct VariablesResponse {
+    #[serde(default)]
+    pub declared: Vec<DeclaredVariable>,
+    #[serde(default)]
+    pub current: std::collections::BTreeMap<String, String>,
+}
+
+/// `GET /importers/{id}/variables` — catalog-read posture, same as the
+/// definition route. A 400 names a non-httpjson binding and a 404 an unknown
+/// source id; both surface as the usual `HTTP <status>` error string, and
+/// callers hide the variables surface for them.
+pub async fn get_variables(source_id: &str) -> ApiResult<VariablesResponse> {
+    let resp = get(&format!("/importers/{source_id}/variables"))
+        .send()
+        .await
+        .map_err(err)?;
+    definition_response(resp).await
+}
+
+/// `PUT /importers/{id}/variables` — full replacement of the instance's
+/// variable set, answered with the post-write effective state (same shape as
+/// the GET). Authorized by the same switch-group posture as the definition
+/// PUT: the group header is proxy-injected, so the request carries none.
+pub async fn put_variables(
+    source_id: &str,
+    vars: &std::collections::BTreeMap<String, String>,
+) -> ApiResult<VariablesResponse> {
+    let resp = Request::put(&url(&format!("/importers/{source_id}/variables")))
+        .json(&serde_json::json!({ "variables": vars }))
+        .map_err(err)?
+        .send()
+        .await
+        .map_err(err)?;
+    definition_response(resp).await
+}
+
 // --- vault writes ---------------------------------------------------------------
 
 #[derive(Clone, Debug, Deserialize)]

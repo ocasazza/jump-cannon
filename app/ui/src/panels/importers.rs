@@ -19,7 +19,7 @@ use std::collections::BTreeMap;
 use dioxus::prelude::*;
 use gloo_storage::{LocalStorage, Storage};
 use panel_kit::editor::{MonacoEditor, PANEL_KIT_DARK_THEME};
-use panel_kit::loading::loading_store;
+use panel_kit::loading::{loading_store, LoadingGate};
 use wasm_bindgen::{JsCast, JsValue};
 
 use crate::pest_worker::{parse_in_worker, ParsePreview};
@@ -82,6 +82,29 @@ enum ServerPackage {
     /// Text as the server last served or accepted.
     Ready(api::ImporterDefinition),
     Failed(String),
+}
+
+/// Runtime-variables section state for the selected catalog source
+/// (`GET`/`PUT /importers/:id/variables`). Absent — not failed — for any
+/// selection without a variables surface: non-httpjson bindings, 400/404
+/// from the server, or a package that declares no variables.
+#[derive(Clone, PartialEq)]
+enum VariablesState {
+    /// No section for this selection.
+    Absent,
+    /// Fetch in flight for the selected source; the section chrome renders
+    /// while the gate shows the load.
+    Loading,
+    /// The fetch failed with a real error (network, 5xx); the gate renders
+    /// it with a retry available through reselecting the source.
+    Failed(String),
+    /// Declared package variables, the instance's effective values, and the
+    /// working edits (one entry per touched field; absent = untouched).
+    Ready {
+        declared: Vec<api::DeclaredVariable>,
+        current: BTreeMap<String, String>,
+        edits: BTreeMap<String, String>,
+    },
 }
 
 /// `POST /importers` draft. The package body is the editor's MANIFEST
@@ -164,6 +187,14 @@ static NEW_SOURCE: GlobalSignal<NewSourceDraft> = Signal::global(NewSourceDraft:
 static BUSY: GlobalSignal<bool> = Signal::global(|| false);
 /// Last server rejection (validation text, authorization, read-only dir).
 static ERROR: GlobalSignal<Option<String>> = Signal::global(|| None);
+
+/// Runtime variables of the selected httpjson catalog source, plus the
+/// in-progress edits keyed by declared variable name.
+static VARIABLES: GlobalSignal<VariablesState> = Signal::global(|| VariablesState::Absent);
+/// A variables PUT is in flight; the section's apply action stays disabled.
+static VARS_BUSY: GlobalSignal<bool> = Signal::global(|| false);
+/// Last variables PUT rejection, shown inline in the section.
+static VARS_ERROR: GlobalSignal<Option<String>> = Signal::global(|| None);
 /// Live state of the last source Apply, anchored to a catalog row. Read by
 /// the graph-area loading overlay while a build is in flight.
 pub(crate) static APPLY: GlobalSignal<Option<ApplyStatus>> = Signal::global(|| None);
@@ -384,6 +415,14 @@ fn set_manifest_from_grammar(text: String) {
 fn select(sel: Selection) {
     *SERVER_PACKAGE.write() = ServerPackage::Idle;
     *ERROR.write() = None;
+    *VARS_ERROR.write() = None;
+    // Drop the previous selection's variables section; a superseded
+    // in-flight GET exits without resolving its store, so resolve it here
+    // to keep the GlobalLoadingBar clear.
+    if !matches!(&*VARIABLES.read(), VariablesState::Absent) {
+        *VARIABLES.write() = VariablesState::Absent;
+        loading_store("importer-variables", "loading variables…").succeed();
+    }
     match &sel {
         Selection::Local(id) => {
             let manifest = PACKAGES.peek().get(id).cloned().unwrap_or_default();
@@ -391,9 +430,23 @@ fn select(sel: Selection) {
             *SELECTION.write() = Some(sel);
             set_manifest(manifest);
         }
-        Selection::Catalog(_) => {
+        Selection::Catalog(id) => {
+            let id = id.clone();
             *SELECTION.write() = Some(sel);
             set_manifest(String::new());
+            // Only httpjson bindings carry declared package variables; for
+            // other kinds the section stays absent without a doomed request.
+            let httpjson = match &*CATALOG.read() {
+                CatalogState::Ready(c) => {
+                    c.sources.iter().any(|p| p.id == id && p.kind == "httpjson")
+                }
+                // Catalog not loaded (stale selection): let the server
+                // decide — a 400/404 hides the section.
+                _ => true,
+            };
+            if httpjson {
+                load_variables(id.clone());
+            }
         }
         Selection::NewCatalog => {
             *SELECTION.write() = Some(sel);
@@ -449,6 +502,107 @@ fn save_server_package(id: String) {
             }
         }
         *BUSY.write() = false;
+    });
+}
+
+/// True when a GET error string is an expected no-section posture rather
+/// than a failure: 400 names a non-httpjson binding, 404 an unknown source
+/// id (also an older server without the route).
+fn is_no_variables_error(message: &str) -> bool {
+    message.starts_with("HTTP 400") || message.starts_with("HTTP 404")
+}
+
+/// Fetch the selected catalog source's runtime variables into the section.
+/// Expected absences (400/404) hide the section silently; real failures
+/// surface through the loading store's gate.
+fn load_variables(id: String) {
+    let store = loading_store("importer-variables", "loading variables…");
+    *VARIABLES.write() = VariablesState::Loading;
+    *VARS_ERROR.write() = None;
+    store.begin();
+    spawn(async move {
+        let result = api::get_variables(&id).await;
+        // A superseded selection (user switched rows mid-flight) must not
+        // overwrite the new row's section.
+        if !matches!(&*SELECTION.read(), Some(Selection::Catalog(sel)) if sel == &id) {
+            return;
+        }
+        match result {
+            Ok(resp) => {
+                *VARIABLES.write() = if resp.declared.is_empty() {
+                    VariablesState::Absent
+                } else {
+                    VariablesState::Ready {
+                        declared: resp.declared,
+                        current: resp.current,
+                        edits: BTreeMap::new(),
+                    }
+                };
+                store.succeed();
+            }
+            Err(message) => {
+                if is_no_variables_error(&message) {
+                    *VARIABLES.write() = VariablesState::Absent;
+                    store.succeed();
+                } else {
+                    *VARIABLES.write() = VariablesState::Failed(message.clone());
+                    store.fail(message);
+                }
+            }
+        }
+    });
+}
+
+/// PUT the full variable set — every declared field's working value, where
+/// an empty field is omitted so the server applies the package default —
+/// then re-apply the source so its graph rebuilds with the new variables
+/// (the server invalidates its alternate; the apply tracker streams the
+/// rebuild through the usual loading overlay and Progress stages).
+fn apply_variables(ctx: Ctx, id: String) {
+    if *VARS_BUSY.peek() {
+        return;
+    }
+    let VariablesState::Ready {
+        declared,
+        current,
+        edits,
+    } = VARIABLES.peek().clone()
+    else {
+        return;
+    };
+    let vars: BTreeMap<String, String> = declared
+        .iter()
+        .map(|d| {
+            let effective = current.get(&d.name).cloned().unwrap_or_default();
+            let value = edits.get(&d.name).cloned().unwrap_or(effective);
+            (d.name.clone(), value)
+        })
+        .filter(|(_, value)| !value.is_empty())
+        .collect();
+    *VARS_BUSY.write() = true;
+    *VARS_ERROR.write() = None;
+    spawn(async move {
+        let result = api::put_variables(&id, &vars).await;
+        // A superseded selection keeps its own section; the PUT still
+        // landed server-side, but this session must not switch views.
+        if matches!(&*SELECTION.read(), Some(Selection::Catalog(sel)) if sel == &id) {
+            match result {
+                Ok(resp) => {
+                    *VARIABLES.write() = if resp.declared.is_empty() {
+                        VariablesState::Absent
+                    } else {
+                        VariablesState::Ready {
+                            declared: resp.declared,
+                            current: resp.current,
+                            edits: BTreeMap::new(),
+                        }
+                    };
+                    apply_source(ctx, id.clone(), Some(id.clone()));
+                }
+                Err(message) => *VARS_ERROR.write() = Some(message),
+            }
+        }
+        *VARS_BUSY.write() = false;
     });
 }
 
@@ -948,6 +1102,115 @@ fn apply_status_view(ctx: Ctx, status: &ApplyStatus) -> Element {
     }
 }
 
+/// The `[data-field=variables]` section between the catalog summary and the
+/// package editor: an httpjson source's declared runtime variables with the
+/// instance's effective values, one input per field. "Apply & reload" PUTs
+/// the full set, then re-applies the source so its graph rebuilds with the
+/// new values. Non-httpjson bindings and expected absences (400/404, no
+/// declared variables) render nothing — the section is absent, not an error.
+fn variables_section(ctx: Ctx, profile: &api::ImporterProfile) -> Element {
+    // Only httpjson bindings have a package with declared variables.
+    if profile.kind != "httpjson" {
+        return rsx! {};
+    }
+    let state = VARIABLES.read().clone();
+    if matches!(state, VariablesState::Absent) {
+        return rsx! {};
+    }
+    let store = loading_store("importer-variables", "loading variables…");
+    let busy = *VARS_BUSY.read();
+    let error = VARS_ERROR.read().clone();
+    let apply_id = profile.id.clone();
+    rsx! {
+        section { class: "imp-vars-section", "data-field": "variables",
+            div { class: "imp-summary-title", "Variables" }
+            span { class: "imp-note",
+                "instance values for this package's placeholders — an empty field uses the package default; applying reloads the source graph"
+            }
+            LoadingGate { store,
+                {match state {
+                    VariablesState::Ready {
+                        declared,
+                        current,
+                        edits,
+                    } => {
+                        // Dirty: any declared field's working value differs
+                        // from its effective current value.
+                        let dirty = declared.iter().any(|d| {
+                            let effective =
+                                current.get(&d.name).cloned().unwrap_or_default();
+                            edits.get(&d.name).map_or(false, |v| *v != effective)
+                        });
+                        rsx! {
+                            div { class: "imp-vars-body",
+                                for d in &declared {
+                                    {
+                                        let name = d.name.clone();
+                                        let description = d.description.clone();
+                                        let effective =
+                                            current.get(&d.name).cloned().unwrap_or_default();
+                                        let value = edits
+                                            .get(&d.name)
+                                            .cloned()
+                                            .unwrap_or(effective.clone());
+                                        let placeholder =
+                                            d.default.clone().unwrap_or_default();
+                                        rsx! {
+                                            label { key: "{name}", class: "imp-field",
+                                                span { title: "{description}", "{name}" }
+                                                input {
+                                                    r#type: "text",
+                                                    title: "{description}",
+                                                    placeholder: "{placeholder}",
+                                                    value: "{value}",
+                                                    oninput: move |e| {
+                                                        if let VariablesState::Ready {
+                                                            edits,
+                                                            ..
+                                                        } = &mut *VARIABLES.write()
+                                                        {
+                                                            edits.insert(
+                                                                name.clone(),
+                                                                e.value(),
+                                                            );
+                                                        }
+                                                    },
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                if let Some(message) = &error {
+                                    div { class: "imp-error", role: "alert",
+                                        "data-field": "variables-error",
+                                        "{api::display_error(message)}"
+                                    }
+                                }
+                                div { class: "imp-actions",
+                                    button {
+                                        class: "btn",
+                                        r#type: "button",
+                                        "data-action": "apply-variables",
+                                        disabled: !dirty || busy,
+                                        title: "write these variables and rebuild this source's graph",
+                                        onclick: move |_| {
+                                            apply_variables(ctx, apply_id.clone())
+                                        },
+                                        if busy { "Applying…" } else { "Apply & reload" }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    // Loading / Failed: the gate itself renders the load
+                    // bar or the error.
+                    _ => rsx! {},
+                }}
+            }
+        }
+    }
+}
+
 // --- panel ------------------------------------------------------------------------
 
 pub fn panel(ctx: Ctx) -> Element {
@@ -1343,6 +1606,7 @@ pub fn panel(ctx: Ctx) -> Element {
                                             {apply_status_view(ctx, status)}
                                         }
                                     }
+                                    {variables_section(ctx, &profile)}
                                     match &server_package {
                                         ServerPackage::Idle => rsx! {},
                                         ServerPackage::Loading => rsx! {
