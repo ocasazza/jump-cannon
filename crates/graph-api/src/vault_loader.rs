@@ -11,7 +11,7 @@
 use std::sync::Arc;
 
 use data_loader::LoadResult;
-use data_loader::{ImportError, Importer};
+use data_loader::{ImportError, ImportProgress, Importer, NoProgress};
 
 use crate::progress::ProgressLog;
 
@@ -39,7 +39,12 @@ pub async fn load_with_progress(
     };
     let scan_id = progress.map(|p| p.start("ingest", scan_label));
 
-    let result = match importer.import().await {
+    let no_progress = NoProgress;
+    let import_progress: &dyn ImportProgress = match progress {
+        Some(log) => &**log,
+        None => &no_progress,
+    };
+    let result = match importer.import(import_progress).await {
         Ok(result) => result,
         Err(error) => {
             if let (Some(progress), Some(id)) = (progress, scan_id) {
@@ -163,8 +168,8 @@ pub async fn load_with_progress(
 mod tests {
     use data_loader::{
         Capability, DiscoveryField, DiscoveryFieldType, EdgeTypeSchema, Effect, ImportFuture,
-        ImporterDescriptor, ImporterSchema, LoadResult, SearchDocument, TagHierarchySchema,
-        Transport,
+        ImportProgress, ImporterDescriptor, ImporterSchema, LoadResult, SearchDocument,
+        TagHierarchySchema, Transport,
     };
     use vault_data::VaultGraph;
     use vault_data::{VaultEdge, VaultNode};
@@ -199,7 +204,10 @@ mod tests {
             )
         }
 
-        fn import<'a>(&'a self) -> ImportFuture<'a, Result<LoadResult, ImportError>> {
+        fn import<'a>(
+            &'a self,
+            _progress: &'a dyn ImportProgress,
+        ) -> ImportFuture<'a, Result<LoadResult, ImportError>> {
             Box::pin(async {
                 let mut graph = VaultGraph::new();
                 graph.add_node(VaultNode {

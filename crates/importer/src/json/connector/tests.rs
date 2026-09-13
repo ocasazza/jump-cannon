@@ -9,7 +9,10 @@ use std::collections::BTreeMap;
 use std::future::Future;
 use std::sync::Arc;
 
-use data_loader::{Capability, Effect, ImportError, ImportFuture, SourceConnector, Transport};
+use data_loader::{
+    Capability, Effect, ImportError, ImportFuture, ImportProgress, NoProgress, SourceConnector,
+    Transport,
+};
 use parking_lot::Mutex;
 
 use super::{HttpJsonConnector, JsonTransport, CONTENT_TYPE};
@@ -405,7 +408,7 @@ fn preflight_success_unlocks_collection_reads() {
     ]));
     let connector = build_connector(PACKAGE, Box::new(transport.clone()));
 
-    let records = run(connector.read()).expect("read succeeds");
+    let records = run(connector.read(&NoProgress)).expect("read succeeds");
     assert_eq!(records.len(), 2, "preflight + 2 collections → 2 records");
     assert_eq!(
         transport.request_count(),
@@ -429,7 +432,7 @@ fn preflight_not_found_lists_available_values() {
     )]));
     let connector = build_connector(PACKAGE, Box::new(transport));
 
-    let error = run(connector.read()).expect_err("preflight must fail");
+    let error = run(connector.read(&NoProgress)).expect_err("preflight must fail");
     match error {
         ImportError::SourceRead { origin, message } => {
             assert_eq!(origin, format!("{ROOT}/v1/banks"));
@@ -454,7 +457,7 @@ fn preflight_not_found_renders_none_when_empty() {
     )]));
     let connector = build_connector(PACKAGE, Box::new(transport));
 
-    let error = run(connector.read()).expect_err("preflight must fail");
+    let error = run(connector.read(&NoProgress)).expect_err("preflight must fail");
     let message = match error {
         ImportError::SourceRead { message, .. } => message,
         other => panic!("expected SourceRead, got {other:?}"),
@@ -496,7 +499,7 @@ fn limit_offset_walks_to_exhaustion() {
     ]));
     let connector = build_connector(PACKAGE_NO_PREFLIGHT, Box::new(transport.clone()));
 
-    let records = run(connector.read()).expect("read succeeds");
+    let records = run(connector.read(&NoProgress)).expect("read succeeds");
     assert_eq!(records.len(), 4, "expected 4 pages");
 
     let requests = transport.requests();
@@ -526,6 +529,97 @@ fn limit_offset_walks_to_exhaustion() {
     }
 }
 
+/// An [`ImportProgress`] that records every event as a flat string log so a
+/// test can assert the stage/advance/finish shape a paged pull emits.
+#[derive(Default)]
+struct RecordingProgress {
+    events: Mutex<Vec<String>>,
+}
+
+impl ImportProgress for RecordingProgress {
+    fn stage(&self, label: &str) -> u64 {
+        let mut events = self.events.lock();
+        events.push(format!("stage:{label}"));
+        events.len() as u64
+    }
+    fn advance(&self, stage: u64, fraction: Option<f32>, detail: &str) {
+        self.events
+            .lock()
+            .push(format!("advance:{stage}:{fraction:?}:{detail}"));
+    }
+    fn finish(&self, stage: u64) {
+        self.events.lock().push(format!("finish:{stage}"));
+    }
+    fn fail(&self, stage: u64, reason: &str) {
+        self.events.lock().push(format!("fail:{stage}:{reason}"));
+    }
+    fn log(&self, message: &str) {
+        self.events.lock().push(format!("log:{message}"));
+    }
+}
+
+#[test]
+fn progress_reports_one_stage_three_advances_and_a_finish() {
+    // Three pages: two full then a short one, so the connector walks to
+    // exhaustion over exactly three requests.
+    let transport = FixtureTransport::new(BTreeMap::from([
+        (
+            format!("{ROOT}/v1/banks/omp/memories?limit=2&offset=0"),
+            ok_response(&pages(vec![
+                serde_json::json!({ "id": "m1" }),
+                serde_json::json!({ "id": "m2" }),
+            ])),
+        ),
+        (
+            format!("{ROOT}/v1/banks/omp/memories?limit=2&offset=2"),
+            ok_response(&pages(vec![
+                serde_json::json!({ "id": "m3" }),
+                serde_json::json!({ "id": "m4" }),
+            ])),
+        ),
+        (
+            format!("{ROOT}/v1/banks/omp/memories?limit=2&offset=4"),
+            ok_response(&pages(vec![serde_json::json!({ "id": "m5" })])),
+        ),
+    ]));
+    let connector = build_connector(PACKAGE_NO_PREFLIGHT, Box::new(transport));
+    let progress = RecordingProgress::default();
+
+    let records = run(connector.read(&progress)).expect("read succeeds");
+    assert_eq!(records.len(), 3, "three pages produce three records");
+
+    let events = progress.events.lock().clone();
+    assert_eq!(
+        events.iter().filter(|e| e.starts_with("stage:")).count(),
+        1,
+        "one stage per collection: {events:?}"
+    );
+    assert!(
+        events.contains(&"stage:Fetching memories from api.example.test".to_string()),
+        "stage names the collection and host: {events:?}"
+    );
+    assert_eq!(
+        events.iter().filter(|e| e.starts_with("finish:")).count(),
+        1,
+        "the stage finishes exactly once: {events:?}"
+    );
+
+    let advances: Vec<&String> = events
+        .iter()
+        .filter(|e| e.starts_with("advance:"))
+        .collect();
+    assert_eq!(advances.len(), 3, "one advance per page: {events:?}");
+    // The detail line carries the running record total; it grows every page.
+    assert!(advances[0].contains("2 records"), "{advances:?}");
+    assert!(advances[1].contains("4 records"), "{advances:?}");
+    assert!(advances[2].contains("5 records"), "{advances:?}");
+    // The collection declares no server total, so the fraction is indeterminate.
+    assert!(
+        advances.iter().all(|a| a.contains("None")),
+        "no declared total means None fraction: {advances:?}"
+    );
+}
+
 #[test]
 fn queries_with_static_query_join_with_amp_not_double_amp() {
     // PACKAGE has a `state = "valid"` static query on `memories`. With
@@ -546,7 +640,7 @@ fn queries_with_static_query_join_with_amp_not_double_amp() {
         ),
     ]));
     let connector = build_connector(PACKAGE, Box::new(transport.clone()));
-    let _ = run(connector.read());
+    let _ = run(connector.read(&NoProgress));
     let requests = transport.requests();
     assert!(
         requests.iter().any(|url| url
@@ -579,7 +673,7 @@ fn queries_without_static_query_start_with_question() {
         ),
     ]));
     let connector = build_connector(PACKAGE, Box::new(transport.clone()));
-    let _ = run(connector.read());
+    let _ = run(connector.read(&NoProgress));
     let requests = transport.requests();
     assert!(
         requests.iter().any(|url| url
@@ -606,7 +700,7 @@ fn none_pagination_emits_one_request() {
     )]));
     let connector = build_connector(PACKAGE_NONE_PAGINATION, Box::new(transport.clone()));
 
-    let records = run(connector.read()).expect("read succeeds");
+    let records = run(connector.read(&NoProgress)).expect("read succeeds");
     assert_eq!(records.len(), 1, "Pagination::None must emit one record");
     assert_eq!(
         transport.requests(),
@@ -646,7 +740,7 @@ fn record_bound_failure_names_the_collection_and_bound() {
     ]));
     let connector = build_connector(PACKAGE_TIGHT_BOUND, Box::new(transport));
 
-    let error = run(connector.read()).expect_err("bound must fail");
+    let error = run(connector.read(&NoProgress)).expect_err("bound must fail");
     let message = match error {
         ImportError::SourceRead { message, .. } => message,
         other => panic!("expected SourceRead, got {other:?}"),
@@ -684,7 +778,7 @@ fn total_pointer_over_bound_fails_loudly_with_both_numbers() {
     ]));
     let connector = build_connector(PACKAGE, Box::new(transport));
 
-    let error = run(connector.read()).expect_err("total over bound must fail");
+    let error = run(connector.read(&NoProgress)).expect_err("total over bound must fail");
     let message = match error {
         ImportError::SourceRead { message, .. } => message,
         other => panic!("expected SourceRead, got {other:?}"),
@@ -714,7 +808,7 @@ fn non_two_xx_propagates_as_source_read() {
     )]));
     let connector = build_connector(PACKAGE, Box::new(transport));
 
-    let error = run(connector.read()).expect_err("preflight must surface the transport error");
+    let error = run(connector.read(&NoProgress)).expect_err("preflight must surface the transport error");
     match error {
         ImportError::SourceRead { origin, message } => {
             assert_eq!(origin, format!("{ROOT}/v1/banks"));
@@ -737,7 +831,7 @@ fn unresolved_placeholder_is_a_programming_error() {
     let connector = HttpJsonConnector::new(package, instance(None), empty, Box::new(transport))
         .expect("connector builds");
 
-    let error = run(connector.read()).expect_err("unbound placeholder must fail");
+    let error = run(connector.read(&NoProgress)).expect_err("unbound placeholder must fail");
     let message = match error {
         ImportError::InvalidDescriptor { message } => message,
         ImportError::SourceRead { message, .. } => message,

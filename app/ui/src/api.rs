@@ -15,7 +15,7 @@ use gloo_net::http::Request;
 use gloo_storage::{LocalStorage, Storage};
 use prost::Message;
 use serde::{Deserialize, Serialize};
-
+use tracing;
 use crate::proto;
 
 const URL_KEY: &str = "jc_server_url";
@@ -202,6 +202,66 @@ pub(crate) fn with_source_header(
 
 pub type ApiResult<T> = Result<T, String>;
 
+#[derive(Clone, Debug, PartialEq, serde::Deserialize)]
+pub struct BuildStatus {
+    pub status: String,
+    pub source: String,
+    #[serde(default)]
+    pub elapsed_ms: Option<u64>,
+    #[serde(default)]
+    pub stage: Option<String>,
+    #[serde(default)]
+    pub detail: Option<String>,
+    #[serde(default)]
+    pub fraction: Option<f32>,
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum LoadError {
+    Building(BuildStatus),
+    Failed(BuildStatus),
+    Http { path: String, status: u16, body: String },
+    Other(String),
+}
+
+impl std::fmt::Display for LoadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LoadError::Building(bs) => {
+                let stage = bs.stage.as_deref().unwrap_or("unknown");
+                write!(f, "importing {}: {}", bs.source, stage)
+            }
+            LoadError::Failed(bs) => {
+                if let Some(err) = &bs.error {
+                    write!(f, "{}", err)
+                } else {
+                    write!(f, "import failed for {}", bs.source)
+                }
+            }
+            LoadError::Http { path, status, body } => {
+                let body = body.trim();
+                if body.is_empty() {
+                    write!(f, "{} -> HTTP {}", path, status)
+                } else {
+                    let body: String = body.chars().take(200).collect();
+                    write!(f, "{} -> HTTP {}: {}", path, status, body)
+                }
+            }
+            LoadError::Other(s) => write!(f, "{}", s),
+        }
+    }
+}
+
+impl From<String> for LoadError {
+    fn from(s: String) -> Self {
+        LoadError::Other(s)
+    }
+}
+
+pub type LoadResult<T> = Result<T, LoadError>;
+
 pub(crate) fn err<E: std::fmt::Display>(e: E) -> String {
     e.to_string()
 }
@@ -296,39 +356,160 @@ fn graph_revision(resp: &gloo_net::http::Response) -> u64 {
         .unwrap_or(0)
 }
 
+fn parse_build_status_from_body(body: &str) -> Option<BuildStatus> {
+    serde_json::from_str::<BuildStatus>(body).ok()
+}
+
+async fn get_revisioned_json_load<T: serde::de::DeserializeOwned>(
+    path: &str,
+) -> LoadResult<Revisioned<T>> {
+    let resp = get(path).send().await.map_err(|e| LoadError::Other(e.to_string()))?;
+    let status = resp.status();
+    
+    if status == 202 {
+        let body = resp.text().await.map_err(|e| LoadError::Other(e.to_string()))?;
+        if let Some(bs) = parse_build_status_from_body(&body) {
+            tracing::warn!("202 Building: {}", bs.source);
+            return Err(LoadError::Building(bs));
+        }
+    }
+    
+    if status == 503 {
+        let body = resp.text().await.map_err(|e| LoadError::Other(e.to_string()))?;
+        if let Some(bs) = parse_build_status_from_body(&body) {
+            if bs.status == "failed" {
+                tracing::warn!("503 Failed: {}", bs.source);
+                return Err(LoadError::Failed(bs));
+            }
+        }
+        return Err(LoadError::Http {
+            path: path.to_string(),
+            status,
+            body,
+        });
+    }
+    
+    if !resp.ok() {
+        let body = resp.text().await.map_err(|e| LoadError::Other(e.to_string()))?;
+        return Err(LoadError::Http {
+            path: path.to_string(),
+            status,
+            body,
+        });
+    }
+    
+    let revision = graph_revision(&resp);
+    let value = resp.json().await.map_err(|e| LoadError::Other(e.to_string()))?;
+    Ok(Revisioned { revision, value })
+}
+
 async fn get_revisioned_json<T: serde::de::DeserializeOwned>(
     path: &str,
 ) -> ApiResult<Revisioned<T>> {
-    let resp = get(path).send().await.map_err(err)?;
-    if !resp.ok() {
-        return Err(format!("{} -> HTTP {}", path, resp.status()));
+    get_revisioned_json_load::<T>(path)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+async fn get_revisioned_bytes_load(path: &str) -> LoadResult<Revisioned<Vec<u8>>> {
+    let resp = get(path).send().await.map_err(|e| LoadError::Other(e.to_string()))?;
+    let status = resp.status();
+    
+    if status == 202 {
+        let body = resp.text().await.map_err(|e| LoadError::Other(e.to_string()))?;
+        if let Some(bs) = parse_build_status_from_body(&body) {
+            tracing::warn!("202 Building: {}", bs.source);
+            return Err(LoadError::Building(bs));
+        }
     }
+    
+    if status == 503 {
+        let body = resp.text().await.map_err(|e| LoadError::Other(e.to_string()))?;
+        if let Some(bs) = parse_build_status_from_body(&body) {
+            if bs.status == "failed" {
+                tracing::warn!("503 Failed: {}", bs.source);
+                return Err(LoadError::Failed(bs));
+            }
+        }
+        return Err(LoadError::Http {
+            path: path.to_string(),
+            status,
+            body,
+        });
+    }
+    
+    if !resp.ok() {
+        let body = resp.text().await.map_err(|e| LoadError::Other(e.to_string()))?;
+        return Err(LoadError::Http {
+            path: path.to_string(),
+            status,
+            body,
+        });
+    }
+    
     let revision = graph_revision(&resp);
-    let value = resp.json().await.map_err(err)?;
+    let value = resp.binary().await.map_err(|e| LoadError::Other(e.to_string()))?;
     Ok(Revisioned { revision, value })
 }
 
 async fn get_revisioned_bytes(path: &str) -> ApiResult<Revisioned<Vec<u8>>> {
-    let resp = get(path).send().await.map_err(err)?;
-    if !resp.ok() {
-        return Err(format!("{} -> HTTP {}", path, resp.status()));
+    get_revisioned_bytes_load(path)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+pub(crate) async fn get_bytes_load(path: &str) -> LoadResult<Vec<u8>> {
+    let resp = get(path).send().await.map_err(|e| LoadError::Other(e.to_string()))?;
+    let status = resp.status();
+    
+    if status == 202 {
+        let body = resp.text().await.map_err(|e| LoadError::Other(e.to_string()))?;
+        if let Some(bs) = parse_build_status_from_body(&body) {
+            tracing::warn!("202 Building: {}", bs.source);
+            return Err(LoadError::Building(bs));
+        }
     }
-    let revision = graph_revision(&resp);
-    let value = resp.binary().await.map_err(err)?;
-    Ok(Revisioned { revision, value })
+    
+    if status == 503 {
+        let body = resp.text().await.map_err(|e| LoadError::Other(e.to_string()))?;
+        if let Some(bs) = parse_build_status_from_body(&body) {
+            if bs.status == "failed" {
+                tracing::warn!("503 Failed: {}", bs.source);
+                return Err(LoadError::Failed(bs));
+            }
+        }
+        return Err(LoadError::Http {
+            path: path.to_string(),
+            status,
+            body,
+        });
+    }
+    
+    if !resp.ok() {
+        let body = resp.text().await.map_err(|e| LoadError::Other(e.to_string()))?;
+        return Err(LoadError::Http {
+            path: path.to_string(),
+            status,
+            body,
+        });
+    }
+    
+    resp.binary().await.map_err(|e| LoadError::Other(e.to_string()))
 }
 
 pub(crate) async fn get_bytes(path: &str) -> ApiResult<Vec<u8>> {
-    let resp = get(path).send().await.map_err(err)?;
-    if !resp.ok() {
-        return Err(format!("{} -> HTTP {}", path, resp.status()));
-    }
-    resp.binary().await.map_err(err)
+    get_bytes_load(path).await.map_err(|e| e.to_string())
+}
+
+pub(crate) async fn get_proto_load<T: Message + Default>(path: &str) -> LoadResult<T> {
+    let bytes = get_bytes_load(path).await?;
+    T::decode(bytes.as_slice()).map_err(|e| LoadError::Other(e.to_string()))
 }
 
 pub(crate) async fn get_proto<T: Message + Default>(path: &str) -> ApiResult<T> {
-    let bytes = get_bytes(path).await?;
-    T::decode(bytes.as_slice()).map_err(err)
+    get_proto_load::<T>(path)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 fn f32s(bytes: &[u8]) -> Vec<f32> {
@@ -381,6 +562,26 @@ pub async fn edges() -> ApiResult<Vec<u32>> {
 
 pub(crate) async fn revisioned_edges() -> ApiResult<Revisioned<Vec<u32>>> {
     let r = get_revisioned_bytes("/graph/edges").await?;
+    Ok(Revisioned {
+        revision: r.revision,
+        value: u32s(&r.value),
+    })
+}
+
+/// LoadResult variant of init
+pub async fn init_load() -> LoadResult<proto::Init> {
+    get_proto_load("/graph/init").await
+}
+
+
+/// LoadResult variant of revisioned_ids
+pub async fn revisioned_ids_load() -> LoadResult<Revisioned<Vec<String>>> {
+    get_revisioned_json_load("/graph/ids").await
+}
+
+/// LoadResult variant of revisioned_edges
+pub async fn revisioned_edges_load() -> LoadResult<Revisioned<Vec<u32>>> {
+    let r = get_revisioned_bytes_load("/graph/edges").await?;
     Ok(Revisioned {
         revision: r.revision,
         value: u32s(&r.value),
@@ -809,6 +1010,57 @@ pub async fn progress_default(since: u64) -> ApiResult<ProgressResponse> {
         req
     };
     req.send().await.map_err(err)?.json().await.map_err(err)
+}
+
+/// `GET /importers/sources/{id}/status` — build status for an alternate source.
+pub async fn source_status(id: &str) -> ApiResult<BuildStatus> {
+    let path = format!("/importers/sources/{id}/status");
+    let req = Request::get(&url(&path)).cache(web_sys::RequestCache::NoStore);
+    let req = if WORLD_BASE.read().is_some() {
+        req.header("x-user", &user_name())
+    } else {
+        req
+    };
+    req.send()
+        .await
+        .map_err(err)?
+        .json()
+        .await
+        .map_err(err)
+}
+
+/// `GET /importers/sources/{id}/progress?since=<seq>` — progress log for an alternate source.
+pub async fn source_progress(id: &str, since: u64) -> ApiResult<ProgressResponse> {
+    let path = format!("/importers/sources/{id}/progress?since={since}");
+    let req = Request::get(&url(&path)).cache(web_sys::RequestCache::NoStore);
+    let req = if WORLD_BASE.read().is_some() {
+        req.header("x-user", &user_name())
+    } else {
+        req
+    };
+    req.send()
+        .await
+        .map_err(err)?
+        .json()
+        .await
+        .map_err(err)
+}
+
+/// `POST /importers/sources/{id}/retry` — retry a failed build.
+pub async fn source_retry(id: &str) -> ApiResult<BuildStatus> {
+    let path = format!("/importers/sources/{id}/retry");
+    let req = Request::post(&url(&path));
+    let req = if WORLD_BASE.read().is_some() {
+        req.header("x-user", &user_name())
+    } else {
+        req
+    };
+    req.send()
+        .await
+        .map_err(err)?
+        .json()
+        .await
+        .map_err(err)
 }
 
 #[allow(dead_code)] // not surfaced in a panel yet — /configs is dev-only on the server

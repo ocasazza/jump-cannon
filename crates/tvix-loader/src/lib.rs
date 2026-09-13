@@ -494,7 +494,7 @@ mod tests {
         let importer = data_loader::HostedImporter::new(Box::new(loader), [read])
             .expect("valid hosted tvix importer");
 
-        let error = data_loader::Importer::import(&importer)
+        let error = data_loader::Importer::import(&importer, &data_loader::NoProgress)
             .await
             .expect_err("invalid tvix must not become an empty graph");
         match error {

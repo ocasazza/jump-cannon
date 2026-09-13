@@ -66,6 +66,12 @@ fn api_routes() -> Router<SourceHost> {
             get(crate::importer_editor::definition_get)
                 .put(crate::importer_editor::definition_put),
         )
+        .route("/importers/sources/:id/status", get(source_status))
+        .route("/importers/sources/:id/progress", get(source_progress))
+        .route(
+            "/importers/sources/:id/retry",
+            axum::routing::post(source_retry),
+        )
         .route("/graph/init", get(graph_init))
         .route("/graph/ids", get(graph_ids))
         .route("/graph/positions", get(graph_positions))
@@ -1249,6 +1255,55 @@ async fn progress_poll(
     let s = selection.0;
     let resp = s.inner.progress.since(p.since.unwrap_or(0));
     axum::Json(resp)
+}
+
+#[derive(serde::Deserialize)]
+struct SourceProgressQuery {
+    since: Option<u64>,
+}
+
+/// `GET /importers/sources/:id/status` — the selected alternate's build state.
+/// Never blocks and never 503s: building, serving, failed, and idle all map to
+/// one 200 JSON shape. 404 for an unknown id, 403 when the caller may not
+/// select alternates.
+async fn source_status(
+    State(host): State<SourceHost>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    match host.status(&id, &headers) {
+        Ok(report) => Json(report).into_response(),
+        Err(error) => error.into_response(),
+    }
+}
+
+/// `GET /importers/sources/:id/progress?since=<seq>` — the alternate's own
+/// progress-log tail (same shape as `/progress`), available while it builds,
+/// serves, or after it fails. Never blocks.
+async fn source_progress(
+    State(host): State<SourceHost>,
+    Path(id): Path<String>,
+    Query(query): Query<SourceProgressQuery>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    match host.progress(&id, query.since.unwrap_or(0), &headers) {
+        Ok(response) => Json(response).into_response(),
+        Err(error) => error.into_response(),
+    }
+}
+
+/// `POST /importers/sources/:id/retry` — clear a cached failure and start a
+/// fresh build. 200 with the building status, or 409 when the source is
+/// already building or serving.
+async fn source_retry(
+    State(host): State<SourceHost>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    match host.retry(&id, &headers) {
+        Ok(report) => Json(report).into_response(),
+        Err(error) => error.into_response(),
+    }
 }
 
 async fn index(State(host): State<SourceHost>) -> impl IntoResponse {

@@ -5,6 +5,7 @@
 //! avoiding the need for a real TCP socket / async runtime spin-up.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::body::{to_bytes, Body};
 use axum::http::{Request, StatusCode};
@@ -13,7 +14,8 @@ use tower::ServiceExt; // for `oneshot`
 
 use data_loader::{
     Capability, ContentSchema, DiscoveryField, DiscoveryFieldType, EdgeTypeSchema, Effect,
-    HostedImporter, ImportError, ImportFuture, Importer, ImporterDescriptor, ImporterSchema,
+    HostedImporter, ImportError, ImportFuture, ImportProgress, Importer, ImporterDescriptor,
+    ImporterSchema,
     LoadResult, Loader, SearchDocument, TagHierarchySchema, Transport,
 };
 use graph_api::importer_catalog::ImporterCatalog;
@@ -131,7 +133,10 @@ impl Importer for DeclaredButUngrantedWrite {
         )
     }
 
-    fn import<'a>(&'a self) -> ImportFuture<'a, Result<LoadResult, ImportError>> {
+    fn import<'a>(
+        &'a self,
+        _progress: &'a dyn ImportProgress,
+    ) -> ImportFuture<'a, Result<LoadResult, ImportError>> {
         Box::pin(async { Ok(load_result(VaultGraph::new())) })
     }
 }
@@ -963,6 +968,14 @@ fn source_request(path: &str, source: &str, groups: Option<&str>) -> Request<Bod
     builder.body(Body::empty()).unwrap()
 }
 
+fn source_status_request(id: &str, groups: Option<&str>) -> Request<Body> {
+    let mut builder = Request::builder().uri(format!("/importers/sources/{id}/status"));
+    if let Some(groups) = groups {
+        builder = builder.header(GROUPS_HEADER, groups);
+    }
+    builder.body(Body::empty()).unwrap()
+}
+
 async fn json_body(response: axum::response::Response) -> serde_json::Value {
     serde_json::from_slice(
         &to_bytes(response.into_body(), 1 << 20)
@@ -1088,7 +1101,9 @@ async fn runtime_switch_builds_alternate_lazily_and_isolates_state() {
     .expect("default ids JSON");
     assert!(default_ids.is_empty());
 
-    let alt_response = app
+    // The first authorized request spawns the build and answers 202 while it
+    // runs — it never awaits the import.
+    let building = app
         .clone()
         .oneshot(source_request(
             "/graph/ids",
@@ -1097,7 +1112,34 @@ async fn runtime_switch_builds_alternate_lazily_and_isolates_state() {
         ))
         .await
         .expect("alternate ids served");
-    assert_eq!(alt_response.status(), StatusCode::OK);
+    assert_eq!(
+        building.status(),
+        StatusCode::ACCEPTED,
+        "the first request reports building, not the built graph"
+    );
+
+    // Poll until the background build completes and the alternate serves.
+    let mut alt_response = None;
+    for _ in 0..300 {
+        let resp = app
+            .clone()
+            .oneshot(source_request(
+                "/graph/ids",
+                "alt-vault",
+                Some(SWITCH_GROUP),
+            ))
+            .await
+            .expect("alternate ids served");
+        match resp.status() {
+            StatusCode::OK => {
+                alt_response = Some(resp);
+                break;
+            }
+            StatusCode::ACCEPTED => tokio::time::sleep(Duration::from_millis(10)).await,
+            other => panic!("unexpected status while building alternate: {other}"),
+        }
+    }
+    let alt_response = alt_response.expect("alternate finishes building and serves");
     let alt_revision = response_revision(&alt_response);
     assert_ne!(alt_revision, default_revision);
     let alt_ids: Vec<String> = serde_json::from_slice(
@@ -1270,7 +1312,10 @@ async fn runtime_switch_error_contract() {
         .expect("not-runnable served");
     assert_eq!(not_runnable.status(), StatusCode::BAD_REQUEST);
 
-    for attempt in 0..2 {
+    // The OKF build (nonexistent root) fails asynchronously: the first request
+    // reports 202 building, then the cached failure surfaces as 503 JSON.
+    let mut failed = false;
+    for _ in 0..300 {
         let broken = app
             .clone()
             .oneshot(source_request(
@@ -1280,12 +1325,98 @@ async fn runtime_switch_error_contract() {
             ))
             .await
             .expect("broken served");
-        assert_eq!(
-            broken.status(),
-            StatusCode::SERVICE_UNAVAILABLE,
-            "attempt {attempt}: cached build failure must surface as 503"
-        );
+        match broken.status() {
+            StatusCode::SERVICE_UNAVAILABLE => {
+                let body = json_body(broken).await;
+                assert_eq!(body["status"], "failed");
+                assert_eq!(body["source"], "broken-okf");
+                assert!(
+                    body["error"].is_string(),
+                    "the 503 body carries the failure message"
+                );
+                failed = true;
+                break;
+            }
+            StatusCode::ACCEPTED => tokio::time::sleep(Duration::from_millis(10)).await,
+            other => panic!("unexpected status for a failing build: {other}"),
+        }
     }
+    assert!(failed, "the broken OKF build eventually caches as 503");
+
+    // The cached failure is replayed, not rebuilt, on the next request.
+    let again = app
+        .oneshot(source_request(
+            "/graph/ids",
+            "broken-okf",
+            Some(SWITCH_GROUP),
+        ))
+        .await
+        .expect("broken served again");
+    assert_eq!(again.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+    let _ = std::fs::remove_dir_all(&vault);
+}
+
+/// The `/importers/sources/:id/status` route is mounted and reports the
+/// alternate's lifecycle without ever blocking or 503-ing: idle before a
+/// build, 404 for an unknown id, 403 without the group, then building→serving.
+#[tokio::test]
+async fn source_status_route_reports_lifecycle() {
+    let vault = fixture_vault("status-route");
+    let host = switch_host(&switch_catalog_json(&vault), Some(SWITCH_GROUP));
+    let app = graph_api::router_with_host(host);
+
+    let idle = app
+        .clone()
+        .oneshot(source_status_request("alt-vault", Some(SWITCH_GROUP)))
+        .await
+        .expect("status served");
+    assert_eq!(idle.status(), StatusCode::OK);
+    let idle = json_body(idle).await;
+    assert_eq!(idle["status"], "idle");
+    assert_eq!(idle["source"], "alt-vault");
+
+    let unknown = app
+        .clone()
+        .oneshot(source_status_request("no-such-source", Some(SWITCH_GROUP)))
+        .await
+        .expect("status served");
+    assert_eq!(unknown.status(), StatusCode::NOT_FOUND);
+
+    let forbidden = app
+        .clone()
+        .oneshot(source_status_request("alt-vault", None))
+        .await
+        .expect("status served");
+    assert_eq!(forbidden.status(), StatusCode::FORBIDDEN);
+
+    // Kick off the build through a graph route, then poll the status route.
+    let kick = app
+        .clone()
+        .oneshot(source_request("/graph/ids", "alt-vault", Some(SWITCH_GROUP)))
+        .await
+        .expect("kick served");
+    assert_eq!(kick.status(), StatusCode::ACCEPTED);
+
+    let mut serving = false;
+    for _ in 0..300 {
+        let status = app
+            .clone()
+            .oneshot(source_status_request("alt-vault", Some(SWITCH_GROUP)))
+            .await
+            .expect("status served");
+        assert_eq!(status.status(), StatusCode::OK, "status never 503s");
+        let body = json_body(status).await;
+        match body["status"].as_str().expect("status string") {
+            "serving" => {
+                serving = true;
+                break;
+            }
+            "building" => tokio::time::sleep(Duration::from_millis(10)).await,
+            other => panic!("unexpected status {other}"),
+        }
+    }
+    assert!(serving, "the alternate reaches serving through the status route");
 
     let _ = std::fs::remove_dir_all(&vault);
 }

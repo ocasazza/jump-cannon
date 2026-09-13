@@ -16,7 +16,8 @@ use std::fmt;
 use std::path::PathBuf;
 
 use data_loader::{
-    Capability, Effect, ImportError, ImportFuture, SourceConnector, SourceRecord, Transport,
+    Capability, Effect, ImportError, ImportFuture, ImportProgress, SourceConnector, SourceRecord,
+    Transport,
 };
 use prost_reflect::{DescriptorPool, DynamicMessage, MethodDescriptor};
 use prost::Message as _;
@@ -180,7 +181,10 @@ impl SourceConnector for GrpcConnector {
         }
     }
 
-    fn read<'a>(&'a self) -> ImportFuture<'a, Result<Vec<SourceRecord>, ImportError>> {
+    fn read<'a>(
+        &'a self,
+        _progress: &'a dyn ImportProgress,
+    ) -> ImportFuture<'a, Result<Vec<SourceRecord>, ImportError>> {
         Box::pin(async move {
             let scope = self.scope();
             let fail = |message: String| ImportError::SourceRead {

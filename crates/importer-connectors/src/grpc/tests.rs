@@ -17,6 +17,7 @@ use prost::Message;
 use tonic::codegen::http;
 
 use super::*;
+use data_loader::NoProgress;
 
 #[derive(Clone, PartialEq, Message)]
 struct HelloReply {
@@ -267,7 +268,7 @@ async fn unary_returns_one_json_record() {
         "test.Greeter/SayHello",
     ))
     .unwrap();
-    let records = connector.read().await.unwrap();
+    let records = connector.read(&NoProgress).await.unwrap();
     assert_eq!(records.len(), 1);
     let record = &records[0];
     assert_eq!(
@@ -297,7 +298,7 @@ async fn server_streaming_returns_one_record_per_message() {
         "test.Greeter/LotsOfReplies",
     ))
     .unwrap();
-    let records = connector.read().await.unwrap();
+    let records = connector.read(&NoProgress).await.unwrap();
     assert_eq!(records.len(), 3);
     for (index, record) in records.iter().enumerate() {
         let value: serde_json::Value = serde_json::from_slice(&record.bytes).unwrap();
@@ -318,7 +319,7 @@ async fn server_reflection_resolves_descriptors() {
         "test.Greeter/SayHello",
     ))
     .unwrap();
-    let records = connector.read().await.unwrap();
+    let records = connector.read(&NoProgress).await.unwrap();
     let value: serde_json::Value = serde_json::from_slice(&records[0].bytes).unwrap();
     assert_eq!(value, serde_json::json!({ "message": "hello world" }));
 }
@@ -332,7 +333,7 @@ async fn bearer_token_reaches_server() {
             .with_metadata_token("grpc-secret"),
     )
     .unwrap();
-    connector.read().await.unwrap();
+    connector.read(&NoProgress).await.unwrap();
     let calls = calls.lock();
     assert_eq!(calls.len(), 1);
     assert_eq!(calls[0].0, "/test.Greeter/SayHello");
@@ -349,7 +350,7 @@ async fn unknown_method_errors() {
         "test.Greeter/Missing",
     ))
     .unwrap();
-    let error = connector.read().await.unwrap_err();
+    let error = connector.read(&NoProgress).await.unwrap_err();
     assert!(matches!(error, ImportError::SourceRead { .. }));
     assert!(error.to_string().contains("Missing"));
 }
@@ -364,7 +365,7 @@ async fn client_streaming_is_rejected() {
         "test.Greeter/StreamIn",
     ))
     .unwrap();
-    let error = connector.read().await.unwrap_err();
+    let error = connector.read(&NoProgress).await.unwrap_err();
     assert!(error.to_string().contains("client-streaming"));
 }
 
@@ -377,7 +378,7 @@ async fn message_bound_errors() {
             .with_max_messages(2),
     )
     .unwrap();
-    let error = connector.read().await.unwrap_err();
+    let error = connector.read(&NoProgress).await.unwrap_err();
     assert!(error.to_string().contains("message bound"));
 }
 
@@ -390,7 +391,7 @@ async fn response_byte_bound_errors() {
             .with_max_response_bytes(4),
     )
     .unwrap();
-    let error = connector.read().await.unwrap_err();
+    let error = connector.read(&NoProgress).await.unwrap_err();
     assert!(error.to_string().contains("byte bound"));
 }
 
@@ -404,7 +405,7 @@ async fn grpc_status_error_surfaces() {
         "test.Greeter/Boom",
     ))
     .unwrap();
-    let error = connector.read().await.unwrap_err();
+    let error = connector.read(&NoProgress).await.unwrap_err();
     assert!(matches!(error, ImportError::SourceRead { .. }));
     assert!(error.to_string().contains("call failed"));
 }

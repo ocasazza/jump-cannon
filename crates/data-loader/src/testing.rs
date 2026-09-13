@@ -12,7 +12,7 @@
 //!    namespace conformance (`{source_kind}:{source_id}:{local}`) and fully
 //!    resolved edge endpoints.
 
-use crate::Importer;
+use crate::{Importer, NoProgress};
 
 /// Assert the unified identity/search contract for one importer.
 ///
@@ -24,8 +24,14 @@ pub async fn assert_import_contract(importer: &dyn Importer) {
         .validate()
         .expect("importer descriptor must satisfy the discovery contract");
 
-    let first = importer.import().await.expect("first import must succeed");
-    let second = importer.import().await.expect("second import must succeed");
+    let first = importer
+        .import(&NoProgress)
+        .await
+        .expect("first import must succeed");
+    let second = importer
+        .import(&NoProgress)
+        .await
+        .expect("second import must succeed");
 
     descriptor
         .schema

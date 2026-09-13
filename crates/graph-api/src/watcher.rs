@@ -566,8 +566,9 @@ fn is_relevant(
 mod tests {
     use super::*;
     use data_loader::{
-        DiscoveryField, DiscoveryFieldType, EdgeTypeSchema, ImportError, ImportFuture, Importer,
-        ImporterDescriptor, ImporterSchema, LoadResult, SearchDocument, TagHierarchySchema,
+        DiscoveryField, DiscoveryFieldType, EdgeTypeSchema, ImportError, ImportFuture,
+        ImportProgress, Importer, ImporterDescriptor, ImporterSchema, LoadResult, SearchDocument,
+        TagHierarchySchema,
     };
     use vault_data::{VaultGraph, VaultNode};
 
@@ -627,7 +628,10 @@ mod tests {
             )
         }
 
-        fn import<'a>(&'a self) -> ImportFuture<'a, Result<LoadResult, ImportError>> {
+        fn import<'a>(
+            &'a self,
+            _progress: &'a dyn ImportProgress,
+        ) -> ImportFuture<'a, Result<LoadResult, ImportError>> {
             Box::pin(async {
                 Err(ImportError::SourceRead {
                     origin: "test".into(),
@@ -662,7 +666,10 @@ mod tests {
             .with_watch(WatchPlan::Poll { interval_ms: 100 })
         }
 
-        fn import<'a>(&'a self) -> ImportFuture<'a, Result<LoadResult, ImportError>> {
+        fn import<'a>(
+            &'a self,
+            _progress: &'a dyn ImportProgress,
+        ) -> ImportFuture<'a, Result<LoadResult, ImportError>> {
             Box::pin(async {
                 Ok(LoadResult {
                     graph: VaultGraph::new(),

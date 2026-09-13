@@ -40,7 +40,8 @@ use std::sync::Mutex;
 use data_loader::{
     identity::{self, Namespace},
     Capability, DiscoveryField, DiscoveryFieldType, EdgeTypeSchema, Effect, ImportError,
-    ImportFuture, Importer, ImporterDescriptor, ImporterSchema, LoadResult, TagHierarchySchema,
+    ImportFuture, ImportProgress, Importer, ImporterDescriptor, ImporterSchema, LoadResult,
+    TagHierarchySchema,
     Transport, WatchPlan,
 };
 
@@ -469,7 +470,10 @@ impl Importer for GitHubImporter {
         .with_watch(watch)
     }
 
-    fn import<'a>(&'a self) -> ImportFuture<'a, Result<LoadResult, ImportError>> {
+    fn import<'a>(
+        &'a self,
+        _progress: &'a dyn ImportProgress,
+    ) -> ImportFuture<'a, Result<LoadResult, ImportError>> {
         Box::pin(async move {
             let extraction = self.resolve_extraction().await?;
             self.load_from_extraction(&extraction)

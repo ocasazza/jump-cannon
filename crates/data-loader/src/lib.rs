@@ -1021,13 +1021,62 @@ impl ImporterDescriptor {
     }
 }
 
+/// Progress observer an importer may report into.
+///
+/// The contract is deliberately minimal and object-safe so an importer can
+/// take a `&dyn ImportProgress` without knowing whether the host wires it to a
+/// live progress log, a metrics sink, or nothing at all. Implementations are
+/// `Send + Sync` and cheap to clone through an `Arc`, so a long paged pull can
+/// report from whatever task drives its I/O.
+///
+/// Stages are identified by an opaque `u64` handle returned from [`stage`].
+/// The handle has no meaning to the importer beyond routing later
+/// [`advance`], [`finish`], and [`fail`] calls back to the stage that
+/// produced it.
+///
+/// [`stage`]: ImportProgress::stage
+/// [`advance`]: ImportProgress::advance
+/// [`finish`]: ImportProgress::finish
+/// [`fail`]: ImportProgress::fail
+pub trait ImportProgress: Send + Sync {
+    /// Begin a named stage; returns a stage handle.
+    fn stage(&self, label: &str) -> u64;
+    /// Report progress within a stage. `fraction` is `0..=1` when a completion
+    /// ratio is known, or `None` when the stage is indeterminate; `detail` is a
+    /// short human line such as `"page 12, 6,000 records"`.
+    fn advance(&self, stage: u64, fraction: Option<f32>, detail: &str);
+    /// Mark a stage completed.
+    fn finish(&self, stage: u64);
+    /// Mark a stage failed with a human-readable reason.
+    fn fail(&self, stage: u64, reason: &str);
+    /// Emit a free-standing log line not attached to any stage.
+    fn log(&self, message: &str);
+}
+
+/// [`ImportProgress`] observer that discards every event. Callers with no
+/// progress feed pass `&NoProgress`.
+pub struct NoProgress;
+
+impl ImportProgress for NoProgress {
+    fn stage(&self, _label: &str) -> u64 {
+        0
+    }
+    fn advance(&self, _stage: u64, _fraction: Option<f32>, _detail: &str) {}
+    fn finish(&self, _stage: u64) {}
+    fn fail(&self, _stage: u64, _reason: &str) {}
+    fn log(&self, _message: &str) {}
+}
+
 /// A fallible asynchronous graph importer.
 ///
 /// The boxed-future method keeps the trait object-safe without requiring an
 /// `async-trait` transformation.
 pub trait Importer: Send + Sync {
     fn descriptor(&self) -> ImporterDescriptor;
-    fn import<'a>(&'a self) -> ImportFuture<'a, Result<LoadResult, ImportError>>;
+    fn import<'a>(
+        &'a self,
+        progress: &'a dyn ImportProgress,
+    ) -> ImportFuture<'a, Result<LoadResult, ImportError>>;
 
     /// Optional body reader: return the markdown body for a node whose
     /// `meta.path` is `path` (relative to the importer's own filesystem root),
@@ -1082,7 +1131,10 @@ where
         .with_watch(watch)
     }
 
-    fn import<'a>(&'a self) -> ImportFuture<'a, Result<LoadResult, ImportError>> {
+    fn import<'a>(
+        &'a self,
+        _progress: &'a dyn ImportProgress,
+    ) -> ImportFuture<'a, Result<LoadResult, ImportError>> {
         Box::pin(async move { self.try_load() })
     }
 }
@@ -1150,7 +1202,10 @@ impl Importer for HostedImporter {
         self.importer.read_body(path)
     }
 
-    fn import<'a>(&'a self) -> ImportFuture<'a, Result<LoadResult, ImportError>> {
+    fn import<'a>(
+        &'a self,
+        progress: &'a dyn ImportProgress,
+    ) -> ImportFuture<'a, Result<LoadResult, ImportError>> {
         Box::pin(async move {
             let descriptor = self.importer.descriptor();
             descriptor.validate()?;
@@ -1161,7 +1216,7 @@ impl Importer for HostedImporter {
             {
                 self.authorize(capability)?;
             }
-            let result = self.importer.import().await?;
+            let result = self.importer.import(progress).await?;
             descriptor.schema.validate_result(&result)?;
             Ok(result)
         })
@@ -1248,7 +1303,10 @@ pub trait SourceConnector: Send + Sync {
     /// one entry per query.
     fn capabilities(&self, effect: Effect) -> Vec<Capability>;
 
-    fn read<'a>(&'a self) -> ImportFuture<'a, Result<Vec<SourceRecord>, ImportError>>;
+    fn read<'a>(
+        &'a self,
+        progress: &'a dyn ImportProgress,
+    ) -> ImportFuture<'a, Result<Vec<SourceRecord>, ImportError>>;
 
     fn write<'a>(
         &'a self,
@@ -1343,9 +1401,11 @@ impl ImportPipeline {
         &self.descriptor.watch
     }
 
-    /// Execute connector -> decoder -> mapper in that order.
-    pub async fn run(&self) -> Result<LoadResult, ImportError> {
-        let source_records = self.connector.read().await?;
+    /// Execute connector -> decoder -> mapper in that order, reporting the
+    /// decode and map phases as their own stages so a long import stays
+    /// visible after acquisition finishes.
+    pub async fn run(&self, progress: &dyn ImportProgress) -> Result<LoadResult, ImportError> {
+        let source_records = self.connector.read(progress).await?;
         for record in &source_records {
             let actual_media_type = record
                 .content_type
@@ -1366,11 +1426,28 @@ impl ImportPipeline {
                 });
             }
         }
-        let decoded = source_records
+        let decode_stage = progress.stage(&format!("Decoding {} records", source_records.len()));
+        let decoded = match source_records
             .into_iter()
             .map(|record| self.decoder.decode(record))
-            .collect::<Result<Vec<_>, _>>()?;
-        let result = self.mapper.map(decoded)?;
+            .collect::<Result<Vec<_>, _>>()
+        {
+            Ok(decoded) => decoded,
+            Err(error) => {
+                progress.fail(decode_stage, &error.to_string());
+                return Err(error);
+            }
+        };
+        progress.finish(decode_stage);
+        let map_stage = progress.stage("Projecting graph");
+        let result = match self.mapper.map(decoded) {
+            Ok(result) => result,
+            Err(error) => {
+                progress.fail(map_stage, &error.to_string());
+                return Err(error);
+            }
+        };
+        progress.finish(map_stage);
         self.descriptor.schema.validate_result(&result)?;
         Ok(result)
     }
@@ -1381,8 +1458,11 @@ impl Importer for ImportPipeline {
         self.descriptor.clone()
     }
 
-    fn import<'a>(&'a self) -> ImportFuture<'a, Result<LoadResult, ImportError>> {
-        Box::pin(async move { self.run().await })
+    fn import<'a>(
+        &'a self,
+        progress: &'a dyn ImportProgress,
+    ) -> ImportFuture<'a, Result<LoadResult, ImportError>> {
+        Box::pin(async move { self.run(progress).await })
     }
 }
 
@@ -1718,7 +1798,10 @@ mod importer_tests {
             vec![capability(effect, &self.scope)]
         }
 
-        fn read<'a>(&'a self) -> ImportFuture<'a, Result<Vec<SourceRecord>, ImportError>> {
+        fn read<'a>(
+            &'a self,
+            _progress: &'a dyn ImportProgress,
+        ) -> ImportFuture<'a, Result<Vec<SourceRecord>, ImportError>> {
             Box::pin(async move {
                 self.trace.lock().unwrap().push("read".into());
                 if let Some(error) = &self.error {
@@ -1851,7 +1934,7 @@ mod importer_tests {
             Box::new(HostedImporter::new(Box::new(pipeline), [read]).unwrap());
 
         assert_eq!(importer.descriptor().id, "fake");
-        let loaded = importer.import().await.unwrap();
+        let loaded = importer.import(&NoProgress).await.unwrap();
 
         assert_eq!(loaded.graph.node_count(), 2);
         assert_eq!(
@@ -1870,7 +1953,7 @@ mod importer_tests {
         )
         .unwrap();
 
-        let error = pipeline.run().await.unwrap_err();
+        let error = pipeline.run(&NoProgress).await.unwrap_err();
 
         assert_eq!(
             error,
@@ -1889,7 +1972,7 @@ mod importer_tests {
         unsupported.content_type = "application/json".into();
         let pipeline = pipeline(&trace, vec![unsupported], None).unwrap();
 
-        let error = pipeline.run().await.unwrap_err();
+        let error = pipeline.run(&NoProgress).await.unwrap_err();
 
         assert_eq!(
             error,
@@ -1943,7 +2026,7 @@ mod importer_tests {
         parameterized.content_type = "Text/Plain; charset=utf-8".into();
         let pipeline = pipeline(&trace, vec![parameterized], None).unwrap();
 
-        let loaded = pipeline.run().await.unwrap();
+        let loaded = pipeline.run(&NoProgress).await.unwrap();
 
         assert_eq!(loaded.graph.node_count(), 1);
         assert_eq!(
@@ -1958,7 +2041,7 @@ mod importer_tests {
         let pipeline = pipeline(&trace, vec![record("a", "one")], None).unwrap();
         let importer = HostedImporter::new(Box::new(pipeline), []).unwrap();
 
-        let error = importer.import().await.unwrap_err();
+        let error = importer.import(&NoProgress).await.unwrap_err();
 
         assert_eq!(
             error,
@@ -2045,7 +2128,7 @@ mod importer_tests {
         let descriptor = Importer::descriptor(&loader);
         let read = descriptor.capabilities[0].clone();
         let importer = HostedImporter::new(Box::new(loader), [read.clone()]).unwrap();
-        let loaded = importer.import().await.unwrap();
+        let loaded = importer.import(&NoProgress).await.unwrap();
 
         assert_eq!(loaded.unresolved, ["legacy diagnostic"]);
         assert_eq!(descriptor.id, "legacy");
@@ -2154,5 +2237,24 @@ mod importer_tests {
                 && error.contains("generate:fixture:missing"),
             "{error}"
         );
+    }
+
+    #[tokio::test]
+    async fn no_progress_satisfies_import_progress_and_drives_a_pipeline() {
+        // NoProgress must be usable as a trait object and accept every event
+        // without effect, so a caller with no progress feed can pass it.
+        let observer: &dyn ImportProgress = &NoProgress;
+        let stage = observer.stage("decode");
+        observer.advance(stage, Some(0.5), "halfway");
+        observer.advance(stage, None, "indeterminate");
+        observer.log("free-standing line");
+        observer.finish(stage);
+        observer.fail(observer.stage("other"), "ignored");
+
+        // A full pipeline must run to completion when driven by NoProgress.
+        let trace = Trace::default();
+        let pipeline = pipeline(&trace, vec![record("a", "one")], None).unwrap();
+        let loaded = pipeline.run(&NoProgress).await.unwrap();
+        assert_eq!(loaded.graph.node_count(), 1);
     }
 }

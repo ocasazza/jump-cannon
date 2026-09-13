@@ -24,7 +24,8 @@
 
 use data_loader::{
     identity::Namespace, Capability, DiscoveryField, DiscoveryFieldType, EdgeTypeSchema, Effect,
-    ImportError, ImportFuture, Importer, ImporterDescriptor, ImporterSchema, LoadResult,
+    ImportError, ImportFuture, ImportProgress, Importer, ImporterDescriptor, ImporterSchema,
+    LoadResult,
     SearchDocument, TagHierarchySchema, Transport, WatchPlan,
 };
 use graph_vcs::{Snapshot, VcsStore};
@@ -109,7 +110,10 @@ impl Importer for WorldImporter {
         self.descriptor_for()
     }
 
-    fn import<'a>(&'a self) -> ImportFuture<'a, Result<LoadResult, ImportError>> {
+    fn import<'a>(
+        &'a self,
+        _progress: &'a dyn ImportProgress,
+    ) -> ImportFuture<'a, Result<LoadResult, ImportError>> {
         Box::pin(async move {
             // A head-less world (no commits) still serves one valid empty
             // snapshot.

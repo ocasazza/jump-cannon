@@ -31,8 +31,8 @@ use data_loader::{
 };
 #[cfg(feature = "native")]
 use data_loader::{
-    Capability, Effect, ImportError as PipelineError, ImportFuture, Importer, ImporterDescriptor,
-    Loader, Transport, WatchPlan,
+    Capability, Effect, ImportError as PipelineError, ImportFuture, ImportProgress, Importer,
+    ImporterDescriptor, Loader, Transport, WatchPlan,
 };
 use pest::iterators::Pair;
 use pest_meta::ast::RuleType;
@@ -821,14 +821,27 @@ impl Importer for FilesystemImporter {
         })
     }
 
-    fn import<'a>(&'a self) -> ImportFuture<'a, Result<LoadResult, PipelineError>> {
+    fn import<'a>(
+        &'a self,
+        progress: &'a dyn ImportProgress,
+    ) -> ImportFuture<'a, Result<LoadResult, PipelineError>> {
         Box::pin(async move {
-            self.loader
+            let stage = progress.stage(&format!(
+                "Parsing {}",
+                self.loader.package.manifest.metadata.name
+            ));
+            let result = self
+                .loader
                 .load_checked()
                 .map_err(|error| PipelineError::Decode {
                     origin: self.loader.input_path.display().to_string(),
                     message: error.to_string(),
-                })
+                });
+            match &result {
+                Ok(_) => progress.finish(stage),
+                Err(error) => progress.fail(stage, &error.to_string()),
+            }
+            result
         })
     }
 }

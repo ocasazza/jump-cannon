@@ -2,7 +2,7 @@
 
 use std::io::Write;
 
-use data_loader::{Transport, WriteRequest};
+use data_loader::{NoProgress, Transport, WriteRequest};
 
 use super::*;
 
@@ -208,7 +208,10 @@ impl SourceConnector for FixtureConnector {
         vec![Capability::new(effect, Transport::InMemory, "fixture")]
     }
 
-    fn read<'a>(&'a self) -> ImportFuture<'a, Result<Vec<SourceRecord>, ImportError>> {
+    fn read<'a>(
+        &'a self,
+        _progress: &'a dyn ImportProgress,
+    ) -> ImportFuture<'a, Result<Vec<SourceRecord>, ImportError>> {
         let records = self.records.clone();
         Box::pin(async move { Ok(records) })
     }
@@ -227,7 +230,7 @@ async fn decorator_expands_inner_records_and_delegates_capabilities() {
         connector.capabilities(Effect::Read),
         vec![Capability::new(Effect::Read, Transport::InMemory, "fixture")]
     );
-    let records = connector.read().await.unwrap();
+    let records = connector.read(&NoProgress).await.unwrap();
     assert_eq!(records.len(), 2);
     assert_eq!(records[0].origin, "mem://plain.md");
     assert_eq!(records[1].origin, "mem://bundle.tar!x.txt");

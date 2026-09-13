@@ -5,7 +5,7 @@ use std::path::Path;
 use std::sync::Mutex;
 
 use data_loader::testing::assert_import_contract;
-use data_loader::{Effect, ImportFuture, ImportError, Importer, Transport, WatchPlan};
+use data_loader::{Effect, ImportError, ImportFuture, Importer, NoProgress, Transport, WatchPlan};
 
 use super::*;
 
@@ -266,7 +266,7 @@ async fn import_maps_the_corpus_into_the_github_namespace() {
     let temp = tempfile::tempdir().unwrap();
     let importer = fixture_importer(temp.path(), FIXTURE_ETAG);
 
-    let result = importer.import().await.unwrap();
+    let result = importer.import(&NoProgress).await.unwrap();
     let graph = &result.graph;
     assert_eq!(graph.node_count(), 2, "README.md is outside the corpus path");
     let start_here = "github:acme-corpus:Start Here";
@@ -315,8 +315,8 @@ async fn etag_304_reuses_the_cached_extraction() {
     let importer =
         GitHubImporter::with_source(test_config(temp.path()), Box::new(source)).unwrap();
 
-    let first = importer.import().await.unwrap();
-    let second = importer.import().await.unwrap();
+    let first = importer.import(&NoProgress).await.unwrap();
+    let second = importer.import(&NoProgress).await.unwrap();
 
     // The second poll sent If-None-Match and got a 304: two requests, the
     // first unconditional, the second revalidating with the fixture ETag.
@@ -350,7 +350,7 @@ async fn etag_304_reuses_the_cached_extraction() {
 async fn restart_recovers_the_cache_pointer() {
     let temp = tempfile::tempdir().unwrap();
     let importer = fixture_importer(temp.path(), FIXTURE_ETAG);
-    importer.import().await.unwrap();
+    importer.import(&NoProgress).await.unwrap();
     drop(importer);
 
     // A new process (fresh in-memory state) over the same cache dir must
@@ -359,7 +359,7 @@ async fn restart_recovers_the_cache_pointer() {
     let source = FixtureTarball::new(fixture_tarball(), FIXTURE_ETAG);
     let importer =
         GitHubImporter::with_source(test_config(temp.path()), Box::new(source)).unwrap();
-    let result = importer.import().await.unwrap();
+    let result = importer.import(&NoProgress).await.unwrap();
     assert_eq!(result.graph.node_count(), 2);
     let requests = importer
         .source
@@ -375,13 +375,13 @@ async fn restart_recovers_the_cache_pointer() {
 async fn a_new_etag_replaces_and_prunes_the_extraction() {
     let temp = tempfile::tempdir().unwrap();
     let importer = fixture_importer(temp.path(), "v1");
-    importer.import().await.unwrap();
+    importer.import(&NoProgress).await.unwrap();
     assert!(temp.path().join("acme-corpus-v1").is_dir());
 
     let source = FixtureTarball::new(fixture_tarball(), "v2");
     let importer =
         GitHubImporter::with_source(test_config(temp.path()), Box::new(source)).unwrap();
-    importer.import().await.unwrap();
+    importer.import(&NoProgress).await.unwrap();
     assert!(temp.path().join("acme-corpus-v2").is_dir());
     assert!(
         !temp.path().join("acme-corpus-v1").exists(),
