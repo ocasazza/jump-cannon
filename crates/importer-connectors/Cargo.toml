@@ -28,7 +28,11 @@ zip         = { version = "8", default-features = false, features = ["deflate"],
 flate2      = { version = "1", optional = true }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"], optional = true }
+# rustls-tls-native-roots, NOT rustls-tls: the bundled webpki roots ignore
+# SSL_CERT_FILE, so behind the Schrodinger Fortigate (which re-signs every
+# outbound chain) every request fails x509 verification inside a container.
+# Native roots read the host bundle the deployment mounts.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-native-roots"], optional = true }
 ssh2 = { version = "0.9", features = ["vendored-openssl"], optional = true }
 tonic = { version = "0.14", default-features = false, features = ["channel", "codegen", "tls-webpki-roots"], optional = true }
 prost = { version = "0.14", optional = true }
