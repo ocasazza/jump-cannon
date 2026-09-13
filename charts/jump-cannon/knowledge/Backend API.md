@@ -36,6 +36,11 @@ source's authored TOML, and `PUT /importers/:id/definition` plus
 `POST /importers` write it behind the runtime-switch group (see
 [[Importer Runtime]], "Package definitions").
 
+When `importers.runtimeSwitchGroup` is set, selected sources are built on a background task. Graph routes for a selection that is still building answer `202 Accepted` with `Retry-After: 2` and JSON `{"status":"building","source","elapsed_ms","stage","detail","fraction"}` — they no longer wait behind a lock. Failed builds answer `503 Service Unavailable` with `{"status":"failed","source","error"}` and are retryable. New status and control routes:
+- `GET /importers/sources/{id}/status` returns 200 with `{"status":"building"|"serving"|"failed"|"idle"}` (never blocks).
+- `GET /importers/sources/{id}/progress?since=` returns that source's event log (available while building, JSON array of `{timestamp, stage, detail, fraction}`).
+- `POST /importers/sources/{id}/retry` returns 200 with `{"status":"building"}` when retry starts, or 409 if already building or serving. Failed entries evict on idle TTL; building entries persist until eviction or successful completion.
+
 Bulk arrays use little-endian numeric buffers; structured messages use protobuf
 or JSON where appropriate. See [[Architecture]], [[Observability]], and
 [[Security Model]]. Importer contracts are documented in [[Importer Runtime]].

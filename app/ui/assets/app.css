@@ -1063,10 +1063,47 @@ textarea.doc-src:focus { outline:none; }
 .imp-apply .imp-note { padding:0; }
 .imp-apply.building { border-left-color:var(--accent); }
 .imp-apply.ok { border-left-color:var(--green); }
-.imp-apply.timeout { border-left-color:var(--yellow); }
 .imp-apply.error { border-left-color:var(--red); }
 .imp-apply.error .imp-apply-line { color:var(--red); }
+.imp-apply.error .imp-actions { gap:.4rem; }
 .imp-chip.apply[data-outcome="building"] { color:var(--accent); border-color:#28557e; }
 .imp-chip.apply[data-outcome="ok"] { color:var(--green); border-color:#2a5334; }
-.imp-chip.apply[data-outcome="timeout"] { color:var(--yellow); border-color:#655123; }
 .imp-chip.apply[data-outcome="error"] { color:var(--red); border-color:#5f2828; }
+
+/* Build-progress card shared by the boot skeleton, the Graph panel overlay,
+   the Importers apply status, and the Progress panel's Importing section. */
+.build-progress { display:flex; flex-direction:column; gap:.35rem; width:100%;
+  max-width:32rem; }
+.build-progress-head { display:flex; justify-content:space-between; align-items:baseline;
+  gap:.75rem; }
+.build-progress-source { color:var(--fg); font-weight:700; overflow-wrap:anywhere; }
+.build-progress-elapsed { color:var(--dim); font-family:var(--mono); font-size:.72rem;
+  flex:0 0 auto; }
+.build-progress-stage { color:var(--fg); font-size:.72rem; overflow-wrap:anywhere; }
+.build-progress-detail { color:var(--dim); font-size:.68rem; overflow-wrap:anywhere; }
+
+/* Progress bar: a determinate <progress> when a fraction is known, else a
+   CSS-only indeterminate sweep (no JavaScript). */
+.build-progress-bar { appearance:none; -webkit-appearance:none; width:100%; height:6px;
+  border:1px solid var(--line2); border-radius:3px; background:var(--bg); overflow:hidden; }
+.build-progress-bar::-webkit-progress-bar { background:var(--bg); }
+.build-progress-bar::-webkit-progress-value { background:var(--accent); }
+.build-progress-bar::-moz-progress-bar { background:var(--accent); }
+.build-progress-bar[indeterminate] { position:relative; }
+.build-progress-bar[indeterminate]::after { content:""; position:absolute; top:0; left:-35%;
+  height:100%; width:35%; border-radius:3px; background:var(--accent);
+  animation:build-progress-sweep 1.1s ease-in-out infinite; }
+@keyframes build-progress-sweep { 0% { left:-35%; } 100% { left:100%; } }
+
+/* Live event feed under a build status: newest last, monospace. */
+.build-progress-feed { display:flex; flex-direction:column; gap:.1rem; width:100%;
+  font-family:var(--mono); font-size:.62rem; color:var(--dim); }
+.build-progress-feed-line { overflow-wrap:anywhere; }
+
+/* Progress-panel "Importing …" section wrapping the build card and feed. */
+.build-section { display:flex; flex-direction:column; gap:.4rem; padding:.4rem .1rem .6rem;
+  border-bottom:1px solid var(--line2); }
+.build-section-title { color:var(--fg); font-weight:700; letter-spacing:.04em; }
+
+/* Graph panel overlay while the applied source is still indexing. */
+.graph-render-status.building { border-color:var(--accent); }

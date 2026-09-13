@@ -50,10 +50,10 @@ pub struct GraphData {
 ///     palette (egui default `ColorBy::Community`);
 ///   - sizes come from pagerank with the default 0.5 multiplier
 ///     (egui default `SizeBy::PageRank`, `size_mul = 0.5`).
-pub async fn load() -> Result<GraphData, String> {
-    let init = api::init().await?;
-    let ids_response = api::revisioned_ids().await?;
-    let edges_response = api::revisioned_edges().await?;
+pub async fn load() -> Result<GraphData, api::LoadError> {
+    let init = api::init_load().await?;
+    let ids_response = api::revisioned_ids_load().await?;
+    let edges_response = api::revisioned_edges_load().await?;
     let ids = ids_response.value;
     let edges = edges_response.value;
     let revision = init.graph_revision;
@@ -69,7 +69,8 @@ pub async fn load() -> Result<GraphData, String> {
             return Err(format!(
                 "inconsistent snapshot ({name} revision {got}, init revision {revision}) — \
                  server graph changed mid-load"
-            ));
+            )
+            .into());
         }
     }
 
@@ -83,7 +84,8 @@ pub async fn load() -> Result<GraphData, String> {
             "inconsistent snapshot (n={n}, ids={}, max edge idx={:?}) — server graph changed mid-load",
             ids.len(),
             edges.iter().max()
-        ));
+        )
+        .into());
     }
     let mut metrics: HashMap<String, Vec<f32>> = HashMap::new();
     for name in ["community", "pagerank"] {
@@ -96,7 +98,8 @@ pub async fn load() -> Result<GraphData, String> {
                     "inconsistent snapshot (metric {name} revision {}, init revision {revision}) — \
                      server graph changed mid-load",
                     r.revision
-                ));
+                )
+                .into());
             }
             Err(e) => tracing::warn!("[graph] metric {name}: {e}"),
         }
@@ -134,6 +137,31 @@ pub async fn load() -> Result<GraphData, String> {
             sizes,
         },
     })
+}
+
+/// Live build-progress card for a source that graph-api is still indexing.
+/// Pure presentation: the boot loop and the Importers tracker own the status
+/// polling and hand the latest [`api::BuildStatus`] in. Rendered in the boot
+/// skeleton, the Graph panel overlay, and the Progress panel so every waiting
+/// surface shows the same source name, `m:ss` elapsed, stage, detail, and bar.
+#[allow(non_snake_case)] // component-style presentation fn, called directly (not via rsx element)
+pub fn BuildProgress(status: api::BuildStatus) -> Element {
+    let elapsed = crate::build_progress::fmt_elapsed(status.elapsed_ms);
+    rsx! {
+        div { class: "build-progress",
+            div { class: "build-progress-head",
+                span { class: "build-progress-source", "{status.source}" }
+                span { class: "build-progress-elapsed", "{elapsed}" }
+            }
+            if let Some(stage) = &status.stage {
+                div { class: "build-progress-stage", "{stage}" }
+            }
+            if let Some(detail) = &status.detail {
+                div { class: "build-progress-detail", "{detail}" }
+            }
+            {crate::build_progress::progress_bar(status.fraction)}
+        }
+    }
 }
 
 /// Convert an embedded world's materialized snapshot into `GraphData`,
@@ -279,7 +307,11 @@ struct Drag {
 ///   - WASDQE pan is handled at the workspace root (see main.rs) and
 ///     gated on the pointer being over this canvas
 #[component]
-pub fn GraphCanvas(graph: Signal<Option<GraphData>>, selected: Signal<Option<String>>) -> Element {
+pub fn GraphCanvas(
+    graph: Signal<Option<GraphData>>,
+    selected: Signal<Option<String>>,
+    building: Signal<Option<api::BuildStatus>>,
+) -> Element {
     let mut drag = use_signal(|| Option::<Drag>::None);
     let render_status = render::RENDER_STATUS.read().clone();
     let render_state = render_status.as_attr();
@@ -390,6 +422,14 @@ pub fn GraphCanvas(graph: Signal<Option<GraphData>>, selected: Signal<Option<Str
                     "data-testid": "graph-render-status",
                     h2 { "{title}" }
                     p { "{detail}" }
+                }
+            }
+            if let Some(status) = building.read().clone() {
+                div {
+                    class: "graph-render-status building",
+                    role: "status",
+                    "data-testid": "graph-render-status",
+                    {BuildProgress(status)}
                 }
             }
         }

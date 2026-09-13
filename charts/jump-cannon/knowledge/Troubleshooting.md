@@ -61,3 +61,9 @@ The [[GitHub Importer]] poll loop surfaces every stage on `/progress`; a
 failed fetch leaves the prior complete revision live, so a stale corpus with
 no error events means the poll itself is not running. Importer internals are
 in [[Importer Runtime]]; search/index behavior in [[Nodes Search and Documents]].
+
+## Import duration and failures
+
+A graph stays live showing "importing for minutes" — this is normal for live-paged APIs such as ChEMBL that page through a public REST API on demand. The import stage, detail, elapsed time, and a live event feed appear in the Importers panel and the Progress panel; watch there rather than waiting for graph data.
+
+An alternate source's build (background import from a runtime-switched selection) may fail due to network, API, or validation errors. The Importers panel shows a Retry button for failed sources; click it to start a new build immediately, or use `POST /importers/sources/{id}/retry` from the command line. Check [[Backend API]] and [[Importer Runtime]] for status and progress query endpoints (`GET /importers/sources/{id}/status`, `GET /importers/sources/{id}/progress?since=`).

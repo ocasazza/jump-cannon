@@ -16,6 +16,7 @@ mod anchored;
 mod api;
 mod appstate;
 mod badges;
+mod build_progress;
 mod selection_card;
 mod client_log;
 mod graph_canvas;
@@ -551,6 +552,11 @@ pub(crate) struct Ctx {
     pub(crate) graph: Signal<Option<GraphData>>,
     pub(crate) graph_session: Signal<GraphSession>,
     pub(crate) load_error: Signal<Option<String>>,
+    /// Live build status when the selected source is still indexing. `Some`
+    /// while graph-api answers the graph routes with `202` — a normal wait,
+    /// never an error. Drives the boot skeleton, the Graph panel overlay, and
+    /// the Progress panel; the boot loop and the Importers tracker own it.
+    pub(crate) building: Signal<Option<api::BuildStatus>>,
     pub(crate) selected: Signal<Option<String>>,
     pub(crate) meta: Signal<Option<proto::NodeMeta>>,
     pub(crate) meta_busy: Signal<bool>,
@@ -877,7 +883,9 @@ pub(crate) async fn reload_graph(mut ctx: Ctx) {
         Ok(g) => {
             commit_server_graph(ctx, epoch, g);
         }
-        Err(e) if ctx.graph_session.peek().epoch == epoch => ctx.load_error.set(Some(e)),
+        Err(e) if ctx.graph_session.peek().epoch == epoch => {
+            ctx.load_error.set(Some(e.to_string()))
+        }
         Err(_) => {}
     }
 }
@@ -942,6 +950,7 @@ fn App() -> Element {
         graph: use_signal(|| None),
         graph_session: use_signal(|| GraphSession::loading_server(api::server_url())),
         load_error: use_signal(|| None),
+        building: use_signal(|| None),
         selected: use_signal(|| None),
         meta: use_signal(|| None),
         meta_busy: use_signal(|| false),
@@ -1035,27 +1044,123 @@ fn App() -> Element {
     // the canvas permanently empty.
     {
         let mut load_error = ctx.load_error;
+        let mut building = ctx.building;
         use_future(move || async move {
             if skip_server_load {
                 return;
             }
             let epoch = begin_server_graph_load(ctx);
+            // Last stage logged, so a still-building source logs at most once
+            // per distinct stage instead of flooding the console every poll.
+            let mut last_stage: Option<String> = None;
             loop {
+                if ctx.graph_session.peek().epoch != epoch {
+                    break;
+                }
                 match graph_canvas::load().await {
                     Ok(g) => {
+                        building.set(None);
                         if commit_server_graph(ctx, epoch, g) {
                             load_error.set(None);
                         }
                         break;
                     }
+                    // Building is a normal wait, not an error: clear any error,
+                    // show live progress, and poll the source's own status until
+                    // it serves (re-run load) or fails (stop). Never logged as an
+                    // error — at most one info line per new stage.
+                    Err(api::LoadError::Building(status)) => {
+                        if ctx.graph_session.peek().epoch != epoch {
+                            break;
+                        }
+                        load_error.set(None);
+                        let source = status.source.clone();
+                        if status.stage != last_stage {
+                            tracing::info!(
+                                "[graph] source {source} building: {}",
+                                status.stage.as_deref().unwrap_or("…")
+                            );
+                            last_stage = status.stage.clone();
+                        }
+                        building.set(Some(status));
+                        loop {
+                            gloo_timers::future::TimeoutFuture::new(1000).await;
+                            if ctx.graph_session.peek().epoch != epoch {
+                                return;
+                            }
+                            match api::source_status(&source).await {
+                                Ok(s) => match s.status.as_str() {
+                                    "serving" => break,
+                                    "failed" => {
+                                        building.set(None);
+                                        load_error
+                                            .set(Some(api::LoadError::Failed(s).to_string()));
+                                        return;
+                                    }
+                                    _ => {
+                                        if s.stage != last_stage {
+                                            tracing::info!(
+                                                "[graph] source {source} building: {}",
+                                                s.stage.as_deref().unwrap_or("…")
+                                            );
+                                            last_stage = s.stage.clone();
+                                        }
+                                        building.set(Some(s));
+                                    }
+                                },
+                                // A transient status hiccup is not a build
+                                // failure; keep polling.
+                                Err(_) => {}
+                            }
+                        }
+                    }
+                    Err(api::LoadError::Failed(status)) => {
+                        if ctx.graph_session.peek().epoch != epoch {
+                            break;
+                        }
+                        building.set(None);
+                        load_error.set(Some(api::LoadError::Failed(status).to_string()));
+                        break;
+                    }
+                    // The genuinely-unexpected path (transport, HTTP, decode):
+                    // warn and retry, exactly as before.
                     Err(e) => {
                         if ctx.graph_session.peek().epoch != epoch {
                             break;
                         }
-                        load_error.set(Some(e));
+                        building.set(None);
+                        tracing::warn!("[graph] load failed: {e}");
+                        load_error.set(Some(e.to_string()));
                         gloo_timers::future::TimeoutFuture::new(1500).await;
                     }
                 }
+            }
+        });
+    }
+
+    // Progress-panel feed: while a source is still indexing, tail its own
+    // progress log at 500 ms and fold it into the shared `BUILD_FEED`. Keyed
+    // on the source identity (a memo) so per-second stage updates to the same
+    // source neither reset the feed nor spawn duplicate pollers.
+    {
+        let building = ctx.building;
+        let build_source = use_memo(move || building.read().as_ref().map(|s| s.source.clone()));
+        use_effect(move || {
+            let source = build_source.read().clone();
+            *build_progress::BUILD_FEED.write() = build_progress::BuildFeed::default();
+            if let Some(source) = source {
+                spawn(async move {
+                    loop {
+                        if build_source.peek().as_deref() != Some(source.as_str()) {
+                            return;
+                        }
+                        let since = build_progress::BUILD_FEED.peek().since;
+                        if let Ok(resp) = api::source_progress(&source, since).await {
+                            build_progress::BUILD_FEED.write().fold(&resp);
+                        }
+                        gloo_timers::future::TimeoutFuture::new(500).await;
+                    }
+                });
             }
         });
     }
@@ -1386,7 +1491,15 @@ fn panel_body(kind: Panel, _maximized: bool, ctx: Ctx) -> Element {
                 };
             }
             if ctx.graph.read().is_some() {
-                rsx! { graph_canvas::GraphCanvas { graph: ctx.graph, selected: ctx.selected } }
+                rsx! {
+                    graph_canvas::GraphCanvas {
+                        graph: ctx.graph,
+                        selected: ctx.selected,
+                        building: ctx.building,
+                    }
+                }
+            } else if let Some(status) = ctx.building.read().clone() {
+                rsx! { div { class: "skeleton", {graph_canvas::BuildProgress(status)} } }
             } else if let Some(e) = ctx.load_error.read().clone() {
                 rsx! { div { class: "skeleton", Spinner { label: "retrying: {e}" } } }
             } else {
@@ -1469,12 +1582,37 @@ fn panel_header_actions(kind: Panel, ctx: Ctx) -> Element {
 /// Live server progress: vault reload stages, search reindex, layout jobs —
 /// the same event log the egui footer renders, polled from /progress.
 fn progress_panel(ctx: Ctx) -> Element {
-    let Ctx { tasks, logs, .. } = ctx;
+    let Ctx {
+        tasks,
+        logs,
+        building,
+        ..
+    } = ctx;
     let ts = tasks.read().clone();
     let ls = logs.read().clone();
+    let build = building.read().clone();
+    let feed: Vec<String> = build_progress::BUILD_FEED
+        .read()
+        .lines
+        .iter()
+        .cloned()
+        .collect();
     rsx! {
         div { class: "jobs",
-            if ts.is_empty() && ls.is_empty() {
+            if let Some(status) = &build {
+                div { class: "build-section", role: "status",
+                    div { class: "build-section-title", "Importing {status.source}" }
+                    {graph_canvas::BuildProgress(status.clone())}
+                    if !feed.is_empty() {
+                        div { class: "build-progress-feed", role: "log",
+                            for (i, line) in feed.iter().enumerate() {
+                                div { key: "{i}", class: "build-progress-feed-line", "{line}" }
+                            }
+                        }
+                    }
+                }
+            }
+            if ts.is_empty() && ls.is_empty() && build.is_none() {
                 div { class: "empty", "no server activity yet" }
             }
             for t in ts.iter().rev() {

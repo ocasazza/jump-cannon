@@ -19,8 +19,8 @@ importer publishes its search and facet keys through `GET /graph/schema`.
 
 Open the **Importers** panel to see the active importer and the sanitized
 deployment catalog. Named source instances show their kind, source identity,
-filesystem claim/path, and read-only state. The panel is intentionally
-non-mutating: select or reconfigure a source with Helm and roll graph-api out.
+filesystem claim/path, and read-only state. When switching to a source that requires building, the boot skeleton, the Graph panel overlay, the Importers panel, and the Progress panel ("Importing <source>") all show the current stage, detail, elapsed time, and a progress bar (determinate when known, indeterminate otherwise) plus a live feed of recent events. Building is never logged as an error or warning. A source build that exceeds a minute is normal for live-paged APIs; if a build fails, a Retry button appears in the Importers panel. For deployment management, select or reconfigure a source with Helm and roll graph-api out.
+
 The built-in `lavender-ingest-okf` profile reads the shared OKF handoff described
 in [[Helm Deployment]].
 

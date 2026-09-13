@@ -369,7 +369,7 @@ async fn get_revisioned_json_load<T: serde::de::DeserializeOwned>(
     if status == 202 {
         let body = resp.text().await.map_err(|e| LoadError::Other(e.to_string()))?;
         if let Some(bs) = parse_build_status_from_body(&body) {
-            tracing::warn!("202 Building: {}", bs.source);
+            tracing::debug!("202 building: {}", bs.source);
             return Err(LoadError::Building(bs));
         }
     }
@@ -378,7 +378,7 @@ async fn get_revisioned_json_load<T: serde::de::DeserializeOwned>(
         let body = resp.text().await.map_err(|e| LoadError::Other(e.to_string()))?;
         if let Some(bs) = parse_build_status_from_body(&body) {
             if bs.status == "failed" {
-                tracing::warn!("503 Failed: {}", bs.source);
+                tracing::debug!("503 failed: {}", bs.source);
                 return Err(LoadError::Failed(bs));
             }
         }
@@ -403,14 +403,6 @@ async fn get_revisioned_json_load<T: serde::de::DeserializeOwned>(
     Ok(Revisioned { revision, value })
 }
 
-async fn get_revisioned_json<T: serde::de::DeserializeOwned>(
-    path: &str,
-) -> ApiResult<Revisioned<T>> {
-    get_revisioned_json_load::<T>(path)
-        .await
-        .map_err(|e| e.to_string())
-}
-
 async fn get_revisioned_bytes_load(path: &str) -> LoadResult<Revisioned<Vec<u8>>> {
     let resp = get(path).send().await.map_err(|e| LoadError::Other(e.to_string()))?;
     let status = resp.status();
@@ -418,7 +410,7 @@ async fn get_revisioned_bytes_load(path: &str) -> LoadResult<Revisioned<Vec<u8>>
     if status == 202 {
         let body = resp.text().await.map_err(|e| LoadError::Other(e.to_string()))?;
         if let Some(bs) = parse_build_status_from_body(&body) {
-            tracing::warn!("202 Building: {}", bs.source);
+            tracing::debug!("202 building: {}", bs.source);
             return Err(LoadError::Building(bs));
         }
     }
@@ -427,7 +419,7 @@ async fn get_revisioned_bytes_load(path: &str) -> LoadResult<Revisioned<Vec<u8>>
         let body = resp.text().await.map_err(|e| LoadError::Other(e.to_string()))?;
         if let Some(bs) = parse_build_status_from_body(&body) {
             if bs.status == "failed" {
-                tracing::warn!("503 Failed: {}", bs.source);
+                tracing::debug!("503 failed: {}", bs.source);
                 return Err(LoadError::Failed(bs));
             }
         }
@@ -465,7 +457,7 @@ pub(crate) async fn get_bytes_load(path: &str) -> LoadResult<Vec<u8>> {
     if status == 202 {
         let body = resp.text().await.map_err(|e| LoadError::Other(e.to_string()))?;
         if let Some(bs) = parse_build_status_from_body(&body) {
-            tracing::warn!("202 Building: {}", bs.source);
+            tracing::debug!("202 building: {}", bs.source);
             return Err(LoadError::Building(bs));
         }
     }
@@ -474,7 +466,7 @@ pub(crate) async fn get_bytes_load(path: &str) -> LoadResult<Vec<u8>> {
         let body = resp.text().await.map_err(|e| LoadError::Other(e.to_string()))?;
         if let Some(bs) = parse_build_status_from_body(&body) {
             if bs.status == "failed" {
-                tracing::warn!("503 Failed: {}", bs.source);
+                tracing::debug!("503 failed: {}", bs.source);
                 return Err(LoadError::Failed(bs));
             }
         }
@@ -528,19 +520,10 @@ fn u32s(bytes: &[u8]) -> Vec<u32> {
 
 // --- graph data ---------------------------------------------------------------
 
-/// `/graph/init` — node/edge counts, community/wcc counts, color palette.
-pub async fn init() -> ApiResult<proto::Init> {
-    get_proto("/graph/init").await
-}
-
 /// `/graph/ids` — node ids in the same order as the binary buffers.
 #[allow(dead_code)] // revision-aware bootstrap uses revisioned_ids
 pub async fn ids() -> ApiResult<Vec<String>> {
     get_json("/graph/ids").await
-}
-
-pub(crate) async fn revisioned_ids() -> ApiResult<Revisioned<Vec<String>>> {
-    get_revisioned_json("/graph/ids").await
 }
 
 /// `/graph/positions` — flat [x0, y0, x1, y1, …] f32 buffer.
@@ -558,14 +541,6 @@ pub async fn positions() -> ApiResult<Vec<f32>> {
 #[allow(dead_code)] // revision-aware bootstrap uses revisioned_edges
 pub async fn edges() -> ApiResult<Vec<u32>> {
     Ok(u32s(&get_bytes("/graph/edges").await?))
-}
-
-pub(crate) async fn revisioned_edges() -> ApiResult<Revisioned<Vec<u32>>> {
-    let r = get_revisioned_bytes("/graph/edges").await?;
-    Ok(Revisioned {
-        revision: r.revision,
-        value: u32s(&r.value),
-    })
 }
 
 /// LoadResult variant of init
@@ -1001,6 +976,7 @@ pub async fn progress(since: u64) -> ApiResult<ProgressResponse> {
 /// carrying `x-jump-cannon-source` blocks behind the very build it would
 /// report on. The default source's log is the only one reachable while an
 /// alternate builds.
+#[allow(dead_code)] // source-scoped progress polling replaced the default-log tail in the Importers panel
 pub async fn progress_default(since: u64) -> ApiResult<ProgressResponse> {
     let req = Request::get(&url(&format!("/progress?since={since}")))
         .cache(web_sys::RequestCache::NoStore);

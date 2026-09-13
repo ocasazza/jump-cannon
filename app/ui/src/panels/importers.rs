@@ -22,7 +22,7 @@ use panel_kit::editor::{MonacoEditor, PANEL_KIT_DARK_THEME};
 use wasm_bindgen::{JsCast, JsValue};
 
 use crate::pest_worker::{parse_in_worker, ParsePreview};
-use crate::{api, reload_graph, Ctx};
+use crate::{api, build_progress, reload_graph, Ctx};
 
 // --- persistence ---------------------------------------------------------------
 
@@ -119,16 +119,16 @@ enum PreviewState {
 #[derive(Clone, PartialEq)]
 enum ApplyState {
     Building {
-        elapsed_secs: u64,
-        /// Latest default-log progress label naming the applied source, when
-        /// the server produces one.
-        stage: Option<String>,
+        /// Latest authoritative status from the source's own build endpoint.
+        status: api::BuildStatus,
+        /// Progress cursor folded into the feed so far — churns the state on
+        /// every new event so the summary re-renders as the feed grows.
+        events_seen: u64,
     },
     Ok {
         nodes: u32,
         edges: u32,
     },
-    Timeout,
     Error(String),
 }
 
@@ -139,6 +139,9 @@ struct ApplyStatus {
     anchor: String,
     /// What is being applied, for display.
     target: String,
+    /// The applied source id: `Some` drives status/progress/retry, `None` is
+    /// the deployment default (a reset, already hosted — nothing to poll).
+    source_id: Option<String>,
     /// The apply clears the session selection; no inline reset is offered.
     reset: bool,
     state: ApplyState,
@@ -169,14 +172,10 @@ static APPLY: GlobalSignal<Option<ApplyStatus>> = Signal::global(|| None);
 /// Bumped by every Apply; the tracker tasks of superseded applies exit
 /// instead of overwriting the current status.
 static APPLY_GEN: GlobalSignal<u64> = Signal::global(|| 0);
-
-/// Ceiling on the first graph payload after an Apply, past which the panel
-/// declares the switch unusable rather than waiting silently.
-///
-/// The cluster ingress in front of graph-api drops the connection at ~75s, so
-/// a source whose build outlives that can never answer through the proxy at
-/// all; 90s leaves headroom for a direct connection on a slower box.
-const APPLY_CEILING_SECS: u64 = 90;
+/// Progress feed for the active Apply, tailed from the applied source's own
+/// `/importers/sources/{id}/progress` log and reset per Apply generation.
+static APPLY_FEED: GlobalSignal<build_progress::BuildFeed> =
+    Signal::global(build_progress::BuildFeed::default);
 
 // --- manifest text surgery (pure functions; unit-tested below) --------------------
 
@@ -606,76 +605,97 @@ fn apply_source(ctx: Ctx, anchor: String, target: Option<String>) {
     }
     let generation = APPLY_GEN.peek().wrapping_add(1);
     *APPLY_GEN.write() = generation;
+    *APPLY_FEED.write() = build_progress::BuildFeed::default();
+    let display = target
+        .clone()
+        .unwrap_or_else(|| "the deployment default".to_string());
     *APPLY.write() = Some(ApplyStatus {
         anchor,
-        target: target
-            .clone()
-            .unwrap_or_else(|| "the deployment default".to_string()),
+        target: display,
+        source_id: target.clone(),
         reset: target.is_none(),
         state: ApplyState::Building {
-            elapsed_secs: 0,
-            stage: None,
+            status: api::BuildStatus {
+                status: "building".to_string(),
+                source: target.clone().unwrap_or_default(),
+                elapsed_ms: None,
+                stage: None,
+                detail: None,
+                fraction: None,
+                error: None,
+            },
+            events_seen: 0,
         },
     });
     spawn(track_apply(ctx, target, generation));
 }
 
-/// Bound the wait at [`APPLY_CEILING_SECS`] and record the outcome.
-///
-/// The load runs as its own task rather than racing the ceiling: dropping it
-/// would abandon a build that may still land, so a late success replaces the
-/// timeout status instead of being thrown away.
-async fn track_apply(ctx: Ctx, target: Option<String>, generation: u64) {
-    spawn(track_stages(target, generation));
-    spawn(async move {
+/// Track an Apply to a terminal outcome. The source's own build status is
+/// authoritative: a large corpus is a long wait, never a timeout, so the
+/// panel polls status at 1 s and the granular progress log at 500 ms until
+/// graph-api reports `serving` (reload the graph) or `failed` (offer Retry).
+async fn track_apply(mut ctx: Ctx, target: Option<String>, generation: u64) {
+    let Some(id) = target else {
+        // Returning to the deployment default: it is already hosted, so there
+        // is nothing to build or poll — just reload and record the outcome.
         reload_graph(ctx).await;
+        finalize_apply(ctx, generation);
+        return;
+    };
+    // Feed poller: tail the alternate's own progress log while it builds.
+    spawn(track_feed(id.clone(), generation));
+    loop {
         if *APPLY_GEN.peek() != generation {
             return;
         }
-        let state = if let Some(error) = ctx.load_error.peek().clone() {
-            ApplyState::Error(error)
-        } else {
-            match ctx.graph.peek().as_ref() {
-                Some(graph) => ApplyState::Ok {
-                    nodes: graph.n_nodes,
-                    edges: graph.n_edges,
-                },
-                None => ApplyState::Error("another graph load superseded this one".into()),
+        match api::source_status(&id).await {
+            Ok(status) => {
+                if *APPLY_GEN.peek() != generation {
+                    return;
+                }
+                match status.status.as_str() {
+                    "serving" => {
+                        reload_graph(ctx).await;
+                        finalize_apply(ctx, generation);
+                        return;
+                    }
+                    "failed" => {
+                        ctx.building.set(None);
+                        let message = status
+                            .error
+                            .clone()
+                            .unwrap_or_else(|| format!("{id} failed to build"));
+                        set_apply_state(generation, ApplyState::Error(message));
+                        return;
+                    }
+                    _ => {
+                        // Mirror the build into the shared signal so the Graph
+                        // panel overlay and boot skeleton track it too.
+                        ctx.building.set(Some(status.clone()));
+                        let events_seen = APPLY_FEED.peek().since;
+                        set_apply_state(
+                            generation,
+                            ApplyState::Building {
+                                status,
+                                events_seen,
+                            },
+                        );
+                    }
+                }
             }
-        };
-        if let Some(status) = APPLY.write().as_mut() {
-            status.state = state;
+            // A transient status hiccup while the source comes up is not a
+            // build failure; keep polling.
+            Err(_) => {}
         }
-    });
-    gloo_timers::future::TimeoutFuture::new((APPLY_CEILING_SECS * 1000) as u32).await;
-    if *APPLY_GEN.peek() != generation {
-        return;
-    }
-    if let Some(status) = APPLY.write().as_mut() {
-        if matches!(status.state, ApplyState::Building { .. }) {
-            status.state = ApplyState::Timeout;
-        }
+        gloo_timers::future::TimeoutFuture::new(1000).await;
     }
 }
 
-/// Tick the elapsed-seconds readout once a second and pick up any progress
-/// label naming the applied source.
-///
-/// The elapsed counter is the load-bearing signal: an alternate's build stages
-/// go to that alternate's own progress log, and `/progress` for a selected
-/// source resolves through the same extractor as the graph fetch, so it blocks
-/// behind the build it would describe. Only the default source's log is
-/// readable meanwhile (`api::progress_default`), which carries stages whenever
-/// the applied source is the one graph-api already hosts.
-async fn track_stages(target: Option<String>, generation: u64) {
-    let started = js_sys::Date::now();
-    let mut since = api::progress_default(0)
-        .await
-        .map(|resp| resp.next_seq)
-        .unwrap_or(0);
-    let mut stage = None;
+/// Tail the applied source's own progress log at 500 ms, folding each event
+/// tail into [`APPLY_FEED`] until the Apply leaves the Building state or is
+/// superseded by a newer generation.
+async fn track_feed(id: String, generation: u64) {
     loop {
-        gloo_timers::future::TimeoutFuture::new(1000).await;
         if *APPLY_GEN.peek() != generation
             || !matches!(
                 APPLY.peek().as_ref().map(|s| &s.state),
@@ -684,42 +704,44 @@ async fn track_stages(target: Option<String>, generation: u64) {
         {
             return;
         }
-        if let Some(id) = &target {
-            if let Ok(resp) = api::progress_default(since).await {
-                since = resp.next_seq;
-                for stamped in &resp.events {
-                    if let Some(label) = source_stage(id, &stamped.event) {
-                        stage = Some(label);
-                    }
-                }
-            }
-            if *APPLY_GEN.peek() != generation {
-                return;
-            }
+        let since = APPLY_FEED.peek().since;
+        if let Ok(resp) = api::source_progress(&id, since).await {
+            APPLY_FEED.write().fold(&resp);
         }
-        let elapsed_secs = ((js_sys::Date::now() - started) / 1000.0) as u64;
-        if let Some(status) = APPLY.write().as_mut() {
-            if matches!(status.state, ApplyState::Building { .. }) {
-                status.state = ApplyState::Building {
-                    elapsed_secs,
-                    stage: stage.clone(),
-                };
-            }
-        }
+        gloo_timers::future::TimeoutFuture::new(500).await;
     }
 }
 
-/// A progress event's display text when it names `id`; events about other
-/// sources (or task bookkeeping) carry nothing the panel can attribute.
-fn source_stage(id: &str, event: &api::ProgressEvent) -> Option<String> {
-    let text = match event {
-        api::ProgressEvent::Start { label, .. } | api::ProgressEvent::UpdateLabel { label, .. } => {
-            label
+/// Record an Apply outcome from the reloaded graph, unless a newer Apply has
+/// superseded this one.
+fn finalize_apply(mut ctx: Ctx, generation: u64) {
+    if *APPLY_GEN.peek() != generation {
+        return;
+    }
+    ctx.building.set(None);
+    let state = if let Some(error) = ctx.load_error.peek().clone() {
+        ApplyState::Error(error)
+    } else {
+        match ctx.graph.peek().as_ref() {
+            Some(graph) => ApplyState::Ok {
+                nodes: graph.n_nodes,
+                edges: graph.n_edges,
+            },
+            None => ApplyState::Error("another graph load superseded this one".into()),
         }
-        api::ProgressEvent::Log { message, .. } => message,
-        _ => return None,
     };
-    text.contains(id).then(|| text.trim().to_string())
+    set_apply_state(generation, state);
+}
+
+/// Write the Apply state for `generation`, dropping the write when a newer
+/// Apply owns the panel.
+fn set_apply_state(generation: u64, state: ApplyState) {
+    if *APPLY_GEN.peek() != generation {
+        return;
+    }
+    if let Some(status) = APPLY.write().as_mut() {
+        status.state = state;
+    }
 }
 
 /// Inline escape from a failed alternate: clearing the session's own selection
@@ -737,31 +759,68 @@ fn return_to_default(ctx: Ctx, anchor: String) -> Element {
     }
 }
 
+/// Retry a failed build: ask the server to rebuild the source, then re-track
+/// from a fresh Apply generation so status and the feed restart.
+fn retry_build(ctx: Ctx, anchor: String, id: String) -> Element {
+    rsx! {
+        button {
+            class: "btn imp-mini",
+            r#type: "button",
+            "data-action": "retry-build",
+            onclick: move |_| {
+                let anchor = anchor.clone();
+                let id = id.clone();
+                spawn(async move {
+                    let _ = api::source_retry(&id).await;
+                    apply_source(ctx, anchor, Some(id));
+                });
+            },
+            "Retry"
+        }
+    }
+}
+
 /// The `[data-field=apply-status]` block under the anchored catalog summary.
 fn apply_status_view(ctx: Ctx, status: &ApplyStatus) -> Element {
     let target = status.target.clone();
     let anchor = status.anchor.clone();
+    let source_id = status.source_id.clone();
     let offer_reset = !status.reset;
     match &status.state {
         ApplyState::Building {
-            elapsed_secs,
-            stage,
-        } => rsx! {
-            div {
-                class: "imp-apply building",
-                role: "status",
-                "data-field": "apply-status",
-                "data-outcome": "building",
-                "data-elapsed": "{elapsed_secs}",
-                span { class: "imp-apply-line", "building {target}… {elapsed_secs}s" }
-                if let Some(stage) = stage {
-                    span { class: "imp-apply-stage", "data-field": "apply-stage", "{stage}" }
-                }
-                span { class: "imp-note",
-                    "an unserved source is parsed, measured, and indexed before its first response; giving up at {APPLY_CEILING_SECS}s"
+            status: build,
+            events_seen,
+        } => {
+            let elapsed = build_progress::fmt_elapsed(build.elapsed_ms);
+            let feed: Vec<String> = APPLY_FEED.read().lines.iter().cloned().collect();
+            rsx! {
+                div {
+                    class: "imp-apply building",
+                    role: "status",
+                    "data-field": "apply-status",
+                    "data-outcome": "building",
+                    "data-events": "{events_seen}",
+                    span { class: "imp-apply-line", "building {target}… {elapsed}" }
+                    if let Some(stage) = &build.stage {
+                        span { class: "imp-apply-stage", "data-field": "apply-stage", "{stage}" }
+                    }
+                    if let Some(detail) = &build.detail {
+                        span { class: "imp-apply-stage", "{detail}" }
+                    }
+                    {build_progress::progress_bar(build.fraction)}
+                    if !feed.is_empty() {
+                        div { class: "build-progress-feed", role: "log",
+                            for (i, line) in feed.iter().enumerate() {
+                                div { key: "{i}", class: "build-progress-feed-line", "{line}" }
+                            }
+                        }
+                    }
+                    span { class: "imp-note",
+                        "an unserved source is parsed, measured, and indexed before its first response"
+                    }
                 }
             }
-        },
+        }
         ApplyState::Ok { nodes, edges } => rsx! {
             div {
                 class: "imp-apply ok",
@@ -777,20 +836,6 @@ fn apply_status_view(ctx: Ctx, status: &ApplyStatus) -> Element {
                 }
             }
         },
-        ApplyState::Timeout => rsx! {
-            div {
-                class: "imp-apply timeout",
-                role: "alert",
-                "data-field": "apply-status",
-                "data-outcome": "timeout",
-                span { class: "imp-apply-line",
-                    "{target} did not finish serving within {APPLY_CEILING_SECS}s; it is a large corpus — the deployment default is still available"
-                }
-                if offer_reset {
-                    {return_to_default(ctx, anchor.clone())}
-                }
-            }
-        },
         ApplyState::Error(message) => rsx! {
             div {
                 class: "imp-apply error",
@@ -798,8 +843,13 @@ fn apply_status_view(ctx: Ctx, status: &ApplyStatus) -> Element {
                 "data-field": "apply-status",
                 "data-outcome": "error",
                 span { class: "imp-apply-line", "{target} failed to load — {message}" }
-                if offer_reset {
-                    {return_to_default(ctx, anchor.clone())}
+                div { class: "imp-actions",
+                    if let Some(id) = &source_id {
+                        {retry_build(ctx, anchor.clone(), id.clone())}
+                    }
+                    if offer_reset {
+                        {return_to_default(ctx, anchor.clone())}
+                    }
                 }
             }
         },
@@ -940,7 +990,6 @@ pub fn panel(ctx: Ctx) -> Element {
                                         .map(|status| match &status.state {
                                             ApplyState::Building { .. } => ("building", "building"),
                                             ApplyState::Ok { .. } => ("ok", "ready"),
-                                            ApplyState::Timeout => ("timeout", "timeout"),
                                             ApplyState::Error(_) => ("error", "failed"),
                                         });
                                     rsx! {
@@ -1623,30 +1672,5 @@ mod tests {
     fn sanitize_id_matches_source_id_charset() {
         assert_eq!(sanitize_id("Lavender Ingest/OKF"), "lavender-ingest-okf");
         assert_eq!(sanitize_id("---"), "package");
-    }
-
-    #[test]
-    fn source_stage_only_reports_labels_naming_the_source() {
-        let start = api::ProgressEvent::Start {
-            id: 1,
-            group: "ingest".into(),
-            label: "Reloading lavender-ingest-okf".into(),
-        };
-        assert_eq!(
-            source_stage("lavender-ingest-okf", &start).as_deref(),
-            Some("Reloading lavender-ingest-okf")
-        );
-        // Another source's reload is not this apply's progress.
-        assert!(source_stage("obsidian-vault", &start).is_none());
-        // Task bookkeeping carries no label to attribute.
-        assert!(source_stage(
-            "lavender-ingest-okf",
-            &api::ProgressEvent::SetProgress {
-                id: 1,
-                progress: 0.5
-            }
-        )
-        .is_none());
-        assert!(source_stage("lavender-ingest-okf", &api::ProgressEvent::Finish { id: 1 }).is_none());
     }
 }

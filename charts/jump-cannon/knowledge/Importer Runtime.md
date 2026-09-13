@@ -97,6 +97,7 @@ panel is the surface: selecting a catalog entry offers "Edit server package"
 and "+ New source" drives `POST /importers`. Browser-local packages in the
 same panel never leave localStorage, and the grammar preview always runs in
 the sandbox Web Worker — the server never parses a sample input.
+Alternate sources selected through the runtime-switch gate are built on a background task. Each importer engine reports progress through `data_loader::ImportProgress` (stage / advance(fraction, detail) / finish / fail / log): the JSON engine emits one stage per collection (`Fetching <collection> from <host>`) and advances after every page with `page N · R records · B MB` (fraction reported only when the collection declares a server total); the pipeline emits `Decoding <n> records` and `Projecting graph`; the pest engine emits `Parsing <package>`. Graph routes for a building selection answer `202 Accepted` with status, elapsed time, stage, detail, and fraction (when available) instead of blocking behind a lock. See [[Backend API]] for the response contract and status/progress/retry endpoints. Building entries persist until eviction or completion; failed builds are retryable and evict on idle TTL. **Operational note:** live-paged APIs like ChEMBL (`chembl-pharmacology`) measure around 4.5 minutes per build on the cluster and evict after ~15 minutes idle, so a later visit pays the import cost again.
 
 The default markdown loader resolves wikilinks and is currently the only
 importer that advertises readable and writable source content. Kubernetes
