@@ -1155,6 +1155,7 @@ fn variables_section(ctx: Ctx, profile: &api::ImporterProfile) -> Element {
                                             .unwrap_or(effective.clone());
                                         let placeholder =
                                             d.default.clone().unwrap_or_default();
+                                        let field = name.clone();
                                         rsx! {
                                             label { key: "{name}", class: "imp-field",
                                                 span { title: "{description}", "{name}" }
@@ -1170,7 +1171,7 @@ fn variables_section(ctx: Ctx, profile: &api::ImporterProfile) -> Element {
                                                         } = &mut *VARIABLES.write()
                                                         {
                                                             edits.insert(
-                                                                name.clone(),
+                                                                field.clone(),
                                                                 e.value(),
                                                             );
                                                         }
