@@ -197,6 +197,8 @@ Progress for each reload stage emits to `crates/graph-api/src/progress.rs` and s
 - No hand-written JS, no JS bundlers (vite, esbuild, webpack), no `protobufjs`, no three.js, no Cosmograph, no OrbitControls. wgpu + Dioxus only.
 - Styling lives in `app/ui/assets/app.css` + `panel_kit::CSS` — keep it there, not inline in components.
 - Match the existing palette/font: the panel-kit theme, Courier Prime monospace.
+- UI/UX follows the design vocabulary of https://impeccable.style/ (also codified upstream in panel-kit's AGENTS.md), within the panel-kit monospace aesthetic: honest progress (measured % or explicit indeterminate, never a fabricated number), `prefers-reduced-motion` variants, correct ARIA roles, one clear hierarchy per surface, no AI-slop chrome.
+- Async hydration is store-shaped and comes from panel-kit (`panel_kit::loading`): render panel chrome immediately, load data lazily behind a per-source store (`loading_store(id, label)` + `begin`/`update`/`succeed`/`fail`), gate panel bodies with `LoadingGate`, and let the top bar's `GlobalLoadingBar` aggregate anything pending. A determinate bar MUST show its percentage; use a `ProgressBar`, never a bare `Spinner`, for panel- or page-level waits (`Spinner` is only for tiny inline waits like search). Stores are ephemeral in-flight status only — undo/rewind of app state stays with `appstate`'s snapshot ring, and a restore surfaces as an ordinary store transition. Do not hand-roll `loaded` signals or bespoke progress markup; the old `imp-progress` CSS is gone on purpose.
 
 ## Session completion (mandatory)
 

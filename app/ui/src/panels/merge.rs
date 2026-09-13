@@ -4,7 +4,7 @@
 
 use dioxus::prelude::*;
 use graph_vcs::{Conflict, ConflictResolution, NodeId, ResolvedNode};
-use panel_kit::Spinner;
+use panel_kit::loading::{loading_store, LoadingGate};
 
 use super::worlds::active_world_id;
 use crate::{api, client_log, Ctx};
@@ -13,11 +13,12 @@ pub fn panel(ctx: Ctx) -> Element {
     let mut conflicts = use_signal(Vec::<Conflict>::new);
     let mut note = use_signal(|| None::<String>);
     let tick = use_signal(|| 0u64);
-    // Gate the empty state behind the first completed fetch (Spinner while
-    // loading, matching the other panels).
-    let mut loaded = use_signal(|| false);
+    // Shared loading store gates the conflict list; refreshes after Ready
+    // update silently, no gate flash on each poll.
+    let store = loading_store("merge", "loading conflicts…");
 
     use_future(move || async move {
+        store.begin();
         let mut seen = (u64::MAX, Option::<String>::None);
         loop {
             let world = ctx.active_world.read().clone();
@@ -36,7 +37,7 @@ pub fn panel(ctx: Ctx) -> Element {
                 } else {
                     conflicts.set(Vec::new());
                 }
-                loaded.set(true);
+                store.succeed();
             }
             gloo_timers::future::TimeoutFuture::new(2000).await;
         }
@@ -78,15 +79,12 @@ pub fn panel(ctx: Ctx) -> Element {
             if !has_world {
                 div { class: "empty", "open a world in the Worlds panel" }
             } else {
+                LoadingGate { store,
                 if let Some(m) = &message {
                     div { class: "note", "{m}" }
                 }
                 if list.is_empty() {
-                    if *loaded.read() {
-                        div { class: "empty", "no recorded conflicts on main" }
-                    } else {
-                        Spinner { label: "loading conflicts…" }
-                    }
+                    div { class: "empty", "no recorded conflicts on main" }
                 }
                 for c in &list {
                     {
@@ -146,6 +144,7 @@ pub fn panel(ctx: Ctx) -> Element {
                     }
                 }
                 div { class: "note", "resolutions land as a commit on main and rebuild the served snapshot" }
+                }
             }
         }
     }

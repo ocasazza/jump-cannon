@@ -834,6 +834,9 @@ fn begin_server_graph_load(mut ctx: Ctx) -> u64 {
         graph_revision: None,
         origin: GraphOrigin::Server { endpoint },
     });
+    // Shared loading store: the Graph panel gate and the workspace
+    // GlobalLoadingBar both read it; succeed() lands on commit.
+    panel_kit::loading::loading_store("graph", "loading graph…").begin();
     epoch
 }
 
@@ -843,6 +846,8 @@ fn commit_server_graph(mut ctx: Ctx, epoch: u64, graph: GraphData) -> bool {
     }
     let revision = graph.graph_revision.filter(|r| *r != 0);
     ctx.graph_session.write().graph_revision = revision;
+    // The gate opens and the GlobalLoadingBar clears on the same commit.
+    panel_kit::loading::loading_store("graph", "loading graph…").succeed();
     panels::layout::set_expected_graph_revision(revision);
     panels::style::reset_for_graph_session(true);
     ctx.graph.set(Some(graph));
@@ -870,6 +875,9 @@ pub(crate) fn replace_with_client_graph(
         },
     });
     ctx.graph.set(Some(graph));
+    // A client graph supersedes any in-flight server load: close the store
+    // so the GlobalLoadingBar cannot dangle over a mounted canvas.
+    panel_kit::loading::loading_store("graph", "loading graph…").succeed();
 }
 
 pub(crate) async fn reload_graph(mut ctx: Ctx) {
@@ -1307,11 +1315,13 @@ fn App() -> Element {
                     }
                 }
                 {hints::header_bar()}
+                // Workspace-level loading surface: any pending store (graph
+                // load, importer build, panel fetches) shows here with its
+                // percentage. Job-count telemetry stays as the activity dot.
+                panel_kit::loading::GlobalLoadingBar {}
                 if n_running > 0 {
                     span { class: "activity", Spinner {} " running {n_running}" }
                 } else if g_now.is_none() {
-                    span { class: "activity", "○ waiting for graph-api" }
-                } else {
                     span { class: "activity idle", "●" }
                 }
             }
@@ -1428,33 +1438,31 @@ fn panel_body(kind: Panel, _maximized: bool, ctx: Ctx) -> Element {
                     };
                     rsx! {
                         div { class: "graph-building", role: "status", "data-field": "graph-building",
-                            div { class: "graph-building-title",
-                                "importing {target}… {elapsed}s"
-                            }
-                            if let Some(stage) = stage {
-                                div { class: "graph-building-stage", "data-field": "building-stage", "{stage}" }
-                            }
-                            div { class: "imp-progress",
-                                role: "progressbar",
-                                if let Some(fraction) = fraction {
-                                    div {
-                                        class: "imp-progress-fill",
-                                        style: format!(
-                                            "width: {:.0}%",
-                                            fraction.clamp(0.0, 1.0) * 100.0
-                                        ),
-                                    }
-                                } else {
-                                    div { class: "imp-progress-fill indeterminate" }
-                                }
+                            // One ProgressBar carries label + stage + the
+                            // mandatory percentage (the store mirrors the
+                            // same state to the GlobalLoadingBar).
+                            panel_kit::loading::ProgressBar {
+                                fraction: fraction.map(|f| f as f64),
+                                label: "importing {target}… {elapsed}s",
+                                detail: stage,
                             }
                         }
                     }
                 } else {
-                    rsx! { div { class: "skeleton", Spinner { label: "retrying: {e}" } } }
+                    rsx! { div { class: "skeleton",
+                        panel_kit::loading::ProgressBar {
+                            fraction: None,
+                            label: "retrying: {e}",
+                        }
+                    } }
                 }
             } else {
-                rsx! { div { class: "skeleton", Spinner { label: "loading graph…" } } }
+                rsx! { div { class: "skeleton",
+                    panel_kit::loading::ProgressBar {
+                        fraction: None,
+                        label: "loading graph…",
+                    }
+                } }
             }
         }
         Panel::Nodes => panels::nodes::panel(ctx),

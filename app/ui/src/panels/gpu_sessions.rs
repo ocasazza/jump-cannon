@@ -4,7 +4,7 @@
 //! or no-world states (the panel itself stays restore-able from the dock).
 
 use dioxus::prelude::*;
-use panel_kit::Spinner;
+use panel_kit::loading::{loading_store, LoadingGate};
 
 use crate::{api, client_log, Ctx};
 
@@ -12,11 +12,12 @@ pub fn panel(ctx: Ctx) -> Element {
     let mut status = use_signal(|| None::<serde_json::Value>);
     let mut note = use_signal(|| None::<String>);
     let mut tick = use_signal(|| 0u64);
-    // Gate the empty state behind the first completed fetch (Spinner while
-    // loading, matching the other panels).
-    let mut loaded = use_signal(|| false);
+    // Shared loading store gates the session-status block; refreshes after
+    // Ready update silently, no gate flash on each poll.
+    let store = loading_store("gpu-sessions", "loading session state…");
 
     use_future(move || async move {
+        store.begin();
         let mut seen = (u64::MAX, Option::<String>::None);
         loop {
             let world = ctx.active_world.read().clone();
@@ -29,7 +30,7 @@ pub fn panel(ctx: Ctx) -> Element {
                         Ok(v) => status.set(Some(v)),
                         Err(e) => note.set(Some(client_log::tagged("gpu-sessions", e))),
                     }
-                    loaded.set(true);
+                    store.succeed();
                 }
             }
             gloo_timers::future::TimeoutFuture::new(3000).await;
@@ -88,14 +89,14 @@ pub fn panel(ctx: Ctx) -> Element {
                         "Park"
                     }
                 }
-                if let Some(v) = &st {
-                    pre { class: "session-status",
-                        {serde_json::to_string_pretty(v).unwrap_or_default()}
+                LoadingGate { store,
+                    if let Some(v) = &st {
+                        pre { class: "session-status",
+                            {serde_json::to_string_pretty(v).unwrap_or_default()}
+                        }
+                    } else {
+                        div { class: "empty", "no session state yet" }
                     }
-                } else if *loaded.read() {
-                    div { class: "empty", "no session state yet" }
-                } else {
-                    Spinner { label: "loading session state…" }
                 }
                 div { class: "note",
                     "worlds share the standing Kueue GPU envelope; idle worlds auto-park"

@@ -5,7 +5,7 @@
 
 use dioxus::prelude::*;
 use graph_vcs::BranchInfo;
-use panel_kit::Spinner;
+use panel_kit::loading::{loading_store, LoadingGate};
 
 use super::worlds::active_world_id;
 use crate::{api, client_log, Ctx};
@@ -14,11 +14,14 @@ pub fn panel(ctx: Ctx) -> Element {
     let mut branches = use_signal(Vec::<BranchInfo>::new);
     let mut note = use_signal(|| None::<String>);
     let mut tick = use_signal(|| 0u64);
-    // Gate the empty state behind the first completed fetch (Spinner while
-    // loading, matching the other panels).
-    let mut loaded = use_signal(|| false);
+    // Gate behind the first completed fetch via the shared loading store:
+    // ProgressBar (never a bare spinner) until Ready, and the workspace-level
+    // GlobalLoadingBar aggregates the same pending state. Refreshes after
+    // Ready update data silently — no gate flash on each poll.
+    let store = loading_store("branches", "loading branches…");
 
     use_future(move || async move {
+        store.begin();
         let mut seen = (u64::MAX, Option::<String>::None);
         loop {
             let world = ctx.active_world.read().clone();
@@ -40,7 +43,7 @@ pub fn panel(ctx: Ctx) -> Element {
                 } else {
                     branches.set(Vec::new());
                 }
-                loaded.set(true);
+                store.succeed();
             }
             gloo_timers::future::TimeoutFuture::new(2000).await;
         }
@@ -55,15 +58,12 @@ pub fn panel(ctx: Ctx) -> Element {
             if !has_world {
                 div { class: "empty", "open a world in the Worlds panel" }
             } else {
+                LoadingGate { store,
                 if let Some(m) = &message {
                     div { class: "note", "{m}" }
                 }
                 if list.is_empty() {
-                    if *loaded.read() {
-                        div { class: "empty", "no branches" }
-                    } else {
-                        Spinner { label: "loading branches…" }
-                    }
+                    div { class: "empty", "no branches" }
                 }
                 for b in &list {
                     {
@@ -157,6 +157,7 @@ pub fn panel(ctx: Ctx) -> Element {
                     }
                 }
                 div { class: "note", "the served graph tracks main; merges into main rebuild the world snapshot" }
+                }
             }
         }
     }

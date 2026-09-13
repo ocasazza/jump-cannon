@@ -9,7 +9,7 @@
 
 use dioxus::prelude::*;
 use graph_vcs::{GraphOp, NodeId, VaultEdge, VaultNode};
-use panel_kit::Spinner;
+use panel_kit::loading::{loading_store, LoadingGate};
 use session_manager::{SessionError, UserIdentity, WorldId, WorldSpec};
 
 use super::instances::download_text;
@@ -52,9 +52,9 @@ pub fn panel(mut ctx: Ctx) -> Element {
     let mut name = use_signal(String::new);
     let mut desc = use_signal(String::new);
     let mut tick = use_signal(|| 0u64);
-    // Gate the empty state behind the first completed fetch so it doesn't
-    // flash before the list resolves (app convention: Spinner while loading).
-    let mut loaded = use_signal(|| false);
+    // Shared loading store gates the world list (the create form renders
+    // immediately); refreshes after Ready update silently, no gate flash.
+    let store = loading_store("worlds", "loading worlds…");
     // Commit-editor form state lives here, not in `commit_editor`: the
     // editor section renders conditionally (embedded host + open world), and
     // hooks must stay unconditional within one scope.
@@ -70,6 +70,7 @@ pub fn panel(mut ctx: Ctx) -> Element {
     // Poll the world list; `tick` forces an immediate refresh after a
     // mutation instead of waiting out the interval.
     use_future(move || async move {
+        store.begin();
         let mut seen_tick = u64::MAX;
         loop {
             let t = *tick.read();
@@ -82,7 +83,7 @@ pub fn panel(mut ctx: Ctx) -> Element {
                     }
                     Err(e) => error.set(Some(client_log::tagged("worlds", e))),
                 }
-                loaded.set(true);
+                store.succeed();
             }
             gloo_timers::future::TimeoutFuture::new(1500).await;
         }
@@ -136,15 +137,12 @@ pub fn panel(mut ctx: Ctx) -> Element {
                 value: "{desc}",
                 oninput: move |event| desc.set(event.value()),
             }
+            LoadingGate { store,
             if let Some(e) = &err {
                 div { class: "note", "error: {e}" }
             }
             if list.is_empty() && err.is_none() {
-                if *loaded.read() {
-                    div { class: "empty", "no worlds yet — create one above" }
-                } else {
-                    Spinner { label: "loading worlds…" }
-                }
+                div { class: "empty", "no worlds yet — create one above" }
             }
             for row in list {
                 {
@@ -272,6 +270,7 @@ pub fn panel(mut ctx: Ctx) -> Element {
                         }
                     }
                 }
+            }
             }
             if let Some(em) = embedded.clone() {
                 div { class: "server",

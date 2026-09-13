@@ -19,6 +19,7 @@ use std::collections::BTreeMap;
 use dioxus::prelude::*;
 use gloo_storage::{LocalStorage, Storage};
 use panel_kit::editor::{MonacoEditor, PANEL_KIT_DARK_THEME};
+use panel_kit::loading::loading_store;
 use wasm_bindgen::{JsCast, JsValue};
 
 use crate::pest_worker::{parse_in_worker, ParsePreview};
@@ -613,11 +614,12 @@ fn apply_source(ctx: Ctx, anchor: String, target: Option<String>) {
     }
     let generation = APPLY_GEN.peek().wrapping_add(1);
     *APPLY_GEN.write() = generation;
+    let target_label = target
+        .clone()
+        .unwrap_or_else(|| "the deployment default".to_string());
     *APPLY.write() = Some(ApplyStatus {
         anchor,
-        target: target
-            .clone()
-            .unwrap_or_else(|| "the deployment default".to_string()),
+        target: target_label.clone(),
         reset: target.is_none(),
         state: ApplyState::Building {
             elapsed_secs: 0,
@@ -625,6 +627,10 @@ fn apply_source(ctx: Ctx, anchor: String, target: Option<String>) {
             fraction: None,
         },
     });
+    // Mirror the build into the shared loading registry: the graph-area
+    // overlay and the workspace GlobalLoadingBar both read the store.
+    loading_store("importer-apply", "importing source…")
+        .begin_with(format!("building {target_label}…"));
     spawn(track_apply(ctx, generation));
 }
 
@@ -735,6 +741,15 @@ async fn track_apply(ctx: Ctx, generation: u64) {
                 ApplyState::Error("another graph load superseded this one".into())
             }
         };
+        match &state {
+            ApplyState::Ok { .. } => {
+                loading_store("importer-apply", "importing source…").succeed()
+            }
+            ApplyState::Error(e) => {
+                loading_store("importer-apply", "importing source…").fail(e.clone())
+            }
+            _ => {}
+        }
         if let Some(status) = APPLY.write().as_mut() {
             status.state = state;
         }
@@ -818,6 +833,9 @@ async fn track_stages(generation: u64) {
                 };
             }
         }
+        // Feed the shared store from the same stage/fraction stream.
+        loading_store("importer-apply", "importing source…")
+            .update(fraction.map(|f| f as f64), stage.clone());
     }
 }
 
@@ -854,20 +872,12 @@ fn apply_status_view(ctx: Ctx, status: &ApplyStatus) -> Element {
                 "data-field": "apply-status",
                 "data-outcome": "building",
                 "data-elapsed": "{elapsed_secs}",
-                span { class: "imp-apply-line", "building {target}… {elapsed_secs}s" }
-                if let Some(stage) = stage {
-                    span { class: "imp-apply-stage", "data-field": "apply-stage", "{stage}" }
-                }
-                div { class: "imp-progress",
-                    role: "progressbar",
-                    if let Some(fraction) = fraction {
-                        div {
-                            class: "imp-progress-fill",
-                            style: format!("width: {:.0}%", fraction.clamp(0.0, 1.0) * 100.0),
-                        }
-                    } else {
-                        div { class: "imp-progress-fill indeterminate" }
-                    }
+                // One ProgressBar carries label + stage + mandatory percentage;
+                // the store mirrors the same state to the GlobalLoadingBar.
+                panel_kit::loading::ProgressBar {
+                    fraction: fraction.map(|f| f as f64),
+                    label: "building {target}… {elapsed_secs}s",
+                    detail: stage.clone(),
                 }
                 span { class: "imp-note",
                     "the server imports, measures, and indexes this source in the background; stages stream below and in the Progress panel"
