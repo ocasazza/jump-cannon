@@ -16,9 +16,14 @@ markdown pipeline the vault source uses. This is the docs-importer mode:
 knowledge updates flow push-to-main → poll → complete validated rebuild →
 atomic snapshot swap, with no chart republish.
 
-Polling uses the tarball ETag. A 304 response re-imports the cached
-extraction; a changed tarball replaces the cache and triggers a rebuild. A
-failed fetch or import leaves the prior complete revision live.
+Polling uses the tarball ETag. Once one import has parsed in this process, a
+304 response reports `ImportOutcome::Unchanged`: the poll tick is one
+conditional GET with no tarball parse, no snapshot rebuild, and no progress
+events — the live revision simply stays mounted. A changed tarball replaces
+the cache, rebuilds, and swaps atomically; a failed fetch or import leaves
+the prior complete revision live. (Before the unchanged gate, every 60 s
+tick rebuilt and logged `change detected` even on 304 — the reload storm
+that flooded `/progress`.)
 
 Node identity is continuous with Obsidian mode: IDs are
 `github:{source}:{vault-relative path}` and the local part matches what the

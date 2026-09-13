@@ -103,7 +103,19 @@ the deployment default's own importer keeps the package it loaded at boot.
 `POST /importers` also appends the new source to
 `<packages_dir>/catalog.local.json`, a runtime overlay graph-api merges into
 the chart catalog at boot (entries carry `origin: runtime`; an overlay that
-fails validation or shadows a chart id is logged and ignored). The Importers
+fails validation or shadows a chart id is logged and ignored). Instance
+variables are mutable through the same gate without touching the package
+text: `GET /importers/{id}/variables` returns an httpjson source's declared
+`[[parser.variables]]` (name, description, default) plus the instance's
+current values, and `PUT /importers/{id}/variables` fully replaces the set —
+keys are validated against the package's declarations, the override persists
+to `<packages_dir>/variables.local.json` (its own file because the source
+overlay rejects shadowing a chart id), the in-memory entry updates, and the
+running alternate is dropped so the next request rebuilds with the new
+values. Boot applies the variable overrides after the source overlay. In the
+panel this is the Variables section on a selected httpjson row: one input
+per declared variable, then "Apply & reload" re-applies the source and
+streams the rebuild. The Importers
 panel is the surface: selecting a catalog entry offers "Edit server package"
 (the Monaco TOML/grammar editor over the served text, then "Save to server"),
 and "+ New source" drives `POST /importers`. Browser-local packages in the
@@ -127,6 +139,17 @@ binds an instance to one HTTP/JSON API per `JUMP_CANNON_IMPORTER_*` env
 var and reads one selected Hindsight memory bank read-only; bounds and
 record caps are loud per collection (see [[Hindsight Importer]]).
 
+Poll-driven reloads are gated on real change: `Importer::import` returns
+`ImportOutcome`, and an importer that can prove its source is unmodified
+answers `Unchanged` — the watcher then keeps the mounted snapshot and emits
+nothing (no rebuild, no `/progress` events). The GitHub importer proves it
+with the tarball ETag (a warm 304); every connector pipeline (the json and
+pest packages) proves it by hashing the fetched records in collection order
+before decode/map, so identical API pages never re-map. Edge value pointers
+in the json engine may name an array of ids (`/referenced_works`); each
+scalar element resolves as one target, matching `split_csv`'s
+one-value-per-element rule.
+
 Two of the shipped packages read public science APIs rather than an
 in-cluster service: `chembl-pharmacology.toml` (EMBL-EBI ChEMBL — approved
 molecules, human protein targets, the mechanism-of-action records that bridge
@@ -137,7 +160,13 @@ egress to the open internet, so they build only where the pod has it and fail
 loudly with the endpoint in the message where it does not. ChEMBL ships some
 measurements as numeric strings (`full_mwt` is `"383.41"`), which is why the
 json engine has the `parse_number` field transform: a `number` discovery
-field gets a number instead of the schema being weakened.
+field gets a number instead of the schema being weakened. Every shipped
+package has a parametrized contract test in `crates/importer/tests/packages.rs`
+(rstest, one named case per package): recorded API responses run through the
+real connector/decoder/mapper pipeline over a fixture transport, asserting
+nodes and — whenever the schema declares edge types — edges, so a silent
+projection break (the pre-fix array pointer that shipped OpenAlex with zero
+citation edges) fails the suite instead of users' graphs.
 
 Shipped example sessions pair a curated UI state with the source it is about:
 `app/ui/assets/sessions/*.yaml` plus an `index.json`, copied into the dist by

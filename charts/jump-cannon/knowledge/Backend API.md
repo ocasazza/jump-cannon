@@ -29,11 +29,16 @@ title-only matching.
 of configured source instances. Its activation mode is `helm_rollout`; the API
 exposes no source-selection or run mutation. graph-api rejects an
 unknown selection, a selected kind that differs from the importer actually
-started, and unsafe filesystem profiles during startup. Package text is the
-one mutable surface: `GET /importers/:id/definition` reads an httpjson
-source's authored TOML, and `PUT /importers/:id/definition` plus
+startup. Package text is one mutable surface: `GET /importers/:id/definition`
+reads an httpjson source's authored TOML, and `PUT /importers/:id/definition` plus
 `POST /importers` write it behind the runtime-switch group (see
-[[Importer Runtime]], "Package definitions").
+[[Importer Runtime]], "Package definitions"). Instance variables are the
+second mutable surface: `GET /importers/:id/variables` returns an httpjson
+source's declared package variables plus its current instance values, and
+`PUT /importers/:id/variables` (same group authorization) fully replaces the
+set — persisted to `<packages_dir>/variables.local.json`, applied in-memory,
+and the running alternate invalidated so the next request rebuilds with the
+new values.
 
 Bulk arrays use little-endian numeric buffers; structured messages use protobuf
 or JSON where appropriate. See [[Architecture]], [[Observability]], and
