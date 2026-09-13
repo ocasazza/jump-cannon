@@ -228,6 +228,179 @@
           }
         }
       }
+    },
+    "routing": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "parentRef": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "name": {
+              "type": "string",
+              "maxLength": 253
+            },
+            "namespace": {
+              "type": "string",
+              "maxLength": 253
+            },
+            "sectionName": {
+              "type": "string",
+              "maxLength": 253
+            }
+          }
+        },
+        "hostnames": {
+          "type": "array",
+          "maxItems": 16,
+          "items": {
+            "type": "string",
+            "pattern": "^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$",
+            "maxLength": 253
+          }
+        },
+        "sessionManager": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "hostnames": {
+              "type": "array",
+              "maxItems": 16,
+              "items": {
+                "type": "string",
+                "pattern": "^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$",
+                "maxLength": 253
+              }
+            }
+          }
+        },
+        "labels": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
+        "annotations": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
+        "timeouts": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "request": {
+              "type": "string",
+              "pattern": "^([0-9]{1,5}(h|m|s|ms)){1,4}$"
+            },
+            "backendRequest": {
+              "type": "string",
+              "pattern": "^([0-9]{1,5}(h|m|s|ms)){1,4}$"
+            }
+          }
+        },
+        "backendPolicy": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": {
+              "type": "boolean"
+            },
+            "requestTimeout": {
+              "type": "string",
+              "pattern": "^([0-9]{1,5}(h|m|s|ms)){1,4}$"
+            },
+            "connectionIdleTimeout": {
+              "type": "string",
+              "pattern": "^([0-9]{1,5}(h|m|s|ms)){1,4}$"
+            },
+            "bufferLimit": {
+              "anyOf": [
+                {
+                  "type": "integer",
+                  "minimum": 1
+                },
+                {
+                  "type": "string",
+                  "pattern": "^[1-9][0-9]*([EPTGMK]i|[EPTGMk])?$"
+                }
+              ]
+            },
+            "socketBufferLimit": {
+              "anyOf": [
+                {
+                  "type": "integer",
+                  "minimum": 1
+                },
+                {
+                  "type": "string",
+                  "pattern": "^[1-9][0-9]*([EPTGMK]i|[EPTGMk])?$"
+                }
+              ]
+            }
+          }
+        },
+        "clientPolicy": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": {
+              "type": "boolean"
+            },
+            "http2": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "initialStreamWindowSize": {
+                  "anyOf": [
+                    {
+                      "type": "integer",
+                      "minimum": 1
+                    },
+                    {
+                      "type": "string",
+                      "pattern": "^[1-9][0-9]*([EPTGMK]i|[EPTGMk])?$"
+                    }
+                  ]
+                },
+                "initialConnectionWindowSize": {
+                  "anyOf": [
+                    {
+                      "type": "integer",
+                      "minimum": 1
+                    },
+                    {
+                      "type": "string",
+                      "pattern": "^[1-9][0-9]*([EPTGMK]i|[EPTGMk])?$"
+                    }
+                  ]
+                }
+              }
+            },
+            "idleTimeout": {
+              "type": "string",
+              "pattern": "^([0-9]{1,5}(h|m|s|ms)){1,4}$"
+            },
+            "bufferLimit": {
+              "anyOf": [
+                {
+                  "type": "integer",
+                  "minimum": 1
+                },
+                {
+                  "type": "string",
+                  "pattern": "^[1-9][0-9]*([EPTGMK]i|[EPTGMk])?$"
+                }
+              ]
+            }
+          }
+        }
+      }
     }
   },
   "additionalProperties": true,

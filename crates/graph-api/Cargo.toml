@@ -22,6 +22,10 @@ tower-http         = { version = "0.5", features = ["fs", "trace", "cors"] }
 # proxy on every cold load; compressing it once (~3x) keeps that transfer
 # short enough that a keepalive-ping-enforcing proxy cannot reset it mid-body.
 flate2             = "1"
+# Brotli for the same assets: ~19% smaller than gzip on the wasm bundle
+# (4.15 MB -> 3.34 MB), which matters on a high-latency link where the
+# transfer, not the CPU, is the constraint. Pure Rust, no C toolchain.
+brotli             = "7"
 serde              = { workspace = true }
 serde_json         = { workspace = true }
 serde_yaml         = "0.9"

@@ -526,3 +526,29 @@ so the rendered Deployment is stable across upgrades.
 {{- end -}}
 {{- join "," $pairs -}}
 {{- end -}}
+
+{{/*
+Routing preconditions. A route with no parent Gateway or no hostname is not a
+route — it is a silently dead object, so the render fails instead.
+*/}}
+{{- define "jump-cannon.validateRouting" -}}
+{{- if not .Values.routing.parentRef.name -}}
+  {{- fail "routing.enabled requires routing.parentRef.name (the Gateway to attach to)" -}}
+{{- end -}}
+{{- if not .Values.routing.hostnames -}}
+  {{- fail "routing.enabled requires at least one routing.hostnames entry" -}}
+{{- end -}}
+{{- range .Values.routing.hostnames -}}
+  {{- if not (regexMatch "^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$" .) -}}
+    {{- fail (printf "routing.hostnames entry %q is not a DNS hostname" .) -}}
+  {{- end -}}
+{{- end -}}
+{{- range .Values.routing.sessionManager.hostnames -}}
+  {{- if not (regexMatch "^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$" .) -}}
+    {{- fail (printf "routing.sessionManager.hostnames entry %q is not a DNS hostname" .) -}}
+  {{- end -}}
+{{- end -}}
+{{- if and .Values.routing.sessionManager.hostnames (not .Values.sessionManager.enabled) -}}
+  {{- fail "routing.sessionManager.hostnames is set but sessionManager.enabled is false: the route would have no backend" -}}
+{{- end -}}
+{{- end -}}

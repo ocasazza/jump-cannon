@@ -1692,8 +1692,9 @@ fn asset_fixture(name: &str, bytes: &[u8]) -> std::path::PathBuf {
     dir
 }
 
-/// A browser (which always sends `Accept-Encoding: gzip`) gets the bundle
-/// compressed, and it decompresses back to the exact bytes on disk.
+/// A client that accepts gzip (and not brotli) gets the bundle gzipped, with
+/// the headers a proxy and a browser cache both need, and it decompresses
+/// back to the exact bytes on disk.
 #[tokio::test]
 async fn wasm_asset_is_gzipped_for_clients_that_accept_it() {
     // Repetitive but non-trivial payload: compresses well, like real wasm.
@@ -1705,7 +1706,7 @@ async fn wasm_asset_is_gzipped_for_clients_that_accept_it() {
         .oneshot(
             Request::builder()
                 .uri("/jump-cannon-ui_bg.wasm")
-                .header("accept-encoding", "gzip, deflate, br")
+                .header("accept-encoding", "gzip, deflate")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -1750,6 +1751,53 @@ async fn wasm_asset_is_gzipped_for_clients_that_accept_it() {
     )
     .expect("body is valid gzip");
     assert_eq!(decoded, payload, "decompressed bytes must be the bundle");
+}
+
+/// Brotli wins when the client offers it (~19% smaller than gzip on the real
+/// bundle), and `br;q=0` is honoured as a refusal rather than a preference.
+#[tokio::test]
+async fn brotli_is_preferred_and_a_refusal_is_honoured() {
+    let payload: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
+    let dir = asset_fixture("jump-cannon-ui_bg.wasm", &payload);
+    let state = state_with_assets(dir);
+
+    let response = graph_api::router(state.clone())
+        .oneshot(
+            Request::builder()
+                .uri("/jump-cannon-ui_bg.wasm")
+                .header("accept-encoding", "gzip, deflate, br")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .expect("router served");
+    assert_eq!(
+        response.headers().get("content-encoding").map(|v| v.to_str().unwrap()),
+        Some("br"),
+        "the smallest encoding the client accepts must win"
+    );
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let mut decoded = Vec::new();
+    brotli::BrotliDecompress(&mut std::io::Cursor::new(body.as_ref()), &mut decoded)
+        .expect("body is valid brotli");
+    assert_eq!(decoded, payload, "decompressed bytes must be the bundle");
+
+    // A client that explicitly refuses brotli falls back to gzip, not br.
+    let refused = graph_api::router(state)
+        .oneshot(
+            Request::builder()
+                .uri("/jump-cannon-ui_bg.wasm")
+                .header("accept-encoding", "br;q=0, gzip")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .expect("router served");
+    assert_eq!(
+        refused.headers().get("content-encoding").map(|v| v.to_str().unwrap()),
+        Some("gzip"),
+        "br;q=0 means the client refuses brotli"
+    );
 }
 
 /// A client without `Accept-Encoding` still gets the raw bytes — correctness

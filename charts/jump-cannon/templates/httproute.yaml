@@ -1,0 +1,98 @@
+{{- if .Values.routing.enabled }}
+{{- include "jump-cannon.validateRouting" . }}
+{{- $parent := .Values.routing.parentRef }}
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: {{ include "jump-cannon.fullname" . }}
+  labels:
+    {{- include "jump-cannon.labels" . | nindent 4 }}
+    app.kubernetes.io/component: graph-api
+    {{- with .Values.routing.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  {{- with .Values.routing.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  parentRefs:
+    - name: {{ $parent.name | quote }}
+      {{- with $parent.namespace }}
+      namespace: {{ . | quote }}
+      {{- end }}
+      {{- with $parent.sectionName }}
+      sectionName: {{ . | quote }}
+      {{- end }}
+  hostnames:
+    {{- range .Values.routing.hostnames }}
+    - {{ . | quote }}
+    {{- end }}
+  rules:
+    # One rule for everything: the frontend bundle and the API share an
+    # origin, and the timeouts below are sized for the bundle, which is the
+    # slowest thing this route carries.
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /
+      timeouts:
+        {{- with .Values.routing.timeouts.request }}
+        request: {{ . | quote }}
+        {{- end }}
+        {{- with .Values.routing.timeouts.backendRequest }}
+        backendRequest: {{ . | quote }}
+        {{- end }}
+      backendRefs:
+        - name: {{ include "jump-cannon.fullname" . }}
+          port: 80
+{{- if .Values.sessionManager.enabled }}
+{{- if .Values.routing.sessionManager.hostnames }}
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: {{ include "jump-cannon.sessionManagerName" . }}
+  labels:
+    {{- include "jump-cannon.labels" . | nindent 4 }}
+    app.kubernetes.io/component: session-manager
+    {{- with .Values.routing.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  {{- with .Values.routing.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  parentRefs:
+    - name: {{ $parent.name | quote }}
+      {{- with $parent.namespace }}
+      namespace: {{ . | quote }}
+      {{- end }}
+      {{- with $parent.sectionName }}
+      sectionName: {{ . | quote }}
+      {{- end }}
+  hostnames:
+    {{- range .Values.routing.sessionManager.hostnames }}
+    - {{ . | quote }}
+    {{- end }}
+  rules:
+    # The session manager serves the same frontend bundle per world, so it
+    # inherits the same timeouts.
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /
+      timeouts:
+        {{- with .Values.routing.timeouts.request }}
+        request: {{ . | quote }}
+        {{- end }}
+        {{- with .Values.routing.timeouts.backendRequest }}
+        backendRequest: {{ . | quote }}
+        {{- end }}
+      backendRefs:
+        - name: {{ include "jump-cannon.sessionManagerName" . }}
+          port: 80
+{{- end }}
+{{- end }}
+{{- end }}

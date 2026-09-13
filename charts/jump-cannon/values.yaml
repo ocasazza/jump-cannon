@@ -579,3 +579,74 @@ grafanaDashboards:
   enabled: true
   label: grafana_dashboard
   labelValue: "1"
+
+# Gateway API routing, colocated with the workload it routes to.
+#
+# Off by default: the chart stays portable, and a deployment that already
+# declares its own route keeps doing so. Turning it on makes this chart own
+# the route AND the transport tuning a big WASM bundle needs, so the two
+# cannot drift apart in different repositories.
+#
+# Why the tuning matters: the release frontend bundle is ~12 MB raw and ~4 MB
+# gzipped (graph-api compresses and serves an ETag — see the Performance
+# Engineering note). Envoy's per-stream HTTP/2 flow-control window defaults to
+# 64 KiB, so on a high-latency link that transfer is dominated by window
+# updates, and any gateway request timeout shorter than the whole download
+# resets the stream mid-body. The browser reports that as
+# `ERR_HTTP2_PING_FAILED` plus
+# `WebAssembly compilation aborted: Response body loading was aborted`.
+#
+# Field paths verified against the Envoy Gateway v1.4.2 CRDs
+# (gateway.envoyproxy.io/v1alpha1).
+routing:
+  enabled: false
+  # Gateway this workload attaches to. `namespace` may be empty for a
+  # Gateway in the release namespace; `sectionName` pins one listener.
+  parentRef:
+    name: ""
+    namespace: ""
+    sectionName: ""
+  # Hostnames served for graph-api. Required when routing.enabled.
+  hostnames: []
+  # Session-manager route. Rendered only when sessionManager.enabled AND
+  # hostnames are given (the manager is a separate origin).
+  sessionManager:
+    hostnames: []
+  # Extra labels/annotations for the generated route objects.
+  labels: {}
+  annotations: {}
+  # Per-route timeouts (Gateway API v1 `rules[].timeouts`). These must exceed
+  # the worst-case bundle download, not the typical one: a 4 MB gzipped
+  # bundle over a 1 Mbps link is ~35 s of streaming.
+  timeouts:
+    request: 300s
+    backendRequest: 300s
+  # Upstream/route-scoped transport tuning (Envoy Gateway
+  # BackendTrafficPolicy, attached to the HTTPRoutes this chart creates —
+  # scoped to this workload, not the shared Gateway).
+  backendPolicy:
+    enabled: true
+    # Time until the entire response is received from graph-api.
+    requestTimeout: 300s
+    # Idle time allowed on an upstream connection (CRD default: 1h).
+    connectionIdleTimeout: 1h
+    # Read/write buffer ceiling per connection (CRD default: 32768 bytes).
+    # A 4 MB body streams through a 32 KiB buffer in ~128 refills.
+    bufferLimit: 4Mi
+    socketBufferLimit: 4Mi
+  # Downstream (browser-facing) HTTP/2 tuning. This is the actual slow-link
+  # lever — and it is OPT-IN because ClientTrafficPolicy can only attach to a
+  # Gateway, never to one route, so enabling it changes transport behaviour
+  # for EVERY workload behind that Gateway. Enable it only on a Gateway this
+  # deployment owns.
+  clientPolicy:
+    enabled: false
+    http2:
+      # CRD default is 64Ki: far too small for a multi-megabyte body on a
+      # high-latency link.
+      initialStreamWindowSize: 1Mi
+      # CRD default is 1Mi.
+      initialConnectionWindowSize: 16Mi
+    # Idle time allowed on a downstream connection (CRD default: 1h).
+    idleTimeout: 1h
+    bufferLimit: 4Mi

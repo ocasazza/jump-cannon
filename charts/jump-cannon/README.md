@@ -282,3 +282,43 @@ modes, storage-class behavior, and pod security contexts govern storage access.
 The built-in Obsidian example seed is never mounted for the OKF source, even if
 `vault.seed.enabled` remains true, because those Markdown files are not an OKF
 bundle.
+
+## Routing (`routing.*`)
+
+Off by default: the chart creates no network exposure unless asked, so a
+deployment that already declares its own route keeps doing so. Enabling it
+makes this chart own its Gateway API route *and* the transport tuning the
+frontend bundle needs, which is the point — a route whose timeouts and HTTP/2
+windows live in another repository drifts away from the bundle it carries.
+
+```yaml
+routing:
+  enabled: true
+  parentRef:
+    name: shared-proxy        # required: the Gateway to attach to
+    namespace: ""             # optional; defaults to the release namespace
+    sectionName: https        # optional: pin one listener
+  hostnames:
+    - jump-cannon.proxy.cluster.nixstation.internal
+  sessionManager:
+    hostnames:                # only with sessionManager.enabled
+      - jump-cannon-sessions.proxy.cluster.nixstation.internal
+```
+
+What it renders:
+
+| object | scope | why |
+|---|---|---|
+| `HTTPRoute` (graph-api, and the session manager when enabled) | this release | `rules[].timeouts.request`/`backendRequest` default to `300s` — sized for the ~3.5 MB WASM bundle, not the median API call |
+| `BackendTrafficPolicy` | **this chart's HTTPRoutes** | upstream `requestTimeout`, `connectionIdleTimeout`, and 4 MiB buffer limits (CRD default is 32768 bytes) |
+| `ClientTrafficPolicy` (`routing.clientPolicy.enabled`, **off**) | **the whole Gateway** | HTTP/2 initial stream window 64 KiB → 1 MiB and connection window → 16 MiB, the real slow-link lever |
+
+`ClientTrafficPolicy` is opt-in because the CRD only permits a `Gateway`
+target (no `sectionName`), so it changes transport for every workload behind
+that Gateway. Enable it only where this deployment owns the Gateway.
+
+Rendering fails loudly on a route that could not work: no `parentRef.name`, no
+`hostnames`, a non-DNS hostname, or a `routing.sessionManager.hostnames` entry
+with `sessionManager.enabled=false`. Field paths are verified against the Envoy
+Gateway v1.4.2 CRDs; the delivery numbers and the failure this fixes are in
+`knowledge/Performance Engineering.md`.

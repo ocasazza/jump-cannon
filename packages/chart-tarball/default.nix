@@ -35,6 +35,67 @@ pkgs.runCommand "jump-cannon-chart-tarball"
       --set tests.k6.enabled=false \
       > legacy.yaml
     grep -Fq 'kind: PersistentVolumeClaim' legacy.yaml
+    # Routing stays off by default: the portable chart creates no
+    # environment-specific network exposure unless asked.
+    if grep -Eq 'kind: (HTTPRoute|BackendTrafficPolicy|ClientTrafficPolicy)' legacy.yaml; then
+      echo "chart-tarball: routing objects rendered without routing.enabled" >&2
+      exit 1
+    fi
+
+    # Routing + transport tuning, colocated with the workload. The bundle is
+    # ~4 MB gzipped, so the route timeouts and the HTTP/2 window sizes are
+    # the difference between a completed download and a stream reset
+    # mid-body (ERR_HTTP2_PING_FAILED in the browser).
+    helm template routing ./jump-cannon \
+      --set graphCompute.enabled=false \
+      --set tests.fuzz.enabled=false \
+      --set tests.performance.enabled=false \
+      --set tests.browser.enabled=false \
+      --set tests.k6.enabled=false \
+      --set routing.enabled=true \
+      --set routing.clientPolicy.enabled=true \
+      --set-string routing.parentRef.name=shared-proxy \
+      --set-string routing.parentRef.sectionName=https \
+      --set-string 'routing.hostnames[0]=jump-cannon.proxy.cluster.nixstation.internal' \
+      > routing.yaml
+    grep -Fq 'apiVersion: gateway.networking.k8s.io/v1' routing.yaml
+    grep -Fq 'kind: HTTPRoute' routing.yaml
+    grep -Fq 'name: "shared-proxy"' routing.yaml
+    grep -Fq 'sectionName: "https"' routing.yaml
+    grep -Fq -e '- "jump-cannon.proxy.cluster.nixstation.internal"' routing.yaml
+    # Per-route timeouts sized for the bundle, not the median request.
+    grep -Fq 'request: "300s"' routing.yaml
+    grep -Fq 'backendRequest: "300s"' routing.yaml
+    # Upstream policy is route-scoped (targets the HTTPRoute, not the
+    # shared Gateway), so it cannot change other workloads' transport.
+    grep -Fq 'kind: BackendTrafficPolicy' routing.yaml
+    grep -Fq 'requestTimeout: "300s"' routing.yaml
+    grep -Fq 'socketBufferLimit: "4Mi"' routing.yaml
+    # Downstream HTTP/2 windows: Envoy's per-stream default is 64Ki, which
+    # throttles a multi-megabyte body on a high-latency link.
+    grep -Fq 'kind: ClientTrafficPolicy' routing.yaml
+    grep -Fq 'initialStreamWindowSize: "1Mi"' routing.yaml
+    grep -Fq 'initialConnectionWindowSize: "16Mi"' routing.yaml
+    # The session-manager route only exists when that component does.
+    if grep -Fq 'component: session-manager' routing.yaml; then
+      echo "chart-tarball: session-manager route rendered without the component" >&2
+      exit 1
+    fi
+
+    helm template routing-sessions ./jump-cannon \
+      -f ./jump-cannon/ci/session-manager.yaml \
+      --set graphCompute.enabled=false \
+      --set tests.fuzz.enabled=false \
+      --set tests.performance.enabled=false \
+      --set tests.browser.enabled=false \
+      --set tests.k6.enabled=false \
+      --set routing.enabled=true \
+      --set-string routing.parentRef.name=shared-proxy \
+      --set-string 'routing.hostnames[0]=jump-cannon.proxy.cluster.nixstation.internal' \
+      --set-string 'routing.sessionManager.hostnames[0]=jump-cannon-sessions.proxy.cluster.nixstation.internal' \
+      > routing-sessions.yaml
+    grep -Fq -e '- "jump-cannon-sessions.proxy.cluster.nixstation.internal"' routing-sessions.yaml
+    grep -Fq 'kind: HTTPRoute' routing-sessions.yaml
     grep -Fq 'name: JUMP_CANNON_IMPORTER_CATALOG_JSON' legacy.yaml
     grep -Fq 'name: JUMP_CANNON_SOURCE' legacy.yaml
     grep -Fq 'value: "obsidian"' legacy.yaml
@@ -338,6 +399,16 @@ pkgs.runCommand "jump-cannon-chart-tarball"
       fi
     }
 
+    expect_render_failure routing-without-gateway \
+      --set routing.enabled=true
+    expect_render_failure routing-without-hostnames \
+      --set routing.enabled=true \
+      --set-string routing.parentRef.name=shared-proxy
+    expect_render_failure routing-session-hostname-without-manager \
+      --set routing.enabled=true \
+      --set-string routing.parentRef.name=shared-proxy \
+      --set-string 'routing.hostnames[0]=jump-cannon.example' \
+      --set-string 'routing.sessionManager.hostnames[0]=sessions.example'
     expect_render_failure unknown-importer \
       --set-string importers.selected=not-in-catalog
     expect_render_failure blank-importer-display-name \
