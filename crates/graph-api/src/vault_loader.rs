@@ -10,45 +10,61 @@
 
 use std::sync::Arc;
 
-use data_loader::LoadResult;
-use data_loader::{ImportError, Importer};
+use data_loader::{ImportError, ImportOutcome, Importer, LoadResult};
 
 use crate::progress::ProgressLog;
 
 /// Load a graph through any [`Importer`], compute metrics, and seed initial
 /// positions. Convenience wrapper for callers that don't want a progress feed.
-pub async fn load(importer: &dyn Importer) -> Result<LoadResult, ImportError> {
+pub async fn load(importer: &dyn Importer) -> Result<ImportOutcome, ImportError> {
     load_with_progress(importer, None).await
 }
 
 /// Like [`load`] but emits per-stage progress into a [`ProgressLog`].
 /// Stages identify the selected importer, metric computation, and position
-/// seeding.
+/// seeding. An [`ImportOutcome::Unchanged`] response emits no progress
+/// events at all: the host keeps its current snapshot and this pass has
+/// nothing to report, so not even a stage row is opened.
 pub async fn load_with_progress(
     importer: &dyn Importer,
     progress: Option<&Arc<ProgressLog>>,
-) -> Result<LoadResult, ImportError> {
+) -> Result<ImportOutcome, ImportError> {
     let descriptor = importer.descriptor();
     let source_name = descriptor.id.as_str();
-    tracing::info!(source = %source_name, "loading graph");
 
     let scan_label = match source_name {
         "obsidian" => "Scanning vault",
         "tvix" => "Evaluating tvix expression",
         _ => descriptor.name.as_str(),
     };
-    let scan_id = progress.map(|p| p.start("ingest", scan_label));
 
     let result = match importer.import().await {
-        Ok(result) => result,
+        // The outcome must be known before any stage is opened: an
+        // unchanged source must not start (and abandon) progress rows.
+        Ok(ImportOutcome::Unchanged) => {
+            tracing::debug!(source = %source_name, "source unchanged; keeping snapshot");
+            return Ok(ImportOutcome::Unchanged);
+        }
+        Ok(ImportOutcome::Loaded(result)) => {
+            tracing::info!(source = %source_name, "loading graph");
+            result
+        }
         Err(error) => {
+            let scan_id = progress.map(|p| p.start("ingest", scan_label));
             if let (Some(progress), Some(id)) = (progress, scan_id) {
                 progress.fail(id, error.to_string());
             }
             return Err(error);
         }
     };
-    descriptor.schema.validate_result(&result)?;
+    let scan_id = progress.map(|p| p.start("ingest", scan_label));
+
+    if let Err(error) = descriptor.schema.validate_result(&result) {
+        if let (Some(progress), Some(id)) = (progress, scan_id) {
+            progress.fail(id, error.to_string());
+        }
+        return Err(error);
+    }
     let data_loader::LoadResult {
         mut graph,
         search_documents,
@@ -152,19 +168,19 @@ pub async fn load_with_progress(
         "metrics computed"
     );
 
-    Ok(LoadResult {
+    Ok(ImportOutcome::Loaded(LoadResult {
         graph,
         search_documents,
         unresolved,
-    })
+    }))
 }
 
 #[cfg(test)]
 mod tests {
     use data_loader::{
         Capability, DiscoveryField, DiscoveryFieldType, EdgeTypeSchema, Effect, ImportFuture,
-        ImporterDescriptor, ImporterSchema, LoadResult, SearchDocument, TagHierarchySchema,
-        Transport,
+        ImportOutcome, ImporterDescriptor, ImporterSchema, LoadResult, SearchDocument,
+        TagHierarchySchema, Transport,
     };
     use vault_data::VaultGraph;
     use vault_data::{VaultEdge, VaultNode};
@@ -199,7 +215,7 @@ mod tests {
             )
         }
 
-        fn import<'a>(&'a self) -> ImportFuture<'a, Result<LoadResult, ImportError>> {
+        fn import<'a>(&'a self) -> ImportFuture<'a, Result<ImportOutcome, ImportError>> {
             Box::pin(async {
                 let mut graph = VaultGraph::new();
                 graph.add_node(VaultNode {
@@ -215,14 +231,14 @@ mod tests {
                     source: "generate:dangling:present".into(),
                     target: "generate:dangling:missing".into(),
                 });
-                Ok(LoadResult {
+                Ok(ImportOutcome::Loaded(LoadResult {
                     graph,
                     search_documents: vec![SearchDocument::new("generate:dangling:present")
                         .with("id", "generate:dangling:present")
                         .with("title", "Present")
                         .with("tags", serde_json::json!([]))],
                     unresolved: Vec::new(),
-                })
+                }))
             })
         }
     }

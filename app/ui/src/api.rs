@@ -240,7 +240,8 @@ fn get(path: &str) -> gloo_net::http::RequestBuilder {
 }
 /// Format a non-2xx response as an error string, appending a short body
 /// excerpt when the server sent one (graph-api's alternate-source 503s are
-/// plain text, e.g. `building importer source "…" — poll /progress`).
+/// plain text, e.g. `building importer source "…" — poll /progress … then
+/// retry`; render sites map that through [`display_error`]).
 pub(crate) async fn status_error(
     path: &str,
     resp: gloo_net::http::Response,
@@ -264,8 +265,25 @@ pub(crate) async fn status_error(
 /// True when an API error string reports a 503 whose body names an
 /// in-flight alternate-source build — the retryable, progress-pollable
 /// condition produced by selecting a source graph-api is still importing.
+/// The single place that knows the server's marker wording; every client
+/// decision about the building condition routes through here.
 pub fn is_building_error(error: &str) -> bool {
     error.contains("HTTP 503") && error.contains("building importer source")
+}
+
+/// Map an API error to user-facing text. The server's building body is an
+/// instruction for machines ("poll /progress … then retry") — the client
+/// already acts on it (retry loop + stage polling, both keyed on
+/// [`is_building_error`]), so surfaces rendering error strings show the
+/// calm import state instead of the wire text.
+pub fn display_error(error: &str) -> String {
+    if is_building_error(error) {
+        "this source is still being imported — stages stream in the graph \
+         area and the Progress panel"
+            .to_string()
+    } else {
+        error.to_string()
+    }
 }
 
 pub(crate) async fn get_json<T: serde::de::DeserializeOwned>(path: &str) -> ApiResult<T> {
@@ -728,6 +746,61 @@ pub async fn post_importer(importer: &NewImporter) -> ApiResult<ImporterProfile>
     definition_response(resp).await
 }
 
+// --- importer runtime variables ---------------------------------------------
+
+/// One `[[parser.variables]]` declaration from an httpjson package: the
+/// placeholder name, its description, and the package default applied when
+/// the instance sets no value.
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+pub struct DeclaredVariable {
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    /// Package default; `None` when the declaration carries none.
+    pub default: Option<String>,
+}
+
+/// `GET`/`PUT /importers/{id}/variables` — an httpjson source's declared
+/// package variables plus the instance's effective current values. Unset
+/// variables are simply absent from `current`; the UI shows the declared
+/// default as the field's placeholder.
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+pub struct VariablesResponse {
+    #[serde(default)]
+    pub declared: Vec<DeclaredVariable>,
+    #[serde(default)]
+    pub current: std::collections::BTreeMap<String, String>,
+}
+
+/// `GET /importers/{id}/variables` — catalog-read posture, same as the
+/// definition route. A 400 names a non-httpjson binding and a 404 an unknown
+/// source id; both surface as the usual `HTTP <status>` error string, and
+/// callers hide the variables surface for them.
+pub async fn get_variables(source_id: &str) -> ApiResult<VariablesResponse> {
+    let resp = get(&format!("/importers/{source_id}/variables"))
+        .send()
+        .await
+        .map_err(err)?;
+    definition_response(resp).await
+}
+
+/// `PUT /importers/{id}/variables` — full replacement of the instance's
+/// variable set, answered with the post-write effective state (same shape as
+/// the GET). Authorized by the same switch-group posture as the definition
+/// PUT: the group header is proxy-injected, so the request carries none.
+pub async fn put_variables(
+    source_id: &str,
+    vars: &std::collections::BTreeMap<String, String>,
+) -> ApiResult<VariablesResponse> {
+    let resp = Request::put(&url(&format!("/importers/{source_id}/variables")))
+        .json(&serde_json::json!({ "variables": vars }))
+        .map_err(err)?
+        .send()
+        .await
+        .map_err(err)?;
+    definition_response(resp).await
+}
+
 // --- vault writes ---------------------------------------------------------------
 
 #[derive(Clone, Debug, Deserialize)]
@@ -880,9 +953,8 @@ pub async fn sm_compute_action(world: &str, action: &str) -> ApiResult<serde_jso
 
 #[cfg(test)]
 mod tests {
-    use super::ImporterCatalog;
+    use super::{display_error, is_building_error, ImporterCatalog};
 
-    #[test]
     fn importer_catalog_accepts_an_omitted_active_kind() {
         let catalog: ImporterCatalog = serde_json::from_value(serde_json::json!({
             "activation": "helm_rollout",
@@ -938,5 +1010,25 @@ mod tests {
             Some("test-admins")
         );
         assert!(catalog.sources[0].runnable);
+    }
+
+    #[test]
+    fn display_error_translates_the_building_instruction() {
+        // Exact wire shape: status_error wraps source_host's Building body.
+        let wire = concat!(
+            "/graph/init -> HTTP 503: building importer source \"lavender-ingest-okf\": ",
+            "the import is running in the background; poll /progress with the same ",
+            "source header for stages, then retry"
+        );
+        assert!(is_building_error(wire));
+        let shown = display_error(wire);
+        // The machine instruction must never reach a user-facing surface.
+        assert!(!shown.contains("poll /progress"));
+        assert!(!shown.contains("retry"));
+        assert!(shown.contains("imported"));
+        // Genuine failures still surface verbatim.
+        let failed = "/graph/init -> HTTP 503: import alternate source \"x\": connector unreachable";
+        assert!(!is_building_error(failed));
+        assert_eq!(display_error(failed), failed);
     }
 }

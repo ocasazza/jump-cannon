@@ -1,0 +1,39 @@
+{
+  "items": [
+    {
+      "id": "u1",
+      "text": "The tofu state bucket lives in the ops project",
+      "context": "tofu state migration runbook",
+      "entities": "tofu, Hydra",
+      "tags": ["runbook"],
+      "state": "valid",
+      "document_id": "doc-1",
+      "fact_type": "world",
+      "metadata": { "session_id": "session-1" },
+      "mentioned_at": "2026-09-01T00:00:00Z",
+      "proof_count": 1
+    },
+    {
+      "id": "u2",
+      "text": "Hydra builds the main branch only",
+      "context": "release pipeline",
+      "entities": "Hydra",
+      "tags": [],
+      "state": "valid",
+      "document_id": "doc-1",
+      "fact_type": "experience",
+      "metadata": { "session_id": "session-1" },
+      "mentioned_at": "2026-09-01T00:01:00Z",
+      "proof_count": 2
+    },
+    {
+      "id": "u3",
+      "text": "A retired observation",
+      "entities": "tofu",
+      "tags": [],
+      "state": "invalidated",
+      "document_id": "doc-2",
+      "fact_type": "observation"
+    }
+  ]
+}

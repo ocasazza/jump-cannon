@@ -2,12 +2,16 @@
 //!
 //! `GET /importers/:id/definition` exposes an httpjson source's authored
 //! package TOML with the catalog's read posture (none).
-//! `PUT /importers/:id/definition` and `POST /importers` mutate the packages
-//! directory and therefore carry the runtime-switching authorization: the
-//! caller's groups header must contain the configured switch group, exactly
-//! as selecting a non-default source does. Every write validates first, then
-//! lands atomically. Runtime-added sources persist in
-//! `<packages_dir>/catalog.local.json`, merged into the chart catalog at boot.
+//! `GET /importers/:id/variables` does the same for the package's declared
+//! `[[parser.variables]]` alongside the instance's effective values.
+//! `PUT /importers/:id/definition`, `PUT /importers/:id/variables`, and
+//! `POST /importers` mutate the packages directory and therefore carry the
+//! runtime-switching authorization: the caller's groups header must contain
+//! the configured switch group, exactly as selecting a non-default source
+//! does. Every write validates first, then lands atomically. Runtime-added
+//! sources persist in `<packages_dir>/catalog.local.json`, per-source
+//! variable replacements in `<packages_dir>/variables.local.json`; both
+//! merge into the chart catalog at boot.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -18,10 +22,10 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
-
 use crate::importer_catalog::{
-    self, CatalogSourceKind, ImporterCatalogOverlay, ImporterHttpJsonSource,
-    ImporterSourceDefinition, OVERLAY_CATALOG_FILENAME,
+    self, CatalogSourceKind, ImporterHttpJsonSource, ImporterCatalogOverlay,
+    ImporterSourceDefinition, ImporterVariablesOverride, ImporterVariablesOverlay,
+    MAX_IMPORTER_CATALOG_BYTES, OVERLAY_CATALOG_FILENAME, VARIABLES_OVERLAY_FILENAME,
 };
 use crate::importer_package::{
     dir_is_writable, parse_importer_package, read_package_definition, require_toml,
@@ -40,6 +44,33 @@ pub struct DefinitionResponse {
 #[derive(Deserialize)]
 pub struct DefinitionPutReq {
     source: String,
+}
+
+/// `GET`/`PUT /importers/:id/variables` response: the bound package's
+/// declared `[[parser.variables]]` plus the source's effective instance
+/// variables. Unset variables are simply absent from `current` — the UI
+/// shows the declared `default` as the placeholder.
+#[derive(Debug, Serialize)]
+pub struct VariablesResponse {
+    pub declared: Vec<DeclaredVariable>,
+    pub current: BTreeMap<String, String>,
+}
+
+/// One `[[parser.variables]]` entry of the bound package. A package
+/// description that is absent serializes as the empty string.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DeclaredVariable {
+    pub name: String,
+    pub description: String,
+    pub default: Option<String>,
+}
+
+/// `PUT /importers/:id/variables` body: a FULL REPLACEMENT of the source's
+/// instance variable set.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VariablesPutReq {
+    variables: BTreeMap<String, String>,
 }
 
 /// `POST /importers` body.
@@ -218,6 +249,149 @@ pub async fn definition_put(
     .into_response()
 }
 
+/// The catalog entry's effective instance variables.
+fn current_variables(host: &SourceHost, source_id: &str) -> BTreeMap<String, String> {
+    host.catalog()
+        .source(source_id)
+        .and_then(|definition| definition.http_json.as_ref())
+        .map(|http_json| http_json.variables.clone())
+        .unwrap_or_default()
+}
+
+/// Read the bound package and extract its declared `[[parser.variables]]`.
+/// Validation is the same synchronous CPU work [`validate_source_text`]
+/// offloads to the blocking pool; a package that no longer validates is a
+/// 500 (the definition editor remains the place to repair it), and a
+/// non-json engine has no variables to declare.
+async fn declared_variables(path: &Path) -> Result<Vec<DeclaredVariable>, Response> {
+    let definition = match read_package_definition(path) {
+        Ok(definition) => definition,
+        Err(error) => return Err(reject(StatusCode::INTERNAL_SERVER_ERROR, error)),
+    };
+    match tokio::task::spawn_blocking(move || {
+        parse_importer_package(&definition.source).and_then(|package| {
+            package
+                .json_config()
+                .map(|config| {
+                    config
+                        .variables
+                        .iter()
+                        .map(|variable| DeclaredVariable {
+                            name: variable.name.clone(),
+                            description: variable.description.clone().unwrap_or_default(),
+                            default: variable.default.clone(),
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .map_err(|error| error.to_string())
+        })
+    })
+    .await
+    {
+        Ok(Ok(declared)) => Ok(declared),
+        Ok(Err(error)) => Err(reject(StatusCode::INTERNAL_SERVER_ERROR, error)),
+        Err(error) => Err(reject(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("package parse task failed: {error}"),
+        )),
+    }
+}
+
+pub async fn variables_get(
+    State(host): State<SourceHost>,
+    RoutePath(source_id): RoutePath<String>,
+) -> Response {
+    let located = match locate(&host, &source_id) {
+        Ok(located) => located,
+        Err(response) => return response,
+    };
+    if !located.path.is_file() {
+        return reject(
+            StatusCode::NOT_FOUND,
+            format!(
+                "package file {:?} for importer source {source_id:?} is not present in the packages directory",
+                located.package
+            ),
+        );
+    }
+    let declared = match declared_variables(&located.path).await {
+        Ok(declared) => declared,
+        Err(response) => return response,
+    };
+    Json(VariablesResponse {
+        declared,
+        current: current_variables(&host, &source_id),
+    })
+    .into_response()
+}
+
+pub async fn variables_put(
+    State(host): State<SourceHost>,
+    headers: HeaderMap,
+    RoutePath(source_id): RoutePath<String>,
+    body: Bytes,
+) -> Response {
+    if let Err(response) = authorize(&host, &headers) {
+        return response;
+    }
+    let req: VariablesPutReq = match parse_body(&body) {
+        Ok(req) => req,
+        Err(response) => return response,
+    };
+    let located = match locate(&host, &source_id) {
+        Ok(located) => located,
+        Err(response) => return response,
+    };
+    if !located.path.is_file() {
+        return reject(
+            StatusCode::NOT_FOUND,
+            format!(
+                "package file {:?} for importer source {source_id:?} is not present in the packages directory",
+                located.package
+            ),
+        );
+    }
+    let declared = match declared_variables(&located.path).await {
+        Ok(declared) => declared,
+        Err(response) => return response,
+    };
+    for name in req.variables.keys() {
+        if !declared.iter().any(|variable| &variable.name == name) {
+            return reject(
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "variable {name:?} is not declared by package {:?} of importer source {source_id:?}",
+                    located.package
+                ),
+            );
+        }
+    }
+    if let Err(response) = require_writable(&located.packages_dir) {
+        return response;
+    }
+    // Persist first, then publish: the served catalog only ever reflects
+    // what boot would reload from disk.
+    if let Err(error) = write_variables_overlay(&located.packages_dir, &source_id, &req.variables)
+    {
+        return reject(StatusCode::INTERNAL_SERVER_ERROR, error);
+    }
+    if let Err(error) = host.set_source_variables(&source_id, req.variables.clone()) {
+        return reject(StatusCode::CONFLICT, error);
+    }
+    // The next selection rebuilds from the new variables.
+    host.invalidate_alternate(&source_id);
+    tracing::info!(
+        source = %source_id,
+        package = %located.package,
+        "importer source variables updated"
+    );
+    Json(VariablesResponse {
+        declared,
+        current: req.variables,
+    })
+    .into_response()
+}
+
 /// Package filenames are joined onto the packages directory, so the charset
 /// is the stable-id charset, no leading dot (temp/probe files live there),
 /// and a `.toml` extension.
@@ -339,6 +513,47 @@ fn append_overlay(
     write_atomically(&path, &text)
 }
 
+/// Read-modify-write `variables.local.json` with one source's full variable
+/// replacement, preserving every other entry. Mirrors [`append_overlay`]: a
+/// pre-existing file that no longer parses (or exceeds the catalog size
+/// ceiling) fails the update loudly and is left untouched. The written
+/// entry is kept even for an empty replacement, so boot re-applies the
+/// cleared set instead of resurrecting chart-declared variables.
+fn write_variables_overlay(
+    packages_dir: &Path,
+    id: &str,
+    variables: &BTreeMap<String, String>,
+) -> Result<(), String> {
+    let path = packages_dir.join(VARIABLES_OVERLAY_FILENAME);
+    let mut overlay = match std::fs::read_to_string(&path) {
+        Ok(raw) => {
+            if raw.len() > MAX_IMPORTER_CATALOG_BYTES {
+                return Err(format!(
+                    "{} is {} bytes; maximum is {MAX_IMPORTER_CATALOG_BYTES}",
+                    path.display(),
+                    raw.len()
+                ));
+            }
+            serde_json::from_str::<ImporterVariablesOverlay>(&raw).map_err(|error| {
+                format!("{} is not a valid variables overlay: {error}", path.display())
+            })?
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            ImporterVariablesOverlay::default()
+        }
+        Err(error) => return Err(format!("failed to read {}: {error}", path.display())),
+    };
+    overlay.sources.insert(
+        id.to_owned(),
+        ImporterVariablesOverride {
+            variables: variables.clone(),
+        },
+    );
+    let text = serde_json::to_string_pretty(&overlay)
+        .map_err(|error| format!("failed to encode variables overlay: {error}"))?;
+    write_atomically(&path, &text)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -350,5 +565,77 @@ mod tests {
         for bad in ["", ".hidden.toml", "../x.toml", "a/b.toml", "Upper.toml", "x.yaml", "..", "pkg.nix"] {
             assert!(validate_package_filename(bad).is_err(), "{bad:?} must be rejected");
         }
+    }
+
+    #[test]
+    fn write_variables_overlay_preserves_other_entries_and_replaces() {
+        let dir = std::env::temp_dir().join(format!("jc-vars-rmw-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        write_variables_overlay(
+            &dir,
+            "other",
+            &BTreeMap::from([("bank".to_owned(), "kept".to_owned())]),
+        )
+        .unwrap();
+        write_variables_overlay(
+            &dir,
+            "hindsight",
+            &BTreeMap::from([
+                ("tenant".to_owned(), "default".to_owned()),
+                ("bank".to_owned(), "relay".to_owned()),
+            ]),
+        )
+        .unwrap();
+        let overlay: ImporterVariablesOverlay = serde_json::from_str(
+            &std::fs::read_to_string(dir.join(VARIABLES_OVERLAY_FILENAME)).unwrap(),
+        )
+        .unwrap();
+        // Full replacement of `hindsight` (no earlier entry to preserve),
+        // other sources untouched.
+        assert_eq!(
+            overlay.sources["hindsight"].variables,
+            BTreeMap::from([
+                ("tenant".to_owned(), "default".to_owned()),
+                ("bank".to_owned(), "relay".to_owned()),
+            ])
+        );
+        assert_eq!(
+            overlay.sources["other"].variables,
+            BTreeMap::from([("bank".to_owned(), "kept".to_owned())])
+        );
+
+        // A second write for the same id replaces, not merges: dropping
+        // `tenant` is the point of full replacement.
+        write_variables_overlay(
+            &dir,
+            "hindsight",
+            &BTreeMap::from([("bank".to_owned(), "relay-2".to_owned())]),
+        )
+        .unwrap();
+        let overlay: ImporterVariablesOverlay = serde_json::from_str(
+            &std::fs::read_to_string(dir.join(VARIABLES_OVERLAY_FILENAME)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            overlay.sources["hindsight"].variables,
+            BTreeMap::from([("bank".to_owned(), "relay-2".to_owned())])
+        );
+
+        // A pre-existing file that no longer parses fails loudly and is
+        // left untouched.
+        let path = dir.join(VARIABLES_OVERLAY_FILENAME);
+        std::fs::write(&path, "{").unwrap();
+        let error = write_variables_overlay(
+            &dir,
+            "hindsight",
+            &BTreeMap::from([("bank".to_owned(), "x".to_owned())]),
+        )
+        .unwrap_err();
+        assert!(error.contains("not a valid variables overlay"), "{error}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -57,6 +57,10 @@ directed = true
 key = "documented_in"
 directed = true
 
+[[schema.edge_types]]
+key = "related_to"
+directed = true
+
 [parser]
 engine = "json"
 
@@ -104,6 +108,14 @@ match_on = "title"
 kind = "documented_in"
 value_pointer = "/document_id"
 target_collection = "documents"
+match_on = "id"
+
+# OpenAlex shape: the pointer names an *array* of ids; every element is one
+# edge target (no transform).
+[[parser.collections.nodes.edges]]
+kind = "related_to"
+value_pointer = "/related"
+target_collection = "memories"
 match_on = "id"
 
 [[parser.collections]]
@@ -405,6 +417,34 @@ fn documented_in_resolves_by_id_without_suffix_collisions() {
         .unresolved
         .iter()
         .any(|entry| entry.contains("doc-1")));
+}
+
+#[test]
+fn array_valued_edge_pointers_resolve_one_edge_per_element() {
+    // OpenAlex `/referenced_works` shape: the pointer names an array of ids.
+    // Every in-scope element becomes an edge; out-of-scope elements land in
+    // `unresolved` exactly like scalar misses.
+    let mut records = hindsight_records();
+    records[0] = record(
+        "memories",
+        json!({"items": [
+            {"id": "u1", "text": "First", "entities": "tofu",
+             "related": ["u2", "u-not-imported"], "state": "valid",
+             "document_id": "doc-1", "fact_type": "world"},
+            {"id": "u2", "text": "Second", "entities": "Hydra",
+             "state": "valid", "document_id": "doc-1", "fact_type": "opinion"}
+        ]}),
+    );
+    let result = mapper().map(records).expect("mapping succeeds");
+    assert!(has_edge(&result, "u1", "u2"), "array element ids must resolve");
+    assert!(
+        !has_edge(&result, "u1", "u-not-imported"),
+        "out-of-scope ids never resolve"
+    );
+    assert!(result
+        .unresolved
+        .iter()
+        .any(|entry| entry.contains("u-not-imported")));
 }
 
 #[test]

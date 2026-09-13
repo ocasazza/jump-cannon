@@ -325,6 +325,10 @@ fn ensure_search_schema(ctx: Ctx) {
         if let Err(error) = &fetched {
             tracing::warn!("[nodes] graph schema fetch failed: {error}");
         }
+        // display_error: while the selected source builds server-side this
+        // fetch 503s with the machine instruction body — log it raw, never
+        // render it verbatim.
+        let fetched = fetched.map_err(|e| api::display_error(&e));
         *SEARCH_SCHEMA.write() = Some(fetched);
     });
 }
@@ -376,7 +380,12 @@ fn run_search(ctx: Ctx) {
                 result_total.set(0);
                 results.set(Vec::new());
                 RICH.write().clear();
-                *SEARCH_ERROR.write() = Some(format!("search failed: {error}"));
+                // display_error: see ensure_search_schema — a building 503
+                // must not quote the server's machine instruction.
+                *SEARCH_ERROR.write() = Some(format!(
+                    "search failed: {}",
+                    api::display_error(&error)
+                ));
             }
         }
         searching.set(false);

@@ -66,6 +66,11 @@ fn api_routes() -> Router<SourceHost> {
             get(crate::importer_editor::definition_get)
                 .put(crate::importer_editor::definition_put),
         )
+        .route(
+            "/importers/:source_id/variables",
+            get(crate::importer_editor::variables_get)
+                .put(crate::importer_editor::variables_put),
+        )
         .route("/graph/init", get(graph_init))
         .route("/graph/ids", get(graph_ids))
         .route("/graph/positions", get(graph_positions))

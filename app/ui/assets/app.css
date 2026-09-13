@@ -1051,6 +1051,13 @@ textarea.doc-src:focus { outline:none; }
 .imp-vars { display:flex; flex-direction:column; gap:.3rem; align-items:flex-start; }
 .imp-var { width:100%; display:grid; grid-template-columns:1fr auto 1fr auto;
   align-items:center; gap:.3rem; color:var(--dim); font-family:var(--mono); }
+/* Runtime-variables section for the selected httpjson source
+   (data-field=variables), between the catalog summary and the package
+   editor. Field rows reuse .imp-field; actions reuse .imp-actions. */
+.imp-vars-section { display:flex; flex-direction:column; gap:.4rem; min-width:0;
+  padding:.45rem .1rem; border-top:1px solid var(--line); }
+.imp-vars-body { display:flex; flex-direction:column; gap:.4rem; }
+.imp-vars-section .imp-actions { padding-top:0; }
 
 /* Live source-apply feedback in the catalog summary (data-field=apply-status)
    and its glanceable row chip (data-field=apply-chip). */

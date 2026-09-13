@@ -1,0 +1,26 @@
+{
+  "mechanisms": [
+    {
+      "mec_id": 1,
+      "mechanism_of_action": "Cyclooxygenase inhibitor",
+      "action_type": "INHIBITOR",
+      "molecule_chembl_id": "CHEMBL25",
+      "target_chembl_id": "CHEMBL240"
+    },
+    {
+      "mec_id": 2,
+      "mechanism_of_action": "Carbonic anhydrase II inhibitor",
+      "action_type": "INHIBITOR",
+      "molecule_chembl_id": "CHEMBL941",
+      "target_chembl_id": "CHEMBL2056"
+    },
+    {
+      "mec_id": 3,
+      "mechanism_of_action": "Cyclooxygenase-2 inhibitor",
+      "action_type": "INHIBITOR",
+      "molecule_chembl_id": "CHEMBL1201585",
+      "target_chembl_id": "CHEMBL240"
+    }
+  ],
+  "page_meta": { "limit": 200, "offset": 0, "total_count": 3 }
+}

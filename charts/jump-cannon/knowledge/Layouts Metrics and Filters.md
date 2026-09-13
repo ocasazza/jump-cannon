@@ -22,8 +22,8 @@ four tabs:
   slab for section views, and named saved views that persist across
   sessions. Canvas keybindings: **F** fits to graph bounds, **C** toggles
   follow-centroid, **⇧C** snaps to the centroid once at the current
-  distance. The roadmap and references live in
-  [[docs/research/computational-cameras]].
+  distance. The roadmap and references live in the repo at
+  `docs/research/computational-cameras.md` (not shipped in the vault).
 
 Importer packages moved to the standalone **Importers** panel: it lists the
 sanitized deployment catalog alongside browser-local TOML packages, edits

@@ -1,0 +1,45 @@
+{
+  "molecules": [
+    {
+      "molecule_chembl_id": "CHEMBL25",
+      "pref_name": "ASPIRIN",
+      "molecule_type": "Small molecule",
+      "max_phase": "4.0",
+      "first_approval": 1950,
+      "molecule_structures": { "canonical_smiles": "CC(=O)Oc1ccccc1C(=O)O" },
+      "molecule_properties": { "full_mwt": "180.16", "alogp": "1.19", "num_ro5_violations": 0 },
+      "molecule_hierarchy": { "parent_chembl_id": "CHEMBL25" }
+    },
+    {
+      "molecule_chembl_id": "CHEMBL521",
+      "pref_name": "ASPIRIN LYSINE",
+      "molecule_type": "Small molecule",
+      "max_phase": "4.0",
+      "first_approval": null,
+      "molecule_structures": { "canonical_smiles": "CC(=O)Oc1ccccc1C(=O)O.NCCCC[C@H](N)C(=O)O" },
+      "molecule_properties": { "full_mwt": "326.33", "alogp": "-1.20", "num_ro5_violations": 0 },
+      "molecule_hierarchy": { "parent_chembl_id": "CHEMBL25" }
+    },
+    {
+      "molecule_chembl_id": "CHEMBL941",
+      "pref_name": "ACETAZOLAMIDE",
+      "molecule_type": "Small molecule",
+      "max_phase": "4.0",
+      "first_approval": 1953,
+      "molecule_structures": { "canonical_smiles": "CC(=O)Nc1nnc(S(N)(=O)=O)s1" },
+      "molecule_properties": { "full_mwt": "222.25", "alogp": "-0.26", "num_ro5_violations": 0 },
+      "molecule_hierarchy": { "parent_chembl_id": "CHEMBL941" }
+    },
+    {
+      "molecule_chembl_id": "CHEMBL1201585",
+      "pref_name": "CELECOXIB",
+      "molecule_type": "Small molecule",
+      "max_phase": "4.0",
+      "first_approval": 1998,
+      "molecule_structures": { "canonical_smiles": "Cc1ccc(-c2cc(C(F)(F)F)nn2-c2ccc(S(N)(=O)=O)cc2)cc1" },
+      "molecule_properties": { "full_mwt": "381.37", "alogp": "3.90", "num_ro5_violations": 0 },
+      "molecule_hierarchy": { "parent_chembl_id": "CHEMBL1201585" }
+    }
+  ],
+  "page_meta": { "limit": 200, "offset": 0, "total_count": 4 }
+}

@@ -382,7 +382,12 @@ impl ManifestMapper {
 /// Read a pointer as a trimmed, non-empty string. Numbers and booleans render
 /// through their JSON form so an id may be numeric.
 fn pointer_str(document: &Value, pointer: &str) -> Option<String> {
-    let value = document.pointer(pointer)?;
+    scalar_str(document.pointer(pointer)?)
+}
+
+/// A scalar rendered as a trimmed, non-empty string; arrays and objects have
+/// no string form.
+fn scalar_str(value: &Value) -> Option<String> {
     let text = match value {
         Value::String(text) => text.trim().to_string(),
         Value::Number(number) => number.to_string(),
@@ -505,15 +510,17 @@ fn field_value(rule: &FieldRule, document: &Value) -> Option<Value> {
     }
 }
 
-/// Values an edge rule references, after its transform.
+/// Values an edge rule references, after its transform. An array-valued
+/// pointer (OpenAlex `/referenced_works`) names one target per element.
 fn rule_values(transform: Transform, document: &Value, pointer: &str) -> Vec<String> {
     match transform {
         Transform::SplitCsv => split_csv(document.pointer(pointer)),
         // Edge targets are ids, never numeric measurements; a numeric id is
         // already stringified by `pointer_str`.
-        Transform::ParseNumber | Transform::None => {
-            pointer_str(document, pointer).into_iter().collect()
-        }
+        Transform::ParseNumber | Transform::None => match document.pointer(pointer) {
+            Some(Value::Array(items)) => items.iter().filter_map(scalar_str).collect(),
+            _ => pointer_str(document, pointer).into_iter().collect(),
+        },
     }
 }
 
