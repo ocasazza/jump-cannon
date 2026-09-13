@@ -2631,6 +2631,21 @@ pub fn panel(ctx: Ctx) -> Element {
                     "↺"
                 }
             }
+            // M5: a remote engine serves no capability manifest —
+            // `/compute/engines` carries {id, display_name, description,
+            // kind} only (E4) — so Jump Cannon cannot say which of these
+            // controls apply. Say that instead of implying a regime.
+            if is_bridge {
+                div { class: "lay-hint", "data-lay-state": "manifest-unknown",
+                    "settings as declared by {running_name} — applicability unknown"
+                }
+                div { class: "lay-hint",
+                    "No regime is resolved for a remote engine: the worker advertises \
+                     identity only, with no capability manifest to filter against. \
+                     Manifest-served engines get the same filtering as the local \
+                     engine once the broker exposes one."
+                }
+            }
             {engine_params(&active)}
 
             // One primary-action slot for every engine kind (was two separate
