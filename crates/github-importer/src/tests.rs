@@ -5,7 +5,9 @@ use std::path::Path;
 use std::sync::Mutex;
 
 use data_loader::testing::assert_import_contract;
-use data_loader::{Effect, ImportFuture, ImportError, Importer, Transport, WatchPlan};
+use data_loader::{
+    Effect, ImportFuture, ImportError, ImportOutcome, Importer, Transport, WatchPlan,
+};
 
 use super::*;
 
@@ -266,7 +268,10 @@ async fn import_maps_the_corpus_into_the_github_namespace() {
     let temp = tempfile::tempdir().unwrap();
     let importer = fixture_importer(temp.path(), FIXTURE_ETAG);
 
-    let result = importer.import().await.unwrap();
+    let result = match importer.import().await.unwrap() {
+        ImportOutcome::Loaded(result) => result,
+        ImportOutcome::Unchanged => panic!("first import must parse the corpus"),
+    };
     let graph = &result.graph;
     assert_eq!(graph.node_count(), 2, "README.md is outside the corpus path");
     let start_here = "github:acme-corpus:Start Here";
@@ -309,17 +314,26 @@ async fn import_maps_the_corpus_into_the_github_namespace() {
 }
 
 #[tokio::test]
-async fn etag_304_reuses_the_cached_extraction() {
+async fn warm_304_reports_unchanged_without_parsing() {
     let temp = tempfile::tempdir().unwrap();
     let source = FixtureTarball::new(fixture_tarball(), FIXTURE_ETAG);
     let importer =
         GitHubImporter::with_source(test_config(temp.path()), Box::new(source)).unwrap();
 
-    let first = importer.import().await.unwrap();
-    let second = importer.import().await.unwrap();
+    // Warm the process: one full fetch + parse.
+    let ImportOutcome::Loaded(first) = importer.import().await.unwrap() else {
+        panic!("first import must load a fresh graph");
+    };
+    // The next poll sent If-None-Match and got a 304 against an extraction
+    // this process already parsed: the import resolves to Unchanged and the
+    // cached tarball is never re-parsed.
+    assert!(matches!(
+        importer.import().await.unwrap(),
+        ImportOutcome::Unchanged
+    ));
 
-    // The second poll sent If-None-Match and got a 304: two requests, the
-    // first unconditional, the second revalidating with the fixture ETag.
+    // Two requests total: the first unconditional, the second revalidating
+    // with the fixture ETag.
     let requests = importer
         .source
         .as_ref()
@@ -333,21 +347,17 @@ async fn etag_304_reuses_the_cached_extraction() {
         "expected one unconditional fetch then one revalidation"
     );
 
-    // The extraction landed under the sanitized-etag cache key and both
-    // imports are byte-identical (304 reuse never re-extracts).
+    // The extraction landed under the sanitized-etag cache key and was kept
+    // (304 reuse never re-extracts).
     assert!(
         temp.path().join("acme-corpus-deadbeef1234").is_dir(),
         "extraction cache directory"
     );
-    let mut first_documents = first.search_documents;
-    let mut second_documents = second.search_documents;
-    first_documents.sort_by(|a, b| a.node_id.cmp(&b.node_id));
-    second_documents.sort_by(|a, b| a.node_id.cmp(&b.node_id));
-    assert_eq!(first_documents, second_documents);
+    assert_eq!(first.graph.node_count(), 2);
 }
 
 #[tokio::test]
-async fn restart_recovers_the_cache_pointer() {
+async fn restart_recovers_the_cache_pointer_and_cold_304_still_parses() {
     let temp = tempfile::tempdir().unwrap();
     let importer = fixture_importer(temp.path(), FIXTURE_ETAG);
     importer.import().await.unwrap();
@@ -355,11 +365,16 @@ async fn restart_recovers_the_cache_pointer() {
 
     // A new process (fresh in-memory state) over the same cache dir must
     // revalidate with the persisted ETag and serve the cached extraction
-    // without ever re-downloading.
+    // without ever re-downloading. Its parse-memory is cold, so the 304 on
+    // the very first poll still parses: Unchanged may only be reported
+    // against a parse this process performed.
     let source = FixtureTarball::new(fixture_tarball(), FIXTURE_ETAG);
     let importer =
         GitHubImporter::with_source(test_config(temp.path()), Box::new(source)).unwrap();
-    let result = importer.import().await.unwrap();
+    let result = match importer.import().await.unwrap() {
+        ImportOutcome::Loaded(result) => result,
+        ImportOutcome::Unchanged => panic!("a cold process must parse its cached extraction"),
+    };
     assert_eq!(result.graph.node_count(), 2);
     let requests = importer
         .source

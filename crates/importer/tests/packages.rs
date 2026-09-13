@@ -13,7 +13,7 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-use data_loader::{ImportError, ImportFuture, Importer};
+use data_loader::{ImportError, ImportFuture, ImportOutcome, Importer};
 use importer::json::JsonTransport;
 use importer::{build_importer_with_transport, InstanceConfig, ValidatedPackage};
 use rstest::rstest;
@@ -128,10 +128,16 @@ async fn shipped_package_produces_nodes_and_declared_edges(#[case] case: Package
     let importer = build_importer_with_transport(package, instance, Box::new(transport))
         .unwrap_or_else(|error| panic!("{} binds: {error}", case.manifest));
 
-    let result = importer
+    let result = match importer
         .import()
         .await
-        .unwrap_or_else(|error| panic!("{} imports from its fixtures: {error}", case.manifest));
+        .unwrap_or_else(|error| panic!("{} imports from its fixtures: {error}", case.manifest))
+    {
+        ImportOutcome::Loaded(result) => result,
+        ImportOutcome::Unchanged => {
+            panic!("{} reported unchanged on its first import", case.manifest)
+        }
+    };
 
     assert!(
         result.graph.node_count() > 0,

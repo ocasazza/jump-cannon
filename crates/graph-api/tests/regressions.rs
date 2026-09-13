@@ -13,8 +13,8 @@ use tower::ServiceExt; // for `oneshot`
 
 use data_loader::{
     Capability, ContentSchema, DiscoveryField, DiscoveryFieldType, EdgeTypeSchema, Effect,
-    HostedImporter, ImportError, ImportFuture, Importer, ImporterDescriptor, ImporterSchema,
-    LoadResult, Loader, SearchDocument, TagHierarchySchema, Transport,
+    HostedImporter, ImportError, ImportFuture, ImportOutcome, Importer, ImporterDescriptor,
+    ImporterSchema, LoadResult, Loader, SearchDocument, TagHierarchySchema, Transport,
 };
 use graph_api::importer_catalog::ImporterCatalog;
 use graph_api::proto::{Init, MetaSummary, NodeMeta};
@@ -131,8 +131,8 @@ impl Importer for DeclaredButUngrantedWrite {
         )
     }
 
-    fn import<'a>(&'a self) -> ImportFuture<'a, Result<LoadResult, ImportError>> {
-        Box::pin(async { Ok(load_result(VaultGraph::new())) })
+    fn import<'a>(&'a self) -> ImportFuture<'a, Result<ImportOutcome, ImportError>> {
+        Box::pin(async { Ok(ImportOutcome::Loaded(load_result(VaultGraph::new()))) })
     }
 }
 

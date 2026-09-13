@@ -9,9 +9,12 @@
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     future::Future,
+    hash::{Hash, Hasher},
     path::PathBuf,
     pin::Pin,
 };
+
+use parking_lot::Mutex;
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -767,6 +770,22 @@ pub struct LoadResult {
     pub unresolved: Vec<String>,
 }
 
+/// The outcome of one [`Importer::import`] pass.
+///
+/// Poll-driven hosts rebuild only on [`ImportOutcome::Loaded`]; a
+/// [`ImportOutcome::Unchanged`] response is proof that the source is
+/// byte-for-byte what it was on this importer's previous successful import,
+/// so the host keeps its current snapshot without emitting progress events
+/// or rebuilding derived state.
+#[derive(Debug)]
+pub enum ImportOutcome {
+    /// Fresh graph; hosts rebuild and swap the snapshot.
+    Loaded(LoadResult),
+    /// Source provably unmodified since the last import; hosts keep the
+    /// current snapshot and emit nothing.
+    Unchanged,
+}
+
 /// A data source that can produce a [`VaultGraph`].
 ///
 /// Implementations are stateless request processors: each call to [`load`]
@@ -1027,7 +1046,7 @@ impl ImporterDescriptor {
 /// `async-trait` transformation.
 pub trait Importer: Send + Sync {
     fn descriptor(&self) -> ImporterDescriptor;
-    fn import<'a>(&'a self) -> ImportFuture<'a, Result<LoadResult, ImportError>>;
+    fn import<'a>(&'a self) -> ImportFuture<'a, Result<ImportOutcome, ImportError>>;
 
     /// Optional body reader: return the markdown body for a node whose
     /// `meta.path` is `path` (relative to the importer's own filesystem root),
@@ -1082,8 +1101,8 @@ where
         .with_watch(watch)
     }
 
-    fn import<'a>(&'a self) -> ImportFuture<'a, Result<LoadResult, ImportError>> {
-        Box::pin(async move { self.try_load() })
+    fn import<'a>(&'a self) -> ImportFuture<'a, Result<ImportOutcome, ImportError>> {
+        Box::pin(async move { Ok(ImportOutcome::Loaded(self.try_load()?)) })
     }
 }
 
@@ -1150,7 +1169,7 @@ impl Importer for HostedImporter {
         self.importer.read_body(path)
     }
 
-    fn import<'a>(&'a self) -> ImportFuture<'a, Result<LoadResult, ImportError>> {
+    fn import<'a>(&'a self) -> ImportFuture<'a, Result<ImportOutcome, ImportError>> {
         Box::pin(async move {
             let descriptor = self.importer.descriptor();
             descriptor.validate()?;
@@ -1161,9 +1180,15 @@ impl Importer for HostedImporter {
             {
                 self.authorize(capability)?;
             }
-            let result = self.importer.import().await?;
-            descriptor.schema.validate_result(&result)?;
-            Ok(result)
+            match self.importer.import().await? {
+                ImportOutcome::Loaded(result) => {
+                    descriptor.schema.validate_result(&result)?;
+                    Ok(ImportOutcome::Loaded(result))
+                }
+                // The schema validates a LoadResult; an unchanged response
+                // carries no graph and passes through untouched.
+                outcome @ ImportOutcome::Unchanged => Ok(outcome),
+            }
         })
     }
 }
@@ -1280,6 +1305,12 @@ pub struct ImportPipeline {
     connector: Box<dyn SourceConnector>,
     decoder: Box<dyn Decoder>,
     mapper: Box<dyn GraphMapper>,
+    /// Content hash of the connector output behind this pipeline's last
+    /// successful import. A repeat [`Importer::import`] over identical
+    /// records short-circuits to [`ImportOutcome::Unchanged`] before any
+    /// decode or mapping work, so a polling host's idle tick costs one
+    /// connector read and nothing else.
+    last_hash: Mutex<Option<u64>>,
 }
 
 impl ImportPipeline {
@@ -1332,7 +1363,13 @@ impl ImportPipeline {
             connector,
             decoder,
             mapper,
+            last_hash: Mutex::new(None),
         })
+    }
+
+    /// Lock the unchanged gate.
+    fn gate(&self) -> parking_lot::MutexGuard<'_, Option<u64>> {
+        self.last_hash.lock()
     }
 
     pub fn descriptor(&self) -> &ImporterDescriptor {
@@ -1344,8 +1381,18 @@ impl ImportPipeline {
     }
 
     /// Execute connector -> decoder -> mapper in that order.
+    ///
+    /// Unlike [`Importer::import`], `run` ignores the unchanged gate: it
+    /// always decodes and maps, which makes it the force-refresh escape
+    /// hatch for hosts that know the source changed.
     pub async fn run(&self) -> Result<LoadResult, ImportError> {
         let source_records = self.connector.read().await?;
+        self.decode_and_map(source_records)
+    }
+
+    /// Media-type check -> decode -> map -> output validation over records
+    /// one connector read already produced.
+    fn decode_and_map(&self, source_records: Vec<SourceRecord>) -> Result<LoadResult, ImportError> {
         for record in &source_records {
             let actual_media_type = record
                 .content_type
@@ -1381,15 +1428,47 @@ impl Importer for ImportPipeline {
         self.descriptor.clone()
     }
 
-    fn import<'a>(&'a self) -> ImportFuture<'a, Result<LoadResult, ImportError>> {
-        Box::pin(async move { self.run().await })
+    /// Import with the unchanged gate: records whose content hash matches
+    /// the last successful import return [`ImportOutcome::Unchanged`]
+    /// without any decode or mapping work. The hash is stored only after a
+    /// fully validated load, so a failing pipeline keeps retrying (and
+    /// reporting) its error on every tick.
+    fn import<'a>(&'a self) -> ImportFuture<'a, Result<ImportOutcome, ImportError>> {
+        Box::pin(async move {
+            let source_records = self.connector.read().await?;
+            let hash = content_hash(&source_records);
+            if self.gate().is_some_and(|last| last == hash) {
+                return Ok(ImportOutcome::Unchanged);
+            }
+            let result = self.decode_and_map(source_records)?;
+            *self.gate() = Some(hash);
+            Ok(ImportOutcome::Loaded(result))
+        })
     }
+}
+
+/// Deterministic digest over one connector read, folded in collection order:
+/// record count, then each record's origin, content type, byte length,
+/// bytes, and metadata all participate, so any observable source change —
+/// including reordering — forces a reload.
+fn content_hash(records: &[SourceRecord]) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    records.len().hash(&mut hasher);
+    for record in records {
+        record.origin.hash(&mut hasher);
+        record.content_type.hash(&mut hasher);
+        record.bytes.len().hash(&mut hasher);
+        record.bytes.hash(&mut hasher);
+        record.metadata.hash(&mut hasher);
+    }
+    hasher.finish()
 }
 
 #[cfg(test)]
 mod importer_tests {
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
 
+    use parking_lot::Mutex;
     use serde_json::json;
     use vault_data::VaultNode;
 
@@ -1709,7 +1788,7 @@ mod importer_tests {
     struct FakeConnector {
         trace: Trace,
         scope: String,
-        records: Vec<SourceRecord>,
+        records: Arc<Mutex<Vec<SourceRecord>>>,
         error: Option<ImportError>,
     }
 
@@ -1720,11 +1799,11 @@ mod importer_tests {
 
         fn read<'a>(&'a self) -> ImportFuture<'a, Result<Vec<SourceRecord>, ImportError>> {
             Box::pin(async move {
-                self.trace.lock().unwrap().push("read".into());
+                self.trace.lock().push("read".into());
                 if let Some(error) = &self.error {
                     return Err(error.clone());
                 }
-                Ok(self.records.clone())
+                Ok(self.records.lock().clone())
             })
         }
 
@@ -1733,7 +1812,7 @@ mod importer_tests {
             request: WriteRequest,
         ) -> ImportFuture<'a, Result<WriteReceipt, ImportError>> {
             Box::pin(async move {
-                self.trace.lock().unwrap().push("write".into());
+                self.trace.lock().push("write".into());
                 Ok(WriteReceipt {
                     origin: request.origin,
                     bytes_written: request.bytes.len() as u64,
@@ -1752,7 +1831,6 @@ mod importer_tests {
         fn decode(&self, record: SourceRecord) -> Result<DecodedRecord, ImportError> {
             self.trace
                 .lock()
-                .unwrap()
                 .push(format!("decode:{}", record.origin));
             if self.fail_at.as_deref() == Some(&record.origin) {
                 return Err(ImportError::Decode {
@@ -1778,7 +1856,7 @@ mod importer_tests {
 
     impl GraphMapper for FakeMapper {
         fn map(&self, records: Vec<DecodedRecord>) -> Result<LoadResult, ImportError> {
-            self.trace.lock().unwrap().push("map".into());
+            self.trace.lock().push("map".into());
             let mut graph = VaultGraph::new();
             let mut search_documents = Vec::new();
             for record in records {
@@ -1828,7 +1906,7 @@ mod importer_tests {
             Box::new(FakeConnector {
                 trace: trace.clone(),
                 scope: "fixture".into(),
-                records,
+                records: Arc::new(Mutex::new(records)),
                 error: None,
             }),
             Box::new(FakeDecoder {
@@ -1851,12 +1929,90 @@ mod importer_tests {
             Box::new(HostedImporter::new(Box::new(pipeline), [read]).unwrap());
 
         assert_eq!(importer.descriptor().id, "fake");
-        let loaded = importer.import().await.unwrap();
+        let ImportOutcome::Loaded(loaded) = importer.import().await.unwrap() else {
+            panic!("first import must load a fresh graph");
+        };
 
         assert_eq!(loaded.graph.node_count(), 2);
         assert_eq!(
-            *trace.lock().unwrap(),
+            *trace.lock(),
             ["read", "decode:a", "decode:b", "map"]
+        );
+    }
+
+    #[tokio::test]
+    async fn identical_records_report_unchanged_without_decode_or_map() {
+        let trace = Trace::default();
+        let read = capability(Effect::Read, "fixture");
+        let pipeline =
+            pipeline(&trace, vec![record("a", "one"), record("b", "two")], None).unwrap();
+        let importer = HostedImporter::new(Box::new(pipeline), [read]).unwrap();
+
+        let ImportOutcome::Loaded(first) = importer.import().await.unwrap() else {
+            panic!("first import must load a fresh graph");
+        };
+        assert_eq!(first.graph.node_count(), 2);
+
+        // The idle poll re-reads the source — the conditional fetch is how
+        // change is detected — but must not decode or map again.
+        assert!(matches!(
+            importer.import().await.unwrap(),
+            ImportOutcome::Unchanged
+        ));
+        assert_eq!(
+            *trace.lock(),
+            ["read", "decode:a", "decode:b", "map", "read"]
+        );
+    }
+
+    #[tokio::test]
+    async fn changed_records_reload_after_an_unchanged_tick() {
+        let trace = Trace::default();
+        let records = Arc::new(Mutex::new(vec![record("a", "one")]));
+        let read = capability(Effect::Read, "fixture");
+        let pipeline = ImportPipeline::new(
+            descriptor(vec![read.clone()]),
+            Box::new(FakeConnector {
+                trace: trace.clone(),
+                scope: "fixture".into(),
+                records: records.clone(),
+                error: None,
+            }),
+            Box::new(FakeDecoder {
+                trace: trace.clone(),
+                fail_at: None,
+            }),
+            Box::new(FakeMapper {
+                trace: trace.clone(),
+            }),
+        )
+        .unwrap();
+        let importer = HostedImporter::new(Box::new(pipeline), [read]).unwrap();
+
+        let ImportOutcome::Loaded(_) = importer.import().await.unwrap() else {
+            panic!("first import must load a fresh graph");
+        };
+        assert!(matches!(
+            importer.import().await.unwrap(),
+            ImportOutcome::Unchanged
+        ));
+
+        records.lock()[0] = record("a", "mutated");
+        let ImportOutcome::Loaded(third) = importer.import().await.unwrap() else {
+            panic!("changed records must reload");
+        };
+        assert_eq!(third.graph.node_count(), 1);
+        assert_eq!(
+            *trace.lock(),
+            [
+                "read",
+                "decode:a",
+                "map",
+                "read",
+                "read",
+                "decode:a",
+                "map"
+            ]
         );
     }
 
@@ -1879,7 +2035,7 @@ mod importer_tests {
                 message: "bad record".into(),
             }
         );
-        assert_eq!(*trace.lock().unwrap(), ["read", "decode:a", "decode:bad"]);
+        assert_eq!(*trace.lock(), ["read", "decode:a", "decode:bad"]);
     }
 
     #[tokio::test]
@@ -1899,7 +2055,7 @@ mod importer_tests {
                 accepted: vec!["text/plain".into()],
             }
         );
-        assert_eq!(*trace.lock().unwrap(), ["read"]);
+        assert_eq!(*trace.lock(), ["read"]);
     }
 
     #[test]
@@ -1914,7 +2070,7 @@ mod importer_tests {
             Box::new(FakeConnector {
                 trace: trace.clone(),
                 scope: "fixture".into(),
-                records: Vec::new(),
+                records: Arc::new(Mutex::new(Vec::new())),
                 error: None,
             }),
             Box::new(FakeDecoder {
@@ -1947,7 +2103,7 @@ mod importer_tests {
 
         assert_eq!(loaded.graph.node_count(), 1);
         assert_eq!(
-            *trace.lock().unwrap(),
+            *trace.lock(),
             ["read", "decode:payload.txt", "map"]
         );
     }
@@ -1966,7 +2122,7 @@ mod importer_tests {
                 capability: capability(Effect::Read, "fixture"),
             }
         );
-        assert!(trace.lock().unwrap().is_empty());
+        assert!(trace.lock().is_empty());
     }
 
     #[test]
@@ -1981,7 +2137,7 @@ mod importer_tests {
             Box::new(FakeConnector {
                 trace,
                 scope: "fixture".into(),
-                records: Vec::new(),
+                records: Arc::new(Mutex::new(Vec::new())),
                 error: None,
             }),
             Box::new(FakeDecoder {
@@ -2018,7 +2174,7 @@ mod importer_tests {
                 capability: capability(Effect::Read, "other-scope"),
             }
         );
-        assert!(trace.lock().unwrap().is_empty());
+        assert!(trace.lock().is_empty());
     }
 
     struct LegacyLoader;    impl Loader for LegacyLoader {
@@ -2045,7 +2201,9 @@ mod importer_tests {
         let descriptor = Importer::descriptor(&loader);
         let read = descriptor.capabilities[0].clone();
         let importer = HostedImporter::new(Box::new(loader), [read.clone()]).unwrap();
-        let loaded = importer.import().await.unwrap();
+        let ImportOutcome::Loaded(loaded) = importer.import().await.unwrap() else {
+            panic!("compatibility loader import must load a fresh graph");
+        };
 
         assert_eq!(loaded.unresolved, ["legacy diagnostic"]);
         assert_eq!(descriptor.id, "legacy");
