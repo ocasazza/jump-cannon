@@ -180,6 +180,33 @@ pub struct ImporterCatalogOverlay {
     pub sources: BTreeMap<String, ImporterSourceDefinition>,
 }
 
+/// File name of the per-source runtime variable overrides inside the
+/// packages directory. `PUT /importers/:id/variables` rewrites it; boot
+/// applies it onto matching httpjson entries after the catalog overlay.
+/// Separate from [`OVERLAY_CATALOG_FILENAME`] because that overlay rejects
+/// shadowing an existing catalog source id, while variable overrides exist
+/// precisely to layer onto chart-declared sources.
+pub const VARIABLES_OVERLAY_FILENAME: &str = "variables.local.json";
+
+/// The runtime variable overrides: one full replacement of an httpjson
+/// source's instance variables per id. Same `sources`-keyed shape as
+/// [`ImporterCatalogOverlay`] so both files read the same way.
+#[derive(Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ImporterVariablesOverlay {
+    #[serde(default)]
+    pub sources: BTreeMap<String, ImporterVariablesOverride>,
+}
+
+/// One source's instance variables as last rewritten by
+/// `PUT /importers/:id/variables`.
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ImporterVariablesOverride {
+    #[serde(default)]
+    pub variables: BTreeMap<String, String>,
+}
+
 /// Where a catalog entry came from; serialized on every profile.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -352,6 +379,73 @@ impl ImporterCatalog {
         );
         self.sources.sort_by(|a, b| a.id.cmp(&b.id));
         Ok(merged)
+    }
+
+    /// Apply the runtime variable overrides from `packages_dir` (if present)
+    /// onto matching httpjson entries. Unknown ids and non-httpjson entries
+    /// are skipped with a warning — an override left behind by a removed or
+    /// re-typed source must not take the deployment down. Returns the number
+    /// of sources overridden; an absent file is zero. An oversized or
+    /// unparseable file is an error, same posture as [`Self::load_overlay`].
+    pub fn load_variables_overlay(&mut self, packages_dir: &Path) -> Result<usize, String> {
+        let path = packages_dir.join(VARIABLES_OVERLAY_FILENAME);
+        let raw = match std::fs::read_to_string(&path) {
+            Ok(raw) => raw,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+            Err(error) => return Err(format!("failed to read {}: {error}", path.display())),
+        };
+        self.apply_variables_overlay(&raw)
+            .map_err(|error| format!("{}: {error}", path.display()))
+    }
+
+    /// Apply variable-override JSON (`{ "sources": { id: { "variables": … } } }`)
+    /// in place of each matching entry's `httpJson.variables`.
+    pub fn apply_variables_overlay(&mut self, raw: &str) -> Result<usize, String> {
+        if raw.len() > MAX_IMPORTER_CATALOG_BYTES {
+            return Err(format!(
+                "importer variables overlay is {} bytes; maximum is {MAX_IMPORTER_CATALOG_BYTES}",
+                raw.len()
+            ));
+        }
+        let overlay: ImporterVariablesOverlay = serde_json::from_str(raw)
+            .map_err(|error| format!("invalid importer variables overlay JSON: {error}"))?;
+        let mut applied = 0;
+        for (id, entry) in overlay.sources {
+            let Some(source) = self.sources.iter_mut().find(|source| source.id == id) else {
+                tracing::warn!(source = %id, "variables overlay names an unknown importer source; skipping");
+                continue;
+            };
+            match source.definition.http_json.as_mut() {
+                Some(http_json) => http_json.variables = entry.variables,
+                None => {
+                    tracing::warn!(source = %id, "variables overlay names a non-httpjson importer source; skipping");
+                    continue;
+                }
+            }
+            applied += 1;
+        }
+        Ok(applied)
+    }
+
+    /// Replace one httpjson source's instance variables in place (the
+    /// in-memory half of `PUT /importers/:id/variables`). The id must exist
+    /// and carry an httpjson binding; callers validate the keys against the
+    /// package's declared variables before calling.
+    pub fn set_source_variables(
+        &mut self,
+        id: &str,
+        variables: BTreeMap<String, String>,
+    ) -> Result<(), String> {
+        let Some(source) = self.sources.iter_mut().find(|source| source.id == id) else {
+            return Err(format!("importer source {id:?} does not exist"));
+        };
+        let Some(http_json) = source.definition.http_json.as_mut() else {
+            return Err(format!(
+                "importer source {id:?} is not an httpjson package source"
+            ));
+        };
+        http_json.variables = variables;
+        Ok(())
     }
 
     /// Add one runtime-authored source (`POST /importers`). Validated like a
@@ -1224,6 +1318,151 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         assert_eq!(catalog.load_overlay(&dir).unwrap(), 0);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn variables_overlay_fully_replaces_matching_httpjson_entries() {
+        let mut catalog = ImporterCatalog::parse(Some(HINDSIGHT), SourceKind::HttpJson).unwrap();
+        catalog
+            .merge_overlay(
+                r#"{ "sources": { "a-vault": { "displayName": "Vault", "kind": "obsidian" } } }"#,
+            )
+            .unwrap();
+
+        let applied = catalog
+            .apply_variables_overlay(
+                r#"{ "sources": {
+                    "hindsight-memory-bank": { "variables": { "bank": "fixture" } },
+                    "a-vault": { "variables": { "bank": "ignored" } },
+                    "removed-source": { "variables": { "bank": "gone" } }
+                } }"#,
+            )
+            .unwrap();
+        // Only the matching httpjson entry counts; unknown and non-httpjson
+        // ids are skipped, never fatal.
+        assert_eq!(applied, 1);
+        let variables = &catalog
+            .source("hindsight-memory-bank")
+            .unwrap()
+            .http_json
+            .as_ref()
+            .unwrap()
+            .variables;
+        // Full replacement: the chart-declared `tenant` is gone too.
+        assert_eq!(
+            variables,
+            &BTreeMap::from([("bank".to_owned(), "fixture".to_owned())])
+        );
+        // The skipped entries keep their definitions untouched.
+        assert!(catalog.source("a-vault").unwrap().http_json.is_none());
+    }
+
+    #[test]
+    fn variables_overlay_rejects_oversized_and_unparseable_documents() {
+        let mut catalog = ImporterCatalog::parse(Some(HINDSIGHT), SourceKind::HttpJson).unwrap();
+        assert!(
+            catalog
+                .apply_variables_overlay("definitely not json")
+                .unwrap_err()
+                .contains("invalid importer variables overlay JSON")
+        );
+        let oversized = format!(
+            r#"{{ "sources": {{ "x": {{ "variables": {{ "a": "{}" }} }} }} }}"#,
+            "v".repeat(MAX_IMPORTER_CATALOG_BYTES)
+        );
+        assert!(
+            catalog
+                .apply_variables_overlay(&oversized)
+                .unwrap_err()
+                .contains("maximum")
+        );
+    }
+
+    #[test]
+    fn load_variables_overlay_reads_the_packages_dir_or_no_ops() {
+        let mut catalog = ImporterCatalog::parse(Some(HINDSIGHT), SourceKind::HttpJson).unwrap();
+        let dir = std::env::temp_dir().join(format!("jc-vars-overlay-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // Absent file: zero applied, chart variables intact.
+        assert_eq!(catalog.load_variables_overlay(&dir).unwrap(), 0);
+        assert_eq!(
+            catalog
+                .source("hindsight-memory-bank")
+                .unwrap()
+                .http_json
+                .as_ref()
+                .unwrap()
+                .variables
+                .get("bank")
+                .map(String::as_str),
+            Some("omp")
+        );
+
+        std::fs::write(
+            dir.join(VARIABLES_OVERLAY_FILENAME),
+            r#"{ "sources": { "hindsight-memory-bank": { "variables": { "bank": "boot" } } } }"#,
+        )
+        .unwrap();
+        assert_eq!(catalog.load_variables_overlay(&dir).unwrap(), 1);
+        assert_eq!(
+            catalog
+                .source("hindsight-memory-bank")
+                .unwrap()
+                .http_json
+                .as_ref()
+                .unwrap()
+                .variables
+                .get("bank")
+                .map(String::as_str),
+            Some("boot")
+        );
+
+        // An unparseable file is a loud boot-time error naming the file.
+        std::fs::write(dir.join(VARIABLES_OVERLAY_FILENAME), "{").unwrap();
+        let error = catalog.load_variables_overlay(&dir).unwrap_err();
+        assert!(error.contains(VARIABLES_OVERLAY_FILENAME), "{error}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn set_source_variables_replaces_or_rejects_loudly() {
+        let mut catalog = ImporterCatalog::parse(Some(HINDSIGHT), SourceKind::HttpJson).unwrap();
+        catalog
+            .merge_overlay(
+                r#"{ "sources": { "a-vault": { "displayName": "Vault", "kind": "obsidian" } } }"#,
+            )
+            .unwrap();
+
+        catalog
+            .set_source_variables(
+                "hindsight-memory-bank",
+                BTreeMap::from([("bank".to_owned(), "fixture".to_owned())]),
+            )
+            .unwrap();
+        assert_eq!(
+            catalog
+                .source("hindsight-memory-bank")
+                .unwrap()
+                .http_json
+                .as_ref()
+                .unwrap()
+                .variables,
+            BTreeMap::from([("bank".to_owned(), "fixture".to_owned())])
+        );
+
+        assert!(
+            catalog
+                .set_source_variables("missing", BTreeMap::new())
+                .unwrap_err()
+                .contains("does not exist")
+        );
+        assert!(
+            catalog
+                .set_source_variables("a-vault", BTreeMap::new())
+                .unwrap_err()
+                .contains("not an httpjson")
+        );
     }
 
     #[test]

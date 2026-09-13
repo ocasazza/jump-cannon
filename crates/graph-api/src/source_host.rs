@@ -16,7 +16,7 @@
 //! header is ignored entirely and every request is served the default —
 //! exactly today's behavior. Writes and compute endpoints stay default-only.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock, RwLockWriteGuard};
 use std::time::{Duration, Instant};
@@ -441,6 +441,25 @@ impl SourceHost {
         self.inner.catalog.rcu(|current| {
             let mut next = ImporterCatalog::clone(current);
             outcome = next.insert_runtime_source(id.clone(), definition.clone());
+            next
+        });
+        outcome
+    }
+
+    /// Replace one httpjson catalog source's instance variables (`PUT
+    /// /importers/:id/variables`), swapping in a fresh catalog snapshot the
+    /// same way [`Self::add_runtime_source`] publishes an addition. Callers
+    /// pair this with [`Self::invalidate_alternate`] so a running alternate
+    /// rebuilds lazily with the new variables on its next request.
+    pub fn set_source_variables(
+        &self,
+        id: &str,
+        variables: BTreeMap<String, String>,
+    ) -> Result<(), String> {
+        let mut outcome = Ok(());
+        self.inner.catalog.rcu(|current| {
+            let mut next = ImporterCatalog::clone(current);
+            outcome = next.set_source_variables(id, variables.clone());
             next
         });
         outcome

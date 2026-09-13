@@ -288,6 +288,17 @@ async fn main() -> anyhow::Result<()> {    let _ = dotenvy::dotenv();
         }
     }
 
+    // Runtime variable overrides (`PUT /importers/:id/variables`) persist
+    // beside the overlay; same posture — a broken file must not take the
+    // deployment down with it.
+    if let Some(packages_dir) = &args.importer_packages_dir {
+        match importer_catalog.load_variables_overlay(packages_dir) {
+            Ok(0) => {}
+            Ok(applied) => tracing::info!(applied, "applied runtime importer variable overrides"),
+            Err(error) => tracing::warn!(%error, "ignoring runtime importer variable overrides"),
+        }
+    }
+
     let importer: Box<dyn Importer> = match source_kind {
         data_loader::SourceKind::World => {
             anyhow::bail!(
