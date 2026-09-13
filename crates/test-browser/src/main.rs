@@ -222,6 +222,11 @@ struct SettingsTabsCheck {
     /// the raw engine constants behind the Advanced disclosure.
     layout_intents_present: bool,
     layout_advanced_present: bool,
+    /// Phase 4 / UI6: the one-shot solver regime's surface — regime id,
+    /// declared quality choice, run-state line, Advanced disclosure, and the
+    /// live-sim rows it must NOT have.
+    #[serde(default)]
+    layout_one_shot: serde_json::Value,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     reason: Option<String>,
 }
@@ -1359,6 +1364,53 @@ async fn drive_page(
           layRoot?.querySelector('[data-lay-state="advanced"]')
         );
 
+        // UI6 / R1: a one-shot solver regime renders the regime surface, its
+        // declared quality choice, and a run-state line — and NO live-sim
+        // rows (cooling / auto-halt belong to a continuous sim). Select the
+        // fCoSE card, assert, then restore the GPU physics engine.
+        const engineCard = (name) => [...(document.querySelectorAll('.lay-card, .lay button') || [])]
+          .find((card) => (card.textContent || '').includes(name));
+        let oneShot = { selected: false };
+        const fcoseCard = engineCard('fCoSE');
+        if (fcoseCard) {
+          fcoseCard.click();
+          const solverRoot = await waitFor(() => {
+            const root = document.querySelector('section.panel-settings .lay');
+            return root?.querySelector('[data-lay-state="last-solved"]') ? root : null;
+          }, 15000);
+          // Press Solve and require the run-state line to actually populate:
+          // a "not solved yet" that never changes would be the same kind of
+          // stale claim this work exists to remove.
+          const solveButton = [...(solverRoot?.querySelectorAll('button.lay-btn') || [])]
+            .find((button) => (button.textContent || '').trim() === 'Solve');
+          solveButton?.click();
+          const solvedLine = await waitFor(() => {
+            const text = (document.querySelector(
+              'section.panel-settings .lay [data-lay-state="last-solved"]'
+            )?.textContent || '').trim();
+            return text.startsWith('last solved') ? text : null;
+          }, 15000);
+          oneShot = {
+            selected: Boolean(solverRoot),
+            solved_line: solvedLine,
+            regime: solverRoot?.querySelector('[data-regime-id]')?.getAttribute('data-regime-id')
+              || null,
+            quality: Boolean(solverRoot?.querySelector('[data-choice="Quality"]')),
+            last_solved: (solverRoot?.querySelector('[data-lay-state="last-solved"]')?.textContent
+              || '').trim(),
+            advanced: Boolean(solverRoot?.querySelector('[data-lay-state="advanced"]')),
+            live_sim_rows: [...(solverRoot?.querySelectorAll('[data-slider]') || [])]
+              .map((row) => row.getAttribute('data-slider'))
+              .filter((label) => ['cooling α', 'cooling floor', 'energy halt'].includes(label)),
+          };
+          const gpuCard = engineCard('GPU force');
+          gpuCard?.click();
+          await waitFor(() => {
+            const root = document.querySelector('section.panel-settings .lay');
+            return root?.querySelector('[data-slider="repulsion"]') ? root : null;
+          }, 15000);
+        }
+
         keyboardContract &&= await keyboardStep('Layout', 'End', 'Camera');
         keyboardContract &&= await keyboardStep('Camera', 'Home', 'Connection');
         keyboardContract &&= await keyboardStep('Connection', 'ArrowLeft', 'Camera');
@@ -1399,6 +1451,21 @@ async fn drive_page(
         if (!layoutPresetsOffered) failures.push('vault graph is not offered the migrated presets');
         if (!layoutIntentsPresent) failures.push('vault regime intents are missing');
         if (!layoutAdvancedPresent) failures.push('Advanced disclosure is missing');
+        if (fcoseCard) {
+          if (!oneShot.selected) failures.push('one-shot solver surface did not render');
+          if (oneShot.regime !== 'fcose-quality') {
+            failures.push(`one-shot regime resolved to ${oneShot.regime}`);
+          }
+          if (!oneShot.quality) failures.push('one-shot regime lost its quality choice');
+          if (!oneShot.last_solved) failures.push('one-shot regime lost its run-state line');
+          if (!oneShot.solved_line) {
+            failures.push('run-state line never reported a completed solve');
+          }
+          if (!oneShot.advanced) failures.push('one-shot regime lost its Advanced disclosure');
+          if (oneShot.live_sim_rows.length) {
+            failures.push(`one-shot regime shows live-sim rows: ${oneShot.live_sim_rows}`);
+          }
+        }
         if (!legacyPanelsAbsent) failures.push('legacy Layout, Style, or Camera panel still exists');
         if (!graphRestored) failures.push('Graph renderer did not remount after Settings restore');
         return {
@@ -1413,6 +1480,7 @@ async fn drive_page(
           layout_presets_offered: layoutPresetsOffered,
           layout_intents_present: layoutIntentsPresent,
           layout_advanced_present: layoutAdvancedPresent,
+          layout_one_shot: oneShot,
           legacy_panels_absent: legacyPanelsAbsent,
           graph_restored: graphRestored,
           reason: failures.length ? failures.join('; ') : null,

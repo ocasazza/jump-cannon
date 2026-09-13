@@ -249,3 +249,32 @@ for untyped regimes; Advanced manifest-filtered; parked overrides surfaced in `w
   `Advanced ▸`, manifest-filtered so a data-owned dimension appears on no
   surface; `why ▸` carries the resolution reason, typed coverage, quarantined
   presets, and the parked-override list.
+- 2026-09-13 (phase 4 landed): remote and static surfaces.
+  **Broker (cross-repo, E4 resolved):** `proto/compute.proto` gains
+  `EngineManifest(EngineManifestRequest) -> EngineManifestResponse` with
+  `CapabilityDimension`; `LayoutEngine::capability_manifest` defaults to
+  `None`, and declaring engines build theirs with `manifest_from_settings`,
+  which *projects the engine's own settings struct* — one dimension per
+  serialized field, control kind inferred (bool → toggle, string → enum,
+  number → absolute, list/tagged → `internal`) — so a declaration cannot
+  drift from what `set_params` accepts. `execution` is derived from the
+  engine's `LayoutDescriptor.kind`, never restated. graph-api exposes
+  `GET /compute/engines/{id}/manifest`: 200 with the snake_case view, 404
+  when the engine declares none or is unknown (distinguishable reasons), 503
+  when the broker is disabled or the worker unreachable.
+  **Panel:** a remote engine's controls are built from its declared
+  dimensions, filtered by the same rules as the local engine (`internal` is
+  not a knob, `owned_by` renders provenance, `min_nodes` gates on the loaded
+  graph); manifest-declared values ride the existing `params` bag on
+  `PUT /compute/layout`. An engine that declares nothing keeps the M5
+  header. Numeric dimensions render as plain number inputs, because the wire
+  contract carries no range and inventing slider bounds would be a claim.
+  **one_shot (UI6/R1):** regimes are now per-engine — the base is the
+  engine's registry defaults (gpu-force keeps its n-tuned base) and the
+  manifest for a non-gpu-force engine is projected the same way the worker
+  projects its own. `fcose-quality.yaml` is the first `execution: one_shot`
+  regime: it renders the regime surface, its declared quality choice
+  (`maps_to` turns the selected option index into the engine's own `quality`
+  value), a `last solved HH:MM · N.Ns` run line, and no live-sim rows at
+  all. Enum controls store the selected option index; a declared value is
+  also accepted verbatim.

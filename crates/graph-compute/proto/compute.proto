@@ -12,6 +12,13 @@ service Compute {
   // the renderer's layout picker is engine-location agnostic.
   rpc ListEngines(ListEnginesRequest) returns (ListEnginesResponse);
 
+  // Capability manifest for ONE engine (docs/layout-ux-spec.md §3): the
+  // control dimensions the engine actually honours, so a client builds
+  // controls from the engine's own declaration instead of guessing. An
+  // engine with no declaration answers `supported: false` — the client then
+  // renders its settings generically and says applicability is unknown (M5).
+  rpc EngineManifest(EngineManifestRequest) returns (EngineManifestResponse);
+
   // Topological-fisheye view (Gansner, Koren, North — IEEE InfoVis 2004).
   // Bidirectional stream: the client sends FocusRequests as the user moves
   // the focal node, and the server emits a fresh HybridFrame for each.
@@ -117,6 +124,35 @@ message ListEnginesResponse {
   // Registry key used when a Subscribe omits `layout_id`
   // (EngineRegistry::default_id()).
   string default_id = 2;
+}
+
+// One control dimension an engine honours (docs/layout-ux-spec.md §3).
+// `control` is the client-side control kind: "multiplier" | "absolute" |
+// "toggle" | "enum" | "internal" (transient state, never a user control).
+// `owned_by` is non-empty only when the engine takes that dimension from
+// data instead of the request (the client renders a provenance capsule, not
+// a knob). `min_nodes` = 0 means "always applicable".
+message CapabilityDimension {
+  string id = 1;            // params field name, verbatim
+  string label = 2;
+  string control = 3;
+  string owned_by = 4;
+  string note = 5;
+  uint64 min_nodes = 6;
+}
+
+message EngineManifestRequest {
+  string engine_id = 1;
+}
+
+message EngineManifestResponse {
+  // false = the engine (or the id) declares no manifest; every other field
+  // is then unset and the client falls back to a generic settings form.
+  bool supported = 1;
+  string engine = 2;
+  uint32 schema_version = 3;   // 1
+  string execution = 4;        // "live" | "one_shot"
+  repeated CapabilityDimension dimensions = 5;
 }
 
 message HealthRequest {}

@@ -866,6 +866,44 @@ pub struct ConfigEntry {
     pub description: Option<String>,
 }
 
+/// One control dimension a remote engine declares
+/// (`GET /compute/engines/:id/manifest`, FROZEN CONTRACT — see
+/// docs/layout-ux-spec.md §3 and graph-api's `CapabilityDimensionView`).
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+pub struct CapabilityDimension {
+    pub id: String,
+    pub label: String,
+    /// `"multiplier" | "absolute" | "toggle" | "enum" | "internal"`.
+    pub control: String,
+    /// `Some` only when the engine takes this dimension from data rather
+    /// than the request — render provenance, never a knob.
+    #[serde(default)]
+    pub owned_by: Option<String>,
+    #[serde(default)]
+    pub note: String,
+    /// Node-count floor below which the dimension is meaningless.
+    #[serde(default)]
+    pub min_nodes: Option<u64>,
+}
+
+/// A remote engine's capability manifest. Its absence (404) is a normal
+/// answer — the engine declares nothing and the panel says so (M5).
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+pub struct EngineManifest {
+    pub engine: String,
+    pub schema_version: u32,
+    /// `"live" | "one_shot"`.
+    pub execution: String,
+    pub dimensions: Vec<CapabilityDimension>,
+}
+
+/// `GET /compute/engines/:id/manifest` — the engine's own declaration of
+/// which controls it honours. 404 (no manifest) and 503 (broker disabled /
+/// worker unreachable) both surface as `Err`, with the server's reason.
+pub async fn engine_manifest(engine_id: &str) -> ApiResult<EngineManifest> {
+    get_json(&format!("/compute/engines/{engine_id}/manifest")).await
+}
+
 /// `GET /configs` — named AppState presets (dev mode only on the server).
 #[allow(dead_code)]
 pub async fn configs() -> ApiResult<Vec<ConfigEntry>> {

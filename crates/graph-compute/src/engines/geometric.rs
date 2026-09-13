@@ -58,7 +58,7 @@
 use graph_layouts::{LayoutDescriptor, LayoutKind, LayoutRequirements};
 use serde::{Deserialize, Serialize};
 
-use super::{CsrShard, EngineCtx, GraphAttributes, LayoutEngine, StepOutput};
+use super::{CsrShard, EngineCapabilityManifest, EngineCtx, GraphAttributes, LayoutEngine, StepOutput, manifest_from_settings};
 use crate::sim::CsrGraph;
 
 /// Stable registry key for this engine.
@@ -1177,6 +1177,14 @@ impl LayoutEngine for GeometricEngine {
             .map_err(|e| format!("decode geometric settings: {e}"))?;
         self.settings = typed;
         Ok(())
+    }
+
+    fn capability_manifest(&self) -> Option<EngineCapabilityManifest> {
+        // The `*_source` fields select which per-node attribute feeds a
+        // force; everything list-valued (per-class radii, affinity matrix,
+        // coordination angles) is honoured but is not one knob, which the
+        // projection marks `internal`.
+        Some(manifest_from_settings(&GeometricSettings::default(), &[]))
     }
 
     fn init(

@@ -158,6 +158,10 @@ static SEED_ERROR: GlobalSignal<Option<String>> = Signal::global(|| None);
 /// settings push), this only advances when a real solve runs — so the panel
 /// can tell when a static engine has un-applied slider edits pending.
 static LAST_SOLVED: GlobalSignal<Option<(String, Value)>> = Signal::global(|| None);
+/// Wall-clock ms and duration ms of the last static solve, for the one-shot
+/// regime's `last solved …` line (UI6). Separate from [`LAST_SOLVED`] so the
+/// dirty-settings detector keeps comparing only `(engine, settings)`.
+static LAST_SOLVE_RUN: GlobalSignal<Option<(u64, u64)>> = Signal::global(|| None);
 static CONTROL_REQUEST_TOKEN: GlobalSignal<u64> = Signal::global(|| 0);
 static CONTROL_BUSY: GlobalSignal<bool> = Signal::global(|| false);
 
@@ -168,6 +172,46 @@ struct RemoteLease {
 }
 
 static REMOTE_LEASE_VIEW: GlobalSignal<Option<RemoteLease>> = Signal::global(|| None);
+
+/// The worker engine whose capability manifest we hold, and the answer:
+/// `Ok` = the engine declared its controls, `Err(reason)` = it declares
+/// none (404) or the deployment cannot ask (503). Either way the panel says
+/// which, and never invents applicability.
+static REMOTE_MANIFEST: GlobalSignal<Option<(String, Result<api::EngineManifest, String>)>> =
+    Signal::global(|| None);
+
+/// Settings-bag key holding the params a manifest-declared control set for
+/// one worker engine. Sent verbatim as `params` on `PUT /compute/layout`.
+fn remote_params_key(engine_id: &str) -> String {
+    format!("remote-params:{engine_id}")
+}
+
+/// Params the user set for one worker engine (empty object = "engine
+/// defaults", which is also what the worker sees when we send nothing).
+fn remote_params(engine_id: &str) -> serde_json::Map<String, Value> {
+    STATE
+        .peek()
+        .settings
+        .get(&remote_params_key(engine_id))
+        .and_then(|v| v.as_object().cloned())
+        .unwrap_or_default()
+}
+
+/// Record one manifest-declared param for a worker engine and re-push the
+/// selection so the worker picks it up. `None` clears it back to the
+/// engine's own default.
+fn set_remote_param(engine_id: &str, field: &str, value: Option<Value>) {
+    let mut params = remote_params(engine_id);
+    match value {
+        Some(v) => {
+            params.insert(field.to_string(), v);
+        }
+        None => {
+            params.remove(field);
+        }
+    }
+    put_settings(&remote_params_key(engine_id), Value::Object(params));
+}
 
 // --- /compute wire types (FROZEN CONTRACT — see graph-api/src/server.rs) --------
 
@@ -687,10 +731,22 @@ fn edit<T: Serialize + DeserializeOwned + Default>(id: &str, f: impl FnOnce(&mut
 // edit); this module owns *how* they land (persist + GPU push through the
 // same path as every other engine's settings).
 
-/// Install the resolver's effective gpu-force settings block. The only
-/// writer of that block — panel controls record overrides instead.
-pub(crate) fn install_gpu_force_settings(options: Value) {
-    put_settings("gpu-force", options);
+/// One engine's registry default settings — the regime base for every local
+/// engine except gpu-force (whose base is n-tuned).
+pub(crate) fn engine_default_settings(engine: &str) -> Value {
+    default_settings(engine)
+}
+
+/// The engine the panel is currently running, for the resolver.
+pub(crate) fn active_engine_id() -> String {
+    STATE.peek().active.clone()
+}
+
+/// Install the resolver's effective settings block for one engine. The only
+/// writer of a regime-backed engine's settings — panel controls record
+/// overrides instead.
+pub(crate) fn install_engine_settings(engine: &str, options: Value) {
+    put_settings(engine, options);
 }
 
 /// gpu-force options the render host should boot with (canvas mount): the
@@ -712,6 +768,9 @@ fn set_active(id: &str) {
     st.active = id.to_string();
     persist(&st);
     *STATE.write() = st;
+    // Regimes are per-engine: re-resolve for the engine now running (and
+    // install its effective settings) before pushing to the host.
+    crate::panels::regimes::on_engine_changed();
     apply_engine(false);
 }
 
@@ -756,6 +815,33 @@ fn select_remote_engine(engine_id: &str) {
     request_remote_selection();
 }
 
+/// The worker engine id the active bridge selection maps to, or `None` when
+/// a local engine is running.
+fn selected_remote_engine_id() -> Option<String> {
+    let st = STATE.peek().clone();
+    match st.active.as_str() {
+        BRIDGE_GEOMETRIC => {
+            let lens: LensConfig = st
+                .settings
+                .get(BRIDGE_GEOMETRIC)
+                .cloned()
+                .and_then(|v| serde_json::from_value(v).ok())
+                .unwrap_or_else(default_lens);
+            Some(if lens.use_gpu { "geometric-gpu" } else { "geometric" }.to_string())
+        }
+        BRIDGE_REMOTE_FA2 => {
+            let settings: RemoteFa2Settings = st
+                .settings
+                .get(BRIDGE_REMOTE_FA2)
+                .cloned()
+                .and_then(|v| serde_json::from_value(v).ok())
+                .unwrap_or_default();
+            Some(settings.layout_id)
+        }
+        _ => None,
+    }
+}
+
 fn desired_remote_selection() -> Option<ComputeLayoutPutReq> {
     let st = STATE.peek().clone();
     match st.active.as_str() {
@@ -785,9 +871,13 @@ fn desired_remote_selection() -> Option<ComputeLayoutPutReq> {
                 .cloned()
                 .and_then(|v| serde_json::from_value(v).ok())
                 .unwrap_or_default();
+            let params = remote_params(&settings.layout_id);
             Some(ComputeLayoutPutReq {
                 layout_id: settings.layout_id,
-                params: None,
+                // Manifest-declared controls ride the params bag the
+                // control-plane contract already carries; an empty bag stays
+                // `None` so the worker keeps its own defaults.
+                params: (!params.is_empty()).then(|| Value::Object(params)),
                 lens: None,
                 expected_generation: None,
             })
@@ -1077,9 +1167,13 @@ fn apply_engine(solve_requested: bool) {
             if active_changed || solve_requested || boot_mismatch {
                 match build_static(&active) {
                     Some(l) => {
+                        let started = now_ms();
                         let r = h.run_static_solve(l.as_ref(), &json);
                         if r.is_ok() {
                             *LAST_SOLVED.write() = Some((active.clone(), json.clone()));
+                            let finished = now_ms();
+                            *LAST_SOLVE_RUN.write() =
+                                Some((finished, finished.saturating_sub(started)));
                         }
                         r
                     }
@@ -2427,6 +2521,21 @@ pub fn panel(ctx: Ctx) -> Element {
                         Err(_) => store_health(None),
                     }
                 }
+                // Capability manifest for the selected worker engine: fetched
+                // once per engine, so the panel can build that engine's
+                // controls from its own declaration (or say it declares
+                // none). Cheap to re-ask only when the selection changes.
+                if let Some(engine) = selected_remote_engine_id() {
+                    let have = REMOTE_MANIFEST
+                        .peek()
+                        .as_ref()
+                        .map(|(id, _)| id == &engine)
+                        .unwrap_or(false);
+                    if !have {
+                        let answer = api::engine_manifest(&engine).await.map_err(|e| e.to_string());
+                        *REMOTE_MANIFEST.write() = Some((engine, answer));
+                    }
+                }
             }
             gloo_timers::future::TimeoutFuture::new(RETRY_MS).await;
         }
@@ -2506,6 +2615,8 @@ pub fn panel(ctx: Ctx) -> Element {
     let remote_solver = remote_solver_status(health.as_ref(), remote_lease, control_busy);
     let history_mode = crate::panels::timeline::history_mode_label();
 
+    // Node count of the mounted graph — the manifest's `min_nodes` gate.
+    let n_nodes_loaded = render::with_host(|h| h.pipes.n_nodes() as usize).unwrap_or(0);
     let active_backend = backend_of(&active);
     let view = *VIEW_BACKEND.read();
     // Display name of the running engine for the cross-backend banner: the
@@ -2631,20 +2742,11 @@ pub fn panel(ctx: Ctx) -> Element {
                     "↺"
                 }
             }
-            // M5: a remote engine serves no capability manifest —
-            // `/compute/engines` carries {id, display_name, description,
-            // kind} only (E4) — so Jump Cannon cannot say which of these
-            // controls apply. Say that instead of implying a regime.
+            // Remote engines: build controls from the engine's OWN
+            // capability manifest when it serves one, and say plainly that
+            // applicability is unknown when it does not (M5).
             if is_bridge {
-                div { class: "lay-hint", "data-lay-state": "manifest-unknown",
-                    "settings as declared by {running_name} — applicability unknown"
-                }
-                div { class: "lay-hint",
-                    "No regime is resolved for a remote engine: the worker advertises \
-                     identity only, with no capability manifest to filter against. \
-                     Manifest-served engines get the same filtering as the local \
-                     engine once the broker exposes one."
-                }
+                {remote_manifest_surface(&running_name, n_nodes_loaded)}
             }
             {engine_params(&active)}
 
@@ -3319,7 +3421,174 @@ fn seed_section(remote: bool) -> Element {
 
 // --- per-engine parameter UIs ----------------------------------------------------------
 
-fn engine_params(active: &str) -> Element {
+/// Number row with no slider: a manifest-declared numeric dimension has no
+/// declared range, so inventing slider bounds would be a lie. Empty means
+/// "the engine's own default" — we never fabricate a current value we did
+/// not set ourselves.
+#[component]
+fn NumRow(
+    label: String,
+    value: Option<f64>,
+    title: Option<String>,
+    on: EventHandler<Option<f64>>,
+) -> Element {
+    let shown = value.map(fmt_f).unwrap_or_default();
+    rsx! {
+        div { class: "lay-row", "data-declared": "{label}", title: title.unwrap_or_default(),
+            span { class: "lay-k", "{label}" }
+            input {
+                r#type: "number",
+                class: "lay-num",
+                value: "{shown}",
+                placeholder: "engine default",
+                onchange: move |e| {
+                    let raw = e.value();
+                    on.call(if raw.trim().is_empty() { None } else { raw.parse::<f64>().ok() });
+                },
+            }
+        }
+    }
+}
+
+/// The remote-engine control surface. With a manifest: one control per
+/// declared dimension, filtered exactly like the local engine's — an
+/// `internal` dimension is not a knob, a dimension the engine sources from
+/// data renders as provenance, and a `min_nodes` floor hides what the
+/// current graph is too small for. Without one: the M5 header, stating that
+/// applicability is unknown rather than implying a regime.
+fn remote_manifest_surface(engine_name: &str, n_nodes: usize) -> Element {
+    let held = REMOTE_MANIFEST.read().clone();
+    let Some((engine_id, answer)) = held else {
+        return rsx! {
+            div { class: "lay-hint", "data-lay-state": "manifest-pending",
+                "asking {engine_name} for its capability manifest…"
+            }
+        };
+    };
+    match answer {
+        Err(reason) => rsx! {
+            div { class: "lay-hint", "data-lay-state": "manifest-unknown",
+                "settings as declared by {engine_name} — applicability unknown"
+            }
+            div { class: "lay-hint", "{reason}" }
+            div { class: "lay-hint",
+                "No regime is resolved for an engine that declares nothing: there is \
+                 no capability manifest to filter against, so every setting below is \
+                 shown as-is. A manifest-serving engine gets the same filtering as \
+                 the local engine."
+            }
+        },
+        Ok(manifest) => {
+            let params = remote_params(&engine_id);
+            let live: Vec<api::CapabilityDimension> = manifest
+                .dimensions
+                .iter()
+                .filter(|d| d.control != "internal" && d.owned_by.is_none())
+                .filter(|d| d.min_nodes.map(|min| n_nodes as u64 >= min).unwrap_or(true))
+                .cloned()
+                .collect();
+            let owned: Vec<api::CapabilityDimension> = manifest
+                .dimensions
+                .iter()
+                .filter(|d| d.owned_by.is_some())
+                .cloned()
+                .collect();
+            let hidden = manifest.dimensions.len() - live.len() - owned.len();
+            rsx! {
+                div { class: "lay-regime-reason", "data-lay-state": "manifest-declared",
+                    "controls declared by {engine_name} · {live.len()} of \
+                     {manifest.dimensions.len()} dimensions apply here"
+                }
+                if manifest.execution == "one_shot" {
+                    div { class: "lay-hint", "one-shot solver — press Solve to run it" }
+                }
+                for dimension in owned.iter() {
+                    div {
+                        key: "{dimension.id}",
+                        class: "lay-capsule",
+                        "data-lay-state": "declared-owned",
+                        span { "{dimension.label} from {dimension.owned_by.clone().unwrap_or_default()}" }
+                    }
+                }
+                for dimension in live.iter() {
+                    {
+                        let id = dimension.id.clone();
+                        let current = params.get(&id).cloned();
+                        let title = if dimension.note.is_empty() {
+                            format!("{} — declared by {engine_name}", dimension.id)
+                        } else {
+                            format!("{} — {}", dimension.id, dimension.note)
+                        };
+                        match dimension.control.as_str() {
+                            "toggle" => rsx! {
+                                CheckRow {
+                                    key: "{id}",
+                                    label: dimension.label.clone(),
+                                    value: current.as_ref().and_then(Value::as_bool).unwrap_or(false),
+                                    title: title.clone(),
+                                    on: {
+                                        let engine = engine_id.clone();
+                                        let field = id.clone();
+                                        move |v: bool| set_remote_param(&engine, &field, Some(serde_json::json!(v)))
+                                    },
+                                }
+                            },
+                            "enum" => rsx! {
+                                TextRow {
+                                    key: "{id}",
+                                    label: dimension.label.clone(),
+                                    value: current
+                                        .as_ref()
+                                        .and_then(Value::as_str)
+                                        .unwrap_or_default()
+                                        .to_string(),
+                                    title: title.clone(),
+                                    on: {
+                                        let engine = engine_id.clone();
+                                        let field = id.clone();
+                                        move |v: String| set_remote_param(
+                                            &engine,
+                                            &field,
+                                            (!v.trim().is_empty()).then(|| serde_json::json!(v)),
+                                        )
+                                    },
+                                }
+                            },
+                            _ => rsx! {
+                                NumRow {
+                                    key: "{id}",
+                                    label: dimension.label.clone(),
+                                    value: current.as_ref().and_then(Value::as_f64),
+                                    title: title.clone(),
+                                    on: {
+                                        let engine = engine_id.clone();
+                                        let field = id.clone();
+                                        move |v: Option<f64>| set_remote_param(
+                                            &engine,
+                                            &field,
+                                            v.map(|v| serde_json::json!(v)),
+                                        )
+                                    },
+                                }
+                            },
+                        }
+                    }
+                }
+                if hidden > 0 {
+                    div { class: "lay-hint",
+                        "{hidden} declared dimension(s) are not single-value controls \
+                         (lists and tagged structures) or need a larger graph."
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Raw per-engine settings form (the hand-written controls each engine has
+/// always had). For a regime-backed engine this lives behind `Advanced ▸`;
+/// for everything else it *is* the surface.
+fn engine_raw_params(active: &str) -> Element {
     match active {
         "gpu-force" => gpu_force_ui(),
         "random" => random_ui(),
@@ -3339,6 +3608,62 @@ fn engine_params(active: &str) -> Element {
         _ => rsx! {
             div { class: "lay-hint", "No layout registered for active id — pick one above." }
         },
+    }
+}
+
+/// `last solved 12:03 · 1.2s` — the one-shot regime's run state (UI6). A
+/// solver that has not run yet says so instead of implying a result.
+fn last_solve_line() -> Element {
+    let run = *LAST_SOLVE_RUN.read();
+    rsx! {
+        div { class: "lay-hint", "data-lay-state": "last-solved",
+            match run {
+                Some((finished, duration)) => format!(
+                    "last solved {} · {:.1}s",
+                    fmt_clock(finished),
+                    duration as f64 / 1000.0
+                ),
+                None => "not solved yet — press Solve".to_string(),
+            }
+        }
+    }
+}
+
+/// `HH:MM` in local time from a wall-clock epoch in milliseconds.
+#[cfg(target_arch = "wasm32")]
+fn fmt_clock(ms: u64) -> String {
+    let date = js_sys::Date::new(&wasm_bindgen::JsValue::from_f64(ms as f64));
+    format!("{:02}:{:02}", date.get_hours(), date.get_minutes())
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn fmt_clock(ms: u64) -> String {
+    let minutes = (ms / 60_000) % 60;
+    let hours = (ms / 3_600_000) % 24;
+    format!("{hours:02}:{minutes:02}")
+}
+
+/// The parameter surface for the running engine. A regime-backed engine
+/// leads with its regime surface (picker, provenance, intents) and keeps the
+/// raw constants behind `Advanced ▸`; gpu-force renders both itself because
+/// its capsules are coverage-dependent. A one-shot regime adds the run-state
+/// line and, per UI6/R1, has no live-sim rows to show at all.
+fn engine_params(active: &str) -> Element {
+    let res = crate::panels::regimes::RESOLUTION.read().clone();
+    let regime_here = res.as_ref().filter(|r| r.engine == active).cloned();
+    match regime_here {
+        Some(regime) if active != "gpu-force" => rsx! {
+            {regime_surface()}
+            if regime.one_shot {
+                {last_solve_line()}
+            }
+            hr { class: "lay-sep" }
+            details { class: "lay-advanced", "data-lay-state": "advanced",
+                summary { "Advanced ▸" }
+                {engine_raw_params(active)}
+            }
+        },
+        _ => engine_raw_params(active),
     }
 }
 
@@ -3536,17 +3861,20 @@ fn set_gpu_force(field: &'static str, value: Value) {
     crate::panels::regimes::set_option_override(field, value);
 }
 
-fn gpu_force_ui() -> Element {
-    let opts: GpuForceOptions = typed_settings("gpu-force");
-    let repulsion_mode = opts.repulsion_mode;
-
-    // Regime resolution (panels/regimes.rs): None only before the first
-    // graph load — render the status-quo (vault) shape until then.
+/// The regime surface every regime-backed engine shares: picker +
+/// resolution reason, the data-owned capsules and coverage chips, the
+/// declared intents, and the `why ▸` provenance disclosure. Reads the
+/// resolution the resolver published — it renders claims, never invents
+/// them.
+fn regime_surface() -> Element {
+    // Regime resolution (panels/regimes.rs): `None` only before the first
+    // graph load, or for an engine no regime targets.
     let res = crate::panels::regimes::RESOLUTION.read().clone();
-    let (regime_id, regime_label, reason, typed_nodes, typed_edges, n_nodes, n_edges) =
+    let (regime_id, engine, regime_label, reason, typed_nodes, typed_edges, n_nodes, n_edges) =
         match &res {
             Some(r) => (
                 r.regime_id.clone(),
+                r.engine.clone(),
                 r.label.clone(),
                 r.reason.clone(),
                 r.typed_nodes,
@@ -3556,6 +3884,7 @@ fn gpu_force_ui() -> Element {
             ),
             None => (
                 "unresolved".to_string(),
+                String::new(),
                 "Resolving…".to_string(),
                 String::new(),
                 0,
@@ -3564,6 +3893,7 @@ fn gpu_force_ui() -> Element {
                 0,
             ),
         };
+    let _ = n_nodes;
     let pinned = res.as_ref().is_some_and(|r| r.pinned);
     let parked = res.as_ref().map(|r| r.parked).unwrap_or(0);
     let applied_overrides = res.as_ref().map(|r| r.applied_overrides).unwrap_or(0);
@@ -3574,22 +3904,11 @@ fn gpu_force_ui() -> Element {
         .map(|r| r.presets_hidden.join(", "))
         .unwrap_or_default();
     let choices = res.as_ref().map(|r| r.choices.clone()).unwrap_or_default();
-    let manifest = crate::panels::regimes::gpu_force_manifest();
-    // M1/M3: controls exist only when manifest ∧ live graph state agree —
-    // the dead-knob rule is structural, not a hand-tuned if per slider.
-    // E1/M2: at full typed coverage the UFF bond table owns every rest —
-    // spring_len is inert, so no slider may exist for it (on any surface).
-    let spring_len_owned = manifest
-        .iter()
-        .find(|d| d.id == "spring_len")
-        .is_some_and(|d| crate::panels::regimes::dim_owned_by_data(d, typed_edges, n_edges));
     let untyped_edges = n_edges.saturating_sub(typed_edges);
-    // Manifest gate: the repulsion backend is a large-graph concern.
-    let backend_available = manifest
-        .iter()
-        .find(|d| d.id == "repulsion_mode")
-        .and_then(|d| d.min_nodes)
-        .is_some_and(|min| n_nodes >= min as usize);
+    // E1/M2: the capsule replaces the control exactly when the ACTIVE
+    // engine's manifest says the data owns that dimension.
+    let spring_len_owned = crate::panels::regimes::manifest_dim(&engine, "spring_len")
+        .is_some_and(|d| crate::panels::regimes::dim_owned_by_data(&d, typed_edges, n_edges));
 
     rsx! {
         // Regime picker + resolution reason (UI2). Selecting a regime pins
@@ -3658,7 +3977,34 @@ fn gpu_force_ui() -> Element {
         if !intents.is_empty() {
             div { class: "lay-sub", "Intents" }
             for intent in intents.iter() {
-                if intent.toggle {
+                if !intent.choices.is_empty() {
+                    div {
+                        key: "{intent.id}",
+                        class: "lay-row",
+                        "data-choice": "{intent.label}",
+                        title: "sets {intent.affects}",
+                        span { class: "lay-k", "{intent.label}" }
+                        select {
+                            class: "lay-select",
+                            onchange: {
+                                let id = intent.id.clone();
+                                move |e: Event<FormData>| {
+                                    if let Ok(index) = e.value().parse::<usize>() {
+                                        crate::panels::regimes::set_intent_choice(&id, index);
+                                    }
+                                }
+                            },
+                            for (index, option_label) in intent.choices.iter().enumerate() {
+                                option {
+                                    key: "{option_label}",
+                                    value: "{index}",
+                                    selected: index == intent.selected,
+                                    "{option_label}"
+                                }
+                            }
+                        }
+                    }
+                } else if intent.toggle {
                     CheckRow {
                         key: "{intent.id}",
                         label: intent.label.clone(),
@@ -3707,6 +4053,32 @@ fn gpu_force_ui() -> Element {
                 }
             }
         }
+    }
+}
+
+fn gpu_force_ui() -> Element {
+    let opts: GpuForceOptions = typed_settings("gpu-force");
+    let repulsion_mode = opts.repulsion_mode;
+    let res = crate::panels::regimes::RESOLUTION.read().clone();
+    let (typed_edges, n_edges, n_nodes) = match &res {
+        Some(r) => (r.typed_edges, r.n_edges, r.n_nodes),
+        None => (0, 0, 0),
+    };
+    let untyped_edges = n_edges.saturating_sub(typed_edges);
+    let manifest = crate::panels::regimes::gpu_force_manifest();
+    // M1/M3: a control exists only where manifest ∧ live graph state agree.
+    let spring_len_owned = manifest
+        .iter()
+        .find(|d| d.id == "spring_len")
+        .is_some_and(|d| crate::panels::regimes::dim_owned_by_data(d, typed_edges, n_edges));
+    let backend_available = manifest
+        .iter()
+        .find(|d| d.id == "repulsion_mode")
+        .and_then(|d| d.min_nodes)
+        .is_some_and(|min| n_nodes >= min as usize);
+
+    rsx! {
+        {regime_surface()}
 
         hr { class: "lay-sep" }
 

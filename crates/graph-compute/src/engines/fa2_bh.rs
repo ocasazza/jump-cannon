@@ -39,7 +39,7 @@ use graph_layouts::{LayoutDescriptor, LayoutKind, LayoutRequirements};
 use serde::{Deserialize, Serialize};
 use wgpu::util::DeviceExt;
 
-use super::{CsrShard, EngineCtx, LayoutEngine, StepOutput};
+use super::{CsrShard, DimAnnotation, EngineCapabilityManifest, EngineCtx, LayoutEngine, StepOutput, manifest_from_settings};
 
 /// Stable registry key for this engine.
 pub const LAYOUT_ID: &str = "fa2-bh";
@@ -217,6 +217,22 @@ impl LayoutEngine for Fa2BhEngine {
             .map_err(|e| format!("decode fa2-bh settings: {e}"))?;
         self.settings = typed;
         Ok(())
+    }
+
+    fn capability_manifest(&self) -> Option<EngineCapabilityManifest> {
+        Some(manifest_from_settings(
+            &Fa2BhSettings::default(),
+            &[
+                DimAnnotation::note(
+                    "theta",
+                    "Barnes-Hut acceptance criterion: larger trades accuracy for speed",
+                ),
+                DimAnnotation::note(
+                    "max_displacement",
+                    "per-step clamp in layout units; 0 disables the clamp",
+                ),
+            ],
+        ))
     }
 
     fn init(

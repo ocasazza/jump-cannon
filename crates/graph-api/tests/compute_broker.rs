@@ -10,7 +10,9 @@
 //! the task summary and the in-process gRPC pattern in
 //! `graph-compute/tests/list_engines_grpc.rs`.
 
-use graph_api::compute_broker::{ComputeBroker, RemoteLayout};
+use graph_api::compute_broker::{
+    CapabilityDimensionView, ComputeBroker, EngineManifestView, ManifestUnavailable, RemoteLayout,
+};
 
 /// A disabled broker (never `connect`ed) reports the contract's graceful
 /// degraded shape: `connected:false`, empty `active`, no engines.
@@ -127,5 +129,101 @@ async fn reselect_errors_without_connect() {
     assert!(
         err.to_string().contains("not connected"),
         "error should explain the broker isn't connected, got: {err}"
+    );
+}
+
+/// A disabled broker cannot answer a manifest request at all — that is a
+/// deployment state (503), not "this engine has no manifest" (404).
+#[tokio::test]
+async fn engine_manifest_reports_a_disabled_broker() {
+    let broker = ComputeBroker::new();
+    let error = broker
+        .engine_manifest("fa2-bh")
+        .await
+        .expect_err("a disabled broker has no worker to ask");
+    assert_eq!(error, ManifestUnavailable::BrokerDisabled);
+    assert!(error.is_unavailable(), "maps to 503, not 404");
+    assert!(
+        error.reason().contains("compute broker disabled"),
+        "reason names the deployment cause: {}",
+        error.reason()
+    );
+}
+
+/// The two definite-"no manifest" cases map to 404 and must be
+/// distinguishable in the body: an engine that declares nothing is a
+/// different fact from an engine that does not exist.
+#[test]
+fn undeclared_and_unknown_engines_are_distinguishable_404s() {
+    let undeclared = ManifestUnavailable::Undeclared("geometric".to_string());
+    let unknown = ManifestUnavailable::UnknownEngine("nope".to_string());
+    assert!(!undeclared.is_unavailable() && !unknown.is_unavailable());
+    assert!(
+        undeclared.reason().contains("serves no capability manifest"),
+        "{}",
+        undeclared.reason()
+    );
+    assert!(
+        unknown.reason().contains("no engine"),
+        "{}",
+        unknown.reason()
+    );
+    assert_ne!(undeclared.reason(), unknown.reason());
+}
+
+/// FROZEN CONTRACT: the HTTP body is snake_case, with `owned_by` and
+/// `min_nodes` null-when-absent so a client can tell "no floor" from
+/// "floor 0" and "not data-owned" from an empty owner string.
+#[test]
+fn manifest_view_serializes_to_the_frozen_shape() {
+    let view = EngineManifestView {
+        engine: "fa2-bh".to_string(),
+        schema_version: 1,
+        execution: "live".to_string(),
+        dimensions: vec![
+            CapabilityDimensionView {
+                id: "scaling_ratio".to_string(),
+                label: "Scaling ratio".to_string(),
+                control: "absolute".to_string(),
+                owned_by: None,
+                note: String::new(),
+                min_nodes: None,
+            },
+            CapabilityDimensionView {
+                id: "edge_rest_len".to_string(),
+                label: "Edge rest len".to_string(),
+                control: "internal".to_string(),
+                owned_by: Some("uff bond table".to_string()),
+                note: "taken from typed data".to_string(),
+                min_nodes: Some(500),
+            },
+        ],
+    };
+    let json = serde_json::to_value(&view).expect("serializes");
+    assert_eq!(
+        json,
+        serde_json::json!({
+            "engine": "fa2-bh",
+            "schema_version": 1,
+            "execution": "live",
+            "dimensions": [
+                {
+                    "id": "scaling_ratio",
+                    "label": "Scaling ratio",
+                    "control": "absolute",
+                    "owned_by": null,
+                    "note": "",
+                    "min_nodes": null
+                },
+                {
+                    "id": "edge_rest_len",
+                    "label": "Edge rest len",
+                    "control": "internal",
+                    "owned_by": "uff bond table",
+                    "note": "taken from typed data",
+                    "min_nodes": 500
+                }
+            ]
+        })
     );
 }

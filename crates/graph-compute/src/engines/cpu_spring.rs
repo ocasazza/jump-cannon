@@ -13,7 +13,7 @@
 use graph_layouts::{LayoutDescriptor, LayoutKind, LayoutRequirements};
 use serde::{Deserialize, Serialize};
 
-use super::{CsrShard, EngineCtx, LayoutEngine, StepOutput};
+use super::{CsrShard, EngineCapabilityManifest, EngineCtx, LayoutEngine, StepOutput, manifest_from_settings};
 use crate::sim::{cpu_step, CsrGraph};
 
 /// Stable registry key for this engine.
@@ -94,6 +94,10 @@ impl LayoutEngine for CpuSpringEngine {
             .map_err(|e| format!("decode cpu-spring settings: {e}"))?;
         self.settings = typed;
         Ok(())
+    }
+
+    fn capability_manifest(&self) -> Option<EngineCapabilityManifest> {
+        Some(manifest_from_settings(&CpuSpringSettings::default(), &[]))
     }
 
     fn init(

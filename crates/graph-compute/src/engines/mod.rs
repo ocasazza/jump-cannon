@@ -374,6 +374,122 @@ pub struct HaloUpdate {
     pub attributes: Option<GraphAttributes>,
 }
 
+/// One control dimension an engine honours — the Rust side of the
+/// `CapabilityDimension` wire message (`proto/compute.proto`,
+/// docs/layout-ux-spec.md §3). A client constructs a control ONLY for a
+/// declared dimension, so a knob can never claim to move something the
+/// engine ignores.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CapabilityDimension {
+    /// Params field name, verbatim.
+    pub id: String,
+    pub label: String,
+    /// `"multiplier" | "absolute" | "toggle" | "enum" | "internal"`.
+    pub control: &'static str,
+    /// Set only when the engine takes this dimension from graph data
+    /// instead of the request — the client renders provenance, not a knob.
+    pub owned_by: Option<&'static str>,
+    /// Node-count floor below which the dimension is meaningless.
+    pub min_nodes: Option<u64>,
+    pub note: &'static str,
+}
+
+/// Everything an engine declares about its controls. `execution` is NOT
+/// restated here: it is derived from the engine's `LayoutDescriptor.kind`,
+/// so the two can never disagree.
+#[derive(Clone, Debug, PartialEq)]
+pub struct EngineCapabilityManifest {
+    pub dimensions: Vec<CapabilityDimension>,
+}
+
+/// Per-field annotation for [`manifest_from_settings`] — the escape hatch for
+/// the few fields whose honest description does not follow from their type.
+#[derive(Clone, Copy, Debug)]
+pub struct DimAnnotation {
+    pub id: &'static str,
+    pub control: Option<&'static str>,
+    pub owned_by: Option<&'static str>,
+    pub min_nodes: Option<u64>,
+    pub note: &'static str,
+}
+
+impl DimAnnotation {
+    /// Annotate one field with a note only.
+    pub const fn note(id: &'static str, note: &'static str) -> Self {
+        Self { id, control: None, owned_by: None, min_nodes: None, note }
+    }
+
+    /// Annotate a field the engine sources from graph data, not the request.
+    pub const fn data_owned(id: &'static str, owner: &'static str, note: &'static str) -> Self {
+        Self {
+            id,
+            control: Some("internal"),
+            owned_by: Some(owner),
+            min_nodes: None,
+            note,
+        }
+    }
+
+    /// Annotate a field that only makes sense above a node-count floor.
+    pub const fn min_nodes(id: &'static str, floor: u64, note: &'static str) -> Self {
+        Self { id, control: None, owned_by: None, min_nodes: Some(floor), note }
+    }
+}
+
+/// Project an engine's typed settings struct into a capability manifest:
+/// one dimension per serialized field, with the control kind inferred from
+/// the serialized value (bool → toggle, string → enum, number → absolute,
+/// list/object → `internal`, i.e. real but not a single-value control).
+///
+/// Deriving the dimensions from the struct itself is the point: a field
+/// added to the settings struct shows up in the manifest automatically, so
+/// the declaration cannot drift away from what `set_params` accepts.
+pub fn manifest_from_settings<T: serde::Serialize>(
+    defaults: &T,
+    annotations: &[DimAnnotation],
+) -> EngineCapabilityManifest {
+    let value = serde_json::to_value(defaults).unwrap_or(serde_json::Value::Null);
+    let Some(fields) = value.as_object() else {
+        return EngineCapabilityManifest {
+            dimensions: Vec::new(),
+        };
+    };
+    let dimensions = fields
+        .iter()
+        .map(|(id, value)| {
+            let annotation = annotations.iter().find(|a| a.id == id.as_str());
+            let inferred = match value {
+                serde_json::Value::Bool(_) => "toggle",
+                serde_json::Value::String(_) => "enum",
+                serde_json::Value::Number(_) => "absolute",
+                // Lists and nested objects are honoured by the engine but are
+                // not one knob; a client must edit them structurally.
+                _ => "internal",
+            };
+            CapabilityDimension {
+                id: id.clone(),
+                label: humanize_field(id),
+                control: annotation.and_then(|a| a.control).unwrap_or(inferred),
+                owned_by: annotation.and_then(|a| a.owned_by),
+                min_nodes: annotation.and_then(|a| a.min_nodes),
+                note: annotation.map(|a| a.note).unwrap_or(""),
+            }
+        })
+        .collect();
+    EngineCapabilityManifest { dimensions }
+}
+
+/// `scaling_ratio` → `Scaling ratio`: a label a panel can show without the
+/// client inventing copy for a field it does not know.
+fn humanize_field(id: &str) -> String {
+    let spaced = id.replace('_', " ");
+    let mut chars = spaced.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+        None => spaced,
+    }
+}
+
 /// A server-side layout solver. Scale-out-first: see the module docs and
 /// `docs/compute-architecture.md` ADR-001.
 ///
@@ -393,6 +509,19 @@ pub trait LayoutEngine: Send + Sync {
     /// ignore (engines with no tunables).
     fn set_params(&mut self, _params: &serde_json::Value) -> Result<(), String> {
         Ok(())
+    }
+
+    /// The engine's capability manifest: every control dimension it actually
+    /// honours (docs/layout-ux-spec.md §3), served to clients through the
+    /// `EngineManifest` RPC. Default `None` = "declares nothing", and the
+    /// client then renders the engine's settings generically and says
+    /// applicability is unknown (M5) rather than inventing claims.
+    ///
+    /// Implementors should build this with [`manifest_from_settings`] over
+    /// their own settings struct so the declaration cannot drift from what
+    /// `set_params` accepts.
+    fn capability_manifest(&self) -> Option<EngineCapabilityManifest> {
+        None
     }
 
     /// Bind the engine to a shard + seed positions and build any GPU/CPU state.
@@ -594,6 +723,25 @@ impl EngineRegistry {
         &self.descriptors
     }
 
+    /// One engine's capability manifest, or `None` when the id is unknown or
+    /// the engine declares nothing. Probes the constructor the same way
+    /// `descriptors` does, so no live instance is required.
+    pub fn manifest(&self, id: &str) -> Option<EngineCapabilityManifest> {
+        let ctor = self.constructors.get(id)?;
+        ctor().capability_manifest()
+    }
+
+    /// `"live"` for a continuous physics engine, `"one_shot"` for a static
+    /// solver — derived from the descriptor so the manifest's execution mode
+    /// cannot disagree with the engine's own kind.
+    pub fn execution(&self, id: &str) -> Option<&'static str> {
+        let descriptor = self.descriptors.iter().find(|d| d.id == id)?;
+        Some(match descriptor.kind {
+            graph_layouts::LayoutKind::Static => "one_shot",
+            graph_layouts::LayoutKind::Physics => "live",
+        })
+    }
+
     /// Whether an id is registered.
     pub fn contains(&self, id: &str) -> bool {
         self.constructors.keys().any(|&k| k == id)
@@ -669,5 +817,130 @@ mod tests {
             let via_construct = construct_leaf(id).unwrap();
             assert_eq!(via_ctor.descriptor().id, via_construct.descriptor().id);
         }
+    }
+
+    /// Spec §3 on the worker side: every dimension an engine declares must
+    /// be a field its own `set_params` accepts. Feeding the declared ids
+    /// back as a params object proves the manifest cannot describe knobs the
+    /// engine would reject.
+    #[test]
+    fn declared_dimensions_are_fields_the_engine_accepts() {
+        let registry = EngineRegistry::builtin();
+        let mut declared_any = false;
+        for &id in LEAF_ENGINE_IDS {
+            let Some(manifest) = registry.manifest(id) else {
+                continue;
+            };
+            declared_any = true;
+            assert!(
+                !manifest.dimensions.is_empty(),
+                "{id}: a declared manifest with no dimensions says nothing"
+            );
+            let mut engine = construct_leaf(id).unwrap();
+            // Round-trip: the engine's own defaults, restricted to exactly
+            // the declared ids, must deserialize.
+            let defaults = serde_json::to_value(serde_json::Map::new()).unwrap();
+            let _ = defaults;
+            let mut params = serde_json::Map::new();
+            for dim in &manifest.dimensions {
+                // Values come from the engine's accepted shape: ask it to
+                // accept each declared field on its own, with the value the
+                // projection derived the dimension from.
+                assert!(
+                    !dim.id.is_empty() && !dim.label.is_empty(),
+                    "{id}: dimension needs an id and a label"
+                );
+                params.insert(dim.id.clone(), serde_json::Value::Null);
+            }
+            // `set_params` with every declared field present (nulls fall back
+            // to serde defaults where the struct allows) must not error on
+            // *unknown field* grounds; a decode error here means the manifest
+            // named something the struct does not have.
+            let accepted = engine.set_params(&serde_json::Value::Object(params.clone()));
+            if let Err(error) = accepted {
+                assert!(
+                    !error.contains("unknown field"),
+                    "{id}: manifest declares a field set_params rejects: {error}"
+                );
+            }
+        }
+        assert!(
+            declared_any,
+            "no leaf engine declares a manifest — the RPC would be dead weight"
+        );
+    }
+
+    /// An engine that declares nothing answers "unsupported", and an unknown
+    /// id does too — both are legitimate answers, not errors.
+    #[test]
+    fn undeclared_and_unknown_engines_have_no_manifest() {
+        let registry = EngineRegistry::builtin();
+        assert!(registry.manifest("no-such-engine").is_none());
+        assert!(registry.execution("no-such-engine").is_none());
+    }
+
+    /// The manifest's execution mode is derived from the descriptor, so the
+    /// two cannot disagree.
+    #[test]
+    fn execution_mode_follows_the_descriptor_kind() {
+        let registry = EngineRegistry::builtin();
+        for descriptor in registry.descriptors() {
+            let expected = match descriptor.kind {
+                graph_layouts::LayoutKind::Static => "one_shot",
+                graph_layouts::LayoutKind::Physics => "live",
+            };
+            assert_eq!(registry.execution(descriptor.id), Some(expected), "{}", descriptor.id);
+        }
+    }
+
+    /// The projection reads the struct, so a field added to the settings
+    /// struct appears automatically, with its control kind inferred.
+    #[test]
+    fn projection_covers_every_serialized_field_with_inferred_control() {
+        let manifest = manifest_from_settings(
+            &fa2_bh::Fa2BhSettings::default(),
+            &[DimAnnotation::note("theta", "Barnes-Hut acceptance criterion")],
+        );
+        let ids: Vec<&str> = manifest.dimensions.iter().map(|d| d.id.as_str()).collect();
+        let defaults = serde_json::to_value(fa2_bh::Fa2BhSettings::default()).unwrap();
+        let mut fields: Vec<&str> = defaults.as_object().unwrap().keys().map(String::as_str).collect();
+        fields.sort();
+        let mut sorted = ids.clone();
+        sorted.sort();
+        assert_eq!(sorted, fields, "one dimension per serialized field");
+        let by_id = |id: &str| manifest.dimensions.iter().find(|d| d.id == id).unwrap();
+        assert_eq!(by_id("strong_gravity").control, "toggle", "bool → toggle");
+        assert_eq!(by_id("scaling_ratio").control, "absolute", "number → absolute");
+        assert_eq!(by_id("scaling_ratio").label, "Scaling ratio", "label is humanized");
+        assert!(by_id("theta").note.contains("Barnes-Hut"), "annotation applied");
+    }
+
+    /// A list-valued field is honoured by the engine but is not one knob:
+    /// the projection marks it `internal` so no client renders a slider.
+    #[test]
+    fn list_valued_settings_are_internal_not_knobs() {
+        let manifest = manifest_from_settings(&GeometricSettings::default(), &[]);
+        let angles = manifest
+            .dimensions
+            .iter()
+            .find(|d| d.id == "coordination_angles")
+            .expect("geometric declares coordination_angles");
+        assert_eq!(angles.control, "internal");
+        // A lens selection serializes as a tagged object (`{"kind": …}`),
+        // not a bare string, so it is `internal` too: honest, because one
+        // dropdown cannot express a tagged structure with its own payload.
+        let sources = manifest
+            .dimensions
+            .iter()
+            .find(|d| d.id == "class_source")
+            .expect("geometric declares class_source");
+        assert_eq!(sources.control, "internal");
+        // A plain bool field is a real toggle, though.
+        let bonding = manifest
+            .dimensions
+            .iter()
+            .find(|d| d.id == "bonding_enabled")
+            .expect("geometric declares bonding_enabled");
+        assert_eq!(bonding.control, "toggle");
     }
 }

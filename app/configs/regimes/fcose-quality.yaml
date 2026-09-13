@@ -1,0 +1,23 @@
+# fCoSE — a ONE-SHOT solver regime (execution: one_shot). The engine runs
+# when the user presses Solve and then stops; there is no sim to cool, damp,
+# or halt, so this regime declares no live-sim option (R1) and the panel
+# renders no live-sim rows for it (UI6).
+#
+# The quality enum is the honest shape for a solver knob: the engine's own
+# `quality` field selects a fixed iteration budget (draft 30 / default 50 /
+# proof 100 sweeps inside fcose.rs), so the control declares the three values
+# it maps to rather than exposing an iteration count the engine derives.
+id: fcose-quality
+schema_version: 1
+label: "fCoSE · one-shot"
+description: "Compound-spring solver: pick a quality budget, press Solve."
+engine: fcose
+execution: one_shot
+applicability: {}
+options: {}
+controls:
+  - id: quality
+    kind: enum
+    label: "Quality"
+    options: [draft, default, proof]
+    maps_to: { quality: ["draft", "default", "proof"] }

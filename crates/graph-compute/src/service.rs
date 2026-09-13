@@ -28,8 +28,9 @@ use crate::engines::GraphAttributes as HostGraphAttributes;
 use crate::partition::HaloDelta as HostHaloDelta;
 use crate::proto::compute_server::Compute;
 use crate::proto::{
-    CoarsenSettings, EngineDescriptor, FocusRequest, GraphAttributes as ProtoGraphAttributes,
-    HaloDelta, HealthRequest, HealthResponse, HybridFrame, ListEnginesRequest, ListEnginesResponse,
+    CapabilityDimension, CoarsenSettings, EngineDescriptor, EngineManifestRequest,
+    EngineManifestResponse, FocusRequest, GraphAttributes as ProtoGraphAttributes, HaloDelta,
+    HealthRequest, HealthResponse, HybridFrame, ListEnginesRequest, ListEnginesResponse,
     LoadGraphRequest, LoadGraphResponse, PositionDelta, SubscribeRequest,
 };
 use crate::sim::{CsrGraph, SimState};
@@ -345,6 +346,45 @@ impl Compute for ComputeService {
         Ok(Response::new(ListEnginesResponse {
             engines,
             default_id: self.state.registry.default_id().to_string(),
+        }))
+    }
+
+    /// Capability manifest for ONE engine (docs/layout-ux-spec.md §3). An
+    /// unknown id or an engine that declares nothing answers
+    /// `supported: false` — not a gRPC error: "this engine says nothing
+    /// about its controls" is a legitimate answer the client handles by
+    /// rendering its settings generically (M5).
+    async fn engine_manifest(
+        &self,
+        req: Request<EngineManifestRequest>,
+    ) -> Result<Response<EngineManifestResponse>, Status> {
+        let engine_id = req.into_inner().engine_id;
+        let Some(manifest) = self.state.registry.manifest(&engine_id) else {
+            return Ok(Response::new(EngineManifestResponse::default()));
+        };
+        let execution = self
+            .state
+            .registry
+            .execution(&engine_id)
+            .unwrap_or("live")
+            .to_string();
+        Ok(Response::new(EngineManifestResponse {
+            supported: true,
+            engine: engine_id,
+            schema_version: 1,
+            execution,
+            dimensions: manifest
+                .dimensions
+                .into_iter()
+                .map(|d| CapabilityDimension {
+                    id: d.id,
+                    label: d.label,
+                    control: d.control.to_string(),
+                    owned_by: d.owned_by.unwrap_or_default().to_string(),
+                    note: d.note.to_string(),
+                    min_nodes: d.min_nodes.unwrap_or(0),
+                })
+                .collect(),
         }))
     }
 

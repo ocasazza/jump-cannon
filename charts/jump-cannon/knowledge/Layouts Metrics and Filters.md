@@ -42,7 +42,7 @@ The Layout tab's parameter surface is being redesigned around capability-honest
 regimes: named YAML regimes resolve from the loaded graph, engine capability
 manifests decide which controls exist, and data-owned simulation dimensions
 (UFF-typed bonds/atoms) render as provenance capsules instead of live knobs.
-**Phases 1–3 have landed.** The registry is six YAML regimes under
+**Phases 1–4 have landed.** The registry is six YAML regimes under
 `app/configs/regimes/`: `molecular-uff`, `vault-large`, `vault-small`
 (catch-all), and the migrated `fast` / `balanced` / `pretty` presets
 (`auto: false` — picker-only, so they never hijack automatic resolution).
@@ -77,9 +77,21 @@ The three measured defects, the registry schema, and the kaizen phasing live in
 `docs/layout-ux.md` (normative engineering spec plus implementation-drift
 changelog: `docs/layout-ux-spec.md`); the molecular force details (repulsion
 mixes via √(wᵢ×wⱼ), `seed_mode: none` keeps authored coordinates) are in
-`docs/molecular-force-layout.md`. Remaining: phase 4 (remote/static regimes — broker-served capability
-manifests, `execution: one_shot` rendering, and a generic fallback form for
-engines that serve no manifest).
+`docs/molecular-force-layout.md`. Remote and static engines are covered too. A graph-compute engine now serves
+its own capability manifest over gRPC (`EngineManifest`, projected from the
+engine's settings struct so it cannot drift), graph-api exposes it at
+`GET /compute/engines/<id>/manifest`, and the panel builds that engine's
+controls from the declaration — filtered by the same rules as the local
+engine, with manifest-declared values riding the existing `params` bag on
+`PUT /compute/layout`. An engine that declares nothing keeps the honest
+`settings as declared by <engine> — applicability unknown` header. One-shot
+solvers (`execution: one_shot`, e.g. the `fcose-quality` regime) render the
+regime surface, a declared quality choice, and a `last solved` line, with no
+live-sim rows at all.
+
+Backlog (needs its own justification): a global geometry scale over typed
+rests — an engine change, not a UI one — and generating the gpu-force
+manifest from the options struct instead of hand-checking it.
 
 The command palette's existing Go to Layout, Go to Style, and Go to Camera
 actions open Settings on the corresponding tab. Existing Layout, Style, and

@@ -88,6 +88,10 @@ fn api_routes() -> Router<SourceHost> {
         .route("/search/rich", get(search_rich))
         .route("/compute/health", get(compute_health))
         .route("/compute/engines", get(compute_engines))
+        .route(
+            "/compute/engines/{id}/manifest",
+            get(compute_engine_manifest),
+        )
         .route("/compute/layout", put(compute_layout_put))
         .route(
             "/compute/session",
@@ -595,6 +599,37 @@ async fn compute_engines(selection: DefaultSource) -> impl IntoResponse {
     let s = selection.0;
     let view = s.inner.compute_broker.list_engines().await;
     axum::Json(view)
+}
+
+/// `GET /compute/engines/:id/manifest` (FROZEN CONTRACT). One engine's
+/// capability manifest, straight from the worker: the control dimensions
+/// that engine actually honours (docs/layout-ux-spec.md §3), so a client
+/// builds controls from the engine's own declaration instead of guessing.
+///
+/// 404 when the answer is a definite "there is no manifest" — the engine
+/// declares none, or no such engine is advertised; the body distinguishes
+/// them. 503 when the deployment cannot answer at all (broker disabled or
+/// worker unreachable). Default-source only, like every `/compute/*` route.
+async fn compute_engine_manifest(
+    selection: DefaultSource,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    let s = selection.0;
+    match s.inner.compute_broker.engine_manifest(&id).await {
+        Ok(view) => (StatusCode::OK, axum::Json(view)).into_response(),
+        Err(error) => {
+            let status = if error.is_unavailable() {
+                StatusCode::SERVICE_UNAVAILABLE
+            } else {
+                StatusCode::NOT_FOUND
+            };
+            (
+                status,
+                axum::Json(serde_json::json!({ "error": error.reason() })),
+            )
+                .into_response()
+        }
+    }
 }
 
 /// `PUT /compute/layout` (FROZEN CONTRACT). Switches the active remote

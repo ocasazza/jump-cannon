@@ -20,8 +20,8 @@ use tonic::transport::Channel;
 
 use graph_compute::proto::compute_client::ComputeClient;
 use graph_compute::proto::{
-    GraphAttributes as ProtoGraphAttributes, HealthRequest, ListEnginesRequest, LoadGraphRequest,
-    PositionDelta, SubscribeRequest,
+    EngineManifestRequest, GraphAttributes as ProtoGraphAttributes, HealthRequest,
+    ListEnginesRequest, LoadGraphRequest, PositionDelta, SubscribeRequest,
 };
 use graph_compute::service::json_to_struct;
 use graph_layouts::geometric::LensConfig;
@@ -481,6 +481,74 @@ impl ComputeBroker {
     /// disabled (no URL configured) or the dial/RPC fails, returns
     /// `{ connected: false, active: "", engines: [] }` rather than an error,
     /// so the renderer's picker shows a disabled hint instead of breaking.
+    /// One engine's capability manifest (docs/layout-ux-spec.md §3), fetched
+    /// from the worker. Dialing mirrors [`Self::list_engines`]; unlike that
+    /// endpoint there is no degraded-but-valid view to return, so every
+    /// failure mode is named explicitly for the HTTP layer to map.
+    pub async fn engine_manifest(
+        &self,
+        engine_id: &str,
+    ) -> Result<EngineManifestView, ManifestUnavailable> {
+        let url = match self.inner.url.read().await.clone() {
+            Some(u) => u,
+            None => return Err(ManifestUnavailable::BrokerDisabled),
+        };
+        let endpoint = Channel::from_shared(url.clone()).map_err(|e| {
+            tracing::warn!("compute broker invalid url {url} for EngineManifest: {e}");
+            ManifestUnavailable::WorkerUnreachable(format!("invalid worker url: {e}"))
+        })?;
+        let channel = endpoint.connect().await.map_err(|e| {
+            tracing::warn!(url = %url, "EngineManifest dial failed: {e}");
+            ManifestUnavailable::WorkerUnreachable(format!("dial failed: {e}"))
+        })?;
+        let mut client = ComputeClient::new(channel);
+        let resp = client
+            .engine_manifest(EngineManifestRequest {
+                engine_id: engine_id.to_string(),
+            })
+            .await
+            .map_err(|e| {
+                tracing::warn!(url = %url, "EngineManifest RPC failed: {e}");
+                ManifestUnavailable::WorkerUnreachable(format!("rpc failed: {e}"))
+            })?
+            .into_inner();
+
+        if !resp.supported {
+            // The worker answers `supported: false` for both "no such
+            // engine" and "this engine declares nothing" — ask the engine
+            // list which one it is so the client gets a true reason.
+            let known = self
+                .list_engines()
+                .await
+                .engines
+                .iter()
+                .any(|e| e.id == engine_id);
+            return Err(if known {
+                ManifestUnavailable::Undeclared(engine_id.to_string())
+            } else {
+                ManifestUnavailable::UnknownEngine(engine_id.to_string())
+            });
+        }
+
+        Ok(EngineManifestView {
+            engine: resp.engine,
+            schema_version: resp.schema_version,
+            execution: resp.execution,
+            dimensions: resp
+                .dimensions
+                .into_iter()
+                .map(|d| CapabilityDimensionView {
+                    id: d.id,
+                    label: d.label,
+                    control: d.control,
+                    owned_by: (!d.owned_by.is_empty()).then_some(d.owned_by),
+                    note: d.note,
+                    min_nodes: (d.min_nodes > 0).then_some(d.min_nodes),
+                })
+                .collect(),
+        })
+    }
+
     pub async fn list_engines(&self) -> EnginesView {
         let selection = self.inner.selection.read().await.clone();
         let active = selection.layout.layout_id;
@@ -611,6 +679,68 @@ pub struct EngineView {
     pub display_name: String,
     pub description: String,
     pub kind: String,
+}
+
+/// JSON body for `GET /compute/engines/:id/manifest` (FROZEN CONTRACT):
+/// `{ "engine": "fa2-bh", "schema_version": 1, "execution": "live",
+/// "dimensions": [ … ] }`. Mirrors the gRPC `EngineManifestResponse` minus
+/// the `supported` discriminator, which the HTTP status carries instead.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct EngineManifestView {
+    pub engine: String,
+    pub schema_version: u32,
+    /// `"live"` | `"one_shot"`.
+    pub execution: String,
+    pub dimensions: Vec<CapabilityDimensionView>,
+}
+
+/// One declared control dimension (FROZEN CONTRACT). `owned_by` is `null`
+/// unless the engine sources that dimension from data rather than the
+/// request; `min_nodes` is `null` when the dimension always applies.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct CapabilityDimensionView {
+    pub id: String,
+    pub label: String,
+    /// `"multiplier" | "absolute" | "toggle" | "enum" | "internal"`.
+    pub control: String,
+    pub owned_by: Option<String>,
+    pub note: String,
+    pub min_nodes: Option<u64>,
+}
+
+/// Why a manifest could not be served. The HTTP layer maps
+/// `BrokerDisabled`/`WorkerUnreachable` to 503 (the deployment cannot
+/// answer) and `Undeclared`/`UnknownEngine` to 404 (the answer is "there is
+/// none"), each with a reason that distinguishes the two.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ManifestUnavailable {
+    BrokerDisabled,
+    WorkerUnreachable(String),
+    Undeclared(String),
+    UnknownEngine(String),
+}
+
+impl ManifestUnavailable {
+    pub fn reason(&self) -> String {
+        match self {
+            Self::BrokerDisabled => {
+                "compute broker disabled (no --compute-url / JUMP_CANNON_COMPUTE_URL)".to_string()
+            }
+            Self::WorkerUnreachable(detail) => format!("compute worker unreachable: {detail}"),
+            Self::Undeclared(id) => {
+                format!("engine {id:?} serves no capability manifest")
+            }
+            Self::UnknownEngine(id) => {
+                format!("no engine {id:?} is advertised by the compute worker")
+            }
+        }
+    }
+
+    /// True when the deployment cannot answer right now (503) rather than
+    /// the answer being a definite "no manifest" (404).
+    pub fn is_unavailable(&self) -> bool {
+        matches!(self, Self::BrokerDisabled | Self::WorkerUnreachable(_))
+    }
 }
 
 impl Default for ComputeBroker {

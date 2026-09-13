@@ -48,7 +48,7 @@
 use graph_layouts::{LayoutDescriptor, LayoutKind, LayoutRequirements};
 use serde::{Deserialize, Serialize};
 
-use super::{CsrShard, EngineCtx, LayoutEngine, StepOutput};
+use super::{CsrShard, DimAnnotation, EngineCapabilityManifest, EngineCtx, LayoutEngine, StepOutput, manifest_from_settings};
 use crate::sim::CsrGraph;
 
 /// Stable registry key for this engine.
@@ -238,6 +238,16 @@ impl LayoutEngine for SgdStressEngine {
             .map_err(|e| format!("decode sgd-stress settings: {e}"))?;
         self.settings = typed;
         Ok(())
+    }
+
+    fn capability_manifest(&self) -> Option<EngineCapabilityManifest> {
+        Some(manifest_from_settings(
+            &SgdStressSettings::default(),
+            &[DimAnnotation::note(
+                "seed",
+                "pivot-selection seed: fixed so a run is reproducible",
+            )],
+        ))
     }
 
     fn init(
