@@ -4,10 +4,12 @@
 //! (wgpu's WebGPU backend). No rendering — this is a layout engine; the
 //! consumer reads positions out and renders them however it likes.
 //!
-//! Algorithm: O(n^2) repulsion + CSR-adjacency springs + gravity + cursor.
-//! Verlet-ish integration with velocity damping. Designed to step
-//! incrementally — caller picks `steps_per_call` and runs `run()` each
-//! frame (or as desired).
+//! Repulsion backends: exact O(n²), Barnes-Hut octree, or negative
+//! sampling (see [`RepulsionMode`]); force laws: spring-electrical or
+//! t-FDP (see [`ForceModel`]); CSR-adjacency attraction over Tigr virtual
+//! vertices; gravity + cursor; semi-implicit Euler with velocity damping.
+//! Designed to step incrementally — caller picks `steps_per_call` and runs
+//! `run()` each frame (or as desired).
 
 use crate::types::Graph;
 use std::borrow::Cow;
@@ -56,34 +58,73 @@ impl Default for EnergyReadback {
 
 // ---------- Public API -------------------------------------------------------
 
-/// Repulsion backend selection. The grid path is the legacy 27-cell
-/// uniform-voxel sweep; the Barnes-Hut path walks a host-built octree
-/// with stackless rope traversal in the WGSL shader.
+/// Repulsion backend selection.
 ///
-/// Default = Grid: BH only wins decisively at N≥50k or in highly
-/// clustered graphs where one voxel collects hundreds of bodies. At
-/// N≤10k uniform synthetic vaults the grid is competitive. Flip the
-/// default once benchmarks on real Obsidian vaults justify it.
+/// * `Exact` — every node visits every other node. O(n²) per step; the
+///   reference implementation the other two are measured against. Fine
+///   below a few thousand nodes.
+/// * `BarnesHut` — host-built octree, stackless rope traversal in WGSL.
+///   Default: best visual result on clustered graphs (hubs + long tails).
+/// * `NegativeSampling` — K random partners per node per step. O(n·K);
+///   the only backend whose cost is independent of spatial density, so
+///   it is the large-graph path. Pair with `ForceModel::TFdp` for the
+///   SNAP-tFDP estimator (arXiv:2608.01907).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RepulsionMode {
-    Grid,
+    Exact,
     BarnesHut,
-    /// DRGraph-style stochastic repulsion: each node samples K random
-    /// others per step instead of visiting spatial neighbors. Skips the
-    /// grid build entirely → ~3-5× cheaper per step at N ≥ 10k. Higher
-    /// per-step variance, converges in ~2× the iterations, but per-iter
-    /// is so much cheaper that wall time wins. arxiv.org/abs/2008.07799
     NegativeSampling,
 }
 
 impl Default for RepulsionMode {
-    // BH is the default: it gives the best visual result on general
-    // clustered graphs (the common case for Obsidian vaults — a few hubs
-    // + long sparse tails). Grid is fine for dense small graphs but
-    // collapses voxels on highly-clustered inputs; NS converges faster
-    // on huge graphs but adds visible per-step variance. BH is the
-    // honest middle ground for a fresh-install default.
     fn default() -> Self { RepulsionMode::BarnesHut }
+}
+
+/// Pairwise force law shared by the spring and repulsion kernels.
+///
+/// * `SpringElectrical` — Hooke springs with rest length `spring_len`
+///   plus Coulomb `repulsion · m_j / d²` repulsion. The historical model.
+/// * `TFdp` — Student-t forces from t-FDP (Zhong et al., TVCG 2023,
+///   arXiv:2303.03964). With `r = d / spring_len`:
+///   attraction `α (r + β r / (1 + r²))`, repulsion `r / (1 + r²)^γ`.
+///   Bounded at short range (no `1/d²` blow-up, so no velocity clamp
+///   fights) and `r^(1-2γ)` at long range. Under `NegativeSampling` the
+///   repulsion is degree-weighted by `(d_i + d_j) / 2` — the expectation
+///   SNAP-tFDP (arXiv:2608.01907, eq. 6) proves its edge-centric sampler
+///   optimises — and scaled by `tfdp_k`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ForceModel {
+    SpringElectrical,
+    TFdp,
+}
+
+impl Default for ForceModel {
+    fn default() -> Self { ForceModel::SpringElectrical }
+}
+
+impl ForceModel {
+    fn as_u32(self) -> u32 {
+        match self {
+            ForceModel::SpringElectrical => 0,
+            ForceModel::TFdp => 1,
+        }
+    }
+    /// Unknown strings fall back to the default rather than to a
+    /// specific variant, so a stale persisted value can never silently
+    /// select a non-default force law.
+    fn from_str(s: &str) -> Self {
+        match s.to_ascii_lowercase().as_str() {
+            "t_fdp" | "tfdp" | "t-fdp" => ForceModel::TFdp,
+            "spring_electrical" | "spring" => ForceModel::SpringElectrical,
+            _ => ForceModel::default(),
+        }
+    }
+    fn to_str(self) -> &'static str {
+        match self {
+            ForceModel::SpringElectrical => "spring_electrical",
+            ForceModel::TFdp => "t_fdp",
+        }
+    }
 }
 
 /// How the force-directed sim seeds its initial node positions.
@@ -144,21 +185,25 @@ impl SeedMode {
 impl RepulsionMode {
     fn as_u32(self) -> u32 {
         match self {
-            RepulsionMode::Grid => 0,
+            RepulsionMode::Exact => 0,
             RepulsionMode::BarnesHut => 1,
             RepulsionMode::NegativeSampling => 2,
         }
     }
+    /// Unknown strings (including the retired `"grid"`) fall back to the
+    /// default backend. Falling back to `Exact` here would silently put a
+    /// stale localStorage value onto the O(n²) path.
     fn from_str(s: &str) -> Self {
         match s.to_ascii_lowercase().as_str() {
+            "exact" | "naive" => RepulsionMode::Exact,
             "barneshut" | "barnes_hut" | "bh" => RepulsionMode::BarnesHut,
             "negativesampling" | "negative_sampling" | "ns" => RepulsionMode::NegativeSampling,
-            _ => RepulsionMode::Grid,
+            _ => RepulsionMode::default(),
         }
     }
     fn to_str(self) -> &'static str {
         match self {
-            RepulsionMode::Grid => "grid",
+            RepulsionMode::Exact => "exact",
             RepulsionMode::BarnesHut => "barnes_hut",
             RepulsionMode::NegativeSampling => "negative_sampling",
         }
@@ -183,8 +228,7 @@ pub struct GpuForceOptions {
     pub cursor_strength: f32,
     pub steps_per_call: u32,
     /// Per-pair distance clip on repulsion. <=0 means "no clip" (full O(n^2)
-    /// attractor at infinity). With grid_enabled this also lets us skip
-    /// far-cell pairs cheaply. Default = 4 * spring_len = 120.
+    /// attractor at infinity). Default = 4 * spring_len = 1600.
     pub repulsion_radius: f32,
     /// Geometric per-call cooling factor applied to `effective_damping`.
     /// 1.0 = no cooling. 0.997 cools toward `cooling_floor` over a few
@@ -220,13 +264,7 @@ pub struct GpuForceOptions {
     /// Average kinetic-energy threshold below which we consider the layout
     /// converged and short-circuit further dispatches. 0 disables.
     pub energy_threshold: f32,
-    /// Whether to use the spatial-hash grid. Default true. Disable for
-    /// correctness comparison or for tiny graphs where the grid build
-    /// dominates. Ignored when `repulsion_mode == BarnesHut`.
-    pub grid_enabled: bool,
-    /// Repulsion backend. Default Grid for back-compat; BarnesHut wins
-    /// on large clustered graphs where one voxel collects hundreds of
-    /// bodies (real Obsidian vaults with hub neighborhoods).
+    /// Repulsion backend. See [`RepulsionMode`].
     pub repulsion_mode: RepulsionMode,
     /// Initial-position seeder. Default `Random` for back-compat. Pick
     /// `TopoFisheye` to seed from the §4 multilevel coarsening pipeline.
@@ -238,6 +276,18 @@ pub struct GpuForceOptions {
     /// K — random samples per node per step under `NegativeSampling`.
     /// DRGraph reports good convergence at K in [5, 20]; default 8.
     pub repulsion_samples: u32,
+    /// Pairwise force law. See [`ForceModel`].
+    pub force_model: ForceModel,
+    /// t-FDP attraction gain α. Paper default 0.1.
+    pub tfdp_alpha: f32,
+    /// t-FDP short-range attraction boost β. Paper default 8.
+    pub tfdp_beta: f32,
+    /// t-FDP repulsion decay exponent γ. Paper default 2.
+    pub tfdp_gamma: f32,
+    /// SNAP-tFDP negative-sample weight k (relative repulsion strength
+    /// under `NegativeSampling` + `TFdp`). Paper recommends 3: k=1 over-
+    /// contracts clusters, gains saturate above 3.
+    pub tfdp_k: f32,
 }
 
 impl GpuForceOptions {
@@ -272,7 +322,11 @@ impl GpuForceOptions {
             cooling_alpha,
             cooling_floor,
             energy_threshold,
-            grid_enabled,
+            force_model,
+            tfdp_alpha,
+            tfdp_beta,
+            tfdp_gamma,
+            tfdp_k,
             repulsion_mode,
             seed_mode,
             theta,
@@ -293,7 +347,11 @@ impl GpuForceOptions {
             cooling_alpha: o_cooling_alpha,
             cooling_floor: o_cooling_floor,
             energy_threshold: o_energy_threshold,
-            grid_enabled: o_grid_enabled,
+            force_model: o_force_model,
+            tfdp_alpha: o_tfdp_alpha,
+            tfdp_beta: o_tfdp_beta,
+            tfdp_gamma: o_tfdp_gamma,
+            tfdp_k: o_tfdp_k,
             repulsion_mode: o_repulsion_mode,
             seed_mode: o_seed_mode,
             theta: o_theta,
@@ -310,7 +368,11 @@ impl GpuForceOptions {
             && cooling_alpha.to_bits()    == o_cooling_alpha.to_bits()
             && cooling_floor.to_bits()    == o_cooling_floor.to_bits()
             && energy_threshold.to_bits() == o_energy_threshold.to_bits()
-            && grid_enabled               == o_grid_enabled
+            && force_model                == o_force_model
+            && tfdp_alpha.to_bits()       == o_tfdp_alpha.to_bits()
+            && tfdp_beta.to_bits()        == o_tfdp_beta.to_bits()
+            && tfdp_gamma.to_bits()       == o_tfdp_gamma.to_bits()
+            && tfdp_k.to_bits()           == o_tfdp_k.to_bits()
             && repulsion_mode             == o_repulsion_mode
             && seed_mode                  == o_seed_mode
             && theta.to_bits()            == o_theta.to_bits()
@@ -364,9 +426,8 @@ impl Default for GpuForceOptions {
             // Spread-friendly defaults: real Obsidian vaults are big
             // (10k+ nodes, dense hub clusters) so the sim needs strong
             // repulsion + long springs to keep communities legible.
-            // repulsion_radius scales with spring_len so the spatial-hash
-            // grid actually exposes the long-range repulsion the layout
-            // needs (4× spring_len = 4 voxels of reach).
+            // repulsion_radius = 4 × spring_len bounds the long-range
+            // repulsion every backend pays for.
             repulsion: 4000.0,
             spring_k: 1.0,
             spring_len: 400.0,
@@ -381,11 +442,15 @@ impl Default for GpuForceOptions {
             cooling_alpha: 0.997,
             cooling_floor: 0.55,
             energy_threshold: 0.05,
-            grid_enabled: true,
             repulsion_mode: RepulsionMode::default(),
             seed_mode: SeedMode::default(),
             theta: 0.7,
             repulsion_samples: 8,
+            force_model: ForceModel::default(),
+            tfdp_alpha: 0.1,
+            tfdp_beta: 8.0,
+            tfdp_gamma: 2.0,
+            tfdp_k: 3.0,
         }
     }
 }
@@ -396,7 +461,7 @@ impl Default for GpuForceOptions {
 impl serde::Serialize for GpuForceOptions {
     fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeStruct;
-        let mut st = s.serialize_struct("GpuForceOptions", 19)?;
+        let mut st = s.serialize_struct("GpuForceOptions", 23)?;
         st.serialize_field("repulsion", &self.repulsion)?;
         st.serialize_field("spring_k", &self.spring_k)?;
         st.serialize_field("spring_len", &self.spring_len)?;
@@ -411,11 +476,15 @@ impl serde::Serialize for GpuForceOptions {
         st.serialize_field("cooling_alpha", &self.cooling_alpha)?;
         st.serialize_field("cooling_floor", &self.cooling_floor)?;
         st.serialize_field("energy_threshold", &self.energy_threshold)?;
-        st.serialize_field("grid_enabled", &self.grid_enabled)?;
         st.serialize_field("repulsion_mode", self.repulsion_mode.to_str())?;
         st.serialize_field("seed_mode", self.seed_mode.to_str())?;
         st.serialize_field("theta", &self.theta)?;
         st.serialize_field("repulsion_samples", &self.repulsion_samples)?;
+        st.serialize_field("force_model", self.force_model.to_str())?;
+        st.serialize_field("tfdp_alpha", &self.tfdp_alpha)?;
+        st.serialize_field("tfdp_beta", &self.tfdp_beta)?;
+        st.serialize_field("tfdp_gamma", &self.tfdp_gamma)?;
+        st.serialize_field("tfdp_k", &self.tfdp_k)?;
         st.end()
     }
 }
@@ -453,8 +522,6 @@ impl<'de> serde::Deserialize<'de> for GpuForceOptions {
             #[serde(default)]
             energy_threshold: Option<f32>,
             #[serde(default)]
-            grid_enabled: Option<bool>,
-            #[serde(default)]
             repulsion_mode: Option<String>,
             #[serde(default)]
             seed_mode: Option<String>,
@@ -462,6 +529,16 @@ impl<'de> serde::Deserialize<'de> for GpuForceOptions {
             theta: Option<f32>,
             #[serde(default)]
             repulsion_samples: Option<u32>,
+            #[serde(default)]
+            force_model: Option<String>,
+            #[serde(default)]
+            tfdp_alpha: Option<f32>,
+            #[serde(default)]
+            tfdp_beta: Option<f32>,
+            #[serde(default)]
+            tfdp_gamma: Option<f32>,
+            #[serde(default)]
+            tfdp_k: Option<f32>,
         }
         let r = Raw::deserialize(d)?;
         let def = GpuForceOptions::default();
@@ -480,7 +557,6 @@ impl<'de> serde::Deserialize<'de> for GpuForceOptions {
             cooling_alpha: r.cooling_alpha.unwrap_or(def.cooling_alpha),
             cooling_floor: r.cooling_floor.unwrap_or(def.cooling_floor),
             energy_threshold: r.energy_threshold.unwrap_or(def.energy_threshold),
-            grid_enabled: r.grid_enabled.unwrap_or(def.grid_enabled),
             repulsion_mode: r.repulsion_mode
                 .as_deref()
                 .map(RepulsionMode::from_str)
@@ -491,6 +567,14 @@ impl<'de> serde::Deserialize<'de> for GpuForceOptions {
                 .unwrap_or(def.seed_mode),
             theta: r.theta.unwrap_or(def.theta),
             repulsion_samples: r.repulsion_samples.unwrap_or(def.repulsion_samples),
+            force_model: r.force_model
+                .as_deref()
+                .map(ForceModel::from_str)
+                .unwrap_or(def.force_model),
+            tfdp_alpha: r.tfdp_alpha.unwrap_or(def.tfdp_alpha),
+            tfdp_beta: r.tfdp_beta.unwrap_or(def.tfdp_beta),
+            tfdp_gamma: r.tfdp_gamma.unwrap_or(def.tfdp_gamma),
+            tfdp_k: r.tfdp_k.unwrap_or(def.tfdp_k),
         })
     }
 }
@@ -657,10 +741,7 @@ impl GpuForceLayout {
                         &wgpu::DeviceDescriptor {
                             label: Some("graph-layouts/gpu_force"),
                             required_features: wgpu::Features::empty(),
-                            required_limits: wgpu::Limits {
-                                max_storage_buffers_per_shader_stage: 8,
-                                ..wgpu::Limits::downlevel_defaults().using_resolution(adapter.limits())
-                            },
+                            required_limits: gpu_force_device_limits(&adapter.limits()),
                             memory_hints: wgpu::MemoryHints::Performance,
                         },
                         None,
@@ -695,13 +776,8 @@ impl GpuForceLayout {
         let floor = self.options.cooling_floor.clamp(0.0, 1.0);
         state.effective_damping = (state.effective_damping * alpha).max(floor.min(self.options.damping));
 
-        // Negative sampling skips the grid build entirely (no bbox, no
-        // bucket sort). That elision is the headline cost win.
-        let use_grid = matches!(self.options.repulsion_mode, RepulsionMode::Grid)
-            && self.options.grid_enabled;
-        if use_grid {
-            state.rebuild_and_upload_grid(&od.device, &od.queue, &self.options);
-        }
+        // Only Barnes-Hut needs host-side per-call work (the octree
+        // rebuild); Exact and NegativeSampling read positions directly.
         if matches!(self.options.repulsion_mode, RepulsionMode::BarnesHut) {
             state.rebuild_and_upload_octree(&od.queue);
         } else {
@@ -711,12 +787,12 @@ impl GpuForceLayout {
         let total_steps = self.options.steps_per_call.max(1);
         for s in 0..total_steps {
             // Re-write params per step so step_index advances under
-            // negative sampling (the WGSL PRNG keys off it). Grid path
-            // ignores step_index but the write is cheap.
+            // negative sampling (the WGSL PRNG keys off it). The other
+            // backends ignore step_index but the write is cheap.
             state.write_params(&od.queue, &self.options, self.step_index);
             self.step_index = self.step_index.wrapping_add(1);
-            let build_grid = s == 0 && use_grid;
-            state.dispatch_step_direct(&od.device, &od.queue, build_grid);
+            let _ = s;
+            state.dispatch_step_direct(&od.device, &od.queue);
             state.swap_position_buffers();
             steps_done += 1;
         }
@@ -851,17 +927,11 @@ impl GpuForceLayout {
         let floor = self.options.cooling_floor.clamp(0.0, 1.0);
         state.effective_damping = (state.effective_damping * alpha).max(floor.min(self.options.damping));
 
-        // Negative sampling skips the grid + bucket sort entirely (no
-        // bbox, no atomics phase). That elision is the cost win.
-        let use_grid = matches!(self.options.repulsion_mode, RepulsionMode::Grid)
-            && self.options.grid_enabled;
-        if use_grid {
-            state.rebuild_and_upload_grid(device, queue, &self.options);
-        }
-        // Build the BH octree CPU-side once per call (matches the grid's
-        // "build once per call" cadence). The shader sees a freshly-uploaded
-        // tree in `oct_nodes_buf` and `params.n_octree`. v2 will move this
-        // to GPU via the build kernels in shaders/octree.wgsl.
+        // Only Barnes-Hut needs host-side per-call work: the octree is
+        // rebuilt CPU-side once per call and the shader sees a freshly-
+        // uploaded tree in `oct_nodes_buf` + `params.n_octree`. v2 will
+        // move this to GPU via the build kernels in shaders/octree.wgsl.
+        // Exact and NegativeSampling read positions directly.
         if matches!(self.options.repulsion_mode, RepulsionMode::BarnesHut) {
             state.rebuild_and_upload_octree(queue);
         } else {
@@ -871,12 +941,6 @@ impl GpuForceLayout {
         // per inner step below so the WGSL PRNG advances under negative
         // sampling.
         state.write_params(queue, &self.options, self.step_index);
-        if use_grid {
-            // GPU-side bucket sort of positions into spatial-hash cells.
-            // Done once per call (not per step), reading from whichever
-            // buffer is currently the "in" side of the ping-pong.
-            state.encode_grid_build_borrowed(device, encoder, shared_buffer);
-        }
         let steps = self.options.steps_per_call.max(1);
         for step_i in 0..steps {
             if step_i > 0 {
@@ -953,6 +1017,8 @@ impl GpuForceLayout {
 
 // ---------- Internal GPU state ----------------------------------------------
 
+/// Mirrors `SimParams` in `shaders/force.wgsl` field-for-field. Every row
+/// below is one 16-byte uniform slot; keep both sides in lockstep.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 struct SimParamsRaw {
@@ -971,19 +1037,18 @@ struct SimParamsRaw {
 
     n_edges: u32,
     repulsion_radius: f32,
-    grid_cell_size: f32,
-    grid_enabled: u32,
-
-    grid_origin: [f32; 3],
-    n_cells: u32,
-
-    grid_dim: [u32; 3],
     repulsion_mode: u32,
-
     bh_theta: f32,
+
     n_octree: u32,
     repulsion_samples: u32,   // K — only consulted when repulsion_mode == 2.
     step_index: u32,          // PRNG seed component for negative sampling.
+    force_model: u32,         // 0 = spring-electrical, 1 = t-FDP.
+
+    tfdp_alpha: f32,
+    tfdp_beta: f32,
+    tfdp_gamma: f32,
+    tfdp_k: f32,
 }
 
 // Each vec3<f32> in a storage buffer occupies 16 bytes (vec3 has stride/align
@@ -1037,22 +1102,6 @@ struct GpuState {
     pipeline: wgpu::ComputePipeline,
     bind_group_layout: wgpu::BindGroupLayout,
 
-    /// Pipelines for the GPU-side spatial-grid bucket sort. All four share
-    /// `gb_bind_group_layout`.
-    gb_clear_pipeline: wgpu::ComputePipeline,
-    gb_count_pipeline: wgpu::ComputePipeline,
-    gb_scan_pipeline: wgpu::ComputePipeline,
-    gb_scatter_pipeline: wgpu::ComputePipeline,
-    gb_bind_group_layout: wgpu::BindGroupLayout,
-    /// Group 0 placeholder bind group for the four grid-build pipelines
-    /// (they only reference group 1). wgpu requires an explicit
-    /// `set_bind_group` for every group index the pipeline layout
-    /// declares, even one whose layout has zero entries — `Binder`
-    /// treats validity as a contiguous prefix from index 0, so an unset
-    /// "empty" group poisons every higher-indexed group too. Must be
-    /// bound at every grid-build dispatch.
-    empty_gb_bind_group: wgpu::BindGroup,
-
     positions: PositionsStorage,
     /// True while pos_a is the "in" and pos_b is the "out" buffer.
     a_is_in: bool,
@@ -1080,17 +1129,6 @@ struct GpuState {
     /// per-stage storage-buffer count to fit Chrome WebGPU's cap of 10).
     #[allow(dead_code)]
     mass_buf: wgpu::Buffer,
-    /// Spatial-hash cells. (Re)allocated when capacity grows.
-    cell_offsets_buf: wgpu::Buffer,
-    cell_offsets_capacity: u64, // bytes
-    cell_nodes_buf: wgpu::Buffer,
-    cell_nodes_capacity: u64,
-    /// Per-cell atomic counts (filled by count_cells, scanned into offsets).
-    cell_counts_buf: wgpu::Buffer,
-    cell_counts_capacity: u64,
-    /// Per-cell atomic write cursor used by scatter_cells.
-    cell_write_cursor_buf: wgpu::Buffer,
-    cell_write_cursor_capacity: u64,
     /// Per-node KE proxy = |vel|^2 written by the shader; CPU reads back
     /// (small) for energy_threshold checks.
     energy_buf: wgpu::Buffer,
@@ -1100,16 +1138,11 @@ struct GpuState {
     /// in v1; v2 will populate via the GPU build kernels in octree.wgsl.
     oct_nodes_buf: wgpu::Buffer,
     oct_nodes_capacity: u64,
-    /// Group(2) BGL referenced by `force_step` whenever BH mode is
-    /// active. Bound even in Grid mode (the shader has the binding
-    /// declared, so it must be present in the bind group) — we just
-    /// fill it with a 1-slot sentinel buffer.
+    /// Group(1) BGL referenced by `force_step` whenever BH mode is
+    /// active. Bound in every mode (the shader has the binding declared,
+    /// so it must be present in the bind group) — the non-BH paths just
+    /// never read it.
     oct_bind_group_layout: wgpu::BindGroupLayout,
-    /// Group 1 placeholder bind group for `force_step`/`spring_step`,
-    /// which don't use the grid-build bindings the real group 1 layout
-    /// declares. Same requirement as `empty_gb_bind_group` above: must be
-    /// explicitly bound at every dispatch, not just groups 0/2/3.
-    force_empty_gb_bind_group: wgpu::BindGroup,
     /// Number of valid octree slots populated last build. 0 = no tree.
     n_octree_used: u32,
     /// Reusable CPU build scratch — kept across frames to avoid
@@ -1127,19 +1160,13 @@ struct GpuState {
     /// can seed the shared buffer via `queue.write_buffer` after init.
     initial_positions: Vec<f32>,
 
-    /// CPU-side mirror of latest positions, used to rebuild the grid each
-    /// step without a GPU readback.
+    /// CPU-side mirror of latest positions, used to rebuild the octree
+    /// each call without a GPU readback.
     cpu_positions: Vec<f32>,
     /// CPU-side mirror of per-node mass (1 + log2(degree)). Used by the
     /// CPU octree builder; kept here so we don't have to read back from
     /// the `mass_buf` GPU buffer each frame.
     cpu_mass: Vec<f32>,
-
-    /// Last-built grid metadata (mirrored into params each step).
-    grid_origin: [f32; 3],
-    grid_cell_size: f32,
-    grid_dim: [u32; 3],
-    n_cells: u32,
 
     /// Stable node-id ordering used to interpret the position buffer.
     node_order: Vec<String>,
@@ -1365,125 +1392,19 @@ fn precompute(graph: &Graph, seed_mode: &SeedMode, spring_len: f32) -> PreComput
     }
 }
 
-// ---------- Spatial-hash grid (CPU build) -----------------------------------
-
-/// Build a uniform 3D voxel grid over `positions` (length n*4, padded vec4).
-/// Returns (origin, cell_size, dim, n_cells, cell_offsets, cell_nodes).
-/// Caps `dim` at 64 per axis so memory stays bounded for crazy bboxes.
-fn build_grid(
-    positions: &[f32],
-    n_nodes: u32,
-    cell_size_in: f32,
-) -> (
-    [f32; 3],
-    f32,
-    [u32; 3],
-    u32,
-    Vec<u32>,
-    Vec<u32>,
-) {
-    let n = n_nodes as usize;
-    if n == 0 {
-        return ([0.0; 3], 1.0, [1, 1, 1], 1, vec![0, 0], vec![0]);
-    }
-    // 1. bbox
-    let mut mn = [f32::INFINITY; 3];
-    let mut mx = [f32::NEG_INFINITY; 3];
-    for i in 0..n {
-        for k in 0..3 {
-            let v = positions[i * 4 + k];
-            if v < mn[k] { mn[k] = v; }
-            if v > mx[k] { mx[k] = v; }
-        }
-    }
-    if !mn[0].is_finite() {
-        mn = [-1.0; 3];
-        mx = [1.0; 3];
-    }
-    // pad bbox slightly so points on the max edge still land in the last cell
-    let pad = (cell_size_in.max(1.0)) * 0.5;
-    let origin = [mn[0] - pad, mn[1] - pad, mn[2] - pad];
-    let extent = [
-        (mx[0] - mn[0]) + 2.0 * pad,
-        (mx[1] - mn[1]) + 2.0 * pad,
-        (mx[2] - mn[2]) + 2.0 * pad,
-    ];
-    let cell_size = cell_size_in.max(1.0);
-    const MAX_DIM: u32 = 64;
-    let mut dim = [
-        (((extent[0] / cell_size).ceil()) as u32).max(1).min(MAX_DIM),
-        (((extent[1] / cell_size).ceil()) as u32).max(1).min(MAX_DIM),
-        (((extent[2] / cell_size).ceil()) as u32).max(1).min(MAX_DIM),
-    ];
-    // If we capped, expand effective cell size so all points still fit.
-    let mut eff_cell = cell_size;
-    for k in 0..3 {
-        let needed = (extent[k] / dim[k] as f32).max(1e-3);
-        if needed > eff_cell {
-            eff_cell = needed;
-        }
-    }
-    // recompute dims with eff_cell to keep grid covering bbox precisely
-    for k in 0..3 {
-        dim[k] = (((extent[k] / eff_cell).ceil()) as u32).max(1).min(MAX_DIM);
-    }
-    let n_cells = dim[0] * dim[1] * dim[2];
-    let inv = 1.0 / eff_cell;
-
-    // 2. count per cell
-    let mut counts = vec![0u32; n_cells as usize];
-    let mut node_cell = vec![0u32; n];
-    for i in 0..n {
-        let mut ix = ((positions[i * 4] - origin[0]) * inv) as i32;
-        let mut iy = ((positions[i * 4 + 1] - origin[1]) * inv) as i32;
-        let mut iz = ((positions[i * 4 + 2] - origin[2]) * inv) as i32;
-        if ix < 0 { ix = 0; } else if ix >= dim[0] as i32 { ix = dim[0] as i32 - 1; }
-        if iy < 0 { iy = 0; } else if iy >= dim[1] as i32 { iy = dim[1] as i32 - 1; }
-        if iz < 0 { iz = 0; } else if iz >= dim[2] as i32 { iz = dim[2] as i32 - 1; }
-        let cell =
-            ix as u32 + iy as u32 * dim[0] + iz as u32 * dim[0] * dim[1];
-        node_cell[i] = cell;
-        counts[cell as usize] += 1;
-    }
-    // 3. prefix sum
-    let mut cell_offsets = vec![0u32; n_cells as usize + 1];
-    let mut acc = 0u32;
-    for c in 0..n_cells as usize {
-        cell_offsets[c] = acc;
-        acc += counts[c];
-    }
-    cell_offsets[n_cells as usize] = acc;
-    // 4. scatter
-    let mut cursor = cell_offsets.clone();
-    let mut cell_nodes = vec![0u32; n];
-    for i in 0..n {
-        let c = node_cell[i] as usize;
-        cell_nodes[cursor[c] as usize] = i as u32;
-        cursor[c] += 1;
-    }
-
-    (origin, eff_cell, dim, n_cells, cell_offsets, cell_nodes)
-}
 
 struct ForcePipelines {
     force_step: wgpu::ComputePipeline,
     force_bgl: wgpu::BindGroupLayout,
-    gb_clear: wgpu::ComputePipeline,
-    gb_count: wgpu::ComputePipeline,
-    gb_scan: wgpu::ComputePipeline,
-    gb_scatter: wgpu::ComputePipeline,
-    gb_bgl: wgpu::BindGroupLayout,
-    /// Group(2) for force_step: the octree storage buffer. Must be bound
-    /// for both Grid and BarnesHut paths (WGSL requires every declared
-    /// binding to be present); the Grid path simply doesn't touch it.
+    /// Group(1) for force_step: the octree storage buffer. Bound in every
+    /// repulsion mode (WGSL requires every declared binding to be
+    /// present); the non-BH paths simply don't touch it.
     oct_bgl: wgpu::BindGroupLayout,
-    /// Group(3): hub-aware (Tigr) virtual-vertex CSR + per-virtual spring
+    /// Group(2): hub-aware (Tigr) virtual-vertex CSR + per-virtual spring
     /// partials. Bound by both `spring_step` and `force_step`.
     spring_bgl: wgpu::BindGroupLayout,
     /// Standalone hub-aware spring kernel (one thread per virtual vertex).
     spring_step: wgpu::ComputePipeline,
-    empty_gb_bg: wgpu::BindGroup,
-    force_empty_gb_bg: wgpu::BindGroup,
 }
 
 fn build_pipeline(device: &wgpu::Device) -> ForcePipelines {
@@ -1509,16 +1430,10 @@ fn build_pipeline(device: &wgpu::Device) -> ForcePipelines {
             },
             count: None,
         },
-        // Bindings 6 + 7 (cell_offsets / cell_nodes) were dropped from
-        // force_step to bring the per-stage storage-buffer count to 10
-        // (Chrome WebGPU's hard cap). The grid-build pipelines on group(1)
-        // still construct the buffers when Grid mode is selected; force_step
-        // just no longer consumes them and falls through to the naive
-        // O(n²) branch in that case.
-        //
-        // Binding 8 (mass) was also dropped — mass is now packed into
-        // positions[i].w (see force.wgsl preamble + precompute below).
-        storage_entry(9, false), // energy_out
+        // Binding 6 = energy_out. Mass is packed into positions[i].w (see
+        // force.wgsl preamble + precompute below), so this is the whole
+        // group: 5 storage + 1 uniform.
+        storage_entry(6, false),
     ];
     let bind_group_layout = device.create_bind_group_layout(
         &wgpu::BindGroupLayoutDescriptor {
@@ -1527,45 +1442,7 @@ fn build_pipeline(device: &wgpu::Device) -> ForcePipelines {
         },
     );
 
-    // Grid-build BGL (group 1 in shader). All four build entry points share
-    // it; bindings an entry point doesn't reference are simply unused.
-    let gb_bgl_entries = [
-        storage_entry(0, true), // gb_positions_in
-        wgpu::BindGroupLayoutEntry {
-            binding: 1,
-            visibility: wgpu::ShaderStages::COMPUTE,
-            ty: wgpu::BindingType::Buffer {
-                ty: wgpu::BufferBindingType::Uniform,
-                has_dynamic_offset: false,
-                min_binding_size: None,
-            },
-            count: None,
-        },
-        storage_entry(2, false), // gb_cell_counts (atomic rw)
-        storage_entry(3, false), // gb_cell_cursor (atomic rw)
-        storage_entry(4, false), // gb_cell_offsets (rw u32)
-        storage_entry(5, false), // gb_cell_nodes   (rw u32)
-    ];
-    let gb_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-        label: Some("gpu_force_grid_build_bgl"),
-        entries: &gb_bgl_entries,
-    });
-    // Empty BGL placeholder at group(0) for build pipelines (the build
-    // entry points only reference @group(1) bindings).
-    let empty_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-        label: Some("gpu_force_grid_build_empty_bgl"),
-        entries: &[],
-    });
-    // wgpu still requires this to be explicitly bound at dispatch time
-    // even though it has zero entries — see the doc comment on
-    // `GpuState::empty_gb_bind_group`.
-    let empty_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some("gpu_force_grid_build_empty_bg"),
-        layout: &empty_bgl,
-        entries: &[],
-    });
-
-    // Group 2: octree storage. Single read-only storage buffer at @binding(1)
+    // Group 1: octree storage. Single read-only storage buffer at @binding(1)
     // matching `oct_nodes` in force.wgsl. We omit the params/bbox bindings
     // (only used by the v2 GPU build kernels) — force_step doesn't reference
     // them, so leaving them out of the BGL keeps the layout minimal.
@@ -1576,21 +1453,8 @@ fn build_pipeline(device: &wgpu::Device) -> ForcePipelines {
         label: Some("gpu_force_octree_bgl"),
         entries: &oct_bgl_entries,
     });
-    // Empty BGL placeholder for group(1) when binding force_step (which
-    // declares both group(0) [main] and group(2) [octree], plus group(1)
-    // bindings the grid-build pipelines own).
-    let force_empty_gb_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-        label: Some("gpu_force_force_empty_gb_bgl"),
-        entries: &[],
-    });
-    // Same "must still be explicitly bound" requirement as `empty_bg`.
-    let force_empty_gb_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some("gpu_force_force_empty_gb_bg"),
-        layout: &force_empty_gb_bgl,
-        entries: &[],
-    });
 
-    // Group 3: hub-aware virtual-vertex CSR + per-virtual spring partials.
+    // Group 2: hub-aware virtual-vertex CSR + per-virtual spring partials.
     // Bound by both `spring_step` (writes partials) and `force_step` (reads).
     let spring_bgl_entries = [
         // virt_csr packs `node_to_virt_offsets` (length n+1) followed by
@@ -1606,91 +1470,34 @@ fn build_pipeline(device: &wgpu::Device) -> ForcePipelines {
         entries: &spring_bgl_entries,
     });
 
+    // Both kernels share one layout: group 0 = main, group 1 = octree,
+    // group 2 = hub-aware spring partials.
     let pipeline_layout = device.create_pipeline_layout(
         &wgpu::PipelineLayoutDescriptor {
             label: Some("gpu_force_pl"),
-            // group 0 = main, group 1 = placeholder, group 2 = octree,
-            // group 3 = hub-aware spring partials.
-            bind_group_layouts: &[
-                &bind_group_layout,
-                &force_empty_gb_bgl,
-                &oct_bgl,
-                &spring_bgl,
-            ],
-            push_constant_ranges: &[],
-        },
-    );
-    let force_step = device.create_compute_pipeline(
-        &wgpu::ComputePipelineDescriptor {
-            label: Some("force_step"),
-            layout: Some(&pipeline_layout),
-            module: &shader,
-            entry_point: Some("force_step"),
-            compilation_options: Default::default(),
-            cache: None,
-        },
-    );
-
-    let gb_pipeline_layout = device.create_pipeline_layout(
-        &wgpu::PipelineLayoutDescriptor {
-            label: Some("gpu_force_grid_build_pl"),
-            bind_group_layouts: &[&empty_bgl, &gb_bgl],
+            bind_group_layouts: &[&bind_group_layout, &oct_bgl, &spring_bgl],
             push_constant_ranges: &[],
         },
     );
     let mk = |name: &'static str| {
         device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some(name),
-            layout: Some(&gb_pipeline_layout),
+            layout: Some(&pipeline_layout),
             module: &shader,
             entry_point: Some(name),
             compilation_options: Default::default(),
             cache: None,
         })
     };
-    let gb_clear = mk("clear_cell_counts");
-    let gb_count = mk("count_cells");
-    let gb_scan = mk("scan_cell_offsets");
-    let gb_scatter = mk("scatter_cells");
-
-    // Spring kernel pipeline. Reuses the main BGL at group(0) (uses
-    // positions_in/edge_neighbors/params; other entries unused). Octree
-    // BGL at group(2) is unused but must match the layout — we still bind
-    // the octree buffer at dispatch time.
-    let spring_pipeline_layout = device.create_pipeline_layout(
-        &wgpu::PipelineLayoutDescriptor {
-            label: Some("gpu_force_spring_pl"),
-            bind_group_layouts: &[
-                &bind_group_layout,
-                &force_empty_gb_bgl,
-                &oct_bgl,
-                &spring_bgl,
-            ],
-            push_constant_ranges: &[],
-        },
-    );
-    let spring_step = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-        label: Some("spring_step"),
-        layout: Some(&spring_pipeline_layout),
-        module: &shader,
-        entry_point: Some("spring_step"),
-        compilation_options: Default::default(),
-        cache: None,
-    });
+    let force_step = mk("force_step");
+    let spring_step = mk("spring_step");
 
     ForcePipelines {
         force_step,
         force_bgl: bind_group_layout,
-        gb_clear,
-        gb_count,
-        gb_scan,
-        gb_scatter,
-        gb_bgl,
         oct_bgl,
         spring_bgl,
         spring_step,
-        empty_gb_bg: empty_bg,
-        force_empty_gb_bg,
     }
 }
 
@@ -1725,16 +1532,35 @@ impl GpuState {
         let cpu_positions = pc.initial_positions.clone();
         let cpu_mass = pc.mass.clone();
 
-        Ok(Self {
+        Ok(Self::assemble(
+            pipelines,
+            PositionsStorage::Owned { pos_a, pos_b },
+            aux,
+            Some(staging),
+            pc,
+            pos_buf_size,
+            cpu_positions,
+            cpu_mass,
+        ))
+    }
+
+    /// Shared tail of `new_owned` / `new_borrowed`: everything after the
+    /// position buffers and pipelines exist.
+    #[allow(clippy::too_many_arguments)]
+    fn assemble(
+        pipelines: ForcePipelines,
+        positions: PositionsStorage,
+        aux: AuxBuffers,
+        staging: Option<wgpu::Buffer>,
+        pc: PreCompute,
+        pos_buf_size: u64,
+        cpu_positions: Vec<f32>,
+        cpu_mass: Vec<f32>,
+    ) -> Self {
+        Self {
             pipeline: pipelines.force_step,
             bind_group_layout: pipelines.force_bgl,
-            gb_clear_pipeline: pipelines.gb_clear,
-            gb_count_pipeline: pipelines.gb_count,
-            gb_scan_pipeline: pipelines.gb_scan,
-            gb_scatter_pipeline: pipelines.gb_scatter,
-            gb_bind_group_layout: pipelines.gb_bgl,
-            empty_gb_bind_group: pipelines.empty_gb_bg,
-            positions: PositionsStorage::Owned { pos_a, pos_b },
+            positions,
             a_is_in: true,
             velocities: aux.vel,
             edge_offsets: aux.off,
@@ -1747,37 +1573,24 @@ impl GpuState {
             spring_pipeline: pipelines.spring_step,
             params_buf: aux.params,
             mass_buf: aux.mass,
-            cell_offsets_buf: aux.cell_offsets,
-            cell_offsets_capacity: aux.cell_offsets_capacity,
-            cell_nodes_buf: aux.cell_nodes,
-            cell_nodes_capacity: aux.cell_nodes_capacity,
-            cell_counts_buf: aux.cell_counts,
-            cell_counts_capacity: aux.cell_counts_capacity,
-            cell_write_cursor_buf: aux.cell_write_cursor,
-            cell_write_cursor_capacity: aux.cell_write_cursor_capacity,
             energy_buf: aux.energy,
             energy_staging: aux.energy_staging,
             oct_nodes_buf: aux.oct_nodes,
             oct_nodes_capacity: aux.oct_nodes_capacity,
             oct_bind_group_layout: pipelines.oct_bgl,
-            force_empty_gb_bind_group: pipelines.force_empty_gb_bg,
             n_octree_used: 0,
             oct_build: OctreeBuild::default(),
-            staging: Some(staging),
+            staging,
             n_nodes: pc.n_nodes,
             n_edges: pc.n_edges,
             pos_buf_size,
             initial_positions: pc.initial_positions,
             cpu_positions,
             cpu_mass,
-            grid_origin: [0.0; 3],
-            grid_cell_size: 1.0,
-            grid_dim: [1, 1, 1],
-            n_cells: 1,
             node_order: pc.node_order,
             effective_damping: 1.0,
             energy_readback: Arc::new(Mutex::new(EnergyReadback::Idle)),
-        })
+        }
     }
 
     /// Build state against caller-supplied device + a borrowed positions
@@ -1809,59 +1622,16 @@ impl GpuState {
         let cpu_positions = pc.initial_positions.clone();
         let cpu_mass = pc.mass.clone();
 
-        Ok(Self {
-            pipeline: pipelines.force_step,
-            bind_group_layout: pipelines.force_bgl,
-            gb_clear_pipeline: pipelines.gb_clear,
-            gb_count_pipeline: pipelines.gb_count,
-            gb_scan_pipeline: pipelines.gb_scan,
-            gb_scatter_pipeline: pipelines.gb_scatter,
-            gb_bind_group_layout: pipelines.gb_bgl,
-            empty_gb_bind_group: pipelines.empty_gb_bg,
-            positions: PositionsStorage::Borrowed { pos_b },
-            a_is_in: true,
-            velocities: aux.vel,
-            edge_offsets: aux.off,
-            edge_neighbors: aux.neigh,
-            virt_csr_buf: aux.virt_csr,
-            virt_edge_offsets_buf: aux.virt_edge_offsets,
-            spring_force_partial_buf: aux.spring_force_partial,
-            n_virtual: aux.n_virtual,
-            spring_bind_group_layout: pipelines.spring_bgl,
-            spring_pipeline: pipelines.spring_step,
-            params_buf: aux.params,
-            mass_buf: aux.mass,
-            cell_offsets_buf: aux.cell_offsets,
-            cell_offsets_capacity: aux.cell_offsets_capacity,
-            cell_nodes_buf: aux.cell_nodes,
-            cell_nodes_capacity: aux.cell_nodes_capacity,
-            cell_counts_buf: aux.cell_counts,
-            cell_counts_capacity: aux.cell_counts_capacity,
-            cell_write_cursor_buf: aux.cell_write_cursor,
-            cell_write_cursor_capacity: aux.cell_write_cursor_capacity,
-            energy_buf: aux.energy,
-            energy_staging: aux.energy_staging,
-            oct_nodes_buf: aux.oct_nodes,
-            oct_nodes_capacity: aux.oct_nodes_capacity,
-            oct_bind_group_layout: pipelines.oct_bgl,
-            force_empty_gb_bind_group: pipelines.force_empty_gb_bg,
-            n_octree_used: 0,
-            oct_build: OctreeBuild::default(),
-            staging: None,
-            n_nodes: pc.n_nodes,
-            n_edges: pc.n_edges,
+        Ok(Self::assemble(
+            pipelines,
+            PositionsStorage::Borrowed { pos_b },
+            aux,
+            None,
+            pc,
             pos_buf_size,
-            initial_positions: pc.initial_positions,
             cpu_positions,
             cpu_mass,
-            grid_origin: [0.0; 3],
-            grid_cell_size: 1.0,
-            grid_dim: [1, 1, 1],
-            n_cells: 1,
-            node_order: pc.node_order,
-            effective_damping: 1.0,
-            energy_readback: Arc::new(Mutex::new(EnergyReadback::Idle)),
-        })
+        ))
     }
 
     /// Seed the shared (borrowed) positions buffer with our initial values.
@@ -1885,167 +1655,18 @@ impl GpuState {
             n_nodes: self.n_nodes,
             n_edges: self.n_edges,
             repulsion_radius: opts.repulsion_radius,
-            grid_cell_size: self.grid_cell_size,
-            grid_enabled: if opts.grid_enabled { 1 } else { 0 },
-            grid_origin: self.grid_origin,
-            n_cells: self.n_cells,
-            grid_dim: self.grid_dim,
             repulsion_mode: opts.repulsion_mode.as_u32(),
             bh_theta: opts.theta.clamp(0.1, 2.0),
             n_octree: self.n_octree_used,
             repulsion_samples: opts.repulsion_samples.max(1),
             step_index,
+            force_model: opts.force_model.as_u32(),
+            tfdp_alpha: opts.tfdp_alpha.max(0.0),
+            tfdp_beta: opts.tfdp_beta.max(0.0),
+            tfdp_gamma: opts.tfdp_gamma.max(0.5),
+            tfdp_k: opts.tfdp_k.max(0.0),
         };
         queue.write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&raw));
-    }
-
-    /// Build the spatial-hash grid from `cpu_positions`, (re)allocate the
-    /// cell buffers if needed, and upload to GPU.
-    fn rebuild_and_upload_grid(
-        &mut self,
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
-        opts: &GpuForceOptions,
-    ) {
-        let _ = queue;
-        let cell_size_target = if opts.repulsion_radius > 0.0 {
-            opts.repulsion_radius
-        } else {
-            (opts.spring_len * 4.0).max(1.0)
-        };
-        // Bbox + dims still computed CPU-side from the (possibly stale)
-        // cpu_positions mirror — same as before this refactor. The
-        // count+scatter use the *fresh* GPU positions buffer, so a slightly
-        // stale bbox just means a slightly wider grid, which is harmless
-        // (the in-shader clamp keeps every node in a valid cell).
-        let (origin, cell_size, dim, n_cells, _co, _cn) =
-            build_grid(&self.cpu_positions, self.n_nodes, cell_size_target);
-        self.grid_origin = origin;
-        self.grid_cell_size = cell_size;
-        self.grid_dim = dim;
-        self.n_cells = n_cells;
-
-        // (Re)allocate cell-* buffers if the grid grew. We size everything
-        // to (n_cells + 1) * 4 — cell_offsets needs the +1 sentinel; the
-        // count/cursor buffers don't but it's fine to oversize.
-        let needed_off_bytes = ((n_cells as u64 + 1) * 4).max(64);
-        if needed_off_bytes > self.cell_offsets_capacity {
-            let cap = needed_off_bytes * 2;
-            self.cell_offsets_buf = device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("cell_offsets"),
-                size: cap,
-                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
-            self.cell_offsets_capacity = cap;
-            // counts/cursor track cell_offsets capacity so all three resize
-            // together — the atomic buffers can't be smaller than n_cells*4.
-            self.cell_counts_buf = device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("cell_counts"),
-                size: cap,
-                usage: wgpu::BufferUsages::STORAGE,
-                mapped_at_creation: false,
-            });
-            self.cell_counts_capacity = cap;
-            self.cell_write_cursor_buf = device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("cell_write_cursor"),
-                size: cap,
-                usage: wgpu::BufferUsages::STORAGE,
-                mapped_at_creation: false,
-            });
-            self.cell_write_cursor_capacity = cap;
-        }
-        let needed_nodes_bytes = (self.n_nodes.max(1) as u64 * 4).max(64);
-        if needed_nodes_bytes > self.cell_nodes_capacity {
-            let cap = needed_nodes_bytes * 2;
-            self.cell_nodes_buf = device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("cell_nodes"),
-                size: cap,
-                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
-            self.cell_nodes_capacity = cap;
-        }
-    }
-
-    /// Build the gb_* bind group used by the four grid-build entry points.
-    /// `pos_in` is the same positions buffer the upcoming `force_step` will
-    /// read — that way the grid is built from the same positions force_step
-    /// sees (no one-frame stale grid).
-    fn make_grid_build_bg(
-        &self,
-        device: &wgpu::Device,
-        pos_in: &wgpu::Buffer,
-    ) -> wgpu::BindGroup {
-        device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("gpu_force_grid_build_bg"),
-            layout: &self.gb_bind_group_layout,
-            entries: &[
-                buf_entry(0, pos_in),
-                buf_entry(1, &self.params_buf),
-                buf_entry(2, &self.cell_counts_buf),
-                buf_entry(3, &self.cell_write_cursor_buf),
-                buf_entry(4, &self.cell_offsets_buf),
-                buf_entry(5, &self.cell_nodes_buf),
-            ],
-        })
-    }
-
-    /// Record the four grid-build dispatches (clear → count → scan → scatter)
-    /// into `encoder`. After this returns, cell_offsets + cell_nodes hold a
-    /// fresh bucket sort of `pos_in`. Each pass is its own compute pass so
-    /// wgpu inserts the necessary storage-buffer barriers between them.
-    fn encode_grid_build(
-        &self,
-        encoder: &mut wgpu::CommandEncoder,
-        bg: &wgpu::BindGroup,
-    ) {
-        let cells_groups = (self.n_cells + 63) / 64;
-        let nodes_groups = (self.n_nodes + 63) / 64;
-        // 1. clear counts + cursor + offsets
-        {
-            let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("grid_clear_pass"),
-                timestamp_writes: None,
-            });
-            cpass.set_pipeline(&self.gb_clear_pipeline);
-            cpass.set_bind_group(0, &self.empty_gb_bind_group, &[]);
-            cpass.set_bind_group(1, bg, &[]);
-            cpass.dispatch_workgroups(cells_groups.max(1), 1, 1);
-        }
-        // 2. count per cell (atomic add)
-        {
-            let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("grid_count_pass"),
-                timestamp_writes: None,
-            });
-            cpass.set_pipeline(&self.gb_count_pipeline);
-            cpass.set_bind_group(0, &self.empty_gb_bind_group, &[]);
-            cpass.set_bind_group(1, bg, &[]);
-            cpass.dispatch_workgroups(nodes_groups.max(1), 1, 1);
-        }
-        // 3. exclusive prefix sum, single workgroup, single thread
-        {
-            let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("grid_scan_pass"),
-                timestamp_writes: None,
-            });
-            cpass.set_pipeline(&self.gb_scan_pipeline);
-            cpass.set_bind_group(0, &self.empty_gb_bind_group, &[]);
-            cpass.set_bind_group(1, bg, &[]);
-            cpass.dispatch_workgroups(1, 1, 1);
-        }
-        // 4. scatter node indices into cell_nodes via cursor atomicAdd
-        {
-            let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("grid_scatter_pass"),
-                timestamp_writes: None,
-            });
-            cpass.set_pipeline(&self.gb_scatter_pipeline);
-            cpass.set_bind_group(0, &self.empty_gb_bind_group, &[]);
-            cpass.set_bind_group(1, bg, &[]);
-            cpass.dispatch_workgroups(nodes_groups.max(1), 1, 1);
-        }
     }
 
     /// Owned-mode "in/out" picker — both buffers live in PositionsStorage::Owned.
@@ -2090,35 +1711,19 @@ impl GpuState {
                 buf_entry(3, &self.edge_offsets),
                 buf_entry(4, &self.edge_neighbors),
                 buf_entry(5, &self.params_buf),
-                // Bindings 6 + 7 omitted (cell_offsets / cell_nodes —
-                // see force.wgsl preamble). Binding 8 omitted (mass packed
-                // into positions[i].w).
-                buf_entry(9, &self.energy_buf),
+                buf_entry(6, &self.energy_buf),
             ],
         })
     }
 
     /// Direct dispatch — owns its own encoder and submits immediately.
-    /// Used by the legacy `run()` path (owned mode only). `build_grid`
-    /// controls whether the grid bucket sort runs in the same submit
-    /// (called once for the first step per call; subsequent steps within
-    /// the same `run()` reuse the grid for symmetry with the borrowed
-    /// path's "build once per call").
-    fn dispatch_step_direct(
-        &self,
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
-        build_grid: bool,
-    ) {
+    /// Used by the legacy `run()` path (owned mode only).
+    fn dispatch_step_direct(&self, device: &wgpu::Device, queue: &wgpu::Queue) {
         let (pos_in, pos_out) = self.owned_in_out();
         let bind_group = self.make_bind_group(device, pos_in, pos_out);
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("gpu_force_cmd"),
         });
-        if build_grid {
-            let gb_bg = self.make_grid_build_bg(device, pos_in);
-            self.encode_grid_build(&mut encoder, &gb_bg);
-        }
         let oct_bg = self.make_oct_bind_group(device);
         let spring_bg = self.make_spring_bind_group(device);
         self.encode_spring_step(&mut encoder, &bind_group, &oct_bg, &spring_bg);
@@ -2127,9 +1732,7 @@ impl GpuState {
     }
 
     /// Record dispatch into a caller-supplied encoder, reading/writing the
-    /// borrowed shared buffer + internal pos_b. Caller is responsible for
-    /// invoking `encode_grid_build_borrowed` before this if grid is enabled
-    /// — `step_with_encoder` does that once per call (not per step).
+    /// borrowed shared buffer + internal pos_b.
     fn dispatch_borrowed_step(
         &self,
         device: &wgpu::Device,
@@ -2142,19 +1745,6 @@ impl GpuState {
         let spring_bg = self.make_spring_bind_group(device);
         self.encode_spring_step(encoder, &bind_group, &oct_bg, &spring_bg);
         self.encode_compute(encoder, &bind_group, &oct_bg, &spring_bg);
-    }
-
-    /// Borrowed-mode wrapper around `encode_grid_build` — builds the bind
-    /// group bound to whichever position buffer is currently the "in" side.
-    fn encode_grid_build_borrowed(
-        &self,
-        device: &wgpu::Device,
-        encoder: &mut wgpu::CommandEncoder,
-        shared: &wgpu::Buffer,
-    ) {
-        let (pos_in, _pos_out) = self.borrowed_in_out(shared);
-        let bg = self.make_grid_build_bg(device, pos_in);
-        self.encode_grid_build(encoder, &bg);
     }
 
     fn encode_compute(
@@ -2170,11 +1760,9 @@ impl GpuState {
         });
         cpass.set_pipeline(&self.pipeline);
         cpass.set_bind_group(0, bind_group, &[]);
-        cpass.set_bind_group(1, &self.force_empty_gb_bind_group, &[]);
-        cpass.set_bind_group(2, oct_bg, &[]);
-        cpass.set_bind_group(3, spring_bg, &[]);
-        let groups = (self.n_nodes + 63) / 64;
-        cpass.dispatch_workgroups(groups.max(1), 1, 1);
+        cpass.set_bind_group(1, oct_bg, &[]);
+        cpass.set_bind_group(2, spring_bg, &[]);
+        dispatch_1d(&mut cpass, self.n_nodes);
     }
 
     fn make_oct_bind_group(&self, device: &wgpu::Device) -> wgpu::BindGroup {
@@ -2213,11 +1801,9 @@ impl GpuState {
         });
         cpass.set_pipeline(&self.spring_pipeline);
         cpass.set_bind_group(0, bind_group, &[]);
-        cpass.set_bind_group(1, &self.force_empty_gb_bind_group, &[]);
-        cpass.set_bind_group(2, oct_bg, &[]);
-        cpass.set_bind_group(3, spring_bg, &[]);
-        let groups = (self.n_virtual + 63) / 64;
-        cpass.dispatch_workgroups(groups.max(1), 1, 1);
+        cpass.set_bind_group(1, oct_bg, &[]);
+        cpass.set_bind_group(2, spring_bg, &[]);
+        dispatch_1d(&mut cpass, self.n_virtual);
     }
 
     fn swap_position_buffers(&mut self) {
@@ -2423,14 +2009,6 @@ struct AuxBuffers {
     n_virtual: u32,
     params: wgpu::Buffer,
     mass: wgpu::Buffer,
-    cell_offsets: wgpu::Buffer,
-    cell_offsets_capacity: u64,
-    cell_nodes: wgpu::Buffer,
-    cell_nodes_capacity: u64,
-    cell_counts: wgpu::Buffer,
-    cell_counts_capacity: u64,
-    cell_write_cursor: wgpu::Buffer,
-    cell_write_cursor_capacity: u64,
     energy: wgpu::Buffer,
     energy_staging: wgpu::Buffer,
     oct_nodes: wgpu::Buffer,
@@ -2498,40 +2076,7 @@ fn build_aux_buffers(device: &wgpu::Device, pc: &PreCompute) -> AuxBuffers {
         contents: bytemuck::cast_slice(nonempty_f32(&pc.mass)),
         usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
     });
-    // Initial capacity: enough for a 1-cell grid + the n nodes. Will grow.
-    let init_cell_offsets = vec![0u32, pc.n_nodes];
-    let cell_offsets_capacity =
-        (init_cell_offsets.len() as u64 * 4).max(64);
-    let cell_offsets = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("cell_offsets"),
-        size: cell_offsets_capacity,
-        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-        mapped_at_creation: false,
-    });
     let n = pc.n_nodes.max(1) as u64;
-    let cell_nodes_capacity = (n * 4).max(64);
-    let cell_nodes = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("cell_nodes"),
-        size: cell_nodes_capacity,
-        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-        mapped_at_creation: false,
-    });
-    // GPU-side bucket-sort scratch: per-cell atomic counts + write cursor.
-    // Sized to match cell_offsets at construction; both grow alongside it.
-    let cell_counts_capacity = cell_offsets_capacity;
-    let cell_counts = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("cell_counts"),
-        size: cell_counts_capacity,
-        usage: wgpu::BufferUsages::STORAGE,
-        mapped_at_creation: false,
-    });
-    let cell_write_cursor_capacity = cell_offsets_capacity;
-    let cell_write_cursor = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("cell_write_cursor"),
-        size: cell_write_cursor_capacity,
-        usage: wgpu::BufferUsages::STORAGE,
-        mapped_at_creation: false,
-    });
     let energy_size = (n * 4).max(64);
     let energy = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("energy"),
@@ -2567,18 +2112,65 @@ fn build_aux_buffers(device: &wgpu::Device, pc: &PreCompute) -> AuxBuffers {
         n_virtual: pc.n_virtual,
         params,
         mass,
-        cell_offsets,
-        cell_offsets_capacity,
-        cell_nodes,
-        cell_nodes_capacity,
-        cell_counts,
-        cell_counts_capacity,
-        cell_write_cursor,
-        cell_write_cursor_capacity,
         energy,
         energy_staging,
         oct_nodes,
         oct_nodes_capacity,
+    }
+}
+
+/// Compute workgroup size shared by every 1-D kernel in force.wgsl
+/// (`@workgroup_size(64)`).
+const WORKGROUP_SIZE: u32 = 64;
+
+/// WebGPU's `maxComputeWorkgroupsPerDimension` (spec default and the
+/// value `wgpu::Limits::downlevel_defaults()` requests). A 1-D dispatch
+/// of `ceil(n / 64)` groups therefore validates only up to
+/// 65535 × 64 = 4 194 240 invocations; above that the pass is rejected.
+const MAX_WORKGROUPS_PER_DIM: u32 = 65535;
+
+/// Dispatch `invocations` lanes of a 64-wide kernel, spilling into the Y
+/// dimension once X would exceed the per-dimension cap. Kernels recover
+/// their linear index via `linear_index()` in force.wgsl
+/// (`gid.x + gid.y * num_workgroups.x * 64`).
+fn dispatch_1d(cpass: &mut wgpu::ComputePass<'_>, invocations: u32) {
+    let (x, y) = dispatch_grid(invocations);
+    cpass.dispatch_workgroups(x, y, 1);
+}
+
+/// `(x, y)` workgroup counts for `dispatch_1d`. Split out so the
+/// arithmetic is unit-testable without a device.
+fn dispatch_grid(invocations: u32) -> (u32, u32) {
+    let groups = invocations.div_ceil(WORKGROUP_SIZE).max(1);
+    let x = groups.min(MAX_WORKGROUPS_PER_DIM);
+    let y = groups.div_ceil(x);
+    (x, y)
+}
+
+/// Device limits the force engine needs, derived from what the adapter
+/// offers.
+///
+/// `wgpu::Limits::downlevel_defaults()` pins `max_storage_buffer_binding_size`
+/// to 128 MiB and `max_buffer_size` to 256 MiB (the WebGPU spec defaults);
+/// `using_resolution` only lifts texture dimensions. At 16 bytes per node
+/// that caps the position buffers at 8 388 608 nodes and the CSR neighbour
+/// buffer at 16.7 M undirected edges regardless of how much VRAM the GPU
+/// has. Ask for the adapter's actual buffer limits instead; everything else
+/// stays at the downlevel baseline so the same request validates in
+/// browsers. Shared by the owned `run()` path here and the renderer-owned
+/// device in `app/ui`.
+pub fn gpu_force_device_limits(adapter: &wgpu::Limits) -> wgpu::Limits {
+    let base = wgpu::Limits::downlevel_defaults().using_resolution(adapter.clone());
+    wgpu::Limits {
+        max_storage_buffers_per_shader_stage: base
+            .max_storage_buffers_per_shader_stage
+            .max(8)
+            .min(adapter.max_storage_buffers_per_shader_stage),
+        max_storage_buffer_binding_size: adapter
+            .max_storage_buffer_binding_size
+            .max(base.max_storage_buffer_binding_size),
+        max_buffer_size: adapter.max_buffer_size.max(base.max_buffer_size),
+        ..base
     }
 }
 
@@ -3204,13 +2796,14 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn unit_gpu_force_grid_produces_reasonable_layout() {
+    async fn unit_gpu_force_exact_produces_reasonable_layout() {
         let _gpu = gpu_test_guard();
-        // 100 random nodes, 200 random edges. Run 10 steps with grid on.
+        // 100 random nodes, 200 random edges. Run 10 steps on the exact
+        // O(n²) reference backend.
         let mut g = random_graph(100, 200);
         let mut layout = GpuForceLayout::new(GpuForceOptions {
             steps_per_call: 10,
-            grid_enabled: true,
+            repulsion_mode: RepulsionMode::Exact,
             repulsion_radius: 120.0,
             ..Default::default()
         });
@@ -3282,26 +2875,29 @@ mod tests {
             Ok(()) => {}
             Err(e) => { eprintln!("skipping (no gpu adapter): {e}"); return; }
         }
-        let mut all_finite = true;
-        let mut hub_pos = [0.0f32; 3];
-        let mut leaf_extent = 0.0f32;
+        let hub_pos = g.nodes["hub"].position3.expect("position3 set");
+        assert!(hub_pos.iter().all(|v| v.is_finite()), "hub position non-finite");
+        // Every leaf is spring-bound to the hub through a *virtual* vertex,
+        // so after 50 steps no leaf may have escaped past a couple of rest
+        // lengths, and the cloud must not have collapsed onto the hub.
+        // (Where the hub itself settles relative to the origin depends on
+        // the deliberately asymmetric seeding above and is not asserted.)
+        let mut max_leaf_dist = 0.0f32;
+        let mut min_leaf_dist = f32::INFINITY;
         for (id, node) in g.nodes.iter() {
+            if id == "hub" { continue; }
             let p = node.position3.expect("position3 set");
-            for k in 0..3 { if !p[k].is_finite() { all_finite = false; } }
-            if id == "hub" {
-                hub_pos = p;
-            } else {
-                let r = (p[0]*p[0] + p[1]*p[1] + p[2]*p[2]).sqrt();
-                if r > leaf_extent { leaf_extent = r; }
-            }
+            assert!(p.iter().all(|v| v.is_finite()), "leaf {id} non-finite");
+            let d = ((p[0] - hub_pos[0]).powi(2)
+                + (p[1] - hub_pos[1]).powi(2)
+                + (p[2] - hub_pos[2]).powi(2))
+            .sqrt();
+            max_leaf_dist = max_leaf_dist.max(d);
+            min_leaf_dist = min_leaf_dist.min(d);
         }
-        assert!(all_finite, "star-hub run produced non-finite positions");
-        // Hub should be near origin (gravity + balanced spring pulls).
-        let hub_r = (hub_pos[0]*hub_pos[0] + hub_pos[1]*hub_pos[1] + hub_pos[2]*hub_pos[2]).sqrt();
-        assert!(hub_r < leaf_extent * 0.5 + 5.0,
-                "hub drifted too far: hub_r={hub_r} leaf_extent={leaf_extent}");
-        // Leaves should occupy a non-degenerate volume.
-        assert!(leaf_extent > 1.0, "leaves collapsed: extent={leaf_extent}");
+        assert!(max_leaf_dist < 60.0, "leaf escaped its hub spring: {max_leaf_dist}");
+        assert!(max_leaf_dist > 1.0, "leaves collapsed onto the hub: {max_leaf_dist}");
+        assert!(min_leaf_dist.is_finite());
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -3450,6 +3046,160 @@ mod tests {
         );
         let back: GpuForceOptions = serde_json::from_str(&json).expect("deserialize");
         assert!(matches!(back.seed_mode, SeedMode::TopoFisheye));
+    }
+
+    #[test]
+    fn dispatch_grid_spills_into_y_past_the_per_dimension_cap() {
+        // Below the cap: plain 1-D.
+        assert_eq!(dispatch_grid(0), (1, 1));
+        assert_eq!(dispatch_grid(1), (1, 1));
+        assert_eq!(dispatch_grid(64), (1, 1));
+        assert_eq!(dispatch_grid(65), (2, 1));
+        let cap = MAX_WORKGROUPS_PER_DIM * WORKGROUP_SIZE;
+        assert_eq!(dispatch_grid(cap), (MAX_WORKGROUPS_PER_DIM, 1));
+        // One lane past the cap needs a second row; every emitted grid
+        // must cover the request and never exceed the cap per dimension.
+        for n in [cap + 1, cap * 3 + 7, 50_000_000, u32::MAX / 64] {
+            let (x, y) = dispatch_grid(n);
+            assert!(x <= MAX_WORKGROUPS_PER_DIM && y <= MAX_WORKGROUPS_PER_DIM, "n={n}");
+            let covered = (x as u64) * (y as u64) * (WORKGROUP_SIZE as u64);
+            assert!(covered >= n as u64, "n={n} covered={covered}");
+        }
+    }
+
+    #[test]
+    fn unknown_backend_strings_fall_back_to_default_not_exact() {
+        // A stale persisted "grid" (the retired voxel path) must land on the
+        // default backend, never on the O(n²) one.
+        assert_eq!(RepulsionMode::from_str("grid"), RepulsionMode::default());
+        assert_eq!(RepulsionMode::from_str("bogus"), RepulsionMode::default());
+        assert_eq!(RepulsionMode::from_str("exact"), RepulsionMode::Exact);
+        assert_eq!(ForceModel::from_str("nope"), ForceModel::default());
+        assert_eq!(ForceModel::from_str("t_fdp"), ForceModel::TFdp);
+        let json = r#"{"repulsion_mode":"grid","force_model":"junk"}"#;
+        let opts: GpuForceOptions = serde_json::from_str(json).expect("lenient");
+        assert_eq!(opts.repulsion_mode, RepulsionMode::default());
+        assert_eq!(opts.force_model, ForceModel::default());
+    }
+
+    #[test]
+    fn force_model_serde_round_trip() {
+        let mut opts = GpuForceOptions::default();
+        opts.force_model = ForceModel::TFdp;
+        opts.tfdp_k = 2.5;
+        let json = serde_json::to_string(&opts).expect("serialize");
+        let back: GpuForceOptions = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back.force_model, ForceModel::TFdp);
+        assert_eq!(back.tfdp_k.to_bits(), 2.5f32.to_bits());
+        assert!(opts.eq_ignoring_cursor(&back));
+    }
+
+    #[test]
+    fn sim_params_uniform_is_sixteen_byte_rows() {
+        // `SimParams` in force.wgsl is laid out as 16-byte rows; a Rust
+        // field added off-row would silently shift every later uniform.
+        assert_eq!(std::mem::size_of::<SimParamsRaw>() % 16, 0);
+        assert_eq!(std::mem::size_of::<SimParamsRaw>(), 96);
+    }
+
+    /// SNAP-tFDP estimator on a two-clique graph: connected pairs must end
+    /// up closer than pairs across the cliques, and nothing may go
+    /// non-finite — the t-force is bounded, so a coincident start must
+    /// still separate.
+    #[tokio::test(flavor = "current_thread")]
+    async fn unit_gpu_force_tfdp_negative_sampling_separates_cliques() {
+        let _gpu = gpu_test_guard();
+        let mut g = Graph::new();
+        let per = 12usize;
+        for i in 0..per * 2 {
+            g.add_node(Node::new(format!("n{i:03}")));
+        }
+        for c in 0..2 {
+            for a in 0..per {
+                for b in (a + 1)..per {
+                    g.add_edge(Edge::new(
+                        format!("e{c}_{a}_{b}"),
+                        format!("n{:03}", c * per + a),
+                        format!("n{:03}", c * per + b),
+                    ));
+                }
+            }
+        }
+        // One bridge so the graph is connected.
+        g.add_edge(Edge::new("bridge", "n000", format!("n{:03}", per)));
+        let mut layout = GpuForceLayout::new(GpuForceOptions {
+            steps_per_call: 400,
+            repulsion_mode: RepulsionMode::NegativeSampling,
+            repulsion_samples: 8,
+            force_model: ForceModel::TFdp,
+            spring_len: 100.0,
+            gravity: 0.0,
+            energy_threshold: 0.0,
+            ..Default::default()
+        });
+        match layout.run(&mut g).await {
+            Ok(()) => {}
+            Err(e) => {
+                eprintln!("skipping (no gpu adapter): {e}");
+                return;
+            }
+        }
+        let pos = |i: usize| g.nodes[&format!("n{i:03}")].position3.expect("position3");
+        let dist = |a: [f32; 3], b: [f32; 3]| {
+            ((a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2) + (a[2] - b[2]).powi(2)).sqrt()
+        };
+        let mut intra = 0.0f32;
+        let mut inter = 0.0f32;
+        let mut n_intra = 0;
+        let mut n_inter = 0;
+        for a in 0..per * 2 {
+            let pa = pos(a);
+            assert!(pa.iter().all(|v| v.is_finite()), "non-finite position for n{a:03}");
+            for b in (a + 1)..per * 2 {
+                let d = dist(pa, pos(b));
+                if (a < per) == (b < per) { intra += d; n_intra += 1; } else { inter += d; n_inter += 1; }
+            }
+        }
+        let intra = intra / n_intra as f32;
+        let inter = inter / n_inter as f32;
+        assert!(intra > 1.0, "clique collapsed to a point: mean intra={intra}");
+        assert!(inter > intra * 1.5, "cliques not separated: intra={intra} inter={inter}");
+    }
+
+    /// Above 65535 × 64 lanes a 1-D dispatch is rejected by WebGPU
+    /// validation. Ignored by default: it allocates a 4.2 M-node graph
+    /// (~1 GB host-side through `Graph`'s string-keyed maps). Run with
+    /// `cargo test -p graph-layouts --release -- --ignored dispatch_past_cap`.
+    #[tokio::test(flavor = "current_thread")]
+    #[ignore]
+    async fn unit_gpu_force_dispatch_past_cap_validates() {
+        let _gpu = gpu_test_guard();
+        let n = (MAX_WORKGROUPS_PER_DIM * WORKGROUP_SIZE + 64) as usize;
+        let mut g = Graph::new();
+        for i in 0..n {
+            g.add_node(Node::new(i.to_string()));
+        }
+        // Sparse ring so the CSR is tiny relative to the position buffers.
+        for i in 0..n {
+            g.add_edge(Edge::new(format!("e{i}"), i.to_string(), ((i + 1) % n).to_string()));
+        }
+        let mut layout = GpuForceLayout::new(GpuForceOptions {
+            steps_per_call: 1,
+            repulsion_mode: RepulsionMode::NegativeSampling,
+            repulsion_samples: 1,
+            ..Default::default()
+        });
+        match layout.run(&mut g).await {
+            Ok(()) => {}
+            Err(e) => {
+                eprintln!("skipping (no gpu adapter): {e}");
+                return;
+            }
+        }
+        // The last lane lives in the second dispatch row; it must have
+        // been integrated (moved off its seed) and stayed finite.
+        let last = g.nodes[&(n - 1).to_string()].position3.expect("position3");
+        assert!(last.iter().all(|v| v.is_finite()));
     }
 
     #[test]

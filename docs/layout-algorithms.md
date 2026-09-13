@@ -238,6 +238,107 @@ Caveats carried from verification: GPU FM³ numbers are 2008-era; SGD has no
 monotonic guarantee; stress/maxent reach local minima; all cited GPU *code* is
 CUDA except GraphWaGu.
 
+## Scale ladder — measured ceilings and what is beyond them (2026-09)
+
+Second research pass, every number below read from the cited paper's own
+text (search engines hallucinated several arXiv IDs during this pass; none of
+those are cited). Headline: **no published work lays out 10⁹ nodes.** The
+largest *measured* layouts are ~10⁷; 10⁸–10⁹ exists only as high-dimensional
+node embeddings (which still need a projection step) or as aggregate /
+community layouts.
+
+| Paper | What it measured |
+|---|---|
+| [2409.00876] GPU pangenome layout (SC'24) | path-guided SGD on CUDA; human Chr.1 **11.1 M nodes**, 6 B pair updates/iter; **57.3×** over multithreaded CPU ODGI; RTX A6000 + A100; profile is memory-bound |
+| [2608.01907] SNAP-tFDP (2026) | degree-weighted t-FDP + edge-centric negative sampling, O(\|E\|·k); **com-lj 4 M nodes / 34 M edges in 9.3 s using 0.8 GB VRAM**; lock-free "bundle by source node" parallelism |
+| [2303.03964] t-FDP (TVCG'23) | Student-t force, FFT-interpolated repulsion; 1 order faster than DRGraph on CPU, **2 orders on GPU** (RTX 2080) |
+| [2108.00529] BigGraphVis | Count-Min sketch + GPU SCoDA communities, then FA2 on the aggregate; **3 M nodes / 34 M edges ≈ 5 min** |
+| [2002.08233] BatchLayout | Flan_1565 **1.56 M / 114 M edges**, 5000 iters in 49 min on CPU (FA2-BH OOM'd) |
+| [2008.07799] DRGraph (VIS'20) | sparse BFS distance + negative sampling + multilevel; Flan_1565 823 s → 171 s on 8 threads |
+| [2008.12336] GOSH · [2110.10049] | **65 M vertices / 1.8 B edges on one GPU in < 1 h / < 30 min** — coarsening-based *embedding*, not layout |
+| [1903.00757] GraphVite · [1903.12287] PBG | 66 M / 1.8 B on 4 GPUs in ~20 h; PBG Freebase model 48.5 GB, partitioning −88 % memory |
+| [1506.06745] GraphMaps | LOD tiles, ≤ 60 nodes per tile in their setting; 38 k nodes took < 6 h preprocessing (edge routing bound) |
+| [0907.2585] GMap (GD'09) | embed → cluster → Delaunay/Voronoi → merge cells per cluster; O(\|V\| log \|V\|); **440 k vertices in 4 min** with n_r=\|V\| random + n_a=40\|V\| artificial points |
+| [1804.03329] hyperbolic tradeoffs | f32 "struggles"; perfect MAP needed a **512-bit** solver — Riemannian hyperbolic optimisation is not a WGSL job |
+
+### Hard walls in this engine (verified against wgpu-types 23 + the WebGPU spec)
+
+Fixed in the same change that added this section:
+
+- **Dispatch cap.** `maxComputeWorkgroupsPerDimension = 65535` × 64 lanes =
+  4 194 240 invocations. A 1-D `dispatch_workgroups(ceil(n/64),1,1)` was
+  rejected above that. `dispatch_1d` now spills into Y and every kernel
+  recovers its index through `linear_index()`.
+- **Buffer caps.** `Limits::downlevel_defaults()` pins storage bindings to
+  128 MiB and buffers to 256 MiB; `using_resolution` only lifts texture
+  limits. That capped positions at 8.4 M nodes and CSR at 16.7 M edges.
+  `gpu_force_device_limits()` now asks for the adapter's buffer limits (both
+  the owned device and the renderer's device use it).
+- **Dead voxel grid.** `RepulsionMode::Grid` had fallen through to the naive
+  O(n²) loop after its bindings were dropped for the 10-storage-buffer cap,
+  and `from_str` sent every unknown string there. The grid build is removed;
+  mode 0 is now the honest `Exact` reference, and unknown strings fall back
+  to the default backend.
+
+### 10⁹-node budget with this engine's buffer layout
+
+positions vec4 16 B + velocities 16 B + energy 4 B + CSR offsets 4 B +
+CSR neighbours 2m·4 B (avg degree 10 → 40 B) + spring partials 16 B =
+**96 B/node → 89 GiB at 10⁹**. A 24 GiB GPU holds ~268 M nodes at that
+layout; a wasm32 heap (4 GiB) holds ~119 M nodes of host mirror at 36 B/node
+with no adjacency. Above ~10⁷ the graph must be coarsened and rendered as
+aggregates; this is arithmetic, not tuning.
+
+### Landed
+
+- `ForceModel::TFdp` in both kernels (`spring_step` attraction, all three
+  repulsion backends) with the paper defaults α=0.1, β=8, γ=2.
+- SNAP-tFDP as a *node-centric* estimator: under `NegativeSampling` + t-FDP
+  each sampled pair is weighted `(deg_i + deg_j)/2` and scaled by `tfdp_k/K`,
+  which is exactly the expectation the paper's eq. 6 derives for its
+  edge-centric sampler. Their "bundle by source node" scheme *is* one thread
+  per CSR row — the shape this engine already had — so no racing writes to
+  other nodes' positions are introduced (WGSL has no f32 atomics).
+
+### Remaining, in dependency order
+
+1. **GPU octree build, or stochastic Barnes-Hut.** The BH tree is still built
+   on the host every call (`octree.wgsl` kernels are stubs). [2506.02219]
+   reports up to 9.4× less time than GPU deterministic BH at equal median
+   error on Coulomb-style sums (graphics kernels, not graph layout — verify
+   on our workloads).
+2. **Multilevel on the device.** `coarsen.rs` is CPU-only and only seeds
+   frame 0. GOSH's single-GPU 65 M/1.8 B result is coarsening doing the work.
+3. **Aggregate view above ~10⁷ nodes.** Two published shapes: GraphMaps-style
+   LOD tiles with a per-tile node budget, or GMap-style cluster regions.
+   GMap's inputs already exist here — Louvain in `graph-metrics`, positions
+   from this engine — and its Delaunay/Voronoi/merge step has a wgpu-native
+   substitute: rasterise the cluster-id Voronoi with a jump-flood pass in a
+   fragment shader (O(pixels · log pixels) per frame, no host geometry), then
+   draw region outlines from the id texture. Open questions before building:
+   2-D projection of the 3-D sim for region maps; which metric drives
+   cluster membership per zoom level; label placement.
+4. **Out-of-core positions/CSR** (PBG/GOSH partition staging) — only after 3,
+   since the aggregate view decides what has to be resident.
+
+Not planned: pairwise SGD stress inside a compute shader (single-pair
+updates conflict; the GPU-viable form is the sampled SGD of [2409.00876]),
+and hyperbolic optimisation in f32 (see [1804.03329]); hyperbolic
+*rendering* of a host-computed embedding is fine.
+
+Test-harness note: the `graph-layouts` *library* builds wgpu with
+`default-features = false` (no Metal/Vulkan/DX12 — native consumers bring
+those), and its GPU tests return early as a pass when no adapter exists. Until
+this change `cargo test -p graph-layouts` therefore never touched a device, and
+`unit_gpu_force_star_hub_stable` had been failing on every real GPU behind
+that skip (its hub-near-origin assertion pinned an equilibrium of a
+deliberately asymmetric seeding, not the Tigr hub-split contract). A
+native-only dev-dependency now enables `metal`/`dx12` for this crate's own
+test binaries, and the test asserts what it defends: finite positions, no
+stall, leaves bound to the hub. The 4.2 M-node dispatch test stays
+`#[ignore]`d (≈1 GB host allocation); run it with
+`cargo test -p graph-layouts --release --lib dispatch_past_cap -- --ignored`.
+
 ---
 
 ## References
@@ -263,3 +364,18 @@ Quality marked as classified by the research pass (primary = paper/official repo
 - [distfdl] Distributed force-directed graph layout and visualization. <https://www.researchgate.net/publication/262400359_Distributed_force-directed_graph_layout_and_visualization>
 - [jia] Jia et al., out-of-core/distributed graph processing, VLDB. <http://www.vldb.org/pvldb/vol11/p297-jia.pdf>
 - GPUGraphLayout — GPU-only Barnes-Hut ForceAtlas2. <https://github.com/govertb/GPUGraphLayout>
+- [2409.00876] Rapid GPU-Based Pangenome Graph Layout (SC'24). <https://arxiv.org/abs/2409.00876>
+- [2608.01907] SNAP-tFDP: Massively Scalable Graph Layouts via Sparse Negative Sampling. <https://arxiv.org/abs/2608.01907>
+- [2303.03964] Force-Directed Graph Layouts Revisited: A New Force Based on the T-Distribution (TVCG 2023). <https://arxiv.org/abs/2303.03964>
+- [2108.00529] BigGraphVis. <https://arxiv.org/abs/2108.00529>
+- [2002.08233] BatchLayout. <https://arxiv.org/abs/2002.08233>
+- [2008.07799] DRGraph (VIS 2020). <https://arxiv.org/abs/2008.07799>
+- [2008.12336] GOSH: Embedding Big Graphs on Small Hardware. <https://arxiv.org/abs/2008.12336>
+- [2110.10049] Boosting Graph Embedding on a Single GPU. <https://arxiv.org/abs/2110.10049>
+- [1903.00757] GraphVite. <https://arxiv.org/abs/1903.00757>
+- [1903.12287] PyTorch-BigGraph. <https://arxiv.org/abs/1903.12287>
+- [1506.06745] GraphMaps: Browsing Large Graphs as Interactive Maps. <https://arxiv.org/abs/1506.06745>
+- [0907.2585] GMap: Drawing Graphs as Maps (Gansner, Hu, Kobourov). <https://arxiv.org/abs/0907.2585> · <https://graphviz.org/documentation/GHK09.pdf>
+- [1804.03329] Representation Tradeoffs for Hyperbolic Embeddings. <https://arxiv.org/abs/1804.03329>
+- [2506.02219] Stochastic Barnes-Hut Approximation for Fast Summation on the GPU. <https://arxiv.org/abs/2506.02219>
+- Gansner & Hu, PRISM node-overlap removal (JGAA 2010) — post-process, not a layout engine. <https://graphviz.org/documentation/GH10.pdf>

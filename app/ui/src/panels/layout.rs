@@ -40,7 +40,7 @@ use graph_layouts::{
     BoxedPhysics, BoxedStatic, CircleAxis, CircleLayout, CircleSettings, CiseLayout, CiseSettings,
     ConcentricLayout, ConcentricMetric, ConcentricSettings, CoseBilkentLayout, CoseBilkentSettings,
     DagreLayout, DagreRanker, DagreSettings, DynPhysicsLayout, DynStaticLayout, FcoseLayout,
-    FcoseQuality, FcoseSettings, GpuForceLayout, GpuForceOptions, Graph, GridLayout, GridSettings,
+    FcoseQuality, FcoseSettings, ForceModel, GpuForceLayout, GpuForceOptions, Graph, GridLayout, GridSettings,
     HilbertLayout, HilbertSettings, KlayLayout, KlaySettings, LayoutDescriptor, LayoutKind,
     LayoutRequirements, PhysicsLayout, RandomLayout, RandomSettings, RankDirection, RepulsionMode,
     SpectralLayout, SpectralSettings, SphereLayout, SphereSettings, StaticLayout,
@@ -3560,6 +3560,7 @@ fn gpu_force_ui() -> Element {
     let opts: GpuForceOptions = typed_settings("gpu-force");
     let active_preset = LayoutPreset::detect(&opts).unwrap_or_default();
     let repulsion_mode = opts.repulsion_mode;
+    let force_model = opts.force_model;
 
     rsx! {
         // Reset lives in the top-row ↺ (resets the active engine); no
@@ -3614,25 +3615,56 @@ fn gpu_force_ui() -> Element {
 
         hr { class: "lay-sep" }
 
+        div { class: "lay-sub", "Force model" }
+        div { class: "lay-hint", "Spring-electrical: classic; t-FDP: bounded t-forces, tighter clusters" }
+        div { class: "lay-row",
+            span { class: "lay-k", "law" }
+            select {
+                class: "lay-select",
+                value: match force_model {
+                    ForceModel::SpringElectrical => "spring",
+                    ForceModel::TFdp => "tfdp",
+                },
+                onchange: move |e| edit::<GpuForceOptions>("gpu-force", |o| {
+                    o.force_model = match e.value().as_str() {
+                        "tfdp" => ForceModel::TFdp,
+                        _ => ForceModel::SpringElectrical,
+                    };
+                }),
+                option { value: "spring", selected: force_model == ForceModel::SpringElectrical, "Spring-electrical" }
+                option { value: "tfdp", selected: force_model == ForceModel::TFdp, "t-FDP (Student-t)" }
+            }
+        }
+        if force_model == ForceModel::TFdp {
+            Slider { label: "α attract", min: 0.01, max: 2.0, value: opts.tfdp_alpha as f64, log: true,
+                on: move |v: f64| edit::<GpuForceOptions>("gpu-force", |o| o.tfdp_alpha = v as f32) }
+            Slider { label: "β short-range", min: 0.0, max: 32.0, value: opts.tfdp_beta as f64,
+                on: move |v: f64| edit::<GpuForceOptions>("gpu-force", |o| o.tfdp_beta = v as f32) }
+            Slider { label: "γ decay", min: 0.5, max: 4.0, value: opts.tfdp_gamma as f64,
+                on: move |v: f64| edit::<GpuForceOptions>("gpu-force", |o| o.tfdp_gamma = v as f32) }
+        }
+
+        hr { class: "lay-sep" }
+
         div { class: "lay-sub", "Repulsion backend" }
-        div { class: "lay-hint", "Grid: dense small; BH: clustered; NS: huge" }
+        div { class: "lay-hint", "Exact: tiny graphs; BH: clustered; NS: huge" }
         div { class: "lay-row",
             span { class: "lay-k", "mode" }
             select {
                 class: "lay-select",
                 value: match repulsion_mode {
-                    RepulsionMode::Grid => "grid",
+                    RepulsionMode::Exact => "exact",
                     RepulsionMode::BarnesHut => "bh",
                     RepulsionMode::NegativeSampling => "ns",
                 },
                 onchange: move |e| edit::<GpuForceOptions>("gpu-force", |o| {
                     o.repulsion_mode = match e.value().as_str() {
-                        "bh" => RepulsionMode::BarnesHut,
+                        "exact" => RepulsionMode::Exact,
                         "ns" => RepulsionMode::NegativeSampling,
-                        _ => RepulsionMode::Grid,
+                        _ => RepulsionMode::BarnesHut,
                     };
                 }),
-                option { value: "grid", selected: repulsion_mode == RepulsionMode::Grid, "Grid (27-cell)" }
+                option { value: "exact", selected: repulsion_mode == RepulsionMode::Exact, "Exact (O(n²))" }
                 option { value: "bh", selected: repulsion_mode == RepulsionMode::BarnesHut, "Barnes-Hut" }
                 option { value: "ns", selected: repulsion_mode == RepulsionMode::NegativeSampling, "Negative sampling" }
             }
@@ -3642,6 +3674,10 @@ fn gpu_force_ui() -> Element {
                 on: move |v: f64| edit::<GpuForceOptions>("gpu-force", |o| {
                     o.repulsion_samples = v.round().max(1.0) as u32;
                 }) }
+            if force_model == ForceModel::TFdp {
+                Slider { label: "k weight", min: 0.1, max: 16.0, value: opts.tfdp_k as f64, log: true,
+                    on: move |v: f64| edit::<GpuForceOptions>("gpu-force", |o| o.tfdp_k = v as f32) }
+            }
         }
     }
 }

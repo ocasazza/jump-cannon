@@ -32,8 +32,10 @@ chrono = { version = "0.4", optional = true }
 console_error_panic_hook = { version = "0.1.7", optional = false }
 
 # WebGPU compute backend for the 3D force-directed layout.
-# wgpu's WebGPU backend targets browsers; webgl is the fallback. Native picks
-# vulkan/metal/dx12 from the default backend set.
+# wgpu's WebGPU backend targets browsers; webgl is the fallback. The library
+# itself enables NO native backend — consumers that run natively (graph-api,
+# graph-compute, the Tauri shell) bring vulkan/metal/dx12 through their own
+# wgpu features, which cargo unifies into this crate.
 wgpu     = { version = "23", default-features = false, features = ["webgpu", "webgl", "wgsl"] }
 bytemuck = { version = "1", features = ["derive"] }
 pollster = "0.4"
@@ -44,6 +46,13 @@ log = "0.4"
 # coarsener used as a `SeedMode` for the force-directed sim. Pure Rust, no
 # transitive deps, works on WASM.
 delaunator = "1.0"
+
+# The GPU tests in `gpu_force.rs` skip (pass) when no adapter exists. Without
+# a native backend `cargo test -p graph-layouts` alone never had one, so every
+# GPU test was a silent no-op. Bring metal/dx12 in for this crate's own test
+# binaries only (vulkan is unconditional on Linux/Windows in wgpu 23).
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+wgpu = { version = "23", default-features = false, features = ["metal", "dx12"] }
 
 [dev-dependencies]
 wasm-bindgen-test = "0.3.34"

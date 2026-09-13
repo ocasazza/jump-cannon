@@ -1818,18 +1818,16 @@ impl RenderHost {
             .await
             .ok_or_else(|| "no compatible WebGPU adapter".to_string())?;
 
-        // The compute pipeline (`force_step` + `spring_step`) binds 14
-        // storage buffers in a single stage — positions in/out,
-        // velocities, edges via CSR (offsets + neighbors), mass,
-        // virtual-vertex CSR, spring force partials, energy, plus the
-        // octree (nodes + ropes) for the Barnes-Hut path. Chrome's
-        // WebGPU default cap is 10, so bump to 14 minimum; cap at the
-        // adapter-reported max so we don't request more than the
-        // hardware can serve. Mirrors the standalone Renderer + the
-        // egui app's main.rs.
+        // Start from the force engine's limits (adapter-sized storage
+        // buffer / buffer size so the position and CSR buffers are not
+        // capped at WebGPU's 128 MiB / 256 MiB defaults — see
+        // `graph_layouts::gpu_force_device_limits`), then bump the
+        // per-stage storage-buffer count for the renderer's own pipelines.
+        // Chrome's WebGPU default cap is 10; request 14 minimum, capped at
+        // the adapter-reported max so we never ask for more than the
+        // hardware can serve.
         let adapter_limits = adapter.limits();
-        let mut limits =
-            wgpu::Limits::downlevel_defaults().using_resolution(adapter_limits.clone());
+        let mut limits = graph_layouts::gpu_force_device_limits(&adapter_limits);
         limits.max_storage_buffers_per_shader_stage = limits
             .max_storage_buffers_per_shader_stage
             .max(14)

@@ -47,3 +47,26 @@ active workflows rather than persistent configuration.
 The default renderer runs `graph-layouts` in the browser. Larger or shared work
 can use [[Compute]]. Treat layout speed, readability, and interaction latency as
 separate measurements under [[Performance Engineering]].
+
+## GPU force engine controls
+
+The in-browser `gpu-force` engine exposes two independent choices on the
+Layout tab:
+
+- **Force model** — *Spring-electrical* (Hooke springs + Coulomb repulsion,
+  the historical look) or *t-FDP* (Student-t forces: bounded short-range
+  repulsion, tighter clusters, clearer inter-cluster gaps). t-FDP adds the
+  α / β / γ sliders; the defaults (0.1 / 8 / 2) are the published ones.
+- **Repulsion backend** — *Exact* (every pair, O(n²): tiny graphs and
+  reference comparisons), *Barnes-Hut* (default; octree, best on clustered
+  vaults), or *Negative sampling* (K random partners per node per step; the
+  only backend whose cost does not depend on how clustered the layout is, so
+  it is the large-graph path). With t-FDP, negative sampling weights each
+  sampled pair by the endpoints' degrees and exposes a *k weight* slider —
+  the SNAP-tFDP estimator, which reproduces the degree-weighted t-FDP
+  objective in expectation.
+
+A persisted backend or force-model value the current build does not recognise
+falls back to the default rather than to the exact O(n²) path. The scale
+limits of this engine and the planned steps beyond them are tracked in
+`docs/layout-algorithms.md` §"Scale ladder".
