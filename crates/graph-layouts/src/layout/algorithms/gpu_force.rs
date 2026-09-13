@@ -580,6 +580,17 @@ impl<'de> serde::Deserialize<'de> for GpuForceOptions {
     }
 }
 
+/// Index-based topology for the string-free ingest path. `edges` is the
+/// undirected edge list `[s0, t0, s1, t1, ...]` (each edge listed once,
+/// indices `< n_nodes`). `positions`, when `Some`, is `[x, y, z]` per node
+/// and overrides the seeder wholesale; when `None` the layout seeds per its
+/// configured [`SeedMode`].
+pub struct CsrInput<'a> {
+    pub n_nodes: u32,
+    pub edges: &'a [u32],
+    pub positions: Option<&'a [f32]>,
+}
+
 /// Owns the wgpu device + queue when the layout is constructed via the
 /// legacy `run()` path. The shared/borrowed path leaves this `None` since
 /// the caller's renderer owns those.
@@ -726,33 +737,10 @@ impl GpuForceLayout {
             }
         };
         if needs_rebuild {
-            // Acquire our own device/queue if we haven't already.
-            if self.owned_device.is_none() {
-                let instance = wgpu::Instance::default();
-                let adapter = instance
-                    .request_adapter(&wgpu::RequestAdapterOptions {
-                        power_preference: wgpu::PowerPreference::HighPerformance,
-                        compatible_surface: None,
-                        force_fallback_adapter: false,
-                    })
-                    .await
-                    .ok_or_else(|| "no GPU adapter".to_string())?;
-                let (device, queue) = adapter
-                    .request_device(
-                        &wgpu::DeviceDescriptor {
-                            label: Some("graph-layouts/gpu_force"),
-                            required_features: wgpu::Features::empty(),
-                            required_limits: gpu_force_device_limits(&adapter.limits()),
-                            memory_hints: wgpu::MemoryHints::Performance,
-                        },
-                        None,
-                    )
-                    .await
-                    .map_err(|e| format!("request_device failed: {e}"))?;
-                self.owned_device = Some(OwnedDevice { device, queue });
-            }
+            self.ensure_owned_device().await?;
             let od = self.owned_device.as_ref().unwrap();
-            self.state = Some(GpuState::new_owned(&od.device, graph, &self.options)?);
+            let pc = precompute(graph, &self.options.seed_mode, self.options.spring_len);
+            self.state = Some(GpuState::new_owned(&od.device, pc)?);
         }
 
         let od = self
@@ -760,54 +748,14 @@ impl GpuForceLayout {
             .as_ref()
             .ok_or_else(|| "owned device missing".to_string())?;
         let state = self.state.as_mut().unwrap();
-        // First-call init for cooling. `effective_damping` is constructed
-        // at 1.0 in `GpuState::new_*`; the `<= 0.0` branch also catches the
-        // edge case where someone explicitly set `damping = 0.0` ("freeze
-        // immediately"), in which case `effective_damping` stays 0.0 (the
-        // re-init writes 0.0 back). Idempotent — no oscillation.
-        // TODO(cooling): if a "freeze immediately" mode is ever a real UX
-        // affordance, replace this branch with a separate `frozen` flag.
-        if state.effective_damping <= 0.0 || state.effective_damping > 1.0 {
-            state.effective_damping = self.options.damping;
-        }
-        // Cool damping per call. See `GpuForceOptions::cooling_alpha` for
-        // the formula and the rationale behind the inner `floor.min(damping)`
-        // (it is *not* a typo for `.max` — see doc-comment).
-        let alpha = self.options.cooling_alpha.clamp(0.5, 1.0);
-        let floor = self.options.cooling_floor.clamp(0.0, 1.0);
-        state.effective_damping = (state.effective_damping * alpha).max(floor.min(self.options.damping));
-
-        // Barnes-Hut builds its octree entirely on the GPU once per call,
-        // reading the current positions. No host readback, no CPU tree.
-        if matches!(self.options.repulsion_mode, RepulsionMode::BarnesHut) {
-            let (pos_in, _) = state.owned_in_out();
-            let mut enc = od.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("octree_build"),
-            });
-            state
-                .octree
-                .encode_build(&od.device, &mut enc, pos_in, &state.oct_nodes_buf);
-            od.queue.submit(Some(enc.finish()));
-        }
-        let mut steps_done = 0u32;
-        let total_steps = self.options.steps_per_call.max(1);
-        for s in 0..total_steps {
-            // Re-write params per step so step_index advances under
-            // negative sampling (the WGSL PRNG keys off it). The other
-            // backends ignore step_index but the write is cheap.
-            state.write_params(&od.queue, &self.options, self.step_index);
-            self.step_index = self.step_index.wrapping_add(1);
-            let _ = s;
-            state.dispatch_step_direct(&od.device, &od.queue);
-            state.swap_position_buffers();
-            steps_done += 1;
-        }
-        let _ = steps_done;
+        encode_owned_steps(od, state, &self.options, &mut self.step_index);
         let positions = state.read_positions_owned(&od.device, &od.queue).await?;
         // Write back into the graph in the same id-order we built the buffer.
-        for (id, p) in state.node_order.iter().zip(positions.chunks_exact(4)) {
-            if let Some(node) = graph.nodes.get_mut(id) {
-                node.position3 = Some([p[0], p[1], p[2]]);
+        if let Some(order) = state.node_order.as_ref() {
+            for (id, p) in order.iter().zip(positions.chunks_exact(4)) {
+                if let Some(node) = graph.nodes.get_mut(id) {
+                    node.position3 = Some([p[0], p[1], p[2]]);
+                }
             }
         }
         Ok(())
@@ -831,7 +779,8 @@ impl GpuForceLayout {
         graph: &Graph,
         positions_buffer: &wgpu::Buffer,
     ) -> Result<(), String> {
-        let state = GpuState::new_borrowed(device, graph, positions_buffer, &self.options)?;
+        let pc = precompute(graph, &self.options.seed_mode, self.options.spring_len);
+        let state = GpuState::new_borrowed(device, positions_buffer, pc)?;
         // SeedMode::None means "keep whatever is already in the shared buffer":
         // skip the write_buffer that would clobber meaningful caller-supplied
         // positions (generated sphere, applied seed, prior settled state).
@@ -841,6 +790,113 @@ impl GpuForceLayout {
             state.upload_initial_positions_to(queue, positions_buffer);
         }
         self.state = Some(state);
+        Ok(())
+    }
+
+    /// Acquire and cache an owned `wgpu::Device`/`Queue` for the `run` /
+    /// `run_csr` paths. No-op once one exists.
+    async fn ensure_owned_device(&mut self) -> Result<(), String> {
+        if self.owned_device.is_some() {
+            return Ok(());
+        }
+        let instance = wgpu::Instance::default();
+        let adapter = instance
+            .request_adapter(&wgpu::RequestAdapterOptions {
+                power_preference: wgpu::PowerPreference::HighPerformance,
+                compatible_surface: None,
+                force_fallback_adapter: false,
+            })
+            .await
+            .ok_or_else(|| "no GPU adapter".to_string())?;
+        let (device, queue) = adapter
+            .request_device(
+                &wgpu::DeviceDescriptor {
+                    label: Some("graph-layouts/gpu_force"),
+                    required_features: wgpu::Features::empty(),
+                    required_limits: gpu_force_device_limits(&adapter.limits()),
+                    memory_hints: wgpu::MemoryHints::Performance,
+                },
+                None,
+            )
+            .await
+            .map_err(|e| format!("request_device failed: {e}"))?;
+        self.owned_device = Some(OwnedDevice { device, queue });
+        Ok(())
+    }
+
+    /// String-free counterpart to [`init_with_device`]: build GPU compute
+    /// resources from an index-based [`CsrInput`] against a caller-supplied
+    /// device + queue + positions buffer. No [`Graph`] is materialised.
+    pub fn init_with_device_csr(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        input: &CsrInput<'_>,
+        positions_buffer: &wgpu::Buffer,
+    ) -> Result<(), String> {
+        let pc = precompute_csr(
+            input.n_nodes,
+            input.edges,
+            input.positions,
+            &self.options.seed_mode,
+            self.options.spring_len,
+        );
+        let state = GpuState::new_borrowed(device, positions_buffer, pc)?;
+        // SeedMode::None means "keep whatever is already in the shared buffer";
+        // every other mode uploads the seeded (or caller-supplied) positions.
+        if !matches!(self.options.seed_mode, SeedMode::None) {
+            state.upload_initial_positions_to(queue, positions_buffer);
+        }
+        self.state = Some(state);
+        Ok(())
+    }
+
+    /// Owned-device, string-free run: (re)builds GPU state from `input`,
+    /// steps `steps_per_call` times, and writes `[x, y, z]` per node into
+    /// `out` (cleared and resized). Never allocates a [`Graph`].
+    pub async fn run_csr(
+        &mut self,
+        input: &CsrInput<'_>,
+        out: &mut Vec<f32>,
+    ) -> Result<(), String> {
+        let n_edges = (input.edges.len() / 2) as u32;
+        let needs_rebuild = match &self.state {
+            None => true,
+            Some(state) => {
+                state.n_nodes != input.n_nodes
+                    || state.n_edges != n_edges
+                    || !matches!(state.positions, PositionsStorage::Owned { .. })
+            }
+        };
+        if needs_rebuild {
+            self.ensure_owned_device().await?;
+            let od = self.owned_device.as_ref().unwrap();
+            let pc = precompute_csr(
+                input.n_nodes,
+                input.edges,
+                input.positions,
+                &self.options.seed_mode,
+                self.options.spring_len,
+            );
+            self.state = Some(GpuState::new_owned(&od.device, pc)?);
+        }
+
+        let od = self
+            .owned_device
+            .as_ref()
+            .ok_or_else(|| "owned device missing".to_string())?;
+        let state = self.state.as_mut().unwrap();
+        encode_owned_steps(od, state, &self.options, &mut self.step_index);
+        let positions = state.read_positions_owned(&od.device, &od.queue).await?;
+        // Strip the vec4 padding down to `[x, y, z]` per node.
+        let n = state.n_nodes as usize;
+        out.clear();
+        out.reserve(n * 3);
+        for p in positions.chunks_exact(4).take(n) {
+            out.push(p[0]);
+            out.push(p[1]);
+            out.push(p[2]);
+        }
         Ok(())
     }
 
@@ -1015,6 +1071,53 @@ impl GpuForceLayout {
     }
 }
 
+/// Cool damping and record `steps_per_call` owned-device force steps into a
+/// fresh encoder each step, advancing `step_index`. Shared by `run` and
+/// `run_csr` (the `Graph` and CSR owned-device entry points).
+fn encode_owned_steps(
+    od: &OwnedDevice,
+    state: &mut GpuState,
+    options: &GpuForceOptions,
+    step_index: &mut u32,
+) {
+    // First-call init for cooling. `effective_damping` is constructed at 1.0
+    // in `GpuState::new_*`; the `<= 0.0` branch also catches the edge case
+    // where someone explicitly set `damping = 0.0` ("freeze immediately"),
+    // in which case `effective_damping` stays 0.0 (the re-init writes 0.0
+    // back). Idempotent — no oscillation.
+    if state.effective_damping <= 0.0 || state.effective_damping > 1.0 {
+        state.effective_damping = options.damping;
+    }
+    // Cool damping per call. See `GpuForceOptions::cooling_alpha` for the
+    // formula and the rationale behind the inner `floor.min(damping)`.
+    let alpha = options.cooling_alpha.clamp(0.5, 1.0);
+    let floor = options.cooling_floor.clamp(0.0, 1.0);
+    state.effective_damping = (state.effective_damping * alpha).max(floor.min(options.damping));
+
+    // Barnes-Hut builds its octree entirely on the GPU once per call,
+    // reading the current positions. No host readback, no CPU tree.
+    if matches!(options.repulsion_mode, RepulsionMode::BarnesHut) {
+        let (pos_in, _) = state.owned_in_out();
+        let mut enc = od.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("octree_build"),
+        });
+        state
+            .octree
+            .encode_build(&od.device, &mut enc, pos_in, &state.oct_nodes_buf);
+        od.queue.submit(Some(enc.finish()));
+    }
+    let total_steps = options.steps_per_call.max(1);
+    for _ in 0..total_steps {
+        // Re-write params per step so step_index advances under negative
+        // sampling (the WGSL PRNG keys off it). Other backends ignore it but
+        // the write is cheap.
+        state.write_params(&od.queue, options, *step_index);
+        *step_index = step_index.wrapping_add(1);
+        state.dispatch_step_direct(&od.device, &od.queue);
+        state.swap_position_buffers();
+    }
+}
+
 // ---------- Internal GPU state ----------------------------------------------
 
 /// Mirrors `SimParams` in `shaders/force.wgsl` field-for-field. Every row
@@ -1162,7 +1265,7 @@ struct GpuState {
 
 
     /// Stable node-id ordering used to interpret the position buffer.
-    node_order: Vec<String>,
+    node_order: Option<Vec<String>>,
 
     /// Effective damping currently in use; cooled per call.
     effective_damping: f32,
@@ -1184,7 +1287,7 @@ const HUB_THRESHOLD: u32 = 32;
 struct PreCompute {
     n_nodes: u32,
     n_edges: u32,
-    node_order: Vec<String>,
+    node_order: Option<Vec<String>>,
     initial_positions: Vec<f32>, // padded vec4-per-node
     velocities: Vec<f32>,
     edge_offsets: Vec<u32>,
@@ -1198,22 +1301,19 @@ struct PreCompute {
     node_to_virt_offsets: Vec<u32>,
 }
 
-fn precompute(graph: &Graph, seed_mode: &SeedMode, spring_len: f32) -> PreCompute {
-    let n_nodes = graph.nodes.len() as u32;
-    let n_edges = graph.edges.len() as u32;
-
-    let mut node_order: Vec<String> = graph.nodes.keys().cloned().collect();
-    node_order.sort();
-    let id_to_idx: std::collections::HashMap<&str, u32> = node_order
-        .iter()
-        .enumerate()
-        .map(|(i, id)| (id.as_str(), i as u32))
-        .collect();
-
+/// Seed initial node positions in flat `[x, y, z]` form (three floats per
+/// node) for the given [`SeedMode`]. `edges` is the index-based undirected
+/// edge list `[s0, t0, s1, t1, ...]`; the TopoFisheye seeder filters
+/// self-loops and out-of-range endpoints. `None` yields zeros (the caller
+/// supplies meaningful positions separately).
+fn seed_positions_flat(
+    n_nodes: u32,
+    edges: &[u32],
+    seed_mode: &SeedMode,
+    spring_len: f32,
+) -> Vec<f32> {
+    let n = n_nodes as usize;
     let radius = ((n_nodes as f32).max(1.0).sqrt()) * 5.0;
-    // Compute the seed in flat xyz form (the seeders share a buffer format),
-    // then expand to vec4-padded `[x,y,z,0]` for the GPU. Nodes with an
-    // author-supplied `position3` override the seeder for that slot.
     let mut seeded: Vec<f32> = match seed_mode {
         SeedMode::Random => {
             let mut s: u32 = 0x9E37_79B1;
@@ -1226,70 +1326,89 @@ fn precompute(graph: &Graph, seed_mode: &SeedMode, spring_len: f32) -> PreComput
                 .collect()
         }
         SeedMode::TopoFisheye => {
-            // Build a flat undirected edge list in id-sorted node order.
-            let mut edges: Vec<u32> = Vec::with_capacity(graph.edges.len() * 2);
-            for e in graph.edges.values() {
-                let (Some(&s), Some(&t)) = (
-                    id_to_idx.get(e.source.as_str()),
-                    id_to_idx.get(e.target.as_str()),
-                ) else {
-                    continue;
-                };
-                if s == t {
+            // Build a flat undirected edge list, filtering self-loops and
+            // out-of-range endpoints exactly as the historical path did.
+            let mut fe: Vec<u32> = Vec::with_capacity(edges.len());
+            let mut k = 0;
+            while k + 1 < edges.len() {
+                let s = edges[k];
+                let t = edges[k + 1];
+                k += 2;
+                if s == t || s as usize >= n || t as usize >= n {
                     continue;
                 }
-                edges.push(s);
-                edges.push(t);
+                fe.push(s);
+                fe.push(t);
             }
             crate::layout::topo_fisheye::seed_positions(
-                n_nodes as usize,
-                &edges,
+                n,
+                &fe,
                 spring_len.max(1.0),
                 0x9E37_79B1,
                 &crate::layout::topo_fisheye::CoarsenParams::default(),
             )
         }
-        // No generated seed: zeros as a base. Every node carries a meaningful
-        // `position3` in this mode (the caller synced it from the live buffer),
-        // so the override below replaces these zeros for the CPU mirror, and
-        // `init_with_device` skips the GPU upload entirely.
-        SeedMode::None => vec![0.0f32; 3 * n_nodes as usize],
+        // No generated seed: zeros as a base. The caller either supplies
+        // meaningful positions (which override these) or accepts zeros.
+        SeedMode::None => vec![0.0f32; 3 * n],
     };
     // Defensive: if the seeder returned the wrong length (e.g. empty graph
     // edge case), fall back to a zero ball so downstream sizing stays sane.
-    if seeded.len() != 3 * n_nodes as usize {
-        seeded = vec![0.0f32; 3 * n_nodes as usize];
+    if seeded.len() != 3 * n {
+        seeded = vec![0.0f32; 3 * n];
     }
+    seeded
+}
 
-    let mut positions: Vec<f32> = Vec::with_capacity(n_nodes as usize * 4);
-    for (idx, id) in node_order.iter().enumerate() {
-        let n = &graph.nodes[id];
-        let p = n.position3.unwrap_or_else(|| {
-            [
-                seeded[3 * idx],
-                seeded[3 * idx + 1],
-                seeded[3 * idx + 2],
-            ]
-        });
-        positions.extend_from_slice(&[p[0], p[1], p[2], 0.0]);
+/// Index-based pre-compute: the real work behind [`precompute`], with no
+/// string ids and no [`Graph`]. `edges` is the undirected edge list
+/// `[s0, t0, s1, t1, ...]` (each edge once, indices `< n_nodes`); self-loops
+/// and out-of-range endpoints are skipped. `positions`, when `Some`, is a
+/// flat `[x, y, z]` triple per node that overrides the seeder for every
+/// node; when `None` the seeder runs per `seed_mode`. `node_order` is `None`
+/// on this path (there are no ids to map back through).
+fn precompute_csr(
+    n_nodes: u32,
+    edges: &[u32],
+    positions: Option<&[f32]>,
+    seed_mode: &SeedMode,
+    spring_len: f32,
+) -> PreCompute {
+    let n = n_nodes as usize;
+    // Base flat xyz: caller-supplied positions override the seeder wholesale.
+    let base: Vec<f32> = match positions {
+        Some(p) if p.len() == 3 * n => p.to_vec(),
+        Some(p) => {
+            // Wrong length: use what fits, zero-fill the rest.
+            let mut v = vec![0.0f32; 3 * n];
+            let m = p.len().min(3 * n);
+            v[..m].copy_from_slice(&p[..m]);
+            v
+        }
+        None => seed_positions_flat(n_nodes, edges, seed_mode, spring_len),
+    };
+
+    // Expand to vec4-padded `[x, y, z, 0]`; mass is injected into .w below.
+    let mut positions_v: Vec<f32> = Vec::with_capacity(n * 4);
+    for i in 0..n {
+        positions_v.extend_from_slice(&[base[3 * i], base[3 * i + 1], base[3 * i + 2], 0.0]);
     }
-    let velocities: Vec<f32> = vec![0.0; n_nodes as usize * 4];
+    let velocities: Vec<f32> = vec![0.0; n * 4];
 
-    let mut adj: Vec<Vec<u32>> = vec![Vec::new(); n_nodes as usize];
-    for e in graph.edges.values() {
-        let (Some(&s), Some(&t)) = (
-            id_to_idx.get(e.source.as_str()),
-            id_to_idx.get(e.target.as_str()),
-        ) else {
-            continue;
-        };
-        if s == t {
+    // CSR adjacency (undirected: each edge contributes both directions).
+    let mut adj: Vec<Vec<u32>> = vec![Vec::new(); n];
+    let mut k = 0;
+    while k + 1 < edges.len() {
+        let s = edges[k];
+        let t = edges[k + 1];
+        k += 2;
+        if s == t || s as usize >= n || t as usize >= n {
             continue;
         }
         adj[s as usize].push(t);
         adj[t as usize].push(s);
     }
-    let mut edge_offsets: Vec<u32> = Vec::with_capacity(n_nodes as usize + 1);
+    let mut edge_offsets: Vec<u32> = Vec::with_capacity(n + 1);
     let mut edge_neighbors: Vec<u32> = Vec::new();
     let mut acc: u32 = 0;
     edge_offsets.push(0);
@@ -1313,8 +1432,8 @@ fn precompute(graph: &Graph, seed_mode: &SeedMode, spring_len: f32) -> PreComput
     // here is enough; the shader preserves .w on every position write.
     for (i, m) in mass.iter().enumerate() {
         let w_off = 4 * i + 3;
-        if w_off < positions.len() {
-            positions[w_off] = *m;
+        if w_off < positions_v.len() {
+            positions_v[w_off] = *m;
         }
     }
     let mass = if mass.is_empty() { vec![1.0f32] } else { mass };
@@ -1330,13 +1449,13 @@ fn precompute(graph: &Graph, seed_mode: &SeedMode, spring_len: f32) -> PreComput
     //   virt_edge_offsets[v+1] = one past last edge_neighbor index for v
     // At a real-vertex boundary we patch the last entry so v+1's start
     // equals the new real vertex's chunk start (covers the degree-0 case).
-    let mut virt_real_idx: Vec<u32> = Vec::with_capacity(n_nodes as usize);
-    let mut virt_edge_offsets: Vec<u32> = Vec::with_capacity(n_nodes as usize + 1);
-    let mut node_to_virt_offsets: Vec<u32> = Vec::with_capacity(n_nodes as usize + 1);
+    let mut virt_real_idx: Vec<u32> = Vec::with_capacity(n);
+    let mut virt_edge_offsets: Vec<u32> = Vec::with_capacity(n + 1);
+    let mut node_to_virt_offsets: Vec<u32> = Vec::with_capacity(n + 1);
     virt_edge_offsets.push(0);
     node_to_virt_offsets.push(0);
     let mut virt_count: u32 = 0;
-    for i in 0..n_nodes as usize {
+    for i in 0..n {
         let start = edge_offsets[i];
         let end = edge_offsets[i + 1];
         let deg = end - start;
@@ -1371,9 +1490,9 @@ fn precompute(graph: &Graph, seed_mode: &SeedMode, spring_len: f32) -> PreComput
 
     PreCompute {
         n_nodes,
-        n_edges,
-        node_order,
-        initial_positions: positions,
+        n_edges: (edges.len() / 2) as u32,
+        node_order: None,
+        initial_positions: positions_v,
         velocities,
         edge_offsets,
         edge_neighbors,
@@ -1383,6 +1502,64 @@ fn precompute(graph: &Graph, seed_mode: &SeedMode, spring_len: f32) -> PreComput
         virt_edge_offsets,
         node_to_virt_offsets,
     }
+}
+
+/// Graph adapter over [`precompute_csr`]: builds the id-sorted node order and
+/// an index-based edge list, seeds positions, and applies per-node
+/// `position3` overrides. Faithful to the historical per-node semantics —
+/// each node with an author-supplied `position3` overrides the seeder for
+/// its slot, every other node keeps the seeded value — implemented by
+/// seeding a base with `seed_positions_flat` and passing the overridden
+/// vector as `positions: Some(..)` (approach (b)). This is the only entry
+/// point that touches [`Graph`]; the CSR path never allocates strings.
+fn precompute(graph: &Graph, seed_mode: &SeedMode, spring_len: f32) -> PreCompute {
+    let n_nodes = graph.nodes.len() as u32;
+    let n = n_nodes as usize;
+
+    let mut node_order: Vec<String> = graph.nodes.keys().cloned().collect();
+    node_order.sort();
+    let id_to_idx: std::collections::HashMap<&str, u32> = node_order
+        .iter()
+        .enumerate()
+        .map(|(i, id)| (id.as_str(), i as u32))
+        .collect();
+
+    // Flat undirected edge list in id-sorted index space. Dangling edges
+    // (endpoint not present) are dropped here; self-loops are carried through
+    // and filtered inside `precompute_csr` (matching the historical path).
+    let mut edges: Vec<u32> = Vec::with_capacity(graph.edges.len() * 2);
+    for e in graph.edges.values() {
+        let (Some(&s), Some(&t)) = (
+            id_to_idx.get(e.source.as_str()),
+            id_to_idx.get(e.target.as_str()),
+        ) else {
+            continue;
+        };
+        edges.push(s);
+        edges.push(t);
+    }
+
+    // Seed a base, then override each node's slot from its `position3`.
+    let seeded = seed_positions_flat(n_nodes, &edges, seed_mode, spring_len);
+    let mut positions: Vec<f32> = vec![0.0f32; 3 * n];
+    for (idx, id) in node_order.iter().enumerate() {
+        let p = graph.nodes[id].position3.unwrap_or([
+            seeded[3 * idx],
+            seeded[3 * idx + 1],
+            seeded[3 * idx + 2],
+        ]);
+        positions[3 * idx] = p[0];
+        positions[3 * idx + 1] = p[1];
+        positions[3 * idx + 2] = p[2];
+    }
+
+    let mut pc = precompute_csr(n_nodes, &edges, Some(&positions), seed_mode, spring_len);
+    // Preserve the historical `n_edges` (raw edge count, including any
+    // self-loops / dangling edges dropped above) so the owned/borrowed
+    // rebuild heuristics stay stable, and record the id order for write-back.
+    pc.n_edges = graph.edges.len() as u32;
+    pc.node_order = Some(node_order);
+    pc
 }
 
 
@@ -1496,12 +1673,7 @@ fn build_pipeline(device: &wgpu::Device) -> ForcePipelines {
 
 impl GpuState {
     /// Build state with caller-supplied device + owned positions buffers.
-    fn new_owned(
-        device: &wgpu::Device,
-        graph: &Graph,
-        options: &GpuForceOptions,
-    ) -> Result<Self, String> {
-        let pc = precompute(graph, &options.seed_mode, options.spring_len);
+    fn new_owned(device: &wgpu::Device, pc: PreCompute) -> Result<Self, String> {
         let pos_buf_size = (pc.n_nodes as u64).max(1) * VEC3_STRIDE;
 
         let pos_a = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -1588,11 +1760,9 @@ impl GpuState {
     /// `step_with_encoder`. This avoids cloning wgpu::Queue.
     fn new_borrowed(
         device: &wgpu::Device,
-        graph: &Graph,
         positions_buffer: &wgpu::Buffer,
-        options: &GpuForceOptions,
+        pc: PreCompute,
     ) -> Result<Self, String> {
-        let pc = precompute(graph, &options.seed_mode, options.spring_len);
         let pos_buf_size = (pc.n_nodes as u64).max(1) * VEC3_STRIDE;
 
         // Internal ping-pong target. COPY_SRC so we can copy back to the
@@ -3394,6 +3564,198 @@ mod tests {
         }
     }
 
+    #[test]
+    fn precompute_csr_matches_graph_precompute() {
+        // A 50-node graph with ids n000.. and a deterministic ring+chord edge
+        // set. Building the index edge list from the SAME `g.edges` iteration
+        // order the adapter uses keeps `edge_neighbors` byte-identical.
+        let n: usize = 50;
+        let mut g = Graph::new();
+        for i in 0..n {
+            g.add_node(Node::new(format!("n{:03}", i)));
+        }
+        for i in 0..n {
+            g.add_edge(Edge::new(
+                format!("r{i}"),
+                format!("n{:03}", i),
+                format!("n{:03}", (i + 1) % n),
+            ));
+        }
+        for i in 0..n / 5 {
+            let a = i * 5;
+            let b = (i * 7 + 3) % n;
+            if a != b {
+                g.add_edge(Edge::new(
+                    format!("c{i}"),
+                    format!("n{:03}", a),
+                    format!("n{:03}", b),
+                ));
+            }
+        }
+
+        let mut ids: Vec<String> = g.nodes.keys().cloned().collect();
+        ids.sort();
+        let id_to_idx: std::collections::HashMap<&str, u32> = ids
+            .iter()
+            .enumerate()
+            .map(|(i, s)| (s.as_str(), i as u32))
+            .collect();
+        let mut edges: Vec<u32> = Vec::new();
+        for e in g.edges.values() {
+            let (Some(&s), Some(&t)) = (
+                id_to_idx.get(e.source.as_str()),
+                id_to_idx.get(e.target.as_str()),
+            ) else {
+                continue;
+            };
+            edges.push(s);
+            edges.push(t);
+        }
+
+        let seed = SeedMode::Random;
+        let len = GpuForceOptions::default().spring_len;
+        let pc_csr = precompute_csr(n as u32, &edges, None, &seed, len);
+        let pc_graph = precompute(&g, &seed, len);
+        assert_eq!(pc_csr.edge_offsets, pc_graph.edge_offsets, "edge_offsets");
+        assert_eq!(pc_csr.edge_neighbors, pc_graph.edge_neighbors, "edge_neighbors");
+        assert_eq!(pc_csr.mass, pc_graph.mass, "mass");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn unit_gpu_force_run_csr_ring_finite() {
+        let _gpu = gpu_test_guard();
+        // 200-node ring, fed as an index edge list. run_csr must produce
+        // finite, non-degenerate positions of length 3*n with no Graph.
+        let n: u32 = 200;
+        let mut edges: Vec<u32> = Vec::with_capacity(n as usize * 2);
+        for i in 0..n {
+            edges.push(i);
+            edges.push((i + 1) % n);
+        }
+        let input = CsrInput {
+            n_nodes: n,
+            edges: &edges,
+            positions: None,
+        };
+        let mut layout = GpuForceLayout::new(GpuForceOptions {
+            steps_per_call: 10,
+            repulsion_mode: RepulsionMode::Exact,
+            repulsion_radius: 120.0,
+            ..Default::default()
+        });
+        let mut out: Vec<f32> = Vec::new();
+        match layout.run_csr(&input, &mut out).await {
+            Ok(()) => {}
+            Err(e) => {
+                eprintln!("skipping (no gpu adapter): {e}");
+                return;
+            }
+        }
+        assert_eq!(out.len(), (n as usize) * 3, "out must be [x,y,z]*n");
+        let mut all_finite = true;
+        let mut mn = [f32::INFINITY; 3];
+        let mut mx = [f32::NEG_INFINITY; 3];
+        for p in out.chunks_exact(3) {
+            for k in 0..3 {
+                if !p[k].is_finite() {
+                    all_finite = false;
+                }
+                mn[k] = mn[k].min(p[k]);
+                mx[k] = mx[k].max(p[k]);
+            }
+        }
+        assert!(all_finite, "all positions must be finite");
+        let span = (mx[0] - mn[0]).max(mx[1] - mn[1]).max(mx[2] - mn[2]);
+        assert!(span > 1.0, "layout degenerate: span={span}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn unit_gpu_force_init_with_device_csr_borrowed_step_finite() {
+        let _gpu = gpu_test_guard();
+        // Borrowed-buffer CSR path: init_with_device_csr then one
+        // step_with_encoder must leave finite positions in the shared buffer.
+        let n: u32 = 64;
+        let mut edges: Vec<u32> = Vec::with_capacity(n as usize * 2);
+        for i in 0..n {
+            edges.push(i);
+            edges.push((i + 1) % n);
+        }
+
+        // Acquire a device the way `run` does; skip cleanly if none.
+        let instance = wgpu::Instance::default();
+        let Some(adapter) = instance
+            .request_adapter(&wgpu::RequestAdapterOptions {
+                power_preference: wgpu::PowerPreference::HighPerformance,
+                compatible_surface: None,
+                force_fallback_adapter: false,
+            })
+            .await
+        else {
+            eprintln!("skipping (no gpu adapter)");
+            return;
+        };
+        let (device, queue) = match adapter
+            .request_device(
+                &wgpu::DeviceDescriptor {
+                    label: Some("test/gpu_force_csr"),
+                    required_features: wgpu::Features::empty(),
+                    required_limits: gpu_force_device_limits(&adapter.limits()),
+                    memory_hints: wgpu::MemoryHints::Performance,
+                },
+                None,
+            )
+            .await
+        {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("skipping: {e}");
+                return;
+            }
+        };
+
+        let pos_buf_size = (n as u64) * VEC3_STRIDE;
+        let positions_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("test_shared_positions"),
+            size: pos_buf_size,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_SRC
+                | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let input = CsrInput {
+            n_nodes: n,
+            edges: &edges,
+            positions: None,
+        };
+        let mut layout = GpuForceLayout::new(GpuForceOptions {
+            steps_per_call: 1,
+            repulsion_mode: RepulsionMode::Exact,
+            repulsion_radius: 120.0,
+            ..Default::default()
+        });
+        layout
+            .init_with_device_csr(&device, &queue, &input, &positions_buffer)
+            .expect("init csr");
+
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("test_step"),
+        });
+        layout.step_with_encoder(&device, &queue, &mut encoder, &positions_buffer);
+        queue.submit(Some(encoder.finish()));
+
+        let positions = layout
+            .read_back_positions(&device, &queue, &positions_buffer)
+            .await
+            .expect("readback");
+        assert_eq!(positions.len(), (n as usize) * 4);
+        for p in positions.chunks_exact(4).take(n as usize) {
+            for k in 0..3 {
+                assert!(p[k].is_finite(), "position must be finite");
+            }
+        }
+    }
+
     // ---- Compact-seed stability ------------------------------------------
     //
     // Regression for "screen turns black on energy_threshold=0" and
@@ -3714,6 +4076,16 @@ impl crate::layout::layout_trait::PhysicsLayout for GpuForceLayout {
         positions_buf: &wgpu::Buffer,
     ) -> Result<(), String> {
         GpuForceLayout::init_with_device(self, device, queue, graph, positions_buf)
+    }
+
+    fn init_with_device_csr(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        input: &CsrInput<'_>,
+        positions_buf: &wgpu::Buffer,
+    ) -> Result<(), String> {
+        GpuForceLayout::init_with_device_csr(self, device, queue, input, positions_buf)
     }
 
     fn step_with_encoder(

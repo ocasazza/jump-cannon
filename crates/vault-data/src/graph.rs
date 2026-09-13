@@ -11,6 +11,26 @@ pub struct VaultGraph {
     pub num_communities: usize,
     pub num_wcc: usize,
     pub density: f64,
+    /// Per-level community assignments from multi-level Louvain: the
+    /// dendrogram flattened to original-node granularity.
+    ///
+    /// `community_levels[k][i]` is the community id of node `i` (in `nodes`
+    /// insertion order) at dendrogram level `k`, with ids compacted to
+    /// `0..distinct_communities_at_level_k`.
+    ///
+    /// Direction of `k`: **level 0 is the coarsest** and is byte-identical
+    /// to every node's `metrics.community`; **higher `k` is finer**. The
+    /// last level (`k == community_levels.len() - 1`) is the finest — the
+    /// result of Louvain's first local-optimization pass. Each finer level
+    /// refines the coarser one: every class at level `k+1` is a subset of a
+    /// class at level `k`. There is always at least one level after
+    /// [`compute_louvain`] (a graph where Louvain finds no improving move
+    /// still yields a single level equal to `community`).
+    ///
+    /// Memory cost: 4 bytes per node per level, i.e.
+    /// `4 * nodes.len() * community_levels.len()` bytes.
+    #[serde(default)]
+    pub community_levels: Vec<Vec<u32>>,
 }
 
 impl VaultGraph {

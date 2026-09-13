@@ -11,6 +11,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::layout::algorithms::gpu_force::CsrInput;
 use crate::types::Graph;
 
 /// Stable string identifier for a registered layout. Used as the registry
@@ -88,6 +89,20 @@ pub trait PhysicsLayout: Send + Sync {
         positions_buf: &wgpu::Buffer,
     ) -> Result<(), String>;
 
+    /// Index-based ingest path: build GPU compute resources from a
+    /// [`CsrInput`] without materialising a [`Graph`]. Layouts that lack a
+    /// CSR path keep the default error; `GpuForceLayout` overrides it.
+    fn init_with_device_csr(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        input: &CsrInput<'_>,
+        positions_buf: &wgpu::Buffer,
+    ) -> Result<(), String> {
+        let _ = (device, queue, input, positions_buf);
+        Err("this layout has no CSR ingest path".into())
+    }
+
     fn step_with_encoder(
         &mut self,
         device: &wgpu::Device,
@@ -120,6 +135,14 @@ pub trait DynPhysicsLayout: Send + Sync {
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         graph: &Graph,
+        positions_buf: &wgpu::Buffer,
+    ) -> Result<(), String>;
+
+    fn init_with_device_csr(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        input: &CsrInput<'_>,
         positions_buf: &wgpu::Buffer,
     ) -> Result<(), String>;
 
@@ -199,6 +222,16 @@ impl<T: PhysicsLayout + 'static> DynPhysicsLayout for BoxedPhysics<T> {
         positions_buf: &wgpu::Buffer,
     ) -> Result<(), String> {
         self.inner.init_with_device(device, queue, graph, positions_buf)
+    }
+
+    fn init_with_device_csr(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        input: &CsrInput<'_>,
+        positions_buf: &wgpu::Buffer,
+    ) -> Result<(), String> {
+        self.inner.init_with_device_csr(device, queue, input, positions_buf)
     }
 
     fn step_with_encoder(

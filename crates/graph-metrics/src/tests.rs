@@ -93,6 +93,71 @@ fn unit_louvain_five_clusters() {
 }
 
 #[test]
+fn unit_louvain_community_levels_dendrogram() {
+    // Two disjoint 6-cliques joined by a single bridge edge.
+    let mut g = VaultGraph::new();
+    for c in 0..2 {
+        for i in 0..6 {
+            g.add_node(VaultNode { id: format!("c{}_n{}", c, i), ..Default::default() });
+        }
+    }
+    for c in 0..2 {
+        for i in 0..6 {
+            for j in (i + 1)..6 {
+                g.add_edge(VaultEdge {
+                    source: format!("c{}_n{}", c, i),
+                    target: format!("c{}_n{}", c, j),
+                });
+            }
+        }
+    }
+    // Bridge connecting the two cliques.
+    g.add_edge(VaultEdge { source: "c0_n0".into(), target: "c1_n0".into() });
+
+    crate::compute_louvain(&mut g, 20);
+
+    let levels = g.community_levels.clone();
+    let l = levels.len();
+    assert!(l >= 1, "expected at least one dendrogram level, got {l}");
+
+    let n = g.nodes.len();
+    for level in &levels {
+        assert_eq!(level.len(), n, "each level must carry one id per node");
+    }
+
+    // Level 0 (coarsest) is byte-identical to metrics.community, in node order.
+    let community: Vec<u32> = g.nodes.values().map(|node| node.metrics.community as u32).collect();
+    assert_eq!(levels[0], community, "level 0 must equal metrics.community");
+
+    // Every level's ids are compacted to a contiguous 0..k range.
+    for (k, level) in levels.iter().enumerate() {
+        let mut distinct: Vec<u32> =
+            level.iter().copied().collect::<std::collections::HashSet<_>>().into_iter().collect();
+        distinct.sort_unstable();
+        let expected: Vec<u32> = (0..distinct.len() as u32).collect();
+        assert_eq!(distinct, expected, "level {k} ids must be compacted to 0..k-1");
+    }
+
+    // Higher k is finer: every class at level k+1 refines a class at level k.
+    // Nodes sharing a finer community must share the coarser one too.
+    for k in 0..l.saturating_sub(1) {
+        let coarse = &levels[k];
+        let fine = &levels[k + 1];
+        for a in 0..n {
+            for b in (a + 1)..n {
+                if fine[a] == fine[b] {
+                    assert_eq!(
+                        coarse[a], coarse[b],
+                        "level {} must refine level {}: nodes {a},{b} share a finer community but not the coarser one",
+                        k + 1, k
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn unit_kcore_triangle() {
     let mut g = make_triangle();
     crate::compute_kcore(&mut g);

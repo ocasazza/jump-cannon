@@ -72,7 +72,9 @@ pub struct GraphSnapshot {
     /// per-request handlers do an `Arc` clone instead of re-walking
     /// `graph.nodes` and re-allocating. Keys: "positions", "edges",
     /// "degree", "pagerank", "kcore", "community", "wcc", "indegree",
-    /// "outdegree", "betweenness", "meta_summary".
+    /// "outdegree", "betweenness", "meta_summary", "community_levels"
+    /// (single f32 = dendrogram depth L), and "community_l{k}" for each
+    /// k in 0..L (per-node ids; l0 coarsest = "community", higher k finer).
     pub binary_cache: HashMap<String, Arc<[u8]>>,
 }
 
@@ -125,6 +127,17 @@ impl GraphSnapshot {
         ] {
             if let Some(buf) = crate::binary::metric_buffer(&graph, name) {
                 binary_cache.insert(name.to_string(), Arc::from(buf));
+            }
+        }
+        // Louvain dendrogram levels: the depth L and each per-node level
+        // (community_l0 = coarsest = community; higher k finer).
+        if let Some(buf) = crate::binary::metric_buffer(&graph, "community_levels") {
+            binary_cache.insert("community_levels".to_string(), Arc::from(buf));
+        }
+        for k in 0..graph.community_levels.len() {
+            let name = format!("community_l{k}");
+            if let Some(buf) = crate::binary::metric_buffer(&graph, &name) {
+                binary_cache.insert(name, Arc::from(buf));
             }
         }
         binary_cache.insert(

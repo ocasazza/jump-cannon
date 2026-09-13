@@ -46,7 +46,11 @@ struct RegionParams {
     n_nodes:      u32,
     palette_len:  u32,
     mode:         u32,
-    _pad:         u32,
+    level:        u32,
+    n_levels:     u32,
+    _pad0:        u32,
+    _pad1:        u32,
+    _pad2:        u32,
 };
 
 // Per-JFA-pass state, bound with a dynamic uniform offset so all passes
@@ -71,7 +75,8 @@ struct RegionCamera {
 @group(0) @binding(1) var<uniform> camera: RegionCamera;
 // Shared positions buffer (xyz = world position, w = mass). Seed only.
 @group(0) @binding(2) var<storage, read> positions: array<vec4<f32>>;
-// Per-node cluster id. Seed only.
+// Per-node cluster id, level-major: id for node i at level k lives at
+// `k * n_nodes + i`. The active level is `params.level`. Seed only.
 @group(0) @binding(3) var<storage, read> cluster_ids: array<u32>;
 @group(0) @binding(4) var<storage, read_write> grid_a_seed:    array<atomic<u32>>;
 @group(0) @binding(5) var<storage, read_write> grid_a_cluster: array<atomic<u32>>;
@@ -152,7 +157,7 @@ fn region_seed(
     // atomicMin on the seed only latches "occupied". The cluster winner
     // is made deterministic under races by taking the smallest id.
     atomicMin(&grid_a_seed[idx], packed);
-    atomicMin(&grid_a_cluster[idx], cluster_ids[i]);
+    atomicMin(&grid_a_cluster[idx], cluster_ids[params.level * params.n_nodes + i]);
 }
 
 fn load_seed(src_is_a: u32, idx: u32) -> u32 {

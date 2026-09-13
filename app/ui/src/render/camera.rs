@@ -113,13 +113,21 @@ impl Camera {
         }
     }
 
+    /// Distance `fit_to_bounds` places the camera at to frame a sphere of
+    /// the given `radius`. Factored out of `fit_to_bounds` so both share the
+    /// formula; the region-map auto-level rule asks "what distance would fit
+    /// this radius?" without moving the camera.
+    pub fn fit_distance(&self, radius: f32) -> f32 {
+        radius * 1.7 / (self.fov_y * 0.5).sin()
+    }
+
     pub fn fit_to_bounds(&mut self, min: Vec3, max: Vec3) {
         let center = (min + max) * 0.5;
         let radius = ((max - min) * 0.5).length().max(1.0);
         // 1.7× padding (was 1.4× — felt too cramped). With fov_y=60°
         // this lands at ≈ 3.4 × radius, giving the cluster ~25%
         // breathing room on every edge of the viewport.
-        let dist = radius * 1.7 / (self.fov_y * 0.5).sin();
+        let dist = self.fit_distance(radius);
         // back off along world +Z, look toward center.
         self.position = center + Vec3::Z * dist;
         // recompute yaw/pitch to look at center

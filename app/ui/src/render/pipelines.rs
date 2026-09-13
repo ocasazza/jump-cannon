@@ -523,9 +523,9 @@ impl GraphPipelines {
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
         });
 
-        // Per-node cluster id. Default: all-zero (one region) so the
-        // region-map underlay reads as a single region until a clustering
-        // pass pushes real ids through `update_cluster_ids`.
+        // Per-node cluster id. Default: a single level of all-zero ids (one
+        // region) so the region-map underlay reads as a single region until
+        // a clustering pass pushes real ids through `update_cluster_levels`.
         let cluster_ids_init: Vec<u32> = vec![0_u32; n_nodes.max(1) as usize];
         let cluster_ids_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("cluster_ids_storage"),
@@ -681,6 +681,16 @@ impl GraphPipelines {
         encoder: &mut wgpu::CommandEncoder,
     ) {
         let sim_running = self.sim_running;
+        // Resolve the region auto-level for this frame from the current
+        // camera framing before borrowing `self.buffers` (bounds() reads
+        // the CPU position mirror). `None` when no bounds exist. See the
+        // shared zoom rule in region_map::auto_level.
+        let region_framing = self.bounds().map(|(mn, mx)| {
+            let center = (mn + mx) * 0.5;
+            let radius = ((mx - mn) * 0.5).length();
+            let d = (self.camera.position - center).length();
+            (d, self.camera.fit_distance(radius))
+        });
         let Some(b) = &mut self.buffers else { return };
 
         // Drive any pending native callbacks. On WASM the browser drives
@@ -719,8 +729,10 @@ impl GraphPipelines {
         // Record the region-map compute passes (clear -> seed -> jump-
         // flood -> prune) into the same encoder. The seed pass reads the
         // positions the sim just wrote. No-op when the region mode is Off
-        // or before the graph is loaded.
-        if let Some(region) = self.region.as_ref() {
+        // or before the graph is loaded. The level is resolved and stored
+        // once here so `region_current_level` reflects this frame.
+        if let Some(region) = self.region.as_mut() {
+            region.update_level(queue, region_framing);
             region.encode(encoder);
         }
 
@@ -1259,22 +1271,68 @@ impl GraphPipelines {
         queue.write_buffer(&b.shape_ids, 0, bytemuck::cast_slice(&shapes));
     }
 
-    /// Replace the per-node cluster id buffer that drives the region-map
-    /// underlay. Length must equal `n_nodes`; a mismatch warns and no-ops.
-    /// No-op before `load` (no buffers yet).
-    pub fn update_cluster_ids(&mut self, queue: &wgpu::Queue, ids: Vec<u32>) {
-        let Some(b) = self.buffers.as_ref() else {
+    /// Replace the per-node cluster ids that drive the region-map underlay
+    /// with a level-major dendrogram: the id for node `i` at level `k` is
+    /// `ids[k * n_nodes + i]`. `ids.len()` must equal `n_nodes * n_levels`
+    /// and `n_levels >= 1`; a mismatch warns and no-ops. Grows and rebinds
+    /// the cluster-id storage buffer when the level count exceeds the
+    /// buffer built in `load`; otherwise writes in place. No-op before
+    /// `load` (no buffers yet).
+    pub fn update_cluster_levels(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        ids: Vec<u32>,
+        n_levels: u32,
+    ) {
+        let Some(b) = self.buffers.as_mut() else {
             return;
         };
-        if ids.len() != b.n_nodes as usize {
+        let n = b.n_nodes as usize;
+        if n_levels == 0 || ids.len() != n * n_levels as usize {
             tracing::warn!(
-                "[render] update_cluster_ids: len {} != n {}",
+                "[render] update_cluster_levels: len {} != n {} * levels {}",
                 ids.len(),
-                b.n_nodes
+                n,
+                n_levels
             );
             return;
         }
-        queue.write_buffer(&b.cluster_ids, 0, bytemuck::cast_slice(&ids));
+        let need_bytes = (ids.len().max(1) * std::mem::size_of::<u32>()) as u64;
+        if need_bytes > b.cluster_ids.size() {
+            // The level-major buffer outgrew the single-level buffer from
+            // `load`; recreate it and rebind the region compute bind group,
+            // which references it at binding 3.
+            b.cluster_ids = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("cluster_ids_storage"),
+                contents: bytemuck::cast_slice(&ids),
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            });
+            if let Some(region) = self.region.as_mut() {
+                region.bind(
+                    device,
+                    queue,
+                    &b.positions,
+                    &b.camera_uniform,
+                    &b.cluster_ids,
+                    b.n_nodes,
+                );
+            }
+        } else {
+            queue.write_buffer(&b.cluster_ids, 0, bytemuck::cast_slice(&ids));
+        }
+        if let Some(region) = self.region.as_mut() {
+            region.set_levels(queue, n_levels);
+        }
+    }
+
+    /// The region level chosen for the last encoded frame (0 before any
+    /// frame or when no region map exists).
+    pub fn region_current_level(&self) -> u32 {
+        self.region
+            .as_ref()
+            .map(RegionMap::region_current_level)
+            .unwrap_or(0)
     }
 
     /// Apply a new region-map configuration (mode, palette, radius,

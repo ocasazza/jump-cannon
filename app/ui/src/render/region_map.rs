@@ -56,10 +56,23 @@ impl RegionMode {
     }
 }
 
+/// Which dendrogram level of the uploaded clustering the region underlay
+/// renders. Level 0 is the coarsest and `n_levels - 1` the finest. `Auto`
+/// picks a level from the camera framing (see the auto rule in
+/// [`auto_level`]); `Fixed` pins one (clamped to `n_levels - 1`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub enum RegionLevel {
+    #[default]
+    Auto,
+    Fixed(u32),
+}
+
 /// Tunable appearance + behaviour of the region underlay.
 #[derive(Clone, Debug, PartialEq)]
 pub struct RegionMapConfig {
     pub mode: RegionMode,
+    /// Dendrogram level selector for the region ids (see [`RegionLevel`]).
+    pub level: RegionLevel,
     /// Max distance (region-grid cells; the grid is [`GRID_SIZE`] square)
     /// from a node for a cell to belong to a region; beyond it the cell
     /// is "ocean" (transparent).
@@ -75,6 +88,7 @@ impl Default for RegionMapConfig {
     fn default() -> Self {
         Self {
             mode: RegionMode::Off,
+            level: RegionLevel::Auto,
             radius_cells: 24.0,
             fill_alpha: 0.35,
             outline: true,
@@ -85,7 +99,7 @@ impl Default for RegionMapConfig {
     }
 }
 
-/// Mirrors `RegionParams` in region_map.wgsl (32 bytes, 16-byte aligned).
+/// Mirrors `RegionParams` in region_map.wgsl (48 bytes, 16-byte aligned).
 #[repr(C)]
 #[derive(Copy, Clone, Pod, Zeroable)]
 struct RegionParams {
@@ -96,7 +110,14 @@ struct RegionParams {
     n_nodes: u32,
     palette_len: u32,
     mode: u32,
-    _pad: u32,
+    /// Active dendrogram level; the seed kernel reads
+    /// `cluster_ids[level * n_nodes + i]`.
+    level: u32,
+    /// Number of uploaded levels (>= 1). Level stride for `cluster_ids`.
+    n_levels: u32,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
 }
 
 /// Mirrors `StepParams` in region_map.wgsl. One slot per jump-flood pass,
@@ -150,6 +171,13 @@ pub struct RegionMap {
     render_bg: wgpu::BindGroup,
 
     n_nodes: u32,
+    /// Number of uploaded dendrogram levels (>= 1). Level stride for the
+    /// shared `cluster_ids` buffer.
+    n_levels: u32,
+    /// Level chosen for the last encoded frame. Returned by
+    /// [`RegionMap::region_current_level`] and mirrored into the params
+    /// uniform read by the seed kernel.
+    current_level: u32,
 }
 
 impl RegionMap {
@@ -285,7 +313,11 @@ impl RegionMap {
             n_nodes: 0,
             palette_len,
             mode: cfg.mode.as_u32(),
-            _pad: 0,
+            level: 0,
+            n_levels: 1,
+            _pad0: 0,
+            _pad1: 0,
+            _pad2: 0,
         };
         let params_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("region params"),
@@ -364,6 +396,8 @@ impl RegionMap {
             step_bg,
             render_bg,
             n_nodes: 0,
+            n_levels: 1,
+            current_level: 0,
         }
     }
 
@@ -487,6 +521,43 @@ impl RegionMap {
         &self.cfg
     }
 
+    /// The level chosen for the most recently encoded frame.
+    pub fn region_current_level(&self) -> u32 {
+        self.current_level
+    }
+
+    /// Record the uploaded dendrogram depth (>= 1). Re-clamps the stored
+    /// current level into range and rewrites the params uniform so the
+    /// seed kernel's level stride matches the freshly uploaded ids.
+    pub fn set_levels(&mut self, queue: &wgpu::Queue, n_levels: u32) {
+        self.n_levels = n_levels.max(1);
+        if self.current_level >= self.n_levels {
+            self.current_level = self.n_levels - 1;
+        }
+        queue.write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&self.params()));
+    }
+
+    /// Resolve the level for this frame from the config's [`RegionLevel`]
+    /// and the current camera framing, store it, and rewrite the params
+    /// uniform when it changed. `framing` is `Some((d, fit_dist))` — the
+    /// camera-to-bounds-centre distance and the distance `fit_to_bounds`
+    /// would choose for the bounds radius — or `None` when no bounds exist
+    /// (Auto then resolves to level 0). Called once per encoded frame.
+    pub fn update_level(&mut self, queue: &wgpu::Queue, framing: Option<(f32, f32)>) {
+        let max_level = self.n_levels.saturating_sub(1);
+        let level = match self.cfg.level {
+            RegionLevel::Fixed(k) => k.min(max_level),
+            RegionLevel::Auto => match framing {
+                Some((d, fit_dist)) => auto_level(self.n_levels, d, fit_dist),
+                None => 0,
+            },
+        };
+        if level != self.current_level {
+            self.current_level = level;
+            queue.write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&self.params()));
+        }
+    }
+
     fn params(&self) -> RegionParams {
         RegionParams {
             grid_size: GRID_SIZE,
@@ -496,7 +567,11 @@ impl RegionMap {
             n_nodes: self.n_nodes,
             palette_len: self.palette_len.max(1),
             mode: self.cfg.mode.as_u32(),
-            _pad: 0,
+            level: self.current_level,
+            n_levels: self.n_levels,
+            _pad0: 0,
+            _pad1: 0,
+            _pad2: 0,
         }
     }
 
@@ -575,6 +650,27 @@ fn palette_floats(palette: &[[f32; 4]]) -> Vec<f32> {
         out.extend_from_slice(c);
     }
     out
+}
+
+/// Shared zoom-to-level rule for [`RegionLevel::Auto`]. `d` is the camera
+/// distance to the bounds centre and `fit_dist` the distance
+/// [`crate::render::camera::Camera::fit_to_bounds`] would place the camera
+/// at for the bounds radius, so `r = d / fit_dist` is 1 at the fitted view
+/// and shrinks as the camera dollies in. The dendrogram is ordered with
+/// level 0 the COARSEST (byte-identical to `community`) and level
+/// `n_levels - 1` the finest. `r >= 1` yields level 0; each halving of `r`
+/// steps one level finer: `level = min(floor(log2(1 / r)), n_levels - 1)`.
+fn auto_level(n_levels: u32, d: f32, fit_dist: f32) -> u32 {
+    let finest = n_levels.saturating_sub(1);
+    if !(fit_dist > 0.0) || !d.is_finite() {
+        return 0;
+    }
+    let r = d / fit_dist;
+    if !(r > 0.0) || r >= 1.0 {
+        return 0;
+    }
+    let steps = (1.0 / r).log2().floor().max(0.0) as u32;
+    steps.min(finest)
 }
 
 fn uniform_entry(

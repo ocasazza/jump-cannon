@@ -2,14 +2,15 @@
 //!
 //! Measures per-step wall time across node counts, repulsion backends, and force models.
 //! Generates deterministic preferential-attachment graphs (Barabasi-Albert style) with
-//! a small LCG seeded from N for reproducibility.
+//! a small LCG seeded from N for reproducibility. Topology is fed as an index-based CSR
+//! edge list straight into `run_csr` — no string-keyed `Graph` is ever built.
 //!
 //! Run:
 //! ```text
 //! cargo run -p graph-layouts --release --example bench_gpu_force -- --nodes 100000,1000000 --steps 20
 //! ```
 
-use graph_layouts::{Edge, ForceModel, Graph, GpuForceLayout, GpuForceOptions, Node, RepulsionMode};
+use graph_layouts::{CsrInput, ForceModel, GpuForceLayout, GpuForceOptions, RepulsionMode};
 use std::time::Instant;
 
 fn main() {
@@ -90,8 +91,8 @@ fn main() {
     for n in &node_counts {
         let n = *n as u32;
 
-        let graph = generate_barabasi_albert(n, degree);
-        let edge_count = graph.edges.len();
+        let (n_nodes, edges) = generate_barabasi_albert(n, degree);
+        let edge_count = edges.len() / 2;
 
         for mode_str in &modes {
             let mode = match *mode_str {
@@ -123,14 +124,20 @@ fn main() {
                 options.force_model = model;
 
                 let mut layout = GpuForceLayout::new(options.clone());
+                let input = CsrInput {
+                    n_nodes,
+                    edges: &edges,
+                    positions: None,
+                };
+                let mut out: Vec<f32> = Vec::new();
 
-                // Warm-up: run once with steps_per_call = 1
-                let mut graph_warmup = graph.clone();
+                // Warm-up: run once with steps_per_call = 1 so pipeline
+                // compilation and buffer allocation don't skew the timed run.
                 let mut warmup_opts = options.clone();
                 warmup_opts.steps_per_call = 1;
                 layout.set_options(warmup_opts);
 
-                match pollster::block_on(layout.run(&mut graph_warmup)) {
+                match pollster::block_on(layout.run_csr(&input, &mut out)) {
                     Ok(_) => {}
                     Err(e) => {
                         println!("{}", e);
@@ -138,12 +145,12 @@ fn main() {
                     }
                 }
 
-                // Timed run with original step count
-                let mut graph_timed = graph.clone();
+                // Timed run with the original step count. Same topology, so
+                // the layout reuses its GPU state and continues the sim.
                 layout.set_options(options);
 
                 let start = Instant::now();
-                match pollster::block_on(layout.run(&mut graph_timed)) {
+                match pollster::block_on(layout.run_csr(&input, &mut out)) {
                     Ok(_) => {}
                     Err(e) => {
                         println!("{}", e);
@@ -161,56 +168,49 @@ fn main() {
                 );
             }
         }
-
-        // Drop the graph to free host memory (Graph is string-keyed and dominates at 1e6 nodes)
-        drop(graph);
     }
 }
 
-/// Generate a deterministic Barabasi-Albert preferential-attachment graph.
-/// Each new node attaches D/2 edges to existing nodes, sampled proportionally to degree.
-/// Uses a simple LCG seeded from N for reproducibility.
-fn generate_barabasi_albert(n: u32, d: u32) -> Graph {
-    let mut g = Graph::new();
+/// Generate a deterministic Barabasi-Albert preferential-attachment graph as an
+/// index-based edge list `[s0, t0, s1, t1, ...]`. Each new node attaches D/2
+/// edges to existing nodes, sampled proportionally to degree. Uses a simple LCG
+/// seeded from N for reproducibility. Returns `(n_nodes, edges)`.
+fn generate_barabasi_albert(n: u32, d: u32) -> (u32, Vec<u32>) {
     let mut rng = Lcg::new(n as u64);
 
-    let mut degree: Vec<u32> = Vec::new();
-    let mut edges_list: Vec<usize> = Vec::new();
+    // Endpoint multiset used for preferential sampling (each existing edge
+    // contributes both of its endpoints).
+    let mut endpoints: Vec<usize> = Vec::new();
+    // Flat undirected edge list, two entries per edge.
+    let mut edges: Vec<u32> = Vec::new();
 
     for i in 0..n {
-        g.add_node(Node::new(format!("n{}", i)));
-        degree.push(0);
-
         let num_edges = (d / 2).max(1);
 
         for _ in 0..num_edges {
             // Preferential attachment needs a seed edge to sample from:
             // the second node attaches to the first unconditionally.
-            if edges_list.is_empty() {
+            if endpoints.is_empty() {
                 if i == 0 {
                     continue;
                 }
-                edges_list.push(0);
-                edges_list.push(0);
+                endpoints.push(0);
+                endpoints.push(0);
             }
 
-            let idx = rng.next() as usize % edges_list.len();
-            let target = edges_list[idx];
+            let idx = rng.next() as usize % endpoints.len();
+            let target = endpoints[idx];
 
             if target != i as usize {
-                let edge_id = format!("e{}", g.edges.len());
-                g.add_edge(Edge::new(edge_id, format!("n{}", i), format!("n{}", target)));
-
-                degree[i as usize] += 1;
-                degree[target] += 1;
-
-                edges_list.push(i as usize);
-                edges_list.push(target);
+                edges.push(i);
+                edges.push(target as u32);
+                endpoints.push(i as usize);
+                endpoints.push(target);
             }
         }
     }
 
-    g
+    (n, edges)
 }
 
 /// Minimal linear congruential generator for reproducible preferential attachment.

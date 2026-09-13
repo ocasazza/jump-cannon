@@ -274,6 +274,8 @@ pub(crate) struct StyleState {
     region_alpha: f32,
     #[serde(default = "default_region_outline")]
     region_outline: bool,
+    #[serde(default)]
+    region_level: crate::render::RegionLevel,
 }
 fn default_region_radius() -> f32 {
     24.0
@@ -339,6 +341,7 @@ impl Default for StyleState {
             region_radius: default_region_radius(),
             region_alpha: default_region_alpha(),
             region_outline: default_region_outline(),
+            region_level: crate::render::RegionLevel::default(),
         }
     }
 }
@@ -744,13 +747,10 @@ thread_local! {
     static STYLE_MIRROR: Cell<StyleState> = Cell::new(StyleState::default());
     /// Metric buffers fetched from /graph/metrics/:name, keyed by name.
     static METRICS_TL: RefCell<HashMap<String, Vec<f32>>> = RefCell::new(HashMap::new());
-    /// Bumped on every cache insert — part of the recompute change-detect.
-    static METRICS_GEN: Cell<u32> = const { Cell::new(0) };
-    /// Metric fetches in flight (or backing off after a failure).
-    static PENDING: RefCell<HashSet<&'static str>> = RefCell::new(HashSet::new());
+    static PENDING: RefCell<HashSet<String>> = RefCell::new(HashSet::new());
     /// Keys the server answered 404 for. Its buffer set is fixed per graph,
     /// so one 404 is final: re-asking would be a permanent warning loop.
-    static UNSERVED: RefCell<HashSet<&'static str>> = RefCell::new(HashSet::new());
+    static UNSERVED: RefCell<HashSet<String>> = RefCell::new(HashSet::new());
     /// Importer facet index behind the primary-tag buckets. graph-api has no
     /// `tag` metric buffer; `/graph/meta_summary` is the same facet source
     /// the Nodes and Filter panels read.
@@ -758,6 +758,8 @@ thread_local! {
     /// Server metrics are only meaningful for a graph-api-owned topology.
     static METRICS_ALLOWED: Cell<bool> = const { Cell::new(false) };
     static METRICS_SESSION: Cell<u64> = const { Cell::new(0) };
+    /// Bumped on every cache insert — part of the recompute change-detect.
+    static METRICS_GEN: Cell<u32> = const { Cell::new(0) };
     /// Change-detect for the buffer recompute — the egui app's
     /// `prev_style_key`, extended with the metrics generation and the
     /// `sizes_base` allocation address. The address changes when either we
@@ -856,49 +858,147 @@ fn ensure_metrics(style: &StyleState) {
         if !SERVED.contains(&key) {
             continue;
         }
+        let key_str = key.to_string();
         if METRICS_TL.with(|m| m.borrow().contains_key(key)) {
             continue;
         }
-        if UNSERVED.with(|u| u.borrow().contains(key)) {
+        if UNSERVED.with(|u| u.borrow().contains(&key_str)) {
             continue;
         }
-        if PENDING.with(|p| !p.borrow_mut().insert(key)) {
+        if PENDING.with(|p| !p.borrow_mut().insert(key_str.clone())) {
             continue;
         }
         let session = METRICS_SESSION.with(Cell::get);
         wasm_bindgen_futures::spawn_local(async move {
-            match crate::api::metric(key).await {
+            match crate::api::metric(&key_str).await {
                 Ok(Some(v)) => {
                     if !current_session(session) {
                         return;
                     }
-                    insert_metric(key, v);
+                    insert_metric(&key_str, v);
                     PENDING.with(|p| {
-                        p.borrow_mut().remove(key);
+                        p.borrow_mut().remove(&key_str);
                     });
                     apply_now();
                 }
                 Ok(None) => {
-                    tracing::warn!("[style] metric {key}: not served by this graph");
+                    tracing::warn!("[style] metric {}: not served by this graph", key_str);
                     UNSERVED.with(|u| {
-                        u.borrow_mut().insert(key);
+                        u.borrow_mut().insert(key_str.clone());
                     });
                     PENDING.with(|p| {
-                        p.borrow_mut().remove(key);
+                        p.borrow_mut().remove(&key_str);
                     });
                 }
                 Err(e) => {
-                    tracing::warn!("[style] metric {key}: {e}");
-                    // 15 s before the key becomes fetchable again — the
-                    // server may still be indexing the vault.
+                    tracing::warn!("[style] metric {}: {}", key_str, e);
                     gloo_timers::future::TimeoutFuture::new(15_000).await;
                     PENDING.with(|p| {
-                        p.borrow_mut().remove(key);
+                        p.borrow_mut().remove(&key_str);
                     });
                 }
             }
         });
     }
+    if style.region_mode != crate::render::RegionMode::Off {
+        ensure_community_levels();
+    }
+}
+
+fn ensure_community_levels() {
+    if !METRICS_ALLOWED.with(Cell::get) {
+        return;
+    }
+    let community_levels_key = "community_levels".to_string();
+    if METRICS_TL.with(|m| m.borrow().contains_key("community_levels")) {
+        let l = METRICS_TL.with(|m| {
+            m.borrow().get("community_levels").and_then(|v| v.first().map(|&x| x as u32))
+        });
+        if let Some(l) = l {
+            for k in 0..l {
+                let level_key = format!("community_l{}", k);
+                if METRICS_TL.with(|m| m.borrow().contains_key(&level_key)) {
+                    continue;
+                }
+                if UNSERVED.with(|u| u.borrow().contains(&level_key)) {
+                    continue;
+                }
+                if PENDING.with(|p| !p.borrow_mut().insert(level_key.clone())) {
+                    continue;
+                }
+                let session = METRICS_SESSION.with(Cell::get);
+                wasm_bindgen_futures::spawn_local(async move {
+                    match crate::api::metric(&level_key).await {
+                        Ok(Some(v)) => {
+                            if !current_session(session) {
+                                return;
+                            }
+                            insert_metric(&level_key, v);
+                            PENDING.with(|p| {
+                                p.borrow_mut().remove(&level_key);
+                            });
+                            apply_now();
+                        }
+                        Ok(None) => {
+                            tracing::warn!("[style] metric {}: not served by this graph", level_key);
+                            UNSERVED.with(|u| {
+                                u.borrow_mut().insert(level_key.clone());
+                            });
+                            PENDING.with(|p| {
+                                p.borrow_mut().remove(&level_key);
+                            });
+                        }
+                        Err(e) => {
+                            tracing::warn!("[style] metric {}: {}", level_key, e);
+                            gloo_timers::future::TimeoutFuture::new(15_000).await;
+                            PENDING.with(|p| {
+                                p.borrow_mut().remove(&level_key);
+                            });
+                        }
+                    }
+                });
+            }
+        }
+        return;
+    }
+    if UNSERVED.with(|u| u.borrow().contains(&community_levels_key)) {
+        return;
+    }
+    if PENDING.with(|p| !p.borrow_mut().insert(community_levels_key.clone())) {
+        return;
+    }
+    let session = METRICS_SESSION.with(Cell::get);
+    wasm_bindgen_futures::spawn_local(async move {
+        match crate::api::metric(&community_levels_key).await {
+            Ok(Some(v)) => {
+                if !current_session(session) {
+                    return;
+                }
+                insert_metric(&community_levels_key, v);
+                PENDING.with(|p| {
+                    p.borrow_mut().remove(&community_levels_key);
+                });
+                ensure_community_levels();
+                apply_now();
+            }
+            Ok(None) => {
+                tracing::warn!("[style] metric {}: not served by this graph", community_levels_key);
+                UNSERVED.with(|u| {
+                    u.borrow_mut().insert(community_levels_key.clone());
+                });
+                PENDING.with(|p| {
+                    p.borrow_mut().remove(&community_levels_key);
+                });
+            }
+            Err(e) => {
+                tracing::warn!("[style] metric {}: {}", community_levels_key, e);
+                gloo_timers::future::TimeoutFuture::new(15_000).await;
+                PENDING.with(|p| {
+                    p.borrow_mut().remove(&community_levels_key);
+                });
+            }
+        }
+    });
 }
 
 fn current_session(session: u64) -> bool {
@@ -929,7 +1029,8 @@ fn host_node_count() -> Option<usize> {
 fn ensure_tag_metric() {
     let facets_ready = TAG_FACETS.with(|c| c.borrow().is_some());
     if !facets_ready {
-        if PENDING.with(|p| !p.borrow_mut().insert(TAG_KEY)) {
+        let tag_key_str = TAG_KEY.to_string();
+        if PENDING.with(|p| !p.borrow_mut().insert(tag_key_str.clone())) {
             return;
         }
         let session = METRICS_SESSION.with(Cell::get);
@@ -942,7 +1043,7 @@ fn ensure_tag_metric() {
                 Ok(m) => {
                     TAG_FACETS.with(|c| *c.borrow_mut() = Some(FieldIndex::from_proto(&m)));
                     PENDING.with(|p| {
-                        p.borrow_mut().remove(TAG_KEY);
+                        p.borrow_mut().remove(&tag_key_str);
                     });
                     ensure_tag_metric();
                     apply_now();
@@ -951,7 +1052,7 @@ fn ensure_tag_metric() {
                     tracing::warn!("[style] tag facets: {e}");
                     gloo_timers::future::TimeoutFuture::new(15_000).await;
                     PENDING.with(|p| {
-                        p.borrow_mut().remove(TAG_KEY);
+                        p.borrow_mut().remove(&tag_key_str);
                     });
                 }
             }
@@ -1004,6 +1105,7 @@ fn apply_now() {
                 .collect();
             pipes.set_region_map(device, queue, crate::render::RegionMapConfig {
                 mode: style.region_mode,
+                level: style.region_level,
                 radius_cells: style.region_radius,
                 fill_alpha: style.region_alpha,
                 outline: style.region_outline,
@@ -1029,13 +1131,41 @@ fn apply_now() {
             pipes.update_colors(queue, colors);
             pipes.update_sizes(queue, sizes);
             pipes.update_shape_ids(queue, shapes);
-
-            // Build cluster IDs from the community metric
-            let ids: Vec<u32> = mv.get("community")
-                .map(|v| v.iter().map(|&x| x as u32).collect())
-                .unwrap_or_else(|| vec![0u32; n]);
-            if ids.len() == n {
-                pipes.update_cluster_ids(queue, ids);
+            // Build cluster levels from the community metrics
+            let (ids, n_levels) = if style.community_source == CommunitySource::Tag {
+                let tag_ids: Vec<u32> = mv.get("tag")
+                    .map(|v| v.iter().map(|&x| x as u32).collect())
+                    .unwrap_or_else(|| vec![0u32; n]);
+                (tag_ids, 1)
+            } else {
+                let l = metrics.get("community_levels").and_then(|v| v.first().map(|&x| x as u32)).unwrap_or(1);
+                let mut all_present = l > 0;
+                for k in 0..l {
+                    if !metrics.contains_key(&format!("community_l{}", k)) {
+                        all_present = false;
+                        break;
+                    }
+                }
+                if all_present && l > 1 {
+                    let mut ids_vec = vec![0u32; n * l as usize];
+                    for k in 0..l {
+                        let level_key = format!("community_l{}", k);
+                        if let Some(level_data) = metrics.get(&level_key) {
+                            for (i, &val) in level_data.iter().enumerate().take(n) {
+                                ids_vec[(k as usize) * n + i] = val as u32;
+                            }
+                        }
+                    }
+                    (ids_vec, l)
+                } else {
+                    let ids: Vec<u32> = mv.get("community")
+                        .map(|v| v.iter().map(|&x| x as u32).collect())
+                        .unwrap_or_else(|| vec![0u32; n]);
+                    (ids, 1)
+                }
+            };
+            if ids.len() == (n * n_levels as usize) || ids.len() == n {
+                pipes.update_cluster_levels(device, queue, ids, n_levels);
             }
             // Edge colors: when EdgeColorBy::None, push the uniform
             // edge_color for every edge so per-edge tinting is inert.
@@ -1201,6 +1331,12 @@ pub fn panel(ctx: Ctx) -> Element {
     // off — same enablement as the egui color button.
     let uniform_edge = s.edge_color_by == EdgeColorBy::None;
     let hex = rgb_hex(s.edge_color);
+    // Region level readout. Hoisted out of `rsx!` because Dioxus does not
+    // allow statements alongside element literals inside a bare block.
+    let l = METRICS_TL.with(|m| {
+        m.borrow().get("community_levels").and_then(|v| v.first().map(|&x| x as u32)).unwrap_or(1)
+    });
+    let cur = *crate::render::REGION_LEVEL.read();
 
     rsx! {
         div { class: "sty",
@@ -1275,6 +1411,40 @@ pub fn panel(ctx: Ctx) -> Element {
                     onchange: move |e| update(|s| s.region_outline = e.checked()),
                 }
             }
+            {
+                let l = METRICS_TL.with(|m| {
+                    m.borrow().get("community_levels").and_then(|v| v.first().map(|&x| x as u32)).unwrap_or(1)
+                });
+                let max_static_levels = 16;
+                let level_count = std::cmp::min(l.saturating_sub(1), max_static_levels as u32) as usize;
+                let mut level_options = vec!["Auto"];
+                level_options.extend(&["0 (coarsest)", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15"][..level_count]);
+
+                let selected_idx = match s.region_level {
+                    crate::render::RegionLevel::Auto => 0,
+                    crate::render::RegionLevel::Fixed(k) => {
+                        if k < l.saturating_sub(1) { (k + 1) as usize } else { 0 }
+                    }
+                };
+
+                select_row("Region level",
+                    level_options,
+                    selected_idx,
+                    move |i| {
+                        let new_level = if i == 0 {
+                            crate::render::RegionLevel::Auto
+                        } else {
+                            crate::render::RegionLevel::Fixed((i - 1) as u32)
+                        };
+                        update(|s| s.region_level = new_level);
+                    })
+            }
+
+            div { class: "sty-row",
+                span { class: "sty-label", "Level" }
+                span { class: "sty-value", "level {cur} of {l}" }
+            }
+
 
             div { class: "sty-row",
                 span { class: "sty-hint", "Cluster regions from the community metric (GMap-style)" }
