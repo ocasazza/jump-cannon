@@ -262,6 +262,10 @@ pub enum Transform {
     None,
     /// `"tofu, Hydra"` becomes `["tofu", "Hydra"]`.
     SplitCsv,
+    /// `"383.41"` becomes the number `383.41`, so an API that ships numbers
+    /// as strings can still populate a `number` discovery field. Numbers
+    /// pass through; anything unparseable is omitted.
+    ParseNumber,
 }
 
 /// An edge derived from a value inside a node document.

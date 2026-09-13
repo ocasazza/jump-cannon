@@ -580,6 +580,21 @@ fn copy_to_clipboard(text: &str) {
 
 // --- source apply tracking -------------------------------------------------------
 
+/// Load one catalog source's graph into this browser session, anchoring the
+/// status on its own row. The entry point for callers outside the panel (the
+/// shipped example sessions); the load, progress, and retry behaviour is
+/// exactly the panel's own.
+pub(crate) fn apply_catalog_source(ctx: Ctx, id: String) {
+    apply_source(ctx, id.clone(), Some(id));
+}
+
+/// Clear this browser session's source selection and return to the
+/// deployment default.
+pub(crate) fn return_to_default_source(ctx: Ctx) {
+    let anchor = VIEWING.peek().clone().unwrap_or_default();
+    apply_source(ctx, anchor, None);
+}
+
 /// Switch the session's graph view and track the resulting load. `target` is
 /// the catalog id to view, or `None` to clear the session selection and return
 /// to the deployment default. `anchor` is the catalog row the status renders

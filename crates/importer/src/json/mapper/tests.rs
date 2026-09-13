@@ -327,6 +327,47 @@ fn split_csv_fields_become_keyword_lists() {
     assert_eq!(document.fields["entities"], json!(["tofu", "Hydra"]));
 }
 
+/// A `number` discovery field must receive a JSON number even when the API
+/// ships the value as a string — ChEMBL's `full_mwt` is `"383.41"`, and a
+/// string there fails `validate_output` on every record.
+#[test]
+fn parse_number_transform_accepts_numeric_strings() {
+    use crate::json::config::{FieldRule, Transform};
+
+    let field = |pointer: &str| FieldRule {
+        key: "weight".to_string(),
+        pointer: pointer.to_string(),
+        transform: Transform::ParseNumber,
+    };
+    let document = json!({
+        "stringy": "383.41",
+        "numeric": 383.41,
+        "blank": "",
+        "words": "not a number",
+        "negative": "-1.5",
+    });
+
+    assert_eq!(
+        super::field_value(&field("/stringy"), &document),
+        Some(json!(383.41)),
+        "a numeric string becomes a number"
+    );
+    assert_eq!(
+        super::field_value(&field("/numeric"), &document),
+        Some(json!(383.41)),
+        "an actual number passes through"
+    );
+    assert_eq!(
+        super::field_value(&field("/negative"), &document),
+        Some(json!(-1.5))
+    );
+    // Unparseable values are omitted, not coerced to 0: a missing measurement
+    // must stay missing.
+    assert_eq!(super::field_value(&field("/words"), &document), None);
+    assert_eq!(super::field_value(&field("/blank"), &document), None);
+    assert_eq!(super::field_value(&field("/absent"), &document), None);
+}
+
 #[test]
 fn mentions_resolve_by_title_case_insensitively() {
     let result = mapped();

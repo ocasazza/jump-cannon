@@ -1243,6 +1243,10 @@
             # ride along unfiltered — the extension allowlist above would drop
             # .js/.ttf payloads the panel-kit editor loads at runtime.
             ./app/ui/assets/vendor
+            # Shipped example sessions: index.json plus one YAML per session,
+            # copied into the dist by trunk (index.html copy-dir). Same
+            # reason as vendor/ — .json/.yaml are not in the allowlist.
+            ./app/ui/assets/sessions
             # The Sessions view path-depends on session-manager/graph-vcs,
             # whose *optional* server deps (graph-api, data-loader, …) still
             # need their manifests parsed, and those use `workspace = true`

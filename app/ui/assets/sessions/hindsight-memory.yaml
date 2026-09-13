@@ -1,0 +1,15 @@
+# Hindsight memory bank — units, canonical entities, and retained documents.
+#
+# Regime: concentric static layout ranked by degree, so the canonical
+# entities every memory unit mentions occupy the inner rings and one-off
+# observations fall to the outside. Folder colour separates the three
+# collections.
+style:
+  size_by: Degree
+  color_by: Folder
+  size_mul: 0.5
+layout:
+  active: concentric
+  settings: {}
+  seed_strategy: None
+  seed_custom: ""

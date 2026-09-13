@@ -1099,3 +1099,11 @@ textarea.doc-src:focus { outline:none; }
 .imp-row-wrap > .imp-row { flex:1 1 auto; }
 .imp-row-load { flex:0 0 auto; padding:0 .45rem; font-size:.7rem; line-height:1;
   color:var(--accent); }
+
+/* Shipped example sessions in the Instances panel. */
+.inst-session { display:flex; flex-direction:column; gap:.15rem; padding:.3rem 0; }
+.inst-session-head { display:flex; align-items:center; gap:.5rem; }
+.inst-session-title { flex:1 1 auto; color:var(--fg); font-size:.72rem; }
+.inst-session-load { flex:0 0 auto; }
+.inst-session-desc { color:var(--dim); font-size:.65rem; line-height:1.35; }
+.inst-session-source { color:var(--accent); font-family:var(--mono); font-size:.6rem; }

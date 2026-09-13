@@ -25,6 +25,7 @@ mod panels;
 mod pest_worker;
 mod proto;
 mod render;
+mod sessions;
 mod worker;
 
 mod github;

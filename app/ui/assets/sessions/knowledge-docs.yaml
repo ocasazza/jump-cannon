@@ -1,0 +1,14 @@
+# Jump Cannon docs — the deployment's own knowledge corpus.
+#
+# Regime: GPU force simulation over the wikilink graph, coloured by document
+# type (runbook, reference, plan) and sized uniformly, which is the shape the
+# living-documentation map is authored against.
+style:
+  size_by: Uniform
+  color_by: Doctype
+  size_mul: 0.5
+layout:
+  active: gpu-force
+  settings: {}
+  seed_strategy: None
+  seed_custom: ""

@@ -173,6 +173,36 @@ importers:
           tenant: default
           bank: jira-ithelp
         pollIntervalMs: 60000
+    # Public chemistry / research corpora. These two reach the open internet
+    # (EMBL-EBI and OpenAlex) rather than an in-cluster service, so they only
+    # import on a node with egress; a blocked node fails the source's build
+    # loudly and leaves every other source serving. No credentials: both APIs
+    # are public, and OpenAlex only asks for a contact address (its polite
+    # pool) which rides as a package variable.
+    chembl-pharmacology:
+      displayName: ChEMBL Pharmacology
+      description: Approved molecules, human protein targets, mechanism-of-action records bridging molecule to target, and drug indications, read from the public ChEMBL REST API through the shared httpjson package engine.
+      kind: httpjson
+      sourceId: chembl
+      httpJson:
+        package: chembl-pharmacology.toml
+        endpoint: https://www.ebi.ac.uk
+        variables:
+          max_phase: "4"
+        # ChEMBL publishes quarterly; a daily poll is already generous.
+        pollIntervalMs: 86400000
+    openalex-works:
+      displayName: OpenAlex Research Works
+      description: The most relevant OpenAlex works for one search scope plus the citation edges among them, read from the public OpenAlex API through the shared httpjson package engine. Change `query` to re-scope the literature neighbourhood.
+      kind: httpjson
+      sourceId: openalex
+      httpJson:
+        package: openalex-works.toml
+        endpoint: https://api.openalex.org
+        variables:
+          query: cheminformatics
+          mailto: ops@schrodinger.com
+        pollIntervalMs: 86400000
 
 # okf-sync CronJob: fast-forward git-pulls the lavender OKF repository
 # (pushed nightly by lavender-ingest) into the shared claim an OKF importer

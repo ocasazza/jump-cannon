@@ -327,30 +327,46 @@ pointer = "/name"
 mod tests {
     use super::*;
 
-    /// The chart ships this exact file to graph-api under
-    /// `httpJsonImporter.mountPath`; if it stops validating, deployments
-    /// selecting `httpjson` fail loudly at startup rather than silently. Keep
-    /// this in lockstep with `charts/jump-cannon/packages/hindsight-memory-bank.toml`.
+    /// The chart ships these exact files to graph-api under the packages
+    /// mount; if one stops validating, deployments selecting it fail loudly
+    /// at startup rather than silently. Keep this in lockstep with
+    /// `charts/jump-cannon/packages/`.
     #[test]
-    fn hindsight_memory_bank_package_validates() {
-        let bytes = include_bytes!(
-            "../../../../charts/jump-cannon/packages/hindsight-memory-bank.toml"
-        );
-        let package = ValidatedPackage::from_toml_bytes(bytes)
-            .expect("charts/jump-cannon/packages/hindsight-memory-bank.toml validates");
-        assert_eq!(package.engine(), crate::EngineKind::Json);
-        assert!(
-            !package.manifest().metadata.id.trim().is_empty(),
-            "package must declare a stable metadata.id"
-        );
-        assert!(
-            !package.json_config().unwrap().collections.is_empty(),
-            "package must declare at least one collection"
-        );
-        package
-            .schema()
-            .validate()
-            .expect("published discovery schema is internally consistent");
+    fn shipped_json_packages_validate() {
+        let shipped: [(&str, &[u8]); 3] = [
+            (
+                "hindsight-memory-bank.toml",
+                include_bytes!("../../../../charts/jump-cannon/packages/hindsight-memory-bank.toml"),
+            ),
+            (
+                "chembl-pharmacology.toml",
+                include_bytes!("../../../../charts/jump-cannon/packages/chembl-pharmacology.toml"),
+            ),
+            (
+                "openalex-works.toml",
+                include_bytes!("../../../../charts/jump-cannon/packages/openalex-works.toml"),
+            ),
+        ];
+        for (name, bytes) in shipped {
+            let package = ValidatedPackage::from_toml_bytes(bytes)
+                .unwrap_or_else(|error| panic!("{name} validates: {error}"));
+            assert_eq!(package.engine(), crate::EngineKind::Json, "{name}");
+            assert!(
+                !package.manifest().metadata.id.trim().is_empty(),
+                "{name} must declare a stable metadata.id"
+            );
+            let config = package
+                .json_config()
+                .unwrap_or_else(|_| panic!("{name} exposes a json config"));
+            assert!(
+                !config.collections.is_empty(),
+                "{name} must declare at least one collection"
+            );
+            package
+                .schema()
+                .validate()
+                .unwrap_or_else(|error| panic!("{name} discovery schema is consistent: {error}"));
+        }
     }
 
     #[test]

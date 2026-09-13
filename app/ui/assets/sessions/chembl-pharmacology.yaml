@@ -1,0 +1,16 @@
+# ChEMBL pharmacology — molecules, targets, and the mechanisms that bridge them.
+#
+# Regime: GPU force simulation (the repulsion/spring defaults handle the
+# tripartite molecule/mechanism/target structure), Louvain communities as
+# colour, PageRank as size, so the heavily-targeted molecules and the
+# promiscuous targets are visible immediately.
+style:
+  size_by: PageRank
+  color_by: Community
+  size_mul: 0.6
+  shape_by: Doctype
+layout:
+  active: gpu-force
+  settings: {}
+  seed_strategy: None
+  seed_custom: ""

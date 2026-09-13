@@ -127,6 +127,26 @@ binds an instance to one HTTP/JSON API per `JUMP_CANNON_IMPORTER_*` env
 var and reads one selected Hindsight memory bank read-only; bounds and
 record caps are loud per collection (see [[Hindsight Importer]]).
 
+Two of the shipped packages read public science APIs rather than an
+in-cluster service: `chembl-pharmacology.toml` (EMBL-EBI ChEMBL — approved
+molecules, human protein targets, the mechanism-of-action records that bridge
+molecule to target, and drug indications; ~29.6k nodes and ~22.5k edges at
+`max_phase = 4`) and `openalex-works.toml` (OpenAlex — one ranked page of a
+search scope plus the citation edges among those works). Both need node
+egress to the open internet, so they build only where the pod has it and fail
+loudly with the endpoint in the message where it does not. ChEMBL ships some
+measurements as numeric strings (`full_mwt` is `"383.41"`), which is why the
+json engine has the `parse_number` field transform: a `number` discovery
+field gets a number instead of the schema being weakened.
+
+Shipped example sessions pair a curated UI state with the source it is about:
+`app/ui/assets/sessions/*.yaml` plus an `index.json`, copied into the dist by
+trunk so every deployment has them (container, `trunk serve`, browser-only
+GitHub Pages). The Instances panel lists them; Load applies the app state
+(layout regime, style, camera) and then loads the named source through the
+same apply path as a manual row Load, so a session on an unbuilt source shows
+the build overlay and streams its stages.
+
 Do not hide network access, credentials, or authorization inside a pure mapper.
 Deployment owns those effects through [[Helm Deployment]] and [[Security Model]].
 
