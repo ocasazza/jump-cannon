@@ -106,7 +106,7 @@ the chart catalog at boot (entries carry `origin: runtime`; an overlay that
 fails validation or shadows a chart id is logged and ignored). Instance
 variables are mutable through the same gate without touching the package
 text: `GET /importers/{id}/variables` returns an httpjson source's declared
-`[[parser.variables]]` (name, description, default) plus the instance's
+parser-variable declarations (name, description, default) plus the instance's
 current values, and `PUT /importers/{id}/variables` fully replaces the set —
 keys are validated against the package's declarations, the override persists
 to `<packages_dir>/variables.local.json` (its own file because the source
