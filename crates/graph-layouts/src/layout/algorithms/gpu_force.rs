@@ -157,6 +157,12 @@ pub enum SeedMode {
     /// positions are all-zero (the `/graph/positions` endpoint is 2-D x,y and
     /// can be degenerate) still needs `Random`/`TopoFisheye` to spread it out.
     None,
+    /// Device-side multilevel coarsening seed (see [`super::gpu_multilevel`]).
+    /// Builds a heavy-edge-matching coarsening cascade, lays out the coarsest
+    /// level, and prolongs positions back down into the fine buffer entirely
+    /// on the GPU — zero host readback. The large-graph seed: chosen by
+    /// [`GpuForceOptions::for_n_nodes`] above 10k nodes.
+    GpuMultilevel,
 }
 
 impl Default for SeedMode {
@@ -171,6 +177,7 @@ impl SeedMode {
         match s.to_ascii_lowercase().as_str() {
             "topo_fisheye" | "topofisheye" | "tf" | "fisheye" => SeedMode::TopoFisheye,
             "none" | "keep" | "keep_current" => SeedMode::None,
+            "gpu_multilevel" | "multilevel" | "ml" => SeedMode::GpuMultilevel,
             _ => SeedMode::Random,
         }
     }
@@ -179,6 +186,7 @@ impl SeedMode {
             SeedMode::Random => "random",
             SeedMode::TopoFisheye => "topo_fisheye",
             SeedMode::None => "none",
+            SeedMode::GpuMultilevel => "gpu_multilevel",
         }
     }
 }
@@ -417,6 +425,10 @@ impl GpuForceOptions {
         // that hasn't moved more than a small fraction of one spring
         // length per step is what counts as "settled."
         o.energy_threshold = (len * 1.0e-4).max(1.0e-6);
+        // Below ~10k nodes the CPU topo-fisheye / warmup seed is cheaper than
+        // 16 levels of GPU dispatch overhead; above it, the fully-device
+        // multilevel seed keeps large graphs off the host entirely.
+        o.seed_mode = if n > 10_000 { SeedMode::GpuMultilevel } else { SeedMode::Random };
         o
     }
 }
@@ -741,6 +753,12 @@ impl GpuForceLayout {
             let od = self.owned_device.as_ref().unwrap();
             let pc = precompute(graph, &self.options.seed_mode, self.options.spring_len);
             self.state = Some(GpuState::new_owned(&od.device, pc)?);
+            if matches!(self.options.seed_mode, SeedMode::GpuMultilevel) {
+                self.state
+                    .as_mut()
+                    .unwrap()
+                    .run_multilevel_seed_owned(&od.device, &od.queue, &self.options);
+            }
         }
 
         let od = self
@@ -780,7 +798,7 @@ impl GpuForceLayout {
         positions_buffer: &wgpu::Buffer,
     ) -> Result<(), String> {
         let pc = precompute(graph, &self.options.seed_mode, self.options.spring_len);
-        let state = GpuState::new_borrowed(device, positions_buffer, pc)?;
+        let mut state = GpuState::new_borrowed(device, positions_buffer, pc)?;
         // SeedMode::None means "keep whatever is already in the shared buffer":
         // skip the write_buffer that would clobber meaningful caller-supplied
         // positions (generated sphere, applied seed, prior settled state).
@@ -788,6 +806,9 @@ impl GpuForceLayout {
         // graph's `position3` (synced from the live buffer by the caller).
         if !matches!(self.options.seed_mode, SeedMode::None) {
             state.upload_initial_positions_to(queue, positions_buffer);
+        }
+        if matches!(self.options.seed_mode, SeedMode::GpuMultilevel) {
+            state.run_multilevel_seed(device, queue, positions_buffer, &self.options);
         }
         self.state = Some(state);
         Ok(())
@@ -841,11 +862,14 @@ impl GpuForceLayout {
             &self.options.seed_mode,
             self.options.spring_len,
         );
-        let state = GpuState::new_borrowed(device, positions_buffer, pc)?;
+        let mut state = GpuState::new_borrowed(device, positions_buffer, pc)?;
         // SeedMode::None means "keep whatever is already in the shared buffer";
         // every other mode uploads the seeded (or caller-supplied) positions.
         if !matches!(self.options.seed_mode, SeedMode::None) {
             state.upload_initial_positions_to(queue, positions_buffer);
+        }
+        if matches!(self.options.seed_mode, SeedMode::GpuMultilevel) {
+            state.run_multilevel_seed(device, queue, positions_buffer, &self.options);
         }
         self.state = Some(state);
         Ok(())
@@ -879,6 +903,12 @@ impl GpuForceLayout {
                 self.options.spring_len,
             );
             self.state = Some(GpuState::new_owned(&od.device, pc)?);
+            if matches!(self.options.seed_mode, SeedMode::GpuMultilevel) {
+                self.state
+                    .as_mut()
+                    .unwrap()
+                    .run_multilevel_seed_owned(&od.device, &od.queue, &self.options);
+            }
         }
 
         let od = self
@@ -1154,6 +1184,45 @@ struct SimParamsRaw {
     tfdp_k: f32,
 }
 
+/// Serialise a `SimParamsRaw` for a device-multilevel coarse-level force
+/// step: `NegativeSampling` repulsion (no octree scratch), the user's force
+/// model + spring/repulsion tunables, and the supplied node/edge counts.
+/// `n_nodes` is spliced with the device-computed coarse count on the GPU for
+/// coarse levels (see `gpu_multilevel`), so the value passed here is only a
+/// placeholder there; the fine level passes its exact count.
+pub(crate) fn ml_coarse_params_bytes(
+    opts: &GpuForceOptions,
+    n_nodes: u32,
+    n_edges: u32,
+    step_index: u32,
+) -> Vec<u8> {
+    let raw = SimParamsRaw {
+        repulsion: opts.repulsion,
+        spring_k: opts.spring_k,
+        spring_len: opts.spring_len,
+        gravity: opts.gravity,
+        damping: opts.damping,
+        dt: opts.dt,
+        cursor_radius: 0.0,
+        cursor_strength: 0.0,
+        cursor_pos: [0.0; 3],
+        n_nodes,
+        n_edges,
+        repulsion_radius: opts.repulsion_radius,
+        repulsion_mode: RepulsionMode::NegativeSampling.as_u32(),
+        bh_theta: opts.theta.clamp(0.1, 2.0),
+        n_octree: 0,
+        repulsion_samples: opts.repulsion_samples.max(1),
+        step_index,
+        force_model: opts.force_model.as_u32(),
+        tfdp_alpha: opts.tfdp_alpha.max(0.0),
+        tfdp_beta: opts.tfdp_beta.max(0.0),
+        tfdp_gamma: opts.tfdp_gamma.max(0.5),
+        tfdp_k: opts.tfdp_k.max(0.0),
+    };
+    bytemuck::bytes_of(&raw).to_vec()
+}
+
 // Each vec3<f32> in a storage buffer occupies 16 bytes (vec3 has stride/align
 // of 16 in WGSL). We use a 4-component layout on the CPU side to match.
 const VEC3_STRIDE: u64 = 16;
@@ -1274,6 +1343,14 @@ struct GpuState {
     /// On native, drained inside `step_with_encoder` after `device.poll(Poll)`;
     /// on WASM, the browser drives the callback between rAF ticks.
     energy_readback: Arc<Mutex<EnergyReadback>>,
+    /// Fine CSR directed-slot count (`edge_offsets[n]`); sizes the device
+    /// multilevel coarsening scratch without a host readback.
+    fine_directed_slots: u32,
+    /// Retained device multilevel seed (built on `SeedMode::GpuMultilevel`).
+    /// Kept resident so the readback-only test helper can report level sizes;
+    /// its scratch is ~1.5x the fine node arrays plus ~1x the fine edge arrays
+    /// (see `gpu_multilevel`). `None` for every other seed mode.
+    multilevel: Option<super::gpu_multilevel::GpuMultilevel>,
 }
 
 /// CPU-side pre-compute: stable id ordering, initial positions
@@ -1351,6 +1428,8 @@ fn seed_positions_flat(
         // No generated seed: zeros as a base. The caller either supplies
         // meaningful positions (which override these) or accepts zeros.
         SeedMode::None => vec![0.0f32; 3 * n],
+        // Device multilevel seed overwrites xyz on the GPU; host seeds zeros.
+        SeedMode::GpuMultilevel => vec![0.0f32; 3 * n],
     };
     // Defensive: if the seeder returned the wrong length (e.g. empty graph
     // edge case), fall back to a zero ball so downstream sizing stays sane.
@@ -1751,6 +1830,8 @@ impl GpuState {
             node_order: pc.node_order,
             effective_damping: 1.0,
             energy_readback: Arc::new(Mutex::new(EnergyReadback::Idle)),
+            fine_directed_slots: pc.edge_offsets.last().copied().unwrap_or(0),
+            multilevel: None,
         }
     }
 
@@ -1795,6 +1876,65 @@ impl GpuState {
     /// `new_borrowed`.
     fn upload_initial_positions_to(&self, queue: &wgpu::Queue, shared: &wgpu::Buffer) {
         queue.write_buffer(shared, 0, bytemuck::cast_slice(&self.initial_positions));
+    }
+
+    /// Run the device multilevel coarsening seed against a borrowed shared
+    /// positions buffer, writing the final fine positions into `fine_pos`.
+    fn run_multilevel_seed(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        fine_pos: &wgpu::Buffer,
+        options: &GpuForceOptions,
+    ) {
+        let ml = super::gpu_multilevel::GpuMultilevel::new(device, self.n_nodes, self.fine_directed_slots);
+        ml.seed(
+            device,
+            queue,
+            &self.pipeline,
+            &self.bind_group_layout,
+            &self.oct_bind_group_layout,
+            &self.spring_bind_group_layout,
+            &self.oct_nodes_buf,
+            fine_pos,
+            &self.edge_offsets,
+            &self.edge_neighbors,
+            &self.virt_csr_buf,
+            &self.virt_edge_offsets_buf,
+            self.n_virtual,
+            options,
+        );
+        self.multilevel = Some(ml);
+    }
+
+    /// Owned-mode variant: seeds the current "in" position buffer (pos_a).
+    fn run_multilevel_seed_owned(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        options: &GpuForceOptions,
+    ) {
+        let ml = super::gpu_multilevel::GpuMultilevel::new(device, self.n_nodes, self.fine_directed_slots);
+        let PositionsStorage::Owned { pos_a, .. } = &self.positions else {
+            return;
+        };
+        ml.seed(
+            device,
+            queue,
+            &self.pipeline,
+            &self.bind_group_layout,
+            &self.oct_bind_group_layout,
+            &self.spring_bind_group_layout,
+            &self.oct_nodes_buf,
+            pos_a,
+            &self.edge_offsets,
+            &self.edge_neighbors,
+            &self.virt_csr_buf,
+            &self.virt_edge_offsets_buf,
+            self.n_virtual,
+            options,
+        );
+        self.multilevel = Some(ml);
     }
 
     fn write_params(&self, queue: &wgpu::Queue, opts: &GpuForceOptions, step_index: u32) {
@@ -2304,7 +2444,7 @@ fn dispatch_1d(cpass: &mut wgpu::ComputePass<'_>, invocations: u32) {
 
 /// `(x, y)` workgroup counts for `dispatch_1d`. Split out so the
 /// arithmetic is unit-testable without a device.
-fn dispatch_grid(invocations: u32) -> (u32, u32) {
+pub(crate) fn dispatch_grid(invocations: u32) -> (u32, u32) {
     let groups = invocations.div_ceil(WORKGROUP_SIZE).max(1);
     let x = groups.min(MAX_WORKGROUPS_PER_DIM);
     let y = groups.div_ceil(x);
@@ -4039,6 +4179,202 @@ mod tests {
                 "coincident BH build produced a non-finite position"
             );
         }
+    }
+
+    /// `SeedMode` string round trip for the device-multilevel variant.
+    #[test]
+    fn unit_seed_mode_gpu_multilevel_round_trip() {
+        assert_eq!(SeedMode::from_str("gpu_multilevel"), SeedMode::GpuMultilevel);
+        assert_eq!(SeedMode::from_str("multilevel"), SeedMode::GpuMultilevel);
+        assert_eq!(SeedMode::from_str("ml"), SeedMode::GpuMultilevel);
+        assert_eq!(SeedMode::from_str("GPU_Multilevel"), SeedMode::GpuMultilevel);
+        assert_eq!(SeedMode::GpuMultilevel.to_str(), "gpu_multilevel");
+        assert_eq!(
+            SeedMode::from_str(SeedMode::GpuMultilevel.to_str()),
+            SeedMode::GpuMultilevel
+        );
+    }
+
+    async fn acquire_test_device() -> Option<(wgpu::Device, wgpu::Queue)> {
+        let instance = wgpu::Instance::default();
+        let adapter = instance
+            .request_adapter(&wgpu::RequestAdapterOptions {
+                power_preference: wgpu::PowerPreference::HighPerformance,
+                compatible_surface: None,
+                force_fallback_adapter: false,
+            })
+            .await?;
+        adapter
+            .request_device(
+                &wgpu::DeviceDescriptor {
+                    label: Some("test/gpu_multilevel"),
+                    required_features: wgpu::Features::empty(),
+                    required_limits: gpu_force_device_limits(&adapter.limits()),
+                    memory_hints: wgpu::MemoryHints::Performance,
+                },
+                None,
+            )
+            .await
+            .ok()
+    }
+
+    /// 20,000-node "ring of rings": 200 rings of 100 nodes, each ring a cycle,
+    /// consecutive rings joined through their node 0. After the device
+    /// multilevel seed with ZERO fine steps the layout must be finite, spread
+    /// wider than 10 spring-lengths, and place graph-adjacent nodes far closer
+    /// than random pairs — a quality proxy a random seed fails.
+    #[tokio::test(flavor = "current_thread")]
+    async fn unit_gpu_multilevel_seed_ring_of_rings_quality() {
+        let _gpu = gpu_test_guard();
+        let rings = 200usize;
+        let per = 100usize;
+        let n = rings * per;
+        let idx = |r: usize, k: usize| (r * per + k) as u32;
+        let mut edges: Vec<u32> = Vec::with_capacity(n * 2 + rings * 2);
+        for r in 0..rings {
+            for k in 0..per {
+                edges.push(idx(r, k));
+                edges.push(idx(r, (k + 1) % per));
+            }
+            let nr = (r + 1) % rings;
+            edges.push(idx(r, 0));
+            edges.push(idx(nr, 0));
+        }
+
+        let Some((device, queue)) = acquire_test_device().await else {
+            eprintln!("skipping (no gpu adapter)");
+            return;
+        };
+        let positions_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("ml_ring_shared"),
+            size: (n as u64) * VEC3_STRIDE,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_SRC
+                | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let opts = GpuForceOptions {
+            seed_mode: SeedMode::GpuMultilevel,
+            ..GpuForceOptions::for_n_nodes(n)
+        };
+        let spring_len = opts.spring_len;
+        let mut layout = GpuForceLayout::new(opts);
+        let input = CsrInput { n_nodes: n as u32, edges: &edges, positions: None };
+        layout
+            .init_with_device_csr(&device, &queue, &input, &positions_buffer)
+            .expect("init csr");
+
+        // ZERO fine steps: read straight back after the seed.
+        let positions = layout
+            .read_back_positions(&device, &queue, &positions_buffer)
+            .await
+            .expect("readback");
+        assert_eq!(positions.len(), n * 4);
+
+        let mut mn = [f32::INFINITY; 3];
+        let mut mx = [f32::NEG_INFINITY; 3];
+        for p in positions.chunks_exact(4).take(n) {
+            for k in 0..3 {
+                assert!(p[k].is_finite(), "seed produced a non-finite position");
+                mn[k] = mn[k].min(p[k]);
+                mx[k] = mx[k].max(p[k]);
+            }
+        }
+        let span = (0..3).map(|k| mx[k] - mn[k]).fold(0.0f32, f32::max);
+        assert!(
+            span > 10.0 * spring_len,
+            "span {span} should exceed 10*spring_len {}",
+            10.0 * spring_len
+        );
+
+        let pos_of = |i: usize| [positions[i * 4], positions[i * 4 + 1], positions[i * 4 + 2]];
+        let dist = |a: [f32; 3], b: [f32; 3]| {
+            ((a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2) + (a[2] - b[2]).powi(2)).sqrt()
+        };
+        let mut adj_sum = 0.0f64;
+        let mut adj_n = 0u64;
+        for r in 0..rings {
+            for k in 0..per {
+                let a = idx(r, k) as usize;
+                let b = idx(r, (k + 1) % per) as usize;
+                adj_sum += dist(pos_of(a), pos_of(b)) as f64;
+                adj_n += 1;
+            }
+        }
+        let adj_mean = adj_sum / adj_n as f64;
+
+        let mut s: u32 = 0x1234_5678;
+        let mut rng = || {
+            s = s.wrapping_mul(1664525).wrapping_add(1013904223);
+            s
+        };
+        let pairs = 2000u32;
+        let mut rnd_sum = 0.0f64;
+        for _ in 0..pairs {
+            let a = (rng() as usize) % n;
+            let b = (rng() as usize) % n;
+            rnd_sum += dist(pos_of(a), pos_of(b)) as f64;
+        }
+        let rnd_mean = rnd_sum / pairs as f64;
+        assert!(
+            adj_mean < 0.25 * rnd_mean,
+            "ring-adjacent mean {adj_mean} should be < 0.25 * random-pair mean {rnd_mean}"
+        );
+    }
+
+    /// A 64-node path graph must produce a cascade of at least two levels
+    /// (fine + coarse) whose coarsest level is <= 1000 nodes and strictly
+    /// smaller than the fine level. Level sizes come from the readback-only
+    /// test helper on `GpuMultilevel`.
+    #[tokio::test(flavor = "current_thread")]
+    async fn unit_gpu_multilevel_cascade_path64_levels() {
+        let _gpu = gpu_test_guard();
+        let n: u32 = 64;
+        let mut edges: Vec<u32> = Vec::with_capacity((n as usize - 1) * 2);
+        for i in 0..n - 1 {
+            edges.push(i);
+            edges.push(i + 1);
+        }
+        let Some((device, queue)) = acquire_test_device().await else {
+            eprintln!("skipping (no gpu adapter)");
+            return;
+        };
+        let positions_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("ml_path_shared"),
+            size: (n as u64) * VEC3_STRIDE,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_SRC
+                | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let mut layout = GpuForceLayout::new(GpuForceOptions {
+            seed_mode: SeedMode::GpuMultilevel,
+            ..GpuForceOptions::for_n_nodes(64)
+        });
+        let input = CsrInput { n_nodes: n, edges: &edges, positions: None };
+        layout
+            .init_with_device_csr(&device, &queue, &input, &positions_buffer)
+            .expect("init csr");
+        let counts = layout
+            .state
+            .as_ref()
+            .unwrap()
+            .multilevel
+            .as_ref()
+            .expect("multilevel seed retained")
+            .level_node_counts(&device, &queue)
+            .await;
+        assert!(
+            counts.len() >= 2,
+            "cascade must have >= 2 levels (fine + coarse), got {counts:?}"
+        );
+        let coarsest = *counts.last().unwrap();
+        assert!(coarsest <= 1000, "coarsest level {coarsest} must be <= 1000 ({counts:?})");
+        assert!(
+            coarsest < counts[0],
+            "coarsest {coarsest} should reduce below fine {} ({counts:?})",
+            counts[0]
+        );
     }
 }
 

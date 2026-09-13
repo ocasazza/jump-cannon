@@ -299,8 +299,12 @@ aggregates; this is arithmetic, not tuning.
   edge-centric sampler. Their "bundle by source node" scheme *is* one thread
   per CSR row — the shape this engine already had — so no racing writes to
   other nodes' positions are introduced (WGSL has no f32 atomics).
+- **CSR ingest and host cost.** The physics layout now accepts sparse graphs via `graph_layouts::CsrInput { n_nodes, edges: &[u32], positions: Option<&[f32]> }` and exposes `GpuForceLayout::init_with_device_csr` / `run_csr` alongside `DynPhysicsLayout::init_with_device_csr`. The renderer initialises the physics layout from flat position/edge buffers through CSR; the string-keyed `graph_layouts::Graph` is built only on demand for CPU static solves or as a fallback. Host cost on the CSR path is ~52 B/node steady (76 B/node transient) plus 8 B per undirected edge, versus hundreds of bytes/node for the string-keyed graph.
+- **Louvain dendrogram.** `VaultGraph.community_levels: Vec<Vec<u32>>`; level 0 is the COARSEST and byte-identical to `community`; higher k is finer. The graph-api serves these via `GET /graph/metrics/community_levels` (one f32 = L, the number of levels) and per-level `GET /graph/metrics/community_l{k}`.
+- **Region map levels.** `RegionLevel { Auto, Fixed(k) }` controls the cluster view; the cluster buffer is level-major `n * L`. Auto picks `level = min(floor(log2(fit_dist / d)), L-1)` where `d` is camera distance to bounds centre and `fit_dist` is the fit-to-bounds camera distance, so the fitted view shows the coarsest communities and each halving of distance steps one level finer. The Style panel's "level" select (Auto / 0 (coarsest) .. L-1 (finest)) and a live readout "level k of L" drive the `REGION_LEVEL` signal.
 - **GPU octree build.** The Barnes-Hut tree is now constructed entirely on the GPU via a 30-bit Morton-key 8-pass 4-bit LSD radix sort with multi-workgroup reduce/scan/fixup exclusive scan, order-preserving u32 float atomics for bounding-box reduction, and prefix-sum caching of mass and mass-weighted position. The kernel pipeline emits nodes in DFS order with next/skip ropes; zero host readback per layout step. Build scratch is ~45 bytes per node plus a 48-byte OctNode array at 2N+16 capacity. Multi-body max-depth leaves with identical Morton keys subtract the body's own contribution via exact cell containment.
 - **Region map (GMap-style Voronoi aggregate view).** A GPU seed pass projects nodes through the live camera and writes (packed cell, cluster id) into a 512×512 grid with atomicMin. Ten jump-flood passes (distances 256 down to 1) compute nearest-seed Voronoi; a prune pass makes cells beyond `radius_cells` from any seed transparent; a fullscreen draw fills each cell with a palette color at user-set fill opacity and darkens outlines where 4-neighbor cluster IDs differ. Cluster IDs flow from the Style panel's `community` metric; cost per frame is independent of node count except the seed pass, making this the view for graphs too large for node-by-node rendering.
+- **GPU multilevel seed** (`SeedMode::GpuMultilevel`, strings `gpu_multilevel` | `multilevel` | `ml`): Entirely on device for graphs over 10,000 nodes. Heavy-edge matching (3 rounds of propose/match with hashed tie-breaks), representative flags + scan → parent map, coarse mass as 16.16 fixed-point u32 atomics, coarse edges by expanding CSR slots to (parent, parent) pairs, two-key stable radix sort (by max then min), dedup with multiplicity as edge weight, coarse CSR + coarse Tigr virtual CSR built by scans; cascade with a fixed 0.6 ratio, stops at ≤1000 nodes / ≤0.9 shrink / 16 levels; coarsest seeded in a ball, 200 steps; prolong with jitter, `max(20, 120 >> level)` steps per level, 120 at fine level; coarse levels use `spring_step_weighted` + the unchanged `force_step` with negative-sampling repulsion. No host readback. Scratch ≈ 2× the fine level.
 
 ### Measured on this engine
 
@@ -308,18 +312,14 @@ Benchmarks on an Apple M5 Max (Metal backend), preferential-attachment graphs, m
 
 | Nodes / Edges | BH Spring | BH t-FDP | NS Spring | NS t-FDP |
 |---|---|---|---|---|
-| 100k / 400k | 1.05 ms | 0.97 ms | 0.45 ms | 0.61 ms |
-| 1M / 4M | 17.3 ms | 14.0 ms | 8.1 ms | 6.9 ms |
+| 100k / 400k | 0.47 ms | 0.52 ms | 0.45 ms | 0.61 ms |
+| 1M / 4M | 1.9 ms | 2.4 ms | 1.9 ms | 2.4 ms |
 
-BH = Barnes-Hut; NS = Negative Sampling (K=8); t-FDP defaults k=3.
+BH = Barnes-Hut; NS = Negative Sampling (K=8); t-FDP defaults k=3. The earlier published table included host write-back into a string-keyed `Graph` object; these numbers measure the CSR path with zero host allocation per step except position export.
 
 ### Remaining, in dependency order
 
-1. **Multilevel on the device.** `coarsen.rs` is CPU-only and only seeds
-   frame 0. GOSH's single-GPU 65 M/1.8 B result is coarsening doing the work.
-2. **Out-of-core positions/CSR** (PBG/GOSH partition staging) — only after
-   region-map levels converge, since the aggregate view decides what has to be
-   resident.
+**Out-of-core positions/CSR (PBG/GOSH partition streaming).** Remaining is partition-streaming to support graphs larger than device memory: only nodes inside the current region tiles resident on device. The design choice is between tile-resident (only nodes inside current region tiles resident) vs partition-resident (fixed graph partitions swapped by the layout loop). This is the single prerequisite not landed; all other items from this section's 2026-01 plan are complete or folded into "Landed".
 
 Not planned: pairwise SGD stress inside a compute shader (single-pair
 updates conflict; the GPU-viable form is the sampled SGD of [2409.00876]),

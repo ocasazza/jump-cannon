@@ -13,7 +13,6 @@ use std::collections::HashMap;
 use dioxus::events::{MouseEvent, WheelEvent};
 use dioxus::html::geometry::WheelDelta;
 use dioxus::prelude::*;
-use graph_layouts::GpuForceOptions;
 
 use crate::api;
 use crate::render;
@@ -43,10 +42,10 @@ pub struct GraphData {
 /// Mirrors the egui app's bootstrap (`app.rs::spawn_fetch_task` +
 /// `try_promote_bootstrap_to_gpu`):
 ///   - the server's 2D positions are ignored — nodes seed on a hollow
-///     sphere shell (radius 800 wu), then the multilevel coarsening
-///     warm-up (`graph_layouts::warmup_positions`) replaces that with a
-///     coarsened-cascade seed so the GPU sim converges in a handful of
-///     frames instead of hundreds;
+///     sphere shell (radius 800 wu); the renderer's GPU force sim refines
+///     that seed with its own size-aware seed mode (device-side multilevel
+///     coarsening above 10k nodes), so there is no CPU-side warm-up to
+///     block the main thread at scale;
 ///   - colors come from the community metric through the Tableau20
 ///     palette (egui default `ColorBy::Community`);
 ///   - sizes come from pagerank with the default 0.5 multiplier
@@ -103,23 +102,13 @@ pub async fn load() -> Result<GraphData, String> {
         }
     }
 
-    // Sphere shell seed, then the coarsening warm-up (which always
-    // returns a full position set, so it effectively rules; the sphere
-    // remains as the fallback should warmup ever come back short).
-    //
-    // Skip the warmup for large graphs (>10k nodes): the multilevel
-    // coarsening + CPU FR cascade runs in WASM on the main thread and
-    // blocks the UI for seconds at 100k scale. The sphere shell seed is
-    // perfectly adequate when a GPU compute backend (graph-compute) is
-    // handling layout — the GPU converges from any reasonable init.
-    let mut positions = render::data::spawn_on_unit_sphere(n, 800.0);
-    if n <= 10_000 {
-        let spring_len = GpuForceOptions::default().spring_len.max(1.0);
-        let warmed = graph_layouts::warmup_positions(n, &edges, spring_len, 0xC0A75E);
-        if warmed.len() == positions.len() {
-            positions = warmed;
-        }
-    }
+    // Seed on a hollow sphere shell (radius 800 wu). The GPU force sim's own
+    // size-aware seed mode (selected by `GpuForceOptions::for_n_nodes` in the
+    // renderer) refines it from there — above 10k nodes it runs a device-side
+    // multilevel coarsening pass, so no CPU warm-up is needed and the main
+    // thread never blocks. The sphere keeps the buffer from being degenerate
+    // before the sim's first step.
+    let positions = render::data::spawn_on_unit_sphere(n, 800.0);
 
     let colors = render::data::colors_from_metric("community", &metrics, n);
     let sizes = render::data::sizes_from_metric("pagerank", &metrics, n, 0.5);
@@ -152,8 +141,8 @@ pub async fn load() -> Result<GraphData, String> {
 /// default colors/sizes, union-find `num_wcc`, no Louvain). Node iteration
 /// order is the snapshot's `BTreeMap` order, so the same snapshot always
 /// mounts the same buffer layout. Positions come from the stored `x`/`y`
-/// when any node carries them; otherwise the same deterministic sphere +
-/// coarsening warm-up as `load()` seeds the sim.
+/// when any node carries them; otherwise the same deterministic sphere-shell
+/// seed as `load()` (the GPU sim refines it).
 pub(crate) fn graph_data_from_snapshot(snapshot: &graph_vcs::Snapshot) -> GraphData {
     let mut id_to_idx: HashMap<String, u32> = HashMap::with_capacity(snapshot.nodes.len());
     let mut ids: Vec<String> = Vec::with_capacity(snapshot.nodes.len());
@@ -191,15 +180,7 @@ pub(crate) fn graph_data_from_snapshot(snapshot: &graph_vcs::Snapshot) -> GraphD
         }
         positions
     } else {
-        let mut positions = render::data::spawn_on_unit_sphere(n, 800.0);
-        if n <= 10_000 {
-            let spring_len = GpuForceOptions::default().spring_len.max(1.0);
-            let warmed = graph_layouts::warmup_positions(n, &edges, spring_len, 0xC0A75E);
-            if warmed.len() == positions.len() {
-                positions = warmed;
-            }
-        }
-        positions
+        render::data::spawn_on_unit_sphere(n, 800.0)
     };
 
     let metrics: HashMap<String, Vec<f32>> = HashMap::new();
@@ -227,7 +208,7 @@ pub(crate) fn graph_data_from_snapshot(snapshot: &graph_vcs::Snapshot) -> GraphD
 /// [`graph_data_from_snapshot`] for the github-import panel's browser-only
 /// path. Node iteration order follows the `IndexMap`'s insertion order for
 /// determinism; nodes carry no stored positions (x/y are 0.0), so we always
-/// seed from the sphere + coarsening warm-up.
+/// seed from the sphere shell (the GPU sim refines it).
 pub(crate) fn graph_data_from_vault(graph: &vault_data::VaultGraph) -> GraphData {
     let mut id_to_idx: HashMap<String, u32> = HashMap::with_capacity(graph.nodes.len());
     let mut ids: Vec<String> = Vec::with_capacity(graph.nodes.len());
@@ -250,15 +231,9 @@ pub(crate) fn graph_data_from_vault(graph: &vault_data::VaultGraph) -> GraphData
     }
     let n_edges = (edges.len() / 2) as u32;
 
-    // No stored positions — seed from sphere + warmup, same as the snapshot path.
-    let mut positions = render::data::spawn_on_unit_sphere(n, 800.0);
-    if n <= 10_000 {
-        let spring_len = GpuForceOptions::default().spring_len.max(1.0);
-        let warmed = graph_layouts::warmup_positions(n, &edges, spring_len, 0xC0A75E);
-        if warmed.len() == positions.len() {
-            positions = warmed;
-        }
-    }
+    // No stored positions — seed from the sphere shell; the renderer's
+    // size-aware GPU seed mode refines it (no CPU warm-up).
+    let positions = render::data::spawn_on_unit_sphere(n, 800.0);
 
     let metrics: HashMap<String, Vec<f32>> = HashMap::new();
     let colors = render::data::colors_from_metric("community", &metrics, n);

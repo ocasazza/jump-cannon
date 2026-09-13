@@ -68,6 +68,8 @@ Layout tab:
 
 **Barnes-Hut tree construction is now fully GPU-accelerated.** The tree builds entirely on the device in each layout step: 30-bit Morton-key indexing and an 8-pass 4-bit LSD radix sort with multi-workgroup exclusive scan produce canonical tree order; prefix sums of mass and mass-weighted position cache every node's center of mass as a difference of two prefix entries (no atomics, no CPU tree traversal). The pipeline emits DFS-order nodes with next/skip ropes for fast traversal. Zero host readback is needed per step except for position export to the renderer.
 
+**GPU multilevel seed for large graphs.** Graphs with more than 10,000 nodes automatically start from a multilevel seed computed entirely on device: heavy-edge matching builds a hierarchy, the coarsest level is laid out in a ball, and positions are progressively prolonged down the hierarchy with adaptive step counts. This eliminates the slow global-untangling phase and reduces steps to convergence from minutes to seconds on million-node graphs.
+
 A persisted backend or force-model value the current build does not recognise
 falls back to the default rather than to the exact O(n²) path. The scale
 limits of this engine and the planned steps beyond them are tracked in
@@ -84,5 +86,7 @@ The **Regions** section in the Style panel controls an aggregate visualization m
 **Fill opacity**: The transparency of the cell color fill (0–1). Set to 0 for outline-only regions; increase toward 1 for opaque colored areas.
 
 **Show outlines**: When enabled, the boundary of each Voronoi cell is darkened where the 4-neighbor cluster ID differs, making region edges stand out.
+**Level**: When the graph has a multilevel community hierarchy (e.g. from Louvain), this select controls which level to display. *Auto* adjusts the level based on camera zoom: coarser (level 0) at zoomed-out views and progressively finer levels as you zoom in. Manual options range from 0 (coarsest communities) to L-1 (finest). A live readout shows the current level as "level k of L".
+
 
 Per frame, the seed pass projects the graph's current positions through the camera and writes the nearest cluster ID into a 512×512 screen-space grid. Ten jump-flood passes (distance steps 256, 128, …, 2, 1) compute the nearest-neighbor Voronoi. Cells farther than the *Radius* setting from any seed become transparent. A fullscreen draw then fills each cell with a color from the current palette (rotated by `id % palette.length()`) at the *Fill opacity*, and stroking outlines where neighbors differ. The entire view recomputes each frame and costs nothing beyond a single O(n) camera-space projection pass, regardless of how many nodes the graph has — making it the only view viable for 10⁷+ node layouts.

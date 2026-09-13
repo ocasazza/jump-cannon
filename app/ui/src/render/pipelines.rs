@@ -35,7 +35,7 @@ use crate::render::region_map::{RegionMap, RegionMapConfig, RegionMode};
 use bytemuck::{Pod, Zeroable};
 use glam::{Mat4, Vec3, Vec4};
 use graph_layouts::{
-    BoxedPhysics, DynPhysicsLayout, DynStaticLayout, Edge as GlEdge, GpuForceLayout,
+    BoxedPhysics, CsrInput, DynPhysicsLayout, DynStaticLayout, Edge as GlEdge, GpuForceLayout,
     GpuForceOptions, Graph as GlGraph, Node as GlNode,
 };
 use std::sync::{Arc, Mutex};
@@ -236,10 +236,6 @@ struct Buffers {
     edge_bind_group: wgpu::BindGroup,
 
     layout: Option<Box<dyn DynPhysicsLayout>>,
-    /// Cached graph the layout was initialised against. Needed so a
-    /// layout swap can re-init a freshly-built layout against the same
-    /// topology without forcing the caller to re-supply it.
-    layout_graph: Option<GlGraph>,
     /// CPU mirrors. positions/sizes used for raycast + fit; colors_base
     /// is the per-node base RGBA so set_selected can multiply alpha
     /// without losing the underlying tint.
@@ -559,13 +555,24 @@ impl GraphPipelines {
             ],
         });
 
-        // Initialise the GPU force layout against the same positions buffer.
-        let layout_graph = build_topology_graph(&graph.positions, &graph.edges);
+        // Initialise the GPU force layout against the same positions buffer,
+        // via the index-based CSR ingest path so no `graph_layouts::Graph` is
+        // materialised. `for_n_nodes` selects the engine's size-aware seed
+        // mode (device-side multilevel coarsening above 10k nodes); the sphere
+        // seed carried in `graph.positions` reaches the layout through
+        // `CsrInput.positions`.
         let layout: Option<Box<dyn DynPhysicsLayout>> = {
             let mut boxed: Box<dyn DynPhysicsLayout> = Box::new(BoxedPhysics::new(
-                GpuForceLayout::new(GpuForceOptions::default()),
+                GpuForceLayout::new(GpuForceOptions::for_n_nodes(n_nodes as usize)),
             ));
-            match boxed.init_with_device(device, queue, &layout_graph, &positions) {
+            match init_physics_layout(
+                device,
+                queue,
+                &mut *boxed,
+                &positions,
+                &graph.positions,
+                &graph.edges,
+            ) {
                 Ok(()) => Some(boxed),
                 Err(e) => {
                     tracing::warn!("[render] init_layout failed: {e}");
@@ -604,7 +611,6 @@ impl GraphPipelines {
             node_bind_group,
             edge_bind_group,
             layout,
-            layout_graph: Some(layout_graph),
             positions_cpu: graph.positions,
             sizes_cpu: graph.sizes,
             colors_base,
@@ -1644,24 +1650,18 @@ impl GraphPipelines {
         // Refresh the CPU mirror so raycasts / bounds() see the seed.
         b.positions_cpu = positions.to_vec();
 
-        // Sync the cached topology graph's `position3` from the new positions
-        // (same id scheme as `build_topology_graph`) and re-init the active
-        // physics layout so the GPU sim resumes from the seed.
-        if let Some(graph) = b.layout_graph.as_mut() {
-            let width = format!("{}", n_nodes.max(1) - 1).len().max(1);
-            for i in 0..n_nodes {
-                let id = format!("{:0width$}", i, width = width);
-                if let Some(node) = graph.nodes.get_mut(&id) {
-                    node.position3 =
-                        Some([positions[i * 3], positions[i * 3 + 1], positions[i * 3 + 2]]);
-                }
-            }
-        }
+        // Re-init the active physics layout from the CSR buffers so the GPU
+        // sim resumes from the seed (positions carried via CsrInput.positions).
         if let Some(mut layout) = b.layout.take() {
-            if let Some(graph) = b.layout_graph.as_ref() {
-                if let Err(e) = layout.init_with_device(device, queue, graph, &b.positions) {
-                    tracing::warn!("[render] set_positions: layout re-init failed: {e}");
-                }
+            if let Err(e) = init_physics_layout(
+                device,
+                queue,
+                &mut *layout,
+                &b.positions,
+                &b.positions_cpu,
+                &b.edges_cpu,
+            ) {
+                tracing::warn!("[render] set_positions: layout re-init failed: {e}");
             }
             b.layout = Some(layout);
         }
@@ -1670,11 +1670,11 @@ impl GraphPipelines {
     }
 
     /// Replace the active physics layout with a pre-built one (port of the
-    /// egui `swap_physics_layout`, minus the factory indirection). Syncs the
-    /// cached topology graph's `position3` from the live CPU positions mirror
-    /// first, so the fresh layout's `init_with_device` resumes from whatever
-    /// the previous layout — including a one-shot static solve — left behind,
-    /// instead of jumping back to the bootstrap positions.
+    /// egui `swap_physics_layout`, minus the factory indirection). Re-inits
+    /// the fresh layout from the CSR buffers, seeding it with the live CPU
+    /// positions mirror (via `CsrInput.positions`) so it resumes from
+    /// whatever the previous layout — including a one-shot static solve —
+    /// left behind, instead of jumping back to the bootstrap positions.
     pub fn swap_physics_layout(
         &mut self,
         device: &wgpu::Device,
@@ -1684,29 +1684,14 @@ impl GraphPipelines {
         let Some(b) = self.buffers.as_mut() else {
             return;
         };
-        if let Some(graph) = b.layout_graph.as_mut() {
-            // `build_topology_graph` builds ids as zero-padded indices, so
-            // the same scheme indexes back in.
-            let n = b.n_nodes as usize;
-            let width = format!("{}", n.max(1) - 1).len().max(1);
-            for i in 0..n {
-                if i * 3 + 2 >= b.positions_cpu.len() {
-                    break;
-                }
-                let id = format!("{:0width$}", i, width = width);
-                if let Some(node) = graph.nodes.get_mut(&id) {
-                    node.position3 = Some([
-                        b.positions_cpu[i * 3],
-                        b.positions_cpu[i * 3 + 1],
-                        b.positions_cpu[i * 3 + 2],
-                    ]);
-                }
-            }
-        }
-        let Some(graph) = b.layout_graph.as_ref() else {
-            return;
-        };
-        match layout.init_with_device(device, queue, graph, &b.positions) {
+        match init_physics_layout(
+            device,
+            queue,
+            &mut *layout,
+            &b.positions,
+            &b.positions_cpu,
+            &b.edges_cpu,
+        ) {
             Ok(()) => {
                 b.layout = Some(layout);
             }
@@ -1716,10 +1701,13 @@ impl GraphPipelines {
         }
     }
 
-    /// One-shot static solve against the cached topology graph (port of the
-    /// egui `run_static_solve`). Writes the solver's positions into the GPU
-    /// buffer + CPU mirror and tears down any active physics layout so
-    /// `compute_step` doesn't immediately stomp the freshly-written positions.
+    /// One-shot static solve (port of the egui `run_static_solve`). Static
+    /// solvers are CPU `Graph` algorithms, so this is the only path that
+    /// still needs the string-keyed topology: it builds one on demand from
+    /// the flat CPU mirrors and drops it when the solve returns. Writes the
+    /// solver's positions into the GPU buffer + CPU mirror and tears down any
+    /// active physics layout so `compute_step` doesn't immediately stomp the
+    /// freshly-written positions.
     pub fn run_static_solve(
         &mut self,
         queue: &wgpu::Queue,
@@ -1730,12 +1718,10 @@ impl GraphPipelines {
             .buffers
             .as_mut()
             .ok_or_else(|| "run_static_solve: no buffers loaded".to_string())?;
-        let graph = b
-            .layout_graph
-            .as_ref()
-            .ok_or_else(|| "run_static_solve: no cached topology graph".to_string())?;
-
-        let positions = layout.solve_dyn(settings, graph)?;
+        // Materialise the topology Graph on demand for the CPU solver, then
+        // let it drop when the solve returns.
+        let graph = build_topology_graph(&b.positions_cpu, &b.edges_cpu);
+        let positions = layout.solve_dyn(settings, &graph)?;
         let n_nodes = b.n_nodes as usize;
         if positions.len() != n_nodes * 3 {
             return Err(format!(
@@ -1882,6 +1868,38 @@ fn build_topology_graph(positions: &[f32], edges: &[u32]) -> GlGraph {
         g.add_edge(GlEdge::new(format!("e{}", e_i), sid, tid));
     }
     g
+}
+
+/// Initialise a physics layout from the renderer's flat CPU buffers via the
+/// index-based CSR ingest path, materialising no `graph_layouts::Graph`.
+/// `positions_cpu` is `[x, y, z]` per node and is carried into the layout
+/// through `CsrInput.positions` so the sim resumes from the current seed /
+/// prior positions. Remote bridge layouts (see panels/layout.rs) that don't
+/// implement CSR return the trait-default error; for that exact message —
+/// and only that one — we fall back to the string-keyed `Graph` path built
+/// on demand. Any other error is a genuine init failure surfaced to the
+/// caller, which logs it and drops the layout, exactly as before.
+fn init_physics_layout(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    layout: &mut dyn DynPhysicsLayout,
+    positions_buf: &wgpu::Buffer,
+    positions_cpu: &[f32],
+    edges_cpu: &[u32],
+) -> Result<(), String> {
+    let input = CsrInput {
+        n_nodes: (positions_cpu.len() / 3) as u32,
+        edges: edges_cpu,
+        positions: Some(positions_cpu),
+    };
+    match layout.init_with_device_csr(device, queue, &input, positions_buf) {
+        Ok(()) => Ok(()),
+        Err(e) if e == "this layout has no CSR ingest path" => {
+            let graph = build_topology_graph(positions_cpu, edges_cpu);
+            layout.init_with_device(device, queue, &graph, positions_buf)
+        }
+        Err(e) => Err(e),
+    }
 }
 
 fn uniform_entry(binding: u32, vis: wgpu::ShaderStages) -> wgpu::BindGroupLayoutEntry {
