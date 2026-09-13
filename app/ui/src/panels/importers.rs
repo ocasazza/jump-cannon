@@ -601,7 +601,7 @@ pub(crate) fn return_to_default_source(ctx: Ctx) {
 /// to the deployment default. `anchor` is the catalog row the status renders
 /// under (the currently selected summary), which differs from `target` when a
 /// reset is triggered from a failed alternate's summary.
-fn apply_source(ctx: Ctx, anchor: String, target: Option<String>) {
+fn apply_source(mut ctx: Ctx, anchor: String, target: Option<String>) {
     match &target {
         Some(id) => {
             api::set_source_id(id);
@@ -612,6 +612,10 @@ fn apply_source(ctx: Ctx, anchor: String, target: Option<String>) {
             VIEWING.write().take();
         }
     }
+    // The selected node belongs to the previous source's id namespace; keep
+    // it and the Inspector fires node-meta fetches for ids the new source
+    // never heard of.
+    ctx.selected.set(None);
     let generation = APPLY_GEN.peek().wrapping_add(1);
     *APPLY_GEN.write() = generation;
     let target_label = target
