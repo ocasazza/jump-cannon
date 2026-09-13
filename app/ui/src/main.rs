@@ -1121,7 +1121,10 @@ fn App() -> Element {
                         }
                         Err(e) => {
                             meta.set(None);
-                            save_msg.set(format!("load failed: {e}"));
+                            // display_error: while the selected source builds
+                            // server-side this fetch 503s with the machine
+                            // instruction body — never quote it verbatim.
+                            save_msg.set(format!("load failed: {}", api::display_error(&e)));
                         }
                     }
                     meta_busy.set(false);
@@ -1141,7 +1144,20 @@ fn App() -> Element {
         let mut logs = ctx.logs;
         use_future(move || async move {
             let mut since = 0u64;
+            // The event log is per source (the request header selects it):
+            // a source switch swaps the log out from under the cursor, so
+            // re-anchor at 0 and drop the previous source's history —
+            // otherwise the alternate's early stages never replay and the
+            // stale default-source log just sits there.
+            let mut source = api::source_id();
             loop {
+                let selected = api::source_id();
+                if selected != source {
+                    source = selected;
+                    since = 0;
+                    tasks.set(Vec::new());
+                    logs.set(Vec::new());
+                }
                 if let Ok(resp) = api::progress(since).await {
                     since = resp.next_seq;
                     if !resp.events.is_empty() {
@@ -1449,10 +1465,14 @@ fn panel_body(kind: Panel, _maximized: bool, ctx: Ctx) -> Element {
                         }
                     }
                 } else {
+                    // display_error guards the label: a building 503 that
+                    // lands here (no apply tracker running) must not quote
+                    // the server's machine instruction verbatim.
+                    let label = format!("retrying: {}", api::display_error(&e));
                     rsx! { div { class: "skeleton",
                         panel_kit::loading::ProgressBar {
                             fraction: None,
-                            label: "retrying: {e}",
+                            label,
                         }
                     } }
                 }

@@ -114,7 +114,7 @@ enum PreviewState {
     Failed { message: String, timeout: bool },
 }
 
-#[derive(Clone, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) enum ApplyState {
     Building {
         elapsed_secs: u64,
@@ -705,15 +705,38 @@ fn graph_data_from_preview(p: &crate::pest_worker::ParsePreview) -> crate::Graph
     }
 }
 
+/// Map one load attempt's outcome to the apply's settled state, or `None`
+/// when the tracker must keep waiting:
+///   - a building 503 — the server-side import is still running, so the
+///     apply stays in its `Building` state (`track_stages` feeds it), or
+///   - neither error nor graph — another load superseded this one
+///     mid-flight and cleared both; that is transient, and the next
+///     iteration re-attempts (a *newer* apply exits via the generation
+///     check instead).
+fn settled_state(error: Option<&str>, graph: Option<&crate::GraphData>) -> Option<ApplyState> {
+    match (error, graph) {
+        (Some(error), _) if api::is_building_error(error) => None,
+        (Some(error), _) => Some(ApplyState::Error(error.to_string())),
+        (None, Some(graph)) => Some(ApplyState::Ok {
+            nodes: graph.n_nodes,
+            edges: graph.n_edges,
+        }),
+        (None, None) => None,
+    }
+}
+
 /// Retry the graph load until it settles, and record the outcome.
 ///
 /// Selecting a source graph-api has not built yet makes the first fetch
 /// answer 503 + `Retry-After` (`building importer source …`) while a
-/// background task imports the corpus — the fetch is fast, the build is not.
-/// Loop: reload, and while the failure names an in-flight build, wait a beat
-/// and retry. All requests stay short (nothing blocks on the build), the UI
-/// keeps rendering, and `track_stages` keeps the apply status fed from the
-/// build's live progress log.
+/// background task imports the corpus — the fetch is fast, the build is
+/// not. Loop: reload, and while the failure names an in-flight build, wait
+/// a beat and retry. All requests stay short (nothing blocks on the
+/// build), the UI keeps rendering, and `track_stages` keeps the apply
+/// status fed from the build's live progress log. The loop is also the
+/// auto-reload: the first attempt after the server finishes the import
+/// commits the graph through the normal load path, so the user never
+/// clicks Load twice.
 async fn track_apply(ctx: Ctx, generation: u64) {
     spawn(track_stages(generation));
     loop {
@@ -721,25 +744,22 @@ async fn track_apply(ctx: Ctx, generation: u64) {
         if *APPLY_GEN.peek() != generation {
             return;
         }
+        // A client-side graph (generate, embedded world) replaced the
+        // server session: this apply is moot. Exit before the next
+        // reload would clobber the mounted graph.
+        if !ctx.graph_session.peek().is_server_backed() {
+            break;
+        }
         let error = ctx.load_error.peek().clone();
-        let state = match (&error, ctx.graph.peek().as_ref()) {
-            (Some(error), _) if api::is_building_error(error) => {
-                // Still building: retry shortly. The apply status stays in
-                // its Building state, refreshed by `track_stages`.
-                gloo_timers::future::TimeoutFuture::new(1000).await;
-                if *APPLY_GEN.peek() != generation {
-                    return;
-                }
-                continue;
+        let Some(state) = settled_state(error.as_deref(), ctx.graph.peek().as_ref()) else {
+            // Still building (or transiently superseded): retry shortly.
+            // The apply status stays in its Building state, refreshed by
+            // `track_stages`.
+            gloo_timers::future::TimeoutFuture::new(1000).await;
+            if *APPLY_GEN.peek() != generation {
+                return;
             }
-            (Some(error), _) => ApplyState::Error(error.clone()),
-            (None, Some(graph)) => ApplyState::Ok {
-                nodes: graph.n_nodes,
-                edges: graph.n_edges,
-            },
-            (None, None) => {
-                ApplyState::Error("another graph load superseded this one".into())
-            }
+            continue;
         };
         match &state {
             ApplyState::Ok { .. } => {
@@ -754,6 +774,11 @@ async fn track_apply(ctx: Ctx, generation: u64) {
             status.state = state;
         }
         return;
+    }
+    let state = ApplyState::Error("another graph load superseded this one".into());
+    loading_store("importer-apply", "importing source…").fail("superseded");
+    if let Some(status) = APPLY.write().as_mut() {
+        status.state = state;
     }
 }
 
@@ -899,18 +924,23 @@ fn apply_status_view(ctx: Ctx, status: &ApplyStatus) -> Element {
                 }
             }
         },
-        ApplyState::Error(message) => rsx! {
-            div {
-                class: "imp-apply error",
-                role: "alert",
-                "data-field": "apply-status",
-                "data-outcome": "error",
-                span { class: "imp-apply-line", "{target} failed to load — {message}" }
-                if offer_reset {
-                    {return_to_default(ctx, anchor.clone())}
+        ApplyState::Error(message) => {
+            // display_error: a building 503 here would otherwise quote the
+            // server's machine instruction ("poll /progress … then retry").
+            let message = api::display_error(message);
+            rsx! {
+                div {
+                    class: "imp-apply error",
+                    role: "alert",
+                    "data-field": "apply-status",
+                    "data-outcome": "error",
+                    span { class: "imp-apply-line", "{target} failed to load — {message}" }
+                    if offer_reset {
+                        {return_to_default(ctx, anchor.clone())}
+                    }
                 }
             }
-        },
+        }
     }
 }
 
@@ -1805,5 +1835,52 @@ mod tests {
             "/graph/init -> HTTP 503: import alternate source \"x\": connector unreachable"
         ));
         assert!(!api::is_building_error("/graph/init -> HTTP 404"));
+    }
+
+    fn empty_graph(n_nodes: u32, n_edges: u32) -> crate::GraphData {
+        crate::GraphData {
+            graph_revision: None,
+            n_nodes,
+            n_edges,
+            num_communities: 0,
+            num_wcc: 0,
+            ids: Vec::new(),
+            id_to_idx: std::collections::HashMap::new(),
+            scene: crate::render::Scene {
+                positions: Vec::new(),
+                edges: Vec::new(),
+                colors: Vec::new(),
+                sizes: Vec::new(),
+            },
+        }
+    }
+
+    #[test]
+    fn building_and_superseded_loads_keep_the_tracker_waiting() {
+        let building = concat!(
+            "/graph/init -> HTTP 503: building importer source \"x\": the import is ",
+            "running in the background; poll /progress with the same source header ",
+            "for stages, then retry"
+        );
+        // A building 503 never settles — the tracker keeps retrying and
+        // track_stages keeps the apply status fed.
+        assert_eq!(settled_state(Some(building), None), None);
+        // Neither error nor graph: another load superseded this attempt
+        // mid-flight; transient, so the tracker must not give up.
+        assert_eq!(settled_state(None, None), None);
+    }
+
+    #[test]
+    fn settled_state_records_terminal_outcomes() {
+        let failed = "/graph/init -> HTTP 503: import alternate source \"x\": connector unreachable";
+        assert_eq!(
+            settled_state(Some(failed), None),
+            Some(ApplyState::Error(failed.to_string()))
+        );
+        let graph = empty_graph(7, 3);
+        assert_eq!(
+            settled_state(None, Some(&graph)),
+            Some(ApplyState::Ok { nodes: 7, edges: 3 })
+        );
     }
 }
