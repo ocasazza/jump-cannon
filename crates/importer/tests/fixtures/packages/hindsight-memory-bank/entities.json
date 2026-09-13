@@ -1,0 +1,6 @@
+{
+  "items": [
+    { "id": "e1", "canonical_name": "tofu", "mention_count": 3 },
+    { "id": "e2", "canonical_name": "Hydra", "mention_count": 5 }
+  ]
+}

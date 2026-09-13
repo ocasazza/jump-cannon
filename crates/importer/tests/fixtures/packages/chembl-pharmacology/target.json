@@ -1,0 +1,17 @@
+{
+  "targets": [
+    {
+      "target_chembl_id": "CHEMBL240",
+      "pref_name": "Prostaglandin G/H synthase 2",
+      "target_type": "SINGLE PROTEIN",
+      "organism": "Homo sapiens"
+    },
+    {
+      "target_chembl_id": "CHEMBL2056",
+      "pref_name": "Carbonic anhydrase II",
+      "target_type": "SINGLE PROTEIN",
+      "organism": "Homo sapiens"
+    }
+  ],
+  "page_meta": { "limit": 200, "offset": 0, "total_count": 2 }
+}

@@ -1,0 +1,9 @@
+{
+  "edges": [
+    { "data": { "source": "u1", "target": "u2", "linkType": "temporal" } },
+    { "data": { "source": "u2", "target": "u1", "linkType": "semantic" } },
+    { "data": { "source": "u1", "target": "u2", "linkType": "caused_by" } },
+    { "data": { "source": "u1", "target": "e1", "linkType": "entity" } }
+  ],
+  "total_units": 3
+}
