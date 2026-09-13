@@ -34,6 +34,24 @@ containerSecurityContext:
     drop:
       - ALL
 
+
+# Corporate TLS-inspection trust. The Schrodinger Fortigate re-signs every
+# outbound HTTPS chain as `O=Schrodinger, CN=Fortigate SSL`; NixOS nodes bake
+# that CA into their host bundle, containers carry only their image's Mozilla
+# roots. Without this, any importer that talks to a public API (ChEMBL,
+# OpenAlex, GitHub codeload) fails x509 verification even though the node
+# reaches the same endpoint fine — `error sending request for url (…)` with
+# no route or DNS fault anywhere.
+#
+# `hostPath` is the node's augmented bundle; `path` is where it lands in the
+# container and what SSL_CERT_FILE points at (the Rust TLS stack reads that
+# single file). Disable for clusters whose nodes do not carry the bundle: the
+# hostPath mount is typed File and a missing file blocks pod startup.
+hostCaBundle:
+  enabled: true
+  hostPath: /etc/ssl/certs/ca-certificates.crt
+  path: /etc/ssl/certs/host-ca-certificates.crt
+
 graphApi:
   replicas: 1
   # Source identifier understood by graph-api. Enabling the Kubernetes
