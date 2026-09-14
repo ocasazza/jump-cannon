@@ -24,3 +24,14 @@ without the component enabled.
 
 Model the resource declaratively and let controller status drive readiness.
 Follow [[Service Access]], [[GitOps Release]], and [[Security Model]].
+
+The proxy in front of Jump Cannon is `netbirdio/reverse-proxy`, reconciled from
+a `netbird-private` Gateway by the netbird-operator — **not** Envoy Gateway. It
+exposes no HTTP/2, timeout, or buffer configuration, so the chart's
+`routing.backendPolicy` / `routing.clientPolicy` (both `gateway.envoyproxy.io`
+resources) are inert on this path and should stay off here. They exist for a
+deployment whose route is terminated by Envoy Gateway.
+
+When a cold load of the frontend bundle aborts on this path, measure the link
+before tuning anything: 2026-09-13 saw 17.3 KB/s with 10 of 11 peers relayed,
+which no origin-side compression can rescue ([[Performance Engineering]]).

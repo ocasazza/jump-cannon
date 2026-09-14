@@ -317,6 +317,13 @@ What it renders:
 target (no `sectionName`), so it changes transport for every workload behind
 that Gateway. Enable it only where this deployment owns the Gateway.
 
+Both policies are `gateway.envoyproxy.io` resources and therefore only do
+something where **Envoy Gateway** terminates the route. Behind a different
+implementation — e.g. a netbird-operator `netbird-private` Gateway whose TLS
+ends in `netbirdio/reverse-proxy` pods with no HTTP/2 or timeout surface —
+leave them off: the objects would render and nothing would read them. The
+`HTTPRoute` is portable Gateway API and works either way.
+
 Rendering fails loudly on a route that could not work: no `parentRef.name`, no
 `hostnames`, a non-DNS hostname, or a `routing.sessionManager.hostnames` entry
 with `sessionManager.enabled=false`. Field paths are verified against the Envoy

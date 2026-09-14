@@ -45,26 +45,55 @@ cluster proxy that surfaced as `ERR_HTTP2_PING_FAILED` with a 200 status, then
 `WebAssembly compilation aborted: Response body loading was aborted` — a reset
 mid-body, not a server error.
 
-### Transport tuning lives in the chart
+### Transport tuning lives in the chart — where an Envoy Gateway fronts it
 
-The second half of that failure is gateway-side, and the knobs now ship with
-the workload (`routing.*` in [[Helm Deployment]], off by default):
+`routing.*` ([[Helm Deployment]], off by default) ships the gateway knobs with
+the workload:
 
 - **HTTP/2 flow control.** Envoy's per-stream initial window defaults to
-  **64 KiB**. A multi-megabyte body then spends its time waiting for window
-  updates rather than sending bytes, which is exactly what a high-latency link
-  cannot afford. `routing.clientPolicy` raises the stream window to 1 MiB and
+  **64 KiB**; a multi-megabyte body then waits on window updates instead of
+  sending bytes. `routing.clientPolicy` raises the stream window to 1 MiB and
   the connection window to 16 MiB.
 - **Timeouts sized for the bundle, not the median request.** The HTTPRoute
-  carries `request`/`backendRequest` timeouts and the route-scoped
-  `BackendTrafficPolicy` carries `requestTimeout`; a 3.5 MB body on a 1 Mbps
-  link is ~28 s of streaming, so a default-ish 15 s route timeout resets it.
-- **Buffer limits.** The CRD default is 32768 bytes; a multi-megabyte body
-  streams through that in hundreds of refills.
+  carries `request`/`backendRequest`, and the route-scoped
+  `BackendTrafficPolicy` carries `requestTimeout`.
+- **Buffer limits.** The CRD default is 32768 bytes.
 
 Blast radius is why the two policies differ: `BackendTrafficPolicy` attaches to
 this chart's own HTTPRoutes, but `ClientTrafficPolicy` can only attach to a
 **Gateway** — the CRD forbids every other target and does not support
 `sectionName` — so enabling it changes transport for every workload behind that
-Gateway. It is opt-in for exactly that reason. Field paths were verified against
-the Envoy Gateway v1.4.2 CRDs.
+Gateway. Field paths verified against the Envoy Gateway v1.4.2 CRDs.
+
+**These policies only do something when an Envoy Gateway terminates the
+route.** They are `gateway.envoyproxy.io` resources, reconciled by Envoy
+Gateway. On the nixstation deployment the front door is *not* Envoy: the
+`netbird-private` Gateway has `gatewayClassName: netbird-private`
+(controller `gateway.netbird.io/controller`), and TLS terminates in
+`netbirdio/reverse-proxy` pods whose only configuration is `NB_PROXY_*` env —
+no HTTP/2 or timeout surface at all. Enabling `routing.clientPolicy` there
+would create an object nothing reads. See [[NetBird Access]].
+
+### Measured: the NetBird path, not the gateway, was the 2026-09-13 constraint
+
+Against the live deployment (before the compression work reached it):
+
+| measurement | value |
+|---|---|
+| bundle served | 11,921,982 B, no `Content-Encoding` |
+| sustained throughput | **17.3 KB/s** (2,077,926 B in 120 s, HTTP/2, 200) |
+| implied download time | ~11.5 minutes |
+| netbird-proxy CPU throttling | 62 of 225,496 periods (**0.027%**) — not the constraint |
+| netbird peers | 10 of 11 `Connection type: Relayed`, `Relays: 1/3 Available` |
+
+So the client had no direct WireGuard path and every byte crossed one ws relay
+(`rels://pdx-nxnx-lv02.schrodinger.com:443`, which itself answers `426 Upgrade
+Required` in 0.34 s — healthy). Chrome gives up on a stream that long
+(`ERR_HTTP2_PING_FAILED`), which is the reported `WebAssembly compilation
+aborted`.
+
+Compression is necessary but not sufficient on that path: 3.5 MB at 17 KB/s is
+still ~3.4 minutes. What compression *does* buy unconditionally is the warm
+reload — `304`, zero bytes. Restoring a peer-to-peer path (or relay capacity
+closer to the client) is the lever that makes a cold load viable; that lives in
+the nixstation NetBird deployment, not here.

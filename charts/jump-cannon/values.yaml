@@ -598,6 +598,13 @@ grafanaDashboards:
 #
 # Field paths verified against the Envoy Gateway v1.4.2 CRDs
 # (gateway.envoyproxy.io/v1alpha1).
+#
+# SCOPE: `backendPolicy` and `clientPolicy` are Envoy Gateway resources. They
+# only take effect where an Envoy Gateway terminates the route. A deployment
+# fronted by something else — e.g. a netbird-operator `netbird-private`
+# Gateway, whose TLS ends in `netbirdio/reverse-proxy` pods that expose no
+# HTTP/2 or timeout settings — should leave both off; the objects would exist
+# and nothing would read them. The HTTPRoute itself is portable Gateway API.
 routing:
   enabled: false
   # Gateway this workload attaches to. `namespace` may be empty for a
