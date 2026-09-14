@@ -1,31 +1,65 @@
 /* jump-cannon panel styles — layered after panel-kit.css. */
 
 /* Static pre-WASM Panel Kit shell. This block deliberately uses standalone
-   colors because it paints before panel_kit::CSS exists. The marked shell is
+   literal colors because it paints before panel_kit::CSS exists (that is where
+   the --bg/--panel/--line theme variables are defined). The values mirror
+   panel-kit's dark theme and the app's real topbar/panel-head geometry so the
+   shell is visually continuous with the booted workspace. The marked shell is
    an adjacent sibling of an empty #main; it must never be mounted inside the
    Dioxus root because Dioxus 0.6 does not clear pre-existing children. */
 .panel-kit-boot { position:fixed; inset:0; z-index:2147483000; display:flex; flex-direction:column;
-  min-width:0; min-height:0; overflow:hidden; background:#09090a; color:#efeff0;
-  font:12px/1.35 "Courier Prime",ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; }
-.panel-kit-boot-bar { display:flex; align-items:center; gap:12px; height:35px; flex:0 0 35px;
-  padding:0 14px; border-bottom:1px solid #242427; letter-spacing:.08em; text-transform:uppercase; }
-.panel-kit-boot-title { font-weight:700; }
-.panel-kit-boot-status { color:#77777d; font-size:10px; }
-.panel-kit-boot-panels { display:grid; grid-template-columns:minmax(0,3fr) minmax(240px,2fr);
-  grid-template-rows:1fr 1fr; gap:8px; flex:1; min-height:0; padding:44px 8px 8px; }
-.panel-kit-boot-panel { position:relative; min-width:0; min-height:90px; border:1px solid #35353a;
-  border-radius:4px; background:#0c0c0d; overflow:hidden; }
-.panel-kit-boot-panel:first-child { grid-row:1 / span 2; }
-.panel-kit-boot-panel::before { content:""; position:absolute; top:9px; left:12px; width:52px; height:8px;
-  border-radius:3px; background:linear-gradient(90deg,#389cf6 0 14%,transparent 14% 22%,#f6be3c 22% 36%,transparent 36% 44%,#ee60c2 44% 58%,transparent 58%); }
-.panel-kit-boot-line { height:6px; margin:34px 12px 0; border-radius:3px; background:#1a1a1d;
-  animation:panel-kit-boot-pulse 1.25s ease-in-out infinite alternate; }
-.panel-kit-boot-line + .panel-kit-boot-line { width:62%; margin-top:9px; animation-delay:.18s; }
+  min-width:0; min-height:0; overflow:hidden; background:#0a0a0a; color:#ededed;
+  font:13px/1.5 ui-monospace,"SF Mono","JetBrains Mono",Menlo,Consolas,monospace; }
+/* Topbar mirrors panel-kit .topbar (36px tall, --panel fill, --line divider). */
+.panel-kit-boot-bar { display:flex; align-items:center; gap:1rem; height:36px; flex:0 0 36px;
+  padding:0 1rem; border-bottom:1px solid #262626; background:#0d0d0d; }
+.panel-kit-boot-title { font-size:.8rem; font-weight:600; letter-spacing:.06em; }
+/* Indeterminate boot progress (pure CSS sweep, no JS) replaces the frozen
+   "loading application…" string; the wrapper's role="status" names it. */
+.panel-kit-boot-progress { margin-left:auto; width:140px; height:5px; border-radius:3px;
+  background:#1a1a1d; overflow:hidden; }
+.panel-kit-boot-progress-bar { width:35%; height:100%; border-radius:3px; background:#5ef38c;
+  animation:panel-kit-boot-sweep 1.1s ease-in-out infinite; }
+@keyframes panel-kit-boot-sweep { 0% { transform:translateX(-120%); } 100% { transform:translateX(400%); } }
+/* Two columns approximate default_layout's floating arrangement: Graph (large,
+   upper-left) over Progress (short, lower-left); Nodes (tall, right) over
+   Settings (lower-right). Flex ratios reproduce the pixel geometry
+   viewport-independently (left 640:right 608; graph 620:progress 200;
+   nodes 620:settings 420). */
+.panel-kit-boot-panels { display:flex; gap:8px; flex:1; min-height:0; padding:8px; position:relative; }
+.panel-kit-boot-col { display:flex; flex-direction:column; gap:8px; min-width:0; min-height:0; }
+.panel-kit-boot-col-left { flex:640 1 0; }
+.panel-kit-boot-col-right { flex:608 1 0; }
+.panel-kit-boot-panel { position:relative; min-width:0; min-height:70px; border:1px solid #3a3a3a;
+  border-radius:4px; background:#0d0d0d; box-shadow:0 6px 24px #0007; overflow:hidden; }
+.panel-kit-boot-graph { flex:620 1 0; }
+.panel-kit-boot-progress-panel { flex:200 1 0; }
+.panel-kit-boot-nodes { flex:620 1 0; }
+.panel-kit-boot-settings { flex:420 1 0; }
+/* Cookie-driven server-rendered variant: graph-api's `GET /` replaces the
+   marked flex columns with one absolutely-positioned frame per visible panel,
+   placed at the visitor's stored rect via inline left/top/width/height. The
+   `.panel-kit-boot-panels` container is position:relative (above) so these
+   coordinates are workspace-relative, matching the app's floating panels. The
+   base `.panel-kit-boot-panel` already supplies border/background/head; this
+   modifier only swaps flex sizing for absolute placement. */
+.panel-kit-boot-panel-fixed { position:absolute; }
+/* Panel head mirrors panel-kit .panel-head (22px, --panel fill) with the
+   traffic-light cluster (blue mode / yellow minimize / pink maximize) and the
+   uppercase panel title. */
+.panel-kit-boot-head { position:absolute; top:-1px; left:8px; right:8px; display:flex;
+  align-items:center; gap:.5rem; height:22px; padding:0 .35rem; background:#0d0d0d; }
+.panel-kit-boot-lights { display:flex; gap:6px; flex:0 0 auto; }
+.panel-kit-boot-lights i { width:12px; height:12px; border-radius:50%; opacity:.9; }
+.panel-kit-boot-lights i:nth-child(1) { background:#3b9bff; }
+.panel-kit-boot-lights i:nth-child(2) { background:#ffbd2e; }
+.panel-kit-boot-lights i:nth-child(3) { background:#ff5fc3; }
+.panel-kit-boot-title-sm { color:#ededed; font-size:.72rem; font-weight:700; text-transform:uppercase;
+  letter-spacing:.06em; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 #main[data-dioxus-id] + .panel-kit-boot[data-panel-kit-static-boot] { display:none; }
-@keyframes panel-kit-boot-pulse { from { opacity:.35; } to { opacity:.9; } }
-@media (max-width:680px) { .panel-kit-boot-panels { grid-template-columns:1fr; grid-template-rows:2fr 1fr; }
-  .panel-kit-boot-panel:first-child { grid-row:auto; } .panel-kit-boot-panel:last-child { display:none; } }
-@media (prefers-reduced-motion:reduce) { .panel-kit-boot-line { animation:none; opacity:.65; } }
+@media (max-width:680px) { .panel-kit-boot-panels { flex-direction:column; }
+  .panel-kit-boot-col { flex:1 1 auto; } .panel-kit-boot-settings { display:none; } }
+@media (prefers-reduced-motion:reduce) { .panel-kit-boot-progress-bar { animation:none; width:100%; } }
 
 /* Shared utility: label text exposed to assistive tech but not painted.
    Panels pair a visible control with an sr-only <label for=…>, so without
@@ -274,6 +308,8 @@ textarea.md:focus { outline:none; border-color:var(--fg); }
   color:var(--dim); font-size:.56rem; letter-spacing:.04em; text-transform:uppercase; }
 .imp-chip.native, .imp-chip.viewing { color:var(--yellow); border-color:#655123; }
 .imp-chip.local { color:var(--accent); border-color:#28557e; }
+.imp-chip.params { color:var(--accent); border-color:#28557e; text-transform:none;
+  letter-spacing:0; font-family:var(--mono); }
 .imp-mini { font-size:.6rem; padding:.05rem .35rem; }
 .imp-note { color:var(--dim); font-size:.66rem; line-height:1.5; padding:.3rem .1rem; }
 .imp-center-hint { padding:1rem; text-align:center; }
@@ -295,6 +331,17 @@ textarea.md:focus { outline:none; border-color:var(--fg); }
 .imp-fact dt { color:var(--dim); font-size:.64rem; }
 .imp-fact dd { min-width:0; margin:0; color:var(--fg); font-family:var(--mono);
   font-size:.65rem; overflow-wrap:anywhere; }
+/* importers: per-request parameter picker inside the catalog summary */
+.imp-params { display:flex; flex-direction:column; gap:.45rem; }
+.imp-param { display:flex; flex-direction:column; gap:.15rem; }
+.imp-param-label { color:var(--dim); font-size:.66rem; text-transform:uppercase;
+  letter-spacing:.05em; }
+.imp-param-select, .imp-param-input { width:100%; box-sizing:border-box;
+  background:var(--bg); color:var(--fg); border:1px solid var(--line2);
+  border-radius:3px; padding:.25rem .4rem; font-family:var(--mono); font-size:12px; }
+.imp-param-select:focus, .imp-param-input:focus { outline:none; border-color:var(--fg); }
+.imp-param-input { margin-top:.15rem; }
+.imp-param-hint { color:var(--dim); font-size:.6rem; line-height:1.4; }
 .imp-preview { display:flex; flex-direction:column; gap:.35rem; min-height:0;
   border-top:1px solid var(--line); padding-top:.4rem; }
 .imp-sample { width:100%; min-height:3.2rem; box-sizing:border-box; resize:vertical;
@@ -1069,14 +1116,60 @@ textarea.doc-src:focus { outline:none; }
 .imp-apply .imp-note { padding:0; }
 .imp-apply.building { border-left-color:var(--accent); }
 .imp-apply.ok { border-left-color:var(--green); }
-.imp-apply.timeout { border-left-color:var(--yellow); }
 .imp-apply.error { border-left-color:var(--red); }
 .imp-apply.error .imp-apply-line { color:var(--red); }
+.imp-apply.error .imp-actions { gap:.4rem; }
 .imp-chip.apply[data-outcome="building"] { color:var(--accent); border-color:#28557e; }
 .imp-chip.apply[data-outcome="ok"] { color:var(--green); border-color:#2a5334; }
-.imp-chip.apply[data-outcome="timeout"] { color:var(--yellow); border-color:#655123; }
 .imp-chip.apply[data-outcome="error"] { color:var(--red); border-color:#5f2828; }
 
+/* Build-progress card shared by the boot skeleton, the Graph panel overlay,
+   the Importers apply status, and the Progress panel's Importing section. */
+.build-progress { display:flex; flex-direction:column; gap:.35rem; width:100%;
+  max-width:32rem; }
+.build-progress-head { display:flex; justify-content:space-between; align-items:baseline;
+  gap:.75rem; }
+.build-progress-source { color:var(--fg); font-weight:700; overflow-wrap:anywhere; }
+.build-progress-elapsed { color:var(--dim); font-family:var(--mono); font-size:.72rem;
+  flex:0 0 auto; }
+.build-progress-stage { color:var(--fg); font-size:.72rem; overflow-wrap:anywhere; }
+.build-progress-detail { color:var(--dim); font-size:.68rem; overflow-wrap:anywhere; }
+
+/* Progress bar: a determinate <progress> when a fraction is known, else a
+   CSS-only indeterminate sweep (no JavaScript). */
+.build-progress-bar { appearance:none; -webkit-appearance:none; width:100%; height:6px;
+  border:1px solid var(--line2); border-radius:3px; background:var(--bg); overflow:hidden; }
+.build-progress-bar::-webkit-progress-bar { background:var(--bg); }
+.build-progress-bar::-webkit-progress-value { background:var(--accent); }
+.build-progress-bar::-moz-progress-bar { background:var(--accent); }
+.build-progress-bar[indeterminate] { position:relative; }
+.build-progress-bar[indeterminate]::after { content:""; position:absolute; top:0; left:-35%;
+  height:100%; width:35%; border-radius:3px; background:var(--accent);
+  animation:build-progress-sweep 1.1s ease-in-out infinite; }
+@keyframes build-progress-sweep { 0% { left:-35%; } 100% { left:100%; } }
+
+/* Live event feed under a build status: newest last, monospace. */
+.build-progress-feed { display:flex; flex-direction:column; gap:.1rem; width:100%;
+  font-family:var(--mono); font-size:.62rem; color:var(--dim); }
+.build-progress-feed-line { overflow-wrap:anywhere; }
+
+/* Progress-panel "Importing …" section wrapping the build card and feed. */
+.build-section { display:flex; flex-direction:column; gap:.4rem; padding:.4rem .1rem .6rem;
+  border-bottom:1px solid var(--line2); }
+.build-section-title { color:var(--fg); font-weight:700; letter-spacing:.04em; }
+
+/* First-paint panel placeholder (build_progress::PanelHydrating): the shared
+   progress bar over a concrete label, centered in the panel body so each panel
+   shows its own hydration state instead of one global gate. Reuses
+   .build-progress-bar for the bar; sized to sit in a full body or a sub-region
+   slot (nav state, lay-empty, catalog list). */
+.panel-hydrating { display:flex; flex-direction:column; align-items:center; justify-content:center;
+  gap:.5rem; height:100%; min-height:4rem; padding:1rem; text-align:center; }
+.panel-hydrating .build-progress-bar { width:min(100%, 12rem); }
+.panel-hydrating-label { color:var(--dim); font-size:.72rem; letter-spacing:.03em; }
+
+/* Graph panel overlay while the applied source is still indexing. */
+.graph-render-status.building { border-color:var(--accent); }
 
 /* Graph-area overlay while a selected importer source builds server-side. */
 .graph-building { position:absolute; inset:0; display:flex; flex-direction:column;

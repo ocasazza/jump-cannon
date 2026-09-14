@@ -16,7 +16,10 @@ pub use layout::algorithms::cose_bilkent::{CoseBilkentLayout, CoseBilkentSetting
 pub use layout::algorithms::cise::{CiseLayout, CiseSettings};
 pub use layout::algorithms::dagre::{DagreLayout, DagreRanker, DagreSettings, RankDirection};
 pub use layout::algorithms::klay::{KlayLayout, KlaySettings};
-pub use layout::algorithms::gpu_force::{GpuForceLayout, GpuForceOptions, RepulsionMode, SeedMode};
+pub use layout::algorithms::gpu_force::{
+    gpu_force_device_limits, CsrInput, ForceModel, GpuForceLayout, GpuForceOptions, RepulsionMode,
+    SeedMode,
+};
 pub use layout::algorithms::random::{RandomLayout, RandomSettings};
 pub use layout::algorithms::circle::{CircleAxis, CircleLayout, CircleSettings};
 pub use layout::algorithms::grid::{GridLayout, GridSettings};

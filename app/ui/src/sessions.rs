@@ -106,11 +106,14 @@ pub(crate) fn load(ctx: Ctx, session: ExampleSession) {
                 // path so a not-yet-built source gets the same background
                 // build, progress overlay, and retry loop as a manual load.
                 match &session.source {
-                    Some(id) if api::source_id().as_deref() != Some(id.as_str()) => {
+                    Some(id)
+                        if api::source_selection().map(|s| s.id).as_deref()
+                            != Some(id.as_str()) =>
+                    {
                         crate::panels::importers::apply_catalog_source(ctx, id.clone());
                     }
                     Some(_) => {}
-                    None if api::source_id().is_some() => {
+                    None if api::source_selection().is_some() => {
                         crate::panels::importers::return_to_default_source(ctx);
                     }
                     None => {}

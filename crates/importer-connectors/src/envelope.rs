@@ -14,7 +14,9 @@
 use std::collections::BTreeMap;
 use std::io::{Cursor, Read};
 
-use data_loader::{Capability, Effect, ImportError, ImportFuture, SourceConnector, SourceRecord};
+use data_loader::{
+    Capability, Effect, ImportError, ImportFuture, ImportProgress, SourceConnector, SourceRecord,
+};
 
 use crate::guess_content_type;
 
@@ -95,10 +97,13 @@ impl SourceConnector for EnvelopeConnector {
         self.inner.capabilities(effect)
     }
 
-    fn read<'a>(&'a self) -> ImportFuture<'a, Result<Vec<SourceRecord>, ImportError>> {
+    fn read<'a>(
+        &'a self,
+        progress: &'a dyn ImportProgress,
+    ) -> ImportFuture<'a, Result<Vec<SourceRecord>, ImportError>> {
         Box::pin(async move {
             let mut records = Vec::new();
-            for record in self.inner.read().await? {
+            for record in self.inner.read(progress).await? {
                 records.extend(expand_envelope(record, &self.limits)?);
             }
             Ok(records)

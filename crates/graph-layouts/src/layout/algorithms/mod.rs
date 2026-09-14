@@ -4,6 +4,7 @@ pub mod cise;
 pub mod dagre;
 pub mod klay;
 pub mod gpu_force;
+pub mod gpu_multilevel;
 pub mod random;
 pub mod circle;
 pub mod grid;

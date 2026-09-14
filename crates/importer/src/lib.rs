@@ -9,11 +9,16 @@
 //!   canonical graph. See [`pest`].
 //! - `engine = "json"` carries the declarative paged-JSON manifest body
 //!   (variables, preflight, collections, mapping). See [`json`].
+//! - `engine = "tvix"` carries an inline Nix generator expression that is a
+//!   function of typed, bounded `[[parser.variables]]`; the engine binds those
+//!   variables at apply time and evaluates the expression into a graph. See
+//!   [`tvix`].
 //!
 //! The package deliberately contains **no data source binding and no
 //! credentials**. An administrator binds a validated package to an explicit
-//! input at runtime: a filesystem path ([`pest::FilesystemImporter`]) or an
-//! HTTP/JSON instance ([`InstanceConfig`] + [`build_importer`]). Tokens are
+//! input at runtime: a filesystem path ([`pest::FilesystemImporter`]), an
+//! HTTP/JSON instance ([`InstanceConfig`] + [`build_importer`]), or a set of
+//! generator parameters ([`build_tvix_importer`]). Tokens are
 //! injected through instance configuration, redacted from `Debug`, capability
 //! scopes, and error messages.
 //!
@@ -41,6 +46,7 @@
 
 pub mod json;
 pub mod pest;
+pub mod tvix;
 
 use serde::Deserialize;
 
@@ -54,6 +60,8 @@ pub use json::{
 pub use json::build_importer;
 #[cfg(feature = "native")]
 pub use pest::{FilesystemImporter, FilesystemLoader};
+#[cfg(feature = "native")]
+pub use tvix::{build_tvix_importer, TvixImporter};
 
 /// Importer package format understood by this crate.
 pub const FORMAT_VERSION: u32 = 3;
@@ -156,6 +164,7 @@ pub struct PackageSchema {
 pub enum ParserConfig {
     Pest(pest::PestEngineConfig),
     Json(json::JsonEngineConfig),
+    Tvix(tvix::TvixEngineConfig),
 }
 
 /// The engine a validated package selects.
@@ -163,6 +172,7 @@ pub enum ParserConfig {
 pub enum EngineKind {
     Pest,
     Json,
+    Tvix,
 }
 
 impl EngineKind {
@@ -170,6 +180,7 @@ impl EngineKind {
         match self {
             Self::Pest => pest::ENGINE,
             Self::Json => json::ENGINE,
+            Self::Tvix => tvix::ENGINE,
         }
     }
 }
@@ -207,7 +218,7 @@ pub enum ImportError {
     )]
     UnsupportedFormatVersion { found: u32, supported: u32 },
 
-    #[error("unknown parser engine {engine:?}; expected \"pest\" or \"json\"")]
+    #[error("unknown parser engine {engine:?}; expected \"pest\", \"json\", or \"tvix\"")]
     UnknownEngine { engine: String },
 
     #[error("invalid importer metadata: {0}")]
@@ -222,6 +233,9 @@ pub enum ImportError {
 
     #[error("invalid json engine package: {0}")]
     JsonEngine(String),
+
+    #[error("invalid tvix engine package: {0}")]
+    TvixEngine(String),
 
     #[error("inline Pest grammar is {actual} bytes; package limit is {max} bytes")]
     GrammarTooLarge { actual: usize, max: usize },
@@ -336,6 +350,7 @@ impl std::fmt::Debug for ValidatedPackage {
 pub(crate) enum EngineRuntime {
     Pest(pest::PestRuntime),
     Json,
+    Tvix,
 }
 
 impl ValidatedPackage {
@@ -365,6 +380,7 @@ impl ValidatedPackage {
         match probe.parser.engine.as_str() {
             pest::ENGINE => pest::validate(text),
             json::ENGINE => json::validate(text),
+            tvix::ENGINE => tvix::validate(text),
             other => Err(ImportError::UnknownEngine {
                 engine: other.to_owned(),
             }),
@@ -391,6 +407,7 @@ impl ValidatedPackage {
         match &self.manifest.parser {
             ParserConfig::Pest(_) => EngineKind::Pest,
             ParserConfig::Json(_) => EngineKind::Json,
+            ParserConfig::Tvix(_) => EngineKind::Tvix,
         }
     }
 
@@ -403,6 +420,11 @@ impl ValidatedPackage {
                 needed: pest::ENGINE,
                 actual: json::ENGINE,
             }),
+            ParserConfig::Tvix(_) => Err(ImportError::WrongEngine {
+                op: "pest engine access",
+                needed: pest::ENGINE,
+                actual: tvix::ENGINE,
+            }),
         }
     }
 
@@ -414,6 +436,28 @@ impl ValidatedPackage {
                 op: "json engine access",
                 needed: json::ENGINE,
                 actual: pest::ENGINE,
+            }),
+            ParserConfig::Tvix(_) => Err(ImportError::WrongEngine {
+                op: "json engine access",
+                needed: json::ENGINE,
+                actual: tvix::ENGINE,
+            }),
+        }
+    }
+
+    /// The tvix engine configuration, or a typed error for pest/json packages.
+    pub fn tvix_config(&self) -> Result<&tvix::TvixEngineConfig, ImportError> {
+        match &self.manifest.parser {
+            ParserConfig::Tvix(config) => Ok(config),
+            ParserConfig::Pest(_) => Err(ImportError::WrongEngine {
+                op: "tvix engine access",
+                needed: tvix::ENGINE,
+                actual: pest::ENGINE,
+            }),
+            ParserConfig::Json(_) => Err(ImportError::WrongEngine {
+                op: "tvix engine access",
+                needed: tvix::ENGINE,
+                actual: json::ENGINE,
             }),
         }
     }
@@ -434,13 +478,21 @@ impl ValidatedPackage {
         pest::parse_input(self, runtime, input)
     }
 
-    /// Json engine: resolve administrator-supplied values against the declared
+    /// Resolve administrator-supplied values against the package's declared
     /// variables, applying defaults and rejecting unknown or unusable values.
+    /// Dispatches per engine: the json engine validates URL path segments; the
+    /// tvix engine validates typed, bounded generator parameters. Pest packages
+    /// declare no variables and fail with a typed wrong-engine error.
     pub fn resolve_variables(
         &self,
         supplied: &std::collections::BTreeMap<String, String>,
     ) -> Result<std::collections::BTreeMap<String, String>, PipelineError> {
-        json::resolve_variables(self, supplied)
+        match &self.manifest.parser {
+            ParserConfig::Tvix(config) => {
+                tvix::resolve_variables(&self.manifest.metadata.id, config, supplied)
+            }
+            _ => json::resolve_variables(self, supplied),
+        }
     }
 
     /// Shared metadata validation: the package id namespaces every emitted

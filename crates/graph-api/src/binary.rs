@@ -43,6 +43,24 @@ pub fn edges_buffer(graph: &VaultGraph, id_to_idx: &HashMap<String, u32>) -> Vec
 /// `crate::ui::field_index::FieldIndex::tag_primary_metric` so the
 /// client-side and server-side derivations agree.
 pub fn metric_buffer(graph: &VaultGraph, name: &str) -> Option<Vec<u8>> {
+    // `community_levels` reports the dendrogram depth L (a single f32), not a
+    // per-node vector. `community_l{k}` returns the per-node community ids at
+    // level k (level 0 coarsest = `community`; higher k finer), or None when
+    // k is out of range so the route answers 404.
+    if name == "community_levels" {
+        let l = graph.community_levels.len() as f32;
+        return Some(l.to_le_bytes().to_vec());
+    }
+    if let Some(suffix) = name.strip_prefix("community_l") {
+        let k: usize = suffix.parse().ok()?;
+        let level = graph.community_levels.get(k)?;
+        let mut out = Vec::with_capacity(level.len() * 4);
+        for &id in level {
+            out.extend_from_slice(&(id as f32).to_le_bytes());
+        }
+        return Some(out);
+    }
+
     let mut out = Vec::with_capacity(graph.nodes.len() * 4);
     for node in graph.nodes.values() {
         let v: f32 = match name {
@@ -77,4 +95,47 @@ fn primary_tag_bucket(tags: &[String]) -> f32 {
     let mut h = DefaultHasher::new();
     primary.hash(&mut h);
     (h.finish() as u32) as f32
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use vault_data::VaultNode;
+
+    fn decode_f32(bytes: &[u8]) -> Vec<f32> {
+        bytes
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect()
+    }
+
+    #[test]
+    fn community_level_buffers() {
+        let mut g = VaultGraph::new();
+        // Coarsest community per node, in insertion order.
+        let comms = [0usize, 0, 1, 1];
+        for (i, c) in comms.iter().enumerate() {
+            let mut node = VaultNode { id: format!("n{i}"), ..Default::default() };
+            node.metrics.community = *c;
+            g.add_node(node);
+        }
+        // Two dendrogram levels: level 0 coarsest (== community), level 1 finer.
+        g.community_levels = vec![vec![0, 0, 1, 1], vec![0, 1, 2, 3]];
+
+        // `community_levels` reports the depth L as a single f32.
+        let levels_buf = metric_buffer(&g, "community_levels").expect("community_levels");
+        assert_eq!(decode_f32(&levels_buf), vec![2.0], "community_levels must decode to L");
+
+        // `community_l0` bytes are byte-identical to the `community` metric bytes.
+        let l0 = metric_buffer(&g, "community_l0").expect("community_l0");
+        let community = metric_buffer(&g, "community").expect("community");
+        assert_eq!(l0, community, "community_l0 bytes must equal community bytes");
+
+        // `community_l1` decodes to the finer level's per-node ids.
+        let l1 = metric_buffer(&g, "community_l1").expect("community_l1");
+        assert_eq!(decode_f32(&l1), vec![0.0, 1.0, 2.0, 3.0]);
+
+        // Out-of-range level is unknown, so the route answers 404.
+        assert!(metric_buffer(&g, "community_l2").is_none());
+    }
 }

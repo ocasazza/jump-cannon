@@ -16,8 +16,8 @@ use std::{
 
 use data_loader::{
     identity::Namespace, Capability, DiscoveryField, DiscoveryFieldType, EdgeTypeSchema, Effect,
-    ImportError, ImportFuture, ImportOutcome, Importer, ImporterDescriptor, ImporterSchema,
-    LoadResult, SearchDocument, TagHierarchySchema, Transport, WatchPlan,
+    ImportError, ImportFuture, ImportOutcome, ImportProgress, Importer, ImporterDescriptor,
+    ImporterSchema, LoadResult, SearchDocument, TagHierarchySchema, Transport, WatchPlan,
 };
 use percent_encoding::percent_decode_str;
 use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
@@ -604,7 +604,10 @@ impl Importer for OkfImporter {
             root: self.root.clone(),
         })
     }
-    fn import<'a>(&'a self) -> ImportFuture<'a, Result<ImportOutcome, ImportError>> {
+    fn import<'a>(
+        &'a self,
+        _progress: &'a dyn ImportProgress,
+    ) -> ImportFuture<'a, Result<ImportOutcome, ImportError>> {
         let importer = self.clone();
         Box::pin(async move {
             let loaded = tokio::task::spawn_blocking(move || importer.load_checked())

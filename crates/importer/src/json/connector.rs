@@ -16,7 +16,8 @@ use std::collections::BTreeMap;
 use std::fmt;
 
 use data_loader::{
-    Capability, Effect, ImportError, ImportFuture, SourceConnector, SourceRecord, Transport,
+    Capability, Effect, ImportError, ImportFuture, ImportProgress, SourceConnector, SourceRecord,
+    Transport,
 };
 
 use super::config::{Collection, JsonEngineConfig, Preflight, SOURCE_KIND};
@@ -381,24 +382,35 @@ impl HttpJsonConnector {
         &self,
         collection: &Collection,
         records: &mut Vec<SourceRecord>,
+        progress: &dyn ImportProgress,
     ) -> Result<(), ImportError> {
         let config = self.config();
         let page_size = config.page_size;
         let max_records = self.package.limits().nodes;
         let static_query = self.static_query(collection)?;
+        let host = host_of(self.instance.root());
+        let stage = progress.stage(&format!("Fetching {} from {host}", collection.name));
         let mut offset: usize = 0;
         let mut accumulated: usize = 0;
         let mut page_index: usize = 0;
+        let mut bytes_fetched: usize = 0;
+        // The completion fraction is only knowable when the collection declares
+        // a server-reported total (`total_pointer`); the `max_records` limit is
+        // a safety ceiling, not a completion target. Without a declared total
+        // the pull is genuinely indeterminate, so the fraction stays `None`.
+        let mut record_bound: Option<usize> = None;
         loop {
             if accumulated >= max_records {
                 // The previous page was full, so the server likely still has
                 // more data. Fail loudly rather than silently truncate.
+                let message = format!(
+                    "collection {}: {} record bound reached while server still returned full pages",
+                    collection.name, max_records
+                );
+                progress.fail(stage, &message);
                 return Err(ImportError::SourceRead {
                     origin: format!("{SOURCE_KIND}:{}", collection.name),
-                    message: format!(
-                        "collection {}: {} record bound reached while server still returned full pages",
-                        collection.name, max_records
-                    ),
+                    message,
                 });
             }
             let query = match collection.paginate {
@@ -423,14 +435,17 @@ impl HttpJsonConnector {
                     message: format!("response {total_pointer} is not a number"),
                 })?;
                 if total as usize > max_records {
+                    let message = format!(
+                        "collection {}: server reports total {total} records, which exceeds the {} bound",
+                        collection.name, max_records
+                    );
+                    progress.fail(stage, &message);
                     return Err(ImportError::SourceRead {
                         origin: url.clone(),
-                        message: format!(
-                            "collection {}: server reports total {total} records, which exceeds the {} bound",
-                            collection.name, max_records
-                        ),
+                        message,
                     });
                 }
+                record_bound = Some(total as usize);
             }
             let items = value.pointer(&collection.items_pointer).ok_or_else(|| ImportError::SourceRead {
                 origin: url.clone(),
@@ -447,6 +462,7 @@ impl HttpJsonConnector {
                 ),
             })?;
             let page_len = items.len();
+            bytes_fetched += bytes.len();
             let mut metadata = BTreeMap::new();
             metadata.insert(
                 RECORD_COLLECTION_KEY.to_string(),
@@ -464,6 +480,19 @@ impl HttpJsonConnector {
             });
             accumulated += page_len;
             page_index += 1;
+            let fraction = record_bound.map(|bound| {
+                if bound == 0 {
+                    1.0
+                } else {
+                    (accumulated as f32 / bound as f32).clamp(0.0, 1.0)
+                }
+            });
+            let detail = format!(
+                "page {page_index} · {} records · {}",
+                format_thousands(accumulated),
+                format_bytes(bytes_fetched)
+            );
+            progress.advance(stage, fraction, &detail);
             match collection.paginate {
                 super::config::Pagination::None => break,
                 super::config::Pagination::LimitOffset => {
@@ -474,6 +503,11 @@ impl HttpJsonConnector {
                 }
             }
         }
+        progress.finish(stage);
+        progress.log(&format!(
+            "collection {} fetched {page_index} pages",
+            collection.name
+        ));
         Ok(())
     }
 }
@@ -519,14 +553,17 @@ impl SourceConnector for HttpJsonConnector {
         }
     }
 
-    fn read<'a>(&'a self) -> ImportFuture<'a, Result<Vec<SourceRecord>, ImportError>> {
+    fn read<'a>(
+        &'a self,
+        progress: &'a dyn ImportProgress,
+    ) -> ImportFuture<'a, Result<Vec<SourceRecord>, ImportError>> {
         Box::pin(async move {
             let mut records = Vec::new();
             if let Some(preflight) = &self.config().preflight {
                 self.run_preflight(preflight).await?;
             }
             for collection in &self.config().collections {
-                self.run_collection(collection, &mut records).await?;
+                self.run_collection(collection, &mut records, progress).await?;
             }
             Ok(records)
         })
@@ -541,6 +578,51 @@ impl SourceConnector for HttpJsonConnector {
                 effect: Effect::Write,
             })
         })
+    }
+}
+
+/// The host authority of an API root URL, used to name a fetch stage. Falls
+/// back to the whole root when the scheme or authority cannot be isolated, so
+/// the label is always non-empty.
+fn host_of(root: &str) -> &str {
+    let without_scheme = root.split_once("://").map_or(root, |(_, rest)| rest);
+    without_scheme
+        .split(['/', '?', '#'])
+        .next()
+        .filter(|host| !host.is_empty())
+        .unwrap_or(root)
+}
+
+/// Format a count with thousands separators, e.g. `6000` becomes `6,000`, so
+/// progress detail lines stay readable at the scale this importer targets.
+fn format_thousands(value: usize) -> String {
+    let digits = value.to_string();
+    let bytes = digits.as_bytes();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (index, &byte) in bytes.iter().enumerate() {
+        if index > 0 && (bytes.len() - index) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(byte as char);
+    }
+    out
+}
+
+/// Format a byte count with one decimal place and an adaptive unit, e.g.
+/// `1887436` becomes `1.8 MB`. Bytes under one kilobyte render as whole bytes.
+fn format_bytes(bytes: usize) -> String {
+    const KB: f64 = 1024.0;
+    const MB: f64 = KB * 1024.0;
+    const GB: f64 = MB * 1024.0;
+    let bytes_f = bytes as f64;
+    if bytes_f >= GB {
+        format!("{:.1} GB", bytes_f / GB)
+    } else if bytes_f >= MB {
+        format!("{:.1} MB", bytes_f / MB)
+    } else if bytes_f >= KB {
+        format!("{:.1} KB", bytes_f / KB)
+    } else {
+        format!("{bytes} B")
     }
 }
 

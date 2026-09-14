@@ -59,6 +59,9 @@ web-sys = { workspace = true, features = [
     "Storage",
     # worker.rs: spawn the tvix-worker bundle from a Blob bootstrap URL
     "Blob", "BlobPropertyBag", "MessageEvent", "Url", "Worker",
+    # main.rs boot-shell mirror: write the jc_shell cookie (HtmlDocument) and
+    # gate the Secure flag on the page origin (Location).
+    "HtmlDocument", "Location",
 ] }
 tracing = "0.1"
 tracing-wasm = "0.2"

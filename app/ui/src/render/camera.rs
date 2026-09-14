@@ -185,6 +185,19 @@ impl Camera {
         }
     }
 
+    /// Distance `fit_to_bounds` places the camera at to frame a sphere of
+    /// the given `radius`. Shares the framing formula with `fit_to_bounds`;
+    /// the region-map auto-level rule asks "what distance would fit this
+    /// radius?" without moving the camera. Orthographic has no dolly
+    /// distance, so it returns the same near/far-satisfying standoff
+    /// `fit_to_bounds` uses for the ortho position.
+    pub fn fit_distance(&self, radius: f32) -> f32 {
+        match self.projection {
+            Projection::Perspective { fov_y } => radius * 1.7 / (fov_y * 0.5).sin(),
+            Projection::Orthographic { .. } => (radius * 4.0).max(self.znear * 10.0),
+        }
+    }
+
     pub fn fit_to_bounds(&mut self, min: Vec3, max: Vec3) {
         let center = (min + max) * 0.5;
         let radius = ((max - min) * 0.5).length().max(1.0);

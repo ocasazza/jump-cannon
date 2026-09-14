@@ -15,7 +15,7 @@
 //!    namespace conformance (`{source_kind}:{source_id}:{local}`) and fully
 //!    resolved edge endpoints.
 
-use crate::{ImportOutcome, Importer};
+use crate::{ImportOutcome, Importer, NoProgress};
 
 /// Assert the unified identity/search contract for one importer.
 ///
@@ -27,13 +27,21 @@ pub async fn assert_import_contract(importer: &dyn Importer) {
         .validate()
         .expect("importer descriptor must satisfy the discovery contract");
 
-    let first = match importer.import().await.expect("first import must succeed") {
+    let first = match importer
+        .import(&NoProgress)
+        .await
+        .expect("first import must succeed")
+    {
         ImportOutcome::Loaded(first) => first,
         ImportOutcome::Unchanged => {
             panic!("first import must load a fresh graph, not report Unchanged")
         }
     };
-    let second = match importer.import().await.expect("second import must succeed") {
+    let second = match importer
+        .import(&NoProgress)
+        .await
+        .expect("second import must succeed")
+    {
         ImportOutcome::Loaded(second) => second,
         // The unchanged gate fires only when the second read produced the
         // exact records behind the first (validated) load, so there is

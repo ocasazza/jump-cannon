@@ -581,7 +581,7 @@ pub fn panel(ctx: Ctx) -> Element {
             *SOUP_STATUS.write() = None;
             return;
         }
-        if let Some(source) = crate::api::source_id() {
+        if let Some(source) = crate::api::source_selection() {
             *SOUP_ERROR.write() = Some(format!(
                 "self-assembly runs on the deployment default source; {source} is a read-only view"
             ));

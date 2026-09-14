@@ -257,7 +257,8 @@
             "obsidian",
             "kubernetes",
             "okf",
-            "httpjson"
+            "httpjson",
+            "tvix"
           ]
         },
         "sourceId": {
@@ -275,6 +276,18 @@
         },
         "httpJson": {
           "$ref": "#/definitions/httpJsonSource"
+        },
+        "tvix": {
+          "$ref": "#/definitions/tvixSource"
+        },
+        "parameters": {
+          "type": "object",
+          "propertyNames": {
+            "pattern": "^[a-z][a-z0-9_]*$"
+          },
+          "additionalProperties": {
+            "$ref": "#/definitions/sourceParameter"
+          }
         },
         "producer": {
           "$ref": "#/definitions/sourceProducer"
@@ -406,6 +419,44 @@
                 "not": {
                   "required": [
                     "source"
+                  ]
+                }
+              },
+              {
+                "not": {
+                  "required": [
+                    "filesystemRescanIntervalSeconds"
+                  ]
+                }
+              }
+            ]
+          }
+        }
+        ,
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "tvix"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "tvix"
+            ],
+            "allOf": [
+              {
+                "not": {
+                  "required": [
+                    "source"
+                  ]
+                }
+              },
+              {
+                "not": {
+                  "required": [
+                    "httpJson"
                   ]
                 }
               },
@@ -553,6 +604,75 @@
           "type": "integer",
           "minimum": 1,
           "maximum": 86400000
+        }
+      }
+    },
+    "tvixSource": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "package"
+      ],
+      "properties": {
+        "package": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "variables": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "sourceParameter": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "label": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "default": {
+          "type": "string",
+          "maxLength": 1024
+        },
+        "values": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "maxLength": 1024
+          }
+        },
+        "discover": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "path",
+            "idPointer"
+          ],
+          "properties": {
+            "path": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 2048
+            },
+            "itemsPointer": {
+              "type": "string",
+              "pattern": "^/"
+            },
+            "idPointer": {
+              "type": "string",
+              "pattern": "^/"
+            },
+            "labelPointer": {
+              "type": "string",
+              "pattern": "^/"
+            }
+          }
         }
       }
     }

@@ -9,10 +9,16 @@ tags: [jump-cannon, importer]
 # Importer Runtime
 
 Importers acquire records, map them into a graph and discovery documents, and
-publish one complete revision. The eight server source kinds are Obsidian,
-tvix, generate, Kubernetes, OKF, a trusted administrator-installed Pest
-package, GitHub, and httpjson (the engine name). Every JSON API — including
-Hindsight — is a declarative package under `charts/jump-cannon/packages/`
+publish one complete revision. The server source kinds are Obsidian,
+Kubernetes, OKF, a trusted administrator-installed Pest package, GitHub, and
+two package engines: `httpjson` (paged JSON APIs) and `tvix` (Nix-expression
+graph generators). Graph generators are no longer compiled CLI sources: the
+retired `generate`/`tvix` `--source` kinds are now `engine = "tvix"` packages
+that bind their expression's runtime parameters (node count, edge count, seed,
+cluster count, affinity) at apply time, exactly as `httpjson` binds its
+variables — see `charts/jump-cannon/packages/generate-random.toml` and
+`generate-clusters.toml`. Every JSON API — including Hindsight — is a
+declarative package under `charts/jump-cannon/packages/`
 bound to an instance at runtime via the `JUMP_CANNON_IMPORTER_*` env vars;
 Hindsight is the package `hindsight-memory-bank.toml`, not a source kind.
 See [[Hindsight Importer]] and AGENTS.md "Importers: packages, not crates".
@@ -25,8 +31,10 @@ of the same manifest, evaluated server-side by the tvix evaluator, was tried
 and superseded: one authored format keeps the editor, the ConfigMap glob
 (`packages/*.toml`), and validation single-pathed, and the shared envelope
 already carries what the `let`-bound Nix form was collapsing. `.nix` package
-files are not loaded; `tvix_wasm::eval_to_json` stays private to graph
-generation.
+files are still not loaded: the tvix engine's generator is an inline TOML
+`expr` field — a function of the declared variables — evaluated by
+`tvix_wasm::eval_graph` against the embedded `graph.nix` library. The browser
+Generate panel uses the same evaluator on the client.
 
 Every importer descriptor must supply discovery schema version 2. It declares
 input media types, typed search/facet fields, edge semantics, and content
@@ -75,7 +83,7 @@ also switch the viewed source per browser session from
 the Importers panel, writes and compute pinned to the deployment-selected
 source. A group of `"*"` opens switching to every caller. Switching is
 non-blocking: the first request selecting an unbuilt runnable source starts
-its import as a background task and answers 503 + `Retry-After: 2` with a
+its import as a background task and answers `202 Accepted` + `Retry-After: 2` with a
 `building importer source` body; `GET /progress` with the same selection
 header serves that build's live event log (never blocking behind the build),
 and the panel/graph overlay poll it until the retry succeeds. The viewer's
@@ -89,6 +97,38 @@ default row) that applies the source, so loading a graph is one click from the
 list while browsing the catalog triggers no server-side imports. The anchored
 row, the graph-area overlay, and the Progress panel all show the build's
 stages and fractions while it runs.
+
+## Parameterised sources
+
+A catalog source may declare **parameters** — instance-level variables whose
+values are bound at apply time rather than at rollout. Parameters are discoverable
+through `GET /importers/sources/{source-id}/parameters`, which returns live
+(bounded, cached 60 s) discovered values or falls back to static lists. The
+catalog schema for an httpjson source gains:
+
+```yaml
+parameters:                                    # optional
+  bank:                                        # parameter name (must match a package variable without a default)
+    label: Memory bank                         # UI label
+    default: omp                               # optional; omitted = parameter is required
+    values: ["omp", "jira-ithelp"]             # optional static list (overridden by discover)
+    discover:                                  # optional live discovery
+      path: /v1/{tenant}/banks
+      items_pointer: /banks
+      id_pointer: /bank_id
+      label_pointer: /name
+```
+
+When a user selects a source with parameters, the frontend picks values and
+encodes them as a **selection string**: `<source-id>` or
+`<source-id>?<k1>=<v1>&<k2>=<v2>` (params sorted by key, URL-encoded, only
+declared names). The string is stored in sessionStorage and sent as
+`x-jump-cannon-source` on every request. graph-api treats
+`(source-id, params)` as a distinct build target: `POST
+/importers/sources/{selection}/build` starts a dedicated importer task with
+those parameters bound, and status/progress/retry routes accept the full
+selection string as `{id}` (URL-encoded). Each parameterised selection's graph
+and schema are cached per source id.
 
 Package definitions are editable through the same gate. `GET
 /importers/{id}/definition` returns an httpjson source's authored TOML
@@ -124,6 +164,8 @@ the sandbox Web Worker — the server never parses a sample input. The preview's
 "View as graph" mounts the parsed sample as a client-only graph in the
 renderer (bounded at 5k nodes / 20k edges), the same mount the Generate panel
 uses, so authoring a package shows its graph without any server round-trip.
+
+Alternate sources selected through the runtime-switch gate are built on a background task. Each importer engine reports progress through `data_loader::ImportProgress` (stage / advance(fraction, detail) / finish / fail / log): the JSON engine emits one stage per collection (`Fetching <collection> from <host>`) and advances after every page with `page N · R records · B MB` (fraction reported only when the collection declares a server total); the pipeline emits `Decoding <n> records` and `Projecting graph`; the pest engine emits `Parsing <package>`. Graph routes for a building selection answer `202 Accepted` with status, elapsed time, stage, detail, and fraction (when available) instead of blocking behind a lock. See [[Backend API]] for the response contract and status/progress/retry endpoints. Building entries persist until eviction or completion; failed builds are retryable and evict on idle TTL. **Operational note:** live-paged APIs like ChEMBL (`chembl-pharmacology`) measure around 4.5 minutes per build on the cluster and evict after ~15 minutes idle, so a later visit pays the import cost again.
 
 The default markdown loader resolves wikilinks and is currently the only
 importer that advertises readable and writable source content. Kubernetes

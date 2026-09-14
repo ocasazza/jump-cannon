@@ -4,6 +4,9 @@ use vault_data::VaultGraph;
 pub fn compute_louvain(graph: &mut VaultGraph, max_outer_iter: usize) {
     let n_orig = graph.nodes.len();
     if n_orig == 0 {
+        // Honor the "always at least one level" invariant even with no nodes:
+        // a single, empty per-node level.
+        graph.community_levels = vec![Vec::new()];
         return;
     }
 
@@ -51,6 +54,8 @@ pub fn compute_louvain(graph: &mut VaultGraph, max_outer_iter: usize) {
             }
         }
         graph.num_communities = n_orig;
+        // Every node is its own community; a single level equal to `community`.
+        graph.community_levels = vec![(0..n_orig as u32).collect()];
         return;
     }
 
@@ -79,33 +84,50 @@ pub fn compute_louvain(graph: &mut VaultGraph, max_outer_iter: usize) {
         }
     }
 
-    // 3. Walk level chain to compute final community per original node.
-    let mut final_comm: Vec<usize> = (0..n_orig).collect();
+    // 3. Walk the level chain, snapshotting the cumulative community of every
+    //    original node after each recorded Louvain pass. `snapshots[j]` is the
+    //    compacted (0..k) community after applying `levels[0..=j]`; snapshots
+    //    get coarser as `j` increases (more merges applied), so `snapshots[0]`
+    //    is the finest recorded pass and `snapshots.last()` is the coarsest.
+    let mut running: Vec<usize> = (0..n_orig).collect();
+    let mut snapshots: Vec<Vec<usize>> = Vec::with_capacity(levels.len());
     for level in &levels {
-        for c in final_comm.iter_mut() {
+        for c in running.iter_mut() {
             *c = level[*c];
         }
+        snapshots.push(compact_community(&running));
     }
 
-    // 4. Compact final ids to 0..k.
-    let mut compact: HashMap<usize, usize> = HashMap::new();
-    let mut next_id = 0usize;
-    for c in final_comm.iter_mut() {
-        let mapped = *compact.entry(*c).or_insert_with(|| {
-            let v = next_id;
-            next_id += 1;
-            v
-        });
-        *c = mapped;
-    }
+    // 4. Assemble `community_levels` coarsest-first: level 0 is the coarsest
+    //    cumulative mapping (byte-identical to `community`), higher levels are
+    //    finer, and the last level is the first Louvain pass. If Louvain found
+    //    no improving move (no snapshots), emit a single trivial level where
+    //    each node is its own community.
+    let community_levels: Vec<Vec<u32>> = if snapshots.is_empty() {
+        vec![(0..n_orig as u32).collect()]
+    } else {
+        snapshots
+            .iter()
+            .rev()
+            .map(|snap| snap.iter().map(|&c| c as u32).collect())
+            .collect()
+    };
 
-    // 5. Write back to graph nodes.
+    // 5. Write back the coarsest level as the canonical `community` metric.
+    let final_comm = &community_levels[0];
     for (i, id) in ids.iter().enumerate() {
         if let Some(node) = graph.nodes.get_mut(id) {
-            node.metrics.community = final_comm[i];
+            node.metrics.community = final_comm[i] as usize;
         }
     }
-    graph.num_communities = next_id;
+    // Compacted ids are contiguous 0..k, so the community count is max + 1.
+    graph.num_communities = final_comm
+        .iter()
+        .copied()
+        .max()
+        .map(|m| m as usize + 1)
+        .unwrap_or(0);
+    graph.community_levels = community_levels;
 }
 
 /// Phase 1: each node is moved to the neighbor community that maximizes

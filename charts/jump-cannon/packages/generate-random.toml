@@ -1,0 +1,60 @@
+# Random graph generator package.
+#
+# A graph generator is DATA, not code: this package carries a Nix expression
+# that is a function of its declared variables, and the `engine = "tvix"`
+# engine of `crates/importer` binds those variables (node count, edge count,
+# seed) at apply time and evaluates the expression to a graph. No new
+# `SourceKind` variant, no `--generate-*` flags, no crate: AGENTS.md,
+# "Importers: packages, not crates".
+#
+# The expression imports the embedded generator library and calls `random`,
+# which wires `nodes` isolated nodes with `edges` uniformly-random directed
+# edges (no self-loops), reproducibly from `seed`.
+
+format_version = 3
+
+[metadata]
+id = "generate.random"
+name = "Random graph"
+version = "1.0.0"
+description = "A deterministic pseudo-random graph: `nodes` isolated nodes wired by `edges` uniformly random directed edges, reproducible from `seed`."
+
+# `nodes`/`edges` are the loud hard bounds on the evaluated graph, bounded in
+# turn by the crate's HARD_LIMITS (1,000,000 nodes / 500,000 edges).
+[limits]
+nodes = 1000000
+edges = 500000
+
+[parser]
+engine = "tvix"
+# A function of the declared variables to a toGraphJSON-shaped attrset. The
+# engine calls it as `( <expr> ) { nodes = …; edges = …; seed = …; }` with each
+# variable coerced from its declared type.
+expr = '''
+{ nodes, edges, seed }:
+let g = import /jc/src/graph.nix { };
+in g.random { inherit nodes edges seed; }
+'''
+
+[[parser.variables]]
+name = "nodes"
+type = "integer"
+default = "1000"
+min = 1
+max = 1000000
+description = "Number of nodes to generate (n0..n{nodes-1})."
+
+[[parser.variables]]
+name = "edges"
+type = "integer"
+default = "2000"
+min = 0
+max = 500000
+description = "Number of directed edges wired uniformly at random (no self-loops)."
+
+[[parser.variables]]
+name = "seed"
+type = "integer"
+default = "0"
+min = 0
+description = "Deterministic RNG seed; the same parameters and seed always produce the identical graph."

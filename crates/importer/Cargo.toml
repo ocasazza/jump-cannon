@@ -10,7 +10,7 @@ default = ["native"]
 # transport. The package core (manifest validation, pest_vm parsing, JSON
 # decode/mapping over caller-supplied bytes) builds on wasm32-unknown-unknown
 # with --no-default-features.
-native = ["dep:reqwest"]
+native = ["dep:reqwest", "dep:tvix-wasm", "dep:tokio"]
 
 [dependencies]
 data-loader = { path = "../data-loader" }
@@ -29,6 +29,12 @@ tracing     = "0.1"
 # outbound chain) every request fails x509 verification inside a container.
 # Native roots read the host bundle the deployment mounts.
 reqwest     = { version = "0.12", default-features = false, features = ["rustls-tls-native-roots"], optional = true }
+# Native-only: the tvix engine evaluates Nix generator expressions on a
+# blocking thread. tvix-wasm builds a pure (default-features off) native
+# evaluator; tokio provides spawn_blocking. The package core (validation,
+# variable resolution, Nix-literal rendering) is wasm-clean without them.
+tvix-wasm   = { path = "../tvix-wasm", default-features = false, optional = true }
+tokio       = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile    = "3"

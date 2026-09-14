@@ -12,7 +12,8 @@ use std::collections::BTreeMap;
 use std::fmt;
 
 use data_loader::{
-    Capability, Effect, ImportError, ImportFuture, SourceConnector, SourceRecord, Transport,
+    Capability, Effect, ImportError, ImportFuture, ImportProgress, SourceConnector, SourceRecord,
+    Transport,
 };
 
 /// `User-Agent` header attached to every production request.
@@ -193,7 +194,10 @@ impl SourceConnector for HttpsConnector {
         }
     }
 
-    fn read<'a>(&'a self) -> ImportFuture<'a, Result<Vec<SourceRecord>, ImportError>> {
+    fn read<'a>(
+        &'a self,
+        _progress: &'a dyn ImportProgress,
+    ) -> ImportFuture<'a, Result<Vec<SourceRecord>, ImportError>> {
         Box::pin(async move {
             let response = self
                 .transport

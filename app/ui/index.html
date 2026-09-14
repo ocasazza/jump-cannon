@@ -3,8 +3,15 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+    <!-- Declare the dark scheme so the UA paints form controls, scrollbars,
+         and the canvas backdrop dark from the very first frame. -->
+    <meta name="color-scheme" content="dark" />
     <title>Jump Cannon</title>
     <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'><rect width='64' height='64' rx='12' fill='%2309090a'/><circle cx='18' cy='32' r='8' fill='%23389cf6'/><circle cx='32' cy='32' r='8' fill='%23f6be3c'/><circle cx='46' cy='32' r='8' fill='%23ee60c2'/></svg>" />
+    <!-- The only styling permitted outside app.css: the document must paint a
+         dark surface before any external stylesheet resolves, so these
+         pre-paint essentials are inlined to kill the first-load white flash. -->
+    <style>html,body{margin:0;background:#09090a;color-scheme:dark}</style>
     <!-- This CSS must load before the Rust module so the static Panel Kit boot
          shell can paint while Trunk downloads and instantiates the app WASM. -->
     <link data-trunk rel="css" href="assets/app.css" />
@@ -36,15 +43,44 @@
          its adjacent sibling; placing pre-existing DOM inside #main makes the
          Dioxus 0.6 diff engine panic with `invalid key`. -->
     <div id="main"></div>
-    <section class="panel-kit-boot" data-panel-kit-static-boot role="status" aria-live="polite">
+    <section class="panel-kit-boot" data-panel-kit-static-boot>
       <header class="panel-kit-boot-bar">
         <strong class="panel-kit-boot-title">JUMP CANNON</strong>
-        <span class="panel-kit-boot-status">loading application…</span>
+        <div class="panel-kit-boot-progress" role="status" aria-live="polite" aria-label="Loading application">
+          <div class="panel-kit-boot-progress-bar"></div>
+        </div>
       </header>
       <main class="panel-kit-boot-panels" aria-hidden="true">
-        <div class="panel-kit-boot-panel"><div class="panel-kit-boot-line"></div><div class="panel-kit-boot-line"></div></div>
-        <div class="panel-kit-boot-panel"><div class="panel-kit-boot-line"></div><div class="panel-kit-boot-line"></div></div>
-        <div class="panel-kit-boot-panel"><div class="panel-kit-boot-line"></div><div class="panel-kit-boot-line"></div></div>
+        <!--panel-kit-boot-frames-->
+        <div class="panel-kit-boot-col panel-kit-boot-col-left">
+          <div class="panel-kit-boot-panel panel-kit-boot-graph">
+            <div class="panel-kit-boot-head">
+              <span class="panel-kit-boot-lights"><i></i><i></i><i></i></span>
+              <span class="panel-kit-boot-title-sm">Graph</span>
+            </div>
+          </div>
+          <div class="panel-kit-boot-panel panel-kit-boot-progress-panel">
+            <div class="panel-kit-boot-head">
+              <span class="panel-kit-boot-lights"><i></i><i></i><i></i></span>
+              <span class="panel-kit-boot-title-sm">Progress</span>
+            </div>
+          </div>
+        </div>
+        <div class="panel-kit-boot-col panel-kit-boot-col-right">
+          <div class="panel-kit-boot-panel panel-kit-boot-nodes">
+            <div class="panel-kit-boot-head">
+              <span class="panel-kit-boot-lights"><i></i><i></i><i></i></span>
+              <span class="panel-kit-boot-title-sm">Nodes</span>
+            </div>
+          </div>
+          <div class="panel-kit-boot-panel panel-kit-boot-settings">
+            <div class="panel-kit-boot-head">
+              <span class="panel-kit-boot-lights"><i></i><i></i><i></i></span>
+              <span class="panel-kit-boot-title-sm">Settings</span>
+            </div>
+          </div>
+        </div>
+        <!--/panel-kit-boot-frames-->
       </main>
     </section>
   </body>

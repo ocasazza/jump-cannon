@@ -40,7 +40,7 @@ use graph_layouts::{
     BoxedPhysics, BoxedStatic, CircleAxis, CircleLayout, CircleSettings, CiseLayout, CiseSettings,
     ConcentricLayout, ConcentricMetric, ConcentricSettings, CoseBilkentLayout, CoseBilkentSettings,
     DagreLayout, DagreRanker, DagreSettings, DynPhysicsLayout, DynStaticLayout, FcoseLayout,
-    FcoseQuality, FcoseSettings, GpuForceLayout, GpuForceOptions, Graph, GridLayout, GridSettings,
+    FcoseQuality, FcoseSettings, ForceModel, GpuForceLayout, GpuForceOptions, Graph, GridLayout, GridSettings,
     HilbertLayout, HilbertSettings, KlayLayout, KlaySettings, LayoutDescriptor, LayoutKind,
     LayoutRequirements, PhysicsLayout, RandomLayout, RandomSettings, RankDirection, RepulsionMode,
     SpectralLayout, SpectralSettings, SphereLayout, SphereSettings, StaticLayout,
@@ -113,7 +113,8 @@ static HEALTH: GlobalSignal<Option<ComputeHealth>> = Signal::global(|| None);
 /// deployment default. `/compute/*` takes graph-api's `DefaultSource`
 /// extractor, which answers 400 for any other selection, so the pollers stand
 /// down and the cluster gallery renders the reason instead.
-static COMPUTE_SOURCE: GlobalSignal<Option<String>> = Signal::global(api::source_id);
+static COMPUTE_SOURCE: GlobalSignal<Option<api::SourceSelection>> =
+    Signal::global(api::source_selection);
 /// What the last apply pushed — the swap/short-circuit detector (mirrors
 /// `prev_layout_key` / `prev_active_layout_id` / `prev_seed_mode` on the
 /// egui App). `generation` ties it to one render-host build: a canvas
@@ -363,7 +364,7 @@ fn remote_solver_status(
 /// on the way out of the default source: they describe the default graph and
 /// would misreport the alternate.
 fn compute_reachable() -> bool {
-    let selected = api::source_id();
+    let selected = api::source_selection();
     if *COMPUTE_SOURCE.peek() != selected {
         *COMPUTE_SOURCE.write() = selected.clone();
         if selected.is_some() {
@@ -751,7 +752,7 @@ fn desired_remote_selection() -> Option<ComputeLayoutPutReq> {
 /// observes a stale generation it retries the same latest intent against the
 /// generation returned by the server.
 fn request_remote_selection() {
-    if let Some(id) = api::source_id() {
+    if let Some(id) = api::source_selection() {
         *SOLVE_MSG.write() =
             format!("remote layouts run on the deployment default source; {id} is a read-only view");
         return;
@@ -1075,6 +1076,12 @@ impl LayoutPreset {
         }
     }
 
+    /// Every preset sets the physics *and* the sampling budget so switching
+    /// presets is meaningful under both force laws: `repulsion` drives the
+    /// spring-electrical law, `tfdp_k` / `repulsion_samples` drive t-FDP
+    /// under negative sampling (SNAP-tFDP: k=1 over-contracts clusters,
+    /// gains saturate above k=3). α/β/γ stay at the paper defaults — they
+    /// shape the force curve, not the speed/quality trade.
     fn apply_to(self, o: &mut GpuForceOptions) {
         match self {
             LayoutPreset::Fast => {
@@ -1088,6 +1095,8 @@ impl LayoutPreset {
                 o.cooling_alpha = 0.99;
                 o.cooling_floor = 0.65;
                 o.energy_threshold = 0.5;
+                o.repulsion_samples = 4;
+                o.tfdp_k = 1.0;
             }
             LayoutPreset::Balanced => {
                 o.repulsion = 250.0;
@@ -1100,6 +1109,8 @@ impl LayoutPreset {
                 o.cooling_alpha = 0.999;
                 o.cooling_floor = 0.85;
                 o.energy_threshold = 0.005;
+                o.repulsion_samples = 8;
+                o.tfdp_k = 3.0;
             }
             LayoutPreset::Pretty => {
                 o.repulsion = 400.0;
@@ -1112,6 +1123,8 @@ impl LayoutPreset {
                 o.cooling_alpha = 0.999;
                 o.cooling_floor = 0.55;
                 o.energy_threshold = 0.02;
+                o.repulsion_samples = 16;
+                o.tfdp_k = 3.0;
             }
         }
     }
@@ -1155,12 +1168,16 @@ fn default_stream_url() -> String {
 fn versioned_stream_url(base: &str) -> Option<String> {
     let lease = expected_stream_lease()?;
     // The browser WebSocket API cannot set headers, so the per-viewer source
-    // selection rides as a query parameter. Strip any stale `source=` baked
-    // into a persisted settings URL first so re-switching never duplicates it.
+    // selection rides as a query parameter. The canonical selection string may
+    // itself contain `?`/`&`/`=`, so it is URL-encoded once here; the server
+    // decodes it once back into the canonical form. Strip any stale `source=`
+    // baked into a persisted settings URL first so re-switching never duplicates it.
     let mut url = strip_query_param(base, "source");
-    if let Some(source) = crate::api::source_id() {
+    if let Some(selection) = crate::api::source_selection() {
         let sep = if url.contains('?') { '&' } else { '?' };
-        url = format!("{url}{sep}source={source}");
+        let canonical = selection.to_string();
+        let encoded = urlencoding::encode(&canonical);
+        url = format!("{url}{sep}source={encoded}");
     }
     let sep = if url.contains('?') { '&' } else { '?' };
     Some(format!(
@@ -1867,7 +1884,7 @@ fn apply_seed_expr(expr: &str) {
 }
 
 fn apply_remote_initial_placement(positions: Vec<f32>, n_nodes: usize) {
-    if let Some(id) = api::source_id() {
+    if let Some(id) = api::source_selection() {
         *SEED_ERROR.write() = Some(format!(
             "remote placement runs on the deployment default source; {id} is a read-only view"
         ));
@@ -2330,7 +2347,7 @@ async fn fetch_session() {
 /// surfaces rejections, and an out-of-band re-poll reconciles with the
 /// server's view instead of waiting for the 2 s cadence.
 fn session_action(action: &'static str) {
-    if let Some(id) = api::source_id() {
+    if let Some(id) = api::source_selection() {
         *SESSION_ERR.write() = Some(format!(
             "the GPU session runs on the deployment default source; {id} is a read-only view"
         ));
@@ -2403,7 +2420,7 @@ pub(crate) fn backend_switch_header() -> Element {
     // peek: the App-scope header must not subscribe to the full settings
     // bag (every slider drag would re-render the whole workspace).
     let running = backend_of(&STATE.peek().active);
-    let status_text = match COMPUTE_SOURCE.read().as_deref() {
+    let status_text = match COMPUTE_SOURCE.read().as_ref().map(|s| s.id.as_str()) {
         Some(id) => format!("unavailable while viewing {id} — default source only"),
         None if session_on => {
             let t = SESSION_TITLE.read().clone();
@@ -2610,7 +2627,7 @@ pub fn panel(ctx: Ctx) -> Element {
                     server_backed,
                     selected_remote.as_deref(),
                     is_bridge,
-                    alternate_source.as_deref(),
+                    alternate_source.as_ref().map(|s| s.id.as_str()),
                 ),
             }
 
@@ -2618,7 +2635,7 @@ pub fn panel(ctx: Ctx) -> Element {
             // gallery, keep the worker health + browser-owned warnings
             // visible (the cluster view carries them on its status card).
             if is_bridge && view == Backend::Local {
-                if let Some(id) = alternate_source.as_deref() {
+                if let Some(id) = alternate_source.as_ref().map(|s| s.id.as_str()) {
                     {compute_source_notice(id)}
                 } else {
                     div { class: "{health_view.class}", "{health_view.text}" }
@@ -2977,7 +2994,7 @@ fn cluster_gallery(
         match snap {
             None => rsx! {
                 div { class: "lay-empty",
-                    panel_kit::Spinner { label: "contacting graph-api for the engine list…" }
+                    crate::build_progress::PanelHydrating { label: "contacting graph-api for the engine list" }
                 }
             },
             Some(Err(error)) => rsx! {
@@ -3560,6 +3577,7 @@ fn gpu_force_ui() -> Element {
     let opts: GpuForceOptions = typed_settings("gpu-force");
     let active_preset = LayoutPreset::detect(&opts).unwrap_or_default();
     let repulsion_mode = opts.repulsion_mode;
+    let force_model = opts.force_model;
 
     rsx! {
         // Reset lives in the top-row ↺ (resets the active engine); no
@@ -3614,25 +3632,56 @@ fn gpu_force_ui() -> Element {
 
         hr { class: "lay-sep" }
 
+        div { class: "lay-sub", "Force model" }
+        div { class: "lay-hint", "Spring-electrical: classic; t-FDP: bounded t-forces, tighter clusters" }
+        div { class: "lay-row",
+            span { class: "lay-k", "law" }
+            select {
+                class: "lay-select",
+                value: match force_model {
+                    ForceModel::SpringElectrical => "spring",
+                    ForceModel::TFdp => "tfdp",
+                },
+                onchange: move |e| edit::<GpuForceOptions>("gpu-force", |o| {
+                    o.force_model = match e.value().as_str() {
+                        "tfdp" => ForceModel::TFdp,
+                        _ => ForceModel::SpringElectrical,
+                    };
+                }),
+                option { value: "spring", selected: force_model == ForceModel::SpringElectrical, "Spring-electrical" }
+                option { value: "tfdp", selected: force_model == ForceModel::TFdp, "t-FDP (Student-t)" }
+            }
+        }
+        if force_model == ForceModel::TFdp {
+            Slider { label: "α attract", min: 0.01, max: 2.0, value: opts.tfdp_alpha as f64, log: true,
+                on: move |v: f64| edit::<GpuForceOptions>("gpu-force", |o| o.tfdp_alpha = v as f32) }
+            Slider { label: "β short-range", min: 0.0, max: 32.0, value: opts.tfdp_beta as f64,
+                on: move |v: f64| edit::<GpuForceOptions>("gpu-force", |o| o.tfdp_beta = v as f32) }
+            Slider { label: "γ decay", min: 0.5, max: 4.0, value: opts.tfdp_gamma as f64,
+                on: move |v: f64| edit::<GpuForceOptions>("gpu-force", |o| o.tfdp_gamma = v as f32) }
+        }
+
+        hr { class: "lay-sep" }
+
         div { class: "lay-sub", "Repulsion backend" }
-        div { class: "lay-hint", "Grid: dense small; BH: clustered; NS: huge" }
+        div { class: "lay-hint", "Exact: tiny graphs; BH: clustered; NS: huge" }
         div { class: "lay-row",
             span { class: "lay-k", "mode" }
             select {
                 class: "lay-select",
                 value: match repulsion_mode {
-                    RepulsionMode::Grid => "grid",
+                    RepulsionMode::Exact => "exact",
                     RepulsionMode::BarnesHut => "bh",
                     RepulsionMode::NegativeSampling => "ns",
                 },
                 onchange: move |e| edit::<GpuForceOptions>("gpu-force", |o| {
                     o.repulsion_mode = match e.value().as_str() {
-                        "bh" => RepulsionMode::BarnesHut,
+                        "exact" => RepulsionMode::Exact,
                         "ns" => RepulsionMode::NegativeSampling,
-                        _ => RepulsionMode::Grid,
+                        _ => RepulsionMode::BarnesHut,
                     };
                 }),
-                option { value: "grid", selected: repulsion_mode == RepulsionMode::Grid, "Grid (27-cell)" }
+                option { value: "exact", selected: repulsion_mode == RepulsionMode::Exact, "Exact (O(n²))" }
                 option { value: "bh", selected: repulsion_mode == RepulsionMode::BarnesHut, "Barnes-Hut" }
                 option { value: "ns", selected: repulsion_mode == RepulsionMode::NegativeSampling, "Negative sampling" }
             }
@@ -3642,6 +3691,10 @@ fn gpu_force_ui() -> Element {
                 on: move |v: f64| edit::<GpuForceOptions>("gpu-force", |o| {
                     o.repulsion_samples = v.round().max(1.0) as u32;
                 }) }
+            if force_model == ForceModel::TFdp {
+                Slider { label: "k weight", min: 0.1, max: 16.0, value: opts.tfdp_k as f64, log: true,
+                    on: move |v: f64| edit::<GpuForceOptions>("gpu-force", |o| o.tfdp_k = v as f32) }
+            }
         }
     }
 }

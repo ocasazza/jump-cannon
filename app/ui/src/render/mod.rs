@@ -22,6 +22,7 @@
 pub mod camera;
 pub mod data;
 pub mod pipelines;
+pub mod region_map;
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
@@ -32,11 +33,18 @@ use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 
 pub use pipelines::{GraphData as Scene, RenderHost};
+pub use region_map::{RegionLevel, RegionMapConfig, RegionMode};
 
 /// Reactive mirror of the sim play/pause state. Updated by
 /// [`set_sim_running`]; panels read this instead of reaching into the
 /// thread-local render host so the UI re-renders on state changes.
 pub static SIM_RUNNING: GlobalSignal<bool> = Signal::global(|| true);
+
+/// Reactive mirror of the region-map level chosen for the last rendered
+/// frame (auto-selected from the camera framing, or the pinned level).
+/// Written by [`tick`] only when the value changes so the Style panel's
+/// level readout re-renders on zoom without churning every frame.
+pub static REGION_LEVEL: GlobalSignal<u32> = Signal::global(|| 0);
 
 /// User-visible lifecycle for the browser WebGPU renderer. The graph data and
 /// the rest of the workspace remain usable when rendering is unavailable, so
@@ -345,6 +353,13 @@ fn tick() {
         let t0 = js_sys::Date::now();
         h.frame();
         perf_record(now, js_sys::Date::now() - t0);
+        // Mirror the region level `frame()` just resolved into the global
+        // signal, but only when it changed so the panel readout doesn't
+        // re-render every tick.
+        let level = h.pipes.region_current_level();
+        if *REGION_LEVEL.peek() != level {
+            *REGION_LEVEL.write() = level;
+        }
     });
 }
 

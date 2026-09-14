@@ -18,7 +18,7 @@ goal is a menu of algorithms that differ along two axes the user cares about:
 
 | # | Algorithm | Family | Complexity | Visual behavior vs FA2 | GPU | Shards | Effort |
 |---|---|---|---|---|---|---|---|
-| 1 | **Barnes-Hut FA2** | force-directed | O(n log n) | *Identical* to FA2, just 100×+ faster | ★★★ | ★★ | Low — tree already host-built in `graph-layouts/octree.wgsl` |
+| 1 | **Barnes-Hut FA2** | force-directed | O(n log n) | *Identical* to FA2, just 100×+ faster | ★★★ | ★★ | **Landed** — tree built on the GPU in `graph-layouts/octree.wgsl` |
 | 2 | **SGD stress** (`s_gd2`) | stress | O(n²) full / **O(kn) pivot** | **Very different** — honors shortest-path distances, untangles structure | ★★★ | ★★★ | Medium |
 | 3 | **Multilevel wrapper** (sfdp / FM³ / Walshaw) | multiscale | O(n log n) | Sharpens *any* inner solver; better global structure | ★★ | ★★ | Medium — coarsening exists in `coarsen.rs` |
 | 4 | **maxent-stress** | stress + entropy | O(n log n) w/ BH | Even node spread, fewer clumps than stress | ★★ | ★★ | Medium |
@@ -64,8 +64,8 @@ cell whose `size / distance < θ` as a single aggregate body. Cuts repulsion to
   cells (center-of-mass) instead of individual nodes.
 - **GPU:** the canonical GPU construction is Burtscher & Pingali's 6-kernel
   CUDA pipeline (build, COM, sort, force, integrate). [[Burtscher-Pingali]][bp11]
-  Our `graph-layouts/octree.wgsl` already follows it (host-built tree today;
-  GPU build is "one Rust change away" per its own header comment).
+  Our `graph-layouts/octree.wgsl` builds the tree on the GPU (Morton sort +
+  level-linear emission; see "Scale ladder" below).
 - **Shards:** ★★ — tree is global; in a distributed setting each worker needs a
   coarse copy of remote COMs (see distributed §5).
 - **Visual:** *identical* to FA2. This is a pure speedup, not a new look.
@@ -238,6 +238,107 @@ Caveats carried from verification: GPU FM³ numbers are 2008-era; SGD has no
 monotonic guarantee; stress/maxent reach local minima; all cited GPU *code* is
 CUDA except GraphWaGu.
 
+## Scale ladder — measured ceilings and what is beyond them (2026-09)
+
+Second research pass, every number below read from the cited paper's own
+text (search engines hallucinated several arXiv IDs during this pass; none of
+those are cited). Headline: **no published work lays out 10⁹ nodes.** The
+largest *measured* layouts are ~10⁷; 10⁸–10⁹ exists only as high-dimensional
+node embeddings (which still need a projection step) or as aggregate /
+community layouts.
+
+| Paper | What it measured |
+|---|---|
+| [2409.00876] GPU pangenome layout (SC'24) | path-guided SGD on CUDA; human Chr.1 **11.1 M nodes**, 6 B pair updates/iter; **57.3×** over multithreaded CPU ODGI; RTX A6000 + A100; profile is memory-bound |
+| [2608.01907] SNAP-tFDP (2026) | degree-weighted t-FDP + edge-centric negative sampling, O(\|E\|·k); **com-lj 4 M nodes / 34 M edges in 9.3 s using 0.8 GB VRAM**; lock-free "bundle by source node" parallelism |
+| [2303.03964] t-FDP (TVCG'23) | Student-t force, FFT-interpolated repulsion; 1 order faster than DRGraph on CPU, **2 orders on GPU** (RTX 2080) |
+| [2108.00529] BigGraphVis | Count-Min sketch + GPU SCoDA communities, then FA2 on the aggregate; **3 M nodes / 34 M edges ≈ 5 min** |
+| [2002.08233] BatchLayout | Flan_1565 **1.56 M / 114 M edges**, 5000 iters in 49 min on CPU (FA2-BH OOM'd) |
+| [2008.07799] DRGraph (VIS'20) | sparse BFS distance + negative sampling + multilevel; Flan_1565 823 s → 171 s on 8 threads |
+| [2008.12336] GOSH · [2110.10049] | **65 M vertices / 1.8 B edges on one GPU in < 1 h / < 30 min** — coarsening-based *embedding*, not layout |
+| [1903.00757] GraphVite · [1903.12287] PBG | 66 M / 1.8 B on 4 GPUs in ~20 h; PBG Freebase model 48.5 GB, partitioning −88 % memory |
+| [1506.06745] GraphMaps | LOD tiles, ≤ 60 nodes per tile in their setting; 38 k nodes took < 6 h preprocessing (edge routing bound) |
+| [0907.2585] GMap (GD'09) | embed → cluster → Delaunay/Voronoi → merge cells per cluster; O(\|V\| log \|V\|); **440 k vertices in 4 min** with n_r=\|V\| random + n_a=40\|V\| artificial points |
+| [1804.03329] hyperbolic tradeoffs | f32 "struggles"; perfect MAP needed a **512-bit** solver — Riemannian hyperbolic optimisation is not a WGSL job |
+
+### Hard walls in this engine (verified against wgpu-types 23 + the WebGPU spec)
+
+Fixed in the same change that added this section:
+
+- **Dispatch cap.** `maxComputeWorkgroupsPerDimension = 65535` × 64 lanes =
+  4 194 240 invocations. A 1-D `dispatch_workgroups(ceil(n/64),1,1)` was
+  rejected above that. `dispatch_1d` now spills into Y and every kernel
+  recovers its index through `linear_index()`.
+- **Buffer caps.** `Limits::downlevel_defaults()` pins storage bindings to
+  128 MiB and buffers to 256 MiB; `using_resolution` only lifts texture
+  limits. That capped positions at 8.4 M nodes and CSR at 16.7 M edges.
+  `gpu_force_device_limits()` now asks for the adapter's buffer limits (both
+  the owned device and the renderer's device use it).
+- **Dead voxel grid.** `RepulsionMode::Grid` had fallen through to the naive
+  O(n²) loop after its bindings were dropped for the 10-storage-buffer cap,
+  and `from_str` sent every unknown string there. The grid build is removed;
+  mode 0 is now the honest `Exact` reference, and unknown strings fall back
+  to the default backend.
+
+### 10⁹-node budget with this engine's buffer layout
+
+positions vec4 16 B + velocities 16 B + energy 4 B + CSR offsets 4 B +
+CSR neighbours 2m·4 B (avg degree 10 → 40 B) + spring partials 16 B =
+**96 B/node → 89 GiB at 10⁹**. A 24 GiB GPU holds ~268 M nodes at that
+layout; a wasm32 heap (4 GiB) holds ~119 M nodes of host mirror at 36 B/node
+with no adjacency. Above ~10⁷ the graph must be coarsened and rendered as
+aggregates; this is arithmetic, not tuning.
+
+### Landed
+
+- `ForceModel::TFdp` in both kernels (`spring_step` attraction, all three
+  repulsion backends) with the paper defaults α=0.1, β=8, γ=2.
+- SNAP-tFDP as a *node-centric* estimator: under `NegativeSampling` + t-FDP
+  each sampled pair is weighted `(deg_i + deg_j)/2` and scaled by `tfdp_k/K`,
+  which is exactly the expectation the paper's eq. 6 derives for its
+  edge-centric sampler. Their "bundle by source node" scheme *is* one thread
+  per CSR row — the shape this engine already had — so no racing writes to
+  other nodes' positions are introduced (WGSL has no f32 atomics).
+- **CSR ingest and host cost.** The physics layout now accepts sparse graphs via `graph_layouts::CsrInput { n_nodes, edges: &[u32], positions: Option<&[f32]> }` and exposes `GpuForceLayout::init_with_device_csr` / `run_csr` alongside `DynPhysicsLayout::init_with_device_csr`. The renderer initialises the physics layout from flat position/edge buffers through CSR; the string-keyed `graph_layouts::Graph` is built only on demand for CPU static solves or as a fallback. Host cost on the CSR path is ~52 B/node steady (76 B/node transient) plus 8 B per undirected edge, versus hundreds of bytes/node for the string-keyed graph.
+- **Louvain dendrogram.** `VaultGraph.community_levels: Vec<Vec<u32>>`; level 0 is the COARSEST and byte-identical to `community`; higher k is finer. The graph-api serves these via `GET /graph/metrics/community_levels` (one f32 = L, the number of levels) and per-level `GET /graph/metrics/community_l{k}`.
+- **Region map levels.** `RegionLevel { Auto, Fixed(k) }` controls the cluster view; the cluster buffer is level-major `n * L`. Auto picks `level = min(floor(log2(fit_dist / d)), L-1)` where `d` is camera distance to bounds centre and `fit_dist` is the fit-to-bounds camera distance, so the fitted view shows the coarsest communities and each halving of distance steps one level finer. The Style panel's "level" select (Auto / 0 (coarsest) .. L-1 (finest)) and a live readout "level k of L" drive the `REGION_LEVEL` signal.
+- **GPU octree build.** The Barnes-Hut tree is now constructed entirely on the GPU via a 30-bit Morton-key 8-pass 4-bit LSD radix sort with multi-workgroup reduce/scan/fixup exclusive scan, order-preserving u32 float atomics for bounding-box reduction, and prefix-sum caching of mass and mass-weighted position. The kernel pipeline emits nodes in DFS order with next/skip ropes; zero host readback per layout step. Build scratch is ~45 bytes per node plus a 48-byte OctNode array at 2N+16 capacity. Multi-body max-depth leaves with identical Morton keys subtract the body's own contribution via exact cell containment.
+- **Region map (GMap-style Voronoi aggregate view).** A GPU seed pass projects nodes through the live camera and writes (packed cell, cluster id) into a 512×512 grid with atomicMin. Ten jump-flood passes (distances 256 down to 1) compute nearest-seed Voronoi; a prune pass makes cells beyond `radius_cells` from any seed transparent; a fullscreen draw fills each cell with a palette color at user-set fill opacity and darkens outlines where 4-neighbor cluster IDs differ. Cluster IDs flow from the Style panel's `community` metric; cost per frame is independent of node count except the seed pass, making this the view for graphs too large for node-by-node rendering.
+- **GPU multilevel seed** (`SeedMode::GpuMultilevel`, strings `gpu_multilevel` | `multilevel` | `ml`): Entirely on device for graphs over 10,000 nodes. Heavy-edge matching (3 rounds of propose/match with hashed tie-breaks), representative flags + scan → parent map, coarse mass as 16.16 fixed-point u32 atomics, coarse edges by expanding CSR slots to (parent, parent) pairs, two-key stable radix sort (by max then min), dedup with multiplicity as edge weight, coarse CSR + coarse Tigr virtual CSR built by scans; cascade with a fixed 0.6 ratio, stops at ≤1000 nodes / ≤0.9 shrink / 16 levels; coarsest seeded in a ball, 200 steps; prolong with jitter, `max(20, 120 >> level)` steps per level, 120 at fine level; coarse levels use `spring_step_weighted` + the unchanged `force_step` with negative-sampling repulsion. No host readback. Scratch ≈ 2× the fine level.
+
+### Measured on this engine
+
+Benchmarks on an Apple M5 Max (Metal backend), preferential-attachment graphs, mean degree 8, per-step wall time including one position readback per run:
+
+| Nodes / Edges | BH Spring | BH t-FDP | NS Spring | NS t-FDP |
+|---|---|---|---|---|
+| 100k / 400k | 0.47 ms | 0.52 ms | 0.45 ms | 0.61 ms |
+| 1M / 4M | 1.9 ms | 2.4 ms | 1.9 ms | 2.4 ms |
+
+BH = Barnes-Hut; NS = Negative Sampling (K=8); t-FDP defaults k=3. The earlier published table included host write-back into a string-keyed `Graph` object; these numbers measure the CSR path with zero host allocation per step except position export.
+
+### Remaining, in dependency order
+
+**Out-of-core positions/CSR (PBG/GOSH partition streaming).** Remaining is partition-streaming to support graphs larger than device memory: only nodes inside the current region tiles resident on device. The design choice is between tile-resident (only nodes inside current region tiles resident) vs partition-resident (fixed graph partitions swapped by the layout loop). This is the single prerequisite not landed; all other items from this section's 2026-01 plan are complete or folded into "Landed".
+
+Not planned: pairwise SGD stress inside a compute shader (single-pair
+updates conflict; the GPU-viable form is the sampled SGD of [2409.00876]),
+and hyperbolic optimisation in f32 (see [1804.03329]); hyperbolic
+*rendering* of a host-computed embedding is fine.
+
+Test-harness note: the `graph-layouts` *library* builds wgpu with
+`default-features = false` (no Metal/Vulkan/DX12 — native consumers bring
+those), and its GPU tests return early as a pass when no adapter exists. Until
+this change `cargo test -p graph-layouts` therefore never touched a device, and
+`unit_gpu_force_star_hub_stable` had been failing on every real GPU behind
+that skip (its hub-near-origin assertion pinned an equilibrium of a
+deliberately asymmetric seeding, not the Tigr hub-split contract). A
+native-only dev-dependency now enables `metal`/`dx12` for this crate's own
+test binaries, and the test asserts what it defends: finite positions, no
+stall, leaves bound to the hub. The 4.2 M-node dispatch test stays
+`#[ignore]`d (≈1 GB host allocation); run it with
+`cargo test -p graph-layouts --release --lib dispatch_past_cap -- --ignored`.
+
 ---
 
 ## References
@@ -263,3 +364,18 @@ Quality marked as classified by the research pass (primary = paper/official repo
 - [distfdl] Distributed force-directed graph layout and visualization. <https://www.researchgate.net/publication/262400359_Distributed_force-directed_graph_layout_and_visualization>
 - [jia] Jia et al., out-of-core/distributed graph processing, VLDB. <http://www.vldb.org/pvldb/vol11/p297-jia.pdf>
 - GPUGraphLayout — GPU-only Barnes-Hut ForceAtlas2. <https://github.com/govertb/GPUGraphLayout>
+- [2409.00876] Rapid GPU-Based Pangenome Graph Layout (SC'24). <https://arxiv.org/abs/2409.00876>
+- [2608.01907] SNAP-tFDP: Massively Scalable Graph Layouts via Sparse Negative Sampling. <https://arxiv.org/abs/2608.01907>
+- [2303.03964] Force-Directed Graph Layouts Revisited: A New Force Based on the T-Distribution (TVCG 2023). <https://arxiv.org/abs/2303.03964>
+- [2108.00529] BigGraphVis. <https://arxiv.org/abs/2108.00529>
+- [2002.08233] BatchLayout. <https://arxiv.org/abs/2002.08233>
+- [2008.07799] DRGraph (VIS 2020). <https://arxiv.org/abs/2008.07799>
+- [2008.12336] GOSH: Embedding Big Graphs on Small Hardware. <https://arxiv.org/abs/2008.12336>
+- [2110.10049] Boosting Graph Embedding on a Single GPU. <https://arxiv.org/abs/2110.10049>
+- [1903.00757] GraphVite. <https://arxiv.org/abs/1903.00757>
+- [1903.12287] PyTorch-BigGraph. <https://arxiv.org/abs/1903.12287>
+- [1506.06745] GraphMaps: Browsing Large Graphs as Interactive Maps. <https://arxiv.org/abs/1506.06745>
+- [0907.2585] GMap: Drawing Graphs as Maps (Gansner, Hu, Kobourov). <https://arxiv.org/abs/0907.2585> · <https://graphviz.org/documentation/GHK09.pdf>
+- [1804.03329] Representation Tradeoffs for Hyperbolic Embeddings. <https://arxiv.org/abs/1804.03329>
+- [2506.02219] Stochastic Barnes-Hut Approximation for Fast Summation on the GPU. <https://arxiv.org/abs/2506.02219>
+- Gansner & Hu, PRISM node-overlap removal (JGAA 2010) — post-process, not a layout engine. <https://graphviz.org/documentation/GH10.pdf>

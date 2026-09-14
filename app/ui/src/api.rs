@@ -10,12 +10,14 @@
 //! The base URL is configurable at runtime and persisted in local storage —
 //! localhost in dev, a LAN/Tailscale address from another device.
 
+use std::collections::BTreeMap;
+
 use dioxus::prelude::*;
 use gloo_net::http::Request;
 use gloo_storage::{LocalStorage, Storage};
 use prost::Message;
 use serde::{Deserialize, Serialize};
-
+use tracing;
 use crate::proto;
 
 const URL_KEY: &str = "jc_server_url";
@@ -153,24 +155,108 @@ fn session_storage() -> Option<web_sys::Storage> {
     None
 }
 
-/// The viewer's selected importer source id, or `None` for the deployment
-/// default. Session-scoped by design: the selection is a per-viewer graph
-/// view, never persisted across browser sessions or shared with other users.
-pub fn source_id() -> Option<String> {
-    let v = session_storage()
-        .and_then(|s| s.get_item(SOURCE_KEY).ok().flatten())
-        .unwrap_or_default();
-    let v = v.trim().to_string();
-    if v.is_empty() {
-        None
-    } else {
-        Some(v)
+/// A parsed source selection: a catalog source id plus optional per-request
+/// parameter values. The canonical string form — `id`, or `id?k1=v1&k2=v2`
+/// with keys sorted and both key and value percent-encoded — is the single
+/// wire token shared by the `x-jump-cannon-source` header, the layout WS
+/// `?source=`, `sessionStorage['jc_source_id']`, and the status/progress/retry
+/// route `{id}`. This mirrors `graph_api::source_host::SourceSelector` grammar
+/// byte for byte so a selection round-trips through either side.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SourceSelection {
+    pub id: String,
+    pub params: BTreeMap<String, String>,
+}
+
+impl SourceSelection {
+    /// Parse a canonical selection string. Rejects an empty id, a `?` with no
+    /// parameters, a parameter that is not `key=value`, an empty parameter
+    /// name, a repeated parameter, and invalid percent-encoding.
+    pub fn parse(raw: &str) -> Result<Self, String> {
+        let raw = raw.trim();
+        if raw.is_empty() {
+            return Err("empty source selection".to_owned());
+        }
+        let (id_part, query) = match raw.split_once('?') {
+            Some((id, query)) => (id, Some(query)),
+            None => (raw, None),
+        };
+        let id = decode_component(id_part)?;
+        if id.is_empty() {
+            return Err("source selection has an empty id".to_owned());
+        }
+        let mut params = BTreeMap::new();
+        if let Some(query) = query {
+            if query.is_empty() {
+                return Err("source selection has a '?' with no parameters".to_owned());
+            }
+            for pair in query.split('&') {
+                let (key, value) = pair.split_once('=').ok_or_else(|| {
+                    format!("source selection parameter {pair:?} is not key=value")
+                })?;
+                let key = decode_component(key)?;
+                let value = decode_component(value)?;
+                if key.is_empty() {
+                    return Err("source selection has a parameter with an empty name".to_owned());
+                }
+                if params.insert(key.clone(), value).is_some() {
+                    return Err(format!("source selection repeats parameter {key:?}"));
+                }
+            }
+        }
+        Ok(Self { id, params })
     }
 }
 
-pub fn set_source_id(id: &str) {
+impl std::fmt::Display for SourceSelection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", encode_component(&self.id))?;
+        if !self.params.is_empty() {
+            let query = self
+                .params
+                .iter()
+                .map(|(key, value)| {
+                    format!("{}={}", encode_component(key), encode_component(value))
+                })
+                .collect::<Vec<_>>()
+                .join("&");
+            write!(f, "?{query}")?;
+        }
+        Ok(())
+    }
+}
+
+fn decode_component(raw: &str) -> Result<String, String> {
+    urlencoding::decode(raw)
+        .map(std::borrow::Cow::into_owned)
+        .map_err(|error| format!("invalid percent-encoding {raw:?} in source selection: {error}"))
+}
+
+fn encode_component(raw: &str) -> String {
+    urlencoding::encode(raw).into_owned()
+}
+
+/// The viewer's selected importer source, or `None` for the deployment
+/// default. Session-scoped by design: the selection is a per-viewer graph
+/// view, never persisted across browser sessions or shared with other users.
+/// A stored value that no longer parses reads back as `None` (the default).
+pub fn source_selection() -> Option<SourceSelection> {
+    let raw = session_storage()
+        .and_then(|s| s.get_item(SOURCE_KEY).ok().flatten())
+        .unwrap_or_default();
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    SourceSelection::parse(raw).ok()
+}
+
+/// Persist the canonical selection string under [`SOURCE_KEY`]. The stored
+/// form is always `SourceSelection::Display`, so it round-trips through
+/// [`source_selection`] and matches every wire token the server expects.
+pub fn set_source_selection(selection: &SourceSelection) {
     if let Some(s) = session_storage() {
-        let _ = s.set_item(SOURCE_KEY, id.trim());
+        let _ = s.set_item(SOURCE_KEY, &selection.to_string());
     }
 }
 
@@ -185,22 +271,84 @@ pub fn clear_source_id() {
 /// other selection. Callers gate those routes on this instead of polling
 /// into a permanent 400 loop.
 pub fn on_default_source() -> bool {
-    source_id().is_none()
+    source_selection().is_none()
 }
 
 /// Inject the source-selection header when the viewer has switched sources.
-/// Sent unconditionally once set; default-source-only routes must be gated
-/// by the caller ([`on_default_source`]), not by reading their 400.
+/// The header carries the canonical selection string verbatim (the server
+/// reads it without further decoding). Sent unconditionally once set;
+/// default-source-only routes must be gated by the caller ([`on_default_source`]),
+/// not by reading their 400.
 pub(crate) fn with_source_header(
     req: gloo_net::http::RequestBuilder,
 ) -> gloo_net::http::RequestBuilder {
-    match source_id() {
-        Some(id) => req.header(SOURCE_HEADER, &id),
+    match source_selection() {
+        Some(selection) => req.header(SOURCE_HEADER, &selection.to_string()),
         None => req,
     }
 }
 
 pub type ApiResult<T> = Result<T, String>;
+
+#[derive(Clone, Debug, PartialEq, serde::Deserialize)]
+pub struct BuildStatus {
+    pub status: String,
+    pub source: String,
+    #[serde(default)]
+    pub elapsed_ms: Option<u64>,
+    #[serde(default)]
+    pub stage: Option<String>,
+    #[serde(default)]
+    pub detail: Option<String>,
+    #[serde(default)]
+    pub fraction: Option<f32>,
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum LoadError {
+    Building(BuildStatus),
+    Failed(BuildStatus),
+    Http { path: String, status: u16, body: String },
+    Other(String),
+}
+
+impl std::fmt::Display for LoadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LoadError::Building(bs) => {
+                let stage = bs.stage.as_deref().unwrap_or("unknown");
+                write!(f, "importing {}: {}", bs.source, stage)
+            }
+            LoadError::Failed(bs) => {
+                if let Some(err) = &bs.error {
+                    write!(f, "{}", err)
+                } else {
+                    write!(f, "import failed for {}", bs.source)
+                }
+            }
+            LoadError::Http { path, status, body } => {
+                let body = body.trim();
+                if body.is_empty() {
+                    write!(f, "{} -> HTTP {}", path, status)
+                } else {
+                    let body: String = body.chars().take(200).collect();
+                    write!(f, "{} -> HTTP {}: {}", path, status, body)
+                }
+            }
+            LoadError::Other(s) => write!(f, "{}", s),
+        }
+    }
+}
+
+impl From<String> for LoadError {
+    fn from(s: String) -> Self {
+        LoadError::Other(s)
+    }
+}
+
+pub type LoadResult<T> = Result<T, LoadError>;
 
 pub(crate) fn err<E: std::fmt::Display>(e: E) -> String {
     e.to_string()
@@ -341,39 +489,152 @@ fn graph_revision(resp: &gloo_net::http::Response) -> u64 {
         .unwrap_or(0)
 }
 
-async fn get_revisioned_json<T: serde::de::DeserializeOwned>(
+fn parse_build_status_from_body(body: &str) -> Option<BuildStatus> {
+    serde_json::from_str::<BuildStatus>(body).ok()
+}
+
+async fn get_revisioned_json_load<T: serde::de::DeserializeOwned>(
     path: &str,
-) -> ApiResult<Revisioned<T>> {
-    let resp = get(path).send().await.map_err(err)?;
-    if !resp.ok() {
-        return Err(status_error(path, resp).await);
+) -> LoadResult<Revisioned<T>> {
+    let resp = get(path).send().await.map_err(|e| LoadError::Other(e.to_string()))?;
+    let status = resp.status();
+    
+    if status == 202 {
+        let body = resp.text().await.map_err(|e| LoadError::Other(e.to_string()))?;
+        if let Some(bs) = parse_build_status_from_body(&body) {
+            tracing::debug!("202 building: {}", bs.source);
+            return Err(LoadError::Building(bs));
+        }
     }
+    
+    if status == 503 {
+        let body = resp.text().await.map_err(|e| LoadError::Other(e.to_string()))?;
+        if let Some(bs) = parse_build_status_from_body(&body) {
+            if bs.status == "failed" {
+                tracing::debug!("503 failed: {}", bs.source);
+                return Err(LoadError::Failed(bs));
+            }
+        }
+        return Err(LoadError::Http {
+            path: path.to_string(),
+            status,
+            body,
+        });
+    }
+    
+    if !resp.ok() {
+        let body = resp.text().await.map_err(|e| LoadError::Other(e.to_string()))?;
+        return Err(LoadError::Http {
+            path: path.to_string(),
+            status,
+            body,
+        });
+    }
+    
     let revision = graph_revision(&resp);
-    let value = resp.json().await.map_err(err)?;
+    let value = resp.json().await.map_err(|e| LoadError::Other(e.to_string()))?;
+    Ok(Revisioned { revision, value })
+}
+
+async fn get_revisioned_bytes_load(path: &str) -> LoadResult<Revisioned<Vec<u8>>> {
+    let resp = get(path).send().await.map_err(|e| LoadError::Other(e.to_string()))?;
+    let status = resp.status();
+    
+    if status == 202 {
+        let body = resp.text().await.map_err(|e| LoadError::Other(e.to_string()))?;
+        if let Some(bs) = parse_build_status_from_body(&body) {
+            tracing::debug!("202 building: {}", bs.source);
+            return Err(LoadError::Building(bs));
+        }
+    }
+    
+    if status == 503 {
+        let body = resp.text().await.map_err(|e| LoadError::Other(e.to_string()))?;
+        if let Some(bs) = parse_build_status_from_body(&body) {
+            if bs.status == "failed" {
+                tracing::debug!("503 failed: {}", bs.source);
+                return Err(LoadError::Failed(bs));
+            }
+        }
+        return Err(LoadError::Http {
+            path: path.to_string(),
+            status,
+            body,
+        });
+    }
+    
+    if !resp.ok() {
+        let body = resp.text().await.map_err(|e| LoadError::Other(e.to_string()))?;
+        return Err(LoadError::Http {
+            path: path.to_string(),
+            status,
+            body,
+        });
+    }
+    
+    let revision = graph_revision(&resp);
+    let value = resp.binary().await.map_err(|e| LoadError::Other(e.to_string()))?;
     Ok(Revisioned { revision, value })
 }
 
 async fn get_revisioned_bytes(path: &str) -> ApiResult<Revisioned<Vec<u8>>> {
-    let resp = get(path).send().await.map_err(err)?;
-    if !resp.ok() {
-        return Err(status_error(path, resp).await);
+    get_revisioned_bytes_load(path)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+pub(crate) async fn get_bytes_load(path: &str) -> LoadResult<Vec<u8>> {
+    let resp = get(path).send().await.map_err(|e| LoadError::Other(e.to_string()))?;
+    let status = resp.status();
+    
+    if status == 202 {
+        let body = resp.text().await.map_err(|e| LoadError::Other(e.to_string()))?;
+        if let Some(bs) = parse_build_status_from_body(&body) {
+            tracing::debug!("202 building: {}", bs.source);
+            return Err(LoadError::Building(bs));
+        }
     }
-    let revision = graph_revision(&resp);
-    let value = resp.binary().await.map_err(err)?;
-    Ok(Revisioned { revision, value })
+    
+    if status == 503 {
+        let body = resp.text().await.map_err(|e| LoadError::Other(e.to_string()))?;
+        if let Some(bs) = parse_build_status_from_body(&body) {
+            if bs.status == "failed" {
+                tracing::debug!("503 failed: {}", bs.source);
+                return Err(LoadError::Failed(bs));
+            }
+        }
+        return Err(LoadError::Http {
+            path: path.to_string(),
+            status,
+            body,
+        });
+    }
+    
+    if !resp.ok() {
+        let body = resp.text().await.map_err(|e| LoadError::Other(e.to_string()))?;
+        return Err(LoadError::Http {
+            path: path.to_string(),
+            status,
+            body,
+        });
+    }
+    
+    resp.binary().await.map_err(|e| LoadError::Other(e.to_string()))
 }
 
 pub(crate) async fn get_bytes(path: &str) -> ApiResult<Vec<u8>> {
-    let resp = get(path).send().await.map_err(err)?;
-    if !resp.ok() {
-        return Err(status_error(path, resp).await);
-    }
-    resp.binary().await.map_err(err)
+    get_bytes_load(path).await.map_err(|e| e.to_string())
+}
+
+pub(crate) async fn get_proto_load<T: Message + Default>(path: &str) -> LoadResult<T> {
+    let bytes = get_bytes_load(path).await?;
+    T::decode(bytes.as_slice()).map_err(|e| LoadError::Other(e.to_string()))
 }
 
 pub(crate) async fn get_proto<T: Message + Default>(path: &str) -> ApiResult<T> {
-    let bytes = get_bytes(path).await?;
-    T::decode(bytes.as_slice()).map_err(err)
+    get_proto_load::<T>(path)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 fn f32s(bytes: &[u8]) -> Vec<f32> {
@@ -392,19 +653,10 @@ fn u32s(bytes: &[u8]) -> Vec<u32> {
 
 // --- graph data ---------------------------------------------------------------
 
-/// `/graph/init` — node/edge counts, community/wcc counts, color palette.
-pub async fn init() -> ApiResult<proto::Init> {
-    get_proto("/graph/init").await
-}
-
 /// `/graph/ids` — node ids in the same order as the binary buffers.
 #[allow(dead_code)] // revision-aware bootstrap uses revisioned_ids
 pub async fn ids() -> ApiResult<Vec<String>> {
     get_json("/graph/ids").await
-}
-
-pub(crate) async fn revisioned_ids() -> ApiResult<Revisioned<Vec<String>>> {
-    get_revisioned_json("/graph/ids").await
 }
 
 /// `/graph/positions` — flat [x0, y0, x1, y1, …] f32 buffer.
@@ -424,8 +676,20 @@ pub async fn edges() -> ApiResult<Vec<u32>> {
     Ok(u32s(&get_bytes("/graph/edges").await?))
 }
 
-pub(crate) async fn revisioned_edges() -> ApiResult<Revisioned<Vec<u32>>> {
-    let r = get_revisioned_bytes("/graph/edges").await?;
+/// LoadResult variant of init
+pub async fn init_load() -> LoadResult<proto::Init> {
+    get_proto_load("/graph/init").await
+}
+
+
+/// LoadResult variant of revisioned_ids
+pub async fn revisioned_ids_load() -> LoadResult<Revisioned<Vec<String>>> {
+    get_revisioned_json_load("/graph/ids").await
+}
+
+/// LoadResult variant of revisioned_edges
+pub async fn revisioned_edges_load() -> LoadResult<Revisioned<Vec<u32>>> {
+    let r = get_revisioned_bytes_load("/graph/edges").await?;
     Ok(Revisioned {
         revision: r.revision,
         value: u32s(&r.value),
@@ -639,6 +903,15 @@ pub struct ImporterProfile {
     pub source: Option<ImporterFilesystemSource>,
     #[serde(default)]
     pub producer: Option<ImporterProducer>,
+    /// Runtime parameter names this source declares (Hindsight's `bank`, a
+    /// tvix generator's `nodes`/`seed`/…). A non-empty list means the row
+    /// needs a parameter picker before Apply. Always present (empty when none).
+    #[serde(default)]
+    pub parameters: Vec<String>,
+    /// The tvix package binding when this source is a generator (`kind =
+    /// "tvix"`): the Nix package path plus its statically-bound variables.
+    #[serde(default)]
+    pub tvix: Option<ImporterTvixSource>,
 }
 
 fn default_origin() -> String {
@@ -665,6 +938,51 @@ pub struct ImporterProducer {
     pub workflow_input: String,
     pub existing_claim_value_path: String,
     pub existing_claim_value: String,
+}
+
+/// A generator source's tvix package binding (`GET /importers` `tvix` block),
+/// mirroring `graph_api::importer_catalog::ImporterTvixSource`: the package
+/// path and the variables bound statically in the catalog. Per-request
+/// variables the viewer overrides arrive through [`ImporterProfile::parameters`].
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ImporterTvixSource {
+    pub package: String,
+    #[serde(default)]
+    pub variables: BTreeMap<String, String>,
+}
+
+/// One selectable value for a parameter: its wire id and a human label.
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+pub struct ParameterValue {
+    pub id: String,
+    pub label: String,
+}
+
+/// One parameter's resolved picker (`GET /importers/sources/{id}/parameters`):
+/// its label, the pre-selected default, the available values (discovered then
+/// static, deduped), whether live discovery succeeded, and any discovery error
+/// (values then fall back to the static list).
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+pub struct SourceParameter {
+    pub label: String,
+    #[serde(default)]
+    pub default: Option<String>,
+    #[serde(default)]
+    pub values: Vec<ParameterValue>,
+    #[serde(default)]
+    pub discovered: bool,
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
+/// `GET /importers/sources/{id}/parameters` body: the source id and its
+/// per-parameter pickers, keyed by parameter name.
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+pub struct SourceParameters {
+    pub source: String,
+    #[serde(default)]
+    pub parameters: BTreeMap<String, SourceParameter>,
 }
 
 /// `GET /importers` — deployment-selectable source profiles and the importer
@@ -896,6 +1214,107 @@ pub async fn progress(since: u64) -> ApiResult<ProgressResponse> {
     get_json(&format!("/progress?since={since}")).await
 }
 
+/// `GET /progress?since=<seq>` against the deployment default source,
+/// bypassing the session's source selection.
+///
+/// `/progress` resolves the selected source through the same extractor as
+/// every graph fetch, and each alternate owns its own progress log, so a poll
+/// carrying `x-jump-cannon-source` blocks behind the very build it would
+/// report on. The default source's log is the only one reachable while an
+/// alternate builds.
+#[allow(dead_code)] // source-scoped progress polling replaced the default-log tail in the Importers panel
+pub async fn progress_default(since: u64) -> ApiResult<ProgressResponse> {
+    let req = Request::get(&url(&format!("/progress?since={since}")))
+        .cache(web_sys::RequestCache::NoStore);
+    let req = if WORLD_BASE.read().is_some() {
+        req.header("x-user", &user_name())
+    } else {
+        req
+    };
+    req.send().await.map_err(err)?.json().await.map_err(err)
+}
+
+/// `GET /importers/sources/{id}/status` — build status for an alternate source.
+/// The canonical selection is URL-encoded once into the `{id}` path segment
+/// (the server's `Path` extractor decodes it once, back to the canonical form).
+pub async fn source_status(selection: &SourceSelection) -> ApiResult<BuildStatus> {
+    let canonical = selection.to_string();
+    let encoded = urlencoding::encode(&canonical);
+    let path = format!("/importers/sources/{encoded}/status");
+    let req = Request::get(&url(&path)).cache(web_sys::RequestCache::NoStore);
+    let req = if WORLD_BASE.read().is_some() {
+        req.header("x-user", &user_name())
+    } else {
+        req
+    };
+    req.send()
+        .await
+        .map_err(err)?
+        .json()
+        .await
+        .map_err(err)
+}
+
+/// `GET /importers/sources/{id}/progress?since=<seq>` — progress log for an alternate source.
+pub async fn source_progress(
+    selection: &SourceSelection,
+    since: u64,
+) -> ApiResult<ProgressResponse> {
+    let canonical = selection.to_string();
+    let encoded = urlencoding::encode(&canonical);
+    let path = format!("/importers/sources/{encoded}/progress?since={since}");
+    let req = Request::get(&url(&path)).cache(web_sys::RequestCache::NoStore);
+    let req = if WORLD_BASE.read().is_some() {
+        req.header("x-user", &user_name())
+    } else {
+        req
+    };
+    req.send()
+        .await
+        .map_err(err)?
+        .json()
+        .await
+        .map_err(err)
+}
+
+/// `POST /importers/sources/{id}/retry` — retry a failed build.
+pub async fn source_retry(selection: &SourceSelection) -> ApiResult<BuildStatus> {
+    let canonical = selection.to_string();
+    let encoded = urlencoding::encode(&canonical);
+    let path = format!("/importers/sources/{encoded}/retry");
+    let req = Request::post(&url(&path));
+    let req = if WORLD_BASE.read().is_some() {
+        req.header("x-user", &user_name())
+    } else {
+        req
+    };
+    req.send()
+        .await
+        .map_err(err)?
+        .json()
+        .await
+        .map_err(err)
+}
+
+/// `GET /importers/sources/{id}/parameters` — the source's per-request parameter
+/// pickers, with any live discovery already run server-side. Keyed by the bare
+/// catalog source id (no parameters); the picker's own values seed a selection.
+pub async fn source_parameters(id: &str) -> ApiResult<SourceParameters> {
+    let encoded = urlencoding::encode(id);
+    let path = format!("/importers/sources/{encoded}/parameters");
+    let req = Request::get(&url(&path)).cache(web_sys::RequestCache::NoStore);
+    let req = if WORLD_BASE.read().is_some() {
+        req.header("x-user", &user_name())
+    } else {
+        req
+    };
+    req.send()
+        .await
+        .map_err(err)?
+        .json()
+        .await
+        .map_err(err)
+}
 #[allow(dead_code)] // not surfaced in a panel yet — /configs is dev-only on the server
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct ConfigEntry {

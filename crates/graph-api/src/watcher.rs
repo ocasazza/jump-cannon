@@ -583,8 +583,8 @@ fn is_relevant(
 mod tests {
     use super::*;
     use data_loader::{
-        DiscoveryField, DiscoveryFieldType, EdgeTypeSchema, ImportError, ImportFuture, Importer,
-        ImportOutcome, ImporterDescriptor, ImporterSchema, LoadResult, SearchDocument,
+        DiscoveryField, DiscoveryFieldType, EdgeTypeSchema, ImportError, ImportFuture, ImportOutcome,
+        ImportProgress, Importer, ImporterDescriptor, ImporterSchema, LoadResult, SearchDocument,
         TagHierarchySchema,
     };
     use vault_data::{VaultGraph, VaultNode};
@@ -645,7 +645,10 @@ mod tests {
             )
         }
 
-        fn import<'a>(&'a self) -> ImportFuture<'a, Result<ImportOutcome, ImportError>> {
+        fn import<'a>(
+            &'a self,
+            _progress: &'a dyn ImportProgress,
+        ) -> ImportFuture<'a, Result<ImportOutcome, ImportError>> {
             Box::pin(async {
                 Err(ImportError::SourceRead {
                     origin: "test".into(),
@@ -680,7 +683,10 @@ mod tests {
             .with_watch(WatchPlan::Poll { interval_ms: 100 })
         }
 
-        fn import<'a>(&'a self) -> ImportFuture<'a, Result<ImportOutcome, ImportError>> {
+        fn import<'a>(
+            &'a self,
+            _progress: &'a dyn ImportProgress,
+        ) -> ImportFuture<'a, Result<ImportOutcome, ImportError>> {
             Box::pin(async {
                 Ok(ImportOutcome::Loaded(LoadResult {
                     graph: VaultGraph::new(),
@@ -852,7 +858,10 @@ mod tests {
             )
         }
 
-        fn import<'a>(&'a self) -> ImportFuture<'a, Result<ImportOutcome, ImportError>> {
+        fn import<'a>(
+            &'a self,
+            _progress: &'a dyn ImportProgress,
+        ) -> ImportFuture<'a, Result<ImportOutcome, ImportError>> {
             Box::pin(async { Ok(ImportOutcome::Unchanged) })
         }
     }

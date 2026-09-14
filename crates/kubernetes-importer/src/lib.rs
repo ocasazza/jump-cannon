@@ -12,7 +12,7 @@ use std::collections::{BTreeMap, HashMap};
 
 use data_loader::{
     identity::Namespace, Capability, DecodedRecord, Decoder, DiscoveryField, DiscoveryFieldType,
-    EdgeTypeSchema, Effect, GraphMapper, ImportError, ImportFuture, ImportPipeline,
+    EdgeTypeSchema, Effect, GraphMapper, ImportError, ImportFuture, ImportPipeline, ImportProgress,
     ImporterDescriptor, ImporterSchema, LoadResult, SearchDocument, SourceConnector, SourceRecord,
     TagHierarchySchema, Transport, WatchPlan,
 };
@@ -518,7 +518,10 @@ impl SourceConnector for KubernetesConnector {
         self.config.capabilities(effect)
     }
 
-    fn read<'a>(&'a self) -> ImportFuture<'a, Result<Vec<SourceRecord>, ImportError>> {
+    fn read<'a>(
+        &'a self,
+        _progress: &'a dyn ImportProgress,
+    ) -> ImportFuture<'a, Result<Vec<SourceRecord>, ImportError>> {
         Box::pin(async move { self.list().await })
     }
 }
@@ -1198,7 +1201,10 @@ mod tests {
             )
         }
 
-        fn import<'a>(&'a self) -> ImportFuture<'a, Result<ImportOutcome, ImportError>> {
+        fn import<'a>(
+            &'a self,
+            _progress: &'a dyn ImportProgress,
+        ) -> ImportFuture<'a, Result<ImportOutcome, ImportError>> {
             Box::pin(async move {
                 let loaded = KubernetesGraphMapper::new("test", false).map(self.records.clone())?;
                 Ok(ImportOutcome::Loaded(loaded))

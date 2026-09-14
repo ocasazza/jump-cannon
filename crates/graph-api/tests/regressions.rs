@@ -5,6 +5,7 @@
 //! avoiding the need for a real TCP socket / async runtime spin-up.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::body::{to_bytes, Body};
 use axum::http::{Request, StatusCode};
@@ -13,8 +14,9 @@ use tower::ServiceExt; // for `oneshot`
 
 use data_loader::{
     Capability, ContentSchema, DiscoveryField, DiscoveryFieldType, EdgeTypeSchema, Effect,
-    HostedImporter, ImportError, ImportFuture, ImportOutcome, Importer, ImporterDescriptor,
-    ImporterSchema, LoadResult, Loader, SearchDocument, TagHierarchySchema, Transport,
+    HostedImporter, ImportError, ImportFuture, ImportOutcome, ImportProgress, Importer,
+    ImporterDescriptor, ImporterSchema, LoadResult, Loader, SearchDocument, TagHierarchySchema,
+    Transport,
 };
 use graph_api::importer_catalog::ImporterCatalog;
 use graph_api::proto::{Init, MetaSummary, NodeMeta};
@@ -131,7 +133,10 @@ impl Importer for DeclaredButUngrantedWrite {
         )
     }
 
-    fn import<'a>(&'a self) -> ImportFuture<'a, Result<ImportOutcome, ImportError>> {
+    fn import<'a>(
+        &'a self,
+        _progress: &'a dyn ImportProgress,
+    ) -> ImportFuture<'a, Result<ImportOutcome, ImportError>> {
         Box::pin(async { Ok(ImportOutcome::Loaded(load_result(VaultGraph::new()))) })
     }
 }
@@ -912,7 +917,7 @@ fn switch_catalog_json(vault: &std::path::Path) -> String {
     serde_json::json!({
         "selected": "default-gen",
         "sources": {
-            "default-gen": { "displayName": "Default generated", "kind": "generate" },
+            "default-gen": { "displayName": "Default generated", "kind": "pest" },
             "alt-vault": {
                 "displayName": "Alt vault",
                 "kind": "obsidian",
@@ -945,7 +950,7 @@ fn switch_catalog_json(vault: &std::path::Path) -> String {
 fn switch_host(catalog_raw: &str, group: Option<&str>) -> SourceHost {
     let catalog = ImporterCatalog::parse_with_runtime_switch(
         Some(catalog_raw),
-        data_loader::SourceKind::Generate,
+        data_loader::SourceKind::Pest,
         group.is_some(),
     )
     .expect("switch catalog parses");
@@ -957,6 +962,14 @@ fn switch_host(catalog_raw: &str, group: Option<&str>) -> SourceHost {
 
 fn source_request(path: &str, source: &str, groups: Option<&str>) -> Request<Body> {
     let mut builder = Request::builder().uri(path).header(SOURCE_HEADER, source);
+    if let Some(groups) = groups {
+        builder = builder.header(GROUPS_HEADER, groups);
+    }
+    builder.body(Body::empty()).unwrap()
+}
+
+fn source_status_request(id: &str, groups: Option<&str>) -> Request<Body> {
+    let mut builder = Request::builder().uri(format!("/importers/sources/{id}/status"));
     if let Some(groups) = groups {
         builder = builder.header(GROUPS_HEADER, groups);
     }
@@ -979,7 +992,7 @@ async fn runtime_switch_disabled_ignores_selection_header() {
     let vault = fixture_vault("disabled");
     let catalog = ImporterCatalog::parse(
         Some(&switch_catalog_json(&vault)),
-        data_loader::SourceKind::Generate,
+        data_loader::SourceKind::Pest,
     )
     .expect("strict catalog parse");
     let app = graph_api::router_with_host(SourceHost::default_only(state_with_catalog(catalog)));
@@ -1088,9 +1101,9 @@ async fn runtime_switch_builds_alternate_lazily_and_isolates_state() {
     .expect("default ids JSON");
     assert!(default_ids.is_empty());
 
-    // First selection of an unbuilt alternate starts a background build and
-    // answers 503 + Retry-After with the `building importer source` marker.
-    let started = app
+    // The first authorized request spawns the build and answers 202 while it
+    // runs — it never awaits the import.
+    let building = app
         .clone()
         .oneshot(source_request(
             "/graph/ids",
@@ -1098,31 +1111,17 @@ async fn runtime_switch_builds_alternate_lazily_and_isolates_state() {
             Some(SWITCH_GROUP),
         ))
         .await
-        .expect("alternate ids request served");
-    assert_eq!(started.status(), StatusCode::SERVICE_UNAVAILABLE);
+        .expect("alternate ids served");
     assert_eq!(
-        started
-            .headers()
-            .get("retry-after")
-            .and_then(|v| v.to_str().ok()),
-        Some("2")
-    );
-    let body = String::from_utf8(
-        to_bytes(started.into_body(), 1 << 20)
-            .await
-            .expect("building body")
-            .to_vec(),
-    )
-    .expect("building body text");
-    assert!(
-        body.starts_with("building importer source"),
-        "building marker: {body}"
+        building.status(),
+        StatusCode::ACCEPTED,
+        "the first request reports building, not the built graph"
     );
 
-    // The build completes in the background; the retry loop the client runs
-    // converges on the alternate's serving state.
-    let alt_response = loop {
-        let response = app
+    // Poll until the background build completes and the alternate serves.
+    let mut alt_response = None;
+    for _ in 0..300 {
+        let resp = app
             .clone()
             .oneshot(source_request(
                 "/graph/ids",
@@ -1131,16 +1130,16 @@ async fn runtime_switch_builds_alternate_lazily_and_isolates_state() {
             ))
             .await
             .expect("alternate ids served");
-        if response.status() == StatusCode::OK {
-            break response;
+        match resp.status() {
+            StatusCode::OK => {
+                alt_response = Some(resp);
+                break;
+            }
+            StatusCode::ACCEPTED => tokio::time::sleep(Duration::from_millis(10)).await,
+            other => panic!("unexpected status while building alternate: {other}"),
         }
-        assert_eq!(
-            response.status(),
-            StatusCode::SERVICE_UNAVAILABLE,
-            "retry sees building or success, nothing else"
-        );
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-    };
+    }
+    let alt_response = alt_response.expect("alternate finishes building and serves");
     let alt_revision = response_revision(&alt_response);
     assert_ne!(alt_revision, default_revision);
     let alt_ids: Vec<String> = serde_json::from_slice(
@@ -1313,7 +1312,10 @@ async fn runtime_switch_error_contract() {
         .expect("not-runnable served");
     assert_eq!(not_runnable.status(), StatusCode::BAD_REQUEST);
 
-    for attempt in 0..2 {
+    // The OKF build (nonexistent root) fails asynchronously: the first request
+    // reports 202 building, then the cached failure surfaces as 503 JSON.
+    let mut failed = false;
+    for _ in 0..300 {
         let broken = app
             .clone()
             .oneshot(source_request(
@@ -1323,12 +1325,98 @@ async fn runtime_switch_error_contract() {
             ))
             .await
             .expect("broken served");
-        assert_eq!(
-            broken.status(),
-            StatusCode::SERVICE_UNAVAILABLE,
-            "attempt {attempt}: cached build failure must surface as 503"
-        );
+        match broken.status() {
+            StatusCode::SERVICE_UNAVAILABLE => {
+                let body = json_body(broken).await;
+                assert_eq!(body["status"], "failed");
+                assert_eq!(body["source"], "broken-okf");
+                assert!(
+                    body["error"].is_string(),
+                    "the 503 body carries the failure message"
+                );
+                failed = true;
+                break;
+            }
+            StatusCode::ACCEPTED => tokio::time::sleep(Duration::from_millis(10)).await,
+            other => panic!("unexpected status for a failing build: {other}"),
+        }
     }
+    assert!(failed, "the broken OKF build eventually caches as 503");
+
+    // The cached failure is replayed, not rebuilt, on the next request.
+    let again = app
+        .oneshot(source_request(
+            "/graph/ids",
+            "broken-okf",
+            Some(SWITCH_GROUP),
+        ))
+        .await
+        .expect("broken served again");
+    assert_eq!(again.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+    let _ = std::fs::remove_dir_all(&vault);
+}
+
+/// The `/importers/sources/:id/status` route is mounted and reports the
+/// alternate's lifecycle without ever blocking or 503-ing: idle before a
+/// build, 404 for an unknown id, 403 without the group, then building→serving.
+#[tokio::test]
+async fn source_status_route_reports_lifecycle() {
+    let vault = fixture_vault("status-route");
+    let host = switch_host(&switch_catalog_json(&vault), Some(SWITCH_GROUP));
+    let app = graph_api::router_with_host(host);
+
+    let idle = app
+        .clone()
+        .oneshot(source_status_request("alt-vault", Some(SWITCH_GROUP)))
+        .await
+        .expect("status served");
+    assert_eq!(idle.status(), StatusCode::OK);
+    let idle = json_body(idle).await;
+    assert_eq!(idle["status"], "idle");
+    assert_eq!(idle["source"], "alt-vault");
+
+    let unknown = app
+        .clone()
+        .oneshot(source_status_request("no-such-source", Some(SWITCH_GROUP)))
+        .await
+        .expect("status served");
+    assert_eq!(unknown.status(), StatusCode::NOT_FOUND);
+
+    let forbidden = app
+        .clone()
+        .oneshot(source_status_request("alt-vault", None))
+        .await
+        .expect("status served");
+    assert_eq!(forbidden.status(), StatusCode::FORBIDDEN);
+
+    // Kick off the build through a graph route, then poll the status route.
+    let kick = app
+        .clone()
+        .oneshot(source_request("/graph/ids", "alt-vault", Some(SWITCH_GROUP)))
+        .await
+        .expect("kick served");
+    assert_eq!(kick.status(), StatusCode::ACCEPTED);
+
+    let mut serving = false;
+    for _ in 0..300 {
+        let status = app
+            .clone()
+            .oneshot(source_status_request("alt-vault", Some(SWITCH_GROUP)))
+            .await
+            .expect("status served");
+        assert_eq!(status.status(), StatusCode::OK, "status never 503s");
+        let body = json_body(status).await;
+        match body["status"].as_str().expect("status string") {
+            "serving" => {
+                serving = true;
+                break;
+            }
+            "building" => tokio::time::sleep(Duration::from_millis(10)).await,
+            other => panic!("unexpected status {other}"),
+        }
+    }
+    assert!(serving, "the alternate reaches serving through the status route");
 
     let _ = std::fs::remove_dir_all(&vault);
 }
@@ -1348,7 +1436,7 @@ fn packages_fixture(tag: &str) -> (std::path::PathBuf, String) {
     let catalog = serde_json::json!({
         "selected": "default-gen",
         "sources": {
-            "default-gen": { "displayName": "Default generated", "kind": "generate" },
+            "default-gen": { "displayName": "Default generated", "kind": "pest" },
             "hindsight": {
                 "displayName": "Hindsight",
                 "kind": "httpjson",
@@ -1367,7 +1455,7 @@ fn packages_fixture(tag: &str) -> (std::path::PathBuf, String) {
 fn packages_host(dir: &std::path::Path, catalog_raw: &str, group: Option<&str>) -> SourceHost {
     let mut catalog = ImporterCatalog::parse_with_runtime_switch(
         Some(catalog_raw),
-        data_loader::SourceKind::Generate,
+        data_loader::SourceKind::Pest,
         group.is_some(),
     )
     .expect("catalog parses");
@@ -1605,6 +1693,210 @@ async fn importers_post_adds_runtime_source_and_persists_overlay() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+// ── Parameterised sources: coverage validation + live discovery ──────────────
+
+/// A packages dir holding the shipped hindsight package plus a catalog binding
+/// it as `hindsight` with the given `httpJson`/`parameters` JSON fragments.
+fn param_packages_fixture(tag: &str, hindsight: serde_json::Value) -> (std::path::PathBuf, String) {
+    let dir = std::env::temp_dir().join(format!("jump-cannon-pkgs-{}-{tag}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("packages dir");
+    std::fs::write(dir.join("hindsight.toml"), TOML_PACKAGE).expect("package file");
+    let mut source = serde_json::json!({
+        "displayName": "Hindsight",
+        "kind": "httpjson",
+    });
+    let object = source.as_object_mut().unwrap();
+    for (key, value) in hindsight.as_object().unwrap() {
+        object.insert(key.clone(), value.clone());
+    }
+    let catalog = serde_json::json!({
+        "selected": "default-gen",
+        "sources": {
+            "default-gen": { "displayName": "Default", "kind": "pest" },
+            "hindsight": source,
+        }
+    })
+    .to_string();
+    (dir, catalog)
+}
+
+/// (c) Selecting an httpjson source whose package requires `bank` (no default)
+/// but neither binds it in `variables` nor declares it as a parameter is a 400
+/// naming the uncovered variable — a misconfigured catalog fails loudly rather
+/// than as an opaque build failure.
+#[tokio::test]
+async fn selecting_source_missing_required_package_variable_is_bad_request() {
+    let (dir, catalog) = param_packages_fixture(
+        "coverage",
+        serde_json::json!({
+            "httpJson": {
+                "package": "hindsight.toml",
+                "endpoint": "http://hindsight.invalid",
+                "variables": { "tenant": "default" }
+            }
+        }),
+    );
+    let host = packages_host(&dir, &catalog, Some(SWITCH_GROUP));
+    let app = graph_api::router_with_host(host);
+
+    let response = app
+        .oneshot(source_request("/graph/ids", "hindsight", Some(SWITCH_GROUP)))
+        .await
+        .expect("served");
+    assert_eq!(
+        response.status(),
+        StatusCode::BAD_REQUEST,
+        "a required package variable that is neither bound nor parameterised is a 400"
+    );
+    let body = text_body(response).await;
+    assert!(
+        body.contains("bank"),
+        "the error names the uncovered variable: {body}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Spawn an in-process HTTP server that answers `GET /v1/default/banks` with the
+/// given status and body, returning its base URL and the serving task.
+async fn spawn_banks_server(
+    status: StatusCode,
+    body: &'static str,
+) -> (String, tokio::task::JoinHandle<()>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind mock banks server");
+    let addr = listener.local_addr().expect("mock addr");
+    let app = axum::Router::new().route(
+        "/v1/default/banks",
+        axum::routing::get(move || async move { (status, body) }),
+    );
+    let handle = tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    (format!("http://{addr}"), handle)
+}
+
+fn parameters_request(id: &str, groups: Option<&str>) -> Request<Body> {
+    let mut builder = Request::builder().uri(format!("/importers/sources/{id}/parameters"));
+    if let Some(groups) = groups {
+        builder = builder.header(GROUPS_HEADER, groups);
+    }
+    builder.body(Body::empty()).unwrap()
+}
+
+/// (d) `/parameters` runs live discovery against the bound API: a healthy
+/// endpoint yields the discovered ids and labels; a 500 falls back to the
+/// static `values` with the error surfaced.
+#[tokio::test]
+async fn parameters_route_discovers_values_and_falls_back_on_error() {
+    // Healthy discovery endpoint.
+    let (url, server) = spawn_banks_server(
+        StatusCode::OK,
+        r#"{"banks":[{"bank_id":"omp","name":"OMP"},{"bank_id":"jira-ithelp","name":"Jira ITHELP"}]}"#,
+    )
+    .await;
+    let (dir, catalog) = param_packages_fixture(
+        "discover-ok",
+        serde_json::json!({
+            "httpJson": {
+                "package": "hindsight.toml",
+                "endpoint": url,
+                "variables": {}
+            },
+            "parameters": {
+                "bank": {
+                    "label": "Memory bank",
+                    "discover": {
+                        "path": "/v1/{tenant}/banks",
+                        "itemsPointer": "/banks",
+                        "idPointer": "/bank_id",
+                        "labelPointer": "/name"
+                    },
+                    "values": ["omp"]
+                }
+            }
+        }),
+    );
+    let host = packages_host(&dir, &catalog, Some(SWITCH_GROUP));
+    let app = graph_api::router_with_host(host);
+
+    let response = app
+        .oneshot(parameters_request("hindsight", Some(SWITCH_GROUP)))
+        .await
+        .expect("parameters served");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = json_body(response).await;
+    assert_eq!(body["source"], "hindsight");
+    let bank = &body["parameters"]["bank"];
+    assert_eq!(bank["label"], "Memory bank");
+    assert_eq!(bank["discovered"], true);
+    assert!(bank["error"].is_null(), "no error on a healthy discovery");
+    let values = bank["values"].as_array().expect("values array");
+    assert!(
+        values
+            .iter()
+            .any(|value| value["id"] == "omp" && value["label"] == "OMP"),
+        "discovered omp with its label: {values:?}"
+    );
+    assert!(
+        values
+            .iter()
+            .any(|value| value["id"] == "jira-ithelp" && value["label"] == "Jira ITHELP"),
+        "discovered jira-ithelp with its label: {values:?}"
+    );
+    server.abort();
+    let _ = std::fs::remove_dir_all(&dir);
+
+    // Discovery endpoint returning 500: fall back to the static values, with the
+    // error surfaced.
+    let (url, server) = spawn_banks_server(StatusCode::INTERNAL_SERVER_ERROR, "boom").await;
+    let (dir, catalog) = param_packages_fixture(
+        "discover-500",
+        serde_json::json!({
+            "httpJson": {
+                "package": "hindsight.toml",
+                "endpoint": url,
+                "variables": {}
+            },
+            "parameters": {
+                "bank": {
+                    "label": "Memory bank",
+                    "discover": {
+                        "path": "/v1/{tenant}/banks",
+                        "itemsPointer": "/banks",
+                        "idPointer": "/bank_id",
+                        "labelPointer": "/name"
+                    },
+                    "values": ["fallback-a", "fallback-b"]
+                }
+            }
+        }),
+    );
+    let host = packages_host(&dir, &catalog, Some(SWITCH_GROUP));
+    let app = graph_api::router_with_host(host);
+
+    let response = app
+        .oneshot(parameters_request("hindsight", Some(SWITCH_GROUP)))
+        .await
+        .expect("parameters served");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = json_body(response).await;
+    let bank = &body["parameters"]["bank"];
+    assert_eq!(bank["discovered"], false, "discovery failed");
+    assert!(bank["error"].is_string(), "the discovery error is surfaced");
+    let values = bank["values"].as_array().expect("values array");
+    let ids: Vec<&str> = values.iter().map(|value| value["id"].as_str().unwrap()).collect();
+    assert_eq!(
+        ids,
+        vec!["fallback-a", "fallback-b"],
+        "falls back to the static values"
+    );
+    server.abort();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// GET/PUT /importers/:id/variables: the declared/current contract with the
 /// catalog's read posture, switch-gated mutation, key validation against the
 /// package's declared variables, persistence to `variables.local.json`, the
@@ -1700,15 +1992,16 @@ async fn importer_variables_get_and_put_contract() {
     );
     assert!(!dir.join("variables.local.json").exists());
 
-    // Selecting the source starts a lazy build (the fixture endpoint is
-    // unreachable, so the entry settles as a cached failure — either way an
-    // alternate entry now exists to invalidate).
+    // Selecting the source spawns a lazy build and answers 202 while it runs
+    // (the fixture endpoint is unreachable, so it settles as a cached failure
+    // in the background) — either way an alternate entry now exists to
+    // invalidate.
     let first = app
         .clone()
         .oneshot(source_request("/graph/ids", "hindsight", Some(SWITCH_GROUP)))
         .await
         .unwrap();
-    assert_eq!(first.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(first.status(), StatusCode::ACCEPTED);
 
     // Valid PUT → 200 with the post-write effective state, persisted to
     // variables.local.json, and published to the in-memory catalog.
@@ -1759,16 +2052,17 @@ async fn importer_variables_get_and_put_contract() {
     assert_eq!(hindsight["httpJson"]["variables"]["bank"], "relay");
 
     // The alternate was invalidated: the next selection starts a fresh
-    // build instead of replaying the pre-PUT cached outcome.
+    // build (202 with a live building status) instead of replaying the
+    // pre-PUT cached outcome.
     let rebuilt = app
         .clone()
         .oneshot(source_request("/graph/ids", "hindsight", Some(SWITCH_GROUP)))
         .await
         .unwrap();
-    assert_eq!(rebuilt.status(), StatusCode::SERVICE_UNAVAILABLE);
-    let rebuilt_body = text_body(rebuilt).await;
-    assert!(
-        rebuilt_body.starts_with("building importer source"),
+    assert_eq!(rebuilt.status(), StatusCode::ACCEPTED);
+    let rebuilt_body = json_body(rebuilt).await;
+    assert_eq!(
+        rebuilt_body["status"], "building",
         "fresh build after invalidation: {rebuilt_body}"
     );
 
@@ -1843,6 +2137,5 @@ async fn variables_overlay_applies_at_boot() {
     assert_eq!(response.status(), StatusCode::OK);
     let body = json_body(response).await;
     assert_eq!(body["current"]["bank"], "boot-bank");
-
     let _ = std::fs::remove_dir_all(&dir);
 }

@@ -1,0 +1,67 @@
+# Clustered graph generator package.
+#
+# Like generate-random.toml, but with community structure: the `clustered`
+# generator round-robin partitions the nodes into `clusters` communities and,
+# with probability `affinity`, wires an edge inside a community rather than
+# across the whole graph. Each node's type is `cluster-<c>`, so the importer's
+# tag projection exposes the community as a facet. A graph generator is data,
+# not code: AGENTS.md, "Importers: packages, not crates".
+
+format_version = 3
+
+[metadata]
+id = "generate.clusters"
+name = "Clustered graph"
+version = "1.0.0"
+description = "A deterministic pseudo-random graph with community structure: `clusters` round-robin communities, edges intra-cluster with probability `affinity`, reproducible from `seed`."
+
+[limits]
+nodes = 1000000
+edges = 500000
+
+[parser]
+engine = "tvix"
+expr = '''
+{ nodes, edges, clusters, affinity, seed }:
+let g = import /jc/src/graph.nix { };
+in g.clustered { inherit nodes edges clusters affinity seed; }
+'''
+
+[[parser.variables]]
+name = "nodes"
+type = "integer"
+default = "1000"
+min = 1
+max = 1000000
+description = "Number of nodes to generate (n0..n{nodes-1})."
+
+[[parser.variables]]
+name = "edges"
+type = "integer"
+default = "2000"
+min = 0
+max = 500000
+description = "Number of directed edges to wire."
+
+[[parser.variables]]
+name = "clusters"
+type = "integer"
+default = "8"
+min = 0
+max = 1000000
+description = "Number of round-robin communities (node i joins cluster i mod clusters). 0 degrades to a uniform random graph."
+
+[[parser.variables]]
+name = "affinity"
+type = "number"
+default = "0.8"
+min = 0.0
+max = 1.0
+description = "Probability (0.0-1.0) that an edge connects two nodes of the same cluster; otherwise it connects two random nodes."
+
+[[parser.variables]]
+name = "seed"
+type = "integer"
+default = "0"
+min = 0
+description = "Deterministic RNG seed; the same parameters and seed always produce the identical graph."

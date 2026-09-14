@@ -47,3 +47,19 @@ wgpu = { version = "23", default-features = false, features = ["webgpu", "wgsl",
 glam = "0.29"
 bytemuck = { version = "1", features = ["derive"] }
 
+# The wasm frontend ships over the wire, so the release profile is tuned for a
+# smaller, faster-decoding binary. trunk already runs wasm-opt (`-Oz
+# --strip-debug`) on the trunk output, so this profile is NOT here for peephole
+# size — wasm-opt owns that. It exists for what wasm-opt cannot do: cross-crate
+# optimization. `lto = "fat"` + `codegen-units = 1` let the whole dependency
+# graph inline and dead-strip across crate boundaries before wasm-opt runs, and
+# `strip = "debuginfo"` drops DWARF that would otherwise bloat the .wasm.
+# opt-level stays at 3 (NOT "z"/"s"): the app drives a wgpu force simulation
+# whose compute/render hot paths must not be de-optimized for size. Panic
+# strategy is left at the default (unwind) deliberately.
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = "debuginfo"
+

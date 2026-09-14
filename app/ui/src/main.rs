@@ -16,6 +16,7 @@ mod anchored;
 mod api;
 mod appstate;
 mod badges;
+mod build_progress;
 mod selection_card;
 mod client_log;
 mod graph_canvas;
@@ -411,6 +412,92 @@ fn default_layout() -> Vec<PanelWin<Panel>> {
     v
 }
 
+/// The `jc_shell` cookie mirrors the *primary* (user-view) workspace's
+/// settled floating layout into a compact string that graph-api's `GET /`
+/// handler reads to server-render the pre-WASM boot shell — so a returning
+/// visitor sees their own panel rects painted before the app WASM loads,
+/// with no JavaScript.
+///
+/// Value grammar (kept byte-for-byte identical to the parser in
+/// `crates/graph-api/src/server.rs::parse_shell_cookie`):
+///
+///   v1;<mode>;<title>,<x>,<y>,<w>,<h>;<title>,<x>,<y>,<w>,<h>;…
+///
+///   - `v1`      literal version tag; the server ignores any other prefix.
+///   - `<mode>`  `f` (floating) or `t` (tiling).
+///   - `<title>` panel display title, `[A-Za-z0-9 _-]`, 1-24 chars.
+///   - coords    non-negative integers ≤ 20000.
+///   - only visible (non-minimized) panels are emitted, in z-order
+///     (bottom-first) so the server can write them in DOM order.
+///   - at most 16 panels and 1024 bytes total; this writer truncates to fit.
+///
+/// In tiling mode the stored pixel rects are still written with a `t` tag; the
+/// server ignores them because tiling geometry is viewport-derived and not
+/// knowable server-side, so it falls back to the static default shell.
+const SHELL_COOKIE_MAX_PANELS: usize = 16;
+const SHELL_COOKIE_MAX_BYTES: usize = 1024;
+const SHELL_COORD_MAX: f64 = 20_000.0;
+
+/// Serialize the visible panels of one workspace into the `jc_shell` grammar.
+fn serialize_shell_cookie(panels: &[PanelWin<Panel>], mode: panel_kit::Mode) -> String {
+    let mode_tag = if mode == panel_kit::Mode::Tiling { 't' } else { 'f' };
+    // Visible = not docked (minimized). Bottom-first z-order so the server
+    // emits DOM order matching the floating stack (later siblings paint on
+    // top), mirroring panel-kit's own render order.
+    let mut order: Vec<&PanelWin<Panel>> = panels
+        .iter()
+        .filter(|p| p.state != panel_kit::WinState::Minimized)
+        .collect();
+    order.sort_by_key(|p| p.z);
+
+    let mut out = format!("v1;{mode_tag}");
+    for p in order.into_iter().take(SHELL_COOKIE_MAX_PANELS) {
+        // Reuse the panel kind's canonical display title — the same source
+        // the topbar and panel headers use — so the shell never invents a
+        // second title mapping.
+        let title = panel_kit::PanelKind::title(p.kind);
+        let clamp = |v: f64| v.round().clamp(0.0, SHELL_COORD_MAX) as i64;
+        let seg = format!(
+            ";{},{},{},{},{}",
+            title,
+            clamp(p.x),
+            clamp(p.y),
+            clamp(p.w),
+            clamp(p.h),
+        );
+        // Truncate at the byte ceiling rather than emit a value the server
+        // will reject wholesale.
+        if out.len() + seg.len() > SHELL_COOKIE_MAX_BYTES {
+            break;
+        }
+        out.push_str(&seg);
+    }
+    out
+}
+
+/// Write the `jc_shell` cookie. The value is percent-encoded for transport
+/// (its grammar's `;` and `,` are cookie delimiters); graph-api percent-decodes
+/// it back before parsing. `Secure` is set only on an https origin — the app is
+/// served over plain http in dev (localhost), where a hardcoded `Secure` flag
+/// would silently drop the cookie.
+fn write_shell_cookie(value: &str) {
+    use wasm_bindgen::JsCast;
+    let Some(win) = web_sys::window() else { return };
+    let Some(doc) = win.document() else { return };
+    let html_doc: web_sys::HtmlDocument = doc.unchecked_into();
+    let encoded = urlencoding::encode(value);
+    let secure = win
+        .location()
+        .protocol()
+        .map(|p| p.eq_ignore_ascii_case("https:"))
+        .unwrap_or(false);
+    let mut cookie = format!("jc_shell={encoded}; path=/; max-age=31536000; SameSite=Lax");
+    if secure {
+        cookie.push_str("; Secure");
+    }
+    let _ = html_doc.set_cookie(&cookie);
+}
+
 /// Sessions view default layout: world management and history share the main
 /// row; the graph surface of the open world sits below, with branch/merge/GPU
 /// consoles in the dock until needed.
@@ -552,6 +639,11 @@ pub(crate) struct Ctx {
     pub(crate) graph: Signal<Option<GraphData>>,
     pub(crate) graph_session: Signal<GraphSession>,
     pub(crate) load_error: Signal<Option<String>>,
+    /// Live build status when the selected source is still indexing. `Some`
+    /// while graph-api answers the graph routes with `202` — a normal wait,
+    /// never an error. Drives the boot skeleton, the Graph panel overlay, and
+    /// the Progress panel; the boot loop and the Importers tracker own it.
+    pub(crate) building: Signal<Option<api::BuildStatus>>,
     pub(crate) selected: Signal<Option<String>>,
     pub(crate) meta: Signal<Option<proto::NodeMeta>>,
     pub(crate) meta_busy: Signal<bool>,
@@ -886,7 +978,9 @@ pub(crate) async fn reload_graph(mut ctx: Ctx) {
         Ok(g) => {
             commit_server_graph(ctx, epoch, g);
         }
-        Err(e) if ctx.graph_session.peek().epoch == epoch => ctx.load_error.set(Some(e)),
+        Err(e) if ctx.graph_session.peek().epoch == epoch => {
+            ctx.load_error.set(Some(e.to_string()))
+        }
         Err(_) => {}
     }
 }
@@ -945,12 +1039,29 @@ fn App() -> Element {
         }
     });
 
+    // Mirror the primary (user-view) workspace's settled layout into the
+    // `jc_shell` cookie so graph-api's `GET /` can server-render THIS
+    // visitor's own panel rects into the pre-WASM boot shell. Only the user
+    // view is mirrored — the Sessions workspace (`jc_sessions_layout_v1`) is a
+    // separate surface the boot shell does not represent. The cookie is
+    // rewritten only once a drag settles (matching panel-kit's own persist
+    // rule), so a mid-gesture layout never thrashes it.
+    use_effect(move || {
+        let panels = ws_user.panels.read();
+        let mode = *ws_user.mode.read();
+        let settled = ws_user.drag.read().is_none() && ws_user.tile_drag.read().is_none();
+        if settled {
+            write_shell_cookie(&serialize_shell_cookie(panels.as_slice(), mode));
+        }
+    });
+
     let initial_embedded = Arc::new(new_embedded_host().expect("embedded host cannot fail"));
     let initial_host = initial_embedded.clone();
     let ctx = Ctx {
         graph: use_signal(|| None),
         graph_session: use_signal(|| GraphSession::loading_server(api::server_url())),
         load_error: use_signal(|| None),
+        building: use_signal(|| None),
         selected: use_signal(|| None),
         meta: use_signal(|| None),
         meta_busy: use_signal(|| false),
@@ -1044,27 +1155,131 @@ fn App() -> Element {
     // the canvas permanently empty.
     {
         let mut load_error = ctx.load_error;
+        let mut building = ctx.building;
         use_future(move || async move {
             if skip_server_load {
                 return;
             }
             let epoch = begin_server_graph_load(ctx);
+            // Last stage logged, so a still-building source logs at most once
+            // per distinct stage instead of flooding the console every poll.
+            let mut last_stage: Option<String> = None;
             loop {
+                if ctx.graph_session.peek().epoch != epoch {
+                    break;
+                }
                 match graph_canvas::load().await {
                     Ok(g) => {
+                        building.set(None);
                         if commit_server_graph(ctx, epoch, g) {
                             load_error.set(None);
                         }
                         break;
                     }
+                    // Building is a normal wait, not an error: clear any error,
+                    // show live progress, and poll the source's own status until
+                    // it serves (re-run load) or fails (stop). Never logged as an
+                    // error — at most one info line per new stage.
+                    Err(api::LoadError::Building(status)) => {
+                        if ctx.graph_session.peek().epoch != epoch {
+                            break;
+                        }
+                        load_error.set(None);
+                        let source = status.source.clone();
+                        if status.stage != last_stage {
+                            tracing::info!(
+                                "[graph] source {source} building: {}",
+                                status.stage.as_deref().unwrap_or("…")
+                            );
+                            last_stage = status.stage.clone();
+                        }
+                        building.set(Some(status));
+                        loop {
+                            gloo_timers::future::TimeoutFuture::new(1000).await;
+                            if ctx.graph_session.peek().epoch != epoch {
+                                return;
+                            }
+                            // `status.source` is the server's canonical selection
+                            // string; re-encode it into the status route. An
+                            // unparseable value is treated as a transient hiccup.
+                            let Ok(selection) = api::SourceSelection::parse(&source) else {
+                                continue;
+                            };
+                            match api::source_status(&selection).await {
+                                Ok(s) => match s.status.as_str() {
+                                    "serving" => break,
+                                    "failed" => {
+                                        building.set(None);
+                                        load_error
+                                            .set(Some(api::LoadError::Failed(s).to_string()));
+                                        return;
+                                    }
+                                    _ => {
+                                        if s.stage != last_stage {
+                                            tracing::info!(
+                                                "[graph] source {source} building: {}",
+                                                s.stage.as_deref().unwrap_or("…")
+                                            );
+                                            last_stage = s.stage.clone();
+                                        }
+                                        building.set(Some(s));
+                                    }
+                                },
+                                // A transient status hiccup is not a build
+                                // failure; keep polling.
+                                Err(_) => {}
+                            }
+                        }
+                    }
+                    Err(api::LoadError::Failed(status)) => {
+                        if ctx.graph_session.peek().epoch != epoch {
+                            break;
+                        }
+                        building.set(None);
+                        load_error.set(Some(api::LoadError::Failed(status).to_string()));
+                        break;
+                    }
+                    // The genuinely-unexpected path (transport, HTTP, decode):
+                    // warn and retry, exactly as before.
                     Err(e) => {
                         if ctx.graph_session.peek().epoch != epoch {
                             break;
                         }
-                        load_error.set(Some(e));
+                        building.set(None);
+                        tracing::warn!("[graph] load failed: {e}");
+                        load_error.set(Some(e.to_string()));
                         gloo_timers::future::TimeoutFuture::new(1500).await;
                     }
                 }
+            }
+        });
+    }
+
+    // Progress-panel feed: while a source is still indexing, tail its own
+    // progress log at 500 ms and fold it into the shared `BUILD_FEED`. Keyed
+    // on the source identity (a memo) so per-second stage updates to the same
+    // source neither reset the feed nor spawn duplicate pollers.
+    {
+        let building = ctx.building;
+        let build_source = use_memo(move || building.read().as_ref().map(|s| s.source.clone()));
+        use_effect(move || {
+            let source = build_source.read().clone();
+            *build_progress::BUILD_FEED.write() = build_progress::BuildFeed::default();
+            if let Some(source) = source {
+                spawn(async move {
+                    loop {
+                        if build_source.peek().as_deref() != Some(source.as_str()) {
+                            return;
+                        }
+                        let since = build_progress::BUILD_FEED.peek().since;
+                        if let Ok(selection) = api::SourceSelection::parse(&source) {
+                            if let Ok(resp) = api::source_progress(&selection, since).await {
+                                build_progress::BUILD_FEED.write().fold(&resp);
+                            }
+                        }
+                        gloo_timers::future::TimeoutFuture::new(500).await;
+                    }
+                });
             }
         });
     }
@@ -1149,9 +1364,9 @@ fn App() -> Element {
             // re-anchor at 0 and drop the previous source's history —
             // otherwise the alternate's early stages never replay and the
             // stale default-source log just sits there.
-            let mut source = api::source_id();
+            let mut source = api::source_selection();
             loop {
-                let selected = api::source_id();
+                let selected = api::source_selection();
                 if selected != source {
                     source = selected;
                     since = 0;
@@ -1431,25 +1646,40 @@ fn panel_body(kind: Panel, _maximized: bool, ctx: Ctx) -> Element {
                 };
             }
             if ctx.graph.read().is_some() {
-                rsx! { graph_canvas::GraphCanvas { graph: ctx.graph, selected: ctx.selected } }
+                rsx! {
+                    graph_canvas::GraphCanvas {
+                        graph: ctx.graph,
+                        selected: ctx.selected,
+                        building: ctx.building,
+                    }
+                }
+            } else if let Some(status) = ctx.building.read().clone() {
+                rsx! { div { class: "skeleton", {graph_canvas::BuildProgress(status)} } }
             } else if let Some(e) = ctx.load_error.read().clone() {
                 if api::is_building_error(&e) {
                     // A selected importer source is being built server-side:
                     // rich non-blocking overlay fed from the live apply
                     // status instead of the raw 503 text.
                     let apply = crate::panels::importers::APPLY.read().clone();
+                    // The merged tracker carries the server's own BuildStatus
+                    // rather than pre-split fields, so read the stage,
+                    // fraction, and elapsed time off it.
                     let (target, stage, fraction, elapsed) = match apply.as_ref() {
                         Some(
                             crate::panels::importers::ApplyStatus {
                                 target,
-                                state: crate::panels::importers::ApplyState::Building {
-                                    elapsed_secs,
-                                    stage,
-                                    fraction,
-                                },
+                                state:
+                                    crate::panels::importers::ApplyState::Building {
+                                        status, ..
+                                    },
                                 ..
                             },
-                        ) => (target.clone(), stage.clone(), *fraction, *elapsed_secs),
+                        ) => (
+                            target.clone(),
+                            status.stage.clone(),
+                            status.fraction,
+                            status.elapsed_ms.unwrap_or(0) / 1000,
+                        ),
                         _ => ("the selected source".to_string(), None, None, 0),
                     };
                     rsx! {
@@ -1561,12 +1791,37 @@ fn panel_header_actions(kind: Panel, ctx: Ctx) -> Element {
 /// Live server progress: vault reload stages, search reindex, layout jobs —
 /// the same event log the egui footer renders, polled from /progress.
 fn progress_panel(ctx: Ctx) -> Element {
-    let Ctx { tasks, logs, .. } = ctx;
+    let Ctx {
+        tasks,
+        logs,
+        building,
+        ..
+    } = ctx;
     let ts = tasks.read().clone();
     let ls = logs.read().clone();
+    let build = building.read().clone();
+    let feed: Vec<String> = build_progress::BUILD_FEED
+        .read()
+        .lines
+        .iter()
+        .cloned()
+        .collect();
     rsx! {
         div { class: "jobs",
-            if ts.is_empty() && ls.is_empty() {
+            if let Some(status) = &build {
+                div { class: "build-section", role: "status",
+                    div { class: "build-section-title", "Importing {status.source}" }
+                    {graph_canvas::BuildProgress(status.clone())}
+                    if !feed.is_empty() {
+                        div { class: "build-progress-feed", role: "log",
+                            for (i, line) in feed.iter().enumerate() {
+                                div { key: "{i}", class: "build-progress-feed-line", "{line}" }
+                            }
+                        }
+                    }
+                }
+            }
+            if ts.is_empty() && ls.is_empty() && build.is_none() {
                 div { class: "empty", "no server activity yet" }
             }
             for t in ts.iter().rev() {

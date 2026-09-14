@@ -278,11 +278,19 @@ impl ImporterSchema {
         if let Err(message) = identity::validate_source_kind(&self.source_kind) {
             return Err(invalid_descriptor(message));
         }
-        if !SourceKind::all().contains(&self.source_kind.as_str()) {
+        // A discovery schema's `source_kind` is a node-ID identity prefix, not a
+        // CLI-constructible source. Package engines (tvix) publish an identity
+        // prefix without a `SourceKind` variant, so accept those in addition to
+        // the CLI kinds. ("httpjson" is still a `SourceKind`, so it is covered
+        // by `all()`.)
+        if !SourceKind::all().contains(&self.source_kind.as_str())
+            && !ENGINE_SOURCE_KINDS.contains(&self.source_kind.as_str())
+        {
             return Err(invalid_descriptor(format!(
-                "source_kind {:?} must be a SourceKind lowercase identifier (one of {})",
+                "source_kind {:?} must be a SourceKind or package-engine identifier (one of {}, {})",
                 self.source_kind,
-                SourceKind::all().join(", ")
+                SourceKind::all().join(", "),
+                ENGINE_SOURCE_KINDS.join(", ")
             )));
         }
         if self.fields.is_empty() || self.fields.len() > MAX_DISCOVERY_FIELDS {
@@ -833,16 +841,21 @@ pub trait Loader: Send + Sync {
     }
 }
 
+/// Node-ID identity prefixes that are valid namespaces without a
+/// CLI-constructible [`SourceKind`] variant. A package engine (tvix: Nix
+/// generators as packages) emits `tvix:{source_id}:{local}` node IDs and a
+/// discovery schema whose `source_kind` is that prefix even though
+/// `--source=tvix` is retired; the `graph-api` self-assembly soup demo emits
+/// `generate:{source_id}:{local}` nodes without any generate loader. Kept
+/// separate from [`SourceKind::all`] so the CLI surface and the identity
+/// allowlist stay decoupled.
+pub const ENGINE_SOURCE_KINDS: &[&str] = &["tvix", "generate"];
+
 /// Enum of known loader types. Used for CLI dispatch (`--source <name>`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SourceKind {
     /// Walk an Obsidian vault on disk (the default).
     Obsidian,
-    /// Evaluate a tvix Nix expression to produce a graph.
-    Tvix,
-    /// Generate a random graph directly in Rust (fast, no Nix eval).
-    /// Controlled by --nodes and --edges CLI flags.
-    Generate,
     /// List allowlisted Kubernetes dynamic resources through kube-rs.
     Kubernetes,
     /// Import an Open Knowledge Format v0.2 bundle from the filesystem.
@@ -869,8 +882,6 @@ impl SourceKind {
     pub fn parse(s: &str) -> Option<Self> {
         match s.to_lowercase().as_str() {
             "obsidian" | "vault" => Some(Self::Obsidian),
-            "tvix" | "nix" => Some(Self::Tvix),
-            "generate" | "gen" | "random" => Some(Self::Generate),
             "kubernetes" | "k8s" => Some(Self::Kubernetes),
             "okf" | "open-knowledge-format" => Some(Self::Okf),
             "pest" | "grammar" => Some(Self::Pest),
@@ -885,8 +896,6 @@ impl SourceKind {
     pub fn all() -> &'static [&'static str] {
         &[
             "obsidian",
-            "tvix",
-            "generate",
             "kubernetes",
             "okf",
             "pest",
@@ -1040,13 +1049,62 @@ impl ImporterDescriptor {
     }
 }
 
+/// Progress observer an importer may report into.
+///
+/// The contract is deliberately minimal and object-safe so an importer can
+/// take a `&dyn ImportProgress` without knowing whether the host wires it to a
+/// live progress log, a metrics sink, or nothing at all. Implementations are
+/// `Send + Sync` and cheap to clone through an `Arc`, so a long paged pull can
+/// report from whatever task drives its I/O.
+///
+/// Stages are identified by an opaque `u64` handle returned from [`stage`].
+/// The handle has no meaning to the importer beyond routing later
+/// [`advance`], [`finish`], and [`fail`] calls back to the stage that
+/// produced it.
+///
+/// [`stage`]: ImportProgress::stage
+/// [`advance`]: ImportProgress::advance
+/// [`finish`]: ImportProgress::finish
+/// [`fail`]: ImportProgress::fail
+pub trait ImportProgress: Send + Sync {
+    /// Begin a named stage; returns a stage handle.
+    fn stage(&self, label: &str) -> u64;
+    /// Report progress within a stage. `fraction` is `0..=1` when a completion
+    /// ratio is known, or `None` when the stage is indeterminate; `detail` is a
+    /// short human line such as `"page 12, 6,000 records"`.
+    fn advance(&self, stage: u64, fraction: Option<f32>, detail: &str);
+    /// Mark a stage completed.
+    fn finish(&self, stage: u64);
+    /// Mark a stage failed with a human-readable reason.
+    fn fail(&self, stage: u64, reason: &str);
+    /// Emit a free-standing log line not attached to any stage.
+    fn log(&self, message: &str);
+}
+
+/// [`ImportProgress`] observer that discards every event. Callers with no
+/// progress feed pass `&NoProgress`.
+pub struct NoProgress;
+
+impl ImportProgress for NoProgress {
+    fn stage(&self, _label: &str) -> u64 {
+        0
+    }
+    fn advance(&self, _stage: u64, _fraction: Option<f32>, _detail: &str) {}
+    fn finish(&self, _stage: u64) {}
+    fn fail(&self, _stage: u64, _reason: &str) {}
+    fn log(&self, _message: &str) {}
+}
+
 /// A fallible asynchronous graph importer.
 ///
 /// The boxed-future method keeps the trait object-safe without requiring an
 /// `async-trait` transformation.
 pub trait Importer: Send + Sync {
     fn descriptor(&self) -> ImporterDescriptor;
-    fn import<'a>(&'a self) -> ImportFuture<'a, Result<ImportOutcome, ImportError>>;
+    fn import<'a>(
+        &'a self,
+        progress: &'a dyn ImportProgress,
+    ) -> ImportFuture<'a, Result<ImportOutcome, ImportError>>;
 
     /// Optional body reader: return the markdown body for a node whose
     /// `meta.path` is `path` (relative to the importer's own filesystem root),
@@ -1101,7 +1159,10 @@ where
         .with_watch(watch)
     }
 
-    fn import<'a>(&'a self) -> ImportFuture<'a, Result<ImportOutcome, ImportError>> {
+    fn import<'a>(
+        &'a self,
+        _progress: &'a dyn ImportProgress,
+    ) -> ImportFuture<'a, Result<ImportOutcome, ImportError>> {
         Box::pin(async move { Ok(ImportOutcome::Loaded(self.try_load()?)) })
     }
 }
@@ -1169,7 +1230,10 @@ impl Importer for HostedImporter {
         self.importer.read_body(path)
     }
 
-    fn import<'a>(&'a self) -> ImportFuture<'a, Result<ImportOutcome, ImportError>> {
+    fn import<'a>(
+        &'a self,
+        progress: &'a dyn ImportProgress,
+    ) -> ImportFuture<'a, Result<ImportOutcome, ImportError>> {
         Box::pin(async move {
             let descriptor = self.importer.descriptor();
             descriptor.validate()?;
@@ -1180,7 +1244,7 @@ impl Importer for HostedImporter {
             {
                 self.authorize(capability)?;
             }
-            match self.importer.import().await? {
+            match self.importer.import(progress).await? {
                 ImportOutcome::Loaded(result) => {
                     descriptor.schema.validate_result(&result)?;
                     Ok(ImportOutcome::Loaded(result))
@@ -1273,7 +1337,10 @@ pub trait SourceConnector: Send + Sync {
     /// one entry per query.
     fn capabilities(&self, effect: Effect) -> Vec<Capability>;
 
-    fn read<'a>(&'a self) -> ImportFuture<'a, Result<Vec<SourceRecord>, ImportError>>;
+    fn read<'a>(
+        &'a self,
+        progress: &'a dyn ImportProgress,
+    ) -> ImportFuture<'a, Result<Vec<SourceRecord>, ImportError>>;
 
     fn write<'a>(
         &'a self,
@@ -1380,19 +1447,26 @@ impl ImportPipeline {
         &self.descriptor.watch
     }
 
-    /// Execute connector -> decoder -> mapper in that order.
+    /// Execute connector -> decoder -> mapper in that order, reporting the
+    /// decode and map phases as their own stages so a long import stays
+    /// visible after acquisition finishes.
     ///
     /// Unlike [`Importer::import`], `run` ignores the unchanged gate: it
     /// always decodes and maps, which makes it the force-refresh escape
     /// hatch for hosts that know the source changed.
-    pub async fn run(&self) -> Result<LoadResult, ImportError> {
-        let source_records = self.connector.read().await?;
-        self.decode_and_map(source_records)
+    pub async fn run(&self, progress: &dyn ImportProgress) -> Result<LoadResult, ImportError> {
+        let source_records = self.connector.read(progress).await?;
+        self.decode_and_map(source_records, progress)
     }
 
     /// Media-type check -> decode -> map -> output validation over records
-    /// one connector read already produced.
-    fn decode_and_map(&self, source_records: Vec<SourceRecord>) -> Result<LoadResult, ImportError> {
+    /// one connector read already produced, reporting the decode and map
+    /// phases through `progress`.
+    fn decode_and_map(
+        &self,
+        source_records: Vec<SourceRecord>,
+        progress: &dyn ImportProgress,
+    ) -> Result<LoadResult, ImportError> {
         for record in &source_records {
             let actual_media_type = record
                 .content_type
@@ -1413,11 +1487,28 @@ impl ImportPipeline {
                 });
             }
         }
-        let decoded = source_records
+        let decode_stage = progress.stage(&format!("Decoding {} records", source_records.len()));
+        let decoded = match source_records
             .into_iter()
             .map(|record| self.decoder.decode(record))
-            .collect::<Result<Vec<_>, _>>()?;
-        let result = self.mapper.map(decoded)?;
+            .collect::<Result<Vec<_>, _>>()
+        {
+            Ok(decoded) => decoded,
+            Err(error) => {
+                progress.fail(decode_stage, &error.to_string());
+                return Err(error);
+            }
+        };
+        progress.finish(decode_stage);
+        let map_stage = progress.stage("Projecting graph");
+        let result = match self.mapper.map(decoded) {
+            Ok(result) => result,
+            Err(error) => {
+                progress.fail(map_stage, &error.to_string());
+                return Err(error);
+            }
+        };
+        progress.finish(map_stage);
         self.descriptor.schema.validate_result(&result)?;
         Ok(result)
     }
@@ -1432,15 +1523,20 @@ impl Importer for ImportPipeline {
     /// the last successful import return [`ImportOutcome::Unchanged`]
     /// without any decode or mapping work. The hash is stored only after a
     /// fully validated load, so a failing pipeline keeps retrying (and
-    /// reporting) its error on every tick.
-    fn import<'a>(&'a self) -> ImportFuture<'a, Result<ImportOutcome, ImportError>> {
+    /// reporting) its error on every tick. When the gate lets the import
+    /// proceed, the decode and map phases report through `progress`; an
+    /// unchanged tick reports no decode or map stages.
+    fn import<'a>(
+        &'a self,
+        progress: &'a dyn ImportProgress,
+    ) -> ImportFuture<'a, Result<ImportOutcome, ImportError>> {
         Box::pin(async move {
-            let source_records = self.connector.read().await?;
+            let source_records = self.connector.read(progress).await?;
             let hash = content_hash(&source_records);
             if self.gate().is_some_and(|last| last == hash) {
                 return Ok(ImportOutcome::Unchanged);
             }
-            let result = self.decode_and_map(source_records)?;
+            let result = self.decode_and_map(source_records, progress)?;
             *self.gate() = Some(hash);
             Ok(ImportOutcome::Loaded(result))
         })
@@ -1797,7 +1893,10 @@ mod importer_tests {
             vec![capability(effect, &self.scope)]
         }
 
-        fn read<'a>(&'a self) -> ImportFuture<'a, Result<Vec<SourceRecord>, ImportError>> {
+        fn read<'a>(
+            &'a self,
+            _progress: &'a dyn ImportProgress,
+        ) -> ImportFuture<'a, Result<Vec<SourceRecord>, ImportError>> {
             Box::pin(async move {
                 self.trace.lock().push("read".into());
                 if let Some(error) = &self.error {
@@ -1929,7 +2028,7 @@ mod importer_tests {
             Box::new(HostedImporter::new(Box::new(pipeline), [read]).unwrap());
 
         assert_eq!(importer.descriptor().id, "fake");
-        let ImportOutcome::Loaded(loaded) = importer.import().await.unwrap() else {
+        let ImportOutcome::Loaded(loaded) = importer.import(&NoProgress).await.unwrap() else {
             panic!("first import must load a fresh graph");
         };
 
@@ -1948,7 +2047,7 @@ mod importer_tests {
             pipeline(&trace, vec![record("a", "one"), record("b", "two")], None).unwrap();
         let importer = HostedImporter::new(Box::new(pipeline), [read]).unwrap();
 
-        let ImportOutcome::Loaded(first) = importer.import().await.unwrap() else {
+        let ImportOutcome::Loaded(first) = importer.import(&NoProgress).await.unwrap() else {
             panic!("first import must load a fresh graph");
         };
         assert_eq!(first.graph.node_count(), 2);
@@ -1956,7 +2055,7 @@ mod importer_tests {
         // The idle poll re-reads the source — the conditional fetch is how
         // change is detected — but must not decode or map again.
         assert!(matches!(
-            importer.import().await.unwrap(),
+            importer.import(&NoProgress).await.unwrap(),
             ImportOutcome::Unchanged
         ));
         assert_eq!(
@@ -1989,16 +2088,16 @@ mod importer_tests {
         .unwrap();
         let importer = HostedImporter::new(Box::new(pipeline), [read]).unwrap();
 
-        let ImportOutcome::Loaded(_) = importer.import().await.unwrap() else {
+        let ImportOutcome::Loaded(_) = importer.import(&NoProgress).await.unwrap() else {
             panic!("first import must load a fresh graph");
         };
         assert!(matches!(
-            importer.import().await.unwrap(),
+            importer.import(&NoProgress).await.unwrap(),
             ImportOutcome::Unchanged
         ));
 
         records.lock()[0] = record("a", "mutated");
-        let ImportOutcome::Loaded(third) = importer.import().await.unwrap() else {
+        let ImportOutcome::Loaded(third) = importer.import(&NoProgress).await.unwrap() else {
             panic!("changed records must reload");
         };
         assert_eq!(third.graph.node_count(), 1);
@@ -2026,7 +2125,7 @@ mod importer_tests {
         )
         .unwrap();
 
-        let error = pipeline.run().await.unwrap_err();
+        let error = pipeline.run(&NoProgress).await.unwrap_err();
 
         assert_eq!(
             error,
@@ -2045,7 +2144,7 @@ mod importer_tests {
         unsupported.content_type = "application/json".into();
         let pipeline = pipeline(&trace, vec![unsupported], None).unwrap();
 
-        let error = pipeline.run().await.unwrap_err();
+        let error = pipeline.run(&NoProgress).await.unwrap_err();
 
         assert_eq!(
             error,
@@ -2099,7 +2198,7 @@ mod importer_tests {
         parameterized.content_type = "Text/Plain; charset=utf-8".into();
         let pipeline = pipeline(&trace, vec![parameterized], None).unwrap();
 
-        let loaded = pipeline.run().await.unwrap();
+        let loaded = pipeline.run(&NoProgress).await.unwrap();
 
         assert_eq!(loaded.graph.node_count(), 1);
         assert_eq!(
@@ -2114,7 +2213,7 @@ mod importer_tests {
         let pipeline = pipeline(&trace, vec![record("a", "one")], None).unwrap();
         let importer = HostedImporter::new(Box::new(pipeline), []).unwrap();
 
-        let error = importer.import().await.unwrap_err();
+        let error = importer.import(&NoProgress).await.unwrap_err();
 
         assert_eq!(
             error,
@@ -2201,7 +2300,7 @@ mod importer_tests {
         let descriptor = Importer::descriptor(&loader);
         let read = descriptor.capabilities[0].clone();
         let importer = HostedImporter::new(Box::new(loader), [read.clone()]).unwrap();
-        let ImportOutcome::Loaded(loaded) = importer.import().await.unwrap() else {
+        let ImportOutcome::Loaded(loaded) = importer.import(&NoProgress).await.unwrap() else {
             panic!("compatibility loader import must load a fresh graph");
         };
 
@@ -2312,5 +2411,24 @@ mod importer_tests {
                 && error.contains("generate:fixture:missing"),
             "{error}"
         );
+    }
+
+    #[tokio::test]
+    async fn no_progress_satisfies_import_progress_and_drives_a_pipeline() {
+        // NoProgress must be usable as a trait object and accept every event
+        // without effect, so a caller with no progress feed can pass it.
+        let observer: &dyn ImportProgress = &NoProgress;
+        let stage = observer.stage("decode");
+        observer.advance(stage, Some(0.5), "halfway");
+        observer.advance(stage, None, "indeterminate");
+        observer.log("free-standing line");
+        observer.finish(stage);
+        observer.fail(observer.stage("other"), "ignored");
+
+        // A full pipeline must run to completion when driven by NoProgress.
+        let trace = Trace::default();
+        let pipeline = pipeline(&trace, vec![record("a", "one")], None).unwrap();
+        let loaded = pipeline.run(&NoProgress).await.unwrap();
+        assert_eq!(loaded.graph.node_count(), 1);
     }
 }

@@ -13,7 +13,7 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-use data_loader::{ImportError, ImportFuture, ImportOutcome, Importer};
+use data_loader::{ImportError, ImportFuture, ImportOutcome, Importer, NoProgress};
 use importer::json::JsonTransport;
 use importer::{build_importer_with_transport, InstanceConfig, ValidatedPackage};
 use rstest::rstest;
@@ -129,7 +129,7 @@ async fn shipped_package_produces_nodes_and_declared_edges(#[case] case: Package
         .unwrap_or_else(|error| panic!("{} binds: {error}", case.manifest));
 
     let result = match importer
-        .import()
+        .import(&NoProgress)
         .await
         .unwrap_or_else(|error| panic!("{} imports from its fixtures: {error}", case.manifest))
     {

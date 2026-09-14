@@ -31,10 +31,11 @@
 #![allow(dead_code)] // preserved API surface from the egui port; not every entry point is wired into the Dioxus UI yet.
 
 use crate::render::camera::Camera;
+use crate::render::region_map::{RegionMap, RegionMapConfig, RegionMode};
 use bytemuck::{Pod, Zeroable};
 use glam::{Mat4, Vec3, Vec4};
 use graph_layouts::{
-    BoxedPhysics, DynPhysicsLayout, DynStaticLayout, Edge as GlEdge, GpuForceLayout,
+    BoxedPhysics, CsrInput, DynPhysicsLayout, DynStaticLayout, Edge as GlEdge, GpuForceLayout,
     GpuForceOptions, Graph as GlGraph, Node as GlNode,
 };
 use std::sync::{Arc, Mutex};
@@ -243,6 +244,10 @@ pub struct GraphPipelines {
     /// only the `step_with_encoder` dispatch is skipped. (Addition over
     /// the egui port, which paused via dt/settings instead.)
     sim_running: bool,
+
+    /// GMap-style cluster region underlay. Built in `new`; its compute
+    /// bind group is wired to the shared buffers in `load`.
+    region: Option<RegionMap>,
 }
 
 struct Buffers {
@@ -260,6 +265,9 @@ struct Buffers {
     /// 1 = square, 2 = triangle, 3 = diamond, 4 = hexagon. Indexes
     /// the switch in `node.wgsl::fs_main`.
     shape_ids: wgpu::Buffer,
+    /// Per-node cluster id (u32 each) for the region-map underlay.
+    /// All-zero by default so a freshly-loaded graph reads as one region.
+    cluster_ids: wgpu::Buffer,
     n_nodes: u32,
     n_edges: u32,
     camera_uniform: wgpu::Buffer,
@@ -276,10 +284,6 @@ struct Buffers {
     node_bind_group: wgpu::BindGroup,
     edge_bind_group: wgpu::BindGroup,
     layout: Option<Box<dyn DynPhysicsLayout>>,
-    /// Cached graph the layout was initialised against. Needed so a
-    /// layout swap can re-init a freshly-built layout against the same
-    /// topology without forcing the caller to re-supply it.
-    layout_graph: Option<GlGraph>,
     /// CPU mirrors. positions/sizes used for raycast + fit; colors_base
     /// is the per-node base RGBA so set_selected can multiply alpha
     /// without losing the underlying tint.
@@ -434,6 +438,7 @@ impl GraphPipelines {
             screen_px: [1.0, 1.0],
             effects: EffectsUniform::default(),
             sim_running: true,
+            region: Some(RegionMap::new(device, color_format)),
         }
     }
 
@@ -575,6 +580,16 @@ impl GraphPipelines {
         });
 
 
+        // Per-node cluster id. Default: a single level of all-zero ids (one
+        // region) so the region-map underlay reads as a single region until
+        // a clustering pass pushes real ids through `update_cluster_levels`.
+        let cluster_ids_init: Vec<u32> = vec![0_u32; n_nodes.max(1) as usize];
+        let cluster_ids_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("cluster_ids_storage"),
+            contents: bytemuck::cast_slice(&cluster_ids_init),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        });
+
         let node_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("node bg"),
             layout: &self.node_bgl,
@@ -602,13 +617,24 @@ impl GraphPipelines {
             ],
         });
 
-        // Initialise the GPU force layout against the same positions buffer.
-        let layout_graph = build_topology_graph(&graph.positions, &graph.edges);
+        // Initialise the GPU force layout against the same positions buffer,
+        // via the index-based CSR ingest path so no `graph_layouts::Graph` is
+        // materialised. `for_n_nodes` selects the engine's size-aware seed
+        // mode (device-side multilevel coarsening above 10k nodes); the sphere
+        // seed carried in `graph.positions` reaches the layout through
+        // `CsrInput.positions`.
         let layout: Option<Box<dyn DynPhysicsLayout>> = {
             let mut boxed: Box<dyn DynPhysicsLayout> = Box::new(BoxedPhysics::new(
-                GpuForceLayout::new(GpuForceOptions::default()),
+                GpuForceLayout::new(GpuForceOptions::for_n_nodes(n_nodes as usize)),
             ));
-            match boxed.init_with_device(device, queue, &layout_graph, &positions) {
+            match init_physics_layout(
+                device,
+                queue,
+                &mut *boxed,
+                &positions,
+                &graph.positions,
+                &graph.edges,
+            ) {
                 Ok(()) => Some(boxed),
                 Err(e) => {
                     tracing::warn!("[render] init_layout failed: {e}");
@@ -638,6 +664,7 @@ impl GraphPipelines {
             edges: edges_buf,
             edge_colors: edge_colors_buf,
             shape_ids: shape_ids_buf,
+            cluster_ids: cluster_ids_buf,
             n_nodes,
             n_edges,
             camera_uniform,
@@ -647,7 +674,6 @@ impl GraphPipelines {
             node_bind_group,
             edge_bind_group,
             layout,
-            layout_graph: Some(layout_graph),
             positions_cpu: graph.positions,
             sizes_cpu: graph.sizes,
             colors_base,
@@ -658,6 +684,21 @@ impl GraphPipelines {
             positions_frame_idx: 0,
             last_positions_copy_frame: 0,
         });
+
+        // Wire the region-map compute bind group to the freshly-created
+        // shared buffers now that they live in `self.buffers`.
+        if let Some(region) = self.region.as_mut() {
+            if let Some(b) = self.buffers.as_ref() {
+                region.bind(
+                    device,
+                    queue,
+                    &b.positions,
+                    &b.camera_uniform,
+                    &b.cluster_ids,
+                    n_nodes,
+                );
+            }
+        }
 
         // Auto-fit the camera to the loaded graph so the bootstrap frame
         // shows something visible.
@@ -709,6 +750,16 @@ impl GraphPipelines {
         encoder: &mut wgpu::CommandEncoder,
     ) {
         let sim_running = self.sim_running;
+        // Resolve the region auto-level for this frame from the current
+        // camera framing before borrowing `self.buffers` (bounds() reads
+        // the CPU position mirror). `None` when no bounds exist. See the
+        // shared zoom rule in region_map::auto_level.
+        let region_framing = self.bounds().map(|(mn, mx)| {
+            let center = (mn + mx) * 0.5;
+            let radius = ((mx - mn) * 0.5).length();
+            let d = (self.camera.position - center).length();
+            (d, self.camera.fit_distance(radius))
+        });
         let Some(b) = &mut self.buffers else { return };
 
         // Drive any pending native callbacks. On WASM the browser drives
@@ -742,6 +793,16 @@ impl GraphPipelines {
             if let Some(l) = b.layout.as_mut() {
                 l.step_with_encoder(device, queue, encoder, &b.positions);
             }
+        }
+
+        // Record the region-map compute passes (clear -> seed -> jump-
+        // flood -> prune) into the same encoder. The seed pass reads the
+        // positions the sim just wrote. No-op when the region mode is Off
+        // or before the graph is loaded. The level is resolved and stored
+        // once here so `region_current_level` reflects this frame.
+        if let Some(region) = self.region.as_mut() {
+            region.update_level(queue, region_framing);
+            region.encode(encoder);
         }
 
         // Throttle: only schedule a fresh readback once every
@@ -901,6 +962,22 @@ impl GraphPipelines {
     /// Records the edge + node draws into the host's render pass.
     pub fn draw(&self, rpass: &mut wgpu::RenderPass<'_>) {
         let Some(b) = &self.buffers else { return };
+
+        // Region underlay (GMap-style cluster map). Drawn BEFORE edges and
+        // nodes in Underlay mode; in Only mode it replaces them; in Off
+        // mode it draws nothing (and `region.draw` is itself a no-op).
+        let region_mode = self
+            .region
+            .as_ref()
+            .map(|r| r.config().mode)
+            .unwrap_or(RegionMode::Off);
+        if let Some(region) = self.region.as_ref() {
+            region.draw(rpass);
+        }
+        if region_mode == RegionMode::Only {
+            return;
+        }
+
         if b.n_edges > 0 {
             rpass.set_pipeline(&self.edge_pipeline);
             rpass.set_bind_group(0, &b.edge_bind_group, &[]);
@@ -1261,6 +1338,91 @@ impl GraphPipelines {
         queue.write_buffer(&b.shape_ids, 0, bytemuck::cast_slice(&shapes));
     }
 
+    /// Replace the per-node cluster ids that drive the region-map underlay
+    /// with a level-major dendrogram: the id for node `i` at level `k` is
+    /// `ids[k * n_nodes + i]`. `ids.len()` must equal `n_nodes * n_levels`
+    /// and `n_levels >= 1`; a mismatch warns and no-ops. Grows and rebinds
+    /// the cluster-id storage buffer when the level count exceeds the
+    /// buffer built in `load`; otherwise writes in place. No-op before
+    /// `load` (no buffers yet).
+    pub fn update_cluster_levels(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        ids: Vec<u32>,
+        n_levels: u32,
+    ) {
+        let Some(b) = self.buffers.as_mut() else {
+            return;
+        };
+        let n = b.n_nodes as usize;
+        if n_levels == 0 || ids.len() != n * n_levels as usize {
+            tracing::warn!(
+                "[render] update_cluster_levels: len {} != n {} * levels {}",
+                ids.len(),
+                n,
+                n_levels
+            );
+            return;
+        }
+        let need_bytes = (ids.len().max(1) * std::mem::size_of::<u32>()) as u64;
+        if need_bytes > b.cluster_ids.size() {
+            // The level-major buffer outgrew the single-level buffer from
+            // `load`; recreate it and rebind the region compute bind group,
+            // which references it at binding 3.
+            b.cluster_ids = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("cluster_ids_storage"),
+                contents: bytemuck::cast_slice(&ids),
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            });
+            if let Some(region) = self.region.as_mut() {
+                region.bind(
+                    device,
+                    queue,
+                    &b.positions,
+                    &b.camera_uniform,
+                    &b.cluster_ids,
+                    b.n_nodes,
+                );
+            }
+        } else {
+            queue.write_buffer(&b.cluster_ids, 0, bytemuck::cast_slice(&ids));
+        }
+        if let Some(region) = self.region.as_mut() {
+            region.set_levels(queue, n_levels);
+        }
+    }
+
+    /// The region level chosen for the last encoded frame (0 before any
+    /// frame or when no region map exists).
+    pub fn region_current_level(&self) -> u32 {
+        self.region
+            .as_ref()
+            .map(RegionMap::region_current_level)
+            .unwrap_or(0)
+    }
+
+    /// Apply a new region-map configuration (mode, palette, radius,
+    /// alpha, outline). Re-uploads the palette and params on the GPU.
+    pub fn set_region_map(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        cfg: RegionMapConfig,
+    ) {
+        if let Some(region) = self.region.as_mut() {
+            region.set_config(device, queue, cfg);
+        }
+    }
+
+    /// The current region-map configuration.
+    pub fn region_map_config(&self) -> &RegionMapConfig {
+        self.region
+            .as_ref()
+            .expect("region map is built in GraphPipelines::new")
+            .config()
+    }
+
     /// Apply a per-node alpha multiplier from the query selection. When
     /// `selected` is `None` the base RGBA is restored. Otherwise nodes
     /// not in the set drop to 0.18 alpha.
@@ -1615,24 +1777,18 @@ impl GraphPipelines {
         // Refresh the CPU mirror so raycasts / bounds() see the seed.
         b.positions_cpu = positions.to_vec();
 
-        // Sync the cached topology graph's `position3` from the new positions
-        // (same id scheme as `build_topology_graph`) and re-init the active
-        // physics layout so the GPU sim resumes from the seed.
-        if let Some(graph) = b.layout_graph.as_mut() {
-            let width = format!("{}", n_nodes.max(1) - 1).len().max(1);
-            for i in 0..n_nodes {
-                let id = format!("{:0width$}", i, width = width);
-                if let Some(node) = graph.nodes.get_mut(&id) {
-                    node.position3 =
-                        Some([positions[i * 3], positions[i * 3 + 1], positions[i * 3 + 2]]);
-                }
-            }
-        }
+        // Re-init the active physics layout from the CSR buffers so the GPU
+        // sim resumes from the seed (positions carried via CsrInput.positions).
         if let Some(mut layout) = b.layout.take() {
-            if let Some(graph) = b.layout_graph.as_ref() {
-                if let Err(e) = layout.init_with_device(device, queue, graph, &b.positions) {
-                    tracing::warn!("[render] set_positions: layout re-init failed: {e}");
-                }
+            if let Err(e) = init_physics_layout(
+                device,
+                queue,
+                &mut *layout,
+                &b.positions,
+                &b.positions_cpu,
+                &b.edges_cpu,
+            ) {
+                tracing::warn!("[render] set_positions: layout re-init failed: {e}");
             }
             b.layout = Some(layout);
         }
@@ -1641,11 +1797,11 @@ impl GraphPipelines {
     }
 
     /// Replace the active physics layout with a pre-built one (port of the
-    /// egui `swap_physics_layout`, minus the factory indirection). Syncs the
-    /// cached topology graph's `position3` from the live CPU positions mirror
-    /// first, so the fresh layout's `init_with_device` resumes from whatever
-    /// the previous layout — including a one-shot static solve — left behind,
-    /// instead of jumping back to the bootstrap positions.
+    /// egui `swap_physics_layout`, minus the factory indirection). Re-inits
+    /// the fresh layout from the CSR buffers, seeding it with the live CPU
+    /// positions mirror (via `CsrInput.positions`) so it resumes from
+    /// whatever the previous layout — including a one-shot static solve —
+    /// left behind, instead of jumping back to the bootstrap positions.
     pub fn swap_physics_layout(
         &mut self,
         device: &wgpu::Device,
@@ -1655,29 +1811,14 @@ impl GraphPipelines {
         let Some(b) = self.buffers.as_mut() else {
             return;
         };
-        if let Some(graph) = b.layout_graph.as_mut() {
-            // `build_topology_graph` builds ids as zero-padded indices, so
-            // the same scheme indexes back in.
-            let n = b.n_nodes as usize;
-            let width = format!("{}", n.max(1) - 1).len().max(1);
-            for i in 0..n {
-                if i * 3 + 2 >= b.positions_cpu.len() {
-                    break;
-                }
-                let id = format!("{:0width$}", i, width = width);
-                if let Some(node) = graph.nodes.get_mut(&id) {
-                    node.position3 = Some([
-                        b.positions_cpu[i * 3],
-                        b.positions_cpu[i * 3 + 1],
-                        b.positions_cpu[i * 3 + 2],
-                    ]);
-                }
-            }
-        }
-        let Some(graph) = b.layout_graph.as_ref() else {
-            return;
-        };
-        match layout.init_with_device(device, queue, graph, &b.positions) {
+        match init_physics_layout(
+            device,
+            queue,
+            &mut *layout,
+            &b.positions,
+            &b.positions_cpu,
+            &b.edges_cpu,
+        ) {
             Ok(()) => {
                 b.layout = Some(layout);
             }
@@ -1687,10 +1828,13 @@ impl GraphPipelines {
         }
     }
 
-    /// One-shot static solve against the cached topology graph (port of the
-    /// egui `run_static_solve`). Writes the solver's positions into the GPU
-    /// buffer + CPU mirror and tears down any active physics layout so
-    /// `compute_step` doesn't immediately stomp the freshly-written positions.
+    /// One-shot static solve (port of the egui `run_static_solve`). Static
+    /// solvers are CPU `Graph` algorithms, so this is the only path that
+    /// still needs the string-keyed topology: it builds one on demand from
+    /// the flat CPU mirrors and drops it when the solve returns. Writes the
+    /// solver's positions into the GPU buffer + CPU mirror and tears down any
+    /// active physics layout so `compute_step` doesn't immediately stomp the
+    /// freshly-written positions.
     pub fn run_static_solve(
         &mut self,
         queue: &wgpu::Queue,
@@ -1701,12 +1845,10 @@ impl GraphPipelines {
             .buffers
             .as_mut()
             .ok_or_else(|| "run_static_solve: no buffers loaded".to_string())?;
-        let graph = b
-            .layout_graph
-            .as_ref()
-            .ok_or_else(|| "run_static_solve: no cached topology graph".to_string())?;
-
-        let positions = layout.solve_dyn(settings, graph)?;
+        // Materialise the topology Graph on demand for the CPU solver, then
+        // let it drop when the solve returns.
+        let graph = build_topology_graph(&b.positions_cpu, &b.edges_cpu);
+        let positions = layout.solve_dyn(settings, &graph)?;
         let n_nodes = b.n_nodes as usize;
         if positions.len() != n_nodes * 3 {
             return Err(format!(
@@ -1855,6 +1997,38 @@ fn build_topology_graph(positions: &[f32], edges: &[u32]) -> GlGraph {
     g
 }
 
+/// Initialise a physics layout from the renderer's flat CPU buffers via the
+/// index-based CSR ingest path, materialising no `graph_layouts::Graph`.
+/// `positions_cpu` is `[x, y, z]` per node and is carried into the layout
+/// through `CsrInput.positions` so the sim resumes from the current seed /
+/// prior positions. Remote bridge layouts (see panels/layout.rs) that don't
+/// implement CSR return the trait-default error; for that exact message —
+/// and only that one — we fall back to the string-keyed `Graph` path built
+/// on demand. Any other error is a genuine init failure surfaced to the
+/// caller, which logs it and drops the layout, exactly as before.
+fn init_physics_layout(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    layout: &mut dyn DynPhysicsLayout,
+    positions_buf: &wgpu::Buffer,
+    positions_cpu: &[f32],
+    edges_cpu: &[u32],
+) -> Result<(), String> {
+    let input = CsrInput {
+        n_nodes: (positions_cpu.len() / 3) as u32,
+        edges: edges_cpu,
+        positions: Some(positions_cpu),
+    };
+    match layout.init_with_device_csr(device, queue, &input, positions_buf) {
+        Ok(()) => Ok(()),
+        Err(e) if e == "this layout has no CSR ingest path" => {
+            let graph = build_topology_graph(positions_cpu, edges_cpu);
+            layout.init_with_device(device, queue, &graph, positions_buf)
+        }
+        Err(e) => Err(e),
+    }
+}
+
 fn uniform_entry(binding: u32, vis: wgpu::ShaderStages) -> wgpu::BindGroupLayoutEntry {
     wgpu::BindGroupLayoutEntry {
         binding,
@@ -1945,18 +2119,16 @@ impl RenderHost {
             .await
             .ok_or_else(|| "no compatible WebGPU adapter".to_string())?;
 
-        // The compute pipeline (`force_step` + `spring_step`) binds 14
-        // storage buffers in a single stage — positions in/out,
-        // velocities, edges via CSR (offsets + neighbors), mass,
-        // virtual-vertex CSR, spring force partials, energy, plus the
-        // octree (nodes + ropes) for the Barnes-Hut path. Chrome's
-        // WebGPU default cap is 10, so bump to 14 minimum; cap at the
-        // adapter-reported max so we don't request more than the
-        // hardware can serve. Mirrors the standalone Renderer + the
-        // egui app's main.rs.
+        // Start from the force engine's limits (adapter-sized storage
+        // buffer / buffer size so the position and CSR buffers are not
+        // capped at WebGPU's 128 MiB / 256 MiB defaults — see
+        // `graph_layouts::gpu_force_device_limits`), then bump the
+        // per-stage storage-buffer count for the renderer's own pipelines.
+        // Chrome's WebGPU default cap is 10; request 14 minimum, capped at
+        // the adapter-reported max so we never ask for more than the
+        // hardware can serve.
         let adapter_limits = adapter.limits();
-        let mut limits =
-            wgpu::Limits::downlevel_defaults().using_resolution(adapter_limits.clone());
+        let mut limits = graph_layouts::gpu_force_device_limits(&adapter_limits);
         limits.max_storage_buffers_per_shader_stage = limits
             .max_storage_buffers_per_shader_stage
             .max(14)
@@ -2034,6 +2206,14 @@ impl RenderHost {
     /// buffers need both halves from one `&mut self`.)
     pub fn pipes_and_queue(&mut self) -> (&mut GraphPipelines, &wgpu::Queue) {
         (&mut self.pipes, &self.queue)
+    }
+
+    /// Split borrow for callers that also need the device (e.g. the Style
+    /// panel's `set_region_map`, which may recreate the palette buffer).
+    pub fn pipes_queue_device(
+        &mut self,
+    ) -> (&mut GraphPipelines, &wgpu::Queue, &wgpu::Device) {
+        (&mut self.pipes, &self.queue, &self.device)
     }
 
     /// Layout-panel entry points — `GraphPipelines` needs the device and/or

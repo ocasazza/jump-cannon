@@ -6,7 +6,7 @@ use std::sync::Mutex;
 
 use data_loader::testing::assert_import_contract;
 use data_loader::{
-    Effect, ImportFuture, ImportError, ImportOutcome, Importer, Transport, WatchPlan,
+    Effect, ImportError, ImportFuture, ImportOutcome, Importer, NoProgress, Transport, WatchPlan,
 };
 
 use super::*;
@@ -268,7 +268,7 @@ async fn import_maps_the_corpus_into_the_github_namespace() {
     let temp = tempfile::tempdir().unwrap();
     let importer = fixture_importer(temp.path(), FIXTURE_ETAG);
 
-    let result = match importer.import().await.unwrap() {
+    let result = match importer.import(&NoProgress).await.unwrap() {
         ImportOutcome::Loaded(result) => result,
         ImportOutcome::Unchanged => panic!("first import must parse the corpus"),
     };
@@ -321,14 +321,14 @@ async fn warm_304_reports_unchanged_without_parsing() {
         GitHubImporter::with_source(test_config(temp.path()), Box::new(source)).unwrap();
 
     // Warm the process: one full fetch + parse.
-    let ImportOutcome::Loaded(first) = importer.import().await.unwrap() else {
+    let ImportOutcome::Loaded(first) = importer.import(&NoProgress).await.unwrap() else {
         panic!("first import must load a fresh graph");
     };
     // The next poll sent If-None-Match and got a 304 against an extraction
     // this process already parsed: the import resolves to Unchanged and the
     // cached tarball is never re-parsed.
     assert!(matches!(
-        importer.import().await.unwrap(),
+        importer.import(&NoProgress).await.unwrap(),
         ImportOutcome::Unchanged
     ));
 
@@ -360,7 +360,7 @@ async fn warm_304_reports_unchanged_without_parsing() {
 async fn restart_recovers_the_cache_pointer_and_cold_304_still_parses() {
     let temp = tempfile::tempdir().unwrap();
     let importer = fixture_importer(temp.path(), FIXTURE_ETAG);
-    importer.import().await.unwrap();
+    importer.import(&NoProgress).await.unwrap();
     drop(importer);
 
     // A new process (fresh in-memory state) over the same cache dir must
@@ -371,7 +371,7 @@ async fn restart_recovers_the_cache_pointer_and_cold_304_still_parses() {
     let source = FixtureTarball::new(fixture_tarball(), FIXTURE_ETAG);
     let importer =
         GitHubImporter::with_source(test_config(temp.path()), Box::new(source)).unwrap();
-    let result = match importer.import().await.unwrap() {
+    let result = match importer.import(&NoProgress).await.unwrap() {
         ImportOutcome::Loaded(result) => result,
         ImportOutcome::Unchanged => panic!("a cold process must parse its cached extraction"),
     };
@@ -390,13 +390,13 @@ async fn restart_recovers_the_cache_pointer_and_cold_304_still_parses() {
 async fn a_new_etag_replaces_and_prunes_the_extraction() {
     let temp = tempfile::tempdir().unwrap();
     let importer = fixture_importer(temp.path(), "v1");
-    importer.import().await.unwrap();
+    importer.import(&NoProgress).await.unwrap();
     assert!(temp.path().join("acme-corpus-v1").is_dir());
 
     let source = FixtureTarball::new(fixture_tarball(), "v2");
     let importer =
         GitHubImporter::with_source(test_config(temp.path()), Box::new(source)).unwrap();
-    importer.import().await.unwrap();
+    importer.import(&NoProgress).await.unwrap();
     assert!(temp.path().join("acme-corpus-v2").is_dir());
     assert!(
         !temp.path().join("acme-corpus-v1").exists(),

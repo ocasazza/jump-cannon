@@ -13,7 +13,8 @@ use std::io::Read;
 use std::path::PathBuf;
 
 use data_loader::{
-    Capability, Effect, ImportError, ImportFuture, SourceConnector, SourceRecord, Transport,
+    Capability, Effect, ImportError, ImportFuture, ImportProgress, SourceConnector, SourceRecord,
+    Transport,
 };
 
 use crate::guess_content_type;
@@ -203,7 +204,10 @@ impl SourceConnector for SshConnector {
         }
     }
 
-    fn read<'a>(&'a self) -> ImportFuture<'a, Result<Vec<SourceRecord>, ImportError>> {
+    fn read<'a>(
+        &'a self,
+        _progress: &'a dyn ImportProgress,
+    ) -> ImportFuture<'a, Result<Vec<SourceRecord>, ImportError>> {
         Box::pin(async move {
             let bytes = self.backend.fetch(&self.config)?;
             if bytes.len() > self.config.max_response_bytes {

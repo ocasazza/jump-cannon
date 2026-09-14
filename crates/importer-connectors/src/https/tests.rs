@@ -7,6 +7,7 @@ use std::sync::Arc;
 use parking_lot::Mutex;
 
 use super::*;
+use data_loader::NoProgress;
 
 struct FixtureTransport {
     response: Result<HttpResponse, String>,
@@ -91,7 +92,7 @@ async fn emits_one_record_with_status_and_content_type() {
         },
         HttpsConfig::new("https://api.example.com/v1/things"),
     );
-    let records = connector.read().await.unwrap();
+    let records = connector.read(&NoProgress).await.unwrap();
     assert_eq!(records.len(), 1);
     let record = &records[0];
     assert_eq!(record.origin, "https://api.example.com/v1/things");
@@ -113,7 +114,7 @@ async fn defaults_content_type_when_absent() {
         },
         HttpsConfig::new("https://api.example.com/blob"),
     );
-    let records = connector.read().await.unwrap();
+    let records = connector.read(&NoProgress).await.unwrap();
     assert_eq!(records[0].content_type, DEFAULT_CONTENT_TYPE);
 }
 
@@ -128,7 +129,7 @@ async fn passes_token_and_byte_cap_to_transport() {
         Box::new(transport),
     )
     .unwrap();
-    connector.read().await.unwrap();
+    connector.read(&NoProgress).await.unwrap();
     assert_eq!(
         seen.lock().as_slice(),
         &[(
@@ -146,7 +147,7 @@ async fn transport_error_propagates_as_source_read() {
         Box::new(FixtureTransport::failing("connection refused")),
     )
     .unwrap();
-    let error = connector.read().await.unwrap_err();
+    let error = connector.read(&NoProgress).await.unwrap_err();
     assert_eq!(
         error,
         ImportError::SourceRead {

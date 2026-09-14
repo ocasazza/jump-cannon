@@ -3,6 +3,7 @@
 //! of the unit suite.
 
 use super::*;
+use data_loader::NoProgress;
 
 struct FixtureBackend {
     result: Result<Vec<u8>, String>,
@@ -52,7 +53,7 @@ async fn emits_one_record_guessing_content_type_from_path() {
         SshConfig::new("files.example.com", "alice", "/srv/data/things.json"),
         Ok(b"{}".to_vec()),
     );
-    let records = connector.read().await.unwrap();
+    let records = connector.read(&NoProgress).await.unwrap();
     assert_eq!(records.len(), 1);
     assert_eq!(records[0].origin, "ssh://alice@files.example.com/srv/data/things.json");
     assert_eq!(records[0].content_type, "application/json");
@@ -65,7 +66,7 @@ async fn enforces_byte_cap_on_backend_output() {
         SshConfig::new("h", "u", "/f.bin").with_max_response_bytes(4),
         Ok(vec![0u8; 5]),
     );
-    let error = connector.read().await.unwrap_err();
+    let error = connector.read(&NoProgress).await.unwrap_err();
     assert!(matches!(error, ImportError::SourceRead { .. }));
     assert!(error.to_string().contains("byte bound"));
 }
@@ -76,7 +77,7 @@ async fn backend_error_propagates() {
         SshConfig::new("h", "u", "/f.bin"),
         Err("channel read failed".to_string()),
     );
-    let error = connector.read().await.unwrap_err();
+    let error = connector.read(&NoProgress).await.unwrap_err();
     assert_eq!(
         error,
         ImportError::SourceRead {

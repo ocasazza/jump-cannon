@@ -41,8 +41,8 @@ use std::sync::Mutex;
 use data_loader::{
     identity::{self, Namespace},
     Capability, DiscoveryField, DiscoveryFieldType, EdgeTypeSchema, Effect, ImportError,
-    ImportFuture, ImportOutcome, Importer, ImporterDescriptor, ImporterSchema, LoadResult,
-    TagHierarchySchema, Transport, WatchPlan,
+    ImportFuture, ImportOutcome, ImportProgress, Importer, ImporterDescriptor, ImporterSchema,
+    LoadResult, TagHierarchySchema, Transport, WatchPlan,
 };
 
 pub use fetch::{FetchOutcome, HttpTarballSource, TarballSource};
@@ -465,7 +465,10 @@ impl Importer for GitHubImporter {
         .with_watch(watch)
     }
 
-    fn import<'a>(&'a self) -> ImportFuture<'a, Result<ImportOutcome, ImportError>> {
+    fn import<'a>(
+        &'a self,
+        _progress: &'a dyn ImportProgress,
+    ) -> ImportFuture<'a, Result<ImportOutcome, ImportError>> {
         Box::pin(async move {
             let cached = self.cached_state();
             let outcome = self.source.fetch(cached.etag.as_deref()).await?;
