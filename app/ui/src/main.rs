@@ -411,6 +411,92 @@ fn default_layout() -> Vec<PanelWin<Panel>> {
     v
 }
 
+/// The `jc_shell` cookie mirrors the *primary* (user-view) workspace's
+/// settled floating layout into a compact string that graph-api's `GET /`
+/// handler reads to server-render the pre-WASM boot shell — so a returning
+/// visitor sees their own panel rects painted before the app WASM loads,
+/// with no JavaScript.
+///
+/// Value grammar (kept byte-for-byte identical to the parser in
+/// `crates/graph-api/src/server.rs::parse_shell_cookie`):
+///
+///   v1;<mode>;<title>,<x>,<y>,<w>,<h>;<title>,<x>,<y>,<w>,<h>;…
+///
+///   - `v1`      literal version tag; the server ignores any other prefix.
+///   - `<mode>`  `f` (floating) or `t` (tiling).
+///   - `<title>` panel display title, `[A-Za-z0-9 _-]`, 1-24 chars.
+///   - coords    non-negative integers ≤ 20000.
+///   - only visible (non-minimized) panels are emitted, in z-order
+///     (bottom-first) so the server can write them in DOM order.
+///   - at most 16 panels and 1024 bytes total; this writer truncates to fit.
+///
+/// In tiling mode the stored pixel rects are still written with a `t` tag; the
+/// server ignores them because tiling geometry is viewport-derived and not
+/// knowable server-side, so it falls back to the static default shell.
+const SHELL_COOKIE_MAX_PANELS: usize = 16;
+const SHELL_COOKIE_MAX_BYTES: usize = 1024;
+const SHELL_COORD_MAX: f64 = 20_000.0;
+
+/// Serialize the visible panels of one workspace into the `jc_shell` grammar.
+fn serialize_shell_cookie(panels: &[PanelWin<Panel>], mode: panel_kit::Mode) -> String {
+    let mode_tag = if mode == panel_kit::Mode::Tiling { 't' } else { 'f' };
+    // Visible = not docked (minimized). Bottom-first z-order so the server
+    // emits DOM order matching the floating stack (later siblings paint on
+    // top), mirroring panel-kit's own render order.
+    let mut order: Vec<&PanelWin<Panel>> = panels
+        .iter()
+        .filter(|p| p.state != panel_kit::WinState::Minimized)
+        .collect();
+    order.sort_by_key(|p| p.z);
+
+    let mut out = format!("v1;{mode_tag}");
+    for p in order.into_iter().take(SHELL_COOKIE_MAX_PANELS) {
+        // Reuse the panel kind's canonical display title — the same source
+        // the topbar and panel headers use — so the shell never invents a
+        // second title mapping.
+        let title = panel_kit::PanelKind::title(p.kind);
+        let clamp = |v: f64| v.round().clamp(0.0, SHELL_COORD_MAX) as i64;
+        let seg = format!(
+            ";{},{},{},{},{}",
+            title,
+            clamp(p.x),
+            clamp(p.y),
+            clamp(p.w),
+            clamp(p.h),
+        );
+        // Truncate at the byte ceiling rather than emit a value the server
+        // will reject wholesale.
+        if out.len() + seg.len() > SHELL_COOKIE_MAX_BYTES {
+            break;
+        }
+        out.push_str(&seg);
+    }
+    out
+}
+
+/// Write the `jc_shell` cookie. The value is percent-encoded for transport
+/// (its grammar's `;` and `,` are cookie delimiters); graph-api percent-decodes
+/// it back before parsing. `Secure` is set only on an https origin — the app is
+/// served over plain http in dev (localhost), where a hardcoded `Secure` flag
+/// would silently drop the cookie.
+fn write_shell_cookie(value: &str) {
+    use wasm_bindgen::JsCast;
+    let Some(win) = web_sys::window() else { return };
+    let Some(doc) = win.document() else { return };
+    let html_doc: web_sys::HtmlDocument = doc.unchecked_into();
+    let encoded = urlencoding::encode(value);
+    let secure = win
+        .location()
+        .protocol()
+        .map(|p| p.eq_ignore_ascii_case("https:"))
+        .unwrap_or(false);
+    let mut cookie = format!("jc_shell={encoded}; path=/; max-age=31536000; SameSite=Lax");
+    if secure {
+        cookie.push_str("; Secure");
+    }
+    let _ = html_doc.set_cookie(&cookie);
+}
+
 /// Sessions view default layout: world management and history share the main
 /// row; the graph surface of the open world sits below, with branch/merge/GPU
 /// consoles in the dock until needed.
@@ -941,6 +1027,22 @@ fn App() -> Element {
                 &format!("{}: open", panel_kit::PanelKind::title(kind)),
             );
             *OPEN_PANEL.write() = None;
+        }
+    });
+
+    // Mirror the primary (user-view) workspace's settled layout into the
+    // `jc_shell` cookie so graph-api's `GET /` can server-render THIS
+    // visitor's own panel rects into the pre-WASM boot shell. Only the user
+    // view is mirrored — the Sessions workspace (`jc_sessions_layout_v1`) is a
+    // separate surface the boot shell does not represent. The cookie is
+    // rewritten only once a drag settles (matching panel-kit's own persist
+    // rule), so a mid-gesture layout never thrashes it.
+    use_effect(move || {
+        let panels = ws_user.panels.read();
+        let mode = *ws_user.mode.read();
+        let settled = ws_user.drag.read().is_none() && ws_user.tile_drag.read().is_none();
+        if settled {
+            write_shell_cookie(&serialize_shell_cookie(panels.as_slice(), mode));
         }
     });
 

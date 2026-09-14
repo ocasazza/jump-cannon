@@ -93,3 +93,19 @@ pub fn progress_bar(fraction: Option<f32>) -> Element {
         },
     }
 }
+
+/// First-paint placeholder for a panel (or a panel sub-surface) whose initial
+/// content is still being fetched. Presentational only: the shared
+/// [`progress_bar`] — indeterminate unless `fraction` is known — above a
+/// concrete label, so each panel shows its own hydration state instead of
+/// hiding behind one global wait. Distinct from `panel_kit::Spinner`, which
+/// stays for transient in-panel actions after first paint.
+#[component]
+pub fn PanelHydrating(label: String, #[props(default)] fraction: Option<f32>) -> Element {
+    rsx! {
+        div { class: "panel-hydrating", role: "status", aria_live: "polite",
+            {progress_bar(fraction)}
+            span { class: "panel-hydrating-label", "{label}" }
+        }
+    }
+}

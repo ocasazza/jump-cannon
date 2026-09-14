@@ -2994,7 +2994,7 @@ fn cluster_gallery(
         match snap {
             None => rsx! {
                 div { class: "lay-empty",
-                    panel_kit::Spinner { label: "contacting graph-api for the engine list…" }
+                    crate::build_progress::PanelHydrating { label: "contacting graph-api for the engine list" }
                 }
             },
             Some(Err(error)) => rsx! {

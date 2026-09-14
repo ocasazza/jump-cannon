@@ -142,25 +142,296 @@ pub fn router(state: AppState) -> Router {
 /// [`router`] with an explicit [`SourceHost`]: per-viewer source selection
 /// is honored according to the host's switch config.
 pub fn router_with_host(host: SourceHost) -> Router {
-    api_routes()
-        .route("/", get(index))
-        .route("/assets/*path", get(asset))
+    let mut router = api_routes();
+    // Frontend dist (dev mode / standalone server): serve every static file —
+    // the vendored Monaco tree under `/assets/vendor/...` and the root-level
+    // bundles (`app.css`, `jump-cannon-ui{.js,_bg.wasm}`, `tvix-worker.js`,
+    // `pest-worker.js`, `snippets/**`) — from disk. Wired as the router's
+    // fallback service, so it only runs when no API route (or the explicit
+    // `/` boot-shell route below) matched: API routes are never shadowed or
+    // 404-hijacked, and with no assets dir configured the fallback is left
+    // unset and unmatched paths 404 as before.
+    if let Some(dist) = host.default_state().inner.assets_dir.clone() {
+        // Explicit `GET /` server-renders the pre-WASM boot shell from the
+        // caller's `jc_shell` cookie. An explicit route outranks the
+        // `fallback_service` below, so ONLY the bare `/` request is
+        // intercepted — index.html fetched by name and every other asset path
+        // still flow through ServeDir's precompressed / 304 pipeline untouched.
+        router = router
+            .route("/", boot_shell_route(dist.clone()))
+            .fallback_service(static_assets_router(dist));
+    }
+    router
         // Permissive CORS: the Dioxus/Tauri app (app/) loads from its own
         // origin (tauri dev server / tauri:// in release) and fetches this API
         // cross-origin. Consistent with the local-dev no-auth stance documented
         // on /vault/page below — revisit both together if this ever binds
-        // beyond loopback.
+        // beyond loopback. Layered last so it also covers the asset fallback.
         .layer(tower_http::cors::CorsLayer::permissive())
-        // Root-level static fallback: the egui dist prefixes its files with
-        // /assets/ (root Trunk.toml public_url), but the Dioxus dist (app/)
-        // links its hashed wasm/js at the root. Serving unmatched paths from
-        // the assets dir lets graph-api host either frontend unchanged.
-        .fallback(get(asset_fallback))
         .with_state(host)
 }
 
-async fn asset_fallback(State(host): State<SourceHost>, uri: axum::http::Uri) -> impl IntoResponse {
-    asset_response(host.default_state(), uri.path().trim_start_matches('/'))
+/// The frontend-dist static file service used as [`router_with_host`]'s
+/// fallback. [`tower_http::services::ServeDir`] resolves each request against
+/// `dist` literally — `/` yields `index.html`, nested paths like
+/// `/assets/vendor/...` resolve as written — and enforces path-traversal
+/// containment, so no crafted `..` request escapes the dist root.
+/// `.precompressed_br()` / `.precompressed_gzip()` send a `foo.br` / `foo.gz`
+/// sibling with the matching `Content-Encoding` when the request's
+/// `Accept-Encoding` permits it, and fall back to the identity file when no
+/// sibling exists (the `trunk watch` dev dist ships none). ServeDir also emits
+/// `Last-Modified` and honors `If-Modified-Since` / `If-None-Match`, so a
+/// repeat load is a 304 instead of a re-sent bundle.
+///
+/// Header policy, applied to every asset response via layers:
+///   - `Vary: Accept-Encoding` — the body varies by the negotiated encoding, so
+///     shared caches must key on it.
+///   - `Cache-Control: no-cache` (equivalently `max-age=0, must-revalidate`) —
+///     every asset name is stable rather than content-hashed (`app/Trunk.toml`
+///     sets `filehash = false` because the app spawns workers at fixed URLs
+///     such as `/tvix-worker.js`), so immutable caching would pin stale bytes.
+///     `no-cache` lets the browser store the response but forces revalidation
+///     before reuse; the validators above turn that revalidation into a 304
+///     rather than a full multi-megabyte re-download.
+fn static_assets_router(dist: std::path::PathBuf) -> Router {
+    let serve = tower_http::services::ServeDir::new(dist)
+        .precompressed_br()
+        .precompressed_gzip();
+    Router::new()
+        .fallback_service(serve)
+        .layer(tower_http::set_header::SetResponseHeaderLayer::overriding(
+            header::VARY,
+            HeaderValue::from_static("accept-encoding"),
+        ))
+        .layer(tower_http::set_header::SetResponseHeaderLayer::overriding(
+            header::CACHE_CONTROL,
+            HeaderValue::from_static("no-cache"),
+        ))
+}
+
+// ─── Pre-WASM boot shell (`GET /`) ───────────────────────────────────────────
+//
+// A returning visitor's own panel layout is painted into the boot shell
+// *before* the app WASM downloads, over a cold wasm cache, with no JavaScript.
+// The app (app/ui/src/main.rs) mirrors its settled floating layout into the
+// `jc_shell` cookie; this handler reads that cookie and rewrites the marked
+// region of index.html with one absolutely-positioned frame per panel.
+//
+// Cookie value grammar (kept byte-for-byte identical to the writer in
+// `app/ui/src/main.rs::serialize_shell_cookie`; the transport form is
+// percent-encoded because the grammar's `;` and `,` are cookie delimiters):
+//
+//   v1;<mode>;<title>,<x>,<y>,<w>,<h>;<title>,<x>,<y>,<w>,<h>;…
+//
+//   - `v1`      literal version tag; any other prefix -> default shell.
+//   - `<mode>`  `f` (floating) or `t` (tiling).
+//   - `<title>` panel display title, `[A-Za-z0-9 _-]`, 1-24 chars.
+//   - coords    non-negative integers ≤ 20000.
+//   - only visible (non-minimized) panels, in z-order (bottom-first) so DOM
+//     order matches the floating stack.
+//   - at most 16 panels and 1024 bytes (decoded); larger -> rejected.
+
+/// The `jc_shell` cookie name, shared with the app-side writer.
+const SHELL_COOKIE_NAME: &str = "jc_shell";
+/// Max accepted decoded cookie length. Matches the writer's truncation
+/// ceiling; anything larger is a tampered or unknown-version value.
+const SHELL_COOKIE_MAX_BYTES: usize = 1024;
+/// Max panels the writer ever emits; a longer list is treated as malformed.
+const SHELL_COOKIE_MAX_PANELS: usize = 16;
+/// Upper bound on any single coordinate (matches the writer's clamp).
+const SHELL_COORD_MAX: i64 = 20_000;
+/// Max panel-title length in the grammar.
+const SHELL_TITLE_MAX: usize = 24;
+/// HTML-comment markers around the four static boot frames in index.html;
+/// the region between them is what the cookie-driven frames replace.
+const SHELL_FRAMES_OPEN: &str = "<!--panel-kit-boot-frames-->";
+const SHELL_FRAMES_CLOSE: &str = "<!--/panel-kit-boot-frames-->";
+
+/// One panel parsed from the cookie: a display title and an integer pixel rect.
+struct ShellPanel {
+    title: String,
+    x: i64,
+    y: i64,
+    w: i64,
+    h: i64,
+}
+
+/// Escape the five HTML-significant characters. The cookie title charset
+/// (`[A-Za-z0-9 _-]`) already excludes every one of these, so a conformant
+/// title is returned unchanged — but the cookie is untrusted input and this
+/// escaper, not the upstream charset check, is the trusted boundary that
+/// guarantees no cookie value can inject markup. Escape unconditionally.
+fn shell_html_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#39;"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// Parse one non-negative bounded integer coordinate. Rejects signs, decimals,
+/// whitespace, and values above [`SHELL_COORD_MAX`].
+fn parse_shell_coord(s: &str) -> Option<i64> {
+    if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let v: i64 = s.parse().ok()?;
+    (v <= SHELL_COORD_MAX).then_some(v)
+}
+
+/// Parse one `<title>,<x>,<y>,<w>,<h>` segment.
+fn parse_shell_panel(seg: &str) -> Option<ShellPanel> {
+    let mut f = seg.split(',');
+    let title = f.next()?;
+    if title.is_empty()
+        || title.len() > SHELL_TITLE_MAX
+        || !title
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b' ' | b'_' | b'-'))
+    {
+        return None;
+    }
+    let x = parse_shell_coord(f.next()?)?;
+    let y = parse_shell_coord(f.next()?)?;
+    let w = parse_shell_coord(f.next()?)?;
+    let h = parse_shell_coord(f.next()?)?;
+    // Exactly five fields — a sixth means a malformed segment.
+    if f.next().is_some() {
+        return None;
+    }
+    Some(ShellPanel {
+        title: title.to_string(),
+        x,
+        y,
+        w,
+        h,
+    })
+}
+
+/// Parse the decoded `jc_shell` value into the panels to render, or `None` on
+/// ANY validation failure. Tiling mode (`t`) also returns `None`: tiling
+/// geometry is derived from the live viewport at grid-layout time and is not
+/// knowable server-side, so a tiling cookie falls back to the static default
+/// shell rather than emitting the stored (pre-tiling) pixel rects.
+fn parse_shell_cookie(value: &str) -> Option<Vec<ShellPanel>> {
+    if value.len() > SHELL_COOKIE_MAX_BYTES {
+        return None;
+    }
+    let mut parts = value.split(';');
+    if parts.next()? != "v1" {
+        return None;
+    }
+    match parts.next()? {
+        "f" => {}
+        _ => return None, // "t" (tiling) or any other mode -> default shell
+    }
+    let mut panels = Vec::new();
+    for seg in parts {
+        if panels.len() >= SHELL_COOKIE_MAX_PANELS {
+            return None;
+        }
+        panels.push(parse_shell_panel(seg)?);
+    }
+    Some(panels)
+}
+
+/// Extract and percent-decode the `jc_shell` cookie from the request's Cookie
+/// header(s). The app writes the value percent-encoded (its grammar's `;` and
+/// `,` are cookie delimiters), so split on `;`, match the name, and decode the
+/// remainder back to the grammar.
+fn shell_cookie_value(headers: &HeaderMap) -> Option<String> {
+    let prefix = format!("{SHELL_COOKIE_NAME}=");
+    for hv in headers.get_all(header::COOKIE) {
+        let Ok(text) = hv.to_str() else { continue };
+        for pair in text.split(';') {
+            if let Some(raw) = pair.trim().strip_prefix(&prefix) {
+                return urlencoding::decode(raw).ok().map(|s| s.into_owned());
+            }
+        }
+    }
+    None
+}
+
+/// Rewrite the marked boot-frame region of `index` with one absolutely-
+/// positioned frame per cookie panel. Returns `None` (caller serves the file
+/// unchanged) when the markers are absent or malformed, or when index.html is
+/// not valid UTF-8.
+fn render_boot_shell(index: &[u8], panels: &[ShellPanel]) -> Option<Vec<u8>> {
+    let text = std::str::from_utf8(index).ok()?;
+    let open = text.find(SHELL_FRAMES_OPEN)?;
+    let region_start = open + SHELL_FRAMES_OPEN.len();
+    let close = text[region_start..].find(SHELL_FRAMES_CLOSE)? + region_start;
+
+    let mut frames = String::new();
+    for p in panels {
+        let title = shell_html_escape(&p.title);
+        // Same head / traffic-lights / title markup as the static shell, plus
+        // the `-fixed` modifier that switches the frame to absolute
+        // positioning at the cookie's page-relative rect.
+        frames.push_str(&format!(
+            "<div class=\"panel-kit-boot-panel panel-kit-boot-panel-fixed\" \
+style=\"left:{}px;top:{}px;width:{}px;height:{}px\">\
+<div class=\"panel-kit-boot-head\">\
+<span class=\"panel-kit-boot-lights\"><i></i><i></i><i></i></span>\
+<span class=\"panel-kit-boot-title-sm\">{}</span>\
+</div></div>",
+            p.x, p.y, p.w, p.h, title
+        ));
+    }
+
+    let mut out = String::with_capacity(index.len() + frames.len());
+    out.push_str(&text[..region_start]);
+    out.push_str(&frames);
+    out.push_str(&text[close..]);
+    Some(out.into_bytes())
+}
+
+/// `GET /` handler core: read index.html, and — when a valid `jc_shell` cookie
+/// is present — return it with the boot frames rewritten to the visitor's own
+/// panel rects; otherwise return the file byte-for-byte so the static default
+/// shell renders. The body is ~4 KB and cookie-dependent, so it is served
+/// uncompressed with `Cache-Control: no-cache` and `Vary: Cookie`.
+fn boot_shell_response(dist: &std::path::Path, headers: &HeaderMap) -> axum::response::Response {
+    let Ok(index) = std::fs::read(dist.join("index.html")) else {
+        // Same 404 posture as the ServeDir path when index.html is absent
+        // (assets dir configured but the dist not built yet).
+        return (StatusCode::NOT_FOUND, "index.html not found").into_response();
+    };
+
+    let rendered = shell_cookie_value(headers)
+        .as_deref()
+        .and_then(parse_shell_cookie)
+        .and_then(|panels| render_boot_shell(&index, &panels));
+    let body = rendered.unwrap_or(index);
+
+    // `Html` sets `Content-Type: text/html; charset=utf-8`; the extra header
+    // map only adds the cache/vary policy (distinct keys, no clobber).
+    let mut out = HeaderMap::new();
+    out.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
+    // The body varies by the jc_shell cookie: shared caches must key on the
+    // Cookie header so one visitor's shell is never served to another.
+    out.insert(header::VARY, HeaderValue::from_static("cookie"));
+    (out, axum::response::Html(body)).into_response()
+}
+
+/// The `GET /` route (boot shell). Generic over the router's state type so the
+/// same wiring is used by [`router_with_host`] (state `SourceHost`) and the
+/// tests (state `()`). The handler is stateless — it closes over the dist dir.
+fn boot_shell_route<S>(dist: std::path::PathBuf) -> axum::routing::MethodRouter<S>
+where
+    S: Clone + Send + Sync + 'static,
+{
+    get(move |headers: HeaderMap| {
+        let dist = dist.clone();
+        async move { boot_shell_response(&dist, &headers) }
+    })
 }
 
 /// Return the sanitized deployment source catalog. The response always
@@ -1325,24 +1596,6 @@ async fn source_parameters(
     }
 }
 
-async fn index(State(host): State<SourceHost>) -> impl IntoResponse {
-    asset_response(host.default_state(), "index.html")
-}
-
-async fn asset(State(host): State<SourceHost>, Path(path): Path<String>) -> impl IntoResponse {
-    // Nested asset directories (e.g. the vendored Monaco bundle at
-    // assets/vendor/) serve literally; bare names keep the legacy
-    // egui-prefix convention of resolving at the dist root.
-    let s = host.default_state();
-    if let Some(dir) = &s.inner.assets_dir {
-        let nested = dir.join("assets").join(&path);
-        if nested.is_file() {
-            return asset_response(s, &format!("assets/{path}"));
-        }
-    }
-    asset_response(s, &path)
-}
-
 // --- App-state config presets -------------------------------------------------
 //
 // These endpoints let the dev-server ship named preset configs so a user can
@@ -1415,51 +1668,6 @@ async fn config_get(selection: SourceSelection, Path(name): Path<String>) -> imp
         )
             .into_response(),
         Err(_) => (StatusCode::NOT_FOUND, "no such config").into_response(),
-    }
-}
-
-/// Serve the frontend dist from disk (assets_dir): read every request —
-/// refresh browser to see JS/CSS/HTML edits without rebuild.
-///
-/// There is no embedded fallback anymore (the egui renderer's include_dir!()
-/// bundle was retired with that crate): the frontend dist is always served
-/// from `--assets-dir` / `JUMP_CANNON_ASSETS_DIR`; without it, assets 404.
-fn asset_response(s: &AppState, path: &str) -> axum::response::Response {
-    let mime = mime_for(path);
-    if let Some(dir) = &s.inner.assets_dir {
-        let full = dir.join(path);
-        match std::fs::read(&full) {
-            Ok(bytes) => {
-                let mut headers = HeaderMap::new();
-                headers.insert(header::CONTENT_TYPE, HeaderValue::from_str(mime).unwrap());
-                (StatusCode::OK, headers, bytes).into_response()
-            }
-            Err(_) => (
-                StatusCode::NOT_FOUND,
-                format!("not found: {}", full.display()),
-            )
-                .into_response(),
-        }
-    } else {
-        (
-            StatusCode::NOT_FOUND,
-            "no assets dir configured (start with --assets-dir or JUMP_CANNON_ASSETS_DIR)",
-        )
-            .into_response()
-    }
-}
-
-fn mime_for(path: &str) -> &'static str {
-    match path.rsplit('.').next().unwrap_or("") {
-        "html" => "text/html; charset=utf-8",
-        "js" => "application/javascript",
-        "wasm" => "application/wasm",
-        "css" => "text/css",
-        "json" => "application/json",
-        "proto" => "text/plain; charset=utf-8",
-        "png" => "image/png",
-        "svg" => "image/svg+xml",
-        _ => "application/octet-stream",
     }
 }
 
@@ -2357,5 +2565,304 @@ mod tests {
         assert!(validate_initial_positions(&nonfinite, 2)
             .unwrap_err()
             .contains("not finite"));
+    }
+
+    // --- Static asset serving (the `router_with_host` frontend fallback) ---
+    //
+    // These drive `static_assets_router` — the exact service wired as the
+    // router's fallback — over a throwaway dist dir, so each asserts an
+    // observable transport contract a regression would break.
+    use axum::body::{to_bytes, Body};
+    use axum::http::Request;
+    use tower::ServiceExt as _;
+
+    /// A unique empty dist dir under the system temp root. Unique per call so
+    /// parallel tests never collide on the same files.
+    fn temp_dist(tag: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "graph-api-assets-{tag}-{}-{nanos}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed),
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[tokio::test]
+    async fn root_serves_index_html_with_revalidation_cache_control() {
+        let dist = temp_dist("index");
+        std::fs::write(dist.join("index.html"), b"<!doctype html><title>jc</title>").unwrap();
+
+        let resp = static_assets_router(dist.clone())
+            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(resp
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .starts_with("text/html"));
+        // Stable-named bundles (filehash = false) must revalidate, not cache
+        // immutably — see `static_assets_router`.
+        assert!(resp
+            .headers()
+            .get(header::CACHE_CONTROL)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .contains("no-cache"));
+        let _ = std::fs::remove_dir_all(&dist);
+    }
+
+    #[tokio::test]
+    async fn precompressed_br_sent_only_when_accept_encoding_allows_it() {
+        let dist = temp_dist("br");
+        std::fs::write(dist.join("a.wasm"), b"identity-bytes").unwrap();
+        std::fs::write(dist.join("a.wasm.br"), b"brotli-sibling-bytes").unwrap();
+
+        // `accept-encoding: br` -> the `.br` sibling, verbatim, tagged `br`.
+        let resp = static_assets_router(dist.clone())
+            .oneshot(
+                Request::builder()
+                    .uri("/a.wasm")
+                    .header(header::ACCEPT_ENCODING, "br")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers()
+                .get(header::CONTENT_ENCODING)
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "br"
+        );
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(body.as_ref(), b"brotli-sibling-bytes");
+
+        // No `accept-encoding` -> the identity file, no `Content-Encoding`.
+        let resp = static_assets_router(dist.clone())
+            .oneshot(
+                Request::builder()
+                    .uri("/a.wasm")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(resp.headers().get(header::CONTENT_ENCODING).is_none());
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(body.as_ref(), b"identity-bytes");
+        let _ = std::fs::remove_dir_all(&dist);
+    }
+
+    #[tokio::test]
+    async fn if_modified_since_returns_304_with_empty_body() {
+        let dist = temp_dist("cond");
+        std::fs::write(dist.join("a.wasm"), b"identity-bytes").unwrap();
+
+        let resp = static_assets_router(dist.clone())
+            .oneshot(
+                Request::builder()
+                    .uri("/a.wasm")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let last_modified = resp
+            .headers()
+            .get(header::LAST_MODIFIED)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_owned();
+
+        let resp = static_assets_router(dist.clone())
+            .oneshot(
+                Request::builder()
+                    .uri("/a.wasm")
+                    .header(header::IF_MODIFIED_SINCE, last_modified.as_str())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_MODIFIED);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        assert!(body.is_empty());
+        let _ = std::fs::remove_dir_all(&dist);
+    }
+
+    #[tokio::test]
+    async fn asset_responses_vary_on_accept_encoding() {
+        let dist = temp_dist("vary");
+        std::fs::write(dist.join("a.wasm"), b"identity-bytes").unwrap();
+
+        let resp = static_assets_router(dist.clone())
+            .oneshot(
+                Request::builder()
+                    .uri("/a.wasm")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(resp
+            .headers()
+            .get(header::VARY)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_ascii_lowercase()
+            .contains("accept-encoding"));
+        let _ = std::fs::remove_dir_all(&dist);
+    }
+
+    // --- Boot shell (`GET /`, cookie-driven) ---
+    //
+    // These drive `boot_shell_route` — the exact route wired at `/` — over a
+    // throwaway dist whose index.html carries the boot-frame markers, so each
+    // pins an observable contract of the server-rendered shell.
+
+    /// Minimal index.html with the boot-frame markers and one static default
+    /// frame between them, mirroring app/ui/index.html's structure.
+    const SHELL_INDEX: &str = concat!(
+        "<!doctype html><html><body>",
+        "<div id=\"main\"></div>",
+        "<section class=\"panel-kit-boot\" data-panel-kit-static-boot>",
+        "<main class=\"panel-kit-boot-panels\">",
+        "<!--panel-kit-boot-frames-->",
+        "<div class=\"panel-kit-boot-panel\">",
+        "<span class=\"panel-kit-boot-title-sm\">Graph</span></div>",
+        "<!--/panel-kit-boot-frames-->",
+        "</main></section></body></html>",
+    );
+
+    fn shell_dist(tag: &str) -> std::path::PathBuf {
+        let dist = temp_dist(tag);
+        std::fs::write(dist.join("index.html"), SHELL_INDEX).unwrap();
+        dist
+    }
+
+    /// Drive `GET /` through the real route. `cookie` is the DECODED grammar;
+    /// it is percent-encoded here exactly as the app-side writer does.
+    async fn shell_get(
+        dist: &std::path::Path,
+        cookie: Option<&str>,
+    ) -> (StatusCode, HeaderMap, Vec<u8>) {
+        let mut req = Request::builder().uri("/");
+        if let Some(c) = cookie {
+            req = req.header(header::COOKIE, format!("jc_shell={}", urlencoding::encode(c)));
+        }
+        let resp = Router::new()
+            .route("/", boot_shell_route(dist.to_path_buf()))
+            .oneshot(req.body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let status = resp.status();
+        let headers = resp.headers().clone();
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap().to_vec();
+        (status, headers, body)
+    }
+
+    #[tokio::test]
+    async fn valid_cookie_renders_visitor_panel_rects() {
+        let dist = shell_dist("shell-valid");
+        let (status, headers, body) =
+            shell_get(&dist, Some("v1;f;Graph,12,44,640,620;Nodes,660,44,608,620")).await;
+        assert_eq!(status, StatusCode::OK);
+        let html = String::from_utf8(body).unwrap();
+        assert!(html.contains(">Graph<"), "missing Graph title: {html}");
+        assert!(html.contains(">Nodes<"), "missing Nodes title: {html}");
+        assert!(html.contains("left:12px"), "missing first rect: {html}");
+        assert!(html.contains("left:660px"), "missing second rect: {html}");
+        assert!(html.contains("panel-kit-boot-panel-fixed"));
+        assert!(headers
+            .get(header::VARY)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_ascii_lowercase()
+            .contains("cookie"));
+        let _ = std::fs::remove_dir_all(&dist);
+    }
+
+    #[tokio::test]
+    async fn absent_cookie_serves_index_byte_for_byte() {
+        let dist = shell_dist("shell-none");
+        let on_disk = std::fs::read(dist.join("index.html")).unwrap();
+        let (status, _headers, body) = shell_get(&dist, None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, on_disk);
+        let _ = std::fs::remove_dir_all(&dist);
+    }
+
+    #[tokio::test]
+    async fn every_rejection_class_falls_back_to_static_shell() {
+        let dist = shell_dist("shell-reject");
+        let on_disk = std::fs::read(dist.join("index.html")).unwrap();
+
+        // 17 valid panels exceed the 16-panel cap.
+        let too_many = format!(
+            "v1;f;{}",
+            std::iter::repeat("Graph,1,1,1,1")
+                .take(17)
+                .collect::<Vec<_>>()
+                .join(";")
+        );
+        // > 1024 decoded bytes.
+        let oversized = format!("v1;f;{}", "Graph,0,0,0,0;".repeat(90));
+        assert!(oversized.len() > SHELL_COOKIE_MAX_BYTES);
+
+        let cases = [
+            "v2;f;Graph,12,44,640,620", // wrong version tag
+            oversized.as_str(),         // oversized value
+            too_many.as_str(),          // > 16 panels
+            "v1;f;Graph,20001,0,0,0",   // coordinate > 20000
+            "v1;f;Graph,12.5,0,0,0",    // non-integer coordinate
+            "v1;f;Gr@ph,0,0,0,0",       // disallowed title character
+            "v1;t;Graph,12,44,640,620", // tiling mode (viewport-derived)
+        ];
+        for c in cases {
+            let (status, _h, body) = shell_get(&dist, Some(c)).await;
+            assert_eq!(status, StatusCode::OK, "case: {c}");
+            assert_eq!(body, on_disk, "should fall back unchanged: {c}");
+        }
+        let _ = std::fs::remove_dir_all(&dist);
+    }
+
+    #[tokio::test]
+    async fn missing_index_is_404() {
+        let dist = temp_dist("shell-missing");
+        let (status, _h, _b) = shell_get(&dist, None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let _ = std::fs::remove_dir_all(&dist);
+    }
+
+    #[test]
+    fn shell_escaper_neutralizes_html_metacharacters() {
+        // A title with HTML metacharacters is impossible under the cookie
+        // charset, so the escaper — the trusted rendering boundary — is
+        // asserted directly instead of through a (rejected) cookie.
+        assert_eq!(
+            shell_html_escape("<img src=x onerror=alert(1)>&\"'"),
+            "&lt;img src=x onerror=alert(1)&gt;&amp;&quot;&#39;"
+        );
     }
 }

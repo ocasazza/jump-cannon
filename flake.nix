@@ -1298,6 +1298,30 @@
           trunkIndexPath = "ui/index.html";
           cargoExtraArgs = "--package jump-cannon-ui";
           wasm-bindgen-cli = pkgs.wasm-bindgen-cli_0_2_118;
+
+          # Precompressed transport siblings: graph-api serves the `.br`/`.gz`
+          # next to each asset with the matching Content-Encoding and falls back
+          # to identity when they are absent (the `trunk watch` dev dist has
+          # none). brotli embeds no timestamp and `gzip -n` drops the name/mtime
+          # header field, so the outputs are byte-deterministic and the store
+          # hash stays stable. Crane merges these onto its own trunk toolchain.
+          nativeBuildInputs = [ pkgs.brotli pkgs.gzip ];
+          postInstall = ''
+            # Every compressible asset larger than 1 KiB (-size +1024c is an
+            # exact byte threshold, no find unit rounding) gets a brotli-q11
+            # (lgwin 24, the largest window standard decoders accept) and a
+            # gzip -9 sibling. The originals are kept for identity requests.
+            find "$out" -type f \( \
+                -name '*.html' -o -name '*.js' -o -name '*.css' \
+              -o -name '*.wasm' -o -name '*.json' -o -name '*.svg' \
+              -o -name '*.ttf'  -o -name '*.txt'  -o -name '*.map' \
+              \) -size +1024c -exec sh -c '
+                for f do
+                  brotli --quality=11 --lgwin=24 --force --output="$f.br" "$f"
+                  gzip -9 -n -c "$f" > "$f.gz"
+                done
+              ' sh {} +
+          '';
         } // pkgs.lib.optionalAttrs (publicUrl != null) {
           trunkExtraBuildArgs = "--public-url ${publicUrl}";
         });

@@ -1197,7 +1197,7 @@ pub fn panel(ctx: Ctx) -> Element {
                 div { class: "imp-rows", role: "listbox", aria_label: "Server catalog",
                     match &catalog {
                         CatalogState::Idle | CatalogState::Loading => rsx! {
-                            div { class: "imp-note", role: "status", "loading catalog…" }
+                            build_progress::PanelHydrating { label: "loading catalog" }
                         },
                         CatalogState::Unavailable(reason) => rsx! {
                             div { class: "imp-note", "data-field": "catalog-unavailable",
