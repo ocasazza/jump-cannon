@@ -35,14 +35,14 @@ mod fetch;
 
 use std::fmt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
 use data_loader::{
     identity::{self, Namespace},
     Capability, DiscoveryField, DiscoveryFieldType, EdgeTypeSchema, Effect, ImportError,
-    ImportFuture, ImportProgress, Importer, ImporterDescriptor, ImporterSchema, LoadResult,
-    TagHierarchySchema,
-    Transport, WatchPlan,
+    ImportFuture, ImportOutcome, ImportProgress, Importer, ImporterDescriptor, ImporterSchema,
+    LoadResult, TagHierarchySchema, Transport, WatchPlan,
 };
 
 pub use fetch::{FetchOutcome, HttpTarballSource, TarballSource};
@@ -222,7 +222,6 @@ struct CacheState {
     /// Active extraction directory under `cache_dir`.
     extraction: Option<PathBuf>,
 }
-
 /// An asynchronous [`Importer`] that publishes the vault corpus of one GitHub
 /// repository ref under the `github:{source_id}:` namespace.
 pub struct GitHubImporter {
@@ -230,6 +229,12 @@ pub struct GitHubImporter {
     namespace: Namespace,
     source: Box<dyn TarballSource>,
     state: Mutex<CacheState>,
+    /// Whether this process has already completed one successful
+    /// parse-to-`LoadResult` pass. Deliberately in-memory only: after a
+    /// restart with a disk-recovered ETag, the first 304 must still parse
+    /// the cached extraction because this process holds no snapshot it
+    /// could keep instead.
+    parsed_once: AtomicBool,
 }
 
 impl GitHubImporter {
@@ -261,23 +266,13 @@ impl GitHubImporter {
                 etag: None,
                 extraction: None,
             }),
+            parsed_once: AtomicBool::new(false),
         })
     }
 
     /// The validated identity namespace (`github:{source_id}:`).
     pub fn namespace(&self) -> &Namespace {
         &self.namespace
-    }
-
-    /// Resolve the extraction directory for this poll: revalidate the cached
-    /// ETag, extract fresh bytes on a 200, reuse the cached extraction on a
-    /// 304. A failed fetch or extraction never disturbs the previously
-    /// published extraction — the error surfaces through [`ImportError`] and
-    /// graph-api keeps the old snapshot live.
-    async fn resolve_extraction(&self) -> Result<PathBuf, ImportError> {
-        let cached = self.cached_state();
-        let outcome = self.source.fetch(cached.etag.as_deref()).await?;
-        self.apply_fetch_outcome(outcome)
     }
 
     /// Apply one fetch outcome against the on-disk cache. Split from the
@@ -473,10 +468,23 @@ impl Importer for GitHubImporter {
     fn import<'a>(
         &'a self,
         _progress: &'a dyn ImportProgress,
-    ) -> ImportFuture<'a, Result<LoadResult, ImportError>> {
+    ) -> ImportFuture<'a, Result<ImportOutcome, ImportError>> {
         Box::pin(async move {
-            let extraction = self.resolve_extraction().await?;
-            self.load_from_extraction(&extraction)
+            let cached = self.cached_state();
+            let outcome = self.source.fetch(cached.etag.as_deref()).await?;
+            // A 304 against an extraction this process already parsed
+            // proves the corpus is unchanged: report it and skip the parse.
+            // The flag is in-memory only, so a restarted process still
+            // parses its disk-recovered extraction on the first 304.
+            if matches!(outcome, FetchOutcome::NotModified)
+                && self.parsed_once.load(Ordering::Acquire)
+            {
+                return Ok(ImportOutcome::Unchanged);
+            }
+            let extraction = self.apply_fetch_outcome(outcome)?;
+            let loaded = self.load_from_extraction(&extraction)?;
+            self.parsed_once.store(true, Ordering::Release);
+            Ok(ImportOutcome::Loaded(loaded))
         })
     }
 }

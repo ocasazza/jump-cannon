@@ -14,9 +14,9 @@ use tower::ServiceExt; // for `oneshot`
 
 use data_loader::{
     Capability, ContentSchema, DiscoveryField, DiscoveryFieldType, EdgeTypeSchema, Effect,
-    HostedImporter, ImportError, ImportFuture, ImportProgress, Importer, ImporterDescriptor,
-    ImporterSchema,
-    LoadResult, Loader, SearchDocument, TagHierarchySchema, Transport,
+    HostedImporter, ImportError, ImportFuture, ImportOutcome, ImportProgress, Importer,
+    ImporterDescriptor, ImporterSchema, LoadResult, Loader, SearchDocument, TagHierarchySchema,
+    Transport,
 };
 use graph_api::importer_catalog::ImporterCatalog;
 use graph_api::proto::{Init, MetaSummary, NodeMeta};
@@ -136,8 +136,8 @@ impl Importer for DeclaredButUngrantedWrite {
     fn import<'a>(
         &'a self,
         _progress: &'a dyn ImportProgress,
-    ) -> ImportFuture<'a, Result<LoadResult, ImportError>> {
-        Box::pin(async { Ok(load_result(VaultGraph::new())) })
+    ) -> ImportFuture<'a, Result<ImportOutcome, ImportError>> {
+        Box::pin(async { Ok(ImportOutcome::Loaded(load_result(VaultGraph::new()))) })
     }
 }
 
@@ -1460,6 +1460,9 @@ fn packages_host(dir: &std::path::Path, catalog_raw: &str, group: Option<&str>) 
     )
     .expect("catalog parses");
     catalog.load_overlay(dir).expect("overlay merges");
+    catalog
+        .load_variables_overlay(dir)
+        .expect("variables overlay applies");
     SourceHost::with_packages_dir(
         state_with_catalog(catalog),
         SwitchConfig::new(group.map(str::to_owned), GROUPS_HEADER),
@@ -1891,5 +1894,248 @@ async fn parameters_route_discovers_values_and_falls_back_on_error() {
         "falls back to the static values"
     );
     server.abort();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// GET/PUT /importers/:id/variables: the declared/current contract with the
+/// catalog's read posture, switch-gated mutation, key validation against the
+/// package's declared variables, persistence to `variables.local.json`, the
+/// in-memory catalog update, and invalidation of the running alternate.
+#[tokio::test]
+async fn importer_variables_get_and_put_contract() {
+    let (dir, catalog) = packages_fixture("variables");
+    let app = graph_api::router_with_host(packages_host(&dir, &catalog, Some(SWITCH_GROUP)));
+
+    // GET: declared `[[parser.variables]]` of the bound package (tenant has
+    // a default, bank is required) and the catalog entry's current values.
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/importers/hindsight/variables")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = json_body(response).await;
+    let declared = body["declared"].as_array().unwrap();
+    assert_eq!(declared.len(), 2, "{declared:?}");
+    assert_eq!(declared[0]["name"], "tenant");
+    assert_eq!(declared[0]["default"], "default");
+    assert_eq!(
+        declared[0]["description"],
+        "Tenant path segment: /v1/{tenant}/banks/..."
+    );
+    assert_eq!(declared[1]["name"], "bank");
+    assert_eq!(declared[1]["default"], serde_json::Value::Null);
+    assert_eq!(body["current"]["bank"], "omp");
+    assert!(
+        body["current"].get("tenant").is_none(),
+        "unset variables are simply absent from current"
+    );
+
+    // Unknown id → 404; non-httpjson binding → 400.
+    let unknown = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/importers/nope/variables")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(unknown.status(), StatusCode::NOT_FOUND);
+    let not_package = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/importers/default-gen/variables")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(not_package.status(), StatusCode::BAD_REQUEST);
+
+    // PUT without the switch group → 403, before any body is even parsed.
+    let forbidden = app
+        .clone()
+        .oneshot(json_request(
+            "PUT",
+            "/importers/hindsight/variables",
+            serde_json::json!({ "variables": { "bank": "relay" } }),
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(forbidden.status(), StatusCode::FORBIDDEN);
+
+    // PUT naming an undeclared variable → 400 naming the offender, and
+    // nothing is written.
+    let rejected = app
+        .clone()
+        .oneshot(json_request(
+            "PUT",
+            "/importers/hindsight/variables",
+            serde_json::json!({ "variables": { "query": "openalex" } }),
+            Some(SWITCH_GROUP),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
+    assert!(
+        text_body(rejected).await.contains("\"query\""),
+        "the 400 must name the offending key"
+    );
+    assert!(!dir.join("variables.local.json").exists());
+
+    // Selecting the source spawns a lazy build and answers 202 while it runs
+    // (the fixture endpoint is unreachable, so it settles as a cached failure
+    // in the background) — either way an alternate entry now exists to
+    // invalidate.
+    let first = app
+        .clone()
+        .oneshot(source_request("/graph/ids", "hindsight", Some(SWITCH_GROUP)))
+        .await
+        .unwrap();
+    assert_eq!(first.status(), StatusCode::ACCEPTED);
+
+    // Valid PUT → 200 with the post-write effective state, persisted to
+    // variables.local.json, and published to the in-memory catalog.
+    let saved = app
+        .clone()
+        .oneshot(json_request(
+            "PUT",
+            "/importers/hindsight/variables",
+            serde_json::json!({ "variables": { "tenant": "default", "bank": "relay" } }),
+            Some(SWITCH_GROUP),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(saved.status(), StatusCode::OK);
+    let body = json_body(saved).await;
+    assert_eq!(body["declared"].as_array().unwrap().len(), 2);
+    assert_eq!(body["current"]["bank"], "relay");
+    assert_eq!(body["current"]["tenant"], "default");
+
+    let overlay: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(dir.join("variables.local.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(overlay["sources"]["hindsight"]["variables"]["bank"], "relay");
+    assert_eq!(
+        overlay["sources"]["hindsight"]["variables"]["tenant"],
+        "default"
+    );
+
+    let listed = json_body(
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/importers")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap(),
+    )
+    .await;
+    let hindsight = listed["sources"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["id"] == "hindsight")
+        .expect("hindsight listed");
+    assert_eq!(hindsight["httpJson"]["variables"]["bank"], "relay");
+
+    // The alternate was invalidated: the next selection starts a fresh
+    // build (202 with a live building status) instead of replaying the
+    // pre-PUT cached outcome.
+    let rebuilt = app
+        .clone()
+        .oneshot(source_request("/graph/ids", "hindsight", Some(SWITCH_GROUP)))
+        .await
+        .unwrap();
+    assert_eq!(rebuilt.status(), StatusCode::ACCEPTED);
+    let rebuilt_body = json_body(rebuilt).await;
+    assert_eq!(
+        rebuilt_body["status"], "building",
+        "fresh build after invalidation: {rebuilt_body}"
+    );
+
+    // GET reflects the replaced set; full replacement drops a key cleanly.
+    let replaced = app
+        .clone()
+        .oneshot(json_request(
+            "PUT",
+            "/importers/hindsight/variables",
+            serde_json::json!({ "variables": { "bank": "solo" } }),
+            Some(SWITCH_GROUP),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(replaced.status(), StatusCode::OK);
+    let body = json_body(replaced).await;
+    assert_eq!(body["current"]["bank"], "solo");
+    assert!(
+        body["current"].get("tenant").is_none(),
+        "full replacement drops unset variables: {}",
+        body["current"]
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Boot applies `variables.local.json` onto matching catalog entries
+/// (unknown ids are skipped, never fatal).
+#[tokio::test]
+async fn variables_overlay_applies_at_boot() {
+    let (dir, catalog) = packages_fixture("vars-boot");
+    std::fs::write(
+        dir.join("variables.local.json"),
+        r#"{ "sources": {
+            "hindsight": { "variables": { "tenant": "default", "bank": "boot-bank" } },
+            "removed-source": { "variables": { "bank": "gone" } }
+        } }"#,
+    )
+    .unwrap();
+    let app = graph_api::router_with_host(packages_host(&dir, &catalog, Some(SWITCH_GROUP)));
+
+    let listed = json_body(
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/importers")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap(),
+    )
+    .await;
+    let hindsight = listed["sources"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["id"] == "hindsight")
+        .expect("hindsight listed");
+    assert_eq!(hindsight["httpJson"]["variables"]["bank"], "boot-bank");
+
+    // GET reports the boot-applied value as the current one.
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/importers/hindsight/variables")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = json_body(response).await;
+    assert_eq!(body["current"]["bank"], "boot-bank");
     let _ = std::fs::remove_dir_all(&dir);
 }

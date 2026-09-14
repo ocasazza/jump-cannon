@@ -79,12 +79,25 @@ one with `importers.selected`. graph-api validates the bounded catalog against
 the source that actually started and exposes only its sanitized form through
 `GET /importers`. The rollout-based selection remains the deployment default;
 when `importers.runtimeSwitchGroup` is set, viewers in that NetBird group can
-also switch the viewed source per browser session from the Importers panel,
-writes and compute pinned to the deployment-selected source. The viewer's
+also switch the viewed source per browser session from
+the Importers panel, writes and compute pinned to the deployment-selected
+source. A group of `"*"` opens switching to every caller. Switching is
+non-blocking: the first request selecting an unbuilt runnable source starts
+its import as a background task and answers `202 Accepted` + `Retry-After: 2` with a
+`building importer source` body; `GET /progress` with the same selection
+header serves that build's live event log (never blocking behind the build),
+and the panel/graph overlay poll it until the retry succeeds. The viewer's
 selection lives in sessionStorage as the **bare string** `jc_source_id` (no
 JSON encoding — the harness and proxy tooling plant and read it through the
 DOM storage API), rides as the `x-jump-cannon-source` request header, and as
 `?source=` on the layout WebSocket, whose browser API cannot set headers.
+Clicking a catalog row selects it for the manifest editor; every runnable row
+carries its own inline Load action (`[data-action="load-row"]`, `⟲` on the
+default row) that applies the source, so loading a graph is one click from the
+list while browsing the catalog triggers no server-side imports. The anchored
+row, the graph-area overlay, and the Progress panel all show the build's
+stages and fractions while it runs.
+
 ## Parameterised sources
 
 A catalog source may declare **parameters** — instance-level variables whose
@@ -117,7 +130,6 @@ those parameters bound, and status/progress/retry routes accept the full
 selection string as `{id}` (URL-encoded). Each parameterised selection's graph
 and schema are cached per source id.
 
-
 Package definitions are editable through the same gate. `GET
 /importers/{id}/definition` returns an httpjson source's authored TOML
 (`package`, `source`, `writable`) with the catalog's read posture;
@@ -131,12 +143,28 @@ the deployment default's own importer keeps the package it loaded at boot.
 `POST /importers` also appends the new source to
 `<packages_dir>/catalog.local.json`, a runtime overlay graph-api merges into
 the chart catalog at boot (entries carry `origin: runtime`; an overlay that
-fails validation or shadows a chart id is logged and ignored). The Importers
+fails validation or shadows a chart id is logged and ignored). Instance
+variables are mutable through the same gate without touching the package
+text: `GET /importers/{id}/variables` returns an httpjson source's declared
+parser-variable declarations (name, description, default) plus the instance's
+current values, and `PUT /importers/{id}/variables` fully replaces the set —
+keys are validated against the package's declarations, the override persists
+to `<packages_dir>/variables.local.json` (its own file because the source
+overlay rejects shadowing a chart id), the in-memory entry updates, and the
+running alternate is dropped so the next request rebuilds with the new
+values. Boot applies the variable overrides after the source overlay. In the
+panel this is the Variables section on a selected httpjson row: one input
+per declared variable, then "Apply & reload" re-applies the source and
+streams the rebuild. The Importers
 panel is the surface: selecting a catalog entry offers "Edit server package"
 (the Monaco TOML/grammar editor over the served text, then "Save to server"),
 and "+ New source" drives `POST /importers`. Browser-local packages in the
 same panel never leave localStorage, and the grammar preview always runs in
-the sandbox Web Worker — the server never parses a sample input.
+the sandbox Web Worker — the server never parses a sample input. The preview's
+"View as graph" mounts the parsed sample as a client-only graph in the
+renderer (bounded at 5k nodes / 20k edges), the same mount the Generate panel
+uses, so authoring a package shows its graph without any server round-trip.
+
 Alternate sources selected through the runtime-switch gate are built on a background task. Each importer engine reports progress through `data_loader::ImportProgress` (stage / advance(fraction, detail) / finish / fail / log): the JSON engine emits one stage per collection (`Fetching <collection> from <host>`) and advances after every page with `page N · R records · B MB` (fraction reported only when the collection declares a server total); the pipeline emits `Decoding <n> records` and `Projecting graph`; the pest engine emits `Parsing <package>`. Graph routes for a building selection answer `202 Accepted` with status, elapsed time, stage, detail, and fraction (when available) instead of blocking behind a lock. See [[Backend API]] for the response contract and status/progress/retry endpoints. Building entries persist until eviction or completion; failed builds are retryable and evict on idle TTL. **Operational note:** live-paged APIs like ChEMBL (`chembl-pharmacology`) measure around 4.5 minutes per build on the cluster and evict after ~15 minutes idle, so a later visit pays the import cost again.
 
 The default markdown loader resolves wikilinks and is currently the only
@@ -152,6 +180,43 @@ same node IDs as Obsidian mode for the same corpus. The httpjson engine
 binds an instance to one HTTP/JSON API per `JUMP_CANNON_IMPORTER_*` env
 var and reads one selected Hindsight memory bank read-only; bounds and
 record caps are loud per collection (see [[Hindsight Importer]]).
+
+Poll-driven reloads are gated on real change: `Importer::import` returns
+`ImportOutcome`, and an importer that can prove its source is unmodified
+answers `Unchanged` — the watcher then keeps the mounted snapshot and emits
+nothing (no rebuild, no `/progress` events). The GitHub importer proves it
+with the tarball ETag (a warm 304); every connector pipeline (the json and
+pest packages) proves it by hashing the fetched records in collection order
+before decode/map, so identical API pages never re-map. Edge value pointers
+in the json engine may name an array of ids (`/referenced_works`); each
+scalar element resolves as one target, matching `split_csv`'s
+one-value-per-element rule.
+
+Two of the shipped packages read public science APIs rather than an
+in-cluster service: `chembl-pharmacology.toml` (EMBL-EBI ChEMBL — approved
+molecules, human protein targets, the mechanism-of-action records that bridge
+molecule to target, and drug indications; ~29.6k nodes and ~22.5k edges at
+`max_phase = 4`) and `openalex-works.toml` (OpenAlex — one ranked page of a
+search scope plus the citation edges among those works). Both need node
+egress to the open internet, so they build only where the pod has it and fail
+loudly with the endpoint in the message where it does not. ChEMBL ships some
+measurements as numeric strings (`full_mwt` is `"383.41"`), which is why the
+json engine has the `parse_number` field transform: a `number` discovery
+field gets a number instead of the schema being weakened. Every shipped
+package has a parametrized contract test in `crates/importer/tests/packages.rs`
+(rstest, one named case per package): recorded API responses run through the
+real connector/decoder/mapper pipeline over a fixture transport, asserting
+nodes and — whenever the schema declares edge types — edges, so a silent
+projection break (the pre-fix array pointer that shipped OpenAlex with zero
+citation edges) fails the suite instead of users' graphs.
+
+Shipped example sessions pair a curated UI state with the source it is about:
+`app/ui/assets/sessions/*.yaml` plus an `index.json`, copied into the dist by
+trunk so every deployment has them (container, `trunk serve`, browser-only
+GitHub Pages). The Instances panel lists them; Load applies the app state
+(layout regime, style, camera) and then loads the named source through the
+same apply path as a manual row Load, so a session on an unbuilt source shows
+the build overlay and streams its stages.
 
 Do not hide network access, credentials, or authorization inside a pure mapper.
 Deployment owns those effects through [[Helm Deployment]] and [[Security Model]].

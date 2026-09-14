@@ -42,6 +42,12 @@ pub struct ParsePreview {
     pub edges: usize,
     pub unresolved: Vec<String>,
     pub sample_ids: Vec<String>,
+    /// Full preview graph (bounded by the worker's caps): every node id and
+    /// link edge pair, for the panel's client-side "view as graph" mount.
+    #[serde(default)]
+    pub node_ids: Vec<String>,
+    #[serde(default)]
+    pub edge_pairs: Vec<(String, String)>,
 }
 
 /// Native stub: the worker is a browser construct. app/ui only ever ships to

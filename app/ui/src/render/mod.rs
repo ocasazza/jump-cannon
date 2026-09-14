@@ -15,9 +15,9 @@
 //! minimize/restore doesn't reset the layout. `GraphCanvas` owns that
 //! lifecycle through one graph-aware effect.
 
-// camera.rs is a verbatim copy of crates/graph-renderer/src/camera.rs —
-// keep it byte-identical (incl. currently-unwired helpers like `reset` /
-// `look_at_point`) so diffs against the source of truth stay trivial.
+// camera.rs began as a verbatim copy of crates/graph-renderer/src/camera.rs;
+// the egui renderer has since been retired and this is now the canonical
+// camera (projection model lives here — see Projection).
 #[allow(dead_code)]
 pub mod camera;
 pub mod data;

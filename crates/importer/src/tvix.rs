@@ -44,7 +44,7 @@ use data_loader::{
 use std::collections::HashMap;
 #[cfg(feature = "native")]
 use data_loader::{
-    identity::Namespace, Capability, Effect, ImportFuture, ImportProgress, Importer,
+    identity::Namespace, Capability, Effect, ImportFuture, ImportOutcome, ImportProgress, Importer,
     ImporterDescriptor, LoadResult, SearchDocument, Transport, WatchPlan,
 };
 #[cfg(feature = "native")]
@@ -632,7 +632,7 @@ impl Importer for TvixImporter {
     fn import<'a>(
         &'a self,
         progress: &'a dyn ImportProgress,
-    ) -> ImportFuture<'a, Result<LoadResult, PipelineError>> {
+    ) -> ImportFuture<'a, Result<ImportOutcome, PipelineError>> {
         Box::pin(async move {
             let stage = progress.stage(&format!("Evaluating {}", self.name));
             // `tvix_wasm::eval_graph` is synchronous and CPU-bound (and uses
@@ -666,7 +666,7 @@ impl Importer for TvixImporter {
                 Ok(_) => progress.finish(project),
                 Err(error) => progress.fail(project, &error.to_string()),
             }
-            result
+            result.map(ImportOutcome::Loaded)
         })
     }
 }

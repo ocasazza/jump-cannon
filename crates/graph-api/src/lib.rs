@@ -40,7 +40,21 @@ pub async fn build_world_state(
     progress: std::sync::Arc<progress::ProgressLog>,
 ) -> Result<AppState, data_loader::ImportError> {
     let importer = data_loader::HostedImporter::new(importer, grants)?;
-    let loaded = vault_loader::load_with_progress(&importer, Some(&progress)).await?;
+    let loaded = match vault_loader::load_with_progress(&importer, Some(&progress)).await? {
+        data_loader::ImportOutcome::Loaded(loaded) => loaded,
+        // Defensive: an initial build has no prior snapshot to keep, and a
+        // cold importer cannot report Unchanged. If one ever does, fail the
+        // build loudly rather than installing an empty world.
+        data_loader::ImportOutcome::Unchanged => {
+            return Err(data_loader::ImportError::Map {
+                message: format!(
+                    "importer {} reported the source unchanged before the first load; \
+                     no snapshot exists to keep",
+                    importer.descriptor().id
+                ),
+            });
+        }
+    };
     AppState::new(
         vault_root,
         importer,

@@ -26,6 +26,7 @@ mod panels;
 mod pest_worker;
 mod proto;
 mod render;
+mod sessions;
 mod worker;
 
 mod github;
@@ -925,6 +926,9 @@ fn begin_server_graph_load(mut ctx: Ctx) -> u64 {
         graph_revision: None,
         origin: GraphOrigin::Server { endpoint },
     });
+    // Shared loading store: the Graph panel gate and the workspace
+    // GlobalLoadingBar both read it; succeed() lands on commit.
+    panel_kit::loading::loading_store("graph", "loading graph…").begin();
     epoch
 }
 
@@ -934,6 +938,8 @@ fn commit_server_graph(mut ctx: Ctx, epoch: u64, graph: GraphData) -> bool {
     }
     let revision = graph.graph_revision.filter(|r| *r != 0);
     ctx.graph_session.write().graph_revision = revision;
+    // The gate opens and the GlobalLoadingBar clears on the same commit.
+    panel_kit::loading::loading_store("graph", "loading graph…").succeed();
     panels::layout::set_expected_graph_revision(revision);
     panels::style::reset_for_graph_session(true);
     ctx.graph.set(Some(graph));
@@ -961,6 +967,9 @@ pub(crate) fn replace_with_client_graph(
         },
     });
     ctx.graph.set(Some(graph));
+    // A client graph supersedes any in-flight server load: close the store
+    // so the GlobalLoadingBar cannot dangle over a mounted canvas.
+    panel_kit::loading::loading_store("graph", "loading graph…").succeed();
 }
 
 pub(crate) async fn reload_graph(mut ctx: Ctx) {
@@ -1327,7 +1336,10 @@ fn App() -> Element {
                         }
                         Err(e) => {
                             meta.set(None);
-                            save_msg.set(format!("load failed: {e}"));
+                            // display_error: while the selected source builds
+                            // server-side this fetch 503s with the machine
+                            // instruction body — never quote it verbatim.
+                            save_msg.set(format!("load failed: {}", api::display_error(&e)));
                         }
                     }
                     meta_busy.set(false);
@@ -1347,7 +1359,20 @@ fn App() -> Element {
         let mut logs = ctx.logs;
         use_future(move || async move {
             let mut since = 0u64;
+            // The event log is per source (the request header selects it):
+            // a source switch swaps the log out from under the cursor, so
+            // re-anchor at 0 and drop the previous source's history —
+            // otherwise the alternate's early stages never replay and the
+            // stale default-source log just sits there.
+            let mut source = api::source_selection();
             loop {
+                let selected = api::source_selection();
+                if selected != source {
+                    source = selected;
+                    since = 0;
+                    tasks.set(Vec::new());
+                    logs.set(Vec::new());
+                }
                 if let Ok(resp) = api::progress(since).await {
                     since = resp.next_seq;
                     if !resp.events.is_empty() {
@@ -1420,8 +1445,8 @@ fn App() -> Element {
             autofocus: true,
             onmousemove: move |e| ws.handle_mouse_move(&e),
             onmouseup: move |_| ws.handle_mouse_up(),
-            // WASDQE camera pan + Shift boost + F fit, fed to the wgpu
-            // renderer's held-key state. Single-key shortcuts must not
+            // WASDQE camera pan + Shift boost, F fit, C toggle follow
+            // centroid, ⇧C snap to center. Single-key shortcuts must not
             // fire while the user is typing in an input/textarea.
             onkeydown: move |e: KeyboardEvent| {
                 // Palette chord first: it must open even while an input has
@@ -1447,8 +1472,26 @@ fn App() -> Element {
                 match e.key() {
                     Key::Shift => render::key_event("Shift", true),
                     Key::Character(c) => {
-                        if c.eq_ignore_ascii_case("f") {
+                        // Ctrl/Alt chords are not single-key camera
+                        // bindings (Ctrl+C must not toggle follow).
+                        let chord = e
+                            .modifiers()
+                            .intersects(Modifiers::CONTROL | Modifiers::ALT);
+                        if chord {
+                            render::key_event(&c, true);
+                        } else if c.eq_ignore_ascii_case("f") {
                             render::fit_camera();
+                        } else if c.eq_ignore_ascii_case("c") {
+                            // Auto-repeat guard: held-C must not strobe the
+                            // follow-centroid toggle.
+                            if e.is_auto_repeating() {
+                                return;
+                            }
+                            if e.modifiers().contains(Modifiers::SHIFT) {
+                                panels::camera::snap_to_center();
+                            } else {
+                                panels::camera::toggle_follow_centroid();
+                            }
                         } else {
                             render::key_event(&c, true);
                         }
@@ -1503,11 +1546,13 @@ fn App() -> Element {
                     }
                 }
                 {hints::header_bar()}
+                // Workspace-level loading surface: any pending store (graph
+                // load, importer build, panel fetches) shows here with its
+                // percentage. Job-count telemetry stays as the activity dot.
+                panel_kit::loading::GlobalLoadingBar {}
                 if n_running > 0 {
                     span { class: "activity", Spinner {} " running {n_running}" }
                 } else if g_now.is_none() {
-                    span { class: "activity", "○ waiting for graph-api" }
-                } else {
                     span { class: "activity idle", "●" }
                 }
             }
@@ -1611,9 +1656,63 @@ fn panel_body(kind: Panel, _maximized: bool, ctx: Ctx) -> Element {
             } else if let Some(status) = ctx.building.read().clone() {
                 rsx! { div { class: "skeleton", {graph_canvas::BuildProgress(status)} } }
             } else if let Some(e) = ctx.load_error.read().clone() {
-                rsx! { div { class: "skeleton", Spinner { label: "retrying: {e}" } } }
+                if api::is_building_error(&e) {
+                    // A selected importer source is being built server-side:
+                    // rich non-blocking overlay fed from the live apply
+                    // status instead of the raw 503 text.
+                    let apply = crate::panels::importers::APPLY.read().clone();
+                    // The merged tracker carries the server's own BuildStatus
+                    // rather than pre-split fields, so read the stage,
+                    // fraction, and elapsed time off it.
+                    let (target, stage, fraction, elapsed) = match apply.as_ref() {
+                        Some(
+                            crate::panels::importers::ApplyStatus {
+                                target,
+                                state:
+                                    crate::panels::importers::ApplyState::Building {
+                                        status, ..
+                                    },
+                                ..
+                            },
+                        ) => (
+                            target.clone(),
+                            status.stage.clone(),
+                            status.fraction,
+                            status.elapsed_ms.unwrap_or(0) / 1000,
+                        ),
+                        _ => ("the selected source".to_string(), None, None, 0),
+                    };
+                    rsx! {
+                        div { class: "graph-building", role: "status", "data-field": "graph-building",
+                            // One ProgressBar carries label + stage + the
+                            // mandatory percentage (the store mirrors the
+                            // same state to the GlobalLoadingBar).
+                            panel_kit::loading::ProgressBar {
+                                fraction: fraction.map(|f| f as f64),
+                                label: "importing {target}… {elapsed}s",
+                                detail: stage,
+                            }
+                        }
+                    }
+                } else {
+                    // display_error guards the label: a building 503 that
+                    // lands here (no apply tracker running) must not quote
+                    // the server's machine instruction verbatim.
+                    let label = format!("retrying: {}", api::display_error(&e));
+                    rsx! { div { class: "skeleton",
+                        panel_kit::loading::ProgressBar {
+                            fraction: None,
+                            label,
+                        }
+                    } }
+                }
             } else {
-                rsx! { div { class: "skeleton", Spinner { label: "loading graph…" } } }
+                rsx! { div { class: "skeleton",
+                    panel_kit::loading::ProgressBar {
+                        fraction: None,
+                        label: "loading graph…",
+                    }
+                } }
             }
         }
         Panel::Nodes => panels::nodes::panel(ctx),

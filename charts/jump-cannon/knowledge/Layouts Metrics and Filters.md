@@ -15,7 +15,15 @@ four tabs:
 - **Layout** chooses the simulation engine, starting positions, solver
   parameters, and playback behavior.
 - **Appearance** maps graph attributes to size, shape, and color.
-- **Camera** controls navigation, fitting, focus, and depth effects.
+- **Camera** controls navigation, fitting, focus, and the camera-effects
+  stack: perspective/orthographic projection with fov, depth of field as a
+  view-space focal band (depth + band width, aperture, max CoC), attribute
+  focus (defocus driven by node degree or size), depth-cue fog, a clipping
+  slab for section views, and named saved views that persist across
+  sessions. Canvas keybindings: **F** fits to graph bounds, **C** toggles
+  follow-centroid, **⇧C** snaps to the centroid once at the current
+  distance. The roadmap and references live in the repo at
+  `docs/research/computational-cameras.md` (not shipped in the vault).
 
 Importer packages moved to the standalone **Importers** panel: it lists the
 sanitized deployment catalog alongside browser-local TOML packages, edits

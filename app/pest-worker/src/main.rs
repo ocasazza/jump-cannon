@@ -60,12 +60,29 @@ fn preview(manifest: &str, input: &str) -> Result<serde_json::Value, String> {
     let package = importer::ValidatedPackage::from_toml(manifest).map_err(|e| e.to_string())?;
     let result = package.parse_input(input).map_err(|e| e.to_string())?;
     let sample_ids: Vec<&String> = result.graph.nodes.keys().take(20).collect();
+    // Full preview graph for the panel's "view as graph" mount: bounded so a
+    // pathological sample cannot balloon the postMessage payload (preview
+    // scale, not production scale — the counts above stay exact).
+    const PREVIEW_NODE_CAP: usize = 5_000;
+    const PREVIEW_EDGE_CAP: usize = 20_000;
+    let node_ids: Vec<&String> = result.graph.nodes.keys().take(PREVIEW_NODE_CAP).collect();
+    let id_set: std::collections::HashSet<&String> = node_ids.iter().copied().collect();
+    let edge_pairs: Vec<(&String, &String)> = result
+        .graph
+        .edges
+        .iter()
+        .filter(|edge| id_set.contains(&edge.source) && id_set.contains(&edge.target))
+        .map(|edge| (&edge.source, &edge.target))
+        .take(PREVIEW_EDGE_CAP)
+        .collect();
     Ok(serde_json::json!({
         "ok": true,
         "nodes": result.graph.nodes.len(),
         "edges": result.graph.edges.len(),
         "unresolved": result.unresolved,
         "sample_ids": sample_ids,
+        "node_ids": node_ids,
+        "edge_pairs": edge_pairs,
     }))
 }
 
@@ -207,6 +224,25 @@ target = "target"
         let sample_ids = v["sample_ids"].as_array().unwrap();
         assert_eq!(sample_ids.len(), 2, "both node ids sampled");
         assert!(sample_ids.iter().all(|id| !id.as_str().unwrap().is_empty()));
+        // The view-as-graph payload mirrors the parsed graph: both mounted
+        // nodes and the one resolved edge, endpoints as id pairs.
+        let node_ids = v["node_ids"].as_array().unwrap();
+        assert_eq!(node_ids.len(), 2, "every node id ships: {reply}");
+        assert!(node_ids.iter().all(|id| !id.as_str().unwrap().is_empty()));
+        let edge_pairs = v["edge_pairs"].as_array().unwrap();
+        assert_eq!(edge_pairs.len(), 1, "only the resolved edge ships: {reply}");
+        let endpoints: Vec<String> = edge_pairs[0]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|id| id.as_str().unwrap().to_string())
+            .collect();
+        // Node ids are namespaced by the package id
+        // (`pest:example.line-graph:<raw>`); the edge endpoints must be the
+        // same two ids the node list carries, in source order.
+        assert_eq!(endpoints.len(), 2);
+        assert!(endpoints[0].ends_with(":n1"), "first endpoint: {:?}", endpoints);
+        assert!(endpoints[1].ends_with(":n2"), "second endpoint: {:?}", endpoints);
     }
 
     #[test]

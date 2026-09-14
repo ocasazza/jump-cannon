@@ -582,7 +582,7 @@
               cargoArtifacts = depsNative;
               pname = "jump-cannon-test-workload-bins";
               version = "0.1.0";
-              nativeBuildInputs = [ pkgs.protobuf pkgs.cc ];
+              nativeBuildInputs = [ pkgs.protobuf pkgs.stdenv.cc ];
               # pprof's frame-pointer unwinder needs frame pointers in the
               # benchmark hot paths; the workspace crates are compiled by this
               # derivation (prebuilt depsNative are not), which is where the
@@ -1250,6 +1250,10 @@
             # ride along unfiltered — the extension allowlist above would drop
             # .js/.ttf payloads the panel-kit editor loads at runtime.
             ./app/ui/assets/vendor
+            # Shipped example sessions: index.json plus one YAML per session,
+            # copied into the dist by trunk (index.html copy-dir). Same
+            # reason as vendor/ — .json/.yaml are not in the allowlist.
+            ./app/ui/assets/sessions
             # The Sessions view path-depends on session-manager/graph-vcs,
             # whose *optional* server deps (graph-api, data-loader, …) still
             # need their manifests parsed, and those use `workspace = true`

@@ -141,6 +141,18 @@ spec:
               value: "true"
             - name: JUMP_CANNON_ASSETS_DIR
               value: /assets
+            {{- if .Values.hostCaBundle.enabled }}
+            # Corporate TLS inspection (Fortigate) re-signs every outbound
+            # HTTPS chain with `O=Schrodinger, CN=Fortigate SSL`. The NixOS
+            # nodes bake that CA into their host bundle; a container carries
+            # only its image's Mozilla roots, so every public-API importer
+            # (ChEMBL, OpenAlex, GitHub codeload) fails x509 verification
+            # while the node itself succeeds. Point the Rust TLS stack at the
+            # host bundle mounted below — same hostPath-File contract the
+            # trivy and vllm workloads use.
+            - name: SSL_CERT_FILE
+              value: {{ .Values.hostCaBundle.path | quote }}
+            {{- end }}
             - name: JUMP_CANNON_SOURCE
               value: {{ $graphSource | quote }}
             - name: JUMP_CANNON_IMPORTER_CATALOG_JSON
@@ -246,7 +258,7 @@ spec:
             {{- toYaml .Values.graphApi.resources | nindent 12 }}
           securityContext:
             {{- toYaml .Values.containerSecurityContext | nindent 12 }}
-          {{- if or $usesFilesystem $usesKubernetes $usesGitHub $needsHttpJsonPackages $gpuSession $dormantSources }}
+          {{- if or $usesFilesystem $usesKubernetes $usesGitHub $needsHttpJsonPackages $gpuSession $dormantSources .Values.hostCaBundle.enabled }}
           volumeMounts:
             {{- if $usesFilesystem }}
             - name: {{ $importer.volumeName }}
@@ -285,9 +297,23 @@ spec:
               subPath: raycluster.yaml
               readOnly: true
             {{- end }}
+            {{- if .Values.hostCaBundle.enabled }}
+            - name: host-ca-bundle
+              mountPath: {{ .Values.hostCaBundle.path | quote }}
+              readOnly: true
+            {{- end }}
           {{- end }}
-      {{- if or $usesFilesystem $usesKubernetes $usesGitHub $needsHttpJsonPackages $gpuSession $dormantSources }}
+      {{- if or $usesFilesystem $usesKubernetes $usesGitHub $needsHttpJsonPackages $gpuSession $dormantSources .Values.hostCaBundle.enabled }}
       volumes:
+        {{- if .Values.hostCaBundle.enabled }}
+        # File (not Directory): on NixOS /etc/ssl/certs is a tree of symlinks
+        # into /etc/static that dangle inside a container, so the bundle file
+        # itself is the only portable mount.
+        - name: host-ca-bundle
+          hostPath:
+            path: {{ .Values.hostCaBundle.hostPath | quote }}
+            type: File
+        {{- end }}
         {{- if $usesGitHub }}
         - name: github-importer-cache
           emptyDir: {}

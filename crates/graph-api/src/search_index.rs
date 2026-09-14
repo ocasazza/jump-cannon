@@ -146,16 +146,37 @@ impl SearchIndex {
             .parse_query(query)
             .with_context(|| format!("parse discovery query {query:?}"))?;
 
-        let (top, total) = searcher
+        let (mut top, mut total) = searcher
             .search(&parsed, &(TopDocs::with_limit(limit), Count))
             .context("search importer discovery index")?;
+
+        // Exact parsing is conjunctive and term-exact, so a typo or a partial
+        // word ("aspirn", "aspir") scores nothing at all. When it finds
+        // nothing, retry the same terms as a fuzzy/prefix disjunction over
+        // every searchable field. Precision first: this never dilutes a query
+        // that already matched.
+        let mut fuzzy_query = None;
+        if top.is_empty() {
+            if let Some(fallback) = self.fuzzy_query(query) {
+                let (fuzzy_top, fuzzy_total) = searcher
+                    .search(&fallback, &(TopDocs::with_limit(limit), Count))
+                    .context("fuzzy search importer discovery index")?;
+                top = fuzzy_top;
+                total = fuzzy_total;
+                fuzzy_query = Some(fallback);
+            }
+        }
+        let scoring: &dyn tantivy::query::Query = match &fuzzy_query {
+            Some(fallback) => fallback.as_ref(),
+            None => &*parsed,
+        };
 
         let snippet_generators = if snippets {
             self.fields
                 .iter()
                 .filter(|field| field.descriptor.snippet)
                 .map(|field| {
-                    SnippetGenerator::create(&searcher, &*parsed, field.field)
+                    SnippetGenerator::create(&searcher, scoring, field.field)
                         .map(|generator| (field.field, generator))
                 })
                 .collect::<tantivy::Result<Vec<_>>>()?
@@ -187,6 +208,56 @@ impl SearchIndex {
         }
 
         Ok(SearchResults { total, hits })
+    }
+
+    /// Build the typo/prefix-tolerant fallback for a query that matched
+    /// nothing exactly: every whitespace term becomes a Levenshtein match
+    /// (distance scaled by term length) plus a prefix match, `Should`-joined
+    /// across every searchable field so a hit on any field counts.
+    ///
+    /// Returns `None` when there is nothing to fuzz (no usable terms, or the
+    /// query used field-qualified syntax like `title:foo`, which the exact
+    /// parser already handles precisely and whose `field:value` shape would
+    /// otherwise be fuzzed as a literal term).
+    fn fuzzy_query(&self, query: &str) -> Option<Box<dyn tantivy::query::Query>> {
+        use tantivy::query::{BooleanQuery, FuzzyTermQuery, Occur};
+        use tantivy::schema::Term;
+
+        if query.contains(':') || self.fields.is_empty() {
+            return None;
+        }
+        let terms: Vec<String> = query
+            .split_whitespace()
+            .map(|term| term.trim_matches(|c: char| !c.is_alphanumeric()).to_lowercase())
+            .filter(|term| term.len() >= 3)
+            .collect();
+        if terms.is_empty() {
+            return None;
+        }
+        let mut clauses: Vec<(Occur, Box<dyn tantivy::query::Query>)> = Vec::new();
+        for term_text in &terms {
+            // Tantivy caps Levenshtein distance at 2; short words get 1 so
+            // "gene" cannot fuzz into every four-letter token.
+            let distance = if term_text.len() <= 5 { 1 } else { 2 };
+            for indexed in &self.fields {
+                if !indexed.descriptor.searchable {
+                    continue;
+                }
+                let term = Term::from_field_text(indexed.field, term_text);
+                clauses.push((
+                    Occur::Should,
+                    Box::new(FuzzyTermQuery::new(term.clone(), distance, true)),
+                ));
+                clauses.push((
+                    Occur::Should,
+                    Box::new(FuzzyTermQuery::new_prefix(term, 0, true)),
+                ));
+            }
+        }
+        if clauses.is_empty() {
+            return None;
+        }
+        Some(Box::new(BooleanQuery::new(clauses)))
     }
 }
 
@@ -285,5 +356,41 @@ mod tests {
             .with("kind", "demo")];
         let index = SearchIndex::build(&schema(), &documents).unwrap();
         assert!(index.search("secret:value", 10, false).is_err());
+    }
+
+    /// Exploring an imported corpus means typing a half-remembered name:
+    /// "aspirn" (typo) and "aspir" (prefix) must find aspirin, while an exact
+    /// match keeps its precision — a query that already hits must not be
+    /// widened into everything that is merely similar.
+    #[test]
+    fn fuzzy_fallback_tolerates_typos_and_prefixes_without_diluting_exact_hits() {
+        let documents = vec![
+            SearchDocument::new("chembl:molecule:CHEMBL25")
+                .with("id", "chembl:molecule:CHEMBL25")
+                .with("title", "ASPIRIN")
+                .with("tags", json!(["analgesic"]))
+                .with("kind", "molecule"),
+            SearchDocument::new("chembl:molecule:CHEMBL1201823")
+                .with("id", "chembl:molecule:CHEMBL1201823")
+                .with("title", "ADALIMUMAB")
+                .with("tags", json!(["antibody"]))
+                .with("kind", "molecule"),
+        ];
+        let index = SearchIndex::build(&schema(), &documents).unwrap();
+
+        let typo = index.search("aspirn", 10, false).unwrap();
+        assert_eq!(typo.hits.first().map(|hit| hit.id.as_str()), Some("chembl:molecule:CHEMBL25"), "one-edit typo finds aspirin: {typo:?}");
+
+        let prefix = index.search("aspir", 10, false).unwrap();
+        assert_eq!(prefix.hits.first().map(|hit| hit.id.as_str()), Some("chembl:molecule:CHEMBL25"), "prefix finds aspirin: {prefix:?}");
+
+        // An exact hit stays exact: the fallback only runs on an empty result,
+        // so "adalimumab" must not also drag in the unrelated molecule.
+        let exact = index.search("adalimumab", 10, false).unwrap();
+        assert_eq!(exact.total, 1);
+        assert_eq!(exact.hits[0].id, "chembl:molecule:CHEMBL1201823");
+
+        // Nonsense stays empty rather than matching the whole corpus.
+        assert_eq!(index.search("zzzzqqqqxxxx", 10, false).unwrap().total, 0);
     }
 }

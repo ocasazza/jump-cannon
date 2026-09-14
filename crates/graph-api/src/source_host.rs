@@ -101,9 +101,12 @@ impl SwitchConfig {
             .unwrap_or_default()
     }
 
-    /// Whether the caller may select a non-default source.
+    /// Whether the caller may select a non-default source. A required group
+    /// of `"*"` authorizes any caller — the deployment explicitly opened
+    /// runtime switching — while an unset group stays fail-closed.
     pub fn authorize(&self, headers: &HeaderMap) -> bool {
         match &self.required_group {
+            Some(required) if required == "*" => true,
             Some(required) => self.caller_groups(headers).iter().any(|g| g == required),
             None => false,
         }
@@ -414,6 +417,7 @@ struct AlternateEntry {
 /// Record a request resolving to this entry. Both signals move together: an
 /// entry kept resident by traffic must also keep rescanning, and one that
 /// stops being requested must stop rebuilding before the sweep evicts it.
+/// Inert on `Building`/`Failed` entries, which have no rescan watcher.
 fn mark_entry_used(entry: &mut AlternateEntry, now: Instant) {
     entry.last_used = now;
     entry.gate.mark_used();
@@ -494,8 +498,10 @@ struct SourceHostInner {
 }
 
 /// Idle detection: ids whose entry hasn't been used since `now - idle_ttl`.
-/// Pure and side-effect-free so the exact selection logic is unit-testable
-/// without a real `AppState` or waiting on real timers.
+/// `Building` entries are exempt — a build in flight must not race its own
+/// eviction; the completion handler resets `last_used` and the TTL applies
+/// from there. Pure and side-effect-free so the exact selection logic is
+/// unit-testable without a real `AppState` or waiting on real timers.
 fn expired_alternate_ids(
     alternates: &HashMap<String, AlternateEntry>,
     now: Instant,
@@ -615,6 +621,9 @@ impl SourceHost {
                     expired_ids
                         .into_iter()
                         .filter_map(|id| {
+                            // Building entries are never selected for
+                            // eviction; treat an unexpected one as abortable
+                            // rather than leaking its build.
                             alternates.remove(&id).map(|entry| {
                                 let watcher = match entry.source {
                                     AlternateSource::Serving { watcher, .. } => watcher,
@@ -660,8 +669,6 @@ impl SourceHost {
         self.inner.packages_dir.as_deref()
     }
 
-    /// Drop a cached alternate (serving or failed) so the next selection
-    /// rebuilds it from the current package file. No-op for unknown ids.
     pub fn invalidate_alternate(&self, source_id: &str) {
         match self.write_alternates().remove(source_id) {
             Some(AlternateEntry {
@@ -679,8 +686,6 @@ impl SourceHost {
         }
     }
 
-    /// Add a runtime-authored source to the live catalog (see
-    /// [`ImporterCatalog::insert_runtime_source`]). Compare-and-swap: two
     /// concurrent adds of the same id resolve to one success and one clean
     /// "already exists".
     pub fn add_runtime_source(
@@ -692,6 +697,25 @@ impl SourceHost {
         self.inner.catalog.rcu(|current| {
             let mut next = ImporterCatalog::clone(current);
             outcome = next.insert_runtime_source(id.clone(), definition.clone());
+            next
+        });
+        outcome
+    }
+
+    /// Replace one httpjson catalog source's instance variables (`PUT
+    /// /importers/:id/variables`), swapping in a fresh catalog snapshot the
+    /// same way [`Self::add_runtime_source`] publishes an addition. Callers
+    /// pair this with [`Self::invalidate_alternate`] so a running alternate
+    /// rebuilds lazily with the new variables on its next request.
+    pub fn set_source_variables(
+        &self,
+        id: &str,
+        variables: BTreeMap<String, String>,
+    ) -> Result<(), String> {
+        let mut outcome = Ok(());
+        self.inner.catalog.rcu(|current| {
+            let mut next = ImporterCatalog::clone(current);
+            outcome = next.set_source_variables(id, variables.clone());
             next
         });
         outcome
@@ -758,7 +782,7 @@ impl SourceHost {
         let Some(raw) = requested else {
             return Ok(Selection::Default);
         };
-        // Gate closed: the header is ignored entirely — today's behavior.
+        // Gate closed: the header is ignored entirely.
         if !self.inner.switch.enabled() {
             return Ok(Selection::Default);
         }
@@ -1823,9 +1847,6 @@ mod tests {
     use super::*;
 
     /// `Failed` entries need no `AppState`, so the idle-detection predicate
-    /// can be exercised directly without spinning up a real importer —
-    /// this is the exact selection logic that was missing before the fix,
-    /// which pinned every lazily-built alternate in memory forever.
     fn entry(idle_for: Duration) -> AlternateEntry {
         AlternateEntry {
             source: AlternateSource::Failed {
@@ -1932,7 +1953,7 @@ mod tests {
         fn import<'a>(
             &'a self,
             _progress: &'a dyn data_loader::ImportProgress,
-        ) -> data_loader::ImportFuture<'a, Result<data_loader::LoadResult, data_loader::ImportError>>
+        ) -> data_loader::ImportFuture<'a, Result<data_loader::ImportOutcome, data_loader::ImportError>>
         {
             Box::pin(async {
                 let mut graph = vault_data::VaultGraph::new();
@@ -1945,14 +1966,14 @@ mod tests {
                     },
                     ..Default::default()
                 });
-                Ok(data_loader::LoadResult {
+                Ok(data_loader::ImportOutcome::Loaded(data_loader::LoadResult {
                     graph,
                     search_documents: vec![data_loader::SearchDocument::new("generate:tiny:root")
                         .with("id", "generate:tiny:root")
                         .with("title", "Root")
                         .with("tags", serde_json::json!([]))],
                     unresolved: Vec::new(),
-                })
+                }))
             })
         }
     }
@@ -2012,9 +2033,15 @@ mod tests {
         let importer =
             data_loader::HostedImporter::new(Box::new(TinyImporter), grants).expect("hosted importer");
         let progress = Arc::new(ProgressLog::new());
-        let loaded = crate::vault_loader::load_with_progress(&importer, Some(&progress))
+        let loaded = match crate::vault_loader::load_with_progress(&importer, Some(&progress))
             .await
-            .expect("initial load");
+            .expect("initial load")
+        {
+            data_loader::ImportOutcome::Loaded(loaded) => loaded,
+            data_loader::ImportOutcome::Unchanged => {
+                panic!("a cold importer must not report Unchanged on the first load")
+            }
+        };
         AppState::new_with_importer_catalog(
             PathBuf::new(),
             importer,
@@ -2373,5 +2400,62 @@ mod tests {
         );
         assert!(recorded.iter().any(|n| n.contains("bank-omp")));
         assert!(recorded.iter().any(|n| n.contains("bank-jira-ithelp")));
+    }
+
+    /// A build in flight must never race its own eviction, however long it
+    /// has been running.
+    #[tokio::test]
+    async fn building_entries_are_exempt_from_idle_eviction() {
+        let ttl = Duration::from_secs(60);
+        let mut alternates = HashMap::new();
+        let mut building = entry(Duration::from_secs(3600));
+        building.source = AlternateSource::Building {
+            progress: Arc::new(ProgressLog::new()),
+            started: Instant::now(),
+            task: tokio::spawn(async {}),
+            generation: 0,
+        };
+        alternates.insert("building".to_owned(), building);
+        alternates.insert("idle".to_owned(), entry(Duration::from_secs(120)));
+
+        let expired = expired_alternate_ids(&alternates, Instant::now(), ttl);
+
+        assert_eq!(expired, vec!["idle".to_owned()]);
+    }
+
+    /// `"*"` opens runtime switching to every caller; an unset group stays
+    /// fail-closed.
+    #[test]
+    fn switch_config_wildcard_authorizes_any_caller() {
+        use axum::http::HeaderMap;
+
+        let headers = HeaderMap::new(); // no group header at all
+        assert!(SwitchConfig::new(Some("*".to_owned()), "x-groups").authorize(&headers));
+        assert!(!SwitchConfig::new(None, "x-groups").authorize(&headers));
+        assert!(!SwitchConfig::new(Some("ops".to_owned()), "x-groups").authorize(&headers));
+    }
+
+    /// The in-flight-build wire shape: 202 ACCEPTED, `Retry-After: 2`, and a
+    /// JSON `BuildStatus` body the client renders as a granular wait rather
+    /// than an error.
+    #[test]
+    fn building_error_maps_to_accepted_202_with_retry_after() {
+        let response = SourceError::Building(BuildStatus {
+            status: "building",
+            source: "hindsight-memory-bank".to_owned(),
+            elapsed_ms: 5,
+            stage: Some("ingest".to_owned()),
+            detail: None,
+            fraction: Some(0.5),
+        })
+        .into_response();
+        assert_eq!(response.status(), axum::http::StatusCode::ACCEPTED);
+        assert_eq!(
+            response
+                .headers()
+                .get("retry-after")
+                .and_then(|v| v.to_str().ok()),
+            Some("2")
+        );
     }
 }

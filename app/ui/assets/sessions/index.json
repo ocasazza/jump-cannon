@@ -1,0 +1,26 @@
+[
+  {
+    "name": "chembl-pharmacology",
+    "title": "ChEMBL pharmacology · community regime",
+    "description": "Approved molecules bridged to human protein targets by mechanism-of-action records. GPU force regime with Louvain communities colouring the molecule/target/mechanism tripartite structure.",
+    "source": "chembl-pharmacology"
+  },
+  {
+    "name": "openalex-citations",
+    "title": "OpenAlex citations · scale-free regime",
+    "description": "The most relevant works for one search scope plus the citation edges among them. PageRank sizing makes the citation hubs of the field pop out of the long tail.",
+    "source": "openalex-works"
+  },
+  {
+    "name": "hindsight-memory",
+    "title": "Hindsight memory · concentric regime",
+    "description": "One agent-memory bank as units, entities, and documents. Concentric static layout ranks by degree so canonical entities sit in the core rings.",
+    "source": "hindsight-memory-bank"
+  },
+  {
+    "name": "knowledge-docs",
+    "title": "Jump Cannon docs · doctype regime",
+    "description": "The deployment's own knowledge corpus, coloured by document type with the wikilink structure under a GPU force regime. Runs on the deployment default source.",
+    "source": null
+  }
+]

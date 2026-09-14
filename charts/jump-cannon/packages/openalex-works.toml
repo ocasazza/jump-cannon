@@ -1,0 +1,169 @@
+# OpenAlex research-literature package.
+#
+# Reads the public OpenAlex API as a read-only citation graph: the works
+# matching one search scope, plus the citation edges among them. The json
+# engine of `crates/importer` does the I/O, decoding, and ID namespacing;
+# this file declares only what a work record looks like and how it becomes
+# nodes, edges, and discovery fields — no new SourceKind, no new crate
+# (AGENTS.md, "Importers: packages, not crates").
+#
+# Verified against https://api.openalex.org:
+#   GET /works?search=&per-page=&select=&mailto= -> {"meta":{"count":N},"results":[…]}
+#
+# Pagination: OpenAlex pages by cursor, which the json engine does not speak,
+# so this package takes one `per-page` page (its 200-record maximum) of the
+# highest-relevance works for the scope. That is the point of the scope
+# variable: `search` selects the neighbourhood, and the citation edges among
+# the returned works make it a graph rather than a list. `select` keeps the
+# response inside `limits.input_bytes` — full work records carry inverted
+# abstracts and are ~30x larger.
+
+format_version = 3
+
+# -----------------------------------------------------------------------------
+# Metadata
+# -----------------------------------------------------------------------------
+
+[metadata]
+id = "openalex.works"
+name = "OpenAlex research works"
+version = "1.0.0"
+description = "Reads the public OpenAlex works API as a read-only citation graph for one search scope: works as nodes with venue, year, type, and citation counts, and work->work edges from each record's referenced works. Scope and contact mail are instance configuration."
+
+# -----------------------------------------------------------------------------
+# Limits
+# -----------------------------------------------------------------------------
+
+[limits]
+nodes = 5000
+input_bytes = 33554432
+
+# =============================================================================
+# Discovery schema
+# =============================================================================
+
+[[schema.fields]]
+key = "venue"
+field_type = "keyword"
+required = false
+searchable = true
+facetable = true
+
+[[schema.fields]]
+key = "doi"
+field_type = "url"
+required = false
+searchable = false
+facetable = false
+
+[[schema.fields]]
+key = "publication_year"
+field_type = "number"
+required = false
+searchable = false
+facetable = false
+
+[[schema.fields]]
+key = "cited_by_count"
+field_type = "number"
+required = false
+searchable = false
+facetable = false
+
+[[schema.fields]]
+key = "language"
+field_type = "keyword"
+required = false
+searchable = true
+facetable = true
+
+[[schema.edge_types]]
+key = "cites"
+directed = true
+description = "Work -> work it references, when the referenced work is also in scope."
+
+# =============================================================================
+# Parser: json engine
+# =============================================================================
+
+[parser]
+engine = "json"
+page_size = 200
+request_timeout_seconds = 120
+
+# The search scope. OpenAlex ranks by relevance, so this is "the 200 most
+# relevant works about X", which is exactly the demo/exploration unit.
+[[parser.variables]]
+name = "query"
+default = "cheminformatics"
+description = "OpenAlex full-text search scope for the imported works"
+
+# OpenAlex asks API users to identify themselves for the polite pool; an
+# unset mail still works but shares the anonymous rate limit.
+[[parser.variables]]
+name = "mailto"
+default = "ops@schrodinger.com"
+description = "Contact address sent as OpenAlex's mailto parameter (polite pool)"
+
+[[parser.collections]]
+name = "works"
+path = "/works"
+items_pointer = "/results"
+# No `total_pointer`: `/meta/count` is how many works match the scope across
+# the whole corpus (tens of thousands), not how many this package imports.
+# Checking it against `limits.nodes` would fail every interesting scope; the
+# real bound is the single `per-page` page requested below.
+
+[parser.collections.query]
+search = "{query}"
+mailto = "{mailto}"
+"per-page" = "200"
+select = "id,display_name,publication_year,cited_by_count,type,doi,language,referenced_works,primary_location"
+
+# One page: the engine's limit/offset walk does not apply to cursor paging.
+[parser.collections.paginate]
+style = "none"
+
+[parser.collections.nodes]
+id_pointer = "/id"
+node_type = "work"
+folder = "works"
+
+[parser.collections.nodes.title]
+pointer = "/display_name"
+max_chars = 120
+fallback_prefix = "work"
+
+# OpenAlex's own work type vocabulary (article, review, preprint, …) drives
+# the `type` facet and colour-by.
+[parser.collections.nodes.doctype]
+pointer = "/type"
+
+[[parser.collections.nodes.fields]]
+key = "venue"
+pointer = "/primary_location/source/display_name"
+
+[[parser.collections.nodes.fields]]
+key = "doi"
+pointer = "/doi"
+
+[[parser.collections.nodes.fields]]
+key = "publication_year"
+pointer = "/publication_year"
+
+[[parser.collections.nodes.fields]]
+key = "cited_by_count"
+pointer = "/cited_by_count"
+
+[[parser.collections.nodes.fields]]
+key = "language"
+pointer = "/language"
+
+# The citation graph: every referenced work that is also in scope becomes an
+# edge. References outside the page resolve to nothing and are dropped, so
+# the mounted graph is the scope's internal citation structure.
+[[parser.collections.nodes.edges]]
+kind = "cites"
+value_pointer = "/referenced_works"
+target_collection = "works"
+match_on = "id"

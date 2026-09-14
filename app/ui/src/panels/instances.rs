@@ -189,14 +189,18 @@ fn init_once() {
 
 // --- panel ---------------------------------------------------------------------
 
-pub fn panel(_ctx: Ctx) -> Element {
+pub fn panel(ctx: Ctx) -> Element {
     appstate::ensure_init();
     init_once();
+    crate::sessions::ensure_catalog();
     // Order matters: same rationale as the egui section — the State timeline
     // is the most-frequently-useful sub-region, so it sits ABOVE the bulky
-    // import/export block.
+    // import/export block. Shipped example sessions lead, because they are
+    // the one-click way into a working regime.
     rsx! {
         div { class: "inst",
+            { sessions_section(ctx) }
+            hr { class: "inst-sep" }
             { timeline_section() }
             hr { class: "inst-sep" }
             { share_section() }
@@ -204,6 +208,63 @@ pub fn panel(_ctx: Ctx) -> Element {
             { io_section() }
             hr { class: "inst-sep" }
             { actions_section() }
+        }
+    }
+}
+
+/// Shipped example sessions: one click applies a curated UI state (layout
+/// regime, style, camera) and loads the source that regime is about.
+fn sessions_section(ctx: Ctx) -> Element {
+    let catalog = crate::sessions::CATALOG.read().clone();
+    let applying = crate::sessions::APPLYING.read().clone();
+    let error = crate::sessions::ERROR.read().clone();
+    rsx! {
+        div { class: "inst-subhead", "Example sessions" }
+        match catalog {
+            crate::sessions::Catalog::Idle | crate::sessions::Catalog::Loading => rsx! {
+                div { class: "inst-hint", role: "status", "loading example sessions…" }
+            },
+            crate::sessions::Catalog::Unavailable(reason) => rsx! {
+                div { class: "inst-hint", "data-field": "sessions-unavailable",
+                    "example sessions unavailable — {reason}"
+                }
+            },
+            crate::sessions::Catalog::Ready(sessions) => rsx! {
+                if sessions.is_empty() {
+                    div { class: "inst-hint", "no example sessions shipped" }
+                }
+                for session in sessions {
+                    {
+                        let busy = applying.as_deref() == Some(session.name.as_str());
+                        let disabled = applying.is_some();
+                        let entry = session.clone();
+                        rsx! {
+                            div { key: "{session.name}", class: "inst-session",
+                                "data-session": "{session.name}",
+                                div { class: "inst-session-head",
+                                    span { class: "inst-session-title", "{session.title}" }
+                                    button {
+                                        class: "btn inst-session-load",
+                                        r#type: "button",
+                                        "data-action": "load-session",
+                                        "data-session": "{session.name}",
+                                        disabled,
+                                        onclick: move |_| crate::sessions::load(ctx, entry.clone()),
+                                        if busy { "Loading…" } else { "Load" }
+                                    }
+                                }
+                                div { class: "inst-session-desc", "{session.description}" }
+                                if let Some(source) = &session.source {
+                                    div { class: "inst-session-source", "source: {source}" }
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+        }
+        if let Some(error) = error {
+            div { class: "inst-hint", role: "alert", "data-field": "session-error", "{error}" }
         }
     }
 }

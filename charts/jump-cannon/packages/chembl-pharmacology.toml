@@ -1,0 +1,361 @@
+# ChEMBL pharmacology package.
+#
+# Reads the EMBL-EBI ChEMBL REST API as a read-only pharmacology graph:
+# approved molecules, their protein targets, the mechanism records that link a
+# molecule to a target, and the disease indications a molecule is studied or
+# approved for. The json engine of `crates/importer` does the I/O, decoding,
+# and ID namespacing; this file only declares what a ChEMBL record looks like
+# and how it becomes nodes, edges, and discovery fields — no new SourceKind,
+# no new crate (AGENTS.md, "Importers: packages, not crates").
+#
+# Verified against ChEMBL 34 at https://www.ebi.ac.uk/chembl/api/data:
+#   GET /molecule.json?limit=&offset=&max_phase=  -> {"molecules":[…],"page_meta":{"total_count":N}}
+#   GET /target.json?limit=&offset=               -> {"targets":[…],"page_meta":{…}}
+#   GET /mechanism.json?limit=&offset=            -> {"mechanisms":[…],"page_meta":{…}}
+#   GET /drug_indication.json?limit=&offset=      -> {"drug_indications":[…],"page_meta":{…}}
+#
+# The graph shape is molecule —(mechanism)— target plus molecule —(indication)—
+# disease: `mechanisms` and `drug_indications` are imported as nodes carrying
+# edge rules to both endpoint collections, because a single edge-list
+# collection can only resolve endpoints within one collection.
+
+format_version = 3
+
+# -----------------------------------------------------------------------------
+# Metadata
+# -----------------------------------------------------------------------------
+
+[metadata]
+id = "chembl.pharmacology"
+name = "ChEMBL pharmacology"
+version = "1.0.0"
+description = "Reads the public ChEMBL REST API as a read-only pharmacology graph: molecules (scoped by clinical phase), protein targets, mechanism-of-action records linking molecule to target, and drug indications linking molecule to disease. Molecule salt/parent forms link through the ChEMBL molecule hierarchy."
+
+# -----------------------------------------------------------------------------
+# Limits
+# -----------------------------------------------------------------------------
+# `nodes` is the loud hard bound per collection: an over-bound scope fails the
+# import instead of truncating, so a widened `max_phase` is a visible error
+# rather than a silently partial graph. `input_bytes` bounds one response body.
+
+[limits]
+nodes = 20000
+input_bytes = 67108864
+
+# =============================================================================
+# Discovery schema
+# =============================================================================
+# `id`, `title`, `tags`, `path`, `type`, `folder` come from the engine; this
+# package declares only what it adds. Every field a rule below populates must
+# appear here, or the package fails validation.
+
+[[schema.fields]]
+key = "smiles"
+field_type = "text"
+required = false
+searchable = true
+facetable = false
+snippet = true
+boost = 2
+
+[[schema.fields]]
+key = "mechanism_of_action"
+field_type = "text"
+required = false
+searchable = true
+facetable = false
+snippet = true
+boost = 4
+
+[[schema.fields]]
+key = "indication"
+field_type = "text"
+required = false
+searchable = true
+facetable = false
+snippet = true
+boost = 4
+
+[[schema.fields]]
+key = "molecule_type"
+field_type = "keyword"
+required = false
+searchable = true
+facetable = true
+
+[[schema.fields]]
+key = "organism"
+field_type = "keyword"
+required = false
+searchable = true
+facetable = true
+
+[[schema.fields]]
+key = "target_type"
+field_type = "keyword"
+required = false
+searchable = true
+facetable = true
+
+[[schema.fields]]
+key = "action_type"
+field_type = "keyword"
+required = false
+searchable = true
+facetable = true
+
+[[schema.fields]]
+key = "max_phase"
+field_type = "keyword"
+required = false
+searchable = true
+facetable = true
+
+[[schema.fields]]
+key = "first_approval"
+field_type = "number"
+required = false
+searchable = false
+facetable = false
+
+[[schema.fields]]
+key = "molecular_weight"
+field_type = "number"
+required = false
+searchable = false
+facetable = false
+
+[[schema.fields]]
+key = "alogp"
+field_type = "number"
+required = false
+searchable = false
+facetable = false
+
+[[schema.fields]]
+key = "ro5_violations"
+field_type = "number"
+required = false
+searchable = false
+facetable = false
+
+# =============================================================================
+# Parser: json engine
+# =============================================================================
+
+# Declared edge vocabulary: every `kind` an edge rule below emits must appear
+# here, or the package fails validation.
+
+[[schema.edge_types]]
+key = "parent_molecule"
+directed = true
+description = "Salt/prodrug form -> its parent molecule in the ChEMBL molecule hierarchy."
+
+[[schema.edge_types]]
+key = "acts_on_molecule"
+directed = true
+description = "Mechanism-of-action record -> the molecule it describes."
+
+[[schema.edge_types]]
+key = "acts_on_target"
+directed = true
+description = "Mechanism-of-action record -> the protein target it acts on."
+
+[[schema.edge_types]]
+key = "indicated_molecule"
+directed = true
+description = "Drug-indication record -> the molecule indicated for that disease."
+
+[parser]
+engine = "json"
+page_size = 200
+request_timeout_seconds = 120
+
+# `max_phase` scopes the molecule set. `4` is "approved", which keeps the
+# default graph at a few thousand molecules; `3`/`2` widen it and will trip
+# `limits.nodes` loudly rather than truncate.
+[[parser.variables]]
+name = "max_phase"
+default = "4"
+description = "ChEMBL clinical phase filter for molecules (4 = approved)"
+
+# ── molecules ────────────────────────────────────────────────────────────────
+
+[[parser.collections]]
+name = "molecules"
+path = "/chembl/api/data/molecule.json"
+items_pointer = "/molecules"
+total_pointer = "/page_meta/total_count"
+
+[parser.collections.query]
+max_phase = "{max_phase}"
+
+[parser.collections.paginate]
+style = "limit_offset"
+
+[parser.collections.nodes]
+id_pointer = "/molecule_chembl_id"
+node_type = "molecule"
+folder = "molecules"
+
+[parser.collections.nodes.title]
+pointer = "/pref_name"
+fallback_prefix = "molecule"
+
+[[parser.collections.nodes.fields]]
+key = "smiles"
+pointer = "/molecule_structures/canonical_smiles"
+
+[[parser.collections.nodes.fields]]
+key = "molecule_type"
+pointer = "/molecule_type"
+
+[[parser.collections.nodes.fields]]
+key = "max_phase"
+pointer = "/max_phase"
+
+[[parser.collections.nodes.fields]]
+key = "first_approval"
+pointer = "/first_approval"
+
+[[parser.collections.nodes.fields]]
+key = "molecular_weight"
+pointer = "/molecule_properties/full_mwt"
+transform = "parse_number"
+
+[[parser.collections.nodes.fields]]
+key = "alogp"
+pointer = "/molecule_properties/alogp"
+transform = "parse_number"
+
+[[parser.collections.nodes.fields]]
+key = "ro5_violations"
+pointer = "/molecule_properties/num_ro5_violations"
+
+# Salt and prodrug forms point at their parent molecule; self-references
+# (parent == self, the common case) are dropped by the engine.
+[[parser.collections.nodes.edges]]
+kind = "parent_molecule"
+value_pointer = "/molecule_hierarchy/parent_chembl_id"
+target_collection = "molecules"
+match_on = "id"
+
+# ── targets ──────────────────────────────────────────────────────────────────
+
+[[parser.collections]]
+name = "targets"
+path = "/chembl/api/data/target.json"
+items_pointer = "/targets"
+total_pointer = "/page_meta/total_count"
+
+[parser.collections.query]
+organism = "Homo sapiens"
+
+[parser.collections.paginate]
+style = "limit_offset"
+
+[parser.collections.nodes]
+id_pointer = "/target_chembl_id"
+node_type = "target"
+folder = "targets"
+
+[parser.collections.nodes.title]
+pointer = "/pref_name"
+fallback_prefix = "target"
+
+[parser.collections.nodes.doctype]
+pointer = "/target_type"
+
+[[parser.collections.nodes.fields]]
+key = "organism"
+pointer = "/organism"
+
+[[parser.collections.nodes.fields]]
+key = "target_type"
+pointer = "/target_type"
+
+# ── mechanisms: the molecule ↔ target bridge ────────────────────────────────
+
+[[parser.collections]]
+name = "mechanisms"
+path = "/chembl/api/data/mechanism.json"
+items_pointer = "/mechanisms"
+total_pointer = "/page_meta/total_count"
+
+[parser.collections.paginate]
+style = "limit_offset"
+
+[parser.collections.nodes]
+id_pointer = "/mec_id"
+local_prefix = "mechanism:"
+node_type = "mechanism"
+folder = "mechanisms"
+
+[parser.collections.nodes.title]
+pointer = "/mechanism_of_action"
+fallback_prefix = "mechanism"
+
+[parser.collections.nodes.doctype]
+pointer = "/action_type"
+
+[[parser.collections.nodes.fields]]
+key = "mechanism_of_action"
+pointer = "/mechanism_of_action"
+
+[[parser.collections.nodes.fields]]
+key = "action_type"
+pointer = "/action_type"
+
+# No `max_phase` rule here: a mechanism record ships it as a number while a
+# molecule ships `"4.0"`, and the declared field is a keyword facet. The
+# phase belongs to the molecule this mechanism points at anyway.
+
+[[parser.collections.nodes.edges]]
+kind = "acts_on_molecule"
+value_pointer = "/molecule_chembl_id"
+target_collection = "molecules"
+match_on = "id"
+
+[[parser.collections.nodes.edges]]
+kind = "acts_on_target"
+value_pointer = "/target_chembl_id"
+target_collection = "targets"
+match_on = "id"
+
+# ── drug indications: the molecule ↔ disease bridge ─────────────────────────
+
+[[parser.collections]]
+name = "indications"
+path = "/chembl/api/data/drug_indication.json"
+items_pointer = "/drug_indications"
+total_pointer = "/page_meta/total_count"
+
+[parser.collections.query]
+max_phase_for_ind = "4"
+
+[parser.collections.paginate]
+style = "limit_offset"
+
+[parser.collections.nodes]
+id_pointer = "/drugind_id"
+local_prefix = "indication:"
+node_type = "indication"
+folder = "indications"
+
+[parser.collections.nodes.title]
+pointer = "/efo_term"
+fallback_prefix = "indication"
+
+[[parser.collections.nodes.fields]]
+key = "indication"
+pointer = "/mesh_heading"
+
+[[parser.collections.nodes.fields]]
+key = "max_phase"
+pointer = "/max_phase_for_ind"
+
+[[parser.collections.nodes.edges]]
+kind = "indicated_molecule"
+value_pointer = "/molecule_chembl_id"
+target_collection = "molecules"
+match_on = "id"

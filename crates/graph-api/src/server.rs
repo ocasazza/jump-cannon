@@ -76,6 +76,11 @@ fn api_routes() -> Router<SourceHost> {
             "/importers/sources/:id/parameters",
             get(source_parameters),
         )
+        .route(
+            "/importers/:source_id/variables",
+            get(crate::importer_editor::variables_get)
+                .put(crate::importer_editor::variables_put),
+        )
         .route("/graph/init", get(graph_init))
         .route("/graph/ids", get(graph_ids))
         .route("/graph/positions", get(graph_positions))
@@ -1524,12 +1529,22 @@ struct ProgressQuery {
 }
 
 async fn progress_poll(
-    selection: SourceSelection,
+    State(host): State<SourceHost>,
+    headers: HeaderMap,
     Query(p): Query<ProgressQuery>,
 ) -> impl IntoResponse {
-    let s = selection.0;
-    let resp = s.inner.progress.since(p.since.unwrap_or(0));
-    axum::Json(resp)
+    // Never resolves through a build: a selected source under construction
+    // serves its live build log so the client can watch stages while the
+    // graph fetch itself reports 202 + Retry-After. The canonical selection
+    // rides the source header; an absent/empty value serves the default.
+    let requested = headers
+        .get(crate::source_host::SOURCE_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+    match host.progress(requested, p.since.unwrap_or(0), &headers) {
+        Ok(response) => Json(response).into_response(),
+        Err(error) => error.into_response(),
+    }
 }
 
 #[derive(serde::Deserialize)]

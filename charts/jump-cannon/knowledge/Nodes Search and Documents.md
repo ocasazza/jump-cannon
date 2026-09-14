@@ -35,6 +35,16 @@ contract as `Search fields` and renders only the active schema's searchable
 keys; the importer identity remains metadata rather than user-facing search
 terminology. Invalid query or schema errors appear inline.
 
+Exact matching comes first and stays precise: the parsed query is conjunctive
+and term-exact, so `adalimumab` returns that one molecule. Only when a query
+matches nothing does graph-api retry it as a typo- and prefix-tolerant
+disjunction over every searchable field — `aspirn` and `aspir` both find
+ASPIRIN — with the Levenshtein distance scaled by term length (1 edit up to
+five characters, 2 beyond). A query that already matched is never widened, a
+field-qualified query (`tags:revenue`) never fuzzes, and nonsense still
+returns nothing. This is what makes an imported corpus explorable when you
+only half-remember a compound, target, or paper title.
+
 The current Obsidian importer is the only built-in with readable and writable
 source content. Saving from the focused editor sends `PUT /vault/page`;
 graph-api preserves YAML frontmatter and the vault watcher reloads the complete

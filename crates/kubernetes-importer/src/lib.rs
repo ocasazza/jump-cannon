@@ -786,7 +786,7 @@ fn kubernetes_schema() -> ImporterSchema {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use data_loader::Importer;
+    use data_loader::{Importer, ImportOutcome};
     use serde_json::json;
     fn decoded(origin: &str, value: Value) -> DecodedRecord {
         DecodedRecord {
@@ -1204,9 +1204,10 @@ mod tests {
         fn import<'a>(
             &'a self,
             _progress: &'a dyn ImportProgress,
-        ) -> ImportFuture<'a, Result<LoadResult, ImportError>> {
+        ) -> ImportFuture<'a, Result<ImportOutcome, ImportError>> {
             Box::pin(async move {
-                KubernetesGraphMapper::new("test", false).map(self.records.clone())
+                let loaded = KubernetesGraphMapper::new("test", false).map(self.records.clone())?;
+                Ok(ImportOutcome::Loaded(loaded))
             })
         }
     }

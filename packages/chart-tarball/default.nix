@@ -53,7 +53,9 @@ pkgs.runCommand "jump-cannon-chart-tarball"
     grep -Fq 'name: lavender-okf-repository' lavender.yaml
     grep -Fq 'mountPath: /var/lib/lavender/okf-repository' lavender.yaml
     grep -Fq 'claimName: lavender-okf-shared' lavender.yaml
-    test "$(grep -Fc 'readOnly: true' lavender.yaml)" -eq 2
+    # Three read-only mounts: the OKF claim, its volume, and the host CA
+    # bundle (hostCaBundle, on by default — Fortigate TLS inspection).
+    test "$(grep -Fc 'readOnly: true' lavender.yaml)" -eq 3
     if grep -Eq '^kind: (ConfigMap|PersistentVolumeClaim)$' lavender.yaml; then
       echo "selected lavender-ingest-okf must not render ConfigMaps or PVCs" >&2
       exit 1

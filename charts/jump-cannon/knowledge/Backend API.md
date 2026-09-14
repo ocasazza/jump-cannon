@@ -30,11 +30,16 @@ title-only matching.
 of configured source instances. Its activation mode is `helm_rollout`; the API
 exposes no source-selection or run mutation. graph-api rejects an
 unknown selection, a selected kind that differs from the importer actually
-started, and unsafe filesystem profiles during startup. Package text is the
-one mutable surface: `GET /importers/:id/definition` reads an httpjson
-source's authored TOML, and `PUT /importers/:id/definition` plus
+startup. Package text is one mutable surface: `GET /importers/:id/definition`
+reads an httpjson source's authored TOML, and `PUT /importers/:id/definition` plus
 `POST /importers` write it behind the runtime-switch group (see
-[[Importer Runtime]], "Package definitions").
+[[Importer Runtime]], "Package definitions"). Instance variables are the
+second mutable surface: `GET /importers/:id/variables` returns an httpjson
+source's declared package variables plus its current instance values, and
+`PUT /importers/:id/variables` (same group authorization) fully replaces the
+set — persisted to `<packages_dir>/variables.local.json`, applied in-memory,
+and the running alternate invalidated so the next request rebuilds with the
+new values.
 
 When `importers.runtimeSwitchGroup` is set, selected sources are built on a background task. Graph routes for a selection that is still building answer `202 Accepted` with `Retry-After: 2` and JSON `{"status":"building","source","elapsed_ms","stage","detail","fraction"}` — they no longer wait behind a lock. Failed builds answer `503 Service Unavailable` with `{"status":"failed","source","error"}` and are retryable. The `{id}` on all importer source routes is the full **selection string** (e.g. `hindsight-memory-bank?bank=omp`, URL-encoded), not just the source-id. New status and control routes:
 - `GET /importers/sources/{id}/parameters` returns 200 JSON `{"source": "<id>", "parameters": {"<param-name>": {"label": "...", "default": "...", "values": [...], "discovered": true|false}}}` with the catalog's declared parameters and their discovered/static values. Discovery runs live (10 s timeout, ≤1000 items) and falls back to static `values` on error, setting `"error": "..."` when fallback is used. Returns 404 when the source is not found or 403 when runtime switching is disabled. Cached per source for 60 s.

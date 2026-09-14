@@ -33,6 +33,10 @@
     <!-- panel-kit's vendored Monaco editor assets, copied verbatim into dist
          so the Importers panel's MonacoEditor can load its workers. -->
     <link data-trunk rel="copy-dir" href="assets/vendor" data-target-path="assets/vendor" />
+    <!-- Shipped example sessions (curated app-state + source pairs). Ride the
+         dist so every deployment has them: container, trunk serve, and the
+         browser-only GitHub Pages mode. -->
+    <link data-trunk rel="copy-dir" href="assets/sessions" data-target-path="assets/sessions" />
   </head>
   <body>
     <!-- Dioxus requires an empty mount element. The static boot shell must be

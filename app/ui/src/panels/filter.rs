@@ -218,7 +218,9 @@ pub(crate) fn ensure_field_index(ctx: Ctx) {
             }
             Err(e) => {
                 tracing::warn!("[filter] meta_summary fetch failed: {e}");
-                *FIELD_INDEX.write() = Some(Err(e));
+                // display_error: a building 503 carries the machine
+                // instruction body; log it raw, render the calm state.
+                *FIELD_INDEX.write() = Some(Err(crate::api::display_error(&e)));
             }
         }
     });

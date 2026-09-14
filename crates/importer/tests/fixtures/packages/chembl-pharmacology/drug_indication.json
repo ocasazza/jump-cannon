@@ -1,0 +1,19 @@
+{
+  "drug_indications": [
+    {
+      "drugind_id": 101,
+      "efo_term": "pain",
+      "mesh_heading": "Pain",
+      "max_phase_for_ind": "4",
+      "molecule_chembl_id": "CHEMBL25"
+    },
+    {
+      "drugind_id": 102,
+      "efo_term": "rheumatoid arthritis",
+      "mesh_heading": "Arthritis, Rheumatoid",
+      "max_phase_for_ind": "4",
+      "molecule_chembl_id": "CHEMBL1201585"
+    }
+  ],
+  "page_meta": { "limit": 200, "offset": 0, "total_count": 2 }
+}

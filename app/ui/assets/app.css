@@ -1098,6 +1098,13 @@ textarea.doc-src:focus { outline:none; }
 .imp-vars { display:flex; flex-direction:column; gap:.3rem; align-items:flex-start; }
 .imp-var { width:100%; display:grid; grid-template-columns:1fr auto 1fr auto;
   align-items:center; gap:.3rem; color:var(--dim); font-family:var(--mono); }
+/* Runtime-variables section for the selected httpjson source
+   (data-field=variables), between the catalog summary and the package
+   editor. Field rows reuse .imp-field; actions reuse .imp-actions. */
+.imp-vars-section { display:flex; flex-direction:column; gap:.4rem; min-width:0;
+  padding:.45rem .1rem; border-top:1px solid var(--line); }
+.imp-vars-body { display:flex; flex-direction:column; gap:.4rem; }
+.imp-vars-section .imp-actions { padding-top:0; }
 
 /* Live source-apply feedback in the catalog summary (data-field=apply-status)
    and its glanceable row chip (data-field=apply-chip). */
@@ -1106,7 +1113,6 @@ textarea.doc-src:focus { outline:none; }
   padding:.35rem .5rem; font-size:.66rem; line-height:1.5; overflow-wrap:anywhere; }
 .imp-apply-line { color:var(--fg); }
 .imp-apply-line strong { color:var(--green); }
-.imp-apply-stage { color:var(--dim); font-family:var(--mono); font-size:.62rem; }
 .imp-apply .imp-note { padding:0; }
 .imp-apply.building { border-left-color:var(--accent); }
 .imp-apply.ok { border-left-color:var(--green); }
@@ -1164,3 +1170,26 @@ textarea.doc-src:focus { outline:none; }
 
 /* Graph panel overlay while the applied source is still indexing. */
 .graph-render-status.building { border-color:var(--accent); }
+
+/* Graph-area overlay while a selected importer source builds server-side. */
+.graph-building { position:absolute; inset:0; display:flex; flex-direction:column;
+  align-items:center; justify-content:center; gap:.5rem; padding:2rem;
+  background:color-mix(in srgb, var(--bg, #101014) 88%, transparent);
+  z-index:5; }
+.graph-building .pk-progress { font-family:var(--mono); }
+
+/* Catalog row + its inline Load action. The row selects (inspect); the Load
+   button applies the source, so one click from the list loads a graph without
+   making catalog browsing trigger server-side imports. */
+.imp-row-wrap { display:flex; align-items:stretch; gap:.2rem; }
+.imp-row-wrap > .imp-row { flex:1 1 auto; }
+.imp-row-load { flex:0 0 auto; padding:0 .45rem; font-size:.7rem; line-height:1;
+  color:var(--accent); }
+
+/* Shipped example sessions in the Instances panel. */
+.inst-session { display:flex; flex-direction:column; gap:.15rem; padding:.3rem 0; }
+.inst-session-head { display:flex; align-items:center; gap:.5rem; }
+.inst-session-title { flex:1 1 auto; color:var(--fg); font-size:.72rem; }
+.inst-session-load { flex:0 0 auto; }
+.inst-session-desc { color:var(--dim); font-size:.65rem; line-height:1.35; }
+.inst-session-source { color:var(--accent); font-family:var(--mono); font-size:.6rem; }

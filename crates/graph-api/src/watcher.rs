@@ -471,22 +471,39 @@ pub async fn reload(state: &AppState) {
 }
 
 /// Reload graph, search index, and facets, then atomically swap them together.
+/// An [`data_loader::ImportOutcome::Unchanged`] response keeps the current
+/// snapshot silently — no progress events, no rebuild, no swap.
 async fn rebuild_snapshot(state: &AppState) -> bool {
     let progress = state.inner.progress.clone();
-
     let descriptor = state.inner.importer.descriptor();
-    let reload_id = progress.start("ingest", format!("Reloading {}", descriptor.name));
-    progress.info("ingest", format!("{} change detected", descriptor.id));
 
     let loaded =
         match crate::vault_loader::load_with_progress(&state.inner.importer, Some(&progress)).await
         {
-            Ok(loaded) => loaded,
+            Ok(data_loader::ImportOutcome::Unchanged) => {
+                tracing::debug!(
+                    source = %descriptor.id,
+                    "source unchanged; keeping snapshot"
+                );
+                return false;
+            }
+            Ok(data_loader::ImportOutcome::Loaded(loaded)) => loaded,
             Err(error) => {
-                progress.fail(reload_id, error.to_string());
+                // load_with_progress already failed its scan stage; the
+                // reload stage below only opens once fresh data exists.
+                tracing::warn!(
+                    source = %descriptor.id,
+                    %error,
+                    "reload failed; keeping last snapshot"
+                );
                 return false;
             }
         };
+
+    // Only now is a reload actually happening: the source produced fresh
+    // bytes and a replacement snapshot is imminent.
+    let reload_id = progress.start("ingest", format!("Reloading {}", descriptor.name));
+    progress.info("ingest", format!("{} change detected", descriptor.id));
 
     let snap_id = progress.start("ingest", "Building snapshot");
     let schema = descriptor.schema;
@@ -566,7 +583,7 @@ fn is_relevant(
 mod tests {
     use super::*;
     use data_loader::{
-        DiscoveryField, DiscoveryFieldType, EdgeTypeSchema, ImportError, ImportFuture,
+        DiscoveryField, DiscoveryFieldType, EdgeTypeSchema, ImportError, ImportFuture, ImportOutcome,
         ImportProgress, Importer, ImporterDescriptor, ImporterSchema, LoadResult, SearchDocument,
         TagHierarchySchema,
     };
@@ -631,7 +648,7 @@ mod tests {
         fn import<'a>(
             &'a self,
             _progress: &'a dyn ImportProgress,
-        ) -> ImportFuture<'a, Result<LoadResult, ImportError>> {
+        ) -> ImportFuture<'a, Result<ImportOutcome, ImportError>> {
             Box::pin(async {
                 Err(ImportError::SourceRead {
                     origin: "test".into(),
@@ -669,13 +686,13 @@ mod tests {
         fn import<'a>(
             &'a self,
             _progress: &'a dyn ImportProgress,
-        ) -> ImportFuture<'a, Result<LoadResult, ImportError>> {
+        ) -> ImportFuture<'a, Result<ImportOutcome, ImportError>> {
             Box::pin(async {
-                Ok(LoadResult {
+                Ok(ImportOutcome::Loaded(LoadResult {
                     graph: VaultGraph::new(),
                     search_documents: Vec::new(),
                     unresolved: Vec::new(),
-                })
+                }))
             })
         }
     }
@@ -822,6 +839,73 @@ mod tests {
         let snapshot = state.snapshot();
         assert_eq!(snapshot.revision, revision);
         assert!(snapshot.graph.nodes.contains_key("generate:test:last-good"));
+    }
+
+    struct UnchangedImporter;
+
+    impl Importer for UnchangedImporter {
+        fn descriptor(&self) -> ImporterDescriptor {
+            ImporterDescriptor::new(
+                "unchanged",
+                "Unchanged",
+                "1",
+                vec![data_loader::Capability::new(
+                    Effect::Read,
+                    Transport::InMemory,
+                    "unchanged",
+                )],
+                test_schema(),
+            )
+        }
+
+        fn import<'a>(
+            &'a self,
+            _progress: &'a dyn ImportProgress,
+        ) -> ImportFuture<'a, Result<ImportOutcome, ImportError>> {
+            Box::pin(async { Ok(ImportOutcome::Unchanged) })
+        }
+    }
+
+    /// A poll tick that resolves to [`ImportOutcome::Unchanged`] must keep
+    /// the current snapshot and stay completely silent on the progress log:
+    /// no reload stage, no "change detected" info, no snapshot build.
+    #[tokio::test]
+    async fn unchanged_reload_keeps_snapshot_and_emits_no_progress() {
+        let mut graph = VaultGraph::new();
+        graph.add_node(VaultNode {
+            id: "generate:test:kept".into(),
+            meta: vault_data::NodeMeta {
+                source_id: "test".into(),
+                title: "Kept".into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        let raw: Box<dyn Importer> = Box::new(UnchangedImporter);
+        let grants = raw.descriptor().capabilities;
+        let importer = HostedImporter::new(raw, grants).unwrap();
+        let progress = Arc::new(crate::progress::ProgressLog::new());
+        let state = crate::AppState::new(
+            PathBuf::new(),
+            importer,
+            test_result(graph),
+            None,
+            crate::compute_broker::ComputeBroker::new(),
+            progress.clone(),
+        )
+        .unwrap();
+        let revision = state.snapshot().revision;
+        let events_before = progress.since(0).next_seq;
+
+        assert!(!rebuild_snapshot(&state).await);
+        let snapshot = state.snapshot();
+        assert_eq!(snapshot.revision, revision);
+        assert!(snapshot.graph.nodes.contains_key("generate:test:kept"));
+        assert_eq!(
+            progress.since(0).next_seq,
+            events_before,
+            "an unchanged tick must not emit any progress event"
+        );
     }
 
     #[test]

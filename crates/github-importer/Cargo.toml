@@ -8,7 +8,11 @@ description = "GitHub tarball importer: polls codeload.github.com with ETag reva
 vault-data  = { path = "../vault-data" }
 data-loader = { path = "../data-loader" }
 vault-links = { path = "../vault-links" }
-reqwest     = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+# rustls-tls-native-roots, NOT rustls-tls: the bundled webpki roots ignore
+# SSL_CERT_FILE, so behind the Schrodinger Fortigate (which re-signs every
+# outbound chain) every request fails x509 verification inside a container.
+# Native roots read the host bundle the deployment mounts.
+reqwest     = { version = "0.12", default-features = false, features = ["rustls-tls-native-roots"] }
 tar         = "0.4"
 flate2      = "1"
 serde       = { workspace = true }

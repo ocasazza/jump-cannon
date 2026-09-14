@@ -10,8 +10,14 @@
 //   space, scaled to ½ pixel-width.
 //
 // DoF: per-fragment CoC is faked via average-endpoint distance to the
-// focus plane; fat lines also stretch DoF naturally because the alpha
-// fade interpolates across the quad.
+// view-space focal band; fat lines also stretch DoF naturally because
+// the alpha fade interpolates across the quad. The attribute-focus
+// channel (FLAG_ATTR) is node-only — edges keep the depth-driven
+// attenuation.
+//
+// Depth cueing (fog) and the clipping slab act per-fragment on the
+// interpolated view-space depth: an edge crossing the slab boundary is
+// cut exactly, not culled wholesale.
 //
 // Layout:
 //   group(0) binding(0)  uniform CameraUniform
@@ -20,20 +26,20 @@
 //   group(0) binding(3)  storage<read> array<vec2<u32>>  edges (src,tgt)
 
 struct CameraUniform {
-    view_proj: mat4x4<f32>,
-    view:      mat4x4<f32>,
-    cam_pos:   vec3<f32>,
-    _pad0:     f32,
-    screen:    vec2<f32>,
-    _pad1:     vec2<f32>,
+    view_proj:  mat4x4<f32>,
+    view:       mat4x4<f32>,
+    cam_pos:    vec3<f32>,
+    proj_scale: f32,  // vertical NDC-per-world-unit scale of the projection
+    screen:     vec2<f32>,
+    _pad1:      vec2<f32>,
 };
 // Layout mirrors the Rust `EffectsUniform` byte-for-byte. Keep in sync
-// with graph_pipelines.rs and node.wgsl.
+// with pipelines.rs and node.wgsl.
 struct EffectsUniform {
-    focus_plane_z:         f32,
-    focus_thickness:       f32,
+    focus_depth:           f32,  // view-space radial focal distance
+    focus_thickness:       f32,  // sharp band full width (view-space)
     cursor_radius_visual:  f32,
-    blur_strength:         f32,
+    aperture:              f32,
     max_coc:               f32,
     edge_alpha_mul:        f32,
     edge_dist_min:         f32,
@@ -43,11 +49,24 @@ struct EffectsUniform {
     edge_width:            f32,   // pixels — fat-line half-width × 2
     edge_fade_floor:       f32,   // long-distance asymptotic alpha floor
     shader_intensity:      f32,   // post-process visual-intensity scalar
+    fog_start:             f32,
+    fog_end:               f32,
+    fog_strength:          f32,
+    clip_near:             f32,
+    clip_far:              f32,
+    focus_attr_center:     f32,
+    _pad_v2:               vec2<f32>,
+    flags:                 u32,
     hovered_node:          u32,   // u32::MAX = no hover (unused in edge.wgsl)
     hovered_edge:          u32,   // u32::MAX = no edge hover
-    _pad_hover0:           u32,
-    _pad_hover1:           u32,
+    _pad_hover:            u32,
 };
+// Keep in sync with FLAG_* in pipelines.rs.
+const FLAG_DOF:   u32 = 1u;
+const FLAG_FOG:   u32 = 2u;
+const FLAG_CLIP:  u32 = 4u;
+const FLAG_ATTR:  u32 = 8u;
+const FLAG_ORTHO: u32 = 16u;
 
 @group(0) @binding(0) var<uniform> camera:  CameraUniform;
 @group(0) @binding(1) var<uniform> effects: EffectsUniform;
@@ -67,7 +86,7 @@ struct EffectsUniform {
 
 struct VertexOutput {
     @builtin(position) clip_pos:   vec4<f32>,
-    @location(0)       world_z:    f32,
+    @location(0)       view_dist:  f32,  // this endpoint's view depth
     @location(1)       edge_len:   f32,
     @location(2)       coc:        f32,
     @location(3)       focus_mul:  f32,
@@ -118,18 +137,27 @@ fn vs_main(@builtin(vertex_index) vid: u32) -> VertexOutput {
     // `edge_fade_floor` in the fragment shader. Hard culls produced
     // visible popping when nodes drifted across the boundary mid-sim.
 
-    // CoC computation only runs when DoF is engaged (focus_thickness <
-    // 1e6 sentinel). Skipping saves a mat-vec + a handful of scalar ops
-    // per edge endpoint when DoF is off (the default).
+    // View-space depth of this vertex's endpoint — interpolated across
+    // the quad for per-fragment fog + clipping slab.
+    let view_pos = camera.view * vec4<f32>(p, 1.0);
+    out.view_dist = -view_pos.z;
+
+    // CoC computation only runs when DoF is engaged (FLAG_DOF). Skipping
+    // saves a mat-vec + a handful of scalar ops per edge endpoint when
+    // DoF is off (the default).
     var coc = 0.0;
-    if (effects.focus_thickness < 1.0e6) {
+    if ((effects.flags & FLAG_DOF) != 0u) {
         let p_mid = 0.5 * (p_src + p_tgt);
-        let view_pos = camera.view * vec4<f32>(p_mid, 1.0);
-        let view_dist = -view_pos.z;
-        let dz = abs(view_dist - effects.focus_plane_z);
+        let mid_view = camera.view * vec4<f32>(p_mid, 1.0);
+        let mid_dist = -mid_view.z;
+        let dz = abs(mid_dist - effects.focus_depth);
         let half_t = max(effects.focus_thickness * 0.5, 0.001);
-        let blur_z = max(dz - half_t, 0.0);
-        coc = min(blur_z * effects.blur_strength, effects.max_coc);
+        let err = max(dz - half_t, 0.0);
+        var coc_px = effects.aperture * err * camera.proj_scale * camera.screen.y * 0.5;
+        if ((effects.flags & FLAG_ORTHO) == 0u) {
+            coc_px = coc_px / max(mid_dist, 1.0);
+        }
+        coc = min(coc_px, effects.max_coc);
     }
 
     // Project both endpoints to clip space, perform the perpendicular
@@ -177,7 +205,6 @@ fn vs_main(@builtin(vertex_index) vid: u32) -> VertexOutput {
     );
 
     out.clip_pos = clip_p + clip_offset;
-    out.world_z  = p.z;
     out.edge_len = edge_len;
     out.coc      = coc;
     out.tint     = edge_colors[edge_idx];
@@ -187,6 +214,14 @@ fn vs_main(@builtin(vertex_index) vid: u32) -> VertexOutput {
 
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
+    // Clipping slab — per-fragment so edges crossing the slab boundary
+    // are cut exactly where they exit the section.
+    if ((effects.flags & FLAG_CLIP) != 0u) {
+        if (in.view_dist < effects.clip_near || in.view_dist > effects.clip_far) {
+            discard;
+        }
+    }
+
     // Two-stage continuous fade — no hard cull, no popping.
     //
     //   stage 1: edge_len in [dist_min, dist_max]
@@ -226,6 +261,14 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     // CoC fade — out-of-focus edges still drop alpha when DoF is engaged.
     let focus_atten = 1.0 / (1.0 + in.coc * 0.05);
 
+    // Depth cueing: attenuate with interpolated view depth.
+    var fog_mul = 1.0;
+    if ((effects.flags & FLAG_FOG) != 0u) {
+        let f = smoothstep(effects.fog_start, effects.fog_end, in.view_dist)
+              * effects.fog_strength;
+        fog_mul = 1.0 - clamp(f, 0.0, 1.0);
+    }
+
     // Per-edge color: `tint.rgb` is the absolute edge color (the
     // community swatch when endpoints share a bucket, otherwise the
     // uniform `edge_color` fallback for bridging edges, OR the uniform
@@ -236,7 +279,9 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let base_a   = in.tint.a;
     var alpha = base_a * effects.edge_alpha_mul
               * visibility * focus_atten * in.focus_mul
+              * fog_mul
               * effects.shader_intensity;
+    base_rgb = base_rgb * fog_mul;
 
     // Hover treatment: brighten toward white and force full alpha so
     // the hovered edge pops above the stacked-alpha herd. Matched

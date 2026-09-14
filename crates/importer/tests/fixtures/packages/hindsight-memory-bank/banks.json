@@ -1,0 +1,6 @@
+{
+  "banks": [
+    { "bank_id": "fixture", "name": "Fixture bank" },
+    { "bank_id": "other", "name": "Other bank" }
+  ]
+}

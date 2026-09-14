@@ -4,7 +4,7 @@
 
 use std::collections::BTreeMap;
 
-use data_loader::NoProgress;
+use data_loader::{ImportOutcome, NoProgress};
 
 use super::*;
 use crate::ValidatedPackage;
@@ -57,10 +57,14 @@ async fn bound_variables_drive_the_evaluated_counts() {
     let package = ValidatedPackage::from_toml(&random_package("")).expect("package validates");
     let importer = build_tvix_importer(package, supplied(&[("nodes", "6"), ("edges", "9")]), "test".to_owned())
         .expect("importer binds");
-    let result = importer
+    let outcome = importer
         .import(&NoProgress)
         .await
         .expect("evaluation succeeds");
+    let result = match outcome {
+        ImportOutcome::Loaded(result) => result,
+        ImportOutcome::Unchanged => panic!("bound_variables_drive_the_evaluated_counts reported unchanged"),
+    };
     assert_eq!(result.graph.node_count(), 6, "six nodes requested");
     assert_eq!(result.graph.edge_count(), 9, "nine edges requested");
     // The instance namespace threads through every node id.
@@ -78,7 +82,11 @@ async fn defaults_apply_when_nothing_is_supplied() {
     let package = ValidatedPackage::from_toml(&random_package("")).expect("package validates");
     let importer =
         build_tvix_importer(package, BTreeMap::new(), "test".to_owned()).expect("importer binds");
-    let result = importer.import(&NoProgress).await.expect("evaluation succeeds");
+    let outcome = importer.import(&NoProgress).await.expect("evaluation succeeds");
+    let result = match outcome {
+        ImportOutcome::Loaded(result) => result,
+        ImportOutcome::Unchanged => panic!("defaults_apply_when_nothing_is_supplied reported unchanged"),
+    };
     assert_eq!(result.graph.node_count(), 4);
     assert_eq!(result.graph.edge_count(), 3);
 }
@@ -216,7 +224,11 @@ default = "0"
     let package = ValidatedPackage::from_toml(source).expect("package validates");
     let importer =
         build_tvix_importer(package, BTreeMap::new(), "test".to_owned()).expect("importer binds");
-    let result = importer.import(&NoProgress).await.expect("evaluation succeeds");
+    let outcome = importer.import(&NoProgress).await.expect("evaluation succeeds");
+    let result = match outcome {
+        ImportOutcome::Loaded(result) => result,
+        ImportOutcome::Unchanged => panic!("clustered_generator_tags_communities reported unchanged"),
+    };
     assert_eq!(result.graph.node_count(), 12);
     for node in result.graph.nodes.values() {
         assert!(

@@ -1,0 +1,14 @@
+# OpenAlex citations — one field's internal citation structure.
+#
+# Regime: GPU force simulation on a scale-free citation graph, sized by
+# PageRank (citation authority) and coloured by work type, which separates
+# reviews from primary articles and preprints.
+style:
+  size_by: PageRank
+  color_by: Doctype
+  size_mul: 0.8
+layout:
+  active: gpu-force
+  settings: {}
+  seed_strategy: None
+  seed_custom: ""

@@ -24,7 +24,11 @@ serde_json  = { workspace = true }
 thiserror   = "2"
 toml        = "0.8"
 tracing     = "0.1"
-reqwest     = { version = "0.12", default-features = false, features = ["rustls-tls"], optional = true }
+# rustls-tls-native-roots, NOT rustls-tls: the bundled webpki roots ignore
+# SSL_CERT_FILE, so behind the Schrodinger Fortigate (which re-signs every
+# outbound chain) every request fails x509 verification inside a container.
+# Native roots read the host bundle the deployment mounts.
+reqwest     = { version = "0.12", default-features = false, features = ["rustls-tls-native-roots"], optional = true }
 # Native-only: the tvix engine evaluates Nix generator expressions on a
 # blocking thread. tvix-wasm builds a pure (default-features off) native
 # evaluator; tokio provides spawn_blocking. The package core (validation,
@@ -36,3 +40,4 @@ tokio       = { workspace = true, optional = true }
 tempfile    = "3"
 tokio       = { workspace = true }
 parking_lot = "0.12"
+rstest      = "0.25"

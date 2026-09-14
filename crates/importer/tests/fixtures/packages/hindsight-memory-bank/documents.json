@@ -1,0 +1,19 @@
+{
+  "items": [
+    {
+      "id": "doc-1",
+      "tags": ["ithelp"],
+      "memory_unit_count": 2,
+      "retain_params": {
+        "context": "ITHELP triage batch",
+        "metadata": { "session_id": "session-1" }
+      }
+    },
+    {
+      "id": "doc-2",
+      "tags": [],
+      "memory_unit_count": 1,
+      "retain_params": { "context": "consolidation sweep", "metadata": {} }
+    }
+  ]
+}

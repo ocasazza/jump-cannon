@@ -281,6 +281,17 @@ async fn main() -> anyhow::Result<()> {    let _ = dotenvy::dotenv();
         }
     }
 
+    // Runtime variable overrides (`PUT /importers/:id/variables`) persist
+    // beside the overlay; same posture — a broken file must not take the
+    // deployment down with it.
+    if let Some(packages_dir) = &args.importer_packages_dir {
+        match importer_catalog.load_variables_overlay(packages_dir) {
+            Ok(0) => {}
+            Ok(applied) => tracing::info!(applied, "applied runtime importer variable overrides"),
+            Err(error) => tracing::warn!(%error, "ignoring runtime importer variable overrides"),
+        }
+    }
+
     let importer: Box<dyn Importer> = match source_kind {
         data_loader::SourceKind::World => {
             anyhow::bail!(
@@ -452,7 +463,20 @@ async fn main() -> anyhow::Result<()> {    let _ = dotenvy::dotenv();
 
     // Initial graph load — emit progress events so the bootstrap fetch
     // sees a populated /progress response on the first poll.
-    let loaded = vault_loader::load_with_progress(&importer, Some(&progress)).await?;
+    let loaded = match vault_loader::load_with_progress(&importer, Some(&progress)).await? {
+        data_loader::ImportOutcome::Loaded(loaded) => loaded,
+        // Defensive: a cold importer cannot report Unchanged on the very
+        // first import. If one ever does there is no prior snapshot to
+        // keep and no honest graph to install, so fail startup loudly
+        // rather than serving an empty vault.
+        data_loader::ImportOutcome::Unchanged => {
+            return Err(anyhow::anyhow!(
+                "importer {} reported the source unchanged before the first load; \
+                 no snapshot exists to keep",
+                importer.descriptor().id
+            ));
+        }
+    };
 
     if let Some(dir) = &args.assets_dir {
         tracing::info!(assets_dir = %dir.display(), "dev mode: serving assets from disk");

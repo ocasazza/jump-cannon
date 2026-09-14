@@ -19,6 +19,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use dioxus::prelude::*;
 use gloo_storage::{LocalStorage, Storage};
 use panel_kit::editor::{MonacoEditor, PANEL_KIT_DARK_THEME};
+use panel_kit::loading::{loading_store, LoadingGate};
 use wasm_bindgen::{JsCast, JsValue};
 
 use crate::pest_worker::{parse_in_worker, ParsePreview};
@@ -83,6 +84,29 @@ enum ServerPackage {
     Failed(String),
 }
 
+/// Runtime-variables section state for the selected catalog source
+/// (`GET`/`PUT /importers/:id/variables`). Absent — not failed — for any
+/// selection without a variables surface: non-httpjson bindings, 400/404
+/// from the server, or a package that declares no variables.
+#[derive(Clone, PartialEq)]
+enum VariablesState {
+    /// No section for this selection.
+    Absent,
+    /// Fetch in flight for the selected source; the section chrome renders
+    /// while the gate shows the load.
+    Loading,
+    /// The fetch failed with a real error (network, 5xx); the gate renders
+    /// it with a retry available through reselecting the source.
+    Failed(String),
+    /// Declared package variables, the instance's effective values, and the
+    /// working edits (one entry per touched field; absent = untouched).
+    Ready {
+        declared: Vec<api::DeclaredVariable>,
+        current: BTreeMap<String, String>,
+        edits: BTreeMap<String, String>,
+    },
+}
+
 /// `POST /importers` draft. The package body is the editor's MANIFEST
 /// buffer, so it gets Monaco and the sandbox preview like any other package.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -113,11 +137,8 @@ enum PreviewState {
     Failed { message: String, timeout: bool },
 }
 
-/// Live outcome of the last source Apply. Applying an alternate source makes
-/// graph-api build that source's whole graph before it answers a single graph
-/// fetch, so the wait is unbounded from the panel's side and must be visible.
-#[derive(Clone, PartialEq)]
-enum ApplyState {
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum ApplyState {
     Building {
         /// Latest authoritative status from the source's own build endpoint.
         status: api::BuildStatus,
@@ -133,18 +154,18 @@ enum ApplyState {
 }
 
 #[derive(Clone, PartialEq)]
-struct ApplyStatus {
+pub(crate) struct ApplyStatus {
     /// Catalog id whose summary and row carry the status — the selection at
     /// Apply time, which is not the applied source for a reset.
     anchor: String,
     /// What is being applied, for display.
-    target: String,
+    pub(crate) target: String,
     /// The applied selection: `Some` drives status/progress/retry, `None` is
     /// the deployment default (a reset, already hosted — nothing to poll).
     selection: Option<api::SourceSelection>,
     /// The apply clears the session selection; no inline reset is offered.
     reset: bool,
-    state: ApplyState,
+    pub(crate) state: ApplyState,
 }
 
 /// The per-request parameter pickers for the currently selected catalog row,
@@ -180,8 +201,17 @@ static NEW_SOURCE: GlobalSignal<NewSourceDraft> = Signal::global(NewSourceDraft:
 static BUSY: GlobalSignal<bool> = Signal::global(|| false);
 /// Last server rejection (validation text, authorization, read-only dir).
 static ERROR: GlobalSignal<Option<String>> = Signal::global(|| None);
-/// Live state of the last source Apply, anchored to a catalog row.
-static APPLY: GlobalSignal<Option<ApplyStatus>> = Signal::global(|| None);
+
+/// Runtime variables of the selected httpjson catalog source, plus the
+/// in-progress edits keyed by declared variable name.
+static VARIABLES: GlobalSignal<VariablesState> = Signal::global(|| VariablesState::Absent);
+/// A variables PUT is in flight; the section's apply action stays disabled.
+static VARS_BUSY: GlobalSignal<bool> = Signal::global(|| false);
+/// Last variables PUT rejection, shown inline in the section.
+static VARS_ERROR: GlobalSignal<Option<String>> = Signal::global(|| None);
+/// Live state of the last source Apply, anchored to a catalog row. Read by
+/// the graph-area loading overlay while a build is in flight.
+pub(crate) static APPLY: GlobalSignal<Option<ApplyStatus>> = Signal::global(|| None);
 /// Bumped by every Apply; the tracker tasks of superseded applies exit
 /// instead of overwriting the current status.
 static APPLY_GEN: GlobalSignal<u64> = Signal::global(|| 0);
@@ -419,6 +449,14 @@ fn set_manifest_from_grammar(text: String) {
 fn select(sel: Selection) {
     *SERVER_PACKAGE.write() = ServerPackage::Idle;
     *ERROR.write() = None;
+    *VARS_ERROR.write() = None;
+    // Drop the previous selection's variables section; a superseded
+    // in-flight GET exits without resolving its store, so resolve it here
+    // to keep the GlobalLoadingBar clear.
+    if !matches!(&*VARIABLES.read(), VariablesState::Absent) {
+        *VARIABLES.write() = VariablesState::Absent;
+        loading_store("importer-variables", "loading variables…").succeed();
+    }
     match &sel {
         Selection::Local(id) => {
             let manifest = PACKAGES.peek().get(id).cloned().unwrap_or_default();
@@ -426,9 +464,23 @@ fn select(sel: Selection) {
             *SELECTION.write() = Some(sel);
             set_manifest(manifest);
         }
-        Selection::Catalog(_) => {
+        Selection::Catalog(id) => {
+            let id = id.clone();
             *SELECTION.write() = Some(sel);
             set_manifest(String::new());
+            // Only httpjson bindings carry declared package variables; for
+            // other kinds the section stays absent without a doomed request.
+            let httpjson = match &*CATALOG.read() {
+                CatalogState::Ready(c) => {
+                    c.sources.iter().any(|p| p.id == id && p.kind == "httpjson")
+                }
+                // Catalog not loaded (stale selection): let the server
+                // decide — a 400/404 hides the section.
+                _ => true,
+            };
+            if httpjson {
+                load_variables(id.clone());
+            }
         }
         Selection::NewCatalog => {
             *SELECTION.write() = Some(sel);
@@ -484,6 +536,114 @@ fn save_server_package(id: String) {
             }
         }
         *BUSY.write() = false;
+    });
+}
+
+/// True when a GET error string is an expected no-section posture rather
+/// than a failure: 400 names a non-httpjson binding, 404 an unknown source
+/// id (also an older server without the route).
+fn is_no_variables_error(message: &str) -> bool {
+    message.starts_with("HTTP 400") || message.starts_with("HTTP 404")
+}
+
+/// Fetch the selected catalog source's runtime variables into the section.
+/// Expected absences (400/404) hide the section silently; real failures
+/// surface through the loading store's gate.
+fn load_variables(id: String) {
+    let store = loading_store("importer-variables", "loading variables…");
+    *VARIABLES.write() = VariablesState::Loading;
+    *VARS_ERROR.write() = None;
+    store.begin();
+    spawn(async move {
+        let result = api::get_variables(&id).await;
+        // A superseded selection (user switched rows mid-flight) must not
+        // overwrite the new row's section.
+        if !matches!(&*SELECTION.read(), Some(Selection::Catalog(sel)) if sel == &id) {
+            return;
+        }
+        match result {
+            Ok(resp) => {
+                *VARIABLES.write() = if resp.declared.is_empty() {
+                    VariablesState::Absent
+                } else {
+                    VariablesState::Ready {
+                        declared: resp.declared,
+                        current: resp.current,
+                        edits: BTreeMap::new(),
+                    }
+                };
+                store.succeed();
+            }
+            Err(message) => {
+                if is_no_variables_error(&message) {
+                    *VARIABLES.write() = VariablesState::Absent;
+                    store.succeed();
+                } else {
+                    *VARIABLES.write() = VariablesState::Failed(message.clone());
+                    store.fail(message);
+                }
+            }
+        }
+    });
+}
+
+/// PUT the full variable set — every declared field's working value, where
+/// an empty field is omitted so the server applies the package default —
+/// then re-apply the source so its graph rebuilds with the new variables
+/// (the server invalidates its alternate; the apply tracker streams the
+/// rebuild through the usual loading overlay and Progress stages).
+fn apply_variables(ctx: Ctx, id: String) {
+    if *VARS_BUSY.peek() {
+        return;
+    }
+    let VariablesState::Ready {
+        declared,
+        current,
+        edits,
+    } = VARIABLES.peek().clone()
+    else {
+        return;
+    };
+    let vars: BTreeMap<String, String> = declared
+        .iter()
+        .map(|d| {
+            let effective = current.get(&d.name).cloned().unwrap_or_default();
+            let value = edits.get(&d.name).cloned().unwrap_or(effective);
+            (d.name.clone(), value)
+        })
+        .filter(|(_, value)| !value.is_empty())
+        .collect();
+    *VARS_BUSY.write() = true;
+    *VARS_ERROR.write() = None;
+    spawn(async move {
+        let result = api::put_variables(&id, &vars).await;
+        // A superseded selection keeps its own section; the PUT still
+        // landed server-side, but this session must not switch views.
+        if matches!(&*SELECTION.read(), Some(Selection::Catalog(sel)) if sel == &id) {
+            match result {
+                Ok(resp) => {
+                    *VARIABLES.write() = if resp.declared.is_empty() {
+                        VariablesState::Absent
+                    } else {
+                        VariablesState::Ready {
+                            declared: resp.declared,
+                            current: resp.current,
+                            edits: BTreeMap::new(),
+                        }
+                    };
+                    apply_source(
+                        ctx,
+                        id.clone(),
+                        Some(api::SourceSelection {
+                            id: id.clone(),
+                            params: BTreeMap::new(),
+                        }),
+                    );
+                }
+                Err(message) => *VARS_ERROR.write() = Some(message),
+            }
+        }
+        *VARS_BUSY.write() = false;
     });
 }
 
@@ -616,12 +776,38 @@ fn copy_to_clipboard(text: &str) {
 
 // --- source apply tracking -------------------------------------------------------
 
+/// Load one catalog source's graph into this browser session, anchoring the
+/// status on its own row. The entry point for callers outside the panel (the
+/// shipped example sessions); the load, progress, and retry behaviour is
+/// exactly the panel's own.
+pub(crate) fn apply_catalog_source(ctx: Ctx, id: String) {
+    apply_source(
+        ctx,
+        id.clone(),
+        Some(api::SourceSelection {
+            id,
+            params: BTreeMap::new(),
+        }),
+    );
+}
+
+/// Clear this browser session's source selection and return to the
+/// deployment default.
+pub(crate) fn return_to_default_source(ctx: Ctx) {
+    let anchor = VIEWING
+        .peek()
+        .as_ref()
+        .map(|selection| selection.id.clone())
+        .unwrap_or_default();
+    apply_source(ctx, anchor, None);
+}
+
 /// Switch the session's graph view and track the resulting load. `target` is
 /// the catalog id to view, or `None` to clear the session selection and return
 /// to the deployment default. `anchor` is the catalog row the status renders
 /// under (the currently selected summary), which differs from `target` when a
 /// reset is triggered from a failed alternate's summary.
-fn apply_source(ctx: Ctx, anchor: String, target: Option<api::SourceSelection>) {
+fn apply_source(mut ctx: Ctx, anchor: String, target: Option<api::SourceSelection>) {
     match &target {
         Some(selection) => {
             api::set_source_selection(selection);
@@ -632,6 +818,10 @@ fn apply_source(ctx: Ctx, anchor: String, target: Option<api::SourceSelection>) 
             VIEWING.write().take();
         }
     }
+    // The selected node belongs to the previous source's id namespace; keep
+    // it and the Inspector fires node-meta fetches for ids the new source
+    // never heard of.
+    ctx.selected.set(None);
     let generation = APPLY_GEN.peek().wrapping_add(1);
     *APPLY_GEN.write() = generation;
     *APPLY_FEED.write() = build_progress::BuildFeed::default();
@@ -775,6 +965,75 @@ fn set_apply_state(generation: u64, state: ApplyState) {
     }
 }
 
+/// Build a client-side [`GraphData`] from a pest parse preview — the same
+/// shape as the Generate panel's `graph_data_from_generated`, with positions
+/// from the Layout panel's seed strategy and neutral metric defaults.
+fn graph_data_from_preview(p: &crate::pest_worker::ParsePreview) -> crate::GraphData {
+    use std::collections::HashMap;
+
+    let n = p.node_ids.len();
+    let ids: Vec<String> = p.node_ids.clone();
+    let id_to_idx: HashMap<String, u32> = ids
+        .iter()
+        .enumerate()
+        .map(|(idx, id)| (id.clone(), idx as u32))
+        .collect();
+    let mut edges: Vec<u32> = Vec::with_capacity(p.edge_pairs.len() * 2);
+    for (source, target) in &p.edge_pairs {
+        let (Some(&s), Some(&t)) = (id_to_idx.get(source), id_to_idx.get(target)) else {
+            continue;
+        };
+        edges.push(s);
+        edges.push(t);
+    }
+    let n_edges = (edges.len() / 2) as u32;
+    let positions = super::layout::seed_positions_for_generated(n);
+    let metrics: HashMap<String, Vec<f32>> = HashMap::new();
+    let colors = crate::render::data::colors_from_metric("community", &metrics, n);
+    let sizes = crate::render::data::sizes_from_metric("pagerank", &metrics, n, 0.5);
+    // Weakly-connected-component count over the mounted (capped) subgraph —
+    // cheap BFS, mirrors the generated-graph path.
+    let mut seen = vec![false; n];
+    let mut num_wcc = 0u32;
+    for start in 0..n {
+        if seen[start] {
+            continue;
+        }
+        num_wcc += 1;
+        seen[start] = true;
+        let mut stack = vec![start];
+        while let Some(node) = stack.pop() {
+            for pair in edges.chunks(2) {
+                if pair.len() == 2 {
+                    let (a, b) = (pair[0] as usize, pair[1] as usize);
+                    if a == node && !seen[b] {
+                        seen[b] = true;
+                        stack.push(b);
+                    } else if b == node && !seen[a] {
+                        seen[a] = true;
+                        stack.push(a);
+                    }
+                }
+            }
+        }
+    }
+    crate::GraphData {
+        graph_revision: None,
+        n_nodes: n as u32,
+        n_edges,
+        num_communities: 0,
+        num_wcc,
+        ids,
+        id_to_idx,
+        scene: crate::render::Scene {
+            positions,
+            edges,
+            colors,
+            sizes,
+        },
+    }
+}
+
 /// Inline escape from a failed alternate: clearing the session's own selection
 /// is session-local and allowed whatever the deployment's runtime-switch
 /// posture, so this is offered even where Apply is not.
@@ -867,23 +1126,138 @@ fn apply_status_view(ctx: Ctx, status: &ApplyStatus) -> Element {
                 }
             }
         },
-        ApplyState::Error(message) => rsx! {
-            div {
-                class: "imp-apply error",
-                role: "alert",
-                "data-field": "apply-status",
-                "data-outcome": "error",
-                span { class: "imp-apply-line", "{target} failed to load — {message}" }
-                div { class: "imp-actions",
-                    if let Some(selection) = &selection {
-                        {retry_build(ctx, anchor.clone(), selection.clone())}
-                    }
-                    if offer_reset {
-                        {return_to_default(ctx, anchor.clone())}
+        ApplyState::Error(message) => {
+            // display_error: a building 503 here would otherwise quote the
+            // server's machine instruction ("poll /progress … then retry").
+            let message = api::display_error(message);
+            rsx! {
+                div {
+                    class: "imp-apply error",
+                    role: "alert",
+                    "data-field": "apply-status",
+                    "data-outcome": "error",
+                    span { class: "imp-apply-line", "{target} failed to load — {message}" }
+                    div { class: "imp-actions",
+                        if let Some(selection) = &selection {
+                            {retry_build(ctx, anchor.clone(), selection.clone())}
+                        }
+                        if offer_reset {
+                            {return_to_default(ctx, anchor.clone())}
+                        }
                     }
                 }
             }
-        },
+        }
+    }
+}
+
+/// The `[data-field=variables]` section between the catalog summary and the
+/// package editor: an httpjson source's declared runtime variables with the
+/// instance's effective values, one input per field. "Apply & reload" PUTs
+/// the full set, then re-applies the source so its graph rebuilds with the
+/// new values. Non-httpjson bindings and expected absences (400/404, no
+/// declared variables) render nothing — the section is absent, not an error.
+fn variables_section(ctx: Ctx, profile: &api::ImporterProfile) -> Element {
+    // Only httpjson bindings have a package with declared variables.
+    if profile.kind != "httpjson" {
+        return rsx! {};
+    }
+    let state = VARIABLES.read().clone();
+    if matches!(state, VariablesState::Absent) {
+        return rsx! {};
+    }
+    let store = loading_store("importer-variables", "loading variables…");
+    let busy = *VARS_BUSY.read();
+    let error = VARS_ERROR.read().clone();
+    let apply_id = profile.id.clone();
+    rsx! {
+        section { class: "imp-vars-section", "data-field": "variables",
+            div { class: "imp-summary-title", "Variables" }
+            span { class: "imp-note",
+                "instance values for this package's placeholders — an empty field uses the package default; applying reloads the source graph"
+            }
+            LoadingGate { store,
+                {match state {
+                    VariablesState::Ready {
+                        declared,
+                        current,
+                        edits,
+                    } => {
+                        // Dirty: any declared field's working value differs
+                        // from its effective current value.
+                        let dirty = declared.iter().any(|d| {
+                            let effective =
+                                current.get(&d.name).cloned().unwrap_or_default();
+                            edits.get(&d.name).map_or(false, |v| *v != effective)
+                        });
+                        rsx! {
+                            div { class: "imp-vars-body",
+                                for d in &declared {
+                                    {
+                                        let name = d.name.clone();
+                                        let description = d.description.clone();
+                                        let effective =
+                                            current.get(&d.name).cloned().unwrap_or_default();
+                                        let value = edits
+                                            .get(&d.name)
+                                            .cloned()
+                                            .unwrap_or(effective.clone());
+                                        let placeholder =
+                                            d.default.clone().unwrap_or_default();
+                                        let field = name.clone();
+                                        rsx! {
+                                            label { key: "{name}", class: "imp-field",
+                                                span { title: "{description}", "{name}" }
+                                                input {
+                                                    r#type: "text",
+                                                    title: "{description}",
+                                                    placeholder: "{placeholder}",
+                                                    value: "{value}",
+                                                    oninput: move |e| {
+                                                        if let VariablesState::Ready {
+                                                            edits,
+                                                            ..
+                                                        } = &mut *VARIABLES.write()
+                                                        {
+                                                            edits.insert(
+                                                                field.clone(),
+                                                                e.value(),
+                                                            );
+                                                        }
+                                                    },
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                if let Some(message) = &error {
+                                    div { class: "imp-error", role: "alert",
+                                        "data-field": "variables-error",
+                                        "{api::display_error(message)}"
+                                    }
+                                }
+                                div { class: "imp-actions",
+                                    button {
+                                        class: "btn",
+                                        r#type: "button",
+                                        "data-action": "apply-variables",
+                                        disabled: !dirty || busy,
+                                        title: "write these variables and rebuild this source's graph",
+                                        onclick: move |_| {
+                                            apply_variables(ctx, apply_id.clone())
+                                        },
+                                        if busy { "Applying…" } else { "Apply & reload" }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    // Loading / Failed: the gate itself renders the load
+                    // bar or the error.
+                    _ => rsx! {},
+                }}
+            }
+        }
     }
 }
 
@@ -1018,6 +1392,7 @@ fn param_picker(params: &api::SourceParameters) -> Element {
     let custom = PARAM_CUSTOM.read().clone();
     rsx! {
         div { class: "imp-params", "data-field": "parameters",
+            div { class: "imp-summary-title", "Parameters" }
             for (name, param) in params.parameters.iter() {
                 {
                     let name = name.clone();
@@ -1242,41 +1617,90 @@ pub fn panel(ctx: Ctx) -> Element {
                                             ApplyState::Ok { .. } => ("ok", "ready"),
                                             ApplyState::Error(_) => ("error", "failed"),
                                         });
+                                    // Every runnable row carries its own Load
+                                    // action, so loading a source's graph is one
+                                    // click from the list — while clicking the
+                                    // row itself only selects it, keeping
+                                    // catalog browsing free of server-side
+                                    // imports. The default row's Load returns
+                                    // the session to the deployment default.
+                                    let load_target = if switch_allowed
+                                        && (profile.selected || profile.runnable)
+                                        && !is_viewing
+                                    {
+                                        if profile.selected {
+                                            Some(None)
+                                        } else {
+                                            Some(Some(api::SourceSelection {
+                                                id: id.clone(),
+                                                params: BTreeMap::new(),
+                                            }))
+                                        }
+                                    } else {
+                                        None
+                                    };
+                                    let loadable = load_target.is_some();
+                                    let load_id = id.clone();
                                     rsx! {
-                                        button {
-                                            key: "{id}",
-                                            class: if selected { "imp-row selected" } else { "imp-row" },
-                                            r#type: "button",
-                                            role: "option",
-                                            aria_selected: if selected { "true" } else { "false" },
-                                            "data-package-id": "{profile.id}",
-                                            "data-source": "server",
-                                            "data-kind": "{profile.kind}",
-                                            "data-native": if native { "true" } else { "false" },
-                                            "data-viewing": if is_viewing { "true" } else { "false" },
-                                            onclick: move |_| select(Selection::Catalog(click_id.clone())),
-                                            span { class: "imp-row-name", "{profile.display_name}" }
-                                            span { class: "imp-row-chips",
-                                                span { class: "imp-chip", "{profile.kind}" }
-                                                if native {
-                                                    span { class: "imp-chip native",
-                                                        title: "native-only connector: runs inside graph-api, not in the browser",
-                                                        "native"
+                                        div { key: "{id}", class: "imp-row-wrap", role: "presentation",
+                                            button {
+                                                class: if selected { "imp-row selected" } else { "imp-row" },
+                                                r#type: "button",
+                                                role: "option",
+                                                aria_selected: if selected { "true" } else { "false" },
+                                                "data-package-id": "{profile.id}",
+                                                "data-source": "server",
+                                                "data-kind": "{profile.kind}",
+                                                "data-native": if native { "true" } else { "false" },
+                                                "data-viewing": if is_viewing { "true" } else { "false" },
+                                                "data-loadable": if loadable { "true" } else { "false" },
+                                                onclick: move |_| select(Selection::Catalog(click_id.clone())),
+                                                span { class: "imp-row-name", "{profile.display_name}" }
+                                                span { class: "imp-row-chips",
+                                                    span { class: "imp-chip", "{profile.kind}" }
+                                                    if native {
+                                                        span { class: "imp-chip native",
+                                                            title: "native-only connector: runs inside graph-api, not in the browser",
+                                                            "native"
+                                                        }
+                                                    }
+                                                    if is_viewing {
+                                                        span { class: "imp-chip viewing", "viewing" }
+                                                    }
+                                                    if let Some(params) = &viewing_params {
+                                                        span { class: "imp-chip params", "{params}" }
+                                                    }
+                                                    if let Some((outcome, label)) = apply_chip {
+                                                        span {
+                                                            class: "imp-chip apply",
+                                                            "data-field": "apply-chip",
+                                                            "data-outcome": "{outcome}",
+                                                            "{label}"
+                                                        }
                                                     }
                                                 }
-                                                if is_viewing {
-                                                    span { class: "imp-chip viewing", "viewing" }
-                                                }
-                                                if let Some(params) = &viewing_params {
-                                                    span { class: "imp-chip params", "{params}" }
-                                                }
-                                                if let Some((outcome, label)) = apply_chip {
-                                                    span {
-                                                        class: "imp-chip apply",
-                                                        "data-field": "apply-chip",
-                                                        "data-outcome": "{outcome}",
-                                                        "{label}"
-                                                    }
+                                            }
+                                            if let Some(target) = load_target {
+                                                button {
+                                                    class: "btn imp-row-load",
+                                                    r#type: "button",
+                                                    "data-action": "load-row",
+                                                    "data-package-id": "{profile.id}",
+                                                    aria_label: if target.is_none() {
+                                                        "Return to the deployment default"
+                                                    } else {
+                                                        "Load this source's graph"
+                                                    },
+                                                    title: if target.is_none() {
+                                                        "return this session to the deployment default"
+                                                    } else {
+                                                        "load this source's graph (imports it if the server has not built it yet)"
+                                                    },
+                                                    onclick: move |_| {
+                                                        select(Selection::Catalog(load_id.clone()));
+                                                        apply_source(ctx, load_id.clone(), target.clone());
+                                                    },
+                                                    if target.is_none() { "⟲" } else { "▶" }
                                                 }
                                             }
                                         }
@@ -1523,6 +1947,7 @@ pub fn panel(ctx: Ctx) -> Element {
                                             {apply_status_view(ctx, status)}
                                         }
                                     }
+                                    {variables_section(ctx, &profile)}
                                     match &server_package {
                                         ServerPackage::Idle => rsx! {},
                                         ServerPackage::Loading => rsx! {
@@ -1818,7 +2243,9 @@ pub fn panel(ctx: Ctx) -> Element {
                             }
                             match &preview {
                                 PreviewState::Idle => rsx! {},
-                                PreviewState::Done(p) => rsx! {
+                                PreviewState::Done(p) => {
+                                    let preview_graph = p.clone();
+                                    rsx! {
                                     div { class: "imp-preview-result", "data-outcome": "ok",
                                         span { class: "imp-counts",
                                             strong { "data-field": "preview-nodes", "{p.nodes}" }
@@ -1842,8 +2269,29 @@ pub fn panel(ctx: Ctx) -> Element {
                                                 }
                                             }
                                         }
+                                        if !p.node_ids.is_empty() {
+                                            button {
+                                                class: "btn imp-mini",
+                                                r#type: "button",
+                                                "data-action": "view-preview-graph",
+                                                title: "mount the parsed sample as a client-side graph",
+                                                onclick: move |_| {
+                                                    let gd = graph_data_from_preview(&preview_graph);
+                                                    *STATUS.write() = Some(format!(
+                                                        "preview graph: {} nodes, {} edges — client-only (server tools disabled)",
+                                                        gd.n_nodes, gd.n_edges
+                                                    ));
+                                                    crate::replace_with_client_graph(
+                                                        ctx,
+                                                        gd,
+                                                        "pest preview",
+                                                    );
+                                                },
+                                                "View as graph"
+                                            }
+                                        }
                                     }
-                                },
+                                }},
                                 PreviewState::Failed { message, timeout } => rsx! {
                                     div {
                                         class: if *timeout { "imp-preview-error timeout" } else { "imp-preview-error" },
@@ -1987,8 +2435,15 @@ mod tests {
     }
 
     #[test]
-    fn sanitize_id_matches_source_id_charset() {
-        assert_eq!(sanitize_id("Lavender Ingest/OKF"), "lavender-ingest-okf");
-        assert_eq!(sanitize_id("---"), "package");
+    fn building_errors_are_detected_from_the_error_string() {
+        assert!(api::is_building_error(
+            "/graph/init -> HTTP 503: building importer source \"hindsight-memory-bank\": the import is running"
+        ));
+        // retryable-by-polling, must surface as an error.
+        assert!(!api::is_building_error(
+            "/graph/init -> HTTP 503: import alternate source \"x\": connector unreachable"
+        ));
+        assert!(!api::is_building_error("/graph/init -> HTTP 404"));
     }
+
 }

@@ -4,7 +4,7 @@
 
 use dioxus::prelude::*;
 use graph_vcs::Commit;
-use panel_kit::Spinner;
+use panel_kit::loading::{loading_store, LoadingGate};
 
 use super::worlds::active_world_id;
 use crate::{client_log, Ctx};
@@ -16,11 +16,12 @@ pub fn panel(ctx: Ctx) -> Element {
     let mut error = use_signal(|| None::<String>);
     let mut new_branch = use_signal(String::new);
     let mut tick = use_signal(|| 0u64);
-    // Gate the empty state behind the first completed fetch (Spinner while
-    // loading, matching the other panels).
-    let mut loaded = use_signal(|| false);
+    // Shared loading store gates the commit list (selector + input render
+    // immediately); refreshes after Ready update silently, no gate flash.
+    let store = loading_store("history", "loading history…");
 
     use_future(move || async move {
+        store.begin();
         let mut seen = (u64::MAX, String::new(), Option::<String>::None);
         loop {
             let world = ctx.active_world.read().clone();
@@ -31,7 +32,7 @@ pub fn panel(ctx: Ctx) -> Element {
                 let Some(wid) = active_world_id(ctx) else {
                     commits.set(Vec::new());
                     branches.set(Vec::new());
-                    loaded.set(true);
+                    store.succeed();
                     gloo_timers::future::TimeoutFuture::new(1500).await;
                     continue;
                 };
@@ -57,7 +58,7 @@ pub fn panel(ctx: Ctx) -> Element {
                     }
                     Err(e) => error.set(Some(client_log::tagged("history", e))),
                 }
-                loaded.set(true);
+                store.succeed();
             }
             gloo_timers::future::TimeoutFuture::new(1500).await;
         }
@@ -92,15 +93,12 @@ pub fn panel(ctx: Ctx) -> Element {
                         }
                     }
                 }
+                LoadingGate { store,
                 if let Some(e) = &err {
                     div { class: "note", "error: {e}" }
                 }
                 if log.is_empty() && err.is_none() {
-                    if *loaded.read() {
-                        div { class: "empty", "no commits on {current_branch}" }
-                    } else {
-                        Spinner { label: "loading history…" }
-                    }
+                    div { class: "empty", "no commits on {current_branch}" }
                 }
                 for c in log {
                     {
@@ -152,6 +150,7 @@ pub fn panel(ctx: Ctx) -> Element {
                             }
                         }
                     }
+                }
                 }
                 input {
                     aria_label: "New branch name",
