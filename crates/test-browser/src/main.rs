@@ -307,6 +307,31 @@ struct ImporterSwitchCheck {
     /// (`[data-lay-state="compute-source-alternate"]`) instead of polling
     /// graph-api into a permanent 400 loop.
     compute_quiet: bool,
+    /// Selecting the parameterised tvix source row reveals its parameter
+    /// picker in the summary: the `nodes` input exists and is prefilled with
+    /// its catalog default (`64`).
+    #[serde(default)]
+    param_picker_visible: bool,
+    /// Editing `nodes` to `48` and applying stores the canonical selection
+    /// string `param-generate?nodes=48&seed=7` in sessionStorage.
+    #[serde(default)]
+    param_apply_stores_selection: bool,
+    /// Applying the parameterised selection swaps the graph to the generated
+    /// tvix graph: exactly 48 sidebar nodes, every id prefixed `tvix:`.
+    #[serde(default)]
+    param_graph_swaps: bool,
+    /// The applied param row surfaces `data-viewing="true"` plus a
+    /// `.imp-chip.params` chip naming the bound parameters (`nodes=48`).
+    #[serde(default)]
+    param_row_viewing: bool,
+    /// Wire contract: the authorized `/importers/sources/<encoded>/status`
+    /// route reports the built parameterised alternate as `serving` (200).
+    #[serde(default)]
+    param_wire_status: bool,
+    /// Wire contract: a selection carrying an undeclared parameter is a 400
+    /// client error (not a build, not a 403/404).
+    #[serde(default)]
+    param_wire_bad_param: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     reason: Option<String>,
 }
@@ -328,6 +353,12 @@ impl ImporterSwitchCheck {
             stale_selection_surfaces: false,
             viewing_non_default_reset: false,
             compute_quiet: false,
+            param_picker_visible: false,
+            param_apply_stores_selection: false,
+            param_graph_swaps: false,
+            param_row_viewing: false,
+            param_wire_status: false,
+            param_wire_bad_param: false,
             reason: Some("graph-api binary not on PATH; scenario skipped".to_string()),
         }
     }
@@ -2662,6 +2693,33 @@ const SWITCH_DEFAULT_ID: &str = "default-obsidian";
 const SWITCH_ALT_ID: &str = "alt-obsidian";
 const SWITCH_DEFAULT_NODE: &str = "Switch Default Fixture";
 const SWITCH_ALT_NODE: &str = "Switch Alt Fixture";
+/// Parameterised third source: an `engine = "tvix"` generator package bound
+/// through the catalog. Selecting it exposes per-request parameter pickers
+/// (`nodes`, `seed`); applying a pick generates a fresh graph server-side.
+const SWITCH_PARAM_ID: &str = "param-generate";
+
+/// The tvix generator package the parameterised source binds. Resolved under
+/// the fixture's packages directory (see [`fixture_packages_dir`]).
+const SWITCH_PARAM_PACKAGE: &str = "generate-random.toml";
+
+/// Locate the chart packages directory so the fixture graph-api can read the
+/// tvix generator package the parameterised source binds. The
+/// `test-browser-rust` flake wrapper exports `JUMP_CANNON_PACKAGES_DIR`
+/// pointing at the nix-store copy of `charts/jump-cannon/packages`; a local
+/// `cargo`/`just` run from a repo checkout falls back to the directory two
+/// levels above this crate's manifest. Returns `None` when neither exists, in
+/// which case the parameterised source is simply omitted from the fixture
+/// catalog and its checks stay false.
+fn fixture_packages_dir() -> Option<PathBuf> {
+    if let Some(dir) = std::env::var_os("JUMP_CANNON_PACKAGES_DIR") {
+        let path = PathBuf::from(dir);
+        if path.is_dir() {
+            return Some(path);
+        }
+    }
+    let candidate = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../charts/jump-cannon/packages");
+    candidate.is_dir().then_some(candidate)
+}
 
 /// The second fixture server: a two-source Obsidian catalog (default vault +
 /// tiny alternate vault) with `JUMP_CANNON_IMPORTER_SWITCH_GROUP` set, serving
@@ -2913,7 +2971,12 @@ async fn setup_switch_fixture(origin: &str) -> Result<Option<SwitchFixture>> {
     }
 
     let alt_path = alt_vault.to_string_lossy().to_string();
-    let catalog = serde_json::json!({
+    // The parameterised tvix source binds a generator package that must be
+    // readable on disk; resolve the chart packages directory once and thread
+    // it into both the catalog (whether to declare the source) and the
+    // spawned server (where to read the package from).
+    let packages_dir = fixture_packages_dir();
+    let mut catalog_value = serde_json::json!({
         "selected": SWITCH_DEFAULT_ID,
         "sources": {
             SWITCH_DEFAULT_ID: {
@@ -2934,11 +2997,28 @@ async fn setup_switch_fixture(origin: &str) -> Result<Option<SwitchFixture>> {
                 }
             }
         }
-    })
-    .to_string();
+    });
+    // Only declare the parameterised source when its generator package is
+    // resolvable; a checkout without the chart packages directory degrades to
+    // the two-source catalog (and the param checks stay false) rather than
+    // shipping a catalog graph-api would reject at boot.
+    if packages_dir.is_some() {
+        catalog_value["sources"][SWITCH_PARAM_ID] = serde_json::json!({
+            "displayName": "Parameterised random graph",
+            "description": "Runtime-parameterised tvix generator for the browser param-picker contract.",
+            "kind": "tvix",
+            "tvix": { "package": SWITCH_PARAM_PACKAGE },
+            "parameters": {
+                "nodes": { "label": "Nodes", "default": "64" },
+                "seed": { "label": "Seed", "default": "7" }
+            }
+        });
+    }
+    let catalog = catalog_value.to_string();
 
     let port = pick_free_port().await?;
-    let server = tokio::process::Command::new(bin)
+    let mut command = tokio::process::Command::new(bin);
+    command
         .arg("--vault-root")
         .arg(&default_vault)
         .arg("--port")
@@ -2947,7 +3027,15 @@ async fn setup_switch_fixture(origin: &str) -> Result<Option<SwitchFixture>> {
         .arg("--assets-dir")
         .arg(&assets)
         .env("JUMP_CANNON_IMPORTER_CATALOG_JSON", catalog)
-        .env("JUMP_CANNON_IMPORTER_SWITCH_GROUP", SWITCH_GROUP)
+        .env("JUMP_CANNON_IMPORTER_SWITCH_GROUP", SWITCH_GROUP);
+    // graph-api resolves catalog `tvix.package` filenames under this directory
+    // (clap env `JUMP_CANNON_IMPORTER_PACKAGES_DIR`); without it the
+    // parameterised source is unrunnable and its build fails with a clear
+    // deployment error.
+    if let Some(dir) = &packages_dir {
+        command.env("JUMP_CANNON_IMPORTER_PACKAGES_DIR", dir);
+    }
+    let server = command
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -3232,6 +3320,88 @@ const APPLY_DEFAULT_JS: &str = r#"(async () => {
     };
 })()"#;
 
+/// Select the parameterised tvix source row, read its prefilled `nodes` pick,
+/// drive it to 48, apply, and observe the generated graph swap plus the
+/// applied row's viewing flag and params chip. Returns every observation the
+/// caller turns into individual check fields (the picker, the stored canonical
+/// selection, the 48-node tvix graph, and the row chip).
+const PARAM_APPLY_JS: &str = r#"(async () => {
+    const waitFor = async (predicate, timeoutMs = 45000) => {
+      const deadline = performance.now() + timeoutMs;
+      while (performance.now() < deadline) {
+        const value = predicate();
+        if (value) return value;
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
+      return null;
+    };
+    const root = await waitFor(() => {
+      const existing = document.querySelector(
+        'section.panel-importers .importers-panel[data-panel="importers"]'
+      );
+      if (existing) return existing;
+      const chip = [...document.querySelectorAll('.dock-chip')]
+        .find((candidate) => (candidate.textContent || '').trim() === 'Importers');
+      chip?.click();
+      return null;
+    });
+    if (!root) return { error: 'importers panel missing' };
+    const row = await waitFor(() => document.querySelector(
+      '.importers-panel button.imp-row[data-package-id="__PARAM_ID__"]'
+    ));
+    if (!row) return { error: 'param row missing' };
+    row.click();
+    const nodesInput = await waitFor(() => document.querySelector(
+      '.imp-summary .imp-param[data-param="nodes"] input.imp-param-input'
+    ));
+    if (!nodesInput) return { error: 'nodes param input missing' };
+    const nodesPrefill = nodesInput.value;
+    // Dioxus updates its state from bubbling input events; setting `.value`
+    // alone never fires the handler, so drive it through the native setter and
+    // dispatch an input event the delegated listener observes.
+    const setter = Object.getOwnPropertyDescriptor(
+      window.HTMLInputElement.prototype, 'value'
+    ).set;
+    setter.call(nodesInput, '48');
+    nodesInput.dispatchEvent(new Event('input', { bubbles: true }));
+    const apply = await waitFor(() => {
+      const button = document.querySelector('.imp-summary [data-action="apply"]');
+      return button && !button.disabled ? button : null;
+    });
+    if (!apply) {
+      return { error: 'apply button missing or disabled', pickerVisible: true, nodesPrefill };
+    }
+    apply.click();
+    await waitFor(() =>
+      sessionStorage.getItem('jc_source_id') === '__PARAM_ID__?nodes=48&seed=7' ? true : null
+    );
+    // Generated tvix graph: exactly 48 sidebar nodes, every id `tvix:`-prefixed.
+    await waitFor(() => {
+      const ids = [...document.querySelectorAll('[data-testid="node-sidebar"] [data-node-id]')]
+        .map((r) => r.getAttribute('data-node-id'));
+      return ids.length === 48 && ids.every((id) => id.startsWith('tvix:')) ? true : null;
+    });
+    const chip = await waitFor(() => {
+      const paramRow = document.querySelector(
+        '.importers-panel button.imp-row[data-package-id="__PARAM_ID__"][data-viewing="true"]'
+      );
+      if (!paramRow) return null;
+      const badge = paramRow.querySelector('.imp-chip.params');
+      return badge ? { text: (badge.textContent || '').trim() } : null;
+    });
+    const ids = [...document.querySelectorAll('[data-testid="node-sidebar"] [data-node-id]')]
+      .map((r) => r.getAttribute('data-node-id'));
+    return {
+      pickerVisible: true,
+      nodesPrefill,
+      stored: sessionStorage.getItem('jc_source_id'),
+      nodeCount: ids.length,
+      allTvix: ids.length > 0 && ids.every((id) => id.startsWith('tvix:')),
+      viewing: Boolean(chip),
+      chip: chip ? chip.text : null,
+    };
+})()"#;
+
 /// Navigate a fresh page to `url`, optionally injecting the group header the
 /// authenticating proxy would set. Navigation is scheduled (not awaited) for
 /// the same reason as the main page: software WebGPU can hold the page-load
@@ -3288,6 +3458,17 @@ fn node_id_matches(id: &str, name: &str) -> bool {
     id == name || id.ends_with(&format!(":{name}"))
 }
 
+/// Append a concrete failure detail to the switch check's reason chain,
+/// preserving any earlier detail. Each failed assertion contributes its own
+/// reason so a red report names exactly what broke.
+fn append_switch_reason(check: &mut ImporterSwitchCheck, detail: impl Into<String>) {
+    let detail = detail.into();
+    check.reason = Some(match check.reason.take() {
+        Some(reason) => format!("{reason}; {detail}"),
+        None => detail,
+    });
+}
+
 /// Drive the runtime-switch contract against the second fixture server.
 async fn run_switch_scenario(
     browser: &Browser,
@@ -3309,6 +3490,12 @@ async fn run_switch_scenario(
         stale_selection_surfaces: false,
         viewing_non_default_reset: false,
         compute_quiet: false,
+        param_picker_visible: false,
+        param_apply_stores_selection: false,
+        param_graph_swaps: false,
+        param_row_viewing: false,
+        param_wire_status: false,
+        param_wire_bad_param: false,
         reason: None,
     };
 
@@ -3331,7 +3518,13 @@ async fn run_switch_scenario(
         && check.denied_apply_absent
         && check.stale_selection_surfaces
         && check.viewing_non_default_reset
-        && check.compute_quiet;
+        && check.compute_quiet
+        && check.param_picker_visible
+        && check.param_apply_stores_selection
+        && check.param_graph_swaps
+        && check.param_row_viewing
+        && check.param_wire_status
+        && check.param_wire_bad_param;
     if !check.ok && check.reason.is_none() {
         check.reason = Some("one or more importer-switch assertions failed".to_string());
     }
@@ -3352,12 +3545,21 @@ async fn run_switch_scenario_inner(
     // ---- wire contract (no browser): the group gate and id validation ----
     let source = ("x-jump-cannon-source", SWITCH_ALT_ID);
     check.wire_forbidden = raw_get_status(&format!("{base}/graph/ids"), &[source]).await? == 403;
-    check.wire_authorized = raw_get_status(
-        &format!("{base}/graph/ids"),
-        &[source, ("x-netbird-groups", SWITCH_GROUP)],
-    )
-    .await?
-        == 200;
+    // An authorized selection of an unbuilt alternate starts its build and
+    // answers 202 immediately; polling reaches 200 once it serves. Accept
+    // either on the first hit, then require 200 within the poll window.
+    let authorized_headers = [source, ("x-netbird-groups", SWITCH_GROUP)];
+    let first = raw_get_status(&format!("{base}/graph/ids"), &authorized_headers).await?;
+    check.wire_authorized = matches!(first, 200 | 202) && {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let mut served = first == 200;
+        while !served && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            served =
+                raw_get_status(&format!("{base}/graph/ids"), &authorized_headers).await? == 200;
+        }
+        served
+    };
     check.wire_unknown = raw_get_status(
         &format!("{base}/graph/ids"),
         &[
@@ -3563,6 +3765,117 @@ async fn run_switch_scenario_inner(
         switched_back.get("clicked").and_then(|v| v.as_bool()) == Some(true)
             && switched_back.get("cleared").and_then(|v| v.as_bool()) == Some(true)
             && switched_back.get("restored").and_then(|v| v.as_bool()) == Some(true);
+
+    // ---- parameterised tvix source: picker, apply, generated graph, chips,
+    // and the parameterised wire contract. The authorized page is back on the
+    // deployment default here; run this before the page closes so the
+    // generated-graph and chip assertions observe the live surface, then
+    // restore the default so the page ends exactly as the switch-back left it.
+    let param: serde_json::Value = evaluate_retry(
+        &page,
+        &js_with(&[("__PARAM_ID__", SWITCH_PARAM_ID)], PARAM_APPLY_JS),
+        5,
+    )
+    .await?;
+    if let Some(error) = param.get("error").and_then(|v| v.as_str()) {
+        append_switch_reason(check, format!("param picker/apply: {error}"));
+    }
+    let picker_visible = param.get("pickerVisible").and_then(|v| v.as_bool()) == Some(true);
+    let nodes_prefill = param
+        .get("nodesPrefill")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    check.param_picker_visible = picker_visible && nodes_prefill == "64";
+    if !check.param_picker_visible {
+        append_switch_reason(
+            check,
+            format!(
+                "param picker not shown with nodes prefilled 64 (visible={picker_visible}, prefill={nodes_prefill:?})"
+            ),
+        );
+    }
+
+    let expected_selection = format!("{SWITCH_PARAM_ID}?nodes=48&seed=7");
+    let stored = param.get("stored").and_then(|v| v.as_str());
+    check.param_apply_stores_selection = stored == Some(expected_selection.as_str());
+    if !check.param_apply_stores_selection {
+        append_switch_reason(
+            check,
+            format!("applying nodes=48 did not store {expected_selection:?} (stored={stored:?})"),
+        );
+    }
+
+    let node_count = param.get("nodeCount").and_then(|v| v.as_u64()).unwrap_or_default();
+    let all_tvix = param.get("allTvix").and_then(|v| v.as_bool()) == Some(true);
+    check.param_graph_swaps = node_count == 48 && all_tvix;
+    if !check.param_graph_swaps {
+        append_switch_reason(
+            check,
+            format!("generated graph did not settle at 48 tvix nodes (count={node_count}, all_tvix={all_tvix})"),
+        );
+    }
+
+    let viewing = param.get("viewing").and_then(|v| v.as_bool()) == Some(true);
+    let chip = param.get("chip").and_then(|v| v.as_str());
+    check.param_row_viewing = viewing && chip.is_some_and(|text| text.contains("nodes=48"));
+    if !check.param_row_viewing {
+        append_switch_reason(
+            check,
+            format!("param row not viewing with a nodes=48 params chip (viewing={viewing}, chip={chip:?})"),
+        );
+    }
+
+    // Wire contract for the parameterised selection (no browser). The browser
+    // applied and built `param-generate?nodes=48&seed=7`, so its status route
+    // reports it serving; the selection is URL-encoded into the {id} path
+    // segment exactly as the frontend encodes `SourceSelection::to_string()`.
+    let group = ("x-netbird-groups", SWITCH_GROUP);
+    let (status_code, status_body) = raw_get(
+        &format!("{base}/importers/sources/param-generate%3Fnodes%3D48%26seed%3D7/status"),
+        &[group],
+    )
+    .await?;
+    let status_text = String::from_utf8_lossy(&status_body);
+    check.param_wire_status = status_code == 200 && status_text.contains("serving");
+    if !check.param_wire_status {
+        append_switch_reason(
+            check,
+            format!(
+                "parameterised /status was not 200 serving (status={status_code}, body={status_text:?})"
+            ),
+        );
+    }
+
+    // An undeclared parameter is a 400 client error: authorization passes (the
+    // group is present) and the source is known, but `bogus` is not one of its
+    // declared parameters, so the selection is rejected before any build.
+    let bad_status = raw_get_status(
+        &format!("{base}/graph/ids"),
+        &[("x-jump-cannon-source", "param-generate?bogus=1"), group],
+    )
+    .await?;
+    check.param_wire_bad_param = bad_status == 400;
+    if !check.param_wire_bad_param {
+        append_switch_reason(
+            check,
+            format!("undeclared-parameter selection was not rejected 400 (status={bad_status})"),
+        );
+    }
+
+    // Restore the deployment default so the page ends clean — session cleared,
+    // default graph loaded — exactly as the switch-back path leaves it.
+    let _: serde_json::Value = evaluate_retry(
+        &page,
+        &js_with(
+            &[
+                ("__DEFAULT_ID__", SWITCH_DEFAULT_ID),
+                ("__DEFAULT_NODE__", SWITCH_DEFAULT_NODE),
+            ],
+            APPLY_DEFAULT_JS,
+        ),
+        5,
+    )
+    .await?;
 
     page_log_pump.abort();
     page_exception_pump.abort();

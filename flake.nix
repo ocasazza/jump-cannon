@@ -336,6 +336,13 @@
               sleep 1
             done
 
+            # The runtime-switch browser scenario's parameterised tvix source
+            # binds a generator package the second fixture graph-api reads from
+            # this directory (via JUMP_CANNON_IMPORTER_PACKAGES_DIR, which the
+            # fixture sets on the spawned server). Point it at the nix-store
+            # copy of the chart packages so the source is runnable.
+            export JUMP_CANNON_PACKAGES_DIR="${./charts/jump-cannon/packages}"
+
             echo "→ running test-browser…"
             test-browser \
               --base-url "http://127.0.0.1:$PORT" \

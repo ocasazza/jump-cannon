@@ -113,7 +113,8 @@ static HEALTH: GlobalSignal<Option<ComputeHealth>> = Signal::global(|| None);
 /// deployment default. `/compute/*` takes graph-api's `DefaultSource`
 /// extractor, which answers 400 for any other selection, so the pollers stand
 /// down and the cluster gallery renders the reason instead.
-static COMPUTE_SOURCE: GlobalSignal<Option<String>> = Signal::global(api::source_id);
+static COMPUTE_SOURCE: GlobalSignal<Option<api::SourceSelection>> =
+    Signal::global(api::source_selection);
 /// What the last apply pushed — the swap/short-circuit detector (mirrors
 /// `prev_layout_key` / `prev_active_layout_id` / `prev_seed_mode` on the
 /// egui App). `generation` ties it to one render-host build: a canvas
@@ -363,7 +364,7 @@ fn remote_solver_status(
 /// on the way out of the default source: they describe the default graph and
 /// would misreport the alternate.
 fn compute_reachable() -> bool {
-    let selected = api::source_id();
+    let selected = api::source_selection();
     if *COMPUTE_SOURCE.peek() != selected {
         *COMPUTE_SOURCE.write() = selected.clone();
         if selected.is_some() {
@@ -751,7 +752,7 @@ fn desired_remote_selection() -> Option<ComputeLayoutPutReq> {
 /// observes a stale generation it retries the same latest intent against the
 /// generation returned by the server.
 fn request_remote_selection() {
-    if let Some(id) = api::source_id() {
+    if let Some(id) = api::source_selection() {
         *SOLVE_MSG.write() =
             format!("remote layouts run on the deployment default source; {id} is a read-only view");
         return;
@@ -1167,12 +1168,16 @@ fn default_stream_url() -> String {
 fn versioned_stream_url(base: &str) -> Option<String> {
     let lease = expected_stream_lease()?;
     // The browser WebSocket API cannot set headers, so the per-viewer source
-    // selection rides as a query parameter. Strip any stale `source=` baked
-    // into a persisted settings URL first so re-switching never duplicates it.
+    // selection rides as a query parameter. The canonical selection string may
+    // itself contain `?`/`&`/`=`, so it is URL-encoded once here; the server
+    // decodes it once back into the canonical form. Strip any stale `source=`
+    // baked into a persisted settings URL first so re-switching never duplicates it.
     let mut url = strip_query_param(base, "source");
-    if let Some(source) = crate::api::source_id() {
+    if let Some(selection) = crate::api::source_selection() {
         let sep = if url.contains('?') { '&' } else { '?' };
-        url = format!("{url}{sep}source={source}");
+        let canonical = selection.to_string();
+        let encoded = urlencoding::encode(&canonical);
+        url = format!("{url}{sep}source={encoded}");
     }
     let sep = if url.contains('?') { '&' } else { '?' };
     Some(format!(
@@ -1879,7 +1884,7 @@ fn apply_seed_expr(expr: &str) {
 }
 
 fn apply_remote_initial_placement(positions: Vec<f32>, n_nodes: usize) {
-    if let Some(id) = api::source_id() {
+    if let Some(id) = api::source_selection() {
         *SEED_ERROR.write() = Some(format!(
             "remote placement runs on the deployment default source; {id} is a read-only view"
         ));
@@ -2342,7 +2347,7 @@ async fn fetch_session() {
 /// surfaces rejections, and an out-of-band re-poll reconciles with the
 /// server's view instead of waiting for the 2 s cadence.
 fn session_action(action: &'static str) {
-    if let Some(id) = api::source_id() {
+    if let Some(id) = api::source_selection() {
         *SESSION_ERR.write() = Some(format!(
             "the GPU session runs on the deployment default source; {id} is a read-only view"
         ));
@@ -2415,7 +2420,7 @@ pub(crate) fn backend_switch_header() -> Element {
     // peek: the App-scope header must not subscribe to the full settings
     // bag (every slider drag would re-render the whole workspace).
     let running = backend_of(&STATE.peek().active);
-    let status_text = match COMPUTE_SOURCE.read().as_deref() {
+    let status_text = match COMPUTE_SOURCE.read().as_ref().map(|s| s.id.as_str()) {
         Some(id) => format!("unavailable while viewing {id} — default source only"),
         None if session_on => {
             let t = SESSION_TITLE.read().clone();
@@ -2622,7 +2627,7 @@ pub fn panel(ctx: Ctx) -> Element {
                     server_backed,
                     selected_remote.as_deref(),
                     is_bridge,
-                    alternate_source.as_deref(),
+                    alternate_source.as_ref().map(|s| s.id.as_str()),
                 ),
             }
 
@@ -2630,7 +2635,7 @@ pub fn panel(ctx: Ctx) -> Element {
             // gallery, keep the worker health + browser-owned warnings
             // visible (the cluster view carries them on its status card).
             if is_bridge && view == Backend::Local {
-                if let Some(id) = alternate_source.as_deref() {
+                if let Some(id) = alternate_source.as_ref().map(|s| s.id.as_str()) {
                     {compute_source_notice(id)}
                 } else {
                     div { class: "{health_view.class}", "{health_view.text}" }

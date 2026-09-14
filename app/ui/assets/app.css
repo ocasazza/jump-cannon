@@ -274,6 +274,8 @@ textarea.md:focus { outline:none; border-color:var(--fg); }
   color:var(--dim); font-size:.56rem; letter-spacing:.04em; text-transform:uppercase; }
 .imp-chip.native, .imp-chip.viewing { color:var(--yellow); border-color:#655123; }
 .imp-chip.local { color:var(--accent); border-color:#28557e; }
+.imp-chip.params { color:var(--accent); border-color:#28557e; text-transform:none;
+  letter-spacing:0; font-family:var(--mono); }
 .imp-mini { font-size:.6rem; padding:.05rem .35rem; }
 .imp-note { color:var(--dim); font-size:.66rem; line-height:1.5; padding:.3rem .1rem; }
 .imp-center-hint { padding:1rem; text-align:center; }
@@ -295,6 +297,17 @@ textarea.md:focus { outline:none; border-color:var(--fg); }
 .imp-fact dt { color:var(--dim); font-size:.64rem; }
 .imp-fact dd { min-width:0; margin:0; color:var(--fg); font-family:var(--mono);
   font-size:.65rem; overflow-wrap:anywhere; }
+/* importers: per-request parameter picker inside the catalog summary */
+.imp-params { display:flex; flex-direction:column; gap:.45rem; }
+.imp-param { display:flex; flex-direction:column; gap:.15rem; }
+.imp-param-label { color:var(--dim); font-size:.66rem; text-transform:uppercase;
+  letter-spacing:.05em; }
+.imp-param-select, .imp-param-input { width:100%; box-sizing:border-box;
+  background:var(--bg); color:var(--fg); border:1px solid var(--line2);
+  border-radius:3px; padding:.25rem .4rem; font-family:var(--mono); font-size:12px; }
+.imp-param-select:focus, .imp-param-input:focus { outline:none; border-color:var(--fg); }
+.imp-param-input { margin-top:.15rem; }
+.imp-param-hint { color:var(--dim); font-size:.6rem; line-height:1.4; }
 .imp-preview { display:flex; flex-direction:column; gap:.35rem; min-height:0;
   border-top:1px solid var(--line); padding-top:.4rem; }
 .imp-sample { width:100%; min-height:3.2rem; box-sizing:border-box; resize:vertical;

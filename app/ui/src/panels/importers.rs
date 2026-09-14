@@ -14,7 +14,7 @@
 //! surface. Panel-local state lives in `GlobalSignal`s (same pattern as
 //! generate.rs) so the file is self-contained.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use dioxus::prelude::*;
 use gloo_storage::{LocalStorage, Storage};
@@ -139,12 +139,24 @@ struct ApplyStatus {
     anchor: String,
     /// What is being applied, for display.
     target: String,
-    /// The applied source id: `Some` drives status/progress/retry, `None` is
+    /// The applied selection: `Some` drives status/progress/retry, `None` is
     /// the deployment default (a reset, already hosted — nothing to poll).
-    source_id: Option<String>,
+    selection: Option<api::SourceSelection>,
     /// The apply clears the session selection; no inline reset is offered.
     reset: bool,
     state: ApplyState,
+}
+
+/// The per-request parameter pickers for the currently selected catalog row,
+/// fetched from `GET /importers/sources/{id}/parameters` once per (row,
+/// catalog generation). The row's declared `parameters` say a picker is needed;
+/// this holds the resolved values (with any live discovery already run).
+#[derive(Clone, PartialEq)]
+enum ParamsState {
+    Idle,
+    Loading,
+    Ready(api::SourceParameters),
+    Failed(String),
 }
 
 static PACKAGES: GlobalSignal<BTreeMap<String, String>> = Signal::global(load_packages);
@@ -159,8 +171,9 @@ static PREVIEW: GlobalSignal<PreviewState> = Signal::global(|| PreviewState::Idl
 static PREVIEW_RUNNING: GlobalSignal<bool> = Signal::global(|| false);
 static STATUS: GlobalSignal<Option<String>> = Signal::global(|| None);
 static CATALOG: GlobalSignal<CatalogState> = Signal::global(|| CatalogState::Idle);
-/// Session-scoped source override (mirrors sessionStorage via api::source_id).
-static VIEWING: GlobalSignal<Option<String>> = Signal::global(api::source_id);
+/// Session-scoped source override (mirrors sessionStorage via api::source_selection).
+static VIEWING: GlobalSignal<Option<api::SourceSelection>> =
+    Signal::global(api::source_selection);
 static SERVER_PACKAGE: GlobalSignal<ServerPackage> = Signal::global(|| ServerPackage::Idle);
 static NEW_SOURCE: GlobalSignal<NewSourceDraft> = Signal::global(NewSourceDraft::default);
 /// A `PUT`/`POST` is in flight; the editor's write actions stay disabled.
@@ -176,6 +189,22 @@ static APPLY_GEN: GlobalSignal<u64> = Signal::global(|| 0);
 /// `/importers/sources/{id}/progress` log and reset per Apply generation.
 static APPLY_FEED: GlobalSignal<build_progress::BuildFeed> =
     Signal::global(build_progress::BuildFeed::default);
+/// Bumped whenever the server catalog is (re)loaded; part of the parameter
+/// fetch key so a catalog refresh re-runs discovery for the open row.
+static CATALOG_GEN: GlobalSignal<u64> = Signal::global(|| 0);
+/// Resolved parameter pickers for the selected catalog row.
+static PARAMS: GlobalSignal<ParamsState> = Signal::global(|| ParamsState::Idle);
+/// The (row id, catalog generation) [`PARAMS`] were fetched for — the fetch
+/// key that keeps discovery from re-running on every render.
+static PARAMS_KEY: GlobalSignal<Option<(String, u64)>> = Signal::global(|| None);
+/// The viewer's in-progress parameter picks for the open row, canonical wire
+/// values keyed by parameter name. Seeded from the stored selection (same id)
+/// or each parameter's default, then edited through the picker controls.
+static PARAM_PICKS: GlobalSignal<BTreeMap<String, String>> = Signal::global(BTreeMap::new);
+/// Parameters whose picker is showing the free-text "Other…" input (the value
+/// is not one of the offered ids). Value-less parameters are never listed here
+/// — they always render a plain text input.
+static PARAM_CUSTOM: GlobalSignal<BTreeSet<String>> = Signal::global(BTreeSet::new);
 
 // --- manifest text surgery (pure functions; unit-tested below) --------------------
 
@@ -592,11 +621,11 @@ fn copy_to_clipboard(text: &str) {
 /// to the deployment default. `anchor` is the catalog row the status renders
 /// under (the currently selected summary), which differs from `target` when a
 /// reset is triggered from a failed alternate's summary.
-fn apply_source(ctx: Ctx, anchor: String, target: Option<String>) {
+fn apply_source(ctx: Ctx, anchor: String, target: Option<api::SourceSelection>) {
     match &target {
-        Some(id) => {
-            api::set_source_id(id);
-            *VIEWING.write() = Some(id.clone());
+        Some(selection) => {
+            api::set_source_selection(selection);
+            *VIEWING.write() = Some(selection.clone());
         }
         None => {
             api::clear_source_id();
@@ -607,17 +636,19 @@ fn apply_source(ctx: Ctx, anchor: String, target: Option<String>) {
     *APPLY_GEN.write() = generation;
     *APPLY_FEED.write() = build_progress::BuildFeed::default();
     let display = target
-        .clone()
+        .as_ref()
+        .map(|selection| selection.to_string())
         .unwrap_or_else(|| "the deployment default".to_string());
+    let build_source = target.as_ref().map(|selection| selection.to_string()).unwrap_or_default();
     *APPLY.write() = Some(ApplyStatus {
         anchor,
         target: display,
-        source_id: target.clone(),
+        selection: target.clone(),
         reset: target.is_none(),
         state: ApplyState::Building {
             status: api::BuildStatus {
                 status: "building".to_string(),
-                source: target.clone().unwrap_or_default(),
+                source: build_source,
                 elapsed_ms: None,
                 stage: None,
                 detail: None,
@@ -634,8 +665,8 @@ fn apply_source(ctx: Ctx, anchor: String, target: Option<String>) {
 /// authoritative: a large corpus is a long wait, never a timeout, so the
 /// panel polls status at 1 s and the granular progress log at 500 ms until
 /// graph-api reports `serving` (reload the graph) or `failed` (offer Retry).
-async fn track_apply(mut ctx: Ctx, target: Option<String>, generation: u64) {
-    let Some(id) = target else {
+async fn track_apply(mut ctx: Ctx, target: Option<api::SourceSelection>, generation: u64) {
+    let Some(selection) = target else {
         // Returning to the deployment default: it is already hosted, so there
         // is nothing to build or poll — just reload and record the outcome.
         reload_graph(ctx).await;
@@ -643,12 +674,12 @@ async fn track_apply(mut ctx: Ctx, target: Option<String>, generation: u64) {
         return;
     };
     // Feed poller: tail the alternate's own progress log while it builds.
-    spawn(track_feed(id.clone(), generation));
+    spawn(track_feed(selection.clone(), generation));
     loop {
         if *APPLY_GEN.peek() != generation {
             return;
         }
-        match api::source_status(&id).await {
+        match api::source_status(&selection).await {
             Ok(status) => {
                 if *APPLY_GEN.peek() != generation {
                     return;
@@ -664,7 +695,7 @@ async fn track_apply(mut ctx: Ctx, target: Option<String>, generation: u64) {
                         let message = status
                             .error
                             .clone()
-                            .unwrap_or_else(|| format!("{id} failed to build"));
+                            .unwrap_or_else(|| format!("{selection} failed to build"));
                         set_apply_state(generation, ApplyState::Error(message));
                         return;
                     }
@@ -694,7 +725,7 @@ async fn track_apply(mut ctx: Ctx, target: Option<String>, generation: u64) {
 /// Tail the applied source's own progress log at 500 ms, folding each event
 /// tail into [`APPLY_FEED`] until the Apply leaves the Building state or is
 /// superseded by a newer generation.
-async fn track_feed(id: String, generation: u64) {
+async fn track_feed(selection: api::SourceSelection, generation: u64) {
     loop {
         if *APPLY_GEN.peek() != generation
             || !matches!(
@@ -705,7 +736,7 @@ async fn track_feed(id: String, generation: u64) {
             return;
         }
         let since = APPLY_FEED.peek().since;
-        if let Ok(resp) = api::source_progress(&id, since).await {
+        if let Ok(resp) = api::source_progress(&selection, since).await {
             APPLY_FEED.write().fold(&resp);
         }
         gloo_timers::future::TimeoutFuture::new(500).await;
@@ -761,7 +792,7 @@ fn return_to_default(ctx: Ctx, anchor: String) -> Element {
 
 /// Retry a failed build: ask the server to rebuild the source, then re-track
 /// from a fresh Apply generation so status and the feed restart.
-fn retry_build(ctx: Ctx, anchor: String, id: String) -> Element {
+fn retry_build(ctx: Ctx, anchor: String, selection: api::SourceSelection) -> Element {
     rsx! {
         button {
             class: "btn imp-mini",
@@ -769,10 +800,10 @@ fn retry_build(ctx: Ctx, anchor: String, id: String) -> Element {
             "data-action": "retry-build",
             onclick: move |_| {
                 let anchor = anchor.clone();
-                let id = id.clone();
+                let selection = selection.clone();
                 spawn(async move {
-                    let _ = api::source_retry(&id).await;
-                    apply_source(ctx, anchor, Some(id));
+                    let _ = api::source_retry(&selection).await;
+                    apply_source(ctx, anchor, Some(selection));
                 });
             },
             "Retry"
@@ -784,7 +815,7 @@ fn retry_build(ctx: Ctx, anchor: String, id: String) -> Element {
 fn apply_status_view(ctx: Ctx, status: &ApplyStatus) -> Element {
     let target = status.target.clone();
     let anchor = status.anchor.clone();
-    let source_id = status.source_id.clone();
+    let selection = status.selection.clone();
     let offer_reset = !status.reset;
     match &status.state {
         ApplyState::Building {
@@ -844,8 +875,8 @@ fn apply_status_view(ctx: Ctx, status: &ApplyStatus) -> Element {
                 "data-outcome": "error",
                 span { class: "imp-apply-line", "{target} failed to load — {message}" }
                 div { class: "imp-actions",
-                    if let Some(id) = &source_id {
-                        {retry_build(ctx, anchor.clone(), id.clone())}
+                    if let Some(selection) = &selection {
+                        {retry_build(ctx, anchor.clone(), selection.clone())}
                     }
                     if offer_reset {
                         {return_to_default(ctx, anchor.clone())}
@@ -853,6 +884,209 @@ fn apply_status_view(ctx: Ctx, status: &ApplyStatus) -> Element {
                 }
             }
         },
+    }
+}
+
+// --- parameter picker ------------------------------------------------------------
+
+/// Fetch the selected row's parameter pickers once per (row, catalog
+/// generation). Guarded on [`PARAMS_KEY`] so re-renders don't re-run discovery;
+/// a superseding selection or catalog refresh replaces the key and refetches.
+fn ensure_params(id: String, generation: u64) {
+    if PARAMS_KEY.peek().as_ref() == Some(&(id.clone(), generation)) {
+        return;
+    }
+    spawn(async move {
+        // Claim the fetch before awaiting so a racing render for the same row
+        // and generation does not re-enter.
+        *PARAMS_KEY.write() = Some((id.clone(), generation));
+        *PARAMS.write() = ParamsState::Loading;
+        PARAM_PICKS.write().clear();
+        PARAM_CUSTOM.write().clear();
+        let result = api::source_parameters(&id).await;
+        if PARAMS_KEY.peek().as_ref() != Some(&(id.clone(), generation)) {
+            return; // a newer selection or catalog generation superseded this fetch
+        }
+        match result {
+            Ok(params) => {
+                seed_param_picks(&id, &params);
+                *PARAMS.write() = ParamsState::Ready(params);
+            }
+            Err(error) => *PARAMS.write() = ParamsState::Failed(error),
+        }
+    });
+}
+
+/// Pre-fill the picker: each parameter takes its value from the stored
+/// selection (when the stored selection is this same source id), else the
+/// parameter's own default. A value not among the offered ids opens the
+/// free-text "Other…" input.
+fn seed_param_picks(id: &str, params: &api::SourceParameters) {
+    let stored = api::source_selection().filter(|selection| selection.id == id);
+    let mut picks = BTreeMap::new();
+    let mut custom = BTreeSet::new();
+    for (name, param) in &params.parameters {
+        let value = stored
+            .as_ref()
+            .and_then(|selection| selection.params.get(name).cloned())
+            .or_else(|| param.default.clone());
+        if let Some(value) = value {
+            if !param.values.is_empty() && !param.values.iter().any(|v| v.id == value) {
+                custom.insert(name.clone());
+            }
+            picks.insert(name.clone(), value);
+        }
+    }
+    *PARAM_PICKS.write() = picks;
+    *PARAM_CUSTOM.write() = custom;
+}
+
+/// The parameter map for an Apply: every visible parameter, its picked value or
+/// its default. Every parameter the viewer could see is included, so the
+/// selection namespace is explicit and deterministic.
+fn selection_params(params: &api::SourceParameters) -> BTreeMap<String, String> {
+    let picks = PARAM_PICKS.peek();
+    params
+        .parameters
+        .iter()
+        .map(|(name, param)| {
+            let value = picks
+                .get(name)
+                .cloned()
+                .or_else(|| param.default.clone())
+                .unwrap_or_default();
+            (name.clone(), value)
+        })
+        .collect()
+}
+
+/// Whether Apply is allowed for a parameterised row: every parameter without a
+/// default must carry a non-empty value.
+fn params_ready(params: &api::SourceParameters) -> bool {
+    let picks = PARAM_PICKS.read();
+    params.parameters.iter().all(|(name, param)| {
+        param.default.is_some() || picks.get(name).map_or(false, |value| !value.is_empty())
+    })
+}
+
+/// The active parameter chip text for a row: sorted `key=value` pairs joined by
+/// a single space (`bank=omp`, `nodes=48 seed=7`).
+fn chip_params_text(params: &BTreeMap<String, String>) -> String {
+    params
+        .iter()
+        .map(|(key, value)| format!("{key}={value}"))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// A short status line under a parameter: any discovery error, else a note that
+/// its values came from live discovery. `None` when there is nothing to say.
+fn param_hint(param: &api::SourceParameter) -> Option<String> {
+    if let Some(error) = &param.error {
+        return Some(format!("discovery failed: {error}"));
+    }
+    if param.discovered {
+        return Some("values discovered from the source".to_string());
+    }
+    None
+}
+
+/// Update a parameter from its `<select>`: `__custom__` reveals the free-text
+/// input; any other value is a direct pick and closes custom mode.
+fn set_param_choice(name: &str, value: String) {
+    if value == "__custom__" {
+        PARAM_CUSTOM.write().insert(name.to_string());
+    } else {
+        PARAM_CUSTOM.write().remove(name);
+        PARAM_PICKS.write().insert(name.to_string(), value);
+    }
+}
+
+/// Update a parameter from a free-text input (value-less parameter, or the
+/// "Other…" escape).
+fn set_param_value(name: &str, value: String) {
+    PARAM_PICKS.write().insert(name.to_string(), value);
+}
+
+/// The per-request parameter picker inside `.imp-summary`. One
+/// `div.imp-param[data-param]` per parameter: a label, then a
+/// `select.imp-param-select` (when the parameter offers values, with an
+/// "Other…" escape to a free-text `input.imp-param-input`) or a plain
+/// `input.imp-param-input` (when it offers none), plus a `.imp-param-hint`.
+fn param_picker(params: &api::SourceParameters) -> Element {
+    let picks = PARAM_PICKS.read().clone();
+    let custom = PARAM_CUSTOM.read().clone();
+    rsx! {
+        div { class: "imp-params", "data-field": "parameters",
+            for (name, param) in params.parameters.iter() {
+                {
+                    let name = name.clone();
+                    let pick = picks.get(&name).cloned().unwrap_or_default();
+                    let is_custom = custom.contains(&name);
+                    let hint = param_hint(param);
+                    // Value-less parameters take a free-text input; parameters with
+                    // offered values take a select plus an "Other…" escape hatch.
+                    let control = if param.values.is_empty() {
+                        let input_name = name.clone();
+                        let input_pick = pick.clone();
+                        rsx! {
+                            input {
+                                class: "imp-param-input",
+                                "data-param": "{name}",
+                                r#type: "text",
+                                value: "{input_pick}",
+                                oninput: move |e| set_param_value(&input_name, e.value()),
+                            }
+                        }
+                    } else {
+                        let select_name = name.clone();
+                        let custom_name = name.clone();
+                        let custom_pick = pick.clone();
+                        let option_pick = pick.clone();
+                        let select_value = if is_custom {
+                            "__custom__".to_string()
+                        } else {
+                            pick.clone()
+                        };
+                        rsx! {
+                            select {
+                                class: "imp-param-select",
+                                "data-param": "{name}",
+                                value: "{select_value}",
+                                onchange: move |e| set_param_choice(&select_name, e.value()),
+                                for value in param.values.iter() {
+                                    option {
+                                        key: "{value.id}",
+                                        value: "{value.id}",
+                                        selected: !is_custom && value.id == option_pick,
+                                        "{value.label}"
+                                    }
+                                }
+                                option { value: "__custom__", selected: is_custom, "Other…" }
+                            }
+                            if is_custom {
+                                input {
+                                    class: "imp-param-input",
+                                    "data-param": "{custom_name}",
+                                    r#type: "text",
+                                    value: "{custom_pick}",
+                                    oninput: move |e| set_param_value(&custom_name, e.value()),
+                                }
+                            }
+                        }
+                    };
+                    rsx! {
+                        div { key: "{name}", class: "imp-param", "data-param": "{name}",
+                            label { class: "imp-param-label", "{param.label}" }
+                            {control}
+                            if let Some(hint) = hint {
+                                span { class: "imp-param-hint", "data-field": "param-hint", "{hint}" }
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -871,10 +1105,12 @@ pub fn panel(ctx: Ctx) -> Element {
                 return;
             }
             *CATALOG.write() = CatalogState::Loading;
-            *CATALOG.write() = match api::importers().await {
+            let next = match api::importers().await {
                 Ok(catalog) => CatalogState::Ready(catalog),
                 Err(error) => CatalogState::Unavailable(error),
             };
+            *CATALOG_GEN.write() += 1;
+            *CATALOG.write() = next;
         });
     }
 
@@ -882,6 +1118,9 @@ pub fn panel(ctx: Ctx) -> Element {
     let packages = PACKAGES.read().clone();
     let catalog = CATALOG.read().clone();
     let viewing = VIEWING.read().clone();
+    let params_state = PARAMS.read().clone();
+    let params_key = PARAMS_KEY.read().clone();
+    let catalog_gen = *CATALOG_GEN.read();
     let apply = APPLY.read().clone();
     let editor_view = *EDITOR_VIEW.read();
     let preview = PREVIEW.read().clone();
@@ -943,10 +1182,12 @@ pub fn panel(ctx: Ctx) -> Element {
                             onclick: move |_| {
                                 spawn(async move {
                                     *CATALOG.write() = CatalogState::Loading;
-                                    *CATALOG.write() = match api::importers().await {
+                                    let next = match api::importers().await {
                                         Ok(c) => CatalogState::Ready(c),
                                         Err(e) => CatalogState::Unavailable(e),
                                     };
+                                    *CATALOG_GEN.write() += 1;
+                                    *CATALOG.write() = next;
                                 });
                             },
                             "↻"
@@ -982,8 +1223,17 @@ pub fn panel(ctx: Ctx) -> Element {
                                     let click_id = id.clone();
                                     let selected = selection == Some(Selection::Catalog(id.clone()));
                                     let native = is_native_kind(&profile.kind);
-                                    let is_viewing = viewing.as_deref() == Some(profile.id.as_str())
+                                    let is_viewing = viewing
+                                        .as_ref()
+                                        .map(|selection| selection.id.as_str())
+                                        == Some(profile.id.as_str())
                                         || (viewing.is_none() && profile.selected);
+                                    let viewing_params = viewing
+                                        .as_ref()
+                                        .filter(|selection| {
+                                            selection.id == profile.id && !selection.params.is_empty()
+                                        })
+                                        .map(|selection| chip_params_text(&selection.params));
                                     let apply_chip = apply
                                         .as_ref()
                                         .filter(|status| status.anchor == id)
@@ -1016,6 +1266,9 @@ pub fn panel(ctx: Ctx) -> Element {
                                                 }
                                                 if is_viewing {
                                                     span { class: "imp-chip viewing", "viewing" }
+                                                }
+                                                if let Some(params) = &viewing_params {
+                                                    span { class: "imp-chip params", "{params}" }
                                                 }
                                                 if let Some((outcome, label)) = apply_chip {
                                                     span {
@@ -1091,12 +1344,18 @@ pub fn panel(ctx: Ctx) -> Element {
                         match profile {
                             Some(profile) => {
                                 let is_default = profile.selected;
-                                let is_viewing = viewing.as_deref() == Some(profile.id.as_str())
+                                let is_viewing = viewing
+                                    .as_ref()
+                                    .map(|selection| selection.id.as_str())
+                                    == Some(profile.id.as_str())
                                     || (viewing.is_none() && is_default);
                                 let native = is_native_kind(&profile.kind);
+                                // A parameterised alternate stays appliable while it is
+                                // being viewed, so its parameters can be changed and
+                                // re-applied; a bare source hides Apply once it is viewed.
                                 let apply_allowed = switch_allowed
                                     && (is_default || profile.runnable)
-                                    && !is_viewing;
+                                    && (!is_viewing || (!is_default && !profile.parameters.is_empty()));
                                 // Clearing the session's own selection is session-local
                                 // and needs no deployment authorization — always offer it
                                 // on the default profile while viewing elsewhere.
@@ -1122,6 +1381,55 @@ pub fn panel(ctx: Ctx) -> Element {
                                     .as_ref()
                                     .filter(|status| status.anchor == profile.id)
                                     .cloned();
+                                // Per-request parameter picker: only for a runnable
+                                // alternate (the deployment default applies as a bare
+                                // reset, so its parameters, if any, are not picked here).
+                                let has_params = !profile.parameters.is_empty();
+                                let show_params = has_params && !is_default;
+                                let params_current = params_key.as_ref().map_or(false, |(kid, kgen)| {
+                                    kid == &profile.id && *kgen == catalog_gen
+                                });
+                                if show_params {
+                                    ensure_params(profile.id.clone(), catalog_gen);
+                                }
+                                let apply_params = if show_params {
+                                    match &params_state {
+                                        ParamsState::Ready(params) if params_current => {
+                                            Some(params.clone())
+                                        }
+                                        _ => None,
+                                    }
+                                } else {
+                                    None
+                                };
+                                let apply_ready = if show_params {
+                                    apply_params.as_ref().map_or(false, params_ready)
+                                } else {
+                                    true
+                                };
+                                let params_view = if show_params {
+                                    match (&params_state, params_current) {
+                                        (ParamsState::Ready(params), true) => param_picker(params),
+                                        (ParamsState::Failed(error), true) => rsx! {
+                                            div {
+                                                class: "imp-note",
+                                                role: "alert",
+                                                "data-field": "parameters-error",
+                                                "could not load parameters — {error}"
+                                            }
+                                        },
+                                        _ => rsx! {
+                                            div {
+                                                class: "imp-note",
+                                                role: "status",
+                                                "data-field": "parameters-loading",
+                                                "loading parameters…"
+                                            }
+                                        },
+                                    }
+                                } else {
+                                    rsx! {}
+                                };
                                 rsx! {
                                     div { class: "imp-summary",
                                         div { class: "imp-summary-title", "{display_name}" }
@@ -1158,6 +1466,7 @@ pub fn panel(ctx: Ctx) -> Element {
                                                 "this source kind names no single package file; duplicate the entry to edit a local copy"
                                             }
                                         }
+                                        {params_view}
                                         div { class: "imp-actions",
                                             button {
                                                 class: "btn",
@@ -1171,19 +1480,28 @@ pub fn panel(ctx: Ctx) -> Element {
                                                     class: "btn",
                                                     r#type: "button",
                                                     "data-action": "apply",
-                                                    disabled: native && !ctx.graph_session.read().is_server_backed(),
+                                                    disabled: (native && !ctx.graph_session.read().is_server_backed()) || !apply_ready,
                                                     title: if native {
                                                         "native-only connector: apply switches the server-hosted source; it cannot run in the browser"
                                                     } else {
                                                         "switch this browser session's graph view"
                                                     },
                                                     onclick: move |_| {
-                                                        let target = (!is_default)
-                                                            .then(|| apply_id.clone());
+                                                        if is_default {
+                                                            apply_source(ctx, apply_anchor.clone(), None);
+                                                            return;
+                                                        }
+                                                        let params = apply_params
+                                                            .as_ref()
+                                                            .map(selection_params)
+                                                            .unwrap_or_default();
                                                         apply_source(
                                                             ctx,
                                                             apply_anchor.clone(),
-                                                            target,
+                                                            Some(api::SourceSelection {
+                                                                id: apply_id.clone(),
+                                                                params,
+                                                            }),
                                                         );
                                                     },
                                                     "{apply_label}"

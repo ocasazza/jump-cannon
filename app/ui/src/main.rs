@@ -1088,7 +1088,13 @@ fn App() -> Element {
                             if ctx.graph_session.peek().epoch != epoch {
                                 return;
                             }
-                            match api::source_status(&source).await {
+                            // `status.source` is the server's canonical selection
+                            // string; re-encode it into the status route. An
+                            // unparseable value is treated as a transient hiccup.
+                            let Ok(selection) = api::SourceSelection::parse(&source) else {
+                                continue;
+                            };
+                            match api::source_status(&selection).await {
                                 Ok(s) => match s.status.as_str() {
                                     "serving" => break,
                                     "failed" => {
@@ -1155,8 +1161,10 @@ fn App() -> Element {
                             return;
                         }
                         let since = build_progress::BUILD_FEED.peek().since;
-                        if let Ok(resp) = api::source_progress(&source, since).await {
-                            build_progress::BUILD_FEED.write().fold(&resp);
+                        if let Ok(selection) = api::SourceSelection::parse(&source) {
+                            if let Ok(resp) = api::source_progress(&selection, since).await {
+                                build_progress::BUILD_FEED.write().fold(&resp);
+                            }
                         }
                         gloo_timers::future::TimeoutFuture::new(500).await;
                     }
