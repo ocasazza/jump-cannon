@@ -2849,6 +2849,7 @@ dependencies = [
  "jump-cannon-filter-model",
  "miniz_oxide",
  "panel-kit",
+ "panel-kit-core",
  "prost",
  "pulldown-cmark",
  "serde",
@@ -3636,7 +3637,7 @@ dependencies = [
 [[package]]
 name = "panel-kit"
 version = "1.0.0"
-source = "git+https://github.com/ocasazza/panel-kit?rev=d718ee0064974e0635dbc24f912ef013e53e4ece#d718ee0064974e0635dbc24f912ef013e53e4ece"
+source = "git+https://github.com/ocasazza/panel-kit?rev=0f5c9b2c1f762fa2389ea0fafb825437ab1d0d67#0f5c9b2c1f762fa2389ea0fafb825437ab1d0d67"
 dependencies = [
  "dioxus",
  "gloo-storage",
@@ -3652,9 +3653,10 @@ dependencies = [
 [[package]]
 name = "panel-kit-core"
 version = "1.0.0"
-source = "git+https://github.com/ocasazza/panel-kit?rev=d718ee0064974e0635dbc24f912ef013e53e4ece#d718ee0064974e0635dbc24f912ef013e53e4ece"
+source = "git+https://github.com/ocasazza/panel-kit?rev=0f5c9b2c1f762fa2389ea0fafb825437ab1d0d67#0f5c9b2c1f762fa2389ea0fafb825437ab1d0d67"
 dependencies = [
  "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -4706,6 +4708,7 @@ version = "1.0.150"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e8014e44b4736ed0538adeecded0fce2a272f22dc9578a7eb6b2d9993c74cfb9"
 dependencies = [
+ "indexmap 2.14.0",
  "itoa",
  "memchr",
  "serde",

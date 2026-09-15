@@ -28,6 +28,7 @@ mod proto;
 mod render;
 mod sessions;
 mod worker;
+mod workspace;
 
 mod github;
 use std::collections::HashSet;
@@ -36,11 +37,16 @@ use std::sync::Arc;
 use dioxus::events::{Key, KeyboardEvent, Modifiers};
 use dioxus::prelude::*;
 use gloo_storage::{LocalStorage, Storage};
+use panel_kit::widgets::{dock, panel, root};
 use panel_kit::{LayoutBuilder, PanelWin, Spinner};
+use panel_kit_core::frame::{PanelProjection, Placement};
+use panel_kit_core::reducer::WorkspaceEvent;
+use panel_kit_core::{Mode, PanelCatalog, PanelCommand, PanelKind};
 use serde::{Deserialize, Serialize};
 use session_manager::{EmbeddedSessionManager, HttpSessionManager, UserIdentity, WorldHost};
 
 use graph_canvas::GraphData;
+use workspace::PanelWorkspace;
 
 /// Top-level app surface. `User` is the classic single-graph workspace;
 /// `Sessions` is the world/session workspace (versioned worlds, branches,
@@ -189,7 +195,7 @@ pub(crate) enum Panel {
     Importers,
 }
 
-impl panel_kit::PanelKind for Panel {
+impl PanelKind for Panel {
     fn title(self) -> &'static str {
         match self {
             Panel::Graph => "Graph",
@@ -884,9 +890,8 @@ fn restore_persisted_world(ctx: Ctx) {
 }
 
 /// Whether `view`'s workspace layout holds `kind`. The palette filters its
-/// jump-to-section commands through this so it never offers a restore that
-/// would silently no-op (`Workspace::restore` on a panel the active view's
-/// layout doesn't contain).
+/// jump-to-section commands through this so it never queues an open-panel
+/// request that the active view's reducer restore command would ignore.
 pub(crate) fn panel_in_view(kind: Panel, view: AppView) -> bool {
     let layout = match view {
         AppView::User => default_layout(),
@@ -1008,11 +1013,70 @@ pub(crate) async fn reload_graph(mut ctx: Ctx) {
 
 // --- app ---------------------------------------------------------------------
 
-/// Open-panel request bridge: modules that can't reach the workspace hook
-/// (the command palette's jump-to-section actions) park a `Panel` here; the
-/// drain effect in [`App`] restores + raises it. The egui analog is
-/// `AppAction::JumpToSection` mutating `state.sections`.
+/// Open-panel request bridge: modules that cannot reach the host-owned
+/// workspace state (the command palette's jump-to-section actions) park a
+/// [`Panel`] here; the drain effect in [`App`] restores + raises it through the
+/// reducer. The egui analog is `AppAction::JumpToSection` mutating
+/// `state.sections`.
 pub(crate) static OPEN_PANEL: GlobalSignal<Option<Panel>> = Signal::global(|| None);
+
+/// Apply graph/camera keyboard shortcuts before panel workspace commands.
+fn handle_graph_key_down(event: &KeyboardEvent, panel_focused: bool) -> bool {
+    match event.key() {
+        Key::Shift => {
+            render::key_event("Shift", true);
+            true
+        }
+        Key::Character(c) => handle_graph_character_key(event, &c, panel_focused),
+        _ => false,
+    }
+}
+
+/// Apply one character key to the graph/camera controls when it owns it.
+fn handle_graph_character_key(event: &KeyboardEvent, key: &str, panel_focused: bool) -> bool {
+    let chord = event
+        .modifiers()
+        .intersects(Modifiers::CONTROL | Modifiers::ALT);
+    if chord {
+        render::key_event(key, true);
+        return false;
+    }
+
+    if is_camera_pan_key(key) {
+        render::key_event(key, true);
+        return true;
+    }
+
+    if key.eq_ignore_ascii_case("f") && !panel_focused {
+        render::fit_camera();
+        return true;
+    }
+
+    if key.eq_ignore_ascii_case("c") {
+        if event.is_auto_repeating() {
+            return true;
+        }
+        if event.modifiers().contains(Modifiers::SHIFT) {
+            panels::camera::snap_to_center();
+        } else {
+            panels::camera::toggle_follow_centroid();
+        }
+        return true;
+    }
+
+    false
+}
+
+/// Whether a browser key belongs to the graph pan/ascend/descend controls.
+fn is_camera_pan_key(key: &str) -> bool {
+    let mut chars = key.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    chars.next().is_none()
+        && matches!(first.to_ascii_lowercase(), 'w' | 'a' | 's' | 'd' | 'q' | 'e')
+}
+
 
 #[component]
 fn App() -> Element {
@@ -1032,30 +1096,37 @@ fn App() -> Element {
     // surface. Migrate v6-v8 layout geometry and let the
     // independent jc_* control state continue unchanged.
     migrate_workspace_layout();
-    // Both views' workspaces are created unconditionally (hook rules); only
-    // the active view's workspace is rendered, so the single wgpu render host
-    // and localStorage layout persistence (`jc_layout_v9` vs
-    // `jc_sessions_layout_v1`) stay consistent per view.
-    let ws_user = panel_kit::use_workspace(WORKSPACE_LAYOUT_KEY, default_layout);
-    let ws_sessions = panel_kit::use_workspace(SESSIONS_LAYOUT_KEY, sessions_default_layout);
+    let catalog = use_hook(workspace::panel_catalog);
+    let ws_user =
+        workspace::use_panel_workspace(WORKSPACE_LAYOUT_KEY, default_layout, catalog.clone());
+    let ws_sessions = workspace::use_panel_workspace(
+        SESSIONS_LAYOUT_KEY,
+        sessions_default_layout,
+        catalog.clone(),
+    );
+    workspace::mount_viewport_observer(&ws_user);
+    workspace::mount_viewport_observer(&ws_sessions);
     // Hoisted above the palette-drain effect so both it and Ctx share one
     // view signal. Boot restores the view last chosen via the switcher.
     let view = use_signal(persisted_view);
+    let open_user = ws_user.clone();
+    let open_sessions = ws_sessions.clone();
 
-    // Drain palette jump-to-section requests into the workspace, logging
-    // the same `("section", "<title>: open")` event the egui app pushed.
+    // Drain palette jump-to-section requests into the active workspace,
+    // logging the same `("section", "<title>: open")` event the egui app
+    // pushed.
     use_effect(move || {
         let req = *OPEN_PANEL.read();
         if let Some(kind) = req {
-            let ws = match *view.read() {
-                AppView::User => ws_user,
-                AppView::Sessions => ws_sessions,
+            let workspace = match *view.read() {
+                AppView::User => open_user.clone(),
+                AppView::Sessions => open_sessions.clone(),
             };
-            ws.restore(kind);
-            appstate::note_mutation(
-                "section",
-                &format!("{}: open", panel_kit::PanelKind::title(kind)),
-            );
+            workspace::workspace_event_handler(&workspace).call(WorkspaceEvent::Command {
+                target: Some(kind),
+                command: PanelCommand::Restore,
+            });
+            appstate::note_mutation("section", &format!("{}: open", PanelKind::title(kind)));
             *OPEN_PANEL.write() = None;
         }
     });
@@ -1067,12 +1138,12 @@ fn App() -> Element {
     // separate surface the boot shell does not represent. The cookie is
     // rewritten only once a drag settles (matching panel-kit's own persist
     // rule), so a mid-gesture layout never thrashes it.
+    let cookie_user = ws_user.clone();
     use_effect(move || {
-        let panels = ws_user.panels.read();
-        let mode = *ws_user.mode.read();
-        let settled = ws_user.drag.read().is_none() && ws_user.tile_drag.read().is_none();
+        let snapshot = cookie_user.snapshot.read();
+        let settled = snapshot.drag.is_none() && snapshot.tile_drag.is_none();
         if settled {
-            write_shell_cookie(&serialize_shell_cookie(panels.as_slice(), mode));
+            write_shell_cookie(&serialize_shell_cookie(&snapshot.panels, snapshot.preferred_mode));
         }
     });
 
@@ -1215,6 +1286,7 @@ fn App() -> Element {
                             last_stage = status.stage.clone();
                         }
                         building.set(Some(status));
+                        let mut last_status_poll_error: Option<String> = None;
                         loop {
                             gloo_timers::future::TimeoutFuture::new(1000).await;
                             if ctx.graph_session.peek().epoch != epoch {
@@ -1227,28 +1299,40 @@ fn App() -> Element {
                                 continue;
                             };
                             match api::source_status(&selection).await {
-                                Ok(s) => match s.status.as_str() {
-                                    "serving" => break,
-                                    "failed" => {
-                                        building.set(None);
-                                        load_error
-                                            .set(Some(api::LoadError::Failed(s).to_string()));
-                                        return;
-                                    }
-                                    _ => {
-                                        if s.stage != last_stage {
-                                            tracing::info!(
-                                                "[graph] source {source} building: {}",
-                                                s.stage.as_deref().unwrap_or("…")
-                                            );
-                                            last_stage = s.stage.clone();
+                                Ok(s) => {
+                                    last_status_poll_error = None;
+                                    match s.status.as_str() {
+                                        "serving" => break,
+                                        "failed" => {
+                                            building.set(None);
+                                            load_error
+                                                .set(Some(api::LoadError::Failed(s).to_string()));
+                                            return;
                                         }
-                                        building.set(Some(s));
+                                        _ => {
+                                            if s.stage != last_stage {
+                                                tracing::info!(
+                                                    "[graph] source {source} building: {}",
+                                                    s.stage.as_deref().unwrap_or("…")
+                                                );
+                                                last_stage = s.stage.clone();
+                                            }
+                                            building.set(Some(s));
+                                        }
                                     }
-                                },
+                                }
                                 // A transient status hiccup is not a build
-                                // failure; keep polling.
-                                Err(_) => {}
+                                // failure; report the poll failure and keep polling.
+                                Err(error) => {
+                                    if last_status_poll_error.as_deref() == Some(error.as_str()) {
+                                        continue;
+                                    }
+                                    tracing::warn!(
+                                        "{}",
+                                        api::source_status_poll_warning("graph", &source, &error)
+                                    );
+                                    last_status_poll_error = Some(error);
+                                }
                             }
                         }
                     }
@@ -1446,13 +1530,19 @@ fn App() -> Element {
     // in-progress server tasks, grey idle dot otherwise.
     let n_running = ctx.tasks.read().iter().filter(|t| t.state == 0).count();
     let view_now = *ctx.view.read();
-    let ws = match view_now {
-        AppView::User => ws_user,
-        AppView::Sessions => ws_sessions,
+    let workspace = match view_now {
+        AppView::User => ws_user.clone(),
+        AppView::Sessions => ws_sessions.clone(),
     };
-    let mode_label = match ws.effective_mode() {
-        panel_kit::Mode::Tiling => "tiling",
-        panel_kit::Mode::Floating => "floating",
+    let (root_class, mode_label) = {
+        let snapshot = workspace.snapshot.read();
+        let mut scratch = workspace.scratch.borrow_mut();
+        let frame = workspace::project_workspace(&snapshot, &mut scratch);
+        let mode_label = match frame.mode {
+            Mode::Tiling => "tiling",
+            Mode::Floating => "floating",
+        };
+        (root::root_class(&frame), mode_label)
     };
     let world_label = ctx.active_world.read().clone();
 
@@ -1461,71 +1551,48 @@ fn App() -> Element {
         // <link rel="css"> so the static boot shell can paint pre-WASM.
         style { {panel_kit::CSS} }
         div {
-            class: ws.root_class(),
+            class: "{root_class}",
             tabindex: "0",
             autofocus: true,
-            onpointermove: move |e| ws.handle_pointer_move(&e),
-            onpointerup: move |e| ws.handle_pointer_up(&e),
-            onpointercancel: move |e| ws.handle_pointer_up(&e),
-            // WASDQE camera pan + Shift boost, F fit while workspace focus is
-            // clear, and C toggle follow / ⇧C snap to center. Focused panels
-            // receive panel-kit's canonical keyboard window management.
-            // Single-key camera shortcuts must not fire while the user is
-            // typing in an input/textarea.
-            onkeydown: move |e: KeyboardEvent| {
-                // Palette chord first: it must open even while an input has
-                // focus, and a consumed event never reaches the camera.
-                if palette::handle_key(&e, ctx) {
-                    return;
-                }
-                if panel_kit::is_editing() {
-                    ws.handle_key(&e);
-                    render::clear_keys();
-                    return;
-                }
-                // Super+V (⌘V / Meta+V): open the hinted node (hovered,
-                // else selected) in the Inspector. Never reaches the camera
-                // keys, so a held Meta can't leave a WASDQE key stuck.
-                if e.modifiers().contains(Modifiers::META) {
-                    if let Key::Character(c) = e.key() {
-                        if c.eq_ignore_ascii_case("v") && anchored::view_node(ctx) {
-                            e.prevent_default();
-                        }
+            onpointermove: {
+                let workspace = workspace.clone();
+                move |e| workspace::handle_pointer_move(&workspace, &e)
+            },
+            onpointerup: {
+                let workspace = workspace.clone();
+                move |e| workspace::handle_pointer_up(&workspace, &e)
+            },
+            onpointercancel: {
+                let workspace = workspace.clone();
+                move |e| workspace::handle_pointer_up(&workspace, &e)
+            },
+            // App-owned handlers get first refusal: palette chords, text
+            // editors, graph/camera controls, then panel-kit reducer input.
+            onkeydown: {
+                let workspace = workspace.clone();
+                move |e: KeyboardEvent| {
+                    if palette::handle_key(&e, ctx) {
+                        return;
                     }
-                    return;
-                }
-                let panel_focused = ws.focused().is_some();
-                ws.handle_key(&e);
-                match e.key() {
-                    Key::Shift => render::key_event("Shift", true),
-                    Key::Character(c) => {
-                        // Ctrl/Alt chords are not single-key camera
-                        // bindings (Ctrl+C must not toggle follow).
-                        let chord = e
-                            .modifiers()
-                            .intersects(Modifiers::CONTROL | Modifiers::ALT);
-                        if chord {
-                            render::key_event(&c, true);
-                        } else if c.eq_ignore_ascii_case("f") {
-                            if !panel_focused {
-                                render::fit_camera();
-                            }
-                        } else if c.eq_ignore_ascii_case("c") {
-                            // Auto-repeat guard: held-C must not strobe the
-                            // follow-centroid toggle.
-                            if e.is_auto_repeating() {
-                                return;
-                            }
-                            if e.modifiers().contains(Modifiers::SHIFT) {
-                                panels::camera::snap_to_center();
-                            } else {
-                                panels::camera::toggle_follow_centroid();
-                            }
-                        } else {
-                            render::key_event(&c, true);
-                        }
+                    if panel_kit::input::is_editing() {
+                        workspace::handle_key(&workspace, &e);
+                        render::clear_keys();
+                        return;
                     }
-                    _ => {}
+                    if e.modifiers().contains(Modifiers::META) {
+                        if let Key::Character(c) = e.key() {
+                            if c.eq_ignore_ascii_case("v") && anchored::view_node(ctx) {
+                                e.prevent_default();
+                            }
+                        }
+                        return;
+                    }
+
+                    let panel_focused = workspace.snapshot.read().focused.is_some();
+                    if handle_graph_key_down(&e, panel_focused) {
+                        return;
+                    }
+                    workspace::handle_key(&workspace, &e);
                 }
             },
             onkeyup: move |e: KeyboardEvent| {
@@ -1587,8 +1654,8 @@ fn App() -> Element {
             }
 
             {match view_now {
-                AppView::User => rsx! { UserWorkspaceView { ws: ViewWs(ws_user), ctx } },
-                AppView::Sessions => rsx! { SessionsWorkspaceView { ws: ViewWs(ws_sessions), ctx } },
+                AppView::User => rsx! { UserWorkspaceView { workspace: ws_user.clone(), ctx } },
+                AppView::Sessions => rsx! { SessionsWorkspaceView { workspace: ws_sessions.clone(), ctx } },
             }}
 
             // Root-mounted, render-empty drivers: the palette overlay (empty
@@ -1601,53 +1668,65 @@ fn App() -> Element {
 
 // --- per-view workspace wrappers ------------------------------------------------
 
-// `Workspace::render_with_header` calls each visible panel's body fn INLINE,
-// so panel hooks land in the caller's scope. Both views must therefore mount
-// under DISTINCT component types: switching views unmounts one scope and
-// initializes the other cleanly, instead of scrambling hook indices inside a
-// single shared scope (the rules-of-hooks panic this fixes).
+// Panel bodies are still mounted under distinct component types. Switching
+// views unmounts one scope and initializes the other cleanly instead of
+// scrambling hook indices inside a single shared scope.
 
-/// Prop wrapper: Dioxus 0.6 requires `PartialEq` props and `Workspace` has
-/// none. Signal equality is identity-based, which is exactly what a prop
-/// comparison needs.
-#[derive(Clone, Copy)]
-struct ViewWs(panel_kit::Workspace<Panel>);
-
-impl PartialEq for ViewWs {
-    fn eq(&self, other: &Self) -> bool {
-        self.0.panels == other.0.panels
-            && self.0.mode == other.0.mode
-            && self.0.drag == other.0.drag
-            && self.0.tile_drag == other.0.tile_drag
-            && self.0.profile == other.0.profile
-            && self.0.focused == other.0.focused
-            && self.0.viewport == other.0.viewport
-            && self.0.ws_scroll == other.0.ws_scroll
-    }
+#[component]
+fn UserWorkspaceView(workspace: PanelWorkspace, ctx: Ctx) -> Element {
+    render_workspace(workspace, ctx)
 }
 
 #[component]
-fn UserWorkspaceView(ws: ViewWs, ctx: Ctx) -> Element {
-    let ws = ws.0;
+fn SessionsWorkspaceView(workspace: PanelWorkspace, ctx: Ctx) -> Element {
+    render_workspace(workspace, ctx)
+}
+
+/// Render one host-owned workspace from composable panel parts.
+fn render_workspace(workspace: PanelWorkspace, ctx: Ctx) -> Element {
+    let emit = workspace::workspace_event_handler(&workspace);
+    let wheel_workspace = workspace.clone();
+    let snapshot = workspace.snapshot.read();
+    let mut scratch = workspace.scratch.borrow_mut();
+    let frame = workspace::project_workspace(&snapshot, &mut scratch);
+    let workspace_class = workspace::workspace_area_class(&frame);
+    let workspace_style = frame.tile_grid.map(root::tile_grid_style).unwrap_or_default();
+
     rsx! {
-        {ws.render_with_header(
-            move |kind, maximized| panel_body(kind, maximized, ctx),
-            move |kind, _maximized| panel_header_actions(kind, ctx),
-        )}
-        {ws.dock()}
+        div {
+            class: "{workspace_class}",
+            style: "{workspace_style}",
+            onwheel: move |event| workspace::handle_wheel(&wheel_workspace, &event),
+            for projected in frame.panels.iter().copied() {
+                {render_projected_panel(projected, &workspace.catalog, emit.clone(), ctx)}
+            }
+        }
+        {dock::dock(frame.dock, &workspace.catalog, emit)}
     }
 }
 
-#[component]
-fn SessionsWorkspaceView(ws: ViewWs, ctx: Ctx) -> Element {
-    let ws = ws.0;
-    rsx! {
-        {ws.render_with_header(
-            move |kind, maximized| panel_body(kind, maximized, ctx),
-            move |kind, _maximized| panel_header_actions(kind, ctx),
-        )}
-        {ws.dock()}
-    }
+/// Render one projected panel from explicit chrome, body, controls, and grip.
+fn render_projected_panel(
+    projected: PanelProjection<Panel>,
+    catalog: &PanelCatalog<Panel>,
+    emit: EventHandler<WorkspaceEvent<Panel>>,
+    ctx: Ctx,
+) -> Element {
+    let Some(meta) = catalog.get(projected.key) else { return rsx! {} };
+    let class = format!("panel-{}", meta.slug);
+    let maximized = matches!(projected.placement, Placement::Maximized);
+    let controls = panel::traffic_lights(projected, emit.clone());
+    let chrome = panel::panel_chrome_with_events(
+        projected,
+        meta,
+        emit.clone(),
+        Some(controls),
+        Some(panel_header_actions(projected.key, ctx)),
+    );
+    let body = panel::panel_body(panel_body(projected.key, maximized, ctx));
+    let resize = panel::resize_grip(projected, emit);
+
+    panel::panel_shell(projected, Some(&class), rsx! { {chrome} {body} {resize} })
 }
 
 // --- panel bodies ----------------------------------------------------------------
@@ -1885,6 +1964,195 @@ fn progress_panel(ctx: Ctx) -> Element {
                     }
                 }
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod workspace_migration_tests {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    use panel_kit_core::frame::{project_into, ProjectionBuffer, ProjectionInput, TileLayoutMetrics};
+    use panel_kit_core::persist::{apply_save_decision, LayoutStore, SavePolicy};
+    use panel_kit_core::reducer::{reduce, ResizePolicy, Snapshot, Viewport, WorkspaceEvent};
+    use panel_kit_core::{
+        ChromeMetrics, Clamp, CommandStep, Mode, PanelCatalog, PanelCommand, TileMetrics, Units,
+        WinState,
+    };
+
+    use super::{
+        default_layout, sessions_default_layout, workspace, Panel, SESSIONS_LAYOUT_KEY,
+        WORKSPACE_LAYOUT_KEY,
+    };
+
+    #[derive(Clone, Default)]
+    struct MemoryStore {
+        key: &'static str,
+        saves: Rc<RefCell<Vec<String>>>,
+        cleared: Rc<RefCell<bool>>,
+    }
+
+    impl MemoryStore {
+        fn new(key: &'static str) -> Self {
+            Self { key, ..Self::default() }
+        }
+
+        fn save_count(&self) -> usize {
+            self.saves.borrow().len()
+        }
+    }
+
+    impl LayoutStore for MemoryStore {
+        fn load(&self) -> Result<Option<String>, String> {
+            Ok(None)
+        }
+
+        fn save(&self, json: &str) -> Result<(), String> {
+            self.saves.borrow_mut().push(json.to_string());
+            Ok(())
+        }
+
+        fn clear(&self) -> Result<(), String> {
+            *self.cleared.borrow_mut() = true;
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn two_concurrent_workspaces_do_not_share_state_or_store() {
+        assert_eq!(WORKSPACE_LAYOUT_KEY, "jc_layout_v9");
+        assert_eq!(SESSIONS_LAYOUT_KEY, "jc_sessions_layout_v1");
+
+        let catalog = workspace::panel_catalog();
+        assert_preserved_panel_ids(&catalog);
+
+        let viewport = Viewport { width: 1280.0, height: 800.0, units: Units::CssPx };
+        let mut user = Snapshot::from_defaults(default_layout(), Mode::Floating, viewport);
+        let mut sessions = Snapshot::from_defaults(sessions_default_layout(), Mode::Floating, viewport);
+        let mut user_scratch = ProjectionBuffer::with_panel_capacity(user.panels.len());
+        let mut sessions_scratch = ProjectionBuffer::with_panel_capacity(sessions.panels.len());
+        let user_store = MemoryStore::new(WORKSPACE_LAYOUT_KEY);
+        let sessions_store = MemoryStore::new(SESSIONS_LAYOUT_KEY);
+
+        assert_eq!(user_store.key, WORKSPACE_LAYOUT_KEY);
+        assert_eq!(sessions_store.key, SESSIONS_LAYOUT_KEY);
+
+        let user_context = reduce_context(&user);
+        let user_reduction = reduce(
+            &mut user,
+            WorkspaceEvent::Command {
+                target: Some(Panel::Document),
+                command: PanelCommand::Restore,
+            },
+            user_context,
+        );
+        apply_save_decision(SavePolicy::OnSettle.decide(&user_reduction), &user_store, &user, &catalog)
+            .expect("user layout persists");
+        assert_eq!(user_store.save_count(), 1);
+        assert_eq!(sessions_store.save_count(), 0);
+        assert!(sessions
+            .panels
+            .iter()
+            .any(|panel| panel.kind == Panel::Branches && panel.state == WinState::Minimized));
+
+        let sessions_context = reduce_context(&sessions);
+        let sessions_reduction = reduce(
+            &mut sessions,
+            WorkspaceEvent::Command {
+                target: Some(Panel::Branches),
+                command: PanelCommand::Restore,
+            },
+            sessions_context,
+        );
+        apply_save_decision(
+            SavePolicy::OnSettle.decide(&sessions_reduction),
+            &sessions_store,
+            &sessions,
+            &catalog,
+        )
+        .expect("sessions layout persists");
+        assert_eq!(user_store.save_count(), 1);
+        assert_eq!(sessions_store.save_count(), 1);
+
+        let surface = panel_kit::surface::surface_profile(user.viewport.width);
+        let chrome = panel_kit_core::frame::ChromeProjectionInput::full(ChromeMetrics::WEB);
+        let tile = TileLayoutMetrics::from_tile_metrics(TileMetrics::WEB, surface);
+        let user_frame = project_into(
+            ProjectionInput {
+                snapshot: &user,
+                surface,
+                chrome: &chrome,
+                clamp: &Clamp::WEB,
+                tile: &tile,
+            },
+            &mut user_scratch,
+        );
+        let surface = panel_kit::surface::surface_profile(sessions.viewport.width);
+        let chrome = panel_kit_core::frame::ChromeProjectionInput::full(ChromeMetrics::WEB);
+        let tile = TileLayoutMetrics::from_tile_metrics(TileMetrics::WEB, surface);
+        let sessions_frame = project_into(
+            ProjectionInput {
+                snapshot: &sessions,
+                surface,
+                chrome: &chrome,
+                clamp: &Clamp::WEB,
+                tile: &tile,
+            },
+            &mut sessions_scratch,
+        );
+        assert_ne!(user_frame.panels.as_ptr(), sessions_frame.panels.as_ptr());
+
+        let mut resized = user.clone();
+        let resize_context = reduce_context(&resized);
+        reduce(
+            &mut resized,
+            WorkspaceEvent::ViewportChanged {
+                size: Viewport { width: 640.0, height: 400.0, units: Units::CssPx },
+                policy: ResizePolicy::ScaleFloating,
+            },
+            resize_context,
+        );
+        let graph = resized.panels.iter().find(|panel| panel.kind == Panel::Graph).expect("graph panel");
+        assert_eq!(graph.x, 6.0);
+        assert_eq!(graph.y, 22.0);
+    }
+
+    fn assert_preserved_panel_ids(catalog: &PanelCatalog<Panel>) {
+        let ids = [
+            (Panel::Graph, "Graph"),
+            (Panel::Nodes, "Nodes"),
+            (Panel::Inspector, "Inspector"),
+            (Panel::Document, "Document"),
+            (Panel::Progress, "Progress"),
+            (Panel::Settings, "Settings"),
+            (Panel::Help, "Help"),
+            (Panel::Filter, "Filter"),
+            (Panel::Metrics, "Metrics"),
+            (Panel::Instances, "Instances"),
+            (Panel::Generate, "Generate"),
+            (Panel::Timeline, "Timeline"),
+            (Panel::Debug, "Debug"),
+            (Panel::Worlds, "Worlds"),
+            (Panel::History, "History"),
+            (Panel::Branches, "Branches"),
+            (Panel::Merge, "Merge"),
+            (Panel::GitHub, "GitHub"),
+            (Panel::GpuSessions, "GpuSessions"),
+            (Panel::Importers, "Importers"),
+        ];
+
+        for (panel, id) in ids {
+            assert_eq!(catalog.stable_id(panel), Some(id));
+        }
+    }
+
+    fn reduce_context(snapshot: &Snapshot<Panel>) -> panel_kit_core::reducer::ReduceContext<'static> {
+        panel_kit_core::reducer::ReduceContext {
+            surface: panel_kit::surface::surface_profile(snapshot.viewport.width),
+            clamp: &Clamp::WEB,
+            command_step: CommandStep::WEB,
+            tile: &TileMetrics::WEB,
         }
     }
 }

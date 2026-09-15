@@ -1255,6 +1255,13 @@ pub async fn source_status(selection: &SourceSelection) -> ApiResult<BuildStatus
         .map_err(err)
 }
 
+/// Format the non-fatal diagnostic for a failed alternate-source status poll.
+pub(crate) fn source_status_poll_warning(surface: &str, source: &str, error: &str) -> String {
+    format!(
+        "[{surface}] source {source} status poll failed: {error}; keeping build poll alive"
+    )
+}
+
 /// `GET /importers/sources/{id}/progress?since=<seq>` — progress log for an alternate source.
 pub async fn source_progress(
     selection: &SourceSelection,
@@ -1372,7 +1379,7 @@ pub async fn sm_compute_action(world: &str, action: &str) -> ApiResult<serde_jso
 
 #[cfg(test)]
 mod tests {
-    use super::{display_error, is_building_error, ImporterCatalog};
+    use super::{display_error, is_building_error, source_status_poll_warning, ImporterCatalog};
 
     fn importer_catalog_accepts_an_omitted_active_kind() {
         let catalog: ImporterCatalog = serde_json::from_value(serde_json::json!({
@@ -1449,5 +1456,19 @@ mod tests {
         let failed = "/graph/init -> HTTP 503: import alternate source \"x\": connector unreachable";
         assert!(!is_building_error(failed));
         assert_eq!(display_error(failed), failed);
+    }
+
+    #[test]
+    fn source_status_poll_warning_names_source_and_error_without_failing_the_wait() {
+        let warning = source_status_poll_warning(
+            "graph",
+            "jump-cannon:gpu-force",
+            "network timeout",
+        );
+
+        assert_eq!(
+            warning,
+            "[graph] source jump-cannon:gpu-force status poll failed: network timeout; keeping build poll alive"
+        );
     }
 }

@@ -2102,89 +2102,98 @@ impl RenderHost {
         canvas: web_sys::HtmlCanvasElement,
         graph: GraphData,
     ) -> Result<Self, String> {
-        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
-            backends: wgpu::Backends::BROWSER_WEBGPU,
-            ..Default::default()
-        });
-        let surface = instance
-            .create_surface(wgpu::SurfaceTarget::Canvas(canvas.clone()))
-            .map_err(|e| format!("create_surface: {e}"))?;
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let _ = (canvas, graph);
+            return Err("RenderHost requires a wasm32 WebGPU canvas target".to_string());
+        }
 
-        let adapter = instance
-            .request_adapter(&wgpu::RequestAdapterOptions {
-                power_preference: wgpu::PowerPreference::HighPerformance,
-                compatible_surface: Some(&surface),
-                force_fallback_adapter: false,
+        #[cfg(target_arch = "wasm32")]
+        {
+            let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+                backends: wgpu::Backends::BROWSER_WEBGPU,
+                ..Default::default()
+            });
+            let surface = instance
+                .create_surface(wgpu::SurfaceTarget::Canvas(canvas.clone()))
+                .map_err(|e| format!("create_surface: {e}"))?;
+
+            let adapter = instance
+                .request_adapter(&wgpu::RequestAdapterOptions {
+                    power_preference: wgpu::PowerPreference::HighPerformance,
+                    compatible_surface: Some(&surface),
+                    force_fallback_adapter: false,
+                })
+                .await
+                .ok_or_else(|| "no compatible WebGPU adapter".to_string())?;
+
+            // Start from the force engine's limits (adapter-sized storage
+            // buffer / buffer size so the position and CSR buffers are not
+            // capped at WebGPU's 128 MiB / 256 MiB defaults — see
+            // `graph_layouts::gpu_force_device_limits`), then bump the
+            // per-stage storage-buffer count for the renderer's own pipelines.
+            // Chrome's WebGPU default cap is 10; request 14 minimum, capped at
+            // the adapter-reported max so we never ask for more than the
+            // hardware can serve.
+            let adapter_limits = adapter.limits();
+            let mut limits = graph_layouts::gpu_force_device_limits(&adapter_limits);
+            limits.max_storage_buffers_per_shader_stage = limits
+                .max_storage_buffers_per_shader_stage
+                .max(14)
+                .min(adapter_limits.max_storage_buffers_per_shader_stage);
+
+            let (device, queue) = adapter
+                .request_device(
+                    &wgpu::DeviceDescriptor {
+                        label: Some("jump-cannon-ui device"),
+                        required_features: wgpu::Features::empty(),
+                        required_limits: limits,
+                        memory_hints: wgpu::MemoryHints::default(),
+                    },
+                    None,
+                )
+                .await
+                .map_err(|e| format!("request_device: {e}"))?;
+
+            // WebGPU validation errors don't panic — they kill rendering
+            // silently (black canvas, app otherwise alive). Route them through
+            // tracing so they're visible in the console at WARN level.
+            device.on_uncaptured_error(Box::new(|e| {
+                tracing::error!("[render] wgpu uncaptured error: {e}");
+            }));
+
+            let caps = surface.get_capabilities(&adapter);
+            let format = caps
+                .formats
+                .iter()
+                .copied()
+                .find(|f| f.is_srgb())
+                .unwrap_or(caps.formats[0]);
+            let (width, height) = Self::physical_size(&canvas);
+            let config = wgpu::SurfaceConfiguration {
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+                format,
+                width: width.max(1),
+                height: height.max(1),
+                present_mode: caps.present_modes[0],
+                desired_maximum_frame_latency: 2,
+                alpha_mode: caps.alpha_modes[0],
+                view_formats: vec![],
+            };
+            surface.configure(&device, &config);
+
+            let mut pipes = GraphPipelines::new(&device, format);
+            pipes.load(&device, &queue, graph)?;
+
+            Ok(Self {
+                canvas,
+                surface,
+                device,
+                queue,
+                config,
+                pipes,
             })
-            .await
-            .ok_or_else(|| "no compatible WebGPU adapter".to_string())?;
-
-        // Start from the force engine's limits (adapter-sized storage
-        // buffer / buffer size so the position and CSR buffers are not
-        // capped at WebGPU's 128 MiB / 256 MiB defaults — see
-        // `graph_layouts::gpu_force_device_limits`), then bump the
-        // per-stage storage-buffer count for the renderer's own pipelines.
-        // Chrome's WebGPU default cap is 10; request 14 minimum, capped at
-        // the adapter-reported max so we never ask for more than the
-        // hardware can serve.
-        let adapter_limits = adapter.limits();
-        let mut limits = graph_layouts::gpu_force_device_limits(&adapter_limits);
-        limits.max_storage_buffers_per_shader_stage = limits
-            .max_storage_buffers_per_shader_stage
-            .max(14)
-            .min(adapter_limits.max_storage_buffers_per_shader_stage);
-
-        let (device, queue) = adapter
-            .request_device(
-                &wgpu::DeviceDescriptor {
-                    label: Some("jump-cannon-ui device"),
-                    required_features: wgpu::Features::empty(),
-                    required_limits: limits,
-                    memory_hints: wgpu::MemoryHints::default(),
-                },
-                None,
-            )
-            .await
-            .map_err(|e| format!("request_device: {e}"))?;
-
-        // WebGPU validation errors don't panic — they kill rendering
-        // silently (black canvas, app otherwise alive). Route them through
-        // tracing so they're visible in the console at WARN level.
-        device.on_uncaptured_error(Box::new(|e| {
-            tracing::error!("[render] wgpu uncaptured error: {e}");
-        }));
-
-        let caps = surface.get_capabilities(&adapter);
-        let format = caps
-            .formats
-            .iter()
-            .copied()
-            .find(|f| f.is_srgb())
-            .unwrap_or(caps.formats[0]);
-        let (width, height) = Self::physical_size(&canvas);
-        let config = wgpu::SurfaceConfiguration {
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-            format,
-            width: width.max(1),
-            height: height.max(1),
-            present_mode: caps.present_modes[0],
-            desired_maximum_frame_latency: 2,
-            alpha_mode: caps.alpha_modes[0],
-            view_formats: vec![],
-        };
-        surface.configure(&device, &config);
-
-        let mut pipes = GraphPipelines::new(&device, format);
-        pipes.load(&device, &queue, graph)?;
-
-        Ok(Self {
-            canvas,
-            surface,
-            device,
-            queue,
-            config,
-            pipes,
-        })
+        }
     }
 
     /// True while the canvas this host was built against is still in the

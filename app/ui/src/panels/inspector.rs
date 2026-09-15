@@ -33,7 +33,7 @@ use std::collections::BTreeMap;
 
 use dioxus::prelude::*;
 use gloo_storage::{LocalStorage, Storage};
-use panel_kit::badge::{Badge, BadgeAction, BadgeClickKind, BadgeKind, Rgb};
+use panel_kit::badge::{Badge, BadgeAction, BadgeClickKind, BadgeKind, BadgeSpec, Rgb};
 use panel_kit::Spinner;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -266,18 +266,19 @@ fn pill_list(ctx: Ctx, pills: Vec<Pill>, truncated: usize) -> Element {
                 {
                     let id = p.id.clone();
                     let mut selected = ctx.selected;
+                    let spec = BadgeSpec {
+                        small: true,
+                        click_kind: BadgeClickKind::Clicked,
+                        override_color: p.tint,
+                        ..BadgeSpec::new("node", p.label.clone(), BadgeKind::Generic)
+                    };
                     rsx! {
                         // Badge's own `title` carries the pill label; wrap it
                         // so the full id + direction reads on hover (the pill
                         // label is the truncated basename).
                         span { class: "ins-pill", key: "{p.id}", title: "{p.tip}",
                             Badge {
-                                field: "node",
-                                value: "{p.label}",
-                                kind: BadgeKind::Generic,
-                                small: true,
-                                click_kind: BadgeClickKind::Clicked,
-                                override_color: p.tint,
+                                spec,
                                 on_action: move |a| {
                                     if let BadgeAction::Clicked { .. } = a {
                                         selected.set(Some(id.clone()));
@@ -318,15 +319,16 @@ fn active_filter_strip() -> Element {
             for (field, value) in chips {
                 {
                     let kind = badges::badge_kind_for(&field);
+                    let spec = BadgeSpec {
+                        active: true,
+                        with_x: true,
+                        small: true,
+                        ..BadgeSpec::new(field.clone(), value.clone(), kind)
+                    };
                     rsx! {
                         Badge {
                             key: "{field}={value}",
-                            field: "{field}",
-                            value: "{value}",
-                            kind,
-                            active: true,
-                            with_x: true,
-                            small: true,
+                            spec,
                             on_action: move |a| {
                                 if let BadgeAction::Toggle { field, value } = a {
                                     filter::edit_filters(|q| q.toggle_field_filter(&field, &value));
@@ -466,33 +468,34 @@ fn browse_tags() -> Element {
                 }
                 div { class: "ins-chips",
                     for (value, count, active) in ranked {
-                        {
-                            let label = format!("{value} ({count})");
-                            let v = value.clone();
-                            rsx! {
-                                Badge {
-                                    key: "{value}",
-                                    field: "tags",
-                                    value: "{label}",
-                                    kind: BadgeKind::Tag,
-                                    active,
-                                    small: true,
-                                    on_action: move |a| {
-                                        // The badge's value carries the composite
-                                        // "name (count)" label; route the raw tag
-                                        // value through the toggle instead so
-                                        // subsequent renders re-match.
-                                        if let BadgeAction::Toggle { .. } = a {
-                                            let v = v.clone();
-                                            filter::edit_filters(move |q| {
-                                                q.toggle_field_filter("tags", &v)
-                                            });
-                                        }
-                                    },
-                                }
+                    {
+                        let label = format!("{value} ({count})");
+                        let v = value.clone();
+                        let spec = BadgeSpec {
+                            active,
+                            small: true,
+                            ..BadgeSpec::new("tags", label, BadgeKind::Tag)
+                        };
+                        rsx! {
+                            Badge {
+                                key: "{value}",
+                                spec,
+                                on_action: move |a| {
+                                    // The badge's value carries the composite
+                                    // "name (count)" label; route the raw tag
+                                    // value through the toggle instead so
+                                    // subsequent renders re-match.
+                                    if let BadgeAction::Toggle { .. } = a {
+                                        let v = v.clone();
+                                        filter::edit_filters(move |q| {
+                                            q.toggle_field_filter("tags", &v)
+                                        });
+                                    }
+                                },
                             }
                         }
                     }
+                }
                 }
             }
         }

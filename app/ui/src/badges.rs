@@ -17,7 +17,7 @@
 #![allow(dead_code)] // adopters land with the panel ports
 
 use dioxus::prelude::*;
-use panel_kit::badge::{Badge, BadgeAction, BadgeClickKind, BadgeKind, Rgb};
+use panel_kit::badge::{Badge, BadgeAction, BadgeClickKind, BadgeKind, BadgeSpec, Rgb};
 use serde_json::Value;
 
 use crate::proto::NodeMeta;
@@ -151,41 +151,46 @@ pub(crate) fn node_badges(
 ) -> Element {
     rsx! {
         for tag in meta.tags.iter() {
-            Badge {
-                field: "tags",
-                value: "{tag}",
-                kind: BadgeKind::Tag,
-                active: is_active("tags", tag),
-                with_plus: true,
-                click_kind: BadgeClickKind::Clicked,
-                override_color: tint,
-                on_action: move |a| on_action.call(a),
+            {
+                let spec = clickable_filter_spec("tags", tag, BadgeKind::Tag, is_active("tags", tag), tint);
+                rsx! {
+                    Badge { spec, on_action: move |a| on_action.call(a) }
+                }
             }
         }
         if let Some(dt) = meta.doctype.as_ref() {
-            Badge {
-                field: "doctype",
-                value: "{dt}",
-                kind: BadgeKind::Doctype,
-                active: is_active("doctype", dt),
-                with_plus: true,
-                click_kind: BadgeClickKind::Clicked,
-                override_color: tint,
-                on_action: move |a| on_action.call(a),
+            {
+                let spec = clickable_filter_spec("doctype", dt, BadgeKind::Doctype, is_active("doctype", dt), tint);
+                rsx! {
+                    Badge { spec, on_action: move |a| on_action.call(a) }
+                }
             }
         }
         if !meta.folder.is_empty() {
-            Badge {
-                field: "folder",
-                value: "{meta.folder}",
-                kind: BadgeKind::Folder,
-                active: is_active("folder", &meta.folder),
-                with_plus: true,
-                click_kind: BadgeClickKind::Clicked,
-                override_color: tint,
-                on_action: move |a| on_action.call(a),
+            {
+                let spec = clickable_filter_spec("folder", &meta.folder, BadgeKind::Folder, is_active("folder", &meta.folder), tint);
+                rsx! {
+                    Badge { spec, on_action: move |a| on_action.call(a) }
+                }
             }
         }
+    }
+}
+
+/// Badge spec for chips whose body click selects and plus click filters.
+fn clickable_filter_spec(
+    field: &str,
+    value: &str,
+    kind: BadgeKind,
+    active: bool,
+    tint: Option<Rgb>,
+) -> BadgeSpec {
+    BadgeSpec {
+        active,
+        with_plus: true,
+        click_kind: BadgeClickKind::Clicked,
+        override_color: tint,
+        ..BadgeSpec::new(field, value, kind)
     }
 }
 
@@ -248,15 +253,14 @@ fn scalar_chip(
     tint: Option<Rgb>,
     on_action: EventHandler<BadgeAction>,
 ) -> Element {
+    let spec = BadgeSpec {
+        active: is_active(field, value),
+        override_color: tint,
+        ..BadgeSpec::new(field, value, BadgeKind::Generic)
+    };
+
     rsx! {
-        Badge {
-            field: "{field}",
-            value: "{value}",
-            kind: BadgeKind::Generic,
-            active: is_active(field, value),
-            override_color: tint,
-            on_action: move |a| on_action.call(a),
-        }
+        Badge { spec, on_action: move |a| on_action.call(a) }
     }
 }
 
@@ -277,55 +281,46 @@ fn string_chip(
 
     if let Some((page, alias)) = parse_wikilink(trimmed) {
         let label = alias.unwrap_or_else(|| page.clone());
+        let spec = BadgeSpec {
+            override_color: tint,
+            ..BadgeSpec::new(field, label, BadgeKind::Wikilink { resolved: true, target: page })
+        };
         return rsx! {
-            Badge {
-                field: "{field}",
-                value: "{label}",
-                kind: BadgeKind::Wikilink { resolved: true, target: page },
-                override_color: tint,
-                on_action: move |a| on_action.call(a),
-            }
+            Badge { spec, on_action: move |a| on_action.call(a) }
         };
     }
 
     if is_url(trimmed) {
         let host = host_from_url(trimmed).unwrap_or_default();
+        let spec = BadgeSpec {
+            override_color: tint,
+            ..BadgeSpec::new(field, trimmed, BadgeKind::Url { href: trimmed.to_string(), host })
+        };
         return rsx! {
-            Badge {
-                field: "{field}",
-                value: "{trimmed}",
-                kind: BadgeKind::Url { href: trimmed.to_string(), host },
-                override_color: tint,
-                on_action: move |a| on_action.call(a),
-            }
+            Badge { spec, on_action: move |a| on_action.call(a) }
         };
     }
 
     // Status pill: dark fill, semantic stroke + text colour, click toggles
     // the (field, value) filter — modal/badges.rs::status_pill.
     if let Some(color) = status_color(trimmed) {
+        let spec = BadgeSpec {
+            small: true,
+            ..BadgeSpec::new(field, trimmed, BadgeKind::Status)
+        };
         return rsx! {
-            Badge {
-                field: "{field}",
-                value: "{trimmed}",
-                kind: BadgeKind::Status,
-                accent_color: color,
-                small: true,
-                on_action: move |a| on_action.call(a),
-            }
+            Badge { spec, accent_color: Some(color.to_string()), on_action: move |a| on_action.call(a) }
         };
     }
 
     // Date chip: yellow stroke, click toggles — modal/badges.rs::date_badge.
     if is_iso_date(trimmed) {
+        let spec = BadgeSpec {
+            small: true,
+            ..BadgeSpec::new(field, trimmed, BadgeKind::Date)
+        };
         return rsx! {
-            Badge {
-                field: "{field}",
-                value: "{trimmed}",
-                kind: BadgeKind::Date,
-                small: true,
-                on_action: move |a| on_action.call(a),
-            }
+            Badge { spec, on_action: move |a| on_action.call(a) }
         };
     }
 
@@ -334,14 +329,15 @@ fn string_chip(
     // `navigate_to = ticket` routing, folded into the action stream as
     // `Navigate` so adopters keep one match.
     if let Some(ticket) = parse_ticket_id(trimmed) {
+        let spec = BadgeSpec {
+            small: true,
+            click_kind: BadgeClickKind::Clicked,
+            ..BadgeSpec::new(field, trimmed, BadgeKind::Generic)
+        };
         return rsx! {
             Badge {
-                field: "{field}",
-                value: "{trimmed}",
-                kind: BadgeKind::Generic,
-                accent_color: "var(--yellow)",
-                small: true,
-                click_kind: BadgeClickKind::Clicked,
+                spec,
+                accent_color: Some("var(--yellow)".to_string()),
                 on_action: move |a| match a {
                     BadgeAction::Clicked { .. } => {
                         on_action.call(BadgeAction::Navigate { target: ticket.clone() })
@@ -361,16 +357,14 @@ fn string_chip(
     // filter is active and the cramped one-shot button otherwise — same
     // split here via the `small` flag.
     let active = is_active(field, trimmed);
+    let spec = BadgeSpec {
+        active,
+        small: !active,
+        override_color: if active { tint } else { None },
+        ..BadgeSpec::new(field, trimmed, BadgeKind::Generic)
+    };
     rsx! {
-        Badge {
-            field: "{field}",
-            value: "{trimmed}",
-            kind: BadgeKind::Generic,
-            active,
-            small: !active,
-            override_color: if active { tint } else { None },
-            on_action: move |a| on_action.call(a),
-        }
+        Badge { spec, on_action: move |a| on_action.call(a) }
     }
 }
 

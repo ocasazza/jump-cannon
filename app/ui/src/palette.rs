@@ -20,8 +20,8 @@
 //! PARITY GAPs (see `parity_gap` and the per-arm comments in
 //! `run_builtin`): Reset Style, New Graph Tab and the Go-to-section
 //! actions are registered for palette parity but disabled — their targets
-//! (panels::style's private state, the panel-kit workspace handle inside
-//! main.rs::use_workspace) are unreachable from this module.
+//! (panels::style's private state, the host-owned panel workspace in
+//! main.rs) are unreachable from this module.
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
@@ -853,8 +853,8 @@ fn seed_default_actions(reg: &mut ActionRegistry) {
         handler: ActionHandler::Builtin(B::ResetStyle),
     });
 
-    // PARITY GAP: panel open/restore state lives in main.rs's
-    // `use_workspace` hook — not reachable from a module-level dispatch.
+    // PARITY GAP: panel open/restore state lives in main.rs's host-owned
+    // workspace state — not reachable from a module-level dispatch.
     // Only offer sections the active view's workspace actually holds: the
     // registry is built once per page load and the view switcher reloads
     // the page, so a boot-time filter is exact (a restore of a panel the
@@ -1545,7 +1545,7 @@ fn execute_action(action_id: &str, params: HashMap<String, ParamValue>) {
 ///
 /// PARITY GAP: the egui version also opened the Filter sidebar section so
 /// the user sees the addition land; panel open state lives in main.rs's
-/// `use_workspace` and is not reachable from here.
+/// host-owned workspace state and is not reachable from here.
 fn append_filter_card(field: String, value: String) {
     filter::edit_filters(|q| {
         let needs_connector = !matches!(
@@ -1688,8 +1688,8 @@ fn run_builtin(variant: BuiltinAction, params: &HashMap<String, ParamValue>) -> 
             crate::panels::style::reset_to_defaults();
             serde_json::json!({ "style": "defaults" })
         }
-        // egui: `state.set_section_open(sec, true)` — here a restore+raise
-        // request the App root drains into `Workspace::restore`.
+        // egui: `state.set_section_open(sec, true)` — here the App root
+        // drains the open-panel request through the active workspace reducer.
         B::JumpToSection(sec) => {
             if let Some(tab) = sec.settings_tab() {
                 crate::panels::settings::select_tab(tab);

@@ -865,12 +865,15 @@ async fn track_apply(mut ctx: Ctx, target: Option<api::SourceSelection>, generat
     };
     // Feed poller: tail the alternate's own progress log while it builds.
     spawn(track_feed(selection.clone(), generation));
+    let source = selection.to_string();
+    let mut last_status_poll_error: Option<String> = None;
     loop {
         if *APPLY_GEN.peek() != generation {
             return;
         }
         match api::source_status(&selection).await {
             Ok(status) => {
+                last_status_poll_error = None;
                 if *APPLY_GEN.peek() != generation {
                     return;
                 }
@@ -885,7 +888,7 @@ async fn track_apply(mut ctx: Ctx, target: Option<api::SourceSelection>, generat
                         let message = status
                             .error
                             .clone()
-                            .unwrap_or_else(|| format!("{selection} failed to build"));
+                            .unwrap_or_else(|| format!("{source} failed to build"));
                         set_apply_state(generation, ApplyState::Error(message));
                         return;
                     }
@@ -905,8 +908,16 @@ async fn track_apply(mut ctx: Ctx, target: Option<api::SourceSelection>, generat
                 }
             }
             // A transient status hiccup while the source comes up is not a
-            // build failure; keep polling.
-            Err(_) => {}
+            // build failure; report the poll failure and keep polling.
+            Err(error) => {
+                if last_status_poll_error.as_deref() != Some(error.as_str()) {
+                    tracing::warn!(
+                        "{}",
+                        api::source_status_poll_warning("importers", &source, &error)
+                    );
+                    last_status_poll_error = Some(error);
+                }
+            }
         }
         gloo_timers::future::TimeoutFuture::new(1000).await;
     }
