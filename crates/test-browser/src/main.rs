@@ -159,6 +159,9 @@ struct HeaderActionCheck {
     secure_context: bool,
     webgpu_available: bool,
     node_count: u64,
+    initial_graph_width: f64,
+    initial_graph_height: f64,
+    initial_graph_framed: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     reason: Option<String>,
     actions: Vec<HeaderActionDetail>,
@@ -1972,6 +1975,47 @@ async fn drive_page(
             canvas_after_click: false,
           };
         });
+        const graphPixels = async () => {
+          const canvas = panel?.querySelector('canvas.graph-canvas');
+          if (!canvas || !canvas.width || !canvas.height) {
+            return { width: 0, height: 0 };
+          }
+          const bitmap = await createImageBitmap(
+            await (await fetch(canvas.toDataURL())).blob()
+          );
+          const sample = document.createElement('canvas');
+          sample.width = bitmap.width;
+          sample.height = bitmap.height;
+          const context = sample.getContext('2d');
+          context.drawImage(bitmap, 0, 0);
+          const pixels = context.getImageData(0, 0, sample.width, sample.height).data;
+          let minX = sample.width;
+          let minY = sample.height;
+          let maxX = -1;
+          let maxY = -1;
+          for (let y = 0; y < sample.height; y += 1) {
+            for (let x = 0; x < sample.width; x += 1) {
+              const i = (y * sample.width + x) * 4;
+              if (pixels[i] > 18 || pixels[i + 1] > 18 || pixels[i + 2] > 18) {
+                minX = Math.min(minX, x);
+                minY = Math.min(minY, y);
+                maxX = Math.max(maxX, x);
+                maxY = Math.max(maxY, y);
+              }
+            }
+          }
+          return {
+            width: maxX >= 0 ? maxX - minX + 1 : 0,
+            height: maxY >= 0 ? maxY - minY + 1 : 0,
+          };
+        };
+        const initialCanvas = panel?.querySelector('canvas.graph-canvas');
+        const initialPixels = await graphPixels();
+        const initialGraphFramed = Boolean(
+          initialCanvas &&
+          initialPixels.width >= initialCanvas.width * 0.25 &&
+          initialPixels.height >= initialCanvas.height * 0.25
+        );
         const nextFrames = () => new Promise((resolve) =>
           requestAnimationFrame(() => requestAnimationFrame(resolve))
         );
@@ -2047,6 +2091,10 @@ async fn drive_page(
         if (!webgpuAvailable) failures.push('navigator.gpu is unavailable');
         if (!renderReady) failures.push('WebGPU render host did not initialize');
         if (nodeCount < 1) failures.push('frontend did not load any graph nodes');
+        if (!initialGraphFramed) failures.push(
+          `initial graph is under-framed: ${initialPixels.width}x${initialPixels.height} ` +
+          `inside ${canvas?.width || 0}x${canvas?.height || 0}`
+        );
         return {
           ok: failures.length === 0,
           action_count: buttons.length,
@@ -2060,6 +2108,9 @@ async fn drive_page(
           secure_context: secureContext,
           webgpu_available: webgpuAvailable,
           node_count: nodeCount,
+          initial_graph_width: initialPixels.width,
+          initial_graph_height: initialPixels.height,
+          initial_graph_framed: initialGraphFramed,
           reason: failures.length ? failures.join('; ') : null,
           actions: details,
         };

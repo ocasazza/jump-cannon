@@ -245,8 +245,13 @@ pub struct GraphPipelines {
     /// the egui port, which paused via dt/settings instead.)
     sim_running: bool,
 
-    /// GMap-style cluster region underlay. Built in `new`; its compute
-    /// bind group is wired to the shared buffers in `load`.
+    /// Refit once after the first GPU position readback. The physics layout
+    /// mutates the shared positions buffer before the asynchronous CPU mirror
+    /// catches up, so the load-time fit can otherwise frame only the seed.
+    refit_after_layout_readback: bool,
+    refit_pending: bool,
+
+    /// GMap-style cluster region underlay.
     region: Option<RegionMap>,
 }
 
@@ -438,6 +443,8 @@ impl GraphPipelines {
             screen_px: [1.0, 1.0],
             effects: EffectsUniform::default(),
             sim_running: true,
+            refit_after_layout_readback: false,
+            refit_pending: false,
             region: Some(RegionMap::new(device, color_format)),
         }
     }
@@ -656,6 +663,7 @@ impl GraphPipelines {
         });
 
         let colors_base = graph.colors.clone();
+        let has_layout = layout.is_some();
         let sizes_base = graph.sizes.clone();
         self.buffers = Some(Buffers {
             positions,
@@ -700,9 +708,11 @@ impl GraphPipelines {
             }
         }
 
-        // Auto-fit the camera to the loaded graph so the bootstrap frame
-        // shows something visible.
+        // Auto-fit the seed immediately, then correct the framing after the
+        // running GPU layout has produced its first CPU-visible positions.
         self.fit_to_loaded_bounds();
+        self.refit_after_layout_readback = has_layout;
+        self.refit_pending = false;
 
         Ok(())
     }
@@ -749,6 +759,10 @@ impl GraphPipelines {
         queue: &wgpu::Queue,
         encoder: &mut wgpu::CommandEncoder,
     ) {
+        if self.refit_pending {
+            self.fit_to_loaded_bounds();
+            self.refit_pending = false;
+        }
         let sim_running = self.sim_running;
         // Resolve the region auto-level for this frame from the current
         // camera framing before borrowing `self.buffers` (bounds() reads
@@ -774,13 +788,16 @@ impl GraphPipelines {
         //   1. drain any completed map (Done -> Idle, copy bytes into
         //      positions_cpu)
         //   2. if previous frame parked us at CopyScheduled, the host has
-        //      since submitted that encoder, so it's safe to issue
-        //      map_async now
+        //      since submitted that encoder, so it's safe to issue map_async
+        //      on the next call
+        let positions_refreshed = Self::drain_positions_readback_inner(b);
+        if positions_refreshed && self.refit_after_layout_readback {
+            self.refit_after_layout_readback = false;
+            self.refit_pending = true;
+        }
         //   3. run the compute layout
         //   4. if state is Idle and the throttle period elapsed, record
         //      a fresh copy + park at CopyScheduled
-        Self::drain_positions_readback_inner(b);
-
         let was_copy_scheduled = matches!(
             b.positions_readback.lock().ok().as_deref(),
             Some(PositionsReadbackState::CopyScheduled)
@@ -871,14 +888,14 @@ impl GraphPipelines {
     /// padding back to vec3), unmap the staging buffer, and reset the
     /// readback state to `Idle`. No-op if no completed map is waiting.
     /// Mirrors `drain_energy_readback`.
-    fn drain_positions_readback_inner(b: &mut Buffers) {
+    fn drain_positions_readback_inner(b: &mut Buffers) -> bool {
         // Briefly hold the lock to inspect state. We must NOT read the
         // mapped range while holding the mutex, since the buffer view
         // implicitly retains state inside wgpu and we want the lock
         // dropped before re-entering wgpu APIs.
         let map_succeeded = {
             let Ok(mut guard) = b.positions_readback.lock() else {
-                return;
+                return false;
             };
             match &*guard {
                 PositionsReadbackState::Done(Ok(())) => true,
@@ -886,13 +903,13 @@ impl GraphPipelines {
                     // Map failures are rare and self-recovering — silently
                     // reset to Idle. No unmap needed (never mapped).
                     *guard = PositionsReadbackState::Idle;
-                    return;
+                    return false;
                 }
-                _ => return, // Idle / CopyScheduled / Mapping: nothing to drain.
+                _ => return false, // Idle / CopyScheduled / Mapping: nothing to drain.
             }
         };
         if !map_succeeded {
-            return;
+            return false;
         }
 
         // Lock dropped — safe to enter wgpu again. The staging buffer is
@@ -926,6 +943,7 @@ impl GraphPipelines {
         if let Ok(mut g) = b.positions_readback.lock() {
             *g = PositionsReadbackState::Idle;
         }
+        true
     }
 
     /// Camera + effects uniform writes. Called per frame after `compute_step`.
