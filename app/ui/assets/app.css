@@ -30,8 +30,8 @@
 .panel-kit-boot-col { display:flex; flex-direction:column; gap:8px; min-width:0; min-height:0; }
 .panel-kit-boot-col-left { flex:640 1 0; }
 .panel-kit-boot-col-right { flex:608 1 0; }
-.panel-kit-boot-panel { position:relative; min-width:0; min-height:70px; border:1px solid #3a3a3a;
-  border-radius:4px; background:#0d0d0d; box-shadow:0 6px 24px #0007; overflow:hidden; }
+.panel-kit-boot-panel { position:relative; min-width:0; min-height:70px; border:1px solid #5f5f5f;
+  border-radius:4px; background:#0d0d0d; overflow:hidden; }
 .panel-kit-boot-graph { flex:620 1 0; }
 .panel-kit-boot-progress-panel { flex:200 1 0; }
 .panel-kit-boot-nodes { flex:620 1 0; }
@@ -59,7 +59,9 @@
 #main[data-dioxus-id] + .panel-kit-boot[data-panel-kit-static-boot] { display:none; }
 @media (max-width:680px) { .panel-kit-boot-panels { flex-direction:column; }
   .panel-kit-boot-col { flex:1 1 auto; } .panel-kit-boot-settings { display:none; } }
-@media (prefers-reduced-motion:reduce) { .panel-kit-boot-progress-bar { animation:none; width:100%; } }
+@media (prefers-reduced-motion:reduce) {
+  .panel-kit-boot-progress-bar { animation:none; width:40%; transform:none; }
+}
 
 /* Shared utility: label text exposed to assistive tech but not painted.
    Panels pair a visible control with an sr-only <label for=…>, so without
@@ -83,10 +85,9 @@
 
 .topbar .activity.idle { color:var(--dim); animation:none; }
 
-/* Tiling: the graph's full-width default moved into default_layout's
-   .with_tile(4, 3) — panel-kit 0.2 renders snapped tile spans inline, so a
-   CSS flex/height override here would be dead (inline wins) and would fight
-   the user's grip-resizes. */
+/* Tiling spans belong to default_layout: panel-kit 1.0 renders them as inline
+   CSS-grid spans, so app CSS must not impose panel height constraints that
+   fight the grid or the user's grip-resizes. */
 
 /* Node browser / search result lists */
 .browse, .search { display:flex; flex-direction:column; gap:.4rem; height:100%; min-height:0; }
@@ -220,7 +221,6 @@ input.nodes-search { flex:1 1 auto; min-width:7rem; }
   .nodes-focus-body { padding:.5rem .6rem .6rem; }
 }
 
-.ws.tiling .panel-nodes { min-height:300px; }
 
 /* Inspector */
 .inspector { display:flex; flex-direction:column; gap:.4rem; }

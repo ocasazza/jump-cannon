@@ -250,11 +250,6 @@ struct LegacyWorkspaceLayout {
     tiling: bool,
 }
 
-#[derive(Serialize, Deserialize)]
-struct WorkspaceLayout {
-    panels: Vec<PanelWin<Panel>>,
-    tiling: bool,
-}
 
 fn current_panel(kind: LegacyPanel) -> Option<Panel> {
     Some(match kind {
@@ -291,7 +286,7 @@ fn convert_panel<K>(panel: PanelWin<K>, kind: Panel) -> PanelWin<Panel> {
     // editor-style Nodes workbench. Upgrade that exact legacy span while
     // preserving every explicitly different user size.
     let (tile_w, tile_h) = if kind == Panel::Nodes && panel.tile_w == 1 && panel.tile_h == 2 {
-        (2, 4)
+        (2, 5)
     } else {
         (panel.tile_w, panel.tile_h)
     };
@@ -314,7 +309,11 @@ fn convert_panel<K>(panel: PanelWin<K>, kind: Panel) -> PanelWin<Panel> {
 /// legacy dock chips are simply removed.
 fn convert_legacy_layout(
     legacy: LegacyWorkspaceLayout,
-) -> (WorkspaceLayout, Option<panels::settings::SettingsTab>) {
+    viewport: (f64, f64),
+) -> (
+    panel_kit::SavedLayoutV2<Panel>,
+    Option<panels::settings::SettingsTab>,
+) {
     let visible_config = legacy
         .panels
         .iter()
@@ -344,23 +343,45 @@ fn convert_legacy_layout(
     }
 
     (
-        WorkspaceLayout {
+        panel_kit::SavedLayoutV2 {
+            version: panel_kit::LAYOUT_SCHEMA_VERSION,
+            units: panel_kit::Units::CssPx,
+            viewport,
+            mode: if legacy.tiling {
+                panel_kit::Mode::Tiling
+            } else {
+                panel_kit::Mode::Floating
+            },
             panels,
-            tiling: legacy.tiling,
         },
         visible_config.map(|(_, _, tab)| tab),
     )
 }
 
+fn browser_viewport() -> (f64, f64) {
+    let window = web_sys::window();
+    let width = window
+        .as_ref()
+        .and_then(|window| window.inner_width().ok())
+        .and_then(|value| value.as_f64())
+        .unwrap_or(1280.0);
+    let height = window
+        .and_then(|window| window.inner_height().ok())
+        .and_then(|value| value.as_f64())
+        .unwrap_or(800.0);
+    (width, height)
+}
+
 fn migrate_workspace_layout() {
-    if LocalStorage::get::<WorkspaceLayout>(WORKSPACE_LAYOUT_KEY).is_ok() {
+    if LocalStorage::get::<panel_kit::StoredLayout<Panel>>(WORKSPACE_LAYOUT_KEY).is_ok() {
         return;
     }
+    let viewport = browser_viewport();
     for key in LEGACY_WORKSPACE_LAYOUT_KEYS {
         let Ok(legacy) = LocalStorage::get::<LegacyWorkspaceLayout>(key) else {
             continue;
         };
-        let (layout, tab) = convert_legacy_layout(legacy);
+        let (layout, tab) = convert_legacy_layout(legacy, viewport);
         if LocalStorage::set(WORKSPACE_LAYOUT_KEY, layout).is_ok() {
             if let Some(tab) = tab {
                 panels::settings::select_tab(tab);
@@ -398,13 +419,13 @@ fn default_layout() -> Vec<PanelWin<Panel>> {
     // Floating mode: the 1280px browser-regression viewport can show both
     // primary surfaces without overlap. The Nodes panel is wide enough for
     // its navigator + focused-content split.
-    // Tiling mode: the graph starts full-width × 3 rows (with_tile replaces
-    // the old .panel-graph CSS override; the grip resizes it in snapped
-    // steps now).
+    // Tiling mode: the graph starts full-width × 3 rows, while Nodes gets five
+    // grid rows so its editor split remains usable at the regular-tier row
+    // floor. Spans replace the old panel-height CSS overrides.
     v.extend([
         b.at(Panel::Graph, 12.0, 44.0, 640.0, 620.0).with_tile(4, 3),
         b.at(Panel::Nodes, 660.0, 44.0, 608.0, 620.0)
-            .with_tile(2, 4),
+            .with_tile(2, 5),
         b.at(Panel::Progress, 12.0, 672.0, 640.0, 200.0),
         b.at(Panel::Settings, 660.0, 672.0, 608.0, 420.0)
             .with_tile(2, 3),
@@ -1443,11 +1464,14 @@ fn App() -> Element {
             class: ws.root_class(),
             tabindex: "0",
             autofocus: true,
-            onmousemove: move |e| ws.handle_mouse_move(&e),
-            onmouseup: move |_| ws.handle_mouse_up(),
-            // WASDQE camera pan + Shift boost, F fit, C toggle follow
-            // centroid, ⇧C snap to center. Single-key shortcuts must not
-            // fire while the user is typing in an input/textarea.
+            onpointermove: move |e| ws.handle_pointer_move(&e),
+            onpointerup: move |e| ws.handle_pointer_up(&e),
+            onpointercancel: move |e| ws.handle_pointer_up(&e),
+            // WASDQE camera pan + Shift boost, F fit while workspace focus is
+            // clear, and C toggle follow / ⇧C snap to center. Focused panels
+            // receive panel-kit's canonical keyboard window management.
+            // Single-key camera shortcuts must not fire while the user is
+            // typing in an input/textarea.
             onkeydown: move |e: KeyboardEvent| {
                 // Palette chord first: it must open even while an input has
                 // focus, and a consumed event never reaches the camera.
@@ -1455,6 +1479,7 @@ fn App() -> Element {
                     return;
                 }
                 if panel_kit::is_editing() {
+                    ws.handle_key(&e);
                     render::clear_keys();
                     return;
                 }
@@ -1469,6 +1494,8 @@ fn App() -> Element {
                     }
                     return;
                 }
+                let panel_focused = ws.focused().is_some();
+                ws.handle_key(&e);
                 match e.key() {
                     Key::Shift => render::key_event("Shift", true),
                     Key::Character(c) => {
@@ -1480,7 +1507,9 @@ fn App() -> Element {
                         if chord {
                             render::key_event(&c, true);
                         } else if c.eq_ignore_ascii_case("f") {
-                            render::fit_camera();
+                            if !panel_focused {
+                                render::fit_camera();
+                            }
                         } else if c.eq_ignore_ascii_case("c") {
                             // Auto-repeat guard: held-C must not strobe the
                             // follow-centroid toggle.
@@ -1590,7 +1619,8 @@ impl PartialEq for ViewWs {
             && self.0.mode == other.0.mode
             && self.0.drag == other.0.drag
             && self.0.tile_drag == other.0.tile_drag
-            && self.0.is_mobile == other.0.is_mobile
+            && self.0.profile == other.0.profile
+            && self.0.focused == other.0.focused
             && self.0.viewport == other.0.viewport
             && self.0.ws_scroll == other.0.ws_scroll
     }

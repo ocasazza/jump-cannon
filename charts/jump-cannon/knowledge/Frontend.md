@@ -11,6 +11,14 @@ tags: [jump-cannon, frontend, dioxus, wgpu]
 `app/ui` is Dioxus 0.6 compiled to WASM. panel-kit owns generic workspace
 behavior; Jump Cannon owns panels, graph interactions, API calls, and app CSS.
 wgpu draws the graph and `graph-layouts` supplies in-process layout compute.
+
+panel-kit 1.0 is the workspace contract. Its `SurfaceProfile` selects compact,
+tablet, or regular layout and pointer capability; root pointer events and
+keyboard window-management commands are routed through `Workspace`. Workspace
+storage reads legacy V1 records but writes `SavedLayoutV2` in CSS-pixel units;
+Jump Cannon's v6-v8 panel-enum migration also emits V2 before `use_workspace`
+reconciles it to the live viewport.
+
 The renderer requires browser WebGPU; there is no WebGL compute fallback. On
 an insecure origin or a browser without a usable adapter, the Graph panel shows
 an actionable unavailable state while Nodes and the rest of the workspace stay

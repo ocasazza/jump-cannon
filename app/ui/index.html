@@ -7,11 +7,11 @@
          and the canvas backdrop dark from the very first frame. -->
     <meta name="color-scheme" content="dark" />
     <title>Jump Cannon</title>
-    <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'><rect width='64' height='64' rx='12' fill='%2309090a'/><circle cx='18' cy='32' r='8' fill='%23389cf6'/><circle cx='32' cy='32' r='8' fill='%23f6be3c'/><circle cx='46' cy='32' r='8' fill='%23ee60c2'/></svg>" />
+    <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'><rect width='64' height='64' rx='12' fill='%230a0a0a'/><circle cx='18' cy='32' r='8' fill='%233b9bff'/><circle cx='32' cy='32' r='8' fill='%23ffbd2e'/><circle cx='46' cy='32' r='8' fill='%23ff5fc3'/></svg>" />
     <!-- The only styling permitted outside app.css: the document must paint a
          dark surface before any external stylesheet resolves, so these
          pre-paint essentials are inlined to kill the first-load white flash. -->
-    <style>html,body{margin:0;background:#09090a;color-scheme:dark}</style>
+    <style>html,body{margin:0;background:#0a0a0a;color:#ededed;color-scheme:dark}</style>
     <!-- This CSS must load before the Rust module so the static Panel Kit boot
          shell can paint while Trunk downloads and instantiates the app WASM. -->
     <link data-trunk rel="css" href="assets/app.css" />
