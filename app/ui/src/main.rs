@@ -1701,7 +1701,7 @@ fn render_workspace(workspace: PanelWorkspace, ctx: Ctx) -> Element {
                 {render_projected_panel(projected, &workspace.catalog, emit.clone(), ctx)}
             }
         }
-        {dock::dock(frame.dock, &workspace.catalog, emit)}
+        {dock::dock(frame.dock, &workspace.catalog, emit, None)}
     }
 }
 
@@ -1977,8 +1977,8 @@ mod workspace_migration_tests {
     use panel_kit_core::persist::{apply_save_decision, LayoutStore, SavePolicy};
     use panel_kit_core::reducer::{reduce, ResizePolicy, Snapshot, Viewport, WorkspaceEvent};
     use panel_kit_core::{
-        ChromeMetrics, Clamp, CommandStep, Mode, PanelCatalog, PanelCommand, TileMetrics, Units,
-        WinState,
+        ChromeMetrics, Clamp, CommandStep, Mode, PanelCatalog, PanelCommand, SnapPolicy,
+        TileMetrics, Units, WinState,
     };
 
     use super::{
@@ -2153,6 +2153,11 @@ mod workspace_migration_tests {
             clamp: &Clamp::WEB,
             command_step: CommandStep::WEB,
             tile: &TileMetrics::WEB,
+            snap: SnapPolicy {
+                resize: false,
+                move_: false,
+                ..SnapPolicy::default()
+            },
         }
     }
 }

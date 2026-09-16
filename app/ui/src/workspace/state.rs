@@ -15,7 +15,9 @@ use panel_kit_core::persist::{
     apply_save_decision, restore_snapshot, LayoutError, RestoreContext, SavePolicy,
 };
 use panel_kit_core::reducer::{reduce, ResizePolicy, Snapshot, Viewport, WorkspaceEvent};
-use panel_kit_core::{ChromeMetrics, Clamp, CommandStep, Mode, PanelCatalog, TileMetrics, Units};
+use panel_kit_core::{
+    ChromeMetrics, Clamp, CommandStep, Mode, PanelCatalog, SnapPolicy, TileMetrics, Units,
+};
 
 use crate::Panel;
 
@@ -155,6 +157,12 @@ pub(crate) fn reduce_context(
         clamp: &Clamp::WEB,
         command_step: CommandStep::WEB,
         tile: &TileMetrics::WEB,
+        // Preserve continuous floating drag/resize; tiling span resize stays snapped.
+        snap: SnapPolicy {
+            resize: false,
+            move_: false,
+            ..SnapPolicy::default()
+        },
     }
 }
 
