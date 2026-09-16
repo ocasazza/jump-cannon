@@ -100,15 +100,18 @@ stages and fractions while it runs.
 
 ## Parameterised sources
 
-A catalog source may declare **parameters** — instance-level variables whose
-values are bound at apply time rather than at rollout. Parameters are discoverable
-through `GET /importers/sources/{source-id}/parameters`, which returns live
-(bounded, cached 60 s) discovered values or falls back to static lists. The
+A package's declared `parser.variables` entries are the single authoritative
+parameter list: every package variable is pickable at apply time rather than
+only at rollout. `GET /importers/sources/{source-id}/parameters` enumerates
+them all, returning live (bounded, cached 60 s) discovered values where a
+catalog **parameter** of the same name declares discovery. The catalog's
+optional `parameters` map is UI metadata overlaid on package variables by
+name — label, pre-selected default, static values, live discovery. The
 catalog schema for an httpjson source gains:
 
 ```yaml
 parameters:                                    # optional
-  bank:                                        # parameter name (must match a package variable without a default)
+  bank:                                        # parameter name (must match a package variable)
     label: Memory bank                         # UI label
     default: omp                               # optional; omitted = parameter is required
     values: ["omp", "jira-ithelp"]             # optional static list (overridden by discover)
@@ -119,10 +122,13 @@ parameters:                                    # optional
       label_pointer: /name
 ```
 
-When a user selects a source with parameters, the frontend picks values and
-encodes them as a **selection string**: `<source-id>` or
-`<source-id>?<k1>=<v1>&<k2>=<v2>` (params sorted by key, URL-encoded, only
-declared names). The string is stored in sessionStorage and sent as
+When a user selects a source, the frontend picks values and encodes them as a
+**selection string**: `<source-id>` or `<source-id>?<k1>=<v1>&<k2>=<v2>`
+(params sorted by key, URL-encoded, any declared package variable name).
+Catalog-declared parameters always ride the string (picked value or
+default); package-only variables ride it only when changed from their
+default, so an untouched source keeps its historical string. The string is
+stored in sessionStorage and sent as
 `x-jump-cannon-source` on every request. graph-api treats
 `(source-id, params)` as a distinct build target: `POST
 /importers/sources/{selection}/build` starts a dedicated importer task with
@@ -197,7 +203,8 @@ in-cluster service: `chembl-pharmacology.toml` (EMBL-EBI ChEMBL — approved
 molecules, human protein targets, the mechanism-of-action records that bridge
 molecule to target, and drug indications; ~29.6k nodes and ~22.5k edges at
 `max_phase = 4`) and `openalex-works.toml` (OpenAlex — one ranked page of a
-search scope plus the citation edges among those works). Both need node
+search scope plus the citation edges among those works; the `count` package
+variable sizes the page, default 200, OpenAlex's per-page cap). Both need node
 egress to the open internet, so they build only where the pod has it and fail
 loudly with the endpoint in the message where it does not. ChEMBL ships some
 measurements as numeric strings (`full_mwt` is `"383.41"`), which is why the

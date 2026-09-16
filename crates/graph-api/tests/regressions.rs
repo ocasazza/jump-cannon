@@ -1897,6 +1897,80 @@ async fn parameters_route_discovers_values_and_falls_back_on_error() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Control-surface parity: the package's declared `[[parser.variables]]` are
+/// the authoritative parameter list. A source whose catalog declares NO
+/// `parameters` map still gets a picker per package variable (label defaults
+/// to the variable name, default and description from the package), and a
+/// selection may pick any package variable — not just catalog-declared
+/// parameters.
+#[tokio::test]
+async fn parameters_route_enumerates_package_variables_without_catalog_parameters() {
+    let (dir, catalog) = param_packages_fixture(
+        "parity",
+        serde_json::json!({
+            "httpJson": {
+                "package": "hindsight.toml",
+                "endpoint": "http://hindsight.invalid",
+                "variables": { "tenant": "default" }
+            }
+        }),
+    );
+    let host = packages_host(&dir, &catalog, Some(SWITCH_GROUP));
+    let app = graph_api::router_with_host(host.clone());
+
+    let response = app
+        .oneshot(parameters_request("hindsight", Some(SWITCH_GROUP)))
+        .await
+        .expect("parameters served");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = json_body(response).await;
+    let tenant = &body["parameters"]["tenant"];
+    assert!(tenant.is_object(), "tenant is a picker: {body}");
+    assert_eq!(tenant["label"], "tenant", "no catalog label: the variable name");
+    assert_eq!(tenant["default"], "default", "package default pre-selects");
+    assert!(
+        tenant["description"].as_str().unwrap_or("").contains("Tenant"),
+        "the package description rides along: {tenant}"
+    );
+    let bank = &body["parameters"]["bank"];
+    assert!(bank.is_object(), "bank is a picker: {body}");
+    assert!(bank["default"].is_null(), "bank is required: no default");
+    assert_eq!(
+        body["parameters"].as_object().unwrap().len(),
+        2,
+        "exactly the package's declared variables: {body}"
+    );
+
+    // A selection picking `bank` — a package variable, not a catalog
+    // parameter — is accepted and spawns the build (202).
+    let app = graph_api::router_with_host(host.clone());
+    let response = app
+        .oneshot(source_request("/graph/ids", "hindsight?bank=omp", Some(SWITCH_GROUP)))
+        .await
+        .expect("served");
+    assert_eq!(
+        response.status(),
+        StatusCode::ACCEPTED,
+        "picking any package variable is a valid selection"
+    );
+
+
+    // A selection naming a variable the package does not declare is a 400
+    // naming the declared variables — the package-aware coverage check is
+    // the gate the sync layer defers to. (`bank` rides along so the
+    // required-variable check passes and the name check is what fires.)
+    let response = graph_api::router_with_host(host)
+        .oneshot(source_request("/graph/ids", "hindsight?bank=omp&quer=x", Some(SWITCH_GROUP)))
+        .await
+        .expect("served");
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = text_body(response).await;
+    assert!(body.contains("quer"), "the error names the bogus variable: {body}");
+    assert!(body.contains("bank"), "the error lists declared variables: {body}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// GET/PUT /importers/:id/variables: the declared/current contract with the
 /// catalog's read posture, switch-gated mutation, key validation against the
 /// package's declared variables, persistence to `variables.local.json`, the

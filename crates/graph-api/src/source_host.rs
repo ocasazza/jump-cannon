@@ -450,8 +450,10 @@ pub struct ParameterValue {
 
 /// One parameter's resolved picker: its label, pre-selected default, the
 /// available values (discovered first, then static, deduped by id), whether
-/// discovery ran successfully, and any discovery error (values then fall back
-/// to the static list).
+/// discovery ran successfully, any discovery error (values then fall back
+/// to the static list), the package variable's own description, and whether
+/// the catalog declared a parameter for it (vs. a package-only variable the
+/// picker exposes for parity).
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ParameterReport {
     pub label: String,
@@ -460,6 +462,9 @@ pub struct ParameterReport {
     pub discovered: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    pub catalog: bool,
 }
 
 /// `GET /importers/sources/:id/parameters` body: the source id and its
@@ -718,6 +723,9 @@ impl SourceHost {
             outcome = next.set_source_variables(id, variables.clone());
             next
         });
+        // The parameter report pre-selects bound instance variables; a cached
+        // report would keep offering the replaced values.
+        self.write_parameters_cache().remove(id);
         outcome
     }
 
@@ -1133,21 +1141,53 @@ impl SourceHost {
         Ok(report)
     }
 
-    /// Build the per-parameter report for one source. Each parameter with a
-    /// `discover` block is listed live; the static `values` are appended
-    /// (deduped by id). Discovery failures fall back to the static values with
-    /// the error surfaced.
+    /// Build the per-parameter report for one source. The bound package's
+    /// declared `[[parser.variables]]` are the authoritative parameter list:
+    /// every package variable gets a picker, and the catalog's `parameters`
+    /// map is optional UI metadata (label, live discovery, static values,
+    /// pre-selected default) overlaid by variable name. Each parameter with
+    /// a `discover` block is listed live; the static `values` are appended
+    /// (deduped by id). Discovery failures fall back to the static values
+    /// with the error surfaced. When the package cannot be loaded the report
+    /// degrades to the catalog's declared parameters — the build path
+    /// reports the package error loudly.
     async fn compute_parameters(
         &self,
         source_id: &str,
         definition: &ImporterSourceDefinition,
     ) -> ParametersReport {
+        let declared = match self.load_source_package(definition).await {
+            Ok(package) => package_variables(&package),
+            Err(_) => Vec::new(),
+        };
+        // The parameter names to report: every declared package variable,
+        // plus any catalog parameter the package does not declare (a stale
+        // catalog entry stays visible rather than silently vanishing).
+        let mut names: Vec<String> = declared.iter().map(|variable| variable.name.clone()).collect();
+        for name in definition.parameters.keys() {
+            if !names.contains(name) {
+                names.push(name.clone());
+            }
+        }
+        // Statically bound instance variables (httpJson/tvix `variables`) are
+        // the effective current values: the picker pre-selects them so an
+        // Apply cannot silently revert a `PUT /importers/:id/variables` edit
+        // to the package default.
+        let bound = match definition.kind {
+            CatalogSourceKind::HttpJson => {
+                definition.http_json.as_ref().map(|binding| &binding.variables)
+            }
+            CatalogSourceKind::Tvix => definition.tvix.as_ref().map(|binding| &binding.variables),
+            _ => None,
+        };
         let mut parameters = BTreeMap::new();
-        for (name, parameter) in &definition.parameters {
+        for name in names {
+            let variable = declared.iter().find(|variable| variable.name == name);
+            let parameter = definition.parameters.get(&name);
             let mut values: Vec<ParameterValue> = Vec::new();
             let mut discovered = false;
             let mut error = None;
-            if let Some(discover) = &parameter.discover {
+            if let Some(discover) = parameter.and_then(|parameter| parameter.discover.as_ref()) {
                 match self.discover_values(source_id, definition, discover).await {
                     Ok(found) => {
                         discovered = true;
@@ -1158,7 +1198,7 @@ impl SourceHost {
             }
             let mut seen: std::collections::HashSet<String> =
                 values.iter().map(|value| value.id.clone()).collect();
-            for value in &parameter.values {
+            for value in parameter.map(|parameter| parameter.values.as_slice()).unwrap_or(&[]) {
                 if seen.insert(value.clone()) {
                     values.push(ParameterValue {
                         id: value.clone(),
@@ -1169,11 +1209,21 @@ impl SourceHost {
             parameters.insert(
                 name.clone(),
                 ParameterReport {
-                    label: parameter.label.clone(),
-                    default: parameter.default.clone(),
+                    label: parameter
+                        .map(|parameter| parameter.label.clone())
+                        .unwrap_or_else(|| name.clone()),
+                    // Pre-selected value, mirroring `merge_binding_variables`:
+                    // catalog parameter default, else the bound instance
+                    // variable, else the package default.
+                    default: parameter
+                        .and_then(|parameter| parameter.default.clone())
+                        .or_else(|| bound.and_then(|vars| vars.get(&name).cloned()))
+                        .or_else(|| variable.and_then(|variable| variable.default.clone())),
                     values,
                     discovered,
                     error,
+                    description: variable.and_then(|variable| variable.description.clone()),
+                    catalog: parameter.is_some(),
                 },
             );
         }
@@ -1181,6 +1231,38 @@ impl SourceHost {
             source: source_id.to_owned(),
             parameters,
         }
+    }
+
+    /// Load the bound package for one source definition (httpjson or tvix).
+    /// Sources without a package binding — or a missing packages dir — are an
+    /// error here; callers degrade or propagate as appropriate.
+    async fn load_source_package(
+        &self,
+        definition: &ImporterSourceDefinition,
+    ) -> Result<importer::ValidatedPackage, String> {
+        let package_file = match definition.kind {
+            CatalogSourceKind::HttpJson => definition
+                .http_json
+                .as_ref()
+                .map(|binding| binding.package.clone()),
+            CatalogSourceKind::Tvix => {
+                definition.tvix.as_ref().map(|binding| binding.package.clone())
+            }
+            _ => None,
+        }
+        .ok_or_else(|| "source has no package binding".to_owned())?;
+        let packages_dir = self
+            .inner
+            .packages_dir
+            .clone()
+            .ok_or_else(|| "importer packages directory is not configured".to_owned())?;
+        let manifest_path = packages_dir.join(package_file);
+        let package = tokio::task::spawn_blocking(move || {
+            crate::importer_package::load_importer_package(&manifest_path)
+        })
+        .await
+        .map_err(|error| format!("package load task failed: {error}"))??;
+        Ok(package.0)
     }
 
     /// Run one parameter's live discovery against the bound httpjson API,
@@ -1197,18 +1279,7 @@ impl SourceHost {
             .http_json
             .as_ref()
             .ok_or_else(|| "discovery requires an httpJson binding".to_owned())?;
-        let packages_dir = self
-            .inner
-            .packages_dir
-            .clone()
-            .ok_or_else(|| "importer packages directory is not configured".to_owned())?;
-        let manifest_path = packages_dir.join(&http_json.package);
-        let package = tokio::task::spawn_blocking(move || {
-            crate::importer_package::load_importer_package(&manifest_path)
-        })
-        .await
-        .map_err(|error| format!("package load task failed: {error}"))??
-        .0;
+        let package = self.load_source_package(definition).await?;
         let json_config = package.json_config().map_err(|error| error.to_string())?;
         // Template variables: package defaults, overridden by the binding's
         // static variables, overridden by parameter defaults. The variable being
@@ -1279,10 +1350,12 @@ impl SourceHost {
 
     /// Validate that every package variable the bound package requires (no
     /// package default) is covered by the binding's static variables or a
-    /// declared parameter, and that every declared parameter names a real
-    /// package variable. Loads the package on first touch; surfaced as a 400
-    /// so a misconfigured catalog entry fails loudly rather than as an opaque
-    /// 503 build failure. Sources with no package binding are trivially valid.
+    /// declared parameter, that every declared parameter names a real
+    /// package variable, and that every parameter on the selection names a
+    /// real package variable. Loads the package on first touch; surfaced as
+    /// a 400 so a misconfigured catalog entry or selection fails loudly
+    /// rather than as an opaque 503 build failure. Sources with no package
+    /// binding are trivially valid.
     async fn validate_parameter_coverage(
         &self,
         selector: &SourceSelector,
@@ -1319,9 +1392,14 @@ impl SourceHost {
         .map_err(|error| SourceError::BadSelection(format!("package load task failed: {error}")))?
         .map_err(SourceError::BadSelection)?
         .0;
-        let declared = declared_variables(&package);
-        for (name, has_default) in &declared {
-            if *has_default || bound_variables.contains_key(name) || parameters.contains_key(name) {
+        let declared = package_variables(&package);
+        for variable in &declared {
+            let name = &variable.name;
+            if variable.default.is_some()
+                || bound_variables.contains_key(name)
+                || parameters.contains_key(name)
+                || selector.params.contains_key(name)
+            {
                 continue;
             }
             return Err(SourceError::BadSelection(format!(
@@ -1330,7 +1408,7 @@ impl SourceHost {
             )));
         }
         let declared_names: std::collections::HashSet<&str> =
-            declared.iter().map(|(name, _)| name.as_str()).collect();
+            declared.iter().map(|variable| variable.name.as_str()).collect();
         for name in parameters.keys() {
             if !declared_names.contains(name.as_str()) {
                 return Err(SourceError::BadSelection(format!(
@@ -1339,15 +1417,32 @@ impl SourceHost {
                 )));
             }
         }
+        // The selection's own parameters must name declared package
+        // variables too — `validate_selection_params` defers this check here
+        // because it runs without the package. A fresh parameter set always
+        // reaches this validator (its selector key is not yet resident).
+        for key in selector.params.keys() {
+            if !declared_names.contains(key.as_str()) {
+                return Err(SourceError::BadSelection(format!(
+                    "source {id:?} has no variable {key:?}; declared variables: [{}]",
+                    declared
+                        .iter()
+                        .map(|variable| variable.name.clone())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )));
+            }
+        }
         Ok(())
     }
 }
 
 /// Validate a selection's parameters against a source definition without the
-/// package: parameters are only accepted on a package-backed source, and every
-/// supplied key must be a declared parameter of that source. (Declared-vs-
-/// package-variable and required-coverage checks need the package; see
-/// [`SourceHost::validate_parameter_coverage`].)
+/// package: parameters are only accepted on a package-backed source. Every
+/// package variable is selectable, so the per-key name check needs the
+/// package and is deferred to [`SourceHost::validate_parameter_coverage`],
+/// which runs on the first touch of any fresh parameter set (a new
+/// parameter set keys a new alternate, so no selection bypasses it).
 fn validate_selection_params(
     selector: &SourceSelector,
     definition: &ImporterSourceDefinition,
@@ -1358,38 +1453,40 @@ fn validate_selection_params(
     if definition.http_json.is_none() && definition.tvix.is_none() {
         return Err(format!("source {:?} does not accept parameters", selector.id));
     }
-    for key in selector.params.keys() {
-        if !definition.parameters.contains_key(key) {
-            return Err(format!(
-                "source {:?} has no parameter {key:?}; declared parameters: [{}]",
-                selector.id,
-                definition
-                    .parameters
-                    .keys()
-                    .cloned()
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ));
-        }
-    }
     Ok(())
 }
 
-/// The package's declared variables as `(name, has_default)`, engine-aware so
-/// coverage validation works for both httpjson and tvix packages.
-fn declared_variables(package: &importer::ValidatedPackage) -> Vec<(String, bool)> {
+/// One declared `[[parser.variables]]` entry of a package, engine-neutral
+/// across the json and tvix engines.
+struct PackageVariable {
+    name: String,
+    default: Option<String>,
+    description: Option<String>,
+}
+
+/// The package's declared variables, engine-aware so coverage validation and
+/// the parameter report work for both httpjson and tvix packages.
+fn package_variables(package: &importer::ValidatedPackage) -> Vec<PackageVariable> {
     if let Ok(config) = package.json_config() {
         return config
             .variables
             .iter()
-            .map(|variable| (variable.name.clone(), variable.default.is_some()))
+            .map(|variable| PackageVariable {
+                name: variable.name.clone(),
+                default: variable.default.clone(),
+                description: variable.description.clone(),
+            })
             .collect();
     }
     if let Ok(config) = package.tvix_config() {
         return config
             .variables
             .iter()
-            .map(|variable| (variable.name.clone(), variable.default.is_some()))
+            .map(|variable| PackageVariable {
+                name: variable.name.clone(),
+                default: variable.default.clone(),
+                description: variable.description.clone(),
+            })
             .collect();
     }
     Vec::new()
@@ -2258,7 +2355,7 @@ mod tests {
     /// params) and `validate_selection_params` rejects a parameter the source
     /// does not declare.
     #[test]
-    fn source_selector_round_trips_and_rejects_undeclared_params() {
+    fn source_selector_round_trips_and_defers_param_name_checks() {
         // Bare id.
         let bare = SourceSelector::parse("hindsight").expect("bare id parses");
         assert_eq!(bare.id, "hindsight");
@@ -2290,8 +2387,10 @@ mod tests {
         assert!(SourceSelector::parse("hindsight?bank").is_err());
         assert!(SourceSelector::parse("hindsight?bank=a&bank=b").is_err());
 
-        // validate_selection_params: a declared parameter is accepted; an
-        // undeclared one and any parameter on a non-package source are rejected.
+        // validate_selection_params: every parameter name is accepted at this
+        // package-less layer (the name check is the package-aware
+        // validate_parameter_coverage's job); a non-package source rejects
+        // any parameter.
         let mut parameters = BTreeMap::new();
         parameters.insert(
             "bank".to_owned(),
@@ -2322,11 +2421,8 @@ mod tests {
         };
         validate_selection_params(&SourceSelector::parse("s?bank=omp").unwrap(), &http_json)
             .expect("declared parameter accepted");
-        assert!(
-            validate_selection_params(&SourceSelector::parse("s?region=us").unwrap(), &http_json)
-                .is_err(),
-            "an undeclared parameter is rejected"
-        );
+        validate_selection_params(&SourceSelector::parse("s?region=us").unwrap(), &http_json)
+            .expect("any package variable is selectable; the name check is package-aware");
 
         let obsidian = ImporterSourceDefinition {
             http_json: None,

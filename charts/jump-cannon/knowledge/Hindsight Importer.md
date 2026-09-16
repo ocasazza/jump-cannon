@@ -106,6 +106,13 @@ loudly so nobody explores a silently partial memory. Content stays
 read-only (no `/vault/page` editor path): Hindsight owns consolidation,
 and writing facts back through a graph view would bypass it.
 
+A poll tick re-reads the API and content-hashes the records: unchanged
+content keeps the serving snapshot and emits **no progress events** — the
+fetch stages are buffered and dropped, so an idle bank does not flash
+"Fetching …" rows in the Progress panel every interval. Changed content
+(or a failing read) replays the buffered fetch story before the reload
+(or error) proceeds.
+
 ## Bank selection via parameters
 
 The single `hindsight-memory-bank` catalog source is parameterised by `bank`,

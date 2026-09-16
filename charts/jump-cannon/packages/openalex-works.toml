@@ -105,6 +105,14 @@ name = "mailto"
 default = "ops@schrodinger.com"
 description = "Contact address sent as OpenAlex's mailto parameter (polite pool)"
 
+# How many works one request returns. OpenAlex caps `per-page` at 200, and
+# this package fetches one page, so `count` is the import size. Larger
+# scopes need the scope variable narrowed instead.
+[[parser.variables]]
+name = "count"
+default = "200"
+description = "Works imported (one page; OpenAlex caps per-page at 200)"
+
 [[parser.collections]]
 name = "works"
 path = "/works"
@@ -117,7 +125,7 @@ items_pointer = "/results"
 [parser.collections.query]
 search = "{query}"
 mailto = "{mailto}"
-"per-page" = "200"
+"per-page" = "{count}"
 select = "id,display_name,publication_year,cited_by_count,type,doi,language,referenced_works,primary_location"
 
 # One page: the engine's limit/offset walk does not apply to cursor paging.

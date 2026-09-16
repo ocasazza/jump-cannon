@@ -1326,21 +1326,25 @@ fn seed_param_picks(id: &str, params: &api::SourceParameters) {
     *PARAM_CUSTOM.write() = custom;
 }
 
-/// The parameter map for an Apply: every visible parameter, its picked value or
-/// its default. Every parameter the viewer could see is included, so the
-/// selection namespace is explicit and deterministic.
+/// The parameter map for an Apply. Catalog-declared parameters are always
+/// included (picked value or default), so their selection namespace stays
+/// explicit and deterministic. Package-only variables — exposed for parity
+/// but not catalog-declared — are included only when the viewer changed
+/// them away from the default, so applying an untouched source keeps the
+/// same selection string it always had.
 fn selection_params(params: &api::SourceParameters) -> BTreeMap<String, String> {
     let picks = PARAM_PICKS.peek();
     params
         .parameters
         .iter()
-        .map(|(name, param)| {
-            let value = picks
-                .get(name)
-                .cloned()
-                .or_else(|| param.default.clone())
-                .unwrap_or_default();
-            (name.clone(), value)
+        .filter_map(|(name, param)| {
+            let pick = picks.get(name).cloned();
+            let modified = pick.is_some() && pick != param.default;
+            if !param.catalog && !modified {
+                return None;
+            }
+            let value = pick.or_else(|| param.default.clone()).unwrap_or_default();
+            Some((name.clone(), value))
         })
         .collect()
 }
@@ -1365,7 +1369,8 @@ fn chip_params_text(params: &BTreeMap<String, String>) -> String {
 }
 
 /// A short status line under a parameter: any discovery error, else a note that
-/// its values came from live discovery. `None` when there is nothing to say.
+/// its values came from live discovery, else the package variable's own
+/// description. `None` when there is nothing to say.
 fn param_hint(param: &api::SourceParameter) -> Option<String> {
     if let Some(error) = &param.error {
         return Some(format!("discovery failed: {error}"));
@@ -1373,7 +1378,7 @@ fn param_hint(param: &api::SourceParameter) -> Option<String> {
     if param.discovered {
         return Some("values discovered from the source".to_string());
     }
-    None
+    param.description.clone()
 }
 
 /// Update a parameter from its `<select>`: `__custom__` reveals the free-text

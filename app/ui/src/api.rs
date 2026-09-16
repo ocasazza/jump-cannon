@@ -961,8 +961,10 @@ pub struct ParameterValue {
 
 /// One parameter's resolved picker (`GET /importers/sources/{id}/parameters`):
 /// its label, the pre-selected default, the available values (discovered then
-/// static, deduped), whether live discovery succeeded, and any discovery error
-/// (values then fall back to the static list).
+/// static, deduped), whether live discovery succeeded, any discovery error
+/// (values then fall back to the static list), and the package variable's
+/// own description, and whether the catalog declared it (vs. a package-only
+/// variable the picker exposes for parity — both absent on older servers).
 #[derive(Clone, Debug, Deserialize, PartialEq)]
 pub struct SourceParameter {
     pub label: String,
@@ -974,6 +976,10 @@ pub struct SourceParameter {
     pub discovered: bool,
     #[serde(default)]
     pub error: Option<String>,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub catalog: bool,
 }
 
 /// `GET /importers/sources/{id}/parameters` body: the source id and its

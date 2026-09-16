@@ -1521,25 +1521,130 @@ impl Importer for ImportPipeline {
 
     /// Import with the unchanged gate: records whose content hash matches
     /// the last successful import return [`ImportOutcome::Unchanged`]
-    /// without any decode or mapping work. The hash is stored only after a
-    /// fully validated load, so a failing pipeline keeps retrying (and
-    /// reporting) its error on every tick. When the gate lets the import
-    /// proceed, the decode and map phases report through `progress`; an
-    /// unchanged tick reports no decode or map stages.
+    /// without any decode or mapping work — and without any user-visible
+    /// progress. The connector read reports through a buffer that is
+    /// replayed into `progress` only when the gate lets the import proceed
+    /// (or the read fails), so a polling host's idle tick stays silent
+    /// instead of flashing fetch stages that lead nowhere. The hash is
+    /// stored only after a fully validated load, so a failing pipeline
+    /// keeps retrying (and reporting) its error on every tick. When the
+    /// gate lets the import proceed, the decode and map phases report
+    /// through `progress` directly.
     fn import<'a>(
         &'a self,
         progress: &'a dyn ImportProgress,
     ) -> ImportFuture<'a, Result<ImportOutcome, ImportError>> {
         Box::pin(async move {
-            let source_records = self.connector.read(progress).await?;
+            let buffered = BufferingProgress::default();
+            let source_records = match self.connector.read(&buffered).await {
+                Ok(records) => records,
+                Err(error) => {
+                    // A failing read is real work with a real story: the
+                    // fetch stages up to the failure stay visible.
+                    buffered.replay_into(progress);
+                    return Err(error);
+                }
+            };
             let hash = content_hash(&source_records);
             if self.gate().is_some_and(|last| last == hash) {
                 return Ok(ImportOutcome::Unchanged);
             }
+            buffered.replay_into(progress);
             let result = self.decode_and_map(source_records, progress)?;
             *self.gate() = Some(hash);
             Ok(ImportOutcome::Loaded(result))
         })
+    }
+}
+
+/// One recorded [`ImportProgress`] call, in emission order.
+#[derive(Debug, Clone, PartialEq)]
+enum ProgressEvent {
+    Stage { id: u64, label: String },
+    Advance { stage: u64, fraction: Option<f32>, detail: String },
+    Finish { stage: u64 },
+    Fail { stage: u64, reason: String },
+    Log { message: String },
+}
+
+/// [`ImportProgress`] sink that records events instead of forwarding them,
+/// so the unchanged gate can decide after the read whether the fetch story
+/// is worth telling. Stage ids are buffer-local; replay remaps them onto
+/// the real sink's ids in emission order.
+#[derive(Default)]
+struct BufferingProgress {
+    events: Mutex<Vec<ProgressEvent>>,
+    next_stage: Mutex<u64>,
+}
+
+impl BufferingProgress {
+    /// Forward every recorded event into `sink`, in order, allocating fresh
+    /// stage ids and translating the buffered references.
+    fn replay_into(&self, sink: &dyn ImportProgress) {
+        let events = self.events.lock();
+        let mut ids = std::collections::HashMap::new();
+        for event in events.iter() {
+            match event {
+                ProgressEvent::Stage { id, label } => {
+                    let real = sink.stage(label);
+                    ids.insert(*id, real);
+                }
+                ProgressEvent::Advance { stage, fraction, detail } => {
+                    if let Some(real) = ids.get(stage) {
+                        sink.advance(*real, *fraction, detail);
+                    }
+                }
+                ProgressEvent::Finish { stage } => {
+                    if let Some(real) = ids.get(stage) {
+                        sink.finish(*real);
+                    }
+                }
+                ProgressEvent::Fail { stage, reason } => {
+                    if let Some(real) = ids.get(stage) {
+                        sink.fail(*real, reason);
+                    }
+                }
+                ProgressEvent::Log { message } => sink.log(message),
+            }
+        }
+    }
+}
+
+impl ImportProgress for BufferingProgress {
+    fn stage(&self, label: &str) -> u64 {
+        let mut next = self.next_stage.lock();
+        let id = *next;
+        *next += 1;
+        self.events.lock().push(ProgressEvent::Stage {
+            id,
+            label: label.to_owned(),
+        });
+        id
+    }
+
+    fn advance(&self, stage: u64, fraction: Option<f32>, detail: &str) {
+        self.events.lock().push(ProgressEvent::Advance {
+            stage,
+            fraction,
+            detail: detail.to_owned(),
+        });
+    }
+
+    fn finish(&self, stage: u64) {
+        self.events.lock().push(ProgressEvent::Finish { stage });
+    }
+
+    fn fail(&self, stage: u64, reason: &str) {
+        self.events.lock().push(ProgressEvent::Fail {
+            stage,
+            reason: reason.to_owned(),
+        });
+    }
+
+    fn log(&self, message: &str) {
+        self.events.lock().push(ProgressEvent::Log {
+            message: message.to_owned(),
+        });
     }
 }
 
@@ -2112,6 +2217,191 @@ mod importer_tests {
                 "decode:a",
                 "map"
             ]
+        );
+    }
+
+    /// A connector that reports a fetch stage during `read`, the way the
+    /// httpjson engine reports one stage per collection.
+    struct StagingConnector {
+        records: Arc<Mutex<Vec<SourceRecord>>>,
+        fail: bool,
+    }
+
+    impl SourceConnector for StagingConnector {
+        fn capabilities(&self, effect: Effect) -> Vec<Capability> {
+            vec![capability(effect, "fixture")]
+        }
+
+        fn read<'a>(
+            &'a self,
+            progress: &'a dyn ImportProgress,
+        ) -> ImportFuture<'a, Result<Vec<SourceRecord>, ImportError>> {
+            Box::pin(async move {
+                let stage = progress.stage("Fetching records from fixture");
+                progress.advance(stage, None, "1 page");
+                if self.fail {
+                    progress.fail(stage, "boom");
+                    return Err(ImportError::SourceRead {
+                        origin: "fixture".into(),
+                        message: "boom".into(),
+                    });
+                }
+                progress.finish(stage);
+                Ok(self.records.lock().clone())
+            })
+        }
+
+        fn write<'a>(
+            &'a self,
+            _request: WriteRequest,
+        ) -> ImportFuture<'a, Result<WriteReceipt, ImportError>> {
+            Box::pin(async move {
+                Err(ImportError::UnsupportedEffect {
+                    effect: Effect::Write,
+                })
+            })
+        }
+    }
+
+    /// An [`ImportProgress`] sink recording each call as a compact string.
+    #[derive(Default)]
+    struct RecordingProgress {
+        events: Mutex<Vec<String>>,
+        next_stage: Mutex<u64>,
+    }
+
+    impl RecordingProgress {
+        fn events(&self) -> Vec<String> {
+            self.events.lock().clone()
+        }
+    }
+
+    impl ImportProgress for RecordingProgress {
+        fn stage(&self, label: &str) -> u64 {
+            let mut next = self.next_stage.lock();
+            let id = *next;
+            *next += 1;
+            self.events.lock().push(format!("stage:{id}:{label}"));
+            id
+        }
+
+        fn advance(&self, stage: u64, _fraction: Option<f32>, detail: &str) {
+            self.events.lock().push(format!("advance:{stage}:{detail}"));
+        }
+
+        fn finish(&self, stage: u64) {
+            self.events.lock().push(format!("finish:{stage}"));
+        }
+
+        fn fail(&self, stage: u64, reason: &str) {
+            self.events.lock().push(format!("fail:{stage}:{reason}"));
+        }
+
+        fn log(&self, message: &str) {
+            self.events.lock().push(format!("log:{message}"));
+        }
+    }
+
+    fn staging_pipeline(
+        records: Arc<Mutex<Vec<SourceRecord>>>,
+        fail: bool,
+    ) -> ImportPipeline {
+        let read = capability(Effect::Read, "fixture");
+        let trace = Trace::default();
+        ImportPipeline::new(
+            descriptor(vec![read]),
+            Box::new(StagingConnector { records, fail }),
+            Box::new(FakeDecoder {
+                trace: trace.clone(),
+                fail_at: None,
+            }),
+            Box::new(FakeMapper { trace }),
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn unchanged_tick_suppresses_fetch_progress() {
+        let records = Arc::new(Mutex::new(vec![record("a", "one")]));
+        let pipeline = staging_pipeline(records, false);
+        let progress = RecordingProgress::default();
+
+        let ImportOutcome::Loaded(_) = pipeline.import(&progress).await.unwrap() else {
+            panic!("first import must load a fresh graph");
+        };
+        assert!(
+            progress
+                .events()
+                .iter()
+                .any(|event| event.starts_with("stage:") && event.contains("Fetching")),
+            "the first load tells the fetch story: {:?}",
+            progress.events()
+        );
+
+        let opened = progress.events().len();
+        assert!(matches!(
+            pipeline.import(&progress).await.unwrap(),
+            ImportOutcome::Unchanged
+        ));
+        assert_eq!(
+            progress.events().len(),
+            opened,
+            "an unchanged tick emits no progress at all: {:?}",
+            progress.events()
+        );
+    }
+
+    #[tokio::test]
+    async fn changed_tick_replays_the_buffered_fetch_story() {
+        let records = Arc::new(Mutex::new(vec![record("a", "one")]));
+        let pipeline = staging_pipeline(records.clone(), false);
+        let progress = RecordingProgress::default();
+
+        let ImportOutcome::Loaded(_) = pipeline.import(&progress).await.unwrap() else {
+            panic!("first import must load a fresh graph");
+        };
+        assert!(matches!(
+            pipeline.import(&progress).await.unwrap(),
+            ImportOutcome::Unchanged
+        ));
+
+        records.lock()[0] = record("a", "mutated");
+        let before = progress.events().len();
+        let ImportOutcome::Loaded(_) = pipeline.import(&progress).await.unwrap() else {
+            panic!("changed records must reload");
+        };
+        let new_events = &progress.events()[before..];
+        assert!(
+            new_events
+                .iter()
+                .any(|event| event.starts_with("stage:") && event.contains("Fetching")),
+            "a changed tick replays the buffered fetch stages: {new_events:?}"
+        );
+        let fetch = new_events
+            .iter()
+            .position(|event| event.contains("Fetching"))
+            .unwrap();
+        let finish = new_events
+            .iter()
+            .position(|event| event.starts_with("finish:"))
+            .unwrap();
+        assert!(fetch < finish, "stage opens before it finishes: {new_events:?}");
+    }
+
+    #[tokio::test]
+    async fn failed_read_replays_the_fetch_failure() {
+        let records = Arc::new(Mutex::new(vec![record("a", "one")]));
+        let pipeline = staging_pipeline(records, true);
+        let progress = RecordingProgress::default();
+
+        let error = pipeline.import(&progress).await.unwrap_err();
+        assert!(matches!(error, ImportError::SourceRead { .. }));
+        let events = progress.events();
+        assert!(
+            events
+                .iter()
+                .any(|event| event.starts_with("fail:") && event.contains("boom")),
+            "a failing read keeps its failure visible: {events:?}"
         );
     }
 
