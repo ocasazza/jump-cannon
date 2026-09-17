@@ -1724,9 +1724,9 @@ fn render_projected_panel(
         Some(panel_header_actions(projected.key, ctx)),
     );
     let body = panel::panel_body(panel_body(projected.key, maximized, ctx));
-    let resize = panel::resize_grip(projected, emit);
+    let resize = panel::resize_grip(projected, emit.clone());
 
-    panel::panel_shell(projected, Some(&class), rsx! { {chrome} {body} {resize} })
+    panel::panel_shell_with_events(projected, Some(&class), rsx! { {chrome} {body} {resize} }, emit)
 }
 
 // --- panel bodies ----------------------------------------------------------------
