@@ -497,6 +497,12 @@ struct SourceHostInner {
     /// `httpjson` alternate; the rollout path still resolves its own full
     /// path via `--importer-manifest`.
     packages_dir: Option<PathBuf>,
+    /// Directory for runtime-side overlay files (`catalog.local.json`,
+    /// `variables.local.json`). Defaults to [`Self::packages_dir`] when
+    /// `None`; set separately when the packages directory is a read-only
+    /// ConfigMap mount and overlays need an emptyDir or PVC. The packages
+    /// directory itself is never written to when these differ.
+    overlay_dir: Option<PathBuf>,
     /// Per-source-id cache of computed parameter reports, keyed by catalog id.
     /// Each entry is reused for [`PARAMETERS_CACHE_TTL`] before recomputation.
     parameters_cache: RwLock<HashMap<String, (Instant, ParametersReport)>>,
@@ -539,6 +545,9 @@ impl SourceHost {
 
     /// Like [`Self::new`] but with an explicit `packages_dir` for resolving
     /// catalog-declared `httpjson` alternate package filenames.
+    /// Writable overlay files (`catalog.local.json`, `variables.local.json`)
+    /// are also stored in `packages_dir` when no separate `overlay_dir` is
+    /// configured (backward-compatible single-directory mode).
     pub fn with_packages_dir(
         default: AppState,
         switch: SwitchConfig,
@@ -550,6 +559,27 @@ impl SourceHost {
             packages_dir,
             ALTERNATE_IDLE_TTL,
             ALTERNATE_EVICTION_INTERVAL,
+        )
+    }
+
+    /// Like [`Self::with_packages_dir`] but with a separate writable
+    /// directory for overlay files. The `packages_dir` remains read-only
+    /// (e.g. a ConfigMap mount); the `overlay_dir` receives runtime-side
+    /// writes (`catalog.local.json`, `variables.local.json`).
+    pub fn with_packages_and_overlay_dir(
+        default: AppState,
+        switch: SwitchConfig,
+        packages_dir: Option<PathBuf>,
+        overlay_dir: Option<PathBuf>,
+    ) -> Self {
+        Self::with_ttl_and_builder(
+            default,
+            switch,
+            packages_dir,
+            overlay_dir,
+            ALTERNATE_IDLE_TTL,
+            ALTERNATE_EVICTION_INTERVAL,
+            default_builder(),
         )
     }
 
@@ -567,6 +597,7 @@ impl SourceHost {
             default,
             switch,
             packages_dir,
+            None, // overlay_dir: fall back to packages_dir for writable overlays
             idle_ttl,
             eviction_interval,
             default_builder(),
@@ -581,6 +612,7 @@ impl SourceHost {
         default: AppState,
         switch: SwitchConfig,
         packages_dir: Option<PathBuf>,
+        overlay_dir: Option<PathBuf>,
         idle_ttl: Duration,
         eviction_interval: Duration,
         builder: AlternateBuilder,
@@ -594,6 +626,7 @@ impl SourceHost {
                 idle_ttl,
                 eviction_interval,
                 packages_dir,
+                overlay_dir,
                 builder,
                 build_generation: AtomicU64::new(0),
                 parameters_cache: RwLock::new(HashMap::new()),
@@ -672,6 +705,15 @@ impl SourceHost {
     /// The directory catalog `httpJson.package` filenames resolve against.
     pub fn packages_dir(&self) -> Option<&Path> {
         self.inner.packages_dir.as_deref()
+    }
+
+    /// Directory for runtime-side overlay files. Falls back to
+    /// [`Self::packages_dir`] when no separate overlay dir was configured.
+    pub fn overlay_dir(&self) -> Option<&Path> {
+        self.inner
+            .overlay_dir
+            .as_deref()
+            .or(self.inner.packages_dir.as_deref())
     }
 
     pub fn invalidate_alternate(&self, source_id: &str) {
@@ -908,6 +950,7 @@ impl SourceHost {
                 selector: selector.clone(),
                 definition,
                 packages_dir: inner.packages_dir.clone(),
+                overlay_dir: inner.overlay_dir.clone(),
                 gate: Arc::clone(&gate),
                 progress: Arc::clone(&progress),
             };
@@ -1578,6 +1621,7 @@ struct BuildRequest {
     selector: SourceSelector,
     definition: crate::importer_catalog::ImporterSourceDefinition,
     packages_dir: Option<PathBuf>,
+    overlay_dir: Option<PathBuf>,
     gate: Arc<RescanGate>,
     progress: Arc<ProgressLog>,
 }
@@ -2201,6 +2245,7 @@ mod tests {
             default,
             test_switch(),
             None,
+            None, // overlay_dir: None falls back to packages_dir
             Duration::from_secs(3600),
             Duration::from_secs(3600),
             builder,

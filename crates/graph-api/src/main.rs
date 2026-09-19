@@ -152,6 +152,12 @@ struct Args {
     /// rollout path still resolves its own full path via `--importer-manifest`.
     #[arg(long, env = "JUMP_CANNON_IMPORTER_PACKAGES_DIR")]
     importer_packages_dir: Option<PathBuf>,
+    /// Writable directory for runtime-side overlay files
+    /// (`catalog.local.json`, `variables.local.json`). Defaults to
+    /// `--importer-packages-dir` when unset. Set this when the packages
+    /// directory is a read-only ConfigMap and overlays need an emptyDir.
+    #[arg(long, env = "JUMP_CANNON_IMPORTER_OVERLAY_DIR")]
+    importer_overlay_dir: Option<PathBuf>,
     /// Versioned TOML importer package. Required by --source=pest (a Pest
     /// grammar + capture map) and --source=httpjson (endpoints + mapping).
     #[arg(long, env = "JUMP_CANNON_IMPORTER_MANIFEST")]
@@ -273,8 +279,11 @@ async fn main() -> anyhow::Result<()> {    let _ = dotenvy::dotenv();
     .context("invalid deployment importer catalog")?;
     // Runtime-authored sources (`POST /importers`) persist in the packages
     // dir; a broken overlay must not take the deployment down with it.
-    if let Some(packages_dir) = &args.importer_packages_dir {
-        match importer_catalog.load_overlay(packages_dir) {
+    // Overlay files (`catalog.local.json`, `variables.local.json`) persist
+    // in `importer_overlay_dir` when set, or fall back to `importer_packages_dir`.
+    let overlay_load_dir = args.importer_overlay_dir.as_ref().or(args.importer_packages_dir.as_ref());
+    if let Some(dir) = overlay_load_dir {
+        match importer_catalog.load_overlay(dir) {
             Ok(0) => {}
             Ok(merged) => tracing::info!(merged, "merged runtime importer catalog overlay"),
             Err(error) => tracing::warn!(%error, "ignoring runtime importer catalog overlay"),
@@ -284,8 +293,8 @@ async fn main() -> anyhow::Result<()> {    let _ = dotenvy::dotenv();
     // Runtime variable overrides (`PUT /importers/:id/variables`) persist
     // beside the overlay; same posture — a broken file must not take the
     // deployment down with it.
-    if let Some(packages_dir) = &args.importer_packages_dir {
-        match importer_catalog.load_variables_overlay(packages_dir) {
+    if let Some(dir) = overlay_load_dir {
+        match importer_catalog.load_variables_overlay(dir) {
             Ok(0) => {}
             Ok(applied) => tracing::info!(applied, "applied runtime importer variable overrides"),
             Err(error) => tracing::warn!(%error, "ignoring runtime importer variable overrides"),

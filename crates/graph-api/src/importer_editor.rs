@@ -115,6 +115,9 @@ fn parse_body<T: DeserializeOwned>(body: &Bytes) -> Result<T, Response> {
 
 struct Located {
     packages_dir: PathBuf,
+    /// Overlay persistence directory (catalog.local.json, variables.local.json).
+    /// Falls back to [`Self::packages_dir`] when not set separately.
+    overlay_dir: PathBuf,
     package: String,
     path: PathBuf,
 }
@@ -135,10 +138,12 @@ fn locate(host: &SourceHost, source_id: &str) -> Result<Located, Response> {
         ));
     };
     let packages_dir = packages_dir(host)?;
+    let overlay_dir = host.overlay_dir().unwrap_or(&packages_dir).to_path_buf();
     Ok(Located {
         path: packages_dir.join(&http_json.package),
         package: http_json.package.clone(),
         packages_dir,
+        overlay_dir: overlay_dir.to_path_buf(),
     })
 }
 
@@ -203,7 +208,7 @@ pub async fn definition_get(
     Json(DefinitionResponse {
         package: located.package,
         source: definition.source,
-        writable: dir_is_writable(&located.packages_dir),
+        writable: dir_is_writable(&located.overlay_dir),
     })
     .into_response()
 }
@@ -467,7 +472,8 @@ pub async fn importers_post(
     if let Err(response) = validate_source_text(req.source.clone()).await {
         return response;
     }
-    if let Err(response) = require_writable(&packages_dir) {
+    let overlay_dir = host.overlay_dir().unwrap_or(&packages_dir).to_path_buf();
+    if let Err(response) = require_writable(&overlay_dir) {
         return response;
     }
 
@@ -476,7 +482,7 @@ pub async fn importers_post(
     if let Err(error) = write_atomically(&package_path, &req.source) {
         return reject(StatusCode::INTERNAL_SERVER_ERROR, error);
     }
-    if let Err(error) = append_overlay(&packages_dir, &req.id, &definition) {
+    if let Err(error) = append_overlay(&overlay_dir, &req.id, &definition) {
         let _ = std::fs::remove_file(&package_path);
         return reject(StatusCode::INTERNAL_SERVER_ERROR, error);
     }

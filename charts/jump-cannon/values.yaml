@@ -236,6 +236,7 @@ httpJsonImporter:
   # Filename of a chart-owned package under charts/jump-cannon/packages/.
   package: "hindsight-memory-bank.toml"
   mountPath: /etc/jump-cannon/importer-packages
+  overlayMountPath: /etc/jump-cannon/importer-overlay
   # Root of the API this package is bound to.
   endpoint: "http://hindsight-api-proxy.hindsight.svc.cluster.local"
   # Values for the variables the package declares. A required variable with no

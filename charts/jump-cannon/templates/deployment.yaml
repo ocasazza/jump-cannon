@@ -214,6 +214,8 @@ spec:
             {{- if $needsHttpJsonPackages }}
             - name: JUMP_CANNON_IMPORTER_PACKAGES_DIR
               value: {{ .Values.httpJsonImporter.mountPath | quote }}
+            - name: JUMP_CANNON_IMPORTER_OVERLAY_DIR
+              value: {{ .Values.httpJsonImporter.overlayMountPath | quote }}
             {{- end }}
             {{- if $usesFilesystem }}
             - name: VAULT_ROOT
@@ -280,6 +282,8 @@ spec:
             - name: importer-packages
               mountPath: {{ .Values.httpJsonImporter.mountPath | quote }}
               readOnly: true
+            - name: importer-overlay
+              mountPath: {{ .Values.httpJsonImporter.overlayMountPath | quote }}
             {{- end }}
             {{- if $usesKubernetes }}
             - name: kubernetes-importer-config
@@ -322,6 +326,8 @@ spec:
         - name: importer-packages
           configMap:
             name: {{ include "jump-cannon.fullname" . }}-importer-packages
+        - name: importer-overlay
+          emptyDir: {}
         {{- end }}
         {{- range $dormant := $dormantSources }}
         - name: {{ $dormant.volumeName }}
