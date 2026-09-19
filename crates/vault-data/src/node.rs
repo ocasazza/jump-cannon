@@ -34,6 +34,20 @@ pub struct NodeMetrics {
     pub kcore: usize,
     pub community: usize,
     pub wcc: usize,
+    /// Phase 0: energy decomposition. Total system energy attributed to this
+    /// node (attractive + repulsive). `None` when no energy pass has run.
+    pub energy: Option<f32>,
+    /// Phase 0: attractive component of energy decomposition.
+    pub energy_attractive: Option<f32>,
+    /// Phase 0: repulsive component of energy decomposition.
+    pub energy_repulsive: Option<f32>,
+    /// Phase 0: frame-to-frame energy variance (stability metric).
+    pub stability_variance: Option<f32>,
+    /// Phase 0: maximum position drift between successive frames.
+    pub stability_drift: Option<f32>,
+    /// Phase 0: edge-anomaly flag. True when this node participates in
+    /// at least one high-stress edge.
+    pub anomaly_flag: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

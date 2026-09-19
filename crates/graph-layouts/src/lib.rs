@@ -9,6 +9,7 @@ mod utils;
 /// Representation-agnostic layout-quality metrics (scale-normalized stress,
 /// edge-length CV). Usable from the native solver tests and the WASM renderer.
 pub mod metrics;
+pub mod convergence;
 
 pub use types::{Graph, Node, Edge, Id, MetadataValue, LayoutOptions};
 pub use layout::algorithms::fcose::{FcoseLayout, FcoseQuality, FcoseSettings};
@@ -27,6 +28,8 @@ pub use layout::algorithms::sphere::{SphereLayout, SphereSettings};
 pub use layout::algorithms::concentric_static::{ConcentricLayout, ConcentricMetric, ConcentricSettings};
 pub use layout::algorithms::hilbert::{HilbertLayout, HilbertSettings};
 pub use layout::algorithms::spectral::{SpectralLayout, SpectralSettings};
+pub use layout::algorithms::stability::{compute_stability, StabilityProfile};
+pub use layout::algorithms::energy_decomposition::{compute_per_node_energy, NodeEnergy, OctreeApprox};
 pub use layout::layout_trait::{
     BoxedPhysics, BoxedStatic, DynPhysicsLayout, DynStaticLayout, LayoutDescriptor, LayoutId,
     LayoutKind, LayoutRequirements, LayoutSettings, PhysicsLayout, StaticLayout,

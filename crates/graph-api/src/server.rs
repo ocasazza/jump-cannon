@@ -1807,6 +1807,15 @@ async fn node_meta(selection: SourceSelection, Path(id): Path<String>) -> impl I
             body,
             source_id: node.meta.source_id.clone(),
             content_type: node.meta.content_type.clone(),
+
+            // Phase 0: energy/stability fields — computed by layout pass,
+            // populated from the snapshot's NodeMetrics.
+            node_energy: node.metrics.energy,
+            node_energy_attractive: node.metrics.energy_attractive,
+            node_energy_repulsive: node.metrics.energy_repulsive,
+            stability_variance: node.metrics.stability_variance,
+            stability_drift: node.metrics.stability_drift,
+            anomaly_flag: node.metrics.anomaly_flag,
             content_readable,
             content_writable,
         };
@@ -1855,6 +1864,13 @@ async fn node_meta(selection: SourceSelection, Path(id): Path<String>) -> impl I
                 body,
                 source_id: "obsidian".into(),
                 content_type: Some("text/markdown".into()),
+                // Phase 0: filesystem-only node has no layout pass.
+                node_energy: None,
+                node_energy_attractive: None,
+                node_energy_repulsive: None,
+                stability_variance: None,
+                stability_drift: None,
+                anomaly_flag: false,
                 content_readable: true,
                 content_writable: can_write_filesystem_content,
             };
@@ -1890,6 +1906,13 @@ async fn node_meta(selection: SourceSelection, Path(id): Path<String>) -> impl I
         body: String::new(),
         source_id: String::new(),
         content_type: None,
+        // Phase 0: stub node has no layout pass.
+        node_energy: None,
+        node_energy_attractive: None,
+        node_energy_repulsive: None,
+        stability_variance: None,
+        stability_drift: None,
+        anomaly_flag: false,
         content_readable: false,
         content_writable: false,
     };

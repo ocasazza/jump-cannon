@@ -193,6 +193,8 @@ pub(crate) enum Panel {
     GpuSessions,
     // Runtime importer package workbench (replaces the Settings → Importers tab):
     Importers,
+    // Edge Inspector — anomalous edge detection viewer
+    EdgeInspector,
 }
 
 impl PanelKind for Panel {
@@ -218,6 +220,7 @@ impl PanelKind for Panel {
             Panel::Merge => "Merge",
             Panel::GpuSessions => "GPU Sessions",
             Panel::Importers => "Importers",
+            Panel::EdgeInspector => "Edge Inspector",
         }
     }
 }
@@ -415,6 +418,7 @@ fn default_layout() -> Vec<PanelWin<Panel>> {
         min(b, Panel::Instances, 860.0, 180.0, 360.0, 420.0),
         min(b, Panel::Generate, 880.0, 200.0, 360.0, 440.0),
         min(b, Panel::Importers, 870.0, 190.0, 760.0, 560.0),
+        min(b, Panel::EdgeInspector, 910.0, 230.0, 380.0, 420.0),
         min(b, Panel::Timeline, 900.0, 220.0, 380.0, 320.0),
         min(b, Panel::GitHub, 890.0, 210.0, 360.0, 440.0),
         min(b, Panel::Debug, 920.0, 240.0, 320.0, 360.0),
@@ -540,6 +544,7 @@ fn sessions_default_layout() -> Vec<PanelWin<Panel>> {
         min(b, Panel::Branches, 840.0, 120.0, 400.0, 360.0),
         min(b, Panel::Merge, 860.0, 160.0, 420.0, 400.0),
         min(b, Panel::GpuSessions, 880.0, 200.0, 380.0, 340.0),
+        min(b, Panel::EdgeInspector, 890.0, 210.0, 380.0, 420.0),
         min(b, Panel::Nodes, 900.0, 240.0, 608.0, 620.0),
         min(b, Panel::Progress, 920.0, 280.0, 640.0, 200.0),
         // Settings carries the session-manager URL + x-user identity the
@@ -1842,6 +1847,7 @@ fn panel_body(kind: Panel, _maximized: bool, ctx: Ctx) -> Element {
         Panel::GpuSessions => panels::gpu_sessions::panel(ctx),
         Panel::GitHub => panels::github::panel(ctx),
         Panel::Importers => panels::importers::panel(ctx),
+        Panel::EdgeInspector => panels::edge_inspector::panel(ctx),
         Panel::Help => rsx! {
             div { class: "help",
                 p { "canvas: drag rotate · wheel zoom · WASD pan · QE fwd/back · Shift boost · F fit · click select" }
@@ -2140,6 +2146,7 @@ mod workspace_migration_tests {
             (Panel::GitHub, "GitHub"),
             (Panel::GpuSessions, "GpuSessions"),
             (Panel::Importers, "Importers"),
+            (Panel::EdgeInspector, "EdgeInspector"),
         ];
 
         for (panel, id) in ids {

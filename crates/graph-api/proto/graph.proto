@@ -45,6 +45,20 @@ message NodeMeta {
   optional string content_type = 20;
   bool content_readable = 21;
   bool content_writable = 22;
+
+  // Phase 0: energy decomposition (water-energetic docking research).
+  // None when no energy decomposition pass has run for this snapshot.
+  optional float node_energy = 23;
+  optional float node_energy_attractive = 24;
+  optional float node_energy_repulsive = 25;
+
+  // Phase 0: stability metrics computed from successive layout frames.
+  optional float stability_variance = 26;
+  optional float stability_drift = 27;
+
+  // Phase 0: edge-anomaly flag. True when this node participates in
+  // at least one edge whose stress exceeds the anomaly threshold.
+  bool anomaly_flag = 28;
 }
 
 // Search response. Returned by /search?q=…

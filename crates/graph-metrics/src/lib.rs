@@ -5,6 +5,7 @@ mod kcore;
 mod wcc;
 mod louvain;
 mod edge_strength;
+pub mod edge_anomaly;
 
 pub use degree::compute_degree;
 pub use pagerank::compute_pagerank;
@@ -13,6 +14,7 @@ pub use kcore::compute_kcore;
 pub use wcc::compute_wcc;
 pub use louvain::compute_louvain;
 pub use edge_strength::{compute_edge_strength, EdgeStrength, EdgeStrengthKind};
+pub use edge_anomaly::{detect_anomalous_edges, EdgeAnomaly};
 
 use vault_data::VaultGraph;
 

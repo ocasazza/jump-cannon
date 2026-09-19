@@ -18,6 +18,8 @@ pub mod timeline;
 // phase 4: Inspector + Document moved out of main.rs for the parity port.
 pub mod document;
 pub mod inspector;
+// Edge Inspector — anomalous edge detection viewer
+pub mod edge_inspector;
 // Sessions view (versioned shared worlds — crates/session-manager).
 pub mod branches;
 pub mod gpu_sessions;

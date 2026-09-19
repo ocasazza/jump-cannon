@@ -697,6 +697,42 @@ fn node_view(ctx: Ctx, id: String) -> Element {
                     div { class: "kv", span { class: "k", "community" } span { class: "v", "{m.community}" } }
                     div { class: "kv", span { class: "k", "kcore" } span { class: "v", "{m.kcore}" } }
                     div { class: "kv", span { class: "k", "wcc" } span { class: "v", "{m.wcc}" } }
+                    // Phase 0 water-energetic metrics — only visible when
+                    // the layout pass has populated these fields.
+                    if let Some(energy) = m.node_energy {
+                        div { class: "kv ins-energy",
+                            span { class: "k", "energy" }
+                            span { class: "v",
+                                { format!("{:.3} (attr {:.3} + rep {:.3})",
+                                    energy,
+                                    m.node_energy_attractive.unwrap_or(0.0),
+                                    m.node_energy_repulsive.unwrap_or(0.0),
+                                ) }
+                            }
+                        }
+                    }
+                    if let Some(var) = m.stability_variance {
+                        {
+                            let drift = m.stability_drift.unwrap_or(0.0);
+                            let class_suffix = if drift > 0.01 { "ins-unstable" } else { "ins-stable" };
+                            rsx! {
+                                div { class: "kv ins-stability {class_suffix}",
+                                    span { class: "k", "stability" }
+                                    span { class: "v",
+                                        { format!("var {:.6}  drift {:.4}",
+                                            var, drift,
+                                        ) }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if m.anomaly_flag {
+                        div { class: "kv ins-anomaly",
+                            span { class: "k", "⚠ anomaly" }
+                            span { class: "v", "edge stress exceeds threshold" }
+                        }
+                    }
                 }
                 { badge_row }
                 { frontmatter_grid(&m.frontmatter_json) }

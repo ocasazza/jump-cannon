@@ -12,6 +12,8 @@ pub mod sphere;
 pub mod concentric_static;
 pub mod hilbert;
 pub mod spectral;
+pub mod stability;
+pub mod energy_decomposition;
 
 #[allow(unused_imports)]
 pub use gpu_force::{GpuForceLayout, GpuForceOptions};

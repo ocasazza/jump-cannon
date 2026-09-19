@@ -15,6 +15,7 @@
 //! scale. `0` ⇒ the layout reproduces the target distances exactly up to scale.
 
 /// Euclidean distance between packed nodes `i` and `j`.
+
 #[inline]
 fn euclid(positions: &[f32], i: usize, j: usize) -> f64 {
     let dx = (positions[3 * i] - positions[3 * j]) as f64;

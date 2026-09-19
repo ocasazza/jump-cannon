@@ -68,6 +68,23 @@ pub struct NodeMeta {
     pub content_readable: bool,
     #[prost(bool, tag = "22")]
     pub content_writable: bool,
+    /// Phase 0: energy decomposition (water-energetic docking research).
+    /// None when no energy decomposition pass has run for this snapshot.
+    #[prost(float, optional, tag = "23")]
+    pub node_energy: ::core::option::Option<f32>,
+    #[prost(float, optional, tag = "24")]
+    pub node_energy_attractive: ::core::option::Option<f32>,
+    #[prost(float, optional, tag = "25")]
+    pub node_energy_repulsive: ::core::option::Option<f32>,
+    /// Phase 0: stability metrics computed from successive layout frames.
+    #[prost(float, optional, tag = "26")]
+    pub stability_variance: ::core::option::Option<f32>,
+    #[prost(float, optional, tag = "27")]
+    pub stability_drift: ::core::option::Option<f32>,
+    /// Phase 0: edge-anomaly flag. True when this node participates in
+    /// at least one edge whose stress exceeds the anomaly threshold.
+    #[prost(bool, tag = "28")]
+    pub anomaly_flag: bool,
 }
 /// Search response. Returned by /search?q=…
 #[derive(Clone, PartialEq, ::prost::Message)]

@@ -3665,7 +3665,9 @@ fn gpu_force_ui() -> Element {
 
         div { class: "lay-sub", "Repulsion backend" }
         div { class: "lay-hint", "Exact: tiny graphs; BH: clustered; NS: huge" }
-        div { class: "lay-row",
+        div {
+            class: "lay-row",
+            title: "Refinement role: Solvent model analog — how pairwise interactions are computed. Exact = explicit solvent, BH = GB implicit, NS = PBSA continuum.",
             span { class: "lay-k", "mode" }
             select {
                 class: "lay-select",
@@ -3688,6 +3690,7 @@ fn gpu_force_ui() -> Element {
         }
         if repulsion_mode == RepulsionMode::NegativeSampling {
             Slider { label: "K samples", min: 1.0, max: 32.0, value: opts.repulsion_samples as f64,
+                title: "Refinement role: Nwat selection count analog — statistical sample size. K random nodes per iteration; the rest are approximated as continuum.",
                 on: move |v: f64| edit::<GpuForceOptions>("gpu-force", |o| {
                     o.repulsion_samples = v.round().max(1.0) as u32;
                 }) }
@@ -3983,7 +3986,7 @@ fn geometric_ui() -> Element {
         // geometric-gpu entry in the Engine picker.
         div { class: "lay-sub", "Options" }
         CheckRow { label: "Multilevel", value: opts.use_multilevel, text: "coarsen",
-            title: "Solve on a coarsened graph hierarchy first, then refine — faster \
+            title: "Refinement role: Funnel stage analog (SP→XP→WS→MM-GBSA). Solve on a coarsened graph hierarchy first, then refine — faster \
                     convergence on large graphs. Off by default.",
             on: move |v: bool| edit::<LensConfig>(BRIDGE_GEOMETRIC, |c| c.use_multilevel = v) }
 
@@ -4047,7 +4050,9 @@ fn geometric_ui() -> Element {
                 option { value: "uniform", selected: matches!(coordination, CoordinationLens::Uniform(_)), "Uniform" }
             }
         }
-        div { class: "lay-row",
+        div {
+            class: "lay-row",
+            title: "Refinement role: Charge method analog — property assignment fidelity. Degree = Gasteiger (fast), PageRank = AM1-BCC (accurate), Uniform = no charges.",
             span { class: "lay-k", "Mass" }
             select {
                 class: "lay-select",
@@ -4069,7 +4074,9 @@ fn geometric_ui() -> Element {
                 option { value: "pagerank", selected: mass == MassLens::PageRank, "PageRank" }
             }
         }
-        div { class: "lay-row",
+        div {
+            class: "lay-row",
+            title: "Refinement role: Water displacement model analog — how local context weights interactions. Jaccard = hydrophobic enclosure, Corrected = hydrophilic displacement.",
             span { class: "lay-k", "Edge Length" }
             select {
                 class: "lay-select",
@@ -4128,12 +4135,10 @@ fn geometric_ui() -> Element {
 
         div { class: "lay-sub", "Integrator" }
         Slider { label: "Time step", min: 0.01, max: 1.0, value: opts.time_step as f64, log: true,
-            title: "Integration dt. The strongest stabilizer: if the layout flip-flops at the \
-                    Max step cap (stiff forces, K·dt² > 2), halve this first.",
+            title: "Refinement role: MD thermostat coupling analog — convergence rate vs. accuracy. The strongest stabilizer: if the layout flip-flops at the Max step cap (stiff forces, K·dt² > 2), halve this first.",
             on: move |v: f64| edit::<LensConfig>(BRIDGE_GEOMETRIC, |c| c.time_step = v as f32) }
         Slider { label: "Damping", min: 0.0, max: 1.0, value: opts.damping as f64,
-            title: "Velocity retention per step (1 = frictionless). Lower dissipates overshoot \
-                    oscillation faster.",
+            title: "Refinement role: MD thermostat coupling analog — controls velocity retention per step (1 = frictionless). Lower dissipates overshoot oscillation faster.",
             on: move |v: f64| edit::<LensConfig>(BRIDGE_GEOMETRIC, |c| c.damping = v as f32) }
         Slider { label: "Max step", min: 0.0, max: 20.0, value: opts.max_step as f64,
             title: "Per-step displacement cap per node (0 = uncapped). A spike guard, not a \
