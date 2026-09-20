@@ -216,6 +216,10 @@ spec:
               value: {{ .Values.httpJsonImporter.mountPath | quote }}
             - name: JUMP_CANNON_IMPORTER_OVERLAY_DIR
               value: {{ .Values.httpJsonImporter.overlayMountPath | quote }}
+            - name: JUMP_CANNON_IMPORTER_CACHE_DIR
+              {{- if .Values.httpJsonImporter.cacheDir }}
+              value: {{ .Values.httpJsonImporter.cacheDir | quote }}
+              {{- end }}
             {{- end }}
             {{- if $usesFilesystem }}
             - name: VAULT_ROOT

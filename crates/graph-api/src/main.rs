@@ -158,6 +158,11 @@ struct Args {
     /// directory is a read-only ConfigMap and overlays need an emptyDir.
     #[arg(long, env = "JUMP_CANNON_IMPORTER_OVERLAY_DIR")]
     importer_overlay_dir: Option<PathBuf>,
+    /// Root directory for the httpjson response-body byte cache. When
+    /// set, every httpjson source caches fetched pages here, keyed by URL.
+    /// Survives process restarts; TTL is driven by the source's poll interval.
+    #[arg(long, env = "JUMP_CANNON_IMPORTER_CACHE_DIR")]
+    importer_cache_dir: Option<PathBuf>,
     /// Versioned TOML importer package. Required by --source=pest (a Pest
     /// grammar + capture map) and --source=httpjson (endpoints + mapping).
     #[arg(long, env = "JUMP_CANNON_IMPORTER_MANIFEST")]
@@ -452,7 +457,7 @@ async fn main() -> anyhow::Result<()> {    let _ = dotenvy::dotenv();
                 poll_interval_ms = instance.poll_interval_ms,
                 "using HTTP/JSON package importer"
             );
-            Box::new(importer::build_importer(package, instance)?)
+            Box::new(importer::build_importer(package, instance, args.importer_cache_dir.clone())?)
         }
     };
 
@@ -548,11 +553,12 @@ async fn main() -> anyhow::Result<()> {    let _ = dotenvy::dotenv();
         tracing::info!("filesystem watcher disabled (--no-watch)");
     }
 
-    let app = router_with_host(graph_api::source_host::SourceHost::with_packages_and_overlay_dir(
+    let app = router_with_host(graph_api::source_host::SourceHost::with_packages_and_overlay_dir_and_cache(
         state,
         switch,
         args.importer_packages_dir.clone(),
         args.importer_overlay_dir.clone(),
+        args.importer_cache_dir.clone(),
     ));
 
     let host: std::net::IpAddr = args.host.parse().unwrap_or_else(|_| {

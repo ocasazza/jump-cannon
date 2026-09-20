@@ -506,6 +506,10 @@ struct SourceHostInner {
     /// Per-source-id cache of computed parameter reports, keyed by catalog id.
     /// Each entry is reused for [`PARAMETERS_CACHE_TTL`] before recomputation.
     parameters_cache: RwLock<HashMap<String, (Instant, ParametersReport)>>,
+    /// Root directory for the httpjson response-body byte cache. When set,
+    /// every httpjson source gets a namespace under this directory. Unset
+    /// disables caching (every reload fetches fresh from the API).
+    cache_dir: Option<PathBuf>,
 }
 
 /// Idle detection: ids whose entry hasn't been used since `now - idle_ttl`.
@@ -553,10 +557,22 @@ impl SourceHost {
         switch: SwitchConfig,
         packages_dir: Option<PathBuf>,
     ) -> Self {
-        Self::with_ttl(
+        Self::with_packages_dir_and_cache(default, switch, packages_dir, None)
+    }
+
+    /// Like [`Self::with_packages_dir`] with an explicit `cache_dir`.
+    pub fn with_packages_dir_and_cache(
+        default: AppState,
+        switch: SwitchConfig,
+        packages_dir: Option<PathBuf>,
+        cache_dir: Option<PathBuf>,
+    ) -> Self {
+        Self::with_packages_and_cache(
             default,
             switch,
             packages_dir,
+            None, // overlay_dir
+            cache_dir,
             ALTERNATE_IDLE_TTL,
             ALTERNATE_EVICTION_INTERVAL,
         )
@@ -572,15 +588,58 @@ impl SourceHost {
         packages_dir: Option<PathBuf>,
         overlay_dir: Option<PathBuf>,
     ) -> Self {
-        Self::with_ttl_and_builder(
-            default,
-            switch,
-            packages_dir,
-            overlay_dir,
-            ALTERNATE_IDLE_TTL,
-            ALTERNATE_EVICTION_INTERVAL,
-            default_builder(),
+        Self::with_packages_and_cache(
+            default, switch, packages_dir, overlay_dir, None,
+            ALTERNATE_IDLE_TTL, ALTERNATE_EVICTION_INTERVAL,
         )
+    }
+
+    /// Like [`Self::with_packages_and_overlay_dir`] with an explicit
+    /// httpjson response-body cache directory.
+    pub fn with_packages_and_overlay_dir_and_cache(
+        default: AppState,
+        switch: SwitchConfig,
+        packages_dir: Option<PathBuf>,
+        overlay_dir: Option<PathBuf>,
+        cache_dir: Option<PathBuf>,
+    ) -> Self {
+        Self::with_packages_and_cache(
+            default, switch, packages_dir, overlay_dir, cache_dir,
+            ALTERNATE_IDLE_TTL, ALTERNATE_EVICTION_INTERVAL,
+        )
+    }
+
+    /// Internal: full constructor with all params including cache_dir.
+    fn with_packages_and_cache(
+        default: AppState,
+        switch: SwitchConfig,
+        packages_dir: Option<PathBuf>,
+        overlay_dir: Option<PathBuf>,
+        cache_dir: Option<PathBuf>,
+        idle_ttl: Duration,
+        eviction_interval: Duration,
+    ) -> Self {
+        let builder = default_builder();
+        let host = Self {
+            inner: Arc::new(SourceHostInner {
+                catalog: ArcSwap::from_pointee(default.inner.importer_catalog.clone()),
+                default,
+                switch,
+                alternates: RwLock::new(HashMap::new()),
+                idle_ttl,
+                eviction_interval,
+                packages_dir,
+                overlay_dir,
+                cache_dir,
+                builder,
+                build_generation: AtomicU64::new(0),
+                parameters_cache: RwLock::new(HashMap::new()),
+            }),
+        };
+        if host.inner.switch.enabled() {
+            host.spawn_eviction_sweep();
+        }
+        host
     }
 
     /// Like [`Self::with_packages_dir`] with an overridable idle TTL and sweep
@@ -627,6 +686,7 @@ impl SourceHost {
                 eviction_interval,
                 packages_dir,
                 overlay_dir,
+                cache_dir: None,
                 builder,
                 build_generation: AtomicU64::new(0),
                 parameters_cache: RwLock::new(HashMap::new()),
@@ -714,6 +774,12 @@ impl SourceHost {
             .overlay_dir
             .as_deref()
             .or(self.inner.packages_dir.as_deref())
+    }
+
+    /// Root directory for the httpjson response-body byte cache.
+    /// `None` means caching is disabled.
+    pub fn cache_dir(&self) -> Option<&Path> {
+        self.inner.cache_dir.as_deref()
     }
 
     pub fn invalidate_alternate(&self, source_id: &str) {
@@ -951,6 +1017,7 @@ impl SourceHost {
                 definition,
                 packages_dir: inner.packages_dir.clone(),
                 overlay_dir: inner.overlay_dir.clone(),
+                cache_dir: inner.cache_dir.clone(),
                 gate: Arc::clone(&gate),
                 progress: Arc::clone(&progress),
             };
@@ -1622,6 +1689,7 @@ struct BuildRequest {
     definition: crate::importer_catalog::ImporterSourceDefinition,
     packages_dir: Option<PathBuf>,
     overlay_dir: Option<PathBuf>,
+    cache_dir: Option<PathBuf>,
     gate: Arc<RescanGate>,
     progress: Arc<ProgressLog>,
 }
@@ -1649,6 +1717,7 @@ fn default_builder() -> AlternateBuilder {
                 &request.selector,
                 &request.definition,
                 request.packages_dir.as_deref(),
+                request.cache_dir.as_deref(),
                 request.gate,
                 request.progress,
             )
@@ -1747,6 +1816,7 @@ async fn build_alternate(
     selector: &SourceSelector,
     definition: &crate::importer_catalog::ImporterSourceDefinition,
     packages_dir: Option<&Path>,
+    cache_dir: Option<&Path>,
     gate: Arc<RescanGate>,
     progress: Arc<ProgressLog>,
 ) -> Result<(AppState, Option<tokio::task::JoinHandle<()>>), String> {
@@ -1790,7 +1860,7 @@ async fn build_alternate(
             // for a remote source; no capability here joins onto it.
             let root = PathBuf::new();
             let importer: Box<dyn data_loader::Importer> = Box::new(
-                importer::build_importer(package, instance)
+                importer::build_importer(package, instance, cache_dir.map(|p| p.to_path_buf()))
                     .map_err(|error| error.to_string())?,
             );
             let grants: std::collections::HashSet<data_loader::Capability> =

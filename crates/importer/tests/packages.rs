@@ -125,7 +125,7 @@ async fn shipped_package_produces_nodes_and_declared_edges(#[case] case: Package
         poll_interval_ms: 0,
     };
     let transport = FixtureTransport::new(case.fixture_dir, case.routes);
-    let importer = build_importer_with_transport(package, instance, Box::new(transport))
+    let importer = build_importer_with_transport(package, instance, Box::new(transport), None)
         .unwrap_or_else(|error| panic!("{} binds: {error}", case.manifest));
 
     let result = match importer

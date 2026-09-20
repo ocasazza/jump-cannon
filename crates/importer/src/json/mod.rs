@@ -21,6 +21,7 @@
 //! the bound instance and `local` is the package's identifier for the document
 //! (prefixed per collection, e.g. `entity:`).
 
+pub mod cache;
 pub mod config;
 pub mod connector;
 pub mod mapper;
@@ -37,6 +38,7 @@ pub use config::{
     NodeRules, Pagination, Predicate, Preflight, Produces, TitleRule, Transform, VariableSpec,
     ENGINE, MAX_PAGE_SIZE, MAX_REQUEST_TIMEOUT_SECONDS, SOURCE_KIND,
 };
+pub use cache::{ByteCache, CachingJsonTransport};
 pub use connector::{HttpJsonConnector, JsonTransport};
 #[cfg(feature = "native")]
 pub use connector::ReqwestTransport;
@@ -198,6 +200,7 @@ pub(crate) fn resolve_variables(
 pub fn build_importer(
     package: ValidatedPackage,
     instance: InstanceConfig,
+    cache_dir: Option<std::path::PathBuf>,
 ) -> Result<ImportPipeline, ImportError> {
     let config = package
         .json_config()
@@ -209,7 +212,7 @@ pub fn build_importer(
         package.limits(),
         config.request_timeout_seconds,
     )?;
-    build_importer_with_transport(package, instance, Box::new(transport))
+    build_importer_with_transport(package, instance, Box::new(transport), cache_dir)
 }
 
 /// Bind a package over an explicit transport. The network shell is one thin
@@ -219,6 +222,7 @@ pub fn build_importer_with_transport(
     package: ValidatedPackage,
     instance: InstanceConfig,
     transport: Box<dyn JsonTransport>,
+    cache_dir: Option<std::path::PathBuf>,
 ) -> Result<ImportPipeline, ImportError> {
     instance.validate()?;
     // Reject non-json packages before anything is constructed on their behalf.
@@ -229,6 +233,35 @@ pub fn build_importer_with_transport(
         })?;
     let variables = package.resolve_variables(&instance.variables)?;
     let namespace = Namespace::new(SOURCE_KIND, &instance.source_id)?;
+
+    // Wrap transport in a response-body cache when a cache directory is
+    // configured. The cache namespace is {cache_dir}/{source_id}/{varhash}
+    // so variable changes create a fresh namespace without invalidating
+    // the old one (it becomes eligible for GC on next restart).
+    let transport: Box<dyn JsonTransport> = if let Some(ref cache_root) = cache_dir {
+        let var_hash = blake3::hash(
+            serde_json::to_string(&variables)
+                .unwrap_or_default()
+                .as_bytes(),
+        );
+        let namespace_dir = cache_root
+            .join(&instance.source_id)
+            .join(var_hash.to_hex().as_str());
+        let ttl = if instance.poll_interval_ms > 0 {
+            std::time::Duration::from_millis(instance.poll_interval_ms)
+        } else {
+            std::time::Duration::from_secs(3600)
+        };
+        match cache::ByteCache::open(namespace_dir, ttl) {
+            Ok(cache) => Box::new(cache::CachingJsonTransport::new(transport, cache)),
+            Err(error) => {
+                tracing::warn!(?error, "failed to open httpjson cache, proceeding uncached");
+                transport
+            }
+        }
+    } else {
+        transport
+    };
 
     let connector = HttpJsonConnector::new(
         package.clone(),
@@ -431,7 +464,7 @@ target = "target"
             token: None,
             poll_interval_ms: 0,
         };
-        let error = build_importer_with_transport(pest_package, instance, Box::new(NoopTransport))
+        let error = build_importer_with_transport(pest_package, instance, Box::new(NoopTransport), None)
             
             .err()
             .expect("a pest package must not bind to an HTTP instance");
