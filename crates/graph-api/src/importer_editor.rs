@@ -236,7 +236,7 @@ pub async fn definition_put(
     if let Err(response) = validate_source_text(req.source.clone()).await {
         return response;
     }
-    if let Err(response) = require_writable(&located.packages_dir) {
+    if let Err(response) = require_writable(&located.overlay_dir) {
         return response;
     }
     if let Err(error) = write_atomically(&located.path, &req.source) {
@@ -371,12 +371,12 @@ pub async fn variables_put(
             );
         }
     }
-    if let Err(response) = require_writable(&located.packages_dir) {
+    if let Err(response) = require_writable(&located.overlay_dir) {
         return response;
     }
     // Persist first, then publish: the served catalog only ever reflects
     // what boot would reload from disk.
-    if let Err(error) = write_variables_overlay(&located.packages_dir, &source_id, &req.variables)
+    if let Err(error) = write_variables_overlay(&located.overlay_dir, &source_id, &req.variables)
     {
         return reject(StatusCode::INTERNAL_SERVER_ERROR, error);
     }
