@@ -264,10 +264,15 @@ fn EdgeInspectorPanel(ctx: Ctx) -> Element {
                     div { class: "ei-empty", "{empty_msg}" }
                 } else {
                     for anomaly in sorted.into_iter() {
-                        EdgeRow {
-                            key: "ei-{anomaly.edge_idx}",
-                            anomaly,
-                            ctx,
+                        {
+                            let key = format!("ei-{}", anomaly.edge_idx);
+                            rsx! {
+                                EdgeRow {
+                                    key,
+                                    anomaly,
+                                    ctx,
+                                }
+                            }
                         }
                     }
                 }
