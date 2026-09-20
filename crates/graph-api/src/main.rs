@@ -548,10 +548,11 @@ async fn main() -> anyhow::Result<()> {    let _ = dotenvy::dotenv();
         tracing::info!("filesystem watcher disabled (--no-watch)");
     }
 
-    let app = router_with_host(graph_api::source_host::SourceHost::with_packages_dir(
+    let app = router_with_host(graph_api::source_host::SourceHost::with_packages_and_overlay_dir(
         state,
         switch,
         args.importer_packages_dir.clone(),
+        args.importer_overlay_dir.clone(),
     ));
 
     let host: std::net::IpAddr = args.host.parse().unwrap_or_else(|_| {
