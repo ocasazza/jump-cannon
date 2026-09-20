@@ -225,9 +225,9 @@ impl PanelKind for Panel {
     }
 }
 
-const WORKSPACE_LAYOUT_KEY: &str = "jc_layout_v9";
-const SESSIONS_LAYOUT_KEY: &str = "jc_sessions_layout_v1";
-const LEGACY_WORKSPACE_LAYOUT_KEYS: &[&str] = &["jc_layout_v8", "jc_layout_v7", "jc_layout_v6"];
+const WORKSPACE_LAYOUT_KEY: &str = "jc_layout_v10";
+const SESSIONS_LAYOUT_KEY: &str = "jc_sessions_layout_v2";
+const LEGACY_WORKSPACE_LAYOUT_KEYS: &[&str] = &["jc_layout_v9", "jc_layout_v8", "jc_layout_v7", "jc_layout_v6"];
 
 /// Panel identity used by the three workspace layouts immediately preceding
 /// the Settings consolidation. Keeping this separate from [`Panel`] lets us
@@ -2027,8 +2027,8 @@ mod workspace_migration_tests {
 
     #[test]
     fn two_concurrent_workspaces_do_not_share_state_or_store() {
-        assert_eq!(WORKSPACE_LAYOUT_KEY, "jc_layout_v9");
-        assert_eq!(SESSIONS_LAYOUT_KEY, "jc_sessions_layout_v1");
+        assert_eq!(WORKSPACE_LAYOUT_KEY, "jc_layout_v10");
+        assert_eq!(SESSIONS_LAYOUT_KEY, "jc_sessions_layout_v2");
 
         let catalog = workspace::panel_catalog();
         assert_preserved_panel_ids(&catalog);
