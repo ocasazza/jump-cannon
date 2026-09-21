@@ -504,15 +504,28 @@ async fn main() -> anyhow::Result<()> {    let _ = dotenvy::dotenv();
     // — local `just dev-up` is completely unaffected (R11).
     let gpu_session = build_gpu_session(&args, compute_broker.clone(), progress.clone()).await;
 
-    let state = AppState::new_with_importer_catalog(
-        vault_root.clone(),
-        importer,
-        loaded,
-        args.assets_dir,
-        compute_broker.clone(),
-        progress.clone(),
-        importer_catalog,
-    )?
+    let state = {
+        let vault_root = vault_root.clone();
+        let progress = progress.clone();
+        let compute_broker = compute_broker.clone();
+        tokio::task::spawn_blocking(move || {
+            AppState::new_with_importer_catalog(
+                vault_root,
+                importer,
+                loaded,
+                args.assets_dir,
+                compute_broker,
+                progress,
+                importer_catalog,
+            )
+        })
+        .await
+        .map_err(|error| {
+            data_loader::ImportError::Map {
+                message: format!("snapshot build panicked during boot: {error}"),
+            }
+        })?
+    }?
     .with_gpu_session(gpu_session);
 
     if let Some(compute_url) = args.compute_url.clone() {

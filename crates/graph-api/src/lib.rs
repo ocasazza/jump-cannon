@@ -55,12 +55,23 @@ pub async fn build_world_state(
             });
         }
     };
-    AppState::new(
-        vault_root,
-        importer,
-        loaded,
-        None,
-        compute_broker::ComputeBroker::new(),
-        progress,
-    )
+    // The snapshot build (Tantivy index, binary caches, metrics) is CPU-heavy
+    // and synchronous; keep it off the async runtime so it doesn't starve HTTP
+    // handlers during a large import.
+    let vault_root2 = vault_root.clone();
+    let progress2 = std::sync::Arc::clone(&progress);
+    tokio::task::spawn_blocking(move || {
+        AppState::new(
+            vault_root2,
+            importer,
+            loaded,
+            None,
+            compute_broker::ComputeBroker::new(),
+            progress2,
+        )
+    })
+    .await
+    .map_err(|error| data_loader::ImportError::Map {
+        message: format!("snapshot build panicked: {error}"),
+    })?
 }
