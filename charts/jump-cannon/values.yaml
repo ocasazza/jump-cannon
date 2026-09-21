@@ -239,7 +239,7 @@ httpJsonImporter:
   overlayMountPath: /etc/jump-cannon/importer-overlay
   # When set, httpjson responses are cached to disk under this directory,
   # keyed by URL + source-id + variable hash. Unset disables caching.
-  cacheDir: 
+  cacheDir: "/etc/jump-cannon/importer-overlay/cache" 
   # Root of the API this package is bound to.
   endpoint: "http://hindsight-api-proxy.hindsight.svc.cluster.local"
   # Values for the variables the package declares. A required variable with no
