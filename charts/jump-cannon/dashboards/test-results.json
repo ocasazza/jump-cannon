@@ -307,7 +307,7 @@
       "id": 5,
       "type": "state-timeline",
       "title": "Pass/fail heatmap \u2014 result per test over time",
-      "description": "One row per individual test/check within each nightly CronJob family: fuzz-graph-layouts, fuzz-graph-compute (fuzz); performance-bench-static-layouts, performance-bench-pagerank, performance-bench-scaling, performance-bench-spmv (criterion benches); performance-geometric-solver (canary + golden + perf budgets in one libtest binary); browser-pre-wasm-mount, browser-header-actions, browser-nodes-editor, browser-settings-tabs, browser-filter-builder, browser-sessions-view, browser-importer-switch (browser). Each nightly run pushes its result to Pushgateway; the value persists until the next run, so a red span covers every day that check kept failing.",
+      "description": "One row per individual test/check within each nightly CronJob family: fuzz-graph-layouts, fuzz-graph-compute (fuzz); performance-bench-static-layouts, performance-bench-pagerank, performance-bench-scaling, performance-bench-spmv (criterion benches); performance-geometric-solver (canary + golden + perf budgets in one libtest binary); browser-pre-wasm-mount, browser-graph-header-actions, browser-nodes-editor, browser-settings-tabs, browser-importers-panel, browser-filter-builder, browser-sessions-view, browser-importer-switch (browser; one row per check object in test-browser's report.json). Each nightly run pushes its result to Pushgateway; the value persists until the next run, so a red span covers every day that check kept failing.",
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"

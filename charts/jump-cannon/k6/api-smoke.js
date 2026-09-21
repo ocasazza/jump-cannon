@@ -22,6 +22,15 @@ const LOAD_VUS = parseInt(__ENV.K6_LOAD_VUS || '5', 10);
 const SPIKE_ENABLED = __ENV.K6_SPIKE_ENABLED === 'true' || __ENV.K6_SPIKE_ENABLED === '1';
 const FUZZ_ENABLED = __ENV.K6_FUZZ_ENABLED === 'true' || __ENV.K6_FUZZ_ENABLED === '1';
 
+// /graph/positions is graph-api's `positions_buffer`: a flat
+// [x0, y0, x1, y1, ...] little-endian f32 stream, two floats per node.
+const POSITION_BYTES = 2 * 4;
+
+// Fuzz probes deliberately send malformed input; a 4xx is the expected
+// rejection, not a transport failure, so only 5xx counts toward
+// http_req_failed. The contract each probe must honour is asserted below.
+const FUZZ_STATUSES = http.expectedStatuses({ min: 200, max: 499 });
+
 // Custom domain metrics streamed to Prometheus via remote write
 export const metrics = {
   activeNodeCount: new Gauge('k6_graph_active_nodes'),
@@ -148,8 +157,10 @@ export function smoke() {
     const importers = http.get(`${BASE}/importers`, { tags: { name: 'importers' } });
     check(importers, { 'importers 200': (r) => r.status === 200 });
 
-    const configs = http.get(`${BASE}/configs`, { tags: { name: 'configs' } });
-    check(configs, { 'configs 200': (r) => r.status === 200 });
+    // No `/configs` probe: graph-api resolves the preset dir as
+    // `<assets-dir>/../../configs`, which the chart's `/assets` mount can
+    // never satisfy, and the preset YAMLs were deleted with the egui
+    // renderer. The route 404s by design, so there is no signal to gate on.
 
     const schema = http.get(`${BASE}/graph/schema`, { tags: { name: 'schema' } });
     check(schema, {
@@ -183,18 +194,18 @@ export function smoke() {
       } catch (_) {}
     }
 
-    // Binary positions stream (3 x f32 per node in little endian)
+    // Binary positions stream (2 x f32 per node in little endian)
     const positionsRes = http.get(`${BASE}/graph/positions`, {
       responseType: 'binary',
       tags: { name: 'positions' },
     });
     check(positionsRes, {
       'positions 200': (r) => r.status === 200,
-      'positions multiple of 12 bytes (x,y,z f32)': (r) => r.body.byteLength % 12 === 0,
+      'positions multiple of 8 bytes (x,y f32)': (r) => r.body.byteLength % POSITION_BYTES === 0,
     });
     if (positionsRes.status === 200) {
       metrics.positionsByteLength.add(positionsRes.body.byteLength);
-      if (positionsRes.body.byteLength >= 12) {
+      if (positionsRes.body.byteLength >= POSITION_BYTES) {
         const f32 = new Float32Array(positionsRes.body);
         check(f32, {
           'first position coordinates finite': (arr) => !isNaN(arr[0]) && isFinite(arr[0]),
@@ -273,19 +284,34 @@ export function fuzz() {
   const nixRes = http.post(`${BASE}/generate`, invalidNixPayload, {
     headers: { 'Content-Type': 'application/json' },
     tags: { name: 'fuzz-generate-syntax' },
+    responseCallback: FUZZ_STATUSES,
   });
   metrics.nixEvalDuration.add(Date.now() - evalStart);
 
-  // Evaluator must reject malformed expressions with 4xx, NEVER panic or 500
-  const nixResilient = nixRes.status === 400 || nixRes.status === 422 || nixRes.status === 404;
+  // /generate is a soft-error envelope (mirroring /vault/page): an eval
+  // failure is HTTP 200 with `ok:false`, a non-empty `error`, and no `graph`.
+  // Anything else -- a 4xx, a 5xx, or a graph for a malformed expression --
+  // is a contract break.
+  let nixBody = null;
+  try {
+    nixBody = JSON.parse(nixRes.body);
+  } catch (_) {}
+  const nixResilient =
+    nixRes.status === 200 &&
+    nixBody !== null &&
+    nixBody.ok === false &&
+    typeof nixBody.error === 'string' &&
+    nixBody.error.length > 0 &&
+    nixBody.graph === undefined;
   check(nixRes, {
-    'nix evaluator handles malformed input gracefully (4xx)': () => nixResilient,
+    'nix evaluator rejects malformed input with the soft-error envelope': () => nixResilient,
   });
   metrics.fuzzResilienceRate.add(nixResilient ? 1 : 0);
 
   // B. Malformed Search Query Parser Fuzzing
   const searchFuzz = http.get(`${BASE}/search?q=${encodeURIComponent('***[[((broken query~~')}`, {
     tags: { name: 'fuzz-search-parser' },
+    responseCallback: FUZZ_STATUSES,
   });
   // Search parser should return 200 with empty results or 400 bad request, not 500
   const searchResilient = searchFuzz.status === 200 || searchFuzz.status === 400;

@@ -643,7 +643,7 @@
               printf 'test_duration_seconds{app="jump-cannon",test="%s"} %s\n' "$test_name" "$duration"
               # One row per run (run = pod name), so Grafana can list runs per
               # test for the flame-graph trace dropdown.
-              printf 'jump_cannon_test_run_info{app="jump-cannon",test="%s",run="%s"} 1\n' "$test_name" "''${JUMP_CANNON_RUN_ID:-$(hostname)}"
+              printf 'jump_cannon_test_run_info{app="jump-cannon",test="%s",run="%s"} 1\n' "$test_name" "''${JUMP_CANNON_RUN_ID:-$(uname -n)}"
             } > "$metrics_file"
             curl -fsS --data-binary @"$metrics_file" \
               "$PUSHGATEWAY_URL/metrics/job/jump-cannon-$test_name/app/jump-cannon/test/$test_name"
@@ -693,7 +693,7 @@
             # pprof this does not replace the statistical run — fuzz asserts
             # invariants, not timings, so the agent's tiny overhead is fine.
             : "''${PYROSCOPE_URL:=}"
-            : "''${JUMP_CANNON_RUN_ID:-$(hostname)}"
+            : "''${JUMP_CANNON_RUN_ID:=$(uname -n)}"
             export PROPTEST_CASES PYROSCOPE_URL JUMP_CANNON_RUN_ID
             ${testMetricsPushShell}
 
@@ -847,12 +847,13 @@
             mkdir -p "$OUT_DIR"
             ${testMetricsPushShell}
 
-            # test-browser scores 7 independent named checks and writes them
-            # to $OUT_DIR/report.json; push one Pushgateway row per check
-            # that actually ran (a check is omitted from the JSON, not
-            # `null`, when its scenario was skipped -- e.g. importer_switch
-            # with no second graph-api binary on PATH -- and must not be
-            # fabricated as a pass or fail here).
+            # test-browser writes one named check object per scenario to
+            # $OUT_DIR/report.json; push one Pushgateway row per check that
+            # actually ran. Checks are discovered from the report (every
+            # top-level object carrying a boolean `.ok`), never enumerated
+            # here, so a new scenario cannot be silently dropped from the
+            # dashboard. A skipped scenario is omitted from the JSON, not
+            # `null`, and must not be fabricated as a pass or fail.
             started="$(date +%s)"
             set +e
             test-browser \
@@ -866,9 +867,8 @@
 
             report="$OUT_DIR/report.json"
             if [ -f "$report" ]; then
-              for field in pre_wasm_mount graph_header_actions nodes_editor settings_tabs filter_builder sessions_view importer_switch; do
-                ok="$(jq -r --arg f "$field" '.[$f].ok // empty' "$report")"
-                [ -n "$ok" ] || continue
+              jq -r 'to_entries[] | select((.value | type) == "object" and (.value.ok | type) == "boolean") | "\(.key) \(.value.ok)"' "$report" \
+              | while read -r field ok; do
                 row_name="browser-$(printf '%s' "$field" | tr '_' '-')"
                 if [ "$ok" = "true" ]; then
                   push_metrics "$row_name" 1 0 "$duration"

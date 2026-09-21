@@ -39,13 +39,22 @@ The importer fixture proves that the active source is identified, the Lavender
 source shows its exact read-only claim and `/var/lib/lavender/okf-repository/okf`
 input, deployment-provisioned RWX and same-namespace requirements, alternate
 `<release>-okf` naming, UID/GID `10001`, and rollout ownership are explained.
-The switch-posture assertion is per-viewer: against the main fixture server
-(no `JUMP_CANNON_IMPORTER_SWITCH_GROUP`) the runtime switch selector must be
-absent (`data-runtime-switch="disabled"`, no `.importer-switch-btn`); against
-a switching-enabled deployment the harness asserts the posture it is served —
-the group-required note and no controls for a denied viewer, controls for an
-authorized one. Restoring Settings must remount a render-ready
-Graph canvas. These results are recorded under `settings_tabs`.
+The switch-posture assertion is derived from served state, never pinned: the
+harness fetches the same `/importers` catalog the panel renders, compares the
+sole `data-viewing="true"` row with the catalog's `selected` profile, and
+derives the expected Apply affordance from the served `runtimeSwitch`
+(`enabled && allowed`) and the Lavender profile's selected/runnable/viewing
+posture. The main fixture deployment runs
+`JUMP_CANNON_IMPORTER_SWITCH_GROUP="*"`, so every viewer is authorized: no
+posture note is rendered, and the Lavender summary must offer
+`[data-action="apply"]` while Lavender is a runnable, non-viewed alternate.
+Against a switching-disabled deployment the summary must offer no Apply and
+the `[data-field="switch-posture"]` note must read "runtime switching is
+disabled"; a denied viewer sees the "viewing other sources requires
+authorization" note with no Apply. These results are recorded under
+`importers_panel`. Restoring
+Settings must remount a render-ready Graph canvas; the tab results are
+recorded under `settings_tabs`.
 
 The Filter builder contract derives its nested-group expectations from the
 served corpus rather than from fixture notes (a deployment whose importer
