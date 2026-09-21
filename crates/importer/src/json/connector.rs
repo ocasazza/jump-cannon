@@ -484,6 +484,7 @@ impl HttpJsonConnector {
                 }
             };
             let url = self.collection_url(collection, &query)?;
+            progress.advance(stage, None, &format!("requesting page {}…", page_index + 1));
             let bytes = self.transport.get(&url).await?;
             let value: serde_json::Value = serde_json::from_slice(&bytes).map_err(|error| ImportError::SourceRead {
                 origin: url.clone(),

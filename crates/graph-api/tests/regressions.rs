@@ -503,6 +503,7 @@ async fn same_cardinality_snapshot_swap_changes_revision() {
             SnapshotSource::new("test", "Test", "1"),
             test_schema(),
             loaded.search_documents,
+            &data_loader::NoProgress,
         )
         .unwrap(),
     ));
@@ -1179,7 +1180,9 @@ async fn runtime_switch_builds_alternate_lazily_and_isolates_state() {
         .await
         .expect("default progress served");
     let default_progress = json_body(default_progress).await;
-    assert_eq!(default_progress["events"].as_array().unwrap().len(), 0);
+    // Boot import now reports granular snapshot-build stages; the
+    // default log is expected to carry those events.
+    assert!(default_progress["events"].as_array().unwrap().len() > 0);
 
     let alt_progress = app
         .clone()

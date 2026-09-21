@@ -316,6 +316,7 @@ mod tests {
             crate::state::SnapshotSource::new("test", "Test", "1"),
             schema,
             search_documents,
+            &data_loader::NoProgress,
         )
         .unwrap()
     }

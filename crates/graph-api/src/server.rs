@@ -1439,6 +1439,7 @@ async fn compute_soup_post(
         crate::state::SnapshotSource::new("compute-soup", "Compute soup", "1"),
         schema,
         search_documents,
+        &data_loader::NoProgress,
     ) {
         Ok(snapshot) => snapshot,
         Err(error) => {

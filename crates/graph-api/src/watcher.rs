@@ -508,8 +508,9 @@ async fn rebuild_snapshot(state: &AppState) -> bool {
     let snap_id = progress.start("ingest", "Building snapshot");
     let schema = descriptor.schema;
     let source = SnapshotSource::new(descriptor.id, descriptor.name, descriptor.version);
+    let progress2 = progress.clone();
     let snapshot = tokio::task::spawn_blocking(move || {
-        GraphSnapshot::build(loaded.graph, source, schema, loaded.search_documents)
+        GraphSnapshot::build(loaded.graph, source, schema, loaded.search_documents, &*progress2)
     })
     .await
     .map_err(|error| error.to_string())

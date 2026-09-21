@@ -80,33 +80,70 @@ pub struct GraphSnapshot {
 
 impl GraphSnapshot {
     /// Build a fresh snapshot from a loaded `VaultGraph`. Recomputes all
-    /// derived caches (id_to_idx, idx_to_id, binary buffers).
+    /// derived caches (id_to_idx, idx_to_id, binary buffers) and reports
+    /// granular progress through `progress`.
     pub fn build(
         graph: VaultGraph,
         source: SnapshotSource,
         schema: ImporterSchema,
         search_documents: Vec<SearchDocument>,
+        progress: &dyn data_loader::ImportProgress,
     ) -> Result<Self, ImportError> {
-        static NEXT_REVISION: AtomicU64 = AtomicU64::new(1);
+        let nodes = graph.nodes.len();
+        let edges = graph.edge_count();
+
+        // --- Validation ---
+        let st_val = progress.stage("Validating graph schema");
         schema.validate_output(&graph, &search_documents)?;
         graph.validate().map_err(|error| ImportError::Map {
             message: format!("invalid graph snapshot: {error}"),
         })?;
+        progress.advance(st_val, None, &format!("{nodes} nodes, {edges} edges"));
+        progress.finish(st_val);
+
+        // --- Search index ---
+        let st_idx = progress.stage("Building full-text search index");
+        let doc_count = search_documents.len();
+        progress.advance(st_idx, None, &format!("{doc_count} documents"));
         let search_index =
             SearchIndex::build(&schema, &search_documents).map_err(|error| ImportError::Map {
                 message: format!("build discovery index: {error:#}"),
             })?;
+        progress.finish(st_idx);
+
+        static NEXT_REVISION: AtomicU64 = AtomicU64::new(1);
         let revision = NEXT_REVISION.fetch_add(1, Ordering::Relaxed);
         assert_ne!(revision, 0, "graph revision counter exhausted");
 
-        let mut id_to_idx = HashMap::with_capacity(graph.nodes.len());
-        let mut idx_to_id = Vec::with_capacity(graph.nodes.len());
+        // --- ID maps ---
+        let st_id = progress.stage("Building node ID maps");
+        let mut id_to_idx = HashMap::with_capacity(nodes);
+        let mut idx_to_id = Vec::with_capacity(nodes);
         for (i, (id, _)) in graph.nodes.iter().enumerate() {
             id_to_idx.insert(id.clone(), i as u32);
             idx_to_id.push(id.clone());
         }
+        progress.finish(st_id);
 
+        // --- Binary caches: positions + edges + metrics ---
+        let metric_names = &[
+            "degree", "indegree", "outdegree", "pagerank", "betweenness",
+            "kcore", "community", "wcc",
+        ];
+        // community_levels + up to N community_l{k} levels
+        let total_metrics = metric_names.len() + 1 + graph.community_levels.len();
+        let st_metrics = progress.stage("Computing graph metrics");
         let mut binary_cache: HashMap<String, Arc<[u8]>> = HashMap::new();
+
+        #[allow(clippy::identity_op)]
+        let mut metric_idx = 0;
+        let mut done = |progress: &dyn data_loader::ImportProgress, st: u64, idx: &mut usize, label: &str| {
+            *idx += 1;
+            let frac = *idx as f32 / total_metrics as f32;
+            progress.advance(st, Some(frac), label);
+        };
+
+        // Layout buffers (fast)
         binary_cache.insert(
             "positions".into(),
             Arc::from(crate::binary::positions_buffer(&graph)),
@@ -115,31 +152,31 @@ impl GraphSnapshot {
             "edges".into(),
             Arc::from(crate::binary::edges_buffer(&graph, &id_to_idx)),
         );
-        for name in [
-            "degree",
-            "indegree",
-            "outdegree",
-            "pagerank",
-            "betweenness",
-            "kcore",
-            "community",
-            "wcc",
-        ] {
+        done(progress, st_metrics, &mut metric_idx, "positions + edges");
+
+        // Graph metrics
+        for name in metric_names {
             if let Some(buf) = crate::binary::metric_buffer(&graph, name) {
                 binary_cache.insert(name.to_string(), Arc::from(buf));
             }
+            done(progress, st_metrics, &mut metric_idx, name);
         }
-        // Louvain dendrogram levels: the depth L and each per-node level
-        // (community_l0 = coarsest = community; higher k finer).
+        // Louvain dendrogram levels
         if let Some(buf) = crate::binary::metric_buffer(&graph, "community_levels") {
             binary_cache.insert("community_levels".to_string(), Arc::from(buf));
         }
+        done(progress, st_metrics, &mut metric_idx, "community_levels");
         for k in 0..graph.community_levels.len() {
             let name = format!("community_l{k}");
             if let Some(buf) = crate::binary::metric_buffer(&graph, &name) {
-                binary_cache.insert(name, Arc::from(buf));
+                binary_cache.insert(name.clone(), Arc::from(buf));
+                done(progress, st_metrics, &mut metric_idx, &name);
             }
         }
+        progress.finish(st_metrics);
+
+        // --- Meta summary ---
+        let st_meta = progress.stage("Building facet summary");
         binary_cache.insert(
             "meta_summary".into(),
             Arc::from(crate::server::build_meta_summary_bytes(
@@ -148,6 +185,7 @@ impl GraphSnapshot {
                 &search_documents,
             )?),
         );
+        progress.finish(st_meta);
 
         Ok(Self {
             revision,
@@ -241,6 +279,7 @@ impl AppState {
             source,
             descriptor.schema,
             loaded.search_documents,
+            &*progress,
         )?;
         Ok(Self {
             inner: Arc::new(AppStateInner {
@@ -298,11 +337,13 @@ mod tests {
     #[test]
     fn rebuilt_snapshots_receive_distinct_nonzero_revisions() {
         let schema = test_schema();
+        let progress = data_loader::NoProgress;
         let first = GraphSnapshot::build(
             VaultGraph::default(),
             SnapshotSource::new("test", "Test", "1"),
             schema.clone(),
             Vec::new(),
+            &progress,
         )
         .unwrap();
         let second = GraphSnapshot::build(
@@ -310,6 +351,7 @@ mod tests {
             SnapshotSource::new("test", "Test", "1"),
             schema,
             Vec::new(),
+            &progress,
         )
         .unwrap();
         assert_ne!(first.revision, 0);
