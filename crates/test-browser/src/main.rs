@@ -218,17 +218,31 @@ struct SettingsTabsCheck {
 
 /// Top-level Importers panel (replaces the retired Settings → Importers
 /// tab): the server catalog list, the selected profile's metadata summary,
-/// and the runtime-switch gate on the summary's Apply affordance.
+/// and the runtime-switch gate on the summary's Apply affordance. Every
+/// expectation is derived from the `/importers` catalog the page itself is
+/// served, never pinned to one deployment's selection or switch posture.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct ImportersPanelCheck {
     ok: bool,
     panel_opened: bool,
     catalog_ready: bool,
+    catalog_fetched: bool,
+    #[serde(default)]
+    catalog_selected: Option<String>,
+    #[serde(default)]
+    session_selection: Option<String>,
+    #[serde(default)]
+    viewing_row: Option<String>,
+    switch_enabled: bool,
+    switch_allowed: bool,
     lavender_row: bool,
     kind_chip: bool,
-    default_viewing: bool,
+    selected_viewing: bool,
+    posture_note: bool,
     summary_card: bool,
-    apply_gated: bool,
+    apply_expected: bool,
+    apply_present: bool,
+    apply_posture: bool,
     actions_present: bool,
     #[serde(default)]
     panel_closed: bool,
@@ -267,8 +281,8 @@ struct SessionsViewCheck {
 }
 
 /// Runtime per-viewer importer switching, exercised against a second,
-/// self-hosted fixture graph-api (the main fixture has no switch group, so
-/// the apply gate lives in `importers_panel`). The scenario
+/// self-hosted fixture graph-api (`importers_panel` asserts whatever posture
+/// the main fixture serves; this scenario owns the switch itself). It
 /// spawns `graph-api` from PATH with `JUMP_CANNON_IMPORTER_SWITCH_GROUP` and
 /// a two-source Obsidian catalog, mirrors the app dist from `--base-url`, and
 /// simulates the authenticating proxy with `Network.setExtraHTTPHeaders`.
@@ -1327,10 +1341,13 @@ async fn drive_page(
 
     // ---- 6b. Importers panel: server catalog, summary, apply gate --------
     // The retired Settings → Importers tab is now a top-level workspace
-    // panel, restored from the dock like the other tray panels. The main
-    // fixture has no runtime-switch group, so the summary's session-scoped
-    // Apply affordance must stay gated here; the authorized contract runs in
-    // the importer_switch scenario.
+    // panel, restored from the dock like the other tray panels. The check
+    // fetches the same `/importers` catalog the panel renders and derives
+    // the viewing row and the Apply posture from it: `runtimeSwitch.allowed`
+    // is computed server-side from this page's own request headers, so the
+    // fetch sees exactly what the panel was served (an authorized viewer on
+    // a `"*"` deployment expects Apply for a runnable non-viewed Lavender;
+    // a disabled or denied one expects the posture note and no Apply).
     let importers_panel_js = r#"(async () => {
         const waitFor = async (predicate, timeoutMs = 30000) => {
           const deadline = performance.now() + timeoutMs;
@@ -1342,6 +1359,35 @@ async fn drive_page(
           return null;
         };
         const failures = [];
+        const LAVENDER_ID = 'lavender-ingest-okf';
+
+        let catalog = null;
+        try {
+          const response = await fetch('/importers', { cache: 'no-store' });
+          if (response.ok) catalog = await response.json();
+        } catch (_) {}
+        const catalogFetched = Boolean(catalog) &&
+          Array.isArray(catalog.sources) &&
+          typeof catalog.runtimeSwitch === 'object' && catalog.runtimeSwitch !== null;
+        const catalogSelected = catalogFetched && typeof catalog.selected === 'string'
+          ? catalog.selected : null;
+        const switchEnabled = catalogFetched && catalog.runtimeSwitch.enabled === true;
+        const switchAllowed = switchEnabled && catalog.runtimeSwitch.allowed === true;
+        const lavenderProfile = catalogFetched
+          ? catalog.sources.find((source) => source.id === LAVENDER_ID) || null
+          : null;
+
+        // The panel marks the session-selected profile viewing, else the
+        // deployment-selected one (app/ui/src/panels/importers.rs).
+        const sessionSelection = sessionStorage.getItem('jc_source_id');
+        let sessionId = null;
+        if (sessionSelection) {
+          try {
+            sessionId = decodeURIComponent(sessionSelection.split('?')[0]);
+          } catch (_) {}
+        }
+        const expectedViewing = sessionId ?? catalogSelected;
+
         // The default layout docks Importers minimized; open it the way a
         // user does.
         const root = await waitFor(() => {
@@ -1368,35 +1414,68 @@ async fn drive_page(
         );
 
         const lavender = document.querySelector(
-          '.importers-panel button.imp-row[data-package-id="lavender-ingest-okf"]'
+          `.importers-panel button.imp-row[data-package-id="${LAVENDER_ID}"]`
         );
-        const lavenderRow = Boolean(lavender) &&
+        const lavenderViewing = expectedViewing === LAVENDER_ID;
+        const lavenderRow = Boolean(lavender) && Boolean(lavenderProfile) &&
           lavender.getAttribute('data-source') === 'server' &&
-          lavender.getAttribute('data-kind') === 'okf' &&
+          lavender.getAttribute('data-kind') === lavenderProfile.kind &&
           lavender.getAttribute('data-native') === 'false' &&
-          lavender.getAttribute('data-viewing') === 'false';
+          lavender.getAttribute('data-viewing') === String(lavenderViewing);
         const chips = [...(lavender?.querySelectorAll('.imp-row-chips .imp-chip') || [])]
           .map((chip) => (chip.textContent || '').trim());
-        const kindChip = chips.includes('okf');
-        const defaultViewing = Boolean(catalogRows) && catalogRows.some((row) =>
-          row.getAttribute('data-package-id') === 'local-obsidian' &&
+        const kindChip = Boolean(lavenderProfile) && chips.includes(lavenderProfile.kind);
+
+        const viewingRows = (catalogRows || []).filter((row) =>
           row.getAttribute('data-viewing') === 'true'
         );
+        const viewingRow = viewingRows.length === 1
+          ? viewingRows[0].getAttribute('data-package-id') : null;
+        const selectedViewing = expectedViewing !== null && viewingRow === expectedViewing;
+
+        // Posture note: disabled and denied deployments each explain why
+        // Apply is absent; an authorized viewer gets no note.
+        const postureText = (document.querySelector(
+          '.importers-panel [data-field="switch-posture"]'
+        )?.textContent || '').trim();
+        const postureNote = !catalogFetched ? false
+          : !switchEnabled ? postureText.startsWith('runtime switching is disabled')
+          : !switchAllowed ? postureText.startsWith('viewing other sources requires authorization')
+          : postureText === '';
 
         lavender?.click();
         const summary = await waitFor(() => {
           const card = document.querySelector('.importers-panel .imp-summary');
           const id = card?.querySelector('[data-field="package-id"]')
             ?.textContent.trim();
-          return id === 'lavender-ingest-okf' ? card : null;
+          return id === LAVENDER_ID ? card : null;
         });
-        const summaryCard = Boolean(summary) &&
+        const summaryCard = Boolean(summary) && Boolean(lavenderProfile) &&
           Boolean(summary.querySelector('.imp-summary-title')?.textContent.trim()) &&
-          summary.querySelector('[data-field="package-kind"]')?.textContent.trim() === 'okf';
-        // Runtime switching is disabled on this fixture: the summary must
-        // not offer Apply, only the duplicate-to-local escape.
-        const applyGated = Boolean(summary) &&
-          !summary.querySelector('[data-action="apply"]') &&
+          summary.querySelector('[data-field="package-kind"]')?.textContent.trim() === lavenderProfile.kind;
+
+        // Mirror the panel's Apply gate (importers.rs `apply_allowed` /
+        // `reset_offered`) over the served profile: a runnable non-viewed
+        // alternate is appliable by an authorized viewer, a bare source
+        // hides Apply once viewed unless it is parameterised, and the
+        // default only offers "Return to default" while viewing elsewhere.
+        const lavenderDefault = Boolean(lavenderProfile) && lavenderProfile.selected === true;
+        const lavenderRunnable = Boolean(lavenderProfile) && lavenderProfile.runnable === true;
+        const lavenderParams = Boolean(lavenderProfile) &&
+          Array.isArray(lavenderProfile.parameters) && lavenderProfile.parameters.length > 0;
+        const applyAllowed = switchAllowed &&
+          (lavenderDefault || lavenderRunnable) &&
+          (!lavenderViewing || (!lavenderDefault && lavenderParams));
+        const resetOffered = lavenderDefault && sessionId !== null && !lavenderViewing;
+        const applyExpected = Boolean(lavenderProfile) && (applyAllowed || resetOffered);
+        const applyButton = summary?.querySelector('[data-action="apply"]') || null;
+        const applyPresent = Boolean(applyButton);
+        const applyLabelOk = !applyPresent ||
+          (applyButton.textContent || '').trim() ===
+            (lavenderDefault ? 'Return to default' : 'Apply (view this source)');
+        const applyPosture = Boolean(summary) &&
+          applyPresent === applyExpected &&
+          applyLabelOk &&
           Boolean(summary.querySelector('[data-action="duplicate"]'));
         const actionsPresent = Boolean(
           document.querySelector('.importers-panel [data-action="refresh-catalog"]')
@@ -1405,22 +1484,40 @@ async fn drive_page(
         );
 
         if (!panelOpened) failures.push('Importers panel did not restore from the dock');
+        if (!catalogFetched) failures.push('GET /importers did not return a catalog');
         if (!catalogReady) failures.push('server catalog did not load');
-        if (!lavenderRow) failures.push('lavender-ingest-okf catalog row is missing or misattributed');
-        if (!kindChip) failures.push('lavender-ingest-okf row has no okf kind chip');
-        if (!defaultViewing) failures.push('local-obsidian row is not marked viewing');
-        if (!summaryCard) failures.push('lavender-ingest-okf summary card is incomplete');
-        if (!applyGated) failures.push('Apply is not gated on the disabled runtime switch');
+        if (!lavenderProfile) failures.push(`${LAVENDER_ID} is not in the served catalog`);
+        if (!lavenderRow) failures.push(`${LAVENDER_ID} catalog row is missing or misattributed`);
+        if (!kindChip) failures.push(`${LAVENDER_ID} row has no kind chip`);
+        if (!selectedViewing) failures.push(
+          `viewing row ${JSON.stringify(viewingRow)} does not match the served selection ${JSON.stringify(expectedViewing)}`
+        );
+        if (!postureNote) failures.push('switch-posture note does not match the served runtime switch');
+        if (!summaryCard) failures.push(`${LAVENDER_ID} summary card is incomplete`);
+        if (!applyPosture) failures.push(
+          `Apply ${applyPresent ? 'offered' : 'absent'} but served posture ` +
+          `(enabled=${switchEnabled}, allowed=${switchAllowed}, runnable=${lavenderRunnable}, ` +
+          `viewing=${lavenderViewing}) expects ${applyExpected ? 'Apply' : 'no Apply'}`
+        );
         if (!actionsPresent) failures.push('catalog refresh or new-package action missing');
         return {
           ok: failures.length === 0,
           panel_opened: panelOpened,
           catalog_ready: catalogReady,
+          catalog_fetched: catalogFetched,
+          catalog_selected: catalogSelected,
+          session_selection: sessionSelection,
+          viewing_row: viewingRow,
+          switch_enabled: switchEnabled,
+          switch_allowed: switchAllowed,
           lavender_row: lavenderRow,
           kind_chip: kindChip,
-          default_viewing: defaultViewing,
+          selected_viewing: selectedViewing,
+          posture_note: postureNote,
           summary_card: summaryCard,
-          apply_gated: applyGated,
+          apply_expected: applyExpected,
+          apply_present: applyPresent,
+          apply_posture: applyPosture,
           actions_present: actionsPresent,
           reason: failures.length ? failures.join('; ') : null,
         };

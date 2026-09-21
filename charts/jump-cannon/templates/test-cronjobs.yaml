@@ -190,6 +190,10 @@ spec:
                   value: {{ .Values.tests.browser.baseUrl | quote }}
                 - name: JUMP_CANNON_BROWSER_TIMEOUT_SECONDS
                   value: {{ .Values.tests.browser.timeoutSeconds | quote }}
+                - name: JUMP_CANNON_RUN_ID
+                  valueFrom:
+                    fieldRef:
+                      fieldPath: metadata.name
               resources:
                 {{- toYaml .Values.tests.commonResources | nindent 16 }}
               securityContext:
