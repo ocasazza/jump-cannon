@@ -157,6 +157,45 @@ include_kinds = ["temporal", "semantic", "caused_by"]
 endpoints_collection = "memories"
 "#;
 
+/// Minimal `page_number` twin of the fixture's `memories` collection:
+/// same node rules, windowed walk instead of offset walk. Pins that
+/// duplicate-id tolerance extends to page-window collections.
+const PACKAGE_PAGE_NUMBERED: &str = r#"
+format_version = 3
+
+[metadata]
+id = "test.windows"
+name = "Test windows"
+version = "1.0.0"
+
+[limits]
+nodes = 50
+
+[[schema.edge_types]]
+key = "mentions"
+directed = true
+
+[parser]
+engine = "json"
+
+[[parser.variables]]
+name = "bank"
+default = "omp"
+
+[[parser.collections]]
+name = "memories"
+path = "/v1/banks/{bank}/memories"
+paginate = { style = "page_number" }
+
+[parser.collections.nodes]
+id_pointer = "/id"
+node_type = "memory"
+
+[parser.collections.nodes.title]
+pointer = "/text"
+fallback_prefix = "memory"
+"#;
+
 fn package() -> ValidatedPackage {
     ValidatedPackage::from_toml_bytes(PACKAGE.as_bytes()).expect("package validates")
 }
@@ -531,6 +570,40 @@ fn duplicate_node_id_from_paginated_recollection_is_tolerated() {
         kept.meta.frontmatter["body"],
         json!("First fact about tofu state migration handling"),
         "the first occurrence must win, not the later duplicate page"
+    );
+}
+
+#[test]
+fn duplicate_node_id_from_page_window_recollection_is_tolerated() {
+    // The page-window twin of the offset-walk failure mode: a work whose
+    // relevance shifts mid-walk reappears in the next window. Same record
+    // by id - keep the first occurrence, never error.
+    let records = vec![
+        record(
+            "memories",
+            json!({"items": [
+                {"id": "u1", "text": "first snapshot of the same work"}
+            ]}),
+        ),
+        record(
+            "memories",
+            json!({"items": [
+                {"id": "u1", "text": "later snapshot from the next window"}
+            ]}),
+        ),
+    ];
+    let mapper = ManifestMapper::new(
+        ValidatedPackage::from_toml_bytes(PACKAGE_PAGE_NUMBERED.as_bytes())
+            .expect("package validates"),
+        Namespace::new(SOURCE_KIND, "omp").expect("namespace"),
+    );
+    let result = mapper
+        .map(records)
+        .expect("a page-window duplicate is tolerated, not an error");
+    assert_eq!(
+        result.graph.node_count(),
+        1,
+        "the re-observed id must not add a second node"
     );
 }
 

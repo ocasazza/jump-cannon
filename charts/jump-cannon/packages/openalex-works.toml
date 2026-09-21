@@ -91,7 +91,7 @@ engine = "json"
 page_size = 200
 request_timeout_seconds = 120
 
-# The search scope. OpenAlex ranks by relevance, so this is "the 200 most
+# The search scope. OpenAlex ranks by relevance, so this is "the N most
 # relevant works about X", which is exactly the demo/exploration unit.
 [[parser.variables]]
 name = "query"
@@ -105,13 +105,13 @@ name = "mailto"
 default = "ops@schrodinger.com"
 description = "Contact address sent as OpenAlex's mailto parameter (polite pool)"
 
-# OpenAlex caps `per-page` at 200. This package is one-page only because
-# OpenAlex pages by cursor, not limit/offset. Change the `query` to narrow
-# the scope rather than requesting more records per page.
+# How many works to import. OpenAlex serves pages of at most 200 records
+# numbered by `page`; a count above 200 walks ceil(count/200) constant
+# windows instead of erroring on the 200-per-page cap.
 [[parser.variables]]
-name = "per_page"
+name = "count"
 default = "200"
-description = "Records per page (OpenAlex caps at 200)"
+description = "Works imported, page-walked in windows of up to 200 (OpenAlex caps a page at 200)"
 
 [[parser.collections]]
 name = "works"
@@ -123,12 +123,16 @@ items_pointer = "/results"
 [parser.collections.query]
 search = "{query}"
 mailto = "{mailto}"
-"per-page" = "{per_page}"
 select = "id,display_name,publication_year,cited_by_count,type,doi,language,referenced_works,primary_location"
 
-# OpenAlex pages by cursor; the json engine does not speak cursor pagination.
+# OpenAlex's other paging mode is cursor-based, which this engine does not
+# speak - but page numbering reaches the first 10,000 results, far past
+# this package's limits.nodes bound, so windows are enough. The engine
+# injects `page` and `per-page` itself; the window size stays constant so
+# consecutive windows tile the result set without overlap.
 [parser.collections.paginate]
-style = "none"
+style = "page_number"
+max_records = "{count}"
 
 [parser.collections.nodes]
 id_pointer = "/id"

@@ -148,7 +148,7 @@ pub struct Collection {
 }
 
 /// How a collection is paged.
-#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq, Default)]
 #[serde(tag = "style", rename_all = "snake_case")]
 pub enum Pagination {
     /// Single request; the endpoint returns everything it will return.
@@ -156,6 +156,33 @@ pub enum Pagination {
     None,
     /// `?limit=&offset=` walked until a short page.
     LimitOffset,
+    /// `?page=&per-page=` windows walked until a short window or the
+    /// record cap. Page-window APIs (OpenAlex) offer no offset parameter,
+    /// so [`Pagination::LimitOffset`] cannot address them; the window
+    /// size must stay constant across the walk, or windows overlap or
+    /// leave gaps between pages.
+    PageNumber {
+        /// Query parameter carrying the 1-based page number.
+        #[serde(default = "default_page_param")]
+        page_param: String,
+        /// Query parameter carrying the constant window size.
+        #[serde(default = "default_page_size_param")]
+        size_param: String,
+        /// Record cap as a `{variable}` template. The walk sizes its
+        /// windows to serve at least this many records in the fewest
+        /// pages, then stops. `None` walks to a short window, bounded
+        /// loudly by `limits.nodes`.
+        #[serde(default)]
+        max_records: Option<String>,
+    },
+}
+
+fn default_page_param() -> String {
+    "page".to_string()
+}
+
+fn default_page_size_param() -> String {
+    "per-page".to_string()
 }
 
 /// What a collection's documents become: graph nodes, or edges between nodes

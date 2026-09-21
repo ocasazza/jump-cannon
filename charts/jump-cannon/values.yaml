@@ -175,6 +175,11 @@ importers:
           query: cheminformatics
           mailto: ops@schrodinger.com
         pollIntervalMs: 86400000
+      parameters:
+        count:
+          label: Result count
+          default: "200"
+          values: ["100", "200", "500", "1000", "2000"]
 
 # okf-sync CronJob: fast-forward git-pulls the lavender OKF repository
 # (pushed nightly by lavender-ingest) into the shared claim an OKF importer

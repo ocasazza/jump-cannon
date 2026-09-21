@@ -529,6 +529,250 @@ fn limit_offset_walks_to_exhaustion() {
     }
 }
 
+/// A page-window package - the OpenAlex shape: `page`/`per-page` query
+/// parameters and a `{count}`-templated record cap, with no offset
+/// parameter. `page_size = 2` bounds the window so tests can vary the cap.
+const PACKAGE_PAGE_NUMBER: &str = r#"
+format_version = 3
+
+[metadata]
+id = "test.windows"
+name = "Test windows"
+version = "1.0.0"
+
+[limits]
+nodes = 50
+
+[[schema.edge_types]]
+key = "cites"
+directed = true
+
+[parser]
+engine = "json"
+page_size = 2
+
+[[parser.variables]]
+name = "count"
+default = "6"
+
+[[parser.collections]]
+name = "works"
+path = "/works"
+query = { search = "chem" }
+paginate = { style = "page_number", max_records = "{count}" }
+items_pointer = "/results"
+
+[parser.collections.nodes]
+id_pointer = "/id"
+node_type = "work"
+
+[parser.collections.nodes.title]
+pointer = "/title"
+fallback_prefix = "work"
+"#;
+
+/// The same shape with no `max_records`: the walk runs to a short window,
+/// bounded loudly by `limits.nodes`.
+const PACKAGE_PAGE_NUMBER_UNCAPPED: &str = r#"
+format_version = 3
+
+[metadata]
+id = "test.windows"
+name = "Test windows"
+version = "1.0.0"
+
+[limits]
+nodes = 50
+
+[[schema.edge_types]]
+key = "cites"
+directed = true
+
+[parser]
+engine = "json"
+page_size = 2
+
+[[parser.variables]]
+name = "count"
+default = "6"
+
+[[parser.collections]]
+name = "works"
+path = "/works"
+query = { search = "chem" }
+paginate = { style = "page_number" }
+items_pointer = "/results"
+
+[parser.collections.nodes]
+id_pointer = "/id"
+node_type = "work"
+
+[parser.collections.nodes.title]
+pointer = "/title"
+fallback_prefix = "work"
+"#;
+
+/// [`build_connector`] for packages whose variables are not `bank`: the
+/// supplied map must name exactly the package's declared variables.
+fn build_connector_vars(
+    pkg: &str,
+    transport: Box<dyn JsonTransport>,
+    supplied: BTreeMap<String, String>,
+) -> HttpJsonConnector {
+    let package = package(pkg);
+    let variables = package
+        .resolve_variables(&supplied)
+        .expect("variables resolve");
+    HttpJsonConnector::new(package, instance(None), variables, transport).expect("connector builds")
+}
+
+/// One fixture page of works under `/results`.
+fn works(items: &[&str]) -> Vec<u8> {
+    let results: Vec<_> = items
+        .iter()
+        .map(|id| serde_json::json!({ "id": id, "title": format!("work {id}") }))
+        .collect();
+    body(serde_json::json!({ "results": results }))
+}
+
+#[test]
+fn page_number_walks_constant_windows_to_the_cap() {
+    // count = 6 (the default) with page_size = 2: ceil(6/2) = 3 full
+    // windows serve the cap, and the walk must stop after page 3 instead
+    // of requesting a fourth.
+    let page = |n: usize| format!("{ROOT}/works?search=chem&page={n}&per-page=2");
+    let transport = FixtureTransport::new(BTreeMap::from([
+        (page(1), ok_response(&works(&["w1", "w2"]))),
+        (page(2), ok_response(&works(&["w3", "w4"]))),
+        (page(3), ok_response(&works(&["w5", "w6"]))),
+    ]));
+    let connector = build_connector_vars(
+        PACKAGE_PAGE_NUMBER,
+        Box::new(transport.clone()),
+        BTreeMap::new(),
+    );
+
+    let records = run(connector.read(&NoProgress)).expect("read succeeds");
+    assert_eq!(records.len(), 3, "one record per fetched window");
+    assert_eq!(
+        records
+            .iter()
+            .map(|r| r.metadata["page"].as_u64().unwrap())
+            .collect::<Vec<_>>(),
+        vec![0, 1, 2],
+        "records keep their zero-based walk index"
+    );
+    assert_eq!(
+        transport.requests(),
+        vec![page(1), page(2), page(3)],
+        "the walk stops once the cap is served"
+    );
+}
+
+#[test]
+fn page_number_cap_below_the_page_size_shrinks_the_window() {
+    // count = 1: a single window of size 1 serves the cap exactly; a
+    // full page_size window would import more records than the cap names.
+    let transport = FixtureTransport::new(BTreeMap::from([(
+        format!("{ROOT}/works?search=chem&page=1&per-page=1"),
+        ok_response(&works(&["w1"])),
+    )]));
+    let connector = build_connector_vars(
+        PACKAGE_PAGE_NUMBER,
+        Box::new(transport.clone()),
+        BTreeMap::from([("count".to_string(), "1".to_string())]),
+    );
+
+    let records = run(connector.read(&NoProgress)).expect("read succeeds");
+    assert_eq!(records.len(), 1);
+    assert_eq!(
+        transport.requests(),
+        vec![format!("{ROOT}/works?search=chem&page=1&per-page=1")],
+        "the window shrinks to the cap instead of importing page_size records"
+    );
+}
+
+#[test]
+fn page_number_stops_on_a_short_window_even_with_the_cap_unmet() {
+    // count = 6, but the scope runs dry: page 2 returns one record. A
+    // short window means the server has no more pages; the walk must stop
+    // rather than keep paging for the records the cap still wants.
+    let transport = FixtureTransport::new(BTreeMap::from([
+        (
+            format!("{ROOT}/works?search=chem&page=1&per-page=2"),
+            ok_response(&works(&["w1", "w2"])),
+        ),
+        (
+            format!("{ROOT}/works?search=chem&page=2&per-page=2"),
+            ok_response(&works(&["w3"])),
+        ),
+    ]));
+    let connector = build_connector_vars(
+        PACKAGE_PAGE_NUMBER,
+        Box::new(transport.clone()),
+        BTreeMap::new(),
+    );
+
+    let records = run(connector.read(&NoProgress)).expect("read succeeds");
+    assert_eq!(records.len(), 2);
+    assert_eq!(
+        transport.requests(),
+        vec![
+            format!("{ROOT}/works?search=chem&page=1&per-page=2"),
+            format!("{ROOT}/works?search=chem&page=2&per-page=2"),
+        ],
+        "a short window ends the walk before the cap is met"
+    );
+}
+
+#[test]
+fn page_number_without_a_cap_walks_to_exhaustion() {
+    // No `max_records`: the walk ends only on a short window, with
+    // `limits.nodes` as the loud backstop.
+    let transport = FixtureTransport::new(BTreeMap::from([
+        (
+            format!("{ROOT}/works?search=chem&page=1&per-page=2"),
+            ok_response(&works(&["w1", "w2"])),
+        ),
+        (
+            format!("{ROOT}/works?search=chem&page=2&per-page=2"),
+            ok_response(&works(&["w3", "w4"])),
+        ),
+        (
+            format!("{ROOT}/works?search=chem&page=3&per-page=2"),
+            ok_response(&works(&["w5"])),
+        ),
+    ]));
+    let connector = build_connector_vars(
+        PACKAGE_PAGE_NUMBER_UNCAPPED,
+        Box::new(transport.clone()),
+        BTreeMap::new(),
+    );
+
+    let records = run(connector.read(&NoProgress)).expect("read succeeds");
+    assert_eq!(records.len(), 3);
+    assert_eq!(transport.request_count(), 3);
+}
+
+#[test]
+fn page_number_cap_of_zero_is_rejected_loudly() {
+    // A zero cap names no records at all - a package or value bug, not an
+    // empty import. It must fail before any request is made.
+    let transport = FixtureTransport::new(BTreeMap::new());
+    let connector = build_connector_vars(
+        PACKAGE_PAGE_NUMBER,
+        Box::new(transport.clone()),
+        BTreeMap::from([("count".to_string(), "0".to_string())]),
+    );
+
+    let error = run(connector.read(&NoProgress)).expect_err("a zero cap must fail");
+    assert!(
+        error.to_string().contains("max_records"),
+        "the error must name the cap: {error:?}"
+    );
+    assert_eq!(transport.request_count(), 0);
+}
+
 /// An [`ImportProgress`] that records every event as a flat string log so a
 /// test can assert the stage/advance/finish shape a paged pull emits.
 #[derive(Default)]

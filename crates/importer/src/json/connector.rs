@@ -316,6 +316,23 @@ impl HttpJsonConnector {
         }
     }
 
+    /// Append page-window pagination parameters to the static query. The
+    /// page number is 1-based (page N covers records [(N-1)*size,
+    /// N*size)); the window size stays constant for the whole walk.
+    fn page_window_query(
+        query: &str,
+        page_param: &str,
+        size_param: &str,
+        size: usize,
+        page: usize,
+    ) -> String {
+        if query.is_empty() {
+            format!("{page_param}={page}&{size_param}={size}")
+        } else {
+            format!("{query}&{page_param}={page}&{size_param}={size}")
+        }
+    }
+
     async fn run_preflight(&self, preflight: &Preflight) -> Result<(), ImportError> {
         let url = self.preflight_url(preflight)?;
         let bytes = self.transport.get(&url).await?;
@@ -399,6 +416,44 @@ impl HttpJsonConnector {
         // a safety ceiling, not a completion target. Without a declared total
         // the pull is genuinely indeterminate, so the fraction stays `None`.
         let mut record_bound: Option<usize> = None;
+
+    // A page-window walk keeps its window size constant for the whole
+    // walk: page N covers [(N-1)*size, N*size), so a mid-walk resize
+    // would re-fetch or skip records. With a cap, the fewest windows
+    // that cover it is ceil(cap / page_size), each of size
+    // ceil(cap / windows) - the walk serves at least the cap and never
+    // opens more windows than it needs.
+    let (window_size, walk_windows) = match &collection.paginate {
+        super::config::Pagination::PageNumber { max_records, .. } => {
+            let field = format!("{}.paginate.max_records", collection.name);
+            match max_records
+                .as_deref()
+                .map(|template| {
+                    let resolved = self.resolve_template(&field, template)?;
+                    resolved.parse::<usize>().map_err(|_| ImportError::InvalidDescriptor {
+                        message: format!(
+                            "json engine: {field} resolved to {resolved:?}, not a whole number of records"
+                        ),
+                    })
+                })
+                .transpose()?
+            {
+                Some(0) => {
+                    return Err(ImportError::InvalidDescriptor {
+                        message: format!(
+                            "json engine: {field} resolved to 0; a page walk must name at least one record"
+                        ),
+                    });
+                }
+                Some(cap) => {
+                    let windows = cap.div_ceil(page_size).max(1);
+                    (cap.div_ceil(windows), Some(windows))
+                }
+                None => (page_size, None),
+            }
+        }
+        _ => (page_size, None),
+    };
         loop {
             if accumulated >= max_records {
                 // The previous page was full, so the server likely still has
@@ -413,10 +468,19 @@ impl HttpJsonConnector {
                     message,
                 });
             }
-            let query = match collection.paginate {
+            let query = match &collection.paginate {
                 super::config::Pagination::None => static_query.clone(),
                 super::config::Pagination::LimitOffset => {
                     Self::pagination_query(&static_query, page_size, offset)
+                }
+                super::config::Pagination::PageNumber { page_param, size_param, .. } => {
+                    Self::page_window_query(
+                        &static_query,
+                        page_param,
+                        size_param,
+                        window_size,
+                        page_index + 1,
+                    )
                 }
             };
             let url = self.collection_url(collection, &query)?;
@@ -493,13 +557,24 @@ impl HttpJsonConnector {
                 format_bytes(bytes_fetched)
             );
             progress.advance(stage, fraction, &detail);
-            match collection.paginate {
+            match &collection.paginate {
                 super::config::Pagination::None => break,
                 super::config::Pagination::LimitOffset => {
                     if page_len < page_size {
                         break;
                     }
                     offset += page_size;
+                }
+                super::config::Pagination::PageNumber { .. } => {
+                    if page_len < window_size {
+                        // A short window means the scope ran dry mid-walk.
+                        break;
+                    }
+                    if walk_windows.is_some_and(|windows| page_index >= windows) {
+                        // The cap is served; stop instead of opening
+                        // another window.
+                        break;
+                    }
                 }
             }
         }

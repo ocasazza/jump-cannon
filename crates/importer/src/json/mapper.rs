@@ -118,15 +118,21 @@ impl GraphMapper for ManifestMapper {
                     }
                 })?;
                 let local = format!("{}{raw_id}", rules.local_prefix);
-                if locals.contains_key(&local) && collection.paginate == Pagination::LimitOffset {
-                    // Offset pagination against a live-mutating remote list
-                    // (e.g. Hindsight's async LLM extraction continuing to
-                    // write while a page walk is in flight) can re-observe
-                    // the same record at a different offset when items
-                    // shift position between page fetches. That is the same
-                    // record by id, not a real collision -- the graph's
-                    // strict `try_add_node` hard-fail below stays in force
-                    // for `Pagination::None` collections, where a duplicate
+                if locals.contains_key(&local)
+                    && matches!(
+                        collection.paginate,
+                        Pagination::LimitOffset | Pagination::PageNumber { .. }
+                    )
+                {
+                    // Multi-request walks against a live-mutating remote
+                    // list can re-observe the same record when items shift
+                    // between fetches - an offset walk re-covering a
+                    // Hindsight memory mid-extraction, or a page window
+                    // re-covering an OpenAlex work whose relevance moved
+                    // mid-walk. That is the same record by id, not a real
+                    // collision -- the graph's strict `try_add_node`
+                    // hard-fail below stays in force for
+                    // `Pagination::None` collections, where a duplicate
                     // id can only mean a genuine package/data bug.
                     tracing::debug!(
                         collection = %collection.name,
