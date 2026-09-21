@@ -105,13 +105,13 @@ name = "mailto"
 default = "ops@schrodinger.com"
 description = "Contact address sent as OpenAlex's mailto parameter (polite pool)"
 
-# How many works one request returns. OpenAlex caps `per-page` at 200, and
-# this package fetches one page, so `count` is the import size. Larger
-# scopes need the scope variable narrowed instead.
+# OpenAlex caps `per-page` at 200. This package is one-page only because
+# OpenAlex pages by cursor, not limit/offset. Change the `query` to narrow
+# the scope rather than requesting more records per page.
 [[parser.variables]]
-name = "count"
+name = "per_page"
 default = "200"
-description = "Works imported (one page; OpenAlex caps per-page at 200)"
+description = "Records per page (OpenAlex caps at 200)"
 
 [[parser.collections]]
 name = "works"
@@ -119,16 +119,14 @@ path = "/works"
 items_pointer = "/results"
 # No `total_pointer`: `/meta/count` is how many works match the scope across
 # the whole corpus (tens of thousands), not how many this package imports.
-# Checking it against `limits.nodes` would fail every interesting scope; the
-# real bound is the single `per-page` page requested below.
 
 [parser.collections.query]
 search = "{query}"
 mailto = "{mailto}"
-"per-page" = "{count}"
+"per-page" = "{per_page}"
 select = "id,display_name,publication_year,cited_by_count,type,doi,language,referenced_works,primary_location"
 
-# One page: the engine's limit/offset walk does not apply to cursor paging.
+# OpenAlex pages by cursor; the json engine does not speak cursor pagination.
 [parser.collections.paginate]
 style = "none"
 
