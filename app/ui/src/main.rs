@@ -1111,6 +1111,38 @@ fn App() -> Element {
     );
     workspace::mount_viewport_observer(&ws_user);
     workspace::mount_viewport_observer(&ws_sessions);
+
+    // Surgical live updates: poll the cheap `/graph/ids` revision header and
+    // re-fetch ONLY the graph payload when the server's topology advances.
+    // The layout panel normally drives this through `/graph/layout/stream`,
+    // but that endpoint needs a compute worker; a static filesystem importer
+    // (e.g. a runtime Pest package) has none, so without this the canvas
+    // would only ever show the snapshot loaded at boot. `reload_graph`
+    // replaces the graph in place — panels, selection, camera, and workspace
+    // state survive, unlike a page reload.
+    {
+        let ctx = use_context::<Ctx>();
+        use_effect(move || {
+            spawn(async move {
+                let mut last: Option<u64> = None;
+                loop {
+                    sleep(std::time::Duration::from_secs(2)).await;
+                    match api::graph_revision_probe().await {
+                        Ok(Some(rev)) => {
+                            let advanced = last.is_some_and(|prev| prev != rev);
+                            last = Some(rev);
+                            if advanced {
+                                spawn(reload_graph(ctx));
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(_) => {}
+                    }
+                }
+            });
+        });
+    }
+
     // Hoisted above the palette-drain effect so both it and Ctx share one
     // view signal. Boot restores the view last chosen via the switcher.
     let view = use_signal(persisted_view);
