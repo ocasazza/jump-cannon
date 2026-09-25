@@ -478,6 +478,24 @@ impl ValidatedPackage {
         pest::parse_input(self, runtime, input)
     }
 
+    /// Parse caller-supplied input and additionally return the node bodies
+    /// captured by the package's optional `content` rule, keyed by local
+    /// capture id. Native hosts serve them through `Importer::read_body`.
+    pub fn parse_input_with_bodies(
+        &self,
+        input: &str,
+    ) -> Result<(data_loader::LoadResult, std::collections::HashMap<String, String>), ImportError>
+    {
+        let EngineRuntime::Pest(runtime) = &self.runtime else {
+            return Err(ImportError::WrongEngine {
+                op: "parse_input_with_bodies",
+                needed: pest::ENGINE,
+                actual: json::ENGINE,
+            });
+        };
+        pest::parse_input_with_bodies(self, runtime, input)
+    }
+
     /// Resolve administrator-supplied values against the package's declared
     /// variables, applying defaults and rejecting unknown or unusable values.
     /// Dispatches per engine: the json engine validates URL path segments; the

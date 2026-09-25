@@ -856,7 +856,8 @@ fn progress_reports_one_stage_three_advances_and_a_finish() {
     // then a post-parse detail with the record total. Three pages = 6 advances.
     assert_eq!(advances.len(), 6, "two advances per page (pre-request + result): {events:?}");
     // Filter to only the post-parse detail advances (those containing "records").
-    let result_advances: Vec<&String> = advances.iter().filter(|a| a.contains("records")).collect();
+    let result_advances: Vec<&String> =
+        advances.iter().copied().filter(|a| a.contains("records")).collect();
     assert_eq!(result_advances.len(), 3, "three result advances: {result_advances:?}");
     assert!(result_advances[0].contains("2 records"), "{result_advances:?}");
     assert!(result_advances[1].contains("4 records"), "{result_advances:?}");

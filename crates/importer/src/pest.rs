@@ -84,6 +84,13 @@ pub struct CaptureRules {
     pub edge: String,
     pub source: String,
     pub target: String,
+    /// Optional per-node body capture. When bound, matched nodes carry a
+    /// readable markdown body: the schema advertises
+    /// `content.readable = true`, the importer gains a scoped `ContentRead`
+    /// capability, and the captured text is served through
+    /// `Importer::read_body`. Omit it for metadata-only packages.
+    #[serde(default)]
+    pub content: Option<String>,
 }
 
 impl CaptureRules {
@@ -101,6 +108,17 @@ impl CaptureRules {
             ("source", &self.source),
             ("target", &self.target),
         ]
+    }
+
+    /// The optional content rule joins the fixed eleven in the
+    /// distinct-rule validation.
+    fn optional_named(&self) -> impl Iterator<Item = (&'static str, &str)> {
+        self.content.iter().map(|rule| ("content", rule.as_str()))
+    }
+
+    /// Whether this package captures per-node bodies.
+    fn captures_content(&self) -> bool {
+        self.content.is_some()
     }
 }
 
@@ -258,6 +276,27 @@ fn pest_schema(manifest: &ImporterManifest) -> ImporterSchema {
         data_loader::TagHierarchySchema::slash(),
     )
     .with_input_media_types(["text/plain"])
+    .with_content(if captures_content(manifest) {
+        data_loader::ContentSchema {
+            readable: true,
+            writable: false,
+            media_types: vec!["text/markdown".to_owned()],
+        }
+    } else {
+        data_loader::ContentSchema {
+            readable: false,
+            writable: false,
+            media_types: Vec::new(),
+        }
+    })
+}
+
+/// Whether the package's parser binds the optional `content` capture.
+fn captures_content(manifest: &ImporterManifest) -> bool {
+    match &manifest.parser {
+        ParserConfig::Pest(config) => config.captures.captures_content(),
+        _ => false,
+    }
 }
 
 fn validate_rule_bindings(
@@ -272,7 +311,12 @@ fn validate_rule_bindings(
     validate_bound_rule("root", &config.root_rule, &rules)?;
 
     let mut assigned = HashMap::new();
-    for (role, name) in config.captures.named() {
+    for (role, name) in config
+        .captures
+        .named()
+        .into_iter()
+        .chain(config.captures.optional_named())
+    {
         validate_bound_rule(role, name, &rules)?;
         if let Some(first_role) = assigned.insert(name, role) {
             return Err(ImportError::AmbiguousCaptureRule {
@@ -319,6 +363,17 @@ pub(crate) fn parse_input(
     runtime: &PestRuntime,
     input: &str,
 ) -> Result<LoadResult, ImportError> {
+    let (result, _bodies) = parse_input_with_bodies(package, runtime, input)?;
+    Ok(result)
+}
+
+/// Same mapping as [`parse_input`], additionally returning the node bodies
+/// captured by the optional `content` rule, keyed by local capture id.
+pub(crate) fn parse_input_with_bodies(
+    package: &ValidatedPackage,
+    runtime: &PestRuntime,
+    input: &str,
+) -> Result<(LoadResult, HashMap<String, String>), ImportError> {
     if input.len() > package.manifest.limits.input_bytes {
         return Err(ImportError::InputTooLarge {
             actual: input.len(),
@@ -398,11 +453,13 @@ pub(crate) fn parse_input(
         .map(|node| engine.search_document(node))
         .collect();
 
-    Ok(LoadResult {
+    let bodies = mapped.bodies;
+    let result = LoadResult {
         graph: mapped.graph,
         search_documents,
         unresolved,
-    })
+    };
+    Ok((result, bodies))
 }
 
 /// Borrowed mapping context: the validated package, its pest configuration,
@@ -453,7 +510,10 @@ impl PestEngine<'_> {
                 });
             }
 
-            let node = self.map_node(pair)?;
+            let (node, body) = self.map_node(pair)?;
+            if let Some((path, body)) = body {
+                mapped.bodies.insert(path, body);
+            }
             if mapped.graph.nodes.contains_key(&node.id) {
                 // Report the local capture id, not the namespaced node ID.
                 return Err(ImportError::DuplicateNodeId(node.meta.path.clone()));
@@ -482,7 +542,10 @@ impl PestEngine<'_> {
         Ok(())
     }
 
-    fn map_node<'i, 'r>(&self, pair: Pair<'i, &'r str>) -> Result<VaultNode, ImportError> {
+    fn map_node<'i, 'r>(
+        &self,
+        pair: Pair<'i, &'r str>,
+    ) -> Result<(VaultNode, Option<(String, String)>), ImportError> {
         let mut fields = NodeFields::default();
         for child in pair.into_inner() {
             self.collect_node_fields(child, &mut fields)?;
@@ -500,9 +563,12 @@ impl PestEngine<'_> {
             .node_id(&id)
             .map_err(|error| invalid_record("node", error.to_string()))?;
 
-        let title = fields.title.unwrap_or_else(|| id.clone());
+        let title = fields.title.clone().unwrap_or_else(|| id.clone());
         fields.tags.sort();
         fields.tags.dedup();
+        let content = fields
+            .content
+            .filter(|body| !body.trim().is_empty());
         let meta = NodeMeta {
             source_id: self.package.manifest.metadata.id.clone(),
             title,
@@ -512,18 +578,22 @@ impl PestEngine<'_> {
             path: id.clone(),
             doctype: fields.kind,
             folder: String::new(),
-            content_type: None,
-            content_readable: false,
+            content_type: content.as_ref().map(|_| "text/markdown".to_owned()),
+            content_readable: content.is_some(),
             content_writable: false,
         };
 
-        Ok(VaultNode {
-            id: node_id,
-            meta,
-            metrics: NodeMetrics::default(),
-            x: 0.0,
-            y: 0.0,
-        })
+        let body = content.map(|body| (id, body));
+        Ok((
+            VaultNode {
+                id: node_id,
+                meta,
+                metrics: NodeMetrics::default(),
+                x: 0.0,
+                y: 0.0,
+            },
+            body,
+        ))
     }
 
     fn collect_node_fields<'i, 'r>(
@@ -536,6 +606,16 @@ impl PestEngine<'_> {
 
         if rule == captures.id {
             return set_scalar(&mut fields.id, pair.as_str(), "node", "id");
+        }
+        if let Some(content_rule) = &captures.content {
+            if rule == content_rule {
+                return set_scalar(
+                    &mut fields.content,
+                    pair.as_str(),
+                    "node",
+                    "content",
+                );
+            }
         }
         if rule == captures.title {
             return set_scalar(&mut fields.title, pair.as_str(), "node", "title");
@@ -675,6 +755,8 @@ impl PestEngine<'_> {
 struct MappedGraph {
     graph: VaultGraph,
     edges: Vec<VaultEdge>,
+    /// Node bodies from the optional `content` capture, keyed by local id.
+    bodies: HashMap<String, String>,
 }
 
 #[derive(Default)]
@@ -684,6 +766,7 @@ struct NodeFields {
     kind: Option<String>,
     tags: Vec<String>,
     properties: HashMap<String, Value>,
+    content: Option<String>,
 }
 
 fn set_scalar(
@@ -712,6 +795,9 @@ fn invalid_record(record: &'static str, detail: impl Into<String>) -> ImportErro
 pub struct FilesystemLoader {
     package: ValidatedPackage,
     input_path: PathBuf,
+    /// Node bodies from the package's optional `content` capture, keyed by
+    /// local capture id; refreshed on every load.
+    bodies: std::sync::Mutex<HashMap<String, String>>,
 }
 
 #[cfg(feature = "native")]
@@ -724,6 +810,7 @@ impl FilesystemLoader {
         Ok(Self {
             package,
             input_path: input_path.into(),
+            bodies: std::sync::Mutex::new(HashMap::new()),
         })
     }
 
@@ -735,7 +822,11 @@ impl FilesystemLoader {
             path: self.input_path.clone(),
             source,
         })?;
-        self.package.parse_input(&input)
+        let (result, bodies) = self.package.parse_input_with_bodies(&input)?;
+        if let Ok(mut store) = self.bodies.lock() {
+            *store = bodies;
+        }
+        Ok(result)
     }
 
     /// Validated package bound to this loader.
@@ -746,6 +837,14 @@ impl FilesystemLoader {
     /// Explicit administrator-configured input path.
     pub fn input_path(&self) -> &Path {
         &self.input_path
+    }
+
+    /// Whether the bound package captures per-node bodies.
+    pub fn captures_content(&self) -> bool {
+        self.package
+            .pest_config()
+            .ok()
+            .is_some_and(|config| config.captures.captures_content())
     }
 }
 
@@ -809,12 +908,31 @@ impl Importer for FilesystemImporter {
         let metadata = &self.loader.package.manifest.metadata;
         let scope = self.loader.input_path.to_string_lossy().into_owned();
         let read = Capability::new(Effect::Read, Transport::Filesystem, scope.clone());
-        let watch = Capability::new(Effect::Watch, Transport::Filesystem, scope);
+        let watch = Capability::new(Effect::Watch, Transport::Filesystem, scope.clone());
+        let mut capabilities = vec![read, watch];
+        if self.loader.captures_content() {
+            // Bodies are served from this importer's capture store, not
+            // from disk. The capability is scoped to the package's own
+            // root (the input's directory) — the same contract OKF uses —
+            // so hosts gate reads on `--vault-root` while cross-source
+            // reads stay denied.
+            let root = self
+                .loader
+                .input_path
+                .parent()
+                .map(|parent| parent.to_string_lossy().into_owned())
+                .unwrap_or(scope);
+            capabilities.push(Capability::new(
+                Effect::ContentRead,
+                Transport::Filesystem,
+                root,
+            ));
+        }
         ImporterDescriptor::new(
             &metadata.id,
             &metadata.name,
             &metadata.version,
-            vec![read, watch],
+            capabilities,
             self.loader.package.schema().clone(),
         )
         .with_watch(WatchPlan::Filesystem {
@@ -845,6 +963,12 @@ impl Importer for FilesystemImporter {
             }
             result
         })
+    }
+
+    /// Node bodies captured by the package's optional `content` rule,
+    /// keyed by the node's local capture id (`NodeMeta::path`).
+    fn read_body(&self, path: &str) -> Option<String> {
+        self.loader.bodies.lock().ok()?.get(path).cloned()
     }
 }
 

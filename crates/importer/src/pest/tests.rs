@@ -342,3 +342,114 @@ mod native {
         data_loader::testing::assert_import_contract(&importer).await;
     }
 }
+
+// --- optional content capture -------------------------------------------------
+
+const CONTENT_GRAMMAR: &str = r#"
+document = { SOI ~ (record ~ NEWLINE?)* ~ EOI }
+record = _{ node | edge }
+node = { "N|" ~ node_id ~ "|" ~ title ~ "|" ~ kind ~ "|" ~ tags ~ "|" ~ properties ~ content }
+node_id = @{ field }
+title = @{ field }
+kind = @{ field }
+tags = _{ (tag ~ ("," ~ tag)*)? }
+tag = @{ atom }
+properties = _{ (property ~ (";" ~ property)*)? }
+property = { key ~ "=" ~ value }
+key = @{ atom }
+value = @{ atom }
+content = _{ "|" ~ body }
+body = @{ (!NEWLINE ~ ANY)+ }
+edge = { "E|" ~ source ~ "|" ~ target }
+source = @{ field }
+target = @{ field }
+field = _{ (!("|" | NEWLINE) ~ ANY)+ }
+atom = _{ (!("," | ";" | "=" | "|" | NEWLINE) ~ ANY)+ }
+"#;
+
+fn content_manifest(captures: &str) -> String {
+    format!(
+        r#"format_version = 3
+
+[metadata]
+id = "example.content-graph"
+name = "Content graph"
+version = "0.1.0"
+description = "Package with per-node bodies"
+
+[parser]
+engine = "pest"
+root_rule = "document"
+grammar = '''{CONTENT_GRAMMAR}'''
+
+[parser.captures]
+node = "node"
+id = "node_id"
+title = "title"
+kind = "kind"
+tag = "tag"
+property = "property"
+key = "key"
+value = "value"
+edge = "edge"
+source = "source"
+target = "target"
+{captures}
+"#
+    )
+}
+
+#[test]
+fn content_capture_marks_nodes_readable_and_returns_bodies() {
+    let package = ValidatedPackage::from_toml(&content_manifest("content = \"body\""))
+        .expect("valid content package");
+    assert!(captures_content(package.manifest()));
+
+    let input = concat!(
+        "N|n1|Alpha|service|red|owner=platform|# alpha body\n",
+        "N|n2|Beta|database||state=ready|# beta body\n"
+    );
+    let (result, bodies) = package
+        .parse_input_with_bodies(input)
+        .expect("input parses");
+
+    for node in result.graph.nodes.values() {
+        assert!(node.meta.content_readable, "node must advertise body");
+        assert_eq!(
+            node.meta.content_type.as_deref(),
+            Some("text/markdown")
+        );
+    }
+    assert_eq!(bodies.get("n1").map(String::as_str), Some("# alpha body"));
+    assert_eq!(bodies.get("n2").map(String::as_str), Some("# beta body"));
+
+    // The schema advertises readable content, and the node bodies do not
+    // escape outside it.
+    let schema = package.schema();
+    assert!(schema.content.readable);
+    assert!(!schema.content.writable);
+    assert!(schema.validate_result(&result).is_ok());
+}
+
+#[test]
+fn packages_without_content_stay_metadata_only() {
+    let package = package();
+    assert!(!captures_content(package.manifest()));
+    let result = package
+        .parse_input("N|n1|Alpha|service|red|owner=platform")
+        .expect("input parses");
+    for node in result.graph.nodes.values() {
+        assert!(!node.meta.content_readable);
+    }
+    assert!(package.schema().validate_result(&result).is_ok());
+}
+
+#[test]
+fn content_rule_must_be_distinct_from_canonical_roles() {
+    let clash = content_manifest("content = \"title\"");
+    let error = ValidatedPackage::from_toml(&clash).expect_err("clashing rule must fail");
+    assert!(
+        matches!(error, ImportError::AmbiguousCaptureRule { .. }),
+        "got {error:?}"
+    );
+}
