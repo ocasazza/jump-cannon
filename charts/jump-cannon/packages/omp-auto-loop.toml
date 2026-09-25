@@ -1,0 +1,80 @@
+# omp auto-loop package.
+#
+# A runtime Pest grammar package (format_version = 3) that turns the omp
+# auto-loop's line-oriented projection (~/.local/state/omp-auto-loop/
+# graph.lines) into the canonical graph. The extension appends one
+# N|id|title|kind|tags|props record per session on every state transition
+# and one event node + session->event edge per loop event; tags carry the
+# event class (continue / gate / goal / heartbeat / settled) and the
+# session's goal state. Per AGENTS.md, "Importers: packages, not crates" —
+# no SourceKind variant, no new crate.
+#
+# Bind locally with:
+#   graph-api --source=pest \
+#     --importer-manifest charts/jump-cannon/packages/omp-auto-loop.toml \
+#     --importer-input ~/.local/state/omp-auto-loop/graph.lines --port 8799
+
+format_version = 3
+
+[metadata]
+id = "ocasazza.omp-auto-loop"
+name = "omp auto-loop"
+version = "1.0.0"
+description = "Reads the omp auto-loop (prime-agent internal-loop port) projection as a graph: one session node per live omp session with goal state, one event node per loop transition tagged by class, and session->event edges."
+
+[limits]
+manifest_bytes = 131072
+grammar_bytes = 65536
+input_bytes = 33554432
+nodes = 100000
+edges = 500000
+
+[[schema.fields]]
+key = "cwd"
+field_type = "keyword"
+required = false
+searchable = true
+facetable = true
+
+[[schema.fields]]
+key = "kind"
+field_type = "keyword"
+required = false
+searchable = true
+facetable = true
+
+[parser]
+engine = "pest"
+root_rule = "document"
+grammar = '''
+document = { SOI ~ (record ~ NEWLINE?)* ~ EOI }
+record = _{ node | edge }
+node = { "N|" ~ node_id ~ "|" ~ title ~ "|" ~ kind ~ "|" ~ tags ~ "|" ~ properties }
+node_id = @{ field }
+title = @{ field }
+kind = @{ field }
+tags = _{ (tag ~ ("," ~ tag)*)? }
+tag = @{ atom }
+properties = _{ (property ~ (";" ~ property)*)? }
+property = { key ~ "=" ~ value }
+key = @{ atom }
+value = @{ atom }
+edge = { "E|" ~ source ~ "|" ~ target }
+source = @{ field }
+target = @{ field }
+field = _{ (!("|" | NEWLINE) ~ ANY)+ }
+atom = _{ (!("," | ";" | "=" | "|" | NEWLINE) ~ ANY)+ }
+'''
+
+[parser.captures]
+node = "node"
+id = "node_id"
+title = "title"
+kind = "kind"
+tag = "tag"
+property = "property"
+key = "key"
+value = "value"
+edge = "edge"
+source = "source"
+target = "target"

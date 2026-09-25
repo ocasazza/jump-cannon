@@ -22,6 +22,9 @@ declarative package under `charts/jump-cannon/packages/`
 bound to an instance at runtime via the `JUMP_CANNON_IMPORTER_*` env vars;
 Hindsight is the package `hindsight-memory-bank.toml`, not a source kind.
 See [[Hindsight Importer]] and AGENTS.md "Importers: packages, not crates".
+The omp auto-loop runtime is the same shape: the pest package
+`omp-auto-loop.toml` over the loop's line projection, with its canvas
+mapping defined in [[OMP Auto-Loop Topos]].
 GitHub delivers a repository tarball over HTTP with ETag polling and reuses
 the Obsidian markdown pipeline; see [[GitHub Importer]]. OKF implements the
 official format version 0.2; its `0.2` version must not be called `0.0.2`.
