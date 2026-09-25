@@ -42,6 +42,21 @@ Edges are `session -> event` only (untyped, per the vault contract).
    "which work in this repo needed autonomous continuations"; `tags:gate`
    surfaces every verifier intervention.
 
+## Applying this topos (static layout)
+
+The canvas persists layouts as `jc_layout_v1` in localStorage (re-seeded at
+boot); this deployment ships
+[`omp-auto-loop.layout.json`](omp-auto-loop.layout.json) — a tiling-mode
+`SavedLayoutV2` with Graph full-row, Nodes + Inspector half-row, Timeline
+and Importers docked. Apply once per browser by pasting the file's JSON:
+
+```js
+localStorage.setItem("jc_layout_v1", <omp-auto-loop.layout.json contents>);
+```
+
+Then reload — the workspace comes up in tiling mode with the loop regime
+pinned; nothing floats.
+
 ## Why a topos and not a dashboard
 
 The generic canvas already owns layout, search, and panels; the topos is

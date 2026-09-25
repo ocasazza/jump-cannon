@@ -1,0 +1,13 @@
+{
+  "version": 2,
+  "units": "CssPx",
+  "viewport": [1600, 900],
+  "mode": "Tiling",
+  "panels": [
+    { "kind": "Graph", "x": 0, "y": 0, "w": 1600, "h": 500, "state": "Floating", "z": 0, "tile_w": 4 },
+    { "kind": "Nodes", "x": 0, "y": 500, "w": 800, "h": 400, "state": "Floating", "z": 0, "tile_w": 2 },
+    { "kind": "Inspector", "x": 800, "y": 500, "w": 800, "h": 400, "state": "Floating", "z": 0, "tile_w": 2 },
+    { "kind": "Timeline", "x": 0, "y": 900, "w": 800, "h": 200, "state": "Minimized", "z": 0, "tile_w": 2 },
+    { "kind": "Importers", "x": 800, "y": 900, "w": 800, "h": 200, "state": "Minimized", "z": 0, "tile_w": 2 }
+  ]
+}
