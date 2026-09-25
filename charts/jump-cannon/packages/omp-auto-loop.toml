@@ -29,6 +29,20 @@ input_bytes = 33554432
 nodes = 100000
 edges = 500000
 
+
+[[schema.fields]]
+key = "ts"
+field_type = "keyword"
+required = false
+searchable = true
+facetable = false
+
+[[schema.fields]]
+key = "sess"
+field_type = "keyword"
+required = false
+searchable = true
+facetable = true
 [[schema.fields]]
 key = "cwd"
 field_type = "keyword"
