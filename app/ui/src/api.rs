@@ -497,7 +497,7 @@ pub(crate) async fn graph_revision_probe() -> LoadResult<Option<u64>> {
     let resp = get("/graph/ids").send().await.map_err(|e| LoadError::Other(e.to_string()))?;
     let status = resp.status();
     let revision = graph_revision(&resp);
-    if !status.is_success() {
+    if !(200..300).contains(&status) {
         return Err(LoadError::Other(format!("/graph/ids -> HTTP {status}")));
     }
     Ok((revision != 0).then_some(revision))

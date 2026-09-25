@@ -1126,7 +1126,7 @@ fn App() -> Element {
             spawn(async move {
                 let mut last: Option<u64> = None;
                 loop {
-                    sleep(std::time::Duration::from_secs(2)).await;
+                    gloo_timers::future::sleep(std::time::Duration::from_secs(2)).await;
                     match api::graph_revision_probe().await {
                         Ok(Some(rev)) => {
                             let advanced = last.is_some_and(|prev| prev != rev);
