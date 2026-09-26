@@ -12,12 +12,37 @@
 One Pest package over the extension's line projection
 (`~/.local/state/omp-auto-loop/graph.lines`):
 
-| Node kind | id | tags | facets |
-|---|---|---|---|
-| `session` | `s<pid>` | `active-goal` / `no-goal` | `cwd` |
-| `event` | `e<pid>_<n>` | `continue` / `gate` / `goal` / `heartbeat` / `settled` | `kind` |
+| Node kind | id | tags | properties | body |
+|---|---|---|---|---|
+| `session` | `s<omp session id>` | `active-goal` / `no-goal`, `main` / `sub`, last outcome | `cwd`, `continuations`, `max_continuations`, `heartbeats`, `model` | the goal's objective (absent without one) |
+| `repo` | `r<hash(shared git dir)>` | repo name | `root` | — |
+| `goal` | `g<hash(objective)>` | `active` / `paused` / `complete` | — | the objective |
+| `gate` | `c<hash(command)>` | — | — | the verifier command |
+| `event` | `e<session id>_<n>` | `continue` / `gate` / `goal` / `settled` / `other` | `ts`, `sess` | the full event message |
 
-Edges are `session -> event` only (untyped, per the vault contract).
+Edges (untyped, per the vault contract — the endpoint kinds carry the
+meaning): `session -> repo`, `session -> goal`, `session -> gate`,
+`session -> session` (parent spawned subagent), `session -> event`, and
+`event -> event` (the session's timeline, in order).
+
+Why these kinds: they are the shared anchors. Sessions are keyed by omp's
+session id, so a restarted or resumed session stays one hub; worktrees of one
+repo resolve to the same shared git dir; the same objective hashes to the
+same goal. Work on the same thing therefore forms one connected component
+instead of one isolated star per process. Heartbeats are a count on the hub,
+not nodes — they were a third of all events and carried no information.
+
+The producer supplies data only: bodies are raw content with newlines
+collapsed (the grammar's `body_text` is one line), never pre-rendered
+markdown. Every presentation choice — what a node click shows, how the
+budget reads, colors, arrangement — belongs to this topos. Properties not
+declared as `[[schema.fields]]` stay node metadata without entering search.
+Every node is upserted in place by id, so shared nodes appear once and always
+carry the current state.
+
+Typed edges (`E|src|tgt|kind`) need upstream work first: `VaultEdge` carries
+no attributes, so a declared `[[schema.edge_types]]` key never reaches the
+canvas.
 
 ## The transformation (generic canvas -> loop regime)
 
