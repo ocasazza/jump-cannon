@@ -1446,6 +1446,22 @@ pub fn panel(ctx: Ctx) -> Element {
     ensure_init();
     crate::appstate::ensure_init();
     let server_backed = ctx.graph_session.read().is_server_backed();
+    // Re-render when the loop's caches change. Fetches (edge kinds, tag
+    // facets, metric buffers) land in thread-locals from a detached future
+    // that cannot write signals, so without this watcher anything the panel
+    // derives from them (the edge-kind legend) keeps its first-render value
+    // until an unrelated signal happens to change.
+    let mut metrics_gen = use_signal(|| METRICS_GEN.with(Cell::get));
+    use_future(move || async move {
+        loop {
+            gloo_timers::future::TimeoutFuture::new(250).await;
+            let now = METRICS_GEN.with(Cell::get);
+            if now != *metrics_gen.peek() {
+                metrics_gen.set(now);
+            }
+        }
+    });
+    let _ = metrics_gen.read();
     // Selection mirror for the post-recompute overlay re-push. Kept fresh
     // for as long as the panel renders (the workspace re-renders open
     // panels whenever the selection signal changes).
