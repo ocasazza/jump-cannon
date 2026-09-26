@@ -554,7 +554,7 @@ pub fn convert_generated_graph(
         let source = namespace.node_id(&edge.source)?;
         let target = namespace.node_id(&edge.target)?;
         if graph.nodes.contains_key(&source) && graph.nodes.contains_key(&target) {
-            graph.add_edge(VaultEdge { source, target });
+            graph.add_edge(VaultEdge::new(source, target));
         }
     }
 

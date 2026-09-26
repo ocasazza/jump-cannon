@@ -83,6 +83,18 @@ falls back to the default rather than to the exact O(n²) path. The scale
 limits of this engine and the planned steps beyond them are tracked in
 `docs/layout-algorithms.md` §"Scale ladder".
 
+## Edge colors by kind
+
+**Edge color by** in the Style panel tints edges from a node metric shared by
+both endpoints (community, folder, doctype, tag) or, with **Kind (edge
+type)**, from the edge's own importer-declared kind: each kind takes the
+palette swatch of its slot in the server's kind palette
+(`GET /graph/edge-kinds` + `/graph/edge-kinds.bin`, see [[Backend API]]), and
+a legend under the selector lists the kinds the mounted graph uses. Untyped
+edges keep the uniform edge color, so a source that declares no kinds looks
+exactly as it does in *None*. Client-only graphs have no server kinds and the
+legend says so.
+
 ## Region map
 
 The **Regions** section in the Style panel controls an aggregate visualization mode for graphs too large to render node-by-node. Each region is a color-filled Voronoi cell, and cells are indexed by the active `community` metric (often a clustering or partition algorithm output like Louvain modularity).

@@ -85,6 +85,8 @@ fn api_routes() -> Router<SourceHost> {
         .route("/graph/ids", get(graph_ids))
         .route("/graph/positions", get(graph_positions))
         .route("/graph/edges", get(graph_edges))
+        .route("/graph/edge-kinds", get(graph_edge_kinds))
+        .route("/graph/edge-kinds.bin", get(graph_edge_kinds_bin))
         .route("/graph/csr.bin", get(graph_csr_bin))
         .route("/graph/metrics/:name", get(graph_metric))
         .route("/graph/meta_summary", get(graph_meta_summary))
@@ -2095,6 +2097,31 @@ async fn graph_positions(selection: SourceSelection) -> impl IntoResponse {
 async fn graph_edges(selection: SourceSelection) -> impl IntoResponse {
     let s = selection.0;
     cached_binary_response(&s, "edges").into_response()
+}
+
+/// Edge kind palette for the snapshot: `{"graph_revision", "kinds": [...]}`.
+/// `/graph/edge-kinds.bin` stores one little-endian `u16` per edge, in
+/// `/graph/edges` order — `0` for an untyped edge, `k` for `kinds[k - 1]`.
+/// Declared edge types lead the palette, so a kind keeps its index across
+/// reloads; undeclared kinds the graph carries follow, sorted.
+async fn graph_edge_kinds(selection: SourceSelection) -> impl IntoResponse {
+    let s = selection.0;
+    let snap = s.snapshot();
+    let mut headers = HeaderMap::new();
+    insert_graph_revision(&mut headers, snap.revision);
+    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    (
+        headers,
+        Json(serde_json::json!({
+            "graph_revision": snap.revision,
+            "kinds": snap.edge_kind_palette,
+        })),
+    )
+}
+
+async fn graph_edge_kinds_bin(selection: SourceSelection) -> impl IntoResponse {
+    let s = selection.0;
+    cached_binary_response(&s, "edge_kinds").into_response()
 }
 
 /// Symmetrized CSR adjacency export consumed by `graph-compute`. Format is

@@ -20,7 +20,10 @@
 //! the buffer builders — the same fallback the egui app hits for keys it
 //! never fetches into `self.metrics`. The `tag` buckets are derived here
 //! from the importer facet index (`/graph/meta_summary`); graph-api serves
-//! no `tag` metric buffer.
+//! no `tag` metric buffer. Edge kinds (`EdgeColorBy::Kind`) come from
+//! `/graph/edge-kinds` + `/graph/edge-kinds.bin` via
+//! `crate::api::revisioned_edge_kinds`, accepted only when they name the
+//! mounted graph's revision.
 
 use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
@@ -165,6 +168,10 @@ enum EdgeColorBy {
     /// Edges whose endpoints share a primary-tag bucket get the tag's
     /// palette swatch; "bridging" edges fall back to `edge_color`.
     Tag,
+    /// The importer-declared edge kind (`VaultEdge.kind`): each kind gets
+    /// the palette swatch of its slot in the server's kind palette; untyped
+    /// edges keep `edge_color`, so an untyped graph renders as `None`.
+    Kind,
 }
 
 impl EdgeColorBy {
@@ -174,6 +181,7 @@ impl EdgeColorBy {
         EdgeColorBy::Folder,
         EdgeColorBy::Doctype,
         EdgeColorBy::Tag,
+        EdgeColorBy::Kind,
     ];
     fn label(self) -> &'static str {
         match self {
@@ -182,12 +190,14 @@ impl EdgeColorBy {
             EdgeColorBy::Folder => "Folder",
             EdgeColorBy::Doctype => "Doctype",
             EdgeColorBy::Tag => "Tag",
+            EdgeColorBy::Kind => "Kind (edge type)",
         }
     }
-    /// `None` returns an empty key (unused — the call site short-circuits).
+    /// `None` and `Kind` return an empty key (unused — the call site
+    /// short-circuits; `Kind` reads the per-edge slots, not a node metric).
     fn metric_key(self) -> &'static str {
         match self {
-            EdgeColorBy::None => "",
+            EdgeColorBy::None | EdgeColorBy::Kind => "",
             EdgeColorBy::Community => "community",
             EdgeColorBy::Folder => "folder",
             EdgeColorBy::Doctype => "doctype",
@@ -692,6 +702,37 @@ fn edge_colors_from_metric(
     out
 }
 
+/// Per-edge RGBA from the server's kind slots: slot `k > 0` takes palette
+/// swatch `k - 1` (alpha from `fallback`); slot `0` — an untyped edge — and
+/// any slot buffer that does not match the mounted edge count keep
+/// `fallback`, so an untyped graph renders exactly like `EdgeColorBy::None`.
+fn edge_colors_from_kinds(
+    slots: Option<&[u16]>,
+    n_edges: usize,
+    fallback: [f32; 4],
+    palette: PaletteId,
+) -> Vec<f32> {
+    let mut out = Vec::with_capacity(n_edges * 4);
+    match slots {
+        Some(slots) if slots.len() == n_edges => {
+            for &slot in slots {
+                if slot == 0 {
+                    out.extend_from_slice(&fallback);
+                } else {
+                    let c = palette_color(u32::from(slot - 1), palette);
+                    out.extend_from_slice(&[c[0], c[1], c[2], fallback[3]]);
+                }
+            }
+        }
+        _ => {
+            for _ in 0..n_edges {
+                out.extend_from_slice(&fallback);
+            }
+        }
+    }
+    out
+}
+
 /// Number of distinct sprite primitives node.wgsl draws (circle, square,
 /// triangle, diamond, hexagon) — data.rs::N_NODE_SHAPES.
 const N_NODE_SHAPES: u32 = 5;
@@ -755,6 +796,13 @@ thread_local! {
     /// `tag` metric buffer; `/graph/meta_summary` is the same facet source
     /// the Nodes and Filter panels read.
     static TAG_FACETS: RefCell<Option<FieldIndex>> = const { RefCell::new(None) };
+    /// Edge kinds of the mounted server graph (`/graph/edge-kinds` +
+    /// `.bin`), fetched once per graph session for `EdgeColorBy::Kind`.
+    static EDGE_KINDS: RefCell<Option<crate::api::EdgeKinds>> = const { RefCell::new(None) };
+    /// The mounted server graph's revision (`None` when the server
+    /// advertises none). Per-revision fetches must name exactly this
+    /// revision — the same guard the bootstrap applies to its buffers.
+    static EXPECTED_REVISION: Cell<Option<u64>> = const { Cell::new(None) };
     /// Server metrics are only meaningful for a graph-api-owned topology.
     static METRICS_ALLOWED: Cell<bool> = const { Cell::new(false) };
     static METRICS_SESSION: Cell<u64> = const { Cell::new(0) };
@@ -773,13 +821,17 @@ thread_local! {
     static LAST_PANEL_RENDER_MS: Cell<f64> = const { Cell::new(0.0) };
 }
 
-pub(crate) fn reset_for_graph_session(server_backed: bool) {
+/// Start a graph session: `server_backed` enables the server-side fetches
+/// and `revision` is the mounted snapshot's revision they must match.
+pub(crate) fn reset_for_graph_session(server_backed: bool, revision: Option<u64>) {
     METRICS_ALLOWED.with(|c| c.set(server_backed));
+    EXPECTED_REVISION.with(|c| c.set(revision.filter(|r| *r != 0)));
     METRICS_SESSION.with(|c| c.set(c.get().wrapping_add(1)));
     METRICS_TL.with(|m| m.borrow_mut().clear());
     PENDING.with(|p| p.borrow_mut().clear());
     UNSERVED.with(|u| u.borrow_mut().clear());
     TAG_FACETS.with(|c| c.borrow_mut().take());
+    EDGE_KINDS.with(|c| c.borrow_mut().take());
     METRICS_GEN.with(|g| g.set(g.get().wrapping_add(1)));
     LAST_APPLIED.with(|c| c.set(None));
 }
@@ -847,6 +899,9 @@ fn ensure_metrics(style: &StyleState) {
     ];
     if style.edge_color_by != EdgeColorBy::None {
         want.push(style.edge_color_by.metric_key());
+    }
+    if style.edge_color_by == EdgeColorBy::Kind {
+        ensure_edge_kinds();
     }
     if style.community_source == CommunitySource::Tag {
         want.push(TAG_KEY);
@@ -1075,6 +1130,75 @@ fn ensure_tag_metric() {
     }
 }
 
+/// The cache key `ensure_edge_kinds` shares with the metric pending/unserved
+/// sets (no metric buffer is named this, so it cannot collide).
+const EDGE_KINDS_KEY: &str = "edge_kinds";
+
+/// Fetch the mounted server graph's edge kinds once per graph session. A
+/// 404 (a graph-api before typed edges) is final for the session; a
+/// response naming another snapshot revision is dropped and asked again on
+/// the next loop tick — the revision poller replaces the graph shortly after,
+/// which starts a fresh session anyway.
+fn ensure_edge_kinds() {
+    if !METRICS_ALLOWED.with(Cell::get) {
+        return;
+    }
+    if EDGE_KINDS.with(|c| c.borrow().is_some()) {
+        return;
+    }
+    if UNSERVED.with(|u| u.borrow().contains(EDGE_KINDS_KEY)) {
+        return;
+    }
+    if PENDING.with(|p| !p.borrow_mut().insert(EDGE_KINDS_KEY.to_string())) {
+        return;
+    }
+    let session = METRICS_SESSION.with(Cell::get);
+    let expected = EXPECTED_REVISION.with(Cell::get);
+    wasm_bindgen_futures::spawn_local(async move {
+        let fetched = crate::api::revisioned_edge_kinds().await;
+        if !current_session(session) {
+            return;
+        }
+        let retry_after_backoff = match fetched {
+            Ok(Some(r))
+                if expected.is_none() || r.revision == 0 || Some(r.revision) == expected =>
+            {
+                EDGE_KINDS.with(|c| *c.borrow_mut() = Some(r.value));
+                METRICS_GEN.with(|g| g.set(g.get().wrapping_add(1)));
+                false
+            }
+            Ok(Some(r)) => {
+                tracing::warn!(
+                    "[style] edge kinds: revision {} != mounted graph {:?}",
+                    r.revision,
+                    expected
+                );
+                true
+            }
+            Ok(None) => {
+                tracing::warn!("[style] edge kinds: not served by this graph-api");
+                UNSERVED.with(|u| {
+                    u.borrow_mut().insert(EDGE_KINDS_KEY.to_string());
+                });
+                false
+            }
+            Err(e) => {
+                tracing::warn!("[style] edge kinds: {e}");
+                true
+            }
+        };
+        if retry_after_backoff {
+            gloo_timers::future::TimeoutFuture::new(15_000).await;
+        }
+        PENDING.with(|p| {
+            p.borrow_mut().remove(EDGE_KINDS_KEY);
+        });
+        if !retry_after_backoff {
+            apply_now();
+        }
+    });
+}
+
 /// Mirror of `app.rs::apply_style_to_gpu`. Edge style + shader intensity
 /// are uniform writes and pushed on every call; the node/edge buffer
 /// recompute is gated on the (style, metrics-gen, buffer-address) key.
@@ -1171,22 +1295,33 @@ fn apply_now() {
             // edge_color for every edge so per-edge tinting is inert.
             let n_edges = pipes.n_edges() as usize;
             if n_edges > 0 {
-                let edge_colors = if style.edge_color_by == EdgeColorBy::None {
-                    let mut v = Vec::with_capacity(n_edges * 4);
-                    for _ in 0..n_edges {
-                        v.extend_from_slice(&style.edge_color);
+                let edge_colors = match style.edge_color_by {
+                    EdgeColorBy::None => {
+                        let mut v = Vec::with_capacity(n_edges * 4);
+                        for _ in 0..n_edges {
+                            v.extend_from_slice(&style.edge_color);
+                        }
+                        v
                     }
-                    v
-                } else {
-                    let edges = pipes.edges_cpu().to_vec();
-                    edge_colors_from_metric(
-                        style.edge_color_by.metric_key(),
-                        mv.as_ref(),
-                        n,
-                        &edges,
-                        style.edge_color,
-                        style.palette,
-                    )
+                    EdgeColorBy::Kind => EDGE_KINDS.with(|c| {
+                        edge_colors_from_kinds(
+                            c.borrow().as_ref().map(|kinds| kinds.slots.as_slice()),
+                            n_edges,
+                            style.edge_color,
+                            style.palette,
+                        )
+                    }),
+                    _ => {
+                        let edges = pipes.edges_cpu().to_vec();
+                        edge_colors_from_metric(
+                            style.edge_color_by.metric_key(),
+                            mv.as_ref(),
+                            n,
+                            &edges,
+                            style.edge_color,
+                            style.palette,
+                        )
+                    }
                 };
                 pipes.update_edge_colors(queue, edge_colors);
             }
@@ -1337,6 +1472,32 @@ pub fn panel(ctx: Ctx) -> Element {
         m.borrow().get("community_levels").and_then(|v| v.first().map(|&x| x as u32)).unwrap_or(1)
     });
     let cur = *crate::render::REGION_LEVEL.read();
+    // Kind legend: the kinds the mounted graph actually uses, each with the
+    // swatch its palette slot maps to. `None` until the kinds have loaded.
+    let kind_legend: Option<Vec<(String, String)>> = (s.edge_color_by == EdgeColorBy::Kind)
+        .then(|| {
+            EDGE_KINDS.with(|c| {
+                c.borrow().as_ref().map(|kinds| {
+                    let mut used = vec![false; kinds.kinds.len()];
+                    for &slot in &kinds.slots {
+                        if let Some(flag) = used.get_mut(usize::from(slot).wrapping_sub(1)) {
+                            *flag = true;
+                        }
+                    }
+                    kinds
+                        .kinds
+                        .iter()
+                        .enumerate()
+                        .filter(|(i, _)| used[*i])
+                        .map(|(i, name)| {
+                            let c = palette_color(i as u32, s.palette);
+                            (name.clone(), rgb_hex([c[0], c[1], c[2], 1.0]))
+                        })
+                        .collect()
+                })
+            })
+        })
+        .flatten();
 
     rsx! {
         div { class: "sty",
@@ -1472,6 +1633,30 @@ pub fn panel(ctx: Ctx) -> Element {
                 EdgeColorBy::ALL.iter().map(|v| v.label()).collect(),
                 EdgeColorBy::ALL.iter().position(|v| *v == s.edge_color_by).unwrap_or(0),
                 move |i| { if let Some(&v) = EdgeColorBy::ALL.get(i) { update(|s| s.edge_color_by = v); } })}
+
+            if s.edge_color_by == EdgeColorBy::Kind {
+                div { class: "sty-row sty-legend",
+                    span { class: "sty-label dim", "Kinds" }
+                    match &kind_legend {
+                        Some(rows) if !rows.is_empty() => rsx! {
+                            div { class: "sty-legend-rows",
+                                for (name, hex) in rows.iter() {
+                                    div { key: "{name}", class: "sty-legend-row",
+                                        span { class: "sty-swatch", style: "background:{hex}" }
+                                        span { class: "sty-legend-name", "{name}" }
+                                    }
+                                }
+                            }
+                        },
+                        Some(_) => rsx! { span { class: "sty-val sty-legend-note", "no typed edges" } },
+                        None => rsx! {
+                            span { class: "sty-val sty-legend-note",
+                                if server_backed { "loading…" } else { "server graphs only" }
+                            }
+                        },
+                    }
+                }
+            }
 
             // egui uses one RGBA picker (Alpha::OnlyBlend); the HTML analog
             // is a color input (RGB) + an alpha slider over the same state.

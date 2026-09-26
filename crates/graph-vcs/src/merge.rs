@@ -219,10 +219,10 @@ pub fn diff_snapshots(a: &Snapshot, b: &Snapshot) -> Vec<GraphOp> {
     }
     for edge in &b.edges {
         if !a.edges.contains(edge) {
-            ops.push(GraphOp::UpsertEdge(vault_data::VaultEdge {
-                source: edge.source.clone(),
-                target: edge.target.clone(),
-            }));
+            ops.push(GraphOp::UpsertEdge(vault_data::VaultEdge::new(
+                edge.source.clone(),
+                edge.target.clone(),
+            )));
         }
     }
     for edge in &a.edges {

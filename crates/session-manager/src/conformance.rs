@@ -85,10 +85,7 @@ pub async fn check_worldhost(host: Arc<dyn WorldHost>) {
             "main",
             vec![
                 GraphOp::UpsertNode(node),
-                GraphOp::UpsertEdge(VaultEdge {
-                    source: "alpha".to_string(),
-                    target: "beta".to_string(),
-                }),
+                GraphOp::UpsertEdge(VaultEdge::new("alpha", "beta")),
             ],
             "conformance",
             "add alpha and edge",

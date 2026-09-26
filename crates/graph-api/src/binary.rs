@@ -6,7 +6,9 @@
 // Future: when backend lives on luna, these endpoints stay binary; the wire
 // cost (and parse cost) is ~10x lower than JSON.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap, HashSet};
+
+use data_loader::EdgeTypeSchema;
 use vault_data::VaultGraph;
 
 /// Flat [x0, y0, x1, y1, ...] little-endian f32 buffer.
@@ -29,6 +31,58 @@ pub fn edges_buffer(graph: &VaultGraph, id_to_idx: &HashMap<String, u32>) -> Vec
         }
     }
     out
+}
+
+/// Per-edge kind indices parallel to [`edges_buffer`]: one little-endian
+/// `u16` per served edge, `0` for an untyped edge and `k` for
+/// `palette[k - 1]`.
+///
+/// The palette is the importer's declared `edge_types` in declaration order,
+/// followed by any kind the graph carries that the schema does not declare,
+/// sorted. Declared-first keeps a kind's index — and so its color — stable
+/// across reloads even when the data churns; the sorted tail keeps the
+/// undeclared case deterministic. The palette is capped at `u16::MAX` kinds;
+/// anything beyond the cap is served untyped.
+pub struct EdgeKinds {
+    pub palette: Vec<String>,
+    pub indices: Vec<u8>,
+}
+
+pub fn edge_kinds(
+    graph: &VaultGraph,
+    id_to_idx: &HashMap<String, u32>,
+    declared: &[EdgeTypeSchema],
+) -> EdgeKinds {
+    let declared_keys: HashSet<&str> = declared.iter().map(|edge_type| edge_type.key.as_str()).collect();
+    let mut extra: BTreeSet<&str> = BTreeSet::new();
+    for edge in &graph.edges {
+        if let Some(kind) = edge.kind.as_deref() {
+            if !declared_keys.contains(kind) {
+                extra.insert(kind);
+            }
+        }
+    }
+    let mut palette: Vec<String> = declared.iter().map(|edge_type| edge_type.key.clone()).collect();
+    palette.extend(extra.into_iter().map(str::to_owned));
+    palette.truncate(usize::from(u16::MAX));
+    let slots: HashMap<&str, u16> = palette
+        .iter()
+        .enumerate()
+        .map(|(i, kind)| (kind.as_str(), i as u16 + 1))
+        .collect();
+
+    let mut indices = Vec::with_capacity(graph.edges.len() * 2);
+    for edge in &graph.edges {
+        if id_to_idx.contains_key(&edge.source) && id_to_idx.contains_key(&edge.target) {
+            let slot = edge
+                .kind
+                .as_deref()
+                .and_then(|kind| slots.get(kind).copied())
+                .unwrap_or(0);
+            indices.extend_from_slice(&slot.to_le_bytes());
+        }
+    }
+    EdgeKinds { palette, indices }
 }
 
 /// Per-metric flat f32 buffer. Returns None if the metric name is unknown.
@@ -137,5 +191,43 @@ mod tests {
 
         // Out-of-range level is unknown, so the route answers 404.
         assert!(metric_buffer(&g, "community_l2").is_none());
+    }
+
+    #[test]
+    fn edge_kind_indices_follow_the_edges_buffer_and_a_declared_first_palette() {
+        use vault_data::VaultEdge;
+
+        let mut g = VaultGraph::new();
+        for id in ["a", "b", "c"] {
+            g.add_node(VaultNode { id: id.into(), ..Default::default() });
+        }
+        let typed = |s: &str, t: &str, kind: &str| VaultEdge {
+            kind: Some(kind.into()),
+            ..VaultEdge::new(s, t)
+        };
+        g.add_edge(typed("a", "b", "pursues"));
+        g.add_edge(VaultEdge::new("b", "c"));
+        g.add_edge(typed("c", "a", "zeta")); // undeclared
+        g.add_edge(typed("a", "ghost", "in_repo")); // dropped from both buffers
+        g.add_edge(typed("a", "c", "alpha")); // undeclared, sorts before zeta
+        g.add_edge(typed("b", "a", "in_repo"));
+
+        let id_to_idx: HashMap<String, u32> =
+            g.nodes.keys().enumerate().map(|(i, id)| (id.clone(), i as u32)).collect();
+        let declared = [
+            EdgeTypeSchema::directed("in_repo", ""),
+            EdgeTypeSchema::directed("pursues", ""),
+        ];
+        let kinds = edge_kinds(&g, &id_to_idx, &declared);
+
+        assert_eq!(kinds.palette, ["in_repo", "pursues", "alpha", "zeta"]);
+        let decoded: Vec<u16> = kinds
+            .indices
+            .chunks_exact(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect();
+        // One slot per served edge, in `/graph/edges` order: 0 = untyped.
+        assert_eq!(decoded, [2, 0, 4, 3, 1]);
+        assert_eq!(decoded.len() * 8, edges_buffer(&g, &id_to_idx).len());
     }
 }

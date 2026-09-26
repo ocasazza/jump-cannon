@@ -203,26 +203,34 @@ impl GraphMapper for ManifestMapper {
 
         // --- pass 2: edges ----------------------------------------------------
         // One dedupe set across every edge source, so a package rule cannot
-        // duplicate an API-provided link (or vice versa).
+        // duplicate an API-provided link (or vice versa). Identity is the
+        // endpoints alone; the first kind seen for a pair wins.
         let mut seen: HashSet<(String, String)> = HashSet::new();
-        let mut push_edge =
-            |graph: &mut VaultGraph, source: String, target: String, dedupe: Dedupe| {
-                let key = match dedupe {
-                    Dedupe::None => None,
-                    Dedupe::Ordered => Some((source.clone(), target.clone())),
-                    Dedupe::Unordered => Some(if source <= target {
-                        (source.clone(), target.clone())
-                    } else {
-                        (target.clone(), source.clone())
-                    }),
-                };
-                if let Some(key) = key {
-                    if !seen.insert(key) {
-                        return;
-                    }
-                }
-                graph.add_edge(VaultEdge { source, target });
+        let mut push_edge = |graph: &mut VaultGraph,
+                             source: String,
+                             target: String,
+                             kind: Option<String>,
+                             dedupe: Dedupe| {
+            let key = match dedupe {
+                Dedupe::None => None,
+                Dedupe::Ordered => Some((source.clone(), target.clone())),
+                Dedupe::Unordered => Some(if source <= target {
+                    (source.clone(), target.clone())
+                } else {
+                    (target.clone(), source.clone())
+                }),
             };
+            if let Some(key) = key {
+                if !seen.insert(key) {
+                    return;
+                }
+            }
+            graph.add_edge(VaultEdge {
+                source,
+                target,
+                kind,
+            });
+        };
 
         for collection in &self.config().collections {
             match &collection.produces {
@@ -309,7 +317,7 @@ impl ManifestMapper {
         by_title: &HashMap<&str, HashMap<String, String>>,
         by_title_ci: &HashMap<&str, HashMap<String, String>>,
         graph: &mut VaultGraph,
-        push_edge: &mut impl FnMut(&mut VaultGraph, String, String, Dedupe),
+        push_edge: &mut impl FnMut(&mut VaultGraph, String, String, Option<String>, Dedupe),
         unresolved: &mut Vec<String>,
     ) {
         let target_collection = rule.target_collection.as_str();
@@ -337,7 +345,13 @@ impl ManifestMapper {
             };
             match resolved {
                 Some(target) => {
-                    push_edge(graph, source_id.to_string(), target, Dedupe::Unordered);
+                    push_edge(
+                        graph,
+                        source_id.to_string(),
+                        target,
+                        Some(rule.kind.clone()),
+                        Dedupe::Unordered,
+                    );
                 }
                 None => unresolved.push(format!(
                     "{} {value:?} referenced by {owner}",
@@ -353,16 +367,32 @@ impl ManifestMapper {
         document: &Value,
         by_local: &HashMap<&str, HashMap<String, MappedNode>>,
         graph: &mut VaultGraph,
-        push_edge: &mut impl FnMut(&mut VaultGraph, String, String, Dedupe),
+        push_edge: &mut impl FnMut(&mut VaultGraph, String, String, Option<String>, Dedupe),
     ) {
-        if let Some(pointer) = &rules.kind_pointer {
-            if !rules.include_kinds.is_empty() {
-                let kind = pointer_str(document, pointer).unwrap_or_default();
-                if !rules.include_kinds.iter().any(|allowed| allowed == &kind) {
-                    return;
-                }
-            }
+        // The API's own link kind rides along when the package declares it
+        // in `[[schema.edge_types]]`; like `doctype_for`, undeclared values
+        // fall back (to an untyped edge) so the vocabulary stays the
+        // package's.
+        let kind = rules
+            .kind_pointer
+            .as_deref()
+            .and_then(|pointer| pointer_str(document, pointer));
+        if !rules.include_kinds.is_empty()
+            && !rules
+                .include_kinds
+                .iter()
+                .any(|allowed| Some(allowed) == kind.as_ref())
+        {
+            return;
         }
+        let kind = kind.filter(|kind| {
+            self.package
+                .manifest()
+                .schema
+                .edge_types
+                .iter()
+                .any(|edge_type| edge_type.key == *kind)
+        });
         let (Some(source), Some(target)) = (
             pointer_str(document, &rules.source_pointer),
             pointer_str(document, &rules.target_pointer),
@@ -381,7 +411,7 @@ impl ManifestMapper {
             // the link has nothing to attach to.
             return;
         };
-        push_edge(graph, source, target, rules.dedupe);
+        push_edge(graph, source, target, kind, rules.dedupe);
     }
 }
 

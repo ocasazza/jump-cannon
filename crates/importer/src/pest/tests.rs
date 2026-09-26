@@ -453,3 +453,141 @@ fn content_rule_must_be_distinct_from_canonical_roles() {
         "got {error:?}"
     );
 }
+
+// --- optional edge_kind capture -----------------------------------------------
+
+const KIND_GRAMMAR: &str = r#"
+document = { SOI ~ (record ~ NEWLINE?)* ~ EOI }
+record = _{ node | edge }
+node = { "N|" ~ node_id ~ "|" ~ title ~ "|" ~ kind ~ "|" ~ tags ~ "|" ~ properties }
+node_id = @{ field }
+title = @{ field }
+kind = @{ field }
+tags = _{ (tag ~ ("," ~ tag)*)? }
+tag = @{ atom }
+properties = _{ (property ~ (";" ~ property)*)? }
+property = { key ~ "=" ~ value }
+key = @{ atom }
+value = @{ atom }
+edge = { "E|" ~ source ~ "|" ~ target ~ ("|" ~ edge_kind)? }
+source = @{ field }
+target = @{ field }
+edge_kind = @{ atom }
+field = _{ (!("|" | NEWLINE) ~ ANY)+ }
+atom = _{ (!("," | ";" | "=" | "|" | NEWLINE) ~ ANY)+ }
+"#;
+
+/// A package binding `edge_kind`; `edge_types` is zero or more
+/// `[[schema.edge_types]]` tables.
+fn kind_manifest(edge_kind: &str, edge_types: &str) -> String {
+    format!(
+        r#"format_version = 3
+
+[metadata]
+id = "example.typed-graph"
+name = "Typed graph"
+version = "0.1.0"
+description = "Package with typed edges"
+
+[parser]
+engine = "pest"
+root_rule = "document"
+grammar = '''{KIND_GRAMMAR}'''
+
+[parser.captures]
+node = "node"
+id = "node_id"
+title = "title"
+kind = "kind"
+tag = "tag"
+property = "property"
+key = "key"
+value = "value"
+edge = "edge"
+source = "source"
+target = "target"
+edge_kind = "{edge_kind}"
+{edge_types}
+"#
+    )
+}
+
+const DECLARED_KINDS: &str = r#"
+[[schema.edge_types]]
+key = "calls"
+directed = true
+
+[[schema.edge_types]]
+key = "owns"
+directed = true
+"#;
+
+const TWO_NODES: &str = "N|n1|One|service||\nN|n2|Two|service||\n";
+
+#[test]
+fn edge_kind_capture_types_edges_and_leaves_untyped_lines_alone() {
+    let package = ValidatedPackage::from_toml(&kind_manifest("edge_kind", DECLARED_KINDS))
+        .expect("valid typed package");
+    let input = format!("{TWO_NODES}E|n1|n2|calls\nE|n2|n1");
+    let result = package.parse_input(&input).expect("input parses");
+
+    assert!(result.unresolved.is_empty());
+    let kinds: Vec<Option<&str>> = result
+        .graph
+        .edges
+        .iter()
+        .map(|edge| edge.kind.as_deref())
+        .collect();
+    assert_eq!(kinds, [Some("calls"), None]);
+    assert_eq!(result.graph.edges[0].source, "pest:example.typed-graph:n1");
+    assert_eq!(result.graph.edges[1].source, "pest:example.typed-graph:n2");
+
+    // The schema publishes exactly the declared vocabulary, not the
+    // built-in `declared` fallback.
+    let published: Vec<&str> = package
+        .schema()
+        .edge_types
+        .iter()
+        .map(|edge_type| edge_type.key.as_str())
+        .collect();
+    assert_eq!(published, ["calls", "owns"]);
+    package.schema().validate_result(&result).unwrap();
+}
+
+#[test]
+fn undeclared_edge_kinds_fail_the_import() {
+    let package = ValidatedPackage::from_toml(&kind_manifest("edge_kind", DECLARED_KINDS))
+        .expect("valid typed package");
+    let error = package
+        .parse_input(&format!("{TWO_NODES}E|n1|n2|bogus"))
+        .expect_err("undeclared kind must fail");
+    match error {
+        ImportError::InvalidRecord { record, detail } => {
+            assert_eq!(record, "edge");
+            assert!(detail.contains("\"bogus\""), "{detail}");
+            assert!(detail.contains("schema.edge_types"), "{detail}");
+        }
+        other => panic!("expected an invalid edge record, got {other:?}"),
+    }
+}
+
+#[test]
+fn packages_without_declared_edge_types_accept_any_captured_kind() {
+    let package = ValidatedPackage::from_toml(&kind_manifest("edge_kind", ""))
+        .expect("valid package without declared edge types");
+    let result = package
+        .parse_input(&format!("{TWO_NODES}E|n1|n2|anything"))
+        .expect("input parses");
+    assert_eq!(result.graph.edges[0].kind.as_deref(), Some("anything"));
+    assert_eq!(package.schema().edge_types[0].key, "declared");
+}
+
+#[test]
+fn edge_kind_binding_is_validated_like_every_capture() {
+    let error = ValidatedPackage::from_toml(&kind_manifest("no_such_rule", DECLARED_KINDS))
+        .expect_err("unknown rule must fail");
+    assert!(
+        matches!(error, ImportError::MissingRule { role: "edge_kind", .. }),
+        "got {error:?}"
+    );
+}

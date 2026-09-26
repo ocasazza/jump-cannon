@@ -519,6 +519,12 @@ textarea.md:focus { outline:none; border-color:var(--fg); }
 .sty-select:focus { outline:none; border-color:var(--fg); }
 .sty-val { flex:0 0 4.4rem; text-align:right; color:var(--dim);
   font-variant-numeric:tabular-nums; white-space:nowrap; }
+.sty-legend { align-items:flex-start; }
+.sty-legend-rows { flex:1; display:flex; flex-direction:column; gap:.12rem; }
+.sty-legend-row { display:flex; align-items:center; gap:.45rem; font-size:10.5px; }
+.sty-swatch { width:8px; height:8px; flex:none; }
+.sty-legend-name { color:var(--fg); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.sty-legend-note { flex:1; text-align:left; }
 
 /* === panel: camera (owned by panels/camera.rs) === */
 .cam { display:flex; flex-direction:column; gap:.35rem; font-size:11.5px; }

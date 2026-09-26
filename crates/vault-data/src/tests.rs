@@ -37,10 +37,7 @@ fn unit_vault_graph_add_and_count() {
         id: "b".into(),
         ..Default::default()
     });
-    g.add_edge(VaultEdge {
-        source: "a".into(),
-        target: "b".into(),
-    });
+    g.add_edge(VaultEdge::new("a", "b"));
     assert_eq!(g.node_count(), 2);
     assert_eq!(g.edge_count(), 1);
 }
@@ -57,6 +54,25 @@ fn unit_vault_graph_serde_roundtrip() {
     let back: VaultGraph = serde_json::from_str(&json).unwrap();
     assert!(back.nodes.contains_key("x"));
     assert!((back.density - 0.5).abs() < 1e-9);
+}
+
+#[test]
+fn unit_edge_kind_is_optional_on_the_wire() {
+    // Untyped edges serialize exactly as before `kind` existed, and edge
+    // JSON written before `kind` existed still deserializes.
+    let untyped = serde_json::to_value(VaultEdge::new("a", "b")).unwrap();
+    assert_eq!(untyped, serde_json::json!({ "source": "a", "target": "b" }));
+    let legacy: VaultEdge = serde_json::from_value(untyped).unwrap();
+    assert_eq!(legacy.kind, None);
+
+    let typed = VaultEdge {
+        kind: Some("calls".into()),
+        ..VaultEdge::new("a", "b")
+    };
+    let back: VaultEdge = serde_json::from_str(&serde_json::to_string(&typed).unwrap()).unwrap();
+    assert_eq!(back, typed);
+    // The kind is an attribute, never identity.
+    assert_eq!(EdgeId::from(&typed), EdgeId::from(&legacy));
 }
 
 #[test]
@@ -86,10 +102,7 @@ fn unit_validate_rejects_dangling_edges() {
         id: "present".into(),
         ..Default::default()
     });
-    graph.add_edge(VaultEdge {
-        source: "present".into(),
-        target: "missing".into(),
-    });
+    graph.add_edge(VaultEdge::new("present", "missing"));
 
     assert!(matches!(
         graph.validate(),

@@ -2691,10 +2691,7 @@ mod importer_tests {
     fn edge_endpoints_must_resolve_within_the_graph() {
         let schema = test_schema();
         let mut result = one_node_result(valid_document());
-        result.graph.add_edge(vault_data::VaultEdge {
-            source: N1.into(),
-            target: "generate:fixture:missing".into(),
-        });
+        result.graph.add_edge(vault_data::VaultEdge::new(N1, "generate:fixture:missing"));
         let error = schema.validate_result(&result).unwrap_err().to_string();
         assert!(
             error.contains("missing endpoint")

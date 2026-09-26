@@ -299,7 +299,8 @@ pub enum Transform {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EdgeRule {
-    /// Declared edge-type key; documentation only, but must be declared.
+    /// Declared edge-type key; must be declared in `[[schema.edge_types]]`
+    /// and becomes every emitted edge's `kind`.
     pub kind: String,
     /// Pointer to the value naming the target(s).
     pub value_pointer: String,
@@ -328,7 +329,9 @@ pub enum MatchOn {
 pub struct EdgeListRules {
     pub source_pointer: String,
     pub target_pointer: String,
-    /// Pointer to the link's kind, used with `include_kinds`.
+    /// Pointer to the link's kind. Filters through `include_kinds`, and a
+    /// value the package declares in `[[schema.edge_types]]` becomes the
+    /// edge's `kind` (undeclared values import untyped).
     #[serde(default)]
     pub kind_pointer: Option<String>,
     /// Only these link kinds import. Empty imports every kind.

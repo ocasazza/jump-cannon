@@ -259,10 +259,7 @@ where
                     let target = namespace
                         .node_id(&local)
                         .expect("accepted local ids already passed namespace validation");
-                    graph.add_edge(VaultEdge {
-                        source: source.clone(),
-                        target,
-                    });
+                    graph.add_edge(VaultEdge::new(source.clone(), target));
                 }
                 None => {
                     unresolved.push(link.clone());

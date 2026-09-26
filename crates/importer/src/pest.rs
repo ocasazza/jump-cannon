@@ -4,11 +4,14 @@
 //! `{ root_rule, grammar, [captures] }` — an inline Pest grammar, its root
 //! rule, and the semantic capture-rule bindings. The semantic capture
 //! contract maps Pest spans into the canonical graph: node, id, title, kind,
-//! tag, property, key, value, edge, source, and target. Capture text is used
-//! exactly as matched by the grammar. Nodes retain source order, tags retain
-//! capture order, properties become string-valued frontmatter, and edges
-//! retain source order. Edges with missing endpoints are reported through
-//! [data_loader::LoadResult::unresolved] and are not added to the graph.
+//! tag, property, key, value, edge, source, target, and the optional
+//! `edge_kind` and `content`. Capture text is used exactly as matched by the
+//! grammar. Nodes retain source order, tags retain capture order, properties
+//! become string-valued frontmatter, and edges retain source order. An edge
+//! whose `edge_kind` capture names a kind the package's `[[schema.edge_types]]`
+//! does not declare fails the import. Edges with missing endpoints are
+//! reported through [data_loader::LoadResult::unresolved] and are not added to
+//! the graph.
 //!
 //! The grammar package format is deliberately free of any data-source
 //! binding: [`ValidatedPackage::parse_input`](crate::ValidatedPackage::parse_input)
@@ -84,6 +87,12 @@ pub struct CaptureRules {
     pub edge: String,
     pub source: String,
     pub target: String,
+    /// Optional per-edge kind capture. When bound and matched, the captured
+    /// text becomes the edge's `kind` and must be one of the package's
+    /// declared `[[schema.edge_types]]` keys when any are declared. Edges
+    /// whose match carries no capture stay untyped.
+    #[serde(default)]
+    pub edge_kind: Option<String>,
     /// Optional per-node body capture. When bound, matched nodes carry a
     /// readable markdown body: the schema advertises
     /// `content.readable = true`, the importer gains a scoped `ContentRead`
@@ -110,10 +119,13 @@ impl CaptureRules {
         ]
     }
 
-    /// The optional content rule joins the fixed eleven in the
-    /// distinct-rule validation.
+    /// The optional rules join the fixed eleven in the distinct-rule
+    /// validation.
     fn optional_named(&self) -> impl Iterator<Item = (&'static str, &str)> {
-        self.content.iter().map(|rule| ("content", rule.as_str()))
+        self.edge_kind
+            .iter()
+            .map(|rule| ("edge_kind", rule.as_str()))
+            .chain(self.content.iter().map(|rule| ("content", rule.as_str())))
     }
 
     /// Whether this package captures per-node bodies.
@@ -695,19 +707,37 @@ impl PestEngine<'_> {
     }
 
     fn map_edge<'i, 'r>(&self, pair: Pair<'i, &'r str>) -> Result<VaultEdge, ImportError> {
-        let mut source = None;
-        let mut target = None;
+        let mut fields = EdgeFields::default();
         for child in pair.into_inner() {
-            self.collect_edge_fields(child, &mut source, &mut target)?;
+            self.collect_edge_fields(child, &mut fields)?;
         }
 
-        let source = source.ok_or_else(|| invalid_record("edge", "missing source capture"))?;
-        let target = target.ok_or_else(|| invalid_record("edge", "missing target capture"))?;
+        let source = fields
+            .source
+            .ok_or_else(|| invalid_record("edge", "missing source capture"))?;
+        let target = fields
+            .target
+            .ok_or_else(|| invalid_record("edge", "missing target capture"))?;
         if source.is_empty() || target.is_empty() {
             return Err(invalid_record(
                 "edge",
                 "source and target captures must be non-empty",
             ));
+        }
+        if let Some(kind) = &fields.kind {
+            if kind.is_empty() {
+                return Err(invalid_record("edge", "edge_kind capture is empty"));
+            }
+            // A package that declares its vocabulary is held to it; one that
+            // declares nothing publishes the built-in `declared` type and
+            // accepts any captured kind.
+            let declared = &self.package.manifest.schema.edge_types;
+            if !declared.is_empty() && !declared.iter().any(|edge_type| edge_type.key == *kind) {
+                return Err(invalid_record(
+                    "edge",
+                    format!("emits edge kind {kind:?}, which schema.edge_types does not declare"),
+                ));
+            }
         }
         Ok(VaultEdge {
             source: self
@@ -720,22 +750,27 @@ impl PestEngine<'_> {
                 .namespace
                 .node_id(&target)
                 .map_err(|error| invalid_record("edge", error.to_string()))?,
+            kind: fields.kind,
         })
     }
 
     fn collect_edge_fields<'i, 'r>(
         &self,
         pair: Pair<'i, &'r str>,
-        source: &mut Option<String>,
-        target: &mut Option<String>,
+        fields: &mut EdgeFields,
     ) -> Result<(), ImportError> {
         let rule = pair.as_rule();
         let captures = &self.config.captures;
         if rule == captures.source {
-            return set_scalar(source, pair.as_str(), "edge", "source");
+            return set_scalar(&mut fields.source, pair.as_str(), "edge", "source");
         }
         if rule == captures.target {
-            return set_scalar(target, pair.as_str(), "edge", "target");
+            return set_scalar(&mut fields.target, pair.as_str(), "edge", "target");
+        }
+        if let Some(kind_rule) = &captures.edge_kind {
+            if rule == kind_rule {
+                return set_scalar(&mut fields.kind, pair.as_str(), "edge", "edge_kind");
+            }
         }
         if rule == captures.node || rule == captures.edge {
             return Err(invalid_record(
@@ -745,7 +780,7 @@ impl PestEngine<'_> {
         }
 
         for child in pair.into_inner() {
-            self.collect_edge_fields(child, source, target)?;
+            self.collect_edge_fields(child, fields)?;
         }
         Ok(())
     }
@@ -767,6 +802,13 @@ struct NodeFields {
     tags: Vec<String>,
     properties: HashMap<String, Value>,
     content: Option<String>,
+}
+
+#[derive(Default)]
+struct EdgeFields {
+    source: Option<String>,
+    target: Option<String>,
+    kind: Option<String>,
 }
 
 fn set_scalar(

@@ -187,10 +187,7 @@ fn two_node_graph(prefix: &str) -> VaultGraph {
         id: format!("{prefix}-b"),
         ..Default::default()
     });
-    graph.add_edge(VaultEdge {
-        source: format!("{prefix}-a"),
-        target: format!("{prefix}-b"),
-    });
+    graph.add_edge(VaultEdge::new(format!("{prefix}-a"), format!("{prefix}-b")));
     graph
 }
 
@@ -476,6 +473,8 @@ async fn graph_endpoints_advertise_one_snapshot_revision() {
         "/graph/ids",
         "/graph/positions",
         "/graph/edges",
+        "/graph/edge-kinds",
+        "/graph/edge-kinds.bin",
         "/graph/metrics/community",
         "/graph/meta_summary",
         "/graph/csr.bin",
@@ -524,6 +523,53 @@ async fn same_cardinality_snapshot_swap_changes_revision() {
         serde_json::from_slice(&to_bytes(resp.into_body(), 1 << 20).await.expect("ids body"))
             .expect("ids json");
     assert_eq!(ids, ["generate:test:after-a", "generate:test:after-b"]);
+}
+
+/// The edge-kind palette and per-edge index buffer are the wire contract the
+/// Style panel's "Kind" edge colors decode: declared kinds lead the palette,
+/// untyped edges are slot 0, and the buffer is parallel to `/graph/edges`.
+#[tokio::test]
+async fn edge_kinds_serve_a_palette_and_a_parallel_index_buffer() {
+    let mut graph = VaultGraph::new();
+    for id in ["a", "b", "c"] {
+        graph.add_node(VaultNode {
+            id: id.into(),
+            ..Default::default()
+        });
+    }
+    graph.add_edge(VaultEdge {
+        kind: Some("reference".into()),
+        ..VaultEdge::new("a", "b")
+    });
+    graph.add_edge(VaultEdge::new("b", "c"));
+    graph.add_edge(VaultEdge {
+        kind: Some("undeclared".into()),
+        ..VaultEdge::new("c", "a")
+    });
+    let app = graph_api::router(state_with_graph(graph));
+
+    let resp = app
+        .clone()
+        .oneshot(Request::builder().uri("/graph/edge-kinds").body(Body::empty()).unwrap())
+        .await
+        .expect("palette served");
+    assert_eq!(resp.status(), StatusCode::OK);
+    let palette: serde_json::Value =
+        serde_json::from_slice(&to_bytes(resp.into_body(), 1 << 20).await.expect("body"))
+            .expect("palette json");
+    assert_eq!(palette["kinds"], serde_json::json!(["reference", "undeclared"]));
+
+    let resp = app
+        .oneshot(Request::builder().uri("/graph/edge-kinds.bin").body(Body::empty()).unwrap())
+        .await
+        .expect("index buffer served");
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = to_bytes(resp.into_body(), 1 << 20).await.expect("body");
+    let slots: Vec<u16> = bytes
+        .chunks_exact(2)
+        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+        .collect();
+    assert_eq!(slots, [1, 0, 2]);
 }
 
 #[tokio::test]

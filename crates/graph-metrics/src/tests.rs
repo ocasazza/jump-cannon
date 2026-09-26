@@ -5,9 +5,9 @@ fn make_triangle() -> VaultGraph {
     for id in ["a", "b", "c"] {
         g.add_node(VaultNode { id: id.to_string(), ..Default::default() });
     }
-    g.add_edge(VaultEdge { source: "a".into(), target: "b".into() });
-    g.add_edge(VaultEdge { source: "b".into(), target: "c".into() });
-    g.add_edge(VaultEdge { source: "c".into(), target: "a".into() });
+    g.add_edge(VaultEdge::new("a", "b"));
+    g.add_edge(VaultEdge::new("b", "c"));
+    g.add_edge(VaultEdge::new("c", "a"));
     g
 }
 
@@ -46,15 +46,15 @@ fn unit_louvain_two_cliques() {
         g.add_node(VaultNode { id: id.to_string(), ..Default::default() });
     }
     // Clique 1
-    g.add_edge(VaultEdge { source: "a".into(), target: "b".into() });
-    g.add_edge(VaultEdge { source: "b".into(), target: "c".into() });
-    g.add_edge(VaultEdge { source: "c".into(), target: "a".into() });
+    g.add_edge(VaultEdge::new("a", "b"));
+    g.add_edge(VaultEdge::new("b", "c"));
+    g.add_edge(VaultEdge::new("c", "a"));
     // Clique 2
-    g.add_edge(VaultEdge { source: "d".into(), target: "e".into() });
-    g.add_edge(VaultEdge { source: "e".into(), target: "f".into() });
-    g.add_edge(VaultEdge { source: "f".into(), target: "d".into() });
+    g.add_edge(VaultEdge::new("d", "e"));
+    g.add_edge(VaultEdge::new("e", "f"));
+    g.add_edge(VaultEdge::new("f", "d"));
     // Bridge
-    g.add_edge(VaultEdge { source: "c".into(), target: "d".into() });
+    g.add_edge(VaultEdge::new("c", "d"));
     crate::compute_louvain(&mut g, 20);
     // Should find 2 communities
     assert_eq!(g.num_communities, 2, "expected 2 communities, got {}", g.num_communities);
@@ -72,20 +72,17 @@ fn unit_louvain_five_clusters() {
     for c in 0..5 {
         for i in 0..20 {
             for j in (i+1)..20 {
-                g.add_edge(VaultEdge {
-                    source: format!("c{}_n{}", c, i),
-                    target: format!("c{}_n{}", c, j),
-                });
+                g.add_edge(VaultEdge::new(
+                    format!("c{}_n{}", c, i),
+                    format!("c{}_n{}", c, j),
+                ));
             }
         }
     }
     // Inter-cluster: 1 edge between cluster reps
     for c1 in 0..5 {
         for c2 in (c1+1)..5 {
-            g.add_edge(VaultEdge {
-                source: format!("c{}_n0", c1),
-                target: format!("c{}_n0", c2),
-            });
+            g.add_edge(VaultEdge::new(format!("c{}_n0", c1), format!("c{}_n0", c2)));
         }
     }
     crate::compute_louvain(&mut g, 20);
@@ -104,15 +101,15 @@ fn unit_louvain_community_levels_dendrogram() {
     for c in 0..2 {
         for i in 0..6 {
             for j in (i + 1)..6 {
-                g.add_edge(VaultEdge {
-                    source: format!("c{}_n{}", c, i),
-                    target: format!("c{}_n{}", c, j),
-                });
+                g.add_edge(VaultEdge::new(
+                    format!("c{}_n{}", c, i),
+                    format!("c{}_n{}", c, j),
+                ));
             }
         }
     }
     // Bridge connecting the two cliques.
-    g.add_edge(VaultEdge { source: "c0_n0".into(), target: "c1_n0".into() });
+    g.add_edge(VaultEdge::new("c0_n0", "c1_n0"));
 
     crate::compute_louvain(&mut g, 20);
 

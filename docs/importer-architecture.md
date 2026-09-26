@@ -276,6 +276,7 @@ or properties):
 | `tag` | Node carries no package tags. |
 | `property` (+ `key`/`value`) | Node carries no package properties. `key` and `value` are valid only together with `property`. |
 | `edge` (+ `source`/`target`) | The graph is node-only. `source` and `target` are valid only together with `edge`; the package schema still declares its edge type and simply never emits it. |
+| `edge_kind` | Edges are untyped (`VaultEdge.kind = None`). When bound, a matched capture becomes the edge's kind and must be one of the package's `[[schema.edge_types]]` keys when any are declared — an undeclared kind fails the import naming it; an edge match without the capture stays untyped. graph-api serves the kinds at `/graph/edge-kinds` (palette) + `/graph/edge-kinds.bin` (one `u16` slot per edge, `/graph/edges` order), and the Style panel's "Kind (edge type)" edge-color mode renders them. |
 
 **Node-level typed properties — the "size" contract.** Capture text is always
 a string at the grammar boundary, but a package that declares a property field

@@ -26,6 +26,13 @@ from validated importer `SearchDocument` records and never falls back to
 title-only matching.
 
 `GET /graph/metrics/community_levels` returns the number of hierarchical levels L in the current community dendrogram (as one f32 value); level 0 is the coarsest. `GET /graph/metrics/community_l{k}` returns per-node community assignments at level k (one u32 per node, little-endian). These endpoints support the multilevel region-map visualization; level 0 is byte-identical to the top-level `community` metric and represents the broadest macro-communities.
+`GET /graph/edge-kinds` returns the snapshot's edge kind palette
+(`{"graph_revision", "kinds": [...]}`: the importer's declared edge types in
+declaration order, then any undeclared kinds the graph carries, sorted) and
+`GET /graph/edge-kinds.bin` one little-endian `u16` per edge in `/graph/edges`
+order — `0` for an untyped edge, `k` for `kinds[k - 1]`. Both carry
+`X-Graph-Revision`; the Style panel's "Kind (edge type)" edge-color mode
+decodes them.
 `GET /importers` returns the active descriptor plus a bounded, sanitized list
 of configured source instances. Its activation mode is `helm_rollout`; the API
 exposes no source-selection or run mutation. graph-api rejects an

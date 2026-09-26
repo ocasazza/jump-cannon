@@ -734,6 +734,57 @@ pub(crate) async fn revisioned_metric(name: &str) -> ApiResult<Revisioned<Vec<f3
     })
 }
 
+/// Edge kinds of one snapshot: the `/graph/edge-kinds` palette plus the
+/// parallel `/graph/edge-kinds.bin` slots — one `u16` per edge in
+/// `/graph/edges` order, `0` for an untyped edge, `k` for `kinds[k - 1]`.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct EdgeKinds {
+    pub(crate) kinds: Vec<String>,
+    pub(crate) slots: Vec<u16>,
+}
+
+#[derive(Deserialize)]
+struct EdgeKindPalette {
+    #[serde(default)]
+    kinds: Vec<String>,
+}
+
+/// `Ok(None)` when the server predates typed edges (404), like [`metric`],
+/// so a caller stops asking. The two halves must name one snapshot
+/// revision; a graph swap between them fails the fetch so the caller retries
+/// against the new graph instead of pairing a stale palette with new slots.
+pub(crate) async fn revisioned_edge_kinds() -> ApiResult<Option<Revisioned<EdgeKinds>>> {
+    let path = "/graph/edge-kinds";
+    let resp = get(path).send().await.map_err(err)?;
+    if resp.status() == 404 {
+        return Ok(None);
+    }
+    if !resp.ok() {
+        return Err(status_error(path, resp).await);
+    }
+    let revision = graph_revision(&resp);
+    let palette: EdgeKindPalette = resp.json().await.map_err(err)?;
+    let slots = get_revisioned_bytes("/graph/edge-kinds.bin").await?;
+    if slots.revision != revision {
+        return Err(format!(
+            "inconsistent snapshot (edge-kinds revision {revision}, edge-kinds.bin revision {}) — \
+             server graph changed mid-load",
+            slots.revision
+        ));
+    }
+    Ok(Some(Revisioned {
+        revision,
+        value: EdgeKinds {
+            kinds: palette.kinds,
+            slots: slots
+                .value
+                .chunks_exact(2)
+                .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                .collect(),
+        },
+    }))
+}
+
 /// `/node/*id` — full per-node metadata plus any readable source body.
 pub async fn node_meta(id: &str) -> ApiResult<proto::NodeMeta> {
     get_proto(&format!("/node/{}", encode_id(id))).await

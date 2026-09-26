@@ -204,7 +204,7 @@ fn snapshot_to_load_result(
             Ok((source, target))
                 if graph.nodes.contains_key(&source) && graph.nodes.contains_key(&target) =>
             {
-                graph.add_edge(VaultEdge { source, target });
+                graph.add_edge(VaultEdge::new(source, target));
             }
             _ => unresolved.push(format!("edge {} -> {}", edge.source, edge.target)),
         }

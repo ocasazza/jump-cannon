@@ -68,13 +68,19 @@ pub struct GraphSnapshot {
     pub id_to_idx: HashMap<String, u32>,
     /// Dense-index ordered list of node ids (parallel to id_to_idx).
     pub idx_to_id: Vec<String>,
+    /// Edge kind palette served at `/graph/edge-kinds`: index `k - 1` of the
+    /// `k` stored per edge in the `edge_kinds` binary buffer (`0` = untyped).
+    /// Declared edge types first, then any undeclared kinds the graph
+    /// carries, sorted (see [`crate::binary::edge_kinds`]).
+    pub edge_kind_palette: Vec<String>,
     /// Precomputed bulk-numeric binary buffers. Built once per snapshot;
     /// per-request handlers do an `Arc` clone instead of re-walking
     /// `graph.nodes` and re-allocating. Keys: "positions", "edges",
-    /// "degree", "pagerank", "kcore", "community", "wcc", "indegree",
-    /// "outdegree", "betweenness", "meta_summary", "community_levels"
-    /// (single f32 = dendrogram depth L), and "community_l{k}" for each
-    /// k in 0..L (per-node ids; l0 coarsest = "community", higher k finer).
+    /// "edge_kinds" (u16 per edge, parallel to "edges"), "degree",
+    /// "pagerank", "kcore", "community", "wcc", "indegree", "outdegree",
+    /// "betweenness", "meta_summary", "community_levels" (single f32 =
+    /// dendrogram depth L), and "community_l{k}" for each k in 0..L (per-node
+    /// ids; l0 coarsest = "community", higher k finer).
     pub binary_cache: HashMap<String, Arc<[u8]>>,
 }
 
@@ -152,6 +158,8 @@ impl GraphSnapshot {
             "edges".into(),
             Arc::from(crate::binary::edges_buffer(&graph, &id_to_idx)),
         );
+        let edge_kinds = crate::binary::edge_kinds(&graph, &id_to_idx, &schema.edge_types);
+        binary_cache.insert("edge_kinds".into(), Arc::from(edge_kinds.indices));
         done(progress, st_metrics, &mut metric_idx, "positions + edges");
 
         // Graph metrics
@@ -195,6 +203,7 @@ impl GraphSnapshot {
             search_index,
             id_to_idx,
             idx_to_id,
+            edge_kind_palette: edge_kinds.palette,
             binary_cache,
         })
     }

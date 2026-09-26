@@ -451,10 +451,7 @@ fn commit_editor(ctx: Ctx, editor: EditorState) -> Element {
                     let source = edge_source.read().trim().to_string();
                     let target = edge_target.read().trim().to_string();
                     commit_ops(
-                        vec![GraphOp::UpsertEdge(VaultEdge {
-                            source: source.clone(),
-                            target: target.clone(),
-                        })],
+                        vec![GraphOp::UpsertEdge(VaultEdge::new(source.clone(), target.clone()))],
                         format!("add edge {source} -> {target}"),
                     );
                     edge_source.set(String::new());

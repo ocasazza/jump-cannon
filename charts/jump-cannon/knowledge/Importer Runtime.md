@@ -184,6 +184,13 @@ format 3 wraps both runtime engines (`crates/importer`): a shared
 `[metadata]`/`[limits]`/`[schema.fields]` envelope plus `[parser] engine =
 "pest"` (inline grammar + capture map) or `"json"` (endpoints + projection).
 Package authors must declare every property that can enter search or facets.
+Edges may carry a kind: a pest package binds the optional `edge_kind`
+capture and a json package's edge rules name theirs, in both cases one of the
+package's declared `schema.edge_types` keys (an undeclared kind fails the import
+naming it; edges without one stay untyped). graph-api serves the kinds beside
+the edge buffer (`/graph/edge-kinds` + `/graph/edge-kinds.bin`) and the Style
+panel's "Kind (edge type)" edge-color mode renders them — see
+[[OMP Auto-Loop Topos]] for the first typed package.
 GitHub reads a polled repository tarball and produces the
 same node IDs as Obsidian mode for the same corpus. The httpjson engine
 binds an instance to one HTTP/JSON API per `JUMP_CANNON_IMPORTER_*` env

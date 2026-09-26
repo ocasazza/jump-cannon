@@ -920,7 +920,7 @@ fn invalidate_graph_derived_state(mut ctx: Ctx) {
     panels::nodes::reset_for_graph_session();
     panels::filter::reset_for_graph_session();
     panels::inspector::reset_for_graph_session();
-    panels::style::reset_for_graph_session(false);
+    panels::style::reset_for_graph_session(false, None);
     panels::timeline::reset_for_graph_session();
     palette::reset_for_graph_session();
     render::set_selected_node(None);
@@ -972,7 +972,7 @@ fn commit_server_graph(mut ctx: Ctx, epoch: u64, graph: GraphData) -> bool {
     // The gate opens and the GlobalLoadingBar clears on the same commit.
     panel_kit::loading::loading_store("graph", "loading graph…").succeed();
     panels::layout::set_expected_graph_revision(revision);
-    panels::style::reset_for_graph_session(true);
+    panels::style::reset_for_graph_session(true, revision);
     ctx.graph.set(Some(graph));
     true
 }

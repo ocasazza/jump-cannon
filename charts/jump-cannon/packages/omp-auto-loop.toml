@@ -6,8 +6,10 @@
 # N|id|title|kind|tags|props record per session on every state transition
 # and one event node + session->event edge per loop event; tags carry the
 # event class (continue / gate / goal / heartbeat / settled) and the
-# session's goal state. Per AGENTS.md, "Importers: packages, not crates" —
-# no SourceKind variant, no new crate.
+# session's goal state. Edges are E|source|target|kind, the kind being one
+# of the [[schema.edge_types]] below; a bare E|source|target stays untyped.
+# Per AGENTS.md, "Importers: packages, not crates" — no SourceKind variant,
+# no new crate.
 #
 # Bind locally with:
 #   graph-api --source=pest \
@@ -19,8 +21,8 @@ format_version = 3
 [metadata]
 id = "ocasazza.omp-auto-loop"
 name = "omp auto-loop"
-version = "1.0.0"
-description = "Reads the omp auto-loop (prime-agent internal-loop port) projection as a graph: one session node per live omp session with goal state, one event node per loop transition tagged by class, and session->event edges."
+version = "1.1.0"
+description = "Reads the omp auto-loop (prime-agent internal-loop port) projection as a graph: one session node per live omp session with goal state, one event node per loop transition tagged by class, and typed session->repo/goal/gate/session/event and event->event edges."
 
 [limits]
 manifest_bytes = 131072
@@ -57,6 +59,40 @@ required = false
 searchable = true
 facetable = true
 
+# Edge kinds. Sessions are the hubs: they point at the shared repo, goal, and
+# gate anchors, at the subagent sessions they spawned, and at their own
+# events; events chain into the session's timeline. The Style panel's
+# "Kind (edge type)" mode colors edges by these keys.
+[[schema.edge_types]]
+key = "in_repo"
+directed = true
+description = "Session -> the repository (shared git dir) it runs in."
+
+[[schema.edge_types]]
+key = "pursues"
+directed = true
+description = "Session -> the goal (objective) it is working toward."
+
+[[schema.edge_types]]
+key = "runs_gate"
+directed = true
+description = "Session -> a verifier gate command it ran."
+
+[[schema.edge_types]]
+key = "spawned"
+directed = true
+description = "Parent session -> the subagent session it spawned."
+
+[[schema.edge_types]]
+key = "emitted"
+directed = true
+description = "Session -> one of its loop events."
+
+[[schema.edge_types]]
+key = "next"
+directed = true
+description = "Event -> the session's next event, in order."
+
 [parser]
 engine = "pest"
 root_rule = "document"
@@ -75,9 +111,10 @@ key = @{ atom }
 value = @{ atom }
 body = _{ "|" ~ body_text }
 body_text = @{ (!NEWLINE ~ ANY)+ }
-edge = { "E|" ~ source ~ "|" ~ target }
+edge = { "E|" ~ source ~ "|" ~ target ~ ("|" ~ edge_kind)? }
 source = @{ field }
 target = @{ field }
+edge_kind = @{ atom }
 field = _{ (!("|" | NEWLINE) ~ ANY)+ }
 atom = _{ (!("," | ";" | "=" | "|" | NEWLINE) ~ ANY)+ }
 '''
@@ -95,3 +132,4 @@ edge = "edge"
 source = "source"
 target = "target"
 content = "body_text"
+edge_kind = "edge_kind"

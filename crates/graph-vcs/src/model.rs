@@ -62,7 +62,8 @@ pub enum GraphOp {
     UpsertNode(VaultNode),
     /// Remove a node. Does not remove edges that reference it.
     DeleteNode(NodeId),
-    /// Insert an edge. Edges have no attributes, so upsert is idempotent.
+    /// Insert an edge. Snapshots key edges by [`EdgeId`] and do not version
+    /// the optional `kind` attribute, so upsert is idempotent.
     UpsertEdge(vault_data::VaultEdge),
     /// Remove an edge by identity.
     DeleteEdge(EdgeId),

@@ -119,9 +119,9 @@ fn triangle_graph() -> VaultGraph {
             ..Default::default()
         });
     }
-    g.add_edge(VaultEdge { source: "A".into(), target: "B".into() });
-    g.add_edge(VaultEdge { source: "B".into(), target: "C".into() });
-    g.add_edge(VaultEdge { source: "C".into(), target: "A".into() });
+    g.add_edge(VaultEdge::new("A", "B"));
+    g.add_edge(VaultEdge::new("B", "C"));
+    g.add_edge(VaultEdge::new("C", "A"));
     g
 }
 

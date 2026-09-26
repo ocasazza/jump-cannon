@@ -187,10 +187,7 @@ mod tests {
             ("c", "d"), // global shortcut
         ];
         for (s, t) in edges {
-            g.add_edge(VaultEdge {
-                source: s.to_string(),
-                target: t.to_string(),
-            });
+            g.add_edge(VaultEdge::new(s, t));
         }
         // indices of the triangle edge a-b (0) and the shortcut c-d (6)
         (g, 0, 6)
@@ -244,18 +241,9 @@ mod tests {
         let mut g = VaultGraph::default();
         g.add_node(node("a"));
         g.add_node(node("b"));
-        g.add_edge(VaultEdge {
-            source: "a".into(),
-            target: "ghost".into(),
-        }); // unknown endpoint
-        g.add_edge(VaultEdge {
-            source: "a".into(),
-            target: "a".into(),
-        }); // self-loop
-        g.add_edge(VaultEdge {
-            source: "a".into(),
-            target: "b".into(),
-        });
+        g.add_edge(VaultEdge::new("a", "ghost")); // unknown endpoint
+        g.add_edge(VaultEdge::new("a", "a")); // self-loop
+        g.add_edge(VaultEdge::new("a", "b"));
         let es = compute_edge_strength(&g, EdgeStrengthKind::Jaccard);
         assert_eq!(es.strength.len(), 3);
         assert_eq!(es.strength[0], 0.0);

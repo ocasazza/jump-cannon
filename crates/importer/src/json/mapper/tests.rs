@@ -278,6 +278,44 @@ fn has_edge(result: &LoadResult, source: &str, target: &str) -> bool {
         .any(|edge| edge.source == source && edge.target == target)
 }
 
+fn edge_kind(result: &LoadResult, source: &str, target: &str) -> Option<String> {
+    let (source, target) = (node_id(source), node_id(target));
+    result
+        .graph
+        .edges
+        .iter()
+        .find(|edge| edge.source == source && edge.target == target)
+        .unwrap_or_else(|| panic!("edge {source} -> {target}"))
+        .kind
+        .clone()
+}
+
+#[test]
+fn edges_carry_their_declared_kind() {
+    let result = mapped();
+    // Rule edges carry the rule's declared kind.
+    assert_eq!(edge_kind(&result, "u1", "entity:e1").as_deref(), Some("mentions"));
+    assert_eq!(
+        edge_kind(&result, "u1", "document:doc-1").as_deref(),
+        Some("documented_in")
+    );
+    // Link-list edges carry the API's kind when the package declares it.
+    assert_eq!(edge_kind(&result, "u1", "u2").as_deref(), Some("temporal"));
+
+    // A link kind the package admits but never declared imports untyped —
+    // the edge vocabulary stays the package's, like `doctype_for`.
+    let open = PACKAGE.replace("include_kinds = [\"temporal\", \"semantic\", \"caused_by\"]\n", "");
+    let open = ValidatedPackage::from_toml_bytes(open.as_bytes()).expect("package validates");
+    let mapper = ManifestMapper::new(open, Namespace::new(SOURCE_KIND, "omp").expect("namespace"));
+    let mut records = hindsight_records();
+    records[3] = record(
+        "links",
+        json!({"edges": [{"data": {"source": "u2", "target": "u1", "linkType": "entity"}}]}),
+    );
+    let result = mapper.map(records).expect("mapping succeeds");
+    assert_eq!(edge_kind(&result, "u2", "u1"), None);
+}
+
 #[test]
 fn output_satisfies_the_declared_schema() {
     let result = mapped();

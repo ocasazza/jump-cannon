@@ -235,10 +235,10 @@ mod tests {
                     },
                     ..Default::default()
                 });
-                graph.add_edge(VaultEdge {
-                    source: "generate:dangling:present".into(),
-                    target: "generate:dangling:missing".into(),
-                });
+                graph.add_edge(VaultEdge::new(
+                    "generate:dangling:present",
+                    "generate:dangling:missing",
+                ));
                 Ok(ImportOutcome::Loaded(LoadResult {
                     graph,
                     search_documents: vec![SearchDocument::new("generate:dangling:present")

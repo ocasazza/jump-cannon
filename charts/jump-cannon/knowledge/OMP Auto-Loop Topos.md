@@ -20,12 +20,23 @@ One Pest package over the extension's line projection
 | `gate` | `c<hash(command)>` | — | — | the verifier command |
 | `event` | `e<session id>_<n>` | `continue` / `gate` / `goal` / `settled` / `other` | `ts`, `sess` | the full event message |
 
-Edges (untyped, per the vault contract — the endpoint kinds carry the
-meaning): `session -> repo`, `session -> goal`, `session -> gate`,
-`session -> session` (parent spawned subagent), `session -> event`, and
-`event -> event` (the session's timeline, in order).
+Edges are typed (`E|src|tgt|kind`); the kind is the relation, declared as a
+`schema.edge_types` entry in the package:
 
-Why these kinds: they are the shared anchors. Sessions are keyed by omp's
+| Kind | Edge | Meaning |
+|---|---|---|
+| `in_repo` | `session -> repo` | the shared git dir the session runs in |
+| `pursues` | `session -> goal` | the objective it works toward |
+| `runs_gate` | `session -> gate` | a verifier command it ran |
+| `spawned` | `session -> session` | parent spawned this subagent |
+| `emitted` | `session -> event` | one of its loop events |
+| `next` | `event -> event` | the session's timeline, in order |
+
+A bare `E|src|tgt` line still parses and imports untyped; a kind outside
+this table fails the import naming the kind, so the producer and the
+package cannot drift silently.
+
+Why these node kinds: they are the shared anchors. Sessions are keyed by omp's
 session id, so a restarted or resumed session stays one hub; worktrees of one
 repo resolve to the same shared git dir; the same objective hashes to the
 same goal. Work on the same thing therefore forms one connected component
@@ -36,13 +47,16 @@ The producer supplies data only: bodies are raw content with newlines
 collapsed (the grammar's `body_text` is one line), never pre-rendered
 markdown. Every presentation choice — what a node click shows, how the
 budget reads, colors, arrangement — belongs to this topos. Properties not
-declared as `[[schema.fields]]` stay node metadata without entering search.
+declared as `schema.fields` entries stay node metadata without entering search.
 Every node is upserted in place by id, so shared nodes appear once and always
 carry the current state.
 
-Typed edges (`E|src|tgt|kind`) need upstream work first: `VaultEdge` carries
-no attributes, so a declared `[[schema.edge_types]]` key never reaches the
-canvas.
+Edge kinds reach the canvas through `/graph/edge-kinds` (the palette) and
+`/graph/edge-kinds.bin` (one slot per edge, in `/graph/edges` order); the
+Style panel's **Edge color by → Kind (edge type)** colors each kind with its
+palette swatch and lists the kinds in use. Which color a kind gets, and
+whether it is drawn at all, is a decision of this topos, not of the
+importer — the package only declares the vocabulary.
 
 ## The transformation (generic canvas -> loop regime)
 

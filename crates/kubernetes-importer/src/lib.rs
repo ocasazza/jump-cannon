@@ -691,10 +691,7 @@ impl GraphMapper for KubernetesGraphMapper {
         for (dependent_id, owner_uids) in owners_by_node {
             for owner_uid in owner_uids {
                 if let Some(owner_id) = uid_to_id.get(&owner_uid) {
-                    graph.add_edge(VaultEdge {
-                        source: owner_id.clone(),
-                        target: dependent_id.clone(),
-                    });
+                    graph.add_edge(VaultEdge::new(owner_id.clone(), dependent_id.clone()));
                 } else {
                     unresolved.push(format!("owner uid {owner_uid} for {dependent_id}"));
                 }
@@ -1038,10 +1035,7 @@ mod tests {
         assert_eq!(loaded.graph.edge_count(), 1);
         assert_eq!(
             loaded.graph.edges[0],
-            VaultEdge {
-                source: "kubernetes:test:uid:owner-uid".into(),
-                target: "kubernetes:test:uid:child-uid".into(),
-            }
+            VaultEdge::new("kubernetes:test:uid:owner-uid", "kubernetes:test:uid:child-uid")
         );
         assert!(loaded.unresolved.is_empty());
         let owner = &loaded.graph.nodes["kubernetes:test:uid:owner-uid"];

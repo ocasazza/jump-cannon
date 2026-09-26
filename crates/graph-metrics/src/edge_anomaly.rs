@@ -157,10 +157,7 @@ mod tests {
     }
 
     fn add_edge(g: &mut VaultGraph, s: &str, t: &str) {
-        g.add_edge(VaultEdge {
-            source: s.to_string(),
-            target: t.to_string(),
-        });
+        g.add_edge(VaultEdge::new(s, t));
     }
 
     /// Two dense clusters connected by a single bridge edge.

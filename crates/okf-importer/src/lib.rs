@@ -568,7 +568,7 @@ impl OkfImporter {
         *edge_endpoint_bytes = next_endpoint_bytes;
         let source = self.node_id(source)?;
         let target = self.node_id(target)?;
-        graph.add_edge(VaultEdge { source, target });
+        graph.add_edge(VaultEdge::new(source, target));
         Ok(())
     }
 

@@ -374,10 +374,7 @@ mod tests {
             ("f", "d"),
             ("c", "d"), // the global shortcut
         ] {
-            graph.add_edge(VaultEdge {
-                source: s.to_string(),
-                target: t.to_string(),
-            });
+            graph.add_edge(VaultEdge::new(s, t));
         }
 
         let snap = test_snapshot(graph);
