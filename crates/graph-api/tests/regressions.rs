@@ -440,6 +440,149 @@ async fn declared_but_ungranted_content_write_is_forbidden() {
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
 }
 
+/// Minimal pest package with `[parser.content_file]`: node bodies live in
+/// `nodes/<id>.md` beside the input and are editable.
+const FILE_CONTENT_PACKAGE: &str = r#"format_version = 3
+
+[metadata]
+id = "example.file-graph"
+name = "File graph"
+version = "0.1.0"
+
+[parser]
+engine = "pest"
+root_rule = "document"
+grammar = '''
+document = { SOI ~ (node ~ NEWLINE?)* ~ EOI }
+node = { "N|" ~ node_id ~ "|" ~ title }
+node_id = @{ field }
+title = @{ field }
+field = _{ (!("|" | NEWLINE) ~ ANY)+ }
+kind = { "k" }
+tag = { "t" }
+property = { key ~ "=" ~ value }
+key = { "k" }
+value = { "v" }
+edge = { source ~ target }
+source = { "s" }
+target = { "t" }
+'''
+
+[parser.captures]
+node = "node"
+id = "node_id"
+title = "title"
+kind = "kind"
+tag = "tag"
+property = "property"
+key = "key"
+value = "value"
+edge = "edge"
+source = "source"
+target = "target"
+
+[parser.content_file]
+path = "nodes/{id}.md"
+writable = true
+"#;
+
+async fn node_meta_of(app: &axum::Router, id: &str) -> NodeMeta {
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/node/{}", id.replace('/', "%2F")))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .expect("router served");
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = to_bytes(resp.into_body(), 1 << 20).await.expect("body");
+    NodeMeta::decode(bytes.as_ref()).expect("decode NodeMeta")
+}
+
+/// A pest package with `[parser.content_file] writable = true`, bound with
+/// `--vault-root` = the input's directory, serves the node's file as its
+/// body and accepts the editor's `PUT /vault/page` for it; a node whose
+/// file is missing stays metadata-only.
+#[tokio::test]
+async fn pest_file_backed_content_round_trips_through_vault_page_put() {
+    let root = std::env::temp_dir().join(format!(
+        "jump-cannon-pest-content-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(root.join("nodes")).expect("content root");
+    std::fs::write(root.join("graph.lines"), "N|s1|Session one\nN|s2|Session two\n")
+        .expect("input");
+    std::fs::write(
+        root.join("nodes/s1.md"),
+        "---\nkind: session\n---\n# Session one\n\nobjective\n",
+    )
+    .expect("node body");
+
+    let package = importer::ValidatedPackage::from_toml(FILE_CONTENT_PACKAGE).expect("package");
+    let importer = importer::FilesystemImporter::new(package, root.join("graph.lines"))
+        .expect("pest package binds");
+    let grants = importer.descriptor().capabilities.into_iter().collect();
+    let state = graph_api::build_world_state(
+        Box::new(importer),
+        grants,
+        root.clone(),
+        Arc::new(graph_api::progress::ProgressLog::new()),
+    )
+    .await
+    .expect("state builds");
+    let app = graph_api::router(state);
+
+    let s1 = node_meta_of(&app, "pest:example.file-graph:s1").await;
+    assert_eq!(s1.path, "nodes/s1");
+    assert!(s1.content_readable, "existing file makes the node readable");
+    assert!(s1.content_writable, "writable package makes it editable");
+    assert_eq!(s1.content_type.as_deref(), Some("text/markdown"));
+    assert_eq!(s1.body, "# Session one\n\nobjective\n");
+
+    let s2 = node_meta_of(&app, "pest:example.file-graph:s2").await;
+    assert_eq!(s2.path, "nodes/s2");
+    assert!(!s2.content_readable && !s2.content_writable);
+    assert_eq!(s2.body, "");
+
+    // The editor PUTs `NodeMeta.path` and the body only.
+    let body = serde_json::to_vec(&serde_json::json!({
+        "path": s1.path,
+        "body": "# Session one\n\nedited objective\n"
+    }))
+    .unwrap();
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/vault/page")
+                .header("content-type", "application/json")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .expect("router served");
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = to_bytes(resp.into_body(), 1 << 20).await.expect("body");
+    let saved: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+    assert_eq!(saved["ok"], true, "{saved}");
+
+    let edited = node_meta_of(&app, "pest:example.file-graph:s1").await;
+    assert_eq!(edited.body, "# Session one\n\nedited objective\n");
+    let on_disk = std::fs::read_to_string(root.join("nodes/s1.md")).expect("saved file");
+    assert!(
+        on_disk.starts_with("---\nkind: session\n---\n"),
+        "the on-disk frontmatter survives the save: {on_disk:?}"
+    );
+    assert!(on_disk.ends_with("# Session one\n\nedited objective\n"), "{on_disk:?}");
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 /// Every independently fetched graph buffer identifies the exact snapshot it
 /// came from. This is what lets the frontend reject a reload that lands
 /// between `/graph/init` and the bulk requests.

@@ -10,9 +10,10 @@
 ## Source
 
 One Pest package over the extension's line projection
-(`~/.local/state/omp-auto-loop/graph.lines`):
+(`~/.local/state/omp-auto-loop/graph.lines`) plus one markdown file per node
+beside it (`nodes/<id>.md`):
 
-| Node kind | id | tags | properties | body |
+| Node kind | id | tags | properties | `nodes/<id>.md` |
 |---|---|---|---|---|
 | `session` | `s<omp session id>` | `active-goal` / `no-goal`, `main` / `sub`, last outcome | `cwd`, `continuations`, `max_continuations`, `heartbeats`, `model` | the goal's objective (absent without one) |
 | `repo` | `r<hash(shared git dir)>` | repo name | `root` | — |
@@ -43,13 +44,25 @@ same goal. Work on the same thing therefore forms one connected component
 instead of one isolated star per process. Heartbeats are a count on the hub,
 not nodes — they were a third of all events and carried no information.
 
-The producer supplies data only: bodies are raw content with newlines
-collapsed (the grammar's `body_text` is one line), never pre-rendered
-markdown. Every presentation choice — what a node click shows, how the
-budget reads, colors, arrangement — belongs to this topos. Properties not
-declared as `schema.fields` entries stay node metadata without entering search.
-Every node is upserted in place by id, so shared nodes appear once and always
-carry the current state.
+The producer supplies data only. `graph.lines` records carry no body; a
+node's content is the multi-line markdown file `nodes/<id>.md` next to
+`graph.lines`, written once by the producer and from then on owned by
+whoever edits it. The package binds that layout with
+`[parser.content_file] path = "nodes/{id}.md", writable = true`: a node is
+readable when its file exists at import time and editable on top of that,
+so a node without a file (a `repo`, say) is metadata-only rather than an
+error. Content is editable in the canvas — the Document panel saves through
+`PUT /vault/page` with the node's `path` (`nodes/<id>`; the route appends
+`.md`), which rewrites the body in place and preserves any YAML frontmatter
+the file carries. Edits are served on the next read and never trigger a
+re-import: only `graph.lines` is watched. For the reads and writes to be
+authorized, graph-api's `--vault-root` must be `graph.lines`' directory,
+spelled exactly as the importer sees it (the content capabilities are scoped
+to that directory). Every presentation choice — what a node click shows, how
+the budget reads, colors, arrangement — belongs to this topos. Properties
+not declared as `schema.fields` entries stay node metadata without entering
+search. Every node is upserted in place by id, so shared nodes appear once
+and always carry the current state.
 
 Edge kinds reach the canvas through `/graph/edge-kinds` (the palette) and
 `/graph/edge-kinds.bin` (one slot per edge, in `/graph/edges` order); the

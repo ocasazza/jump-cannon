@@ -277,6 +277,20 @@ or properties):
 | `property` (+ `key`/`value`) | Node carries no package properties. `key` and `value` are valid only together with `property`. |
 | `edge` (+ `source`/`target`) | The graph is node-only. `source` and `target` are valid only together with `edge`; the package schema still declares its edge type and simply never emits it. |
 | `edge_kind` | Edges are untyped (`VaultEdge.kind = None`). When bound, a matched capture becomes the edge's kind and must be one of the package's `[[schema.edge_types]]` keys when any are declared — an undeclared kind fails the import naming it; an edge match without the capture stays untyped. graph-api serves the kinds at `/graph/edge-kinds` (palette) + `/graph/edge-kinds.bin` (one `u16` slot per edge, `/graph/edges` order), and the Style panel's "Kind (edge type)" edge-color mode renders them. |
+| `content` | Nodes are metadata-only. When bound, the captured text is the node's read-only markdown body, served through `Importer::read_body`. Mutually exclusive with `[parser.content_file]`. |
+
+**File-backed content — `[parser.content_file]`.** Bodies that outlive the
+input line (multi-line markdown, user edits) live in one file per node beside
+the input: `path = "nodes/{id}.md"` (relative, `{id}` exactly once, plain
+segments, `.md`) and `writable = true|false`. The raw local id is substituted;
+an id that is not a single path segment (`/`, `\`, NUL, `.`, `..`) leaves that
+node metadata-only rather than failing the document. `NodeMeta::path` is the
+derived path without `.md` (the vault-links convention), a node is readable
+exactly when its file exists at import time and writable on top of that when
+the package says so, and the importer's `ContentRead`/`ContentWrite`
+capabilities are scoped to the input's directory — so `--vault-root` must be
+that directory for `GET /node/*id` bodies and `PUT /vault/page` saves to be
+authorized. Only the input is watched; body edits are served on the next read.
 
 **Node-level typed properties — the "size" contract.** Capture text is always
 a string at the grammar boundary, but a package that declares a property field

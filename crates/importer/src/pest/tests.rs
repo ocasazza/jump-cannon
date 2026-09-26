@@ -341,6 +341,187 @@ mod native {
         let importer = FilesystemImporter::new(package(), file.path()).expect("pest package binds");
         data_loader::testing::assert_import_contract(&importer).await;
     }
+
+    /// Input directory with `graph.lines` beside a `nodes/` folder holding
+    /// one existing body (with frontmatter) and one symlink escaping the
+    /// root; `n2` has no file and `../escape` is not a single segment.
+    fn content_file_fixture() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("temp input dir");
+        std::fs::write(
+            dir.path().join("graph.lines"),
+            "N|n1|Alpha|service||\nN|n2|Beta|service||\nN|../escape|Escape|service||\nN|n4|Link|service||\nE|n1|n2",
+        )
+        .expect("write input");
+        let nodes = dir.path().join("nodes");
+        std::fs::create_dir(&nodes).expect("nodes dir");
+        std::fs::write(
+            nodes.join("n1.md"),
+            "---\ntitle: Alpha\n---\n# Alpha\n\nfile body\n",
+        )
+        .expect("write body");
+        let outside = tempfile::NamedTempFile::new().expect("outside file");
+        std::fs::write(outside.path(), "outside").expect("write outside");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(outside.path(), nodes.join("n4.md")).expect("symlink");
+        // Keep the outside file alive for the test's duration by leaking
+        // its handle into the fixture directory's lifetime.
+        std::mem::forget(outside);
+        dir
+    }
+
+    fn content_file_importer(dir: &tempfile::TempDir, writable: bool) -> FilesystemImporter {
+        let package = ValidatedPackage::from_toml(&super::content_file_manifest(&format!(
+            "path = \"nodes/{{id}}.md\"\nwritable = {writable}"
+        )))
+        .expect("valid package");
+        FilesystemImporter::new(package, dir.path().join("graph.lines")).expect("binds")
+    }
+
+    #[tokio::test]
+    async fn content_file_nodes_follow_the_files_beside_the_input() {
+        let dir = content_file_fixture();
+        let importer = content_file_importer(&dir, true);
+
+        let descriptor = importer.descriptor();
+        descriptor.validate().expect("descriptor agrees with schema");
+        let root = dir.path().to_string_lossy().into_owned();
+        for effect in [Effect::ContentRead, Effect::ContentWrite] {
+            assert!(
+                descriptor.capabilities.contains(&Capability::new(
+                    effect,
+                    Transport::Filesystem,
+                    root.clone()
+                )),
+                "{effect:?} must be scoped to the input's directory"
+            );
+        }
+        assert_eq!(
+            descriptor.watch,
+            WatchPlan::Filesystem {
+                root: dir.path().join("graph.lines")
+            },
+            "node files never drive reloads"
+        );
+
+        let progress = data_loader::NoProgress;
+        let ImportOutcome::Loaded(result) = importer.import(&progress).await.expect("import") else {
+            panic!("cold import reports Loaded")
+        };
+        descriptor.schema.validate_result(&result).expect("nodes stay inside the schema");
+        let node = |id: &str| result.graph.nodes[&format!("pest:example.line-graph:{id}")].meta.clone();
+
+        let alpha = node("n1");
+        assert_eq!(alpha.path, "nodes/n1");
+        assert!(alpha.content_readable && alpha.content_writable);
+        assert_eq!(alpha.content_type.as_deref(), Some("text/markdown"));
+        assert_eq!(
+            importer.read_body("nodes/n1").as_deref(),
+            Some("# Alpha\n\nfile body\n"),
+            "frontmatter is stripped from the served body"
+        );
+
+        let beta = node("n2");
+        assert_eq!(beta.path, "nodes/n2", "missing files keep their derived path");
+        assert!(!beta.content_readable && !beta.content_writable);
+        assert_eq!(beta.content_type, None);
+        assert_eq!(importer.read_body("nodes/n2"), None);
+
+        let escape = node("../escape");
+        assert_eq!(escape.path, "../escape");
+        assert!(!escape.content_readable && !escape.content_writable);
+
+        #[cfg(unix)]
+        {
+            let link = node("n4");
+            assert!(!link.content_readable, "a symlink out of the root is not content");
+            assert_eq!(importer.read_body("nodes/n4"), None);
+        }
+    }
+
+    #[tokio::test]
+    async fn content_file_without_writable_is_read_only() {
+        let dir = content_file_fixture();
+        let importer = content_file_importer(&dir, false);
+
+        let descriptor = importer.descriptor();
+        descriptor.validate().expect("descriptor agrees with schema");
+        assert!(!descriptor
+            .capabilities
+            .iter()
+            .any(|capability| capability.effect == Effect::ContentWrite));
+
+        let ImportOutcome::Loaded(result) =
+            importer.import(&data_loader::NoProgress).await.expect("import")
+        else {
+            panic!("cold import reports Loaded")
+        };
+        let alpha = &result.graph.nodes["pest:example.line-graph:n1"].meta;
+        assert!(alpha.content_readable);
+        assert!(!alpha.content_writable);
+        data_loader::testing::assert_import_contract(&importer).await;
+    }
+
+    /// The chart ships this exact file; the omp auto-loop producer writes
+    /// `graph.lines` plus `nodes/<id>.md` beside it. If the package stops
+    /// validating or stops binding that layout, the deployment fails at boot.
+    #[tokio::test]
+    async fn shipped_omp_auto_loop_package_serves_editable_node_files() {
+        let package = ValidatedPackage::from_toml(include_str!(
+            "../../../../charts/jump-cannon/packages/omp-auto-loop.toml"
+        ))
+        .expect("omp-auto-loop.toml validates");
+        assert_eq!(package.manifest().metadata.id, "ocasazza.omp-auto-loop");
+
+        let dir = tempfile::tempdir().expect("state dir");
+        std::fs::write(
+            dir.path().join("graph.lines"),
+            concat!(
+                "N|s1|Session one|session|active-goal,main|cwd=/repo;model=m\n",
+                "N|rabc|repo|repo|repo|root=/repo\n",
+                "N|s2|Old producer|session|no-goal|cwd=/x|legacy inline body\n",
+                "E|s1|rabc|in_repo\n"
+            ),
+        )
+        .expect("input");
+        std::fs::create_dir(dir.path().join("nodes")).expect("nodes dir");
+        std::fs::write(
+            dir.path().join("nodes/s1.md"),
+            "# Objective\n\nShip file-backed content.\n",
+        )
+        .expect("body");
+
+        let importer = FilesystemImporter::new(package, dir.path().join("graph.lines")).expect("binds");
+        data_loader::testing::assert_import_contract(&importer).await;
+        let descriptor = importer.descriptor();
+        assert!(descriptor.schema.content.readable && descriptor.schema.content.writable);
+        let root = dir.path().to_string_lossy().into_owned();
+        assert!(descriptor.capabilities.contains(&Capability::new(
+            Effect::ContentWrite,
+            Transport::Filesystem,
+            root
+        )));
+
+        let ImportOutcome::Loaded(result) =
+            importer.import(&data_loader::NoProgress).await.expect("import")
+        else {
+            panic!("cold import reports Loaded")
+        };
+        assert_eq!(result.graph.edges.len(), 1, "typed edge resolves");
+        let session = &result.graph.nodes["pest:ocasazza.omp-auto-loop:s1"].meta;
+        assert_eq!(session.path, "nodes/s1");
+        assert!(session.content_readable && session.content_writable);
+        assert_eq!(
+            importer.read_body("nodes/s1").as_deref(),
+            Some("# Objective\n\nShip file-backed content.\n")
+        );
+        let repo = &result.graph.nodes["pest:ocasazza.omp-auto-loop:rabc"].meta;
+        assert!(!repo.content_readable, "a node without a file is metadata-only");
+        let legacy = &result.graph.nodes["pest:ocasazza.omp-auto-loop:s2"].meta;
+        assert!(
+            !legacy.content_readable,
+            "an inline body still parses but is not bound to any capture"
+        );
+    }
 }
 
 // --- optional content capture -------------------------------------------------
@@ -403,7 +584,7 @@ target = "target"
 fn content_capture_marks_nodes_readable_and_returns_bodies() {
     let package = ValidatedPackage::from_toml(&content_manifest("content = \"body\""))
         .expect("valid content package");
-    assert!(captures_content(package.manifest()));
+    assert!(package.schema().content.readable);
 
     let input = concat!(
         "N|n1|Alpha|service|red|owner=platform|# alpha body\n",
@@ -434,7 +615,7 @@ fn content_capture_marks_nodes_readable_and_returns_bodies() {
 #[test]
 fn packages_without_content_stay_metadata_only() {
     let package = package();
-    assert!(!captures_content(package.manifest()));
+    assert!(!package.schema().content.readable);
     let result = package
         .parse_input("N|n1|Alpha|service|red|owner=platform")
         .expect("input parses");
@@ -452,6 +633,105 @@ fn content_rule_must_be_distinct_from_canonical_roles() {
         matches!(error, ImportError::AmbiguousCaptureRule { .. }),
         "got {error:?}"
     );
+}
+
+// --- file-backed content ([parser.content_file]) -------------------------------
+
+/// The plain line grammar (no inline body) with a `[parser.content_file]`
+/// table appended.
+fn content_file_manifest(content_file: &str) -> String {
+    manifest("").replace(
+        "[[schema.fields]]\nkey = \"owner\"",
+        &format!("[parser.content_file]\n{content_file}\n\n[[schema.fields]]\nkey = \"owner\""),
+    )
+}
+
+#[test]
+fn content_file_template_is_validated() {
+    for invalid in [
+        "nodes/node.md",
+        "nodes/{id}/{id}.md",
+        "/abs/{id}.md",
+        "../{id}.md",
+        "nodes/./{id}.md",
+        "nodes//{id}.md",
+        "nodes\\{id}.md",
+        "nodes/{id}.txt",
+        "{id}",
+        ".md",
+    ] {
+        let error = ValidatedPackage::from_toml(&content_file_manifest(&format!(
+            "path = {invalid:?}"
+        )))
+        .expect_err(invalid);
+        assert!(
+            matches!(error, ImportError::ContentFile(_)),
+            "{invalid}: {error:?}"
+        );
+    }
+
+    let package = ValidatedPackage::from_toml(&content_file_manifest("path = \"nodes/{id}.md\""))
+        .expect("relative single-placeholder template is valid");
+    let content_file = package
+        .pest_config()
+        .unwrap()
+        .content_file
+        .as_ref()
+        .expect("content_file bound");
+    assert!(!content_file.writable, "writable defaults to false");
+    assert_eq!(content_file.file_for("n1").as_deref(), Some("nodes/n1.md"));
+    for unsafe_id in ["a/b", "a\\b", ".", "..", "a\0b", ""] {
+        assert_eq!(content_file.file_for(unsafe_id), None, "{unsafe_id:?}");
+    }
+}
+
+#[test]
+fn content_file_and_content_capture_are_mutually_exclusive() {
+    let both = content_manifest("content = \"body\"").replace(
+        "[parser.captures]",
+        "[parser.content_file]\npath = \"nodes/{id}.md\"\n\n[parser.captures]",
+    );
+    let error = ValidatedPackage::from_toml(&both).expect_err("both bindings must fail");
+    assert!(
+        matches!(&error, ImportError::ContentFile(detail) if detail.contains("mutually exclusive")),
+        "{error:?}"
+    );
+}
+
+#[test]
+fn content_file_schema_advertises_read_and_optional_write() {
+    let read_only = ValidatedPackage::from_toml(&content_file_manifest("path = \"nodes/{id}.md\""))
+        .expect("valid package");
+    assert!(read_only.schema().content.readable);
+    assert!(!read_only.schema().content.writable);
+
+    let writable = ValidatedPackage::from_toml(&content_file_manifest(
+        "path = \"nodes/{id}.md\"\nwritable = true",
+    ))
+    .expect("valid package");
+    assert!(writable.schema().content.readable);
+    assert!(writable.schema().content.writable);
+    assert_eq!(writable.schema().content.media_types, ["text/markdown"]);
+}
+
+#[test]
+fn content_file_without_a_host_probe_keeps_paths_but_stays_metadata_only() {
+    let package = ValidatedPackage::from_toml(&content_file_manifest(
+        "path = \"nodes/{id}.md\"\nwritable = true",
+    ))
+    .expect("valid package");
+    let result = package
+        .parse_input("N|n1|Alpha|service||\nN|a/b|Slash|service||")
+        .expect("input parses");
+
+    let alpha = &result.graph.nodes["pest:example.line-graph:n1"].meta;
+    assert_eq!(alpha.path, "nodes/n1");
+    assert!(!alpha.content_readable);
+    assert!(!alpha.content_writable);
+    let slash = &result.graph.nodes["pest:example.line-graph:a/b"].meta;
+    assert_eq!(slash.path, "a/b", "unsafe ids keep the id as their path");
+    assert!(!slash.content_readable);
+    assert!(package.schema().validate_result(&result).is_ok());
 }
 
 // --- optional edge_kind capture -----------------------------------------------

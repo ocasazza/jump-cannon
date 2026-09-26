@@ -8,20 +8,30 @@
 # event class (continue / gate / goal / heartbeat / settled) and the
 # session's goal state. Edges are E|source|target|kind, the kind being one
 # of the [[schema.edge_types]] below; a bare E|source|target stays untyped.
+#
+# Node content is file-backed: the producer writes each node's markdown
+# once to nodes/<id>.md beside graph.lines ([parser.content_file] below),
+# and from then on the file belongs to whoever edits it — the canvas
+# editor saves through PUT /vault/page. graph.lines records carry no body;
+# the grammar's optional trailing `|body_text` field is still accepted (so
+# older producers keep parsing) but is not bound to any capture.
+#
 # Per AGENTS.md, "Importers: packages, not crates" — no SourceKind variant,
 # no new crate.
 #
-# Bind locally with:
+# Bind locally with (--vault-root must be graph.lines' directory, exactly
+# as spelled, so content reads and writes are authorized):
 #   graph-api --source=pest \
 #     --importer-manifest charts/jump-cannon/packages/omp-auto-loop.toml \
-#     --importer-input ~/.local/state/omp-auto-loop/graph.lines --port 8799
+#     --importer-input ~/.local/state/omp-auto-loop/graph.lines \
+#     --vault-root ~/.local/state/omp-auto-loop --port 8799
 
 format_version = 3
 
 [metadata]
 id = "ocasazza.omp-auto-loop"
 name = "omp auto-loop"
-version = "1.1.0"
+version = "1.2.0"
 description = "Reads the omp auto-loop (prime-agent internal-loop port) projection as a graph: one session node per live omp session with goal state, one event node per loop transition tagged by class, and typed session->repo/goal/gate/session/event and event->event edges."
 
 [limits]
@@ -131,5 +141,10 @@ value = "value"
 edge = "edge"
 source = "source"
 target = "target"
-content = "body_text"
 edge_kind = "edge_kind"
+
+# One markdown file per node, relative to graph.lines' directory. A node is
+# readable when its file exists at import time and editable on top of that.
+[parser.content_file]
+path = "nodes/{id}.md"
+writable = true

@@ -256,6 +256,9 @@ pub enum ImportError {
         second_role: &'static str,
     },
 
+    #[error("invalid parser.content_file: {0}")]
+    ContentFile(String),
+
     #[error("input is {actual} bytes; package limit is {max} bytes")]
     InputTooLarge { actual: usize, max: usize },
 
@@ -493,7 +496,7 @@ impl ValidatedPackage {
                 actual: json::ENGINE,
             });
         };
-        pest::parse_input_with_bodies(self, runtime, input)
+        pest::parse_input_with_bodies(self, runtime, input, None)
     }
 
     /// Resolve administrator-supplied values against the package's declared

@@ -1,17 +1,24 @@
 //! The `pest` engine: runtime Pest grammar packages.
 //!
 //! The `[parser]` table of a `format_version = 3` package carries
-//! `{ root_rule, grammar, [captures] }` — an inline Pest grammar, its root
-//! rule, and the semantic capture-rule bindings. The semantic capture
-//! contract maps Pest spans into the canonical graph: node, id, title, kind,
-//! tag, property, key, value, edge, source, target, and the optional
-//! `edge_kind` and `content`. Capture text is used exactly as matched by the
-//! grammar. Nodes retain source order, tags retain capture order, properties
-//! become string-valued frontmatter, and edges retain source order. An edge
-//! whose `edge_kind` capture names a kind the package's `[[schema.edge_types]]`
+//! `{ root_rule, grammar, [captures], [content_file] }` — an inline Pest
+//! grammar, its root rule, the semantic capture-rule bindings, and the
+//! optional file-backed content binding. The semantic capture contract maps
+//! Pest spans into the canonical graph: node, id, title, kind, tag, property,
+//! key, value, edge, source, target, and the optional `edge_kind` and
+//! `content`. Capture text is used exactly as matched by the grammar. Nodes
+//! retain source order, tags retain capture order, properties become
+//! string-valued frontmatter, and edges retain source order. An edge whose
+//! `edge_kind` capture names a kind the package's `[[schema.edge_types]]`
 //! does not declare fails the import. Edges with missing endpoints are
 //! reported through [data_loader::LoadResult::unresolved] and are not added to
 //! the graph.
+//!
+//! Node bodies come from one of two mutually exclusive bindings: the
+//! `content` capture (body text inside the input, read-only) or
+//! `[parser.content_file]` (one markdown file per node beside the input,
+//! optionally writable through the host's `PUT /vault/page`). See
+//! [`ContentFileConfig`].
 //!
 //! The grammar package format is deliberately free of any data-source
 //! binding: [`ValidatedPackage::parse_input`](crate::ValidatedPackage::parse_input)
@@ -54,8 +61,8 @@ use crate::{
 /// The `[parser] engine` tag selecting this engine.
 pub const ENGINE: &str = "pest";
 
-/// Runtime Pest parser configuration: the root rule, the inline grammar, and
-/// the capture-rule bindings.
+/// Runtime Pest parser configuration: the root rule, the inline grammar, the
+/// capture-rule bindings, and the optional file-backed content binding.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PestEngineConfig {
@@ -65,6 +72,72 @@ pub struct PestEngineConfig {
     pub grammar: String,
     /// Semantic names in the Pest parse tree.
     pub captures: CaptureRules,
+    /// File-backed per-node content; mutually exclusive with
+    /// `captures.content`.
+    pub content_file: Option<ContentFileConfig>,
+}
+
+/// `[parser.content_file]`: one markdown file per node, addressed by a path
+/// template relative to the content root (the directory containing the bound
+/// input).
+///
+/// The template contains `{id}` exactly once, is relative, uses plain `/`
+/// separated segments (no `.`/`..`), and ends in `.md`. The raw local id is
+/// substituted; an id that cannot be a single path segment (`/`, `\`, NUL,
+/// `.`, `..`) leaves that node metadata-only instead of failing the import.
+/// `NodeMeta::path` records the derived path without the `.md` extension —
+/// the vault-links convention `PUT /vault/page` and the shared body reader
+/// use — and a node is readable exactly when its file exists at import time,
+/// writable when `writable = true` on top of that.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ContentFileConfig {
+    /// Relative path template, e.g. `nodes/{id}.md`.
+    pub path: String,
+    /// Whether readable nodes are also editable through the host.
+    #[serde(default)]
+    pub writable: bool,
+}
+
+const ID_PLACEHOLDER: &str = "{id}";
+const MARKDOWN_EXTENSION: &str = ".md";
+
+impl ContentFileConfig {
+    fn validate(&self) -> Result<(), ImportError> {
+        let path = self.path.as_str();
+        let invalid = |detail: &str| ImportError::ContentFile(format!("path {path:?} {detail}"));
+        if path.matches(ID_PLACEHOLDER).count() != 1 {
+            return Err(invalid("must contain `{id}` exactly once"));
+        }
+        if path.contains(['\\', '\0']) {
+            return Err(invalid("must not contain backslashes or NUL bytes"));
+        }
+        if path.starts_with('/') {
+            return Err(invalid("must be relative to the input's directory"));
+        }
+        if path.split('/').any(|segment| matches!(segment, "" | "." | "..")) {
+            return Err(invalid("segments must be plain names (no empty, `.`, or `..`)"));
+        }
+        if !path.ends_with(MARKDOWN_EXTENSION) || path.len() == MARKDOWN_EXTENSION.len() {
+            return Err(invalid("must name a markdown file ending in `.md`"));
+        }
+        Ok(())
+    }
+
+    /// The node's relative markdown file for a local id, or `None` when the
+    /// raw id cannot be substituted as one path segment.
+    pub fn file_for(&self, id: &str) -> Option<String> {
+        if id.is_empty() || id == "." || id == ".." || id.contains(['/', '\\', '\0']) {
+            return None;
+        }
+        Some(self.path.replace(ID_PLACEHOLDER, id))
+    }
+}
+
+/// The relative markdown file behind a `NodeMeta::path` in the vault-links
+/// convention (`<path>.md`).
+fn markdown_file(node_path: &str) -> String {
+    format!("{node_path}{MARKDOWN_EXTENSION}")
 }
 
 /// Pest rule names that carry canonical graph semantics.
@@ -155,6 +228,8 @@ pub(crate) struct PestParserToml {
     pub root_rule: String,
     pub grammar: String,
     pub captures: CaptureRules,
+    #[serde(default)]
+    pub content_file: Option<ContentFileConfig>,
 }
 
 /// Prebuilt pest execution state: the optimized grammar VM and the node-ID
@@ -196,10 +271,21 @@ pub(crate) fn validate(source: &str) -> Result<ValidatedPackage, ImportError> {
         ));
     }
 
+    if let Some(content_file) = &wire.parser.content_file {
+        content_file.validate()?;
+        if wire.parser.captures.captures_content() {
+            return Err(ImportError::ContentFile(
+                "parser.content_file and parser.captures.content are mutually exclusive"
+                    .to_owned(),
+            ));
+        }
+    }
+
     let config = PestEngineConfig {
         root_rule: wire.parser.root_rule,
         grammar: wire.parser.grammar,
         captures: wire.parser.captures,
+        content_file: wire.parser.content_file,
     };
 
     let (_, optimized) = pest_meta::parse_and_optimize(&config.grammar)
@@ -288,26 +374,30 @@ fn pest_schema(manifest: &ImporterManifest) -> ImporterSchema {
         data_loader::TagHierarchySchema::slash(),
     )
     .with_input_media_types(["text/plain"])
-    .with_content(if captures_content(manifest) {
-        data_loader::ContentSchema {
-            readable: true,
-            writable: false,
-            media_types: vec!["text/markdown".to_owned()],
-        }
-    } else {
-        data_loader::ContentSchema {
-            readable: false,
-            writable: false,
-            media_types: Vec::new(),
-        }
+    .with_content(match &manifest.parser {
+        ParserConfig::Pest(config) => config.content_schema(),
+        _ => data_loader::ContentSchema::default(),
     })
 }
 
-/// Whether the package's parser binds the optional `content` capture.
-fn captures_content(manifest: &ImporterManifest) -> bool {
-    match &manifest.parser {
-        ParserConfig::Pest(config) => config.captures.captures_content(),
-        _ => false,
+impl PestEngineConfig {
+    /// Content operations this package publishes: read-only bodies for the
+    /// `content` capture, read plus optional write for `content_file`,
+    /// nothing for metadata-only packages.
+    pub fn content_schema(&self) -> data_loader::ContentSchema {
+        let readable = self.captures.captures_content() || self.content_file.is_some();
+        data_loader::ContentSchema {
+            readable,
+            writable: self
+                .content_file
+                .as_ref()
+                .is_some_and(|content_file| content_file.writable),
+            media_types: if readable {
+                vec!["text/markdown".to_owned()]
+            } else {
+                Vec::new()
+            },
+        }
     }
 }
 
@@ -367,6 +457,12 @@ fn join_errors<E: std::fmt::Display>(errors: Vec<E>) -> String {
         .join("\n")
 }
 
+/// Host answer to "does this `[parser.content_file]` file exist?", asked once
+/// per node with the derived relative markdown file. Bytes-only callers pass
+/// `None`: every file-backed node then imports metadata-only while keeping its
+/// derived path.
+pub type ContentFileProbe<'a> = &'a dyn Fn(&str) -> bool;
+
 /// Parse one UTF-8 input and deterministically map its semantic captures to a
 /// fresh graph. Engine dispatch happens in
 /// [`ValidatedPackage::parse_input`](crate::ValidatedPackage::parse_input).
@@ -375,7 +471,7 @@ pub(crate) fn parse_input(
     runtime: &PestRuntime,
     input: &str,
 ) -> Result<LoadResult, ImportError> {
-    let (result, _bodies) = parse_input_with_bodies(package, runtime, input)?;
+    let (result, _bodies) = parse_input_with_bodies(package, runtime, input, None)?;
     Ok(result)
 }
 
@@ -385,6 +481,7 @@ pub(crate) fn parse_input_with_bodies(
     package: &ValidatedPackage,
     runtime: &PestRuntime,
     input: &str,
+    content_files: Option<ContentFileProbe<'_>>,
 ) -> Result<(LoadResult, HashMap<String, String>), ImportError> {
     if input.len() > package.manifest.limits.input_bytes {
         return Err(ImportError::InputTooLarge {
@@ -399,6 +496,7 @@ pub(crate) fn parse_input_with_bodies(
         config: package
             .pest_config()
             .expect("parse_input is only reached for pest packages"),
+        content_files,
     };
 
     let root_rule = engine.config.root_rule.as_str();
@@ -475,11 +573,12 @@ pub(crate) fn parse_input_with_bodies(
 }
 
 /// Borrowed mapping context: the validated package, its pest configuration,
-/// and the prebuilt runtime.
+/// the prebuilt runtime, and the host's content-file probe.
 struct PestEngine<'a> {
     package: &'a ValidatedPackage,
     runtime: &'a PestRuntime,
     config: &'a PestEngineConfig,
+    content_files: Option<ContentFileProbe<'a>>,
 }
 
 impl PestEngine<'_> {
@@ -522,15 +621,15 @@ impl PestEngine<'_> {
                 });
             }
 
-            let (node, body) = self.map_node(pair)?;
-            if let Some((path, body)) = body {
-                mapped.bodies.insert(path, body);
-            }
-            if mapped.graph.nodes.contains_key(&node.id) {
+            let mapped_node = self.map_node(pair)?;
+            if mapped.graph.nodes.contains_key(&mapped_node.node.id) {
                 // Report the local capture id, not the namespaced node ID.
-                return Err(ImportError::DuplicateNodeId(node.meta.path.clone()));
+                return Err(ImportError::DuplicateNodeId(mapped_node.local_id));
             }
-            mapped.graph.add_node(node);
+            if let Some(body) = mapped_node.body {
+                mapped.bodies.insert(mapped_node.local_id, body);
+            }
+            mapped.graph.add_node(mapped_node.node);
             return Ok(());
         }
 
@@ -554,10 +653,7 @@ impl PestEngine<'_> {
         Ok(())
     }
 
-    fn map_node<'i, 'r>(
-        &self,
-        pair: Pair<'i, &'r str>,
-    ) -> Result<(VaultNode, Option<(String, String)>), ImportError> {
+    fn map_node<'i, 'r>(&self, pair: Pair<'i, &'r str>) -> Result<MappedNode, ImportError> {
         let mut fields = NodeFields::default();
         for child in pair.into_inner() {
             self.collect_node_fields(child, &mut fields)?;
@@ -578,26 +674,34 @@ impl PestEngine<'_> {
         let title = fields.title.clone().unwrap_or_else(|| id.clone());
         fields.tags.sort();
         fields.tags.dedup();
-        let content = fields
+        let body = fields
             .content
             .filter(|body| !body.trim().is_empty());
+        let content = match &self.config.content_file {
+            Some(content_file) => self.content_file_node(content_file, &id),
+            None => NodeContent {
+                path: id.clone(),
+                readable: body.is_some(),
+                writable: false,
+            },
+        };
         let meta = NodeMeta {
             source_id: self.package.manifest.metadata.id.clone(),
             title,
             tags: fields.tags,
             frontmatter: fields.properties,
             mtime: 0,
-            path: id.clone(),
+            path: content.path,
             doctype: fields.kind,
             folder: String::new(),
-            content_type: content.as_ref().map(|_| "text/markdown".to_owned()),
-            content_readable: content.is_some(),
-            content_writable: false,
+            content_type: content.readable.then(|| "text/markdown".to_owned()),
+            content_readable: content.readable,
+            content_writable: content.writable,
         };
 
-        let body = content.map(|body| (id, body));
-        Ok((
-            VaultNode {
+        Ok(MappedNode {
+            local_id: id,
+            node: VaultNode {
                 id: node_id,
                 meta,
                 metrics: NodeMetrics::default(),
@@ -605,7 +709,31 @@ impl PestEngine<'_> {
                 y: 0.0,
             },
             body,
-        ))
+        })
+    }
+
+    /// `[parser.content_file]` placement for one node: the derived path (in
+    /// the vault-links convention, without `.md`) plus existence-based
+    /// readable/writable flags. Unsafe ids fall back to metadata-only under
+    /// the id itself; so does every node when the host supplied no probe.
+    fn content_file_node(&self, content_file: &ContentFileConfig, id: &str) -> NodeContent {
+        let Some(file) = content_file.file_for(id) else {
+            return NodeContent {
+                path: id.to_owned(),
+                readable: false,
+                writable: false,
+            };
+        };
+        let readable = self.content_files.is_some_and(|exists| exists(&file));
+        let path = file
+            .strip_suffix(MARKDOWN_EXTENSION)
+            .expect("validated template ends in .md")
+            .to_owned();
+        NodeContent {
+            path,
+            readable,
+            writable: readable && content_file.writable,
+        }
     }
 
     fn collect_node_fields<'i, 'r>(
@@ -794,6 +922,21 @@ struct MappedGraph {
     bodies: HashMap<String, String>,
 }
 
+/// One mapped node record: the local capture id (kept for diagnostics and the
+/// capture-body store), the graph node, and its inline body when captured.
+struct MappedNode {
+    local_id: String,
+    node: VaultNode,
+    body: Option<String>,
+}
+
+/// Where a node's body lives and what the host may do with it.
+struct NodeContent {
+    path: String,
+    readable: bool,
+    writable: bool,
+}
+
 #[derive(Default)]
 struct NodeFields {
     id: Option<String>,
@@ -857,14 +1000,27 @@ impl FilesystemLoader {
     }
 
     /// Read the bounded UTF-8 file and return parse/mapping errors to callers
-    /// that can handle a fallible load operation.
+    /// that can handle a fallible load operation. With `[parser.content_file]`
+    /// bound, every node's markdown file is probed under the content root so
+    /// readable/writable reflect what exists at import time.
     pub fn load_checked(&self) -> Result<LoadResult, ImportError> {
         let bytes = read_bounded(&self.input_path, self.package.manifest.limits.input_bytes)?;
         let input = String::from_utf8(bytes).map_err(|source| ImportError::InputUtf8 {
             path: self.input_path.clone(),
             source,
         })?;
-        let (result, bodies) = self.package.parse_input_with_bodies(&input)?;
+        let EngineRuntime::Pest(runtime) = &self.package.runtime else {
+            unreachable!("FilesystemLoader::new only binds pest packages")
+        };
+        let content_root = self
+            .content_file()
+            .map(|_| ContentRoot::open(&self.content_root()));
+        let exists =
+            |file: &str| matches!(&content_root, Some(Some(root)) if root.resolve(file).is_some());
+        let probe = content_root
+            .as_ref()
+            .map(|_| &exists as ContentFileProbe<'_>);
+        let (result, bodies) = parse_input_with_bodies(&self.package, runtime, &input, probe)?;
         if let Ok(mut store) = self.bodies.lock() {
             *store = bodies;
         }
@@ -881,6 +1037,17 @@ impl FilesystemLoader {
         &self.input_path
     }
 
+    /// Directory that scopes node content: the bound input's directory. This
+    /// is what `[parser.content_file]` paths are relative to and what the host
+    /// must pass as `--vault-root` for content reads and writes to be
+    /// authorized.
+    pub fn content_root(&self) -> PathBuf {
+        match self.input_path.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
+            _ => PathBuf::from("."),
+        }
+    }
+
     /// Whether the bound package captures per-node bodies.
     pub fn captures_content(&self) -> bool {
         self.package
@@ -888,6 +1055,61 @@ impl FilesystemLoader {
             .ok()
             .is_some_and(|config| config.captures.captures_content())
     }
+
+    fn content_file(&self) -> Option<&ContentFileConfig> {
+        self.package.pest_config().ok()?.content_file.as_ref()
+    }
+
+    /// Body of a `[parser.content_file]` node: the file behind
+    /// `NodeMeta::path`, confined to the content root, frontmatter stripped.
+    fn read_content_file(&self, node_path: &str) -> Option<String> {
+        let file = ContentRoot::open(&self.content_root())?.resolve(&markdown_file(node_path))?;
+        let raw = std::fs::read_to_string(file).ok()?;
+        Some(strip_frontmatter(&raw).to_owned())
+    }
+}
+
+/// A canonicalized content root that resolves relative markdown files only
+/// when they stay inside it (symlinks included) and exist as regular files.
+#[cfg(feature = "native")]
+struct ContentRoot {
+    root: PathBuf,
+    canonical: PathBuf,
+}
+
+#[cfg(feature = "native")]
+impl ContentRoot {
+    fn open(root: &Path) -> Option<Self> {
+        Some(Self {
+            root: root.to_path_buf(),
+            canonical: root.canonicalize().ok()?,
+        })
+    }
+
+    fn resolve(&self, relative_file: &str) -> Option<PathBuf> {
+        let file = self.root.join(relative_file).canonicalize().ok()?;
+        (file.starts_with(&self.canonical) && file.is_file()).then_some(file)
+    }
+}
+
+/// Drop a leading `---` YAML frontmatter block, the same shape graph-api's
+/// shared body reader strips, so the editor never renders it twice.
+#[cfg(feature = "native")]
+fn strip_frontmatter(raw: &str) -> &str {
+    let Some(rest) = raw
+        .strip_prefix("---\n")
+        .or_else(|| raw.strip_prefix("---\r\n"))
+    else {
+        return raw;
+    };
+    let mut offset = 0;
+    for line in rest.split_inclusive('\n') {
+        if line.trim_end_matches(['\n', '\r']) == "---" {
+            return rest[offset + line.len()..].trim_start_matches('\n');
+        }
+        offset += line.len();
+    }
+    raw
 }
 
 #[cfg(feature = "native")]
@@ -950,22 +1172,25 @@ impl Importer for FilesystemImporter {
         let metadata = &self.loader.package.manifest.metadata;
         let scope = self.loader.input_path.to_string_lossy().into_owned();
         let read = Capability::new(Effect::Read, Transport::Filesystem, scope.clone());
-        let watch = Capability::new(Effect::Watch, Transport::Filesystem, scope.clone());
+        let watch = Capability::new(Effect::Watch, Transport::Filesystem, scope);
         let mut capabilities = vec![read, watch];
-        if self.loader.captures_content() {
-            // Bodies are served from this importer's capture store, not
-            // from disk. The capability is scoped to the package's own
-            // root (the input's directory) — the same contract OKF uses —
-            // so hosts gate reads on `--vault-root` while cross-source
-            // reads stay denied.
-            let root = self
-                .loader
-                .input_path
-                .parent()
-                .map(|parent| parent.to_string_lossy().into_owned())
-                .unwrap_or(scope);
+        // Content capabilities are scoped to the content root (the input's
+        // directory) — the same contract OKF uses — so hosts gate reads and
+        // writes on `--vault-root` while cross-source access stays denied.
+        // Capture-mode bodies come from this importer's store; file-backed
+        // bodies come from `<root>/<NodeMeta::path>.md`.
+        let content = &self.loader.package.schema().content;
+        let root = self.loader.content_root().to_string_lossy().into_owned();
+        if content.readable {
             capabilities.push(Capability::new(
                 Effect::ContentRead,
+                Transport::Filesystem,
+                root.clone(),
+            ));
+        }
+        if content.writable {
+            capabilities.push(Capability::new(
+                Effect::ContentWrite,
                 Transport::Filesystem,
                 root,
             ));
@@ -977,6 +1202,8 @@ impl Importer for FilesystemImporter {
             capabilities,
             self.loader.package.schema().clone(),
         )
+        // Only the input drives reloads: edits to file-backed node bodies
+        // are served on the next read and never trigger a re-import.
         .with_watch(WatchPlan::Filesystem {
             root: self.loader.input_path.clone(),
         })
@@ -1007,9 +1234,13 @@ impl Importer for FilesystemImporter {
         })
     }
 
-    /// Node bodies captured by the package's optional `content` rule,
-    /// keyed by the node's local capture id (`NodeMeta::path`).
+    /// Node body for `NodeMeta::path`: the `[parser.content_file]` markdown
+    /// file under the content root, or the body captured by the optional
+    /// `content` rule (keyed by local capture id).
     fn read_body(&self, path: &str) -> Option<String> {
+        if self.loader.content_file().is_some() {
+            return self.loader.read_content_file(path);
+        }
         self.loader.bodies.lock().ok()?.get(path).cloned()
     }
 }
