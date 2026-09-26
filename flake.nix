@@ -1523,6 +1523,11 @@
       x86_64-linux.test-runner-image = inputs.self.packages.x86_64-linux.test-runner-image;
       x86_64-linux.okf-sync-k8s-image = inputs.self.packages.x86_64-linux.okf-sync-k8s-image;
       aarch64-darwin.graph-compute = inputs.self.packages.aarch64-darwin.graph-compute;
+      # Built on the darwin builders so desktop consumers (the omp auto-loop
+      # canvas agent in ocasazza/nixos-config) substitute them from the Hydra
+      # cache instead of compiling the Rust/wasm closure locally.
+      aarch64-darwin.graph-api = inputs.self.packages.aarch64-darwin.graph-api;
+      aarch64-darwin.app-web = inputs.self.packages.aarch64-darwin.app-web;
       aarch64-darwin.bench-pagerank = inputs.self.packages.aarch64-darwin.bench-pagerank;
     };
   };
