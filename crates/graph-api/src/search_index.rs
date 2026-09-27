@@ -11,12 +11,12 @@ use data_loader::{DiscoveryField, DiscoveryFieldType, ImporterSchema, SearchDocu
 use tantivy::{
     collector::{Count, TopDocs},
     doc,
-    query::QueryParser,
+    query::{Query, QueryParser, TermQuery},
     schema::{
         Field, IndexRecordOption, Schema, TextFieldIndexing, TextOptions, Value as TantivyValue,
         STORED, STRING,
     },
-    Index, IndexReader, ReloadPolicy, SnippetGenerator, TantivyDocument,
+    Index, IndexReader, ReloadPolicy, SnippetGenerator, TantivyDocument, Term,
 };
 
 const WRITER_MEMORY_BYTES: usize = 50_000_000;
@@ -142,9 +142,24 @@ impl SearchIndex {
         for indexed in &self.fields {
             parser.set_field_boost(indexed.field, f32::from(indexed.descriptor.boost));
         }
-        let parsed = parser
-            .parse_query(query)
-            .with_context(|| format!("parse discovery query {query:?}"))?;
+        // A query that is exactly a node id finds that node. Namespaced ids
+        // (`pest:<package>:<local>`) would otherwise parse as a query on a
+        // field named after the source kind and be rejected as unknown.
+        let exact_id: Box<dyn Query> = Box::new(TermQuery::new(
+            Term::from_field_text(self.node_id, query),
+            IndexRecordOption::Basic,
+        ));
+        let parsed = if searcher
+            .search(&exact_id, &Count)
+            .context("look up discovery node id")?
+            > 0
+        {
+            exact_id
+        } else {
+            parser
+                .parse_query(query)
+                .with_context(|| format!("parse discovery query {query:?}"))?
+        };
 
         let (mut top, mut total) = searcher
             .search(&parsed, &(TopDocs::with_limit(limit), Count))
@@ -355,6 +370,32 @@ mod tests {
             .with("tags", json!([]))
             .with("kind", "demo")];
         let index = SearchIndex::build(&schema(), &documents).unwrap();
+        assert!(index.search("secret:value", 10, false).is_err());
+    }
+
+    /// Pasting a namespaced node id into search must find that node. The id's
+    /// colons otherwise parse as a query on a field named after the source
+    /// kind, which is rejected — while genuine unknown-field queries still are.
+    #[test]
+    fn an_exact_namespaced_id_finds_its_node() {
+        let documents = vec![
+            SearchDocument::new("pest:ocasazza.omp-auto-loop:s01a0d57a-8199")
+                .with("id", "pest:ocasazza.omp-auto-loop:s01a0d57a-8199")
+                .with("title", "nixos-config#01a0d57a")
+                .with("tags", json!(["main"]))
+                .with("kind", "session"),
+            SearchDocument::new("pest:ocasazza.omp-auto-loop:s2")
+                .with("id", "pest:ocasazza.omp-auto-loop:s2")
+                .with("title", "other")
+                .with("tags", json!([]))
+                .with("kind", "session"),
+        ];
+        let index = SearchIndex::build(&schema(), &documents).unwrap();
+        let hit = index
+            .search("  pest:ocasazza.omp-auto-loop:s01a0d57a-8199 ", 10, true)
+            .unwrap();
+        assert_eq!(hit.total, 1);
+        assert_eq!(hit.hits[0].id, "pest:ocasazza.omp-auto-loop:s01a0d57a-8199");
         assert!(index.search("secret:value", 10, false).is_err());
     }
 
