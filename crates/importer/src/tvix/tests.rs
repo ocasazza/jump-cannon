@@ -263,3 +263,110 @@ fn unknown_supplied_variable_is_rejected() {
         "error must name the unknown variable: {error}"
     );
 }
+
+fn metadata_package(weight: &str) -> String {
+    format!(
+        r#"format_version = 3
+
+[metadata]
+id = "generate.metadata"
+name = "Metadata generator"
+version = "1.0.0"
+
+[[schema.fields]]
+key = "weight"
+field_type = "number"
+required = false
+searchable = false
+facetable = true
+
+[parser]
+engine = "tvix"
+expr = '''
+{{}}: {{
+  nodes = [
+    {{
+      id = "alpha";
+      type = "service";
+      title = "Alpha";
+      tags = [ "featured" ];
+      doctype = "component";
+      path = "generated/alpha";
+      weight = {weight};
+    }}
+    {{ id = "beta"; type = "service"; }}
+  ];
+  links = [ ];
+}}
+'''
+"#
+    )
+}
+
+#[tokio::test]
+async fn declared_numeric_metadata_is_projected() {
+    let package =
+        ValidatedPackage::from_toml(&metadata_package("2.5")).expect("metadata package validates");
+    assert!(
+        package
+            .schema()
+            .field("weight")
+            .is_some_and(|field| field.facetable),
+        "the package field must extend the fixed tvix schema"
+    );
+    let importer =
+        build_tvix_importer(package, BTreeMap::new(), "metadata".to_owned()).expect("binds");
+    let ImportOutcome::Loaded(result) = importer.import(&NoProgress).await.expect("imports") else {
+        panic!("static generator must load")
+    };
+
+    let alpha = &result.graph.nodes["tvix:metadata:alpha"];
+    assert_eq!(alpha.meta.title, "Alpha");
+    assert_eq!(alpha.meta.tags, ["service", "featured"]);
+    assert_eq!(alpha.meta.doctype.as_deref(), Some("component"));
+    assert_eq!(alpha.meta.path, "generated/alpha");
+    assert_eq!(alpha.meta.frontmatter["weight"], serde_json::json!(2.5));
+    assert!(
+        !alpha.meta.frontmatter.contains_key("title")
+            && !alpha.meta.frontmatter.contains_key("tags")
+            && !alpha.meta.frontmatter.contains_key("doctype")
+            && !alpha.meta.frontmatter.contains_key("path"),
+        "presentation metadata is consumed instead of duplicated in frontmatter"
+    );
+    assert_eq!(
+        result.search_documents[0].fields["weight"],
+        serde_json::json!(2.5)
+    );
+    assert!(
+        !result.search_documents[1].fields.contains_key("weight"),
+        "an optional field may be absent"
+    );
+    importer
+        .descriptor()
+        .schema
+        .validate_result(&result)
+        .expect("projected metadata satisfies the declared schema");
+}
+
+#[tokio::test]
+async fn declared_metadata_with_the_wrong_type_is_rejected() {
+    let package =
+        ValidatedPackage::from_toml(&metadata_package("\"heavy\"")).expect("package validates");
+    let importer =
+        build_tvix_importer(package, BTreeMap::new(), "metadata".to_owned()).expect("binds");
+    let error = importer
+        .import(&NoProgress)
+        .await
+        .expect_err("a string cannot populate a number field");
+    assert!(
+        error.to_string().contains("weight") && error.to_string().contains("number"),
+        "projection error must name the field and expected type: {error}"
+    );
+}
+
+#[test]
+fn canonical_schema_field_collision_is_rejected() {
+    let source = metadata_package("2.5").replace("key = \"weight\"", "key = \"title\"");
+    let error = ValidatedPackage::from_toml(&source).expect_err("canonical field must not collide");
+    assert!(error.to_string().contains("title"), "{error}");
+}

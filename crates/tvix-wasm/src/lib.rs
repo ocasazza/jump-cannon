@@ -11,7 +11,7 @@
 //! construction — this is what lets the crate compile for
 //! `wasm32-unknown-unknown`.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -216,46 +216,65 @@ pub struct GeneratedGraph {
     pub edges: Vec<GenEdge>,
 }
 
-/// A node. `kind` is the Nix `type` field (renamed to dodge the Rust keyword).
-#[derive(Debug, Clone, PartialEq)]
+/// A node. `kind` is the Nix `type` field (renamed to dodge the Rust keyword);
+/// every other wire key is retained as metadata for importer projection.
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct GenNode {
     pub id: String,
+    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
     pub kind: Option<String>,
+    #[serde(flatten)]
+    pub metadata: BTreeMap<String, serde_json::Value>,
 }
 
-/// A directed/undirected edge between two node ids.
-#[derive(Debug, Clone, PartialEq)]
+/// A graph edge with the standard `toGraphJSON` attributes plus retained
+/// package-defined metadata.
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct GenEdge {
     pub source: String,
     pub target: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub directed: Option<bool>,
+    #[serde(flatten)]
+    pub metadata: BTreeMap<String, serde_json::Value>,
 }
 
-// Wire shapes matching toGraphJSON output. `#[serde(flatten)]` is avoided and
-// extra fields are simply ignored, so node/edge metadata does not break parsing.
-//
-// These also serve as the canonical `{ nodes, links }` JSON WIRE for the
-// server-side generate backend: graph-api evaluates natively, re-emits a
-// `GeneratedGraph` through [`to_graph_json`] (which round-trips through these
-// shapes), and the WASM client parses it back via [`parse_graph_json`]. They
-// are `Serialize` for exactly that purpose.
-#[derive(Serialize, Deserialize)]
+// Owned wire shapes used while parsing `toGraphJSON` output. Flattening keeps
+// every non-core attribute instead of silently dropping metadata.
+#[derive(Deserialize)]
 struct RawNode {
     id: String,
-    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "type")]
     kind: Option<String>,
+    #[serde(flatten)]
+    extra: BTreeMap<String, serde_json::Value>,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Deserialize)]
 struct RawEdge {
     source: String,
     target: String,
+    id: Option<String>,
+    directed: Option<bool>,
+    #[serde(flatten)]
+    extra: BTreeMap<String, serde_json::Value>,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Deserialize)]
 struct RawGraph {
     nodes: Vec<RawNode>,
     /// toGraphJSON emits `links`; accept that name.
     links: Vec<RawEdge>,
+}
+
+/// Borrowed serialization view. Serializing the public generated types
+/// directly avoids cloning every id and metadata map on large graphs.
+#[derive(Serialize)]
+struct RawGraphRef<'a> {
+    nodes: &'a [GenNode],
+    links: &'a [GenEdge],
 }
 
 // ── Evaluation ──────────────────────────────────────────────────────────────
@@ -331,6 +350,7 @@ pub fn parse_graph_json(json: &str) -> Result<GeneratedGraph, String> {
         .map(|n| GenNode {
             id: n.id,
             kind: n.kind,
+            metadata: n.extra,
         })
         .collect();
     let edges = raw
@@ -339,6 +359,9 @@ pub fn parse_graph_json(json: &str) -> Result<GeneratedGraph, String> {
         .map(|e| GenEdge {
             source: e.source,
             target: e.target,
+            id: e.id,
+            directed: e.directed,
+            metadata: e.extra,
         })
         .collect();
 
@@ -349,26 +372,12 @@ pub fn parse_graph_json(json: &str) -> Result<GeneratedGraph, String> {
 /// (the same shape `toGraphJSON` / [`parse_graph_json`] accept). Used by the
 /// server-side generate backend to return an evaluated graph to the client.
 pub fn to_graph_json(graph: &GeneratedGraph) -> String {
-    let raw = RawGraph {
-        nodes: graph
-            .nodes
-            .iter()
-            .map(|n| RawNode {
-                id: n.id.clone(),
-                kind: n.kind.clone(),
-            })
-            .collect(),
-        links: graph
-            .edges
-            .iter()
-            .map(|e| RawEdge {
-                source: e.source.clone(),
-                target: e.target.clone(),
-            })
-            .collect(),
+    let raw = RawGraphRef {
+        nodes: &graph.nodes,
+        links: &graph.edges,
     };
-    // The shapes are plain structs of owned strings — serialisation is
-    // infallible in practice; fall back to an empty graph rather than panic.
+    // JSON serialization of strings, booleans, and already-validated JSON
+    // values is infallible in practice; preserve the existing soft fallback.
     serde_json::to_string(&raw).unwrap_or_else(|_| r#"{"nodes":[],"links":[]}"#.to_string())
 }
 
@@ -681,20 +690,34 @@ mod tests {
         assert!(!err.is_empty(), "expected a non-empty error message");
     }
 
-    /// The server generate backend evaluates natively, re-emits the graph as
     /// `{ nodes, links }` JSON (`to_graph_json`), and the client parses it back
-    /// (`parse_graph_json`). That round-trip must reproduce the eval result
-    /// exactly, including the optional `type`/`kind` field.
+    /// (`parse_graph_json`). That round-trip must reproduce every graph field,
+    /// including flattened node metadata and edge attributes.
     #[test]
     fn graph_json_round_trip() {
-        let graph = eval_graph(STAR_EXPR).expect("star eval should succeed");
+        let expr = r#"{
+            nodes = [
+                { id = "a"; type = "service"; title = "Alpha"; weight = 2.5; tags = [ "hot" ]; }
+                { id = "b"; }
+            ];
+            links = [
+                { id = "edge-a-b"; source = "a"; target = "b"; directed = true; confidence = 0.9; }
+            ];
+        }"#;
+        let graph = eval_graph(expr).expect("graph with metadata should evaluate");
         let json = to_graph_json(&graph);
         let parsed = parse_graph_json(&json).expect("re-parse should succeed");
         assert_eq!(parsed, graph, "round-trip must be lossless");
 
-        // A present kind survives the round-trip.
-        let center = parsed.nodes.iter().find(|n| n.id == "n0").unwrap();
-        assert_eq!(center.kind.as_deref(), Some("center"));
+        let alpha = &parsed.nodes[0];
+        assert_eq!(alpha.kind.as_deref(), Some("service"));
+        assert_eq!(alpha.metadata["title"], serde_json::json!("Alpha"));
+        assert_eq!(alpha.metadata["weight"], serde_json::json!(2.5));
+        assert_eq!(alpha.metadata["tags"], serde_json::json!(["hot"]));
+        let edge = &parsed.edges[0];
+        assert_eq!(edge.id.as_deref(), Some("edge-a-b"));
+        assert_eq!(edge.directed, Some(true));
+        assert_eq!(edge.metadata["confidence"], serde_json::json!(0.9));
     }
 
     /// A `kind = None` node must round-trip as an absent `type` field (and a

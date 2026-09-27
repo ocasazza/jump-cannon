@@ -1720,6 +1720,51 @@ async fn graph_init(selection: SourceSelection) -> impl IntoResponse {
     proto_response(&msg)
 }
 
+fn derived_node_facts(
+    schema: &data_loader::ImporterSchema,
+    id: &str,
+    title: &str,
+    tags: &[String],
+    path: &str,
+    doctype: Option<&str>,
+    frontmatter: &std::collections::HashMap<String, serde_json::Value>,
+) -> Vec<proto::NodeFact> {
+    schema
+        .fields
+        .iter()
+        .filter_map(|field| {
+            let value_json = match field.key.as_str() {
+                "id" => serde_json::to_string(id).ok(),
+                "title" if !title.is_empty() => serde_json::to_string(title).ok(),
+                "tags" => serde_json::to_string(tags).ok(),
+                "path" if !path.is_empty() => serde_json::to_string(path).ok(),
+                "type" => doctype
+                    .or_else(|| tags.first().map(String::as_str))
+                    .and_then(|kind| serde_json::to_string(kind).ok()),
+                key => frontmatter
+                    .get(key)
+                    .and_then(|value| serde_json::to_string(value).ok()),
+            }?;
+            Some(proto::NodeFact {
+                key: field.key.clone(),
+                value_json,
+                field_type: field.field_type.as_str().to_owned(),
+            })
+        })
+        .collect()
+}
+
+fn phase_zero_provenance(source_id: &str) -> proto::Provenance {
+    proto::Provenance {
+        source_id: source_id.to_owned(),
+        transform_id: None,
+        first_seen_run: None,
+        last_changed_run: None,
+        change: "unchanged".to_owned(),
+        history_bounded: true,
+    }
+}
+
 /// `/node/:id` lookup.
 ///
 /// Primary path: serve from the in-memory `VaultGraph`. Many ids the renderer
@@ -1791,6 +1836,15 @@ async fn node_meta(selection: SourceSelection, Path(id): Path<String>) -> impl I
         } else {
             String::new()
         };
+        let facts = derived_node_facts(
+            &snap.schema,
+            &id,
+            &node.meta.title,
+            &node.meta.tags,
+            &node.meta.path,
+            node.meta.doctype.as_deref(),
+            &node.meta.frontmatter,
+        );
         let msg = proto::NodeMeta {
             id: id.clone(),
             title: node.meta.title.clone(),
@@ -1821,6 +1875,8 @@ async fn node_meta(selection: SourceSelection, Path(id): Path<String>) -> impl I
             anomaly_flag: node.metrics.anomaly_flag,
             content_readable,
             content_writable,
+            facts,
+            provenance: Some(phase_zero_provenance(&node.meta.source_id)),
         };
         return proto_response(&msg).into_response();
     }
@@ -1846,15 +1902,20 @@ async fn node_meta(selection: SourceSelection, Path(id): Path<String>) -> impl I
                 Some((f, t)) => (f.to_string(), t.to_string()),
                 None => (String::new(), stripped.to_string()),
             };
+            let path = format!("{stripped}.md");
+            let tags = Vec::new();
+            let frontmatter = std::collections::HashMap::new();
+            let facts =
+                derived_node_facts(&snap.schema, &id, &title, &tags, &path, None, &frontmatter);
             let msg = proto::NodeMeta {
                 id: id.clone(),
                 title,
-                path: format!("{stripped}.md"),
+                path,
                 folder,
                 // Not "external" — this is a real vault page that just
                 // isn't in the layout graph.
                 doctype: None,
-                tags: Vec::new(),
+                tags,
                 frontmatter_json: "{}".into(),
                 degree: 0,
                 indegree: 0,
@@ -1876,6 +1937,8 @@ async fn node_meta(selection: SourceSelection, Path(id): Path<String>) -> impl I
                 anomaly_flag: false,
                 content_readable: true,
                 content_writable: can_write_filesystem_content,
+                facts,
+                provenance: Some(phase_zero_provenance("obsidian")),
             };
             return proto_response(&msg).into_response();
         }
@@ -1887,13 +1950,26 @@ async fn node_meta(selection: SourceSelection, Path(id): Path<String>) -> impl I
         Some((f, t)) => (f.to_string(), t.to_string()),
         None => (String::new(), id.clone()),
     };
+    let path = id.clone();
+    let doctype = Some("external".to_owned());
+    let tags = Vec::new();
+    let frontmatter = std::collections::HashMap::new();
+    let facts = derived_node_facts(
+        &snap.schema,
+        &id,
+        &title,
+        &tags,
+        &path,
+        doctype.as_deref(),
+        &frontmatter,
+    );
     let msg = proto::NodeMeta {
         id: id.clone(),
         title,
-        path: id.clone(),
+        path,
         folder,
-        doctype: Some("external".into()),
-        tags: Vec::new(),
+        doctype,
+        tags,
         frontmatter_json: "{}".into(),
         degree: 0,
         indegree: 0,
@@ -1918,6 +1994,8 @@ async fn node_meta(selection: SourceSelection, Path(id): Path<String>) -> impl I
         anomaly_flag: false,
         content_readable: false,
         content_writable: false,
+        facts,
+        provenance: Some(phase_zero_provenance("")),
     };
     proto_response(&msg).into_response()
 }

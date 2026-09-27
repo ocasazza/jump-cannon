@@ -17,8 +17,12 @@ as `hindsight-memory-bank.toml`; see [[Hindsight Importer]]), or run an
 `engine = "tvix"` generator package that evaluates a parameterised Nix
 expression into a graph (`generate-random.toml`, `generate-clusters.toml`) with
 its node count, edge count, seed, cluster count, and affinity bound at apply
-time. Every server importer publishes its search and facet keys through
-`GET /graph/schema`.
+time. Tvix packages may declare `[[schema.fields]]`; matching flattened node
+metadata is type-checked, indexed or faceted as declared, and retained as node
+frontmatter. Metadata `title`, `tags`, `doctype`, and `path` populate their
+canonical node fields. The same metadata survives the browser Generate panel's
+`toGraphJSON` round trip. Every server importer publishes its search and facet
+keys through `GET /graph/schema`.
 
 Open the **Importers** panel to see the active importer and the sanitized
 deployment catalog. Named source instances show their kind, source identity,

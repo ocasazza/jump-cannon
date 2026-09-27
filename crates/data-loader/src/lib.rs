@@ -49,6 +49,21 @@ pub enum DiscoveryFieldType {
     Url,
 }
 
+impl DiscoveryFieldType {
+    /// Stable wire name used by package manifests and protobuf fact rows.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Text => "text",
+            Self::Keyword => "keyword",
+            Self::KeywordList => "keyword_list",
+            Self::Number => "number",
+            Self::Boolean => "boolean",
+            Self::Date => "date",
+            Self::Url => "url",
+        }
+    }
+}
+
 /// One named field in an importer's source-neutral discovery contract.
 ///
 /// Unknown source attributes may still be retained in `NodeMeta.frontmatter`,
@@ -110,6 +125,13 @@ impl DiscoveryField {
     pub fn with_default(mut self, value: impl Into<serde_json::Value>) -> Self {
         self.default_value = Some(value.into());
         self
+    }
+
+    /// Validate one emitted JSON value against this field's discovery type.
+    /// Projection engines call this before publication so errors name the
+    /// package field at the boundary that produced the bad value.
+    pub fn validate_value(&self, value: &serde_json::Value) -> Result<(), String> {
+        validate_field_value(self, value)
     }
 }
 

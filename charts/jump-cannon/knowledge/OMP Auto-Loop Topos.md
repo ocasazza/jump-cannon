@@ -13,9 +13,9 @@ One Pest package over the extension's line projection
 (`~/.local/state/omp-auto-loop/graph.lines`) plus one markdown file per node
 beside it (`nodes/<id>.md`):
 
-| Node kind | id | tags | properties | `nodes/<id>.md` |
+| Node kind | id | tags | declared properties | `nodes/<id>.md` |
 |---|---|---|---|---|
-| `session` | `s<omp session id>` | `active-goal` / `no-goal`, `main` / `sub`, last outcome | `cwd`, `continuations`, `max_continuations`, `heartbeats`, `model` | the goal's objective (absent without one) |
+| `session` | `s<omp session id>` | `active-goal` / `no-goal`, `main` / `sub`, last outcome | `cwd`, `continuations` (number), `max_continuations` (number), `heartbeats` (number), `model` | the goal's objective (absent without one) |
 | `repo` | `r<hash(shared git dir)>` | repo name | `root` | — |
 | `goal` | `g<hash(objective)>` | `active` / `paused` / `complete` | — | the objective |
 | `gate` | `c<hash(command)>` | — | — | the verifier command |
@@ -59,10 +59,13 @@ re-import: only `graph.lines` is watched. For the reads and writes to be
 authorized, graph-api's `--vault-root` must be `graph.lines`' directory,
 spelled exactly as the importer sees it (the content capabilities are scoped
 to that directory). Every presentation choice — what a node click shows, how
-the budget reads, colors, arrangement — belongs to this topos. Properties
-not declared as `schema.fields` entries stay node metadata without entering
-search. Every node is upserted in place by id, so shared nodes appear once
-and always carry the current state.
+the budget reads, colors, arrangement — belongs to this topos. The Source
+table's properties are optional `schema.fields` entries: numeric loop counters,
+`model`, and `root` participate in facets and appear in the shared Facts
+sections when present, while old nodes that lack them still import. Any other
+undeclared property remains frontmatter for chips but does not enter search or
+Facts. Every node is upserted in place by id, so shared nodes appear once and
+always carry the current state.
 
 Edge kinds reach the canvas through `/graph/edge-kinds` (the palette) and
 `/graph/edge-kinds.bin` (one slot per edge, in `/graph/edges` order); the

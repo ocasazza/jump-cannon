@@ -26,8 +26,8 @@ use gloo_storage::{LocalStorage, Storage};
 use panel_kit::Spinner;
 use serde::{Deserialize, Serialize};
 
-use crate::panels::{document, filter};
-use crate::{api, Ctx};
+use crate::panels::{document, filter, inspector};
+use crate::{api, badges, Ctx};
 
 /// Rich indexed hits for the current query (display list only — the id set
 /// for canvas highlighting lives on `ctx.results`).
@@ -786,6 +786,17 @@ fn focused_node(ctx: Ctx) -> Element {
     } else {
         ("metadata only", "nodes-content-state metadata")
     };
+    let facts = {
+        let query = filter::QUERY.read();
+        let is_active = |field: &str, value: &str| query.is_filter_active(field, value);
+        badges::node_facts(
+            &meta,
+            &is_active,
+            None,
+            inspector::badge_dispatch(ctx, meta.id.clone()),
+        )
+    };
+    let provenance = badges::node_provenance(&meta);
     rsx! {
         article {
             class: "nodes-focus",
@@ -807,6 +818,10 @@ fn focused_node(ctx: Ctx) -> Element {
                         span { class: "nodes-source", "{meta.source_id}" }
                     }
                 }
+            }
+            div { class: "nodes-focus-details",
+                { facts }
+                { provenance }
             }
             div { class: "nodes-focus-body",
                 { document::viewer(ctx, "jc-nodes-src") }

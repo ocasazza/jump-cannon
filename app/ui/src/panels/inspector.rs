@@ -679,6 +679,19 @@ fn node_view(ctx: Ctx, id: String) -> Element {
                     }
                 }
             };
+            let facts = {
+                let query = filter::QUERY.read();
+                let is_active = |field: &str, value: &str| {
+                    query.is_filter_active(field, value)
+                };
+                badges::node_facts(
+                    m,
+                    &is_active,
+                    tint,
+                    badge_dispatch(ctx, id.clone()),
+                )
+            };
+            let provenance = badges::node_provenance(m);
             // Identity + metric rows — the egui show_metadata id header and
             // its metric keys (degree/pagerank/community/kcore), plus the
             // extra typed fields the /node/:id wire carries (title, path,
@@ -736,6 +749,8 @@ fn node_view(ctx: Ctx, id: String) -> Element {
                 }
                 { badge_row }
                 { frontmatter_grid(&m.frontmatter_json) }
+                { facts }
+                { provenance }
             }
         }
     };

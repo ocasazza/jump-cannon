@@ -7,9 +7,10 @@
 //! Pest spans into the canonical graph: node, id, title, kind, tag, property,
 //! key, value, edge, source, target, and the optional `edge_kind` and
 //! `content`. Capture text is used exactly as matched by the grammar. Nodes
-//! retain source order, tags retain capture order, properties become
-//! string-valued frontmatter, and edges retain source order. An edge whose
-//! `edge_kind` capture names a kind the package's `[[schema.edge_types]]`
+//! retain source order, tags retain capture order, undeclared properties stay
+//! strings, declared properties are projected to their discovery JSON type,
+//! and edges retain source order. An edge whose `edge_kind` capture names a
+//! kind the package's `[[schema.edge_types]]`
 //! does not declare fails the import. Edges with missing endpoints are
 //! reported through [data_loader::LoadResult::unresolved] and are not added to
 //! the graph.
@@ -319,18 +320,6 @@ fn validate_package_schema(schema: &PackageSchema) -> Result<(), ImportError> {
                 field.key
             )));
         }
-        if !matches!(
-            field.field_type,
-            DiscoveryFieldType::Text
-                | DiscoveryFieldType::Keyword
-                | DiscoveryFieldType::Date
-                | DiscoveryFieldType::Url
-        ) {
-            return Err(ImportError::InvalidMetadata(format!(
-                "Pest property field {:?} must be text, keyword, date, or url",
-                field.key
-            )));
-        }
         if field.sensitive {
             return Err(ImportError::InvalidMetadata(format!(
                 "sensitive property {:?} must not enter the discovery schema",
@@ -593,11 +582,7 @@ impl PestEngine<'_> {
         }
         for field in &self.package.manifest.schema.fields {
             if let Some(value) = node.meta.frontmatter.get(&field.key) {
-                let keep = field.field_type == DiscoveryFieldType::Text
-                    || value.as_str().is_some_and(|value| !value.trim().is_empty());
-                if keep {
-                    document.insert(&field.key, value.clone());
-                }
+                document.insert(&field.key, value.clone());
             }
         }
         document
@@ -771,12 +756,9 @@ impl PestEngine<'_> {
             return Ok(());
         }
         if rule == captures.property {
-            let (key, value) = self.map_property(pair)?;
-            if fields
-                .properties
-                .insert(key.clone(), Value::String(value))
-                .is_some()
-            {
+            let (key, raw_value) = self.map_property(pair)?;
+            let value = self.property_value(&key, &raw_value)?;
+            if fields.properties.insert(key.clone(), value).is_some() {
                 return Err(invalid_record(
                     "node",
                     format!("duplicate property key '{key}'"),
@@ -811,6 +793,46 @@ impl PestEngine<'_> {
             return Err(invalid_record("property", "key capture is empty"));
         }
         Ok((key, value))
+    }
+
+    fn property_value(&self, key: &str, raw: &str) -> Result<Value, ImportError> {
+        let Some(field) = self
+            .package
+            .manifest
+            .schema
+            .fields
+            .iter()
+            .find(|field| field.key == key)
+        else {
+            return Ok(Value::String(raw.to_owned()));
+        };
+        let value = match field.field_type {
+            DiscoveryFieldType::Text
+            | DiscoveryFieldType::Keyword
+            | DiscoveryFieldType::Date
+            | DiscoveryFieldType::Url => Value::String(raw.to_owned()),
+            DiscoveryFieldType::Number
+            | DiscoveryFieldType::Boolean
+            | DiscoveryFieldType::KeywordList => serde_json::from_str(raw).map_err(|error| {
+                invalid_record(
+                    "property",
+                    format!(
+                        "field {key:?} must be {} JSON: {error}",
+                        field.field_type.as_str()
+                    ),
+                )
+            })?,
+        };
+        field.validate_value(&value).map_err(|detail| {
+            invalid_record(
+                "property",
+                format!(
+                    "field {key:?} must be {}: {detail}",
+                    field.field_type.as_str()
+                ),
+            )
+        })?;
+        Ok(value)
     }
 
     fn collect_property_fields<'i, 'r>(

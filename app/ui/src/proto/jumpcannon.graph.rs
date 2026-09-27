@@ -85,6 +85,36 @@ pub struct NodeMeta {
     /// at least one edge whose stress exceeds the anomaly threshold.
     #[prost(bool, tag = "28")]
     pub anomaly_flag: bool,
+    /// Derived at request time from the snapshot schema and node metadata.
+    #[prost(message, repeated, tag = "29")]
+    pub facts: ::prost::alloc::vec::Vec<NodeFact>,
+    /// Phase 0 reports source identity honestly; run fields arrive with the ledger.
+    #[prost(message, optional, tag = "30")]
+    pub provenance: ::core::option::Option<Provenance>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct NodeFact {
+    #[prost(string, tag = "1")]
+    pub key: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub value_json: ::prost::alloc::string::String,
+    #[prost(string, tag = "3")]
+    pub field_type: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct Provenance {
+    #[prost(string, tag = "1")]
+    pub source_id: ::prost::alloc::string::String,
+    #[prost(string, optional, tag = "2")]
+    pub transform_id: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(uint64, optional, tag = "3")]
+    pub first_seen_run: ::core::option::Option<u64>,
+    #[prost(uint64, optional, tag = "4")]
+    pub last_changed_run: ::core::option::Option<u64>,
+    #[prost(string, tag = "5")]
+    pub change: ::prost::alloc::string::String,
+    #[prost(bool, tag = "6")]
+    pub history_bounded: bool,
 }
 /// Search response. Returned by /search?q=…
 #[derive(Clone, PartialEq, ::prost::Message)]

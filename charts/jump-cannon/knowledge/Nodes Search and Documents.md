@@ -10,9 +10,16 @@ tags: [jump-cannon, search, editing]
 
 Nodes is an editor-style workbench. Its left navigator lists nodes and its main
 area follows the selected node, showing source identity, path, content state,
-frontmatter badges, and any readable body. Select from the navigator or the
-Graph; both routes focus the same node. Inspector and Document remain available
-as detachable views, while Nodes keeps navigation and content together for the
+schema-derived Facts, Provenance, frontmatter badges, and any readable body.
+Inspector renders the same shared Facts and Provenance components beside its
+metrics, badges, frontmatter, and neighbours; neither surface branches on the
+source kind. Facts follow the active discovery schema in declaration order,
+with numeric values aligned as data, keyword lists shown as chips, and bounded
+text. Provenance is derived from the current snapshot: Phase 0 reports the
+source, `unchanged`, and `history bounded`; later retained run history can fill
+the transform and first/last-run rows. Select from the navigator or the Graph;
+both routes focus the same node. Inspector and Document remain available as
+detachable views, while Nodes keeps navigation and content together for the
 normal workflow.
 
 With an empty query, switch the navigator between Flat and Tags. Tags groups by

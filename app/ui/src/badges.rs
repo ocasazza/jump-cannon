@@ -216,6 +216,111 @@ pub(crate) fn frontmatter_chips(
     }
 }
 
+/// Schema-derived facts shared by the Nodes panel and Inspector. The server
+/// preserves declaration order and sends values as JSON so every importer uses
+/// this one presentation path.
+pub(crate) fn node_facts(
+    meta: &NodeMeta,
+    is_active: &dyn Fn(&str, &str) -> bool,
+    tint: Option<Rgb>,
+    on_action: EventHandler<BadgeAction>,
+) -> Element {
+    if meta.facts.is_empty() {
+        return rsx! {};
+    }
+    rsx! {
+        section { class: "nodes-facts node-detail-section",
+            h3 { "Facts" }
+            dl { class: "node-facts-grid",
+                for fact in &meta.facts {
+                    div { class: "node-fact-row", key: "{fact.key}",
+                        dt { "{fact.key}" }
+                        dd { class: if fact.field_type == "number" { "node-fact-value number" } else { "node-fact-value" },
+                            { fact_value(fact, is_active, tint, on_action) }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn fact_value(
+    fact: &crate::proto::NodeFact,
+    is_active: &dyn Fn(&str, &str) -> bool,
+    tint: Option<Rgb>,
+    on_action: EventHandler<BadgeAction>,
+) -> Element {
+    let Ok(value) = serde_json::from_str::<Value>(&fact.value_json) else {
+        return rsx! { span { "{fact.value_json}" } };
+    };
+    match fact.field_type.as_str() {
+        "keyword_list" => rsx! {
+            div { class: "node-fact-chips",
+                { value_chips(&fact.key, &value, is_active, tint, on_action) }
+            }
+        },
+        "number" => rsx! { span { "{value}" } },
+        "text" => {
+            let text = value.as_str().unwrap_or(&fact.value_json);
+            rsx! { div { class: "node-fact-text", "{text}" } }
+        }
+        _ => {
+            let display = value
+                .as_str()
+                .map(str::to_owned)
+                .unwrap_or_else(|| value.to_string());
+            rsx! { span { "{display}" } }
+        }
+    }
+}
+
+/// Phase-0 provenance shared by both node detail surfaces. Later phases fill
+/// the optional transform/run fields without changing this component.
+pub(crate) fn node_provenance(meta: &NodeMeta) -> Element {
+    let Some(provenance) = meta.provenance.as_ref() else {
+        return rsx! {};
+    };
+    rsx! {
+        section { class: "nodes-provenance node-detail-section",
+            h3 { "Provenance" }
+            dl { class: "node-provenance-grid",
+                if !provenance.source_id.is_empty() {
+                    div { class: "node-fact-row",
+                        dt { "source" }
+                        dd { class: "node-fact-value", "{provenance.source_id}" }
+                    }
+                }
+                if let Some(transform_id) = provenance.transform_id.as_ref() {
+                    div { class: "node-fact-row",
+                        dt { "transform" }
+                        dd { class: "node-fact-value", "{transform_id}" }
+                    }
+                }
+                if let Some(run) = provenance.first_seen_run {
+                    div { class: "node-fact-row",
+                        dt { "first seen" }
+                        dd { class: "node-fact-value number", "#{run}" }
+                    }
+                }
+                if let Some(run) = provenance.last_changed_run {
+                    div { class: "node-fact-row",
+                        dt { "last changed" }
+                        dd { class: "node-fact-value number", "#{run}" }
+                    }
+                }
+                div { class: "node-fact-row",
+                    dt { "change" }
+                    dd { class: "node-fact-value", "{provenance.change}" }
+                }
+                if provenance.history_bounded {
+                    div { class: "node-provenance-bound", "history bounded" }
+                }
+            }
+        }
+    }
+}
+
 /// Port of frontmatter_chip.rs::render_value — strings get the detector
 /// cascade, arrays recurse one level over scalars, numbers/bools become
 /// toggle chips, nulls/objects are skipped.

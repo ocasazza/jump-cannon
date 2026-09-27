@@ -59,6 +59,26 @@ message NodeMeta {
   // Phase 0: edge-anomaly flag. True when this node participates in
   // at least one edge whose stress exceeds the anomaly threshold.
   bool anomaly_flag = 28;
+
+  // Derived at request time from the snapshot schema and node metadata.
+  repeated NodeFact facts = 29;
+  // Phase 0 reports source identity honestly; run fields arrive with the ledger.
+  Provenance provenance = 30;
+}
+
+message NodeFact {
+  string key = 1;
+  string value_json = 2;
+  string field_type = 3;
+}
+
+message Provenance {
+  string source_id = 1;
+  optional string transform_id = 2;
+  optional uint64 first_seen_run = 3;
+  optional uint64 last_changed_run = 4;
+  string change = 5;
+  bool history_bounded = 6;
 }
 
 // Search response. Returned by /search?q=…

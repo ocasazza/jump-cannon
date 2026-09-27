@@ -476,7 +476,7 @@ mod native {
         std::fs::write(
             dir.path().join("graph.lines"),
             concat!(
-                "N|s1|Session one|session|active-goal,main|cwd=/repo;model=m\n",
+                "N|s1|Session one|session|active-goal,main|cwd=/repo;continuations=2;max_continuations=3;heartbeats=4;model=m\n",
                 "N|rabc|repo|repo|repo|root=/repo\n",
                 "N|s2|Old producer|session|no-goal|cwd=/x|legacy inline body\n",
                 "E|s1|rabc|in_repo\n"
@@ -490,10 +490,25 @@ mod native {
         )
         .expect("body");
 
-        let importer = FilesystemImporter::new(package, dir.path().join("graph.lines")).expect("binds");
+        let importer =
+            FilesystemImporter::new(package, dir.path().join("graph.lines")).expect("binds");
         data_loader::testing::assert_import_contract(&importer).await;
         let descriptor = importer.descriptor();
         assert!(descriptor.schema.content.readable && descriptor.schema.content.writable);
+        for key in ["continuations", "max_continuations", "heartbeats"] {
+            let field = descriptor.schema.field(key).expect("numeric loop field");
+            assert_eq!(field.field_type, data_loader::DiscoveryFieldType::Number);
+            assert!(!field.required, "nodes may omit {key}");
+            assert!(field.facetable, "{key} participates in meta_summary");
+        }
+        assert!(descriptor
+            .schema
+            .field("model")
+            .is_some_and(|field| field.facetable && !field.required));
+        assert!(descriptor
+            .schema
+            .field("root")
+            .is_some_and(|field| field.facetable && !field.required));
         let root = dir.path().to_string_lossy().into_owned();
         assert!(descriptor.capabilities.contains(&Capability::new(
             Effect::ContentWrite,
@@ -501,8 +516,10 @@ mod native {
             root
         )));
 
-        let ImportOutcome::Loaded(result) =
-            importer.import(&data_loader::NoProgress).await.expect("import")
+        let ImportOutcome::Loaded(result) = importer
+            .import(&data_loader::NoProgress)
+            .await
+            .expect("import")
         else {
             panic!("cold import reports Loaded")
         };
@@ -510,12 +527,23 @@ mod native {
         let session = &result.graph.nodes["pest:ocasazza.omp-auto-loop:s1"].meta;
         assert_eq!(session.path, "nodes/s1");
         assert!(session.content_readable && session.content_writable);
+        assert_eq!(session.frontmatter["continuations"], serde_json::json!(2));
+        assert_eq!(
+            session.frontmatter["max_continuations"],
+            serde_json::json!(3)
+        );
+        assert_eq!(session.frontmatter["heartbeats"], serde_json::json!(4));
+        assert_eq!(session.frontmatter["model"], serde_json::json!("m"));
         assert_eq!(
             importer.read_body("nodes/s1").as_deref(),
             Some("# Objective\n\nShip file-backed content.\n")
         );
         let repo = &result.graph.nodes["pest:ocasazza.omp-auto-loop:rabc"].meta;
-        assert!(!repo.content_readable, "a node without a file is metadata-only");
+        assert!(
+            !repo.content_readable,
+            "a node without a file is metadata-only"
+        );
+        assert_eq!(repo.frontmatter["root"], serde_json::json!("/repo"));
         let legacy = &result.graph.nodes["pest:ocasazza.omp-auto-loop:s2"].meta;
         assert!(
             !legacy.content_readable,

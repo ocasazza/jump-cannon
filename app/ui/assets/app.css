@@ -208,6 +208,25 @@ input.nodes-search { flex:1 1 auto; min-width:7rem; }
 .nodes-content-state.editable { color:var(--green); }
 .nodes-content-state.readable { color:var(--accent); }
 .nodes-focus-body { flex:1 1 auto; min-height:0; overflow:hidden; padding:.6rem .75rem .75rem; }
+.nodes-focus-details { display:grid; grid-template-columns:minmax(0, 1.35fr) minmax(9rem, .65fr);
+  gap:.8rem; flex:0 1 auto; max-height:45%; overflow:auto; padding:.55rem .75rem;
+  border-bottom:1px solid var(--line); }
+.node-detail-section { min-width:0; }
+.node-detail-section h3 { margin:0 0 .35rem; color:var(--dim); font-size:.62rem;
+  font-weight:600; letter-spacing:.08em; text-transform:uppercase; }
+.node-facts-grid, .node-provenance-grid { display:flex; flex-direction:column; gap:.18rem; margin:0; }
+.node-fact-row { display:grid; grid-template-columns:minmax(5.5rem, .7fr) minmax(0, 1.3fr);
+  gap:.55rem; align-items:start; min-width:0; }
+.node-fact-row dt { overflow:hidden; color:var(--dim); font-size:10px; line-height:1.45;
+  text-overflow:ellipsis; white-space:nowrap; }
+.node-fact-row dd { min-width:0; margin:0; }
+.node-fact-value { overflow-wrap:anywhere; color:var(--fg); font-size:10.5px; line-height:1.45; }
+.node-fact-value.number { text-align:right; font-variant-numeric:tabular-nums; }
+.node-fact-chips { display:flex; flex-wrap:wrap; gap:.22rem; }
+.node-fact-text { max-height:6.5rem; overflow:auto; padding-right:.2rem; white-space:pre-wrap; }
+.node-provenance-bound { margin-top:.22rem; color:var(--yellow); font-size:9.5px; }
+.inspector .node-detail-section { margin-top:.45rem; padding-top:.45rem;
+  border-top:1px solid var(--line); }
 .nodes-focus-empty { display:flex; flex-direction:column; align-items:center; justify-content:center;
   height:100%; min-height:0; padding:1rem; color:var(--dim); text-align:center; }
 .nodes-focus-empty h2 { margin:0 0 .4rem; color:var(--fg); font-size:.9rem; }
@@ -219,6 +238,7 @@ input.nodes-search { flex:1 1 auto; min-width:7rem; }
   .nodes-nav { border-right:0; border-bottom:1px solid var(--line); }
   .nodes-focus-head { padding:.5rem .6rem; }
   .nodes-focus-body { padding:.5rem .6rem .6rem; }
+  .nodes-focus-details { grid-template-columns:minmax(0, 1fr); max-height:52%; padding:.5rem .6rem; }
 }
 
 

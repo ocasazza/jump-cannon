@@ -196,7 +196,7 @@ pub(crate) fn validate(source: &str) -> Result<ValidatedPackage, ImportError> {
     validate_package_schema(&wire.schema)
         .map_err(|error| ImportError::TvixEngine(error.to_string()))?;
 
-    let schema = tvix_schema();
+    let schema = tvix_schema(&wire.schema);
     schema
         .validate()
         .map_err(|error| ImportError::TvixEngine(error.to_string()))?;
@@ -287,15 +287,19 @@ fn validate_config(config: &TvixEngineConfig) -> Result<(), PipelineError> {
     Ok(())
 }
 
-/// The tvix engine publishes a fixed projection, so a package cannot add
-/// discovery fields or edge types: the graph carries only node ids and one
-/// `type`. Reject a declared `[schema]` body rather than silently drop it.
+const CORE_KEYS: &[&str] = &["id", "title", "tags", "path", "type"];
+
+/// Tvix packages may add node discovery fields carried by flattened node
+/// metadata. Canonical fields remain engine-owned and edge schema additions
+/// stay unsupported because generated edge metadata is not projected.
 fn validate_package_schema(schema: &PackageSchema) -> Result<(), PipelineError> {
-    if !schema.fields.is_empty() {
-        return Err(invalid(
-            "the tvix engine publishes a fixed discovery schema and does not accept [[schema.fields]]"
-                .to_owned(),
-        ));
+    for field in &schema.fields {
+        if CORE_KEYS.contains(&field.key.as_str()) {
+            return Err(invalid(format!(
+                "schema field {:?} collides with a canonical field",
+                field.key
+            )));
+        }
     }
     if !schema.edge_types.is_empty() {
         return Err(invalid(
@@ -470,25 +474,26 @@ fn is_identifier(value: &str) -> bool {
             .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
 }
 
-/// Canonical discovery fields every tvix package publishes, plus the single
-/// directed edge type. The projection populates exactly these fields, so the
-/// schema is fixed (no package additions).
-fn tvix_schema() -> ImporterSchema {
+/// Canonical discovery fields every tvix package publishes plus its declared
+/// metadata fields and the single directed edge type.
+fn tvix_schema(package_schema: &PackageSchema) -> ImporterSchema {
+    let mut fields = vec![
+        DiscoveryField::new("id", DiscoveryFieldType::Keyword, true).searchable(2),
+        DiscoveryField::new("title", DiscoveryFieldType::Text, true)
+            .searchable(4)
+            .snippet(),
+        DiscoveryField::new("tags", DiscoveryFieldType::KeywordList, true)
+            .searchable(3)
+            .facetable(),
+        DiscoveryField::new("path", DiscoveryFieldType::Keyword, true).searchable(2),
+        DiscoveryField::new("type", DiscoveryFieldType::Keyword, true)
+            .searchable(2)
+            .facetable(),
+    ];
+    fields.extend(package_schema.fields.iter().cloned());
     ImporterSchema::new(
         SOURCE_KIND,
-        vec![
-            DiscoveryField::new("id", DiscoveryFieldType::Keyword, true).searchable(2),
-            DiscoveryField::new("title", DiscoveryFieldType::Text, true)
-                .searchable(4)
-                .snippet(),
-            DiscoveryField::new("tags", DiscoveryFieldType::KeywordList, true)
-                .searchable(3)
-                .facetable(),
-            DiscoveryField::new("path", DiscoveryFieldType::Keyword, true).searchable(2),
-            DiscoveryField::new("type", DiscoveryFieldType::Keyword, true)
-                .searchable(2)
-                .facetable(),
-        ],
+        fields,
         vec![EdgeTypeSchema::directed(
             "declared",
             "Directed edge declared by the evaluated Nix graph",
@@ -504,50 +509,127 @@ fn invalid(message: String) -> PipelineError {
     }
 }
 
-/// Project a [`tvix_wasm::GeneratedGraph`] into the canonical graph. Each node's
-/// Nix `type` becomes its single tag; edges reference the namespaced node ids.
-/// This is the tvix projection folded out of the retired `tvix-loader` crate,
-/// parameterised by the instance namespace so `source_id` varies per instance.
+/// Project a [`tvix_wasm::GeneratedGraph`] into the canonical graph. Core
+/// presentation metadata is consumed into typed node fields; every remaining
+/// metadata key stays in frontmatter and declared fields also enter discovery.
 #[cfg(feature = "native")]
 pub fn convert_generated_graph(
     generated: &tvix_wasm::GeneratedGraph,
     namespace: &Namespace,
     source_id: &str,
+    schema: &ImporterSchema,
 ) -> Result<LoadResult, PipelineError> {
+    const PRESENTATION_KEYS: &[&str] = &["title", "tags", "doctype", "path"];
+
     let mut graph = VaultGraph::new();
     let mut search_documents = Vec::with_capacity(generated.nodes.len());
 
     for node in &generated.nodes {
         let tag = node.kind.as_deref().unwrap_or("node");
         let node_id = namespace.node_id(&node.id)?;
+        let title = node
+            .metadata
+            .get("title")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or(&node.id)
+            .to_owned();
+        let path = node
+            .metadata
+            .get("path")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or(&node.id)
+            .to_owned();
+        let doctype = node
+            .metadata
+            .get("doctype")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("generated")
+            .to_owned();
+        let mut tags = vec![tag.to_owned()];
+        if let Some(value) = node.metadata.get("tags") {
+            let extra_tags = value.as_array().ok_or_else(|| PipelineError::Map {
+                message: format!(
+                    "tvix node {:?} metadata field \"tags\" must be a list of strings",
+                    node.id
+                ),
+            })?;
+            for value in extra_tags {
+                let extra = value.as_str().ok_or_else(|| PipelineError::Map {
+                    message: format!(
+                        "tvix node {:?} metadata field \"tags\" must contain only strings",
+                        node.id
+                    ),
+                })?;
+                if !extra.is_empty() && !tags.iter().any(|tag| tag == extra) {
+                    tags.push(extra.to_owned());
+                }
+            }
+        }
+        let frontmatter: HashMap<String, serde_json::Value> = node
+            .metadata
+            .iter()
+            .filter(|(key, _)| !PRESENTATION_KEYS.contains(&key.as_str()))
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect();
+
+        let mut document = SearchDocument::new(&node_id)
+            .with("id", node_id.clone())
+            .with("title", title.clone())
+            .with("tags", serde_json::json!(tags))
+            .with("path", path.clone())
+            .with("type", doctype.clone());
+        for field in schema
+            .fields
+            .iter()
+            .filter(|field| !CORE_KEYS.contains(&field.key.as_str()))
+        {
+            match node.metadata.get(&field.key) {
+                Some(value) => {
+                    field
+                        .validate_value(value)
+                        .map_err(|detail| PipelineError::Map {
+                            message: format!(
+                                "tvix node {:?} metadata field {:?} must be {}: {detail}",
+                                node.id,
+                                field.key,
+                                field.field_type.as_str()
+                            ),
+                        })?;
+                    document.insert(&field.key, value.clone());
+                }
+                None if field.required && field.default_value.is_none() => {
+                    return Err(PipelineError::Map {
+                        message: format!(
+                            "tvix node {:?} is missing required metadata field {:?}",
+                            node.id, field.key
+                        ),
+                    });
+                }
+                None => {}
+            }
+        }
+
         let meta = NodeMeta {
             source_id: source_id.to_owned(),
-            title: node.id.clone(),
-            tags: vec![tag.to_string()],
-            frontmatter: HashMap::new(),
+            title,
+            tags,
+            frontmatter,
             mtime: 0,
-            path: node.id.clone(),
-            doctype: Some("generated".into()),
+            path,
+            doctype: Some(doctype),
             folder: String::new(),
             content_type: None,
             content_readable: false,
             content_writable: false,
         };
         graph.add_node(VaultNode {
-            id: node_id.clone(),
+            id: node_id,
             meta,
             metrics: NodeMetrics::default(),
             x: 0.0,
             y: 0.0,
         });
-        search_documents.push(
-            SearchDocument::new(&node_id)
-                .with("id", node_id)
-                .with("title", node.id.clone())
-                .with("tags", serde_json::json!([tag]))
-                .with("path", node.id.clone())
-                .with("type", tag),
-        );
+        search_documents.push(document);
     }
 
     for edge in &generated.edges {
@@ -604,7 +686,7 @@ pub fn build_tvix_importer(
         source_id,
         namespace,
         expr,
-        schema: tvix_schema(),
+        schema: package.schema().clone(),
     })
 }
 
@@ -661,7 +743,8 @@ impl Importer for TvixImporter {
             progress.finish(stage);
 
             let project = progress.stage("Projecting graph");
-            let result = convert_generated_graph(&generated, &self.namespace, &self.source_id);
+            let result =
+                convert_generated_graph(&generated, &self.namespace, &self.source_id, &self.schema);
             match &result {
                 Ok(_) => progress.finish(project),
                 Err(error) => progress.fail(project, &error.to_string()),

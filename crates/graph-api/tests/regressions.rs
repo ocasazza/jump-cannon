@@ -38,6 +38,9 @@ fn test_schema() -> ImporterSchema {
             DiscoveryField::new("tags", DiscoveryFieldType::KeywordList, true)
                 .searchable(2)
                 .facetable(),
+            DiscoveryField::new("path", DiscoveryFieldType::Keyword, false),
+            DiscoveryField::new("type", DiscoveryFieldType::Keyword, false),
+            DiscoveryField::new("weight", DiscoveryFieldType::Number, false).facetable(),
         ],
         vec![EdgeTypeSchema::directed("reference", "test edge")],
         TagHierarchySchema::slash(),
@@ -73,10 +76,25 @@ fn load_result(mut graph: VaultGraph) -> LoadResult {
             if node.meta.title.is_empty() {
                 node.meta.title = node.id.clone();
             }
-            SearchDocument::new(&node.id)
+            let mut document = SearchDocument::new(&node.id)
                 .with("id", node.id.clone())
                 .with("title", node.meta.title.clone())
-                .with("tags", serde_json::json!(node.meta.tags))
+                .with("tags", serde_json::json!(node.meta.tags));
+            if !node.meta.path.is_empty() {
+                document.insert("path", node.meta.path.clone());
+            }
+            if let Some(kind) = node
+                .meta
+                .doctype
+                .as_deref()
+                .or_else(|| node.meta.tags.first().map(String::as_str))
+            {
+                document.insert("type", kind);
+            }
+            if let Some(weight) = node.meta.frontmatter.get("weight") {
+                document.insert("weight", weight.clone());
+            }
+            document
         })
         .collect();
     LoadResult {
@@ -500,6 +518,59 @@ async fn node_meta_of(app: &axum::Router, id: &str) -> NodeMeta {
     assert_eq!(resp.status(), StatusCode::OK);
     let bytes = to_bytes(resp.into_body(), 1 << 20).await.expect("body");
     NodeMeta::decode(bytes.as_ref()).expect("decode NodeMeta")
+}
+
+#[tokio::test]
+async fn node_meta_derives_declared_facts_and_phase_zero_provenance() {
+    let mut graph = VaultGraph::new();
+    graph.add_node(VaultNode {
+        id: "facts".into(),
+        meta: vault_data::NodeMeta {
+            source_id: "test".into(),
+            title: "Fact node".into(),
+            tags: vec!["fallback-kind".into(), "featured".into()],
+            path: "generated/facts".into(),
+            doctype: Some("service".into()),
+            frontmatter: std::collections::HashMap::from([("weight".into(), serde_json::json!(7))]),
+            ..Default::default()
+        },
+        ..Default::default()
+    });
+    let app = graph_api::router(state_with_graph(graph));
+
+    let meta = node_meta_of(&app, "generate:test:facts").await;
+    assert_eq!(
+        meta.facts
+            .iter()
+            .map(|fact| fact.key.as_str())
+            .collect::<Vec<_>>(),
+        ["id", "title", "tags", "path", "type", "weight"],
+        "facts follow discovery schema declaration order"
+    );
+    let weight = meta
+        .facts
+        .iter()
+        .find(|fact| fact.key == "weight")
+        .expect("declared frontmatter fact");
+    assert_eq!(weight.value_json, "7");
+    assert_eq!(weight.field_type, "number");
+    let kind = meta
+        .facts
+        .iter()
+        .find(|fact| fact.key == "type")
+        .expect("canonical type fact");
+    assert_eq!(
+        kind.value_json, "\"service\"",
+        "doctype wins over the first tag"
+    );
+
+    let provenance = meta.provenance.expect("provenance is always populated");
+    assert_eq!(provenance.source_id, "test");
+    assert_eq!(provenance.transform_id, None);
+    assert_eq!(provenance.first_seen_run, None);
+    assert_eq!(provenance.last_changed_run, None);
+    assert_eq!(provenance.change, "unchanged");
+    assert!(provenance.history_bounded);
 }
 
 /// A pest package with `[parser.content_file] writable = true`, bound with

@@ -25,6 +25,16 @@ field-qualified queries return HTTP 400. graph-api builds this index directly
 from validated importer `SearchDocument` records and never falls back to
 title-only matching.
 
+`GET /node/*id` returns protobuf `NodeMeta` for every hosted source. Its
+schema-derived `facts` field uses tag 29 and preserves discovery-field
+declaration order; values come from canonical node fields or matching
+frontmatter. Phase-0 `provenance` uses tag 30 and reports the producing
+`source_id`, `change = "unchanged"`, and `history_bounded = true`; transform
+and run fields remain absent until the run ledger exists. Both fields are
+derived from the current snapshot at request time, not stored. Any edit to
+`NodeMeta` must run `just app-proto` and commit the regenerated
+`app/ui/src/proto/jumpcannon.graph.rs`.
+
 `GET /graph/metrics/community_levels` returns the number of hierarchical levels L in the current community dendrogram (as one f32 value); level 0 is the coarsest. `GET /graph/metrics/community_l{k}` returns per-node community assignments at level k (one u32 per node, little-endian). These endpoints support the multilevel region-map visualization; level 0 is byte-identical to the top-level `community` metric and represents the broadest macro-communities.
 `GET /graph/edge-kinds` returns the snapshot's edge kind palette
 (`{"graph_revision", "kinds": [...]}`: the importer's declared edge types in
