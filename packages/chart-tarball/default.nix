@@ -338,14 +338,23 @@ pkgs.runCommand "jump-cannon-chart-tarball"
     # hook only fires on buildStatus 0 -- stopped reaching the cluster for a
     # week. Count the set, and pin the invariant that actually matters
     # (performance must never grow one) so the next opt-in is a deliberate
-    # edit here instead of an invisible outage.
-    test "$(grep -Fc 'fieldPath: metadata.name' profiled.yaml)" -eq 2
-    ! awk '
-      /^kind: CronJob$/                      { inperf = 0 }
+    # edit here instead of an invisible outage. Both checks print why they
+    # fail; the performance check is an explicit `if`, because `! cmd` is
+    # exempt from `set -e` and would never fail the build.
+    runIds=$(grep -Fc 'fieldPath: metadata.name' profiled.yaml || true)
+    if [ "$runIds" -ne 2 ]; then
+      echo "profiled render: expected 2 downward-API run ids (fuzz, browser), found $runIds" >&2
+      exit 1
+    fi
+    if awk '
+      /^---/                                 { inperf = 0 }
       /^  name: .*-jump-cannon-performance$/ { inperf = 1 }
       inperf && /fieldPath: metadata\.name$/ { found = 1 }
       END { exit !found }
-    ' profiled.yaml
+    ' profiled.yaml; then
+      echo "profiled render: the performance CronJob must not carry a downward-API run id (its pushgateway series key off the pod hostname)" >&2
+      exit 1
+    fi
     grep -Fq 'ekacnet-cubismgrafana-panel' legacy.yaml
     grep -Fq '"type": "flamegraph"' legacy.yaml
     grep -Fq 'grafana-pyroscope-datasource' legacy.yaml
