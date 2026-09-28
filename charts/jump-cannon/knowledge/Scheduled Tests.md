@@ -27,3 +27,16 @@ queue when enabled) with its own bounded resources, so high-frequency soak
 schedules are never blocked behind GPU quota. See [[Observability]].
 Results feed [[Observability]], [[Fuzz Testing]], [[Browser Regression]], and
 [[Performance Engineering]].
+
+The k6 script and the browser test binary reach the cluster on different
+cadences. The k6 script ships inside the chart artifact, so it is pinned to
+the chart's `app.kubernetes.io/version` (the source revision Hydra packaged);
+the browser binary ships in the `jump-cannon-test-runner` image, which the
+Browser CronJob pulls with `imagePullPolicy: Always`. After a jump-cannon
+commit lands, the two can therefore disagree — the chart artifact can be older
+than the image. When a nightly job fails, compare the CronJob's
+`app.kubernetes.io/version` against the current source revision before
+suspecting the app: a k6 failure against a live graph-api is usually a stale
+chart script, and a browser failure can be a newer binary asserting a contract
+the older chart's values no longer satisfy. See [[Browser Regression]] and
+[[Helm Deployment]].
