@@ -35,8 +35,8 @@ use crate::render::region_map::{RegionMap, RegionMapConfig, RegionMode};
 use bytemuck::{Pod, Zeroable};
 use glam::{Mat4, Vec3, Vec4};
 use graph_layouts::{
-    BoxedPhysics, CsrInput, DynPhysicsLayout, DynStaticLayout, Edge as GlEdge, GpuForceLayout,
-    GpuForceOptions, Graph as GlGraph, Node as GlNode,
+    BoxedPhysics, CsrInput, DynPhysicsLayout, DynStaticLayout, Edge as GlEdge, EdgePhysics,
+    GpuForceLayout, GpuForceOptions, Graph as GlGraph, Node as GlNode, NodePhysics,
 };
 use std::sync::{Arc, Mutex};
 use wgpu::util::DeviceExt;
@@ -85,6 +85,13 @@ pub struct GraphData {
     pub edges: Vec<u32>,     // [src,tgt, ...] length = 2*m
     pub colors: Vec<f32>,    // [r,g,b,a, ...] length = 4*n
     pub sizes: Vec<f32>,     // length = n
+    /// Per-node physics, one entry per node. `None` (or a length that does
+    /// not match the node count) falls back to the engine default of
+    /// `1 + log2(degree)` for both the inertia and the repulsion charge.
+    pub node_physics: Option<Vec<NodePhysics>>,
+    /// Per-edge physics, one entry per undirected edge in `edges` order.
+    /// `None` falls back to weight 1 / rest length 1.
+    pub edge_physics: Option<Vec<EdgePhysics>>,
 }
 
 #[repr(C)]
@@ -292,6 +299,11 @@ struct Buffers {
     colors_base: Vec<f32>,
     sizes_base: Vec<f32>,
     edges_cpu: Vec<u32>,
+    /// CPU mirrors of the per-node / per-edge physics. Carried through the
+    /// `set_positions` / `swap_physics_layout` re-inits so a re-seeded sim
+    /// keeps the physics it was running with.
+    node_physics_cpu: Option<Vec<NodePhysics>>,
+    edge_physics_cpu: Option<Vec<EdgePhysics>>,
 
     /// MAP_READ | COPY_DST staging buffer for the async GPU→CPU
     /// positions readback. Sized `n_nodes * 16` bytes (vec4 stride to
@@ -623,6 +635,16 @@ impl GraphPipelines {
         // mode (device-side multilevel coarsening above 10k nodes); the sphere
         // seed carried in `graph.positions` reaches the layout through
         // `CsrInput.positions`.
+        // Physics arrays are only honoured when their length matches the
+        // topology; anything else falls back to the engine defaults rather
+        // than silently truncating.
+        let n_nodes_u = n_nodes as usize;
+        let node_physics: Option<Vec<NodePhysics>> = graph.node_physics.clone().filter(|p| {
+            p.len() == n_nodes_u
+        });
+        let edge_physics: Option<Vec<EdgePhysics>> = graph.edge_physics.clone().filter(|e| {
+            e.len() == (n_edges as usize).max(1) || e.is_empty()
+        });
         let layout: Option<Box<dyn DynPhysicsLayout>> = {
             let mut boxed: Box<dyn DynPhysicsLayout> = Box::new(BoxedPhysics::new(
                 GpuForceLayout::new(GpuForceOptions::for_n_nodes(n_nodes as usize)),
@@ -634,6 +656,8 @@ impl GraphPipelines {
                 &positions,
                 &graph.positions,
                 &graph.edges,
+                node_physics.as_deref(),
+                edge_physics.as_deref(),
             ) {
                 Ok(()) => Some(boxed),
                 Err(e) => {
@@ -679,6 +703,8 @@ impl GraphPipelines {
             colors_base,
             sizes_base,
             edges_cpu: graph.edges,
+            node_physics_cpu: node_physics,
+            edge_physics_cpu: edge_physics,
             positions_staging,
             positions_readback: Arc::new(Mutex::new(PositionsReadbackState::Idle)),
             positions_frame_idx: 0,
@@ -1787,6 +1813,8 @@ impl GraphPipelines {
                 &b.positions,
                 &b.positions_cpu,
                 &b.edges_cpu,
+                b.node_physics_cpu.as_deref(),
+                b.edge_physics_cpu.as_deref(),
             ) {
                 tracing::warn!("[render] set_positions: layout re-init failed: {e}");
             }
@@ -1794,6 +1822,70 @@ impl GraphPipelines {
         }
 
         Ok(())
+    }
+
+    /// Push a new per-node physics set into the live sim. `physics.len()`
+    /// must equal the node count. The CPU mirror is updated first, so the
+    /// next layout re-init (a seed swap or a physics-engine swap) carries
+    /// the same values, and the `.w` charge slot of the shared positions
+    /// buffer is re-synced so the Barnes-Hut octree agrees with the force
+    /// kernel.
+    pub fn update_node_physics(
+        &mut self,
+        queue: &wgpu::Queue,
+        physics: Vec<NodePhysics>,
+    ) -> Result<(), String> {
+        let b = self
+            .buffers
+            .as_mut()
+            .ok_or_else(|| "update_node_physics: no buffers loaded".to_string())?;
+        if physics.len() != b.n_nodes as usize {
+            return Err(format!(
+                "update_node_physics: got {} entries, expected {}",
+                physics.len(),
+                b.n_nodes
+            ));
+        }
+        b.node_physics_cpu = Some(physics.clone());
+        let charges: Vec<f32> = physics.iter().map(|p| p.repulsion).collect();
+        for (i, c) in charges.iter().enumerate() {
+            queue.write_buffer(
+                &b.positions,
+                i as u64 * 16 + 12,
+                bytemuck::bytes_of(c),
+            );
+        }
+        match b.layout.as_mut() {
+            Some(layout) => layout.set_node_physics(queue, &physics),
+            None => Ok(()),
+        }
+    }
+
+    /// Push a new per-edge physics set into the live sim. `physics.len()`
+    /// must equal the undirected edge count. Like the node variant the CPU
+    /// mirror is updated so a later layout re-init keeps the values.
+    pub fn update_edge_physics(
+        &mut self,
+        queue: &wgpu::Queue,
+        physics: Vec<EdgePhysics>,
+    ) -> Result<(), String> {
+        let b = self
+            .buffers
+            .as_mut()
+            .ok_or_else(|| "update_edge_physics: no buffers loaded".to_string())?;
+        let m = b.edges_cpu.len() / 2;
+        if physics.len() > m {
+            return Err(format!(
+                "update_edge_physics: got {} entries, expected at most {}",
+                physics.len(),
+                m
+            ));
+        }
+        b.edge_physics_cpu = Some(physics.clone());
+        match b.layout.as_mut() {
+            Some(layout) => layout.set_edge_physics(queue, &physics),
+            None => Ok(()),
+        }
     }
 
     /// Replace the active physics layout with a pre-built one (port of the
@@ -1818,6 +1910,8 @@ impl GraphPipelines {
             &b.positions,
             &b.positions_cpu,
             &b.edges_cpu,
+            b.node_physics_cpu.as_deref(),
+            b.edge_physics_cpu.as_deref(),
         ) {
             Ok(()) => {
                 b.layout = Some(layout);
@@ -2006,6 +2100,7 @@ fn build_topology_graph(positions: &[f32], edges: &[u32]) -> GlGraph {
 /// and only that one — we fall back to the string-keyed `Graph` path built
 /// on demand. Any other error is a genuine init failure surfaced to the
 /// caller, which logs it and drops the layout, exactly as before.
+#[allow(clippy::too_many_arguments)]
 fn init_physics_layout(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
@@ -2013,13 +2108,15 @@ fn init_physics_layout(
     positions_buf: &wgpu::Buffer,
     positions_cpu: &[f32],
     edges_cpu: &[u32],
+    node_physics: Option<&[NodePhysics]>,
+    edge_physics: Option<&[EdgePhysics]>,
 ) -> Result<(), String> {
     let input = CsrInput {
         n_nodes: (positions_cpu.len() / 3) as u32,
         edges: edges_cpu,
         positions: Some(positions_cpu),
-        node_physics: None,
-        edge_physics: None,
+        node_physics,
+        edge_physics,
     };
     match layout.init_with_device_csr(device, queue, &input, positions_buf) {
         Ok(()) => Ok(()),
@@ -2241,6 +2338,16 @@ impl RenderHost {
         settings: &serde_json::Value,
     ) -> Result<(), String> {
         self.pipes.run_static_solve(&self.queue, layout, settings)
+    }
+
+    /// Per-node physics update (see [`GraphPipelines::update_node_physics`]).
+    pub fn update_node_physics(&mut self, physics: Vec<NodePhysics>) -> Result<(), String> {
+        self.pipes.update_node_physics(&self.queue, physics)
+    }
+
+    /// Per-edge physics update (see [`GraphPipelines::update_edge_physics`]).
+    pub fn update_edge_physics(&mut self, physics: Vec<EdgePhysics>) -> Result<(), String> {
+        self.pipes.update_edge_physics(&self.queue, physics)
     }
 
     /// Seed/scrub path: write a full position set into the live buffer

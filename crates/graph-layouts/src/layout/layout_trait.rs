@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::layout::algorithms::gpu_force::CsrInput;
+use crate::layout::algorithms::gpu_force::{EdgePhysics, NodePhysics};
 use crate::types::Graph;
 
 /// Stable string identifier for a registered layout. Used as the registry
@@ -114,6 +115,19 @@ pub trait PhysicsLayout: Send + Sync {
     fn set_settings(&mut self, settings: Self::Settings);
     fn settings(&self) -> &Self::Settings;
 
+    /// Replace the live per-node physics (in place, no re-init). Layouts
+    /// without per-node physics keep the default no-op.
+    fn set_node_physics(&mut self, queue: &wgpu::Queue, physics: &[NodePhysics]) -> Result<(), String> {
+        let _ = (queue, physics);
+        Ok(())
+    }
+
+    /// Replace the live per-edge physics (in place, no re-init).
+    fn set_edge_physics(&mut self, queue: &wgpu::Queue, physics: &[EdgePhysics]) -> Result<(), String> {
+        let _ = (queue, physics);
+        Ok(())
+    }
+
     fn is_halted(&self) -> bool { false }
     fn last_max_ke(&self) -> f32 { 0.0 }
     fn wake(&mut self) {}
@@ -157,6 +171,9 @@ pub trait DynPhysicsLayout: Send + Sync {
     fn set_settings_json(&mut self, settings: &Value) -> Result<(), String>;
     fn settings_json(&self) -> Value;
     fn default_settings_json(&self) -> Value;
+
+    fn set_node_physics(&mut self, queue: &wgpu::Queue, physics: &[NodePhysics]) -> Result<(), String>;
+    fn set_edge_physics(&mut self, queue: &wgpu::Queue, physics: &[EdgePhysics]) -> Result<(), String>;
 
     fn is_halted(&self) -> bool;
     fn last_max_ke(&self) -> f32;
@@ -257,6 +274,14 @@ impl<T: PhysicsLayout + 'static> DynPhysicsLayout for BoxedPhysics<T> {
 
     fn default_settings_json(&self) -> Value {
         serde_json::to_value(T::Settings::default()).unwrap_or(Value::Null)
+    }
+
+    fn set_node_physics(&mut self, queue: &wgpu::Queue, physics: &[NodePhysics]) -> Result<(), String> {
+        self.inner.set_node_physics(queue, physics)
+    }
+
+    fn set_edge_physics(&mut self, queue: &wgpu::Queue, physics: &[EdgePhysics]) -> Result<(), String> {
+        self.inner.set_edge_physics(queue, physics)
     }
 
     fn is_halted(&self) -> bool { self.inner.is_halted() }

@@ -287,6 +287,17 @@ fn mass_accum(
     atomicAdd(&c_mass[p], u32(m * params.mass_scale));
 }
 
+// Per-node physics (inertia, repulsion charge) for the coarse relax
+// passes. Both fields carry the child sum the .w slot accumulates, which is
+// what the pre-split kernel used as inertia; the charge repeats it so the
+// pairwise repulsion keeps the same weight it had when .w was the only
+// per-node number.
+struct NodePhysics {
+    mass: f32,
+    repulsion: f32,
+};
+@group(0) @binding(16) var<storage, read_write> c_node_phys: array<NodePhysics>;
+
 // c_pos[i] = (0, 0, 0, coarse_mass). xyz is set later by seed_ball / prolong,
 // which preserve the .w mass this kernel writes.
 @compute @workgroup_size(64)
@@ -298,6 +309,7 @@ fn place_mass(
     if (i >= nc()) { return; }
     let m = f32(atomicLoad(&c_mass[i])) / params.mass_scale;
     c_pos[i] = vec4<f32>(0.0, 0.0, 0.0, m);
+    c_node_phys[i] = NodePhysics(m, m);
 }
 
 // ---- Coarse edge expansion -------------------------------------------------

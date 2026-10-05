@@ -215,6 +215,13 @@ struct MlLevel {
     virt_eoff: wgpu::Buffer,
     parent: wgpu::Buffer,
     meta: wgpu::Buffer,
+    /// Per-node (inertia, charge) for the level's own relax passes, written
+    /// by `place_mass` from the child sums. The fine level instead binds the
+    /// real per-node physics from the force ingest.
+    node_phys: wgpu::Buffer,
+    /// (weight 1, rest length 1) per directed slot — the coarse CSR's own
+    /// `ewt` is all-ones, so this reproduces the pre-split spring law.
+    edge_physics: wgpu::Buffer,
 }
 
 /// Transient buffers shared across all cascade steps (levels are built and
@@ -252,6 +259,10 @@ struct SeedCtx<'a> {
     fine_pos: &'a wgpu::Buffer,
     fine_off: &'a wgpu::Buffer,
     fine_neigh: &'a wgpu::Buffer,
+    /// Per-node inertia bound at group(0) binding 7.
+    fine_mass: &'a wgpu::Buffer,
+    /// Per-directed-slot edge physics bound at group(2) binding 3.
+    fine_edge_physics: &'a wgpu::Buffer,
     options: &'a GpuForceOptions,
 }
 
@@ -260,6 +271,11 @@ struct LevelRef<'a> {
     off: &'a wgpu::Buffer,
     neigh: &'a wgpu::Buffer,
     ewt: &'a wgpu::Buffer,
+    /// Per-node physics bound at group(0) binding 7 for this level's
+    /// relax passes.
+    mass: &'a wgpu::Buffer,
+    /// (weight, rest_length) per directed slot, bound at group(2) binding 3.
+    edge_physics: &'a wgpu::Buffer,
     pos: &'a wgpu::Buffer,
     virt_csr: &'a wgpu::Buffer,
     virt_eoff: &'a wgpu::Buffer,
@@ -311,6 +327,23 @@ fn storage_copy(device: &wgpu::Device, label: &str, bytes: u64) -> wgpu::Buffer 
         size: bytes.max(4),
         usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
         mapped_at_creation: false,
+    })
+}
+
+/// `count` (weight 1, rest length 1) pairs — the neutral edge physics.
+fn init_edge_physics(device: &wgpu::Device, label: &str, count: u64) -> wgpu::Buffer {
+    device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some(label),
+        contents: bytemuck::cast_slice(
+            &vec![
+                super::gpu_force::EdgePhysics {
+                    weight: 1.0,
+                    rest_length: 1.0,
+                };
+                count.max(1) as usize
+            ],
+        ),
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
     })
 }
 
@@ -411,7 +444,11 @@ impl GpuMultilevel {
             &[(3, true), (6, false), (7, true), (14, false)],
             &g1_params,
         );
-        let place_mass = mk("place_mass", &[(12, false), (14, false), (15, false)], &g1_params);
+        let place_mass = mk(
+            "place_mass",
+            &[(12, false), (14, false), (15, false), (16, false)],
+            &g1_params,
+        );
         let row_of_slot = mk("row_of_slot", &[(0, true), (7, true), (8, false)], &g1_params);
         let expand_pairs = mk(
             "expand_pairs",
@@ -547,6 +584,8 @@ impl GpuMultilevel {
                         usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
                         mapped_at_creation: false,
                     }),
+                    node_phys: storage(device, "ml_node_phys", n_cap as u64 * 8),
+                    edge_physics: init_edge_physics(device, "ml_edge_physics", slots_cap as u64),
                 }
             })
             .collect();
@@ -729,6 +768,10 @@ impl GpuMultilevel {
         fine_neigh: &wgpu::Buffer,
         fine_virt_csr: &wgpu::Buffer,
         fine_virt_eoff: &wgpu::Buffer,
+        // Per-node inertia / per-slot edge physics for `force_step` and
+        // `spring_step` at the fine level.
+        fine_mass: &wgpu::Buffer,
+        fine_edge_physics: &wgpu::Buffer,
         fine_n_virtual: u32,
         options: &GpuForceOptions,
     ) {
@@ -741,6 +784,8 @@ impl GpuMultilevel {
             fine_pos,
             fine_off,
             fine_neigh,
+            fine_mass,
+            fine_edge_physics,
             options,
         };
         let spring_len = options.spring_len.max(1.0);
@@ -777,6 +822,8 @@ impl GpuMultilevel {
                 off: &coarse.off,
                 neigh: &coarse.neigh,
                 ewt: &coarse.ewt,
+                mass: &coarse.node_phys,
+                edge_physics: &coarse.edge_physics,
                 pos: &coarse.pos,
                 virt_csr: &coarse.virt_csr,
                 virt_eoff: &coarse.virt_eoff,
@@ -797,6 +844,8 @@ impl GpuMultilevel {
                 off: &finer.off,
                 neigh: &finer.neigh,
                 ewt: &finer.ewt,
+                mass: &finer.node_phys,
+                edge_physics: &finer.edge_physics,
                 pos: &finer.pos,
                 virt_csr: &finer.virt_csr,
                 virt_eoff: &finer.virt_eoff,
@@ -824,6 +873,8 @@ impl GpuMultilevel {
                 off: fine_off,
                 neigh: fine_neigh,
                 ewt: &self.fine_ewt,
+                mass: ctx.fine_mass,
+                edge_physics: ctx.fine_edge_physics,
                 pos: fine_pos,
                 virt_csr: fine_virt_csr,
                 virt_eoff: fine_virt_eoff,
@@ -946,7 +997,12 @@ impl GpuMultilevel {
         let bg_place = kbg(
             device,
             &self.pipes.place_mass.g0,
-            &[(12, &coarse.pos), (14, &self.scratch.cmass), (15, &coarse.meta)],
+            &[
+                (12, &coarse.pos),
+                (14, &self.scratch.cmass),
+                (15, &coarse.meta),
+                (16, &coarse.node_phys),
+            ],
         );
         pass1(&mut enc, &self.pipes.place_mass.pipe, &bg_place, &pbg, dispatch_grid(coarse.n_cap));
 
@@ -1114,6 +1170,7 @@ impl GpuMultilevel {
                     wgpu::BindGroupEntry { binding: 4, resource: lv.neigh.as_entire_binding() },
                     wgpu::BindGroupEntry { binding: 5, resource: self.sim_params_buf.as_entire_binding() },
                     wgpu::BindGroupEntry { binding: 6, resource: self.scratch.energy.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 7, resource: lv.mass.as_entire_binding() },
                 ],
             });
             let bg1 = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -1128,6 +1185,7 @@ impl GpuMultilevel {
                     wgpu::BindGroupEntry { binding: 0, resource: lv.virt_csr.as_entire_binding() },
                     wgpu::BindGroupEntry { binding: 1, resource: lv.virt_eoff.as_entire_binding() },
                     wgpu::BindGroupEntry { binding: 2, resource: self.scratch.spring_partial.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 3, resource: lv.edge_physics.as_entire_binding() },
                 ],
             });
             pass3(&mut enc, ctx.force_step, &bg0, &bg1, &bg2, dispatch_grid(lv.n_cap));

@@ -11,7 +11,8 @@
 // damping.
 //
 // Two force laws (`params.force_model`):
-//   0 = spring-electrical  Hooke springs + Coulomb `repulsion · m / d²`
+//   0 = spring-electrical  Hooke springs + Coulomb
+//                          `repulsion · q_i · q_j / d²` (q = the .w charge)
 //   1 = t-FDP              Student-t forces (Zhong et al., TVCG 2023). With
 //                          r = d / spring_len:
 //                            attraction  α (r + β r / (1 + r²))
@@ -29,8 +30,10 @@
 //   @group(0) @binding(4) edge_neighbors     (read)       length 2*m
 //   @group(0) @binding(5) params             (uniform)
 //   @group(0) @binding(6) energy_out         (read_write) length n  (|vel|²)
+//   @group(0) @binding(7) node_physics       (read)       length n  (mass, charge)
 //   @group(1) @binding(1) oct_nodes          (read)       Barnes-Hut octree
-//   @group(2) @binding(0..2)                              hub-aware spring CSR
+//   @group(2) @binding(0..3)                              hub-aware spring CSR
+//                                                       (binding 3 = edge physics)
 //
 // Dispatch shape: every kernel is 64 lanes wide and 1-D in meaning, but
 // the host spills into the Y dimension once ceil(n/64) would exceed
@@ -79,10 +82,12 @@ struct SimParams {
 };
 
 // Positions are stored as vec4 — xyz is the world-space position, w is
-// the per-node mass. Packing mass into the .w slot drops one storage-
-// binding slot vs a separate `mass` buffer. Every position read uses
-// `.xyz`; mass reads use `.w`. Writes to `positions_out` must preserve
-// the .w (see force_step's final store).
+// the per-node repulsion charge. Packing the charge into the .w slot
+// drops one storage-binding slot vs a separate buffer and lets the
+// octree builder (shaders/octree.wgsl) accumulate it unchanged.
+// Inertia lives in the separate `node_mass` buffer. Every position read
+// uses `.xyz`; charge reads use `.w`. Writes to `positions_out` must
+// preserve the .w (see force_step's final store).
 @group(0) @binding(0) var<storage, read>       positions_in:    array<vec4<f32>>;
 @group(0) @binding(1) var<storage, read_write> positions_out:   array<vec4<f32>>;
 @group(0) @binding(2) var<storage, read_write> velocities:      array<vec3<f32>>;
@@ -90,6 +95,13 @@ struct SimParams {
 @group(0) @binding(4) var<storage, read>       edge_neighbors:  array<u32>;
 @group(0) @binding(5) var<uniform>             params:          SimParams;
 @group(0) @binding(6) var<storage, read_write> energy_out:      array<f32>;
+// Per-node physics: (inertia, repulsion charge). The live source of both
+// halves; `positions[i].w` carries the same charge for the octree builder.
+struct NodePhysics {
+    mass: f32,
+    repulsion: f32,
+};
+@group(0) @binding(7) var<storage, read>       node_physics:    array<NodePhysics>;
 
 // ---- Barnes-Hut octree bindings (group 1) ----------------------------------
 //
@@ -136,6 +148,14 @@ const OCT_BODY_INTERNAL: u32 = 0xFFFFFFFFu;
 @group(2) @binding(1) var<storage, read>       virt_edge_offsets:    array<u32>;
 @group(2) @binding(2) var<storage, read_write> spring_force_partial: array<vec3<f32>>;
 
+// Per-directed-slot edge physics, aligned 1:1 with `edge_neighbors`; both
+// halves of an undirected edge carry the same (weight, rest_length).
+struct EdgePhysics {
+    weight: f32,
+    rest_length: f32,
+};
+@group(2) @binding(3) var<storage, read> edge_physics: array<EdgePhysics>;
+
 const WORKGROUP_SIZE: u32 = 64u;
 
 // Linear lane index for a dispatch that may have spilled into Y. Matches
@@ -165,7 +185,9 @@ fn degree_of(i: u32) -> f32 {
 // pos_j` (so a positive scalar along `d` pushes i away from j) and the
 // squared distance (already floored by the caller).
 
-// Coulomb repulsion `repulsion · w / d²` along d.
+// Coulomb repulsion `repulsion · q_self · q_other / d²` along d. The
+// charge product is symmetric: the same `w` argument the octree
+// accumulates multiplies the body's own charge.
 fn coulomb_repulsion(d: vec3<f32>, dist2: f32, w: f32) -> vec3<f32> {
     return d * (params.repulsion * w / dist2);
 }
@@ -181,23 +203,24 @@ fn tfdp_repulsion(d: vec3<f32>, dist2: f32, w: f32) -> vec3<f32> {
     return d * (params.spring_k * params.spring_len * w * mag / max(r * params.spring_len, 1e-6));
 }
 
-fn repulsion_force(d: vec3<f32>, dist2: f32, w: f32) -> vec3<f32> {
+fn repulsion_force(d: vec3<f32>, dist2: f32, q_self: f32, w: f32) -> vec3<f32> {
     if (params.force_model == 1u) {
-        return tfdp_repulsion(d, dist2, w);
+        return tfdp_repulsion(d, dist2, q_self * w);
     }
-    return coulomb_repulsion(d, dist2, w);
+    return coulomb_repulsion(d, dist2, q_self * w);
 }
 
-// Attraction on `i` from an edge to `other`, given `d = pos_other - pos_i`.
-fn attraction_force(d: vec3<f32>) -> vec3<f32> {
+// Attraction on `i` across edge `ep` to `other`, given
+// `d = pos_other - pos_i`: `spring_k · weight · (dist - spring_len · rest)`.
+fn attraction_force(d: vec3<f32>, ep: EdgePhysics) -> vec3<f32> {
     let dist = max(length(d), 0.01);
     if (params.force_model == 1u) {
         let r = dist / max(params.spring_len, 1e-6);
-        let mag = params.tfdp_alpha * (r + params.tfdp_beta * r / (1.0 + r * r));
+        let mag = params.tfdp_alpha * (r + params.tfdp_beta * r / (1.0 + r * r)) * ep.weight;
         return (d / dist) * (params.spring_k * params.spring_len * mag);
     }
-    let stretch = dist - params.spring_len;
-    return (d / dist) * (params.spring_k * stretch);
+    let stretch = dist - params.spring_len * ep.rest_length;
+    return (d / dist) * (params.spring_k * ep.weight * stretch);
 }
 
 // ---- Hub-aware spring kernel ----------------------------------------------
@@ -229,7 +252,7 @@ fn spring_step(
     var f = vec3<f32>(0.0, 0.0, 0.0);
     for (var k: u32 = estart; k < eend; k = k + 1u) {
         let other = edge_neighbors[k];
-        f = f + attraction_force(positions_in[other].xyz - pos);
+        f = f + attraction_force(positions_in[other].xyz - pos, edge_physics[k]);
     }
     spring_force_partial[v] = f;
 }
@@ -246,7 +269,11 @@ fn force_step(
 
     let pos_full = positions_in[i];
     let pos = pos_full.xyz;
-    let self_mass = pos_full.w;
+    // The octree accumulates `positions_in[j].w`, so subtract that same
+    // value from a co-located multi-body cell; the pairwise force uses the
+    // live charge from the node_physics buffer.
+    let oct_charge = pos_full.w;
+    let self_charge = node_physics[i].repulsion;
     var vel = velocities[i];
     var force = vec3<f32>(0.0, 0.0, 0.0);
 
@@ -311,7 +338,7 @@ fn force_step(
                         let d = pos - com;
                         let dist2 = dot(d, d);
                         if (dist2 <= r_clip2 && mass_n > 0.0) {
-                            force = force + repulsion_force(d, max(dist2, dist2_floor), mass_n);
+                            force = force + repulsion_force(d, max(dist2, dist2_floor), self_charge, mass_n);
                         }
                     }
                 } else {
@@ -319,20 +346,20 @@ fn force_step(
                     // when it falls inside the leaf cell (exact membership,
                     // since the cell is body i's own Morton cell). Guard the
                     // adjusted mass against going non-positive.
-                    var m = mass_n;
+                    var q = mass_n;
                     var c = com;
                     let inside = all(abs(pos - center) <= vec3<f32>(half * 1.001 + 1e-4));
                     if (inside) {
-                        m = mass_n - self_mass;
-                        if (m > 1e-6) {
-                            c = (com * mass_n - pos * self_mass) / m;
+                        q = mass_n - oct_charge;
+                        if (q > 1e-6) {
+                            c = (com * mass_n - pos * oct_charge) / q;
                         }
                     }
-                    if (m > 1e-6) {
+                    if (q > 1e-6) {
                         let d = pos - c;
                         let dist2 = dot(d, d);
                         if (dist2 <= r_clip2) {
-                            force = force + repulsion_force(d, max(dist2, dist2_floor), m);
+                            force = force + repulsion_force(d, max(dist2, dist2_floor), self_charge, q);
                         }
                     }
                 }
@@ -346,7 +373,7 @@ fn force_step(
             let dist2 = dot(d, d);
             if (mass_n > 0.0 && dist2 > 0.0 && (s * s) < (theta2 * dist2)) {
                 if (dist2 <= r_clip2) {
-                    force = force + repulsion_force(d, max(dist2, dist2_floor), mass_n);
+                    force = force + repulsion_force(d, max(dist2, dist2_floor), self_charge, mass_n);
                 }
                 idx = node.links.z; // accepted → skip subtree
             } else {
@@ -385,8 +412,8 @@ fn force_step(
             let dist2 = dot(d, d);
             if (dist2 > r_clip2) { continue; }
             let dist2c = max(dist2, dist2_floor);
-            let w = select(p_j.w, 0.5 * (deg_i + degree_of(j)), tfdp);
-            force = force + repulsion_force(d, dist2c, w) * sample_scale;
+            let w = select(node_physics[j].repulsion, 0.5 * (deg_i + degree_of(j)), tfdp);
+            force = force + repulsion_force(d, dist2c, self_charge, w) * sample_scale;
         }
     } else {
         // Exact O(n²) reference. Fine for small graphs (< few thousand
@@ -398,8 +425,7 @@ fn force_step(
             let dist2 = dot(d, d);
             if (dist2 > r_clip2) { continue; }
             let dist2c = max(dist2, dist2_floor);
-            // Mass packed into .w of positions buffer.
-            force = force + repulsion_force(d, dist2c, p_j.w);
+            force = force + repulsion_force(d, dist2c, self_charge, node_physics[j].repulsion);
         }
     }
 
@@ -429,9 +455,11 @@ fn force_step(
         }
     }
 
-    // ---- Integrate (per-node mass) -----------------------------------------
-    // Mass packed into positions_in[i].w (captured earlier as `self_mass`).
-    let m = max(self_mass, 1.0);
+    // ---- Integrate (per-node inertia) --------------------------------------
+    // Inertia comes from the node_mass buffer, not from positions[i].w (which
+    // is the repulsion charge). The 1e-6 floor only guards an explicit
+    // zero/negative mass from dividing by zero.
+    let m = max(node_physics[i].mass, 1e-6);
     let accel = force / m;
     vel = (vel + accel * params.dt) * params.damping;
 
@@ -462,10 +490,10 @@ fn force_step(
     let new_pos = pos + vel * params.dt;
 
     velocities[i] = vel;
-    // Preserve the .w mass slot — without this the next frame's force_step
-    // reads positions_in[i].w == 0, which divides by zero in the mass
-    // term and stalls every node tagged as a hub.
-    positions_out[i] = vec4<f32>(new_pos, self_mass);
+    // Preserve the .w charge slot — without this the next frame's
+    // force_step reads positions_in[i].w == 0, which zeroes this node's
+    // share of every pairwise repulsion.
+    positions_out[i] = vec4<f32>(new_pos, self_charge);
 
     // Track per-node KE proxy = |vel|^2. CPU reduces.
     energy_out[i] = dot(vel, vel);
