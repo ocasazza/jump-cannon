@@ -197,6 +197,9 @@ struct MlPipes {
     coarse_nv: KPipe,
     coarse_virt_fill: KPipe,
     seed_ball: KPipe,
+    /// Zeroes the relax scratch's velocity words and copies the level's
+    /// per-node inertia into their `.w` — force.wgsl reads inertia there.
+    seed_vel_mass: KPipe,
     prolong: KPipe,
     spring_weighted: KPipe,
 }
@@ -208,6 +211,9 @@ struct MlLevel {
     slots_cap: u32,
     nv_cap: u32,
     off: wgpu::Buffer,
+    /// Coarse CSR neighbours, two u32 per directed slot: the neighbour then
+    /// `pack2x16float(weight, rest_length)` — the same shape the fine CSR
+    /// has, so `edge_offsets` and the virtual CSR stay slot-indexed.
     neigh: wgpu::Buffer,
     ewt: wgpu::Buffer,
     pos: wgpu::Buffer,
@@ -215,13 +221,6 @@ struct MlLevel {
     virt_eoff: wgpu::Buffer,
     parent: wgpu::Buffer,
     meta: wgpu::Buffer,
-    /// Per-node (inertia, charge) for the level's own relax passes, written
-    /// by `place_mass` from the child sums. The fine level instead binds the
-    /// real per-node physics from the force ingest.
-    node_phys: wgpu::Buffer,
-    /// (weight 1, rest length 1) per directed slot — the coarse CSR's own
-    /// `ewt` is all-ones, so this reproduces the pre-split spring law.
-    edge_physics: wgpu::Buffer,
 }
 
 /// Transient buffers shared across all cascade steps (levels are built and
@@ -259,10 +258,10 @@ struct SeedCtx<'a> {
     fine_pos: &'a wgpu::Buffer,
     fine_off: &'a wgpu::Buffer,
     fine_neigh: &'a wgpu::Buffer,
-    /// Per-node inertia bound at group(0) binding 7.
-    fine_mass: &'a wgpu::Buffer,
-    /// Per-directed-slot edge physics bound at group(2) binding 3.
-    fine_edge_physics: &'a wgpu::Buffer,
+    /// Per-node inertia at the fine level: the `.w` slot of the force
+    /// engine's velocity words, copied into the relax scratch by
+    /// `seed_vel_mass`.
+    fine_vel: &'a wgpu::Buffer,
     options: &'a GpuForceOptions,
 }
 
@@ -271,11 +270,10 @@ struct LevelRef<'a> {
     off: &'a wgpu::Buffer,
     neigh: &'a wgpu::Buffer,
     ewt: &'a wgpu::Buffer,
-    /// Per-node physics bound at group(0) binding 7 for this level's
-    /// relax passes.
-    mass: &'a wgpu::Buffer,
-    /// (weight, rest_length) per directed slot, bound at group(2) binding 3.
-    edge_physics: &'a wgpu::Buffer,
+    /// vec4 buffer whose `.w` carries this level's per-node inertia for the
+    /// relax passes — its positions for a coarse level (`place_mass` writes
+    /// the child sum there), the fine velocity words at level 0.
+    mass_src: &'a wgpu::Buffer,
     pos: &'a wgpu::Buffer,
     virt_csr: &'a wgpu::Buffer,
     virt_eoff: &'a wgpu::Buffer,
@@ -327,23 +325,6 @@ fn storage_copy(device: &wgpu::Device, label: &str, bytes: u64) -> wgpu::Buffer 
         size: bytes.max(4),
         usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
         mapped_at_creation: false,
-    })
-}
-
-/// `count` (weight 1, rest length 1) pairs — the neutral edge physics.
-fn init_edge_physics(device: &wgpu::Device, label: &str, count: u64) -> wgpu::Buffer {
-    device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: Some(label),
-        contents: bytemuck::cast_slice(
-            &vec![
-                super::gpu_force::EdgePhysics {
-                    weight: 1.0,
-                    rest_length: 1.0,
-                };
-                count.max(1) as usize
-            ],
-        ),
-        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
     })
 }
 
@@ -446,7 +427,7 @@ impl GpuMultilevel {
         );
         let place_mass = mk(
             "place_mass",
-            &[(12, false), (14, false), (15, false), (16, false)],
+            &[(12, false), (14, false), (15, false)],
             &g1_params,
         );
         let row_of_slot = mk("row_of_slot", &[(0, true), (7, true), (8, false)], &g1_params);
@@ -515,6 +496,7 @@ impl GpuMultilevel {
             &g1_params,
         );
         let seed_ball = mk("seed_ball", &[(12, false), (15, false)], &g1_params);
+        let seed_vel_mass = mk("seed_vel_mass", &[(32, true), (33, false)], &g1_params);
         let prolong = mk("prolong", &[(6, false), (7, true), (12, false), (30, true)], &g1_params);
         let spring_weighted = mk(
             "spring_step_weighted",
@@ -554,6 +536,7 @@ impl GpuMultilevel {
             coarse_nv,
             coarse_virt_fill,
             seed_ball,
+            seed_vel_mass,
             prolong,
             spring_weighted,
         };
@@ -572,7 +555,8 @@ impl GpuMultilevel {
                     slots_cap,
                     nv_cap,
                     off: storage_copy(device, "ml_off", (n_cap as u64 + 1) * u4),
-                    neigh: storage(device, "ml_neigh", slots_cap as u64 * u4),
+                    // Two u32 per directed slot (neighbour + packed physics).
+                    neigh: storage(device, "ml_neigh", 2 * slots_cap as u64 * u4),
                     ewt: storage(device, "ml_ewt", slots_cap as u64 * u4),
                     pos: storage_copy(device, "ml_pos", n_cap as u64 * v16),
                     virt_csr: storage_cd(device, "ml_virt_csr", (n_cap as u64 + 1 + nv_cap as u64) * u4),
@@ -584,8 +568,6 @@ impl GpuMultilevel {
                         usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
                         mapped_at_creation: false,
                     }),
-                    node_phys: storage(device, "ml_node_phys", n_cap as u64 * 8),
-                    edge_physics: init_edge_physics(device, "ml_edge_physics", slots_cap as u64),
                 }
             })
             .collect();
@@ -768,10 +750,10 @@ impl GpuMultilevel {
         fine_neigh: &wgpu::Buffer,
         fine_virt_csr: &wgpu::Buffer,
         fine_virt_eoff: &wgpu::Buffer,
-        // Per-node inertia / per-slot edge physics for `force_step` and
-        // `spring_step` at the fine level.
-        fine_mass: &wgpu::Buffer,
-        fine_edge_physics: &wgpu::Buffer,
+        // Per-node inertia for `force_step` at the fine level: the `.w` of
+        // the force engine's velocity words. Its edge physics ride the
+        // packed `fine_neigh` array.
+        fine_vel: &wgpu::Buffer,
         fine_n_virtual: u32,
         options: &GpuForceOptions,
     ) {
@@ -784,8 +766,7 @@ impl GpuMultilevel {
             fine_pos,
             fine_off,
             fine_neigh,
-            fine_mass,
-            fine_edge_physics,
+            fine_vel,
             options,
         };
         let spring_len = options.spring_len.max(1.0);
@@ -822,8 +803,7 @@ impl GpuMultilevel {
                 off: &coarse.off,
                 neigh: &coarse.neigh,
                 ewt: &coarse.ewt,
-                mass: &coarse.node_phys,
-                edge_physics: &coarse.edge_physics,
+                mass_src: &coarse.pos,
                 pos: &coarse.pos,
                 virt_csr: &coarse.virt_csr,
                 virt_eoff: &coarse.virt_eoff,
@@ -844,8 +824,7 @@ impl GpuMultilevel {
                 off: &finer.off,
                 neigh: &finer.neigh,
                 ewt: &finer.ewt,
-                mass: &finer.node_phys,
-                edge_physics: &finer.edge_physics,
+                mass_src: &finer.pos,
                 pos: &finer.pos,
                 virt_csr: &finer.virt_csr,
                 virt_eoff: &finer.virt_eoff,
@@ -873,8 +852,7 @@ impl GpuMultilevel {
                 off: fine_off,
                 neigh: fine_neigh,
                 ewt: &self.fine_ewt,
-                mass: ctx.fine_mass,
-                edge_physics: ctx.fine_edge_physics,
+                mass_src: ctx.fine_vel,
                 pos: fine_pos,
                 virt_csr: fine_virt_csr,
                 virt_eoff: fine_virt_eoff,
@@ -1001,7 +979,6 @@ impl GpuMultilevel {
                 (12, &coarse.pos),
                 (14, &self.scratch.cmass),
                 (15, &coarse.meta),
-                (16, &coarse.node_phys),
             ],
         );
         pass1(&mut enc, &self.pipes.place_mass.pipe, &bg_place, &pbg, dispatch_grid(coarse.n_cap));
@@ -1124,8 +1101,21 @@ impl GpuMultilevel {
             enc.copy_buffer_to_buffer(lv.meta, 4, &self.sim_params_buf, SIM_N_EDGES_OFFSET, 4);
         }
 
-        // Reset velocities for this level.
+        // Reset velocities for this level and re-seed the per-node inertia
+        // the reused `force_step` reads from their `.w` slot.
         enc.clear_buffer(&self.scratch.vel, 0, Some(lv.n_cap as u64 * 16));
+        let bg_vel = kbg(
+            device,
+            &self.pipes.seed_vel_mass.g0,
+            &[(32, lv.mass_src), (33, &self.scratch.vel)],
+        );
+        pass1(
+            &mut enc,
+            &self.pipes.seed_vel_mass.pipe,
+            &bg_vel,
+            &pbg,
+            dispatch_grid(lv.n_cap),
+        );
 
         match &prelude {
             Prelude::SeedBall { .. } => {
@@ -1170,7 +1160,6 @@ impl GpuMultilevel {
                     wgpu::BindGroupEntry { binding: 4, resource: lv.neigh.as_entire_binding() },
                     wgpu::BindGroupEntry { binding: 5, resource: self.sim_params_buf.as_entire_binding() },
                     wgpu::BindGroupEntry { binding: 6, resource: self.scratch.energy.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 7, resource: lv.mass.as_entire_binding() },
                 ],
             });
             let bg1 = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -1185,7 +1174,6 @@ impl GpuMultilevel {
                     wgpu::BindGroupEntry { binding: 0, resource: lv.virt_csr.as_entire_binding() },
                     wgpu::BindGroupEntry { binding: 1, resource: lv.virt_eoff.as_entire_binding() },
                     wgpu::BindGroupEntry { binding: 2, resource: self.scratch.spring_partial.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 3, resource: lv.edge_physics.as_entire_binding() },
                 ],
             });
             pass3(&mut enc, ctx.force_step, &bg0, &bg1, &bg2, dispatch_grid(lv.n_cap));

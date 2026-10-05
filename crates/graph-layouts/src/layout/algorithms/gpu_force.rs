@@ -609,9 +609,11 @@ pub struct CsrInput<'a> {
     pub edge_physics: Option<&'a [EdgePhysics]>,
 }
 
-/// Per-node physics, one entry per node. Packed into a read-only storage
-/// buffer bound into `force_step`; the pair is splittable so callers can
-/// vary inertia independently of the repulsion charge.
+/// Per-node physics, one entry per node. The pair is splittable so callers
+/// can vary inertia independently of the repulsion charge; each half rides
+/// the `.w` slot of an existing buffer — the inertia in `velocities[i].w`,
+/// the charge in `positions[i].w` (which is also what the Barnes-Hut octree
+/// accumulates), so neither needs a storage binding of its own.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct NodePhysics {
@@ -626,6 +628,8 @@ pub struct NodePhysics {
 /// Per-edge physics, one entry per undirected edge in `CsrInput.edges`
 /// order. The spring on `(i, j)` is
 /// `options.spring_k * weight * (dist - options.spring_len * rest_length)`.
+/// The GPU copy is packed as `pack2x16float(weight, rest_length)` into the
+/// odd word of each directed slot of the CSR neighbour array.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct EdgePhysics {
@@ -916,11 +920,16 @@ impl GpuForceLayout {
             self.options.spring_len,
         );
         let mut state = GpuState::new_borrowed(device, positions_buffer, pc)?;
-        // SeedMode::None means "keep whatever is already in the shared buffer";
-        // every other mode uploads the seeded (or caller-supplied) positions.
+        // SeedMode::None means "keep whatever xyz is already in the shared
+        // buffer"; every other mode uploads the seeded (or caller-supplied)
+        // positions.
         if !matches!(self.options.seed_mode, SeedMode::None) {
             state.upload_initial_positions_to(queue, positions_buffer);
         }
+        // The repulsion charge rides `positions[i].w`, which a caller that
+        // supplied only xyz (SeedMode::None) has left at zero. Seed it here
+        // in every mode — 4 bytes per node, xyz untouched.
+        write_charges(queue, positions_buffer, &state.node_physics_cpu);
         if matches!(self.options.seed_mode, SeedMode::GpuMultilevel) {
             state.run_multilevel_seed(device, queue, positions_buffer, &self.options);
         }
@@ -1156,14 +1165,15 @@ impl GpuForceLayout {
     }
 
     /// Replace the live per-node physics. `physics.len()` must equal the
-    /// node count of the current ingest. The storage buffer is written in
-    /// place: no re-init, the simulation keeps running and picks the new
+    /// node count of the current ingest. Both halves are written in place —
+    /// no re-init, the simulation keeps running and picks the new
     /// inertia/charge up on the next dispatch.
     ///
-    /// The Barnes-Hut octree accumulates the charge out of
-    /// `positions[i].w`, so this also rewrites the `.w` slot of the
-    /// position buffers the engine owns. On the borrowed path the shared
-    /// buffer belongs to the caller, which is why
+    /// Each half lives in the `.w` slot of an existing buffer: the inertia
+    /// in `velocities[i].w` (`accel = force / mass`) and the charge in
+    /// `positions[i].w`, which the Barnes-Hut octree accumulates from too.
+    /// The position buffers the engine owns are rewritten here; on the
+    /// borrowed path the shared buffer belongs to the caller, which is why
     /// [`GpuForceLayout::sync_charges_to`] exists for it.
     pub fn set_node_physics(
         &mut self,
@@ -1183,11 +1193,15 @@ impl GpuForceLayout {
         if let Some(m) = physics.iter().map(|p| p.mass).find(|m| !m.is_finite() || *m <= 0.0) {
             return Err(format!("set_node_physics: mass must be finite and > 0, got {m}"));
         }
-        queue.write_buffer(
-            &state.node_physics_buf,
-            0,
-            bytemuck::cast_slice(physics),
-        );
+        // Inertia is `velocities[i].w`; one 4-byte strided write per node so
+        // the live xyz velocity is left alone.
+        for (i, p) in physics.iter().enumerate() {
+            queue.write_buffer(
+                &state.velocities,
+                i as u64 * VEC3_STRIDE + 12,
+                bytemuck::bytes_of(&p.mass),
+            );
+        }
         state.node_physics_cpu.clear();
         state.node_physics_cpu.extend_from_slice(physics);
         // Mirror the charge into positions[i].w for the octree builder —
@@ -1210,8 +1224,9 @@ impl GpuForceLayout {
     }
 
     /// Replace the live per-edge physics. `physics.len()` must equal the
-    /// number of undirected edges of the current ingest; the per-directed-
-    /// slot buffer the shader reads is rewritten in place.
+    /// number of undirected edges of the current ingest; the packed word of
+    /// every affected directed CSR slot in `edge_neighbors` is rewritten in
+    /// place.
     pub fn set_edge_physics(
         &mut self,
         queue: &wgpu::Queue,
@@ -1235,13 +1250,19 @@ impl GpuForceLayout {
                 }
             }
         }
-        queue.write_buffer(&state.edge_physics_buf, 0, bytemuck::cast_slice(&slots));
+        for (k, ep) in slots.iter().enumerate() {
+            queue.write_buffer(
+                &state.edge_neighbors,
+                (2 * k) as u64 * 4 + 4,
+                bytemuck::bytes_of(&pack2x16float(ep.weight, ep.rest_length)),
+            );
+        }
         state.edge_physics_cpu = slots;
         self.wake();
         Ok(())
     }
 
-    /// Mirror the charges from the `node_physics` buffer into the `.w`
+    /// Mirror the charges from `node_physics_cpu` into the `.w`
     /// slot of a caller-owned positions buffer. The renderer calls this
     /// after [`GpuForceLayout::set_node_physics`] so the Barnes-Hut octree
     /// (which reads `positions_in[i].w`) sees the same charges the force
@@ -1254,7 +1275,7 @@ impl GpuForceLayout {
         Ok(())
     }
 
-    /// Charges currently held by the node-physics buffer, in node order.
+    /// Charges currently held in `positions[i].w`, in node order.
     pub fn node_charges(&self) -> Result<Vec<f32>, String> {
         let Some(state) = self.state.as_ref() else {
             return Err("layout not initialised".to_string());
@@ -1403,6 +1424,8 @@ pub(crate) fn ml_coarse_params_bytes(
 
 // Each vec3<f32> in a storage buffer occupies 16 bytes (vec3 has stride/align
 // of 16 in WGSL). We use a 4-component layout on the CPU side to match.
+// The fourth float carries per-node state the sim needs but has nowhere else
+// to live: the charge in `positions`, the inertia in `velocities`.
 const VEC3_STRIDE: u64 = 16;
 
 /// wgpu rejects zero-sized storage buffers at bind-group validation, and an
@@ -1416,6 +1439,54 @@ fn nonempty_f32(v: &[f32]) -> &[f32] {
 
 fn nonempty_u32(v: &[u32]) -> &[u32] {
     if v.is_empty() { &[0] } else { v }
+}
+
+/// IEEE-754 binary32 → binary16 bit pattern, round-to-nearest-even — the
+/// same conversion WGSL's `pack2x16float` performs. Values beyond the half
+/// range saturate to ±inf and f32 subnormals flush to zero; the only inputs
+/// are spring multipliers and rest lengths, which live in roughly [0.1, 10].
+fn f32_to_f16_bits(v: f32) -> u16 {
+    let x = v.to_bits();
+    let sign = ((x >> 16) & 0x8000) as u16;
+    let exp = ((x >> 23) & 0xff) as i32;
+    let mant = x & 0x007f_ffff;
+    match exp {
+        // Inf / NaN.
+        0xff => {
+            if mant == 0 {
+                sign | 0x7c00
+            } else {
+                sign | 0x7e00
+            }
+        }
+        // Zero / f32 subnormal — an order of magnitude below half's
+        // smallest subnormal, so a flush is exact for every input here.
+        0 => sign,
+        _ => {
+            // Half's exponent bias is 15, f32's is 127.
+            let half_exp = exp - 127 + 15;
+            if half_exp >= 0x1f {
+                sign | 0x7c00
+            } else if half_exp <= 0 {
+                // Subnormal half: shift the implicit leading 1 back in.
+                let m = (mant | 0x0080_0000) >> (1 - half_exp + 13);
+                sign | m as u16
+            } else {
+                let mut h = ((half_exp as u16) << 10) | ((mant >> 13) as u16);
+                let rem = mant & 0x1fff;
+                if rem > 0x1000 || (rem == 0x1000 && (h & 1) == 1) {
+                    h += 1;
+                }
+                sign | h
+            }
+        }
+    }
+}
+
+/// Host half of `pack2x16float(vec2(lo, hi))`: `lo` in the low 16 bits,
+/// `hi` in the high 16. One `edge_neighbors` odd slot holds exactly this.
+fn pack2x16float(lo: f32, hi: f32) -> u32 {
+    (f32_to_f16_bits(lo) as u32) | ((f32_to_f16_bits(hi) as u32) << 16)
 }
 
 /// Position buffer ownership.
@@ -1472,21 +1543,17 @@ struct GpuState {
     spring_bind_group_layout: wgpu::BindGroupLayout,
     spring_pipeline: wgpu::ComputePipeline,
     params_buf: wgpu::Buffer,
-    /// Per-node (inertia, repulsion charge). `force_step` divides by
-    /// `.mass` and multiplies the pairwise repulsion by `.repulsion`.
-    node_physics_buf: wgpu::Buffer,
-    /// CPU mirror of `node_physics_buf` so `set_node_physics` can mirror the
-    /// charges into a caller-owned positions buffer without a readback.
+    /// CPU mirror of the per-node physics, i.e. of the `.w` slots of
+    /// `velocities` (inertia) and `positions` (charge) — there is no
+    /// dedicated buffer to read back from, and `set_node_physics` needs the
+    /// charges to mirror them into a caller-owned positions buffer.
     node_physics_cpu: Vec<NodePhysics>,
-    /// Per-directed-slot (weight, rest_length), aligned 1:1 with
-    /// `edge_neighbors` (both halves of an edge carry the same pair).
-    /// Read by `spring_step`.
-    edge_physics_buf: wgpu::Buffer,
-    /// CPU mirrors behind the two physics buffers: the per-directed-slot
-    /// values and the slot → undirected-edge ordinal map.
+    /// CPU mirrors behind the packed edge physics: the per-directed-slot
+    /// values and the slot → undirected-edge ordinal map. The GPU copy
+    /// rides the odd word of each `edge_neighbors` slot pair.
     edge_physics_cpu: Vec<EdgePhysics>,
     slot_edge_ord: Vec<u32>,
-    /// Directed CSR slot count (`edge_neighbors.len()`).
+    /// Directed CSR slot count (`edge_physics_cpu.len()`).
     edge_slots: usize,
     /// Per-node KE proxy = |vel|^2 written by the shader; CPU reads back
     /// (small) for energy_threshold checks.
@@ -1554,15 +1621,21 @@ struct PreCompute {
     n_edges: u32,
     node_order: Option<Vec<String>>,
     initial_positions: Vec<f32>, // padded vec4-per-node
+    /// Zero velocities with the inertia seeded into `.w` of each vec4.
     velocities: Vec<f32>,
     edge_offsets: Vec<u32>,
+    /// Two u32 per directed CSR slot: the neighbour, then
+    /// `pack2x16float(weight, rest_length)`. `edge_offsets` still counts
+    /// slots, so slot k's pair starts at `edge_neighbors[2 * k]`.
     edge_neighbors: Vec<u32>,
-    /// Per-node (inertia, repulsion charge). Bound into `force_step` as the
-    /// `node_physics` storage buffer; `accel = force / mass`.
+    /// Per-node (inertia, repulsion charge), the CPU mirror the two packed
+    /// slots above are built from: the charge into `positions[i].w`, the
+    /// inertia into `velocities[i].w` (`accel = force / mass`).
     node_physics: Vec<NodePhysics>,
-    /// Per-directed-slot edge physics, aligned 1:1 with `edge_neighbors`
-    /// (both halves of an undirected edge carry the same pair). Read by
-    /// `spring_step`.
+    /// Per-directed-slot edge physics, aligned 1:1 with the directed slots
+    /// of `edge_neighbors` (both halves of an undirected edge carry the
+    /// same pair). The GPU copy is the packed word; this is the mirror
+    /// `set_edge_physics` rebuilds it from.
     edge_physics: Vec<EdgePhysics>,
     /// Undirected-edge ordinal per directed CSR slot, so a later
     /// `set_edge_physics` can expand its per-edge input to the slot layout.
@@ -1671,11 +1744,14 @@ fn precompute_csr(
     for i in 0..n {
         positions_v.extend_from_slice(&[base[3 * i], base[3 * i + 1], base[3 * i + 2], 0.0]);
     }
-    let velocities: Vec<f32> = vec![0.0; n * 4];
+    // Velocities are vec4 on the GPU: xyz start at zero and .w carries the
+    // node's inertia, which `force_step` reads back and preserves on every
+    // store (see `set_node_physics` for the live-retune path).
+    let mut velocities: Vec<f32> = vec![0.0; n * 4];
 
     // CSR adjacency (undirected: each edge contributes both directions).
     // Each adjacency entry carries the index of the undirected edge it came
-    // from so the per-slot `edge_physics` array stays aligned with
+    // from so the per-slot `edge_physics` mirror stays aligned with
     // `edge_neighbors`.
     let mut adj: Vec<Vec<(u32, u32)>> = vec![Vec::new(); n];
     let mut k = 0;
@@ -1706,14 +1782,20 @@ fn precompute_csr(
     for ns in &adj {
         acc += ns.len() as u32;
         for (nb, ord) in ns {
+            let ep = phys_of(*ord);
             edge_neighbors.push(*nb);
-            edge_physics_v.push(phys_of(*ord));
+            edge_neighbors.push(pack2x16float(ep.weight, ep.rest_length));
+            edge_physics_v.push(ep);
             slot_edge_ord.push(*ord);
         }
         edge_offsets.push(acc);
     }
     if edge_neighbors.is_empty() {
         edge_neighbors.push(0);
+        edge_neighbors.push(pack2x16float(
+            DEFAULT_EDGE_PHYSICS.weight,
+            DEFAULT_EDGE_PHYSICS.rest_length,
+        ));
         edge_physics_v.push(DEFAULT_EDGE_PHYSICS);
         slot_edge_ord.push(0);
     }
@@ -1728,14 +1810,13 @@ fn precompute_csr(
         .collect();
     // Pack the repulsion charge into positions[i].w so the Barnes-Hut octree
     // builder (which accumulates `positions_in[j].w`) keeps working
-    // unchanged. `force_step` reads inertia from the separate `node_mass`
-    // storage buffer instead. Charge values never change after this, so a
-    // single inject here is enough; the shader preserves .w on every
-    // position write.
+    // unchanged, and the inertia into velocities[i].w, which is where
+    // `force_step` reads it. Neither value changes here, so a single inject
+    // is enough; the shader preserves both .w slots on every store.
     for (i, p) in physics.iter().enumerate() {
-        let w_off = 4 * i + 3;
-        if w_off < positions_v.len() {
-            positions_v[w_off] = p.repulsion;
+        if 4 * i + 3 < positions_v.len() {
+            positions_v[4 * i + 3] = p.repulsion;
+            velocities[4 * i + 3] = p.mass;
         }
     }
     let node_physics = if physics.is_empty() {
@@ -1899,14 +1980,13 @@ struct ForcePipelines {
     spring_step: wgpu::ComputePipeline,
 }
 
-fn build_pipeline(device: &wgpu::Device) -> ForcePipelines {
-    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-        label: Some("force.wgsl"),
-        source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(include_str!(
-            "shaders/force.wgsl"
-        ))),
-    });
-    let bgl_entries = [
+/// Group(0) of the shared force pipeline layout: positions in/out,
+/// velocities, the CSR pair, the params uniform and the energy probe. The
+/// per-node physics lives in the `.w` of positions/velocities and the
+/// per-edge physics in the odd word of each `edge_neighbors` slot, so no
+/// binding is spent on either.
+fn force_group0_entries() -> [wgpu::BindGroupLayoutEntry; 7] {
+    [
         storage_entry(0, true),
         storage_entry(1, false),
         storage_entry(2, false),
@@ -1922,13 +2002,58 @@ fn build_pipeline(device: &wgpu::Device) -> ForcePipelines {
             },
             count: None,
         },
-        // Binding 6 = energy_out. Binding 7 = node_physics (per-node
-        // inertia + repulsion charge); `positions[i].w` mirrors the charge
-        // so the octree builder can accumulate it unchanged. Group:
-        // 6 storage + 1 uniform.
         storage_entry(6, false),
-        storage_entry(7, true),
+    ]
+}
+
+/// Group(1): the Barnes-Hut octree array. We omit the params/bbox bindings
+/// (only used by the v2 GPU build kernels) — force_step doesn't reference
+/// them, so leaving them out of the BGL keeps the layout minimal.
+fn oct_group1_entries() -> [wgpu::BindGroupLayoutEntry; 1] {
+    [storage_entry(1, true)] // oct_nodes (read-only in force_step)
+}
+
+/// Group(2): hub-aware (Tigr) virtual-vertex CSR + per-virtual spring
+/// partials. Bound by both `spring_step` (writes partials) and
+/// `force_step` (reads).
+fn spring_group2_entries() -> [wgpu::BindGroupLayoutEntry; 3] {
+    // virt_csr packs `node_to_virt_offsets` (length n+1) followed by
+    // `virt_real_idx` (length n_virtual). Saves one storage-binding slot vs
+    // the previous separate buffers, keeping the per-stage count at the cap.
+    [
+        storage_entry(0, true),  // virt_csr (read)
+        storage_entry(1, true),  // virt_edge_offsets (read)
+        storage_entry(2, false), // spring_force_partial (rw)
+    ]
+}
+
+/// Storage buffers the shared force pipeline layout binds for the compute
+/// stage, summed over groups 0..2. Chrome's WebGPU runtime rejects
+/// `create_pipeline_layout` above 10, which is what "The number of storage
+/// buffers (N) in the Compute stage exceeds the maximum per-stage limit"
+/// reports — so this is the number the whole layout has to keep at or
+/// under. Counted from the entry lists so the regression test cannot drift
+/// from the real layout.
+#[cfg(test)]
+fn compute_stage_storage_buffers() -> u32 {
+    let groups = [
+        force_group0_entries().len(),
+        oct_group1_entries().len(),
+        spring_group2_entries().len(),
     ];
+    // Group 0's binding 5 is the params uniform; everything else in the
+    // three lists is storage.
+    (groups.iter().sum::<usize>() - 1) as u32
+}
+
+fn build_pipeline(device: &wgpu::Device) -> ForcePipelines {
+    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("force.wgsl"),
+        source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(include_str!(
+            "shaders/force.wgsl"
+        ))),
+    });
+    let bgl_entries = force_group0_entries();
     let bind_group_layout = device.create_bind_group_layout(
         &wgpu::BindGroupLayoutDescriptor {
             label: Some("gpu_force_bgl"),
@@ -1940,9 +2065,7 @@ fn build_pipeline(device: &wgpu::Device) -> ForcePipelines {
     // matching `oct_nodes` in force.wgsl. We omit the params/bbox bindings
     // (only used by the v2 GPU build kernels) — force_step doesn't reference
     // them, so leaving them out of the BGL keeps the layout minimal.
-    let oct_bgl_entries = [
-        storage_entry(1, true), // oct_nodes (read-only in force_step)
-    ];
+    let oct_bgl_entries = oct_group1_entries();
     let oct_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
         label: Some("gpu_force_octree_bgl"),
         entries: &oct_bgl_entries,
@@ -1950,18 +2073,7 @@ fn build_pipeline(device: &wgpu::Device) -> ForcePipelines {
 
     // Group 2: hub-aware virtual-vertex CSR + per-virtual spring partials.
     // Bound by both `spring_step` (writes partials) and `force_step` (reads).
-    let spring_bgl_entries = [
-        // virt_csr packs `node_to_virt_offsets` (length n+1) followed by
-        // `virt_real_idx` (length n_virtual). Saves one storage-binding
-        // slot vs the previous separate buffers, getting the per-stage
-        // count under Chrome WebGPU's cap of 10.
-        storage_entry(0, true),  // virt_csr (read)
-        storage_entry(1, true),  // virt_edge_offsets (read)
-        storage_entry(2, false), // spring_force_partial (rw)
-        // edge_physics (read) — (weight, rest_length) per directed CSR slot,
-        // aligned with edge_neighbors.
-        storage_entry(3, true),
-    ];
+    let spring_bgl_entries = spring_group2_entries();
     let spring_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
         label: Some("gpu_force_spring_bgl"),
         entries: &spring_bgl_entries,
@@ -2063,12 +2175,10 @@ impl GpuState {
             spring_bind_group_layout: pipelines.spring_bgl,
             spring_pipeline: pipelines.spring_step,
             params_buf: aux.params,
-            node_physics_buf: aux.node_physics,
             node_physics_cpu: pc.node_physics,
             edge_slots: pc.edge_physics.len(),
             edge_physics_cpu: pc.edge_physics,
             slot_edge_ord: pc.slot_edge_ord,
-            edge_physics_buf: aux.edge_physics,
             energy_buf: aux.energy,
             energy_staging: aux.energy_staging,
             oct_nodes_buf: aux.oct_nodes,
@@ -2154,8 +2264,10 @@ impl GpuState {
             &self.edge_neighbors,
             &self.virt_csr_buf,
             &self.virt_edge_offsets_buf,
-            &self.node_physics_buf,
-            &self.edge_physics_buf,
+            // Per-node inertia for the fine level's relax passes rides the
+            // `.w` of the velocities word; the packed edge physics ride
+            // `edge_neighbors` itself.
+            &self.velocities,
             self.n_virtual,
             options,
         );
@@ -2186,8 +2298,7 @@ impl GpuState {
             &self.edge_neighbors,
             &self.virt_csr_buf,
             &self.virt_edge_offsets_buf,
-            &self.node_physics_buf,
-            &self.edge_physics_buf,
+            &self.velocities,
             self.n_virtual,
             options,
         );
@@ -2271,7 +2382,6 @@ impl GpuState {
                 buf_entry(4, &self.edge_neighbors),
                 buf_entry(5, &self.params_buf),
                 buf_entry(6, &self.energy_buf),
-                buf_entry(7, &self.node_physics_buf),
             ],
         })
     }
@@ -2341,7 +2451,6 @@ impl GpuState {
                 buf_entry(0, &self.virt_csr_buf),
                 buf_entry(1, &self.virt_edge_offsets_buf),
                 buf_entry(2, &self.spring_force_partial_buf),
-                buf_entry(3, &self.edge_physics_buf),
             ],
         })
     }
@@ -2569,23 +2678,21 @@ struct AuxBuffers {
     spring_force_partial: wgpu::Buffer,
     n_virtual: u32,
     params: wgpu::Buffer,
-    /// Per-node (inertia, repulsion charge).
-    node_physics: wgpu::Buffer,
-    /// Per-directed-slot (weight, rest_length), aligned with `neigh`.
-    edge_physics: wgpu::Buffer,
     energy: wgpu::Buffer,
     energy_staging: wgpu::Buffer,
     oct_nodes: wgpu::Buffer,
     oct_nodes_capacity: u64,
 }
 
-/// Build the velocity, edge_offsets, edge_neighbors, params, mass, grid,
-/// and energy buffers used by both owned and borrowed paths.
+/// Build the velocity, edge_offsets, edge_neighbors, params, grid, and
+/// energy buffers used by both owned and borrowed paths.
 fn build_aux_buffers(device: &wgpu::Device, pc: &PreCompute) -> AuxBuffers {
+    // COPY_DST because `set_node_physics` retunes the inertia in
+    // `velocities[i].w` without rebuilding anything.
     let vel = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("velocities"),
         contents: bytemuck::cast_slice(nonempty_f32(&pc.velocities)),
-        usage: wgpu::BufferUsages::STORAGE,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
     });
     let off = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("edge_offsets"),
@@ -2635,27 +2742,6 @@ fn build_aux_buffers(device: &wgpu::Device, pc: &PreCompute) -> AuxBuffers {
         usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         mapped_at_creation: false,
     });
-    let mut node_physics_init: Vec<NodePhysics> = pc.node_physics.clone();
-    if node_physics_init.is_empty() {
-        node_physics_init.push(NodePhysics {
-            mass: 1.0,
-            repulsion: 1.0,
-        });
-    }
-    let node_physics = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: Some("node_physics"),
-        contents: bytemuck::cast_slice(&node_physics_init),
-        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-    });
-    let mut edge_physics_init: Vec<EdgePhysics> = pc.edge_physics.clone();
-    if edge_physics_init.is_empty() {
-        edge_physics_init.push(DEFAULT_EDGE_PHYSICS);
-    }
-    let edge_physics = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: Some("edge_physics"),
-        contents: bytemuck::cast_slice(&edge_physics_init),
-        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-    });
     let n = pc.n_nodes.max(1) as u64;
     let energy_size = (n * 4).max(64);
     let energy = device.create_buffer(&wgpu::BufferDescriptor {
@@ -2693,8 +2779,6 @@ fn build_aux_buffers(device: &wgpu::Device, pc: &PreCompute) -> AuxBuffers {
         spring_force_partial,
         n_virtual: pc.n_virtual,
         params,
-        node_physics,
-        edge_physics,
         energy,
         energy_staging,
         oct_nodes,
@@ -4051,9 +4135,59 @@ mod tests {
     //
     // The engine used to carry one `1 + log2(degree)` number per node in
     // `positions[i].w` and use it BOTH as the Coulomb charge and as the
-    // inertia. These four tests pin the split: charge (`.w`) drives
-    // repulsion, the `node_physics` buffer drives `accel = force / mass`,
-    // and the per-slot `edge_physics` buffer drives the springs.
+    // inertia. These tests pin the split: the charge drives repulsion, the
+    // inertia drives `accel = force / mass`, and the springs use the per-slot
+    // (weight, rest_length) pair.
+
+    /// The shared force pipeline layout must stay at or under Chrome
+    /// WebGPU's cap of 10 storage buffers per compute stage: the layout
+    /// creation that used 12 for the two physics buffers is exactly the
+    /// browser failure this packing scheme exists to avoid
+    /// (`CreatePipelineLayout("gpu_force_pl")`). Counted from the layout
+    /// entries themselves, so adding a binding trips the test.
+    #[test]
+    fn force_pipeline_layout_fits_ten_storage_buffers() {
+        let storage_buffers = compute_stage_storage_buffers();
+        assert!(
+            storage_buffers <= 10,
+            "compute stage binds {storage_buffers} storage buffers, over Chrome WebGPU's cap of 10 \
+             (the two per-node/per-edge physics bindings were folded into \
+             velocities.w and the edge_neighbors pairs)"
+        );
+    }
+
+    /// The packed per-slot spring pair must survive the half precision the
+    /// shader's `unpack2x16float` applies: 1.0 exact, and the documented
+    /// multiplier range (roughly 0.1–10) within a half's precision there.
+    #[test]
+    fn packed_edge_physics_round_trips() {
+        for (lo, hi) in [(1.0f32, 1.0f32), (0.5, 2.0), (10.0, 0.1), (3.25, 7.75)] {
+            let packed = pack2x16float(lo, hi);
+            let back_lo = f16_to_f32(packed as u16);
+            let back_hi = f16_to_f32((packed >> 16) as u16);
+            assert!((back_lo - lo).abs() <= 0.001 * lo, "lo {lo} -> {back_lo}");
+            assert!((back_hi - hi).abs() <= 0.001 * hi, "hi {hi} -> {back_hi}");
+        }
+        // (1.0, 1.0) is the neutral pair every slot defaults to; it must be
+        // bit-exact in both halves so a default CSR is the unweighted law.
+        assert_eq!(pack2x16float(1.0, 1.0), 0x3c00_3c00);
+        assert_eq!(f16_to_f32(0x3c00), 1.0);
+    }
+
+    /// Independent half → `f32` decode, so the round-trip check above does
+    /// not test the encoder against itself.
+    fn f16_to_f32(h: u16) -> f32 {
+        let sign = if h & 0x8000 == 0 { 1.0f32 } else { -1.0f32 };
+        let exp = ((h >> 10) & 0x1f) as i32;
+        let mant = (h & 0x3ff) as f32;
+        if exp == 0 {
+            sign * mant * 2f32.powi(-24)
+        } else if exp == 0x1f {
+            if mant == 0.0 { sign * f32::INFINITY } else { f32::NAN }
+        } else {
+            sign * (1.0 + mant / 1024.0) * 2f32.powi(exp - 15)
+        }
+    }
 
     /// Shared setup for the physics tests: an adapter + device, or `None`
     /// when the machine has no GPU (then the test skips, like the rest).

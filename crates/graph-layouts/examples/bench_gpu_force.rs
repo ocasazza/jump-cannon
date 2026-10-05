@@ -67,17 +67,14 @@ fn main() {
                     i += 1;
                 }
             }
-            "--models" => {
-                if i + 1 < args.len() {
-                    models = args[i + 1]
-                        .split(',')
-                        .map(|s| s.trim())
-                        .collect();
-                    i += 2;
-                } else {
-                    i += 1;
-                }
+            "--models" if i + 1 < args.len() => {
+                models = args[i + 1]
+                    .split(',')
+                    .map(|s| s.trim())
+                    .collect();
+                i += 2;
             }
+            "--models" => i += 1,
             _ => {
                 i += 1;
             }
@@ -115,19 +112,23 @@ fn main() {
                     _ => continue,
                 };
 
-                let mut options = GpuForceOptions::default();
-                options.steps_per_call = step_count;
-                options.energy_threshold = 0.0;
-                options.repulsion_samples = 8;
-                options.tfdp_k = 3.0;
-                options.repulsion_mode = mode;
-                options.force_model = model;
+                let options = GpuForceOptions {
+                    steps_per_call: step_count,
+                    energy_threshold: 0.0,
+                    repulsion_samples: 8,
+                    tfdp_k: 3.0,
+                    repulsion_mode: mode,
+                    force_model: model,
+                    ..Default::default()
+                };
 
                 let mut layout = GpuForceLayout::new(options.clone());
                 let input = CsrInput {
                     n_nodes,
                     edges: &edges,
                     positions: None,
+                    node_physics: None,
+                    edge_physics: None,
                 };
                 let mut out: Vec<f32> = Vec::new();
 
