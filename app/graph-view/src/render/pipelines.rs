@@ -35,8 +35,9 @@ use crate::render::region_map::{RegionMap, RegionMapConfig, RegionMode};
 use bytemuck::{Pod, Zeroable};
 use glam::{Mat4, Vec3, Vec4};
 use graph_layouts::{
-    BoxedPhysics, CsrInput, DynPhysicsLayout, DynStaticLayout, Edge as GlEdge, EdgePhysics,
-    GpuForceLayout, GpuForceOptions, Graph as GlGraph, Node as GlNode, NodePhysics,
+    AmphiphileLayout, AmphiphileOptions, BoxedPhysics, CsrInput, DynPhysicsLayout, DynStaticLayout,
+    Edge as GlEdge, EdgePhysics, GpuForceLayout, GpuForceOptions, Graph as GlGraph, Node as GlNode,
+    NodePhysics, Species,
 };
 use std::sync::{Arc, Mutex};
 use wgpu::util::DeviceExt;
@@ -304,6 +305,9 @@ struct Buffers {
     /// keeps the physics it was running with.
     node_physics_cpu: Option<Vec<NodePhysics>>,
     edge_physics_cpu: Option<Vec<EdgePhysics>>,
+    /// Particle species for the amphiphile backend; carried through every
+    /// layout re-init.
+    species_cpu: Option<Vec<Species>>,
 
     /// MAP_READ | COPY_DST staging buffer for the async GPU→CPU
     /// positions readback. Sized `n_nodes * 16` bytes (vec4 stride to
@@ -658,6 +662,7 @@ impl GraphPipelines {
                 &graph.edges,
                 node_physics.as_deref(),
                 edge_physics.as_deref(),
+                None,
             ) {
                 Ok(()) => Some(boxed),
                 Err(e) => {
@@ -705,6 +710,7 @@ impl GraphPipelines {
             edges_cpu: graph.edges,
             node_physics_cpu: node_physics,
             edge_physics_cpu: edge_physics,
+            species_cpu: None,
             positions_staging,
             positions_readback: Arc::new(Mutex::new(PositionsReadbackState::Idle)),
             positions_frame_idx: 0,
@@ -1815,6 +1821,7 @@ impl GraphPipelines {
                 &b.edges_cpu,
                 b.node_physics_cpu.as_deref(),
                 b.edge_physics_cpu.as_deref(),
+                b.species_cpu.as_deref(),
             ) {
                 tracing::warn!("[render] set_positions: layout re-init failed: {e}");
             }
@@ -1912,6 +1919,7 @@ impl GraphPipelines {
             &b.edges_cpu,
             b.node_physics_cpu.as_deref(),
             b.edge_physics_cpu.as_deref(),
+                b.species_cpu.as_deref(),
         ) {
             Ok(()) => {
                 b.layout = Some(layout);
@@ -1920,6 +1928,35 @@ impl GraphPipelines {
                 tracing::warn!("[render] swap_physics_layout init failed: {e}");
             }
         }
+    }
+
+    /// Replace the active layout with the amphiphile self-assembly backend
+    /// over `species`, re-initialised from the live positions.
+    pub fn swap_to_amphiphile(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        options: AmphiphileOptions,
+        species: Vec<Species>,
+    ) {
+        if let Some(b) = self.buffers.as_mut() {
+            b.species_cpu = Some(species);
+        }
+        let layout: Box<dyn DynPhysicsLayout> = Box::new(BoxedPhysics::new(AmphiphileLayout::new(options)));
+        self.swap_physics_layout(device, queue, layout);
+    }
+
+    /// Push a new species set into the live sim; `Err` when the active
+    /// layout has no species (e.g. the spring-electrical engine).
+    pub fn update_species(&mut self, queue: &wgpu::Queue, species: Vec<Species>) -> Result<(), String> {
+        let b = self.buffers.as_mut().ok_or_else(|| "update_species: no buffers loaded".to_string())?;
+        if species.len() != b.n_nodes as usize {
+            return Err(format!("update_species: got {} entries, expected {}", species.len(), b.n_nodes));
+        }
+        let layout = b.layout.as_mut().ok_or_else(|| "update_species: no layout".to_string())?;
+        layout.set_species(queue, &species)?;
+        b.species_cpu = Some(species);
+        Ok(())
     }
 
     /// One-shot static solve (port of the egui `run_static_solve`). Static
@@ -2110,6 +2147,7 @@ fn init_physics_layout(
     edges_cpu: &[u32],
     node_physics: Option<&[NodePhysics]>,
     edge_physics: Option<&[EdgePhysics]>,
+    species: Option<&[Species]>,
 ) -> Result<(), String> {
     let input = CsrInput {
         n_nodes: (positions_cpu.len() / 3) as u32,
@@ -2117,6 +2155,7 @@ fn init_physics_layout(
         positions: Some(positions_cpu),
         node_physics,
         edge_physics,
+        species,
     };
     match layout.init_with_device_csr(device, queue, &input, positions_buf) {
         Ok(()) => Ok(()),
@@ -2343,6 +2382,16 @@ impl RenderHost {
     /// Per-node physics update (see [`GraphPipelines::update_node_physics`]).
     pub fn update_node_physics(&mut self, physics: Vec<NodePhysics>) -> Result<(), String> {
         self.pipes.update_node_physics(&self.queue, physics)
+    }
+
+    /// Swap to the amphiphile backend (see [`GraphPipelines::swap_to_amphiphile`]).
+    pub fn swap_to_amphiphile(&mut self, options: AmphiphileOptions, species: Vec<Species>) {
+        self.pipes.swap_to_amphiphile(&self.device, &self.queue, options, species);
+    }
+
+    /// Species update (see [`GraphPipelines::update_species`]).
+    pub fn update_species(&mut self, species: Vec<Species>) -> Result<(), String> {
+        self.pipes.update_species(&self.queue, species)
     }
 
     /// Per-edge physics update (see [`GraphPipelines::update_edge_physics`]).

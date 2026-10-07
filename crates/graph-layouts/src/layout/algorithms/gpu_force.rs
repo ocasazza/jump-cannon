@@ -607,6 +607,8 @@ pub struct CsrInput<'a> {
     pub positions: Option<&'a [f32]>,
     pub node_physics: Option<&'a [NodePhysics]>,
     pub edge_physics: Option<&'a [EdgePhysics]>,
+    /// Particle species for the amphiphile backend; solvent when `None`.
+    pub species: Option<&'a [crate::layout::algorithms::amphiphile::Species]>,
 }
 
 /// Per-node physics, one entry per node. The pair is splittable so callers
@@ -2869,7 +2871,7 @@ fn buf_entry(binding: u32, buf: &wgpu::Buffer) -> wgpu::BindGroupEntry<'_> {
 // on native `device.poll(Wait)` runs the callback synchronously before we
 // hit recv().
 
-fn futures_channel() -> (OneshotTx, OneshotRx) {
+pub(crate) fn futures_channel() -> (OneshotTx, OneshotRx) {
     let inner = std::sync::Arc::new(OneshotInner {
         slot: std::sync::Mutex::new(None),
     });
@@ -2885,22 +2887,22 @@ struct OneshotInner {
     slot: std::sync::Mutex<Option<Result<(), wgpu::BufferAsyncError>>>,
 }
 
-struct OneshotTx {
+pub(crate) struct OneshotTx {
     inner: std::sync::Arc<OneshotInner>,
 }
 impl OneshotTx {
-    fn send(self, v: Result<(), wgpu::BufferAsyncError>) {
+    pub(crate) fn send(self, v: Result<(), wgpu::BufferAsyncError>) {
         if let Ok(mut slot) = self.inner.slot.lock() {
             *slot = Some(v);
         }
     }
 }
 
-struct OneshotRx {
+pub(crate) struct OneshotRx {
     inner: std::sync::Arc<OneshotInner>,
 }
 impl OneshotRx {
-    async fn recv(self) -> Result<Result<(), wgpu::BufferAsyncError>, ()> {
+    pub(crate) async fn recv(self) -> Result<Result<(), wgpu::BufferAsyncError>, ()> {
         // Spin-yield until the slot is populated. On native, by the time we
         // arrive here `device.poll(Wait)` has already run the callback. On
         // wasm32 we yield to the event loop until the GPU job completes.
@@ -4316,7 +4318,7 @@ mod tests {
                 edges,
                 positions: Some(seed),
                 node_physics: None,
-                edge_physics: Some(ep),
+                edge_physics: Some(ep), species: None,
             };
             relax_to_positions(&input, base.clone()).await
         }
@@ -4372,7 +4374,7 @@ mod tests {
                 edges: &[],
                 positions: Some(seed),
                 node_physics: Some(&np),
-                edge_physics: None,
+                edge_physics: None, species: None,
             };
             relax_to_positions(&input, base.clone()).await
         }
@@ -4422,7 +4424,7 @@ mod tests {
                 edges: &[],
                 positions: Some(seed),
                 node_physics: Some(&np),
-                edge_physics: None,
+                edge_physics: None, species: None,
             };
             relax_to_positions(&input, base.clone()).await
         }
@@ -4476,7 +4478,7 @@ mod tests {
                 edges: &[],
                 positions: Some(seed),
                 node_physics: Some(&np0),
-                edge_physics: None,
+                edge_physics: None, species: None,
             };
             let positions = seeded_positions_buffer(&device, &input);
             let mut layout = GpuForceLayout::new(opts);
@@ -4564,7 +4566,7 @@ mod tests {
             edges: &edges,
             positions: None,
             node_physics: None,
-            edge_physics: None,
+            edge_physics: None, species: None,
         };
         let mut layout = GpuForceLayout::new(GpuForceOptions {
             steps_per_call: 10,
@@ -4657,7 +4659,7 @@ mod tests {
             edges: &edges,
             positions: None,
             node_physics: None,
-            edge_physics: None,
+            edge_physics: None, species: None,
         };
         let mut layout = GpuForceLayout::new(GpuForceOptions {
             steps_per_call: 1,
@@ -5055,7 +5057,7 @@ mod tests {
             edges: &edges,
             positions: None,
             node_physics: None,
-            edge_physics: None,
+            edge_physics: None, species: None,
         };
         layout
             .init_with_device_csr(&device, &queue, &input, &positions_buffer)
@@ -5153,7 +5155,7 @@ mod tests {
             edges: &edges,
             positions: None,
             node_physics: None,
-            edge_physics: None,
+            edge_physics: None, species: None,
         };
         layout
             .init_with_device_csr(&device, &queue, &input, &positions_buffer)
