@@ -2860,6 +2860,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "jump-cannon-graph-view"
+version = "1.0.0"
+dependencies = [
+ "bytemuck",
+ "dioxus",
+ "glam",
+ "graph-layouts",
+ "js-sys",
+ "serde",
+ "serde_json",
+ "tracing",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
+ "wgpu",
+]
+
+[[package]]
 name = "jump-cannon-ui"
 version = "1.0.0"
 dependencies = [

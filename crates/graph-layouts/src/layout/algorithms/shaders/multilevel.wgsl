@@ -37,16 +37,16 @@ const HUB: u32 = 32u;
 // different pipelines may bind the same slot to different buffers (the octree
 // pattern). Roles are documented per binding.
 @group(0) @binding(0)  var<storage, read>        f_off:      array<u32>;            // finer CSR offsets (len n_fine+1)
-@group(0) @binding(1)  var<storage, read>        f_neigh:    array<u32>;            // finer CSR neighbours (len f_slots)
+@group(0) @binding(1)  var<storage, read>        f_neigh:    array<u32>;            // finer CSR neighbours, 2 u32 per directed slot: neighbour ++ pack2x16float(weight, rest_length)
 @group(0) @binding(2)  var<storage, read>        f_ewt:      array<f32>;            // finer edge weights (len f_slots)
-@group(0) @binding(3)  var<storage, read>        f_pos:      array<vec4<f32>>;      // finer positions (xyz + mass in .w)
+@group(0) @binding(3)  var<storage, read>        f_pos:      array<vec4<f32>>;      // finer positions (xyz + per-node mass in .w)
 @group(0) @binding(4)  var<storage, read_write>  matched:    array<u32>;            // per finer node: UNMATCHED or rep=min(i,j)
 @group(0) @binding(5)  var<storage, read_write>  propose:    array<u32>;            // per finer node: proposed partner or SELF_PROP
 @group(0) @binding(6)  var<storage, read_write>  parent:     array<u32>;            // per finer node: coarse index (this cascade step)
 @group(0) @binding(7)  var<storage, read>        f_meta:     array<u32>;            // finer meta [nc, mc, slots, _]
 @group(0) @binding(8)  var<storage, read_write>  slot_row:   array<u32>;            // per finer CSR slot: owning row id
 @group(0) @binding(9)  var<storage, read>        c_off:      array<u32>;            // coarse CSR offsets (read)
-@group(0) @binding(10) var<storage, read_write>  c_neigh:    array<u32>;            // coarse CSR neighbours
+@group(0) @binding(10) var<storage, read_write>  c_neigh:    array<u32>;            // coarse CSR neighbours, 2 u32 per directed slot (as f_neigh)
 @group(0) @binding(11) var<storage, read_write>  c_ewt:      array<f32>;            // coarse edge weights
 @group(0) @binding(12) var<storage, read_write>  c_pos:      array<vec4<f32>>;      // coarse positions (xyz + mass in .w)
 @group(0) @binding(13) var<storage, read_write>  c_cursor:   array<atomic<u32>>;    // atomic fill cursor (init = c_off)
@@ -67,6 +67,8 @@ const HUB: u32 = 32u;
 @group(0) @binding(28) var<storage, read_write>  virt_eoff:  array<u32>;            // per virtual vertex: CSR edge slice offsets
 @group(0) @binding(29) var<storage, read_write>  c_off_atom: array<atomic<u32>>;    // coarse degrees, atomic view of the off buffer
 @group(0) @binding(30) var<storage, read>        pos_src:    array<vec4<f32>>;      // coarser positions (prolong source)
+@group(0) @binding(32) var<storage, read>        mass_src:   array<vec4<f32>>;      // per-node inertia source for the relax, read from .w
+@group(0) @binding(33) var<storage, read_write>  vel_dst:    array<vec4<f32>>;      // relax scratch velocities; inertia is seeded into .w
 
 // ---- Group 1: uniforms -----------------------------------------------------
 
@@ -201,7 +203,7 @@ fn hem_propose(
     var best_w: f32 = -1.0;
     var best_h: u32 = 0u;
     for (var k = start; k < end; k = k + 1u) {
-        let j = f_neigh[k];
+        let j = f_neigh[2u * k];
         if (j == i) { continue; }
         if (matched[j] != UNMATCHED) { continue; }
         let w = f_ewt[k];
@@ -287,6 +289,11 @@ fn mass_accum(
     atomicAdd(&c_mass[p], u32(m * params.mass_scale));
 }
 
+// The child mass sum lands in `c_pos[i].w` — the coarse level's per-node
+// physics. `seed_vel_mass` copies it into the `.w` of the relax scratch's
+// velocity words, which is where the reused force.wgsl `force_step` reads
+// the inertia from (there is no per-level physics binding of its own).
+
 // c_pos[i] = (0, 0, 0, coarse_mass). xyz is set later by seed_ball / prolong,
 // which preserve the .w mass this kernel writes.
 @compute @workgroup_size(64)
@@ -333,7 +340,7 @@ fn expand_pairs(
         return;
     }
     let row = slot_row[slot];
-    let col = f_neigh[slot];
+    let col = f_neigh[2u * slot];
     let ps = parent[row];
     let pt = parent[col];
     if (ps == pt) {
@@ -573,11 +580,18 @@ fn coarse_fill(
     let a = edge_min[e];
     let b = edge_max[e];
     let w = f32(atomicLoad(&edge_wt[e]));
+    // Two u32 per directed slot, matching the fine CSR the reused force.wgsl
+    // kernels read: the neighbour, then the spring's (weight, rest length)
+    // packed as two halves. The rest length is 1.0 — the coarse springs were
+    // unit-rest before the physics split.
+    let phys = pack2x16float(vec2<f32>(w, 1.0));
     let pa = atomicAdd(&c_cursor[a], 1u);
-    c_neigh[pa] = b;
+    c_neigh[2u * pa] = b;
+    c_neigh[2u * pa + 1u] = phys;
     c_ewt[pa] = w;
     let pb = atomicAdd(&c_cursor[b], 1u);
-    c_neigh[pb] = a;
+    c_neigh[2u * pb] = a;
+    c_neigh[2u * pb + 1u] = phys;
     c_ewt[pb] = w;
 }
 
@@ -651,6 +665,22 @@ fn seed_ball(
     c_pos[i] = vec4<f32>(dir * r, m);
 }
 
+// Zero the relax scratch's velocity xyz and copy the level's per-node
+// inertia into `.w`, where the reused force.wgsl `force_step` reads it
+// (`accel = force / velocities[i].w`). Bound to this level's `c_pos` (whose
+// `.w` `place_mass` filled) for a coarse level, or to the fine force engine's
+// velocity words at level 0. The host clears the buffer first, so this only
+// has to supply the `.w`.
+@compute @workgroup_size(64)
+fn seed_vel_mass(
+    @builtin(global_invocation_id) gid: vec3<u32>,
+    @builtin(num_workgroups) nwg: vec3<u32>,
+) {
+    let i = linear_index(gid, nwg);
+    if (i >= params.n_fine_cap) { return; }
+    vel_dst[i] = vec4<f32>(0.0, 0.0, 0.0, mass_src[i].w);
+}
+
 // Prolong: each finer node inherits its parent's coarser position plus a small
 // jitter, so contracted pairs separate. Preserves the finer .w mass (set by
 // place_mass for coarse destinations, or the original fine mass at level 0).
@@ -704,7 +734,7 @@ fn spring_step_weighted(
     let eend = virt_eoff[v + 1u];
     var f = vec3<f32>(0.0, 0.0, 0.0);
     for (var k = estart; k < eend; k = k + 1u) {
-        let other = c_neigh[k];
+        let other = c_neigh[2u * k];
         let w = c_ewt[k];
         f = f + attraction_force(f_pos[other].xyz - pos) * w;
     }

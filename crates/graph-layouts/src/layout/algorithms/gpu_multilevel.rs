@@ -197,6 +197,9 @@ struct MlPipes {
     coarse_nv: KPipe,
     coarse_virt_fill: KPipe,
     seed_ball: KPipe,
+    /// Zeroes the relax scratch's velocity words and copies the level's
+    /// per-node inertia into their `.w` — force.wgsl reads inertia there.
+    seed_vel_mass: KPipe,
     prolong: KPipe,
     spring_weighted: KPipe,
 }
@@ -208,6 +211,9 @@ struct MlLevel {
     slots_cap: u32,
     nv_cap: u32,
     off: wgpu::Buffer,
+    /// Coarse CSR neighbours, two u32 per directed slot: the neighbour then
+    /// `pack2x16float(weight, rest_length)` — the same shape the fine CSR
+    /// has, so `edge_offsets` and the virtual CSR stay slot-indexed.
     neigh: wgpu::Buffer,
     ewt: wgpu::Buffer,
     pos: wgpu::Buffer,
@@ -252,6 +258,10 @@ struct SeedCtx<'a> {
     fine_pos: &'a wgpu::Buffer,
     fine_off: &'a wgpu::Buffer,
     fine_neigh: &'a wgpu::Buffer,
+    /// Per-node inertia at the fine level: the `.w` slot of the force
+    /// engine's velocity words, copied into the relax scratch by
+    /// `seed_vel_mass`.
+    fine_vel: &'a wgpu::Buffer,
     options: &'a GpuForceOptions,
 }
 
@@ -260,6 +270,10 @@ struct LevelRef<'a> {
     off: &'a wgpu::Buffer,
     neigh: &'a wgpu::Buffer,
     ewt: &'a wgpu::Buffer,
+    /// vec4 buffer whose `.w` carries this level's per-node inertia for the
+    /// relax passes — its positions for a coarse level (`place_mass` writes
+    /// the child sum there), the fine velocity words at level 0.
+    mass_src: &'a wgpu::Buffer,
     pos: &'a wgpu::Buffer,
     virt_csr: &'a wgpu::Buffer,
     virt_eoff: &'a wgpu::Buffer,
@@ -411,7 +425,11 @@ impl GpuMultilevel {
             &[(3, true), (6, false), (7, true), (14, false)],
             &g1_params,
         );
-        let place_mass = mk("place_mass", &[(12, false), (14, false), (15, false)], &g1_params);
+        let place_mass = mk(
+            "place_mass",
+            &[(12, false), (14, false), (15, false)],
+            &g1_params,
+        );
         let row_of_slot = mk("row_of_slot", &[(0, true), (7, true), (8, false)], &g1_params);
         let expand_pairs = mk(
             "expand_pairs",
@@ -478,6 +496,7 @@ impl GpuMultilevel {
             &g1_params,
         );
         let seed_ball = mk("seed_ball", &[(12, false), (15, false)], &g1_params);
+        let seed_vel_mass = mk("seed_vel_mass", &[(32, true), (33, false)], &g1_params);
         let prolong = mk("prolong", &[(6, false), (7, true), (12, false), (30, true)], &g1_params);
         let spring_weighted = mk(
             "spring_step_weighted",
@@ -517,6 +536,7 @@ impl GpuMultilevel {
             coarse_nv,
             coarse_virt_fill,
             seed_ball,
+            seed_vel_mass,
             prolong,
             spring_weighted,
         };
@@ -535,7 +555,8 @@ impl GpuMultilevel {
                     slots_cap,
                     nv_cap,
                     off: storage_copy(device, "ml_off", (n_cap as u64 + 1) * u4),
-                    neigh: storage(device, "ml_neigh", slots_cap as u64 * u4),
+                    // Two u32 per directed slot (neighbour + packed physics).
+                    neigh: storage(device, "ml_neigh", 2 * slots_cap as u64 * u4),
                     ewt: storage(device, "ml_ewt", slots_cap as u64 * u4),
                     pos: storage_copy(device, "ml_pos", n_cap as u64 * v16),
                     virt_csr: storage_cd(device, "ml_virt_csr", (n_cap as u64 + 1 + nv_cap as u64) * u4),
@@ -729,6 +750,10 @@ impl GpuMultilevel {
         fine_neigh: &wgpu::Buffer,
         fine_virt_csr: &wgpu::Buffer,
         fine_virt_eoff: &wgpu::Buffer,
+        // Per-node inertia for `force_step` at the fine level: the `.w` of
+        // the force engine's velocity words. Its edge physics ride the
+        // packed `fine_neigh` array.
+        fine_vel: &wgpu::Buffer,
         fine_n_virtual: u32,
         options: &GpuForceOptions,
     ) {
@@ -741,6 +766,7 @@ impl GpuMultilevel {
             fine_pos,
             fine_off,
             fine_neigh,
+            fine_vel,
             options,
         };
         let spring_len = options.spring_len.max(1.0);
@@ -777,6 +803,7 @@ impl GpuMultilevel {
                 off: &coarse.off,
                 neigh: &coarse.neigh,
                 ewt: &coarse.ewt,
+                mass_src: &coarse.pos,
                 pos: &coarse.pos,
                 virt_csr: &coarse.virt_csr,
                 virt_eoff: &coarse.virt_eoff,
@@ -797,6 +824,7 @@ impl GpuMultilevel {
                 off: &finer.off,
                 neigh: &finer.neigh,
                 ewt: &finer.ewt,
+                mass_src: &finer.pos,
                 pos: &finer.pos,
                 virt_csr: &finer.virt_csr,
                 virt_eoff: &finer.virt_eoff,
@@ -824,6 +852,7 @@ impl GpuMultilevel {
                 off: fine_off,
                 neigh: fine_neigh,
                 ewt: &self.fine_ewt,
+                mass_src: ctx.fine_vel,
                 pos: fine_pos,
                 virt_csr: fine_virt_csr,
                 virt_eoff: fine_virt_eoff,
@@ -946,7 +975,11 @@ impl GpuMultilevel {
         let bg_place = kbg(
             device,
             &self.pipes.place_mass.g0,
-            &[(12, &coarse.pos), (14, &self.scratch.cmass), (15, &coarse.meta)],
+            &[
+                (12, &coarse.pos),
+                (14, &self.scratch.cmass),
+                (15, &coarse.meta),
+            ],
         );
         pass1(&mut enc, &self.pipes.place_mass.pipe, &bg_place, &pbg, dispatch_grid(coarse.n_cap));
 
@@ -1068,8 +1101,21 @@ impl GpuMultilevel {
             enc.copy_buffer_to_buffer(lv.meta, 4, &self.sim_params_buf, SIM_N_EDGES_OFFSET, 4);
         }
 
-        // Reset velocities for this level.
+        // Reset velocities for this level and re-seed the per-node inertia
+        // the reused `force_step` reads from their `.w` slot.
         enc.clear_buffer(&self.scratch.vel, 0, Some(lv.n_cap as u64 * 16));
+        let bg_vel = kbg(
+            device,
+            &self.pipes.seed_vel_mass.g0,
+            &[(32, lv.mass_src), (33, &self.scratch.vel)],
+        );
+        pass1(
+            &mut enc,
+            &self.pipes.seed_vel_mass.pipe,
+            &bg_vel,
+            &pbg,
+            dispatch_grid(lv.n_cap),
+        );
 
         match &prelude {
             Prelude::SeedBall { .. } => {
