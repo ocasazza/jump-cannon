@@ -20,3 +20,7 @@ Merge-time Metal Criterion runs publish their native reports as immutable Hydra
 build products. Compare retained Hydra results directly; benchmark derivations
 must not manage credentials, upload into a mutable dashboard store, or depend on
 an out-of-band format-conversion script.
+
+Graph metrics run on every reload, so their cost is part of load time.
+`just test bench` and the nightly `performance-bench-metrics` row measure each
+metric and `compute_all` on vault-shaped graphs of 1k, 10k, and 30k nodes.
