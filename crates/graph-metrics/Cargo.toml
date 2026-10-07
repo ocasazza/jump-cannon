@@ -8,3 +8,6 @@ description = "Graph metric computation for VaultGraph (degree, PageRank, betwee
 vault-data = { path = "../vault-data" }
 petgraph   = { workspace = true }
 rand       = { workspace = true }
+
+[dev-dependencies]
+proptest = "1"

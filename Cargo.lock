@@ -1841,6 +1841,7 @@ name = "graph-metrics"
 version = "1.0.0"
 dependencies = [
  "petgraph 0.6.5",
+ "proptest",
  "rand 0.8.7",
  "vault-data",
 ]
@@ -1850,6 +1851,7 @@ name = "graph-vcs"
 version = "1.0.0"
 dependencies = [
  "minigraf",
+ "proptest",
  "reqwest 0.12.28",
  "serde",
  "serde_json",

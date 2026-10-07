@@ -2,7 +2,7 @@
 #
 #   just test                  full suite (native cargo + Rust browser smoke)
 #   just test cargo            native unit + integration (incl. regression.rs + fuzz.rs at default volume)
-#   just test fuzz [CASES]     property-based fuzz: graph-layouts + graph-compute engines (default 10000)
+#   just test fuzz [CASES]     property-based fuzz: layouts, compute engines, graph metrics, VCS merge (default 10000)
 #   just test bench            criterion benches across layouts; HTML in target/criterion/
 #   just test canary [URL]     live-cluster gRPC smoke (default http://[::1]:50051)
 #   just test geometric        geometric engine: solved-case canary + regression golden + perf
@@ -26,13 +26,16 @@ all: cargo browser-rust
 cargo:
     cargo test --workspace
 
-# Property-based fuzz over graph-layouts layouts + graph-compute engines.
+# Property-based fuzz over graph-layouts layouts, graph-compute engines,
+# graph-metrics (against reference algorithms), and the graph-vcs merge laws.
 # CASES sets PROPTEST_CASES (default 10000).
 [group('test')]
-[doc('Property-based fuzz: graph-layouts + graph-compute engines (CASES, default 10000)')]
+[doc('Property-based fuzz: layouts, compute engines, graph metrics, VCS merge (CASES, default 10000)')]
 fuzz cases='10000':
     PROPTEST_CASES={{cases}} cargo test -p graph-layouts --test fuzz --release
     PROPTEST_CASES={{cases}} cargo test -p graph-compute --test fuzz --release
+    PROPTEST_CASES={{cases}} cargo test -p graph-metrics --test properties --release
+    PROPTEST_CASES={{cases}} cargo test -p graph-vcs --test merge_laws --release
 
 # Criterion benches across static layouts; HTML report in target/criterion/.
 [group('test')]
