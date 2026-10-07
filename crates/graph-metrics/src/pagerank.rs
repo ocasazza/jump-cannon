@@ -18,23 +18,25 @@ pub fn compute_pagerank(graph: &mut VaultGraph, damping: f64, iters: usize) {
         }
     }
 
+    let mut new_scores = vec![0.0f64; n];
     for _ in 0..iters {
-        let mut new_scores = vec![(1.0 - damping) / n as f64; n];
+        // Dangling nodes spread their rank uniformly; fold that into the base.
+        let dangling: f64 = out_neighbors
+            .iter()
+            .zip(&scores)
+            .filter(|(neighbors, _)| neighbors.is_empty())
+            .map(|(_, s)| s)
+            .sum();
+        new_scores.fill(((1.0 - damping) + damping * dangling) / n as f64);
         for (i, neighbors) in out_neighbors.iter().enumerate() {
-            if neighbors.is_empty() {
-                // Dangling node: distribute evenly
-                let share = damping * scores[i] / n as f64;
-                for j in 0..n {
-                    new_scores[j] += share;
-                }
-            } else {
+            if !neighbors.is_empty() {
                 let share = damping * scores[i] / neighbors.len() as f64;
                 for &j in neighbors {
                     new_scores[j] += share;
                 }
             }
         }
-        scores = new_scores;
+        std::mem::swap(&mut scores, &mut new_scores);
     }
 
     for (i, id) in ids.iter().enumerate() {
