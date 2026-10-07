@@ -1,3 +1,4 @@
+use rand::{rngs::StdRng, Rng, SeedableRng};
 use std::collections::{HashMap, HashSet};
 use vault_data::VaultGraph;
 
@@ -33,14 +34,7 @@ pub fn compute_louvain(graph: &mut VaultGraph, max_outer_iter: usize) {
     }
 
     // Collapse parallel edges into a single weighted edge per neighbor.
-    let mut adj: Vec<Vec<(usize, f64)>> = Vec::with_capacity(n_orig);
-    for nbrs in adj_raw.into_iter() {
-        let mut combined: HashMap<usize, f64> = HashMap::with_capacity(nbrs.len());
-        for (j, w) in nbrs {
-            *combined.entry(j).or_insert(0.0) += w;
-        }
-        adj.push(combined.into_iter().collect());
-    }
+    let adj: Vec<Vec<(usize, f64)>> = adj_raw.into_iter().map(merge_sorted).collect();
 
     // Handle the no-edges case explicitly.
     let total_weight: f64 = adj
@@ -154,7 +148,12 @@ fn phase1_local_optimization(adj: &[Vec<(usize, f64)>]) -> Vec<usize> {
     }
 
     let mut sigma_tot: Vec<f64> = ki.clone();
-
+    let mut k_v_to_c = vec![0.0f64; n];
+    let mut seen = vec![false; n];
+    let mut touched: Vec<usize> = Vec::new();
+    // Random tie-breaks find higher-modularity partitions than first-seen
+    // ones; the fixed seed keeps the result identical across runs.
+    let mut rng = StdRng::seed_from_u64(0x10_0b_a1);
     let mut changed = true;
     let mut guard = 0usize;
     while changed && guard < 50 {
@@ -168,11 +167,14 @@ fn phase1_local_optimization(adj: &[Vec<(usize, f64)>]) -> Vec<usize> {
             // Self-loops are stored with weight 2*w (doubled per the
             // undirected-adjacency convention used by ki); halve when
             // counting them as a single edge into v's own community.
-            let mut k_v_to_c: HashMap<usize, f64> = HashMap::new();
             for &(u, w) in &adj[v] {
                 let cu = community[u];
                 let contrib = if u == v { w * 0.5 } else { w };
-                *k_v_to_c.entry(cu).or_insert(0.0) += contrib;
+                if !seen[cu] {
+                    seen[cu] = true;
+                    touched.push(cu);
+                }
+                k_v_to_c[cu] += contrib;
             }
 
             // Remove v from its current community.
@@ -182,14 +184,27 @@ fn phase1_local_optimization(adj: &[Vec<(usize, f64)>]) -> Vec<usize> {
             // Default best = stay in cv with gain 0 (pre-move modularity reference).
             let mut best_c = cv;
             let mut best_gain = 0.0f64;
+            let mut ties = 0u32;
 
-            for (&c, &k_v_in_c) in &k_v_to_c {
-                let gain = k_v_in_c / m - ki[v] * sigma_tot[c] / (2.0 * m * m);
+            for &c in &touched {
+                let gain = k_v_to_c[c] / m - ki[v] * sigma_tot[c] / (2.0 * m * m);
                 if gain > best_gain {
                     best_gain = gain;
                     best_c = c;
+                    ties = 1;
+                } else if gain == best_gain && ties > 0 {
+                    // Reservoir sampling: each tied community wins with p = 1/ties.
+                    ties += 1;
+                    if rng.gen_range(0..ties) == 0 {
+                        best_c = c;
+                    }
                 }
             }
+            for &c in &touched {
+                k_v_to_c[c] = 0.0;
+                seen[c] = false;
+            }
+            touched.clear();
 
             // Insert v into best community.
             sigma_tot[best_c] += ki[v];
@@ -223,7 +238,7 @@ fn phase2_aggregate(
         .collect();
     let k = next_id;
 
-    let mut super_adj_map: Vec<HashMap<usize, f64>> = vec![HashMap::new(); k];
+    let mut super_adj: Vec<Vec<(usize, f64)>> = vec![Vec::new(); k];
     for (i, nbrs) in adj.iter().enumerate() {
         let ci = comm_compacted[i];
         for &(j, w) in nbrs {
@@ -237,27 +252,36 @@ fn phase2_aggregate(
             // both nbr entries summing without halving — but we DO halve,
             // matching the undirected adjacency convention used by phase1
             // where ki = sum(w) over the doubled adjacency = 2m).
-            *super_adj_map[ci].entry(cj).or_insert(0.0) += w * 0.5;
+            super_adj[ci].push((cj, w * 0.5));
         }
     }
+    let mut super_adj: Vec<Vec<(usize, f64)>> = super_adj.into_iter().map(merge_sorted).collect();
 
     // For phase1 to see ki = 2m at the next level, self-loops must be
     // counted twice in the per-node degree. Convert: store self-loop weight
     // s, but emit it as a single (i,i,2s) entry so iteration yields 2s for
     // ki. We've halved above; double self-loops to restore the "edge
     // appears twice" convention.
-    for (i, map) in super_adj_map.iter_mut().enumerate() {
-        if let Some(w) = map.get_mut(&i) {
+    for (i, nbrs) in super_adj.iter_mut().enumerate() {
+        if let Some((_, w)) = nbrs.iter_mut().find(|(j, _)| *j == i) {
             *w *= 2.0;
         }
     }
 
-    let super_adj: Vec<Vec<(usize, f64)>> = super_adj_map
-        .into_iter()
-        .map(|map| map.into_iter().collect())
-        .collect();
-
     (super_adj, compact)
+}
+
+/// Sort a neighbour list by index and sum the weights of repeated neighbours.
+fn merge_sorted(mut nbrs: Vec<(usize, f64)>) -> Vec<(usize, f64)> {
+    nbrs.sort_by_key(|&(j, _)| j);
+    let mut out: Vec<(usize, f64)> = Vec::with_capacity(nbrs.len());
+    for (j, w) in nbrs {
+        match out.last_mut() {
+            Some((last, acc)) if *last == j => *acc += w,
+            _ => out.push((j, w)),
+        }
+    }
+    out
 }
 
 fn compact_community(community: &[usize]) -> Vec<usize> {
