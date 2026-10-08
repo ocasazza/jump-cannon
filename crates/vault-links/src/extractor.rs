@@ -165,8 +165,6 @@ where
             .unwrap_or_default();
 
         let meta = NodeMeta {
-            source_id: "obsidian".into(),
-            title: note.title.clone(),
             tags: note.tags.clone(),
             frontmatter: note.frontmatter.clone(),
             mtime: *mtime as i64,
@@ -178,6 +176,7 @@ where
             content_type: Some("text/markdown".into()),
             content_readable: true,
             content_writable: true,
+            ..NodeMeta::new("obsidian", note.title.clone())
         };
 
         graph.add_node(VaultNode {

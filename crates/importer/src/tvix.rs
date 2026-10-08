@@ -610,8 +610,6 @@ pub fn convert_generated_graph(
         }
 
         let meta = NodeMeta {
-            source_id: source_id.to_owned(),
-            title,
             tags,
             frontmatter,
             mtime: 0,
@@ -621,6 +619,7 @@ pub fn convert_generated_graph(
             content_type: None,
             content_readable: false,
             content_writable: false,
+            ..NodeMeta::new(source_id.to_owned(), title)
         };
         graph.add_node(VaultNode {
             id: node_id,
