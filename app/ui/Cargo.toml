@@ -84,4 +84,5 @@ miniz_oxide = "0.8"
 vault-links = { path = "../../crates/vault-links" }
 data-loader = { path = "../../crates/data-loader" }
 vault-data = { path = "../../crates/vault-data" }
+graph-metrics = { path = "../../crates/graph-metrics" }
 tvix-wasm = { path = "../../crates/tvix-wasm" }
