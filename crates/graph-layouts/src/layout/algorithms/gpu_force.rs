@@ -640,22 +640,26 @@ pub struct EdgePhysics {
     pub rest_length: f32,
 }
 
-/// Default per-node physics when the caller supplies none: the engine's
-/// historical hub weighting `1 + log2(degree)` for both the inertia and the
-/// repulsion charge.
-fn default_node_physics(degree: usize) -> NodePhysics {
-    let d = 1.0 + (degree.max(1) as f32).log2();
-    NodePhysics {
-        mass: d,
-        repulsion: d,
+impl NodePhysics {
+    /// The engine's default when the caller supplies none: the hub weighting
+    /// `1 + log2(degree)` for both the inertia and the repulsion charge, where
+    /// `degree` counts non-self-loop edge endpoints.
+    pub fn for_degree(degree: usize) -> Self {
+        let d = 1.0 + (degree.max(1) as f32).log2();
+        NodePhysics {
+            mass: d,
+            repulsion: d,
+        }
     }
 }
 
-/// Default per-edge physics when the caller supplies none.
-const DEFAULT_EDGE_PHYSICS: EdgePhysics = EdgePhysics {
-    weight: 1.0,
-    rest_length: 1.0,
-};
+impl EdgePhysics {
+    /// The engine's default when the caller supplies none.
+    pub const DEFAULT: EdgePhysics = EdgePhysics {
+        weight: 1.0,
+        rest_length: 1.0,
+    };
+}
 
 
 /// Owns the wgpu device + queue when the layout is constructed via the
@@ -1771,7 +1775,7 @@ fn precompute_csr(
     let phys_of = |ord: u32| -> EdgePhysics {
         edge_physics
             .and_then(|e| e.get(ord as usize).copied())
-            .unwrap_or(DEFAULT_EDGE_PHYSICS)
+            .unwrap_or(EdgePhysics::DEFAULT)
     };
     let mut edge_offsets: Vec<u32> = Vec::with_capacity(n + 1);
     let mut edge_neighbors: Vec<u32> = Vec::new();
@@ -1793,10 +1797,10 @@ fn precompute_csr(
     if edge_neighbors.is_empty() {
         edge_neighbors.push(0);
         edge_neighbors.push(pack2x16float(
-            DEFAULT_EDGE_PHYSICS.weight,
-            DEFAULT_EDGE_PHYSICS.rest_length,
+            EdgePhysics::DEFAULT.weight,
+            EdgePhysics::DEFAULT.rest_length,
         ));
-        edge_physics_v.push(DEFAULT_EDGE_PHYSICS);
+        edge_physics_v.push(EdgePhysics::DEFAULT);
         slot_edge_ord.push(0);
     }
     let physics: Vec<NodePhysics> = adj
@@ -1805,7 +1809,7 @@ fn precompute_csr(
         .map(|(i, ns)| {
             node_physics
                 .and_then(|p| p.get(i).copied())
-                .unwrap_or_else(|| default_node_physics(ns.len()))
+                .unwrap_or_else(|| NodePhysics::for_degree(ns.len()))
         })
         .collect();
     // Pack the repulsion charge into positions[i].w so the Barnes-Hut octree
