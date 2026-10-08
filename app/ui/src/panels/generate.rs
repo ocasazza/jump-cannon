@@ -32,6 +32,7 @@ use std::collections::HashMap;
 use dioxus::prelude::*;
 use gloo_net::http::Request;
 use gloo_storage::{LocalStorage, Storage};
+use graph_layouts::{EdgePhysics, NodePhysics};
 use serde::{Deserialize, Serialize};
 
 use crate::api::{err, url};
@@ -195,6 +196,10 @@ struct Persisted {
     /// (mirrors the graph-api `--seed` generate flag; absent = seed 0).
     #[serde(default)]
     gen_seed: u64,
+    /// One-shot: evaluate `source` at the next boot instead of loading the
+    /// server graph. Set by example sessions, whose state apply reloads.
+    #[serde(default)]
+    evaluate_on_load: bool,
 }
 
 impl Default for Persisted {
@@ -208,6 +213,7 @@ impl Default for Persisted {
             soup_radius: 40.0,
             soup_seed: 1,
             gen_seed: 0,
+            evaluate_on_load: false,
         }
     }
 }
@@ -228,8 +234,33 @@ fn persist() {
         soup_radius: *SOUP_RADIUS.read(),
         soup_seed: *SOUP_SEED.read(),
         gen_seed: *GEN_SEED.read(),
+        evaluate_on_load: false,
     };
     let _ = LocalStorage::set(STORE_KEY, &p);
+}
+
+/// The expression of the catalog demo named `name`.
+pub(crate) fn demo_expr(name: &str) -> Option<&'static str> {
+    demos().iter().find(|d| d.name == name).map(|d| d.expr)
+}
+
+/// Stage `expr` in the editor and mark it for evaluation at the next boot.
+pub(crate) fn stage_boot_evaluation(expr: &str) {
+    let mut p = restore();
+    p.source = expr.to_string();
+    p.evaluate_on_load = true;
+    let _ = LocalStorage::set(STORE_KEY, &p);
+}
+
+/// Consume the boot evaluation staged by [`stage_boot_evaluation`].
+pub(crate) fn take_boot_evaluation() -> bool {
+    let mut p = restore();
+    if !p.evaluate_on_load {
+        return false;
+    }
+    p.evaluate_on_load = false;
+    let _ = LocalStorage::set(STORE_KEY, &p);
+    true
 }
 
 // --- panel-local state -------------------------------------------------------------
@@ -271,8 +302,8 @@ async fn post_json<B: Serialize, T: serde::de::DeserializeOwned>(
 }
 
 /// `toGraphJSON`'s `{ nodes, links }` shape, as embedded in the /generate
-/// response (`GeneratePostResp.graph`). Extra per-node fields (`kind`, …) are
-/// ignored — only identity and topology feed the renderer.
+/// response (`GeneratePostResp.graph`). Besides identity and topology only the
+/// optional physics attributes are read; other per-node fields are ignored.
 #[derive(Clone, Debug, Deserialize)]
 struct GeneratedGraph {
     #[serde(default)]
@@ -281,15 +312,27 @@ struct GeneratedGraph {
     links: Vec<GenLink>,
 }
 
+/// `mass` and `charge` multiply the engine's degree-weighted default inertia
+/// and repulsion charge for the GPU force sim.
 #[derive(Clone, Debug, Deserialize)]
 struct GenNode {
     id: String,
+    #[serde(default)]
+    mass: Option<f32>,
+    #[serde(default)]
+    charge: Option<f32>,
 }
 
+/// `weight` multiplies the spring stiffness and `restLength` the spring's
+/// rest length for the GPU force sim.
 #[derive(Clone, Debug, Deserialize)]
 struct GenLink {
     source: String,
     target: String,
+    #[serde(default)]
+    weight: Option<f32>,
+    #[serde(default, rename = "restLength")]
+    rest_length: Option<f32>,
 }
 
 /// `POST /generate` — soft-error contract: HTTP 200 with `ok:false` carries the
@@ -365,12 +408,25 @@ async fn eval_worker(expr: &str) -> Result<GeneratedGraph, String> {
 /// response shape). Shared by the Inline and LocalWorker executors so all
 /// three backends feed the same promotion path.
 fn convert_generated(g: tvix_wasm::GeneratedGraph) -> GeneratedGraph {
+    let number = |m: &std::collections::BTreeMap<String, serde_json::Value>, key: &str| {
+        m.get(key).and_then(serde_json::Value::as_f64).map(|v| v as f32)
+    };
     GeneratedGraph {
-        nodes: g.nodes.into_iter().map(|n| GenNode { id: n.id }).collect(),
+        nodes: g
+            .nodes
+            .into_iter()
+            .map(|n| GenNode {
+                mass: number(&n.metadata, "mass"),
+                charge: number(&n.metadata, "charge"),
+                id: n.id,
+            })
+            .collect(),
         links: g
             .edges
             .into_iter()
             .map(|e| GenLink {
+                weight: number(&e.metadata, "weight"),
+                rest_length: number(&e.metadata, "restLength"),
                 source: e.source,
                 target: e.target,
             })
@@ -452,15 +508,9 @@ fn graph_data_from_generated(g: &GeneratedGraph) -> GraphData {
     }
     let n = ids.len();
 
-    let mut edges: Vec<u32> = Vec::with_capacity(g.links.len() * 2);
-    for e in &g.links {
-        let (Some(&s), Some(&t)) = (id_to_idx.get(&e.source), id_to_idx.get(&e.target)) else {
-            continue;
-        };
-        edges.push(s);
-        edges.push(t);
-    }
+    let (edges, edge_physics) = generated_edges(g, &id_to_idx);
     let n_edges = (edges.len() / 2) as u32;
+    let node_physics = generated_node_physics(g, &id_to_idx, &edges, n);
 
     // Honour the Layout panel's Initial-seed strategy for the generated
     // graph's INITIAL positions, instead of always imposing the default sphere
@@ -485,8 +535,140 @@ fn graph_data_from_generated(g: &GeneratedGraph) -> GraphData {
             edges,
             colors,
             sizes,
+            node_physics,
+            edge_physics,
         },
     }
+}
+
+/// Edge endpoints in renderer order, and per-edge physics aligned with them
+/// (`None` when no link sets `weight` or `restLength`). Links with an unknown
+/// endpoint are dropped from both.
+fn generated_edges(
+    g: &GeneratedGraph,
+    id_to_idx: &HashMap<String, u32>,
+) -> (Vec<u32>, Option<Vec<EdgePhysics>>) {
+    let mut edges: Vec<u32> = Vec::with_capacity(g.links.len() * 2);
+    let mut springs: Vec<EdgePhysics> = Vec::with_capacity(g.links.len());
+    for e in &g.links {
+        let (Some(&s), Some(&t)) = (id_to_idx.get(&e.source), id_to_idx.get(&e.target)) else {
+            continue;
+        };
+        edges.push(s);
+        edges.push(t);
+        springs.push(EdgePhysics {
+            weight: e.weight.unwrap_or(EdgePhysics::DEFAULT.weight),
+            rest_length: e.rest_length.unwrap_or(EdgePhysics::DEFAULT.rest_length),
+        });
+    }
+    let any = g.links.iter().any(|e| e.weight.is_some() || e.rest_length.is_some());
+    (edges, any.then_some(springs))
+}
+
+/// Per-node physics for a generated graph, or `None` when no node sets
+/// `mass` or `charge`. Each attribute multiplies the engine default for the
+/// node's degree; the first node with a given id wins, as in `id_to_idx`.
+fn generated_node_physics(
+    g: &GeneratedGraph,
+    id_to_idx: &HashMap<String, u32>,
+    edges: &[u32],
+    n: usize,
+) -> Option<Vec<NodePhysics>> {
+    if !g.nodes.iter().any(|node| node.mass.is_some() || node.charge.is_some()) {
+        return None;
+    }
+    let mut degree = vec![0usize; n];
+    for pair in edges.chunks_exact(2) {
+        if pair[0] != pair[1] {
+            degree[pair[0] as usize] += 1;
+            degree[pair[1] as usize] += 1;
+        }
+    }
+    let mut scale: Vec<Option<(f32, f32)>> = vec![None; n];
+    for node in &g.nodes {
+        let slot = &mut scale[id_to_idx[&node.id] as usize];
+        if slot.is_none() {
+            *slot = Some((node.mass.unwrap_or(1.0), node.charge.unwrap_or(1.0)));
+        }
+    }
+    Some(
+        (0..n)
+            .map(|i| {
+                let base = NodePhysics::for_degree(degree[i]);
+                let (mass, charge) = scale[i].unwrap_or((1.0, 1.0));
+                NodePhysics { mass: base.mass * mass, repulsion: base.repulsion * charge }
+            })
+            .collect(),
+    )
+}
+
+// Evaluate — the egui flow queues a one-shot request and `App::update`
+// dispatches it to the picked `ExecutionBackend`; here the dispatch is an
+// async task off the click (or off boot, for an example session). Server
+// evaluates over async HTTP; Inline runs tvix-wasm in the browser; Auto
+// prefers Server and falls back to a Web Worker when graph-api is unreachable.
+pub(crate) fn run_evaluation(ctx: Ctx) {
+    if *RUNNING.read() || SOURCE.read().trim().is_empty() {
+        return;
+    }
+    let backend = *BACKEND.read();
+    let src = SOURCE.read().clone();
+    *RUNNING.write() = true;
+    *ERROR.write() = None;
+    *STATUS.write() = Some("queued…".to_string());
+    spawn(async move {
+        let (result, evaluator) = match backend {
+            Backend::Server => {
+                *STATUS.write() = Some("evaluating on the server…".to_string());
+                (generate(&src).await, "server")
+            }
+            Backend::Inline => {
+                *STATUS.write() = Some("evaluating locally…".to_string());
+                (eval_inline(&src).await, "inline")
+            }
+            Backend::LocalWorker => {
+                *STATUS.write() = Some("evaluating in a Web Worker…".to_string());
+                (eval_worker(&src).await, "web worker")
+            }
+            Backend::Auto => {
+                *STATUS.write() = Some("evaluating on the server…".to_string());
+                match generate_server(&src, *GEN_SEED.read()).await {
+                    ServerEval::Graph(g) => (Ok(g), "server"),
+                    // A real eval error from a reachable server — surface
+                    // it; falling back would just re-pay the eval.
+                    ServerEval::EvalErr(e) => (Err(e), "server"),
+                    // Unreachable → the non-freeze local fallback (egui
+                    // resolve_generate_backend's wasm Auto → LocalWorker).
+                    ServerEval::Unreachable(_) => {
+                        *STATUS.write() = Some(
+                            "server unreachable — evaluating in a Web Worker…".to_string(),
+                        );
+                        (eval_worker(&src).await, "web worker")
+                    }
+                }
+            }
+        };
+        match result {
+            Ok(g) => {
+                // Replace the live graph client-side (the egui pending →
+                // Bootstrap → GPU promotion path). `/generate` does not
+                // host the result, so a server reload would discard it —
+                // mount the converted scene directly instead.
+                let gd = graph_data_from_generated(&g);
+                *STATUS.write() = Some(format!(
+                    "{} nodes, {} edges — client-only graph (server tools disabled)",
+                    gd.n_nodes, gd.n_edges
+                ));
+                *ERROR.write() = None;
+                crate::replace_with_client_graph(ctx, gd, evaluator);
+            }
+            Err(e) => {
+                *ERROR.write() = Some(e);
+                *STATUS.write() = None;
+            }
+        }
+        *RUNNING.write() = false;
+    });
 }
 
 // --- panel ---------------------------------------------------------------------------
@@ -498,74 +680,7 @@ pub fn panel(ctx: Ctx) -> Element {
     let backend = *BACKEND.read();
     let soup_idx = (*SOUP_EXAMPLE.read()).min(SOUP_EXAMPLES.len() - 1);
 
-    // Evaluate — the egui flow queues a one-shot request and `App::update`
-    // dispatches it to the picked `ExecutionBackend`; here the dispatch is an
-    // async task off the click. Server evaluates over async HTTP; Inline runs
-    // tvix-wasm in the browser; Auto prefers Server and falls back to Inline
-    // when graph-api is unreachable.
-    let evaluate = move |_| {
-        if *RUNNING.read() || SOURCE.read().trim().is_empty() {
-            return;
-        }
-        let backend = *BACKEND.read();
-        let src = SOURCE.read().clone();
-        *RUNNING.write() = true;
-        *ERROR.write() = None;
-        *STATUS.write() = Some("queued…".to_string());
-        spawn(async move {
-            let (result, evaluator) = match backend {
-                Backend::Server => {
-                    *STATUS.write() = Some("evaluating on the server…".to_string());
-                    (generate(&src).await, "server")
-                }
-                Backend::Inline => {
-                    *STATUS.write() = Some("evaluating locally…".to_string());
-                    (eval_inline(&src).await, "inline")
-                }
-                Backend::LocalWorker => {
-                    *STATUS.write() = Some("evaluating in a Web Worker…".to_string());
-                    (eval_worker(&src).await, "web worker")
-                }
-                Backend::Auto => {
-                    *STATUS.write() = Some("evaluating on the server…".to_string());
-                    match generate_server(&src, *GEN_SEED.read()).await {
-                        ServerEval::Graph(g) => (Ok(g), "server"),
-                        // A real eval error from a reachable server — surface
-                        // it; falling back would just re-pay the eval.
-                        ServerEval::EvalErr(e) => (Err(e), "server"),
-                        // Unreachable → the non-freeze local fallback (egui
-                        // resolve_generate_backend's wasm Auto → LocalWorker).
-                        ServerEval::Unreachable(_) => {
-                            *STATUS.write() = Some(
-                                "server unreachable — evaluating in a Web Worker…".to_string(),
-                            );
-                            (eval_worker(&src).await, "web worker")
-                        }
-                    }
-                }
-            };
-            match result {
-                Ok(g) => {
-                    // Replace the live graph client-side (the egui pending →
-                    // Bootstrap → GPU promotion path). `/generate` does not
-                    // host the result, so a server reload would discard it —
-                    // mount the converted scene directly instead.
-                    let gd = graph_data_from_generated(&g);
-                    *STATUS.write() = Some(format!(
-                        "{} nodes, {} edges — client-only graph (server tools disabled)",
-                        gd.n_nodes, gd.n_edges
-                    ));
-                    *ERROR.write() = None;
-                    crate::replace_with_client_graph(ctx, gd, evaluator);
-                }
-                Err(e) => {
-                    *ERROR.write() = Some(e);
-                    *STATUS.write() = None;
-                }
-            }
-            *RUNNING.write() = false;
-        });
-    };
+    let evaluate = move |_| run_evaluation(ctx);
 
     // Run the self-assembly demo: host the soup + select Geometric (GPU) with
     // the membrane regime server-side, then reload the hosted graph.
@@ -850,5 +965,58 @@ pub fn panel(ctx: Ctx) -> Element {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn graph(json: &str) -> (GeneratedGraph, HashMap<String, u32>) {
+        let g: GeneratedGraph = serde_json::from_str(json).unwrap();
+        let ids = g.nodes.iter().enumerate().map(|(i, n)| (n.id.clone(), i as u32)).collect();
+        (g, ids)
+    }
+
+    #[test]
+    fn edge_physics_stays_aligned_when_a_link_is_dropped() {
+        let (g, ids) = graph(
+            r#"{"nodes":[{"id":"a"},{"id":"b"},{"id":"c"}],
+                "links":[{"source":"a","target":"b","weight":2},
+                         {"source":"a","target":"missing","weight":9},
+                         {"source":"b","target":"c","restLength":3}]}"#,
+        );
+        let (edges, physics) = generated_edges(&g, &ids);
+        assert_eq!(edges, vec![0, 1, 1, 2]);
+        assert_eq!(
+            physics.unwrap(),
+            vec![
+                EdgePhysics { weight: 2.0, rest_length: 1.0 },
+                EdgePhysics { weight: 1.0, rest_length: 3.0 },
+            ]
+        );
+    }
+
+    #[test]
+    fn node_attributes_scale_the_degree_default() {
+        let (g, ids) = graph(
+            r#"{"nodes":[{"id":"hub","charge":4},{"id":"x","mass":0.5},{"id":"y"}],
+                "links":[{"source":"hub","target":"x"},{"source":"hub","target":"y"}]}"#,
+        );
+        let (edges, _) = generated_edges(&g, &ids);
+        let physics = generated_node_physics(&g, &ids, &edges, 3).unwrap();
+        let hub = NodePhysics::for_degree(2);
+        let leaf = NodePhysics::for_degree(1);
+        assert_eq!(physics[0], NodePhysics { mass: hub.mass, repulsion: hub.repulsion * 4.0 });
+        assert_eq!(physics[1], NodePhysics { mass: leaf.mass * 0.5, repulsion: leaf.repulsion });
+        assert_eq!(physics[2], leaf);
+    }
+
+    #[test]
+    fn graphs_without_physics_attributes_keep_engine_defaults() {
+        let (g, ids) = graph(r#"{"nodes":[{"id":"a"},{"id":"b"}],"links":[{"source":"a","target":"b"}]}"#);
+        let (edges, edge_physics) = generated_edges(&g, &ids);
+        assert!(edge_physics.is_none());
+        assert!(generated_node_physics(&g, &ids, &edges, 2).is_none());
     }
 }

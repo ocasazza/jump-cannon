@@ -35,8 +35,8 @@ use crate::render::region_map::{RegionMap, RegionMapConfig, RegionMode};
 use bytemuck::{Pod, Zeroable};
 use glam::{Mat4, Vec3, Vec4};
 use graph_layouts::{
-    BoxedPhysics, CsrInput, DynPhysicsLayout, DynStaticLayout, Edge as GlEdge, GpuForceLayout,
-    GpuForceOptions, Graph as GlGraph, Node as GlNode,
+    BoxedPhysics, CsrInput, DynPhysicsLayout, DynStaticLayout, Edge as GlEdge, EdgePhysics,
+    GpuForceLayout, GpuForceOptions, Graph as GlGraph, Node as GlNode, NodePhysics,
 };
 use std::sync::{Arc, Mutex};
 use wgpu::util::DeviceExt;
@@ -85,6 +85,12 @@ pub struct GraphData {
     pub edges: Vec<u32>,     // [src,tgt, ...] length = 2*m
     pub colors: Vec<f32>,    // [r,g,b,a, ...] length = 4*n
     pub sizes: Vec<f32>,     // length = n
+    /// Per-node physics, one entry per node; `None` or a mismatched length
+    /// uses the engine default `1 + log2(degree)` for inertia and charge.
+    pub node_physics: Option<Vec<NodePhysics>>,
+    /// Per-edge physics, one entry per edge in `edges` order; `None` or a
+    /// mismatched length uses weight 1 and rest length 1.
+    pub edge_physics: Option<Vec<EdgePhysics>>,
 }
 
 #[repr(C)]
@@ -292,6 +298,10 @@ struct Buffers {
     colors_base: Vec<f32>,
     sizes_base: Vec<f32>,
     edges_cpu: Vec<u32>,
+    /// Physics carried through the `set_positions` / `swap_physics_layout`
+    /// re-inits so a re-seeded sim keeps the values it was running with.
+    node_physics_cpu: Option<Vec<NodePhysics>>,
+    edge_physics_cpu: Option<Vec<EdgePhysics>>,
 
     /// MAP_READ | COPY_DST staging buffer for the async GPU→CPU
     /// positions readback. Sized `n_nodes * 16` bytes (vec4 stride to
@@ -623,6 +633,8 @@ impl GraphPipelines {
         // mode (device-side multilevel coarsening above 10k nodes); the sphere
         // seed carried in `graph.positions` reaches the layout through
         // `CsrInput.positions`.
+        let node_physics = graph.node_physics.filter(|p| p.len() == n_nodes as usize);
+        let edge_physics = graph.edge_physics.filter(|p| p.len() == graph.edges.len() / 2);
         let layout: Option<Box<dyn DynPhysicsLayout>> = {
             let mut boxed: Box<dyn DynPhysicsLayout> = Box::new(BoxedPhysics::new(
                 GpuForceLayout::new(GpuForceOptions::for_n_nodes(n_nodes as usize)),
@@ -634,6 +646,8 @@ impl GraphPipelines {
                 &positions,
                 &graph.positions,
                 &graph.edges,
+                node_physics.as_deref(),
+                edge_physics.as_deref(),
             ) {
                 Ok(()) => Some(boxed),
                 Err(e) => {
@@ -679,6 +693,8 @@ impl GraphPipelines {
             colors_base,
             sizes_base,
             edges_cpu: graph.edges,
+            node_physics_cpu: node_physics,
+            edge_physics_cpu: edge_physics,
             positions_staging,
             positions_readback: Arc::new(Mutex::new(PositionsReadbackState::Idle)),
             positions_frame_idx: 0,
@@ -1787,6 +1803,8 @@ impl GraphPipelines {
                 &b.positions,
                 &b.positions_cpu,
                 &b.edges_cpu,
+                b.node_physics_cpu.as_deref(),
+                b.edge_physics_cpu.as_deref(),
             ) {
                 tracing::warn!("[render] set_positions: layout re-init failed: {e}");
             }
@@ -1818,6 +1836,8 @@ impl GraphPipelines {
             &b.positions,
             &b.positions_cpu,
             &b.edges_cpu,
+            b.node_physics_cpu.as_deref(),
+            b.edge_physics_cpu.as_deref(),
         ) {
             Ok(()) => {
                 b.layout = Some(layout);
@@ -2006,6 +2026,7 @@ fn build_topology_graph(positions: &[f32], edges: &[u32]) -> GlGraph {
 /// and only that one — we fall back to the string-keyed `Graph` path built
 /// on demand. Any other error is a genuine init failure surfaced to the
 /// caller, which logs it and drops the layout, exactly as before.
+#[allow(clippy::too_many_arguments)]
 fn init_physics_layout(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
@@ -2013,13 +2034,15 @@ fn init_physics_layout(
     positions_buf: &wgpu::Buffer,
     positions_cpu: &[f32],
     edges_cpu: &[u32],
+    node_physics: Option<&[NodePhysics]>,
+    edge_physics: Option<&[EdgePhysics]>,
 ) -> Result<(), String> {
     let input = CsrInput {
         n_nodes: (positions_cpu.len() / 3) as u32,
         edges: edges_cpu,
         positions: Some(positions_cpu),
-        node_physics: None,
-        edge_physics: None,
+        node_physics,
+        edge_physics,
     };
     match layout.init_with_device_csr(device, queue, &input, positions_buf) {
         Ok(()) => Ok(()),

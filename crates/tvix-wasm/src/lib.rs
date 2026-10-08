@@ -586,6 +586,48 @@ in
 "#,
     },
     Demo {
+        name: "Communities (per-edge springs)",
+        expr: r#"# Per-edge physics for the GPU force layout. A link's `weight`
+# multiplies its spring stiffness and `restLength` its rest length (both
+# default 1). Short stiff springs inside each community and long weak ones
+# between them pull the four communities apart; delete the two attributes
+# to see the same graph as one tangle.
+let
+  g = import /jc/src/graph.nix {};
+  base = g.clustered { nodes = 400; edges = 1200; clusters = 4; affinity = 0.9; seed = 7; };
+  cluster = builtins.listToAttrs (map (n: { name = n.id; value = n.type; }) base.nodes);
+  spring = e:
+    if cluster.${e.source} == cluster.${e.target}
+    then e // { weight = 2.0; restLength = 0.5; }
+    else e // { weight = 0.2; restLength = 6.0; };
+in
+  base // { links = map spring base.links; }
+"#,
+    },
+    Demo {
+        name: "Communities (per-node charge)",
+        expr: r#"# Per-node physics for the GPU force layout. A node's `charge`
+# multiplies its repulsion and `mass` its inertia (both default 1, on top of
+# the degree-based default). Each community gets twice the charge of the
+# previous one, so they settle from tight to diffuse; the per-edge springs
+# keep the communities apart.
+let
+  g = import /jc/src/graph.nix {};
+  base = g.clustered { nodes = 400; edges = 1200; clusters = 4; affinity = 0.9; seed = 7; };
+  cluster = builtins.listToAttrs (map (n: { name = n.id; value = n.type; }) base.nodes);
+  charge = { cluster-0 = 0.5; cluster-1 = 1.0; cluster-2 = 2.0; cluster-3 = 4.0; };
+  spring = e:
+    if cluster.${e.source} == cluster.${e.target}
+    then e // { weight = 2.0; restLength = 0.5; }
+    else e // { weight = 0.2; restLength = 6.0; };
+in
+  base // {
+    nodes = map (n: n // { charge = charge.${n.type}; }) base.nodes;
+    links = map spring base.links;
+  }
+"#,
+    },
+    Demo {
         name: "Soup (self-assembly seed)",
         expr: r#"# Unbonded particle soup: N isolated nodes, zero edges. The
 # initial condition for the dynamic-bonding self-assembly engine — bonds

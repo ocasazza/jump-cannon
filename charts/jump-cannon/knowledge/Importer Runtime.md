@@ -236,7 +236,9 @@ trunk so every deployment has them (container, `trunk serve`, browser-only
 GitHub Pages). The Instances panel lists them; Load applies the app state
 (layout regime, style, camera) and then loads the named source through the
 same apply path as a manual row Load, so a session on an unbuilt source shows
-the build overlay and streams its stages.
+the build overlay and streams its stages. A session whose index entry names a
+`generate` demo instead evaluates that Generate catalog expression in the
+browser after the reload, so it needs no server.
 
 Do not hide network access, credentials, or authorization inside a pure mapper.
 Deployment owns those effects through [[Helm Deployment]] and [[Security Model]].

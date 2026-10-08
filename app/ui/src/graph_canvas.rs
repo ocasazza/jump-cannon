@@ -135,6 +135,8 @@ pub async fn load() -> Result<GraphData, api::LoadError> {
             edges,
             colors,
             sizes,
+            node_physics: None,
+            edge_physics: None,
         },
     })
 }
@@ -229,6 +231,8 @@ pub(crate) fn graph_data_from_snapshot(snapshot: &graph_vcs::Snapshot) -> GraphD
             edges,
             colors,
             sizes,
+            node_physics: None,
+            edge_physics: None,
         },
     }
 }
@@ -281,6 +285,8 @@ pub(crate) fn graph_data_from_vault(graph: &vault_data::VaultGraph) -> GraphData
             edges,
             colors,
             sizes,
+            node_physics: None,
+            edge_physics: None,
         },
     }
 }

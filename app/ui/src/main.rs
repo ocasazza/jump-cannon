@@ -19,6 +19,7 @@ mod badges;
 mod build_progress;
 mod selection_card;
 mod client_log;
+mod client_metrics;
 mod graph_canvas;
 mod hints;
 mod palette;
@@ -998,6 +999,12 @@ pub(crate) fn replace_with_client_graph(
         },
     });
     ctx.graph.set(Some(graph));
+    // Metric-driven styling reads the same buffers graph-api would serve;
+    // compute them in-browser for the client-owned topology.
+    let metrics = ctx.graph.read().as_ref().map(client_metrics::compute);
+    if let Some(metrics) = metrics {
+        panels::style::begin_client_session(metrics);
+    }
     // A client graph supersedes any in-flight server load: close the store
     // so the GlobalLoadingBar cannot dangle over a mounted canvas.
     panel_kit::loading::loading_store("graph", "loading graph…").succeed();
@@ -1089,6 +1096,9 @@ fn App() -> Element {
     // handling, style/camera loops) before any panel renders — a saved
     // layout with every panel minimized must still process boot presets.
     appstate::ensure_init();
+    // Client-graph metrics land outside any fetch; the style loop must be
+    // armed to apply them even with every panel minimized.
+    panels::style::ensure_init();
     // _v6: the FilterStrip ("Filters") panel merged into the Filter panel, so
     // its enum variant is gone — a saved v5 layout referencing it would fail to
     // deserialize; re-seed instead. (v5: re-seed so a minimized Graph panel
@@ -1278,7 +1288,8 @@ fn App() -> Element {
     // the component body would re-run the import on every App re-render
     // (each graph promotion re-renders App — an import loop).
     let github_boot = use_hook(crate::github::boot_spec);
-    let skip_server_load = github_boot.is_some();
+    let generate_boot = use_hook(panels::generate::take_boot_evaluation);
+    let skip_server_load = github_boot.is_some() || generate_boot;
 
     // Resilient initial load: retry until the backend answers, so a server
     // that's still indexing (or starting up) self-heals instead of leaving
@@ -1429,6 +1440,7 @@ fn App() -> Element {
 
     // Boot import in GitHub mode: drive the panel's shared import routine so
     // progress and errors surface in the GitHub panel, and open that panel.
+    // An example session's staged Generate expression is evaluated instead.
     // The future body reads no signals, so it runs exactly once.
     use_future(move || {
         let boot = github_boot.clone();
@@ -1436,6 +1448,8 @@ fn App() -> Element {
             if let Some(spec) = boot {
                 *OPEN_PANEL.write() = Some(Panel::GitHub);
                 panels::github::spawn_import(spec, ctx);
+            } else if generate_boot {
+                panels::generate::run_evaluation(ctx);
             }
         }
     });

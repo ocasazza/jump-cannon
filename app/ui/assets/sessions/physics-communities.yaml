@@ -1,0 +1,15 @@
+# Generated communities — per-node and per-edge physics.
+#
+# Regime: GPU force simulation over the "Communities (per-node charge)"
+# Generate demo. Links carry short stiff springs inside a community and long
+# weak ones between communities, and each community doubles the repulsion
+# charge of the last, so four clusters settle apart from tight to diffuse.
+style:
+  size_by: Uniform
+  color_by: Community
+  size_mul: 0.6
+layout:
+  active: gpu-force
+  settings: {}
+  seed_strategy: None
+  seed_custom: ""

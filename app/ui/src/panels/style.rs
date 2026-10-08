@@ -805,6 +805,9 @@ thread_local! {
     static EXPECTED_REVISION: Cell<Option<u64>> = const { Cell::new(None) };
     /// Server metrics are only meaningful for a graph-api-owned topology.
     static METRICS_ALLOWED: Cell<bool> = const { Cell::new(false) };
+    /// True while the metrics in [`METRICS_TL`] were computed in-browser for
+    /// a client-owned graph — fetches must not run in that session.
+    static CLIENT_SESSION: Cell<bool> = const { Cell::new(false) };
     static METRICS_SESSION: Cell<u64> = const { Cell::new(0) };
     /// Bumped on every cache insert — part of the recompute change-detect.
     static METRICS_GEN: Cell<u32> = const { Cell::new(0) };
@@ -825,9 +828,26 @@ thread_local! {
 /// and `revision` is the mounted snapshot's revision they must match.
 pub(crate) fn reset_for_graph_session(server_backed: bool, revision: Option<u64>) {
     METRICS_ALLOWED.with(|c| c.set(server_backed));
+    CLIENT_SESSION.with(|c| c.set(false));
     EXPECTED_REVISION.with(|c| c.set(revision.filter(|r| *r != 0)));
     METRICS_SESSION.with(|c| c.set(c.get().wrapping_add(1)));
     METRICS_TL.with(|m| m.borrow_mut().clear());
+    PENDING.with(|p| p.borrow_mut().clear());
+    UNSERVED.with(|u| u.borrow_mut().clear());
+    TAG_FACETS.with(|c| c.borrow_mut().take());
+    EDGE_KINDS.with(|c| c.borrow_mut().take());
+    METRICS_GEN.with(|g| g.set(g.get().wrapping_add(1)));
+    LAST_APPLIED.with(|c| c.set(None));
+}
+
+/// Seed a client-owned graph's metrics, computed in-browser
+/// ([`crate::client_metrics`]). Replaces the fetch path for the session.
+pub(crate) fn begin_client_session(metrics: std::collections::HashMap<String, Vec<f32>>) {
+    METRICS_ALLOWED.with(|c| c.set(true));
+    CLIENT_SESSION.with(|c| c.set(true));
+    EXPECTED_REVISION.with(|c| c.set(None));
+    METRICS_SESSION.with(|c| c.set(c.get().wrapping_add(1)));
+    METRICS_TL.with(|m| *m.borrow_mut() = metrics);
     PENDING.with(|p| p.borrow_mut().clear());
     UNSERVED.with(|u| u.borrow_mut().clear());
     TAG_FACETS.with(|c| c.borrow_mut().take());
@@ -878,6 +898,11 @@ const TAG_KEY: &str = "tag";
 /// egui app does for keys absent from its metrics map.
 fn ensure_metrics(style: &StyleState) {
     if !METRICS_ALLOWED.with(Cell::get) {
+        return;
+    }
+    if CLIENT_SESSION.with(Cell::get) {
+        // Everything was computed and seeded at graph replace; there is no
+        // server to ask for the rest.
         return;
     }
     /// graph-api's per-node binary cache keys (graph-api `state.rs`). Asking
@@ -1517,10 +1542,10 @@ pub fn panel(ctx: Ctx) -> Element {
 
     rsx! {
         div { class: "sty",
-            if !server_backed {
+            if !server_backed && !METRICS_ALLOWED.with(Cell::get) {
                 div { class: "sty-note",
-                    "Client-only graph: server-derived metrics are unavailable. Uniform and \
-                     renderer-local styling still apply."
+                    "Client-only graph: metrics are unavailable for a graph this large. \
+                     Uniform and renderer-local styling still apply."
                 }
             }
             div { class: "sty-reset-row",
