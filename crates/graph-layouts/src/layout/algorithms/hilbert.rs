@@ -63,10 +63,8 @@ impl StaticLayout for HilbertLayout {
     }
 
     fn solve(settings: &Self::Settings, graph: &Graph) -> Result<Vec<f32>, String> {
-        let mut node_order: Vec<&String> = graph.nodes.keys().collect();
-        node_order.sort();
-
-        let n = node_order.len();
+        // Positions depend only on the index; slot i is the i-th sorted id.
+        let n = graph.nodes.len();
         let order = settings.order.clamp(1, 10);
         let extent = settings.extent.max(0.0);
 

@@ -56,6 +56,11 @@ The default renderer runs `graph-layouts` in the browser. Larger or shared work
 can use [[Compute]]. Treat layout speed, readability, and interaction latency as
 separate measurements under [[Performance Engineering]].
 
+Each reload computes node metrics on the server. `kcore` is the core number of
+the undirected graph with parallel links and self-links collapsed. `community`
+comes from Louvain and is identical for identical graphs, so community colors
+stay stable across reloads that do not change the graph.
+
 ## GPU force engine controls
 
 The in-browser `gpu-force` engine exposes two independent choices on the
