@@ -665,8 +665,6 @@ impl GraphMapper for KubernetesGraphMapper {
                 .try_add_node(VaultNode {
                     id: node_id.clone(),
                     meta: NodeMeta {
-                        source_id: self.source_id.clone(),
-                        title: name.into(),
                         tags,
                         frontmatter: properties,
                         mtime: 0,
@@ -676,6 +674,7 @@ impl GraphMapper for KubernetesGraphMapper {
                         content_type: Some("application/json".into()),
                         content_readable: false,
                         content_writable: false,
+                        ..NodeMeta::new(self.source_id.clone(), name)
                     },
                     metrics: NodeMetrics::default(),
                     x: 0.0,

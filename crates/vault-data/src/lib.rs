@@ -11,7 +11,7 @@ pub use color::PALETTE;
 pub use edge::{EdgeId, VaultEdge};
 pub use field_schema::{DoctypeSchema, FieldSchema, FieldType};
 pub use graph::{GraphValidationError, VaultGraph};
-pub use node::{NodeMeta, NodeMetrics, VaultNode};
+pub use node::{NodeMeta, NodeMetrics, VaultNode, REQUIRED_META_FIELDS};
 
 /// Source-neutral name for the canonical graph exchanged by importers.
 ///

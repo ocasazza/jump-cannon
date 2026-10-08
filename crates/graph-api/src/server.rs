@@ -1383,12 +1383,10 @@ async fn compute_soup_post(
         vg.add_node(vault_data::VaultNode {
             id: id.clone(),
             meta: vault_data::NodeMeta {
-                source_id: "compute-soup".into(),
-                title: local.clone(),
                 tags: vec!["particle".into()],
-                path: local,
+                path: local.clone(),
                 doctype: Some("particle".into()),
-                ..Default::default()
+                ..vault_data::NodeMeta::new("compute-soup", local)
             },
             ..Default::default()
         });

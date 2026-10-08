@@ -671,8 +671,6 @@ impl PestEngine<'_> {
             },
         };
         let meta = NodeMeta {
-            source_id: self.package.manifest.metadata.id.clone(),
-            title,
             tags: fields.tags,
             frontmatter: fields.properties,
             mtime: 0,
@@ -682,6 +680,7 @@ impl PestEngine<'_> {
             content_type: content.readable.then(|| "text/markdown".to_owned()),
             content_readable: content.readable,
             content_writable: content.writable,
+            ..NodeMeta::new(self.package.manifest.metadata.id.clone(), title)
         };
 
         Ok(MappedNode {
