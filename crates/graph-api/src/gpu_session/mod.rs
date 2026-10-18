@@ -732,8 +732,13 @@ impl Controller {
         )
     }
 
+    /// Kueue Workloads are read at `v1beta2`: it is the storage version since
+    /// Kueue 0.15 and the only version served from 0.20 onward (`v1beta1` is
+    /// `served: false`). The fields read below — `metadata.ownerReferences`
+    /// and `status.conditions[].{type,status,message}` with the `Admitted` /
+    /// `Evicted` types — are identical in both versions.
     fn workload_api(&self) -> Api<DynamicObject> {
-        let gvk = GroupVersionKind::gvk("kueue.x-k8s.io", "v1beta1", "Workload");
+        let gvk = GroupVersionKind::gvk("kueue.x-k8s.io", "v1beta2", "Workload");
         Api::namespaced_with(
             self.client.clone(),
             &self.config.namespace,
