@@ -64,12 +64,12 @@ spec:
         checksum/kubernetes-importer-config: {{ toJson .Values.kubernetesImporter.config | replace "{{ .Release.Namespace }}" .Release.Namespace | sha256sum }}
         {{- end }}
         {{- if $gpuSession }}
-        checksum/gpu-session-template: {{ include "jump-cannon.rayclusterManifest" . | sha256sum }}
+        checksum/gpu-session-template: {{ include "jump-cannon.computeJobManifest" . | sha256sum }}
         {{- end }}
     spec:
       serviceAccountName: {{ include "jump-cannon.serviceAccountName" . }}
       {{- /* The GPU session controller needs in-cluster API access to manage the
-             session RayCluster, so session mode forces token automount on. */}}
+             session Job and Service, so session mode forces token automount on. */}}
       automountServiceAccountToken: {{ or .Values.serviceAccount.automountServiceAccountToken $gpuSession }}
       imagePullSecrets:
         {{- toYaml .Values.imagePullSecrets | nindent 8 }}
@@ -227,23 +227,27 @@ spec:
             - name: JUMP_CANNON_FILESYSTEM_RESCAN_SECONDS
               value: {{ $filesystemRescanSeconds | quote }}
             {{- end }}
+            {{- if include "jump-cannon.computeUrl" . }}
             - name: JUMP_CANNON_COMPUTE_URL
-              value: {{ .Values.graphApi.computeUrl | quote }}
+              value: {{ include "jump-cannon.computeUrl" . | quote }}
+            {{- end }}
             {{- if $gpuSession }}
             - name: JUMP_CANNON_GPU_SESSION_TEMPLATE
-              value: /etc/jump-cannon/gpu-session/raycluster.yaml
+              value: /etc/jump-cannon/gpu-session/job.yaml
             - name: JUMP_CANNON_GPU_SESSION_CLUSTER_NAME
               value: {{ include "jump-cannon.computeName" . | quote }}
             - name: JUMP_CANNON_GPU_SESSION_NAMESPACE
               value: {{ include "jump-cannon.computeNamespace" . | quote }}
+            - name: JUMP_CANNON_GPU_SESSION_COMPUTE_PORT
+              value: {{ .Values.graphCompute.service.port | quote }}
             - name: JUMP_CANNON_GPU_SESSION_IDLE_SECONDS
               value: {{ .Values.graphCompute.session.idleSeconds | quote }}
             - name: JUMP_CANNON_GPU_SESSION_ADMISSION_TIMEOUT
               value: {{ .Values.graphCompute.session.admissionTimeoutSeconds | quote }}
             - name: JUMP_CANNON_GPU_SESSION_MAX_SECONDS
               value: {{ .Values.graphCompute.session.maxExecTimeSeconds | quote }}
-            - name: JUMP_CANNON_GPU_SESSION_HEAD_START_TIMEOUT
-              value: {{ .Values.graphCompute.session.headStartTimeoutSeconds | quote }}
+            - name: JUMP_CANNON_GPU_SESSION_START_TIMEOUT
+              value: {{ .Values.graphCompute.session.startTimeoutSeconds | quote }}
             {{- end }}
             - name: RUST_LOG
               value: {{ .Values.graphApi.rustLog | quote }}
@@ -301,8 +305,8 @@ spec:
             {{- end }}
             {{- if $gpuSession }}
             - name: gpu-session-template
-              mountPath: /etc/jump-cannon/gpu-session/raycluster.yaml
-              subPath: raycluster.yaml
+              mountPath: /etc/jump-cannon/gpu-session/job.yaml
+              subPath: job.yaml
               readOnly: true
             {{- end }}
             {{- if .Values.hostCaBundle.enabled }}

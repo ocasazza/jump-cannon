@@ -1,22 +1,18 @@
-{{- if .Values.graphCompute.enabled }}
-{{- $computeNamespace := include "jump-cannon.computeNamespace" . }}
-{{- if not .Values.graphCompute.session.enabled }}
-{{ include "jump-cannon.rayclusterManifest" . }}
+{{- if and .Values.graphCompute.enabled (not .Values.graphCompute.session.enabled) }}
+{{ include "jump-cannon.computeJobManifest" . }}
 ---
-{{- end }}
 apiVersion: v1
 kind: Service
 metadata:
   name: {{ include "jump-cannon.computeName" . }}
-  namespace: {{ $computeNamespace }}
+  namespace: {{ include "jump-cannon.computeNamespace" . }}
   labels:
     {{- include "jump-cannon.labels" . | nindent 4 }}
     app.kubernetes.io/component: graph-compute
 spec:
   type: ClusterIP
   selector:
-    ray.io/cluster: {{ include "jump-cannon.computeName" . }}
-    ray.io/node-type: head
+    batch.kubernetes.io/job-name: {{ include "jump-cannon.computeName" . }}
   ports:
     - name: grpc
       port: {{ .Values.graphCompute.service.port }}

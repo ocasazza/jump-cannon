@@ -236,20 +236,29 @@ pkgs.runCommand "jump-cannon-chart-tarball"
     grep -Fq 'value: "kubernetes"' named-kubernetes.yaml
     grep -Fq 'in-cluster-kubernetes' named-kubernetes.yaml
 
-    # Static compute mode (default): the RayCluster CR renders with the
-    # Kueue max-exec-time safety label.
+    # Static compute mode (default): one suspended batch/v1 Job with the
+    # Kueue labels renders, plus the ClusterIP Service selecting its pods.
     helm template gpu-static ./jump-cannon \
       --set tests.fuzz.enabled=false \
       --set tests.performance.enabled=false \
       --set tests.browser.enabled=false \
       --set tests.k6.enabled=false \
       > gpu-static.yaml
-    grep -Fq 'kind: RayCluster' gpu-static.yaml
+    grep -Eq '^kind: Job$' gpu-static.yaml
+    grep -Fq 'apiVersion: batch/v1' gpu-static.yaml
+    grep -Eq '^  suspend: true$' gpu-static.yaml
+    grep -Fq 'name: graph-compute' gpu-static.yaml
+    grep -Fq 'kueue.x-k8s.io/queue-name' gpu-static.yaml
     grep -Fq 'kueue.x-k8s.io/max-exec-time-seconds' gpu-static.yaml
+    grep -Fq 'batch.kubernetes.io/job-name: gpu-static-jump-cannon-compute' gpu-static.yaml
+    if grep -Eqi 'raycluster|ray\.io|ray-head' gpu-static.yaml; then
+      echo "static compute must not render any Ray resource" >&2
+      exit 1
+    fi
 
-    # On-demand session mode: no RayCluster CR; the template ConfigMap,
-    # least-privilege session RBAC, Deployment env/mount, and the always-on
-    # compute Service render instead.
+    # On-demand session mode: no top-level Job (Rust owns the Job and its
+    # Service); the template ConfigMap, least-privilege session RBAC, and
+    # Deployment env/mount render instead.
     helm template gpu-session ./jump-cannon \
       --set graphCompute.session.enabled=true \
       --set tests.fuzz.enabled=false \
@@ -257,23 +266,106 @@ pkgs.runCommand "jump-cannon-chart-tarball"
       --set tests.browser.enabled=false \
       --set tests.k6.enabled=false \
       > gpu-session.yaml
-    if grep -Eq '^kind: RayCluster$' gpu-session.yaml; then
-      echo "session mode must not render the RayCluster CR" >&2
+    if grep -Eq '^kind: Job$' gpu-session.yaml; then
+      echo "session mode must not render a top-level compute Job" >&2
+      exit 1
+    fi
+    if grep -Eq '^  name: gpu-session-jump-cannon-compute$' gpu-session.yaml; then
+      echo "session mode must not render the compute Service or Job" >&2
       exit 1
     fi
     grep -Fq 'gpu-session-template' gpu-session.yaml
-    grep -Fq 'rayclusters' gpu-session.yaml
-    grep -Fq 'pods/log' gpu-session.yaml
+    grep -Fq 'job.yaml: |' gpu-session.yaml
+    grep -Fq -e '- jobs' gpu-session.yaml
+    grep -Fq -e '- services' gpu-session.yaml
+    grep -Fq -e '- pods/log' gpu-session.yaml
+    grep -Fq -e '- workloads' gpu-session.yaml
     grep -Fq 'kueue.x-k8s.io/max-exec-time-seconds' gpu-session.yaml
     grep -Fq 'name: JUMP_CANNON_GPU_SESSION_TEMPLATE' gpu-session.yaml
+    grep -Fq 'value: /etc/jump-cannon/gpu-session/job.yaml' gpu-session.yaml
     grep -Fq 'name: JUMP_CANNON_GPU_SESSION_CLUSTER_NAME' gpu-session.yaml
     grep -Fq 'name: JUMP_CANNON_GPU_SESSION_NAMESPACE' gpu-session.yaml
-    grep -Fq 'jump-cannon-compute' gpu-session.yaml
+    grep -Fq 'name: JUMP_CANNON_GPU_SESSION_COMPUTE_PORT' gpu-session.yaml
+    grep -Fq 'name: JUMP_CANNON_GPU_SESSION_START_TIMEOUT' gpu-session.yaml
+    if grep -Fq 'HEAD_START_TIMEOUT' gpu-session.yaml; then
+      echo "session mode must not render the retired head-start timeout env" >&2
+      exit 1
+    fi
     # The session controller needs the in-cluster API; session mode must
     # force service-account token automount on.
     grep -Fq 'automountServiceAccountToken: true' gpu-session.yaml
-    if grep -Fq 'rayclusters/finalizers' gpu-session.yaml; then
-      echo "session RBAC must not touch RayCluster finalizers" >&2
+    if grep -Eqi 'raycluster|ray\.io|ray-head' gpu-session.yaml; then
+      echo "session mode must not render any Ray resource or RBAC" >&2
+      exit 1
+    fi
+    if grep -Fq 'jobs/finalizers' gpu-session.yaml; then
+      echo "session RBAC must not touch Job finalizers" >&2
+      exit 1
+    fi
+
+    # Deployer shape (session-manager per-world broker, chart-owned compute
+    # off): the world template ConfigMap carries a suspended Kueue Job named
+    # by the __world__ placeholder; the broker Role is Job/Service/Pod/Workload
+    # only; the chart renders no compute Job or Service.
+    helm template gpu-deployer ./jump-cannon \
+      -f ./jump-cannon/ci/session-manager.yaml \
+      > gpu-deployer.yaml
+    grep -Fq 'gpu-world-template' gpu-deployer.yaml
+    grep -Fq 'job.yaml: |' gpu-deployer.yaml
+    grep -Fq 'name: __world__' gpu-deployer.yaml
+    grep -Fq 'namespace: gpu-workloads' gpu-deployer.yaml
+    grep -Fq 'kueue.x-k8s.io/queue-name' gpu-deployer.yaml
+    grep -Fq 'kueue.x-k8s.io/priority-class' gpu-deployer.yaml
+    grep -Fq 'kueue.x-k8s.io/max-exec-time-seconds' gpu-deployer.yaml
+    grep -Fq 'nixstation.io/gpu-workload: elastic' gpu-deployer.yaml
+    grep -Fq 'suspend: true' gpu-deployer.yaml
+    grep -Fq -e '- jobs' gpu-deployer.yaml
+    grep -Fq -e '- services' gpu-deployer.yaml
+    grep -Fq -e '- pods/log' gpu-deployer.yaml
+    grep -Fq -e '- workloads' gpu-deployer.yaml
+    grep -Fq 'name: JUMP_CANNON_SM_GPU_TEMPLATE' gpu-deployer.yaml
+    grep -Fq 'value: /etc/jump-cannon/gpu-world/job.yaml' gpu-deployer.yaml
+    grep -Fq 'name: JUMP_CANNON_SM_START_TIMEOUT' gpu-deployer.yaml
+    if grep -Fq 'HEAD_START_TIMEOUT' gpu-deployer.yaml; then
+      echo "deployer shape must not render the retired head-start timeout env" >&2
+      exit 1
+    fi
+    if grep -Eqi 'raycluster|ray\.io|ray-head' gpu-deployer.yaml; then
+      echo "deployer shape must not render any Ray resource or RBAC" >&2
+      exit 1
+    fi
+    if grep -Eq '^kind: Job$' gpu-deployer.yaml; then
+      echo "deployer shape must not render a top-level compute Job" >&2
+      exit 1
+    fi
+    if grep -Eq '^  name: gpu-deployer-jump-cannon-compute$' gpu-deployer.yaml; then
+      echo "deployer shape must not render a chart-owned compute Service" >&2
+      exit 1
+    fi
+    if grep -Fq 'JUMP_CANNON_COMPUTE_URL' gpu-deployer.yaml; then
+      echo "deployer shape (graphCompute.enabled=false) must not render JUMP_CANNON_COMPUTE_URL" >&2
+      exit 1
+    fi
+
+    # graph-api compute URL: absent when graphCompute is disabled (the broker
+    # must not dial a Service the chart never created), derived from the
+    # compute Service when enabled, and an explicit graphApi.computeUrl wins.
+    if grep -Fq 'JUMP_CANNON_COMPUTE_URL' legacy.yaml; then
+      echo "graphCompute.enabled=false must not render JUMP_CANNON_COMPUTE_URL" >&2
+      exit 1
+    fi
+    grep -Fq 'name: JUMP_CANNON_COMPUTE_URL' gpu-static.yaml
+    grep -Fq 'value: "http://gpu-static-jump-cannon-compute.default.svc:50051"' gpu-static.yaml
+    helm template compute-url-override ./jump-cannon \
+      --set graphApi.computeUrl=http://x:1 \
+      --set tests.fuzz.enabled=false \
+      --set tests.performance.enabled=false \
+      --set tests.browser.enabled=false \
+      --set tests.k6.enabled=false \
+      > compute-url-override.yaml
+    grep -Fq 'value: "http://x:1"' compute-url-override.yaml
+    if grep -Fq 'compute-url-override-jump-cannon-compute.default.svc' compute-url-override.yaml; then
+      echo "explicit graphApi.computeUrl must win over the derived URL" >&2
       exit 1
     fi
 

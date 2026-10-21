@@ -1,12 +1,13 @@
-# helm-template coverage for the session-manager deployment with the
-# per-world GPU broker enabled (and the legacy single-tenant session off).
+# helm-template coverage for the deployer shape: session-manager with the
+# per-world GPU broker in the gpu-workloads namespace, no chart-owned compute.
 sessionManager:
   enabled: true
   gpu:
     enabled: true
-    namespace: gpu-workloads
 
 graphCompute:
+  enabled: false
+  namespace: gpu-workloads
   session:
     enabled: false
 

@@ -7,6 +7,6 @@ metadata:
     {{- include "jump-cannon.labels" . | nindent 4 }}
     app.kubernetes.io/component: graph-api
 data:
-  raycluster.yaml: |
-    {{- include "jump-cannon.rayclusterManifest" . | nindent 4 }}
+  job.yaml: |
+    {{- include "jump-cannon.computeJobManifest" . | nindent 4 }}
 {{- end }}
