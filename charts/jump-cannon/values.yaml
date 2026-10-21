@@ -71,7 +71,10 @@ graphApi:
     pullPolicy: Always
   port: 8765
   rustLog: info
-  computeUrl: http://jump-cannon-compute:50051
+  # Empty derives http://<compute Service>.<compute namespace>.svc:<port> when
+  # graphCompute.enabled, and renders no JUMP_CANNON_COMPUTE_URL (broker off)
+  # otherwise. A non-empty value is used verbatim.
+  computeUrl: ""
   resources:
     requests:
       cpu: 250m
@@ -347,12 +350,33 @@ graphCompute:
   rustLog: info
   tickHz: "30"
   bindAddr: "[::]:50051"
-  # On-demand GPU session lifecycle. When enabled, the chart does NOT create
-  # the RayCluster CR; instead it renders the identical manifest into the
-  # <fullname>-gpu-session-template ConfigMap mounted into graph-api, which
-  # creates/deletes the RayCluster on demand (explicit dispatch/park,
+  # Resources of the graph-compute container (one GPU per Job).
+  resources:
+    requests:
+      cpu: "2"
+      memory: 4Gi
+      nvidia.com/gpu: "1"
+    limits:
+      cpu: "4"
+      memory: 8Gi
+      nvidia.com/gpu: "1"
+  nodeSelector:
+    nixstation.io/gpu-workload: elastic
+  kueue:
+    queueName: gpu
+    workloadPriorityClassName: batch
+    podPriorityClassName: gpu-batch
+  job:
+    # Pod failures tolerated before the Job is marked failed.
+    backoffLimit: 4
+  # Static mode (session.enabled=false): the chart renders one suspended
+  # batch/v1 Job plus its ClusterIP Service; Kueue admits and unsuspends the
+  # Job. Job pod templates are immutable: changing the image or resources
+  # means replacing the standing Job.
+  # Session mode (session.enabled=true): the chart renders the same Job into
+  # the <fullname>-gpu-session-template ConfigMap mounted into graph-api,
+  # which creates/deletes the Job and its Service on demand (dispatch/park,
   # idle auto-park, hard time cap) within the standing Kueue quota envelope.
-  # The compute Service always renders (zero endpoints while parked).
   # Requires graphApi.replicas == 1 (enforced by a chart fail).
   session:
     enabled: false
@@ -360,37 +384,12 @@ graphCompute:
     idleSeconds: 900
     # Seconds to wait for Kueue admission before failing the session.
     admissionTimeoutSeconds: 600
-    # Hard cap on session lifetime in seconds. Also stamped onto the
-    # RayCluster as the kueue.x-k8s.io/max-exec-time-seconds label in BOTH
-    # modes (Kueue-enforced safety rail).
+    # Hard cap on session lifetime in seconds. Also stamped onto the Job as
+    # the kueue.x-k8s.io/max-exec-time-seconds label in BOTH modes
+    # (Kueue-enforced safety rail).
     maxExecTimeSeconds: 14400
-    # Seconds to wait for the Ray head pod to become ready after admission.
-    headStartTimeoutSeconds: 900
-  ray:
-    image: rayproject/ray:2.52.0-py311@sha256:a601a539f3d881d644848690622cfa4d31e22d6cb3f5158e8b4bb96418d28da8
-    rayVersion: "2.52.0"
-    queueName: gpu
-    workloadPriorityClassName: batch
-    podPriorityClassName: gpu-batch
-    ttlSeconds: 14400
-    nodeSelector:
-      nixstation.io/gpu-workload: elastic
-    headResources:
-      requests:
-        cpu: "1"
-        memory: 2Gi
-      limits:
-        cpu: "2"
-        memory: 4Gi
-    backendResources:
-      requests:
-        cpu: "2"
-        memory: 4Gi
-        nvidia.com/gpu: "1"
-      limits:
-        cpu: "4"
-        memory: 8Gi
-        nvidia.com/gpu: "1"
+    # Seconds to wait for the Job pod to become healthy after admission.
+    startTimeoutSeconds: 900
 
 # Multi-user session-manager: world/session/VCS REST API plus per-world
 # graph serving, backed by the world-store PVC. Disabled by default; the
@@ -427,11 +426,13 @@ sessionManager:
     limits:
       cpu: "2"
       memory: 2Gi
-  # Per-world GPU compute broker: one Kueue-admitted RayCluster per world,
+  # Per-world GPU compute broker: one Kueue-admitted Job per world,
   # lifecycle-managed by the session-manager (dispatch/park, idle auto-park,
   # hard caps) within the same standing LocalQueue envelope as
-  # graphCompute.session. Mutually exclusive with graphCompute.session
-  # (enforced by a chart fail); requires sessionManager.replicas == 1.
+  # graphCompute.session. The broker creates each world's Job and Service
+  # from the <fullname>-session-manager-gpu-world-template ConfigMap.
+  # Mutually exclusive with graphCompute.session; requires
+  # sessionManager.replicas == 1 (both enforced by a chart fail).
   gpu:
     enabled: false
     # Defaults to graphCompute.namespace (the release namespace when unset).
@@ -439,7 +440,7 @@ sessionManager:
     idleSeconds: 900
     admissionTimeoutSeconds: 600
     maxExecTimeSeconds: 14400
-    headStartTimeoutSeconds: 900
+    startTimeoutSeconds: 900
 
 # TerminusDB backend for sessionManager.store=terminusdb: one database per
 # world, served by a single-replica StatefulSet with its own PVC. Disabled by

@@ -1,7 +1,7 @@
 # jump-cannon chart
 
 This chart packages the jump-cannon frontend/API, an optional Kueue-admitted
-RayCluster GPU compute session, and nightly CronJobs for fuzz, performance, and
+GPU compute Job, and nightly CronJobs for fuzz, performance, and
 browser smoke tests. By default, the jobs run every day in
 `America/Los_Angeles`: fuzz at 00:00, browser smoke at 00:15, and performance
 at 00:30.
@@ -39,6 +39,56 @@ In nixstation, render them into `gpu-workloads` with `graphCompute.namespace`
 and `tests.performance.namespace` so they use the existing LocalQueue. With the
 ClusterQueue GPU quota at `0`, the scheduled performance Job stays queued until
 an operator deliberately grants quota and frees silicon from a serving workload.
+
+## GPU compute
+
+The compute backend is a `batch/v1` Job created suspended and admitted by
+Kueue. It runs one `graph-compute` container (the gRPC layout server, port
+`graphCompute.service.port`, default 50051) with a `tcpSocket` readiness probe
+on the `grpc` port. Kueue owns `spec.suspend`: admission unsuspends the Job and
+preemption re-suspends it. The Job carries the `kueue.x-k8s.io/queue-name`,
+`kueue.x-k8s.io/priority-class`, and `kueue.x-k8s.io/max-exec-time-seconds`
+labels.
+
+| Value | Default | Purpose |
+|---|---|---|
+| `graphCompute.enabled` | `true` | Render the standing compute Job and its ClusterIP Service (static mode) |
+| `graphCompute.namespace` | `""` (release namespace) | Namespace for the Job, Service, and session RBAC |
+| `graphCompute.kueue.queueName` | `gpu` | LocalQueue the Job is submitted to |
+| `graphCompute.kueue.workloadPriorityClassName` | `batch` | Kueue WorkloadPriorityClass |
+| `graphCompute.kueue.podPriorityClassName` | `gpu-batch` | Pod `priorityClassName` |
+| `graphCompute.nodeSelector` | `nixstation.io/gpu-workload: elastic` | Pod node selector |
+| `graphCompute.resources` | requests cpu `2`, memory `4Gi`, `nvidia.com/gpu: 1`; limits cpu `4`, memory `8Gi`, `nvidia.com/gpu: 1` | `graph-compute` container resources |
+| `graphCompute.job.backoffLimit` | `4` | Job `backoffLimit` |
+| `graphCompute.service.port` | `50051` | Compute Service and container gRPC port |
+| `graphCompute.session.enabled` | `false` | On-demand single-tenant session instead of the static Job |
+| `graphCompute.session.startTimeoutSeconds` | `900` | Fail a session that stays admitted/starting too long |
+| `graphApi.computeUrl` | `""` | Compute URL for graph-api's `JUMP_CANNON_COMPUTE_URL` |
+
+Static mode (`graphCompute.enabled=true`, `graphCompute.session.enabled=false`)
+renders the Job and a ClusterIP Service named after it, selecting the Job pod
+by `batch.kubernetes.io/job-name`. With `graphCompute.session.enabled=true` the
+chart instead renders the Job manifest into a template ConfigMap mounted in
+graph-api at `/etc/jump-cannon/gpu-session/job.yaml` and a namespaced Role and
+RoleBinding; graph-api creates and deletes the Service and the Job itself, and
+park deletes the Job, then the Service. graph-api reads the template from
+`JUMP_CANNON_GPU_SESSION_TEMPLATE` and is configured through
+`JUMP_CANNON_GPU_SESSION_CLUSTER_NAME` (the Job and Service name),
+`..._NAMESPACE`, `..._COMPUTE_PORT`, `..._IDLE_SECONDS`,
+`..._ADMISSION_TIMEOUT`, `..._MAX_SECONDS`, and `..._START_TIMEOUT`.
+
+`JUMP_CANNON_COMPUTE_URL` is `graphApi.computeUrl` when set. When empty and
+`graphCompute.enabled=true` the chart derives
+`http://<compute name>.<compute namespace>.svc:<graphCompute.service.port>`.
+When empty and `graphCompute.enabled=false` the variable is not rendered, which
+disables graph-api's single-tenant compute broker (the per-world session-manager
+broker is unaffected).
+
+Session RBAC (graph-api's `rbac-gpu-session.yaml` and the session-manager's
+`rbac-session-manager.yaml`, both in the compute namespace) grants exactly:
+`batch` `jobs` create/get/list/watch/delete; core `services`
+create/get/delete; core `pods` and `pods/log` get/list/watch; and
+`kueue.x-k8s.io` `workloads` get/list/watch.
 
 Set `tests.performance.profiling.enabled=true` with
 `tests.performance.profiling.pyroscopeUrl` pointing at an in-cluster Pyroscope
@@ -101,25 +151,27 @@ stays at one replica.
 ### Per-world GPU broker
 
 With `sessionManager.gpu.enabled=true` the session-manager also runs the
-per-world GPU compute broker: one Kueue-admitted RayCluster per world in the
+per-world GPU compute broker: one Kueue-admitted compute Job per world in the
 compute namespace, lifecycle-managed exactly like the single-tenant
-`graphCompute.session` loop (dispatch → admission → head ready; park deletes
-the CR; idle auto-park; the `kueue.x-k8s.io/max-exec-time-seconds` hard cap).
-All world clusters land in the same standing LocalQueue envelope
-(`graphCompute.ray.queueName`). The chart renders the same
-`jump-cannon.rayclusterManifest` into a per-world template ConfigMap with a
-`__world__` name placeholder; the broker stamps
-`<release-fullname>-<world-slug>` (DNS-1123, ≤63 chars) per world and
-maintains a per-world ClusterIP Service (same name,
-`ray.io/cluster`/`ray.io/node-type=head` selector) because KubeRay's head
-service never exposes the graph-compute sidecar's gRPC port. A world's
-compute URL is `http://<cluster-name>.<compute-namespace>.svc:50051`.
+`graphCompute.session` loop (dispatch → admission → starting → ready; park
+deletes the Job, then the Service; idle auto-park; the
+`kueue.x-k8s.io/max-exec-time-seconds` hard cap). All world Jobs land in the
+same standing LocalQueue envelope (`graphCompute.kueue.queueName`). The chart
+renders the same Job manifest into a per-world template ConfigMap with a
+`__world__` name placeholder, mounted in the session-manager at
+`/etc/jump-cannon/gpu-world/job.yaml` (`JUMP_CANNON_SM_GPU_TEMPLATE`); the
+broker stamps `<release-fullname>-<world-slug>` (DNS-1123, ≤63 chars) per world
+and creates and deletes a per-world ClusterIP Service (same name,
+`batch.kubernetes.io/job-name` selector, targetPort `grpc`). A world's compute
+URL is `http://<job-name>.<compute-namespace>.svc:<compute port>`.
 `sessionManager.gpu` is mutually exclusive with `graphCompute.session` (a
 chart `fail` enforces this) and defaults its namespace to
-`graphCompute.namespace`; RBAC mirrors `rbac-gpu-session.yaml` plus
-`rayclusters list` and `services get/create/delete`. Timeouts
-(`idleSeconds`, `admissionTimeoutSeconds`, `maxExecTimeSeconds`,
-`headStartTimeoutSeconds`) mirror the `graphCompute.session` defaults.
+`graphCompute.namespace`; its RBAC is identical to `rbac-gpu-session.yaml`.
+The broker reads `JUMP_CANNON_SM_COMPUTE_NAMESPACE`, `..._RELEASE`,
+`..._COMPUTE_PORT`, `..._IDLE_SECONDS`, `..._ADMISSION_TIMEOUT`,
+`..._MAX_SECONDS`, and `..._START_TIMEOUT`, set from `idleSeconds`,
+`admissionTimeoutSeconds`, `maxExecTimeSeconds`, and `startTimeoutSeconds`,
+which mirror the `graphCompute.session` defaults.
 
 ## Kubernetes importer
 

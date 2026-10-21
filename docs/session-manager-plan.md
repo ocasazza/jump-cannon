@@ -30,7 +30,7 @@ and TerminusDB (cluster), Kueue-shared per-world GPU, and a multi-view UI.
   per-world ACLs. No OIDC flow in-app.
 - Two deployment targets are first-class: standalone browser/Tauri
   (wgpu + minigraf, no backend GPU) and multi-GPU cluster (TerminusDB +
-  Kueue-shared RayClusters for extremely large graphs).
+  Kueue-shared compute Jobs for extremely large graphs).
 
 ## What exists now
 
@@ -41,7 +41,7 @@ and TerminusDB (cluster), Kueue-shared per-world GPU, and a multi-view UI.
 | graph-api split (`api_router`/`router`), `build_world_state`, `WatchPlan::Push` wired | `crates/graph-api` | done, behavior unchanged |
 | `KubernetesSessionManager` server (`server` feature): auth middleware, VCS/session REST `/api/*`, per-world nested graph serving `/worlds/:name/*` (RwLock + tower oneshot mux), `WorldImporter` | `crates/session-manager` | done, 12 tests incl. HTTP conformance |
 | `HttpSessionManager` client (wasm-clean, reqwest) | `crates/session-manager/src/http.rs` | done |
-| `GpuBroker`: per-world RayClusters via wrapped `gpu_session::GpuSessionHandle`s, per-world compute Services, activity touch | `crates/session-manager/src/gpu_broker.rs` | done, disabled without template env |
+| `GpuBroker`: per-world compute Jobs via wrapped `gpu_session::GpuSessionHandle`s, per-world compute Services (created and deleted from Rust), activity touch | `crates/session-manager/src/gpu_broker.rs` | done, disabled without template env |
 | Helm: `sessionManager.*` values, Deployment/Service/PVC/RBAC/templates, `ci/session-manager.yaml`, mutual-exclusion `fail` vs `graphCompute.session` | `charts/jump-cannon` | done, helm template/lint green |
 | App views: `AppView::{User,Sessions}` topbar switcher, per-view workspaces (`jc_layout_v9` / `jc_sessions_layout_v1`), `Ctx.host: Arc<dyn WorldHost>`, world-aware `api::url` via `WORLD_BASE`. **View switching mounts in place** (persisted `jc_view` + `ctx.view.set`): the views own separate workspaces, servers, and world hosts; the distinct `UserWorkspaceView`/`SessionsWorkspaceView` component types keep the switch a clean unmount/mount of hook scopes. The open world persists as `jc_world` and re-mounts on return to Sessions. `window.__jc_boot` still stamps boot for the browser suite. | `app/ui/src/main.rs`, `api.rs` | done |
 | Sessions panels: Worlds, History, Branches, Merge, GPU Sessions. Settings also rides the Sessions dock (it carries the session-manager URL + x-user identity); palette jump-to-section commands are filtered at boot to panels the active view's workspace holds, and the new panels gate their empty states behind a first-fetch Spinner like the older panels. | `app/ui/src/panels/{worlds,history,branches,merge,gpu_sessions}.rs`, `palette.rs` | done |
@@ -96,7 +96,7 @@ exercised in a real browser:
   `multi_user` decides whether `sessions()` is `Some`. The UI hides
   session/membership UI when not multi-user.
 - GPU: `JUMP_CANNON_SM_GPU_TEMPLATE` + `_COMPUTE_NAMESPACE` etc. arm the
-  broker; chart mounts a `__world__`-placeholder RayCluster template.
+  broker; chart mounts a `__world__`-placeholder Job template.
   Compute URL pattern: `http://<release>-<world>.<ns>.svc:50051`.
 - panel-kit "views" (`use_views`, dynamic storage keys) is an upstream PR to
   the panel-kit repo — the app currently uses two static workspaces, which is
@@ -136,7 +136,7 @@ graph-vcs --all-features` stays green with no container runtime.
   wasm worlds, embedded-world canvas + commit editor.
 - **M8 closeout**: knowledge notes (`Session Manager.md`,
   `Worlds and Versioning.md`; update `Start Here.md`, `Architecture.md`,
-  `Compute.md`, `Kueue Scheduling.md`, `Ray GPU Sessions.md`,
+  `Compute.md`, `Kueue Scheduling.md`, `GPU Sessions.md`,
   `Security Model.md`), `docs/importer-architecture.md` Phase-3 checkboxes
   (Push watch plan landed), browser-rust Sessions-view boot check, final
   gates (`cargo check --workspace --tests`, `just app-check`,

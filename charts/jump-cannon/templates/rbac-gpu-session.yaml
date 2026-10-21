@@ -1,6 +1,6 @@
 {{- if and .Values.graphCompute.enabled .Values.graphCompute.session.enabled }}
 {{- if ne (int .Values.graphApi.replicas) 1 }}
-{{- fail "graphCompute.session.enabled requires graphApi.replicas == 1: two in-memory GPU session controllers would fight over the single RayCluster" }}
+{{- fail "graphCompute.session.enabled requires graphApi.replicas == 1: two in-memory GPU session controllers would fight over the single compute Job" }}
 {{- end }}
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
@@ -12,13 +12,32 @@ metadata:
     app.kubernetes.io/component: graph-api
 rules:
   - apiGroups:
-      - ray.io
+      - batch
     resources:
-      - rayclusters
+      - jobs
+    verbs:
+      - create
+      - get
+      - list
+      - watch
+      - delete
+  - apiGroups:
+      - ""
+    resources:
+      - services
+    verbs:
+      - create
+      - get
+      - delete
+  - apiGroups:
+      - ""
+    resources:
+      - pods
+      - pods/log
     verbs:
       - get
-      - create
-      - delete
+      - list
+      - watch
   - apiGroups:
       - kueue.x-k8s.io
     resources:
@@ -26,19 +45,7 @@ rules:
     verbs:
       - get
       - list
-  - apiGroups:
-      - ""
-    resources:
-      - pods
-    verbs:
-      - get
-      - list
-  - apiGroups:
-      - ""
-    resources:
-      - pods/log
-    verbs:
-      - get
+      - watch
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding

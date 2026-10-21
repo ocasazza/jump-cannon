@@ -1,7 +1,7 @@
 //! Compute-worker broker.
 //!
-//! graph-api dials a `graph-compute` worker (default `http://[::1]:50051`,
-//! override with `JUMP_CANNON_COMPUTE_URL`) and re-broadcasts each
+//! graph-api dials the `graph-compute` worker at `JUMP_CANNON_COMPUTE_URL`
+//! (unset or empty disables the broker) and re-broadcasts each
 //! `PositionDelta` it receives onto a `tokio::sync::broadcast` channel that
 //! the WebSocket handler subscribes to.
 //!
@@ -9,7 +9,7 @@
 //! endpoint never returns 503 for a transient worker outage. A background
 //! reconnect task keeps the gRPC stream alive across worker restarts using
 //! exponential backoff (1s → cap 30s, reset on a successful dial), covering
-//! local worker restarts and Kubernetes/Ray pod replacement alike.
+//! local worker restarts and Kubernetes pod replacement alike.
 
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -25,6 +25,15 @@ use graph_compute::proto::{
 };
 use graph_compute::service::json_to_struct;
 use graph_layouts::geometric::LensConfig;
+
+/// The configured worker URL, or `None` when the setting is unset, empty, or
+/// blank. An empty `JUMP_CANNON_COMPUTE_URL` disables the broker exactly like
+/// an unset one; it must never become a dial loop against an empty URL.
+pub fn configured_worker_url(raw: Option<&str>) -> Option<String> {
+    raw.map(str::trim)
+        .filter(|url| !url.is_empty())
+        .map(str::to_string)
+}
 
 #[derive(Clone)]
 pub struct ComputeBroker {
@@ -616,5 +625,33 @@ pub struct EngineView {
 impl Default for ComputeBroker {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unset_empty_and_blank_worker_urls_disable_the_broker() {
+        assert_eq!(configured_worker_url(None), None);
+        assert_eq!(configured_worker_url(Some("")), None);
+        assert_eq!(configured_worker_url(Some("  \t ")), None);
+    }
+
+    #[test]
+    fn configured_worker_url_is_trimmed() {
+        assert_eq!(
+            configured_worker_url(Some(" http://compute.gpu-workloads.svc:50051\n")),
+            Some("http://compute.gpu-workloads.svc:50051".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn broker_without_a_configured_url_is_not_configured() {
+        // main.rs only calls `connect_with` for `Some(url)`; an empty setting
+        // never reaches it, so the broker stays idle and dials nothing.
+        let broker = ComputeBroker::new();
+        assert!(!broker.is_configured().await);
     }
 }

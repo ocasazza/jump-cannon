@@ -209,7 +209,7 @@ struct SessionBroker {
 #[derive(Clone, Debug, Default, PartialEq, Deserialize)]
 struct ComputeSession {
     enabled: bool,
-    /// parked | dispatching | queued | admitted | head_starting | ready |
+    /// parked | dispatching | queued | admitted | starting | ready |
     /// parking | failed
     #[serde(default)]
     state: String,
@@ -2273,7 +2273,7 @@ fn session_status(state: &str) -> (&'static str, &'static str) {
         "ready" => ("●", "ok"),
         "failed" => ("⚠", "fail"),
         "parked" => ("○", "off"),
-        // dispatching | queued | admitted | head_starting | parking
+        // dispatching | queued | admitted | starting | parking
         _ => ("◐", "warm"),
     }
 }
@@ -2297,7 +2297,6 @@ fn session_state_label(session: &ComputeSession) -> String {
         "parked" => "parked".to_string(),
         "ready" => "ready".to_string(),
         "failed" => "failed".to_string(),
-        "head_starting" => format!("starting · {elapsed}"),
         other => format!("{other} · {elapsed}"),
     }
 }
@@ -3120,7 +3119,7 @@ fn session_console(
             false,
             "Park the cluster — releases the GPU quota".to_string(),
         ),
-        "dispatching" | "queued" | "admitted" | "head_starting" => (
+        "dispatching" | "queued" | "admitted" | "starting" => (
             "Park",
             false,
             "Cancel the dispatch and park the cluster".to_string(),
@@ -3436,7 +3435,7 @@ mod session_tests {
         assert_eq!(session_status("parked"), ("○", "off"));
         assert_eq!(session_status("ready"), ("●", "ok"));
         assert_eq!(session_status("failed"), ("⚠", "fail"));
-        for warm in ["dispatching", "queued", "admitted", "head_starting", "parking"] {
+        for warm in ["dispatching", "queued", "admitted", "starting", "parking"] {
             assert_eq!(session_status(warm), ("◐", "warm"), "state {warm}");
         }
     }

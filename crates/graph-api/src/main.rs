@@ -35,8 +35,8 @@ struct Args {
     /// frontend dist, e.g. app/ui/dist). Without it, assets 404.
     #[arg(long, env = "JUMP_CANNON_ASSETS_DIR")]
     assets_dir: Option<PathBuf>,
-    /// URL of the graph-compute gRPC worker. When unset, the compute broker
-    /// is disabled.
+    /// URL of the graph-compute gRPC worker. When unset or empty, the compute
+    /// broker is disabled.
     #[arg(long, env = "JUMP_CANNON_COMPUTE_URL")]
     compute_url: Option<String>,
     /// Disable the filesystem watcher. Useful for one-shot CLI usage; the
@@ -170,24 +170,32 @@ struct Args {
     /// Filesystem input bound to --importer-manifest. Required by --source=pest.
     #[arg(long, env = "JUMP_CANNON_IMPORTER_INPUT")]
     importer_input: Option<PathBuf>,
-    /// Path to the chart-rendered RayCluster session template (JSON, mounted
-    /// from a ConfigMap). When set (and a kube client is available), the
-    /// on-demand GPU session controller runs; unset = the feature is fully
+    /// Path to the chart-rendered compute Job session template (YAML or JSON,
+    /// mounted from a ConfigMap). When set (and a kube client is available),
+    /// the on-demand GPU session controller runs; unset = the feature is fully
     /// disabled and /compute/session reports {"enabled": false}.
     #[arg(long, env = "JUMP_CANNON_GPU_SESSION_TEMPLATE")]
     gpu_session_template: Option<PathBuf>,
-    /// Stable RayCluster name for the session (the chart passes its fullname
-    /// so Rust never duplicates Helm naming logic). Required with
+    /// Stable name of the session Job and its Service (the chart passes its
+    /// fullname so Rust never duplicates Helm naming logic). Required with
     /// --gpu-session-template.
     #[arg(long, env = "JUMP_CANNON_GPU_SESSION_CLUSTER_NAME")]
     gpu_session_cluster_name: Option<String>,
-    /// Namespace holding the session RayCluster + Kueue Workloads.
+    /// Namespace holding the session Job, Service, and Kueue Workloads.
     #[arg(
         long,
         env = "JUMP_CANNON_GPU_SESSION_NAMESPACE",
         default_value = "gpu-workloads"
     )]
     gpu_session_namespace: String,
+    /// graph-compute gRPC port the session Service exposes (the chart passes
+    /// graphCompute.service.port).
+    #[arg(
+        long,
+        env = "JUMP_CANNON_GPU_SESSION_COMPUTE_PORT",
+        default_value_t = 50051
+    )]
+    gpu_session_compute_port: u16,
     /// Idle auto-park timeout in seconds (no layout subscribers).
     #[arg(
         long,
@@ -210,14 +218,13 @@ struct Args {
         default_value_t = 14400
     )]
     gpu_session_max_seconds: u64,
-    /// Head-start timeout in seconds (admitted → ready) before the session
-    /// fails.
+    /// Start timeout in seconds (admitted → ready) before the session fails.
     #[arg(
         long,
-        env = "JUMP_CANNON_GPU_SESSION_HEAD_START_TIMEOUT",
+        env = "JUMP_CANNON_GPU_SESSION_START_TIMEOUT",
         default_value_t = 900
     )]
-    gpu_session_head_start_timeout_seconds: u64,
+    gpu_session_start_timeout_seconds: u64,
 }
 
 #[tokio::main]
@@ -528,7 +535,9 @@ async fn main() -> anyhow::Result<()> {    let _ = dotenvy::dotenv();
     }?
     .with_gpu_session(gpu_session);
 
-    if let Some(compute_url) = args.compute_url.clone() {
+    if let Some(compute_url) =
+        graph_api::compute_broker::configured_worker_url(args.compute_url.as_deref())
+    {
         let broker = compute_broker.clone();
         // ADR-002: pick + tune the remote layout engine from env. Empty/unset
         // ⇒ the worker's startup default (backward compatible).
@@ -553,7 +562,7 @@ async fn main() -> anyhow::Result<()> {    let _ = dotenvy::dotenv();
         });
     } else {
         tracing::info!(
-            "compute broker disabled (no --compute-url / JUMP_CANNON_COMPUTE_URL); \
+            "compute broker disabled (--compute-url / JUMP_CANNON_COMPUTE_URL unset or empty); \
              /graph/layout/stream will return 503"
         );
     }
@@ -717,18 +726,55 @@ async fn build_gpu_session(
         GpuSessionConfig {
             cluster_name,
             namespace: args.gpu_session_namespace.clone(),
+            compute_port: args.gpu_session_compute_port,
             template,
             idle_timeout: std::time::Duration::from_secs(args.gpu_session_idle_seconds),
             admission_timeout: std::time::Duration::from_secs(
                 args.gpu_session_admission_timeout_seconds,
             ),
             max_session: std::time::Duration::from_secs(args.gpu_session_max_seconds),
-            head_start_timeout: std::time::Duration::from_secs(
-                args.gpu_session_head_start_timeout_seconds,
+            start_timeout: std::time::Duration::from_secs(
+                args.gpu_session_start_timeout_seconds,
             ),
         },
         client,
         broker,
         progress,
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use graph_api::compute_broker::configured_worker_url;
+
+    #[test]
+    fn empty_compute_url_flag_disables_the_broker() {
+        let args = Args::try_parse_from(["graph-api", "--compute-url", ""]).expect("parses");
+        assert_eq!(configured_worker_url(args.compute_url.as_deref()), None);
+    }
+
+    #[test]
+    fn empty_compute_url_env_disables_the_broker() {
+        // A deployment that renders the key with no value behaves like one
+        // that omits it; only this test touches the variable.
+        std::env::set_var("JUMP_CANNON_COMPUTE_URL", "");
+        let args = Args::try_parse_from(["graph-api"]).expect("parses");
+        std::env::remove_var("JUMP_CANNON_COMPUTE_URL");
+        assert_eq!(configured_worker_url(args.compute_url.as_deref()), None);
+    }
+
+    #[test]
+    fn configured_compute_url_enables_the_broker() {
+        let args = Args::try_parse_from([
+            "graph-api",
+            "--compute-url",
+            "http://jump-cannon-compute.gpu-workloads.svc:50051",
+        ])
+        .expect("parses");
+        assert_eq!(
+            configured_worker_url(args.compute_url.as_deref()).as_deref(),
+            Some("http://jump-cannon-compute.gpu-workloads.svc:50051")
+        );
+    }
 }
