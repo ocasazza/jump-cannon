@@ -8,7 +8,7 @@ tags: [jump-cannon, helm]
 
 # Helm Deployment
 
-`charts/jump-cannon` packages graph-api, frontend assets, optional Ray compute,
+`charts/jump-cannon` packages graph-api, frontend assets, optional GPU compute,
 scheduled tests, and this knowledge graph. Build the release artifact with
 `nix build .#chart-tarball`; Hydra publishes the resulting chart through the
 secured chart cache.
@@ -119,6 +119,6 @@ cluster policy, credentials, NetBird resources, and Gateway routes. Continue
 through [[GitOps Release]], [[Security Model]], and [[Scheduled Tests]].
 
 This is the production infrastructure boundary for Jump Cannon, including the
-optional GPU-backed RayCluster. Local Docker Compose remains development-only;
+optional GPU-backed compute Job. Local Docker Compose remains development-only;
 parallel repository-level infrastructure stacks are intentionally not
 maintained.
