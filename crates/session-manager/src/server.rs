@@ -417,7 +417,7 @@ async fn close_world(
             // Park the world's GPU session (if any) — a closed world must
             // not hold Kueue quota.
             if let Some(broker) = s.inner.manager.gpu_broker() {
-                broker.retire(&id).await;
+                broker.retire(&id);
             }
             Json(json!({ "ok": true })).into_response()
         }
@@ -515,12 +515,8 @@ async fn compute_dispatch(
         Ok(parts) => parts,
         Err(resp) => return resp,
     };
-    match broker.dispatch(&id, &compute_broker, &progress).await {
-        Ok(state) => Json(json!({ "ok": true, "state": state.as_str(), "error": null }))
-            .into_response(),
-        Err(e) => Json(json!({ "ok": false, "state": null, "error": format!("{e:#}") }))
-            .into_response(),
-    }
+    let state = broker.dispatch(&id, &compute_broker, &progress).await;
+    Json(json!({ "ok": true, "state": state.as_str(), "error": null })).into_response()
 }
 
 async fn compute_park(
@@ -538,12 +534,8 @@ async fn compute_park(
     let Some(broker) = s.inner.manager.gpu_broker() else {
         return gpu_disabled_response();
     };
-    match broker.park(&id).await {
-        Ok(state) => Json(json!({ "ok": true, "state": state.as_str(), "error": null }))
-            .into_response(),
-        Err(e) => Json(json!({ "ok": false, "state": null, "error": format!("{e:#}") }))
-            .into_response(),
-    }
+    let state = broker.park(&id);
+    Json(json!({ "ok": true, "state": state.as_str(), "error": null })).into_response()
 }
 
 async fn compute_session(State(s): State<ServerState>, Path(id): Path<String>) -> Response {

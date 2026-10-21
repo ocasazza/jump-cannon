@@ -170,24 +170,32 @@ struct Args {
     /// Filesystem input bound to --importer-manifest. Required by --source=pest.
     #[arg(long, env = "JUMP_CANNON_IMPORTER_INPUT")]
     importer_input: Option<PathBuf>,
-    /// Path to the chart-rendered RayCluster session template (JSON, mounted
-    /// from a ConfigMap). When set (and a kube client is available), the
-    /// on-demand GPU session controller runs; unset = the feature is fully
+    /// Path to the chart-rendered compute Job session template (YAML or JSON,
+    /// mounted from a ConfigMap). When set (and a kube client is available),
+    /// the on-demand GPU session controller runs; unset = the feature is fully
     /// disabled and /compute/session reports {"enabled": false}.
     #[arg(long, env = "JUMP_CANNON_GPU_SESSION_TEMPLATE")]
     gpu_session_template: Option<PathBuf>,
-    /// Stable RayCluster name for the session (the chart passes its fullname
-    /// so Rust never duplicates Helm naming logic). Required with
+    /// Stable name of the session Job and its Service (the chart passes its
+    /// fullname so Rust never duplicates Helm naming logic). Required with
     /// --gpu-session-template.
     #[arg(long, env = "JUMP_CANNON_GPU_SESSION_CLUSTER_NAME")]
     gpu_session_cluster_name: Option<String>,
-    /// Namespace holding the session RayCluster + Kueue Workloads.
+    /// Namespace holding the session Job, Service, and Kueue Workloads.
     #[arg(
         long,
         env = "JUMP_CANNON_GPU_SESSION_NAMESPACE",
         default_value = "gpu-workloads"
     )]
     gpu_session_namespace: String,
+    /// graph-compute gRPC port the session Service exposes (the chart passes
+    /// graphCompute.service.port).
+    #[arg(
+        long,
+        env = "JUMP_CANNON_GPU_SESSION_COMPUTE_PORT",
+        default_value_t = 50051
+    )]
+    gpu_session_compute_port: u16,
     /// Idle auto-park timeout in seconds (no layout subscribers).
     #[arg(
         long,
@@ -210,14 +218,13 @@ struct Args {
         default_value_t = 14400
     )]
     gpu_session_max_seconds: u64,
-    /// Head-start timeout in seconds (admitted → ready) before the session
-    /// fails.
+    /// Start timeout in seconds (admitted → ready) before the session fails.
     #[arg(
         long,
-        env = "JUMP_CANNON_GPU_SESSION_HEAD_START_TIMEOUT",
+        env = "JUMP_CANNON_GPU_SESSION_START_TIMEOUT",
         default_value_t = 900
     )]
-    gpu_session_head_start_timeout_seconds: u64,
+    gpu_session_start_timeout_seconds: u64,
 }
 
 #[tokio::main]
@@ -719,14 +726,15 @@ async fn build_gpu_session(
         GpuSessionConfig {
             cluster_name,
             namespace: args.gpu_session_namespace.clone(),
+            compute_port: args.gpu_session_compute_port,
             template,
             idle_timeout: std::time::Duration::from_secs(args.gpu_session_idle_seconds),
             admission_timeout: std::time::Duration::from_secs(
                 args.gpu_session_admission_timeout_seconds,
             ),
             max_session: std::time::Duration::from_secs(args.gpu_session_max_seconds),
-            head_start_timeout: std::time::Duration::from_secs(
-                args.gpu_session_head_start_timeout_seconds,
+            start_timeout: std::time::Duration::from_secs(
+                args.gpu_session_start_timeout_seconds,
             ),
         },
         client,

@@ -401,9 +401,9 @@ impl WorldHost for KubernetesSessionManager {
         Box::pin(async move {
             self.require_open(id)?;
             // With the GPU broker installed the world has an on-demand
-            // compute endpoint: the per-world Service DNS name is stable
-            // whether or not a session is currently dispatched (zero
-            // endpoints while parked); dispatch happens via the REST API.
+            // compute endpoint: the per-world Service DNS name is stable, the
+            // Service itself exists only while a session is dispatched
+            // (dispatch happens via the REST API).
             match self.gpu_broker() {
                 Some(broker) => Ok(ComputeHandle::RemoteGrpc {
                     url: broker.compute_url(id),
