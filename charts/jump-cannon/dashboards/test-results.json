@@ -2,9 +2,10 @@
   "title": "jump-cannon \u2014 Test Results",
   "uid": "jump-cannon-test-results",
   "tags": [
-    "jump-cannon",
-    "ci",
-    "tests"
+    "sys_team.it_ops",
+    "dash_component.jump_cannon",
+    "dash_audience.engineer",
+    "dash_kind.overview"
   ],
   "timezone": "browser",
   "schemaVersion": 41,
