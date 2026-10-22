@@ -15,8 +15,10 @@ routes for the nixstation cluster.
 Every JSON under `dashboards/` renders as a `grafana_dashboard`-labeled
 ConfigMap so the app ships the dashboards it is measured by. The monitoring
 stack's Grafana sidecar (k8s-sidecar watching `grafana_dashboard=1`) loads
-them into its provisioned charts folder; the test-results dashboard reads the
-Pushgateway gauges the nightly CronJobs push. Disable with
+them into its `apps` folder; the test-results dashboard reads the
+Pushgateway gauges the nightly CronJobs push. Dashboard tags follow the
+[dashboard tag convention](https://github.com/schrodinger/envoy-ai-gateway/blob/main/docs/developer/cluster/dashboard-tags.md).
+Disable with
 `grafanaDashboards.enabled=false`; the label key/value are configurable via
 `grafanaDashboards.label` / `grafanaDashboards.labelValue`.
 
