@@ -43,11 +43,11 @@ pub(crate) fn badge_kind_for(field: &str) -> BadgeKind {
 /// counterpart, so it keeps its hex).
 pub(crate) fn status_color(s: &str) -> Option<&'static str> {
     match s.to_ascii_lowercase().as_str() {
-        "active" | "done" | "ok" | "ready" | "passed" => Some("var(--green)"),
-        "failed" | "blocked" | "broken" | "error" => Some("var(--red)"),
-        "needs-review" | "needs-fetch" | "in-progress" | "wip" => Some("var(--yellow)"),
+        "active" | "done" | "ok" | "ready" | "passed" => Some("var(--color-success)"),
+        "failed" | "blocked" | "broken" | "error" => Some("var(--color-failure)"),
+        "needs-review" | "needs-fetch" | "in-progress" | "wip" => Some("var(--color-warning)"),
         "draft" | "pending" => Some("#3b9bff"),
-        "archived" | "deprecated" | "stale" => Some("var(--fg)"),
+        "archived" | "deprecated" | "stale" => Some("var(--color-text)"),
         _ => None,
     }
 }
@@ -442,7 +442,7 @@ fn string_chip(
         return rsx! {
             Badge {
                 spec,
-                accent_color: Some("var(--yellow)".to_string()),
+                accent_color: Some("var(--color-warning)".to_string()),
                 on_action: move |a| match a {
                     BadgeAction::Clicked { .. } => {
                         on_action.call(BadgeAction::Navigate { target: ticket.clone() })

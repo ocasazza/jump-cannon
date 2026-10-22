@@ -32,6 +32,7 @@ use dioxus::prelude::*;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 
+use graph_layouts::Species;
 pub use pipelines::{GraphData as Scene, RenderHost};
 pub use region_map::{RegionLevel, RegionMapConfig, RegionMode};
 
@@ -113,6 +114,11 @@ struct Ctl {
     last_tick_ms: f64,
     selected: Option<u32>,
     highlights: Option<HashSet<u32>>,
+    /// Per-node particle species for the amphiphile engine. Survives host
+    /// rebuilds so a minimize/restore (which reboots the host into gpu-force)
+    /// re-seeds the species mirror before the Layout panel re-applies the
+    /// amphiphile engine onto the fresh host.
+    species: Vec<Species>,
     sim_running: bool,
     /// Monotonic mount generation — a stale async init must not clobber
     /// a newer mount's host.
@@ -263,11 +269,13 @@ fn reapply_ctl_state() {
         let c = c.borrow();
         (c.selected, c.highlights.clone(), c.sim_running)
     });
+    let species = CTL.with(|c| c.borrow().species.clone());
     with_host(|h| {
         let (pipes, queue) = h.pipes_and_queue();
         pipes.set_selected_emphasis(queue, selected, SELECT_EMPHASIS);
         pipes.set_selected(queue, highlights.as_ref());
         pipes.set_sim_running(sim_running);
+        pipes.set_species(queue, &species);
     });
     // Filter evaluation lives outside renderer mount state. Reapply its last
     // valid result after a canvas/host rebuild just as we do selection and
