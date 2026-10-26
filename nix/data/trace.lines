@@ -1,0 +1,63 @@
+N|orchestrator|Orchestrator|agent|core,entry|latency_ms=12.5;energy=184;t=0;status=ok
+N|planner|Planner|agent|core,plan|latency_ms=31.0;energy=242;t=1;status=ok
+N|researcher|Researcher|agent|io,net|latency_ms=88.4;energy=361;t=2;status=warn
+N|reviewer|Reviewer|agent|gate|latency_ms=64.2;energy=298;t=3;status=ok
+N|summarizer|Summarizer|agent|output,text|latency_ms=27.9;energy=141;t=4;status=ok
+N|archivist|Archivist|agent|memory-ops,index|latency_ms=45.1;energy=207;t=5;status=info
+N|read_file|Read File|tool|io,fs|latency_ms=8.4;energy=12;t=6;status=ok
+N|grep_repo|Grep Repo|tool|io,search|latency_ms=22.7;energy=38;t=7;status=ok
+N|run_tests|Run Tests|tool|gate,build|latency_ms=1840.0;energy=902;t=8;status=error
+N|web_search|Web Search|tool|net,io|latency_ms=412.6;energy=133;t=9;status=warn
+N|sql_query|SQL Query|tool|data,io|latency_ms=96.3;energy=84;t=10;status=ok
+N|git_diff|Git Diff|tool|vcs,io|latency_ms=19.8;energy=21;t=11;status=ok
+N|compile_wasm|Compile WASM|tool|build,wasm|latency_ms=1260.5;energy=1440;t=12;status=warn
+N|render_chart|Render Chart|tool|ui,io|latency_ms=54.2;energy=67;t=13;status=ok
+N|send_mail|Send Mail|tool|net,out|latency_ms=71.4;energy=29;t=14;status=info
+N|build_index|Build Index|tool|search,build|latency_ms=610.9;energy=488;t=15;status=warn
+N|episodic_log|Episodic Log|memory|log,append|latency_ms=3.2;energy=6;t=16;status=ok
+N|task_board|Task Board|memory|board,state|latency_ms=5.7;energy=9;t=17;status=ok
+N|code_index|Code Index|memory|search,index|latency_ms=14.6;energy=44;t=18;status=ok
+N|note_store|Note Store|memory|notes,append|latency_ms=7.1;energy=11;t=19;status=ok
+N|cache_hot|Cache Hot|memory|cache,ttl|latency_ms=1.9;energy=3;t=20;status=ok
+N|trace_ring|Trace Ring|memory|log,ring|latency_ms=2.4;energy=5;t=21;status=warn
+N|budget_ledger|Budget Ledger|memory|cost,ledger|latency_ms=4.1;energy=8;t=22;status=warn
+N|spec_mirror|Spec Mirror|memory|schema,mirror|latency_ms=11.5;energy=26;t=23;status=info
+E|orchestrator|planner|invokes
+E|orchestrator|researcher|invokes
+E|orchestrator|summarizer|invokes
+E|orchestrator|run_tests|invokes
+E|orchestrator|build_index|invokes
+E|planner|researcher|invokes
+E|planner|reviewer|invokes
+E|planner|git_diff|invokes
+E|planner|read_file|invokes
+E|researcher|web_search|invokes
+E|researcher|grep_repo|invokes
+E|researcher|sql_query|invokes
+E|researcher|read_file|invokes
+E|reviewer|run_tests|invokes
+E|reviewer|git_diff|invokes
+E|reviewer|compile_wasm|invokes
+E|reviewer|grep_repo|invokes
+E|summarizer|render_chart|invokes
+E|summarizer|send_mail|invokes
+E|archivist|build_index|invokes
+E|orchestrator|episodic_log|reads
+E|orchestrator|task_board|reads
+E|planner|task_board|reads
+E|planner|code_index|reads
+E|researcher|note_store|reads
+E|researcher|code_index|reads
+E|researcher|cache_hot|reads
+E|reviewer|cache_hot|reads
+E|reviewer|trace_ring|reads
+E|reviewer|budget_ledger|reads
+E|summarizer|episodic_log|reads
+E|summarizer|note_store|reads
+E|archivist|code_index|reads
+E|archivist|spec_mirror|reads
+E|archivist|budget_ledger|reads
+E|run_tests|trace_ring|reads
+E|compile_wasm|cache_hot|reads
+E|build_index|code_index|reads
+E|render_chart|cache_hot|reads

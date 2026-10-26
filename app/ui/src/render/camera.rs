@@ -17,6 +17,17 @@ impl Projection {
     pub const DEFAULT_FOV_Y: f32 = std::f32::consts::FRAC_PI_3; // 60°
 }
 
+/// Everything about the view except the viewport: see [`Camera::pose`].
+#[derive(Clone, Copy, Debug)]
+pub struct CameraPose {
+    pub position: Vec3,
+    pub yaw: f32,
+    pub pitch: f32,
+    pub projection: Projection,
+    pub znear: f32,
+    pub zfar: f32,
+}
+
 #[derive(Clone)]
 pub struct Camera {
     pub position: Vec3,
@@ -33,6 +44,31 @@ pub struct Camera {
 }
 
 impl Camera {
+    /// The view pose, independent of viewport size: what a remount must keep
+    /// so a rebuilt renderer does not throw the user's framing away.
+    pub fn pose(&self) -> CameraPose {
+        CameraPose {
+            position: self.position,
+            yaw: self.yaw,
+            pitch: self.pitch,
+            projection: self.projection,
+            znear: self.znear,
+            zfar: self.zfar,
+        }
+    }
+
+    /// Adopt a carried pose, keeping this camera's aspect (the new canvas may
+    /// have different dimensions than the one the pose came from).
+    pub fn set_pose(&mut self, pose: CameraPose) {
+        self.position = pose.position;
+        self.initial_position = pose.position;
+        self.yaw = pose.yaw;
+        self.pitch = pose.pitch;
+        self.projection = pose.projection;
+        self.znear = pose.znear;
+        self.zfar = pose.zfar;
+    }
+
     pub fn new(aspect: f32) -> Self {
         let position = Vec3::new(0.0, 0.0, 1500.0);
         Self {

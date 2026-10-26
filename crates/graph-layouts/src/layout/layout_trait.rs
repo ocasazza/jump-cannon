@@ -13,6 +13,7 @@ use serde_json::Value;
 
 use crate::layout::algorithms::gpu_force::CsrInput;
 use crate::layout::algorithms::gpu_force::{EdgePhysics, NodePhysics};
+use crate::layout::algorithms::amphiphile::Species;
 use crate::types::Graph;
 
 /// Stable string identifier for a registered layout. Used as the registry
@@ -128,6 +129,13 @@ pub trait PhysicsLayout: Send + Sync {
         Ok(())
     }
 
+    /// Replace the live particle species (in place, no re-init). Layouts
+    /// without species keep the default error so hosts can tell them apart.
+    fn set_species(&mut self, queue: &wgpu::Queue, species: &[Species]) -> Result<(), String> {
+        let _ = (queue, species);
+        Err("this layout has no particle species".into())
+    }
+
     fn is_halted(&self) -> bool { false }
     fn last_max_ke(&self) -> f32 { 0.0 }
     fn wake(&mut self) {}
@@ -174,6 +182,7 @@ pub trait DynPhysicsLayout: Send + Sync {
 
     fn set_node_physics(&mut self, queue: &wgpu::Queue, physics: &[NodePhysics]) -> Result<(), String>;
     fn set_edge_physics(&mut self, queue: &wgpu::Queue, physics: &[EdgePhysics]) -> Result<(), String>;
+    fn set_species(&mut self, queue: &wgpu::Queue, species: &[Species]) -> Result<(), String>;
 
     fn is_halted(&self) -> bool;
     fn last_max_ke(&self) -> f32;
@@ -282,6 +291,10 @@ impl<T: PhysicsLayout + 'static> DynPhysicsLayout for BoxedPhysics<T> {
 
     fn set_edge_physics(&mut self, queue: &wgpu::Queue, physics: &[EdgePhysics]) -> Result<(), String> {
         self.inner.set_edge_physics(queue, physics)
+    }
+
+    fn set_species(&mut self, queue: &wgpu::Queue, species: &[Species]) -> Result<(), String> {
+        self.inner.set_species(queue, species)
     }
 
     fn is_halted(&self) -> bool { self.inner.is_halted() }

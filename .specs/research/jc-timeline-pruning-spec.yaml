@@ -1,0 +1,279 @@
+rrd_cycle_applied: true
+self_verification_completed: true
+
+evaluation_specification:
+  metadata:
+    user_prompt: "implement /skill:impeccable live task execution timeline views; animated DAG(ish) task / transformation execution / uses the bones of the twix generators but applies lazy parameterized graph iterators / functional array[like] programming techniques (map, reduce, filter, etc...) to transform the graph. In this case the generic rust transformation struct will be implemented by our topos to be a 'dream' consolidation and labeling of the graph on a periodic basis. We also need a UI/UX element that lets us see upcoming / past scheduled runs. Also: better node level content in the UI/backend — right now if you click on a node its not much info / doesnt show whats going on."
+    artifact_type: "design proposals (high-level approaches with success-probability estimates; explicitly NOT implementations — Phase 1 of a tree-of-thought exercise)"
+    subject: "jump-cannon — Rust workspace; Dioxus/wgpu frontend, axum graph-api, ArcSwap<GraphSnapshot> single-snapshot serving, format_version=3 TOML importer packages, tvix-eval Nix generator engine"
+    usage: >
+      Judge one proposal at a time. First resolve every checklist item as YES/NO from the
+      proposal text. Any `essential` item answered NO caps the overall score at 2.0. Any
+      `pitfall` item answered YES is a quality defect and lowers the score. Then score each
+      rubric dimension 1-5 by placing the artifact between its `score_2` and `score_4`
+      anchors. The total is the weight-sum of dimension scores divided by 5. Rank proposals
+      by that total, breaking ties on D1 (Core abstraction generality) then D3 (Per-run state
+      model), because those are the two failure modes that cannot be fixed after the fact.
+    split_of_responsibilities: >
+      Checklist items are binary GATES: they ask whether a specific required or forbidden thing
+      is present. Rubric dimensions are GRADES: they ask how well the thing that is present is
+      done. The overlap is deliberate and non-double-counting — e.g. CK-002 asks "does the
+      core contain agent vocabulary at all?" (gate) while D1 asks "given it does not, is the
+      run semantics expressed in graph terms?" (grade).
+
+  checklist:
+    - id: "CK-001"
+      question: "Is the transformation expressed as configuration in the existing `format_version = 3` package model — reusing the `tvix` engine's `{expr, [[parser.variables]]}` mechanism with values bound per application — rather than as a new crate, a new `SourceKind`/`CatalogSourceKind` variant, a `graph-api` match arm, or per-source `--flags`?"
+      category: "hard_rule"
+      importance: "essential"
+      rationale: "AGENTS.md 'Importers: packages, not crates' is the repo's hard law, and the tvix engine already IS 'describe once, bind parameters at apply time'. A proposal that adds compiled surface for what is data is infeasible in this repo regardless of its merit."
+    - id: "CK-002"
+      question: "Do all core types, fields, endpoints, and panels introduced by the proposal speak only graph/transformation vocabulary — with no `session`, `agent`, `tool call`, `goal`, `omp`, or local filesystem path anywhere in the shared core?"
+      category: "hard_rule"
+      importance: "essential"
+      rationale: "The requester explicitly asked not to overfit to their personal agent loop and noted the feature lands upstream. Personal-vocabulary in the core is the single clearest overfitting signal."
+    - id: "CK-003"
+      question: "Is every proposed UI element Rust + Dioxus (panel-kit, wgpu), with no hand-written JavaScript/TypeScript, no JS bundler, no three.js/OrbitControls/Cosmograph, and no JS protobuf shim?"
+      category: "hard_rule"
+      importance: "essential"
+      rationale: "AGENTS.md hard rule; the animation layer is exactly where an otherwise good proposal is likely to reach for a JS tween/easing library."
+    - id: "CK-004"
+      question: "Does the animated DAG view specify a `prefers-reduced-motion` variant (and a non-animated equivalent that conveys the same state)?"
+      category: "hard_rule"
+      importance: "essential"
+      rationale: "AGENTS.md mandates reduced-motion variants under the impeccable.style vocabulary. An animated DAG is the feature's centrepiece; motion without a reduced-motion path is a spec defect, not a polish item."
+    - id: "CK-005"
+      question: "Is every progress/loading indication in the new UI either a measured percentage or an explicitly indeterminate state — never a fabricated or interpolated number?"
+      category: "hard_rule"
+      importance: "important"
+      rationale: "AGENTS.md 'honest progress (measured % or explicit indeterminate, never a fabricated number)'. Timeline playback naturally tempts a synthesised completion percentage."
+    - id: "CK-006"
+      question: "Do new asynchronously loaded panels use panel-kit's store-shaped hydration (`loading_store` + `begin`/`update`/`succeed`/`fail` + `LoadingGate`, aggregated by `GlobalLoadingBar`) rather than hand-rolled `loaded` signals or a bare `Spinner` for a panel-level wait?"
+      category: "hard_rule"
+      importance: "important"
+      rationale: "AGENTS.md removed the old `imp-progress` CSS and mandates the panel-kit path explicitly; the Runs/Scheduled panel is a new store-shaped surface."
+    - id: "CK-007"
+      question: "Does the proposal reuse the existing HTTP surface (`/graph/*`, `/node/*id`, `/progress?since=`, `/importers*`, `POST /generate`) or, for each new endpoint it adds, state why no existing endpoint fits?"
+      category: "hard_rule"
+      importance: "essential"
+      rationale: "The serving model is a single ArcSwap<GraphSnapshot> with a revision counter and a fixed route set; unexamined new endpoints usually mean the proposal has not understood that model."
+    - id: "CK-008"
+      question: "Does the per-run state model impose an explicit bound — retention window, run count cap, or keyframe interval — rather than accumulating whole-graph state per run?"
+      category: "hard_rule"
+      importance: "essential"
+      rationale: "Unbounded per-run full-graph retention is the one design in this space that cannot ship. Boundedness is binary: either the proposal states a policy or it does not."
+    - id: "CK-009"
+      question: "Does the proposal specify what happens when a transformation's output exceeds the tvix caps (1M nodes / 4M edges, overridable by `JC_MAX_NODES`/`JC_MAX_EDGES`) — recorded as a failed run with a visible reason, never a crash, a hang, or a silently truncated graph?"
+      category: "hard_rule"
+      importance: "essential"
+      rationale: "`crates/tvix-wasm/src/lib.rs` caps output and errors with a message; tvix has no fuel/step limit, so a runaway periodic transform is the default failure mode, not an edge case."
+    - id: "CK-010"
+      question: "Does the Nix-side work respect the tvix closure-across-3+-imports bug — i.e. do new combinators/transform modules receive `graph` as an explicit parameter (the `graph-combinators.nix { graph }` pattern) rather than importing `graph.nix` directly, with the workaround named?"
+      category: "hard_rule"
+      importance: "important"
+      rationale: "This bug is documented in the file headers and it dictates the module structure of the whole transformation library; a proposal unaware of it will not survive first contact with tvix."
+    - id: "CK-011"
+      question: "Does the proposal name concrete file paths and symbols it will change (e.g. `crates/tvix-wasm/src/nix/graph-combinators.nix`, `crates/importer/src/tvix.rs`, `crates/vault-data/src/node.rs`, `crates/graph-api/src/server.rs`, `app/ui/src/panels/*`)?"
+      category: "principle"
+      importance: "important"
+      rationale: "At proposal stage, named integration points are the only evidence of feasibility. Absence is not automatically wrong, but it removes the proposer's claims from being checkable."
+    - id: "CK-012"
+      question: "Does the proposal demonstrate generality with at least one worked example that is NOT the requester's omp-auto-loop (e.g. re-clustering a Kubernetes cluster graph on a cadence, rolling-window topic scoring over a GitHub corpus, or nightly consolidation of an Obsidian vault)?"
+      category: "principle"
+      importance: "important"
+      rationale: "The requester asked the team to 'see how other users would take advantage of this feature'. A non-omp example is the observable form of that; it also stress-tests whether the core abstraction really is graph-generic."
+    - id: "CK-013"
+      question: "Does the proposal name the required `charts/jump-cannon/knowledge/` map update as part of the same change (AGENTS.md: behavior/deployment changes must update the affected notes and wikilinks in the same change)?"
+      category: "hard_rule"
+      importance: "important"
+      rationale: "A cheap, binary repo convention that a serious upstreamable proposal will already account for."
+    - id: "CK-014"
+      question: "Is the transformation expression designed to take NO filesystem or network input at evaluation time (all external state arriving as declared, typed variables), consistent with tvix-eval being built `default-features = false` with impure/arbitrary builtins removed?"
+      category: "hard_rule"
+      importance: "essential"
+      rationale: "The pure tvix build makes FS/network access impossible. A proposal whose transform 'reads the events file' is infeasible as written, and the workaround (a re-import/re-bind per run) must be stated."
+    - id: "CK-015"
+      question: "Does the proposal specify what the UI shows when a run fails, times out, or yields an empty graph — e.g. previous state retained, run marked failed with a reason — rather than leaving the canvas to blank?"
+      category: "hard_rule"
+      importance: "important"
+      rationale: "Correctness of animated state is invisible until it is wrong; empty-result transforms are common (a filter that matches nothing this interval)."
+    - id: "CK-016"
+      question: "Is the artifact a design proposal — approach, trade-offs, seams, phases, risks — rather than an implementation, patch, or a claim that code has been written?"
+      category: "hard_rule"
+      importance: "essential"
+      rationale: "This is Phase 1 of a tree-of-thought exercise; the deliverable being ranked is the approach, so code volume is a defect, not a merit."
+    - id: "CK-017"
+      question: "Does the proposal state a success-probability / confidence estimate for the approach itself?"
+      category: "principle"
+      importance: "optional"
+      rationale: "The exercise asks for approaches with probability estimates; an unestimated proposal is incomplete but not fatally so."
+    - id: "CK-018"
+      question: "Does the proposal treat the existing `app/ui/src/panels/timeline.rs` position-frame scrub ring as if it already were the run timeline (scrubbing node positions, play/pause/step, `jc_timeline_v1`) rather than recognising it as a different thing from run history?"
+      category: "pitfall"
+      importance: "pitfall"
+      rationale: "`timeline.rs` is a 768-line keyframe+delta position ring over the live GPU sim. A new run timeline is a different object; conflating them produces either a wrong reuse or a duplicated surface."
+    - id: "CK-019"
+      question: "Does the proposal introduce its own scheduler/runtime — a tokio task per transformation with its own interval, a job queue, a cron thread — instead of reusing the existing watch/reload tick loop and `WatchPlan`?"
+      category: "pitfall"
+      importance: "pitfall"
+      rationale: "The repo has no scheduler today; `WatchPlan::{Static,Filesystem,Poll,Push}` plus the 400 ms debounced watcher and `JUMP_CANNON_IMPORTER_POLL_INTERVAL_MS` already provide the tick. A new runtime is the classic scope bomb in a design proposal."
+    - id: "CK-020"
+      question: "Does the proposal run transformation evaluation on a UI thread or the browser main thread (risking a tab lockup), rather than the native `spawn_blocking` path that `POST /generate` already uses?"
+      category: "pitfall"
+      importance: "pitfall"
+      rationale: "`eval_graph` is synchronous, CPU-bound, and non-`Send` (Rc internals); the source comments call out the retired tvix-worker as the missing timeout backstop."
+    - id: "CK-021"
+      question: "Does the proposal hold per-run history inside the live in-memory `ArcSwap<GraphSnapshot>` — the structure that holds exactly one current graph — as though runs were additional snapshots of it?"
+      category: "pitfall"
+      importance: "pitfall"
+      rationale: "`GraphSnapshot` is the single current graph plus its index/metrics/binary caches; loading N historical runs into it would evict the current graph and defeat the atomic-swap contract."
+    - id: "CK-022"
+      question: "Does the proposal fold the successful-graph-merge (the 'dream' consolidation/labeling) into the transformation such that a failing or partial transform can corrupt the served graph, rather than landing its output as a distinct, addressable artifact?"
+      category: "pitfall"
+      importance: "pitfall"
+      rationale: "A transform applied to the live graph has no rollback path in the current model; treating its output as a first-class addressable state is the property that makes the feature safe to re-run."
+
+  rubric_dimensions:
+    - name: "Core abstraction generality"
+      description: >
+        Is the unit of the feature — the run — defined purely in graph/transformation terms, and
+        is the Rust transformation struct shaped so that an independent implementation (the
+        requester's 'topos') can implement and consume it from outside this repo?
+      scale: "1-5"
+      weight: 0.100
+      anchors:
+        contrast: "Run fields describe a transformation applied to a graph revision, not a session in a particular application."
+        score_2: |
+          pub struct Run { pub session: String, pub kind: RunKind, pub next_event_at: i64, pub agent_tool: String }
+        score_4: |
+          pub struct Run { pub id: RunId, pub transform: TransformId, pub bound: BTreeMap<String, Value>,
+                           pub input_revision: u64, pub output_revision: u64, pub status: RunStatus, pub delta: RunDelta }
+          // a third party implements `Transform` (expr + variable schema + apply(g, bound) -> Graph)
+    - name: "Package and engine model reuse"
+      description: >
+        Is the transformation carried by the existing versioned package mechanism with its
+        expression evaluated as a function of declared, typed variables bound at apply time?
+      scale: "1-5"
+      weight: 0.133
+      anchors:
+        contrast: "A version-3 package on the existing `tvix` engine with typed variables, not a new engine tag or envelope with bespoke fields."
+        score_2: |
+          [transform]
+          engine = "omp-loop"
+          expr = "<read ~/.local/state/omp-auto-loop/graph.lines>"
+          cadence_ms = 5000
+        score_4: |
+          format_version = 3
+          [parser]
+          engine = "tvix"
+          expr = "gcl: graph: windowed { inherit (graph) nodes edges; }"
+          [[parser.variables]]
+          name = "window"; type = "integer"; default = 50
+    - name: "Per-run state model and cost"
+      description: >
+        What exactly is recorded per run, and what does the timeline store? Bounded delta plus
+        periodic keyframes, or whole-graph copies?
+      scale: "1-5"
+      weight: 0.133
+      anchors:
+        contrast: "A bounded delta per run with periodic keyframes, not a full graph copy per run."
+        score_2: |
+          runs: HashMap<RunId, serde_json::Value>   // full { nodes, links } JSON per run, unbounded retention
+        score_4: |
+          struct RunDelta { added: Vec<NodeId>, removed: Vec<NodeId>, changed: Vec<NodeId> }
+          // one delta per run in graph-vcs MinigrafStore; full keyframe every K runs; ring retention of N runs
+    - name: "Serving and rendering integration"
+      description: >
+        How does an animated DAG actually move pixels, given how the graph is served today?
+      scale: "1-5"
+      weight: 0.133
+      anchors:
+        contrast: "Frame N patches only what changed, under the existing revision guard, instead of refetching and rebuilding the whole scene."
+        score_2: |
+          // per tick: re-fetch /graph/init, /graph/ids, /graph/edges and rebuild every buffer
+        score_4: |
+          // per frame: patch the changed node/edge ranges into the existing GPU buffers; the
+          // revision guard already in graph_canvas::load is the admission check for every frame
+    - name: "Scheduling model"
+      description: >
+        Where does 'upcoming runs' come from, in a tool with no scheduler?
+      scale: "1-5"
+      weight: 0.134
+      anchors:
+        contrast: "A declared, serialisable run plan with stated miss/overlap semantics, not a value derived from the current time."
+        score_2: |
+          "upcoming": [next_run_at(now + 3000ms), next_run_at(now + 6000ms)]  // a tokio task per transform; no miss or overlap policy
+        score_4: |
+          enum RunPlan { Manual, Every(Duration), Daily(TimeOfDay) }  // evaluated by the existing watch-plan tick loop; missed runs coalesce to one; no overlap
+    - name: "Node-content generality"
+      description: >
+        Does the node-click experience improve for EVERY source, by changing the shared node
+        metadata path that `/node/*id` already serves?
+      scale: "1-5"
+      weight: 0.100
+      anchors:
+        contrast: "New fields on the shared node metadata served to every importer, not a panel that appears for one source."
+        score_2: |
+          // new panel tab "agent status": last tool call, session goal, loop iteration —
+          // shown only when source_id starts with "pest:omp"
+        score_4: |
+          pub struct NodeMeta { .., provenance: Provenance { first_seen_run: Option<RunId>, last_seen_run: Option<RunId>,
+                           changed_in: Vec<RunId> }, first_seen_at: i64, last_seen_at: i64 }
+          // served by the existing GET /node/*id; every importer gains it
+    - name: "Incremental deliverability"
+      description: >
+        Is the plan sliced so that each phase lands user-visible value on an existing seam?
+      scale: "1-5"
+      weight: 0.133
+      anchors:
+        contrast: "Phases that each land on an existing seam and are usable the day they merge, not one rewrite."
+        score_2: |
+          Phase 1: build the transformation runtime + scheduler + animated timeline + node inspector (12 months)
+        score_4: |
+          P1 manual one-shot transform + run record + runs list (no scheduler, no animation)
+          P2 delta-driven run history
+          P3 RunPlan on the existing poll tick loop
+          P4 animated playback over the existing buffers
+          P5 node provenance fields on NodeMeta
+    - name: "Risk specificity and mitigation"
+      description: >
+        Does the risk section name this codebase's actual landmines and pair each with a
+        specific countermeasure?
+      scale: "1-5"
+      weight: 0.134
+      anchors:
+        contrast: "The repository's documented landmines, each with a countermeasure that exists in this codebase, not generic worry words."
+        score_2: |
+          Risks: eval may be slow; scheduling could race; performance at scale.
+        score_4: |
+          Risk: tvix has no fuel/timeout and eval is inline + CPU-bound -> per-run node/edge budget under
+          JC_MAX_NODES/JC_MAX_EDGES, run on spawn_blocking as POST /generate does, wall-clock ceiling
+          recorded as a failed run. Risk: foldl'-of-addNode is O(n^2) in graph.nix -> genList + one
+          listToAttrs (the soupGen pattern). Risk: closures across 3+ import levels break -> combinators
+          take { graph } explicitly. Risk: /graph/* fetches are non-atomic -> the existing revision guard
+          admits every animation frame.
+
+  scoring:
+    aggregation: "weighted_sum"
+    formula: "total = sum(weight_d * score_d) / 5, giving 1.0-5.0"
+    total_weight: 1.000
+    essential_fail_cap: "Any `essential` checklist item answered NO caps the total at 2.0."
+    pitfall_handling: "A YES on a `pitfall` item is a defect: cap the affected dimension's score at 2 and state the defect in the rationale."
+
+  selection:
+    objective: "Select the top 3 proposals to take into full development."
+    procedure:
+      - "Resolve every checklist item for every proposal from the proposal text alone; record YES/NO with the quoted line that decided it."
+      - "Score all eight dimensions per proposal; compute the weighted total."
+      - "Disqualify any proposal with a NO on CK-001, CK-002, CK-003, CK-014, or CK-016."
+      - "Rank survivors by total; break ties on D1 (Core abstraction generality), then D3 (Per-run state model), then D6 (Node-content generality)."
+      - "Take the top 3. If fewer than 3 survive disqualification, report the shortfall explicitly rather than promoting a disqualified proposal; a disqualified runner-up is a finding, not a selection."
+    diversity_requirement: >
+      The three selected proposals must not be three phrasings of one design. If two selected
+      proposals would land their first phase on the same seam, prefer the pair that differs in
+      where the run state lives, and record the collision in the selection note.
+    selection_note_format: >
+      For each selected proposal: name, total score, the two dimensions that carried it, the one
+      dimension that is weakest and what would have to change to raise it, and the first phase's
+      kill criterion. Explicitly state which requester-specific vocabulary (if any) was found
+      and where it was found.

@@ -268,7 +268,7 @@ fn EdgeInspectorPanel(ctx: Ctx) -> Element {
                             let key = format!("ei-{}", anomaly.edge_idx);
                             rsx! {
                                 EdgeRow {
-                                    key,
+                                    key: "{key}",
                                     anomaly,
                                     ctx,
                                 }

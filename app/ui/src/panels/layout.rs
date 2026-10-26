@@ -37,12 +37,13 @@ use serde_json::Value;
 
 use graph_layouts::geometric::{ClassLens, CoordinationLens, EdgeLengthLens, LensConfig, MassLens};
 use graph_layouts::{
-    BoxedPhysics, BoxedStatic, CircleAxis, CircleLayout, CircleSettings, CiseLayout, CiseSettings,
-    ConcentricLayout, ConcentricMetric, ConcentricSettings, CoseBilkentLayout, CoseBilkentSettings,
-    DagreLayout, DagreRanker, DagreSettings, DynPhysicsLayout, DynStaticLayout, FcoseLayout,
-    FcoseQuality, FcoseSettings, ForceModel, GpuForceLayout, GpuForceOptions, Graph, GridLayout, GridSettings,
-    HilbertLayout, HilbertSettings, KlayLayout, KlaySettings, LayoutDescriptor, LayoutKind,
-    LayoutRequirements, PhysicsLayout, RandomLayout, RandomSettings, RankDirection, RepulsionMode,
+    AmphiphileLayout, AmphiphileOptions, BoxedPhysics, BoxedStatic, CircleAxis, CircleLayout,
+    CircleSettings, CiseLayout, CiseSettings, ConcentricLayout, ConcentricMetric,
+    ConcentricSettings, CoseBilkentLayout, CoseBilkentSettings, DagreLayout, DagreRanker,
+    DagreSettings, DynPhysicsLayout, DynStaticLayout, FcoseLayout, FcoseQuality, FcoseSettings,
+    ForceModel, GpuForceLayout, GpuForceOptions, Graph, GridLayout, GridSettings, HilbertLayout,
+    HilbertSettings, KlayLayout, KlaySettings, LayoutDescriptor, LayoutKind, LayoutRequirements,
+    PhysicsLayout, RandomLayout, RandomSettings, RankDirection, RepulsionMode, SeedMode,
     SpectralLayout, SpectralSettings, SphereLayout, SphereSettings, StaticLayout,
 };
 
@@ -509,6 +510,8 @@ fn local_descriptors() -> &'static [LayoutDescriptor] {
     static DESCRIPTORS: LazyLock<Vec<LayoutDescriptor>> = LazyLock::new(|| {
         vec![
             <GpuForceLayout as PhysicsLayout>::descriptor(),
+            gpu_multilevel_descriptor(),
+            <AmphiphileLayout as PhysicsLayout>::descriptor(),
             <RandomLayout as StaticLayout>::descriptor(),
             <CircleLayout as StaticLayout>::descriptor(),
             <GridLayout as StaticLayout>::descriptor(),
@@ -526,6 +529,39 @@ fn local_descriptors() -> &'static [LayoutDescriptor] {
     &DESCRIPTORS
 }
 
+/// Descriptor for the `gpu-multilevel` card: the in-process GPU force sim
+/// pinned to the device-side multilevel coarsening seed
+/// ([`SeedMode::GpuMultilevel`]). Not a distinct engine type — a one-click
+/// "big graph" preset over `GpuForceLayout`.
+fn gpu_multilevel_descriptor() -> LayoutDescriptor {
+    LayoutDescriptor {
+        id: "gpu-multilevel",
+        kind: LayoutKind::Physics,
+        display_name: "GPU multilevel (force)",
+        description: "wgpu force sim seeded by a device-side heavy-edge-matching coarsening cascade — fast, untangled layouts for large graphs, no host readback",
+        requirements: LayoutRequirements {
+            needs_edges: false,
+            needs_cpu_positions: false,
+            needs_gpu_positions_buffer: true,
+        },
+    }
+}
+
+/// `GpuForceOptions` tuned like gpu-force but with the multilevel device seed
+/// pinned on, so the card always runs the coarsening cascade.
+fn gpu_multilevel_defaults() -> GpuForceOptions {
+    GpuForceOptions {
+        seed_mode: SeedMode::GpuMultilevel,
+        ..GpuForceOptions::default()
+    }
+}
+
+/// Both ids back `GpuForceLayout` (gpu-multilevel just pins the seed mode), so
+/// the `apply_engine` size-tuning and repulsion-radius derivation apply to both.
+fn is_gpu_force_like(id: &str) -> bool {
+    id == "gpu-force" || id == "gpu-multilevel"
+}
+
 fn descriptor_for(id: &str) -> Option<LayoutDescriptor> {
     match id {
         BRIDGE_REMOTE_FA2 => Some(<RemoteFa2Layout as PhysicsLayout>::descriptor()),
@@ -537,6 +573,8 @@ fn descriptor_for(id: &str) -> Option<LayoutDescriptor> {
 fn default_settings(id: &str) -> Value {
     let v = match id {
         "gpu-force" => serde_json::to_value(GpuForceOptions::default()),
+        "gpu-multilevel" => serde_json::to_value(gpu_multilevel_defaults()),
+        "amphiphile" => serde_json::to_value(AmphiphileOptions::default()),
         "random" => serde_json::to_value(RandomSettings::default()),
         "circle" => serde_json::to_value(CircleSettings::default()),
         "grid" => serde_json::to_value(GridSettings::default()),
@@ -579,6 +617,16 @@ fn build_physics(id: &str, json: &Value) -> Option<Box<dyn DynPhysicsLayout>> {
         "gpu-force" => {
             let opts: GpuForceOptions = serde_json::from_value(json.clone()).unwrap_or_default();
             Box::new(BoxedPhysics::new(GpuForceLayout::new(opts))) as Box<dyn DynPhysicsLayout>
+        }
+        "gpu-multilevel" => {
+            let mut opts: GpuForceOptions =
+                serde_json::from_value(json.clone()).unwrap_or_else(|_| gpu_multilevel_defaults());
+            opts.seed_mode = SeedMode::GpuMultilevel;
+            Box::new(BoxedPhysics::new(GpuForceLayout::new(opts)))
+        }
+        "amphiphile" => {
+            let opts: AmphiphileOptions = serde_json::from_value(json.clone()).unwrap_or_default();
+            Box::new(BoxedPhysics::new(AmphiphileLayout::new(opts)))
         }
         BRIDGE_REMOTE_FA2 => {
             let s: RemoteFa2Settings = serde_json::from_value(json.clone()).unwrap_or_default();
@@ -939,9 +987,12 @@ fn apply_engine(solve_requested: bool) {
         let mut st = STATE.read().clone();
         let active = st.active.clone();
         if !st.settings.contains_key(&active) {
-            let initial = if active == "gpu-force" {
-                serde_json::to_value(GpuForceOptions::for_n_nodes(n_nodes))
-                    .unwrap_or_else(|_| default_settings(&active))
+            let initial = if is_gpu_force_like(&active) {
+                let mut o = GpuForceOptions::for_n_nodes(n_nodes);
+                if active == "gpu-multilevel" {
+                    o.seed_mode = SeedMode::GpuMultilevel;
+                }
+                serde_json::to_value(o).unwrap_or_else(|_| default_settings(&active))
             } else {
                 default_settings(&active)
             };
@@ -955,15 +1006,19 @@ fn apply_engine(solve_requested: bool) {
     let active = st.active.clone();
     let mut json = st.settings.get(&active).cloned().unwrap_or(Value::Null);
 
-    // gpu-force: derive repulsion_radius from spring_len (4×, the legacy
-    // rule) and cap steps_per_call so persisted high values can't pin the
-    // GPU — both ported from apply_layout_to_gpu.
-    if active == "gpu-force" {
+    // gpu-force / gpu-multilevel: derive repulsion_radius from spring_len
+    // (4×, the legacy rule) and cap steps_per_call so persisted high values
+    // can't pin the GPU — both ported from apply_layout_to_gpu. gpu-multilevel
+    // additionally re-pins the device multilevel seed on every settings push.
+    if is_gpu_force_like(&active) {
         if let Ok(mut o) = serde_json::from_value::<GpuForceOptions>(json.clone()) {
             o.repulsion_radius = (4.0 * o.spring_len).max(1.0);
             const MAX_STEPS_PER_CALL: u32 = 16;
             if o.steps_per_call > MAX_STEPS_PER_CALL {
                 o.steps_per_call = MAX_STEPS_PER_CALL;
+            }
+            if active == "gpu-multilevel" {
+                o.seed_mode = SeedMode::GpuMultilevel;
             }
             json = serde_json::to_value(&o).unwrap_or(json);
         }
@@ -2820,7 +2875,7 @@ fn local_card(d: &LayoutDescriptor, active: bool) -> Element {
         LayoutKind::Static => ("static", "kind-static"),
         LayoutKind::Physics => ("physics", "kind-physics"),
     };
-    let (proc_label, proc_class) = if id == "gpu-force" {
+    let (proc_label, proc_class) = if matches!(id, "gpu-force" | "gpu-multilevel" | "amphiphile") {
         ("gpu", "proc-gpu")
     } else {
         ("cpu", "proc-cpu")
@@ -3373,6 +3428,8 @@ fn seed_section(remote: bool) -> Element {
 fn engine_params(active: &str) -> Element {
     match active {
         "gpu-force" => gpu_force_ui(),
+        "gpu-multilevel" => gpu_multilevel_ui(),
+        "amphiphile" => amphiphile_ui(),
         "random" => random_ui(),
         "circle" => circle_ui(),
         "grid" => grid_ui(),
@@ -3576,6 +3633,85 @@ mod frame_tests {
         assert_eq!(encoded, expected);
         assert!(positions_le_bytes(&positions, 2).is_err());
         assert!(positions_le_bytes(&[0.0, f32::NAN, 1.0], 1).is_err());
+    }
+}
+
+/// Params for the `gpu-multilevel` card: the same `GpuForceOptions` physics as
+/// gpu-force (its own settings bag) with the device multilevel seed pinned on.
+/// The essential knobs; the full set lives under GPU force-directed.
+fn gpu_multilevel_ui() -> Element {
+    let opts: GpuForceOptions = typed_settings("gpu-multilevel");
+    rsx! {
+        div { class: "lay-hint",
+            "GPU force sim seeded by a device-side multilevel coarsening cascade \
+             (heavy-edge matching, no host readback) — best for large graphs. \
+             Essential physics knobs here; the full set lives under GPU force-directed."
+        }
+        hr { class: "lay-sep" }
+        div { class: "lay-sub", "Physics" }
+        Slider { label: "repulsion", min: 0.1, max: 100_000.0, value: opts.repulsion as f64, log: true,
+            on: move |v: f64| edit::<GpuForceOptions>("gpu-multilevel", |o| o.repulsion = v as f32) }
+        Slider { label: "spring_k", min: 0.0001, max: 10.0, value: opts.spring_k as f64, log: true,
+            on: move |v: f64| edit::<GpuForceOptions>("gpu-multilevel", |o| o.spring_k = v as f32) }
+        Slider { label: "spring_len", min: 1.0, max: 10_000.0, value: opts.spring_len as f64, log: true,
+            on: move |v: f64| edit::<GpuForceOptions>("gpu-multilevel", |o| o.spring_len = v as f32) }
+        Slider { label: "gravity", min: 0.00001, max: 1.0, value: opts.gravity as f64, log: true,
+            on: move |v: f64| edit::<GpuForceOptions>("gpu-multilevel", |o| o.gravity = v as f32) }
+        Slider { label: "damping", min: 0.0, max: 1.0, value: opts.damping as f64,
+            on: move |v: f64| edit::<GpuForceOptions>("gpu-multilevel", |o| o.damping = v as f32) }
+        Slider { label: "dt", min: 0.0001, max: 1.0, value: opts.dt as f64, log: true,
+            on: move |v: f64| edit::<GpuForceOptions>("gpu-multilevel", |o| o.dt = v as f32) }
+        Slider { label: "steps/call", min: 1.0, max: 64.0, value: opts.steps_per_call as f64,
+            on: move |v: f64| edit::<GpuForceOptions>("gpu-multilevel", |o| {
+                o.steps_per_call = v.round().max(1.0) as u32;
+            }) }
+    }
+}
+
+/// Params for the amphiphile self-assembly engine. The species-pair well
+/// table (`epsilon`) stays at the validated lipid default; these are the
+/// regime knobs. Particle species (head / tail / solvent) come from the
+/// graph — absent species default to solvent, so the Generate panel's
+/// self-assembly examples assign them for the in-process run.
+fn amphiphile_ui() -> Element {
+    let o: AmphiphileOptions = typed_settings("amphiphile");
+    rsx! {
+        div { class: "lay-hint",
+            "Coarse-grained lipid model on the GPU: tails attract tails, heads \
+             face the solvent, and micelles / bilayers / vesicles emerge. \
+             Species come from the graph; the Generate panel's self-assembly \
+             examples assign head / tail / solvent."
+        }
+        hr { class: "lay-sep" }
+        div { class: "lay-sub", "Regime" }
+        Slider { label: "temperature", min: 0.0, max: 40.0, value: o.temperature as f64,
+            on: move |v: f64| edit::<AmphiphileOptions>("amphiphile", |o| o.temperature = v as f32) }
+        Slider { label: "σ diameter", min: 1.0, max: 200.0, value: o.sigma as f64, log: true,
+            on: move |v: f64| edit::<AmphiphileOptions>("amphiphile", |o| o.sigma = v as f32) }
+        Slider { label: "cutoff", min: 1.0, max: 400.0, value: o.cutoff as f64, log: true,
+            on: move |v: f64| edit::<AmphiphileOptions>("amphiphile", |o| o.cutoff = v as f32) }
+        Slider { label: "gravity", min: 0.0, max: 1.0, value: o.gravity as f64,
+            on: move |v: f64| edit::<AmphiphileOptions>("amphiphile", |o| o.gravity = v as f32) }
+        Slider { label: "damping", min: 0.0, max: 1.0, value: o.damping as f64,
+            on: move |v: f64| edit::<AmphiphileOptions>("amphiphile", |o| o.damping = v as f32) }
+        Slider { label: "dt", min: 0.001, max: 0.5, value: o.dt as f64, log: true,
+            on: move |v: f64| edit::<AmphiphileOptions>("amphiphile", |o| o.dt = v as f32) }
+
+        hr { class: "lay-sep" }
+        div { class: "lay-sub", "Bonds (optional)" }
+        div { class: "lay-hint", "Intra-molecule springs on graph edges; 0 = emergent-only (species wells)" }
+        Slider { label: "bond_k", min: 0.0, max: 50.0, value: o.bond_k as f64,
+            on: move |v: f64| edit::<AmphiphileOptions>("amphiphile", |o| o.bond_k = v as f32) }
+        Slider { label: "bond_len", min: 1.0, max: 200.0, value: o.bond_len as f64, log: true,
+            on: move |v: f64| edit::<AmphiphileOptions>("amphiphile", |o| o.bond_len = v as f32) }
+
+        hr { class: "lay-sep" }
+        Slider { label: "steps/call", min: 1.0, max: 32.0, value: o.steps_per_call as f64,
+            on: move |v: f64| edit::<AmphiphileOptions>("amphiphile", |o| {
+                o.steps_per_call = v.round().max(1.0) as u32;
+            }) }
+        SeedRow { label: "seed", value: o.seed,
+            on: move |v: u64| edit::<AmphiphileOptions>("amphiphile", |o| o.seed = v) }
     }
 }
 

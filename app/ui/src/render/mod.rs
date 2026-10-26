@@ -32,6 +32,7 @@ use dioxus::prelude::*;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 
+use graph_layouts::Species;
 pub use pipelines::{GraphData as Scene, RenderHost};
 pub use region_map::{RegionLevel, RegionMapConfig, RegionMode};
 
@@ -113,6 +114,11 @@ struct Ctl {
     last_tick_ms: f64,
     selected: Option<u32>,
     highlights: Option<HashSet<u32>>,
+    /// Per-node particle species for the amphiphile engine. Survives host
+    /// rebuilds so a minimize/restore (which reboots the host into gpu-force)
+    /// re-seeds the species mirror before the Layout panel re-applies the
+    /// amphiphile engine onto the fresh host.
+    species: Vec<Species>,
     sim_running: bool,
     /// Monotonic mount generation — a stale async init must not clobber
     /// a newer mount's host.
@@ -179,6 +185,16 @@ pub fn mount_canvas(mut scene: Scene) {
         c.generation
     });
 
+    // Camera pose travels with the graph across mounts. A mount is not only a
+    // graph change: panel focus can rebuild the canvas subtree (panel-kit),
+    // and a fresh RenderHost otherwise starts at the default framing, so the
+    // user's pan and zoom silently reset.
+    let carried_camera = HOST.with(|h| {
+        h.borrow()
+            .as_ref()
+            .map(|host| host.pipes.camera.pose())
+    });
+
     let carried = HOST.with(|h| {
         let mut slot = h.borrow_mut();
         let carried = slot.as_ref().and_then(|host| {
@@ -231,7 +247,10 @@ pub fn mount_canvas(mut scene: Scene) {
         }
 
         match RenderHost::new(canvas.clone(), scene).await {
-            Ok(host) => {
+            Ok(mut host) => {
+                if let Some(pose) = carried_camera {
+                    host.pipes.camera.set_pose(pose);
+                }
                 let still_current = CTL.with(|c| c.borrow().generation == generation);
                 if !still_current {
                     return; // a newer mount superseded this init
@@ -263,11 +282,13 @@ fn reapply_ctl_state() {
         let c = c.borrow();
         (c.selected, c.highlights.clone(), c.sim_running)
     });
+    let species = CTL.with(|c| c.borrow().species.clone());
     with_host(|h| {
         let (pipes, queue) = h.pipes_and_queue();
         pipes.set_selected_emphasis(queue, selected, SELECT_EMPHASIS);
         pipes.set_selected(queue, highlights.as_ref());
         pipes.set_sim_running(sim_running);
+        pipes.set_species(queue, &species);
     });
     // Filter evaluation lives outside renderer mount state. Reapply its last
     // valid result after a canvas/host rebuild just as we do selection and

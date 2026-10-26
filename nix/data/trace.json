@@ -1,0 +1,512 @@
+{
+  "nodes": [
+    {
+      "id": "orchestrator",
+      "title": "Orchestrator",
+      "kind": "agent",
+      "tags": [
+        "core",
+        "entry"
+      ],
+      "latency_ms": 12.5,
+      "energy": 184,
+      "t": 0,
+      "status": "ok"
+    },
+    {
+      "id": "planner",
+      "title": "Planner",
+      "kind": "agent",
+      "tags": [
+        "core",
+        "plan"
+      ],
+      "latency_ms": 31.0,
+      "energy": 242,
+      "t": 1,
+      "status": "ok"
+    },
+    {
+      "id": "researcher",
+      "title": "Researcher",
+      "kind": "agent",
+      "tags": [
+        "io",
+        "net"
+      ],
+      "latency_ms": 88.4,
+      "energy": 361,
+      "t": 2,
+      "status": "warn"
+    },
+    {
+      "id": "reviewer",
+      "title": "Reviewer",
+      "kind": "agent",
+      "tags": [
+        "gate"
+      ],
+      "latency_ms": 64.2,
+      "energy": 298,
+      "t": 3,
+      "status": "ok"
+    },
+    {
+      "id": "summarizer",
+      "title": "Summarizer",
+      "kind": "agent",
+      "tags": [
+        "output",
+        "text"
+      ],
+      "latency_ms": 27.9,
+      "energy": 141,
+      "t": 4,
+      "status": "ok"
+    },
+    {
+      "id": "archivist",
+      "title": "Archivist",
+      "kind": "agent",
+      "tags": [
+        "memory-ops",
+        "index"
+      ],
+      "latency_ms": 45.1,
+      "energy": 207,
+      "t": 5,
+      "status": "info"
+    },
+    {
+      "id": "read_file",
+      "title": "Read File",
+      "kind": "tool",
+      "tags": [
+        "io",
+        "fs"
+      ],
+      "latency_ms": 8.4,
+      "energy": 12,
+      "t": 6,
+      "status": "ok"
+    },
+    {
+      "id": "grep_repo",
+      "title": "Grep Repo",
+      "kind": "tool",
+      "tags": [
+        "io",
+        "search"
+      ],
+      "latency_ms": 22.7,
+      "energy": 38,
+      "t": 7,
+      "status": "ok"
+    },
+    {
+      "id": "run_tests",
+      "title": "Run Tests",
+      "kind": "tool",
+      "tags": [
+        "gate",
+        "build"
+      ],
+      "latency_ms": 1840.0,
+      "energy": 902,
+      "t": 8,
+      "status": "error"
+    },
+    {
+      "id": "web_search",
+      "title": "Web Search",
+      "kind": "tool",
+      "tags": [
+        "net",
+        "io"
+      ],
+      "latency_ms": 412.6,
+      "energy": 133,
+      "t": 9,
+      "status": "warn"
+    },
+    {
+      "id": "sql_query",
+      "title": "SQL Query",
+      "kind": "tool",
+      "tags": [
+        "data",
+        "io"
+      ],
+      "latency_ms": 96.3,
+      "energy": 84,
+      "t": 10,
+      "status": "ok"
+    },
+    {
+      "id": "git_diff",
+      "title": "Git Diff",
+      "kind": "tool",
+      "tags": [
+        "vcs",
+        "io"
+      ],
+      "latency_ms": 19.8,
+      "energy": 21,
+      "t": 11,
+      "status": "ok"
+    },
+    {
+      "id": "compile_wasm",
+      "title": "Compile WASM",
+      "kind": "tool",
+      "tags": [
+        "build",
+        "wasm"
+      ],
+      "latency_ms": 1260.5,
+      "energy": 1440,
+      "t": 12,
+      "status": "warn"
+    },
+    {
+      "id": "render_chart",
+      "title": "Render Chart",
+      "kind": "tool",
+      "tags": [
+        "ui",
+        "io"
+      ],
+      "latency_ms": 54.2,
+      "energy": 67,
+      "t": 13,
+      "status": "ok"
+    },
+    {
+      "id": "send_mail",
+      "title": "Send Mail",
+      "kind": "tool",
+      "tags": [
+        "net",
+        "out"
+      ],
+      "latency_ms": 71.4,
+      "energy": 29,
+      "t": 14,
+      "status": "info"
+    },
+    {
+      "id": "build_index",
+      "title": "Build Index",
+      "kind": "tool",
+      "tags": [
+        "search",
+        "build"
+      ],
+      "latency_ms": 610.9,
+      "energy": 488,
+      "t": 15,
+      "status": "warn"
+    },
+    {
+      "id": "episodic_log",
+      "title": "Episodic Log",
+      "kind": "memory",
+      "tags": [
+        "log",
+        "append"
+      ],
+      "latency_ms": 3.2,
+      "energy": 6,
+      "t": 16,
+      "status": "ok"
+    },
+    {
+      "id": "task_board",
+      "title": "Task Board",
+      "kind": "memory",
+      "tags": [
+        "board",
+        "state"
+      ],
+      "latency_ms": 5.7,
+      "energy": 9,
+      "t": 17,
+      "status": "ok"
+    },
+    {
+      "id": "code_index",
+      "title": "Code Index",
+      "kind": "memory",
+      "tags": [
+        "search",
+        "index"
+      ],
+      "latency_ms": 14.6,
+      "energy": 44,
+      "t": 18,
+      "status": "ok"
+    },
+    {
+      "id": "note_store",
+      "title": "Note Store",
+      "kind": "memory",
+      "tags": [
+        "notes",
+        "append"
+      ],
+      "latency_ms": 7.1,
+      "energy": 11,
+      "t": 19,
+      "status": "ok"
+    },
+    {
+      "id": "cache_hot",
+      "title": "Cache Hot",
+      "kind": "memory",
+      "tags": [
+        "cache",
+        "ttl"
+      ],
+      "latency_ms": 1.9,
+      "energy": 3,
+      "t": 20,
+      "status": "ok"
+    },
+    {
+      "id": "trace_ring",
+      "title": "Trace Ring",
+      "kind": "memory",
+      "tags": [
+        "log",
+        "ring"
+      ],
+      "latency_ms": 2.4,
+      "energy": 5,
+      "t": 21,
+      "status": "warn"
+    },
+    {
+      "id": "budget_ledger",
+      "title": "Budget Ledger",
+      "kind": "memory",
+      "tags": [
+        "cost",
+        "ledger"
+      ],
+      "latency_ms": 4.1,
+      "energy": 8,
+      "t": 22,
+      "status": "warn"
+    },
+    {
+      "id": "spec_mirror",
+      "title": "Spec Mirror",
+      "kind": "memory",
+      "tags": [
+        "schema",
+        "mirror"
+      ],
+      "latency_ms": 11.5,
+      "energy": 26,
+      "t": 23,
+      "status": "info"
+    }
+  ],
+  "edges": [
+    {
+      "source": "orchestrator",
+      "target": "planner",
+      "kind": "invokes"
+    },
+    {
+      "source": "orchestrator",
+      "target": "researcher",
+      "kind": "invokes"
+    },
+    {
+      "source": "orchestrator",
+      "target": "summarizer",
+      "kind": "invokes"
+    },
+    {
+      "source": "orchestrator",
+      "target": "run_tests",
+      "kind": "invokes"
+    },
+    {
+      "source": "orchestrator",
+      "target": "build_index",
+      "kind": "invokes"
+    },
+    {
+      "source": "planner",
+      "target": "researcher",
+      "kind": "invokes"
+    },
+    {
+      "source": "planner",
+      "target": "reviewer",
+      "kind": "invokes"
+    },
+    {
+      "source": "planner",
+      "target": "git_diff",
+      "kind": "invokes"
+    },
+    {
+      "source": "planner",
+      "target": "read_file",
+      "kind": "invokes"
+    },
+    {
+      "source": "researcher",
+      "target": "web_search",
+      "kind": "invokes"
+    },
+    {
+      "source": "researcher",
+      "target": "grep_repo",
+      "kind": "invokes"
+    },
+    {
+      "source": "researcher",
+      "target": "sql_query",
+      "kind": "invokes"
+    },
+    {
+      "source": "researcher",
+      "target": "read_file",
+      "kind": "invokes"
+    },
+    {
+      "source": "reviewer",
+      "target": "run_tests",
+      "kind": "invokes"
+    },
+    {
+      "source": "reviewer",
+      "target": "git_diff",
+      "kind": "invokes"
+    },
+    {
+      "source": "reviewer",
+      "target": "compile_wasm",
+      "kind": "invokes"
+    },
+    {
+      "source": "reviewer",
+      "target": "grep_repo",
+      "kind": "invokes"
+    },
+    {
+      "source": "summarizer",
+      "target": "render_chart",
+      "kind": "invokes"
+    },
+    {
+      "source": "summarizer",
+      "target": "send_mail",
+      "kind": "invokes"
+    },
+    {
+      "source": "archivist",
+      "target": "build_index",
+      "kind": "invokes"
+    },
+    {
+      "source": "orchestrator",
+      "target": "episodic_log",
+      "kind": "reads"
+    },
+    {
+      "source": "orchestrator",
+      "target": "task_board",
+      "kind": "reads"
+    },
+    {
+      "source": "planner",
+      "target": "task_board",
+      "kind": "reads"
+    },
+    {
+      "source": "planner",
+      "target": "code_index",
+      "kind": "reads"
+    },
+    {
+      "source": "researcher",
+      "target": "note_store",
+      "kind": "reads"
+    },
+    {
+      "source": "researcher",
+      "target": "code_index",
+      "kind": "reads"
+    },
+    {
+      "source": "researcher",
+      "target": "cache_hot",
+      "kind": "reads"
+    },
+    {
+      "source": "reviewer",
+      "target": "cache_hot",
+      "kind": "reads"
+    },
+    {
+      "source": "reviewer",
+      "target": "trace_ring",
+      "kind": "reads"
+    },
+    {
+      "source": "reviewer",
+      "target": "budget_ledger",
+      "kind": "reads"
+    },
+    {
+      "source": "summarizer",
+      "target": "episodic_log",
+      "kind": "reads"
+    },
+    {
+      "source": "summarizer",
+      "target": "note_store",
+      "kind": "reads"
+    },
+    {
+      "source": "archivist",
+      "target": "code_index",
+      "kind": "reads"
+    },
+    {
+      "source": "archivist",
+      "target": "spec_mirror",
+      "kind": "reads"
+    },
+    {
+      "source": "archivist",
+      "target": "budget_ledger",
+      "kind": "reads"
+    },
+    {
+      "source": "run_tests",
+      "target": "trace_ring",
+      "kind": "reads"
+    },
+    {
+      "source": "compile_wasm",
+      "target": "cache_hot",
+      "kind": "reads"
+    },
+    {
+      "source": "build_index",
+      "target": "code_index",
+      "kind": "reads"
+    },
+    {
+      "source": "render_chart",
+      "target": "cache_hot",
+      "kind": "reads"
+    }
+  ]
+}

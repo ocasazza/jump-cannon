@@ -36,7 +36,7 @@ use bytemuck::{Pod, Zeroable};
 use glam::{Mat4, Vec3, Vec4};
 use graph_layouts::{
     BoxedPhysics, CsrInput, DynPhysicsLayout, DynStaticLayout, Edge as GlEdge, EdgePhysics,
-    GpuForceLayout, GpuForceOptions, Graph as GlGraph, Node as GlNode, NodePhysics,
+    GpuForceLayout, GpuForceOptions, Graph as GlGraph, Node as GlNode, NodePhysics, Species,
 };
 use std::sync::{Arc, Mutex};
 use wgpu::util::DeviceExt;
@@ -298,6 +298,11 @@ struct Buffers {
     colors_base: Vec<f32>,
     sizes_base: Vec<f32>,
     edges_cpu: Vec<u32>,
+    /// Per-node particle species for the amphiphile engine (empty = all
+    /// solvent). Fed into `CsrInput.species` on every layout (re)init, and
+    /// live-updated on a running amphiphile layout by `set_species`. Carried
+    /// across host rebuilds via `render::Ctl` like positions/selection.
+    species_cpu: Vec<Species>,
     /// Physics carried through the `set_positions` / `swap_physics_layout`
     /// re-inits so a re-seeded sim keeps the values it was running with.
     node_physics_cpu: Option<Vec<NodePhysics>>,
@@ -646,6 +651,7 @@ impl GraphPipelines {
                 &positions,
                 &graph.positions,
                 &graph.edges,
+                &[],
                 node_physics.as_deref(),
                 edge_physics.as_deref(),
             ) {
@@ -693,6 +699,7 @@ impl GraphPipelines {
             colors_base,
             sizes_base,
             edges_cpu: graph.edges,
+            species_cpu: Vec::new(),
             node_physics_cpu: node_physics,
             edge_physics_cpu: edge_physics,
             positions_staging,
@@ -1803,6 +1810,7 @@ impl GraphPipelines {
                 &b.positions,
                 &b.positions_cpu,
                 &b.edges_cpu,
+                &b.species_cpu,
                 b.node_physics_cpu.as_deref(),
                 b.edge_physics_cpu.as_deref(),
             ) {
@@ -1836,6 +1844,7 @@ impl GraphPipelines {
             &b.positions,
             &b.positions_cpu,
             &b.edges_cpu,
+            &b.species_cpu,
             b.node_physics_cpu.as_deref(),
             b.edge_physics_cpu.as_deref(),
         ) {
@@ -1844,6 +1853,30 @@ impl GraphPipelines {
             }
             Err(e) => {
                 tracing::warn!("[render] swap_physics_layout init failed: {e}");
+            }
+        }
+    }
+
+    /// Store the per-node particle species mirror and, when a live physics
+    /// layout accepts species (the amphiphile engine), push them in place so a
+    /// running sim re-clusters without a re-init. Engines without species (the
+    /// force sims) keep the mirror for the next `swap`/`set_positions` init and
+    /// ignore the live push. A length mismatch with the live node count is
+    /// dropped rather than erroring — the mirror still feeds the next init,
+    /// which length-guards it.
+    pub fn set_species(&mut self, queue: &wgpu::Queue, species: &[Species]) {
+        let Some(b) = self.buffers.as_mut() else {
+            return;
+        };
+        b.species_cpu = species.to_vec();
+        if !species.is_empty() && species.len() == b.n_nodes as usize {
+            if let Some(layout) = b.layout.as_mut() {
+                match layout.set_species(queue, species) {
+                    Ok(()) => {}
+                    // The force engines have no species buffer — expected.
+                    Err(e) if e == "this layout has no particle species" => {}
+                    Err(e) => tracing::warn!("[render] set_species: {e}"),
+                }
             }
         }
     }
@@ -2034,15 +2067,23 @@ fn init_physics_layout(
     positions_buf: &wgpu::Buffer,
     positions_cpu: &[f32],
     edges_cpu: &[u32],
+    species_cpu: &[Species],
     node_physics: Option<&[NodePhysics]>,
     edge_physics: Option<&[EdgePhysics]>,
 ) -> Result<(), String> {
+    let n_nodes = (positions_cpu.len() / 3) as u32;
+    // Only hand species to the layout when they line up with the node count;
+    // a stale set (wrong length, e.g. a carried set from a different graph)
+    // falls back to the engine default (all solvent) rather than erroring.
+    let species = (!species_cpu.is_empty() && species_cpu.len() == n_nodes as usize)
+        .then_some(species_cpu);
     let input = CsrInput {
-        n_nodes: (positions_cpu.len() / 3) as u32,
+        n_nodes,
         edges: edges_cpu,
         positions: Some(positions_cpu),
         node_physics,
         edge_physics,
+        species,
     };
     match layout.init_with_device_csr(device, queue, &input, positions_buf) {
         Ok(()) => Ok(()),
@@ -2256,6 +2297,11 @@ impl RenderHost {
     pub fn swap_physics_layout(&mut self, layout: Box<dyn DynPhysicsLayout>) {
         self.pipes
             .swap_physics_layout(&self.device, &self.queue, layout);
+    }
+
+    /// Set the per-node particle species mirror (amphiphile engine input).
+    pub fn set_species(&mut self, species: &[Species]) {
+        self.pipes.set_species(&self.queue, species);
     }
 
     pub fn run_static_solve(
