@@ -185,6 +185,16 @@ pub fn mount_canvas(mut scene: Scene) {
         c.generation
     });
 
+    // Camera pose travels with the graph across mounts. A mount is not only a
+    // graph change: panel focus can rebuild the canvas subtree (panel-kit),
+    // and a fresh RenderHost otherwise starts at the default framing, so the
+    // user's pan and zoom silently reset.
+    let carried_camera = HOST.with(|h| {
+        h.borrow()
+            .as_ref()
+            .map(|host| host.pipes.camera.pose())
+    });
+
     let carried = HOST.with(|h| {
         let mut slot = h.borrow_mut();
         let carried = slot.as_ref().and_then(|host| {
@@ -237,7 +247,10 @@ pub fn mount_canvas(mut scene: Scene) {
         }
 
         match RenderHost::new(canvas.clone(), scene).await {
-            Ok(host) => {
+            Ok(mut host) => {
+                if let Some(pose) = carried_camera {
+                    host.pipes.camera.set_pose(pose);
+                }
                 let still_current = CTL.with(|c| c.borrow().generation == generation);
                 if !still_current {
                     return; // a newer mount superseded this init
