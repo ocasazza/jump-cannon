@@ -1735,8 +1735,19 @@ fn render_workspace(workspace: PanelWorkspace, ctx: Ctx) -> Element {
             class: "{workspace_class}",
             style: "{workspace_style}",
             onwheel: move |event| workspace::handle_wheel(&wheel_workspace, &event),
-            for projected in frame.panels.iter().copied() {
-                {render_projected_panel(projected, &workspace.catalog, emit.clone(), ctx)}
+            // Keep-alive: the graph panel stays mounted (hidden, keyed) when
+            // the projection drops it — focusing or maximizing another panel
+            // would otherwise tear down the WebGPU canvas and its camera.
+            {
+                panel_kit::keepalive::render_keepalive_with(
+                    &snapshot,
+                    &workspace.catalog,
+                    &frame,
+                    |key| key == Panel::Graph,
+                    |projected, meta, _hidden| {
+                        render_projected_panel_for(projected, meta, emit.clone(), ctx)
+                    },
+                )
             }
         }
         {dock::dock(frame.dock, &workspace.catalog, emit, None)}
@@ -1751,6 +1762,17 @@ fn render_projected_panel(
     ctx: Ctx,
 ) -> Element {
     let Some(meta) = catalog.get(projected.key) else { return rsx! {} };
+    render_projected_panel_for(projected, meta, emit, ctx)
+}
+
+/// The same panel, when the caller already resolved its catalog metadata
+/// (the keep-alive renderer hands it back with the projection).
+fn render_projected_panel_for(
+    projected: PanelProjection<Panel>,
+    meta: &panel_kit_core::panel::PanelMeta<Panel>,
+    emit: EventHandler<WorkspaceEvent<Panel>>,
+    ctx: Ctx,
+) -> Element {
     let class = format!("panel-{}", meta.slug);
     let maximized = matches!(projected.placement, Placement::Maximized);
     let controls = panel::traffic_lights(projected, emit.clone());

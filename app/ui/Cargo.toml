@@ -9,8 +9,8 @@ license.workspace = true
 dioxus = { workspace = true }
 # Shared panel-workspace library (also consumed by snake-pit).
 # Develop against a local checkout via [patch] in the workspace Cargo.toml.
-panel-kit = { version = "1.0.0", git = "https://github.com/ocasazza/panel-kit", rev = "8e4de76ff1092d5919793adde1fe2554c51b42f2" }
-panel-kit-core = { version = "1.0.0", git = "https://github.com/ocasazza/panel-kit", rev = "8e4de76ff1092d5919793adde1fe2554c51b42f2", features = ["spec-json"] }
+panel-kit = { version = "1.0.0", git = "https://github.com/ocasazza/panel-kit", rev = "3842c8f" # panel-kit#21 keepalive_with; move to the merge commit when it lands }
+panel-kit-core = { version = "1.0.0", git = "https://github.com/ocasazza/panel-kit", rev = "3842c8f" # panel-kit#21 keepalive_with; move to the merge commit when it lands, features = ["spec-json"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 # WASM-side HTTP to graph-api (the frontend always runs in a webview).
