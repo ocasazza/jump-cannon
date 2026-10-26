@@ -1435,27 +1435,38 @@ fn param_picker(params: &api::SourceParameters) -> Element {
                         let select_name = name.clone();
                         let custom_name = name.clone();
                         let custom_pick = pick.clone();
-                        let option_pick = pick.clone();
                         let select_value = if is_custom {
                             "__custom__".to_string()
                         } else {
                             pick.clone()
                         };
+                        let items: Vec<panel_kit::widgets::DropdownItem> = param
+                            .values
+                            .iter()
+                            .map(|v| panel_kit::widgets::DropdownItem {
+                                value: v.id.clone(),
+                                label: v.label.clone(),
+                                group: String::new(),
+                            })
+                            .chain(std::iter::once(panel_kit::widgets::DropdownItem {
+                                value: "__custom__".to_string(),
+                                label: "Other…".to_string(),
+                                group: String::new(),
+                            }))
+                            .collect();
+                        let dd_state = use_signal(panel_kit::widgets::DropdownState::default);
+                        let select_name = select_name.clone();
                         rsx! {
-                            select {
-                                class: "imp-param-select",
-                                "data-param": "{name}",
-                                value: "{select_value}",
-                                onchange: move |e| set_param_choice(&select_name, e.value()),
-                                for value in param.values.iter() {
-                                    option {
-                                        key: "{value.id}",
-                                        value: "{value.id}",
-                                        selected: !is_custom && value.id == option_pick,
-                                        "{value.label}"
+                            panel_kit::widgets::Dropdown {
+                                items,
+                                state: dd_state,
+                                selected: select_value,
+                                searchable: param.values.len() > 8,
+                                on_action: move |action: panel_kit::widgets::DropdownAction| {
+                                    if let panel_kit::widgets::DropdownAction::Select { value } = action {
+                                        set_param_choice(&select_name, value);
                                     }
-                                }
-                                option { value: "__custom__", selected: is_custom, "Other…" }
+                                },
                             }
                             if is_custom {
                                 input {
