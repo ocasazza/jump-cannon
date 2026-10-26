@@ -1085,57 +1085,80 @@ pub fn panel(ctx: Ctx) -> Element {
                                     }
                                 }
 
-                                if !identifiers.is_empty() {
-                                    div { class: "browse-group", "identifiers" }
-                                    nav { class: "queue", "aria-label": "Identifier matches",
-                                        for (id, html) in identifiers {
-                                            {
-                                                let active = selected.read().as_deref() == Some(id.as_str());
-                                                let click_id = id.clone();
-                                                rsx! {
-                                                    button {
-                                                        key: "f:{id}",
-                                                        class: if active { "queue-item active" } else { "queue-item" },
-                                                        "data-node-id": id.clone(),
-                                                        onclick: move |_| selected.set(Some(click_id.clone())),
-                                                        span { class: "qi-id qi-fuzzy", dangerous_inner_html: "{html}" }
-                                                    }
+                                {
+                                    // One table for both result sets: fuzzy
+                                    // identifier matches first, then indexed
+                                    // hits, de-duplicated by id. The cell
+                                    // callback keeps the fuzzy/snippet
+                                    // highlighting, which plain cell text
+                                    // would drop.
+                                    let mut seen = std::collections::HashSet::new();
+                                    let mut rows_all: Vec<(String, String)> = Vec::new();
+                                    for (id, html) in identifiers.iter() {
+                                        if seen.insert(id.clone()) {
+                                            rows_all.push((id.clone(), html.clone()));
+                                        }
+                                    }
+                                    for hit in rich.iter() {
+                                        if seen.insert(hit.id.clone()) {
+                                            let html = if hit.snippet.is_empty() {
+                                                hit.id.clone()
+                                            } else {
+                                                hit.snippet.clone()
+                                            };
+                                            rows_all.push((hit.id.clone(), html));
+                                        }
+                                    }
+                                    let columns = vec![
+                                        panel_kit::widgets::data_table::DataColumnSpec::new("id", "id"),
+                                        panel_kit::widgets::data_table::DataColumnSpec::new("match", "match"),
+                                    ];
+                                    let data = {
+                                        let mut builder = panel_kit::widgets::data_table::TableData::builder(&columns);
+                                        for (id, html) in rows_all.iter() {
+                                            builder.row(
+                                                id.as_str(),
+                                                [
+                                                    panel_kit::widgets::data_table::Value::Text(id.as_str()),
+                                                    panel_kit::widgets::data_table::Value::Text(html.as_str()),
+                                                ],
+                                            );
+                                        }
+                                        builder.build()
+                                    };
+                                    let html_cells: std::rc::Rc<Vec<String>> =
+                                        std::rc::Rc::new(rows_all.iter().map(|(_, h)| h.clone()).collect());
+                                    let ids_only: std::rc::Rc<Vec<String>> =
+                                        std::rc::Rc::new(rows_all.iter().map(|(i, _)| i.clone()).collect());
+                                    let selected_now = selected.read().clone();
+                                    let mut selected_set = selected;
+                                    rsx! {
+                                        if server_backed {
+                                            div { class: "browse-group", "indexed"
+                                                if *searching.read() {
+                                                    Spinner {}
+                                                } else {
+                                                    span { class: "sugg-count", " {rich.len()} shown · {total} total" }
                                                 }
                                             }
                                         }
-                                    }
-                                }
-
-                                if server_backed {
-                                    div { class: "browse-group",
-                                        "indexed"
-                                        if *searching.read() {
-                                            Spinner {}
-                                        } else {
-                                            span { class: "sugg-count", " {rich.len()} shown · {total} total" }
-                                        }
-                                    }
-                                    if rich.is_empty() && !*searching.read() && !search_failed {
-                                        div { class: "more", "no indexed matches" }
-                                    }
-                                    nav { class: "queue", "aria-label": "Indexed matches",
-                                        for hit in rich {
-                                            {
-                                                let active = selected.read().as_deref() == Some(hit.id.as_str());
-                                                let click_id = hit.id.clone();
-                                                rsx! {
-                                                    button {
-                                                        key: "c:{hit.id}",
-                                                        class: if active { "queue-item rich active" } else { "queue-item rich" },
-                                                        "data-node-id": hit.id.clone(),
-                                                        onclick: move |_| selected.set(Some(click_id.clone())),
-                                                        span { class: "qi-id", "{hit.id}" }
-                                                        if !hit.snippet.is_empty() {
-                                                            span { class: "qi-snippet", dangerous_inner_html: "{hit.snippet}" }
-                                                        }
-                                                    }
-                                                }
-                                            }
+                                        panel_kit::widgets::data_table::DataTable {
+                                            id: "nodes-results",
+                                            columns,
+                                            data,
+                                            label: "Search results",
+                                            placeholder: "filter results",
+                                            selected: selected_now.map(|s| vec![s]),
+                                            empty: rsx! { div { class: "more", "no matches" } },
+                                            cell: move |(row, column): (usize, usize)| {
+                                                let text = if column == 0 {
+                                                    ids_only.get(row).cloned().unwrap_or_default()
+                                                } else {
+                                                    html_cells.get(row).cloned().unwrap_or_default()
+                                                };
+                                                rsx! { span { dangerous_inner_html: "{text}" } }
+                                            },
+                                            on_row: move |id: String| selected_set.set(Some(id)),
                                         }
                                     }
                                 }
