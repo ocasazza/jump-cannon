@@ -42,7 +42,7 @@ use panel_kit::widgets::{dock, panel, root};
 use panel_kit::{LayoutBuilder, PanelWin, Spinner};
 use panel_kit_core::frame::{PanelProjection, Placement};
 use panel_kit_core::reducer::WorkspaceEvent;
-use panel_kit_core::{Mode, PanelCatalog, PanelCommand, PanelKind};
+use panel_kit_core::{Mode, PanelCommand, PanelKind};
 use serde::{Deserialize, Serialize};
 use session_manager::{EmbeddedSessionManager, HttpSessionManager, UserIdentity, WorldHost};
 
@@ -1749,37 +1749,23 @@ fn render_workspace(workspace: PanelWorkspace, ctx: Ctx) -> Element {
             class: "{workspace_class}",
             style: "{workspace_style}",
             onwheel: move |event| workspace::handle_wheel(&wheel_workspace, &event),
-            for projected in frame.panels.iter().copied() {
-                {render_projected_panel(projected, &workspace.catalog, emit.clone(), ctx)}
+            // Keep-alive: the graph panel stays mounted (hidden, keyed) when
+            // the projection drops it — focusing or maximizing another panel
+            // would otherwise tear down the WebGPU canvas and its camera.
+            {
+                panel_kit::keepalive::render_keepalive_with(
+                    &snapshot,
+                    &workspace.catalog,
+                    &frame,
+                    |key| key == Panel::Graph,
+                    |projected, meta, _hidden| render_panel(projected, meta, emit.clone(), ctx),
+                )
             }
         }
         {dock::dock(frame.dock, &workspace.catalog, emit, None)}
     }
 }
 
-/// Render one projected panel from explicit chrome, body, controls, and grip.
-fn render_projected_panel(
-    projected: PanelProjection<Panel>,
-    catalog: &PanelCatalog<Panel>,
-    emit: EventHandler<WorkspaceEvent<Panel>>,
-    ctx: Ctx,
-) -> Element {
-    let Some(meta) = catalog.get(projected.key) else { return rsx! {} };
-    let class = format!("panel-{}", meta.slug);
-    let maximized = matches!(projected.placement, Placement::Maximized);
-    let controls = panel::traffic_lights(projected, emit.clone());
-    let chrome = panel::panel_chrome_with_events(
-        projected,
-        meta,
-        emit.clone(),
-        Some(controls),
-        Some(panel_header_actions(projected.key, ctx)),
-    );
-    let body = panel::panel_body(panel_body(projected.key, maximized, ctx));
-    let resize = panel::resize_grip(projected, emit.clone());
-
-    panel::panel_shell_with_events(projected, Some(&class), rsx! { {chrome} {body} {resize} }, emit)
-}
 
 // --- panel bodies ----------------------------------------------------------------
 
@@ -2214,4 +2200,27 @@ mod workspace_migration_tests {
             },
         }
     }
+}
+
+
+fn render_panel(
+    projected: PanelProjection<Panel>,
+    meta: &panel_kit_core::panel::PanelMeta<Panel>,
+    emit: EventHandler<WorkspaceEvent<Panel>>,
+    ctx: Ctx,
+) -> Element {
+    let class = format!("panel-{}", meta.slug);
+    let maximized = matches!(projected.placement, Placement::Maximized);
+    let controls = panel::traffic_lights(projected, emit.clone());
+    let chrome = panel::panel_chrome_with_events(
+        projected,
+        meta,
+        emit.clone(),
+        Some(controls),
+        Some(panel_header_actions(projected.key, ctx)),
+    );
+    let body = panel::panel_body(panel_body(projected.key, maximized, ctx));
+    let resize = panel::resize_grip(projected, emit.clone());
+
+    panel::panel_shell_with_events(projected, Some(&class), rsx! { {chrome} {body} {resize} }, emit)
 }

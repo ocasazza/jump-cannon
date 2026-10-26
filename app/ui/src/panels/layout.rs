@@ -3247,11 +3247,6 @@ fn seed_section(remote: bool) -> Element {
     let st = STATE.read().clone();
     let strategy = st.seed_strategy.clone();
 
-    let strategy_value = match &strategy {
-        SeedStrategy::None => "none".to_string(),
-        SeedStrategy::BuiltIn(i) => format!("b{i}"),
-        SeedStrategy::Custom => "custom".to_string(),
-    };
 
     let body = match strategy.clone() {
         SeedStrategy::None => rsx! {
@@ -3316,39 +3311,50 @@ fn seed_section(remote: bool) -> Element {
         }
         div { class: "lay-row",
             span { class: "lay-k", "seed" }
-            select {
-                class: "lay-select",
-                value: "{strategy_value}",
-                onchange: move |e| {
-                    match e.value().as_str() {
-                        "none" => set_seed_strategy(SeedStrategy::None),
-                        "custom" => set_seed_strategy(SeedStrategy::Custom),
-                        v => {
-                            if let Some(i) = v.strip_prefix('b').and_then(|s| s.parse::<usize>().ok()) {
-                                set_seed_strategy(SeedStrategy::BuiltIn(i));
-                            }
-                        }
-                    }
-                },
-                option {
-                    value: "none",
-                    title: "Leave the current positions untouched",
-                    selected: matches!(strategy, SeedStrategy::None),
-                    "No seed"
-                }
+            {
+                let mut items = vec![panel_kit::widgets::DropdownItem {
+                    value: "none".to_string(),
+                    label: "No seed".to_string(),
+                    group: String::new(),
+                }];
                 for i in builtin_demo_indices() {
-                    option {
-                        key: "{i}",
-                        value: "b{i}",
-                        selected: strategy == SeedStrategy::BuiltIn(i),
-                        {tvix_wasm::seed_demos()[i].name}
-                    }
+                    items.push(panel_kit::widgets::DropdownItem {
+                        value: format!("b{i}"),
+                        label: tvix_wasm::seed_demos()[i].name.to_string(),
+                        group: "built-in".to_string(),
+                    });
                 }
-                option {
-                    value: "custom",
-                    title: "Author a seed as a Nix expression",
-                    selected: matches!(strategy, SeedStrategy::Custom),
-                    "Custom (Nix)"
+                items.push(panel_kit::widgets::DropdownItem {
+                    value: "custom".to_string(),
+                    label: "Custom (Nix)".to_string(),
+                    group: String::new(),
+                });
+                let current = match strategy {
+                    SeedStrategy::None => "none".to_string(),
+                    SeedStrategy::Custom => "custom".to_string(),
+                    SeedStrategy::BuiltIn(i) => format!("b{i}"),
+                };
+                let dd_state = use_signal(panel_kit::widgets::DropdownState::default);
+                rsx! {
+                    panel_kit::widgets::Dropdown {
+                        items,
+                        state: dd_state,
+                        selected: current,
+                        searchable: false,
+                        on_action: move |action: panel_kit::widgets::DropdownAction| {
+                            if let panel_kit::widgets::DropdownAction::Select { value } = action {
+                                match value.as_str() {
+                                    "none" => set_seed_strategy(SeedStrategy::None),
+                                    "custom" => set_seed_strategy(SeedStrategy::Custom),
+                                    v => {
+                                        if let Some(i) = v.strip_prefix('b').and_then(|s| s.parse::<usize>().ok()) {
+                                            set_seed_strategy(SeedStrategy::BuiltIn(i));
+                                        }
+                                    }
+                                }
+                            }
+                        },
+                    }
                 }
             }
         }
