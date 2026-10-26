@@ -50,5 +50,12 @@ fn all_panel_kinds() -> &'static [Panel] {
         Panel::GitHub,
         Panel::GpuSessions,
         Panel::Importers,
+        // Edge Inspector must be catalogued: it ships in `default_layout()`
+        // and `sessions_default_layout()`, and panel-kit refuses to persist a
+        // snapshot whose live panel has no stable id (`MissingStableId` ->
+        // "panel key is missing from the panel catalog"). Omitting it made
+        // every workspace/sessions layout save fail, spamming the console and
+        // failing the browser regression on `page_errors`.
+        Panel::EdgeInspector,
     ]
 }

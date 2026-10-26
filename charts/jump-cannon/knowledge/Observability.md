@@ -15,7 +15,7 @@ and result metrics to Pushgateway / Prometheus for Grafana dashboards.
 The chart ships its Grafana dashboards with the release: every JSON under
 `charts/jump-cannon/dashboards/` renders as a `grafana_dashboard`-labeled
 ConfigMap (see `grafanaDashboards` in `values.yaml`), and the monitoring
-stack's Grafana sidecar loads them into its provisioned charts folder. The
+stack's Grafana sidecar loads them into its `apps` folder. The
 test-results dashboard queries the Pushgateway gauges from [[Scheduled Tests]]
 (`test_run_passed` / `test_run_failed` / `test_duration_seconds` /
 `jump_cannon_test_last_run_timestamp_seconds`, all `app="jump-cannon"`).

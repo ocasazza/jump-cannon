@@ -1,5 +1,5 @@
-//! Shipped example sessions: curated app-state + source pairs that show one
-//! simulation/exploration regime each.
+//! Shipped example sessions: curated app-state + graph pairs (an importer
+//! source or a Generate demo) that show one simulation/exploration regime each.
 //!
 //! The files ride the frontend dist (`assets/sessions/`), not the server, so
 //! they work in every deployment — the container, `trunk serve`, and the
@@ -11,7 +11,8 @@
 //! session names an importer source, switch this browser session's view to it
 //! through the Importers panel's apply path — which starts the source's
 //! background build and streams its progress if the server has not built it
-//! yet.
+//! yet. A session naming a Generate demo instead stages that expression and
+//! evaluates it in this browser after the reload, in place of the server graph.
 
 use dioxus::prelude::*;
 
@@ -27,6 +28,10 @@ pub(crate) struct ExampleSession {
     /// deployment default source.
     #[serde(default)]
     pub(crate) source: Option<String>,
+    /// Generate-catalog demo whose graph the session explores instead of a
+    /// source; it is evaluated in this browser after the reload.
+    #[serde(default)]
+    pub(crate) generate: Option<String>,
 }
 
 /// Fetch state of the shipped index.
@@ -84,6 +89,13 @@ pub(crate) fn load(ctx: Ctx, session: ExampleSession) {
     *ERROR.write() = None;
     spawn(async move {
         let result = async {
+            let generate = match &session.generate {
+                Some(name) => Some(
+                    crate::panels::generate::demo_expr(name)
+                        .ok_or_else(|| format!("unknown Generate demo {name:?}"))?,
+                ),
+                None => None,
+            };
             let response = gloo_net::http::Request::get(&asset_url(&format!(
                 "{}.yaml",
                 session.name
@@ -97,6 +109,10 @@ pub(crate) fn load(ctx: Ctx, session: ExampleSession) {
             let yaml = response.text().await.map_err(|error| error.to_string())?;
             let state = appstate::import_str(&yaml).map_err(|error| error.to_string())?;
             appstate::apply(&state, "example session");
+            // After `apply`, which overwrites the Generate state and reloads.
+            if let Some(expr) = generate {
+                crate::panels::generate::stage_boot_evaluation(expr);
+            }
             Ok(())
         }
         .await;
@@ -123,4 +139,29 @@ pub(crate) fn load(ctx: Ctx, session: ExampleSession) {
         }
         APPLYING.write().take();
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_shipped_session_loads() {
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/assets/sessions");
+        let index: Vec<ExampleSession> =
+            serde_json::from_str(&std::fs::read_to_string(format!("{dir}/index.json")).unwrap())
+                .unwrap();
+        for session in index {
+            let yaml = std::fs::read_to_string(format!("{dir}/{}.yaml", session.name))
+                .unwrap_or_else(|e| panic!("{}: {e}", session.name));
+            appstate::import_str(&yaml).unwrap_or_else(|e| panic!("{}: {e}", session.name));
+            if let Some(demo) = &session.generate {
+                assert!(
+                    crate::panels::generate::demo_expr(demo).is_some(),
+                    "{}: unknown Generate demo {demo:?}",
+                    session.name
+                );
+            }
+        }
+    }
 }

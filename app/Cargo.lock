@@ -2189,6 +2189,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "graph-metrics"
+version = "1.0.0"
+dependencies = [
+ "petgraph",
+ "rand 0.8.6",
+ "vault-data",
+]
+
+[[package]]
 name = "graph-vcs"
 version = "1.0.0"
 dependencies = [
@@ -2891,6 +2900,7 @@ dependencies = [
  "gloo-storage",
  "gloo-timers",
  "graph-layouts",
+ "graph-metrics",
  "graph-vcs",
  "js-sys",
  "jump-cannon-filter-model",

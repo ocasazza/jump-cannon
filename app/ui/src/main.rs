@@ -19,6 +19,7 @@ mod badges;
 mod build_progress;
 mod selection_card;
 mod client_log;
+mod client_metrics;
 mod graph_canvas;
 mod hints;
 mod palette;
@@ -974,6 +975,12 @@ fn commit_server_graph(mut ctx: Ctx, epoch: u64, graph: GraphData) -> bool {
     panels::layout::set_expected_graph_revision(revision);
     panels::style::reset_for_graph_session(true, revision);
     ctx.graph.set(Some(graph));
+    // Metric-driven styling reads the same buffers graph-api would serve;
+    // compute them in-browser for the client-owned topology.
+    let metrics = ctx.graph.read().as_ref().map(client_metrics::compute);
+    if let Some(metrics) = metrics {
+        panels::style::begin_client_session(metrics);
+    }
     true
 }
 
@@ -1089,6 +1096,9 @@ fn App() -> Element {
     // handling, style/camera loops) before any panel renders — a saved
     // layout with every panel minimized must still process boot presets.
     appstate::ensure_init();
+    // Client-graph metrics land outside any fetch; the style loop must be
+    // armed to apply them even with every panel minimized.
+    panels::style::ensure_init();
     // _v6: the FilterStrip ("Filters") panel merged into the Filter panel, so
     // its enum variant is gone — a saved v5 layout referencing it would fail to
     // deserialize; re-seed instead. (v5: re-seed so a minimized Graph panel

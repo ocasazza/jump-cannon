@@ -41,10 +41,18 @@ input, deployment-provisioned RWX and same-namespace requirements, alternate
 `<release>-okf` naming, UID/GID `10001`, and rollout ownership are explained.
 The switch-posture assertion is derived from served state, never pinned: the
 harness fetches the same `/importers` catalog the panel renders, compares the
-sole `data-viewing="true"` row with the catalog's `selected` profile, and
-derives the expected Apply affordance from the served `runtimeSwitch`
-(`enabled && allowed`) and the Lavender profile's selected/runnable/viewing
-posture. The main fixture deployment runs
+viewing rows with the catalog's `selected` profile, and derives the expected
+Apply affordance from the served `runtimeSwitch` (`enabled && allowed`) and
+the Lavender profile's selected/runnable/viewing posture. Exactly one row is
+viewing only when a session id or a deployment `selected` profile names one; a
+deployment whose `importers.selected` is empty and whose active source is
+native (outside the catalog) legitimately marks **no** row
+`data-viewing="true"`, and the check asserts that zero-row case rather than
+requiring a non-null selection. Every panel kind that appears in
+`default_layout()` or `sessions_default_layout()` must also be listed in
+`app/ui/src/workspace/catalog.rs`: panel-kit refuses to persist a snapshot
+whose live panel has no catalog stable id, and that refusal surfaces as a
+`page_errors` entry that fails the whole run. The main fixture deployment runs
 `JUMP_CANNON_IMPORTER_SWITCH_GROUP="*"`, so every viewer is authorized: no
 posture note is rendered, and the Lavender summary must offer
 `[data-action="apply"]` while Lavender is a runnable, non-viewed alternate.

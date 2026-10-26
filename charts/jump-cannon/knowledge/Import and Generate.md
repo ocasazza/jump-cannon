@@ -36,3 +36,14 @@ through the importer catalog rather than a `--source` flag. The browser Generate
 panel evaluates supported Nix expressions through tvix on the client and creates
 a browser-owned graph. Source selection and credentials remain deployment policy.
 See [[Importer Runtime]], [[Backend API]], and [[Security Model]].
+
+Generated graphs can tune the in-browser GPU force layout per node and per
+link. A node's `charge` multiplies its repulsion and `mass` its inertia; a
+link's `weight` multiplies its spring stiffness and `restLength` its rest
+length. Each defaults to 1 on top of the engine's degree-based default. The
+"Communities" Generate demos and the "Generated communities · physics regime"
+example session show both.
+
+Metric-driven styling works on generated graphs too: the browser computes the
+same metric set graph-api serves (community, pagerank, degree, …) on the
+client-owned topology, with betweenness skipped above 10k nodes.

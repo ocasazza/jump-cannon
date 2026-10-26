@@ -51,12 +51,9 @@ impl StaticLayout for SphereLayout {
     }
 
     fn solve(settings: &Self::Settings, graph: &Graph) -> Result<Vec<f32>, String> {
-        // Match the engine's id-sorted node order so the returned packed
-        // positions line up with the GPU positions buffer index-for-index.
-        let mut node_order: Vec<&String> = graph.nodes.keys().collect();
-        node_order.sort();
-
-        let n = node_order.len();
+        // Positions depend only on the index, so slot i belongs to the i-th
+        // id in the engine's sorted order without sorting here.
+        let n = graph.nodes.len();
         let mut out: Vec<f32> = Vec::with_capacity(n * 3);
         let radius = settings.radius.max(0.0);
         let jitter = settings.jitter.clamp(0.0, 1.0);

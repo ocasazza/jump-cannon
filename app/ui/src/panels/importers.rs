@@ -1041,6 +1041,8 @@ fn graph_data_from_preview(p: &crate::pest_worker::ParsePreview) -> crate::Graph
             edges,
             colors,
             sizes,
+            node_physics: None,
+            edge_physics: None,
         },
     }
 }

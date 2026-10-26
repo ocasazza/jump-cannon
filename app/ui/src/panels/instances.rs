@@ -257,6 +257,9 @@ fn sessions_section(ctx: Ctx) -> Element {
                                 if let Some(source) = &session.source {
                                     div { class: "inst-session-source", "source: {source}" }
                                 }
+                                if let Some(demo) = &session.generate {
+                                    div { class: "inst-session-source", "generated: {demo}" }
+                                }
                             }
                         }
                     }

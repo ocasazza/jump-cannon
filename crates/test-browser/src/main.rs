@@ -1378,7 +1378,13 @@ async fn drive_page(
           : null;
 
         // The panel marks the session-selected profile viewing, else the
-        // deployment-selected one (app/ui/src/panels/importers.rs).
+        // deployment-selected one (app/ui/src/panels/importers.rs). With
+        // neither — a deployment whose `importers.selected` is empty, serving
+        // a native source outside the catalog — the panel marks NO row
+        // viewing, because `is_viewing` needs a session id or a selected
+        // profile. The served active importer is native here, so no catalog
+        // entry is the deployment default and the expected viewing row is
+        // legitimately null.
         const sessionSelection = sessionStorage.getItem('jc_source_id');
         let sessionId = null;
         if (sessionSelection) {
@@ -1431,7 +1437,14 @@ async fn drive_page(
         );
         const viewingRow = viewingRows.length === 1
           ? viewingRows[0].getAttribute('data-package-id') : null;
-        const selectedViewing = expectedViewing !== null && viewingRow === expectedViewing;
+        // Mirror the panel's `is_viewing` rule exactly: exactly one row when
+        // a session id or a deployment `selected` profile names one, and
+        // NONE when neither does (a native active source outside the
+        // catalog). Demanding a non-null expected viewing row here failed
+        // every such deployment regardless of what the panel rendered.
+        const selectedViewing = expectedViewing === null
+          ? viewingRows.length === 0
+          : viewingRows.length === 1 && viewingRow === expectedViewing;
 
         // Posture note: disabled and denied deployments each explain why
         // Apply is absent; an authorized viewer gets no note.
@@ -1490,7 +1503,8 @@ async fn drive_page(
         if (!lavenderRow) failures.push(`${LAVENDER_ID} catalog row is missing or misattributed`);
         if (!kindChip) failures.push(`${LAVENDER_ID} row has no kind chip`);
         if (!selectedViewing) failures.push(
-          `viewing row ${JSON.stringify(viewingRow)} does not match the served selection ${JSON.stringify(expectedViewing)}`
+          `viewing rows [${viewingRows.map((row) => row.getAttribute('data-package-id')).join(', ')}] ` +
+          `do not match the served selection ${JSON.stringify(expectedViewing)}`
         );
         if (!postureNote) failures.push('switch-posture note does not match the served runtime switch');
         if (!summaryCard) failures.push(`${LAVENDER_ID} summary card is incomplete`);

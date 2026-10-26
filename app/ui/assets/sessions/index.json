@@ -22,5 +22,12 @@
     "title": "Jump Cannon docs · doctype regime",
     "description": "The deployment's own knowledge corpus, coloured by document type with the wikilink structure under a GPU force regime. Runs on the deployment default source.",
     "source": null
+  },
+  {
+    "name": "physics-communities",
+    "title": "Generated communities · physics regime",
+    "description": "Four generated communities under the GPU force regime with per-edge springs (short inside a community, long between) and per-node charge doubling from one community to the next. Generated in the browser; needs no server.",
+    "source": null,
+    "generate": "Communities (per-node charge)"
   }
 ]

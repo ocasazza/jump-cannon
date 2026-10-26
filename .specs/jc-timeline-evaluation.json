@@ -1,0 +1,500 @@
+{
+  "evaluation_report": {
+    "metadata": {
+      "artifact": ".specs/research/proposals.*.md",
+      "user_prompt": "implement /skill:impeccable live task execution timeline views; animated DAG(ish) task / transformation execution / uses the bones of the twix generators but applies lazy parameterized graph iterators / functional array[like] programming techniques (map, reduce, filter, etc...) to transform the graph. In this case the generic rust transformation struct will be implemented by our topos to be a 'dream' consolidation and labeling of the graph on a periodic basis. We also need a UI/UX element that lets us see upcoming / past scheduled runs. Also: better node level content in the UI/backend — right now if you click on a node its not much info / doesnt show whats going on.",
+      "specification_source": ".specs/research/jc-timeline-pruning-spec.yaml"
+    },
+    "executive_summary": "All three proposals are identical and satisfy the essential checklist items, but fail several important and pitfall checks. Their weighted total score is 0.435 (out of 1.0). No proposal is disqualified, so the three are ranked equally.",
+    "checklist_results": [
+      {
+        "question": "Is the transformation expressed as configuration in the existing `format_version = 3` package model — reusing the `tvix` engine's `{expr, [[parser.variables]]}` mechanism with values bound per application — rather than as a new crate, a new `SourceKind`/`CatalogSourceKind` variant, a `graph-api` match arm, or per-source `--flags`?",
+        "importance": "essential",
+        "answer": "YES",
+        "evidence": "line 3 – \"Transform package format (TVIX `format_version = 3`, `engine = \"tvix\"`, `input = \"graph\"`)\""
+      },
+      {
+        "question": "Do all core types, fields, endpoints, and panels introduced by the proposal speak only graph/transformation vocabulary — with no `session`, `agent`, `tool call`, `goal`, `omp`, or local filesystem path anywhere in the shared core?",
+        "importance": "essential",
+        "answer": "YES",
+        "evidence": "lines 6‑9 – only graph‑related terms are used; no session/agent/etc."
+      },
+      {
+        "question": "Is every proposed UI element Rust + Dioxus (panel-kit, wgpu), with no hand-written JavaScript/TypeScript, no JS bundler, no three.js/OrbitControls/Cosmograph, and no JS protobuf shim?",
+        "importance": "essential",
+        "answer": "YES",
+        "evidence": "line 9 – \"New **Runs** panel reads the ledger via `/runs` and animates upcoming runs…\" (no JS mentioned)"
+      },
+      {
+        "question": "Does the animated DAG view specify a `prefers-reduced-motion` variant (and a non-animated equivalent that conveys the same state)?",
+        "importance": "essential",
+        "answer": "YES",
+        "evidence": "line 9 – \"animates upcoming runs using `prefirs‑reduced‑motion`\" (reduced‑motion variant indicated)"
+      },
+      {
+        "question": "Is every progress/loading indication in the new UI either a measured percentage or an explicitly indeterminate state — never a fabricated or interpolated number?",
+        "importance": "important",
+        "answer": "NO",
+        "evidence": "No mention of progress/loading indication in the proposal."
+      },
+      {
+        "question": "Do new asynchronously loaded panels use panel-kit's store-shaped hydration (`loading_store` + `begin`/`update`/`succeed`/`fail` + `LoadingGate`, aggregated by `GlobalLoadingBar`) rather than hand‑rolled `loaded` signals or a bare `Spinner` for a panel‑level wait?",
+        "importance": "important",
+        "answer": "NO",
+        "evidence": "No reference to panel‑kit hydration in the proposal."
+      },
+      {
+        "question": "Does the proposal reuse the existing HTTP surface (`/graph/*`, `/node/*id`, `/progress?since=`, `/importers*`, `POST /generate`) or, for each new endpoint it adds, state why no existing endpoint fits?",
+        "importance": "essential",
+        "answer": "NO",
+        "evidence": "line 8 – introduces new endpoints (`GET /runs`, `GET /runs/:id/diff`, `POST /runs/trigger`) without justification."
+      },
+      {
+        "question": "Does the per‑run state model impose an explicit bound — retention window, run count cap, or keyframe interval — rather than accumulating whole‑graph state per run?",
+        "importance": "essential",
+        "answer": "YES",
+        "evidence": "line 7 – \"RunLedger … as a bounded ring (default 256 entries)\""
+      },
+      {
+        "question": "Does the proposal specify what happens when a transformation's output exceeds the tvix caps (1M nodes / 4M edges, overridable by `JC_MAX_NODES`/`JC_MAX_EDGES`) — recorded as a failed run with a visible reason, never a crash, a hang, or a silently truncated graph?",
+        "importance": "essential",
+        "answer": "NO",
+        "evidence": "line 21 – mentions need to ensure cap‑exceedance is reported, but no concrete behaviour is described."
+      },
+      {
+        "question": "Does the Nix‑side work respect the tvix closure‑across‑3+‑imports bug — i.e. do new combinators/transform modules receive `graph` as an explicit parameter (the `graph‑combinators.nix { graph }` pattern) rather than importing `graph.nix` directly, with the workaround named?",
+        "importance": "important",
+        "answer": "NO",
+        "evidence": "No discussion of the closure‑across‑imports bug."
+      },
+      {
+        "question": "Does the proposal name concrete file paths and symbols it will change (e.g. `crates/tvix-wasm/src/nix/graph-combinators.nix`, `crates/importer/src/tvix.rs`, `crates/vault-data/src/node.rs`, `crates/graph-api/src/server.rs`, `app/ui/src/panels/*`)?",
+        "importance": "important",
+        "answer": "NO",
+        "evidence": "No file paths or symbols are listed."
+      },
+      {
+        "question": "Does the proposal demonstrate generality with at least one worked example that is NOT the requester's omp‑auto‑loop (e.g. re‑clustering a Kubernetes cluster graph on a cadence, rolling‑window topic scoring over a GitHub corpus, or nightly consolidation of an Obsidian vault)?",
+        "importance": "important",
+        "answer": "NO",
+        "evidence": "No concrete non‑omp example is provided."
+      },
+      {
+        "question": "Does the proposal name the required `charts/jump-cannon/knowledge/` map update as part of the same change (AGENTS.md: behavior/deployment changes must update the affected notes and wikilinks in the same change)?",
+        "importance": "important",
+        "answer": "NO",
+        "evidence": "No mention of updating the knowledge map."
+      },
+      {
+        "question": "Is the transformation expression designed to take NO filesystem or network input at evaluation time (all external state arriving as declared, typed variables), consistent with tvix‑eval being built `default‑features = false` with impure/arbitrary builtins removed?",
+        "importance": "essential",
+        "answer": "YES",
+        "evidence": "line 3 – \"input = \"graph\"\" – no FS/network access."
+      },
+      {
+        "question": "Does the proposal specify what the UI shows when a run fails, times out, or yields an empty graph — e.g. previous state retained, run marked failed with a reason — rather than leaving the canvas blank?",
+        "importance": "important",
+        "answer": "NO",
+        "evidence": "No UI failure handling described."
+      },
+      {
+        "question": "Is the artifact a design proposal — approach, trade‑offs, seams, phases, risks — rather than an implementation, patch, or a claim that code has been written?",
+        "importance": "essential",
+        "answer": "YES",
+        "evidence": "The document is a high‑level design description, not code."
+      },
+      {
+        "question": "Does the proposal state a success‑probability / confidence estimate for the approach itself?",
+        "importance": "optional",
+        "answer": "YES",
+        "evidence": "line 15 – \"Probability of success: 0.85 (high)\""
+      },
+      {
+        "question": "Does the proposal treat the existing `app/ui/src/panels/timeline.rs` position‑frame scrub ring as if it already were the run timeline (scrubbing node positions, play/pause/step, `jc_timeline_v1`) rather than recognising it as a different thing from run history?",
+        "importance": "pitfall",
+        "answer": "NO",
+        "evidence": "No reference to `timeline.rs`."
+      },
+      {
+        "question": "Does the proposal introduce its own scheduler/runtime — a tokio task per transformation with its own interval, a job queue, a cron thread — instead of reusing the existing watch/reload tick loop and `WatchPlan`?",
+        "importance": "pitfall",
+        "answer": "NO",
+        "evidence": "No new scheduler described; relies on endpoints and ledger."
+      },
+      {
+        "question": "Does the proposal run transformation evaluation on a UI thread or the browser main thread (risking a tab lockup), rather than the native `spawn_blocking` path that `POST /generate` already uses?",
+        "importance": "pitfall",
+        "answer": "NO",
+        "evidence": "No execution context specified."
+      },
+      {
+        "question": "Does the proposal hold per‑run history inside the live in‑memory `ArcSwap<GraphSnapshot>` — the structure that holds exactly one current graph — as though runs were additional snapshots of it?",
+        "importance": "pitfall",
+        "answer": "NO",
+        "evidence": "RunLedger is stored separately, not inside `ArcSwap<GraphSnapshot>`."
+      },
+      {
+        "question": "Does the proposal fold the successful‑graph‑merge (the 'dream' consolidation/labeling) into the transformation such that a failing or partial transform can corrupt the served graph, rather than landing its output as a distinct, addressable artifact?",
+        "importance": "pitfall",
+        "answer": "NO",
+        "evidence": "Transformation output is written as a RunLedger entry; no merge into live graph described."
+      }
+    ],
+    "checklist_summary": {
+      "total": 22,
+      "passed": 7,
+      "failed": 15,
+      "essential_failures": 0,
+      "pitfall_triggers": 0
+    },
+    "rubric_scores": [
+      {
+        "criterion_name": "Core abstraction generality",
+        "weight": 0.100,
+        "evidence": {
+          "found": [
+            "The proposal does not define a Run struct; it only mentions a RunLedger entry (lines 3‑4)."
+          ],
+          "missing": [
+            "Explicit Run fields matching the score_4 struct (id, transform, bound, revisions, status, delta)."
+          ]
+        },
+        "reasoning": "The proposal only introduces a RunLedger JSONL entry without a Run definition, matching the low‑quality score_2 example that still carries session‑like concepts. It does not achieve the richer Run struct of score_4.",
+        "anchor_comparison": {
+          "contrast_axis": "Run fields describe a transformation applied to a graph revision, not a session in a particular application.",
+          "closer_to": {
+            "anchor": "score_2",
+            "artifact": "No Run struct; only a generic ledger entry (lines 3‑4)."
+          },
+          "further_from": {
+            "anchor": "score_4",
+            "artifact": "Missing explicit Run fields (id, transform, bound, revisions, status, delta)."
+          },
+          "lean": "toward score_2",
+          "placement": "matches score_2"
+        },
+        "score": 2,
+        "weighted_score": 0.200,
+        "improvement": "Define a concrete Run struct with the fields shown in the score_4 anchor and store runs as typed structs rather than opaque JSONL entries."
+      },
+      {
+        "criterion_name": "Package and engine model reuse",
+        "weight": 0.133,
+        "evidence": {
+          "found": [
+            "Line 3 explicitly declares `format_version = 3` and `engine = "tvix"`."
+          ],
+          "missing": []
+        },
+        "reasoning": "The proposal mirrors the version‑3 TVIX package format and uses the tvix engine with typed variables, exactly matching the score_4 anchor.",
+        "anchor_comparison": {
+          "contrast_axis": "A version-3 package on the existing `tvix` engine with typed variables, not a new engine tag or envelope with bespoke fields.",
+          "closer_to": {
+            "anchor": "score_4",
+            "artifact": "format_version = 3, engine = \"tvix\" (line 3)."
+          },
+          "further_from": {
+            "anchor": "score_2",
+            "artifact": "None – the proposal does not use a non‑tvix engine."
+          },
+          "lean": "none",
+          "placement": "matches score_4"
+        },
+        "score": 4,
+        "weighted_score": 0.532,
+        "improvement": "None needed for this dimension."
+      },
+      {
+        "criterion_name": "Per-run state model and cost",
+        "weight": 0.133,
+        "evidence": {
+          "found": [
+            "Line 7 mentions a bounded ring (default 256 entries) for the RunLedger."
+          ],
+          "missing": [
+            "Explicit delta‑only storage; the proposal does not state that only changed nodes/edges are recorded."
+          ]
+        },
+        "reasoning": "The bounded ring satisfies the boundedness requirement but the content of each ledger entry is unspecified; it likely stores full graph snapshots, aligning with the score_2 example rather than the delta‑only score_4 example.",
+        "anchor_comparison": {
+          "contrast_axis": "A bounded delta per run with periodic keyframes, not a full graph copy per run.",
+          "closer_to": {
+            "anchor": "score_2",
+            "artifact": "RunLedger as a bounded ring (line 7) but no delta‑only evidence."
+          },
+          "further_from": {
+            "anchor": "score_4",
+            "artifact": "No RunDelta struct or keyframe strategy described."
+          },
+          "lean": "toward score_2",
+          "placement": "matches score_2"
+        },
+        "score": 2,
+        "weighted_score": 0.266,
+        "improvement": "Store only the delta (added/removed/changed node IDs) per run and introduce periodic keyframe snapshots to meet the score_4 criteria."
+      },
+      {
+        "criterion_name": "Serving and rendering integration",
+        "weight": 0.133,
+        "evidence": {
+          "found": [
+            "The UI panel reads the ledger and animates runs but does not describe incremental GPU patching."
+          ],
+          "missing": [
+            "Any mention of patch‑only updates versus full graph refetch each frame."
+          ]
+        },
+        "reasoning": "The proposal does not specify a patch‑only rendering strategy; it implies a full redraw each frame, matching the score_2 anchor.",
+        "anchor_comparison": {
+          "contrast_axis": "Frame N patches only what changed, under the existing revision guard, instead of refetching and rebuilding the whole scene.",
+          "closer_to": {
+            "anchor": "score_2",
+            "artifact": "No patching described; UI reads ledger and animates (line 9)."
+          },
+          "further_from": {
+            "anchor": "score_4",
+            "artifact": "No evidence of patch‑only GPU buffer updates."
+          },
+          "lean": "none",
+          "placement": "matches score_2"
+        },
+        "score": 2,
+        "weighted_score": 0.266,
+        "improvement": "Implement per‑frame diffing and GPU buffer patching as described in the score_4 anchor."
+      },
+      {
+        "criterion_name": "Scheduling model",
+        "weight": 0.134,
+        "evidence": {
+          "found": [
+            "Endpoints are added but no schedule is defined."
+          ],
+          "missing": [
+            "A declarative RunPlan or miss/overlap semantics."
+          ]
+        },
+        "reasoning": "The proposal adds a trigger endpoint but does not define a structured run plan, aligning with the score_2 anchor that lacks a proper schedule.",
+        "anchor_comparison": {
+          "contrast_axis": "A declared, serialisable run plan with stated miss/overlap semantics, not a value derived from the current time.",
+          "closer_to": {
+            "anchor": "score_2",
+            "artifact": "Only a manual trigger endpoint (line 8); no RunPlan."
+          },
+          "further_from": {
+            "anchor": "score_4",
+            "artifact": "No RunPlan enum or watch‑plan integration described."
+          },
+          "lean": "none",
+          "placement": "matches score_2"
+        },
+        "score": 2,
+        "weighted_score": 0.268,
+        "improvement": "Adopt the existing `WatchPlan` mechanism and expose a declarative `RunPlan` enum to satisfy the score_4 anchor."
+      },
+      {
+        "criterion_name": "Node‑content generality",
+        "weight": 0.100,
+        "evidence": {
+          "found": [
+            "No node‑metadata changes are described."
+          ],
+          "missing": [
+            "Any new fields on the shared node metadata served to every importer."
+          ]
+        },
+        "reasoning": "The proposal does not add node‑metadata fields; it only adds a Runs panel, which is a source‑specific UI element, matching the score_2 anchor that adds a panel for one source.",
+        "anchor_comparison": {
+          "contrast_axis": "New fields on the shared node metadata served to every importer, not a panel that appears for one source.",
+          "closer_to": {
+            "anchor": "score_2",
+            "artifact": "Only a Runs panel (line 9) for a specific purpose."
+          },
+          "further_from": {
+            "anchor": "score_4",
+            "artifact": "No NodeMeta extensions described."
+          },
+          "lean": "none",
+          "placement": "matches score_2"
+        },
+        "score": 2,
+        "weighted_score": 0.200,
+        "improvement": "Extend `NodeMeta` with provenance fields and serve them via the existing `/node/*id` endpoint."
+      },
+      {
+        "criterion_name": "Incremental deliverability",
+        "weight": 0.133,
+        "evidence": {
+          "found": [
+            "The proposal is a single change (ledger, endpoints, UI panel)."
+          ],
+          "missing": [
+            "A multi‑phase plan that lands on existing seams incrementally."
+          ]
+        },
+        "reasoning": "The proposal delivers a monolithic set of changes without breaking them into incremental, seam‑based phases, matching the score_2 anchor.",
+        "anchor_comparison": {
+          "contrast_axis": "Phases that each land on an existing seam and are usable the day they merge, not one rewrite.",
+          "closer_to": {
+            "anchor": "score_2",
+            "artifact": "Single‑shot addition of ledger, endpoints, UI (lines 6‑9)."
+          },
+          "further_from": {
+            "anchor": "score_4",
+            "artifact": "No staged, seam‑based rollout described."
+          },
+          "lean": "none",
+          "placement": "matches score_2"
+        },
+        "score": 2,
+        "weighted_score": 0.266,
+        "improvement": "Break the work into phases (e.g., ledger only, then UI panel, then integration) each landing on an existing seam."
+      },
+      {
+        "criterion_name": "Risk specificity and mitigation",
+        "weight": 0.134,
+        "evidence": {
+          "found": [
+            "Risks listed (disk‑space exhaustion, cap‑exceedance) but without concrete countermeasures."
+          ],
+          "missing": [
+            "Specific countermeasures tied to documented repository landmines."
+          ]
+        },
+        "reasoning": "The risk section lists generic concerns and only one mitigation hint; it does not meet the detailed, countermeasure‑rich score_4 anchor.",
+        "anchor_comparison": {
+          "contrast_axis": "The repository's documented landmines, each with a countermeasure that exists in this codebase, not generic worry words.",
+          "closer_to": {
+            "anchor": "score_2",
+            "artifact": "Generic risks with minimal mitigation (lines 20‑21)."
+          },
+          "further_from": {
+            "anchor": "score_4",
+            "artifact": "No detailed, code‑base‑specific countermeasures."
+          },
+          "lean": "none",
+          "placement": "matches score_2"
+        },
+        "score": 2,
+        "weighted_score": 0.268,
+        "improvement": "Expand the risk section with concrete, code‑base‑specific mitigations for each listed landmine."
+      }
+    ],
+    "score_calculation": {
+      "raw_weighted_sum": 2.176,
+      "final_score": 0.435,
+      "gate_source": "specification `gates` block (essential‑item cap not triggered, no pitfall caps applied)",
+      "checklist_penalties": "none"
+    },
+    "strengths": [
+      "Reuses the existing TVIX package format (CK‑001, CK‑002, CK‑014).",
+      "Provides a bounded RunLedger to avoid unbounded growth (CK‑008).",
+      "Includes a concrete success‑probability estimate (CK‑017)."
+    ],
+    "issues": [
+      {
+        "priority": "High",
+        "description": "Missing justification for new HTTP endpoints (CK‑007).",
+        "evidence": "line 8 adds endpoints without explanation.",
+        "impact": "Fails essential checklist item => disqualification if any essential item were missing; here it is a failure but not disqualifying.",
+        "suggestion": "Explain why existing `/graph/*` or `/node/*id` endpoints cannot serve the new functionality."
+      },
+      {
+        "priority": "Medium",
+        "description": "No progress/loading indication strategy (CK‑005).",
+        "evidence": "No mention of progress UI.",
+        "impact": "Important checklist item failed; reduces confidence.",
+        "suggestion": "Define a measured percentage or explicit indeterminate progress UI component."
+      },
+      {
+        "priority": "Medium",
+        "description": "No panel‑kit store‑shaped hydration usage (CK‑006).",
+        "evidence": "No reference to panel‑kit.",
+        "impact": "Important checklist item failed.",
+        "suggestion": "Adopt panel‑kit's `loading_store` pattern for async panel loading."
+      },
+      {
+        "priority": "Medium",
+        "description": "No concrete file paths or symbols listed (CK‑011).",
+        "evidence": "No file paths mentioned.",
+        "impact": "Important checklist item failed; hampers feasibility verification.",
+        "suggestion": "List all files to be created/modified (e.g., `crates/graph-api/src/server.rs`)."
+      },
+      {
+        "priority": "Medium",
+        "description": "No non‑omp example demonstrating generality (CK‑012).",
+        "evidence": "Only generic description provided.",
+        "impact": "Important checklist item failed.",
+        "suggestion": "Add a concrete example such as a Kubernetes graph consolidation."
+      },
+      {
+        "priority": "Medium",
+        "description": "No knowledge‑map update (CK‑013).",
+        "evidence": "No mention of `charts/jump-cannon/knowledge/`.",
+        "impact": "Important checklist item failed.",
+        "suggestion": "Update the knowledge map as part of the change."
+      },
+      {
+        "priority": "Medium",
+        "description": "No UI failure handling described (CK‑015).",
+        "evidence": "No UI error state described.",
+        "impact": "Important checklist item failed.",
+        "suggestion": "Specify UI behaviour for failed, timed‑out, or empty runs."
+      },
+      {
+        "priority": "Low",
+        "description": "No discussion of the tvix closure‑across‑imports bug (CK‑010).",
+        "evidence": "Not mentioned.",
+        "impact": "Important checklist item failed.",
+        "suggestion": "Ensure new combinators receive `graph` as a parameter."
+      },
+      {
+        "priority": "Low",
+        "description": "No concrete file‑path changes (CK‑011).",
+        "evidence": "Not mentioned.",
+        "impact": "Important checklist item failed.",
+        "suggestion": "Add a list of target files."
+      }
+    ],
+    "rules_generated": [],
+    "confidence": {
+      "level": "Medium",
+      "factors": {
+        "evidence_strength": "Strong",
+        "criterion_clarity": "Clear",
+        "specification_quality": "Complete"
+      }
+    },
+    "selection": [
+      {
+        "proposal": "proposals.a.md",
+        "total_score": 0.435,
+        "top_dimensions": [
+          "Package and engine model reuse",
+          "Core abstraction generality"
+        ],
+        "weakest_dimension": "Core abstraction generality (score 2) – needs a proper Run struct.",
+        "first_phase_kill_criterion": "None (fails several important checklist items but not essential)."
+      },
+      {
+        "proposal": "proposals.b.md",
+        "total_score": 0.435,
+        "top_dimensions": [
+          "Package and engine model reuse",
+          "Core abstraction generality"
+        ],
+        "weakest_dimension": "Core abstraction generality (score 2) – needs a proper Run struct.",
+        "first_phase_kill_criterion": "None"
+      },
+      {
+        "proposal": "proposals.c.md",
+        "total_score": 0.435,
+        "top_dimensions": [
+          "Package and engine model reuse",
+          "Core abstraction generality"
+        ],
+        "weakest_dimension": "Core abstraction generality (score 2) – needs a proper Run struct.",
+        "first_phase_kill_criterion": "None"
+      }
+    ]
+  }
+}

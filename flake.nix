@@ -599,6 +599,8 @@
                 CARGO_TARGET_DIR=target/benches \
                   cargo build --release -p graph-layouts --example bench_static_layouts
                 CARGO_TARGET_DIR=target/benches \
+                  cargo build --release -p graph-metrics --example bench_metrics
+                CARGO_TARGET_DIR=target/benches \
                   cargo build --release -p graph-compute \
                     --example bench_pagerank \
                     --example bench_scaling \
@@ -617,6 +619,7 @@
                 install -m 0755 "$geometric" "$out/bin/graph-compute-geometric"
 
                 install -m 0755 target/benches/release/examples/bench_static_layouts "$out/bin/graph-layouts-bench-static"
+                install -m 0755 target/benches/release/examples/bench_metrics "$out/bin/graph-metrics-bench"
                 install -m 0755 target/benches/release/examples/bench_pagerank "$out/bin/graph-compute-bench-pagerank"
                 install -m 0755 target/benches/release/examples/bench_scaling "$out/bin/graph-compute-bench-scaling"
                 install -m 0755 target/benches/release/examples/bench_spmv "$out/bin/graph-compute-bench-spmv"
@@ -797,6 +800,10 @@
             overall_status=0
             if ! run_and_report performance-bench-static-layouts \
               graph-layouts-bench-static --bench "''${profile_args[@]}"; then
+              overall_status=1
+            fi
+            if ! run_and_report performance-bench-metrics \
+              graph-metrics-bench --bench --noplot "''${profile_args[@]}"; then
               overall_status=1
             fi
             if ! run_and_report performance-bench-pagerank \

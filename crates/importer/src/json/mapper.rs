@@ -158,8 +158,6 @@ impl GraphMapper for ManifestMapper {
                     .try_add_node(VaultNode {
                         id: node_id.clone(),
                         meta: NodeMeta {
-                            source_id: self.namespace.source_id().to_string(),
-                            title: title.clone(),
                             tags: tags.clone(),
                             frontmatter: frontmatter.clone().into_iter().collect(),
                             mtime: 0,
@@ -169,6 +167,7 @@ impl GraphMapper for ManifestMapper {
                             content_type: None,
                             content_readable: false,
                             content_writable: false,
+                            ..NodeMeta::new(self.namespace.source_id().to_string(), title.clone())
                         },
                         ..VaultNode::default()
                     })

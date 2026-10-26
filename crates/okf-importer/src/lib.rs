@@ -413,8 +413,6 @@ impl OkfImporter {
                 .try_add_node(VaultNode {
                     id: node_id,
                     meta: NodeMeta {
-                        source_id: self.source_id.clone(),
-                        title,
                         tags,
                         frontmatter,
                         mtime,
@@ -424,6 +422,7 @@ impl OkfImporter {
                         content_type: Some("text/markdown".into()),
                         content_readable: true,
                         content_writable: false,
+                        ..NodeMeta::new(self.source_id.clone(), title)
                     },
                     metrics: NodeMetrics::default(),
                     x: 0.0,

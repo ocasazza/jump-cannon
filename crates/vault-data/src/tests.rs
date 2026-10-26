@@ -130,3 +130,23 @@ fn unit_community_color_wraps() {
     let c20 = color::community_color(20);
     assert_eq!(c0, c20); // palette wraps at 20
 }
+
+#[test]
+fn constructor_covers_required_fields() {
+    // REQUIRED_META_FIELDS, NodeMeta::new's arguments, and missing_required
+    // must all name the same set. Extend all three together.
+    assert_eq!(REQUIRED_META_FIELDS, &["source_id", "title"]);
+    let meta = NodeMeta::new("src", "Title");
+    assert_eq!(meta.source_id, "src");
+    assert_eq!(meta.title, "Title");
+    assert!(meta.missing_required().is_empty());
+}
+
+#[test]
+fn missing_required_names_the_empty_fields() {
+    let mut meta = NodeMeta::new("src", "Title");
+    meta.title = "  ".into();
+    assert_eq!(meta.missing_required(), vec!["title"]);
+    meta.source_id = String::new();
+    assert_eq!(meta.missing_required(), vec!["source_id", "title"]);
+}

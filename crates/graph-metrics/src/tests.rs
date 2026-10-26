@@ -155,10 +155,24 @@ fn unit_louvain_community_levels_dendrogram() {
 }
 
 #[test]
-fn unit_kcore_triangle() {
+fn unit_kcore_triangle_is_two_core() {
     let mut g = make_triangle();
     crate::compute_kcore(&mut g);
     for id in ["a", "b", "c"] {
-        assert!(g.nodes[id].metrics.kcore >= 1, "triangle nodes should have k-core >= 1");
+        assert_eq!(g.nodes[id].metrics.kcore, 2);
+    }
+}
+
+#[test]
+fn unit_kcore_path_is_one_core() {
+    let mut g = VaultGraph::new();
+    for id in ["a", "b", "c"] {
+        g.add_node(VaultNode { id: id.to_string(), ..Default::default() });
+    }
+    g.add_edge(VaultEdge::new("a", "b"));
+    g.add_edge(VaultEdge::new("b", "c"));
+    crate::compute_kcore(&mut g);
+    for id in ["a", "b", "c"] {
+        assert_eq!(g.nodes[id].metrics.kcore, 1, "node {id}");
     }
 }
