@@ -42,7 +42,7 @@ use panel_kit::widgets::{dock, panel, root};
 use panel_kit::{LayoutBuilder, PanelWin, Spinner};
 use panel_kit_core::frame::{PanelProjection, Placement};
 use panel_kit_core::reducer::WorkspaceEvent;
-use panel_kit_core::{Mode, PanelCatalog, PanelCommand, PanelKind};
+use panel_kit_core::{Mode, PanelCommand, PanelKind};
 use serde::{Deserialize, Serialize};
 use session_manager::{EmbeddedSessionManager, HttpSessionManager, UserIdentity, WorldHost};
 
@@ -975,6 +975,12 @@ fn commit_server_graph(mut ctx: Ctx, epoch: u64, graph: GraphData) -> bool {
     panels::layout::set_expected_graph_revision(revision);
     panels::style::reset_for_graph_session(true, revision);
     ctx.graph.set(Some(graph));
+    // Metric-driven styling reads the same buffers graph-api would serve;
+    // compute them in-browser for the client-owned topology.
+    let metrics = ctx.graph.read().as_ref().map(client_metrics::compute);
+    if let Some(metrics) = metrics {
+        panels::style::begin_client_session(metrics);
+    }
     true
 }
 
@@ -999,12 +1005,6 @@ pub(crate) fn replace_with_client_graph(
         },
     });
     ctx.graph.set(Some(graph));
-    // Metric-driven styling reads the same buffers graph-api would serve;
-    // compute them in-browser for the client-owned topology.
-    let metrics = ctx.graph.read().as_ref().map(client_metrics::compute);
-    if let Some(metrics) = metrics {
-        panels::style::begin_client_session(metrics);
-    }
     // A client graph supersedes any in-flight server load: close the store
     // so the GlobalLoadingBar cannot dangle over a mounted canvas.
     panel_kit::loading::loading_store("graph", "loading graph…").succeed();
@@ -1288,8 +1288,7 @@ fn App() -> Element {
     // the component body would re-run the import on every App re-render
     // (each graph promotion re-renders App — an import loop).
     let github_boot = use_hook(crate::github::boot_spec);
-    let generate_boot = use_hook(panels::generate::take_boot_evaluation);
-    let skip_server_load = github_boot.is_some() || generate_boot;
+    let skip_server_load = github_boot.is_some();
 
     // Resilient initial load: retry until the backend answers, so a server
     // that's still indexing (or starting up) self-heals instead of leaving
@@ -1440,7 +1439,6 @@ fn App() -> Element {
 
     // Boot import in GitHub mode: drive the panel's shared import routine so
     // progress and errors surface in the GitHub panel, and open that panel.
-    // An example session's staged Generate expression is evaluated instead.
     // The future body reads no signals, so it runs exactly once.
     use_future(move || {
         let boot = github_boot.clone();
@@ -1448,8 +1446,6 @@ fn App() -> Element {
             if let Some(spec) = boot {
                 *OPEN_PANEL.write() = Some(Panel::GitHub);
                 panels::github::spawn_import(spec, ctx);
-            } else if generate_boot {
-                panels::generate::run_evaluation(ctx);
             }
         }
     });
@@ -1749,8 +1745,19 @@ fn render_workspace(workspace: PanelWorkspace, ctx: Ctx) -> Element {
             class: "{workspace_class}",
             style: "{workspace_style}",
             onwheel: move |event| workspace::handle_wheel(&wheel_workspace, &event),
-            for projected in frame.panels.iter().copied() {
-                {render_projected_panel(projected, &workspace.catalog, emit.clone(), ctx)}
+            // Keep-alive: the graph panel stays mounted (hidden, keyed) when
+            // the projection drops it — focusing or maximizing another panel
+            // would otherwise tear down the WebGPU canvas and its camera.
+            {
+                panel_kit::keepalive::render_keepalive_with(
+                    &snapshot,
+                    &workspace.catalog,
+                    &frame,
+                    |key| key == Panel::Graph,
+                    |projected, meta, _hidden| {
+                        render_panel(projected, meta, emit.clone(), ctx)
+                    },
+                )
             }
         }
         {dock::dock(frame.dock, &workspace.catalog, emit, None)}
@@ -1758,13 +1765,14 @@ fn render_workspace(workspace: PanelWorkspace, ctx: Ctx) -> Element {
 }
 
 /// Render one projected panel from explicit chrome, body, controls, and grip.
-fn render_projected_panel(
+/// The same panel, when the caller already resolved its catalog metadata
+/// (the keep-alive renderer hands it back with the projection).
+fn render_panel(
     projected: PanelProjection<Panel>,
-    catalog: &PanelCatalog<Panel>,
+    meta: &panel_kit_core::panel::PanelMeta<Panel>,
     emit: EventHandler<WorkspaceEvent<Panel>>,
     ctx: Ctx,
 ) -> Element {
-    let Some(meta) = catalog.get(projected.key) else { return rsx! {} };
     let class = format!("panel-{}", meta.slug);
     let maximized = matches!(projected.placement, Placement::Maximized);
     let controls = panel::traffic_lights(projected, emit.clone());

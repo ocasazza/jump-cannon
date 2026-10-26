@@ -444,26 +444,24 @@ fn multi_chart(series: &[(&str, &'static str, String, &[[f64; 2]])]) -> Element 
         .filter_map(|(_, _, _, pts)| pts.last().map(|p| p[0]))
         .fold(0.0_f64, f64::max);
     let x_min = (x_max - CHART_WINDOW_SECS).max(0.0);
-    let span = (x_max - x_min).max(1e-9);
 
-    let lines: Vec<(String, &'static str)> = series
+    // Points per series inside the window; the kit's chart owns the
+    // projection (its own x/y spans, scales and accessible label).
+    let visible_pts: Vec<Vec<(f64, f64)>> = series
         .iter()
-        .map(|(_, color, _, pts)| {
-            let visible: Vec<&[f64; 2]> = pts.iter().filter(|p| p[0] >= x_min).collect();
-            let y_max = visible
-                .iter()
-                .map(|p| p[1])
-                .fold(0.0_f64, f64::max)
-                .max(1e-9);
-            let line: String = visible
-                .iter()
-                .map(|p| {
-                    let x = (p[0] - x_min) / span * 100.0;
-                    let y = 100.0 - (p[1] / y_max * 100.0).clamp(0.0, 100.0);
-                    format!("{x:.2},{y:.2} ")
-                })
-                .collect();
-            (line, *color)
+        .map(|(_, _, _, pts)| {
+            pts.iter()
+                .filter(|p| p[0] >= x_min)
+                .map(|p| (p[0], p[1]))
+                .collect()
+        })
+        .collect();
+    let views: Vec<panel_kit_core::widgets::charts::SeriesView<'_>> = series
+        .iter()
+        .zip(visible_pts.iter())
+        .map(|((name, _, _, _), points)| panel_kit_core::widgets::charts::SeriesView {
+            name,
+            points: points.as_slice(),
         })
         .collect();
     let y_maxes: Vec<f64> = series
@@ -477,20 +475,7 @@ fn multi_chart(series: &[(&str, &'static str, String, &[[f64; 2]])]) -> Element 
         .collect();
 
     rsx! {
-        svg {
-            class: "dbg-chart tall",
-            view_box: "0 0 100 100",
-            preserve_aspect_ratio: "none",
-            for (pts , color) in lines {
-                polyline {
-                    points: "{pts}",
-                    fill: "none",
-                    stroke: "{color}",
-                    stroke_width: "1.2",
-                    vector_effect: "non-scaling-stroke",
-                }
-            }
-        }
+        { panel_kit::widgets::charts::time_series(&views, "ms") }
         div { class: "dbg-legend",
             for (i , (name , color , stats , _)) in series.iter().enumerate() {
                 div { key: "{name}", class: "dbg-legend-row",

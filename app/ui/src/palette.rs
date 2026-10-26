@@ -2147,16 +2147,28 @@ fn param_widget(param: &ActionParameter, value: &ParamValue) -> Element {
                 .as_selected()
                 .and_then(|v| v.first().cloned())
                 .unwrap_or_default();
-            let opts = param.options.clone();
+            let items: Vec<panel_kit::widgets::DropdownItem> = param
+                .options
+                .iter()
+                .map(|o| panel_kit::widgets::DropdownItem {
+                    value: o.value.clone(),
+                    label: o.label.clone(),
+                    group: String::new(),
+                })
+                .collect();
+            let pick_pid = pid.clone();
+            let dd_state = use_signal(panel_kit::widgets::DropdownState::default);
             rsx! {
-                select { class: "cp-form-in",
-                    onchange: move |e| set_form_value(&pid, ParamValue::Selected(vec![e.value()])),
-                    for o in opts {
-                        option { key: "{o.value}", value: "{o.value}",
-                            selected: o.value == current,
-                            "{o.label}"
+                panel_kit::widgets::Dropdown {
+                    items,
+                    state: dd_state,
+                    selected: current,
+                    searchable: false,
+                    on_action: move |action: panel_kit::widgets::DropdownAction| {
+                        if let panel_kit::widgets::DropdownAction::Select { value } = action {
+                            set_form_value(&pick_pid, ParamValue::Selected(vec![value]));
                         }
-                    }
+                    },
                 }
             }
         }

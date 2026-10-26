@@ -34,10 +34,8 @@
 
 use std::collections::HashMap;
 
-use dioxus::events::{Key, KeyboardEvent, Modifiers};
 use dioxus::prelude::*;
 use panel_kit::Spinner;
-use wasm_bindgen::JsCast;
 
 use crate::panels::filter;
 use crate::panels::inspector::badge_dispatch;
@@ -236,91 +234,9 @@ fn u16_to_byte(s: &str, u16_idx: usize) -> usize {
     s.len()
 }
 
-/// Byte offset → UTF-16 offset.
-fn byte_to_u16(s: &str, byte_idx: usize) -> usize {
-    s[..byte_idx.min(s.len())].encode_utf16().count()
-}
-
 // --- DOM cursor/selection helpers ------------------------------------------------------
 
-/// The web-sys feature set doesn't include HtmlTextAreaElement, so the
-/// selection API goes through js-sys reflection on the raw element — still
-/// all-Rust, no JS shims.
-fn edit_el(editor_id: &str) -> Option<web_sys::Element> {
-    web_sys::window()?.document()?.get_element_by_id(editor_id)
-}
-
-/// Read `selectionStart` (UTF-16 units) from the source textarea.
-fn dom_cursor_u16(editor_id: &str) -> usize {
-    edit_el(editor_id)
-        .and_then(|el| js_sys::Reflect::get(&el, &"selectionStart".into()).ok())
-        .and_then(|v| v.as_f64())
-        .map(|f| f as usize)
-        .unwrap_or(0)
-}
-
-/// `setSelectionRange(start, end)` + `focus()` on the source textarea.
-fn dom_set_selection_u16(editor_id: &str, start: usize, end: usize) {
-    let Some(el) = edit_el(editor_id) else {
-        return;
-    };
-    if let Ok(f) = js_sys::Reflect::get(&el, &"focus".into()) {
-        if let Some(func) = f.dyn_ref::<js_sys::Function>() {
-            let _ = func.call0(&el);
-        }
-    }
-    if let Ok(f) = js_sys::Reflect::get(&el, &"setSelectionRange".into()) {
-        if let Some(func) = f.dyn_ref::<js_sys::Function>() {
-            let _ = func.call2(&el, &(start as f64).into(), &(end as f64).into());
-        }
-    }
-}
-
 // --- editing actions --------------------------------------------------------------------
-
-/// Insert `s` at the textarea cursor — the Tab → 4-spaces shim. The
-/// controlled-textarea value rewrite resets the DOM cursor, so the new
-/// position is restored on the next tick.
-fn insert_at_cursor(node_id: &str, editor_id: &str, s: &str) {
-    let cur = dom_cursor_u16(editor_id);
-    with_doc(node_id, |d| {
-        let cur = cur.min(d.buffer.encode_utf16().count());
-        let byte = u16_to_byte(&d.buffer, cur);
-        d.buffer.insert_str(byte, s);
-        d.recompute_dirty();
-        d.cursor_u16 = cur + s.encode_utf16().count();
-    });
-    let target = cur + s.encode_utf16().count();
-    let editor_id = editor_id.to_string();
-    spawn(async move {
-        gloo_timers::future::TimeoutFuture::new(0).await;
-        dom_set_selection_u16(&editor_id, target, target);
-    });
-}
-
-/// Walk the buffer for the next find hit after `find_last_jump`, wrapping
-/// to the start when exhausted; select it in the textarea — port of
-/// `jump_to_next_match`.
-fn jump_to_next_match(node_id: &str, editor_id: &str) {
-    let sel = with_doc(node_id, |d| {
-        if d.find_query.is_empty() {
-            return None;
-        }
-        let from = d.find_last_jump.min(d.buffer.len());
-        let hit = d.buffer[from..]
-            .find(d.find_query.as_str())
-            .map(|i| from + i)
-            .or_else(|| d.buffer.find(d.find_query.as_str()))?;
-        d.find_last_jump = hit + d.find_query.len();
-        let start = byte_to_u16(&d.buffer, hit);
-        let end = byte_to_u16(&d.buffer, hit + d.find_query.len());
-        d.cursor_u16 = end;
-        Some((start, end))
-    });
-    if let Some((start, end)) = sel {
-        dom_set_selection_u16(editor_id, start, end);
-    }
-}
 
 /// Spawn the `PUT /vault/page` save — the egui `kick_off_page_save` +
 /// drain pair. `force` is the retry path (egui's retry button skips the
@@ -557,119 +473,33 @@ pub(crate) fn viewer(ctx: Ctx, editor_id: &'static str) -> Element {
 /// not a dependency of this crate and new deps are out of scope, so the
 /// source renders as plain monospace.
 fn source_editor(
-    ctx: Ctx,
-    editor_id: &'static str,
+    _ctx: Ctx,
+    _editor_id: &'static str,
     node_id: &str,
-    path: &str,
+    _path: &str,
     st: &DocState,
-    total_lines: usize,
+    _total_lines: usize,
 ) -> Element {
-    // Same logical-vs-visual line caveat as the egui gutter: long wrapped
-    // lines diverge — accepted, markdown body lines are usually short.
-    let gutter: String = (1..=total_lines).map(|n| format!("{n}\n")).collect();
-    let rows = total_lines.max(20);
-
-    let match_count = if st.find_query.is_empty() {
-        0
-    } else {
-        st.buffer.matches(st.find_query.as_str()).count()
-    };
-
-    let id_in = node_id.to_string();
-    let id_kd = node_id.to_string();
-    let id_cur = node_id.to_string();
-    let id_cur2 = node_id.to_string();
-    let id_fq = node_id.to_string();
-    let id_fkd = node_id.to_string();
-    let id_fnext = node_id.to_string();
-    let path_kd = path.to_string();
-    let find_query = st.find_query.clone();
-    let buffer = st.buffer.clone();
-    let editor_id_find = editor_id;
-    let editor_id_find_button = editor_id;
-    let editor_id_input = editor_id;
-    let editor_id_key = editor_id;
-    let editor_id_cursor = editor_id;
-    let editor_id_cursor_key = editor_id;
-
+    // Monaco replaces the hand-rolled gutter + find strip + textarea: it
+    // brings syntax highlighting (the old code documented its absence as a
+    // parity gap), find-in-file, folding and multi-cursor, and keeps the
+    // buffer/dirty flow of the panel untouched.
+    let id = node_id.to_string();
     rsx! {
-        if st.find_open {
-            div { class: "doc-find",
-                span { class: "doc-dim", "Find" }
-                input {
-                    class: "filter doc-findin",
-                    value: "{find_query}",
-                    oninput: move |e| with_doc(&id_fq, |d| {
-                        d.find_query = e.value();
-                        d.find_last_jump = 0;
-                    }),
-                    onkeydown: move |e: KeyboardEvent| {
-                        if e.key() == Key::Enter {
-                            jump_to_next_match(&id_fkd, editor_id_find);
-                        }
-                    },
-                }
-                span { class: "doc-dim", "{match_count} matches" }
-                button { class: "btn", title: "Enter while focused in the find field",
-                    onclick: move |_| jump_to_next_match(&id_fnext, editor_id_find_button),
-                    "Find next"
-                }
-            }
-        }
-        div { class: "doc-srcwrap",
-            pre { class: "doc-gutter", "{gutter}" }
-            textarea {
-                id: editor_id,
-                class: "doc-src",
-                spellcheck: false,
-                rows: "{rows}",
-                value: "{buffer}",
-                oninput: move |e| {
-                    let v = e.value();
-                    let cur = dom_cursor_u16(editor_id_input);
-                    with_doc(&id_in, |d| {
-                        d.buffer = v;
-                        d.recompute_dirty();
-                        // Clamp the find-walk position to the new length so
-                        // an in-progress "Find next" doesn't snap to the top
-                        // on every keystroke.
-                        d.find_last_jump = d.find_last_jump.min(d.buffer.len());
-                        d.cursor_u16 = cur;
-                    });
-                },
-                // Cursor readout tracking — click + arrow keys move the
-                // caret without an input event.
-                onclick: move |_| {
-                    let cur = dom_cursor_u16(editor_id_cursor);
-                    with_doc(&id_cur, |d| d.cursor_u16 = cur);
-                },
-                onkeyup: move |_| {
-                    let cur = dom_cursor_u16(editor_id_cursor_key);
-                    with_doc(&id_cur2, |d| d.cursor_u16 = cur);
-                },
-                onkeydown: move |e: KeyboardEvent| {
-                    let mods = e.modifiers();
-                    let cmd = mods.contains(Modifiers::META) || mods.contains(Modifiers::CONTROL);
-                    match e.key() {
-                        // Tab → four-space soft indent (egui consumed the
-                        // raw Tab before the TextEdit saw it).
-                        Key::Tab if !cmd => {
-                            e.prevent_default();
-                            insert_at_cursor(&id_kd, editor_id_key, "    ");
-                        }
-                        Key::Escape => with_doc(&id_kd, |d| d.find_open = false),
-                        Key::Character(c) if cmd && c.eq_ignore_ascii_case("s") => {
-                            e.prevent_default();
-                            try_save(ctx, id_kd.clone(), path_kd.clone(), false);
-                        }
-                        Key::Character(c) if cmd && c.eq_ignore_ascii_case("f") => {
-                            e.prevent_default();
-                            with_doc(&id_kd, |d| d.find_open = !d.find_open);
-                        }
-                        _ => {}
-                    }
-                },
-            }
+        panel_kit::editor::MonacoEditor {
+            key: "{node_id}",
+            initial: st.buffer.clone(),
+            language: "markdown".to_string(),
+            theme: Some(panel_kit::editor::PANEL_KIT_DARK_THEME.to_string()),
+            word_wrap: true,
+            on_change: move |text: String| {
+                let id = id.clone();
+                with_doc(&id, |d| {
+                    d.buffer = text;
+                    d.recompute_dirty();
+                    d.find_last_jump = 0;
+                });
+            },
         }
     }
 }
