@@ -1745,7 +1745,7 @@ fn render_workspace(workspace: PanelWorkspace, ctx: Ctx) -> Element {
                     &frame,
                     |key| key == Panel::Graph,
                     |projected, meta, _hidden| {
-                        render_projected_panel_for(projected, meta, emit.clone(), ctx)
+                        render_panel(projected, meta, emit.clone(), ctx)
                     },
                 )
             }
@@ -1757,7 +1757,7 @@ fn render_workspace(workspace: PanelWorkspace, ctx: Ctx) -> Element {
 /// Render one projected panel from explicit chrome, body, controls, and grip.
 /// The same panel, when the caller already resolved its catalog metadata
 /// (the keep-alive renderer hands it back with the projection).
-fn render_projected_panel_for(
+fn render_panel(
     projected: PanelProjection<Panel>,
     meta: &panel_kit_core::panel::PanelMeta<Panel>,
     emit: EventHandler<WorkspaceEvent<Panel>>,
