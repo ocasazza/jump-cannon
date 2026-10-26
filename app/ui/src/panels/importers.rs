@@ -1402,7 +1402,7 @@ fn set_param_value(name: &str, value: String) {
 
 /// The per-request parameter picker inside `.imp-summary`. One
 /// `div.imp-param[data-param]` per parameter: a label, then a
-/// `select.imp-param-select` (when the parameter offers values, with an
+/// `Dropdown` (when the parameter offers values, with an
 /// "Other…" escape to a free-text `input.imp-param-input`) or a plain
 /// `input.imp-param-input` (when it offers none), plus a `.imp-param-hint`.
 fn param_picker(params: &api::SourceParameters) -> Element {
