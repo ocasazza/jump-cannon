@@ -837,7 +837,7 @@ pub fn panel(ctx: Ctx) -> Element {
     let Ctx {
         graph,
         graph_session,
-        mut selected,
+        selected,
         mut query,
         searching,
         result_total,
@@ -860,7 +860,6 @@ pub fn panel(ctx: Ctx) -> Element {
 
     let schema = SEARCH_SCHEMA.read().clone();
     let search_error = SEARCH_ERROR.read().clone();
-    let search_failed = search_error.is_some();
     let tag_contract = tags_are_facetable(&schema);
     let tag_schema_error = schema
         .as_ref()

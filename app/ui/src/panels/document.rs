@@ -36,7 +36,6 @@ use std::collections::HashMap;
 
 use dioxus::prelude::*;
 use panel_kit::Spinner;
-use wasm_bindgen::JsCast;
 
 use crate::panels::filter;
 use crate::panels::inspector::badge_dispatch;
@@ -235,91 +234,9 @@ fn u16_to_byte(s: &str, u16_idx: usize) -> usize {
     s.len()
 }
 
-/// Byte offset → UTF-16 offset.
-fn byte_to_u16(s: &str, byte_idx: usize) -> usize {
-    s[..byte_idx.min(s.len())].encode_utf16().count()
-}
-
 // --- DOM cursor/selection helpers ------------------------------------------------------
 
-/// The web-sys feature set doesn't include HtmlTextAreaElement, so the
-/// selection API goes through js-sys reflection on the raw element — still
-/// all-Rust, no JS shims.
-fn edit_el(editor_id: &str) -> Option<web_sys::Element> {
-    web_sys::window()?.document()?.get_element_by_id(editor_id)
-}
-
-/// Read `selectionStart` (UTF-16 units) from the source textarea.
-fn dom_cursor_u16(editor_id: &str) -> usize {
-    edit_el(editor_id)
-        .and_then(|el| js_sys::Reflect::get(&el, &"selectionStart".into()).ok())
-        .and_then(|v| v.as_f64())
-        .map(|f| f as usize)
-        .unwrap_or(0)
-}
-
-/// `setSelectionRange(start, end)` + `focus()` on the source textarea.
-fn dom_set_selection_u16(editor_id: &str, start: usize, end: usize) {
-    let Some(el) = edit_el(editor_id) else {
-        return;
-    };
-    if let Ok(f) = js_sys::Reflect::get(&el, &"focus".into()) {
-        if let Some(func) = f.dyn_ref::<js_sys::Function>() {
-            let _ = func.call0(&el);
-        }
-    }
-    if let Ok(f) = js_sys::Reflect::get(&el, &"setSelectionRange".into()) {
-        if let Some(func) = f.dyn_ref::<js_sys::Function>() {
-            let _ = func.call2(&el, &(start as f64).into(), &(end as f64).into());
-        }
-    }
-}
-
 // --- editing actions --------------------------------------------------------------------
-
-/// Insert `s` at the textarea cursor — the Tab → 4-spaces shim. The
-/// controlled-textarea value rewrite resets the DOM cursor, so the new
-/// position is restored on the next tick.
-fn insert_at_cursor(node_id: &str, editor_id: &str, s: &str) {
-    let cur = dom_cursor_u16(editor_id);
-    with_doc(node_id, |d| {
-        let cur = cur.min(d.buffer.encode_utf16().count());
-        let byte = u16_to_byte(&d.buffer, cur);
-        d.buffer.insert_str(byte, s);
-        d.recompute_dirty();
-        d.cursor_u16 = cur + s.encode_utf16().count();
-    });
-    let target = cur + s.encode_utf16().count();
-    let editor_id = editor_id.to_string();
-    spawn(async move {
-        gloo_timers::future::TimeoutFuture::new(0).await;
-        dom_set_selection_u16(&editor_id, target, target);
-    });
-}
-
-/// Walk the buffer for the next find hit after `find_last_jump`, wrapping
-/// to the start when exhausted; select it in the textarea — port of
-/// `jump_to_next_match`.
-fn jump_to_next_match(node_id: &str, editor_id: &str) {
-    let sel = with_doc(node_id, |d| {
-        if d.find_query.is_empty() {
-            return None;
-        }
-        let from = d.find_last_jump.min(d.buffer.len());
-        let hit = d.buffer[from..]
-            .find(d.find_query.as_str())
-            .map(|i| from + i)
-            .or_else(|| d.buffer.find(d.find_query.as_str()))?;
-        d.find_last_jump = hit + d.find_query.len();
-        let start = byte_to_u16(&d.buffer, hit);
-        let end = byte_to_u16(&d.buffer, hit + d.find_query.len());
-        d.cursor_u16 = end;
-        Some((start, end))
-    });
-    if let Some((start, end)) = sel {
-        dom_set_selection_u16(editor_id, start, end);
-    }
-}
 
 /// Spawn the `PUT /vault/page` save — the egui `kick_off_page_save` +
 /// drain pair. `force` is the retry path (egui's retry button skips the
