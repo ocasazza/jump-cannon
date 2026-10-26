@@ -309,7 +309,7 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 
 {{/*
 Session-manager helpers. The per-world GPU broker defaults its compute
-namespace to the graphCompute compute namespace so per-world RayClusters land
+namespace to the graphCompute compute namespace so per-world Jobs land
 in the same standing LocalQueue envelope as the single-tenant session.
 */}}
 {{- define "jump-cannon.sessionManagerName" -}}
@@ -336,7 +336,7 @@ per-world broker) managing the same compute namespace.
 {{- define "jump-cannon.validateSessionManagerGpu" -}}
 {{- if and .Values.sessionManager.enabled .Values.sessionManager.gpu.enabled -}}
 {{- if ne (int .Values.sessionManager.replicas) 1 -}}
-{{- fail "sessionManager.gpu.enabled requires sessionManager.replicas == 1: in-memory per-world GPU controllers in two replicas would fight over the same RayClusters" -}}
+{{- fail "sessionManager.gpu.enabled requires sessionManager.replicas == 1: in-memory per-world GPU controllers in two replicas would fight over the same Jobs" -}}
 {{- end -}}
 {{- if and .Values.graphCompute.enabled .Values.graphCompute.session.enabled -}}
 {{- fail "graphCompute.session.enabled and sessionManager.gpu.enabled are mutually exclusive: two GPU controllers would manage the same compute namespace" -}}
@@ -366,98 +366,95 @@ requires the in-cluster server.
 {{- end -}}
 
 {{/*
-Single source of truth for the graph-compute RayCluster manifest. Rendered
-directly as a CR by raycluster-compute.yaml when
-graphCompute.session.enabled=false, and embedded into the gpu-session-template
-ConfigMap when session mode is on, so the two paths can never drift.
-The kueue.x-k8s.io/max-exec-time-seconds label is the Kueue-enforced hard cap
-and must be present in BOTH modes.
+Effective JUMP_CANNON_COMPUTE_URL: graphApi.computeUrl when set, else the
+in-cluster compute Service URL when graphCompute is enabled, else empty
+(the env var is then not rendered and graph-api's compute broker stays off).
 */}}
-{{- define "jump-cannon.rayclusterManifest" -}}
-{{- include "jump-cannon.rayclusterManifestNamed" (dict "root" . "clusterName" (include "jump-cannon.computeName" .)) -}}
+{{- define "jump-cannon.computeUrl" -}}
+{{- if .Values.graphApi.computeUrl -}}
+{{- .Values.graphApi.computeUrl -}}
+{{- else if .Values.graphCompute.enabled -}}
+{{- printf "http://%s.%s.svc:%v" (include "jump-cannon.computeName" .) (include "jump-cannon.computeNamespace" .) .Values.graphCompute.service.port -}}
+{{- end -}}
 {{- end -}}
 
 {{/*
-Parameterized form of jump-cannon.rayclusterManifest: takes a dict with
-"root" (the template context), "clusterName" (metadata.name — a placeholder
-like __world__ for the session-manager per-world template, which the GPU
-broker stamps per world at dispatch time), an optional "namespace" override
-(sessionManager.gpu.namespace for per-world clusters), and an optional
-"maxExecSeconds" override (sessionManager.gpu.maxExecTimeSeconds).
+Single source of truth for the graph-compute Job manifest. Rendered directly
+by compute-job.yaml when graphCompute.session.enabled=false, and embedded into
+the gpu-session-template ConfigMap when session mode is on, so the two paths
+can never drift. The kueue.x-k8s.io/max-exec-time-seconds label is the
+Kueue-enforced hard cap and is present in BOTH modes.
 */}}
-{{- define "jump-cannon.rayclusterManifestNamed" -}}
+{{- define "jump-cannon.computeJobManifest" -}}
+{{- include "jump-cannon.computeJobManifestNamed" (dict "root" . "jobName" (include "jump-cannon.computeName" .)) -}}
+{{- end -}}
+
+{{/*
+Parameterized form of jump-cannon.computeJobManifest: takes a dict with
+"root" (the template context), "jobName" (metadata.name — a placeholder like
+__world__ for the session-manager per-world template, which the GPU broker
+stamps per world at dispatch time), an optional "namespace" override
+(sessionManager.gpu.namespace for per-world Jobs), and an optional
+"maxExecSeconds" override (sessionManager.gpu.maxExecTimeSeconds).
+The Job is created suspended; Kueue admission unsuspends it.
+*/}}
+{{- define "jump-cannon.computeJobManifestNamed" -}}
 {{- $root := .root -}}
-apiVersion: ray.io/v1
-kind: RayCluster
+apiVersion: batch/v1
+kind: Job
 metadata:
-  name: {{ .clusterName }}
+  name: {{ .jobName }}
   namespace: {{ .namespace | default (include "jump-cannon.computeNamespace" $root) }}
   labels:
     {{- include "jump-cannon.labels" $root | nindent 4 }}
     app.kubernetes.io/component: graph-compute
-    kueue.x-k8s.io/queue-name: {{ $root.Values.graphCompute.ray.queueName | quote }}
-    kueue.x-k8s.io/priority-class: {{ $root.Values.graphCompute.ray.workloadPriorityClassName | quote }}
+    kueue.x-k8s.io/queue-name: {{ $root.Values.graphCompute.kueue.queueName | quote }}
+    kueue.x-k8s.io/priority-class: {{ $root.Values.graphCompute.kueue.workloadPriorityClassName | quote }}
     kueue.x-k8s.io/max-exec-time-seconds: {{ (.maxExecSeconds | default (default 14400 $root.Values.graphCompute.session.maxExecTimeSeconds)) | quote }}
-  annotations:
-    ai-gateway.schrodinger.com/ttl-seconds: {{ $root.Values.graphCompute.ray.ttlSeconds | quote }}
 spec:
-  rayVersion: {{ $root.Values.graphCompute.ray.rayVersion | quote }}
-  headGroupSpec:
-    rayStartParams:
-      dashboard-host: "0.0.0.0"
-      num-cpus: "0"
-      num-gpus: "0"
-    template:
-      metadata:
-        labels:
-          {{- include "jump-cannon.selectorLabels" $root | nindent 10 }}
-          app.kubernetes.io/component: graph-compute
-      spec:
-        serviceAccountName: {{ $root.Values.graphCompute.serviceAccountName | quote }}
-        automountServiceAccountToken: false
-        priorityClassName: {{ $root.Values.graphCompute.ray.podPriorityClassName | quote }}
-        imagePullSecrets:
-          {{- toYaml $root.Values.imagePullSecrets | nindent 10 }}
-        nodeSelector:
-          {{- toYaml $root.Values.graphCompute.ray.nodeSelector | nindent 10 }}
-        securityContext:
-          {{- toYaml $root.Values.graphCompute.podSecurityContext | nindent 10 }}
-        containers:
-          - name: ray-head
-            image: {{ $root.Values.graphCompute.ray.image | quote }}
-            imagePullPolicy: IfNotPresent
-            env:
-              - name: RAY_USAGE_STATS_ENABLED
-                value: "0"
-            ports:
-              - name: gcs
-                containerPort: 6379
-              - name: dashboard
-                containerPort: 8265
-              - name: client
-                containerPort: 10001
-              - name: metrics
-                containerPort: 8080
-            resources:
-              {{- toYaml $root.Values.graphCompute.ray.headResources | nindent 14 }}
-          - name: graph-compute
-            image: {{ include "jump-cannon.graphComputeImage" $root | quote }}
-            imagePullPolicy: {{ $root.Values.graphCompute.image.pullPolicy }}
-            ports:
-              - name: grpc
-                containerPort: {{ $root.Values.graphCompute.service.port }}
-                protocol: TCP
-            env:
-              - name: GRAPH_COMPUTE_TICK_HZ
-                value: {{ $root.Values.graphCompute.tickHz | quote }}
-              - name: GRAPH_COMPUTE_ADDR
-                value: {{ $root.Values.graphCompute.bindAddr | quote }}
-              - name: RUST_LOG
-                value: {{ $root.Values.graphCompute.rustLog | quote }}
-            resources:
-              {{- toYaml $root.Values.graphCompute.ray.backendResources | nindent 14 }}
-            securityContext:
-              {{- toYaml $root.Values.containerSecurityContext | nindent 14 }}
+  suspend: true
+  completions: 1
+  parallelism: 1
+  backoffLimit: {{ $root.Values.graphCompute.job.backoffLimit }}
+  template:
+    metadata:
+      labels:
+        {{- include "jump-cannon.selectorLabels" $root | nindent 8 }}
+        app.kubernetes.io/component: graph-compute
+    spec:
+      restartPolicy: OnFailure
+      serviceAccountName: {{ $root.Values.graphCompute.serviceAccountName | quote }}
+      automountServiceAccountToken: false
+      priorityClassName: {{ $root.Values.graphCompute.kueue.podPriorityClassName | quote }}
+      imagePullSecrets:
+        {{- toYaml $root.Values.imagePullSecrets | nindent 8 }}
+      nodeSelector:
+        {{- toYaml $root.Values.graphCompute.nodeSelector | nindent 8 }}
+      securityContext:
+        {{- toYaml $root.Values.graphCompute.podSecurityContext | nindent 8 }}
+      containers:
+        - name: graph-compute
+          image: {{ include "jump-cannon.graphComputeImage" $root | quote }}
+          imagePullPolicy: {{ $root.Values.graphCompute.image.pullPolicy }}
+          ports:
+            - name: grpc
+              containerPort: {{ $root.Values.graphCompute.service.port }}
+              protocol: TCP
+          readinessProbe:
+            tcpSocket:
+              port: grpc
+            periodSeconds: 5
+          env:
+            - name: GRAPH_COMPUTE_TICK_HZ
+              value: {{ $root.Values.graphCompute.tickHz | quote }}
+            - name: GRAPH_COMPUTE_ADDR
+              value: {{ $root.Values.graphCompute.bindAddr | quote }}
+            - name: RUST_LOG
+              value: {{ $root.Values.graphCompute.rustLog | quote }}
+          resources:
+            {{- toYaml $root.Values.graphCompute.resources | nindent 12 }}
+          securityContext:
+            {{- toYaml $root.Values.containerSecurityContext | nindent 12 }}
 {{- end -}}
 
 {{/*

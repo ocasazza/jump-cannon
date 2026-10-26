@@ -122,7 +122,7 @@ console marker. The egui implementation lives in git history.
 
 ## Non-goals
 
-The compute layer (graph-compute, broker orchestration, Kubernetes/Ray) stays
+The compute layer (graph-compute, broker orchestration, Kubernetes Jobs) stays
 behind graph-api — the app consumes its HTTP/streaming interfaces only.
 
 ## Future work — camera models
