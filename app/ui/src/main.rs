@@ -41,7 +41,7 @@ use panel_kit::widgets::{dock, panel, root};
 use panel_kit::{LayoutBuilder, PanelWin, Spinner};
 use panel_kit_core::frame::{PanelProjection, Placement};
 use panel_kit_core::reducer::WorkspaceEvent;
-use panel_kit_core::{Mode, PanelCatalog, PanelCommand, PanelKind};
+use panel_kit_core::{Mode, PanelCommand, PanelKind};
 use serde::{Deserialize, Serialize};
 use session_manager::{EmbeddedSessionManager, HttpSessionManager, UserIdentity, WorldHost};
 
@@ -1755,16 +1755,6 @@ fn render_workspace(workspace: PanelWorkspace, ctx: Ctx) -> Element {
 }
 
 /// Render one projected panel from explicit chrome, body, controls, and grip.
-fn render_projected_panel(
-    projected: PanelProjection<Panel>,
-    catalog: &PanelCatalog<Panel>,
-    emit: EventHandler<WorkspaceEvent<Panel>>,
-    ctx: Ctx,
-) -> Element {
-    let Some(meta) = catalog.get(projected.key) else { return rsx! {} };
-    render_projected_panel_for(projected, meta, emit, ctx)
-}
-
 /// The same panel, when the caller already resolved its catalog metadata
 /// (the keep-alive renderer hands it back with the projection).
 fn render_projected_panel_for(
