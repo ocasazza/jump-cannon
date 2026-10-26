@@ -209,7 +209,7 @@ fn hem_propose(
         let w = f_ewt[k];
         let lo = min(i, j);
         let hi = max(i, j);
-        let h = pcg_hash(lo * 0x9E3779B9u ^ (hi * 0x85EBCA6Bu) ^ (params.round * 0xC2B2AE35u) ^ params.seed);
+        let h = pcg_hash((lo * 0x9E3779B9u) ^ (hi * 0x85EBCA6Bu) ^ (params.round * 0xC2B2AE35u) ^ params.seed);
         if (w > best_w || (w == best_w && h > best_h)) {
             best_w = w;
             best_h = h;
