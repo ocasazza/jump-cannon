@@ -3684,7 +3684,7 @@ dependencies = [
 [[package]]
 name = "panel-kit"
 version = "1.1.1"
-source = "git+https://github.com/ocasazza/panel-kit?rev=3842c8f#3842c8f3999d85fc7a99bd84914d616984540c98"
+source = "git+https://github.com/ocasazza/panel-kit?rev=d0948db22ff9a8b4c2431eaf3fc3d9697166683b#d0948db22ff9a8b4c2431eaf3fc3d9697166683b"
 dependencies = [
  "dioxus",
  "gloo-storage",
@@ -3700,7 +3700,7 @@ dependencies = [
 [[package]]
 name = "panel-kit-core"
 version = "1.1.1"
-source = "git+https://github.com/ocasazza/panel-kit?rev=3842c8f#3842c8f3999d85fc7a99bd84914d616984540c98"
+source = "git+https://github.com/ocasazza/panel-kit?rev=d0948db22ff9a8b4c2431eaf3fc3d9697166683b#d0948db22ff9a8b4c2431eaf3fc3d9697166683b"
 dependencies = [
  "serde",
  "serde_json",
