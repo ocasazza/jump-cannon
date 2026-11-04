@@ -29,14 +29,14 @@
 //! `requested_selection` channel — which drives the meta fetch + renderer
 //! highlight through the main.rs effects.
 
-use std::collections::BTreeMap;
-
 use dioxus::prelude::*;
 use gloo_storage::{LocalStorage, Storage};
-use panel_kit::badge::{Badge, BadgeAction, BadgeClickKind, BadgeKind, BadgeSpec, Rgb};
+use panel_kit::badge::{Badge, BadgeAction, BadgeKind, BadgeSpec, Rgb};
+use panel_kit::widgets::frontmatter::frontmatter_grid;
+use panel_kit::widgets::pills::pill_list;
 use panel_kit::Spinner;
+use panel_kit_core::widgets::selection::{build_pills, neighbor_set, Pill, PillDirection};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 
 use crate::panels::filter;
 use crate::{api, badges, Ctx};
@@ -152,148 +152,16 @@ fn open_url(href: &str) {
 
 // --- neighbours -----------------------------------------------------------------------
 
-/// Link direction relative to the focused node. The egui inspector folded
-/// the packed edge list into an undirected set; the wire format is
-/// directed, so the port surfaces it per pill.
-#[derive(Clone, Copy, PartialEq)]
-enum Dir {
-    In,
-    Out,
-    Both,
-}
-
-impl Dir {
-    fn glyph(self) -> &'static str {
-        match self {
-            Dir::In => "←",
-            Dir::Out => "→",
-            Dir::Both => "↔",
-        }
-    }
-    fn tip(self) -> &'static str {
-        match self {
-            Dir::In => "incoming link",
-            Dir::Out => "outgoing link",
-            Dir::Both => "links both ways",
-        }
-    }
-}
-
-/// Walk the packed `[src, tgt]` edge list and collect the focused node's
-/// unique neighbours with direction, sorted ascending by index — port of
-/// the egui `neighbor_set` (which sorted the same way, sans direction).
-fn neighbor_set(idx: u32, edges: &[u32]) -> Vec<(u32, Dir)> {
-    let mut map: BTreeMap<u32, (bool, bool)> = BTreeMap::new(); // (out, in)
-    for chunk in edges.chunks_exact(2) {
-        let (s, t) = (chunk[0], chunk[1]);
-        if s == idx && t != idx {
-            map.entry(t).or_default().0 = true;
-        } else if t == idx && s != idx {
-            map.entry(s).or_default().1 = true;
-        }
-    }
-    map.into_iter()
-        .map(|(i, (out, inn))| {
-            let dir = match (out, inn) {
-                (true, true) => Dir::Both,
-                (true, false) => Dir::Out,
-                _ => Dir::In,
-            };
-            (i, dir)
-        })
-        .collect()
-}
-
-/// Truncate a node id to a single-line pill label — port of the egui
-/// `short_id_for_pill` (basename of path-like ids, 24-char ellipsis).
-fn short_id_for_pill(id: &str) -> String {
-    let basename = id.rsplit('/').next().unwrap_or(id);
-    const MAX: usize = 24;
-    if basename.chars().count() <= MAX {
-        basename.to_string()
-    } else {
-        let head: String = basename.chars().take(MAX - 1).collect();
-        format!("{head}…")
-    }
-}
-
-/// One clickable node pill row's precomputed data (owned, so the rsx
-/// closures don't borrow the graph guard).
-struct Pill {
-    id: String,
-    label: String,
-    tint: Option<Rgb>,
-    tip: String,
-}
-
-fn build_pills(items: &[(u32, Option<Dir>)], ids: &[String]) -> (Vec<Pill>, usize) {
-    // Same per-frame widget cap as the egui clickable_list.
-    const MAX: usize = 200;
-    let truncated = items.len().saturating_sub(MAX);
-    let pills = items
-        .iter()
-        .take(MAX)
-        .map(|&(i, dir)| {
-            let id = ids.get(i as usize).cloned().unwrap_or_else(|| "?".into());
-            let short = short_id_for_pill(&id);
-            let label = match dir {
-                Some(d) => format!("{} {}", d.glyph(), short),
-                None => short,
-            };
-            let tip = match dir {
-                Some(d) => format!("{} — {}", id, d.tip()),
-                None => id.clone(),
-            };
-            Pill {
-                id,
-                label,
-                tint: community_tint(i),
-                tip,
-            }
-        })
-        .collect();
-    (pills, truncated)
-}
-
-/// Render a wrapped row of clickable node pills — port of the egui
-/// `clickable_list`: body-click selects the node (camera/highlight/meta
-/// follow from main.rs), no filter affordance because the pill represents
-/// a node, not a (field, value) attribute.
-fn pill_list(ctx: Ctx, pills: Vec<Pill>, truncated: usize) -> Element {
-    rsx! {
-        div { class: "ins-pills",
-            for p in pills {
-                {
-                    let id = p.id.clone();
-                    let mut selected = ctx.selected;
-                    let spec = BadgeSpec {
-                        small: true,
-                        click_kind: BadgeClickKind::Clicked,
-                        override_color: p.tint,
-                        ..BadgeSpec::new("node", p.label.clone(), BadgeKind::Generic)
-                    };
-                    rsx! {
-                        // Badge's own `title` carries the pill label; wrap it
-                        // so the full id + direction reads on hover (the pill
-                        // label is the truncated basename).
-                        span { class: "ins-pill", key: "{p.id}", title: "{p.tip}",
-                            Badge {
-                                spec,
-                                on_action: move |a| {
-                                    if let BadgeAction::Clicked { .. } = a {
-                                        selected.set(Some(id.clone()));
-                                    }
-                                },
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        if truncated > 0 {
-            div { class: "ins-note", "… {truncated} more not shown" }
-        }
-    }
+/// Wrapped row of clickable node pills over panel-kit's pill painter:
+/// body-click selects the node (camera/highlight/meta follow from main.rs).
+fn pill_row(ctx: Ctx, pills: Vec<Pill>, truncated: usize) -> Element {
+    let mut selected = ctx.selected;
+    pill_list(
+        "node",
+        pills,
+        truncated,
+        EventHandler::new(move |id: String| selected.set(Some(id))),
+    )
 }
 
 // --- active filter strip ----------------------------------------------------------------
@@ -502,90 +370,6 @@ fn browse_tags() -> Element {
     }
 }
 
-// --- frontmatter leftover grid -----------------------------------------------------------------
-
-/// Keys already promoted to typed `NodeMeta` fields — mirrors the egui
-/// frontmatter_grid.rs SKIP_KEYS (NOT the chip walker's list, which also
-/// skips "aliases"; the two surfaces keep distinct lists by design).
-const GRID_SKIP_KEYS: &[&str] = &["tags", "tag", "doctype", "folder", "title", "id", "path"];
-
-fn grid_skipped(key: &str) -> bool {
-    GRID_SKIP_KEYS.iter().any(|k| k.eq_ignore_ascii_case(key))
-}
-
-/// True when the chip walker (badges::frontmatter_chips) would emit at
-/// least one chip for this value, so the grid must NOT also render the row
-/// — port of frontmatter_grid.rs::chip_walker_handles.
-fn chip_walker_handles(value: &Value) -> bool {
-    match value {
-        Value::String(s) => {
-            let t = s.trim();
-            !t.is_empty() && t.chars().count() <= 120
-        }
-        Value::Array(arr) => arr
-            .iter()
-            .any(|v| matches!(v, Value::String(_) | Value::Number(_) | Value::Bool(_))),
-        Value::Number(_) | Value::Bool(_) => true,
-        Value::Null | Value::Object(_) => false,
-    }
-}
-
-/// The collapsed "Frontmatter" section for everything the chip walker did
-/// NOT render — long-form strings, nested objects, mixed arrays, nulls —
-/// port of `show_frontmatter_section` + `show_frontmatter_grid`. Keeps the
-/// inspector honest about the full page metadata, not just the chip-shaped
-/// subset.
-fn frontmatter_grid(frontmatter_json: &str) -> Element {
-    if frontmatter_json.is_empty() || frontmatter_json == "{}" || frontmatter_json == "null" {
-        return rsx! {};
-    }
-    let Ok(map) = serde_json::from_str::<serde_json::Map<String, Value>>(frontmatter_json) else {
-        return rsx! {};
-    };
-    let rows: Vec<(String, Value)> = map
-        .iter()
-        .filter(|(k, v)| !grid_skipped(k) && !chip_walker_handles(v))
-        .map(|(k, v)| (k.clone(), v.clone()))
-        .collect();
-    // Don't even draw the collapsing header when every frontmatter value is
-    // already a chip — same pre-check as the egui section.
-    if rows.is_empty() {
-        return rsx! {};
-    }
-    rsx! {
-        details { class: "ins-section",
-            summary { "Frontmatter" }
-            div { class: "ins-fmgrid",
-                for (key, value) in rows {
-                    div { class: "ins-fmrow", key: "{key}",
-                        span { class: "ins-fmkey", "{key}" }
-                        { fm_value_cell(&value) }
-                    }
-                }
-            }
-        }
-    }
-}
-
-/// One leftover-frontmatter value cell — port of frontmatter_grid.rs::
-/// value_cell: long text in a bounded scroller, nulls as an em-dash,
-/// nested JSON pretty-printed.
-fn fm_value_cell(value: &Value) -> Element {
-    match value {
-        Value::String(s) => rsx! { div { class: "ins-fmtext", "{s}" } },
-        Value::Null => rsx! { span { class: "ins-note", "—" } },
-        Value::Object(_) | Value::Array(_) => {
-            let pretty = serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string());
-            rsx! { pre { class: "ins-fmjson", "{pretty}" } }
-        }
-        // Scalars are chip-walker territory — unreachable under normal flow.
-        Value::Number(n) => rsx! { span { class: "ins-fmtext", "{n}" } },
-        Value::Bool(b) => {
-            rsx! { span { class: "ins-fmtext", { if *b { "true" } else { "false" } } } }
-        }
-    }
-}
-
 // --- panel -----------------------------------------------------------------------------------
 
 pub(crate) fn panel(ctx: Ctx) -> Element {
@@ -781,7 +565,7 @@ fn community_and_neighbors(
     ctx: Ctx,
     id: &str,
     idx: u32,
-    neighbors: &[(u32, Dir)],
+    neighbors: &[(u32, PillDirection)],
     ids: &[String],
 ) -> Element {
     let comm_guard = COMMUNITY.read();
@@ -793,15 +577,16 @@ fn community_and_neighbors(
     let Some(my_comm) = my_comm else {
         // No labelled community → neighbours are the de-facto community.
         let n = neighbors.len();
-        let items: Vec<(u32, Option<Dir>)> = neighbors.iter().map(|&(i, d)| (i, Some(d))).collect();
-        let (pills, truncated) = build_pills(&items, ids);
+        let items: Vec<(u32, Option<PillDirection>)> =
+            neighbors.iter().map(|&(i, d)| (i, Some(d))).collect();
+        let (pills, truncated) = build_pills(&items, ids, community_tint);
         return rsx! {
             details { class: "ins-section", open: true, key: "comm-n:{id}",
                 summary { "Community ({n} members, neighbours)" }
                 if pills.is_empty() {
                     div { class: "ins-note", "(no neighbours)" }
                 } else {
-                    { pill_list(ctx, pills, truncated) }
+                    { pill_row(ctx, pills, truncated) }
                 }
             }
         };
@@ -820,8 +605,8 @@ fn community_and_neighbors(
     drop(comm_guard);
 
     let n_sib = siblings.len();
-    let sib_items: Vec<(u32, Option<Dir>)> = siblings.iter().map(|&i| (i, None)).collect();
-    let (sib_pills, sib_trunc) = build_pills(&sib_items, ids);
+    let sib_items: Vec<(u32, Option<PillDirection>)> = siblings.iter().map(|&i| (i, None)).collect();
+    let (sib_pills, sib_trunc) = build_pills(&sib_items, ids, community_tint);
 
     // The Neighbours dropdown only adds signal when its set diverges from
     // the labelled community siblings — identical sets would just repeat
@@ -829,8 +614,9 @@ fn community_and_neighbors(
     let neighbor_idxs: Vec<u32> = neighbors.iter().map(|&(i, _)| i).collect();
     let show_neighbors = siblings != neighbor_idxs;
     let n_nb = neighbors.len();
-    let nb_items: Vec<(u32, Option<Dir>)> = neighbors.iter().map(|&(i, d)| (i, Some(d))).collect();
-    let (nb_pills, nb_trunc) = build_pills(&nb_items, ids);
+    let nb_items: Vec<(u32, Option<PillDirection>)> =
+        neighbors.iter().map(|&(i, d)| (i, Some(d))).collect();
+    let (nb_pills, nb_trunc) = build_pills(&nb_items, ids, community_tint);
 
     rsx! {
         details { class: "ins-section", open: true, key: "comm:{id}",
@@ -838,7 +624,7 @@ fn community_and_neighbors(
             if sib_pills.is_empty() {
                 div { class: "ins-note", "(no siblings)" }
             } else {
-                { pill_list(ctx, sib_pills, sib_trunc) }
+                { pill_row(ctx, sib_pills, sib_trunc) }
             }
         }
         if show_neighbors {
@@ -847,7 +633,7 @@ fn community_and_neighbors(
                 if nb_pills.is_empty() {
                     div { class: "ins-note", "(no neighbours)" }
                 } else {
-                    { pill_list(ctx, nb_pills, nb_trunc) }
+                    { pill_row(ctx, nb_pills, nb_trunc) }
                 }
             }
         }
