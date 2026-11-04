@@ -23,7 +23,9 @@ use panel_kit::loading::{loading_store, LoadingGate};
 use wasm_bindgen::{JsCast, JsValue};
 
 use crate::pest_worker::{parse_in_worker, ParsePreview};
-use crate::{api, build_progress, reload_graph, Ctx};
+use crate::{api, reload_graph, Ctx};
+use panel_kit::widgets::build_progress::{progress_bar, PanelHydrating};
+use panel_kit_core::widgets::build_progress::{fmt_elapsed, BuildFeed};
 
 // --- persistence ---------------------------------------------------------------
 
@@ -217,8 +219,7 @@ pub(crate) static APPLY: GlobalSignal<Option<ApplyStatus>> = Signal::global(|| N
 static APPLY_GEN: GlobalSignal<u64> = Signal::global(|| 0);
 /// Progress feed for the active Apply, tailed from the applied source's own
 /// `/importers/sources/{id}/progress` log and reset per Apply generation.
-static APPLY_FEED: GlobalSignal<build_progress::BuildFeed> =
-    Signal::global(build_progress::BuildFeed::default);
+static APPLY_FEED: GlobalSignal<BuildFeed> = Signal::global(BuildFeed::default);
 /// Bumped whenever the server catalog is (re)loaded; part of the parameter
 /// fetch key so a catalog refresh re-runs discovery for the open row.
 static CATALOG_GEN: GlobalSignal<u64> = Signal::global(|| 0);
@@ -824,7 +825,7 @@ fn apply_source(mut ctx: Ctx, anchor: String, target: Option<api::SourceSelectio
     ctx.selected.set(None);
     let generation = APPLY_GEN.peek().wrapping_add(1);
     *APPLY_GEN.write() = generation;
-    *APPLY_FEED.write() = build_progress::BuildFeed::default();
+    *APPLY_FEED.write() = BuildFeed::default();
     let display = target
         .as_ref()
         .map(|selection| selection.to_string())
@@ -938,7 +939,7 @@ async fn track_feed(selection: api::SourceSelection, generation: u64) {
         }
         let since = APPLY_FEED.peek().since;
         if let Ok(resp) = api::source_progress(&selection, since).await {
-            APPLY_FEED.write().fold(&resp);
+            resp.fold_into(&mut APPLY_FEED.write());
         }
         gloo_timers::future::TimeoutFuture::new(500).await;
     }
@@ -1094,7 +1095,7 @@ fn apply_status_view(ctx: Ctx, status: &ApplyStatus) -> Element {
             status: build,
             events_seen,
         } => {
-            let elapsed = build_progress::fmt_elapsed(build.elapsed_ms);
+            let elapsed = fmt_elapsed(build.elapsed_ms);
             let feed: Vec<String> = APPLY_FEED.read().lines.iter().cloned().collect();
             rsx! {
                 div {
@@ -1110,7 +1111,7 @@ fn apply_status_view(ctx: Ctx, status: &ApplyStatus) -> Element {
                     if let Some(detail) = &build.detail {
                         span { class: "imp-apply-stage", "{detail}" }
                     }
-                    {build_progress::progress_bar(build.fraction)}
+                    {progress_bar(build.fraction)}
                     if !feed.is_empty() {
                         div { class: "build-progress-feed", role: "log",
                             for (i, line) in feed.iter().enumerate() {
@@ -1601,7 +1602,7 @@ pub fn panel(ctx: Ctx) -> Element {
                 div { class: "imp-rows", role: "listbox", aria_label: "Server catalog",
                     match &catalog {
                         CatalogState::Idle | CatalogState::Loading => rsx! {
-                            build_progress::PanelHydrating { label: "loading catalog" }
+                            PanelHydrating { label: "loading catalog" }
                         },
                         CatalogState::Unavailable(reason) => rsx! {
                             div { class: "imp-note", "data-field": "catalog-unavailable",

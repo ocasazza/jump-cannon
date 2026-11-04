@@ -148,7 +148,7 @@ pub async fn load() -> Result<GraphData, api::LoadError> {
 /// surface shows the same source name, `m:ss` elapsed, stage, detail, and bar.
 #[allow(non_snake_case)] // component-style presentation fn, called directly (not via rsx element)
 pub fn BuildProgress(status: api::BuildStatus) -> Element {
-    let elapsed = crate::build_progress::fmt_elapsed(status.elapsed_ms);
+    let elapsed = panel_kit_core::widgets::build_progress::fmt_elapsed(status.elapsed_ms);
     rsx! {
         div { class: "build-progress",
             div { class: "build-progress-head",
@@ -161,7 +161,7 @@ pub fn BuildProgress(status: api::BuildStatus) -> Element {
             if let Some(detail) = &status.detail {
                 div { class: "build-progress-detail", "{detail}" }
             }
-            {crate::build_progress::progress_bar(status.fraction)}
+            {panel_kit::widgets::build_progress::progress_bar(status.fraction)}
         }
     }
 }

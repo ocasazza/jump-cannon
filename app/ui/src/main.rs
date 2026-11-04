@@ -16,12 +16,9 @@ mod anchored;
 mod api;
 mod appstate;
 mod badges;
-mod build_progress;
-mod selection_card;
 mod client_log;
 mod client_metrics;
 mod graph_canvas;
-mod hints;
 mod palette;
 mod panels;
 mod pest_worker;
@@ -48,6 +45,12 @@ use session_manager::{EmbeddedSessionManager, HttpSessionManager, UserIdentity, 
 
 use graph_canvas::GraphData;
 use workspace::PanelWorkspace;
+
+/// Progress-panel feed for the source named by `Ctx::building`; polled at
+/// App level, read by the Progress panel. The Importers panel keeps its own
+/// feed tied to its apply generation.
+pub(crate) static BUILD_FEED: GlobalSignal<panel_kit_core::widgets::build_progress::BuildFeed> =
+    Signal::global(panel_kit_core::widgets::build_progress::BuildFeed::default);
 
 /// Top-level app surface. `User` is the classic single-graph workspace;
 /// `Sessions` is the world/session workspace (versioned worlds, branches,
@@ -1417,17 +1420,17 @@ fn App() -> Element {
         let build_source = use_memo(move || building.read().as_ref().map(|s| s.source.clone()));
         use_effect(move || {
             let source = build_source.read().clone();
-            *build_progress::BUILD_FEED.write() = build_progress::BuildFeed::default();
+            *BUILD_FEED.write() = panel_kit_core::widgets::build_progress::BuildFeed::default();
             if let Some(source) = source {
                 spawn(async move {
                     loop {
                         if build_source.peek().as_deref() != Some(source.as_str()) {
                             return;
                         }
-                        let since = build_progress::BUILD_FEED.peek().since;
+                        let since = BUILD_FEED.peek().since;
                         if let Ok(selection) = api::SourceSelection::parse(&source) {
                             if let Ok(resp) = api::source_progress(&selection, since).await {
-                                build_progress::BUILD_FEED.write().fold(&resp);
+                                resp.fold_into(&mut BUILD_FEED.write());
                             }
                         }
                         gloo_timers::future::TimeoutFuture::new(500).await;
@@ -1689,7 +1692,7 @@ fn App() -> Element {
                         "{mode_label} · connecting…"
                     }
                 }
-                {hints::header_bar()}
+                {panel_kit::widgets::hints::HintBar()}
                 // Workspace-level loading surface: any pending store (graph
                 // load, importer build, panel fetches) shows here with its
                 // percentage. Job-count telemetry stays as the activity dot.
@@ -1970,7 +1973,7 @@ fn progress_panel(ctx: Ctx) -> Element {
     let ts = tasks.read().clone();
     let ls = logs.read().clone();
     let build = building.read().clone();
-    let feed: Vec<String> = build_progress::BUILD_FEED
+    let feed: Vec<String> = BUILD_FEED
         .read()
         .lines
         .iter()
