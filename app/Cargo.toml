@@ -14,7 +14,6 @@
 # shared with snake-pit. Develop against a local checkout with:
 #   [patch."https://github.com/ocasazza/panel-kit"]
 #   panel-kit = { path = "../../panel-kit" }
-panel-kit-core = { path = "../../panel-kit/crates/panel-kit-core" }
 
 #
 # Deliberately a *separate* workspace from the repo root: the main workspace

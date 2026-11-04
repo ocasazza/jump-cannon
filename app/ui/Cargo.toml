@@ -8,11 +8,13 @@ license.workspace = true
 # Dioxus 0.6 — all-Rust UI, compiled to WASM and rendered in Tauri's webview.
 dioxus = { workspace = true }
 # Shared panel-workspace library (also consumed by snake-pit).
-# Pinned to panel-kit#21's merge commit (keepalive_with)
+# Pinned to panel-kit v1.2.0 (1ad4d6e): vendored jump-cannon components
+# (selection cards, build feed, hints, detectors, form rows, pills,
+# frontmatter grid, frame ring) live in the library since this pin.
 
 # Develop against a local checkout via [patch] in the workspace Cargo.toml.
-panel-kit = { version = "1.0.0", git = "https://github.com/ocasazza/panel-kit", rev = "d0948db22ff9a8b4c2431eaf3fc3d9697166683b" }
-panel-kit-core = { version = "1.0.0", git = "https://github.com/ocasazza/panel-kit", rev = "d0948db22ff9a8b4c2431eaf3fc3d9697166683b", features = ["spec-json"] }
+panel-kit = { version = "1.2.0", git = "https://github.com/ocasazza/panel-kit", rev = "1ad4d6ec3c9922a75e5b484dc788b895f258c30b" }
+panel-kit-core = { version = "1.2.0", git = "https://github.com/ocasazza/panel-kit", rev = "1ad4d6ec3c9922a75e5b484dc788b895f258c30b", features = ["spec-json"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 # WASM-side HTTP to graph-api (the frontend always runs in a webview).
