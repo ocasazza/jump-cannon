@@ -13,8 +13,8 @@ dioxus = { workspace = true }
 # frontmatter grid, frame ring) live in the library since this pin.
 
 # Develop against a local checkout via [patch] in the workspace Cargo.toml.
-panel-kit = { version = "1.2.0", git = "https://github.com/ocasazza/panel-kit", rev = "1ad4d6ec3c9922a75e5b484dc788b895f258c30b" }
-panel-kit-core = { version = "1.2.0", git = "https://github.com/ocasazza/panel-kit", rev = "1ad4d6ec3c9922a75e5b484dc788b895f258c30b", features = ["spec-json"] }
+panel-kit = { version = "1.2.0", git = "https://github.com/ocasazza/panel-kit", rev = "7ff07cf234980aac8de215a942dc280fbf778339" }
+panel-kit-core = { version = "1.2.0", git = "https://github.com/ocasazza/panel-kit", rev = "7ff07cf234980aac8de215a942dc280fbf778339", features = ["spec-json"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 # WASM-side HTTP to graph-api (the frontend always runs in a webview).
