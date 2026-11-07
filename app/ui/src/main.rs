@@ -1612,7 +1612,7 @@ fn App() -> Element {
             },
             onpointercancel: {
                 let workspace = workspace.clone();
-                move |e| workspace::handle_pointer_up(&workspace, &e)
+                move |e| workspace::handle_pointer_cancel(&workspace, &e)
             },
             // App-owned handlers get first refusal: palette chords, text
             // editors, graph/camera controls, then panel-kit reducer input.
