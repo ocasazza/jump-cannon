@@ -31,3 +31,16 @@ fn integration_path_graph() {
     assert_eq!(graph.nodes.len(), 4);
     assert_eq!(graph.edges.len(), 3);
 }
+
+/// Every catalog demo evaluates; the membrane sheet keeps its 666 x 11 heads.
+#[test]
+fn catalog_demos_evaluate() {
+    for demo in tvix_wasm::demos() {
+        let g = tvix_wasm::eval_graph(demo.expr).unwrap_or_else(|e| panic!("{}: {e}", demo.name));
+        assert!(!g.nodes.is_empty(), "{} produced no nodes", demo.name);
+        if demo.name == "Membrane sheet in water" {
+            let heads = g.nodes.iter().filter(|n| n.id.starts_with('g')).count();
+            assert_eq!(heads, 666 * 11);
+        }
+    }
+}

@@ -628,6 +628,59 @@ in
 "#,
     },
     Demo {
+        name: "Membrane sheet in water",
+        expr: r#"# Membrane sheet in water. The 666 x 11 grid is the bilayer surface (its
+# lattice springs keep it flat); every grid node is a lipid head with a tail
+# chain hanging off it; the soup is water, repelled by the tails.
+# Nodes and edges are each built in ONE listToAttrs: folding addNode/merge
+# per lipid copies the growing set every step (O(n^2)) and stalls tvix.
+let
+  g = import /jc/src/graph.nix {};
+
+  rows = 666; cols = 11;   # the sheet
+  tailLen = 3;             # tail beads per lipid
+  waters  = 200;
+
+  str = builtins.toString;
+  range = n: builtins.genList (i: i) n;
+  cells = builtins.concatMap (r: map (c: { inherit r c; }) (range cols)) (range rows);
+  head = x: "g" + str x.r + "_" + str x.c;
+  bead = x: i: "t" + str x.r + "_" + str x.c + "_" + str i;
+  node = id: type: { name = id; value = { inherit id type; metadata = {}; }; };
+  edge = id: src: tgt: { name = id; value = { inherit id; source = src; target = tgt; directed = true; metadata = {}; }; };
+
+  nodes = builtins.listToAttrs (
+    map (x: node (head x) "head") cells
+    ++ builtins.concatMap (x: map (i: node (bead x i) "tail") (range tailLen)) cells
+    ++ map (i: node ("s" + str i) "water") (range waters));
+
+  edges = builtins.listToAttrs (
+    # lattice: right and down
+    builtins.concatMap (x:
+      (if x.c + 1 < cols then [ (edge (head x + "->" + head (x // { c = x.c + 1; })) (head x) (head (x // { c = x.c + 1; }))) ] else [])
+      ++ (if x.r + 1 < rows then [ (edge (head x + "->" + head (x // { r = x.r + 1; })) (head x) (head (x // { r = x.r + 1; }))) ] else [])
+    ) cells
+    # lipid: head -> bead0 -> bead1 -> ...
+    ++ builtins.concatMap (x:
+      map (i: let src = if i == 0 then head x else bead x (i - 1); in edge (src + "->" + bead x i) src (bead x i)) (range tailLen)
+    ) cells);
+
+  json = g.toGraphJSON { inherit nodes edges; };
+
+  charge = { head = 1.0; tail = 3.0; water = 0.5; };
+  mass   = { head = 2.0; tail = 1.0; water = 0.5; };
+  spring = e:
+    if builtins.substring 0 1 e.target == "g"
+    then e // { weight = 2.0; restLength = 1.0; }   # lattice: holds the sheet
+    else e // { weight = 3.0; restLength = 0.4; };  # bonds along a lipid
+in
+  json // {
+    nodes = map (n: n // { charge = charge.${n.type}; mass = mass.${n.type}; }) json.nodes;
+    links = map spring json.links;
+  }
+"#,
+    },
+    Demo {
         name: "Soup (self-assembly seed)",
         expr: r#"# Unbonded particle soup: N isolated nodes, zero edges. The
 # initial condition for the dynamic-bonding self-assembly engine — bonds

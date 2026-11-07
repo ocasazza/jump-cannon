@@ -29,8 +29,6 @@
 //! `requested_selection` channel — which drives the meta fetch + renderer
 //! highlight through the main.rs effects.
 
-use std::collections::BTreeMap;
-
 use dioxus::prelude::*;
 use gloo_storage::{LocalStorage, Storage};
 use panel_kit::badge::{Badge, BadgeAction, BadgeClickKind, BadgeKind, BadgeSpec, Rgb};
@@ -39,6 +37,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::panels::filter;
+use crate::nav::GraphIndex;
 use crate::{api, badges, Ctx};
 
 // --- persisted state ---------------------------------------------------------------
@@ -179,21 +178,13 @@ impl Dir {
     }
 }
 
-/// Walk the packed `[src, tgt]` edge list and collect the focused node's
-/// unique neighbours with direction, sorted ascending by index — port of
-/// the egui `neighbor_set` (which sorted the same way, sans direction).
-fn neighbor_set(idx: u32, edges: &[u32]) -> Vec<(u32, Dir)> {
-    let mut map: BTreeMap<u32, (bool, bool)> = BTreeMap::new(); // (out, in)
-    for chunk in edges.chunks_exact(2) {
-        let (s, t) = (chunk[0], chunk[1]);
-        if s == idx && t != idx {
-            map.entry(t).or_default().0 = true;
-        } else if t == idx && s != idx {
-            map.entry(s).or_default().1 = true;
-        }
-    }
-    map.into_iter()
-        .map(|(i, (out, inn))| {
+/// The focused node's unique neighbours with link direction, sorted
+/// ascending by index, read from the shared vi graph index.
+fn neighbor_set(idx: u32, index: &GraphIndex) -> Vec<(u32, Dir)> {
+    index
+        .adjacent(idx)
+        .into_iter()
+        .map(|(i, out, inn)| {
             let dir = match (out, inn) {
                 (true, true) => Dir::Both,
                 (true, false) => Dir::Out,
@@ -760,7 +751,8 @@ fn node_view(ctx: Ctx, id: String) -> Element {
     // rendered these from the metric/edge buffers).
     let graph_sections: Element = match (g, idx) {
         (Some(g), Some(idx)) => {
-            let neighbors = neighbor_set(idx, &g.scene.edges);
+            let index = crate::vi::index_for(g, ctx.graph_session.peek().epoch);
+            let neighbors = neighbor_set(idx, &index);
             community_and_neighbors(ctx, &id, idx, &neighbors, &g.ids)
         }
         _ => rsx! {},
