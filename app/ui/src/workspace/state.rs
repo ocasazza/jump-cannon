@@ -48,8 +48,7 @@ pub(crate) fn use_panel_workspace(
     defaults: fn() -> Vec<PanelWin<Panel>>,
     catalog: Rc<PanelCatalog<Panel>>,
 ) -> PanelWorkspace {
-    let default_snapshot =
-        Snapshot::from_defaults(defaults(), Mode::Floating, current_viewport());
+    let default_snapshot = Snapshot::from_defaults(defaults(), Mode::Floating, current_viewport());
     let store = use_hook(move || Rc::new(LocalStorageLayoutStore::new(storage_key)));
     let snapshot = use_signal({
         let catalog = catalog.clone();
@@ -59,17 +58,27 @@ pub(crate) fn use_panel_workspace(
     });
     let scratch = use_hook({
         let panel_count = snapshot.peek().panels.len();
-        move || Rc::new(RefCell::new(ProjectionBuffer::with_panel_capacity(panel_count)))
+        move || {
+            Rc::new(RefCell::new(ProjectionBuffer::with_panel_capacity(
+                panel_count,
+            )))
+        }
     });
 
-    PanelWorkspace {
+    let workspace = PanelWorkspace {
         storage_key,
         snapshot,
         catalog,
         scratch,
         store,
         save_policy: SavePolicy::OnSettle,
-    }
+    };
+    let animating = snapshot
+        .read()
+        .tile_drag
+        .is_some_and(|tile| tile.animating());
+    panel_kit::input::use_tile_drag_frames(animating, workspace_event_handler(&workspace));
+    workspace
 }
 
 /// Subscribe one workspace to viewport changes with Jump Cannon's scale policy.
@@ -137,9 +146,11 @@ pub(crate) fn project_workspace<'frame>(
 
 /// CSS class for the view area that contains projected panels.
 pub(crate) fn workspace_area_class(frame: &ProjectedFrame<'_, Panel>) -> &'static str {
-    if frame.panels.iter().any(|panel| {
-        matches!(panel.placement, Placement::Maximized)
-    }) {
+    if frame
+        .panels
+        .iter()
+        .any(|panel| matches!(panel.placement, Placement::Maximized))
+    {
         "ws maxed"
     } else if frame.mode == Mode::Tiling {
         "ws tiling"
@@ -169,7 +180,11 @@ pub(crate) fn reduce_context(
 /// Current browser viewport expressed in the reducer's CSS-pixel units.
 fn current_viewport() -> Viewport {
     let (width, height) = viewport_size();
-    Viewport { width, height, units: Units::CssPx }
+    Viewport {
+        width,
+        height,
+        units: Units::CssPx,
+    }
 }
 
 /// Restore a snapshot through the core V1/V2 reader, falling back visibly.
