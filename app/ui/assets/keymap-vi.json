@@ -1,0 +1,29 @@
+{
+  "spec_version": 1,
+  "id": "jump-cannon.vi",
+  "modes": ["normal"],
+  "rules": [
+    { "keys": "]", "intent": "nav.cycle +1", "label": "next node", "group": "Move" },
+    { "keys": "[", "intent": "nav.cycle -1", "label": "prev node", "group": "Move" },
+    { "keys": "g g", "intent": "nav.first", "label": "first node", "group": "Move" },
+    { "keys": "G", "intent": "nav.last", "label": "last node", "group": "Move" },
+    { "keys": "h", "intent": "nav.step any codomain", "label": "outgoing neighbour", "group": "Edges" },
+    { "keys": "l", "intent": "nav.step any domain", "label": "incoming neighbour", "group": "Edges" },
+    { "keys": "j", "intent": "nav.sibling any codomain +1", "label": "next sibling", "group": "Edges" },
+    { "keys": "k", "intent": "nav.sibling any codomain -1", "label": "prev sibling", "group": "Edges" },
+    { "keys": "m {a-z}", "intent": "nav.mark $1", "label": "set mark", "group": "Marks" },
+    { "keys": "' {a-z}", "intent": "nav.jump $1", "label": "go to mark", "group": "Marks" },
+    { "keys": "<c-o>", "intent": "nav.jumplist -1", "label": "back", "group": "Marks" },
+    { "keys": "<c-i>", "intent": "nav.jumplist +1", "label": "forward", "group": "Marks" },
+    { "keys": "/", "intent": "nav.search", "label": "search", "group": "Search" },
+    { "keys": "n", "intent": "nav.match next", "label": "next match", "group": "Search" },
+    { "keys": "N", "intent": "nav.match prev", "label": "prev match", "group": "Search" },
+    { "keys": "z z", "intent": "app.center", "label": "center on cursor", "group": "View" },
+    { "keys": "z f", "intent": "app.fit", "label": "fit graph", "group": "View" },
+    { "keys": "z t", "intent": "app.toggle_follow", "label": "toggle follow", "group": "View" },
+    { "keys": "<cr>", "intent": "app.open", "label": "open document", "group": "Open" },
+    { "keys": "i", "intent": "app.inspect", "label": "inspect", "group": "Open" },
+    { "keys": "?", "intent": "app.which_key", "label": "help panel", "group": "Help" },
+    { "keys": ":", "intent": "app.tour", "label": "start tour", "group": "Help" }
+  ]
+}

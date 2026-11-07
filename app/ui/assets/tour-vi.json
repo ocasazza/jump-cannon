@@ -1,0 +1,16 @@
+{
+  "spec_version": 1,
+  "id": "jump-cannon.vi-tour",
+  "done": "Tour complete — ? opens the Help panel; press it again to dismiss.",
+  "steps": [
+    { "prompt": "Press ] to place the cursor on a node.", "expect": "nav.cycle +1", "after": "The cursor is the highlighted node; the Inspector follows it." },
+    { "prompt": "Press h to walk to an outgoing neighbour.", "expect": "nav.step any codomain", "after": "h follows an edge leaving the node; the badge shows how many there are." },
+    { "prompt": "Press l to walk to an incoming neighbour.", "expect": "nav.step any domain", "after": "l follows an edge pointing at the node." },
+    { "prompt": "Press m a to mark this node as a.", "expect": "nav.mark a", "after": "Marks are letters you can return to." },
+    { "prompt": "Press ] to move away.", "expect": "nav.cycle +1", "after": "Every move is recorded in the jumplist." },
+    { "prompt": "Press ' a to return to the mark.", "expect": "nav.jump a", "after": "Back at a." },
+    { "prompt": "Press Ctrl-o to go back through the jumplist.", "expect": "nav.jumplist -1", "after": "Ctrl-i goes forward again." },
+    { "prompt": "Press z z to center the camera on the cursor.", "expect": "app.center", "after": "z t toggles whether the camera follows." },
+    { "prompt": "Press ? to open the Help panel with every key.", "expect": "app.which_key" }
+  ]
+}

@@ -22,12 +22,15 @@ mod client_log;
 mod client_metrics;
 mod graph_canvas;
 mod hints;
+mod nav;
 mod palette;
 mod panels;
 mod pest_worker;
 mod proto;
 mod render;
 mod sessions;
+mod vi;
+mod which_key;
 mod worker;
 mod workspace;
 
@@ -1031,6 +1034,22 @@ pub(crate) async fn reload_graph(mut ctx: Ctx) {
 /// reducer. The egui analog is `AppAction::JumpToSection` mutating
 /// `state.sections`.
 pub(crate) static OPEN_PANEL: GlobalSignal<Option<Panel>> = Signal::global(|| None);
+/// Dismiss request: minimise a panel to the dock (the inverse of `OPEN_PANEL`).
+pub(crate) static CLOSE_PANEL: GlobalSignal<Option<Panel>> = Signal::global(|| None);
+/// The active view's workspace snapshot, for callers outside the component tree.
+pub(crate) static ACTIVE_SNAPSHOT: GlobalSignal<Option<Signal<panel_kit_core::reducer::Snapshot<Panel>>>> =
+    Signal::global(|| None);
+
+/// Whether `kind` is open (not minimised) in the active workspace.
+pub(crate) fn panel_visible(kind: Panel) -> bool {
+    ACTIVE_SNAPSHOT.peek().is_some_and(|snapshot| {
+        snapshot
+            .peek()
+            .panels
+            .iter()
+            .any(|p| p.kind == kind && p.state != panel_kit::WinState::Minimized)
+    })
+}
 
 /// Apply graph/camera keyboard shortcuts before panel workspace commands.
 fn handle_graph_key_down(event: &KeyboardEvent, panel_focused: bool) -> bool {
@@ -1144,6 +1163,30 @@ fn App() -> Element {
             });
             appstate::note_mutation("section", &format!("{}: open", PanelKind::title(kind)));
             *OPEN_PANEL.write() = None;
+        }
+    });
+    let snap_user = ws_user.snapshot;
+    let snap_sessions = ws_sessions.snapshot;
+    use_effect(move || {
+        *ACTIVE_SNAPSHOT.write() = Some(match *view.read() {
+            AppView::User => snap_user,
+            AppView::Sessions => snap_sessions,
+        });
+    });
+    let close_user = ws_user.clone();
+    let close_sessions = ws_sessions.clone();
+    use_effect(move || {
+        let req = *CLOSE_PANEL.read();
+        if let Some(kind) = req {
+            let workspace = match *view.read() {
+                AppView::User => close_user.clone(),
+                AppView::Sessions => close_sessions.clone(),
+            };
+            workspace::workspace_event_handler(&workspace).call(WorkspaceEvent::Command {
+                target: Some(kind),
+                command: PanelCommand::Minimize,
+            });
+            *CLOSE_PANEL.write() = None;
         }
     });
 
@@ -1636,7 +1679,22 @@ fn App() -> Element {
                         return;
                     }
 
-                    let panel_focused = workspace.snapshot.read().focused.is_some();
+                    let focused = workspace.snapshot.read().focused;
+                    // Esc on the focused Help panel dismisses it to the dock.
+                    if focused == Some(Panel::Help) && e.key() == Key::Escape {
+                        *CLOSE_PANEL.write() = Some(Panel::Help);
+                        e.prevent_default();
+                        return;
+                    }
+                    // Vi traversal owns bare keys unless a panel other than the
+                    // graph has focus, so that panel's `m`/Enter commands work.
+                    // Help has no keys of its own, so `?` can toggle it closed.
+                    if matches!(focused, None | Some(Panel::Graph) | Some(Panel::Help))
+                        && vi::handle_key(&e, ctx)
+                    {
+                        return;
+                    }
+                    let panel_focused = focused.is_some();
                     if handle_graph_key_down(&e, panel_focused) {
                         return;
                     }
@@ -1689,6 +1747,16 @@ fn App() -> Element {
                         "{mode_label} · connecting…"
                     }
                 }
+                span {
+                    class: "topbar-posture",
+                    role: "status",
+                    "aria-live": "polite",
+                    "data-field": "vi-posture",
+                    "{vi::posture_label(workspace.snapshot.read().focused)}"
+                    if let Some((i, o)) = vi::HINT.read().degree {
+                        span { class: "topbar-degree", "data-field": "vi-degree", title: "incoming / outgoing edges of the cursor node", " ↑{i} ↓{o}" }
+                    }
+                }
                 {hints::header_bar()}
                 // Workspace-level loading surface: any pending store (graph
                 // load, importer build, panel fetches) shows here with its
@@ -1710,6 +1778,8 @@ fn App() -> Element {
             // until opened) and the hover/click focus engine.
             {palette::overlay(ctx)}
             {anchored::driver(ctx)}
+            {vi::driver(ctx)}
+            which_key::WhichKey {}
         }
     }
 }
@@ -1911,6 +1981,9 @@ fn panel_body(kind: Panel, _maximized: bool, ctx: Ctx) -> Element {
                 p { "🔵 tiling ⇄ floating" }
                 p { "🟡 minimize → dock" }
                 p { "🩷 maximize ⇄ restore" }
+                hr {}
+                p { "keys: ? toggles this panel · : starts the tour · Esc cancels a pending sequence" }
+                {which_key::key_reference()}
             }
         },
     }
