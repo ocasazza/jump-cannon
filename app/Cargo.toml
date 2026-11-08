@@ -11,12 +11,10 @@
 #
 # The panel-workspace library lives in its own repo now —
 # https://github.com/ocasazza/panel-kit — consumed as a git dependency and
-# shared with snake-pit. Develop against a local checkout with the patch
-# below (paths are relative to this file; panel-kit-keys is the worktree
-# carrying the key vocabulary modules):
-[patch."https://github.com/ocasazza/panel-kit"]
-panel-kit = { path = "../../panel-kit-keys" }
-panel-kit-core = { path = "../../panel-kit-keys/crates/panel-kit-core" }
+# shared with snake-pit. Develop against a local checkout with:
+#   [patch."https://github.com/ocasazza/panel-kit"]
+#   panel-kit = { path = "../../panel-kit" }
+#   panel-kit-core = { path = "../../panel-kit/crates/panel-kit-core" }
 
 #
 # Deliberately a *separate* workspace from the repo root: the main workspace
