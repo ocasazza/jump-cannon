@@ -228,7 +228,7 @@ pub struct AppStateInner {
     pub assets_dir: Option<PathBuf>,
     /// gRPC client to a `graph-compute` worker.
     pub compute_broker: ComputeBroker,
-    /// On-demand GPU session controller (Kueue/KubeRay RayCluster
+    /// On-demand GPU session controller (Kueue-admitted compute Job + Service
     /// lifecycle). `None` when the feature is disabled — no template mounted
     /// or no kube client — so local dev is completely unaffected (R11).
     pub gpu_session: Option<GpuSessionHandle>,

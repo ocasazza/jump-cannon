@@ -69,7 +69,7 @@ or JSON where appropriate. See [[Architecture]], [[Observability]], and
 [[Security Model]]. Importer contracts are documented in [[Importer Runtime]].
 
 The `/compute/*` family fronts the optional remote layout worker
-([[Ray GPU Sessions]]). `/compute/health` and `/compute/engines` degrade
+([[GPU Sessions]]). `/compute/health` and `/compute/engines` degrade
 gracefully when the worker is absent; their wire shapes are frozen contracts
 with the frontend. `GET /compute/session` reports the on-demand GPU session
 lifecycle as derived state with the broker status embedded, and

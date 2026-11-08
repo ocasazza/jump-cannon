@@ -14,7 +14,7 @@ frame latency, API latency, and remote-session startup rather than combining
 them into one score.
 
 Weekly cluster results flow through [[Scheduled Tests]] to [[Observability]].
-GPU-backed runs follow [[Kueue Scheduling]] and [[Ray GPU Sessions]].
+GPU-backed runs follow [[Kueue Scheduling]] and [[GPU Sessions]].
 
 Merge-time Metal Criterion runs publish their native reports as immutable Hydra
 build products. Compare retained Hydra results directly; benchmark derivations

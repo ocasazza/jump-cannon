@@ -1,5 +1,5 @@
 //! GPU Sessions panel: per-world GPU compute lifecycle on a multi-user
-//! cluster host — Kueue-admitted RayClusters shared across worlds under the
+//! cluster host — Kueue-admitted compute Jobs shared across worlds under the
 //! standing GPU envelope. Hidden by content, not by presence, in single-user
 //! or no-world states (the panel itself stays restore-able from the dock).
 
@@ -57,7 +57,7 @@ pub fn panel(ctx: Ctx) -> Element {
                     button {
                         class: "btn",
                         r#type: "button",
-                        title: "create the world's RayCluster and wait for Kueue admission",
+                        title: "create the world's compute Job and wait for Kueue admission",
                         onclick: move |_| {
                             let w = ctx.active_world.read().clone();
                             spawn(async move {
@@ -74,7 +74,7 @@ pub fn panel(ctx: Ctx) -> Element {
                     button {
                         class: "btn",
                         r#type: "button",
-                        title: "delete the RayCluster and release the GPU envelope",
+                        title: "delete the compute Job and release the GPU envelope",
                         onclick: move |_| {
                             let w = ctx.active_world.read().clone();
                             spawn(async move {

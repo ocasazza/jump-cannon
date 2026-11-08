@@ -1,11 +1,11 @@
-//! Bounded two-container head-pod log tailer (Q7).
+//! Bounded compute-pod log tailer (Q7).
 //!
-//! Polls `pods/log` (no `follow=true` streams) for the `graph-compute` and
-//! `ray-head` containers while the session is admitted/head_starting/ready/
+//! Polls `pods/log` (no `follow=true` streams) for the Job pod's
+//! `graph-compute` container while the session is admitted/starting/ready/
 //! parking, and forwards each line into the `gpu-session` progress group so
 //! the frontend's Progress panel renders it with zero frontend work.
 //!
-//! Bounding rules (all per container):
+//! Bounding rules:
 //! - `tailLines=100` on the first read of each pod generation, then
 //!   `sinceTime=<last seen>` incremental reads.
 //! - Per-line truncation at ~500 chars.
@@ -23,13 +23,13 @@ use kube::Client;
 
 use crate::progress::ProgressLog;
 
-use super::observe::HeadPodFacts;
+use super::observe::ComputePodFacts;
 
 /// Progress group every log line lands in (the frontend renders this group
 /// in the Progress panel automatically).
 pub const LOG_GROUP: &str = "gpu-session";
 
-const CONTAINERS: [&str; 2] = ["graph-compute", "ray-head"];
+const CONTAINER: &str = "graph-compute";
 const FIRST_READ_TAIL_LINES: i64 = 100;
 const MAX_LINE_CHARS: usize = 500;
 const RATE_CAP_PER_MINUTE: u32 = 60;
@@ -37,9 +37,9 @@ const RATE_CAP_PER_MINUTE: u32 = 60;
 /// loop.
 const KUBE_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Per-container cursor + rate window.
+/// Cursor + rate window for the tailed container.
 struct ContainerCursor {
-    /// UID of the head pod generation this cursor tracks.
+    /// UID of the compute pod generation this cursor tracks.
     pod_uid: Option<String>,
     /// Timestamp of the last emitted line (sent back as `sinceTime`).
     since: Option<Timestamp>,
@@ -84,7 +84,7 @@ pub struct LogTailer {
     client: Client,
     namespace: String,
     progress: Arc<ProgressLog>,
-    cursors: [ContainerCursor; 2],
+    cursor: ContainerCursor,
 }
 
 impl LogTailer {
@@ -93,52 +93,45 @@ impl LogTailer {
             client,
             namespace,
             progress,
-            cursors: [ContainerCursor::new(), ContainerCursor::new()],
+            cursor: ContainerCursor::new(),
         }
     }
 
-    /// One tail pass over both containers. `head` is the current head-pod
-    /// facts from this tick's observation; all errors are logged and
-    /// swallowed (log tailing must never flap the state machine).
-    pub async fn poll(&mut self, head: &HeadPodFacts) {
-        for (i, container) in CONTAINERS.iter().enumerate() {
-            if let Err(e) = self.poll_container(i, container, head).await {
-                tracing::warn!(
-                    container,
-                    error = %format!("{e:#}"),
-                    "gpu-session log tail failed"
-                );
-            }
+    /// One tail pass. `pod` is the current compute-pod facts from this
+    /// tick's observation; all errors are logged and swallowed (log tailing
+    /// must never flap the state machine).
+    pub async fn poll(&mut self, pod: &ComputePodFacts) {
+        if let Err(e) = self.poll_container(pod).await {
+            tracing::warn!(
+                container = CONTAINER,
+                error = %format!("{e:#}"),
+                "gpu-session log tail failed"
+            );
         }
     }
 
-    async fn poll_container(
-        &mut self,
-        index: usize,
-        container: &str,
-        head: &HeadPodFacts,
-    ) -> anyhow::Result<()> {
-        let cursor = &mut self.cursors[index];
-        if cursor.pod_uid.as_deref() != Some(head.uid.as_str()) {
+    async fn poll_container(&mut self, pod: &ComputePodFacts) -> anyhow::Result<()> {
+        let cursor = &mut self.cursor;
+        if cursor.pod_uid.as_deref() != Some(pod.uid.as_str()) {
             if cursor.pod_uid.is_some() {
                 self.progress.warn(
                     LOG_GROUP,
-                    format!("[{container}] head pod replaced (now {}); log cursor reset", head.name),
+                    format!("[{CONTAINER}] compute pod replaced (now {}); log cursor reset", pod.name),
                 );
             }
             *cursor = ContainerCursor::new();
-            cursor.pod_uid = Some(head.uid.clone());
+            cursor.pod_uid = Some(pod.uid.clone());
         }
 
         let params = LogParams {
-            container: Some(container.to_string()),
+            container: Some(CONTAINER.to_string()),
             timestamps: true,
             since_time: cursor.since,
             tail_lines: (cursor.since.is_none()).then_some(FIRST_READ_TAIL_LINES),
             ..Default::default()
         };
         let pods: Api<Pod> = Api::namespaced(self.client.clone(), &self.namespace);
-        let text = tokio::time::timeout(KUBE_TIMEOUT, pods.logs(&head.name, &params))
+        let text = tokio::time::timeout(KUBE_TIMEOUT, pods.logs(&pod.name, &params))
             .await
             .map_err(|_| anyhow::anyhow!("pods/log read timed out"))??;
 
@@ -168,12 +161,10 @@ impl LogTailer {
 
         for line in lines {
             match cursor.admit() {
-                Ok(()) => self
-                    .progress
-                    .info(LOG_GROUP, format!("[{container}] {line}")),
+                Ok(()) => self.progress.info(LOG_GROUP, format!("[{CONTAINER}] {line}")),
                 Err(elided) if elided > 0 => self.progress.warn(
                     LOG_GROUP,
-                    format!("[{container}] ...{elided} lines elided (rate cap)"),
+                    format!("[{CONTAINER}] ...{elided} lines elided (rate cap)"),
                 ),
                 Err(_) => {}
             }
@@ -196,23 +187,24 @@ pub fn truncate_line(line: &str, max: usize) -> String {
     out
 }
 
-/// Label selector shared by the observer and (indirectly) the tailer.
-pub fn head_pod_selector(cluster_name: &str) -> String {
-    format!("ray.io/cluster={cluster_name},ray.io/node-type=head")
+/// Label selector for the Job's pods: the Job controller stamps every pod it
+/// creates with `batch.kubernetes.io/job-name=<job name>`.
+pub fn compute_pod_selector(job_name: &str) -> String {
+    format!("batch.kubernetes.io/job-name={job_name}")
 }
 
-/// List head pods for the cluster; fact extraction lives in `observe`'s
-/// callers. Kept here so `ListParams` construction has one home.
-pub async fn list_head_pods(
+/// List the session Job's pods; fact extraction lives in `observe`. Kept here
+/// so `ListParams` construction has one home.
+pub async fn list_compute_pods(
     client: &Client,
     namespace: &str,
-    cluster_name: &str,
+    job_name: &str,
 ) -> anyhow::Result<Vec<Pod>> {
     let pods: Api<Pod> = Api::namespaced(client.clone(), namespace);
-    let lp = ListParams::default().labels(&head_pod_selector(cluster_name));
+    let lp = ListParams::default().labels(&compute_pod_selector(job_name));
     let list = tokio::time::timeout(KUBE_TIMEOUT, pods.list(&lp))
         .await
-        .map_err(|_| anyhow::anyhow!("head pod list timed out"))??;
+        .map_err(|_| anyhow::anyhow!("compute pod list timed out"))??;
     Ok(list.items)
 }
 
@@ -252,10 +244,10 @@ mod tests {
     }
 
     #[test]
-    fn head_pod_selector_matches_chart_labels() {
+    fn compute_pod_selector_uses_the_job_controller_label() {
         assert_eq!(
-            head_pod_selector("jump-cannon-compute"),
-            "ray.io/cluster=jump-cannon-compute,ray.io/node-type=head"
+            compute_pod_selector("jump-cannon-compute"),
+            "batch.kubernetes.io/job-name=jump-cannon-compute"
         );
     }
 }

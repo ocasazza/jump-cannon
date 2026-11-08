@@ -5,9 +5,10 @@
 //! Authentication is by trusted identity header — run behind an
 //! authenticating ingress that sets `--user-header`.
 //!
-//! When a per-world RayCluster template is mounted (`--gpu-template`), the
-//! GPU broker manages one Kueue-admitted RayCluster per world; without it
-//! the broker is disabled and `compute` reports `ComputeHandle::Null`.
+//! When a per-world compute Job template is mounted (`--gpu-template`), the
+//! GPU broker manages one Kueue-admitted Job (plus its Service) per world;
+//! without it the broker is disabled and `compute` reports
+//! `ComputeHandle::Null`.
 
 use clap::Parser;
 use session_manager::gpu_broker::{self, GpuBroker, GpuBrokerConfig};
@@ -38,22 +39,22 @@ struct Args {
     /// authenticating ingress). Requests without it get 401.
     #[arg(long, env = "JUMP_CANNON_USER_HEADER", default_value = "x-user")]
     user_header: String,
-    /// Path to the chart-rendered per-world RayCluster template (YAML/JSON,
+    /// Path to the chart-rendered per-world compute Job template (YAML/JSON,
     /// mounted from a ConfigMap; `metadata.name` is a placeholder stamped
     /// per world). When set (and a kube client is available), the per-world
     /// GPU broker runs; unset = the broker is fully disabled and compute
     /// session endpoints report `{"enabled": false}`.
     #[arg(long, env = "JUMP_CANNON_SM_GPU_TEMPLATE")]
     gpu_template: Option<PathBuf>,
-    /// Namespace holding the per-world RayClusters, Kueue Workloads, and
-    /// compute Services.
+    /// Namespace holding the per-world Jobs, Kueue Workloads, and compute
+    /// Services.
     #[arg(
         long,
         env = "JUMP_CANNON_SM_COMPUTE_NAMESPACE",
         default_value = "gpu-workloads"
     )]
     gpu_namespace: String,
-    /// Release prefix for per-world cluster names (`<prefix>-<world-slug>`).
+    /// Release prefix for per-world Job names (`<prefix>-<world-slug>`).
     #[arg(
         long,
         env = "JUMP_CANNON_SM_RELEASE",
@@ -89,14 +90,14 @@ struct Args {
         default_value_t = gpu_broker::DEFAULT_MAX_SECONDS
     )]
     gpu_max_seconds: u64,
-    /// Head-start timeout in seconds (admitted → ready) before a world
+    /// Start timeout in seconds (admitted → compute pod ready) before a world
     /// session fails.
     #[arg(
         long,
-        env = "JUMP_CANNON_SM_HEAD_START_TIMEOUT",
-        default_value_t = gpu_broker::DEFAULT_HEAD_START_TIMEOUT_SECONDS
+        env = "JUMP_CANNON_SM_START_TIMEOUT",
+        default_value_t = gpu_broker::DEFAULT_START_TIMEOUT_SECONDS
     )]
-    gpu_head_start_timeout_seconds: u64,
+    gpu_start_timeout_seconds: u64,
 }
 
 /// Build the per-world GPU broker from CLI/env config. Returns `None`
@@ -127,7 +128,7 @@ async fn build_gpu_broker(args: &Args) -> Option<GpuBroker> {
         idle_timeout: std::time::Duration::from_secs(args.gpu_idle_seconds),
         admission_timeout: std::time::Duration::from_secs(args.gpu_admission_timeout_seconds),
         max_session: std::time::Duration::from_secs(args.gpu_max_seconds),
-        head_start_timeout: std::time::Duration::from_secs(args.gpu_head_start_timeout_seconds),
+        start_timeout: std::time::Duration::from_secs(args.gpu_start_timeout_seconds),
         compute_port: args.gpu_compute_port,
     })
     .await
