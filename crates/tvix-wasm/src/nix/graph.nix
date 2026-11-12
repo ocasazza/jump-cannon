@@ -260,6 +260,52 @@ let
       edges = builtins.listToAttrs edgeEntries;
     };
 
+  # waterSheet : { molecules, rows, cols } -> toGraphJSON graph
+  # Two disconnected components kinds in one graph:
+  #  - a pool of `molecules` water molecules, each a 3-node path H1 - O - H2
+  #    (types water-H / water-O), no edge between molecules;
+  #  - one `rows` x `cols` sheet lattice (type sheet), each node joined to its
+  #    right and down neighbour.
+  # Built with one listToAttrs per attrset (O(n+e)), like `random`.
+  waterSheet = { molecules ? 1000, rows ? 64, cols ? 64 }:
+    let
+      str = builtins.toString;
+      ids = builtins.genList (i: i);
+      moleculeNodes = builtins.concatMap (m:
+        let w = "w" + str m; in [
+          { name = w + "_O"; value = { id = w + "_O"; type = "water-O"; metadata = { }; }; }
+          { name = w + "_H1"; value = { id = w + "_H1"; type = "water-H"; metadata = { }; }; }
+          { name = w + "_H2"; value = { id = w + "_H2"; type = "water-H"; metadata = { }; }; }
+        ]) (ids molecules);
+      bond = id: source: target: {
+        name = id;
+        value = { inherit id source target; directed = false; metadata = { }; };
+      };
+      moleculeEdges = builtins.concatMap (m:
+        let w = "w" + str m; in [
+          (bond (w + "_b1") (w + "_O") (w + "_H1"))
+          (bond (w + "_b2") (w + "_O") (w + "_H2"))
+        ]) (ids molecules);
+      cells = rows * cols;
+      sid = i: "s" + str i;
+      sheetNodes = builtins.map (i: {
+        name = sid i;
+        value = { id = sid i; type = "sheet"; metadata = { }; };
+      }) (ids cells);
+      sheetEdges = builtins.concatMap (i:
+        let
+          r = i / cols;
+          c = i - cols * r;
+        in
+        (if c + 1 < cols then [ (bond ("sh" + str i) (sid i) (sid (i + 1))) ] else [ ])
+        ++ (if r + 1 < rows then [ (bond ("sv" + str i) (sid i) (sid (i + cols))) ] else [ ])
+      ) (ids cells);
+    in
+    toGraphJSON {
+      nodes = builtins.listToAttrs (moleculeNodes ++ sheetNodes);
+      edges = builtins.listToAttrs (moleculeEdges ++ sheetEdges);
+    };
+
 in {
   inherit emptyGraph addNode addEdge removeNode removeEdge;
   inherit getNodeIds getEdgeIds nodeCount edgeCount;
@@ -267,5 +313,5 @@ in {
   inherit neighbors inNeighbors degree edgesFrom edgesTo;
   inherit merge isEmpty isSubgraphOf;
   inherit fromEdgeList toNodeList toEdgeList toGraphJSON;
-  inherit random clustered;
+  inherit random clustered waterSheet;
 }

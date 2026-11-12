@@ -1,0 +1,54 @@
+# Water pool plus sheet lattice generator package.
+#
+# One graph holding `molecules` disconnected water molecules (each a 3-node
+# path H - O - H, types `water-H` / `water-O`) and a single `rows` x `cols`
+# sheet lattice (type `sheet`). The node types surface as facets, so the pool
+# and the sheet can be isolated in the UI. A graph generator is data, not
+# code: AGENTS.md, "Importers: packages, not crates".
+
+format_version = 3
+
+[metadata]
+id = "generate.water-sheet"
+name = "Water pool and sheet"
+version = "1.0.0"
+description = "A pool of disconnected H-O-H molecules next to one rows x cols sheet lattice. Deterministic; node and edge counts follow from the parameters."
+
+# Package ceiling: nodes <= 1000000 and edges <= 500000 (HARD_LIMITS). Total
+# nodes = 3*molecules + rows*cols; total edges = 2*molecules + the sheet's
+# 2*rows*cols - rows - cols.
+[limits]
+nodes = 1000000
+edges = 500000
+
+[parser]
+engine = "tvix"
+expr = '''
+{ molecules, rows, cols }:
+let g = import /jc/src/graph.nix { };
+in g.waterSheet { inherit molecules rows cols; }
+'''
+
+[[parser.variables]]
+name = "molecules"
+type = "integer"
+default = "20000"
+min = 0
+max = 333333
+description = "Number of disconnected water molecules (3 nodes, 2 edges each)."
+
+[[parser.variables]]
+name = "rows"
+type = "integer"
+default = "256"
+min = 0
+max = 1000000
+description = "Sheet lattice rows."
+
+[[parser.variables]]
+name = "cols"
+type = "integer"
+default = "256"
+min = 0
+max = 1000000
+description = "Sheet lattice columns."

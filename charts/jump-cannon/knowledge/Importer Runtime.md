@@ -17,7 +17,7 @@ retired `generate`/`tvix` `--source` kinds are now `engine = "tvix"` packages
 that bind their expression's runtime parameters (node count, edge count, seed,
 cluster count, affinity) at apply time, exactly as `httpjson` binds its
 variables — see `charts/jump-cannon/packages/generate-random.toml` and
-`generate-clusters.toml`. Every JSON API — including Hindsight — is a
+`generate-clusters.toml`; `generate-water-sheet.toml` builds a pool of disconnected H-O-H molecules beside one sheet lattice. Every JSON API — including Hindsight — is a
 declarative package under `charts/jump-cannon/packages/`
 bound to an instance at runtime via the `JUMP_CANNON_IMPORTER_*` env vars;
 Hindsight is the package `hindsight-memory-bank.toml`, not a source kind.
