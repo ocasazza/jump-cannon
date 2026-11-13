@@ -15,7 +15,7 @@ repository tarball (see [[GitHub Importer]]), bind an `httpjson` engine to one
 declarative TOML package under `charts/jump-cannon/packages/` (Hindsight ships
 as `hindsight-memory-bank.toml`; see [[Hindsight Importer]]), or run an
 `engine = "tvix"` generator package that evaluates a parameterised Nix
-expression into a graph (`generate-random.toml`, `generate-clusters.toml`) with
+expression into a graph (`generate-random.toml`, `generate-clusters.toml`, `generate-water-sheet.toml`) with
 its node count, edge count, seed, cluster count, and affinity bound at apply
 time. Tvix packages may declare `[[schema.fields]]`; matching flattened node
 metadata is type-checked, indexed or faceted as declared, and retained as node

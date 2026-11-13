@@ -239,6 +239,35 @@ default = "0"
     }
 }
 
+/// The shipped water-sheet package yields disconnected 3-node molecules and one
+/// lattice with exact node and edge counts.
+#[tokio::test]
+async fn water_sheet_package_counts_and_components() {
+    let source = include_str!("../../../../charts/jump-cannon/packages/generate-water-sheet.toml");
+    let package = ValidatedPackage::from_toml(source).expect("package validates");
+    let importer = build_tvix_importer(
+        package,
+        supplied(&[("molecules", "5"), ("rows", "3"), ("cols", "4")]),
+        "test".to_owned(),
+    )
+    .expect("importer binds");
+    let outcome = importer.import(&NoProgress).await.expect("evaluation succeeds");
+    let result = match outcome {
+        ImportOutcome::Loaded(result) => result,
+        ImportOutcome::Unchanged => panic!("water sheet reported unchanged"),
+    };
+    // 5*3 molecule nodes + 3*4 sheet nodes; 5*2 bonds + (3*3 + 2*4) lattice edges.
+    assert_eq!(result.graph.node_count(), 27);
+    assert_eq!(result.graph.edges.len(), 27);
+    let oxygens = result
+        .graph
+        .nodes
+        .values()
+        .filter(|n| n.meta.tags.iter().any(|t| t == "water-O"))
+        .count();
+    assert_eq!(oxygens, 5);
+}
+
 /// A declared default that violates its own bound is caught at parse time.
 #[test]
 fn default_outside_bounds_is_rejected_at_parse() {
