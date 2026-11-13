@@ -1,0 +1,8 @@
+[package]
+name = "native-graph-generator"
+version = "1.0.0"
+edition = "2021"
+description = "Native SoA water-sheet graph generator: pool of H-O-H molecules plus a rows x cols sheet lattice, 100M+ node scale, no attrset/toGraphJSON materialization"
+
+[dependencies]
+libc = "0.2"

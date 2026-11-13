@@ -5,6 +5,7 @@ members = [
     "crates/graph-metrics",
     "crates/graph-api",
     "crates/graph-compute",
+    "crates/native-graph-generator",
     "crates/vault-data",
     "crates/graph-vcs",
     "crates/session-manager",

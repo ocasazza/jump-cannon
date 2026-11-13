@@ -3134,6 +3134,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "native-graph-generator"
+version = "1.0.0"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "ndk-sys"
 version = "0.5.0+25.2.9519653"
 source = "registry+https://github.com/rust-lang/crates.io-index"
