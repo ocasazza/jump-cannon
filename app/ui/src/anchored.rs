@@ -19,7 +19,8 @@ use std::collections::{HashMap, HashSet};
 use dioxus::prelude::*;
 
 use crate::graph_canvas::GraphData;
-use crate::hints;
+use panel_kit::widgets::hints::{clear, publish};
+use panel_kit_core::widgets::hints::{node_hint as pk_node_hint, Hint, NodeHintMeta};
 use crate::panels::filter::{self, FilterBehavior};
 use crate::proto::NodeMeta;
 use crate::render;
@@ -40,6 +41,21 @@ const HOVER_HOLD_MS: f64 = 250.0;
 /// Hint-bar source keys.
 const HINT_HOVER: &str = "node-hover";
 const HINT_SELECTED: &str = "node-selected";
+
+/// Node hint from `/node/:id` meta when available, else the bare id
+/// (browser-only graphs have no meta endpoint). Maps the wire `NodeMeta`
+/// onto panel-kit's renderer-neutral `NodeHintMeta`.
+fn hint_for_node(source: &'static str, id: &str, meta: Option<&NodeMeta>) -> Hint {
+    let meta = meta.map(|m| NodeHintMeta {
+        title: m.title.clone(),
+        path: m.path.clone(),
+        doctype: m.doctype.clone(),
+        folder: m.folder.clone(),
+        tags: m.tags.clone(),
+        body: m.body.clone(),
+    });
+    pk_node_hint(source, id, meta.as_ref())
+}
 
 // --- focus sets (port of ui/focus_set.rs) --------------------------------------
 
@@ -421,7 +437,7 @@ fn kick_hint_fetch(ctx: Ctx, id: String) {
             Ok(m) => {
                 let hovered = HOVER_IDX.peek().and_then(|idx| id_for(&ctx.graph, idx));
                 if hovered.as_deref() == Some(id.as_str()) {
-                    hints::publish(hints::node_hint(HINT_HOVER, &id, Some(&m)));
+                    publish(hint_for_node(HINT_HOVER, &id, Some(&m)));
                 }
                 TIMING.with(|t| t.borrow_mut().hint_meta = Some(m));
             }
@@ -449,11 +465,11 @@ fn tick_hover_hint(ctx: Ctx, now: f64) {
             if cached.is_none() {
                 t.hint_armed_at = Some(now);
             }
-            Some(hints::node_hint(HINT_HOVER, id, cached))
+            Some(hint_for_node(HINT_HOVER, id, cached))
         });
         match hint {
-            Some(h) => hints::publish(h),
-            None => hints::clear(HINT_HOVER),
+            Some(h) => publish(h),
+            None => clear(HINT_HOVER),
         }
         return;
     }
@@ -578,9 +594,9 @@ fn FocusDriver(ctx: Ctx) -> Element {
         Some(id) => {
             let meta = ctx.meta.read();
             let meta = meta.as_ref().filter(|m| m.id == id);
-            hints::publish(hints::node_hint(HINT_SELECTED, &id, meta));
+            publish(hint_for_node(HINT_SELECTED, &id, meta));
         }
-        None => hints::clear(HINT_SELECTED),
+        None => clear(HINT_SELECTED),
     });
 
     rsx! {}

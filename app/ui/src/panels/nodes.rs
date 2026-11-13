@@ -24,6 +24,7 @@ use std::sync::Arc;
 use dioxus::prelude::*;
 use gloo_storage::{LocalStorage, Storage};
 use panel_kit::Spinner;
+use panel_kit::widgets::build_progress::PanelHydrating;
 use serde::{Deserialize, Serialize};
 
 use crate::panels::{document, filter, inspector};
@@ -847,7 +848,7 @@ pub fn panel(ctx: Ctx) -> Element {
     } = ctx;
     let graph_guard = graph.read();
     let Some(graph) = graph_guard.as_ref() else {
-        return rsx! { crate::build_progress::PanelHydrating { label: "loading node index" } };
+        return rsx! { PanelHydrating { label: "loading node index" } };
     };
     let q = query.read().trim().to_string();
     let q_lower = q.to_lowercase();
@@ -1059,7 +1060,7 @@ pub fn panel(ctx: Ctx) -> Element {
                                                 div { class: "nodes-nav-state error", "tag index failed: {error}" }
                                             },
                                             _ => rsx! {
-                                                div { class: "nodes-nav-state", crate::build_progress::PanelHydrating { label: "loading tags" } }
+                                                div { class: "nodes-nav-state", PanelHydrating { label: "loading tags" } }
                                             },
                                         },
                                     },
@@ -1067,7 +1068,7 @@ pub fn panel(ctx: Ctx) -> Element {
                                         if let Some(error) = tag_schema_error {
                                             div { class: "nodes-nav-state error", "tag schema unavailable: {error}" }
                                         } else {
-                                            div { class: "nodes-nav-state", crate::build_progress::PanelHydrating { label: "checking tag schema" } }
+                                            div { class: "nodes-nav-state", PanelHydrating { label: "checking tag schema" } }
                                         }
                                     },
                                 }

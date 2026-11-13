@@ -1276,6 +1276,34 @@ pub struct ProgressResponse {
     pub events: Vec<Stamped>,
 }
 
+impl ProgressEvent {
+    /// Map the wire event onto panel-kit's renderer-neutral event (drops the
+    /// server-only ids / log levels the feed never displays).
+    fn to_feed_event(&self) -> panel_kit_core::widgets::build_progress::ProgressEvent {
+        use panel_kit_core::widgets::build_progress::ProgressEvent as P;
+        match self {
+            ProgressEvent::Start { group, label, .. } => P::Start {
+                group: group.clone(),
+                label: label.clone(),
+            },
+            ProgressEvent::SetProgress { progress, .. } => P::SetProgress { progress: *progress },
+            ProgressEvent::UpdateLabel { label, .. } => P::UpdateLabel { label: label.clone() },
+            ProgressEvent::Finish { .. } => P::Finish,
+            ProgressEvent::Fail { reason, .. } => P::Fail { reason: reason.clone() },
+            ProgressEvent::Log { message, .. } => P::Log { message: message.clone() },
+        }
+    }
+}
+
+impl ProgressResponse {
+    /// Fold this response into a build feed: advance the cursor and append
+    /// each event's display line.
+    pub fn fold_into(&self, feed: &mut panel_kit_core::widgets::build_progress::BuildFeed) {
+        let events: Vec<_> = self.events.iter().map(|s| s.event.to_feed_event()).collect();
+        feed.fold(self.next_seq, events.iter());
+    }
+}
+
 /// `GET /progress?since=<seq>` — tail of the server-side progress event log
 /// for the caller's selected source (the deployment default when no source
 /// is selected). The route never blocks behind a build: a selected source

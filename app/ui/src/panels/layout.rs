@@ -50,6 +50,10 @@ use graph_layouts::{
 use crate::api::{self, get_json, put_json, put_raw_json};
 use crate::render;
 use crate::Ctx;
+use panel_kit::widgets::forms::{CheckRow, IntRow, Slider, TextRow};
+use panel_kit::widgets::selection::SelectableCard;
+use panel_kit_core::widgets::selection::SelectionCard;
+use panel_kit::widgets::build_progress::PanelHydrating;
 
 const STORE_KEY: &str = "jc_layout_v1";
 
@@ -2051,143 +2055,6 @@ pub(crate) fn seed_positions_for_generated(n: usize) -> Vec<f32> {
 
 // --- shared widgets -------------------------------------------------------------------
 
-fn fmt_f(v: f64) -> String {
-    format!("{}", v as f32)
-}
-
-/// Slider row: range input (optionally log-mapped, like egui's
-/// `.logarithmic(true)`) + a number box for direct entry.
-#[component]
-fn Slider(
-    label: String,
-    min: f64,
-    max: f64,
-    value: f64,
-    on: EventHandler<f64>,
-    log: Option<bool>,
-    title: Option<String>,
-) -> Element {
-    let log = log.unwrap_or(false);
-    let pos = if log {
-        1000.0 * (value.max(min) / min).ln() / (max / min).ln()
-    } else {
-        value
-    };
-    let (rmin, rmax, rstep) = if log {
-        (0.0, 1000.0, 1.0)
-    } else {
-        (min, max, ((max - min) / 1000.0).max(1e-6))
-    };
-    rsx! {
-        div { class: "lay-row", title: title.unwrap_or_default(),
-            span { class: "lay-k", "{label}" }
-            input {
-                r#type: "range",
-                class: "lay-range",
-                min: "{rmin}",
-                max: "{rmax}",
-                step: "{rstep}",
-                value: "{pos}",
-                oninput: move |e| {
-                    if let Ok(p) = e.value().parse::<f64>() {
-                        let v = if log { min * (max / min).powf(p / 1000.0) } else { p };
-                        on.call(v);
-                    }
-                },
-            }
-            input {
-                r#type: "number",
-                class: "lay-num",
-                value: "{fmt_f(value)}",
-                onchange: move |e| {
-                    if let Ok(v) = e.value().parse::<f64>() {
-                        on.call(v.clamp(min, max));
-                    }
-                },
-            }
-        }
-    }
-}
-
-/// Integer drag-value stand-in (egui `DragValue`): a clamped number box.
-#[component]
-fn IntRow(
-    label: String,
-    min: i64,
-    max: i64,
-    value: i64,
-    on: EventHandler<i64>,
-    title: Option<String>,
-    note: Option<String>,
-) -> Element {
-    rsx! {
-        div { class: "lay-row", title: title.unwrap_or_default(),
-            span { class: "lay-k", "{label}" }
-            input {
-                r#type: "number",
-                class: "lay-num",
-                min: "{min}",
-                max: "{max}",
-                step: "1",
-                value: "{value}",
-                onchange: move |e| {
-                    if let Ok(v) = e.value().parse::<i64>() {
-                        on.call(v.clamp(min, max));
-                    }
-                },
-            }
-            if let Some(n) = note {
-                span { class: "lay-note", "{n}" }
-            }
-        }
-    }
-}
-
-#[component]
-fn CheckRow(
-    label: String,
-    value: bool,
-    on: EventHandler<bool>,
-    text: Option<String>,
-    title: Option<String>,
-) -> Element {
-    rsx! {
-        div { class: "lay-row", title: title.unwrap_or_default(),
-            span { class: "lay-k", "{label}" }
-            label { class: "lay-check",
-                input {
-                    r#type: "checkbox",
-                    checked: value,
-                    onchange: move |e| on.call(e.checked()),
-                }
-                if let Some(t) = text {
-                    span { "{t}" }
-                }
-            }
-        }
-    }
-}
-
-#[component]
-fn TextRow(
-    label: String,
-    value: String,
-    on: EventHandler<String>,
-    title: Option<String>,
-) -> Element {
-    rsx! {
-        div { class: "lay-row", title: title.unwrap_or_default(),
-            span { class: "lay-k", "{label}" }
-            input {
-                r#type: "text",
-                class: "lay-text",
-                value: "{value}",
-                onchange: move |e| on.call(e.value()),
-            }
-        }
-    }
-}
-
 /// Seed (u64) row: re-roll button + text entry. Text, not number — re-rolled
 /// seeds exceed the f64-safe integer range a number input would mangle.
 #[component]
@@ -2829,10 +2696,10 @@ fn EngineCard(
 ) -> Element {
     // Keep the existing `lay-card*` class names so the browser regression
     // suite's `[data-source-id]` / `[aria-pressed]` selectors keep matching.
-    // The shared `SelectableCard` component supplies the head / chip / desc /
+    // The library `SelectableCard` component supplies the head / chip / desc /
     // why skeleton; the "● running" badge is a layout-specific slot via
     // `children`.
-    let mut class = String::from("select-card lay-card");
+    let mut class = String::from("pk-select-card lay-card");
     if active {
         class.push_str(" active");
     }
@@ -2843,20 +2710,24 @@ fn EngineCard(
         (kind_class.to_string(), kind_label.clone()),
         (proc_class.to_string(), proc_label.clone()),
     ];
+    let card = SelectionCard {
+        source_id: title.clone(),
+        kind: "engine".to_string(),
+        class,
+        name: name.clone(),
+        subtitle: String::new(),
+        chips,
+        description: description.clone(),
+        disabled_reason: disabled_reason.clone().unwrap_or_default(),
+        is_viewing: active,
+        is_ghost: ghost,
+        disabled,
+        title: title.clone(),
+        ..Default::default()
+    };
     rsx! {
-        crate::selection_card::SelectableCard {
-            source_id: title.clone(),
-            kind: "engine".to_string(),
-            card_class: class,
-            name: name.clone(),
-            subtitle: String::new(),
-            chips,
-            description: description.clone(),
-            disabled_reason: disabled_reason.clone().unwrap_or_default(),
-            is_viewing: active,
-            is_ghost: ghost,
-            disabled,
-            title: title.clone(),
+        SelectableCard {
+            card,
             on_select: Some(on_select),
             if active {
                 div { class: "lay-card-status",
@@ -3048,7 +2919,7 @@ fn cluster_gallery(
         match snap {
             None => rsx! {
                 div { class: "lay-empty",
-                    crate::build_progress::PanelHydrating { label: "contacting graph-api for the engine list" }
+                    PanelHydrating { label: "contacting graph-api for the engine list" }
                 }
             },
             Some(Err(error)) => rsx! {

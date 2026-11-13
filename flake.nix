@@ -1253,6 +1253,8 @@
             (pkgs.lib.fileset.fileFilter
               (file: builtins.any file.hasExt [ "rs" "toml" "lock" "html" "css" "wgsl" ])
               ./app)
+            ./app/ui/assets/keymap-vi.json
+            ./app/ui/assets/tour-vi.json
             # Vendored third-party assets (Monaco editor bundle, fonts, notices)
             # ride along unfiltered — the extension allowlist above would drop
             # .js/.ttf payloads the panel-kit editor loads at runtime.
