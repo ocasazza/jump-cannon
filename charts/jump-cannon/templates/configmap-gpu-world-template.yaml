@@ -1,5 +1,5 @@
 {{- if and .Values.sessionManager.enabled .Values.sessionManager.gpu.enabled }}
-{{- /* Per-world RayCluster template for the session-manager GPU broker.
+{{- /* Per-world Job template for the session-manager GPU broker.
        metadata.name is the __world__ placeholder; the broker stamps
        <release>-<world-slug> per world at dispatch time. The max-exec label
        comes from sessionManager.gpu (not the legacy single-tenant session). */}}
@@ -11,6 +11,6 @@ metadata:
     {{- include "jump-cannon.labels" . | nindent 4 }}
     app.kubernetes.io/component: session-manager
 data:
-  raycluster.yaml: |
-    {{- include "jump-cannon.rayclusterManifestNamed" (dict "root" . "clusterName" "__world__" "namespace" (include "jump-cannon.smComputeNamespace" .) "maxExecSeconds" .Values.sessionManager.gpu.maxExecTimeSeconds) | nindent 4 }}
+  job.yaml: |
+    {{- include "jump-cannon.computeJobManifestNamed" (dict "root" . "jobName" "__world__" "namespace" (include "jump-cannon.smComputeNamespace" .) "maxExecSeconds" .Values.sessionManager.gpu.maxExecTimeSeconds) | nindent 4 }}
 {{- end }}

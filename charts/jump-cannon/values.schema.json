@@ -164,7 +164,7 @@
               "type": "integer",
               "minimum": 1
             },
-            "headStartTimeoutSeconds": {
+            "startTimeoutSeconds": {
               "type": "integer",
               "minimum": 1
             }

@@ -19,6 +19,20 @@ storage reads legacy V1 records but writes `SavedLayoutV2` in CSS-pixel units;
 Jump Cannon's v6-v8 panel-enum migration also emits V2 before `use_workspace`
 reconciles it to the live viewport.
 
+Vi-style graph traversal sits in front of the camera keys. Keyboard semantics
+(chord grammar, counts, sequences, jumplist, marks, search matches) are
+`panel-kit-core::{keymap, graph_nav}`; `app/ui/src/nav.rs` supplies the
+`GraphIndex` (forward and reverse CSR with per-edge kinds, one sort per edge
+kind, slot 0 is `untyped`), the `Intent` vocabulary, and the default keymap
+`app/ui/assets/keymap-vi.json`. `app/ui/src/vi.rs` translates events, syncs
+the cursor with `Ctx.selected`, and re-aims the camera on each move (`z t`
+toggles follow). `h`/`l` step toward edge targets/sources, `j`/`k` walk
+siblings, `gg`/`G` first/last, `[`/`]` cycle, `/` focuses the Nodes search
+(its results become the `n`/`N` matches), `m{a-z}`/`'{a-z}` marks,
+`<c-o>`/`<c-i>` jumplist, `Enter`/`i` open Document/Inspector, `?` lists keys.
+Vi keys apply while no panel except Graph has focus; unbound keys fall through
+to the camera and panel handlers.
+
 The renderer requires browser WebGPU; there is no WebGL compute fallback. On
 an insecure origin or a browser without a usable adapter, the Graph panel shows
 an actionable unavailable state while Nodes and the rest of the workspace stay

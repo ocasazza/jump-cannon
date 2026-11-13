@@ -29,7 +29,7 @@ Three hosts implement the same contract:
   VcsStore). This host backs the standalone browser/Tauri app.
 - **KubernetesSessionManager** — the cluster server: axum, per-world ACLs, the
   REST API below, per-world nested graph-api serving, and a `GpuBroker` that
-  manages one Kueue-admitted RayCluster per world (see [[Ray GPU Sessions]]).
+  manages one Kueue-admitted compute Job per world (see [[GPU Sessions]]).
 - **HttpSessionManager** — the wasm-clean client of that REST API; the app
   swaps to it when a session-manager URL is configured.
 
@@ -58,7 +58,7 @@ TerminusDB database per world; requires the chart's optional `terminusdb`
 StatefulSet, whose admin password comes only from a user-created Secret).
 
 Deploy through the chart's `sessionManager.*` values (Deployment, Service,
-world-store PVC, RBAC, per-world RayCluster template). Exactly one replica is
+world-store PVC, RBAC, per-world compute Job template). Exactly one replica is
 supported, and `sessionManager.gpu` is mutually exclusive with the legacy
 `graphCompute.session` mode — the chart fails the render otherwise. Review the
 values in [[Helm Deployment]] and the component picture in [[Architecture]].
@@ -70,8 +70,8 @@ NetBird TLS proxy at
 `https://jump-cannon-sessions.proxy.cluster.nixstation.internal` (the shared
 proxy injects `x-user`; browsers put this URL in Settings → session manager).
 The single-tenant `graphCompute.session` is retired there; per-world
-dispatch creates a Kueue-held RayCluster in `gpu-workloads` until quota is
-granted ("waiting for a seed, not broken" — [[Ray GPU Sessions]]). The `jump-cannon-session-manager` image publishes like the other runtime images
+dispatch creates a Kueue-held compute Job in `gpu-workloads` until quota is
+granted ("waiting for a seed, not broken" — [[GPU Sessions]]). The `jump-cannon-session-manager` image publishes like the other runtime images
 ([[GitOps Release]]).
 
 **World open state is in-memory:** a pod restart closes every world — the

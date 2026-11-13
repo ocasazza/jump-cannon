@@ -1,11 +1,12 @@
-//! RayCluster session template: load, validate, and stamp the chart-rendered
+//! Compute session template: load, validate, and stamp the chart-rendered
 //! manifest mounted into the graph-api pod.
 //!
-//! The Helm chart owns *what* the session cluster looks like; graph-api owns
-//! *when* it exists. The template is treated as opaque JSON (`serde_json::Value`)
-//! — never typed KubeRay structs — so CRD version skew cannot break us (R12).
-//! Validation happens once at boot; a bad template fails the session FEATURE
-//! loudly (logged, `enabled:false`) and never panics the server.
+//! The Helm chart owns *what* the session workload looks like; graph-api owns
+//! *when* it exists. The template is treated as opaque JSON
+//! (`serde_json::Value`) — never typed Kubernetes structs — so schema skew
+//! cannot break us (R12). Validation happens once at boot; a bad template
+//! fails the session FEATURE loudly (logged, `enabled:false`) and never
+//! panics the server.
 
 use std::path::Path;
 
@@ -13,15 +14,15 @@ use anyhow::{anyhow, bail, Context};
 use serde_json::Value;
 
 /// Kueue queue label — must be present in the chart-rendered template so the
-/// RayCluster is admitted through the ClusterQueue (and Kueue owns
-/// `spec.suspend`, which we never touch).
+/// Job is admitted through the ClusterQueue (and Kueue owns `spec.suspend`,
+/// which we never touch).
 pub const QUEUE_LABEL: &str = "kueue.x-k8s.io/queue-name";
 /// Kueue-enforced hard execution cap. Injected at stamp time when the chart
 /// did not set it (default matches the controller-side max session length).
 pub const MAX_EXEC_LABEL: &str = "kueue.x-k8s.io/max-exec-time-seconds";
 
-/// A validated RayCluster manifest ready to stamp and POST via the kube
-/// dynamic API.
+/// A validated Job manifest ready to stamp and POST via the kube dynamic
+/// API.
 #[derive(Clone, Debug)]
 pub struct SessionTemplate {
     manifest: Value,
@@ -52,7 +53,7 @@ impl SessionTemplate {
     fn read(path: &Path) -> anyhow::Result<Value> {
         let raw = std::fs::read_to_string(path)
             .with_context(|| format!("read gpu session template {}", path.display()))?;
-        // The chart mounts the manifest as YAML (raycluster.yaml); YAML is a
+        // The chart mounts the manifest as YAML (job.yaml); YAML is a
         // superset of JSON, so this accepts either rendering.
         serde_yaml::from_str(&raw).with_context(|| {
             format!(
@@ -63,9 +64,8 @@ impl SessionTemplate {
     }
 
     /// Boot-time validation per the locked spec: parses as an object,
-    /// `kind == "RayCluster"`, apiVersion in the ray.io group, metadata
-    /// name/namespace match the configured values, and the Kueue queue label
-    /// is present.
+    /// `kind == "Job"` in `batch/v1`, metadata name/namespace match the
+    /// configured values, and the Kueue queue label is present.
     pub fn validate(manifest: &Value, cluster_name: &str, namespace: &str) -> anyhow::Result<()> {
         Self::validate_inner(manifest, Some(cluster_name), namespace)
     }
@@ -81,15 +81,15 @@ impl SessionTemplate {
             .get("kind")
             .and_then(Value::as_str)
             .ok_or_else(|| anyhow!("missing kind"))?;
-        if kind != "RayCluster" {
-            bail!("kind must be RayCluster, got {kind:?}");
+        if kind != "Job" {
+            bail!("kind must be Job, got {kind:?}");
         }
         let api_version = manifest
             .get("apiVersion")
             .and_then(Value::as_str)
             .ok_or_else(|| anyhow!("missing apiVersion"))?;
-        if !api_version.starts_with("ray.io/") {
-            bail!("apiVersion must be in the ray.io group, got {api_version:?}");
+        if api_version != "batch/v1" {
+            bail!("apiVersion must be batch/v1, got {api_version:?}");
         }
         let name = manifest
             .pointer("/metadata/name")
@@ -130,7 +130,7 @@ impl SessionTemplate {
     /// `metadata.name`, `metadata.namespace`, and the max-exec-time label
     /// (injected with `max_exec_seconds` when the chart left it unset; an
     /// explicitly chart-set value is kept). Everything else is verbatim —
-    /// the chart owns the cluster shape.
+    /// the chart owns the Job shape.
     pub fn render(&self, cluster_name: &str, namespace: &str, max_exec_seconds: u64) -> Value {
         let mut out = self.manifest.clone();
         // Validation guarantees these paths exist as objects/strings.
@@ -157,8 +157,8 @@ mod tests {
 
     fn good_manifest() -> Value {
         json!({
-            "apiVersion": "ray.io/v1",
-            "kind": "RayCluster",
+            "apiVersion": "batch/v1",
+            "kind": "Job",
             "metadata": {
                 "name": "jump-cannon-compute",
                 "namespace": "gpu-workloads",
@@ -167,7 +167,7 @@ mod tests {
                     "app.kubernetes.io/name": "jump-cannon"
                 }
             },
-            "spec": { "headGroupSpec": {} }
+            "spec": { "suspend": true, "completions": 1 }
         })
     }
 
@@ -180,14 +180,14 @@ mod tests {
     #[test]
     fn validate_rejects_wrong_kind() {
         let mut m = good_manifest();
-        m["kind"] = json!("RayJob");
+        m["kind"] = json!("Deployment");
         let err = SessionTemplate::validate(&m, "jump-cannon-compute", "gpu-workloads")
             .expect_err("wrong kind must fail");
-        assert!(err.to_string().contains("RayCluster"), "{err}");
+        assert!(err.to_string().contains("Job"), "{err}");
     }
 
     #[test]
-    fn validate_rejects_non_ray_group() {
+    fn validate_rejects_non_batch_group() {
         let mut m = good_manifest();
         m["apiVersion"] = json!("apps/v1");
         assert!(
@@ -248,10 +248,8 @@ mod tests {
         );
         assert_eq!(label(&stamped, MAX_EXEC_LABEL), Some("14400"));
         // Untouched fields survive verbatim (chart owns the shape).
-        assert_eq!(
-            stamped.pointer("/spec/headGroupSpec"),
-            Some(&json!({}))
-        );
+        assert_eq!(stamped.pointer("/spec/suspend"), Some(&json!(true)));
+        assert_eq!(stamped.pointer("/spec/completions"), Some(&json!(1)));
         // The template itself is not mutated by render.
         assert!(label(&template.manifest, MAX_EXEC_LABEL).is_none());
     }
@@ -276,7 +274,7 @@ mod tests {
         assert!(SessionTemplate::load(&missing, "a", "b").is_err());
         // Parses as YAML but fails validation (name/namespace mismatch).
         let invalid = dir.join("invalid.yaml");
-        std::fs::write(&invalid, "kind: RayCluster\n").expect("write");
+        std::fs::write(&invalid, "kind: Deployment\n").expect("write");
         assert!(SessionTemplate::load(&invalid, "a", "b").is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -285,10 +283,10 @@ mod tests {
     fn load_templated_accepts_placeholder_name_and_stamps_per_world() {
         let dir = std::env::temp_dir().join(format!("gpu-world-template-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("mkdir");
-        let path = dir.join("raycluster.yaml");
+        let path = dir.join("compute-job.yaml");
         std::fs::write(
             &path,
-            "apiVersion: ray.io/v1\nkind: RayCluster\nmetadata:\n  name: __world__\n  namespace: gpu-workloads\n  labels:\n    kueue.x-k8s.io/queue-name: gpu\nspec: {}\n",
+            "apiVersion: batch/v1\nkind: Job\nmetadata:\n  name: __world__\n  namespace: gpu-workloads\n  labels:\n    kueue.x-k8s.io/queue-name: gpu\nspec: {}\n",
         )
         .expect("write");
         let template =
@@ -319,10 +317,10 @@ mod tests {
     fn load_accepts_chart_yaml_rendering() {
         let dir = std::env::temp_dir().join(format!("gpu-session-template-yaml-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("mkdir");
-        let path = dir.join("raycluster.yaml");
+        let path = dir.join("compute-job.yaml");
         std::fs::write(
             &path,
-            "apiVersion: ray.io/v1\nkind: RayCluster\nmetadata:\n  name: jump-cannon-compute\n  namespace: gpu-workloads\n  labels:\n    kueue.x-k8s.io/queue-name: gpu\nspec: {}\n",
+            "apiVersion: batch/v1\nkind: Job\nmetadata:\n  name: jump-cannon-compute\n  namespace: gpu-workloads\n  labels:\n    kueue.x-k8s.io/queue-name: gpu\nspec: {}\n",
         )
         .expect("write");
         let template = SessionTemplate::load(&path, "jump-cannon-compute", "gpu-workloads")

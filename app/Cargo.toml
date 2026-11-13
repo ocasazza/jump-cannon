@@ -15,6 +15,7 @@
 #   [patch."https://github.com/ocasazza/panel-kit"]
 #   panel-kit = { path = "../../panel-kit" }
 
+
 #
 # Deliberately a *separate* workspace from the repo root: the main workspace
 # builds through nix + crane and must not absorb the Tauri/Dioxus dependency

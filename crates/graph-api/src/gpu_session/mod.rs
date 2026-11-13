@@ -1,20 +1,24 @@
 //! On-demand GPU compute session controller.
 //!
-//! Owns the lifecycle of the session RayCluster CR in the compute namespace:
-//! dispatch when a user picks a cluster engine (or explicitly), live state
-//! derivation from cluster objects + broker status (Q3, see [`observe`]),
-//! idle auto-park (Q5), a controller-side hard session cap, and head-pod log
-//! surfacing into the `gpu-session` progress group (Q7, see [`logs`]).
+//! Owns the lifecycle of the session's compute Job and its Service in the
+//! compute namespace: dispatch when a user picks a cluster engine (or
+//! explicitly), live state derivation from the Job, its Kueue Workload, and
+//! the Job's pod plus broker status (Q3, see [`observe`]), idle auto-park
+//! (Q5), a controller-side hard session cap, and compute-pod log surfacing
+//! into the `gpu-session` progress group (Q7, see [`logs`]).
 //!
-//! Kueue/KubeRay ground truth honoured here:
-//! - `spec.suspend` is NEVER touched — Kueue owns it while admitted.
-//! - Park = DELETE the RayCluster CR (pods GC via owner refs, quota freed).
-//! - Dispatch = POST a fresh CR stamped from the chart-rendered template
-//!   (see [`template`]); `AlreadyExists` while the old CR finalizes is
-//!   absorbed by the `Parking`/`Dispatching` states.
+//! Kueue ground truth honoured here:
+//! - `spec.suspend` is NEVER touched — Kueue owns it (the chart creates the
+//!   Job suspended; Kueue unsuspends on admission and re-suspends on
+//!   preemption, re-queuing the Workload).
+//! - Park = DELETE the Job with background propagation (pods die with it,
+//!   quota is freed), then the Service.
+//! - Dispatch = POST the Service, then a fresh Job stamped from the
+//!   chart-rendered template (see [`template`]); `AlreadyExists` while the
+//!   old Job finalizes is absorbed by the `Parking`/`Dispatching` states.
 //!
 //! All kube access goes through the dynamic API (`serde_json::Value`) for
-//! RayCluster/Workload and typed reads for core pods/pods/log (R12). Every
+//! Job/Workload and typed reads/writes for core pods/Services/pods/log (R12). Every
 //! kube call is timeout-bound; nothing in the handler or controller paths
 //! panics.
 
@@ -22,19 +26,27 @@ pub mod logs;
 pub mod observe;
 pub mod template;
 
+use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Context};
-use kube::api::{Api, ApiResource, DeleteParams, DynamicObject, GroupVersionKind, ListParams, PostParams};
+use k8s_openapi::api::core::v1::{Service, ServicePort, ServiceSpec};
+use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
+use k8s_openapi::jiff::Timestamp;
+use kube::api::{
+    Api, ApiResource, DeleteParams, DynamicObject, GroupVersionKind, ListParams, ObjectMeta,
+    PostParams,
+};
 use kube::Client;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use crate::compute_broker::{BrokerStatus, ComputeBroker};
 use crate::progress::{ProgressLog, TaskId};
 
 use logs::LogTailer;
-use observe::{BrokerFacts, DeriveInput, HeadPodFacts, RayClusterFacts, WorkloadFacts};
+use observe::{BrokerFacts, ComputePodFacts, DeriveInput, JobFacts, WorkloadFacts};
 use template::SessionTemplate;
 
 /// Reconcile tick while the session is anything but parked (Q3 ~2s).
@@ -43,15 +55,24 @@ const ACTIVE_TICK: Duration = Duration::from_secs(2);
 const PARKED_TICK: Duration = Duration::from_secs(30);
 /// Bound on every kube API call.
 const KUBE_TIMEOUT: Duration = Duration::from_secs(10);
-/// Log-tail cadence while a head pod exists (Q7).
+/// Log-tail cadence while a compute pod exists (Q7).
 const LOG_POLL: Duration = Duration::from_secs(5);
-/// How long a crash-looping CR is kept so the tailer can capture logs before
+/// How long a crash-looping Job is kept so the tailer can capture logs before
 /// the auto-park delete (Q8).
 const FAILURE_LOG_GRACE: Duration = Duration::from_secs(60);
 /// Parking longer than this emits periodic warn events; finalizers are NEVER
 /// force-removed (Q8).
 const PARKING_WARN_AFTER: Duration = Duration::from_secs(5 * 60);
 const PARKING_WARN_EVERY: Duration = Duration::from_secs(60);
+
+/// Label the Job controller stamps on every pod of a Job; the Service
+/// selects the session's pod through it.
+const JOB_NAME_LABEL: &str = "batch.kubernetes.io/job-name";
+/// Name of the container port the chart declares for graph-compute's gRPC
+/// server (the Service's `targetPort`).
+const GRPC_PORT_NAME: &str = "grpc";
+/// Label prefix owned by Kueue; never copied onto the Service.
+const KUEUE_LABEL_PREFIX: &str = "kueue.x-k8s.io/";
 
 /// Observed session state (Q3). Serialized snake_case on the wire.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -61,7 +82,7 @@ pub enum SessionState {
     Dispatching,
     Queued,
     Admitted,
-    HeadStarting,
+    Starting,
     Ready,
     Parking,
     Failed,
@@ -74,7 +95,7 @@ impl SessionState {
             SessionState::Dispatching => "dispatching",
             SessionState::Queued => "queued",
             SessionState::Admitted => "admitted",
-            SessionState::HeadStarting => "head_starting",
+            SessionState::Starting => "starting",
             SessionState::Ready => "ready",
             SessionState::Parking => "parking",
             SessionState::Failed => "failed",
@@ -87,8 +108,8 @@ impl SessionState {
             SessionState::Parked => "GPU session parked",
             SessionState::Dispatching => "Dispatch GPU session",
             SessionState::Queued => "GPU session queued",
-            SessionState::Admitted => "GPU session admitted; starting head pod",
-            SessionState::HeadStarting => "GPU head running; waiting for worker",
+            SessionState::Admitted => "GPU session admitted; starting compute pod",
+            SessionState::Starting => "Compute pod running; waiting for the worker",
             SessionState::Ready => "GPU session ready",
             SessionState::Parking => "Parking GPU session",
             SessionState::Failed => "GPU session failed",
@@ -110,13 +131,17 @@ pub enum Desired {
 
 /// Static configuration for the session controller (from clap flags / env).
 pub struct GpuSessionConfig {
+    /// Name of the session Job and of the Service that fronts it.
     pub cluster_name: String,
     pub namespace: String,
     pub template: SessionTemplate,
+    /// graph-compute gRPC port the Service exposes.
+    pub compute_port: u16,
     pub idle_timeout: Duration,
     pub admission_timeout: Duration,
     pub max_session: Duration,
-    pub head_start_timeout: Duration,
+    /// Admitted/starting longer than this fails the session.
+    pub start_timeout: Duration,
 }
 
 /// `GET /compute/session` payload when the feature is enabled (exact wire
@@ -153,12 +178,12 @@ struct Shared {
     episode_started: Option<Instant>,
     /// When the failure latched (crashloop log-grace clock).
     failed_at: Option<Instant>,
-    /// Delete already issued for the current CR (awaiting NotFound).
+    /// Delete already issued for the current Job (awaiting NotFound).
     delete_issued: bool,
-    /// We have observed a CR in this episode — distinguishes "never
+    /// We have observed a Job in this episode — distinguishes "never
     /// created" (dispatch should create) from "deleted under us" (Q8:
     /// external delete → surface + park, not silent redispatch).
-    had_cluster: bool,
+    had_job: bool,
     parking_since: Option<Instant>,
     last_parking_warn: Option<Instant>,
     /// Open progress task for the current lifecycle, if any.
@@ -178,7 +203,7 @@ impl Shared {
             episode_started: None,
             failed_at: None,
             delete_issued: false,
-            had_cluster: false,
+            had_job: false,
             parking_since: None,
             last_parking_warn: None,
             task: None,
@@ -204,7 +229,7 @@ pub struct GpuSessionHandle {
 
 impl GpuSessionHandle {
     /// Build the controller and spawn its reconcile loop. Boot-adoption (Q8:
-    /// a pre-existing CR is adopted with desired=Running) happens on the
+    /// a pre-existing Job is adopted with desired=Running) happens on the
     /// loop's first tick.
     pub fn spawn(
         config: GpuSessionConfig,
@@ -279,7 +304,7 @@ impl GpuSessionHandle {
                         &mut shared,
                         &self.inner.progress,
                         SessionState::Dispatching,
-                        Some("creating RayCluster".to_string()),
+                        Some("creating compute Job".to_string()),
                     );
                 }
             }
@@ -436,40 +461,45 @@ impl Controller {
         last_log_poll: &mut Instant,
     ) -> anyhow::Result<()> {
         // --- Observe (IO half; every call timeout-bound) ---
-        let raycluster = match self.get_raycluster().await {
-            Ok(rc) => rc,
+        let job = match self.get_job().await {
+            Ok(j) => j,
             Err(e) => {
                 // Observation failure must not flap the state machine; keep
                 // the cached state and retry next tick.
-                tracing::warn!(error = %format!("{e:#}"), "gpu session: RayCluster get failed");
+                tracing::warn!(error = %format!("{e:#}"), "gpu session: Job get failed");
                 return Ok(());
             }
         };
 
-        // Boot adoption (Q8): a pre-existing, non-terminating CR means we
+        // Boot adoption (Q8): a pre-existing, non-terminating Job means we
         // restarted mid-session — adopt it as desired=Running with a fresh
-        // idle timer.
+        // idle timer, and make sure its Service still exists.
         if initial {
-            if let Some(rc) = &raycluster {
-                if !rc.terminating {
-                    let mut shared = self.shared.lock().expect("gpu session lock");
-                    shared.desired = Desired::Running;
-                    shared.last_activity = Instant::now();
-                    shared.episode_started = Some(Instant::now());
-                    drop(shared);
-                    tracing::info!("gpu session: adopted pre-existing RayCluster");
+            if let Some(j) = &job {
+                if !j.terminating {
+                    {
+                        let mut shared = self.shared.lock().expect("gpu session lock");
+                        shared.desired = Desired::Running;
+                        shared.last_activity = Instant::now();
+                        shared.episode_started = Some(Instant::now());
+                    }
+                    tracing::info!("gpu session: adopted pre-existing compute Job");
+                    let (_, service) = self.stamped();
+                    if let Err(e) = self.ensure_service(&service).await {
+                        tracing::warn!(error = %format!("{e:#}"), "gpu session: adopted Job's Service check failed");
+                    }
                 }
             }
         }
 
-        let workload = match &raycluster {
-            Some(rc) if !rc.terminating => self.get_workload(&rc.uid).await?,
+        let workload = match &job {
+            Some(j) if !j.terminating => self.get_workload(&j.uid).await?,
             _ => None,
         };
-        // The head pod is also fetched while the CR is terminating so the
+        // The compute pod is also fetched while the Job is terminating so the
         // tailer keeps working through the Parking state (Q7).
-        let head_pod = match &raycluster {
-            Some(_) => self.get_head_pod().await?,
+        let compute_pod = match &job {
+            Some(_) => self.get_compute_pod().await?,
             None => None,
         };
         let broker = self.broker.status().await;
@@ -482,9 +512,9 @@ impl Controller {
 
         let derived = observe::derive(&DeriveInput {
             desired,
-            raycluster: raycluster.clone(),
+            job: job.clone(),
             workload: workload.clone(),
-            head_pod: head_pod.clone(),
+            compute_pod: compute_pod.clone(),
             broker: BrokerFacts {
                 connected: broker.connected,
                 worker_ok: broker.worker_ok,
@@ -511,8 +541,8 @@ impl Controller {
                 tracing::warn!(reason = %reason, "gpu session failed");
                 shared.failure_reason = Some(reason.clone());
                 shared.failed_at = Some(Instant::now());
-                // Q8: quota never granted / evicted → Fail event + auto-park
-                // (don't leave a pending Workload). Crashloop holds the CR
+                // Q8: quota never granted / deactivated → Fail event + auto-park
+                // (don't leave a pending Workload). Crashloop holds the Job
                 // for the log-grace window; that delete fires below once the
                 // grace elapses.
                 if !reason.contains("crash-looping") {
@@ -523,8 +553,8 @@ impl Controller {
 
             transition(&mut shared, &self.progress, derived.state, derived.detail.clone());
 
-            if raycluster.is_some() {
-                shared.had_cluster = true;
+            if job.is_some() {
+                shared.had_job = true;
             }
 
             match derived.state {
@@ -537,7 +567,7 @@ impl Controller {
                         .as_deref()
                         .is_some_and(|r| r.contains("crash-looping"))
                         && !grace_elapsed;
-                    if raycluster.is_some() && !shared.delete_issued && !crashloop_hold {
+                    if job.is_some() && !shared.delete_issued && !crashloop_hold {
                         // Crashloop log-grace elapsed (other failures already
                         // parked in the latch block above): auto-park now.
                         shared.desired = Desired::Parked;
@@ -545,15 +575,15 @@ impl Controller {
                         action = PostAction::Delete;
                     }
                 }
-                // Head-start timeout: admitted/head_starting stuck past the
-                // limit fails the session (the pod is up but the worker never
-                // came healthy — usually a crash the pod-level checks miss).
-                SessionState::Admitted | SessionState::HeadStarting
-                    if shared.state_since.elapsed() >= self.config.head_start_timeout =>
+                // Start timeout: admitted/starting stuck past the limit fails
+                // the session (the pod is up but the worker never came
+                // healthy — usually a crash the pod-level checks miss).
+                SessionState::Admitted | SessionState::Starting
+                    if shared.state_since.elapsed() >= self.config.start_timeout =>
                 {
                     let reason = format!(
-                        "head pod did not become ready within {}s",
-                        self.config.head_start_timeout.as_secs()
+                        "compute pod did not become ready within {}s",
+                        self.config.start_timeout.as_secs()
                     );
                     tracing::warn!(reason = %reason, "gpu session failed");
                     shared.failure_reason = Some(reason.clone());
@@ -561,27 +591,27 @@ impl Controller {
                     shared.desired = Desired::Parked;
                     shared.episode_started = None;
                     transition(&mut shared, &self.progress, SessionState::Failed, Some(reason));
-                    if raycluster.is_some() && !shared.delete_issued {
+                    if job.is_some() && !shared.delete_issued {
                         action = PostAction::Delete;
                     }
                 }
                 _ => {
                     if shared.desired == Desired::Running
-                        && raycluster.is_none()
+                        && job.is_none()
                         && !shared.delete_issued
                     {
-                        if shared.had_cluster {
-                            // The CR vanished under us (eviction /
-                            // max-exec-time / janitor) — surface and park
-                            // instead of silently re-dispatching (Q8).
+                        if shared.had_job {
+                            // The Job vanished under us (manual delete,
+                            // janitor) — surface and park instead of
+                            // silently re-dispatching (Q8).
                             action = PostAction::ExternalDeletePark;
                         } else {
                             action = PostAction::Create;
                         }
                     } else if shared.desired == Desired::Parked
-                        && raycluster
+                        && job
                             .as_ref()
-                            .is_some_and(|rc| !rc.terminating)
+                            .is_some_and(|j| !j.terminating)
                         && !shared.delete_issued
                     {
                         action = PostAction::Delete;
@@ -600,7 +630,7 @@ impl Controller {
                 if stale && due {
                     self.progress.warn(
                         logs::LOG_GROUP,
-                        "RayCluster stuck terminating for over 5 minutes; \
+                        "compute Job stuck terminating for over 5 minutes; \
                          waiting on finalizers (never force-removing)",
                     );
                     shared.last_parking_warn = Some(Instant::now());
@@ -610,11 +640,11 @@ impl Controller {
                 shared.last_parking_warn = None;
             }
 
-            // CR fully gone → a fresh dispatch may create again.
-            if raycluster.is_none() {
+            // Job fully gone → a fresh dispatch may create again.
+            if job.is_none() {
                 shared.delete_issued = false;
                 if shared.desired == Desired::Parked {
-                    shared.had_cluster = false;
+                    shared.had_job = false;
                 }
             }
 
@@ -662,18 +692,18 @@ impl Controller {
         // --- Act (IO, lock released) ---
         match action {
             PostAction::None => {}
-            PostAction::Create => match self.create_raycluster().await {
+            PostAction::Create => match self.create_session().await {
                 Ok(()) => {
                     self.progress.info(
                         logs::LOG_GROUP,
-                        "RayCluster created; waiting for Kueue admission",
+                        "compute Job created; waiting for Kueue admission",
                     );
                 }
                 Err(e) => {
                     tracing::warn!(error = %format!("{e:#}"), "gpu session: create failed; retrying next tick");
                 }
             },
-            PostAction::Delete => match self.delete_raycluster().await {
+            PostAction::Delete => match self.delete_session().await {
                 Ok(()) => {
                     self.shared
                         .lock()
@@ -685,37 +715,40 @@ impl Controller {
                 }
             },
             PostAction::ExternalDeletePark => {
-                let mut shared = self.shared.lock().expect("gpu session lock");
-                shared.had_cluster = false;
-                shared.desired = Desired::Parked;
-                shared.episode_started = None;
-                if shared.failure_reason.is_none() {
-                    shared.failure_reason = Some(
-                        "RayCluster deleted externally (evicted, max-exec-time, or janitor)"
-                            .to_string(),
-                    );
-                }
-                let reason = shared
-                    .failure_reason
-                    .clone()
-                    .unwrap_or_else(|| "cluster deleted externally".into());
+                let reason = {
+                    let mut shared = self.shared.lock().expect("gpu session lock");
+                    shared.had_job = false;
+                    shared.desired = Desired::Parked;
+                    shared.episode_started = None;
+                    if shared.failure_reason.is_none() {
+                        shared.failure_reason = Some("compute Job deleted externally".to_string());
+                    }
+                    shared
+                        .failure_reason
+                        .clone()
+                        .unwrap_or_else(|| "Job deleted externally".into())
+                };
                 self.progress.warn(logs::LOG_GROUP, reason);
+                // The Service belonged to the vanished Job.
+                if let Err(e) = self.delete_service().await {
+                    tracing::warn!(error = %format!("{e:#}"), "gpu session: Service cleanup after external delete failed");
+                }
             }
         }
 
-        // Head-pod log tailing (Q7) on its own 5s cadence. Failed is
+        // Compute-pod log tailing (Q7) on its own 5s cadence. Failed is
         // included so the crashloop log-grace window actually captures logs.
         let tail_states = matches!(
             derived.state,
             SessionState::Admitted
-                | SessionState::HeadStarting
+                | SessionState::Starting
                 | SessionState::Ready
                 | SessionState::Parking
                 | SessionState::Failed
         );
         if tail_states && last_log_poll.elapsed() >= LOG_POLL {
-            if let Some(head) = &head_pod {
-                tailer.poll(head).await;
+            if let Some(pod) = &compute_pod {
+                tailer.poll(pod).await;
                 *last_log_poll = Instant::now();
             }
         }
@@ -723,8 +756,8 @@ impl Controller {
         Ok(())
     }
 
-    fn raycluster_api(&self) -> Api<DynamicObject> {
-        let gvk = GroupVersionKind::gvk("ray.io", "v1", "RayCluster");
+    fn job_api(&self) -> Api<DynamicObject> {
+        let gvk = GroupVersionKind::gvk("batch", "v1", "Job");
         Api::namespaced_with(
             self.client.clone(),
             &self.config.namespace,
@@ -734,9 +767,10 @@ impl Controller {
 
     /// Kueue Workloads are read at `v1beta2`: it is the storage version since
     /// Kueue 0.15 and the only version served from 0.20 onward (`v1beta1` is
-    /// `served: false`). The fields read below — `metadata.ownerReferences`
-    /// and `status.conditions[].{type,status,message}` with the `Admitted` /
-    /// `Evicted` types — are identical in both versions.
+    /// `served: false`). The fields read — `metadata.ownerReferences`,
+    /// `spec.active`, and `status.conditions[].{type,status,reason,message,
+    /// lastTransitionTime}` for `QuotaReserved` / `Admitted` / `Evicted` /
+    /// `Finished` — are identical in both versions.
     fn workload_api(&self) -> Api<DynamicObject> {
         let gvk = GroupVersionKind::gvk("kueue.x-k8s.io", "v1beta2", "Workload");
         Api::namespaced_with(
@@ -746,39 +780,21 @@ impl Controller {
         )
     }
 
-    async fn get_raycluster(&self) -> anyhow::Result<Option<RayClusterFacts>> {
-        let api = self.raycluster_api();
-        let name = &self.config.cluster_name;
-        match tokio::time::timeout(KUBE_TIMEOUT, api.get(name)).await {
-            Ok(Ok(obj)) => {
-                let uid = obj
-                    .metadata
-                    .uid
-                    .clone()
-                    .ok_or_else(|| anyhow!("RayCluster has no uid"))?;
-                let age = obj
-                    .metadata
-                    .creation_timestamp
-                    .as_ref()
-                    .map(|t| {
-                        let elapsed =
-                            k8s_openapi::jiff::Timestamp::now().duration_since(t.0);
-                        std::time::Duration::try_from(elapsed).unwrap_or_default()
-                    })
-                    .unwrap_or_default();
-                Ok(Some(RayClusterFacts {
-                    uid,
-                    terminating: obj.metadata.deletion_timestamp.is_some(),
-                    age,
-                }))
-            }
+    fn service_api(&self) -> Api<Service> {
+        Api::namespaced(self.client.clone(), &self.config.namespace)
+    }
+
+    async fn get_job(&self) -> anyhow::Result<Option<JobFacts>> {
+        let api = self.job_api();
+        match tokio::time::timeout(KUBE_TIMEOUT, api.get(&self.config.cluster_name)).await {
+            Ok(Ok(obj)) => Ok(Some(observe::job_facts(&obj, Timestamp::now())?)),
             Ok(Err(kube::Error::Api(e))) if e.code == 404 => Ok(None),
-            Ok(Err(e)) => Err(e).context("get RayCluster"),
-            Err(_) => Err(anyhow!("get RayCluster timed out")),
+            Ok(Err(e)) => Err(e).context("get Job"),
+            Err(_) => Err(anyhow!("get Job timed out")),
         }
     }
 
-    /// Find the Kueue Workload owned by the RayCluster CR (ownerReferences
+    /// Find the Kueue Workload owned by the session Job (ownerReferences
     /// UID match) and extract its admission facts from conditions.
     async fn get_workload(&self, owner_uid: &str) -> anyhow::Result<Option<WorkloadFacts>> {
         let api = self.workload_api();
@@ -786,114 +802,187 @@ impl Controller {
             .await
             .map_err(|_| anyhow!("list Workloads timed out"))?
             .context("list Workloads")?;
-        for wl in &list.items {
-            let owned = wl
-                .metadata
-                .owner_references
-                .as_ref()
-                .is_some_and(|refs| refs.iter().any(|r| r.uid == owner_uid));
-            if !owned {
-                continue;
-            }
-            let conditions = wl
-                .data
-                .pointer("/status/conditions")
-                .and_then(serde_json::Value::as_array);
-            let mut facts = WorkloadFacts::default();
-            if let Some(conditions) = conditions {
-                for c in conditions {
-                    let ty = c.get("type").and_then(serde_json::Value::as_str);
-                    let status = c.get("status").and_then(serde_json::Value::as_str);
-                    match (ty, status) {
-                        (Some("Admitted"), Some("True")) => facts.admitted = true,
-                        (Some("Evicted"), Some("True")) => facts.evicted = true,
-                        _ => {}
-                    }
-                    if let Some(msg) = c.get("message").and_then(serde_json::Value::as_str) {
-                        if !msg.is_empty() {
-                            facts.message = Some(msg.to_string());
-                        }
-                    }
-                }
-            }
-            return Ok(Some(facts));
-        }
-        Ok(None)
+        Ok(observe::owned_workload(&list.items, owner_uid)
+            .map(|wl| observe::workload_facts(wl, Timestamp::now())))
     }
 
-    async fn get_head_pod(&self) -> anyhow::Result<Option<HeadPodFacts>> {
-        let pods = logs::list_head_pods(&self.client, &self.config.namespace, &self.config.cluster_name)
-            .await?;
-        Ok(pods.first().map(head_pod_facts))
+    async fn get_compute_pod(&self) -> anyhow::Result<Option<ComputePodFacts>> {
+        let pods = logs::list_compute_pods(
+            &self.client,
+            &self.config.namespace,
+            &self.config.cluster_name,
+        )
+        .await?;
+        Ok(observe::pick_current_pod(&pods).map(observe::compute_pod_facts))
     }
 
-    async fn create_raycluster(&self) -> anyhow::Result<()> {
-        let manifest = self.config.template.render(
+    /// The stamped Job manifest and the Service that fronts it.
+    fn stamped(&self) -> (Value, Service) {
+        let job = self.config.template.render(
             &self.config.cluster_name,
             &self.config.namespace,
             self.config.max_session.as_secs(),
         );
-        let obj: DynamicObject =
-            serde_json::from_value(manifest).context("template does not decode as DynamicObject")?;
-        let api = self.raycluster_api();
-        match tokio::time::timeout(KUBE_TIMEOUT, api.create(&PostParams::default(), &obj)).await {
+        let service = service_manifest(
+            &job,
+            &self.config.cluster_name,
+            &self.config.namespace,
+            self.config.compute_port,
+        );
+        (job, service)
+    }
+
+    /// Create the Service, or keep the existing one when it already routes
+    /// to this Job's pod; an existing Service with a different selector or
+    /// ports is replaced.
+    async fn ensure_service(&self, desired: &Service) -> anyhow::Result<()> {
+        let api = self.service_api();
+        let name = &self.config.cluster_name;
+        match tokio::time::timeout(KUBE_TIMEOUT, api.create(&PostParams::default(), desired)).await
+        {
+            Ok(Ok(_)) => return Ok(()),
+            Ok(Err(kube::Error::Api(e))) if e.code == 409 => {}
+            Ok(Err(e)) => return Err(e).context("create compute Service"),
+            Err(_) => return Err(anyhow!("create compute Service timed out")),
+        }
+
+        let existing = match tokio::time::timeout(KUBE_TIMEOUT, api.get(name)).await {
+            Ok(Ok(s)) => s,
+            Ok(Err(kube::Error::Api(e))) if e.code == 404 => {
+                return Err(anyhow!("compute Service vanished while ensuring it"))
+            }
+            Ok(Err(e)) => return Err(e).context("get compute Service"),
+            Err(_) => return Err(anyhow!("get compute Service timed out")),
+        };
+        if service_routes_like(&existing, desired) {
+            return Ok(());
+        }
+        tracing::warn!(service = %name, "gpu session: replacing compute Service whose selector/ports differ");
+        self.delete_service().await?;
+        match tokio::time::timeout(KUBE_TIMEOUT, api.create(&PostParams::default(), desired)).await
+        {
             Ok(Ok(_)) => Ok(()),
-            // Old CR still finalizing — the Dispatching state absorbs this;
-            // next tick retries.
-            Ok(Err(kube::Error::Api(e))) if e.code == 409 => Ok(()),
-            Ok(Err(e)) => Err(e).context("create RayCluster"),
-            Err(_) => Err(anyhow!("create RayCluster timed out")),
+            Ok(Err(e)) => Err(e).context("re-create compute Service"),
+            Err(_) => Err(anyhow!("re-create compute Service timed out")),
         }
     }
 
-    async fn delete_raycluster(&self) -> anyhow::Result<()> {
-        let api = self.raycluster_api();
+    /// Delete the Service; `NotFound` is absorbed.
+    async fn delete_service(&self) -> anyhow::Result<()> {
+        let api = self.service_api();
+        let name = &self.config.cluster_name;
+        match tokio::time::timeout(KUBE_TIMEOUT, api.delete(name, &DeleteParams::default())).await
+        {
+            Ok(Ok(_)) => Ok(()),
+            Ok(Err(kube::Error::Api(e))) if e.code == 404 => Ok(()),
+            Ok(Err(e)) => Err(e).context("delete compute Service"),
+            Err(_) => Err(anyhow!("delete compute Service timed out")),
+        }
+    }
+
+    /// Dispatch: Service first (so the DNS name exists before the pod), then
+    /// the suspended Job Kueue admits.
+    async fn create_session(&self) -> anyhow::Result<()> {
+        let (job, service) = self.stamped();
+        self.ensure_service(&service).await?;
+        let obj: DynamicObject =
+            serde_json::from_value(job).context("template does not decode as DynamicObject")?;
+        let api = self.job_api();
+        match tokio::time::timeout(KUBE_TIMEOUT, api.create(&PostParams::default(), &obj)).await {
+            Ok(Ok(_)) => Ok(()),
+            // Old Job still finalizing — the Dispatching state absorbs this;
+            // next tick retries.
+            Ok(Err(kube::Error::Api(e))) if e.code == 409 => Ok(()),
+            Ok(Err(e)) => Err(e).context("create Job"),
+            Err(_) => Err(anyhow!("create Job timed out")),
+        }
+    }
+
+    /// Park: delete the Job (releases the quota), then the Service. A failed
+    /// Service delete is only logged — the leftover Service has no endpoints
+    /// and the next dispatch reuses it.
+    async fn delete_session(&self) -> anyhow::Result<()> {
+        self.delete_job().await?;
+        if let Err(e) = self.delete_service().await {
+            tracing::warn!(error = %format!("{e:#}"), "gpu session: compute Service delete failed; the next dispatch reuses it");
+        }
+        Ok(())
+    }
+
+    async fn delete_job(&self) -> anyhow::Result<()> {
+        let api = self.job_api();
         let name = self.config.cluster_name.clone();
-        match tokio::time::timeout(KUBE_TIMEOUT, api.delete(&name, &DeleteParams::default())).await
+        // Background cascade: pods die with the Job; quota frees immediately.
+        match tokio::time::timeout(
+            KUBE_TIMEOUT,
+            api.delete(&name, &DeleteParams::background()),
+        )
+        .await
         {
             Ok(Ok(_)) => {
                 self.progress
-                    .info(logs::LOG_GROUP, "RayCluster delete issued (parking)");
+                    .info(logs::LOG_GROUP, "compute Job delete issued (parking)");
                 Ok(())
             }
             Ok(Err(kube::Error::Api(e))) if e.code == 404 => Ok(()),
-            Ok(Err(e)) => Err(e).context("delete RayCluster"),
-            Err(_) => Err(anyhow!("delete RayCluster timed out")),
+            Ok(Err(e)) => Err(e).context("delete Job"),
+            Err(_) => Err(anyhow!("delete Job timed out")),
         }
     }
 }
 
-/// Extract head-pod facts from a typed Pod (pure; unit-tested below).
-fn head_pod_facts(pod: &k8s_openapi::api::core::v1::Pod) -> HeadPodFacts {
-    let status = pod.status.as_ref();
-    let running = status
-        .and_then(|s| s.phase.as_deref())
-        .is_some_and(|p| p == "Running");
-    let mut crash_loop_back_off = false;
-    let mut restart_count = 0u32;
-    for cs in status
-        .and_then(|s| s.container_statuses.as_ref())
+/// ClusterIP Service fronting the session Job's gRPC port. It selects the
+/// Job's pod by the Job controller's `job-name` label and inherits the
+/// stamped Job's labels minus Kueue's.
+fn service_manifest(job: &Value, name: &str, namespace: &str, port: u16) -> Service {
+    let labels: BTreeMap<String, String> = job
+        .pointer("/metadata/labels")
+        .and_then(Value::as_object)
         .into_iter()
         .flatten()
-    {
-        restart_count = restart_count.saturating_add(cs.restart_count.max(0) as u32);
-        if cs
-            .state
-            .as_ref()
-            .and_then(|s| s.waiting.as_ref())
-            .and_then(|w| w.reason.as_deref())
-            .is_some_and(|r| r == "CrashLoopBackOff")
-        {
-            crash_loop_back_off = true;
-        }
+        .filter(|(key, _)| !key.starts_with(KUEUE_LABEL_PREFIX))
+        .filter_map(|(key, value)| value.as_str().map(|v| (key.clone(), v.to_string())))
+        .collect();
+    Service {
+        metadata: ObjectMeta {
+            name: Some(name.to_string()),
+            namespace: Some(namespace.to_string()),
+            labels: Some(labels),
+            ..Default::default()
+        },
+        spec: Some(ServiceSpec {
+            type_: Some("ClusterIP".to_string()),
+            selector: Some(BTreeMap::from([(
+                JOB_NAME_LABEL.to_string(),
+                name.to_string(),
+            )])),
+            ports: Some(vec![ServicePort {
+                name: Some(GRPC_PORT_NAME.to_string()),
+                port: i32::from(port),
+                target_port: Some(IntOrString::String(GRPC_PORT_NAME.to_string())),
+                protocol: Some("TCP".to_string()),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        }),
+        status: None,
     }
-    HeadPodFacts {
-        name: pod.metadata.name.clone().unwrap_or_default(),
-        uid: pod.metadata.uid.clone().unwrap_or_default(),
-        running,
-        crash_loop_back_off,
-        restart_count,
-    }
+}
+
+/// True when `existing` already routes like `desired`: same selector and the
+/// same port → targetPort pairs.
+fn service_routes_like(existing: &Service, desired: &Service) -> bool {
+    let (Some(e), Some(d)) = (&existing.spec, &desired.spec) else {
+        return false;
+    };
+    let ports = |s: &ServiceSpec| {
+        s.ports
+            .iter()
+            .flatten()
+            .map(|p| (p.port, p.target_port.clone()))
+            .collect::<Vec<_>>()
+    };
+    e.selector == d.selector && ports(e) == ports(d)
 }
 
 fn unix_ms() -> u64 {
@@ -906,54 +995,96 @@ fn unix_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use k8s_openapi::api::core::v1::{ContainerState, ContainerStateWaiting, ContainerStatus, Pod, PodStatus};
+    use serde_json::json;
 
-    fn pod(phase: &str, waiting: Option<&str>, restarts: i32) -> Pod {
-        Pod {
-            metadata: kube::api::ObjectMeta {
-                name: Some("head-0".into()),
-                uid: Some("uid-9".into()),
-                ..Default::default()
-            },
-            status: Some(PodStatus {
-                phase: Some(phase.into()),
-                container_statuses: Some(vec![ContainerStatus {
-                    name: "ray-head".into(),
-                    ready: false,
-                    restart_count: restarts,
-                    image: "img".into(),
-                    image_id: String::new(),
-                    started: None,
-                    state: Some(ContainerState {
-                        waiting: waiting.map(|r| ContainerStateWaiting {
-                            reason: Some(r.into()),
-                            message: None,
-                        }),
-                        ..Default::default()
-                    }),
-                    ..Default::default()
-                }]),
-                ..Default::default()
-            }),
-            ..Default::default()
+    fn stamped_job() -> Value {
+        json!({
+            "apiVersion": "batch/v1",
+            "kind": "Job",
+            "metadata": {
+                "name": "jump-cannon-alpha",
+                "namespace": "gpu-workloads",
+                "labels": {
+                    "app.kubernetes.io/name": "jump-cannon",
+                    "app.kubernetes.io/component": "graph-compute",
+                    "kueue.x-k8s.io/queue-name": "gpu",
+                    "kueue.x-k8s.io/priority-class": "batch",
+                    "kueue.x-k8s.io/max-exec-time-seconds": "14400"
+                }
+            }
+        })
+    }
+
+    #[test]
+    fn session_state_wire_names_match_as_str() {
+        for state in [
+            SessionState::Parked,
+            SessionState::Dispatching,
+            SessionState::Queued,
+            SessionState::Admitted,
+            SessionState::Starting,
+            SessionState::Ready,
+            SessionState::Parking,
+            SessionState::Failed,
+        ] {
+            assert_eq!(
+                serde_json::to_value(state).expect("serialize"),
+                Value::String(state.as_str().to_string())
+            );
         }
+        assert_eq!(SessionState::Starting.as_str(), "starting");
     }
 
     #[test]
-    fn head_pod_facts_running() {
-        let f = head_pod_facts(&pod("Running", None, 0));
-        assert!(f.running);
-        assert!(!f.crash_loop_back_off);
-        assert_eq!(f.restart_count, 0);
-        assert_eq!(f.name, "head-0");
+    fn service_manifest_selects_the_job_pod() {
+        let svc = service_manifest(&stamped_job(), "jump-cannon-alpha", "gpu-workloads", 50051);
+        assert_eq!(svc.metadata.name.as_deref(), Some("jump-cannon-alpha"));
+        assert_eq!(svc.metadata.namespace.as_deref(), Some("gpu-workloads"));
+        let spec = svc.spec.expect("spec");
+        assert_eq!(spec.type_.as_deref(), Some("ClusterIP"));
+        assert_eq!(
+            spec.selector,
+            Some(BTreeMap::from([(
+                "batch.kubernetes.io/job-name".to_string(),
+                "jump-cannon-alpha".to_string()
+            )]))
+        );
+        let port = &spec.ports.expect("ports")[0];
+        assert_eq!(port.name.as_deref(), Some("grpc"));
+        assert_eq!(port.port, 50051);
+        assert_eq!(port.target_port, Some(IntOrString::String("grpc".into())));
     }
 
     #[test]
-    fn head_pod_facts_crashloop() {
-        let f = head_pod_facts(&pod("Pending", Some("CrashLoopBackOff"), 7));
-        assert!(!f.running);
-        assert!(f.crash_loop_back_off);
-        assert_eq!(f.restart_count, 7);
+    fn service_manifest_inherits_job_labels_without_kueue_ones() {
+        let svc = service_manifest(&stamped_job(), "jump-cannon-alpha", "gpu-workloads", 50051);
+        let labels = svc.metadata.labels.expect("labels");
+        assert_eq!(
+            labels.get("app.kubernetes.io/component").map(String::as_str),
+            Some("graph-compute")
+        );
+        assert!(labels.keys().all(|k| !k.starts_with("kueue.x-k8s.io/")), "{labels:?}");
+    }
+
+    #[test]
+    fn service_routes_like_detects_selector_and_port_drift() {
+        let desired = service_manifest(&stamped_job(), "jump-cannon-alpha", "gpu-workloads", 50051);
+        let mut same = desired.clone();
+        // Server-populated fields do not matter.
+        same.spec.as_mut().expect("spec").cluster_ip = Some("10.0.0.7".into());
+        assert!(service_routes_like(&same, &desired));
+
+        let mut other_selector = desired.clone();
+        other_selector.spec.as_mut().expect("spec").selector =
+            Some(BTreeMap::from([("some.other/label".to_string(), "x".to_string())]));
+        assert!(!service_routes_like(&other_selector, &desired));
+
+        let other_port = service_manifest(&stamped_job(), "jump-cannon-alpha", "gpu-workloads", 9);
+        assert!(!service_routes_like(&other_port, &desired));
+
+        let mut no_spec = desired.clone();
+        no_spec.spec = None;
+        assert!(!service_routes_like(&no_spec, &desired));
     }
 
     #[test]
@@ -977,7 +1108,7 @@ mod tests {
             &mut shared,
             &progress,
             SessionState::Dispatching,
-            Some("creating RayCluster".into()),
+            Some("creating compute Job".into()),
         );
         assert!(shared.task.is_some());
         let events = progress.since(0).events;
@@ -996,13 +1127,14 @@ mod tests {
             progress.since(0).events.last().map(|e| &e.event),
             Some(crate::progress::ProgressEvent::Finish { .. })
         ));
+        // A preemption after ready queues again: a fresh lifecycle task opens.
+        transition(&mut shared, &progress, SessionState::Queued, Some("evicted".into()));
+        assert!(shared.task.is_some());
+        assert!(matches!(
+            progress.since(0).events.last().map(|e| &e.event),
+            Some(crate::progress::ProgressEvent::Start { .. })
+        ));
         // A failure with an open task emits Fail.
-        transition(
-            &mut shared,
-            &progress,
-            SessionState::Dispatching,
-            None,
-        );
         transition(
             &mut shared,
             &progress,

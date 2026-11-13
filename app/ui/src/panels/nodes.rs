@@ -469,7 +469,9 @@ fn node_button(
             class: "{class_name}",
             "data-node-id": id.clone(),
             "aria-current": if active { "page" } else { "false" },
+            "data-vi-cursor": if active { "true" } else { "false" },
             onclick: move |_| selected.set(Some(click_id.clone())),
+            if active { span { class: "qi-cursor", "aria-hidden": "true", "▸" } }
             span { class: "qi-id", "{id}" }
         }
     }
@@ -935,6 +937,7 @@ pub fn panel(ctx: Ctx) -> Element {
             div { class: "nodes-toolbar",
                 div { class: "nodes-search-row",
                     input {
+                        id: crate::vi::SEARCH_INPUT_ID,
                         class: "filter nodes-search",
                         placeholder: "fuzzy ids · indexed fields · filters…",
                         value: "{query}",
@@ -943,6 +946,20 @@ pub fn panel(ctx: Ctx) -> Element {
                             *GEN.write() += 1;
                             filter::ensure_field_index(ctx);
                             run_search(ctx);
+                        },
+                        // While a vi `/` prompt is open, Enter/Escape return the
+                        // keyboard to the graph keymap (matches stay for n/N).
+                        onkeydown: move |event| {
+                            if crate::vi::search_active()
+                                && matches!(
+                                    event.key(),
+                                    dioxus::events::Key::Enter | dioxus::events::Key::Escape
+                                )
+                            {
+                                event.stop_propagation();
+                                event.prevent_default();
+                                crate::vi::finish_search();
+                            }
                         },
                     }
                     div { class: "nodes-view-toggle", role: "group", "aria-label": "Node navigator view",

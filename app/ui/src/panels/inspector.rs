@@ -35,10 +35,11 @@ use panel_kit::badge::{Badge, BadgeAction, BadgeKind, BadgeSpec, Rgb};
 use panel_kit::widgets::frontmatter::frontmatter_grid;
 use panel_kit::widgets::pills::pill_list;
 use panel_kit::Spinner;
-use panel_kit_core::widgets::selection::{build_pills, neighbor_set, Pill, PillDirection};
+use panel_kit_core::widgets::selection::{build_pills, Pill, PillDirection};
 use serde::{Deserialize, Serialize};
 
 use crate::panels::filter;
+use crate::nav::GraphIndex;
 use crate::{api, badges, Ctx};
 
 // --- persisted state ---------------------------------------------------------------
@@ -152,7 +153,24 @@ fn open_url(href: &str) {
 
 // --- neighbours -----------------------------------------------------------------------
 
-/// Wrapped row of clickable node pills over panel-kit's pill painter:
+/// Link direction relative to the focused node, derived from the shared
+/// graph index's forward and reverse adjacency.
+fn neighbor_set(idx: u32, index: &GraphIndex) -> Vec<(u32, PillDirection)> {
+    index
+        .adjacent(idx)
+        .into_iter()
+        .map(|(i, out, inn)| {
+            let direction = match (out, inn) {
+                (true, true) => PillDirection::Both,
+                (true, false) => PillDirection::Out,
+                _ => PillDirection::In,
+            };
+            (i, direction)
+        })
+        .collect()
+}
+
+/// Wrapped row of clickable node pills over panel-kit's shared pill painter:
 /// body-click selects the node (camera/highlight/meta follow from main.rs).
 fn pill_row(ctx: Ctx, pills: Vec<Pill>, truncated: usize) -> Element {
     let mut selected = ctx.selected;
@@ -544,7 +562,8 @@ fn node_view(ctx: Ctx, id: String) -> Element {
     // rendered these from the metric/edge buffers).
     let graph_sections: Element = match (g, idx) {
         (Some(g), Some(idx)) => {
-            let neighbors = neighbor_set(idx, &g.scene.edges);
+            let index = crate::vi::index_for(g, ctx.graph_session.peek().epoch);
+            let neighbors = neighbor_set(idx, &index);
             community_and_neighbors(ctx, &id, idx, &neighbors, &g.ids)
         }
         _ => rsx! {},

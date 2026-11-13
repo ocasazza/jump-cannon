@@ -228,6 +228,8 @@ pub(crate) enum BuiltinAction {
 #[derive(Debug, Clone)]
 pub(crate) enum ActionHandler {
     Builtin(BuiltinAction),
+    /// A vi keymap rule, run exactly as its keypress would be.
+    Vi(crate::nav::Intent),
 }
 
 #[derive(Debug, Clone)]
@@ -439,6 +441,21 @@ fn font_family_options() -> Vec<ParameterOption> {
 }
 
 fn seed_default_actions(reg: &mut ActionRegistry) {
+    for (keys, label, group, intent) in crate::nav::palette_rules() {
+        reg.register(Action {
+            id: format!("vi:{keys}"),
+            title: label.clone(),
+            description: format!("vi: {label}"),
+            keywords: words(&["vi", "graph", "navigate", "cursor"]),
+            kind: ActionType::Singleton,
+            parameters: vec![],
+            parent_id: None,
+            children_ids: vec![],
+            category: group,
+            shortcut: Some(keys),
+            handler: ActionHandler::Vi(intent),
+        });
+    }
     use BuiltinAction as B;
 
     let font_size_param = ActionParameter {
@@ -1533,8 +1550,13 @@ fn execute_action(action_id: &str, params: HashMap<String, ParamValue>) {
     // Attribute the snapshot/event to the palette action by its title —
     // the egui `snapshot_source` + frontend-event pair.
     crate::appstate::note_mutation("palette", &action.title);
-    let ActionHandler::Builtin(variant) = action.handler;
-    let result = run_builtin(variant, &params);
+    let result = match action.handler {
+        ActionHandler::Builtin(variant) => run_builtin(variant, &params),
+        ActionHandler::Vi(intent) => {
+            crate::vi::run_intent(intent, None);
+            serde_json::json!({})
+        }
+    };
     REGISTRY
         .write()
         .record_execution(&action.id, params, result);
