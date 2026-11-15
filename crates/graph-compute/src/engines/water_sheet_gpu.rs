@@ -85,7 +85,9 @@ struct Gpu {
     csr_neighbors: wgpu::Buffer,
     params_buf: wgpu::Buffer,
     // One contiguous MAP_READ buffer for the 3 out-axis copies.
-    readback: wgpu::Buffer,
+    readback: Option<wgpu::Buffer>,
+    /// Bytes held by the CSR offsets + neighbours buffers.
+    csr_bytes: u64,
 
     params: WaterSheetParams,
     settings: WaterSheetSettings,
@@ -122,12 +124,15 @@ impl WaterSheetGpuEngine {
         }
     }
 
-    /// Dispatch `steps` frames without host readback (pure GPU throughput).
-    pub fn step_deferred(&mut self) {
-        let gpu = self.gpu.as_mut().expect("step_deferred before init");
+    /// Encode `n` ping-pong steps into ONE compute pass / command buffer and
+    /// submit it, with no host readback. Pure GPU throughput; pair with
+    /// [`sync`](Self::sync) to wait for completion.
+    pub fn step_n(&mut self, n: u32) {
+        let gpu = self.gpu.as_mut().expect("step_n before init");
         let mut encoder = gpu
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        let mut idx = gpu.read_idx;
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: None,
@@ -136,44 +141,78 @@ impl WaterSheetGpuEngine {
             let p = &gpu.params;
             let s = &gpu.settings;
             let wg = s.workgroup.max(1);
-            pass.set_bind_group(0, &gpu.bind_groups[gpu.read_idx], &[]);
-            if s.staged {
-                // Sheet stencil: 2-D grid of 8×8 workgroups over (cols, rows).
-                let gx = p.cols.div_ceil(SHEET_WG).max(1);
-                let gy = p.rows.div_ceil(SHEET_WG).max(1);
-                pass.set_pipeline(&gpu.pipelines[1]);
-                pass.dispatch_workgroups(gx, gy, 1);
-                // Molecule section: 1-D over 3M nodes, tiled into 2-D if huge.
-                let mols_wg = (3 * p.molecules).div_ceil(wg).max(1);
-                let (mx, my, mz) = workgroup_dims_2d(mols_wg);
-                pass.set_pipeline(&gpu.pipelines[2]);
-                pass.dispatch_workgroups(mx, my, mz);
-            } else {
-                let total = p.n_nodes().div_ceil(wg).max(1);
-                let (x, y, z) = workgroup_dims_2d(total);
-                pass.set_pipeline(&gpu.pipelines[0]);
-                pass.dispatch_workgroups(x, y, z);
+            let (sheet_gx, sheet_gy) = (p.cols.div_ceil(SHEET_WG).max(1), p.rows.div_ceil(SHEET_WG).max(1));
+            let mol_dims = workgroup_dims_2d((3 * p.molecules).div_ceil(wg).max(1));
+            let all_dims = workgroup_dims_2d(p.n_nodes().div_ceil(wg).max(1));
+            for _ in 0..n {
+                pass.set_bind_group(0, &gpu.bind_groups[idx], &[]);
+                if s.staged {
+                    // Sheet stencil: 2-D grid of 8×8 workgroups over (cols, rows).
+                    pass.set_pipeline(&gpu.pipelines[1]);
+                    pass.dispatch_workgroups(sheet_gx, sheet_gy, 1);
+                    // Molecule section: 1-D over 3M nodes, tiled into 2-D if huge.
+                    pass.set_pipeline(&gpu.pipelines[2]);
+                    pass.dispatch_workgroups(mol_dims.0, mol_dims.1, mol_dims.2);
+                } else {
+                    pass.set_pipeline(&gpu.pipelines[0]);
+                    pass.dispatch_workgroups(all_dims.0, all_dims.1, all_dims.2);
+                }
+                idx ^= 1;
             }
         }
-        // OUT buffer for this step: group 0 wrote B, group 1 wrote A.
-        let (out_px, out_py, out_pz) = if gpu.read_idx == 0 {
-            (&gpu.px_b, &gpu.py_b, &gpu.pz_b)
-        } else {
-            (&gpu.px_a, &gpu.py_a, &gpu.pz_a)
-        };
-        let nb = gpu.n_bytes_per_axis;
-        encoder.copy_buffer_to_buffer(out_px, 0, &gpu.readback, 0, nb);
-        encoder.copy_buffer_to_buffer(out_py, 0, &gpu.readback, nb, nb);
-        encoder.copy_buffer_to_buffer(out_pz, 0, &gpu.readback, 2 * nb, nb);
         gpu.queue.submit(std::iter::once(encoder.finish()));
-        gpu.read_idx ^= 1;
+        gpu.read_idx = idx;
     }
 
-    /// Map the readback buffer and return the current interleaved positions.
+    /// One step, no readback.
+    pub fn step_deferred(&mut self) {
+        self.step_n(1);
+    }
+
+    /// Block until every submitted step has finished on the GPU (queue sync).
+    pub fn sync(&self) {
+        let gpu = self.gpu.as_ref().expect("sync before init");
+        gpu.device.poll(wgpu::Maintain::Wait);
+    }
+
+    /// Total bytes of device buffers this engine holds (excluding the lazily
+    /// created readback buffer).
+    pub fn device_bytes(&self) -> u64 {
+        let gpu = self.gpu.as_ref().expect("device_bytes before init");
+        let n = gpu.n_bytes_per_axis;
+        // 6 position + 3 velocity axes, CSR, params.
+        9 * n + gpu.csr_bytes + std::mem::size_of::<WaterParamsRaw>() as u64
+    }
+
+    /// Copy the current positions into the (lazily created) readback buffer,
+    /// map it, and return the interleaved positions.
     pub fn read_positions(&mut self) -> Vec<f32> {
         let gpu = self.gpu.as_mut().expect("read_positions before init");
-        gpu.device.poll(wgpu::Maintain::Wait);
-        let slice = gpu.readback.slice(..);
+        let nb = gpu.n_bytes_per_axis;
+        if gpu.readback.is_none() {
+            gpu.readback = Some(gpu.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("water_readback"),
+                size: 3 * nb,
+                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }));
+        }
+        let readback = gpu.readback.as_ref().unwrap();
+        // The current positions are the INPUT buffers of the next step.
+        let (px, py, pz) = if gpu.read_idx == 0 {
+            (&gpu.px_a, &gpu.py_a, &gpu.pz_a)
+        } else {
+            (&gpu.px_b, &gpu.py_b, &gpu.pz_b)
+        };
+        let mut encoder = gpu
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        encoder.copy_buffer_to_buffer(px, 0, readback, 0, nb);
+        encoder.copy_buffer_to_buffer(py, 0, readback, nb, nb);
+        encoder.copy_buffer_to_buffer(pz, 0, readback, 2 * nb, nb);
+        gpu.queue.submit(std::iter::once(encoder.finish()));
+
+        let slice = readback.slice(..);
         let (tx, rx) = std::sync::mpsc::channel();
         slice.map_async(wgpu::MapMode::Read, move |res| {
             let _ = tx.send(res);
@@ -191,11 +230,11 @@ impl WaterSheetGpuEngine {
         gpu.host.z.copy_from_slice(zs);
         let out = gpu.host.to_interleaved();
         drop(data);
-        gpu.readback.unmap();
+        readback.unmap();
         out
     }
 
-    /// Readback-free current SoA positions (valid after any deferred step).
+    /// SoA positions as of the last [`read_positions`](Self::read_positions).
     pub fn host_positions(&self) -> &cpu::Positions {
         &self.gpu.as_ref().expect("host_positions before init").host
     }
@@ -314,18 +353,17 @@ impl LayoutEngine for WaterSheetGpuEngine {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
 
-        let readback = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("water_readback"),
-            size: 3 * nb,
-            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
+        let csr_bytes = 4 * (shard.graph.offsets.len() + shard.graph.neighbors.len()) as u64;
 
+        // The 1-D kernels' workgroup size is a WGSL const; substitute the
+        // configured value so it is tunable per run.
+        let wgsl = include_str!("../shaders/water_sheet.wgsl").replace(
+            "const NAIVE_WG: u32 = 256u;",
+            &format!("const NAIVE_WG: u32 = {}u;", settings.workgroup),
+        );
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("water_sheet_shader"),
-            source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(include_str!(
-                "../shaders/water_sheet.wgsl"
-            ))),
+            source: wgpu::ShaderSource::Wgsl(Cow::Owned(wgsl)),
         });
 
         let storage_ro = |binding: u32| wgpu::BindGroupLayoutEntry {
@@ -448,7 +486,8 @@ impl LayoutEngine for WaterSheetGpuEngine {
             csr_offsets,
             csr_neighbors,
             params_buf,
-            readback,
+            readback: None,
+            csr_bytes,
             params,
             settings,
             n_bytes_per_axis: nb,
