@@ -60,7 +60,9 @@ graphApi:
   # this to github to pull the knowledge corpus from a GitHub repository
   # (see githubImporter below) instead of the vault filesystem. Set this to
   # httpjson to read a JSON API through an importer package (see
-  # httpJsonImporter below), such as the shipped Hindsight memory bank.
+  # httpJsonImporter below), such as the shipped Hindsight memory bank. Set
+  # this to native to build the waterSheet topology in-process at startup
+  # (see nativeImporter below) — no vault claim, package, or remote endpoint.
   source: obsidian
   # Optional full-rescan fallback for non-OKF filesystem sources. Set this
   # above 0 when writes arrive through another pod or mount.
@@ -232,6 +234,24 @@ githubImporter:
   tokenSecret:
     name: ""
     key: "token"
+
+# Native water-sheet generator mode, selected with graphApi.source: native.
+# graph-api builds the waterSheet topology (3-node water molecules plus a
+# rows x cols sheet lattice) in-process at startup via the
+# native-graph-generator crate — the exact shape of the tvix waterSheet
+# generator, without tvix evaluation. Nothing is fetched or mounted: no vault
+# claim, no seed init container, and no package dir. Node IDs are
+# native:{sourceId}:{local} with the waterSheet local names (w0_O, s0, …).
+nativeImporter:
+  # Number of disconnected 3-node water molecules (each contributes 3 nodes,
+  # 2 edges).
+  molecules: 20000
+  # Sheet lattice rows and columns (rows*cols nodes, 2*rows*cols-rows-cols
+  # edges). Defaults reproduce the task's 20000/256/256 water sheet.
+  rows: 256
+  cols: 256
+  # ASCII slug namespacing node IDs (JUMP_CANNON_NATIVE_SOURCE_ID).
+  sourceId: default
 
 # Package-driven HTTP/JSON mode, selected with graphApi.source: httpjson.
 # graph-api reads a paged JSON API according to a versioned TOML importer

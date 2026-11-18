@@ -3,6 +3,7 @@
 {{- $usesFilesystem := $importer.usesFilesystem -}}
 {{- $usesKubernetes := $importer.usesKubernetes -}}
 {{- $usesGitHub := eq $importer.kind "github" -}}
+{{- $usesNative := eq $importer.kind "native" -}}
 {{- $usesHttpJson := eq $importer.kind "httpjson" -}}
 {{- $filesystemRescanSeconds := $importer.filesystemRescanIntervalSeconds -}}
 {{- $hasKnowledge := and $importer.allowsSeeds .Values.vault.seed.enabled .Values.vault.seed.includeKnowledgeBase -}}
@@ -220,6 +221,19 @@ spec:
             - name: JUMP_CANNON_IMPORTER_CACHE_DIR
               value: {{ .Values.httpJsonImporter.cacheDir | quote }}
             {{- end }}
+            {{- end }}
+            {{- /* The native generator is fully in-process: parameters ride
+                   env, and nothing is mounted — no vault claim, no package
+                   dir, no cache volume, no seed init container. */ -}}
+            {{- if $usesNative }}
+            - name: JUMP_CANNON_NATIVE_MOLECULES
+              value: {{ .Values.nativeImporter.molecules | quote }}
+            - name: JUMP_CANNON_NATIVE_ROWS
+              value: {{ .Values.nativeImporter.rows | quote }}
+            - name: JUMP_CANNON_NATIVE_COLS
+              value: {{ .Values.nativeImporter.cols | quote }}
+            - name: JUMP_CANNON_NATIVE_SOURCE_ID
+              value: {{ .Values.nativeImporter.sourceId | quote }}
             {{- end }}
             {{- if $usesFilesystem }}
             - name: VAULT_ROOT

@@ -15,6 +15,7 @@ members = [
     "crates/kubernetes-importer",
     "crates/okf-importer",
     "crates/importer",
+    "crates/native-importer",
     "crates/importer-connectors",
     "crates/test-browser",
     "crates/test-profiling",

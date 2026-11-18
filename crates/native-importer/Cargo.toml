@@ -1,0 +1,13 @@
+[package]
+name = "native-importer"
+version = "1.0.0"
+edition = "2021"
+description = "graph-api source over the native water-sheet generator: builds the graph.nix waterSheet topology in-process at startup, no vault claim or tvix evaluation"
+
+[dependencies]
+native-graph-generator = { path = "../native-graph-generator" }
+data-loader = { path = "../data-loader" }
+vault-data = { path = "../vault-data" }
+
+[dev-dependencies]
+serde_json = { workspace = true }

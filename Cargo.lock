@@ -1750,6 +1750,7 @@ dependencies = [
  "k8s-openapi",
  "kube",
  "kubernetes-importer",
+ "native-importer",
  "notify",
  "notify-debouncer-mini",
  "okf-importer",
@@ -3138,6 +3139,16 @@ name = "native-graph-generator"
 version = "1.0.0"
 dependencies = [
  "libc",
+]
+
+[[package]]
+name = "native-importer"
+version = "1.0.0"
+dependencies = [
+ "data-loader",
+ "native-graph-generator",
+ "serde_json",
+ "vault-data",
 ]
 
 [[package]]

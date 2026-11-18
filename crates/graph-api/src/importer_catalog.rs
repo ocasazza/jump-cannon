@@ -56,6 +56,11 @@ pub enum CatalogSourceKind {
     /// Session-manager shared world; never constructible from chart catalog
     /// metadata (no filesystem source), like the other non-filesystem kinds.
     World,
+    /// Native in-process water-sheet generator, selected with
+    /// `graphApi.source: native` and bound from the `nativeImporter` values.
+    /// Not a catalog-declared source: its parameters (molecules, rows, cols)
+    /// are deployment env, not catalog metadata.
+    Native,
 }
 
 impl From<SourceKind> for CatalogSourceKind {
@@ -68,6 +73,7 @@ impl From<SourceKind> for CatalogSourceKind {
             SourceKind::GitHub => Self::GitHub,
             SourceKind::HttpJson => Self::HttpJson,
             SourceKind::World => Self::World,
+            SourceKind::Native => Self::Native,
         }
     }
 }
