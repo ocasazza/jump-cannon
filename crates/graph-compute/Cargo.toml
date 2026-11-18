@@ -110,6 +110,10 @@ proptest = "1"
 # [[bench]] target, so they survive crane's mkDummySrc deps-only build phase —
 # matching the graph-layouts convention.
 criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
+# Water-sheet topology oracle: the native SoA generator is the source of truth
+# for the `waterSheet` node order and bond set that the GPU layout derives
+# implicitly from the node index. Dev-dep only, so the lib stays independent.
+native-graph-generator = { path = "../native-graph-generator" }
 # pprof-rs's criterion profiler (BENCH_PPROF=1 in the bench examples) emits one
 # `profile.pb` per benchmark for the flake's jump-cannon-perf wrapper to push
 # to the cluster Pyroscope. criterion 0.5 is the pinned compatible pair.

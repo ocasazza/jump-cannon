@@ -1788,6 +1788,7 @@ dependencies = [
  "graph-metrics",
  "half",
  "hyper-util",
+ "native-graph-generator",
  "pollster",
  "pprof",
  "proptest",
