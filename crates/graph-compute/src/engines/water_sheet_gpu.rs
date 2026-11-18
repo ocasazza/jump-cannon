@@ -14,7 +14,7 @@
 //!   - molecule pass — 1-D dispatch over the molecule section (windowed O–O
 //!     repulsion + O–H bonds).
 //!
-//! Work is O(N · R²) with R ≤ 3, never O(N²): every force is a fixed-order sum
+//! Work is O(N · R²) with R bounded (staged tiles cap it at 8), never O(N²): every force is a fixed-order sum
 //! over a bounded window, so the kernels stay atomic-free and deterministic.
 
 use std::borrow::Cow;
@@ -31,11 +31,12 @@ use crate::water::{cpu, WaterSheetParams, WaterSheetSettings};
 /// Stable registry key for this engine.
 pub const LAYOUT_ID: &str = "water-sheet-gpu";
 
-/// Workgroup shape of the staged sheet stencil (8×8 → a 14×14 shared tile at
-/// `R_S_STAGE = 3`; must match the WGSL consts).
+/// Workgroup shape of the staged sheet stencil (8×8 → a `(8+2R)²` shared tile;
+/// must match the WGSL const). The radius `R` is `settings.r_sheet`,
+/// substituted into the WGSL at pipeline build.
 const SHEET_WG: u32 = 8;
-/// Compile-time radius of the staged sheet kernel; must match the WGSL const.
-const R_S_STAGE: u32 = 3;
+/// Largest staged radius (shared tile `(8+2R)²` stays well under 32 KiB).
+const MAX_STAGED_RADIUS: u32 = 8;
 
 #[repr(C)]
 #[derive(Copy, Clone, Pod, Zeroable, Debug)]
@@ -257,10 +258,16 @@ impl LayoutEngine for WaterSheetGpuEngine {
         }
         let s: WaterSheetSettings =
             serde_json::from_value(v.clone()).map_err(|e| format!("decode water-sheet settings: {e}"))?;
-        if s.staged && s.r_sheet != R_S_STAGE {
+        if s.workgroup == 0 || s.workgroup > 1024 {
             return Err(format!(
-                "water-sheet: staged kernel fixes its repulsion radius at {R_S_STAGE}; \
-                 set r_sheet = {R_S_STAGE} or staged = false"
+                "water-sheet: workgroup {} out of range 1..=1024",
+                s.workgroup
+            ));
+        }
+        if s.staged && s.r_sheet > MAX_STAGED_RADIUS {
+            return Err(format!(
+                "water-sheet: staged kernel supports r_sheet <= {MAX_STAGED_RADIUS}, got {}",
+                s.r_sheet
             ));
         }
         self.settings = Some(s);
@@ -355,12 +362,17 @@ impl LayoutEngine for WaterSheetGpuEngine {
 
         let csr_bytes = 4 * (shard.graph.offsets.len() + shard.graph.neighbors.len()) as u64;
 
-        // The 1-D kernels' workgroup size is a WGSL const; substitute the
-        // configured value so it is tunable per run.
-        let wgsl = include_str!("../shaders/water_sheet.wgsl").replace(
-            "const NAIVE_WG: u32 = 256u;",
-            &format!("const NAIVE_WG: u32 = {}u;", settings.workgroup),
-        );
+        // The 1-D kernels' workgroup size and the staged tile radius are WGSL
+        // consts; substitute the configured values so they are tunable per run.
+        let wgsl = include_str!("../shaders/water_sheet.wgsl")
+            .replace(
+                "const NAIVE_WG: u32 = 256u;",
+                &format!("const NAIVE_WG: u32 = {}u;", settings.workgroup),
+            )
+            .replace(
+                "const R_S_STAGE: u32 = 3u;",
+                &format!("const R_S_STAGE: u32 = {}u;", settings.r_sheet),
+            );
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("water_sheet_shader"),
             source: wgpu::ShaderSource::Wgsl(Cow::Owned(wgsl)),

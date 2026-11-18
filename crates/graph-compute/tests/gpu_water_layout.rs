@@ -77,12 +77,19 @@ fn gpu_matches_cpu_and_relaxes_geometry() {
     let Some(mut ctx) = common::gpu_ctx_or_skip("gpu_matches_cpu_and_relaxes_geometry") else {
         return;
     };
-    for staged in [false, true] {
+    // (staged, (r_sheet, r_mol)): the tuned default window and the original
+    // wide one, each through both the naive and the staged sheet kernel.
+    for (staged, (r_sheet, r_mol)) in [false, true]
+        .into_iter()
+        .flat_map(|st| [(st, (1, 1)), (st, (3, 2))])
+    {
         let s = WaterSheetSettings {
             staged,
+            r_sheet,
+            r_mol,
             ..small()
         };
-
+        eprintln!("--- staged={staged} r_sheet={r_sheet} r_mol={r_mol}");
         let cpu_short = run_cpu(&s, SHORT_STEPS as usize);
         let gpu_short = run_gpu(&mut ctx, &s, SHORT_STEPS);
         let d_short = max_abs_diff(&cpu_short, &gpu_short);
@@ -123,19 +130,24 @@ fn gpu_matches_cpu_on_ragged_shapes() {
     let Some(mut ctx) = common::gpu_ctx_or_skip("gpu_matches_cpu_on_ragged_shapes") else {
         return;
     };
-    for staged in [false, true] {
+    for (staged, (r_sheet, r_mol)) in [false, true]
+        .into_iter()
+        .flat_map(|st| [(st, (1, 1)), (st, (3, 2))])
+    {
         let s = WaterSheetSettings {
             molecules: 7,
             rows: 13,
             cols: 11,
             staged,
+            r_sheet,
+            r_mol,
             ..WaterSheetSettings::default()
         };
         let cpu = run_cpu(&s, SHORT_STEPS as usize);
         let gpu = run_gpu(&mut ctx, &s, SHORT_STEPS);
         let d = max_abs_diff(&cpu, &gpu);
-        eprintln!("ragged staged={staged}: max|gpu-cpu| = {d:e}");
-        assert!(d < SHORT_TOL, "ragged staged={staged}: diff {d}");
+        eprintln!("ragged staged={staged} r={r_sheet}/{r_mol}: max|gpu-cpu| = {d:e}");
+        assert!(d < SHORT_TOL, "ragged staged={staged} r={r_sheet}/{r_mol}: diff {d}");
     }
 }
 

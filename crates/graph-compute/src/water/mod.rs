@@ -185,9 +185,8 @@ pub struct WaterSheetSettings {
     /// Molecule repulsion window radius (Chebyshev, in molecule-grid cells).
     pub r_mol: u32,
 
-    /// Use the shared-memory staged sheet kernel (2-D dispatch tiling).
-    /// The staged kernel fixes its radius at compile time (`R_S_STAGE = 3`),
-    /// so `staged = true` requires `r_sheet == 3`.
+    /// Use the shared-memory staged sheet kernel (2-D dispatch tiling). Its
+    /// shared tile is sized from `r_sheet` at pipeline build (`r_sheet <= 8`).
     pub staged: bool,
     /// Workgroup size for the 1-D kernels (naive + molecule pass).
     pub workgroup: u32,
@@ -209,8 +208,8 @@ impl Default for WaterSheetSettings {
             rcut: 1.6,
             dt: 0.05,
             damping: 0.9,
-            r_sheet: 3,
-            r_mol: 2,
+            r_sheet: 1,
+            r_mol: 1,
             staged: false,
             workgroup: 256,
         }

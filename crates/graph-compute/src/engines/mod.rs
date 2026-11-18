@@ -164,6 +164,13 @@ fn build_gpu_ctx() -> anyhow::Result<GpuCtx> {
                 // caps at 65535 would still need 2-D tiling — a follow-up.)
                 max_compute_workgroups_per_dimension:
                     adapter_limits.max_compute_workgroups_per_dimension,
+                // Workgroup-size ceilings (default 256 invocations): lets
+                // kernels with a tunable workgroup (water-sheet) use up to the
+                // adapter's 1024 on Metal. A ceiling, not an allocation.
+                max_compute_invocations_per_workgroup:
+                    adapter_limits.max_compute_invocations_per_workgroup,
+                max_compute_workgroup_size_x: adapter_limits.max_compute_workgroup_size_x,
+                max_compute_workgroup_size_y: adapter_limits.max_compute_workgroup_size_y,
                 ..wgpu::Limits::default()
             },
             // Prefer few large allocations over many small ones — the working

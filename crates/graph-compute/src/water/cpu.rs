@@ -317,16 +317,34 @@ mod tests {
         assert!(r.max_oh_err > OH_TOL || r.max_sheet_spacing_err > SPACING_TOL, "{r:?}");
     }
 
-    #[test]
-    fn cpu_relaxes_to_lattice_and_bond_lengths() {
-        let s = small();
-        let pos = run_cpu(&s, STEPS);
-        let r = geometry_report(&pos, &s);
-        eprintln!("cpu geometry after {STEPS} steps: {r:?}");
+    fn assert_relaxes(s: &WaterSheetSettings) {
+        let pos = run_cpu(s, STEPS);
+        let r = geometry_report(&pos, s);
+        eprintln!(
+            "cpu geometry after {STEPS} steps (r_sheet={}, r_mol={}): {r:?}",
+            s.r_sheet, s.r_mol
+        );
         assert!(pos.x.iter().chain(&pos.y).chain(&pos.z).all(|v| v.is_finite()));
         assert!(r.max_sheet_spacing_err < SPACING_TOL, "sheet spacing: {r:?}");
         assert!(r.max_oh_err < OH_TOL, "O-H bond length: {r:?}");
         assert!(r.max_lattice_offset < OFFSET_TOL, "lattice offset: {r:?}");
+    }
+
+    /// Default (tuned) window.
+    #[test]
+    fn cpu_relaxes_to_lattice_and_bond_lengths() {
+        assert_relaxes(&small());
+    }
+
+    /// The original wide window (r_sheet = 3, r_mol = 2): the tuned narrow
+    /// default must not have changed what the layout converges to.
+    #[test]
+    fn cpu_relaxes_with_wide_window() {
+        assert_relaxes(&WaterSheetSettings {
+            r_sheet: 3,
+            r_mol: 2,
+            ..small()
+        });
     }
 
     #[test]

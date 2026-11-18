@@ -58,9 +58,8 @@ struct Params {
 
 const NAIVE_WG: u32 = 256u;
 const SHEET_WG: u32 = 8u;
-/// Compile-time repulsion radius of the staged sheet kernel. The staged path
-/// requires `settings.r_sheet == 3` (validated at engine init) so the shared
-/// tile has a fixed shape.
+/// Compile-time repulsion radius of the staged sheet kernel (substituted by
+/// the engine with `settings.r_sheet`) so the shared tile has a fixed shape.
 const R_S_STAGE: u32 = 3u;
 const TILE_W: u32 = SHEET_WG + 2u * R_S_STAGE;
 const TILE: u32 = TILE_W * TILE_W;
@@ -72,18 +71,14 @@ fn rest_for(i: u32) -> f32 {
     return select(params.sheet_rest, params.bond_rest, i < 3u * params.n_mol);
 }
 
-fn bond_force(i: u32, f: vec3<f32>) -> vec3<f32> {
-    var acc = f;
+fn bond_force(i: u32, pi: vec3<f32>) -> vec3<f32> {
+    var acc = vec3<f32>(0.0, 0.0, 0.0);
     let rest = rest_for(i);
     let start = offsets[i];
     let end = offsets[i + 1u];
     for (var k = start; k < end; k = k + 1u) {
         let j = neighbors[k];
-        let d = vec3<f32>(
-            px_in[j] - px_in[i],
-            py_in[j] - py_in[i],
-            pz_in[j] - pz_in[i],
-        );
+        let d = vec3<f32>(px_in[j], py_in[j], pz_in[j]) - pi;
         let len = length(d);
         if (len > 1e-9) {
             let t = params.k_bond * (len - rest) / len;
@@ -93,14 +88,13 @@ fn bond_force(i: u32, f: vec3<f32>) -> vec3<f32> {
     return acc;
 }
 
-fn repulse(f: vec3<f32>, i: u32, j: u32) -> vec3<f32> {
-    let d = vec3<f32>(
-        px_in[i] - px_in[j],
-        py_in[i] - py_in[j],
-        pz_in[i] - pz_in[j],
-    );
-    let len = length(d);
-    if (len < params.rcut && len > 1e-9) {
+/// Soft repulsion on the node at `pi` from node `j`. The squared-distance
+/// cull skips the sqrt for the (majority of) window cells beyond `rcut`.
+fn repulse(f: vec3<f32>, pi: vec3<f32>, j: u32) -> vec3<f32> {
+    let d = pi - vec3<f32>(px_in[j], py_in[j], pz_in[j]);
+    let d2 = dot(d, d);
+    if (d2 < params.rcut * params.rcut && d2 > 1e-18) {
+        let len = sqrt(d2);
         let t = 1.0 - len / params.rcut;
         let w = params.k_rep * (t * t) / len;
         return f + w * d;
@@ -111,7 +105,8 @@ fn repulse(f: vec3<f32>, i: u32, j: u32) -> vec3<f32> {
 /// Bond springs + windowed repulsion + integration for node `i`. Shared by
 /// `step_naive` (all nodes) and `mol_staged` (molecule section).
 fn integrate(i: u32) {
-    var f = bond_force(i, vec3<f32>(0.0, 0.0, 0.0));
+    let pi = vec3<f32>(px_in[i], py_in[i], pz_in[i]);
+    var f = bond_force(i, pi);
 
     let sheet_base = 3u * params.n_mol;
     if (i >= sheet_base) {
@@ -131,7 +126,7 @@ fn integrate(i: u32) {
                 if (rr < 0 || cc < 0 || rr >= rows || cc >= cols) {
                     continue;
                 }
-                f = repulse(f, i, sheet_base + u32(rr * cols + cc));
+                f = repulse(f, pi, sheet_base + u32(rr * cols + cc));
             }
         }
     } else if (i % 3u == 0u) {
@@ -156,7 +151,7 @@ fn integrate(i: u32) {
                 if (jm >= i32(params.n_mol)) {
                     continue;
                 }
-                f = repulse(f, i, u32(jm) * 3u);
+                f = repulse(f, pi, u32(jm) * 3u);
             }
         }
     }
@@ -166,9 +161,9 @@ fn integrate(i: u32) {
     vx[i] = nv.x;
     vy[i] = nv.y;
     vz[i] = nv.z;
-    px_out[i] = px_in[i] + params.dt * nv.x;
-    py_out[i] = py_in[i] + params.dt * nv.y;
-    pz_out[i] = pz_in[i] + params.dt * nv.z;
+    px_out[i] = pi.x + params.dt * nv.x;
+    py_out[i] = pi.y + params.dt * nv.y;
+    pz_out[i] = pi.z + params.dt * nv.z;
 }
 
 @compute @workgroup_size(NAIVE_WG)
@@ -224,7 +219,8 @@ fn sheet_staged(
     let c = gid.x;
     if (r < params.rows && c < params.cols) {
         let i = 3u * params.n_mol + r * params.cols + c;
-        var f = bond_force(i, vec3<f32>(0.0, 0.0, 0.0));
+        let pi = vec3<f32>(px_in[i], py_in[i], pz_in[i]);
+        var f = bond_force(i, pi);
         let ly = i32(r - base_r);
         let lx = i32(c - base_c);
         let rad = i32(R_S_STAGE);
@@ -237,14 +233,10 @@ fn sheet_staged(
                 let tc = lx + dc + i32(R_S_STAGE);
                 let t = u32(tr * i32(TILE_W) + tc);
                 if (tile_ok[t] == 1u) {
-                    let j = 3u * params.n_mol + u32(i32(r) + dr) * params.cols + u32(i32(c) + dc);
-                    let d = vec3<f32>(
-                        px_in[i] - tile[t].x,
-                        py_in[i] - tile[t].y,
-                        pz_in[i] - tile[t].z,
-                    );
-                    let len = length(d);
-                    if (len < params.rcut && len > 1e-9) {
+                    let d = pi - tile[t];
+                    let d2 = dot(d, d);
+                    if (d2 < params.rcut * params.rcut && d2 > 1e-18) {
+                        let len = sqrt(d2);
                         let tt = 1.0 - len / params.rcut;
                         let w = params.k_rep * (tt * tt) / len;
                         f = f + w * d;
@@ -258,8 +250,8 @@ fn sheet_staged(
         vx[i] = nv.x;
         vy[i] = nv.y;
         vz[i] = nv.z;
-        px_out[i] = px_in[i] + params.dt * nv.x;
-        py_out[i] = py_in[i] + params.dt * nv.y;
-        pz_out[i] = pz_in[i] + params.dt * nv.z;
+        px_out[i] = pi.x + params.dt * nv.x;
+        py_out[i] = pi.y + params.dt * nv.y;
+        pz_out[i] = pi.z + params.dt * nv.z;
     }
 }

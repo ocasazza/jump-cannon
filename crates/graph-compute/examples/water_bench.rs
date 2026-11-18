@@ -8,8 +8,10 @@
 //!
 //! ```text
 //! cargo run --release -p graph-compute --example water_bench -- \
-//!     [--sizes 1e6,1e7,1e8] [--steps 20] [--batch 10] [--workgroup 256] \
-//!     [--staged 0|1] [--rsheet 3] [--rmol 2]
+//!     [--sizes 1e6,1e7,1e8] [--steps 20] [--batch 10] [--workgroup N] \
+//!     [--staged 0|1] [--rsheet R] [--rmol R]
+//!
+//! Omitted flags default to [`WaterSheetSettings::default()`].
 //! ```
 //!
 //! `--steps` is the number of timed iterations per size, executed as
@@ -34,14 +36,17 @@ struct Args {
 }
 
 fn parse_args() -> Args {
+    // Defaults mirror `WaterSheetSettings::default()` so the bench can never
+    // drift from the engine's tuned configuration.
+    let d = WaterSheetSettings::default();
     let mut a = Args {
         sizes: vec![1e6, 1e7, 1e8],
         steps: 20,
         batch: 10,
-        workgroup: 256,
-        staged: false,
-        r_sheet: 3,
-        r_mol: 2,
+        workgroup: d.workgroup,
+        staged: d.staged,
+        r_sheet: d.r_sheet,
+        r_mol: d.r_mol,
     };
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
@@ -125,8 +130,8 @@ fn main() {
         args.workgroup, args.staged, args.r_sheet, args.r_mol, args.steps, args.batch
     );
     println!(
-        "{:>12} {:>12} {:>10} {:>12} {:>14} {:>12} {:>9}",
-        "target", "nodes", "ms/iter", "nodes/s", "device bytes", "bytes/node", "init_s"
+        "{:>12} {:>12} {:>10} {:>10} {:>12} {:>14} {:>12} {:>9}",
+        "target", "nodes", "ms/it min", "ms/it med", "nodes/s(min)", "device bytes", "bytes/node", "init_s"
     );
 
     let base = WaterSheetSettings {
@@ -205,14 +210,18 @@ fn main() {
             per_iter_ms.push(t.elapsed().as_secs_f64() * 1e3 / args.batch as f64);
         }
         per_iter_ms.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        let median_ms = per_iter_ms[per_iter_ms.len() / 2];
+        // `min` is the headline (least contended sample on a shared GPU);
+        // the median is printed beside it so noise is visible.
+        let min_ms = per_iter_ms[0];
+        let med_ms = per_iter_ms[per_iter_ms.len() / 2];
         let bytes = engine.device_bytes();
         println!(
-            "{:>12} {:>12} {:>10.3} {:>12} {:>14} {:>12.1} {:>9.1}",
+            "{:>12} {:>12} {:>10.3} {:>10.3} {:>12} {:>14} {:>12.1} {:>9.1}",
             human(target),
             human(n as f64),
-            median_ms,
-            human(n as f64 / (median_ms / 1e3)),
+            min_ms,
+            med_ms,
+            human(n as f64 / (min_ms / 1e3)),
             gib(bytes),
             bytes as f64 / n as f64,
             init_s
