@@ -149,7 +149,12 @@ fn connection_panel(mut ctx: Ctx) -> Element {
         graph_session,
         ..
     } = ctx;
-    let graph = graph.read().clone();
+    // The stats row is the only consumer; a full topology clone here would
+    // copy every node id and the id index on each render.
+    let graph_stats = graph
+        .read()
+        .as_ref()
+        .map(|g| (g.n_nodes, g.n_edges, g.num_communities, g.num_wcc));
     let session = graph_session.read().clone();
 
     rsx! {
@@ -212,23 +217,23 @@ fn connection_panel(mut ctx: Ctx) -> Element {
                     "Set"
                 }
             }
-            if let Some(graph) = graph {
+            if let Some((n_nodes, n_edges, n_communities, n_wcc)) = graph_stats {
                 div { class: "stats",
                     div { class: "kv",
                         span { class: "k", "nodes" }
-                        span { class: "v", "{graph.n_nodes}" }
+                        span { class: "v", "{n_nodes}" }
                     }
                     div { class: "kv",
                         span { class: "k", "edges" }
-                        span { class: "v", "{graph.n_edges}" }
+                        span { class: "v", "{n_edges}" }
                     }
                     div { class: "kv",
                         span { class: "k", "communities" }
-                        span { class: "v", "{graph.num_communities}" }
+                        span { class: "v", "{n_communities}" }
                     }
                     div { class: "kv",
                         span { class: "k", "components" }
-                        span { class: "v", "{graph.num_wcc}" }
+                        span { class: "v", "{n_wcc}" }
                     }
                 }
             }

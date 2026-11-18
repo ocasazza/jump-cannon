@@ -16,6 +16,16 @@ use crate::GraphData;
 /// Above this node count the `betweenness` buffer is not computed.
 pub(crate) const BETWEENNESS_MAX_NODES: usize = 10_000;
 
+/// Above this node count the whole in-browser metric build is skipped.
+///
+/// The build clones every node id into a `VaultGraph` and runs PageRank /
+/// Louvain / k-core on this thread, so a large client-owned graph (a big
+/// GitHub import) would freeze the UI for seconds — the same reason
+/// betweenness is capped, just at a scale that keeps the rest of the set
+/// affordable. Above the cap the Style panel falls back to the uniform
+/// buffers instead.
+pub(crate) const CLIENT_METRICS_MAX_NODES: usize = 100_000;
+
 /// Per-node metric buffers in renderer node order, keyed by graph-api's
 /// binary-cache names. Betweenness is present only under the node cap.
 pub(crate) fn compute(graph: &GraphData) -> HashMap<String, Vec<f32>> {

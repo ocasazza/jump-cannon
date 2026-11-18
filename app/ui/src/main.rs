@@ -980,13 +980,13 @@ fn commit_server_graph(mut ctx: Ctx, epoch: u64, graph: GraphData) -> bool {
     panel_kit::loading::loading_store("graph", "loading graph…").succeed();
     panels::layout::set_expected_graph_revision(revision);
     panels::style::reset_for_graph_session(true, revision);
+    let n_nodes = graph.n_nodes as usize;
     ctx.graph.set(Some(graph));
-    // Metric-driven styling reads the same buffers graph-api would serve;
-    // compute them in-browser for the client-owned topology.
-    let metrics = ctx.graph.read().as_ref().map(client_metrics::compute);
-    if let Some(metrics) = metrics {
-        panels::style::begin_client_session(metrics);
-    }
+    // Metric-driven styling fetches the server's own buffers lazily
+    // (reset_for_graph_session above arms the fetch path); computing them
+    // in-browser here would rebuild the whole topology on the main thread
+    // for every server load.
+    panels::layout::auto_pause_large_graph(n_nodes);
     true
 }
 
@@ -1011,9 +1011,30 @@ pub(crate) fn replace_with_client_graph(
         },
     });
     ctx.graph.set(Some(graph));
+    // Metric-driven styling: a client-owned topology has no server to fetch
+    // the buffers from, so build them in-browser at replace. The build walks
+    // the whole topology on this thread; above the size cap it is skipped and
+    // the Style panel falls back to the uniform buffers.
+    let n_nodes = ctx
+        .graph
+        .read()
+        .as_ref()
+        .map(|g| g.n_nodes as usize)
+        .unwrap_or(0);
+    if n_nodes <= client_metrics::CLIENT_METRICS_MAX_NODES {
+        let metrics = ctx.graph.read().as_ref().map(client_metrics::compute);
+        if let Some(metrics) = metrics {
+            panels::style::begin_client_session(metrics);
+        }
+    } else {
+        // No metric buffers for this session: drop any previous graph's
+        // cache so the Style panel cannot apply a stale set.
+        panels::style::reset_for_graph_session(false, None);
+    }
     // A client graph supersedes any in-flight server load: close the store
     // so the GlobalLoadingBar cannot dangle over a mounted canvas.
     panel_kit::loading::loading_store("graph", "loading graph…").succeed();
+    panels::layout::auto_pause_large_graph(n_nodes);
 }
 
 pub(crate) async fn reload_graph(mut ctx: Ctx) {
@@ -1618,7 +1639,10 @@ fn App() -> Element {
         });
     }
 
-    let g_now = ctx.graph.read().clone();
+    // Only presence is read here; cloning the topology would copy every node
+    // id (and the id index) on each App render — hundreds of MB on a large
+    // graph, churned once per second by the task poll.
+    let graph_loaded = ctx.graph.read().is_some();
     let session_label = ctx.graph_session.read().short_label();
     // Mirrors the egui tray's right-side running indicator: a live count of
     // in-progress server tasks, grey idle dot otherwise.
@@ -1744,7 +1768,7 @@ fn App() -> Element {
                         } else {
                             "sessions · no world open"
                         }
-                    } else if g_now.is_some() {
+                    } else if graph_loaded {
                         "{mode_label} · {session_label}"
                     } else {
                         "{mode_label} · connecting…"
@@ -1767,7 +1791,7 @@ span {
                 panel_kit::loading::GlobalLoadingBar {}
                 if n_running > 0 {
                     span { class: "activity", Spinner {} " running {n_running}" }
-                } else if g_now.is_none() {
+                } else if !graph_loaded {
                     span { class: "activity idle", "●" }
                 }
             }
