@@ -42,6 +42,7 @@ pub mod geometric_gpu;
 pub mod multilevel;
 pub mod sgd_stress;
 pub mod sgd_stress_gpu;
+pub mod water_sheet_gpu;
 
 pub use cpu_spring::CpuSpringEngine;
 pub use fa2_bh::Fa2BhEngine;
@@ -52,6 +53,7 @@ pub use geometric_gpu::GeometricGpuEngine;
 pub use multilevel::{MultilevelEngine, MultilevelSettings, SweepSchedule};
 pub use sgd_stress::SgdStressEngine;
 pub use sgd_stress_gpu::SgdStressGpuEngine;
+pub use water_sheet_gpu::WaterSheetGpuEngine;
 
 /// Per-worker execution context shared by all engines.
 ///
@@ -162,6 +164,13 @@ fn build_gpu_ctx() -> anyhow::Result<GpuCtx> {
                 // caps at 65535 would still need 2-D tiling — a follow-up.)
                 max_compute_workgroups_per_dimension:
                     adapter_limits.max_compute_workgroups_per_dimension,
+                // Workgroup-size ceilings (default 256 invocations): lets
+                // kernels with a tunable workgroup (water-sheet) use up to the
+                // adapter's 1024 on Metal. A ceiling, not an allocation.
+                max_compute_invocations_per_workgroup:
+                    adapter_limits.max_compute_invocations_per_workgroup,
+                max_compute_workgroup_size_x: adapter_limits.max_compute_workgroup_size_x,
+                max_compute_workgroup_size_y: adapter_limits.max_compute_workgroup_size_y,
                 ..wgpu::Limits::default()
             },
             // Prefer few large allocations over many small ones — the working
@@ -460,6 +469,7 @@ pub const LEAF_ENGINE_IDS: &[LayoutId] = &[
     SgdStressGpuEngine::ID,
     GeometricEngine::ID,
     GeometricGpuEngine::ID,
+    WaterSheetGpuEngine::ID,
 ];
 
 /// Construct a fresh, uninitialized **leaf** (non-multilevel) engine by id.
@@ -483,6 +493,7 @@ pub fn construct_leaf(id: &str) -> Option<Box<dyn LayoutEngine>> {
         SgdStressGpuEngine::ID => Some(Box::new(SgdStressGpuEngine::new())),
         GeometricEngine::ID => Some(Box::new(GeometricEngine::new())),
         GeometricGpuEngine::ID => Some(Box::new(GeometricGpuEngine::new())),
+        WaterSheetGpuEngine::ID => Some(Box::new(WaterSheetGpuEngine::new())),
         _ => None,
     }
 }
@@ -506,6 +517,7 @@ fn leaf_ctor_for(id: &str) -> EngineConstructor {
         SgdStressGpuEngine::ID => || construct_leaf(SgdStressGpuEngine::ID).unwrap(),
         GeometricEngine::ID => || construct_leaf(GeometricEngine::ID).unwrap(),
         GeometricGpuEngine::ID => || construct_leaf(GeometricGpuEngine::ID).unwrap(),
+        WaterSheetGpuEngine::ID => || construct_leaf(WaterSheetGpuEngine::ID).unwrap(),
         _ => panic!("leaf_ctor_for: unknown leaf engine id {id:?}"),
     }
 }
