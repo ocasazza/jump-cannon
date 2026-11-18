@@ -144,11 +144,14 @@ static LAST_SOLVED: GlobalSignal<Option<(String, Value)>> = Signal::global(|| No
 static CONTROL_REQUEST_TOKEN: GlobalSignal<u64> = Signal::global(|| 0);
 static CONTROL_BUSY: GlobalSignal<bool> = Signal::global(|| false);
 
-/// Above this node count the local GPU sim starts paused: at this size a
-/// single compute step costs tens of milliseconds, so an auto-running sim
-/// starves the UI thread. The Layout panel explains why; Resume/Wake still
-/// runs it — the user's call.
-pub(crate) const AUTO_PAUSE_MIN_NODES: usize = 250_000;
+/// Above this node count the local GPU sim starts paused.
+///
+/// Measured on an M-series laptop at a 1276x1098 canvas (this-device
+/// gpu-force, 8 steps/frame): ~26 fps at 50k nodes, ~18 at 100k, ~10 at
+/// 200k, ~3-5 at 1.24M. At 200k a single compute step already blows the
+/// frame budget, so an auto-running sim starves the UI thread; the Layout
+/// panel explains why and Resume/Wake still runs it — the user's call.
+pub(crate) const AUTO_PAUSE_MIN_NODES: usize = 200_000;
 /// Node count of the mount that was auto-paused, `None` once the user
 /// resumed (the notice only renders while the sim is paused).
 static AUTO_PAUSE_NODES: GlobalSignal<Option<usize>> = Signal::global(|| None);
