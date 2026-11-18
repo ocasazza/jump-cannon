@@ -14,7 +14,7 @@ The test harness in `crates/test-browser/` is the only exception, and only becau
 
 | Crate | Role |
 |---|---|
-| `crates/data-loader` | Source-neutral importer contracts. Every descriptor carries discovery schema version 2, and every completed import emits one validated `SearchDocument` per graph node. Defines the eight CLI source kinds (Obsidian, tvix, generate, Kubernetes, OKF, Pest, GitHub, httpjson) plus `world`, which is served by the session manager rather than the standalone CLI. `httpjson` ships with no built-in source: every JSON API is a declarative package under `charts/jump-cannon/packages/` (e.g. `hindsight-memory-bank.toml`), bound to an instance at runtime via `JUMP_CANNON_IMPORTER_*`. |
+| `crates/data-loader` | Source-neutral importer contracts. Every descriptor carries discovery schema version 2, and every completed import emits one validated `SearchDocument` per graph node. Defines the eight CLI source kinds (Obsidian, tvix, generate, Kubernetes, OKF, Pest, GitHub, httpjson, native) plus `world`, which is served by the session manager rather than the standalone CLI. `httpjson` ships with no built-in source: every JSON API is a declarative package under `charts/jump-cannon/packages/` (e.g. `hindsight-memory-bank.toml`), bound to an instance at runtime via `JUMP_CANNON_IMPORTER_*`. |
 | `crates/graph-api` | axum HTTP server. Loads the selected importer, serves `/graph/*`, `/graph/schema`, `/node/*id`, `/search`, `/vault/page` (Obsidian editor PUT), `/progress`, etc. Atomically swaps an in-memory `GraphSnapshot` containing the graph, importer schema, generic Tantivy search index, schema-driven facets, metrics, and binary caches. Serves the frontend dist from `--assets-dir` / `JUMP_CANNON_ASSETS_DIR`. |
 | `crates/graph-layouts` | wgpu compute force-sim. Native + WASM. Consumed in-process by `app/ui` (path dependency). |
 | `crates/graph-compute` | Optional standalone layout solver, gRPC on `[::1]:50051`. Opt-in via `--compute-url` / `JUMP_CANNON_COMPUTE_URL` — unset or empty means the broker is never dialed. Runs through the local docker-compose development stack or the Helm chart's Kueue-admitted `batch/v1` compute Job (one `graph-compute` container, fronted by a ClusterIP Service). |
@@ -26,6 +26,8 @@ The test harness in `crates/test-browser/` is the only exception, and only becau
 | `crates/okf-importer` | Bounded filesystem importer for the official Open Knowledge Format v0.2 schema, including typed status, trust, attestation, provenance, and relationship discovery. |
 | `crates/kubernetes-importer` | Capability-scoped, allowlisted Kubernetes metadata importer with owner-reference edges and namespace/API/label facets. |
 | `crates/github-importer` | GitHub tarball importer. Polls codeload with ETag revalidation, extracts into a local cache, and reuses vault-links Obsidian parsing so the knowledge corpus updates push-to-main without a chart republish. |
+| `crates/native-graph-generator` | Pure SoA water-sheet generator (`WaterSheetGenerator`): a pool of 3-node water molecules plus a rows x cols sheet lattice in flat pre-sized vectors — no attrset, toGraphJSON, or VaultGraph materialization. Mirrors `waterSheet` in `crates/tvix-wasm/src/nix/graph.nix`; benchmark-scale (100M+ nodes) in one O(n + e) pass. Ships a count/timing/RSS CLI binary. |
+| `crates/native-importer` | The `native` graph-api source over that generator: builds the waterSheet topology in-process at startup under `native:{source_id}:` (locals `w{m}_O`/`w{m}_H1`/`w{m}_H2`, `s{i}`), validates `JUMP_CANNON_NATIVE_*` bounds loudly, and serves the required discovery fields plus a facetable `type`. No transport: one in-memory Read capability, static watch, no vault claim. |
 | `crates/importer` | Unified runtime importer engine. One versioned TOML package format (`format_version = 3`): a shared `[metadata]`/`[limits]`/`[schema.fields]` envelope plus `[parser] engine = "pest"` (inline grammar + capture map, trusted administrator-installed packages), `[parser] engine = "json"` (paged JSON endpoints + projection), or `[parser] engine = "tvix"` (an inline Nix generator expression that is a function of typed, bounded `[[parser.variables]]`, evaluated by `tvix-wasm` into a graph — the generator packages `generate-random.toml`/`generate-clusters.toml`, which replace the retired `generate`/`tvix` source kinds and the `tvix-loader` crate). The package is mechanism; the path/bank/tenant/URL, or the generator's node count/seed/cluster count, is instance configuration bound at runtime. One engine serves every JSON API: there are N packages (`hindsight-memory-bank.toml`, …) and one `SourceKind::HttpJson`. `serde(deny_unknown_fields)` validation rejects unknown envelope and engine keys; `validate_template`/`validate_pointer` enforce that every `{placeholder}` names a declared variable and every JSON pointer starts with `/`. The core (validation, `parse_input`, JSON decode/map, tvix variable resolution and Nix-literal rendering) builds on wasm32 with `--no-default-features`; the `native` feature gates filesystem loading, the reqwest transport, and tvix evaluation. |
 | `crates/tvix-wasm` | `tvix-eval` bridge — native + WASM Nix expression evaluator. Enables Nix expressions in the UI/data pipeline without shelling out. |
 | `crates/importer-connectors` | Generic byte-source connectors feeding `crates/importer` grammar packages: `https` (reqwest native / gloo-net wasm, runtime bearer token), `envelope` (pure-Rust tar/tar.gz/zip/gzip expansion, wasm-clean), `ssh` (native; agent or key-file auth, optional known_hosts pinning), `grpc` (native; tonic + prost-reflect dynamic unary/server-streaming invocation from a descriptor set or server reflection). Each is a `SourceConnector` declaring exact capabilities; credentials are runtime config, never package fields. |
@@ -44,6 +46,7 @@ Read the crate map above correctly: every importer crate in it is a
 | `okf-importer` | one published interchange format (OKF v0.2) |
 | `kubernetes-importer` | the Kubernetes dynamic-API transport |
 | `github-importer` | the polled-tarball-over-HTTP transport |
+| `native-importer` | no transport — the deterministic in-process generator (waterSheet) |
 | `importer` | the runtime package engines: pest grammars and paged JSON over HTTP, both declared as versioned TOML packages |
 | `importer-connectors` | byte acquisition transports — HTTPS, SSH, gRPC — plus tar/tar.gz/zip/gzip envelope expansion, all behind `SourceConnector` |
 
@@ -98,7 +101,7 @@ Scope rule: the compute layer (`graph-compute`, gRPC broker, Kubernetes Job orch
 ## Data flow
 
 ```
-configured source (Obsidian / tvix / generate / Kubernetes / OKF / Pest / GitHub, or an httpjson package instance)
+configured source (Obsidian / tvix / generate / Kubernetes / OKF / Pest / GitHub / native, or an httpjson package instance)
        │
        ▼
 graph-api validates and builds one ArcSwap<GraphSnapshot>
@@ -178,6 +181,10 @@ Run `just test browser-rust` before claiming any visual change works. Don't comm
 | `JUMP_CANNON_IMPORTER_TOKEN` env / `--importer-token` flag | graph-api | unset → no Authorization header sent (redacted from every log line, capability scope, and error message) |
 | `JUMP_CANNON_IMPORTER_SOURCE_ID` env / `--importer-source-id` flag | graph-api | unset → sourced from the bound instance (engine falls back to the package id); namespaced as `httpjson:{source_id}:…` |
 | `JUMP_CANNON_IMPORTER_POLL_INTERVAL_MS` env / `--importer-poll-interval-ms` flag | graph-api | `60000` (0 → static one-shot) |
+| `JUMP_CANNON_NATIVE_MOLECULES` env / `--native-molecules` flag | graph-api | `20000` water molecules with `--source=native` (3 nodes + 2 edges each) |
+| `JUMP_CANNON_NATIVE_ROWS` env / `--native-rows` flag | graph-api | `256` sheet rows with `--source=native` |
+| `JUMP_CANNON_NATIVE_COLS` env / `--native-cols` flag | graph-api | `256` sheet columns with `--source=native` (nodes = 3·molecules + rows·cols = 125536 by default) |
+| `JUMP_CANNON_NATIVE_SOURCE_ID` env / `--native-source-id` flag | graph-api | `default`; namespaced as `native:{source_id}:…` |
 
 `.env` at the repo root is auto-loaded by the justfile (`set dotenv-load := true`).
 

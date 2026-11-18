@@ -52,8 +52,9 @@ struct Args {
         default_value_t = 0
     )]
     filesystem_rescan_seconds: u64,
-    /// Data source: obsidian (default), kubernetes, okf, pest, github, or
-    /// httpjson. Package-driven kinds (pest, httpjson, tvix) take their
+    /// Data source: obsidian (default), kubernetes, okf, pest, github,
+    /// httpjson, or native (in-process water-sheet generator). Package-driven
+    /// kinds (pest, httpjson, tvix) take their
     /// behaviour from a package, so a new API — or a new graph generator — is a
     /// package, not a new source kind. Graph generators are `engine = "tvix"`
     /// packages selected through the importer catalog, not `--source`.
@@ -88,6 +89,20 @@ struct Args {
     /// Stable ASCII slug used to namespace OKF node IDs.
     #[arg(long, env = "JUMP_CANNON_OKF_SOURCE_ID", default_value = "default")]
     okf_source_id: String,
+    /// Number of disconnected 3-node water molecules for --source=native.
+    /// Bound from JUMP_CANNON_NATIVE_MOLECULES in the chart.
+    #[arg(long, env = "JUMP_CANNON_NATIVE_MOLECULES", default_value_t = 20_000)]
+    native_molecules: u64,
+    /// Sheet lattice rows for --source=native.
+    #[arg(long, env = "JUMP_CANNON_NATIVE_ROWS", default_value_t = 256)]
+    native_rows: u64,
+    /// Sheet lattice columns for --source=native.
+    #[arg(long, env = "JUMP_CANNON_NATIVE_COLS", default_value_t = 256)]
+    native_cols: u64,
+    /// Stable ASCII slug used to namespace native node IDs
+    /// (`native:{source_id}:w0_O`, …). Bound from JUMP_CANNON_NATIVE_SOURCE_ID.
+    #[arg(long, env = "JUMP_CANNON_NATIVE_SOURCE_ID", default_value = "default")]
+    native_source_id: String,
     /// GitHub repository slug (`owner/repo`) backing --source=github.
     #[arg(long, env = "JUMP_CANNON_GITHUB_REPO")]
     github_repo: Option<String>,
@@ -427,6 +442,22 @@ async fn main() -> anyhow::Result<()> {    let _ = dotenvy::dotenv();
                 "using GitHub importer"
             );
             Box::new(github_importer::GitHubImporter::new(config)?)
+        }
+        data_loader::SourceKind::Native => {
+            let config = native_importer::NativeSourceConfig {
+                source_id: args.native_source_id.clone(),
+                molecules: args.native_molecules,
+                rows: args.native_rows,
+                cols: args.native_cols,
+            };
+            tracing::info!(
+                source_id = %config.source_id,
+                molecules = config.molecules,
+                rows = config.rows,
+                cols = config.cols,
+                "using native water-sheet generator"
+            );
+            Box::new(native_importer::NativeImporter::new(config)?)
         }
         data_loader::SourceKind::HttpJson => {
             let manifest_path = args.importer_manifest.as_ref().with_context(|| {

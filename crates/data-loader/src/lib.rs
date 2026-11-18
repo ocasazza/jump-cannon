@@ -897,6 +897,11 @@ pub enum SourceKind {
     /// (`crates/session-manager`). Not a CLI-selectable source: worlds are
     /// hosted per-world by the session-manager server.
     World,
+    /// Deterministic water-sheet graph built in-process at startup by
+    /// `crates/native-graph-generator` (a pool of 3-node water molecules
+    /// plus one rows x cols sheet lattice). No remote endpoint, filesystem
+    /// root, or package: parameters bind from `JUMP_CANNON_NATIVE_*`.
+    Native,
 }
 
 impl SourceKind {
@@ -910,6 +915,7 @@ impl SourceKind {
             "github" => Some(Self::GitHub),
             "httpjson" | "http-json" => Some(Self::HttpJson),
             "world" => Some(Self::World),
+            "native" | "water-sheet" => Some(Self::Native),
             _ => None,
         }
     }
@@ -924,6 +930,7 @@ impl SourceKind {
             "github",
             "httpjson",
             "world",
+            "native",
         ]
     }
 }
@@ -2006,6 +2013,16 @@ mod importer_tests {
             Some(SourceKind::Okf)
         );
         assert!(SourceKind::all().contains(&"okf"));
+    }
+
+    #[test]
+    fn source_kind_accepts_native_names() {
+        assert_eq!(SourceKind::parse("native"), Some(SourceKind::Native));
+        assert_eq!(SourceKind::parse("WATER-SHEET"), Some(SourceKind::Native));
+        assert!(SourceKind::all().contains(&"native"));
+        // The generated source is a real SourceKind, not a package-engine
+        // prefix: schemas may declare source_kind "native".
+        assert!(!ENGINE_SOURCE_KINDS.contains(&"native"));
     }
 
     struct FakeConnector {

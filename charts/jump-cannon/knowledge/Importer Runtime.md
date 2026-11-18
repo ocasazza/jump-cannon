@@ -26,7 +26,10 @@ The omp auto-loop runtime is the same shape: the pest package
 `omp-auto-loop.toml` over the loop's line projection, with its canvas
 mapping defined in [[OMP Auto-Loop Topos]].
 GitHub delivers a repository tarball over HTTP with ETag polling and reuses
-the Obsidian markdown pipeline; see [[GitHub Importer]]. OKF implements the
+the Obsidian markdown pipeline; see [[GitHub Importer]]. The `native` kind
+needs no transport at all: it builds the `waterSheet` topology in-process at
+startup from the native-graph-generator crate; see [[Native Graph
+Generator]]. OKF implements the
 official format version 0.2; its `0.2` version must not be called `0.0.2`.
 
 A package is exactly one `format_version = 3` TOML file. A Nix serialization

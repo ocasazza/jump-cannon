@@ -13,11 +13,12 @@ also load bounded Kubernetes metadata, import an Open Knowledge Format v0.2
 bundle, parse a trusted Pest package (importer package format 3), pull a GitHub
 repository tarball (see [[GitHub Importer]]), bind an `httpjson` engine to one
 declarative TOML package under `charts/jump-cannon/packages/` (Hindsight ships
-as `hindsight-memory-bank.toml`; see [[Hindsight Importer]]), or run an
+as `hindsight-memory-bank.toml`; see [[Hindsight Importer]]), run an
 `engine = "tvix"` generator package that evaluates a parameterised Nix
 expression into a graph (`generate-random.toml`, `generate-clusters.toml`, `generate-water-sheet.toml`) with
 its node count, edge count, seed, cluster count, and affinity bound at apply
-time. Tvix packages may declare `[[schema.fields]]`; matching flattened node
+time, or build the same `waterSheet` natively in-process with the `native`
+source kind (see [[Native Graph Generator]]). Tvix packages may declare `[[schema.fields]]`; matching flattened node
 metadata is type-checked, indexed or faceted as declared, and retained as node
 frontmatter. Metadata `title`, `tags`, `doctype`, and `path` populate their
 canonical node fields. The same metadata survives the browser Generate panel's

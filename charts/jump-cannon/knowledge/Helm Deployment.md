@@ -63,6 +63,13 @@ see [[Hindsight Importer]] for the Hindsight example and AGENTS.md for the
 generic binding). An authenticated API takes a token only through
 `httpJsonImporter.tokenSecret`. See [[Importer Runtime]] for the engine.
 
+`graphApi.source: native` selects the in-process generator mode: graph-api
+builds the waterSheet topology from `nativeImporter.molecules`/`rows`/`cols`
+(rendered as `JUMP_CANNON_NATIVE_*` env) with no vault claim, no seed init
+container, no package ConfigMap, and no volumeMounts of any kind beyond the
+host CA bundle — the graph exists because the process computed it. See
+[[Native Graph Generator]].
+
 The chart's inactive `lavender-ingest-okf` instance consumes the externally
 provisioned `lavender-okf-shared` RWX claim read-only. It mounts the repository
 at `/var/lib/lavender/okf-repository` and imports

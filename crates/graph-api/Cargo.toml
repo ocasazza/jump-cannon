@@ -47,6 +47,7 @@ data-loader    = { path = "../data-loader" }
 kubernetes-importer = { path = "../kubernetes-importer" }
 okf-importer = { path = "../okf-importer" }
 github-importer = { path = "../github-importer" }
+native-importer = { path = "../native-importer" }
 importer = { path = "../importer" }
 vault-links    = { path = "../vault-links" }
 graph-layouts  = { path = "../graph-layouts" }
