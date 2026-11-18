@@ -147,10 +147,9 @@ fn main() {
         let p = s.params();
         let n = p.n_nodes() as u64;
 
-        // Cheap pre-flight against adapter limits: the biggest single buffer is
-        // the CSR neighbour list (≈ 4 entries per sheet node + 4 per molecule).
-        let est_neighbors_bytes = 4 * (4 * (p.rows as u64 * p.cols as u64) + 4 * p.molecules as u64);
-        let largest = est_neighbors_bytes.max(4 * n);
+        // Cheap pre-flight against adapter limits: bonds are implicit, so the
+        // largest single buffer is a position/velocity axis (4 B per node).
+        let largest = 4 * n;
         if largest > limits.max_buffer_size
             || largest > limits.max_storage_buffer_binding_size as u64
         {
