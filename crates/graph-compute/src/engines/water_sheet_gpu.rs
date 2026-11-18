@@ -82,13 +82,9 @@ struct Gpu {
     vx: wgpu::Buffer,
     vy: wgpu::Buffer,
     vz: wgpu::Buffer,
-    csr_offsets: wgpu::Buffer,
-    csr_neighbors: wgpu::Buffer,
     params_buf: wgpu::Buffer,
     // One contiguous MAP_READ buffer for the 3 out-axis copies.
     readback: Option<wgpu::Buffer>,
-    /// Bytes held by the CSR offsets + neighbours buffers.
-    csr_bytes: u64,
 
     params: WaterSheetParams,
     settings: WaterSheetSettings,
@@ -181,8 +177,8 @@ impl WaterSheetGpuEngine {
     pub fn device_bytes(&self) -> u64 {
         let gpu = self.gpu.as_ref().expect("device_bytes before init");
         let n = gpu.n_bytes_per_axis;
-        // 6 position + 3 velocity axes, CSR, params.
-        9 * n + gpu.csr_bytes + std::mem::size_of::<WaterParamsRaw>() as u64
+        // 6 position + 3 velocity axes + params (bonds are implicit).
+        9 * n + std::mem::size_of::<WaterParamsRaw>() as u64
     }
 
     /// Copy the current positions into the (lazily created) readback buffer,
@@ -324,17 +320,6 @@ impl LayoutEngine for WaterSheetGpuEngine {
         let vy = soa_init("water_vy", &vec![0.0f32; n]);
         let vz = soa_init("water_vz", &vec![0.0f32; n]);
 
-        let csr_offsets = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("water_csr_offsets"),
-            contents: bytemuck::cast_slice(&shard.graph.offsets),
-            usage: wgpu::BufferUsages::STORAGE,
-        });
-        let csr_neighbors = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("water_csr_neighbors"),
-            contents: bytemuck::cast_slice(&shard.graph.neighbors),
-            usage: wgpu::BufferUsages::STORAGE,
-        });
-
         let w = params.mol_grid_w();
         let raw = WaterParamsRaw {
             n_nodes: params.n_nodes(),
@@ -359,8 +344,6 @@ impl LayoutEngine for WaterSheetGpuEngine {
             contents: bytemuck::bytes_of(&raw),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
-
-        let csr_bytes = 4 * (shard.graph.offsets.len() + shard.graph.neighbors.len()) as u64;
 
         // The 1-D kernels' workgroup size and the staged tile radius are WGSL
         // consts; substitute the configured values so they are tunable per run.
@@ -410,10 +393,8 @@ impl LayoutEngine for WaterSheetGpuEngine {
                 storage_rw(6),
                 storage_rw(7),
                 storage_rw(8),
-                storage_ro(9),
-                storage_ro(10),
                 wgpu::BindGroupLayoutEntry {
-                    binding: 11,
+                    binding: 9,
                     visibility: wgpu::ShaderStages::COMPUTE,
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Uniform,
@@ -461,9 +442,7 @@ impl LayoutEngine for WaterSheetGpuEngine {
                     wgpu::BindGroupEntry { binding: 6, resource: vx.as_entire_binding() },
                     wgpu::BindGroupEntry { binding: 7, resource: vy.as_entire_binding() },
                     wgpu::BindGroupEntry { binding: 8, resource: vz.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 9, resource: csr_offsets.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 10, resource: csr_neighbors.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 11, resource: params_buf.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 9, resource: params_buf.as_entire_binding() },
                 ],
             })
         };
@@ -495,11 +474,8 @@ impl LayoutEngine for WaterSheetGpuEngine {
             vx,
             vy,
             vz,
-            csr_offsets,
-            csr_neighbors,
             params_buf,
             readback: None,
-            csr_bytes,
             params,
             settings,
             n_bytes_per_axis: nb,

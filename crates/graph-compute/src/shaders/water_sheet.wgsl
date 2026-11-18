@@ -1,7 +1,9 @@
 // GPU-resident water-sheet layout kernels (`"water-sheet-gpu"`).
 //
 // Three entry points over one shared bind-group layout (SoA positions in/out
-// ping-pong + SoA velocities in place + CSR + params uniform):
+// ping-pong + SoA velocities in place + params uniform). Bonds are computed
+// from the node index (canonical waterSheet topology); the CSR is never
+// uploaded, which keeps 16.8 bytes/node of graph data off the device.
 //
 //   - `step_naive`  — 1-D dispatch over ALL nodes; each invocation reads its
 //     repulsion window straight from the global SoA buffers. Workgroups are
@@ -9,14 +11,16 @@
 //     per-dimension cap, so `i = gid.y * nwg.x * NAIVE_WG + gid.x`.
 //   - `sheet_staged` — 2-D dispatch over the lattice grid with the node's
 //     repulsion window staged through workgroup shared memory (classic stencil
-//     tiling): the 8×8 workgroup loads a 14×14 tile once, then every thread
+//     tiling): the 8×8 workgroup loads a (8+2R)² tile once, then every thread
 //     scans its window from shared memory instead of re-reading global memory.
 //   - `mol_staged`  — 1-D dispatch over the molecule section (H bonds only;
 //     O windowed repulsion in the molecule grid), paired with `sheet_staged`
 //     so the ping-pong OUT buffer's molecule section is refreshed too.
 //
 // Force model (identical to `water::cpu::node_force`, same fixed order):
-//   1. bond springs along CSR edges (O–H at `bond_rest`, sheet at `sheet_rest`);
+//   1. bond springs over the canonical topology, in the exact order the CSR
+//      emits them (molecule O–H at `bond_rest`, sheet up/left/right/down at
+//      `sheet_rest`);
 //   2. bounded-window soft repulsion (zero beyond `rcut`), sheet node vs its
 //      r_sheet-window lattice cells, molecule O vs its r_mol-window O's.
 // Then semi-implicit Euler: `v = (v + dt·f)·damping; p += dt·v`.
@@ -52,9 +56,7 @@ struct Params {
 @group(0) @binding(6) var<storage, read_write> vx: array<f32>;
 @group(0) @binding(7) var<storage, read_write> vy: array<f32>;
 @group(0) @binding(8) var<storage, read_write> vz: array<f32>;
-@group(0) @binding(9) var<storage, read> offsets: array<u32>;
-@group(0) @binding(10) var<storage, read> neighbors: array<u32>;
-@group(0) @binding(11) var<uniform> params: Params;
+@group(0) @binding(9) var<uniform> params: Params;
 
 const NAIVE_WG: u32 = 256u;
 const SHEET_WG: u32 = 8u;
@@ -67,22 +69,47 @@ const TILE: u32 = TILE_W * TILE_W;
 var<workgroup> tile: array<vec3<f32>, TILE>;
 var<workgroup> tile_ok: array<u32, TILE>;
 
-fn rest_for(i: u32) -> f32 {
-    return select(params.sheet_rest, params.bond_rest, i < 3u * params.n_mol);
+/// Spring from neighbour `j` onto the node at `pi`.
+fn spring(acc: vec3<f32>, pi: vec3<f32>, j: u32, rest: f32) -> vec3<f32> {
+    let d = vec3<f32>(px_in[j], py_in[j], pz_in[j]) - pi;
+    let len = length(d);
+    if (len > 1e-9) {
+        let t = params.k_bond * (len - rest) / len;
+        return acc + t * d;
+    }
+    return acc;
 }
 
+/// Bond springs over the canonical waterSheet topology, derived from the node
+/// index in the SAME fixed order `WaterSheetParams::graph` emits: a sheet node
+/// sees up, left, right, down; a molecule's O sees H1 then H2; each H sees its O.
 fn bond_force(i: u32, pi: vec3<f32>) -> vec3<f32> {
     var acc = vec3<f32>(0.0, 0.0, 0.0);
-    let rest = rest_for(i);
-    let start = offsets[i];
-    let end = offsets[i + 1u];
-    for (var k = start; k < end; k = k + 1u) {
-        let j = neighbors[k];
-        let d = vec3<f32>(px_in[j], py_in[j], pz_in[j]) - pi;
-        let len = length(d);
-        if (len > 1e-9) {
-            let t = params.k_bond * (len - rest) / len;
-            acc = acc + t * d;
+    let sheet_base = 3u * params.n_mol;
+    if (i < sheet_base) {
+        let o = (i / 3u) * 3u;
+        if (i == o) {
+            acc = spring(acc, pi, o + 1u, params.bond_rest);
+            acc = spring(acc, pi, o + 2u, params.bond_rest);
+        } else {
+            acc = spring(acc, pi, o, params.bond_rest);
+        }
+    } else {
+        let local = i - sheet_base;
+        let cols = params.cols;
+        let r = local / cols;
+        let c = local - cols * r;
+        if (r > 0u) {
+            acc = spring(acc, pi, i - cols, params.sheet_rest);
+        }
+        if (c > 0u) {
+            acc = spring(acc, pi, i - 1u, params.sheet_rest);
+        }
+        if (c + 1u < cols) {
+            acc = spring(acc, pi, i + 1u, params.sheet_rest);
+        }
+        if (r + 1u < params.rows) {
+            acc = spring(acc, pi, i + cols, params.sheet_rest);
         }
     }
     return acc;
