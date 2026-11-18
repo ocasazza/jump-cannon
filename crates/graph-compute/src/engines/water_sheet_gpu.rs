@@ -280,12 +280,34 @@ impl LayoutEngine for WaterSheetGpuEngine {
             .gpu
             .as_ref()
             .ok_or_else(|| "water-sheet-gpu requires a wgpu device".to_string())?;
-        let settings = self
-            .settings
-            .clone()
-            .ok_or_else(|| "water-sheet-gpu requires set_params (waterSheet shape) before init")?;
+        // Shape resolution: an explicit `set_params` whose shape matches the
+        // graph is used as-is (validated below, as before); otherwise the
+        // shape is inferred from the CSR, so a bare graph push (UI engine
+        // picker, graph-api compute broker) needs no `set_params`. Tuning
+        // knobs come from `set_params` when present, else the defaults.
+        let graph = shard.graph;
+        let settings = match &self.settings {
+            Some(s) if s.params().n_nodes() == graph.n_nodes => s.clone(),
+            _ => {
+                let inferred = WaterSheetParams::infer_from_csr(graph)?;
+                match &self.settings {
+                    Some(s) => WaterSheetSettings {
+                        molecules: inferred.molecules,
+                        rows: inferred.rows,
+                        cols: inferred.cols,
+                        ..*s
+                    },
+                    None => WaterSheetSettings {
+                        molecules: inferred.molecules,
+                        rows: inferred.rows,
+                        cols: inferred.cols,
+                        ..WaterSheetSettings::default()
+                    },
+                }
+            }
+        };
         let params = settings.params();
-        params.validate_csr(shard.graph)?;
+        params.validate_csr(graph)?;
 
         let device = gpu_ctx.device.clone();
         let queue = gpu_ctx.queue.clone();

@@ -162,6 +162,87 @@ impl WaterSheetParams {
         }
         Ok(())
     }
+
+    /// Infer the `(molecules, rows, cols)` shape of a CSR built in
+    /// `waterSheet` node order (molecule prefix, then row-major sheet), so a
+    /// bare graph push — the UI engine picker or the graph-api compute broker,
+    /// which send the CSR with no shape — can select this engine without
+    /// `set_params`.
+    ///
+    /// Recovery:
+    ///   - the molecule prefix is the longest run, from node 0, of 3-node
+    ///     H–O–H paths: `O = 3m` bonded to exactly `{O+1, O+2}`, each H to
+    ///     exactly `{O}`;
+    ///   - the sheet is the remaining `cells = n - 3M` nodes. Its top-left
+    ///     cell `s` has at most two neighbours — right (`s+1`) and down
+    ///     (`s+cols`) — so `cols` is `(smallest neighbour of s greater than
+    ///     s+1) - s` when one exists, else the sheet is a single row
+    ///     (`cols = cells`);
+    ///   - `rows = cells / cols`, which must divide exactly.
+    ///
+    /// A 1-column sheet is a simple path — the SAME CSR as the 1-row sheet of
+    /// the same length — so `Nx1` canonicalises to the single-row form
+    /// `(1, N)`. For every shape the recovered params reproduce the input
+    /// graph (`params.graph() == csr`), and a shape-matching `set_params`
+    /// round-trips exactly.
+    ///
+    /// Returns `Err` for a remainder that is not a valid sheet (a neighbour of
+    /// the base cell pointing back at the molecule prefix, or a cell count
+    /// that does not fill `cols` columns), and re-validates the result with
+    /// [`validate_csr`] so a count-mismatched graph is still rejected.
+    pub fn infer_from_csr(g: &CsrGraph) -> Result<Self, String> {
+        let n = g.n_nodes;
+        let nbrs = |i: u32| -> &[u32] {
+            let (a, b) = (g.offsets[i as usize] as usize, g.offsets[(i + 1) as usize] as usize);
+            &g.neighbors[a..b]
+        };
+        // Molecule prefix: each O bonded to exactly {O+1, O+2}, each H to {O}.
+        let mut molecules = 0u32;
+        while 3 * molecules + 2 < n {
+            let o = 3 * molecules;
+            let is_o = nbrs(o).len() == 2
+                && nbrs(o).contains(&(o + 1))
+                && nbrs(o).contains(&(o + 2));
+            let is_h = |h: u32| nbrs(h).len() == 1 && nbrs(h)[0] == o;
+            if is_o && is_h(o + 1) && is_h(o + 2) {
+                molecules += 1;
+            } else {
+                break;
+            }
+        }
+        let s = 3 * molecules;
+        let cells = n - s;
+        let (rows, cols) = if cells == 0 {
+            (0, 0)
+        } else {
+            let sn = nbrs(s);
+            if sn.iter().any(|&v| v <= s) {
+                return Err(format!(
+                    "water-sheet: cannot infer shape: sheet base node {s} is bonded \
+                     to a node <= {s} (molecules and sheet must be disconnected)"
+                ));
+            }
+            // The base cell's neighbours are right (s+1) and/or down (s+cols);
+            // a down neighbour is the smallest one greater than s+1. A
+            // 1-column sheet's only bond IS the down bond s->s+1, so it falls
+            // into the no-down branch and canonicalises to the identical
+            // single-row path.
+            let cols = match sn.iter().find(|&&v| v > s + 1).copied() {
+                Some(down) => down - s,
+                None => cells,
+            };
+            if cells % cols != 0 {
+                return Err(format!(
+                    "water-sheet: cannot infer shape: {cells} sheet cells do not fill \
+                     {cols} columns"
+                ));
+            }
+            (cells / cols, cols)
+        };
+        let params = Self { molecules, rows, cols };
+        params.validate_csr(g)?;
+        Ok(params)
+    }
 }
 
 /// Tunables for the water-sheet layout. Carried in `set_params` JSON by the
@@ -323,5 +404,79 @@ mod tests {
         };
         let g = wrong.graph();
         assert!(p.validate_csr(&g).is_err());
+    }
+
+    fn assert_same_csr(a: &CsrGraph, b: &CsrGraph) {
+        assert_eq!(a.n_nodes, b.n_nodes);
+        assert_eq!(a.offsets, b.offsets);
+        assert_eq!(a.neighbors, b.neighbors);
+    }
+
+    /// Unambiguous shapes: the inference must return the exact triple and the
+    /// recovered params must reproduce the input CSR byte for byte.
+    #[test]
+    fn infer_recovers_exact_shape() {
+        let cases = [
+            (0u32, 0u32, 0u32),    // empty graph
+            (0, 1, 1),             // single sheet cell
+            (0, 1, 7),             // single row
+            (5, 0, 0),             // molecules only, no sheet
+            (7, 3, 4),             // ragged
+            (20_000, 256, 256),    // 125,536 nodes / 170,304 bonds
+            (3, 1, 5),             // single row with molecules
+        ];
+        for (m, r, c) in cases {
+            let p = WaterSheetParams::new(m, r, c);
+            let g = p.graph();
+            let q = WaterSheetParams::infer_from_csr(&g)
+                .unwrap_or_else(|e| panic!("infer({m}, {r}, {c}): {e}"));
+            assert_eq!(q, p, "infer({m}, {r}, {c})");
+            assert_same_csr(&q.graph(), &g);
+        }
+    }
+
+    /// A 1-column sheet is a simple path — the SAME CSR as the 1-row sheet of
+    /// the same length (its only bond is the down bond `s -> s+1`) — so `Nx1`
+    /// canonicalises to the single-row form `(1, N)` and must still reproduce
+    /// the graph exactly.
+    #[test]
+    fn infer_canonicalises_1_column_sheets() {
+        for (m, r, c) in [(0u32, 7u32, 1u32), (3, 5, 1)] {
+            let p = WaterSheetParams::new(m, r, c);
+            let g = p.graph();
+            let q = WaterSheetParams::infer_from_csr(&g)
+                .unwrap_or_else(|e| panic!("infer({m}, {r}, {c}): {e}"));
+            assert_eq!(q, WaterSheetParams::new(m, 1, r * c), "({m}, {r}, {c})");
+            assert_same_csr(&q.graph(), &g);
+        }
+        // The ambiguity is a fact of the topology, not an inference bug.
+        assert_same_csr(
+            &WaterSheetParams::new(0, 7, 1).graph(),
+            &WaterSheetParams::new(0, 1, 7).graph(),
+        );
+    }
+
+    #[test]
+    fn infer_rejects_non_water_sheet() {
+        // 4-cycle 0-1-2-3-0: the base node's far neighbour is 3 away, giving
+        // cols = 3, and 4 cells do not fill 3 columns.
+        let cycle4 = CsrGraph {
+            n_nodes: 4,
+            offsets: vec![0, 2, 4, 6, 8],
+            neighbors: vec![1, 3, 0, 2, 1, 3, 2, 0],
+        };
+        let e = WaterSheetParams::infer_from_csr(&cycle4).unwrap_err();
+        assert!(e.contains("cannot infer shape"), "{e}");
+
+        // A molecule–sheet bond: the scan stops before it (H2 has two
+        // neighbours, so it is not a valid molecule tail), and the remainder
+        // then fails the count check in validate_csr.
+        let bonded = CsrGraph {
+            n_nodes: 4,
+            offsets: vec![0, 2, 3, 5, 6, 6],
+            neighbors: vec![1, 2, 0, 0, 3, 2],
+        };
+        let e = WaterSheetParams::infer_from_csr(&bonded).unwrap_err();
+        assert!(e.starts_with("water-sheet:"), "{e}");
     }
 }
