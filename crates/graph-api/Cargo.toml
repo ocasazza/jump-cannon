@@ -22,6 +22,7 @@ serde              = { workspace = true }
 serde_json         = { workspace = true }
 serde_yaml         = "0.9"
 bytes              = "1"
+sha2               = "0.10"
 bytemuck           = { version = "1", features = ["derive"] }
 prost              = "0.13"
 tonic              = "0.12"

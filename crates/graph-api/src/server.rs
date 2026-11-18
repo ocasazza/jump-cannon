@@ -25,6 +25,8 @@ use data_loader::{Capability, Effect, HostedImporter, Importer, Transport};
 use graph_layouts::geometric::LensConfig;
 use vault_data::color::PALETTE;
 
+mod assets;
+
 const PROTOBUF_CT: &str = "application/x-protobuf";
 const OCTET_CT: &str = "application/octet-stream";
 const GRAPH_REVISION_HEADER: &str = "x-graph-revision";
@@ -186,9 +188,12 @@ pub fn router_with_host(host: SourceHost) -> Router {
 /// `.precompressed_br()` / `.precompressed_gzip()` send a `foo.br` / `foo.gz`
 /// sibling with the matching `Content-Encoding` when the request's
 /// `Accept-Encoding` permits it, and fall back to the identity file when no
-/// sibling exists (the `trunk watch` dev dist ships none). ServeDir also emits
-/// `Last-Modified` and honors `If-Modified-Since` / `If-None-Match`, so a
-/// repeat load is a 304 instead of a re-sent bundle.
+/// sibling exists (the `trunk watch` dev dist ships none). Dist files come
+/// from the Nix store with epoch mtimes, so date validators (`Last-Modified` /
+/// `If-Modified-Since`) are unusable there; [`assets::assets_service`] replaces
+/// them with strong content-hash ETags (`If-None-Match` → 304, no
+/// `Last-Modified` emitted), so a revalidation answers from content, never from
+/// an epoch date.
 ///
 /// Header policy, applied to every asset response via layers:
 ///   - `Vary: Accept-Encoding` — the body varies by the negotiated encoding, so
@@ -201,11 +206,7 @@ pub fn router_with_host(host: SourceHost) -> Router {
 ///     before reuse; the validators above turn that revalidation into a 304
 ///     rather than a full multi-megabyte re-download.
 fn static_assets_router(dist: std::path::PathBuf) -> Router {
-    let serve = tower_http::services::ServeDir::new(dist)
-        .precompressed_br()
-        .precompressed_gzip();
-    Router::new()
-        .fallback_service(serve)
+    assets::assets_service(dist)
         .layer(tower_http::set_header::SetResponseHeaderLayer::overriding(
             header::VARY,
             HeaderValue::from_static("accept-encoding"),
@@ -2813,45 +2814,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn if_modified_since_returns_304_with_empty_body() {
-        let dist = temp_dist("cond");
-        std::fs::write(dist.join("a.wasm"), b"identity-bytes").unwrap();
-
-        let resp = static_assets_router(dist.clone())
-            .oneshot(
-                Request::builder()
-                    .uri("/a.wasm")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-        let last_modified = resp
-            .headers()
-            .get(header::LAST_MODIFIED)
-            .unwrap()
-            .to_str()
-            .unwrap()
-            .to_owned();
-
-        let resp = static_assets_router(dist.clone())
-            .oneshot(
-                Request::builder()
-                    .uri("/a.wasm")
-                    .header(header::IF_MODIFIED_SINCE, last_modified.as_str())
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::NOT_MODIFIED);
-        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
-        assert!(body.is_empty());
-        let _ = std::fs::remove_dir_all(&dist);
-    }
-
-    #[tokio::test]
     async fn asset_responses_vary_on_accept_encoding() {
         let dist = temp_dist("vary");
         std::fs::write(dist.join("a.wasm"), b"identity-bytes").unwrap();
@@ -2873,6 +2835,223 @@ mod tests {
             .unwrap()
             .to_ascii_lowercase()
             .contains("accept-encoding"));
+        let _ = std::fs::remove_dir_all(&dist);
+    }
+
+    // --- Asset revalidation: content-hash ETags over epoch-mtime dists ---
+    //
+    // Dist files come from the Nix store with epoch mtimes, so a date
+    // validator is meaningless and an epoch `If-Modified-Since` must never
+    // produce a 304 (that is how an upgraded server keeps users on the OLD
+    // wasm forever). Revalidation is instead keyed on a content-hash ETag.
+
+    /// Write `name` with `bytes` and force the Nix-store epoch mtime
+    /// (1970-01-01T00:00:01Z).
+    fn write_epoch_file(dir: &std::path::Path, name: &str, bytes: &[u8]) {
+        let path = dir.join(name);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(&path, bytes).unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1))
+            .unwrap();
+    }
+
+    fn sha256_etag(bytes: &[u8]) -> String {
+        use sha2::{Digest, Sha256};
+        format!("\"{:x}\"", Sha256::digest(bytes))
+    }
+
+    async fn get(
+        router: &axum::Router,
+        uri: &str,
+        headers: &[(axum::http::HeaderName, &str)],
+    ) -> axum::response::Response {
+        let mut req = Request::builder().uri(uri);
+        for (name, value) in headers {
+            req = req.header(name, *value);
+        }
+        router
+            .clone()
+            .oneshot(req.body(Body::empty()).unwrap())
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn epoch_mtime_dist_never_304s_on_if_modified_since() {
+        let dist = temp_dist("etag-ims");
+        write_epoch_file(&dist, "a.wasm", b"identity-bytes");
+
+        // Exactly what a browser revalidating against a Nix-store dist sends:
+        // the epoch Last-Modified it was served before the upgrade.
+        let resp = get(
+            &static_assets_router(dist.clone()),
+            "/a.wasm",
+            &[(header::IF_MODIFIED_SINCE, "Thu, 01 Jan 1970 00:00:01 GMT")],
+        )
+        .await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "an epoch If-Modified-Since must never yield a 304 (stale wasm forever)"
+        );
+        assert!(
+            resp.headers().get(header::LAST_MODIFIED).is_none(),
+            "dist assets must not advertise Last-Modified from an epoch mtime"
+        );
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(body.as_ref(), b"identity-bytes");
+        let _ = std::fs::remove_dir_all(&dist);
+    }
+
+    #[tokio::test]
+    async fn etag_is_content_hash_and_if_none_match_yields_304() {
+        let dist = temp_dist("etag-inm");
+        write_epoch_file(&dist, "a.wasm", b"v1-bytes");
+        let router = static_assets_router(dist.clone());
+
+        let resp = get(&router, "/a.wasm", &[]).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let etag = resp
+            .headers()
+            .get(header::ETAG)
+            .expect("an asset 200 must carry an ETag")
+            .to_str()
+            .unwrap()
+            .to_owned();
+        assert_eq!(etag, sha256_etag(b"v1-bytes"), "ETag must be the content hash");
+
+        let resp = get(&router, "/a.wasm", &[(header::IF_NONE_MATCH, &etag)]).await;
+        assert_eq!(resp.status(), StatusCode::NOT_MODIFIED);
+        assert_eq!(
+            resp.headers().get(header::ETAG).unwrap().to_str().unwrap(),
+            etag
+        );
+        assert!(to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .is_empty());
+        let _ = std::fs::remove_dir_all(&dist);
+    }
+
+    #[tokio::test]
+    async fn upgraded_dist_serves_new_bytes_despite_old_etag() {
+        // Two dists, same path, different bytes, both epoch mtime: the deploy
+        // swap after an upgrade.
+        let old = temp_dist("etag-old");
+        write_epoch_file(&old, "jump-cannon-ui_bg.wasm", b"old-wasm");
+        let new = temp_dist("etag-new");
+        write_epoch_file(&new, "jump-cannon-ui_bg.wasm", b"new-wasm");
+
+        let resp = get(
+            &static_assets_router(old.clone()),
+            "/jump-cannon-ui_bg.wasm",
+            &[],
+        )
+        .await;
+        let old_etag = resp
+            .headers()
+            .get(header::ETAG)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_owned();
+
+        let resp = get(
+            &static_assets_router(new.clone()),
+            "/jump-cannon-ui_bg.wasm",
+            &[(header::IF_NONE_MATCH, old_etag.as_str())],
+        )
+        .await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "a client holding the previous ETag must be re-sent the new bytes"
+        );
+        let new_etag = resp
+            .headers()
+            .get(header::ETAG)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_owned();
+        assert_ne!(new_etag, old_etag);
+        assert_eq!(new_etag, sha256_etag(b"new-wasm"));
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(body.as_ref(), b"new-wasm");
+        let _ = std::fs::remove_dir_all(&old);
+        let _ = std::fs::remove_dir_all(&new);
+    }
+
+    #[tokio::test]
+    async fn precompressed_variants_have_their_own_etags() {
+        let dist = temp_dist("etag-br");
+        write_epoch_file(&dist, "a.wasm", b"identity-bytes");
+        write_epoch_file(&dist, "a.wasm.br", b"brotli-bytes");
+        let router = static_assets_router(dist.clone());
+
+        let resp = get(&router, "/a.wasm", &[(header::ACCEPT_ENCODING, "br")]).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.headers().get(header::CONTENT_ENCODING).unwrap(), "br");
+        let br_etag = resp
+            .headers()
+            .get(header::ETAG)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_owned();
+        assert_eq!(br_etag, sha256_etag(b"brotli-bytes"));
+        assert_eq!(
+            to_bytes(resp.into_body(), usize::MAX).await.unwrap().as_ref(),
+            b"brotli-bytes"
+        );
+
+        // That tag on the identity representation must NOT 304: other bytes.
+        let resp = get(&router, "/a.wasm", &[(header::IF_NONE_MATCH, br_etag.as_str())]).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_ne!(
+            resp.headers().get(header::ETAG).unwrap().to_str().unwrap(),
+            br_etag
+        );
+
+        // ... but revalidating the br representation with its own tag is a 304.
+        let resp = get(
+            &router,
+            "/a.wasm",
+            &[
+                (header::ACCEPT_ENCODING, "br"),
+                (header::IF_NONE_MATCH, br_etag.as_str()),
+            ],
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::NOT_MODIFIED);
+        let _ = std::fs::remove_dir_all(&dist);
+    }
+
+    #[tokio::test]
+    async fn root_index_has_content_etag() {
+        let dist = temp_dist("etag-index");
+        write_epoch_file(&dist, "index.html", b"<!doctype html><title>jc</title>");
+        let router = static_assets_router(dist.clone());
+
+        let resp = get(&router, "/", &[]).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let etag = resp
+            .headers()
+            .get(header::ETAG)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_owned();
+        assert_eq!(etag, sha256_etag(b"<!doctype html><title>jc</title>"));
+
+        let resp = get(&router, "/", &[(header::IF_NONE_MATCH, etag.as_str())]).await;
+        assert_eq!(resp.status(), StatusCode::NOT_MODIFIED);
         let _ = std::fs::remove_dir_all(&dist);
     }
 
