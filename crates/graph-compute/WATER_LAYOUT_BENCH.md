@@ -167,3 +167,52 @@ cargo test -p graph-compute --test gpu_water_layout  # 3 passed, 0 failed
 The CPU relaxation test is discriminating: negating `k_bond` in
 `water::cpu::node_force` fails both relaxation tests (5 passed, 2 failed), and
 restoring it returns to 7 passed.
+
+## End-to-end from native generator
+
+`examples/water_e2e.rs` runs the production path end to end: the native SoA
+`WaterSheetGenerator` (a dev-dependency of graph-compute — the same crate
+`graph-api --source native` feeds) builds the `waterSheet` graph, its counts
+and per-node kinds are cross-checked against `WaterSheetParams`, and the GPU
+engine relaxes that shape. Topology equality itself — node count, per-index
+kind, and the full undirected edge set — is asserted exhaustively by
+`tests/water_topology_matches_generator.rs` over degenerate, single-axis,
+ragged, and `20000x256x256` shapes; no GPU ordering fix was needed (both sides
+already emit O/H1/H2 triples then a row-major sheet).
+
+Shape: `molecules = 30,000,000`, sheet `3163 x 3163` →
+**100,004,569 nodes**, 80,002,812 undirected bonds (30M O + 60M H + 10,004,569
+sheet cells). Reproduce:
+
+```text
+cargo run -p graph-compute --release --example water_e2e -- --steps 300
+```
+
+Two runs, tuned defaults (`workgroup=256 staged=false r_sheet=1 r_mol=1`), on
+the shared M5 Max Metal device — 100M timing is contended, so treat the min
+column as a best sample (see the noise note above):
+
+| run | generate_s | init_s | ms/it min | ms/it med | nodes/s (min) | device bytes | bytes/node |
+|----:|-----------:|-------:|----------:|----------:|--------------:|-------------:|-----------:|
+| 1 | 0.38 | 1.66 | 20.712 | 55.104 | 4.83G | 3.35 GiB | 36.0 |
+| 2 | 0.18 | 1.01 | 34.052 | 54.278 | 2.94G | 3.35 GiB | 36.0 |
+
+`generate_s` is the native SoA build alone (one O(n+e) pass, ~2.3 GB host
+state) and `init_s` is CSR build + canonical seed + device upload + pipeline
+creation. Per-iteration time is above the `1e8` row in the table above because
+this shape is 90% molecule nodes (that bench shape is 30%): every molecule
+node pays the O–O window scan plus two O–H springs, while sheet nodes pay the
+lattice window.
+
+Post-run geometry, measured on the read-back positions after the 300 timed
+steps (bit-identical across both runs — the layout is deterministic, only the
+timing is noisy):
+
+| metric | measured | target | test tolerance |
+|---|---:|---:|---:|
+| max abs(O–H distance − `bond_rest` 0.96) | **0.0071** | 0 | 0.05 |
+| max abs(lattice spacing − `sheet_rest` 1.00) | **0.0766** | 0 | 0.15 |
+| max lattice offset from the ideal grid (centroid removed) | **0.3030** | 0 | 0.5 |
+
+So the 100M-node layout converges to the target geometry within the same
+tolerances the small-scale GPU oracle asserts — it does not merely execute.
