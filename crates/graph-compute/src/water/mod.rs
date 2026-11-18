@@ -45,6 +45,18 @@ pub struct WaterSheetParams {
 }
 
 impl WaterSheetParams {
+    /// Build params for `molecules` molecules plus a `rows` x `cols` sheet —
+    /// the same shape `WaterSheetGenerator::new` of the native SoA generator
+    /// produces (dev-dep oracle), so both sides can be constructed from the
+    /// identical triple.
+    pub fn new(molecules: u32, rows: u32, cols: u32) -> Self {
+        Self {
+            molecules,
+            rows,
+            cols,
+        }
+    }
+
     pub fn n_nodes(&self) -> u32 {
         MOLECULE_STRIDE * self.molecules + self.rows * self.cols
     }
