@@ -176,3 +176,53 @@ fn batched_steps_equal_single_steps() {
     let b = run_gpu(&mut ctx, &s, 7);
     assert_eq!(a, b, "7×step_n(1) must be bit-identical to step_n(7)");
 }
+
+/// A bare graph push with NO `set_params` — the UI engine picker / graph-api
+/// compute broker path: the engine must infer the waterSheet shape from the
+/// CSR, fall back to the default tuning, and still match the CPU oracle.
+#[test]
+fn gpu_infers_shape_without_set_params() {
+    let _g = gpu_guard();
+    let Some(mut ctx) = common::gpu_ctx_or_skip("gpu_infers_shape_without_set_params") else {
+        return;
+    };
+    // `small()` is (10, 8x8) with default physics — exactly what the engine
+    // reconstructs from the inferred shape plus `WaterSheetSettings::default()`.
+    let s = small();
+    let p = s.params();
+    let g = p.graph();
+    let seed = seed_positions(&p, &s);
+    let cpu = run_cpu(&s, 1);
+
+    let mut e = WaterSheetGpuEngine::new();
+    e.init(&mut ctx, &CsrShard::whole(&g), &seed)
+        .expect("init without set_params");
+    e.step_n(1);
+    let gpu = Positions::from_interleaved(&e.read_positions());
+    let d = max_abs_diff(&cpu, &gpu);
+    eprintln!("inferred-shape 1-step max|gpu-cpu| = {d:e}");
+    assert!(
+        gpu.x.iter().chain(&gpu.y).chain(&gpu.z).all(|v| v.is_finite()),
+        "non-finite positions after inferred-shape step"
+    );
+    assert!(d < SHORT_TOL, "inferred-shape diff {d}");
+
+    // A `set_params` shape that does NOT match the graph: the shape is
+    // re-inferred from the CSR while the tuning knobs are kept.
+    let wrong_shape = WaterSheetSettings {
+        molecules: 1000,
+        rows: 64,
+        cols: 64,
+        ..small()
+    };
+    let mut e2 = WaterSheetGpuEngine::new();
+    e2.set_params(&serde_json::to_value(&wrong_shape).unwrap())
+        .expect("set_params");
+    e2.init(&mut ctx, &CsrShard::whole(&g), &seed)
+        .expect("init with a mismatched set_params shape");
+    e2.step_n(1);
+    let gpu2 = Positions::from_interleaved(&e2.read_positions());
+    let d2 = max_abs_diff(&cpu, &gpu2);
+    eprintln!("mismatched-shape 1-step max|gpu-cpu| = {d2:e}");
+    assert!(d2 < SHORT_TOL, "mismatched-shape diff {d2}");
+}
