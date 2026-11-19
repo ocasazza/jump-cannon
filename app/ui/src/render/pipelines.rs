@@ -322,6 +322,11 @@ struct Buffers {
     /// a fresh `copy_buffer_to_buffer` when
     /// `positions_frame_idx - last_positions_copy_frame >= POSITIONS_READBACK_PERIOD`.
     last_positions_copy_frame: u64,
+    /// One-shot: the load-time fit framed the CPU-side seed, but a physics
+    /// layout (re)seeds the shared positions buffer at its own world scale
+    /// during init. Refit once the first post-load readback lands so the
+    /// boot framing reflects the extent actually on the GPU.
+    pending_refit: bool,
 }
 
 impl GraphPipelines {
@@ -706,6 +711,7 @@ impl GraphPipelines {
             positions_readback: Arc::new(Mutex::new(PositionsReadbackState::Idle)),
             positions_frame_idx: 0,
             last_positions_copy_frame: 0,
+            pending_refit: true,
         });
 
         // Wire the region-map compute bind group to the freshly-created
@@ -802,7 +808,29 @@ impl GraphPipelines {
         //   3. run the compute layout
         //   4. if state is Idle and the throttle period elapsed, record
         //      a fresh copy + park at CopyScheduled
-        Self::drain_positions_readback_inner(b);
+        let readback_arrived = Self::drain_positions_readback_inner(b);
+
+        // One-shot boot refit: a physics layout (re)seeds the positions
+        // buffer at its own world scale during init, so the load-time fit
+        // framed the pre-seed CPU extent (the ±800 sphere while the 1.24M
+        // lattice actually spans ~±50k). The first completed readback
+        // carries the real extent — frame it before the user sees a
+        // mis-scaled, all-offscreen view.
+        if readback_arrived && b.pending_refit {
+            b.pending_refit = false;
+            let (mut mn, mut mx) = (
+                Vec3::splat(f32::INFINITY),
+                Vec3::splat(f32::NEG_INFINITY),
+            );
+            for chunk in b.positions_cpu.chunks_exact(3) {
+                let p = Vec3::new(chunk[0], chunk[1], chunk[2]);
+                mn = mn.min(p);
+                mx = mx.max(p);
+            }
+            if mn.is_finite() && mx.is_finite() {
+                self.camera.fit_to_bounds(mn, mx);
+            }
+        }
 
         let was_copy_scheduled = matches!(
             b.positions_readback.lock().ok().as_deref(),
@@ -894,14 +922,14 @@ impl GraphPipelines {
     /// padding back to vec3), unmap the staging buffer, and reset the
     /// readback state to `Idle`. No-op if no completed map is waiting.
     /// Mirrors `drain_energy_readback`.
-    fn drain_positions_readback_inner(b: &mut Buffers) {
+    fn drain_positions_readback_inner(b: &mut Buffers) -> bool {
         // Briefly hold the lock to inspect state. We must NOT read the
         // mapped range while holding the mutex, since the buffer view
         // implicitly retains state inside wgpu and we want the lock
         // dropped before re-entering wgpu APIs.
         let map_succeeded = {
             let Ok(mut guard) = b.positions_readback.lock() else {
-                return;
+                return false;
             };
             match &*guard {
                 PositionsReadbackState::Done(Ok(())) => true,
@@ -909,13 +937,13 @@ impl GraphPipelines {
                     // Map failures are rare and self-recovering — silently
                     // reset to Idle. No unmap needed (never mapped).
                     *guard = PositionsReadbackState::Idle;
-                    return;
+                    return false;
                 }
-                _ => return, // Idle / CopyScheduled / Mapping: nothing to drain.
+                _ => return false, // Idle / CopyScheduled / Mapping: nothing to drain.
             }
         };
         if !map_succeeded {
-            return;
+            return false;
         }
 
         // Lock dropped — safe to enter wgpu again. The staging buffer is
@@ -949,6 +977,7 @@ impl GraphPipelines {
         if let Ok(mut g) = b.positions_readback.lock() {
             *g = PositionsReadbackState::Idle;
         }
+        true
     }
 
     /// Camera + effects uniform writes. Called per frame after `compute_step`.
@@ -2016,6 +2045,14 @@ impl GraphPipelines {
     pub fn fit_camera(&mut self) {
         if let Some((mn, mx)) = self.bounds() {
             self.camera.fit_to_bounds(mn, mx);
+        }
+    }
+
+    /// Drop the pending one-shot boot refit — a remount that carries the
+    /// user's camera pose must keep it instead of auto-framing.
+    pub fn cancel_pending_refit(&mut self) {
+        if let Some(b) = self.buffers.as_mut() {
+            b.pending_refit = false;
         }
     }
 }
