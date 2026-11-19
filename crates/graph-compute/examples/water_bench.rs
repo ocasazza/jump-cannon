@@ -9,10 +9,16 @@
 //! ```text
 //! cargo run --release -p graph-compute --example water_bench -- \
 //!     [--sizes 1e6,1e7,1e8] [--steps 20] [--batch 10] [--workgroup N] \
-//!     [--staged 0|1] [--rsheet R] [--rmol R]
+//!     [--staged 0|1] [--rsheet R] [--rmol R] [--precision f32|f64pos|f64]
 //!
 //! Omitted flags default to [`WaterSheetSettings::default()`].
 //! ```
+//!
+//! `--precision` selects the state precision: `f32` (original), `f64pos`
+//! (64-bit fixed-point positions, f32 forces) or `f64` (native WGSL f64,
+//! which requires `SHADER_F64` and is reported as unsupported on adapters
+//! without it — e.g. Apple GPUs). `bytes/node` reflects the mode's real
+//! device footprint.
 //!
 //! `--steps` is the number of timed iterations per size, executed as
 //! `steps / batch` submits of `batch` iterations each (one command buffer per
@@ -22,7 +28,7 @@
 use std::time::Instant;
 
 use graph_compute::engines::WaterSheetGpuEngine;
-use graph_compute::water::{seed_positions, WaterSheetSettings};
+use graph_compute::water::{seed_positions, WaterPrecision, WaterSheetSettings};
 use graph_compute::{CsrShard, EngineCtx, LayoutEngine};
 
 struct Args {
@@ -33,6 +39,7 @@ struct Args {
     staged: bool,
     r_sheet: u32,
     r_mol: u32,
+    precision: WaterPrecision,
 }
 
 fn parse_args() -> Args {
@@ -47,6 +54,7 @@ fn parse_args() -> Args {
         staged: d.staged,
         r_sheet: d.r_sheet,
         r_mol: d.r_mol,
+        precision: d.precision,
     };
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
@@ -75,6 +83,14 @@ fn parse_args() -> Args {
             "--staged" => a.staged = matches!(val(i), "1" | "true"),
             "--rsheet" => a.r_sheet = val(i).parse().expect("rsheet"),
             "--rmol" => a.r_mol = val(i).parse().expect("rmol"),
+            "--precision" => {
+                a.precision = match val(i) {
+                    "f32" => WaterPrecision::F32,
+                    "f64pos" => WaterPrecision::F64Pos,
+                    "f64" => WaterPrecision::F64,
+                    other => panic!("unknown precision {other} (f32|f64pos|f64)"),
+                }
+            }
             other => panic!("unknown argument {other}"),
         }
         i += 2;
@@ -118,16 +134,24 @@ fn main() {
         return;
     };
     let limits = gpu.device.limits();
+    let shader_f64 = gpu.device.features().contains(wgpu::Features::SHADER_F64);
     println!(
-        "adapter: {} ({:?}) | max_buffer_size {} | max_storage_binding {}",
+        "adapter: {} ({:?}) | max_buffer_size {} | max_storage_binding {} | SHADER_F64 {}",
         gpu.adapter_info.name,
         gpu.adapter_info.backend,
         gib(limits.max_buffer_size),
         gib(limits.max_storage_buffer_binding_size as u64),
+        shader_f64,
     );
     println!(
-        "config: workgroup={} staged={} r_sheet={} r_mol={} steps={} batch={}",
-        args.workgroup, args.staged, args.r_sheet, args.r_mol, args.steps, args.batch
+        "config: precision={:?} workgroup={} staged={} r_sheet={} r_mol={} steps={} batch={}",
+        args.precision,
+        args.workgroup,
+        args.staged,
+        args.r_sheet,
+        args.r_mol,
+        args.steps,
+        args.batch
     );
     println!(
         "{:>12} {:>12} {:>10} {:>10} {:>12} {:>14} {:>12} {:>9}",
@@ -139,6 +163,7 @@ fn main() {
         staged: args.staged,
         r_sheet: args.r_sheet,
         r_mol: args.r_mol,
+        precision: args.precision,
         ..WaterSheetSettings::default()
     };
 
@@ -148,8 +173,13 @@ fn main() {
         let n = p.n_nodes() as u64;
 
         // Cheap pre-flight against adapter limits: bonds are implicit, so the
-        // largest single buffer is a position/velocity axis (4 B per node).
-        let largest = 4 * n;
+        // largest single buffer is a position axis (4 B per node in f32,
+        // 8 B in the f64/f64pos modes).
+        let pos_bytes = match args.precision {
+            WaterPrecision::F32 => 4u64,
+            WaterPrecision::F64Pos | WaterPrecision::F64 => 8u64,
+        };
+        let largest = pos_bytes * n;
         if largest > limits.max_buffer_size
             || largest > limits.max_storage_buffer_binding_size as u64
         {

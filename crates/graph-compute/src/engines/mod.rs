@@ -144,42 +144,63 @@ fn build_gpu_ctx() -> anyhow::Result<GpuCtx> {
     // Requesting the adapter's own max is always valid (it's a ceiling, not an
     // allocation) and Metal / desktop Vulkan back it with multi-GB buffers.
     let adapter_limits = adapter.limits();
-    let (device, queue) = pollster::block_on(adapter.request_device(
-        &wgpu::DeviceDescriptor {
-            label: Some("graph-compute-device"),
-            // Note: native WGSL f16 (`enable f16;` / SHADER_F16) is not yet
-            // implemented by Naga in wgpu 23, so we don't request it. The f16
-            // SpMV variant instead packs two halves per u32 and decodes with the
-            // core `unpack2x16float` builtin — no device feature needed.
-            required_features: wgpu::Features::empty(),
-            required_limits: wgpu::Limits {
-                max_storage_buffers_per_shader_stage: 12,
-                max_storage_buffer_binding_size: adapter_limits.max_storage_buffer_binding_size,
-                max_buffer_size: adapter_limits.max_buffer_size,
-                // A 1-D dispatch of one thread per node hits WebGPU's default
-                // 65535 workgroups-per-dimension cap at ~4.2M nodes
-                // (65535 × 64). Raise to the adapter max so a single linear
-                // dispatch addresses the 10–20M regime; Metal/Vulkan allow far
-                // more per dimension. (Portability note: an adapter that truly
-                // caps at 65535 would still need 2-D tiling — a follow-up.)
-                max_compute_workgroups_per_dimension:
-                    adapter_limits.max_compute_workgroups_per_dimension,
-                // Workgroup-size ceilings (default 256 invocations): lets
-                // kernels with a tunable workgroup (water-sheet) use up to the
-                // adapter's 1024 on Metal. A ceiling, not an allocation.
-                max_compute_invocations_per_workgroup:
-                    adapter_limits.max_compute_invocations_per_workgroup,
-                max_compute_workgroup_size_x: adapter_limits.max_compute_workgroup_size_x,
-                max_compute_workgroup_size_y: adapter_limits.max_compute_workgroup_size_y,
-                ..wgpu::Limits::default()
-            },
-            // Prefer few large allocations over many small ones — the working
-            // set is a handful of big per-node/per-edge arrays.
-            memory_hints: wgpu::MemoryHints::Performance,
+    // f64 WGSL needs the SHADER_F64 feature. Request it when the adapter
+    // advertises it (the water-sheet F64 precision mode probes the DEVICE's
+    // features at init), and retry without it if the device request fails so
+    // an f64-capability quirk can never take the whole GPU down.
+    let adapter_features = adapter.features();
+    let mut required_features = wgpu::Features::empty();
+    if adapter_features.contains(wgpu::Features::SHADER_F64) {
+        required_features |= wgpu::Features::SHADER_F64;
+    }
+    let make_desc = |required_features: wgpu::Features| wgpu::DeviceDescriptor {
+        label: Some("graph-compute-device"),
+        // Note: native WGSL f16 (`enable f16;` / SHADER_F16) is not yet
+        // implemented by Naga in wgpu 23, so we don't request it. The f16
+        // SpMV variant instead packs two halves per u32 and decodes with the
+        // core `unpack2x16float` builtin — no device feature needed.
+        required_features,
+        required_limits: wgpu::Limits {
+            max_storage_buffers_per_shader_stage: 12,
+            max_storage_buffer_binding_size: adapter_limits.max_storage_buffer_binding_size,
+            max_buffer_size: adapter_limits.max_buffer_size,
+            // A 1-D dispatch of one thread per node hits WebGPU's default
+            // 65535 workgroups-per-dimension cap at ~4.2M nodes
+            // (65535 × 64). Raise to the adapter max so a single linear
+            // dispatch addresses the 10–20M regime; Metal/Vulkan allow far
+            // more per dimension. (Portability note: an adapter that truly
+            // caps at 65535 would still need 2-D tiling — a follow-up.)
+            max_compute_workgroups_per_dimension:
+                adapter_limits.max_compute_workgroups_per_dimension,
+            // Workgroup-size ceilings (default 256 invocations): lets
+            // kernels with a tunable workgroup (water-sheet) use up to the
+            // adapter's 1024 on Metal. A ceiling, not an allocation.
+            max_compute_invocations_per_workgroup:
+                adapter_limits.max_compute_invocations_per_workgroup,
+            max_compute_workgroup_size_x: adapter_limits.max_compute_workgroup_size_x,
+            max_compute_workgroup_size_y: adapter_limits.max_compute_workgroup_size_y,
+            ..wgpu::Limits::default()
         },
-        None,
-    ))
-    .context("failed to request wgpu device")?;
+        // Prefer few large allocations over many small ones — the working
+        // set is a handful of big per-node/per-edge arrays.
+        memory_hints: wgpu::MemoryHints::Performance,
+    };
+    let (device, queue) = match pollster::block_on(
+        adapter.request_device(&make_desc(required_features), None),
+    ) {
+        Ok(x) => x,
+        Err(e) if required_features.contains(wgpu::Features::SHADER_F64) => {
+            tracing::warn!(
+                error = %e,
+                "wgpu device request with SHADER_F64 failed; retrying without it"
+            );
+            pollster::block_on(
+                adapter.request_device(&make_desc(wgpu::Features::empty()), None),
+            )
+            .context("failed to request wgpu device")?
+        }
+        Err(e) => return Err(anyhow::Error::from(e).context("failed to request wgpu device")),
+    };
 
     tracing::info!(
         max_storage_buffer_binding_size = device.limits().max_storage_buffer_binding_size,

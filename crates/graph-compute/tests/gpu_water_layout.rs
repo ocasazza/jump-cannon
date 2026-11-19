@@ -18,8 +18,11 @@
 mod common;
 
 use graph_compute::engines::WaterSheetGpuEngine;
-use graph_compute::water::cpu::{geometry_report, run_cpu, Positions};
-use graph_compute::water::{seed_positions, WaterSheetSettings};
+use graph_compute::water::cpu::{
+    geometry_report, max_abs_diff_64, max_abs_diff_f64, run_cpu, run_cpu_f64, run_cpu_f64pos,
+    Positions, Positions64,
+};
+use graph_compute::water::{seed_positions, WaterPrecision, WaterSheetSettings};
 use graph_compute::{CsrShard, EngineCtx, LayoutEngine};
 
 /// Serializes GPU tests in this binary — concurrent wgpu device creation trips
@@ -225,4 +228,261 @@ fn gpu_infers_shape_without_set_params() {
     let d2 = max_abs_diff(&cpu, &gpu2);
     eprintln!("mismatched-shape 1-step max|gpu-cpu| = {d2:e}");
     assert!(d2 < SHORT_TOL, "mismatched-shape diff {d2}");
+}
+
+// ---------------------------------------------------------------------------
+// f64 precision modes (`WaterPrecision::{F32, F64Pos, F64}`).
+// ---------------------------------------------------------------------------
+
+/// Whether the device exposes native WGSL f64 (`SHADER_F64`). `F64` only runs
+/// when true; `F64Pos` needs no feature and never depends on it.
+fn f64_native(ctx: &EngineCtx) -> bool {
+    ctx.gpu
+        .as_ref()
+        .map(|g| g.device.features().contains(wgpu::Features::SHADER_F64))
+        .unwrap_or(false)
+}
+
+/// Run `steps` on the GPU and return the FULL f64 position state. The `F64Pos`
+/// mode decodes its `(integer, fraction)` fixed-point words in f64, so the
+/// 2^-40 position quantum is not collapsed to a single f32 by the readback.
+fn run_gpu_f64(ctx: &mut EngineCtx, s: &WaterSheetSettings, steps: u32) -> Positions64 {
+    let p = s.params();
+    let g = p.graph();
+    let seed = seed_positions(&p, s);
+    let mut e = WaterSheetGpuEngine::new();
+    e.set_params(&serde_json::to_value(s).unwrap())
+        .expect("set_params");
+    e.init(ctx, &CsrShard::whole(&g), &seed).expect("gpu init");
+    e.step_n(steps);
+    Positions64::from_interleaved(&e.read_positions_f64())
+}
+
+/// Initialize the engine and return the error string; panics if init succeeds.
+fn gpu_init_error(ctx: &mut EngineCtx, s: &WaterSheetSettings) -> String {
+    let p = s.params();
+    let g = p.graph();
+    let seed = seed_positions(&p, s);
+    let mut e = WaterSheetGpuEngine::new();
+    e.set_params(&serde_json::to_value(s).unwrap())
+        .expect("set_params");
+    match e.init(ctx, &CsrShard::whole(&g), &seed) {
+        Ok(()) => panic!("init unexpectedly succeeded for precision {:?}", s.precision),
+        Err(err) => err,
+    }
+}
+
+/// Short-horizon tolerance against the FULL f64 oracle: the f64 modes still
+/// compute forces in f32 (`F64Pos`) or f64 (`F64`), so this bound is the
+/// f32-force contraction, not the position-storage precision.
+const F64_SHORT_TOL: f64 = 1e-4;
+/// Long-horizon (300-step, converged) bound against the full f64 oracle.
+const F64_LONG_TOL: f64 = 1e-3;
+/// GPU `F64Pos` vs its own CPU oracle (`step_cpu_f64pos`, the same f32-force /
+/// f32-velocity / high-precision-position operation sequence). The remaining
+/// gap is GPU-vs-CPU force rounding (Metal contracts/reassociates the f32 dot
+/// products, so the two implementations differ by ~1 ulp), amplified by the
+/// transient: measured 2e-7 at 20 steps, 1e-6 at 300.
+const F64POS_ORACLE_TOL: f64 = 1e-5;
+
+/// Per-mode oracle test on the canonical (10, 8×8) shape, naive and staged
+/// kernels. `F64Pos` is compared in f64 against its own oracle and against the
+/// full-f64 oracle; `F64` runs natively only when `SHADER_F64` is exposed and
+/// otherwise must reject the mode with a named error.
+#[test]
+fn f64_precision_modes_match_their_oracles() {
+    let _g = gpu_guard();
+    let Some(mut ctx) = common::gpu_ctx_or_skip("f64_precision_modes_match_their_oracles")
+    else {
+        return;
+    };
+    let native = f64_native(&ctx);
+    eprintln!("SHADER_F64 on device: {native}");
+
+    for staged in [false, true] {
+        let base = WaterSheetSettings {
+            staged,
+            ..small()
+        };
+
+        // F32 baseline (f32 CPU oracle), unchanged behaviour.
+        let cpu32 = run_cpu(&base, SHORT_STEPS as usize);
+        let gpu32 = run_gpu(&mut ctx, &base, SHORT_STEPS);
+        let d32 = max_abs_diff(&cpu32, &gpu32);
+        eprintln!("f32 staged={staged}: {SHORT_STEPS}-step max|gpu-cpu| = {d32:e}");
+        assert!(d32 < SHORT_TOL, "f32 staged={staged}: {d32:e}");
+
+        // F64Pos: 64-bit fixed-point positions (2^-40 quantum), f32 forces.
+        let s_pos = WaterSheetSettings {
+            precision: WaterPrecision::F64Pos,
+            ..base.clone()
+        };
+        let oracle_pos = run_cpu_f64pos(&s_pos, SHORT_STEPS as usize);
+        let gpu_pos = run_gpu_f64(&mut ctx, &s_pos, SHORT_STEPS);
+        let d_pos = max_abs_diff_64(&gpu_pos, &oracle_pos);
+        eprintln!("f64pos staged={staged}: {SHORT_STEPS}-step max|gpu-oracle| (f64) = {d_pos:e}");
+        assert!(
+            d_pos < F64POS_ORACLE_TOL,
+            "f64pos staged={staged}: gpu vs own oracle {d_pos:e}"
+        );
+
+        // It must also track the TRUE full-f64 oracle at f32-force precision.
+        let d_true_short = max_abs_diff_64(&gpu_pos, &run_cpu_f64(&s_pos, SHORT_STEPS as usize));
+        eprintln!(
+            "f64pos staged={staged}: {SHORT_STEPS}-step vs full f64 oracle = {d_true_short:e}"
+        );
+        assert!(
+            d_true_short < F64_SHORT_TOL,
+            "f64pos staged={staged} vs full oracle: {d_true_short:e}"
+        );
+
+        // Long horizon: the damped layout converges; the fixed-point state
+        // must stay on its oracle and well inside the f32 long-horizon bound.
+        let oracle_pos_long = run_cpu_f64pos(&s_pos, LONG_STEPS as usize);
+        let gpu_pos_long = run_gpu_f64(&mut ctx, &s_pos, LONG_STEPS);
+        let d_pos_long = max_abs_diff_64(&gpu_pos_long, &oracle_pos_long);
+        eprintln!("f64pos staged={staged}: {LONG_STEPS}-step max|gpu-oracle| (f64) = {d_pos_long:e}");
+        assert!(
+            d_pos_long < F64POS_ORACLE_TOL,
+            "f64pos long staged={staged}: {d_pos_long:e}"
+        );
+
+        // Geometry on the f64 result itself (same bounds as the f32 test).
+        let r = geometry_report(&gpu_pos_long.to_f32(), &s_pos);
+        eprintln!("f64pos long staged={staged}: geometry {r:?}");
+        assert!(r.max_sheet_spacing_err < 0.15, "staged={staged}: {r:?}");
+        assert!(r.max_oh_err < 0.05, "staged={staged}: {r:?}");
+        assert!(r.max_lattice_offset < 0.5, "staged={staged}: {r:?}");
+
+        // F64: native f64 kernel only where the adapter exposes SHADER_F64;
+        // otherwise `init` must hard-error naming the mode (no silent
+        // precision downgrade — measurable on Apple GPUs, which have no fp64).
+        let s64 = WaterSheetSettings {
+            precision: WaterPrecision::F64,
+            ..base.clone()
+        };
+        if native {
+            let gpu64 = run_gpu_f64(&mut ctx, &s64, SHORT_STEPS);
+            let d64 = max_abs_diff_64(&gpu64, &run_cpu_f64(&s64, SHORT_STEPS as usize));
+            eprintln!("f64 (native) staged={staged}: {SHORT_STEPS}-step = {d64:e}");
+            assert!(d64 < F64_SHORT_TOL, "f64 native staged={staged}: {d64:e}");
+
+            let gpu64_long = run_gpu_f64(&mut ctx, &s64, LONG_STEPS);
+            let d64_long =
+                max_abs_diff_64(&gpu64_long, &run_cpu_f64(&s64, LONG_STEPS as usize));
+            eprintln!("long staged={staged}: f64 {LONG_STEPS}-step = {d64_long:e}");
+            assert!(d64_long < F64_LONG_TOL, "f64 long staged={staged}: {d64_long:e}");
+        } else {
+            let err = gpu_init_error(&mut ctx, &s64);
+            eprintln!("f64 staged={staged}: unsupported on this adapter: {err}");
+            assert!(
+                err.contains("'f64'") && err.contains("SHADER_F64"),
+                "f64 rejection must name the mode and the missing feature: {err}"
+            );
+        }
+    }
+}
+
+/// Drift demonstration over 10,000 steps on a modest shape (100 molecules +
+/// 16×16 sheet = 556 nodes), comparing the FULL f64 GPU state against the
+/// full-f64 CPU oracle.
+///
+/// Measured on this box, 10,000 steps, absolute (positions are O(1)):
+///   f32 state vs the full-f64 oracle:      1.36e-3 — per-step f32 position
+///     rounding accumulates (the drift the mode exists to remove)
+///   F64Pos state vs the full-f64 oracle:   1.46e-5 — 93x tighter; what is
+///     left is the f32 *force* model plus GPU-vs-CPU dot-product rounding
+///     (~1 ulp), not position-storage drift (growth: 6.8e-7 at 100 steps,
+///     1.6e-6 at 1k, 3.1e-6 at 3k, 1.4e-5 at 10k)
+///   F64Pos state vs its own CPU oracle:    1.43e-5 — same cause
+///
+/// `F64POS_DRIFT_MAX` sits between the two bands with margin, and the explicit
+/// 20x ratio assertion keeps the test discriminating: a silent f32 fallback
+/// (or a readback collapse) lands in the f32 band and fails both checks.
+const F32_DRIFT_MIN: f64 = 1e-4;
+const F64POS_DRIFT_MAX: f64 = 5e-5;
+/// Minimum f32/f64pos drift ratio the demonstration must show.
+const MIN_DRIFT_RATIO: f64 = 20.0;
+
+#[test]
+fn f32_drifts_while_f64_modes_track_the_oracle() {
+    let _g = gpu_guard();
+    let Some(mut ctx) = common::gpu_ctx_or_skip("f32_drifts_while_f64_modes_track_the_oracle")
+    else {
+        return;
+    };
+    let base = WaterSheetSettings {
+        molecules: 100,
+        rows: 16,
+        cols: 16,
+        ..WaterSheetSettings::default()
+    };
+    const STEPS: u32 = 10_000;
+    let oracle = run_cpu_f64(&base, STEPS as usize);
+
+    let s32 = WaterSheetSettings {
+        precision: WaterPrecision::F32,
+        ..base.clone()
+    };
+    let s_pos = WaterSheetSettings {
+        precision: WaterPrecision::F64Pos,
+        ..base.clone()
+    };
+    let s64 = WaterSheetSettings {
+        precision: WaterPrecision::F64,
+        ..base.clone()
+    };
+
+    // F32 is read back as f32 (its whole state is f32), widened for the diff.
+    let gpu32 = run_gpu(&mut ctx, &s32, STEPS);
+    let e32 = max_abs_diff_f64(&gpu32, &oracle);
+
+    // F64Pos is read back as f64: the fixed-point state, not its f32 shadow.
+    let gpu_pos = run_gpu_f64(&mut ctx, &s_pos, STEPS);
+    let e_pos = max_abs_diff_64(&gpu_pos, &oracle);
+    let e_pos_oracle = max_abs_diff_64(&gpu_pos, &run_cpu_f64pos(&s_pos, STEPS as usize));
+
+    // F64: native where supported; otherwise the mode must be rejected by name.
+    let native = f64_native(&ctx);
+    let e64 = if native {
+        let g = run_gpu_f64(&mut ctx, &s64, STEPS);
+        Some(max_abs_diff_64(&g, &run_cpu_f64(&s64, STEPS as usize)))
+    } else {
+        let err = gpu_init_error(&mut ctx, &s64);
+        assert!(
+            err.contains("'f64'") && err.contains("SHADER_F64"),
+            "f64 rejection must name the mode and the missing feature: {err}"
+        );
+        eprintln!("f64: unsupported on this adapter ({err})");
+        None
+    };
+
+    eprintln!(
+        "{STEPS}-step drift vs full-f64 oracle (556 nodes, SHADER_F64={native}): \
+         f32={e32:e} f64pos={e_pos:e} f64pos-vs-own-oracle={e_pos_oracle:e} \
+         f64={e64:?}"
+    );
+
+    assert!(
+        e32 > F32_DRIFT_MIN,
+        "f32 must visibly drift from the f64 oracle: {e32:e} <= {F32_DRIFT_MIN:e}"
+    );
+    assert!(
+        e_pos < F64POS_DRIFT_MAX,
+        "f64pos must track the f64 oracle: {e_pos:e} >= {F64POS_DRIFT_MAX:e}"
+    );
+    assert!(
+        e32 / e_pos.max(f64::MIN_POSITIVE) > MIN_DRIFT_RATIO,
+        "f32 drift must exceed f64pos drift by >{MIN_DRIFT_RATIO}x: {e32:e} / {e_pos:e}"
+    );
+    assert!(
+        e_pos_oracle < F64POS_DRIFT_MAX,
+        "f64pos must mirror its own oracle: {e_pos_oracle:e} >= {F64POS_DRIFT_MAX:e}"
+    );
+    if let Some(e64) = e64 {
+        assert!(
+            e64 < F64POS_DRIFT_MAX,
+            "f64 must track the f64 oracle: {e64:e} >= {F64POS_DRIFT_MAX:e}"
+        );
+    }
 }
