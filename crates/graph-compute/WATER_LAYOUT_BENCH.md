@@ -155,13 +155,116 @@ at both radii.
 | f16 positions/velocities | halves traffic but quantises to ~1e-2 absolute at layout scale | not implemented; would break the 1e-3 oracle tolerance |
 | adapter limits | already at adapter max for workgroups; 100M fits the 4 GiB storage-binding cap | nothing to raise |
 
+## Precision
+
+`WaterSheetSettings.precision` selects the numeric representation of the
+GPU-resident position state. Velocities and the force model stay f32 in every
+mode; only the position storage and accumulation change.
+
+| mode | position state | needs | this adapter |
+|---|---|---|---|
+| `f32` (default) | 3 × f32, 4 B/axis | — | runs |
+| `f64pos` | 3 × 64-bit fixed point, 8 B/axis | — | runs |
+| `f64` | 3 × native f64, 8 B/axis | `SHADER_F64` | **unsupported** |
+
+Probe (`examples/water_f64_probe.rs`):
+
+```text
+adapter: Apple M5 Max (Metal)
+probe: SHADER_F64 supported = false
+  request_device(SHADER_F64) error: Unsupported features were requested: Features(SHADER_F64)
+```
+
+Apple GPUs expose no fp64. `F64` therefore hard-errors, naming the mode
+(`precision 'f64' requires wgpu::Features::SHADER_F64, not exposed by this
+adapter (Apple M5 Max / Metal)`); the bench reports that per size and the test
+asserts the rejection. **There is no silent precision downgrade.**
+
+### Why fixed point, not an f32 double-double
+
+The obvious double-float design — a `(hi, lo)` f32 pair updated with Dekker's
+`TwoSum` — does not survive this stack. wgpu-hal leaves Metal's
+`MTLCompileOptions.fastMathEnabled` at its default (on), and the shader
+compiler reassociates floating point, folding `(a + b) - a` to `b` and the
+`TwoSum` residual to zero. Measured with that kernel: the `lo` word was
+**exactly 0 for every component on every step**, and the 10,000-step drift was
+bit-identical to the f32 kernel. Integer arithmetic is immune to such
+reassociation, so `F64Pos` stores each component as a 64-bit fixed-point pair
+(`i32` integer word × 2⁸ + `u32` fraction word, scale 2⁻⁴⁰), updated by an
+exact integer add with carry. Resolution 9.1e-13, range ±8.4e6 — enough for a
+10⁸-node sheet, and no device feature is involved.
+
+### Cost
+
+| size | f32 min / med ms | f64pos min / med ms | f64pos/f32 (min) | bytes/node |
+|-----:|-----------------:|--------------------:|-----------------:|-----------:|
+|  1M  | 0.242 / 0.259, 0.256 / 0.264 | 0.242 / 0.260, 0.260 / 0.419 | **1.00×** | 36 → 60 |
+| 10M  | 1.016 / 1.143, 1.118 / 1.244 | 1.643 / 1.770, 1.755 / 1.802 | **1.58×** | 36 → 60 |
+| 100M | 10.260 / 44.666, 10.545 / 51.253 | 16.568 / 88.449, 17.293 / 96.422 | **1.64×** | 36 → 60 |
+
+Two runs each, `--steps 100 --batch 10`, tuned defaults
+(`workgroup=256 staged=false r_sheet=1 r_mol=1`).
+
+**The cost is memory, and it is honest:** 6 ping-pong position axes at 8 B
+instead of 4 B takes the state from 36.0 to 60.0 B/node (+67 %), and this
+kernel is bandwidth-bound, so the 10M/100M time tracks the byte ratio (1.58–
+1.64× for 1.67× bytes). 1M is launch-bound and unchanged. There is **no**
+"same speed" claim to make: `f64pos` buys precision with bandwidth. (100M
+timing remains contended — see the noise note; the min column is the best
+sample and the bytes ratio is the physical cause.)
+
+### Drift evidence (`tests/gpu_water_layout.rs`)
+
+10,000 steps, 556 nodes, GPU state vs the full-f64 CPU oracle, max absolute
+deviation (positions are O(1)):
+
+| horizon | f32 | f64pos |
+|---:|---:|---:|
+| 100 | — | 6.8e-7 |
+| 300 | — | 1.0e-6 |
+| 1,000 | — | 1.5e-6 |
+| 3,000 | — | 3.0e-6 |
+| 10,000 | **1.36e-3** | **1.46e-5** |
+
+`f64pos` is **93× tighter**. What remains is not position-storage drift: the
+f32 *force* model is shared, and GPU-vs-CPU dot-product rounding (~1 ulp; Metal
+contracts the f32 products) is amplified by the transient —
+`f64pos` GPU vs its own CPU oracle is 1.43e-5, and the growth curve above is
+smooth. For reference, the CPU `step_cpu_f64pos` oracle (f64 position, same f32
+forces) reaches 9.5e-7 against the full oracle, so ~1e-6 is the f32-force floor
+and the residual 1.4e-5 is implementation rounding, not storage quantisation.
+The test asserts `f32 > 1e-4`, `f64pos < 5e-5`, and a >20× ratio, so a silent
+f32 fallback (or an f32-collapsed readback — which measured exactly the f32
+value, 1.36e-3, before the readback exposed the full state) fails it.
+
+Short-horizon oracle checks (`f64_precision_modes_match_their_oracles`, 20 and
+300 steps, naive and staged kernels): `f64pos` GPU vs its CPU oracle 1.5–3.9e-7,
+vs the full-f64 oracle 1.3–1.7e-7; `f64` is asserted to be rejected by name.
+
+### Recommendation
+
+- Keep `f32` as the default: it is the throughput mode.
+- Use `f64pos` when long-horizon positional drift matters more than ~1.6×
+  step time at 10M+ (parity at 1M): 93× less drift for 67 % more device memory.
+- `f64` is not available on Apple silicon; it stays implemented for
+  fp64-capable adapters and is covered by the error-path test here.
+
 ## Verification
 
 Every commit in the log ran:
 
 ```text
-cargo test -p graph-compute --lib water          # 7 passed, 0 failed
-cargo test -p graph-compute --test gpu_water_layout  # 3 passed, 0 failed
+cargo test -p graph-compute --lib water                          # 7 passed, 0 failed
+cargo test -p graph-compute --test gpu_water_layout              # 3 passed, 0 failed
+```
+
+The precision work (commit `db075f3b99`) ran the full set:
+
+```text
+cargo test -p graph-compute --lib water                          # 12 passed, 0 failed
+cargo test -p graph-compute --test gpu_water_layout              #  6 passed, 0 failed
+cargo test -p graph-compute --test water_topology_matches_generator  # 1 passed, 0 failed
+cargo check -p graph-compute --tests --examples                  # clean
 ```
 
 The CPU relaxation test is discriminating: negating `k_bond` in

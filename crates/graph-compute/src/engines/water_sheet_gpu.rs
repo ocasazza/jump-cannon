@@ -26,10 +26,40 @@ use wgpu::util::DeviceExt;
 
 use super::{CsrShard, EngineCtx, LayoutEngine, StepOutput};
 use crate::analytics::workgroup_dims_2d;
-use crate::water::{cpu, WaterSheetParams, WaterSheetSettings};
+use crate::water::{cpu, WaterPrecision, WaterSheetParams, WaterSheetSettings};
 
 /// Stable registry key for this engine.
 pub const LAYOUT_ID: &str = "water-sheet-gpu";
+
+/// Implementation actually running on this device. `F64Pos` needs no device
+/// feature; `F64` is only reachable on adapters exposing `SHADER_F64` (the
+/// engine hard-errors otherwise, naming the mode).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EffectiveMode {
+    /// f32 storage and arithmetic (the original kernel).
+    F32,
+    /// 64-bit fixed-point positions (u32 pair, 2^-40 quantum), f32
+    /// velocities and forces. Needs no device feature.
+    F64Pos,
+    /// Native f64 storage and arithmetic (requires `SHADER_F64`).
+    F64,
+}
+
+impl EffectiveMode {
+    fn pos_bytes(self) -> u64 {
+        match self {
+            EffectiveMode::F32 => 4,
+            EffectiveMode::F64Pos | EffectiveMode::F64 => 8,
+        }
+    }
+
+    fn vel_bytes(self) -> u64 {
+        match self {
+            EffectiveMode::F64 => 8,
+            EffectiveMode::F32 | EffectiveMode::F64Pos => 4,
+        }
+    }
+}
 
 /// Workgroup shape of the staged sheet stencil (8×8 → a `(8+2R)²` shared tile;
 /// must match the WGSL const). The radius `R` is `settings.r_sheet`,
@@ -88,6 +118,8 @@ struct Gpu {
 
     params: WaterSheetParams,
     settings: WaterSheetSettings,
+    mode: EffectiveMode,
+    /// Bytes of one position axis (readback copy size per axis).
     n_bytes_per_axis: u64,
     /// Host copy of the current positions (SoA), refreshed on readback.
     host: cpu::Positions,
@@ -173,19 +205,23 @@ impl WaterSheetGpuEngine {
     }
 
     /// Total bytes of device buffers this engine holds (excluding the lazily
-    /// created readback buffer).
+    /// created readback buffer). Per-node: 6 ping-pong position axes + 3
+    /// velocity axes, each 4 B (f32) or 8 B (f64/f64pos positions) per node.
     pub fn device_bytes(&self) -> u64 {
         let gpu = self.gpu.as_ref().expect("device_bytes before init");
-        let n = gpu.n_bytes_per_axis;
-        // 6 position + 3 velocity axes + params (bonds are implicit).
-        9 * n + std::mem::size_of::<WaterParamsRaw>() as u64
+        let n = gpu.params.n_nodes() as u64;
+        let (pb, vb) = (gpu.mode.pos_bytes(), gpu.mode.vel_bytes());
+        6 * pb * n + 3 * vb * n + std::mem::size_of::<WaterParamsRaw>() as u64
     }
 
     /// Copy the current positions into the (lazily created) readback buffer,
-    /// map it, and return the interleaved positions.
-    pub fn read_positions(&mut self) -> Vec<f32> {
-        let gpu = self.gpu.as_mut().expect("read_positions before init");
+    /// map it, and run `f` over the mapped bytes. `n` is the node count and
+    /// `mode` the effective precision, so `f` can unpack per mode.
+    fn map_readback<R>(&mut self, f: impl FnOnce(&[u8], usize, EffectiveMode) -> R) -> R {
+        let gpu = self.gpu.as_mut().expect("readback before init");
         let nb = gpu.n_bytes_per_axis;
+        let n = gpu.params.n_nodes() as usize;
+        let mode = gpu.mode;
         if gpu.readback.is_none() {
             gpu.readback = Some(gpu.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("water_readback"),
@@ -218,16 +254,120 @@ impl WaterSheetGpuEngine {
         rx.recv().unwrap().unwrap();
 
         let data = slice.get_mapped_range();
-        let n = gpu.params.n_nodes() as usize;
-        let xs: &[f32] = bytemuck::cast_slice(&data[0..4 * n]);
-        let ys: &[f32] = bytemuck::cast_slice(&data[4 * n..8 * n]);
-        let zs: &[f32] = bytemuck::cast_slice(&data[8 * n..12 * n]);
-        gpu.host.x.copy_from_slice(xs);
-        gpu.host.y.copy_from_slice(ys);
-        gpu.host.z.copy_from_slice(zs);
-        let out = gpu.host.to_interleaved();
+        let out = f(&data, n, mode);
         drop(data);
         readback.unmap();
+        out
+    }
+
+    /// Unpack mapped readback bytes into SoA f32 axes — the display / force
+    /// precision. The packed `F64Pos` mode collapses each `(hi, lo)` pair with
+    /// an f32 add, exactly the value its force model consumes.
+    fn unpack_f32(
+        data: &[u8],
+        n: usize,
+        mode: EffectiveMode,
+    ) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
+        let mut x = vec![0.0f32; n];
+        let mut y = vec![0.0f32; n];
+        let mut z = vec![0.0f32; n];
+        let stride = match mode {
+            EffectiveMode::F32 => 4,
+            EffectiveMode::F64Pos | EffectiveMode::F64 => 8,
+        };
+        for (axis, out) in [&mut x, &mut y, &mut z].into_iter().enumerate() {
+            let buf = &data[axis * stride * n..(axis + 1) * stride * n];
+            match mode {
+                EffectiveMode::F32 => {
+                    out.copy_from_slice(bytemuck::cast_slice(buf));
+                }
+                EffectiveMode::F64Pos => {
+                    let u: &[u32] = bytemuck::cast_slice(buf);
+                    for (i, slot) in out.iter_mut().enumerate() {
+                        *slot = (u[2 * i] as i32) as f32 / 256.0
+                            + (u[2 * i + 1] as f32) / 1099511627776.0;
+                    }
+                }
+                EffectiveMode::F64 => {
+                    let v: &[f64] = bytemuck::cast_slice(buf);
+                    for (i, slot) in out.iter_mut().enumerate() {
+                        *slot = v[i] as f32;
+                    }
+                }
+            }
+        }
+        (x, y, z)
+    }
+
+    /// Unpack mapped readback bytes into SoA f64 axes — the full stored state.
+    /// The `F64Pos` mode decodes its 64-bit fixed-point pair in f64, so the
+    /// 2^-40 position quantum is not collapsed to a single f32.
+    fn unpack_f64(
+        data: &[u8],
+        n: usize,
+        mode: EffectiveMode,
+    ) -> (Vec<f64>, Vec<f64>, Vec<f64>) {
+        let mut x = vec![0.0f64; n];
+        let mut y = vec![0.0f64; n];
+        let mut z = vec![0.0f64; n];
+        let stride = match mode {
+            EffectiveMode::F32 => 4,
+            EffectiveMode::F64Pos | EffectiveMode::F64 => 8,
+        };
+        for (axis, out) in [&mut x, &mut y, &mut z].into_iter().enumerate() {
+            let buf = &data[axis * stride * n..(axis + 1) * stride * n];
+            match mode {
+                EffectiveMode::F32 => {
+                    let v: &[f32] = bytemuck::cast_slice(buf);
+                    for (i, slot) in out.iter_mut().enumerate() {
+                        *slot = f64::from(v[i]);
+                    }
+                }
+                EffectiveMode::F64Pos => {
+                    let u: &[u32] = bytemuck::cast_slice(buf);
+                    for (i, slot) in out.iter_mut().enumerate() {
+                        *slot = f64::from(u[2 * i] as i32) / 256.0
+                            + f64::from(u[2 * i + 1]) / 1099511627776.0;
+                    }
+                }
+                EffectiveMode::F64 => {
+                    let v: &[f64] = bytemuck::cast_slice(buf);
+                    out.copy_from_slice(v);
+                }
+            }
+        }
+        (x, y, z)
+    }
+
+    /// Copy the current positions into the (lazily created) readback buffer,
+    /// map it, and return the interleaved f32 positions.
+    pub fn read_positions(&mut self) -> Vec<f32> {
+        let (x, y, z) = self.map_readback(Self::unpack_f32);
+        let gpu = self.gpu.as_mut().expect("read_positions before init");
+        gpu.host.x = x;
+        gpu.host.y = y;
+        gpu.host.z = z;
+        gpu.host.to_interleaved()
+    }
+
+    /// Read the current positions back as interleaved f64. The `F64Pos` mode's
+    /// fixed-point components are decoded in f64, preserving the 2^-40 position
+    /// quantum that the f32 display readback rounds away. Used by the
+    /// precision drift tests.
+    pub fn read_positions_f64(&mut self) -> Vec<f64> {
+        let n = self
+            .gpu
+            .as_ref()
+            .expect("read_positions_f64 before init")
+            .params
+            .n_nodes() as usize;
+        let (x, y, z) = self.map_readback(Self::unpack_f64);
+        let mut out = Vec::with_capacity(3 * n);
+        for i in 0..n {
+            out.push(x[i]);
+            out.push(y[i]);
+            out.push(z[i]);
+        }
         out
     }
 
@@ -312,7 +452,6 @@ impl LayoutEngine for WaterSheetGpuEngine {
         let device = gpu_ctx.device.clone();
         let queue = gpu_ctx.queue.clone();
         let n = params.n_nodes() as usize;
-        let nb = 4u64 * n as u64;
         if positions.len() != 3 * n {
             return Err(format!(
                 "water-sheet-gpu: seed has {} floats, graph needs {}",
@@ -322,25 +461,109 @@ impl LayoutEngine for WaterSheetGpuEngine {
         }
         let host = cpu::Positions::from_interleaved(positions);
 
-        let soa_init = |label: &'static str, axis: &[f32]| {
+        // Effective precision: `F64Pos` needs no device feature, so it always
+        // runs. `F64` is native WGSL f64 and requires `SHADER_F64`; on an
+        // adapter without it (Apple GPUs expose no fp64) the request is a hard
+        // error naming the mode — never a silent precision downgrade.
+        let has_f64 = device.features().contains(wgpu::Features::SHADER_F64);
+        let mode = match settings.precision {
+            WaterPrecision::F32 => EffectiveMode::F32,
+            WaterPrecision::F64Pos => EffectiveMode::F64Pos,
+            WaterPrecision::F64 if has_f64 => EffectiveMode::F64,
+            WaterPrecision::F64 => {
+                return Err(format!(
+                    "water-sheet-gpu: precision 'f64' requires wgpu::Features::SHADER_F64, \
+                     not exposed by this adapter ({} / {:?}); use precision 'f64pos' \
+                     (64-bit fixed-point positions, no fp64 hardware needed) or 'f32'",
+                    gpu_ctx.adapter_info.name, gpu_ctx.adapter_info.backend
+                ));
+            }
+        };
+        tracing::info!(
+            requested = ?settings.precision,
+            effective = ?mode,
+            shader_f64 = has_f64,
+            "water-sheet precision mode"
+        );
+        let nb = mode.pos_bytes() * n as u64;
+
+        let usage = wgpu::BufferUsages::STORAGE
+            | wgpu::BufferUsages::COPY_SRC
+            | wgpu::BufferUsages::COPY_DST;
+        let init_buf = |label: &'static str, contents: &[u8]| {
             device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some(label),
-                contents: bytemuck::cast_slice(axis),
-                usage: wgpu::BufferUsages::STORAGE
-                    | wgpu::BufferUsages::COPY_SRC
-                    | wgpu::BufferUsages::COPY_DST,
+                contents,
+                usage,
             })
         };
+        let init_f32 = |label: &'static str, axis: &[f32]| init_buf(label, bytemuck::cast_slice(axis));
+        let init_u32 = |label: &'static str, axis: &[u32]| init_buf(label, bytemuck::cast_slice(axis));
+        let init_f64 = |label: &'static str, axis: &[f64]| init_buf(label, bytemuck::cast_slice(axis));
+
         // Ping-pong SoA positions, seeded identically so a 0-step read is correct.
-        let px_a = soa_init("water_px_a", &host.x);
-        let py_a = soa_init("water_py_a", &host.y);
-        let pz_a = soa_init("water_pz_a", &host.z);
-        let px_b = soa_init("water_px_b", &host.x);
-        let py_b = soa_init("water_py_b", &host.y);
-        let pz_b = soa_init("water_pz_b", &host.z);
-        let vx = soa_init("water_vx", &vec![0.0f32; n]);
-        let vy = soa_init("water_vy", &vec![0.0f32; n]);
-        let vz = soa_init("water_vz", &vec![0.0f32; n]);
+        let (px_a, py_a, pz_a, px_b, py_b, pz_b, vx, vy, vz) = match mode {
+            EffectiveMode::F32 => {
+                let z = vec![0.0f32; n];
+                (
+                    init_f32("water_px_a", &host.x),
+                    init_f32("water_py_a", &host.y),
+                    init_f32("water_pz_a", &host.z),
+                    init_f32("water_px_b", &host.x),
+                    init_f32("water_py_b", &host.y),
+                    init_f32("water_pz_b", &host.z),
+                    init_f32("water_vx", &z),
+                    init_f32("water_vy", &z),
+                    init_f32("water_vz", &z),
+                )
+            }
+            EffectiveMode::F64Pos => {
+                // 64-bit fixed-point (integer word, fraction word), scale
+                // 2^-40: value = hi/2^8 + lo/2^40. The seed is f32, so the
+                // split is exact in f64.
+                let fixed = |axis: &[f32]| -> Vec<u32> {
+                    let mut v = vec![0u32; 2 * n];
+                    for (i, &x) in axis.iter().enumerate() {
+                        let scaled = f64::from(x) * 1099511627776.0; // * 2^40
+                        let hi = (scaled / 4294967296.0).floor();
+                        let lo = scaled - hi * 4294967296.0;
+                        v[2 * i] = (hi as i32) as u32;
+                        v[2 * i + 1] = lo as u32;
+                    }
+                    v
+                };
+                let (pxa, pya, pza) = (fixed(&host.x), fixed(&host.y), fixed(&host.z));
+                let z = vec![0.0f32; n];
+                (
+                    init_u32("water_px_a", &pxa),
+                    init_u32("water_py_a", &pya),
+                    init_u32("water_pz_a", &pza),
+                    init_u32("water_px_b", &pxa),
+                    init_u32("water_py_b", &pya),
+                    init_u32("water_pz_b", &pza),
+                    init_f32("water_vx", &z),
+                    init_f32("water_vy", &z),
+                    init_f32("water_vz", &z),
+                )
+            }
+            EffectiveMode::F64 => {
+                let widen =
+                    |axis: &[f32]| -> Vec<f64> { axis.iter().map(|&x| f64::from(x)).collect() };
+                let (pxa, pya, pza) = (widen(&host.x), widen(&host.y), widen(&host.z));
+                let z = vec![0.0f64; n];
+                (
+                    init_f64("water_px_a", &pxa),
+                    init_f64("water_py_a", &pya),
+                    init_f64("water_pz_a", &pza),
+                    init_f64("water_px_b", &pxa),
+                    init_f64("water_py_b", &pya),
+                    init_f64("water_pz_b", &pza),
+                    init_f64("water_vx", &z),
+                    init_f64("water_vy", &z),
+                    init_f64("water_vz", &z),
+                )
+            }
+        };
 
         let w = params.mol_grid_w();
         let raw = WaterParamsRaw {
@@ -369,7 +592,12 @@ impl LayoutEngine for WaterSheetGpuEngine {
 
         // The 1-D kernels' workgroup size and the staged tile radius are WGSL
         // consts; substitute the configured values so they are tunable per run.
-        let wgsl = include_str!("../shaders/water_sheet.wgsl")
+        let src = match mode {
+            EffectiveMode::F32 => include_str!("../shaders/water_sheet.wgsl"),
+            EffectiveMode::F64Pos => include_str!("../shaders/water_sheet_f64pos.wgsl"),
+            EffectiveMode::F64 => include_str!("../shaders/water_sheet_f64.wgsl"),
+        };
+        let wgsl = src
             .replace(
                 "const NAIVE_WG: u32 = 256u;",
                 &format!("const NAIVE_WG: u32 = {}u;", settings.workgroup),
@@ -500,6 +728,7 @@ impl LayoutEngine for WaterSheetGpuEngine {
             readback: None,
             params,
             settings,
+            mode,
             n_bytes_per_axis: nb,
             host,
         });

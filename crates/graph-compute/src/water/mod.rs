@@ -245,6 +245,27 @@ impl WaterSheetParams {
     }
 }
 
+/// Numeric precision of the GPU-resident water-sheet state.
+///
+/// - `F32`: the original kernel — f32 positions, velocities and forces.
+/// - `F64Pos`: high-precision positions stored as an exact 64-bit fixed-point
+///   pair (scale 2^-40), which needs no `SHADER_F64` feature and no fp64
+///   hardware; f32 velocities and forces. Forces are computed from the
+///   positions rounded to f32, the velocity is integrated in f32, and the f32
+///   increment is added to the fixed-point position with an exact integer add.
+/// - `F64`: positions, velocities and forces all f64 (native WGSL `f64`,
+///   requires `wgpu::Features::SHADER_F64`; on an adapter without it — Apple
+///   GPUs expose no fp64 — the engine rejects the mode with an error naming
+///   it, never a silent precision downgrade).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum WaterPrecision {
+    #[default]
+    F32,
+    F64Pos,
+    F64,
+}
+
 /// Tunables for the water-sheet layout. Carried in `set_params` JSON by the
 /// engine, and used verbatim by the CPU reference so both paths share one
 /// source of truth for the physics constants.
@@ -255,6 +276,9 @@ pub struct WaterSheetSettings {
     pub molecules: u32,
     pub rows: u32,
     pub cols: u32,
+
+    /// Numeric precision of the GPU state (see [`WaterPrecision`]).
+    pub precision: WaterPrecision,
 
     /// O–H bond rest length.
     pub bond_rest: f32,
@@ -294,6 +318,7 @@ impl Default for WaterSheetSettings {
             molecules: 1000,
             rows: 64,
             cols: 64,
+            precision: WaterPrecision::default(),
             bond_rest: 0.96,
             sheet_rest: 1.0,
             k_bond: 4.0,
