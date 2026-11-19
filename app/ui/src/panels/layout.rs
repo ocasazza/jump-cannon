@@ -144,6 +144,18 @@ static LAST_SOLVED: GlobalSignal<Option<(String, Value)>> = Signal::global(|| No
 static CONTROL_REQUEST_TOKEN: GlobalSignal<u64> = Signal::global(|| 0);
 static CONTROL_BUSY: GlobalSignal<bool> = Signal::global(|| false);
 
+/// Above this node count the local GPU sim starts paused.
+///
+/// Measured on an M-series laptop at a 1276x1098 canvas (this-device
+/// gpu-force, 8 steps/frame): ~26 fps at 50k nodes, ~18 at 100k, ~10 at
+/// 200k, ~3-5 at 1.24M. At 200k a single compute step already blows the
+/// frame budget, so an auto-running sim starves the UI thread; the Layout
+/// panel explains why and Resume/Wake still runs it — the user's call.
+pub(crate) const AUTO_PAUSE_MIN_NODES: usize = 200_000;
+/// Node count of the mount that was auto-paused, `None` once the user
+/// resumed (the notice only renders while the sim is paused).
+static AUTO_PAUSE_NODES: GlobalSignal<Option<usize>> = Signal::global(|| None);
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct RemoteLease {
     graph_revision: u64,
@@ -2379,6 +2391,41 @@ pub(crate) fn backend_switch_header() -> Element {
     }
 }
 
+/// Start the local sim paused when a graph above [`AUTO_PAUSE_MIN_NODES`] is
+/// committed: a single compute step at that size costs tens of milliseconds,
+/// so an auto-running sim starves the UI thread. Called from the graph-commit
+/// path (not only the Layout panel) so it holds with the panel closed; the
+/// notice and Resume live in the panel, and Resume overrides it.
+pub(crate) fn auto_pause_large_graph(n_nodes: usize) {
+    if n_nodes < AUTO_PAUSE_MIN_NODES || active_is_remote() {
+        return;
+    }
+    *AUTO_PAUSE_NODES.write() = Some(n_nodes);
+    render::set_sim_running(false);
+}
+
+/// One-line explanation for the large-graph auto-pause. Names the live
+/// compute cluster when one advertises engines — the preferred home for a
+/// layout too big for the in-process sim.
+fn auto_pause_notice(n_nodes: usize) -> String {
+    let cluster = COMPUTE
+        .peek()
+        .as_ref()
+        .and_then(|r| r.as_ref().ok())
+        .is_some_and(|e| !e.engines.is_empty());
+    if cluster {
+        format!(
+            "{n_nodes} nodes: the local sim starts paused — a compute step at this size \
+             stalls the UI. Pick a Compute Cluster engine, or Resume to run it locally."
+        )
+    } else {
+        format!(
+            "{n_nodes} nodes: the local sim starts paused — a compute step at this size \
+             stalls the UI. Resume to run it anyway."
+        )
+    }
+}
+
 pub fn panel(ctx: Ctx) -> Element {
     // Re-push the persisted engine onto the live host once per panel mount
     // (the host always boots gpu-force; PREV_APPLIED gates redundant swaps).
@@ -2476,6 +2523,9 @@ pub fn panel(ctx: Ctx) -> Element {
     let is_bridge = active == BRIDGE_GEOMETRIC || active == BRIDGE_REMOTE_FA2;
     // Live sim state for the Pause/Resume toggle (physics + remote engines).
     let sim_running = *render::SIM_RUNNING.read();
+    // Large-graph auto-pause notice: only meaningful while the sim is paused
+    // (a manual resume clears the stored count).
+    let auto_pause = if sim_running { None } else { *AUTO_PAUSE_NODES.read() };
     // Static engines don't auto-apply slider edits — flag when the current
     // settings differ from what was last actually solved so the user knows to
     // press Solve. Physics engines apply live, so this never fires for them.
@@ -2652,7 +2702,13 @@ pub fn panel(ctx: Ctx) -> Element {
                             } else {
                                 "Pause or resume the local running layout (also on the graph HUD)."
                             },
-                            onclick: move |_| render::set_sim_running(!sim_running),
+                            onclick: move |_| {
+                                // A manual resume retires the auto-pause notice.
+                                if !sim_running {
+                                    *AUTO_PAUSE_NODES.write() = None;
+                                }
+                                render::set_sim_running(!sim_running);
+                            },
                             { if is_bridge {
                                 if sim_running { "Freeze view" } else { "Follow live" }
                             } else if sim_running { "Pause" } else { "Resume" } }
@@ -2661,6 +2717,9 @@ pub fn panel(ctx: Ctx) -> Element {
                 }
                 if static_dirty {
                     div { class: "lay-hint", "Unsolved slider changes — press Solve to apply." }
+                }
+                if let Some(n) = auto_pause {
+                    div { class: "lay-hint", "{auto_pause_notice(n)}" }
                 }
             }
             if !solve_msg.is_empty() {

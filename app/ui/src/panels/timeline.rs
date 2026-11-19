@@ -197,6 +197,30 @@ pub(crate) fn ensure_ticker() {
     });
 }
 
+/// Ring byte budget: cap on the total stored position bytes (each stored
+/// frame — keyframe or delta — holds a full frame's worth of components).
+/// Keeps the scrub buffer from OOMing wasm's linear memory at large graphs
+/// while leaving small-graph scrub depth untouched.
+const RING_BYTE_BUDGET: usize = 256 * 1024 * 1024;
+/// Lower bound on the effective (budgeted) ring depth.
+const MIN_EFFECTIVE_DEPTH: usize = 8;
+/// Upper bound on the effective (budgeted) ring depth — the egui default.
+const MAX_EFFECTIVE_DEPTH: usize = 300;
+
+/// The requested ring depth reconciled with the byte budget: `per_frame_bytes`
+/// is the cost of one stored frame, so the retained frame count shrinks with
+/// per-frame size, clamped to `[MIN_EFFECTIVE_DEPTH, MAX_EFFECTIVE_DEPTH]`.
+fn budgeted_depth(requested: usize, per_frame_bytes: usize) -> usize {
+    let fit = if per_frame_bytes == 0 {
+        MAX_EFFECTIVE_DEPTH
+    } else {
+        RING_BYTE_BUDGET / per_frame_bytes
+    };
+    requested
+        .min(fit)
+        .clamp(MIN_EFFECTIVE_DEPTH, MAX_EFFECTIVE_DEPTH)
+}
+
 /// One timeline tick:
 ///
 /// 1. Reconcile the ring's depth with the knobs (a change evicts immediately).
@@ -223,10 +247,24 @@ fn tick() {
 
         // Equivalent of the egui `loaded_into_gpu` gate: no host (canvas not
         // mounted yet) or no buffers — just keep the mirrors honest.
-        let loaded = crate::render::with_host(|h| h.pipes.is_loaded()).unwrap_or(false);
+        let (loaded, components) = crate::render::with_host(|h| {
+            (h.pipes.is_loaded(), h.pipes.positions_cpu().len())
+        })
+        .unwrap_or((false, 0));
         if !loaded {
             mirror(&ring);
             return;
+        }
+
+        // Reconcile the ring with its byte budget. One stored frame
+        // (keyframe or delta) costs `components * 4` bytes, and at large
+        // graphs the requested depth can push the ring past wasm's 4 GiB
+        // linear memory (300 frames × 14.9 MB ≈ 4.5 GB at 1.24M nodes) and
+        // OOM the module; the budget shrinks the retained frame count with
+        // per-frame size while small graphs keep the requested depth.
+        let effective = budgeted_depth(depth, components.saturating_mul(4));
+        if ring.depth() != effective {
+            ring.set_depth(effective);
         }
 
         let paused = matches!(*SCRUB.peek(), ScrubState::Paused { .. });
@@ -496,5 +534,43 @@ fn human_bytes(b: usize) -> String {
         format!("{:.1} KB", b as f64 / KB as f64)
     } else {
         format!("{b} B")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn large_frame_shrinks_depth_to_the_byte_budget() {
+        // 1.24M nodes × 3 f32 per frame = 14.88 MB; 256 MiB / 14.88 MB ≈ 18.
+        assert_eq!(budgeted_depth(300, 1_240_000 * 3 * 4), 18);
+    }
+
+    #[test]
+    fn small_frame_keeps_the_requested_depth() {
+        // 125k nodes × 3 f32 = 1.5 MB; 300 frames fit well inside the budget.
+        assert_eq!(budgeted_depth(300, 125_536 * 3 * 4), 178);
+        // 10k nodes × 3 f32 = 120 KB; the 300 default survives untouched.
+        assert_eq!(budgeted_depth(300, 10_000 * 3 * 4), 300);
+    }
+
+    #[test]
+    fn requested_depth_below_the_fit_wins() {
+        assert_eq!(budgeted_depth(20, 10_000 * 3 * 4), 20);
+    }
+
+    #[test]
+    fn depth_is_clamped_to_sane_bounds() {
+        // An absurd frame size can't take the ring below the floor.
+        assert_eq!(budgeted_depth(300, usize::MAX), MIN_EFFECTIVE_DEPTH);
+        // An absurd request can't take it past the egui default.
+        assert_eq!(budgeted_depth(10_000, 12), MAX_EFFECTIVE_DEPTH);
+    }
+
+    #[test]
+    fn zero_frame_size_keeps_the_requested_depth() {
+        assert_eq!(budgeted_depth(300, 0), 300);
+        assert_eq!(budgeted_depth(2, 0), MIN_EFFECTIVE_DEPTH);
     }
 }

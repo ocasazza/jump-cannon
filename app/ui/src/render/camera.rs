@@ -235,24 +235,38 @@ impl Camera {
     }
 
     pub fn fit_to_bounds(&mut self, min: Vec3, max: Vec3) {
+        if !min.is_finite() || !max.is_finite() {
+            return;
+        }
         let center = (min + max) * 0.5;
         let radius = ((max - min) * 0.5).length().max(1.0);
         // 1.7× padding (was 1.4× — felt too cramped). With fov_y=60°
         // this lands at ≈ 3.4 × radius, giving the cluster ~25%
         // breathing room on every edge of the viewport.
-        match &mut self.projection {
+        let standoff = match &mut self.projection {
             Projection::Perspective { fov_y } => {
                 let dist = radius * 1.7 / (*fov_y * 0.5).sin();
                 // back off along world +Z, look toward center.
                 self.position = center + Vec3::Z * dist;
+                dist
             }
             Projection::Orthographic { half_height } => {
                 *half_height = radius * 1.7;
                 // Position only needs to satisfy near/far; scale comes
                 // from half_height.
-                self.position = center + Vec3::Z * (radius * 4.0).max(self.znear * 10.0);
+                let dist = (radius * 4.0).max(self.znear * 10.0);
+                self.position = center + Vec3::Z * dist;
+                dist
             }
-        }
+        };
+        // The far plane must cover the framed sphere at whatever world scale
+        // the active layout uses: a device-side seed sets its own scale (the
+        // 1.24M lattice spans ~±50k, so the fitted standoff is ~254k), and
+        // the fixed boot 200k far plane then clipped the whole graph to a
+        // black canvas. Grow-only: the pass has no depth buffer, so only
+        // clipping reads it, and shrinking would re-clip a zoomed-out view.
+        // `znear` is deliberately untouched — dollying close must not clip.
+        self.zfar = self.zfar.max(standoff + radius * 3.0);
         // recompute yaw/pitch to look at center
         let dir = (center - self.position).normalize();
         self.pitch = dir.y.asin();

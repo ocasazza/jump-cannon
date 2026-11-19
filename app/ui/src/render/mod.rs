@@ -250,6 +250,9 @@ pub fn mount_canvas(mut scene: Scene) {
             Ok(mut host) => {
                 if let Some(pose) = carried_camera {
                     host.pipes.camera.set_pose(pose);
+                    // A carried pose is the user's framing; don't let the
+                    // post-load one-shot refit override it.
+                    host.pipes.cancel_pending_refit();
                 }
                 let still_current = CTL.with(|c| c.borrow().generation == generation);
                 if !still_current {
