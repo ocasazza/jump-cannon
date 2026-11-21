@@ -3744,8 +3744,8 @@ dependencies = [
 
 [[package]]
 name = "panel-kit"
-version = "1.2.0"
-source = "git+https://github.com/ocasazza/panel-kit?rev=72b0510a7b9dee1416d78555d87a313cc4127614#72b0510a7b9dee1416d78555d87a313cc4127614"
+version = "2.0.0"
+source = "git+https://github.com/ocasazza/panel-kit?rev=7c2c7ae394eb892791bf739e19e585b40ce90461#7c2c7ae394eb892791bf739e19e585b40ce90461"
 dependencies = [
  "dioxus",
  "gloo-storage",
@@ -3761,8 +3761,8 @@ dependencies = [
 
 [[package]]
 name = "panel-kit-core"
-version = "1.2.0"
-source = "git+https://github.com/ocasazza/panel-kit?rev=72b0510a7b9dee1416d78555d87a313cc4127614#72b0510a7b9dee1416d78555d87a313cc4127614"
+version = "2.0.0"
+source = "git+https://github.com/ocasazza/panel-kit?rev=7c2c7ae394eb892791bf739e19e585b40ce90461#7c2c7ae394eb892791bf739e19e585b40ce90461"
 dependencies = [
  "serde",
  "serde_json",
@@ -3770,8 +3770,8 @@ dependencies = [
 
 [[package]]
 name = "panel-kit-grammar"
-version = "1.2.0"
-source = "git+https://github.com/ocasazza/panel-kit?rev=72b0510a7b9dee1416d78555d87a313cc4127614#72b0510a7b9dee1416d78555d87a313cc4127614"
+version = "2.0.0"
+source = "git+https://github.com/ocasazza/panel-kit?rev=7c2c7ae394eb892791bf739e19e585b40ce90461#7c2c7ae394eb892791bf739e19e585b40ce90461"
 dependencies = [
  "panel-kit-core",
  "pest",
