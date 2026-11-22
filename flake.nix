@@ -92,6 +92,8 @@
         graph-api = craneLib.buildPackage (commonArgs // {
           cargoArtifacts = depsNative;
           cargoExtraArgs = "--package graph-api";
+          # Route integration tests bind a loopback HTTP server.
+          __darwinAllowLocalNetworking = pkgs.stdenv.hostPlatform.isDarwin;
           # graph-api is pure Rust (axum + prost) — no system libs, just protoc
           nativeBuildInputs = [ pkgs.protobuf ];
         });
