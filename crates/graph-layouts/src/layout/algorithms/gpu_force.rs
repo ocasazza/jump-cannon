@@ -1098,12 +1098,22 @@ impl GpuForceLayout {
         // sampling.
         state.write_params(queue, &self.options, self.step_index);
         let steps = self.options.steps_per_call.max(1);
+        // The caller owns the shared buffer. Reuse its two ping-pong bindings
+        // within this batch, never across calls that could supply a different buffer.
+        let mut position_groups = [None, None];
+        let oct_bg = state.make_oct_bind_group(device);
+        let spring_bg = state.make_spring_bind_group(device);
         for step_i in 0..steps {
             if step_i > 0 {
                 self.step_index = self.step_index.wrapping_add(1);
                 state.write_params(queue, &self.options, self.step_index);
             }
-            state.dispatch_borrowed_step(device, encoder, shared_buffer);
+            let group = position_groups[state.a_is_in as usize].get_or_insert_with(|| {
+                let (input, output) = state.borrowed_in_out(shared_buffer);
+                state.make_bind_group(device, input, output)
+            });
+            state.encode_spring_step(encoder, group, &oct_bg, &spring_bg);
+            state.encode_compute(encoder, group, &oct_bg, &spring_bg);
             state.swap_position_buffers();
         }
         // Bump once more so the next call's first step also gets a fresh
@@ -2405,22 +2415,6 @@ impl GpuState {
         self.encode_spring_step(&mut encoder, &bind_group, &oct_bg, &spring_bg);
         self.encode_compute(&mut encoder, &bind_group, &oct_bg, &spring_bg);
         queue.submit(Some(encoder.finish()));
-    }
-
-    /// Record dispatch into a caller-supplied encoder, reading/writing the
-    /// borrowed shared buffer + internal pos_b.
-    fn dispatch_borrowed_step(
-        &self,
-        device: &wgpu::Device,
-        encoder: &mut wgpu::CommandEncoder,
-        shared: &wgpu::Buffer,
-    ) {
-        let (pos_in, pos_out) = self.borrowed_in_out(shared);
-        let bind_group = self.make_bind_group(device, pos_in, pos_out);
-        let oct_bg = self.make_oct_bind_group(device);
-        let spring_bg = self.make_spring_bind_group(device);
-        self.encode_spring_step(encoder, &bind_group, &oct_bg, &spring_bg);
-        self.encode_compute(encoder, &bind_group, &oct_bg, &spring_bg);
     }
 
     fn encode_compute(
@@ -4666,7 +4660,7 @@ mod tests {
             edge_physics: None, species: None,
         };
         let mut layout = GpuForceLayout::new(GpuForceOptions {
-            steps_per_call: 1,
+            steps_per_call: 3,
             repulsion_mode: RepulsionMode::Exact,
             repulsion_radius: 120.0,
             ..Default::default()
@@ -4674,6 +4668,8 @@ mod tests {
         layout
             .init_with_device_csr(&device, &queue, &input, &positions_buffer)
             .expect("init csr");
+        let before = layout.read_back_positions(&device, &queue, &positions_buffer)
+            .await.expect("initial positions");
 
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("test_step"),
@@ -4686,6 +4682,8 @@ mod tests {
             .await
             .expect("readback");
         assert_eq!(positions.len(), (n as usize) * 4);
+        assert!(before.chunks_exact(4).zip(positions.chunks_exact(4))
+            .any(|(a, b)| a[..3] != b[..3]), "the shared buffer must receive the layout result");
         for p in positions.chunks_exact(4).take(n as usize) {
             for k in 0..3 {
                 assert!(p[k].is_finite(), "position must be finite");
