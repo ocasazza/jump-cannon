@@ -11,8 +11,8 @@ dioxus = { workspace = true }
 # Shared jump-cannon components, keymaps, and graph navigation.
 
 # Develop against a local checkout via [patch] in the workspace Cargo.toml.
-panel-kit = { version = "1.2.0", git = "https://github.com/ocasazza/panel-kit", rev = "72b0510a7b9dee1416d78555d87a313cc4127614" }
-panel-kit-core = { version = "1.2.0", git = "https://github.com/ocasazza/panel-kit", rev = "72b0510a7b9dee1416d78555d87a313cc4127614", features = ["spec-json"] }
+panel-kit = { version = "2.0.0", git = "https://github.com/ocasazza/panel-kit", rev = "7c2c7ae394eb892791bf739e19e585b40ce90461" }
+panel-kit-core = { version = "2.0.0", git = "https://github.com/ocasazza/panel-kit", rev = "7c2c7ae394eb892791bf739e19e585b40ce90461", features = ["spec-json"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 # WASM-side HTTP to graph-api (the frontend always runs in a webview).
