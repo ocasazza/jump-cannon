@@ -60,6 +60,7 @@ pub struct ReqwestTransport {
     token: Option<String>,
     max_response_bytes: usize,
     timeout_seconds: u64,
+    retry: RetryPolicy,
 }
 
 #[cfg(feature = "native")]
@@ -70,6 +71,7 @@ impl fmt::Debug for ReqwestTransport {
             .field("token", &self.token.as_ref().map(|_| "<redacted>"))
             .field("max_response_bytes", &self.max_response_bytes)
             .field("timeout_seconds", &self.timeout_seconds)
+            .field("retry", &self.retry)
             .finish()
     }
 }
@@ -113,7 +115,85 @@ impl ReqwestTransport {
             token: instance.token.clone(),
             max_response_bytes,
             timeout_seconds,
+            retry: RetryPolicy::default(),
         })
+    }
+}
+
+#[cfg(feature = "native")]
+impl ReqwestTransport {
+    /// Replace the retry policy. Production keeps [`RetryPolicy::default`];
+    /// tests shorten the delays.
+    pub fn with_retry_policy(mut self, retry: RetryPolicy) -> Self {
+        self.retry = retry;
+        self
+    }
+
+    /// One request. A failure is tagged transient (worth another attempt) or
+    /// fatal (retrying would repeat the same answer).
+    async fn get_once(&self, url: &str) -> Result<Vec<u8>, Attempt> {
+        let mut request = self
+            .client
+            .get(url)
+            .header(reqwest::header::ACCEPT, CONTENT_TYPE);
+        if let Some(token) = &self.token {
+            request = request.bearer_auth(token);
+        }
+        // reqwest's error display never includes request headers, so the
+        // bearer token cannot leak through these messages.
+        let response = request.send().await.map_err(|error| {
+            let fatal = error.is_builder() || error.is_redirect();
+            Attempt::new(
+                fatal,
+                ImportError::SourceRead {
+                    origin: url.to_string(),
+                    message: format!("HTTP request failed: {error}"),
+                },
+            )
+        })?;
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.bytes().await.unwrap_or_default();
+            let excerpt = truncate_excerpt(&body, ERROR_BODY_EXCERPT_BYTES);
+            return Err(Attempt::new(
+                !is_retryable_status(status),
+                ImportError::SourceRead {
+                    origin: url.to_string(),
+                    message: format!("HTTP {status}: {excerpt}"),
+                },
+            ));
+        }
+        if let Some(length) = response.content_length() {
+            if length as usize > self.max_response_bytes {
+                return Err(Attempt::Fatal(ImportError::SourceRead {
+                    origin: url.to_string(),
+                    message: format!(
+                        "response Content-Length {length} exceeds the {} byte bound",
+                        self.max_response_bytes
+                    ),
+                }));
+            }
+        }
+        let mut stream = response;
+        let mut bytes = Vec::new();
+        while let Some(chunk) = stream.chunk().await.map_err(|error| {
+            Attempt::Transient(ImportError::SourceRead {
+                origin: url.to_string(),
+                message: format!("HTTP stream failed: {error}"),
+            })
+        })? {
+            if bytes.len() + chunk.len() > self.max_response_bytes {
+                return Err(Attempt::Fatal(ImportError::SourceRead {
+                    origin: url.to_string(),
+                    message: format!(
+                        "response stream exceeds the {} byte bound",
+                        self.max_response_bytes
+                    ),
+                }));
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        Ok(bytes)
     }
 }
 
@@ -121,58 +201,93 @@ impl ReqwestTransport {
 impl JsonTransport for ReqwestTransport {
     fn get<'a>(&'a self, url: &'a str) -> ImportFuture<'a, Result<Vec<u8>, ImportError>> {
         Box::pin(async move {
-            let mut request = self
-                .client
-                .get(url)
-                .header(reqwest::header::ACCEPT, CONTENT_TYPE);
-            if let Some(token) = &self.token {
-                request = request.bearer_auth(token);
-            }
-            // reqwest's error display never includes request headers, so the
-            // bearer token cannot leak through these messages.
-            let response = request.send().await.map_err(|error| ImportError::SourceRead {
-                origin: url.to_string(),
-                message: format!("HTTP request failed: {error}"),
-            })?;
-            let status = response.status();
-            if !status.is_success() {
-                let body = response.bytes().await.unwrap_or_default();
-                let excerpt = truncate_excerpt(&body, ERROR_BODY_EXCERPT_BYTES);
-                return Err(ImportError::SourceRead {
-                    origin: url.to_string(),
-                    message: format!("HTTP {status}: {excerpt}"),
-                });
-            }
-            if let Some(length) = response.content_length() {
-                if length as usize > self.max_response_bytes {
-                    return Err(ImportError::SourceRead {
-                        origin: url.to_string(),
-                        message: format!(
-                            "response Content-Length {length} exceeds the {} byte bound",
-                            self.max_response_bytes
-                        ),
-                    });
+            let mut failed = 0u32;
+            loop {
+                match self.get_once(url).await {
+                    Ok(bytes) => return Ok(bytes),
+                    Err(Attempt::Fatal(error)) => return Err(error),
+                    Err(Attempt::Transient(error)) => {
+                        failed += 1;
+                        if failed >= self.retry.max_attempts {
+                            return Err(error);
+                        }
+                        let delay = self.retry.delay_after(failed);
+                        tracing::warn!(
+                            url,
+                            attempt = failed,
+                            max_attempts = self.retry.max_attempts,
+                            delay_ms = delay.as_millis() as u64,
+                            %error,
+                            "transient source read failure; retrying"
+                        );
+                        tokio::time::sleep(delay).await;
+                    }
                 }
             }
-            let mut stream = response;
-            let mut bytes = Vec::new();
-            while let Some(chunk) = stream.chunk().await.map_err(|error| ImportError::SourceRead {
-                origin: url.to_string(),
-                message: format!("HTTP stream failed: {error}"),
-            })? {
-                if bytes.len() + chunk.len() > self.max_response_bytes {
-                    return Err(ImportError::SourceRead {
-                        origin: url.to_string(),
-                        message: format!(
-                            "response stream exceeds the {} byte bound",
-                            self.max_response_bytes
-                        ),
-                    });
-                }
-                bytes.extend_from_slice(&chunk);
-            }
-            Ok(bytes)
         })
+    }
+}
+
+/// How a failed request is retried. A source that is momentarily slow or
+/// restarting (a 500 from a timed-out query, a refused connection) answers the
+/// next attempt; without this one such failure ends the whole import and the
+/// process supervisor re-walks every page from the start.
+#[cfg(feature = "native")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RetryPolicy {
+    /// Total attempts per request, the first included.
+    pub max_attempts: u32,
+    /// Wait after the first failure; doubles after each further one.
+    pub base_delay: std::time::Duration,
+    /// Upper bound on any single wait.
+    pub max_delay: std::time::Duration,
+}
+
+#[cfg(feature = "native")]
+impl Default for RetryPolicy {
+    fn default() -> Self {
+        Self {
+            max_attempts: 5,
+            base_delay: std::time::Duration::from_millis(500),
+            max_delay: std::time::Duration::from_secs(8),
+        }
+    }
+}
+
+#[cfg(feature = "native")]
+impl RetryPolicy {
+    /// Wait before the next attempt, after `failed` consecutive failures
+    /// (1 = the first request failed).
+    pub fn delay_after(&self, failed: u32) -> std::time::Duration {
+        let doublings = failed.saturating_sub(1).min(20);
+        self.base_delay
+            .saturating_mul(1u32 << doublings)
+            .min(self.max_delay)
+    }
+}
+
+/// Statuses that say "try again": request timeout, too early, rate limit, and
+/// the server-side failures a slow or restarting source produces. Everything
+/// else (including 501 and the 4xx family) repeats the same answer.
+#[cfg(feature = "native")]
+fn is_retryable_status(status: reqwest::StatusCode) -> bool {
+    matches!(status.as_u16(), 408 | 425 | 429 | 500 | 502 | 503 | 504)
+}
+
+#[cfg(feature = "native")]
+enum Attempt {
+    Transient(ImportError),
+    Fatal(ImportError),
+}
+
+#[cfg(feature = "native")]
+impl Attempt {
+    fn new(fatal: bool, error: ImportError) -> Self {
+        if fatal {
+            Self::Fatal(error)
+        } else {
+            Self::Transient(error)
+        }
     }
 }
 

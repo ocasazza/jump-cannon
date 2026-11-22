@@ -1095,3 +1095,116 @@ fn unresolved_placeholder_is_a_programming_error() {
 fn user_agent_constant_is_what_we_send() {
     assert_eq!(super::USER_AGENT, "jump-cannon-http-json-importer");
 }
+
+#[cfg(feature = "native")]
+mod retry {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use data_loader::ImportError;
+
+    use super::{instance, run, JsonTransport};
+    use crate::json::connector::{ReqwestTransport, RetryPolicy};
+
+    /// Serves `script[n]` (status, body) to the nth connection and repeats the
+    /// last entry once the script runs out. Returns the URL and a connection
+    /// counter; every response closes the connection, so one connection is one
+    /// request.
+    async fn serve(script: Vec<(u16, &'static str)>) -> (String, Arc<AtomicUsize>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind a loopback port");
+        let addr = listener.local_addr().expect("local addr");
+        let hits = Arc::new(AtomicUsize::new(0));
+        let counter = hits.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let n = counter.fetch_add(1, Ordering::SeqCst);
+                let (status, body) = script[n.min(script.len() - 1)];
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    let mut seen = Vec::new();
+                    while !seen.windows(4).any(|w| w == b"\r\n\r\n") {
+                        let read = socket.read(&mut buf).await.unwrap_or(0);
+                        if read == 0 {
+                            return;
+                        }
+                        seen.extend_from_slice(&buf[..read]);
+                    }
+                    let response = format!(
+                        "HTTP/1.1 {status} X\r\ncontent-type: application/json\r\n\
+                         content-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = socket.write_all(response.as_bytes()).await;
+                    let _ = socket.shutdown().await;
+                });
+            }
+        });
+        (format!("http://{addr}/v1/banks"), hits)
+    }
+
+    fn transport(max_attempts: u32) -> ReqwestTransport {
+        ReqwestTransport::new(&instance(None), crate::Limits::default(), 5)
+            .expect("transport builds")
+            .with_retry_policy(RetryPolicy {
+                max_attempts,
+                base_delay: Duration::from_millis(1),
+                max_delay: Duration::from_millis(4),
+            })
+    }
+
+    #[test]
+    fn a_transient_500_is_retried_until_the_source_answers() {
+        let (result, hits) = run(async {
+            let (url, hits) =
+                serve(vec![(500, "{\"detail\":\"\"}"), (503, ""), (200, "{\"ok\":1}")]).await;
+            (transport(5).get(&url).await, hits)
+        });
+        assert_eq!(result.expect("the third attempt succeeds"), b"{\"ok\":1}");
+        assert_eq!(hits.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn a_source_that_keeps_failing_is_abandoned_after_max_attempts() {
+        let (result, hits) = run(async {
+            let (url, hits) = serve(vec![(500, "{\"detail\":\"\"}")]).await;
+            (transport(3).get(&url).await, hits)
+        });
+        let error = result.expect_err("every attempt fails");
+        match error {
+            ImportError::SourceRead { message, .. } => {
+                assert!(message.contains("500"), "last error is kept: {message}")
+            }
+            other => panic!("expected SourceRead, got {other:?}"),
+        }
+        assert_eq!(hits.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn a_client_error_is_not_retried() {
+        let (result, hits) = run(async {
+            let (url, hits) = serve(vec![(404, "{}")]).await;
+            (transport(5).get(&url).await, hits)
+        });
+        result.expect_err("404 is final");
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn the_wait_doubles_and_stops_at_the_cap() {
+        let policy = RetryPolicy {
+            max_attempts: 9,
+            base_delay: Duration::from_millis(500),
+            max_delay: Duration::from_secs(8),
+        };
+        let waits: Vec<u64> = (1..=7).map(|n| policy.delay_after(n).as_millis() as u64).collect();
+        assert_eq!(waits, [500, 1000, 2000, 4000, 8000, 8000, 8000]);
+    }
+}
