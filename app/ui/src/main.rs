@@ -1257,14 +1257,8 @@ fn App() -> Element {
         user: use_signal(api::user_name),
     };
 
-    // Surgical live updates: poll the cheap `/graph/ids` revision header and
-    // re-fetch ONLY the graph payload when the server's topology advances.
-    // The layout panel normally drives this through `/graph/layout/stream`,
-    // but that endpoint needs a compute worker; a static filesystem importer
-    // (e.g. a runtime Pest package) has none, so without this the canvas
-    // would only ever show the snapshot loaded at boot. `reload_graph`
-    // replaces the graph in place — panels, selection, camera, and workspace
-    // state survive, unlike a page reload.
+    // Importers without a compute worker have no layout stream. Poll snapshot
+    // metadata so a topology change refreshes the graph without resetting the workspace.
     {
         let ctx = ctx;
         use_effect(move || {

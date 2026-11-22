@@ -489,17 +489,10 @@ fn graph_revision(resp: &gloo_net::http::Response) -> u64 {
         .unwrap_or(0)
 }
 
-/// Cheap liveness probe for the graph topology revision: `HEAD`-style GET
-/// of `/graph/ids` returning only the `X-Graph-Revision` header. Returns
-/// `Ok(None)` when the server does not advertise a revision (older graph-api)
-/// so callers can stay inert instead of reloading on every tick.
+/// Poll the snapshot revision without fetching the node ID list. Older
+/// servers omit the protobuf field, which decodes to zero (unknown).
 pub(crate) async fn graph_revision_probe() -> LoadResult<Option<u64>> {
-    let resp = get("/graph/ids").send().await.map_err(|e| LoadError::Other(e.to_string()))?;
-    let status = resp.status();
-    let revision = graph_revision(&resp);
-    if !(200..300).contains(&status) {
-        return Err(LoadError::Other(format!("/graph/ids -> HTTP {status}")));
-    }
+    let revision = init_load().await?.graph_revision;
     Ok((revision != 0).then_some(revision))
 }
 
