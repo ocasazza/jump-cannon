@@ -2131,10 +2131,16 @@ fn progress_panel(ctx: Ctx) -> Element {
 
 #[cfg(test)]
 mod workspace_migration_tests {
+    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Mutex, PoisonError};
+
     use std::cell::RefCell;
     use std::rc::Rc;
 
-    use panel_kit_core::frame::{project_into, ProjectionBuffer, ProjectionInput, TileLayoutMetrics};
+    use panel_kit_core::frame::{
+        project_into, FrameStatus, ProjectionBuffer, ProjectionInput, TileLayoutMetrics,
+    };
     use panel_kit_core::persist::{apply_save_decision, LayoutStore, SavePolicy};
     use panel_kit_core::reducer::{reduce, ResizePolicy, Snapshot, Viewport, WorkspaceEvent};
     use panel_kit_core::{
@@ -2146,6 +2152,40 @@ mod workspace_migration_tests {
         default_layout, sessions_default_layout, workspace, Panel, SESSIONS_LAYOUT_KEY,
         WORKSPACE_LAYOUT_KEY,
     };
+
+    struct CountingAllocator;
+
+    #[global_allocator]
+    static COUNTING_ALLOCATOR: CountingAllocator = CountingAllocator;
+    static ALLOCATION_TEST_LOCK: Mutex<()> = Mutex::new(());
+    static RECORDED_ALLOCATIONS: AtomicUsize = AtomicUsize::new(0);
+
+    thread_local! {
+        static COUNT_ALLOCATIONS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    // Count only the measuring thread, so unrelated test-harness work cannot
+    // perturb the projection contract.
+    unsafe impl GlobalAlloc for CountingAllocator {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            record_allocation();
+            unsafe { System.alloc(layout) }
+        }
+
+        unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+            record_allocation();
+            unsafe { System.alloc_zeroed(layout) }
+        }
+
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+            unsafe { System.dealloc(ptr, layout) }
+        }
+
+        unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+            record_allocation();
+            unsafe { System.realloc(ptr, layout, new_size) }
+        }
+    }
 
     #[derive(Clone, Default)]
     struct MemoryStore {
@@ -2277,6 +2317,115 @@ mod workspace_migration_tests {
         let graph = resized.panels.iter().find(|panel| panel.kind == Panel::Graph).expect("graph panel");
         assert_eq!(graph.x, 6.0);
         assert_eq!(graph.y, 22.0);
+    }
+
+    #[test]
+    fn inspector_restore_projects_without_allocations() {
+        let viewport = Viewport {
+            width: 1280.0,
+            height: 800.0,
+            units: Units::CssPx,
+        };
+        let mut snapshot = Snapshot::from_defaults(default_layout(), Mode::Floating, viewport);
+        assert_eq!(
+            snapshot
+                .panels
+                .iter()
+                .find(|panel| panel.kind == Panel::Inspector)
+                .expect("Inspector is in the user workspace")
+                .state,
+            WinState::Minimized
+        );
+        let mut scratch = ProjectionBuffer::with_panel_capacity(snapshot.panels.len());
+
+        let initial = workspace::project_workspace(&snapshot, &mut scratch);
+        assert!(!initial.panels.iter().any(|panel| panel.key == Panel::Inspector));
+        drop(initial);
+
+        let context = reduce_context(&snapshot);
+        reduce(
+            &mut snapshot,
+            WorkspaceEvent::Command {
+                target: Some(Panel::Inspector),
+                command: PanelCommand::Restore,
+            },
+            context,
+        );
+        assert_eq!(
+            snapshot
+                .panels
+                .iter()
+                .find(|panel| panel.kind == Panel::Inspector)
+                .expect("Inspector remains in the user workspace")
+                .state,
+            WinState::Floating
+        );
+
+        let warmup = workspace::project_workspace(&snapshot, &mut scratch);
+        assert_eq!(warmup.status, FrameStatus::Ready);
+        assert!(warmup.panels.iter().any(|panel| panel.key == Panel::Inspector));
+        drop(warmup);
+
+        let allocations = allocations_during(|| {
+            let frame = workspace::project_workspace(&snapshot, &mut scratch);
+            assert_eq!(frame.status, FrameStatus::Ready);
+            assert!(frame.panels.iter().any(|panel| panel.key == Panel::Inspector));
+        });
+        assert_eq!(allocations, 0);
+    }
+
+    #[test]
+    fn allocation_counter_detects_intentional_allocation() {
+        // Positive control: the counting allocator must observe a real heap
+        // allocation, otherwise the zero-allocation assertions above prove
+        // nothing.
+        let quiet = allocations_during(|| {
+            std::hint::black_box(1_u32 + 1);
+        });
+        assert_eq!(quiet, 0);
+
+        let allocations = allocations_during(|| {
+            let buffer = std::hint::black_box(Vec::<u8>::with_capacity(4096));
+            assert!(buffer.capacity() >= 4096);
+        });
+        assert_eq!(allocations, 1);
+    }
+
+    fn record_allocation() {
+        if COUNT_ALLOCATIONS.with(std::cell::Cell::get) {
+            RECORDED_ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn allocations_during(run: impl FnOnce()) -> usize {
+        // The lock only serializes measurements and guards no data. Poisoning
+        // means an earlier allocation assertion panicked, which is already
+        // reported on its own; recover so it does not cascade into every later
+        // test. Unwinding still restores the counting flag via CountingScope.
+        let _serial = ALLOCATION_TEST_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+        COUNT_ALLOCATIONS.with(|enabled| enabled.set(false));
+        let scope = CountingScope::start();
+        run();
+        drop(scope);
+        RECORDED_ALLOCATIONS.load(Ordering::SeqCst)
+    }
+
+    struct CountingScope {
+        previous: bool,
+    }
+
+    impl CountingScope {
+        fn start() -> Self {
+            RECORDED_ALLOCATIONS.store(0, Ordering::SeqCst);
+            let previous = COUNT_ALLOCATIONS.with(|enabled| enabled.replace(true));
+            Self { previous }
+        }
+    }
+
+    impl Drop for CountingScope {
+        fn drop(&mut self) {
+            COUNT_ALLOCATIONS.with(|enabled| enabled.set(self.previous));
+        }
     }
 
     fn assert_preserved_panel_ids(catalog: &PanelCatalog<Panel>) {
