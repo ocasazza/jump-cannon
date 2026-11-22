@@ -129,6 +129,27 @@ fn encode_id(s: &str) -> String {
     s.replace('/', "%2F")
 }
 
+fn state_with_node_metrics(id: &str, metrics: vault_data::NodeMetrics) -> AppState {
+    let mut graph = triangle_graph();
+    graph.nodes.get_mut(id).expect("fixture node").metrics = metrics;
+    state_with_graph(graph)
+}
+
+async fn get_node_meta(state: AppState, id: &str) -> NodeMeta {
+    let resp = graph_api::router(state)
+        .oneshot(
+            Request::builder()
+                .uri(format!("/node/{}", encode_id(id)))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .expect("router served");
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = to_bytes(resp.into_body(), 1 << 20).await.expect("body");
+    NodeMeta::decode(bytes.as_ref()).expect("decode NodeMeta")
+}
+
 // ── Tests ────────────────────────────────────────────────────────────────────
 
 #[tokio::test]
@@ -185,56 +206,58 @@ async fn stub_for_missing_node() {
     assert_eq!(meta.tags.len(), 0);
 }
 
-// ── Future: uncomment after proto extension ──────────────────────────────────
+// Inspector response integration: these fields are rendered by the UI from
+// the server's NodeMeta payload.
 
 #[tokio::test]
-async fn energy_fields() {
-    // Will assert meta.node_energy, meta.node_energy_attractive, meta.node_energy_repulsive
-    let state = state_with_graph(triangle_graph());
-    let app = graph_api::router(state);
-    let req = Request::builder()
-        .uri(format!("/node/{}", encode_id("generate:test:A")))
-        .body(Body::empty())
-        .unwrap();
-    let resp = app.oneshot(req).await.expect("router served");
-    assert_eq!(resp.status(), StatusCode::OK);
-    let bytes = to_bytes(resp.into_body(), 1 << 20).await.expect("body");
-    let meta = NodeMeta::decode(bytes.as_ref()).expect("decode NodeMeta");
+async fn energy_fields_reach_inspector_metadata() {
+    let state = state_with_node_metrics(
+        "A",
+        vault_data::NodeMetrics {
+            energy: Some(1.5),
+            energy_attractive: Some(0.5),
+            energy_repulsive: Some(1.0),
+            ..Default::default()
+        },
+    );
+    let meta = get_node_meta(state, "generate:test:A").await;
+
     assert_eq!(meta.id, "generate:test:A");
-    // No energy pass runs on test graph — all energy fields are None.
-    assert_eq!(meta.node_energy, None);
-    assert_eq!(meta.node_energy_attractive, None);
-    assert_eq!(meta.node_energy_repulsive, None);
+    assert_eq!(meta.node_energy, Some(1.5));
+    assert_eq!(meta.node_energy_attractive, Some(0.5));
+    assert_eq!(meta.node_energy_repulsive, Some(1.0));
 }
 
 #[tokio::test]
-async fn stability_fields() {
-    let state = state_with_graph(triangle_graph());
-    let app = graph_api::router(state);
-    let req = Request::builder()
-        .uri(format!("/node/{}", encode_id("generate:test:C")))
-        .body(Body::empty())
-        .unwrap();
-    let resp = app.oneshot(req).await.expect("router served");
-    assert_eq!(resp.status(), StatusCode::OK);
-    let bytes = to_bytes(resp.into_body(), 1 << 20).await.expect("body");
-    let meta = NodeMeta::decode(bytes.as_ref()).expect("decode NodeMeta");
+async fn stability_fields_reach_inspector_metadata() {
+    let state = state_with_node_metrics(
+        "C",
+        vault_data::NodeMetrics {
+            stability_variance: Some(0.125),
+            stability_drift: Some(0.25),
+            ..Default::default()
+        },
+    );
+    let meta = get_node_meta(state, "generate:test:C").await;
+
     assert_eq!(meta.id, "generate:test:C");
+    assert_eq!(meta.stability_variance, Some(0.125));
+    assert_eq!(meta.stability_drift, Some(0.25));
 }
 
 #[tokio::test]
-async fn anomaly_flag() {
-    let state = state_with_graph(triangle_graph());
-    let app = graph_api::router(state);
-    let req = Request::builder()
-        .uri(format!("/node/{}", encode_id("generate:test:C")))
-        .body(Body::empty())
-        .unwrap();
-    let resp = app.oneshot(req).await.expect("router served");
-    assert_eq!(resp.status(), StatusCode::OK);
-    let bytes = to_bytes(resp.into_body(), 1 << 20).await.expect("body");
-    let meta = NodeMeta::decode(bytes.as_ref()).expect("decode NodeMeta");
+async fn anomaly_flag_reaches_inspector_metadata() {
+    let state = state_with_node_metrics(
+        "C",
+        vault_data::NodeMetrics {
+            anomaly_flag: true,
+            ..Default::default()
+        },
+    );
+    let meta = get_node_meta(state, "generate:test:C").await;
+
     assert_eq!(meta.id, "generate:test:C");
+    assert!(meta.anomaly_flag);
 }
 
 #[tokio::test]
@@ -249,63 +272,175 @@ async fn protobuf_roundtrip() {
     let decoded = NodeMeta::decode(buf.as_ref()).expect("decode");
     assert_eq!(decoded.id, "test:X");
 }
-// ── Indirection tests: verify new-field plumbing ─────────────────────────────
-// These tests guard against the "inert pass" hazard: a new field must not only
-// exist in the proto definition but must actually reach the /node/:id response.
 
 #[tokio::test]
-async fn node_meta_degree_reflects_stored_value() {
-    // Baseline: prove that /node/:id returns the degree stored in the snapshot.
-    // If this fails, the snapshot wiring is broken and no new field will work.
-    let state = state_with_graph(triangle_graph());
-    let app = graph_api::router(state);
-    let req = Request::builder()
-        .uri(format!("/node/{}", encode_id("generate:test:A")))
-        .body(Body::empty())
-        .unwrap();
-    let resp = app.oneshot(req).await.expect("router served");
-    assert_eq!(resp.status(), StatusCode::OK);
-    let bytes = to_bytes(resp.into_body(), 1 << 20).await.expect("body");
-    let meta = NodeMeta::decode(bytes.as_ref()).expect("decode NodeMeta");
-    // degree is u32; a node known to have edges should have degree > 0.
-    // Zero is acceptable since no layout/metadata pass runs on test graphs;
-    // the assertion documents the contract: the field EXISTS and is populated
-    // from the snapshot. If this assertion changes, all new-field plumbing is
-    // suspect.
-    let _ = meta.degree; // field exists in proto and is populated by snapshot
+async fn node_meta_degree_fields_reflect_stored_values() {
+    let state = state_with_node_metrics(
+        "A",
+        vault_data::NodeMetrics {
+            degree: 17,
+            indegree: 7,
+            outdegree: 10,
+            ..Default::default()
+        },
+    );
+    let meta = get_node_meta(state, "generate:test:A").await;
+
+    assert_eq!(meta.degree, 17);
+    assert_eq!(meta.indegree, 7);
+    assert_eq!(meta.outdegree, 10);
 }
 
-#[tokio::test]
-async fn encode_decode_new_field_tag_range_valid() {
-    // Protobuf wire-format guard: the tagged fields we plan to add (23-28)
-    // must not collide with any existing field number in the NodeMeta message.
-    // Today this is a no-op; after proto extension, encode a NodeMeta with
-    // tag=23 set, decode, and assert the value survived.
+#[test]
+fn inspector_metrics_survive_protobuf_round_trip() {
     let meta = NodeMeta {
         id: "guard-test".into(),
+        node_energy: Some(1.5),
+        node_energy_attractive: Some(0.5),
+        node_energy_repulsive: Some(1.0),
+        stability_variance: Some(0.25),
+        stability_drift: Some(0.125),
+        anomaly_flag: true,
         ..Default::default()
     };
     let mut buf = Vec::new();
     meta.encode(&mut buf).expect("encode");
     let decoded = NodeMeta::decode(buf.as_ref()).expect("decode");
+
     assert_eq!(decoded.id, "guard-test");
-    // Tag 23 round-trip: verify the new field survives encode→decode.
-    let with_energy = NodeMeta {
-        id: "guard-test".into(),
-        node_energy: Some(1.5),
-        node_energy_attractive: None,
-        node_energy_repulsive: None,
-        stability_variance: None,
-        stability_drift: None,
-        anomaly_flag: false,
+    assert_eq!(decoded.node_energy, Some(1.5));
+    assert_eq!(decoded.node_energy_attractive, Some(0.5));
+    assert_eq!(decoded.node_energy_repulsive, Some(1.0));
+    assert_eq!(decoded.stability_variance, Some(0.25));
+    assert_eq!(decoded.stability_drift, Some(0.125));
+    assert!(decoded.anomaly_flag);
+}
+
+// ── Absent-field regressions ─────────────────────────────────────────────────
+// Metrics that no layout or metadata pass produced must stay absent on the
+// wire. A zero or fabricated value would show the Inspector a measurement that
+// was never taken.
+
+#[tokio::test]
+async fn absent_energy_and_stability_fields_stay_none_without_layout_pass() {
+    let state = state_with_graph(triangle_graph());
+    let meta = get_node_meta(state, "generate:test:A").await;
+
+    assert_eq!(meta.id, "generate:test:A");
+    assert_eq!(meta.node_energy, None);
+    assert_eq!(meta.node_energy_attractive, None);
+    assert_eq!(meta.node_energy_repulsive, None);
+    assert_eq!(meta.stability_variance, None);
+    assert_eq!(meta.stability_drift, None);
+    assert!(!meta.anomaly_flag);
+}
+
+#[tokio::test]
+async fn node_meta_degree_is_zero_without_metrics_pass() {
+    let state = state_with_graph(triangle_graph());
+    let meta = get_node_meta(state, "generate:test:A").await;
+
+    assert_eq!(meta.degree, 0);
+    assert_eq!(meta.indegree, 0);
+    assert_eq!(meta.outdegree, 0);
+}
+
+#[tokio::test]
+async fn partial_energy_does_not_fabricate_sibling_components() {
+    let state = state_with_node_metrics(
+        "A",
+        vault_data::NodeMetrics {
+            energy: Some(2.0),
+            ..Default::default()
+        },
+    );
+    let meta = get_node_meta(state, "generate:test:A").await;
+
+    assert_eq!(meta.node_energy, Some(2.0));
+    assert_eq!(meta.node_energy_attractive, None);
+    assert_eq!(meta.node_energy_repulsive, None);
+}
+
+#[tokio::test]
+async fn partial_stability_does_not_fabricate_drift() {
+    let state = state_with_node_metrics(
+        "C",
+        vault_data::NodeMetrics {
+            stability_variance: Some(0.5),
+            ..Default::default()
+        },
+    );
+    let meta = get_node_meta(state, "generate:test:C").await;
+
+    assert_eq!(meta.stability_variance, Some(0.5));
+    assert_eq!(meta.stability_drift, None);
+}
+
+#[tokio::test]
+async fn missing_node_stub_reports_no_inspector_metrics() {
+    let meta = get_node_meta(empty_state(), "missing-node").await;
+
+    assert_eq!(meta.node_energy, None);
+    assert_eq!(meta.node_energy_attractive, None);
+    assert_eq!(meta.node_energy_repulsive, None);
+    assert_eq!(meta.stability_variance, None);
+    assert_eq!(meta.stability_drift, None);
+    assert!(!meta.anomaly_flag);
+    assert_eq!(meta.degree, 0);
+}
+
+#[test]
+fn absent_optional_metrics_decode_as_none_not_zero() {
+    let meta = NodeMeta {
+        id: "absent-test".into(),
         ..Default::default()
     };
-    let mut buf2 = Vec::new();
-    with_energy.encode(&mut buf2).expect("encode energy");
-    let decoded2 = NodeMeta::decode(buf2.as_ref()).expect("decode energy");
-    assert_eq!(decoded2.node_energy, Some(1.5));
-    // Other fields must remain at defaults after encoding only one.
-    assert_eq!(decoded2.anomaly_flag, false);
-    assert_eq!(decoded2.stability_variance, None);
+    let mut buf = Vec::new();
+    meta.encode(&mut buf).expect("encode");
+    let decoded = NodeMeta::decode(buf.as_ref()).expect("decode");
+
+    assert_eq!(decoded.node_energy, None);
+    assert_eq!(decoded.node_energy_attractive, None);
+    assert_eq!(decoded.node_energy_repulsive, None);
+    assert_eq!(decoded.stability_variance, None);
+    assert_eq!(decoded.stability_drift, None);
+    assert!(!decoded.anomaly_flag);
+}
+
+#[test]
+fn explicit_zero_metrics_stay_present_on_wire() {
+    let meta = NodeMeta {
+        id: "zero-test".into(),
+        node_energy: Some(0.0),
+        stability_variance: Some(0.0),
+        ..Default::default()
+    };
+    let mut buf = Vec::new();
+    meta.encode(&mut buf).expect("encode");
+    let decoded = NodeMeta::decode(buf.as_ref()).expect("decode");
+
+    assert_eq!(decoded.node_energy, Some(0.0));
+    assert_eq!(decoded.stability_variance, Some(0.0));
+    assert_eq!(decoded.node_energy_attractive, None);
+    assert_eq!(decoded.stability_drift, None);
+}
+
+#[test]
+fn single_populated_metric_leaves_siblings_absent_after_encode() {
+    let meta = NodeMeta {
+        id: "partial-test".into(),
+        node_energy: Some(1.5),
+        ..Default::default()
+    };
+    let mut buf = Vec::new();
+    meta.encode(&mut buf).expect("encode");
+    let decoded = NodeMeta::decode(buf.as_ref()).expect("decode");
+
+    assert_eq!(decoded.node_energy, Some(1.5));
+    assert_eq!(decoded.node_energy_attractive, None);
+    assert_eq!(decoded.node_energy_repulsive, None);
+    assert_eq!(decoded.stability_variance, None);
+    assert_eq!(decoded.stability_drift, None);
+    assert!(!decoded.anomaly_flag);
 }
 

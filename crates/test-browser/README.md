@@ -44,6 +44,17 @@ bundle.
     `filter-builder.png`, `sessions-view.png`, and `boot.png`.
     Pixel content is reviewed rather than asserted.
 
+15. Keyboard navigation dispatches bubbling key events through the app root:
+    `]` and `[` move the selected node and vi cursor together and return to the
+    anchor; `g` exposes the `g g` hint, and `g g` moves the selection and vi
+    cursor to the first visible node (stepping off the anchor first when the
+    anchor already is that node); `/` focuses Nodes search.
+16. Inspector restores from the dock with its metric rows rendered in the
+    expected value shapes (values are not compared with the server payload),
+    and clicking a directed neighbour pill (`←`, `→`, or `↔`; undirected
+    community siblings do not qualify) changes the Inspector node, Nodes
+    focused content, and vi cursor to the pill's target.
+
 On Linux, the harness uses Vulkan for WebGPU compute while disabling the
 display surface; unified headless Chrome presents through its offscreen path
 instead of waiting on a nonexistent swapchain.
@@ -71,9 +82,9 @@ Output lands in `target/test-browser-rust/`:
 - `sessions-view.png` — Sessions workspace (Worlds panel, dock)
 - `boot.png` — screenshot at the moment all assertions passed
 - `report.json` — JSON including structured `pre_wasm_mount`, `nodes_editor`,
-  `settings_tabs`, `filter_builder`, `sessions_view`, `graph_header_actions`,
-  `importer_switch`,
-  canvas, boot-log, and browser-error results
+  `navigation`, `inspector`, `settings_tabs`, `filter_builder`,
+  `sessions_view`, `graph_header_actions`, `importer_switch`, canvas,
+  boot-log, and browser-error results
 
 ## CLI
 
@@ -89,3 +100,31 @@ test-browser \
 liveness probe before Chromium starts. HTTPS goes directly through Chromium so
 the run validates the browser's real certificate trust, private-network
 authentication, secure-context state, and WebGPU exposure.
+
+## Navigation and Inspector fixture limitations
+
+`just test browser-rust` is the canonical seeded run. Its temporary vault
+contains the stable `Node Editor Fixture`, `Node Shared Fixture`, and
+`Node Untagged Fixture` notes plus the chart's Jump Cannon knowledge graph.
+The three browser-specific notes have no wikilinks: keyboard coverage uses the
+graph-wide `]` / `[` cycle rather than assuming those notes have neighbors.
+The Inspector scenario starts with the fixture selection, then searches the
+first 32 rendered graph rows (preferring `Start Here`) for a server-backed
+node with a selectable directed neighbor pill (label `←`, `→`, or `↔`, with a
+title naming the target). Undirected community-sibling pills do not qualify.
+It never adds synthetic edges or pill targets; a graph with no such visible
+neighbor will fail this scenario.
+
+Supplying `VAULT_ROOT` to the wrapper disables the three browser-specific
+notes and the strict fixture requirement. Direct harness runs against a
+custom server must provide a server-backed graph with a connected node; use
+`--fixtures-required` only when `Node Editor Fixture` is present:
+
+```
+cargo run -p test-browser -- \
+  --base-url http://127.0.0.1:8765 \
+  --chromium /path/to/chromium \
+  --out-dir target/test-browser-rust \
+  --timeout-secs 120 \
+  --fixtures-required
+```

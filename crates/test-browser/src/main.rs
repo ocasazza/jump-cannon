@@ -108,6 +108,10 @@ struct Report {
     #[serde(skip_serializing_if = "Option::is_none")]
     nodes_editor: Option<NodesEditorCheck>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    navigation: Option<NavigationCheck>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    inspector: Option<InspectorCheck>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     settings_tabs: Option<SettingsTabsCheck>,
     #[serde(skip_serializing_if = "Option::is_none")]
     importers_panel: Option<ImportersPanelCheck>,
@@ -198,6 +202,47 @@ struct NodesEditorCheck {
     editor_group_ids: Vec<String>,
     #[serde(default)]
     shared_group_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    reason: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct NavigationCheck {
+    ok: bool,
+    fixture_contract: bool,
+    graph_focused: bool,
+    fixture_id: String,
+    anchor_id: String,
+    next_node_id: String,
+    cycle_forward: bool,
+    cycle_backward: bool,
+    cursor_selection_synced: bool,
+    which_key_prefix: bool,
+    prefix_resolved: bool,
+    gg_origin_id: String,
+    gg_first_id: String,
+    degree_visible: bool,
+    search_handoff: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    reason: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct InspectorCheck {
+    ok: bool,
+    inspector_opened: bool,
+    fixture_selected: bool,
+    metrics_present: bool,
+    inspector_sections: bool,
+    pill_list_present: bool,
+    pill_count: usize,
+    pill_clicked: bool,
+    selection_synced: bool,
+    inspector_minimized: bool,
+    fixture_id: String,
+    pill_source_id: String,
+    pill_target_id: String,
+    pill_direction: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     reason: Option<String>,
 }
@@ -432,6 +477,8 @@ async fn main() -> Result<()> {
         pre_wasm_mount,
         header_actions,
         nodes_editor,
+        navigation,
+        inspector,
         settings_tabs,
         importers_panel,
         filter_builder,
@@ -446,6 +493,8 @@ async fn main() -> Result<()> {
                 && o.pre_wasm_mount.ok
                 && o.header_actions.ok
                 && o.nodes_editor.ok
+                && o.navigation.ok
+                && o.inspector.ok
                 && o.settings_tabs.ok
                 && o.importers_panel.ok
                 && o.filter_builder.ok
@@ -465,6 +514,10 @@ async fn main() -> Result<()> {
                 o.header_actions.reason.clone()
             } else if !o.nodes_editor.ok {
                 o.nodes_editor.reason.clone()
+            } else if !o.navigation.ok {
+                o.navigation.reason.clone()
+            } else if !o.inspector.ok {
+                o.inspector.reason.clone()
             } else if !o.settings_tabs.ok {
                 o.settings_tabs.reason.clone()
             } else if !o.importers_panel.ok {
@@ -492,6 +545,8 @@ async fn main() -> Result<()> {
                 Some(o.pre_wasm_mount.clone()),
                 Some(o.header_actions.clone()),
                 Some(o.nodes_editor.clone()),
+                Some(o.navigation.clone()),
+                Some(o.inspector.clone()),
                 Some(o.settings_tabs.clone()),
                 Some(o.importers_panel.clone()),
                 Some(o.filter_builder.clone()),
@@ -506,6 +561,8 @@ async fn main() -> Result<()> {
             0,
             0,
             false,
+            None,
+            None,
             None,
             None,
             None,
@@ -529,6 +586,8 @@ async fn main() -> Result<()> {
         pre_wasm_mount,
         graph_header_actions: header_actions,
         nodes_editor,
+        navigation,
+        inspector,
         settings_tabs,
         importers_panel,
         filter_builder,
@@ -559,6 +618,8 @@ struct RunOk {
     pre_wasm_mount: PreWasmMountCheck,
     header_actions: HeaderActionCheck,
     nodes_editor: NodesEditorCheck,
+    navigation: NavigationCheck,
+    inspector: InspectorCheck,
     settings_tabs: SettingsTabsCheck,
     importers_panel: ImportersPanelCheck,
     filter_builder: FilterBuilderCheck,
@@ -1190,6 +1251,443 @@ async fn drive_page(
     tokio::fs::write(&nodes_shot_path, nodes_bytes).await?;
     tracing::info!("wrote screenshot {}", nodes_shot_path.display());
 
+    // ---- 5b. Keyboard navigation reaches the app through its root handler -
+    // Drive actual bubbling keydown events from the focusable app root and
+    // assert the same Nodes selection/cursor state a user sees. The seeded
+    // fixture notes guarantee a stable anchor, while cycle navigation works
+    // even though those editor fixtures deliberately have no graph links.
+    let navigation_js = r#"(async () => {
+        const waitFor = async (predicate, timeoutMs = 6000) => {
+          const deadline = performance.now() + timeoutMs;
+          while (performance.now() < deadline) {
+            const value = predicate();
+            if (value) return value;
+            await new Promise((resolve) => setTimeout(resolve, 50));
+          }
+          return null;
+        };
+        const failures = [];
+        const editor = await waitFor(() =>
+          document.querySelector('[data-testid="nodes-editor"]')
+        );
+        const flat = editor?.querySelector('[data-node-list-mode="flat"]');
+        if (flat?.getAttribute('aria-pressed') !== 'true') flat?.click();
+        await waitFor(() =>
+          document.querySelector('[data-node-list-mode="flat"]')
+            ?.getAttribute('aria-pressed') === 'true'
+        );
+
+        const rows = () => [...(document.querySelectorAll(
+          '[data-testid="node-sidebar"] [data-node-id]'
+        ) || [])];
+        const rowId = (row) => row?.getAttribute('data-node-id') || '';
+        const seededFixture = rows().find((row) => {
+          const id = rowId(row);
+          return id === 'Node Editor Fixture' || id.endsWith(':Node Editor Fixture');
+        });
+        const fixtureContract = Boolean(seededFixture);
+        const anchor = seededFixture ||
+          rows().find((row) => row.getAttribute('data-vi-cursor') === 'true') ||
+          rows()[0];
+        const anchorId = rowId(anchor);
+        anchor?.click();
+        const selectedId = () => document.querySelector(
+          '[data-testid="node-main"] [data-focused-node]'
+        )?.getAttribute('data-focused-node') || '';
+        const cursorId = () => rowId(document.querySelector(
+          '[data-testid="node-sidebar"] [data-node-id][data-vi-cursor="true"]'
+        ));
+        const initialSelection = Boolean(anchorId && await waitFor(() =>
+          selectedId() === anchorId && cursorId() === anchorId
+        ));
+        const graphPanel = document.querySelector('section.panel-graph');
+        const graphRect = graphPanel?.getBoundingClientRect();
+        if (graphPanel && graphRect) {
+          const pointer = {
+            bubbles: true, cancelable: true, button: 0, buttons: 1, pointerId: 1,
+            clientX: graphRect.left + graphRect.width / 2,
+            clientY: graphRect.top + graphRect.height / 2,
+          };
+          graphPanel.dispatchEvent(new PointerEvent('pointerdown', pointer));
+          graphPanel.dispatchEvent(new PointerEvent('pointerup', {
+            ...pointer, buttons: 0
+          }));
+        }
+        const graphFocused = Boolean(await waitFor(() =>
+          document.querySelector('section.panel-graph.focused')
+        ));
+        const dispatchKey = (key) => {
+          const root = document.querySelector('[tabindex="0"][autofocus]');
+          if (!root) return false;
+          root.focus();
+          root.dispatchEvent(new KeyboardEvent('keydown', {
+            key, bubbles: true, cancelable: true
+          }));
+          return true;
+        };
+        // vi writes this echo from its own intent handler, so it shows the
+        // keymap acted rather than only that the selection happened to move.
+        const echoIs = (label) => {
+          const echo = document.querySelector(
+            '[data-testid="which-key"] .which-key-echo'
+          );
+          return echo?.getAttribute('data-kind') === 'did' &&
+            (echo.textContent || '').includes(label);
+        };
+        const before = selectedId();
+        dispatchKey(']');
+        const nextNodeId = await waitFor(() => {
+          const selected = selectedId();
+          return selected && selected !== before && cursorId() === selected
+            ? selected : null;
+        });
+        const cycleForward = Boolean(nextNodeId);
+        const nextEchoed = Boolean(await waitFor(() => echoIs('next node')));
+        dispatchKey('[');
+        const cycleBackward = Boolean(await waitFor(() =>
+          selectedId() === before && cursorId() === before
+        ));
+        const prevEchoed = Boolean(await waitFor(() => echoIs('prev node')));
+        const forwardAndBackSynced = Boolean(
+          nextNodeId && cursorId() === before
+        );
+
+        // `g g` must visibly move to the first visible node. If the anchor is
+        // already that node, step off it first so the jump is observable.
+        const firstRowId = rowId(rows()[0]);
+        if (firstRowId && selectedId() === firstRowId) {
+          dispatchKey(']');
+          await waitFor(() => {
+            const selected = selectedId();
+            return selected && selected !== firstRowId && cursorId() === selected
+              ? selected : null;
+          });
+        }
+        const ggOriginId = selectedId();
+        dispatchKey('g');
+        const whichKeyPrefix = Boolean(await waitFor(() => {
+          const hint = document.querySelector('[data-testid="which-key"]');
+          const firstNode = [...(hint?.querySelectorAll('.which-key-list li') || [])]
+            .some((row) => row.querySelector('kbd')?.textContent.trim() === 'g g');
+          return hint?.getAttribute('data-open') === 'true' && firstNode;
+        }));
+        dispatchKey('g');
+        const prefixResolved = Boolean(await waitFor(() => {
+          const hint = document.querySelector('[data-testid="which-key"]');
+          return firstRowId && ggOriginId !== firstRowId &&
+            selectedId() === firstRowId && cursorId() === firstRowId &&
+            !hint?.querySelector('.which-key-typed');
+        }));
+        const firstEchoed = Boolean(await waitFor(() => echoIs('first node')));
+
+        dispatchKey('/');
+        const searchHandoff = Boolean(await waitFor(() => {
+          const search = document.querySelector('input.nodes-search');
+          return search && document.activeElement === search;
+        }));
+        // The vi degree badge renders "↑in ↓out" for the cursor node; any
+        // non-empty text would pass, so match the shape the badge emits.
+        const degreeText = (document.querySelector('[data-field="vi-degree"]')
+          ?.textContent || '').trim();
+        const degreeVisible = /^↑\d+ ↓\d+$/.test(degreeText);
+        // Close the `/` prompt so its searching flag cannot leak into the
+        // Inspector checks below; the search input handles Escape.
+        const searchInput = document.querySelector('input.nodes-search');
+        if (searchInput) {
+          searchInput.dispatchEvent(new KeyboardEvent('keydown', {
+            key: 'Escape', bubbles: true, cancelable: true,
+          }));
+        }
+        const cursorSelectionSynced = Boolean(
+          initialSelection && cycleForward && cycleBackward && forwardAndBackSynced
+        );
+
+        if (!editor) failures.push('Nodes editor was not mounted for keyboard navigation');
+        if (!initialSelection) failures.push('keyboard navigation could not anchor on a selected node');
+        if (!graphFocused) failures.push('Graph panel did not receive keyboard focus');
+        if (!cycleForward) failures.push('] did not move the selected node and vi cursor');
+        if (!cycleBackward) failures.push('[ did not return to the anchor node');
+        if (!whichKeyPrefix) failures.push('g did not expose the gg first-node hint');
+        if (!prefixResolved) failures.push(
+          'gg did not move the selection and vi cursor to the first visible node'
+        );
+        if (!degreeVisible) failures.push('vi degree status was not rendered for the cursor');
+        if (!nextEchoed) failures.push('] did not echo the vi next-node action');
+        if (!prevEchoed) failures.push('[ did not echo the vi prev-node action');
+        if (!firstEchoed) failures.push('gg did not echo the vi first-node action');
+        if (!searchHandoff) failures.push('/ did not focus Nodes search');
+        return {
+          ok: failures.length === 0,
+          fixture_contract: fixtureContract,
+          graph_focused: graphFocused,
+          fixture_id: rowId(seededFixture),
+          anchor_id: anchorId,
+          next_node_id: nextNodeId || '',
+          cycle_forward: cycleForward,
+          cycle_backward: cycleBackward,
+          cursor_selection_synced: cursorSelectionSynced,
+          which_key_prefix: whichKeyPrefix,
+          prefix_resolved: prefixResolved,
+          gg_origin_id: ggOriginId,
+          gg_first_id: firstRowId,
+          degree_visible: degreeVisible,
+          search_handoff: searchHandoff,
+          reason: failures.length ? failures.join('; ') : null,
+        };
+    })()"#;
+    let navigation_value: serde_json::Value =
+        page.evaluate(navigation_js).await?.into_value()?;
+    let mut navigation: NavigationCheck = serde_json::from_value(navigation_value)
+        .context("decode keyboard navigation regression result")?;
+    if args.fixtures_required && !navigation.fixture_contract {
+        navigation.ok = false;
+        navigation.reason = Some(match navigation.reason.take() {
+            Some(reason) => format!("{reason}; required Node Editor Fixture was not imported"),
+            None => "required Node Editor Fixture was not imported".to_string(),
+        });
+    }
+
+    // ---- 5c. Inspector pills select real graph nodes ---------------------
+    // The browser-only editor notes have no wikilinks; begin with that stable
+    // selection, then use a linked row from the served graph (Start Here first)
+    // and click its directed neighbour pill (← → ↔), not an undirected community
+    // sibling. Selection must follow into both the Inspector and Nodes cursor
+    // rather than merely rendering pill markup.
+    let inspector_js = r#"(async () => {
+        const waitFor = async (predicate, timeoutMs = 6000) => {
+          const deadline = performance.now() + timeoutMs;
+          while (performance.now() < deadline) {
+            const value = predicate();
+            if (value) return value;
+            await new Promise((resolve) => setTimeout(resolve, 50));
+          }
+          return null;
+        };
+        const failures = [];
+        const rows = () => [...(document.querySelectorAll(
+          '[data-testid="node-sidebar"] [data-node-id]'
+        ) || [])];
+        const rowId = (row) => row?.getAttribute('data-node-id') || '';
+        const fixture = rows().find((row) => {
+          const id = rowId(row);
+          return id === 'Node Editor Fixture' || id.endsWith(':Node Editor Fixture');
+        });
+        const fixtureId = rowId(fixture);
+        const initialRow = fixture ||
+          rows().find((row) => row.getAttribute('data-vi-cursor') === 'true') ||
+          rows()[0];
+        const initialId = rowId(initialRow);
+        initialRow?.click();
+
+        let restoreRequested = false;
+        const inspector = await waitFor(() => {
+          const panel = document.querySelector('section.panel-inspector');
+          if (panel) return panel;
+          if (!restoreRequested) {
+            restoreRequested = true;
+            [...document.querySelectorAll('.dock-chip')]
+              .find((chip) => (chip.textContent || '').trim() === 'Inspector')
+              ?.click();
+          }
+          return null;
+        }, 10000);
+        const initialSelectionLoaded = Boolean(initialId && await waitFor(() =>
+          document.querySelector('section.panel-inspector .ins-id')
+            ?.textContent.trim() === initialId
+        ));
+        const fixtureSelected = Boolean(
+          fixtureId && initialId === fixtureId && initialSelectionLoaded
+        );
+        // Shape-only: /node/:id values are not decoded in this harness, so each
+        // metric row must render with the value format the Inspector emits.
+        const metricShapes = {
+          degree: /^\d+ \(\d+ in \/ \d+ out\)$/,
+          pagerank: /^\d+\.\d{4}$/,
+          betweenness: /^\d+\.\d{4}$/,
+          community: /^\d+$/,
+          kcore: /^\d+$/,
+          wcc: /^\d+$/,
+        };
+        const metricRows = [...(document.querySelectorAll(
+          'section.panel-inspector .metrics-grid .kv'
+        ) || [])].map((row) => [
+          (row.querySelector('.k')?.textContent || '').trim(),
+          (row.querySelector('.v')?.textContent || '').trim(),
+        ]);
+        const metricsPresent = Object.entries(metricShapes).every(([key, shape]) =>
+          metricRows.some(([label, value]) => label === key && shape.test(value))
+        );
+
+        const nodeIds = [...new Set(rows().map(rowId).filter(Boolean))];
+        const preferredIds = nodeIds.filter((id) =>
+          id.toLowerCase().includes('start here')
+        );
+        const candidateIds = [...new Set([...preferredIds, ...nodeIds])].slice(0, 32);
+        // Start Here <-> Welcome is the seeded two-way link: Welcome.md links to
+        // Start Here, and the chart's Start Here note links back.
+        const startHereId = preferredIds[0] || '';
+        const isWelcome = (id) => /(^|[:/])Welcome(\.md)?$/.test(id);
+        // The Inspector degree row reads "N (i in / o out)".
+        const parseDegree = () => {
+          const row = [...document.querySelectorAll(
+            'section.panel-inspector .metrics-grid .kv'
+          )].find((item) =>
+            (item.querySelector('.k')?.textContent || '').trim() === 'degree'
+          );
+          const text = (row?.querySelector('.v')?.textContent || '').trim();
+          const match = /^(\d+) \((\d+) in \/ (\d+) out\)$/.exec(text);
+          return match && {
+            text,
+            degree: Number(match[1]),
+            inbound: Number(match[2]),
+            outbound: Number(match[3]),
+          };
+        };
+        let startHereWelcome = null;
+        let startHereDegree = null;
+        const directionPills = [
+          ['→', 'outgoing', 'outgoing link'],
+          ['↔', 'both', 'links both ways'],
+          ['←', 'incoming', 'incoming link'],
+        ];
+        // Directed neighbour pills carry a glyph label and a title of
+        // "{id} — {link tip}"; undirected community siblings have neither.
+        const directedPill = (pill) => {
+          const title = pill.getAttribute('title') || '';
+          const label = (pill.querySelector('.badge-label')?.textContent || '').trim();
+          for (const [glyph, direction, tip] of directionPills) {
+            const suffix = ` — ${tip}`;
+            if (label.startsWith(`${glyph} `) && title.endsWith(suffix)) {
+              return { id: title.slice(0, -suffix.length), direction };
+            }
+          }
+          return null;
+        };
+        let pillSourceId = '';
+        let pillTargetId = '';
+        let pillDirection = '';
+        let pillCount = 0;
+        let pillButton = null;
+        let inspectorSections = false;
+        for (const candidateId of candidateIds) {
+          const row = rows().find((item) => rowId(item) === candidateId);
+          row?.click();
+          const selected = await waitFor(() =>
+            document.querySelector('section.panel-inspector .ins-id')
+              ?.textContent.trim() === candidateId,
+            2500
+          );
+          if (!selected) continue;
+          const sections = [...document.querySelectorAll(
+            'section.panel-inspector .ins-section'
+          )];
+          const pills = [...document.querySelectorAll(
+            'section.panel-inspector .ins-section .pk-pills .pk-pill'
+          )];
+          inspectorSections = sections.length > 0;
+          pillCount = pills.length;
+          if (candidateId === startHereId) {
+            const welcome = pills.map(directedPill).find((target) =>
+              Boolean(target) && isWelcome(target.id)
+            );
+            startHereWelcome = welcome ? welcome.direction : 'missing';
+            startHereDegree = await waitFor(parseDegree, 2500);
+          }
+          const selectable = pills.find((pill) => {
+            const target = directedPill(pill);
+            return target && target.id !== candidateId &&
+              nodeIds.includes(target.id) && pill.querySelector('button.badge-main');
+          });
+          if (selectable) {
+            const target = directedPill(selectable);
+            pillSourceId = candidateId;
+            pillTargetId = target.id;
+            pillDirection = target.direction;
+            pillButton = selectable.querySelector('button.badge-main');
+            break;
+          }
+        }
+        const pillListPresent = Boolean(pillSourceId && pillTargetId && pillCount > 0);
+        pillButton?.click();
+        const pillClicked = Boolean(pillListPresent && await waitFor(() =>
+          document.querySelector('section.panel-inspector .ins-id')
+            ?.textContent.trim() === pillTargetId
+        ));
+        const selectionSynced = Boolean(pillClicked && await waitFor(() => {
+          const focused = document.querySelector(
+            '[data-testid="node-main"] [data-focused-node]'
+          )?.getAttribute('data-focused-node');
+          const cursor = rowId(document.querySelector(
+            '[data-testid="node-sidebar"] [data-node-id][data-vi-cursor="true"]'
+          ));
+          return focused === pillTargetId && cursor === pillTargetId;
+        }));
+        const minimize = document.querySelector(
+          'section.panel-inspector > header.panel-head .light.min'
+        );
+        minimize?.click();
+        const inspectorMinimized = Boolean(await waitFor(() =>
+          !document.querySelector('section.panel-inspector')
+        ));
+
+        if (!inspector) failures.push('Inspector did not restore from its dock');
+        if (!initialSelectionLoaded) failures.push('Inspector did not load the selected node');
+        if (!metricsPresent) failures.push(
+          'Inspector metric rows are missing or have unexpected value shapes'
+        );
+        if (!inspectorSections) failures.push('Inspector community/neighbour sections are missing');
+        if (!pillListPresent) failures.push(
+          'no directed neighbour pill (← → ↔) was rendered for the first 32 graph rows'
+        );
+        if (!pillClicked) failures.push('clicking a Panel Kit pill did not select its node');
+        if (!selectionSynced) failures.push('pill selection did not sync Inspector, Nodes, and vi cursor');
+        if (!inspectorMinimized) failures.push('Inspector did not return to the dock');
+        if (fixtureId && !startHereId) failures.push(
+          'Start Here is missing from the served graph'
+        );
+        if (fixtureId && startHereId && startHereWelcome === null) failures.push(
+          'Start Here Inspector did not load its neighbour pills'
+        );
+        if (fixtureId && startHereWelcome && startHereWelcome !== 'both') failures.push(
+          `Start Here should link both ways with Welcome (↔), found ${startHereWelcome}`
+        );
+        if (fixtureId && startHereWelcome === 'both' && !(
+          startHereDegree?.degree >= 1 && startHereDegree.inbound >= 1 &&
+          startHereDegree.outbound >= 1
+        )) failures.push(
+          `Start Here degree ${startHereDegree?.text || '(missing)'} omits its two-way link`
+        );
+        return {
+          ok: failures.length === 0,
+          inspector_opened: Boolean(inspector),
+          fixture_selected: fixtureSelected,
+          metrics_present: metricsPresent,
+          inspector_sections: inspectorSections,
+          pill_list_present: pillListPresent,
+          pill_count: pillCount,
+          pill_clicked: pillClicked,
+          selection_synced: selectionSynced,
+          inspector_minimized: inspectorMinimized,
+          fixture_id: fixtureId,
+          pill_source_id: pillSourceId,
+          pill_target_id: pillTargetId,
+          pill_direction: pillDirection,
+          reason: failures.length ? failures.join('; ') : null,
+        };
+    })()"#;
+    let inspector_value: serde_json::Value =
+        page.evaluate(inspector_js).await?.into_value()?;
+    let mut inspector: InspectorCheck = serde_json::from_value(inspector_value)
+        .context("decode Inspector pill regression result")?;
+    if args.fixtures_required && !inspector.fixture_selected {
+        inspector.ok = false;
+        inspector.reason = Some(match inspector.reason.take() {
+            Some(reason) => format!("{reason}; required Node Editor Fixture was not selected in Inspector"),
+            None => "required Node Editor Fixture was not selected in Inspector".to_string(),
+        });
+    }
+
+
     // ---- 6. Unified Settings exposes four accessible, real tabs ---------
     // Maximize Settings so every tab is both visible and pointer-hit-testable,
     // exercise each delegated panel, then restore the workspace. Restoring
@@ -1574,7 +2072,7 @@ async fn drive_page(
                   return null;
                 };
                 document.querySelector(
-                  'section.panel-importers > header.panel-head .light.yellow'
+                  'section.panel-importers > header.panel-head .light.min'
                 )?.click();
                 return Boolean(await waitFor(() =>
                   !document.querySelector('section.panel-importers') ? true : null
@@ -2635,8 +3133,10 @@ async fn drive_page(
     let maxed_state_js = r#"(() => {
         const panel = document.querySelector('section.panel-worlds');
         const maxed = Boolean(panel?.querySelector('.max-hint'));
+        // Hidden keep-alive slots stay in the DOM (display: none) by design;
+        // only rendered siblings count against maximized mounting.
         const others = [...document.querySelectorAll('section.panel')]
-          .filter((p) => p !== panel).length;
+          .filter((p) => p !== panel && p.getClientRects().length > 0).length;
         return { maxed, others };
     })()"#;
     let mut maximized_mounted = false;
@@ -2709,6 +3209,8 @@ async fn drive_page(
         pre_wasm_mount,
         header_actions,
         nodes_editor,
+        navigation,
+        inspector,
         settings_tabs,
         importers_panel,
         filter_builder,

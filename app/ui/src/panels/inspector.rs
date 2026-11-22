@@ -658,3 +658,36 @@ fn community_and_neighbors(
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{build_pills, neighbor_set, GraphIndex};
+
+    #[test]
+    fn inspector_neighbor_pills_show_link_direction() {
+        let ids = ["focus", "outgoing", "both", "incoming"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        let index = GraphIndex::build(&ids, &[0, 1, 0, 2, 2, 0, 3, 0], None);
+        let items = neighbor_set(0, &index)
+            .into_iter()
+            .map(|(idx, direction)| (idx, Some(direction)))
+            .collect::<Vec<_>>();
+        let (pills, truncated) = build_pills(&items, &ids, |_| None);
+
+        assert_eq!(truncated, 0);
+        assert_eq!(
+            pills.iter().map(|pill| pill.label.as_str()).collect::<Vec<_>>(),
+            vec!["→ outgoing", "↔ both", "← incoming"]
+        );
+        assert_eq!(
+            pills.iter().map(|pill| pill.tip.as_str()).collect::<Vec<_>>(),
+            vec![
+                "outgoing — outgoing link",
+                "both — links both ways",
+                "incoming — incoming link",
+            ]
+        );
+    }
+}
