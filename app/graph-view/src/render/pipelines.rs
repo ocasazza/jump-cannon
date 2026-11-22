@@ -402,7 +402,7 @@ impl GraphPipelines {
                 })],
             }),
             primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::TriangleList,
+                topology: wgpu::PrimitiveTopology::TriangleStrip,
                 ..Default::default()
             },
             depth_stencil: None,
@@ -431,10 +431,7 @@ impl GraphPipelines {
                 })],
             }),
             primitive: wgpu::PrimitiveState {
-                // Fat lines: each edge expands into a screen-space quad
-                // (6 verts, 2 tris) in the vertex shader for a constant
-                // pixel width. See `shaders/edge.wgsl`.
-                topology: wgpu::PrimitiveTopology::TriangleList,
+                topology: wgpu::PrimitiveTopology::TriangleStrip,
                 ..Default::default()
             },
             depth_stencil: None,
@@ -1013,13 +1010,12 @@ impl GraphPipelines {
         if b.n_edges > 0 {
             rpass.set_pipeline(&self.edge_pipeline);
             rpass.set_bind_group(0, &b.edge_bind_group, &[]);
-            // 6 verts per edge for the fat-line quad expansion.
-            rpass.draw(0..(b.n_edges * 6), 0..1);
+            rpass.draw(0..4, 0..b.n_edges);
         }
         if b.n_nodes > 0 {
             rpass.set_pipeline(&self.node_pipeline);
             rpass.set_bind_group(0, &b.node_bind_group, &[]);
-            rpass.draw(0..6, 0..b.n_nodes);
+            rpass.draw(0..4, 0..b.n_nodes);
         }
     }
 
@@ -1149,8 +1145,7 @@ impl GraphPipelines {
     /// the edge whose midpoint is closer to the camera (smaller NDC z).
     ///
     /// Returns `edge_idx` such that `edges_cpu()[edge_idx*2 .. edge_idx*2+2]`
-    /// is the (src, tgt) pair — i.e. it matches the `vid / 6u` quad index
-    /// used by `edge.wgsl`.
+    /// is the (src, tgt) pair indexed by the edge shader instance.
     pub fn raycast_edge(
         &self,
         ndc: [f32; 2],

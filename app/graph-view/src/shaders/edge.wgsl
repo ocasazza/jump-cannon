@@ -3,11 +3,7 @@
 // the edges automatically follow — no per-frame CPU rebuild of the
 // edge vertex buffer.
 //
-// Fat-line draw call: `draw(0..(6 * n_edges), 0..1)`. Each edge becomes
-// a screen-space quad of width `effects.edge_width` pixels:
-//   vid layout (per edge): 0=src-, 1=tgt-, 2=tgt+, 3=src-, 4=tgt+, 5=src+
-//   where ± is the offset perpendicular to the edge direction in clip
-//   space, scaled to ½ pixel-width.
+// Each edge instance is a four-vertex triangle strip of constant pixel width.
 //
 // DoF: per-fragment CoC is faked via average-endpoint distance to the
 // view-space focal band; fat lines also stretch DoF naturally because
@@ -95,13 +91,10 @@ struct VertexOutput {
 };
 
 @vertex
-fn vs_main(@builtin(vertex_index) vid: u32) -> VertexOutput {
-    // Per-edge quad: 6 verts → 2 tris.
-    //   0=src-, 1=tgt-, 2=tgt+, 3=src-, 4=tgt+, 5=src+
-    let edge_idx = vid / 6u;
-    let corner   = vid % 6u;
-    let endpoint = (corner == 1u) || (corner == 2u) || (corner == 4u);
-    let side     = (corner == 2u) || (corner == 4u) || (corner == 5u);
+fn vs_main(@builtin(vertex_index) corner: u32, @builtin(instance_index) edge_idx: u32) -> VertexOutput {
+    // tgt-, tgt+, src-, src+: the shared diagonal runs from tgt+ to src-.
+    let endpoint = corner < 2u;
+    let side = (corner & 1u) != 0u;
 
     let edge = edges[edge_idx];
     let p_src = positions[edge.x];

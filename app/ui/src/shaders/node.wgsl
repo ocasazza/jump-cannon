@@ -33,7 +33,7 @@
 //   group(0) binding(6)  storage<read> array<u32>       shape_ids
 //   group(0) binding(7)  storage<read> array<f32>       focus_attr [0,1]
 //
-// Draw call: draw(0..6, 0..n_nodes).
+// Draw call: draw(0..4, 0..n_nodes), triangle strip.
 
 struct CameraUniform {
     view_proj:  mat4x4<f32>,
@@ -113,15 +113,7 @@ fn vs_main(
     @builtin(vertex_index) vid: u32,
     @builtin(instance_index) iid: u32,
 ) -> VertexOutput {
-    var corners = array<vec2<f32>, 6>(
-        vec2<f32>(-1.0, -1.0),
-        vec2<f32>( 1.0, -1.0),
-        vec2<f32>(-1.0,  1.0),
-        vec2<f32>( 1.0, -1.0),
-        vec2<f32>( 1.0,  1.0),
-        vec2<f32>(-1.0,  1.0),
-    );
-    let corner = corners[vid];
+    let corner = vec2<f32>(select(-1.0, 1.0, (vid & 1u) != 0u), select(-1.0, 1.0, vid >= 2u));
 
     let inst_pos   = positions[iid];
     var inst_color = colors[iid];
