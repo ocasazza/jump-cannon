@@ -69,9 +69,8 @@ pub(crate) struct Hint {
     pub count: Option<u32>,
     /// Rules still reachable from the pending sequence.
     pub candidates: Vec<Candidate>,
-    /// Mode name and index into the keymap's modes.
+    /// Mode name.
     pub mode: String,
-    pub mode_ix: usize,
     /// Echo line: what the last key did, a tip, or the tour prompt.
     pub message: Option<Echo>,
     /// Vi cursor degree `(incoming, outgoing)` for the degree badge.
@@ -186,7 +185,6 @@ fn hint_of(vi: &ViState, candidates: Vec<Candidate>) -> Hint {
         count: vi.keys.count,
         candidates,
         mode: KEYMAP.mode_name(&vi.keys).to_owned(),
-        mode_ix: vi.keys.mode,
         message: prev.message.clone(),
         degree: prev.degree,
     }
