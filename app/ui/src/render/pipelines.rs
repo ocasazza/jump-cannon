@@ -322,6 +322,8 @@ struct Buffers {
     /// a fresh `copy_buffer_to_buffer` when
     /// `positions_frame_idx - last_positions_copy_frame >= POSITIONS_READBACK_PERIOD`.
     last_positions_copy_frame: u64,
+    /// GPU positions may have changed since the last staging copy.
+    positions_dirty: bool,
     /// One-shot: the load-time fit framed the CPU-side seed, but a physics
     /// layout (re)seeds the shared positions buffer at its own world scale
     /// during init. Refit once the first post-load readback lands so the
@@ -708,6 +710,7 @@ impl GraphPipelines {
             positions_readback: Arc::new(Mutex::new(PositionsReadbackState::Idle)),
             positions_frame_idx: 0,
             last_positions_copy_frame: 0,
+            positions_dirty: true,
             pending_refit: true,
         });
 
@@ -776,16 +779,6 @@ impl GraphPipelines {
         encoder: &mut wgpu::CommandEncoder,
     ) {
         let sim_running = self.sim_running;
-        // Resolve the region auto-level for this frame from the current
-        // camera framing before borrowing `self.buffers` (bounds() reads
-        // the CPU position mirror). `None` when no bounds exist. See the
-        // shared zoom rule in region_map::auto_level.
-        let region_framing = self.bounds().map(|(mn, mx)| {
-            let center = (mn + mx) * 0.5;
-            let radius = ((mx - mn) * 0.5).length();
-            let d = (self.camera.position - center).length();
-            (d, self.camera.fit_distance(radius))
-        });
         let Some(b) = &mut self.buffers else { return };
 
         // Drive any pending native callbacks. On WASM the browser drives
@@ -839,18 +832,9 @@ impl GraphPipelines {
 
         if sim_running {
             if let Some(l) = b.layout.as_mut() {
+                b.positions_dirty |= !l.is_halted();
                 l.step_with_encoder(device, queue, encoder, &b.positions);
             }
-        }
-
-        // Record the region-map compute passes (clear -> seed -> jump-
-        // flood -> prune) into the same encoder. The seed pass reads the
-        // positions the sim just wrote. No-op when the region mode is Off
-        // or before the graph is loaded. The level is resolved and stored
-        // once here so `region_current_level` reflects this frame.
-        if let Some(region) = self.region.as_mut() {
-            region.update_level(queue, region_framing);
-            region.encode(encoder);
         }
 
         // Throttle: only schedule a fresh readback once every
@@ -861,7 +845,7 @@ impl GraphPipelines {
         let elapsed = b
             .positions_frame_idx
             .wrapping_sub(b.last_positions_copy_frame);
-        if elapsed >= POSITIONS_READBACK_PERIOD {
+        if b.positions_dirty && elapsed >= POSITIONS_READBACK_PERIOD {
             let readback_idle = b
                 .positions_readback
                 .lock()
@@ -869,8 +853,24 @@ impl GraphPipelines {
                 .unwrap_or(false);
             if readback_idle {
                 Self::schedule_positions_copy_inner(b, encoder);
+                b.positions_dirty = false;
                 b.last_positions_copy_frame = b.positions_frame_idx;
             }
+        }
+        let region_framing = self.bounds().map(|(mn, mx)| {
+            let center = (mn + mx) * 0.5;
+            let radius = ((mx - mn) * 0.5).length();
+            let d = (self.camera.position - center).length();
+            (d, self.camera.fit_distance(radius))
+        });
+        // Record the region-map compute passes (clear -> seed -> jump-
+        // flood -> prune) into the same encoder. The seed pass reads the
+        // positions the sim just wrote. No-op when the region mode is Off
+        // or before the graph is loaded. The level is resolved and stored
+        // once here so `region_current_level` reflects this frame.
+        if let Some(region) = self.region.as_mut() {
+            region.update_level(queue, region_framing);
+            region.encode(encoder);
         }
     }
 
@@ -934,6 +934,7 @@ impl GraphPipelines {
                     // Map failures are rare and self-recovering — silently
                     // reset to Idle. No unmap needed (never mapped).
                     *guard = PositionsReadbackState::Idle;
+                    b.positions_dirty = true;
                     return false;
                 }
                 _ => return false, // Idle / CopyScheduled / Mapping: nothing to drain.
@@ -1820,6 +1821,7 @@ impl GraphPipelines {
             padded.extend_from_slice(&[0.0; 4]);
         }
         queue.write_buffer(&b.positions, 0, bytemuck::cast_slice(&padded));
+        b.positions_dirty = true;
 
         // Refresh the CPU mirror so raycasts / bounds() see the seed.
         b.positions_cpu = positions.to_vec();
@@ -1861,6 +1863,7 @@ impl GraphPipelines {
         let Some(b) = self.buffers.as_mut() else {
             return;
         };
+        b.positions_dirty = true;
         match init_physics_layout(
             device,
             queue,
@@ -1950,6 +1953,7 @@ impl GraphPipelines {
             padded.extend_from_slice(&[0.0; 4]);
         }
         queue.write_buffer(&b.positions, 0, bytemuck::cast_slice(&padded));
+        b.positions_dirty = true;
 
         // Refresh the CPU mirror so raycasts and `bounds()` see the new
         // positions instead of the pre-solve state.
@@ -2187,6 +2191,7 @@ pub struct RenderHost {
     device: wgpu::Device,
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
+    redraw: bool,
     pub pipes: GraphPipelines,
 }
 
@@ -2289,6 +2294,7 @@ impl RenderHost {
                 device,
                 queue,
                 config,
+                redraw: true,
                 pipes,
             })
         }
@@ -2351,6 +2357,10 @@ impl RenderHost {
             .set_positions(&self.device, &self.queue, positions)
     }
 
+    pub(super) fn invalidate(&mut self) {
+        self.redraw = true;
+    }
+
     /// Canvas client (logical/CSS px) size.
     pub fn logical_size(&self) -> (f32, f32) {
         (
@@ -2372,23 +2382,28 @@ impl RenderHost {
     /// One full frame: resize-check → compute + uniform writes (the old
     /// `prepare()`) → render pass with edge-then-node draws (the old
     /// `paint()`) → submit + present.
-    pub fn frame(&mut self) {
+    pub fn frame(&mut self) -> bool {
         if !self.canvas_attached() {
-            return;
+            self.redraw = true;
+            return false;
         }
         let (pw, ph) = Self::physical_size(&self.canvas);
         if pw < 4 || ph < 4 {
-            return;
+            self.redraw = true;
+            return false;
         }
         // Keep the canvas backing store at device-pixel resolution (CSS
         // scales it back down to the client rect).
         if self.canvas.width() != pw {
+            self.redraw = true;
             self.canvas.set_width(pw);
         }
         if self.canvas.height() != ph {
+            self.redraw = true;
             self.canvas.set_height(ph);
         }
         if self.config.width != pw || self.config.height != ph {
+            self.redraw = true;
             self.config.width = pw;
             self.config.height = ph;
             self.surface.configure(&self.device, &self.config);
@@ -2399,17 +2414,29 @@ impl RenderHost {
         // shares the same units as mouse-event coordinates.
         let (lw, lh) = self.logical_size();
         let screen = [lw.max(1.0), lh.max(1.0)];
+        if !self.redraw && self.pipes.screen_px == screen {
+            let busy = self.pipes.buffers.as_ref().is_some_and(|b| {
+                (self.pipes.sim_running && b.layout.as_ref().is_some_and(|l| !l.is_halted()))
+                    || b.positions_dirty
+                    || !matches!(b.positions_readback.lock().as_deref(), Ok(PositionsReadbackState::Idle))
+            });
+            if !busy {
+                return false;
+            }
+        }
+        // Leave invalidated until presentation succeeds, including after surface loss.
+        self.redraw = true;
         self.pipes.set_screen(screen);
 
         let frame = match self.surface.get_current_texture() {
             Ok(f) => f,
             Err(wgpu::SurfaceError::Lost) | Err(wgpu::SurfaceError::Outdated) => {
                 self.surface.configure(&self.device, &self.config);
-                return;
+                return false;
             }
             Err(e) => {
                 tracing::warn!("[render] get_current_texture: {e}");
-                return;
+                return false;
             }
         };
         let view = frame
@@ -2459,5 +2486,7 @@ impl RenderHost {
 
         self.queue.submit(std::iter::once(encoder.finish()));
         frame.present();
+        self.redraw = false;
+        true
     }
 }

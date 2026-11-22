@@ -989,7 +989,7 @@ pub(crate) fn stage_self_assembly(
 /// is the one-shot Solve/Wake channel: Static layouts re-solve, Physics layouts
 /// `wake()` (egui shares the flag the same way).
 fn apply_engine(solve_requested: bool) {
-    let Some(n_nodes) = render::with_host(|h| h.pipes.n_nodes() as usize) else {
+    let Some(n_nodes) = render::inspect_host(|h| h.pipes.n_nodes() as usize) else {
         if solve_requested {
             *SOLVE_MSG.write() = "renderer not mounted — open the Graph panel first".to_string();
         }
@@ -1874,7 +1874,7 @@ fn builtin_demo_indices() -> Vec<usize> {
 /// provokes skips the buffer upload; `keep == false` restores `"random"`.
 fn set_gpu_force_seed_mode(keep: bool) {
     let mode = if keep { "none" } else { "random" };
-    let n = render::with_host(|h| h.pipes.n_nodes() as usize).unwrap_or(0);
+    let n = render::inspect_host(|h| h.pipes.n_nodes() as usize).unwrap_or(0);
     let mut st = STATE.read().clone();
     let entry = st
         .settings
@@ -1924,7 +1924,7 @@ fn apply_builtin_seed(i: usize) {
 /// The eval runs synchronously on the click handler, the same cost the egui
 /// app paid (its seed path never went through a background job).
 fn apply_seed_expr(expr: &str) {
-    let Some(n) = render::with_host(|h| h.pipes.n_nodes() as usize) else {
+    let Some(n) = render::inspect_host(|h| h.pipes.n_nodes() as usize) else {
         *SEED_ERROR.write() = Some("renderer not mounted — open the Graph panel first".to_string());
         return;
     };

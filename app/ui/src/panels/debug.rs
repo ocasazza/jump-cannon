@@ -7,7 +7,7 @@
 //! port has no hook into the Dioxus/wgpu frame, so a panel-local ticker
 //! samples wall-clock deltas (`Date.now()` — the `web-sys` `Performance`
 //! feature isn't enabled and Cargo.toml is owned elsewhere) plus the live
-//! renderer state via `crate::render::with_host`. Sampling only runs while
+//! renderer state via `crate::render::inspect_host`. Sampling only runs while
 //! the panel is mounted.
 
 use dioxus::prelude::*;
@@ -15,7 +15,7 @@ use gloo_storage::{LocalStorage, Storage};
 use serde::{Deserialize, Serialize};
 
 use crate::graph_canvas::GraphData;
-use crate::render::with_host;
+use crate::render::inspect_host;
 use crate::Ctx;
 
 const CHART_WINDOW_SECS: f64 = 10.0;
@@ -168,7 +168,7 @@ fn DebugPanel(graph: Signal<Option<GraphData>>) -> Element {
             };
             let cost_ms = mean_tail(&costs);
             prev = now;
-            let (max_ke, halted, sim_running, n_nodes, n_edges, host_live) = with_host(|h| {
+            let (max_ke, halted, sim_running, n_nodes, n_edges, host_live) = inspect_host(|h| {
                 (
                     h.pipes.last_max_ke(),
                     h.pipes.is_halted(),

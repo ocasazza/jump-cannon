@@ -3,7 +3,7 @@
 //! Live layout-quality readout with pinning. Where the egui panel set
 //! one-shot request flags drained by `App::drain_metrics_request`, this port
 //! computes inline: read CPU positions + edges from the wgpu renderer
-//! (`render::with_host`) and call `graph_layouts::metrics` — same math, same
+//! (`render::inspect_host`) and call `graph_layouts::metrics` — same math, same
 //! size gates. The panel never touches the GPU; `positions_cpu` is the
 //! renderer's async GPU→CPU readback mirror.
 //!
@@ -162,7 +162,7 @@ fn compute(full: bool) {
     const MAX_FULL_NODES: usize = 2000;
     const MAX_CROSSING_EDGES: usize = 20_000;
 
-    let Some((positions, edge_pairs)) = render::with_host(|h| {
+    let Some((positions, edge_pairs)) = render::inspect_host(|h| {
         let positions = h.pipes.positions_cpu().to_vec();
         let pairs: Vec<(u32, u32)> = h
             .pipes

@@ -247,7 +247,7 @@ fn tick() {
 
         // Equivalent of the egui `loaded_into_gpu` gate: no host (canvas not
         // mounted yet) or no buffers — just keep the mirrors honest.
-        let (loaded, components) = crate::render::with_host(|h| {
+        let (loaded, components) = crate::render::inspect_host(|h| {
             (h.pipes.is_loaded(), h.pipes.positions_cpu().len())
         })
         .unwrap_or((false, 0));
@@ -278,7 +278,7 @@ fn tick() {
             });
             if n % stride as u64 == 0 {
                 if let Some(positions) =
-                    crate::render::with_host(|h| h.pipes.positions_cpu().to_vec())
+                    crate::render::inspect_host(|h| h.pipes.positions_cpu().to_vec())
                 {
                     if !positions.is_empty() {
                         ring.push(&positions);

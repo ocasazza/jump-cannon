@@ -137,6 +137,18 @@ thread_local! {
 /// surface ported from graph_pipelines.rs lives on `h.pipes`, the 6DoF
 /// camera on `h.pipes.camera`.
 pub(crate) fn with_host<R>(f: impl FnOnce(&mut RenderHost) -> R) -> Option<R> {
+    access_host(|host| {
+        host.invalidate();
+        f(host)
+    })
+}
+
+/// Inspect live renderer state without invalidating the canvas.
+pub(crate) fn inspect_host<R>(f: impl FnOnce(&RenderHost) -> R) -> Option<R> {
+    HOST.with(|h| h.borrow().as_ref().map(f))
+}
+
+fn access_host<R>(f: impl FnOnce(&mut RenderHost) -> R) -> Option<R> {
     HOST.with(|h| h.borrow_mut().as_mut().map(f))
 }
 
@@ -358,8 +370,9 @@ fn tick() {
         ([ax * dt * speed, ay * dt * speed, az * dt * speed], active)
     });
 
-    with_host(|h| {
+    access_host(|h| {
         if dt_valid {
+            h.invalidate();
             h.pipes.camera.pan(pan[0], pan[1], pan[2]);
         }
         // Defensive: a NaN that sneaks into the camera basis (bad input
@@ -371,11 +384,14 @@ fn tick() {
             || !h.pipes.camera.pitch.is_finite()
         {
             tracing::warn!("[render] camera state went non-finite — resetting");
+            h.invalidate();
             let aspect = h.pipes.camera.aspect;
             h.pipes.camera = crate::render::camera::Camera::new(aspect);
         }
         let t0 = js_sys::Date::now();
-        h.frame();
+        if !h.frame() {
+            return;
+        }
         perf_record(now, js_sys::Date::now() - t0);
         // Mirror the region level `frame()` just resolved into the global
         // signal, but only when it changed so the panel readout doesn't
