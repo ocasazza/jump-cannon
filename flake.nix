@@ -1261,6 +1261,10 @@
             # copied into the dist by trunk (index.html copy-dir). Same
             # reason as vendor/ — .json/.yaml are not in the allowlist.
             ./app/ui/assets/sessions
+            # Compiled into the UI by include_str! (app/ui/src/nav.rs); .json is
+            # not in the extension allowlist above.
+            ./app/ui/assets/keymap-vi.json
+            ./app/ui/assets/tour-vi.json
             # The Sessions view path-depends on session-manager/graph-vcs,
             # whose *optional* server deps (graph-api, data-loader, …) still
             # need their manifests parsed, and those use `workspace = true`
