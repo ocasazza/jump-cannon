@@ -12,8 +12,12 @@
 //! Errors are [`data_loader::ImportError`] so the connector fits the same
 //! pipeline as every other [`data_loader::SourceConnector`] in the repo.
 
+#[cfg(feature = "native")]
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::fmt;
+#[cfg(feature = "native")]
+use std::time::SystemTime;
 
 use data_loader::{
     Capability, Effect, ImportError, ImportFuture, ImportProgress, SourceConnector, SourceRecord,
@@ -36,8 +40,11 @@ pub const USER_AGENT: &str = "jump-cannon-http-json-importer";
 /// we emit.
 pub const CONTENT_TYPE: &str = "application/json";
 
-/// Maximum bytes of a non-2xx body included in the error message. Bodies
-/// beyond this are truncated with an ellipsis so the diagnostic stays bounded.
+/// Maximum bytes of a non-2xx body the client reads — and includes in the
+/// error message. The streaming read stops at this cap (plus one byte to
+/// detect overflow), so an error body from a slow source can never be
+/// downloaded whole before the import aborts. Bodies beyond the cap are
+/// truncated with an ellipsis so the diagnostic stays bounded.
 #[cfg(feature = "native")]
 const ERROR_BODY_EXCERPT_BYTES: usize = 256;
 
@@ -145,6 +152,7 @@ impl ReqwestTransport {
             let fatal = error.is_builder() || error.is_redirect();
             Attempt::new(
                 fatal,
+                FailureClass::Connect,
                 ImportError::SourceRead {
                     origin: url.to_string(),
                     message: format!("HTTP request failed: {error}"),
@@ -153,15 +161,30 @@ impl ReqwestTransport {
         })?;
         let status = response.status();
         if !status.is_success() {
-            let body = response.bytes().await.unwrap_or_default();
+            // Both RFC 9110 forms: non-negative seconds, or an HTTP-date.
+            let retry_after = response
+                .headers()
+                .get(reqwest::header::RETRY_AFTER)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| parse_retry_after(value, SystemTime::now()));
+            // Stream the error body up to the excerpt bound instead of
+            // buffering it whole (`bytes()`), which an oversized body would
+            // make unbounded.
+            let body = read_bounded(response, ERROR_BODY_EXCERPT_BYTES).await;
             let excerpt = truncate_excerpt(&body, ERROR_BODY_EXCERPT_BYTES);
-            return Err(Attempt::new(
-                !is_retryable_status(status),
-                ImportError::SourceRead {
-                    origin: url.to_string(),
-                    message: format!("HTTP {status}: {excerpt}"),
-                },
-            ));
+            let error = ImportError::SourceRead {
+                origin: url.to_string(),
+                message: format!("HTTP {status}: {excerpt}"),
+            };
+            return if is_retryable_status(status) {
+                Err(Attempt::Transient {
+                    class: FailureClass::Status(status.as_u16()),
+                    retry_after,
+                    error,
+                })
+            } else {
+                Err(Attempt::Fatal(error))
+            };
         }
         if let Some(length) = response.content_length() {
             if length as usize > self.max_response_bytes {
@@ -177,10 +200,14 @@ impl ReqwestTransport {
         let mut stream = response;
         let mut bytes = Vec::new();
         while let Some(chunk) = stream.chunk().await.map_err(|error| {
-            Attempt::Transient(ImportError::SourceRead {
-                origin: url.to_string(),
-                message: format!("HTTP stream failed: {error}"),
-            })
+            Attempt::Transient {
+                class: FailureClass::Stream,
+                retry_after: None,
+                error: ImportError::SourceRead {
+                    origin: url.to_string(),
+                    message: format!("HTTP stream failed: {error}"),
+                },
+            }
         })? {
             if bytes.len() + chunk.len() > self.max_response_bytes {
                 return Err(Attempt::Fatal(ImportError::SourceRead {
@@ -206,18 +233,34 @@ impl JsonTransport for ReqwestTransport {
                 match self.get_once(url).await {
                     Ok(bytes) => return Ok(bytes),
                     Err(Attempt::Fatal(error)) => return Err(error),
-                    Err(Attempt::Transient(error)) => {
+                    Err(Attempt::Transient {
+                        class,
+                        retry_after,
+                        error,
+                    }) => {
                         failed += 1;
                         if failed >= self.retry.max_attempts {
                             return Err(error);
                         }
-                        let delay = self.retry.delay_after(failed);
+                        // A Retry-After asking for a wait longer than the
+                        // policy ceiling is a refusal, not a delay: the
+                        // source will not be back within our patience, so
+                        // stop instead of sleeping through it.
+                        let delay = match retry_after {
+                            Some(requested) if requested > self.retry.max_delay => {
+                                return Err(error);
+                            }
+                            Some(requested) => requested,
+                            None => self.retry.delay_after(failed),
+                        };
+                        // Log-safe facts only: the status code or failure
+                        // class, the attempt count, and the wait. Never the
+                        // URL, the upstream error text, or any body excerpt.
                         tracing::warn!(
-                            url,
+                            status = %class.label(),
                             attempt = failed,
                             max_attempts = self.retry.max_attempts,
                             delay_ms = delay.as_millis() as u64,
-                            %error,
                             "transient source read failure; retrying"
                         );
                         tokio::time::sleep(delay).await;
@@ -274,21 +317,86 @@ fn is_retryable_status(status: reqwest::StatusCode) -> bool {
     matches!(status.as_u16(), 408 | 425 | 429 | 500 | 502 | 503 | 504)
 }
 
+/// How an attempt failed, reduced to values safe for a structured log: the
+/// status code, or a fixed failure class. The URL, the upstream error text,
+/// and any response body stay out of log fields and live only in the final
+/// [`ImportError`].
+#[cfg(feature = "native")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FailureClass {
+    /// The request never reached a response: DNS, connect, TLS, or timeout.
+    Connect,
+    /// A response started but its body stream failed mid-read.
+    Stream,
+    /// The server answered with a non-2xx status.
+    Status(u16),
+}
+
+#[cfg(feature = "native")]
+impl FailureClass {
+    /// The log-safe label: the numeric status code, or the class name.
+    fn label(self) -> Cow<'static, str> {
+        match self {
+            Self::Status(code) => Cow::Owned(code.to_string()),
+            Self::Connect => Cow::Borrowed("connect"),
+            Self::Stream => Cow::Borrowed("stream"),
+        }
+    }
+}
+
 #[cfg(feature = "native")]
 enum Attempt {
-    Transient(ImportError),
+    Transient {
+        class: FailureClass,
+        /// A parsed `Retry-After` from the response, if it carried one.
+        retry_after: Option<std::time::Duration>,
+        error: ImportError,
+    },
     Fatal(ImportError),
 }
 
 #[cfg(feature = "native")]
 impl Attempt {
-    fn new(fatal: bool, error: ImportError) -> Self {
+    fn new(fatal: bool, class: FailureClass, error: ImportError) -> Self {
         if fatal {
             Self::Fatal(error)
         } else {
-            Self::Transient(error)
+            Self::Transient {
+                class,
+                retry_after: None,
+                error,
+            }
         }
     }
+}
+
+/// RFC 9110 permits decimal seconds or an HTTP-date. An overflowing
+/// seconds value still exceeds the retry budget; it is not a malformed date.
+#[cfg(feature = "native")]
+fn parse_retry_after(value: &str, now: SystemTime) -> Option<std::time::Duration> {
+    let value = value.trim();
+    if !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit()) {
+        return Some(std::time::Duration::from_secs(value.parse().unwrap_or(u64::MAX)));
+    }
+    let resume = httpdate::parse_http_date(value).ok()?;
+    Some(resume.duration_since(now).unwrap_or_default())
+}
+
+/// Read at most `limit + 1` bytes of a response body, stopping the stream
+/// once that many have been read. The extra byte only proves the body
+/// exceeded the cap; [`truncate_excerpt`] slices it to `limit` and appends
+/// the ellipsis, so an oversized error body is never polled to exhaustion.
+#[cfg(feature = "native")]
+async fn read_bounded(mut response: reqwest::Response, limit: usize) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    while bytes.len() <= limit {
+        let Ok(Some(chunk)) = response.chunk().await else {
+            break;
+        };
+        let take = (limit + 1).saturating_sub(bytes.len());
+        bytes.extend_from_slice(&chunk[..take.min(chunk.len())]);
+    }
+    bytes
 }
 
 #[cfg(feature = "native")]

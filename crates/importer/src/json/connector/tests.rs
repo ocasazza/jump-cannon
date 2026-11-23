@@ -1207,4 +1207,61 @@ mod retry {
         let waits: Vec<u64> = (1..=7).map(|n| policy.delay_after(n).as_millis() as u64).collect();
         assert_eq!(waits, [500, 1000, 2000, 4000, 8000, 8000, 8000]);
     }
+
+    async fn raw_response(headers: &str, body: Vec<u8>) -> (String, Arc<AtomicUsize>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        let headers = headers.to_owned();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let counter = hits.clone();
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let mut buf = [0; 4096];
+                if socket.read(&mut buf).await.unwrap_or(0) == 0 { continue; }
+                if counter.fetch_add(1, Ordering::SeqCst) == 0 {
+                    socket.write_all(headers.as_bytes()).await.unwrap();
+                    socket.write_all(&body).await.unwrap();
+                    // An incomplete response stays open until the client drops it.
+                    tokio::spawn(async move { let _ = socket.read(&mut buf).await; });
+                } else {
+                    socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok").await.unwrap();
+                }
+            }
+        });
+        (url, hits)
+    }
+
+    #[test]
+    fn excessive_retry_after_preserves_rate_limit_error() {
+        run(async {
+            for delay in ["1", "999999999999999999999999", "Sun, 06 Nov 2095 08:49:37 GMT"] {
+                let header = format!("HTTP/1.1 429 Too Many Requests\r\nRetry-After: {delay}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                let (url, hits) = raw_response(&header, vec![]).await;
+                assert!(transport(2).get(&url).await.unwrap_err().to_string().contains("429"));
+                assert_eq!(hits.load(Ordering::SeqCst), 1);
+            }
+        });
+    }
+
+    #[test]
+    fn retry_waits_until_server_delay_elapses() {
+        run(async {
+            let (url, _) = raw_response("HTTP/1.1 503 Busy\r\nRetry-After: 1\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", vec![]).await;
+            let client = transport(2).with_retry_policy(RetryPolicy { max_attempts: 2, base_delay: Duration::from_millis(1), max_delay: Duration::from_secs(2) });
+            let start = std::time::Instant::now();
+            assert_eq!(client.get(&url).await.unwrap(), b"ok");
+            assert!(start.elapsed() >= Duration::from_secs(1));
+        });
+    }
+
+    #[test]
+    fn oversized_error_excerpt_does_not_wait_for_eof() {
+        run(async {
+            let (url, _) = raw_response("HTTP/1.1 404 Missing\r\nContent-Length: 1000000\r\n\r\n", vec![b'x'; 512]).await;
+            let client = transport(1);
+            let error = tokio::time::timeout(Duration::from_secs(2), client.get(&url)).await.expect("excerpt must not wait for EOF").unwrap_err();
+            assert!(error.to_string().contains(&format!("{}…", "x".repeat(256))));
+        });
+    }
 }

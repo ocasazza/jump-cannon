@@ -2259,6 +2259,7 @@ version = "1.0.0"
 dependencies = [
  "blake3",
  "data-loader",
+ "httpdate",
  "parking_lot",
  "pest",
  "pest_meta",
